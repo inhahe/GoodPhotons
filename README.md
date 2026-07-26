@@ -1608,7 +1608,15 @@ or a native-primitive wrap — see below). Two authoring forms:
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
   math, `pi`, and functions `abs sqrt sin cos tan exp log floor fract sign saturate min
-  max atan2 step pow clamp mix smoothstep noise`.
+  max atan2 step pow clamp mix smoothstep noise`. It can also **sample a declared image
+  as a term**: `tex:<name>(u, v)` returns the mean of the texel's three linear RGB
+  channels (the same `Texture::scalarAt` sampler a `texture:<name>` slot binding uses,
+  honouring that texture's `filter`/`wrap`), so a photo can be one *operand* of a formula
+  — `expr "saturate(tex:grime(u,v) * (0.5 + 0.5*sin(28*u)) * 2)"` — instead of only being
+  pasted over a slot. Its coordinates are ordinary sub-expressions, so the lookup can be
+  warped. `tex:` needs a real surface, so it is a **compile error** in an isosurface
+  `function { expr }`, in a medium `density`/`ior` program, and at load-time constant
+  sites — never a silent zero. Worked example: `scenes/pattern_tex.ftsl`.
 - **Named generator** — `type <gen>` plus params (mirrors material syntax):
 
   | Generator | Parameters | Result |

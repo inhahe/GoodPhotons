@@ -867,6 +867,23 @@ private:
     std::unordered_map<std::string, int> matIndex_;
     std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
     std::unordered_map<std::string, int> patternIndex_;   // pattern name -> Scene::patterns index
+
+    // Texture scope for `tex:<name>(u, v)` samples inside a pattern expression. Passed
+    // to compilePatternExpr ONLY at value sites that are evaluated with a shading
+    // context (material / pattern / record-driver expressions); leaving it off at the
+    // others (implicit field formulas, medium density/ior, load-time constant sites)
+    // is what turns an unperformable sample into a clear compile error. Resolution
+    // reads textureIndex_, which Pass 1b fills before patterns / records / materials
+    // are built — so file order does not matter for those. The one ordering rule is
+    // texture-samples-texture: a procedural `texture { rgb "…" }` bakes DURING Pass
+    // 1b, so it can only sample textures declared ABOVE it (and never itself, which
+    // therefore fails cleanly as "unknown texture" rather than recursing).
+    static int texScopeThunk_(const void* self, const char* name) {
+        const auto& idx = static_cast<const Builder*>(self)->textureIndex_;
+        auto it = idx.find(name);
+        return (it == idx.end()) ? -1 : it->second;
+    }
+    PatTexScope texScope_{ this, &Builder::texScopeThunk_ };
     std::unordered_map<std::string, int> recordIndex_;    // record name  -> Scene::records index
     const std::vector<Record>* records_ = nullptr;        // -> L.scene.records (set in build; for record refs at value sites)
     std::unordered_map<std::string, Spectrum> spdFileCache_; // path -> loaded measured SPD
@@ -938,7 +955,7 @@ private:
         m.reflect = constantSpectrum(0.75);
         std::vector<PatNode> drv;
         std::string cerr;
-        if (!compilePatternExpr(driverExpr, drv, cerr)) {
+        if (!compilePatternExpr(driverExpr, drv, cerr, /*allowT=*/false, &texScope_)) {
             fail("record material driver '" + driverExpr + "': " + cerr);
             return -1;
         }
@@ -1374,9 +1391,9 @@ private:
                 fail("texture '" + b.name + "': rgb needs three quoted exprs: rgb \"r(u,v)\" \"g(u,v)\" \"b(u,v)\""); return false;
             }
             std::vector<PatNode> pr, pg, pb; std::string perr;
-            if (!compilePatternExpr(rgbS->val.words[0], pr, perr)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
-            if (!compilePatternExpr(rgbS->val.words[1], pg, perr)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
-            if (!compilePatternExpr(rgbS->val.words[2], pb, perr)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[0], pr, perr, false, &texScope_)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[1], pg, perr, false, &texScope_)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[2], pb, perr, false, &texScope_)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
             int res = (int)dblOf(b, "res", 512.0);
             if (res < 1) res = 1; else if (res > 8192) res = 8192;
             tex.encoding = TexEncoding::Linear;   // expr outputs are linear albedo already
@@ -1389,7 +1406,7 @@ private:
                 double v = 1.0 - (y + 0.5) / res;
                 for (int x = 0; x < res; ++x) {
                     double u = (x + 0.5) / res;
-                    PatCtx c; c.u = u; c.v = v;
+                    PatCtx c; c.u = u; c.v = v; bindPatTex(c, L.scene);
                     double rr = patternEval(pr.data(), (int)pr.size(), c);
                     double gg = patternEval(pg.data(), (int)pg.size(), c);
                     double bb = patternEval(pb.data(), (int)pb.size(), c);
@@ -1514,7 +1531,7 @@ private:
             std::string expr;
             for (size_t k = 0; k < es->val.words.size(); ++k) { if (k) expr += " "; expr += es->val.words[k]; }
             std::string perr;
-            if (!compilePatternExpr(expr, pat.nodes, perr)) {
+            if (!compilePatternExpr(expr, pat.nodes, perr, false, &texScope_)) {
                 fail("pattern '" + b.name + "': " + perr); return false;
             }
         } else {
@@ -1682,7 +1699,7 @@ private:
             for (auto& st : ch.stops) {
                 if (ch.kind == ChanKind::Scalar) {
                     std::string cerr;
-                    if (!compilePatternExpr(st.token, st.expr, cerr)) {
+                    if (!compilePatternExpr(st.token, st.expr, cerr, false, &texScope_)) {
                         fail("record '" + rec.name + "' channel '" + ch.name +
                              "': bad stop expression '" + st.token + "': " + cerr);
                         return false;
@@ -1754,7 +1771,7 @@ private:
                 auto rit = recordIndex_.find(rname);
                 if (rit == recordIndex_.end()) { fail("`from`: unknown record '" + rname + "'"); return m; }
                 std::vector<PatNode> drv; std::string cerr;
-                if (!compilePatternExpr(dexpr, drv, cerr)) {
+                if (!compilePatternExpr(dexpr, drv, cerr, false, &texScope_)) {
                     fail("`from " + rname + "` driver '" + dexpr + "': " + cerr); return m;
                 }
                 const Record& rec = L.scene.records[rit->second];
@@ -1864,7 +1881,7 @@ private:
                 if (selStop >= 0) { fail("record-override `" + slot + " = " + rhs +
                     "`: a stop selector needs a record channel"); return m; }
                 std::string cerr;
-                if (!compilePatternExpr(rhs, rb.driver, cerr)) {
+                if (!compilePatternExpr(rhs, rb.driver, cerr, false, &texScope_)) {
                     fail("record-override `" + slot + " = " + rhs + "`: " + cerr); return m;
                 }
                 rb.recordIndex = -1;

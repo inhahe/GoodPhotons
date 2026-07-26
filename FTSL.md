@@ -251,6 +251,37 @@ meshes and on native primitives that declare a `uv` wrap, see §9). Constant `pi
 **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
 `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
 
+**Image samples — `tex:<name>(u, v)`:** samples a declared `texture` as a *scalar term
+inside the formula*, so a photograph can be one operand of an expression rather than
+only bound wholesale to a slot:
+
+```
+texture "grime" { file maps/grime.png  encoding linear }
+
+# the photo AND-ed with a procedural ripple — not expressible by binding the image
+pattern "worn" { expr "saturate(tex:grime(u,v) * (0.5 + 0.5*sin(28*u)) * 2)" }
+
+material "wall" { type mix  layer "clean" 0.5  layer "dirty" 0.5  weight_map pattern:worn }
+```
+
+The two arguments are ordinary sub-expressions, so the lookup can be warped
+(`tex:grime(u*2 + 0.1*sin(10*v), v)`). The value is the **mean of the three linear RGB
+channels** at that texel — exactly the sampler a `texture:<name>` scalar-slot binding
+uses (`Texture::scalarAt`) — honouring the texture's own `filter` and `wrap`; prefer
+`encoding linear` when the image is meant as *data* rather than as colour. Any texture
+declared anywhere in the file may be sampled (declaration order does not matter), with
+one exception: a **procedural** `texture { rgb "…" }` is baked while textures are being
+built, so it can only sample images declared *above* it.
+
+Worked example: `scenes/pattern_tex.ftsl` (a photo AND-ed with a sine ripple, a photo
+blended against a world-space band and thresholded, and a warped lookup).
+
+`tex:` is accepted only where a shading context actually exists: `pattern` blocks,
+record scalar-stop and driver expressions, record-override scalar expressions, and
+procedural texture channels. In an isosurface `function { expr }`, a medium
+`density`/`ior` program, or a load-time constant there is no surface to sample, and
+`tex:` is a **compile error** rather than a silent zero.
+
 **POV-Ray internal functions:** the whole classic `functions.inc` isosurface library is
 built in — `f_torus`, `f_heart`, `f_klein_bottle`, `f_superellipsoid`, `f_dupin_cyclid`,
 `f_helix1`, `f_spiral`, `f_boy_surface`, `f_kummer_surface_v1/v2`, … (~73 functions, exact
@@ -596,7 +627,9 @@ and a Lipschitz bound (`max_gradient`, see §10.3).
   when *defining* a surface and read `0`.
 - **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
   `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args). `noise` is
-  deterministic 3-D value noise in `[0,1]` (same on CPU/GPU).
+  deterministic 3-D value noise in `[0,1]` (same on CPU/GPU). The image sample
+  `tex:<name>(u, v)` (§6.1) is **not** available here — a field expression *defines* a
+  surface, so there is no surface to sample yet; using it is a compile error.
 - **Operators:** `+ - * / % ^` and unary `-`. `^` is `pow` (right-assoc), `%` is
   floating-point modulo. There is **no** `mod()` function — use `%`. Unknown
   identifiers are a hard error.

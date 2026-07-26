@@ -6,8 +6,9 @@ inputs* and is *applied* by binding them at the use site (``gold(u=v, a=1)`` /
 positional ``gold(expr)``).  Binding is pure substitution, so a bound material is an
 ordinary material whose fields are concrete formulas — and adding it to a
 :class:`Scene` lowers each field to a renderable companion (colour slot → a
-:class:`ProcTexture` over ``u``/``v``; scalar slot → a
-:class:`~loom.material.FuncPattern` over world ``x``/``y``/``z``), so every emitted
+:class:`ProcTexture` baked over ``u``/``v``; scalar slot → a live
+:class:`~loom.material.FuncPattern` seeing world ``x``/``y``/``z`` *and* ``u``/``v``),
+so every emitted
 ``.ftsl`` is renderable with zero ftrace changes.  Runnable directly or under pytest.
 """
 
@@ -127,14 +128,20 @@ def test_colour_slot_rejects_world_coordinates():
         raise AssertionError("a colour field over x/y/z must be rejected")
 
 
-def test_scalar_slot_rejects_surface_uv():
-    m = Material("bad", "metal", roughness=U)               # u in a scalar pattern
-    try:
-        m.expand("bad")
-    except ValueError as e:
-        assert "world x/y/z" in str(e)
-    else:
-        raise AssertionError("a scalar field over u/v must be rejected")
+def test_scalar_slot_accepts_surface_uv():
+    """A scalar slot is a *live* pattern, so u/v are in scope alongside x/y/z.
+
+    ftrace evaluates a `pattern:` bound to a scalar slot through `patCtxFromHit`
+    (src/scene.h), which fills world position, the field value, the hit normal and
+    the surface u/v — `scenes/uv_native.ftsl` ships `weight_map pattern:uvcheck8`
+    over `floor(u*8)`.  Only a *colour* slot is u/v-restricted, and for the opposite
+    reason: it bakes into an image that is indexed by u/v and nothing else."""
+    m = Material("ok", "metal", roughness=0.5 * U + 0.5 * sin(6.0 * X))
+    comps, resolved = m.expand("ok")
+    assert len(comps) == 1 and isinstance(comps[0], FuncPattern)
+    assert resolved.props["roughness"] == "pattern:ok_roughness"
+    body = _emit(comps[0])
+    assert "u" in body and "sin(" in body
 
 
 def test_scene_expands_bundle_into_companions_before_the_material():

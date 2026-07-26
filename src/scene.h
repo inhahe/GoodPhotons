@@ -1332,9 +1332,28 @@ struct Scene {
     }
 };
 
+// PatOp::Tex sampler: the LINEAR grayscale value of one of the Scene's image
+// textures (Texture::scalarAt — the same sampler roughness / film-thickness maps
+// use, and the exact twin of the device's dTexScalarAt). Installed into a PatCtx by
+// bindPatTex so pattern.h itself never has to know what a Texture is.
+inline double scenePatTexSample(const void* self, int idx, double u, double v) {
+    const Scene& s = *static_cast<const Scene*>(self);
+    if (idx < 0 || idx >= (int)s.textures.size()) return 0.0;
+    return s.textures[idx].scalarAt(u, v);
+}
+inline void bindPatTex(PatCtx& c, const Scene& s) {
+    c.texFn = &scenePatTexSample;
+    c.texSelf = &s;
+}
+
 // Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
-// implicit field value f (0 on non-implicit surfaces), oriented normal, and radius.
-inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v); }
+// implicit field value f (0 on non-implicit surfaces), oriented normal, radius, and
+// the scene's texture table (so `tex:<name>(u,v)` samples inside a pattern work).
+inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
+    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v);
+    bindPatTex(c, scene);
+    return c;
+}
 
 // Reflect-slot reflectance from a bound parametric record, if the material has a
 // REC_SLOT_REFLECT binding. Returns true and sets `out` (constant-stop selector, or
@@ -1352,7 +1371,7 @@ inline bool recordReflectBound(const Scene& scene, const Material& m,
         out = ch.stops[rb->selStop].color(lambda);            // constant stop selector
     } else {
         double d = patternEval(rb->driver.data(), (int)rb->driver.size(),
-                               patCtxFromHit(h));
+                               patCtxFromHit(scene, h));
         out = recReflectanceAt(rec, ch, d, lambda);
     }
     return true;
@@ -1390,7 +1409,7 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
 // value, or `dflt` if `pat` is out of range.
 inline double patternScalarAt(const Scene& scene, int pat, const Hit& h, double dflt) {
     if (pat >= 0 && pat < (int)scene.patterns.size())
-        return scene.patterns[pat].eval(patCtxFromHit(h));
+        return scene.patterns[pat].eval(patCtxFromHit(scene, h));
     return dflt;
 }
 
@@ -1400,7 +1419,7 @@ inline double patternScalarAt(const Scene& scene, int pat, const Hit& h, double 
 // SAME roughness at a hit — otherwise the density and the sample diverge.
 inline double materialRoughness(const Scene& scene, const Material& m, const Hit& h) {
     if (const RecBinding* rb = m.recBindingFor(REC_SLOT_ROUGHNESS)) {
-        PatCtx c = patCtxFromHit(h);
+        PatCtx c = patCtxFromHit(scene, h);
         double r = 0.0;
         if (rb->recordIndex < 0) {
             // direct scalar expression, e.g. `roughness = sin(v*3.14159)`
@@ -1419,7 +1438,7 @@ inline double materialRoughness(const Scene& scene, const Material& m, const Hit
         return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
     }
     if (m.roughnessPat >= 0 && m.roughnessPat < (int)scene.patterns.size()) {
-        double r = scene.patterns[m.roughnessPat].eval(patCtxFromHit(h));
+        double r = scene.patterns[m.roughnessPat].eval(patCtxFromHit(scene, h));
         return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
     }
     if (m.roughnessTex >= 0 && m.roughnessTex < (int)scene.textures.size())
@@ -1433,7 +1452,7 @@ inline double materialRoughness(const Scene& scene, const Material& m, const Hit
 // hit, else the constant thickness. Spatially varies §3.2 iridescence.
 inline double materialFilmThickness(const Scene& scene, const Material& m, const Hit& h) {
     if (m.filmThicknessPat >= 0 && m.filmThicknessPat < (int)scene.patterns.size())
-        return scene.patterns[m.filmThicknessPat].eval(patCtxFromHit(h)) * m.filmThickness;
+        return scene.patterns[m.filmThicknessPat].eval(patCtxFromHit(scene, h)) * m.filmThickness;
     if (m.filmThicknessTex >= 0 && m.filmThicknessTex < (int)scene.textures.size())
         return scene.textures[m.filmThicknessTex].scalarAt(h.u, h.v) * m.filmThickness;
     return m.filmThickness;
@@ -1451,7 +1470,7 @@ inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, 
         (m.mixWeightPat >= 0 || m.mixWeightTex >= 0)) {
         double t;
         if (m.mixWeightPat >= 0 && m.mixWeightPat < (int)scene.patterns.size())
-            t = scene.patterns[m.mixWeightPat].eval(patCtxFromHit(h));
+            t = scene.patterns[m.mixWeightPat].eval(patCtxFromHit(scene, h));
         else
             t = scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
         if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;

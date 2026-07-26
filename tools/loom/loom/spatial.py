@@ -35,6 +35,17 @@ builtin (``src/pattern.h``), so the emitted string always parses; the numpy path
 computes the *same* mathematics (``noise`` is intentionally absent — ftrace's value
 noise has no bit-identical numpy twin, so it would break the "one definition, two
 backends" honesty).
+
+One leaf is not a coordinate but a *photograph*: :class:`Image` samples a decoded
+image file as a scalar **term inside a formula**, so a picture can be multiplied,
+thresholded, warped or blended like any other subexpression rather than only bound
+wholesale to a material slot.  It honours the two-backend rule the same way as the
+rest of the algebra: it emits ftrace's ``tex:<name>(u, v)`` pattern op (``PatOp::Tex``
+in ``src/pattern.h``, with the GPU twin in ``render_cuda.cu``) and its
+:meth:`Image.eval_np` is a faithful port of ``Texture::sampleRgb``/``scalarAt`` —
+same ``-0.5`` texel offset, same ``v``-flip, same repeat/clamp/mirror wrapping, same
+mean-of-RGB reduction.  Its ``u``/``v`` arguments are ordinary sub-expressions, so
+the coordinates can themselves be warped or rebound.
 """
 
 from __future__ import annotations
@@ -96,6 +107,24 @@ class SpatialExpr:
     # ---- named-input inspection / binding (J3b materials-as-bundles) -------
     def _input_name(self):
         return None  # a Surface leaf returns its binding name
+
+    def _image_texture(self):
+        return None  # an Image leaf returns the loom Texture it needs declared
+
+    def image_textures(self) -> List:
+        """The :class:`loom.scene.Texture` declarations required by the
+        :class:`Image` leaves in this tree, deduped by name and in encounter order.
+
+        :meth:`loom.Scene.add` collects these automatically, so an ``Image`` term
+        drops into a field without the author having to declare the texture
+        separately — but the list is public so a hand-rolled emit path can too."""
+        out, seen = [], set()
+        for n in self._walk():
+            t = n._image_texture()
+            if t is not None and t.name not in seen:
+                seen.add(t.name)
+                out.append(t)
+        return out
 
     def free_inputs(self, include_coords: bool = False) -> "frozenset[str]":
         """The set of named input leaves present in the tree.
@@ -242,6 +271,142 @@ class Surface(SpatialExpr):
         if self.name in mapping:
             return _coerce(mapping[self.name])
         return self
+
+
+class Image(SpatialExpr):
+    """An **image sampled as a term inside a formula** (J3b item 3b).
+
+    ``Image("bark.png")`` is a scalar leaf whose value at a surface point is the
+    image's grayscale level there, so a photo can be *multiplied into* a procedural
+    field rather than pasted over it::
+
+        grime = Image("grime.png")
+        rough = 0.05 + 0.9 * grime * (0.5 + 0.5 * sin(30 * X))
+
+    This is the complement of :func:`loom.scene.skin` — that binds a whole image to
+    a material slot; this makes the image one operand of an expression.
+
+    The coordinates default to the surface params :data:`U`/:data:`V` but are
+    ordinary :class:`SpatialExpr`\\s, so the image can be warped
+    (``Image("p.png", u=U * 2 + 0.1 * sin(10 * V))``) and stays rebindable — a
+    :meth:`SpatialExpr.substitute` reaches inside them, which is how a material
+    bundle's ``u=``/``v=`` binding flows into an image term.
+
+    **Both backends.**  :meth:`emit` writes ftrace's ``tex:<name>(u, v)`` pattern-VM
+    call (``PatOp::Tex``) and the required ``texture`` declaration is collected by
+    :meth:`SpatialExpr.image_textures` — :meth:`loom.Scene.add` picks it up, so the
+    author never declares it.  :meth:`eval_np` is an exact port of ftrace's
+    ``Texture::sampleRgb`` / ``scalarAt`` (same v-flip, same wrap, same bilerp, same
+    channel mean), so the 2-D raster path agrees with the render wherever the
+    coordinates are computable there — i.e. whenever ``u``/``v`` are expressed in
+    :data:`X`/:data:`Y`/:data:`Z`; bare :data:`U`/:data:`V` stay emit-only, as they
+    are everywhere else.
+
+    ``encoding`` defaults to ``"linear"`` (not ``"srgb"``, the default for a
+    :class:`~loom.scene.Texture` *skin*) because a value used as a NUMBER wants the
+    stored levels, not a de-gamma'd colour — the same advice ftrace gives for its
+    scalar maps.
+    """
+
+    _cache: dict = {}          # path -> decoded float32 HxWx3 in [0,1] (LINEAR)
+
+    def __init__(self, path, *, u=None, v=None, name: str = None,
+                 encoding: str = "linear", filter: str = "bilinear",
+                 wrap: str = "repeat") -> None:
+        self.path = str(path).replace("\\", "/")
+        self.u = _coerce(U if u is None else u)
+        self.v = _coerce(V if v is None else v)
+        if encoding not in ("srgb", "linear"):
+            raise ValueError('image encoding must be "srgb" or "linear"')
+        if filter not in ("bilinear", "nearest"):
+            raise ValueError('image filter must be "bilinear" or "nearest"')
+        if wrap not in ("repeat", "clamp", "mirror"):
+            raise ValueError('image wrap must be "repeat", "clamp" or "mirror"')
+        self.encoding = encoding
+        self.filter = filter
+        self.wrap = wrap
+        self.name = name if name is not None else self._auto_name()
+
+    # ---- texture declaration ---------------------------------------------
+    def _auto_name(self) -> str:
+        """A deterministic ftsl identifier for this image+sampler settings.
+
+        Two ``Image`` leaves over the same file with the same sampler settings get
+        the SAME name, so they share one ``texture`` block; differing settings get
+        different names, so they don't silently collide."""
+        import hashlib, re, os
+        stem = re.sub(r"[^A-Za-z0-9_]", "_", os.path.splitext(os.path.basename(self.path))[0])
+        key = f"{self.path}|{self.encoding}|{self.filter}|{self.wrap}"
+        return f"img_{stem}_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:8]}"
+
+    def _image_texture(self):
+        from .scene import Texture   # lazy: scene.py is the higher layer
+        return Texture(self.name, self.path, encoding=self.encoding,
+                       filter=self.filter, wrap=self.wrap)
+
+    # ---- tree ------------------------------------------------------------
+    def children(self):
+        return (self.u, self.v)
+
+    def _rebuild(self, new_children):
+        return Image(self.path, u=new_children[0], v=new_children[1],
+                     name=self.name, encoding=self.encoding,
+                     filter=self.filter, wrap=self.wrap)
+
+    # ---- emit ------------------------------------------------------------
+    def emit(self, coords, ctx) -> str:
+        return f"tex:{self.name}({self.u.emit(coords, ctx)},{self.v.emit(coords, ctx)})"
+
+    # ---- numpy twin (exact port of Texture::sampleRgb + scalarAt) --------
+    @classmethod
+    def _load(cls, path: str, encoding: str):
+        key = (path, encoding)
+        hit = cls._cache.get(key)
+        if hit is not None:
+            return hit
+        from PIL import Image as _PILImage
+        with _PILImage.open(path) as im:
+            a = _np.asarray(im.convert("RGB"), dtype=_np.float32) / 255.0
+        if encoding == "srgb":       # sRGB EOTF, matching ftrace's texture decode
+            a = _np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4)
+        cls._cache[key] = a
+        return a
+
+    def _wrap_index(self, i, n):
+        if self.wrap == "clamp":
+            return _np.clip(i, 0, n - 1)
+        if self.wrap == "mirror":
+            period = 2 * n
+            m = _np.mod(i, period)
+            return _np.where(m < n, m, period - 1 - m)
+        return _np.mod(i, n)         # repeat
+
+    def eval_np(self, coords, clock, cache):
+        if _np is None:              # pragma: no cover
+            raise ImportError("Image.eval_np needs numpy")
+        u = _np.asarray(self.u.eval_np(coords, clock, cache), dtype=_np.float64)
+        v = _np.asarray(self.v.eval_np(coords, clock, cache), dtype=_np.float64)
+        img = self._load(self.path, self.encoding)
+        h, w = img.shape[0], img.shape[1]
+        if self.filter == "nearest":
+            x = self._wrap_index(_np.floor(u * w).astype(_np.int64), w)
+            y = self._wrap_index(_np.floor((1.0 - v) * h).astype(_np.int64), h)
+            c = img[y, x]
+        else:
+            tu = u * w - 0.5
+            tv = (1.0 - v) * h - 0.5      # ftrace flips v (OBJ convention)
+            flx = _np.floor(tu)
+            fly = _np.floor(tv)
+            fx = (tu - flx)[..., None]
+            fy = (tv - fly)[..., None]
+            x0 = self._wrap_index(flx.astype(_np.int64), w)
+            x1 = self._wrap_index(flx.astype(_np.int64) + 1, w)
+            y0 = self._wrap_index(fly.astype(_np.int64), h)
+            y1 = self._wrap_index(fly.astype(_np.int64) + 1, h)
+            a = img[y0, x0] * (1 - fx) + img[y0, x1] * fx
+            b = img[y1, x0] * (1 - fx) + img[y1, x1] * fx
+            c = a * (1 - fy) + b * fy
+        return c.mean(axis=-1)            # Texture::scalarAt = mean of linear rgb
 
 
 class _Time(SpatialExpr):

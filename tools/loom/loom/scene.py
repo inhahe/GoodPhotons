@@ -142,6 +142,30 @@ class Texture(Element):
 _COLOR_SLOTS = ("reflect", "transmit", "emit", "emission", "color", "tint")
 
 
+def _spatial_fields(el):
+    """Every :class:`~loom.spatial.SpatialExpr` reachable from an element's own
+    attributes (one container level deep).
+
+    Deliberately duck-typed rather than a per-class hook: a spatial field can sit on
+    a :class:`~loom.material.FuncPattern`'s ``template``, on a :class:`ProcTexture`'s
+    ``r``/``g``/``b``, in a :class:`Material`'s ``props`` dict, or on an
+    ``Isosurface``'s template — one scan covers all of them and any future holder."""
+    from .spatial import SpatialExpr
+    out = []
+    for v in vars(el).values():
+        if isinstance(v, SpatialExpr):
+            out.append(v)
+        elif isinstance(v, (list, tuple)):
+            out.extend(c for c in v if isinstance(c, SpatialExpr))
+        elif isinstance(v, dict):
+            for c in v.values():
+                if isinstance(c, SpatialExpr):
+                    out.append(c)
+                elif isinstance(c, (list, tuple)):
+                    out.extend(g for g in c if isinstance(g, SpatialExpr))
+    return out
+
+
 def _field_exprs(v):
     """If ``v`` is a scalar :class:`~loom.spatial.SpatialExpr` field or a tuple of
     them (mixing plain numbers), return the list of components (numbers coerced);
@@ -167,8 +191,9 @@ class Material(Element):
     result is an ordinary material whose fields are concrete formulas in real ftrace
     variables — never literal bundle syntax.  A field property lowers to a renderable
     companion element when the material is added to a :class:`Scene` (:meth:`expand`):
-    a colour slot → a :class:`ProcTexture` over ``u``/``v``; a scalar slot → a
-    :class:`~loom.material.FuncPattern` over world ``x``/``y``/``z``.  The albedo
+    a colour slot → a :class:`ProcTexture` baked over ``u``/``v``; a scalar slot → a
+    live :class:`~loom.material.FuncPattern` evaluated per hit (world ``x``/``y``/``z``,
+    the field value, the hit normal and ``u``/``v`` are all in scope).  The albedo
     input :data:`A`, left unbound, resolves to the material's ``albedo_default``."""
 
     def __init__(self, name: str, mtype: str = "diffuse", *,
@@ -246,9 +271,11 @@ class Material(Element):
         ``(companions, resolved_material)`` where the material's field slots now
         reference the companions (``reflect texture:<p>_reflect`` /
         ``roughness pattern:<p>_roughness``).  Colour slots bake over surface
-        ``u``/``v`` (a :class:`ProcTexture`); scalar slots evaluate world ``x/y/z``
-        (a :class:`~loom.material.FuncPattern`).  A field that mixes the wrong
-        coordinate family for its slot raises."""
+        ``u``/``v`` (a :class:`ProcTexture`) and may therefore use *only* ``u``/``v``
+        — anything else raises.  Scalar slots stay live (a
+        :class:`~loom.material.FuncPattern`) and are evaluated per hit, so they may
+        use world ``x/y/z``, the field value, the hit normal and ``u``/``v`` in any
+        combination."""
         from .material import FuncPattern
         comps: List[Element] = []
         new_props = {}
@@ -272,13 +299,16 @@ class Material(Element):
                 comps.append(ProcTexture(texname, exprs[0], exprs[1], exprs[2]))
                 new_props[k] = f"texture:{texname}"
             else:
+                # No coordinate restriction here, deliberately.  A scalar slot lowers
+                # to a *live* pattern, and ftrace evaluates it through
+                # `patCtxFromHit` (src/scene.h), which fills x/y/z, the field value,
+                # the hit normal AND surface u/v — so a scalar field may draw on any
+                # of them, and mix them freely.  (`scenes/uv_native.ftsl` ships
+                # exactly that: `weight_map pattern:uvcheck8` over floor(u*8).)  The
+                # asymmetry with a colour slot is real but runs the other way: a
+                # colour skin is *baked* into an image indexed by u/v, so u/v is all
+                # it can ever see.
                 e = exprs[0]
-                bad = {"u", "v"} & e.free_inputs()
-                if bad:
-                    raise ValueError(
-                        f"material '{self.name}' scalar slot '{k}' field uses "
-                        f"{sorted(bad)}; a scalar pattern sees world x/y/z (and the "
-                        f"hit normal), not surface u/v")
                 patname = f"{prefix}_{k}"
                 comps.append(FuncPattern(patname, e))
                 new_props[k] = f"pattern:{patname}"
@@ -1003,9 +1033,39 @@ class Scene:
         self.elements: List[Element] = []
         self.lights: List[Light] = []
 
+    def _add_image_textures(self, e: Element) -> None:
+        """Declare the ``texture`` blocks any :class:`~loom.spatial.Image` term
+        inside ``e`` needs.
+
+        An ``Image`` leaf emits ftrace's ``tex:<name>(u, v)`` pattern-VM call, which
+        only resolves if a texture of that name is declared — so collecting the
+        companion declaration has to be automatic, or every image *term* would emit
+        a dangling reference and fail to load.  The scan is duck-typed over the
+        element's attributes (a spatial field may live on ``template``, on an
+        ``r``/``g``/``b`` channel, or inside ``props``) and names are deduped, so
+        several fields sampling the same file share one block.
+
+        Each block is tagged ``_auto_image`` so that an *explicit* declaration of the
+        same name added later replaces it rather than emitting a second block with a
+        duplicate name (see :meth:`add`) — the author's own ``Texture`` always wins."""
+        have = {getattr(t, "name", None) for t in self.textures}
+        for src in _spatial_fields(e):
+            for tex in src.image_textures():
+                if tex.name not in have:
+                    have.add(tex.name)
+                    tex._auto_image = True
+                    self.textures.append(tex)
+
     def add(self, *elems: Element) -> "Scene":
         from .record import Record as _Record  # lazy: record.py imports scene.Element
         for e in elems:
+            self._add_image_textures(e)
+            if isinstance(e, (Texture, ProcTexture)):
+                # An explicit declaration supersedes one auto-collected from an
+                # Image term, whichever order they were added in.
+                self.textures = [t for t in self.textures
+                                 if not (getattr(t, "_auto_image", False)
+                                         and getattr(t, "name", None) == e.name)]
             # Textures/patterns/records are emitted before the materials that bind
             # them (ftrace resolves them in an earlier pass, but keep the text tidy).
             if isinstance(e, (Texture, ProcTexture)):

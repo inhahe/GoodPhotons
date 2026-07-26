@@ -1160,7 +1160,8 @@ __device__ static Real medAlbedo(const DMedium& m, Real lambda) {
 __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
-                                      double u, double v);
+                                      double u, double v,
+                                      const DTexture* tex, int nTex);
 __device__ static double dFieldEval(const DFieldNode* nodes, int n,
                                     double pwx, double pwy, double pwz,
                                     const PatNode* exprPool);
@@ -1245,7 +1246,7 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, nullptr, 0);
     return d > 0.0 ? d : 0.0;
 }
 
@@ -1347,7 +1348,7 @@ __device__ static double dMedNAt(const DMedium& m, const DVec3& p) {
     if (m.iorN <= 0 || !m.ior) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double n = dPatternEval(m.ior, m.iorN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, nullptr, 0);
     return n > 1e-3 ? n : 1e-3;
 }
 
@@ -1600,7 +1601,8 @@ __device__ static inline float dSmaxF(float a, float b, float k) { return -dSmin
 __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
-                                      double u, double v);
+                                      double u, double v,
+                                      const DTexture* tex, int nTex);
 __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float x, float y, float z, float f,
                                       float nx, float ny, float nz, float r,
@@ -1615,7 +1617,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
             if (!exprPool) return BIG;
             double r = sqrt(px*px + py*py + pz*pz);
             return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r, 0.0, 0.0);
+                                0.0, 0.0, 0.0, r, 0.0, 0.0, nullptr, 0);
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -3529,10 +3531,14 @@ __device__ static double dPatValueNoise(double x, double y, double z) {
 }
 // Postfix scalar-stack evaluator (exact port of patternEval). PatNode/PatOp are the
 // POD host types (pattern.h), uploaded verbatim; variables come in as scalar args.
+// `tex`/`nTex` back PatOp::Tex samples (the scene's texture table); pass nullptr/0
+// where textures are out of scope (field formulas, medium density/ior) — the host
+// compiler rejects `tex:` at those sites, so such a node can never actually appear.
 __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
-                                      double u, double v) {
+                                      double u, double v,
+                                      const DTexture* tex, int nTex) {
     double st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const PatNode& nd = nodes[i];
@@ -3587,6 +3593,12 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                 double args[POV_FN_MAX_ARGS];
                 for (int k = na - 1; k >= 0; --k) args[k] = st[--sp];
                 st[sp++] = povFnEval(id, args);
+                break;
+            }
+            case PatOp::Tex: {
+                double vv = st[--sp];                       // args pushed as (u, v)
+                int    ti = (int)nd.a;
+                st[sp-1] = (tex && ti >= 0 && ti < nTex) ? dTexScalarAt(tex[ti], st[sp-1], vv) : 0.0;
                 break;
             }
         }
@@ -3685,6 +3697,11 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                 st[sp++] = (float)povFnEval(id, args);
                 break;
             }
+            case PatOp::Tex: {   // unreachable: this VM only runs DF_EXPR field formulas,
+                --sp;            // and the host compiler rejects `tex:` outside a shading
+                st[sp-1] = 0.0f; // context. Handled explicitly so the switch stays total.
+                break;
+            }
         }
     }
     return sp > 0 ? st[0] : 0.0f;
@@ -3697,7 +3714,7 @@ __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit&
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, sc.textures, sc.nTex);
 }
 
 // Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
@@ -3717,7 +3734,7 @@ __device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, 
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, sc.textures, sc.nTex);
 }
 // Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
 // evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
@@ -3764,13 +3781,15 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
     if (m.recRoughMode == 0) {                             // direct scalar expression
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
+                         sc.textures, sc.nTex);
     } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
         v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
     } else {                                               // per-hit driven
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
+                                sc.textures, sc.nTex);
         v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
                              m.recRoughInterp, h, d);
     }
@@ -3847,7 +3866,8 @@ __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
-                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
+                            sc.textures, sc.nTex);
     out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
                      (double)m.recReflLo, (double)m.recReflHi, d, lambda);
     return true;

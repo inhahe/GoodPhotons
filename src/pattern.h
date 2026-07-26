@@ -51,12 +51,21 @@ enum class PatOp : int {
     // the POV internal id (0..75); the evaluator pops povFnArity(id) args (the
     // first three are the coordinates) and pushes the returned scalar.
     PovFn,
+    // texture sample: pops (u, v) and pushes the LINEAR grayscale value of a named
+    // image texture there (Texture::scalarAt — the same sampler roughness/film maps
+    // use). The node's `a` holds the Scene::textures index, resolved at compile time
+    // from the authored `tex:<name>(u, v)` call. This is what makes an image usable
+    // as a TERM INSIDE a formula ("procedural * photo"), as opposed to binding a
+    // whole image to a slot. Sampling needs a texture table, which only exists in a
+    // scene-shading context, so the compiler only accepts `tex:` where one is in
+    // scope (see PatTexScope).
+    Tex,
 };
 
 // One postfix node. POD (no std:: members) so it uploads to the GPU verbatim.
 struct PatNode {
     PatOp  op = PatOp::Const;
-    double a  = 0.0;   // literal for Const (unused otherwise)
+    double a  = 0.0;   // literal for Const; POV internal id for PovFn; texture index for Tex
 };
 
 // Per-hit evaluation context (the pattern variables).
@@ -67,6 +76,26 @@ struct PatCtx {
     double r = 0;                 // radius |p|
     double u = 0, v = 0;          // surface UV (mesh interpolated or native-primitive wrap)
     double t = 0;                 // flyby timeline in [0,1] (camera_curve record tracks only)
+    // PatOp::Tex sampler hook. pattern.h deliberately knows nothing about Texture
+    // (texture.h drags in the spectral/upsampling machinery and is not something we
+    // want every TU — least of all nvcc — to parse), so a sample goes through an
+    // opaque callback installed by whoever owns the Scene: scene.h's bindPatTex.
+    // Null => Tex reads 0; that can only happen at a site where the compiler already
+    // refused to accept `tex:` in the first place.
+    double (*texFn)(const void* self, int idx, double u, double v) = nullptr;
+    const void* texSelf = nullptr;
+};
+
+// Compile-time texture-name resolution for `tex:<name>(u, v)`. A value site passes
+// one of these to compilePatternExpr exactly when a texture table will be in scope
+// at evaluation time; passing nothing (the default) makes `tex:` a scope ERROR
+// rather than a silent zero — so an implicit field formula, a medium density/ior
+// program or a load-time constant site can never smuggle in a sample it could not
+// actually perform. Kept as self+thunk (not std::function) to keep this header light.
+struct PatTexScope {
+    const void* self = nullptr;
+    int (*lookup)(const void* self, const char* name) = nullptr;   // -> index, or -1
+    int resolve(const char* n) const { return lookup ? lookup(self, n) : -1; }
 };
 
 inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, double v = 0) {
@@ -172,6 +201,11 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 st[sp++] = povFnEval(id, args);
                 break;
             }
+            case PatOp::Tex: {
+                double vv = st[--sp];                       // args pushed as (u, v)
+                st[sp-1] = c.texFn ? c.texFn(c.texSelf, (int)nd.a, st[sp-1], vv) : 0.0;
+                break;
+            }
         }
     }
     return sp > 0 ? st[0] : 0.0;
@@ -187,7 +221,9 @@ struct Pattern {
 // (B) Expression compiler: infix math -> postfix, over the pattern variables.
 // Supports: literals, constant `pi`; variables x y z f nx ny nz r u v; unary + -;
 // binary + - * / % ^ (^ = pow, right-assoc); functions abs sqrt sin cos tan exp
-// log floor fract sign saturate min max pow atan2 step clamp mix smoothstep noise.
+// log floor fract sign saturate min max pow atan2 step clamp mix smoothstep noise;
+// and `tex:<name>(u, v)` — the grayscale sample of a named image texture, so a photo
+// can be a TERM inside a formula (`0.3 + 0.7*tex:grime(u,v)*sin(20*x)`).
 // Returns false + fills `err` on a parse error. Shunting-yard with an operator and
 // an output (postfix) queue; function arity is checked at the closing paren.
 // ---------------------------------------------------------------------------
@@ -199,6 +235,7 @@ struct Tok {
     PatOp  var = PatOp::VarX;   // for Var
     std::string name;          // for Func
     char op = 0;               // for Op ('+','-','*','/','%','^','u' unary minus)
+    int   texId = -1;          // for a `tex:<name>` Func: the resolved texture index
 };
 
 inline bool isIdentStart(char c) { return std::isalpha((unsigned char)c) || c == '_'; }
@@ -222,8 +259,16 @@ inline bool varOp(const std::string& s, PatOp& out) {
 // Function name -> (opcode, arity[, povId]). Returns false if not a known function.
 // For exact POV-Ray internal functions (f_torus, f_heart, ...) out=PatOp::PovFn and
 // povId is the POV internal id; for built-ins povId is left as -1.
+inline bool texFuncName(const std::string& s) {
+    return s.size() > 4 && s.compare(0, 4, "tex:") == 0;
+}
+
 inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
     povId = -1;
+    // `tex:<name>(u, v)` — sample a named image texture. The name is part of the
+    // token (the tokenizer scans `tex:foo` as one identifier), so arity is fixed at
+    // 2 and the index is resolved separately against the call site's PatTexScope.
+    if (texFuncName(s)) { out = PatOp::Tex; arity = 2; return true; }
     struct F { const char* n; PatOp op; int ar; };
     static const F fs[] = {
         {"abs",PatOp::Abs,1},{"sqrt",PatOp::Sqrt,1},{"sin",PatOp::Sin,1},
@@ -263,7 +308,8 @@ inline PatOp binOp(char c) {
     }
 }
 
-inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& err, bool allowT = false) {
+inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& err,
+                     bool allowT = false, const PatTexScope* tex = nullptr) {
     size_t i = 0, n = s.size();
     bool prevValue = false;   // was the previous token a value/RParen (for unary minus)
     while (i < n) {
@@ -282,15 +328,42 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
             size_t j = i;
             while (j < n && isIdentCh(s[j])) ++j;
             std::string id = s.substr(i, j - i);
+            // A texture reference `tex:<name>` scans as ONE identifier, so a sample
+            // reads as a plain two-argument call `tex:<name>(u, v)` and reuses the
+            // very same `tex:` spelling that material slots already use for images.
+            if (id == "tex" && j < n && s[j] == ':') {
+                size_t e = j + 1;
+                while (e < n && isIdentCh(s[e])) ++e;
+                id = s.substr(i, e - i);
+                j = e;
+            }
             i = j;
             // skip spaces to see if a '(' follows -> function call
             size_t k = i; while (k < n && std::isspace((unsigned char)s[k])) ++k;
             bool isCall = (k < n && s[k] == '(');
             PatOp vop; PatOp fop; int ar;
             if (isCall && funcOp(id, fop, ar)) {
-                Tok t; t.kind = Tok::Func; t.name = id; out.push_back(t);
+                Tok t; t.kind = Tok::Func; t.name = id;
+                if (fop == PatOp::Tex) {
+                    std::string nm = id.substr(4);
+                    if (!tex) {
+                        err = "texture sample '" + id + "' is out of scope here — a texture can only "
+                              "be sampled where a scene texture table exists (material / pattern / "
+                              "record expressions), not in an implicit field formula, a medium "
+                              "density/ior program, or a load-time constant site";
+                        return false;
+                    }
+                    t.texId = tex->resolve(nm.c_str());
+                    if (t.texId < 0) { err = "unknown texture '" + nm + "' in " + id + "(u, v)"; return false; }
+                }
+                out.push_back(t);
                 prevValue = false; continue;
             }
+            if (texFuncName(id)) {
+                err = "texture sample '" + id + "' must be called with coordinates, e.g. " + id + "(u, v)";
+                return false;
+            }
+            if (id == "tex") { err = "texture sample needs a name: tex:<texture>(u, v)"; return false; }
             if (id == "pi") {
                 Tok t; t.kind = Tok::Num; t.num = 3.14159265358979323846;
                 out.push_back(t); prevValue = true; continue;
@@ -329,10 +402,14 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
 // `allowT` publishes the flyby-timeline variable `t` as in-scope (camera_curve record
 // tracks only). Default false: every other call site keeps `t` an out-of-scope error,
 // so a surface/constant driver can never silently read the timeline.
-inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& out, std::string& err, bool allowT = false) {
+// `tex` publishes the scene's named image textures for `tex:<name>(u, v)` samples;
+// null (the default) makes any such sample a scope error — see PatTexScope.
+inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& out,
+                               std::string& err, bool allowT = false,
+                               const PatTexScope* tex = nullptr) {
     using namespace pattern_detail;
     std::vector<Tok> toks;
-    if (!tokenize(expr, toks, err, allowT)) return false;
+    if (!tokenize(expr, toks, err, allowT, tex)) return false;
 
     std::vector<PatNode> queue;             // output (postfix)
     std::vector<Tok>     ops;               // operator stack (Op / Func / LParen)
@@ -345,7 +422,10 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
             else             { PatNode nd; nd.op = binOp(t.op); queue.push_back(nd); }
         } else if (t.kind == Tok::Func) {
             PatOp op; int ar; int povId; funcOp(t.name, op, ar, povId);
-            PatNode nd; nd.op = op; if (op == PatOp::PovFn) nd.a = (double)povId; queue.push_back(nd);
+            PatNode nd; nd.op = op;
+            if      (op == PatOp::PovFn) nd.a = (double)povId;
+            else if (op == PatOp::Tex)   nd.a = (double)t.texId;   // resolved at tokenize
+            queue.push_back(nd);
         }
     };
 
@@ -408,13 +488,15 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
     return true;
 }
 
-// True if a compiled pattern program references any per-hit surface intrinsic
-// (x y z f nx ny nz r u v). Used by value sites that must be load-time constant
-// (records stage 5a scope check): a constant site has no per-hit context, so it
-// admits only var-free (constant) drivers — a `R.chan(u)` there is a scope error.
+// True if a compiled pattern program needs a per-hit shading context — either a
+// surface intrinsic (x y z f nx ny nz r u v) or a texture sample (which needs the
+// scene's texture table, present only while shading). Used by value sites that must
+// be load-time constant (records stage 5a scope check): a constant site has no such
+// context, so it admits only var-free drivers — `R.chan(u)` or a `tex:` sample there
+// is a scope error rather than a silent zero.
 inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
     for (const PatNode& nd : prog)
-        if (nd.op >= PatOp::VarX && nd.op <= PatOp::VarV) return true;
+        if ((nd.op >= PatOp::VarX && nd.op <= PatOp::VarV) || nd.op == PatOp::Tex) return true;
     return false;
 }
 

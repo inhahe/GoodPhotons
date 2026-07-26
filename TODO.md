@@ -1778,9 +1778,42 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          `A`→`albedo_default`; `Scene.add` **expands** each field into a renderable companion (colour slot →
          `ProcTexture` over `u/v`; scalar slot → `FuncPattern` over `x/y/z`), with coordinate-family validation.
          Validated: a bundle scene emits `.ftsl` ftrace parses & renders identically to the hand-authored
-         `func_skin` path. Tests: `test_spatial.py` (+9), `test_material_bundle.py` (14). **Remaining:** part (b)
-         `Image("path")` leaf (image-as-a-function-term) + item 4 (N-D input domain).
-         **PART (b) IS NOT ZERO-COST — needs an ftrace pattern-VM texture-sample op (2026-07-26 scoping).** Unlike
+         `func_skin` path. Tests: `test_spatial.py` (+9), `test_material_bundle.py` (14). **Remaining:** item 4
+         (N-D input domain).
+         **DONE — part (b) 2026-07-26 (v0.57.0).** The scoping below was right that it needed a renderer change, so
+         the op was built first and the loom leaf second. **ftrace:** new `PatOp::Tex`, appended at the END of the
+         enum so `patternHasFreeVars`'s `VarX..VarV` range is unperturbed, spelled **`tex:<name>(u, v)`** — the
+         tokenizer scans `tex:foo` as one identifier and `funcOp` reports arity 2. The texture index rides in the
+         existing `PatNode::a` double (the same trick `PatOp::PovFn` uses for its internal id), so the struct layout
+         and the verbatim device upload are unchanged. `pattern.h` stays free of `texture.h` (which drags
+         `upsample.h`/`spectrum.h`/`color.h` into every TU, nvcc's included): sampling goes through an opaque
+         `PatCtx::texFn`/`texSelf` hook installed by `scene.h`'s `bindPatTex`, and `patCtxFromHit` now takes the
+         `Scene`. Compile-time name resolution is **opt-in per value site** via a new `PatTexScope`, handed to
+         `compilePatternExpr` only where a shading context exists (pattern blocks, record scalar stops / drivers /
+         overrides, procedural texture channels) — so `tex:` in an isosurface `function { expr }`, a medium
+         `density`/`ior` program or a load-time constant is a **specific compile error, never a silent 0.0**
+         (9 error paths verified). GPU twin in `dPatternEval` over the existing `dTexScalarAt`, with the two new
+         params threaded through all 8 call sites (no default args — it's forward-declared twice). Ordering: Pass 1b
+         builds textures before patterns/records/materials, so file order is irrelevant for those; the one rule is
+         that a *procedural* `texture { rgb "…" }` bakes during 1b and can only sample images declared above it.
+         **loom:** `Image(path, u=…, v=…, encoding=…, filter=…, wrap=…)` in `spatial.py` — coordinates are ordinary
+         sub-expressions (warpable, and `substitute` reaches into them so a bundle's `u=`/`v=` binding flows in);
+         `_auto_name()` gives a deterministic `img_<stem>_<hash8>` over path+sampler so identical images share one
+         declaration and different samplers don't collide; `SpatialExpr.image_textures()` + `Scene._add_image_textures`
+         auto-declare the companion `texture` block (an explicit one of the same name wins in either order), without
+         which every image term would emit a dangling reference; `eval_np` is a faithful port of
+         `Texture::sampleRgb`/`scalarAt` (half-texel offset, v-flip, repeat/clamp/mirror, mean-of-linear-RGB).
+         `encoding` defaults to `linear` — a value used as a NUMBER wants the stored levels.
+         **Also fixed en route:** `Material.expand`'s scalar-slot guard rejected `{u,v}`, which was simply wrong
+         about ftrace — a scalar slot is a *live* pattern evaluated through `patCtxFromHit`, which supplies u/v
+         (`scenes/uv_native.ftsl` ships `weight_map pattern:uvcheck8` over `floor(u*8)`). Only the *colour* slot is
+         coordinate-restricted, and for the opposite reason (it bakes into a u/v-indexed image).
+         **Validated:** the loom-emitted `.ftsl` renders **bit-for-bit identical** to hand-authored
+         `scraps/texop_pattern.ftsl`, which in turn is bit-for-bit identical to the shipped `texture:<name>` slot
+         binding on both CPU and GPU; the composed case (`scraps/loom_image_mixed.ftsl` / `texop_mixed.ftsl`) matches
+         CPU↔GPU to MC noise. Tests: `tools/loom/tests/test_image_term.py` (25), suite 1046 → 1071.
+         Docs: README.md, FTSL.md §6.1 + isosurface section, loom DESIGN.md/README.md.
+         **[superseded scoping, kept for the record] PART (b) IS NOT ZERO-COST — needs an ftrace pattern-VM texture-sample op (2026-07-26).** Unlike
          a/c/d, an `Image` leaf sampled *inside* a pattern/isosurface expression has **no** shipped ftrace target:
          `src/pattern.h` `funcOp` has no texture/image builtin (only abs/sqrt/sin/…/noise), so emitting a `tex(...)`
          call would be un-renderable — violating the "renderable at every commit" rule. The proper fix is a new

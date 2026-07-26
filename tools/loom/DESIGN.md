@@ -736,14 +736,50 @@ tools/loom/
     `Scene` **expands** each field to a renderable companion (`Material.expand`): a colour
     slot (`reflect`/`transmit`/`emit`/…) → a `ProcTexture` baked over surface `u`/`v` (now
     accepts `SpatialExpr` channels, re-baked per frame with time coefficients folded in, its
-    `roots()` surfacing them for cycle-check); a scalar slot → a `FuncPattern` over world
-    `x`/`y`/`z`. A field mixing the wrong coordinate family for its slot (world `x/y/z` in a
-    `u/v` colour skin, or `u/v` in a world-space scalar pattern) raises — the two families are
-    ftrace's real backends, not an approximation. Validated: a bundle scene emits byte-for-byte
-    renderable `.ftsl` that ftrace parses & renders identically to the hand-authored
-    `func_skin` path. Tests: `tests/test_material_bundle.py` (free-inputs union, keyword/
-    positional/partial application, arbitrary-expr RHS, colour→ProcTexture / scalar→FuncPattern
-    lowering, coordinate-family rejection, Scene expansion ordering, animated re-bake, roots).
+    `roots()` surfacing them for cycle-check); a scalar slot → a live `FuncPattern`. The two
+    slot kinds have genuinely different coordinate reach, and only the colour one is
+    restricted: a colour skin *bakes* into an image indexed by `u`/`v`, so world `x/y/z` in a
+    colour field raises. A scalar slot stays live and ftrace evaluates it via `patCtxFromHit`
+    (`src/scene.h`), which supplies world position, the field value, the hit normal **and**
+    surface `u`/`v` — so a scalar field may mix all of them (`scenes/uv_native.ftsl` ships
+    `weight_map pattern:uvcheck8` over `floor(u*8)`). Validated: a bundle scene emits
+    byte-for-byte renderable `.ftsl` that ftrace parses & renders identically to the
+    hand-authored `func_skin` path. Tests: `tests/test_material_bundle.py` (free-inputs union,
+    keyword/positional/partial application, arbitrary-expr RHS, colour→ProcTexture /
+    scalar→FuncPattern lowering, colour-slot world-coordinate rejection, scalar-slot u/v
+    acceptance, Scene expansion ordering, animated re-bake, roots).
+  - **J3b item 3(b) — `Image`, a photograph as a TERM in a formula.** ✅ (`spatial.py`
+    + `scene.py`, and a new ftrace opcode). The complement of `skin()`: `skin()` binds a
+    whole image to a material slot, whereas `Image("bark.png")` is a scalar *leaf* that
+    composes — `0.05 + 0.9 * Image("grime.png") * (0.5 + 0.5*sin(30*X))`. This is the one
+    part of item 3 that was **not** zero-cost on the renderer: no pattern-VM op could
+    sample a texture, so emitting one would have produced un-renderable `.ftsl`. Added
+    `PatOp::Tex` (`src/pattern.h`), spelled `tex:<name>(u, v)`, with the texture index
+    carried in the existing `PatNode::a` double (the trick `PatOp::PovFn` already uses),
+    so `PatNode` still uploads to the device verbatim. `pattern.h` stays free of
+    `texture.h` — sampling goes through an opaque `PatCtx::texFn` hook that `scene.h`
+    installs (`bindPatTex`). Compile-time resolution is opt-in per value site via a
+    `PatTexScope`, granted only where a shading context exists (pattern blocks, record
+    stops/drivers/overrides, procedural texture channels), so `tex:` in a field formula
+    or medium program is a **clear compile error, never a silent zero**. GPU twin in
+    `dPatternEval` (`render_cuda.cu`) over the existing `dTexScalarAt`.
+    On the loom side: `Image`'s `u`/`v` are ordinary sub-expressions (so the lookup is
+    warpable and `substitute` reaches into it, which is how a bundle's `u=`/`v=` binding
+    flows in); `_auto_name()` derives a deterministic `img_<stem>_<hash>` from path +
+    sampler settings, so identical images share one declaration and differing samplers
+    don't collide; `SpatialExpr.image_textures()` collects the needed `Texture` blocks
+    and `Scene.add` declares them automatically (an explicit declaration of the same name
+    wins in either order) — otherwise every image term would emit a dangling reference.
+    `eval_np` is a faithful port of `Texture::sampleRgb`/`scalarAt` (half-texel offset,
+    `v`-flip, repeat/clamp/mirror, mean-of-linear-RGB), so the two-backend rule holds.
+    `encoding` defaults to `"linear"`, not `"srgb"`: a value used as a *number* wants the
+    stored levels. Validated end-to-end: the loom-emitted `.ftsl` renders **bit-for-bit
+    identically** to the hand-authored `scraps/texop_pattern.ftsl`, and the composed case
+    (`scraps/loom_image_mixed.ftsl`) matches CPU↔GPU to MC noise.
+    Tests: `tests/test_image_term.py` (emit shape, warped/rebound coordinates, auto-name
+    determinism & separation, `image_textures` dedup incl. nested leaves, Scene
+    auto-declaration + ordering + explicit-wins, scalar-slot acceptance, and `eval_np`
+    nearest/bilinear/wrap/sRGB/shape against hand-computed values).
 - **M11 — "transform video" script.** ✅ done (`loom/xvideo.py`). Separate two-pass
   offline tool (§11.8), kept out of the streaming emitter: **materialize** a clip into a
   4-D block `(T,H,W,C)` (`Clip.from_array` / `.from_frames` / `.from_canvas`), **transform**
