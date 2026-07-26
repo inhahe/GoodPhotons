@@ -3484,6 +3484,10 @@ static void printHelp(const char* prog) {
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
 "  -rgb                  mode R fast RGB (non-spectral) backward preview on the GPU (much\n"
 "                        faster; drops dispersion/thin-film/fluorescence — Option B)\n"
+"  -heroc <N>            hero-wavelength bundle size, 1..8 (default 4); 1 = single-λ, hero off\n"
+"  -herosplit            at a dispersive interface fan the bundle into N monochromatic\n"
+"                        sub-paths (crisp prism/rainbow caustics) instead of de-hero'ing;\n"
+"                        costs ~N× traversal past the split (CPU forward modes A/B/C, M/S)\n"
 "  -t <n>                CPU thread count\n"
 "\n"
 "Scene-ignore (faster preview — strip expensive features, like the rasterizer):\n"
@@ -3828,6 +3832,10 @@ static int run(int argc, char** argv) {
             if (g_heroC < 1) g_heroC = 1;
             if (g_heroC > hero::kHeroMax) g_heroC = hero::kHeroMax;
         }
+        // Split-at-dispersion instead of de-hero. A single global policy flag read by
+        // every CPU forward tracer via Renderer::heroSplit's default initialiser, so it
+        // needs no plumbing through the renderer entry points (see hero.h).
+        else if (!std::strcmp(argv[i], "-herosplit")) hero::gSplit = true;
         else if ((!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev")) && i + 1 < argc) exposureCli = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
@@ -4083,6 +4091,15 @@ static int run(int argc, char** argv) {
     g_directOnly = directOnly;
     if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);
     if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
+    // -herosplit only reaches the CPU forward tracer; say so rather than silently
+    // ignoring it, and point out that it is a no-op without a bundle to split.
+    if (hero::gSplit) {
+        if (g_heroC <= 1)
+            std::printf("[hero] -herosplit has no effect with -heroc 1 (no secondaries to split)\n");
+        else
+            std::printf("[hero] split-at-dispersion ON (C=%d fan-out; CPU forward modes A/B/C + "
+                        "photon-map M/S only)\n", g_heroC);
+    }
 
     if (checkBvhOnly) {
         // Bound the linear-reference work (~O(rays * prims)) so the self-test

@@ -80,6 +80,17 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `e.absorbed += beta[i] * (1 - c_i/q)`. Omit that and `sum/emitted` collapses
   (measured 0.66); the old ratio reweight *created* ledger energy (up to 1.007). With
   the booking the ledger closes identically, which it never did before.
+  The bounce loop lives in **`tracePhotonHeroLoop`**, split out of `tracePhotonHero`
+  so the opt-in `-herosplit` policy can **re-enter it recursively** — once per
+  secondary — at a dispersive interface, instead of de-hero'ing. Each sub-path
+  re-runs the same interaction with its own λ (its own Snell direction / grating
+  order) on its own `MediumStack` copy, then continues monochromatically; the branch
+  is guarded on `secAlive`, so a sub-path never re-splits and recursion is at most
+  one level deep (cost linear in C, bounded stack). Weights are untouched — the C
+  sub-paths keep `base/C` each and the parent zeroes them — so the ledger stays
+  exact. The policy is a whole-run choice, so it rides on the `hero::gSplit` global
+  that `Renderer::heroSplit` default-initialises from, rather than being threaded
+  through every entry point the way per-pass `heroC` must be.
 - **`backward.h`** — CPU backward reference tracer (`radianceHero`). Every Russian
   roulette in the hero path uses the **max over live λ** as its survival
   probability, with survivors reweighting `thr[i] *= c_i/q ≤ 1` — never the hero's

@@ -2276,7 +2276,51 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           hero gate is now `heroC>1`. Verified on `cornell` mode M: `-heroc 1` is bit-identical to a `kHeroC=1`
           rebuild (2.80M photons, auto-exposure 1.11e-13), `-heroc 4` matches the default (9.09M, 1.11e-13),
           `-heroc 2`/`8` interpolate and run clean; mode B `-heroc 1` gives `sum/emitted=1.000000`.
-    - [ ] **Optional split-at-dispersion (crisp dispersive caustics)** — an *alternative* to the default de-hero
+    - [x] **Optional split-at-dispersion (crisp dispersive caustics) — DONE 2026-07-26 (VERSION 0.65.0), CPU
+          forward.** Shipped as `-herosplit` (off by default). Implementation:
+          * `src/hero.h`: new `hero::gSplit` runtime flag. Unlike `heroC` — which the drivers vary per pass (the
+            meter pre-pass, the media/GRIN/lens gate) and therefore thread explicitly through every renderer entry
+            point — this is one global policy choice, so `main()` sets it once while parsing argv and
+            `Renderer::heroSplit` default-initialises from it. That is why modes `A`/`B`/`C` **and** the `M`/`S`
+            photon deposit all picked it up with zero call-site churn (`photonmap_render.h` and, through it,
+            `sppm_render.h` both just construct a `Renderer`).
+          * `src/render.h`: the bounce loop of `tracePhotonHero` was extracted verbatim into a new
+            `tracePhotonHeroLoop(..., ray, stk, lam, beta, secAlive, bounce0, ...)`. That is the whole trick — the
+            split branch **re-enters that method recursively**, once per secondary, so the ~20 `return` sites in
+            the loop body keep working unchanged and no explicit work stack / CPS rewrite was needed. Each
+            secondary runs `interactPhotonSpecular` with its **own** λ (its own Snell direction / grating order /
+            Stokes shift) on a **copy** of the `MediumStack` (sub-paths diverge from that vertex), then continues
+            from `bounce + 1` with `secAlive = false`. Because the branch is guarded on `secAlive`, a sub-path can
+            never re-split: recursion is at most **one level deep**, so cost is linear in C, not exponential, and
+            the per-frame footprint is a bounded ~600 B.
+          * **Weights / ledger.** No ×C boost: the C sub-paths keep `base/C` each and the parent zeroes
+            `beta[i]`, so the total is exactly what the de-hero'd hero would have carried alone and every
+            sub-path books its own terminal fate. `interactPhotonSpecular` already books `e.absorbed += beta` on
+            every `return false`, so nothing leaks.
+          * `main.cpp`: `-herosplit` parse, a startup notice naming the supported modes (and warning that it is a
+            no-op under `-heroc 1`), plus new `-heroc`/`-herosplit` lines in the usage text (`-heroc` had never
+            been listed there).
+          * **Validation** on a new scene `scraps/abs_herosplit.ftsl` (absolute-exposure Cornell box with a
+            dispersive `glass:SF10` flint sphere, mode B, 256², fixed gain 6, CPU), vs a 200M-photon reference:
+            flag **off** byte-identical to `scraps/ftrace_base_cc20a46.exe` (md5 `e2eef2cb…`) and
+            `-heroc 1 -herosplit` byte-identical to plain `-heroc 1` (md5 `2b8f0fe8…`); flag **on**
+            `sum/emitted = 1.000000` exactly (0.999990 off) with mean luminance −0.026 % vs the reference
+            (off −0.054 %) ⇒ both unbiased. **At equal wall clock (180 s):** caustic-region noise RMS luma
+            0.0340→**0.0303 (0.89×)**, chroma 0.0386→**0.0271 (0.70×)**; whole frame 0.92× / 0.80×. Cost
+            **1.11×** per photon (20M back-to-back: 173.3 s off, 192.3 s on). The split PNG is 6 % *smaller*
+            (91 126 vs 97 040 B). New helper `scraps/region_rms.py` reports RMS inside a box as well as over
+            the whole frame — whole-image RMS is dominated by the flat diffuse walls and hides the caustic.
+            **Methodology warning:** an early reading of 1.54× cost was wrong — the two runs were ~25 min apart
+            and machine throughput drifted 1.6× in between. Compare timings **back-to-back** only, or give both
+            policies the same `-time` budget and compare photon counts.
+          * Still de-hero (not split) at `Layered` and `Mix`: those are λ-dependent *decisions* (coat Fresnel
+            probability, child selection) rather than λ-dependent *directions*, and their split point sits
+            before any interaction so it doesn't fit the resume-from-a-ray shape. Logged in `known-issues.md`.
+          * NOT done (deliberately, both noted in the README and the startup notice): the GPU forward tracer
+            (execution divergence as the fan-out wavelengths take different branches — and the emission
+            back-pressure / fixed work-pool needed to keep the photon buffers bounded), and the backward tracer
+            `R` / BDPT `D` / VCM `U`.
+          Original note: an *alternative* to the default de-hero
           policy, exposed as an opt-in flag (e.g. `-herosplit`, off by default). At a dispersive dielectric interface,
           instead of terminating the secondaries (`beta[0] *= C; secAlive = false`), **continue all C wavelengths**,
           each refracting along its *own* per-λ direction from that point — turning one bundle into C now-monochromatic

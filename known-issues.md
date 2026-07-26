@@ -537,6 +537,46 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   `base` and `nEmitted` counts PATHS, so the estimate is energy-identical to single-λ. Cost: up to C× more stored
   photons from one shared BVH walk (the intended chroma-noise win). **Mode U (VCM/UPS)** still single-λ — its
   BDPT-style light-subpath tracing (`src/vcm.h`) needs per-λ merge/connect (same complexity class as BDPT-D).
+- **Opt-in split-at-dispersion (`-herosplit`) — DONE 2026-07-26 (VERSION 0.65.0), CPU forward.** The alternative
+  to the default de-hero policy: at a dispersive interface all C wavelengths **continue**, each running the same
+  interaction with its **own** λ (its own Snell direction / grating order / Stokes shift), so one bundle fans out
+  into C independent monochromatic sub-paths. Both estimators are unbiased; splitting resolves a prism / rainbow /
+  dispersive caustic's chromatic spread *geometrically per photon* instead of stochastically across many photons.
+  * **The implementation trick.** The bounce loop of `tracePhotonHero` (`src/render.h`) was extracted verbatim
+    into `tracePhotonHeroLoop(..., ray, stk, lam, beta, secAlive, bounce0, ...)`, and the split branch
+    **re-enters that method recursively**, once per secondary, with `secAlive = false` and `bounce0 = bounce+1`.
+    That keeps all ~20 `return` sites in the loop body working unchanged — no explicit work stack, no CPS
+    rewrite. Because the branch is guarded on `secAlive`, a sub-path can never re-split, so recursion is at most
+    **one level deep**: cost is linear in C, not exponential, and the per-frame footprint (one `MediumStack` copy
+    + two `kHeroMax` double arrays, ~600 B) is bounded. Each sub-path gets its **own copy** of the
+    `MediumStack`, since that is exactly where the sub-paths diverge inside the glass.
+  * **Ledger.** No ×C boost: the C sub-paths keep `base/C` each and the parent zeroes `beta[i]`, so the total
+    equals what the de-hero'd hero would have carried alone and every sub-path books its own terminal fate
+    (`interactPhotonSpecular` already books `e.absorbed += beta` on every `return false`).
+  * **Plumbing.** `hero::gSplit` (in `src/hero.h`) is a single global policy flag set once by `main()` during
+    argv parsing, and `Renderer::heroSplit` default-initialises from it. That is deliberate: `heroC` has to be
+    threaded explicitly because the drivers vary it per pass (the meter pre-pass, the media/GRIN/lens gate),
+    but a whole-run policy choice does not — so modes `A`/`B`/`C` **and** the `M`/`S` deposit picked it up with
+    **zero** call-site churn (`photonmap_render.h`, and `sppm_render.h` through it, just construct a `Renderer`).
+  * **Validated** on a new scene `scraps/abs_herosplit.ftsl` (absolute-exposure Cornell + `glass:SF10` flint
+    sphere, mode B, 256², fixed gain 6, CPU), against a 200 M-photon reference:
+    - flag **off** byte-identical to `scraps/ftrace_base_cc20a46.exe` (3 M photons, md5 `e2eef2cb…` both);
+      `-heroc 1 -herosplit` byte-identical to plain `-heroc 1` (md5 `2b8f0fe8…` both);
+    - flag **on** `sum/emitted = 1.000000` **exactly** (0.999990 off), mean luminance −0.026 % vs the
+      reference (−0.054 % for off) ⇒ both unbiased;
+    - **equal wall clock (180 s each):** caustic-region noise RMS luma 0.0340→**0.0303 (0.89×)**, chroma
+      0.0386→**0.0271 (0.70×)**; whole frame 0.0579→0.0532 (0.92×) and 0.0417→0.0333 (0.80×).
+      (`scraps/region_rms.py`, new — whole-image RMS is dominated by the flat diffuse walls and hides what
+      a change did to the caustic, so it reports a box as well as the full frame.)
+    - **cost 1.11×** per photon (20 M photons back-to-back: 173.3 s off, 192.3 s on). The split PNG is 6 %
+      *smaller* (91 126 vs 97 040 B) — less caustic noise compresses better.
+    **Methodology warning (cost this session ~40 min):** an early measurement read 1.54× (187 s vs 122 s)
+    because the two runs were ~25 min apart and the machine's throughput drifted by 1.6× in between. Never
+    compare wall clock across runs separated in time — run the two policies **back-to-back**, or give both
+    the same `-time` budget and compare photon counts.
+  * **Not covered:** the GPU forward tracer (execution divergence as the fan-out wavelengths take different
+    branches, plus the emission back-pressure / fixed work-pool needed to keep the device photon buffers
+    bounded), and modes `R` / `D` / `U`. Also **not** applied at `Layered` / `Mix` — see the next bullet.
 - **Three known approximations in the CPU hero path** (all minor, documented for when they're revisited):
   - **A zero hero throughput kills the whole bundle — FIXED everywhere (2026-07-26).** `bdpt.h`'s
     `randomWalk` (absolute `secF[]` + max-over-live-λ early-out), `backward.h`'s `radianceHero` /
@@ -550,6 +590,13 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   - **Mix material stays multi-λ with a shared child selection.** Exact for constant mix weights; for *spectrally
     varying* mix weights with diffuse children it introduces a small bias (the child is picked by the hero λ's
     weight, secondaries ride along). Acceptable vs. de-heroing every Mix; revisit if a spectral-mix scene shows it.
+    `Layered` has the same shape (its coat Fresnel probability is λ-dependent, so it de-heros outright).
+    **`-herosplit` does not cover either.** These are λ-dependent *decisions*, not λ-dependent *directions*, and
+    their natural split point sits *before* any interaction has happened — which does not fit
+    `tracePhotonHeroLoop`'s "resume from a ray" entry shape the way the dispersive case does (there each
+    secondary can just re-run `interactPhotonSpecular` at the same hit with its own λ and hand back a fresh ray).
+    Extending split to them needs a "resume at this hit with this material" entry point; worth doing if a
+    spectral-mix or coated-dielectric scene ever shows the bias, but nothing observed yet.
   - **Equal-*time* benefit is geometry-dependent.** Hero shares one BVH walk across C wavelengths, so its win grows
     with scene complexity. On trivial geometry (Cornell: a few quads + 2 spheres) traversal is nearly free and the
     4× per-λ shading makes hero ~1.6× slower per spp, so at *equal time* single-λ can edge it there. On heavy
@@ -1628,7 +1675,7 @@ scene-level control-point fix is still the best-LOOKING result for the gallery (
 removes the sharp reversal geometrically → jerk 6.5°); the engine fix is the general
 safety net so aggressive future paths degrade to a bounded pan instead of a rake.
 
-### Mode-M dense photon map makes per-frame gather slow — PERF NOTE 2026-07-14
+### Mode-M dense photon map makes per-frame gather slow — PERF NOTE 2026-07-14, root-caused 2026-07-26
 
 With a very dense saved map (the 60M-photon gallery map deposits ~58.3M photons), each
 per-camera density-estimate gather is expensive (~90–120 s/frame at 960×540, 48 spp on a
@@ -1638,6 +1685,40 @@ reduction. **Tuning opportunity:** once the map is saved (`-savemap`), re-gather
 `-loadmap` at reduced spp (~16–20) for roughly a 2–3× speedup with near-identical quality
 (the map deposit — the physically expensive part — is skipped entirely). Not a bug; a
 knob worth remembering when iterating on camera angles / radius on a fixed map.
+
+**Root cause, and it is worse than linear (measured 2026-07-26).** The gather radius is
+chosen *independently of the photon count* — `main.cpp:2722` (and the twins at 6130 /
+6205 / 6564) set `radius = g_pmRadiusAbs > 0 ? g_pmRadiusAbs : scene.sceneRadius *
+g_pmRadiusFactor`. `PhotonMap::build(r)` then sizes the uniform grid at `cellSize = r`
+(`photonmap.h:84–97`), so the grid resolution is **frozen** for a given scene+radius no
+matter how many photons land in it — e.g. `scraps/abs_herosplit.ftsl` reports
+`grid 59x59x59` at 500k emitted *and* at 8M emitted. Photons per cell therefore grows
+**linearly** with `-n`, and every pixel's 3×3×3 neighbourhood scan grows with it.
+
+Timed sweep (`-device cpu -mode M`, 256×256, `scraps/abs_herosplit.ftsl`, wall clock
+including the deposit):
+
+| `-n` emitted | photons stored | total |
+|---|---|---|
+| 1 M | ~6.7 M | 65 s |
+| 2 M | 13.4 M | 139 s (2.14×) |
+| 4 M | ~27 M | 369 s (2.66×) |
+| 8 M | ~53 M | killed — no output after ~16 min, 5.4 GB RSS |
+
+So it scales ≈ `N^1.4`, not `N`: the per-cell photon list grows linearly *and* the
+counting-sort/storage cost grows linearly on top. The 8 M case looks like a hang from
+the outside (no progress line during the gather) — it isn't, it's just this curve. Note
+this is **not** a `-heroc`/`-herosplit` regression: it was measured identically with the
+hero bundle off, and hero only multiplies the *stored* count (C deposits per photon),
+which moves you along the same curve faster.
+
+**Proper fix:** make the gather radius a function of density instead of a constant —
+either (a) `k`-nearest-neighbour gathers (pick `r` per query so ~`k` photons are found,
+which is what makes classic PPM scale), or (b) at minimum shrink the global radius as
+`r ∝ N^(-1/3)` so photons-per-cell stays constant, which keeps the grid cost flat and
+also sharpens the estimate as you add photons instead of just blurring harder. Until
+then the practical workaround is to pass an explicit smaller `-pmradius` when raising
+`-n`, or to use `-savemap`/`-loadmap` so the expensive part is paid once.
 
 ### Shared FORWARD (A/B) multi-camera pass writes all frames only at the end — FIXED 2026-07-14
 

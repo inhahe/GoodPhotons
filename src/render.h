@@ -296,6 +296,12 @@ struct Renderer {
                                  // useHero is on (hero + heroC-1 secondaries). Runtime-
                                  // configurable via -heroc N, clamped to [1, kHeroMax];
                                  // defaults to kHeroC. C==1 collapses to single-λ.
+    bool heroSplit    = hero::gSplit; // SPLIT-AT-DISPERSION policy (-herosplit): at a
+                                 // dispersive interface, fan the bundle out into C
+                                 // monochromatic sub-paths (each refracting along its own
+                                 // per-λ direction) instead of de-hero'ing to the hero
+                                 // alone. Off by default; costs C× traversal past the
+                                 // split but resolves chromatic spread geometrically.
     bool beamGather   = false;   // PHOTON-BEAMS gather for the shared multi-camera pass
                                  // (CLI -beams). When on and nCam>1, each camera samples
                                  // its OWN collision point along every medium beam segment
@@ -1845,7 +1851,6 @@ struct Renderer {
         bool secAlive = (C > 1);
         auto activeSum = [&]() { double s = 0.0; int n = secAlive ? C : 1;
                                  for (int i = 0; i < n; ++i) s += beta[i]; return s; };
-        auto deHero = [&]() { if (!secAlive) return; beta[0] *= (double)C; secAlive = false; };
         e.emitted += activeSum();
 
         // Direct light -> camera (area/quad emitters only; matches the scalar tracer).
@@ -1858,8 +1863,35 @@ struct Renderer {
 
         Ray ray{origin + dir * 1e-6, dir};
         MediumStack stk;                 // dielectric priority (Beer-Lambert uses hero λ)
+        tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, ray, stk, lam, beta,
+                            secAlive, /*bounce0=*/0, rng, e);
+    }
 
-        for (int bounce = 0; bounce < maxBounce; ++bounce) {
+    // Bounce loop for a hero bundle that is already sitting at (`ray`, `stk`) with
+    // `secAlive ? heroC : 1` live wavelengths carrying `lamIn[]`/`betaIn[]`, resuming at
+    // bounce index `bounce0`. Split out of tracePhotonHero so the `-herosplit` policy can
+    // RE-ENTER it once per monochromatic sub-path that a dispersive interface fans out
+    // (see the dispersive case below). Every such sub-path is spawned with
+    // `secAlive == false`, and the split branch is guarded on `secAlive`, so a sub-path
+    // can never split again — recursion is at most one level deep and the per-frame
+    // footprint (a MediumStack plus two kHeroMax double arrays) is bounded.
+    void tracePhotonHeroLoop(const Scene& scene, const CamTarget* cams, int nCam,
+                             Film* sensorFilm, Ray ray, MediumStack stk,
+                             const double* lamIn, const double* betaIn, bool secAlive,
+                             int bounce0, Pcg32& rng, EnergyReport& e) const {
+        const int C = heroC;
+        double lam[hero::kHeroMax], beta[hero::kHeroMax];
+        // Copy only the LIVE entries: a monochromatic sub-path spawned by -herosplit only
+        // fills slot 0 of its lamIn/betaIn, so reading all C would read indeterminate
+        // values (harmless today since nUp==1 ignores them, but still UB).
+        const int nLive = secAlive ? C : 1;
+        for (int i = 0; i < nLive; ++i) { lam[i] = lamIn[i]; beta[i] = betaIn[i]; }
+        for (int i = nLive; i < C; ++i) { lam[i] = 0.0; beta[i] = 0.0; }
+        auto activeSum = [&]() { double s = 0.0; int n = secAlive ? C : 1;
+                                 for (int i = 0; i < n; ++i) s += beta[i]; return s; };
+        auto deHero = [&]() { if (!secAlive) return; beta[0] *= (double)C; secAlive = false; };
+
+        for (int bounce = bounce0; bounce < maxBounce; ++bounce) {
             int nUp = secAlive ? C : 1;
             Hit h = scene.closestHit(ray);
             double dEvent = h.valid ? h.t : 1e30;
@@ -2028,8 +2060,39 @@ struct Renderer {
                 case MatType::Grating:
                 case MatType::HalfMirror:
                 case MatType::Fluorescent: {
-                    // Dispersive / wavelength-switching: terminate secondaries, then run
-                    // the shared scalar interaction on the (boosted) hero channel.
+                    // Dispersive / wavelength-switching: the outgoing direction (and, for a
+                    // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
+                    // cannot keep riding one shared direction past this interface.
+                    if (heroSplit && secAlive && nUp > 1) {
+                        // SPLIT-AT-DISPERSION (-herosplit): fan out instead of de-hero'ing.
+                        // Each secondary runs the SAME interaction with its OWN λ — so it
+                        // refracts along its own Snell direction / diffracts into its own
+                        // grating order — and then continues as an independent monochromatic
+                        // sub-path from this vertex. Weights are untouched (no ×C boost): the
+                        // C sub-paths still carry base/C each, so they sum to the same total
+                        // power the de-hero'd hero would have carried alone, and the energy
+                        // ledger stays exact because every sub-path books its own fate.
+                        for (int i = 1; i < nUp; ++i) {
+                            if (beta[i] <= 0.0) continue;   // dead secondary: nothing to carry
+                            double cl[hero::kHeroMax], cb[hero::kHeroMax];
+                            cl[0] = lam[i]; cb[0] = beta[i];
+                            MediumStack cstk = stk;         // sub-paths diverge from here on
+                            Ray cray = ray;
+                            if (interactPhotonSpecular(scene, cams, nCam, m, h, cray, cb[0],
+                                                       cl[0], cstk, rng, e))
+                                tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, cray, cstk,
+                                                    cl, cb, /*secAlive=*/false, bounce + 1,
+                                                    rng, e);
+                            beta[i] = 0.0;                  // its energy is now that sub-path's
+                        }
+                        secAlive = false;                   // hero carries on alone, UNBOOSTED
+                        if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0],
+                                                    lam[0], stk, rng, e))
+                            return;
+                        continue;
+                    }
+                    // Default policy: terminate secondaries, then run the shared scalar
+                    // interaction on the (boosted) hero channel.
                     deHero();
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0], lam[0], stk, rng, e))
                         return;
