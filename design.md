@@ -71,7 +71,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   marching also runs in parallel across objects.
 - **`render.h`** — CPU forward tracer (modes A/B/C + photon deposit for M/S/P):
   per-photon loop, Russian roulette, sphere-scan cos/sin tables, splatting.
-- **`backward.h`** — CPU backward reference tracer (`radianceHero`).
+- **`backward.h`** — CPU backward reference tracer (`radianceHero`). Every Russian
+  roulette in the hero path uses the **max over live λ** as its survival
+  probability, with survivors reweighting `thr[i] *= c_i/q ≤ 1` — never the hero's
+  own coefficient with a `c_i/c_hero` ratio, which amplifies a secondary whenever
+  the hero λ is the dark one (a saturated wall spectrum makes that a 15× weight
+  spike). That applies to Diffuse, DiffuseTransmit's lobe pick, and the achromatic
+  delta lobes Mirror/Filter/Glossy, which for the same reason as BDPT's
+  `keepBundle` do **not** de-hero (their outgoing direction ignores λ). At
+  `nUp == 1` every one of these is the scalar code verbatim.
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,

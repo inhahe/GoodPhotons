@@ -5922,23 +5922,66 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
                 bkNeeLightHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
                 if (sc.envIndex >= 0) bkNeeEnvHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
                 if (directOnly) return;                            // Whitted: no diffuse indirect
-                Real sumHero = rhoR[0] + rhoT[0];
+                // Lobe pick + RR over the whole bundle (see D_DIFFUSE): the reflect/transmit
+                // probabilities are the per-lobe MAX over live λ, so no secondary is ever
+                // amplified. The maxima can sum past 1 (each λ alone is guarded), in which
+                // case both shrink proportionally. At nUp == 1 this is the scalar code.
+                Real qR = rhoR[0], qT = rhoT[0];
+                for (int i = 1; i < nUp; ++i) {
+                    if (rhoR[i] > qR) qR = rhoR[i];
+                    if (rhoT[i] > qT) qT = rhoT[i];
+                }
+                Real sumHero = qR + qT;
+                if (nUp > 1 && sumHero > (Real)1) { qR /= sumHero; qT /= sumHero; sumHero = qR + qT; }
                 Real u = rng.uniform();
-                if (u < rhoR[0]) {                                 // reflect (front)
-                    for (int i = 1; i < nUp; ++i) thr[i] *= (double)rhoR[i] / (double)rhoR[0];
+                if (u < qR) {                                      // reflect (front)
+                    for (int i = 0; i < nUp; ++i) thr[i] *= (double)rhoR[i] / (double)qR;
                     DVec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
                     ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
                 } else if (u < sumHero) {                          // transmit (back)
-                    for (int i = 1; i < nUp; ++i) thr[i] *= (double)rhoT[i] / (double)rhoT[0];
+                    for (int i = 0; i < nUp; ++i) thr[i] *= (double)rhoT[i] / (double)qT;
                     DVec3 wOut = cosineHemisphere(nb, rng);
                     contBsdfPdf = fmax(0.0, (double)dot(wOut, nb)) / DPI;
                     ro = h.p + nb * RAY_EPS; rd = wOut; specularArrival = false; break;
                 }
                 return;                                            // absorbed
             }
-            case D_DIELECTRIC: case D_THINFILM: case D_MULTILAYER: case D_MIRROR:
-            case D_GRATING:    case D_HALFMIRROR: case D_FILTER:   case D_GLOSSY:
+            case D_MIRROR: case D_FILTER: case D_GLOSSY: {
+                // ACHROMATIC delta lobes (device twin of backward.h): specular, so no NEE
+                // and specularArrival stays true, but the outgoing DIRECTION is the same
+                // for every λ — a mirror reflects, a gel passes straight through, a glossy
+                // lobe is the mirror direction blurred by a λ-independent roughness. So the
+                // bundle keeps riding and only the per-λ coefficient differs.
+                // The scalar path survives by ANALOG Russian roulette on the hero's own
+                // coefficient; rolling that coin on the hero alone would kill live
+                // secondaries whenever c_hero == 0 (a Wratten gel is 0 over most of the
+                // spectrum), so the survival probability is the MAX over live λ and the
+                // survivors reweight by c_i/q. At nUp == 1, q == c[0] and thr[0] *= 1.0,
+                // i.e. the scalar code verbatim (same rng draws, same order).
+                Real c[hero::kHeroMax];
+                double q = 0.0;
+                for (int i = 0; i < nUp; ++i) {
+                    c[i] = (mp->type == D_FILTER) ? clamp01(specLookup(mp->transmit, lam[i]))
+                                                  : clamp01(dReflectSlot(sc, *mp, h, lam[i]));
+                    if ((double)c[i] > q) q = (double)c[i];
+                }
+                if (rng.uniform() >= q) return;                    // RR absorb (q == 0 -> always)
+                for (int i = 0; i < nUp; ++i) thr[i] *= (double)c[i] / q;
+                if (mp->type == D_MIRROR) {
+                    ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n);
+                } else if (mp->type == D_FILTER) {
+                    ro = h.p + rd * RAY_EPS;                       // direction unchanged
+                } else {
+                    DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
+                    if (dot(o, h.n) <= 0) return;
+                    ro = h.p + h.n * RAY_EPS; rd = o;
+                }
+                specularArrival = true;
+                break;
+            }
+            case D_DIELECTRIC: case D_THINFILM: case D_MULTILAYER:
+            case D_GRATING:    case D_HALFMIRROR:
             case D_FLUORESCENT: {
                 // Dispersive / wavelength-switching: terminate the secondaries (boosting
                 // the hero xC so the estimate stays unbiased), then run the shared scalar
@@ -5958,9 +6001,15 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
                 bkNeeLightHero(sc, h, rho, L, thr, lam, invPdf, nUp, rng);
                 if (sc.envIndex >= 0) bkNeeEnvHero(sc, h, rho, L, thr, lam, invPdf, nUp, rng);
                 if (directOnly) return;                            // Whitted: no diffuse indirect
-                Real rhoHero = rho[0];
-                if (rng.uniform() >= rhoHero) return;              // hero RR absorb
-                for (int i = 1; i < nUp; ++i) thr[i] *= (double)rho[i] / (double)rhoHero;
+                // Continuation RR over the WHOLE bundle: survival probability is max_i rho_i,
+                // not the hero's own albedo, and every live λ reweights by rho_i/q <= 1.
+                // Rolling the coin on the hero alone (thr[i] *= rho_i/rho_0) amplifies a
+                // secondary by up to rho_max/rho_hero — on a saturated wall (redWall spans
+                // 0.05..0.75) a 15x weight spike. At nUp == 1, q == rho[0] and thr[0] *= 1.0.
+                Real q = rho[0];
+                for (int i = 1; i < nUp; ++i) if (rho[i] > q) q = rho[i];
+                if (rng.uniform() >= q) return;                    // RR absorb
+                for (int i = 0; i < nUp; ++i) thr[i] *= (double)rho[i] / (double)q;
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
                 ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;

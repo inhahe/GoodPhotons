@@ -2373,10 +2373,39 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
               `abs_hero_delta` 200²/2048 spp) and CPU (`cornell` 96²/64 spp); the earlier scenes unregressed
               (`absolute` −0.008 %, `abs_hero_mats` −0.000 %, both exactly as before); smoke sweep
               `mirror_selfie` / `group` / `material_presets` / `translucency` / `mixmat` clean.
-              Renders in `png/hero_delta/`. **Not** ported to the unidirectional tracers: there Mirror and
-              Filter survive by *Russian roulette* on r(λ)/T(λ) with `beta` unchanged, so keeping the bundle
-              means making the coin the hero's and reweighting `beta[i] *= r_i/r_hero` — a different change,
-              logged in known-issues.md.
+              Renders in `png/hero_delta/`. Ported to the **backward** tracer in the next item; the **forward**
+              tracers still de-hero there.
+        - [x] **Backward tracer (R): achromatic delta lobes + max-over-λ Russian roulette — DONE 2026-07-26
+              (VERSION 0.63.0).** Two changes to `radianceHero` (`src/backward.h`) and its device twin
+              `bkRadianceHero` (`src/render_cuda.cu`), kept 1:1. (1) `Mirror`/`Filter`/`Glossy` stop
+              de-heroing — their outgoing *direction* is λ-independent, so the bundle rides on; since the
+              unidirectional form is an *analog RR* rather than a throughput multiply, the survival
+              probability became `q = max_i c_i` with survivors reweighting `thr[i] *= c_i/q ≤ 1`.
+              (2) **The diffuse continuation stops rolling its coin on the hero alone.** The old
+              `if (u >= rho[0]) die; thr[i] *= rho_i/rho_0` *amplifies* a secondary by up to
+              `rho_max/rho_hero` — on the built-in `redWall`/`greenWall` spectra (0.05 … 0.75) a **15× weight
+              spike per diffuse bounce**. Now `q = max_i rho_i`, `thr[i] *= rho_i/q ≤ 1`; DiffuseTransmit
+              picks its lobe from the per-lobe maxima (rescaled if they sum past 1). At `nUp == 1` both are
+              the scalar code verbatim, so `-heroc 1` stays byte-identical (verified on both backends for
+              `abs_hero_delta` and `abs_hero_mats`, 256²/64 spp).
+              **(2) is what made hero actually pay off in mode R — (1) alone regressed luma.** Noise RMS
+              (luma / chroma) vs a 262144-spp `-heroc 1` reference, GPU 256²:
+              `scraps/abs_hero_diffuse.ftsl` (coloured Cornell, no delta lobes) at 4096 spp — single-λ
+              0.0604 / 0.0714, hero-4 *before* 0.0605 / 0.0565 (**hero was worth nothing in luma**), *after*
+              **0.0254 / 0.0254**; `scraps/abs_hero_mats.ftsl` at 4096 spp — 0.0875 / 0.1136, before
+              0.1566 / 0.1110 (**worse than single-λ**), after **0.0398 / 0.0597**;
+              `scraps/abs_hero_delta.ftsl` at 16384 spp — 0.1122 / 0.0955, before 0.1062 / 0.0936,
+              keepBundle-only 0.1305 / 0.0710, after **0.0549 / 0.0393**. That is ≈0.42–0.52× RMS = a **4×
+              variance cut** for 1.35× CPU / 1.36× GPU wall-clock ⇒ **≈2.9× at equal noise**; energy
+              unbiased (−0.015 % … +0.034 %). Diagnosis trail: an achromatic-wall control
+              (`scraps/abs_hero_delta_gray.ftsl`) showed change (1) alone going 0.0755→0.0406 luma with no
+              regression, pinning it on the coloured diffuse walls. Renders in `png/hero_achroma2/`,
+              `png/hero_diff/`, `png/hero_mats/`, `png/hero_gray/`. Full write-up in known-issues.md,
+              including the reference-correlation measurement trap.
+        - [ ] **Same two fixes for the FORWARD tracers** (`src/render.h` `tracePhotonHero` + the device twins
+              `shadeStepHero`/`traceHeroPhoton`): Mirror/Filter/Glossy still de-hero there, and the diffuse /
+              diffuse-transmit continuation still uses `beta[i] *= rho_i/rho_hero`. Same expected win
+              (modes A/B/C and the M/S photon deposit).
     - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
           through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy
           rather than four copies. Validate: every mode's converged image is unchanged vs the single-λ baseline (same

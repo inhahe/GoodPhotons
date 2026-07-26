@@ -446,10 +446,51 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   96²/64 spp, plus `abs_hero_delta` GPU 200²/2048 spp); the earlier BDPT-hero validation scenes are
   unregressed (`scenes/absolute.ftsl` −0.008 %, `scraps/abs_hero_mats.ftsl` −0.000 %, both exactly as before);
   smoke sweep `mirror_selfie` / `group` / `material_presets` / `translucency` / `mixmat` clean.
-  **Still conservative in the unidirectional tracers** (`src/render.h` `tracePhotonHero`, `src/backward.h`
-  `radianceHero`, and their device twins): there Mirror and Filter survive by *Russian roulette* on r(λ)/T(λ)
-  with `beta` unchanged, so keeping the bundle needs the survival coin to be the hero's with a per-λ
-  `beta[i] *= r_i/r_hero` reweight — a different (and more invasive) change than the BDPT throughput multiply.
+  **Still conservative in the FORWARD tracers** (`src/render.h` `tracePhotonHero` and its device twin
+  `shadeStepHero`/`traceHeroPhoton`): there Mirror / Filter / Glossy still de-hero, and the diffuse
+  continuation still rolls the coin on the hero alone. The backward tracer got both fixes — next bullet.
+- **Backward tracer (mode R): achromatic delta lobes keep the bundle, and EVERY Russian roulette is now
+  max-over-live-λ — DONE 2026-07-26 (VERSION 0.63.0).** Two changes to `radianceHero` (`src/backward.h`) and
+  its device twin `bkRadianceHero` (`src/render_cuda.cu`), kept 1:1:
+  1. **Mirror / Filter / Glossy stop de-heroing.** Like the BDPT change above, their outgoing *direction* is
+     λ-independent (a mirror reflects, a gel passes straight through, a glossy lobe is the mirror direction
+     blurred by a λ-independent roughness), so only the per-λ coefficient differs. The unidirectional form is
+     an *analog RR* rather than a throughput multiply, so the survival probability became `q = max_i c_i` with
+     survivors reweighting by `c_i/q ≤ 1`.
+  2. **Diffuse and DiffuseTransmit no longer roll the continuation coin on the hero alone.** The old
+     `if (u >= rho[0]) die; thr[i] *= rho_i/rho_0` *amplifies* a secondary by up to `rho_max/rho_hero` — on
+     the built-in `redWall`/`greenWall` spectra (0.05 … 0.75) that is a **15× weight spike** every diffuse
+     bounce. Now `q = max_i rho_i` and `thr[i] *= rho_i/q ≤ 1`, so no λ is ever amplified. DiffuseTransmit
+     picks its lobe from the per-lobe maxima `qR`/`qT` (proportionally rescaled in the rare case they sum
+     past 1, which the per-λ energy guard allows).
+  At `nUp == 1` both are the scalar code verbatim (`q == c[0]`, every reweight `*= 1.0`, same rng draws in the
+  same order), so `-heroc 1` stays byte-identical.
+  **The second half is what actually made hero pay off in mode R** — change 1 alone *regressed* luma. Noise
+  RMS vs a 262144-spp `-heroc 1` reference, GPU, 256², as (luma / chroma):
+
+  | scene | spp | single-λ | hero-4 before | +keepBundle only | **hero-4 after (both)** |
+  |---|---|---|---|---|---|
+  | `abs_hero_diffuse` (coloured Cornell, no delta lobes) | 4096 | 0.0604 / 0.0714 | 0.0605 / 0.0565 | — | **0.0254 / 0.0254** |
+  | `abs_hero_mats` (glossy sphere + translucent leaf) | 4096 | 0.0875 / 0.1136 | 0.1566 / 0.1110 | — | **0.0398 / 0.0597** |
+  | `abs_hero_delta` (gold mirror + Wratten-58 gel + coloured walls) | 1024 | 0.4197 / 0.2726 | 0.4148 / 0.2659 | 0.4287 / 0.1397 | **0.1853 / 0.0957** |
+  | " | 4096 | 0.2072 / 0.1683 | 0.2021 / 0.1655 | 0.2530 / 0.1015 | **0.0940 / 0.0579** |
+  | " | 16384 | 0.1122 / 0.0955 | 0.1062 / 0.0936 | 0.1305 / 0.0710 | **0.0549 / 0.0393** |
+
+  Read the first two rows: **before this change hero was worth nothing in mode R on a coloured scene** (0.0605
+  vs 0.0604 single-λ) and on the glossy/translucent scene it was actively *worse* (0.1566 vs 0.0875), because
+  the ratio amplification ate the whole stratification win. After, it is ~0.42–0.52× RMS = a **4× variance
+  reduction**, for 1.35× CPU / 1.36× GPU wall-clock (`abs_hero_delta` 4096 spp: 62.1→84.1 s CPU, 1.1→1.5 s
+  GPU) ⇒ **≈2.9× at equal noise**. Energy is unbiased (`−0.015 %` … `+0.034 %` vs the reference).
+  Diagnosis trail worth remembering: an achromatic-wall control scene (`scraps/abs_hero_delta_gray.ftsl`, same
+  geometry, `whitewall 0.75` everywhere) showed change 1 alone going 0.0755→0.0406 luma with *no* regression —
+  which pinned the regression on the coloured diffuse walls rather than on the delta lobes.
+  Validated: `-heroc 1` byte-identical to `scraps/ftrace_base_6b8ca3f.exe` on **both** backends for
+  `abs_hero_delta` and `abs_hero_mats` (256²/64 spp).
+  **Methodology trap (cost an hour):** a reference rendered at 2× the test's spp *shares half its samples* with
+  the test image — seeds are keyed on the absolute sample index (`seedUnit(rng, (sampleBase+s)*nPix+pixIdx)`),
+  so a 32768-spp reference contains the 16384-spp render verbatim. `rms(test − ref)` is then silently
+  discounted by ~0.7× **for whichever estimator produced the reference**, which flatters the baseline. Use a
+  reference at ≥16× the test spp (or a different estimator).
 - **Photon-mapping modes M (photon map) + S (SPPM) — DONE (CPU).** `tracePhotonHero`'s map deposit now writes
   **all `nUp` live wavelengths** as per-λ photon records (`for (i<nUp) depositPhoton(h.p, ray.d, h.n, lam[i],
   beta[i]);` in `src/render.h`), and the shared `tracePhotonPass` (`src/photonmap_render.h`, used by M and S) sets
@@ -459,10 +500,12 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   photons from one shared BVH walk (the intended chroma-noise win). **Mode U (VCM/UPS)** still single-λ — its
   BDPT-style light-subpath tracing (`src/vcm.h`) needs per-λ merge/connect (same complexity class as BDPT-D).
 - **Three known approximations in the CPU hero path** (all minor, documented for when they're revisited):
-  - **A zero hero throughput kills the whole bundle.** Every tracer terminates on the *hero's* throughput
-    (`betaFactor <= 0` in `bdpt.h`'s `randomWalk`, the RR tests in `render.h`/`backward.h`), and the secondary
-    reweight `secRatio[i] = f_i/f_hero` needs `f_hero > 0` anyway. So a surface that is exactly black at λ₀ but
-    coloured at λ₁ drops the secondaries' contribution. Harmless for ordinary reflectance spectra (which are
+  - **A zero hero throughput kills the whole bundle — now only in the FORWARD tracers.** `bdpt.h`'s
+    `randomWalk` (absolute `secF[]` + max-over-live-λ early-out) and `backward.h`'s `radianceHero` /
+    `bkRadianceHero` (max-over-live-λ RR everywhere) have both been fixed; only `render.h`'s `tracePhotonHero`
+    and its device twin still terminate on the *hero's* RR test with a `beta[i] *= rho_i/rho_hero` reweight
+    that needs `rho_hero > 0`. So a surface that is exactly black at λ₀ but
+    coloured at λ₁ drops the secondaries' contribution *there*. Harmless for ordinary reflectance spectra (which are
     positive across the band) and impossible to hit when a single emitter drives the λ CDF; it can only bite a
     scene with narrow, disjoint emitter lines *and* materials with exact spectral zeros. The proper fix is
     PBRT-v4's formulation — carry the pdf itself as a per-λ spectrum and MIS across wavelengths — which is an
