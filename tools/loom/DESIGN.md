@@ -712,6 +712,20 @@ tools/loom/
   semantics vs ftrace ops, `uses_time`/`time_signals`, one expr → both backends, static
   bake, iso integration). Demo: `examples/shared_pattern.py` (a drifting gyroid as both a
   2-D loop and a 3-D isosurface loop).
+  - **J3b item 3 — Surface leaf family + binding-by-substitution.** ✅ (spatial.py
+    foundation). The coordinate leaf `_Coord` is generalised to a public `Surface` family:
+    `X`/`Y`/`Z` (axes 0/1/2, both backends) plus the *surface* params `U`/`V` (the ftrace
+    pattern vars `u`/`v` — **emit-only**, no numpy twin) and the material *albedo* `A` (a
+    pure binding placeholder — ftrace's VM has no `a` variable, so emitting a bare `A`
+    raises; it must be substituted or defaulted first). `SpatialExpr.free_inputs()` reports
+    the bindable named leaves (`{u,v,a}`; `include_coords=True` adds `x/y/z`) and
+    `SpatialExpr.substitute({name: expr})` rewrites them by name (functional — the original
+    tree is untouched). This is the substrate for **materials-as-bundles** (`gold(u=v, a=1)`
+    / `(a=x*.5)` authoring): loom resolves every binding to a concrete field in real ftrace
+    variables **at emit**, so it never writes literal bundle syntax and every intermediate
+    stays renderable — needing **zero** ftrace C++ changes. Tests: `test_spatial.py`
+    (uv-emit, no-numpy-twin, albedo-raises-until-bound, free-inputs, substitute rewrite/
+    partial/nested).
 - **M11 — "transform video" script.** ✅ done (`loom/xvideo.py`). Separate two-pass
   offline tool (§11.8), kept out of the streaming emitter: **materialize** a clip into a
   4-D block `(T,H,W,C)` (`Clip.from_array` / `.from_frames` / `.from_canvas`), **transform**

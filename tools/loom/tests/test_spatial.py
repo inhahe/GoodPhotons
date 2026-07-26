@@ -20,7 +20,7 @@ import numpy as np  # noqa: E402
 
 from loom import (  # noqa: E402
     Clock, Cache, Sine,
-    SpatialExpr, sexpr, X, Y, Z, T, SPATIAL_PATTERNS,
+    SpatialExpr, Surface, sexpr, X, Y, Z, U, V, A, T, SPATIAL_PATTERNS,
     sin, cos, sqrt, sign, clamp,
     FuncPattern, Isosurface, Canvas2D,
 )
@@ -213,6 +213,91 @@ def test_new_spatial_presets_registered():
         assert name in SPATIAL_PATTERNS
         expr = SPATIAL_PATTERNS[name](4.0)
         assert isinstance(expr, SpatialExpr)
+
+
+# ---------------------------------------------------------------------------
+# J3b item 3: the Surface leaf family + binding-by-substitution
+# ---------------------------------------------------------------------------
+
+def test_surface_uv_emit_as_ftrace_pattern_vars():
+    # u/v are real ftrace pattern variables (VarU/VarV) -> emit-only tokens
+    assert _emit(U) == "(u)"
+    assert _emit(V) == "(v)"
+    e = 0.5 + 0.5 * sin(6.0 * U)
+    assert "(u)" in _emit(e)
+
+
+def test_surface_uv_have_no_numpy_twin():
+    # emit-only: the 2-D raster backend has no surface UV
+    for leaf in (U, V):
+        try:
+            leaf.eval_np((0.0, 0.0, 0.0), Clock(t=0.0), Cache())
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{leaf.name} must not evaluate numerically")
+
+
+def test_albedo_leaf_has_no_ftrace_variable():
+    # ftrace's pattern VM has no `a` var -> emitting a bare A must raise
+    try:
+        _emit(A)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a bare albedo leaf must not emit")
+    # ...but once bound it emits the substituted expression
+    bound = (A * 0.5).substitute({"a": X})
+    assert _emit(bound) == "((x)*(0.5))"
+
+
+def test_coords_still_evaluate_both_ways():
+    assert _emit(X) == "(x)" and _emit(Y) == "(y)" and _emit(Z) == "(z)"
+    got = (X + Z).eval_np((np.array([1.0]), 0.0, np.array([2.0])),
+                          Clock(t=0.0), Cache())
+    assert got[0] == 3.0
+    # X/Y/Z carry the coordinate flag; U/V/A do not
+    assert X.is_coord and Y.is_coord and Z.is_coord
+    assert not U.is_coord and not V.is_coord and not A.is_coord
+
+
+def test_free_inputs_excludes_coords_by_default():
+    e = sin(6.0 * U) + cos(3.0 * V) * X + A
+    assert e.free_inputs() == frozenset({"u", "v", "a"})
+    assert e.free_inputs(include_coords=True) == frozenset({"u", "v", "a", "x"})
+    # a pure spatial formula exposes no bindable inputs
+    assert (sin(X) * cos(Y)).free_inputs() == frozenset()
+
+
+def test_substitute_rewrites_named_leaves_by_name():
+    # gold(u=v): rebind the surface param u to the consumer's expression v
+    e = 0.5 + 0.5 * sin(6.0 * U)
+    rebound = e.substitute({"u": V})
+    assert "(v)" in _emit(rebound) and "(u)" not in _emit(rebound)
+    # the original tree is untouched (functional rewrite)
+    assert "(u)" in _emit(e)
+
+
+def test_substitute_accepts_arbitrary_expressions_and_numbers():
+    # gold(u=x*.5) / gold(a=1): RHS is any coercible value
+    e = A * U
+    out = e.substitute({"a": 1.0, "u": X * 0.5})
+    assert _emit(out) == "((1)*((x)*(0.5)))"
+
+
+def test_substitute_leaves_unmatched_inputs_free():
+    e = U + V
+    half = e.substitute({"u": X})
+    assert half.free_inputs() == frozenset({"v"})
+
+
+def test_substitute_is_stable_across_nested_nodes():
+    e = clamp(A + sin(U), -V, V)
+    out = e.substitute({"a": 0.2, "u": X, "v": Y})
+    assert out.free_inputs() == frozenset()
+    # binds cleanly and emits a concrete field in real ftrace vars
+    txt = _emit(out)
+    assert "(0.2)" in txt and "sin((x))" in txt and "(y)" in txt
 
 
 def _run_all():

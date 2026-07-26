@@ -11,6 +11,15 @@ whose leaves are the coordinate variables :data:`X`, :data:`Y`, :data:`Z` and th
 loop phase :data:`T`, and whose *coefficients* may be temporal :class:`Signal`\\s
 (baked per frame — exactly how the 3-D side already animates a static formula).
 
+The leaf family (:class:`Surface`) also carries the *surface* inputs :data:`U`,
+:data:`V` (the ftrace pattern vars ``u``/``v`` — emit-only) and the material
+*albedo* placeholder :data:`A` (no ftrace variable — a pure binding slot).  A
+:class:`SpatialExpr` reports its named inputs with :meth:`SpatialExpr.free_inputs`
+and binds them by rewrite with :meth:`SpatialExpr.substitute` — this is the
+substrate for materials-as-bundles (``gold(u=v, a=1)`` / ``(a=x*.5)`` authoring):
+loom resolves every binding to a concrete field in real ftrace variables at emit,
+so it never writes literal bundle syntax and stays renderable at every step.
+
 A :class:`SpatialExpr` evaluates two ways:
 
 - :meth:`SpatialExpr.eval_np` — numerically over numpy coordinate arrays (2-D
@@ -84,6 +93,42 @@ class SpatialExpr:
             yield n
             stack.extend(n.children())
 
+    # ---- named-input inspection / binding (J3b materials-as-bundles) -------
+    def _input_name(self):
+        return None  # a Surface leaf returns its binding name
+
+    def free_inputs(self, include_coords: bool = False) -> "frozenset[str]":
+        """The set of named input leaves present in the tree.
+
+        By default this is the *bindable* free-input set — the surface params
+        (:data:`U`, :data:`V`) and the albedo (:data:`A`) — which is exactly what
+        a material exposes for binding (``gold(u=v, a=1)``).  Pass
+        ``include_coords=True`` to also include the system-provided spatial
+        coordinates :data:`X`/:data:`Y`/:data:`Z`."""
+        out = set()
+        for n in self._walk():
+            nm = n._input_name()
+            if nm is None:
+                continue
+            if include_coords or not getattr(n, "is_coord", False):
+                out.add(nm)
+        return frozenset(out)
+
+    def substitute(self, mapping) -> "SpatialExpr":
+        """Return a copy of the tree with every named input leaf whose name is a
+        key of ``mapping`` replaced by ``mapping[name]`` (coerced into the spatial
+        algebra).  This is how a material binds its free inputs at emit —
+        ``gold(u=v)`` rewrites the :data:`U` leaf to the consumer's expression,
+        so loom always emits a concrete field in real ftrace variables and never
+        literal bundle syntax."""
+        kids = self.children()
+        if not kids:
+            return self
+        return self._rebuild([k.substitute(mapping) for k in kids])
+
+    def _rebuild(self, new_children) -> "SpatialExpr":
+        return self  # leaves have no children; interior nodes override
+
     def time_signals(self) -> List[Signal]:
         """The temporal Signals embedded as coefficients (deduped) — the DAG roots
         an :class:`Isosurface`/:class:`FuncPattern` must expose for cycle/cache."""
@@ -146,18 +191,57 @@ class _Const(SpatialExpr):
         return self.v
 
 
-class _Coord(SpatialExpr):
-    """A coordinate variable: axis 0/1/2 -> x/y/z."""
+class Surface(SpatialExpr):
+    """A named input leaf of the field / material grammar (J3b).
 
-    def __init__(self, axis: int, label: str) -> None:
+    Six singletons live on this class:
+
+    - :data:`X` / :data:`Y` / :data:`Z` — the spatial coordinates (axes 0/1/2).
+      Evaluated *both* ways: ``eval_np`` indexes the coordinate arrays and
+      ``emit`` writes the coordinate token.
+    - :data:`U` / :data:`V` — the surface parameters (ftrace pattern variables
+      ``u`` / ``v``).  **Emit-only**: they are real ftsl tokens so they render,
+      but they have no numpy twin, so ``eval_np`` raises (the 2-D raster backend
+      has no surface UV).
+    - :data:`A` — the material *albedo* input.  ftrace's pattern VM has **no**
+      ``a`` variable, so :data:`A` is a pure binding placeholder: it must be
+      substituted away (``substitute({'a': ...})``) or defaulted by the material
+      before ``emit``; emitting a bare :data:`A` raises.
+
+    A material's free-input set (:meth:`SpatialExpr.free_inputs`) is the union of
+    its properties' input leaves; binding rewrites those leaves by name with
+    :meth:`SpatialExpr.substitute` — ``gold(u=v, a=1)``."""
+
+    def __init__(self, name: str, *, axis: int = None, emit_ok: bool = True) -> None:
+        self.name = name
         self.axis = axis
-        self.label = label
+        self.is_coord = axis is not None
+        self._emit_ok = emit_ok
 
     def emit(self, coords, ctx) -> str:
-        return f"({coords[self.axis]})"
+        if self.axis is not None:
+            return f"({coords[self.axis]})"
+        if not self._emit_ok:
+            raise ValueError(
+                f"the material input '{self.name}' has no ftrace pattern "
+                f"variable; bind it (e.g. {self.name}=<expr>) or give the "
+                f"material an albedo default before emitting")
+        return f"({self.name})"
 
     def eval_np(self, coords, clock, cache):
-        return coords[self.axis]
+        if self.axis is not None:
+            return coords[self.axis]
+        raise ValueError(
+            f"the surface input '{self.name}' is emit-only (no numpy twin); it "
+            f"exists on the 3-D / material backend, not the 2-D raster path")
+
+    def _input_name(self):
+        return self.name
+
+    def substitute(self, mapping) -> "SpatialExpr":
+        if self.name in mapping:
+            return _coerce(mapping[self.name])
+        return self
 
 
 class _Time(SpatialExpr):
@@ -209,6 +293,9 @@ class _Bin(SpatialExpr):
     def children(self):
         return (self.a, self.b)
 
+    def _rebuild(self, new_children):
+        return _Bin(self.op, new_children[0], new_children[1])
+
     def emit(self, coords, ctx) -> str:
         return f"({self.a.emit(coords, ctx)}{self.op}{self.b.emit(coords, ctx)})"
 
@@ -223,6 +310,9 @@ class _Neg(SpatialExpr):
 
     def children(self):
         return (self.a,)
+
+    def _rebuild(self, new_children):
+        return _Neg(new_children[0])
 
     def emit(self, coords, ctx) -> str:
         return f"(-({self.a.emit(coords, ctx)}))"
@@ -243,6 +333,9 @@ class _Fn(SpatialExpr):
     def children(self):
         return tuple(self.args)
 
+    def _rebuild(self, new_children):
+        return _Fn(self.name, new_children, self.npfn)
+
     def emit(self, coords, ctx) -> str:
         inner = ",".join(a.emit(coords, ctx) for a in self.args)
         return f"{self.name}({inner})"
@@ -255,9 +348,12 @@ class _Fn(SpatialExpr):
 # leaf singletons + math functions (each emits a real ftsl pattern builtin)
 # ---------------------------------------------------------------------------
 
-X = _Coord(0, "x")
-Y = _Coord(1, "y")
-Z = _Coord(2, "z")
+X = Surface("x", axis=0)
+Y = Surface("y", axis=1)
+Z = Surface("z", axis=2)
+U = Surface("u")                    # surface param (emit-only)
+V = Surface("v")                    # surface param (emit-only)
+A = Surface("a", emit_ok=False)     # albedo binding placeholder (no ftrace var)
 T = _Time()
 
 
