@@ -74,13 +74,17 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`backward.h`** — CPU backward reference tracer (`radianceHero`).
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
+  Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,
+  per-λ connection terms under one shared hero-driven MIS weight; the splat
+  normalises by `1/min(nUp_light, nUp_eye)` instead of a per-subpath ×C boost).
 - **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.
 - **`spectrum.h` / `spectral_library.h` / `upsample.h` / `color.h` / `hero.h`** —
   spectral core: measured SPDs/materials, RGB→spectrum upsampling, CIE tables,
   hero-wavelength sampling (`kHeroC=4`: hero λ + 3 stratified secondaries) used by
-  R, A/B/C, M/S on CPU and the GPU forward megakernel. Emitter SPD sampling is
+  R, A/B/C, M/S and BDPT D on CPU and the GPU forward/backward megakernels.
+  Emitter SPD sampling is
   cached per light. Tabulated curves (FTSL `table { }` / `file:`) build a
   `Spectrum` via `tabulatedSpectrum` (piecewise-linear, default) or
   `tabulatedSpectrumMono` (opt-in `interp=cubic`: monotone Fritsch–Carlson/PCHIP —

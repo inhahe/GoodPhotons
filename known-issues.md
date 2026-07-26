@@ -352,7 +352,7 @@ second 12-byte random-access stream per visit only added traffic. Packing the CI
 into `DPhoton` itself would grow the struct 32→44B and tax every mode's deposit
 bandwidth, so that variant wasn't pursued either. Keep the CPU-side table only.
 
-### TECH-DEBT (2026-07-20, updated 2026-07-26): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S) and the whole GPU megakernel (forward A/B/C + M-deposit, backward R) — GPU wavefront, GPU BDPT, BDPT (D) and VCM (U) still single-λ
+### TECH-DEBT (2026-07-20, updated 2026-07-26): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S + BDPT D) and the whole GPU megakernel (forward A/B/C + M-deposit, backward R) — GPU wavefront, GPU BDPT and VCM (U) still single-λ
 `radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
 `tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
 **CPU photon-mapping modes M (photon map) + S (SPPM)** hero-wavelength spectral sampling (hero λ + 3 stratified
@@ -386,8 +386,32 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   de-hero fires): `-heroc 1` byte-identical to the pre-change binary at `-spp 1`; converged `-heroc 4` vs
   `-heroc 1` agree to 0.03 % mean luminance (both auto-expose 1.04e-13); chroma noise 0.540→0.416 (0.77×) at
   C=4 with luma flat; same wall-clock; media/GRIN scenes byte-identical between `-heroc 1` and `-heroc 4`.
-- **GPU BDPT megakernel** (`kBdpt`) and **BDPT (D)** — still 1 λ/photon.
-  Propagate the same shared wavelength-sampling + de-hero policy rather than copying the logic per mode.
+- **BDPT (mode D, CPU) — DONE 2026-07-26.** `src/bdpt.h` carries a `HeroBundle` (the C wavelengths + their
+  `invPdfLambda`, drawn once per sample from ONE stratified base draw) along **both** subpaths: `Vertex` gained
+  `betaSec[kHeroMax-1]` + `nUp`, `randomWalk` propagates the secondaries with a per-material
+  `secRatio[i] = f_{i+1}/f_hero` reweight and de-heros at every delta vertex, and all four `connectBDPT`
+  strategies evaluate `f`/`Le` per-λ into a `Lsec[]` out-parameter. Two design points worth remembering:
+  (a) every *sampling* decision is hero-driven, so **one** `misWeight` serves the whole bundle; (b) the ×C
+  de-hero boost used by the unidirectional tracers is deliberately **not** folded into the vertex throughputs —
+  two independently de-hero'd subpaths would square it — so each vertex records `nUp` and the splat normalises
+  once by `1/min(nUp_light, nUp_eye)`. Because Glossy is *connectible* (non-delta) in BDPT, mode D keeps the
+  bundle alive across glossy bounces, which the unidirectional tracers do not. Validated: `-heroc 1` on
+  `cornell` byte-identical to a pre-change rebuild; energy checked on `scenes/absolute.ftsl` (absolute mode =
+  fixed sensor gain, so the noisy p99 auto-exposure can't confound it) — `-heroc 4` matches `-heroc 1` to
+  **0.002 %** mean luminance at 2048 spp; chroma-noise RMS 0.1564→0.1247 (0.80×) with luma 0.2178→0.1967
+  (0.90×) at 128 spp vs a 2048-spp reference; `_fog_cornell.ftsl` byte-identical across `-heroc 1`/`4`
+  (media gate). Cost 1.19–1.38× wall-clock on these trivially light scenes, so still a win at equal time.
+  *Methodology note for future hero work:* never compare two runs by their printed `auto-exposure` — it is a
+  p99 statistic printed to 3 significant figures, worth ~±1 % on its own. Use an absolute-mode scene.
+- **GPU BDPT megakernel** (`kBdpt`) — still 1 λ/photon, and it is what `-device auto` picks for `-mode D`, so
+  hero BDPT currently needs an explicit `-mode D -device cpu`. Port the CPU `HeroBundle`/`nUp` scheme.
+- **Mirror and Filter de-hero even though they are achromatic in direction.** `randomWalk`'s rule is "every
+  delta vertex de-heros", which is right for dielectric / thin-film / multilayer / grating / half-mirror
+  (each picks its continuation by a wavelength-dependent process) but conservative for `Mirror` and `Filter`,
+  whose outgoing direction does not depend on λ. They could keep the bundle alive (only their per-λ
+  reflectance/transmittance would need a `secRatio`). Costs a little chroma-noise win in mirror-heavy scenes;
+  the same conservatism exists in the unidirectional tracers. Fix = give those two cases a `secRatio` and
+  exclude them from the `if (delta) nUp = 1;` collapse.
 - **Photon-mapping modes M (photon map) + S (SPPM) — DONE (CPU).** `tracePhotonHero`'s map deposit now writes
   **all `nUp` live wavelengths** as per-λ photon records (`for (i<nUp) depositPhoton(h.p, ray.d, h.n, lam[i],
   beta[i]);` in `src/render.h`), and the shared `tracePhotonPass` (`src/photonmap_render.h`, used by M and S) sets
@@ -396,7 +420,15 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   `base` and `nEmitted` counts PATHS, so the estimate is energy-identical to single-λ. Cost: up to C× more stored
   photons from one shared BVH walk (the intended chroma-noise win). **Mode U (VCM/UPS)** still single-λ — its
   BDPT-style light-subpath tracing (`src/vcm.h`) needs per-λ merge/connect (same complexity class as BDPT-D).
-- **Two known approximations in the CPU hero path** (both minor, documented for when they're revisited):
+- **Three known approximations in the CPU hero path** (all minor, documented for when they're revisited):
+  - **A zero hero throughput kills the whole bundle.** Every tracer terminates on the *hero's* throughput
+    (`betaFactor <= 0` in `bdpt.h`'s `randomWalk`, the RR tests in `render.h`/`backward.h`), and the secondary
+    reweight `secRatio[i] = f_i/f_hero` needs `f_hero > 0` anyway. So a surface that is exactly black at λ₀ but
+    coloured at λ₁ drops the secondaries' contribution. Harmless for ordinary reflectance spectra (which are
+    positive across the band) and impossible to hit when a single emitter drives the λ CDF; it can only bite a
+    scene with narrow, disjoint emitter lines *and* materials with exact spectral zeros. The proper fix is
+    PBRT-v4's formulation — carry the pdf itself as a per-λ spectrum and MIS across wavelengths — which is an
+    architecture change across every mode, not a local patch.
   - **Mix material stays multi-λ with a shared child selection.** Exact for constant mix weights; for *spectrally
     varying* mix weights with diffuse children it introduces a small bias (the child is picked by the hero λ's
     weight, secondaries ride along). Acceptable vs. de-heroing every Mix; revisit if a spectral-mix scene shows it.

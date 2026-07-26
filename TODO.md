@@ -2280,12 +2280,56 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           work per path). README + a `-herosplit` flag-table row; VERSION minor bump when shipped.
     - [ ] **U (VCM/UPS)** — carry the N λ along the light subpath and merge/connect per-λ (BDPT-level MIS). CPU + GPU.
     - [ ] **D (BDPT)** — carry the N λ along both subpaths; the connection term evaluates per-λ. GPU megakernel too.
+        - [x] **CPU (`src/bdpt.h`) — DONE 2026-07-26 (VERSION 0.60.0).** Both subpaths now carry the bundle.
+              `HeroBundle` (the C wavelengths + their `invPdfLambda`) is drawn once per sample from ONE stratified
+              base draw (`u + i/C` wrapped, through `scene.emitSampler.sampleAt`) and handed to
+              `generateCameraSubpath` / `generateLightSubpath` / `connectBDPT`, so both sides of every connection
+              speak about the same λ's. `Vertex` gained `betaSec[kHeroMax-1]` + `nUp`; `randomWalk` propagates the
+              secondaries with a per-material `secRatio[i] = f_{i+1}/f_hero` reweight (Diffuse/Fluorescent
+              `rho_i/rho_hero`, Glossy `r_i/r_hero`, DiffuseTransmit `rho_i(lobe)/rho_hero(lobe)` for the lobe the
+              hero's coin picked) and **de-heros at every delta vertex** (`nUp = 1`). All four `connectBDPT`
+              strategies (s==0 pure eye, t==1 light-image splat, s==1 NEE, interior) evaluate `f`/`Le` per-λ and
+              fill a `Lsec[]` out-parameter; every zero early-out became a max-over-live-λ test, since the hero can
+              legitimately be black where a secondary is not.
+              **The key derivation:** because every *sampling* decision (emitter pick, direction, NEE point, RR)
+              is hero-driven, the MIS weight is identical for all λ — so `misWeight` is computed **once** and
+              applied to the whole bundle. And the ×C de-hero boost the unidirectional tracers use is **NOT**
+              folded into the vertex throughputs here: two independently de-hero'd subpaths would square it.
+              Instead each vertex records `nUp` and the splat normalises once by
+              `1/min(nUp_light, nUp_eye)` — which collapses to exactly the scalar estimator when either side
+              de-hero'd, and is unbiased either way. Side benefit: **Glossy is non-delta in BDPT**, so unlike the
+              unidirectional tracers (which de-hero there) mode D keeps the full bundle across glossy bounces.
+              Gate mirrors `BackwardRenderer`: `heroC>1 && !scene.backwardMedium().enabled && !sceneHasGrin &&
+              !cam.hasLens()`; `main.cpp` wires `br.heroC = g_heroC`. **Validated** (all CPU, on scenes whose
+              dispersive SF10 sphere makes de-hero fire):
+              (a) `-heroc 1` on `cornell` at 200²/8 spp is **byte-identical** to a pre-change rebuild;
+              (b) **energy** — `scenes/absolute.ftsl` renders in absolute mode (fixed sensor gain, so the
+              tone-map is identical between runs and the noisy p99 auto-exposure can't confound the
+              comparison): at 2048 spp `-heroc 4` matches `-heroc 1` to **0.002 %** mean luminance;
+              (c) **noise** — vs a 2048-spp reference, at 128 spp chroma-noise RMS falls 0.1564→0.1247
+              (**0.80×**) and luma 0.2178→0.1967 (0.90×); the same measurement on `cornell` at 256 spp vs a
+              4096-spp reference gives 0.1119→0.0908 (0.81×) / 0.1603→0.1445 (0.90×) — consistent;
+              (d) **gate** — a media scene (`_fog_cornell.ftsl`) is byte-identical at `-heroc 1` and `-heroc 4`;
+              (e) smoke sweep over `material_presets` / `translucency` / `mixmat` / `textured` / `absolute`
+              runs clean. Cost 1.19–1.38× wall-clock (18.2s→21.6s at 256 spp on cornell), so still a win at
+              *equal time*; these are trivially light scenes, and the shared-BVH amortisation grows with
+              geometry. **Caveat:** don't compare hero runs by their printed `auto-exposure` — it is a p99
+              statistic printed to 3 significant figures, so two runs of the *same* estimator can differ by
+              ~1 % for reasons that have nothing to do with energy (this is why (b) uses absolute mode).
+        - [ ] **GPU BDPT megakernel** — the device BDPT (`-mode D` on GPU, which is what `-device auto` picks) is
+              still single-λ. Port the same `HeroBundle`/`nUp` scheme; the CPU version is the reference.
     - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
           through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy
           rather than four copies. Validate: every mode's converged image is unchanged vs the single-λ baseline (same
           tone-map) but reaches a given colour-noise level in ~fewer samples; dispersion/thin-film unaffected.
-    - [ ] **Docs + version** — README §"spectral" updated (ftrace becomes hero-wavelength, 4 λ/path); VERSION minor
-          bump; note any mode where the secondaries are deliberately dropped (e.g. hard-specular chains).
+    - [x] **Docs + version — DONE (rolling, through 0.59.0).** README's spectral bullet, the "what ftrace is
+          actually good at" §, the renderer-comparison table and the `-heroc <N>` flag row all state the current
+          coverage (CPU `A/B/C`, `R`, `M/S`; GPU megakernel `A/B/C`, `M`-deposit, `R`) and the exclusions
+          (GPU wavefront, BDPT `D`, VCM `U`, and any scene with media / GRIN / a finite-lens camera). The
+          deliberate secondary-drop is documented everywhere as the de-hero policy (dispersive or
+          wavelength-switching interface → secondaries terminated, hero boosted ×C — Wilkie et al. 2014 /
+          PBRT-v4 `TerminateSecondary`). VERSION took a minor bump per landing (…→0.59.0 for GPU mode R).
+          Re-check this box's wording whenever a further mode gains hero.
 
 Sequencing note: L1/L3/L4 are done (mode R). The remaining L-HERO work is a real, cross-mode spectral-core upgrade;
 start with the backward tracer (R) as the reference, then propagate the shared `HeroLambda` plumbing to A/B/C and D
