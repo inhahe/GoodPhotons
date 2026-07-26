@@ -1769,6 +1769,17 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          Validated: a bundle scene emits `.ftsl` ftrace parses & renders identically to the hand-authored
          `func_skin` path. Tests: `test_spatial.py` (+9), `test_material_bundle.py` (14). **Remaining:** part (b)
          `Image("path")` leaf (image-as-a-function-term) + item 4 (N-D input domain).
+         **PART (b) IS NOT ZERO-COST — needs an ftrace pattern-VM texture-sample op (2026-07-26 scoping).** Unlike
+         a/c/d, an `Image` leaf sampled *inside* a pattern/isosurface expression has **no** shipped ftrace target:
+         `src/pattern.h` `funcOp` has no texture/image builtin (only abs/sqrt/sin/…/noise), so emitting a `tex(...)`
+         call would be un-renderable — violating the "renderable at every commit" rule. The proper fix is a new
+         `PatOp::Tex` (a texture-sample-at-(u,v) op) threaded through: pattern compile (resolve `tex:<name>` →
+         texture index, needs the texture-index map in pattern scope), `PatNode` carrying the index, CPU eval
+         (reuse `Texture::scalarAt`), and the GPU pattern interpreter in `render_cuda.cu` (`dPatternEval`, which
+         already handles `VarU`/`VarV`; reuse the existing device sampler `dScalarAt`, render_cuda.cu:3426; upload
+         the per-pattern texture-index table). Bounded but cross-cutting + GPU + **VERSION bump** — a distinct
+         workstream from the pure-loom a/c/d, to be done as its own focused pass (in lockstep, it also wants the
+         numpy twin: PIL load + bilinear sample where coordinates permit).
          **`t` IS A FIRST-CLASS REBINDABLE INPUT (2026-07-19).** Don't treat `t` (clock time) as a magic ambient
          parameter — make it just one named input among `{t, x, y, z, u, v, a}`, rebindable by the same
          substitution as `u`/`v`/`a`. This unifies the Signal (temporal) and Surface (spatial) tiers *at the
