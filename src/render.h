@@ -1949,16 +1949,37 @@ struct Renderer {
                         camSpecularSplatAllHero(scene, cams, nCam, h.p,  h.n, lam, beta, rhoR, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p, -h.n, lam, beta, rhoT, nUp, rng);
                     }
-                    double sumHero = rhoR[0] + rhoT[0];
+                    // Lobe pick + RR over the whole bundle (see the Diffuse case): the
+                    // reflect/transmit probabilities are the per-lobe MAX over live λ, so no
+                    // secondary is ever amplified. The maxima can sum past 1 (each λ alone is
+                    // guarded), in which case both shrink proportionally. At nUp == 1 the two
+                    // maxima are rhoR[0]/rhoT[0] and every reweight is *= 1.0.
+                    double qR = rhoR[0], qT = rhoT[0];
+                    for (int i = 1; i < nUp; ++i) {
+                        if (rhoR[i] > qR) qR = rhoR[i];
+                        if (rhoT[i] > qT) qT = rhoT[i];
+                    }
+                    double sumHero = qR + qT;
+                    if (nUp > 1 && sumHero > 1.0) { qR /= sumHero; qT /= sumHero; sumHero = qR + qT; }
                     double uu = rng.uniform();
-                    if (uu < rhoR[0]) {                           // reflect (front)
-                        for (int i = 1; i < nUp; ++i) beta[i] *= rhoR[i] / rhoR[0];
+                    if (uu < qR) {                                // reflect (front)
+                        // The reweight is deterministic absorption — book it, or the energy
+                        // ledger loses the difference (sum/emitted would drop well below 1).
+                        for (int i = 0; i < nUp; ++i) {
+                            double w = rhoR[i] / qR;
+                            e.absorbed += beta[i] * (1.0 - w);
+                            beta[i] *= w;
+                        }
                         Vec3 wo = cosineHemisphere(h.n, rng);
                         double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
                         ray = Ray{h.p + h.n * 1e-6, wo}; continue;
                     } else if (uu < sumHero) {                    // transmit (back)
-                        for (int i = 1; i < nUp; ++i) beta[i] *= rhoT[i] / rhoT[0];
+                        for (int i = 0; i < nUp; ++i) {
+                            double w = rhoT[i] / qT;
+                            e.absorbed += beta[i] * (1.0 - w);
+                            beta[i] *= w;
+                        }
                         Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
                         double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
@@ -1966,14 +1987,46 @@ struct Renderer {
                     }
                     e.absorbed += activeSum(); return;
                 }
+                case MatType::Mirror:
+                case MatType::Filter:
+                case MatType::Glossy: {
+                    // ACHROMATIC delta lobes (mirrors the backward tracer's radianceHero):
+                    // specular — so no camera connect, exactly like the scalar path — but the
+                    // outgoing DIRECTION does not depend on λ, so the bundle keeps riding and
+                    // only the per-λ coefficient differs. The scalar lobe survives by ANALOG
+                    // Russian roulette on its coefficient; rolling that coin on the hero alone
+                    // would kill live secondaries whenever c_hero == 0 (a Wratten gel is 0 over
+                    // most of the spectrum) AND amplify by c_i/c_hero, so the survival
+                    // probability is the MAX over live λ and survivors reweight by c_i/q <= 1.
+                    double c[hero::kHeroMax];
+                    double q = 0.0;
+                    for (int i = 0; i < nUp; ++i) {
+                        c[i] = (m.type == MatType::Filter) ? clamp01(m.transmit(lam[i]))
+                                                           : clamp01(reflectSlot(scene, m, h, lam[i]));
+                        if (c[i] > q) q = c[i];
+                    }
+                    if (rng.uniform() >= q) { e.absorbed += activeSum(); return; }  // RR absorb
+                    for (int i = 0; i < nUp; ++i) {                                // bounded reweight
+                        double w = c[i] / q;
+                        e.absorbed += beta[i] * (1.0 - w);   // deterministic part of the absorption
+                        beta[i] *= w;
+                    }
+                    if (m.type == MatType::Mirror) {
+                        ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                    } else if (m.type == MatType::Filter) {
+                        ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
+                    } else {
+                        Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
+                        if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }  // below surface
+                        ray = Ray{h.p + h.n * 1e-6, o};
+                    }
+                    continue;
+                }
                 case MatType::Dielectric:
                 case MatType::ThinFilm:
                 case MatType::Multilayer:
-                case MatType::Mirror:
                 case MatType::Grating:
                 case MatType::HalfMirror:
-                case MatType::Filter:
-                case MatType::Glossy:
                 case MatType::Fluorescent: {
                     // Dispersive / wavelength-switching: terminate secondaries, then run
                     // the shared scalar interaction on the (boosted) hero channel.
@@ -1999,9 +2052,20 @@ struct Renderer {
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, wi, lam, beta, rho, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, lam, beta, rho, nUp, rng);
                     }
-                    double rhoHero = rho[0];
-                    if (rng.uniform() >= rhoHero) { e.absorbed += activeSum(); return; }  // hero RR absorb
-                    for (int i = 1; i < nUp; ++i) beta[i] *= rho[i] / rhoHero;            // secondary reweight
+                    // Continuation RR over the WHOLE bundle: the survival probability is
+                    // max_i rho_i, not the hero's own albedo, and every live λ reweights by
+                    // rho_i/q <= 1. Rolling the coin on the hero alone (beta[i] *= rho_i/rho_0)
+                    // amplifies a secondary by up to rho_max/rho_hero — on a saturated wall
+                    // (redWall spans 0.05..0.75) a 15x weight spike per bounce, which cancels
+                    // the whole stratification win. At nUp == 1, q == rho[0] and beta[0] *= 1.0.
+                    double q = rho[0];
+                    for (int i = 1; i < nUp; ++i) if (rho[i] > q) q = rho[i];
+                    if (rng.uniform() >= q) { e.absorbed += activeSum(); return; }        // RR absorb
+                    for (int i = 0; i < nUp; ++i) {                                       // bounded reweight
+                        double w = rho[i] / q;
+                        e.absorbed += beta[i] * (1.0 - w);   // deterministic part of the absorption
+                        beta[i] *= w;
+                    }
                     Vec3 wo = cosineHemisphere(h.n, rng);
                     double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
                     for (int i = 0; i < nUp; ++i) beta[i] *= corr;

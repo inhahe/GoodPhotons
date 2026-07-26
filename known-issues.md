@@ -446,9 +446,8 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   96²/64 spp, plus `abs_hero_delta` GPU 200²/2048 spp); the earlier BDPT-hero validation scenes are
   unregressed (`scenes/absolute.ftsl` −0.008 %, `scraps/abs_hero_mats.ftsl` −0.000 %, both exactly as before);
   smoke sweep `mirror_selfie` / `group` / `material_presets` / `translucency` / `mixmat` clean.
-  **Still conservative in the FORWARD tracers** (`src/render.h` `tracePhotonHero` and its device twin
-  `shadeStepHero`/`traceHeroPhoton`): there Mirror / Filter / Glossy still de-hero, and the diffuse
-  continuation still rolls the coin on the hero alone. The backward tracer got both fixes — next bullet.
+  The backward tracer got both fixes (next bullet) and the forward tracers after it (the one after that), so
+  every hero tracer now uses the max-over-live-λ rule.
 - **Backward tracer (mode R): achromatic delta lobes keep the bundle, and EVERY Russian roulette is now
   max-over-live-λ — DONE 2026-07-26 (VERSION 0.63.0).** Two changes to `radianceHero` (`src/backward.h`) and
   its device twin `bkRadianceHero` (`src/render_cuda.cu`), kept 1:1:
@@ -491,6 +490,45 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   so a 32768-spp reference contains the 16384-spp render verbatim. `rms(test − ref)` is then silently
   discounted by ~0.7× **for whichever estimator produced the reference**, which flatters the baseline. Use a
   reference at ≥16× the test spp (or a different estimator).
+- **Forward tracers (modes A/B/C + the M/S photon deposit): the same two fixes — DONE 2026-07-26
+  (VERSION 0.64.0).** `tracePhotonHero` (`src/render.h`) and its device twin `shadeStepHero`
+  (`src/render_cuda.cu`) got the identical pair of changes described in the previous bullet: Mirror / Filter /
+  Glossy stop de-heroing (achromatic delta lobes keep the bundle riding), and every continuation Russian
+  roulette — Diffuse, DiffuseTransmit and the new delta group — survives on `q = max_i c_i` with survivors
+  reweighting by `c_i/q ≤ 1` instead of rolling the coin on the hero and reweighting by `c_i/c_hero`.
+  **The forward tracers keep an energy ledger, which the previous bullet's tracer does not — and that
+  ledger caught a real bug in the first attempt.** The reweight `beta[i] *= c_i/q` is *deterministic
+  absorption*, so it has to be booked: without it `sum/emitted` fell to **0.6597** on
+  `scraps/abs_hero_delta.ftsl`. Each reweight loop now does `e.absorbed += beta[i] * (1 - w); beta[i] *= w;`
+  and the ledger closes at `1.000000` again. Booking it makes the ledger *exactly* consistent for the first
+  time: absorb books `Σβᵢ` with probability `1-q`, survivors book `Σβᵢ(1-ρᵢ/q)` and carry `Σβᵢρᵢ/q`, and
+  `(1-q)Σβᵢ + q·Σβᵢ = Σβᵢ` identically. The **old** ratio reweight never closed — it *created* ledger energy
+  (`sum/emitted` 1.00281 `cornell`, 1.00459 `group`, 1.00172 `material_presets`, 1.00743 `mixmat`,
+  1.00713 `abs_hero_diffuse`, 1.00696 `abs_hero_mats`; all now 0.999996 … 1.000003). Note this was a *ledger*
+  inconsistency, not image bias — `E[ρ₀ · βᵢρᵢ/ρ₀] = βᵢρᵢ` is correct, so the old estimator was unbiased in
+  expectation. What the amplification actually cost was **variance**: a very heavy-tailed weight
+  distribution, which is why the old hero-4 mean luminance can still read −0.25 % off at 200 M photons.
+  Noise RMS vs an 8 × 10⁹-photon `-heroc 1` reference, GPU mode B, 256², as (luma / chroma); every test at
+  200 M photons except the last column, which is single-λ given the *same wall-clock* as new hero-4:
+
+  | scene | single-λ | hero-4 before | **hero-4 after** | single-λ at equal time |
+  |---|---|---|---|---|
+  | `abs_hero_delta` (gold mirror + Wratten-58 gel + coloured walls) | 0.0460 / 0.0350 (2.9 s) | 0.0492 / 0.0342 (5.8 s) | **0.0289 / 0.0172** (7.3 s) | 0.0321 / 0.0228 (500 M, 6.8 s) |
+  | `abs_hero_diffuse` (coloured Cornell, no delta lobes) | 0.0407 / 0.0563 (2.9 s) | 0.0514 / 0.0539 (6.1 s) | **0.0254 / 0.0216** (7.8 s) | 0.0269 / 0.0361 (540 M, 7.4 s) |
+  | `abs_hero_mats` (glossy sphere + translucent leaf) | 0.0377 / 0.0587 (3.3 s) | 0.1069 / 0.0443 (7.1 s) | **0.0233 / 0.0239** (9.0 s) | 0.0247 / 0.0423 (545 M, 8.5 s) |
+
+  As in mode R, hero-4 *before* this change was a net **loss** in the forward tracers — worse luma than
+  single-λ at 2–2.5× the cost on all three scenes, catastrophically so on `abs_hero_mats` (0.1069 vs 0.0377,
+  with the mean luminance still −0.251 % off at 200 M photons — heavy tails, not bias). After, it is a genuine
+  win, but a **smaller one than mode R's ≈2.9× at equal noise**: forward hero shares only the *main path's* BVH walk, while the
+  per-λ camera splat / photon deposit costs a full C×, so the equal-time margin is ~1.1× luma and 1.3–1.8×
+  chroma on GPU (the chroma win is the point — that is what hero is for). CPU amortizes better
+  (`abs_hero_mats` 20 M photons: single-λ 0.1148 / 0.0973 in 6.5 s, hero-4 0.0641 / 0.0333 in 12.3 s ⇒ 1.30×
+  luma / 2.13× chroma at equal time). Mean luminance is unbiased (−0.007 % … +0.062 %, all within the tests'
+  own noise). Validated: `sum/emitted = 1.000000` on both backends; `-heroc 1` byte-identical to
+  `scraps/ftrace_base_c64cd9f.exe` on GPU (`abs_hero_delta` 50 M, md5 `c16c9efa…`) and CPU (3 M, md5
+  `145db925…`); **mode M** photon deposit unbiased (`abs_hero_mats` 8 M photons, hero-4 mean +0.002 % vs
+  `-heroc 1`, ledger 1.000000 both).
 - **Photon-mapping modes M (photon map) + S (SPPM) — DONE (CPU).** `tracePhotonHero`'s map deposit now writes
   **all `nUp` live wavelengths** as per-λ photon records (`for (i<nUp) depositPhoton(h.p, ray.d, h.n, lam[i],
   beta[i]);` in `src/render.h`), and the shared `tracePhotonPass` (`src/photonmap_render.h`, used by M and S) sets
@@ -500,16 +538,15 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   photons from one shared BVH walk (the intended chroma-noise win). **Mode U (VCM/UPS)** still single-λ — its
   BDPT-style light-subpath tracing (`src/vcm.h`) needs per-λ merge/connect (same complexity class as BDPT-D).
 - **Three known approximations in the CPU hero path** (all minor, documented for when they're revisited):
-  - **A zero hero throughput kills the whole bundle — now only in the FORWARD tracers.** `bdpt.h`'s
-    `randomWalk` (absolute `secF[]` + max-over-live-λ early-out) and `backward.h`'s `radianceHero` /
-    `bkRadianceHero` (max-over-live-λ RR everywhere) have both been fixed; only `render.h`'s `tracePhotonHero`
-    and its device twin still terminate on the *hero's* RR test with a `beta[i] *= rho_i/rho_hero` reweight
-    that needs `rho_hero > 0`. So a surface that is exactly black at λ₀ but
-    coloured at λ₁ drops the secondaries' contribution *there*. Harmless for ordinary reflectance spectra (which are
-    positive across the band) and impossible to hit when a single emitter drives the λ CDF; it can only bite a
-    scene with narrow, disjoint emitter lines *and* materials with exact spectral zeros. The proper fix is
-    PBRT-v4's formulation — carry the pdf itself as a per-λ spectrum and MIS across wavelengths — which is an
-    architecture change across every mode, not a local patch.
+  - **A zero hero throughput kills the whole bundle — FIXED everywhere (2026-07-26).** `bdpt.h`'s
+    `randomWalk` (absolute `secF[]` + max-over-live-λ early-out), `backward.h`'s `radianceHero` /
+    `bkRadianceHero`, and `render.h`'s `tracePhotonHero` / `shadeStepHero` all now survive on
+    `q = max_i c_i` rather than on the hero's own coefficient, so a surface that is exactly black at λ₀ but
+    coloured at λ₁ no longer drops the secondaries' contribution there. What remains unfixed is the deeper
+    issue this was a symptom of: the λ pdf is still a scalar hero pdf rather than a per-λ spectrum, so
+    hero sampling still cannot MIS across wavelengths. The proper fix is PBRT-v4's formulation — carry the
+    pdf itself as a per-λ spectrum and MIS across wavelengths — which is an architecture change across
+    every mode, not a local patch.
   - **Mix material stays multi-λ with a shared child selection.** Exact for constant mix weights; for *spectrally
     varying* mix weights with diffuse children it introduces a small bias (the child is picked by the hero λ's
     weight, secondaries ride along). Acceptable vs. de-heroing every Mix; revisit if a spectral-mix scene shows it.

@@ -70,7 +70,16 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   serial — bit-identical to the old serial code by construction. Per-implicit
   marching also runs in parallel across objects.
 - **`render.h`** — CPU forward tracer (modes A/B/C + photon deposit for M/S/P):
-  per-photon loop, Russian roulette, sphere-scan cos/sin tables, splatting.
+  per-photon loop, Russian roulette, sphere-scan cos/sin tables, splatting. The hero
+  variant `tracePhotonHero` follows the same **max over live λ** RR rule as
+  `backward.h` below (Diffuse, DiffuseTransmit's lobe pick, and the achromatic delta
+  lobes Mirror/Filter/Glossy, which keep the bundle) — with one extra obligation the
+  backward tracer doesn't have: the forward tracer keeps an **energy ledger**
+  (`emitted = absorbed + sensor + escaped + residual`), and the survivors' reweight
+  `beta[i] *= c_i/q` is *deterministic absorption*, so each reweight books
+  `e.absorbed += beta[i] * (1 - c_i/q)`. Omit that and `sum/emitted` collapses
+  (measured 0.66); the old ratio reweight *created* ledger energy (up to 1.007). With
+  the booking the ledger closes identically, which it never did before.
 - **`backward.h`** — CPU backward reference tracer (`radianceHero`). Every Russian
   roulette in the hero path uses the **max over live λ** as its survival
   probability, with survivors reweighting `thr[i] *= c_i/q ≤ 1` — never the hero's

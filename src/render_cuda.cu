@@ -4551,8 +4551,11 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
 
 // One hero bounce (called only while secAlive, so nUp == C). Handles the model-C catch,
 // escape/sensor bookkeeping, and the diffuse / diffuse-transmit lobes with per-λ deposit +
-// splat + Russian-roulette on the hero (secondaries reweighted by rho[i]/rho[0]). At any of
-// the nine specular / wavelength-switching materials it DE-HEROS (beta[0] *= C, secAlive =
+// splat. EVERY Russian roulette here survives on the MAX over live λ (q = max_i c_i) and
+// reweights survivors by c_i/q <= 1, so no secondary is ever amplified; at nUp == 1 that is
+// exactly the scalar analog RR with a *= 1.0 reweight. Mirror/Filter/Glossy are delta lobes
+// but ACHROMATIC (λ-independent outgoing direction), so the bundle keeps riding through them.
+// At the six dispersive / wavelength-switching materials it DE-HEROS (beta[0] *= C, secAlive =
 // false) and delegates that same hit to the shared scalar interactSpecular — from then on
 // the caller runs the ordinary single-λ shadeStep. No fog/GRIN here (gated out upstream).
 __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int camMode,
@@ -4606,16 +4609,37 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rhoR, nUp, rng);
             camSpecularSplatAllHero(sc, cs, camMode, h.p, nb, lam, beta, rhoT, nUp, rng);
         }
-        Real sumHero = rhoR[0] + rhoT[0];
+        // Lobe pick + RR over the whole bundle (see the diffuse tail): the reflect/transmit
+        // probabilities are the per-lobe MAX over live λ, so no secondary is ever amplified.
+        // The maxima can sum past 1 (each λ alone is guarded), in which case both shrink
+        // proportionally — guarded by nUp > 1 so the scalar path can never take that branch.
+        // At nUp == 1 the two maxima are rhoR[0]/rhoT[0] and every reweight is *= 1.0.
+        Real qR = rhoR[0], qT = rhoT[0];
+        for (int i = 1; i < nUp; ++i) {
+            if (rhoR[i] > qR) qR = rhoR[i];
+            if (rhoT[i] > qT) qT = rhoT[i];
+        }
+        Real sumHero = qR + qT;
+        if (nUp > 1 && sumHero > (Real)1) { qR /= sumHero; qT /= sumHero; sumHero = qR + qT; }
         Real uu = rng.uniform();
-        if (uu < rhoR[0]) {
-            for (int i = 1; i < nUp; ++i) beta[i] *= rhoR[i] / rhoR[0];
+        if (uu < qR) {
+            // The reweight is deterministic absorption — book it, or the energy ledger loses
+            // the difference (sum/emitted would drop well below 1).
+            for (int i = 0; i < nUp; ++i) {
+                Real w = rhoR[i] / qR;
+                eAbsorbed += (double)beta[i] * (double)((Real)1 - w);
+                beta[i] *= w;
+            }
             DVec3 wo = cosineHemisphere(h.n, rng);
             Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
             for (int i = 0; i < nUp; ++i) beta[i] *= corr;
             ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE;
         } else if (uu < sumHero) {
-            for (int i = 1; i < nUp; ++i) beta[i] *= rhoT[i] / rhoT[0];
+            for (int i = 0; i < nUp; ++i) {
+                Real w = rhoT[i] / qT;
+                eAbsorbed += (double)beta[i] * (double)((Real)1 - w);
+                beta[i] *= w;
+            }
             DVec3 wo = cosineHemisphere(nb, rng);
             Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
             for (int i = 0; i < nUp; ++i) beta[i] *= corr;
@@ -4625,9 +4649,42 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         return WF_TERMINATE;
     }
 
+    if (m.type == D_MIRROR || m.type == D_FILTER || m.type == D_GLOSSY) {
+        // ACHROMATIC delta lobes (device twin of render.h's Mirror/Filter/Glossy hero case):
+        // specular — so no camera connect, exactly like the scalar path — but the outgoing
+        // DIRECTION does not depend on λ, so the bundle keeps riding and only the per-λ
+        // coefficient differs. The scalar lobe survives by ANALOG Russian roulette on its
+        // coefficient; rolling that coin on the hero alone would kill live secondaries
+        // whenever c_hero == 0 (a Wratten gel is 0 over most of the spectrum) AND amplify by
+        // c_i/c_hero, so the survival probability is the MAX over live λ and survivors
+        // reweight by c_i/q <= 1.
+        Real c[hero::kHeroMax];
+        Real q = (Real)0;
+        for (int i = 0; i < nUp; ++i) {
+            c[i] = (m.type == D_FILTER) ? clamp01(specLookup(m.transmit, lam[i]))
+                                        : clamp01(dReflectSlot(sc, m, h, lam[i]));
+            if (c[i] > q) q = c[i];
+        }
+        if (rng.uniform() >= q) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+        for (int i = 0; i < nUp; ++i) {                     // bounded reweight
+            Real w = c[i] / q;
+            eAbsorbed += (double)beta[i] * (double)((Real)1 - w);   // deterministic absorption
+            beta[i] *= w;
+        }
+        if (m.type == D_MIRROR) {
+            DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o;
+        } else if (m.type == D_FILTER) {
+            ro = h.p + rd * RAY_EPS;   // straight through, direction unchanged
+        } else {
+            DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+            if (dot(o, h.n) <= 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+            ro = h.p + h.n * RAY_EPS; rd = o;
+        }
+        return WF_CONTINUE;
+    }
+
     if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER ||
-        m.type == D_MIRROR || m.type == D_GRATING || m.type == D_HALFMIRROR ||
-        m.type == D_FILTER || m.type == D_GLOSSY || m.type == D_FLUORESCENT) {
+        m.type == D_GRATING || m.type == D_HALFMIRROR || m.type == D_FLUORESCENT) {
         // Dispersive / wavelength-switching: terminate secondaries, boost the hero ×C, then
         // run the shared scalar interaction on the (now single-λ) hero channel.
         beta[0] *= (Real)C; secAlive = false;
@@ -4645,9 +4702,19 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
         camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rho, nUp, rng);
     }
-    Real rhoHero = rho[0];
-    if (rng.uniform() >= rhoHero) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
-    for (int i = 1; i < nUp; ++i) beta[i] *= rho[i] / rhoHero;   // secondary reweight
+    // Continuation RR over the WHOLE bundle: the survival probability is max_i rho_i, not the
+    // hero's own albedo, and every live λ reweights by rho_i/q <= 1. Rolling the coin on the
+    // hero alone (beta[i] *= rho_i/rho_0) amplifies a secondary by up to rho_max/rho_hero — on
+    // a saturated wall (redWall spans 0.05..0.75) a 15x weight spike per bounce, which cancels
+    // the whole stratification win. At nUp == 1, q == rho[0] and beta[0] *= 1.0.
+    Real q = rho[0];
+    for (int i = 1; i < nUp; ++i) if (rho[i] > q) q = rho[i];
+    if (rng.uniform() >= q) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+    for (int i = 0; i < nUp; ++i) {                              // bounded reweight
+        Real w = rho[i] / q;
+        eAbsorbed += (double)beta[i] * (double)((Real)1 - w);    // deterministic absorption
+        beta[i] *= w;
+    }
     DVec3 wo = cosineHemisphere(h.n, rng);
     Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
     for (int i = 0; i < nUp; ++i) beta[i] *= corr;

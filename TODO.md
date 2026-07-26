@@ -2373,8 +2373,8 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
               `abs_hero_delta` 200²/2048 spp) and CPU (`cornell` 96²/64 spp); the earlier scenes unregressed
               (`absolute` −0.008 %, `abs_hero_mats` −0.000 %, both exactly as before); smoke sweep
               `mirror_selfie` / `group` / `material_presets` / `translucency` / `mixmat` clean.
-              Renders in `png/hero_delta/`. Ported to the **backward** tracer in the next item; the **forward**
-              tracers still de-hero there.
+              Renders in `png/hero_delta/`. Ported to the **backward** tracer in the next item and to the
+              **forward** tracers in the one after that, so every hero tracer now keeps the bundle here.
         - [x] **Backward tracer (R): achromatic delta lobes + max-over-λ Russian roulette — DONE 2026-07-26
               (VERSION 0.63.0).** Two changes to `radianceHero` (`src/backward.h`) and its device twin
               `bkRadianceHero` (`src/render_cuda.cu`), kept 1:1. (1) `Mirror`/`Filter`/`Glossy` stop
@@ -2402,10 +2402,33 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
               regression, pinning it on the coloured diffuse walls. Renders in `png/hero_achroma2/`,
               `png/hero_diff/`, `png/hero_mats/`, `png/hero_gray/`. Full write-up in known-issues.md,
               including the reference-correlation measurement trap.
-        - [ ] **Same two fixes for the FORWARD tracers** (`src/render.h` `tracePhotonHero` + the device twins
-              `shadeStepHero`/`traceHeroPhoton`): Mirror/Filter/Glossy still de-hero there, and the diffuse /
-              diffuse-transmit continuation still uses `beta[i] *= rho_i/rho_hero`. Same expected win
-              (modes A/B/C and the M/S photon deposit).
+        - [x] **Same two fixes for the FORWARD tracers — DONE 2026-07-26 (VERSION 0.64.0).**
+              `tracePhotonHero` (`src/render.h`) and its device twin `shadeStepHero`
+              (`src/render_cuda.cu`) got the identical pair: Mirror/Filter/Glossy stop de-heroing, and
+              Diffuse / DiffuseTransmit / the new delta group all survive on `q = max_i c_i` with
+              survivors reweighting `beta[i] *= c_i/q ≤ 1`.
+              **The forward tracers keep an energy ledger, and it caught a bug the backward port could not
+              have:** the reweight is *deterministic absorption*, so it must be booked — without
+              `e.absorbed += beta[i]*(1-w)` the ledger fell to `sum/emitted = 0.6597`. With it the ledger
+              closes *exactly* for the first time — the **old** ratio reweight created ledger energy on
+              every scene tried (`sum/emitted` 1.00281 `cornell`, 1.00459 `group`, 1.00172
+              `material_presets`, 1.00743 `mixmat`, 1.00713 `abs_hero_diffuse`, 1.00696 `abs_hero_mats`;
+              all now 0.999996 … 1.000003). That was a ledger inconsistency, not image bias
+              (`E[ρ₀·βᵢρᵢ/ρ₀] = βᵢρᵢ` is correct); what the amplification cost was **variance**.
+              Noise RMS (luma / chroma) vs an 8e9-photon `-heroc 1` reference, GPU mode B 256², all tests
+              at 200 M photons: `abs_hero_delta` — single-λ 0.0460 / 0.0350 (2.9 s), hero-4 *before*
+              0.0492 / 0.0342 (5.8 s), *after* **0.0289 / 0.0172** (7.3 s), single-λ at equal time
+              0.0321 / 0.0228; `abs_hero_diffuse` — 0.0407 / 0.0563, before 0.0514 / 0.0539, after
+              **0.0254 / 0.0216**, equal-time single-λ 0.0269 / 0.0361; `abs_hero_mats` — 0.0377 / 0.0587,
+              before **0.1069** / 0.0443 (mean luminance still −0.251 % off — heavy tails), after
+              **0.0233 / 0.0239**, equal-time single-λ 0.0247 / 0.0423. So hero was a net *loss* in the
+              forward tracers too, and is now a win — but a **smaller** one than mode R's ≈2.9×, because
+              forward hero shares only the main path's BVH walk while the per-λ camera splat / photon
+              deposit costs a full C×: ~1.1× luma and 1.3–1.8× chroma at equal GPU time (CPU amortizes
+              better — `abs_hero_mats` 20 M: 0.1148 / 0.0973 in 6.5 s vs 0.0641 / 0.0333 in 12.3 s ⇒ 1.30×
+              luma / 2.13× chroma). `sum/emitted = 1.000000` on both backends, `-heroc 1` byte-identical,
+              mode M deposit unbiased (+0.002 %). Renders in `png/heroFwd/`, `png/heroFwdD/`,
+              `png/heroFwdM/`. Full write-up in known-issues.md.
     - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
           through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy
           rather than four copies. Validate: every mode's converged image is unchanged vs the single-λ baseline (same

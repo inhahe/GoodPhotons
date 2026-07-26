@@ -1060,9 +1060,9 @@ second:**
   al. 2014 / PBRT-v4 `TerminateSecondary`), so they reach a given colour-noise level in
   fewer samples (measured ~0.77× chroma-noise RMS at equal photons in the light tracers,
   ~0.87× in the photon map, ~0.77× in GPU mode `R`, ~0.80× in BDPT on a glass-sphere
-  Cornell box and as low as **0.42×** — with luma noise down 0.42× as well — on a
-  saturated glossy/translucent scene where the bundle never de-heros; luma otherwise
-  unchanged or better) while dispersion stays bit-for-bit intact.
+  Cornell box — which de-heros at the glass — and as low as **0.38–0.49× chroma with
+  0.55–0.63× luma** on saturated coloured interiors where the bundle rides the whole
+  path) while dispersion stays bit-for-bit intact.
   For photon mapping each traced path deposits all its live wavelengths as per-λ photon
   records, so total stored energy is unchanged. In BDPT *both* subpaths carry the same
   bundle and every connection is evaluated per-λ with a single shared MIS weight (all the
@@ -1073,15 +1073,19 @@ second:**
   mirror-and-Wratten-gel box, where de-heroing at the first mirror had left hero buying
   almost nothing). Mode `D`
   is hero-capable on **both** backends, and the CPU and GPU BDPT agree to 0.03%.
-  The **backward tracer (`-mode R`)** does the same on both backends: mirrors, gel
-  filters and glossy lobes keep the bundle, and — more importantly — every Russian
+  The **backward tracer (`-mode R`)** and the **forward tracers (`A/B/C`, and the `M`/`S`
+  photon deposit)** do the same on both backends: mirrors, gel filters and glossy lobes
+  keep the bundle, and — more importantly — every Russian
   roulette along the path survives on the *strongest* live wavelength rather than on the
   hero's own, so no wavelength is ever amplified by a `ρ(λᵢ)/ρ(λ_hero)` ratio. On
   saturated (strongly coloured) diffuse interiors that ratio used to cancel the whole
   benefit; mode `R` there went from "hero buys nothing in luma" to **0.42–0.52× noise
   RMS on luma *and* chroma** — a 4× variance cut for 1.35× the time, i.e. ~2.9× faster
-  to a given noise level. (The forward tracers `A/B/C` and the `M`/`S` deposit still use
-  the older, more conservative rule; see `known-issues.md`.)
+  to a given noise level. The forward tracers gain less, because they share only the
+  main path's BVH walk while the per-λ camera splat / photon deposit costs a full 4×:
+  ~1.1× luma and 1.3–1.8× chroma at equal GPU time (1.3× / 2.1× on CPU). Before the
+  fix hero was a net *loss* in both — up to 2.8× the luma noise of plain single-λ on a
+  glossy/translucent interior.
   Hero collapses to a single continuous
   wavelength the instant dispersion matters, so it *keeps* the forward photon map's true
   caustic splitting (below) rather than trading it away. Still single-λ **by design or
@@ -2185,7 +2189,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
-| `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S` and BDPT `D`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, and BDPT `D`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. In mode `R` the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`), VCM (`U`), and by any scene with participating media, a GRIN volume, or a finite-lens camera |
+| `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S` and BDPT `D`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, and BDPT `D`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. In modes `R` and `A`/`B`/`C` (and the `M`/`S` deposit) the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors in `R` and ~1.1× luma / 1.3–1.8× chroma at equal time in the forward modes. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`), VCM (`U`), and by any scene with participating media, a GRIN volume, or a finite-lens camera |
 | `-beams` / `-photonbeams` | **Decorrelated single-scatter volumetrics** for the shared forward mode-`B` multi-camera / flyby pass. Normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Deliberately omits the multiple-scatter haze wash (crisper bow). Runs on **CPU and GPU** (ported to the CUDA forward tracer; spectral-rainbow-phase media stay CPU-tabulated and fall back to CPU); needs ≥2 shared cameras + a scattering `medium`. No effect otherwise. |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
