@@ -1430,14 +1430,36 @@ replacement for the renderer or the primary editing tool.**
       selector (grey / per-object tint / **UV checker**). Orbiting the 3 spatial dims is the **view-only
       re-projection** the rotation rule calls for. A swept-mesh scene opens on the Meshes tab by default
       (its spine curves still populate the Curves tab). Verified via PrintWindow screenshot.
-      - **Still open (deferred):** (1) **textures** (image *or* formula). **Loom half DONE
-        2026-07-24** — the sidecar now emits a `materials` list (each material's `type`/`props` +
+      - **(1) textures** (image *or* formula) — ✅ **DONE 2026-07-26 (VERSION 0.58.0).** **Loom half
+        2026-07-24** — the sidecar emits a `materials` list (each material's `type`/`props` +
         the `texture` skin it binds, animated props evaluated at the clock) and a `textures` list
         (image `file`/encoding/filter/wrap, or formula `r`/`g`/`b`/`res` — `Texture` vs
-        `ProcTexture`), so the viewer finally sees *which* skin a mesh wears and where to get it.
-        4 new tests. **C++ half still open:** the Meshes tab must load the image (or bake the
-        `r/g/b` formula, the G5 procedural-skin path) into a D3D11 texture and sample it at the
-        mesh UVs instead of the UV-checker placeholder. (2) **Re-tessellation when rotating *into* a parameter/extra
+        `ProcTexture`), so the viewer sees *which* skin a mesh wears and where to get it.
+        4 new tests. A 5th test landed 2026-07-26 with the fix for a real serialisation bug: a
+        material *bundle* whose colour slot is a `SpatialExpr` lowers to a `ProcTexture` whose
+        channels are **live expression objects**, so the whole sidecar dump died with
+        `Object of type _Bin is not JSON serializable`; `_describe_texture` now bakes each channel
+        to its ftsl source at the clock via `ProcTexture._chan_str`, i.e. the viewer compiles the
+        *identical* string ftrace would. **C++ half 2026-07-26** — `SkinLib`/`Skin` in
+        `src/viewer_gui.cpp` decode every sidecar texture into a D3D11 SRV and the Meshes tab
+        gained a 4th colour mode, **texture** (now the default), which draws each triangle with
+        `PrimReserve`/`PrimVtx` at its **interpolated per-vertex UVs** (batching `PushTexture` per
+        material rather than per triangle) modulated by the lambert shade. Image skins go through
+        ftrace's own `Texture::load` (path tried verbatim, then relative to the sidecar dir);
+        formula skins are baked on the CPU through ftrace's own pattern VM
+        (`compilePatternExpr`/`patternEval`), a line-for-line mirror of `FtslLoader::addTexture`,
+        so the preview can't drift from the renderer. A `PatTexScope`/`PatCtx::texFn` pair lets a
+        formula sample an already-decoded image with `tex:<name>(u,v)` — same "images must be
+        declared above" ordering rule as ftrace. Linear texels are sRGB-encoded on upload
+        (IMMUTABLE `R8G8B8A8_UNORM`, ≤2048 px edge). Anything unusable — missing file, syntax
+        error, unknown `tex:` name — degrades to grey lambert and prints a red per-skin reason
+        under the pane instead of crashing or drawing black. `runViewerGui` also now calls
+        `ImGui_ImplWin32_EnableDpiAwareness()` + `ScaleAllSizes(dpi)`/`FontScaleDpi` so the whole
+        GUI renders at native resolution instead of being DWM-upscaled and blurry. Verified by
+        PrintWindow screenshot on a purpose-built 4-tube scene covering all four paths (image
+        skin, procedural formula, formula-sampling-an-image, no texture) plus a deliberately
+        broken sidecar for the error path.
+      - **Still open (deferred):** (2) **Re-tessellation when rotating *into* a parameter/extra
         dimension** via a latest-wins off-thread job queue. **Loom half DONE 2026-07-24** — the
         viewer↔loom **live re-introspection channel** (`ViewerSession`/`serve_viewer` in
         `loom.viewer`, plus a `python -m loom.viewer <scene.py>` CLI entry): a resident loom process
@@ -1496,7 +1518,8 @@ replacement for the renderer or the primary editing tool.**
         This replaces F7's static MC-mesh with the actual field for the native viewer too. New loom tests
         (6) + the whole loom suite green; C++ compiled with the new `ftsl.h`/`render_cuda.h` includes.
         *Deferred within F7:* the `-serve` streaming path (only needed if the raymarch is ever pushed to a
-        separate process) and F4's C++ texture display (image/formula → sampled D3D11 texture at mesh UVs).
+        separate process). (F4's C++ texture display — image/formula → sampled D3D11 texture at mesh UVs —
+        was still open when this was written; it landed 2026-07-26, see §F4.)
       - **How the primary path used to be scoped — RE-SCOPED 2026-07-24 after an architecture audit.** The
         field-raymarcher itself **already exists and already ships**: `-raster-gpu` (feature **G2**) casts
         primary rays straight at the implicit **with NO tessellation** — `renderIsoPreviewCuda` →

@@ -642,10 +642,20 @@ tools/loom/
   sliders for N-D grids. **F4 core is complete:** `_describe_element` emits each `SweptMesh`'s tessellated
   `mesh` (`vertices`/`faces`/`uvs`, from `sweep_rings`+`skin_rings` at the clock), and the viewer's
   **Meshes tab** (`collectMeshes`/`drawMeshPane`) draws it as a shaded, painter's-depth-sorted triangle
-  surface with two-sided lambert lighting, a wireframe overlay, and grey/per-object/UV-checker colouring
-  (orbiting is view-only). Deferred F4 pieces: real image/formula **textures** (needs materials to emit
-  their `skin`/`func_skin` into the sidecar — G5) and **off-thread re-tessellation when rotating into a
-  parameter dim** (needs a live viewer↔loom channel, since the static sidecar can't re-bake geometry).
+  surface with two-sided lambert lighting, a wireframe overlay, and grey/per-object/UV-checker/**texture**
+  colouring (orbiting is view-only). **F4 textures are complete:** `introspect` emits a `materials` list
+  (type/props + the resolved `texture` each binds) and a `textures` list — image skins as
+  `file`/`encoding`/`filter`/`wrap`, formula skins as their three `r`/`g`/`b` UV expressions + `res`.
+  `_describe_texture` **bakes** a formula channel to its ftsl source at the clock (`ProcTexture._chan_str`
+  + an `EmitCtx`), because a material *bundle* whose colour slot is a `SpatialExpr` lowers to a
+  `ProcTexture` holding live expression objects — those are neither JSON-serialisable (the sidecar dump
+  used to die outright) nor compilable by the viewer. In C++, `SkinLib` decodes each texture into a D3D11
+  SRV — images through ftrace's own `Texture::load`, formulas baked on the CPU through ftrace's own
+  `compilePatternExpr`/`patternEval` (with a `PatTexScope` so `tex:<name>(u,v)` resolves against images
+  declared above, exactly as in `FtslLoader::addTexture`) — and the Meshes tab draws each triangle at its
+  interpolated per-vertex UVs. Unusable skins degrade to grey with a printed reason. Still deferred:
+  **off-thread re-tessellation when rotating into a parameter dim** (needs the live viewer↔loom channel,
+  since the static sidecar can't re-bake geometry).
   **F7's MC-mesh fallback is complete:** `_describe_element` bakes each `IsoMesh`'s field to a
   marching-cubes mesh (`_iso_mesh_geometry`→`mcubes.mesh_field`) into the object's `mesh` key, so the
   existing Meshes tab draws the isosurface with no C++ change. **F7's primary path is also complete:**

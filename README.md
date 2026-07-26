@@ -2299,16 +2299,22 @@ selectable channel** or by **channels 0/1/2 → RGB**; **click any point to insp
 position and every channel value, and for N-D grids **per-extra-dim slice sliders** collapse
 the dims you're not viewing to a chosen lattice index. A **Meshes tab** draws `SweptMesh`
 surfaces (tubes, ribbons, blobs) as a **shaded, depth-sorted triangle mesh** — flat two-sided
-lambert lighting, an optional wireframe overlay, and grey / per-object-tint / UV-checker
-colouring; orbiting spins the existing tessellation (view-only). `IsoMesh` isosurfaces are
-baked to a marching-cubes mesh and shown in the same Meshes tab. When the sidecar carries a
+lambert lighting, an optional wireframe overlay, and grey / per-object-tint / UV-checker /
+**texture** colouring; orbiting spins the existing tessellation (view-only). In **texture**
+mode (the default) each mesh wears its **real skin**, sampled at the interpolated per-vertex
+UVs: an image texture is decoded with ftrace's own loader (paths resolve relative to the
+sidecar), and a procedural `r`/`g`/`b` formula skin is baked on the CPU through ftrace's own
+pattern VM — including `tex:<name>(u,v)` sampling of an image declared above it — so the
+preview matches what the renderer would produce. A mesh with no skin, or a skin that fails to
+load or compile, falls back to grey and the reason is printed under the pane. `IsoMesh`
+isosurfaces are baked to a marching-cubes mesh and shown in the same Meshes tab. When the sidecar carries a
 `source` key — the `.ftsl` `save_sidecar` emits beside it — a **Render tab** raymarches the
 *real* isosurface **field** in-process: it parses the `.ftsl` with ftrace's own `ftsl::load`
 and sphere-traces the field bytecode via `renderIsoPreviewCuda` (the `-raster-gpu` preview
 kernel — no tessellation), driven by an orbit camera (drag to rotate, wheel to dolly) with
 resolution and FOV controls, blitting each converged frame into a D3D11 texture. This is the
-actual field rather than the static marching-cubes mesh. (Still in progress: real mesh
-textures — see §F in `TODO.md`.)
+actual field rather than the static marching-cubes mesh. (Still in progress: live
+re-tessellation when you rotate *into* a parameter dimension — see §F in `TODO.md`.)
 
 ---
 

@@ -3751,3 +3751,23 @@ leading integer (`2`, `8`), rendering a near-black image from a handful of photo
 in `run()` (src/main.cpp): tokens containing `e`/`E`/`.` are now parsed as a double and
 rounded to the nearest count; plain integers still go through `atoll` exactly. Found while
 validating `-stereo`.
+
+## OPEN (minor, 2026-07-26): native `-viewer` Meshes tab ignores a skin's `clamp`/`mirror` wrap mode
+The F4 texture display (`SkinLib` in `src/viewer_gui.cpp`) uploads each skin as a plain
+D3D11 texture and lets **ImGui's own DX11 backend sampler** do the filtering — and that
+sampler is created once, with `D3D11_TEXTURE_ADDRESS_WRAP` on all three axes
+(`imgui_impl_dx11.cpp`, `ImGui_ImplDX11_CreateDeviceObjects`). So a sidecar texture
+declared `wrap="clamp"` or `wrap="mirror"` still *tiles* in the preview whenever a mesh's
+UVs run outside `[0,1]`. Everything else about the skin is faithful (ftrace's own
+`Texture::load` decodes images, ftrace's own pattern VM bakes formula skins), so this is
+the one place the preview can disagree with a real render. The nearest/bilinear `filter`
+mode *is* honoured, but only because the bake resamples through `Texture::sampleRgb` —
+the GPU sampler is always linear on top of that, so a `nearest` skin gets a faint
+smoothing at extreme magnification.
+
+**Proper fix:** stop relying on the shared backend sampler for skins. Either (a) give
+`SkinLib` its own `ID3D11SamplerState` per wrap/filter combination and bind it with an
+`ImDrawList` callback around the mesh draw (`AddCallback` → set sampler → restore), or
+(b) pre-expand the wrap mode into the *UVs* at bake time (clamp/mirror the per-vertex UVs
+on the CPU before `PrimVtx`), which is cheaper but only correct when a triangle doesn't
+straddle the tile boundary. (a) is the real answer.

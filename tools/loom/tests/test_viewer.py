@@ -433,6 +433,27 @@ def test_introspect_emits_image_and_formula_textures():
     assert tex["stripes"]["r"] == "u" and tex["stripes"]["res"] == 256
 
 
+def test_formula_texture_channels_are_baked_to_ftsl_strings():
+    """A material *bundle* with a spatial-field colour slot lowers to a
+    ``ProcTexture`` whose r/g/b channels are live ``SpatialExpr`` objects, not
+    strings (``ProcTexture._chan`` keeps anything with ``.emit``).  The sidecar must
+    bake them at the clock the way ``ProcTexture.emit`` does — otherwise the whole
+    JSON dump dies with "Object of type _Bin is not JSON serializable", and even a
+    ``repr`` fallback would hand the viewer something it cannot compile."""
+    from loom.scene import Material, Sphere
+    from loom.spatial import U, V
+    sc = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+    sc.add(Material("bundled", "diffuse", reflect=(0.5 + 0.5 * U, V, 0.25)),
+           Sphere((0, 0, 0), 1.0, "bundled"))
+    d = introspect(sc, clock=Clock.at_frame(0, 4))
+    tex = [t for t in d["textures"] if t["kind"] == "formula"]
+    assert tex, "bundle colour field should have produced a ProcTexture"
+    for ch in ("r", "g", "b"):
+        assert isinstance(tex[0][ch], str), f"channel {ch} not baked to a string"
+    assert "u" in tex[0]["r"] and "v" in tex[0]["g"]
+    json.dumps(d)          # the real regression: the sidecar must serialise at all
+
+
 def test_introspect_material_animated_prop_evaluated_at_clock():
     from loom.scene import Material, Sphere
     from loom.signals import Sine

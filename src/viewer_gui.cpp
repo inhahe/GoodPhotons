@@ -415,6 +415,203 @@ static std::vector<MeshGeom> collectMeshes(const Sidecar& sc) {
     return meshes;
 }
 
+// --------------------------------------------------------------------------
+// F4 — skins: the sidecar's `textures` + `materials` decoded into real GPU
+// textures the mesh pane samples at the mesh UVs (replacing the UV-checker
+// placeholder). Decoding goes through ftrace's OWN `Texture` (image files) and
+// pattern VM (procedural `rgb "r(u,v)" …` skins baked exactly the way
+// `FtslLoader::addTexture` bakes them), so the preview shows the same pixels the
+// renderer would — no second decoder to drift out of sync.
+// --------------------------------------------------------------------------
+struct Skin {
+    std::string               name;
+    Texture                   tex;            // decoded LINEAR rgb (ftrace's own)
+    ID3D11Texture2D*          d3d = nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    std::string               err;            // non-empty => unusable, shown in the UI
+    std::string               kind;           // "image" | "formula"
+};
+
+// Largest edge we upload. A skin may legitimately be 8192² (the ftsl `res` cap),
+// which is 256 MB of RGBA — far more than a preview pane can show. Anything bigger
+// is resampled down through the texture's own sampler (so its filter/wrap apply).
+static const int SKIN_MAX_EDGE = 2048;
+
+struct SkinLib {
+    std::vector<Skin>                    skins;
+    std::unordered_map<std::string, int> byName;      // texture name -> index
+    std::unordered_map<std::string, int> byMaterial;  // material name -> index
+    int nOk = 0;
+
+    // `tex:<name>(u,v)` inside a procedural skin resolves against the images decoded
+    // BEFORE it, mirroring ftrace's rule that a procedural texture can only sample
+    // images declared above it (both bake in sidecar/file order).
+    static int lookupThunk(const void* self, const char* name) {
+        const SkinLib* L = (const SkinLib*)self;
+        auto it = L->byName.find(name);
+        if (it == L->byName.end()) return -1;
+        return L->skins[it->second].tex.valid() ? it->second : -1;
+    }
+    static double sampleThunk(const void* self, int idx, double u, double v) {
+        const SkinLib* L = (const SkinLib*)self;
+        if (idx < 0 || idx >= (int)L->skins.size()) return 0.0;
+        return L->skins[idx].tex.scalarAt(u, v);
+    }
+
+    int forMaterial(const std::string& m) const {
+        auto it = byMaterial.find(m);
+        return (it == byMaterial.end()) ? -1 : it->second;
+    }
+    const Skin* skinFor(const std::string& material) const {
+        int i = forMaterial(material);
+        return (i < 0) ? nullptr : &skins[i];
+    }
+
+    void release() {
+        for (auto& s : skins) {
+            if (s.srv) { s.srv->Release(); s.srv = nullptr; }
+            if (s.d3d) { s.d3d->Release(); s.d3d = nullptr; }
+        }
+        skins.clear(); byName.clear(); byMaterial.clear(); nOk = 0;
+    }
+
+    // Decode one `textures[]` entry into `sk.tex` (or set sk.err).
+    void decode(const minijson::Value& t, Skin& sk, const std::string& baseDir) {
+        auto pick = [&](const char* key, const char* dflt) {
+            const minijson::Value* v = t.find(key);
+            return (v && v->isString()) ? v->str : std::string(dflt);
+        };
+        std::string flt = pick("filter", "bilinear");
+        sk.tex.filter = (flt == "nearest") ? TexFilter::Nearest : TexFilter::Bilinear;
+        std::string wr = pick("wrap", "repeat");
+        sk.tex.wrap = (wr == "clamp")  ? TexWrap::Clamp
+                    : (wr == "mirror") ? TexWrap::Mirror : TexWrap::Repeat;
+        sk.tex.name = sk.name;
+
+        if (sk.kind == "image") {
+            std::string file = pick("file", "");
+            if (file.empty()) { sk.err = "image skin has no `file`"; return; }
+            sk.tex.encoding = (pick("encoding", "srgb") == "linear")
+                                  ? TexEncoding::Linear : TexEncoding::sRGB;
+            // Paths in the sidecar are as the loom script authored them (usually
+            // relative to where it ran). Try verbatim first, then next to the sidecar.
+            std::string e1, e2;
+            if (!sk.tex.load(file, e1)) {
+                bool rel = file.size() < 2 || (file[1] != ':' && file[0] != '/' && file[0] != '\\');
+                if (rel && !baseDir.empty() && sk.tex.load(baseDir + file, e2)) return;
+                sk.err = e1;
+            }
+            return;
+        }
+        if (sk.kind != "formula") { sk.err = "unsupported skin kind '" + sk.kind + "'"; return; }
+
+        // Procedural skin: bake the three UV expressions to a res x res LINEAR grid,
+        // byte-for-byte the same loop as FtslLoader::addTexture (ftsl.h).
+        const char* chan[3] = { "r", "g", "b" };
+        std::vector<PatNode> prog[3];
+        PatTexScope scope{ this, &SkinLib::lookupThunk };
+        for (int k = 0; k < 3; ++k) {
+            std::string expr = pick(chan[k], "0");
+            std::string perr;
+            if (!compilePatternExpr(expr, prog[k], perr, false, &scope)) {
+                sk.err = std::string(chan[k]) + ": " + perr;
+                return;
+            }
+        }
+        const minijson::Value* rv = t.find("res");
+        int res = (rv && rv->isNumber()) ? (int)rv->num : 512;
+        res = std::min(std::max(res, 1), SKIN_MAX_EDGE);
+        sk.tex.encoding = TexEncoding::Linear;   // expr outputs are linear albedo
+        sk.tex.w = sk.tex.h = res;
+        sk.tex.rgb.assign((size_t)res * res, Vec3{0, 0, 0});
+        auto cl = [](double q) { return q < 0.0 ? 0.0 : (q > 1.0 ? 1.0 : q); };
+        for (int y = 0; y < res; ++y) {
+            double v = 1.0 - (y + 0.5) / res;    // matches sampleRgb's (1-v) flip
+            for (int x = 0; x < res; ++x) {
+                PatCtx c;
+                c.u = (x + 0.5) / res; c.v = v;
+                c.texFn = &SkinLib::sampleThunk; c.texSelf = this;
+                sk.tex.rgb[(size_t)y * res + x] =
+                    Vec3{ cl(patternEval(prog[0].data(), (int)prog[0].size(), c)),
+                          cl(patternEval(prog[1].data(), (int)prog[1].size(), c)),
+                          cl(patternEval(prog[2].data(), (int)prog[2].size(), c)) };
+            }
+        }
+    }
+
+    // Upload a decoded skin as an sRGB-encoded RGBA8 texture. `Texture::rgb` is
+    // LINEAR (that is what the renderer wants); the ImGui blit path is a plain
+    // pass-through to an 8-bit backbuffer, so gamma-encode here or every skin shows
+    // up washed-out dark.
+    bool upload(Skin& sk, ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+        if (!sk.tex.valid()) return false;
+        int W = std::min(sk.tex.w, SKIN_MAX_EDGE), H = std::min(sk.tex.h, SKIN_MAX_EDGE);
+        std::vector<uint8_t> px((size_t)W * H * 4);
+        for (int y = 0; y < H; ++y) {
+            // v runs the other way (sampleRgb flips it), so row 0 here is row 0 there.
+            double v = 1.0 - (y + 0.5) / H;
+            for (int x = 0; x < W; ++x) {
+                Vec3 c = sk.tex.sampleRgb((x + 0.5) / W, v);
+                uint8_t* d = &px[((size_t)y * W + x) * 4];
+                d[0] = (uint8_t)std::lround(std::clamp(srgbGamma(c.x), 0.0, 1.0) * 255.0);
+                d[1] = (uint8_t)std::lround(std::clamp(srgbGamma(c.y), 0.0, 1.0) * 255.0);
+                d[2] = (uint8_t)std::lround(std::clamp(srgbGamma(c.z), 0.0, 1.0) * 255.0);
+                d[3] = 255;
+            }
+        }
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = W; td.Height = H; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA sd = {};
+        sd.pSysMem = px.data();
+        sd.SysMemPitch = (UINT)W * 4;
+        if (dev->CreateTexture2D(&td, &sd, &sk.d3d) != S_OK) { sk.err = "CreateTexture2D failed"; return false; }
+        if (dev->CreateShaderResourceView(sk.d3d, nullptr, &sk.srv) != S_OK) {
+            sk.d3d->Release(); sk.d3d = nullptr;
+            sk.err = "CreateShaderResourceView failed";
+            return false;
+        }
+        (void)ctx;
+        return true;
+    }
+
+    void build(const Sidecar& sc, const std::string& baseDir,
+               ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+        release();
+        if (const minijson::Value* ts = sc.arr("textures")) {
+            for (const auto& t : ts->arr) {
+                if (!t.isObject()) continue;
+                Skin sk;
+                sk.name = scalarStr(t.find("name"), "");
+                sk.kind = scalarStr(t.find("kind"), "");
+                if (sk.name.empty()) continue;
+                decode(t, sk, baseDir);
+                // Register the NAME before uploading so a later procedural skin's
+                // `tex:` can resolve it (lookupThunk re-checks tex.valid()).
+                int idx = (int)skins.size();
+                skins.push_back(std::move(sk));
+                byName[skins[idx].name] = idx;
+                if (skins[idx].err.empty() && upload(skins[idx], dev, ctx)) ++nOk;
+            }
+        }
+        // A mesh names a MATERIAL; the skin it wears is that material's `texture:`
+        // binding, which the sidecar resolved for us (loom's `_describe_material`).
+        if (const minijson::Value* ms = sc.arr("materials")) {
+            for (const auto& m : ms->arr) {
+                if (!m.isObject()) continue;
+                std::string mn = scalarStr(m.find("name"), "");
+                const minijson::Value* tv = m.find("texture");
+                if (mn.empty() || !tv || !tv->isString()) continue;
+                auto it = byName.find(tv->str);
+                if (it != byName.end()) byMaterial[mn] = it->second;
+            }
+        }
+    }
+};
+
 } // namespace
 
 // --------------------------------------------------------------------------
@@ -894,24 +1091,39 @@ static void drawFieldPane(const std::vector<FieldGeom>& fields, FieldView& view)
 // F4 — mesh pane: SweptMesh tessellated surfaces as a shaded, depth-sorted
 // triangle mesh. Orbiting the 3 spatial dims is a view-only re-projection (no
 // re-tessellation, exactly as the F4 rule specifies for isometries of the shown
-// dims). Colour: flat lambert shading, per-object tint, or a UV checker.
+// dims). Colour: flat lambert shading, per-object tint, a UV checker, or the
+// material's real skin sampled per-pixel at the interpolated mesh UVs.
 // --------------------------------------------------------------------------
 struct MeshView {
     float yaw = 0.6f, pitch = 0.4f, zoom = 1.0f;
     bool  shade = true;         // flat lambert lighting
     bool  wire = false;         // wireframe overlay
-    int   colorBy = 0;          // 0 = grey, 1 = per-object tint, 2 = UV checker
+    int   colorBy = 3;          // 0 grey, 1 per-object tint, 2 UV checker, 3 texture
 };
 
-static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view) {
+static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
+                         const SkinLib& skins) {
     ImGui::TextUnformatted("Meshes - drag to orbit, wheel to zoom (view-only re-projection)");
     ImGui::Checkbox("shade", &view.shade); ImGui::SameLine();
     ImGui::Checkbox("wireframe", &view.wire); ImGui::SameLine();
     ImGui::SetNextItemWidth(150);
-    const char* cmodes[] = { "grey", "per-object tint", "UV checker" };
-    ImGui::Combo("colour", &view.colorBy, cmodes, 3);
+    const char* cmodes[] = { "grey", "per-object tint", "UV checker", "texture" };
+    ImGui::Combo("colour", &view.colorBy, cmodes, 4);
+    if (view.colorBy == 3) {
+        ImGui::SameLine();
+        if (skins.skins.empty())
+            ImGui::TextDisabled("(no textures in the sidecar - falls back to grey)");
+        else
+            ImGui::TextDisabled("(%d/%d skin(s) ready)", skins.nOk, (int)skins.skins.size());
+    }
 
+    // Reserve the footer rows (stats + one line per broken skin) BEFORE sizing the
+    // canvas — the canvas otherwise eats the whole remaining height and pushes them
+    // out of the window, which is exactly where a skin's error message must not go.
+    int footer = 1;
+    for (const auto& sk : skins.skins) if (!sk.err.empty()) ++footer;
     ImVec2 avail = ImGui::GetContentRegionAvail();
+    avail.y -= footer * ImGui::GetTextLineHeightWithSpacing();
     if (avail.y < 80.0f) avail.y = 80.0f;
     ImVec2 origin = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("mesh_canvas", avail);
@@ -1004,28 +1216,77 @@ static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view) {
     // back-to-front so nearer triangles overdraw farther ones
     std::sort(tris.begin(), tris.end(), [](const Tri& p, const Tri& q){ return p.depth < q.depth; });
 
+    // Which skin each mesh wears (mesh -> material -> texture), resolved once. A mesh
+    // with no UVs can't be textured however good its skin, so drop those to grey.
+    std::vector<ID3D11ShaderResourceView*> meshSrv(meshes.size(), nullptr);
+    if (view.colorBy == 3)
+        for (size_t mi = 0; mi < meshes.size(); ++mi) {
+            const Skin* sk = skins.skinFor(meshes[mi].material);
+            if (sk && sk->srv && (int)meshes[mi].uvs.size() >= 2 * meshes[mi].nverts)
+                meshSrv[mi] = sk->srv;
+        }
+
+    // Textured triangles go through the raw primitive API with per-VERTEX UVs, so the
+    // skin is interpolated across the face rather than sampled once at the centroid
+    // (what the UV-checker placeholder did). ImDrawList batches by texture, so we
+    // push a texture only when it actually changes along the depth order.
+    ID3D11ShaderResourceView* cur = nullptr;
     for (const Tri& t : tris) {
-        ImU32 base;
-        if (view.colorBy == 1)        base = tints[t.mi % 4];
-        else if (view.colorBy == 2) {  // UV checker at the triangle centroid
-            float u = (t.ua + t.ub + t.uc) / 3.0f, v = (t.va + t.vb + t.vc) / 3.0f;
-            int cu = (int)std::floor(u * 8.0f), cv = (int)std::floor(v * 8.0f);
-            bool on = ((cu + cv) & 1) != 0;
-            base = on ? IM_COL32(210, 210, 220, 255) : IM_COL32(90, 95, 110, 255);
-        } else                        base = IM_COL32(180, 185, 195, 255);
+        ID3D11ShaderResourceView* want = meshSrv.empty() ? nullptr : meshSrv[t.mi];
+        if (want != cur) {
+            if (cur)  dl->PopTexture();
+            if (want) dl->PushTexture((ImTextureID)(intptr_t)want);
+            cur = want;
+        }
         float s = view.shade ? t.shade : 1.0f;
-        int r = (int)(((base >> IM_COL32_R_SHIFT) & 0xFF) * s);
-        int g = (int)(((base >> IM_COL32_G_SHIFT) & 0xFF) * s);
-        int b = (int)(((base >> IM_COL32_B_SHIFT) & 0xFF) * s);
-        dl->AddTriangleFilled(t.a, t.b, t.c, IM_COL32(r, g, b, 255));
-        if (view.wire)
+        if (cur) {
+            // White modulated by the lambert term: ImGui multiplies vertex colour by
+            // the texel, so this shades the skin instead of replacing it. The v is
+            // flipped back because Texture::sampleRgb treats v=0 as the image BOTTOM
+            // while the uploaded D3D texture has v=0 at its top row.
+            int g = (int)(255.0f * s);
+            ImU32 col = IM_COL32(g, g, g, 255);
+            dl->PrimReserve(3, 3);
+            dl->PrimVtx(t.a, ImVec2(t.ua, 1.0f - t.va), col);
+            dl->PrimVtx(t.b, ImVec2(t.ub, 1.0f - t.vb), col);
+            dl->PrimVtx(t.c, ImVec2(t.uc, 1.0f - t.vc), col);
+        } else {
+            ImU32 base;
+            if (view.colorBy == 1)        base = tints[t.mi % 4];
+            else if (view.colorBy == 2) {  // UV checker at the triangle centroid
+                float u = (t.ua + t.ub + t.uc) / 3.0f, v = (t.va + t.vb + t.vc) / 3.0f;
+                int cu = (int)std::floor(u * 8.0f), cv = (int)std::floor(v * 8.0f);
+                bool on = ((cu + cv) & 1) != 0;
+                base = on ? IM_COL32(210, 210, 220, 255) : IM_COL32(90, 95, 110, 255);
+            } else                        base = IM_COL32(180, 185, 195, 255);
+            int r = (int)(((base >> IM_COL32_R_SHIFT) & 0xFF) * s);
+            int g = (int)(((base >> IM_COL32_G_SHIFT) & 0xFF) * s);
+            int b = (int)(((base >> IM_COL32_B_SHIFT) & 0xFF) * s);
+            dl->AddTriangleFilled(t.a, t.b, t.c, IM_COL32(r, g, b, 255));
+        }
+        if (view.wire) {
+            // A line is drawn from the atlas' white pixel, so it must NOT inherit a
+            // skin binding (it would come out tinted by whatever texel that UV lands
+            // on). Unbind first; the next textured triangle re-pushes. Wires stay
+            // interleaved with the fills, so nearer faces still hide farther edges.
+            if (cur) { dl->PopTexture(); cur = nullptr; }
             dl->AddTriangle(t.a, t.b, t.c, IM_COL32(30, 30, 36, 120), 1.0f);
+        }
     }
+    if (cur) dl->PopTexture();
     dl->PopClipRect();
 
     int totalTris = 0, totalV = 0;
     for (const auto& m : meshes) { totalTris += m.nfaces; totalV += m.nverts; }
     ImGui::Text("%d mesh(es), %d verts, %d tris", (int)meshes.size(), totalV, totalTris);
+
+    // Any skin that failed to decode is a real authoring error (a missing file, a bad
+    // formula) — surface it here rather than silently drawing grey.
+    for (const auto& sk : skins.skins)
+        if (!sk.err.empty())
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.45f, 1.0f),
+                               "skin '%s' (%s): %s", sk.name.c_str(),
+                               sk.kind.c_str(), sk.err.c_str());
 }
 
 // --------------------------------------------------------------------------
@@ -1437,6 +1698,13 @@ int runViewerGui(const std::string& sidecarPath) {
 #endif
 
     // --- window ---
+    // MUST precede window creation. Without it Windows DPI-*virtualizes* the process on
+    // a scaled display: the swapchain is created at the logical client size and the
+    // compositor upscales it, so every glyph and every 1-px mesh wireframe comes out
+    // blurry. Opting in makes the backbuffer native-resolution; the style/font scale
+    // below then restores the intended physical size (see just after ImGui::Begin-time
+    // setup) so the UI is crisp rather than merely small.
+    ImGui_ImplWin32_EnableDpiAwareness();
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0,
                        GetModuleHandle(nullptr), nullptr, nullptr, nullptr,
                        nullptr, L"FtraceViewer", nullptr };
@@ -1460,8 +1728,28 @@ int runViewerGui(const std::string& sidecarPath) {
     ImNodes::CreateContext();               // F5 modulator-DAG panel
     ImGui::GetIO().IniFilename = nullptr;   // don't litter an imgui.ini in the CWD
     ImGui::StyleColorsDark();
+    // Now that the backbuffer is native-resolution (EnableDpiAwareness above), scale
+    // the whole UI by the monitor's content scale so 13 px of font stays the same
+    // PHYSICAL size it was before — crisp instead of upscaled, not microscopic.
+    {
+        float dpi = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);
+        if (dpi > 1.0f) {
+            ImGui::GetStyle().ScaleAllSizes(dpi);
+            ImGui::GetStyle().FontScaleDpi = dpi;
+        }
+    }
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+    // F4 skins — needs the device, so it happens after CreateDeviceD3D. Relative
+    // image paths in the sidecar fall back to the sidecar's own directory.
+    SkinLib skins;
+    {
+        std::string baseDir;
+        size_t cut = sidecarPath.find_last_of("/\\");
+        if (cut != std::string::npos) baseDir = sidecarPath.substr(0, cut + 1);
+        skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
+    }
 
     bool done = false;
     bool firstFrame = true;   // one-shot: default-select the primary geometry tab
@@ -1552,7 +1840,7 @@ int runViewerGui(const std::string& sidecarPath) {
                 // unless the live Render tab is present, which takes priority.
                 ImGuiTabItemFlags mf = (firstFrame && !haveRender) ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem("Meshes", nullptr, mf)) {
-                    drawMeshPane(meshes, mview);
+                    drawMeshPane(meshes, mview, skins);
                     ImGui::EndTabItem();
                 }
             }
@@ -1574,6 +1862,7 @@ int runViewerGui(const std::string& sidecarPath) {
 #ifdef HAVE_CUDA
     rpane.release();   // free the raymarch texture before the D3D device goes away
 #endif
+    skins.release();   // ditto for the F4 skin textures
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImNodes::DestroyContext();
