@@ -2279,7 +2279,8 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           (de-hero is unbiased; splitting is a different, also-unbiased estimator — same mean, sharper caustics, more
           work per path). README + a `-herosplit` flag-table row; VERSION minor bump when shipped.
     - [ ] **U (VCM/UPS)** — carry the N λ along the light subpath and merge/connect per-λ (BDPT-level MIS). CPU + GPU.
-    - [ ] **D (BDPT)** — carry the N λ along both subpaths; the connection term evaluates per-λ. GPU megakernel too.
+    - [x] **D (BDPT) — DONE 2026-07-26 (CPU 0.60.0, GPU 0.61.0).** Both subpaths carry the N λ; the connection
+          term evaluates per-λ. CPU *and* GPU megakernel (sub-items below).
         - [x] **CPU (`src/bdpt.h`) — DONE 2026-07-26 (VERSION 0.60.0).** Both subpaths now carry the bundle.
               `HeroBundle` (the C wavelengths + their `invPdfLambda`) is drawn once per sample from ONE stratified
               base draw (`u + i/C` wrapped, through `scene.emitSampler.sampleAt`) and handed to
@@ -2316,8 +2317,37 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
               geometry. **Caveat:** don't compare hero runs by their printed `auto-exposure` — it is a p99
               statistic printed to 3 significant figures, so two runs of the *same* estimator can differ by
               ~1 % for reasons that have nothing to do with energy (this is why (b) uses absolute mode).
-        - [ ] **GPU BDPT megakernel** — the device BDPT (`-mode D` on GPU, which is what `-device auto` picks) is
-              still single-λ. Port the same `HeroBundle`/`nUp` scheme; the CPU version is the reference.
+        - [x] **GPU BDPT megakernel — DONE 2026-07-26 (VERSION 0.61.0).** 1:1 device port of the CPU scheme, so
+              the two can be diffed and neither drifts: `DHeroBundle` (C λ + their `invPdfLambda`, one stratified
+              base draw) is threaded through `dGenCameraSubpath` / `dGenLightSubpath` / `dRandomWalk` /
+              `dConnectBDPT`; same per-material `secRatio` set, same `if (delta) nUp = 1;` de-hero, one
+              `dMisWeight` for the whole bundle, and the same `1/min(nUp_light, nUp_eye)` normalisation at the
+              splat (not a ×C boost folded into `beta`). Same gate as the host CPU renderer:
+              `heroC>1 && mediaN==0 && !hasGrin && !cam.hasLens()`, applied inside `renderBdptCuda(..., int heroC)`
+              which `main.cpp` feeds `g_heroC`.
+              **The GPU-specific design point:** the per-vertex secondary throughputs live in a **parallel array**
+              (`pathSec[vertexIdx*secStride + i]`) instead of inside `DVertex`, and `kBdpt` became a template
+              `kBdptT<int NS>` on the secondary-slot count, so the scalar instantiation `kBdptT<0>` sizes those
+              arrays at 1 and costs **nothing**. This matters: `DVertex` is ~100 B and a thread frame holds
+              `2*BDPT_MAXV` = 22 of them (~8 KB of spilled local state already, at `__launch_bounds__(128,3)`), so
+              widening the struct would have cost the *scalar* path real occupancy. The hero instantiation adds
+              ~1.2 KB. **Validated:**
+              (a) `-heroc 1` on `cornell` 160²/256 spp is **byte-identical** to a pre-change rebuild;
+              (b) **energy** (absolute mode = fixed sensor gain) — `scenes/absolute.ftsl` at 2048 spp,
+              `-heroc 4` vs `1` = **−0.008 %** mean luminance; and on a new scratch scene
+              `scraps/abs_hero_mats.ftsl` (a `glossy` sphere + a `translucent` quad, chosen to exercise the two
+              per-λ reweights `absolute.ftsl` doesn't) **−0.000 %** at 4096 spp;
+              (c) **noise** — `absolute` at 128 spp vs a 32768-spp reference: chroma 0.1614→0.1270 (**0.79×**),
+              luma 0.2313→0.2087 (0.90×); `cornell` 200²/256 spp vs a 16384-spp reference: chroma
+              0.1195→0.0955 (**0.80×**), luma 0.1792→0.1645 (0.92×); and `abs_hero_mats` — where Glossy and
+              DiffuseTransmit are *both connectible*, so the bundle **never de-heros** — chroma 0.1794→0.0761
+              and luma 0.1508→0.0634, i.e. **0.42× on both**, a far bigger win than the dispersive scenes;
+              (d) **gates** — `_fog_cornell.ftsl` (media) and `scenes/realcam.ftsl` (finite lens) are each
+              byte-identical across `-heroc 1`/`4`;
+              (e) **cross-backend** — CPU vs GPU hero BDPT agree to **0.03 %** mean luminance on `absolute` at
+              2048 spp;
+              (f) smoke sweep `material_presets` / `translucency` / `mixmat` / `textured` at `-heroc 4` clean.
+              Cost 1.17–1.18× wall-clock, so a clear win at equal time. Renders in `png/bdpt_hero_gpu/`.
     - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
           through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy
           rather than four copies. Validate: every mode's converged image is unchanged vs the single-λ baseline (same

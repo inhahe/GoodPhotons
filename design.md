@@ -83,7 +83,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`spectrum.h` / `spectral_library.h` / `upsample.h` / `color.h` / `hero.h`** —
   spectral core: measured SPDs/materials, RGB→spectrum upsampling, CIE tables,
   hero-wavelength sampling (`kHeroC=4`: hero λ + 3 stratified secondaries) used by
-  R, A/B/C, M/S and BDPT D on CPU and the GPU forward/backward megakernels.
+  R, A/B/C, M/S and BDPT D on CPU and the GPU forward/backward/BDPT megakernels
+  (the GPU BDPT keeps its per-vertex secondaries in a parallel array and templates
+  `kBdptT<NS>` on the slot count, so the scalar instantiation costs no extra local
+  memory).
   Emitter SPD sampling is
   cached per light. Tabulated curves (FTSL `table { }` / `file:`) build a
   `Spectrum` via `tabulatedSpectrum` (piecewise-linear, default) or

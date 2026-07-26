@@ -192,9 +192,14 @@ bool cudaBdptSupported(const Scene& scene);
 // progress / request an early stop. A null `prog` renders all spp in one launch (the
 // historical path). Either way the result is bit-identical for a given spp (the RNG is
 // seeded on the global sample index, so chunking never changes the image).
+// `heroC` (`-heroc N`) > 1 carries a hero wavelength plus C-1 stratified secondaries down
+// BOTH subpaths of every sample (one shared BVH walk, one shared MIS weight, sharply lower
+// chroma noise). It is clamped to hero::kHeroMax and silently dropped to 1 for scenes the
+// hero walk does not cover (participating media, GRIN, a physical lens) — the same gate the
+// CPU BDPT applies. heroC <= 1 reproduces the original single-λ kernel bit-for-bit.
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction,
-                    const SppProgress* prog = nullptr);
+                    const SppProgress* prog = nullptr, int heroC = 1);
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
 // (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.

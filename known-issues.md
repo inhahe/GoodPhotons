@@ -352,13 +352,14 @@ second 12-byte random-access stream per visit only added traffic. Packing the CI
 into `DPhoton` itself would grow the struct 32→44B and tax every mode's deposit
 bandwidth, so that variant wasn't pursued either. Keep the CPU-side table only.
 
-### TECH-DEBT (2026-07-20, updated 2026-07-26): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S + BDPT D) and the whole GPU megakernel (forward A/B/C + M-deposit, backward R) — GPU wavefront, GPU BDPT and VCM (U) still single-λ
+### TECH-DEBT (2026-07-20, updated 2026-07-26): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S + BDPT D) and the whole GPU megakernel (forward A/B/C + M-deposit, backward R, BDPT D) — GPU wavefront and VCM (U) still single-λ
 `radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
 `tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
 **CPU photon-mapping modes M (photon map) + S (SPPM)** hero-wavelength spectral sampling (hero λ + 3 stratified
 secondaries, `hero.h` `kHeroC=4`). Its **device twin** (`traceHeroPhoton`/`genPhotonHero`/`shadeStepHero` in
 `src/render_cuda.cu`) now gives the **GPU forward megakernel** the same thing (modes A/B/C and the mode-M photon
-deposit), and `bkRadianceHero()` gives the **GPU backward megakernel** mode R (both DONE items below).
+deposit), `bkRadianceHero()` gives the **GPU backward megakernel** mode R, and the templated `kBdptT<NS>` gives
+the **GPU BDPT megakernel** mode D (all DONE items below).
 Validated: mode R on `cornell.ftsl` (chroma 0.89× overall / 0.74×
 spectral-dominated, luma flat); modes A/B/C on `cornell` mode B (chroma 0.77×, luma 0.97×, energy
 `sum/emitted≈1.0025`, dispersion intact); mode M on `cornell` (energy conserved exactly — auto-exposure identical,
@@ -403,8 +404,22 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   (media gate). Cost 1.19–1.38× wall-clock on these trivially light scenes, so still a win at equal time.
   *Methodology note for future hero work:* never compare two runs by their printed `auto-exposure` — it is a
   p99 statistic printed to 3 significant figures, worth ~±1 % on its own. Use an absolute-mode scene.
-- **GPU BDPT megakernel** (`kBdpt`) — still 1 λ/photon, and it is what `-device auto` picks for `-mode D`, so
-  hero BDPT currently needs an explicit `-mode D -device cpu`. Port the CPU `HeroBundle`/`nUp` scheme.
+- **GPU BDPT megakernel (`kBdptT`) — DONE 2026-07-26.** 1:1 device port of the CPU `HeroBundle`/`nUp` scheme:
+  `DHeroBundle` (C λ + their `invPdfLambda`), `dRandomWalk`/`dGenCameraSubpath`/`dGenLightSubpath`/`dConnectBDPT`
+  all carry the bundle, one `dMisWeight` per connection, `1/min(nUp_light, nUp_eye)` normalisation at the splat.
+  **Design point:** the per-vertex secondary throughputs live in a **parallel array** (`pathSec[v*secStride+i]`)
+  rather than inside `DVertex`, and the kernel is templated on `int NS` (secondary slots) so the scalar
+  instantiation `kBdptT<0>` sizes those arrays at 1 and pays *zero* extra local memory — `DVertex` is ~100 B ×
+  2·`BDPT_MAXV` per thread (~8 KB of spilled frame already), so widening the struct would have cost the scalar
+  path real occupancy. The host `renderBdptCuda(..., int heroC)` gates on
+  `heroC>1 && mediaN==0 && !hasGrin && !cam.hasLens()` and picks the `kBdptT<BDPT_NSEC>` vs `kBdptT<0>`
+  instantiation. Validated: `-heroc 1` byte-identical to a pre-change rebuild (`cornell` 160²/256 spp);
+  energy on `scenes/absolute.ftsl` (absolute mode = fixed gain) `-heroc 4` vs `1` = **−0.008 %** at 2048 spp, and
+  on a new glossy+translucent scratch scene `scraps/abs_hero_mats.ftsl` **−0.000 %** at 4096 spp; chroma noise
+  0.1614→0.1270 (0.79×) / luma 0.2313→0.2087 on `absolute`, 0.1195→0.0955 (0.80×) on `cornell`, and — because
+  Glossy and DiffuseTransmit are both connectible, so the bundle *never* de-heros there — **0.42× chroma AND
+  0.42× luma** on `abs_hero_mats`; cost 1.17–1.18×. Media (`_fog_cornell.ftsl`) and lens (`scenes/realcam.ftsl`)
+  gates byte-identical across `-heroc 1`/`4`. CPU vs GPU hero BDPT agree to **0.03 %** on `absolute` at 2048 spp.
 - **Mirror and Filter de-hero even though they are achromatic in direction.** `randomWalk`'s rule is "every
   delta vertex de-heros", which is right for dielectric / thin-film / multilayer / grating / half-mirror
   (each picks its continuation by a wavelength-dependent process) but conservative for `Mirror` and `Filter`,

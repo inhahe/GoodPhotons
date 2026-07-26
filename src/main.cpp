@@ -2692,7 +2692,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // through the same unified progress driver as the forward and mode-R renders.
         auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
-            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth, diffraction, p);
+            // g_heroC > 1 enables the hero-wavelength bundle on both subpaths; the kernel
+            // applies the media/GRIN/lens gate itself (matching the CPU BdptRenderer).
+            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth, diffraction, p, g_heroC);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
