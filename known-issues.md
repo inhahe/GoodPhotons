@@ -420,13 +420,36 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   Glossy and DiffuseTransmit are both connectible, so the bundle *never* de-heros there — **0.42× chroma AND
   0.42× luma** on `abs_hero_mats`; cost 1.17–1.18×. Media (`_fog_cornell.ftsl`) and lens (`scenes/realcam.ftsl`)
   gates byte-identical across `-heroc 1`/`4`. CPU vs GPU hero BDPT agree to **0.03 %** on `absolute` at 2048 spp.
-- **Mirror and Filter de-hero even though they are achromatic in direction.** `randomWalk`'s rule is "every
-  delta vertex de-heros", which is right for dielectric / thin-film / multilayer / grating / half-mirror
-  (each picks its continuation by a wavelength-dependent process) but conservative for `Mirror` and `Filter`,
-  whose outgoing direction does not depend on λ. They could keep the bundle alive (only their per-λ
-  reflectance/transmittance would need a `secRatio`). Costs a little chroma-noise win in mirror-heavy scenes;
-  the same conservatism exists in the unidirectional tracers. Fix = give those two cases a `secRatio` and
-  exclude them from the `if (delta) nUp = 1;` collapse.
+- **Mirror and Filter no longer de-hero in BDPT (mode D) — DONE 2026-07-26.** `randomWalk`'s old rule was
+  "every delta vertex de-heros", which is right for dielectric / thin-film / multilayer / grating / half-mirror
+  (each picks its continuation by a wavelength-dependent process) but needlessly conservative for `Mirror` and
+  `Filter`, whose outgoing direction does not depend on λ at all. Both now set a `keepBundle` flag that opts
+  them out of the `if (delta) nUp = 1;` collapse and carry the secondaries on a per-λ factor instead (CPU
+  `src/bdpt.h` + GPU `src/render_cuda.cu` `dRandomWalk`, kept 1:1).
+  **This forced a real correctness fix, not just a policy tweak.** The per-λ factor used to be a *ratio* to
+  the hero's (`secRatio[i] = f_i / f_hero`), which is undefined exactly where it matters most: a Wratten gel's
+  `T(λ)` is legitimately **0** across most of the spectrum, so `T(λ_hero) == 0` while a secondary is wide
+  open. The old code's `if (f_hero <= 0) terminate` then dropped the whole bundle including the live
+  secondaries — measured **−4.9 %** energy on a Wratten-58 test scene. The array is now the **absolute**
+  per-λ factor `secF[i] = f_i·cos/pdf_hero` (plus a `secChromatic` flag for the λ-independent cases, which
+  just reuse `betaFactor`), and the early-out became a **max-over-live-λ** test. That also removes the same
+  latent bias for Diffuse / Glossy / DiffuseTransmit, whose spectral albedo can hit exactly 0 at the hero λ.
+  With `nUp == 1` every hero loop is empty and `mxF == betaFactor`, so it is the old scalar test verbatim.
+  **Validated** on a new scratch scene `scraps/abs_hero_delta.ftsl` (absolute mode; a `metal:gold` mirror back
+  wall + sphere and a `filter:wratten-58` gel pane, so nearly every path crosses one):
+  energy `-heroc 4` vs `1` = **−0.006 %** at 2048 spp (was −3.978 % with the ratio formulation, and the two
+  lobes isolated separately gave mirror −0.006 % / filter −4.894 %, pinning it on the filter);
+  noise at 128 spp vs a 32768-spp reference — single-λ chroma 0.1801 / luma 0.3685, hero-4 *before* this
+  change 0.1676 / 0.3522 (0.93× / 0.96× — the bundle died at the first mirror, so hero bought almost
+  nothing), hero-4 *after* **0.0842 / 0.2086 = 0.47× chroma and 0.57× luma**;
+  `-heroc 1` byte-identical to the pre-change build on both backends (`cornell` GPU 160²/256 spp and CPU
+  96²/64 spp, plus `abs_hero_delta` GPU 200²/2048 spp); the earlier BDPT-hero validation scenes are
+  unregressed (`scenes/absolute.ftsl` −0.008 %, `scraps/abs_hero_mats.ftsl` −0.000 %, both exactly as before);
+  smoke sweep `mirror_selfie` / `group` / `material_presets` / `translucency` / `mixmat` clean.
+  **Still conservative in the unidirectional tracers** (`src/render.h` `tracePhotonHero`, `src/backward.h`
+  `radianceHero`, and their device twins): there Mirror and Filter survive by *Russian roulette* on r(λ)/T(λ)
+  with `beta` unchanged, so keeping the bundle needs the survival coin to be the hero's with a per-λ
+  `beta[i] *= r_i/r_hero` reweight — a different (and more invasive) change than the BDPT throughput multiply.
 - **Photon-mapping modes M (photon map) + S (SPPM) — DONE (CPU).** `tracePhotonHero`'s map deposit now writes
   **all `nUp` live wavelengths** as per-λ photon records (`for (i<nUp) depositPhoton(h.p, ray.d, h.n, lam[i],
   beta[i]);` in `src/render.h`), and the shared `tracePhotonPass` (`src/photonmap_render.h`, used by M and S) sets

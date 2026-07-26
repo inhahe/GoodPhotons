@@ -6567,13 +6567,17 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 
         DVec3 wo = normalize(path[cur - 1].p - path[cur].p);
         DVec3 wi; double pdfW = 0, pdfRevW = 0, betaFactor = 0; int delta = 0; bool terminate = false;
-        // Hero bundle: per-secondary throughput factor RELATIVE to the hero's, i.e.
-        // secRatio[i] = f_{i+1}·cos / (f_hero·cos) for the lobe the hero actually sampled.
-        // Everything wavelength-independent (all the geometry, the glossy lobe, the adjoint
-        // correction) leaves it at 1, so only the λ-dependent albedos below fill it in.
-        // Ignored entirely when nUp == 1.
-        double secRatio[BDPT_NSEC];
-        for (int i = 0; i + 1 < nUp; ++i) secRatio[i] = 1.0;
+        // Mirror / Filter are delta but choose their continuation WITHOUT consulting λ,
+        // so the secondaries can ride through them; they set keepBundle to opt out of
+        // the `if (delta) nUp = 1` collapse below (device twin of bdpt.h).
+        bool keepBundle = false;
+        // Hero bundle: per-secondary throughput factor secF[i] = f_{i+1}·cos/pdf for the
+        // lobe the hero actually sampled (pdf is always the hero's). ABSOLUTE, not a ratio
+        // to the hero's — a ratio is undefined exactly where it matters most, a chromatic
+        // lobe whose hero value is 0 while a secondary's is not. Wavelength-INDEPENDENT
+        // cases leave `secChromatic` false and reuse `betaFactor`. Ignored when nUp == 1.
+        double secF[BDPT_NSEC];
+        bool secChromatic = false;
         switch (mp->type) {
             case D_DIFFUSE:
             case D_FLUORESCENT: {
@@ -6583,9 +6587,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = rho;
-                if (rho <= 0) terminate = true;
-                else for (int i = 0; i + 1 < nUp; ++i)
-                    secRatio[i] = clamp01(dDiffuseRho(sc, *mp, h, hb.lam[i + 1])) / rho;
+                secChromatic = true;                  // rho <= 0 is caught by the max test
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(dDiffuseRho(sc, *mp, h, hb.lam[i + 1]));
                 break;
             }
             case D_GLOSSY: {
@@ -6596,13 +6600,14 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = r;
-                if (r <= 0 || pdfW <= 0) terminate = true;
+                if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the max test
                 // The glossy LOBE (mirror direction + roughness exponent) carries no
                 // wavelength dependence, so the whole bundle follows the sampled direction
                 // and only the reflectance differs per λ. (The unidirectional hero tracers
                 // de-hero here instead — see known-issues.md.)
-                else for (int i = 0; i + 1 < nUp; ++i)
-                    secRatio[i] = clamp01(dReflectSlot(sc, *mp, h, hb.lam[i + 1])) / r;
+                secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(dReflectSlot(sc, *mp, h, hb.lam[i + 1]));
                 break;
             }
             case D_DIFFUSETRANSMIT: {
@@ -6625,18 +6630,22 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 // The lobe was CHOSEN by the hero's albedo split, so each secondary divides
                 // by the HERO's albedo for that lobe, not its own:
                 // f_i·cos/pdf_hero = rho_i(lobe) · tot_hero / rho_hero(lobe).
+                secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i) {
                     double rR, rT; dDiffuseTransmitAlbedos(sc, *mp, h, hb.lam[i + 1], rR, rT);
                     double num = reflLobe ? rR   : rT;
                     double den = reflLobe ? rhoR : rhoT;
-                    secRatio[i] = (den > 0.0) ? num / den : 0.0;
+                    secF[i] = (den > 0.0) ? num * tot / den : 0.0;
                 }
                 break;
             }
             case D_MIRROR: {
                 double r = clamp01(specLookup(mp->reflect, lambda));
                 wi = reflectv(rd, path[cur].ns); betaFactor = r; delta = 1;
-                if (r <= 0) terminate = true;
+                // Mirror direction is λ-independent: keep the bundle, reweight per-λ.
+                keepBundle = true; secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(specLookup(mp->reflect, hb.lam[i + 1]));
                 break;
             }
             case D_DIELECTRIC: {
@@ -6656,7 +6665,12 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 // Colored gel filter: straight-through delta, throughput ×= T(lambda).
                 double t = clamp01(specLookup(mp->transmit, lambda));
                 wi = rd; betaFactor = t; delta = 1;
-                if (t <= 0) terminate = true;
+                // Straight-through for every λ: keep the bundle, reweight per-λ. This is
+                // the case with the widest per-λ spread (a Wratten gel is 0 over most of
+                // the spectrum), and the reason secF is absolute rather than a ratio.
+                keepBundle = true; secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(specLookup(mp->transmit, hb.lam[i + 1]));
                 break;
             }
             case D_THINFILM: {
@@ -6681,14 +6695,20 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             default: terminate = true; break;
         }
-        if (terminate || betaFactor <= 0.0) return;
+        // Kill the walk only when EVERY live wavelength is dead: the hero's own factor can
+        // legitimately be 0 while a secondary's is not (gel filter, saturated spectral
+        // reflectance), and dropping the bundle there biases low. nUp == 1 -> empty loop ->
+        // mxF == betaFactor, i.e. exactly the old scalar test.
+        double mxF = betaFactor;
+        if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
+        if (terminate || mxF <= 0.0) return;
 
         path[cur].delta = delta;
         if (delta) { pdfW = 0.0; pdfRevW = 0.0; }
         path[cur - 1].pdfRev = dConvertDensity(pdfRevW, path[cur], path[cur - 1]);
 
         beta *= betaFactor;
-        for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= betaFactor * secRatio[i];
+        for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
         // Veach adjoint shading-normal correction on the LIGHT subpath only (1 when
         // ns==ng). wo = toward previous (light-side) vertex; wi = sampled continuation.
         if (importance && !delta) {
@@ -6701,9 +6721,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // half-mirror ...) picks a direction the secondaries cannot follow, so the bundle
         // collapses to the hero from here on. The vertex JUST pushed keeps its full nUp (it
         // really was reached by all C wavelengths); only its continuation is single-λ.
-        // Mirror and Filter are delta but wavelength-INDEPENDENT in direction — they could
-        // stay multi-λ; see known-issues.md.
-        if (delta) nUp = 1;
+        // EXCEPTION: Mirror and Filter are delta but wavelength-INDEPENDENT in direction,
+        // so they set keepBundle and carry the secondaries on a per-λ secF instead.
+        if (delta && !keepBundle) nUp = 1;
         double sgn = dot(wi, path[cur].ng) >= 0.0 ? 1.0 : -1.0;
         ro = path[cur].p + path[cur].ng * (Real)(sgn * 1e-6);
         rd = normalize(wi);

@@ -77,6 +77,11 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,
   per-λ connection terms under one shared hero-driven MIS weight; the splat
   normalises by `1/min(nUp_light, nUp_eye)` instead of a per-subpath ×C boost).
+  The per-λ scatter factor `secF[]` is **absolute** (`f_i·cos/pdf_hero`), never a
+  ratio to the hero's, and the walk's early-out is a max over live λ — so a lobe
+  whose hero value is 0 (a gel filter, a saturated albedo) can't drop live
+  secondaries. Delta vertices de-hero *except* Mirror and Filter, which pick their
+  continuation without consulting λ and so set `keepBundle`.
 - **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.

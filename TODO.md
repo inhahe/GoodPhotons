@@ -2348,6 +2348,35 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
               2048 spp;
               (f) smoke sweep `material_presets` / `translucency` / `mixmat` / `textured` at `-heroc 4` clean.
               Cost 1.17–1.18× wall-clock, so a clear win at equal time. Renders in `png/bdpt_hero_gpu/`.
+        - [x] **Mirror / Filter keep the bundle — DONE 2026-07-26 (VERSION 0.62.0).** `Mirror` and `Filter`
+              are delta, but neither consults λ to pick its continuation (a mirror reflects, a gel passes
+              straight through), so the "every delta vertex de-heros" rule was leaving free chroma-noise on
+              the table in mirror-heavy scenes. Both now set a `keepBundle` flag that skips the
+              `if (delta) nUp = 1;` collapse (CPU `bdpt.h` + GPU `render_cuda.cu`, kept 1:1).
+              **This exposed a genuine bias in the ratio formulation.** The per-λ factor was `secRatio[i] =
+              f_i / f_hero`, which is undefined precisely where it matters: a Wratten gel's `T(λ)` is
+              legitimately **0** across most of the spectrum, so `T(λ_hero) == 0` while a secondary is wide
+              open — and the old `if (f_hero <= 0) terminate` then threw away the live secondaries too
+              (measured **−4.9 %** energy). The array is now the **absolute** factor
+              `secF[i] = f_i·cos/pdf_hero` (with a `secChromatic` flag so the λ-independent lobes just reuse
+              `betaFactor`), and the early-out became a **max-over-live-λ** test — which also removes the
+              same latent bias for Diffuse / Glossy / DiffuseTransmit when a spectral albedo hits exactly 0
+              at the hero λ. At `nUp == 1` every hero loop is empty and `mxF == betaFactor`, i.e. the old
+              scalar test verbatim. **Validated** on a new scene `scraps/abs_hero_delta.ftsl` (absolute mode,
+              `metal:gold` mirror back wall + sphere, `filter:wratten-58` gel pane):
+              energy `-heroc 4` vs `1` = **−0.006 %** at 2048 spp (−3.978 % with the ratio form; isolating
+              the lobes gave mirror −0.006 %, filter −4.894 %, pinning it on the filter);
+              noise at 128 spp vs a 32768-spp reference — single-λ chroma 0.1801 / luma 0.3685, hero-4
+              *before* 0.1676 / 0.3522 (**0.93× / 0.96×** — the bundle died at the first mirror, so hero
+              bought almost nothing), hero-4 *after* 0.0842 / 0.2086 = **0.47× chroma, 0.57× luma**;
+              `-heroc 1` byte-identical to the pre-change build on GPU (`cornell` 160²/256 spp,
+              `abs_hero_delta` 200²/2048 spp) and CPU (`cornell` 96²/64 spp); the earlier scenes unregressed
+              (`absolute` −0.008 %, `abs_hero_mats` −0.000 %, both exactly as before); smoke sweep
+              `mirror_selfie` / `group` / `material_presets` / `translucency` / `mixmat` clean.
+              Renders in `png/hero_delta/`. **Not** ported to the unidirectional tracers: there Mirror and
+              Filter survive by *Russian roulette* on r(λ)/T(λ) with `beta` unchanged, so keeping the bundle
+              means making the coin the hero's and reweighting `beta[i] *= r_i/r_hero` — a different change,
+              logged in known-issues.md.
     - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
           through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy
           rather than four copies. Validate: every mode's converged image is unchanged vs the single-λ baseline (same

@@ -536,14 +536,22 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // this vertex is a delta (specular) scatter.
         Vec3 wo = normalize(path[prevSurfIdx].p - cur.p);   // toward the previous vertex
         Vec3 wi; double pdfW = 0.0, pdfRevW = 0.0, betaFactor = 0.0;
-        // Hero bundle: per-secondary throughput factor RELATIVE to the hero's, i.e.
-        // secRatio[i] = f_{i+1}·cos / (f_hero·cos) for the lobe the hero actually
-        // sampled. Everything wavelength-independent (all the geometry, the glossy lobe,
-        // the adjoint correction) leaves it at 1, so only the λ-dependent albedos below
-        // need to fill it in. Ignored entirely when nUp == 1.
-        double secRatio[hero::kHeroMax - 1];
-        for (int i = 0; i + 1 < nUp; ++i) secRatio[i] = 1.0;
-        bool delta = false, terminate = false;
+        // Hero bundle: per-secondary throughput factor, i.e. secF[i] = f_{i+1}·cos/pdf
+        // for the lobe the hero actually sampled (pdf is always the hero's). This is the
+        // ABSOLUTE factor, not a ratio to the hero's: a ratio would be undefined exactly
+        // where it matters most — a strongly chromatic lobe whose hero value is 0 while a
+        // secondary's is not (a Wratten gel is 0 over most of the spectrum). Cases that
+        // are wavelength-INDEPENDENT (all the geometry, the specular interfaces, the
+        // adjoint correction) leave `secChromatic` false and reuse `betaFactor` for every
+        // λ. Ignored entirely when nUp == 1.
+        double secF[hero::kHeroMax - 1];
+        bool secChromatic = false;
+        // A few DELTA lobes are nevertheless wavelength-INDEPENDENT in direction
+        // (Mirror reflects, Filter passes straight through — neither consults λ to
+        // pick the continuation), so the secondaries CAN keep riding the hero's ray
+        // past them; only their per-λ reflectance/transmittance differs. Those set
+        // `keepBundle` to opt out of the `if (delta) nUp = 1` collapse below.
+        bool delta = false, terminate = false, keepBundle = false;
         switch (mp->type) {
             case MatType::Diffuse:
             case MatType::Fluorescent: {              // elastic base only (see header)
@@ -553,9 +561,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
                 pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 betaFactor = rho;                     // f*cos/pdf = rho
-                if (rho <= 0) terminate = true;
-                else for (int i = 0; i + 1 < nUp; ++i)
-                    secRatio[i] = clamp01(diffuseReflectance(scene, *mp, h, hb.lam[i + 1])) / rho;
+                secChromatic = true;                  // rho <= 0 is caught by the max test
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(diffuseReflectance(scene, *mp, h, hb.lam[i + 1]));
                 break;
             }
             case MatType::Glossy: {
@@ -566,13 +574,14 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
                 pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 betaFactor = r;                       // f*cos/pdf = r
-                if (r <= 0 || pdfW <= 0) terminate = true;
+                if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the max test
                 // The glossy LOBE (mirror direction + roughness exponent) carries no
                 // wavelength dependence, so the whole bundle can follow the sampled
                 // direction and only the reflectance differs per λ. (The unidirectional
                 // hero tracers de-hero here instead — see known-issues.md.)
-                else for (int i = 0; i + 1 < nUp; ++i)
-                    secRatio[i] = clamp01(reflectSlot(scene, *mp, h, hb.lam[i + 1])) / r;
+                secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(reflectSlot(scene, *mp, h, hb.lam[i + 1]));
                 break;
             }
             case MatType::DiffuseTransmit: {
@@ -594,11 +603,12 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 // The lobe was CHOSEN by the hero's albedo split, so each secondary
                 // divides by the hero's albedo for that lobe, not its own:
                 // f_i·cos/pdf_hero = rho_i(lobe) · tot_hero / rho_hero(lobe).
-                else for (int i = 0; i + 1 < nUp; ++i) {
+                secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i) {
                     double rR, rT; diffuseTransmitAlbedos(*mp, hb.lam[i + 1], scene, &h, rR, rT);
                     double num = reflLobe ? rR   : rT;
                     double den = reflLobe ? rhoR : rhoT;
-                    secRatio[i] = (den > 0.0) ? num / den : 0.0;
+                    secF[i] = (den > 0.0) ? num * tot / den : 0.0;
                 }
                 break;
             }
@@ -606,7 +616,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 wi = reflect(ray.d, cur.ns);
                 betaFactor = r; delta = true;
-                if (r <= 0) terminate = true;
+                // The mirror direction is the same for every λ, so the bundle survives;
+                // only the reflectance is per-λ (cf. Glossy, the rough version of this).
+                keepBundle = true; secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(reflectSlot(scene, *mp, h, hb.lam[i + 1]));
                 break;
             }
             case MatType::Dielectric: {
@@ -665,7 +679,14 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 // Colored gel filter: straight-through delta, throughput ×= T(lambda).
                 double t = clamp01(mp->transmit(lambda));
                 wi = ray.d; betaFactor = t; delta = true;   // direction unchanged
-                if (t <= 0) terminate = true;
+                // Straight-through for every λ, so the bundle survives; a gel filter is
+                // exactly where the per-λ transmittance spread is largest, so this is
+                // the case that benefits most from NOT de-heroing — AND the case that
+                // forces the absolute (rather than ratio) formulation of secF, since
+                // T(λ_hero) is legitimately 0 across most of a Wratten passband.
+                keepBundle = true; secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(mp->transmit(hb.lam[i + 1]));
                 break;
             }
             case MatType::ThinFilm: {
@@ -690,7 +711,14 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             default: terminate = true; break;
         }
-        if (terminate || betaFactor <= 0.0) return;
+        // Kill the walk only when EVERY live wavelength is dead. The hero's own factor can
+        // legitimately be 0 while a secondary's is not (a gel filter, a saturated spectral
+        // reflectance), and dropping the whole bundle there biases the estimate low — it
+        // measured -4.9 % on a Wratten-58 test scene. With nUp == 1 the loop is empty and
+        // mxF == betaFactor, so this is exactly the old scalar test.
+        double mxF = betaFactor;
+        if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
+        if (terminate || mxF <= 0.0) return;
 
         // Specular vertices carry a delta density: PBRT stores 0 for both the forward
         // and reverse area densities so MIS skips connections through them.
@@ -701,7 +729,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         path[prevSurfIdx].pdfRev = convertDensity(pdfRevW, cur, path[prevSurfIdx]);
 
         beta *= betaFactor;
-        for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= betaFactor * secRatio[i];
+        for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
         // Veach shading-normal ADJOINT correction (§5.3) for the LIGHT (Importance)
         // subpath only: a particle tracer deposits irradiance per GEOMETRIC area, so an
         // interpolated shading normal must be reweighted at each non-specular vertex or
@@ -723,10 +751,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // keeps its full nUp (it really was reached by all C wavelengths); only the
         // continuation collapses. Delta vertices are exactly the non-connectible ones,
         // so this also means every vertex that can take part in a connection has a
-        // meaningful nUp. Mirror and Filter are delta but wavelength-INDEPENDENT in
-        // direction, so they could in principle keep the bundle alive — logged as a
-        // future refinement in known-issues.md rather than special-cased here.
-        if (delta) nUp = 1;
+        // meaningful nUp. EXCEPTION: Mirror and Filter are delta but pick their
+        // continuation without consulting λ, so they set `keepBundle` and carry the
+        // secondaries through on a per-λ `secF` instead (see those cases above).
+        if (delta && !keepBundle) nUp = 1;
         // Spawn the continuation from the correct side of the geometric normal.
         double sgn = dot(wi, cur.ng) >= 0.0 ? 1.0 : -1.0;
         ray = Ray{cur.p + cur.ng * (sgn * 1e-6), normalize(wi)};

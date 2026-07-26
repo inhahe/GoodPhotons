@@ -1067,7 +1067,11 @@ second:**
   records, so total stored energy is unchanged. In BDPT *both* subpaths carry the same
   bundle and every connection is evaluated per-λ with a single shared MIS weight (all the
   pdfs are hero-driven); glossy vertices are connectible there, so — unlike the
-  unidirectional tracers — mode `D` keeps the bundle alive across glossy bounces. Mode `D`
+  unidirectional tracers — mode `D` keeps the bundle alive across glossy bounces, and it
+  likewise rides straight through **mirrors** and **gel filters**, whose outgoing direction
+  doesn't depend on λ either (worth **0.47× chroma / 0.57× luma** noise on a
+  mirror-and-Wratten-gel box, where de-heroing at the first mirror had left hero buying
+  almost nothing). Mode `D`
   is hero-capable on **both** backends, and the CPU and GPU BDPT agree to 0.03%.
   Hero collapses to a single continuous
   wavelength the instant dispersion matters, so it *keeps* the forward photon map's true
