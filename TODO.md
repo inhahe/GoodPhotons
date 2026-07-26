@@ -1755,6 +1755,20 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          exposed as `sabs` in Python to dodge the builtin shadow, but it *emits* `abs`), so loom's function
          vocabulary is a subset of ftrace's by construction — which is why export is clean and J3c's shared
          grammar can be the single enforcement point.
+         **DONE — parts (a),(c),(d) 2026-07-26.** (a) `loom/spatial.py`: the coordinate leaf `_Coord` is
+         generalised to a public **`Surface`** family — `X Y Z` (axes, both backends), `U V` (surface params,
+         ftrace `u`/`v`, **emit-only**), `A` (albedo placeholder — no ftrace var, so a bare `A` raises until
+         substituted/defaulted); `SpatialExpr.free_inputs()` + `.substitute({name: expr})` (functional rewrite).
+         (c) binding-by-substitution: `gold(u=v)` swaps the `U` leaf at emit — loom always resolves to a concrete
+         field in real ftrace variables, **never** literal bundle syntax (so the J3c SEQUENCING concern is
+         sidestepped: **zero** ftrace changes, renderable at every commit). (d) `loom/scene.py`:
+         **materials-as-bundles** — a `Material` property may be a `SpatialExpr` field; `Material.free_inputs()`
+         is the union; `mat(u=v, a=1)` / positional `mat(expr)` applies by substituting across the bundle; unbound
+         `A`→`albedo_default`; `Scene.add` **expands** each field into a renderable companion (colour slot →
+         `ProcTexture` over `u/v`; scalar slot → `FuncPattern` over `x/y/z`), with coordinate-family validation.
+         Validated: a bundle scene emits `.ftsl` ftrace parses & renders identically to the hand-authored
+         `func_skin` path. Tests: `test_spatial.py` (+9), `test_material_bundle.py` (14). **Remaining:** part (b)
+         `Image("path")` leaf (image-as-a-function-term) + item 4 (N-D input domain).
          **`t` IS A FIRST-CLASS REBINDABLE INPUT (2026-07-19).** Don't treat `t` (clock time) as a magic ambient
          parameter — make it just one named input among `{t, x, y, z, u, v, a}`, rebindable by the same
          substitution as `u`/`v`/`a`. This unifies the Signal (temporal) and Surface (spatial) tiers *at the

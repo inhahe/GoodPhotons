@@ -726,6 +726,24 @@ tools/loom/
     stays renderable — needing **zero** ftrace C++ changes. Tests: `test_spatial.py`
     (uv-emit, no-numpy-twin, albedo-raises-until-bound, free-inputs, substitute rewrite/
     partial/nested).
+  - **J3b item 3 — materials-as-bundles.** ✅ (`scene.py`). A `Material` property may now
+    be a `SpatialExpr` field (scalar) or a tuple of them (a colour), making the material a
+    **parameterized bundle**: `Material.free_inputs()` is the union of its fields' bindable
+    leaves and `mat(u=v, a=1)` / `mat(expr)` (positional, sole free input) **applies** it by
+    substituting across every field — pure functional rewrite, so a bound material is an
+    ordinary one whose fields are concrete formulas. Unbound `u`/`v` stay the surface params;
+    an unbound albedo `A` resolves to the material's `albedo_default`. Adding a bundle to a
+    `Scene` **expands** each field to a renderable companion (`Material.expand`): a colour
+    slot (`reflect`/`transmit`/`emit`/…) → a `ProcTexture` baked over surface `u`/`v` (now
+    accepts `SpatialExpr` channels, re-baked per frame with time coefficients folded in, its
+    `roots()` surfacing them for cycle-check); a scalar slot → a `FuncPattern` over world
+    `x`/`y`/`z`. A field mixing the wrong coordinate family for its slot (world `x/y/z` in a
+    `u/v` colour skin, or `u/v` in a world-space scalar pattern) raises — the two families are
+    ftrace's real backends, not an approximation. Validated: a bundle scene emits byte-for-byte
+    renderable `.ftsl` that ftrace parses & renders identically to the hand-authored
+    `func_skin` path. Tests: `tests/test_material_bundle.py` (free-inputs union, keyword/
+    positional/partial application, arbitrary-expr RHS, colour→ProcTexture / scalar→FuncPattern
+    lowering, coordinate-family rejection, Scene expansion ordering, animated re-bake, roots).
 - **M11 — "transform video" script.** ✅ done (`loom/xvideo.py`). Separate two-pass
   offline tool (§11.8), kept out of the streaming emitter: **materialize** a clip into a
   4-D block `(T,H,W,C)` (`Clip.from_array` / `.from_frames` / `.from_canvas`), **transform**
