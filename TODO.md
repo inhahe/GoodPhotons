@@ -1924,10 +1924,24 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       `range` kind), reads like assignment, and makes anonymity natural. Touches both loom's emitters (§ scene.py
       `emit`) and the shared grammar in lockstep; do it **before** the grammar ossifies into ftrace's C++ front-end so
       both sides adopt the new header at once. Decide alongside item 3 / the ftrace port.
-- [ ] **SHIP — bundle GPDA with the ftrace release.** The GraphParser (GPDA) is becoming ftrace's scene front-end,
-      so the shipped product now depends on it. Ensure `release.bat` / the release artifact carries the GPDA parser
-      (vendored into ftrace's build, like loom vendored `_gpda.py`) and that a clean checkout builds/ships without an
-      external GraphParser checkout. (Reminder logged 2026-07-19.)
+- [x] **SHIP — bundle GPDA with the ftrace release — DONE 2026-07-26 (verified, no code change needed).** The
+      GraphParser (GPDA) is ftrace's scene front-end shim, so the shipped product depends on it. Verified fully
+      vendored and self-contained:
+      * All 7 files in `src/gpda/` are git-tracked (`ftsl_reduce.hpp`, `ftsl_scene.gen.cpp`, `ftsl_shim.hpp`,
+        `gpda_lexer.hpp`, `pool.hpp`, `tokenized.cpp`, `tokenized.hpp`) — the parser engine (`tokenized.*`,
+        `pool.hpp`) copied verbatim from `GraphParser/cpp`, the grammar **pre-compiled to C++** by
+        `loom.grammar.emit_cpp` into `ftsl_scene.gen.cpp`. Nothing is loaded from a `.epeg` at runtime, so the
+        release artifact needs no data files.
+      * `CMakeLists.txt` compiles the two vendored `.cpp` in both targets (lines 32–33 and 55) and adds
+        `src/gpda` to the include dirs (line 48). Every `src/**.cpp|.cu|.c` named in `CMakeLists.txt` is
+        git-tracked (checked mechanically against `git ls-files`) ⇒ a clean checkout has all sources.
+      * The only include reaching outside `src/gpda` is `ftrace_parse_slice.hpp` in `ftsl_reduce.hpp`, and it is
+        guarded by `#ifdef FTSL_SHIM_STANDALONE` — used solely by the throwaway `scraps/gpda_shim` de-risk
+        harness, never by the in-tree build (in-tree, `ftsl.h` includes the header after the real `ftsl::Block`
+        types are defined).
+      * `build.bat`, `release.bat` and `CMakeLists.txt` contain **zero** references to
+        `D:\visual studio projects\GraphParser`; `release.bat` ships one self-contained `ftrace.exe`.
+      (Reminder logged 2026-07-19.)
 - **Dependency note:** the FTSL record itself (§0) is fully implemented (Stages 1–6 + GPU parity DONE), so
   this is a loom-side mirror + parser effort, not blocked on ftrace.
 - [ ] **FUTURE — loom retime / 4D time-shear node** (deferred; unlocked once `t` is a first-class input, J3b item 3).
