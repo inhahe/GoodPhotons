@@ -775,6 +775,29 @@ missing capability.** Why we may want it someday, and why we don't need it now:
     vector semantics so a node can push 3 values. Cleanest for "transform a point," but rewrites the VM's
     fundamental one-scalar-out contract across CPU eval, device eval, arity accounting, and every consumer.
 
+### DEFERRED (2026-07-18, reaffirmed 2026-07-26): GPU marching cubes — export-only mesh extraction (TODO §8 G4)
+**Status: intentionally not built.** Like MatMulAdd above, this is an optimization of an
+already-working path, not a missing capability. It is the last open item in TODO section B
+(the `gyroid_nd` `--oscillate` grammar), which is otherwise complete.
+
+- **What it would be.** Run marching cubes on the GPU to extract an isosurface triangle mesh,
+  instead of the current CPU implementation (`src/isomesh.h`).
+- **Why it is NOT needed for the video path.** The reason per-frame tessellation used to matter
+  was that every animation frame re-marched the field on the CPU. That bottleneck is already
+  gone: **G2** added the GPU primary-ray isosurface preview (`kIsoPreview`, `-raster-gpu`), which
+  sphere-traces the implicit field directly and **never tessellates at all**. `gyroid_nd` routes
+  its frames through it, so the video pipeline does not call marching cubes. G4 would therefore
+  accelerate only the *explicit mesh-export* path (`--export-mesh` / `.obj` output), which is an
+  occasional, offline, one-shot operation rather than a per-frame cost.
+- **Why we skip it now.** Mesh export is not a measured pain point — it runs once per asset, not
+  once per frame, and the CPU marcher is fast enough at the grid resolutions in use. Porting it
+  means duplicating the marching-cubes tables, edge-vertex dedup, and the watertight-seam handling
+  onto the device, plus a device→host vertex/index readback — real work whose only payoff is a
+  faster offline export.
+- **When to revisit.** If mesh-export throughput becomes a real bottleneck — e.g. batch-exporting
+  a long frame sequence to `.obj`/`.gltf`, or interactive export at high grid resolutions where
+  the CPU march visibly stalls the UI.
+
 ### ~~TECH DEBT (2026-07-18): `-raster-gpu` iso preview shades flat per-material albedo (no textures)~~ — FIXED 2026-07-19 (G5)
 The GPU primary-ray isosurface preview (G2, `kIsoPreview` in `src/render_cuda.cu`,
 wired as `-raster-gpu`) cast one ray/pixel with the shared `closestHit` and shaded

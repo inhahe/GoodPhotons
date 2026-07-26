@@ -356,6 +356,17 @@ instead of per block. loom exposes the same per-axis `frame` and emits it into e
 Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--oscillate`/`--lock`/
 `--couple` axis grammar. Each phase is independently committable and keeps tests green.
 
+> **SECTION CLOSED 2026-07-26.** Everything in B that delivers a capability is built and green
+> (1046 loom tests pass): Phase 1 (P1.1–P1.5), Phase 2 (P2.1), Phase 3 (P3.1–P3.3, slices S1–S7),
+> and §8 G1 / G2 / G5. The two remaining unchecked items — **G3** (`PatOp::MatMulAdd`) and **G4**
+> (GPU marching cubes) — are **deliberate deferrals, not pending work**: both are optimizations of
+> paths that already work correctly, and neither unlocks anything. G3 only *compresses* the pattern
+> encoding (the N-D rotation matrix already compiles to scalar bytecode and ray-marches on the GPU
+> today); G4 only speeds up *offline mesh export* (the video path no longer tessellates at all,
+> since G2's `-raster-gpu` sphere-traces the field directly). Each has a written revisit trigger and
+> a full build plan in `known-issues.md` ("Deferred: `PatOp::MatMulAdd`" and "Deferred: GPU marching
+> cubes"). **Do not treat B as unfinished** — reopen only if one of those triggers actually fires.
+
 ### Phase 1 — the `--oscillate`/`--lock` core (§5 steps 1–5)
 - [x] **P1.1 Parser + model, no behavior change.** `--oscillate`/`--lock` grammar →
       `Group{items:[(amp,axis)], rate, phase}`. Unit-test parser in isolation (grouping,
