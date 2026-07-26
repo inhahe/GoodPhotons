@@ -5131,8 +5131,10 @@ __device__ static int dEmitterForMat(const DScene& sc, int matId) {
 // Sample the shared wavelength from the scene emission sampler (mirrors
 // EmissionSampler::sample). Sets pdf (per nm, for the >0 guard); the BDPT weight
 // uses the continuous invPdfLambda below (exactly as the CPU path does).
-__device__ static Real dSampleSceneLambda(const DScene& sc, DRng& rng, double& pdf) {
-    double u = (double)rng.uniform();
+// Inverse-CDF core, split out so the hero-wavelength bundle can push its own stratified
+// u values (base draw + C-1 wrapped strata) through the same sampler the scalar path
+// uses — the device twin of EmissionSampler::sampleAt.
+__device__ static Real dSampleSceneLambdaU(const DScene& sc, double u, double& pdf) {
     const double* cdf = sc.emitSamplerCdf;
     int lo = 0, hi = sc.emitSamplerN;
     while (lo + 1 < hi) { int m = (lo + hi) / 2; if (cdf[m] <= u) lo = m; else hi = m; }
@@ -5140,6 +5142,9 @@ __device__ static Real dSampleSceneLambda(const DScene& sc, DRng& rng, double& p
     double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
     pdf = (c1 - c0) / sc.emitSamplerStep;
     return (Real)(DLMIN + (lo + frac) * sc.emitSamplerStep);
+}
+__device__ static Real dSampleSceneLambda(const DScene& sc, DRng& rng, double& pdf) {
+    return dSampleSceneLambdaU(sc, (double)rng.uniform(), pdf);
 }
 // invPdfLambda(lambda) = emitG / g(lambda), g(lambda) = sum_k geomWeight_k*SPD_k.
 // In BDPT scope every emitter is an area/sphere light, so geomWeight = area*PI.
@@ -5292,6 +5297,65 @@ __device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real
 // Point matches the BDPT device path; unbiased, an independent noise realization vs
 // the CPU's sphere-cone / cylinder-arc importance sampling). spot/env/collimated are
 // gated to the CPU, so they're skipped here.
+// One emitter connection's SAMPLING + VISIBILITY, factored out of bkNeeLight so the
+// scalar NEE and the hero-wavelength NEE below run the identical geometry off the
+// identical rng stream. Everything here is wavelength-INDEPENDENT; the caller supplies
+// rho/PI and the emitter SPD. The final product is deliberately left to the caller
+// rather than fused into one weight here, so the scalar path's float rounding is
+// unchanged by this refactor (device `Real` is fp32 by default — see FTRACE_GPU_FP32).
+struct BkNeeGeom {
+    DVec3 wi;        // unit direction surface -> sampled light point
+    Real  dist;      // shadow-ray length
+    Real  dist2;     // dist*dist (spot: inverse-square falloff)
+    Real  cosSurf;   // cosine at the shading surface
+    Real  stG;       // Chiang shadow-terminator gate (1 on flat geometry)
+    Real  fall;      // spot cone falloff (spot emitters only)
+    Real  G;         // area-measure geometry term cosSurf*cosLight/dist2 (non-spot)
+    bool  spot;      // point-spot emitter (deterministic connect, draws no rng)
+};
+__device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec3& ngo,
+                                     const DEmitter& em, DRng& rng, BkNeeGeom& g) {
+    if (em.shape == 2) {
+        // Point spot (device twin of emitterGeom's spot branch): deterministic connect
+        // to the light point, cone falloff toward the surface, no rng draw. Peak
+        // intensity/SPD = 1; the falloff scales it toward the cone edge.
+        DVec3 toL = em.origin - h.p;
+        g.dist2 = dot(toL, toL);
+        g.dist  = sqrt(g.dist2);
+        g.wi = toL / g.dist;
+        g.cosSurf = dot(h.n, g.wi);
+        if (g.cosSurf <= (Real)0) return false;
+        g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
+        if (g.stG <= (Real)0) return false;
+        g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
+        if (g.fall <= (Real)0) return false;
+        if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
+        g.G = (Real)0; g.spot = true;
+        return true;
+    }
+    Real u1 = rng.uniform(), u2 = rng.uniform();
+    DVec3 y, nL;
+    emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
+    DVec3 toL = y - h.p;
+    g.dist2 = dot(toL, toL);
+    g.dist = sqrt(g.dist2);
+    g.wi = toL / g.dist;
+    g.cosSurf = dot(h.n, g.wi);
+    if (g.cosSurf <= 0) return false;
+    // Geometric-hemisphere softening (matches CPU backward.h neeLight): the light must lie
+    // on the geometric front side too, ramped smoothly instead of a hard cutoff (Chiang
+    // 2019). No-op when h.n==h.ng (flat tris / analytic spheres, stG==1); shadow ray offset
+    // along the geometric normal so it clears the true surface.
+    g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
+    if (g.stG <= (Real)0) return false;
+    Real cosLight = dot(nL, -g.wi);               // light is one-sided
+    if (cosLight <= 0) return false;
+    if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
+    g.G = g.cosSurf * cosLight / g.dist2;
+    g.fall = (Real)1; g.spot = false;
+    return true;
+}
+
 __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                                     double invPdfLambda, Real lambda, DRng& rng) {
     double total = 0.0;
@@ -5300,59 +5364,46 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
     for (int k = 0; k < sc.nEmitters; ++k) {
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnv)
-        if (em.shape == 2) {
-            // Point spot (device twin of emitterGeom's spot branch): deterministic connect
-            // to the light point, cone falloff toward the surface, no rng draw. Peak
-            // intensity/SPD = 1; the falloff scales it toward the cone edge.
-            DVec3 toL = em.origin - h.p;
-            Real dist2 = dot(toL, toL);
-            Real dist  = sqrt(dist2);
-            DVec3 wi = toL / dist;
-            Real cosSurf = dot(h.n, wi);
-            if (cosSurf <= (Real)0) continue;
-            Real stG = dShadowTerminatorG(wi, h.n, ngo0);
-            if (stG <= (Real)0) continue;
-            Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
-            if (fall <= (Real)0) continue;
-            if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
-            double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-            double contrib = (double)(f * fall * cosSurf / dist2 * stG) * emitW;
-            if (sc.mediaN > 0)
-                contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, wi, dist, lambda, rng);
-            total += contrib;
-            continue;
-        }
-        Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 y, nL;
-        emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
-        DVec3 toL = y - h.p;
-        Real dist2 = dot(toL, toL);
-        Real dist = sqrt(dist2);
-        DVec3 wi = toL / dist;
-        Real cosSurf = dot(h.n, wi);
-        if (cosSurf <= 0) continue;
-        // Geometric-hemisphere softening (matches CPU backward.h neeLight): the light must lie
-        // on the geometric front side too, ramped smoothly instead of a hard cutoff (Chiang
-        // 2019). No-op when h.n==h.ng (flat tris / analytic spheres, stG==1); shadow ray offset
-        // along the geometric normal so it clears the true surface.
-        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
-        Real stG = dShadowTerminatorG(wi, h.n, ngo);
-        if (stG <= (Real)0) continue;
-        Real cosLight = dot(nL, -wi);                 // light is one-sided
-        if (cosLight <= 0) continue;
-        if (occluded(sc, h.p + ngo * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
-        Real G = cosSurf * cosLight / dist2;
+        BkNeeGeom g;
+        if (!bkEmitterGeom(sc, h, ngo0, em, rng, g)) continue;
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        double contrib = (double)(f * G) * emitW * (double)em.area * (double)stG;
+        double contrib = g.spot
+            ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
+            : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
         // Shadow-ray transmittance through any participating media (superposition;
         // homogeneous = exact exp with no rng draw, heterogeneous = ratio tracking).
         // Matches the forward connectVolume / device volume-NEE transmittance so surface
         // direct light agrees between the forward and backward estimators.
         if (sc.mediaN > 0)
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, wi, dist, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, g.wi, g.dist, lambda, rng);
         total += contrib;
     }
     return total;
+}
+
+// Hero-wavelength surface NEE (device twin of backward.h neeLightHero): ONE shared
+// visibility sample per emitter — the very rng stream bkNeeLight would draw — evaluated
+// for all `nUp` live wavelengths, accumulating thr[i]*(rho[i]/PI)*SPD(lam[i])*invPdf[i]*w
+// into L[i]. Only reached on the media-free hero fast path, so there is no shadow-ray
+// transmittance term (bkRadianceHero is gated on mediaN == 0).
+__device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Real* rho,
+                                      double* L, const double* thr, const Real* lam,
+                                      const double* invPdf, int nUp, DRng& rng) {
+    DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    for (int k = 0; k < sc.nEmitters; ++k) {
+        const DEmitter& em = sc.emitters[k];
+        if (em.collimated || em.shape == 3) continue;
+        BkNeeGeom g;
+        if (!bkEmitterGeom(sc, h, ngo0, em, rng, g)) continue;
+        for (int i = 0; i < nUp; ++i) {
+            Real f = rho[i] / (Real)DPI;
+            double emitW = (double)specLookup(em.emitSpd, lam[i]) * invPdf[i];
+            double contrib = g.spot
+                ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
+                : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+            L[i] += thr[i] * contrib;
+        }
+    }
 }
 
 // Volume next-event estimation (device twin of backward.h neeVolume): connect a fog
@@ -5414,41 +5465,76 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
 // shadow ray to the scene exit carrying media transmittance, and a balance-heuristic
 // MIS weight against the cosine-sampled continuation (MIS'd again on the BSDF-sampled
 // escape in bkRadiance). Returns the contribution (0 if occluded / below the horizon).
-__device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
-                                  double invPdfLambda, Real lambda, DRng& rng) {
-    if (sc.envIndex < 0) return 0.0;
+// The env connection's SAMPLING + VISIBILITY + MIS weight, all wavelength-independent,
+// factored out of bkNeeEnv (device twin of backward.h envGeom) so the scalar and hero
+// env NEE share one direction sample and one shadow ray.
+struct BkEnvGeom {
+    DVec3  wi;        // sampled incoming env direction
+    double pdfW;      // its solid-angle pdf
+    Real   cosSurf;   // cosine at the shading surface
+    Real   stG;       // Chiang shadow-terminator gate
+    double wMis;      // balance heuristic vs. the cosine-sampled continuation
+    double farDist;   // shadow-ray length to the scene exit
+};
+__device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkEnvGeom& g) {
     // Sample an incoming env direction: image env importance-samples the luminance CDF
     // (dEnvSample gives dir + solid-angle pdfW), constant env is uniform on the sphere
     // (pdf 1/4pi). Both draw exactly two uniforms in the same order as the CPU
     // scene.sampleEnvDir, so the estimator matches.
-    DVec3 wi; double pdfW;
-    const bool imageEnv = (sc.env.scale != nullptr);
-    if (imageEnv) {
-        dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), wi, pdfW);
-        if (pdfW <= 0.0) return 0.0;
+    if (sc.env.scale != nullptr) {
+        dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), g.wi, g.pdfW);
+        if (g.pdfW <= 0.0) return false;
     } else {
         double z = 1.0 - 2.0 * (double)rng.uniform();
         double sr = sqrt(fmax(0.0, 1.0 - z * z));
         double phi = 2.0 * DPI * (double)rng.uniform();
-        wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
-        pdfW = 1.0 / (4.0 * DPI);
+        g.wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+        g.pdfW = 1.0 / (4.0 * DPI);
     }
-    Real cosSurf = dot(h.n, wi);
-    if (cosSurf <= (Real)0) return 0.0;                     // below the shading horizon
+    g.cosSurf = dot(h.n, g.wi);
+    if (g.cosSurf <= (Real)0) return false;                 // below the shading horizon
     DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
-    Real stG = dShadowTerminatorG(wi, h.n, ngo);            // Chiang soft terminator (1 if flat)
-    if (stG <= (Real)0) return 0.0;                         // behind true geometry: hard shadow
-    double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
-    if (occluded(sc, h.p + ngo * RAY_EPS, wi, (Real)farDist)) return 0.0;
-    double Lenv = imageEnv ? dEnvRadiance(sc.env, wi, lambda)
-                           : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
+    g.stG = dShadowTerminatorG(g.wi, h.n, ngo);             // Chiang soft terminator (1 if flat)
+    if (g.stG <= (Real)0) return false;                     // behind true geometry: hard shadow
+    g.farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
+    if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, (Real)g.farDist)) return false;
+    double pdfBsdf = (double)g.cosSurf / DPI;               // cosine-hemisphere pdf for wi
+    g.wMis = g.pdfW / (g.pdfW + pdfBsdf);                   // balance heuristic
+    return true;
+}
+
+__device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
+                                  double invPdfLambda, Real lambda, DRng& rng) {
+    if (sc.envIndex < 0) return 0.0;
+    BkEnvGeom g;
+    if (!bkEnvGeom(sc, h, rng, g)) return 0.0;
+    double Lenv = (sc.env.scale != nullptr) ? dEnvRadiance(sc.env, g.wi, lambda)
+                                            : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
-    double pdfBsdf = (double)cosSurf / DPI;                 // cosine-hemisphere pdf for wi
-    double wMis = pdfW / (pdfW + pdfBsdf);                  // balance heuristic
-    double contrib = ((double)rho / DPI) * Lenv * (double)cosSurf * invPdfLambda / pdfW * wMis * (double)stG;
+    double contrib = ((double)rho / DPI) * Lenv * (double)g.cosSurf * invPdfLambda / g.pdfW
+                     * g.wMis * (double)g.stG;
     if (sc.mediaN > 0)                                      // Beer-Lambert to the scene exit
-        contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, wi, (Real)farDist, lambda, rng);
+        contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, g.wi, (Real)g.farDist, lambda, rng);
     return contrib;
+}
+
+// Hero-wavelength environment NEE (device twin of backward.h neeEnvHero): one shared env
+// direction + shadow ray, evaluated for all `nUp` live wavelengths. Media-free hero fast
+// path, so no transmittance term.
+__device__ static void bkNeeEnvHero(const DScene& sc, const DHit& h, const Real* rho,
+                                    double* L, const double* thr, const Real* lam,
+                                    const double* invPdf, int nUp, DRng& rng) {
+    if (sc.envIndex < 0) return;
+    BkEnvGeom g;
+    if (!bkEnvGeom(sc, h, rng, g)) return;
+    const bool imageEnv = (sc.env.scale != nullptr);
+    for (int i = 0; i < nUp; ++i) {
+        double Lenv = imageEnv ? dEnvRadiance(sc.env, g.wi, lam[i])
+                               : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]);
+        if (Lenv <= 0.0) continue;
+        L[i] += thr[i] * (((double)rho[i] / DPI) * Lenv * (double)g.cosSurf * invPdf[i]
+                          / g.pdfW * g.wMis * (double)g.stG);
+    }
 }
 
 // Environment NEE at a fog scattering vertex (device twin of backward.h neeEnvVolume,
@@ -5483,6 +5569,154 @@ __device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const 
     double contrib = (double)alb * (double)phase * Lenv * invPdfLambda / pdfW * wMis;
     contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, (Real)farDist, lambda, rng);
     return contrib;
+}
+
+// Handle ONE surface material interaction on a single wavelength — the whole material
+// switch, factored out of bkRadiance (device twin of backward.h interactMaterial) so the
+// scalar tracer and the hero tracer (which de-heros before calling this) share one copy.
+// `mp` is the resolved leaf material (Mix already peeled by the caller); the surface's own
+// emission is handled by the caller BEFORE this call. All path state is in/out. Returns
+// true if the path continues (ray + state updated), false if it terminated (L already
+// holds this path's final value): a `break` in the old switch maps to `return true`, a
+// `return L` to `return false`.
+__device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const DHit& h,
+                                  int matId, int diffraction, bool directOnly,
+                                  DVec3& ro, DVec3& rd, Real& lambda, double& invPdfLambda,
+                                  double& thr, double& L, bool& specularArrival,
+                                  double& contBsdfPdf, DMediumStack& stk, DRng& rng) {
+    switch (mp->type) {
+        case D_DIELECTRIC: {
+            DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd);
+            ro = nro; rd = nrd; specularArrival = true; return true;
+        }
+        case D_THINFILM: {
+            DVec3 nro, nrd;
+            if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd)) return false;
+            ro = nro; rd = nrd; specularArrival = true; return true;
+        }
+        case D_MULTILAYER: {
+            DVec3 nro, nrd;
+            if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd)) return false;
+            ro = nro; rd = nrd; specularArrival = true; return true;
+        }
+        case D_MIRROR: {
+            Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
+            if (rng.uniform() >= r) return false;   // RR absorb
+            ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; return true;
+        }
+        case D_GRATING: {
+            Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
+            if (rng.uniform() >= r) return false;
+            DVec3 nro, nrd;
+            if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) return false;
+            ro = nro; rd = nrd; specularArrival = true; return true;
+        }
+        case D_HALFMIRROR: {
+            Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
+            if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
+            else                   { ro = h.p + rd * RAY_EPS; }
+            specularArrival = true; return true;
+        }
+        case D_FILTER: {
+            // Colored gel filter: pass straight through, survive with prob T(lambda).
+            Real t = clamp01(specLookup(mp->transmit, lambda));
+            if (rng.uniform() >= t) return false;   // absorbed
+            ro = h.p + rd * RAY_EPS;                // direction unchanged
+            specularArrival = true; return true;
+        }
+        case D_GLOSSY: {
+            Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
+            if (rng.uniform() >= r) return false;
+            DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
+            if (dot(o, h.n) <= 0) return false;
+            ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; return true;
+        }
+        case D_DIFFUSETRANSMIT: {
+            // Two-lobe Lambertian (device twin of backward.h DiffuseTransmit): NEE the
+            // reflect lobe against lights in the front (+n) hemisphere and the transmit
+            // lobe in the back (-n) hemisphere (a normal-flipped Hit reuses bkNeeLight),
+            // then continue reflect / transmit / absorb (throughput unchanged on survival).
+            Real rhoR = clamp01(dDiffuseRho(sc, *mp, h, lambda));
+            Real rhoT = clamp01(specLookup(mp->transmit, lambda));
+            Real sum = rhoR + rhoT;
+            if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
+            DVec3 nb = h.n * (Real)(-1);
+            L += thr * bkNeeLight(sc, h, rhoR, invPdfLambda, lambda, rng);   // front lobe
+            if (sc.envIndex >= 0)
+                L += thr * bkNeeEnv(sc, h, rhoR, invPdfLambda, lambda, rng);
+            DHit hb = h; hb.n = nb;
+            L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng);  // back lobe
+            if (sc.envIndex >= 0)
+                L += thr * bkNeeEnv(sc, hb, rhoT, invPdfLambda, lambda, rng);
+            if (directOnly) return false;            // Whitted: no diffuse indirect
+            Real u = rng.uniform();
+            if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; return true; }
+            else if (u < sum) { DVec3 wOut = cosineHemisphere(nb,  rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, nb )) / DPI; ro = h.p + nb  * RAY_EPS; rd = wOut; specularArrival = false; return true; }
+            return false;                            // absorbed
+        }
+        case D_FLUORESCENT: {
+            // Bispectral reradiation — device adjoint of backward.h MatType::Fluorescent.
+            // Elastic base reflects at the output wavelength; the fluorescent channel
+            // excites at a separately-sampled lambdaIn (Stokes shift). Both channels NEE;
+            // one stochastic continuation carries the indirect term.
+            double rhoEl = clamp01((double)specLookup(mp->reflect, lambda));   // elastic base @lambda(out)
+            L += thr * bkNeeLight(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
+            if (sc.envIndex >= 0)
+                L += thr * bkNeeEnv(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
+            double Mint = mp->fluoMint;
+            bool haveFluoro = (Mint > 0.0 && mp->fluoYield > (Real)0);
+            double gOut = 0.0, rhoFluo = 0.0, invPdfIn = 0.0;
+            Real lambdaIn = 0;
+            if (haveFluoro) {
+                gOut = ((double)specLookup(mp->fluoEmitSpec, lambda) / Mint) * invPdfLambda;
+                double pin = 0.0;
+                lambdaIn = dSampleSceneLambda(sc, rng, pin);
+                if (pin > 0.0) {
+                    invPdfIn = dInvPdfLambda(sc, lambdaIn);
+                    double rhoIn = clamp01((double)specLookup(mp->reflect, lambdaIn));
+                    double eps   = clamp01((double)specLookup(mp->fluoAbsorb, lambdaIn));
+                    double aEffIn = fmin(eps, fmax(0.0, 1.0 - rhoIn));
+                    rhoFluo = aEffIn * (double)mp->fluoYield;                 // reradiation albedo @lambdaIn
+                    if (rhoFluo > 0.0) {                                      // fluoro DIRECT NEE
+                        L += thr * gOut * bkNeeLight(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
+                        if (sc.envIndex >= 0)
+                            L += thr * gOut * bkNeeEnv(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
+                    }
+                }
+            }
+            if (directOnly) return false;                                    // Whitted: no indirect (elastic or fluoro)
+            double wFluo = gOut * rhoFluo;                                    // natural indirect-fluoro weight
+            double pF = (wFluo > 0.0) ? fmin(fmax(0.0, 1.0 - rhoEl), wFluo) : 0.0;
+            double u = rng.uniform();
+            if (u < rhoEl) {                                                  // elastic continuation
+                DVec3 wOut = cosineHemisphere(h.n, rng);
+                contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+                ro = h.p + h.n * RAY_EPS; rd = wOut;
+                specularArrival = false; return true;
+            } else if (u < rhoEl + pF) {                                      // fluoro (wavelength-switched)
+                thr *= wFluo / pF;
+                lambda = lambdaIn;                                            // Stokes shift (to the input wl)
+                invPdfLambda = invPdfIn;
+                DVec3 wOut = cosineHemisphere(h.n, rng);
+                contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+                ro = h.p + h.n * RAY_EPS; rd = wOut;
+                specularArrival = false; return true;
+            }
+            return false;                                                     // absorbed / terminated
+        }
+        case D_DIFFUSE:
+        default: {
+            Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
+            L += thr * bkNeeLight(sc, h, rho, invPdfLambda, lambda, rng);
+            if (sc.envIndex >= 0)                   // env-NEE toward the sky (MIS'd on miss)
+                L += thr * bkNeeEnv(sc, h, rho, invPdfLambda, lambda, rng);
+            if (directOnly) return false;           // Whitted: no diffuse indirect
+            if (rng.uniform() >= rho) return false; // RR on albedo
+            DVec3 wOut = cosineHemisphere(h.n, rng);
+            contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+            ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; return true;
+        }
+    }
 }
 
 // Estimate spectral-weighted radiance for one wavelength along a camera ray (port of
@@ -5573,141 +5807,145 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
             L += thr * (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda;
 
+        if (!bkInteract(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
+                        invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk, rng))
+            return L;                                   // path terminated in the interaction
+    }
+    return L;
+}
+
+// Hero-wavelength variant of bkRadiance — the device twin of backward.h radianceHero.
+// Carries C wavelengths (hero + C-1 stratified secondaries) down ONE camera path: index 0
+// is the hero and drives every sampling decision off the same rng stream a single-λ path
+// would, while the secondaries ride the identical vertices and are reweighted per-λ. At a
+// dispersive / wavelength-switching material (anything but Diffuse/DiffuseTransmit) the
+// secondaries de-hero (terminate) and the hero is boosted xC so it alone carries an
+// unbiased single-λ estimate onward — PBRT-v4's TerminateSecondary convention. The caller
+// gates this to scenes WITHOUT participating media / GRIN / a physical lens, so those
+// branches are absent here. Fills Lout[0..C).
+__device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
+                                      const Real* lamIn, const double* invPdfIn, int C,
+                                      double* Lout, DRng& rng) {
+    Real   lam[hero::kHeroMax];
+    double invPdf[hero::kHeroMax], thr[hero::kHeroMax];
+    for (int i = 0; i < C; ++i) { lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = 1.0; Lout[i] = 0.0; }
+    double* L = Lout;                                  // accumulate straight into the output
+    bool secAlive = (C > 1);
+    bool specularArrival = true;                       // camera ray may see a light directly
+    double contBsdfPdf = 0.0;                          // solid-angle pdf of the continuation (env MIS)
+    DMediumStack stk; stk.clear();                     // dielectric priority (Beer-Lambert on the hero λ)
+    const int maxBounce = sc.bkMaxBounce;
+    const bool directOnly = (sc.bkDirectOnly != 0);
+
+    for (int b = 0; b < maxBounce; ++b) {
+        int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
+        DHit h = closestHit(sc, ro, rd);
+
+        // Beer-Lambert over the in-glass segment. A non-empty stack implies we already
+        // de-hero'd (a dielectric entry de-heros), so nUp == 1 whenever absorption is
+        // non-zero; the loop still handles the general case.
+        if (h.valid) {
+            int cm = stk.topMat();
+            if (cm >= 0)
+                for (int i = 0; i < nUp; ++i) {
+                    Real a = (Real)specLookup(sc.mats[cm].absorb, lam[i]);
+                    if (a > 0) thr[i] *= exp(-(double)a * (double)h.t);
+                }
+        }
+
+        if (!h.valid) {                                // escaped: env radiance per λ
+            if (sc.envIndex >= 0) {
+                const bool imageEnv = (sc.env.scale != nullptr);
+                double wMis = 1.0;
+                if (!specularArrival) {                // MIS against the env-NEE at the last vertex
+                    double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
+                    wMis = (contBsdfPdf + pdfEnv > 0.0) ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
+                }
+                for (int i = 0; i < nUp; ++i) {
+                    double Lenv = (imageEnv ? dEnvRadiance(sc.env, rd, lam[i])
+                                            : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]))
+                                  * invPdf[i];
+                    L[i] += thr[i] * Lenv * wMis;
+                }
+            }
+            return;
+        }
+
+        const DMaterial* mp = &sc.mats[h.matId];
+        int matId = h.matId;
+        if (mp->type == D_MIX) {                       // resolve stochastic mix
+            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+            if (child < 0) return;                      // absorbed
+            mp = &sc.mats[child]; matId = child;
+        }
+        // Surface emission on a specular/camera arrival (NEE covers diffuse arrivals).
+        int li = dEmitterForMat(sc, matId);
+        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
+            for (int i = 0; i < nUp; ++i)
+                L[i] += thr[i] * (double)specLookup(sc.emitters[li].emitSpd, lam[i]) * invPdf[i];
+
         switch (mp->type) {
-            case D_DIELECTRIC: {
-                DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd);
-                ro = nro; rd = nrd; specularArrival = true; break;
-            }
-            case D_THINFILM: {
-                DVec3 nro, nrd;
-                if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd)) return L;
-                ro = nro; rd = nrd; specularArrival = true; break;
-            }
-            case D_MULTILAYER: {
-                DVec3 nro, nrd;
-                if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd)) return L;
-                ro = nro; rd = nrd; specularArrival = true; break;
-            }
-            case D_MIRROR: {
-                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-                if (rng.uniform() >= r) return L;       // RR absorb
-                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; break;
-            }
-            case D_GRATING: {
-                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-                if (rng.uniform() >= r) return L;
-                DVec3 nro, nrd;
-                if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) return L;
-                ro = nro; rd = nrd; specularArrival = true; break;
-            }
-            case D_HALFMIRROR: {
-                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-                if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
-                else                   { ro = h.p + rd * RAY_EPS; }
-                specularArrival = true; break;
-            }
-            case D_FILTER: {
-                // Colored gel filter: pass straight through, survive with prob T(lambda).
-                Real t = clamp01(specLookup(mp->transmit, lambda));
-                if (rng.uniform() >= t) return L;   // absorbed
-                ro = h.p + rd * RAY_EPS;            // direction unchanged
-                specularArrival = true; break;
-            }
-            case D_GLOSSY: {
-                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-                if (rng.uniform() >= r) return L;
-                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
-                if (dot(o, h.n) <= 0) return L;
-                ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; break;
-            }
             case D_DIFFUSETRANSMIT: {
-                // Two-lobe Lambertian (device twin of backward.h DiffuseTransmit): NEE the
-                // reflect lobe against lights in the front (+n) hemisphere and the transmit
-                // lobe in the back (-n) hemisphere (a normal-flipped Hit reuses bkNeeLight),
-                // then continue reflect / transmit / absorb (throughput unchanged on survival).
-                Real rhoR = clamp01(dDiffuseRho(sc, *mp, h, lambda));
-                Real rhoT = clamp01(specLookup(mp->transmit, lambda));
-                Real sum = rhoR + rhoT;
-                if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
+                Real rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
+                for (int i = 0; i < nUp; ++i) {
+                    Real rr = clamp01(dDiffuseRho(sc, *mp, h, lam[i]));
+                    Real rt = clamp01(specLookup(mp->transmit, lam[i]));
+                    Real s = rr + rt;
+                    if (s > (Real)1) { rr /= s; rt /= s; }        // per-λ energy guard
+                    rhoR[i] = rr; rhoT[i] = rt;
+                }
                 DVec3 nb = h.n * (Real)(-1);
-                L += thr * bkNeeLight(sc, h, rhoR, invPdfLambda, lambda, rng);   // front lobe
-                if (sc.envIndex >= 0)
-                    L += thr * bkNeeEnv(sc, h, rhoR, invPdfLambda, lambda, rng);
-                DHit hb = h; hb.n = nb;
-                L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng);  // back lobe
-                if (sc.envIndex >= 0)
-                    L += thr * bkNeeEnv(sc, hb, rhoT, invPdfLambda, lambda, rng);
-                if (directOnly) return L;                // Whitted: no diffuse indirect
+                bkNeeLightHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng);      // front lobe
+                if (sc.envIndex >= 0) bkNeeEnvHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng);
+                DHit hb = h; hb.n = nb;                            // back hemisphere (transmit lobe)
+                bkNeeLightHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                if (sc.envIndex >= 0) bkNeeEnvHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                if (directOnly) return;                            // Whitted: no diffuse indirect
+                Real sumHero = rhoR[0] + rhoT[0];
                 Real u = rng.uniform();
-                if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break; }
-                else if (u < sum) { DVec3 wOut = cosineHemisphere(nb,  rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, nb )) / DPI; ro = h.p + nb  * RAY_EPS; rd = wOut; specularArrival = false; break; }
-                return L;                                // absorbed
+                if (u < rhoR[0]) {                                 // reflect (front)
+                    for (int i = 1; i < nUp; ++i) thr[i] *= (double)rhoR[i] / (double)rhoR[0];
+                    DVec3 wOut = cosineHemisphere(h.n, rng);
+                    contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+                    ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
+                } else if (u < sumHero) {                          // transmit (back)
+                    for (int i = 1; i < nUp; ++i) thr[i] *= (double)rhoT[i] / (double)rhoT[0];
+                    DVec3 wOut = cosineHemisphere(nb, rng);
+                    contBsdfPdf = fmax(0.0, (double)dot(wOut, nb)) / DPI;
+                    ro = h.p + nb * RAY_EPS; rd = wOut; specularArrival = false; break;
+                }
+                return;                                            // absorbed
             }
+            case D_DIELECTRIC: case D_THINFILM: case D_MULTILAYER: case D_MIRROR:
+            case D_GRATING:    case D_HALFMIRROR: case D_FILTER:   case D_GLOSSY:
             case D_FLUORESCENT: {
-                // Bispectral reradiation — device adjoint of backward.h MatType::Fluorescent.
-                // Elastic base reflects at the output wavelength; the fluorescent channel
-                // excites at a separately-sampled lambdaIn (Stokes shift). Both channels NEE;
-                // one stochastic continuation carries the indirect term.
-                double rhoEl = clamp01((double)specLookup(mp->reflect, lambda));   // elastic base @lambda(out)
-                L += thr * bkNeeLight(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
-                if (sc.envIndex >= 0)
-                    L += thr * bkNeeEnv(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
-                double Mint = mp->fluoMint;
-                bool haveFluoro = (Mint > 0.0 && mp->fluoYield > (Real)0);
-                double gOut = 0.0, rhoFluo = 0.0, invPdfIn = 0.0;
-                Real lambdaIn = 0;
-                if (haveFluoro) {
-                    gOut = ((double)specLookup(mp->fluoEmitSpec, lambda) / Mint) * invPdfLambda;
-                    double pin = 0.0;
-                    lambdaIn = dSampleSceneLambda(sc, rng, pin);
-                    if (pin > 0.0) {
-                        invPdfIn = dInvPdfLambda(sc, lambdaIn);
-                        double rhoIn = clamp01((double)specLookup(mp->reflect, lambdaIn));
-                        double eps   = clamp01((double)specLookup(mp->fluoAbsorb, lambdaIn));
-                        double aEffIn = fmin(eps, fmax(0.0, 1.0 - rhoIn));
-                        rhoFluo = aEffIn * (double)mp->fluoYield;                 // reradiation albedo @lambdaIn
-                        if (rhoFluo > 0.0) {                                      // fluoro DIRECT NEE
-                            L += thr * gOut * bkNeeLight(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
-                            if (sc.envIndex >= 0)
-                                L += thr * gOut * bkNeeEnv(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
-                        }
-                    }
-                }
-                if (directOnly) return L;                                        // Whitted: no indirect (elastic or fluoro)
-                double wFluo = gOut * rhoFluo;                                    // natural indirect-fluoro weight
-                double pF = (wFluo > 0.0) ? fmin(fmax(0.0, 1.0 - rhoEl), wFluo) : 0.0;
-                double u = rng.uniform();
-                if (u < rhoEl) {                                                  // elastic continuation
-                    DVec3 wOut = cosineHemisphere(h.n, rng);
-                    contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                    ro = h.p + h.n * RAY_EPS; rd = wOut;
-                    specularArrival = false; break;
-                } else if (u < rhoEl + pF) {                                      // fluoro (wavelength-switched)
-                    thr *= wFluo / pF;
-                    lambda = lambdaIn;                                            // Stokes shift (to the input wl)
-                    invPdfLambda = invPdfIn;
-                    DVec3 wOut = cosineHemisphere(h.n, rng);
-                    contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                    ro = h.p + h.n * RAY_EPS; rd = wOut;
-                    specularArrival = false; break;
-                }
-                return L;                                                         // absorbed / terminated
+                // Dispersive / wavelength-switching: terminate the secondaries (boosting
+                // the hero xC so the estimate stays unbiased), then run the shared scalar
+                // interaction on the hero channel alone. Note bkInteract may itself switch
+                // lam[0]/invPdf[0] (a fluorescent Stokes shift) — legal now that index 0 is
+                // the only live wavelength.
+                if (secAlive) { thr[0] *= (double)C; secAlive = false; }
+                if (!bkInteract(sc, mp, h, matId, diffraction, directOnly, ro, rd, lam[0],
+                                invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk, rng))
+                    return;
+                break;
             }
             case D_DIFFUSE:
             default: {
-                Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
-                L += thr * bkNeeLight(sc, h, rho, invPdfLambda, lambda, rng);
-                if (sc.envIndex >= 0)                   // env-NEE toward the sky (MIS'd on miss)
-                    L += thr * bkNeeEnv(sc, h, rho, invPdfLambda, lambda, rng);
-                if (directOnly) return L;               // Whitted: no diffuse indirect
-                if (rng.uniform() >= rho) return L;     // RR on albedo
+                Real rho[hero::kHeroMax];
+                for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, *mp, h, lam[i]));
+                bkNeeLightHero(sc, h, rho, L, thr, lam, invPdf, nUp, rng);
+                if (sc.envIndex >= 0) bkNeeEnvHero(sc, h, rho, L, thr, lam, invPdf, nUp, rng);
+                if (directOnly) return;                            // Whitted: no diffuse indirect
+                Real rhoHero = rho[0];
+                if (rng.uniform() >= rhoHero) return;              // hero RR absorb
+                for (int i = 1; i < nUp; ++i) thr[i] *= (double)rho[i] / (double)rhoHero;
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
                 ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
             }
         }
     }
-    return L;
 }
 
 // Backward reference megakernel (GPU mode R). Grid-strides over res*res*spp samples;
@@ -5719,10 +5957,14 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
 // index (pixel * sppTotal + sampleBase + localSample) so a render split into any number
 // of chunks draws exactly the same union of streams as one single-shot pass of sppTotal
 // samples — chunked progress is therefore bit-identical to the monolithic render.
+// `heroC` > 1 selects the hero-wavelength bundle (bkRadianceHero): one stratified base
+// draw yields C wavelengths that share a single BVH walk, each splatting L/C. heroC == 1
+// runs the classic single-λ estimator bit-for-bit (the host gates heroC to 1 whenever the
+// scene has media / GRIN / a physical lens, which bkRadianceHero does not cover).
 __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
                           long long totalSamples, long long chunkSpp, long long sppTotal,
                           long long sampleBase, int resX,
-                          int diffraction, unsigned long long seedBase) {
+                          int diffraction, unsigned long long seedBase, int heroC) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     for (long long idx = g; idx < totalSamples; idx += G) {
@@ -5731,6 +5973,40 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
+        size_t o = ((size_t)py * resX + px) * 3;
+
+        if (heroC > 1) {
+            // One stratified base draw -> hero + C-1 secondary wavelengths, all from the
+            // scene emission CDF (device twin of BackwardRenderer::renderRows). The hero
+            // (index 0) must have a valid pdf; a dead secondary carries invPdf 0 and
+            // splats nothing. Hero is gated off for a physical lens, so no lens weight.
+            Real   lam[hero::kHeroMax];
+            double invPdf[hero::kHeroMax];
+            double u = (double)rng.uniform(), pdf0 = 0.0;
+            lam[0] = dSampleSceneLambdaU(sc, u, pdf0);
+            if (pdf0 <= 0.0) continue;
+            invPdf[0] = dInvPdfLambda(sc, lam[0]);
+            for (int i = 1; i < heroC; ++i) {
+                double uu = u + (double)i / heroC;
+                if (uu >= 1.0) uu -= 1.0;              // wrap into [0,1)
+                double pdfi = 0.0;
+                lam[i] = dSampleSceneLambdaU(sc, uu, pdfi);
+                invPdf[i] = (pdfi > 0.0) ? dInvPdfLambda(sc, lam[i]) : 0.0;
+            }
+            DVec3 hro, hrd;
+            Real jx = rng.uniform(), jy = rng.uniform();
+            dGenRay(cam, px, py, jx, jy, hro, hrd);
+            double Lh[hero::kHeroMax];
+            bkRadianceHero(sc, diffraction, hro, hrd, lam, invPdf, heroC, Lh, rng);
+            for (int i = 0; i < heroC; ++i) {
+                double w = Lh[i] / (double)heroC;
+                atomicAdd(&film[o + 0], (double)cieX(lam[i]) * w);
+                atomicAdd(&film[o + 1], (double)cieY(lam[i]) * w);
+                atomicAdd(&film[o + 2], (double)cieZ(lam[i]) * w);
+            }
+            if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
+            continue;
+        }
 
         double pdf = 0.0;
         Real lambda = dSampleSceneLambda(sc, rng, pdf);
@@ -5751,7 +6027,6 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         }
         double Lval = bkRadiance(sc, diffraction, ro, rd, lambda, invPdfLambda, rng);
         double w = Lval * wLens;
-        size_t o = ((size_t)py * resX + px) * 3;
         atomicAdd(&film[o + 0], (double)cieX(lambda) * w);
         atomicAdd(&film[o + 1], (double)cieY(lambda) * w);
         atomicAdd(&film[o + 2], (double)cieZ(lambda) * w);
@@ -9365,7 +9640,7 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
 
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction, const SppProgress* prog,
-                        int maxBounce, bool directOnly) {
+                        int maxBounce, bool directOnly, int heroC) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBackwardSupported(scene, cam)) return out;
@@ -9374,6 +9649,13 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     buildUpload(scene, cam, resX, resY, up);
     if (maxBounce >= 1) up.sc.bkMaxBounce = maxBounce;   // Stage 3: -max-bounce cap
     up.sc.bkDirectOnly = directOnly ? 1 : 0;             // Stage 3: -direct-only (Whitted)
+    // Hero-wavelength bundle (`-heroc N`). bkRadianceHero covers the plain surface walk
+    // only, so fall back to the single-λ estimator when the scene needs a branch it does
+    // not carry: participating media, gradient-index bending, or a physical lens (whose
+    // per-λ refraction would give each wavelength its own camera ray). Same gate as the
+    // CPU BackwardRenderer::renderRows, so CPU and GPU mode R agree on when hero applies.
+    const int effHeroC = (heroC > 1 && up.sc.mediaN == 0 && !up.sc.hasGrin && !cam.hasLens())
+                             ? ((heroC > hero::kHeroMax) ? hero::kHeroMax : heroC) : 1;
 
     const size_t npix = (size_t)resX * resY;
     double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
@@ -9395,7 +9677,7 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
         kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, spp, base, resX,
-                                 diffraction ? 1 : 0, seed);
+                                 diffraction ? 1 : 0, seed, effHeroC);
         cudaCheckKernel("backward");
     };
 

@@ -14,12 +14,13 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
 
 - **Spectral transport** — continuous per-photon wavelengths over a configurable band
   (e.g. `spectral 360 830 1`); per-wavelength refraction gives dispersion and
-  chromatic aberration with no extra code. On the **CPU** the tracers use
+  chromatic aberration with no extra code. On the **CPU** tracers *and* the **GPU
+  megakernel** (forward `A/B/C` + `M`, and the backward reference `R`) they use
   **hero-wavelength sampling** (4 stratified λ share one BVH walk, cutting colour
   noise ~0.77×), collapsing to a **single continuous λ** the moment dispersion
   matters — so dispersive **caustics** (light focused through a prism, a lens, or a
   glass of water) still split into true spectral colour instead of smearing an
-  averaged RGB, for more physically realistic focusing. (`kHeroC=1` reverts to one
+  averaged RGB, for more physically realistic focusing. (`-heroc 1` reverts to one
   λ per photon, bit-identically.)
 - **Forward *and* backward** engines that validate each other (mode `V` reports
   the residual between them).
@@ -1051,22 +1052,25 @@ second:**
   per path. **We claim no edge on this axis** — and ftrace now closes the noise gap on
   the **CPU** tracers — the **backward reference tracer (`-mode R`)**, the
   **forward light tracers (`-mode A/B/C`)**, and the **photon-mapping modes (`-mode M/S`)** —
-  plus the **GPU forward megakernel** (modes `A/B/C` and the `M` photon-map deposit)
+  plus the **GPU megakernel** (forward modes `A/B/C`, the `M` photon-map deposit, and the
+  backward reference `R`)
   all use hero-wavelength sampling (a hero λ plus 3 stratified secondaries riding one
   shared BVH walk, secondaries de-hero'd at the first dispersive interface — Wilkie et
   al. 2014 / PBRT-v4 `TerminateSecondary`), so they reach a given colour-noise level in
   fewer samples (measured ~0.77× chroma-noise RMS at equal photons in the light tracers,
-  ~0.87× in the photon map, luma unchanged) while dispersion stays bit-for-bit intact.
+  ~0.87× in the photon map, ~0.77× in GPU mode `R`, luma unchanged) while dispersion stays
+  bit-for-bit intact.
   For photon mapping each traced path deposits all its live wavelengths as per-λ photon
   records, so total stored energy is unchanged. Hero collapses to a single continuous
   wavelength the instant dispersion matters, so it *keeps* the forward photon map's true
   caustic splitting (below) rather than trading it away. Still single-λ **by design or
-  pending work**: the **GPU wavefront** backend (hero forces the megakernel), the **GPU
-  backward / BDPT megakernels**, **BDPT (`-mode D`)**, and **VCM/UPS (`-mode U`)** — these
-  carry one λ per photon for now (hero for U is planned; see `known-issues.md`). The bundle
-  size is runtime-configurable with **`-heroc N`** (default 4, range 1–8); `-heroc 1` turns
-  hero off, reducing every hero tracer (CPU and the GPU forward megakernel) bit-identically
-  to the classic single-λ estimator.
+  pending work**: the **GPU wavefront** backend (`-wavefront` — hero forces the megakernel),
+  the **GPU BDPT megakernel**, **BDPT (`-mode D`)**, and **VCM/UPS (`-mode U`)** — these
+  carry one λ per photon for now (hero for U is planned; see `known-issues.md`). Scenes with
+  participating media, a GRIN volume, or a finite-lens camera also stay single-λ everywhere.
+  The bundle size is runtime-configurable with **`-heroc N`** (default 4, range 1–8);
+  `-heroc 1` turns hero off, reducing every hero tracer (CPU and the GPU megakernel)
+  bit-identically to the classic single-λ estimator.
 - **Dispersion — colours actually splitting** through a prism / lens / water. Only
   the single-λ (ours) and hero-wavelength (PBRT-v4, Mitsuba 3) schemes get this right;
   co-sampled spectral (PBRT-v3, Mitsuba 0.x) and every RGB pipeline cannot.
@@ -1076,7 +1080,7 @@ see sources below):
 
 | Renderer (engine) | Default colour | Spectral mode | Per-path/photon carrier |
 |---|---|---|---|
-| **ftrace (this — forward photon)** | spectral | always | **hero wavelength, 4 λ/photon (CPU A/B/C, R & photon-map M/S); 1 λ on GPU / BDPT / VCM (U)** — true dispersive caustics either way |
+| **ftrace (this — forward photon)** | spectral | always | **hero wavelength, 4 λ/photon (CPU A/B/C, R & photon-map M/S; GPU megakernel A/B/C, M & R); 1 λ on the GPU wavefront / BDPT / VCM (U)** — true dispersive caustics either way |
 | PBRT-v3 (SPPM photon map) | RGB | compile-time (`SampledSpectrum`, ~30 bins @ 10 nm) | **co-sampled: all bins on one photon** — no split |
 | Mitsuba 0.x (`ptracer`/`ppm`/`sppm`) | RGB | compile-time (`SPECTRUM_SAMPLES`, e.g. 15–30) | **co-sampled: all bins per sample** — no split |
 | PBRT-v4 | spectral | always | hero wavelength, 4 λ/path (default, recompilable) |
@@ -2160,7 +2164,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
-| `-heroc <N>` | Hero-wavelength bundle size on the **CPU** spectral tracers (modes `A`/`B`/`C`, `R`, and photon-map `M`/`S`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). GPU / BDPT (`D`) / VCM (`U`) ignore it (still single-λ) |
+| `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R` and photon-map `M`/`S`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, and backward `R`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`), BDPT (`D`), VCM (`U`), and by any scene with participating media, a GRIN volume, or a finite-lens camera |
 | `-beams` / `-photonbeams` | **Decorrelated single-scatter volumetrics** for the shared forward mode-`B` multi-camera / flyby pass. Normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Deliberately omits the multiple-scatter haze wash (crisper bow). Runs on **CPU and GPU** (ported to the CUDA forward tracer; spectral-rainbow-phase media stay CPU-tabulated and fall back to CPU); needs ≥2 shared cameras + a scattering `medium`. No effect otherwise. |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |

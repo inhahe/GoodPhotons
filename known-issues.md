@@ -352,13 +352,14 @@ second 12-byte random-access stream per visit only added traffic. Packing the CI
 into `DPhoton` itself would grow the struct 32→44B and tax every mode's deposit
 bandwidth, so that variant wasn't pursued either. Keep the CPU-side table only.
 
-### TECH-DEBT (2026-07-20): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S) and the GPU forward megakernel (A/B/C + M-deposit) — GPU wavefront, GPU backward/BDPT, and VCM (U) still single-λ
+### TECH-DEBT (2026-07-20, updated 2026-07-26): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S) and the whole GPU megakernel (forward A/B/C + M-deposit, backward R) — GPU wavefront, GPU BDPT, BDPT (D) and VCM (U) still single-λ
 `radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
 `tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
 **CPU photon-mapping modes M (photon map) + S (SPPM)** hero-wavelength spectral sampling (hero λ + 3 stratified
 secondaries, `hero.h` `kHeroC=4`). Its **device twin** (`traceHeroPhoton`/`genPhotonHero`/`shadeStepHero` in
 `src/render_cuda.cu`) now gives the **GPU forward megakernel** the same thing (modes A/B/C and the mode-M photon
-deposit — see the DONE item below). Validated: mode R on `cornell.ftsl` (chroma 0.89× overall / 0.74×
+deposit), and `bkRadianceHero()` gives the **GPU backward megakernel** mode R (both DONE items below).
+Validated: mode R on `cornell.ftsl` (chroma 0.89× overall / 0.74×
 spectral-dominated, luma flat); modes A/B/C on `cornell` mode B (chroma 0.77×, luma 0.97×, energy
 `sum/emitted≈1.0025`, dispersion intact); mode M on `cornell` (energy conserved exactly — auto-exposure identical,
 chroma 0.87×, luma flat); GPU mode B on `cornell` (n=5e7, 300²: `-heroc 4` and `-heroc 1` both converge to
@@ -375,9 +376,16 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
 - **GPU wavefront (streaming) backend** (`render_cuda.cu` `wavefrontTrace`) — still 1 λ/photon; `-wavefront`
   with `-heroc>1` silently falls back to the megakernel (which does carry hero). Port the SoA pool to hold the
   `lam[]`/`beta[]` bundle if the streaming backend ever needs the chroma win on divergent scenes.
-- **GPU backward megakernel** (`renderBackwardCuda`) — mode R on GPU is still single-λ, so `-mode R -device gpu`
-  does *not* get the colour-noise reduction. (The `-device auto` default picks GPU on this machine, so hero only
-  kicks in with `-device cpu`.)
+- **GPU backward megakernel (`renderBackwardCuda`) — DONE 2026-07-26.** `bkRadianceHero()` in
+  `src/render_cuda.cu` is the 1:1 device twin of the CPU `radianceHero` (`bkNeeLightHero`/`bkNeeEnvHero` ↔
+  `neeLightHero`/`neeEnvHero`, `bkInteract` ↔ `interactMaterial`, same de-hero material set, same gate). Four
+  supporting extractions (`dSampleSceneLambdaU`, `bkEmitterGeom`→`BkNeeGeom`, `bkEnvGeom`→`BkEnvGeom`,
+  `bkInteract`) are pure code moves that deliberately return geometric *pieces* rather than fused weights, so the
+  scalar path's fp32 rounding is untouched. `kBackward` branches on a new `heroC`; `renderBackwardCuda` gates on
+  `heroC>1 && mediaN==0 && !hasGrin && !cam.hasLens()`. Validated on `cornell` (dispersive SF10 sphere, so
+  de-hero fires): `-heroc 1` byte-identical to the pre-change binary at `-spp 1`; converged `-heroc 4` vs
+  `-heroc 1` agree to 0.03 % mean luminance (both auto-expose 1.04e-13); chroma noise 0.540→0.416 (0.77×) at
+  C=4 with luma flat; same wall-clock; media/GRIN scenes byte-identical between `-heroc 1` and `-heroc 4`.
 - **GPU BDPT megakernel** (`kBdpt`) and **BDPT (D)** — still 1 λ/photon.
   Propagate the same shared wavelength-sampling + de-hero policy rather than copying the logic per mode.
 - **Photon-mapping modes M (photon map) + S (SPPM) — DONE (CPU).** `tracePhotonHero`'s map deposit now writes

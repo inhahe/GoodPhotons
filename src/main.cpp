@@ -2340,7 +2340,7 @@ static int runCompositeProgressive(
                 SppProgress bp; bp.sampleBase = acc.spp;   // mixes into the device seed
                 bp.report = [](const Film&, long long, bool) { return false; };
                 r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp,
-                                       g_maxBounceOverride, g_directOnly);
+                                       g_maxBounceOverride, g_directOnly, g_heroC);
             } else
 #endif
                 r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
@@ -2631,7 +2631,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (rgbFast)      return renderBackwardRGBCuda(scene, cam, res, resY, sppTarget, diffraction, p,
                                                            g_maxBounceOverride, g_directOnly);
             if (gpuBackward)  return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p,
-                                                        g_maxBounceOverride, g_directOnly);
+                                                        g_maxBounceOverride, g_directOnly, g_heroC);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -6080,7 +6080,7 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
                 if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
                     mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
-                                            g_maxBounceOverride, g_directOnly);
+                                            g_maxBounceOverride, g_directOnly, g_heroC);
                     onGpu = true;
                 }
 #endif
@@ -6129,7 +6129,7 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
                 if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
                     ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
-                                             g_maxBounceOverride, g_directOnly);
+                                             g_maxBounceOverride, g_directOnly, g_heroC);
                     refGpu = true;
                 }
 #endif

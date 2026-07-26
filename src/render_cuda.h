@@ -218,10 +218,14 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 // seeded on the global sample index, so chunking never changes the image).
 // maxBounce (< 1 => leave the device default of 32) caps the backward path depth
 // (-max-bounce); directOnly (-direct-only) renders direct + specular recursion only.
+// heroC (`-heroc N`) > 1 carries a hero wavelength plus C-1 stratified secondaries down
+// each camera path (one shared BVH walk, sharply lower chroma noise); it is clamped to
+// hero::kHeroMax and silently dropped to 1 for scenes the hero walk does not cover
+// (participating media, GRIN, a physical lens) — the same gate the CPU tracer applies.
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction,
                         const SppProgress* prog = nullptr,
-                        int maxBounce = 32, bool directOnly = false);
+                        int maxBounce = 32, bool directOnly = false, int heroC = 1);
 
 // True if this scene + camera can be rendered by the FAST RGB backward megakernel
 // (mode R `-rgb`, Option B in gpu-backward-fast.md): the reduced non-spectral tracer

@@ -2195,7 +2195,8 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           conserved exactly** (`-heroc 4` and `-heroc 1` both converge to auto-exposure 1.06e-13), and `-heroc 1`
           reproduces the classic single-λ device stream bit-for-bit.
           **Still TODO:** the GPU forward wavefront path (streaming backend) — hero forces the megakernel there;
-          and the GPU backward/BDPT megakernels (below).
+          and the GPU BDPT megakernel (below). (The GPU *backward* megakernel landed 2026-07-26 — see the
+          next entry.)
     - [x] **R (backward) — CPU DONE.** `radianceHero()` in `src/backward.h` samples a hero λ + 3 stratified
           secondaries (`hero.h`, `kHeroC=4`), rides them along one shared BVH walk, evaluates materials/NEE per-λ
           (`neeLightHero`/`neeEnvHero`, shared `interactMaterial`/`emitterGeom`/`envGeom` helpers) and splats 4
@@ -2204,7 +2205,39 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           convention. Gated on: `kHeroC>1 && no fog/GRIN/lens` (those stay scalar, C=1 is bit-identical). Validated
           on `cornell.ftsl`: converged image unchanged, glass-sphere dispersion intact, **luma noise flat (1.03×),
           chroma noise down (0.89× overall, 0.74× in spectral-dominated neutral regions)** at equal spp.
-          **Still TODO:** the GPU backward megakernel (`renderBackwardCuda`) — mode R on GPU is still single-λ.
+    - [x] **R (backward) — GPU DONE 2026-07-26 (VERSION 0.59.0).** `bkRadianceHero()` in `src/render_cuda.cu` is
+          the device twin of the CPU `radianceHero`, mirroring it 1:1 so the two can be diffed and neither can
+          drift: `bkNeeLightHero`/`bkNeeEnvHero` ↔ `neeLightHero`/`neeEnvHero`, `bkInteract` ↔ `interactMaterial`,
+          same de-hero material set, same gate. Four supporting refactors, each a pure code move that leaves the
+          scalar path's fp32 rounding untouched (device `Real` is `float` by default — see `FTRACE_GPU_FP32`):
+          (1) `dSampleSceneLambdaU(sc, u, pdf)` split out of `dSampleSceneLambda` so the bundle can push its own
+          stratified `u` values (base draw + C−1 wrapped strata) through the same inverse-CDF sampler;
+          (2) `bkEmitterGeom` → `BkNeeGeom` and (3) `bkEnvGeom` → `BkEnvGeom`, which return the geometric *pieces*
+          (`wi`/`dist2`/`cosSurf`/`G`/`stG`/…) rather than a fused weight, so each caller re-forms the original
+          float product verbatim; (4) the whole material switch hoisted verbatim out of `bkRadiance` into
+          `bkInteract`, shared by the scalar path and by hero's de-hero fallthrough. `kBackward` takes a new
+          `heroC` parameter and draws the bundle per sample; `renderBackwardCuda` gates on
+          `heroC>1 && mediaN==0 && !hasGrin && !cam.hasLens()` (clamped to `hero::kHeroMax`) and is fed `g_heroC`
+          from all four `main.cpp` call sites (progressive, chunked, and the two meter frames).
+          **Validated** on `cornell.ftsl` (which carries a dispersive SF10 glass sphere, so the de-hero branch
+          fires) at 300², GPU:
+          • **`-heroc 1` is arithmetically bit-identical to the pre-change binary** — byte-for-byte equal at
+            `-spp 1` (one `atomicAdd` per pixel, so accumulation order can't matter). At `-spp 64` exactly one
+            channel of one pixel out of 270 000 differs by 1 LSB; that is `atomicAdd(double)` summation order
+            shifting with the recompiled kernel's warp scheduling, not an arithmetic change (each binary is
+            self-deterministic on rerun).
+          • **Energy conserved:** converged (`-spp 131072`) `-heroc 4` vs `-heroc 1` agree to **0.03 %** in mean
+            linear luminance, both auto-exposing to 1.04e-13 — so the ×C de-hero boost is exact.
+          • **Chroma noise down, luma flat** at equal spp (64) against a 131 072-spp reference: rms chroma
+            0.540 (C=1) → 0.477 (C=2) → **0.416 (C=4, −23 %)** → 0.404 (C=8); rms luma 0.829 → 0.803 (flat).
+          • **Free:** 70.4 s (C=1) vs 68.9 s (C=4) for 131 072 spp — the bundle rides one BVH walk.
+          • **Gate verified:** `_fog_cornell` (media) and `grin_lens` (GRIN) are byte-identical between
+            `-heroc 1` and `-heroc 4`, i.e. they correctly fall back to single-λ.
+          • **CPU ↔ GPU agree** to 0.29 % mean luminance at 2048 spp / 200² (noise-level).
+          • Smoke-clean on `iridescent`, `multilayer`, `layered`, `_fluo_cornell`, `mixmat`, `translucency`,
+            `material_presets`.
+          **Still TODO:** the GPU backward **wavefront** path (`-wavefront`) is still single-λ, like the forward
+          wavefront backend; hero forces the megakernel.
     - [x] **M (photon map) + S (SPPM) — CPU DONE.** The shared forward photon pass (`tracePhotonPass` in
           `src/photonmap_render.h`, used by both modes M and S) now sets `r.useHero` under the same gate as the
           forward tracers (`kHeroC>1 && scene.media.empty() && !sceneHasGrin`), so each traced path runs
