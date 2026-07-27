@@ -400,7 +400,8 @@ Origin tags point at the authoritative design text for each item.
       and they were destroyed after the `thread_local` pool at exit (heap corruption; ftrace segfaulted on exit).
       `parse()` now runs `reset_scratch()` on the way out, and the pool is owned through a deleter that frees it only
       when drained. Same latent pattern fixed in `scannerless.{hpp,cpp}`.
-    - *Still open:* delete the legacy parser after one release; port the rich `ParseError` to `scannerless`
+    - *Legacy parser: deleted in 0.79.0* (nothing in `src/` references it any more).
+    - *Still open:* port the rich `ParseError` to `scannerless`
       (needs char-level expected sets + offset→line/col mapping).
 
 ---
@@ -2302,6 +2303,30 @@ ftrace's own language). Two follow-ups were captured:
       (known-issues): the physical solar disk is ~10⁵× the sky, so sun-lit diffuse surfaces are HDR and converge slowly
       in forward modes (same as any sunny HDRI) — an efficient distant-directional-sun emitter (parallel forward
       emission + backward NEE) would fix this and is the proper enhancement.
+
+- [x] **K2 follow-up — first-class distant directional sun (`EmitterShape::Sun`).** **DONE 2026-07-27 (0.84.0).**
+      Built the enhancement K2 logged. New light subtype `light sun { elevation … azimuth … (or dir …) angle 0.53
+      spd … intensity … }` registers an infinitely-distant disc emitter whose rays arrive **parallel**, plus a new
+      **`sun_disk on | off | separate`** switch on the Preetham sky block: `separate` strips the baked disk out of
+      the equirect map and registers an **energy-matched** `light sun` beside the skylight dome (the baked profile's
+      `∫t dΩ = 0.8133·πR²` is converted to an equivalent hard cone `θ = acos(1 − Ω_eff/2π)`, and the disk spectrum —
+      the air-mass-attenuated 5778 K blackbody — is scaled to the same luminance the map carried).
+      **Radiometry:** the authored `spd` is *perpendicular spectral irradiance*, stored internally as radiance
+      `E⊥/Ω`, so widening `angle` softens the penumbra without changing exposure. **Forward:** photons are born on a
+      disc the size of the scene's cross-section, aimed down the beam (joint pdf `1/(Ω·πR²) = 1/envGeom`, exactly
+      analog), so every photon enters the scene. **Backward:** cone NEE with `1/pdfW = Ω`, and the directly-viewed
+      disc added on a ray miss under the `specularArrival` gate — unbiased with **no** MIS weight, because NEE runs
+      at exactly the material types that then clear that flag. The hard cone reuses `spotCosInner == spotCosOuter`
+      so `spotOmega` evaluates to `Ω` — **no new emitter field** on host or device. Touched: `scene.h` (`addSunLight`,
+      `sunRadiance`/`sunXYZForDir`, `geomWeight`, `finalizeEmitters`), `sky.h` (`SunDisk` + extended generator),
+      `ftsl.h` (subtype + `sun_disk`), `backward.h`, `photonmap_render.h`, `sppm_render.h`, `main.cpp`
+      (`addEnvBackground`, mode-D/U guard), `raster.h` (preview shading), `bdpt.h`/`vcm.h` (reject), and the full
+      **CUDA mirror** in `render_cuda.cu`. Modes `D`/`U` refuse a sun scene (not area-connectible), as for
+      `spot`/`env`; everything else (A/B/C/R/`-rgb`/P/M/S) runs on **CPU and GPU**. **Validated** with
+      `scenes/_sun_check.ftsl`: forward B vs backward R **0.09%**, CPU vs GPU mode R **0.01%**, `-rgb` **0.00%**,
+      photon-map M vs R **0.02%**, `angle` 0.53°→8° exposure shift **0.019%**, `sun_disk separate` vs baked
+      **0.12%**. The payoff: at 2×10⁷ photons in mode B the baked disk reached 4% of the converged floor level
+      (image essentially black) while `separate` reached **91%** and looked finished. All 11 `-check*` self-tests pass.
 
   <details><summary>original K2 scope</summary>
 

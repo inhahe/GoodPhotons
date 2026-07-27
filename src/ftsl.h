@@ -758,7 +758,8 @@ public:
             const char* what = (e.shape == EmitterShape::Sphere)   ? "sphere"
                              : (e.shape == EmitterShape::Cylinder) ? "cylinder"
                              : (e.shape == EmitterShape::Spot)     ? "spot"
-                             : (e.shape == EmitterShape::Env)      ? "env" : "this";
+                             : (e.shape == EmitterShape::Env)      ? "env"
+                             : (e.shape == EmitterShape::Sun)      ? "sun" : "this";
             fail(std::string("an emit pattern is not supported on a ") + what +
                  " light — only quad and mesh emitters sample a (u,v) that matches the "
                  "one emission-on-hit interpolates, and a mismatch would bias the image");
@@ -3457,7 +3458,8 @@ private:
         // bottom (`` and `area` both spell the default), which is the only subtype that
         // can honour a pattern.
         if (spdPat >= 0 && (subtype == "collimated" || subtype == "sphere" ||
-                            subtype == "cylinder" || subtype == "spot" || subtype == "env")) {
+                            subtype == "cylinder" || subtype == "spot" ||
+                            subtype == "env" || subtype == "sun")) {
             fail("an spd pattern is only supported on the default rectangular area light — "
                  "a '" + subtype + "' light samples positions that no surface (u,v) "
                  "corresponds to, so the pattern would be silently ignored");
@@ -3563,6 +3565,40 @@ private:
             L.scene.addSpotLight(P(xf.apply(o)), normalize(xf.applyDir(dir)), cosInner, cosOuter, spd, binWidth_);
             return true;
         }
+        if (subtype == "sun") {
+            // Distant directional sun: an infinitely-far disc of angular radius
+            // `angle`/2 about `dir`, so every point of the scene sees it in the same
+            // direction at the same radiance. Aim it either with `dir` (pointing TO the
+            // sun, like the sky block's `sun_dir`) or with `elevation`/`azimuth` in
+            // degrees. `angle` is the full angular DIAMETER in degrees (default 0.53,
+            // the real sun); widening it only softens shadows, because `spd` is the
+            // perpendicular IRRADIANCE, which is what fixes the exposure.
+            Vec3 dir{0.3, 0.6, 0.2};
+            if (!vec3Of(b, "dir", dir)) {
+                double el = dblOf(b, "elevation", 45.0) * PI / 180.0;
+                double az = dblOf(b, "azimuth", 0.0) * PI / 180.0;
+                dir = Vec3{std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az)};
+            }
+            if (find(b, "power") || find(b, "lumens")) {
+                fail("sun light: absolute `power`/`lumens` is not supported (a distant "
+                     "light's flux depends on the scene's cross-section); use `spd` "
+                     "(perpendicular irradiance) or `intensity` instead");
+                return false;
+            }
+            double halfAng = 0.5 * dblOf(b, "angle", 0.53) * PI / 180.0;
+            if (halfAng <= 0.0) {
+                fail("sun light: `angle` (angular diameter, degrees) must be > 0"); return false;
+            }
+            if (halfAng >= PI * 0.5) {
+                fail("sun light: `angle` must be under 180 degrees (it is a cone, not a "
+                     "whole sphere — use an `env` light for that)"); return false;
+            }
+            double inten = dblOf(b, "intensity", 1.0);
+            Spectrum irr = (inten == 1.0) ? spd
+                                          : Spectrum([spd, inten](double w) { return spd(w) * inten; });
+            L.scene.addSunLight(normalize(xf.applyDir(dir)), halfAng, irr, binWidth_);
+            return true;
+        }
         if (subtype == "env") {
             // Environment light. With a `file` it is an image-based (lat-long) env:
             // each texel is upsampled to a physical emission spectrum and directions
@@ -3596,13 +3632,40 @@ private:
                 int res = (int)dblOf(b, "res", 1024.0);
                 if (res < 16) res = 16; if (res > 8192) res = 8192;
                 int sw = res, sh = res / 2;
-                std::vector<Vec3> img = sky::generatePreethamSky(sw, sh, sunDir, turb, gAlb, inten);
+                // `sun_disk on` (default) bakes the solar disk into the map, as before.
+                // `sun_disk off` leaves the map as pure skylight; `sun_disk separate`
+                // ALSO registers an equivalent first-class `sun` emitter, which is the
+                // fast-converging form: the ~10^5x brighter sun is then sampled
+                // directly instead of having to be found inside 6.8e-5 sr of texels.
+                std::string diskStr = strOf(b, "sun_disk", "on");
+                bool diskOn = (diskStr == "on" || diskStr == "true" || diskStr == "yes" ||
+                               diskStr == "baked");
+                bool diskSep = (diskStr == "separate" || diskStr == "light" ||
+                                diskStr == "emitter");
+                bool diskOff = (diskStr == "off" || diskStr == "false" || diskStr == "no" ||
+                                diskStr == "none");
+                if (!diskOn && !diskSep && !diskOff) {
+                    fail("env sky: `sun_disk` must be one of on / off / separate (got '" +
+                         diskStr + "')"); return false;
+                }
+                sky::SunDisk disk;
+                std::vector<Vec3> img = sky::generatePreethamSky(sw, sh, sunDir, turb, gAlb,
+                                                                 inten, diskOn, &disk);
                 auto map = std::make_shared<EnvMap>();
                 std::string eerr;
                 if (!map->buildFromRgb(img, sw, sh, dblOf(b, "rotate", 0.0), 1.0, eerr)) {
                     fail("env sky: " + eerr); return false;
                 }
                 L.scene.addEnvLight(std::move(map), binWidth_);
+                if (diskSep && disk.present) {
+                    // The map was rotated about +y by `rotate`; rotate the sun with it so
+                    // the separate emitter still lands where the sky says it does.
+                    double rot = dblOf(b, "rotate", 0.0) * PI / 180.0;
+                    double cs = std::cos(rot), sn = std::sin(rot);
+                    Vec3 d = disk.dir;
+                    Vec3 dRot{d.x * cs - d.z * sn, d.y, d.x * sn + d.z * cs};
+                    L.scene.addSunLight(dRot, disk.halfAngle, disk.irradiance, binWidth_);
+                }
                 return true;
             }
             std::string file = strOf(b, "file");

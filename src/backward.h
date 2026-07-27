@@ -119,6 +119,26 @@ struct BackwardRenderer {
             w = fall * cosSurf / dist2 * stG;                // I(w)/dist^2 (× BRDF & SPD by caller)
             return true;
         }
+        if (em.shape == EmitterShape::Sun) {
+            // Distant directional sun: sample wi uniformly in the solar cone about
+            // -beamDir (solid-angle pdf 1/Omega) and shadow-ray it to the scene exit —
+            // there is no finite light distance, so no 1/dist^2 and no cosLight. In
+            // solid-angle measure w = cos(surf)/pdfW = cos(surf)*Omega, and since spdFn
+            // is the sun's RADIANCE the caller's (rho/PI)*SPD*w reproduces the textbook
+            // (rho/PI)*E_perp*cos(surf) for the irradiance the light was authored with.
+            // Two rng draws, matching the area-light path below, so adding a sun does
+            // not reshuffle any other emitter's stream.
+            double s1 = rng.uniform(), s2 = rng.uniform();
+            Vec3 wi = em.sampleCone(-em.beamDir, s1, s2);
+            double cosSurf = dot(h.n, wi);
+            if (cosSurf <= 0) return false;
+            double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
+            if (stG <= 0.0) return false;                    // behind true geometry: hard shadow
+            dist = length(scene.sceneCenter - h.p) + scene.sceneRadius;   // to the scene exit
+            if (scene.occluded(h.p + ngo * 1e-6, wi, dist)) return false;
+            w = cosSurf * em.spotOmega * stG;
+            return true;
+        }
         double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 y, nLight, wi;
         double pdfW = 0.0;
@@ -255,6 +275,20 @@ struct BackwardRenderer {
                 double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
                 double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
                 total += albedo * phase * emitW * fall / dist2 * T;
+                continue;
+            }
+            if (em.shape == EmitterShape::Sun) {
+                // Distant sun at a volume vertex: cone-sampled direction (pdf 1/Omega),
+                // no surface cosine, transmittance to the scene exit. 1/pdfW = Omega.
+                double s1 = rng.uniform(), s2 = rng.uniform();
+                Vec3 wi = em.sampleCone(-em.beamDir, s1, s2);
+                double dist = length(scene.sceneCenter - p) + scene.sceneRadius;
+                if (scene.occluded(p + wi * 1e-6, wi, dist)) continue;
+                double phase  = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
+                double albedo = scene.backwardMedium().albedo(lambda);
+                double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
+                double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
+                total += albedo * phase * emitW * em.spotOmega * T;
                 continue;
             }
             double u1 = rng.uniform(), u2 = rng.uniform();
@@ -678,6 +712,12 @@ struct BackwardRenderer {
                         L += thr * Lenv * wMis;
                     }
                 }
+                // Directly-viewed solar disc: camera / specular arrivals only. A diffuse
+                // or volume vertex already spent its one estimator on the sun via
+                // NEE (emitterGeom / neeVolume) and sets specularArrival = false, so
+                // this is a clean single-strategy split, not a missing MIS weight.
+                if (scene.sunCount > 0 && specularArrival)
+                    L += thr * scene.sunRadiance(ray.d, lambda) * invPdfLambda;
                 return L;
             }
             const Material* mp = &scene.mats[h.matId];
@@ -783,6 +823,9 @@ struct BackwardRenderer {
                             L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i] * wMis;
                     }
                 }
+                if (scene.sunCount > 0 && specularArrival)   // directly-viewed solar disc
+                    for (int i = 0; i < nUp; ++i)
+                        L[i] += thr[i] * scene.sunRadiance(ray.d, lam[i]) * invPdf[i];
                 finish(); return;
             }
 

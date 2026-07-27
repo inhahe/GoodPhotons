@@ -854,7 +854,8 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     if (scene.emitters.empty() || scene.totalPower <= 0.0) return 0;
     int ei = scene.selectEmitter(rng);
     const Emitter& em = scene.emitters[ei];
-    if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
+    if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
+        em.shape == EmitterShape::Sun || em.collimated)
         return 0;                                    // unsupported in BDPT scope
 
     double u1 = rng.uniform(), u2 = rng.uniform();
@@ -1100,7 +1101,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (!pt.isConnectible()) return 0.0;
         int ei = scene.selectEmitter(rng);
         const Emitter& em = scene.emitters[ei];
-        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
+        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
+            em.shape == EmitterShape::Sun || em.collimated)
             return 0.0;
         double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 y, nOut;

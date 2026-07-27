@@ -89,6 +89,11 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             if (scene.envIndex >= 0)
                 directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                            * (thr * scene.envRadiance(ray.d, lambda) * invPdfL);
+            // Directly-viewed solar disc (camera / specular escapes only — a diffuse
+            // vertex stores a hit point and returns before it can reach here).
+            if (scene.sunCount > 0)
+                directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                           * (thr * scene.sunRadiance(ray.d, lambda) * invPdfL);
             return;
         }
         const Material* mp = &scene.mats[h.matId];

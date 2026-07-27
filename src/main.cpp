@@ -1689,13 +1689,24 @@ static void thinFilmSwatch(double n1, double n2) {
 // surfaces; this pass supplies the *direct view* of the sky behind the geometry.
 // No-op unless the scene has an env light. Silhouette pixels are classified by the
 // pixel center (a sub-pixel edge approximation, like mode P's classifier).
+// A distant `sun` light is handled here too: a forward photon fired into the solar
+// cone never travels *toward* the camera (the disc is at infinity), so the direct
+// view of the solar disc — like the sky behind the geometry — is a pure camera-ray
+// term. `sunXYZForDir` returns 0 outside every sun's cone, so this costs nothing
+// for a scene without one.
 static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
-    if (scene.envIndex < 0) return;
+    const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
+    if (!haveEnv && !haveSun) return;
     for (int py = 0; py < film.resY; ++py)
         for (int px = 0; px < film.resX; ++px) {
             Ray r = cam.genRay(px, py, 0.5, 0.5);
             Hit h = scene.closestHit(r);
-            if (!h.valid) film.add(px, py, scene.envXYZForDir(r.d) * (double)N);
+            if (!h.valid) {
+                Vec3 bg{0, 0, 0};
+                if (haveEnv) bg += scene.envXYZForDir(r.d);
+                if (haveSun) bg += scene.sunXYZForDir(r.d);
+                film.add(px, py, bg * (double)N);
+            }
         }
 }
 
@@ -2416,8 +2427,9 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
         if (matUsed[i] && scene.mats[i].type == MatType::Layered)
             return "layered materials";
     for (const auto& em : scene.emitters)
-        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
-            return "spot / environment / collimated lights";
+        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
+            em.shape == EmitterShape::Sun || em.collimated)
+            return "spot / environment / sun / collimated lights";
     return nullptr;
 }
 

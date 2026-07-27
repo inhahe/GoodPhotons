@@ -599,13 +599,13 @@ two slots:
   subpath samples on it — and MIS combines the two, so if they disagreed the image would be
   **biased**, not merely noisy. Only a rectangular area light (bilinear parameters) and a mesh
   emitter (barycentric UVs) can report a sampled (u,v) that provably equals the one a hit
-  interpolates. A `sphere` / `cylinder` / `spot` / `env` light is **refused** at load.
+  interpolates. A `sphere` / `cylinder` / `spot` / `sun` / `env` light is **refused** at load.
 * **`power` / `lumens` normalise the *unpatterned* spectrum.** The pattern is a pure
   post-multiplier on radiance — which is exactly what keeps every selection and positional pdf
   untouched, and hence the estimator unbiased — so a profile averaging 0.5 emits about half the
   requested flux. Scale `power` up to hold total output fixed.
-* **CPU only for now** (0.80.0). A scene with an emission pattern falls back from the GPU
-  backends to the CPU tracer with a notice.
+* **CPU *and* GPU** (ported in 0.82.0). `DMaterial::emitPat` / `DEmitter::emitPat` mirror the
+  host pair, so an emission pattern no longer forces a CPU fallback.
 
 An emissive **material** (`emit` on a `material` block) only becomes a *sampleable* light when
 it is bound to a `mesh {}`; a bare `quad {}` with an emissive material just adds emissive
@@ -992,10 +992,18 @@ scene to fixed-exposure output (`power` wins if both given). Env lights reject
 | `sphere` | `center` `radius`(0.1) `spd` — a glowing ball (also dropped into geometry) |
 | `cylinder` | `center` `axis`(0,1,0) `length`(0.5) `radius`(0.05) `segments`(48) `caps`(off) `spd` — a tube/fluorescent |
 | `spot` | `origin`(0.5,0.99,0.5) `dir`(0,-1,0) `inner_angle`(20°) `outer_angle`(30°) `spd` |
+| `sun` | `elevation`(45°) `azimuth`(0°) *or* `dir`(toward the sun) `angle`(0.53°) `spd` `intensity`(1) |
 | `env` | constant: `spd`. Image-based: `file "sky.hdr"` `rotate`(0°) `intensity`(1) |
 
 `caps on`/`true`/`yes` closes the cylinder (emissive end discs). `spot` angles are
 half-angles in degrees with a smoothstep penumbra between inner and outer.
+
+`sun` is an infinitely-distant directional light — a disc of angular **diameter**
+`angle` degrees whose rays arrive parallel. `spd` is the **perpendicular spectral
+irradiance** (the light hitting a surface facing the sun), so widening `angle` softens
+the penumbra without changing the exposure. `power`/`lumens` are refused (a distant
+light's flux depends on the scene's cross-section, not the light) — use `intensity`.
+Like `spot`/`env`, `sun` is not connectible in modes `D`/`U`, which refuse the scene.
 
 The default rectangular `area` light also accepts an **emission profile** over its
 surface — `spd pattern:<n>` (the pattern *is* the profile, greyscale) or

@@ -144,6 +144,14 @@ inline PreviewLight deriveLight(const Scene& sc) {
         }
         p.weight   = std::max(e.power, 0.0);
         p.falloff2 = fall2;
+        if (e.shape == EmitterShape::Sun) {
+            // A distant sun is directional: fake it as a point source parked far up the
+            // beam with distance falloff disabled, so every surface shades from the same
+            // (to ~1e-4 rad) direction at full strength. No new PLight field, hence no
+            // change needed in the two GPU mirrors of this struct.
+            p.pos = sc.sceneCenter - normalize(e.beamDir) * (sc.sceneRadius * 1e4 + 1e4);
+            p.falloff2 = 0.0;
+        }
         totalPow  += p.weight;
         L.lights.push_back(p);
     }

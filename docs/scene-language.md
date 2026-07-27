@@ -557,6 +557,58 @@ no area or light-side cosine). No emissive geometry is added — a point light i
 infinitely small, so it has no direct-view term. Validated by
 `scenes/spotlight.ftsl` (mode V: forward agrees with backward; CPU==GPU energy).
 
+```
+light sun {                        # a distant directional sun
+    elevation 40   azimuth 25      # degrees; azimuth from +x toward +z
+    angle     0.53                 # angular DIAMETER of the disc, degrees
+    spd       preset:bb5800
+    intensity 3
+}
+```
+
+A `light sun` registers an **infinitely-distant directional** emitter
+(`shape = EmitterShape::Sun`): a disc of angular radius `angle/2` sitting at infinity,
+so its rays arrive **parallel** across the whole scene. Author its aim with
+`elevation` + `azimuth` (matching the sky block's convention) or a raw `dir` pointing
+*toward* the sun; internally it is stored as `beamDir`, the direction light **travels**.
+
+*Radiometry.* The authored `spd` is the **perpendicular spectral irradiance** `E⊥` —
+what a surface facing the sun receives — and the emitter stores radiance
+`L = E⊥ / Ω`, with `Ω = 2π(1 − cos θ)` the disc's solid angle. NEE at a Lambertian
+vertex therefore returns `(ρ/π)·L·cos·Ω = (ρ/π)·E⊥·cos`, independent of `angle`: making
+the disc wider softens the shadow penumbra **without changing the exposure** (measured:
+0.53° → 8° moves the lit-floor level by 0.019%). Because the cone is *hard* (no
+penumbra falloff), the existing spot fields are reused with
+`spotCosInner == spotCosOuter == cos θ`, which makes `spotOmega = π(2 − cᵢ − c₀)`
+evaluate to exactly `Ω` — no new emitter fields on host or device.
+
+*Forward emission is the whole point.* The geometric weight is
+`envGeom = Ω · πR²` (`R` = scene bounding-sphere radius), so
+`power = emitIntegral · Ω · πR²` — the flux the beam actually pours through the scene's
+cross-section. A photon is born by sampling a travel direction uniformly in the cone
+(pdf `1/Ω`) and an entry point on a disc of radius `R` **perpendicular to that
+direction**, pushed upstream to `sceneCenter − dir·R` (pdf `1/πR²`); the joint
+`1/(Ω·πR²) = 1/envGeom` makes the spawn exactly analog, the same trick the env uses but
+*aimed*, so **every** photon enters the scene instead of most missing it. That is the
+convergence win over baking the sun into the sky map.
+
+*Direct view, without MIS.* The solar disc is directly viewable, and the miss term is
+added **only when `specularArrival` is true** (a camera ray or a specular chain). This
+is exactly unbiased with **no MIS weight**, because `neeLight`/`neeEnv` are called
+precisely at the material types that then clear `specularArrival` — so a given path
+spends exactly one estimator on the sun, never two. (The env is different: it is both
+NEE'd *and* BSDF-hit, hence balance-heuristic weighted.)
+
+`power`/`lumens` are **refused** on a `sun` block — a distant light's total flux
+depends on the scene's cross-section rather than on the light, so an absolute watt
+figure would be meaningless; scale with `intensity` instead. Like `spot` and `env`, a
+sun is not connectible in area measure, so modes `D` (BDPT) and `U` (VCM) refuse a
+scene containing one. Everything else — forward A/B/C, backward R (spectral and
+`-rgb`), composite P, photon map M, SPPM S — supports it on **both CPU and GPU**.
+Validated by `scenes/_sun_check.ftsl`: mode B forward and mode R backward agree to
+0.09%, CPU and GPU mode R to 0.01%, the RGB fast path to 0.00%, and photon-map mode M
+to the backward reference to 0.02%.
+
 A `light sphere` registers a spherical `Emitter` (`shape = EmitterShape::Sphere`,
 `area = 4·π·r²`) and also drops an emissive sphere into the geometry so photons
 that strike it are absorbed and it is visible in the photon-catch camera modes

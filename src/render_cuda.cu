@@ -590,10 +590,14 @@ struct DEmitter {
     DVec3  origin, u, v, normal, beamDir;
     double area, power;
     int    collimated;
-    int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder, 5 mesh
+    int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder, 5 mesh, 6 sun
     double radius;             // sphere radius (shape==1) / tube radius (shape==4)
     int    caps;               // cylinder (shape==4): also emit from the two end discs
-    double spotCosInner, spotCosOuter, spotOmega;   // spot cone (shape==2)
+    // Cone cosines / solid angle. Spot (shape==2): the smoothstep penumbra. Distant sun
+    // (shape==6): inner == outer == cos(halfAngle), so spotOmega = PI*(2-ci-co) is
+    // exactly the solar cone's solid angle 2*PI*(1-cos theta) — the same field reuse the
+    // host Emitter makes, so no extra members are needed on either side.
+    double spotCosInner, spotCosOuter, spotOmega;
     // Mesh area light (shape==5): device pointer to this emitter's triangle CDF and its
     // count. nullptr/0 for every other shape. area == sum of the triangle areas.
     const DEmitTri* meshTris; int meshTriN;
@@ -623,6 +627,26 @@ __device__ static double spotFalloff(double ct, double cosInner, double cosOuter
     double t = (ct - cosOuter) / (cosInner - cosOuter);
     return t * t * (3.0 - 2.0 * t);
 }
+
+// ---- distant sun (shape==6) helpers, device twins of host Emitter::sampleCone/inCone --
+// Uniform direction inside the cone of half-angle acos(spotCosOuter) about `axis`
+// (solid-angle pdf 1/spotOmega). Same closed form and same u1/u2 roles as the host, so
+// CPU and GPU agree on the shape of the penumbra.
+__device__ static inline DVec3 dSunSampleCone(const DEmitter& em, const DVec3& axis,
+                                              double u1, double u2) {
+    double ct = em.spotCosOuter + u1 * (1.0 - em.spotCosOuter);
+    double st = sqrt(fmax(0.0, 1.0 - ct * ct));
+    double phi = 2.0 * 3.14159265358979323846 * u2;
+    DVec3 t, b; onb(axis, t, b);
+    return t * (Real)(st * cos(phi)) + b * (Real)(st * sin(phi)) + axis * (Real)ct;
+}
+// Does viewing direction `d` land on this sun's disc? `beamDir` is the TRAVEL direction,
+// so a ray looking AT the sun runs opposite it.
+__device__ static inline bool dInSunCone(const DEmitter& em, const DVec3& d) {
+    return (double)dot(d, em.beamDir) <= -em.spotCosOuter;
+}
+// (dSunRadiance — the summed radiance of every sun whose disc contains a direction — is
+// defined further down, once DScene exists.)
 
 // Sample a surface point + outward normal on an emitter (mirrors host
 // Emitter::samplePoint). Quad draws are unchanged, so quad scenes stay parity.
@@ -831,6 +855,9 @@ struct DScene {
     double sceneRadius;              // env (shape==3): bounding-sphere radius
     DEnvMap env;                     // image env tables (env.scale null => constant env)
     int    envIndex;                 // index of the env emitter in `emitters`, or -1 (mirrors Scene::envIndex)
+    int    sunCount;                 // number of shape==6 (distant sun) emitters (mirrors Scene::sunCount);
+                                     // every sun-aware hot path tests this first, so a scene
+                                     // without a sun pays one integer compare
     DVec3  rgbEnv;                    // fast RGB backward: constant-env radiance in linear sRGB (0 if no env)
     // Scene-ignore render params (Stage 3), set by renderBackward[RGB]Cuda from the CLI
     // flags. bkMaxBounce caps the backward path-depth loop (default 32). bkDirectOnly=1
@@ -1218,6 +1245,16 @@ __device__ static Real specLookup(const double* tab, Real lambda) {
     int i = (int)f; Real frac = f - i;
     return (Real)tab[i] * ((Real)1 - frac) + (Real)tab[i + 1] * frac;
 }
+__device__ static inline double dSunRadiance(const DScene& sc, const DVec3& d, Real lambda) {
+    if (sc.sunCount == 0) return 0.0;
+    double L = 0.0;
+    for (int k = 0; k < sc.nEmitters; ++k) {
+        const DEmitter& e = sc.emitters[k];
+        if (e.shape == 6 && dInSunCone(e, d)) L += (double)specLookup(e.emitSpd, lambda);
+    }
+    return L;
+}
+
 __device__ static Real medSigmaT(const DMedium& m, Real lambda) {
     Real a = specLookup(m.sigma_a, lambda), s = specLookup(m.sigma_s, lambda);
     Real v = fmax((Real)0, a) + fmax((Real)0, s);
@@ -4317,6 +4354,20 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         DVec3 disk = t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
         origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
         emitN = dir;
+    } else if (em.shape == 6) {
+        // Distant directional sun (device twin of render.h). Sample the travel direction
+        // inside the solar cone (pdf 1/Omega), then the entry point on a disk of radius R
+        // perpendicular to it (pdf 1/(pi R^2)) — the same upstream-disk trick the env
+        // uses, but aimed instead of isotropic, so EVERY photon crosses the scene rather
+        // than one in ~10^5. The joint pdf 1/(Omega*pi*R^2) is exactly 1/envGeom, so
+        // beta = emitIntegral*envGeom is analog with no reweight.
+        dir = dSunSampleCone(em, em.beamDir, (double)u1, (double)u2);
+        DVec3 t, b; onb(dir, t, b);
+        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
+        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius
+               + t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
+        emitN = dir;
     } else {
         // quad: constant normal; sphere: surface point. Also returns this point's
         // `emit pattern:` factor — 1.0 (and a bit-identical draw) when unpatterned.
@@ -4353,8 +4404,9 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     // Connect the emitter itself to the camera (makes the source visible): model
     // B splats to the pinhole, model A splats through the finite lens pupil. Model
     // C instead catches photons that physically arrive. A spot is a point light
-    // with no projected area, so it has no direct term.
-    if (em.shape != 2 && em.shape != 3) {
+    // with no projected area, so it has no direct term; a distant sun's disc is at
+    // infinity, so its direct view is the backend-agnostic addEnvBackground pass.
+    if (em.shape != 2 && em.shape != 3 && em.shape != 6) {
         // Emitter vertex: ns==ng==emitN, so the adjoint correction is identically 1
         // (wi is irrelevant here — pass emitN).
         splatSurfaceAll(sc, cs, camMode, origin, emitN, emitN, emitN, lambda, beta, (Real)1, rng);
@@ -4748,6 +4800,14 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         DVec3 disk = t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
         origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
         emitN = dir;
+    } else if (em.shape == 6) {                       // distant sun — see genPhoton
+        dir = dSunSampleCone(em, em.beamDir, (double)u1, (double)u2);
+        DVec3 t, b; onb(dir, t, b);
+        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
+        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius
+               + t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
+        emitN = dir;
     } else {
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
@@ -4784,9 +4844,9 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
     int nUp = secAlive ? C : 1;
     for (int i = 0; i < nUp; ++i) eEmitted += (double)beta[i];
 
-    // Direct emitter->camera connection (area/quad emitters only; spot/env have no direct
-    // term). No-op for mode C (splat helpers skip it) and the mode-M deposit pass (nCam==0).
-    if (em.shape != 2 && em.shape != 3) {
+    // Direct emitter->camera connection (area/quad emitters only; spot/env/sun have no
+    // direct term). No-op for mode C (splat helpers skip it) and the mode-M deposit pass (nCam==0).
+    if (em.shape != 2 && em.shape != 3 && em.shape != 6) {
         Real rhoOne[hero::kHeroMax]; for (int i = 0; i < nUp; ++i) rhoOne[i] = (Real)1;
         splatSurfaceAllHero(sc, cs, camMode, origin, emitN, emitN, emitN, lam, beta, rhoOne, nUp, rng);
         camSpecularSplatAllHero(sc, cs, camMode, origin, emitN, lam, beta, rhoOne, nUp, rng);
@@ -5497,9 +5557,11 @@ __device__ static double dInvPdfLambda(const DScene& sc, Real lambda) {
         const DEmitter& e = sc.emitters[k];
         // geomWeight (mirrors Scene::Emitter::geomWeight): area/sphere/cylinder = area*PI;
         // point-spot (shape 2) = spotOmega (falloff-weighted solid angle); env (shape 3) =
-        // envGeom = 4*PI^2*R^2. Collimated beams are gated to the CPU.
+        // envGeom = 4*PI^2*R^2; distant sun (shape 6) = envGeom = Omega*PI*R^2 (the solar
+        // cone times the scene's projected disc). Collimated beams are gated to the CPU.
         double gw = (e.shape == 2) ? e.spotOmega
                   : (e.shape == 3) ? (4.0 * DPI * DPI * sc.sceneRadius * sc.sceneRadius)
+                  : (e.shape == 6) ? (e.spotOmega * DPI * sc.sceneRadius * sc.sceneRadius)
                                    : ((double)e.area * DPI);
         g += gw * (double)specLookup(e.emitSpd, lambda);
     }
@@ -5655,6 +5717,8 @@ struct BkNeeGeom {
     Real  fall;      // spot cone falloff (spot emitters only)
     Real  G;         // area-measure geometry term cosSurf*cosLight/dist2 (non-spot)
     bool  spot;      // point-spot emitter (deterministic connect, draws no rng)
+    bool  sun;       // distant-sun emitter (cone NEE in solid-angle measure)
+    Real  wSun;      // sun only: the complete λ-independent weight cosSurf*Omega*stG
 };
 __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec3& ngo,
                                      const DEmitter& em, DRng& rng, BkNeeGeom& g) {
@@ -5673,7 +5737,26 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
         if (g.fall <= (Real)0) return false;
         if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
-        g.G = (Real)0; g.spot = true;
+        g.G = (Real)0; g.spot = true; g.sun = false;
+        return true;
+    }
+    if (em.shape == 6) {
+        // Distant sun (device twin of emitterGeom's Sun branch): sample wi uniformly in
+        // the solar cone about -beamDir (pdf 1/Omega) and shadow-ray it to the scene exit.
+        // No finite light distance, so no 1/dist^2 and no cosLight: in solid-angle measure
+        // the whole λ-independent weight is cosSurf/pdfW = cosSurf*Omega. Two rng draws,
+        // matching the area path, so adding a sun reshuffles no other emitter's stream.
+        double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
+        g.wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
+        g.cosSurf = dot(h.n, g.wi);
+        if (g.cosSurf <= (Real)0) return false;
+        g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
+        if (g.stG <= (Real)0) return false;
+        g.dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
+        g.dist2 = g.dist * g.dist;
+        if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist)) return false;
+        g.wSun = (Real)((double)g.cosSurf * em.spotOmega * (double)g.stG);
+        g.G = (Real)0; g.fall = (Real)1; g.spot = false; g.sun = true;
         return true;
     }
     Real u1 = rng.uniform(), u2 = rng.uniform();
@@ -5701,7 +5784,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
     g.G = g.cosSurf * cosLight / g.dist2;
     if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
-    g.fall = (Real)1; g.spot = false;
+    g.fall = (Real)1; g.spot = false; g.sun = false;
     return true;
 }
 
@@ -5716,7 +5799,9 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         BkNeeGeom g;
         if (!bkEmitterGeom(sc, h, ngo0, em, rng, g)) continue;
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        double contrib = g.spot
+        double contrib = g.sun
+            ? (double)(f * g.wSun) * emitW
+            : g.spot
             ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
             : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
         // Shadow-ray transmittance through any participating media (superposition;
@@ -5747,7 +5832,9 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
         for (int i = 0; i < nUp; ++i) {
             Real f = rho[i] / (Real)DPI;
             double emitW = (double)specLookup(em.emitSpd, lam[i]) * invPdf[i];
-            double contrib = g.spot
+            double contrib = g.sun
+                ? (double)(f * g.wSun) * emitW
+                : g.spot
                 ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
                 : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
             L[i] += thr[i] * contrib;
@@ -5784,6 +5871,21 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             Real phase = dMedPhase(med, dot(wIn, wi), lambda);
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
             double contrib = (double)(alb * phase * fall / dist2) * emitW;
+            contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
+            total += contrib;
+            continue;
+        }
+        if (em.shape == 6) {
+            // Distant sun at a volume vertex (device twin of neeVolume's Sun branch):
+            // cone-sampled direction (pdf 1/Omega, so 1/pdfW = Omega), no surface cosine,
+            // transmittance out to the scene exit.
+            double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
+            DVec3 wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
+            Real dist = (Real)((double)length(sc.sceneCenter - p) + sc.sceneRadius);
+            if (occluded(sc, p + wi * RAY_EPS, wi, dist)) continue;
+            Real phase = dMedPhase(med, dot(wIn, wi), lambda);
+            double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+            double contrib = (double)(alb * phase) * emitW * em.spotOmega;
             contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
             total += contrib;
             continue;
@@ -6137,6 +6239,12 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                     L += thr * Lenv * wMis;
                 }
             }
+            // Directly-viewed solar disc: camera / specular arrivals only. A diffuse or
+            // volume vertex already spent its one estimator on the sun via NEE
+            // (bkEmitterGeom / bkNeeVolume) and sets specularArrival = false, so this is
+            // a clean single-strategy split, not a missing MIS weight (host twin: backward.h).
+            if (sc.sunCount > 0 && specularArrival)
+                L += thr * dSunRadiance(sc, rd, lambda) * invPdfLambda;
             return L;
         }
         // Beer-Lambert attenuation over the in-glass segment up to this surface
@@ -6222,6 +6330,9 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
                     L[i] += thr[i] * Lenv * wMis;
                 }
             }
+            if (sc.sunCount > 0 && specularArrival)     // directly-viewed solar disc
+                for (int i = 0; i < nUp; ++i)
+                    L[i] += thr[i] * dSunRadiance(sc, rd, lam[i]) * invPdf[i];
             return;
         }
 
@@ -6478,6 +6589,18 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             total = total + hadamard(f * (fall * cosSurf / dist2 * stG), em.rgbEmit);
             continue;
         }
+        if (em.shape == 6) {                           // distant sun: cone NEE, 1/pdfW = Omega
+            double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
+            DVec3 wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
+            Real cosSurf = dot(h.n, wi);
+            if (cosSurf <= (Real)0) continue;
+            Real stG = dShadowTerminatorG(wi, h.n, ngo0);
+            if (stG <= (Real)0) continue;
+            Real dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
+            if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist)) continue;
+            total = total + hadamard(f * (Real)((double)(cosSurf * stG) * em.spotOmega), em.rgbEmit);
+            continue;
+        }
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 y, nL;
         // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
@@ -6551,6 +6674,14 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                     L = L + hadamard(beta, sc.rgbEnv) * (Real)wMis;
                 }
             }
+            // Directly-viewed solar disc (camera / specular arrivals only, as in the
+            // spectral walk). rgbEmit already carries the sun's wavelength-integrated
+            // radiance, so no per-λ term is needed here.
+            if (sc.sunCount > 0 && specularArrival)
+                for (int k = 0; k < sc.nEmitters; ++k) {
+                    const DEmitter& e = sc.emitters[k];
+                    if (e.shape == 6 && dInSunCone(e, rd)) L = L + hadamard(beta, e.rgbEmit);
+                }
             return L;
         }
         // Beer-Lambert attenuation over the in-glass segment (3-tap RGB sigma_a).
@@ -7190,7 +7321,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     if (sc.nEmitters == 0 || sc.totalPower <= 0.0) return 0;
     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
     const DEmitter& em = sc.emitters[ei];
-    if (em.shape == 2 || em.shape == 3 || em.collimated) return 0;
+    if (em.shape == 2 || em.shape == 3 || em.shape == 6 || em.collimated) return 0;
     Real u1 = rng.uniform(), u2 = rng.uniform();
     DVec3 y, nOut;
     // `emitPatW` is this point's `emit pattern:` factor (1.0, and a bit-identical draw,
@@ -7404,7 +7535,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         if (!dVertConnectible(sc, pt)) return 0.0;
         int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
         const DEmitter& em = sc.emitters[ei];
-        if (em.shape == 2 || em.shape == 3 || em.collimated) return 0.0;
+        if (em.shape == 2 || em.shape == 3 || em.shape == 6 || em.collimated) return 0.0;
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 y, nOut;
         // The sampled point's `emit pattern:` factor scales the radiance this strategy
@@ -7860,6 +7991,16 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 oY += (double)cieY(lambda) * e;
                 oZ += (double)cieZ(lambda) * e;
             }
+            // Directly-viewed solar disc. This walk terminates at the first diffuse
+            // vertex (the density estimate returns there), so any escape reaching here
+            // is a camera ray or a specular chain — never a diffuse continuation that
+            // the map / NEE already credited with the sun. (Host twin: photonmap_render.h.)
+            if (sc.sunCount > 0) {
+                double e = thr * dSunRadiance(sc, rd, lambda) * invPdfL;
+                oX += (double)cieX(lambda) * e;
+                oY += (double)cieY(lambda) * e;
+                oZ += (double)cieZ(lambda) * e;
+            }
             return;
         }
 
@@ -8043,6 +8184,15 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                                     ? dEnvRadiance(sc.env, rd, lambda)
                                     : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
                 double e = thr * envRad * invPdfL;
+                dX += (double)cieX(lambda) * e;
+                dY += (double)cieY(lambda) * e;
+                dZ += (double)cieZ(lambda) * e;
+            }
+            // Directly-viewed solar disc (camera / specular escapes only — a diffuse
+            // vertex stores a hit point and returns before it can reach here).
+            // Host twin: sppm_render.h.
+            if (sc.sunCount > 0) {
+                double e = thr * dSunRadiance(sc, rd, lambda) * invPdfL;
                 dX += (double)cieX(lambda) * e;
                 dY += (double)cieY(lambda) * e;
                 dZ += (double)cieZ(lambda) * e;
@@ -8515,7 +8665,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 
         int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
         const DEmitter& em = sc.emitters[ei];
-        if (em.shape == 2 || em.shape == 3 || em.collimated) continue;
+        if (em.shape == 2 || em.shape == 3 || em.shape == 6 || em.collimated) continue;
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 y, nOut;
         // The sampled point's `emit pattern:` factor (1.0, and a bit-identical draw, when
@@ -8859,7 +9009,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 if (edges + 1 <= ctx.maxDepth && sc.nEmitters > 0 && sc.totalPower > 0.0) {
                     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
                     const DEmitter& em = sc.emitters[ei];
-                    if (!(em.shape == 2 || em.shape == 3 || em.collimated)) {
+                    if (!(em.shape == 2 || em.shape == 3 || em.shape == 6 || em.collimated)) {
                         Real u1 = rng.uniform(), u2 = rng.uniform();
                         DVec3 yL, nL;
                         // Sampled point's emission-pattern factor (1.0 when unpatterned).
@@ -9397,6 +9547,10 @@ bool cudaForwardSupported(const Scene& scene) {
     // volume Planck-λ CDF, and genPhoton has a volume-birth branch + isotropic emission
     // splat mirroring the CPU tracer. An emissive-only scene (nEmitters==0) never indexes
     // sc.emitters because volumeBirth is always true when totalPower==0.
+    // A distant `sun` emitter (shape==6) is supported too: genPhoton/genPhotonHero have a
+    // parallel-beam birth branch over the scene cross-section, bkEmitterGeom/bkNeeLight/
+    // bkNeeVolume/bkNeeLightRGB do the cone NEE, and the ray-miss paths add the directly-
+    // viewed solar disc under the same `specularArrival` gate as the CPU tracer.
     return true;
 }
 
@@ -9812,7 +9966,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                  : (e.shape == EmitterShape::Spot)     ? 2
                  : (e.shape == EmitterShape::Env)      ? 3
                  : (e.shape == EmitterShape::Cylinder) ? 4
-                 : (e.shape == EmitterShape::Mesh)     ? 5 : 0;
+                 : (e.shape == EmitterShape::Mesh)     ? 5
+                 : (e.shape == EmitterShape::Sun)      ? 6 : 0;
         de.radius = e.radius;
         de.caps = e.caps ? 1 : 0;
         // Mesh area light: upload this emitter's triangle CDF to the device and point the
@@ -10115,6 +10270,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sceneRadius = scene.sceneRadius;
     sc.env = denv;
     sc.envIndex = scene.envIndex;
+    sc.sunCount = scene.sunCount;      // >0 enables the direct-view solar-disc miss term
     // Fast RGB backward: constant-env radiance in linear sRGB (0 when there's no env).
     if (scene.envIndex >= 0 && scene.envIndex < (int)scene.emitters.size()) {
         Vec3 le = rgbbake::emitToRgb(scene.emitters[scene.envIndex].spdFn);

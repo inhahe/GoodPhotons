@@ -1498,6 +1498,20 @@ struct Renderer {
             Vec3 disk = t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
             origin = scene.sceneCenter - dir * scene.sceneRadius + disk;
             emitN = dir;
+        } else if (em.shape == EmitterShape::Sun) {
+            // Distant directional sun. Sample the travel direction inside the solar
+            // cone (pdf 1/Omega), then the entry point on a disk of radius R
+            // perpendicular to it (pdf 1/(pi R^2)) — the same upstream-disk trick the
+            // env uses, but aimed instead of isotropic, so EVERY photon crosses the
+            // scene rather than one in ~10^5. The joint pdf 1/(Omega*pi*R^2) is exactly
+            // 1/envGeom, so beta = emitIntegral*envGeom is analog with no reweight.
+            dir = em.sampleCone(em.beamDir, u1, u2);
+            Vec3 t, b; onb(dir, t, b);
+            double rd = scene.sceneRadius * std::sqrt(rng.uniform());
+            double pd = 2.0 * PI * rng.uniform();
+            origin = scene.sceneCenter - dir * scene.sceneRadius
+                   + t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
+            emitN = dir;
         } else {
             // quad: constant normal; sphere: surface point. emitterSamplePoint also
             // returns this point's `emit pattern:` factor — 1.0 (and a bit-identical
@@ -1536,8 +1550,11 @@ struct Renderer {
         // (Skipped in forward-catch mode; there the aperture test below handles it.)
         // A spot is a point light with no projected area, so it has no such direct
         // term (its cone illuminates surfaces, which then connect to the camera).
+        // A Sun is excluded for the same reason as the env: it has no finite surface to
+        // connect to, and the disc's direct view is composited by addEnvBackground.
         if (nCam > 0 && !forwardCatch &&
-            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env) {
+            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env &&
+            em.shape != EmitterShape::Sun) {
             camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, 1.0, rng);
             camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
         }
@@ -1842,6 +1859,15 @@ struct Renderer {
             Vec3 disk = t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
             origin = scene.sceneCenter - dir * scene.sceneRadius + disk;
             emitN = dir;
+        } else if (em.shape == EmitterShape::Sun) {
+            // Distant directional sun — see the scalar tracer for the pdf argument.
+            dir = em.sampleCone(em.beamDir, u1, u2);
+            Vec3 t, b; onb(dir, t, b);
+            double rd = scene.sceneRadius * std::sqrt(rng.uniform());
+            double pd = 2.0 * PI * rng.uniform();
+            origin = scene.sceneCenter - dir * scene.sceneRadius
+                   + t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
+            emitN = dir;
         } else {
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
@@ -1875,7 +1901,8 @@ struct Renderer {
 
         // Direct light -> camera (area/quad emitters only; matches the scalar tracer).
         if (nCam > 0 && !forwardCatch &&
-            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env) {
+            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env &&
+            em.shape != EmitterShape::Sun) {
             double rhoOne[hero::kHeroMax]; for (int i = 0; i < C; ++i) rhoOne[i] = 1.0;
             camSplatAllHero(scene, cams, nCam, origin, emitN, emitN, emitN, lam, beta, rhoOne, C, rng);
             camSpecularSplatAllHero(scene, cams, nCam, origin, emitN, lam, beta, rhoOne, C, rng);

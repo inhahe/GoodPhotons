@@ -542,7 +542,17 @@ struct Sensor {
 // samplePoint area-samples uniformly across all its triangles (pick a tri by a
 // cumulative-area CDF, then barycentric point), so a glowing OBJ / tessellated shape
 // acts as one area light. Its "geometric weight" is the same area*PI as a quad.
-enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder, Mesh };
+// A Sun emitter is a DISTANT DIRECTIONAL light: an infinitely-far disc of angular
+// radius `theta` about `beamDir`, so every point of the scene sees it in the same
+// direction and at the same radiance. It is the counterpart of Env for a *small*
+// bright feature: forward emission fires PARALLEL photons across the scene's
+// projected cross-section (every photon enters the scene — none are wasted aiming
+// at a 6.8e-5 sr feature from a uniform sphere), and the backward/photon-map tracers
+// next-event-estimate it inside its cone with pdf 1/Omega. That is what separates a
+// ~1e5x-brighter-than-sky sun from the env importance sampler, which is why a daylight
+// scene lit by `light sun` converges like any single-light scene while the same sun
+// baked into an HDRI produces fireflies (see known-issues, K2 follow-up).
+enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder, Mesh, Sun };
 
 // Smoothstep spotlight falloff as a function of cos(angle-off-axis). 1 inside the
 // inner cone, 0 outside the outer cone, cubic-smooth (3t^2-2t^3) in the penumbra.
@@ -593,7 +603,14 @@ struct Emitter {
     Vec3 beamDir{1, 0, 0};    // collimated fire direction / spot axis
     double spotCosInner = 1.0, spotCosOuter = 1.0; // spot penumbra cosines (Spot)
     double spotOmega = 0.0;   // spot falloff-weighted solid angle = PI*(2-ci-co)
-    double envGeom = 0.0;     // env phase-space weight 4*PI^2*R^2 (Env; set in build())
+    // Env: phase-space weight 4*PI^2*R^2. Sun: the same quantity for a cone light,
+    // Omega*PI*R^2 (cone solid angle x the scene's projected disc). Both set in build()
+    // because both depend on the scene bounding sphere.
+    double envGeom = 0.0;
+    // Sun only: the directly-viewed XYZ of this light, integral(CIE(lam)*L(lam) dlam).
+    // Precomputed in build() because the direct-view path (a camera/specular ray that
+    // escapes into the sun's cone) is evaluated per pixel and must not re-integrate.
+    Vec3 viewXYZ{0, 0, 0};
     std::vector<EmitTri> meshTris; // Mesh: per-triangle area CDF for uniform sampling
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
@@ -609,7 +626,7 @@ struct Emitter {
     // spot. (Area/sphere keep the exact area*PI expression for bit-identity.)
     double geomWeight() const {
         if (shape == EmitterShape::Spot) return spotOmega;
-        if (shape == EmitterShape::Env)  return envGeom;
+        if (shape == EmitterShape::Env || shape == EmitterShape::Sun) return envGeom;
         return area * PI;
     }
 
@@ -706,6 +723,23 @@ struct Emitter {
             if (vvOut) *vvOut = u2;
         }
     }
+
+    // Sun: sample a direction uniformly inside the angular cone about `axis`
+    // (solid-angle pdf 1/spotOmega, exact for any half-angle). Called with
+    // axis = beamDir for forward emission (the direction a photon travels) and
+    // axis = -beamDir for a next-event connection (the direction a shading point
+    // looks toward the sun). A Sun stores spotCosInner == spotCosOuter == cos(theta),
+    // which makes the shared spotOmega = PI*(2-ci-co) expression evaluate to exactly
+    // the cone solid angle 2*PI*(1-cos theta) — so no extra field is needed.
+    Vec3 sampleCone(const Vec3& axis, double u1, double u2) const {
+        double ct = spotCosOuter + u1 * (1.0 - spotCosOuter);
+        double st = std::sqrt(std::max(0.0, 1.0 - ct * ct));
+        double phi = 2.0 * PI * u2;
+        Vec3 t, b; onb(axis, t, b);
+        return t * (st * std::cos(phi)) + b * (st * std::sin(phi)) + axis * ct;
+    }
+    // Sun: does the escaping ray direction `d` (unit) look back into the solar disc?
+    bool inCone(const Vec3& d) const { return dot(d, beamDir) <= -spotCosOuter; }
 
     // Solid-angle (cone) importance sampling of a sphere emitter as seen from a
     // reference point `ref` (PBRT's Sphere::Sample_Li). Samples a direction `wi`
@@ -995,6 +1029,10 @@ struct Scene {
     double sceneRadius = 0.0;
     Vec3 envXYZ{0, 0, 0};
     std::shared_ptr<EnvMap> envMap;   // image-based env (null => constant env)
+    // Number of EmitterShape::Sun emitters, recounted by finalizeEmitters(). Every
+    // sun-aware hot path (ray miss, background pass) tests this first so a scene
+    // without a sun pays one integer compare.
+    int sunCount = 0;
 
     // Environment radiance from direction `d` at wavelength lambda (0 if no env).
     // Constant env ignores `d`; an image env samples the lat-long map.
@@ -1006,6 +1044,29 @@ struct Scene {
     Vec3 envXYZForDir(const Vec3& d) const {
         if (envIndex < 0) return Vec3{0, 0, 0};
         return envMap ? envMap->xyz(d) : envXYZ;
+    }
+    // Radiance of every distant sun whose disc contains direction `d` (0 when the ray
+    // escapes into empty sky). Added ONLY on a camera / specular arrival: at a diffuse
+    // or volume vertex the sun is covered by NEE (emitterGeom / neeVolume) and the
+    // continuation ray must not count it a second time — the same single-estimator split
+    // the Spot light already uses, which is why no MIS weight appears anywhere for a sun.
+    // (MIS'ing the two would be a pure variance win over a 6.8e-5 sr target, not a
+    // correctness fix; logged as a follow-up rather than done here.)
+    double sunRadiance(const Vec3& d, double lambda) const {
+        if (sunCount == 0) return 0.0;
+        double L = 0.0;
+        for (const auto& e : emitters)
+            if (e.shape == EmitterShape::Sun && e.inCone(d)) L += e.spdFn(lambda);
+        return L;
+    }
+    // Directly-viewed sun XYZ in direction `d`, for the forward tracers' background
+    // pass (which composites colour, not per-wavelength radiance).
+    Vec3 sunXYZForDir(const Vec3& d) const {
+        Vec3 s{0, 0, 0};
+        if (sunCount == 0) return s;
+        for (const auto& e : emitters)
+            if (e.shape == EmitterShape::Sun && e.inCone(d)) s += e.viewXYZ;
+        return s;
     }
     // Reciprocal of the sampled-wavelength pdf-weighted mean env radiance shape used
     // by the forward emission reweight (== the env emitter's spdFn).
@@ -1124,6 +1185,37 @@ struct Scene {
         emitters.push_back(std::move(e));
     }
 
+    // Register a distant directional sun. `toSun` points FROM the scene TOWARD the sun
+    // (the natural authoring convention, matching sky::SunDisk::dir and the sky block's
+    // `sun_dir`); it is negated into `beamDir`, which everywhere else in the engine is
+    // the direction light TRAVELS. `halfAngle` is the angular radius of the solar
+    // disc in radians (the real sun is 0.00465 rad = 0.53 deg across). `irradiance`
+    // is the spectrum of the irradiance falling on a surface FACING the sun, in the
+    // same per-nm units every other emitter's `spd` uses.
+    //
+    // The stored `spdFn` is the sun's RADIANCE, irradiance/Omega, because every
+    // consumer (NEE, the direct view, the forward reweight) wants radiance. Dividing
+    // here rather than at each site is also what makes the light's brightness
+    // INDEPENDENT of `halfAngle`: widening the disc to soften shadows spreads the same
+    // irradiance over a larger cone instead of scaling the scene's exposure.
+    // geomWeight (envGeom = Omega*PI*R^2) depends on the scene bounds, so build()
+    // fills it in — exactly like the env light.
+    void addSunLight(const Vec3& toSun, double halfAngle, const Spectrum& irradiance,
+                     double stepNm) {
+        Emitter e;
+        e.shape = EmitterShape::Sun;
+        e.beamDir = normalize(toSun) * -1.0;
+        double ct = std::cos(halfAngle);
+        e.spotCosInner = e.spotCosOuter = ct;
+        e.spotOmega = PI * (2.0 - ct - ct);          // == 2*PI*(1-cos theta), the cone
+        const double invOmega = (e.spotOmega > 0.0) ? 1.0 / e.spotOmega : 0.0;
+        Spectrum rad = [irradiance, invOmega](double lambda) {
+            return irradiance(lambda) * invOmega;
+        };
+        e.spd.build(rad, stepNm); e.spdFn = rad; e.emitIntegral = e.spd.integral;
+        emitters.push_back(std::move(e));
+    }
+
     // Register a constant environment light: uniform radiance `spd` arriving from
     // every direction (an infinitely-distant sphere). geomWeight (envGeom) and the
     // background colour (envXYZ) depend on the scene bounds, so they are filled in
@@ -1178,6 +1270,10 @@ struct Scene {
         // radiance, so no selection or positional pdf anywhere has to change.
         for (auto& e : emitters)
             e.emitPat = (e.matId >= 0 && e.matId < (int)mats.size()) ? mats[e.matId].emitPat : -1;
+        // Recount the distant suns here (not in addSunLight) so the flag survives every
+        // path that rebuilds the emitter list, including applyIgnoreFlags' filtering.
+        sunCount = 0;
+        for (const auto& e : emitters) if (e.shape == EmitterShape::Sun) ++sunCount;
         emitterCdf.assign(emitters.size(), 0.0);
         for (size_t i = 0; i < emitters.size(); ++i) {
             // Area/sphere keep the exact emitIntegral*area*PI expression so those
@@ -1185,7 +1281,8 @@ struct Scene {
             emitters[i].power =
                 (emitters[i].shape == EmitterShape::Spot)
                     ? emitters[i].emitIntegral * emitters[i].spotOmega
-                : (emitters[i].shape == EmitterShape::Env)
+                : (emitters[i].shape == EmitterShape::Env ||
+                   emitters[i].shape == EmitterShape::Sun)
                     ? emitters[i].emitIntegral * emitters[i].envGeom
                 : emitters[i].emitIntegral * emitters[i].area * PI;
             totalPower += emitters[i].power;
@@ -1241,6 +1338,16 @@ struct Scene {
             sceneCenter = b.center();
             sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
         }
+        // Distant suns are sized by the same bounding sphere: a photon is born on a
+        // disc of radius R perpendicular to its (cone-sampled) travel direction, so the
+        // phase-space weight is the cone solid angle times that disc's area.
+        for (auto& e : emitters)
+            if (e.shape == EmitterShape::Sun) {
+                e.envGeom = e.spotOmega * PI * sceneRadius * sceneRadius;
+                e.viewXYZ = Vec3{0, 0, 0};
+                for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0)
+                    e.viewXYZ += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * e.spdFn(lam);
+            }
         if (envIndex >= 0) {
             emitters[envIndex].envGeom = 4.0 * PI * PI * sceneRadius * sceneRadius;
             // Directly-viewed background colour: integral of L_env(lambda)*CIE dlambda.

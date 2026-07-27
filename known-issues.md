@@ -462,7 +462,34 @@ render (less converged) is markedly cleaner and red-orange throughout.
 full-brightness green dot because its colour is `CIE(λ)`. This is intrinsic to per-photon spectral splatting and
 only shrinks with more samples (or full hero-wavelength XYZ splatting). Left as-is; converges correctly.
 
-### TECH-DEBT — OPEN (2026-07-24): analytic sky (K2) bakes the physical solar disk into the env, so sun-lit surfaces converge slowly in forward modes
+### TECH-DEBT — DONE (2026-07-24): analytic sky (K2) bakes the physical solar disk into the env, so sun-lit surfaces converge slowly in forward modes
+
+**Resolved 2026-07-27 (0.84.0)** by building exactly the proposed proper fix: a first-class
+**`EmitterShape::Sun`** distant directional emitter, exposed as `light sun { elevation … azimuth …
+angle … spd … }` and as a new `sun_disk on|off|separate` option on the Preetham sky block
+(`separate` strips the baked disk out of the map and registers an **energy-matched** `light sun`
+beside the skylight dome).
+
+Forward emission (`Scene::addSunLight` + `render.h` / `render_cuda.cu` `genPhoton`/`genPhotonHero`)
+samples a travel direction in the solar cone (pdf `1/Ω`) and an entry point on a disc of radius
+`R` *perpendicular to it*, pushed upstream to `sceneCenter − dir·R` (pdf `1/πR²`); with
+`geomWeight = envGeom = Ω·πR²` the spawn is exactly analog and **every photon enters the scene**.
+Backward NEE (`backward.h` `neeLight`, device `bkEmitterGeom`/`bkNeeLight`/`bkNeeLightHero`/
+`bkNeeVolume`/`bkNeeLightRGB`) samples the cone with `1/pdfW = Ω`; the directly-viewed disc is
+added on a ray miss **only under the `specularArrival` gate**, which is exactly unbiased with no
+MIS weight because NEE runs precisely at the material types that then clear that flag. The hard
+cone reuses `spotCosInner == spotCosOuter == cos θ` (making `spotOmega` evaluate to `Ω`), so no new
+emitter field was needed on host or device. The authored `spd` is **perpendicular irradiance**, so
+widening `angle` softens the penumbra without touching the exposure. Modes `D`/`U` refuse a sun
+scene (not connectible in area measure), as they already do for `spot`/`env`.
+
+Measured: forward B vs backward R **0.09%**, CPU vs GPU mode R **0.01%**, `-rgb` fast path
+**0.00%**, photon-map M vs R **0.02%**, SPPM S CPU vs GPU **0.16%** (8 passes, radius still
+shrinking), `angle` 0.53°→8° exposure shift **0.019%**, `sun_disk
+separate` vs baked `on` **0.12%** (once the map resolves the disc at res 4096). The convergence
+win this entry was filed for: at 2×10⁷ photons in mode B the baked disk reached 4% of the
+converged floor level (image essentially black, RMS 0.170) while `separate` reached **91%**
+(fully-formed daylight image, RMS 0.050). Original entry follows.
 
 The Preetham sky (`src/sky.h`, `light env { sky preetham … }`) bakes the solar disk into the
 equirectangular `EnvMap` at its **physical** magnitude (~10⁵× the mean sky luminance). Directly-viewed

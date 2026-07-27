@@ -486,7 +486,8 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     if (scene.emitters.empty() || scene.totalPower <= 0.0) return;
     int ei = scene.selectEmitter(rng);
     const Emitter& em = scene.emitters[ei];
-    if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated) return;
+    if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
+        em.shape == EmitterShape::Sun || em.collimated) return;
 
     double u1 = rng.uniform(), u2 = rng.uniform();
     Vec3 y, nOut;
@@ -792,7 +793,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             if (edges + 1 <= ctx.maxDepth && !scene.emitters.empty() && scene.totalPower > 0.0) {
                 int ei = scene.selectEmitter(rng);
                 const Emitter& em = scene.emitters[ei];
-                if (!(em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)) {
+                if (!(em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
+                      em.shape == EmitterShape::Sun || em.collimated)) {
                     double u1 = rng.uniform(), u2 = rng.uniform();
                     Vec3 yL, nL;
                     double epat = emitterSamplePoint(scene, em, u1, u2, yL, nL);

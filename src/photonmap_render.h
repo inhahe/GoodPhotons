@@ -290,6 +290,13 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             if (scene.envIndex >= 0)
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                      * (thr * scene.envRadiance(ray.d, lambda) * invPdfL);
+            // Directly-viewed solar disc. This walk terminates at the first diffuse
+            // vertex (the density estimate returns there), so any escape reaching here
+            // is a camera ray or a specular chain — never a diffuse continuation that
+            // the map / NEE already credited with the sun.
+            if (scene.sunCount > 0)
+                L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                     * (thr * scene.sunRadiance(ray.d, lambda) * invPdfL);
             return L;
         }
         const Material* mp = &scene.mats[h.matId];

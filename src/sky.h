@@ -100,11 +100,33 @@ inline Vec3 sunDiskXYZ(double T, double m) {
     return Vec3{X, Y, Z};
 }
 
+// Description of the solar disk, handed back so a caller that asked for `bakeSunDisk
+// == false` can register an exactly equivalent first-class `Sun` emitter in its place.
+// That swap is what makes a daylight scene converge: baked into the map the ~10^5x
+// brighter sun is just 6.8e-5 sr of a texel grid the env importance sampler has to
+// find, whereas a Sun emitter is sampled directly (see Scene::addSunLight).
+//
+// `halfAngle` is the cone whose solid angle equals the *effective* (limb-softened)
+// solid angle of the baked profile, and `irradiance` is the disk's PERPENDICULAR
+// spectral irradiance -- so `addSunLight(dir, halfAngle, irradiance, ...)` deposits
+// the same flux on every surface as the baked disk did, with the same colour.
+struct SunDisk {
+    bool     present = false;    // false when the sun is at/below the horizon
+    Vec3     dir{0, 1, 0};       // unit direction TO the sun
+    double   halfAngle = 0.0;    // radians
+    Spectrum irradiance;         // W/m^2/nm perpendicular to `dir` (relative units)
+};
+
 // Generate the equirectangular linear-RGB sky. `sunDir` need not be normalised.
 // `groundAlbedo` tints the below-horizon hemisphere (a flat lit ground). `intensity`
-// scales the normalised mean sky luminance (default 1).
+// scales the normalised mean sky luminance (default 1). With `bakeSunDisk == false`
+// the map carries SKYLIGHT ONLY (the sky's normalisation is unchanged either way,
+// since it is computed before the disk is drawn); `sunOut`, if non-null, receives the
+// disk description regardless of whether it was baked.
 inline std::vector<Vec3> generatePreethamSky(int w, int h, Vec3 sunDir, double turbidity,
-                                             double groundAlbedo, double intensity) {
+                                             double groundAlbedo, double intensity,
+                                             bool bakeSunDisk = true,
+                                             SunDisk* sunOut = nullptr) {
     double sl = std::sqrt(dot(sunDir, sunDir));
     Vec3 sd = (sl > 1e-9) ? sunDir * (1.0/sl) : Vec3{0, 1, 0};
     double thetaS = std::acos(std::clamp(sd.y, -1.0, 1.0));   // solar zenith angle
@@ -167,6 +189,48 @@ inline std::vector<Vec3> generatePreethamSky(int w, int h, Vec3 sunDir, double t
         sunRgb.x = std::max(0.0, sunRgb.x); sunRgb.y = std::max(0.0, sunRgb.y); sunRgb.z = std::max(0.0, sunRgb.z);
     }
     const double sunAngRadius = 0.5 * PI/180.0 * 1.2;   // ~0.53 deg disk, slightly softened
+
+    if (sunOut) {
+        // Effective solid angle of the softened profile t(gamma) below (full inside
+        // 0.8R, linear ramp to 0 at R). With dOmega = 2*pi*gamma dgamma at these tiny
+        // angles, integral(t dOmega) = (0.64 + 0.17333) * pi * R^2, so a HARD cone of
+        // that solid angle carries exactly the same flux at the same colour.
+        const double omegaEff = 0.8133333333333333 * PI * sunAngRadius * sunAngRadius;
+        sunOut->present   = (sd.y > 0.0 && sunXYZ.y > 1e-9);
+        sunOut->dir       = sd;
+        sunOut->halfAngle = std::acos(std::clamp(1.0 - omegaEff / (2.0 * PI), -1.0, 1.0));
+        // Spectral shape: the same attenuated 5778 K blackbody sunDiskXYZ() integrates,
+        // evaluated straight rather than round-tripped through RGB (so the sun keeps its
+        // true continuum instead of a three-primary metamer). Tabulated at 1 nm because
+        // sunRadiance() runs per ray miss.
+        double beta = std::max(0.0, 0.04608 * T - 0.04586);
+        double m = airMass(thetaS);
+        Spectrum bb = blackbody(5778.0);
+        const int nTab = (int)(LAMBDA_MAX - LAMBDA_MIN) + 1;
+        std::vector<double> tab((size_t)nTab);
+        double yInt = 0.0;
+        for (int i = 0; i < nTab; ++i) {
+            double lam = LAMBDA_MIN + i;
+            double um = lam / 1000.0;
+            double tau = 0.008735 * std::pow(um, -4.08) + beta * std::pow(um, -1.3);
+            tab[(size_t)i] = std::max(0.0, bb(lam)) * std::exp(-m * tau);
+            yInt += tab[(size_t)i] * cieY(lam);
+        }
+        // Rescale to the disk RADIANCE the bake uses (L_sun_phys * norm cd/m^2 -- the
+        // RGB->spectrum convention here and in EnvMap both make integral(CIE_Y*L)dlam
+        // the luminance), then radiance -> perpendicular irradiance via omegaEff.
+        double k = (sunOut->present && yInt > 1e-12) ? (L_sun_phys * norm / yInt) * omegaEff : 0.0;
+        for (double& t : tab) t *= k;
+        sunOut->irradiance = [tab](double lam) {
+            double x = lam - LAMBDA_MIN;
+            if (x < 0.0 || x > (double)(tab.size() - 1)) return 0.0;
+            int i = (int)x; double f = x - (double)i;
+            if ((size_t)i + 1 >= tab.size()) return tab.back();
+            return tab[(size_t)i] * (1.0 - f) + tab[(size_t)i + 1] * f;
+        };
+    }
+    if (!bakeSunDisk) sunRgb = Vec3{0, 0, 0};
+
     for (int row = 0; row < h; ++row) {
         double theta = (row + 0.5) / h * PI;
         double cosTheta = std::cos(theta);

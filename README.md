@@ -1207,7 +1207,28 @@ per-path carrier is left unqualified here.
 | `cylinder` | Cylindrical tube light | `center`, `axis`, `length`, `radius`, `caps`, `spd` |
 | `spot` | Cone spotlight with penumbra | `origin`, `dir`, `inner_angle`, `outer_angle`, `spd` |
 | `collimated` | Parallel beam (3 cm pencil, ×enclosing group scale), centered on `origin` | `origin`, `dir`, `spd` |
+| `sun` | Distant directional sun (parallel beam over the whole scene, soft-edged disc) | `elevation` + `azimuth` (or `dir`), `angle`, `spd`, `intensity` |
 | `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity`, **or `sky`** (analytic sky, below) |
+
+**Distant sun.** `light sun { … }` is a first-class **directional** emitter: an
+infinitely-distant disc of angular diameter `angle` (degrees; default `0.53`, the real
+sun) whose rays arrive parallel. Aim it with `elevation <deg>` + `azimuth <deg>`
+(azimuth from +x toward +z, the same convention as the sky block) or a raw
+`dir <x y z>` pointing *toward* the sun.
+
+Its `spd` is the **perpendicular spectral irradiance** — the light falling on a surface
+that faces the sun — so a grey Lambertian floor reads exactly `ρ/π · E⊥ · cos θ`, and
+widening `angle` softens the shadow penumbra **without changing the exposure**
+(verified: 0.53° → 8° shifts the lit-floor level by 0.02%). Because a distant light's
+total flux depends on the scene's cross-section rather than the light, absolute
+`power` / `lumens` is refused here; scale with `intensity <s>` instead.
+
+Unlike every other light, the sun costs nothing in forward modes: photons are born on a
+disc the size of the scene's own cross-section, aimed down the beam, so **every** photon
+enters the scene instead of most missing it. Backward modes next-event-estimate it
+inside its cone, and the disc itself is directly viewable (aim a camera at it). Runs on
+both CPU and GPU in modes A/B/C/R/P/M/S (mode `D`/`U` refuse it, like `spot` and `env`).
+See `scenes/_sun_check.ftsl`.
 
 **Analytic physical sky.** An `env` light can synthesise a **Preetham daylight sky**
 instead of loading an HDRI — write `sky preetham` (or just supply `turbidity` /
@@ -1227,6 +1248,17 @@ than the sky (as in any real sunny HDRI), sun-lit diffuse surfaces are high-dyna
 and benefit from a generous photon budget / higher `-noise` target in forward modes; the
 sky background itself is read directly and is noise-free. See `scraps/sky_test.ftsl`
 (daytime) and `scraps/sky_sunset.ftsl` (low-sun reddening).
+
+**`sun_disk on | off | separate`** controls how that solar disk is delivered. The
+default `on` bakes it into the equirect map (accurate but slow to converge in forward
+modes, since a photon must randomly land on a disc covering ~10⁻⁵ of the sphere).
+`separate` instead strips the disk out of the map and registers an equal-energy
+`light sun` alongside the skylight dome — same picture, but the sun is now importance-
+sampled/parallel-emitted, which is dramatically faster to converge: at 2×10⁷ photons in
+mode B a baked-disk render reached 4% of its converged floor level (image essentially
+black), while `separate` reached 91% and looked finished. `off` drops the disk entirely
+(skylight only). The `separate` split is energy-matched to the baked profile (measured
+agreement 0.12% once the map resolves the disc).
 
 **Absolute power.** Any non-env light may author a real physical output —
 `power <watts>` (radiometric radiant flux) or `lumens <lm>` (photometric luminous

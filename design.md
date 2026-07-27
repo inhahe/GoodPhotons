@@ -101,8 +101,24 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   emitter into a wrong image instead of a message. This is what makes the loom
   emitter-drift audit (`scraps/emit_audit.py`, TODO J3c) mechanically possible at all.
   Lights are `Emitter`s with an `EmitterShape`
-  (Quad/Sphere/Spot/Env/Cylinder/**Mesh**); each carries its own SPD and a `power`
-  = emitIntegral·geomWeight selection weight. **Mesh area lights** (since 0.41.0): a
+  (Quad/Sphere/Spot/Env/Cylinder/**Mesh**/**Sun**); each carries its own SPD and a `power`
+  = emitIntegral·geomWeight selection weight. **Distant sun** (since 0.84.0):
+  `EmitterShape::Sun` (`Scene::addSunLight`, `light sun { … }`) is an infinitely-distant
+  disc whose rays arrive parallel. It reuses the spot fields with
+  `spotCosInner == spotCosOuter == cos θ`, so `spotOmega` evaluates to the cone solid
+  angle `Ω` and no new field is needed on host or device; `geomWeight = Ω·πR²`. The
+  authored SPD is *perpendicular irradiance*, stored as radiance `E⊥/Ω` (so `angle`
+  changes the penumbra, not the exposure). Forward emission samples the cone then an
+  entry disc of radius `R` perpendicular to the sampled direction — joint pdf
+  `1/(Ω·πR²) = 1/geomWeight`, exactly analog, so **every** photon enters the scene.
+  Backward does cone NEE and adds the direct disc view on a ray miss only when
+  `specularArrival` is true — a single unbiased estimator with **no MIS weight**, since
+  NEE runs at precisely the material types that then clear that flag. `Scene::sunCount`
+  gates all of it, so sun-free scenes are untouched. Not area-connectible, so `bdpt.h` /
+  `vcm.h` reject it like Spot/Env. The Preetham sky's `sun_disk separate` option
+  (`sky::SunDisk`) unbakes the solar disc from the env map and registers an
+  energy-matched Sun instead — the same picture, converging ~20× faster in forward modes.
+  **Mesh area lights** (since 0.41.0): a
   material with an `emit` spectrum bound to a `mesh` registers an
   `EmitterShape::Mesh` emitter (`Scene::addMeshLight`) holding a per-triangle
   cumulative-area CDF (`Emitter::meshTris`, `EmitTri`); `samplePoint` binary-searches
@@ -315,7 +331,7 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   therefore only legal where the sampler's (u,v) provably equals the (u,v) a hit interpolates
   — `EmitterShape::Quad` (bilinear parameters) and `EmitterShape::Mesh` (barycentric UVs on
   `EmitTri`, which gained `uv0`/`uvE1`/`uvE2`). Every other shape (sphere, cylinder, spot,
-  collimated, env) is **refused at load**, at two points: `addLight`'s subtype gate, and
+  sun, collimated, env) is **refused at load**, at two points: `addLight`'s subtype gate, and
   `checkEmitPatsSupported` after `Scene::build()` for the material route. Making the quad
   agree required fixing a latent pre-existing bug — the area light's *second* triangle
   carried default UVs disagreeing with `addQuad`'s, i.e. a diagonal seam for any UV-driven
