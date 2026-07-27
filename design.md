@@ -119,7 +119,21 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   R, A/B/C, M/S and BDPT D on CPU and the GPU forward/backward/BDPT megakernels
   (the GPU BDPT keeps its per-vertex secondaries in a parallel array and templates
   `kBdptT<NS>` on the slot count, so the scalar instantiation costs no extra local
-  memory).
+  memory). `hero.h` is deliberately thin and dependency-free: it owns the two shared
+  constants, the stratified bundle draw `sampleBundle()` (templated on the sampler so
+  it serves both the forward tracer's per-emitter `Emitter::spd` and the
+  backward/BDPT tracers' scene-wide `Scene::emitSampler`), the live-λ maximum
+  `maxOf()`, the `gSplit` policy flag, and — most importantly — the **single
+  authoritative statement of the four hero policies** (stratification; which lobes
+  de-hero and why the criterion is a λ-*dependent direction* rather than mere
+  delta-ness; analog RR is max-over-live-λ; per-λ factors are absolute not ratios),
+  along with the two rules that are deliberately per-tracer (the forward energy
+  ledger must book the RR reweight as absorption; BDPT normalises by
+  `1/min(nUp_light, nUp_eye)` instead of a ×C boost). The four tracers are different
+  *estimators* rather than four copies of one, so they are **not** unified behind a
+  shared `HeroLambda` struct — only the genuinely identical pieces and the policy
+  prose are shared, because that prose going stale in three files is what let each
+  of this feature's two real bugs be fixed independently two-to-four times.
   Emitter SPD sampling is
   cached per light. Tabulated curves (FTSL `table { }` / `file:`) build a
   `Spectrum` via `tabulatedSpectrum` (piecewise-linear, default) or

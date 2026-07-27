@@ -1266,20 +1266,15 @@ struct BdptRenderer {
                     HeroBundle hb;
                     if (useHero) {
                         // One stratified base draw -> hero + C-1 secondaries, all from
-                        // the emission CDF. The hero (index 0) must have a valid pdf;
-                        // a dead secondary carries invPdf 0 and therefore contributes 0.
-                        double u = rng.uniform(), pdf0 = 0.0;
-                        hb.lam[0] = scene.emitSampler.sampleAt(u, pdf0);
-                        if (pdf0 <= 0.0) continue;
-                        hb.invPdf[0] = scene.invPdfLambda(hb.lam[0]);
+                        // the emission CDF (hero.h policy 1). The hero (index 0) must have
+                        // a valid pdf; a dead secondary carries invPdf 0 and contributes 0.
+                        double pdfA[hero::kHeroMax];
+                        if (!hero::sampleBundle(scene.emitSampler, rng.uniform(), C,
+                                                hb.lam, pdfA)) continue;
                         hb.C = C;
-                        for (int i = 1; i < C; ++i) {
-                            double uu = u + (double)i / C;
-                            if (uu >= 1.0) uu -= 1.0;          // wrap into [0,1)
-                            double pdfI = 0.0;
-                            hb.lam[i] = scene.emitSampler.sampleAt(uu, pdfI);
-                            hb.invPdf[i] = (pdfI > 0.0) ? scene.invPdfLambda(hb.lam[i]) : 0.0;
-                        }
+                        hb.invPdf[0] = scene.invPdfLambda(hb.lam[0]);
+                        for (int i = 1; i < C; ++i)
+                            hb.invPdf[i] = (pdfA[i] > 0.0) ? scene.invPdfLambda(hb.lam[i]) : 0.0;
                     } else {
                         double pdfLam = 0.0;
                         hb.lam[0] = scene.emitSampler.sample(rng, pdfLam);

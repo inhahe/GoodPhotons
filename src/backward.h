@@ -825,11 +825,7 @@ struct BackwardRenderer {
                     // guarded), in which case both shrink proportionally. At nUp == 1 the two
                     // maxima are rhoR[0]/rhoT[0], their sum is already <= 1, and every
                     // reweight is *= 1.0 — the scalar code verbatim.
-                    double qR = rhoR[0], qT = rhoT[0];
-                    for (int i = 1; i < nUp; ++i) {
-                        if (rhoR[i] > qR) qR = rhoR[i];
-                        if (rhoT[i] > qT) qT = rhoT[i];
-                    }
+                    double qR = hero::maxOf(rhoR, nUp), qT = hero::maxOf(rhoT, nUp);
                     double sumHero = qR + qT;
                     if (nUp > 1 && sumHero > 1.0) { qR /= sumHero; qT /= sumHero; sumHero = qR + qT; }
                     double u = rng.uniform();
@@ -867,12 +863,10 @@ struct BackwardRenderer {
                     // q == c[0] and thr[0] *= 1.0, so this is the scalar code verbatim —
                     // same rng draws, same order, bit-identical.
                     double c[hero::kHeroMax];
-                    double q = 0.0;
-                    for (int i = 0; i < nUp; ++i) {
+                    for (int i = 0; i < nUp; ++i)
                         c[i] = (m.type == MatType::Filter) ? clamp01(m.transmit(lam[i]))
                                                            : clamp01(reflectSlot(scene, m, h, lam[i]));
-                        if (c[i] > q) q = c[i];
-                    }
+                    const double q = hero::maxOf(c, nUp);
                     if (rng.uniform() >= q) { finish(); return; }   // RR absorb (q == 0 always absorbs)
                     for (int i = 0; i < nUp; ++i) thr[i] *= c[i] / q;
                     if (m.type == MatType::Mirror) {
@@ -916,8 +910,7 @@ struct BackwardRenderer {
                     // (redWall spans 0.05..0.75) that is a 15x weight spike, and the noise it
                     // injects grew once the bundle started surviving mirrors/gels. With
                     // nUp == 1, q == rho[0] and thr[0] *= 1.0 — the scalar code verbatim.
-                    double q = rho[0];
-                    for (int i = 1; i < nUp; ++i) if (rho[i] > q) q = rho[i];
+                    const double q = hero::maxOf(rho, nUp);
                     if (rng.uniform() >= q) { finish(); return; }         // RR absorb
                     for (int i = 0; i < nUp; ++i) thr[i] *= rho[i] / q;   // bounded reweight
                     Vec3 wOut = cosineHemisphere(h.n, rng);
@@ -961,20 +954,13 @@ struct BackwardRenderer {
                              0xD1B54A32D192ED03ULL);
                     if (useHero) {
                         // One stratified base draw → hero + C-1 secondary wavelengths,
-                        // all from the emission CDF. The hero (index 0) must have a
-                        // valid pdf; dead secondaries (pdf 0) carry invPdf 0 and splat 0.
-                        double u = rng.uniform();
+                        // all from the emission CDF (hero.h policy 1). The hero (index 0)
+                        // must have a valid pdf; dead secondaries (pdf 0) carry invPdf 0
+                        // and splat 0.
                         double lamA[hero::kHeroMax], invA[hero::kHeroMax];
                         double pdfA[hero::kHeroMax];
-                        pdfA[0] = 0.0;
-                        lamA[0] = scene.emitSampler.sampleAt(u, pdfA[0]);
-                        if (pdfA[0] <= 0) continue;
-                        for (int i = 1; i < C; ++i) {
-                            double uu = u + (double)i / C;
-                            if (uu >= 1.0) uu -= 1.0;            // wrap into [0,1)
-                            pdfA[i] = 0.0;
-                            lamA[i] = scene.emitSampler.sampleAt(uu, pdfA[i]);
-                        }
+                        if (!hero::sampleBundle(scene.emitSampler, rng.uniform(), C,
+                                                lamA, pdfA)) continue;
                         // Fill the per-sample SPD table, then derive invA from it by
                         // replicating Scene::invPdfLambda on the cached values (same
                         // emitter order, same zero guard — bit-identical). The NEE

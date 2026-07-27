@@ -2487,10 +2487,40 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
               luma / 2.13× chroma). `sum/emitted = 1.000000` on both backends, `-heroc 1` byte-identical,
               mode M deposit unbiased (+0.002 %). Renders in `png/heroFwd/`, `png/heroFwdD/`,
               `png/heroFwdM/`. Full write-up in known-issues.md.
-    - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
-          through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy
-          rather than four copies. Validate: every mode's converged image is unchanged vs the single-λ baseline (same
-          tone-map) but reaches a given colour-noise level in ~fewer samples; dispersion/thin-film unaffected.
+    - [x] **Shared plumbing — DONE 2026-07-26 (no VERSION bump: zero observable change).** Landed as the
+          *achievable* subset of the original idea, after surveying what is actually duplicated. Two helpers plus
+          one comment block went into `src/hero.h`:
+          * **`hero::sampleBundle(sampler, u, C, lam, pdf)`** — POLICY (1), the stratified λ draw itself (hero
+            takes `u`, secondary i takes `u + i/C` wrapped, all through the same emission CDF; returns false iff
+            the *hero's* pdf is non-positive, since only it must be valid). It was three near-identical copies;
+            now one. Templated on the sampler so the header stays dependency-free and both callers fit: the
+            forward tracer samples one `Emitter::spd`, the backward/BDPT tracers the scene-wide
+            `Scene::emitSampler` (both `EmissionSampler`).
+          * **`hero::maxOf(a, n)`** — POLICIES (3)/(4), the max over live λ, used both as the analog-RR survival
+            probability and as the "is the whole bundle black?" early-out. Replaced 6 hand-rolled loops
+            (`render.h` ×3 including the DiffuseTransmit per-lobe pair, `backward.h` ×3).
+          * **A single authoritative POLICY block** at the top of `hero.h` stating all four rules — (1)
+            stratification, (2) which lobes de-hero, and that the criterion is a *λ-dependent direction* rather
+            than merely being delta, (3) analog RR is max-over-live-λ never hero-only (with both failure modes:
+            `c_hero == 0` kills live secondaries, and hero-only ratios amplify by up to 15× per diffuse bounce),
+            (4) per-λ factors are absolute never ratios — plus the two rules that deliberately are *not* shared
+            (the forward tracers must book the reweight as absorption in their energy ledger and nobody else may;
+            BDPT normalises a connection by `1/min(nUp_light, nUp_eye)` at the splat instead of folding a ×C
+            de-hero boost into vertex throughputs, since two independently de-hero'd subpaths would square it).
+            This is the part that actually pays: the prose was duplicated near-verbatim across three files, and
+            each of the two real bugs in this section's history had to be found and fixed independently in two-to-
+            four places.
+          **Why NOT the original "small `HeroLambda` struct threaded through every spectral evaluation site":**
+          the four tracers are genuinely different *estimators*, not four copies of one. The forward tracers
+          multiply throughputs and keep an energy ledger; the backward tracer runs analog RR on a radiometric
+          weight and books nothing; BDPT stores an absolute per-λ factor per vertex, computes ONE MIS weight for
+          the whole bundle, and must not de-hero-boost at all. Forcing them behind one struct would have produced
+          a struct whose fields each tracer reinterprets — worse than the duplication it removed. The GPU twins
+          in `render_cuda.cu` stay separate on purpose, as decided earlier in this section.
+          **Validated as a pure refactor: 24/24 renders byte-identical** to `scraps/ftrace_base_99a898d.exe` —
+          the full cross product {`abs_hero_delta`, `abs_hero_mats`, `abs_herosplit`} × {mode B, R, D} ×
+          {`-heroc 1`, `-heroc 4`} on CPU (18), plus CPU mode M, mode S and `-herosplit`, plus GPU modes B/R/D at
+          `-heroc 4` (6). Renders in `png/heroRefac/`.
     - [x] **Docs + version — DONE (rolling, through 0.59.0).** README's spectral bullet, the "what ftrace is
           actually good at" §, the renderer-comparison table and the `-heroc <N>` flag row all state the current
           coverage (CPU `A/B/C`, `R`, `M/S`; GPU megakernel `A/B/C`, `M`-deposit, `R`) and the exclusions

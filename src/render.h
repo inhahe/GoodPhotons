@@ -1821,20 +1821,11 @@ struct Renderer {
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
 
-        // Hero + stratified secondary wavelengths from this emitter's SPD (one base draw,
-        // C-1 wrapped strata). The hero must have a valid pdf; a dead secondary carries
-        // beta 0 and simply splats nothing.
-        double lam[hero::kHeroMax];
-        double u = rng.uniform();
-        double pdf0 = 0.0;
-        lam[0] = em.spd.sampleAt(u, pdf0);
-        if (pdf0 <= 0) return;
-        for (int i = 1; i < C; ++i) {
-            double uu = u + (double)i / C;
-            if (uu >= 1.0) uu -= 1.0;                 // wrap into [0,1)
-            double pdfi = 0.0;
-            lam[i] = em.spd.sampleAt(uu, pdfi);
-        }
+        // Hero + stratified secondary wavelengths from this emitter's SPD (hero.h policy 1:
+        // one base draw, C-1 wrapped strata). The hero must have a valid pdf; a dead
+        // secondary carries beta 0 and simply splats nothing, so its pdf goes unread.
+        double lam[hero::kHeroMax], pdfLam[hero::kHeroMax];
+        if (!hero::sampleBundle(em.spd, rng.uniform(), C, lam, pdfLam)) return;
         // Per-λ throughput: base power split C ways. Image-env reweights each λ by the
         // directional radiance estimator (no-op for a constant env).
         double base = (scene.emitters.size() == 1) ? em.power : scene.totalPower;
@@ -1986,11 +1977,7 @@ struct Renderer {
                     // secondary is ever amplified. The maxima can sum past 1 (each λ alone is
                     // guarded), in which case both shrink proportionally. At nUp == 1 the two
                     // maxima are rhoR[0]/rhoT[0] and every reweight is *= 1.0.
-                    double qR = rhoR[0], qT = rhoT[0];
-                    for (int i = 1; i < nUp; ++i) {
-                        if (rhoR[i] > qR) qR = rhoR[i];
-                        if (rhoT[i] > qT) qT = rhoT[i];
-                    }
+                    double qR = hero::maxOf(rhoR, nUp), qT = hero::maxOf(rhoT, nUp);
                     double sumHero = qR + qT;
                     if (nUp > 1 && sumHero > 1.0) { qR /= sumHero; qT /= sumHero; sumHero = qR + qT; }
                     double uu = rng.uniform();
@@ -2031,12 +2018,10 @@ struct Renderer {
                     // most of the spectrum) AND amplify by c_i/c_hero, so the survival
                     // probability is the MAX over live λ and survivors reweight by c_i/q <= 1.
                     double c[hero::kHeroMax];
-                    double q = 0.0;
-                    for (int i = 0; i < nUp; ++i) {
+                    for (int i = 0; i < nUp; ++i)
                         c[i] = (m.type == MatType::Filter) ? clamp01(m.transmit(lam[i]))
                                                            : clamp01(reflectSlot(scene, m, h, lam[i]));
-                        if (c[i] > q) q = c[i];
-                    }
+                    const double q = hero::maxOf(c, nUp);
                     if (rng.uniform() >= q) { e.absorbed += activeSum(); return; }  // RR absorb
                     for (int i = 0; i < nUp; ++i) {                                // bounded reweight
                         double w = c[i] / q;
@@ -2121,8 +2106,7 @@ struct Renderer {
                     // amplifies a secondary by up to rho_max/rho_hero — on a saturated wall
                     // (redWall spans 0.05..0.75) a 15x weight spike per bounce, which cancels
                     // the whole stratification win. At nUp == 1, q == rho[0] and beta[0] *= 1.0.
-                    double q = rho[0];
-                    for (int i = 1; i < nUp; ++i) if (rho[i] > q) q = rho[i];
+                    const double q = hero::maxOf(rho, nUp);
                     if (rng.uniform() >= q) { e.absorbed += activeSum(); return; }        // RR absorb
                     for (int i = 0; i < nUp; ++i) {                                       // bounded reweight
                         double w = rho[i] / q;
