@@ -788,6 +788,12 @@ struct Scene {
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
     std::vector<Record>  records;    // parametric records: named per-channel LUTs (§records)
+    // N-D sampled arrays ("grids"), sampled from a pattern expression as
+    // `grid:<name>(c0, …)`. Headers and samples are split so the samples form ONE
+    // flat pool: a grid refers to its run by offset (never by pointer, which would
+    // dangle when the pool grows), and that is also the exact shape the GPU uploads.
+    std::vector<PatGrid> grids;
+    std::vector<float>   gridPool;
     Sensor sensor;
     // Participating media. Zero or more independent regions (global haze, bounded
     // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
@@ -1346,12 +1352,31 @@ inline void bindPatTex(PatCtx& c, const Scene& s) {
     c.texSelf = &s;
 }
 
+// PatOp::Grid tables. Unlike textures these need no callback: the sampler lives in
+// pattern.h and reads plain POD (headers + one flat float pool), which is exactly the
+// layout the GPU uploads, so host and device share one code path.
+inline void bindPatGrid(PatCtx& c, const Scene& s) {
+    c.grids     = s.grids.empty() ? nullptr : s.grids.data();
+    c.nGrids    = (int)s.grids.size();
+    c.gridPool  = s.gridPool.empty() ? nullptr : s.gridPool.data();
+    c.gridPoolN = (int)s.gridPool.size();
+}
+
+// Publish every scene-owned pattern table into a context. Call this (not the
+// individual binders) wherever a PatCtx is built by hand, so a newly added table
+// can't be silently missed at one site.
+inline void bindPatScene(PatCtx& c, const Scene& s) {
+    bindPatTex(c, s);
+    bindPatGrid(c, s);
+}
+
 // Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
 // implicit field value f (0 on non-implicit surfaces), oriented normal, radius, and
-// the scene's texture table (so `tex:<name>(u,v)` samples inside a pattern work).
+// the scene's pattern tables (so `tex:<name>(u,v)` and `grid:<name>(…)` sampling
+// inside a pattern work).
 inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
     PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v);
-    bindPatTex(c, scene);
+    bindPatScene(c, scene);
     return c;
 }
 

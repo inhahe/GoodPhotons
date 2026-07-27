@@ -727,6 +727,7 @@ public:
 
     bool build(const std::vector<Block>& blocks, Loaded& L) {
         records_ = &L.scene.records;   // stable handle for record refs at value sites (records added in Pass 1d)
+        gridsRef_ = &L.scene.grids;    // ditto for grid arity lookups (grids added in Pass 1a)
         // Pass 0: global scene settings — the length unit and spectral range. All
         // authored lengths are scaled to the internal unit (metres) at load time,
         // so a scene authored in cm and one in m render identically.
@@ -763,6 +764,13 @@ public:
         // Pass 1: collect named spectra (resolve refs lazily), materials, camera.
         for (const auto& b : blocks)
             if (b.type == "spectrum") spectraBlocks_[b.name] = &b;
+
+        // Pass 1a: N-D sampled arrays. FIRST of the table passes, because a procedural
+        // `texture { rgb "…" }` bakes during Pass 1b and may sample `grid:<name>(…)`.
+        for (const auto& b : blocks) {
+            if (b.type != "grid") continue;
+            if (!addGrid(b, L)) return false;
+        }
 
         // Pass 1b: image textures (must exist before materials that bind them).
         for (const auto& b : blocks) {
@@ -834,7 +842,7 @@ public:
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
                      b.type == "texture" || b.type == "pattern" || b.type == "record" ||
-                     b.type == "mesh_asset") { /* handled */ }
+                     b.type == "grid" || b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
@@ -887,6 +895,24 @@ private:
         return (it == idx.end()) ? -1 : it->second;
     }
     PatTexScope texScope_{ this, &Builder::texScopeThunk_ };
+
+    // Grid scope for `grid:<name>(c0, …)` samples inside a pattern expression. Same
+    // deal as texScope_, with one extra job: it also reports the grid's DIMENSIONALITY,
+    // because a grid's call arity is a property of the grid itself (a 2-D grid takes
+    // two coordinates), not of the function name — so the compiler can only check the
+    // argument count once the name resolves. Filled by the grid pass, which runs before
+    // textures/patterns/records, so authoring order doesn't matter for those.
+    std::unordered_map<std::string, int> gridIndex_;      // grid name -> Scene::grids index
+    const std::vector<PatGrid>* gridsRef_ = nullptr;      // -> L.scene.grids (for the ndim report)
+    static int gridScopeThunk_(const void* self, const char* name, int* ndim) {
+        const Builder* bl = static_cast<const Builder*>(self);
+        auto it = bl->gridIndex_.find(name);
+        if (it == bl->gridIndex_.end()) return -1;
+        if (ndim && bl->gridsRef_ && it->second < (int)bl->gridsRef_->size())
+            *ndim = (*bl->gridsRef_)[it->second].ndim;
+        return it->second;
+    }
+    PatGridScope gridScope_{ this, &Builder::gridScopeThunk_ };
     std::unordered_map<std::string, int> recordIndex_;    // record name  -> Scene::records index
     const std::vector<Record>* records_ = nullptr;        // -> L.scene.records (set in build; for record refs at value sites)
     std::unordered_map<std::string, Spectrum> spdFileCache_; // path -> loaded measured SPD
@@ -958,7 +984,7 @@ private:
         m.reflect = constantSpectrum(0.75);
         std::vector<PatNode> drv;
         std::string cerr;
-        if (!compilePatternExpr(driverExpr, drv, cerr, /*allowT=*/false, &texScope_)) {
+        if (!compilePatternExpr(driverExpr, drv, cerr, /*allowT=*/false, &texScope_, &gridScope_)) {
             fail("record material driver '" + driverExpr + "': " + cerr);
             return -1;
         }
@@ -1394,22 +1420,24 @@ private:
                 fail("texture '" + b.name + "': rgb needs three quoted exprs: rgb \"r(u,v)\" \"g(u,v)\" \"b(u,v)\""); return false;
             }
             std::vector<PatNode> pr, pg, pb; std::string perr;
-            if (!compilePatternExpr(rgbS->val.words[0], pr, perr, false, &texScope_)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
-            if (!compilePatternExpr(rgbS->val.words[1], pg, perr, false, &texScope_)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
-            if (!compilePatternExpr(rgbS->val.words[2], pb, perr, false, &texScope_)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[0], pr, perr, false, &texScope_, &gridScope_)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[1], pg, perr, false, &texScope_, &gridScope_)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[2], pb, perr, false, &texScope_, &gridScope_)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
             int res = (int)dblOf(b, "res", 512.0);
             if (res < 1) res = 1; else if (res > 8192) res = 8192;
             tex.encoding = TexEncoding::Linear;   // expr outputs are linear albedo already
             tex.w = res; tex.h = res;
             tex.rgb.assign((size_t)res * res, Vec3{0, 0, 0});
             auto cl = [](double t) { return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t); };
+            // Bind the scene's pattern tables once; only (u,v) vary per texel.
+            PatCtx c; bindPatScene(c, L.scene);
             for (int y = 0; y < res; ++y) {
                 // Invert v to match sampleRgb's (1-v) flip so f(u,v) reads back at the
                 // surface UV (top-left storage, v=0 at image bottom / OBJ convention).
                 double v = 1.0 - (y + 0.5) / res;
                 for (int x = 0; x < res; ++x) {
                     double u = (x + 0.5) / res;
-                    PatCtx c; c.u = u; c.v = v; bindPatTex(c, L.scene);
+                    c.u = u; c.v = v;
                     double rr = patternEval(pr.data(), (int)pr.size(), c);
                     double gg = patternEval(pg.data(), (int)pg.size(), c);
                     double bb = patternEval(pb.data(), (int)pb.size(), c);
@@ -1534,7 +1562,7 @@ private:
             std::string expr;
             for (size_t k = 0; k < es->val.words.size(); ++k) { if (k) expr += " "; expr += es->val.words[k]; }
             std::string perr;
-            if (!compilePatternExpr(expr, pat.nodes, perr, false, &texScope_)) {
+            if (!compilePatternExpr(expr, pat.nodes, perr, false, &texScope_, &gridScope_)) {
                 fail("pattern '" + b.name + "': " + perr); return false;
             }
         } else {
@@ -1562,6 +1590,138 @@ private:
         int id = (int)L.scene.patterns.size();
         L.scene.patterns.push_back(std::move(pat));
         patternIndex_[b.name] = id;
+        return true;
+    }
+
+    // ---- N-D sampled arrays (`grid`) ----
+    //   grid "name" {
+    //       shape 3 4                 # sample counts per axis, axis 0 outermost (C order)
+    //       lo 0 0                    # box corner: absent -> zeros, one number -> broadcast
+    //       hi 1 1                    # absent -> unit-spacing index lattice, one -> isotropic
+    //       outside clamp             # clamp (default) | wrap | extrapolate
+    //       data { 0 1 2  3 4 5  … }  # product(shape) numbers, C order
+    //   }
+    // Sampled from any pattern expression as `grid:<name>(c0, …)` with one coordinate
+    // per axis. Coordinates are the grid's OWN units and are NOT scaled by the scene's
+    // `units` setting — like `pattern`'s `scale`/`size`, a grid is unit-agnostic; author
+    // `lo`/`hi` in whatever the expression feeding it produces (metres, u/v, …).
+    static bool parseGridOutside(const std::string& s, PatGridOutside& out) {
+        if (s == "clamp" || s == "edge")   { out = PatGridOutside::Clamp;       return true; }
+        if (s == "wrap"  || s == "repeat") { out = PatGridOutside::Wrap;        return true; }
+        if (s == "extrapolate" || s == "extend") { out = PatGridOutside::Extrapolate; return true; }
+        return false;
+    }
+
+    bool addGrid(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("grid needs a \"name\""); return false; }
+        if (gridIndex_.count(b.name)) { fail("duplicate grid name '" + b.name + "'"); return false; }
+        const std::string who = "grid '" + b.name + "'";
+
+        // Samples: a `data { … }` brace body (the flat-word list form `palette {}` uses)
+        // or an inline `data 1 2 3` line. Nesting/newlines inside the body are pure
+        // formatting — C order is the shape, exactly as in loom's data.Grid.
+        const Stmt* ds = find(b, "data");
+        if (!ds) { fail(who + " needs a `data { … }` list of numbers"); return false; }
+        const std::vector<std::string>& dw = ds->val.block ? ds->val.block->words : ds->val.words;
+        std::vector<float> samples;
+        samples.reserve(dw.size());
+        for (const auto& w : dw) {
+            if (!isNumber(w)) { fail(who + ": non-numeric sample '" + w + "' in `data`"); return false; }
+            samples.push_back((float)num(w));
+        }
+        if (samples.empty()) { fail(who + ": `data` is empty"); return false; }
+
+        // Shape. Absent means "1-D, as long as the data" — the common ramp/LUT case.
+        std::vector<int> shape;
+        if (const Stmt* ss = find(b, "shape")) {
+            for (const auto& w : ss->val.words) {
+                if (!isNumber(w)) { fail(who + ": non-numeric `shape` entry '" + w + "'"); return false; }
+                int n = (int)num(w);
+                if (n < 1) { fail(who + ": `shape` entries must be >= 1"); return false; }
+                shape.push_back(n);
+            }
+        }
+        if (shape.empty()) shape.push_back((int)samples.size());
+        if ((int)shape.size() > PAT_GRID_MAX_DIM) {
+            fail(who + ": " + std::to_string(shape.size()) + " axes exceeds the " +
+                 std::to_string((int)PAT_GRID_MAX_DIM) + "-D limit");
+            return false;
+        }
+        long long need = 1;
+        for (int n : shape) need *= (long long)n;
+        if (need != (long long)samples.size()) {
+            fail(who + ": `shape` wants " + std::to_string(need) + " samples but `data` has " +
+                 std::to_string(samples.size()));
+            return false;
+        }
+
+        PatGrid g;
+        g.ndim = (int)shape.size();
+        for (int a = 0; a < g.ndim; ++a) g.shape[a] = shape[a];
+
+        // Read an axis-vector setting: absent -> `have=false`, one number -> broadcast,
+        // exactly ndim numbers -> per-axis. Anything else is an authoring error.
+        auto axisVec = [&](const char* key, double* out, bool& have, bool& scalar) -> bool {
+            have = false; scalar = false;
+            const Stmt* s = find(b, key);
+            if (!s) return true;
+            std::vector<double> v;
+            for (const auto& w : s->val.words) {
+                if (!isNumber(w)) { fail(who + std::string(": non-numeric `") + key + "` entry '" + w + "'"); return false; }
+                v.push_back(num(w));
+            }
+            if (v.empty()) return true;
+            if ((int)v.size() == 1) { scalar = true; for (int a = 0; a < g.ndim; ++a) out[a] = v[0]; }
+            else if ((int)v.size() == g.ndim) { for (int a = 0; a < g.ndim; ++a) out[a] = v[a]; }
+            else {
+                fail(who + std::string(": `") + key + "` needs 1 or " + std::to_string(g.ndim) + " numbers");
+                return false;
+            }
+            have = true;
+            return true;
+        };
+
+        bool haveLo = false, loScalar = false, haveHi = false, hiScalar = false;
+        double lo[PAT_GRID_MAX_DIM] = {0, 0, 0, 0};
+        double hi[PAT_GRID_MAX_DIM] = {0, 0, 0, 0};
+        if (!axisVec("lo", lo, haveLo, loScalar)) return false;
+        if (!axisVec("hi", hi, haveHi, hiScalar)) return false;
+        (void)loScalar;
+        // `hi` defaults mirror loom's Grid._resolve_hi:
+        //   absent  -> the unit-spacing INDEX lattice, hi[a] = lo[a] + shape[a] - 1
+        //   scalar  -> an ISOTROPIC lattice: spacing is set by axis 0, other axes follow
+        //   vector  -> the exact box
+        if (!haveHi) {
+            for (int a = 0; a < g.ndim; ++a) hi[a] = lo[a] + double(g.shape[a] - 1);
+        } else if (hiScalar) {
+            const double h = (g.shape[0] > 1) ? (hi[0] - lo[0]) / double(g.shape[0] - 1) : 0.0;
+            for (int a = 0; a < g.ndim; ++a) hi[a] = lo[a] + h * double(g.shape[a] - 1);
+        }
+        for (int a = 0; a < g.ndim; ++a) {
+            if (g.shape[a] > 1 && hi[a] == lo[a]) {
+                fail(who + ": axis " + std::to_string(a) + " has " + std::to_string(g.shape[a]) +
+                     " samples but a zero-width extent (lo == hi)");
+                return false;
+            }
+            g.lo[a] = lo[a];
+            g.hi[a] = hi[a];
+        }
+
+        std::string os = strOf(b, "outside", "clamp");
+        if (!parseGridOutside(os, g.outside)) {
+            fail(who + ": unknown `outside` '" + os + "' (clamp|wrap|extrapolate)");
+            return false;
+        }
+
+        // Samples go into ONE shared pool; the header points at its run by OFFSET, never
+        // by pointer — the pool grows as later grids load, and that is also the exact
+        // flat layout the GPU uploads.
+        g.off   = (int)L.scene.gridPool.size();
+        g.count = (int)samples.size();
+        L.scene.gridPool.insert(L.scene.gridPool.end(), samples.begin(), samples.end());
+        int id = (int)L.scene.grids.size();
+        L.scene.grids.push_back(g);
+        gridIndex_[b.name] = id;
         return true;
     }
 
@@ -1702,7 +1862,7 @@ private:
             for (auto& st : ch.stops) {
                 if (ch.kind == ChanKind::Scalar) {
                     std::string cerr;
-                    if (!compilePatternExpr(st.token, st.expr, cerr, false, &texScope_)) {
+                    if (!compilePatternExpr(st.token, st.expr, cerr, false, &texScope_, &gridScope_)) {
                         fail("record '" + rec.name + "' channel '" + ch.name +
                              "': bad stop expression '" + st.token + "': " + cerr);
                         return false;
@@ -1774,7 +1934,7 @@ private:
                 auto rit = recordIndex_.find(rname);
                 if (rit == recordIndex_.end()) { fail("`from`: unknown record '" + rname + "'"); return m; }
                 std::vector<PatNode> drv; std::string cerr;
-                if (!compilePatternExpr(dexpr, drv, cerr, false, &texScope_)) {
+                if (!compilePatternExpr(dexpr, drv, cerr, false, &texScope_, &gridScope_)) {
                     fail("`from " + rname + "` driver '" + dexpr + "': " + cerr); return m;
                 }
                 const Record& rec = L.scene.records[rit->second];
@@ -1884,7 +2044,7 @@ private:
                 if (selStop >= 0) { fail("record-override `" + slot + " = " + rhs +
                     "`: a stop selector needs a record channel"); return m; }
                 std::string cerr;
-                if (!compilePatternExpr(rhs, rb.driver, cerr, false, &texScope_)) {
+                if (!compilePatternExpr(rhs, rb.driver, cerr, false, &texScope_, &gridScope_)) {
                     fail("record-override `" + slot + " = " + rhs + "`: " + cerr); return m;
                 }
                 rb.recordIndex = -1;

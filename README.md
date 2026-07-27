@@ -1679,6 +1679,18 @@ or a native-primitive wrap — see below). Two authoring forms:
   warped. `tex:` needs a real surface, so it is a **compile error** in an isosurface
   `function { expr }`, in a medium `density`/`ior` program, and at load-time constant
   sites — never a silent zero. Worked example: `scenes/pattern_tex.ftsl`.
+  It can equally **sample an N-D array of authored numbers**: a `grid "name" { shape …
+  lo … hi … outside … data { … } }` block declares a **regular lattice in 1–4
+  dimensions** (samples in C order, axis 0 outermost), and `grid:<name>(c0, …)` reads it
+  back with separable **N-linear** interpolation — so a measured curve, a lookup table or
+  a small height field becomes a term in a formula. The call's **arity is the grid's own
+  dimensionality**, so a wrong argument count is a compile error rather than a silent
+  zero. `lo` defaults to zeros and `hi` to the unit-spacing *index* lattice (coordinates
+  are then literally indices); a single `hi` number gives an isotropic lattice. Outside
+  the box, `outside` picks `clamp` (default), `wrap` (period `hi-lo`) or `extrapolate`.
+  Grids upload verbatim to the GPU and both backends run the *same* sampler, so a grid
+  renders identically either way; `ftrace -checkgrid` is the deterministic self-test and
+  `scenes/pattern_grid.ftsl` the worked example (one feature per wall strip).
 - **Named generator** — `type <gen>` plus params (mirrors material syntax):
 
   | Generator | Parameters | Result |
@@ -2321,7 +2333,7 @@ alone can't restore, so they are not disk-resumable.
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
-`-thinfilmswatch`, `-checkgrating`, `-checkupsample`.
+`-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`.
 
 **Scene front end:** `-legacy-parser` (parse `.ftsl` with the retired hand-written
 parser instead of the shared grammar — escape hatch, slated for removal),

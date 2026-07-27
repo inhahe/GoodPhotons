@@ -96,6 +96,36 @@ Origin tags point at the authoritative design text for each item.
     * These land with **N-D scatterpoint + N-D grid datatypes ported into ftrace** (mirroring loom's `data.Grid` /
       scatter + `interp.py` curves) — see the loom→ftrace data-port item. Grammar first (shared `.epeg`), then the
       C++ front-end at the J3c port, then the runtime sampler.
+    * **STATUS (2026-07-26): the N-D GRID datatype + sampler is DONE in ftrace (VERSION 0.71.0).** Increment 3's
+      regular-lattice half shipped ahead of the axis-tuple *syntax* (increment 2) by taking the call form the
+      lexer already supports — `grid:<name>(c0, …)`, the `tex:<name>(u,v)` precedent — so the runtime exists before
+      the sugar. What landed:
+      - `src/pattern.h`: `PatOp::Grid`, `PatGrid` (ndim ≤ `PAT_GRID_MAX_DIM` = 4, `shape`/`lo`/`hi`/`outside` +
+        `off`/`count` into a shared pool), `PatGridOutside {Clamp, Wrap, Extrapolate}`, and the shared
+        `__host__ __device__` `patGridCellFrac` / `patGridSample` (separable N-linear over 2^ndim corners, C order
+        with axis 0 outermost). Samples are addressed by **offset into one flat pool**, never by pointer, so the
+        pool can grow and the header uploads to the GPU verbatim.
+      - `PatGridScope` + tokenizer/compiler support: `grid:` scans as ONE identifier like `tex:`, but its **arity is
+        the grid's own `ndim`**, resolved at compile time — the first op whose argument count is not a property of
+        the function name. Wrong arity, unknown name, an uncalled `grid:<name>` and a bare `grid` are all compile
+        errors.
+      - `Scene::grids` / `Scene::gridPool`, published via `bindPatScene` (which now also covers `bindPatTex`, so a
+        future table can't be missed at one of the hand-built-PatCtx sites).
+      - `src/ftsl.h`: the `grid "name" { shape … lo … hi … outside … data { … } }` element, loaded in a new **Pass
+        1a** (before textures, so a procedural `texture { rgb "…" }` can sample one). `lo`/`hi` implement loom's
+        `_resolve_lo`/`_resolve_hi` defaults exactly (absent-`hi` ⇒ unit-spacing index lattice; scalar-`hi` ⇒
+        isotropic lattice from axis 0). `data { … }` uses the flat-word brace body the `palette {}` precedent
+        already parses, so the **shared grammar needed no change**.
+      - `src/render_cuda.cu`: `DScene.grids/gridPool` upload verbatim and `dPatternEval` gained a `PatOp::Grid` case
+        that calls the *same* `patGridSample`. The old `(const DTexture* tex, int nTex)` parameter pair became a
+        `DPatEnv` bundle across all 9 call sites + both forward declarations, so the next table costs one field
+        instead of nine edits.
+      - `ftrace -checkgrid`: deterministic self-test — exact sample recovery, C-order flattening, 1-D…4-D
+        multilinear exactness (worst error 1e-8, float-pool storage), all three `outside` policies, and the
+        compile/arity/scope rules. Cross-backend: `scraps/grid_test.ftsl` at 16384 spp agrees CPU↔GPU to **0.003 %**
+        mean (RMS 0.99/255 — pure MC noise).
+      **Still open here:** the ragged **scatter** sibling (Shepard IDW), and the `[[…][…]](u,v)` *authoring* sugar
+      (increment 2) reaching this same datatype.
     * **STATUS (2026-07-26): increment 1 of 3 DONE — the shared grammar + loom's canonical tree parse the call.**
       `tools/loom/loom/grammar/ftsl.epeg` now carries the axis tuple, and `loom/grammar/values.py` normalizes it
       (11 new cases in `tests/test_grammar_values.py`; suite 1072 → 1083):
@@ -114,9 +144,9 @@ Origin tags point at the authoritative design text for each item.
       positionals-before-keywords and no-duplicate-formals so the error can name the axis. `as_sampled()` is where
       the **unsaturated** error lives (a bare array reaching a field that samples).
       **STILL TO DO:** (2) mirror `axistuple` into ftrace's `ftsl_scene.epeg` + the C++ reducer, and reuse the same
-      production on the N-D grid / scatter element grammars; (3) the runtime N-D grid/scatter sampler (loom already
-      has the callable `Grid`/`Scatter` in `data.py`), plus the `shape=` / `lo` / `hi` constructor conveniences
-      below. **Increment 2 is a lexer decision, not a mechanical port** (found while doing 1): ftrace's tokenizer
+      production on the N-D grid / scatter element grammars; and the SCATTER half of increment 3 (loom's `Scatter`
+      in `data.py` / the `interp.py` scatter path — the ragged sibling of the grid landed below).
+      **Increment 2 is a lexer decision, not a mechanical port** (found while doing 1): ftrace's tokenizer
       (`src/ftsl.h` ~line 127) does *not* treat parens as delimiters — a bareword accretes until
       whitespace/brace/bracket/comment/quote — precisely so an expression value like `0.5+0.5*sin(2*pi*8*u)` stays
       **one** token. So `reflect [0 1](u)` currently lexes as `… ']' Word("(u)")`, and the trailing Word ends the

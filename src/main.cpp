@@ -972,6 +972,176 @@ static int checkUpsample() {
     return pass ? 0 : 1;
 }
 
+// Deterministic N-D grid sampler self-test (src/pattern.h: PatGrid / patGridSample,
+// reached from a pattern expression as `grid:<name>(c0, …)`). Validates, with no
+// scene and no renderer:
+//   (a) sample points reproduce the stored samples EXACTLY (no off-by-one, no drift);
+//   (b) C-order flattening — axis 0 is the OUTERMOST axis, matching loom's data.Grid
+//       and the nesting-is-the-shape authoring rule;
+//   (c) separable N-linear interpolation is exact for a multilinear function, in 1-D
+//       through 4-D (the strongest available analytic check on the corner weights);
+//   (d) the three out-of-box policies: clamp (edge-extend), wrap (period hi-lo, with
+//       sample n-1 aliasing sample 0) and extrapolate (the boundary cell continues);
+//   (e) the compile path: `grid:<name>(…)` resolves through a PatGridScope, takes the
+//       GRID's own dimensionality as its arity, and pushes coordinates in axis order.
+static int checkGrid() {
+    auto mk = [](int ndim, const int* shape, const double* lo, const double* hi,
+                 PatGridOutside os, int off, int count) {
+        PatGrid g;
+        g.ndim = ndim;
+        for (int a = 0; a < ndim; ++a) { g.shape[a] = shape[a]; g.lo[a] = lo[a]; g.hi[a] = hi[a]; }
+        g.outside = os; g.off = off; g.count = count;
+        return g;
+    };
+    double worst = 0.0;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkgrid] %-34s got %.9f want %.9f  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    bool ok = true;
+
+    // ---- (a)+(b) exact sample recovery and C-order on a 2x3 grid -------------
+    // data laid out row-major: value at (i, j) == i*3 + j.
+    std::vector<float> pool;
+    const int off23 = (int)pool.size();
+    for (int i = 0; i < 2; ++i) for (int j = 0; j < 3; ++j) pool.push_back((float)(i * 3 + j));
+    const int    sh23[2] = {2, 3};
+    const double lo23[2] = {0, 0}, hi23[2] = {1, 2};   // unit-spacing index lattice
+    PatGrid g23 = mk(2, sh23, lo23, hi23, PatGridOutside::Clamp, off23, 6);
+    for (int i = 0; i < 2; ++i) for (int j = 0; j < 3; ++j) {
+        double c[2] = {(double)i, (double)j};
+        ok &= chk("2x3 sample recovery (C order)", patGridSample(g23, pool.data(), (int)pool.size(), c),
+                  (double)(i * 3 + j), 1e-12);
+    }
+    // Midpoint between (0,0)=0 and (0,1)=1 is 0.5; between (0,0) and (1,0)=3 is 1.5.
+    { double c[2] = {0.0, 0.5}; ok &= chk("2x3 bilinear mid (axis 1)", patGridSample(g23, pool.data(), (int)pool.size(), c), 0.5, 1e-12); }
+    { double c[2] = {0.5, 0.0}; ok &= chk("2x3 bilinear mid (axis 0)", patGridSample(g23, pool.data(), (int)pool.size(), c), 1.5, 1e-12); }
+
+    // ---- (c) N-linear exactness for a multilinear function, 1-D .. 4-D -------
+    // f(t0..t_{n-1}) = prod(0.3 + 0.7*t_a) is multilinear, so N-linear interpolation
+    // of its corner values must reproduce it EXACTLY at every interior point.
+    for (int nd = 1; nd <= PAT_GRID_MAX_DIM; ++nd) {
+        int    shape[PAT_GRID_MAX_DIM];
+        double lo[PAT_GRID_MAX_DIM], hi[PAT_GRID_MAX_DIM];
+        int    n = 1;
+        for (int a = 0; a < nd; ++a) { shape[a] = 2; lo[a] = -1.0; hi[a] = 3.0; n *= 2; }
+        const int offN = (int)pool.size();
+        for (int c = 0; c < n; ++c) {
+            // C order: axis 0 is the OUTERMOST, so its index is the high bit.
+            double f = 1.0;
+            for (int a = 0; a < nd; ++a) {
+                int up = (c >> (nd - 1 - a)) & 1;
+                f *= 0.3 + 0.7 * (double)up;
+            }
+            pool.push_back((float)f);
+        }
+        PatGrid g = mk(nd, shape, lo, hi, PatGridOutside::Clamp, offN, n);
+        const double ts[3] = {0.125, 0.5, 0.875};
+        for (int s = 0; s < 3; ++s) {
+            double co[PAT_GRID_MAX_DIM], want = 1.0;
+            for (int a = 0; a < nd; ++a) {
+                double t = ts[(s + a) % 3];
+                co[a] = lo[a] + t * (hi[a] - lo[a]);
+                want *= 0.3 + 0.7 * t;
+            }
+            char lbl[64]; std::snprintf(lbl, sizeof lbl, "%d-D multilinear exactness", nd);
+            ok &= chk(lbl, patGridSample(g, pool.data(), (int)pool.size(), co), want, 1e-6);
+        }
+    }
+
+    // ---- (d) out-of-box policies on a 1-D ramp over [0,1] --------------------
+    const int offR = (int)pool.size();
+    pool.push_back(0.25f); pool.push_back(0.75f);       // data { 0.25 0.75 }, lo 0, hi 1
+    const int    shR[1] = {2};
+    const double loR[1] = {0.0}, hiR[1] = {1.0};
+    PatGrid gClamp = mk(1, shR, loR, hiR, PatGridOutside::Clamp, offR, 2);
+    PatGrid gExtra = mk(1, shR, loR, hiR, PatGridOutside::Extrapolate, offR, 2);
+    { double c[1] = {0.5};  ok &= chk("clamp: interior",       patGridSample(gClamp, pool.data(), (int)pool.size(), c), 0.50, 1e-9); }
+    { double c[1] = {-2.0}; ok &= chk("clamp: below lo",       patGridSample(gClamp, pool.data(), (int)pool.size(), c), 0.25, 1e-9); }
+    { double c[1] = {5.0};  ok &= chk("clamp: above hi",       patGridSample(gClamp, pool.data(), (int)pool.size(), c), 0.75, 1e-9); }
+    { double c[1] = {-1.0}; ok &= chk("extrapolate: below lo", patGridSample(gExtra, pool.data(), (int)pool.size(), c), -0.25, 1e-9); }
+    { double c[1] = {2.0};  ok &= chk("extrapolate: above hi", patGridSample(gExtra, pool.data(), (int)pool.size(), c), 1.25, 1e-9); }
+
+    // Wrap: 5 samples over [0,1] with sample 4 aliasing sample 0 -> a period-1 sawtooth.
+    const int offW = (int)pool.size();
+    const float saw[5] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
+    for (float f : saw) pool.push_back(f);
+    const int    shW[1] = {5};
+    const double loW[1] = {0.0}, hiW[1] = {1.0};
+    PatGrid gWrap = mk(1, shW, loW, hiW, PatGridOutside::Wrap, offW, 5);
+    { double c[1] = {0.375};  ok &= chk("wrap: interior",  patGridSample(gWrap, pool.data(), (int)pool.size(), c), 0.375, 1e-6); }
+    { double c[1] = {1.375};  ok &= chk("wrap: +1 period", patGridSample(gWrap, pool.data(), (int)pool.size(), c), 0.375, 1e-6); }
+    { double c[1] = {-0.625}; ok &= chk("wrap: -1 period", patGridSample(gWrap, pool.data(), (int)pool.size(), c), 0.375, 1e-6); }
+    { double c[1] = {1.0};    ok &= chk("wrap: seam aliases sample 0", patGridSample(gWrap, pool.data(), (int)pool.size(), c), 0.0, 1e-6); }
+
+    // ---- (e) the `grid:<name>(…)` compile + eval path ------------------------
+    // A two-entry scope: "ramp" is the 1-D clamp ramp, "tbl" is the 2x3 C-order grid.
+    struct Scope {
+        static int lookup(const void*, const char* name, int* ndim) {
+            if (!std::strcmp(name, "ramp")) { if (ndim) *ndim = 1; return 0; }
+            if (!std::strcmp(name, "tbl"))  { if (ndim) *ndim = 2; return 1; }
+            return -1;
+        }
+    };
+    PatGridScope scope; scope.self = nullptr; scope.lookup = &Scope::lookup;
+    PatGrid grids[2] = {gClamp, g23};
+
+    struct Case { const char* expr; double u, v; double want; };
+    const Case cases[] = {
+        {"grid:ramp(u)",             0.5,  0.0, 0.50},
+        {"grid:ramp(2*u)",           0.25, 0.0, 0.50},
+        {"grid:tbl(0, 1)",           0.0,  0.0, 1.00},   // C order: (i=0, j=1) -> 1
+        {"grid:tbl(1, 0)",           0.0,  0.0, 3.00},   // (i=1, j=0) -> 3
+        {"grid:tbl(u, v) + 1",       1.0,  2.0, 6.00},   // corner (1,2) = 5
+        {"grid:ramp(grid:tbl(0,0))", 0.0,  0.0, 0.25},   // nested: tbl(0,0)=0 -> ramp(0)
+    };
+    for (const Case& cs : cases) {
+        std::vector<PatNode> prog; std::string perr;
+        if (!compilePatternExpr(cs.expr, prog, perr, false, nullptr, &scope)) {
+            std::printf("[checkgrid] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+            ok = false; continue;
+        }
+        PatCtx c;
+        c.u = cs.u; c.v = cs.v;
+        c.grids = grids; c.nGrids = 2;
+        c.gridPool = pool.data(); c.gridPoolN = (int)pool.size();
+        char lbl[80]; std::snprintf(lbl, sizeof lbl, "expr %s", cs.expr);
+        ok &= chk(lbl, patternEval(prog.data(), (int)prog.size(), c), cs.want, 1e-9);
+    }
+    // Arity is the GRID's dimensionality, so a wrong argument count must be an error,
+    // and an out-of-scope / unknown grid must not silently compile to 0.
+    struct Bad { const char* expr; const char* why; };
+    const Bad bads[] = {
+        {"grid:tbl(u)",     "2-D grid called with 1 argument"},
+        {"grid:ramp(u, v)", "1-D grid called with 2 arguments"},
+        {"grid:nope(u)",    "unknown grid name"},
+        {"grid:ramp",       "grid referenced without a call"},
+        {"grid(u)",         "bare `grid` with no name"},
+    };
+    for (const Bad& bd : bads) {
+        std::vector<PatNode> prog; std::string perr;
+        if (compilePatternExpr(bd.expr, prog, perr, false, nullptr, &scope)) {
+            std::printf("[checkgrid] `%s` compiled but should be rejected (%s)  BAD\n", bd.expr, bd.why);
+            ok = false;
+        }
+    }
+    // With no grid scope at all (a load-time constant site), `grid:` must be refused.
+    {
+        std::vector<PatNode> prog; std::string perr;
+        if (compilePatternExpr("grid:ramp(u)", prog, perr, false, nullptr, nullptr)) {
+            std::printf("[checkgrid] `grid:ramp(u)` compiled with no grid scope  BAD\n");
+            ok = false;
+        }
+    }
+
+    std::printf("[checkgrid] worst absolute error = %.3g\n", worst);
+    std::printf("[checkgrid] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // The film accumulates radiance in an arbitrary (non-absolute) radiometric scale
 // that depends on photon count, light power, etc., so the image is always anchored
 // by an auto-exposure that maps the 99th luminance percentile to ~0.9. `expComp`
@@ -3662,6 +3832,7 @@ static int run(int argc, char** argv) {
     bool diffraction = true;      // MatType::Grating diffraction on/off (-diffraction)
     bool checkGratingOnly = false;
     bool checkUpsampleOnly = false;
+    bool checkGridOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
     bool rgbBackward = false;      // -rgb: fast RGB (non-spectral) backward preview (mode R, GPU)
@@ -3950,6 +4121,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-nodiffraction")) diffraction = false;
         else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
+        else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
         else if (!std::strcmp(argv[i], "-rgb")) rgbBackward = true;
@@ -4094,6 +4266,7 @@ static int run(int argc, char** argv) {
     if (thinFilmSwatchOnly) { thinFilmSwatch(filmIor, 1.5); return 0; } // visual diagnostic
     if (checkGratingOnly)  return checkGrating();  // deterministic, no scene needed
     if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed
+    if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
     bool prism     = !std::strcmp(sceneName, "prism");
     bool materials = !std::strcmp(sceneName, "materials");
     bool fluoro    = !std::strcmp(sceneName, "fluoro");

@@ -768,6 +768,13 @@ struct DScene {
     double           totalPower;
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
     const DTexture*  textures; int nTex;   // reflectance textures (mat.reflectTex)
+    // N-D sampled arrays (§grids), reached from a pattern as `grid:<name>(c0, …)`.
+    // Uploaded VERBATIM: the host PatGrid header is already POD that refers to its
+    // samples by OFFSET (never a pointer), and gridPool is the same flat float run the
+    // host samples, so patGridSample — the one shared __host__ __device__ sampler in
+    // pattern.h — runs here unchanged and the two backends agree bit-for-bit.
+    const PatGrid*   grids;    int nGrids;
+    const float*     gridPool; int gridPoolN;
     const double*    fluoCdfAll;    // flattened per-material fluorescence emission CDFs
     // BDPT shared wavelength sampler (mirrors Scene::emitSampler): the combined
     // g(lambda)=sum_k geomWeight_k*SPD_k CDF, its bin step, and emitG = its integral.
@@ -796,6 +803,33 @@ struct DScene {
     int    bkMaxBounce;
     int    bkDirectOnly;
 };
+
+// Everything the pattern VM (dPatternEval) needs beyond the scalar variables: the
+// SCENE-OWNED sample tables a pattern expression can reach into. Bundled into one
+// struct rather than threaded as loose parameters because the list grows (textures
+// for `tex:`, grids for `grid:`, …) and every growth would otherwise touch all nine
+// call sites and both forward declarations.
+//
+// dPatEnvNone() is the OUT-OF-SCOPE environment used at value sites the host compiler
+// already refuses `tex:`/`grid:` at (implicit field formulas, medium density/ior), so
+// such a node can never actually appear there; the null tables just make the VM
+// total instead of undefined if one ever did.
+struct DPatEnv {
+    const DTexture* tex;      int nTex;
+    const PatGrid*  grids;    int nGrids;
+    const float*    gridPool; int gridPoolN;
+};
+__host__ __device__ static inline DPatEnv dPatEnvNone() {
+    DPatEnv e; e.tex = nullptr; e.nTex = 0;
+    e.grids = nullptr; e.nGrids = 0; e.gridPool = nullptr; e.gridPoolN = 0;
+    return e;
+}
+__host__ __device__ static inline DPatEnv dPatEnvOf(const DScene& sc) {
+    DPatEnv e; e.tex = sc.textures; e.nTex = sc.nTex;
+    e.grids = sc.grids; e.nGrids = sc.nGrids;
+    e.gridPool = sc.gridPool; e.gridPoolN = sc.gridPoolN;
+    return e;
+}
 
 // Lens-projection radius maps (device twins of camera.h projRadius/Inv/Deriv). The
 // projection tag matches CameraProjection (camera.h): 0 rectilinear, 1 equidistant,
@@ -1161,7 +1195,7 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
                                       double u, double v,
-                                      const DTexture* tex, int nTex);
+                                      const DPatEnv& env);
 __device__ static double dFieldEval(const DFieldNode* nodes, int n,
                                     double pwx, double pwy, double pwz,
                                     const PatNode* exprPool);
@@ -1246,7 +1280,7 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, nullptr, 0);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, dPatEnvNone());
     return d > 0.0 ? d : 0.0;
 }
 
@@ -1348,7 +1382,7 @@ __device__ static double dMedNAt(const DMedium& m, const DVec3& p) {
     if (m.iorN <= 0 || !m.ior) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double n = dPatternEval(m.ior, m.iorN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, nullptr, 0);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, dPatEnvNone());
     return n > 1e-3 ? n : 1e-3;
 }
 
@@ -1602,7 +1636,7 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
                                       double u, double v,
-                                      const DTexture* tex, int nTex);
+                                      const DPatEnv& env);
 __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float x, float y, float z, float f,
                                       float nx, float ny, float nz, float r,
@@ -1617,7 +1651,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
             if (!exprPool) return BIG;
             double r = sqrt(px*px + py*py + pz*pz);
             return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r, 0.0, 0.0, nullptr, 0);
+                                0.0, 0.0, 0.0, r, 0.0, 0.0, dPatEnvNone());
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -3547,7 +3581,7 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
                                       double u, double v,
-                                      const DTexture* tex, int nTex) {
+                                      const DPatEnv& env) {
     double st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const PatNode& nd = nodes[i];
@@ -3607,7 +3641,22 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
             case PatOp::Tex: {
                 double vv = st[--sp];                       // args pushed as (u, v)
                 int    ti = (int)nd.a;
-                st[sp-1] = (tex && ti >= 0 && ti < nTex) ? dTexScalarAt(tex[ti], st[sp-1], vv) : 0.0;
+                st[sp-1] = (env.tex && ti >= 0 && ti < env.nTex)
+                             ? dTexScalarAt(env.tex[ti], st[sp-1], vv) : 0.0;
+                break;
+            }
+            case PatOp::Grid: {
+                // Arity is the GRID's own dimensionality; coordinates were pushed in
+                // axis order, so pop them back to front. patGridSample is the SHARED
+                // __host__ __device__ sampler from pattern.h — there is no device
+                // re-implementation to drift from the host one.
+                int gi = (int)nd.a;
+                if (gi < 0 || gi >= env.nGrids || !env.grids) { st[sp++] = 0.0; break; }
+                const PatGrid& g = env.grids[gi];
+                int gnd = g.ndim < 1 ? 1 : (g.ndim > PAT_GRID_MAX_DIM ? PAT_GRID_MAX_DIM : g.ndim);
+                double co[PAT_GRID_MAX_DIM];
+                for (int k = gnd - 1; k >= 0; --k) co[k] = st[--sp];
+                st[sp++] = patGridSample(g, env.gridPool, env.gridPoolN, co);
                 break;
             }
         }
@@ -3711,6 +3760,9 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                 st[sp-1] = 0.0f; // context. Handled explicitly so the switch stays total.
                 break;
             }
+            case PatOp::Grid:    // likewise unreachable — `grid:` needs a grid scope, which
+                st[sp++] = 0.0f; // field formulas are never compiled with. The operand count
+                break;           // is unknown here (it is the grid's ndim), so just push 0.
         }
     }
     return sp > 0 ? st[0] : 0.0f;
@@ -3723,7 +3775,7 @@ __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit&
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, sc.textures, sc.nTex);
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, dPatEnvOf(sc));
 }
 
 // Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
@@ -3743,7 +3795,7 @@ __device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, 
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, sc.textures, sc.nTex);
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, dPatEnvOf(sc));
 }
 // Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
 // evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
@@ -3791,14 +3843,14 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
                          px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
-                         sc.textures, sc.nTex);
+                         dPatEnvOf(sc));
     } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
         v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
     } else {                                               // per-hit driven
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
                                 px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
-                                sc.textures, sc.nTex);
+                                dPatEnvOf(sc));
         v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
                              m.recRoughInterp, h, d);
     }
@@ -3876,7 +3928,7 @@ __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
     double r = sqrt(px * px + py * py + pz * pz);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
                             px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
-                            sc.textures, sc.nTex);
+                            dPatEnvOf(sc));
     out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
                      (double)m.recReflLo, (double)m.recReflHi, d, lambda);
     return true;
@@ -9657,6 +9709,13 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;
     sc.textures = d_tex; sc.nTex = (int)dtex.size();
+    // N-D grids upload VERBATIM — the host PatGrid header refers to its samples by
+    // offset into the shared pool, never by pointer, so no fix-up is needed and the
+    // device sampler is literally the same function the host runs.
+    sc.grids    = scene.grids.empty()    ? nullptr : (const PatGrid*)keep(uploadVec(scene.grids));
+    sc.nGrids   = (int)scene.grids.size();
+    sc.gridPool = scene.gridPool.empty() ? nullptr : (const float*)keep(uploadVec(scene.gridPool));
+    sc.gridPoolN = (int)scene.gridPool.size();
     sc.fluoCdfAll = d_fluoCdf;
     sc.emitSamplerCdf = d_emitSamp;
     sc.emitSamplerN = (int)(emitSampCdf.empty() ? 0 : emitSampCdf.size() - 1);

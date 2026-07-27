@@ -282,6 +282,63 @@ procedural texture channels. In an isosurface `function { expr }`, a medium
 `density`/`ior` program, or a load-time constant there is no surface to sample, and
 `tex:` is a **compile error** rather than a silent zero.
 
+**Sampled arrays — `grid:<name>(c0, …)`:** a `grid` element declares an **N-dimensional
+regular lattice of numbers** (1-D through 4-D) that any expression can interpolate. Where
+`tex:` reads an *image* in UV space, `grid:` reads *authored data* over an arbitrary
+domain — a measured curve, a lookup table, a small height field, a tabulated response:
+
+```
+grid "ramp" {
+    lo   0
+    hi   1
+    data { 0 0.15 0.55 0.8 1 }         # 5 samples over [0,1]
+}
+
+grid "tile" {
+    shape 3 3                          # axis 0 is the OUTERMOST axis (C order)
+    lo    0 0
+    hi    1 1
+    data {
+        0.02 0.98 0.02
+        0.98 0.02 0.98
+        0.02 0.98 0.02
+    }
+}
+
+pattern "p" { expr "grid:ramp(u) * grid:tile(v, u)" }
+```
+
+| Key | Meaning |
+|---|---|
+| `data { … }` | The samples, in **C order** (axis 0 outermost / slowest). Required. Newlines and grouping inside the body are pure formatting. |
+| `shape a b …` | Sample count per axis; the number of entries is the dimensionality (max 4). Omitted ⇒ **1-D**, as long as `data`. `product(shape)` must equal the sample count. |
+| `lo` | The box's low corner. Omitted ⇒ **zeros**; one number ⇒ broadcast to every axis; `ndim` numbers ⇒ exact. |
+| `hi` | The high corner. Omitted ⇒ the **unit-spacing index lattice** (`hi[a] = lo[a] + shape[a] - 1`, i.e. coordinates *are* indices); one number ⇒ an **isotropic** lattice whose spacing is set by axis 0; `ndim` numbers ⇒ the exact box. |
+| `outside` | Behaviour beyond the box: `clamp` (default — edge-extend), `wrap` (periodic with period `hi-lo`, so sample `n-1` aliases sample 0), `extrapolate` (the boundary cell's slope continues). |
+
+The call's **arity is the grid's own dimensionality** — a 2-D grid takes two coordinates,
+in axis order — so `grid:tile(u)` is a compile error, not a silent zero. Interpolation is
+separable **N-linear** (linear / bilinear / trilinear / quadrilinear), so a grid whose
+samples come from a multilinear function reproduces it exactly. Coordinates are in the
+grid's **own units** and are *not* rescaled by the scene's `units` setting (like a
+`pattern`'s `scale`, a grid is unit-agnostic).
+
+Grids load before textures, patterns and records, so declaration order never matters —
+including inside a procedural `texture { rgb "…" }`, which may sample any grid. Scope
+matches `tex:`: `grid:` is available in `pattern` blocks, procedural texture channels and
+record driver/stop/override expressions. It is **not** yet available in scalar *field*
+formulas (isosurface `function { expr }`, medium `density`/`ior`, load-time constants),
+where it is a compile error rather than a silent zero — unlike `tex:`, that is a plumbing
+gap rather than a semantic one, tracked in `known-issues.md`.
+
+The whole path is shared with the GPU: the `PatGrid` headers and the flat sample pool
+upload verbatim and the device runs the *same* sampler function, so a grid renders
+identically on either backend. `ftrace -checkgrid` runs the deterministic sampler
+self-test (exact sample recovery, C-order flattening, 1-D…4-D multilinear exactness, the
+three `outside` policies, and the compile/arity rules), and
+`scenes/pattern_grid.ftsl` renders one feature per wall strip (plain ramp, 2-D C order,
+`wrap`, the default index lattice, `extrapolate`) as a direct albedo read-out.
+
 **POV-Ray internal functions:** the whole classic `functions.inc` isosurface library is
 built in — `f_torus`, `f_heart`, `f_klein_bottle`, `f_superellipsoid`, `f_dupin_cyclid`,
 `f_helix1`, `f_spiral`, `f_boy_surface`, `f_kummer_surface_v1/v2`, … (~73 functions, exact

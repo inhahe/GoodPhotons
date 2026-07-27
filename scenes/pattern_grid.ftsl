@@ -1,0 +1,108 @@
+# pattern_grid.ftsl — the N-D `grid` datatype and the `grid:<name>(c0, …)` sampler.
+#
+# A `grid` is a regular lattice of authored numbers in 1..4 dimensions, read back from
+# any pattern expression with separable N-linear interpolation. Where `tex:` samples an
+# IMAGE in UV space, `grid:` samples DATA over an arbitrary domain — a measured curve, a
+# lookup table, a small height field.
+#
+# Each of the five back-wall strips drives the `weight_map` of a 2-child mix (child 0 =
+# white, child 1 = black), so a strip's albedo IS the sampler's output, and the render is
+# a direct read-out of one feature:
+#
+#   1 (bottom)  ramp    the plain case: 2 samples over [0,1] -> a linear ramp in u
+#   2           tile    2-D, 3x3 checker: C order, axis 0 outermost
+#   3           saw     `outside wrap`: period hi-lo, sample n-1 aliases sample 0
+#   4           idx     default lo/hi: the UNIT-SPACING INDEX lattice (domain 0..3)
+#   5 (top)     ext     `outside extrapolate`: the boundary cell's slope continues
+#
+# Render:  ftrace -in scenes/pattern_grid.ftsl -o png/pattern_grid.png -spp 512 -window
+# The sampler itself is covered analytically by `ftrace -checkgrid`.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# --- 1-D, explicit box: 2 samples spanning [0,1] -> grid:ramp(t) == clamp(t, 0, 1).
+grid "ramp" {
+    lo   0
+    hi   1
+    data { 0 1 }
+}
+
+# --- 2-D. The shape's first entry is the OUTERMOST axis, so `data` reads as rows:
+#     row 0 = [0.02 0.98 0.02], row 1 = [0.98 0.02 0.98], row 2 = row 0.
+grid "tile" {
+    shape 3 3
+    lo    0 0
+    hi    1 1
+    data {
+        0.02 0.98 0.02
+        0.98 0.02 0.98
+        0.02 0.98 0.02
+    }
+}
+
+# --- Periodic. 5 samples over [0,1] with `wrap`: sample 4 aliases sample 0, so the
+#     period is exactly hi-lo = 1 and the ramp resets cleanly at every seam.
+grid "saw" {
+    shape   5
+    lo      0
+    hi      1
+    outside wrap
+    data { 0 0.25 0.5 0.75 1 }
+}
+
+# --- No lo/hi at all. `lo` defaults to zeros and `hi` to the unit-spacing INDEX
+#     lattice, so this grid's domain is 0..3 — a query coordinate IS a sample index.
+grid "idx" {
+    data { 0.9 0.1 0.9 0.1 }
+}
+
+# --- Extrapolate: sampled over [-0.5, 1.5] below, the boundary cell's slope continues
+#     instead of flattening (the `saturate` only keeps the result a legal albedo).
+grid "ext" {
+    lo      0
+    hi      1
+    outside extrapolate
+    data { 0.2 0.6 }
+}
+
+pattern "p_ramp" { expr "grid:ramp(u)" }
+pattern "p_tile" { expr "grid:tile(v, u)" }
+pattern "p_saw"  { expr "grid:saw(u * 3)" }
+pattern "p_idx"  { expr "grid:idx(u * 3)" }
+pattern "p_ext"  { expr "saturate(grid:ext(u * 2 - 0.5))" }
+
+material "white" { type diffuse reflect whitewall 1.0 }
+material "black" { type diffuse reflect whitewall 0.0 }
+material "wall"  { type diffuse reflect whitewall 0.75 }
+
+material "m_ramp" { type mix  layer "white" 0.5  layer "black" 0.5  weight_map pattern:p_ramp }
+material "m_tile" { type mix  layer "white" 0.5  layer "black" 0.5  weight_map pattern:p_tile }
+material "m_saw"  { type mix  layer "white" 0.5  layer "black" 0.5  weight_map pattern:p_saw  }
+material "m_idx"  { type mix  layer "white" 0.5  layer "black" 0.5  weight_map pattern:p_idx  }
+material "m_ext"  { type mix  layer "white" 0.5  layer "black" 0.5  weight_map pattern:p_ext  }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material wall }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material wall }   # ceiling
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material wall }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material wall }   # right
+
+quad { origin 0 0.00 0   u 1 0 0   v 0 0.2 0   material m_ramp }
+quad { origin 0 0.20 0   u 1 0 0   v 0 0.2 0   material m_tile }
+quad { origin 0 0.40 0   u 1 0 0   v 0 0.2 0   material m_saw  }
+quad { origin 0 0.60 0   u 1 0 0   v 0 0.2 0   material m_idx  }
+quad { origin 0 0.80 0   u 1 0 0   v 0 0.2 0   material m_ext  }
+
+light area {
+    origin 0.2 0.999 0.2   u 0.6 0 0   v 0 0 0.6   normal 0 -1 0
+    spd    preset:bb6500
+    power  200
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.2   look_at 0.5 0.5 0.0   up 0 1 0   fov_y 40
+    mode R
+    film { res 512 512   iso 100   shutter 1   exposure 1 }
+}
