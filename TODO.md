@@ -1914,6 +1914,11 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          the *grammar* (one node type, `t` an input) is clean, but the two *executors* stay distinct strategies on
          that node — scalar-per-frame (frame-keyed cache) vs numpy-array-over-space — don't pretend they're one call.
       4. **N-D *input* domain** (several named driver *axes*, not one `range` scalar).
+         **NOT SCHEDULED (user, 2026-07-25)** — items 1/2/3 are all done, so this is the only thing keeping J3b
+         open, and it is deliberately left out. It is also the piece most entangled with the axis-labelled-array
+         work above (§"ADDENDUM — axis-labelled arrays"): an N-D *record* input domain is the same "several named
+         driver axes" idea the sample call already introduces on the value side, so doing it before that lands
+         would build a second, competing spelling.
       Each emits down to the J3a form or a documented construct (e.g. lower a `D=3` channel to `spectrum:`-refs +
       synthesised `spectrum` decls); non-lowerable forms stay loom-only representation.
 - [ ] **J3c — full-scene `.ftsl` parser + emitter reconciliation.** Add `.ftsl -> loom Element tree` to
@@ -2315,8 +2320,8 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           conserved exactly** (auto-exposure identical, 1.11e-13, hero 9.09M vs single 2.80M photons), **chroma
           noise down 0.87×**, luma flat, against a 1.5e7 single-λ reference. (Milder chroma win than A/B/C's 0.77×
           because the gather already averages many photons.) Modes S (SPPM) inherits it via `tracePhotonPass`.
-          **Still TODO:** mode U (VCM/UPS) — its BDPT-style light-subpath tracing (`src/vcm.h`) is the same
-          complexity class as BDPT-D below; and all GPU photon-mapping paths.
+          **Still TODO:** all GPU photon-mapping paths. (Mode U's CPU half — the same complexity class as
+          BDPT-D below — landed 2026-07-26, 0.69.0; see the U entry.)
     - [x] **Runtime `-heroc N` flag — DONE.** The bundle size is now a runtime CLI knob (`hero.h`: `kHeroC=4`
           default, new `kHeroMax=8` compile-time cap for the fixed stack arrays). `main.cpp` parses `-heroc N`
           (clamped 1..kHeroMax) into `g_heroC` and threads it to every CPU hero path: `Renderer::heroC`
@@ -2386,6 +2391,42 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           (de-hero is unbiased; splitting is a different, also-unbiased estimator — same mean, sharper caustics, more
           work per path). README + a `-herosplit` flag-table row; VERSION minor bump when shipped.
     - [ ] **U (VCM/UPS)** — carry the N λ along the light subpath and merge/connect per-λ (BDPT-level MIS). CPU + GPU.
+        - [x] **CPU (`src/vcm.h`) — DONE 2026-07-26 (VERSION 0.69.0).** Both subpaths now carry the bundle.
+              `vcmPass` draws one `bdpt::HeroBundle` per **path index** (replacing the single `lam[i]`/`invLam[i]`
+              draw) so light path *p* and camera path *p* share the same C wavelengths — which is exactly what
+              makes strategy (c), the paired vertex connection, EXACT per-λ, as in BDPT. `hero::sampleBundle`
+              with `C == 1` is literally `emitSampler.sampleAt(rng.uniform(), pdf)`, so `-heroc 1` consumes the
+              same rng draws in the same order and is bit-identical (verified against the 0.68.1 binary on
+              `cornell` mode U: `cmp` clean).
+              `scatterSample` gained the `bdpt.h::randomWalk` secondary block verbatim — per-λ `secF[]` for
+              Diffuse/Fluorescent, Glossy, DiffuseTransmit (dividing by the HERO's lobe albedo, since the hero
+              chose the lobe), Mirror and Filter (`keepBundle`: delta but λ-independent in direction), and the
+              de-hero collapse `if (delta && !keepBundle) nUp = 1` for Dielectric/HalfMirror/ThinFilm/
+              Multilayer/Grating. Every `<= 0` early-out became a max-over-live-λ test (hero.h policy 3), and
+              Beer-Lambert absorption in the nested-dielectric stack is now per-λ on both walks (that IS the
+              colour of coloured glass). All four strategies are per-λ: (a) emission, (b) NEE, (c) connection
+              at `nUp = min(camera, light-vertex)`, each normalised by `1/nUp` at the accumulate — the same
+              average-the-bundle rule bdpt.h uses at its splat, NOT a ×C boost, which two independently
+              de-hero'd subpaths would square.
+              (d) **merging** is the one strategy that crosses paths, so — exactly as the single-λ version
+              already keyed on `LightVertex::lambda` — it stays keyed on the LIGHT vertex's wavelengths: the
+              camera BSDF is evaluated at each of the light vertex's live λ, weighted by that λ's stored
+              throughput and cached CIE, and averaged over `nUp_lightvertex`. The MIS weights everywhere stay
+              the hero's, since every sampling density in this renderer is wavelength-INDEPENDENT.
+              **Memory:** the secondaries live in a *parallel* `std::vector<LightVertexSec>` indexed in lockstep
+              with `lightVerts`, never inside `LightVertex` — stored light vertices are the dominant cost of a
+              VCM pass (and of the GPU slab), so a `-heroc 1` run allocates exactly nothing extra.
+              **Validated** on `scenes/absolute.ftsl` (absolute units ⇒ physically-linear film, so two runs are
+              directly comparable): C=1 vs C=4 at 1600 passes agree to a mean bias of **−0.001 %** (rms 1.36/255,
+              below either estimator's own 400→1600 self-noise), while C=4's self-noise drops from rms 3.11 to
+              2.28 (~1.85× variance reduction). On a purpose-built Wratten-58 gel + mirror box — the `keepBundle`
+              stress case — C=1 vs C=4 at 3200 passes agree to **+0.016 %** and C=4 halves the RMS noise
+              (1.84 → 0.93, ~4× variance reduction), which is the ideal C=4 win.
+        - [ ] **GPU (`src/vcm_cuda.cu`)** — the device session is still the single-wavelength estimator; with
+              `-heroc N > 1` mode U now prints a notice saying the bundle applies to the CPU path only. Same
+              CPU-then-GPU split BDPT took (0.60.0 → 0.61.0). The device `LightVertex` slab will need the same
+              *parallel* secondary array (never inline fields), or the slab's ~`vcmCap·npix·128 B` footprint
+              quadruples.
     - [x] **D (BDPT) — DONE 2026-07-26 (CPU 0.60.0, GPU 0.61.0).** Both subpaths carry the N λ; the connection
           term evaluates per-λ. CPU *and* GPU megakernel (sub-items below).
         - [x] **CPU (`src/bdpt.h`) — DONE 2026-07-26 (VERSION 0.60.0).** Both subpaths now carry the bundle.

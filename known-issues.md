@@ -471,7 +471,7 @@ second 12-byte random-access stream per visit only added traffic. Packing the CI
 into `DPhoton` itself would grow the struct 32→44B and tax every mode's deposit
 bandwidth, so that variant wasn't pursued either. Keep the CPU-side table only.
 
-### TECH-DEBT (2026-07-20, updated 2026-07-26): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S + BDPT D) and the whole GPU megakernel (forward A/B/C + M-deposit, backward R, BDPT D) — GPU wavefront and VCM (U) still single-λ
+### TECH-DEBT (2026-07-20, updated 2026-07-26): hero-wavelength sampling is on ALL the CPU tracers (R + A/B/C + M/S + BDPT D + VCM U) and the whole GPU megakernel (forward A/B/C + M-deposit, backward R, BDPT D) — the GPU wavefront backend and the GPU VCM session are the last single-λ paths
 `radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
 `tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
 **CPU photon-mapping modes M (photon map) + S (SPPM)** hero-wavelength spectral sampling (hero λ + 3 stratified
@@ -654,8 +654,36 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   `r.useHero` under the `kHeroC>1 && scene.media.empty() && !sceneHasGrin` gate. The gather keys off each photon's
   own λ (`photonmap_render.h:245`), so the heterogeneous-λ map gathers correctly; C records of `base/C` sum to
   `base` and `nEmitted` counts PATHS, so the estimate is energy-identical to single-λ. Cost: up to C× more stored
-  photons from one shared BVH walk (the intended chroma-noise win). **Mode U (VCM/UPS)** still single-λ — its
-  BDPT-style light-subpath tracing (`src/vcm.h`) needs per-λ merge/connect (same complexity class as BDPT-D).
+  photons from one shared BVH walk (the intended chroma-noise win). **Mode U (VCM/UPS)** got the same treatment
+  later the same day — see the VCM bullet below.
+- **VCM/UPS (mode U, CPU) — DONE 2026-07-26 (VERSION 0.69.0).** `src/vcm.h` now carries a `bdpt::HeroBundle`
+  along **both** subpaths, so all four strategies (emission `s=0`, NEE `s=1`, vertex *connection*, vertex
+  *merging*) evaluate per-λ. Design points worth remembering:
+  * **One bundle is drawn per *path index*, not per subpath.** `vcmPass` pre-draws `bundles[nPix]` from a single
+    stratified variate each and both the light-tracing and the camera-tracing worker index it by the same `i`,
+    so light path *p* and camera path *p* share the same C wavelengths. That makes the **connection** strategy
+    exact per-λ: `nUpConn = min(nUp_cam, nUp_lightVertex)`, sum over the shared λ, normalise by `1/nUpConn`.
+  * **Merging stays keyed on the LIGHT vertex's own wavelengths.** A merge crosses paths, so there is no shared
+    λ set; the estimator sums over the stored vertex's live λ and divides by its `nUp`, with the BSDF re-evaluated
+    at each stored λ against the camera vertex. That is the pre-existing spectral-photon-mapping approximation
+    generalised, not a new one.
+  * **MIS weights stay the hero's** everywhere. Every *sampling* density in this renderer is λ-independent
+    (cosine / glossy-lobe pdfs don't depend on λ; only throughput *values* do), so one `dVCM`/`dVC`/`dVM`
+    bookkeeping triple serves the whole bundle — same argument as BDPT's single `misWeight`.
+  * **The secondary payload is a parallel array** (`std::vector<LightVertexSec>` indexed in lockstep with
+    `lightVerts`), never extra fields inside `LightVertex`. Stored light vertices are the dominant memory cost
+    of a VCM pass (and of the GPU slab at ~`vcmCap·npix·128 B`), so `-heroc 1` must allocate exactly nothing
+    extra — same reasoning as the GPU BDPT `pathSec[v*secStride+i]` split above.
+  * `scatterSample` gained the **absolute** per-λ `secF[]` block copied verbatim from `bdpt.h::randomWalk`
+    (including `keepBundle` for Mirror/Filter and the max-over-live-λ early-out), and Beer-Lambert absorption in
+    the medium stack is now per-λ on both walks — that *is* the colour of coloured glass.
+  Validated: `-heroc 1` **bit-identical** to the 0.68.1 binary on `cornell` mode U; `scenes/absolute.ftsl`
+  (absolute mode = fixed sensor gain) C=4 vs C=1 at 1600 passes = **−0.001 %** mean, with self-noise RMS
+  3.107→2.284; a new `scraps/_vcm_hero_gel.ftsl` (Wratten-58 gel pane + mirror slab — the `keepBundle` stress
+  case) **+0.016 %** at 3200 passes with self-noise RMS 1.837→0.932 (**0.51×** = ~4× variance reduction).
+  **Still TODO: the GPU VCM session** (`src/vcm_cuda.cu`) is single-λ; `-mode U -device gpu` prints a one-line
+  notice saying so rather than silently ignoring `-heroc`. It is not gated off, because `g_heroC` defaults to 4
+  and gating would silently change device selection for everyone.
 - **Opt-in split-at-dispersion (`-herosplit`) — DONE 2026-07-26 (VERSION 0.65.0), CPU forward.** The alternative
   to the default de-hero policy: at a dispersive interface all C wavelengths **continue**, each running the same
   interaction with its **own** λ (its own Snell direction / grating order / Stokes shift), so one bundle fans out

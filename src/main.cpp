@@ -2871,6 +2871,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         int maxDepth = 8;   // full path length in edges
         double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                           : scene.sceneRadius * g_pmRadiusFactor;
+        // Hero-wavelength bundle (Wilkie 2014). Mode U's scene scope already excludes
+        // everything the hero gate would reject — vcmUnsupportedFeature refuses media,
+        // GRIN and lens cameras — so `-heroc N > 1` is the whole condition. CPU only for
+        // now; the GPU session below is still the single-wavelength estimator.
+        const int vcmHeroC = g_heroC;
 #ifdef HAVE_CUDA
         // GPU VCM (M12): resident device session mirroring vcm.h's vcmPass. Each pass traces
         // one light + one camera subpath per pixel, combining BDPT vertex connections with
@@ -2885,6 +2890,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 cudaAvailable() && cudaVcmSupported(scene)) {
                 VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxDepth);
                 if (sess) {
+                    if (vcmHeroC > 1)
+                        std::printf("[hero] mode U GPU session is single-wavelength; "
+                                    "-heroc %d applies to the CPU path only (use -device cpu)\n",
+                                    vcmHeroC);
                     std::printf("mode U: VCM/UPS on %s — connections + merging, R0=%.4g, "
                                 "alpha=%.2f at %dx%d (maxDepth=%d, light=%s) ...\n",
                                 cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxDepth, lightLabel);
@@ -2919,8 +2928,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         }
 #endif
         std::printf("mode U: VCM/UPS — connections + merging, R0=%.4g, alpha=%.2f at %dx%d on "
-                    "%d CPU threads (maxDepth=%d, light=%s) ...\n",
-                    R0, g_vcmAlpha, res, resY, nThreads, maxDepth, lightLabel);
+                    "%d CPU threads (maxDepth=%d, light=%s, %s) ...\n",
+                    R0, g_vcmAlpha, res, resY, nThreads, maxDepth, lightLabel,
+                    vcmHeroC > 1 ? (std::string("hero C=") + std::to_string(vcmHeroC)).c_str()
+                                 : "single-lambda");
         vcm::VcmState st; st.init(res, resY);
         auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
             Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
@@ -2930,7 +2941,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 double radius = R0 * std::pow(it, 0.5 * (g_vcmAlpha - 1.0));
                 if (radius <= 0.0) radius = R0;
                 vcm::vcmPass(scene, cam, st, radius, nThreads, diffraction, maxDepth,
-                             (uint64_t)(st.passes + 1));
+                             (uint64_t)(st.passes + 1), vcmHeroC);
                 disp = vcm::vcmResolve(st);
                 for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
                 if (p->report(disp, st.passes, st.passes >= passTarget)) break;
