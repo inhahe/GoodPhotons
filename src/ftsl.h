@@ -142,10 +142,74 @@ inline std::vector<Token> tokenize(const std::string& src) {
 // Parse tree
 // ---------------------------------------------------------------------------
 struct Block;
+
+// One entry inside a `[ … ]` bracket group at a value site: either a bare token or a
+// nested group. Kept as a raw tree by BOTH front ends (the legacy parser and the
+// shared-grammar reducer) so that neither has to decide what the brackets MEAN — that
+// is the loader's job, and keeping the decision in exactly one place is what stops the
+// two parsers drifting apart.
+struct BrItem {
+    bool                isGroup = false;
+    std::string         word;      // when !isGroup
+    std::vector<BrItem> items;     // when isGroup
+};
+
+// An inline N-D array literal at a value site — `[0 1](u)`, `[[0 1 2][3 4 5]](u,v)`.
+// The NESTING is the shape (axis 0 outermost, C order — the same layout a `grid`
+// element's `data { … }` uses), so a shape need never be spelled. `call` is the raw
+// text of the trailing sample call INCLUDING its parens, and is empty when the array
+// was written UNSATURATED — legal to author, an error to render, with the fix in the
+// message. The loader desugars each of these into an anonymous grid + pattern.
+struct ArrayLit {
+    std::vector<BrItem> items;
+    std::string         call;
+    int                 line = 0;
+};
+
 struct Value {
     std::vector<std::string> words;    // scalar / vector / expression tokens
     std::shared_ptr<Block> block;      // nested brace block (table/film/coat/body/...)
+    std::shared_ptr<ArrayLit> array;   // inline `[ … ](coords)` array literal, if any
 };
+// What does a `[ … ]` group at a value site MEAN?  There are two answers — a record
+// channel's STOP SELECTOR (`REC.chan[2]`) and an inline N-D ARRAY LITERAL (`[0 1](u)`) —
+// and this ONE function is where the question is answered, for BOTH front ends.  Keeping
+// the decision here (rather than duplicating it in Parser::parseValue and in the GPDA
+// reducer) is what stops the two from drifting: the grammar and the hand parser each only
+// have to *collect* the group's raw shape, never interpret it.
+//
+//   1. a trailing sample call    -> array literal (the call names the coordinates)
+//   2. otherwise nesting present -> array literal, UNSATURATED (an error at load time,
+//                                   but a parse-level array all the same)
+//   3. otherwise something foldable before the group -> the record stop selector; append
+//      the words to that token (`REC.chan` + `[2]`), exactly as before.  "Foldable" is a
+//      dotted word, or — inside the `= rhs [i]` record-override form, where a selector is
+//      the only thing brackets can possibly mean — any preceding token at all.
+//   4. otherwise nothing before the group and every item a number -> array literal,
+//      unsaturated (`roughness [0 1]` — the author forgot the `(u)`)
+//   5. otherwise -> drop it (a stray bracket group; unchanged legacy behaviour)
+inline void applyBracketGroup(Value& v, std::vector<BrItem> items,
+                              const std::string& call, int line,
+                              bool overrideForm = false) {
+    bool nested = false, allNum = !items.empty();
+    for (const auto& it : items) {
+        if (it.isGroup) { nested = true; allNum = false; }
+        else if (!isNumber(it.word)) allNum = false;
+    }
+    bool dotted = !v.words.empty() &&
+                  (overrideForm || v.words.back().find('.') != std::string::npos);
+    if (!call.empty() || nested || (v.words.empty() && allNum)) {
+        v.array = std::make_shared<ArrayLit>();
+        v.array->items = std::move(items);
+        v.array->call  = call;
+        v.array->line  = line;
+    } else if (dotted) {
+        std::string idx;
+        for (const auto& it : items) idx += it.word;
+        v.words.back() += "[" + idx + "]";
+    }
+}
+
 struct Stmt { std::string key; Value val; int line = 0; };
 struct Block {
     std::string type;                  // material / quad / film / table / ...
@@ -178,6 +242,41 @@ struct Parser {
     // named params (gaussian/shortpass) — and stop at the next bareword, which
     // begins the next statement's key. A trailing `{` opens a nested brace block
     // (table/film/…) whose type is the preceding word, or the statement key.
+    // Collect a `[ … ]` group at a value site into its raw item tree, WITHOUT deciding
+    // what it means (that is applyBracketGroup's job). Nested groups become nested items,
+    // which is how an N-D array literal spells its shape; newlines are skipped so a big
+    // literal may be laid out over several lines. Assumes cur() == LBracket.
+    std::vector<BrItem> parseBracketGroup() {
+        adv();                                  // consume '['
+        std::vector<BrItem> items;
+        while (!is(Tok::RBracket) && !is(Tok::End)) {
+            if (is(Tok::Newline)) { adv(); continue; }
+            if (is(Tok::LBracket)) {
+                BrItem g; g.isGroup = true; g.items = parseBracketGroup();
+                items.push_back(std::move(g));
+                continue;
+            }
+            if (!is(Tok::Word)) break;
+            BrItem w; w.word = cur().text; adv();
+            items.push_back(std::move(w));
+        }
+        if (is(Tok::RBracket)) adv(); else fail("bracket group missing ']'");
+        return items;
+    }
+
+    // A sample call immediately after a `]` — `(u)`, `(u,v)`. ftrace's tokenizer does NOT
+    // treat parens as delimiters (that is exactly what keeps an expression value like
+    // `0.5+0.5*sin(2*pi*u)` a single token), so the call arrives as an ordinary Word that
+    // happens to be wholly parenthesised — the same shape the shared grammar's PARENWORD
+    // terminal matches. Returns "" (and consumes nothing) when there is no call.
+    std::string takeAxisTuple() {
+        if (!is(Tok::Word)) return "";
+        const std::string& tx = cur().text;
+        if (tx.size() < 2 || tx.front() != '(' || tx.back() != ')') return "";
+        std::string call = tx; adv();
+        return call;
+    }
+
     void parseValue(const std::string& key, Value& v) {
         // Record-override assignment: `slot = <rhs>` (used inside a `material "m" { … }`
         // record block, §records stage 4). A standalone `=` first token never begins a
@@ -189,11 +288,9 @@ struct Parser {
             v.words.push_back("="); adv();
             if (is(Tok::Word) || is(Tok::String)) { v.words.push_back(cur().text); adv(); }
             if (is(Tok::LBracket)) {
-                adv();
-                std::string idx;
-                while (is(Tok::Word)) { idx += cur().text; adv(); }
-                if (is(Tok::RBracket)) adv(); else fail("record-override selector missing ']'");
-                if (!v.words.empty()) v.words.back() += "[" + idx + "]";
+                int ln = cur().line;
+                std::vector<BrItem> items = parseBracketGroup();
+                applyBracketGroup(v, std::move(items), takeAxisTuple(), ln, true);
             }
             return;
         }
@@ -216,17 +313,14 @@ struct Parser {
             }
             v.words.push_back(cur().text); adv();
         }
-        // Records stage 5a: a trailing `[i]` stop selector on a record-channel ref
-        // (`RECORD.channel[i]`) at an ordinary value site — fold the bracket tokens back
-        // into the preceding word so they don't leak into the brace-body statement stream
-        // (the `=` override path above already does this). Only when the preceding word
-        // looks like a dotted reference, so a stray `[` elsewhere still surfaces as an error.
-        if (is(Tok::LBracket) && !v.words.empty() && v.words.back().find('.') != std::string::npos) {
-            adv();
-            std::string idx;
-            while (is(Tok::Word)) { idx += cur().text; adv(); }
-            if (is(Tok::RBracket)) adv(); else fail("record selector missing ']'");
-            v.words.back() += "[" + idx + "]";
+        // A `[ … ]` group at an ordinary value site: either the record-channel stop
+        // selector `RECORD.channel[i]` (records stage 5a) or an inline array literal
+        // `[0 1](u)`. Collect it raw and let the shared applyBracketGroup decide which —
+        // that decision must live in exactly one place or the two front ends drift.
+        if (is(Tok::LBracket)) {
+            int ln = cur().line;
+            std::vector<BrItem> items = parseBracketGroup();
+            applyBracketGroup(v, std::move(items), takeAxisTuple(), ln);
         }
         if (is(Tok::LBrace)) {
             std::string btype = key, bname;
@@ -725,7 +819,7 @@ class Builder {
 public:
     std::string err;
 
-    bool build(const std::vector<Block>& blocks, Loaded& L) {
+    bool build(std::vector<Block>& blocks, Loaded& L) {
         records_ = &L.scene.records;   // stable handle for record refs at value sites (records added in Pass 1d)
         gridsRef_    = &L.scene.grids;      // ditto for N-D table arity lookups
         scattersRef_ = &L.scene.scatters;   // (both kinds are added in Pass 1a)
@@ -765,6 +859,12 @@ public:
         // Pass 1: collect named spectra (resolve refs lazily), materials, camera.
         for (const auto& b : blocks)
             if (b.type == "spectrum") spectraBlocks_[b.name] = &b;
+
+        // Pass 1-arr: desugar inline `[ … ](coords)` array literals into anonymous
+        // `grid` + `pattern` block pairs, APPENDED to `blocks`. Running it before Pass 1a
+        // is what makes an inline literal work at every slot that already accepts a
+        // `pattern:` — the rest of the loader never learns the syntax exists.
+        if (!desugarArrays(blocks)) return false;
 
         // Pass 1a: N-D data tables (regular `grid`s and ragged `scatter`s). FIRST of the
         // table passes, because a procedural `texture { rgb "…" }` bakes during Pass 1b
@@ -1607,6 +1707,159 @@ private:
         int id = (int)L.scene.patterns.size();
         L.scene.patterns.push_back(std::move(pat));
         patternIndex_[b.name] = id;
+        return true;
+    }
+
+    // ---- inline array literals: `[0 1](u)` / `[[0 1 2][3 4 5]](u,v)` ----
+    // The shorthand for "a tiny lookup table, written where it is used". It is pure
+    // SUGAR: each literal becomes an anonymous `grid` + a one-line `pattern` that samples
+    // it, and the value site is rewritten to `pattern:<gen>`. That is why the literal
+    // works in every slot that already takes a pattern without any of those slots
+    // knowing the syntax exists — and why the two front ends only ever have to carry the
+    // literal's raw shape (ftsl::BrItem), never its meaning.
+    //
+    // The NESTING is the shape (axis 0 outermost, C order — the same layout `grid`'s
+    // `data { … }` uses), so a shape need never be spelled; the array must be rectangular.
+    // The domain is the UNIT box per axis (lo 0, hi 1), NOT the `grid` element's default
+    // index lattice: an inline literal has no domain of its own and is overwhelmingly
+    // read at normalized coordinates (`u`, `v`), whereas a standalone `grid` is a data
+    // container whose sample spacing is the meaningful thing.
+
+    // Walk the raw bracket tree in C order, proving it RECTANGULAR (every group at a
+    // given depth the same length) while collecting the per-axis extents.
+    bool flattenArray(const std::vector<BrItem>& items, int depth,
+                      std::vector<int>& shape, std::vector<std::string>& out,
+                      const std::string& who) {
+        if (items.empty()) { fail(who + ": empty `[ ]` group"); return false; }
+        const bool grouped = items[0].isGroup;
+        for (const auto& it : items) {
+            if (it.isGroup != grouped) {
+                fail(who + ": axis " + std::to_string(depth) +
+                     " mixes numbers with nested `[ … ]` groups");
+                return false;
+            }
+        }
+        if ((int)shape.size() == depth) shape.push_back((int)items.size());
+        else if (shape[depth] != (int)items.size()) {
+            fail(who + ": ragged array — axis " + std::to_string(depth) + " has both " +
+                 std::to_string(shape[depth]) + " and " + std::to_string(items.size()) +
+                 " entries (an inline array must be rectangular; use a `scatter` for "
+                 "irregular data)");
+            return false;
+        }
+        if (!grouped) {
+            for (const auto& it : items) {
+                if (!isNumber(it.word)) {
+                    fail(who + ": non-numeric entry '" + it.word + "' in an inline array");
+                    return false;
+                }
+                out.push_back(it.word);
+            }
+            return true;
+        }
+        for (const auto& it : items)
+            if (!flattenArray(it.items, depth + 1, shape, out, who)) return false;
+        return true;
+    }
+
+    // Turn ONE literal into its `grid` + `pattern` pair (appended to `gen`) and rewrite
+    // the statement's value to reference the generated pattern.
+    bool desugarOne(Stmt& s, std::vector<Block>& gen, int& n) {
+        const ArrayLit& a = *s.val.array;
+        const std::string nm  = "__arr" + std::to_string(n++);
+        const std::string who = "line " + std::to_string(a.line) + ": `" + s.key + "`";
+        if (a.call.empty()) {
+            fail(who + ": an inline array literal needs a trailing sample call naming the "
+                 "coordinates it is read at — e.g. `[0 1](u)`, or `[[0 1][2 3]](u,v)` for "
+                 "2-D. Write the call with no spaces inside the parentheses and nothing "
+                 "between it and the `]`.");
+            return false;
+        }
+        if (!s.val.words.empty()) {
+            fail(who + ": an inline array literal must be the whole value, but it follows '" +
+                 s.val.words.back() + "'");
+            return false;
+        }
+        std::vector<int> shape;
+        std::vector<std::string> flat;
+        if (!flattenArray(a.items, 0, shape, flat, who)) return false;
+        if ((int)shape.size() > PAT_ND_MAX_DIM) {
+            fail(who + ": " + std::to_string(shape.size()) + " nested axes exceeds the " +
+                 std::to_string((int)PAT_ND_MAX_DIM) + "-D limit");
+            return false;
+        }
+        // Arity is checked HERE, not left to the generated grid sample, so the message can
+        // talk about what the author wrote (`[…](u)`) instead of a name they never chose.
+        {
+            int args = 1, depth = 0;
+            for (size_t k = 1; k + 1 < a.call.size(); ++k) {
+                char c = a.call[k];
+                if (c == '(') ++depth;
+                else if (c == ')') --depth;
+                else if (c == ',' && depth == 0) ++args;
+            }
+            if (a.call.size() <= 2) args = 0;           // `()`
+            if (args != (int)shape.size()) {
+                fail(who + ": the array is " + std::to_string(shape.size()) +
+                     "-D but its sample call `" + a.call + "` gives " +
+                     std::to_string(args) + " coordinate(s) — one per nesting level");
+                return false;
+            }
+        }
+
+        Block g;
+        g.type = "grid";
+        g.name = nm;
+        auto addStmt = [&](Block& blk, const char* key, std::vector<std::string> words) {
+            Stmt t; t.key = key; t.line = a.line; t.val.words = std::move(words);
+            blk.words.push_back(t.key);
+            for (const auto& w : t.val.words) blk.words.push_back(w);
+            blk.stmts.push_back(std::move(t));
+        };
+        {
+            std::vector<std::string> sh;
+            for (int d : shape) sh.push_back(std::to_string(d));
+            addStmt(g, "shape", sh);
+            addStmt(g, "lo", std::vector<std::string>(shape.size(), "0"));
+            addStmt(g, "hi", std::vector<std::string>(shape.size(), "1"));
+            addStmt(g, "data", flat);
+        }
+        gen.push_back(std::move(g));
+
+        Block p;
+        p.type = "pattern";
+        p.name = nm;
+        addStmt(p, "expr", {"grid:" + nm + a.call});
+        gen.push_back(std::move(p));
+
+        s.val.array.reset();
+        s.val.words.push_back("pattern:" + nm);
+        return true;
+    }
+
+    bool desugarArrays(std::vector<Block>& blocks) {
+        std::vector<Block> gen;
+        int n = 0;
+        // A block's flat `words` dump is a mirror of its statements (key, then value
+        // words), so any block whose statements changed has to be re-mirrored — some
+        // bodies (`palette`, `data`) are read through `words` rather than `stmts`.
+        std::function<bool(Block&)> visit = [&](Block& b) -> bool {
+            bool touched = false;
+            for (auto& s : b.stmts) {
+                if (s.val.array) { if (!desugarOne(s, gen, n)) return false; touched = true; }
+                if (s.val.block) { if (!visit(*s.val.block)) return false; }
+            }
+            if (touched && !b.words.empty()) {
+                b.words.clear();
+                for (const auto& s : b.stmts) {
+                    b.words.push_back(s.key);
+                    for (const auto& w : s.val.words) b.words.push_back(w);
+                }
+            }
+            return true;
+        };
+        for (auto& b : blocks) if (!visit(b)) return false;
+        for (auto& g : gen) blocks.push_back(std::move(g));
         return true;
     }
 

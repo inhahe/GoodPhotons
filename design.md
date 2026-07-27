@@ -244,6 +244,26 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   scopes are separate namespaces (a grid `foo` is not `scatter:foo`). Both are wired into
   every *pattern* site but not yet into scalar *field* formulas (isosurface/density) — a
   plumbing gap tracked in `known-issues.md`.
+
+  **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
+  the write-it-where-you-use-it spelling of the same thing, and they are implemented as
+  **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the
+  grid/scatter pass) turns each literal into an anonymous `grid "__arrN"` plus a one-line
+  `pattern "__arrN" { expr "grid:__arrN<call>" }` appended to the block list, and rewrites
+  the value site to `pattern:__arrN`. That is why a literal works at *every* slot that
+  already accepts a pattern without any of those slots changing, and it is verified by
+  rendering `scenes/pattern_array.ftsl` against a hand-written `grid` + `pattern` twin
+  (bit-identical). Nesting is the shape; the domain is the **unit box** per axis (an inline
+  literal has no domain of its own), deliberately unlike the `grid` element's index-lattice
+  default. The syntax reaches the loader through **both** front ends: the shared grammar
+  grows a `PARENWORD` terminal (a token that is *wholly* parenthesised) and one merged
+  `selector = '[' sel_item* ']' axistuple?` production covering both jobs of `[ … ]` at a
+  value site, while the legacy tokenizer needs no change at all — a call arrives as an
+  ordinary bareword because ftrace never treated `(` as a delimiter (which is exactly what
+  keeps `0.5+0.5*sin(2*pi*u)` one token). Critically, **neither parser decides what the
+  brackets mean**: both collect the raw `ftsl::BrItem` tree and hand it to the single
+  shared `ftsl::applyBracketGroup`, which is what stops the two front ends drifting on the
+  one syntax that is genuinely ambiguous (record stop selector vs. array literal).
 - **`envmap.h` / `sky.h`** — infinite environment lighting. `EnvMap` turns an
   equirectangular linear-RGB buffer into an importance-sampled directional emitter
   (per-texel Jakob–Hanika spectral upsampling + a luminance·sinθ 2-D sampler);

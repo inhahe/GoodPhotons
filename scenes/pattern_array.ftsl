@@ -1,0 +1,93 @@
+# pattern_array.ftsl — INLINE ARRAY LITERALS: `[0 1](u)`, `[[0 1][2 3]](u,v)`.
+#
+# A `grid` element is the right home for real data. But a lot of the tables an author
+# actually writes are three numbers long and used exactly once, and giving each of those a
+# name, a block and a `pattern` wrapper is more ceremony than content. So an array may be
+# written *where it is used*:
+#
+#     roughness [0.05 0.4 0.05](u)
+#
+# Two halves. `[ … ]` is the data, and NESTING is the shape — axis 0 outermost, C order,
+# exactly like a `grid`'s `data { … }` — so a shape is never spelled and can't disagree
+# with the data. `(…)` is the SAMPLE CALL: it says at which coordinates the array is read,
+# one coordinate per nesting level, and each coordinate is a full pattern expression. The
+# array spans the UNIT interval on every axis (0 at the first entry, 1 at the last), which
+# is what makes `(u)` / `(u,v)` the natural things to write.
+#
+# The call is not optional: an array with no call is "unsaturated" — the loader rejects it
+# and says so, because an uncalled array has no value. Write the call with no spaces inside
+# the parentheses (ftrace's tokenizer keeps an expression as one token, and that is also
+# what keeps `0.5+0.5*sin(2*pi*3*u)` legal as a coordinate).
+#
+# Each of the five back-wall strips drives the `weight_map` of a 2-child mix (child 0 =
+# white, child 1 = black), so a strip's albedo IS the array's output:
+#
+#   1 (bottom)  ramp   `[0 1](u)` — the two-entry base case: a straight linear ramp.
+#                      Compare scenes/pattern_scatter.ftsl, where the same two samples
+#                      under Shepard IDW give an S-curve instead; a grid interpolates
+#                      LINEARLY between its lattice points, and this is a grid.
+#   2           comb   `[0 1 0 1 0 1](u)` — six taps, so five linear segments: a triangle
+#                      wave. More entries is the only thing "more detail" means here.
+#   3           warp   the same two entries as strip 1, but read at
+#                      `0.5+0.5*sin(2*pi*3*u)` — the coordinate is an EXPRESSION, so the
+#                      ramp is swept back and forth three times across the strip.
+#   4           tile   `[[0 0.5][0.5 1]](u,v)` — 2-D, one nesting level per axis: a
+#                      bilinear saddle, dark at one corner and bright at the opposite one.
+#   5 (top)     spot   a 3x3 array read at (u,v): a soft bright cross over a dark ground,
+#                      the smallest array that shows 2-D interpolation actually curving.
+#
+# Every one of these desugars to an anonymous `grid` plus a one-line `pattern`, so a
+# literal works in any slot that already accepts `pattern:<name>` — and `grid`/`scatter`
+# remain the spelling to reach for when the data is big, shared, or worth naming.
+#
+# Render:  ftrace -in scenes/pattern_array.ftsl -o png/pattern_array.png -spp 512 -window
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 1.0 }
+material "black" { type diffuse reflect whitewall 0.0 }
+material "wall"  { type diffuse reflect whitewall 0.75 }
+
+material "m_ramp" { type mix  layer "white" 0.5  layer "black" 0.5
+    weight_map [0 1](u)
+}
+material "m_comb" { type mix  layer "white" 0.5  layer "black" 0.5
+    weight_map [0 1 0 1 0 1](u)
+}
+material "m_warp" { type mix  layer "white" 0.5  layer "black" 0.5
+    weight_map [0 1](0.5+0.5*sin(2*pi*3*u))
+}
+material "m_tile" { type mix  layer "white" 0.5  layer "black" 0.5
+    weight_map [[0 0.5][0.5 1]](u,v)
+}
+material "m_spot" { type mix  layer "white" 0.5  layer "black" 0.5
+    weight_map [[0.1 0.6 0.1]
+                [0.6 1.0 0.6]
+                [0.1 0.6 0.1]](u,v)
+}
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material wall }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material wall }   # ceiling
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material wall }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material wall }   # right
+
+quad { origin 0 0.00 0   u 1 0 0   v 0 0.2 0   material m_ramp }
+quad { origin 0 0.20 0   u 1 0 0   v 0 0.2 0   material m_comb }
+quad { origin 0 0.40 0   u 1 0 0   v 0 0.2 0   material m_warp }
+quad { origin 0 0.60 0   u 1 0 0   v 0 0.2 0   material m_tile }
+quad { origin 0 0.80 0   u 1 0 0   v 0 0.2 0   material m_spot }
+
+light area {
+    origin 0.2 0.999 0.2   u 0.6 0 0   v 0 0 0.6   normal 0 -1 0
+    spd    preset:bb6500
+    power  200
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.2   look_at 0.5 0.5 0.0   up 0 1 0   fov_y 40
+    mode R
+    film { res 512 512   iso 100   shutter 1   exposure 1 }
+}

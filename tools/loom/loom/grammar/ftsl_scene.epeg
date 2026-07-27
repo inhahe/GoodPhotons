@@ -30,6 +30,18 @@ COMMENT = /#[^\n]*/ @skip           # `# …` to end of line
 NEWLINE = /\n/                      # significant: delimits statements / blocks
 
 STRING  = /"[^"]*"/                                 # quoted name / path / expression
+# A wholly-parenthesised run — `(u)`, `(u,v)`, `(0.5+0.5*sin(2*pi*u))`.  Carved off
+# the front of WORD ONLY so an array literal's *sample call* has a token type of its
+# own: `[0 1](u)`.  ftrace's tokenizer deliberately does NOT treat parens as
+# delimiters — that is exactly what keeps an expression value like
+# `0.5+0.5*sin(2*pi*8*u)` a single token — so making `(` a delimiter would shatter
+# every expression in the language.  A context-free terminal that matches a token
+# which is ENTIRELY parenthesised (starts '(', ends ')', no delimiter between) names
+# the call position without touching them: longest-match keeps expressions safe,
+# since `(a+b)*c` is 7 chars of WORD against only 5 of PARENWORD, so WORD wins.
+# Declared before KVWORD so the keyword-rebind form `(a=u)` lexes as a call rather
+# than as a `key=val` value continuation.
+PARENWORD = /\([^ \t\r\n{}\[\]#"]*\)/
 # A strtod-complete numeric literal (ftrace's isNumber): a value *continuation*.
 # `0-1` / `1-2` are NOT numbers (strtod stops at the inner dash) — longest-match
 # then makes them plain WORDs, exactly as ftrace's isNumber returns false.
@@ -58,11 +70,11 @@ blank_lines  = NEWLINE*
 
 # ---- parametric record: `NAME = range LO HI [ <lines> ]` -------------
 record_decl  = WORD '=' 'range' range_word* blank_lines record_body
-range_word   = NUMWORD | KVWORD | STRING | WORD
+range_word   = NUMWORD | KVWORD | STRING | WORD | PARENWORD
 record_body  = '[' rec_item* ']'
 rec_item     = NEWLINE | record_line
 record_line  = WORD stop_word*                 # channel name + stop tokens
-stop_word    = NUMWORD | KVWORD | STRING | WORD
+stop_word    = NUMWORD | KVWORD | STRING | WORD | PARENWORD
 
 # ---- spectrum decl: `spectrum "name" [subtype] = <value>` -----------
 # The one block form with an `=` value instead of a brace body.
@@ -85,13 +97,26 @@ key_tok    = WORD | NUMWORD | KVWORD
 
 # parseValue: the record-override `= rhs [i]` form, or a normal value — a first
 # token (any), then continuations (numbers / k=v / strings), an optional
-# `[i]` selector, and an optional trailing nested `{ … }` block.
+# `[…]` bracket group, and an optional trailing nested `{ … }` block.
 value       = override_val | normal_val
 override_val = '=' rhs? selector?
-rhs         = STRING | NUMWORD | KVWORD | WORD
+rhs         = STRING | NUMWORD | KVWORD | WORD | PARENWORD
 normal_val  = val_head? cont* selector? block?
-val_head    = STRING | NUMWORD | KVWORD | WORD
+val_head    = STRING | NUMWORD | KVWORD | WORD | PARENWORD
 cont        = NUMWORD | KVWORD | STRING        # NOT a plain WORD (that ends the value)
-selector    = '[' sel_word* ']'
-sel_word    = NUMWORD | KVWORD | WORD
+# ONE production covers both jobs of `[ … ]` at a value site, because there is only
+# ever one way to read a bracket group here and keeping them merged is what keeps the
+# grammar unambiguous:
+#   * the record-channel STOP SELECTOR, `REC.chan[2]` — a flat run of words that the
+#     reducer folds back into the preceding dotted word; and
+#   * an inline N-D ARRAY LITERAL, `[0 1](u)` / `[[0 1 2][3 4 5]](u,v)` — nesting is
+#     the shape, and the trailing `axistuple` is the *sample call* that says at which
+#     coordinates the array is read.  An uncalled array is legal to write but
+#     `unsaturated`; that error lives in the loader, not here.
+# NEWLINE is a sel_item so a big array literal can be laid out over several lines.
+selector    = '[' sel_item* ']' axistuple?
+sel_item    = NEWLINE | sub_array | sel_word
+sub_array   = '[' sel_item* ']'                # nested axis of an array literal
+sel_word    = NUMWORD | KVWORD | WORD | PARENWORD
+axistuple   = PARENWORD                        # the sample call: `(u)`, `(u,v)`
 block       = '{' body_item* '}'

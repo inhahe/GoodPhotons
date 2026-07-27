@@ -372,6 +372,53 @@ partition of unity, symmetry, the closed-form two-sample weight for several expo
 far-field flattening, and the compile/arity/namespace rules), and
 `scenes/pattern_scatter.ftsl` renders one feature per wall strip.
 
+**Inline array literals — `[0 1](u)`:** most of the tables an author actually writes are
+three numbers long and used exactly once, and giving each of those a name, a block and a
+`pattern` wrapper is more ceremony than content. So an array may be written **where it is
+used**, at any value site that accepts a `pattern:<name>`:
+
+```
+material "m" {
+    type      diffuse
+    reflect   whitewall 0.8
+    roughness [0.05 0.4 0.05](u)                 # 1-D: 3 taps across u
+}
+
+material "n" {
+    type       mix   layer "a" 0.5   layer "b" 0.5
+    weight_map [[0 0.5][0.5 1]](u,v)             # 2-D: one nesting level per axis
+}
+```
+
+Two halves. `[ … ]` is the data and **nesting is the shape** — axis 0 outermost, C order,
+exactly as in a `grid`'s `data { … }` — so a shape is never spelled and cannot disagree
+with the data; the array must be **rectangular** (for irregular data, use a `scatter`).
+`(…)` is the **sample call**: it says at which coordinates the array is read, **one
+coordinate per nesting level**, and each coordinate is a full pattern expression — so
+`[0 1](0.5+0.5*sin(2*pi*3*u))` sweeps the ramp back and forth three times. A literal spans
+the **unit interval on every axis** (0 at the first entry, 1 at the last), which is what
+makes `(u)` / `(u,v)` the natural things to write, and is deliberately *different* from a
+`grid` element's index-lattice default: an inline literal has no domain of its own, whereas
+a standalone grid is a data container whose sample spacing is the meaningful thing.
+
+Write the call with **no spaces inside the parentheses**, and nothing between it and the
+`]`. (ftrace's tokenizer keeps an unquoted expression as a single token — that is what
+makes `0.5+0.5*sin(2*pi*3*u)` legal as a coordinate in the first place — so a space would
+split the call in two.) A space *before* the `(` is fine; the array itself may be laid out
+over several lines.
+
+The call is **not optional**: an array with no call is *unsaturated* and is rejected at
+load time, because an uncalled array has no value. A ragged array, a non-numeric entry and
+a coordinate count that disagrees with the nesting are all load errors too, each naming
+what the author wrote.
+
+Each literal desugars to an anonymous `grid` plus a one-line `pattern` and the value site
+is rewritten to reference it — which is exactly why a literal works in every slot that
+takes a pattern without any of those slots knowing the syntax exists, and why it
+interpolates **N-linearly** just like a grid. The sugar is exact: `scenes/pattern_array.ftsl`
+and a hand-written `grid` + `pattern` twin render bit-for-bit identically. Reach for a
+named `grid`/`scatter` instead when the data is big, shared, or worth naming.
+
 **Scope and loading (both datatypes).** Grids and scatters load before textures, patterns
 and records, so declaration order never matters — including inside a procedural
 `texture { rgb "…" }`, which may sample either. Scope matches `tex:`: both are available

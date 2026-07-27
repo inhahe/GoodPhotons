@@ -59,15 +59,37 @@ inline std::string unquote(const std::string& type, const std::string& value) {
     return value;
 }
 
-// Concatenate a selector's sel_word leaves with no separator (ftrace builds the
-// index string by appending each Word token's text).
-inline std::string selector_index(const PN* selector) {
-    std::string idx;
-    for (const PN* sw : children(selector, "sel_word")) {
-        const PN* t = leaf_of(sw);
-        idx += t->value;
+// Collect a `[ … ]` group's raw item tree (bare words, and nested groups for an N-D
+// array literal's inner axes) WITHOUT interpreting it — ftsl::applyBracketGroup owns
+// that decision for both front ends. `node` is a `selector` or a `sub_array`.
+inline std::vector<ftsl::BrItem> bracket_items(const PN* node) {
+    std::vector<ftsl::BrItem> out;
+    for (const auto& c : node->children) {
+        if (c->name == "sel_item") {
+            for (const auto& g : c->children) {
+                if (g->name == "sub_array") {
+                    ftsl::BrItem it; it.isGroup = true; it.items = bracket_items(g.get());
+                    out.push_back(std::move(it));
+                } else if (g->name == "sel_word") {
+                    ftsl::BrItem it; it.word = leaf_of(g.get())->value;
+                    out.push_back(std::move(it));
+                }
+            }
+        }
     }
-    return idx;
+    return out;
+}
+
+// The trailing sample call on a selector — `(u)`, `(u,v)` — or "" when absent.
+inline std::string selector_call(const PN* selector) {
+    const PN* at = child(selector, "axistuple");
+    return at ? leaf_of(at)->value : std::string();
+}
+
+// Hand the group to the shared decision function (see ftsl::applyBracketGroup).
+inline void apply_selector(ftsl::Value& v, const PN* sel, bool overrideForm) {
+    ftsl::applyBracketGroup(v, bracket_items(sel), selector_call(sel),
+                            (int)sel->first_pos().first, overrideForm);
 }
 
 // ---- forward decls --------------------------------------------------------
@@ -88,12 +110,9 @@ inline ftsl::Value reduce_value(const PN* value_node, const std::string& key) {
         const PN* sel = child(c, "selector");
         if (rhs) {
             const PN* t = leaf_of(rhs);
-            std::string r = unquote(t->name, t->value);
-            if (sel) r += "[" + selector_index(sel) + "]";
-            v.words.push_back(r);
-        } else if (sel && !v.words.empty()) {
-            v.words.back() += "[" + selector_index(sel) + "]";
+            v.words.push_back(unquote(t->name, t->value));
         }
+        if (sel) apply_selector(v, sel, /*overrideForm=*/true);
         return v;
     }
 
@@ -110,10 +129,7 @@ inline ftsl::Value reduce_value(const PN* value_node, const std::string& key) {
         v.words.push_back(unquote(t->name, t->value));
     }
     const PN* sel = child(c, "selector");
-    if (sel && !v.words.empty() &&
-            v.words.back().find('.') != std::string::npos) {
-        v.words.back() += "[" + selector_index(sel) + "]";
-    }
+    if (sel) apply_selector(v, sel, /*overrideForm=*/false);
     const PN* blk = child(c, "block");
     if (blk) {
         std::string btype = key, bname;
@@ -245,6 +261,17 @@ struct Diff {
 inline void diff_value(const ftsl::Value& a, const ftsl::Value& b,
                        const std::string& where, Diff& d);
 
+// Render a bracket item tree back to its source spelling, so a mismatch report shows
+// the shape that actually differs rather than just "arrays differ".
+inline std::string flatten_items(const std::vector<ftsl::BrItem>& items) {
+    std::string s = "[";
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i) s += " ";
+        s += items[i].isGroup ? flatten_items(items[i].items) : items[i].word;
+    }
+    return s + "]";
+}
+
 inline void diff_block(const ftsl::Block& a, const ftsl::Block& b,
                        const std::string& where, Diff& d) {
     if (a.type != b.type) d.add(where, "type '" + a.type + "' != '" + b.type + "'");
@@ -307,6 +334,19 @@ inline void diff_value(const ftsl::Value& a, const ftsl::Value& b,
         d.add(where, "one has a nested block, the other doesn't");
     } else if (a.block && b.block) {
         diff_block(*a.block, *b.block, where + ".block", d);
+    }
+    if (static_cast<bool>(a.array) != static_cast<bool>(b.array)) {
+        d.add(where, "one has an inline array literal, the other doesn't");
+    } else if (a.array && b.array) {
+        if (a.array->call != b.array->call) {
+            d.add(where, "array call '" + a.array->call + "' != '" + b.array->call + "'");
+        }
+        if (a.array->line != b.array->line) {
+            d.add(where, "array line " + std::to_string(a.array->line) +
+                  " != " + std::to_string(b.array->line));
+        }
+        std::string as = flatten_items(a.array->items), bs = flatten_items(b.array->items);
+        if (as != bs) d.add(where, "array shape " + as + " != " + bs);
     }
 }
 

@@ -1701,6 +1701,19 @@ or a native-primitive wrap — see below). Two authoring forms:
   characteristic plateau), and `power` is the locality knob: low values blend broadly,
   high values approach a nearest-neighbour/Voronoi look. Self-test `ftrace -checkscatter`,
   worked example `scenes/pattern_scatter.ftsl`.
+- **Inline array literal** — a tiny table written *where it is used*, with no block, no
+  name and no `pattern` wrapper: `roughness [0.05 0.4 0.05](u)`. The `[ … ]` is the data
+  and **nesting is the shape** (axis 0 outermost, C order, as in a `grid`'s `data`), so a
+  shape is never spelled and cannot disagree with the data; `[[0 0.5][0.5 1]](u,v)` is
+  2-D. The trailing `(…)` is the **sample call** — one coordinate per nesting level, each
+  a full pattern expression (`[0 1](0.5+0.5*sin(2*pi*3*u))` sweeps the ramp back and
+  forth). A literal spans the **unit interval on every axis**, which is what makes `(u)` /
+  `(u,v)` the natural coordinates. The call is required: an *unsaturated* array is a load
+  error, as is a ragged one or a wrong coordinate count. Each literal desugars to an
+  anonymous `grid` + `pattern`, so it works in **every slot that accepts `pattern:<name>`**
+  and interpolates N-linearly exactly like a grid. Worked example
+  `scenes/pattern_array.ftsl`; reach for a named `grid`/`scatter` when the data is big,
+  shared, or worth naming.
 - **Named generator** — `type <gen>` plus params (mirrors material syntax):
 
   | Generator | Parameters | Result |

@@ -177,21 +177,44 @@ Origin tags point at the authoritative design text for each item.
       or a nested `Call`). Argument *order* is intentionally not a grammar rule — the normalizer enforces
       positionals-before-keywords and no-duplicate-formals so the error can name the axis. `as_sampled()` is where
       the **unsaturated** error lives (a bare array reaching a field that samples).
-      **STILL TO DO:** (2) mirror `axistuple` into ftrace's `ftsl_scene.epeg` + the C++ reducer, and reuse the same
-      production on the N-D grid / scatter element grammars. (Increment 3 is now complete on both halves — the
-      regular `grid` in 0.71.0 and the ragged `scatter` in 0.72.0; see the two STATUS blocks above.)
-      **Increment 2 is a lexer decision, not a mechanical port** (found while doing 1): ftrace's tokenizer
-      (`src/ftsl.h` ~line 127) does *not* treat parens as delimiters — a bareword accretes until
-      whitespace/brace/bracket/comment/quote — precisely so an expression value like `0.5+0.5*sin(2*pi*8*u)` stays
-      **one** token. So `reflect [0 1](u)` currently lexes as `… ']' Word("(u)")`, and the trailing Word ends the
-      value and becomes the *next* statement's key. Making `(` a delimiter outright would shatter every expression
-      value in the tree. The minimal fix that doesn't: emit `(` as a delimiter **only immediately after a `]`**,
-      which is exactly the array-call position and can never occur inside an expression word. The `NAME axistuple`
-      half then needs no lexer change at all and arguably wants none — `ramp(u)` is already a single Word and
-      ftrace's expression evaluator already reads `name(args)` as a call, so the NAME form falls out of the
-      existing expression path. This is why the design note below schedules the C++ front-end at the **J3c port**
-      rather than now: with no runtime sampler yet, parsing the tuple early would only move the failure from
-      "syntax error" to "unknown value".
+      (Increment 3 is now complete on both halves — the regular `grid` in 0.71.0 and the ragged `scatter` in
+      0.72.0; see the two STATUS blocks above.)
+    * **STATUS (2026-07-27): increment 2 DONE — ftrace parses and RENDERS `[0 1](u)`. Shipped as 0.73.0.**
+      Inline array literals now work at every value site that accepts a `pattern:<name>`, in **both** front ends.
+      - **No lexer change was needed after all** — the "emit `(` as a delimiter only after a `]`" plan below was
+        dropped, because it is context-sensitive and therefore inexpressible in the shared grammar's regex
+        auto-lexer, and because it turned out to be unnecessary. Instead the grammar gained a context-*free*
+        terminal `PARENWORD = /\([^ \t\r\n{}\[\]#"]*\)/` — a token that is *wholly* parenthesised. Longest-match
+        keeps every expression safe: `(a+b)*c` is 7 chars of `WORD` against only 5 of `PARENWORD`, so `WORD` wins.
+        ftrace's legacy tokenizer needs **zero** changes: a call arrives as an ordinary bareword that happens to
+        start `(` and end `)`, which is exactly what `Parser::takeAxisTuple` tests for.
+      - **One production, both meanings.** `selector = '[' sel_item* ']' axistuple?` (with `sel_item = NEWLINE |
+        sub_array | sel_word`) covers *both* jobs of `[ … ]` at a value site — the record stop selector
+        `REC.chan[2]` and an array literal — so exactly one production starts with `[` there and the grammar stays
+        unambiguous. `NEWLINE` as a `sel_item` lets a big literal be laid out over several lines.
+      - **Neither parser decides what the brackets mean.** Both collect the raw shape into the new
+        `ftsl::BrItem` tree (`ftsl::ArrayLit` = items + call text + line) and hand it to the single shared
+        `ftsl::applyBracketGroup`, which applies the five-rule decision (call ⇒ array; else nesting ⇒ unsaturated
+        array; else a dotted/override predecessor ⇒ stop-selector fold; else all-numeric with nothing before ⇒
+        unsaturated array; else drop). Keeping that decision in one place is what stops the two front ends
+        drifting on the one genuinely ambiguous syntax. `diff_value` now compares `Value::array` too.
+      - **The literal is pure sugar.** `Builder::desugarArrays` (a pre-pass run immediately before Pass 1a) turns
+        each literal into an anonymous `grid "__arrN"` + `pattern "__arrN" { expr "grid:__arrN<call>" }` appended
+        to the block list, and rewrites the site to `pattern:__arrN` — so every slot that already takes a pattern
+        works with **no per-site change**. Nesting is the shape (C order, axis 0 outermost, rectangular enforced);
+        the domain is the **unit box** per axis, deliberately unlike the `grid` element's index-lattice default
+        (an inline literal has no domain of its own and is read at normalized `u`/`v`).
+      - **Errors name what the author wrote**, never the generated `__arrN`: unsaturated (with the "no spaces
+        inside the parentheses" rule spelled out), ragged, mixed numbers/groups, non-numeric entry, coordinate
+        count vs nesting level, literal-follows-another-token, and >4 nested axes.
+      - **Validation:** the corpus sweep is unchanged at ok=362 / mismatch=0 (both front ends still agree on all
+        367 authored scenes), all 11 self-tests pass, and — the decisive one — `scenes/pattern_array.ftsl` and a
+        hand-written `grid` + `pattern` twin (`scraps/array_explicit.ftsl`) render **bit-for-bit identically**,
+        which proves the desugar is exactly the sugar it claims to be. A flat-0.75-twin albedo read-out
+        (`scraps/array_profile.py`) additionally confirms the five strips track the analytic N-linear values.
+      - **Deferred:** the keyword-rebind form `(a=u)` (formals don't exist yet — it currently lexes as a call and
+        would fail in the expression compiler), and `NAME axistuple` (`ramp(u)`), which needs no work because
+        ftrace's expression evaluator already reads `name(args)` as a call.
     * **ADDENDUM — call = sample; late-binding & rebinding of the consumed axis (design intent, user).** The
       trailing `(...)` is not just a *label* on a literal — it is the **sample call**, exactly like loom's
       `grid(x, y)`. Two authoring positions, so a material can *define* what an array consumes, or *defer* it to its

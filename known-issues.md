@@ -112,6 +112,27 @@ already `__host__ __device__` and shared, so only the plumbing is missing), and 
 stub case with real ones that pop `ndim` coordinates. Then drop this entry and the "surface
 patterns only" caveat from FTSL.md.
 
+### TECH-DEBT — OPEN (2026-07-27): spectrum slots don't accept `pattern:<name>`, so `reflect [0 1](u)` is a load error
+
+0.73.0 added inline array literals (`roughness [0 1](u)`, FTSL.md §6.1, example
+`scenes/pattern_array.ftsl`). They desugar to `pattern:__arrN` and therefore work at exactly
+the set of slots that already bind a scalar pattern — which is *narrow*: `bindScalarPattern`
+is called for `roughness`, `film_thickness_map`, `weight_map` and a coat's `roughness`, and
+nothing else. In particular **spectrum-valued slots** (`reflect`, `transmit`, `emit`, …)
+accept a spectrum expression or a `texture:<name>`, but not a pattern — so the natural
+spelling from the design note, `reflect [0 1](u)`, fails with "unrecognized spectrum
+expression". That is a clear error rather than a wrong render, but it is the very example
+the feature was designed around, and the same gap blocks `reflect pattern:p` for a
+hand-written pattern.
+
+**Proper fix:** decide what a *scalar* pattern means in a spectrum slot — the obvious
+reading is a greyscale reflectance, i.e. the pattern's scalar times a flat spectrum, matching
+how `texture:` already greys out — and add that binding beside the existing
+spectrum/`texture:` cases in the material builder (`src/ftsl.h`, `spectrumOf` / the `reflect`
+and `transmit` paths). It should also be honoured by the GPU material upload, which already
+carries per-slot pattern ids for the scalar slots. Then extend `scenes/pattern_array.ftsl`
+with a `reflect [ … ](u)` strip and drop this entry.
+
 ### BUILD BUG — FIXED (2026-07-26): editing a header did not rebuild the `.cu` files, and the linker could then keep a **stale copy of the function you just changed**
 
 **Symptom that exposed it.** A change to `PhotonMap::buildAuto` (a header-inline function in
