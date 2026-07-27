@@ -263,6 +263,121 @@ def test_reads_real_sample_vdb(fname, grids):
         assert box6[3] > box6[0] and box6[4] > box6[1] and box6[5] > box6[2]
 
 
+# ---- rotated / general AffineMap transforms (E4) --------------------------
+def _rot_z(deg):
+    """Index->world map: rotate `deg` about Z, scale 0.1, offset to (1,2,3)."""
+    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
+    k = 0.1
+    return vdbio.VdbTransform((k * c, -k * s, 0.0,
+                               k * s,  k * c, 0.0,
+                               0.0,    0.0,   k), (1.0, 2.0, 3.0))
+
+
+def test_transform_diagonal_detection():
+    diag = vdbio.VdbTransform.diagonal((2.0, 3.0, 4.0), (1.0, 0.0, -1.0))
+    assert diag.is_diagonal
+    assert diag.scale == (2.0, 3.0, 4.0)
+    assert diag.apply(1, 1, 1) == (3.0, 3.0, 3.0)
+    assert not _rot_z(30).is_diagonal
+    # A 90-degree rotation is *not* diagonal even though cos(90)~0 -- the
+    # off-diagonals carry the whole map.
+    assert not _rot_z(90).is_diagonal
+
+
+def test_diagonal_tolerance_ignores_float_crumbs():
+    # A DCC composing a 180-degree rotation in floating point leaves ~1e-17 in
+    # the off-diagonals; that must still read as axis-aligned, not rotated.
+    eps = 1e-17
+    t = vdbio.VdbTransform((0.5, eps, 0.0, eps, 0.5, 0.0, 0.0, 0.0, 0.5),
+                           (0.0, 0.0, 0.0))
+    assert t.is_diagonal
+
+
+def test_voxel_size_is_rotation_invariant():
+    # Column norms are the true index-step lengths; the bare diagonal is not.
+    for deg in (0.0, 30.0, 90.0):
+        vs = _rot_z(deg).voxel_size
+        for v in vs:
+            assert abs(v - 0.1) < 1e-12
+
+
+def test_rotated_grid_roundtrips_through_affinemap():
+    vol = _blob(16, 16, 16)
+    xform = _rot_z(30)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "rot.vdb")
+        vdbio.write_vdb(path, [vdbio.VolumeGrid("density", vol, transform=xform)])
+        back = vdbio.read_vdb_grids(path)
+    g = back["density"]
+    sub, lo, _hi = _positive_subbox(vol)
+    assert g.values.shape == sub.shape
+    assert float(np.abs(g.values - sub).max()) == 0.0    # samples untouched by rotation
+    assert tuple(g.index_lo) == tuple(int(v) for v in lo)
+    assert not g.transform.is_diagonal
+    for a, b in zip(g.transform.a, xform.a):
+        assert abs(a - b) < 1e-12
+    for a, b in zip(g.transform.t, xform.t):
+        assert abs(a - b) < 1e-12
+    # The decisive check: array offset (0,0,0) lands where the original map
+    # sends its index, rotation included.
+    for w, e in zip(g.world_of(0, 0, 0), xform.apply(*lo)):
+        assert abs(w - e) < 1e-9
+
+
+def test_rotated_grid_has_no_axis_aligned_box():
+    vol = _blob(16, 16, 16)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "rot.vdb")
+        vdbio.write_vdb(path, [vdbio.VolumeGrid("density", vol, transform=_rot_z(30))])
+        # read_vdb must refuse rather than hand back a box that misplaces voxels
+        with pytest.raises(ValueError, match="rotated"):
+            vdbio.read_vdb(path)
+        g = vdbio.read_vdb_grids(path)["density"]      # the full-fidelity read works
+    assert g.values.ndim == 3
+
+
+def test_unrotated_affinemap_still_yields_a_box():
+    # An AffineMap that happens to be diagonal is a legal, common file; it must
+    # come back through the plain read_vdb path with the right box.
+    vol = _blob(16, 16, 16)
+    xform = vdbio.VdbTransform.diagonal((0.25, 0.25, 0.25), (-1.0, -2.0, -3.0))
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "aff.vdb")
+        vdbio.write_vdb(path, [vdbio.VolumeGrid("density", vol, transform=xform)])
+        arr, box6 = vdbio.read_vdb(path)["density"]
+    _, lo, hi = _positive_subbox(vol)
+    exp = xform.apply(*lo) + xform.apply(*hi)
+    for a, b in zip(box6, exp):
+        assert abs(a - b) < 1e-9
+
+
+def test_read_vdb_grids_matches_read_vdb_on_diagonal_files():
+    # The two entry points must not drift: read_vdb is defined as read_vdb_grids
+    # plus `.box`, so every diagonal file has to agree exactly.
+    vol = _blob(20, 20, 20)
+    box = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "blob.vdb")
+        vdbio.write_vdb(path, [vdbio.VolumeGrid("density", vol, box)])
+        pairs = vdbio.read_vdb(path)
+        grids = vdbio.read_vdb_grids(path)
+    assert set(pairs) == set(grids)
+    arr, box6 = pairs["density"]
+    g = grids["density"]
+    assert float(np.abs(arr - g.values).max()) == 0.0
+    assert box6 == g.box
+    assert g.transform.is_diagonal
+
+
+def test_volumegrid_requires_exactly_one_placement():
+    vol = _blob(8, 8, 8)
+    with pytest.raises(ValueError, match="exactly one"):
+        vdbio.VolumeGrid("d", vol)
+    with pytest.raises(ValueError, match="exactly one"):
+        vdbio.VolumeGrid("d", vol, (0, 0, 0, 1, 1, 1),
+                         transform=vdbio.VdbTransform.diagonal((1, 1, 1), (0, 0, 0)))
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -35,19 +35,39 @@ field's negative lobe is not represented.
 
 The companion :func:`read_vdb` parses back everything this module writes plus a
 useful slice of what real DCC tools emit: ACTIVE_MASK / full-float / half / ZIP
-/ **blosc** value codecs, over the diagonal transform maps (Scale, Translate and
-their combinations).  It does **not** decode a rotated ``AffineMap`` (can't land
-on an axis-aligned dense array) or ``.nvdb``.
+/ **blosc** value codecs, over every **linear** transform map — the diagonal ones
+(Scale, Translate and their combinations) and the general ``AffineMap`` /
+``UnitaryMap``.  It does not read ``.nvdb``.
+
+Rotated grids
+-------------
+A rotated ``AffineMap`` does not change the *samples* — an OpenVDB tree is always
+a regular lattice in **index** space, and the map only says where that lattice
+sits in the world.  So the dense array is unaffected; what a rotation breaks is
+only the axis-aligned ``box6`` that :func:`read_vdb` returns, which cannot
+express a tilted lattice.
+
+Hence the two entry points:
+
+* :func:`read_vdb` → ``{name: (array, box6)}``.  Unchanged, and still **rejects**
+  a rotated map — returning an axis-aligned box for a tilted grid would silently
+  misplace every voxel, which is worse than an error.
+* :func:`read_vdb_grids` → ``{name: ReadGrid}``, carrying the index-space array,
+  its index origin and the full :class:`VdbTransform`.  This reads *any* linear
+  map, so it is the way to ingest a rotated grid (mirroring ftrace's
+  ``readTransform``, which has always accepted ``AffineMap``/``UnitaryMap``).
 """
 
 from __future__ import annotations
 
 import io
+import math
 import struct
 import zlib
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-__all__ = ["write_vdb", "read_vdb", "bake_field", "write_volume", "VolumeGrid"]
+__all__ = ["write_vdb", "read_vdb", "read_vdb_grids", "bake_field",
+           "write_volume", "VolumeGrid", "VdbTransform", "ReadGrid"]
 
 # ---- OpenVDB file-format constants (mirror src/vdb_openvdb.cpp) -----------
 _MAGIC = 0x56444220            # "VDB " in the low 32 bits of the int64 magic
@@ -63,6 +83,140 @@ _GRID_TYPE = "Tree_float_5_4_3"
 _HALF_SUFFIX = "_HalfFloat"   # grid-type suffix flagging 16-bit half storage
 
 Box = Tuple[float, float, float, float, float, float]
+
+# Off-diagonal magnitude (relative to the row scale) below which a map counts as
+# axis-aligned.  Not zero, because a DCC that composes a 0°/90°/180° rotation in
+# floating point writes ~1e-17 crumbs into the off-diagonals; treating those as a
+# real rotation would reject grids that are exactly axis-aligned in intent.
+_DIAG_TOL = 1e-12
+
+
+class VdbTransform:
+    """The grid's **index → world** affine: ``world = A · index + t``.
+
+    ``a`` is the 3×3 linear part, **row-major** (``a[row * 3 + col]``), and ``t``
+    is the world position of index ``(0, 0, 0)``.  Every OpenVDB linear map
+    reduces to this pair, so one representation covers Scale / Translate /
+    ScaleTranslate / Affine / Unitary alike — matching ftrace's ``readTransform``
+    (``src/vdb_openvdb.cpp``), which fills exactly the same ``A``/``T``.
+
+    Note OpenVDB serialises an ``AffineMap`` in **row-vector** convention
+    (``world = index · M``); the column-vector ``A`` above is that matrix
+    transposed, which is what the reader stores.
+    """
+
+    __slots__ = ("a", "t")
+
+    def __init__(self, a: Sequence[float], t: Sequence[float]) -> None:
+        if len(a) != 9 or len(t) != 3:
+            raise ValueError("VdbTransform needs a 9-element matrix and a 3-vector")
+        self.a = tuple(float(v) for v in a)
+        self.t = tuple(float(v) for v in t)
+
+    @classmethod
+    def diagonal(cls, scale: Sequence[float], offset: Sequence[float]) -> "VdbTransform":
+        """The axis-aligned case: per-axis ``scale`` about ``offset``."""
+        sx, sy, sz = (float(v) for v in scale)
+        return cls((sx, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, sz), offset)
+
+    @property
+    def is_diagonal(self) -> bool:
+        """True when the lattice stays axis-aligned (no rotation or shear).
+
+        Compared against each row's own scale so the test is unit-free: a grid
+        measured in metres and the same grid in millimetres agree.
+        """
+        a = self.a
+        for r in range(3):
+            row = a[r * 3:r * 3 + 3]
+            mag = max(abs(v) for v in row)
+            if mag == 0.0:
+                continue
+            for cidx, v in enumerate(row):
+                if cidx != r and abs(v) > _DIAG_TOL * mag:
+                    return False
+        return True
+
+    @property
+    def scale(self) -> Tuple[float, float, float]:
+        """Per-axis voxel size — the diagonal of ``a``.
+
+        Meaningful on its own only when :attr:`is_diagonal`; on a rotated map it
+        is just the diagonal, not the lattice spacing (use :attr:`voxel_size`).
+        """
+        return (self.a[0], self.a[4], self.a[8])
+
+    @property
+    def voxel_size(self) -> Tuple[float, float, float]:
+        """World length of one index step along each axis — the column norms of
+        ``a``.  Correct under rotation, where the diagonal alone is not."""
+        return tuple(math.sqrt(self.a[c] ** 2 + self.a[3 + c] ** 2 + self.a[6 + c] ** 2)
+                     for c in range(3))
+
+    def apply(self, i: float, j: float, k: float) -> Tuple[float, float, float]:
+        """Map one index coordinate to world."""
+        a, t = self.a, self.t
+        return (a[0] * i + a[1] * j + a[2] * k + t[0],
+                a[3] * i + a[4] * j + a[5] * k + t[1],
+                a[6] * i + a[7] * j + a[8] * k + t[2])
+
+    def __repr__(self) -> str:            # pragma: no cover - debugging aid
+        kind = "diagonal" if self.is_diagonal else "rotated"
+        return f"VdbTransform({kind}, scale={self.voxel_size}, t={self.t})"
+
+
+class ReadGrid:
+    """One grid parsed out of a ``.vdb`` by :func:`read_vdb_grids`.
+
+    ``values`` is dense in **index** space — ``values[di, dj, dk]`` is the voxel
+    at index ``index_lo + (di, dj, dk)``.  Keeping it in index space is what lets
+    a rotated grid come back at all: the samples are a regular lattice either
+    way, and only :attr:`transform` knows where that lattice lies in the world.
+    """
+
+    __slots__ = ("name", "values", "index_lo", "transform")
+
+    def __init__(self, name: str, values, index_lo: Tuple[int, int, int],
+                 transform: VdbTransform) -> None:
+        self.name = name
+        self.values = values
+        self.index_lo = tuple(int(v) for v in index_lo)
+        self.transform = transform
+
+    @property
+    def shape(self) -> Tuple[int, int, int]:
+        return tuple(self.values.shape)
+
+    @property
+    def index_hi(self) -> Tuple[int, int, int]:
+        """Inclusive upper index corner."""
+        return tuple(lo + n - 1 for lo, n in zip(self.index_lo, self.shape))
+
+    def world_of(self, di: int, dj: int, dk: int) -> Tuple[float, float, float]:
+        """World position of the sample at *array* offset ``(di, dj, dk)``."""
+        lo = self.index_lo
+        return self.transform.apply(lo[0] + di, lo[1] + dj, lo[2] + dk)
+
+    @property
+    def box(self) -> Box:
+        """The axis-aligned world box of the sample range (corners inclusive).
+
+        Raises for a rotated grid, where no axis-aligned box describes the
+        lattice — an approximate one would silently misplace every voxel.
+        """
+        if not self.transform.is_diagonal:
+            raise ValueError(
+                f"read_vdb: grid '{self.name}' has a rotated transform, so it has no "
+                "axis-aligned world box; use read_vdb_grids() and read .transform "
+                "(index -> world) instead of read_vdb()")
+        lo, hi = self.index_lo, self.index_hi
+        x0, y0, z0 = self.transform.apply(*lo)
+        x1, y1, z1 = self.transform.apply(*hi)
+        return (x0, y0, z0, x1, y1, z1)
+
+    def __repr__(self) -> str:            # pragma: no cover - debugging aid
+        return (f"ReadGrid({self.name!r}, shape={self.shape}, "
+                f"index_lo={self.index_lo}, {self.transform!r})")
 
 
 # ---- little helpers -------------------------------------------------------
@@ -225,29 +379,43 @@ def _write_internal_buffers(buf: io.BytesIO, node: _Node,
             _write_internal_buffers(buf, node.children[off], True, compression, half)
 
 
-def _serialize_body(vol, box: Box, compression: int = _COMPRESS_ACTIVE_MASK,
-                    half: bool = False) -> bytes:
+def _serialize_body(vol, box: Optional[Box], compression: int = _COMPRESS_ACTIVE_MASK,
+                    half: bool = False,
+                    transform: Optional[VdbTransform] = None) -> bytes:
     nx, ny, nz = vol.shape
-    x0, y0, z0, x1, y1, z1 = (float(v) for v in box)
-
-    def _scale(lo, hi, n):
-        if n > 1:
-            return (hi - lo) / (n - 1)
-        return (hi - lo) or 1.0
-
-    sx, sy, sz = _scale(x0, x1, nx), _scale(y0, y1, ny), _scale(z0, z1, nz)
 
     body = io.BytesIO()
     body.write(struct.pack("<I", compression))
     body.write(struct.pack("<I", 0))                        # grid metamap: empty
-    # transform: ScaleTranslateMap (world = scale·index + translation)
-    _w_str(body, "ScaleTranslateMap")
-    body.write(struct.pack("<3d", x0, y0, z0))              # translation
-    body.write(struct.pack("<3d", sx, sy, sz))              # scale
-    body.write(struct.pack("<3d", sx, sy, sz))              # voxelSize (skipped)
-    body.write(struct.pack("<3d", 1.0 / sx, 1.0 / sy, 1.0 / sz))
-    body.write(struct.pack("<3d", 1.0 / sx**2, 1.0 / sy**2, 1.0 / sz**2))
-    body.write(struct.pack("<3d", 0.5 / sx, 0.5 / sy, 0.5 / sz))
+    if transform is not None:
+        # A general linear map, written as an AffineMap: a 4x4 of doubles in
+        # OpenVDB's ROW-VECTOR convention (world = index . M), so M's upper-left
+        # 3x3 is the transpose of our column-vector `a` and its last row is the
+        # translation.  Read back by _read_map and by ftrace's readTransform.
+        a, t = transform.a, transform.t
+        _w_str(body, "AffineMap")
+        body.write(struct.pack("<16d",
+                               a[0], a[3], a[6], 0.0,
+                               a[1], a[4], a[7], 0.0,
+                               a[2], a[5], a[8], 0.0,
+                               t[0], t[1], t[2], 1.0))
+    else:
+        x0, y0, z0, x1, y1, z1 = (float(v) for v in box)
+
+        def _scale(lo, hi, n):
+            if n > 1:
+                return (hi - lo) / (n - 1)
+            return (hi - lo) or 1.0
+
+        sx, sy, sz = _scale(x0, x1, nx), _scale(y0, y1, ny), _scale(z0, z1, nz)
+        # transform: ScaleTranslateMap (world = scale·index + translation)
+        _w_str(body, "ScaleTranslateMap")
+        body.write(struct.pack("<3d", x0, y0, z0))          # translation
+        body.write(struct.pack("<3d", sx, sy, sz))          # scale
+        body.write(struct.pack("<3d", sx, sy, sz))          # voxelSize (skipped)
+        body.write(struct.pack("<3d", 1.0 / sx, 1.0 / sy, 1.0 / sz))
+        body.write(struct.pack("<3d", 1.0 / sx**2, 1.0 / sy**2, 1.0 / sz**2))
+        body.write(struct.pack("<3d", 0.5 / sx, 0.5 / sy, 0.5 / sz))
     # tree
     body.write(struct.pack("<i", 1))                        # bufferCount
     body.write(struct.pack("<f", 0.0))                      # background
@@ -267,18 +435,36 @@ def _serialize_body(vol, box: Box, compression: int = _COMPRESS_ACTIVE_MASK,
 class VolumeGrid:
     """A named dense scalar grid: ``values`` is an (nx,ny,nz) array, ``box`` is
     the world-space extent ``(x0,y0,z0,x1,y1,z1)`` the samples span (corners
-    inclusive)."""
+    inclusive).
 
-    def __init__(self, name: str, values, box: Box):
+    Pass ``transform=`` (a :class:`VdbTransform`) instead of ``box`` to place the
+    lattice with a general index→world affine — the way to write a **rotated**
+    grid, which no axis-aligned ``box`` can express.  ``box`` is then derived for
+    reference but the transform is what gets serialised.
+    """
+
+    def __init__(self, name: str, values, box: Optional[Box] = None, *,
+                 transform: Optional[VdbTransform] = None):
         import numpy as np
         self.name = str(name)
         self.values = np.ascontiguousarray(values, dtype="<f4")
         if self.values.ndim != 3:
             raise ValueError("VolumeGrid values must be a 3-D (nx,ny,nz) array")
+        if (box is None) == (transform is None):
+            raise ValueError("VolumeGrid needs exactly one of box= or transform=")
+        self.transform = transform
+        if box is None:
+            # Index 0..n-1 under the given map.  Only meaningful (and only
+            # reported) when the map is axis-aligned; a rotated grid has no box.
+            nx, ny, nz = self.values.shape
+            lo = transform.apply(0, 0, 0)
+            hi = transform.apply(nx - 1, ny - 1, nz - 1)
+            self.box: Optional[Box] = (lo + hi) if transform.is_diagonal else None
+            return
         b = tuple(float(v) for v in box)
         if len(b) != 6:
             raise ValueError("box must be a 6-tuple (x0,y0,z0,x1,y1,z1)")
-        self.box: Box = b  # type: ignore[assignment]
+        self.box = b  # type: ignore[assignment]
 
 
 def write_vdb(path: str, grids: Sequence[VolumeGrid], *,
@@ -316,7 +502,8 @@ def write_vdb(path: str, grids: Sequence[VolumeGrid], *,
     compression = (_COMPRESS_ACTIVE_MASK
                    | (_COMPRESS_ZIP if zip else 0)
                    | (_COMPRESS_BLOSC if blosc else 0))
-    bodies = [_serialize_body(g.values, g.box, compression, half) for g in grids]
+    bodies = [_serialize_body(g.values, g.box, compression, half, g.transform)
+              for g in grids]
     gtype = _GRID_TYPE + (_HALF_SUFFIX if half else "")
 
     # header
@@ -516,6 +703,40 @@ def _read_values(c: _Cur, dest_count: int, value_mask: bytes, background: float,
     return dest
 
 
+def _read_map(g: "_Cur") -> VdbTransform:
+    """``Transform::read`` → the index→world affine.
+
+    Byte layouts mirror ftrace's ``readTransform`` (``src/vdb_openvdb.cpp``) so
+    the two readers agree grid-for-grid; every linear map OpenVDB emits reduces
+    to one 3×3 + offset.
+    """
+    map_type = g.string()
+    if map_type in ("ScaleTranslateMap", "UniformScaleTranslateMap"):
+        t = (g.f64(), g.f64(), g.f64())
+        s = (g.f64(), g.f64(), g.f64())
+        for _ in range(12):
+            g.f64()                                 # voxelSize, inverses
+        return VdbTransform.diagonal(s, t)
+    if map_type in ("UniformScaleMap", "ScaleMap"):
+        s = (g.f64(), g.f64(), g.f64())             # scale first, no offset
+        for _ in range(12):
+            g.f64()
+        return VdbTransform.diagonal(s, (0.0, 0.0, 0.0))
+    if map_type == "TranslationMap":
+        t = (g.f64(), g.f64(), g.f64())             # offset only, unit scale
+        return VdbTransform.diagonal((1.0, 1.0, 1.0), t)
+    if map_type in ("AffineMap", "UnitaryMap"):
+        # A full 4x4 of doubles in OpenVDB's ROW-VECTOR convention (world =
+        # index . M), so the column-vector linear part is the transpose of M's
+        # upper-left 3x3 and the translation is its last row.
+        m = [g.f64() for _ in range(16)]
+        return VdbTransform((m[0], m[4], m[8],
+                             m[1], m[5], m[9],
+                             m[2], m[6], m[10]),
+                            (m[12], m[13], m[14]))
+    raise ValueError(f"read_vdb: unsupported transform map '{map_type}'")
+
+
 def read_vdb(path: str) -> Dict[str, Tuple["object", Box]]:
     """Parse a ``.vdb`` back into ``{name: (dense_array, box6)}``.
 
@@ -523,7 +744,22 @@ def read_vdb(path: str) -> Dict[str, Tuple["object", Box]]:
     (``COMPRESS_ZIP``, zlib) and **blosc** (``COMPRESS_BLOSC``, via the ``blosc``
     package) value codecs over the diagonal transform maps (Scale / Translate /
     UniformScale and their combinations).  A blosc grid without the ``blosc``
-    package, or a rotated ``AffineMap``, raises with a clear message."""
+    package raises with a clear message.
+
+    A **rotated** grid has no axis-aligned ``box6``, so it raises here too —
+    use :func:`read_vdb_grids`, which returns the index→world transform instead.
+    """
+    return {name: (gr.values, gr.box) for name, gr in read_vdb_grids(path).items()}
+
+
+def read_vdb_grids(path: str) -> Dict[str, ReadGrid]:
+    """Parse a ``.vdb`` into ``{name: ReadGrid}`` — the full-fidelity read.
+
+    Same value codecs as :func:`read_vdb`, but every **linear** transform map is
+    accepted (including a rotated ``AffineMap``/``UnitaryMap``), because the
+    samples come back in **index** space with the map carried alongside rather
+    than being folded into an axis-aligned box.
+    """
     import numpy as np
     with open(path, "rb") as f:
         buf = f.read()
@@ -546,7 +782,7 @@ def read_vdb(path: str) -> Dict[str, Tuple["object", Box]]:
     _LEAF_DY = (_off >> 3) & 7
     _LEAF_DZ = _off & 7
 
-    out: Dict[str, Tuple[object, Box]] = {}
+    out: Dict[str, ReadGrid] = {}
     for _ in range(grid_count):
         # OpenVDB "unique names" append 0x1e + instance index to disambiguate
         # duplicates — strip it back to the authored grid name.
@@ -564,28 +800,10 @@ def read_vdb(path: str) -> Dict[str, Tuple["object", Box]]:
         compression = g.u32()                               # compression flags
         for _ in range(g.u32()):                            # grid metamap
             g.skip_meta()
-        # Transform: the diagonal (axis-aligned) maps that keep the samples on a
-        # regular lattice.  A rotated AffineMap can't project onto loom's dense
-        # array, so it's rejected.  (Byte layouts mirror ftrace's readTransform.)
-        map_type = g.string()
-        tx = ty = tz = 0.0
-        sx = sy = sz = 1.0
-        if map_type in ("ScaleTranslateMap", "UniformScaleTranslateMap"):
-            tx, ty, tz = g.f64(), g.f64(), g.f64()
-            sx, sy, sz = g.f64(), g.f64(), g.f64()
-            for _ in range(12):
-                g.f64()                                     # voxelSize, inverses
-        elif map_type in ("UniformScaleMap", "ScaleMap"):
-            sx, sy, sz = g.f64(), g.f64(), g.f64()          # scale first, no offset
-            for _ in range(12):
-                g.f64()
-        elif map_type == "TranslationMap":
-            tx, ty, tz = g.f64(), g.f64(), g.f64()          # offset only, unit scale
-        else:
-            raise ValueError(
-                f"read_vdb: unsupported map '{map_type}' "
-                "(only diagonal scale/translate maps; a rotated AffineMap "
-                "can't be read onto an axis-aligned dense grid)")
+        # Transform: any linear map.  The tree is a regular lattice in INDEX
+        # space regardless, so a rotation costs the samples nothing — it only
+        # means the caller must read `.transform` rather than `.box`.
+        xform = _read_map(g)
         g.i32()                                             # bufferCount
         background = g.f32()
         num_tiles = g.u32()
@@ -667,9 +885,6 @@ def read_vdb(path: str) -> Dict[str, Tuple["object", Box]]:
         nx = hi[0] - lo[0] + 1; ny = hi[1] - lo[1] + 1; nz = hi[2] - lo[2] + 1
         arr = np.zeros((nx, ny, nz), dtype=np.float64)
         arr[xs - lo[0], ys - lo[1], zs - lo[2]] = vs
-        # world box of the active index range [lo, hi] (samples, corners incl.)
-        box6 = (tx + lo[0] * sx, ty + lo[1] * sy, tz + lo[2] * sz,
-                tx + hi[0] * sx, ty + hi[1] * sy, tz + hi[2] * sz)
-        out[name] = (arr, box6)
+        out[name] = ReadGrid(name, arr, lo, xform)
         c.p = end_pos                                       # next descriptor
     return out

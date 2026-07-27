@@ -1320,8 +1320,23 @@ density+temperature, `_sphere.vdb`/`_cube.vdb` UniformScaleMap level sets all re
   reader's per-voxel mask-expand + dense-fill loops were **vectorised** (numpy `unpackbits` + boolean scatter,
   bit-identical) — reading all four real samples dropped ~20 s → 2.8 s. 13 new tests (995 loom green).
 
-**Still open:** rotated `AffineMap`; **Vec3** grids; ingesting `.nvdb`; sparse-storage transforms; and
-resampling sparse↔dense.
+**Rotated `AffineMap` — DONE 2026-07-26.** loom now decodes (and writes) every OpenVDB *linear* map,
+closing a real asymmetry: ftrace's `readTransform` has always accepted `AffineMap`/`UnitaryMap` and
+genuinely honours them (it inverts the 3×3 for world→index sampling and AABBs the index box's 8 corners),
+while loom rejected them. The key realisation is that **a rotation costs the samples nothing** — an
+OpenVDB tree is a regular lattice in *index* space either way, and the map only says where that lattice
+sits — so the dense array is unaffected and the only casualty is the axis-aligned `box6`. That drove the
+API shape: `read_vdb(path)` keeps returning `{name: (array, box6)}` and still **refuses** a rotated grid
+(handing back an approximate box would silently misplace every voxel — the failure mode this project keeps
+choosing against), while the new `read_vdb_grids(path)` returns `{name: ReadGrid}` with the index-space
+array, its `index_lo`, and the full `VdbTransform` (`world = A·index + t`, mirroring ftrace's `A`/`T`).
+`VolumeGrid(name, values, transform=…)` writes one back out as an `AffineMap`, so the path round-trips.
+`is_diagonal` measures each off-diagonal against its own row's scale — unit-free, and tolerant of the
+~1e-17 crumbs a DCC leaves when it composes a 90°/180° rotation in floating point. 8 new tests (1095 loom
+green) plus an ftrace interop check: one asymmetric L-shaped volume written twice, diagonal vs 45°-about-Y
+(`scraps/vdb_rot_make.py`), renders visibly rotated in ftrace with identical voxels.
+
+**Still open:** **Vec3** grids; ingesting `.nvdb`; sparse-storage transforms; and resampling sparse↔dense.
 
 ### E5 — Axis-typed signals: one influence model (broadcast / pointwise / reduce) + mod·pin + sample·select grammar  *(loom; LARGE, design; unifies E2/E4 and records-5a)*
 **Idea / decision (design-captured 2026-07-18, from a design bounce).** The whole "what can modulate what,
@@ -2895,6 +2910,20 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-26: **E4 — loom reads and writes rotated `.vdb` transforms.** Closed a real loom↔ftrace
+  asymmetry: ftrace's `readTransform` has always accepted `AffineMap`/`UnitaryMap` and honours them
+  properly (inverting the 3×3 for world→index sampling, AABB'ing the index box's 8 corners), while loom's
+  reader rejected them outright. The insight that shaped the API: **a rotation costs the samples nothing**
+  — an OpenVDB tree is a regular lattice in *index* space regardless — so the dense array is untouched and
+  only the axis-aligned `box6` is inexpressible. So `read_vdb` is unchanged and still refuses a rotated
+  grid (an approximate box would silently misplace every voxel), and the new `read_vdb_grids` returns
+  `ReadGrid` records carrying the index-space array + `index_lo` + a full `VdbTransform`; `VolumeGrid(…,
+  transform=…)` writes one as an `AffineMap`. Refactoring the map decode into `_read_map` left all 19
+  pre-existing tests passing untouched, incl. the four real third-party sample files and the
+  byte-for-byte default-output assertion. 8 new tests (1095 loom green); ftrace interop verified by
+  rendering one asymmetric L-shaped volume diagonal vs 45°-about-Y (`scraps/vdb_rot_make.py` →
+  `png/vdbrot/{flat,rot}.png`) — identical voxels, visibly rotated. loom `DESIGN.md`'s E4 entry was also
+  stale from before the codec work and is now current.
 - 2026-07-26: **0.77.0 — the loader reports unknown keys, and J3c's emitter-drift audit is closed with it.**
   The audit ("check every `Element.emit` against the live grammar") could not be done by reading code: ftrace
   silently ignored any key no builder read, so drift produces a *wrong image* rather than an error. Built the

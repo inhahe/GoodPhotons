@@ -550,24 +550,44 @@ tools/loom/
   accuracy, 2-manifold edges, adaptive==dense, fewer evals, empty-box, callable+SpatialExpr,
   morphing field, IsoMesh emit/static-cache/roots). Demo: `examples/mesh_bake.py` (a breathing
   smooth-min metaball union baked per frame; still validated in ftrace).
-- **E4 (write side) — Volume output to `.vdb`.** ✅ done (`loom/vdbio.py`). Bake any loom
-  field to a dense lattice and serialise it as a **loom-native OpenVDB `.vdb`** grid that
-  ftrace ingests directly (`density vdb:<path>` / `temperature vdb:<path>`). Format is the
-  uncompressed subset ftrace's own reader (`src/vdb_openvdb.cpp`) accepts: `Tree_float_5_4_3`,
-  `COMPRESS_ACTIVE_MASK` only (no blosc/ZIP/half), full float32, `ScaleTranslateMap` matching
-  numpy `linspace` endpoint-inclusive bakes — so **no OpenVDB/NanoVDB dependency** on either
-  end. API: `write_vdb(path, [VolumeGrid(name, values, box), …])` (multi-grid dense writer;
-  positive voxels vectorised into 8³ leaves under Internal<4>/<5>, empty leaves dropped),
-  `bake_field(field, box, res)` (field/isosurface/callable → dense `<f4` + world box, reusing
-  the `mcubes` samplers), `write_volume(path, *, box, res, **fields)` (bake several named fields
-  over one box/res → named grids, e.g. a `density`+`temperature` fire pair), and `read_vdb(path)`
-  (parses back loom's own written subset for round-tripping — **not** arbitrary third-party
-  `.vdb`). Round-trip is **bit-exact** (full float32). Tests: `tests/test_vdbio.py` (bit-exact
-  round-trip, world-box↔linspace positions, multi-grid named selection, sparse-empty-leaf drop,
-  duplicate-name rejection, bake+write). Cross-validated through ftrace on CPU+GPU
-  (`scraps/make_loom_vdb.py` → `scraps/loom_smoke.vdb`, rendered by `scraps/loom_vdb.ftsl`;
-  sparse device path `1000/1000 bricks active`, energy `sum/emitted=1.000000`). Still open: the
-  general *read* side (arbitrary `.vdb`/`.nvdb`, blosc/half) and sparse-storage transforms.
+- **E4 — Volume `.vdb` write *and* read.** ✅ done (`loom/vdbio.py`). Bake any loom field to a
+  dense lattice and serialise it as a **loom-native OpenVDB `.vdb`** grid that ftrace ingests
+  directly (`density vdb:<path>` / `temperature vdb:<path>`), and read back both loom's own
+  output and a useful slice of what real DCC tools emit — with **no OpenVDB/NanoVDB dependency**
+  on either end. Tree is `Tree_float_5_4_3` (positive voxels vectorised into 8³ leaves under
+  Internal<4>/<5>, empty leaves dropped).
+  - **Write API:** `write_vdb(path, [VolumeGrid(name, values, box|transform=…), …])`,
+    `bake_field(field, box, res)` (field/isosurface/callable → dense `<f4` + world box, reusing
+    the `mcubes` samplers), `write_volume(path, *, box, res, **fields)` (several named fields
+    over one box/res, e.g. a `density`+`temperature` fire pair). Codecs: `COMPRESS_ACTIVE_MASK`
+    always, optionally `half=` (16-bit, `_HalfFloat` grid type), `zip=` (interchange only —
+    ftrace has no ZIP) or `blosc=` (DCC-standard, and on ftrace's render path). Defaults are
+    **byte-for-byte** the original ACTIVE_MASK/float32 output (test-asserted).
+  - **Read API — two entry points, because the return type is the whole question.**
+    `read_vdb(path)` → `{name: (array, box6)}` as always; `read_vdb_grids(path)` →
+    `{name: ReadGrid}` carrying the index-space array, its `index_lo`, and the full
+    `VdbTransform` (index→world `A·i + t`, mirroring ftrace's `readTransform`).
+  - **Transforms.** All of OpenVDB's linear maps are decoded: the diagonal ones (Scale /
+    Translate / UniformScale and combinations) and the general `AffineMap`/`UnitaryMap`.
+    A **rotation costs the samples nothing** — an OpenVDB tree is a regular lattice in *index*
+    space regardless, and the map only says where that lattice sits — so the dense array is
+    unaffected and only the axis-aligned `box6` becomes inexpressible. Hence `read_vdb` still
+    **rejects** a rotated grid (an approximate box would silently misplace every voxel, the
+    worst failure mode) while `read_vdb_grids` reads it fine. `VolumeGrid(…, transform=…)`
+    writes one, as an `AffineMap`. `is_diagonal` compares each off-diagonal against its own
+    row's scale, so it is unit-free and tolerates the ~1e-17 crumbs a DCC leaves when it
+    composes a 90°/180° rotation in floating point.
+  - **Tests:** `tests/test_vdbio.py` (27) — bit-exact round-trip, world-box↔linspace positions,
+    multi-grid named selection, sparse-empty-leaf drop, duplicate-name rejection, bake+write,
+    each codec, four real third-party sample files, and the rotated set (round-trip through
+    `AffineMap`, `read_vdb` refusal, diagonal-`AffineMap` still yielding a box, and the two read
+    entry points agreeing on diagonal files). Cross-validated through ftrace on CPU+GPU
+    (`scraps/make_loom_vdb.py` → `scraps/loom_smoke.vdb` via `scraps/loom_vdb.ftsl`; sparse
+    device path `1000/1000 bricks active`, energy `sum/emitted=1.000000`), and the rotated path
+    by rendering one asymmetric volume under a diagonal vs a 45°-about-Y map
+    (`scraps/vdb_rot_make.py`).
+  - **Still open:** **Vec3** grids; ingesting `.nvdb`; sparse-storage transforms; resampling
+    sparse↔dense.
 - **E5 (foundation) — Axis-typed signals (one influence model).** ✅ done (`loom/axes.py`). Resolves E5's
   deferred open-q (node taxonomy + axis-set representation) with a small additive layer *on top of* the
   scalar `Signal` DAG (no churn; 891 prior tests stay green). An `AxSignal` is a pure function of a **point**

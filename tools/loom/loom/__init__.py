@@ -34,7 +34,8 @@ from .scene import (
 from .transform import Transform
 from .mcubes import mesh_field
 from .vdbio import (
-    write_vdb, read_vdb, bake_field, write_volume, VolumeGrid,
+    write_vdb, read_vdb, read_vdb_grids, bake_field, write_volume, VolumeGrid,
+    VdbTransform, ReadGrid,
 )
 from .axes import (
     AxSignal, Ax, AConst, Lift, AFn, Sample, select, Reduce,
@@ -109,7 +110,8 @@ __all__ = [
     "parse_ladder", "emit_ladder", "ladder_shape",
     "SweptMesh", "IsoMesh", "ribbon", "tube", "blob", "fan", "Volume",
     "mesh_field",
-    "write_vdb", "read_vdb", "bake_field", "write_volume", "VolumeGrid",
+    "write_vdb", "read_vdb", "read_vdb_grids", "bake_field", "write_volume",
+    "VolumeGrid", "VdbTransform", "ReadGrid",
     "AxSignal", "Ax", "AConst", "Lift", "AFn", "Sample", "select", "Reduce",
     "CurveSample", "RecordSample", "sample",
     "Binding", "Target", "combine", "as_ax",
