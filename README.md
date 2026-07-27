@@ -831,11 +831,11 @@ Declared with `material "name" { type <type> … }`.
 | Type | Description | Key parameters |
 |---|---|---|
 | `diffuse` | Lambertian reflector | `reflect` (spectrum or `texture:<name>`) |
-| `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). Both lobes and the back-hemisphere connections run **on the GPU in mode D** (BDPT, M9). Alias `diffuse_transmit` | `reflect` (spectrum or `texture:<name>`), `transmit` (spectrum); the two are energy-clamped so `reflect+transmit ≤ 1` |
+| `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). Both lobes and the back-hemisphere connections run **on the GPU in mode D** (BDPT, M9). Alias `diffuse_transmit` | `reflect` (spectrum, `texture:<name>` or `pattern:`/`reflect_map`), `transmit` (spectrum or `pattern:`/`transmit_map`); the two are energy-clamped so `reflect+transmit ≤ 1` |
 | `dielectric` | Refractive glass with dispersion, optional **frosting**, **colored-glass tint** and **nested-dielectric priority** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption; `priority <N>` (integer) disambiguates overlapping dielectrics — see below |
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
-| `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`) |
+| `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`; also `pattern:<name>` / `transmit_map` for a transmittance that varies across the gel) |
 | `glossy` | Rough microfacet reflector | `reflect`, `roughness` (constant or `texture:<name>` map) |
 | `thinfilm` | Single-layer interference (iridescence) | `ior`, `film_ior`, `film_thickness` (nm), `film_thickness_map texture:<name>`, `substrate_k` |
 | `multilayer` | N-layer Abelès transfer-matrix stack | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>` |
@@ -1752,7 +1752,16 @@ hue — and the multiplier is clamped to [0,1] so a formula can't manufacture en
 on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy` and `grating`; on the families
 that read their reflect spectrum directly (`fluorescent`, `thinfilm`, `dielectric`) the
 loader **rejects** it rather than ignore it silently. Same code path on CPU and GPU. Worked
-example `scenes/reflect_pattern.ftsl`. (`transmit` and `emit` don't take a pattern yet.)
+example `scenes/reflect_pattern.ftsl`.
+
+**Pattern-driven transmittance.** The same two spellings on the `transmit` slot —
+`transmit pattern:<name>` / `transmit [0 1](u)` alone in the slot, or `transmit_map
+pattern:<name>` modulating an authored spectrum. That varies a `translucent` surface's
+back-hemisphere albedo across its face (still energy-guarded so reflect + transmit ≤ 1), or
+a `filter`'s per-wavelength gel transmittance — a colored gel whose density is painted by a
+formula. Those two families are the only ones that read the slot at all, so a transmit
+pattern anywhere else is a load error, same policy as `reflect`. Worked example
+`scenes/transmit_pattern.ftsl`. (`emit` doesn't take a pattern yet.)
 
 **UV on native primitives.** The `u v` pattern variables aren't limited to meshes.
 A native `sphere {}` carries built-in equirectangular (lat/long) UVs, a `quad {}`
@@ -2283,7 +2292,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-scene <name>` | Built-in scene (e.g. `cornell`) |
 | `-n <photons>` | Trace exactly this many photons/samples |
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
-| `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
+| `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension). Mode `V` produces a *pair* of images (the two independent estimates it cross-checks) and writes them as `<out>_forward` / `<out>_backward` beside the given path |
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
 | `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |

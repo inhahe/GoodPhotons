@@ -414,7 +414,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::Filter: {
-            double t = clamp01(mp->transmit(lambda));
+            double t = clamp01(transmitSlot(scene, *mp, h, lambda));
             wi = rayDir; betaFactor = t; delta = true;   // t <= 0 -> caller's max test
             // Straight-through for every λ, so the bundle survives — and a gel filter is
             // exactly where the per-λ transmittance spread is largest, i.e. the case that
@@ -424,7 +424,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             if (nSec) {
                 *keepBundle = true; *secChromatic = true;
                 for (int i = 0; i < nSec; ++i)
-                    secF[i] = clamp01(mp->transmit(lamAll[i + 1]));
+                    secF[i] = clamp01(transmitSlot(scene, *mp, h, lamAll[i + 1]));
             }
             break;
         }

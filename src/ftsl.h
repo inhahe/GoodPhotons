@@ -1632,17 +1632,29 @@ private:
     // Returning the base spectrum (rather than assigning) keeps every material type's own
     // default intact; call it wherever `spectrumParam(b, "reflect", …)` used to be called.
     // `m.type` must already be set — the honoured-family check below reads it.
-    Spectrum reflectParam(const Block& b, Material& m, const Spectrum& dflt) {
-        bindScalarPattern(b, "reflect_map", m.reflectPat);
-        Spectrum base;
-        const Stmt* s = find(b, "reflect");
+    // The shared mechanism, keyed on the slot name: `<key> pattern:p` puts the pattern
+    // ALONE in the slot (base becomes a flat 1.0), `<mapKey> pattern:p` modulates whatever
+    // `<key>` otherwise says. Identical for `reflect`/`reflect_map` and `transmit`/
+    // `transmit_map`, hence one implementation.
+    Spectrum patternedSpectrumParam(const Block& b, const char* key, const char* mapKey,
+                                    int& patOut, const Spectrum& dflt) {
+        bindScalarPattern(b, mapKey, patOut);
+        const Stmt* s = find(b, key);
         if (s && !s->val.words.empty() && s->val.words[0].rfind("pattern:", 0) == 0) {
-            if (!bindScalarPattern(b, "reflect", m.reflectPat)) return dflt;  // unknown name: failed
-            base = constantSpectrum(1.0);
-        } else {
-            base = spectrumParam(b, "reflect", dflt);
+            if (!bindScalarPattern(b, key, patOut)) return dflt;   // unknown name: failed
+            return constantSpectrum(1.0);
         }
-        return base;
+        return spectrumParam(b, key, dflt);
+    }
+
+    Spectrum reflectParam(const Block& b, Material& m, const Spectrum& dflt) {
+        return patternedSpectrumParam(b, "reflect", "reflect_map", m.reflectPat, dflt);
+    }
+
+    // Same for the transmit slot (read through transmitSlot() by Filter's gel
+    // transmittance and DiffuseTransmit's back-lobe albedo).
+    Spectrum transmitParam(const Block& b, Material& m, const Spectrum& dflt) {
+        return patternedSpectrumParam(b, "transmit", "transmit_map", m.transmitPat, dflt);
     }
 
     // Which material families route their reflect slot through diffuseReflectance() /
@@ -1657,21 +1669,36 @@ private:
                t == MatType::Glossy    || t == MatType::Grating;
     }
 
-    // Refuse a reflect pattern on a family that would not apply it. Run from the COMMON
-    // tail of buildMaterial (not from reflectParam) so it also catches the types that
-    // never read `reflect` at all — otherwise `reflect_map` on, say, a thinfilm would be
-    // dropped in silence, which reads as "it worked".
-    void checkReflectPatSupported(const Block& b, Material& m) {
-        if (reflectPatHonoured(m.type)) return;
-        const Stmt* rs = find(b, "reflect");
-        const bool patInReflect = rs && !rs->val.words.empty() &&
-                                  rs->val.words[0].rfind("pattern:", 0) == 0;
-        if (!patInReflect && !find(b, "reflect_map")) return;
-        fail("a reflect pattern is not supported on this material type — only the "
-             "families whose reflect slot goes through the shared per-hit accessors "
-             "(diffuse, translucent, mirror, halfmirror, glossy, grating) apply one; "
-             "elsewhere it would be silently ignored");
-        m.reflectPat = -1;
+    // The transmit slot is only ever READ by these two: a colored gel's T(lambda) and a
+    // translucent's back-hemisphere albedo. Every other type leaves `transmit` at its 0
+    // default and never looks at it, so a pattern there is meaningless.
+    static bool transmitPatHonoured(MatType t) {
+        return t == MatType::Filter || t == MatType::DiffuseTransmit;
+    }
+
+    // Refuse a slot pattern on a family that would not apply it.
+    void checkSlotPatSupported(const Block& b, const char* key, const char* mapKey,
+                               bool honoured, int& patOut, const char* families) {
+        if (honoured) return;
+        const Stmt* s = find(b, key);
+        const bool patInSlot = s && !s->val.words.empty() &&
+                               s->val.words[0].rfind("pattern:", 0) == 0;
+        if (!patInSlot && !find(b, mapKey)) return;
+        fail(std::string("a ") + key + " pattern is not supported on this material type — "
+             "only the families whose " + key + " slot goes through the shared per-hit "
+             "accessor (" + families + ") apply one; elsewhere it would be silently ignored");
+        patOut = -1;
+    }
+
+    // Run from the COMMON tail of buildMaterial (not from reflectParam/transmitParam) so
+    // it also catches the types that never read the slot at all — otherwise `reflect_map`
+    // on, say, a thinfilm would be dropped in silence, which reads as "it worked".
+    void checkSlotPatsSupported(const Block& b, Material& m) {
+        checkSlotPatSupported(b, "reflect", "reflect_map", reflectPatHonoured(m.type),
+                              m.reflectPat,
+                              "diffuse, translucent, mirror, halfmirror, glossy, grating");
+        checkSlotPatSupported(b, "transmit", "transmit_map", transmitPatHonoured(m.type),
+                              m.transmitPat, "translucent, filter");
     }
 
     // If `<key>`'s value is `texture:<name>`, bind that texture's grayscale value to a
@@ -2549,7 +2576,7 @@ private:
             if (find(b, "reflect") || find(b, "reflect_map"))
                 m.reflect = reflectParam(b, m, m.reflect);
             if (find(b, "ior"))            m.ior           = spectrumParam(b, "ior", m.ior);
-            checkReflectPatSupported(b, m);
+            checkSlotPatsSupported(b, m);
             return m;
         }
         std::string type = strOf(b, "type", "diffuse");
@@ -2569,7 +2596,7 @@ private:
             m.type = MatType::DiffuseTransmit;
             if (bindReflectTexture(b, m)) { bindScalarPattern(b, "reflect_map", m.reflectPat); m.reflect = constantSpectrum(0.5); }
             else                          m.reflect = reflectParam(b, m, constantSpectrum(0.4));
-            m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.4));
+            m.transmit = transmitParam(b, m, constantSpectrum(0.4));
         } else if (type == "dielectric") {
             m.type = MatType::Dielectric;
             m.ior = spectrumParam(b, "ior", glassOrDefault("BK7", 1.5168));
@@ -2600,7 +2627,7 @@ private:
             // (`transmit file:data/filter/rosco-red.csv` / `transmit filter:red-25`)
             // or a primitive (`transmit gaussian center=630 sigma=25`).
             m.type = MatType::Filter;
-            m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.5));
+            m.transmit = transmitParam(b, m, constantSpectrum(0.5));
         } else if (type == "glossy") {
             m.type = MatType::Glossy;
             m.reflect = reflectParam(b, m, constantSpectrum(0.9));
@@ -2690,7 +2717,7 @@ private:
         } else {
             fail("unknown material type '" + type + "'");
         }
-        checkReflectPatSupported(b, m);
+        checkSlotPatsSupported(b, m);
         // Nested-dielectric priority (§ nested dielectrics): `priority <N>` — integer,
         // higher wins where dielectric solids overlap. Common to every material type
         // (only consulted for dielectric-like ones); unset => the ahead-of-time audit

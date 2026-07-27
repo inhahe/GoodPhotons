@@ -460,7 +460,7 @@ struct BackwardRenderer {
             }
             case MatType::Filter: {
                 // Colored gel filter: pass straight through, survive with prob T(lambda).
-                double t = clamp01(m.transmit(lambda));
+                double t = clamp01(transmitSlot(scene, m, h, lambda));
                 if (rng.uniform() >= t) return false;      // absorbed
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
                 specularArrival = true; return true;
@@ -527,7 +527,7 @@ struct BackwardRenderer {
                 // Two-lobe Lambertian: NEE the reflect lobe in the front hemisphere and
                 // the transmit lobe in the back (a normal-flipped Hit reuses neeLight/env).
                 double rhoR = clamp01(diffuseReflectance(scene, m, h, lambda));
-                double rhoT = clamp01(m.transmit(lambda));
+                double rhoT = clamp01(transmitSlot(scene, m, h, lambda));
                 double sum = rhoR + rhoT;
                 if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }   // energy guard
                 L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng, spdCache);
@@ -806,7 +806,7 @@ struct BackwardRenderer {
                     double rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i) {
                         double rr = clamp01(diffuseReflectance(scene, m, h, lam[i]));
-                        double rt = clamp01(m.transmit(lam[i]));
+                        double rt = clamp01(transmitSlot(scene, m, h, lam[i]));
                         double s = rr + rt;
                         if (s > 1.0) { rr /= s; rt /= s; }       // per-λ energy guard
                         rhoR[i] = rr; rhoT[i] = rt;
@@ -864,7 +864,7 @@ struct BackwardRenderer {
                     // same rng draws, same order, bit-identical.
                     double c[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)
-                        c[i] = (m.type == MatType::Filter) ? clamp01(m.transmit(lam[i]))
+                        c[i] = (m.type == MatType::Filter) ? clamp01(transmitSlot(scene, m, h, lam[i]))
                                                            : clamp01(reflectSlot(scene, m, h, lam[i]));
                     const double q = hero::maxOf(c, nUp);
                     if (rng.uniform() >= q) { finish(); return; }   // RR absorb (q == 0 always absorbs)

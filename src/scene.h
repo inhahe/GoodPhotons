@@ -107,6 +107,14 @@ struct Material {
     // Because it is a scalar multiplier it is wavelength-flat by construction — colour
     // still comes from the spectrum/texture, never from the pattern.
     int reflectPat = -1;
+    // Same idea on the TRANSMIT slot, read through transmitSlot(): a per-hit multiplier
+    // on the constant `transmit` spectrum, clamped to [0,1]. `transmit pattern:<name>`
+    // (or `transmit [0 1](u)`) puts the pattern in the slot alone over a flat-1.0 base;
+    // `transmit_map pattern:<name>` beside a spectrum modulates that. On a Filter this
+    // makes the gel's transmittance vary across its face; on a translucent (two-lobe
+    // Lambertian) it varies the back-hemisphere albedo, still under the rhoR+rhoT <= 1
+    // energy guard, which is applied AFTER the multiplier at every call site.
+    int transmitPat = -1;
 
     // --- Parametric-record drive (§records) ---------------------------------
     // A material's slots can be driven by parametric records (Scene::records). Each
@@ -1416,13 +1424,17 @@ inline bool recordReflectBound(const Scene& scene, const Material& m,
     return true;
 }
 
-// Per-hit multiplier from a bound `reflectPat` (`reflect pattern:<n>` / `reflect_map`),
-// clamped to [0,1] so a runaway formula can never manufacture energy. 1.0 when unbound,
-// which is why both reflect accessors can apply it unconditionally.
-inline double reflectPatMul(const Scene& scene, const Material& m, const Hit& h) {
-    if (m.reflectPat < 0 || m.reflectPat >= (int)scene.patterns.size()) return 1.0;
-    double p = scene.patterns[m.reflectPat].eval(patCtxFromHit(scene, h));
+// Per-hit multiplier from a scalar pattern bound to a SPECTRAL slot (`reflectPat` /
+// `transmitPat`), clamped to [0,1] so a runaway formula can never manufacture energy.
+// 1.0 when unbound, which is why the slot accessors can apply it unconditionally.
+inline double slotPatMul(const Scene& scene, int pat, const Hit& h) {
+    if (pat < 0 || pat >= (int)scene.patterns.size()) return 1.0;
+    double p = scene.patterns[pat].eval(patCtxFromHit(scene, h));
     return p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);
+}
+
+inline double reflectPatMul(const Scene& scene, const Material& m, const Hit& h) {
+    return slotPatMul(scene, m.reflectPat, h);
 }
 
 // Reflect-slot reflectance for the SPECULAR families (Mirror / Glossy / Grating /
@@ -1456,6 +1468,18 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
         }
     }
     return m.reflectPat < 0 ? rv : rv * reflectPatMul(scene, m, h);
+}
+
+// Transmit-slot value at a hit — the single point of truth for BOTH readings of the
+// slot: a Filter's per-wavelength gel transmittance T(lambda), and a DiffuseTransmit's
+// back-hemisphere Lambertian albedo rhoT. The constant `transmit` spectrum scaled by a
+// bound transmit pattern (there is no record channel and no texture on this slot, so
+// unlike diffuseReflectance there is only the one base path). Callers still clamp01 and,
+// for the two-lobe case, still apply the rhoR+rhoT <= 1 energy guard afterwards.
+inline double transmitSlot(const Scene& scene, const Material& m,
+                           const Hit& h, double lambda) {
+    double v = m.transmit(lambda);
+    return m.transmitPat < 0 ? v : v * slotPatMul(scene, m.transmitPat, h);
 }
 
 // Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern

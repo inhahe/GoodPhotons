@@ -242,7 +242,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
             case MatType::Filter: {
-                thr *= clamp01(m.transmit(lambda));
+                thr *= clamp01(transmitSlot(scene, m, h, lambda));
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
@@ -418,7 +418,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 break;
             }
             case MatType::Filter: {
-                double t = clamp01(m.transmit(lambda));
+                double t = clamp01(transmitSlot(scene, m, h, lambda));
                 thr *= t;
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;

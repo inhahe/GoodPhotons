@@ -2091,6 +2091,18 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
 
 static std::string checkpointPath(const std::string& outPath) { return outPath + ".ftbuf"; }
 
+// "png/foo.png" + "_forward" -> "png/foo_forward.png". Inserts a suffix before the
+// extension, keeping the directory (so a companion image lands next to -o rather than in
+// the CWD) and the format (writeImage dispatches on the extension). No extension, or a
+// dot that belongs to a directory component, appends instead.
+static std::string pathWithSuffix(const std::string& path, const char* suffix) {
+    size_t dot = path.find_last_of('.');
+    size_t sep = path.find_last_of("/\\");
+    if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
+        return path + suffix;
+    return path.substr(0, dot) + suffix + path.substr(dot);
+}
+
 static bool writeCheckpoint(const std::string& outPath, const Checkpoint& c,
                             uint64_t guard, char mode) {
     std::ofstream o(checkpointPath(outPath), std::ios::binary);
@@ -3056,8 +3068,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
                     e.residual / e.emitted, tot / e.emitted);
         compareFilms(fwd, N, ref, spp);
-        writeFilm("validate_forward.ppm", fwd, (double)N);
-        writeFilm("validate_backward.ppm", ref, (double)spp);
+        // Mode V produces a PAIR of images (the two independent estimates), so it derives
+        // `<out>_forward` / `<out>_backward` from -o instead of writing one -o file. It
+        // used to hard-code `validate_forward.ppm` / `validate_backward.ppm` in the CWD,
+        // which ignored -o entirely and scattered output into the repo root.
+        const std::string vFwd = pathWithSuffix(outPath, "_forward");
+        const std::string vBk  = pathWithSuffix(outPath, "_backward");
+        writeFilm(vFwd.c_str(), fwd, (double)N);
+        writeFilm(vBk.c_str(),  ref, (double)spp);
         return 0;
     }
 

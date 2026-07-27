@@ -319,10 +319,12 @@ struct DMaterial {
     // Material::roughnessPat / filmThicknessPat / mixWeightPat. reflectPat instead
     // MULTIPLIES the reflect slot per hit (device twin of Material::reflectPat) — the
     // greyscale-albedo half of `reflect pattern:<n>` / `reflect_map pattern:<n>`.
+    // transmitPat does the same on the transmit slot (device twin of Material::transmitPat).
     int    roughnessPat;
     int    filmThicknessPat;
     int    mixWeightPat;
     int    reflectPat;
+    int    transmitPat;
     // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
     // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
     // twin of Material::priority.
@@ -3992,6 +3994,16 @@ __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const D
     return clamp01(m.reflectPat < 0 ? rv : rv * dReflectPatMul(sc, m, h));
 }
 
+// Transmit-slot value at a hit (device twin of host transmitSlot): the constant baked
+// transmit spectrum scaled by a bound transmit pattern. Serves BOTH readings of the slot
+// — a filter's gel transmittance T(lambda) and a translucent's back-lobe albedo rhoT —
+// so every device transmit read goes through here, exactly as the host does.
+__device__ static Real dTransmitSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    Real v = specLookup(m.transmit, lambda);
+    if (m.transmitPat < 0) return v;
+    return v * (Real)clamp01(dPatternScalarAt(sc, m.transmitPat, h));
+}
+
 // Sample a Stokes-shifted emission wavelength lambda' ~ M for a fluorescent
 // material (mirrors EmissionSampler::sample over [DLMIN, DLMAX]).
 __device__ static Real sampleFluoEmit(const DScene& sc, const DMaterial& m, DRng& rng) {
@@ -4259,7 +4271,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         // Colored gel / Wratten filter (device twin of render.h MatType::Filter): a thin
         // non-scattering absorber. Pass straight through; survive with prob T(lambda),
         // else absorb. RR on the transmittance keeps beta unchanged and unbiased.
-        Real t = clamp01(specLookup(m.transmit, lambda));
+        Real t = clamp01(dTransmitSlot(sc, m, h, lambda));
         if (rng.uniform() >= t) { eAbsorbed += beta; return WF_TERMINATE; }
         ro = h.p + rd * RAY_EPS;   // straight through, direction unchanged
         return WF_CONTINUE;
@@ -4440,7 +4452,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // passing the flipped normal images whichever side the camera is on. Non-specular,
         // so a directly-viewed translucent solid is VISIBLE in model B (unlike dielectric).
         Real rhoR = dDiffuseRho(sc, m, h, lambda);
-        Real rhoT = clamp01(specLookup(m.transmit, lambda));
+        Real rhoT = clamp01(dTransmitSlot(sc, m, h, lambda));
         Real sum = rhoR + rhoT;
         if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
         DVec3 nb = h.n * (Real)(-1);
@@ -4691,7 +4703,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         Real rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
         for (int i = 0; i < nUp; ++i) {
             Real rr = clamp01(dDiffuseRho(sc, m, h, lam[i]));
-            Real rt = clamp01(specLookup(m.transmit, lam[i]));
+            Real rt = clamp01(dTransmitSlot(sc, m, h, lam[i]));
             Real s = rr + rt; if (s > (Real)1) { rr /= s; rt /= s; }   // per-λ energy guard
             rhoR[i] = rr; rhoT[i] = rt;
         }
@@ -4757,7 +4769,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         Real c[hero::kHeroMax];
         Real q = (Real)0;
         for (int i = 0; i < nUp; ++i) {
-            c[i] = (m.type == D_FILTER) ? clamp01(specLookup(m.transmit, lam[i]))
+            c[i] = (m.type == D_FILTER) ? clamp01(dTransmitSlot(sc, m, h, lam[i]))
                                         : clamp01(dReflectSlot(sc, m, h, lam[i]));
             if (c[i] > q) q = c[i];
         }
@@ -5142,7 +5154,7 @@ __device__ static inline void dDiffuseTransmitAlbedos(const DScene& sc, const DM
                                                       const DHit& h, Real lambda,
                                                       double& rhoR, double& rhoT) {
     rhoR = clamp01(dDiffuseRho(sc, m, h, lambda));
-    rhoT = clamp01(specLookup(m.transmit, lambda));
+    rhoT = clamp01(dTransmitSlot(sc, m, h, lambda));
     double sum = rhoR + rhoT;
     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; }
 }
@@ -5803,7 +5815,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
         }
         case D_FILTER: {
             // Colored gel filter: pass straight through, survive with prob T(lambda).
-            Real t = clamp01(specLookup(mp->transmit, lambda));
+            Real t = clamp01(dTransmitSlot(sc, *mp, h, lambda));
             if (rng.uniform() >= t) return false;   // absorbed
             ro = h.p + rd * RAY_EPS;                // direction unchanged
             specularArrival = true; return true;
@@ -5821,7 +5833,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             // lobe in the back (-n) hemisphere (a normal-flipped Hit reuses bkNeeLight),
             // then continue reflect / transmit / absorb (throughput unchanged on survival).
             Real rhoR = clamp01(dDiffuseRho(sc, *mp, h, lambda));
-            Real rhoT = clamp01(specLookup(mp->transmit, lambda));
+            Real rhoT = clamp01(dTransmitSlot(sc, *mp, h, lambda));
             Real sum = rhoR + rhoT;
             if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
             DVec3 nb = h.n * (Real)(-1);
@@ -6073,7 +6085,7 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
                 Real rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
                 for (int i = 0; i < nUp; ++i) {
                     Real rr = clamp01(dDiffuseRho(sc, *mp, h, lam[i]));
-                    Real rt = clamp01(specLookup(mp->transmit, lam[i]));
+                    Real rt = clamp01(dTransmitSlot(sc, *mp, h, lam[i]));
                     Real s = rr + rt;
                     if (s > (Real)1) { rr /= s; rt /= s; }        // per-λ energy guard
                     rhoR[i] = rr; rhoT[i] = rt;
@@ -6125,7 +6137,7 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
                 Real c[hero::kHeroMax];
                 double q = 0.0;
                 for (int i = 0; i < nUp; ++i) {
-                    c[i] = (mp->type == D_FILTER) ? clamp01(specLookup(mp->transmit, lam[i]))
+                    c[i] = (mp->type == D_FILTER) ? clamp01(dTransmitSlot(sc, *mp, h, lam[i]))
                                                   : clamp01(dReflectSlot(sc, *mp, h, lam[i]));
                     if ((double)c[i] > q) q = (double)c[i];
                 }
@@ -6875,14 +6887,14 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             case D_FILTER: {
                 // Colored gel filter: straight-through delta, throughput ×= T(lambda).
-                double t = clamp01(specLookup(mp->transmit, lambda));
+                double t = clamp01(dTransmitSlot(sc, *mp, h, lambda));
                 wi = rd; betaFactor = t; delta = 1;
                 // Straight-through for every λ: keep the bundle, reweight per-λ. This is
                 // the case with the widest per-λ spread (a Wratten gel is 0 over most of
                 // the spectrum), and the reason secF is absolute rather than a ratio.
                 keepBundle = true; secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i)
-                    secF[i] = clamp01(specLookup(mp->transmit, hb.lam[i + 1]));
+                    secF[i] = clamp01(dTransmitSlot(sc, *mp, h, hb.lam[i + 1]));
                 break;
             }
             case D_THINFILM: {
@@ -7609,7 +7621,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
                 break;
             }
             case D_FILTER: {
-                thr *= (double)clamp01(specLookup(m.transmit, lambda));
+                thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
                 ro = h.p + rd * RAY_EPS; break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
@@ -7767,7 +7779,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 break;
             }
             case D_FILTER: {
-                thr *= (double)clamp01(specLookup(m.transmit, lambda));
+                thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
                 ro = h.p + rd * RAY_EPS; break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
@@ -7897,7 +7909,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 break;
             }
             case D_FILTER: {
-                thr *= (double)clamp01(specLookup(m.transmit, lambda));
+                thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
                 ro = h.p + rd * RAY_EPS; break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
@@ -8218,7 +8230,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             break;
         }
         case D_FILTER: {
-            double t = clamp01(specLookup(m.transmit, lambda));
+            double t = clamp01(dTransmitSlot(sc, m, h, lambda));
             wi = rd; betaFactor = t; delta = true;   // t <= 0 -> caller's max test
             // Straight-through for every λ, so the bundle survives — and a gel filter is
             // exactly where the per-λ transmittance spread is largest, i.e. the case that
@@ -8228,7 +8240,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             if (nSec) {
                 *keepBundle = true; *secChromatic = true;
                 for (int i = 0; i < nSec; ++i)
-                    secF[i] = clamp01(specLookup(m.transmit, lamAll[i + 1]));
+                    secF[i] = clamp01(dTransmitSlot(sc, m, h, lamAll[i + 1]));
             }
             break;
         }
@@ -9461,6 +9473,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.filmThicknessPat = m.filmThicknessPat;
         d.mixWeightPat = m.mixWeightPat;
         d.reflectPat = m.reflectPat;
+        d.transmitPat = m.transmitPat;
         // --- parametric-record REFLECT binding (§records stage 6a) ---
         // Device twin of recordReflectBound. A constant selStop binding bakes the stop's
         // colour straight into reflect[] (so the plain specLookup path is exact, no device
@@ -10514,6 +10527,7 @@ bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam) {
         }
         if (m.reflectTex >= 0) return false;                        // textured albedo not baked to RGB
         if (m.reflectPat >= 0) return false;                        // pattern-modulated albedo, ditto
+        if (m.transmitPat >= 0) return false;                       // pattern-modulated transmittance, ditto
         if (m.recBindingFor(REC_SLOT_REFLECT)) return false;        // record-driven reflectance
     }
     if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;

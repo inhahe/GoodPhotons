@@ -1,0 +1,78 @@
+# Pattern-driven transmittance — the `transmit` slot takes a scalar pattern, exactly
+# like `reflect` does (see scenes/reflect_pattern.ftsl).
+#
+# Two spellings, one mechanism (a per-hit MULTIPLIER on the slot, clamped to [0,1]):
+#
+#   transmit pattern:<name>      the pattern is ALONE in the slot, so the base spectrum
+#   transmit [0 1](u)            becomes a flat 1.0 and the pattern IS the (greyscale)
+#                                transmittance. The inline array literal desugars to the
+#                                `pattern:` form, which is what makes the second line work.
+#
+#   transmit <spectrum>          the pattern MODULATES that spectrum, so the colour of the
+#   transmit_map pattern:<name>  gel/translucent still comes from the spectrum and only its
+#                                strength varies across the surface.
+#
+# The slot is only READ by the two families that have a transmit lobe — `translucent`
+# (back-hemisphere Lambertian albedo, energy-guarded against the reflect lobe) and
+# `filter` (a colored gel's per-wavelength transmittance). Every other type leaves
+# `transmit` at 0 and never looks at it, so the loader REFUSES a transmit pattern there
+# rather than silently dropping it.
+#
+#   ftrace -in scenes/transmit_pattern.ftsl -mode R -device cpu -spp 400 \
+#          -o png/transmit_pattern.png -window -keepwindow
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse  reflect whitewall 0.75 }
+material "grey"  { type diffuse  reflect 0.35 }
+
+# Concentric rings in the quad's own UV space — the same field both panels use.
+pattern "p_rings" {
+    expr "0.5+0.5*cos(2*pi*5*sqrt((u-0.5)*(u-0.5)+(v-0.5)*(v-0.5)))"
+}
+
+# LEFT panel: an inline array literal alone in the slot. A left-to-right ramp from opaque
+# (u=0) to fully translucent (u=1); the reflect lobe stays a constant dark grey, so what
+# you see change across the panel is purely the transmitted light from the lamp behind it.
+material "ramp"  { type translucent  reflect rgb 0.15 0.15 0.15  transmit [0 1](u) }
+
+# RIGHT panel: a red gel whose transmittance is modulated by the ring field. The hue is
+# the spectrum's; the rings only meter how much of it gets through.
+material "rings" { type filter  transmit gaussian center=630 sigma=40 amp=0.95
+                                transmit_map pattern:p_rings }
+
+# --- box (open toward the camera) ---
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material grey  }   # back wall
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material white }   # left wall
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material white }   # right wall
+
+# --- the two backlit panels, side by side, facing the camera ---
+quad { origin 0.06 0.25 0.85   u 0.42 0 0   v 0 0.5 0   material ramp  }
+quad { origin 0.52 0.25 0.85   u 0.42 0 0   v 0 0.5 0   material rings }
+
+# Lamps BEHIND the panels, aimed at the camera, so the panels are seen in transmission.
+# Two of them, individually tuned: a translucent panel DIFFUSES the light it transmits
+# (spreading it over the back hemisphere, so it needs a strong lamp to read), while a gel
+# filter is a straight-through delta and shows the lamp's own radiance barely attenuated —
+# a single lamp bright enough for the left panel blows the right one to white.
+light area {
+    origin 0.10 0.30 0.25   u 0.34 0 0   v 0 0.4 0   normal 0 0 1
+    power 170   spd preset:bb6500
+}
+light area {
+    origin 0.56 0.30 0.25   u 0.34 0 0   v 0 0.4 0   normal 0 0 1
+    power 12    spd preset:bb6500
+}
+# A dim fill so the panels' reflect side and the box read at all.
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    power 40   spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.3   look_at 0.5 0.5 0.0   up 0 1 0   fov_y 40
+    mode R
+    film { res 512 512   iso 100   shutter 1   exposure 1 }
+}

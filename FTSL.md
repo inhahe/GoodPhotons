@@ -497,10 +497,11 @@ Fills a complete material; a few knobs may be overridden afterward
 | type | key params (defaults) |
 |---|---|
 | `diffuse` | `reflect <spec>`(whitewall 0.75); `reflect texture:<n>` for a spatially-varying albedo; `reflect pattern:<n>` for a procedural greyscale one, `reflect_map` to modulate either |
-| `translucent` | `reflect <spec>`(0.4); `transmit <spec>`(0.4) — two-sided Lambertian (diffuse transmission / thin-SSS look). Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; light diffuses THROUGH the surface. `reflect texture:<n>` allowed. Alias: `diffuse_transmit`. `reflect`+`transmit` are energy-clamped to ≤1. |
+| `translucent` | `reflect <spec>`(0.4); `transmit <spec>`(0.4) — two-sided Lambertian (diffuse transmission / thin-SSS look). Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; light diffuses THROUGH the surface. `reflect texture:<n>` allowed, and both slots take a pattern (`reflect`/`transmit pattern:<n>`, `reflect_map`/`transmit_map`). Alias: `diffuse_transmit`. `reflect`+`transmit` are energy-clamped to ≤1. |
 | `mirror` | `reflect <spec>`(0.95) |
 | `halfmirror` | `reflect <spec>`(0.5) |
 | `glossy` | `reflect <spec>`(0.9) or `reflect pattern:<n>`/`reflect_map`; `roughness <r>`(0.2) or `roughness pattern:/texture:<n>` |
+| `filter` | `transmit <spec>`(0.5) — a colored gel / Wratten filter: a thin non-scattering absorber. A ray passes straight through (no reflection, no refraction) and survives with probability T(λ). Feed T from a measured curve (`transmit filter:red-25`, `transmit file:…csv`) or a primitive (`transmit gaussian center=630 sigma=25`); `transmit pattern:<n>` / `transmit_map` vary it across the surface. |
 | `dielectric` | `ior <spec>`(BK7); `roughness`(0)/map; `absorb <spec>`(0) Beer-Lambert tint per metre |
 | `thinfilm` | `ior`(1.5); `film_ior`(1.30); `film_thickness <nm>`(300)/`film_thickness_map`; `substrate_k <spec>`(0) |
 | `grating` | `reflect`(0.9); `groove_spacing <nm>`(1000); `groove_dir <x y z>`(0,1,0); `max_order`(3) |
@@ -512,8 +513,9 @@ Fills a complete material; a few knobs may be overridden afterward
 Scalar-parameter maps: `roughness` / `film_thickness_map` / `weight_map` accept
 `pattern:<name>` (math over x,y,z,normal,u,v) or `texture:<name>` (grayscale UV map).
 
-**Pattern-driven reflectance.** The `reflect` slot takes a pattern too, and a scalar in a
-spectral slot is a per-hit **multiplier** on whatever the slot otherwise holds:
+**Pattern-driven reflectance and transmittance.** The `reflect` and `transmit` slots take a
+pattern too, and a scalar in a spectral slot is a per-hit **multiplier** on whatever the slot
+otherwise holds:
 
 ```
 material "ramp"  { type diffuse reflect [0 1](u) }                     # greyscale ramp
@@ -522,6 +524,9 @@ material "tint"  { type diffuse reflect rgb 0.9 0.22 0.12             # colour f
                                  reflect_map pattern:p_rings }         # …variation from here
 material "skin"  { type diffuse reflect texture:wood                   # an image albedo…
                                  reflect_map pattern:wear }            # …weathered per hit
+material "panel" { type translucent reflect 0.15 transmit [0 1](u) }   # opaque -> clear ramp
+material "gel"   { type filter  transmit gaussian center=630 sigma=40  # colour from here…
+                                transmit_map pattern:p_rings }         # …strength from here
 ```
 
 A pattern written *into* `reflect` is alone in the slot, so the base spectrum becomes a flat
@@ -531,11 +536,16 @@ authored spectrum or texture. Because the pattern is a scalar it can only ever d
 brighten: **colour comes from the spectrum/texture, never from the pattern.** The multiplier
 is clamped to [0,1], so a runaway formula cannot manufacture energy.
 
-Supported on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy` and `grating` — the
-families whose reflect slot goes through the shared per-hit accessors. Elsewhere
-(`fluorescent`, `thinfilm`, `dielectric`, …) the reflect spectrum is read directly and a
-pattern would be dropped in silence, so the loader **refuses** it there instead. `transmit`
-and `emit` do not take a pattern yet. Worked example: `scenes/reflect_pattern.ftsl`.
+`transmit` / `transmit_map` work identically on the transmit slot — a `translucent`'s
+back-hemisphere albedo (still energy-guarded so reflect + transmit ≤ 1) or a `filter`'s
+per-wavelength gel transmittance.
+
+Reflect patterns are supported on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy`
+and `grating`; transmit patterns on `translucent` and `filter` — the families whose slot goes
+through the shared per-hit accessor. Elsewhere the spectrum is read directly (or not at all)
+and a pattern would be dropped in silence, so the loader **refuses** it there instead. `emit`
+does not take a pattern yet. Worked examples: `scenes/reflect_pattern.ftsl`,
+`scenes/transmit_pattern.ftsl`.
 
 ### 7.3 `mix` — stochastic material blend
 

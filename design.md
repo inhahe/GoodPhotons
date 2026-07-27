@@ -244,9 +244,28 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   accessors (Fluorescent's `fluoroWeights`, which has no hit to evaluate at; ThinFilm;
   Dielectric) are **rejected at load** rather than silently ignored, because the flat-1.0
   base a lone `reflect pattern:` leaves behind would otherwise render as albedo 1.0 — a
-  wrong image rather than a missing effect. `transmit` is the obvious next slot but has no
-  shared accessor (`m.transmit(lambda)` is read at 14 sites across 7 renderer headers), so
-  it is gated on writing `transmitSlot()` first; tracked in `known-issues.md`.
+  wrong image rather than a missing effect.
+
+  **Pattern-driven transmittance (`Material::transmitPat`).** The same mechanism on the
+  `transmit` slot: `transmit pattern:<n>` / `transmit [0 1](u)` alone in the slot, or
+  `transmit_map pattern:<n>` modulating an authored spectrum. Reaching it needed a
+  refactor first — unlike `reflect`, the transmit slot had **no shared accessor** and was
+  read as a bare `m.transmit(lambda)` at 16 sites across 7 renderer headers (`render.h`,
+  `backward.h`, `bdpt.h`, `vcm.h`, `photonmap_render.h`, `sppm_render.h`) plus 16 device
+  sites in `render_cuda.cu`. Those now all funnel through `transmitSlot(scene, m, h,
+  lambda)` in `scene.h` (device twin `dTransmitSlot`), which is the single point of truth
+  for **both** readings of the slot: a `filter`'s per-wavelength gel transmittance
+  T(λ), and a `translucent`'s back-hemisphere Lambertian albedo ρ_T. Callers keep their
+  own `clamp01` and, for the two-lobe case, still apply the ρ_R + ρ_T ≤ 1 energy guard
+  *after* the multiplier. There is no record channel and no texture on this slot, so the
+  accessor has only the one base path (simpler than `diffuseReflectance`). Only those two
+  families are honoured — every other type leaves `transmit` at its 0 default and never
+  reads it — so a transmit pattern anywhere else is a load error, same policy as
+  `reflect`. The reflect and transmit loader paths are themselves now one function
+  (`patternedSpectrumParam` + `checkSlotPatSupported`, keyed on the slot name), and
+  `renderBackwardRGBCuda` opts out of its baked-RGB fast path on `transmitPat` too.
+  `emit` remains open — it needs emitter registration and power renormalisation, not just
+  an accessor; tracked in `known-issues.md`.
 
   **N-D authored-data tables.** A pattern formula can sample arrays of authored numbers in
   1–4 dimensions, via two sibling datatypes ported from loom's `data.py`/`interp.py`:

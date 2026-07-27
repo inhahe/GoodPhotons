@@ -1319,7 +1319,7 @@ struct Renderer {
                 // the wavelength-dependent survival IS the colored transmission.
                 // Specular straight-through, so no camera connect (like clear glass):
                 // you see the filter's effect on whatever lies behind it.
-                double t = clamp01(m.transmit(lambda));
+                double t = clamp01(transmitSlot(scene, m, h, lambda));
                 if (rng.uniform() >= t) { e.absorbed += beta; return false; }
                 ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight, unchanged
                 return true;
@@ -1715,7 +1715,7 @@ struct Renderer {
                     // camera is on. Because both lobes are non-specular, a directly-viewed
                     // translucent solid is VISIBLE in mode B (unlike clear dielectric).
                     double rhoR = clamp01(diffuseReflectance(scene, m, h, lambda));
-                    double rhoT = clamp01(m.transmit(lambda));
+                    double rhoT = clamp01(transmitSlot(scene, m, h, lambda));
                     double sum = rhoR + rhoT;
                     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }  // energy guard
                     Vec3 ngo = orientedGeoN(h);
@@ -1954,7 +1954,7 @@ struct Renderer {
                     double rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i) {
                         double rr = clamp01(diffuseReflectance(scene, m, h, lam[i]));
-                        double rt = clamp01(m.transmit(lam[i]));
+                        double rt = clamp01(transmitSlot(scene, m, h, lam[i]));
                         double s = rr + rt;
                         if (s > 1.0) { rr /= s; rt /= s; }        // per-λ energy guard
                         rhoR[i] = rr; rhoT[i] = rt;
@@ -2020,7 +2020,7 @@ struct Renderer {
                     // probability is the MAX over live λ and survivors reweight by c_i/q <= 1.
                     double c[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)
-                        c[i] = (m.type == MatType::Filter) ? clamp01(m.transmit(lam[i]))
+                        c[i] = (m.type == MatType::Filter) ? clamp01(transmitSlot(scene, m, h, lam[i]))
                                                            : clamp01(reflectSlot(scene, m, h, lam[i]));
                     const double q = hero::maxOf(c, nUp);
                     if (rng.uniform() >= q) { e.absorbed += activeSum(); return; }  // RR absorb

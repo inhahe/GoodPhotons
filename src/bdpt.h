@@ -84,7 +84,8 @@ inline void diffuseTransmitAlbedos(const Material& m, double lambda, const Scene
                                    const Hit* hitForTex, double& rhoR, double& rhoT) {
     rhoR = hitForTex ? clamp01(diffuseReflectance(scene, m, *hitForTex, lambda))
                      : clamp01(m.reflect(lambda));
-    rhoT = clamp01(m.transmit(lambda));
+    rhoT = hitForTex ? clamp01(transmitSlot(scene, m, *hitForTex, lambda))
+                     : clamp01(m.transmit(lambda));
     double sum = rhoR + rhoT;
     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; }
 }
@@ -677,7 +678,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             case MatType::Filter: {
                 // Colored gel filter: straight-through delta, throughput ×= T(lambda).
-                double t = clamp01(mp->transmit(lambda));
+                double t = clamp01(transmitSlot(scene, *mp, h, lambda));
                 wi = ray.d; betaFactor = t; delta = true;   // direction unchanged
                 // Straight-through for every λ, so the bundle survives; a gel filter is
                 // exactly where the per-λ transmittance spread is largest, so this is
@@ -686,7 +687,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 // T(λ_hero) is legitimately 0 across most of a Wratten passband.
                 keepBundle = true; secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i)
-                    secF[i] = clamp01(mp->transmit(hb.lam[i + 1]));
+                    secF[i] = clamp01(transmitSlot(scene, *mp, h, hb.lam[i + 1]));
                 break;
             }
             case MatType::ThinFilm: {

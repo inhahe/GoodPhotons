@@ -112,7 +112,7 @@ already `__host__ __device__` and shared, so only the plumbing is missing), and 
 stub case with real ones that pop `ndim` coordinates. Then drop this entry and the "surface
 patterns only" caveat from FTSL.md.
 
-### TECH-DEBT — FIXED for `reflect` (2026-07-27, 0.75.0); `transmit`/`emit` still open
+### TECH-DEBT — FIXED for `reflect` (0.75.0) and `transmit` (0.76.0); `emit` still open
 
 0.73.0 added inline array literals (`roughness [0 1](u)`, FTSL.md §6.1, example
 `scenes/pattern_array.ftsl`). They desugar to `pattern:__arrN` and therefore work at exactly
@@ -142,16 +142,38 @@ Verified: `reflect [0 1](u)` and `reflect pattern:p` (with `expr "u"`) render
 the pattern scene (RMSE 6.83/255 at 200 spp) is *below* the no-pattern control (7.12), i.e.
 pure Monte Carlo noise.
 
-**Still open — `transmit` and `emit`.** Only the families whose reflect slot goes through
-those two accessors honour a pattern (diffuse, translucent, mirror, halfmirror, glossy,
-grating); the loader hard-*rejects* one elsewhere rather than dropping it silently, since a
-lone `reflect pattern:` leaves a flat-1.0 base that would otherwise render as albedo 1.0 —
-a wrong image, not a missing effect. Extending to `transmit` is a bigger job than it looks:
-`m.transmit(lambda)` is read **directly at 14 call sites across 7 renderer headers** with no
-shared accessor, so the prerequisite is a `transmitSlot(scene, m, h, lambda)` mirroring
-`reflectSlot` — worth doing on its own merits, and only then is the pattern binding a
-two-line change. `emit` is a separate pipeline again (emitter registration + power
-normalisation), so a pattern there needs its own design.
+Only the families whose reflect slot goes through those two accessors honour a pattern
+(diffuse, translucent, mirror, halfmirror, glossy, grating); the loader hard-*rejects* one
+elsewhere rather than dropping it silently, since a lone `reflect pattern:` leaves a
+flat-1.0 base that would otherwise render as albedo 1.0 — a wrong image, not a missing
+effect.
+
+**FIXED for `transmit` in 0.76.0**, but only after the refactor this entry called for.
+`m.transmit(lambda)` was read as a bare spectrum lookup at **16 host call sites across 6
+renderer headers** (`render.h`, `backward.h`, `bdpt.h`, `vcm.h`, `photonmap_render.h`,
+`sppm_render.h`) and **16 device sites** in `render_cuda.cu`, with no shared accessor. All
+32 now funnel through `transmitSlot(scene, m, h, lambda)` in `scene.h` / `dTransmitSlot` in
+`render_cuda.cu` — the single point of truth for *both* readings of the slot, a `filter`'s
+gel transmittance T(λ) and a `translucent`'s back-hemisphere albedo ρ_T. Callers keep their
+own `clamp01` and the two-lobe callers still apply the ρ_R + ρ_T ≤ 1 energy guard *after*
+the multiplier. There is no record channel and no texture on this slot, so the accessor has
+only the one base path. `Material::transmitPat` / `DMaterial::transmitPat` then bind
+`transmit pattern:<n>` / `transmit [0 1](u)` / `transmit_map`, honoured on `translucent` and
+`filter` and rejected everywhere else (every other type leaves `transmit` at 0 and never
+reads it). The reflect and transmit loader paths collapsed into one shared
+`patternedSpectrumParam` + `checkSlotPatSupported`, and the RGB-bake fast path opts out on
+`transmitPat` alongside `reflectPat`. Worked example: `scenes/transmit_pattern.ftsl`.
+
+Verified: `transmit pattern:p` (flat `expr "0.4"`) and `transmit 0.4 transmit_map
+pattern:p_one` render **bit-identically** to plain `transmit 0.4`; the ramp panel's measured
+brightness tracks `u` and plateaus exactly where the ρ_R + ρ_T guard kicks in; CPU-vs-GPU
+disagreement on the pattern scene (RMSE 6.40/255 at 300 spp) is *below* the no-pattern
+control (9.88), i.e. pure Monte Carlo noise; mode D (BDPT) and mode V agree — V's
+forward-vs-backward best-fit scale is 0.994. All 11 `-check*` self-tests pass and the
+grammar-equivalence sweep is ok=380 / mismatch=0.
+
+**Still open — `emit`.** A separate pipeline again (emitter registration + power
+normalisation), so a pattern there needs its own design, not just an accessor.
 
 ### BUILD BUG — FIXED (2026-07-26): editing a header did not rebuild the `.cu` files, and the linker could then keep a **stale copy of the function you just changed**
 

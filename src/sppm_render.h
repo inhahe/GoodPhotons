@@ -178,7 +178,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 break;
             }
             case MatType::Filter: {
-                thr *= clamp01(m.transmit(lambda));
+                thr *= clamp01(transmitSlot(scene, m, h, lambda));
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
