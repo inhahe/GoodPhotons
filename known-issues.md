@@ -486,10 +486,19 @@ scene (not connectible in area measure), as they already do for `spot`/`env`.
 Measured: forward B vs backward R **0.09%**, CPU vs GPU mode R **0.01%**, `-rgb` fast path
 **0.00%**, photon-map M vs R **0.02%**, SPPM S CPU vs GPU **0.16%** (8 passes, radius still
 shrinking), `angle` 0.53°→8° exposure shift **0.019%**, `sun_disk
-separate` vs baked `on` **0.12%** (once the map resolves the disc at res 4096). The convergence
-win this entry was filed for: at 2×10⁷ photons in mode B the baked disk reached 4% of the
-converged floor level (image essentially black, RMS 0.170) while `separate` reached **91%**
-(fully-formed daylight image, RMS 0.050). Original entry follows.
+separate` vs baked `on` **0.12%** (once the map resolves the disc at res 4096). New deterministic
+self-test **`ftrace -checksun`** pins the four invariants with no scene/renderer/RNG: the spot-field
+reuse really equals the cone solid angle, `L·Ω == E⊥` at every angular diameter (exposure
+invariance), `sampleCone` is uniform in solid angle about both the forward and the NEE axis, and
+`inCone` agrees with it at the rim (so the NEE estimator and the direct-view miss term see the
+same disc and the split cannot double-count). Worst absolute error 5.3e-14.
+
+The convergence win this entry was filed for, measured on the very scene named below
+(`scraps/sky_test.ftsl`, mode B, GPU): **baked** reached only 7.2% noise after 30 s / 2×10⁹
+photons and the image still had *no* warm sunlight and *no* cast shadows (the sun had barely been
+hit), while **`sun_disk separate`** hit the 4% target in **5.5 s / 3.0×10⁸ photons** with the sun
+fully formed — ~**20× fewer photons** for the same noise, and a qualitatively correct picture
+rather than a skylight-only one. Original entry follows.
 
 The Preetham sky (`src/sky.h`, `light env { sky preetham … }`) bakes the solar disk into the
 equirectangular `EnvMap` at its **physical** magnitude (~10⁵× the mean sky luminance). Directly-viewed

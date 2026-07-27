@@ -1228,7 +1228,9 @@ disc the size of the scene's own cross-section, aimed down the beam, so **every*
 enters the scene instead of most missing it. Backward modes next-event-estimate it
 inside its cone, and the disc itself is directly viewable (aim a camera at it). Runs on
 both CPU and GPU in modes A/B/C/R/P/M/S (mode `D`/`U` refuse it, like `spot` and `env`).
-See `scenes/_sun_check.ftsl`.
+See `scenes/_sun_check.ftsl`, and `ftrace -checksun` for the deterministic self-test
+(cone solid angle, exposure invariance, uniform-in-solid-angle cone sampling, and
+NEE/direct-view rim agreement).
 
 **Analytic physical sky.** An `env` light can synthesise a **Preetham daylight sky**
 instead of loading an HDRI — write `sky preetham` (or just supply `turbidity` /
@@ -1253,12 +1255,15 @@ sky background itself is read directly and is noise-free. See `scraps/sky_test.f
 default `on` bakes it into the equirect map (accurate but slow to converge in forward
 modes, since a photon must randomly land on a disc covering ~10⁻⁵ of the sphere).
 `separate` instead strips the disk out of the map and registers an equal-energy
-`light sun` alongside the skylight dome — same picture, but the sun is now importance-
-sampled/parallel-emitted, which is dramatically faster to converge: at 2×10⁷ photons in
-mode B a baked-disk render reached 4% of its converged floor level (image essentially
-black), while `separate` reached 91% and looked finished. `off` drops the disk entirely
-(skylight only). The `separate` split is energy-matched to the baked profile (measured
-agreement 0.12% once the map resolves the disc).
+`light sun` alongside the skylight dome — same picture, but the sun is now
+parallel-emitted and cone-NEE'd, which is dramatically faster to converge. On
+`scraps/sky_test.ftsl` (mode B, GPU): **baked** reached only 7.2% noise after 30 s /
+2×10⁹ photons and the image still showed *no* warm sunlight and *no* cast shadows (the
+sun had barely been hit at all), while **`separate`** hit the 4% target in **5.5 s /
+3.0×10⁸ photons** with the sun fully formed — about **20× fewer photons** for the same
+noise, and a qualitatively correct picture instead of a skylight-only one. `off` drops
+the disk entirely (skylight only). The `separate` split is energy-matched to the baked
+profile (measured agreement 0.12% once the map resolves the disc).
 
 **Absolute power.** Any non-env light may author a real physical output —
 `power <watts>` (radiometric radiant flux) or `lumens <lm>` (photometric luminous
@@ -2460,7 +2465,8 @@ alone can't restore, so they are not disk-resumable.
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
-`-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`.
+`-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`,
+`-checksun`.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are

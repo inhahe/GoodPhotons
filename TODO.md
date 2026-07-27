@@ -2325,8 +2325,13 @@ ftrace's own language). Two follow-ups were captured:
       `spot`/`env`; everything else (A/B/C/R/`-rgb`/P/M/S) runs on **CPU and GPU**. **Validated** with
       `scenes/_sun_check.ftsl`: forward B vs backward R **0.09%**, CPU vs GPU mode R **0.01%**, `-rgb` **0.00%**,
       photon-map M vs R **0.02%**, `angle` 0.53°→8° exposure shift **0.019%**, `sun_disk separate` vs baked
-      **0.12%**. The payoff: at 2×10⁷ photons in mode B the baked disk reached 4% of the converged floor level
-      (image essentially black) while `separate` reached **91%** and looked finished. All 11 `-check*` self-tests pass.
+      **0.12%**. The payoff, on `scraps/sky_test.ftsl` (mode B, GPU): **baked** reached only 7.2% noise after
+      30 s / 2×10⁹ photons and *still* had no warm sunlight and no cast shadows, while **`sun_disk separate`**
+      hit the 4% target in **5.5 s / 3.0×10⁸ photons** with the sun fully formed — ~**20× fewer photons** for
+      the same noise, and a qualitatively correct picture instead of a skylight-only one. New deterministic
+      self-test **`-checksun`** (0.84.1) pins the cone solid angle, `L·Ω == E⊥` exposure invariance,
+      uniform-in-solid-angle cone sampling about both axes, and NEE/direct-view rim agreement — worst error
+      5.3e-14, and it caught a real sign error on its first run. All 12 `-check*` self-tests pass.
 
   <details><summary>original K2 scope</summary>
 

@@ -1378,6 +1378,134 @@ static int checkScatter() {
     return ok ? 0 : 1;
 }
 
+// Deterministic distant-sun self-test (EmitterShape::Sun; src/scene.h addSunLight /
+// sampleCone / inCone / geomWeight). No scene file, no renderer, no RNG-seeded image —
+// it pins the four invariants the emitter's correctness rests on:
+//   (a) the shared spot field reuse really does produce the cone solid angle:
+//       spotOmega == 2*PI*(1 - cos theta) for every authored `angle`;
+//   (b) EXPOSURE INVARIANCE — the authored `spd` is perpendicular irradiance, so the
+//       stored radiance times the solid angle must reproduce it exactly, independent of
+//       the angular diameter. This is the property that lets you widen `angle` to soften
+//       a penumbra without re-grading the shot;
+//   (c) sampleCone is uniform in SOLID ANGLE about its axis — every direction lands
+//       inside the cone, the mean cosine matches (1+cos theta)/2, and the fraction inside
+//       an inner sub-cone matches its solid-angle share. Forward emission (axis = beamDir)
+//       and NEE (axis = -beamDir) both consume this, so a bias here breaks the B/R match;
+//   (d) inCone agrees with sampleCone (every sampled NEE direction reads back as ON the
+//       disc, and a direction just outside the rim reads back as off it) — the direct-view
+//       miss term and the NEE estimator must see the same disc or the split double-counts.
+static int checkSun() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checksun] %-42s got %.9f want %.9f  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+
+    // A flat unit "irradiance" spectrum makes the radiometry checks read directly:
+    // stored radiance must come back as 1/Omega at every wavelength.
+    Spectrum flat = [](double) { return 1.0; };
+    const double toSun[3][3] = {{0.0, 1.0, 0.0}, {0.6, 0.5, 0.3}, {-0.2, 0.05, -1.0}};
+    const double diamDeg[] = {0.53, 2.0, 8.0, 45.0, 120.0};
+
+    for (int a = 0; a < 3; ++a) {
+        for (double dd : diamDeg) {
+            Scene sc;
+            const double theta = 0.5 * dd * PI / 180.0;
+            Vec3 aim = normalize(Vec3{toSun[a][0], toSun[a][1], toSun[a][2]});
+            sc.addSunLight(aim, theta, flat, 1.0);
+            const Emitter& e = sc.emitters.back();
+            char lbl[96];
+
+            // (a) the spot-field reuse must land exactly on the cone solid angle.
+            const double omega = 2.0 * PI * (1.0 - std::cos(theta));
+            std::snprintf(lbl, sizeof lbl, "spotOmega == cone SA (%.2f deg)", dd);
+            ok &= chk(lbl, e.spotOmega, omega, 1e-12);
+
+            // beamDir is the TRAVEL direction: exactly opposite the authored aim.
+            std::snprintf(lbl, sizeof lbl, "beamDir == -toSun (%.2f deg)", dd);
+            ok &= chk(lbl, dot(e.beamDir, aim), -1.0, 1e-12);
+
+            // (b) radiance * Omega == the authored perpendicular irradiance, at any
+            // angular diameter. This is the exposure-invariance guarantee.
+            for (double lam : {380.0, 550.0, 780.0}) {
+                std::snprintf(lbl, sizeof lbl, "L*Omega == E_perp @%.0fnm (%.2f deg)", lam, dd);
+                ok &= chk(lbl, e.spdFn(lam) * e.spotOmega, 1.0, 1e-12);
+            }
+
+            // (c) sampleCone: uniform in solid angle about BOTH the forward axis
+            // (beamDir) and the NEE axis (-beamDir). Stratified u1/u2 over the unit
+            // square, so this is deterministic — no RNG, no flaky tolerance.
+            const int NS = 200;                       // 200x200 = 40000 strata
+            const double ci = std::cos(theta);
+            const double inner = 0.5 * (1.0 + ci);    // an inner sub-cone: cos = midpoint
+            for (int side = 0; side < 2; ++side) {
+                Vec3 axis = (side == 0) ? e.beamDir : e.beamDir * -1.0;
+                double sumCos = 0.0; long long nIn = 0, nInner = 0, nOnDisc = 0;
+                for (int i = 0; i < NS; ++i)
+                    for (int j = 0; j < NS; ++j) {
+                        double u1 = (i + 0.5) / NS, u2 = (j + 0.5) / NS;
+                        Vec3 d = sc.emitters.back().sampleCone(axis, u1, u2);
+                        double c = dot(d, axis);
+                        sumCos += c;
+                        if (c >= ci - 1e-12) ++nIn;
+                        if (c >= inner - 1e-12) ++nInner;
+                        // (d) a NEE draw (axis = -beamDir, so `d` already points TOWARD
+                        // the sun — the same sense as an escaping camera ray) must read
+                        // back as ON the disc.
+                        if (side == 1 && sc.emitters.back().inCone(d)) ++nOnDisc;
+                        // unit length is what makes every cosine above meaningful
+                        if (std::fabs(length(d) - 1.0) > 1e-9) ok = false;
+                    }
+                const double N = (double)NS * NS;
+                const char* wh = (side == 0) ? "fwd" : "nee";
+                std::snprintf(lbl, sizeof lbl, "%s: all draws inside cone (%.2f deg)", wh, dd);
+                ok &= chk(lbl, (double)nIn / N, 1.0, 1e-12);
+                // Uniform-in-solid-angle => cos is uniform on [cos theta, 1].
+                std::snprintf(lbl, sizeof lbl, "%s: mean cos == (1+cos)/2 (%.2f deg)", wh, dd);
+                ok &= chk(lbl, sumCos / N, 0.5 * (1.0 + ci), 1e-3);
+                // ...so the inner sub-cone's share is its solid-angle share, = 1/2 here.
+                std::snprintf(lbl, sizeof lbl, "%s: inner sub-cone share (%.2f deg)", wh, dd);
+                ok &= chk(lbl, (double)nInner / N, 0.5, 2e-3);
+                if (side == 1) {
+                    std::snprintf(lbl, sizeof lbl, "nee draw reads back inCone (%.2f deg)", dd);
+                    ok &= chk(lbl, (double)nOnDisc / N, 1.0, 1e-12);
+                }
+            }
+
+            // (d) the rim is where the direct-view term and NEE must agree. A direction
+            // a hair INSIDE the rim is on the disc; a hair outside is not.
+            {
+                Vec3 t, b; onb(aim, t, b);
+                for (double eps : {-1e-4, 1e-4}) {
+                    double th = theta + eps;
+                    Vec3 look = aim * std::cos(th) + t * std::sin(th);   // ray TOWARD the sun
+                    bool want = (eps < 0.0);
+                    if (sc.emitters.back().inCone(look) != want) {
+                        std::printf("[checksun] rim test failed at %.2f deg, eps=%+.0e  BAD\n", dd, eps);
+                        ok = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // A degenerate scene bound must not make the emitter's power NaN/inf: geomWeight
+    // is Omega*PI*R^2 and is only filled by build(), so an unbuilt emitter reads 0.
+    {
+        Scene sc;
+        sc.addSunLight(Vec3{0, 1, 0}, 0.5 * 0.53 * PI / 180.0, flat, 1.0);
+        ok &= chk("unbuilt sun geomWeight == 0", sc.emitters.back().geomWeight(), 0.0, 0.0);
+    }
+
+    std::printf("[checksun] worst absolute error = %.3g\n", worst);
+    std::printf("[checksun] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // The film accumulates radiance in an arbitrary (non-absolute) radiometric scale
 // that depends on photon count, light power, etc., so the image is always anchored
 // by an auto-exposure that maps the 99th luminance percentile to ~0.9. `expComp`
@@ -4097,6 +4225,7 @@ static int run(int argc, char** argv) {
     bool checkUpsampleOnly = false;
     bool checkGridOnly = false;
     bool checkScatterOnly = false;
+    bool checkSunOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
     bool rgbBackward = false;      // -rgb: fast RGB (non-spectral) backward preview (mode R, GPU)
@@ -4384,6 +4513,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
+        else if (!std::strcmp(argv[i], "-checksun")) checkSunOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
         else if (!std::strcmp(argv[i], "-rgb")) rgbBackward = true;
@@ -4534,6 +4664,7 @@ static int run(int argc, char** argv) {
     if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed
     if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
+    if (checkSunOnly)      return checkSun();      // deterministic, no scene needed
 
     // --- every output directory must exist BEFORE a single photon is traced ----------
     // Otherwise a mistyped/not-yet-created output directory used to be discovered only
