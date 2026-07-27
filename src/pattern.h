@@ -31,11 +31,13 @@
   #define PATTERN_HD __host__ __device__
   #endif
   #define PAT_FLOOR(x) ::floor(x)
+  #define PAT_POW(x, y) ::pow(x, y)
 #else
   #ifndef PATTERN_HD
   #define PATTERN_HD
   #endif
   #define PAT_FLOOR(x) std::floor(x)
+  #define PAT_POW(x, y) std::pow(x, y)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -84,6 +86,12 @@ enum class PatOp : int {
     // array sampled along u"); a `grid` element is the named, reusable spelling of
     // that array, and the call IS the sample.
     Grid,
+    // Scattered-sample lookup: the RAGGED sibling of Grid. Pops the scatter's `ndim`
+    // query coordinates and pushes the Shepard inverse-distance blend of samples that
+    // sit at arbitrary positions — no lattice, so it reads measured/irregular data a
+    // Grid cannot represent. `a` holds the scatter-table index; the arity is likewise
+    // the scatter's own dimensionality.
+    Scatter,
 };
 
 // One postfix node. POD (no std:: members) so it uploads to the GPU verbatim.
@@ -106,7 +114,11 @@ struct PatNode {
 // index, matching loom's `_flatten_nested` (so `[[0 1 2][3 4 5]]` is shape (2,3)
 // with axis 0 selecting the row). A query is `grid:<name>(c0, c1, …)` with one
 // coordinate per axis, in that same order.
-enum : int { PAT_GRID_MAX_DIM = 4 };
+//
+// Shared by BOTH N-D pattern tables (PatGrid and its ragged sibling PatScatter):
+// it bounds the fixed-size coordinate buffers the samplers put on the stack, so it
+// has to be one constant, not one per datatype.
+enum : int { PAT_ND_MAX_DIM = 4 };
 
 // Out-of-domain policy. Mirrors loom's `on_outside` — minus "raise", which is a
 // load-time authoring guard in loom but would have to be a per-sample abort here;
@@ -118,15 +130,16 @@ enum class PatGridOutside : int {
     Extrapolate,    // keep the boundary cell but let the fraction run past [0,1]
 };
 
-// Samples live in ONE shared pool (Scene::gridPool / its device copy) and a grid
-// refers to its run by OFFSET, never by pointer: a pointer into a std::vector would
-// dangle the moment the pool grew, and the offset form is also exactly what the GPU
-// upload wants (one flat device array + POD headers).
+// Numbers live in ONE shared pool (Scene::dataPool / its device copy) that every N-D
+// table draws from, and a table refers to its run by OFFSET, never by pointer: a
+// pointer into a std::vector would dangle the moment the pool grew, and the offset
+// form is also exactly what the GPU upload wants (one flat device array + POD
+// headers, regardless of how many tables or kinds of table a scene declares).
 struct PatGrid {
     int ndim = 1;
-    int shape[PAT_GRID_MAX_DIM] = {1, 1, 1, 1};
-    double lo[PAT_GRID_MAX_DIM] = {0, 0, 0, 0};
-    double hi[PAT_GRID_MAX_DIM] = {0, 0, 0, 0};
+    int shape[PAT_ND_MAX_DIM] = {1, 1, 1, 1};
+    double lo[PAT_ND_MAX_DIM] = {0, 0, 0, 0};
+    double hi[PAT_ND_MAX_DIM] = {0, 0, 0, 0};
     PatGridOutside outside = PatGridOutside::Clamp;
     int off = 0;                   // index of sample 0 within the shared pool
     int count = 0;                 // == product(shape); the sampler never reads past it
@@ -172,9 +185,9 @@ PATTERN_HD inline void patGridCellFrac(const PatGrid& g, int axis, double coord,
 PATTERN_HD inline double patGridSample(const PatGrid& g, const float* pool, int poolN,
                                        const double* coords) {
     if (!pool || g.count <= 0) return 0.0;
-    int    base[PAT_GRID_MAX_DIM];
-    double frac[PAT_GRID_MAX_DIM];
-    const int nd = (g.ndim < 1) ? 1 : (g.ndim > PAT_GRID_MAX_DIM ? PAT_GRID_MAX_DIM : g.ndim);
+    int    base[PAT_ND_MAX_DIM];
+    double frac[PAT_ND_MAX_DIM];
+    const int nd = (g.ndim < 1) ? 1 : (g.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : g.ndim);
     for (int a = 0; a < nd; ++a) patGridCellFrac(g, a, coords[a], base[a], frac[a]);
     const bool wrap = (g.outside == PatGridOutside::Wrap);
     double acc = 0.0;
@@ -200,6 +213,62 @@ PATTERN_HD inline double patGridSample(const PatGrid& g, const float* pool, int 
     return acc;
 }
 
+// ---------------------------------------------------------------------------
+// N-D scattered samples ("scatter") — values at ARBITRARY positions, no lattice.
+// ---------------------------------------------------------------------------
+// The ragged sibling of PatGrid, and a faithful port of loom's `data.Scatter` +
+// `interp.ScatterField`. A grid can only express data that already sits on a regular
+// box; measurements rarely do — a handful of probe points, samples along a path, a
+// few authored control values. A scatter stores each sample's own position and blends
+// them by Shepard inverse-distance weighting, which needs no structure at all.
+//
+// Weight of sample i at query q is |q - p_i|^-power, i.e. (d²)^(-power/2); the result
+// is the weighted mean, so the interpolant reproduces a CONSTANT field exactly (the
+// weights are normalised) and reproduces each sample exactly at its own position (the
+// eps test below, which also removes the 1/0 singularity there). Beyond the samples
+// it flattens toward the global weighted mean rather than diverging — the natural
+// counterpart to a grid's `clamp`.
+//
+// Positions and values interleave in the SAME shared pool a grid draws from, one
+// sample per stride of (ndim + 1): [p0 … p_{ndim-1}, value]. That keeps the whole
+// N-D-table story to a single flat float array on both backends.
+struct PatScatter {
+    int    ndim  = 1;
+    int    count = 0;         // number of samples (each ndim+1 floats wide)
+    int    off   = 0;         // index of sample 0's first coordinate in the pool
+    double power = 2.0;       // Shepard exponent; 2 is loom's default (and the cheap path)
+    double eps   = 1e-9;      // SQUARED-distance coincidence threshold
+};
+
+// Shepard inverse-distance sample. Device-safe; `poolN` bounds every read so a
+// malformed header can never walk off the end. Twin of loom's `_shepard_weights`
+// + `ScatterField._eval`.
+PATTERN_HD inline double patScatterSample(const PatScatter& s, const float* pool,
+                                          int poolN, const double* q) {
+    if (!pool || s.count <= 0) return 0.0;
+    const int nd = (s.ndim < 1) ? 1 : (s.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : s.ndim);
+    const int stride = nd + 1;
+    const double half = 0.5 * s.power;
+    double num = 0.0, den = 0.0;
+    for (int i = 0; i < s.count; ++i) {
+        const int at = s.off + i * stride;
+        if (at < 0 || at + stride > poolN) break;      // truncated run: stop, never read past
+        double d2 = 0.0;
+        for (int a = 0; a < nd; ++a) {
+            const double d = q[a] - (double)pool[at + a];
+            d2 += d * d;
+        }
+        const double val = (double)pool[at + nd];
+        // Coincident with this sample: return it EXACTLY. This is both the correct
+        // limit (its weight diverges) and what keeps the sampler finite at a sample.
+        if (d2 <= s.eps) return val;
+        const double w = (s.power == 2.0) ? 1.0 / d2 : PAT_POW(d2, -half);
+        num += w * val;
+        den += w;
+    }
+    return (den > 0.0) ? num / den : 0.0;
+}
+
 // Per-hit evaluation context (the pattern variables).
 struct PatCtx {
     double x = 0, y = 0, z = 0;   // world point
@@ -216,13 +285,16 @@ struct PatCtx {
     // refused to accept `tex:` in the first place.
     double (*texFn)(const void* self, int idx, double u, double v) = nullptr;
     const void* texSelf = nullptr;
-    // PatOp::Grid table. Unlike a Texture, a PatGrid is plain POD over a flat float
-    // pool, so it needs no opaque callback — the table is handed over directly and the
-    // very same `patGridSample` runs on both backends.
+    // N-D table headers (PatOp::Grid / PatOp::Scatter). Unlike a Texture, these are
+    // plain POD over a flat float pool, so they need no opaque callback — the tables
+    // are handed over directly and the very same samplers run on both backends.
+    // Both kinds index the ONE shared pool below.
     const PatGrid* grids = nullptr;
     int nGrids = 0;
-    const float* gridPool = nullptr;
-    int gridPoolN = 0;
+    const PatScatter* scatters = nullptr;
+    int nScatters = 0;
+    const float* dataPool = nullptr;
+    int dataPoolN = 0;
 };
 
 // Compile-time texture-name resolution for `tex:<name>(u, v)`. A value site passes
@@ -237,18 +309,24 @@ struct PatTexScope {
     int resolve(const char* n) const { return lookup ? lookup(self, n) : -1; }
 };
 
-// Compile-time grid-name resolution for `grid:<name>(c0, …)`. Same shape and the
-// same scope rule as PatTexScope — a site that will have no grid table at eval time
-// passes nothing, making the sample a legible ERROR instead of a silent zero. The
-// lookup also reports the grid's DIMENSIONALITY, because that is the call's arity:
-// a 2-D grid must be called `grid:g(x, y)`, and getting it wrong is an authoring
-// error the compiler can name precisely.
-struct PatGridScope {
+// Which N-D table a `<kind>:<name>(…)` call names. Passed to the lookup below so ONE
+// scope object serves every such datatype: adding the next one costs an enumerator,
+// not another parameter on compilePatternExpr (and another edit at all of its call
+// sites) — the same reasoning as DPatEnv on the GPU side.
+enum class PatTableKind : int { Grid = 0, Scatter };
+
+// Compile-time name resolution for the N-D table samplers `grid:<name>(c0, …)` and
+// `scatter:<name>(c0, …)`. Same shape and the same scope rule as PatTexScope — a site
+// that will have no table at eval time passes nothing, making the sample a legible
+// ERROR instead of a silent zero. The lookup also reports the table's DIMENSIONALITY,
+// because that is the call's arity: a 2-D grid must be called `grid:g(x, y)`, and
+// getting it wrong is an authoring error the compiler can name precisely.
+struct PatTableScope {
     const void* self = nullptr;
-    int (*lookup)(const void* self, const char* name, int* ndim) = nullptr;
-    int resolve(const char* n, int& ndim) const {
+    int (*lookup)(const void* self, PatTableKind kind, const char* name, int* ndim) = nullptr;
+    int resolve(PatTableKind kind, const char* n, int& ndim) const {
         ndim = 0;
-        return lookup ? lookup(self, n, &ndim) : -1;
+        return lookup ? lookup(self, kind, n, &ndim) : -1;
     }
 };
 
@@ -364,10 +442,20 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 int gi = (int)nd.a;
                 if (gi < 0 || gi >= c.nGrids || !c.grids) { st[sp++] = 0.0; break; }
                 const PatGrid& g = c.grids[gi];
-                int nd2 = g.ndim < 1 ? 1 : (g.ndim > PAT_GRID_MAX_DIM ? PAT_GRID_MAX_DIM : g.ndim);
-                double co[PAT_GRID_MAX_DIM];
+                int nd2 = g.ndim < 1 ? 1 : (g.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : g.ndim);
+                double co[PAT_ND_MAX_DIM];
                 for (int k = nd2 - 1; k >= 0; --k) co[k] = st[--sp];  // pushed in axis order
-                st[sp++] = patGridSample(g, c.gridPool, c.gridPoolN, co);
+                st[sp++] = patGridSample(g, c.dataPool, c.dataPoolN, co);
+                break;
+            }
+            case PatOp::Scatter: {
+                int si = (int)nd.a;
+                if (si < 0 || si >= c.nScatters || !c.scatters) { st[sp++] = 0.0; break; }
+                const PatScatter& sc = c.scatters[si];
+                int nd2 = sc.ndim < 1 ? 1 : (sc.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : sc.ndim);
+                double co[PAT_ND_MAX_DIM];
+                for (int k = nd2 - 1; k >= 0; --k) co[k] = st[--sp];  // pushed in axis order
+                st[sp++] = patScatterSample(sc, c.dataPool, c.dataPoolN, co);
                 break;
             }
         }
@@ -400,8 +488,8 @@ struct Tok {
     std::string name;          // for Func
     char op = 0;               // for Op ('+','-','*','/','%','^','u' unary minus)
     int   texId = -1;          // for a `tex:<name>` Func: the resolved texture index
-    int   gridId = -1;         // for a `grid:<name>` Func: the resolved grid index
-    int   gridDim = 0;         // ... and its dimensionality == the call's arity
+    int   tableId = -1;        // for a `grid:`/`scatter:<name>` Func: the table index
+    int   tableDim = 0;        // ... and its dimensionality == the call's arity
 };
 
 inline bool isIdentStart(char c) { return std::isalpha((unsigned char)c) || c == '_'; }
@@ -431,6 +519,12 @@ inline bool texFuncName(const std::string& s) {
 inline bool gridFuncName(const std::string& s) {
     return s.size() > 5 && s.compare(0, 5, "grid:") == 0;
 }
+inline bool scatterFuncName(const std::string& s) {
+    return s.size() > 8 && s.compare(0, 8, "scatter:") == 0;
+}
+// The `<kind>:` prefix length of an N-D table call, for stripping off the name.
+inline size_t tablePrefixLen(PatTableKind k) { return k == PatTableKind::Grid ? 5 : 8; }
+inline const char* tableKindName(PatTableKind k) { return k == PatTableKind::Grid ? "grid" : "scatter"; }
 
 inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
     povId = -1;
@@ -438,10 +532,12 @@ inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
     // token (the tokenizer scans `tex:foo` as one identifier), so arity is fixed at
     // 2 and the index is resolved separately against the call site's PatTexScope.
     if (texFuncName(s)) { out = PatOp::Tex; arity = 2; return true; }
-    // `grid:<name>(c0, …)` — sample a named N-D array. Arity is the GRID's own ndim,
-    // which this name-only lookup cannot know, so it reports 0 and every caller that
-    // needs the real arity takes it from the token's resolved `gridDim` instead.
-    if (gridFuncName(s)) { out = PatOp::Grid; arity = 0; return true; }
+    // `grid:<name>(c0, …)` / `scatter:<name>(c0, …)` — sample a named N-D table. Arity
+    // is the TABLE's own ndim, which this name-only lookup cannot know, so it reports 0
+    // and every caller that needs the real arity takes it from the token's resolved
+    // `tableDim` instead.
+    if (gridFuncName(s))    { out = PatOp::Grid;    arity = 0; return true; }
+    if (scatterFuncName(s)) { out = PatOp::Scatter; arity = 0; return true; }
     struct F { const char* n; PatOp op; int ar; };
     static const F fs[] = {
         {"abs",PatOp::Abs,1},{"sqrt",PatOp::Sqrt,1},{"sin",PatOp::Sin,1},
@@ -483,7 +579,7 @@ inline PatOp binOp(char c) {
 
 inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& err,
                      bool allowT = false, const PatTexScope* tex = nullptr,
-                     const PatGridScope* grid = nullptr) {
+                     const PatTableScope* tables = nullptr) {
     size_t i = 0, n = s.size();
     bool prevValue = false;   // was the previous token a value/RParen (for unary minus)
     while (i < n) {
@@ -505,7 +601,7 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
             // A texture reference `tex:<name>` scans as ONE identifier, so a sample
             // reads as a plain two-argument call `tex:<name>(u, v)` and reuses the
             // very same `tex:` spelling that material slots already use for images.
-            if ((id == "tex" || id == "grid") && j < n && s[j] == ':') {
+            if ((id == "tex" || id == "grid" || id == "scatter") && j < n && s[j] == ':') {
                 size_t e = j + 1;
                 while (e < n && isIdentCh(s[e])) ++e;
                 id = s.substr(i, e - i);
@@ -530,17 +626,21 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
                     t.texId = tex->resolve(nm.c_str());
                     if (t.texId < 0) { err = "unknown texture '" + nm + "' in " + id + "(u, v)"; return false; }
                 }
-                if (fop == PatOp::Grid) {
-                    std::string nm = id.substr(5);
-                    if (!grid) {
-                        err = "grid sample '" + id + "' is out of scope here — a grid can only "
-                              "be sampled where a scene grid table exists (material / pattern / "
-                              "record expressions), not in an implicit field formula, a medium "
-                              "density/ior program, or a load-time constant site";
+                if (fop == PatOp::Grid || fop == PatOp::Scatter) {
+                    const PatTableKind kind = (fop == PatOp::Grid) ? PatTableKind::Grid
+                                                                   : PatTableKind::Scatter;
+                    const std::string what = tableKindName(kind);
+                    std::string nm = id.substr(tablePrefixLen(kind));
+                    if (!tables) {
+                        err = what + " sample '" + id + "' is out of scope here — a " + what +
+                              " can only be sampled where a scene " + what + " table exists "
+                              "(material / pattern / record expressions), not in an implicit "
+                              "field formula, a medium density/ior program, or a load-time "
+                              "constant site";
                         return false;
                     }
-                    t.gridId = grid->resolve(nm.c_str(), t.gridDim);
-                    if (t.gridId < 0) { err = "unknown grid '" + nm + "' in " + id + "(...)"; return false; }
+                    t.tableId = tables->resolve(kind, nm.c_str(), t.tableDim);
+                    if (t.tableId < 0) { err = "unknown " + what + " '" + nm + "' in " + id + "(...)"; return false; }
                 }
                 out.push_back(t);
                 prevValue = false; continue;
@@ -549,13 +649,14 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
                 err = "texture sample '" + id + "' must be called with coordinates, e.g. " + id + "(u, v)";
                 return false;
             }
-            if (gridFuncName(id)) {
-                err = "grid sample '" + id + "' must be called with one coordinate per axis, "
-                      "e.g. " + id + "(u)";
+            if (gridFuncName(id) || scatterFuncName(id)) {
+                err = std::string(gridFuncName(id) ? "grid" : "scatter") + " sample '" + id +
+                      "' must be called with one coordinate per axis, e.g. " + id + "(u)";
                 return false;
             }
             if (id == "tex") { err = "texture sample needs a name: tex:<texture>(u, v)"; return false; }
             if (id == "grid") { err = "grid sample needs a name: grid:<grid>(c0, ...)"; return false; }
+            if (id == "scatter") { err = "scatter sample needs a name: scatter:<scatter>(c0, ...)"; return false; }
             if (id == "pi") {
                 Tok t; t.kind = Tok::Num; t.num = 3.14159265358979323846;
                 out.push_back(t); prevValue = true; continue;
@@ -596,13 +697,14 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
 // so a surface/constant driver can never silently read the timeline.
 // `tex` publishes the scene's named image textures for `tex:<name>(u, v)` samples;
 // null (the default) makes any such sample a scope error — see PatTexScope.
+// `tables` does the same for the N-D datatypes `grid:<name>(…)` / `scatter:<name>(…)`.
 inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& out,
                                std::string& err, bool allowT = false,
                                const PatTexScope* tex = nullptr,
-                               const PatGridScope* grid = nullptr) {
+                               const PatTableScope* tables = nullptr) {
     using namespace pattern_detail;
     std::vector<Tok> toks;
-    if (!tokenize(expr, toks, err, allowT, tex, grid)) return false;
+    if (!tokenize(expr, toks, err, allowT, tex, tables)) return false;
 
     std::vector<PatNode> queue;             // output (postfix)
     std::vector<Tok>     ops;               // operator stack (Op / Func / LParen)
@@ -618,7 +720,8 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
             PatNode nd; nd.op = op;
             if      (op == PatOp::PovFn) nd.a = (double)povId;
             else if (op == PatOp::Tex)   nd.a = (double)t.texId;    // resolved at tokenize
-            else if (op == PatOp::Grid)  nd.a = (double)t.gridId;   // resolved at tokenize
+            else if (op == PatOp::Grid || op == PatOp::Scatter)
+                                         nd.a = (double)t.tableId;  // resolved at tokenize
             queue.push_back(nd);
         }
     };
@@ -663,9 +766,9 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
                 if (!wasFunc.empty())  wasFunc.pop_back();
                 if (!ops.empty() && ops.back().kind == Tok::Func) {
                     PatOp op; int ar; funcOp(ops.back().name, op, ar);
-                    // A grid's arity is its own dimensionality, not a property of the
-                    // name, so it comes from the token resolved at tokenize time.
-                    if (op == PatOp::Grid) ar = ops.back().gridDim;
+                    // An N-D table's arity is its own dimensionality, not a property of
+                    // the name, so it comes from the token resolved at tokenize time.
+                    if (op == PatOp::Grid || op == PatOp::Scatter) ar = ops.back().tableDim;
                     if (fn && args != ar) {
                         err = "function '" + ops.back().name + "' expects " + std::to_string(ar) +
                               " arg(s), got " + std::to_string(args); return false;
@@ -694,7 +797,8 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
 inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
     for (const PatNode& nd : prog)
         if ((nd.op >= PatOp::VarX && nd.op <= PatOp::VarV) ||
-            nd.op == PatOp::Tex || nd.op == PatOp::Grid) return true;
+            nd.op == PatOp::Tex || nd.op == PatOp::Grid ||
+            nd.op == PatOp::Scatter) return true;
     return false;
 }
 

@@ -84,29 +84,33 @@ either `std::filesystem::create_directories` it or fail immediately with
 `ftrace: output directory 'png/nope' does not exist` — before a single photon is traced.
 The same check belongs on the `.ftbuf` checkpoint sidecar path.
 
-### TECH-DEBT — OPEN (2026-07-27): `grid:<name>(…)` is a *surface-pattern* sampler only — field / isosurface / density formulas can't reach it
+### TECH-DEBT — OPEN (2026-07-27): `grid:<name>(…)` / `scatter:<name>(…)` are *surface-pattern* samplers only — field / isosurface / density formulas can't reach them
 
-0.71.0 added the N-D `grid` datatype and the `grid:<name>(c0, …)` sampler (docs: FTSL.md
-§6.1, example: `scenes/pattern_grid.ftsl`, self-test: `ftrace -checkgrid`). It is wired into
-every *pattern* site — `pattern`, `texture { rgb … }`, record drivers/stops, material
-overrides — but deliberately **not** into the four `compilePatternExpr` call sites that
-compile scalar *field* formulas (`src/ftsl.h` ~2864 `function` block, ~3441 density field,
-~3560 isosurface `expr`, ~4446 the `allowT` record driver): those are compiled with no
-`PatGridScope`, so `grid:foo(x,y,z)` there fails at compile time with `unknown grid`.
+0.71.0 added the N-D `grid` datatype and the `grid:<name>(c0, …)` sampler; 0.72.0 added its
+ragged sibling `scatter` and `scatter:<name>(c0, …)` (docs: FTSL.md §6.1, examples:
+`scenes/pattern_grid.ftsl` / `scenes/pattern_scatter.ftsl`, self-tests: `ftrace -checkgrid` /
+`-checkscatter`). Both are wired into every *pattern* site — `pattern`, `texture { rgb … }`,
+record drivers/stops, material overrides — but deliberately **not** into the four
+`compilePatternExpr` call sites that compile scalar *field* formulas (`src/ftsl.h` ~2864
+`function` block, ~3441 density field, ~3560 isosurface `expr`, ~4446 the `allowT` record
+driver): those are compiled with no `PatTableScope`, so `grid:foo(x,y,z)` there fails at
+compile time with `unknown grid` (likewise `unknown scatter`).
 
 That is the safe behaviour, not a silent wrong answer, but it blocks the obvious use: a
 **sampled density volume** or a measured height field driving an isosurface, which is
-exactly what an N-D grid is for. The GPU side already reflects the gap — `dPatternEvalF`
-(the FP32 twin in `src/render_cuda.cu` that evaluates field formulas) carries a
-`case PatOp::Grid` that pushes `0.0f` **without popping its operands**, because the operand
-count is the grid's own `ndim` and is not knowable there. It is unreachable today; it would
-corrupt the eval stack the moment a grid became reachable from a field formula.
+exactly what these datatypes are for. The GPU side already reflects the gap —
+`dPatternEvalF` (the FP32 twin in `src/render_cuda.cu` that evaluates field formulas)
+carries a shared `case PatOp::Grid: case PatOp::Scatter:` that pushes `0.0f` **without
+popping its operands**, because the operand count is the table's own `ndim` and is not
+knowable there. It is unreachable today; it would corrupt the eval stack the moment either
+sampler became reachable from a field formula.
 
-**Proper fix:** pass `&gridScope_` at those four sites too, thread the grid table into the
-FP32 field-eval environment the same way `DPatEnv` threads it into `dPatternEval` (the
-sampler `patGridSample` in `pattern.h` is already `__host__ __device__` and shared, so only
-the plumbing is missing), and replace the stub case with a real one that pops `g.ndim`
-coordinates. Then drop this entry and the "surface patterns only" caveat from FTSL.md.
+**Proper fix:** pass `&tableScope_` at those four sites too, thread the two tables and the
+shared `dataPool` into the FP32 field-eval environment the same way `DPatEnv` threads them
+into `dPatternEval` (the samplers `patGridSample` / `patScatterSample` in `pattern.h` are
+already `__host__ __device__` and shared, so only the plumbing is missing), and replace the
+stub case with real ones that pop `ndim` coordinates. Then drop this entry and the "surface
+patterns only" caveat from FTSL.md.
 
 ### BUILD BUG — FIXED (2026-07-26): editing a header did not rebuild the `.cu` files, and the linker could then keep a **stale copy of the function you just changed**
 

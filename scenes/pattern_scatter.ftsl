@@ -1,0 +1,130 @@
+# pattern_scatter.ftsl — the N-D `scatter` datatype and the `scatter:<name>(c0, …)` sampler.
+#
+# A `scatter` is the RAGGED sibling of a `grid`: values at ARBITRARY positions in 1..4
+# dimensions, with no lattice at all. Where a grid interpolates a regular box N-linearly,
+# a scatter blends its samples by Shepard inverse-distance weighting — the interpolant
+# for data that never sat on a grid in the first place (a handful of probe measurements,
+# a few authored control points, samples along a path).
+#
+# Two properties are worth watching for in the render, because they are what distinguish
+# IDW from linear interpolation:
+#   * every sample is reproduced EXACTLY at its own position, and the field arrives there
+#     with zero slope — hence the characteristic flat spot / plateau at each sample;
+#   * `power` controls how local the blend is. Low power = broad, soft, everything
+#     influences everything; high power = each sample dominates its own neighbourhood and
+#     the field approaches a nearest-neighbour (Voronoi) look.
+#
+# Each of the five back-wall strips drives the `weight_map` of a 2-child mix (child 0 =
+# white, child 1 = black), so a strip's albedo IS the sampler's output:
+#
+#   1 (bottom)  line    the plain case: 2 samples at u=0,1 -> a symmetric S-curve, NOT a
+#                       straight ramp (that difference from `grid:` is the whole point)
+#   2           sharp   the same two samples at power 8: nearly a step at the midpoint
+#   3           stops   4 samples at IRREGULAR positions — note the plateau at each one
+#   4           pts     2-D, 5 scattered points: a smooth blobby field over (u, v)
+#   5 (top)     soft    the same 5 points at power 1: broader, flatter, less local
+#
+# Render:  ftrace -in scenes/pattern_scatter.ftsl -o png/pattern_scatter.png -spp 512 -window
+# The sampler itself is covered analytically by `ftrace -checkscatter`.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# --- 1-D, two samples. `data` is (position…, value) per sample, so with dim 1 that is
+#     simply pairs. Shepard with power 2 gives q²/((1-q)² + q²): 0 and 1 at the ends,
+#     0.5 at the midpoint, but S-shaped in between rather than linear.
+scatter "line" {
+    dim   1
+    power 2
+    data { 0 0    1 1 }
+}
+
+# --- The same two samples, sharpened. Raising the exponent pulls every query toward its
+#     nearest sample, so the transition collapses toward a step at u = 0.5.
+scatter "sharp" {
+    dim   1
+    power 8
+    data { 0 0    1 1 }
+}
+
+# --- Irregular 1-D positions — the case a `grid` cannot express at all. Watch for the
+#     flat spot at each authored u: IDW reproduces a sample exactly and arrives with
+#     zero gradient, which is exactly why it reads as a plateau rather than a corner.
+scatter "stops" {
+    dim 1
+    data {
+        0.00  0.05
+        0.15  0.95
+        0.55  0.25
+        1.00  0.80
+    }
+}
+
+# --- 2-D: five points scattered over the unit square, each with its own value. Three
+#     numbers per sample: x, y, value.
+scatter "pts" {
+    dim   2
+    power 2
+    data {
+        0.15 0.20   0.95
+        0.80 0.25   0.10
+        0.50 0.55   0.70
+        0.20 0.85   0.15
+        0.90 0.90   0.85
+    }
+}
+
+# --- The same five points with power 1. Distant samples keep much more influence, so the
+#     field is broader and flatter — the low end of the locality knob.
+scatter "soft" {
+    dim   2
+    power 1
+    data {
+        0.15 0.20   0.95
+        0.80 0.25   0.10
+        0.50 0.55   0.70
+        0.20 0.85   0.15
+        0.90 0.90   0.85
+    }
+}
+
+pattern "p_line"  { expr "scatter:line(u)"     }
+pattern "p_sharp" { expr "scatter:sharp(u)"    }
+pattern "p_stops" { expr "scatter:stops(u)"    }
+pattern "p_pts"   { expr "scatter:pts(u, v)"   }
+pattern "p_soft"  { expr "scatter:soft(u, v)"  }
+
+material "white" { type diffuse reflect whitewall 1.0 }
+material "black" { type diffuse reflect whitewall 0.0 }
+material "wall"  { type diffuse reflect whitewall 0.75 }
+
+material "m_line"  { type mix  layer "white" 0.5  layer "black" 0.5  weight_map pattern:p_line  }
+material "m_sharp" { type mix  layer "white" 0.5  layer "black" 0.5  weight_map pattern:p_sharp }
+material "m_stops" { type mix  layer "white" 0.5  layer "black" 0.5  weight_map pattern:p_stops }
+material "m_pts"   { type mix  layer "white" 0.5  layer "black" 0.5  weight_map pattern:p_pts   }
+material "m_soft"  { type mix  layer "white" 0.5  layer "black" 0.5  weight_map pattern:p_soft  }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material wall }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material wall }   # ceiling
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material wall }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material wall }   # right
+
+quad { origin 0 0.00 0   u 1 0 0   v 0 0.2 0   material m_line  }
+quad { origin 0 0.20 0   u 1 0 0   v 0 0.2 0   material m_sharp }
+quad { origin 0 0.40 0   u 1 0 0   v 0 0.2 0   material m_stops }
+quad { origin 0 0.60 0   u 1 0 0   v 0 0.2 0   material m_pts   }
+quad { origin 0 0.80 0   u 1 0 0   v 0 0.2 0   material m_soft  }
+
+light area {
+    origin 0.2 0.999 0.2   u 0.6 0 0   v 0 0 0.6   normal 0 -1 0
+    spd    preset:bb6500
+    power  200
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.2   look_at 0.5 0.5 0.0   up 0 1 0   fov_y 40
+    mode R
+    film { res 512 512   iso 100   shutter 1   exposure 1 }
+}

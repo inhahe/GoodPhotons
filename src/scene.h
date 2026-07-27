@@ -788,12 +788,14 @@ struct Scene {
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
     std::vector<Record>  records;    // parametric records: named per-channel LUTs (§records)
-    // N-D sampled arrays ("grids"), sampled from a pattern expression as
-    // `grid:<name>(c0, …)`. Headers and samples are split so the samples form ONE
-    // flat pool: a grid refers to its run by offset (never by pointer, which would
-    // dangle when the pool grows), and that is also the exact shape the GPU uploads.
-    std::vector<PatGrid> grids;
-    std::vector<float>   gridPool;
+    // N-D data tables, sampled from a pattern expression: regular lattices as
+    // `grid:<name>(c0, …)` and scattered samples as `scatter:<name>(c0, …)`. Headers
+    // and numbers are split so ALL of them share ONE flat pool: a table refers to its
+    // run by offset (never by pointer, which would dangle when the pool grows), and
+    // that is also the exact shape the GPU uploads — one array however many tables.
+    std::vector<PatGrid>    grids;
+    std::vector<PatScatter> scatters;
+    std::vector<float>      dataPool;
     Sensor sensor;
     // Participating media. Zero or more independent regions (global haze, bounded
     // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
@@ -1352,14 +1354,16 @@ inline void bindPatTex(PatCtx& c, const Scene& s) {
     c.texSelf = &s;
 }
 
-// PatOp::Grid tables. Unlike textures these need no callback: the sampler lives in
-// pattern.h and reads plain POD (headers + one flat float pool), which is exactly the
-// layout the GPU uploads, so host and device share one code path.
-inline void bindPatGrid(PatCtx& c, const Scene& s) {
-    c.grids     = s.grids.empty() ? nullptr : s.grids.data();
+// PatOp::Grid / PatOp::Scatter tables. Unlike textures these need no callback: the
+// samplers live in pattern.h and read plain POD (headers + one flat float pool), which
+// is exactly the layout the GPU uploads, so host and device share one code path.
+inline void bindPatData(PatCtx& c, const Scene& s) {
+    c.grids     = s.grids.empty()    ? nullptr : s.grids.data();
     c.nGrids    = (int)s.grids.size();
-    c.gridPool  = s.gridPool.empty() ? nullptr : s.gridPool.data();
-    c.gridPoolN = (int)s.gridPool.size();
+    c.scatters  = s.scatters.empty() ? nullptr : s.scatters.data();
+    c.nScatters = (int)s.scatters.size();
+    c.dataPool  = s.dataPool.empty() ? nullptr : s.dataPool.data();
+    c.dataPoolN = (int)s.dataPool.size();
 }
 
 // Publish every scene-owned pattern table into a context. Call this (not the
@@ -1367,7 +1371,7 @@ inline void bindPatGrid(PatCtx& c, const Scene& s) {
 // can't be silently missed at one site.
 inline void bindPatScene(PatCtx& c, const Scene& s) {
     bindPatTex(c, s);
-    bindPatGrid(c, s);
+    bindPatData(c, s);
 }
 
 // Build a procedural-pattern evaluation context from a hit: world point (x,y,z),

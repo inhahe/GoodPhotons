@@ -1691,6 +1691,16 @@ or a native-primitive wrap — see below). Two authoring forms:
   Grids upload verbatim to the GPU and both backends run the *same* sampler, so a grid
   renders identically either way; `ftrace -checkgrid` is the deterministic self-test and
   `scenes/pattern_grid.ftsl` the worked example (one feature per wall strip).
+  For data that never sat on a lattice there is the **ragged sibling**: a
+  `scatter "name" { dim … power … data { … } }` block holds values at **arbitrary
+  positions** in 1–4 dimensions (one interleaved `p0 … p_{n-1} value` run per sample),
+  and `scatter:<name>(c0, …)` blends them by **Shepard inverse-distance weighting** —
+  the interpolant for a handful of probe measurements, authored control points or
+  samples along a path. Like `grid:`, the call's arity is the table's own `dim`. Every
+  sample is reproduced *exactly* at its own position and with zero slope (the
+  characteristic plateau), and `power` is the locality knob: low values blend broadly,
+  high values approach a nearest-neighbour/Voronoi look. Self-test `ftrace -checkscatter`,
+  worked example `scenes/pattern_scatter.ftsl`.
 - **Named generator** — `type <gen>` plus params (mirrors material syntax):
 
   | Generator | Parameters | Result |
@@ -2333,7 +2343,7 @@ alone can't restore, so they are not disk-resumable.
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
-`-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`.
+`-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`.
 
 **Scene front end:** `-legacy-parser` (parse `.ftsl` with the retired hand-written
 parser instead of the shared grammar — escape hatch, slated for removal),

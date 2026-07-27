@@ -982,7 +982,7 @@ static int checkUpsample() {
 //       through 4-D (the strongest available analytic check on the corner weights);
 //   (d) the three out-of-box policies: clamp (edge-extend), wrap (period hi-lo, with
 //       sample n-1 aliasing sample 0) and extrapolate (the boundary cell continues);
-//   (e) the compile path: `grid:<name>(…)` resolves through a PatGridScope, takes the
+//   (e) the compile path: `grid:<name>(…)` resolves through a PatTableScope, takes the
 //       GRID's own dimensionality as its arity, and pushes coordinates in axis order.
 static int checkGrid() {
     auto mk = [](int ndim, const int* shape, const double* lo, const double* hi,
@@ -1023,9 +1023,9 @@ static int checkGrid() {
     // ---- (c) N-linear exactness for a multilinear function, 1-D .. 4-D -------
     // f(t0..t_{n-1}) = prod(0.3 + 0.7*t_a) is multilinear, so N-linear interpolation
     // of its corner values must reproduce it EXACTLY at every interior point.
-    for (int nd = 1; nd <= PAT_GRID_MAX_DIM; ++nd) {
-        int    shape[PAT_GRID_MAX_DIM];
-        double lo[PAT_GRID_MAX_DIM], hi[PAT_GRID_MAX_DIM];
+    for (int nd = 1; nd <= PAT_ND_MAX_DIM; ++nd) {
+        int    shape[PAT_ND_MAX_DIM];
+        double lo[PAT_ND_MAX_DIM], hi[PAT_ND_MAX_DIM];
         int    n = 1;
         for (int a = 0; a < nd; ++a) { shape[a] = 2; lo[a] = -1.0; hi[a] = 3.0; n *= 2; }
         const int offN = (int)pool.size();
@@ -1041,7 +1041,7 @@ static int checkGrid() {
         PatGrid g = mk(nd, shape, lo, hi, PatGridOutside::Clamp, offN, n);
         const double ts[3] = {0.125, 0.5, 0.875};
         for (int s = 0; s < 3; ++s) {
-            double co[PAT_GRID_MAX_DIM], want = 1.0;
+            double co[PAT_ND_MAX_DIM], want = 1.0;
             for (int a = 0; a < nd; ++a) {
                 double t = ts[(s + a) % 3];
                 co[a] = lo[a] + t * (hi[a] - lo[a]);
@@ -1080,13 +1080,14 @@ static int checkGrid() {
     // ---- (e) the `grid:<name>(…)` compile + eval path ------------------------
     // A two-entry scope: "ramp" is the 1-D clamp ramp, "tbl" is the 2x3 C-order grid.
     struct Scope {
-        static int lookup(const void*, const char* name, int* ndim) {
+        static int lookup(const void*, PatTableKind kind, const char* name, int* ndim) {
+            if (kind != PatTableKind::Grid) return -1;
             if (!std::strcmp(name, "ramp")) { if (ndim) *ndim = 1; return 0; }
             if (!std::strcmp(name, "tbl"))  { if (ndim) *ndim = 2; return 1; }
             return -1;
         }
     };
-    PatGridScope scope; scope.self = nullptr; scope.lookup = &Scope::lookup;
+    PatTableScope scope; scope.self = nullptr; scope.lookup = &Scope::lookup;
     PatGrid grids[2] = {gClamp, g23};
 
     struct Case { const char* expr; double u, v; double want; };
@@ -1107,7 +1108,7 @@ static int checkGrid() {
         PatCtx c;
         c.u = cs.u; c.v = cs.v;
         c.grids = grids; c.nGrids = 2;
-        c.gridPool = pool.data(); c.gridPoolN = (int)pool.size();
+        c.dataPool = pool.data(); c.dataPoolN = (int)pool.size();
         char lbl[80]; std::snprintf(lbl, sizeof lbl, "expr %s", cs.expr);
         ok &= chk(lbl, patternEval(prog.data(), (int)prog.size(), c), cs.want, 1e-9);
     }
@@ -1120,6 +1121,7 @@ static int checkGrid() {
         {"grid:nope(u)",    "unknown grid name"},
         {"grid:ramp",       "grid referenced without a call"},
         {"grid(u)",         "bare `grid` with no name"},
+        {"scatter:ramp(u)", "a grid name is NOT visible in the scatter namespace"},
     };
     for (const Bad& bd : bads) {
         std::vector<PatNode> prog; std::string perr;
@@ -1139,6 +1141,192 @@ static int checkGrid() {
 
     std::printf("[checkgrid] worst absolute error = %.3g\n", worst);
     std::printf("[checkgrid] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Deterministic N-D scatter sampler self-test (src/pattern.h: PatScatter /
+// patScatterSample, reached from a pattern expression as `scatter:<name>(c0, …)`).
+// The ragged sibling of -checkgrid; validates, with no scene and no renderer:
+//   (a) EXACT reproduction at each sample position — the property that makes Shepard
+//       an interpolant rather than merely an approximation (and the branch that
+//       removes the 1/0 singularity there);
+//   (b) partition of unity: a constant-valued sample set reads back as that constant
+//       EVERYWHERE, in 1-D through 4-D. This is the analytic check on normalisation;
+//   (c) symmetry — equidistant samples blend to their plain mean, independent of
+//       `power`, which pins the weight formula's distance handling;
+//   (d) `power` actually sharpens: a higher exponent pulls a query nearer the closer
+//       sample, checked against the closed-form two-sample weight;
+//   (e) far-field behaviour: at large distance the blend tends to the plain mean
+//       (it flattens rather than diverging — a scatter's answer to a grid's `clamp`);
+//   (f) the compile path: `scatter:<name>(…)` resolves through a PatTableScope, takes
+//       the SCATTER's own dimensionality as its arity, and lives in a namespace
+//       separate from `grid:`.
+static int checkScatter() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkscatter] %-40s got %.9f want %.9f  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    // Build a scatter from (position, value) tuples into the shared flat pool.
+    std::vector<float> pool;
+    auto add = [&](int ndim, const std::vector<double>& flat, double power) {
+        PatScatter s;
+        s.ndim = ndim; s.power = power; s.eps = 1e-9;
+        s.off = (int)pool.size();
+        s.count = (int)(flat.size() / (size_t)(ndim + 1));
+        for (double d : flat) pool.push_back((float)d);
+        return s;
+    };
+    auto smp = [&](const PatScatter& s, const double* q) {
+        return patScatterSample(s, pool.data(), (int)pool.size(), q);
+    };
+
+    // ---- (a) exact reproduction at every sample position ---------------------
+    // Four samples in 2-D with deliberately unequal values; each must read back exactly.
+    const std::vector<double> quad = {
+        0.0, 0.0,  0.10,
+        1.0, 0.0,  0.90,
+        0.0, 1.0,  0.40,
+        1.0, 1.0,  0.70,
+    };
+    PatScatter s2 = add(2, quad, 2.0);
+    for (int i = 0; i < 4; ++i) {
+        double q[2] = {quad[i * 3 + 0], quad[i * 3 + 1]};
+        char lbl[80]; std::snprintf(lbl, sizeof lbl, "exact at sample %d", i);
+        // 1e-6, not 0: the pool stores FLOATS, so an authored 0.10 is only float-exact.
+        // "Exact" here means "the stored sample, with no interpolation error on top".
+        ok &= chk(lbl, smp(s2, q), quad[i * 3 + 2], 1e-6);
+    }
+
+    // ---- (b) partition of unity, 1-D .. 4-D ----------------------------------
+    // Every sample carries the SAME value, so a normalised blend must return it at any
+    // query — including one far outside the samples' own extent.
+    const double kConst = 0.375;
+    for (int nd = 1; nd <= PAT_ND_MAX_DIM; ++nd) {
+        std::vector<double> flat;
+        // 2^nd samples on the unit cube's corners, all valued kConst.
+        for (int c = 0; c < (1 << nd); ++c) {
+            for (int a = 0; a < nd; ++a) flat.push_back(((c >> a) & 1) ? 1.0 : 0.0);
+            flat.push_back(kConst);
+        }
+        PatScatter s = add(nd, flat, 2.0);
+        const double qs[3][4] = {{0.5, 0.5, 0.5, 0.5}, {0.2, 0.7, 0.1, 0.9}, {7.0, -3.0, 5.0, 2.0}};
+        for (int k = 0; k < 3; ++k) {
+            char lbl[80]; std::snprintf(lbl, sizeof lbl, "%d-D partition of unity, q%d", nd, k);
+            ok &= chk(lbl, smp(s, qs[k]), kConst, 1e-9);
+        }
+    }
+
+    // ---- (c) symmetry: equidistant samples blend to the plain mean -----------
+    // Midpoint of the 2-D quad above: all four are equidistant, so the answer is the
+    // mean of the values regardless of the exponent.
+    const double quadMean = (0.10 + 0.90 + 0.40 + 0.70) / 4.0;
+    { double q[2] = {0.5, 0.5}; ok &= chk("2-D midpoint == mean (power 2)", smp(s2, q), quadMean, 1e-6); }
+    {
+        PatScatter s2p = add(2, quad, 6.0);
+        double q[2] = {0.5, 0.5};
+        ok &= chk("2-D midpoint == mean (power 6)", smp(s2p, q), quadMean, 1e-6);
+    }
+
+    // ---- (d) `power` sharpens, matching the closed-form two-sample weight -----
+    // Samples at 0 and 1 valued 0 and 1: at q the weights are q^-p and (1-q)^-p, so the
+    // result is (1-q)^p / (q^p + (1-q)^p) — an independent formula, not a re-derivation
+    // of the implementation.
+    const std::vector<double> pair = {0.0, 0.0,   1.0, 1.0};
+    const double q1 = 0.25;
+    for (double p : {1.0, 2.0, 3.0, 8.0}) {
+        PatScatter s1 = add(1, pair, p);
+        double q[1] = {q1};
+        const double wa = std::pow(q1, -p), wb = std::pow(1.0 - q1, -p);
+        const double want = wb / (wa + wb);          // value 0 at a, 1 at b
+        char lbl[80]; std::snprintf(lbl, sizeof lbl, "1-D two-sample, power %.0f", p);
+        ok &= chk(lbl, smp(s1, q), want, 1e-9);
+    }
+    // Sharper exponent must move the answer TOWARD the nearer sample (value 0 at 0.0).
+    {
+        PatScatter sSoft = add(1, pair, 1.0), sHard = add(1, pair, 8.0);
+        double q[1] = {q1};
+        if (!(smp(sHard, q) < smp(sSoft, q))) {
+            std::printf("[checkscatter] higher power did not sharpen toward the nearer sample  BAD\n");
+            ok = false;
+        }
+    }
+
+    // ---- (e) far field tends to the plain mean -------------------------------
+    // At a great distance every sample is essentially equidistant, so the blend
+    // flattens to the unweighted mean instead of diverging.
+    { double q[2] = {1e6, 1e6}; ok &= chk("far field -> mean", smp(s2, q), quadMean, 1e-4); }
+
+    // ---- (f) the `scatter:<name>(…)` compile + eval path ----------------------
+    // "pts" is the 2-D quad; "line" is the 1-D pair. Grid lookups must MISS: the two
+    // datatypes share the scope object but not the namespace.
+    struct Scope {
+        static int lookup(const void*, PatTableKind kind, const char* name, int* ndim) {
+            if (kind != PatTableKind::Scatter) return -1;
+            if (!std::strcmp(name, "pts"))  { if (ndim) *ndim = 2; return 0; }
+            if (!std::strcmp(name, "line")) { if (ndim) *ndim = 1; return 1; }
+            return -1;
+        }
+    };
+    PatTableScope scope; scope.self = nullptr; scope.lookup = &Scope::lookup;
+    PatScatter tables[2] = {s2, add(1, pair, 2.0)};
+
+    struct Case { const char* expr; double u, v; double want; };
+    const double wa = std::pow(0.25, -2.0), wb = std::pow(0.75, -2.0);
+    const Case cases[] = {
+        {"scatter:pts(0, 0)",              0.0,  0.0, 0.10},        // exact at a sample
+        {"scatter:pts(u, v)",              1.0,  1.0, 0.70},        // ... via variables
+        {"scatter:pts(0.5, 0.5)",          0.0,  0.0, quadMean},    // equidistant -> mean
+        {"scatter:line(0.25)",             0.0,  0.0, wb / (wa + wb)},
+        {"scatter:line(u) * 2",            0.25, 0.0, 2.0 * wb / (wa + wb)},
+        {"scatter:line(scatter:pts(0,0))", 0.0,  0.0,               // nested: pts(0,0) = 0.1
+             std::pow(0.1, -2.0) * 0.0 / (std::pow(0.1, -2.0) + std::pow(0.9, -2.0)) +
+             std::pow(0.9, -2.0) * 1.0 / (std::pow(0.1, -2.0) + std::pow(0.9, -2.0))},
+    };
+    for (const Case& cs : cases) {
+        std::vector<PatNode> prog; std::string perr;
+        if (!compilePatternExpr(cs.expr, prog, perr, false, nullptr, &scope)) {
+            std::printf("[checkscatter] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+            ok = false; continue;
+        }
+        PatCtx c;
+        c.u = cs.u; c.v = cs.v;
+        c.scatters = tables; c.nScatters = 2;
+        c.dataPool = pool.data(); c.dataPoolN = (int)pool.size();
+        char lbl[96]; std::snprintf(lbl, sizeof lbl, "expr %s", cs.expr);
+        ok &= chk(lbl, patternEval(prog.data(), (int)prog.size(), c), cs.want, 1e-6);
+    }
+    struct Bad { const char* expr; const char* why; };
+    const Bad bads[] = {
+        {"scatter:pts(u)",      "2-D scatter called with 1 argument"},
+        {"scatter:line(u, v)",  "1-D scatter called with 2 arguments"},
+        {"scatter:nope(u)",     "unknown scatter name"},
+        {"scatter:pts",         "scatter referenced without a call"},
+        {"scatter(u)",          "bare `scatter` with no name"},
+        {"grid:pts(u, v)",      "a scatter name is NOT visible in the grid namespace"},
+    };
+    for (const Bad& bd : bads) {
+        std::vector<PatNode> prog; std::string perr;
+        if (compilePatternExpr(bd.expr, prog, perr, false, nullptr, &scope)) {
+            std::printf("[checkscatter] `%s` compiled but should be rejected (%s)  BAD\n", bd.expr, bd.why);
+            ok = false;
+        }
+    }
+    // With no table scope at all (a load-time constant site), `scatter:` must be refused.
+    {
+        std::vector<PatNode> prog; std::string perr;
+        if (compilePatternExpr("scatter:pts(u, v)", prog, perr, false, nullptr, nullptr)) {
+            std::printf("[checkscatter] `scatter:pts(u,v)` compiled with no table scope  BAD\n");
+            ok = false;
+        }
+    }
+
+    std::printf("[checkscatter] worst absolute error = %.3g\n", worst);
+    std::printf("[checkscatter] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -3833,6 +4021,7 @@ static int run(int argc, char** argv) {
     bool checkGratingOnly = false;
     bool checkUpsampleOnly = false;
     bool checkGridOnly = false;
+    bool checkScatterOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
     bool rgbBackward = false;      // -rgb: fast RGB (non-spectral) backward preview (mode R, GPU)
@@ -4122,6 +4311,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
+        else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
         else if (!std::strcmp(argv[i], "-rgb")) rgbBackward = true;
@@ -4267,6 +4457,7 @@ static int run(int argc, char** argv) {
     if (checkGratingOnly)  return checkGrating();  // deterministic, no scene needed
     if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed
     if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
+    if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     bool prism     = !std::strcmp(sceneName, "prism");
     bool materials = !std::strcmp(sceneName, "materials");
     bool fluoro    = !std::strcmp(sceneName, "fluoro");

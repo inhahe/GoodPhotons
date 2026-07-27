@@ -124,8 +124,42 @@ Origin tags point at the authoritative design text for each item.
         multilinear exactness (worst error 1e-8, float-pool storage), all three `outside` policies, and the
         compile/arity/scope rules. Cross-backend: `scraps/grid_test.ftsl` at 16384 spp agrees CPU↔GPU to **0.003 %**
         mean (RMS 0.99/255 — pure MC noise).
-      **Still open here:** the ragged **scatter** sibling (Shepard IDW), and the `[[…][…]](u,v)` *authoring* sugar
-      (increment 2) reaching this same datatype.
+      **Still open here:** the `[[…][…]](u,v)` *authoring* sugar (increment 2) reaching this same datatype.
+      (Several names above were generalized by the scatter port immediately below — `PAT_GRID_MAX_DIM` →
+      `PAT_ND_MAX_DIM`, `PatGridScope` → `PatTableScope`, `Scene::gridPool` → `Scene::dataPool`.)
+    * **STATUS (2026-07-27): increment 3's RAGGED half — the N-D `scatter` datatype + sampler — is DONE
+      (VERSION 0.72.0).** Ported from loom's `data.Scatter` / `interp.ScatterField`: N values at arbitrary
+      positions, blended by **Shepard inverse-distance weighting** `w_i = 1/(d²)^(power/2)`, with a coincident
+      sample (`d² ≤ eps`) returned *exactly* — which is both the correct limit and the singularity guard.
+      Defaults `power = 2` (the cheap `1/d²` path), `eps = 1e-9`. loom's vector-valued `VecScatterField` and its
+      `_local_query` transform were deliberately **not** ported (ftrace's tables are scalar and unit-agnostic).
+      The port was done by **generalizing the grid machinery rather than cloning it**, on the same reasoning as
+      the earlier `DPatEnv` bundling: adding the *next* datatype should cost an enumerator, not a new parameter
+      on `compilePatternExpr` and edits at all its call sites. Concretely:
+      - `src/pattern.h`: `PatOp::Scatter`, `PatScatter` (`ndim`/`count`/`off` into the shared pool + `power`/`eps`),
+        and the shared `__host__ __device__` `patScatterSample`. Samples are **interleaved** at stride `ndim+1`
+        (`p0 … p_{ndim-1}, value`) — one `data { … }` list, because a scatter's positions and values are not
+        separable the way a lattice's are. `PatGridScope` became `PatTableScope` + `PatTableKind {Grid, Scatter}`
+        and `Tok::gridId/gridDim` became `tableId/tableDim`, so one kind-dispatching resolver serves both
+        namespaces (and they *are* separate namespaces: `grid:pts(…)` cannot see a scatter, and vice versa —
+        both directions are covered by the self-tests' must-reject lists).
+      - `Scene::gridPool` became **`Scene::dataPool` — ONE flat float pool shared by both datatypes**, so a scene
+        costs exactly one GPU allocation for its tables however many it declares, of either kind.
+      - `src/ftsl.h`: the `scatter "name" { dim … power … eps … data { … } }` element, loaded in the same Pass 1a
+        as grids; again **no grammar change** was needed (verified by grep: `ftsl_scene.epeg` names neither
+        `grid` nor `scatter` — `plain_header` + the flat-word brace body already cover both).
+      - `src/render_cuda.cu`: `DScene`/`DPatEnv` gained the scatter table beside the grid one and share the
+        renamed pool; `dPatternEval` calls the *same* `patScatterSample`.
+      - `ftrace -checkscatter`: deterministic self-test built on properties that are analytically independent of
+        the implementation — exact reproduction at every sample, 1-D…4-D partition of unity, midpoint == plain
+        mean by symmetry at two powers, the closed-form two-sample weight `(1-q)^p/(q^p+(1-q)^p)` at four powers
+        plus a "higher power sharpens" monotonicity check, and the far-field → mean limit. Worst error 1.4e-7
+        (float-pool storage). Plus the compile/arity/scope/namespace rules. All 11 self-tests pass.
+      - Validation: `scenes/pattern_scatter.ftsl` (five strips: the S-curve two-sample case, the same at power 8
+        collapsing to a step, four irregular 1-D stops showing the plateau at each, and a 5-point 2-D field at
+        powers 2 and 1). Rendered albedo — recovered by dividing out illumination with a flat-0.75 twin render —
+        tracks the analytic IDW at all 81 probe points; CPU↔GPU agree to **0.18/255 mean, 0.81/255 worst** (pure
+        MC noise).
     * **STATUS (2026-07-26): increment 1 of 3 DONE — the shared grammar + loom's canonical tree parse the call.**
       `tools/loom/loom/grammar/ftsl.epeg` now carries the axis tuple, and `loom/grammar/values.py` normalizes it
       (11 new cases in `tests/test_grammar_values.py`; suite 1072 → 1083):
@@ -144,8 +178,8 @@ Origin tags point at the authoritative design text for each item.
       positionals-before-keywords and no-duplicate-formals so the error can name the axis. `as_sampled()` is where
       the **unsaturated** error lives (a bare array reaching a field that samples).
       **STILL TO DO:** (2) mirror `axistuple` into ftrace's `ftsl_scene.epeg` + the C++ reducer, and reuse the same
-      production on the N-D grid / scatter element grammars; and the SCATTER half of increment 3 (loom's `Scatter`
-      in `data.py` / the `interp.py` scatter path — the ragged sibling of the grid landed below).
+      production on the N-D grid / scatter element grammars. (Increment 3 is now complete on both halves — the
+      regular `grid` in 0.71.0 and the ragged `scatter` in 0.72.0; see the two STATUS blocks above.)
       **Increment 2 is a lexer decision, not a mechanical port** (found while doing 1): ftrace's tokenizer
       (`src/ftsl.h` ~line 127) does *not* treat parens as delimiters — a bareword accretes until
       whitespace/brace/bracket/comment/quote — precisely so an expression value like `0.5+0.5*sin(2*pi*8*u)` stays

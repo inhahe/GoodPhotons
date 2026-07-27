@@ -226,6 +226,24 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `dApplyNormalMap` in the device `closestHit`) so every renderer and both devices
   perturb shading identically; tangents transform with instances (`instanceHitToWorld`,
   the device uploading a per-instance `Wm` = toWorld linear).
+  **N-D authored-data tables.** A pattern formula can sample arrays of authored numbers in
+  1–4 dimensions, via two sibling datatypes ported from loom's `data.py`/`interp.py`:
+  `grid:<name>(c0, …)` reads a **regular lattice** (`PatGrid`, samples in C order with axis 0
+  outermost, separable N-linear over 2^ndim corners, `clamp`/`wrap`/`extrapolate` outside the
+  box), and `scatter:<name>(c0, …)` reads **arbitrary positions** (`PatScatter`, Shepard
+  inverse-distance weighting `1/(d²)^(power/2)`, a coincident sample returned exactly).
+  Both live in `pattern.h` as `__host__ __device__` samplers (`patGridSample` /
+  `patScatterSample`) so there is no device re-implementation to drift. Architectural notes:
+  (a) both are the only ops whose **arity is not a property of the function name** — it is the
+  table's own `ndim`, resolved at tokenize time through a `PatTableScope` (a kind-dispatching
+  `{Grid, Scatter}` callback the FTSL builder installs), so a wrong argument count is a
+  compile error rather than a silent zero; (b) tables address their numbers by `int off` +
+  `int count` into **one flat `Scene::dataPool` shared by both kinds** — never by pointer,
+  since the pool grows as later tables load — which is also exactly the layout the GPU
+  uploads, so a scene costs one allocation for its tables however many it declares. The
+  scopes are separate namespaces (a grid `foo` is not `scatter:foo`). Both are wired into
+  every *pattern* site but not yet into scalar *field* formulas (isosurface/density) — a
+  plumbing gap tracked in `known-issues.md`.
 - **`envmap.h` / `sky.h`** — infinite environment lighting. `EnvMap` turns an
   equirectangular linear-RGB buffer into an importance-sampled directional emitter
   (per-texel Jakob–Hanika spectral upsampling + a luminance·sinθ 2-D sampler);

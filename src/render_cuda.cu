@@ -768,13 +768,15 @@ struct DScene {
     double           totalPower;
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
     const DTexture*  textures; int nTex;   // reflectance textures (mat.reflectTex)
-    // N-D sampled arrays (§grids), reached from a pattern as `grid:<name>(c0, …)`.
-    // Uploaded VERBATIM: the host PatGrid header is already POD that refers to its
-    // samples by OFFSET (never a pointer), and gridPool is the same flat float run the
-    // host samples, so patGridSample — the one shared __host__ __device__ sampler in
-    // pattern.h — runs here unchanged and the two backends agree bit-for-bit.
-    const PatGrid*   grids;    int nGrids;
-    const float*     gridPool; int gridPoolN;
+    // N-D data tables (§grids), reached from a pattern as `grid:<name>(c0, …)` (regular
+    // lattice) or `scatter:<name>(c0, …)` (ragged). Uploaded VERBATIM: the host headers
+    // are already POD that refer to their numbers by OFFSET (never a pointer), and
+    // dataPool is the same flat float run the host reads, so patGridSample /
+    // patScatterSample — the shared __host__ __device__ samplers in pattern.h — run here
+    // unchanged and the two backends agree bit-for-bit.
+    const PatGrid*    grids;    int nGrids;
+    const PatScatter* scatters; int nScatters;
+    const float*      dataPool; int dataPoolN;
     const double*    fluoCdfAll;    // flattened per-material fluorescence emission CDFs
     // BDPT shared wavelength sampler (mirrors Scene::emitSampler): the combined
     // g(lambda)=sum_k geomWeight_k*SPD_k CDF, its bin step, and emitG = its integral.
@@ -815,19 +817,23 @@ struct DScene {
 // such a node can never actually appear there; the null tables just make the VM
 // total instead of undefined if one ever did.
 struct DPatEnv {
-    const DTexture* tex;      int nTex;
-    const PatGrid*  grids;    int nGrids;
-    const float*    gridPool; int gridPoolN;
+    const DTexture*   tex;      int nTex;
+    const PatGrid*    grids;    int nGrids;
+    const PatScatter* scatters; int nScatters;
+    const float*      dataPool; int dataPoolN;
 };
 __host__ __device__ static inline DPatEnv dPatEnvNone() {
     DPatEnv e; e.tex = nullptr; e.nTex = 0;
-    e.grids = nullptr; e.nGrids = 0; e.gridPool = nullptr; e.gridPoolN = 0;
+    e.grids = nullptr; e.nGrids = 0;
+    e.scatters = nullptr; e.nScatters = 0;
+    e.dataPool = nullptr; e.dataPoolN = 0;
     return e;
 }
 __host__ __device__ static inline DPatEnv dPatEnvOf(const DScene& sc) {
     DPatEnv e; e.tex = sc.textures; e.nTex = sc.nTex;
     e.grids = sc.grids; e.nGrids = sc.nGrids;
-    e.gridPool = sc.gridPool; e.gridPoolN = sc.gridPoolN;
+    e.scatters = sc.scatters; e.nScatters = sc.nScatters;
+    e.dataPool = sc.dataPool; e.dataPoolN = sc.dataPoolN;
     return e;
 }
 
@@ -3653,10 +3659,23 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                 int gi = (int)nd.a;
                 if (gi < 0 || gi >= env.nGrids || !env.grids) { st[sp++] = 0.0; break; }
                 const PatGrid& g = env.grids[gi];
-                int gnd = g.ndim < 1 ? 1 : (g.ndim > PAT_GRID_MAX_DIM ? PAT_GRID_MAX_DIM : g.ndim);
-                double co[PAT_GRID_MAX_DIM];
+                int gnd = g.ndim < 1 ? 1 : (g.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : g.ndim);
+                double co[PAT_ND_MAX_DIM];
                 for (int k = gnd - 1; k >= 0; --k) co[k] = st[--sp];
-                st[sp++] = patGridSample(g, env.gridPool, env.gridPoolN, co);
+                st[sp++] = patGridSample(g, env.dataPool, env.dataPoolN, co);
+                break;
+            }
+            case PatOp::Scatter: {
+                // Same contract as Grid, sharing the same flat pool and the same shared
+                // sampler — a scatter just resolves its value by inverse-distance blend
+                // instead of a lattice walk.
+                int si = (int)nd.a;
+                if (si < 0 || si >= env.nScatters || !env.scatters) { st[sp++] = 0.0; break; }
+                const PatScatter& s = env.scatters[si];
+                int snd = s.ndim < 1 ? 1 : (s.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : s.ndim);
+                double co[PAT_ND_MAX_DIM];
+                for (int k = snd - 1; k >= 0; --k) co[k] = st[--sp];
+                st[sp++] = patScatterSample(s, env.dataPool, env.dataPoolN, co);
                 break;
             }
         }
@@ -3760,9 +3779,10 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                 st[sp-1] = 0.0f; // context. Handled explicitly so the switch stays total.
                 break;
             }
-            case PatOp::Grid:    // likewise unreachable — `grid:` needs a grid scope, which
-                st[sp++] = 0.0f; // field formulas are never compiled with. The operand count
-                break;           // is unknown here (it is the grid's ndim), so just push 0.
+            case PatOp::Grid:      // likewise unreachable — `grid:`/`scatter:` need a table
+            case PatOp::Scatter:   // scope, which field formulas are never compiled with. The
+                st[sp++] = 0.0f;   // operand count is unknown here (it is the table's ndim),
+                break;             // so just push 0. See known-issues.md for the real fix.
         }
     }
     return sp > 0 ? st[0] : 0.0f;
@@ -9709,13 +9729,16 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;
     sc.textures = d_tex; sc.nTex = (int)dtex.size();
-    // N-D grids upload VERBATIM — the host PatGrid header refers to its samples by
-    // offset into the shared pool, never by pointer, so no fix-up is needed and the
-    // device sampler is literally the same function the host runs.
-    sc.grids    = scene.grids.empty()    ? nullptr : (const PatGrid*)keep(uploadVec(scene.grids));
-    sc.nGrids   = (int)scene.grids.size();
-    sc.gridPool = scene.gridPool.empty() ? nullptr : (const float*)keep(uploadVec(scene.gridPool));
-    sc.gridPoolN = (int)scene.gridPool.size();
+    // N-D data tables upload VERBATIM — the host PatGrid / PatScatter headers refer to
+    // their numbers by offset into the shared pool, never by pointer, so no fix-up is
+    // needed and the device samplers are literally the same functions the host runs.
+    // One pool serves both kinds, so this is one allocation however many tables.
+    sc.grids     = scene.grids.empty()    ? nullptr : (const PatGrid*)keep(uploadVec(scene.grids));
+    sc.nGrids    = (int)scene.grids.size();
+    sc.scatters  = scene.scatters.empty() ? nullptr : (const PatScatter*)keep(uploadVec(scene.scatters));
+    sc.nScatters = (int)scene.scatters.size();
+    sc.dataPool  = scene.dataPool.empty() ? nullptr : (const float*)keep(uploadVec(scene.dataPool));
+    sc.dataPoolN = (int)scene.dataPool.size();
     sc.fluoCdfAll = d_fluoCdf;
     sc.emitSamplerCdf = d_emitSamp;
     sc.emitSamplerN = (int)(emitSampCdf.empty() ? 0 : emitSampCdf.size() - 1);

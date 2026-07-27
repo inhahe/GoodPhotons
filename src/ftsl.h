@@ -727,7 +727,8 @@ public:
 
     bool build(const std::vector<Block>& blocks, Loaded& L) {
         records_ = &L.scene.records;   // stable handle for record refs at value sites (records added in Pass 1d)
-        gridsRef_ = &L.scene.grids;    // ditto for grid arity lookups (grids added in Pass 1a)
+        gridsRef_    = &L.scene.grids;      // ditto for N-D table arity lookups
+        scattersRef_ = &L.scene.scatters;   // (both kinds are added in Pass 1a)
         // Pass 0: global scene settings — the length unit and spectral range. All
         // authored lengths are scaled to the internal unit (metres) at load time,
         // so a scene authored in cm and one in m render identically.
@@ -765,11 +766,16 @@ public:
         for (const auto& b : blocks)
             if (b.type == "spectrum") spectraBlocks_[b.name] = &b;
 
-        // Pass 1a: N-D sampled arrays. FIRST of the table passes, because a procedural
-        // `texture { rgb "…" }` bakes during Pass 1b and may sample `grid:<name>(…)`.
+        // Pass 1a: N-D data tables (regular `grid`s and ragged `scatter`s). FIRST of the
+        // table passes, because a procedural `texture { rgb "…" }` bakes during Pass 1b
+        // and may sample `grid:<name>(…)` / `scatter:<name>(…)`.
         for (const auto& b : blocks) {
             if (b.type != "grid") continue;
             if (!addGrid(b, L)) return false;
+        }
+        for (const auto& b : blocks) {
+            if (b.type != "scatter") continue;
+            if (!addScatter(b, L)) return false;
         }
 
         // Pass 1b: image textures (must exist before materials that bind them).
@@ -842,7 +848,8 @@ public:
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
                      b.type == "texture" || b.type == "pattern" || b.type == "record" ||
-                     b.type == "grid" || b.type == "mesh_asset") { /* handled */ }
+                     b.type == "grid" || b.type == "scatter" ||
+                     b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
@@ -896,23 +903,33 @@ private:
     }
     PatTexScope texScope_{ this, &Builder::texScopeThunk_ };
 
-    // Grid scope for `grid:<name>(c0, …)` samples inside a pattern expression. Same
-    // deal as texScope_, with one extra job: it also reports the grid's DIMENSIONALITY,
-    // because a grid's call arity is a property of the grid itself (a 2-D grid takes
-    // two coordinates), not of the function name — so the compiler can only check the
-    // argument count once the name resolves. Filled by the grid pass, which runs before
-    // textures/patterns/records, so authoring order doesn't matter for those.
-    std::unordered_map<std::string, int> gridIndex_;      // grid name -> Scene::grids index
-    const std::vector<PatGrid>* gridsRef_ = nullptr;      // -> L.scene.grids (for the ndim report)
-    static int gridScopeThunk_(const void* self, const char* name, int* ndim) {
+    // N-D table scope for `grid:<name>(c0, …)` and `scatter:<name>(c0, …)` samples
+    // inside a pattern expression. Same deal as texScope_, with one extra job: it also
+    // reports the table's DIMENSIONALITY, because the call arity is a property of the
+    // table itself (a 2-D grid takes two coordinates), not of the function name — so
+    // the compiler can only check the argument count once the name resolves. Filled by
+    // the data pass, which runs before textures/patterns/records, so authoring order
+    // doesn't matter for those.
+    std::unordered_map<std::string, int> gridIndex_;         // name -> Scene::grids index
+    std::unordered_map<std::string, int> scatterIndex_;      // name -> Scene::scatters index
+    const std::vector<PatGrid>*    gridsRef_    = nullptr;   // -> L.scene.grids    (ndim report)
+    const std::vector<PatScatter>* scattersRef_ = nullptr;   // -> L.scene.scatters (ndim report)
+    static int tableScopeThunk_(const void* self, PatTableKind kind, const char* name, int* ndim) {
         const Builder* bl = static_cast<const Builder*>(self);
-        auto it = bl->gridIndex_.find(name);
-        if (it == bl->gridIndex_.end()) return -1;
-        if (ndim && bl->gridsRef_ && it->second < (int)bl->gridsRef_->size())
-            *ndim = (*bl->gridsRef_)[it->second].ndim;
+        if (kind == PatTableKind::Grid) {
+            auto it = bl->gridIndex_.find(name);
+            if (it == bl->gridIndex_.end()) return -1;
+            if (ndim && bl->gridsRef_ && it->second < (int)bl->gridsRef_->size())
+                *ndim = (*bl->gridsRef_)[it->second].ndim;
+            return it->second;
+        }
+        auto it = bl->scatterIndex_.find(name);
+        if (it == bl->scatterIndex_.end()) return -1;
+        if (ndim && bl->scattersRef_ && it->second < (int)bl->scattersRef_->size())
+            *ndim = (*bl->scattersRef_)[it->second].ndim;
         return it->second;
     }
-    PatGridScope gridScope_{ this, &Builder::gridScopeThunk_ };
+    PatTableScope tableScope_{ this, &Builder::tableScopeThunk_ };
     std::unordered_map<std::string, int> recordIndex_;    // record name  -> Scene::records index
     const std::vector<Record>* records_ = nullptr;        // -> L.scene.records (set in build; for record refs at value sites)
     std::unordered_map<std::string, Spectrum> spdFileCache_; // path -> loaded measured SPD
@@ -984,7 +1001,7 @@ private:
         m.reflect = constantSpectrum(0.75);
         std::vector<PatNode> drv;
         std::string cerr;
-        if (!compilePatternExpr(driverExpr, drv, cerr, /*allowT=*/false, &texScope_, &gridScope_)) {
+        if (!compilePatternExpr(driverExpr, drv, cerr, /*allowT=*/false, &texScope_, &tableScope_)) {
             fail("record material driver '" + driverExpr + "': " + cerr);
             return -1;
         }
@@ -1420,9 +1437,9 @@ private:
                 fail("texture '" + b.name + "': rgb needs three quoted exprs: rgb \"r(u,v)\" \"g(u,v)\" \"b(u,v)\""); return false;
             }
             std::vector<PatNode> pr, pg, pb; std::string perr;
-            if (!compilePatternExpr(rgbS->val.words[0], pr, perr, false, &texScope_, &gridScope_)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
-            if (!compilePatternExpr(rgbS->val.words[1], pg, perr, false, &texScope_, &gridScope_)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
-            if (!compilePatternExpr(rgbS->val.words[2], pb, perr, false, &texScope_, &gridScope_)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[0], pr, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[1], pg, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[2], pb, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
             int res = (int)dblOf(b, "res", 512.0);
             if (res < 1) res = 1; else if (res > 8192) res = 8192;
             tex.encoding = TexEncoding::Linear;   // expr outputs are linear albedo already
@@ -1562,7 +1579,7 @@ private:
             std::string expr;
             for (size_t k = 0; k < es->val.words.size(); ++k) { if (k) expr += " "; expr += es->val.words[k]; }
             std::string perr;
-            if (!compilePatternExpr(expr, pat.nodes, perr, false, &texScope_, &gridScope_)) {
+            if (!compilePatternExpr(expr, pat.nodes, perr, false, &texScope_, &tableScope_)) {
                 fail("pattern '" + b.name + "': " + perr); return false;
             }
         } else {
@@ -1642,9 +1659,9 @@ private:
             }
         }
         if (shape.empty()) shape.push_back((int)samples.size());
-        if ((int)shape.size() > PAT_GRID_MAX_DIM) {
+        if ((int)shape.size() > PAT_ND_MAX_DIM) {
             fail(who + ": " + std::to_string(shape.size()) + " axes exceeds the " +
-                 std::to_string((int)PAT_GRID_MAX_DIM) + "-D limit");
+                 std::to_string((int)PAT_ND_MAX_DIM) + "-D limit");
             return false;
         }
         long long need = 1;
@@ -1682,8 +1699,8 @@ private:
         };
 
         bool haveLo = false, loScalar = false, haveHi = false, hiScalar = false;
-        double lo[PAT_GRID_MAX_DIM] = {0, 0, 0, 0};
-        double hi[PAT_GRID_MAX_DIM] = {0, 0, 0, 0};
+        double lo[PAT_ND_MAX_DIM] = {0, 0, 0, 0};
+        double hi[PAT_ND_MAX_DIM] = {0, 0, 0, 0};
         if (!axisVec("lo", lo, haveLo, loScalar)) return false;
         if (!axisVec("hi", hi, haveHi, hiScalar)) return false;
         (void)loScalar;
@@ -1716,12 +1733,90 @@ private:
         // Samples go into ONE shared pool; the header points at its run by OFFSET, never
         // by pointer — the pool grows as later grids load, and that is also the exact
         // flat layout the GPU uploads.
-        g.off   = (int)L.scene.gridPool.size();
+        g.off   = (int)L.scene.dataPool.size();
         g.count = (int)samples.size();
-        L.scene.gridPool.insert(L.scene.gridPool.end(), samples.begin(), samples.end());
+        L.scene.dataPool.insert(L.scene.dataPool.end(), samples.begin(), samples.end());
         int id = (int)L.scene.grids.size();
         L.scene.grids.push_back(g);
         gridIndex_[b.name] = id;
+        return true;
+    }
+
+    // ---- N-D scattered samples (the ragged sibling of `grid`) ----
+    //   scatter "name" {
+    //       dim   2                   # coordinates per sample; absent -> 1
+    //       power 2                   # Shepard exponent (absent -> 2); higher = tighter
+    //       eps   1e-9                # squared-distance "this IS that sample" threshold
+    //       data {                    # (dim + 1) numbers per sample: position…, value
+    //           0 0   0.1
+    //           1 0   0.9
+    //           0.5 1 0.4
+    //       }
+    //   }
+    // Sampled as `scatter:<name>(c0, …)` with one coordinate per dimension, exactly like
+    // a grid — and like a grid, its coordinates are its OWN units, unscaled by `units`.
+    // Use this where the data does NOT sit on a lattice; a `grid` is both smaller and
+    // cheaper (O(2^ndim) vs O(count) per sample) whenever the data actually is regular.
+    bool addScatter(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("scatter needs a \"name\""); return false; }
+        if (scatterIndex_.count(b.name)) { fail("duplicate scatter name '" + b.name + "'"); return false; }
+        const std::string who = "scatter '" + b.name + "'";
+
+        PatScatter s;
+        if (const Stmt* ds = find(b, "dim")) {
+            if (ds->val.words.empty() || !isNumber(ds->val.words[0])) {
+                fail(who + ": `dim` needs a number"); return false;
+            }
+            s.ndim = (int)num(ds->val.words[0]);
+            if (s.ndim < 1 || s.ndim > PAT_ND_MAX_DIM) {
+                fail(who + ": `dim` must be 1.." + std::to_string((int)PAT_ND_MAX_DIM));
+                return false;
+            }
+        }
+
+        if (const Stmt* ps = find(b, "power")) {
+            if (ps->val.words.empty() || !isNumber(ps->val.words[0])) {
+                fail(who + ": `power` needs a number"); return false;
+            }
+            s.power = num(ps->val.words[0]);
+            if (!(s.power > 0.0)) { fail(who + ": `power` must be > 0"); return false; }
+        }
+        if (const Stmt* es = find(b, "eps")) {
+            if (es->val.words.empty() || !isNumber(es->val.words[0])) {
+                fail(who + ": `eps` needs a number"); return false;
+            }
+            s.eps = num(es->val.words[0]);
+            if (s.eps < 0.0) { fail(who + ": `eps` must be >= 0"); return false; }
+        }
+
+        // Samples: same flat-word `data { … }` body a grid uses, but read in strides of
+        // (dim + 1) — the position's coordinates followed by that sample's value. One
+        // interleaved list keeps a sample's position and value visually together, which
+        // is the whole point of a scatter (they are not separable the way a lattice is).
+        const Stmt* ds = find(b, "data");
+        if (!ds) { fail(who + " needs a `data { … }` list of numbers"); return false; }
+        const std::vector<std::string>& dw = ds->val.block ? ds->val.block->words : ds->val.words;
+        std::vector<float> flat;
+        flat.reserve(dw.size());
+        for (const auto& w : dw) {
+            if (!isNumber(w)) { fail(who + ": non-numeric entry '" + w + "' in `data`"); return false; }
+            flat.push_back((float)num(w));
+        }
+        if (flat.empty()) { fail(who + ": `data` is empty"); return false; }
+        const int stride = s.ndim + 1;
+        if ((int)(flat.size() % (size_t)stride) != 0) {
+            fail(who + ": `data` has " + std::to_string(flat.size()) + " numbers, which is not a " +
+                 "multiple of dim+1 = " + std::to_string(stride) + " (each sample is " +
+                 std::to_string(s.ndim) + " coordinate(s) then its value)");
+            return false;
+        }
+
+        s.count = (int)(flat.size() / (size_t)stride);
+        s.off   = (int)L.scene.dataPool.size();
+        L.scene.dataPool.insert(L.scene.dataPool.end(), flat.begin(), flat.end());
+        int id = (int)L.scene.scatters.size();
+        L.scene.scatters.push_back(s);
+        scatterIndex_[b.name] = id;
         return true;
     }
 
@@ -1862,7 +1957,7 @@ private:
             for (auto& st : ch.stops) {
                 if (ch.kind == ChanKind::Scalar) {
                     std::string cerr;
-                    if (!compilePatternExpr(st.token, st.expr, cerr, false, &texScope_, &gridScope_)) {
+                    if (!compilePatternExpr(st.token, st.expr, cerr, false, &texScope_, &tableScope_)) {
                         fail("record '" + rec.name + "' channel '" + ch.name +
                              "': bad stop expression '" + st.token + "': " + cerr);
                         return false;
@@ -1934,7 +2029,7 @@ private:
                 auto rit = recordIndex_.find(rname);
                 if (rit == recordIndex_.end()) { fail("`from`: unknown record '" + rname + "'"); return m; }
                 std::vector<PatNode> drv; std::string cerr;
-                if (!compilePatternExpr(dexpr, drv, cerr, false, &texScope_, &gridScope_)) {
+                if (!compilePatternExpr(dexpr, drv, cerr, false, &texScope_, &tableScope_)) {
                     fail("`from " + rname + "` driver '" + dexpr + "': " + cerr); return m;
                 }
                 const Record& rec = L.scene.records[rit->second];
@@ -2044,7 +2139,7 @@ private:
                 if (selStop >= 0) { fail("record-override `" + slot + " = " + rhs +
                     "`: a stop selector needs a record channel"); return m; }
                 std::string cerr;
-                if (!compilePatternExpr(rhs, rb.driver, cerr, false, &texScope_, &gridScope_)) {
+                if (!compilePatternExpr(rhs, rb.driver, cerr, false, &texScope_, &tableScope_)) {
                     fail("record-override `" + slot + " = " + rhs + "`: " + cerr); return m;
                 }
                 rb.recordIndex = -1;

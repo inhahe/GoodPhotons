@@ -323,21 +323,68 @@ samples come from a multilinear function reproduces it exactly. Coordinates are 
 grid's **own units** and are *not* rescaled by the scene's `units` setting (like a
 `pattern`'s `scale`, a grid is unit-agnostic).
 
-Grids load before textures, patterns and records, so declaration order never matters —
-including inside a procedural `texture { rgb "…" }`, which may sample any grid. Scope
-matches `tex:`: `grid:` is available in `pattern` blocks, procedural texture channels and
-record driver/stop/override expressions. It is **not** yet available in scalar *field*
-formulas (isosurface `function { expr }`, medium `density`/`ior`, load-time constants),
-where it is a compile error rather than a silent zero — unlike `tex:`, that is a plumbing
-gap rather than a semantic one, tracked in `known-issues.md`.
+`ftrace -checkgrid` runs the deterministic sampler self-test (exact sample recovery,
+C-order flattening, 1-D…4-D multilinear exactness, the three `outside` policies, and the
+compile/arity rules), and `scenes/pattern_grid.ftsl` renders one feature per wall strip
+(plain ramp, 2-D C order, `wrap`, the default index lattice, `extrapolate`) as a direct
+albedo read-out.
 
-The whole path is shared with the GPU: the `PatGrid` headers and the flat sample pool
-upload verbatim and the device runs the *same* sampler function, so a grid renders
-identically on either backend. `ftrace -checkgrid` runs the deterministic sampler
-self-test (exact sample recovery, C-order flattening, 1-D…4-D multilinear exactness, the
-three `outside` policies, and the compile/arity rules), and
-`scenes/pattern_grid.ftsl` renders one feature per wall strip (plain ramp, 2-D C order,
-`wrap`, the default index lattice, `extrapolate`) as a direct albedo read-out.
+**Scattered samples — `scatter:<name>(c0, …)`:** the **ragged sibling** of a grid. A
+`scatter` holds values at *arbitrary* positions — no lattice — and blends them by
+**Shepard inverse-distance weighting**. Reach for it when the data never sat on a grid in
+the first place: a few probe measurements, samples along a path, a handful of authored
+control points.
+
+```
+scatter "pts" {
+    dim   2                            # coordinates per sample (1..4); omitted ⇒ 1
+    power 2                            # inverse-distance exponent; omitted ⇒ 2
+    data {                             # (dim + 1) numbers per sample: position…, value
+        0.15 0.20   0.95
+        0.80 0.25   0.10
+        0.50 0.55   0.70
+    }
+}
+
+pattern "p" { expr "scatter:pts(u, v)" }
+```
+
+| Key | Meaning |
+|---|---|
+| `data { … }` | The samples, each as its **position then its value** — `dim + 1` numbers, repeated. One interleaved list, because a scatter's position and value are not separable the way a lattice's are. Required. |
+| `dim` | Coordinates per sample, i.e. the call's arity. Omitted ⇒ **1** (so `data` is position/value pairs). Max 4. |
+| `power` | The exponent on distance: weight of a sample is `|q − p|^-power`. Omitted ⇒ **2** (also the fastest path). Higher ⇒ each sample dominates its own neighbourhood, approaching nearest-neighbour / Voronoi; lower ⇒ broader, softer, more global. |
+| `eps` | Squared-distance threshold for "the query **is** this sample". Omitted ⇒ `1e-9`. |
+
+Two behaviours distinguish this from `grid:`'s linear interpolation, and both are
+deliberate: a sample is reproduced **exactly** at its own position and the field arrives
+there with **zero slope** (hence a visible plateau at each sample), and outside the
+samples the field **flattens toward their weighted mean** rather than diverging — the
+scatter counterpart of a grid's `clamp`. Being normalised, it also reproduces a constant
+field exactly, everywhere.
+
+A scatter costs O(count) per sample against a grid's O(2^ndim), and stores a position per
+value — so where data genuinely is regular, a `grid` is both smaller and faster. Use a
+scatter for the data a grid *cannot* represent.
+
+`ftrace -checkscatter` is the deterministic self-test (exact reproduction, 1-D…4-D
+partition of unity, symmetry, the closed-form two-sample weight for several exponents,
+far-field flattening, and the compile/arity/namespace rules), and
+`scenes/pattern_scatter.ftsl` renders one feature per wall strip.
+
+**Scope and loading (both datatypes).** Grids and scatters load before textures, patterns
+and records, so declaration order never matters — including inside a procedural
+`texture { rgb "…" }`, which may sample either. Scope matches `tex:`: both are available
+in `pattern` blocks, procedural texture channels and record driver/stop/override
+expressions. Neither is *yet* available in scalar **field** formulas (isosurface
+`function { expr }`, medium `density`/`ior`, load-time constants), where a sample is a
+compile error rather than a silent zero — unlike `tex:`, that is a plumbing gap rather
+than a semantic one, tracked in `known-issues.md`. The two names live in **separate
+namespaces**: a grid called `foo` is not reachable as `scatter:foo`.
+
+The whole path is shared with the GPU: the `PatGrid` / `PatScatter` headers and the one
+flat number pool they share upload verbatim and the device runs the *same* sampler
+functions, so either table renders identically on either backend.
 
 **POV-Ray internal functions:** the whole classic `functions.inc` isosurface library is
 built in — `f_torus`, `f_heart`, `f_klein_bottle`, `f_superellipsoid`, `f_dupin_cyclid`,
