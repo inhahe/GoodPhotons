@@ -1312,16 +1312,14 @@ __device__ static double dVdbSample(const DVdbGrid& g, const DVec3& p) {
     int nx = g.nx, ny = g.ny, nz = g.nz;
     if (fi < -0.5 || fj < -0.5 || fk < -0.5 ||
         fi > nx - 0.5 || fj > ny - 0.5 || fk > nz - 0.5) return 0.0;
-    double ffi = floor(fi), ffj = floor(fj), ffk = floor(fk);
-    int i0 = (int)ffi, j0 = (int)ffj, k0 = (int)ffk;
-    auto cl = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
-    int i0c = cl(i0, nx-1), i1c = cl(i0+1, nx-1);
-    int j0c = cl(j0, ny-1), j1c = cl(j0+1, ny-1);
-    int k0c = cl(k0, nz-1), k1c = cl(k0+1, nz-1);
-    double tx = fi - ffi, ty = fj - ffj, tz = fk - ffk;
-    tx = tx < 0 ? 0 : (tx > 1 ? 1 : tx);
-    ty = ty < 0 ? 0 : (ty > 1 ? 1 : ty);
-    tz = tz < 0 ? 0 : (tz > 1 ? 1 : tz);
+    // Clamp the COORDINATE (not just the stencil indices) — see VdbGrid::sample.
+    auto cld = [](double v, double hi) { return v < 0.0 ? 0.0 : (v > hi ? hi : v); };
+    double ci = cld(fi, nx-1), cj = cld(fj, ny-1), ck = cld(fk, nz-1);
+    int i0c = (int)ci, j0c = (int)cj, k0c = (int)ck;   // ci >= 0, so trunc == floor
+    int i1c = i0c + 1 < nx ? i0c + 1 : nx - 1;
+    int j1c = j0c + 1 < ny ? j0c + 1 : ny - 1;
+    int k1c = k0c + 1 < nz ? k0c + 1 : nz - 1;
+    double tx = ci - i0c, ty = cj - j0c, tz = ck - k0c;
     const int32_t*  BI = g.brickIndex;
     const uint16_t* BD = g.brickData;
     const int  sh = g.brickShift, mask = g.brickB - 1;

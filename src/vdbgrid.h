@@ -99,15 +99,20 @@ struct VdbGrid {
         // already clips rays to the AABB, so this only guards interpolation edges.
         if (fi < -0.5 || fj < -0.5 || fk < -0.5 ||
             fi > nx - 0.5 || fj > ny - 0.5 || fk > nz - 0.5) return 0.0;
-        // Clamp the interpolation stencil to the valid lattice.
-        auto clampi = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
-        int i0 = clampi((int)std::floor(fi), nx - 1), i1 = clampi(i0 + 1, nx - 1);
-        int j0 = clampi((int)std::floor(fj), ny - 1), j1 = clampi(j0 + 1, ny - 1);
-        int k0 = clampi((int)std::floor(fk), nz - 1), k1 = clampi(k0 + 1, nz - 1);
-        double tx = fi - std::floor(fi), ty = fj - std::floor(fj), tz = fk - std::floor(fk);
-        if (tx < 0) tx = 0; else if (tx > 1) tx = 1;
-        if (ty < 0) ty = 0; else if (ty > 1) ty = 1;
-        if (tz < 0) tz = 0; else if (tz > 1) tz = 1;
+        // Clamp the sample COORDINATE to the lattice, then interpolate. Clamping
+        // only the stencil indices (as this used to) leaves the fraction near 1
+        // in the outer half-voxel shell below index 0, so the sample would be
+        // dominated by the SECOND voxel and get wronger the further out it went;
+        // clamping the coordinate makes that shell read the edge voxel, which is
+        // what the clamp was always meant to do. Inside [0, n-1] this is
+        // bit-identical to the old code (and drops three floor() calls).
+        auto clampd = [](double v, double hi) { return v < 0.0 ? 0.0 : (v > hi ? hi : v); };
+        double ci = clampd(fi, nx - 1), cj = clampd(fj, ny - 1), ck = clampd(fk, nz - 1);
+        int i0 = (int)ci, j0 = (int)cj, k0 = (int)ck;   // ci >= 0, so trunc == floor
+        int i1 = i0 + 1 < nx ? i0 + 1 : nx - 1;
+        int j1 = j0 + 1 < ny ? j0 + 1 : ny - 1;
+        int k1 = k0 + 1 < nz ? k0 + 1 : nz - 1;
+        double tx = ci - i0, ty = cj - j0, tz = ck - k0;
         auto at = [&](int i, int j, int k) -> double {
             return (double)halfBitsToFloat(data[(size_t(k) * ny + j) * nx + i]);
         };

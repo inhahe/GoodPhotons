@@ -2416,6 +2416,36 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
 
 ## Recently fixed
 
+### VDB sampler read the *second* voxel in the low-face half-voxel shell — FIXED 2026-07-27 (v0.84.2)
+
+`VdbGrid::sample` (`src/vdbgrid.h`) and its device twin `dVdbSample` (`src/render_cuda.cu`)
+clamped the interpolation **stencil indices** to `[0, n-1]` but left the interpolation
+**fraction** alone. For a point just below index 0 — `fi ∈ (-0.5, 0)`, which the half-voxel
+margin explicitly admits — `floor(fi)` is `-1`, so `i0` clamped up to `0` and `i1` became `1`,
+while `tx = fi - floor(fi)` stayed in `(0.5, 1)`. The sample was therefore **dominated by the
+second voxel**, and got *wronger the further outside the point was* (at `fi = -0.49` it was
+99% `v[1]`, 1% `v[0]`), which is backwards. The upper shell was fine, because clamping `i1`
+down to `n-1` makes both stencil taps the same voxel there — so the bug was asymmetric and
+only ever hit the x/y/z **min** faces.
+
+Effect: a half-voxel-thick shell on the three low faces of every imported `.vdb`/`.nvdb`
+volume rendered with density taken from the *next* slab in. Usually invisible (a cloud's edge
+voxels are near-zero), but plainly wrong wherever the boundary slab differs from its neighbour
+— on `scraps/cloud.nvdb` the shell read `0.325` where the edge voxel is `0.0`.
+
+**Fix:** clamp the sample *coordinate* to `[0, n-1]` before the floor, which is what the clamp
+was always meant to mean, then derive `i0`/`i1`/`tx` from the clamped coordinate. Inside the
+lattice this is **bit-identical** to the old code (and drops three `floor()` calls from the hot
+path, since `(int)` truncation equals `floor` for a non-negative coordinate). Applied
+identically to the CPU and CUDA samplers so the twins stay in step.
+
+Found by porting the sampler into loom (`ReadGrid.sample`, `loom/vdbio.py`) for the new
+`VolumeField` term and noticing that a **360° rotation** — which must be a no-op — moved the
+baked field by up to 0.32. Regression test:
+`tests/test_vdbio.py::test_sampler_edge_shell_reads_the_edge_voxel_not_the_second`, plus
+`test_volume_field_placement_is_lossless`, which catches it independently; both fail against
+the old stencil-only clamp.
+
 ### Scene grammar: two value-less flag keywords can't share a line — FIXED (docs+scene) 2026-07-14
 
 `camera_curve "fly" { … closed   exposure_lock … }` silently dropped the exposure lock, so
