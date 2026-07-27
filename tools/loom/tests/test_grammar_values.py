@@ -19,8 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 from loom.grammar.values import (  # noqa: E402
-    Arr, Ref, ShapeError, Vec,
-    as_color, as_color_list, as_scalar, as_vector, parse_value,
+    Arg, Arr, Call, Ref, ShapeError, Vec,
+    as_color, as_color_list, as_sampled, as_scalar, as_vector, parse_value,
 )
 
 
@@ -164,6 +164,74 @@ def test_as_scalar_and_as_vector():
 def test_syntax_error_is_valueerror_not_shapeerror():
     with pytest.raises(ValueError):
         parse_value("[1 0 0")                 # unbalanced bracket
+
+
+# ---- axis-labelled arrays: the sample call --------------------------------
+# A trailing tuple on an array is not a label, it is the *sample call* — the
+# same operation as loom's `grid(x, y)` (TODO "ADDENDUM — call = sample").
+
+def test_call_is_array_plus_coordinates():
+    assert parse_value("[0 1](u)") == Call(Vec([0.0, 1.0]), [Arg(None, "u")])
+
+
+def test_call_on_a_2d_array():
+    assert parse_value("[[0,1,2][3,4,5]](u,v)") == Call(
+        Arr([Vec([0.0, 1.0, 2.0]), Vec([3.0, 4.0, 5.0])]),
+        [Arg(None, "u"), Arg(None, "v")],
+    )
+
+
+def test_array_without_a_tuple_is_not_a_call():
+    # `[X] == X` still holds — an uncalled array is a plain, *unsaturated* value.
+    assert parse_value("[0 1]") == Vec([0.0, 1.0])
+
+
+def test_bare_name_is_only_a_value_when_called():
+    assert parse_value("ramp(u)") == Call("ramp", [Arg(None, "u")])
+    with pytest.raises(ValueError):
+        parse_value("ramp")                   # a stray bareword is still not a value
+
+
+def test_keyword_rebind_targets_a_named_axis():
+    assert parse_value("[0 1](a=u)") == Call(Vec([0.0, 1.0]), [Arg("a", "u")])
+
+
+def test_coordinate_may_be_a_constant_or_a_nested_call():
+    assert parse_value("n(m(u), 3)") == Call(
+        "n", [Arg(None, Call("m", [Arg(None, "u")])), Arg(None, 3.0)])
+
+
+def test_call_composes_inside_a_bigger_value():
+    # the tuple hangs off a *piece*, not off the whole value
+    assert parse_value("[[0 1](u), [2 3](v)]") == Arr([
+        Call(Vec([0.0, 1.0]), [Arg(None, "u")]),
+        Call(Vec([2.0, 3.0]), [Arg(None, "v")]),
+    ])
+
+
+def test_positionals_must_precede_keywords():
+    with pytest.raises(ShapeError) as ei:
+        parse_value("[0 1](a=u, 3)")
+    assert "positional" in str(ei.value)
+
+
+def test_an_axis_cannot_be_bound_twice():
+    with pytest.raises(ShapeError) as ei:
+        parse_value("[0 1](a=u, a=v)")
+    assert "twice" in str(ei.value)
+
+
+def test_as_sampled_rejects_an_unsaturated_array():
+    assert as_sampled("[0 1](u)") == Call(Vec([0.0, 1.0]), [Arg(None, "u")])
+    with pytest.raises(ShapeError) as ei:
+        as_sampled("[0 1]")
+    assert "unsaturated" in str(ei.value)
+
+
+def test_a_call_is_the_wrong_shape_for_a_plain_color():
+    with pytest.raises(ShapeError) as ei:
+        as_color("[1 0 0](u)")
+    assert "sample call" in str(ei.value)
 
 
 if __name__ == "__main__":

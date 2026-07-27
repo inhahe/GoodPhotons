@@ -22,6 +22,12 @@ reference implementation of the syntax decision recorded in ``TODO.md``
 * **``[X] ≡ X`` is a whole-value identity** — a lone bracket is transparent; the
   instant it has a sibling the brackets are load-bearing (they *are* the separate
   arrays).  Only brackets nest.
+* **A trailing tuple on an array is the sample call, not a label** (ADDENDUM —
+  "call = sample", 2026-07-20): ``[0 1](u)`` reads the array at the driver ``u``,
+  exactly as loom's ``grid(x, y)`` does; ``(a=u)`` rebinds a *named* axis.  The
+  tuple hangs off a piece, so calls compose (``[[0 1](u), [2 3](v)]``,
+  ``n(m(u), v)``).  An array written *without* one is **unsaturated** — legal to
+  declare, an error only when a field tries to sample it (:func:`as_sampled`).
 
 Syntax stays split from shape: the grammar is context-free and this module builds
 *any* nested value-tree; :func:`as_color`, :func:`as_color_list`, … then validate
@@ -69,7 +75,38 @@ class Arr:
     items: List["Node"]
 
 
-Node = Union[Vec, Arr]
+@dataclass
+class Arg:
+    """One argument of a sample call.
+
+    ``formal`` is ``None`` for a positional argument (it binds the next axis, left
+    to right) or the array-side axis name for a keyword rebind — ``(a=u)`` reads
+    *formal* ``a`` = *driver* ``u``.  ``driver`` is what supplies the coordinate:
+    an axis/driver name (``"u"``), a constant, or a nested :class:`Call`
+    (composition, ``n(m(u), v)``).
+    """
+    formal: Optional[str]
+    driver: "Coord"
+
+
+@dataclass
+class Call:
+    """A *sampled* value — an array (or a named array parameter) together with the
+    coordinates it is sampled at.  ``[0 1](u)`` is ``Call(Vec([0, 1]), [Arg(None,
+    "u")])``.
+
+    The trailing tuple is not a label on the literal; it *is* the sample call — the
+    same operation as loom's ``grid(x, y)``.  An array written without one is not a
+    ``Call`` at all, it is a bare :class:`Vec` / :class:`Arr`: an **unsaturated**
+    value, legal to declare and an error only when something tries to render it.
+    :func:`as_sampled` is where that error lives.
+    """
+    target: Union["Node", str]      # an array literal, or a NAME being called
+    args: List[Arg]
+
+
+Node = Union[Vec, Arr, Call]
+Coord = Union[str, float, Call]
 
 
 class ShapeError(ValueError):
@@ -107,15 +144,80 @@ def _vnums(vnums_node) -> List[Scalar]:
 
 def _piece(p):
     """One ``vpiece`` -> ``('tag', space)`` / ``('nums', [scalar…])`` /
-    ``('bracket', inner_value_node)``."""
+    ``('sampled', vsampled_node)``."""
     ct = _kid(p, "colour_tag")
     if ct is not None:
         space = ct.value if ct.value is not None else ct.children[0].value
         return ("tag", space)
-    vb = _kid(p, "vbracket")
-    if vb is not None:
-        return ("bracket", _kid(vb, "value"))
+    vs = _kid(p, "vsampled")
+    if vs is not None:
+        return ("sampled", vs)
     return ("nums", _vnums(_kid(p, "vnums")))
+
+
+# ---- the sample call ------------------------------------------------------
+# `vsampled = vbracket axistuple? | NAME axistuple` — a trailing tuple is not a
+# label on the array, it is the *sample call*.  Without one, a bracket is just a
+# bracket and the `[X] ≡ X` identity still applies, so `_sampled` returns the
+# inner node unchanged in that case and a :class:`Call` only when a tuple is
+# actually present.
+
+def _check_args(args: List["Arg"]) -> List["Arg"]:
+    """Positionals-before-keywords and no-duplicate-formals.
+
+    The grammar deliberately does not enforce either (``arg = NAME '=' coord |
+    coord`` in any order), so that the error can be phrased in terms of axes
+    instead of arriving as an opaque parse failure.
+    """
+    seen_keyword = False
+    formals: set = set()
+    for a in args:
+        if a.formal is None:
+            if seen_keyword:
+                raise ShapeError(
+                    "positional axis arguments must come before keyword ones: "
+                    "write `(u, a=v)`, not `(a=v, u)`")
+        else:
+            seen_keyword = True
+            if a.formal in formals:
+                raise ShapeError(
+                    f"axis '{a.formal}' is bound twice in one sample call")
+            formals.add(a.formal)
+    return args
+
+
+def _sampled(vs, space: Optional[str]) -> Node:
+    """A ``vsampled`` node -> a :class:`Call`, or — when there is no trailing
+    tuple — the bracket's own normalized node."""
+    vb = _kid(vs, "vbracket")
+    target: Union[Node, str]
+    if vb is not None:
+        target = _normalize(_kid(vb, "value"), space)
+    else:
+        target = _kid(vs, "NAME").value
+    tup = _kid(vs, "axistuple")
+    if tup is None:
+        return target
+    return Call(target, _check_args([_arg(a, space) for a in _kids(tup, "arg")]))
+
+
+def _arg(a, space: Optional[str]) -> "Arg":
+    """One ``arg`` -> :class:`Arg`.  A direct ``NAME`` child (as opposed to one
+    nested under ``coord``) is the keyword form's *formal*."""
+    formal = _kid(a, "NAME")
+    return Arg(formal.value if formal is not None else None,
+               _coord(_kid(a, "coord"), space))
+
+
+def _coord(c, space: Optional[str]) -> "Coord":
+    """One ``coord`` -> a driver name, a constant, or a nested call."""
+    vs = _kid(c, "vsampled")
+    if vs is not None:
+        return _sampled(vs, space)
+    nm = _kid(c, "NAME")
+    if nm is not None:
+        return nm.value
+    return float(_kid(c, "NUMBER").value)
 
 
 def _normalize(node, inherited_space: Optional[str] = None) -> Node:
@@ -125,7 +227,7 @@ def _normalize(node, inherited_space: Optional[str] = None) -> Node:
     before a bracket colors the bracket's contents until an inner tag overrides).
     """
     runs = [[_piece(p) for p in _kids(vr, "vpiece")] for vr in _kids(node, "vrun")]
-    has_struct = any(k in ("tag", "bracket") for run in runs for (k, _) in run)
+    has_struct = any(k in ("tag", "sampled") for run in runs for (k, _) in run)
 
     if not has_struct:
         # Every run is exactly one bare `nums` piece.  The comma-role rule:
@@ -149,15 +251,17 @@ def _normalize(node, inherited_space: Optional[str] = None) -> Node:
                 cur_space = payload
             elif kind == "nums":
                 items.append(Vec(payload, cur_space))
-            else:  # bracket
-                items.append(_normalize(payload, cur_space))
+            else:  # bracket, with or without a trailing sample call
+                items.append(_sampled(payload, cur_space))
     return items[0] if len(items) == 1 else Arr(items)
 
 
 def parse_value(text: str) -> Node:
-    """Parse a bare ``.ftsl`` value into its canonical :class:`Vec` / :class:`Arr`
-    tree.  Raises :class:`ValueError` on a syntax error (a *shape* mismatch is only
-    raised later, by the ``as_*`` validators)."""
+    """Parse a bare ``.ftsl`` value into its canonical :class:`Vec` / :class:`Arr` /
+    :class:`Call` tree.  Raises :class:`ValueError` on a syntax error; a *field*
+    shape mismatch is only raised later, by the ``as_*`` validators.  (The one
+    thing normalization itself rejects is an ill-formed argument list — argument
+    order is deliberately not a grammar rule so the error can name the axis.)"""
     try:
         tree = _value_parser().parse(text)
     except SyntaxError as exc:
@@ -181,6 +285,9 @@ def _describe(node: Node) -> str:
         if any(isinstance(it, Arr) for it in node.items):
             return "a list-of-lists"
         return f"a flat list of {len(node.items)} vectors"
+    if isinstance(node, Call):
+        n = len(node.args)
+        return f"a sample call with {n} coordinate{'' if n == 1 else 's'}"
     return "an unknown value"
 
 
@@ -227,3 +334,21 @@ def as_color_list(value: Union[str, Node], default_space: str = "rgb"):
     if isinstance(node, Arr) and all(isinstance(it, Vec) for it in node.items):
         return [as_color(it, default_space) for it in node.items]
     raise ShapeError(f"expected a flat list of colors, got {_describe(node)}")
+
+
+def as_sampled(value: Union[str, Node]) -> Call:
+    """A *sampled* array — an array together with the coordinates it is read at,
+    ``[0 1](u)`` or ``ramp(u, v)``.
+
+    This is where the **unsaturated** error lives: an array on its own is a legal
+    thing to write down, but nothing can be rendered from it until a site says
+    *where* to sample it, so a bare array reaching a field that samples is an
+    error with a fix in the message rather than a silent default.
+    """
+    node = _as_node(value)
+    if isinstance(node, Call):
+        return node
+    raise ShapeError(
+        f"expected a sampled array like `[0 1](u)`, got {_describe(node)} — an "
+        "array is unsaturated until it is called at a coordinate; add `(u)` "
+        "(or `(u, v)` for a 2-D array)")

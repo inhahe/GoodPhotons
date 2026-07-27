@@ -96,11 +96,27 @@ Origin tags point at the authoritative design text for each item.
     * These land with **N-D scatterpoint + N-D grid datatypes ported into ftrace** (mirroring loom's `data.Grid` /
       scatter + `interp.py` curves) — see the loom→ftrace data-port item. Grammar first (shared `.epeg`), then the
       C++ front-end at the J3c port, then the runtime sampler.
-    * **STATUS (2026-07-24 audit): NOT implemented.** Only *design intent* lives here; there is **no grammar,
-      reducer, or runtime** for the trailing axis-label tuple or the rebinding below. What *is* built is the
-      surrounding value/spectrum/binding grammar + the J3c validation shim (see the Progress notes above) — none of
-      which is the array-call syntax. The loom side now has the building block: a callable N-D `Grid`/`Scatter`
-      (`grid(x, y)` / `grid.sample(...)`, `data.py`), so the Python half of the sampler exists.
+    * **STATUS (2026-07-26): increment 1 of 3 DONE — the shared grammar + loom's canonical tree parse the call.**
+      `tools/loom/loom/grammar/ftsl.epeg` now carries the axis tuple, and `loom/grammar/values.py` normalizes it
+      (11 new cases in `tests/test_grammar_values.py`; suite 1072 → 1083):
+      ```
+      vpiece    = colour_tag | vsampled | vnums
+      vsampled  = vbracket axistuple? | NAME axistuple
+      axistuple = '(' arg (',' arg)* ')'
+      arg       = NAME '=' coord | coord
+      coord     = vsampled | NAME | NUMBER
+      ```
+      Two deliberate refinements of the sketch below: the tuple hangs off a **piece**, not off the whole `value`, so
+      a call composes *inside* a bigger value (`[[0 1](u), [2 3](v)]`); and a bare `NAME` is a value **only when
+      called**, so adding this cannot make a stray bareword parse as a value. Canonical tree gains `Call(target,
+      args)` / `Arg(formal, driver)` (`target` = an array literal or a called NAME; `driver` = a name, a constant,
+      or a nested `Call`). Argument *order* is intentionally not a grammar rule — the normalizer enforces
+      positionals-before-keywords and no-duplicate-formals so the error can name the axis. `as_sampled()` is where
+      the **unsaturated** error lives (a bare array reaching a field that samples).
+      **STILL TO DO:** (2) mirror `axistuple` into ftrace's `src/gpda/ftsl_scene.epeg` + the C++ reducer, and reuse
+      the same production on the N-D grid / scatter element grammars; (3) the runtime N-D grid/scatter sampler
+      (loom already has the callable `Grid`/`Scatter` in `data.py`), plus the `shape=` / `lo` / `hi` constructor
+      conveniences below.
     * **ADDENDUM — call = sample; late-binding & rebinding of the consumed axis (design intent, user).** The
       trailing `(...)` is not just a *label* on a literal — it is the **sample call**, exactly like loom's
       `grid(x, y)`. Two authoring positions, so a material can *define* what an array consumes, or *defer* it to its
