@@ -325,6 +325,11 @@ struct DMaterial {
     int    mixWeightPat;
     int    reflectPat;
     int    transmitPat;
+    // emitPat does the same on the emission slot, for emission-on-hit (device twin of
+    // Material::emitPat). The other half of the slot — Le at a point the emitter SAMPLER
+    // drew — goes through DEmitter::emitPat; the two are constructed to agree pointwise
+    // because MIS combines them.
+    int    emitPat;
     // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
     // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
     // twin of Material::priority.
@@ -574,7 +579,10 @@ struct DMedium {
 
 // One triangle of a Mesh emitter (mirrors host EmitTri): v0 + two edge vectors, the
 // unit normal, and the inclusive cumulative-area CDF value used for area sampling.
-struct DEmitTri { DVec3 v0, e1, e2, nrm; double cumArea; };
+// uv0/uvE1/uvE2 mirror the same-named host fields so a sampled point can report the
+// SAME (u,v) the ray-hit path interpolates — only read when an emission pattern is
+// bound, but uploaded unconditionally (they are part of the host EmitTri).
+struct DEmitTri { DVec3 v0, e1, e2, nrm; double cumArea; DVec3 uv0, uvE1, uvE2; };
 
 // One emitter (mirrors host Emitter). `cdfOffset`/`cdfN` index this emitter's
 // wavelength CDF slice inside the flattened lightCdfAll buffer.
@@ -596,6 +604,11 @@ struct DEmitter {
     // device can evaluate Le(lambda) directly (DMaterial carries no emit spectrum).
     int    matId;
     double emitSpd[SPEC_N];
+    // Index into DScene::patterns of this emitter's emission profile (device twin of
+    // Emitter::emitPat, itself adopted from the emissive material at registration);
+    // -1 = uniform. Deliberately absent from `power` — the pattern modulates the
+    // radiance at a point, not the emitter's selection weight, exactly as on the host.
+    int    emitPat;
     // Fast RGB backward (mode R -rgb): the emitter's linear-sRGB radiance, baked as
     // xyzToLinearSrgb(integral over lambda of CIE(lambda)*emitSpd(lambda)) — the exact
     // wavelength-integrated radiance the spectral estimator converges to (the
@@ -613,8 +626,18 @@ __device__ static double spotFalloff(double ct, double cosInner, double cosOuter
 
 // Sample a surface point + outward normal on an emitter (mirrors host
 // Emitter::samplePoint). Quad draws are unchanged, so quad scenes stay parity.
+//
+// `uuOut`/`vvOut` optionally report the sampled point's TEXTURE coordinates, which an
+// emission pattern needs. As on the host they are filled only for the two shapes that
+// can carry one — Quad (the bilinear parameters) and Mesh (the chosen triangle's
+// barycentric UV, the same interpolation the ray-hit path uses) — and left at 0
+// elsewhere, since sphere / tube / spot / env emitters reject `emit pattern:` at load.
+// Passing null (the default) keeps every existing caller's arithmetic untouched.
 __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double u2,
-                                          DVec3& y, DVec3& nOut) {
+                                          DVec3& y, DVec3& nOut,
+                                          double* uuOut = nullptr, double* vvOut = nullptr) {
+    if (uuOut) *uuOut = 0.0;
+    if (vvOut) *vvOut = 0.0;
     if (em.shape == 1) {
         double z = 1.0 - 2.0 * u1;
         double r = sqrt(fmax(0.0, 1.0 - z * z));
@@ -675,9 +698,15 @@ __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double 
         double b2 = u2 * su;
         y = t.v0 + t.e1 * (Real)b1 + t.e2 * (Real)b2;
         nOut = t.nrm;
+        // Same barycentric weights the ray-hit path uses, so a bound emission pattern
+        // reads identically from either side of the transport.
+        if (uuOut) *uuOut = t.uv0.x + t.uvE1.x * (Real)b1 + t.uvE2.x * (Real)b2;
+        if (vvOut) *vvOut = t.uv0.y + t.uvE1.y * (Real)b1 + t.uvE2.y * (Real)b2;
     } else {
         y = em.origin + em.u * (Real)u1 + em.v * (Real)u2;
         nOut = em.normal;
+        if (uuOut) *uuOut = u1;
+        if (vvOut) *vvOut = u2;
     }
 }
 
@@ -4056,6 +4085,51 @@ __device__ static Real dTransmitSlot(const DScene& sc, const DMaterial& m, const
     return v * (Real)clamp01(dPatternScalarAt(sc, m.transmitPat, h));
 }
 
+// ---- emission slot: the two halves of `emit pattern:` on the device -----------------
+// Emission is read from BOTH sides of transport — at a hit ON an emissive surface (the
+// s=0 / direct-hit strategy) and at a point the emitter SAMPLER drew (NEE and light
+// subpaths) — and MIS combines them, so the two must agree pointwise. dEmitPatMul covers
+// the first (device twin of host emitSlot's slotPatMul, identical in form to
+// dReflectPatMul) and dEmitterSamplePointPat the second (device twin of host
+// emitterSamplePoint + emitterPatMulAt). Every device emission read goes through one of
+// them; a missed site would bias the image rather than drop a visible effect.
+
+// Per-hit multiplier from a bound emitPat, clamped to [0,1]. 1 when unbound, so callers
+// can multiply unconditionally.
+__device__ static double dEmitPatMul(const DScene& sc, int emitPat, const DHit& h) {
+    if (emitPat < 0 || emitPat >= sc.nPatterns) return 1.0;
+    return clamp01(dPatternScalarAt(sc, emitPat, h));
+}
+
+// The emission-pattern multiplier at a point on `em`, given the point's own texture
+// coordinates (device twin of host emitterPatMulAt). Clamped to [0,1] like the
+// reflect/transmit slot patterns, so a runaway formula can never manufacture light.
+// The implicit field value f is 0, matching dPatternScalarAt and the host's makePatCtx.
+__device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
+                                          const DVec3& y, const DVec3& nOut,
+                                          double uu, double vv) {
+    if (em.emitPat < 0 || em.emitPat >= sc.nPatterns) return 1.0;
+    const DPattern& p = sc.patterns[em.emitPat];
+    double px = y.x, py = y.y, pz = y.z;
+    double r = sqrt(px * px + py * py + pz * pz);
+    return clamp01(dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
+                                nOut.x, nOut.y, nOut.z, r, uu, vv, dPatEnvOf(sc)));
+}
+
+// Draw a point on `em` and return the emission-pattern multiplier there, so a caller can
+// write `Le = specLookup(em.emitSpd, lambda) * invPdfLambda * pmul` (device twin of host
+// emitterSamplePoint(scene, ...)). 1.0 whenever no pattern is bound, which is every scene
+// that does not use the feature — those keep bit-identical draws, since the uv outputs are
+// the only extra work and they do not touch the RNG.
+__device__ static double dEmitterSamplePointPat(const DScene& sc, const DEmitter& em,
+                                                double u1, double u2,
+                                                DVec3& y, DVec3& nOut) {
+    if (em.emitPat < 0) { emitterSamplePoint(em, u1, u2, y, nOut); return 1.0; }
+    double uu = 0.0, vv = 0.0;
+    emitterSamplePoint(em, u1, u2, y, nOut, &uu, &vv);
+    return dEmitterPatMulAt(sc, em, y, nOut, uu, vv);
+}
+
 // Sample a Stokes-shifted emission wavelength lambda' ~ M for a fluorescent
 // material (mirrors EmissionSampler::sample over [DLMIN, DLMAX]).
 __device__ static Real sampleFluoEmit(const DScene& sc, const DMaterial& m, DRng& rng) {
@@ -4206,6 +4280,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     DVec3 origin, emitN, dir;
     Real spotW = (Real)1;                            // spot direction reweight (else 1)
     bool envImage = false; double envPdfW = 0.0;     // image env: reweight below
+    double emitPatW = 1.0;                           // `emit pattern:` factor at the point
     if (em.shape == 2) {
         // Point spot: uniform direction in the outer cone; reweight beta by
         // falloff*(Omega_outer/Omega_eff) to match the smoothstep profile.
@@ -4243,7 +4318,9 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
         emitN = dir;
     } else {
-        emitterSamplePoint(em, u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
+        // quad: constant normal; sphere: surface point. Also returns this point's
+        // `emit pattern:` factor — 1.0 (and a bit-identical draw) when unpatterned.
+        emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
     }
     Real pdfL = 0;
@@ -4265,6 +4342,12 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         double denom = 4.0 * 3.14159265358979323846 * envPdfW * avg;
         beta = (denom > 0.0) ? (Real)((double)beta * rad / denom) : (Real)0;
     }
+    // An emission pattern is a pure post-multiplier on the photon's carried power: the
+    // emitter is still SELECTED by its unpatterned power and the point still drawn
+    // uniformly over its area, so no pdf changes and the estimator stays unbiased
+    // (host twin: render.h). eEmitted is credited the patterned value so the energy
+    // report matches what actually leaves the surface.
+    if (emitPatW != 1.0) beta = (Real)((double)beta * emitPatW);
     eEmitted += beta;
 
     // Connect the emitter itself to the camera (makes the source visible): model
@@ -4638,6 +4721,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
     DVec3 origin, emitN, dir;
     Real spotW = (Real)1;
     bool envImage = false; double envPdfW = 0.0;
+    double emitPatW = 1.0;                           // `emit pattern:` factor at the point
     if (em.shape == 2) {
         origin = em.origin;
         double ct = em.spotCosOuter + (double)u1 * (1.0 - em.spotCosOuter);
@@ -4665,7 +4749,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
         emitN = dir;
     } else {
-        emitterSamplePoint(em, u1, u2, origin, emitN);
+        emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
     }
 
@@ -4693,6 +4777,9 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
             beta[i] = (denom > 0.0) ? (Real)((double)beta[i] * rad / denom) : (Real)0;
         }
     }
+    // Achromatic post-multiplier — see genPhoton for why this changes no pdf.
+    if (emitPatW != 1.0)
+        for (int i = 0; i < C; ++i) beta[i] = (Real)((double)beta[i] * emitPatW);
     secAlive = (C > 1);
     int nUp = secAlive ? C : 1;
     for (int i = 0; i < nUp; ++i) eEmitted += (double)beta[i];
@@ -5113,6 +5200,13 @@ struct DVertex {
     double mediumG;             // HG asymmetry g at a BV_MEDIUM vertex
     int   mediumId;             // sc.media index at a BV_MEDIUM vertex (-1 otherwise)
     Real  u, v;                 // interpolated surface texcoords (per-hit BSDF eval, M9)
+    // This vertex's `emit pattern:` factor (device twin of bdpt.h Vertex::emitPatW),
+    // cached because dVertexLe is called from several MIS strategies and has no DHit to
+    // re-evaluate the pattern from. 1 for a non-emissive vertex or an unpatterned light,
+    // so every existing scene multiplies by exactly one. A BV_LIGHT vertex gets it from
+    // dEmitterSamplePointPat (the sampled point); a BV_SURFACE vertex from dEmitPatMul at
+    // the hit — the two agree pointwise, which is what keeps s=0 / s=1 MIS unbiased.
+    Real  emitPatW;
     int   nUp;                  // live hero wavelengths here (1 = single-λ walk / de-hero'd)
 };
 
@@ -5367,7 +5461,8 @@ __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVe
                                    Real lambda, double invPdfLambda) {
     if (v.lightIdx < 0) return 0.0;
     if (ddot(v.ng, w) <= 0.0) return 0.0;
-    return (double)specLookup(sc.emitters[v.lightIdx].emitSpd, lambda) * invPdfLambda;
+    return (double)specLookup(sc.emitters[v.lightIdx].emitSpd, lambda) * invPdfLambda
+           * (double)v.emitPatW;
 }
 // Emitter that owns an emissive surface material (mirrors Scene::emitterForMat).
 __device__ static int dEmitterForMat(const DScene& sc, int matId) {
@@ -5583,7 +5678,12 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     }
     Real u1 = rng.uniform(), u2 = rng.uniform();
     DVec3 y, nL;
-    emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
+    // Also returns this point's `emit pattern:` multiplier (1.0, and a bit-identical
+    // draw, when there is none). Folding it into the λ-independent geometry weight G
+    // below makes the scalar AND hero NEE pick it up at once, and matches the
+    // emission-on-hit factor at the same surface point — which keeps the MIS pair
+    // consistent (host twin: backward.h emitterGeom).
+    double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
     DVec3 toL = y - h.p;
     g.dist2 = dot(toL, toL);
     g.dist = sqrt(g.dist2);
@@ -5600,6 +5700,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     if (cosLight <= 0) return false;
     if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
     g.G = g.cosSurf * cosLight / g.dist2;
+    if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
     g.fall = (Real)1; g.spot = false;
     return true;
 }
@@ -5689,7 +5790,8 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         }
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 y, nL;
-        emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
+        // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
+        double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
         DVec3 toL = y - p;
         Real dist2 = dot(toL, toL);
         Real dist  = sqrt(dist2);
@@ -5701,6 +5803,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         Real G = cosLight / dist2;                        // no surface cosine at a volume vertex
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
         double contrib = (double)(alb * phase * G) * emitW * (double)em.area;
+        if (epat != 1.0) contrib *= epat;                 // no-op without a pattern
         contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
         total += contrib;
     }
@@ -6050,10 +6153,13 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             if (child < 0) return L;                    // absorbed
             mp = &sc.mats[child]; matId = child;
         }
-        // Emission on specular/camera arrival (NEE covers diffuse arrivals).
+        // Emission on specular/camera arrival (NEE covers diffuse arrivals), scaled by
+        // this hit's `emit pattern:` factor — the same value the NEE side gets from the
+        // sampler at this point (device twin of host emitSlot).
         int li = dEmitterForMat(sc, matId);
         if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
-            L += thr * (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda;
+            L += thr * (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda
+                     * dEmitPatMul(sc, mp->emitPat, h);
 
         if (!bkInteract(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
                         invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk, rng))
@@ -6127,10 +6233,13 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
             mp = &sc.mats[child]; matId = child;
         }
         // Surface emission on a specular/camera arrival (NEE covers diffuse arrivals).
+        // The `emit pattern:` factor is achromatic, so one eval serves the whole bundle.
         int li = dEmitterForMat(sc, matId);
-        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
+        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0) {
+            double ep = dEmitPatMul(sc, mp->emitPat, h);
             for (int i = 0; i < nUp; ++i)
-                L[i] += thr[i] * (double)specLookup(sc.emitters[li].emitSpd, lam[i]) * invPdf[i];
+                L[i] += thr[i] * (double)specLookup(sc.emitters[li].emitSpd, lam[i]) * invPdf[i] * ep;
+        }
 
         switch (mp->type) {
             case D_DIFFUSETRANSMIT: {
@@ -6371,7 +6480,9 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         }
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 y, nL;
-        emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
+        // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
+        // The pattern is achromatic, so it scales the baked RGB radiance directly.
+        double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
         DVec3 toL = y - h.p;
         Real dist2 = dot(toL, toL);
         Real dist = sqrt(dist2);
@@ -6384,6 +6495,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         if (cosLight <= 0) continue;
         if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
+        if (epat != 1.0) G = (Real)((double)G * epat);   // no-op without a pattern
         total = total + hadamard(f * (G * em.area * stG), em.rgbEmit);
     }
     return total;
@@ -6460,8 +6572,11 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             mp = &sc.mats[child]; matId = child;
         }
         int li = dEmitterForMat(sc, matId);
-        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
-            L = L + hadamard(beta, sc.emitters[li].rgbEmit);
+        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0) {
+            // The emission pattern is achromatic, so it scales the baked RGB radiance.
+            double ep = dEmitPatMul(sc, mp->emitPat, h);
+            L = L + hadamard(beta * (Real)ep, sc.emitters[li].rgbEmit);
+        }
 
         switch (mp->type) {
             case D_DIELECTRIC: {
@@ -6799,7 +6914,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             DVertex v;
             v.type = BV_MEDIUM; v.p = mpos; v.ns = rd; v.ng = rd;
             v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
-            v.matId = -1; v.lightIdx = -1;
+            v.matId = -1; v.lightIdx = -1; v.emitPatW = (Real)1;
             v.mediumG = sm.g; v.mediumId = scatterMed;
             // Hero is gated off for scenes with media, so nUp is 1 here in practice.
             v.nUp = nUp;
@@ -6833,6 +6948,10 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
         v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
         v.matId = matId; v.lightIdx = dEmitterForMat(sc, matId);
+        // Emission-on-hit half of the slot, evaluated once here where the DHit is in hand
+        // (dVertexLe is called later from several MIS strategies with no hit available).
+        // Host twin: bdpt.h's slotPatMul at the same hit.
+        v.emitPatW = (mp->emitPat >= 0) ? (Real)dEmitPatMul(sc, mp->emitPat, h) : (Real)1;
         v.mediumG = 0.0; v.mediumId = -1;
         v.u = h.u; v.v = h.v;   // per-hit texcoords for textured/patterned/record BSDF eval (M9)
         v.nUp = nUp;
@@ -7027,6 +7146,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     DVertex c;
     c.type = BV_CAMERA; c.ns = cam.w; c.ng = cam.w;
     c.beta = 1.0; c.pdfFwd = 0; c.pdfRev = 0; c.delta = 0; c.matId = -1; c.lightIdx = -1;
+    c.emitPatW = (Real)1;
     c.mediumG = 0.0; c.mediumId = -1; c.nUp = hb.C;
     for (int i = 0; i + 1 < hb.C; ++i) pathSec[i] = 1.0;
     if (cam.hasLens) {
@@ -7072,8 +7192,12 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     const DEmitter& em = sc.emitters[ei];
     if (em.shape == 2 || em.shape == 3 || em.collimated) return 0;
     Real u1 = rng.uniform(), u2 = rng.uniform();
-    DVec3 y, nOut; emitterSamplePoint(em, u1, u2, y, nOut);
-    double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+    DVec3 y, nOut;
+    // `emitPatW` is this point's `emit pattern:` factor (1.0, and a bit-identical draw,
+    // when the emitter is unpatterned). It scales the emitted radiance the subpath starts
+    // with, exactly as the emission-on-hit side scales the s=0 strategy's radiance.
+    double emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
+    double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
     if (Le <= 0.0) return 0;
     double pdfChoice = em.power / sc.totalPower;
     double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
@@ -7082,11 +7206,12 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     L0.type = BV_LIGHT; L0.p = y; L0.ns = nOut; L0.ng = nOut;
     L0.beta = Le; L0.pdfFwd = pdfChoice * pdfPos; L0.pdfRev = 0; L0.delta = 0;
     L0.matId = em.matId; L0.lightIdx = ei;
+    L0.emitPatW = (Real)emitPatW;
     L0.mediumG = 0.0; L0.mediumId = -1;
     // The light endpoint carries each wavelength's own emitted radiance Le(λ)/pdf(λ).
     L0.nUp = hb.C;
     for (int i = 0; i + 1 < hb.C; ++i)
-        pathSec[i] = (double)specLookup(em.emitSpd, hb.lam[i + 1]) * hb.invPdf[i + 1];
+        pathSec[i] = (double)specLookup(em.emitSpd, hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
     path[0] = L0; int n = 1;
     DVec3 dir = cosineHemisphere(nOut, rng);
     double cosLight = ddot(nOut, dir);
@@ -7185,6 +7310,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     DVertex sampled;
     sampled.type = BV_SURFACE; sampled.beta = 0; sampled.pdfFwd = 0; sampled.pdfRev = 0;
     sampled.delta = 0; sampled.matId = -1; sampled.lightIdx = -1;
+    sampled.emitPatW = (Real)1;
     sampled.mediumG = 0.0; sampled.mediumId = -1; sampled.u = 0; sampled.v = 0;
 
     if (s == 0) {
@@ -7280,18 +7406,22 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         const DEmitter& em = sc.emitters[ei];
         if (em.shape == 2 || em.shape == 3 || em.collimated) return 0.0;
         Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 y, nOut; emitterSamplePoint(em, u1, u2, y, nOut);
+        DVec3 y, nOut;
+        // The sampled point's `emit pattern:` factor scales the radiance this strategy
+        // sees; s=0 applies the pointwise-equal emission-on-hit factor, which is what
+        // keeps the two MIS-combined strategies consistent.
+        double emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
         DVec3 toL = y - pt.p; double dist2 = ddot(toL, toL);
         if (dist2 <= 0.0) return 0.0;
         double dist = sqrt(dist2); DVec3 wi = toL * (Real)(1.0 / dist);
         double cosLight = ddot(nOut, wi * (Real)-1);
         if (cosLight <= 0.0) return 0.0;               // emitter stays one-sided
         nUp = pt.nUp;
-        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
         double LeSec[BDPT_NSEC];
         {   double mxLe = Le;
             for (int i = 0; i + 1 < nUp; ++i) {
-                LeSec[i] = (double)specLookup(em.emitSpd, hb.lam[i + 1]) * hb.invPdf[i + 1];
+                LeSec[i] = (double)specLookup(em.emitSpd, hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
                 if (LeSec[i] > mxLe) mxLe = LeSec[i];
             }
             if (mxLe <= 0.0) return 0.0;
@@ -7348,6 +7478,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         }
         sampled.type = BV_LIGHT; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
         sampled.lightIdx = ei; sampled.matId = em.matId; sampled.beta = Le / pdfA; sampled.pdfFwd = pdfA;
+        sampled.emitPatW = (Real)emitPatW;   // so dVertexLe on this sampled vertex agrees
     } else {
         const DVertex& qs = light[s - 1];
         const DVertex& pt = eye[t - 1];
@@ -7617,7 +7748,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
         if (li >= 0) {                                   // emitter
             if (specularSeen) {                          // specular-direct: NEE can't reach it
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
-                double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * rhoV * invPdfL;
+                double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * rhoV * invPdfL
+                         * dEmitPatMul(sc, m.emitPat, h);   // `emit pattern:` at this hit
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
             return;                                       // else: direct handled by NEE at vis
@@ -7742,7 +7874,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
 
         int li = dEmitterForMat(sc, matId);
         if (li >= 0) {                                   // directly-viewed / specular-seen emitter
-            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL;
+            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL
+                     * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
             oX += (double)cieX(lambda) * e;
             oY += (double)cieY(lambda) * e;
             oZ += (double)cieZ(lambda) * e;
@@ -7927,7 +8060,8 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
 
         int li = dEmitterForMat(sc, matId);
         if (li >= 0) {                                   // directly-viewed / specular-seen emitter
-            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL;
+            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL
+                     * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
             dX += (double)cieX(lambda) * e;
             dY += (double)cieY(lambda) * e;
             dZ += (double)cieZ(lambda) * e;
@@ -8156,11 +8290,13 @@ struct DVcmCtx {
 __device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
     DVertex v; v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = matId; v.lightIdx = -1;
+    v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.mediumG = 0; v.mediumId = -1; v.u = h.u; v.v = h.v; return v;
 }
 __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
     DVertex v; v.type = BV_SURFACE; v.p = lv.p; v.ns = lv.ns; v.ng = lv.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = lv.matId; v.lightIdx = -1;
+    v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.mediumG = 0; v.mediumId = -1; v.u = lv.u; v.v = lv.v; return v;
 }
 
@@ -8381,13 +8517,17 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         const DEmitter& em = sc.emitters[ei];
         if (em.shape == 2 || em.shape == 3 || em.collimated) continue;
         Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 y, nOut; emitterSamplePoint(em, u1, u2, y, nOut);
-        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+        DVec3 y, nOut;
+        // The sampled point's `emit pattern:` factor (1.0, and a bit-identical draw, when
+        // unpatterned) scales the radiance the light subpath starts with — the MIS pdfs
+        // are untouched, exactly as in dGenLightSubpath.
+        double emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
+        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
         // Max-over-live-λ: the hero can legitimately sit in a gap of the emission spectrum
         // while a secondary is on it. nUp == 1 -> empty loop -> mxLe == Le, the old test.
         double LeSec[SECN], mxLe = Le;
         for (int k = 0; k + 1 < nUp; ++k) {
-            LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1];
+            LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1] * emitPatW;
             if (LeSec[k] > mxLe) mxLe = LeSec[k];
         }
         if (mxLe <= 0.0) continue;
@@ -8678,10 +8818,13 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             if (li >= 0) {
                 double cosLight = ddot(h.ng, wo);
                 if (cosLight > 0.0) {
-                    double Le = (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda;
+                    // Achromatic `emit pattern:` factor at this hit — the same value the
+                    // light-subpath / NEE sides get from the sampler at this point.
+                    double ep = dEmitPatMul(sc, mp->emitPat, h);
+                    double Le = (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda * ep;
                     double LeSec[SECN], mxLe = Le;
                     for (int k = 0; k + 1 < nUp; ++k) {
-                        LeSec[k] = (double)specLookup(sc.emitters[li].emitSpd, lamAll[k + 1]) * invAll[k + 1];
+                        LeSec[k] = (double)specLookup(sc.emitters[li].emitSpd, lamAll[k + 1]) * invAll[k + 1] * ep;
                         if (LeSec[k] > mxLe) mxLe = LeSec[k];
                     }
                     if (mxLe > 0.0) {
@@ -8718,7 +8861,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     const DEmitter& em = sc.emitters[ei];
                     if (!(em.shape == 2 || em.shape == 3 || em.collimated)) {
                         Real u1 = rng.uniform(), u2 = rng.uniform();
-                        DVec3 yL, nL; emitterSamplePoint(em, u1, u2, yL, nL);
+                        DVec3 yL, nL;
+                        // Sampled point's emission-pattern factor (1.0 when unpatterned).
+                        double epat = dEmitterSamplePointPat(sc, em, u1, u2, yL, nL);
                         DVec3 toL = yL - h.p; double dist2 = ddot(toL, toL);
                         if (dist2 > 1e-12) {
                             double distL = sqrt(dist2); DVec3 wiL = toL * (Real)(1.0 / distL);
@@ -8729,10 +8874,10 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             if (cosAtLight > 0.0 && sideOk) {
                                 // Cheap gates + shadow ray first, BSDF eval after (bit-
                                 // identical: no RNG in either; skips the eval when shadowed).
-                                double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+                                double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * epat;
                                 double LeSec[SECN], mxLe = Le;
                                 for (int k = 0; k + 1 < nUp; ++k) {
-                                    LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1];
+                                    LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1] * epat;
                                     if (LeSec[k] > mxLe) mxLe = LeSec[k];
                                 }
                                 double sgn = ddot(h.ng, wiL) >= 0.0 ? 1.0 : -1.0;
@@ -9231,15 +9376,12 @@ bool cudaForwardSupported(const Scene& scene) {
     for (const auto& t : scene.tris)      if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres)   if (unsupported(s.matId)) return false;
     for (const auto& im : scene.implicits) if (unsupported(im.matId)) return false;
-    // `emit pattern:` / `emit_map` (0.80.0) is CPU-only for now. It is not a throughput
-    // slot like reflect/transmit: the same profile has to be applied on BOTH sides of
-    // transport — emission-on-hit AND the Le at an emitter-sampled point — and MIS
-    // combines them, so a device port that misses even one of the ~20 emission reads
-    // produces a BIASED image rather than a visibly missing effect. Rejecting the whole
-    // scene here keeps the two backends' emission identical by construction until the
-    // device side is ported and checked against the CPU reference (see known-issues.md).
-    for (const auto& em : scene.emitters) if (em.emitPat >= 0) return false;
-    for (const auto& m : scene.mats)      if (m.emitPat >= 0) return false;
+    // `emit pattern:` / `emit_map` runs on the device (0.82.0). Unlike reflect/transmit it
+    // is not a one-sided throughput slot: the same profile has to be applied on BOTH sides
+    // of transport — emission-on-hit AND the Le at an emitter-sampled point — because MIS
+    // combines them, so every device emission read goes through dEmitPatMul (the hit side)
+    // or dEmitterSamplePointPat (the sampler side) rather than reading emitSpd raw. No
+    // fallback needed; a patterned scene renders on the GPU in every supported mode.
     // Spectral water-droplet (rainbow) phase is now on the device: the (lambda x mu) Airy
     // table + per-lambda CDF (rainbow.h) is uploaded per medium and dMedPhase / dMedPhaseSample
     // reproduce the bow bit-closely against the CPU tracer (M10). No fallback needed.
@@ -9535,6 +9677,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.mixWeightPat = m.mixWeightPat;
         d.reflectPat = m.reflectPat;
         d.transmitPat = m.transmitPat;
+        d.emitPat = m.emitPat;
         // --- parametric-record REFLECT binding (§records stage 6a) ---
         // Device twin of recordReflectBound. A constant selStop binding bakes the stop's
         // colour straight into reflect[] (so the plain specLookup path is exact, no device
@@ -9685,6 +9828,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                 dtris[i].e2  = {(Real)s.e2.x,  (Real)s.e2.y,  (Real)s.e2.z};
                 dtris[i].nrm = {(Real)s.nrm.x, (Real)s.nrm.y, (Real)s.nrm.z};
                 dtris[i].cumArea = s.cumArea;
+                // Source-triangle UVs, so a sampled point reports the same (u,v) the
+                // ray-hit path interpolates (an emission pattern reads both sides).
+                dtris[i].uv0  = {(Real)s.uv0.x,  (Real)s.uv0.y,  (Real)s.uv0.z};
+                dtris[i].uvE1 = {(Real)s.uvE1.x, (Real)s.uvE1.y, (Real)s.uvE1.z};
+                dtris[i].uvE2 = {(Real)s.uvE2.x, (Real)s.uvE2.y, (Real)s.uvE2.z};
             }
             de.meshTris = (const DEmitTri*)keep(uploadVec(dtris));
             de.meshTriN = (int)dtris.size();
@@ -9695,6 +9843,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.cdfN = (int)e.spd.cdf.size();
         de.cdfStep = e.spd.step;
         de.matId = e.matId;                 // BDPT: link to emissive surface material
+        de.emitPat = e.emitPat;             // `emit pattern:` profile over this emitter
         bakeSpec(e.spdFn, de.emitSpd);       // BDPT: baked emission SPD for Le(lambda)
         { Vec3 le = rgbbake::emitToRgb(e.spdFn); de.rgbEmit = {le.x, le.y, le.z}; }  // fast RGB backward
         cdfAll.insert(cdfAll.end(), e.spd.cdf.begin(), e.spd.cdf.end());
@@ -10589,7 +10738,9 @@ bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam) {
         if (m.reflectTex >= 0) return false;                        // textured albedo not baked to RGB
         if (m.reflectPat >= 0) return false;                        // pattern-modulated albedo, ditto
         if (m.transmitPat >= 0) return false;                       // pattern-modulated transmittance, ditto
-        if (m.emitPat >= 0) return false;                           // pattern-modulated emission, ditto
+        // emitPat is fine here: an emission pattern is an ACHROMATIC scalar, so it
+        // commutes with the spectral->RGB bake — ep*integral(CIE*emitSpd) is exactly
+        // integral(CIE*ep*emitSpd). bkNeeLightRGB / bkRadianceRGB apply it to rgbEmit.
         if (m.recBindingFor(REC_SLOT_REFLECT)) return false;        // record-driven reflectance
     }
     if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;

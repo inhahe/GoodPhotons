@@ -1803,8 +1803,11 @@ rectangular **area** light and a **mesh** emitter. A sphere / cylinder / spot / 
 refused at load. Two more consequences worth knowing: `power`/`lumens` normalise the
 *unpatterned* spectrum (the pattern is a pure post-multiplier on radiance — which is exactly
 what leaves every pdf untouched — so a profile averaging 0.5 emits about half the requested
-flux), and an emission pattern is **CPU-only** for now, falling back from the GPU backends
-with a notice. Worked example `scenes/emit_pattern.ftsl`.
+flux), and since **0.82.0** the **GPU megakernel** implements *both* of those readings —
+forward `A`/`B`/`C`, backward `R` (spectral, hero, and the fast RGB path), the photon-map
+deposit and gather, BDPT `D` and VCM `U` — so a patterned lamp renders on-device in every
+supported mode instead of falling back to the CPU. Worked example
+`scenes/emit_pattern.ftsl`.
 
 **UV on native primitives.** The `u v` pattern variables aren't limited to meshes.
 A native `sphere {}` carries built-in equirectangular (lat/long) UVs, a `quad {}`

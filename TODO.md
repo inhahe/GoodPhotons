@@ -2976,6 +2976,42 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-27: **0.82.0 — `emit pattern:` / `emit_map` now runs on the CUDA backends; the last 0.80.0
+  tech-debt item is closed.** Emission is the one throughput slot read from **both sides of transport** —
+  emission-on-hit (the s=0 / direct-hit / specular-arrival strategy) *and* the Le at a point the emitter
+  *sampler* drew (NEE, light subpaths) — and MIS **combines** them, so the two must agree pointwise. That
+  is exactly why 0.80.0 shipped it CPU-only behind a whole-scene reject: a *partially* ported pattern
+  biases the image instead of dropping a visible effect, and the device has ~20 emission read sites rather
+  than the one or two `reflectPat`/`transmitPat` funnel through. All of them landed at once.
+  `DEmitter::emitPat` / `DMaterial::emitPat` upload; `DEmitTri` carries `uv0`/`uvE1`/`uvE2` and the device
+  `emitterSamplePoint` gained optional `uuOut`/`vvOut` (Quad: the bilinear `u1,u2`; Mesh: the chosen
+  `EmitTri`'s barycentric UVs) so a *sampled* point reports the same (u,v) a *hit* interpolates — the
+  property that makes the profile legal on those two shapes and refused on sphere/cylinder/spot/env.
+  Three accessors mirror `scene.h`: `dEmitPatMul` (hit side), `dEmitterPatMulAt` /
+  `dEmitterSamplePointPat` (sampler side). Two structural choices kept the site count down: the sampler
+  factor folds into `bkEmitterGeom`'s λ-independent `G`, so scalar **and** hero NEE pick it up from one
+  place (host twin: `emitterGeom` folding into `w`); and a cached `Real emitPatW` on `DVertex` (twin of
+  `bdpt.h Vertex::emitPatW`), read by `dVertexLe`, covers every BDPT MIS strategy from one place. The
+  pattern remains a pure post-multiplier on carried radiance/beta — the emitter is still *selected* by its
+  unpatterned `power` and the point still drawn uniformly over its area, so **no pdf anywhere changes**
+  and the estimator is unbiased by construction (only variance rises). Unpatterned scenes stay
+  bit-identical: every new factor is guarded by `if (epat != 1.0)` or is an exact multiply by `1.0`, and
+  the extra UV outputs consume no RNG, so draw sequences are unchanged. Both `Supported` gates dropped —
+  including the **RGB fast path**, which unlike `reflectPat`/`transmitPat` is safe because an *achromatic*
+  scalar commutes with the spectral→RGB bake (`ep·∫CIE·emitSpd == ∫CIE·ep·emitSpd`), so it applies
+  straight to the pre-baked `rgbEmit`. Two deliberate non-sites: `dInvPdfLambda` (a wavelength pdf,
+  matching the host) and the spot/env branches (refused at load). **Validated** on
+  `scenes/emit_pattern.ftsl` (two patterned quad area lights + a patterned *mesh* emitter, i.e. both
+  UV-carrying shapes): GPU-vs-CPU mode R at 2000 spp / 512² mean ratio **0.9999** (median 1.0000, sRGB
+  RMSE 2.36/255, under the images' own 2.24% noise floor); GPU cross-estimator global B/R **1.00001** and
+  D/R **0.99995**; GPU-VCM-vs-CPU-VCM **0.9998**; RGB fast path vs spectral R **0.9991**; mode-M photon
+  map GPU-vs-CPU **1.0056** (median 1.0000; the residual is M's own density-estimate noise, as in M2/M4);
+  forward energy closure `sum/emitted = 1.000000` at 4×10⁹ photons. U/R came in at 1.00679, but an **unpatterned control**
+  gives 1.00706 with the same per-band profile — a pre-existing VCM-vs-R estimator difference on this
+  scene, not the pattern (the band holding the directly-visible patterned panels is U/R = 1.0002). 11/11
+  `-check*` self-tests pass; all 80 `scenes/*.ftsl` load. `raster.h`/`raster_cuda.cu` still ignore
+  `emitPat`, deliberately and consistently with `reflectPat`/`transmitPat` — a cosmetic preview mismatch,
+  not bias.
 - 2026-07-26: **0.81.0 — E5 is complete: scene value-sites route through `Target`, and the viewer shows the
   axis model.** Two follow-ups, both loom-side plus one C++ panel.
   *(1) Routing.* `Lift` took a clock-parameterized `Signal` **up** into the axis layer; nothing brought one

@@ -309,29 +309,76 @@ pre-existing bug on the way: the area light's *second* triangle carried default 
 disagreeing with `addQuad`'s, i.e. a diagonal seam for any UV-driven emission pattern **or
 texture** on an area light.
 
-### TECH-DEBT — the emission pattern (`emitPat`) is CPU-only; the CUDA backends reject the scene
+### TECH-DEBT — DONE (0.82.0): the emission pattern (`emitPat`) now runs on the CUDA backends
 
-0.80.0 ships `emit pattern:` / `emit_map` (and `spd` / `spd_map`) on the CPU only.
-`cudaForwardSupported` returns false if any `Emitter` or `Material` has `emitPat >= 0`, and
-`cudaBackwardRGBSupported` does the same, so a patterned scene silently falls back to the CPU
-(with a `-device gpu` message naming the emission profile as the reason).
+0.80.0 shipped `emit pattern:` / `emit_map` (and `spd` / `spd_map`) on the CPU only.
+`cudaForwardSupported` returned false if any `Emitter` or `Material` had `emitPat >= 0`, and
+`cudaBackwardRGBSupported` did the same, so a patterned scene silently fell back to the CPU.
 
-This was deliberate, not an oversight: unlike `reflectPat`/`transmitPat` — which funnel
-through one or two shared accessors — the device has roughly **20 emission read sites**
-(`specLookup(em.emitSpd, …)` and `dEmitterForMat` and their callers), and because emission is
-read from both sides of transport a *partially* ported pattern would produce a **biased**
-image rather than a visibly missing effect. Rejecting the whole scene is the safe state.
+That was deliberate, not an oversight: unlike `reflectPat`/`transmitPat` — which funnel
+through one or two shared accessors — the device has roughly **20 emission read sites**, and
+because emission is read from both sides of transport a *partially* ported pattern would
+produce a **biased** image rather than a visibly missing effect. Rejecting the whole scene
+was the safe state until every site could be done at once.
 
-The port needs: `DEmitter::emitPat` and `DMaterial::emitPat` uploaded; `DEmitTri` carrying
-`uv0`/`uvE1`/`uvE2`; a device `dEmitSlot` and `dEmitterSamplePointPat` mirroring the host
-accessors in `scene.h`; every one of those ~20 sites routed through them; then drop the two
-`Supported` gates. **Must be parity-checked against 0.80.0's CPU reference images** — a
-CPU/GPU RMSE at matched spp, plus the same R-vs-B-vs-U cross-estimator check on the GPU,
-since a missed site shows up as bias rather than as an obvious artefact.
+**What landed (0.82.0), all in `src/render_cuda.cu`.** `DEmitter::emitPat` and
+`DMaterial::emitPat` upload; `DEmitTri` carries `uv0`/`uvE1`/`uvE2` and the device
+`emitterSamplePoint` gained optional `uuOut`/`vvOut` (filled for Quad from the bilinear
+`u1,u2` and for Mesh from the chosen `EmitTri`'s barycentric UVs), so a *sampled* point
+reports the same (u,v) the *hit* path interpolates. Three accessors mirror `scene.h`:
+`dEmitPatMul` (the emission-on-hit side, twin of `emitSlot`'s `slotPatMul`),
+`dEmitterPatMulAt` and `dEmitterSamplePointPat` (the sampler side). Every device emission
+read routes through one of them — forward `genPhoton`/`genPhotonHero`; backward
+`bkEmitterGeom` (folded into the λ-independent `G`, so scalar *and* hero NEE pick it up from
+one place, exactly as host `emitterGeom` folds it into `w`), `bkNeeVolume`, `bkNeeLightRGB`,
+`bkRadiance`/`bkRadianceHero`/`bkRadianceRGB`; the three photon-map visible-point sites;
+BDPT's `dGenLightSubpath` + `dConnectBDPT` s=1; and VCM's light subpath + s=0 emission + NEE.
+`DVertex` gained a cached `Real emitPatW` (twin of `bdpt.h Vertex::emitPatW`) read by
+`dVertexLe`, set at all seven construction sites, so every BDPT MIS strategy is covered from
+one place. Unpatterned scenes stay bit-identical: each new factor is either guarded by
+`if (epat != 1.0)` or is an exact multiply by `1.0`, and the extra UV outputs consume no RNG.
 
-Related, and *not* part of the port: `raster.h` / `raster_cuda.cu` (the preview rasteriser)
-ignore `emitPat`, consistent with their existing behaviour for `reflectPat`/`transmitPat` —
-the preview is a shading approximation, so this is a cosmetic mismatch, not bias.
+Two deviations from the plan sketched above, both deliberate. (1) The planned `dEmitSlot`
+became `dEmitPatMul`: `DMaterial` carries no emit spectrum on the device (emission is read
+from `sc.emitters[li].emitSpd`/`.rgbEmit`), so only the *multiplier* can be factored out.
+(2) The `cudaBackwardRGBSupported` gate was dropped too, not merely left in place — an
+emission pattern is an **achromatic** scalar, so it commutes with the spectral→RGB bake
+(`ep·∫CIE·emitSpd == ∫CIE·ep·emitSpd`) and can be applied to the pre-baked `rgbEmit`. That is
+why it differs from `reflectPat`/`transmitPat`, which genuinely are not evaluated on that
+path and still reject. Deliberately *not* patterned: `dInvPdfLambda`'s
+`g += gw * specLookup(e.emitSpd, lambda)` — a wavelength pdf, matching the host — and the
+spot/env branches, which cannot carry a pattern (refused at load).
+
+**Validation** (`scenes/emit_pattern.ftsl`: two patterned quad area lights + a patterned
+*mesh* emitter, i.e. both UV-carrying shapes; absolute exposure so images compare directly):
+
+- **GPU vs CPU, mode R, 2000 spp, 512²** — mean luminance ratio **0.9999**, median 1.0000,
+  sRGB RMSE 2.36/255, itself below the images' own 2.24% noise floor.
+- **GPU cross-estimator, 160²** — global B/R = **1.00001**, D/R = **0.99995**. U/R = 1.00679,
+  but an **unpatterned control** gives U/R = **1.00706** with the same per-band profile, so
+  that residual is a pre-existing VCM-vs-R estimator difference on this scene, not the
+  pattern. Per luminance band, B/R and D/R are 1.0000 everywhere; the U excess sits only in
+  the dim indirect bands, while the band containing the directly-visible patterned panels —
+  the one place the profile is read most directly — is U/R = 1.0002.
+- **GPU VCM vs CPU VCM on the patterned scene** — mean **0.9998**, median 1.0000 (the direct
+  test that the device VCM pattern path matches the CPU reference).
+- **GPU RGB fast path vs GPU spectral R** — mean **0.9991**, median 1.0000, confirming the
+  achromatic-commutes-with-the-bake argument for dropping that gate.
+- **Photon map, mode M, GPU vs CPU at 30 M photons** — mean **1.0056**, median 1.0000. The
+  larger per-pixel RMSE (10.7/255) is mode M's inherent density-estimate noise — the two
+  backends pick different adaptive gather radii — the same character the M2/M4 validations
+  recorded, not bias.
+- **Forward energy closure**: `sum/emitted = 1.000000` in mode B at 4×10⁹ photons and in
+  mode M at 30 M.
+- **Load rejection still enforced**: `light sphere { spd_map pattern:p }` is refused with the
+  "samples positions that no surface (u,v) corresponds to" diagnostic. The host-side gate
+  that makes the whole feature sound is untouched by the port.
+- All 11 `-check*` self-tests PASS; all 80 `scenes/*.ftsl` load.
+
+Related, and deliberately *still* out of scope: `raster.h` / `raster_cuda.cu` (the preview
+rasteriser) ignore `emitPat`, consistent with their existing behaviour for
+`reflectPat`/`transmitPat` — the preview is a shading approximation, so this is a cosmetic
+mismatch, not bias.
 
 ### BUILD BUG — FIXED (2026-07-26): editing a header did not rebuild the `.cu` files, and the linker could then keep a **stale copy of the function you just changed**
 
