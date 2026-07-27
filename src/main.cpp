@@ -4476,6 +4476,52 @@ static int run(int argc, char** argv) {
     if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed
     if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
+
+    // --- every output directory must exist BEFORE a single photon is traced ----------
+    // Otherwise a mistyped/not-yet-created output directory used to be discovered only
+    // by the first writer: the render ran to completion, printed "error: could not
+    // write ..." at every -interval tick, and exited having thrown the entire
+    // accumulated film away. Resolve the parents once, here, where `out` is final (the
+    // bare-invocation preview path above can still rewrite it).
+    //
+    // `-o` covers most of it: the `.ftbuf` checkpoint sidecar (`out + ".ftbuf"`), the
+    // per-camera `outFor()` variants and the stereo eye pair all live beside it.
+    // `-savemap` is the one independent path, and a discarded photon map costs just as
+    // much as a discarded film.
+    //
+    // Policy: create the directory. Renders are routinely aimed at a fresh per-series
+    // subdirectory (png/<setname>/), and refusing to make one would be a pointless
+    // extra step. But say so on stdout, so a typo shows up as a surprise directory in
+    // the log rather than silently; and if creation fails, bail NOW with a clear
+    // message instead of rendering into the void.
+    {
+        namespace fs = std::filesystem;
+        auto ensureOutDir = [](const char* what, const std::string& file) -> bool {
+            std::error_code ec;
+            fs::path parent = fs::path(file).parent_path();
+            if (parent.empty() || fs::is_directory(parent, ec)) return true;
+            if (fs::exists(parent, ec)) {
+                std::fprintf(stderr, "ftrace: %s path '%s' exists but is not a directory "
+                                     "(from %s)\n",
+                             what, parent.string().c_str(), file.c_str());
+                return false;
+            }
+            ec.clear();
+            fs::create_directories(parent, ec);
+            if (ec || !fs::is_directory(parent)) {
+                std::fprintf(stderr, "ftrace: %s directory '%s' does not exist and could "
+                                     "not be created: %s\n",
+                             what, parent.string().c_str(),
+                             ec ? ec.message().c_str() : "unknown error");
+                return false;
+            }
+            std::printf("[out] created %s directory %s\n", what, parent.string().c_str());
+            return true;
+        };
+        if (!ensureOutDir("output", out)) return 2;
+        if (!g_pmapSave.empty() && !ensureOutDir("-savemap", g_pmapSave)) return 2;
+    }
+
     bool prism     = !std::strcmp(sceneName, "prism");
     bool materials = !std::strcmp(sceneName, "materials");
     bool fluoro    = !std::strcmp(sceneName, "fluoro");

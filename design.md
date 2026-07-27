@@ -37,6 +37,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   allow, CPU fallback otherwise; all-M pinhole groups meter in one batched
   `renderPhotonMapSharedCuda` pass with `MeterConverge` early-stop via `onFrame`),
   PNG/PPM output.
+  **Output-directory precheck:** an `ensureOutDir` lambda runs once after the `-check*`
+  self-test early-returns — the earliest point where `out` is final, since the
+  bare-invocation preview path can still rewrite it to a `$TEMP` name — and creates
+  `-o`'s (and `-savemap`'s) missing parent directory, or exits 2 with a named error.
+  It has to be a precheck rather than a per-write fallback because every writer is
+  reached only *after* the film exists: a bad directory used to be discovered at the
+  first `-interval` tick and threw the whole accumulated render away. One check on `-o`
+  suffices for the `.ftbuf` sidecar, the per-camera `outFor()` names and the stereo eye
+  pair, which all share its directory; `-savemap` is the only independent path.
 - **`src/gpda/`** — the FTSL front end. `ftsl_scene.epeg` (in
   `tools/loom/loom/grammar/`) is the **single source of truth** for FTSL's syntax;
   `loom.grammar.emit_cpp` compiles it to `ftsl_scene.gen.cpp` — a parser graph plus

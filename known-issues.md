@@ -73,16 +73,31 @@ header, add an offset→line/col helper to the scannerless `Parser`, and write a
 `describe_matcher(const Node&)` for char-level terminals. Not urgent — no shipped ftrace
 path uses the scannerless engine.
 
-### PAPERCUT — OPEN (2026-07-26): `-o` into a non-existent directory fails every write interval and loses the whole render
+### PAPERCUT — DONE (2026-07-26, 0.77.1): `-o` into a non-existent directory fails every write interval and loses the whole render
 
-`ftrace -o png/nope/out.png …` runs the full render, prints `error: could not write …` at
-each `-interval` tick, and exits having written nothing — the accumulated film is simply
-lost. Hit twice now (once with `png/bench/`, once with `png/parserflip/`).
+`ftrace -o png/nope/out.png …` ran the full render, printed `error: could not write …` at
+each `-interval` tick, and exited having written nothing — the accumulated film was simply
+lost. Hit twice (once with `png/bench/`, once with `png/parserflip/`).
 
-**Proper fix:** resolve `-o`'s parent directory up front, during argument parsing, and
-either `std::filesystem::create_directories` it or fail immediately with
-`ftrace: output directory 'png/nope' does not exist` — before a single photon is traced.
-The same check belongs on the `.ftbuf` checkpoint sidecar path.
+**Fixed** in `src/main.cpp`, right after the `-check*` self-test early-returns (where `out`
+is final — the bare-invocation preview path can still rewrite it, so the check can't move
+into the argument loop itself). An `ensureOutDir` lambda resolves a path's parent and:
+
+- parent empty or already a directory → nothing to do;
+- parent exists but is *not* a directory → `ftrace: output path '…' exists but is not a
+  directory` and `return 2`;
+- otherwise `fs::create_directories` it, printing `[out] created output directory …` so a
+  typo shows up in the log instead of silently making a stray directory; if creation fails,
+  `return 2` with the `std::error_code` message.
+
+Applied to `-o` and to `-savemap` (the one output path not derived from `-o`; a discarded
+photon map costs as much as a discarded film). Everything else this run writes lives beside
+`-o` — the `.ftbuf` checkpoint sidecar (`out + ".ftbuf"`), the per-camera `outFor()`
+variants, the stereo eye pair — so the single `-o` check covers them all.
+
+Verified: `-o png/dirfix/deep/nested/out.png` creates the whole tree and writes both the
+PNG and its `.ftbuf`; `-o png/dirfix_file.png/out.png` (parent is a regular file) fails
+before the scene renders.
 
 ### TECH-DEBT — OPEN (2026-07-27): `grid:<name>(…)` / `scatter:<name>(…)` are *surface-pattern* samplers only — field / isosurface / density formulas can't reach them
 

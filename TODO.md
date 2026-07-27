@@ -1337,6 +1337,15 @@ green) plus an ftrace interop check: one asymmetric L-shaped volume written twic
 (`scraps/vdb_rot_make.py`), renders visibly rotated in ftrace with identical voxels.
 
 **Still open:** **Vec3** grids; ingesting `.nvdb`; sparse-storage transforms; and resampling sparse↔dense.
+- **Vec3 grids are BLOCKED on validation data (assessed 2026-07-26).** None of the four real sample files in
+  `scraps/` carries a `Tree_vec3s_*` grid (all four are `Tree_float_5_4_3_HalfFloat`), and there is no
+  installable OpenVDB Python binding on this platform to synthesise one (`openvdb` / `pyopenvdb` /
+  `openvdb-python` all fail to resolve on PyPI). Writing the reader blind against the spec would produce
+  something validated only against loom's own writer — precisely the "works until it meets a real file"
+  failure this module has so far avoided by testing against third-party output. Also note there is **no
+  consumer**: ftrace supports scalar float grids only, so a Vec3 read would serve loom-internal use
+  (velocity/advection) that isn't designed yet. Unblock by sourcing one real vec3 `.vdb` (a DCC export or an
+  openvdb.org sample), then the tree walk is the existing one with a 3-wide value stride.
 
 ### E5 — Axis-typed signals: one influence model (broadcast / pointwise / reduce) + mod·pin + sample·select grammar  *(loom; LARGE, design; unifies E2/E4 and records-5a)*
 **Idea / decision (design-captured 2026-07-18, from a design bounce).** The whole "what can modulate what,
@@ -2910,6 +2919,19 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-26: **0.77.1 — a missing `-o` directory no longer eats the whole render.** `known-issues.md`'s
+  oldest papercut (hit twice): `-o png/nope/out.png` traced every photon, printed `error: could not write …`
+  at each `-interval` tick, and exited with nothing — the film was reachable only by the writers, which run
+  *after* it exists. Fixed with an `ensureOutDir` precheck in `main.cpp`, placed after the `-check*`
+  self-test early-returns because that's the earliest point where `out` is final (the bare-invocation
+  preview path can still rewrite it to a `$TEMP` name). It creates the missing parent (announced as
+  `[out] created output directory …`, so a typo shows up in the log rather than silently) and exits 2 with a
+  named error if it can't, or if the parent exists but isn't a directory. Policy is *create*, not *refuse*,
+  because renders are routinely aimed at a fresh `png/<series>/`. One check on `-o` covers the `.ftbuf`
+  sidecar, the per-camera `outFor()` names and the stereo eye pair (all share its directory); `-savemap` is
+  the only independent output path and gets the same treatment. Verified both ways: a 3-deep nested `-o`
+  creates the tree and writes PNG + `.ftbuf`, and a parent that is a regular file fails before the scene
+  renders.
 - 2026-07-26: **E4 — loom reads and writes rotated `.vdb` transforms.** Closed a real loom↔ftrace
   asymmetry: ftrace's `readTransform` has always accepted `AffineMap`/`UnitaryMap` and honours them
   properly (inverting the 3×3 for world→index sampling, AABB'ing the index box's 8 corners), while loom's
