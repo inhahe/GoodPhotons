@@ -39,16 +39,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   PNG/PPM output.
 - **`src/gpda/`** — the FTSL front end. `ftsl_scene.epeg` (in
   `tools/loom/loom/grammar/`) is the **single source of truth** for FTSL's syntax;
-  `loom.grammar.emit_cpp` compiles it to `ftsl_scene.gen.cpp` (a parser graph),
-  which `tokenized.{hpp,cpp}` + `pool.hpp` (verbatim vendored copies of the upstream
-  GPDA parser in `D:\visual studio projects\GraphParser`) walk to a parse tree, which
+  `loom.grammar.emit_cpp` compiles it to `ftsl_scene.gen.cpp` — a parser graph plus
+  the lexer's rule table. `gpda_lexer.hpp` (hand-written, *not* generated) turns
+  source text into tokens by longest match over those rules; it derives a first-byte
+  set from each rule's pattern and takes a literal fast path where it can, so a token
+  costs one or two `std::regex` calls rather than one per rule.
+  `tokenized.{hpp,cpp}` + `pool.hpp` (verbatim vendored copies of the upstream GPDA
+  parser in `D:\visual studio projects\GraphParser`) then walk the graph to a parse
+  tree, which
   `ftsl_reduce.hpp` reduces to the same `std::vector<ftsl::Block>` the hand-written
   parser produced. `ftsl_frontend.hpp` is the entry point (`ftsl_gpda::parse`, plus
   `use_legacy()` / `validate()` behind the two transition flags). loom parses the
   *same* grammar in Python via the pinned `tools/loom/loom/grammar/_gpda.py`, so
   ftrace and loom cannot disagree about the language. The flip (0.68) was gated on
   `-validate-grammar` reporting zero structural mismatches across all 2595 `.ftsl`
-  files in the tree, down to per-statement line numbers.
+  files in the tree, down to per-statement line numbers. Loading the largest scene in
+  the tree (22 KB) costs ~42 ms of lex+parse. `tools/gpda_lexcheck/` is the permanent
+  differential validator for the lexer's fast paths: it brute-forces that no rule's
+  first-set ever excludes a byte the rule's own regex could match, and that the fast
+  lexer's token stream is identical to a naive all-regex one.
 - **`scene.h` / `ftsl.h`** — scene model and the FTSL semantic pass
   (cameras, camera_curve/path/orbit, materials, lights, media, implicits, meshes).
   `FTSL.md` documents the language. Everything downstream of

@@ -21,6 +21,37 @@ pre-scan in `main.cpp`, and reduce `-validate-grammar` to a no-op warning (or re
 too — with one parser there is nothing to cross-check). Everything downstream of
 `std::vector<Block>` is shared and stays.
 
+### PERF — OPEN (2026-07-27): scene loading is down 5×, but the graph walk (not the lexer) is what's left
+
+The 0.68 front-end flip made loading measurably slower than the hand-written parser —
+roughly linear in scene size, ~8.7 µs/byte at first, so the largest scene in the tree
+(`scenes/gallery_settled.ftsl`, 22 KB) spent ~200 ms in the front end before rendering
+started. Two rounds of work took that to **~42 ms** (lex 7.1 ms + parse 34.6 ms),
+measured with `tools/gpda_lexcheck/lexcheck.exe scenes/gallery_settled.ftsl`:
+
+- **Lexer, 47 ms → 7.1 ms.** The naive loop ran all 16 rule regexes at every position and
+  `std::regex` costs ~1 µs a call. `src/gpda/gpda_lexer.hpp` now derives a first-byte set
+  from each pattern and skips rules that cannot start with the current byte, and matches
+  metacharacter-free patterns (9 of the 16) with a string compare. Validated by
+  `tools/gpda_lexcheck/`.
+- **Parser, 66.6 ms → 34.6 ms** (upstream GraphParser `f8ea9a3`, re-vendored): precomputed
+  the per-node `return_links` shared_ptr instead of rebuilding it on each of ~19 RuleRef
+  traversals per token; made the closure's visited set a hash table instead of a linear
+  scan (8.16M key comparisons per parse → 93K); dropped the pointless `std::atomic` on the
+  intrusive refcount (the pool is thread-local, so cross-thread refcounting was already
+  corruption) — that alone was ~20% of parse time.
+
+**What remains.** Measured on that scene: 424K closure steps, 61K `ParseNode`s built (each
+with a heap-allocated `children` vector via `plist_to_vector` plus a rule-name
+`std::string` copy), 140K `plist_push`es — and only ~2.4 of the ~30 expanded terminals per
+token ever match, so most of those nodes belong to derivations that die. The next real win
+is therefore not another micro-optimisation but **not building parse nodes speculatively**:
+keep the children as the persistent list they already are and materialise
+`ParseNode::children` once, lazily, for the tree that actually wins. That changes
+`ParseNode`'s public shape, so it touches `ftsl_reduce.hpp`, both GraphParser test suites
+and loom's mirror. Worth doing only if scene load shows up again — 42 ms on the single
+largest scene, with the median scene well under 5 ms, is no longer near the top.
+
 ### TECH-DEBT — OPEN (2026-07-26): `GraphParser/cpp/scannerless.{hpp,cpp}` still throws bare `std::runtime_error`, not the rich `ParseError`
 
 The tokenized engine (the one ftrace uses) throws a `ParseError` carrying line/col, the

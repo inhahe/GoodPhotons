@@ -51,6 +51,10 @@
 *.ckpt
 /renders/
 
+# tools/gpda_lexcheck build output (rebuild with its build.bat)
+/tools/gpda_lexcheck/obj/
+/tools/gpda_lexcheck/lexcheck.exe
+
 # Scratch / throwaway scripts and test outputs
 /scraps/
 

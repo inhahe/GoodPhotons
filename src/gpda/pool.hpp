@@ -20,9 +20,18 @@
 // refcount drops to zero; memory stays alive for the thread's lifetime
 // (typical parsers churn many short-lived objects, so the pool stays
 // warm).
+//
+// THREADING: a pool-allocated object belongs to the thread that allocated it,
+// and only that thread may hold, copy or drop IntrusivePtrs to it.  That is
+// not a restriction introduced by the non-atomic refcount below — it is
+// inherent to the thread-local pool: `T::deallocate` returns the object to
+// *the releasing* thread's pool, so dropping the last reference on another
+// thread corrupts that thread's freelist however the count is maintained.
+// Several threads each running their own parser is fine; each touches only
+// its own objects.  Handing a parse tree to another thread and refcounting it
+// there was already unsupported.
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -33,9 +42,16 @@
 namespace gpda_pool {
 
 // Base for pool-allocated, intrusively-refcounted types.
+//
+// The counter is deliberately NOT std::atomic: see the THREADING note above —
+// an object may only ever be refcounted by its allocating thread, so the
+// interlocked read-modify-write buys nothing.  It is not free either: the
+// parser copies IntrusivePtrs millions of times per parse (every cursor and
+// every visited-set entry retains a stack), and a `lock xadd` per copy
+// measured at ~20% of total parse time on a 22 KB input.
 template <typename Derived>
 struct Refcounted {
-    mutable std::atomic<std::uint32_t> _refcount{0};
+    mutable std::uint32_t _refcount{0};
 };
 
 template <typename T>
@@ -117,11 +133,10 @@ class IntrusivePtr {
     T* ptr_;
 
     void retain() const noexcept {
-        if (ptr_) ptr_->_refcount.fetch_add(1, std::memory_order_relaxed);
+        if (ptr_) ++ptr_->_refcount;
     }
     void release() noexcept {
-        if (ptr_ && ptr_->_refcount.fetch_sub(1,
-                                              std::memory_order_acq_rel) == 1)
+        if (ptr_ && --ptr_->_refcount == 0)
             T::deallocate(ptr_);
         ptr_ = nullptr;
     }
@@ -133,7 +148,7 @@ public:
     // Explicit adopt: wraps a newly-allocated T*, takes ownership (refcount
     // goes from 0 to 1).  Use this only with a freshly pool-allocated T.
     explicit IntrusivePtr(T* p) noexcept : ptr_(p) {
-        if (ptr_) ptr_->_refcount.fetch_add(1, std::memory_order_relaxed);
+        if (ptr_) ++ptr_->_refcount;
     }
 
     IntrusivePtr(const IntrusivePtr& o) noexcept : ptr_(o.ptr_) { retain(); }
@@ -145,7 +160,7 @@ public:
     ~IntrusivePtr() { release(); }
 
     IntrusivePtr& operator=(const IntrusivePtr& o) noexcept {
-        if (o.ptr_) o.ptr_->_refcount.fetch_add(1, std::memory_order_relaxed);
+        if (o.ptr_) ++o.ptr_->_refcount;
         release();
         ptr_ = o.ptr_;
         return *this;
@@ -165,7 +180,7 @@ public:
     explicit operator bool() const noexcept { return ptr_ != nullptr; }
 
     bool is_unique() const noexcept {
-        return ptr_ && ptr_->_refcount.load(std::memory_order_relaxed) == 1;
+        return ptr_ && ptr_->_refcount == 1;
     }
 
     void reset() noexcept { release(); }

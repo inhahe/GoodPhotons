@@ -62,8 +62,7 @@ void Parser::expand(std::uint32_t initial_node,
         while (true) {
             if (it.stack && it.stack->length > max_depth) break;
 
-            auto key = state_key(it.node, it.stack);
-            if (!visited.insert(std::move(key))) break;
+            if (!visited.insert(it.node, it.stack)) break;
 
             const Node& n = graph.nodes[it.node];
 
@@ -82,8 +81,7 @@ void Parser::expand(std::uint32_t initial_node,
                 }
                 StackEntry entry;
                 entry.rule_id = n.rule_id;
-                entry.return_links = std::make_shared<
-                    const std::vector<std::uint32_t>>(n.links);
+                entry.return_links = n.links_shared;
                 entry.parent_children = it.children;
                 entry.start_pos = tok_pos;
                 std::size_t prev = it.stack ? it.stack->head.merge_hash : 0;
@@ -265,8 +263,7 @@ void Parser::find_completion(std::uint32_t initial_node,
         work.pop_back();
 
         while (true) {
-            auto key = state_key(it.node, it.stack);
-            if (!visited.insert(std::move(key))) break;
+            if (!visited.insert(it.node, it.stack)) break;
 
             const Node& n = graph.nodes[it.node];
 
@@ -283,8 +280,7 @@ void Parser::find_completion(std::uint32_t initial_node,
                 if (n.rule_id >= graph.rule_starts.size()) break;
                 StackEntry entry;
                 entry.rule_id = n.rule_id;
-                entry.return_links = std::make_shared<
-                    const std::vector<std::uint32_t>>(n.links);
+                entry.return_links = n.links_shared;
                 entry.parent_children = it.children;
                 entry.start_pos = tok_pos;
                 std::size_t prev = it.stack ? it.stack->head.merge_hash : 0;
