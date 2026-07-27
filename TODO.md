@@ -113,10 +113,21 @@ Origin tags point at the authoritative design text for each item.
       or a nested `Call`). Argument *order* is intentionally not a grammar rule — the normalizer enforces
       positionals-before-keywords and no-duplicate-formals so the error can name the axis. `as_sampled()` is where
       the **unsaturated** error lives (a bare array reaching a field that samples).
-      **STILL TO DO:** (2) mirror `axistuple` into ftrace's `src/gpda/ftsl_scene.epeg` + the C++ reducer, and reuse
-      the same production on the N-D grid / scatter element grammars; (3) the runtime N-D grid/scatter sampler
-      (loom already has the callable `Grid`/`Scatter` in `data.py`), plus the `shape=` / `lo` / `hi` constructor
-      conveniences below.
+      **STILL TO DO:** (2) mirror `axistuple` into ftrace's `ftsl_scene.epeg` + the C++ reducer, and reuse the same
+      production on the N-D grid / scatter element grammars; (3) the runtime N-D grid/scatter sampler (loom already
+      has the callable `Grid`/`Scatter` in `data.py`), plus the `shape=` / `lo` / `hi` constructor conveniences
+      below. **Increment 2 is a lexer decision, not a mechanical port** (found while doing 1): ftrace's tokenizer
+      (`src/ftsl.h` ~line 127) does *not* treat parens as delimiters — a bareword accretes until
+      whitespace/brace/bracket/comment/quote — precisely so an expression value like `0.5+0.5*sin(2*pi*8*u)` stays
+      **one** token. So `reflect [0 1](u)` currently lexes as `… ']' Word("(u)")`, and the trailing Word ends the
+      value and becomes the *next* statement's key. Making `(` a delimiter outright would shatter every expression
+      value in the tree. The minimal fix that doesn't: emit `(` as a delimiter **only immediately after a `]`**,
+      which is exactly the array-call position and can never occur inside an expression word. The `NAME axistuple`
+      half then needs no lexer change at all and arguably wants none — `ramp(u)` is already a single Word and
+      ftrace's expression evaluator already reads `name(args)` as a call, so the NAME form falls out of the
+      existing expression path. This is why the design note below schedules the C++ front-end at the **J3c port**
+      rather than now: with no runtime sampler yet, parsing the tuple early would only move the failure from
+      "syntax error" to "unknown value".
     * **ADDENDUM — call = sample; late-binding & rebinding of the consumed axis (design intent, user).** The
       trailing `(...)` is not just a *label* on a literal — it is the **sample call**, exactly like loom's
       `grid(x, y)`. Two authoring positions, so a material can *define* what an array consumes, or *defer* it to its
