@@ -5,6 +5,54 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH-DEBT — OPEN (2026-07-26): the hand-written `.ftsl` parser is still compiled in behind `-legacy-parser`
+
+0.68.0 flipped ftrace's front end over to the shared grammar
+(`tools/loom/loom/grammar/ftsl_scene.epeg` → `src/gpda/`), gated on the corpus differ
+reaching **MATCH 2595/2595** (every `.ftsl` in the tree, structurally identical down to
+`Stmt::line`). The retired hand-written parser in `src/ftsl.h` (`tokenize`, `Parser`,
+`parseTop`, `parseValue`, `parseBraceBody`, …) is still there, reachable via
+`-legacy-parser` / `FTRACE_LEGACY_PARSER`, as a one-release escape hatch.
+
+**Proper fix:** after 0.68 has had a release's worth of real use with no scene falling
+back, delete the legacy tokenizer + `Parser` from `ftsl.h`, drop `-legacy-parser` and the
+`legacy_flag()` / `use_legacy()` plumbing in `src/gpda/ftsl_frontend.hpp` and the argv
+pre-scan in `main.cpp`, and reduce `-validate-grammar` to a no-op warning (or remove it
+too — with one parser there is nothing to cross-check). Everything downstream of
+`std::vector<Block>` is shared and stays.
+
+### TECH-DEBT — OPEN (2026-07-26): `GraphParser/cpp/scannerless.{hpp,cpp}` still throws bare `std::runtime_error`, not the rich `ParseError`
+
+The tokenized engine (the one ftrace uses) throws a `ParseError` carrying line/col, the
+exact accepted-continuation set, and the enclosing rule chain — that diagnostic quality is
+the main reason the front-end flip was worth doing. The **scannerless** engine, which
+shares the same graph-walking core, still throws a plain `std::runtime_error` with no
+position and no expected set.
+
+**Why it wasn't done with the tokenized version:** the tokenized parser gets `line`/`col`
+for free (the lexer stamps every token) and its expected set is a set of *token* patterns,
+which `join_expected` can name directly. Scannerless has neither: it would need
+(a) a byte-offset → line/col map built once per parse from the input text, and (b) an
+expected-set formatter that describes **char-level** matchers (literal strings, char
+classes with ranges, `.`, unicode classes) in a form a user can read — e.g. collapsing
+`[0-9]` back to its source spelling rather than dumping 10 alternatives.
+
+**Proper fix:** hoist `ParseError` + `join_expected` + `escape_token_text` into a shared
+header, add an offset→line/col helper to the scannerless `Parser`, and write a
+`describe_matcher(const Node&)` for char-level terminals. Not urgent — no shipped ftrace
+path uses the scannerless engine.
+
+### PAPERCUT — OPEN (2026-07-26): `-o` into a non-existent directory fails every write interval and loses the whole render
+
+`ftrace -o png/nope/out.png …` runs the full render, prints `error: could not write …` at
+each `-interval` tick, and exits having written nothing — the accumulated film is simply
+lost. Hit twice now (once with `png/bench/`, once with `png/parserflip/`).
+
+**Proper fix:** resolve `-o`'s parent directory up front, during argument parsing, and
+either `std::filesystem::create_directories` it or fail immediately with
+`ftrace: output directory 'png/nope' does not exist` — before a single photon is traced.
+The same check belongs on the `.ftbuf` checkpoint sidecar path.
+
 ### BUILD BUG — FIXED (2026-07-26): editing a header did not rebuild the `.cu` files, and the linker could then keep a **stale copy of the function you just changed**
 
 **Symptom that exposed it.** A change to `PhotonMap::buildAuto` (a header-inline function in

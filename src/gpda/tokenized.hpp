@@ -85,6 +85,39 @@ inline std::string join_expected(const std::vector<std::string>& e,
     return s;
 }
 
+// Render a token's text for a one-line diagnostic.  A token value can itself be
+// whitespace (a NEWLINE token in a line-oriented grammar is literally "\n"), and
+// splicing that raw would break the message across lines and detach it from the
+// line/col it reports — so control characters are escaped, C-style.  Over-long
+// values are elided in the middle, keeping both ends recognizable.
+inline std::string escape_token_text(const std::string& v,
+                                     std::size_t max_len = 40) {
+    std::string s;
+    s.reserve(v.size());
+    for (char c : v) {
+        switch (c) {
+            case '\n': s += "\\n"; break;
+            case '\r': s += "\\r"; break;
+            case '\t': s += "\\t"; break;
+            case '\\': s += "\\\\"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    static const char* kHex = "0123456789abcdef";
+                    s += "\\x";
+                    s += kHex[(static_cast<unsigned char>(c) >> 4) & 0xF];
+                    s += kHex[static_cast<unsigned char>(c) & 0xF];
+                } else {
+                    s += c;
+                }
+        }
+    }
+    if (s.size() > max_len) {
+        const std::size_t keep = (max_len - 3) / 2;
+        s = s.substr(0, keep) + "..." + s.substr(s.size() - keep);
+    }
+    return s;
+}
+
 // ============================================================================
 // Persistent list (same pattern as the scannerless version)
 // ============================================================================
@@ -372,18 +405,46 @@ private:
     // iterations (avoids per-call 32-slot vector allocation).  Used as a
     // stack: acquire on entry, release on exit; predicates that recurse
     // get their own from deeper in the stack.
-    std::vector<Visited> visited_pool_;
+    //
+    // Held by pointer, NOT by value: a caller keeps its `Visited&` alive
+    // across expand(), which for a predicate node recurses back into
+    // expand_all() and acquires another one.  With a vector-of-values that
+    // acquire can reallocate and leave every outer frame holding a reference
+    // into freed storage — the StateKeys they then push retain PList cursors
+    // in a container that is never destroyed, so those cursors leak (and the
+    // write itself is a use-after-free).  unique_ptr elements keep the
+    // Visited objects at stable addresses.
+    std::vector<std::unique_ptr<Visited>> visited_pool_;
     std::size_t visited_in_use_ = 0;
 
     Visited& acquire_visited() {
         if (visited_in_use_ >= visited_pool_.size()) {
-            visited_pool_.emplace_back();
+            visited_pool_.push_back(std::make_unique<Visited>());
         }
-        auto& v = visited_pool_[visited_in_use_++];
+        auto& v = *visited_pool_[visited_in_use_++];
         v.clear();
         return v;
     }
     void release_visited() { --visited_in_use_; }
+
+    // Drop every pool-allocated reference this parse accumulated.  `Visited`
+    // only clears itself on *acquire*, so after the last release each entry
+    // still owns the PListPtr cursors it saw — and a Parser routinely outlives
+    // a parse (it is commonly a member, or a function-local static).  Holding
+    // them pins the whole cursor-stack graph between parses, and at process
+    // exit they get torn down after the pool that owns them.  Also drops
+    // `tokens_`, which points at a vector local to parse().
+    void reset_scratch() noexcept {
+        for (auto& v : visited_pool_) v->clear();
+        visited_in_use_ = 0;
+        tokens_ = nullptr;
+    }
+
+    // Runs reset_scratch() on the way out of parse(), thrown-from included.
+    struct ScratchGuard {
+        Parser* p;
+        ~ScratchGuard() { p->reset_scratch(); }
+    };
 
     std::vector<Cursor> expand_all(const std::vector<Cursor>& cursors,
                                    std::uint32_t tok_pos);
@@ -420,8 +481,11 @@ private:
     // epsilon-expanded set at the failure position (terminals only), so it is
     // exactly the set of continuations the grammar would have accepted; `tok`
     // is the offending token, or null when the input simply ran out.
+    // `tok` is the offending token, or null at end of input — in which case
+    // `last` (the final real token, if any) supplies the position to report.
     ParseError make_error(const std::vector<Cursor>& expanded,
-                          const Token* tok, std::size_t pos) const;
+                          const Token* tok, std::size_t pos,
+                          const Token* last = nullptr) const;
 
     StateKey state_key(std::uint32_t node,
                        const PListPtr<StackEntry>& stack) const {

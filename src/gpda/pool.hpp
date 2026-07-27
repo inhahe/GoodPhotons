@@ -45,6 +45,7 @@ class Pool {
     std::vector<std::unique_ptr<Slot[]>> chunks_;
     std::vector<T*> freelist_;
     std::size_t next_chunk_size_ = 64;
+    std::size_t live_ = 0;          // objects handed out and not yet destroyed
 
     void grow() {
         auto chunk = std::make_unique<Slot[]>(next_chunk_size_);
@@ -68,17 +69,44 @@ public:
         if (freelist_.empty()) grow();
         T* p = freelist_.back();
         freelist_.pop_back();
+        ++live_;
         return ::new (p) T(std::forward<Args>(args)...);
     }
 
     void destroy(T* p) noexcept {
         p->~T();
         freelist_.push_back(p);
+        --live_;
     }
 
+    // Objects handed out and not yet returned.  Exposed so tests can assert
+    // that a parse leaves nothing pinned.
+    std::size_t live() const noexcept { return live_; }
+
+    // A pool MUST outlive every object it handed out — and that is not
+    // something scoping can guarantee here.  A pool-allocated object can end up
+    // owned by something with static storage duration (a Parser kept as a
+    // function-local static holds PList cursors; a parse tree can be cached),
+    // and at process exit those are torn down in an order the pool has no say
+    // over.  With a plain `thread_local Pool`, the pool is destroyed FIRST:
+    // every straggler then runs its destructor on freed chunk memory and pushes
+    // onto a destroyed freelist.  That is heap corruption at exit, and it is
+    // exactly what surfaced when ftrace made this parser its .ftsl front end
+    // (the Parser singleton's scratch outlived the pool).
+    //
+    // So ownership goes through a deleter that frees the pool only when nothing
+    // is outstanding.  If objects are still live at thread exit we deliberately
+    // leak the pool instead — a bounded, once-per-thread leak of that thread's
+    // chunks — so the stragglers can still be destroyed safely afterwards.
+    struct FreeOnlyIfDrained {
+        void operator()(Pool* p) const noexcept {
+            if (p && p->live_ == 0) delete p;
+        }
+    };
+
     static Pool& instance() noexcept {
-        thread_local Pool p;
-        return p;
+        thread_local std::unique_ptr<Pool, FreeOnlyIfDrained> p(new Pool());
+        return *p;
     }
 };
 

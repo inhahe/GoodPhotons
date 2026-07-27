@@ -2157,20 +2157,40 @@ useful flags: `--resume` (skip already-rendered frames), `--start/--end/--step` 
 `--no-encode`, `--keep-frames`, `--crf`/`--codec`/`--pix-fmt`, and `--dry-run`. Run with
 `--help` for the full list.
 
-### Grammar cross-check (`-validate-grammar`)
+### The shared grammar (`-legacy-parser`, `-validate-grammar`)
 
-FTSL has two front-ends: ftrace's authoritative hand-written parser (`src/ftsl.h`)
-and a **shared grammar** — the same `.ftsl` syntax written once as a formal grammar
-(`tools/loom/loom/grammar/ftsl_scene.epeg`, compiled to a parser graph consumed by
-loom *and* vendored into ftrace as generated C++). The `-validate-grammar` flag runs
-the shared grammar alongside the hand-written parser on the scene you load,
-structurally diffs the two block trees, and prints any disagreement to stderr as a
-`[validate-grammar] …` warning. It is **non-authoritative and off by default**:
-ftrace always renders from its own parse, so the flag adds only a diagnostic (also
-enabled by setting the `FTRACE_VALIDATE_GRAMMAR` environment variable to a non-empty,
-non-`0` value). The goal is to drive the mismatch count to zero across the whole
-scene corpus before eventually flipping the front-end over to the shared grammar as
-the single source of truth. With no flag there is zero cost.
+FTSL's syntax is written **once**, as a formal grammar:
+`tools/loom/loom/grammar/ftsl_scene.epeg`. It is compiled to a parser graph that both
+loom (in Python) and ftrace (as generated C++, `src/gpda/ftsl_scene.gen.cpp`) consume,
+so the language has exactly one definition and the two tools cannot drift apart.
+**As of 0.68 the shared grammar is ftrace's front end** — it parses every scene you
+load, and the `.epeg` file is the single source of truth for what FTSL accepts.
+
+Besides removing the drift risk, the grammar parser gives much better errors. Because
+it walks a graph of cursors and expands only to *terminals*, at a failure the live
+cursor set is exactly the set of continuations the grammar would have accepted, and
+the cursor stacks name the enclosing rules:
+
+```
+scene.ftsl:1:15: unexpected NEWLINE '\n'; expected '{'
+    (in brace_body < plain_header < top_block < item)
+```
+
+where the retired hand-written parser could only manage `line 1: expected '{' after
+material`.
+
+Two flags cover the transition:
+
+- **`-legacy-parser`** parses with the old hand-written parser (`src/ftsl.h`) instead.
+  This is a one-release escape hatch in case a scene trips on the new front end; it is
+  slated for removal. Also settable via the `FTRACE_LEGACY_PARSER` environment
+  variable.
+- **`-validate-grammar`** parses the scene *both* ways, structurally diffs the two
+  block trees, and prints any disagreement to stderr as a `[validate-grammar] …`
+  warning. Also enabled by setting `FTRACE_VALIDATE_GRAMMAR` to a non-empty, non-`0`
+  value. This is what drove the flip: the two parsers agree on **all 2595 `.ftsl`
+  files in the tree**, structurally identical down to per-statement line numbers.
+  With no flag there is zero cost.
 
 ### Importing Mitsuba scenes
 
@@ -2297,6 +2317,11 @@ alone can't restore, so they are not disk-resumable.
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
 `-thinfilmswatch`, `-checkgrating`, `-checkupsample`.
+
+**Scene front end:** `-legacy-parser` (parse `.ftsl` with the retired hand-written
+parser instead of the shared grammar — escape hatch, slated for removal),
+`-validate-grammar` (parse both ways and warn on any disagreement). See
+**The shared grammar** above.
 
 ---
 

@@ -5,8 +5,8 @@ This is a pinned, verbatim copy of the GPDA tokenized graph parser, vendored
 into loom so its ``.ftsl`` parsing has no external dependency.
 
     Upstream : D:\\visual studio projects\\GraphParser  (gpda.py)
-    Commit   : 8c6b749  (2026-07-26)
-    sha256   : c865a4aeb14f1b3c…  (first 16 hex of the pinned gpda.py)
+    Commit   : d4362e6  (2026-07-26)
+    sha256   : c34c8a6ca029a9bd…  (first 16 hex of the pinned gpda.py)
 
 The file is fully self-contained (only ``import re``).  To refresh, re-copy
 ``gpda.py`` from the upstream repo, re-apply this header, and bump the commit /
@@ -15,7 +15,6 @@ hash above.  Public entry points used by loom: ``load_grammar(text)`` ->
 / ``.value``).
 
 --- original module docstring follows ------------------------------------
-
 gpda.py - GPDA Graph Parser
 ============================
 Implementation of the GPDA parsing algorithm with zero lookahead/lookbehind.
@@ -995,7 +994,8 @@ class GraphParser:
                 expected, context = self._expected_and_context(
                     self._expand_all(cursors, end_pos))
                 raise SyntaxError(self._format_error(
-                    f"unexpected end of input after {last.value!r} "
+                    "unexpected end of input after "
+                    f"{self._escape_token_text(last.value)} "
                     f"(line {last.line}, col {last.col})", expected, context))
             else:
                 completions = self._find_completions(
@@ -1377,6 +1377,38 @@ class GraphParser:
         return expected, context[:4]
 
     @staticmethod
+    def _escape_token_text(v, max_len=40):
+        """Render a token's text for a one-line diagnostic.
+
+        A token value can itself be whitespace (a NEWLINE token in a
+        line-oriented grammar is literally "\\n"), and splicing that raw would
+        break the message across lines and detach it from the line/col it
+        reports — so control characters are escaped, C-style.  Over-long values
+        are elided in the middle, keeping both ends recognizable.  Kept in step
+        with gpda_tok::escape_token_text in cpp/tokenized.hpp so both
+        implementations word an error identically.
+        """
+        out = []
+        for c in v:
+            if c == '\n':
+                out.append('\\n')
+            elif c == '\r':
+                out.append('\\r')
+            elif c == '\t':
+                out.append('\\t')
+            elif c == '\\':
+                out.append('\\\\')
+            elif ord(c) < 0x20:
+                out.append('\\x%02x' % ord(c))
+            else:
+                out.append(c)
+        s = ''.join(out)
+        if len(s) > max_len:
+            keep = (max_len - 3) // 2
+            s = s[:keep] + '...' + s[-keep:]
+        return "'" + s + "'"
+
+    @staticmethod
     def _format_error(head, expected, context):
         msg = head
         if expected:
@@ -1401,7 +1433,8 @@ class GraphParser:
             else f"{token.type} "
         raise SyntaxError(self._format_error(
             f"line {token.line}, col {token.col}: "
-            f"unexpected {kind}{token.value!r}", expected, context))
+            f"unexpected {kind}{self._escape_token_text(token.value)}",
+            expected, context))
 
 
 # ========================== EPEG Bootstrap Parser ==========================

@@ -1,9 +1,12 @@
-// reduce.hpp — GPDA ParseNode tree  ->  ftrace ftsl::Block tree, + a structural
-// differ.  This is the heart of the J3c validation shim: it turns the shared
-// grammar's parse tree into the exact std::vector<ftsl::Block> shape ftrace's
-// hand-written parseTop() produces, so the two can be diffed block-for-block.
+// ftsl_reduce.hpp — GPDA ParseNode tree  ->  ftrace ftsl::Block tree, + a
+// structural differ.  This is the back half of ftrace's authoritative .ftsl front
+// end (see ftsl_frontend.hpp): it turns the shared grammar's parse tree into the
+// exact std::vector<ftsl::Block> shape the rest of ftrace consumes.  The differ
+// exists because that shape was originally reverse-engineered from ftrace's
+// hand-written parseTop(); it still backs `-validate-grammar`, which diffs the two
+// front ends block-for-block.
 //
-// The mapping faithfully mirrors ftrace's Parser (src/ftsl.h):
+// The mapping faithfully mirrors ftrace's legacy Parser (src/ftsl.h):
 //   * value continuation / record-override `= rhs [i]` / `[i]` selector folding
 //   * nested-block type/name derivation (bareword => type, single quoted => name)
 //   * brace-body flat `words` dump (key, then post-pop value words)
@@ -20,12 +23,12 @@
 #include "tokenized.hpp"
 // ftsl::Block / Stmt / Value come from ftrace's front-end.  In-tree this header
 // is included by ftsl.h *after* those types are defined; the standalone de-risk
-// harness (scraps/gpda_shim) defines FTSL_SHIM_STANDALONE to pull a copied slice.
-#ifdef FTSL_SHIM_STANDALONE
+// harness (scraps/gpda_shim) defines FTSL_GPDA_STANDALONE to pull a copied slice.
+#ifdef FTSL_GPDA_STANDALONE
 #include "ftrace_parse_slice.hpp"
 #endif
 
-namespace shim {
+namespace ftsl_gpda {
 
 using PN = gpda_tok::ParseNode;
 
@@ -323,4 +326,4 @@ inline Diff diff_scene(const std::vector<ftsl::Block>& a,
     return d;
 }
 
-}  // namespace shim
+}  // namespace ftsl_gpda

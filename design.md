@@ -37,9 +37,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   allow, CPU fallback otherwise; all-M pinhole groups meter in one batched
   `renderPhotonMapSharedCuda` pass with `MeterConverge` early-stop via `onFrame`),
   PNG/PPM output.
-- **`scene.h` / `ftsl.h`** — scene model and the FTSL scene-language parser
+- **`src/gpda/`** — the FTSL front end. `ftsl_scene.epeg` (in
+  `tools/loom/loom/grammar/`) is the **single source of truth** for FTSL's syntax;
+  `loom.grammar.emit_cpp` compiles it to `ftsl_scene.gen.cpp` (a parser graph),
+  which `tokenized.{hpp,cpp}` + `pool.hpp` (verbatim vendored copies of the upstream
+  GPDA parser in `D:\visual studio projects\GraphParser`) walk to a parse tree, which
+  `ftsl_reduce.hpp` reduces to the same `std::vector<ftsl::Block>` the hand-written
+  parser produced. `ftsl_frontend.hpp` is the entry point (`ftsl_gpda::parse`, plus
+  `use_legacy()` / `validate()` behind the two transition flags). loom parses the
+  *same* grammar in Python via the pinned `tools/loom/loom/grammar/_gpda.py`, so
+  ftrace and loom cannot disagree about the language. The flip (0.68) was gated on
+  `-validate-grammar` reporting zero structural mismatches across all 2595 `.ftsl`
+  files in the tree, down to per-statement line numbers.
+- **`scene.h` / `ftsl.h`** — scene model and the FTSL semantic pass
   (cameras, camera_curve/path/orbit, materials, lights, media, implicits, meshes).
-  `FTSL.md` documents the language. Lights are `Emitter`s with an `EmitterShape`
+  `FTSL.md` documents the language. Everything downstream of
+  `std::vector<Block>` — turning blocks into a `Scene` — lives here and is shared by
+  both front ends; the hand-written *parser* is still compiled in behind
+  `-legacy-parser` as a one-release escape hatch.
+  Lights are `Emitter`s with an `EmitterShape`
   (Quad/Sphere/Spot/Env/Cylinder/**Mesh**); each carries its own SPD and a `power`
   = emitIntegral·geomWeight selection weight. **Mesh area lights** (since 0.41.0): a
   material with an `emit` spectrum bound to a `mesh` registers an

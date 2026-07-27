@@ -509,7 +509,8 @@ ParseNodePtr Parser::reconstruct_lr(const ParseNodePtr& tree) {
 // separate FIRST-set computation.  Rendering it is the whole trick behind a
 // decent GPDA diagnostic.
 ParseError Parser::make_error(const std::vector<Cursor>& expanded,
-                              const Token* tok, std::size_t pos) const {
+                              const Token* tok, std::size_t pos,
+                              const Token* last) const {
     std::vector<std::string> expected;
     std::vector<std::string> context;
 
@@ -559,9 +560,16 @@ ParseError Parser::make_error(const std::vector<Cursor>& expanded,
         const bool anon = tok->type.empty() || tok->type[0] == '_';
         os << "line " << tok->line << ", col " << tok->col << ": unexpected ";
         if (!anon) os << tok->type << " ";
-        os << "'" << tok->value << "'";
+        os << "'" << escape_token_text(tok->value) << "'";
     } else {
         os << "unexpected end of input";
+        // `last` is the final real token, when there was one: a bare "unexpected
+        // end of input" gives no idea *where* the input trailed off, and for an
+        // unterminated block the last token is exactly what the reader needs.
+        if (last) {
+            os << " after '" << escape_token_text(last->value) << "' (line "
+               << last->line << ", col " << last->col << ")";
+        }
     }
     if (!expected.empty()) os << "; expected " << join_expected(expected);
     if (!context.empty()) {
@@ -578,6 +586,10 @@ ParseError Parser::make_error(const std::vector<Cursor>& expanded,
         err.col  = tok->col;
     } else {
         err.at_eof = true;
+        // No offending token, but a caller that wants to point at something (an
+        // editor squiggle, a caret line) still needs coordinates — give it the end
+        // of the input, i.e. the last token's position.
+        if (last) { err.line = last->line; err.col = last->col; }
     }
     err.pos      = pos;
     err.expected = std::move(expected);
@@ -597,6 +609,7 @@ ParseNodePtr Parser::parse(const std::vector<Token>& tokens) {
         if (t.type != "EOF") real.push_back(t);
     }
     tokens_ = &real;
+    ScratchGuard scratch_guard{this};
 
     graph.finalize();
     if (graph.start_rule_id >= graph.rule_starts.size()) {
@@ -645,7 +658,7 @@ ParseNodePtr Parser::parse(const std::vector<Token>& tokens) {
         // what would have let the parse continue — that is the useful half of
         // an "unexpected end of input" message ("expected '}'").
         throw make_error(expand_all(cursors, static_cast<std::uint32_t>(n)),
-                         nullptr, n);
+                         nullptr, n, real.empty() ? nullptr : &real.back());
     }
 
     ParseNodePtr tree = completions[0];

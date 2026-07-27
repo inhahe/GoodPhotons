@@ -395,14 +395,17 @@ struct Parser {
     }
 };
 
-}  // namespace ftsl  (temporarily closed so the validation shim can see
+}  // namespace ftsl  (temporarily closed so the GPDA front end can see
    //                  ftsl::Block/Stmt/Value at global scope)
 
-// J3c grammar-validation shim: the shared .ftsl grammar (GPDA) run alongside the
-// hand-written Parser above.  Included here — after Block/Stmt/Value/Parser are
-// defined — so its inline reducer/differ can reference them.  Non-authoritative;
-// see the header for details.
-#include "gpda/ftsl_shim.hpp"
+// The authoritative .ftsl front end: the shared grammar
+// (tools/loom/loom/grammar/ftsl_scene.epeg, compiled to a GPDA graph) plus the
+// reducer that turns its parse tree into the Block tree the hand-written Parser
+// above used to produce.  Included here — after Block/Stmt/Value/Parser are
+// defined — so its inline reducer/differ can reference them.  loadSource() below
+// calls ftsl_gpda::parse() by default; the Parser above survives only as the
+// `-legacy-parser` escape hatch and as `-validate-grammar`'s cross-check.
+#include "gpda/ftsl_frontend.hpp"
 
 namespace ftsl {
 
@@ -4687,12 +4690,24 @@ inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
 inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
                        Loaded& L, std::string& err,
                        const SupportFn& supported = {}) {
-    Parser p; p.t = tokenize(src);
-    std::vector<Block> blocks = p.parseTop();
-    if (!p.err.empty()) { err = p.err; return false; }
+    // Parse with the legacy hand-written recursive-descent parser.  Kept as a
+    // callback so it can serve both `-legacy-parser` and `-validate-grammar`.
+    auto legacy_parse = [&src](std::vector<Block>& out, std::string& e) -> bool {
+        Parser p; p.t = tokenize(src);
+        out = p.parseTop();
+        if (!p.err.empty()) { e = p.err; return false; }
+        return true;
+    };
 
-    // J3c validation shim (non-authoritative); see load() below and src/gpda/ftsl_shim.hpp.
-    ftsl_shim::validate(src, blocks, nameForMsgs);
+    std::vector<Block> blocks;
+    if (ftsl_gpda::use_legacy()) {
+        if (!legacy_parse(blocks, err)) return false;
+    } else {
+        // Authoritative path: the shared grammar (src/gpda/ftsl_frontend.hpp).
+        if (!ftsl_gpda::parse(src, blocks, err)) return false;
+        // Optional cross-check against the legacy parser (`-validate-grammar`).
+        ftsl_gpda::validate(blocks, legacy_parse, nameForMsgs);
+    }
 
     // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
     std::vector<size_t> preferIdx;

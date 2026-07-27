@@ -245,6 +245,28 @@ Origin tags point at the authoritative design text for each item.
     reconciliations (logged): record-driven whole-material override block (ftrace `isRecordOverrideBlock`, not emitted
     by loom); loom Light `color`/`size`/`turbidity` props ftrace ignores; stale `absorb 3 0.5 0.3` comment
     (`ftsl.h` ~1838, see known-issues.md).
+  - **DONE (2026-07-26): the flip landed — the shared grammar IS ftrace's front end.** VERSION 0.67.0 → **0.68.0**.
+    - *Gate met:* the corpus differ reached **MATCH 2595/2595** (`old_fail=0 gpda_fail=0 mismatch=0`) — every `.ftsl`
+      in the tree, structurally identical down to `Stmt::line` (which required threading token line/col through the
+      parse tree, upstream GraphParser `7432f42`). loom's own suite: 1072/1072.
+    - *Code:* `ftsl_shim.hpp` → **`src/gpda/ftsl_frontend.hpp`** (namespace `shim` → `ftsl_gpda`), and `loadSource`
+      now calls `ftsl_gpda::parse()` by default. `-legacy-parser` / `FTRACE_LEGACY_PARSER` selects the retired
+      hand-written parser (one-release escape hatch); `-validate-grammar` still cross-checks both.
+      Both flags needed a **pre-scan** in `main.cpp` — the scene loads (~3813) *before* the argv loop (~3837), so
+      `-validate-grammar` had silently never worked as a CLI flag (only via the env var).
+    - *Error quality* is the visible win: `line 1, col 15: unexpected NEWLINE '\n'; expected '{'
+      (in brace_body < plain_header < top_block < item)` vs the legacy `line 1: expected '{' after material`.
+    - *Verified:* bit-identical renders GPDA vs `-legacy-parser` on `_ellipsoid_test.ftsl` (mode B/GPU) and
+      `mirror_selfie.ftsl` (mode R/GPU), `-validate-grammar` silent, exit 0.
+    - *Two lifetime bugs the flip exposed* (fixed upstream in GraphParser `284244f`, re-vendored):
+      (1) `Parser::acquire_visited()` returned a reference into a `std::vector<Visited>` that a recursing predicate
+      could reallocate — a use-after-free that showed up as a permanently retained cursor; elements are `unique_ptr`
+      now. (2) `Visited` only cleared on *acquire*, so a Parser outliving a parse kept the pool's cursor stacks alive
+      and they were destroyed after the `thread_local` pool at exit (heap corruption; ftrace segfaulted on exit).
+      `parse()` now runs `reset_scratch()` on the way out, and the pool is owned through a deleter that frees it only
+      when drained. Same latent pattern fixed in `scannerless.{hpp,cpp}`.
+    - *Still open:* delete the legacy parser after one release; port the rich `ParseError` to `scannerless`
+      (needs char-level expected sets + offset→line/col mapping).
 
 ---
 
