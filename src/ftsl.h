@@ -1143,17 +1143,22 @@ private:
         // of `rgb`, right for coloured lights (`spd rgbillum 1 0.6 0.2`). Meant for lights;
         // accepted anywhere a spectrum is. (Head keywords, not trailing modifiers, because
         // the parser stops a value at the next bareword.)
-        // The `…smits` heads (`rgbsmits`/…) take the classic Smits 1999 basis and the
-        // `…box` heads (`rgbbox`/…) a plain calibrated 3-box, instead of the default
-        // Jakob-Hanika fit — selectable, lower-fidelity alternative upsamplers (K1).
+        // The `…smits` heads (`rgbsmits`/…) take the classic Smits 1999 basis, the
+        // `…box` heads (`rgbbox`/…) a plain calibrated 3-box, and the `…meng` heads
+        // (`rgbmeng`/…) the Meng 2015 smoothest-spectrum grid, instead of the default
+        // Jakob-Hanika fit — selectable alternative upsamplers (K1). `…meng` is the
+        // one to reach for when a reflectance will be re-illuminated by a strongly
+        // non-D65 light or dispersed, since it is the *smoothest* spectrum of that
+        // colour rather than a shape-constrained fit.
         {
             bool isLine  = (h == "rgbline"  || h == "hsvline"  || h == "hslline");
             bool isIllum = (h == "rgbillum" || h == "hsvillum" || h == "hslillum");
             bool isSmits = (h == "rgbsmits" || h == "hsvsmits" || h == "hslsmits");
             bool isBox   = (h == "rgbbox"   || h == "hsvbox"   || h == "hslbox");
-            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine || isIllum || isSmits || isBox) {
+            bool isMeng  = (h == "rgbmeng"  || h == "hsvmeng"  || h == "hslmeng");
+            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine || isIllum || isSmits || isBox || isMeng) {
                 if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
-                std::string space = (isLine || isIllum || isSmits || isBox) ? h.substr(0, 3) : h;
+                std::string space = (isLine || isIllum || isSmits || isBox || isMeng) ? h.substr(0, 3) : h;
                 Vec3 c;
                 if      (space == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
                 else if (space == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
@@ -1165,6 +1170,7 @@ private:
                 if (isIllum) return rgbToIlluminantJH(c.x, c.y, c.z);
                 if (isSmits) return rgbToReflectanceSmits(c.x, c.y, c.z);
                 if (isBox)   return rgbToReflectanceBox(c.x, c.y, c.z);
+                if (isMeng)  return rgbToReflectanceMeng(c.x, c.y, c.z);
                 return rgbToReflectanceJH(c.x, c.y, c.z);
             }
         }

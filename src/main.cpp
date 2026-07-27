@@ -960,7 +960,38 @@ static int checkUpsample() {
     }
     bool passF = boxPhysical && boxErr < 0.30;   // crude basis; saturated colours clamp
 
-    bool pass = passA && passB && passW && passC && passD && passE && passF;
+    // (g) Meng 2015 smoothest-spectrum grid. Because the interpolation weights are
+    // divided by each vertex's X+Y+Z, the mix lands on the requested chromaticity
+    // *exactly*, so the only error is the brightness clamp — near-zero for anything
+    // a smooth reflectance can actually be that bright. The second check is the one
+    // that matters for the method: the result must be SMOOTHER (lower sum of squared
+    // first differences) than the Jakob-Hanika fit of the same colour, since that is
+    // the entire property being tabulated.
+    double mengErr = 0.0, mengWhiteErr = 0.0; bool mengPhysical = true, mengSmoother = true;
+    for (const C& c : tests) {
+        if (c.r == 0.0 && c.g == 0.0 && c.b == 0.0) continue;   // black -> zero
+        Spectrum spd = rgbToReflectanceMeng(c.r, c.g, c.b);
+        Spectrum jh  = rgbToReflectanceJH(c.r, c.g, c.b);
+        double roughM = 0.0, roughJ = 0.0, prevM = spd(B.lam[0]), prevJ = jh(B.lam[0]);
+        for (int i = 0; i < B.N; ++i) {
+            double s = spd(B.lam[i]);
+            if (s < -1e-9 || s > 1.0 + 1e-9) mengPhysical = false;
+            double dM = s - prevM, dJ = jh(B.lam[i]) - prevJ;
+            roughM += dM * dM; roughJ += dJ * dJ;
+            prevM = s; prevJ = jh(B.lam[i]);
+        }
+        if (roughM > roughJ) mengSmoother = false;
+        Vec3 lin = reflectanceToLinearSrgbD65(spd);
+        double e = std::max({std::fabs(lin.x - c.r), std::fabs(lin.y - c.g), std::fabs(lin.z - c.b)});
+        if (c.r == 1.0 && c.g == 1.0 && c.b == 1.0) mengWhiteErr = e; else mengErr = std::max(mengErr, e);
+        std::printf("[checkupsample] meng  %-8s (%.2f %.2f %.2f) -> (%.4f %.4f %.4f)  err=%.5f  rough=%.5f (jh %.5f)\n",
+                    c.name, c.r, c.g, c.b, lin.x, lin.y, lin.z, e, roughM, roughJ);
+    }
+    // Tabulated + interpolated, so allow a hair more slack than the analytic fits;
+    // white is capped by the brightest smooth reflectance of that chromaticity.
+    bool passG = mengPhysical && mengSmoother && mengErr < 5e-3 && mengWhiteErr < 0.02;
+
+    bool pass = passA && passB && passW && passC && passD && passE && passF && passG;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
@@ -968,6 +999,8 @@ static int checkUpsample() {
     std::printf("[checkupsample] illuminant round-trip max error = %.5f  (%s)\n", illumErr, passD ? "ok" : "BAD");
     std::printf("[checkupsample] smits round-trip max error = %.5f (<0.20 expected)  (%s)\n", smitsErr, passE ? "ok" : "BAD");
     std::printf("[checkupsample] box round-trip max error = %.5f (<0.30 expected)  (%s)\n", boxErr, passF ? "ok" : "BAD");
+    std::printf("[checkupsample] meng round-trip max error = %.5f (excl. white %.5f); smoother than JH: %s  (%s)\n",
+                mengErr, mengWhiteErr, mengSmoother ? "yes" : "NO", passG ? "ok" : "BAD");
     std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

@@ -1008,6 +1008,17 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   but blocky (hard band edges, no smoothness), so it's the baseline against which `rgb`
   (Jakob–Hanika) and `rgbsmits` trade fidelity for smoothness. A valid `[0,1]`-clamped
   *material* reflectance like the others.
+- **`rgbmeng r g b`** (also `hsvmeng …`, `hslmeng …`) — the **Meng 2015** upsampler: of
+  all physical reflectances that produce the requested colour, take the **smoothest** one
+  (the minimum of `Σ(s[i+1]−s[i])²`), read from a baked table over the sRGB chromaticity
+  triangle. This is the **highest-fidelity** of the four: it round-trips sRGB to <0.0001
+  *and* is provably smoother than the `rgb` (Jakob–Hanika) fit for the same colour, since
+  smoothness is exactly what it minimises. That matters whenever a reflectance is seen
+  under a strongly **non-D65** light or **dispersed** — all four upsamplers agree under
+  D65 by construction, but only the reconstructed *shape* decides the colour under a
+  tungsten or sodium source, and a smooth shape is what real pigments have. Slightly more
+  memory than the analytic fits (a ~140 KB table) and a table lookup instead of a solve.
+  A valid `[0,1]`-clamped *material* reflectance like the others.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum. Interpolated
   **piecewise-linear** by default; add an **`interp=cubic`** flag among the entries
   (`table { interp=cubic  400:0.05 … }`) for a **monotone cubic (PCHIP)** curve —

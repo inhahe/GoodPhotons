@@ -263,6 +263,44 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   doesn't span the 360–830 nm render range. Since `Spectrum` is
   `std::function<double(double)>` evaluated at each photon's exact λ, the interpolant
   shape shows directly (there's no pre-binning), which is why overshoot matters.
+- **`upsample.h` — the RGB→spectrum upsampler family.** Five reconstructions of a
+  spectrum from a colour triple, each reached by its own FTSL head keyword
+  (`rgb`/`hsv`/`hsl` + suffix), all sharing one `upsample::Basis` (95 samples,
+  360–830 nm at 5 nm; weights `k·D65(λ)·CMF(λ)·Δλ`, `k` normalised so unit
+  reflectance integrates to `Y=1`). They differ in what they optimise, which is why
+  more than one is kept: **Jakob–Hanika** (`rgb`, the default) fits a 3-parameter
+  sigmoid — always in `[0,1]`, cheap, but the *shape* is whatever the sigmoid
+  family allows; **JH illuminant** (`rgbillum`) is the same fit renormalised for
+  emission; **Smits 1999** (`rgbsmits`) mixes seven fixed basis curves; **3-box**
+  (`rgbbox`) solves a 3×3 for one flat step per band — exact round-trip but blocky;
+  **Meng 2015** (`rgbmeng`) is the *smoothest* physical reflectance producing the
+  colour. Only under a non-D65 illuminant (or under dispersion) does the choice show
+  in the render — every upsampler round-trips its own colour under D65 by
+  construction, so it is the reconstructed *shape*, not the colour, that differs
+  (`scraps/meng_test.ftsl` makes this visible by lighting four identical panels with
+  illuminant A). `-checkupsample` validates all five: round-trip error, `[0,1]`
+  physicality, and — for Meng specifically — that its roughness is provably below
+  JH's on every test colour.
+  Meng is table-driven, and the table (`src/meng_table.h`, ~140 KB) is **baked by us**
+  (`tools/bake_meng.py`), not transcribed from the authors' supplemental — the method
+  is published, the published data carries no licence. Two deliberate departures from
+  the paper make the bake much simpler *and* more accurate for our use:
+  (a) the grid is barycentric **in the sRGB primary triangle** rather than over the
+  spectral locus, because every colour ftrace upsamples arrives as `rgb r g b` with
+  components in `[0,1]` and therefore already lies inside that triangle — the
+  barycentric coordinates are just `(r·S_R, g·S_G, b·S_B)` normalised (`S_i` = column
+  sums of `linSrgbToXyz`), so there is no search, no cell classification, no locus
+  polygon; and (b) each vertex is solved at **`Y=1` with no upper bound**, not at some
+  fraction of max brightness with `s ≤ 1`. (b) is the load-bearing one: the
+  minimum-roughness solution is linear in the target XYZ only if the feasible set is a
+  *cone*, and `{s ≥ 0}` is while `{0 ≤ s ≤ 1}` is not. Tabulating against an active
+  upper bound silently destroys the very property being tabulated — scaling the stored
+  spectrum down to a darker colour stops being optimal — which is exactly the bug that
+  first made `-checkupsample` report Meng as *rougher* than JH. The renderer scales to
+  the requested luminance and clamps at use time. Interpolation weights each cell
+  vertex by `bary_k / T_k` (`T_k = X+Y+Z` of its spectrum) rather than by `bary_k`
+  alone, because a chromaticity is an `(X+Y+Z)`-weighted mean — that is what makes the
+  interpolated chromaticity *exact* rather than merely close.
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.

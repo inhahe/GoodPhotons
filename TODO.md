@@ -2429,13 +2429,35 @@ ftrace's own language). Two follow-ups were captured:
           wired through `evalSpectrum` (`ftsl.h`) and mirrored in loom (`BoxSpec`, with tests). Validated by
           `-checkupsample` (box section, err <0.02, all reflectances clamped `[0,1]`). Reflectance upsampler →
           host-side bake, no GPU change.
-    - [ ] **Still open:** **Meng 2015** upsampler — BLOCKED on the paper's published precomputed
-          spectrum table (external data we don't vendor); an approximate reimplementation wouldn't be
-          faithful, so this waits on sourcing that asset. *(The **named user mapping** is effectively
-          covered: `spectrum "name" = <expr>` already registers a reusable named spectrum referenced via
-          `spectrum:name` (ftsl.h ~335/1239), and the new `rgb`/`rgbsmits`/`rgbbox`/`rgbillum`/`rgbline`
-          heads are exactly named `(r,g,b)->spectrum` functions — so the only residual is a user-supplied
-          custom basis, which is low-value given the built-ins and left out unless a scene needs it.)*
+    - [x] **Meng 2015 smoothest-spectrum upsampler landed** *(2026-07-27, v0.85.0).* Of all physical
+          reflectances that produce a given colour, take the **smoothest** (minimum `Σ(s[i+1]−s[i])²`),
+          tabulated over chromaticity and interpolated. Surface: **head keywords**
+          `rgbmeng`/`hsvmeng`/`hslmeng` through `evalSpectrum` (`ftsl.h`), mirrored in loom (`MengSpec`,
+          with tests). *This was previously logged as BLOCKED on the paper's published precomputed table
+          ("external data we don't vendor") — that framing was simply wrong on both halves.* First, the
+          supplemental carries **no licence and no copyright notice anywhere** (verified against the real
+          137 MB zip), and this repo has no LICENSE of its own to reconcile it with — so there was never a
+          licensing obstacle to begin with. Second, and more to the point, we don't *want* their table:
+          the method is published in full, so we bake our own (`tools/bake_meng.py` → `src/meng_table.h`,
+          order 16 / 153 vertices / 81 samples / ~138 KB) with two departures that make ours **more**
+          accurate than the paper's grid for our use — a grid barycentric in the sRGB primary triangle
+          (every colour we upsample already lies inside it, so no search or cell classification), and
+          vertices solved at `Y=1` **unbounded above** rather than under an active `s ≤ 1` bound. The
+          second is essential, not cosmetic: min-roughness is linear in target XYZ only over a *cone*, and
+          `{0 ≤ s ≤ 1}` isn't one — tabulating against a live upper bound destroys the tabulated property,
+          which is precisely the bug that first made `-checkupsample` call Meng *rougher* than JH.
+          Validated by `-checkupsample` (section g): round-trip max error **0.00005** (white 0.01208,
+          itself better than JH's 0.01647 — pure white is genuinely infeasible as a bounded reflectance
+          under our blackbody-6504 "D65"), all samples in `[0,1]`, and roughness provably below JH's on
+          every test colour. Render: `scraps/meng_test.ftsl` (four upsamplers, same colour, lit by
+          illuminant A — a D65 wash cannot distinguish them by construction). Reflectance upsampler →
+          host-side bake, no GPU change.
+    - **Residual (deliberately not scheduled):** a **user-supplied custom basis**. The **named user
+          mapping** is already covered — `spectrum "name" = <expr>` registers a reusable named spectrum
+          referenced via `spectrum:name` (ftsl.h ~335/1239), and the
+          `rgb`/`rgbsmits`/`rgbbox`/`rgbillum`/`rgbline`/`rgbmeng` heads are exactly named
+          `(r,g,b)->spectrum` functions. So the only thing left is letting a scene bring its own basis
+          curves, which is low-value given the five built-ins and stays out unless a scene needs it.
 
 - [x] **K2 — Analytic physical sky (`turbidity`).** **DONE 2026-07-24.** Implemented the **Preetham et al. 2002**
       analytic daylight model as an `env` sub-kind: `light env { sky preetham  turbidity t  sun_dir …  (or
