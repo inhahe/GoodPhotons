@@ -332,8 +332,11 @@ struct VcmSession;   // opaque; lives in render_cuda.cu
 bool cudaVcmSupported(const Scene& scene);
 // Returns nullptr if CUDA is unavailable or the scene is out of scope. `maxDepth` (<1 =>
 // default 8) is the full path length in edges (also the per-light-subpath stored-vertex cap).
+// `heroC` > 1 carries a hero-wavelength bundle of that width along BOTH subpaths (clamped to
+// hero::kHeroMax); 1 is the classic single-λ session, which the templated kernels reproduce
+// bit-identically and without allocating the per-vertex secondary slab at all.
 VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
-                            bool diffraction, int maxDepth);
+                            bool diffraction, int maxDepth, int heroC = 1);
 // Run one VCM pass at the given merge `radius` (the caller shrinks it per the progressive
 // schedule r_i = R0 * i^((alpha-1)/2)), accumulating into the resident per-pixel sum.
 void vcmSessionPass(VcmSession* s, double radius);

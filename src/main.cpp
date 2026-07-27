@@ -2888,15 +2888,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const bool wantAuto = !std::strcmp(device, "auto");
             if ((wantGpu || wantAuto) && !cam.hasLens() &&
                 cudaAvailable() && cudaVcmSupported(scene)) {
-                VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxDepth);
+                VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxDepth,
+                                                   vcmHeroC);
                 if (sess) {
-                    if (vcmHeroC > 1)
-                        std::printf("[hero] mode U GPU session is single-wavelength; "
-                                    "-heroc %d applies to the CPU path only (use -device cpu)\n",
-                                    vcmHeroC);
                     std::printf("mode U: VCM/UPS on %s — connections + merging, R0=%.4g, "
-                                "alpha=%.2f at %dx%d (maxDepth=%d, light=%s) ...\n",
-                                cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxDepth, lightLabel);
+                                "alpha=%.2f at %dx%d (maxDepth=%d, light=%s, %s) ...\n",
+                                cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxDepth, lightLabel,
+                                vcmHeroC > 1
+                                    ? (std::string("hero C=") + std::to_string(vcmHeroC)).c_str()
+                                    : "single-lambda");
                     auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
                         Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
                         for (long long pass = 0; pass < passTarget; ++pass) {

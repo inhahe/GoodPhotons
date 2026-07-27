@@ -471,14 +471,15 @@ second 12-byte random-access stream per visit only added traffic. Packing the CI
 into `DPhoton` itself would grow the struct 32→44B and tax every mode's deposit
 bandwidth, so that variant wasn't pursued either. Keep the CPU-side table only.
 
-### TECH-DEBT (2026-07-20, updated 2026-07-26): hero-wavelength sampling is on ALL the CPU tracers (R + A/B/C + M/S + BDPT D + VCM U) and the whole GPU megakernel (forward A/B/C + M-deposit, backward R, BDPT D) — the GPU wavefront backend and the GPU VCM session are the last single-λ paths
+### TECH-DEBT (2026-07-20, updated 2026-07-26): hero-wavelength sampling is on ALL the CPU tracers (R + A/B/C + M/S + BDPT D + VCM U) and the whole GPU megakernel (forward A/B/C + M-deposit, backward R, BDPT D, VCM U) — the GPU wavefront backend is the last single-λ path
 `radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
 `tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
 **CPU photon-mapping modes M (photon map) + S (SPPM)** hero-wavelength spectral sampling (hero λ + 3 stratified
 secondaries, `hero.h` `kHeroC=4`). Its **device twin** (`traceHeroPhoton`/`genPhotonHero`/`shadeStepHero` in
 `src/render_cuda.cu`) now gives the **GPU forward megakernel** the same thing (modes A/B/C and the mode-M photon
 deposit), `bkRadianceHero()` gives the **GPU backward megakernel** mode R, and the templated `kBdptT<NS>` gives
-the **GPU BDPT megakernel** mode D (all DONE items below).
+the **GPU BDPT megakernel** mode D, and the templated `kVcmLightT<NS>`/`kVcmCameraT<NS>` gives the **GPU VCM/UPS
+session** mode U (all DONE items below).
 Validated: mode R on `cornell.ftsl` (chroma 0.89× overall / 0.74×
 spectral-dominated, luma flat); modes A/B/C on `cornell` mode B (chroma 0.77×, luma 0.97×, energy
 `sum/emitted≈1.0025`, dispersion intact); mode M on `cornell` (energy conserved exactly — auto-exposure identical,
@@ -681,9 +682,38 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   (absolute mode = fixed sensor gain) C=4 vs C=1 at 1600 passes = **−0.001 %** mean, with self-noise RMS
   3.107→2.284; a new `scraps/_vcm_hero_gel.ftsl` (Wratten-58 gel pane + mirror slab — the `keepBundle` stress
   case) **+0.016 %** at 3200 passes with self-noise RMS 1.837→0.932 (**0.51×** = ~4× variance reduction).
-  **Still TODO: the GPU VCM session** (`src/vcm_cuda.cu`) is single-λ; `-mode U -device gpu` prints a one-line
-  notice saying so rather than silently ignoring `-heroc`. It is not gated off, because `g_heroC` defaults to 4
-  and gating would silently change device selection for everyone.
+  The GPU half followed the same day — see the next bullet.
+- **VCM/UPS (mode U, GPU megakernel) — DONE 2026-07-26 (VERSION 0.70.0).** The device session lives in
+  `src/render_cuda.cu` (NOT a separate `vcm_cuda.cu` — older notes said otherwise), and its two kernels became
+  `kVcmLightT<NS>` / `kVcmCameraT<NS>`, templated on the SECONDARY slot count exactly like `kBdptT<NS>`. The
+  `<0>` instantiation sizes every per-λ array at 1, so every hero loop compiles away to nothing, the C==1 λ draw
+  is literally the old `dSampleSceneLambda(sc, rng, pdfL)` (rng stream untouched), and every hero *term* keeps
+  the ORIGINAL floating-point expression order — hence `-heroc 1` is **bit-identical** (verified `cmp`-clean
+  against the 0.68.1 binary on `cornell` mode U, 160², 64 spp). Design points:
+  * **The secondary payload is a parallel device slab**, `lvSec[(i*vcmCap + k)*secStride + j]` with
+    `secStride == C-1`, never inline in `DVcmLV`. The light-vertex slab is `npix · vcmCap · ~128 B` and is by
+    far the largest allocation in a VCM session, so `-heroc 1` must allocate *zero* extra — same rule (and the
+    same indexing shape) as GPU BDPT's `pathSec`. `kVcmCompactScatter` compacts the sec rows alongside the
+    vertices.
+  * **`DVcmSec` is only 16 B** — `{double beta; float lam;}`. CIE weights are *not* cached per secondary; they
+    are recomputed as `cieX/Y/Z(row[q].lam)` at gather time, which is bit-identical to caching (the hero's own
+    `DVcmLV::cx` is just `(double)cieX(lambda)`) and halves the slab.
+  * **`lamBuf`/`invLamBuf` were widened to stride C** (`lamBuf[i*C + k]`) so the light kernel's bundle for path
+    *i* is handed to the camera kernel for path *i* — that shared-bundle property is what makes the
+    **connection** strategy exact per-λ (`nUpConn = min(nUp_cam, lv.nUp)`).
+  * **Merging stays keyed on the light vertex's `lv.nUp`**, same approximation as the CPU side.
+  * `dVcmScatter` gained the absolute per-λ `secF[]` / `secChromatic` / `keepBundle` block. The `<=0` terminates
+    on Diffuse/Glossy/Mirror/Filter became max-over-live-λ tests, but **Grating's `r<=0` bail was kept** — it
+    gates the RNG-consuming `gratingDiffract`, so removing it would desynchronise the device rng stream.
+  Validated on an RTX 4090 at 200², 2048 spp against 32768-spp single-λ references (luma / chroma / wall-clock,
+  C1 → C4): `absolute` 0.9366→0.8402 / 1.2373→**0.9817 (0.79×)** / 8.0→12.0 s; `abs_hero_delta`
+  0.8714→0.7494 / 1.3584→**1.1138 (0.82×)** / 7.2→10.8 s; `abs_hero_diffuse` 0.8575→0.7502 /
+  1.1000→**0.7961 (0.72×)** / 8.7→13.2 s; `abs_hero_mats` 0.9104→0.7612 / 1.2459→**0.9179 (0.74×)** /
+  11.6→19.6 s. Bias on `scenes/absolute.ftsl` at 4096 passes, C4 vs C1: **+0.011 %**. CPU vs GPU hero VCM
+  (200², 1024 passes, `-heroc 4`) agree to **0.028 %** — and the GPU is 31× faster (5.9 s vs 182.6 s).
+  *Reading the bias numbers:* `abs_hero_diffuse` shows +0.396 % (C1) / +0.418 % (C4) against its reference, but
+  that is the progressive-radius estimator's own convergence bias at 2048 vs 32768 passes — the C4-minus-C1
+  delta is only +0.022 %.
 - **Opt-in split-at-dispersion (`-herosplit`) — DONE 2026-07-26 (VERSION 0.65.0), CPU forward.** The alternative
   to the default de-hero policy: at a dispersive interface all C wavelengths **continue**, each running the same
   interaction with its **own** λ (its own Snell direction / grating order / Stokes shift), so one bundle fans out

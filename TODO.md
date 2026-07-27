@@ -2390,7 +2390,9 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           the flag *off* the image is bit-identical to today, and *on* it converges to the same converged energy
           (de-hero is unbiased; splitting is a different, also-unbiased estimator — same mean, sharper caustics, more
           work per path). README + a `-herosplit` flag-table row; VERSION minor bump when shipped.
-    - [ ] **U (VCM/UPS)** — carry the N λ along the light subpath and merge/connect per-λ (BDPT-level MIS). CPU + GPU.
+    - [x] **U (VCM/UPS) — DONE 2026-07-26 (CPU 0.69.0, GPU 0.70.0).** Both subpaths carry the N λ and all four
+          strategies (emission, NEE, connection, merging) evaluate per-λ with BDPT-level MIS. CPU *and* GPU
+          (sub-items below).
         - [x] **CPU (`src/vcm.h`) — DONE 2026-07-26 (VERSION 0.69.0).** Both subpaths now carry the bundle.
               `vcmPass` draws one `bdpt::HeroBundle` per **path index** (replacing the single `lam[i]`/`invLam[i]`
               draw) so light path *p* and camera path *p* share the same C wavelengths — which is exactly what
@@ -2422,11 +2424,24 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
               2.28 (~1.85× variance reduction). On a purpose-built Wratten-58 gel + mirror box — the `keepBundle`
               stress case — C=1 vs C=4 at 3200 passes agree to **+0.016 %** and C=4 halves the RMS noise
               (1.84 → 0.93, ~4× variance reduction), which is the ideal C=4 win.
-        - [ ] **GPU (`src/vcm_cuda.cu`)** — the device session is still the single-wavelength estimator; with
-              `-heroc N > 1` mode U now prints a notice saying the bundle applies to the CPU path only. Same
-              CPU-then-GPU split BDPT took (0.60.0 → 0.61.0). The device `LightVertex` slab will need the same
-              *parallel* secondary array (never inline fields), or the slab's ~`vcmCap·npix·128 B` footprint
-              quadruples.
+        - [x] **GPU (`src/render_cuda.cu` — the device session lives there, not in a `vcm_cuda.cu`) — DONE
+              2026-07-26 (VERSION 0.70.0).** `kVcmLight`/`kVcmCamera` became `kVcmLightT<NS>`/`kVcmCameraT<NS>`,
+              templated on the secondary slot count exactly like `kBdptT<NS>`, so the `<0>` instantiation sizes
+              every per-λ array at 1, compiles all hero loops away, and keeps `-heroc 1` **bit-identical**
+              (`cmp`-clean vs the 0.68.1 binary on `cornell` mode U). As predicted above, the secondary payload
+              is a **parallel** slab `lvSec[(i*vcmCap+k)*secStride + j]`, `secStride == C-1`, never inline in
+              `DVcmLV` — and each slot is only 16 B (`{double beta; float lam;}`) because the CIE weights are
+              recomputed from `lam` at gather time (bit-identical to caching them, since the hero's own
+              `DVcmLV::cx` is just `(double)cieX(lambda)`). `lamBuf`/`invLamBuf` were widened to stride C so
+              light path *p* and camera path *p* share the bundle, which is what makes the connection strategy
+              exact per-λ (`nUpConn = min(nUp_cam, lv.nUp)`); merging stays keyed on `lv.nUp`. `dVcmScatter`
+              gained the absolute per-λ `secF[]`/`secChromatic`/`keepBundle` block, with Grating's `r<=0` bail
+              deliberately kept (it gates the RNG-consuming `gratingDiffract`).
+              **Validated** on an RTX 4090 at 200², 2048 spp vs 32768-spp single-λ references (luma / chroma,
+              C1 → C4): `absolute` 0.94→0.84 / 1.24→**0.98 (0.79×)**; `abs_hero_delta` 0.87→0.75 /
+              1.36→**1.11 (0.82×)**; `abs_hero_diffuse` 0.86→0.75 / 1.10→**0.80 (0.72×)**; `abs_hero_mats`
+              0.91→0.76 / 1.25→**0.92 (0.74×)**; cost 1.50–1.69×. C4-vs-C1 bias on `absolute` at 4096 passes
+              **+0.011 %**, and CPU vs GPU hero VCM agree to **0.028 %** (GPU 31× faster: 5.9 s vs 182.6 s).
     - [x] **D (BDPT) — DONE 2026-07-26 (CPU 0.60.0, GPU 0.61.0).** Both subpaths carry the N λ; the connection
           term evaluates per-λ. CPU *and* GPU megakernel (sub-items below).
         - [x] **CPU (`src/bdpt.h`) — DONE 2026-07-26 (VERSION 0.60.0).** Both subpaths now carry the bundle.

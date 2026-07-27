@@ -7967,6 +7967,19 @@ struct DVcmLV {
     float  lambda;
     int    matId, edges;
     Real   u, v;
+    int    nUp;            // hero wavelengths still live here (1 == de-hero'd / single-λ)
+};
+
+// The SECONDARY hero wavelengths of a stored light vertex, one slot per secondary. Kept in a
+// PARALLEL slab (`lvSec[(i*vcmCap + k)*secStride + j]`, secStride == C-1) rather than inline in
+// DVcmLV, exactly like GPU BDPT's `pathSec`: the light-vertex slab is `npix * vcmCap * 128 B`
+// and is by far the largest allocation in a VCM session, so a single-λ run (`-heroc 1`) must
+// allocate the sec slab at zero and pay nothing. Only `beta` and `lam` are stored — cie(λ) is
+// recomputed at gather time, which is bit-identical to caching it (DVcmLV::cx is likewise just
+// `(double)cieX(lambda)`) and halves the slot to 16 B.
+struct DVcmSec {
+    double beta;
+    float  lam;
 };
 
 // Uniform hash grid over the compacted light vertices (device twin of vcm.h VcmGrid). `lv`
@@ -8004,16 +8017,37 @@ __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
 // Returns wi/betaFactor/pdfW/pdfRevW/cosThetaOut/delta/terminate. Uses per-hit slots
 // (dReflectSlot / dMatRoughness / dDiffuseRho) so it matches the CPU VCM exactly. Media are
 // out of scope; `stk` still resolves the nested-dielectric exterior IOR (dDielectricStep).
+//
+// HERO BUNDLE (Wilkie 2014; the four shared policies live in hero.h). When `nUp > 1` the caller
+// carries nUp wavelengths on this one ray: `lamAll` is the bundle (lamAll[0] == the hero ==
+// `lambda`) and on return `secF[i]` is the ABSOLUTE throughput factor for secondary i — NOT a
+// ratio to the hero's, which is undefined exactly where it matters most (a gel whose T(λ_hero)
+// is 0 while a secondary is wide open). `secChromatic` says secF was filled at all; the
+// λ-independent lobes leave it false and the caller reuses `betaFactor` for every λ.
+// `keepBundle` marks the delta lobes that nevertheless pick their continuation WITHOUT
+// consulting λ (Mirror reflects, Filter passes straight through), so they opt out of the
+// caller's `if (delta) nUp = 1` collapse.
+//
+// NOTE the `<= 0` early terminations the scalar version did for a zero reflectance /
+// transmittance are GONE from the chromatic lobes: the caller applies a max-over-live-λ test
+// instead, which at nUp == 1 is exactly the old scalar test (`mxF == betaFactor`). Grating
+// keeps its `r <= 0` bail because it gates an RNG consumer (gratingDiffract).
 __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const DHit& h,
                                    const DVec3& rd, Real lambda, DRng& rng, int matId,
                                    DMediumStack& stk, int diffraction,
                                    DVec3& wi, double& betaFactor, double& pdfW, double& pdfRevW,
-                                   double& cosThetaOut, bool& delta, bool& terminate) {
+                                   double& cosThetaOut, bool& delta, bool& terminate,
+                                   const Real* lamAll = nullptr, int nUp = 1,
+                                   double* secF = nullptr, bool* secChromatic = nullptr,
+                                   bool* keepBundle = nullptr) {
     DVertex vt = dVertFromHit(h, matId);
     const DVec3& ns = h.n;
     DVec3 wo = normalize(rd * (Real)-1);
     wi = DVec3(0, 0, 0); betaFactor = 0; pdfW = 0; pdfRevW = 0; cosThetaOut = 0;
     delta = false; terminate = false;
+    const int nSec = (secF && lamAll && nUp > 1) ? nUp - 1 : 0;   // secondaries to fill
+    if (secChromatic) *secChromatic = false;
+    if (keepBundle)   *keepBundle = false;
     switch (m.type) {
         case D_DIFFUSE:
         case D_FLUORESCENT: {
@@ -8022,8 +8056,12 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             double rho = clamp01(dDiffuseRho(sc, m, h, lambda));
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
-            betaFactor = rho;
-            if (rho <= 0) terminate = true;
+            betaFactor = rho;                     // rho <= 0 is caught by the caller's max test
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(dDiffuseRho(sc, m, h, lamAll[i + 1]));
+            }
             break;
         }
         case D_GLOSSY: {
@@ -8034,25 +8072,51 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
             betaFactor = r;
-            if (r <= 0 || pdfW <= 0) terminate = true;
+            if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test
+            // The glossy LOBE (mirror direction + roughness exponent) carries no wavelength
+            // dependence, so the whole bundle follows the sampled direction and only the
+            // reflectance differs per λ.
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(dReflectSlot(sc, m, h, lamAll[i + 1]));
+            }
             break;
         }
         case D_DIFFUSETRANSMIT: {
             double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
             double tot = rhoR + rhoT;
             if (tot <= 0.0) { terminate = true; break; }
-            if (rng.uniform() * tot < rhoR) wi = cosineHemisphere(ns, rng);
-            else                            wi = cosineHemisphere(ns * (Real)-1, rng);
+            const bool reflLobe = (rng.uniform() * tot < rhoR);
+            if (reflLobe) wi = cosineHemisphere(ns, rng);
+            else          wi = cosineHemisphere(ns * (Real)-1, rng);
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
             betaFactor = tot;
             if (pdfW <= 0) terminate = true;
+            // The lobe was CHOSEN by the hero's albedo split, so each secondary divides by the
+            // HERO's albedo for that lobe: f_i·cos/pdf_hero = rho_i(lobe)·tot_hero/rho_hero(lobe).
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i) {
+                    double rR, rT; dDiffuseTransmitAlbedos(sc, m, h, lamAll[i + 1], rR, rT);
+                    double num = reflLobe ? rR   : rT;
+                    double den = reflLobe ? rhoR : rhoT;
+                    secF[i] = (den > 0.0) ? num * tot / den : 0.0;
+                }
+            }
             break;
         }
         case D_MIRROR: {
             double r = clamp01(dReflectSlot(sc, m, h, lambda));
             wi = reflectv(rd, ns); betaFactor = r; delta = true;
-            if (r <= 0) terminate = true;
+            // The mirror direction is the same for every λ, so the bundle survives; only the
+            // reflectance is per-λ (cf. Glossy, the rough version of this).
+            if (nSec) {
+                *keepBundle = true; *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(dReflectSlot(sc, m, h, lamAll[i + 1]));
+            }
             break;
         }
         case D_DIELECTRIC: {
@@ -8068,8 +8132,17 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
         }
         case D_FILTER: {
             double t = clamp01(specLookup(m.transmit, lambda));
-            wi = rd; betaFactor = t; delta = true;
-            if (t <= 0) terminate = true;
+            wi = rd; betaFactor = t; delta = true;   // t <= 0 -> caller's max test
+            // Straight-through for every λ, so the bundle survives — and a gel filter is
+            // exactly where the per-λ transmittance spread is largest, i.e. the case that
+            // benefits most from NOT de-heroing, AND the case that forces the absolute
+            // (rather than ratio) secF, since T(λ_hero) is legitimately 0 across most of a
+            // Wratten passband.
+            if (nSec) {
+                *keepBundle = true; *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(specLookup(m.transmit, lamAll[i + 1]));
+            }
             break;
         }
         case D_THINFILM: {
@@ -8099,12 +8172,21 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
 
 // Phase 1: one light subpath per pixel. Stores connectible vertices into the per-path slab
 // `lvSlab[i*vcmCap + k]` (count in `lvCount[i]`), splats connect-to-camera contributions into
-// `splat` (atomic, W*H*3 XYZ), and records this path index's wavelength (shared with the
-// camera path) into lamBuf/invLamBuf. Device twin of vcm.h traceLightSubpath.
-__global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
-                          DVcmLV* lvSlab, int* lvCount, double* splat,
-                          Real* lamBuf, double* invLamBuf, int resX, int resY, int vcmCap,
-                          unsigned long long seedBase, long long passIdx) {
+// `splat` (atomic, W*H*3 XYZ), and records this path index's wavelength BUNDLE (shared with the
+// camera path of the SAME index) into lamBuf/invLamBuf at stride C. Device twin of vcm.h
+// traceLightSubpath.
+//
+// Templated on the number of SECONDARY hero slots exactly like kBdptT: the scalar
+// instantiation kVcmLightT<0> sizes every per-λ array at 1, so a `-heroc 1` run pays zero extra
+// registers/local memory and stays bit-identical to the pre-hero kernel.
+template <int NS>
+__global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
+                           DVcmLV* lvSlab, DVcmSec* lvSec, int secStride, int heroC,
+                           int* lvCount, double* splat,
+                           Real* lamBuf, double* invLamBuf, int resX, int resY, int vcmCap,
+                           unsigned long long seedBase, long long passIdx) {
+    constexpr int SECN = (NS > 0) ? NS : 1;
+    const int C = (NS > 0) ? heroC : 1;
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
@@ -8114,12 +8196,35 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                              + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL;
         DRng rng; rng.seed(s * 2 + 55, seedBase ^ s);
 
-        double pdfL = 0.0;
-        Real lambda = dSampleSceneLambda(sc, rng, pdfL);
-        double invPdfLambda = (pdfL > 0.0) ? dInvPdfLambda(sc, lambda) : 0.0;
-        lamBuf[i] = lambda; invLamBuf[i] = invPdfLambda;
+        // Hero + C-1 stratified secondaries from ONE base uniform (u + k/C wrapped into [0,1)),
+        // pushed through the same inverse CDF as the scalar draw — so C == 1 consumes the
+        // identical single rng variate the pre-hero kernel did.
+        Real lamAll[SECN + 1];
+        double invAll[SECN + 1];
+        {
+            double pdfL = 0.0;
+            if (C > 1) {
+                double u = (double)rng.uniform();
+                lamAll[0] = dSampleSceneLambdaU(sc, u, pdfL);
+                invAll[0] = (pdfL > 0.0) ? dInvPdfLambda(sc, lamAll[0]) : 0.0;
+                for (int k = 1; k < C; ++k) {
+                    double uu = u + (double)k / C;
+                    if (uu >= 1.0) uu -= 1.0;
+                    double pdfK = 0.0;
+                    lamAll[k] = dSampleSceneLambdaU(sc, uu, pdfK);
+                    invAll[k] = (pdfK > 0.0) ? dInvPdfLambda(sc, lamAll[k]) : 0.0;
+                }
+            } else {
+                lamAll[0] = dSampleSceneLambda(sc, rng, pdfL);
+                invAll[0] = (pdfL > 0.0) ? dInvPdfLambda(sc, lamAll[0]) : 0.0;
+            }
+        }
+        const Real lambda = lamAll[0];
+        const double invPdfLambda = invAll[0];
+        for (int k = 0; k < C; ++k) { lamBuf[i * C + k] = lamAll[k]; invLamBuf[i * C + k] = invAll[k]; }
         if (invPdfLambda <= 0.0) continue;
         if (sc.nEmitters == 0 || sc.totalPower <= 0.0) continue;
+        int nUp = C;                                  // wavelengths still riding this ray
 
         int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
         const DEmitter& em = sc.emitters[ei];
@@ -8127,7 +8232,14 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 y, nOut; emitterSamplePoint(em, u1, u2, y, nOut);
         double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        if (Le <= 0.0) continue;
+        // Max-over-live-λ: the hero can legitimately sit in a gap of the emission spectrum
+        // while a secondary is on it. nUp == 1 -> empty loop -> mxLe == Le, the old test.
+        double LeSec[SECN], mxLe = Le;
+        for (int k = 0; k + 1 < nUp; ++k) {
+            LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1];
+            if (LeSec[k] > mxLe) mxLe = LeSec[k];
+        }
+        if (mxLe <= 0.0) continue;
         double pdfChoice = em.power / sc.totalPower;
         double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
         if (pdfPos <= 0.0 || pdfChoice <= 0.0) continue;
@@ -8141,10 +8253,21 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         double directPdfW = pdfChoice * pdfPos;
 
         double beta = Le * cosLight / emissionPdfW;
+        // MIS bookkeeping is the HERO's for the whole bundle: every sampling density in this
+        // renderer (cosine / glossy-lobe / emitter pdfs) is wavelength-INDEPENDENT, so one
+        // dVCM/dVC/dVM triple serves every λ — only the throughput VALUES differ.
         double dVCM = directPdfW / emissionPdfW;
         double dVC  = cosLight / emissionPdfW;
         double dVM  = dVC * ctx.misVcWeight;
 
+        double betaSec[SECN];
+        double cieSx[SECN], cieSy[SECN], cieSz[SECN];
+        for (int k = 0; k + 1 < nUp; ++k) {
+            betaSec[k] = LeSec[k] * cosLight / emissionPdfW;
+            cieSx[k] = (double)cieX(lamAll[k + 1]);
+            cieSy[k] = (double)cieY(lamAll[k + 1]);
+            cieSz[k] = (double)cieZ(lamAll[k + 1]);
+        }
         double cieLx = (double)cieX(lambda), cieLy = (double)cieY(lambda), cieLz = (double)cieZ(lambda);
         DMediumStack stk; stk.clear();
         DVec3 prevP = y;
@@ -8159,6 +8282,12 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 int cm = stk.topMat();
                 double a = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
                 if (a > 0.0) beta *= exp(-a * (double)h.t);
+                // Per-λ absorption: this IS the colour of coloured glass, so it must not be
+                // evaluated at the hero alone.
+                for (int k = 0; k + 1 < nUp; ++k) {
+                    double ak = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lamAll[k + 1]) : 0.0;
+                    if (ak > 0.0) betaSec[k] *= exp(-ak * (double)h.t);
+                }
             }
             double dist = h.t;
             DVec3 rdCur = rd;
@@ -8188,7 +8317,12 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     lv.cx = cieLx; lv.cy = cieLy; lv.cz = cieLz;
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
                     lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v;
+                    lv.nUp = nUp;
                     lvSlab[i * vcmCap + stored] = lv;
+                    if (NS > 0 && lvSec) {
+                        DVcmSec* row = lvSec + (size_t)(i * vcmCap + stored) * secStride;
+                        for (int k = 0; k + 1 < nUp; ++k) { row[k].beta = betaSec[k]; row[k].lam = (float)lamAll[k + 1]; }
+                    }
                     stored++;
                 }
                 // Connect this vertex to the pinhole camera (t=1 light-image splat).
@@ -8212,9 +8346,16 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                 DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
                                 if (!occluded(sc, oo, wcam, (Real)(distc - 2e-6))) {
                                     DVertex vt = dVertFromHit(h, matId);
-                                    double f = dBsdfF(sc, vt, wo, wcam, lambda);
-                                    f *= (double)dShadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
-                                    if (f > 0.0) {
+                                    // The adjoint correction and shadow-terminator G are purely
+                                    // geometric, so they scale every λ the same way.
+                                    double geo = (double)dShadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
+                                    double f = dBsdfF(sc, vt, wo, wcam, lambda) * geo;
+                                    double fSec[SECN], mxf = f;
+                                    for (int k = 0; k + 1 < nUp; ++k) {
+                                        fSec[k] = dBsdfF(sc, vt, wo, wcam, lamAll[k + 1]) * geo;
+                                        if (fSec[k] > mxf) mxf = fSec[k];
+                                    }
+                                    if (mxf > 0.0) {
                                         double bsdfRevPdfW = dBsdfPdf(sc, vt, wcam, wo, lambda);
                                         double imgPtDist = ctx.imagePlaneDist / cosAtCamera;
                                         double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
@@ -8222,12 +8363,23 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                         double wLight = (imgToSurf / ctx.nLightPaths) *
                                                         (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW);
                                         double misW = 1.0 / (wLight + 1.0);
+                                        double ax = 0, ay = 0, az = 0;
                                         double contrib = misW * beta * f * imgToSurf / ctx.nLightPaths;
                                         if (contrib > 0.0) {
+                                            ax = cieLx * contrib; ay = cieLy * contrib; az = cieLz * contrib;
+                                        }
+                                        for (int k = 0; k + 1 < nUp; ++k) {
+                                            double cs = misW * betaSec[k] * fSec[k] * imgToSurf / ctx.nLightPaths;
+                                            if (cs > 0.0) { ax += cieSx[k] * cs; ay += cieSy[k] * cs; az += cieSz[k] * cs; }
+                                        }
+                                        // The C wavelengths are C samples of ONE spectral
+                                        // estimate, so the bundle averages (see hero.h).
+                                        if (nUp > 1) { double inv = 1.0 / nUp; ax *= inv; ay *= inv; az *= inv; }
+                                        if (ax != 0.0 || ay != 0.0 || az != 0.0) {
                                             size_t o2 = ((size_t)py * resX + px) * 3;
-                                            atomicAdd(&splat[o2 + 0], cieLx * contrib);
-                                            atomicAdd(&splat[o2 + 1], cieLy * contrib);
-                                            atomicAdd(&splat[o2 + 2], cieLz * contrib);
+                                            atomicAdd(&splat[o2 + 0], ax);
+                                            atomicAdd(&splat[o2 + 1], ay);
+                                            atomicAdd(&splat[o2 + 2], az);
                                         }
                                     }
                                 }
@@ -8240,9 +8392,14 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             if (edges == ctx.maxDepth) break;
 
             DVec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
+            double secF[SECN]; bool secChromatic = false, keepBundle = false;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, diffraction,
-                        wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate);
-            if (terminate || betaFactor <= 0.0) break;
+                        wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
+                        lamAll, nUp, secF, &secChromatic, &keepBundle);
+            // Kill the walk only when EVERY live λ is dead (nUp == 1 -> mxF == betaFactor).
+            double mxF = betaFactor;
+            if (secChromatic) for (int k = 0; k + 1 < nUp; ++k) if (secF[k] > mxF) mxF = secF[k];
+            if (terminate || mxF <= 0.0) break;
             if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) break;
 
             // misScatter(delta, cosThetaOut, pdfW, pdfRevW)
@@ -8254,7 +8411,16 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 dVCM = 1.0 / pdfW;
             }
             beta *= betaFactor;
-            if (!delta) beta *= (double)dShadingAdjointCorr(wo, normalize(wi), h.n, ngo);
+            for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= secChromatic ? secF[k] : betaFactor;
+            if (!delta) {
+                double adj = (double)dShadingAdjointCorr(wo, normalize(wi), h.n, ngo);
+                beta *= adj;
+                for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= adj;
+            }
+            // De-hero at a λ-DEPENDENT direction change (dielectric / thin-film / multilayer /
+            // grating / half-mirror). Mirror and Filter set keepBundle: their outgoing direction
+            // does not consult λ at all, so the secondaries ride on.
+            if (delta && !keepBundle) nUp = 1;
             prevP = h.p;
             double sgn2 = ddot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
             ro = h.p + h.ng * (Real)(sgn2 * 1e-6);
@@ -8268,21 +8434,32 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 // the PAIRED light subpath [pathBegin[i],pathEnd[i]) and merging over the grid, then adds this
 // pass's per-pixel radiance (camera result + the light splat) into the persistent `accum` sum.
 // Device twin of vcm.h traceCameraSubpath. `grid.lv` is the compact light-vertex array.
-__global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx, DVcmGrid grid,
-                           const int* pathBegin, const int* pathEnd, const double* splat,
-                           double* accum, const Real* lamBuf, const double* invLamBuf,
-                           int resX, int resY, unsigned long long seedBase, long long passIdx) {
+template <int NS>
+__global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx, DVcmGrid grid,
+                            const DVcmSec* lvSec, int secStride, int heroC,
+                            const int* pathBegin, const int* pathEnd, const double* splat,
+                            double* accum, const Real* lamBuf, const double* invLamBuf,
+                            int resX, int resY, unsigned long long seedBase, long long passIdx) {
+    constexpr int SECN = (NS > 0) ? NS : 1;
+    const int C = (NS > 0) ? heroC : 1;
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
     for (long long i = g; i < npix; i += G) {
         double sxl = splat[i * 3 + 0], syl = splat[i * 3 + 1], szl = splat[i * 3 + 2];
-        double invPdfLambda = invLamBuf[i];
+        double invPdfLambda = invLamBuf[i * C];
         if (invPdfLambda <= 0.0) {                         // no valid wavelength: only the splat
             accum[i * 3 + 0] += sxl; accum[i * 3 + 1] += syl; accum[i * 3 + 2] += szl;
             continue;
         }
-        Real lambda = lamBuf[i];
+        // THE bundle of path index i — the SAME C wavelengths the light kernel walked for this
+        // index. That pairing is what makes strategy (c) (connection to the paired light
+        // subpath) exact per-λ rather than an approximation: both ends share the λ set.
+        Real lamAll[SECN + 1];
+        double invAll[SECN + 1];
+        for (int k = 0; k < C; ++k) { lamAll[k] = lamBuf[i * C + k]; invAll[k] = invLamBuf[i * C + k]; }
+        Real lambda = lamAll[0];
+        int nUp = C;
         int px = (int)(i % resX), py = (int)(i / resX);
         unsigned long long s = (unsigned long long)i * 0xC2B2AE3D27D4EB4FULL
                              + (unsigned long long)passIdx * 0xA24BAED4963EE407ULL;
@@ -8290,6 +8467,14 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 
         double rx = 0, ry = 0, rz = 0;
         double cieCx = (double)cieX(lambda), cieCy = (double)cieY(lambda), cieCz = (double)cieZ(lambda);
+        double betaSec[SECN];
+        double cieSx[SECN], cieSy[SECN], cieSz[SECN];
+        for (int k = 0; k + 1 < C; ++k) {
+            betaSec[k] = 1.0;                              // camera vertex beta == 1 for every λ
+            cieSx[k] = (double)cieX(lamAll[k + 1]);
+            cieSy[k] = (double)cieY(lamAll[k + 1]);
+            cieSz[k] = (double)cieZ(lamAll[k + 1]);
+        }
 
         DVec3 ro, rd;
         Real jx = rng.uniform(), jy = rng.uniform();
@@ -8314,6 +8499,10 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 int cm = stk.topMat();
                 double a = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
                 if (a > 0.0) beta *= exp(-a * (double)h.t);
+                for (int k = 0; k + 1 < nUp; ++k) {       // per-λ: the colour of coloured glass
+                    double ak = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lamAll[k + 1]) : 0.0;
+                    if (ak > 0.0) betaSec[k] *= exp(-ak * (double)h.t);
+                }
             }
             double dist = h.t;
             DVec3 rdCur = rd;
@@ -8339,7 +8528,12 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 double cosLight = ddot(h.ng, wo);
                 if (cosLight > 0.0) {
                     double Le = (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda;
-                    if (Le > 0.0) {
+                    double LeSec[SECN], mxLe = Le;
+                    for (int k = 0; k + 1 < nUp; ++k) {
+                        LeSec[k] = (double)specLookup(sc.emitters[li].emitSpd, lamAll[k + 1]) * invAll[k + 1];
+                        if (LeSec[k] > mxLe) mxLe = LeSec[k];
+                    }
+                    if (mxLe > 0.0) {
                         double misW = 1.0;
                         const DEmitter& em = sc.emitters[li];
                         if (em.area > 0.0 && sc.totalPower > 0.0 && edges >= 2) {
@@ -8350,7 +8544,13 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                             misW = 1.0 / (1.0 + wCamera);
                         }
                         double e = beta * Le * misW;
-                        rx += cieCx * e; ry += cieCy * e; rz += cieCz * e;
+                        double ax = cieCx * e, ay = cieCy * e, az = cieCz * e;
+                        for (int k = 0; k + 1 < nUp; ++k) {
+                            double ek = betaSec[k] * LeSec[k] * misW;
+                            ax += cieSx[k] * ek; ay += cieSy[k] * ek; az += cieSz[k] * ek;
+                        }
+                        if (nUp > 1) { double inv = 1.0 / nUp; ax *= inv; ay *= inv; az *= inv; }
+                        rx += ax; ry += ay; rz += az;
                     }
                 }
                 break;                                    // can't scatter off a light
@@ -8379,13 +8579,30 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                 // Cheap gates + shadow ray first, BSDF eval after (bit-
                                 // identical: no RNG in either; skips the eval when shadowed).
                                 double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+                                double LeSec[SECN], mxLe = Le;
+                                for (int k = 0; k + 1 < nUp; ++k) {
+                                    LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1];
+                                    if (LeSec[k] > mxLe) mxLe = LeSec[k];
+                                }
                                 double sgn = ddot(h.ng, wiL) >= 0.0 ? 1.0 : -1.0;
                                 DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
-                                double f = 0.0;
-                                if (Le > 0.0 && em.area > 0.0 &&
-                                    !occluded(sc, oo, wiL, (Real)(distL - 2e-6)))
+                                double f = 0.0, fSec[SECN];
+                                for (int k = 0; k + 1 < nUp; ++k) fSec[k] = 0.0;
+                                if (mxLe > 0.0 && em.area > 0.0 &&
+                                    !occluded(sc, oo, wiL, (Real)(distL - 2e-6))) {
                                     f = dBsdfF(sc, vt, wo, wiL, lambda) * stG;
-                                if (f > 0.0) {
+                                    for (int k = 0; k + 1 < nUp; ++k)
+                                        fSec[k] = dBsdfF(sc, vt, wo, wiL, lamAll[k + 1]) * stG;
+                                }
+                                // Fuse BSDF x Le per-λ before the max test: either factor may
+                                // vanish at the hero while the product is alive at a secondary.
+                                // At nUp == 1 this is exactly the old `f > 0` gate.
+                                double mxfLe = f * Le;
+                                for (int k = 0; k + 1 < nUp; ++k) {
+                                    double p = fSec[k] * LeSec[k];
+                                    if (p > mxfLe) mxfLe = p;
+                                }
+                                if (mxfLe > 0.0) {
                                     double pdfChoice = em.power / sc.totalPower;
                                     double invArea = 1.0 / em.area;
                                     double directPdfW = invArea * dist2 / cosAtLight;
@@ -8399,10 +8616,21 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                     double misW = 1.0 / (wLight + 1.0 + wCamera);
                                     double contrib = misW * fabs(cosToLight) /
                                                      (pdfChoice * directPdfW) * Le * f;
+                                    double ax = 0, ay = 0, az = 0;
                                     if (contrib > 0.0) {
                                         double e = beta * contrib;
-                                        rx += cieCx * e; ry += cieCy * e; rz += cieCz * e;
+                                        ax = cieCx * e; ay = cieCy * e; az = cieCz * e;
                                     }
+                                    for (int k = 0; k + 1 < nUp; ++k) {
+                                        double ck = misW * fabs(cosToLight) /
+                                                    (pdfChoice * directPdfW) * LeSec[k] * fSec[k];
+                                        if (ck > 0.0) {
+                                            double ek = betaSec[k] * ck;
+                                            ax += cieSx[k] * ek; ay += cieSy[k] * ek; az += cieSz[k] * ek;
+                                        }
+                                    }
+                                    if (nUp > 1) { double inv = 1.0 / nUp; ax *= inv; ay *= inv; az *= inv; }
+                                    rx += ax; ry += ay; rz += az;
                                 }
                             }
                         }
@@ -8436,10 +8664,26 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
                     if (occluded(sc, oo, w, (Real)(distc - 2e-6))) continue;
                     DVertex lvt = dVertFromLV(lv);
+                    double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
                     double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;
                     double fLit = dBsdfF(sc, lvt, lv.wo, w * (Real)-1, lambda);
-                    fLit *= (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
-                    if (fCam <= 0.0 || fLit <= 0.0) continue;
+                    fLit *= adjLit;
+                    // The camera path and the stored light path share this pass's bundle (same
+                    // path index i), so a connection is EXACT per-λ over the wavelengths still
+                    // live at BOTH ends. `lv.nUp` is 1 whenever the light walk de-hero'd.
+                    const int lvUp = (NS > 0) ? lv.nUp : 1;
+                    const int nUpConn = (nUp < lvUp) ? nUp : lvUp;
+                    double fProdSec[SECN], mxProd = fCam * fLit;
+                    const DVcmSec* lsRow = ((NS > 0) && lvSec) ? (lvSec + (size_t)j * secStride) : nullptr;
+                    for (int k = 0; k + 1 < nUpConn; ++k) {
+                        double fc = dBsdfF(sc, vt, wo, w, lamAll[k + 1]) * stGCam;
+                        double fl = dBsdfF(sc, lvt, lv.wo, w * (Real)-1, lamAll[k + 1]) * adjLit;
+                        fProdSec[k] = fc * fl;
+                        if (fProdSec[k] > mxProd) mxProd = fProdSec[k];
+                    }
+                    // At nUpConn == 1 this is exactly the old `fCam <= 0 || fLit <= 0` bail
+                    // (both factors are non-negative, so the product is 0 iff either is).
+                    if (mxProd <= 0.0) continue;
                     double camDirPdfW = dBsdfPdf(sc, vt, wo, w, lambda);
                     double camRevPdfW = dBsdfPdf(sc, vt, w, wo, lambda);
                     double litDirPdfW = dBsdfPdf(sc, lvt, lv.wo, w * (Real)-1, lambda);
@@ -8451,7 +8695,14 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     double misW = 1.0 / (wLight + 1.0 + wCamera);
                     double Gt = fabs(cosCam) * fabs(cosLit) / dist2;
                     double contrib = misW * Gt * fCam * fLit * beta * lv.beta;
-                    if (contrib > 0.0) { rx += cieCx * contrib; ry += cieCy * contrib; rz += cieCz * contrib; }
+                    double ax = 0, ay = 0, az = 0;
+                    if (contrib > 0.0) { ax = cieCx * contrib; ay = cieCy * contrib; az = cieCz * contrib; }
+                    for (int k = 0; k + 1 < nUpConn; ++k) {
+                        double ck = misW * Gt * fProdSec[k] * betaSec[k] * lsRow[k].beta;
+                        if (ck > 0.0) { ax += cieSx[k] * ck; ay += cieSy[k] * ck; az += cieSz[k] * ck; }
+                    }
+                    if (nUpConn > 1) { double inv = 1.0 / nUpConn; ax *= inv; ay *= inv; az *= inv; }
+                    rx += ax; ry += ay; rz += az;
                 }
 
                 // (d) Vertex merging — gather nearby light vertices from ALL paths (XYZ estimate).
@@ -8476,8 +8727,22 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                               if (edges + lv.edges > ctx.maxDepth) continue;
                               DVec3 wMerge = lv.wo;
                               Real lam = (Real)lv.lambda;
+                              // A MERGE crosses paths, so the two ends carry DIFFERENT bundles
+                              // and there is no shared λ set. The estimate therefore stays keyed
+                              // on the LIGHT vertex's own wavelengths (the pre-existing spectral
+                              // photon-mapping approximation, generalised from 1 λ to lv.nUp):
+                              // sum over its live λ, divide by lv.nUp, and let the camera's HERO
+                              // throughput/MIS weight scale the whole gather as before.
+                              const int lvUp = (NS > 0) ? lv.nUp : 1;
+                              const DVcmSec* row = ((NS > 0) && lvSec)
+                                                 ? (lvSec + (size_t)idx * secStride) : nullptr;
                               double fCam = dBsdfF(sc, vt, wo, wMerge, lam);
-                              if (fCam <= 0.0) continue;
+                              double fSec[SECN], mxF = fCam;
+                              for (int q = 0; q + 1 < lvUp; ++q) {
+                                  fSec[q] = dBsdfF(sc, vt, wo, wMerge, (Real)row[q].lam);
+                                  if (fSec[q] > mxF) mxF = fSec[q];
+                              }
+                              if (mxF <= 0.0) continue;   // == the old `fCam <= 0` at lvUp == 1
                               double denom = fabs(ddot(wMerge, ngoCam));
                               double gcorr = (denom <= 1e-8) ? 1.0 : fabs(ddot(wMerge, h.n)) / denom;
                               fCam *= gcorr;
@@ -8487,7 +8752,16 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                               double wCamera = dVCM * ctx.misVcWeight + dVM * camRevPdfW;
                               double misW = 1.0 / (wLight + 1.0 + wCamera);
                               double wgt = misW * fCam * lv.beta;
-                              mx += lv.cx * wgt; my += lv.cy * wgt; mz += lv.cz * wgt;
+                              double ax = lv.cx * wgt, ay = lv.cy * wgt, az = lv.cz * wgt;
+                              for (int q = 0; q + 1 < lvUp; ++q) {
+                                  double wq = misW * fSec[q] * gcorr * row[q].beta;
+                                  Real lq = (Real)row[q].lam;
+                                  ax += (double)cieX(lq) * wq;
+                                  ay += (double)cieY(lq) * wq;
+                                  az += (double)cieZ(lq) * wq;
+                              }
+                              if (lvUp > 1) { double inv = 1.0 / lvUp; ax *= inv; ay *= inv; az *= inv; }
+                              mx += ax; my += ay; mz += az;
                           }
                     }}}
                     double bn = beta * ctx.vmNorm;
@@ -8498,9 +8772,13 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             if (edges == ctx.maxDepth) break;
 
             DVec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
+            double secF[SECN]; bool secChromatic = false, keepBundle = false;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, diffraction,
-                        wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate);
-            if (terminate || betaFactor <= 0.0) break;
+                        wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
+                        lamAll, nUp, secF, &secChromatic, &keepBundle);
+            double mxF = betaFactor;
+            if (secChromatic) for (int k = 0; k + 1 < nUp; ++k) if (secF[k] > mxF) mxF = secF[k];
+            if (terminate || mxF <= 0.0) break;
             if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) break;
 
             if (delta) { dVCM = 0.0; dVC *= cosThetaOut; dVM *= cosThetaOut; }
@@ -8511,6 +8789,8 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 dVCM = 1.0 / pdfW;
             }
             beta *= betaFactor;                           // camera side: no adjoint on continuation
+            for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= secChromatic ? secF[k] : betaFactor;
+            if (delta && !keepBundle) nUp = 1;             // λ-dependent direction change
             prevP = h.p;
             double sgn2 = ddot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
             ro = h.p + h.ng * (Real)(sgn2 * 1e-6);
@@ -8586,14 +8866,25 @@ struct SppmRMaxF {
 struct MaxD { HD double operator()(double a, double b) const { return a < b ? b : a; } };
 
 // Scatter each light path's stored slab vertices into the compact array at its scanned
-// offset (device twin of the old host compaction loop; per-path order preserved).
-__global__ void kVcmCompactScatter(const DVcmLV* slab, const int* lvCount, const int* pathBegin,
-                                   DVcmLV* compact, int npix, int vcmCap) {
+// offset (device twin of the old host compaction loop; per-path order preserved). The hero
+// secondary rows ride along in lockstep so `secCompact[j*secStride + q]` stays paired with
+// `compact[j]`; `secSlab == nullptr` (a `-heroc 1` session) skips that entirely.
+__global__ void kVcmCompactScatter(const DVcmLV* slab, const DVcmSec* secSlab, int secStride,
+                                   const int* lvCount, const int* pathBegin,
+                                   DVcmLV* compact, DVcmSec* secCompact, int npix, int vcmCap) {
     int stride = gridDim.x * blockDim.x;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < npix; i += stride) {
         int cnt = lvCount[i], b = pathBegin[i];
         const DVcmLV* src = slab + (size_t)i * vcmCap;
         for (int k = 0; k < cnt; ++k) compact[b + k] = src[k];
+        if (secSlab) {
+            const DVcmSec* ssrc = secSlab + (size_t)i * vcmCap * secStride;
+            for (int k = 0; k < cnt; ++k) {
+                int nu = src[k].nUp;
+                DVcmSec* dst = secCompact + (size_t)(b + k) * secStride;
+                for (int q = 0; q + 1 < nu; ++q) dst[q] = ssrc[(size_t)k * secStride + q];
+            }
+        }
     }
 }
 
@@ -11060,18 +11351,22 @@ struct VcmSession {
     int  diffraction = 0;
     int  maxDepth = 8;
     int  vcmCap = 8;              // max stored connectible vertices per light subpath (== maxDepth)
+    int  heroC = 1;               // hero bundle width (1 == classic single-λ session)
+    int  secStride = 0;           // heroC-1 secondary slots per stored vertex (0 when heroC==1)
     long long passes = 0;
     // Persistent (allocated once in Begin):
     gpu::DVcmLV* d_lvSlab = nullptr;   // npix * vcmCap
+    gpu::DVcmSec* d_lvSecSlab = nullptr;  // npix*vcmCap*secStride (NULL unless heroC>1)
     int*    d_lvCount = nullptr;       // npix
     double* d_splat   = nullptr;       // npix*3 (this pass's connect-to-camera XYZ)
     double* d_accum   = nullptr;       // npix*3 (running SUM over passes)
-    gpu::Real* d_lamBuf = nullptr;     // npix   (per-path wavelength, shared light<->camera)
-    double* d_invLam  = nullptr;       // npix   (invPdfLambda; <=0 marks "no valid wavelength")
+    gpu::Real* d_lamBuf = nullptr;     // npix*heroC (per-path BUNDLE, shared light<->camera)
+    double* d_invLam  = nullptr;       // npix*heroC (invPdfLambda; [i*C]<=0 marks "no wavelength")
     int*    d_pathBegin = nullptr;     // npix (device-scanned per-pass)
     int*    d_pathEnd   = nullptr;     // npix
     // Grow-only device scratch for the on-device compaction + grid build (no per-pass malloc):
     gpu::DVcmLV* d_lvCompact = nullptr; size_t lvCompactCap = 0;
+    gpu::DVcmSec* d_lvSecCompact = nullptr; size_t lvSecCompactCap = 0;
     int*    d_cellKey   = nullptr;      size_t cellKeyCap = 0;
     int*    d_order     = nullptr;      size_t orderCap = 0;
     int*    d_cellStart = nullptr;      size_t cellStartCap = 0;  // entries (nCells+1)
@@ -11089,22 +11384,31 @@ bool cudaVcmSupported(const Scene& scene) {
 }
 
 VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
-                            bool diffraction, int maxDepth) {
+                            bool diffraction, int maxDepth, int heroC) {
     if (!cudaAvailable() || !cudaVcmSupported(scene)) return nullptr;
     VcmSession* s = new VcmSession();
     s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
     s->diffraction = diffraction ? 1 : 0;
     s->maxDepth = (maxDepth > 0) ? maxDepth : 8;
     s->vcmCap = s->maxDepth;
+    // Hero bundle width. The kernels are templated on the SECONDARY slot count, so a C==1
+    // session instantiates kVcm*T<0>: no sec slab, no per-λ arrays, no extra registers.
+    int C = (heroC < 1) ? 1 : heroC;
+    if (C > BDPT_NSEC + 1) C = BDPT_NSEC + 1;
+    s->heroC = C;
+    s->secStride = C - 1;
     buildUploadScene(scene, s->up);
     s->cam = bakeCamera(scene, cam, resX, resY, s->up);
     const size_t np = s->npix;
     CUDA_CHECK(cudaMalloc(&s->d_lvSlab,  np * (size_t)s->vcmCap * sizeof(gpu::DVcmLV)));
+    if (s->secStride > 0)
+        CUDA_CHECK(cudaMalloc(&s->d_lvSecSlab,
+                              np * (size_t)s->vcmCap * (size_t)s->secStride * sizeof(gpu::DVcmSec)));
     CUDA_CHECK(cudaMalloc(&s->d_lvCount, np * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s->d_splat,   np * 3 * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&s->d_accum,   np * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&s->d_lamBuf,  np * sizeof(gpu::Real)));
-    CUDA_CHECK(cudaMalloc(&s->d_invLam,  np * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_lamBuf,  np * (size_t)C * sizeof(gpu::Real)));
+    CUDA_CHECK(cudaMalloc(&s->d_invLam,  np * (size_t)C * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&s->d_pathBegin, np * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s->d_pathEnd,   np * sizeof(int)));
     CUDA_CHECK(cudaMemset(s->d_accum, 0, np * 3 * sizeof(double)));
@@ -11134,9 +11438,16 @@ void vcmSessionPass(VcmSession* s, double radius) {
     CUDA_CHECK(cudaMemset(s->d_splat, 0, np * 3 * sizeof(double)));
     unsigned long long seedL = 0xD1B54A32D192ED03ULL
                              ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL);
-    kVcmLight<<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
-                             s->d_lvSlab, s->d_lvCount, s->d_splat,
-                             s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, seedL, passIdx);
+    if (s->secStride > 0)
+        kVcmLightT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
+                                 s->d_lvSlab, s->d_lvSecSlab, s->secStride, s->heroC,
+                                 s->d_lvCount, s->d_splat,
+                                 s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, seedL, passIdx);
+    else
+        kVcmLightT<0><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
+                                 s->d_lvSlab, nullptr, 0, 1,
+                                 s->d_lvCount, s->d_splat,
+                                 s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, seedL, passIdx);
     cudaCheckKernel("vcm-light");
 
     // (2) Compact the slab ON DEVICE into contiguous per-path ranges: exclusive-scan the
@@ -11154,8 +11465,11 @@ void vcmSessionPass(VcmSession* s, double radius) {
     const size_t nLV = (size_t)((nLVi > 0) ? nLVi : 0);
     if (nLV > 0) {
         ensureDevCap(s->d_lvCompact, s->lvCompactCap, nLV);
-        kVcmCompactScatter<<<2048, 128>>>(s->d_lvSlab, s->d_lvCount, s->d_pathBegin,
-                                          s->d_lvCompact, (int)np, s->vcmCap);
+        if (s->secStride > 0)
+            ensureDevCap(s->d_lvSecCompact, s->lvSecCompactCap, nLV * (size_t)s->secStride);
+        kVcmCompactScatter<<<2048, 128>>>(s->d_lvSlab, s->d_lvSecSlab, s->secStride,
+                                          s->d_lvCount, s->d_pathBegin,
+                                          s->d_lvCompact, s->d_lvSecCompact, (int)np, s->vcmCap);
         cudaCheckKernel("vcm-compact");
     }
 
@@ -11206,7 +11520,14 @@ void vcmSessionPass(VcmSession* s, double radius) {
     // (5) Camera pass — one camera subpath per pixel; adds this pass's radiance into accum.
     unsigned long long seedC = 0xC2B2AE3D27D4EB4FULL
                              ^ ((unsigned long long)(passIdx + 1) * 0xA24BAED4963EE407ULL);
-    kVcmCamera<<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
+    if (s->secStride > 0)
+        kVcmCameraT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
+                              (nLV > 0) ? s->d_lvSecCompact : nullptr, s->secStride, s->heroC,
+                              s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
+                              s->d_lamBuf, s->d_invLam, W, H, seedC, passIdx);
+    else
+        kVcmCameraT<0><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
+                              nullptr, 0, 1,
                               s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
                               s->d_lamBuf, s->d_invLam, W, H, seedC, passIdx);
     cudaCheckKernel("vcm-camera");
@@ -11235,6 +11556,8 @@ void vcmSessionEnd(VcmSession* s) {
     if (!s) return;
     cudaFree(s->d_lvSlab); cudaFree(s->d_lvCount); cudaFree(s->d_splat); cudaFree(s->d_accum);
     cudaFree(s->d_lamBuf); cudaFree(s->d_invLam); cudaFree(s->d_pathBegin); cudaFree(s->d_pathEnd);
+    if (s->d_lvSecSlab)    cudaFree(s->d_lvSecSlab);
+    if (s->d_lvSecCompact) cudaFree(s->d_lvSecCompact);
     if (s->d_lvCompact) cudaFree(s->d_lvCompact);
     if (s->d_cellKey)   cudaFree(s->d_cellKey);
     if (s->d_cellStart) cudaFree(s->d_cellStart);
