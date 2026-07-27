@@ -378,6 +378,202 @@ def test_volumegrid_requires_exactly_one_placement():
                          transform=vdbio.VdbTransform.diagonal((1, 1, 1), (0, 0, 0)))
 
 
+# ---- NanoVDB (.nvdb) reader -----------------------------------------------
+# `scraps/cloud.nvdb` is a genuine third-party NanoVDB file (a 41^3 fog volume
+# with a nonzero background and 10 constant tiles), so these assert the tree
+# walk against metadata NanoVDB wrote *independently* of the tree: the file
+# header's index bbox / voxel size / grid name, and the root node's own stored
+# min/max statistics.  A wrong offset or bit order cannot survive that.
+_NVDB_SAMPLE = os.path.join(_SCRAPS, "cloud.nvdb")
+
+
+def _nvdb_file_meta(path):
+    """The `.nvdb` FileMetaData fields, read straight out of the header."""
+    import struct
+    with open(path, "rb") as f:
+        buf = f.read()
+    grid_size, _file_size, _key, voxels = struct.unpack_from("<QQQQ", buf, 16)
+    world = struct.unpack_from("<6d", buf, 16 + 40)
+    index = struct.unpack_from("<6i", buf, 16 + 88)
+    voxel_size = struct.unpack_from("<3d", buf, 16 + 112)
+    name_size = struct.unpack_from("<I", buf, 16 + 136)[0]
+    name = buf[16 + 176:16 + 176 + name_size].split(b"\0", 1)[0].decode()
+    grid_at = 16 + 176 + name_size
+    return dict(name=name, index=index, world=world, voxel_size=voxel_size,
+                voxels=voxels, grid=buf[grid_at:grid_at + grid_size])
+
+
+def test_nvdb_matches_its_own_header_metadata():
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    meta = _nvdb_file_meta(_NVDB_SAMPLE)
+    grids = vdbio.read_nvdb(_NVDB_SAMPLE)
+    assert set(grids) == {meta["name"]}
+    g = grids[meta["name"]]
+    # The dense bake must span exactly the header's active index bbox.
+    assert tuple(g.index_lo) == tuple(meta["index"][:3])
+    assert tuple(g.index_hi) == tuple(meta["index"][3:])
+    # ...and the transform must reproduce the header's voxel size.
+    for got, want in zip(g.transform.voxel_size, meta["voxel_size"]):
+        assert abs(got - want) < 1e-12
+    # The header's world bbox is voxel-inclusive (one voxel wider at the top
+    # than the sample corners `box` reports).
+    for got, want in zip(g.box[:3], meta["world"][:3]):
+        assert abs(got - want) < 1e-9
+    for got, want, vs in zip(g.box[3:], meta["world"][3:], meta["voxel_size"]):
+        assert abs(got - (want - vs)) < 1e-9
+
+
+def test_nvdb_matches_root_node_statistics():
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    import struct
+    meta = _nvdb_file_meta(_NVDB_SAMPLE)
+    # RootData sits at grid+672 (TreeData) + mNodeOffset[3]; its min/max are
+    # computed by NanoVDB over the same voxels our walk visits.
+    grid = meta["grid"]
+    root = 672 + struct.unpack_from("<q", grid, 672 + 24)[0]
+    background, vmin, vmax = struct.unpack_from("<3f", grid, root + 28)
+    g = vdbio.read_nvdb(_NVDB_SAMPLE)[meta["name"]]
+    assert abs(g.background - background) < 1e-9
+    assert abs(float(g.values.min()) - vmin) < 1e-6
+    assert abs(float(g.values.max()) - vmax) < 1e-6
+    # A background-only bake would be flat; the tiles + leaves must have landed.
+    assert float(g.values.max()) > background
+    assert int((g.values != background).sum()) > meta["voxels"] // 2
+
+
+def test_nvdb_every_leaf_voxel_lands_where_nanovdb_put_it():
+    """Pin the leaf layout against a route that doesn't use the tree walk.
+
+    NanoVDB writes leaves breadth-first and contiguously, so ``TreeData``'s
+    first-leaf offset + leaf count reach every leaf directly — independently of
+    the child-offset descent :func:`read_nvdb` uses.  Comparing the two catches
+    a wrong value/mask offset, which the header-level assertions cannot.
+    """
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    import struct
+    grid = _nvdb_file_meta(_NVDB_SAMPLE)["grid"]
+    tree = 672
+    first_leaf, = struct.unpack_from("<q", grid, tree)
+    nleaf, = struct.unpack_from("<I", grid, tree + 32)
+    assert nleaf > 0
+    g = vdbio.read_nvdb(_NVDB_SAMPLE)["cloud"]
+    lo = g.index_lo
+
+    LEAF_STRIDE = 2144
+    checked = active_total = 0
+    for li in range(nleaf):
+        leaf = tree + first_leaf + li * LEAF_STRIDE
+        bbmin = struct.unpack_from("<3i", grid, leaf)
+        origin = tuple(v & ~7 for v in bbmin)             # LeafNode::origin()
+        mask = np.unpackbits(np.frombuffer(grid, np.uint8, 64, leaf + 16),
+                             bitorder="little").astype(bool)
+        vals = np.frombuffer(grid, "<f4", 512, leaf + 96)
+        lmin, lmax = struct.unpack_from("<2f", grid, leaf + 80)
+        act = vals[mask]
+        active_total += int(mask.sum())
+        if act.size:
+            # NanoVDB's own per-leaf statistics, over the same active voxels.
+            assert abs(float(act.min()) - lmin) < 1e-6
+            assert abs(float(act.max()) - lmax) < 1e-6
+        for n in np.nonzero(mask)[0]:
+            i = origin[0] + ((int(n) >> 6) & 7) - lo[0]
+            j = origin[1] + ((int(n) >> 3) & 7) - lo[1]
+            k = origin[2] + (int(n) & 7) - lo[2]
+            assert abs(float(g.values[i, j, k]) - float(vals[n])) < 1e-6
+            checked += 1
+    assert checked > 10000                                 # not a vacuous pass
+    # Leaves plus the 10 constant tiles must account for every active voxel.
+    tiles = struct.unpack_from("<3I", grid, tree + 44)
+    voxels, = struct.unpack_from("<Q", grid, tree + 56)
+    assert active_total + tiles[0] * 8 ** 3 + tiles[1] * 128 ** 3 == voxels
+
+
+def test_nvdb_root_tile_stride_matches_the_node_layout():
+    """The root's tile table must end exactly where the first upper node begins.
+
+    ``sizeof(RootData::Tile)`` is 32 (NanoVDB static-asserts every node type is
+    a multiple of ``NANOVDB_DATA_ALIGNMENT``); this checks the constant against
+    the file rather than trusting the header, which matters because a sample
+    with a single root tile would otherwise never exercise the stride.
+    """
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    import struct
+    grid = _nvdb_file_meta(_NVDB_SAMPLE)["grid"]
+    tree = 672
+    _leaf, _lower, upper_off, root_off = struct.unpack_from("<4q", grid, tree)
+    table_size, = struct.unpack_from("<I", grid, tree + root_off + 24)
+    assert table_size >= 1
+    root_bytes = vdbio._RD_SIZE + table_size * vdbio._RD_TILE_SIZE
+    assert root_off + root_bytes == upper_off
+
+
+def test_nvdb_reads_a_raw_grid_buffer():
+    """The container-less layout ftrace also accepts (`writeUncompressedGrids`)."""
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    meta = _nvdb_file_meta(_NVDB_SAMPLE)
+    with tempfile.TemporaryDirectory() as d:
+        raw = os.path.join(d, "raw.nvdb")
+        with open(raw, "wb") as f:
+            f.write(meta["grid"])            # the grid buffer, no FileHeader
+        got = vdbio.read_nvdb(raw)
+    want = vdbio.read_nvdb(_NVDB_SAMPLE)
+    assert set(got) == set(want)
+    assert float(np.abs(got[meta["name"]].values
+                        - want[meta["name"]].values).max()) == 0.0
+
+
+def test_read_vdb_grids_dispatches_on_magic():
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    direct = vdbio.read_nvdb(_NVDB_SAMPLE)
+    viaany = vdbio.read_vdb_grids(_NVDB_SAMPLE)
+    assert set(direct) == set(viaany)
+    for name in direct:
+        assert float(np.abs(direct[name].values - viaany[name].values).max()) == 0.0
+
+
+def test_nvdb_rejects_non_nanovdb():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "junk.nvdb")
+        with open(path, "wb") as f:
+            f.write(b"not a volume at all, really no" + b"\0" * 64)
+        with pytest.raises(ValueError, match="not a NanoVDB"):
+            vdbio.read_nvdb(path)
+
+
+def test_nvdb_rejects_compressed_container():
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    with open(_NVDB_SAMPLE, "rb") as f:
+        buf = bytearray(f.read())
+    buf[14:16] = (1).to_bytes(2, "little")   # FileHeader.codec = ZIP
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "zip.nvdb")
+        with open(path, "wb") as f:
+            f.write(bytes(buf))
+        with pytest.raises(ValueError, match="compressed .nvdb"):
+            vdbio.read_nvdb(path)
+
+
+def test_nvdb_rejects_non_float_grid():
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    meta = _nvdb_file_meta(_NVDB_SAMPLE)
+    grid = bytearray(meta["grid"])
+    grid[636:640] = (6).to_bytes(4, "little")    # GridType::Vec3f
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "vec3.nvdb")
+        with open(path, "wb") as f:
+            f.write(bytes(grid))
+        with pytest.raises(ValueError, match="only float grids"):
+            vdbio.read_nvdb(path)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

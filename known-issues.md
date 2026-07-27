@@ -1434,24 +1434,30 @@ encoder+decoder** (no OpenVDB/NanoVDB dependency — ftrace's reader is under ou
   UniformScale/Scale/Translation), validated against genuine third-party files
   (`scraps/_smoke.vdb` Houdini blosc smoke, `_fire.vdb`, `_sphere.vdb`/`_cube.vdb` level sets).
   Reader is numpy-vectorised (~20 s → 2.8 s on the four real samples).
+- **NanoVDB read (DONE 2026-07-27):** `read_nvdb` ingests `.nvdb` v32.6 float `5_4_3` in both
+  layouts (`FileHeader` container + raw grid buffer); `read_vdb_grids` dispatches on magic.
+  Read-only — loom has no NanoVDB *writer* and no demand for one. Validated against ftrace's
+  independent `src/vdbgrid.cpp` (bbox/AABB/peak match), NanoVDB's own redundant per-node
+  statistics, and an end-to-end render A/B (means agree to 0.007%; per-pixel diff halves at 4×
+  photons → √N noise, not bias). See TODO §E4 for the format notes.
 - **Still open (E4 leftovers, not yet built):**
-  1. **Rotated `AffineMap`/`UnitaryMap` grids** — currently *rejected* (a rotated transform can't
-     land samples on a dense axis-aligned array without resampling). Would need a resample-to-lattice
-     step on read.
+  1. ~~**Rotated `AffineMap`/`UnitaryMap` grids**~~ — **DONE 2026-07-26**: `read_vdb_grids` returns
+     `{name: ReadGrid}` with the index array + full `VdbTransform`, so any linear map reads; plain
+     `read_vdb` still refuses a rotated grid rather than hand back a wrong axis-aligned box.
   2. **Vec3 grids** (`Tree_vec3s_5_4_3`, e.g. velocity/colour fields) — reader handles scalar
      `Tree_float_5_4_3` only. **Note:** ftrace's volume path also ingests scalar float only
      (`src/vdb_openvdb.cpp` rejects non-`Tree_float_5_4_3`), and none of the sample `.vdb`s carry
      Vec3 data, so this is loom-completeness-only with no render-path consumer and no real file to
      validate against — low priority until a concrete use appears.
-  3. **NanoVDB `.nvdb` ingest in loom** — loom `Volume` can *reference* a `.nvdb` for ftrace
-     (`density="vdb:<path>"`), and ftrace imports `.nvdb` natively, but `loom.vdbio` reads/writes
-     OpenVDB `.vdb` only (not the NanoVDB container).
+  3. ~~**NanoVDB `.nvdb` ingest in loom**~~ — **DONE 2026-07-27** (see above). What remains
+     unbuilt is the *write* end: loom cannot author a `.nvdb`. No consumer wants it (ftrace reads
+     loom's byte-verified `.vdb` directly), so this is not tracked as debt.
   4. **Sparse-storage transforms + sparse↔dense resampling** — `vdbio` reads a sparse `.vdb` into a
      *dense* numpy array; the field-domain transforms E4 envisioned (N-D rotate-and-slice, warps,
      resample between sparse and dense backings) are not implemented — only straight read/write.
-- **When to revisit each:** (1)/(4) when a DCC asset arrives with a rotated or genuinely-sparse
-  transform loom must keep; (2) when a loom or ftrace feature actually consumes a vector volume;
-  (3) if loom needs to author the NanoVDB container directly rather than via ftrace's importer.
+- **When to revisit each:** (4) when a DCC asset arrives with a genuinely-sparse transform loom must
+  keep, or a volume big enough that a dense bake is untenable; (2) when a loom or ftrace feature
+  actually consumes a vector volume (and a real vec3 file exists to validate against).
 
 ### DEFERRED (2026-07-18): `PatOp::MatMulAdd` — a fused matrix·vec+offset pattern opcode (future optimization)
 **Status: intentionally not built. This is an optimization of an already-working path, not a

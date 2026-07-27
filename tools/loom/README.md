@@ -75,7 +75,7 @@ tools/loom/
 │   ├── spatial.py   spatial expression DSL (X, Y, Z, U, V, T + math + Image terms) → ftsl `expr`
 │   ├── sweep.py     sweep engine (rotation-minimizing frames, ribbon/tube/skin_rings, OBJ out)
 │   ├── mcubes.py    adaptive marching cubes (bake a scalar field to a mesh)
-│   ├── vdbio.py     bake a field to a dense grid → OpenVDB .vdb (density/temperature) + read back
+│   ├── vdbio.py     bake a field to a dense grid → OpenVDB .vdb (density/temperature); reads .vdb and NanoVDB .nvdb
 │   ├── axes.py      axis-typed signals: broadcast/pin/mod composition + sample/reduce grammar + lower() onto any scene value-site
 │   ├── anim.py      N-D curve → scene-variable go-between: config + JSON sidecar + value fan-out + named slots + live pipe
 │   ├── material.py  function-driven materials (waves/checker/rings/blobs, mixes)

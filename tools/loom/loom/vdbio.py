@@ -37,7 +37,33 @@ The companion :func:`read_vdb` parses back everything this module writes plus a
 useful slice of what real DCC tools emit: ACTIVE_MASK / full-float / half / ZIP
 / **blosc** value codecs, over every **linear** transform map — the diagonal ones
 (Scale, Translate and their combinations) and the general ``AffineMap`` /
-``UnitaryMap``.  It does not read ``.nvdb``.
+``UnitaryMap``.
+
+Reading NanoVDB
+---------------
+:func:`read_nvdb` additionally ingests **NanoVDB** ``.nvdb`` (v32.6, float 5_4_3)
+in either accepted layout — a ``FileHeader``-prefixed multi-grid container, or a
+bare raw grid buffer.  A ``.nvdb`` is not a serialised stream but a *memory
+image*: a linear buffer of 32-byte-aligned PODs referring to each other by signed
+byte offsets, so the reader indexes at fixed offsets and walks the tree rather
+than decompressing anything.  This mirrors ftrace's own reader
+(``src/vdbgrid.cpp``), the only ``.nvdb`` consumer on the render path;
+:func:`read_vdb_grids` dispatches to it on magic, so a caller that just wants
+"read whatever volume this is" need not care which format it was handed.  loom
+has no NanoVDB *writer* — ``.nvdb`` support is read-only.
+
+The two readers deliberately differ in what they hand back, because they answer
+different questions:
+
+* :func:`read_vdb` / :func:`read_vdb_grids` round-trip what this module *writes*,
+  so they keep only the **active positive** voxels and bound the box from them.
+* :func:`read_nvdb` must agree grid-for-grid with what ftrace renders, so it
+  produces a **faithful dense bake** over the tree's active index bbox: inactive
+  voxels take the grid's ``background`` and every non-child tile is expanded.
+  That is not a nicety — ``LeafData::getValue`` ignores the value mask and
+  ``InternalNode::getValue`` returns a tile's value whether or not the tile is
+  active, so anything less would silently drop real data (the ``cloud.nvdb``
+  sample carries 10 active lower-level tiles = 10 × 8³ voxels).
 
 Rotated grids
 -------------
@@ -66,7 +92,7 @@ import struct
 import zlib
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-__all__ = ["write_vdb", "read_vdb", "read_vdb_grids", "bake_field",
+__all__ = ["write_vdb", "read_vdb", "read_vdb_grids", "read_nvdb", "bake_field",
            "write_volume", "VolumeGrid", "VdbTransform", "ReadGrid"]
 
 # ---- OpenVDB file-format constants (mirror src/vdb_openvdb.cpp) -----------
@@ -174,14 +200,19 @@ class ReadGrid:
     way, and only :attr:`transform` knows where that lattice lies in the world.
     """
 
-    __slots__ = ("name", "values", "index_lo", "transform")
+    __slots__ = ("name", "values", "index_lo", "transform", "background")
 
     def __init__(self, name: str, values, index_lo: Tuple[int, int, int],
-                 transform: VdbTransform) -> None:
+                 transform: VdbTransform, background: float = 0.0) -> None:
         self.name = name
         self.values = values
         self.index_lo = tuple(int(v) for v in index_lo)
         self.transform = transform
+        #: Value of every voxel outside the grid's active topology.  Usually 0
+        #: for a fog volume (and always 0 for anything :func:`write_vdb` emits),
+        #: but a level set stores its half-band width here, and a real ``.nvdb``
+        #: may carry a nonzero haze — so a faithful bake needs it.
+        self.background = float(background)
 
     @property
     def shape(self) -> Tuple[int, int, int]:
@@ -759,6 +790,10 @@ def read_vdb_grids(path: str) -> Dict[str, ReadGrid]:
     accepted (including a rotated ``AffineMap``/``UnitaryMap``), because the
     samples come back in **index** space with the map carried alongside rather
     than being folded into an axis-aligned box.
+
+    **Dispatches on the file magic**, exactly as ftrace's ``loadVdbGrid`` does,
+    so a NanoVDB ``.nvdb`` is handed to :func:`read_nvdb` and callers need not
+    care which container a volume arrived in.
     """
     import numpy as np
     with open(path, "rb") as f:
@@ -766,6 +801,8 @@ def read_vdb_grids(path: str) -> Dict[str, ReadGrid]:
     c = _Cur(buf)
     magic = c.i64()
     if (magic & 0xFFFFFFFF) != _MAGIC:
+        if (magic & 0xFFFFFFFFFFFFFF) == (_NVDB_MAGIC_NUMBER & 0xFFFFFFFFFFFFFF):
+            return read_nvdb(path)                       # "NanoVDB" + variant byte
         raise ValueError("not an OpenVDB file")
     file_ver = c.u32()
     c.u32(); c.u32()                                        # library version
@@ -885,6 +922,257 @@ def read_vdb_grids(path: str) -> Dict[str, ReadGrid]:
         nx = hi[0] - lo[0] + 1; ny = hi[1] - lo[1] + 1; nz = hi[2] - lo[2] + 1
         arr = np.zeros((nx, ny, nz), dtype=np.float64)
         arr[xs - lo[0], ys - lo[1], zs - lo[2]] = vs
-        out[name] = ReadGrid(name, arr, lo, xform)
+        out[name] = ReadGrid(name, arr, lo, xform, background)
         c.p = end_pos                                       # next descriptor
+    return out
+
+
+# ---- NanoVDB (.nvdb) reader ----------------------------------------------
+#
+# Mirrors ftrace's `loadVdbGrid` (src/vdbgrid.cpp), which is the only consumer
+# of `.nvdb` in this ecosystem, so the two readers agree grid-for-grid.  The
+# format is not a serialised stream like `.vdb` — an `.nvdb` grid is a *memory
+# image*: a linear buffer of 32-byte-aligned PODs referring to each other by
+# signed byte offsets, laid out GridData / TreeData / RootData+tiles /
+# InternalNode<5>… / InternalNode<4>… / LeafNode<3>….  So there is nothing to
+# decompress: we index the buffer at fixed offsets (verified against the
+# vendored `src/third_party/nanovdb/NanoVDB.h`, version 32.6) and walk it.
+_NVDB_MAGIC_NUMBER = 0x304244566F6E614E   # "NanoVDB0" — grid *and* file (v32.6)
+_NVDB_MAGIC_GRID = 0x314244566F6E614E     # "NanoVDB1" — grid only (newer)
+_NVDB_MAGIC_FILE = 0x324244566F6E614E     # "NanoVDB2" — file container only
+_NVDB_MAJOR = 32                          # NANOVDB_MAJOR_VERSION_NUMBER
+
+# GridData, 672B.  Offsets from the start of the grid buffer.
+_GD_VERSION = 16
+_GD_GRID_COUNT = 28
+_GD_GRID_SIZE = 32
+_GD_NAME = 40                             # char[256], NUL-terminated
+_GD_MAT_D = 384                           # double[9], index->world 3x3 (row-major)
+_GD_VEC_D = 528                           # double[3], index->world translation
+_GD_GRID_TYPE = 636                       # uint32 GridType
+_GD_SIZE = 672
+
+# TreeData, 64B, immediately after GridData.
+_TD_NODE_OFFSET = 0                       # int64[4]: to first leaf/lower/upper/root
+_TD_SIZE = 64
+
+# RootData (float): BBox<Coord> mBBox(24) + mTableSize(4) + background/min/max/
+# avg/dev(5*4), padded to the 32B alignment => 64B, then the tile table.
+_RD_TABLE_SIZE = 24
+_RD_BACKGROUND = 28
+_RD_SIZE = 64
+_RD_TILE_SIZE = 32                        # key(8) + child(8) + state(4) + value(4), 32B aligned
+
+# InternalData<float, LOG2DIM>: mBBox(24) + mFlags(8) + mValueMask + mChildMask
+# + min/max/avg/dev, then a 32B-aligned table of 8-byte {float value | int64
+# child} unions.  (level, log2dim) -> (value_mask, child_mask, table).
+_ND_UPPER = (32, 4128, 8256)              # LOG2DIM 5: 32768 slots, 4096B masks
+_ND_LOWER = (32, 544, 1088)               # LOG2DIM 4:  4096 slots,  512B masks
+
+# LeafData<float, 3>: mBBoxMin(12) + mBBoxDif(3) + mFlags(1) + mValueMask(64) +
+# min/max/avg/dev(16), then a 32B-aligned float[512].
+_LF_VALUES = 96
+
+_NVDB_TYPE_NAMES = {
+    0: "unknown", 1: "float", 2: "double", 3: "int16", 4: "int32", 5: "int64",
+    6: "Vec3f", 7: "Vec3d", 8: "Mask", 9: "half", 10: "uint32", 11: "bool",
+    12: "RGBA8", 13: "Fp4", 14: "Fp8", 15: "Fp16", 16: "FpN", 17: "Vec4f",
+    18: "Vec4d", 19: "Index", 20: "OnIndex", 21: "IndexMask", 22: "OnIndexMask",
+    23: "PointIndex", 24: "Vec3u8", 25: "Vec3u16",
+}
+
+
+def _nvdb_set_bits(np, buf: bytes, off: int, nbytes: int):
+    """Indices of the set bits in a NanoVDB ``Mask`` — ``mWords[n>>6] & 1<<(n&63)``.
+
+    That is plain little-endian bit order over the byte array, so one
+    ``unpackbits`` recovers it (no per-word shuffling needed).
+    """
+    words = np.frombuffer(buf, dtype=np.uint8, count=nbytes, offset=off)
+    return np.nonzero(np.unpackbits(words, bitorder="little"))[0]
+
+
+def _nvdb_fill(arr, lo, origin, dim, value) -> None:
+    """Paint the ``dim``-cubed index region at ``origin`` into ``arr``, clipped.
+
+    A tile (a node slot with no child) stands for a whole constant block, and
+    ``getValue`` returns that block's value for every voxel inside it — so a
+    faithful dense bake has to expand it, exactly as ftrace's accessor does.
+    """
+    sl = []
+    for ax in range(3):
+        a = origin[ax] - lo[ax]
+        b = a + dim
+        a = max(a, 0)
+        b = min(b, arr.shape[ax])
+        if a >= b:
+            return
+        sl.append(slice(a, b))
+    arr[sl[0], sl[1], sl[2]] = value
+
+
+def _nvdb_read_grid(np, buf: bytes, base: int) -> ReadGrid:
+    """Bake one NanoVDB grid buffer starting at byte ``base`` into a ReadGrid."""
+    gtype = struct.unpack_from("<I", buf, base + _GD_GRID_TYPE)[0]
+    if gtype != 1:                                       # GridType::Float
+        raise ValueError(
+            "read_nvdb: only float grids supported (grid is "
+            f"{_NVDB_TYPE_NAMES.get(gtype, gtype)})")
+    name = buf[base + _GD_NAME:base + _GD_NAME + 256].split(b"\0", 1)[0].decode("ascii")
+    mat = struct.unpack_from("<9d", buf, base + _GD_MAT_D)
+    vec = struct.unpack_from("<3d", buf, base + _GD_VEC_D)
+    # NanoVDB's `matMult(mat, vec, ijk)` is row-major column-vector — the same
+    # convention VdbTransform stores — so the 3x3 carries over unchanged.
+    xform = VdbTransform(mat, vec)
+
+    tree = base + _GD_SIZE
+    node_off = struct.unpack_from("<4q", buf, tree + _TD_NODE_OFFSET)
+    if node_off[3] == 0:
+        raise ValueError(f"read_nvdb: grid '{name}' has no root node")
+    root = tree + node_off[3]
+
+    # The root's own bbox IS the tree's active index bbox (ftrace bakes exactly
+    # this range), inclusive on both ends.
+    bb = struct.unpack_from("<6i", buf, root)
+    lo, hi = bb[:3], bb[3:]
+    shape = tuple(hi[a] - lo[a] + 1 for a in range(3))
+    if min(shape) <= 0:
+        raise ValueError(f"read_nvdb: grid '{name}' has no active voxels")
+    if shape[0] * shape[1] * shape[2] > 512 * 1024 * 1024:
+        raise ValueError(
+            f"read_nvdb: grid '{name}' too large to dense-bake "
+            f"({shape[0]}x{shape[1]}x{shape[2]} voxels)")
+
+    background = struct.unpack_from("<f", buf, root + _RD_BACKGROUND)[0]
+    arr = np.full(shape, background, dtype=np.float64)
+
+    def walk_internal(node, origin, log2dim, child_log2, offsets, child_is_leaf):
+        vm_off, cm_off, tbl_off = offsets
+        nslots = 1 << (3 * log2dim)
+        mask_bytes = nslots // 8
+        child_bits = set(int(v) for v in
+                         _nvdb_set_bits(np, buf, node + cm_off, mask_bytes))
+        children = np.frombuffer(buf, dtype="<i8", count=nslots, offset=node + tbl_off)
+        # The union's float shares the low 4 bytes of each 8-byte slot.
+        values = np.frombuffer(buf, dtype="<f4", count=2 * nslots,
+                               offset=node + tbl_off)[0::2]
+        lmask = (1 << log2dim) - 1
+        child_dim = 1 << child_log2
+        for n in range(nslots):
+            i = (n >> (2 * log2dim)) & lmask
+            j = (n >> log2dim) & lmask
+            k = n & lmask
+            corg = (origin[0] + (i << child_log2),
+                    origin[1] + (j << child_log2),
+                    origin[2] + (k << child_log2))
+            if n in child_bits:
+                child = node + int(children[n])
+                if child_is_leaf:
+                    # LeafData::getValue ignores the value mask, so ftrace's
+                    # bake writes every stored voxel — active or not.
+                    vals = np.frombuffer(buf, dtype="<f4", count=512,
+                                         offset=child + _LF_VALUES)
+                    # slot = (dx<<6)|(dy<<3)|dz is exactly C order for (8,8,8).
+                    _nvdb_fill_block(arr, lo, corg, vals.reshape(8, 8, 8))
+                else:
+                    walk_internal(child, corg, 4, 3, _ND_LOWER, True)
+            else:
+                # A tile, active or not: `getValue` returns its value either way.
+                _nvdb_fill(arr, lo, corg, child_dim, float(values[n]))
+
+    table_size = struct.unpack_from("<I", buf, root + _RD_TABLE_SIZE)[0]
+    for t in range(table_size):
+        tile = root + _RD_SIZE + t * _RD_TILE_SIZE
+        key, child = struct.unpack_from("<Qq", buf, tile)
+        value = struct.unpack_from("<f", buf, tile + 20)[0]
+        # KeyToCoord: 21 bits per axis, x high / y mid / z low, each the
+        # ORIGINAL uint32 coordinate shifted down by the child's TOTAL (12).
+        km = (1 << 21) - 1
+        org = tuple(_as_i32(((key >> s) & km) << 12) for s in (42, 21, 0))
+        if child != 0:
+            walk_internal(root + child, org, 5, 7, _ND_UPPER, False)
+        else:
+            _nvdb_fill(arr, lo, org, 1 << 12, value)
+
+    return ReadGrid(name, arr, lo, xform, background)
+
+
+def _nvdb_fill_block(arr, lo, origin, block) -> None:
+    """Paint an 8-cubed leaf block into ``arr``, clipped to its bounds."""
+    src, dst = [], []
+    for ax in range(3):
+        a = origin[ax] - lo[ax]
+        c0 = max(-a, 0)
+        c1 = min(arr.shape[ax] - a, 8)
+        if c0 >= c1:
+            return
+        src.append(slice(c0, c1))
+        dst.append(slice(a + c0, a + c1))
+    arr[dst[0], dst[1], dst[2]] = block[src[0], src[1], src[2]]
+
+
+def _as_i32(v: int) -> int:
+    """Reinterpret the low 32 bits of ``v`` as a signed int32."""
+    v &= 0xFFFFFFFF
+    return v - (1 << 32) if v >= (1 << 31) else v
+
+
+def read_nvdb(path: str) -> Dict[str, ReadGrid]:
+    """Parse a NanoVDB ``.nvdb`` into ``{name: ReadGrid}``.
+
+    Accepts both layouts ftrace accepts: the **file container** (``FileHeader``
+    then ``{FileMetaData, name, grid}…``, uncompressed) and a **raw grid
+    buffer** (as written by ``writeUncompressedGrids`` or dumped from a
+    ``GridHandle``).  Float ``5_4_3`` grids only — the one type ftrace renders.
+
+    Unlike :func:`read_vdb`, the array is the grid's **faithful dense bake**
+    over the tree's active index bounding box: inactive voxels carry the grid
+    ``background`` and constant *tiles* are expanded, exactly as ftrace's
+    accessor-driven bake in ``src/vdbgrid.cpp`` does.  (``read_vdb`` keeps its
+    own older convention — active, positive voxels only — because it round-trips
+    :func:`write_vdb`, whose background is always 0.)  ``ReadGrid.background``
+    carries the background either way.
+    """
+    import numpy as np
+    with open(path, "rb") as f:
+        buf = f.read()
+    if len(buf) < 16:
+        raise ValueError(f"read_nvdb: file too small: '{path}'")
+    magic = struct.unpack_from("<Q", buf, 0)[0]
+
+    # Disambiguate the two layouts the way NanoVDB (and ftrace) does: in default
+    # builds a file and a grid share the same magic, so the discriminator is
+    # whether byte 16 parses as a compatible *grid* version field.
+    def grid_major(off: int) -> int:
+        if off + _GD_SIZE > len(buf):
+            return -1
+        return struct.unpack_from("<I", buf, off + _GD_VERSION)[0] >> 21
+
+    out: Dict[str, ReadGrid] = {}
+    if magic == _NVDB_MAGIC_GRID or (magic == _NVDB_MAGIC_NUMBER
+                                     and grid_major(0) == _NVDB_MAJOR):
+        # Raw grid buffer: grids follow one another, each self-describing.
+        count = struct.unpack_from("<I", buf, _GD_GRID_COUNT)[0] or 1
+        off = 0
+        for _ in range(count):
+            gr = _nvdb_read_grid(np, buf, off)
+            out[gr.name] = gr
+            off += struct.unpack_from("<Q", buf, off + _GD_GRID_SIZE)[0]
+        return out
+
+    if magic not in (_NVDB_MAGIC_NUMBER, _NVDB_MAGIC_FILE):
+        raise ValueError(f"read_nvdb: not a NanoVDB file or raw grid: '{path}'")
+    _ver, grid_count, codec = struct.unpack_from("<IHH", buf, 8)
+    if codec != 0:
+        raise ValueError(
+            "read_nvdb: compressed .nvdb not supported (re-export "
+            f"uncompressed): '{path}'")
+    p = 16
+    for _ in range(grid_count):
+        grid_size, _file_size = struct.unpack_from("<QQ", buf, p)
+        name_size = struct.unpack_from("<I", buf, p + 136)[0]
+        p += 176 + name_size                             # FileMetaData + name
+        gr = _nvdb_read_grid(np, buf, p)
+        out[gr.name] = gr
+        p += grid_size
     return out

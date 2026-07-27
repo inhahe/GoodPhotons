@@ -1337,7 +1337,52 @@ array, its `index_lo`, and the full `VdbTransform` (`world = A·index + t`, mirr
 green) plus an ftrace interop check: one asymmetric L-shaped volume written twice, diagonal vs 45°-about-Y
 (`scraps/vdb_rot_make.py`), renders visibly rotated in ftrace with identical voxels.
 
-**Still open:** **Vec3** grids; ingesting `.nvdb`; sparse-storage transforms; and resampling sparse↔dense.
+**NanoVDB `.nvdb` ingest — DONE 2026-07-27.** `loom.vdbio.read_nvdb(path)` reads NanoVDB v32.6 float
+`5_4_3` grids in **both** accepted layouts — a `FileHeader`-prefixed multi-grid container and a bare raw
+grid buffer — and `read_vdb_grids` now **dispatches on magic**, so a caller that just wants "read whatever
+volume this is" no longer has to know which format it holds. The item was unblocked (unlike Vec3, below)
+because `scraps/cloud.nvdb` is *genuine third-party data* and `src/vdbgrid.cpp` is a completely independent
+reader to check against — the same "must meet a real file" bar this module has held throughout.
+
+The format is not a serialised stream but a **memory image**: a linear buffer of 32-byte-aligned PODs
+referring to each other by *signed byte offsets*, laid out `GridData / TreeData / RootData+tiles /
+Internal<5>… / Internal<4>… / Leaf<3>…`. Nothing to decompress — you index at fixed offsets and walk.
+Every struct offset was byte-verified against the vendored `src/third_party/nanovdb/NanoVDB.h` *and* the
+real file before a line of parser was written. Three details mattered:
+
+- **Tiles are real data.** `LeafData::getValue(i)` returns `mValues[i]` with **no mask check**, and
+  `InternalNode::getValue` returns `mTable[n].value` whenever `childMask` is off — active or not. So the
+  bake must write every stored leaf voxel and expand every non-child tile, exactly as ftrace's
+  accessor-driven bake does; `cloud.nvdb` has 10 active lower-level tiles (10 × 8³ voxels) that a
+  mask-filtered read would silently drop. Hence the **deliberate convention split**, documented in the
+  module docstring: `read_vdb` keeps only active-positive voxels (it round-trips loom's own writer),
+  while `read_nvdb` is a faithful dense bake over the tree's active index bbox with inactive =
+  `background`. `ReadGrid` gained a `background` slot for this (0 for fog, the half-band width for a level
+  set, 0.03 in `cloud.nvdb`).
+- **Bit/coord order is plain.** `Mask::isOn(n) = mWords[n>>6] & (1<<(n&63))` is little-endian over the byte
+  array, so one `np.unpackbits(bitorder="little")` recovers it with no per-word shuffle; and the leaf slot
+  `((i&7)<<6)|((j&7)<<3)|(k&7)` is *exactly* C order for an `(8,8,8)` reshape.
+- **The transform carries over untransposed.** NanoVDB's `matMult` is row-major column-vector — the same
+  convention `VdbTransform.a` stores — unlike OpenVDB's row-vector `AffineMap`, which needs the transpose.
+
+**Validated three ways.** (1) Against ftrace's own reader: index bbox `41³ @ (30,30,30)`, world AABB
+`0.3..0.71` and `peak 1.001` match ftrace's `[vdb]` line exactly. (2) Against NanoVDB's own redundantly
+stored statistics: array min/max match `RootData`'s, every leaf's active min/max matches its
+`mMinimum`/`mMaximum`, and `active_total + tiles[0]·8³ + tiles[1]·128³ == mVoxelCount` (33401) holds
+exactly. (3) End-to-end through the renderer (`scraps/nvdb_roundtrip.py`): the `.nvdb` re-emitted as a
+`.vdb` and rendered in the same scene by ftrace's *independent* OpenVDB reader agrees to **0.007%** in the
+mean, and the per-pixel relative diff **halves with 4× photons** (8.65% → 4.35%, ratio 1.99) — √N, i.e.
+pure independent-MC noise, not a volume difference. (The `.vdb` comes back 39³ rather than 41³ because
+`write_vdb` trims the zero outer shell by design; that write-side trim shifts the AABB, which diverges the
+RNG streams and is the whole source of the per-pixel noise.) 9 new tests (**1137 loom green**), and all
+**11 layout-constant mutations are caught** — two (`_LF_VALUES`, `_RD_TILE_SIZE`) initially slipped through
+and drove two extra tests: an *independent* breadth-first leaf traversal via `mNodeOffset[0]` + stride 2144
+(not the reader's child-offset descent) with a per-voxel index check, and a root-tile-stride test asserting
+the root table ends exactly where the first upper node begins.
+
+**Still open:** **Vec3** grids; sparse-storage transforms; and resampling sparse↔dense. Note loom has no
+NanoVDB *writer* — `.nvdb` support is read-only, and there's no demand for the write end (ftrace reads
+`.vdb` happily, and loom's `.vdb` writer is byte-verified).
 - **Vec3 grids are BLOCKED on validation data (assessed 2026-07-26).** None of the four real sample files in
   `scraps/` carries a `Tree_vec3s_*` grid (all four are `Tree_float_5_4_3_HalfFloat`), and there is no
   installable OpenVDB Python binding on this platform to synthesise one (`openvdb` / `pyopenvdb` /

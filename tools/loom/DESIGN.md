@@ -420,7 +420,7 @@ tools/loom/
     ftsl_emit.py            snapshot → .ftsl text (new)
     drive.py                render_range, viewer, assembly, seed (new)
     mcubes.py               marching cubes: bake a field to a mesh (M7)
-    vdbio.py                bake a field to a dense grid + write/read .vdb (E4 write)
+    vdbio.py                bake a field to a dense grid + write/read .vdb, read .nvdb (E4)
     axes.py                 axis-typed signals: broadcast/pin/mod + sample/reduce + lower-to-value-site (E5)
     anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe (E2 s1–2)
     xvideo.py               two-pass spacetime transform video (M11)
@@ -565,8 +565,21 @@ tools/loom/
     **byte-for-byte** the original ACTIVE_MASK/float32 output (test-asserted).
   - **Read API — two entry points, because the return type is the whole question.**
     `read_vdb(path)` → `{name: (array, box6)}` as always; `read_vdb_grids(path)` →
-    `{name: ReadGrid}` carrying the index-space array, its `index_lo`, and the full
-    `VdbTransform` (index→world `A·i + t`, mirroring ftrace's `readTransform`).
+    `{name: ReadGrid}` carrying the index-space array, its `index_lo`, the full
+    `VdbTransform` (index→world `A·i + t`, mirroring ftrace's `readTransform`) and the grid
+    `background`.
+  - **NanoVDB `.nvdb` read** (read-only; loom has no NanoVDB writer). `read_nvdb(path)` handles
+    v32.6 float `5_4_3` in both accepted layouts — a `FileHeader` multi-grid container and a bare
+    raw grid buffer — and `read_vdb_grids` **dispatches on magic**, so a caller wanting "read
+    whatever volume this is" needn't know which it holds. A `.nvdb` is a *memory image*, not a
+    stream: 32-byte-aligned PODs linked by signed byte offsets (`GridData / TreeData / RootData+
+    tiles / Internal<5> / Internal<4> / Leaf<3>`), so the reader indexes at fixed offsets and
+    walks. It mirrors ftrace's `src/vdbgrid.cpp` and therefore produces a **faithful dense bake**
+    — inactive voxels take `background`, every non-child tile is expanded — deliberately unlike
+    `read_vdb`, which keeps only active-positive voxels because it round-trips loom's own writer.
+    That difference is load-bearing: `LeafData::getValue` ignores the value mask and
+    `InternalNode::getValue` returns a tile's value active-or-not, so a mask-filtered read would
+    drop real data (the `cloud.nvdb` sample carries 10 active lower-level tiles).
   - **Transforms.** All of OpenVDB's linear maps are decoded: the diagonal ones (Scale /
     Translate / UniformScale and combinations) and the general `AffineMap`/`UnitaryMap`.
     A **rotation costs the samples nothing** — an OpenVDB tree is a regular lattice in *index*
@@ -577,17 +590,28 @@ tools/loom/
     writes one, as an `AffineMap`. `is_diagonal` compares each off-diagonal against its own
     row's scale, so it is unit-free and tolerates the ~1e-17 crumbs a DCC leaves when it
     composes a 90°/180° rotation in floating point.
-  - **Tests:** `tests/test_vdbio.py` (27) — bit-exact round-trip, world-box↔linspace positions,
+  - **Tests:** `tests/test_vdbio.py` (36) — bit-exact round-trip, world-box↔linspace positions,
     multi-grid named selection, sparse-empty-leaf drop, duplicate-name rejection, bake+write,
-    each codec, four real third-party sample files, and the rotated set (round-trip through
+    each codec, four real third-party sample files, the rotated set (round-trip through
     `AffineMap`, `read_vdb` refusal, diagonal-`AffineMap` still yielding a box, and the two read
-    entry points agreeing on diagonal files). Cross-validated through ftrace on CPU+GPU
+    entry points agreeing on diagonal files), and the NanoVDB set against the real
+    `scraps/cloud.nvdb` — header metadata, `RootData` statistics, an **independent**
+    breadth-first leaf walk (via `mNodeOffset[0]`, not the reader's child-offset descent) checking
+    per-leaf min/max and every active voxel's landing index, the root-tile stride, the raw-buffer
+    layout, magic dispatch, and the three rejections (non-NanoVDB, compressed, non-float). All
+    **11 layout-constant mutations are caught** — two initially were not, which is what drove the
+    independent-walk and tile-stride tests. Cross-validated through ftrace on CPU+GPU
     (`scraps/make_loom_vdb.py` → `scraps/loom_smoke.vdb` via `scraps/loom_vdb.ftsl`; sparse
     device path `1000/1000 bricks active`, energy `sum/emitted=1.000000`), and the rotated path
     by rendering one asymmetric volume under a diagonal vs a 45°-about-Y map
-    (`scraps/vdb_rot_make.py`).
-  - **Still open:** **Vec3** grids; ingesting `.nvdb`; sparse-storage transforms; resampling
-    sparse↔dense.
+    (`scraps/vdb_rot_make.py`). The NanoVDB path was likewise checked end-to-end
+    (`scraps/nvdb_roundtrip.py`): `cloud.nvdb` read by loom, re-emitted as a `.vdb`, and rendered
+    in the same scene through ftrace's *independent* OpenVDB reader — means agree to 0.007%, and
+    the per-pixel diff halves at 4× photons (8.65% → 4.35%), i.e. √N noise from the diverged RNG
+    streams rather than a volume difference.
+  - **Still open:** **Vec3** grids (blocked — no real vec3 file to validate against, and no
+    consumer: ftrace is scalar-float-only); sparse-storage transforms; resampling sparse↔dense.
+    Writing `.nvdb` is deliberately not built (ftrace reads loom's `.vdb` directly).
 - **E5 (foundation) — Axis-typed signals (one influence model).** ✅ done (`loom/axes.py`). Resolves E5's
   deferred open-q (node taxonomy + axis-set representation) with a small additive layer *on top of* the
   scalar `Signal` DAG (no churn; 891 prior tests stay green). An `AxSignal` is a pure function of a **point**
