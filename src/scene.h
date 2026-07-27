@@ -395,9 +395,9 @@ struct Medium {
     }
 
     // Inside-test for an implicit-shaped bound: is world point p within the field?
-    bool insideField(const Vec3& p) const {
+    bool insideField(const Vec3& p, const PatTables* tabs = nullptr) const {
         double f = fieldEval(boundField.data(), (int)boundField.size(), p,
-                             boundFieldExpr.data());
+                             boundFieldExpr.data(), tabs);
         return boundInsideNeg ? (f < 0.0) : (f > 0.0);
     }
 
@@ -413,11 +413,15 @@ struct Medium {
     // medium. Evaluated by the shared pattern VM (x y z r live; f/normal/uv read 0).
     // For an implicit bound the multiplier is 0 outside the field (the medium simply
     // does not exist there), so delta/ratio tracking carves out the exact iso-shape.
-    double densityAt(const Vec3& p) const {
-        if (boundShape == MediumBound::Implicit && !insideField(p)) return 0.0;
+    // `tabs` publishes the scene's `grid:`/`scatter:` tables, so a density field can be
+    // a SAMPLED volume (`density "grid:rho(x, y, z)"`) rather than only a formula. It is
+    // a parameter, not a member, because it points into Scene's vectors — see PatTables.
+    double densityAt(const Vec3& p, const PatTables* tabs = nullptr) const {
+        if (boundShape == MediumBound::Implicit && !insideField(p, tabs)) return 0.0;
         if (vdb) return vdb->sample(p);   // imported .nvdb volume (trilinear)
         if (density.empty()) return 1.0;
         PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
+        patBindTables(c, tabs);
         double d = patternEval(density.data(), (int)density.size(), c);
         return d > 0.0 ? d : 0.0;
     }
@@ -427,29 +431,30 @@ struct Medium {
 
     // Local refractive index n at a world point (>= a small floor). 1 when this
     // is not a GRIN medium. Evaluated by the shared pattern VM (x y z r live).
-    double nAt(const Vec3& p) const {
+    double nAt(const Vec3& p, const PatTables* tabs = nullptr) const {
         if (ior.empty()) return 1.0;
         PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
+        patBindTables(c, tabs);
         double n = patternEval(ior.data(), (int)ior.size(), c);
         return n > 1e-3 ? n : 1e-3;
     }
     // ∇n at a world point via central differences with step h (world units).
-    Vec3 gradNAt(const Vec3& p, double h) const {
+    Vec3 gradNAt(const Vec3& p, double h, const PatTables* tabs = nullptr) const {
         double inv = 0.5 / h;
-        double gx = nAt(p + Vec3(h, 0, 0)) - nAt(p - Vec3(h, 0, 0));
-        double gy = nAt(p + Vec3(0, h, 0)) - nAt(p - Vec3(0, h, 0));
-        double gz = nAt(p + Vec3(0, 0, h)) - nAt(p - Vec3(0, 0, h));
+        double gx = nAt(p + Vec3(h, 0, 0), tabs) - nAt(p - Vec3(h, 0, 0), tabs);
+        double gy = nAt(p + Vec3(0, h, 0), tabs) - nAt(p - Vec3(0, h, 0), tabs);
+        double gz = nAt(p + Vec3(0, 0, h), tabs) - nAt(p - Vec3(0, 0, h), tabs);
         return Vec3(gx, gy, gz) * inv;
     }
     // Point-in-bound test (a GRIN region must be bounded). Mirrors clipToBounds'
     // membership: sphere chord / AABB / implicit field. Unbounded => everywhere.
-    bool insideBound(const Vec3& p) const {
+    bool insideBound(const Vec3& p, const PatTables* tabs = nullptr) const {
         if (!bounded) return true;
         if (boundShape == MediumBound::Sphere) {
             Vec3 d = p - bcenter;
             return dot(d, d) <= bradius * bradius;
         }
-        if (boundShape == MediumBound::Implicit) return insideField(p);
+        if (boundShape == MediumBound::Implicit) return insideField(p, tabs);
         return p.x >= bmin.x && p.x <= bmax.x && p.y >= bmin.y &&
                p.y <= bmax.y && p.z >= bmin.z && p.z <= bmax.z;
     }
@@ -814,6 +819,21 @@ struct Scene {
     std::vector<PatGrid>    grids;
     std::vector<PatScatter> scatters;
     std::vector<float>      dataPool;
+    // Non-owning view of the three vectors above, for evaluators that only forward the
+    // tables onward (implicit fields, medium density/ior programs). Cheap enough to
+    // build once per ray/traversal, which is the ONLY correct lifetime: a Scene is
+    // copied and moved (buildCornell returns by value), so a stored PatTables would
+    // dangle. Never cache it in a member — pass it as a parameter.
+    PatTables patTables() const {
+        PatTables t;
+        t.grids     = grids.empty()    ? nullptr : grids.data();
+        t.nGrids    = (int)grids.size();
+        t.scatters  = scatters.empty() ? nullptr : scatters.data();
+        t.nScatters = (int)scatters.size();
+        t.dataPool  = dataPool.empty() ? nullptr : dataPool.data();
+        t.dataPoolN = (int)dataPool.size();
+        return t;
+    }
     Sensor sensor;
     // Participating media. Zero or more independent regions (global haze, bounded
     // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
@@ -1297,10 +1317,14 @@ struct Scene {
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
         const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
+        // Sampled tables, in case an implicit's field formula reads `grid:`/`scatter:`.
+        // Built once per ray, not per implicit hit: three pointer copies either way, and
+        // the lambda is called many times.
+        const PatTables tabs = patTables();
         bvh.traverseClosest(r, tmin, tMax, [&](int prim, double& tm) {
             if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
-            else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h)) tm = h.t; }
+            else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs)) tm = h.t; }
             else {
                 const MeshInstance& inst = instances[prim - nT - nS - nI];
                 Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
@@ -1327,11 +1351,12 @@ struct Scene {
         const size_t nI = implicits.size();
         const double seg = maxDist - tmin;
         const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
+        const PatTables tabs = patTables();      // see closestHit
         return bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
             if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
-            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h);
+            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs);
             const MeshInstance& inst = instances[prim - nT - nS - nI];
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             return blasList[inst.blasId].occludedLocal(lr, tmin, seg);  // world seg == local seg
@@ -1344,7 +1369,8 @@ struct Scene {
         const TriShear sh = makeTriShear(r.d);
         for (const auto& t : tris)     intersectTri(sh, r, t, tmin, h);
         for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
-        for (const auto& im : implicits) intersectImplicit(r, im, tmin, h);
+        const PatTables tabs = patTables();
+        for (const auto& im : implicits) intersectImplicit(r, im, tmin, h, &tabs);
         for (const auto& inst : instances) {
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             Hit lh; lh.t = h.t;
@@ -1375,13 +1401,15 @@ inline void bindPatTex(PatCtx& c, const Scene& s) {
 // PatOp::Grid / PatOp::Scatter tables. Unlike textures these need no callback: the
 // samplers live in pattern.h and read plain POD (headers + one flat float pool), which
 // is exactly the layout the GPU uploads, so host and device share one code path.
+//
+// Two shapes of the same three pointers, because there are two kinds of caller:
+//  - `Scene::patTables()` for code that only forwards the tables onward — the field /
+//    isosurface / medium evaluators, which take a `const PatTables*` and build their
+//    PatCtx internally.
+//  - `bindPatData(c, scene)` for code holding a PatCtx it built itself.
 inline void bindPatData(PatCtx& c, const Scene& s) {
-    c.grids     = s.grids.empty()    ? nullptr : s.grids.data();
-    c.nGrids    = (int)s.grids.size();
-    c.scatters  = s.scatters.empty() ? nullptr : s.scatters.data();
-    c.nScatters = (int)s.scatters.size();
-    c.dataPool  = s.dataPool.empty() ? nullptr : s.dataPool.data();
-    c.dataPoolN = (int)s.dataPool.size();
+    PatTables t = s.patTables();
+    patBindTables(c, &t);
 }
 
 // Publish every scene-owned pattern table into a context. Call this (not the

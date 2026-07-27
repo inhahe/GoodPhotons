@@ -99,6 +99,73 @@ Verified: `-o png/dirfix/deep/nested/out.png` creates the whole tree and writes 
 PNG and its `.ftbuf`; `-o png/dirfix_file.png/out.png` (parent is a regular file) fails
 before the scene renders.
 
+### BUG + TECH-DEBT — DONE (2026-07-26, 0.78.0): `grid:` / `scatter:` now reach field / isosurface / density / ior / camera-track formulas — and the guard no longer corrupts the eval stack
+
+Fixed in 0.78.0. Two things turned out to be tangled here, and the second was worse than
+this entry claimed:
+
+1. **The gap.** All four field-formula `compilePatternExpr` sites now pass `&tableScope_`
+   (`src/ftsl.h`: `addFunctionLeaf`, medium `density`, medium `ior`, the `camera_curve`
+   record driver), so a `function` leaf can be a measured height field, a medium density
+   can be a sampled volume, an `ior` field can be a measured index volume, and a flyby
+   track can be driven by tabulated data. `texScope_` is deliberately still withheld at
+   those sites: `tex:` needs a hit's (u,v), which a field formula has no access to, so it
+   remains a clean compile error.
+
+2. **The "unreachable" stub was reachable, and it was a live wrong render — not latent
+   GPU debt.** `medium { density pattern:<p> }` copies a *pattern*'s nodes (compiled WITH
+   a table scope, so `PatOp::Grid` is real) into `med.density`, which `Medium::densityAt`
+   evaluated through a bare `PatCtx` — `c.grids == nullptr`. The guard pushed 0 **without
+   popping** its `ndim` operands, so `patternEval` returned `st[0]`: the first
+   **coordinate**, not the sample. Confirmed by render: `scraps/gridmed.ftsl`
+   (`grid:down(x)`, descending) came out as the *mirror image* of its analytic twin
+   `scraps/gridmed_ref.ftsl` (`density "1 - x"`). Both guards (`pattern.h`, and the FP64
+   `dPatternEval` in `render_cuda.cu`) now `return 0.0` for the whole program instead:
+   the arity is the table's own `ndim`, which is precisely what can't be read when the
+   header wasn't found, so no balanced pop is possible and a placeholder push is never
+   safe.
+
+**How it's plumbed.** Host: a new `PatTables` POD + `patBindTables` (`pattern.h`) and
+`Scene::patTables()`, threaded as a `const PatTables*` parameter through `fieldLeafSDF` /
+`fieldEval` / `fieldGradient` / `Implicit::eval`/`gradient` / `intersectImplicit` /
+`estimateFieldLipschitz` / `marchImplicit` and `Medium::insideField`/`densityAt`/`nAt`/
+`gradNAt`/`insideBound`. Never a member: it points into `Scene`'s vectors and a `Scene` is
+copied and moved, so a cached copy would dangle. `Renderer::sampleMediaCollision` /
+`mediaTransmittance` were retyped from `const std::vector<Medium>&` to `const Scene&` (18
+call sites) so no caller can forget the tables. Device: `dPatternEvalF` gained a
+`const DPatEnv& env` with real `Tex`/`Grid`/`Scatter` cases (coords promoted to double and
+the result demoted, as `PatOp::PovFn` already did), threaded through `dFieldLeafSDF(F)` /
+`dFieldEval(F)` / `dFieldGradient` / `dMedDensityAt` / `dMedInside` / `dMedNAt` /
+`dMedGradN`; `dMediaSampleCollision` / `dMediaTransmittance` likewise now take the whole
+`DScene` (24 call sites).
+
+Verified, three ways:
+
+* **Medium density** — `png/gridmed/grid.png` (`density pattern:rho` where `rho` is
+  `grid:down(x)`, a *descending* ramp) is now **byte-identical** to `png/gridmed/ref.png`
+  (analytic `1 - x`) on **both** backends (`mean|d|=0.000`, `max|d|=0`), where before the
+  fix they were mirror images. The left-right-mirrored comparison is far off
+  (`mean|d|=21.6`), which is exactly the corrupted render the guard used to produce.
+* **Isosurface field** — the scratch pair `scraps/gridiso{,_ref}.ftsl` puts a 2×2 grid holding the bilinear
+  `0.05 + 0.7*x` inside a `function { expr "y - grid:hf(x, z)" }` leaf; against its
+  analytic twin it agrees to `mean|d|=0.46 / max 6` on both backends (the residual is the
+  grid pool's **float** storage: `0.05f` shifts the plane ~7e-9 m, a sub-pixel silhouette
+  jitter), while the mirrored comparison is `mean|d|=60`.
+* **Self-test** — `ftrace -checkgrid` gained sections (f) and (g), which pin the two
+  invariants directly and need no renderer: an unbound table evaluates to **0, never to a
+  coordinate** (1-D and 2-D calls), and `Medium::densityAt` fed `Scene::patTables()`
+  returns the sampled value while omitting the tables returns a clean 0.
+
+The load-time majorant (`density_max` estimate), the isosurface Lipschitz probe and the
+implicit-bound inside-sign detect all evaluate with real tables too — otherwise a
+`grid:`-driven field would majorise/bound to 0 and vanish.
+
+Checked-in worked example: `scenes/grid_field.ftsl` — a 5×5 lattice read as an isosurface
+height field (`expr "y - grid:terrain(x, z)"`) inside a corridor filled by a 1-D
+`density "grid:haze(y)"` profile, i.e. both new sites in one scene.
+
+<details><summary>original entry</summary>
+
 ### TECH-DEBT — OPEN (2026-07-27): `grid:<name>(…)` / `scatter:<name>(…)` are *surface-pattern* samplers only — field / isosurface / density formulas can't reach them
 
 0.71.0 added the N-D `grid` datatype and the `grid:<name>(c0, …)` sampler; 0.72.0 added its
@@ -126,6 +193,8 @@ into `dPatternEval` (the samplers `patGridSample` / `patScatterSample` in `patte
 already `__host__ __device__` and shared, so only the plumbing is missing), and replace the
 stub case with real ones that pop `ndim` coordinates. Then drop this entry and the "surface
 patterns only" caveat from FTSL.md.
+
+</details>
 
 ### TECH-DEBT — FIXED for `reflect` (0.75.0) and `transmit` (0.76.0); `emit` still open
 

@@ -311,9 +311,31 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `int count` into **one flat `Scene::dataPool` shared by both kinds** — never by pointer,
   since the pool grows as later tables load — which is also exactly the layout the GPU
   uploads, so a scene costs one allocation for its tables however many it declares. The
-  scopes are separate namespaces (a grid `foo` is not `scatter:foo`). Both are wired into
-  every *pattern* site but not yet into scalar *field* formulas (isosurface/density) — a
-  plumbing gap tracked in `known-issues.md`.
+  scopes are separate namespaces (a grid `foo` is not `scatter:foo`).
+
+  **Reaching the field formulas (0.78.0).** Unlike `tex:`, which genuinely needs a hit's
+  (u,v) and so stays a compile error outside a shading context, a table sample needs only
+  coordinates — so the FTSL builder passes `&tableScope_` at four further compile sites:
+  the `function` field leaf, a medium's `density` and `ior` programs, and `camera_curve`
+  drivers. Evaluation is the harder half: a compiled `PatOp::Grid` node carries an index
+  into `Scene::grids`, so **every** evaluation site must be able to see those vectors.
+  The mechanism is `PatTables` — a non-owning `{grids, scatters, dataPool}` view built by
+  `Scene::patTables()` (device: `dPatEnvOf(DScene&)`) and threaded as a **parameter**
+  through `Implicit::eval`/`gradient`, `intersectImplicit`, `estimateFieldLipschitz`,
+  `Medium::densityAt`/`nAt`/`gradNAt`/`insideBound`, the GRIN marcher, `isomesh::marchImplicit`
+  and `airtight::check`. It is deliberately *never* a member: a `Scene` is copied and moved
+  (`buildCornell` returns by value), so a stored view would dangle. The two multi-medium
+  wrappers (`sampleMediaCollision` / `mediaTransmittance`, and their device twins) were
+  retyped to take the whole `Scene`/`DScene` rather than `media`, so no caller can *forget*
+  the tables. Load-time consumers use the real tables too — the Lipschitz bound, the
+  majorant-density scan and the `boundInsideNeg` sign test would otherwise all read a
+  grid-driven field as identically 0.
+
+  The evaluator's "table not found" guards **abandon the program** (`return 0`) rather than
+  pushing a placeholder, because the operand count is the missing table's own `ndim`: a push
+  would leave the stack unbalanced and quietly return a *coordinate* as the result. That was
+  a live wrong render before 0.78.0, reachable via `medium { density pattern:<p> }`, which
+  copies a table-scoped pattern's nodes into a medium evaluated without tables.
 
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as

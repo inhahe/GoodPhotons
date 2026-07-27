@@ -450,7 +450,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         double tMed = 0.0;
         if (!scene.media.empty()) {
             int which;
-            if (mats.sampleMediaCollision(scene.media, ray.o, ray.d, dSurf, lambda,
+            if (mats.sampleMediaCollision(scene, ray.o, ray.d, dSurf, lambda,
                                           rng, tMed, which)) {
                 dEvent = tMed; mediumEvent = true; scatterMed = which;
             }
@@ -1067,7 +1067,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         // Transmittance of the fog the connection ray crosses (1 in vacuum, no RNG).
         // Evaluated at the hero only: the hero gate disables bundling when the scene has
         // any medium, so Tr is exactly 1 whenever nUp > 1.
-        double Tr = mats.mediaTransmittance(scene.media, qs.p, wcam, dist, lambda, rng);
+        double Tr = mats.mediaTransmittance(scene, qs.p, wcam, dist, lambda, rng);
         double G = std::fabs(cosSurf) * cosCam / dist2;
         L = qs.beta * f * G * cameraWe(cam, cosCam) * Tr;
         for (int i = 0; i + 1 < nUp; ++i)
@@ -1136,7 +1136,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         double pdfA = pdfChoice / em.area;             // area-measure light pdf
         if (pdfA <= 0.0) return 0.0;
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
-        double Tr = mats.mediaTransmittance(scene.media, pt.p, wi, dist, lambda, rng);
+        double Tr = mats.mediaTransmittance(scene, pt.p, wi, dist, lambda, rng);
         double G = std::fabs(cosSurf) * cosLight / dist2;
         L = pt.beta * f * Le * G / pdfA * Tr * stG;
         for (int i = 0; i + 1 < nUp; ++i)
@@ -1214,7 +1214,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         }
         if (scene.occluded(connOrigin(pt, w), w, dist - 2e-6)) return 0.0;
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
-        double Tr = mats.mediaTransmittance(scene.media, pt.p, w, dist, lambda, rng);
+        double Tr = mats.mediaTransmittance(scene, pt.p, w, dist, lambda, rng);
         double G = std::fabs(cosE) * std::fabs(cosL) / dist2;
         L = pt.beta * fE * fL * qs.beta * G * Tr * stGE * stGL;
         for (int i = 0; i + 1 < nUp; ++i)

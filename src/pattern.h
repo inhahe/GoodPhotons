@@ -297,6 +297,32 @@ struct PatCtx {
     int dataPoolN = 0;
 };
 
+// The SCENE-OWNED half of a PatCtx, with none of the per-hit coordinates: just the N-D
+// sampler tables. A shading site builds its PatCtx from a Hit and binds these in one go
+// (scene.h's patCtxFromHit), but a *field* formula — an isosurface leaf, a medium
+// density/ior program, a camera_curve driver — has no Hit at all: its evaluator makes a
+// bare PatCtx per query, so it has to carry the tables separately and splice them in.
+// Hence this struct, threaded through the field/medium evaluators as one parameter
+// (never as loose pointers) for the same reason DPatEnv exists on the device: the list
+// grows, and every growth would otherwise touch a dozen signatures.
+//
+// Deliberately NOT stored inside Implicit/Medium: these are pointers into Scene's
+// vectors, and a Scene is copied and moved (buildCornell returns by value), so a cached
+// copy would dangle. The owner passes them at the call.
+struct PatTables {
+    const PatGrid*    grids    = nullptr; int nGrids    = 0;
+    const PatScatter* scatters = nullptr; int nScatters = 0;
+    const float*      dataPool = nullptr; int dataPoolN = 0;
+};
+// Splice the tables into a freshly built PatCtx. Null is a no-op, which keeps every
+// evaluator's `const PatTables* = nullptr` default meaning "no tables in scope".
+inline void patBindTables(PatCtx& c, const PatTables* t) {
+    if (!t) return;
+    c.grids     = t->grids;    c.nGrids    = t->nGrids;
+    c.scatters  = t->scatters; c.nScatters = t->nScatters;
+    c.dataPool  = t->dataPool; c.dataPoolN = t->dataPoolN;
+}
+
 // Compile-time texture-name resolution for `tex:<name>(u, v)`. A value site passes
 // one of these to compilePatternExpr exactly when a texture table will be in scope
 // at evaluation time; passing nothing (the default) makes `tex:` a scope ERROR
@@ -440,7 +466,15 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
             }
             case PatOp::Grid: {
                 int gi = (int)nd.a;
-                if (gi < 0 || gi >= c.nGrids || !c.grids) { st[sp++] = 0.0; break; }
+                // A resolved index always names a live table: the compiler accepts
+                // `grid:` only where a PatTableScope was in scope, and that scope is the
+                // same Scene these headers come from. So this guard can only fire if an
+                // evaluation SITE forgot to bind them (patBindTables / bindPatData) — a
+                // wiring bug, not an authoring one. Bail out of the whole program instead
+                // of pushing a placeholder: the operand count is the table's own `ndim`,
+                // which is exactly what can't be read here, so a push would leave the
+                // stack unbalanced and quietly return a COORDINATE as the result.
+                if (!c.grids || gi < 0 || gi >= c.nGrids) return 0.0;
                 const PatGrid& g = c.grids[gi];
                 int nd2 = g.ndim < 1 ? 1 : (g.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : g.ndim);
                 double co[PAT_ND_MAX_DIM];
@@ -450,7 +484,7 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
             }
             case PatOp::Scatter: {
                 int si = (int)nd.a;
-                if (si < 0 || si >= c.nScatters || !c.scatters) { st[sp++] = 0.0; break; }
+                if (!c.scatters || si < 0 || si >= c.nScatters) return 0.0;  // see Grid
                 const PatScatter& sc = c.scatters[si];
                 int nd2 = sc.ndim < 1 ? 1 : (sc.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : sc.ndim);
                 double co[PAT_ND_MAX_DIM];
@@ -633,9 +667,10 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
                     std::string nm = id.substr(tablePrefixLen(kind));
                     if (!tables) {
                         err = what + " sample '" + id + "' is out of scope here — a " + what +
-                              " can only be sampled where a scene " + what + " table exists "
-                              "(material / pattern / record expressions), not in an implicit "
-                              "field formula, a medium density/ior program, or a load-time "
+                              " can only be sampled where the scene's " + what + " tables are "
+                              "reachable at evaluation time (material / pattern / record "
+                              "expressions, isosurface and `function` field formulas, medium "
+                              "density/ior programs, camera_curve drivers), not at a load-time "
                               "constant site";
                         return false;
                     }

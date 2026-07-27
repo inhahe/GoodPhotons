@@ -1139,6 +1139,54 @@ static int checkGrid() {
         }
     }
 
+    // ---- (f) the not-found guard ABANDONS the program, it does not corrupt the stack --
+    // A `grid:` node whose tables aren't bound used to push 0 WITHOUT popping its
+    // operands, so patternEval returned st[0] — the first COORDINATE — as the sample.
+    // That was reachable for real (`medium { density pattern:<p> }` copies a
+    // table-scoped pattern's nodes into a medium), and it silently rendered a mirrored
+    // field. Pin it: an unbound table evaluates to 0, never to a coordinate.
+    {
+        struct Unbound { const char* expr; double u, v; };
+        const Unbound ubs[] = {
+            {"grid:ramp(u)",    0.8, 0.0},     // stack-corrupt answer would be 0.8
+            {"grid:tbl(u, v)",  0.7, 1.0},     // ... and 0.7 for the 2-D call
+        };
+        for (const Unbound& b : ubs) {
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(b.expr, prog, perr, false, nullptr, &scope)) {
+                std::printf("[checkgrid] compile `%s` FAILED: %s\n", b.expr, perr.c_str());
+                ok = false; continue;
+            }
+            PatCtx c;
+            c.u = b.u; c.v = b.v;                       // grids deliberately left unbound
+            c.dataPool = pool.data(); c.dataPoolN = (int)pool.size();
+            char lbl[96];
+            std::snprintf(lbl, sizeof lbl, "unbound `%s` -> 0, not a coord", b.expr);
+            ok &= chk(lbl, patternEval(prog.data(), (int)prog.size(), c), 0.0, 1e-12);
+        }
+    }
+
+    // ---- (g) end-to-end through a medium's density field ---------------------
+    // `density "grid:ramp(x)"` is a SAMPLED volume, and Scene::patTables() is the view
+    // that carries the tables all the way to Medium::densityAt. Verify the hand-off,
+    // and that omitting it fails as a clean 0 rather than as the x coordinate.
+    {
+        Scene sc;
+        sc.dataPool.assign(pool.begin(), pool.end());
+        sc.grids.push_back(gClamp);                     // index 0 == "ramp" in `scope`
+        sc.grids.push_back(g23);                        // index 1 == "tbl"
+        Medium med; std::string perr;
+        if (!compilePatternExpr("grid:ramp(x)", med.density, perr, false, nullptr, &scope)) {
+            std::printf("[checkgrid] compile medium density FAILED: %s\n", perr.c_str());
+            ok = false;
+        } else {
+            const PatTables tabs = sc.patTables();
+            const Vec3 p(0.8, 0.0, 0.0);                // ramp(0.8) = 0.25 + 0.8*0.5
+            ok &= chk("medium density `grid:ramp(x)`", med.densityAt(p, &tabs), 0.65, 1e-6);
+            ok &= chk("medium density, tables omitted", med.densityAt(p, nullptr), 0.0, 1e-12);
+        }
+    }
+
     std::printf("[checkgrid] worst absolute error = %.3g\n", worst);
     std::printf("[checkgrid] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
@@ -4643,7 +4691,8 @@ static int run(int argc, char** argv) {
             const Implicit& im = scene.implicits[k];
             std::string name = im.name.empty() ? ("isosurface_" + std::to_string(k)) : im.name;
             isomesh::Options mo; mo.res = std::max(2, exportMeshRes);
-            isomesh::Mesh m = isomesh::marchImplicit(im, mo);
+            const PatTables tabs = scene.patTables();
+            isomesh::Mesh m = isomesh::marchImplicit(im, mo, &tabs);
             watertight::Report r = watertight::check(m.pos, m.tri);
             report("isosurface", name, im.matId, r);
         }
@@ -4678,7 +4727,8 @@ static int run(int argc, char** argv) {
         for (size_t k = 0; k < scene.implicits.size(); ++k) {
             const Implicit& im = scene.implicits[k];
             std::string name = im.name.empty() ? ("isosurface_" + std::to_string(k)) : im.name;
-            airtight::Report r = airtight::check(im, airtightRays, 0x9E3779B97F4A7C15ull + k);
+            const PatTables tabs = scene.patTables();
+            airtight::Report r = airtight::check(im, airtightRays, 0x9E3779B97F4A7C15ull + k, &tabs);
             bool glass = dielectric(im.matId);
             if (r.degenerate) {
                 std::printf("  [SKIP] \"%s\"  degenerate/unbounded container — no valid chords\n",
@@ -4744,7 +4794,8 @@ static int run(int argc, char** argv) {
         for (size_t k = 0; k < scene.implicits.size(); ++k) {
             std::printf("[export-mesh] marching isosurface %zu/%zu at res %d ...\n",
                         k + 1, scene.implicits.size(), mo.res);
-            isomesh::Mesh m = isomesh::marchImplicit(scene.implicits[k], mo);
+            const PatTables tabs = scene.patTables();
+            isomesh::Mesh m = isomesh::marchImplicit(scene.implicits[k], mo, &tabs);
             std::printf("[export-mesh]   marched: %zu verts, %zu tris\n",
                         m.pos.size(), m.tri.size() / 3);
             if (mo.adaptive && !m.tri.empty()) {

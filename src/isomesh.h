@@ -59,7 +59,12 @@ struct Mesh {
 };
 
 // ---- Uniform marching tetrahedra over one implicit (container-capped) -------
-inline Mesh marchImplicit(const Implicit& im, const Options& opt) {
+// `tabs` publishes the scene's grid:/scatter: tables, so an isosurface whose field
+// formula samples a measured volume polygonises the SAME surface the ray tracer
+// sphere-traces. Pass scene.patTables(); omitting it on a sampling field would
+// march a field that evaluates to 0 everywhere (patternEval bails).
+inline Mesh marchImplicit(const Implicit& im, const Options& opt,
+                          const PatTables* tabs = nullptr) {
     Mesh m;
     Aabb capBox = im.bounds;              // sampling domain (= container AABB); caps here
     Vec3 ext0 = capBox.hi - capBox.lo;
@@ -112,7 +117,7 @@ inline Mesh marchImplicit(const Implicit& im, const Options& opt) {
     // see-through look), bounded only where the field exits the sampling lattice.
     const bool doCap = im.capped;
     auto augEval = [&](const Vec3& p)->double {
-        double f = im.eval(p);
+        double f = im.eval(p, tabs);
         return doCap ? std::max(f, contSDF(p)) : f;
     };
     double eps = maxe / std::max(NX, std::max(NY, NZ)) * 0.5;

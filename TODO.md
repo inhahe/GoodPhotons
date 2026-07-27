@@ -2919,6 +2919,34 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-26: **0.78.0 — `grid:`/`scatter:` reach the field formulas, and the not-found guard no longer
+  corrupts the eval stack.** Authored-data tables were compile-legal only in *pattern* sites; now the
+  FTSL builder also passes `&tableScope_` at the `function` field leaf, a medium's `density` and `ior`
+  programs, and `camera_curve` drivers — so `expr "grid:terrain(x, z) - y"` is a measured height field,
+  `ior "1 + grid:n(x, y, z)"` a measured GRIN profile. (`tex:` stays a compile error there: it needs a
+  hit's u,v, which a field formula has none of.) Evaluation was the real work: a compiled `PatOp::Grid`
+  node holds an index into `Scene::grids`, so a non-owning `PatTables` view (`Scene::patTables()`;
+  device `dPatEnvOf`) is threaded as a **parameter** through `Implicit::eval`/`gradient`,
+  `intersectImplicit`, `estimateFieldLipschitz`, `Medium::densityAt`/`nAt`/`gradNAt`/`insideBound`,
+  the GRIN marcher, `isomesh::marchImplicit` and `airtight::check` — never a member, since a `Scene`
+  is copied and moved and a stored view would dangle. The multi-medium wrappers were retyped from
+  `media` to the whole `Scene`/`DScene` (18 host + 24 device call sites) so no caller can *forget* the
+  tables. The load-time consumers get them too: the Lipschitz bound, the majorant-density scan and the
+  `boundInsideNeg` sign test all previously read a grid-driven field as identically 0. **This was a
+  live wrong render, not latent debt:** `medium { density pattern:<p> }` copies a table-scoped
+  pattern's nodes into a medium that was evaluated without tables, and the guard pushed 0 *without
+  popping its operands*, so `patternEval` returned the first **coordinate** as the sample. Proven with
+  a descending grid (`data { 1 0 }`) whose analytic twin is `density "1 - x"`: before the fix the two
+  renders were mirror images, after it they are byte-identical (`mean|d|=0.000`) on **both** backends
+  while the mirrored comparison is far off. Both guards now `return 0` — abandoning the whole program
+  is the only balanced option, since the operand count is the missing table's own `ndim`. The FP32
+  device VM's `Tex`/`Grid`/`Scatter` stubs were implemented at the same time (promote/demote around
+  the double-only samplers, as `PovFn` already did). Pinned by two new `-checkgrid` sections — an
+  unbound table evaluates to **0, never to a coordinate**, and `Medium::densityAt` fed
+  `Scene::patTables()` returns the sample while omitting the tables returns a clean 0 — and by a
+  matching isosurface pair (`scraps/gridiso{,_ref}.ftsl`, a 2×2 lattice holding a bilinear plane;
+  agrees to the grid pool's float storage, ~7e-9 m of silhouette, on both backends). New worked
+  example `scenes/grid_field.ftsl` exercises both new sites at once.
 - 2026-07-26: **0.77.1 — a missing `-o` directory no longer eats the whole render.** `known-issues.md`'s
   oldest papercut (hit twice): `-o png/nope/out.png` traced every photon, printed `error: could not write …`
   at each `-interval` tick, and exited with nothing — the film was reachable only by the writers, which run

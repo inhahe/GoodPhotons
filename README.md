@@ -1717,6 +1717,17 @@ or a native-primitive wrap — see below). Two authoring forms:
   characteristic plateau), and `power` is the locality knob: low values blend broadly,
   high values approach a nearest-neighbour/Voronoi look. Self-test `ftrace -checkscatter`,
   worked example `scenes/pattern_scatter.ftsl`.
+  Unlike `tex:`, a table sample needs no surface — only coordinates — so `grid:`/`scatter:`
+  are legal in **scalar field formulas** too: an isosurface / CSG `function { expr }` leaf
+  (`expr "grid:terrain(x, z) - y"` is a measured height field), a medium's `density`
+  program (a measured volume without going through `vdb:`), a medium's `ior` program
+  (`ior "1 + grid:n(x, y, z)"` — a measured refractive-index profile that bends rays, see
+  GRIN media), and a `camera_curve` driver (`fov_from lens.fov(grid:zoom(t))`). Everything
+  downstream reads the same tables: the isosurface polygoniser, the sphere-trace Lipschitz
+  bound, the medium's majorant scan and the GRIN marcher. Only a **load-time constant**
+  site — evaluated before the tables are visible — remains a compile error. Worked example
+  `scenes/grid_field.ftsl` (a 5×5 lattice as an isosurface height field, plus a 1-D
+  profile as a medium's density).
 - **Inline array literal** — a tiny table written *where it is used*, with no block, no
   name and no `pattern` wrapper: `roughness [0.05 0.4 0.05](u)`. The `[ … ]` is the data
   and **nesting is the shape** (axis 0 outermost, C order, as in a `grid`'s `data`), so a

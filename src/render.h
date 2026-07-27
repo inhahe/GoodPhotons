@@ -352,8 +352,12 @@ struct Renderer {
     // dMax first. Delta (Woodcock) tracking for a heterogeneous medium: candidate
     // collisions at rate sigma_max, accepted as real with prob sigmaT(x)/sigma_max
     // (a rejected "null collision" just continues) — unbiased, throughput unchanged.
+    // `tabs` are the scene's grid:/scatter: tables, required (not defaulted) so a
+    // density program that samples a measured volume can never be silently evaluated
+    // without them — the two wrappers below are the only callers and both have a Scene.
     bool sampleMediumCollision(const Medium& med, const Vec3& o, const Vec3& dir,
-                               double dMax, double lambda, Pcg32& rng, double& tHit) const {
+                               double dMax, double lambda, Pcg32& rng, double& tHit,
+                               const PatTables* tabs) const {
         double stBase = med.sigmaT(lambda);
         if (stBase <= 0.0) return false;
         double ta, tb;
@@ -369,7 +373,7 @@ struct Renderer {
         for (;;) {
             t += -std::log(1.0 - rng.uniform()) / sigMax;
             if (t >= tb) return false;
-            double sigT = stBase * med.densityAt(o + dir * t);
+            double sigT = stBase * med.densityAt(o + dir * t, tabs);
             if (rng.uniform() * sigMax < sigT) { tHit = t; return true; }  // real collision
         }                                                                 // else null collision
     }
@@ -378,7 +382,8 @@ struct Renderer {
     // homogeneous medium (clipped to its bound); ratio tracking otherwise (candidate
     // collisions at rate sigma_max, each scaling the estimate by 1 - sigmaT(x)/sigma_max).
     double mediumTransmittance(const Medium& med, const Vec3& o, const Vec3& dir,
-                               double dist, double lambda, Pcg32& rng) const {
+                               double dist, double lambda, Pcg32& rng,
+                               const PatTables* tabs) const {
         double stBase = med.sigmaT(lambda);
         if (stBase <= 0.0) return 1.0;
         double ta, tb;
@@ -391,7 +396,7 @@ struct Renderer {
         for (;;) {
             t += -std::log(1.0 - rng.uniform()) / sigMax;
             if (t >= tb) break;
-            double sigT = stBase * med.densityAt(o + dir * t);
+            double sigT = stBase * med.densityAt(o + dir * t, tabs);
             Tr *= 1.0 - sigT / sigMax;
         }
         return Tr;
@@ -414,13 +419,20 @@ struct Renderer {
 
     // Earliest real collision across all media within [0,dMax]. On a hit, `tHit` is the
     // distance and `whichMed` the index of the scattering medium. false if none.
-    bool sampleMediaCollision(const std::vector<Medium>& media, const Vec3& o,
+    //
+    // Takes the whole Scene rather than just `scene.media` because a density program may
+    // sample the scene's `grid:`/`scatter:` tables (`density "grid:rho(x, y, z)"`), which
+    // live beside the media in the Scene. Deriving the tables here means no caller can
+    // forget to pass them — and every caller already had the Scene in hand.
+    bool sampleMediaCollision(const Scene& scene, const Vec3& o,
                               const Vec3& dir, double dMax, double lambda, Pcg32& rng,
                               double& tHit, int& whichMed) const {
+        const std::vector<Medium>& media = scene.media;
+        const PatTables tabs = scene.patTables();
         double best = dMax; int which = -1;
         for (int i = 0; i < (int)media.size(); ++i) {
             double t;
-            if (sampleMediumCollision(media[i], o, dir, dMax, lambda, rng, t) && t < best) {
+            if (sampleMediumCollision(media[i], o, dir, dMax, lambda, rng, t, &tabs) && t < best) {
                 best = t; which = i;
             }
         }
@@ -429,11 +441,12 @@ struct Renderer {
     }
 
     // Combined transmittance through all media = product of per-medium transmittances.
-    double mediaTransmittance(const std::vector<Medium>& media, const Vec3& o,
+    double mediaTransmittance(const Scene& scene, const Vec3& o,
                               const Vec3& dir, double dist, double lambda, Pcg32& rng) const {
+        const PatTables tabs = scene.patTables();   // see sampleMediaCollision
         double Tr = 1.0;
-        for (const Medium& m : media) {
-            Tr *= mediumTransmittance(m, o, dir, dist, lambda, rng);
+        for (const Medium& m : scene.media) {
+            Tr *= mediumTransmittance(m, o, dir, dist, lambda, rng, &tabs);
             if (Tr <= 0.0) break;
         }
         return Tr;
@@ -496,7 +509,7 @@ struct Renderer {
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
         if (!scene.media.empty())
-            contrib *= mediaTransmittance(scene.media, p, g.wdir, g.dist, lambda, rng);
+            contrib *= mediaTransmittance(scene, p, g.wdir, g.dist, lambda, rng);
         film.add(g.px, g.py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -513,7 +526,7 @@ struct Renderer {
             double f = rho[i] / PI;
             double contrib = beta[i] * f * g.cosSurf * g.corr / g.denom * g.stG;
             if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene.media, p, g.wdir, g.dist, lam[i], rng);
+                contrib *= mediaTransmittance(scene, p, g.wdir, g.dist, lam[i], rng);
             film.add(g.px, g.py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -537,7 +550,7 @@ struct Renderer {
         double Lambda = med.albedo(lambda);
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
-        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);   // fog transmittance (all media)
+        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);   // fog transmittance (all media)
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -598,7 +611,7 @@ struct Renderer {
         // land mid-tone at ABS_EXPOSURE_GAIN, matching B.
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         if (!scene.media.empty())
-            contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
+            contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -635,7 +648,7 @@ struct Renderer {
             double contrib = beta[i] * rho[i] * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
             contrib *= cellNorm;
             if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene.media, p, wdir, dist, lam[i], rng);
+                contrib *= mediaTransmittance(scene, p, wdir, dist, lam[i], rng);
             film.add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -668,7 +681,7 @@ struct Renderer {
         // matches B's absolute scale in absolute-EV modes (per-camera constant; auto-
         // exposed scenes unaffected).
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);   // all media
+        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);   // all media
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -689,7 +702,7 @@ struct Renderer {
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * (1.0 / (4.0 * PI)) / (dist2 * omega);
-        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
+        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -713,7 +726,7 @@ struct Renderer {
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
         double contrib = beta * (1.0 / (4.0 * PI)) * cosLens * (PI * R * R) / (dist * dist);
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
+        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -984,8 +997,8 @@ struct Renderer {
             // Fog transmittance on the two outer (vacuum-side) segments only; the
             // interior segment is solid glass (its absorption is the Beer-Lambert above).
             if (!scene.media.empty()) {
-                contrib *= mediaTransmittance(scene.media, p,     wP, dP2, lambda, rng);
-                contrib *= mediaTransmittance(scene.media, ch.P1, wE, dE,  lambda, rng);
+                contrib *= mediaTransmittance(scene, p,     wP, dP2, lambda, rng);
+                contrib *= mediaTransmittance(scene, ch.P1, wE, dE,  lambda, rng);
             }
             film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
         }
@@ -1135,7 +1148,7 @@ struct Renderer {
 
             // Fog transmittance on the exterior segment only (interior is solid glass).
             if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene.media, p, wP, dP, lambda, rng);
+                contrib *= mediaTransmittance(scene, p, wP, dP, lambda, rng);
 
             film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
         }
@@ -1567,7 +1580,7 @@ struct Renderer {
             // scatter independently below — so skip the analog collision sampling here.
             if (!scene.media.empty() && !doBeamGather) {
                 double tMed; int which;
-                if (sampleMediaCollision(scene.media, ray.o, ray.d, dSurf, lambda, rng, tMed, which)) {
+                if (sampleMediaCollision(scene, ray.o, ray.d, dSurf, lambda, rng, tMed, which)) {
                     dEvent = tMed; mediumEvent = true; scatterMed = which; mp = ray.o + ray.d * tMed;
                 }
             }
@@ -1619,7 +1632,7 @@ struct Renderer {
                     for (int c = 0; c < nCam; ++c) {
                         if (!(cams[c].cam && cams[c].film)) continue;
                         double tC; int whichC;
-                        if (!sampleMediaCollision(scene.media, ray.o, ray.d, dSurf, lambda, crng, tC, whichC))
+                        if (!sampleMediaCollision(scene, ray.o, ray.d, dSurf, lambda, crng, tC, whichC))
                             continue;   // this camera saw no in-scatter along this beam
                         Vec3 xc = ray.o + ray.d * tC;
                         double betaC = (aC > 0.0) ? betaPre * std::exp(-aC * tC) : betaPre;
@@ -1634,7 +1647,7 @@ struct Renderer {
                 // dimmed direct light; the removed energy (out-scattered + absorbed) is booked
                 // as absorbed. The photon then continues STRAIGHT to the surface below.
                 double before = beta;
-                beta *= mediaTransmittance(scene.media, ray.o, ray.d, dSurf, lambda, crng);
+                beta *= mediaTransmittance(scene, ray.o, ray.d, dSurf, lambda, crng);
                 e.absorbed += (before - beta);
             }
 

@@ -1209,7 +1209,7 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       const DPatEnv& env);
 __device__ static double dFieldEval(const DFieldNode* nodes, int n,
                                     double pwx, double pwy, double pwz,
-                                    const PatNode* exprPool);
+                                    const PatNode* exprPool, const DPatEnv& env);
 
 // IEEE-754 binary16 -> binary32 (device twin of halfBitsToFloat in vdbgrid.h).
 // The uploaded VDB lattice is fp16; this decodes it in the hot density sampler.
@@ -1279,9 +1279,9 @@ __device__ static double dVdbSample(const DVdbGrid& g, const DVec3& p) {
 // Dimensionless density multiplier at a world point (>= 0). Device twin of
 // Medium::densityAt: the shared pattern VM with x y z r live (f/normal/uv read 0).
 // For an implicit bound the multiplier is 0 outside the field (medium absent there).
-__device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
+__device__ static double dMedDensityAt(const DMedium& m, const DVec3& p, const DPatEnv& env) {
     if (m.boundShape == 2 && m.boundField) {   // implicit-field membership carve-out
-        double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr);
+        double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr, env);
         bool inside = m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
         if (!inside) return 0.0;
     }
@@ -1291,7 +1291,7 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, dPatEnvNone());
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, env);
     return d > 0.0 ? d : 0.0;
 }
 
@@ -1372,7 +1372,7 @@ __device__ static bool dMedClip(const DMedium& m, const DVec3& o, const DVec3& d
 // with the CPU marcher (grin.h) so CPU and GPU bend rays identically.
 
 // Point-in-bound membership (device twin of Medium::insideBound).
-__device__ static bool dMedInside(const DMedium& m, const DVec3& p) {
+__device__ static bool dMedInside(const DMedium& m, const DVec3& p, const DPatEnv& env) {
     if (!m.bounded) return true;
     if (m.boundShape == 1) {   // sphere
         double dx = (double)p.x - m.bcenter.x, dy = (double)p.y - m.bcenter.y,
@@ -1380,7 +1380,7 @@ __device__ static bool dMedInside(const DMedium& m, const DVec3& p) {
         return dx * dx + dy * dy + dz * dz <= m.bradius * m.bradius;
     }
     if (m.boundShape == 2 && m.boundField) {   // implicit field
-        double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr);
+        double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr, env);
         return m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
     }
     return p.x >= m.bmin.x && p.x <= m.bmax.x && p.y >= m.bmin.y &&
@@ -1389,23 +1389,24 @@ __device__ static bool dMedInside(const DMedium& m, const DVec3& p) {
 
 // Local refractive index n at a world point (device twin of Medium::nAt): the shared
 // pattern VM with x y z r live, floored at 1e-3. 1.0 when this medium is not GRIN.
-__device__ static double dMedNAt(const DMedium& m, const DVec3& p) {
+__device__ static double dMedNAt(const DMedium& m, const DVec3& p, const DPatEnv& env) {
     if (m.iorN <= 0 || !m.ior) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double n = dPatternEval(m.ior, m.iorN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, dPatEnvNone());
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, env);
     return n > 1e-3 ? n : 1e-3;
 }
 
 // ∇n at a world point via central differences with step h (device twin of Medium::gradNAt).
-__device__ static DVec3 dMedGradN(const DMedium& m, const DVec3& p, double h) {
+__device__ static DVec3 dMedGradN(const DMedium& m, const DVec3& p, double h,
+                                  const DPatEnv& env) {
     double inv = 0.5 / h;
     DVec3 xp = p, xm = p; xp.x = (Real)(p.x + h); xm.x = (Real)(p.x - h);
     DVec3 yp = p, ym = p; yp.y = (Real)(p.y + h); ym.y = (Real)(p.y - h);
     DVec3 zp = p, zm = p; zp.z = (Real)(p.z + h); zm.z = (Real)(p.z - h);
-    double gx = dMedNAt(m, xp) - dMedNAt(m, xm);
-    double gy = dMedNAt(m, yp) - dMedNAt(m, ym);
-    double gz = dMedNAt(m, zp) - dMedNAt(m, zm);
+    double gx = dMedNAt(m, xp, env) - dMedNAt(m, xm, env);
+    double gy = dMedNAt(m, yp, env) - dMedNAt(m, ym, env);
+    double gz = dMedNAt(m, zp, env) - dMedNAt(m, zm, env);
     return DVec3{ (Real)(gx * inv), (Real)(gy * inv), (Real)(gz * inv) };
 }
 
@@ -1416,7 +1417,8 @@ __device__ static DVec3 dMedGradN(const DMedium& m, const DVec3& p, double h) {
 // Renderer::sampleMediumCollision: exact analytic free-flight (one draw) for a
 // homogeneous medium (bit-identical to before), else delta (Woodcock) tracking.
 __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, const DVec3& dir,
-                                           Real dMax, Real lambda, DRng& rng, Real& tHit) {
+                                           Real dMax, Real lambda, DRng& rng, Real& tHit,
+                                           const DPatEnv& env) {
     double stBase = (double)medSigmaT(m, lambda);
     if (stBase <= 0.0) return false;
     double ta, tb;
@@ -1433,7 +1435,7 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
         t += -log(1.0 - (double)rng.uniform()) / sigMax;
         if (t >= tb) return false;
         DVec3 pp = o + dir * (Real)t;
-        double sigT = stBase * dMedDensityAt(m, pp);
+        double sigT = stBase * dMedDensityAt(m, pp, env);
         if ((double)rng.uniform() * sigMax < sigT) { tHit = (Real)t; return true; }
     }
 }
@@ -1442,7 +1444,8 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
 // Renderer::mediumTransmittance: exact exp for a homogeneous medium (no RNG draw), else
 // ratio tracking. Homogeneous scenes therefore keep the exact analytic transmittance.
 __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const DVec3& dir,
-                                         Real dist, Real lambda, DRng& rng) {
+                                         Real dist, Real lambda, DRng& rng,
+                                         const DPatEnv& env) {
     double stBase = (double)medSigmaT(m, lambda);
     if (stBase <= 0.0) return (Real)1;
     double ta, tb;
@@ -1455,7 +1458,7 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
         t += -log(1.0 - (double)rng.uniform()) / sigMax;
         if (t >= tb) break;
         DVec3 pp = o + dir * (Real)t;
-        double sigT = stBase * dMedDensityAt(m, pp);
+        double sigT = stBase * dMedDensityAt(m, pp, env);
         Tr *= 1.0 - sigT / sigMax;
     }
     return (Real)Tr;
@@ -1467,13 +1470,18 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
 // per-medium transmittances, and the first collision across all media is the EARLIEST
 // of their independent free-flight samples (Poisson superposition). With one medium
 // these reduce to the exact single-medium paths above.
-__device__ static bool dMediaSampleCollision(const DMedium* media, int n, const DVec3& o,
+// Take the whole DScene (not just media[0..n)) because a density program may sample the
+// scene's grid:/scatter: tables, which live beside the media — same reasoning as the
+// host's Renderer::sampleMediaCollision, and it means no call site can forget them.
+__device__ static bool dMediaSampleCollision(const DScene& sc, const DVec3& o,
                                              const DVec3& dir, Real dMax, Real lambda,
                                              DRng& rng, Real& tHit, int& whichMed) {
+    const DMedium* media = sc.media; const int n = sc.mediaN;
+    const DPatEnv env = dPatEnvOf(sc);
     Real best = dMax; int which = -1;
     for (int i = 0; i < n; ++i) {
         Real t;
-        if (dMedSampleCollision(media[i], o, dir, dMax, lambda, rng, t) && t < best) {
+        if (dMedSampleCollision(media[i], o, dir, dMax, lambda, rng, t, env) && t < best) {
             best = t; which = i;
         }
     }
@@ -1481,11 +1489,12 @@ __device__ static bool dMediaSampleCollision(const DMedium* media, int n, const 
     tHit = best; whichMed = which; return true;
 }
 
-__device__ static Real dMediaTransmittance(const DMedium* media, int n, const DVec3& o,
+__device__ static Real dMediaTransmittance(const DScene& sc, const DVec3& o,
                                            const DVec3& dir, Real dist, Real lambda, DRng& rng) {
+    const DPatEnv env = dPatEnvOf(sc);       // see dMediaSampleCollision
     Real Tr = (Real)1;
-    for (int i = 0; i < n; ++i) {
-        Tr *= dMedTransmittance(media[i], o, dir, dist, lambda, rng);
+    for (int i = 0; i < sc.mediaN; ++i) {
+        Tr *= dMedTransmittance(sc.media[i], o, dir, dist, lambda, rng, env);
         if (Tr <= (Real)0) break;
     }
     return Tr;
@@ -1651,10 +1660,15 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
 __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float x, float y, float z, float f,
                                       float nx, float ny, float nz, float r,
-                                      float u, float v);
+                                      float u, float v, const DPatEnv& env);
 
+// `env` publishes the scene's texture/grid/scatter tables so a DF_EXPR leaf can BE a
+// sampled volume or height field (`function { expr "grid:terrain(x, z) - y" }`), exactly
+// as the host's fieldLeafSDF takes a PatTables. Pass dPatEnvOf(sc), never dPatEnvNone(),
+// at any site reachable from a real scene: a `grid:` node evaluated without its table
+// makes patternEval bail to 0, i.e. an empty field.
 __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double py, double pz,
-                                       const PatNode* exprPool) {
+                                       const PatNode* exprPool, const DPatEnv& env) {
     switch (nd.op) {
         case DF_SPHERE:
             return sqrt(px*px + py*py + pz*pz) - nd.p[0];
@@ -1662,7 +1676,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
             if (!exprPool) return BIG;
             double r = sqrt(px*px + py*py + pz*pz);
             return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r, 0.0, 0.0, dPatEnvNone());
+                                0.0, 0.0, 0.0, r, 0.0, 0.0, env);
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -1705,7 +1719,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
 // Whole-field SDF at world point (pw) via the postfix scalar stack. Mirrors fieldEval.
 __device__ static double dFieldEval(const DFieldNode* nodes, int n,
                                     double pwx, double pwy, double pwz,
-                                    const PatNode* exprPool) {
+                                    const PatNode* exprPool, const DPatEnv& env) {
     double st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const DFieldNode& nd = nodes[i];
@@ -1720,7 +1734,7 @@ __device__ static double dFieldEval(const DFieldNode* nodes, int n,
                 double plx = nd.inv[0]*pwx + nd.inv[1]*pwy + nd.inv[2]*pwz + nd.tx;
                 double ply = nd.inv[3]*pwx + nd.inv[4]*pwy + nd.inv[5]*pwz + nd.ty;
                 double plz = nd.inv[6]*pwx + nd.inv[7]*pwy + nd.inv[8]*pwz + nd.tz;
-                st[sp++] = dFieldLeafSDF(nd, plx, ply, plz, exprPool) * nd.scale;
+                st[sp++] = dFieldLeafSDF(nd, plx, ply, plz, exprPool, env) * nd.scale;
             }
         }
     }
@@ -1729,7 +1743,7 @@ __device__ static double dFieldEval(const DFieldNode* nodes, int n,
 // ---- FP32 twins of the field VM (see DFieldNodeF): used ONLY by the sphere-trace
 // march/refine in intersectImplicit, where the result is stored in float anyway.
 __device__ static float dFieldLeafSDFF(const DFieldNodeF& nd, float px, float py, float pz,
-                                       const PatNodeF* exprPool) {
+                                       const PatNodeF* exprPool, const DPatEnv& env) {
     switch (nd.op) {
         case DF_SPHERE:
             return sqrtf(px*px + py*py + pz*pz) - nd.p[0];
@@ -1737,7 +1751,7 @@ __device__ static float dFieldLeafSDFF(const DFieldNodeF& nd, float px, float py
             if (!exprPool) return (float)BIG;
             float r = sqrtf(px*px + py*py + pz*pz);
             return dPatternEvalF(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0f,
-                                 0.0f, 0.0f, 0.0f, r, 0.0f, 0.0f);
+                                 0.0f, 0.0f, 0.0f, r, 0.0f, 0.0f, env);
         }
         case DF_BOX: {
             float r = nd.p[3];
@@ -1779,7 +1793,7 @@ __device__ static float dFieldLeafSDFF(const DFieldNodeF& nd, float px, float py
 }
 __device__ static float dFieldEvalF(const DFieldNodeF* nodes, int n,
                                     float pwx, float pwy, float pwz,
-                                    const PatNodeF* exprPool) {
+                                    const PatNodeF* exprPool, const DPatEnv& env) {
     float st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const DFieldNodeF& nd = nodes[i];
@@ -1794,7 +1808,7 @@ __device__ static float dFieldEvalF(const DFieldNodeF* nodes, int n,
                 float plx = nd.inv[0]*pwx + nd.inv[1]*pwy + nd.inv[2]*pwz + nd.tx;
                 float ply = nd.inv[3]*pwx + nd.inv[4]*pwy + nd.inv[5]*pwz + nd.ty;
                 float plz = nd.inv[6]*pwx + nd.inv[7]*pwy + nd.inv[8]*pwz + nd.tz;
-                st[sp++] = dFieldLeafSDFF(nd, plx, ply, plz, exprPool) * nd.scale;
+                st[sp++] = dFieldLeafSDFF(nd, plx, ply, plz, exprPool, env) * nd.scale;
             }
         }
     }
@@ -1804,12 +1818,12 @@ __device__ static float dFieldEvalF(const DFieldNodeF* nodes, int n,
 __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
                                       double px, double py, double pz, double eps,
                                       double& gx, double& gy, double& gz,
-                                      const PatNode* exprPool) {
+                                      const PatNode* exprPool, const DPatEnv& env) {
     // stencil offsets k1(1,-1,-1) k2(-1,-1,1) k3(-1,1,-1) k4(1,1,1)
-    double f1 = dFieldEval(nodes, n, px + eps, py - eps, pz - eps, exprPool);
-    double f2 = dFieldEval(nodes, n, px - eps, py - eps, pz + eps, exprPool);
-    double f3 = dFieldEval(nodes, n, px - eps, py + eps, pz - eps, exprPool);
-    double f4 = dFieldEval(nodes, n, px + eps, py + eps, pz + eps, exprPool);
+    double f1 = dFieldEval(nodes, n, px + eps, py - eps, pz - eps, exprPool, env);
+    double f2 = dFieldEval(nodes, n, px - eps, py - eps, pz + eps, exprPool, env);
+    double f3 = dFieldEval(nodes, n, px - eps, py + eps, pz - eps, exprPool, env);
+    double f4 = dFieldEval(nodes, n, px + eps, py + eps, pz + eps, exprPool, env);
     gx =  f1 - f2 - f3 + f4;
     gy = -f1 - f2 + f3 + f4;
     gz = -f1 + f2 - f3 + f4;
@@ -1857,6 +1871,9 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     const DFieldNodeF* ndF = sc.fieldNodesF + im.nodeOff;
     const PatNodeF* exprPoolF = sc.fieldExprNodesF;
     const int N = im.nodeN;
+    // The scene's texture/grid/scatter tables, so a `function` leaf that samples a
+    // measured volume marches the real field (dPatEnvNone() would read 0 everywhere).
+    const DPatEnv env = dPatEnvOf(sc);
 
     // ---- Container clip: entry/exit params [tEnter, tExit] and the container's OUTWARD
     // normals at those crossings (needed to shade caps). Box (lo/hi) or world sphere.
@@ -1940,7 +1957,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     };
 
     float t = (float)t0;
-    float f = dFieldEvalF(ndF, N, oxF + dxF*t, oyF + dyF*t, ozF + dzF*t, exprPoolF);
+    float f = dFieldEvalF(ndF, N, oxF + dxF*t, oyF + dyF*t, ozF + dzF*t, exprPoolF, env);
     // NEAR CAP: ray enters the container already inside the solid (f<0); the container
     // face is the nearest surface. `open` skips this to reveal the cut edge.
     if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0f)
@@ -1950,7 +1967,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         float tn = t + step;
         bool last = false;
         if (tn >= t1F) { tn = t1F; last = true; }
-        float fn = dFieldEvalF(ndF, N, oxF + dxF*tn, oyF + dyF*tn, ozF + dzF*tn, exprPoolF);
+        float fn = dFieldEvalF(ndF, N, oxF + dxF*tn, oyF + dyF*tn, ozF + dzF*tn, exprPoolF, env);
         bool crossed = (f > 0.0f && fn <= 0.0f) || (f < 0.0f && fn >= 0.0f) || (f == 0.0f && fn != 0.0f);
         if (crossed) {
             float ta = t, tb = tn, fa = f, fb = fn;
@@ -1964,7 +1981,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
                     tm = 0.5f*(ta + tb);
                 }
                 if (tm <= ta || tm >= tb) break;   // float interval exhausted: converged
-                float fm = dFieldEvalF(ndF, N, oxF + dxF*tm, oyF + dyF*tm, ozF + dzF*tm, exprPoolF);
+                float fm = dFieldEvalF(ndF, N, oxF + dxF*tm, oyF + dyF*tm, ozF + dzF*tm, exprPoolF, env);
                 if ((fa > 0.0f) == (fm > 0.0f)) {
                     ta = tm; fa = fm;
                     if (regulaFalsi && rfSide == +1) fb *= 0.5f;
@@ -1979,7 +1996,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             if (th < tmin || th >= (double)hit.t) return false;
             double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
             double eps = fmax(1e-6, 1e-4*th);
-            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool);
+            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env);
             return writeHit(th, px, py, pz, gx, gy, gz);
         }
         if (last) {
@@ -2300,13 +2317,16 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd) {
     // lens matches CPU to ~the noise floor (see known-issues.md "mode-R GRIN radial caustic").
     double px = ro.x, py = ro.y, pz = ro.z;
     double dx = rd.x, dy = rd.y, dz = rd.z;
+    // Hoisted out of the (up to 10^5-iteration) march: three pointer copies, so an `ior`
+    // field can read a MEASURED index volume (`ior "1 + grid:n(x, y, z)"`).
+    const DPatEnv env = dPatEnvOf(sc);
     for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
         DVec3 cro{px, py, pz}, crd{dx, dy, dz};   // float snapshot for the geometry queries
         // GRIN region containing ro (first enabled GRIN membership), or -1.
         int gm = -1;
         for (int mi = 0; mi < sc.mediaN; ++mi) {
             const DMedium& md = sc.media[mi];
-            if (md.enabled && md.iorN > 0 && dMedInside(md, cro)) { gm = mi; break; }
+            if (md.enabled && md.iorN > 0 && dMedInside(md, cro, env)) { gm = mi; break; }
         }
         if (gm < 0) {
             // Outside any GRIN region: jump to the nearest GRIN entry before the next
@@ -2344,8 +2364,8 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd) {
         if (hs.valid && (double)hs.t <= ds) break;   // surface within a step
         // Symplectic Eikonal step with optical direction T = n·d (|T| = n):
         //   T += ∇n·ds ;  x += (T/n)·ds ;  d = T/|T|.
-        double n0 = dMedNAt(g, cro);
-        DVec3 grad = dMedGradN(g, cro, 0.5 * ds);
+        double n0 = dMedNAt(g, cro, env);
+        DVec3 grad = dMedGradN(g, cro, 0.5 * ds, env);
         double Tx = dx * n0 + (double)grad.x * ds;
         double Ty = dy * n0 + (double)grad.y * ds;
         double Tz = dz * n0 + (double)grad.z * ds;
@@ -2665,7 +2685,7 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * f * cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
-    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // `med` is the medium that scattered the photon (its phase/albedo); transmittance is
@@ -2686,7 +2706,7 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
     // scattering; normalise by dist^2 * pixelSolidAngle (rectilinear or fisheye).
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * Lambda * ph / (Real)((double)dist2 * solidAngle);
-    contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A (physical camera): next-event splat through the finite lens pupil. Sample a
@@ -2725,7 +2745,7 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     // mode B's radiance*camEq absolute scale. Per-camera constant; auto-exposed scenes
     // stay byte-identical, only absolute-EV A/C are re-seated to mid-tone at gain 6.
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
@@ -2755,7 +2775,7 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     // Same flux->film-irradiance normaliser as connectLens (see there); per-camera
     // constant, so auto-exposed scenes are unaffected.
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-    contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 
@@ -2896,7 +2916,7 @@ __device__ static void connectEmissionVolume(const DScene& sc, const DCamera& ca
     if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) / (Real)((double)dist2 * solidAngle);
-    contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A (finite-lens) isotropic emission splat — device twin of connectEmissionLensVolume.
@@ -2919,7 +2939,7 @@ __device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera
     if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) * cosLens * (Real)DPI * (R * R) / (dist * dist);
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-    contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 __device__ static void camSplatEmissionAll(const DScene& sc, const DCamSet& cs, int camMode,
@@ -3189,7 +3209,7 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
         DVec3 wPR = wP.toR();
         if (occluded(sc, (p + wP * 1e-6).toR(), wPR, (Real)(dP - 2e-6))) continue;
         if (sc.mediaN > 0)
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p.toR(), wPR, (Real)dP, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc, p.toR(), wPR, (Real)dP, lambda, rng);
 
         filmAdd(film, hits, cam.resX, px, py, lambda, (Real)contrib);
     }
@@ -3333,8 +3353,8 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         if (occluded(sc, (ch.P1 + wE * 1e-6).toR(), wER, (Real)(dE - 2e-6))) continue;
 
         if (sc.mediaN > 0) {
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p.toR(),   wPR, (Real)dP2, lambda, rng);
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, ch.P1.toR(), wER, (Real)dE, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc, p.toR(),   wPR, (Real)dP2, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc, ch.P1.toR(), wER, (Real)dE, lambda, rng);
         }
         filmAdd(film, hits, cam.resX, px, py, lambda, (Real)contrib);
     }
@@ -3662,7 +3682,14 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                 // __host__ __device__ sampler from pattern.h — there is no device
                 // re-implementation to drift from the host one.
                 int gi = (int)nd.a;
-                if (gi < 0 || gi >= env.nGrids || !env.grids) { st[sp++] = 0.0; break; }
+                // A resolved index always names a live table (the host compiler only
+                // accepts `grid:` where a table scope was in scope, and that scope is the
+                // same Scene this DScene was built from), so this can only fire if a call
+                // site passed dPatEnvNone() — a wiring bug. Bail out of the WHOLE program:
+                // the operand count is the table's own ndim, exactly what can't be read
+                // here, so pushing a placeholder would leave the stack unbalanced and
+                // silently return a COORDINATE as the result. Mirrors pattern.h.
+                if (gi < 0 || gi >= env.nGrids || !env.grids) return 0.0;
                 const PatGrid& g = env.grids[gi];
                 int gnd = g.ndim < 1 ? 1 : (g.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : g.ndim);
                 double co[PAT_ND_MAX_DIM];
@@ -3675,7 +3702,7 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                 // sampler — a scatter just resolves its value by inverse-distance blend
                 // instead of a lattice walk.
                 int si = (int)nd.a;
-                if (si < 0 || si >= env.nScatters || !env.scatters) { st[sp++] = 0.0; break; }
+                if (si < 0 || si >= env.nScatters || !env.scatters) return 0.0;  // see Grid
                 const PatScatter& s = env.scatters[si];
                 int snd = s.ndim < 1 ? 1 : (s.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : s.ndim);
                 double co[PAT_ND_MAX_DIM];
@@ -3722,7 +3749,7 @@ __device__ static float dPatValueNoiseF(float x, float y, float z) {
 __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float x, float y, float z, float f,
                                       float nx, float ny, float nz, float r,
-                                      float u, float v) {
+                                      float u, float v, const DPatEnv& env) {
     float st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const PatNodeF& nd = nodes[i];
@@ -3779,15 +3806,40 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                 st[sp++] = (float)povFnEval(id, args);
                 break;
             }
-            case PatOp::Tex: {   // unreachable: this VM only runs DF_EXPR field formulas,
-                --sp;            // and the host compiler rejects `tex:` outside a shading
-                st[sp-1] = 0.0f; // context. Handled explicitly so the switch stays total.
+            case PatOp::Tex: {   // args pushed as (u, v); the sampler is double-only, so
+                float vv = st[--sp];                       // promote / demote like PovFn
+                int   ti = (int)nd.a;
+                st[sp-1] = (env.tex && ti >= 0 && ti < env.nTex)
+                             ? (float)dTexScalarAt(env.tex[ti], (double)st[sp-1], (double)vv)
+                             : 0.0f;
                 break;
             }
-            case PatOp::Grid:      // likewise unreachable — `grid:`/`scatter:` need a table
-            case PatOp::Scatter:   // scope, which field formulas are never compiled with. The
-                st[sp++] = 0.0f;   // operand count is unknown here (it is the table's ndim),
-                break;             // so just push 0. See known-issues.md for the real fix.
+            case PatOp::Grid: {
+                // Arity is the GRID's own dimensionality, so the operands can only be
+                // popped once the header is in hand — which is why the not-found case must
+                // abandon the program rather than push a placeholder (see dPatternEval).
+                // patGridSample is the SHARED __host__ __device__ sampler from pattern.h;
+                // it is double-only, so coordinates are promoted and the result demoted,
+                // exactly as PatOp::PovFn does above.
+                int gi = (int)nd.a;
+                if (gi < 0 || gi >= env.nGrids || !env.grids) return 0.0f;
+                const PatGrid& g = env.grids[gi];
+                int gnd = g.ndim < 1 ? 1 : (g.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : g.ndim);
+                double co[PAT_ND_MAX_DIM];
+                for (int k = gnd - 1; k >= 0; --k) co[k] = (double)st[--sp];
+                st[sp++] = (float)patGridSample(g, env.dataPool, env.dataPoolN, co);
+                break;
+            }
+            case PatOp::Scatter: {   // same contract as Grid, inverse-distance blended
+                int si = (int)nd.a;
+                if (si < 0 || si >= env.nScatters || !env.scatters) return 0.0f;
+                const PatScatter& sc = env.scatters[si];
+                int snd = sc.ndim < 1 ? 1 : (sc.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : sc.ndim);
+                double co[PAT_ND_MAX_DIM];
+                for (int k = snd - 1; k >= 0; --k) co[k] = (double)st[--sp];
+                st[sp++] = (float)patScatterSample(sc, env.dataPool, env.dataPoolN, co);
+                break;
+            }
         }
     }
     return sp > 0 ? st[0] : 0.0f;
@@ -4347,7 +4399,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // exact analytic free-flight if homogeneous); the earliest collision wins and
         // its medium (scatterMed) drives the scatter. Device twin of sampleMediaCollision.
         Real tMed; int which;
-        if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, rng, tMed, which)) {
+        if (dMediaSampleCollision(sc, ro, rd, dSurf, lambda, rng, tMed, which)) {
             mediumEvent = true; scatterMed = which; mp = ro + rd * tMed; dEvent = tMed;
         }
     }
@@ -4392,7 +4444,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real aC = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
         for (int c = 0; c < cs.nCam; ++c) {
             Real tC; int whichC;
-            if (!dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, *crng, tC, whichC))
+            if (!dMediaSampleCollision(sc, ro, rd, dSurf, lambda, *crng, tC, whichC))
                 continue;   // this camera saw no in-scatter along this beam
             DVec3 xc = ro + rd * tC;
             Real betaC = (aC > 0) ? betaPre * exp(-aC * tC) : betaPre;
@@ -4408,7 +4460,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // scatter transmission) so surfaces behind the fog are correctly dimmed; the removed
         // energy (out-scattered + absorbed) is booked as absorbed. Then continue STRAIGHT.
         Real before = beta;
-        beta *= dMediaTransmittance(sc.media, sc.mediaN, ro, rd, dSurf, lambda, *crng);
+        beta *= dMediaTransmittance(sc, ro, rd, dSurf, lambda, *crng);
         eAbsorbed += (double)(before - beta);
     }
 
@@ -4516,7 +4568,7 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
     Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
     for (int i = 0; i < nUp; ++i) {
         Real contrib = beta[i] * (rho[i] / (Real)DPI) * geo;
-        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lam[i], rng);
+        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
     }
 }
@@ -4549,7 +4601,7 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
     Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG * cellNorm;
     for (int i = 0; i < nUp; ++i) {
         Real contrib = beta[i] * rho[i] * geo;
-        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lam[i], rng);
+        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
     }
 }
@@ -5571,7 +5623,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         // Matches the forward connectVolume / device volume-NEE transmittance so surface
         // direct light agrees between the forward and backward estimators.
         if (sc.mediaN > 0)
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, g.wi, g.dist, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lambda, rng);
         total += contrib;
     }
     return total;
@@ -5631,7 +5683,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             Real phase = dMedPhase(med, dot(wIn, wi), lambda);
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
             double contrib = (double)(alb * phase * fall / dist2) * emitW;
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, dist, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
             total += contrib;
             continue;
         }
@@ -5649,7 +5701,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         Real G = cosLight / dist2;                        // no surface cosine at a volume vertex
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
         double contrib = (double)(alb * phase * G) * emitW * (double)em.area;
-        contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, dist, lambda, rng);
+        contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
         total += contrib;
     }
     return total;
@@ -5710,7 +5762,7 @@ __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
     double contrib = ((double)rho / DPI) * Lenv * (double)g.cosSurf * invPdfLambda / g.pdfW
                      * g.wMis * (double)g.stG;
     if (sc.mediaN > 0)                                      // Beer-Lambert to the scene exit
-        contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, g.wi, (Real)g.farDist, lambda, rng);
+        contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, (Real)g.farDist, lambda, rng);
     return contrib;
 }
 
@@ -5763,7 +5815,7 @@ __device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const 
     Real phase = dMedPhase(med, dot(wIn, wi), lambda);      // phase == its own pdf (HG or rainbow)
     double wMis = pdfW / (pdfW + (double)phase);            // balance heuristic
     double contrib = (double)alb * (double)phase * Lenv * invPdfLambda / pdfW * wMis;
-    contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, (Real)farDist, lambda, rng);
+    contrib *= (double)dMediaTransmittance(sc, p, wi, (Real)farDist, lambda, rng);
     return contrib;
 }
 
@@ -5944,7 +5996,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // Mirrors backward.h radiance() so the two estimators agree.
         if (sc.mediaN > 0) {
             Real tMed; int whichMed;
-            if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, rng, tMed, whichMed)) {
+            if (dMediaSampleCollision(sc, ro, rd, dSurf, lambda, rng, tMed, whichMed)) {
                 DVec3 p = ro + rd * tMed;
                 int cm = stk.topMat();     // Beer-Lambert over the in-glass free-flight leg
                 Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
@@ -6712,7 +6764,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         double tMed = 0.0; bool mediumEvent = false; int scatterMed = -1;
         if (sc.mediaN > 0) {
             Real tm; int which;
-            if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, (Real)dSurf, lambda, rng, tm, which)) {
+            if (dMediaSampleCollision(sc, ro, rd, (Real)dSurf, lambda, rng, tm, which)) {
                 tMed = (double)tm; mediumEvent = true; scatterMed = which;
             }
         }
@@ -7209,7 +7261,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
         // Hero-only transmittance: the hero gate excludes any medium, so Tr is exactly 1
         // whenever nUp > 1.
-        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, qs.p, wcam, (Real)dist, lambda, rng) : 1.0;
+        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, qs.p, wcam, (Real)dist, lambda, rng) : 1.0;
         double G = fabs(cosSurf) * cosCam / dist2;
         L = qs.beta * f * G * dCameraWe(cam, cosCam) * Tr;
         for (int i = 0; i + 1 < nUp; ++i)
@@ -7285,7 +7337,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         double pdfA = pdfChoice / em.area;
         if (pdfA <= 0.0) return 0.0;
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
-        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, pt.p, wi, (Real)dist, lambda, rng) : 1.0;
+        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, pt.p, wi, (Real)dist, lambda, rng) : 1.0;
         double G = fabs(cosSurf) * cosLight / dist2;
         L = pt.beta * f * Le * G / pdfA * Tr;
         for (int i = 0; i + 1 < nUp; ++i)
@@ -7384,7 +7436,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             if (mxE <= 0.0 || mxL <= 0.0) return 0.0;
         }
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
-        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, pt.p, w, (Real)dist, lambda, rng) : 1.0;
+        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, pt.p, w, (Real)dist, lambda, rng) : 1.0;
         double G = fabs(cosE) * fabs(cosL) / dist2;
         L = pt.beta * fE * fL * qs.beta * G * Tr;
         for (int i = 0; i + 1 < nUp; ++i)

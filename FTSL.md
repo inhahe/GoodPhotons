@@ -470,13 +470,28 @@ including the **`reflect` slot** (§7.2), where `reflect [0 1](u)` is a greyscal
 
 **Scope and loading (both datatypes).** Grids and scatters load before textures, patterns
 and records, so declaration order never matters — including inside a procedural
-`texture { rgb "…" }`, which may sample either. Scope matches `tex:`: both are available
-in `pattern` blocks, procedural texture channels and record driver/stop/override
-expressions. Neither is *yet* available in scalar **field** formulas (isosurface
-`function { expr }`, medium `density`/`ior`, load-time constants), where a sample is a
-compile error rather than a silent zero — unlike `tex:`, that is a plumbing gap rather
-than a semantic one, tracked in `known-issues.md`. The two names live in **separate
-namespaces**: a grid called `foo` is not reachable as `scatter:foo`.
+`texture { rgb "…" }`, which may sample either. Scope is **wider than `tex:`'s**: on top of
+`pattern` blocks, procedural texture channels and record driver/stop/override expressions,
+both reach every scalar **field** formula —
+
+* an isosurface / CSG `function { expr }` leaf, so a field can *be* measured data:
+  `expr "grid:terrain(x, z) - y"` is a height field, `expr "grid:rho(x,y,z) - 0.5"` an
+  isosurface of a measured volume;
+* a medium's `density` program — `density "grid:rho(x, y, z)"` — a measured volume without
+  going through `vdb:`;
+* a medium's `ior` program — `ior "1 + grid:n(x, y, z)"` — a measured refractive-index
+  profile driving GRIN bending (§ media);
+* a `camera_curve` driver, so an authored table can steer a flyby: `fov_from lens.fov(grid:zoom(t))`.
+
+Unlike `tex:`, which needs a *surface* (a hit's `u`,`v`) and so stays a compile error at
+those sites, a table sample needs nothing but coordinates. Everything that consumes such a
+field uses the same tables the renderer does: the isosurface polygoniser, the sphere-trace
+Lipschitz estimate, the medium's majorant-density scan and the GRIN marcher. The one
+remaining exception is a **load-time constant** site, which is evaluated before any table
+view exists, and there a sample is a compile error. Worked example:
+`scenes/grid_field.ftsl` (a 5×5 lattice read as an isosurface height field, plus a 1-D
+profile read as a medium's density). The two names live in **separate namespaces**: a grid
+called `foo` is not reachable as `scatter:foo`.
 
 The whole path is shared with the GPU: the `PatGrid` / `PatScatter` headers and the one
 flat number pool they share upload verbatim and the device runs the *same* sampler

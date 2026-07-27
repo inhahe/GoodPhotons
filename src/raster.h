@@ -297,12 +297,15 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
             int T = (int)std::min<size_t>((size_t)nImp, (size_t)hw);
             std::atomic<int> next{0}, done{0};
             std::mutex progMx;
+            // Shared read-only table view (see Scene::patTables): every worker marches with
+            // the same one, so a sampled field polygonises identically across threads.
+            const PatTables tabs = sc.patTables();
             auto workBody = [&]() {
                 for (;;) {
                     int slot = next.fetch_add(1);
                     if (slot >= nImp) break;
                     int i = order[slot];
-                    meshes[i] = isomesh::marchImplicit(sc.implicits[i], opt);
+                    meshes[i] = isomesh::marchImplicit(sc.implicits[i], opt, &tabs);
                     int d = done.fetch_add(1) + 1;
                     if (progress) { std::lock_guard<std::mutex> lk(progMx); progress(d, nImp); }
                 }

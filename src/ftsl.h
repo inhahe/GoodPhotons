@@ -3459,7 +3459,13 @@ private:
         std::string expr;
         for (size_t k = 0; k < es->val.words.size(); ++k) { if (k) expr += " "; expr += es->val.words[k]; }
         std::vector<PatNode> prog; std::string perr;
-        if (!compilePatternExpr(expr, prog, perr)) { fail("function expr: " + perr); return false; }
+        // `&tableScope_` (but NOT texScope_): the field evaluators are handed the scene's
+        // grid:/scatter: tables, so a `function` leaf can BE a measured volume or height
+        // field — `expr "grid:terrain(x, z) - y"`. There is no shading context here, so
+        // `tex:` (which needs u,v from a hit) stays unavailable and fails to compile.
+        if (!compilePatternExpr(expr, prog, perr, /*allowT=*/false, nullptr, &tableScope_)) {
+            fail("function expr: " + perr); return false;
+        }
         Affine L2W;
         for (int k = 0; k < 9; ++k) L2W.m[k] = L_ * authoredXf.m[k];
         L2W.t = authoredXf.t * L_;
@@ -3600,8 +3606,14 @@ private:
                           !(openV == "off" || openV == "false" || openV == "no" || openV == "0");
             im.capped = !isOpen;
             double mg = dblOf(b, "max_gradient", 0.0);
+            // The Lipschitz probe must see the SAME field the marcher will: a
+            // `grid:`-sampling formula evaluated without the tables reads 0 everywhere,
+            // whose estimated slope is 0 — an unusably tiny bound. The data pass runs
+            // before geometry, so the tables are already loaded here.
+            const PatTables tabs = L.scene.patTables();
             im.lipschitz = (mg > 0.0) ? mg
-                                      : 1.3 * estimateFieldLipschitz(im.nodes, im.exprNodes, box);
+                                      : 1.3 * estimateFieldLipschitz(im.nodes, im.exprNodes, box,
+                                                                     /*grid=*/24, &tabs);
             double acc = dblOf(b, "accuracy", 0.0);
             im.minStep = (acc > 0.0) ? acc * L_ : implicitMinStep(box);
         } else {
@@ -3950,7 +3962,8 @@ private:
                     // Inside-sign auto-detect: SDF/CSG fields are negative inside, so a
                     // point deep in the AABB (its center) reads f<0 => inside == (f<0).
                     Vec3 ctr = (im.bounds.lo + im.bounds.hi) * 0.5;
-                    med.boundInsideNeg = (im.eval(ctr) <= 0.0);
+                    const PatTables btabs = L.scene.patTables();   // field may sample grid:/scatter:
+                    med.boundInsideNeg = (im.eval(ctr, &btabs) <= 0.0);
                 } else if (auto mit = meshAabbByName_.find(onm); mit != meshAabbByName_.end()) {
                     const Aabb& box = mit->second;
                     med.bounded = true;
@@ -4040,7 +4053,11 @@ private:
                     std::string expr;
                     for (size_t k = 0; k < ds->val.words.size(); ++k) { if (k) expr += " "; expr += ds->val.words[k]; }
                     std::string perr;
-                    if (!compilePatternExpr(expr, prog, perr)) {
+                    // `&tableScope_`, no texScope_: densityAt is handed the scene's tables
+                    // (see Medium::densityAt), so `density "grid:rho(x, y, z)"` samples a
+                    // measured volume without going through `vdb:`; there is no hit here,
+                    // so `tex:` remains a compile error.
+                    if (!compilePatternExpr(expr, prog, perr, /*allowT=*/false, nullptr, &tableScope_)) {
                         fail("medium density: " + perr); return false;
                     }
                 }
@@ -4061,13 +4078,18 @@ private:
                     const Vec3& hi = med.bmax;
                     const int NS = 24;
                     double peak = 0.0;
+                    const PatTables tabs = L.scene.patTables();
                     for (int iz = 0; iz <= NS; ++iz)
                     for (int iy = 0; iy <= NS; ++iy)
                     for (int ix = 0; ix <= NS; ++ix) {
                         Vec3 p{ lo.x + (hi.x - lo.x) * ix / NS,
                                 lo.y + (hi.y - lo.y) * iy / NS,
                                 lo.z + (hi.z - lo.z) * iz / NS };
-                        peak = std::max(peak, med.densityAt(p));
+                        // Real tables: the majorant must be estimated from the SAME field
+                        // the renderer samples, or a `grid:`-driven density would majorise
+                        // to 0 and the medium would vanish. The data pass runs before this
+                        // one, so L.scene.grids/scatters/dataPool are already populated.
+                        peak = std::max(peak, med.densityAt(p, &tabs));
                     }
                     dmax = 1.3 * peak;
                 }
@@ -4159,7 +4181,10 @@ private:
                 std::string expr;
                 for (size_t k = 0; k < is->val.words.size(); ++k) { if (k) expr += " "; expr += is->val.words[k]; }
                 std::string perr;
-                if (!compilePatternExpr(expr, prog, perr)) {
+                // `&tableScope_`, no texScope_: the Eikonal marcher hands nAt/gradNAt the
+                // scene's tables, so a MEASURED index volume can bend rays —
+                // `ior "1 + grid:n(x, y, z)"` (an atmospheric profile, a GRIN lens blank).
+                if (!compilePatternExpr(expr, prog, perr, /*allowT=*/false, nullptr, &tableScope_)) {
                     fail("medium ior: " + perr); return false;
                 }
             }
@@ -5048,7 +5073,9 @@ private:
                     recOk = false; return;
                 }
             std::vector<PatNode> drv; std::string cerr;
-            if (!compilePatternExpr(dexpr, drv, cerr, /*allowT=*/true)) {
+            // `&tableScope_`: recSample below binds the scene's tables, so a flyby track
+            // can be driven by MEASURED data over the timeline — `fov_from lens.fov(grid:zoom(t))`.
+            if (!compilePatternExpr(dexpr, drv, cerr, /*allowT=*/true, nullptr, &tableScope_)) {
                 fail("camera_curve '" + base + "' " + key + " driver '" + dexpr + "': " + cerr);
                 recOk = false; return;
             }
@@ -5071,6 +5098,7 @@ private:
         // the PatCtx only needs `t`.
         auto recSample = [&](const RecTrack& rt, double fr) -> double {
             PatCtx c{}; c.t = fr;
+            bindPatData(c, L.scene);   // grid:/scatter: in the driver (see the compile site)
             double d = rt.driver.empty() ? fr : patternEval(rt.driver.data(), (int)rt.driver.size(), c);
             const Record& rec = L.scene.records[(size_t)rt.recIdx];
             return recSampleScalar(rec, rec.channels[(size_t)rt.chanIdx], d, c);

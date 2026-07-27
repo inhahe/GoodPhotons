@@ -82,8 +82,13 @@ inline double sdfSmax(double a, double b, double k) {
 
 // ---- leaf SDF evaluation (query point already mapped to the leaf's local space) ----
 // `exprPool` backs FieldOp::Expr leaves (the shared PatNode program pool); it may be
-// null when the field has no expression leaves.
-inline double fieldLeafSDF(const FieldNode& nd, const Vec3& pl, const PatNode* exprPool) {
+// null when the field has no expression leaves. `tabs` publishes the scene's N-D sampler
+// tables so an Expr leaf can read `grid:<name>(…)` / `scatter:<name>(…)` — a sampled
+// density volume or a measured height field defining the surface. Null means none are in
+// scope, which is a wiring bug at any site the compiler let such a sample through, so
+// patternEval bails to 0 there rather than silently unbalancing its stack.
+inline double fieldLeafSDF(const FieldNode& nd, const Vec3& pl, const PatNode* exprPool,
+                          const PatTables* tabs = nullptr) {
     switch (nd.op) {
         case FieldOp::Sphere:
             return length(pl) - nd.p[0];
@@ -95,6 +100,7 @@ inline double fieldLeafSDF(const FieldNode& nd, const Vec3& pl, const PatNode* e
             PatCtx c;
             c.x = pl.x; c.y = pl.y; c.z = pl.z;
             c.r = std::sqrt(pl.x * pl.x + pl.y * pl.y + pl.z * pl.z);
+            patBindTables(c, tabs);
             return exprPool ? patternEval(exprPool + nd.exprOff, nd.exprN, c) : DBL_MAX;
         }
         case FieldOp::Box: {
@@ -148,8 +154,10 @@ inline double fieldLeafSDF(const FieldNode& nd, const Vec3& pl, const PatNode* e
 }
 
 // Evaluate the whole field at a world point via the postfix scalar stack.
-// `exprPool` backs FieldOp::Expr leaves (may be null when the field has none).
-inline double fieldEval(const FieldNode* nodes, int n, const Vec3& pw, const PatNode* exprPool) {
+// `exprPool` backs FieldOp::Expr leaves (may be null when the field has none); `tabs`
+// carries the scene's N-D sampler tables for `grid:`/`scatter:` inside those leaves.
+inline double fieldEval(const FieldNode* nodes, int n, const Vec3& pw, const PatNode* exprPool,
+                        const PatTables* tabs = nullptr) {
     double st[64];
     int sp = 0;
     for (int i = 0; i < n; ++i) {
@@ -163,7 +171,7 @@ inline double fieldEval(const FieldNode* nodes, int n, const Vec3& pw, const Pat
             case FieldOp::SmoothDifference: { double b = st[--sp], a = st[--sp]; st[sp++] = sdfSmax(a, -b, nd.p[0]); break; }
             default: {  // leaf
                 Vec3 pl = nd.inv.apply(pw);
-                st[sp++] = fieldLeafSDF(nd, pl, exprPool) * nd.scale;
+                st[sp++] = fieldLeafSDF(nd, pl, exprPool, tabs) * nd.scale;
             }
         }
     }
@@ -173,12 +181,12 @@ inline double fieldEval(const FieldNode* nodes, int n, const Vec3& pw, const Pat
 // Surface normal from the field gradient (tetrahedron central differences). eps
 // scales with the hit distance so the stencil stays well-conditioned at any range.
 inline Vec3 fieldGradient(const FieldNode* nodes, int n, const Vec3& p, double eps,
-                          const PatNode* exprPool) {
+                          const PatNode* exprPool, const PatTables* tabs = nullptr) {
     const Vec3 k1{ 1, -1, -1}, k2{-1, -1,  1}, k3{-1,  1, -1}, k4{ 1,  1,  1};
-    Vec3 g = k1 * fieldEval(nodes, n, p + k1 * eps, exprPool)
-           + k2 * fieldEval(nodes, n, p + k2 * eps, exprPool)
-           + k3 * fieldEval(nodes, n, p + k3 * eps, exprPool)
-           + k4 * fieldEval(nodes, n, p + k4 * eps, exprPool);
+    Vec3 g = k1 * fieldEval(nodes, n, p + k1 * eps, exprPool, tabs)
+           + k2 * fieldEval(nodes, n, p + k2 * eps, exprPool, tabs)
+           + k3 * fieldEval(nodes, n, p + k3 * eps, exprPool, tabs)
+           + k4 * fieldEval(nodes, n, p + k4 * eps, exprPool, tabs);
     double len = length(g);
     return len > 0.0 ? g / len : Vec3{0, 0, 1};
 }
@@ -249,18 +257,22 @@ struct Implicit {
     Aabb uvBounds;               // reference box for the [0,1] wrap (set by builder)
     bool uvBoundsSet = false;
 
-    double eval(const Vec3& pw) const {
-        return fieldEval(nodes.data(), (int)nodes.size(), pw, exprNodes.data());
+    // `tabs` publishes the scene's `grid:`/`scatter:` tables to Expr leaves. It is a
+    // parameter rather than a member because it points into Scene's vectors and a Scene
+    // is copied/moved — see PatTables in pattern.h.
+    double eval(const Vec3& pw, const PatTables* tabs = nullptr) const {
+        return fieldEval(nodes.data(), (int)nodes.size(), pw, exprNodes.data(), tabs);
     }
-    Vec3   gradient(const Vec3& pw, double eps) const {
-        return fieldGradient(nodes.data(), (int)nodes.size(), pw, eps, exprNodes.data());
+    Vec3   gradient(const Vec3& pw, double eps, const PatTables* tabs = nullptr) const {
+        return fieldGradient(nodes.data(), (int)nodes.size(), pw, eps, exprNodes.data(), tabs);
     }
 };
 
 // Sphere-trace a ray against one Implicit. `r.d` need not be unit length: the SDF
 // is in world distance, so the parametric step is (|f|/lipschitz)/|d|. Writes into
 // `hit` (respecting hit.t as the current closest) and returns true on a nearer hit.
-inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit& hit) {
+inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit& hit,
+                              const PatTables* tabs = nullptr) {
     // ---- Container clip: entry/exit params [tEnter, tExit] and the container's
     // OUTWARD normals at those crossings (needed to shade caps). The container is the
     // world AABB `bounds` (box) or a world sphere. `bounds` is always the BVH/broad box.
@@ -352,7 +364,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
     };
 
     double t = t0;
-    double f = fieldEval(nd, N, r.o + r.d * t, pool);
+    double f = fieldEval(nd, N, r.o + r.d * t, pool, tabs);
     // NEAR CAP: the ray enters the container from outside (tEnter >= tmin) already
     // inside the solid (f<0). The container face is then the first surface along the
     // ray — the nearest possible hit — so cap it and return. `open` surfaces skip this
@@ -369,7 +381,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         // before evaluating the boundary would drop that hit.
         bool last = false;
         if (tn >= t1) { tn = t1; last = true; }
-        double fn = fieldEval(nd, N, r.o + r.d * tn, pool);
+        double fn = fieldEval(nd, N, r.o + r.d * tn, pool, tabs);
         bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) ||
                        (f == 0.0 && fn != 0.0);
         if (crossed) {
@@ -386,7 +398,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
                 } else {
                     tm = 0.5 * (ta + tb);
                 }
-                double fm = fieldEval(nd, N, r.o + r.d * tm, pool);
+                double fm = fieldEval(nd, N, r.o + r.d * tm, pool, tabs);
                 if ((fa > 0.0) == (fm > 0.0)) {
                     ta = tm; fa = fm;
                     if (regulaFalsi && side == +1) fb *= 0.5;   // Illinois: shrink stuck side
@@ -402,7 +414,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             if (th < tmin || th >= hit.t) return false;
             Vec3 p = r.o + r.d * th;
             double eps = std::fmax(1e-6, 1e-4 * th);
-            Vec3 g = fieldGradient(nd, N, p, eps, pool);
+            Vec3 g = fieldGradient(nd, N, p, eps, pool, tabs);
             return writeHit(th, p, g);   // field surface: geometric normal = gradient
         }
         if (last) {
@@ -531,7 +543,8 @@ inline bool fieldHasExpr(const std::vector<FieldNode>& nodes) {
 // least 1 (a true SDF has L = 1) so plain SDF leaves in the same field aren't slowed.
 inline double estimateFieldLipschitz(const std::vector<FieldNode>& nodes,
                                      const std::vector<PatNode>& exprNodes,
-                                     const Aabb& box, int grid = 24) {
+                                     const Aabb& box, int grid = 24,
+                                     const PatTables* tabs = nullptr) {
     const FieldNode* nd = nodes.data();
     const int N = (int)nodes.size();
     const PatNode* pool = exprNodes.data();
@@ -546,9 +559,9 @@ inline double estimateFieldLipschitz(const std::vector<FieldNode>& nodes,
         Vec3 p{box.lo.x + ext.x * (ix / (double)grid),
                box.lo.y + ext.y * (iy / (double)grid),
                box.lo.z + ext.z * (iz / (double)grid)};
-        double gx = fieldEval(nd, N, p + Vec3{eps,0,0}, pool) - fieldEval(nd, N, p - Vec3{eps,0,0}, pool);
-        double gy = fieldEval(nd, N, p + Vec3{0,eps,0}, pool) - fieldEval(nd, N, p - Vec3{0,eps,0}, pool);
-        double gz = fieldEval(nd, N, p + Vec3{0,0,eps}, pool) - fieldEval(nd, N, p - Vec3{0,0,eps}, pool);
+        double gx = fieldEval(nd, N, p + Vec3{eps,0,0}, pool, tabs) - fieldEval(nd, N, p - Vec3{eps,0,0}, pool, tabs);
+        double gy = fieldEval(nd, N, p + Vec3{0,eps,0}, pool, tabs) - fieldEval(nd, N, p - Vec3{0,eps,0}, pool, tabs);
+        double gz = fieldEval(nd, N, p + Vec3{0,0,eps}, pool, tabs) - fieldEval(nd, N, p - Vec3{0,0,eps}, pool, tabs);
         double g = std::sqrt(gx*gx + gy*gy + gz*gz) / (2.0 * eps);
         if (g > maxg) maxg = g;
     }
