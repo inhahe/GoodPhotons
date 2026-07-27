@@ -310,11 +310,30 @@ pattern "p" { expr "grid:ramp(u) * grid:tile(v, u)" }
 
 | Key | Meaning |
 |---|---|
-| `data { … }` | The samples, in **C order** (axis 0 outermost / slowest). Required. Newlines and grouping inside the body are pure formatting. |
-| `shape a b …` | Sample count per axis; the number of entries is the dimensionality (max 4). Omitted ⇒ **1-D**, as long as `data`. `product(shape)` must equal the sample count. |
+| `data { … }` | The samples, in **C order** (axis 0 outermost / slowest). Required. Newlines and grouping inside the body are pure formatting. May instead be written **bracketed** — `data [[0 1 2][3 4 5]]` — and then the **nesting is the shape**, so `shape` becomes unnecessary (see below). |
+| `shape a b …` | Sample count per axis; the number of entries is the dimensionality (max 4). Omitted ⇒ **1-D**, as long as `data`. `product(shape)` must equal the sample count. Redundant when `data` is *nested*: it is then accepted only if it agrees, and the mismatch is reported with both shapes. |
 | `lo` | The box's low corner. Omitted ⇒ **zeros**; one number ⇒ broadcast to every axis; `ndim` numbers ⇒ exact. |
 | `hi` | The high corner. Omitted ⇒ the **unit-spacing index lattice** (`hi[a] = lo[a] + shape[a] - 1`, i.e. coordinates *are* indices); one number ⇒ an **isotropic** lattice whose spacing is set by axis 0; `ndim` numbers ⇒ the exact box. |
 | `outside` | Behaviour beyond the box: `clamp` (default — edge-extend), `wrap` (periodic with period `hi-lo`, so sample `n-1` aliases sample 0), `extrapolate` (the boundary cell's slope continues). |
+
+`data` may also be written **bracketed**, and then the nesting carries the shape — the same
+rule the inline array literal below uses, and the one shape you cannot get wrong, because
+it is not written down twice:
+
+```
+grid "tile" {                          # exactly the grid above, with nothing repeated
+    lo   0 0
+    hi   1 1
+    data [[0.02 0.98 0.02]
+          [0.98 0.02 0.98]
+          [0.02 0.98 0.02]]
+}
+```
+
+A *flat* bracket group (`data [0 1 2 3]`) is just the bracketed spelling of the flat list,
+so an explicit `shape` still folds it; only real nesting infers a shape. A ragged array is
+an error, and a grid's `data` takes no `(…)` sample call — that belongs at a value site
+that *reads* the grid.
 
 The call's **arity is the grid's own dimensionality** — a 2-D grid takes two coordinates,
 in axis order — so `grid:tile(u)` is a compile error, not a silent zero. Interpolation is
@@ -351,7 +370,7 @@ pattern "p" { expr "scatter:pts(u, v)" }
 
 | Key | Meaning |
 |---|---|
-| `data { … }` | The samples, each as its **position then its value** — `dim + 1` numbers, repeated. One interleaved list, because a scatter's position and value are not separable the way a lattice's are. Required. |
+| `data { … }` | The samples, each as its **position then its value** — `dim + 1` numbers, repeated. One interleaved list, because a scatter's position and value are not separable the way a lattice's are. Required. May also be written **bracketed**, either flat or with **one group per sample** — `data [[0.15 0.20 0.95][0.80 0.25 0.10]]` — in which case the `dim + 1` stride is checked per group, so a miscount names the offending sample instead of failing on the total. |
 | `dim` | Coordinates per sample, i.e. the call's arity. Omitted ⇒ **1** (so `data` is position/value pairs). Max 4. |
 | `power` | The exponent on distance: weight of a sample is `|q − p|^-power`. Omitted ⇒ **2** (also the fastest path). Higher ⇒ each sample dominates its own neighbourhood, approaching nearest-neighbour / Voronoi; lower ⇒ broader, softer, more global. |
 | `eps` | Squared-distance threshold for "the query **is** this sample". Omitted ⇒ `1e-9`. |

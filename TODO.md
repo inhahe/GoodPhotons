@@ -265,6 +265,27 @@ Origin tags point at the authoritative design text for each item.
         constant" reading, keeping the interpolated field geometrically isotropic); a full `hi` tuple → the exact box
         (allows deliberately anisotropic cells). Whatever surface syntax the grid element grows for domain must offer
         these same defaults so common grids stay terse.
+
+      **STATUS (2026-07-27): DONE — shipped in 0.74.0.**
+      - The **`lo`/`hi` half was already shipped** with the datatype itself (0.71.0): `addGrid` implements exactly the
+        rules above — `lo` omitted → zeros, `lo <scalar>` → broadcast; `hi` omitted → unit-spacing index lattice,
+        `hi <scalar>` → one isotropic lattice constant derived off axis 0, full tuple → the exact box. Nothing to do.
+      - The **nested-`data` half shipped here.** A `grid`/`scatter` element's `data` may now be written **bracketed**,
+        and for a grid the **nesting is the shape**: `data [[0 1 2][3 4 5]]` is a 2×3 grid with no `shape` line at
+        all. Writing a `shape` that disagrees with the nesting is an error that prints both. A *flat* bracket group
+        carries no shape (it is just the bracketed spelling of the flat list), so `shape 2 2  data [0 1 2 3]` still
+        folds as before — nothing in the corpus changed meaning. For a `scatter`, a bracketed `data` is one group per
+        sample, each exactly `dim+1` numbers wide (coords then value), checked per group.
+      - Implementation: the increment-2 machinery is reused wholesale. `Builder::desugarArrays` now **skips `grid` and
+        `scatter` blocks** — their `data` is the element's own samples, not a value-site literal — and `addGrid` /
+        `addScatter` read the `ftsl::BrItem` tree directly through the shared `flattenArray` (which already proves the
+        tree rectangular and numeric). A sample call on an element's `data` (`data [0 1](u)`) is a dedicated error
+        naming where the call *does* belong. No grammar change was needed: `data`'s value site already goes through
+        the merged `selector` production.
+      - Verified: all seven bracketed forms load; eight error paths produce clear messages; `scraps/array_nestdata.ftsl`
+        (nested `data`) renders **bit-identically** to `scraps/array_explicit.ftsl` (`shape` + flat `data { … }`);
+        corpus equivalence sweep still ok=362 / mismatch=0 / parsefail=5 (pre-existing); `-checkgrid` / `-checkscatter`
+        / `-checkbvh` / `-checkimplicit` all PASS.
   - **ADDENDUM — case-insensitive *keywords* (future intent, 2026-07-20; user).** The user wants FTSL keywords to
     (maybe, later) be **case-insensitive** — but **only keywords** (block kinds, property names, enum/mode values,
     spectrum/colour heads like `rgb`/`blackbody`/`gaussian`), **never custom identifiers** (record/material/light

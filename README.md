@@ -1688,6 +1688,9 @@ or a native-primitive wrap — see below). Two authoring forms:
   zero. `lo` defaults to zeros and `hi` to the unit-spacing *index* lattice (coordinates
   are then literally indices); a single `hi` number gives an isotropic lattice. Outside
   the box, `outside` picks `clamp` (default), `wrap` (period `hi-lo`) or `extrapolate`.
+  `data` can also be written **bracketed**, and then the **nesting is the shape**
+  (`data [[0 1 2][3 4 5]]` is a 2×3 grid), so `shape` need not be written at all — the one
+  shape you can't get wrong, because it isn't written down twice.
   Grids upload verbatim to the GPU and both backends run the *same* sampler, so a grid
   renders identically either way; `ftrace -checkgrid` is the deterministic self-test and
   `scenes/pattern_grid.ftsl` the worked example (one feature per wall strip).

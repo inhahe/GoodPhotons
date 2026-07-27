@@ -264,6 +264,17 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   brackets mean**: both collect the raw `ftsl::BrItem` tree and hand it to the single
   shared `ftsl::applyBracketGroup`, which is what stops the two front ends drifting on the
   one syntax that is genuinely ambiguous (record stop selector vs. array literal).
+
+  The same bracket spelling is accepted for a **`grid`/`scatter` element's own `data`**, and
+  there it is *not* sugar: `desugarArrays` deliberately skips those two block types, because
+  a `data [ … ]` group is the element's samples rather than a value-site literal (there is no
+  sample call to make — one there is an error naming the right place to put it). `addGrid`
+  and `addScatter` read the `BrItem` tree directly through the shared `flattenArray`. For a
+  grid the **nesting is the shape**, so `shape` need not be written at all (writing one that
+  disagrees is an error printing both); a *flat* group carries no shape, so `shape 2 2` still
+  folds `data [0 1 2 3]`. For a scatter, one group per sample, each `dim+1` numbers wide.
+  This is loom's `data.py` constructor convenience carried over verbatim in spirit, and it is
+  verified bit-identical against the `shape` + flat-`data` spelling.
 - **`envmap.h` / `sky.h`** — infinite environment lighting. `EnvMap` turns an
   equirectangular linear-RGB buffer into an importance-sampled directional emitter
   (per-texel Jakob–Hanika spectral upsampling + a luminance·sinθ 2-D sampler);

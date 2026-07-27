@@ -1729,7 +1729,7 @@ private:
     // given depth the same length) while collecting the per-axis extents.
     bool flattenArray(const std::vector<BrItem>& items, int depth,
                       std::vector<int>& shape, std::vector<std::string>& out,
-                      const std::string& who) {
+                      const std::string& who, const char* raggedHint = "") {
         if (items.empty()) { fail(who + ": empty `[ ]` group"); return false; }
         const bool grouped = items[0].isGroup;
         for (const auto& it : items) {
@@ -1741,10 +1741,10 @@ private:
         }
         if ((int)shape.size() == depth) shape.push_back((int)items.size());
         else if (shape[depth] != (int)items.size()) {
-            fail(who + ": ragged array — axis " + std::to_string(depth) + " has both " +
+            fail(who + ": ragged — axis " + std::to_string(depth) + " has both " +
                  std::to_string(shape[depth]) + " and " + std::to_string(items.size()) +
-                 " entries (an inline array must be rectangular; use a `scatter` for "
-                 "irregular data)");
+                 " entries; every group at the same nesting level must be the same length" +
+                 raggedHint);
             return false;
         }
         if (!grouped) {
@@ -1782,7 +1782,8 @@ private:
         }
         std::vector<int> shape;
         std::vector<std::string> flat;
-        if (!flattenArray(a.items, 0, shape, flat, who)) return false;
+        if (!flattenArray(a.items, 0, shape, flat, who,
+                          " (use a named `scatter` element for irregular data)")) return false;
         if ((int)shape.size() > PAT_ND_MAX_DIM) {
             fail(who + ": " + std::to_string(shape.size()) + " nested axes exceeds the " +
                  std::to_string((int)PAT_ND_MAX_DIM) + "-D limit");
@@ -1844,6 +1845,10 @@ private:
         // words), so any block whose statements changed has to be re-mirrored — some
         // bodies (`palette`, `data`) are read through `words` rather than `stmts`.
         std::function<bool(Block&)> visit = [&](Block& b) -> bool {
+            // A `grid`/`scatter` element's own `data [ … ]` is that element's samples, not
+            // a value-site literal: nesting there is the element's shape and there is no
+            // sample call to make. Its bracket group is read by addGrid / addScatter.
+            if (b.type == "grid" || b.type == "scatter") return true;
             bool touched = false;
             for (auto& s : b.stmts) {
                 if (s.val.array) { if (!desugarOne(s, gen, n)) return false; touched = true; }
@@ -1887,29 +1892,62 @@ private:
         if (gridIndex_.count(b.name)) { fail("duplicate grid name '" + b.name + "'"); return false; }
         const std::string who = "grid '" + b.name + "'";
 
-        // Samples: a `data { … }` brace body (the flat-word list form `palette {}` uses)
-        // or an inline `data 1 2 3` line. Nesting/newlines inside the body are pure
-        // formatting — C order is the shape, exactly as in loom's data.Grid.
+        // Samples: a `data { … }` brace body (the flat-word list form `palette {}` uses),
+        // an inline `data 1 2 3` line, or a BRACKETED `data [[0 1 2][3 4 5]]` whose nesting
+        // IS the shape (loom's data.Grid constructor rule — a shape you cannot get wrong,
+        // because it is not written down twice). In the two flat forms, nesting/newlines
+        // inside the body are pure formatting and C order is the shape.
         const Stmt* ds = find(b, "data");
         if (!ds) { fail(who + " needs a `data { … }` list of numbers"); return false; }
-        const std::vector<std::string>& dw = ds->val.block ? ds->val.block->words : ds->val.words;
+        std::vector<int> shape;            // filled from the nesting when `data` is bracketed
         std::vector<float> samples;
-        samples.reserve(dw.size());
-        for (const auto& w : dw) {
-            if (!isNumber(w)) { fail(who + ": non-numeric sample '" + w + "' in `data`"); return false; }
-            samples.push_back((float)num(w));
+        if (ds->val.array) {
+            if (!ds->val.array->call.empty()) {
+                fail(who + ": `data` is this grid's own samples, so it takes no `" +
+                     ds->val.array->call + "` sample call — the call belongs at a value site "
+                     "that reads the grid, e.g. `grid:" + b.name + "(u)`");
+                return false;
+            }
+            std::vector<std::string> words;
+            if (!flattenArray(ds->val.array->items, 0, shape, words, who + " `data`")) return false;
+            // Only NESTING carries a shape. A single flat `data [0 1 2 3]` is just the
+            // bracketed spelling of the flat list, so an explicit `shape` still folds it.
+            if (shape.size() < 2) shape.clear();
+            samples.reserve(words.size());
+            for (const auto& w : words) samples.push_back((float)num(w));
+        } else {
+            const std::vector<std::string>& dw = ds->val.block ? ds->val.block->words : ds->val.words;
+            samples.reserve(dw.size());
+            for (const auto& w : dw) {
+                if (!isNumber(w)) { fail(who + ": non-numeric sample '" + w + "' in `data`"); return false; }
+                samples.push_back((float)num(w));
+            }
         }
         if (samples.empty()) { fail(who + ": `data` is empty"); return false; }
 
-        // Shape. Absent means "1-D, as long as the data" — the common ramp/LUT case.
-        std::vector<int> shape;
+        // Shape. Absent means "1-D, as long as the data" — the common ramp/LUT case. An
+        // explicit `shape` is how a FLAT list is folded; alongside bracketed data it is
+        // redundant, so it is accepted only when it agrees (and named when it doesn't).
         if (const Stmt* ss = find(b, "shape")) {
+            std::vector<int> given;
             for (const auto& w : ss->val.words) {
                 if (!isNumber(w)) { fail(who + ": non-numeric `shape` entry '" + w + "'"); return false; }
                 int n = (int)num(w);
                 if (n < 1) { fail(who + ": `shape` entries must be >= 1"); return false; }
-                shape.push_back(n);
+                given.push_back(n);
             }
+            if (!shape.empty() && given != shape) {
+                auto join = [](const std::vector<int>& v) {
+                    std::string s;
+                    for (size_t k = 0; k < v.size(); ++k) { if (k) s += " "; s += std::to_string(v[k]); }
+                    return s;
+                };
+                fail(who + ": `shape " + join(given) + "` disagrees with the nesting of `data`, "
+                     "which is " + join(shape) + " — with bracketed data the shape is the nesting, "
+                     "so just drop the `shape` line");
+                return false;
+            }
+            if (shape.empty()) shape = given;
         }
         if (shape.empty()) shape.push_back((int)samples.size());
         if ((int)shape.size() > PAT_ND_MAX_DIM) {
@@ -2046,17 +2084,45 @@ private:
         // (dim + 1) — the position's coordinates followed by that sample's value. One
         // interleaved list keeps a sample's position and value visually together, which
         // is the whole point of a scatter (they are not separable the way a lattice is).
+        // Brackets are also accepted, and there the nesting carries the same meaning it
+        // does for a grid: `data [[0 0 0.1][1 0 0.9]]` is one group PER SAMPLE, so the
+        // stride is checked per group and a miscount names the offending sample.
         const Stmt* ds = find(b, "data");
         if (!ds) { fail(who + " needs a `data { … }` list of numbers"); return false; }
-        const std::vector<std::string>& dw = ds->val.block ? ds->val.block->words : ds->val.words;
+        const int stride = s.ndim + 1;
         std::vector<float> flat;
-        flat.reserve(dw.size());
-        for (const auto& w : dw) {
-            if (!isNumber(w)) { fail(who + ": non-numeric entry '" + w + "' in `data`"); return false; }
-            flat.push_back((float)num(w));
+        if (ds->val.array) {
+            if (!ds->val.array->call.empty()) {
+                fail(who + ": `data` is this scatter's own samples, so it takes no `" +
+                     ds->val.array->call + "` sample call — the call belongs at a value site "
+                     "that reads it, e.g. `scatter:" + b.name + "(u)`");
+                return false;
+            }
+            std::vector<int> shape;
+            std::vector<std::string> words;
+            if (!flattenArray(ds->val.array->items, 0, shape, words, who + " `data`")) return false;
+            if (shape.size() > 2) {
+                fail(who + ": `data` nests " + std::to_string(shape.size()) + " deep, but a "
+                     "scatter's samples are a flat list or ONE group per sample");
+                return false;
+            }
+            if (shape.size() == 2 && shape[1] != stride) {
+                fail(who + ": each `data` group has " + std::to_string(shape[1]) + " numbers but "
+                     "dim+1 = " + std::to_string(stride) + " (each sample is " +
+                     std::to_string(s.ndim) + " coordinate(s) then its value)");
+                return false;
+            }
+            flat.reserve(words.size());
+            for (const auto& w : words) flat.push_back((float)num(w));
+        } else {
+            const std::vector<std::string>& dw = ds->val.block ? ds->val.block->words : ds->val.words;
+            flat.reserve(dw.size());
+            for (const auto& w : dw) {
+                if (!isNumber(w)) { fail(who + ": non-numeric entry '" + w + "' in `data`"); return false; }
+                flat.push_back((float)num(w));
+            }
         }
         if (flat.empty()) { fail(who + ": `data` is empty"); return false; }
-        const int stride = s.ndim + 1;
         if ((int)(flat.size() % (size_t)stride) != 0) {
             fail(who + ": `data` has " + std::to_string(flat.size()) + " numbers, which is not a " +
                  "multiple of dim+1 = " + std::to_string(stride) + " (each sample is " +
