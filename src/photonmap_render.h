@@ -157,7 +157,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             if (specularSeen) {                          // specular-direct: NEE can't reach it
                 double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                     * (thr * rhoV * m.emit(lambda) * invPdfL);
+                     * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL);
             }
             return L;                                     // else: direct handled by NEE at vis
         }
@@ -306,7 +306,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
 
         if (m.isLight) {                                 // directly-viewed emitter
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                 * (thr * m.emit(lambda) * invPdfL);
+                 * (thr * emitSlot(scene, m, h, lambda) * invPdfL);
             return L;
         }
 

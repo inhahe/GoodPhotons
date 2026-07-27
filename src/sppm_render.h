@@ -105,7 +105,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
 
         if (m.isLight) {
             directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                       * (thr * m.emit(lambda) * invPdfL);
+                       * (thr * emitSlot(scene, m, h, lambda) * invPdfL);
             return;
         }
 

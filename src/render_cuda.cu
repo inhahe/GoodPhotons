@@ -9231,6 +9231,15 @@ bool cudaForwardSupported(const Scene& scene) {
     for (const auto& t : scene.tris)      if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres)   if (unsupported(s.matId)) return false;
     for (const auto& im : scene.implicits) if (unsupported(im.matId)) return false;
+    // `emit pattern:` / `emit_map` (0.80.0) is CPU-only for now. It is not a throughput
+    // slot like reflect/transmit: the same profile has to be applied on BOTH sides of
+    // transport — emission-on-hit AND the Le at an emitter-sampled point — and MIS
+    // combines them, so a device port that misses even one of the ~20 emission reads
+    // produces a BIASED image rather than a visibly missing effect. Rejecting the whole
+    // scene here keeps the two backends' emission identical by construction until the
+    // device side is ported and checked against the CPU reference (see known-issues.md).
+    for (const auto& em : scene.emitters) if (em.emitPat >= 0) return false;
+    for (const auto& m : scene.mats)      if (m.emitPat >= 0) return false;
     // Spectral water-droplet (rainbow) phase is now on the device: the (lambda x mu) Airy
     // table + per-lambda CDF (rainbow.h) is uploaded per medium and dMedPhase / dMedPhaseSample
     // reproduce the bow bit-closely against the CPU tracer (M10). No fallback needed.
@@ -10580,6 +10589,7 @@ bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam) {
         if (m.reflectTex >= 0) return false;                        // textured albedo not baked to RGB
         if (m.reflectPat >= 0) return false;                        // pattern-modulated albedo, ditto
         if (m.transmitPat >= 0) return false;                       // pattern-modulated transmittance, ditto
+        if (m.emitPat >= 0) return false;                           // pattern-modulated emission, ditto
         if (m.recBindingFor(REC_SLOT_REFLECT)) return false;        // record-driven reflectance
     }
     if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;

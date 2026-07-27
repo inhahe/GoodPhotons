@@ -1,0 +1,16 @@
+# Unit quad in the XY plane (z=0), facing +Z, with a full [0,1]x[0,1] UV chart.
+# The smallest mesh that can carry a texture or an `emit pattern:` — used by
+# scenes/emit_pattern.ftsl to exercise the Mesh area-emitter path (a `quad {}`
+# block only drops triangles into the scene; a `mesh {}` block with an emissive
+# material is what registers a sampleable Mesh emitter).
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 1 1
+vt 0 1
+vn 0 0 1
+f 1/1/1 2/2/1 3/3/1
+f 1/1/1 3/3/1 4/4/1

@@ -243,6 +243,13 @@ struct Vertex {
 
     // Light data (type == Light, or a Surface that is emissive)
     const Emitter* light = nullptr;
+    // This vertex's `emit pattern:` factor (Material::emitPat evaluated here), cached
+    // because Le() below has no Scene to evaluate it from and is called from several
+    // MIS strategies. 1.0 for a non-emissive vertex or an unpatterned light, so every
+    // existing scene multiplies by exactly one. A Light vertex gets it from
+    // emitterSamplePoint (the sampled point); a Surface vertex from slotPatMul at the
+    // hit — the two agree pointwise, which is what keeps s=0 / s=1 MIS unbiased.
+    double emitPatW = 1.0;
 
     // Medium data (type == Medium): HG anisotropy g and index into scene.media of the
     // medium that scattered here (for the phase function value and pdf).
@@ -261,7 +268,7 @@ struct Vertex {
     double Le(const Vec3& w, double lambda, double invPdfLambda) const {
         if (!mat || !mat->isLight) return 0.0;
         if (dot(ng, w) <= 0.0) return 0.0;           // one-sided emitter
-        return mat->emit(lambda) * invPdfLambda;
+        return mat->emit(lambda) * invPdfLambda * emitPatW;
     }
     bool isLightVertex() const {
         return type == VType::Light || (type == VType::Surface && mat && mat->isLight);
@@ -522,7 +529,12 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         v.matId = h.matId; v.mat = mp; v.beta = beta;
         v.nUp = nUp;
         for (int i = 0; i + 1 < nUp; ++i) v.betaSec[i] = betaSec[i];
-        if (mp->isLight) v.light = scene.emitterForMat(h.matId);
+        if (mp->isLight) {
+            v.light = scene.emitterForMat(h.matId);
+            // Evaluate the emission pattern once, here, where the Hit is in hand — Le()
+            // is called later from several MIS strategies with no Scene available.
+            if (mp->emitPat >= 0) v.emitPatW = slotPatMul(scene, mp->emitPat, h);
+        }
         // Index, not a reference: push_back below may reallocate the vector, and a
         // Vertex& taken before it would dangle (stale reads corrupted mode-D MIS pdfs
         // and the pdfRev write below scribbled on freed heap memory — ASan-verified).
@@ -847,8 +859,13 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
 
     double u1 = rng.uniform(), u2 = rng.uniform();
     Vec3 y, nOut;
-    em.samplePoint(u1, u2, y, nOut);
-    double Le = em.spdFn(lambda) * invPdfLambda;      // emitted radiance at lambda
+    // `emitPatW` is this point's `emit pattern:` factor (1.0, and a bit-identical call,
+    // when the emitter has none). It scales the emitted radiance only — the positional
+    // pdf below stays 1/area and pdfChoice stays power-weighted, exactly as the eye
+    // subpath's s=0/s=1 MIS terms assume — so the estimator is unchanged apart from the
+    // radiance itself. Vertex::emitPatW carries the same factor for those MIS terms.
+    double emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
+    double Le = em.spdFn(lambda) * invPdfLambda * emitPatW;   // emitted radiance at lambda
     if (Le <= 0.0) return 0;
 
     double pdfChoice = em.power / scene.totalPower;
@@ -866,7 +883,9 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     // Le(λ)/p(λ) they start with. The eye subpath is generated from the same bundle, so
     // both sides of every connection speak about the same C wavelengths.
     L0.nUp = hb.C;
-    for (int i = 0; i + 1 < hb.C; ++i) L0.betaSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1];
+    L0.emitPatW = emitPatW;
+    for (int i = 0; i + 1 < hb.C; ++i)
+        L0.betaSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
     path.push_back(L0);
 
     Vec3 dir = cosineHemisphere(nOut, rng);
@@ -1084,7 +1103,10 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
             return 0.0;
         double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 y, nOut; em.samplePoint(u1, u2, y, nOut);
+        Vec3 y, nOut;
+        // Pattern factor at the sampled point (1.0 without a pattern). It scales Le
+        // below, never pdfA — see generateLightSubpath for why that stays unbiased.
+        double emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
         Vec3 toL = y - pt.p; double dist2 = dot(toL, toL);
         if (dist2 <= 0.0) return 0.0;
         double dist = std::sqrt(dist2); Vec3 wi = toL / dist;
@@ -1121,12 +1143,12 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         }
         // The emitter was CHOSEN at the hero wavelength; only its emitted radiance is
         // re-evaluated per-λ (the pdf stays hero-driven, as everywhere else).
-        double Le = em.spdFn(lambda) * invPdfLambda;
+        double Le = em.spdFn(lambda) * invPdfLambda * emitPatW;
         double LeSec[hero::kHeroMax - 1] = {0};
         {
             double mxLe = Le;
             for (int i = 0; i + 1 < nUp; ++i) {
-                LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1];
+                LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
                 if (LeSec[i] > mxLe) mxLe = LeSec[i];
             }
             if (mxLe <= 0.0) return 0.0;
@@ -1144,6 +1166,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         sampled.type = VType::Light; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
         sampled.light = &em; sampled.matId = em.matId;
         sampled.mat = (em.matId >= 0) ? &scene.mats[em.matId] : nullptr;
+        sampled.emitPatW = emitPatW;
         sampled.beta = Le / pdfA; sampled.delta = false; sampled.pdfFwd = pdfA;
     } else {
         // Interior connection light[s-1] <-> eye[t-1].

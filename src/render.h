@@ -1459,6 +1459,7 @@ struct Renderer {
         Vec3 emitN;
         double spotW = 1.0;                      // spot: p_e/p_u direction reweight (else 1)
         double envPdfW = 0.0;                    // env: solid-angle pdf of the sampled dir
+        double emitPatW = 1.0;                   // `emit pattern:` factor at the sampled point
         if (em.shape == EmitterShape::Spot) {
             // Point spot: sample a direction uniformly in the outer cone, then
             // reweight beta by falloff*(Omega_outer/Omega_eff) so the emitted
@@ -1498,7 +1499,10 @@ struct Renderer {
             origin = scene.sceneCenter - dir * scene.sceneRadius + disk;
             emitN = dir;
         } else {
-            em.samplePoint(u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
+            // quad: constant normal; sphere: surface point. emitterSamplePoint also
+            // returns this point's `emit pattern:` factor — 1.0 (and a bit-identical
+            // call) when the emitter carries no pattern.
+            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
         double pdfL = 0.0;
@@ -1518,6 +1522,13 @@ struct Renderer {
             double denom = 4.0 * PI * envPdfW * em.spdFn(lambda);
             beta = (denom > 0.0) ? beta * (scene.envMap->radiance(dir, lambda) / denom) : 0.0;
         }
+        // An emission pattern is a pure post-multiplier on the photon's carried power:
+        // the emitter is still SELECTED by its unpatterned power and the point still
+        // drawn uniformly over its area, so no pdf anywhere changes and the estimator
+        // stays unbiased. The cost is variance — a mostly-dark pattern spends most of
+        // its photons on near-zero beta. `emitted` is credited the patterned value so
+        // the energy report matches what actually leaves the surface.
+        if (emitPatW != 1.0) beta *= emitPatW;
         e.emitted += beta;
 
         // Direct light -> camera: makes the source itself visible. The Lambertian
@@ -1805,6 +1816,7 @@ struct Renderer {
         Vec3 origin, emitN, dir;
         double spotW = 1.0;
         double envPdfW = 0.0;
+        double emitPatW = 1.0;                   // `emit pattern:` factor at the sampled point
         if (em.shape == EmitterShape::Spot) {
             origin = em.origin;
             double ct = em.spotCosOuter + u1 * (1.0 - em.spotCosOuter);
@@ -1831,7 +1843,7 @@ struct Renderer {
             origin = scene.sceneCenter - dir * scene.sceneRadius + disk;
             emitN = dir;
         } else {
-            em.samplePoint(u1, u2, origin, emitN);
+            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
 
@@ -1852,6 +1864,9 @@ struct Renderer {
                 beta[i] = (denom > 0.0) ? beta[i] * (scene.envMap->radiance(dir, lam[i]) / denom) : 0.0;
             }
         }
+        // Achromatic post-multiplier — see the scalar tracer above for why this changes
+        // no pdf and therefore introduces no bias.
+        if (emitPatW != 1.0) for (int i = 0; i < C; ++i) beta[i] *= emitPatW;
 
         bool secAlive = (C > 1);
         auto activeSum = [&]() { double s = 0.0; int n = secAlive ? C : 1;

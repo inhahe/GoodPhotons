@@ -555,9 +555,9 @@ Fills a complete material; a few knobs may be overridden afterward
 Scalar-parameter maps: `roughness` / `film_thickness_map` / `weight_map` accept
 `pattern:<name>` (math over x,y,z,normal,u,v) or `texture:<name>` (grayscale UV map).
 
-**Pattern-driven reflectance and transmittance.** The `reflect` and `transmit` slots take a
-pattern too, and a scalar in a spectral slot is a per-hit **multiplier** on whatever the slot
-otherwise holds:
+**Pattern-driven reflectance, transmittance and emission.** The `reflect`, `transmit` and
+`emit` slots take a pattern too, and a scalar in a spectral slot is a per-hit **multiplier**
+on whatever the slot otherwise holds:
 
 ```
 material "ramp"  { type diffuse reflect [0 1](u) }                     # greyscale ramp
@@ -569,6 +569,8 @@ material "skin"  { type diffuse reflect texture:wood                   # an imag
 material "panel" { type translucent reflect 0.15 transmit [0 1](u) }   # opaque -> clear ramp
 material "gel"   { type filter  transmit gaussian center=630 sigma=40  # colour from here…
                                 transmit_map pattern:p_rings }         # …strength from here
+material "strip" { type diffuse reflect 0.0 emit blackbody 5200        # a lamp's colour…
+                                emit_map pattern:p_rings }             # …brightness profile
 ```
 
 A pattern written *into* `reflect` is alone in the slot, so the base spectrum becomes a flat
@@ -585,9 +587,32 @@ per-wavelength gel transmittance.
 Reflect patterns are supported on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy`
 and `grating`; transmit patterns on `translucent` and `filter` — the families whose slot goes
 through the shared per-hit accessor. Elsewhere the spectrum is read directly (or not at all)
-and a pattern would be dropped in silence, so the loader **refuses** it there instead. `emit`
-does not take a pattern yet. Worked examples: `scenes/reflect_pattern.ftsl`,
-`scenes/transmit_pattern.ftsl`.
+and a pattern would be dropped in silence, so the loader **refuses** it there instead.
+
+**`emit` / `emit_map` — emission profiles.** Same two spellings, same clamped scalar
+multiplier, on the emission slot; a `light` block spells its slot `spd`, so there the pair is
+`spd pattern:<n>` / `spd_map pattern:<n>`. Three things make emission different from the other
+two slots:
+
+* **Only quad and mesh emitters may carry one.** An emission profile is read from *both* sides
+  of transport — once when a camera path lands on the emitter, once at the point NEE / a light
+  subpath samples on it — and MIS combines the two, so if they disagreed the image would be
+  **biased**, not merely noisy. Only a rectangular area light (bilinear parameters) and a mesh
+  emitter (barycentric UVs) can report a sampled (u,v) that provably equals the one a hit
+  interpolates. A `sphere` / `cylinder` / `spot` / `env` light is **refused** at load.
+* **`power` / `lumens` normalise the *unpatterned* spectrum.** The pattern is a pure
+  post-multiplier on radiance — which is exactly what keeps every selection and positional pdf
+  untouched, and hence the estimator unbiased — so a profile averaging 0.5 emits about half the
+  requested flux. Scale `power` up to hold total output fixed.
+* **CPU only for now** (0.80.0). A scene with an emission pattern falls back from the GPU
+  backends to the CPU tracer with a notice.
+
+An emissive **material** (`emit` on a `material` block) only becomes a *sampleable* light when
+it is bound to a `mesh {}`; a bare `quad {}` with an emissive material just adds emissive
+triangles that emission-on-hit can see.
+
+Worked examples: `scenes/reflect_pattern.ftsl`, `scenes/transmit_pattern.ftsl`,
+`scenes/emit_pattern.ftsl`.
 
 ### 7.3 `mix` — stochastic material blend
 
@@ -962,7 +987,7 @@ scene to fixed-exposure output (`power` wins if both given). Env lights reject
 
 | subtype | keys (defaults) |
 |---|---|
-| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd` — a rectangle |
+| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd`, `spd_map` — a rectangle |
 | `collimated` | `dir`(0,0,-1) `origin`(0.5,0.5,0.95) `spd` — a thin pencil beam |
 | `sphere` | `center` `radius`(0.1) `spd` — a glowing ball (also dropped into geometry) |
 | `cylinder` | `center` `axis`(0,1,0) `length`(0.5) `radius`(0.05) `segments`(48) `caps`(off) `spd` — a tube/fluorescent |
@@ -971,6 +996,11 @@ scene to fixed-exposure output (`power` wins if both given). Env lights reject
 
 `caps on`/`true`/`yes` closes the cylinder (emissive end discs). `spot` angles are
 half-angles in degrees with a smoothstep penumbra between inner and outer.
+
+The default rectangular `area` light also accepts an **emission profile** over its
+surface — `spd pattern:<n>` (the pattern *is* the profile, greyscale) or
+`spd_map pattern:<n>` (modulate the authored SPD). Only this subtype and mesh emitters
+can carry one; see §7.2 for why, and for the `power`/`lumens` interaction.
 
 ---
 

@@ -735,6 +735,35 @@ public:
         // built in addLight; finalizeEmitters computes powers, the selection CDF,
         // and the combined backward wavelength sampler).
         L.scene.build();
+        // build() -> finalizeEmitters() has now adopted each emitter's emitPat from the
+        // material on its geometry, so this is the first moment the SHAPE of every
+        // emission pattern's emitter is known. Reject the shapes that cannot honour one.
+        if (!checkEmitPatsSupported(L)) return false;
+        return true;
+    }
+
+    // An emission pattern is read from BOTH sides of transport — emission-on-hit (a
+    // PatCtx built from a Hit) and the Le at an emitter-sampled point (a PatCtx built
+    // from Emitter::samplePoint) — and MIS combines the two. If they disagree even
+    // slightly the render is BIASED, not merely noisy, so a pattern is only legal on the
+    // shapes where samplePoint can report exactly the (u,v) a hit would interpolate:
+    // Quad (bilinear parameters, matched by addAreaLight's two UV'd tris) and Mesh (the
+    // EmitTri's barycentric UVs, the same interpolation geometry.h does). A sphere/tube/
+    // spot/env emitter has no such correspondence, so refuse loudly rather than render
+    // a wrong image — the same rule checkSlotPatSupported applies to reflect/transmit.
+    bool checkEmitPatsSupported(Loaded& L) {
+        for (const auto& e : L.scene.emitters) {
+            if (e.emitPat < 0) continue;
+            if (e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh) continue;
+            const char* what = (e.shape == EmitterShape::Sphere)   ? "sphere"
+                             : (e.shape == EmitterShape::Cylinder) ? "cylinder"
+                             : (e.shape == EmitterShape::Spot)     ? "spot"
+                             : (e.shape == EmitterShape::Env)      ? "env" : "this";
+            fail(std::string("an emit pattern is not supported on a ") + what +
+                 " light — only quad and mesh emitters sample a (u,v) that matches the "
+                 "one emission-on-hit interpolates, and a mismatch would bias the image");
+            return false;
+        }
         return true;
     }
 
@@ -2514,8 +2543,16 @@ private:
         // so NEE / forward emission sample it. The SPD is radiance per unit solid angle
         // per unit area (absolute if the scene is absolute); a mesh block's optional
         // `power`/`lumens` rescales it there to hit a target flux over the mesh area.
-        if (find(b, "emit")) {
-            m.emit = spectrumParam(b, "emit", constantSpectrum(0.0));
+        // `emit` takes the same two pattern spellings as `reflect`/`transmit` (0.80.0):
+        // `emit pattern:p` makes the pattern the whole emission profile (greyscale, base
+        // spectrum flat 1.0), `emit_map pattern:p` modulates whatever `emit` otherwise
+        // says. Unlike those two the pattern is read from BOTH sides of transport —
+        // emission-on-hit and the Le at an emitter-sampled point — so it is only legal
+        // where the two provably agree on (u,v); checkEmitPatSupported (run after the
+        // scene is built, when the emitter shapes are known) enforces that.
+        if (find(b, "emit") || find(b, "emit_map")) {
+            m.emit = patternedSpectrumParam(b, "emit", "emit_map", m.emitPat,
+                                            constantSpectrum(0.0));
             m.isLight = true;
         }
         // Tangent-space NORMAL MAP (C6): `normal_map texture:<name> [strength <s>]`.
@@ -3407,7 +3444,25 @@ private:
         // When no bareword subtype was parsed (empty), fall back to the property.
         // Old default point/area lights have no `kind`, so they stay empty as before.
         if (subtype.empty()) subtype = strOf(b, "kind", "");
-        Spectrum spd = spectrumParam(b, "spd", blackbody(6500.0));
+        // A light block's emission slot is spelled `spd`, so its pattern spellings are
+        // `spd pattern:p` (the pattern IS the profile) and `spd_map pattern:p` (modulate
+        // the authored SPD) — the same pair a material spells `emit` / `emit_map`. Only
+        // the default rectangular quad below can carry one: it is the one light subtype
+        // whose emitter samples a (u,v) that provably matches the geometry it drops into
+        // the scene. Note `power`/`lumens` still normalise the UNPATTERNED SPD, so a
+        // pattern that averages 0.5 emits half the requested flux (see Material::emitPat).
+        int spdPat = -1;
+        Spectrum spd = patternedSpectrumParam(b, "spd", "spd_map", spdPat, blackbody(6500.0));
+        // Everything NOT in this list falls through to the rectangular quad at the
+        // bottom (`` and `area` both spell the default), which is the only subtype that
+        // can honour a pattern.
+        if (spdPat >= 0 && (subtype == "collimated" || subtype == "sphere" ||
+                            subtype == "cylinder" || subtype == "spot" || subtype == "env")) {
+            fail("an spd pattern is only supported on the default rectangular area light — "
+                 "a '" + subtype + "' light samples positions that no surface (u,v) "
+                 "corresponds to, so the pattern would be silently ignored");
+            return false;
+        }
         // Uniform scale of the enclosing group chain (spheres/pencils scale by it;
         // a non-uniform scale is only meaningful for the flat quad/mesh emitters).
         bool nonUniform = false; double s = xf.uniformScale(nonUniform);
@@ -3577,10 +3632,18 @@ private:
         Vec3 nw = normalize(xf.applyDir(nrm));
         spd = absPower(b, spd, length(cross(us, vs)) * PI, L);
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
+        lm.emitPat = spdPat;
         int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
         Vec3 a = os, bb = os + us, cc = os + us + vs, dd = os + vs;
+        // UVs must equal the emitter's own (u,v) parameterisation — Emitter::samplePoint
+        // returns the bilinear (u1,u2) of `origin + us*u1 + vs*u2`, so corner a is (0,0),
+        // bb is (1,0), cc is (1,1) and dd is (0,1). The first tri's defaults already say
+        // that; the second's did NOT (it inherited (0,0),(1,0),(1,1) for corners a,cc,dd),
+        // which put a seam down the diagonal of any UV-driven emission pattern — and,
+        // before this change, of any texture applied to an area light's quad.
         L.scene.tris.push_back(Tri{a, bb, cc, id, -1, {}});
-        L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {}});
+        L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {},
+                                   Vec3{0, 0, 0}, Vec3{1, 1, 0}, Vec3{0, 1, 0}});
         L.scene.addAreaLight(os, us, vs, nw, length(cross(us, vs)), spd, binWidth_,
                              /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/id);
         return true;

@@ -300,8 +300,43 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `reflect`. The reflect and transmit loader paths are themselves now one function
   (`patternedSpectrumParam` + `checkSlotPatSupported`, keyed on the slot name), and
   `renderBackwardRGBCuda` opts out of its baked-RGB fast path on `transmitPat` too.
-  `emit` remains open — it needs emitter registration and power renormalisation, not just
-  an accessor; tracked in `known-issues.md`.
+
+  **Pattern-driven emission (`Material::emitPat` / `Emitter::emitPat`).** The third leg of
+  the trio, and the strict one. Spellings match: `emit pattern:<n>` alone in the slot (base
+  collapses to flat 1.0 ⇒ the pattern *is* a greyscale emission profile) or `emit_map
+  pattern:<n>` modulating an authored spectrum; a `light` block spells the same slot `spd`,
+  so there the pair is `spd pattern:` / `spd_map pattern:`. `finalizeEmitters` copies the
+  material's `emitPat` onto the `Emitter` it registers, so the two spellings converge on one
+  runtime field. Emission is stricter than reflect/transmit because it is read from **both
+  sides of transport**: once when a camera path lands on the emitter (emission-on-hit, PatCtx
+  built from the `Hit`) and once at the point NEE / a light subpath samples on it (PatCtx
+  built from `Emitter::samplePoint`). MIS *combines* those two estimates, so if they ever
+  disagreed pointwise the image would be **biased**, not merely noisy. The profile is
+  therefore only legal where the sampler's (u,v) provably equals the (u,v) a hit interpolates
+  — `EmitterShape::Quad` (bilinear parameters) and `EmitterShape::Mesh` (barycentric UVs on
+  `EmitTri`, which gained `uv0`/`uvE1`/`uvE2`). Every other shape (sphere, cylinder, spot,
+  collimated, env) is **refused at load**, at two points: `addLight`'s subtype gate, and
+  `checkEmitPatsSupported` after `Scene::build()` for the material route. Making the quad
+  agree required fixing a latent pre-existing bug — the area light's *second* triangle
+  carried default UVs disagreeing with `addQuad`'s, i.e. a diagonal seam for any UV-driven
+  emission pattern **or texture** on an area light. `Emitter::samplePoint` gained optional
+  `uuOut`/`vvOut`, and the read is funnelled through three accessors in `scene.h`:
+  `emitSlot` (emission-on-hit), `emitterPatMulAt`, and `emitterSamplePoint` (sample + return
+  the multiplier in one call). The pattern is a **pure post-multiplier on radiance / photon
+  beta**: `Emitter::power`, `pdfChoice`, `pdfPos`/`pdfA`, `emissionPdfW`, `directPdfW` and
+  every VCM `dVCM`/`dVC`/`dVM` are deliberately untouched, which is exactly what makes it
+  unbiased by construction (no selection or positional pdf changes anywhere). The cost is
+  variance on a mostly-dark profile, and the fact that `power`/`lumens` normalise the
+  *unpatterned* spectrum, so a profile averaging 0.5 emits about half the requested flux —
+  documented rather than auto-corrected, since folding the mean into `power` would need a
+  compensating 1/mean on photon beta and on BDPT's `pdfChoice`. Verified unbiased at 160×160
+  against four independent estimators (R vs D within 0.3%, with a pattern-free control
+  showing the *same* residual, so it is a pre-existing R-vs-D difference; B/400M photons
+  within 0.005%; U/VCM within 0.02%). **CPU-only in 0.80.0**: the device has ~20 emission
+  read sites, and a partial port would be *biased* rather than visibly incomplete, so
+  `cudaForwardSupported` (and `cudaBackwardRGBSupported`) reject the whole scene and the CPU
+  renders it; the port is tracked in `known-issues.md`. The preview rasteriser ignores
+  `emitPat`, consistent with its existing treatment of `reflectPat`/`transmitPat`.
 
   **N-D authored-data tables.** A pattern formula can sample arrays of authored numbers in
   1–4 dimensions, via two sibling datatypes ported from loom's `data.py`/`interp.py`:

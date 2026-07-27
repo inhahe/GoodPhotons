@@ -221,7 +221,7 @@ patterns only" caveat from FTSL.md.
 
 </details>
 
-### TECH-DEBT — FIXED for `reflect` (0.75.0) and `transmit` (0.76.0); `emit` still open
+### TECH-DEBT — FIXED (`reflect` 0.75.0, `transmit` 0.76.0, `emit` 0.80.0)
 
 0.73.0 added inline array literals (`roughness [0 1](u)`, FTSL.md §6.1, example
 `scenes/pattern_array.ftsl`). They desugar to `pattern:__arrN` and therefore work at exactly
@@ -281,8 +281,57 @@ control (9.88), i.e. pure Monte Carlo noise; mode D (BDPT) and mode V agree — 
 forward-vs-backward best-fit scale is 0.994. All 11 `-check*` self-tests pass and the
 grammar-equivalence sweep is ok=380 / mismatch=0.
 
-**Still open — `emit`.** A separate pipeline again (emitter registration + power
-normalisation), so a pattern there needs its own design, not just an accessor.
+**FIXED for `emit` in 0.80.0** — the strict leg. Same two spellings (`emit pattern:<n>` /
+`emit [0 1](u)` alone in the slot, `emit_map pattern:<n>` modulating an authored spectrum),
+plus the `light`-block alias `spd pattern:` / `spd_map pattern:` for the same slot;
+`finalizeEmitters` copies `Material::emitPat` onto the `Emitter` so both spellings converge
+on one runtime field. What makes emission different from reflect/transmit is that it is read
+from **both sides of transport** — emission-on-hit when a camera path lands on the emitter,
+and Le at the point NEE / a light subpath samples — and MIS *combines* the two, so a
+pointwise disagreement is **bias**, not noise. The profile is therefore only legal where the
+sampler's (u,v) provably equals the hit's: `EmitterShape::Quad` (bilinear parameters) and
+`EmitterShape::Mesh` (barycentric UVs; `EmitTri` gained `uv0`/`uvE1`/`uvE2`). Sphere,
+cylinder, spot, collimated and env are **refused at load** — `addLight`'s subtype gate for
+the `light` route, `checkEmitPatsSupported` after `Scene::build()` for the material route.
+Reads funnel through `emitSlot` / `emitterPatMulAt` / `emitterSamplePoint` in `scene.h`.
+The pattern is a pure post-multiplier on radiance / photon beta: `power`, `pdfChoice`,
+`pdfPos`/`pdfA`, `emissionPdfW`, `directPdfW` and every VCM `dVCM`/`dVC`/`dVM` are untouched,
+which is what makes it unbiased by construction. Caveat, documented rather than
+auto-corrected: `power`/`lumens` normalise the *unpatterned* spectrum, so a profile averaging
+0.5 emits about half the requested flux. Worked example: `scenes/emit_pattern.ftsl`.
+
+Verified unbiased at 160×160 against four independent estimators: R vs D (BDPT) global ratio
+1.00268 — and a **control with the pattern removed** shows the same 1.00240 with the same
+corner-shaped tile profile, so that residual is a pre-existing R-vs-D estimator difference,
+not the pattern; B (forward photons, 400M) vs R global 1.00005; U (VCM, 1500 spp) vs R global
+1.00018. Load rejection of `light sphere { spd pattern:p }` confirmed. Fixed a latent
+pre-existing bug on the way: the area light's *second* triangle carried default UVs
+disagreeing with `addQuad`'s, i.e. a diagonal seam for any UV-driven emission pattern **or
+texture** on an area light.
+
+### TECH-DEBT — the emission pattern (`emitPat`) is CPU-only; the CUDA backends reject the scene
+
+0.80.0 ships `emit pattern:` / `emit_map` (and `spd` / `spd_map`) on the CPU only.
+`cudaForwardSupported` returns false if any `Emitter` or `Material` has `emitPat >= 0`, and
+`cudaBackwardRGBSupported` does the same, so a patterned scene silently falls back to the CPU
+(with a `-device gpu` message naming the emission profile as the reason).
+
+This was deliberate, not an oversight: unlike `reflectPat`/`transmitPat` — which funnel
+through one or two shared accessors — the device has roughly **20 emission read sites**
+(`specLookup(em.emitSpd, …)` and `dEmitterForMat` and their callers), and because emission is
+read from both sides of transport a *partially* ported pattern would produce a **biased**
+image rather than a visibly missing effect. Rejecting the whole scene is the safe state.
+
+The port needs: `DEmitter::emitPat` and `DMaterial::emitPat` uploaded; `DEmitTri` carrying
+`uv0`/`uvE1`/`uvE2`; a device `dEmitSlot` and `dEmitterSamplePointPat` mirroring the host
+accessors in `scene.h`; every one of those ~20 sites routed through them; then drop the two
+`Supported` gates. **Must be parity-checked against 0.80.0's CPU reference images** — a
+CPU/GPU RMSE at matched spp, plus the same R-vs-B-vs-U cross-estimator check on the GPU,
+since a missed site shows up as bias rather than as an obvious artefact.
+
+Related, and *not* part of the port: `raster.h` / `raster_cuda.cu` (the preview rasteriser)
+ignore `emitPat`, consistent with their existing behaviour for `reflectPat`/`transmitPat` —
+the preview is a shading approximation, so this is a cosmetic mismatch, not bias.
 
 ### BUILD BUG — FIXED (2026-07-26): editing a header did not rebuild the `.cu` files, and the linker could then keep a **stale copy of the function you just changed**
 

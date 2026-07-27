@@ -2919,6 +2919,44 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-27: **0.80.0 — `emit pattern:` / `emit_map`: the reflect / transmit / emit trio is complete.**
+  Same mechanism as 0.75.0/0.76.0 — a scalar pattern in a spectral slot is a per-hit **multiplier**
+  clamped to [0,1], so `emit pattern:<n>` (and `emit [0 1](u)`) leaves the pattern alone in the slot and
+  the base collapses to a flat 1.0 (a greyscale emission profile), while `emit <spectrum>` + `emit_map
+  pattern:<n>` modulates that spectrum so the lamp keeps its colour and only its brightness varies. A
+  `light` block spells the same slot `spd`, so the pair there is `spd pattern:` / `spd_map pattern:`;
+  `finalizeEmitters` copies `Material::emitPat` onto the registered `Emitter`, so both spellings converge
+  on one runtime field. **Emission is the strict leg**, and that drove every design choice: it is read
+  from *both sides of transport* — emission-on-hit (PatCtx from the `Hit`) and Le at the point NEE / a
+  light subpath samples (PatCtx from `Emitter::samplePoint`) — and MIS **combines** the two, so a
+  pointwise disagreement is **bias**, not noise. So (a) the profile is only legal where the sampler's
+  (u,v) provably equals the hit's — `EmitterShape::Quad` (bilinear parameters) and `EmitterShape::Mesh`
+  (barycentric UVs; `EmitTri` gained `uv0`/`uvE1`/`uvE2`) — with sphere/cylinder/spot/collimated/env
+  **refused at load** at two points (`addLight`'s subtype gate, `checkEmitPatsSupported` after
+  `Scene::build()`); (b) all reads funnel through three new accessors in `scene.h` (`emitSlot`,
+  `emitterPatMulAt`, `emitterSamplePoint`, the last sampling *and* returning the multiplier in one call),
+  wired into all six tracers — `backward.h` (scalar + hero emission-on-hit, `emitterGeom`, `neeVolume`),
+  `render.h` (both `genPhoton` variants), `photonmap_render.h`, `sppm_render.h`, `bdpt.h` (a new
+  `Vertex::emitPatW` threaded through `Le`, `randomWalk`, `generateLightSubpath` and the `s == 1` branch)
+  and `vcm.h`; and (c) it is a **pure post-multiplier on radiance / photon beta** — `power`, `pdfChoice`,
+  `pdfPos`/`pdfA`, `emissionPdfW`, `directPdfW` and every VCM `dVCM`/`dVC`/`dVM` are deliberately
+  untouched, which is precisely what makes it unbiased by construction. Fixed a latent pre-existing bug on
+  the way: the area light's *second* triangle carried default UVs disagreeing with `addQuad`'s — a
+  diagonal seam for any UV-driven emission pattern **or texture** on an area light. Caveat, documented
+  rather than auto-corrected: `power`/`lumens` normalise the *unpatterned* spectrum, so a profile
+  averaging 0.5 emits about half the requested flux (folding the mean into `power` would need a
+  compensating 1/mean on photon beta *and* on BDPT's `pdfChoice`). **CPU-only**: the device has ~20
+  emission read sites and a partial port would be *biased* rather than visibly incomplete, so
+  `cudaForwardSupported` / `cudaBackwardRGBSupported` reject the whole scene and the three GPU-fallback
+  "why" strings name the emission profile; the port is logged in `known-issues.md`. *Verified unbiased at
+  160×160 against four independent estimators:* R vs D (BDPT) global ratio 1.00268 — and a **control with
+  the pattern removed** reproduces the same 1.00240 with the same corner-shaped tile profile, so that
+  residual is a pre-existing R-vs-D estimator difference, not the pattern; B (forward photons, 400M) vs R
+  global **1.00005** (tiles 0.9990–1.0024); U (VCM, 1500 spp) vs R global **1.00018** (tiles
+  0.9973–1.0028). Load rejection of `light sphere { spd pattern:p }` confirmed; all eleven deterministic
+  self-tests pass and every scene in `scenes/` still loads. Worked example: `scenes/emit_pattern.ftsl`
+  (a `spd_map` ring lamp, a lone-`spd pattern:` checkerboard, and an `emit_map` material on a mesh
+  emitter via the new `meshes/uvquad.obj`).
 - 2026-07-27: **0.79.0 — the hand-written `.ftsl` parser is deleted; the shared grammar is now the *only*
   front end.** 0.68.0 flipped ftrace over to the grammar
   (`tools/loom/loom/grammar/ftsl_scene.epeg` → `src/gpda/`) after the corpus differ hit **MATCH 2595/2595**

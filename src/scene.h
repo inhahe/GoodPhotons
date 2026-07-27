@@ -115,6 +115,27 @@ struct Material {
     // Lambertian) it varies the back-hemisphere albedo, still under the rhoR+rhoT <= 1
     // energy guard, which is applied AFTER the multiplier at every call site.
     int transmitPat = -1;
+    // Same idea on the EMIT slot, read through emitSlot(): a per-point multiplier on the
+    // emitted radiance, clamped to [0,1] — a gobo / stained-glass / video-wall profile on
+    // an area light. `emit pattern:<name>` (or `emit [0 1](u)`) puts the pattern in the
+    // slot alone over a flat-1.0 base; `emit_map pattern:<name>` beside an SPD modulates
+    // that, so colour still comes from the spectrum.
+    //
+    // Emission is the one slot read from BOTH sides of the light transport — as
+    // emission-on-hit (a path lands on the emissive surface, PatCtx from the Hit) and as
+    // Le at a point drawn by the emitter sampler (NEE / BDPT / forward photon birth,
+    // PatCtx from Emitter::samplePointUV). MIS combines those two estimators, so they
+    // MUST agree pointwise or the image is biased, not just noisy. That is why the
+    // pattern is only accepted where the emitter sampler's (u,v) provably equals the
+    // geometry's hit (u,v): a rectangular area light (whose two tris now carry the same
+    // corner UVs addQuad uses) and a mesh area light (whose EmitTri carries the source
+    // triangle's UVs). Sphere / tube / spot / env emitters are rejected at load.
+    //
+    // The multiplier is deliberately NOT folded into Emitter::power, so no selection or
+    // positional pdf changes anywhere: it is a pure post-multiplier on radiance and on a
+    // born photon's beta, which keeps every estimator unbiased by construction. The cost
+    // is variance — a mostly-dark pattern still gets sampled as if it were fully on.
+    int emitPat = -1;
 
     // --- Parametric-record drive (§records) ---------------------------------
     // A material's slots can be driven by parametric records (Scene::records). Each
@@ -544,6 +565,11 @@ inline double spotFalloff(double ct, double cosInner, double cosOuter) {
 struct EmitTri {
     Vec3 v0, e1, e2, nrm;
     double cumArea = 0.0;
+    // The source triangle's texture coordinates, so a sampled point can report the SAME
+    // (u,v) the ray-hit path interpolates (geometry.h: uv = b0*uv0 + b1*uv1 + b2*uv2).
+    // Only read when an emission pattern is bound; stored as uv0 + the two uv edges to
+    // mirror the v0/e1/e2 layout above.
+    Vec3 uv0{0, 0, 0}, uvE1{1, 0, 0}, uvE2{1, 1, 0};
 };
 
 struct Emitter {
@@ -573,6 +599,10 @@ struct Emitter {
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
     double power = 0.0;       // emitIntegral * geomWeight (selection weight)
+    // Index into Scene::patterns of an emission profile over this emitter's surface,
+    // copied from the emissive material's `emitPat` at registration; -1 = uniform.
+    // Deliberately absent from `power` above — see Material::emitPat for why.
+    int emitPat = -1;
 
     // Per-emitter spectral/geometric weight fed into the combined backward
     // wavelength sampler and the power law: area*PI for surfaces, spotOmega for a
@@ -588,7 +618,18 @@ struct Emitter {
     // draws to the pre-sphere engine, so quad scenes stay bit-identical). Sphere:
     // a uniformly-distributed surface point (pdf = 1/area for both shapes). Not
     // used for Spot (a point light — see the forward/backward spot paths).
-    void samplePoint(double u1, double u2, Vec3& y, Vec3& nOut) const {
+    //
+    // `uuOut`/`vvOut` optionally report the sampled point's TEXTURE coordinates, which
+    // an emission pattern needs (emitterPatMul). They are filled only for the two shapes
+    // that can carry one — Quad (the bilinear parameters, which addAreaLight's two tris
+    // are UV'd to match) and Mesh (the chosen EmitTri's barycentric UV, the same
+    // interpolation geometry.h does at a hit) — and left at 0 elsewhere, since sphere /
+    // tube / spot / env emitters reject `emit pattern:` at load. Passing null (the
+    // default) keeps every existing caller's arithmetic untouched.
+    void samplePoint(double u1, double u2, Vec3& y, Vec3& nOut,
+                     double* uuOut = nullptr, double* vvOut = nullptr) const {
+        if (uuOut) *uuOut = 0.0;
+        if (vvOut) *vvOut = 0.0;
         if (shape == EmitterShape::Sphere) {
             double z = 1.0 - 2.0 * u1;                 // cos(theta) uniform in [-1,1]
             double r = std::sqrt(std::max(0.0, 1.0 - z * z));
@@ -654,9 +695,15 @@ struct Emitter {
             double b2 = u2 * su;
             y = t.v0 + t.e1 * b1 + t.e2 * b2;
             nOut = t.nrm;
+            // Same barycentric weights the ray-hit path uses, so a bound emission
+            // pattern reads identically from either side of the transport.
+            if (uuOut) *uuOut = t.uv0.x + t.uvE1.x * b1 + t.uvE2.x * b2;
+            if (vvOut) *vvOut = t.uv0.y + t.uvE1.y * b1 + t.uvE2.y * b2;
         } else {
             y = origin + u * u1 + v * u2;
             nOut = normal;
+            if (uuOut) *uuOut = u1;
+            if (vvOut) *vvOut = u2;
         }
     }
 
@@ -1040,6 +1087,10 @@ struct Scene {
             et.v0 = t.v0; et.e1 = e1; et.e2 = e2;
             et.nrm = nc / (2.0 * a);              // == normalize(cross(e1,e2))
             et.cumArea = total;
+            // Carry the source triangle's UVs as uv0 + edges, so a sampled point can
+            // report the same (u,v) the ray-hit path interpolates — required for an
+            // emission pattern to agree across NEE and emission-on-hit.
+            et.uv0 = t.uv0; et.uvE1 = t.uv1 - t.uv0; et.uvE2 = t.uv2 - t.uv0;
             e.meshTris.push_back(et);
         }
         if (e.meshTris.empty() || total <= 0.0) return; // nothing emissive
@@ -1120,6 +1171,13 @@ struct Scene {
     // wavelength sampler. Idempotent; called by build().
     void finalizeEmitters(double stepNm = 1.0) {
         totalPower = 0.0;
+        // Adopt each emitter's emission profile from the material on its geometry. Done
+        // here — one place, after every registration path — rather than threading an
+        // extra argument through addAreaLight / addMeshLight / the built-in scenes.
+        // NOT folded into `power` below: the pattern is a pure post-multiplier on
+        // radiance, so no selection or positional pdf anywhere has to change.
+        for (auto& e : emitters)
+            e.emitPat = (e.matId >= 0 && e.matId < (int)mats.size()) ? mats[e.matId].emitPat : -1;
         emitterCdf.assign(emitters.size(), 0.0);
         for (size_t i = 0; i < emitters.size(); ++i) {
             // Area/sphere keep the exact emitIntegral*area*PI expression so those
@@ -1508,6 +1566,41 @@ inline double transmitSlot(const Scene& scene, const Material& m,
                            const Hit& h, double lambda) {
     double v = m.transmit(lambda);
     return m.transmitPat < 0 ? v : v * slotPatMul(scene, m.transmitPat, h);
+}
+
+// Emitted radiance at a hit ON an emissive surface, i.e. emission-on-hit: the material's
+// `emit` SPD scaled by a bound emission pattern. The single point of truth for that half
+// of the emission slot; the other half — Le at a point the emitter SAMPLER drew — goes
+// through emitterSamplePoint() below, and the two are constructed to agree pointwise
+// because MIS combines them (see Material::emitPat).
+inline double emitSlot(const Scene& scene, const Material& m,
+                       const Hit& h, double lambda) {
+    double v = m.emit(lambda);
+    return m.emitPat < 0 ? v : v * slotPatMul(scene, m.emitPat, h);
+}
+
+// The emission-pattern multiplier at a point on `em`, given the point's own texture
+// coordinates. Clamped to [0,1] like the reflect/transmit slot patterns, so a runaway
+// formula can never manufacture light.
+inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
+                              const Vec3& y, const Vec3& nOut, double uu, double vv) {
+    if (em.emitPat < 0 || em.emitPat >= (int)scene.patterns.size()) return 1.0;
+    PatCtx c = makePatCtx(y, 0.0, nOut, uu, vv);
+    bindPatScene(c, scene);
+    double p = scene.patterns[em.emitPat].eval(c);
+    return p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);
+}
+
+// Draw a point on `em` and return the emission-pattern multiplier there, so a caller can
+// write `Le = em.spdFn(lambda) * invPdfLambda * pmul`. 1.0 whenever no pattern is bound,
+// which is every scene that does not use the feature — those keep bit-identical draws
+// (samplePoint's uv outputs are the only extra work and they do not touch the RNG).
+inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
+                                 double u1, double u2, Vec3& y, Vec3& nOut) {
+    if (em.emitPat < 0) { em.samplePoint(u1, u2, y, nOut); return 1.0; }
+    double uu = 0.0, vv = 0.0;
+    em.samplePoint(u1, u2, y, nOut, &uu, &vv);
+    return emitterPatMulAt(scene, em, y, nOut, uu, vv);
 }
 
 // Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern

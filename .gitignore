@@ -43,6 +43,9 @@
 
 # Generated meshes (regenerate with tools/make_mesh.py)
 *.obj
+# ...except this one: a hand-written UV'd unit quad that a shipped scene
+# (scenes/emit_pattern.ftsl) depends on, not a generated mesh.
+!meshes/uvquad.obj
 
 # Reference PDFs (e.g. Kodak Wratten handbook used to digitize filter data)
 *.pdf

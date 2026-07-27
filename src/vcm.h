@@ -489,13 +489,18 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated) return;
 
     double u1 = rng.uniform(), u2 = rng.uniform();
-    Vec3 y, nOut; em.samplePoint(u1, u2, y, nOut);
-    double Le = em.spdFn(lambda) * invPdfLambda;
+    Vec3 y, nOut;
+    // `emit pattern:` factor at the sampled point (1.0 without one). It scales the
+    // emitted radiance ONLY: directPdfW / emissionPdfW below — and therefore every dVCM
+    // / dVC / dVM MIS quantity derived from them — stay exactly as the camera side's
+    // s=0/s=1 terms assume, which is what keeps VCM's weights consistent.
+    double emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
+    double Le = em.spdFn(lambda) * invPdfLambda * emitPatW;
     // Max over the LIVE wavelengths, never the hero alone (hero.h policy 3): a spiky
     // emission spectrum can be dark at the hero and bright at a secondary.
     double LeSec[hero::kHeroMax - 1] = {0}, mxLe = Le;
     for (int i = 0; i + 1 < C; ++i) {
-        LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1];
+        LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
         if (LeSec[i] > mxLe) mxLe = LeSec[i];
     }
     if (mxLe <= 0.0) return;
@@ -749,10 +754,13 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         if (mp->isLight) {
             double cosLight = dot(h.ng, wo);
             if (cosLight > 0.0) {
-                double Le = mp->emit(lambda) * invPdfLambda;
+                // Achromatic `emit pattern:` factor at this hit — the same value the
+                // light-subpath / NEE sides get from emitterSamplePoint at this point.
+                double ep = (mp->emitPat < 0) ? 1.0 : slotPatMul(scene, mp->emitPat, h);
+                double Le = mp->emit(lambda) * invPdfLambda * ep;
                 double LeSec[hero::kHeroMax - 1] = {0}, mxLe = Le;
                 for (int i = 0; i + 1 < nUp; ++i) {
-                    LeSec[i] = mp->emit(hb.lam[i + 1]) * hb.invPdf[i + 1];
+                    LeSec[i] = mp->emit(hb.lam[i + 1]) * hb.invPdf[i + 1] * ep;
                     if (LeSec[i] > mxLe) mxLe = LeSec[i];
                 }
                 if (mxLe > 0.0) {
@@ -786,7 +794,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 const Emitter& em = scene.emitters[ei];
                 if (!(em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)) {
                     double u1 = rng.uniform(), u2 = rng.uniform();
-                    Vec3 yL, nL; em.samplePoint(u1, u2, yL, nL);
+                    Vec3 yL, nL;
+                    double epat = emitterSamplePoint(scene, em, u1, u2, yL, nL);
                     Vec3 toL = yL - h.p; double dist2 = dot(toL, toL);
                     if (dist2 > 1e-12) {
                         double distL = std::sqrt(dist2); Vec3 wi = toL / distL;
@@ -802,13 +811,14 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                           : (cosToLight > 0.0 && stG > 0.0);
                         if (cosAtLight > 0.0 && sideOk) {
                             double f = bsdfF(*mp, h.n, wo, wi, lambda, scene, &h) * stG;
-                            double Le = em.spdFn(lambda) * invPdfLambda;
+                            double Le = em.spdFn(lambda) * invPdfLambda * epat;
                             // Per-λ BSDF × emitted radiance; the emitter-sampling densities
-                            // below are λ-independent and stay the hero's.
+                            // below are λ-independent and stay the hero's (the pattern
+                            // scales radiance only, never a pdf).
                             double fLeSec[hero::kHeroMax - 1] = {0}, mxfLe = f * Le;
                             for (int i = 0; i + 1 < nUp; ++i) {
                                 fLeSec[i] = bsdfF(*mp, h.n, wo, wi, hb.lam[i + 1], scene, &h) * stG *
-                                            em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1];
+                                            em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * epat;
                                 if (fLeSec[i] > mxfLe) mxfLe = fLeSec[i];
                             }
                             if (mxfLe > 0.0 && em.area > 0.0 &&

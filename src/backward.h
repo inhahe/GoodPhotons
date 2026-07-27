@@ -146,7 +146,14 @@ struct BackwardRenderer {
             w = cosSurf / pdfW * stG;                        // solid-angle measure
             return true;
         }
-        if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
+        // quad / mesh / interior-sphere / cylinder fallback. emitterSamplePoint also
+        // returns this point's `emit pattern:` multiplier (1.0 when there is none, so
+        // every unpatterned scene stays bit-identical); folding it into the λ-independent
+        // geometry weight `w` makes both the scalar and hero NEE pick it up at once, and
+        // matches the emitSlot() factor the emission-on-hit side applies at the same
+        // surface point — which is what keeps the MIS pair consistent.
+        double epat = 1.0;
+        if (!cylVisible) epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
         Vec3 toL = y - h.p;
         double dist2 = dot(toL, toL);
         dist = std::sqrt(dist2);
@@ -160,6 +167,7 @@ struct BackwardRenderer {
         if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) return false;
         double G = cosSurf * cosLight / dist2;           // geometry term
         w = G * effArea * stG;                           // pdf_area = 1/effArea (visible area for cylinder)
+        if (epat != 1.0) w *= epat;                      // no-op (and bit-identical) without a pattern
         return true;
     }
 
@@ -268,7 +276,10 @@ struct BackwardRenderer {
                 double phase = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
                 contrib = albedo * phase * emitW / pdfW;   // solid-angle measure
             } else {
-                if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
+                // quad / mesh / interior-sphere / cylinder fallback; also returns the
+                // sampled point's emission-pattern factor (1.0 when unpatterned).
+                double epat = 1.0;
+                if (!cylVisible) epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
                 Vec3 toL = y - p;
                 double dist2 = dot(toL, toL);
                 dist = std::sqrt(dist2);
@@ -279,6 +290,7 @@ struct BackwardRenderer {
                 double phase = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
                 double G = cosLight / dist2;               // no surface cosine at a volume vertex
                 contrib = albedo * phase * emitW * G * effArea;
+                if (epat != 1.0) contrib *= epat;
             }
             contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
             total += contrib;
@@ -698,10 +710,13 @@ struct BackwardRenderer {
             const Material& m = *mp;
 
             // Emission (add only on specular/camera arrival; NEE covers diffuse).
-            // The surface's own emitted radiance Le=m.emit(lambda), weighted by the
+            // The surface's own emitted radiance Le=emitSlot(...), weighted by the
             // reciprocal wavelength pdf (= its SPD integral for a single light).
+            // emitSlot applies any `emit pattern:` at this hit; the NEE side below
+            // applies the SAME profile via emitterSamplePoint, which is what keeps the
+            // two estimators consistent (see Material::emitPat).
             if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0)
-                L += thr * m.emit(lambda) * invPdfLambda;
+                L += thr * emitSlot(scene, m, h, lambda) * invPdfLambda;
 
             if (!interactMaterial(scene, m, h, mats, ray, lambda, invPdfLambda, thr, L,
                                   specularArrival, contBsdfPdf, stk, rng, spdCache))
@@ -797,9 +812,13 @@ struct BackwardRenderer {
             const Material& m = *mp;
 
             // Surface emission on a specular/camera arrival (NEE covers diffuse).
-            if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0)
+            // An `emit pattern:` is achromatic, so evaluate it ONCE for the whole hero
+            // bundle rather than per-wavelength inside emitSlot.
+            if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0) {
+                double ep = (m.emitPat < 0) ? 1.0 : slotPatMul(scene, m.emitPat, h);
                 for (int i = 0; i < nUp; ++i)
-                    L[i] += thr[i] * m.emit(lam[i]) * invPdf[i];
+                    L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
+            }
 
             switch (m.type) {
                 case MatType::DiffuseTransmit: {

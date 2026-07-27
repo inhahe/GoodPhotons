@@ -1785,7 +1785,26 @@ back-hemisphere albedo across its face (still energy-guarded so reflect + transm
 a `filter`'s per-wavelength gel transmittance — a colored gel whose density is painted by a
 formula. Those two families are the only ones that read the slot at all, so a transmit
 pattern anywhere else is a load error, same policy as `reflect`. Worked example
-`scenes/transmit_pattern.ftsl`. (`emit` doesn't take a pattern yet.)
+`scenes/transmit_pattern.ftsl`.
+
+**Pattern-driven emission.** The same two spellings again, on the `emit` slot —
+`emit pattern:<name>` alone (the pattern *is* the greyscale emission profile) or
+`emit_map pattern:<name>` beside a spectrum (the lamp keeps its colour, the pattern meters
+its brightness). A `light` block spells its emission slot `spd`, so there the pair reads
+`spd pattern:<name>` / `spd_map pattern:<name>`. Paint a stained-glass window, a filament's
+hot spot, an LED matrix or a gobo straight onto a lamp's surface.
+
+Emission is stricter than the other two slots for a reason: the profile is read from **both
+sides of transport** — once when a camera path lands on the emitter, once at the point NEE
+or a light subpath samples on it — and MIS combines the two, so if the two readings ever
+disagreed the render would be **biased**, not merely noisy. It is therefore only allowed on
+the two emitter shapes whose sampled (u,v) provably equals the (u,v) a hit interpolates: a
+rectangular **area** light and a **mesh** emitter. A sphere / cylinder / spot / env light is
+refused at load. Two more consequences worth knowing: `power`/`lumens` normalise the
+*unpatterned* spectrum (the pattern is a pure post-multiplier on radiance — which is exactly
+what leaves every pdf untouched — so a profile averaging 0.5 emits about half the requested
+flux), and an emission pattern is **CPU-only** for now, falling back from the GPU backends
+with a notice. Worked example `scenes/emit_pattern.ftsl`.
 
 **UV on native primitives.** The `u v` pattern variables aren't limited to meshes.
 A native `sphere {}` carries built-in equirectangular (lat/long) UVs, a `quad {}`

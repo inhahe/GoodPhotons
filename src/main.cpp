@@ -2975,9 +2975,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (!cudaBdptSupported(scene)) {
                 const char* why = "scene has a BDPT-GPU-unsupported feature "
                                   "(fluorescent/oversized-mix material, fog, "
-                                  "spot/env/collimated light, or a per-hit BSDF the GPU "
-                                  "BDPT can't MIS: a procedural pattern or frosted/colored "
-                                  "glass)";
+                                  "spot/env/collimated light, an `emit pattern:` emission "
+                                  "profile, or a per-hit BSDF the GPU BDPT can't MIS: a "
+                                  "procedural pattern or frosted/colored glass)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -2994,8 +2994,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // light (M1). Collimated beams still fall back to the CPU backward tracer.
             if (!cudaBackwardSupported(scene, cam)) {
                 const char* why = "scene has a backward-GPU-unsupported feature "
-                                  "(collimated light, or a lens deeper than the "
-                                  "device cap)";
+                                  "(collimated light, an `emit pattern:` emission "
+                                  "profile, or a lens deeper than the device cap)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -3016,7 +3016,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         } else if (!cudaForwardSupported(scene)) {
             const char* why = "GPU-unsupported feature (layered material, indexed "
                               "palette, parametric record, oversized multilayer/mix "
-                              "material, or an emissive 'fire' volume)";
+                              "material, an `emit pattern:` emission profile, or an "
+                              "emissive 'fire' volume)";
             if (wantGpu) std::fprintf(stderr, "[device] scene has a %s; using CPU\n", why);
             else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else {
