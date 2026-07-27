@@ -131,6 +131,30 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `cie*power*norm/pi` into three floats. The `-savemap` cache format is `FTPMP02`
   (two blocks: positions, then payloads); `FTPMP01` files are rejected with a message
   telling the user to re-deposit.
+  **The mode-M gather radius is density-adaptive** (`PhotonMap::buildAuto`, default on;
+  `-nopmauto` or an explicit `-pmradius` opts out bit-identically). `build(r)` sizes the grid
+  at `cellSize == r`, so a radius chosen from scene size alone freezes the grid and makes
+  photons-per-cell — and gather cost — grow *linearly* with `-n`. `buildAuto` therefore bins
+  once at the requested radius as a probe, asks `medianNeighborCount()` what a typical gather
+  actually sees, and re-bins at `r·sqrt(k/n)` for a target `k = kAt1M·cbrt(M/1e6)`, `M` =
+  stored photons. The cube root is a deliberate choice, not a free parameter: holding the
+  disc population *constant* (`r ∝ M^-1/2`) would hold variance constant too, so the image
+  would never converge in noise, only in bias. `r ∝ M^-1/3` gives per-query cost `M^1/3`,
+  noise `M^-1/6` and bias `M^-2/3` — both error terms → 0, with a mild cost curve.
+  `build` is split into `buildGrid` + `fillCie` for this, since the probe needs a second
+  counting sort but only one (expensive, threaded) CIE pass.
+  **`medianNeighborCount` samples by cell, not by array index** — cells are fixed by the
+  bbox and cell size, i.e. by geometry, whereas the counting sort is stable and so preserves
+  a within-cell order that differs between a fresh deposit and a `-loadmap` of the same map.
+  Sampling by array position therefore made `-loadmap` stop reproducing its `-savemap` run.
+  Within a sampled cell the representative is the lexicographically smallest position (a
+  set-minimum, hence order-free); the cell *centre* would not do, because a cell that the
+  surface merely clips has its centre off-surface and reports a spuriously empty
+  neighbourhood.
+  The GPU shared path gets the same treatment via `renderPhotonMapSharedCuda`'s `autoK`
+  argument (0 = off) — it must, since that is the high-photon-count path where a
+  count-independent radius collapses worst. The gather reads `pm.radius` after the build, so
+  the adapted value needs no further plumbing.
 - **`spectrum.h` / `spectral_library.h` / `upsample.h` / `color.h` / `hero.h`** —
   spectral core: measured SPDs/materials, RGB→spectrum upsampling, CIE tables,
   hero-wavelength sampling (`kHeroC=4`: hero λ + 3 stratified secondaries) used by

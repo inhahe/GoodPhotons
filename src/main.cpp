@@ -1098,6 +1098,35 @@ static int g_previewRows = 0;   // terminal lines the last preview occupied (for
 static double g_pmRadiusAbs = 0.0;
 static double g_pmRadiusFactor = 0.02;
 
+// Density-adaptive gather radius (mode M). ON by default: the radius above is only a
+// starting point, and PhotonMap::buildAuto measures how many photons a typical gather
+// actually sees and rescales the radius so that population lands on
+// `g_pmAutoCount * cbrt(stored/1e6)`. Without this the radius is independent of `-n`, so
+// photons-per-cell — and gather time — grows linearly with the photon count and mode M
+// gets *slower per sample* the more photons you ask for (see known-issues.md). The target
+// grows sublinearly on purpose so that noise AND bias both still converge; see the long
+// note on PhotonMap::buildAuto for the exponent argument.
+//
+// An explicit `-pmradius <r>` means "use exactly this radius" and turns the adaptation off
+// (that was the documented workaround for the scaling problem, so it must keep working);
+// `-pmauto` forces it back on, `-nopmauto` off, `-pmcount <k>` sets the target and implies on.
+static bool   g_pmAutoRadius = true;
+static double g_pmAutoCount  = 200.0;   // calibrated to today's look — see PhotonMap::buildAuto
+
+// Bin a freshly-deposited (or freshly-loaded) photon map, honouring the adaptive-radius
+// setting, and say out loud what radius it settled on — the radius printed before the
+// deposit is only the starting point, and a silently-different one would be baffling when
+// comparing renders. Returns the radius actually used.
+static double buildPhotonMap(PhotonMap& pm, double radius, const char* tag) {
+    if (!g_pmAutoRadius) { pm.build(radius); return radius; }
+    double nProbe = 0.0, kTarget = 0.0;
+    const double r = pm.buildAuto(radius, g_pmAutoCount, &nProbe, &kTarget);
+    std::printf("%s adaptive gather radius: %.4g -> %.4g (a typical gather saw %.0f photons "
+                "at the starting radius; target %.0f for %zu stored)\n",
+                tag, radius, r, nProbe, kTarget, pm.photons.size());
+    return r;
+}
+
 // Mode-M final gather (CLI -pmfg <K>). 0 = off: read the density estimate directly at the
 // visible point (fast, but the estimate's blur softens contact shadows / fine detail right
 // at that surface). K > 0 = Jensen final gather: shoot K cosine-weighted hemisphere
@@ -2730,7 +2759,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
         tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC);
-        pm.build(radius);
+        radius = buildPhotonMap(pm, radius, "mode M:");
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
                     "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
@@ -3820,8 +3849,14 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
-        else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
+        // An explicit absolute radius pins the radius: don't then adapt it out from under
+        // the user (this was the documented workaround for mode M's scaling problem).
+        // -pmradiusfrac only rescales the STARTING radius, so it leaves adaptation on.
+        else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) { g_pmRadiusAbs = std::atof(argv[++i]); g_pmAutoRadius = false; }
         else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-pmauto")) g_pmAutoRadius = true;
+        else if (!std::strcmp(argv[i], "-nopmauto")) g_pmAutoRadius = false;
+        else if (!std::strcmp(argv[i], "-pmcount") && i + 1 < argc) { g_pmAutoCount = std::atof(argv[++i]); g_pmAutoRadius = true; }
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
         else if (!std::strcmp(argv[i], "-savemap") && i + 1 < argc) g_pmapSave = argv[++i];
         else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
@@ -6130,7 +6165,7 @@ static int run(int argc, char** argv) {
                     double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                                           : scene.sceneRadius * g_pmRadiusFactor;
                     tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap, g_heroC);
-                    meterPmap.build(radius);
+                    buildPhotonMap(meterPmap, radius, "[meter]");
                     meterPmapBuilt = true;
                 }
                 mf = renderPhotonCamera(scene, mc.cam, W, H, meterPmap, meterSpp, nThreads,
@@ -6217,7 +6252,8 @@ static int run(int argc, char** argv) {
                     };
                 renderPhotonMapSharedCuda(scene, mcams, rxs, rys, meterN, radius, e,
                                           diffraction, meterSpp, nullptr, &onFrame,
-                                          nullptr, nullptr, g_heroC, g_pmFinalGather);
+                                          nullptr, nullptr, g_heroC, g_pmFinalGather,
+                                          g_pmAutoRadius ? g_pmAutoCount : 0.0);
                 metered = true;   // a black meter falls into the no-anchor warning below
             }
         }
@@ -6637,7 +6673,8 @@ static int run(int argc, char** argv) {
                                           g_showWindow ? &liveProg : nullptr, &writeFrame,
                                           g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
                                           g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
-                                          g_pmFinalGather);
+                                          g_pmFinalGather,
+                                          g_pmAutoRadius ? g_pmAutoCount : 0.0);
                 if (e.emitted > 0.0)
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,
@@ -6653,7 +6690,7 @@ static int run(int argc, char** argv) {
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
         tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC);
-        pm.build(radius);
+        buildPhotonMap(pm, radius, "[camera]");
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "
                     "grid %dx%dx%d — gathering %zu cameras ...\n",

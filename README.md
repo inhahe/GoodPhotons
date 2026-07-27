@@ -594,13 +594,22 @@ that converges to the same physical image.
   **without re-tracing a single photon** (the expensive forward pass is skipped entirely).
   A scene-identity guard rejects a stale map built for a different scene, falling back to
   a fresh deposit. (Matches the forward splat modes `A`/`B`/`C` — same forward physics,
-  just measured from a stored map.) *Scaling caveat:* the gather radius does **not** adapt
-  to `-n`, so photons-per-cell — and hence gather time — still grows with the photon count;
-  at very high `-n` a render can look stalled when it is only working through a huge map.
-  Pass a smaller `-pmradius` when you raise `-n`, or use `-savemap`/`-loadmap` (currently
-  honoured only on `-device gpu`) so the deposit is paid once. (The map itself is 80
-  bytes/photon and its inner query loop is bandwidth-tuned, so this is a milder curve than
-  it used to be — but it is still a curve.)
+  just measured from a stored map.) The gather radius is **density-adaptive by default**:
+  after the deposit ftrace measures how many photons a typical gather actually sees, then
+  re-bins the grid at the radius that hits a target population — a target that grows only as
+  the *cube root* of the stored photon count. Without this the radius came from the scene
+  size alone, so photons-per-cell (and gather time) grew linearly with `-n`, and a high-`-n`
+  render could look stalled when it was only grinding through a huge map. Measured on a
+  Cornell-style test scene, cost per emitted photon used to **rise** with `-n`
+  (54.9 → 67.3 µs/M going from 500k to 4M) and now **falls** (27.0 → 9.0 µs/M) — a 7.5×
+  wall-clock win at `-n 4000000` (269 s → 36 s). Quality improves too, because the same wall clock now buys
+  far more photons: scored against a converged BDPT reference at **matched render time**,
+  RMSE drops ~20–24% overall and ~32–41% on flat wall areas where noise dominates. Controls:
+  `-pmcount <k>` sets the target population at 1 M stored photons (default `200`, calibrated
+  so ordinary renders keep the look they already had — raise for smoother/blurrier, lower
+  for sharper/grainier); `-nopmauto` restores the old fixed-radius behaviour exactly
+  (bit-identical), as does passing an explicit `-pmradius`. `-savemap`/`-loadmap` (currently
+  honoured only on `-device gpu`) still lets the deposit be paid just once.
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the
@@ -2203,7 +2212,9 @@ add-on), this doubles as a Blender → FTSL path.
 | `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
 | `-on-unsupported error\|fallback\|strip` | What to do when the selected mode can't render a scene feature (GRIN media, or a fisheye camera in mode `D`/`U`). `error` (default) prints a diagnostic and aborts; `fallback` renders that camera in mode `R` (backward reference) instead; `strip` removes the offending feature (e.g. drops the GRIN `ior`, turning the medium into a plain one) and renders in the requested mode anyway. Complements `prefer { … } else { … }` in the scene file, which resolves the mode/feature mismatch *before* this policy is consulted |
-| `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
+| `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier. In mode `M` this is the *starting* radius the density adaptation refines from — except `-pmradius`, which pins it exactly (implies `-nopmauto`) |
+| `-pmcount <k>` | Mode `M` density-adaptive gather radius: target number of photons a typical gather should see, at 1 M stored photons (default `200`; the target grows as the cube root of the stored count). Implies `-pmauto`. Higher = smoother/blurrier and slower, lower = sharper/grainier and faster |
+| `-pmauto` / `-nopmauto` | Turn the mode-`M` density-adaptive gather radius on (default) or off. `-nopmauto` reproduces the old fixed-radius output bit-for-bit |
 | `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
 | `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |

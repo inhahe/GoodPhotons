@@ -5,6 +5,46 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUILD BUG — FIXED (2026-07-26): editing a header did not rebuild the `.cu` files, and the linker could then keep a **stale copy of the function you just changed**
+
+**Symptom that exposed it.** A change to `PhotonMap::buildAuto` (a header-inline function in
+`src/photonmap.h`) had no effect on the running binary across *four* consecutive
+`build.bat` runs — including one after deleting `build_cuda2/bin/ftrace.exe` to force a
+relink. A `printf` added inside the edited block never appeared. `main.obj` genuinely
+contained the new code (`grep -a` found the new format string in it); the linked exe did
+not. Touching `src/render_cuda.cu` by hand fixed it instantly.
+
+**Root cause.** MSVC's `ClCompile` records every `#include` it opened (`/showIncludes` →
+`.tlog`) and rebuilds a `.cpp` when any of them changes. MSBuild's **`CudaCompile` task does
+not do this at all** — it compares only the `.cu`'s own timestamp. So a header-only edit
+left `render_cuda.obj` / `raster_cuda.obj` stale while the build reported success.
+
+That is much worse than "the GPU path is one build behind", because `render_cuda.cu` and
+`raster_cuda.cu` include the *same* headers as the C++ TUs (`photonmap.h`, `render.h`,
+`scene.h`, …). Every inline/template function in those headers is emitted as a **COMDAT in
+both objects**, the linker keeps exactly one copy, and it is free to keep the stale one.
+Net effect: **a header-only edit could silently produce a binary running the OLD body of a
+function, pulled from a `.cu` you never touched — even on a CPU-only code path.** Any
+"bit-identical before/after" validation done without touching a `.cu` was potentially
+meaningless.
+
+**Fix.** `CMakeLists.txt` now runs `cmake/touch_stale_cu.cmake` as a `PRE_BUILD` step of the
+`ftrace` target: it bumps the mtime of any `src/*.cu` older than the newest `src/*.h` /
+`src/*.cuh`, which is the one signal `CudaCompile` does honour. `OBJECT_DEPENDS` is **not** a
+usable fix here — CMake's Visual Studio generator emits `<CudaCompile Include="..."/>` items
+with no metadata at all, so the `AdditionalInputs` never reach MSBuild (verified by
+inspecting the generated `ftrace.vcxproj`). The check is deliberately coarse (any header
+newer than a `.cu` rebuilds both `.cu` files, ~1.5 min) and is idempotent, since the touch
+sets the mtime to now. **Verified:** `touch src/photonmap.h` followed by `build.bat` now
+prints `[cuda-deps] photonmap.h is newer than render_cuda.cu — touching it so nvcc rebuilds`
+and recompiles both `.cu` TUs.
+
+**Consequence for past results:** the SoA photon-map change (`fd643ce`) was re-validated
+after this fix — `-nopmauto` output is bit-identical to the pre-change binary
+`scraps/ftrace_base_99a898d.exe` on CPU mode M, CPU mode S, GPU mode M and GPU mode S, so
+that commit's claims stand. Earlier header-only measurements that were never re-checked
+should be treated with suspicion.
+
 ### TECH-DEBT — DONE (2026-07-24, v0.49.0): volumetric blackbody emission ("fire", C3) now runs on the GPU forward tracer
 
 **Was:** the emissive-volume path (a `medium` with a `temperature vdb:` grid + `emission blackbody`) ran only
@@ -1675,7 +1715,7 @@ scene-level control-point fix is still the best-LOOKING result for the gallery (
 removes the sharp reversal geometrically → jerk 6.5°); the engine fix is the general
 safety net so aggressive future paths degrade to a bounded pan instead of a rake.
 
-### Mode-M dense photon map makes per-frame gather slow — PERF NOTE 2026-07-14, root-caused 2026-07-26
+### Mode-M dense photon map makes per-frame gather slow — FIXED 2026-07-26 (noted 2026-07-14)
 
 With a very dense saved map (the 60M-photon gallery map deposits ~58.3M photons), each
 per-camera density-estimate gather is expensive (~90–120 s/frame at 960×540, 48 spp on a
@@ -1706,7 +1746,7 @@ including the deposit):
 | 8 M | ~53 M | killed — no output after ~16 min, 5.4 GB RSS |
 
 So it scaled ≈ `N^1.4`, not `N` — and there turned out to be **two independent causes**,
-one of which is now fixed. The 8 M case looks like a hang from the outside (no progress
+both of which are now fixed. The 8 M case looks like a hang from the outside (no progress
 line during the gather); it isn't, it's just this curve. Note this is **not** a
 `-heroc`/`-herosplit` regression: it was measured identically with the hero bundle off,
 and hero only multiplies the *stored* count (C deposits per photon), which moves you
@@ -1754,22 +1794,73 @@ CPU mode S, GPU mode M, GPU mode S) plus a `-savemap` → `-loadmap` round trip.
 then payloads); old files are refused with a message telling the user to re-deposit and
 fall back to a fresh deposit.
 
-**Cause 1 (the linear part) — STILL OPEN.** The radius remains count-independent, so
-photons-per-cell still grows linearly with `-n` and the gather cost with it; the fix above
-only lowered the constant. The proper fix is to make the radius a function of density:
-either (a) `k`-nearest-neighbour gathers (pick `r` per query so ~`k` photons are found,
-which is what makes classic PPM scale), or (b) shrink the global default radius with the
-*stored* photon count, which is known before `build()` is called. Note (b) needs a
-deliberate choice of exponent and it is not simply "keep cost flat": `r ∝ N^(-1/2)` does
-hold photons-per-disc (and therefore both cost and variance) constant, but constant
-variance means the image never converges in noise, only in bias. The MSE-optimal 2-D
-kernel bandwidth `r ∝ N^(-1/6)` converges properly and brings cost down to `N^(2/3)`;
-`r ∝ N^(-1/3)` is more aggressive (cost `N^(1/3)`, variance still → 0, bias → 0 faster)
-and is probably the right engineering pick. Either way it **changes default mode-M output**,
-so it wants a VERSION minor bump, a README note, and an opt-out — and modes S/U already do
-per-pass radius reduction (`R0 * pow(it, 0.5*(alpha-1))`), so mode M is the odd one out
-and should reuse that machinery's conventions. Until then the workaround is an explicit
-smaller `-pmradius` when raising `-n`, or `-savemap`/`-loadmap` so the deposit is paid once.
+**Cause 1 (the linear part) — FIXED 2026-07-26: the gather radius is now density-adaptive
+(`PhotonMap::buildAuto`, on by default in mode M).** The radius used to come from the scene
+size alone, so `build(r)` froze the grid at `cellSize = r` and photons-per-cell — plus the
+3×3×3 scan cost — grew linearly with `-n`. Measured populations at the fixed radius were
+perfectly linear: 350 / 1395 / 5623 / 22433 photons per gather at 1.67 M / 6.7 M / 26.7 M /
+107 M stored.
+
+The fix bins once at the starting radius `r0`, **probes the actual density** (median photons
+seen by a sample of real `queryR` calls), then re-bins at
+`r1 = r0 · sqrt(k / n_probe)` where the target population is
+
+```
+k(M) = kAt1M · cbrt(M / 1e6)        (kAt1M = 200, i.e. -pmcount)
+```
+
+so `r ∝ M^(-1/3)`: per-query cost `M^(1/3)`, noise `M^(-1/6)`, bias `M^(-2/3)` — both error
+terms still go to zero, unlike the tempting `r ∝ M^(-1/2)` (constant population ⇒ constant
+*variance* ⇒ the image never converges in noise, only in bias). The MSE-optimal 2-D bandwidth
+would be `M^(-1/6)` (cost `M^(2/3)`); the cube root is the more aggressive engineering pick.
+
+`kAt1M = 200` is **calibrated to the old look**: at the default `-pmradiusfrac` the fixed
+radius already delivered ~185–210 photons per gather at 1 M stored, so ordinary renders keep
+the population (and therefore the styling) they already had — only the runaway tail is cut.
+At 1.67 M / 6.7 M / 26.7 M / 107 M stored the old 311 / 1256 / 5045 / 20221 become
+237 / 377 / 598 / 949.
+
+Measured on `scraps/abs_herosplit.ftsl` (`-device cpu -mode M`, 256², wall clock incl.
+deposit, runs strictly serial):
+
+| `-n` emitted | fixed | adaptive | speedup | fixed µs/M emitted | adaptive µs/M |
+|---|---|---|---|---|---|
+| 500 k | 27.5 s | 13.5 s | 2.03× | 54.9 | 27.0 |
+| 1 M | 52.3 s | 18.6 s | 2.82× | 52.4 | 18.6 |
+| 2 M | 111.8 s | 26.5 s | 4.22× | 55.9 | 13.2 |
+| 4 M | 269.1 s | 36.1 s | 7.45× | 67.3 | 9.0 |
+
+Note the *shape*: cost per emitted photon used to **rise** with `-n` and now **falls**. The
+grid also unfreezes — 72 → 113 → 179 → 282 cells per axis across 250 k → 16 M emitted, where
+it used to sit at 59³ forever.
+
+This trades blur (bias) for grain (variance), so it was validated at **matched wall time**,
+not matched `-n`, against an independent converged BDPT reference (`png/pmref/ref_bdpt.png`,
+scored by the throwaway `scraps/pm_quality.py`). RMSE drops ~20–24% whole-frame and ~32–41%
+on a flat left-wall patch where noise dominates — and adaptive at 29.5 s beats fixed at
+54.5 s. So it is a quality *improvement* even at the small end, not just a speed/quality
+trade.
+
+Requirements from the original entry, all satisfied: VERSION minor bump (0.66.0 → **0.67.0**),
+README note (mode-M bullet + three CLI-table rows), and an opt-out — `-nopmauto` or an
+explicit `-pmradius` (which implies it) reproduces the old output **bit-for-bit**, verified on
+CPU mode M, CPU mode S, GPU mode M, GPU mode S, plus a `-savemap` → `-loadmap` round trip.
+`-pmcount <k>` retunes the target. The GPU shared-map path takes the same target as an `autoK`
+argument to `renderPhotonMapSharedCuda` and adapts identically.
+
+Two implementation notes worth keeping:
+* `build()` was split into `buildGrid()` + `fillCie()` so the probe can bin twice while paying
+  the expensive threaded CIE precompute only once.
+* The probe **must be order-independent**, or `-loadmap` stops reproducing its `-savemap` run.
+  The counting sort is stable, so within-cell photon order differs between a fresh deposit and
+  a reload of the same map; striding over `photons[]` by array index therefore picked different
+  probe points and yielded a different radius (0.008981 vs 0.008977). It now samples by *cell*
+  (geometry-determined) and takes the lexicographically smallest position in the cell as the
+  representative — a set minimum, hence order-free. The cell *centre* will not do: a cell the
+  surface merely clips has its centre off-surface and reports a spuriously empty neighbourhood.
+
+Modes S/U keep their own per-pass radius reduction (`R0 * pow(it, 0.5*(alpha-1))`) and are
+unaffected. `-savemap`/`-loadmap` is still the way to pay a big deposit only once.
 
 ### Shared FORWARD (A/B) multi-camera pass writes all frames only at the end — FIXED 2026-07-14
 

@@ -10498,7 +10498,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const SppProgress* prog,
                                             const std::function<bool(int, const Film&)>* onFrame,
                                             const char* mapLoad, const char* mapSave, int heroC,
-                                            int fgRays) {
+                                            int fgRays, double autoK) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -10520,13 +10520,27 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // trace and optionally persist it (-savemap). The map is view-independent, so a loaded
     // one is re-gathered for any camera/radius without re-tracing a photon.
     PhotonMap pm;
+
+    // Bin the map, honouring the density-adaptive radius (autoK > 0). Say out loud what
+    // radius it settled on: the one printed before the deposit is only a starting point and
+    // a silently-different one would be baffling when comparing renders. The gather below
+    // reads pm.radius, so nothing else needs to know which branch ran.
+    auto buildMap = [&]() {
+        if (autoK <= 0.0) { pm.build(radius); return; }
+        double nProbe = 0.0, kTarget = 0.0;
+        const double r = pm.buildAuto(radius, autoK, &nProbe, &kTarget);
+        std::printf("[gpu] adaptive gather radius: %.4g -> %.4g (a typical gather saw %.0f "
+                    "photons at the starting radius; target %.0f for %zu stored)\n",
+                    radius, r, nProbe, kTarget, pm.photons.size());
+    };
+
     bool mapLoaded = false;
     if (mapLoad && *mapLoad) {
         mapLoaded = loadPhotonMap(mapLoad, pm, eOut, photonMapGuard(scene, diffraction));
         if (mapLoaded) {
             std::printf("[loadmap] %s: %zu photons from %lld emitted -- deposit skipped\n",
                         mapLoad, pm.photons.size(), (long long)pm.nEmitted);
-            pm.build(radius);                   // (re)build the grid at the requested radius
+            buildMap();                         // (re)build the grid at the requested radius
         } else {
             std::fprintf(stderr, "[loadmap] falling back to a fresh deposit\n");
         }
@@ -10606,7 +10620,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         }
     }
     if (d_photons) cudaFree(d_photons);
-    pm.build(radius);                       // host counting sort -> cell-contiguous runs
+    buildMap();                             // host counting sort -> cell-contiguous runs
 
     double energy[5] = {0,0,0,0,0};
     CUDA_CHECK(cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));

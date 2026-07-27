@@ -163,10 +163,18 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // deposited map is the expensive result of the forward photon trace and is independent of
 // camera and gather radius, so it is worth persisting: `mapSave` writes it after the deposit,
 // and `mapLoad` reloads it and SKIPS the deposit entirely — re-gathering new camera angles /
-// a new radius for free, without re-tracing a photon. The file (magic "FTPMP01\n") holds the
+// a new radius for free, without re-tracing a photon. The file (magic "FTPMP02\n") holds the
 // raw photon set + emitted count + energy; the grid is rebuilt on load at the requested
 // `radius`, so one file serves any radius. A scene-identity guard rejects a stale map built
 // for a different scene (it falls back to a fresh deposit). Both default null (no caching).
+//
+// `autoK` > 0 turns on the density-adaptive gather radius: `radius` becomes only a STARTING
+// point, and the grid is rebuilt at whatever radius makes a typical gather see the target
+// population (PhotonMap::buildAuto, photonmap.h — see there for why the target scales as the
+// cube root of the stored count). 0 = off, use `radius` exactly. This must be honoured on the
+// GPU too, not just the CPU: the shared-map path IS the high-photon-count path, which is
+// exactly where a count-independent radius collapses. The gather reads pm.radius (not this
+// argument) after the build, so the adapted value flows through with no further plumbing.
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
@@ -174,7 +182,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const SppProgress* prog = nullptr,
                                             const std::function<bool(int, const Film&)>* onFrame = nullptr,
                                             const char* mapLoad = nullptr, const char* mapSave = nullptr,
-                                            int heroC = 1, int fgRays = 0);
+                                            int heroC = 1, int fgRays = 0, double autoK = 0.0);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/

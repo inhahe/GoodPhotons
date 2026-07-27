@@ -102,6 +102,20 @@ if(CMAKE_CUDA_COMPILER)
     option(FTRACE_GPU_FP32 "Compute GPU transport in float (mixed precision)" ON)
 
     target_sources(ftrace PRIVATE src/render_cuda.cu src/raster_cuda.cu)
+
+    # Header dependencies for the .cu TUs — DO NOT REMOVE.
+    #
+    # MSBuild's CudaCompile task does not scan #includes, so a header edit leaves the .cu
+    # objects stale AND (because the .cu TUs share headers with the C++ ones) can leave the
+    # linker holding a stale COMDAT of an inline function you just changed. OBJECT_DEPENDS
+    # does not help — the VS generator emits CudaCompile items with no metadata. Instead a
+    # pre-build step bumps the mtime of any .cu older than the headers, which is the one
+    # signal CudaCompile does honour. Full rationale in cmake/touch_stale_cu.cmake.
+    add_custom_command(TARGET ftrace PRE_BUILD
+        COMMAND "${CMAKE_COMMAND}" "-DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/touch_stale_cu.cmake"
+        COMMENT "Checking .cu header dependencies (MSBuild CudaCompile does not)")
+
     target_compile_definitions(ftrace PRIVATE HAVE_CUDA=1)
     # Emit source line-number info in device code (nvcc -lineinfo). This is
     # essentially free at runtime (unlike -G, which disables optimisation) and
