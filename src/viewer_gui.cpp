@@ -1403,9 +1403,64 @@ static void drawScenePanel(const Sidecar& sc) {
 // F5 — modulator-DAG panel (imnodes). Each node shows its op + stable id; each
 // edge is a link into the destination's labelled parameter pin (so you can read
 // which input of a node's function each upstream modulator feeds).
+//
+// E5 axis annotation (sidecar v2). A modulator is typed by its **free axes**, and
+// an influence edge carries a pin/mod mode + gain — neither is recoverable from
+// the op name alone, so loom projects both into the sidecar and we surface them:
+//   * a node shows its axis set as `{s,t}` (∅ for a constant, which broadcasts
+//     everywhere) plus the extras that make the model legible — a Target's
+//     declared quantity kind, the axis a Reduce consumes, and, on the two bridge
+//     nodes, the value-site's scope (`t from clock, s pinned`).
+//   * an edge into a Target reads `mod[0] x0.8` / `pin[1] x0.25` on its input pin
+//     instead of an anonymous `in0`.
+// Everything is optional: a v1 sidecar simply renders as before.
 // --------------------------------------------------------------------------
-struct DagNode { int id = 0; std::string op, label; };
-struct DagEdge { int src = 0, dst = 0; std::string param; };
+struct DagNode {
+    int id = 0;
+    std::string op, label;
+    std::string axes;      // "{s,t}" / "{}"     — empty when unannotated
+    std::string detail;    // "gain target" / "reduce s (sum)" / site scope
+};
+struct DagEdge {
+    int src = 0, dst = 0;
+    std::string param;
+    std::string mode;      // "pin" / "mod" — empty for a plain input edge
+    double gain = 1.0;
+};
+
+// "{s,t}" from a JSON array of axis names ("{}" when empty — the broadcast case).
+static std::string axisSetStr(const minijson::Value* v) {
+    if (!v || !v->isArray()) return "";
+    std::string s = "{";
+    for (size_t i = 0; i < v->arr.size(); ++i) {
+        if (i) s += ",";
+        s += v->arr[i].asString("?");
+    }
+    return s + "}";
+}
+
+// The one-line "what kind of node is this, in E5 terms" caption.
+static std::string dagDetail(const minijson::Value& n) {
+    const minijson::Value* site = n.find("site");
+    if (site && site->isString()) {                    // Lower / LowerVec bridge
+        std::string s = scalarStr(n.find("clock_axis"), "t") + " from clock";
+        std::string bound = axisSetStr(n.find("bound_axes"));
+        if (!bound.empty() && bound != "{}") s += ", " + bound + " pinned";
+        std::string src = axisSetStr(n.find("source_axes"));
+        if (!src.empty()) s += "  <- " + src;
+        return s;
+    }
+    if (const minijson::Value* k = n.find("target_kind"))
+        return k->asString("?") + " target (neutral "
+               + scalarStr(n.find("neutral"), "?") + ")";
+    if (const minijson::Value* r = n.find("reduces"))
+        return "reduce " + r->asString("?") + " ("
+               + scalarStr(n.find("reduce_op"), "?") + ", "
+               + scalarStr(n.find("samples"), "?") + " samples)";
+    if (const minijson::Value* c = n.find("channel"))
+        return "channel " + c->asString("?");
+    return "";
+}
 struct DagGraph {
     std::vector<DagNode> nodes;
     std::vector<DagEdge> edges;
@@ -1425,9 +1480,11 @@ static DagGraph collectDag(const Sidecar& sc) {
     if (nodes && nodes->isArray())
         for (const auto& n : nodes->arr) {
             DagNode dn;
-            dn.id    = n.intAt("id", 0);
-            dn.op    = n.find("op") ? n.find("op")->asString("?") : "?";
-            dn.label = scalarStr(n.find("label"), "");
+            dn.id     = n.intAt("id", 0);
+            dn.op     = n.find("op") ? n.find("op")->asString("?") : "?";
+            dn.label  = scalarStr(n.find("label"), "");
+            dn.axes   = axisSetStr(n.find("axes"));      // "" when unannotated
+            dn.detail = dagDetail(n);
             g.nodes.push_back(std::move(dn));
         }
     if (edges && edges->isArray())
@@ -1436,6 +1493,8 @@ static DagGraph collectDag(const Sidecar& sc) {
             de.src   = e.intAt("src", 0);
             de.dst   = e.intAt("dst", 0);
             de.param = scalarStr(e.find("param"), "in");
+            const minijson::Value* m = e.find("mode");
+            if (m && m->isString()) { de.mode = m->str; de.gain = e.numAt("gain", 1.0); }
             g.edges.push_back(std::move(de));
         }
     return g;
@@ -1489,12 +1548,21 @@ static void drawDagPanel(DagGraph& g) {
         ImNodes::EndNodeTitleBar();
         if (!n.label.empty() && n.label != n.op)
             ImGui::TextDisabled("= %s", n.label.c_str());
-        // one labelled input pin per incoming edge (the param it feeds)
+        if (!n.axes.empty())            // E5: the node's free axes
+            ImGui::TextDisabled("axes %s", n.axes.c_str());
+        if (!n.detail.empty())          // target kind / reduced axis / site scope
+            ImGui::TextDisabled("%s", n.detail.c_str());
+        // one labelled input pin per incoming edge (the param it feeds; an E5
+        // influence edge also shows its pin/mod mode and gain)
         auto it = inEdges.find(n.id);
         if (it != inEdges.end())
             for (int ei : it->second) {
+                const DagEdge& e = g.edges[ei];
                 ImNodes::BeginInputAttribute(DAG_IN_BASE + ei);
-                ImGui::TextUnformatted(g.edges[ei].param.c_str());
+                if (e.mode.empty())
+                    ImGui::TextUnformatted(e.param.c_str());
+                else            // param is already "mod[i]"/"pin[i]"; add the gain
+                    ImGui::Text("%s x%g", e.param.c_str(), e.gain);
                 ImNodes::EndInputAttribute();
             }
         ImNodes::BeginOutputAttribute(DAG_OUT_BASE + n.id);

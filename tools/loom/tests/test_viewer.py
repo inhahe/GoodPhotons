@@ -336,6 +336,97 @@ def test_introspect_dag_edge_param_labels():
     assert ("Sine", "Mul", "a") in labelled
 
 
+# ---------------------------------------------------------------------------
+# §E5 — the on-disk projection of axis annotations (sidecar v2)
+# ---------------------------------------------------------------------------
+
+def _axis_scene():
+    """A scene whose radius is a GAIN Target and whose centre is a curve sampled
+    along its own `s` axis and swept over the loop — i.e. every E5 feature at a
+    real value-site."""
+    from loom import (Target, GAIN, mod, pin, Sine, lower, CurveSample, Ax,
+                      Ramp, PointPath, LoopCurve)
+    from loom.signals.core import Const
+    curve = LoopCurve(PointPath([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)],
+                                closed=True), Const(0.0))
+    sc = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+    sc.add(Sphere(lower(CurveSample(curve, Ax("s")), dim=3, bind={"s": Ramp()}),
+                  Target(GAIN, [mod(0.6 + 0.4 * Sine(), 0.8), pin(0.5, 0.25)],
+                         base=0.3),
+                  "m"))
+    return sc
+
+
+def test_sidecar_is_version_2():
+    from loom.viewer import SIDECAR_VERSION
+    assert SIDECAR_VERSION == 2
+    assert introspect(build())["version"] == 2
+
+
+def test_dag_nodes_carry_their_axis_set():
+    dag = introspect(_axis_scene())["dag"]
+    by_op = {}
+    for n in dag["nodes"]:
+        by_op.setdefault(n["op"], []).append(n)
+    # the curve sample genuinely depends on BOTH the arclength and the clock
+    assert by_op["CurveSample"][0]["axes"] == ["s", "t"]
+    # a coordinate leaf names itself; a constant is the empty (broadcast) set
+    assert by_op["Ax"][0] == {**by_op["Ax"][0], "axes": ["s"], "leaf_axis": "s"}
+    assert any(n["axes"] == [] for n in by_op["AConst"])
+
+
+def test_dag_target_node_declares_its_quantity_kind():
+    dag = introspect(_axis_scene())["dag"]
+    tgt = [n for n in dag["nodes"] if n["op"] == "Target"][0]
+    assert tgt["target_kind"] == "gain" and tgt["neutral"] == 1.0
+    assert tgt["axes"] == ["t"]          # base ∅ ∪ driver {t}
+
+
+def test_dag_influence_edges_carry_mode_and_gain():
+    """The pin/mod edge attributes are invisible in a plain child list (sources
+    hang off Binding records), so an editor could not tell a mod from a pin."""
+    dag = introspect(_axis_scene())["dag"]
+    tgt = [n for n in dag["nodes"] if n["op"] == "Target"][0]
+    infl = {e["param"]: e for e in dag["edges"] if e["dst"] == tgt["id"]
+            and "mode" in e}
+    assert infl["mod[0]"]["mode"] == "mod" and infl["mod[0]"]["gain"] == 0.8
+    assert infl["pin[1]"]["mode"] == "pin" and infl["pin[1]"]["gain"] == 0.25
+    # the base is a plain input, not an influence edge
+    base = [e for e in dag["edges"] if e["dst"] == tgt["id"] and e["param"] == "base"]
+    assert base and "mode" not in base[0]
+
+
+def test_dag_bridge_nodes_report_the_value_site_scope():
+    dag = introspect(_axis_scene())["dag"]
+    lv = [n for n in dag["nodes"] if n["op"] == "LowerVec"][0]
+    assert lv["site"] == "vector"
+    assert lv["clock_axis"] == "t"          # t comes from the clock
+    assert lv["bound_axes"] == ["s"]        # s is pinned by bind=
+    assert lv["source_axes"] == ["s", "t"]  # …of an {s,t} node
+    assert any(n["op"] == "Lower" and n["site"] == "scalar" for n in dag["nodes"])
+
+
+def test_dag_reduce_node_names_the_axis_it_consumes():
+    from loom import Reduce, Ax
+    from loom.axes import axis_annotation
+    r = Reduce(Ax("s") * Ax("t"), "s", 8, "mean")
+    rec = axis_annotation(r)
+    assert rec["axes"] == ["t"] and rec["reduces"] == "s"
+    assert rec["reduce_op"] == "mean" and rec["samples"] == 8
+
+
+def test_axis_annotation_is_empty_for_a_legacy_signal():
+    from loom.axes import axis_annotation, binding_edges
+    from loom.signals import Sine
+    assert axis_annotation(Sine()) == {}
+    assert binding_edges(Sine()) == {}
+
+
+def test_sidecar_with_axis_annotations_serialises():
+    # the real regression: every projected value must be JSON-encodable
+    json.dumps(introspect(_axis_scene()))
+
+
 def test_introspect_datasets_sorted_and_unique():
     d = introspect(build())
     ids = [ds["id"] for ds in d["datasets"]]

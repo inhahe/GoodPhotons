@@ -1347,7 +1347,7 @@ green) plus an ftrace interop check: one asymmetric L-shaped volume written twic
   (velocity/advection) that isn't designed yet. Unblock by sourcing one real vec3 `.vdb` (a DCC export or an
   openvdb.org sample), then the tree walk is the existing one with a 3-wide value stride.
 
-### E5 — Axis-typed signals: one influence model (broadcast / pointwise / reduce) + mod·pin + sample·select grammar  *(loom; LARGE, design; unifies E2/E4 and records-5a)*
+### E5 — Axis-typed signals: one influence model (broadcast / pointwise / reduce) + mod·pin + sample·select grammar  ✅ DONE 2026-07-26  *(loom; LARGE, design; unifies E2/E4 and records-5a)*
 **Idea / decision (design-captured 2026-07-18, from a design bounce).** The whole "what can modulate what,
 and does t-influencing-t break?" question collapses into **one** model: every value-producing node in the
 loom signal DAG is **a function of a named set of axes** (its free variables) — e.g. a purely spatial
@@ -1484,8 +1484,34 @@ and to a `Signal`, `LowerVec` dim probe / scalar-node / dim-mismatch / per-frame
 `lower()` dispatch, curve sweep, `as_signal` + `VecSignal.of` coercion both ways, site-node memoisation, and an
 end-to-end `Target`→`Sphere.radius` + swept `CurveSample`→`Sphere.center` round-trip through `emit`).
 1120 loom green.
-**Still open (follow-up):** the on-disk `.ftsl` projection of axis annotations. Additive on top of the
-`loom.axes` core.
+**FOLLOW-UP 3 DONE 2026-07-26 (`loom.axes` + the viewer sidecar + `src/viewer_gui.cpp`) — E5 IS COMPLETE.**
+*The on-disk projection of axis annotations* — the second half of the deferred open-q. It resolves into a
+**decision** and an **implementation**.
+- **The decision: `.ftsl` carries no axis annotation, and shouldn't.** `.ftsl` is a **bound**, per-frame
+  projection. By the time a scene emits, the clock axis has been fixed to `clock.t` and every other axis
+  pinned by `bind=`, so an `{s,t}` node has already collapsed to a *number*. ftrace renders one frame and has
+  no notion of an axis; annotating its language would turn `.ftsl` into an animation format and move the
+  animation authority out of loom — against loom's core ideas 2 ("discretize LAST, per frame") and 5
+  ("emit-`.ftsl`-first"). This is written down in `loom/axes.py` beside the code so it stops being re-litigated.
+- **The implementation: the viewer introspection sidecar, v1 → v2.** That is the on-disk representation an
+  *editor* reads (F1/F5), and it is where the annotation belongs. `axis_annotation(node)` and
+  `binding_edges(target)` live in `loom/axes.py` — the model owns its own serialisation and `loom.viewer` just
+  merges the dicts in.
+  - **Nodes** gain their free `axes` (`{s,t}`; `[]` for a constant, which broadcasts everywhere), plus
+    `target_kind` + `neutral` (a `Target`'s declared quantity type), `reduces` + `reduce_op` + `samples` (the
+    *only* cross-axis node — worth surfacing), `component` / `channel` / `leaf_axis`, and on the two bridge
+    nodes `site` (scalar/vector), `clock_axis`, `bound_axes` and `source_axes` — together the value-site's
+    entire axis scope ("`t` from the clock, `{s}` pinned, reading an `{s,t}` node").
+  - **Edges** out of a `Target` gain `mode` (`pin`/`mod`) and `gain`, and are named `mod[i]`/`pin[i]` instead
+    of an anonymous `in<i>`. This is the piece a plain child list **cannot** express: the sources hang off
+    `Binding` records, so a generic DAG walk saw only unlabelled inputs and an editor could not tell a `mod`
+    from a `pin`, let alone at what gain.
+  - **`src/viewer_gui.cpp`'s F5 panel renders all of it** — an `axes {s,t}` chip on the node, a one-line
+    kind/scope caption (`gain target (neutral 1)`, `reduce s (mean, 8 samples)`, `t from clock, {s} pinned <-
+    {s,t}`), and `mod[0] x0.8` on the input pin. Verified on a live viewer window.
+  - Purely **additive**: a v1 reader ignores the new keys, and an unannotated (legacy-`Signal`) node renders
+    exactly as before.
+8 new tests (`tests/test_viewer.py`, 58 total). 1128 loom green.
 
 ### E6 — Quick mesh viewer: open a bare mesh in a ready-lit scene  ✅ DONE 2026-07-21  *(ftrace; user-proposed 2026-07-19)*
 **Shipped.** A bare positional mesh path — `ftrace model.glb` (also `.obj`/`.gltf`/`.fbx`/`.stl`/`.ply`) —
@@ -2950,6 +2976,29 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-26: **0.81.0 — E5 is complete: scene value-sites route through `Target`, and the viewer shows the
+  axis model.** Two follow-ups, both loom-side plus one C++ panel.
+  *(1) Routing.* `Lift` took a clock-parameterized `Signal` **up** into the axis layer; nothing brought one
+  back **down**, so `Target` — the pin/mod combine node — was a self-contained algebra that could not
+  actually drive `Sphere.radius` or a camera position. `Lower`/`LowerVec` are the exact inverse: the site's
+  clock axis is fed `clock.t`, and every *other* axis must be pinned with `bind={'s': <coord or Signal>}` (a
+  constant reads one arclength of a spatial curve; a `Signal` sweeps along it over the loop). Records-5a's
+  scope rule is enforced at **construction**, naming the unbound axes, instead of failing deep inside a
+  render. Routing is **one memoised hook** (`signals.core.lower_axsignal`) consumed by `as_signal`,
+  `VecSignal.of`, `ftsl_emit.site_node` and `Element.roots()` — no element constructor changed, and every
+  value-site accepts an axis node uniformly. Memoising the lowered node is *required*: node identity is the
+  per-frame `Cache` key **and** `roots()` must hand the cycle detector the very node emission will evaluate.
+  Also `mod()`/`pin()` sugar, `as_ax` now lifts a legacy `Signal`, and a latent bug is fixed — a `GAIN`
+  target with a negative source computed `x ** gain`, which Python returns as a **complex**, blowing up far
+  from the cause; it now raises a domain error naming the fix.
+  *(2) The on-disk projection.* Decided **`.ftsl` carries no axis annotation** — it is a *bound* per-frame
+  snapshot (every axis already collapsed to a number), and annotating it would make ftrace's language an
+  animation format. The projection belongs in the **viewer introspection sidecar** (v1 → **v2**), which is
+  what an editor reads: nodes gain their free `axes` plus target-kind / reduced-axis / value-site-scope
+  detail, and an edge into a `Target` gains the `mode` + `gain` a plain child list cannot express (sources
+  hang off `Binding` records, so a generic walk saw only anonymous inputs). `src/viewer_gui.cpp`'s F5 panel
+  renders all of it (`axes {s,t}`, `gain target (neutral 1)`, `mod[0] x0.8`), verified live. Purely additive.
+  33 new tests; 1128 loom green.
 - 2026-07-27: **0.80.0 — `emit pattern:` / `emit_map`: the reflect / transmit / emit trio is complete.**
   Same mechanism as 0.75.0/0.76.0 — a scalar pattern in a spectral slot is a per-hit **multiplier**
   clamped to [0,1], so `emit pattern:<n>` (and `emit [0 1](u)`) leaves the pattern alone in the slot and

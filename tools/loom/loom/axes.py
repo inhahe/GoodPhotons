@@ -780,11 +780,102 @@ def lower(node: AxSignal, *, dim: Optional[int] = None,
     return Lower(node, clock_axis=clock_axis, bind=bind)
 
 
+# ---------------------------------------------------------------------------
+# The on-disk projection of an axis annotation
+# ---------------------------------------------------------------------------
+#
+# `.ftsl` deliberately carries NO axis annotation.  It is a *bound* per-frame
+# projection: by the time a scene emits, the clock axis has been fixed to
+# `clock.t` and every other axis pinned by `bind=`, so a `{s,t}` node has already
+# collapsed to a number.  ftrace renders one frame and has no notion of an axis;
+# pushing the annotation into its language would make .ftsl an animation format
+# and move the animation authority out of loom (DESIGN.md core ideas 2 and 5).
+#
+# The on-disk projection that *does* need it is the **viewer introspection
+# sidecar** (F1/F5), which is what an editor reads: its `dag` section already
+# enumerates every modulator node and edge, but a bare op name can't tell you
+# that a node is `{s,t}` rather than `{t}`, nor that an edge is a `mod` at gain
+# 0.4 into a GAIN target rather than a plain input.  Those are exactly the two
+# E5 attributes (axis set, pin/mod edge), so they are projected here — the model
+# owns its own serialisation, and `loom.viewer` just merges the dicts in.
+
+
+def axis_annotation(node) -> Dict[str, object]:
+    """The JSON-friendly axis annotation of one DAG node (``{}`` if it has none).
+
+    Keys, all optional and additive:
+
+    - ``axes`` — the node's free variables, sorted (every :class:`AxSignal`).
+    - ``target_kind`` / ``neutral`` — a :class:`Target`'s declared quantity type
+      and the identity element ``mod`` edges accumulate toward.
+    - ``reduces`` / ``reduce_op`` / ``samples`` — a :class:`Reduce`'s consumed
+      axis (the *only* cross-axis node, so this is worth surfacing).
+    - ``clock_axis`` — the axis a clock-threading node feeds from the clock
+      (:class:`CurveSample`, :class:`Lower`/:class:`LowerVec`).
+    - ``bound_axes`` — the axes a value-site pinned via ``bind=`` (the bridge
+      nodes); together with ``clock_axis`` this *is* the site's axis scope.
+    - ``source_axes`` — the axis set the bridge *consumes*.  A bridge node's own
+      free axes are ∅ by construction (that is what binding means), so this is
+      the informative half: "this site reads an ``{s,t}`` node, taking ``t`` from
+      the clock and pinning ``s``".
+    - ``site`` — ``'scalar'`` / ``'vector'`` for the two bridge nodes, i.e. "an
+      axis node reaches a scene variable here".
+    - ``component`` / ``channel`` / ``leaf_axis`` — small per-node specifics.
+    """
+    rec: Dict[str, object] = {}
+    axes = getattr(node, "axes", None)
+    if isinstance(axes, (frozenset, set)):
+        rec["axes"] = sorted(str(a) for a in axes)
+    if isinstance(node, Ax):
+        rec["leaf_axis"] = node.name
+    elif isinstance(node, _Comp):
+        rec["component"] = node.i
+    elif isinstance(node, Target):
+        rec["target_kind"] = node.kind
+        rec["neutral"] = _NEUTRAL[node.kind]
+    elif isinstance(node, Reduce):
+        rec["reduces"] = node.axis
+        rec["reduce_op"] = node.op if isinstance(node.op, str) else "callable"
+        rec["samples"] = node.samples
+    elif isinstance(node, CurveSample):
+        rec["clock_axis"] = node.clock_axis
+    elif isinstance(node, RecordSample):
+        rec["channel"] = node.channel
+    if isinstance(node, (Lower, LowerVec)):
+        rec["site"] = "vector" if isinstance(node, LowerVec) else "scalar"
+        rec["clock_axis"] = node.clock_axis
+        rec["bound_axes"] = sorted(node.bind)
+        rec["source_axes"] = sorted(str(a) for a in node.node.axes)
+    return rec
+
+
+def binding_edges(node) -> Dict[int, Dict[str, object]]:
+    """A :class:`Target`'s **influence edges**, keyed by source node id.
+
+    ``{source_id: {"mode": 'pin'|'mod', "gain": float, "index": i}}`` — the E5
+    edge attributes, which a plain child list cannot express (the sources hang
+    off :class:`Binding` records, so a generic walk sees only anonymous inputs).
+    Empty for anything that is not a ``Target``.
+
+    Keyed by source id, so one node bound *twice* into the same target keeps its
+    first edge — which matches the sidecar's ``(src, dst)``-deduplicated edge set
+    (share a source through two edges and you get one link, as today).
+    """
+    if not isinstance(node, Target):
+        return {}
+    out: Dict[int, Dict[str, object]] = {}
+    for i, b in enumerate(node.bindings):
+        out.setdefault(b.source.id,
+                       {"mode": b.mode, "gain": b.gain, "index": i})
+    return out
+
+
 __all__ = [
     "AxSignal", "Ax", "AConst", "Lift", "AFn", "Sample", "select", "Reduce",
     "CurveSample", "RecordSample", "sample",
     "Binding", "Target", "combine", "mod", "pin", "as_ax",
     "Lower", "LowerVec", "lower",
+    "axis_annotation", "binding_edges",
     "ADDITIVE", "GAIN", "BIPOLAR",
     "AXIS_T", "AXIS_S", "AXIS_U", "AXIS_V", "Point",
 ]

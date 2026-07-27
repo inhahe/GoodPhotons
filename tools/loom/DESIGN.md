@@ -621,7 +621,22 @@ tools/loom/
   node emission will evaluate. Sugar: `mod(src, gain)`/`pin(src, gain)` build `Binding`s, `Binding` coerces its
   source via `as_ax` (which now also `Lift`s a legacy `Signal`), and a `GAIN` target with a negative source now
   raises a domain error instead of silently producing a complex number. Tests: `tests/test_axes.py` (55).
-  Remaining follow-up: the `.ftsl` projection of axis annotations.
+  **Follow-up 3 done — the on-disk projection of axis annotations.** The resolution of the deferred open-q's
+  second half is a *decision plus an implementation*. **`.ftsl` carries no axis annotation, deliberately**: it
+  is a **bound**, per-frame projection — by emit time the clock axis is fixed to `clock.t` and every other axis
+  pinned by `bind=`, so an `{s,t}` node has already collapsed to a number. ftrace renders one frame and has no
+  notion of an axis; annotating its language would make `.ftsl` an animation format and move the animation
+  authority out of loom (core ideas 2 and 5). The on-disk projection that *does* need the annotation is the
+  **viewer introspection sidecar** (F1/F5) — what an editor reads. `loom.axes.axis_annotation(node)` and
+  `binding_edges(target)` are the model's own serialisers (the model owns its projection; `loom.viewer` just
+  merges the dicts), feeding sidecar **v2**: a DAG node carries its free `axes`, plus `target_kind`/`neutral`
+  (a `Target`'s declared quantity), `reduces`/`reduce_op`/`samples` (the one cross-axis node), `component` /
+  `channel` / `leaf_axis`, and — on the two bridge nodes — `site`, `clock_axis`, `bound_axes` and `source_axes`
+  (the value-site's whole axis scope). An edge out of a `Target` carries the `mode` (`pin`/`mod`) and `gain`
+  that a plain child list *cannot* express (sources hang off `Binding` records, so a generic walk saw only
+  anonymous inputs), and is named `mod[i]`/`pin[i]`. `src/viewer_gui.cpp`'s F5 panel renders all of it — an
+  axis chip (`axes {s,t}`), a one-line kind/scope caption, and `mod[0] x0.8` on the input pin. Purely additive:
+  a v1 reader ignores the new keys. Tests: 8 in `tests/test_viewer.py`. **E5 is complete.**
 - **E2 (slices 1–2) — N-D curve → scene-variable go-between.** ✅ done (`loom/anim.py`). The channel-a config
   model + JSON sidecar + channel-b value fan-out — the pure-Python core of the animation go-between (resolves
   E2 OPEN Q1/Q2: config in a loom struct with a serialized sidecar; go-between = loom). `CurveDrive(dims,

@@ -48,8 +48,12 @@ from typing import Any, Callable, Dict, List, Optional
 from .signals.core import Clock, walk
 from .data import PointPath, TrackedPath, Grid, Scatter
 from .interp import eval_curve
+from .axes import axis_annotation, binding_edges
 
-SIDECAR_VERSION = 1
+# 2: DAG nodes/edges carry the E5 axis annotation (`axes`, target kind, pin/mod
+#    edge mode+gain, value-site scope).  Purely additive — a version-1 reader
+#    ignores the new keys.
+SIDECAR_VERSION = 2
 
 # how many points to sample along a curve for the viewer's display polyline
 _POLYLINE_SAMPLES = 96
@@ -433,7 +437,16 @@ def _describe_material(mat: Any, clock: Optional[Clock] = None) -> Dict[str, Any
 def _describe_dag(scene: Any) -> Dict[str, List[Dict[str, Any]]]:
     """Nodes (op + short label + stable id) and edges (child feeds parent) over
     every modulator reachable from the scene.  Each edge is ``{src, dst, param}``
-    where ``src`` feeds ``dst`` through ``dst``'s ``param`` input (F5's link labels)."""
+    where ``src`` feeds ``dst`` through ``dst``'s ``param`` input (F5's link labels).
+
+    **E5 axis annotation (sidecar v2).** This is the on-disk projection of
+    :mod:`loom.axes` (``.ftsl`` itself carries none — it is a per-frame *bound*
+    snapshot, see the note in that module).  A node additionally carries its free
+    ``axes``, and a ``Target`` its declared ``target_kind``/``neutral``; an edge
+    out of a ``Target`` carries the ``mode`` (``pin``/``mod``) and ``gain`` that
+    a plain child list cannot express, and is named ``mod[i]``/``pin[i]`` instead
+    of an anonymous ``in<i>``.  So an editor reading the sidecar can show the
+    influence model, not just the call graph."""
     from .scene import element_roots
     nodes: Dict[int, Dict[str, Any]] = {}
     edges: List[Dict[str, Any]] = []
@@ -446,14 +459,24 @@ def _describe_dag(scene: Any) -> Dict[str, List[Dict[str, Any]]]:
         for r in roots:
             for n in walk(r):
                 if n.id not in nodes:
-                    nodes[n.id] = {"id": n.id, "op": type(n).__name__,
-                                   "label": _node_label(n)}
+                    rec = {"id": n.id, "op": type(n).__name__,
+                           "label": _node_label(n)}
+                    rec.update(axis_annotation(n))
+                    nodes[n.id] = rec
+                binds = binding_edges(n)      # {} unless n is a Target
                 for idx, c in enumerate(n.children()):
                     key = (c.id, n.id)
-                    if key not in seen_edge:
-                        seen_edge.add(key)
-                        edges.append({"src": c.id, "dst": n.id,
-                                      "param": _edge_param(n, c, idx)})
+                    if key in seen_edge:
+                        continue
+                    seen_edge.add(key)
+                    e = {"src": c.id, "dst": n.id,
+                         "param": _edge_param(n, c, idx)}
+                    b = binds.get(c.id)
+                    if b is not None:         # an E5 influence edge
+                        e["mode"] = b["mode"]
+                        e["gain"] = b["gain"]
+                        e["param"] = f"{b['mode']}[{b['index']}]"
+                    edges.append(e)
     return {"nodes": list(nodes.values()), "edges": edges}
 
 
