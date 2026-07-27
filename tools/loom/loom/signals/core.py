@@ -96,16 +96,38 @@ class Cache:
     Shared sub-graphs (a modulator feeding several parameters) are then
     evaluated once per frame.  Pass a fresh :class:`Cache` per frame, or reuse
     one keyed by frame index.
+
+    **Retimed sub-evaluations get their own scope.**  The ``(node id, frame)``
+    key assumes *one value per node per frame*, which is exactly the assumption
+    a :class:`~loom.signals.retime.Retime` node breaks: it evaluates its subtree
+    at a *different* phase within the same frame, so writing those values into
+    the frame-keyed store would poison every other reader of the same node.
+    :meth:`scope` hands out a **nested** cache keyed by the continuous sample
+    point, so sharing still happens *within* one retimed evaluation (a diamond
+    under the retime node is computed once) and never leaks across sample
+    points.  Scopes live as long as their parent cache — with the documented
+    one-cache-per-frame usage that is one dict per retime node per frame.
     """
 
     def __init__(self) -> None:
         self._store: Dict[Tuple[int, int], object] = {}
+        self._scopes: Dict[object, "Cache"] = {}
 
     def get(self, node_id: int, frame: int):
         return self._store.get((node_id, frame))
 
     def set(self, node_id: int, frame: int, value) -> None:
         self._store[(node_id, frame)] = value
+
+    def scope(self, key) -> "Cache":
+        """A nested cache for one retimed sample point (``key`` must be hashable
+        and must include whatever distinguishes the sample — node id, frame and
+        the continuous phase)."""
+        sub = self._scopes.get(key)
+        if sub is None:
+            sub = Cache()
+            self._scopes[key] = sub
+        return sub
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +284,21 @@ class TimeFn(Signal):
     def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
         t = clock.t - math.floor(clock.t) if self.periodic else clock.t
         return float(self.fn(t))
+
+
+class Phase(Signal):
+    """The clock's own normalized phase ``t``, **as a value**.
+
+    This is what makes time a first-class input rather than an ambient one: a
+    graph can do arithmetic on ``t`` and hand the result to
+    :class:`~loom.signals.retime.Retime` to sample another sub-graph at that
+    phase (``delay`` is ``Retime(x, Phase() - dt)``).  Evaluating it is exactly
+    ``clock.t`` — no wrapping, no shaping (``Ramp(0, 1)`` is numerically the
+    same thing, but reads as an *animation* rather than as the clock).
+    """
+
+    def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
+        return clock.t
 
 
 # ---------------------------------------------------------------------------

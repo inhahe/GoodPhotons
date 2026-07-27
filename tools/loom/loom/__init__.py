@@ -6,7 +6,7 @@ interpolators.
 """
 
 from .signals import (
-    Signal, Clock, Cache, Const, TimeFn,
+    Signal, Clock, Cache, Const, TimeFn, Phase,
     Add, Sub, Mul, Div, Neg, Clamp, Rectify, Power, MapRange, Mix, RefSignal,
     Sin, Cos,
     as_signal, Number,
@@ -14,6 +14,7 @@ from .signals import (
     VecSignal, vec, lerp,
     Sine, Cosine, LoopNoise,
     Ramp, Ease,
+    Retime, VecRetime, retime, retimed_clock, freeze, delay, warp,
 )
 from .data import PointPath, TrackedPath, Grid, Scatter
 from .color import (
@@ -74,7 +75,7 @@ from .viewer import (
     load_build, build_scene, introspect, ViewerModel,
 )
 from .spatial import (
-    SpatialExpr, Surface, Image, VolumeField, sexpr, X, Y, Z, U, V, A, T,
+    SpatialExpr, Surface, Image, VolumeField, SigAt, sexpr, X, Y, Z, U, V, A, T,
     SPATIAL_PATTERNS,
     sin, cos, tan, sqrt, exp, log, floor, fract, sign, saturate, sabs,
     smin, smax, spow, atan2, step, clamp, mix, smoothstep,
@@ -87,7 +88,7 @@ from .xvideo import Clip, spacetime_rotate, spacetime_shear
 from .audio import SampleBuffer
 
 __all__ = [
-    "Signal", "Clock", "Cache", "Const", "TimeFn",
+    "Signal", "Clock", "Cache", "Const", "TimeFn", "Phase",
     "Add", "Sub", "Mul", "Div", "Neg", "Clamp", "Rectify", "Power",
     "MapRange", "Mix", "RefSignal", "Sin", "Cos",
     "as_signal", "Number",
@@ -95,6 +96,7 @@ __all__ = [
     "VecSignal", "vec", "lerp",
     "Sine", "Cosine", "LoopNoise",
     "Ramp", "Ease",
+    "Retime", "VecRetime", "retime", "retimed_clock", "freeze", "delay", "warp",
     "PointPath", "TrackedPath", "Grid", "Scatter",
     "Color", "rgb", "hsv", "hsl",
     "hsv_to_rgb", "rgb_to_hsv", "hsl_to_rgb", "rgb_to_hsl",
@@ -130,8 +132,8 @@ __all__ = [
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
     "PreviewServer", "preview_range",
     "load_build", "build_scene", "introspect", "ViewerModel",
-    "SpatialExpr", "Surface", "Image", "VolumeField", "sexpr", "X", "Y", "Z",
-    "U", "V", "A", "T",
+    "SpatialExpr", "Surface", "Image", "VolumeField", "SigAt", "sexpr",
+    "X", "Y", "Z", "U", "V", "A", "T",
     "SPATIAL_PATTERNS",
     "sin", "cos", "tan", "sqrt", "exp", "log", "floor", "fract", "sign",
     "saturate", "sabs", "smin", "smax", "spow", "atan2", "step", "clamp",

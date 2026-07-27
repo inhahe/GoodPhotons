@@ -2269,7 +2269,9 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       `camera_curve`). **Motivating consumer: an editor/GUI** (load an existing `.ftsl`, manipulate in loom's object
       model, re-emit) and possibly the raster preview loading authored scenes. Not on any current critical path — the
       grammar's real job is ftrace's parser — so this waits until a concrete editor need exists.
-- [ ] **PROPOSAL — unify element headers to `name = KIND { … }` (and anonymous `KIND { … }`).** Today elements
+- [x] **PROPOSAL — unify element headers to `name = KIND { … }` — DONE 2026-07-19 (v0.9.1).** Superseded by the
+      actionable **NEXT UP** entry at the top of this file, which shipped exactly this; kept for the rationale.
+      Today elements
       spell their name inconsistently: records already use `NAME = range LO-HI [ … ]` (a `name = kind …` binding),
       but materials/textures/cameras use `KIND "name" { … }`. The cleaner, more programmatic form (per user, 2026-07-19)
       is to make *every* named element a binding — `hero = camera { … }`, `gold = material { … }`, `hide = texture
@@ -2298,7 +2300,44 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       (Reminder logged 2026-07-19.)
 - **Dependency note:** the FTSL record itself (§0) is fully implemented (Stages 1–6 + GPU parity DONE), so
   this is a loom-side mirror + parser effort, not blocked on ftrace.
-- [ ] **FUTURE — loom retime / 4D time-shear node** (deferred; unlocked once `t` is a first-class input, J3b item 3).
+- [x] **loom retime / 4D time-shear node — DONE 2026-07-27** (unblocked when J3b item 3 landed `t` as a first-class
+      input, 2026-07-26). Shipped as designed below; what the build actually decided:
+      * **`signals/retime.py`** (new) — `retimed_clock(clock, t, wrap)`, `Retime` (scalar), `VecRetime` (a vector
+        retimed *as a whole*, so every component reads the same sample phase and shared sub-graphs are evaluated
+        once per sample point; `.as_vec()` re-exposes it as a plain `VecSignal`), the `retime()` dispatcher, and
+        the sugar `freeze(x, at)` / `delay(x, dt)` / `warp(x, g)`. Plus **`Phase`** in `signals/core.py` — the
+        clock's own `t` *as a value*, which is what makes the family expressible at all (`delay` is literally
+        `Retime(x, Phase() - dt)`).
+      * **`wrap` defaults to "wrap iff `clock.loop`"** — that one default is what keeps `sig(t−dt)` seamless on a
+        closed loop (it's the same loop, rotated) while leaving an open timeline honest off the end. Negative `dt`
+        looks *ahead*, which is equally well-defined: the graph is a pure function of the clock, not a stream.
+      * **(1) cache — took the "scope a nested cache" option**, not the "widen the key" one: `Cache.scope(key)`
+        returns a nested `Cache` keyed `(node id, frame, sample phase)`, and every retime evaluates its child
+        through it. Widening the global `(node_id, frame)` key would have touched every `at()` call site and put
+        1150 passing tests at risk; `scope()` is purely additive and behaviour is byte-identical when no retime
+        node exists. Off-current-`t` sampling is *not* restricted anywhere.
+      * **(2) cycles — confirmed (2a) alone suffices and (2b) stays deferred.** Both retime edges (the retimed
+        subtree **and** the phase driver) are ordinary structural edges reported by `children()`, so
+        `detect_signal_cycle` keeps owning them unchanged. A retime is **not** a recurrence — it reads a pure
+        function at another point, it does not read its own past — so no causality validator was needed or built.
+      * **The headline 4-D shear is `spatial.SigAt`** (spatial tier, because a coordinate must be in scope):
+        `SigAt(sig, when)` reads a modulator at a phase that is *itself a field*, e.g.
+        `SigAt(Sine(cycles=3), T - X/c)`. This is the thing that could not be faked — a bare `Signal` used as a
+        spatial term (`_Sig`) bakes **one number per frame** shared by the whole field. `emit()` deliberately
+        raises (ftrace evaluates a pattern per hit with no access to loom's modulator DAG; baking one number would
+        silently drop the shear), so it joins `VolumeField` as the second **single-backend** leaf in `spatial.py` —
+        discretise-then-render via `mesh_field` / `bake_field` / `write_volume`. Cost is bounded and stated: one
+        graph evaluation per *distinct* phase (`np.unique` + inverse), with `quantize=k` capping it at `k`.
+      * Tests: **`tools/loom/tests/test_retime.py`** (27; suite 1150 → 1177). Mutation-checked three ways —
+        degrading `Cache.scope` to the parent cache, dropping the driver edge from `children()`, and forcing
+        `wrap=True` each fail a test. The cache tests specifically use a **sub-frame** retime/shear, where the
+        retimed phase lands on the *same* `clock.frame`; a coarser delay maps to a different frame index and the
+        keys never collide, so the first version of the test passed even with the bug reintroduced.
+      * Docs: `tools/loom/design.md` § 4 + M10.5, `tools/loom/README.md` layout. Demo:
+        `tools/loom/examples/time_shear.py` (tabulates the family; `--render2d` renders the travelling wave as a
+        seamless loop — spatial frequency `k = w/c` falls out rather than being authored).
+      * Still not built, on purpose: recurrent / stateful (delayed-feedback) nodes — see (2b) below.
+  *Original entry (deferred; unlocked once `t` is a first-class input, J3b item 3).*
   Once `t` is a passable *value* (not just the ambient clock), add a node that samples a subgraph at a
   **shifted / warped / per-point** time. Because a Signal is a pure stateless function of a Clock, sampling at
   an arbitrary `t` is well-defined and cheap (build a Clock at that `t`, evaluate). Capabilities this unlocks,
@@ -3099,6 +3138,33 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-27: **loom retime + the 4-D time-shear — time is now a value you can pass, not just the frame
+  you happen to be on.** (loom-only; no `ftrace.exe` change, so no `VERSION` bump.) A `Signal` was always a
+  *pure function of a `Clock`*, so evaluating one at another phase was already well-defined and cheap —
+  the only thing that ever assumed one-value-per-node-per-frame was the **memo**. So the whole family fell
+  out of two additions: **`Phase`** (a leaf returning `clock.t` *as a value*) and **`Retime(x, when)`**
+  (evaluate `x` against `retimed_clock(clock, when)`), plus `VecRetime` for retiming a vector as a whole.
+  Sugar on top: `freeze` (a hold — and `at` may itself be animated, so a *scrubbable* hold is free),
+  `delay` (`x(t−dt)`; wraps iff the clock is closed, so a delayed seamless loop stays seamless, and a
+  negative `dt` legitimately looks *ahead*), `warp` (`x(g(t))`). The cache problem the roadmap flagged was
+  solved by **`Cache.scope(key)`** — a nested cache keyed `(node id, frame, sample phase)` — rather than
+  widening the global key, which would have touched every `at()` call site; sharing still works *within*
+  one sample point and nothing leaks out to the frame. The cycle question resolved to "nothing to add":
+  both retime edges are ordinary structural `children()`, and a retime is **not** a recurrence (it reads a
+  pure function elsewhere, not its own past), so `detect_signal_cycle` still owns it and the temporal
+  causality guard stays deferred until an actual stateful node exists. The payoff is the spatial-tier
+  **`SigAt`**: a modulator sampled at a phase that is *itself a field* — `SigAt(Sine(cycles=3), T − X/c)`
+  is a wave whose phase lags with distance, i.e. a genuine shear of the spacetime block, and the one thing
+  that could not be faked by animating a coefficient (a bare `Signal` used as a spatial term bakes one
+  number per frame for the *whole* field). `SigAt.emit()` deliberately raises — ftrace evaluates a pattern
+  per hit with no access to loom's modulator DAG, and baking one number would silently drop the shear —
+  making it the second single-backend leaf in `spatial.py` alongside `VolumeField`; the workflow is
+  discretise-then-render. Cost is one graph evaluation per *distinct* phase, with `quantize=k` capping it.
+  27 new tests (1150 → **1177**), mutation-checked three ways; notably the cache tests had to be rewritten
+  to use a **sub-frame** retime — with a coarser delay the retimed phase maps to a *different* frame index,
+  the keys never collide, and the first version of the test passed even with the bug put back.
+  `tools/loom/{loom/signals/retime.py,loom/signals/core.py,loom/spatial.py,tests/test_retime.py,
+  examples/time_shear.py,design.md,README.md}`.
 - 2026-07-27: **0.83.0 — the viewer's Modulator DAG pane now shows the whole graph
   (adaptive height + wrapping layers + a real zoom).** Reported as "the modular DAG pane doesn't seem to
   be tall enough to show the whole thing," and it had three independent causes. (1) The pane was a

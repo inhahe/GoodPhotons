@@ -67,7 +67,8 @@ from __future__ import annotations
 import operator
 from typing import Callable, List, Sequence, Tuple, Union
 
-from .signals.core import Signal, Number
+from .signals.core import Signal, Number, as_signal
+from .signals.retime import retimed_clock
 from .ftsl_emit import fmt
 
 try:  # numpy is only needed for the 2-D numeric path
@@ -669,6 +670,85 @@ class _Sig(SpatialExpr):
 
     def _is_time(self) -> bool:
         return True
+
+
+class SigAt(SpatialExpr):
+    """A temporal :class:`~loom.signals.core.Signal` sampled at a **spatially
+    varying** phase — the 4-D *time shear*.
+
+    :class:`_Sig` (what a bare ``Signal`` coerces to) bakes one number per frame:
+    the whole field shares the modulator's current value.  ``SigAt`` instead reads
+    the modulator at a phase that is *itself* a field, so different points of space
+    see different moments::
+
+        from loom import SigAt, X, T, Sine
+        wave = SigAt(Sine(cycles=3), T - X / 4.0)   # a wave whose phase lags with x
+
+    This is the spatial half of :mod:`loom.signals.retime`, and it rests on the
+    same fact: a ``Signal`` is a pure function of a clock, so evaluating it at
+    another phase is just building that clock.  ``wrap`` is passed to
+    :func:`~loom.signals.retime.retimed_clock` (default: wrap iff the clock is a
+    closed loop, which keeps a sheared loop seamless).
+
+    **Single-backend, deliberately.**  ftrace's pattern VM evaluates a formula
+    per hit with no access to loom's modulator DAG, so a per-point signal read has
+    no ftsl spelling; :meth:`emit` raises rather than bake a wrong constant.  Use
+    it on the numeric path — :func:`loom.mesh_field`, :func:`loom.vdbio.bake_field`
+    / :func:`loom.vdbio.write_volume`, the 2-D canvas — i.e. discretise the sheared
+    field and hand *that* to the renderer.
+
+    **Cost.**  The signal is evaluated once per *distinct* phase in the query, so a
+    smooth shear over an ``N``-point grid costs ``N`` graph evaluations.  Pass
+    ``quantize=k`` to snap the phase to ``k`` levels (``round(t*k)/k``) and pay only
+    ``k`` — ``quantize=clock.frames`` reproduces "shear by whole frames" exactly.
+    """
+
+    def __init__(self, sig, when, *, wrap=None, quantize=None) -> None:
+        self.sig = as_signal(sig)
+        self.when = _coerce(when)
+        self.wrap = None if wrap is None else bool(wrap)
+        if quantize is not None:
+            quantize = int(quantize)
+            if quantize < 1:
+                raise ValueError("SigAt quantize must be >= 1 (or None)")
+        self.quantize = quantize
+
+    def children(self):
+        return (self.when,)
+
+    def _rebuild(self, new_children):
+        return SigAt(self.sig, new_children[0], wrap=self.wrap,
+                     quantize=self.quantize)
+
+    def _time_signal(self):
+        return self.sig
+
+    def _is_time(self) -> bool:
+        return True
+
+    def emit(self, coords, ctx) -> str:
+        raise TypeError(
+            "SigAt cannot be emitted as an ftsl expression: ftrace evaluates a "
+            "pattern per hit and has no access to loom's modulator DAG, so a "
+            "per-point signal read has no ftsl spelling (baking one number would "
+            "silently drop the shear). Discretise it instead — loom.mesh_field(...) "
+            "or loom.vdbio.bake_field(...)/write_volume(...) — and render the result.")
+
+    def eval_np(self, coords, clock, cache):
+        if _np is None:  # pragma: no cover
+            raise ImportError("SigAt.eval_np needs numpy")
+        ph = _np.asarray(self.when.eval_np(coords, clock, cache), dtype=float)
+        if not _np.all(_np.isfinite(ph)):
+            raise ValueError("SigAt: sample phase field has non-finite values")
+        if self.quantize is not None:
+            ph = _np.round(ph * self.quantize) / self.quantize
+        uniq, inv = _np.unique(ph, return_inverse=True)
+        vals = _np.empty(uniq.shape, dtype=float)
+        for i, t in enumerate(uniq):
+            rc = retimed_clock(clock, float(t), self.wrap)
+            sub = None if cache is None else cache.scope((id(self), clock.frame, rc.t))
+            vals[i] = self.sig.at(rc, sub)
+        return vals[inv].reshape(ph.shape)
 
 
 # ---------------------------------------------------------------------------

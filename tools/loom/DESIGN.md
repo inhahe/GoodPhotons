@@ -97,6 +97,35 @@ dataclasses, beat/tempo, wavetable-osc phase machinery if unused).
   (the scribbles3 closed curve, see Layer 3) — everything periodic in `t` ⇒ the
   whole scene loops with no seam.
 - **Deterministic randomness**: a seeded `Rand`/`Noise` leaf (repeatable loops).
+- **Time as a value + retiming** (`signals/retime.py`). Because a `Signal` is a
+  *pure function of a `Clock`*, evaluating one at some other phase is already
+  well-defined — the only thing that ever assumed one-value-per-node-per-frame was
+  the memo. So the whole family comes from two additions:
+  - **`Phase`** — a leaf that returns `clock.t` *as a value*, making time a
+    first-class input rather than an ambient one.
+  - **`Retime(x, when)` / `VecRetime`** — evaluate `x` against
+    `retimed_clock(clock, when)`. Sugar: `freeze(x, at)` (`x` pinned at one phase,
+    and `at` may itself be animated ⇒ a scrubbable hold), `delay(x, dt)`
+    (`x(t−dt)`; wraps on a closed clock so a delayed seamless loop *stays*
+    seamless — negative `dt` looks ahead, which is equally well-defined for a pure
+    function), `warp(x, g)` (`x(g(t))` for a Signal or a plain `f(t)->t'`).
+    `wrap` defaults to *wrap iff `clock.loop`*, keeping an open timeline honest
+    off the end.
+  - **The cache.** `Cache` keys on `(node id, frame)`; a retimed subtree is
+    evaluated at a *different phase inside the same frame*, so its values must not
+    land in that store. Every retime evaluates its child through
+    **`Cache.scope(key)`** — a nested `Cache` keyed `(node id, frame, sample
+    phase)`. Sharing still works *within* one sample point; nothing leaks between
+    sample points or out to the frame. (Chosen over widening the global key, which
+    would have touched every `at()` call site; `scope()` is purely additive and
+    behaviour is unchanged when no retime node exists.)
+  - **Cycles.** Both edges — the retimed subtree *and* the phase driver — are
+    ordinary structural edges reported by `children()`, so `detect_signal_cycle`
+    keeps owning them. A retime is **not** a recurrence: it reads a pure function
+    at another point, it does not read its own past (see the open item below).
+  - The 4-D **time-shear** — a *spatially varying* sample phase — needs a
+    coordinate in scope, so it lives on the spatial tier as `spatial.SigAt`
+    (§ M10.5).
 
 **Open item (documented, not built yet):** *feedback / "elastic" modulators* whose
 output depends on their own past (springs, relaxation). Those need **state across
@@ -627,7 +656,8 @@ tools/loom/
       (so the round-trips can't pass vacuously) and conserve mass to 5%.
     - **`emit()` deliberately raises.** ftrace's pattern VM has no volume-sampling opcode, so
       there is no honest ftsl string; a `VolumeField` is bake-only and the error names
-      `write_volume`. This is the one leaf in `spatial.py` that is single-backend.
+      `write_volume`. It is one of the two single-backend leaves in `spatial.py` (the
+      other is `SigAt`, below).
     - Support added alongside: `VdbTransform.inverse_linear`/`to_index`/`premultiplied`,
       `ReadGrid.world_box` (AABB of the eight index-box corners — defined for a rotated grid,
       unlike `.box`) and `ReadGrid.with_transform` (shares the array).
@@ -899,6 +929,31 @@ tools/loom/
     determinism & separation, `image_textures` dedup incl. nested leaves, Scene
     auto-declaration + ordering + explicit-wins, scalar-slot acceptance, and `eval_np`
     nearest/bilinear/wrap/sRGB/shape against hand-computed values).
+  - **Retime / 4-D time-shear — `SigAt`.** ✅ (`spatial.py`, on top of
+    `signals/retime.py`, § 4). The spatial half of retiming, and the reason the whole
+    feature was worth building. A bare `Signal` coerced into the spatial algebra becomes
+    `_Sig`, which bakes **one number per frame** — the entire field shares the modulator's
+    current value. `SigAt(sig, when)` instead reads the modulator at a phase that is
+    *itself a field*, so different points of space see different **moments**:
+    `SigAt(Sine(cycles=3), T - X/4.0)` is a wave whose phase lags with distance. It is an
+    ordinary `SpatialExpr` leaf, so warping, `substitute`, meshing (`mesh_field`) and
+    baking (`bake_field`/`write_volume`) all apply unchanged.
+    - **Single-backend, deliberately.** `emit()` raises: ftrace evaluates a pattern per hit
+      and has no access to loom's modulator DAG, so a per-point signal read has no ftsl
+      spelling — and baking one number would silently *drop the shear*, which is the whole
+      effect. The error names the discretise-then-render route (`mesh_field` /
+      `bake_field` / `write_volume`), the same workflow `VolumeField` uses.
+    - **Cost is bounded and stated.** `eval_np` groups the phase field with
+      `np.unique(..., return_inverse=True)`, so the signal graph is evaluated once per
+      *distinct* phase, each inside its own `Cache.scope`; `quantize=k` snaps phases to `k`
+      levels and caps it at `k`. (Wrapped phases that coincide share a scope — on a closed
+      clock `t=1` and `t=0` are one sample.)
+    - Tests: `tests/test_retime.py` (27) — shear-vs-flat anti-vacuity, constant phase ≡ a
+      plain coefficient, quantize call-counts, loop seamlessness, emit-raises, `_is_time`
+      /`_rebuild`, non-finite phase field, and **cache non-poisoning** for a *sub-frame*
+      shear where every sample lands on `clock.frame` (the only case a frame-keyed memo
+      cannot survive). Mutation-checked: degrading `Cache.scope` to the parent cache, or
+      dropping the driver edge from `children()`, each fails a test.
 - **M11 — "transform video" script.** ✅ done (`loom/xvideo.py`). Separate two-pass
   offline tool (§11.8), kept out of the streaming emitter: **materialize** a clip into a
   4-D block `(T,H,W,C)` (`Clip.from_array` / `.from_frames` / `.from_canvas`), **transform**

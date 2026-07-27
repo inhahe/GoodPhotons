@@ -65,14 +65,14 @@ for MP4 and **NumPy** for the mesher / spacetime tools).
 ```
 tools/loom/
 ├── loom/            the package
-│   ├── signals/     modulation DAG (Signal graph): leaves, math ops, N-D vector signals
+│   ├── signals/     modulation DAG (Signal graph): leaves, math ops, N-D vector signals, retime/delay/warp
 │   ├── mathnd.py    N-D vectors / matrices, Givens-rotation builder, the 3-D slicer
 │   ├── data.py      datasets: PointPath | TrackedPath | Grid | Scatter (N-D, DAG nodes)
 │   ├── color.py     colour model: RGB + HSV + HSL (animatable, seamless hue loops)
 │   ├── interp.py    interpolators (loop curve | tracked multi-curve | grid field | scatter field)
 │   ├── iso.py       isosurfaces: gyroid / Schwarz-P / Schwarz-D / Neovius + N-D slicing
 │   ├── pov.py       POV-Ray function library, with which are N-D-generalizable
-│   ├── spatial.py   spatial expression DSL (X, Y, Z, U, V, T + math + Image/VolumeField terms) → ftsl `expr`
+│   ├── spatial.py   spatial expression DSL (X, Y, Z, U, V, T + math + Image/VolumeField/SigAt terms) → ftsl `expr`
 │   ├── sweep.py     sweep engine (rotation-minimizing frames, ribbon/tube/skin_rings, OBJ out)
 │   ├── mcubes.py    adaptive marching cubes (bake a scalar field to a mesh)
 │   ├── vdbio.py     bake a field to a dense grid → OpenVDB .vdb (density/temperature); reads .vdb and NanoVDB .nvdb
