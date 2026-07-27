@@ -848,11 +848,32 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       `(a)*x+(b)*y+(c)*z`, which ftrace compiles straight to `Const/VarX/Mul/Add` bytecode and evaluates
       directly (including on the GPU: `-raster-gpu` ray-marches D=8 tumble gyroids today). So MatMulAdd
       only *compresses* the encoding (one fused opcode vs ~6 scalar ops per row) — a compactness /
-      marginal-speed win, **not** a new capability. Revisit only if per-frame pattern eval becomes a
-      real bottleneck (it isn't — sin/cos/PovFn + the sphere-march dominate). See known-issues.md
-      "Deferred: `PatOp::MatMulAdd`". Prefer the contained single-output "matrow" form (Option A) if so.
-- [ ] **G4 (deferred, export-only)** GPU marching cubes — *only* to accelerate mesh export, not the
-      video path. Build only if mesh-export throughput becomes a pain point.
+      marginal-speed win, **not** a new capability.
+      **MEASURED 2026-07-27.** The old stated reason ("sin/cos/PovFn + the sphere-march dominate") is
+      **wrong**: `patternEval` costs ~4.7 ns/node *regardless of opcode*, so cost ∝ node count, and the
+      affine rows are 85–89% of every emitted field — MatRow would genuinely cut nodes 3.5–4×. The real
+      reason to defer is **Amdahl**: field eval is only 7% of a `-raster-gpu` render, 12% of `-raster`,
+      11–14% of an export at the D=8 sizes actually rendered (and ~4% for a default random draw), so
+      MatRow buys ~3–9% end-to-end. It *does* pay off in the fully-coupled high-D regime — measured
+      **D=16 `--coupling all`: 3917 nodes, 62% field eval, 1.9× faster with MatRow**.
+      **Sharpened trigger:** build it when a real workload's field exceeds **~800 pattern nodes**
+      (≈25% field eval) — in practice `--coupling all` at D≥8, or a long video at D≥12 fully coupled.
+      Default `cyclic` coupling stays under 20% even at D=16. Cost model: `time ≈ 3.50 s + 1.452 ms ×
+      nodes` (GPU iso, 600²). See known-issues.md "Deferred: `PatOp::MatMulAdd`" for the full tables and
+      the probe method. Prefer the contained single-output "matrow" form (Option A).
+- [ ] **G4 (deferred, export-only — but the bottleneck it assumed turned out to be elsewhere)** GPU
+      marching cubes, *only* for mesh export, not the video path. **MEASURED 2026-07-27:** a res-160
+      export was **55% ASCII OBJ write** (11.77 s of 21.47 s), not marching — so even a free GPU march
+      capped out at 1.8×. Fixed the writer instead (see G4b); the march is now the largest remaining
+      block (~8.7 s of 13.4 s, scaling as res³). Revisit only for repeated export cost — batch-exporting
+      a frame sequence, or interactive export at res ≥ 384.
+- [x] **G4b — fast OBJ writer.** **DONE 2026-07-27 (v0.84.3).** `isomesh::writeObj` did one
+      `std::fprintf` per line (~6.6M calls for a 3.3M-tri mesh), where FILE locking + format reparsing
+      dominate I/O — measured 22 MB/s on a 257 MB file. Now formats into an 8 MB staging buffer flushed
+      with `fwrite`, with hand-rolled decimal conversion for the integer-only face lines; floats keep the
+      same `snprintf` conversion specifiers so output is **byte-identical** (verified by md5 against the
+      previous binary). **Write 11.77 s → 4.66 s (2.5×); whole export 21.47 s → 13.40 s (1.6×).**
+      Multi-group export (`scenes/implicit.ftsl`, 3 isosurfaces) re-validated.
 - [x] **G5 — `-raster-gpu` / `kIsoPreview` textured shading** *(user-requested 2026-07-19; also logged
       in known-issues.md).* **DONE 2026-07-19.** Ported the CPU rasterizer's textured-preview path
       (`Texture::sampleRgb`/`sampleRgbTriplanar`) into `kIsoPreview`: a shared flattened linear-RGB texel
@@ -3138,6 +3159,24 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-27: **Measured G3/G4 instead of guessing — overturned both deferrals' stated reasons, and the
+  measurement pointed at a third thing that was actually the bottleneck (v0.84.3).** Built a probe method
+  that changes *only* program size while keeping output bit-identical (rewrite the field `E` as `(E+E)/2`
+  — bit-exact in IEEE, and unlike a padding tail it adds *realistic* nodes), asserting identical output
+  md5 / triangle counts across x1/x2/x4 variants, so any time delta is pattern eval and nothing else.
+  Findings: (1) `patternEval` costs **~4.7 ns/node regardless of opcode** — a `Mul` costs what a `sin`
+  does — so G3's premise "sin/cos + the sphere-march dominate" is **false**; cost is purely node count,
+  and affine rows are 85–89% of every emitted field, so MatRow really would cut nodes 3.5–4×. (2) But
+  field eval is only **7% of `-raster-gpu`, 12% of `-raster`, 11–14% of an export** at the sizes actually
+  rendered (~4% for a default random draw) — so G3 stays deferred on **Amdahl**, not opcode mix, with a
+  new numeric trigger (**>800 nodes**, i.e. `--coupling all` at D≥8; measured D=16 fully coupled = 3917
+  nodes, 62% field eval, 1.9× win). (3) G4's premise was also wrong: a res-160 export was **55% ASCII OBJ
+  write**, not marching, capping even a *free* GPU march at 1.8×. So the right fix was the writer, not a
+  CUDA port — `isomesh::writeObj` was doing one `fprintf` per line (~6.6M calls, 22 MB/s); it now formats
+  into an 8 MB buffer flushed with `fwrite` plus hand-rolled integer conversion for face lines, keeping
+  the same `snprintf` specifiers for floats so output is **byte-identical** (md5-verified against the old
+  binary). **Write 11.77 s → 4.66 s (2.5×), export 21.47 s → 13.40 s (1.6×)** — a bigger real win than
+  MatRow gives on any default scene, for a fraction of G4's cost.
 - 2026-07-27: **loom retime + the 4-D time-shear — time is now a value you can pass, not just the frame
   you happen to be on.** (loom-only; no `ftrace.exe` change, so no `VERSION` bump.) A `Signal` was always a
   *pure function of a `Clock`*, so evaluating one at another phase was already well-defined and cheap —

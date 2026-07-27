@@ -1476,12 +1476,56 @@ missing capability.** Why we may want it someday, and why we don't need it now:
   ~6 scalar ops per emitted matrix row (`Const, VarX, Mul, VarY, Mul, Add, …`). Same math, bit-identical
   result — fewer `PatNode`s in the compiled program and a slightly cheaper inner eval. It is **not** a new
   capability.
-- **Why we skip it now.** Per-frame pattern evaluation is not the bottleneck (the sin/cos/`PovFn` terms
-  and the sphere-march dominate the field eval), and the postfix programs are well within any practical
-  size. The payoff is marginal; the cleanest correct implementation still isn't free (see below).
-- **When to revisit.** If a real workload ever makes pattern-eval node count or throughput a measured
-  problem — e.g. very high-D fields with many coupling edges producing enormous postfix programs, or a
-  profile showing the linear ops as a hot fraction of field eval.
+- **Why we skip it now (MEASURED 2026-07-27 — the original reasoning was wrong, the conclusion holds
+  for default workloads).** The 2026-07-18 note claimed "the sin/cos/`PovFn` terms and the sphere-march
+  dominate the field eval". **That is false.** `patternEval` is a pure interpreter costing a measured
+  **~4.7 ns per `PatNode` regardless of opcode** — a `Mul` costs the same as a `sin`. So pattern cost is
+  proportional to *node count*, nothing else, and the baked affine rows (85–89% of every emitted
+  `gyroid_nd` field) are exactly where the nodes are. MatRow really would cut node count ~3.5–4×.
+  The actual reason to skip it is **Amdahl**, not opcode mix: field eval is only a small share of any
+  default workload. Measured end-to-end (probe method below):
+
+  | workload | nodes | field eval | MatRow end-to-end |
+  |---|---|---|---|
+  | `gyroid_nd` default random draw (median of 8, `--dims-range 3 8`, cyclic) | 76 | ~4% | ~3% |
+  | D=8, `--oscillating 6 --harmonics 2`, cyclic — `-raster-gpu` 600² | 162 | 7% | ~5% |
+  | …same scene, `-raster -raster-iso 96` 600² | 162 | 12% | ~9% |
+  | …same scene, `-export-mesh -mesh-res 160` | 162 | 11–14% | ~10% |
+  | **D=16, `--oscillating 16 --harmonics 3 --coupling all`** — `-raster-gpu` 600² | **3917** | **62%** | **47% (1.9×)** |
+
+  So at the sizes anyone actually renders, MatRow buys ~3–9%. It only becomes worthwhile in the
+  fully-coupled high-D regime, which is reachable but not default.
+- **The cost model (use this instead of re-measuring).** GPU iso preview at 600², the field is the only
+  variable: **`time ≈ 3.50 s + 1.452 ms × nodes`**. Field-eval share is therefore a function of node
+  count alone — 10% at ~270 nodes, 25% at ~800, 50% at ~2400. MatRow's node reduction is remarkably
+  stable at **3.5–4.0×** across every configuration tested (because the affine-row fraction barely
+  moves), so the end-to-end win is fully determined by node count. Node count vs the two knobs that
+  drive it (`scraps/g3_sweep.py`, regenerable):
+
+  | D | coupling | nodes | MatRow gain | | D | coupling | nodes | MatRow gain |
+  |---|---|---|---|---|---|---|---|---|
+  | 4 | cyclic | 90 | 3% | | 4 | all | 134 | 4% |
+  | 8 | cyclic | 236 | 7% | | 8 | all | 821 | 19% |
+  | 12 | cyclic | 392 | 10% | | 12 | all | 2147 | 35% |
+  | 16 | cyclic | 536 | 14% | | 16 | all | 4007 | 47% |
+
+  Default `cyclic` coupling grows node count ~linearly in D (edges ~D) and stays under 20% even at
+  D=16. `--coupling all` grows it ~quadratically (edges ~D²) and crosses 20% at D=8.
+- **When to revisit — now a number, not a vibe.** Build MatRow when a real workload's emitted field
+  exceeds **~800 pattern nodes** (≈25% field eval, ≈1.25× win) and that workload is run often enough to
+  matter — in practice that means someone actually rendering `--coupling all` at D≥8, or a long video at
+  D≥12 fully coupled where 1.4–1.9×/frame is real wall-clock. Below ~250 nodes it is measurement noise;
+  don't bother.
+- **How the numbers were measured (reproducible).** The probes are in `scraps/` (git-ignored):
+  `g3_bench.cpp`/`g3_build.bat` (per-opcode ns/node microbenchmark + a `-count` node census built
+  against ftrace's own `src/pattern.h`), `g3_render.py` (end-to-end render probe), `g3_export2.py`
+  (export probe), `g3_sweep.py` (node count vs D/coupling). The trick that makes them valid: change
+  *only* program size while keeping output bit-identical, by rewriting the field `E` as `(E+E)/2`
+  repeatedly — bit-exact in IEEE (adding a value to itself just bumps the exponent) and it adds
+  *realistic* nodes rather than a branch-predictable padding tail. Every run asserts an identical
+  output-PNG md5 / identical triangle count across the x1/x2/x4 variants, so any time difference is
+  pattern eval and nothing else. Fit a line through (nodes, time) → slope is ns/node, intercept is
+  everything that isn't field eval.
 - **How to build it (the design fork), if revisited.** The pattern VM is a single-scalar-stack machine:
   every `PatNode` is a POD `{PatOp op; double a;}` that pops N and pushes **exactly one** scalar. A
   matrix·vec+offset is 12 coefficients in → a **3-vector** out, which doesn't fit that contract. Two ways:
@@ -1509,14 +1553,39 @@ already-working path, not a missing capability. It is the last open item in TODO
   its frames through it, so the video pipeline does not call marching cubes. G4 would therefore
   accelerate only the *explicit mesh-export* path (`--export-mesh` / `.obj` output), which is an
   occasional, offline, one-shot operation rather than a per-frame cost.
-- **Why we skip it now.** Mesh export is not a measured pain point — it runs once per asset, not
-  once per frame, and the CPU marcher is fast enough at the grid resolutions in use. Porting it
-  means duplicating the marching-cubes tables, edge-vertex dedup, and the watertight-seam handling
-  onto the device, plus a device→host vertex/index readback — real work whose only payoff is a
-  faster offline export.
-- **When to revisit.** If mesh-export throughput becomes a real bottleneck — e.g. batch-exporting
-  a long frame sequence to `.obj`/`.gltf`, or interactive export at high grid resolutions where
-  the CPU march visibly stalls the UI.
+- **Why we skip it now (MEASURED 2026-07-27 — and the measurement moved the target).** Timing the
+  phases of a res-160 gyroid export (21.47 s total, 3.29M tris) by watching when the `.obj` file is
+  created showed the march was **not** where the time went:
+
+  | phase | before | share |
+  |---|---|---|
+  | startup + scene load + march + dedup | 9.70 s | 45% |
+  | …of which pattern/field eval | ~2.4–3.0 s | ~13% |
+  | **ASCII OBJ write** | **11.77 s** | **55%** |
+
+  The single biggest cost in a mesh export was **writing the file**, which GPU marching cubes does
+  nothing about. Even an infinitely fast, free GPU march would only have taken 21.47 s → 11.77 s
+  (1.8× ceiling), and a realistic port — plus a device→host readback of 1.6M verts / 3.3M tris —
+  lands well short of that.
+- **So we fixed the writer instead (DONE 2026-07-27, v0.84.3).** `isomesh::writeObj` was doing one
+  `std::fprintf` per line — ~6.6M calls for this mesh — where FILE locking and format-string
+  reparsing dominate actual I/O (measured **22 MB/s** for a 257 MB file). Rewrote it to format into
+  an 8 MB staging buffer flushed with `fwrite`, with a hand-rolled decimal conversion for the
+  integer-only face lines; float fields still go through `snprintf` with the *same* conversion
+  specifiers, so output is **byte-identical** (verified: same md5 as the old binary's file).
+  Result: **write 11.77 s → 4.66 s (2.5×), whole export 21.47 s → 13.40 s (1.6×)** — a bigger win
+  than MatRow gives on any default scene, for a fraction of the work a CUDA marcher would cost.
+  Multi-group exports (`scenes/implicit.ftsl`, 3 isosurfaces) re-validated structurally.
+- **Remaining headroom in the writer (not taken — diminishing returns).** The write is now 4.66 s /
+  35% of export at 55 MB/s. What's left is ~3.3M `snprintf` calls for the `v`/`vn` float lines
+  (~1.25 µs/line); the face lines are already hand-rolled. Squeezing further means reimplementing
+  printf's `%.6g` float formatting, which risks byte-exactness for a moderate gain — deliberately
+  not done. A binary/compressed mesh format would sidestep it entirely if export size ever matters.
+- **When to revisit G4 itself.** Now that the writer is fixed, the march is the largest remaining
+  block (~8.7 s of 13.4 s, and it scales as res³). Revisit if mesh export becomes a repeated cost —
+  batch-exporting a frame sequence, or interactive export at res ≥ 384 where the CPU march visibly
+  stalls — bearing in mind ~13% of that block is field eval (which MatRow, not G4, would address)
+  and the readback is unavoidable.
 
 ### ~~TECH DEBT (2026-07-18): `-raster-gpu` iso preview shades flat per-material albedo (no textures)~~ — FIXED 2026-07-19 (G5)
 The GPU primary-ray isosurface preview (G2, `kIsoPreview` in `src/render_cuda.cu`,
