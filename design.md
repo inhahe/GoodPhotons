@@ -681,8 +681,44 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `raster_cuda.cu` = GPU raster (own section below).
 - **`livewindow.*`** — Win32 GDI live preview (`-window`/`-keepwindow`), interactive
   fly viewer input, camera-path timeline panel.
-- **`record.h` / `render_progress.h`** — run records, live status line
-  (`[live] … photons, ~N% noise`), noise estimation for `-noise` budgets.
+- **`record.h` / `record_ladder.h`** — **parametric records**: a named bank of per-channel
+  look-up tables over a shared scalar domain `[lo,hi]`, sampled by one per-hit driver
+  scalar so a single expression sweeps a whole material at once. `record.h` holds the
+  structural model (`RecChannel` → `RecStop`s with a redistributed domain position) plus
+  stop compilation and sampling (`recSampleScalar` / `recSampleSpectrum`, nearest /
+  linear / smooth Fritsch–Carlson). Channels are named **by destination**, so a channel
+  whose name matches a material slot auto-binds and one that doesn't is still reachable
+  by dot.
+  `record_ladder.h` is the **delimiter precedence ladder** a channel line's stops are
+  written in: whitespace binds tightest (like `×`), comma looser (like `+`), `[ ]` are
+  the parentheses — so `1 1 1, 2 2 2` reads as `(1·1·1)+(2·2·2)`, two groups of three.
+  Structure is recoverable from the delimiters alone; the channel's arity only
+  *validates*, which is why `[1 1 1] [2 2 2]` and `1 1 1, 2 2 2` denote the same tree.
+  Parens `( )` are deliberately **not** a rung — they belong to expressions and the
+  named-input application surface — so a parenthesised run is an opaque atom and
+  `clamp(x,0,1)` stays one leaf.
+  The ladder lives in the **loader, not the grammar**, and that is the point: `,` is not
+  one of the lexer's delimiters, so a comma survives lexing glued to its word (`0,`) and
+  is simply re-split here, paren-aware. Only `[` / `]` genuinely delimit, so the grammar
+  carries exactly one extra rule (`stop_group`) whose markers `ftsl_reduce.hpp` flattens
+  back into `[`/`]` words. `Parser::parseChannelStops` (`ftsl.h`) drives it and preserves
+  additivity **structurally**: a line with no colour tag and no `,`/`[`/`]` takes the
+  byte-identical pre-ladder whitespace loop, so no existing record can reparse
+  differently.
+  The same function strips an optional **inline colour head** (`rgb`/`hsv`/`hsl` and
+  every upsampler/emission variant — `isColourHead` is the one list) into
+  `RecChannel::space`, then hands `{space, comps…}` to the *same* `evalSpectrum` a
+  top-level `spectrum "x" = rgb …` declaration uses. Converging on that one evaluator is
+  what makes inline colour nearly free: the record path inherits all 18 colour heads, and
+  the Jakob–Hanika coefficient bake and the GPU upload never learn that records exist.
+  `tools/loom/loom/ladder.py` + `record.py` are the declared Python twins; a stop-boundary
+  disagreement between them would be a *silent wrong render* rather than a parse error, so
+  `tools/check_record_twins.py` diffs ftrace's per-channel stop count (probed via an
+  out-of-range `rec.ch[999]` selector) against loom's across the `scenes/_record_*.ftsl`
+  fixtures.
+- **`render_progress.h`** — progress hook for chunked samples-per-pixel renderers (modes
+  `R`, `D`): the live status line (`[live] … photons, ~N% noise`) and noise estimation for
+  `-noise` budgets.
 
 ## GPU raster pipeline (`raster_cuda.cu`)
 

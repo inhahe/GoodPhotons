@@ -29,8 +29,14 @@ Single-element groups unwrap (idempotent bracketing).  :func:`emit_ladder` rende
 such a structure back to canonical ladder text, and :func:`shape` reports the
 (rectangular) nested dimensions.
 
-This is loom-only authoring (the J3b superset); current ftrace cannot parse it
-(its tokenizer is not comma-aware — see ``ROADMAP_records.md`` §5).
+**ftrace reads this too** (since v0.86.0): the C++ twin of this module is
+``src/record_ladder.h``, driven from ``Parser::parseChannelStops`` in ``src/ftsl.h``.
+The two implementations must agree exactly — loom emits what ftrace reads, and a
+disagreement about where stop boundaries fall is a *silent* wrong-render bug, not a
+parse error.  (The ladder can live in ftrace's loader rather than its grammar because
+``,`` is not one of ftrace's tokenizer delimiters, so a comma survives lexing glued to
+its word and is re-split here, paren-aware; only ``[`` / ``]`` genuinely delimit and the
+front end passes those through as marker words.)
 """
 
 from __future__ import annotations
@@ -155,6 +161,27 @@ def parse_ladder(s: str) -> Value:
     if c.peek() is not None:
         raise ValueError(f"ladder: trailing tokens {toks[c.i:]!r}")
     return v
+
+
+def uses_ladder(s: str) -> bool:
+    """True if ``s`` actually uses a ladder delimiter (``,`` / ``[`` / ``]``).
+
+    Paren-aware, so ``clamp(x,0,1)`` is *not* a ladder use — its comma sits inside an
+    opaque expression atom.  Callers use this to decide whether the author opted into
+    the generalized form at all: a value with no ladder delimiter is a plain whitespace
+    list and keeps whatever simpler reading it had before, which is what makes the
+    generalized grammar an additive superset rather than a breaking change.
+
+    Twin of ``recladder::usesLadder`` in ``src/record_ladder.h``.
+    """
+    return any(t in _DELIMS for t in _tokenize(s))
+
+
+def depth(v: Value) -> int:
+    """Nesting depth of a parsed value: 0 for a leaf, ``1 + max(child)`` for a group."""
+    if isinstance(v, str):
+        return 0
+    return 1 + max((depth(c) for c in v), default=0)
 
 
 # ---------------------------------------------------------------------------

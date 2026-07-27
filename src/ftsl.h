@@ -71,6 +71,7 @@
 #include "upsample.h"
 #include "color.h"
 #include "sky.h"
+#include "record_ladder.h"   // generalized record-stop delimiter ladder (J3b item 2)
 
 namespace ftsl {
 
@@ -82,6 +83,27 @@ inline bool isNumber(const std::string& s) {
     return end == s.c_str() + s.size();
 }
 inline double num(const std::string& s) { return std::strtod(s.c_str(), nullptr); }
+
+// The arity-3 COLOUR HEADS: every spectrum expression of the form `<head> a b c`,
+// across all three colour spaces and all the upsamplers/emission forms. Kept as one
+// list because two very different sites need the same answer: `evalSpectrum` (which
+// consumes them as a value head) and a record channel's inline-colour TAG (where the
+// head is written once for the whole channel and each stop supplies only the triple).
+// Splitting the list would let the two drift, and the failure mode is silent — a head
+// the tag accepts but `evalSpectrum` doesn't would turn a colour stop into a mystery
+// scalar-expression error pointing at the wrong token.
+inline bool isColourHead(const std::string& h) {
+    static const char* kHeads[] = {
+        "rgb",      "hsv",      "hsl",
+        "rgbline",  "hsvline",  "hslline",     // dominant-wavelength emission (K3)
+        "rgbillum", "hsvillum", "hslillum",    // Jakob-Hanika illuminant (K1)
+        "rgbsmits", "hsvsmits", "hslsmits",    // Smits 1999 reflectance (K1)
+        "rgbbox",   "hsvbox",   "hslbox",      // calibrated 3-box reflectance (K1)
+        "rgbmeng",  "hsvmeng",  "hslmeng",     // Meng 2015 smoothest reflectance (K1)
+    };
+    for (const char* k : kHeads) if (h == k) return true;
+    return false;
+}
 
 // NOTE: the measured-SPD CSV loader (`loadSpdCsv`) that used to live here now lives
 // in spectral_library.h as `speclib::loadSpdCsv` — a single implementation shared by
@@ -1156,7 +1178,7 @@ private:
             bool isSmits = (h == "rgbsmits" || h == "hsvsmits" || h == "hslsmits");
             bool isBox   = (h == "rgbbox"   || h == "hsvbox"   || h == "hslbox");
             bool isMeng  = (h == "rgbmeng"  || h == "hsvmeng"  || h == "hslmeng");
-            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine || isIllum || isSmits || isBox || isMeng) {
+            if (isColourHead(h)) {
                 if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
                 std::string space = (isLine || isIllum || isSmits || isBox || isMeng) ? h.substr(0, 3) : h;
                 Vec3 c;
@@ -2082,6 +2104,140 @@ private:
         }
     }
 
+    // Read one record channel line's stops — the **generalized stop grammar** (J3b
+    // item 2, `src/record_ladder.h`). Three delimiters form a fixed precedence ladder:
+    // whitespace binds tightest (juxtaposition -> a vector), comma looser (a new stop),
+    // brackets are its parentheses. So structure comes from the delimiters alone and
+    // the channel's arity only *validates*:
+    //
+    //     reflect  spectrum:steel spectrum:gold      # 2 colour-ref stops (as always)
+    //     rough    0 0.4 1                           # 3 scalar stops    (as always)
+    //     reflect  rgb 0 0 0, 1 1 1                  # 2 inline-colour stops (J3b item 1)
+    //     reflect  rgb [0 0 0] [1 1 1]               # ...the same thing, bracket form
+    //     tint     0 0 0,                            # ONE arity-3 stop (trailing comma)
+    //
+    // The whole thing is a strict ADDITIVE SUPERSET: a line using none of the ladder
+    // delimiters and carrying no colour tag takes a path that is behaviourally the old
+    // one — every word its own stop — so no record in the tree can reparse differently.
+    // That is deliberate rather than incidental: records are data, and a silent change
+    // in how an existing gradient is chopped into stops would show up only as a subtly
+    // wrong render, which is exactly the class of regression worth designing out.
+    //
+    // A leading colour head (`rgb`/`hsv`/`hsl` and every upsampler variant — see
+    // `isColourHead`) is the channel-level INLINE-COLOUR TAG: it fixes arity 3, so each
+    // comma group (or the lone group) is one colour written in place, instead of a chain
+    // of `spectrum:<name>` refs that each need their own top-level declaration.
+    bool parseChannelStops(const std::string& recName, RecChannel& ch,
+                           const std::vector<std::string>& words) {
+        auto bad = [&](const std::string& m) {
+            fail("record '" + recName + "' channel '" + ch.name + "': " + m);
+            return false;
+        };
+        if (words.empty()) return bad("has no stops");
+
+        // A leading colour head tags the whole channel and is not itself a stop.
+        size_t first = 0;
+        if (isColourHead(words[0])) {
+            ch.space = words[0];
+            first = 1;
+            if (words.size() == 1) return bad("'" + ch.space + "' tag with no stops");
+        }
+        const std::vector<std::string> body(words.begin() + first, words.end());
+
+        std::vector<std::string> toks;
+        recladder::tokenize(body, toks);
+
+        // Fast path: no ladder delimiter and no tag -> the plain whitespace list, read
+        // exactly as it always was (a `p:<pos>` word pins the stop that follows it).
+        if (ch.space.empty() && !recladder::usesLadder(toks)) {
+            bool havePin = false; double pinPos = 0.0;
+            for (const auto& w : toks) {
+                if (w.rfind("p:", 0) == 0) {
+                    if (!isNumber(w.substr(2))) return bad("bad p:<pos> '" + w + "'");
+                    havePin = true; pinPos = num(w.substr(2));
+                    continue;
+                }
+                RecStop st; st.token = w;
+                if (havePin) { st.pinned = true; st.pos = pinPos; havePin = false; }
+                ch.stops.push_back(std::move(st));
+            }
+            if (havePin) return bad("trailing p:<pos> with no value");
+            if (ch.stops.empty()) return bad("has no stops");
+            return true;
+        }
+
+        recladder::Value v;
+        bool trailingComma = false;
+        std::string lerr;
+        if (!recladder::parse(toks, v, trailingComma, lerr)) return bad(lerr);
+
+        // Turn the parsed ladder into a stop list. A leading `p:<pos>` component pins
+        // the stop it introduces (the ladder is purely structural, so the pin prefix
+        // stays an orthogonal concern peeled off here).
+        auto stopFrom = [&](const recladder::Value& g, RecStop& st) -> bool {
+            std::vector<std::string> comps;
+            if (g.isLeaf) comps.push_back(g.leaf);
+            else for (const auto& c : g.items) {
+                if (!c.isLeaf) return bad("stop is nested more than two levels deep");
+                comps.push_back(c.leaf);
+            }
+            if (!comps.empty() && comps[0].rfind("p:", 0) == 0) {
+                if (!isNumber(comps[0].substr(2))) return bad("bad p:<pos> '" + comps[0] + "'");
+                st.pinned = true; st.pos = num(comps[0].substr(2));
+                comps.erase(comps.begin());
+                if (comps.empty()) return bad("p:<pos> with no value");
+            }
+            st.token = comps[0];
+            if (comps.size() > 1) st.comps = comps;
+            return true;
+        };
+
+        const int depth = v.depth();
+        if (depth >= 2) {                       // a group per stop — the general shape
+            for (const auto& g : v.items) {
+                RecStop st;
+                if (!stopFrom(g, st)) return false;
+                ch.stops.push_back(std::move(st));
+            }
+        } else if (!ch.space.empty() || trailingComma) {
+            // One juxtaposed run that is ONE stop, not N: either the arity-3 tag says so
+            // (`reflect rgb .5 .5 .5`) or the author's trailing comma does (`tint 0 0 0,`).
+            RecStop st;
+            if (!stopFrom(v, st)) return false;
+            ch.stops.push_back(std::move(st));
+        } else {
+            // Untagged, comma-free, but bracketed — `rough [0] [1]`. Brackets around a
+            // single value are idempotent, so this is still the whitespace reading.
+            if (v.isLeaf) { RecStop st; if (!stopFrom(v, st)) return false; ch.stops.push_back(std::move(st)); }
+            else for (const auto& g : v.items) {
+                RecStop st;
+                if (!stopFrom(g, st)) return false;
+                ch.stops.push_back(std::move(st));
+            }
+        }
+        if (ch.stops.empty()) return bad("has no stops");
+
+        // Validate arity against the channel's kind. ftrace materializes exactly two
+        // kinds of channel — scalar and colour — so an arity-D vector channel has no
+        // destination here even though the grammar happily describes one. Say that
+        // outright rather than failing later with a confusing per-stop message.
+        for (const auto& st : ch.stops) {
+            const size_t arity = st.comps.empty() ? 1 : st.comps.size();
+            if (!ch.space.empty()) {
+                if (arity != 3)
+                    return bad("'" + ch.space + "' stops need 3 components, got " +
+                               std::to_string(arity));
+            } else if (arity != 1) {
+                return bad("arity-" + std::to_string(arity) + " vector stops have no "
+                           "destination in ftrace — tag the channel with a colour head "
+                           "(e.g. `" + ch.name + " rgb " + st.comps[0] + " " + st.comps[1] +
+                           " " + st.comps[2 % st.comps.size()] + ", ...`) to make it a "
+                           "colour channel, or write one value per stop for a scalar one");
+            }
+        }
+        return true;
+    }
+
     // Build one Record from a `NAME = range LO-HI [ ... ]` block: parse the domain,
     // interp, channels and stops; redistribute positions (stage 1); then compile each
     // stop into a scalar pattern program or a resolved colour + linear-RGB (stage 2).
@@ -2112,32 +2268,10 @@ private:
                 else { fail("record '" + rec.name + "': interp must be nearest|linear|smooth"); return false; }
                 continue;
             }
-            // Otherwise: a channel line. Its words are the stops, with optional `p:<pos>`
-            // prefixes pinning the position of the following value.
+            // Otherwise: a channel line, read by the generalized stop grammar.
             RecChannel ch;
             ch.name = s.key;
-            bool havePin = false; double pinPos = 0.0;
-            for (const auto& w : s.val.words) {
-                if (w.rfind("p:", 0) == 0) {
-                    if (!isNumber(w.substr(2))) {
-                        fail("record '" + rec.name + "' channel '" + ch.name + "': bad p:<pos> '" + w + "'");
-                        return false;
-                    }
-                    havePin = true; pinPos = num(w.substr(2));
-                    continue;
-                }
-                RecStop st; st.token = w;
-                if (havePin) { st.pinned = true; st.pos = pinPos; havePin = false; }
-                ch.stops.push_back(std::move(st));
-            }
-            if (havePin) {
-                fail("record '" + rec.name + "' channel '" + ch.name + "': trailing p:<pos> with no value");
-                return false;
-            }
-            if (ch.stops.empty()) {
-                fail("record '" + rec.name + "' channel '" + ch.name + "' has no stops");
-                return false;
-            }
+            if (!parseChannelStops(rec.name, ch, s.val.words)) return false;
             redistributeStops(ch, rec.lo, rec.hi);
             rec.channels.push_back(std::move(ch));
         }
@@ -2159,20 +2293,30 @@ private:
                 }
             }
         }
-        // Stage 2: compile stop tokens. A stop is a COLOUR iff its token is a prefixed
-        // spectrum ref (contains ':', e.g. spectrum:steel / metal:copper / rgb:... );
-        // otherwise it is a SCALAR pattern expression (a literal, or math over
-        // intrinsics x y z nx ny nz r u v f + functions). A channel must be homogeneous.
+        // Stage 2: compile stop tokens. A channel is a COLOUR channel two ways — either
+        // it carries an inline-colour TAG (`reflect rgb 0 0 0, 1 1 1`), or its stops are
+        // prefixed spectrum refs (`spectrum:steel` / `metal:copper` — anything with a
+        // ':'). Otherwise every stop is a SCALAR pattern expression (a literal, or math
+        // over intrinsics x y z nx ny nz r u v f + functions). A channel must be
+        // homogeneous. Note the two colour forms CONVERGE here: a tagged stop is handed
+        // to the very same `evalSpectrum` as `rgb 0 0 0` written at any other value
+        // site, so it inherits every upsampler and colour space for free and nothing
+        // downstream (the JH coeff bake, the CPU sampler, the GPU upload) can tell the
+        // two apart.
         for (auto& ch : rec.channels) {
-            bool anyColour = false, anyScalar = false;
-            for (const auto& st : ch.stops)
-                (st.token.find(':') != std::string::npos ? anyColour : anyScalar) = true;
-            if (anyColour && anyScalar) {
-                fail("record '" + rec.name + "' channel '" + ch.name +
-                     "': mixes colour (spectrum:...) and scalar stops");
-                return false;
+            if (!ch.space.empty()) {
+                ch.kind = ChanKind::Spectrum;
+            } else {
+                bool anyColour = false, anyScalar = false;
+                for (const auto& st : ch.stops)
+                    (st.token.find(':') != std::string::npos ? anyColour : anyScalar) = true;
+                if (anyColour && anyScalar) {
+                    fail("record '" + rec.name + "' channel '" + ch.name +
+                         "': mixes colour (spectrum:...) and scalar stops");
+                    return false;
+                }
+                ch.kind = anyColour ? ChanKind::Spectrum : ChanKind::Scalar;
             }
-            ch.kind = anyColour ? ChanKind::Spectrum : ChanKind::Scalar;
             for (auto& st : ch.stops) {
                 if (ch.kind == ChanKind::Scalar) {
                     std::string cerr;
@@ -2182,7 +2326,12 @@ private:
                         return false;
                     }
                 } else {
-                    Value v; v.words = { st.token };
+                    Value v;
+                    if (ch.space.empty()) v.words = { st.token };
+                    else {
+                        v.words.push_back(ch.space);
+                        for (const auto& c : st.comps) v.words.push_back(c);
+                    }
                     st.color = evalSpectrum(v);
                     if (!err.empty()) return false;   // evalSpectrum already set the message
                     st.rgb = reflectanceToLinearSrgbD65(st.color);

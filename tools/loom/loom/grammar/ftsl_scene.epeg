@@ -74,7 +74,20 @@ range_word   = NUMWORD | KVWORD | STRING | WORD | PARENWORD
 record_body  = '[' rec_item* ']'
 rec_item     = NEWLINE | record_line
 record_line  = WORD stop_word*                 # channel name + stop tokens
-stop_word    = NUMWORD | KVWORD | STRING | WORD | PARENWORD
+# A stop token, or an explicit `[ … ]` GROUP — the bracket rung of the generalized
+# stop grammar's delimiter precedence ladder (whitespace binds tightest like `×`,
+# comma looser like `+`, brackets are the ladder's parentheses).  Commas need no rule
+# here: `,` is NOT one of ftrace's tokenizer delimiters, so `0 0 0, 1 1 1` already
+# lexes as words with the comma riding along (`0,`) and the loader's ladder re-splits
+# them paren-aware — which is precisely what keeps an expression like `clamp(x,0,1)`
+# a single leaf.  Brackets DO delimit, so the group has to be spelled out; the reducer
+# flattens it back into the word list with `[` / `]` marker words (no real word can
+# ever equal one, since both are excluded from every terminal's character class).
+# NEWLINE inside a group lets a long gradient be laid out over several lines, exactly
+# as `selector` already allows for an array literal.
+stop_word    = NUMWORD | KVWORD | STRING | WORD | PARENWORD | stop_group
+stop_group   = '[' stop_item* ']'
+stop_item    = NEWLINE | stop_word
 
 # ---- spectrum decl: `spectrum "name" [subtype] = <value>` -----------
 # The one block form with an `=` value instead of a brace body.

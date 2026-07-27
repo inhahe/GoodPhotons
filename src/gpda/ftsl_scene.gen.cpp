@@ -12,826 +12,872 @@ gpda_tok::Graph build_ftsl_scene_graph() {
     using gpda_tok::Graph;
     using gpda_tok::NodeType;
     Graph g;
-    g.nodes.resize(216);
+    g.nodes.resize(228);
 
     g.nodes[0].type = NodeType::RuleStart;
     g.nodes[0].rule_name = "scene_file";
-    g.nodes[0].links = {65};
+    g.nodes[0].links = {69};
 
     g.nodes[1].type = NodeType::RuleEnd;
     g.nodes[1].rule_name = "scene_file";
 
     g.nodes[2].type = NodeType::RuleStart;
     g.nodes[2].rule_name = "item";
-    g.nodes[2].links = {67, 68};
+    g.nodes[2].links = {71, 72};
 
     g.nodes[3].type = NodeType::RuleEnd;
     g.nodes[3].rule_name = "item";
 
     g.nodes[4].type = NodeType::RuleStart;
     g.nodes[4].rule_name = "top_block";
-    g.nodes[4].links = {69, 70, 71, 72, 73};
+    g.nodes[4].links = {73, 74, 75, 76, 77};
 
     g.nodes[5].type = NodeType::RuleEnd;
     g.nodes[5].rule_name = "top_block";
 
     g.nodes[6].type = NodeType::RuleStart;
     g.nodes[6].rule_name = "prefer_block";
-    g.nodes[6].links = {74};
+    g.nodes[6].links = {78};
 
     g.nodes[7].type = NodeType::RuleEnd;
     g.nodes[7].rule_name = "prefer_block";
 
     g.nodes[8].type = NodeType::RuleStart;
     g.nodes[8].rule_name = "block_list";
-    g.nodes[8].links = {82};
+    g.nodes[8].links = {86};
 
     g.nodes[9].type = NodeType::RuleEnd;
     g.nodes[9].rule_name = "block_list";
 
     g.nodes[10].type = NodeType::RuleStart;
     g.nodes[10].rule_name = "blank_lines";
-    g.nodes[10].links = {88};
+    g.nodes[10].links = {92};
 
     g.nodes[11].type = NodeType::RuleEnd;
     g.nodes[11].rule_name = "blank_lines";
 
     g.nodes[12].type = NodeType::RuleStart;
     g.nodes[12].rule_name = "record_decl";
-    g.nodes[12].links = {90};
+    g.nodes[12].links = {94};
 
     g.nodes[13].type = NodeType::RuleEnd;
     g.nodes[13].rule_name = "record_decl";
 
     g.nodes[14].type = NodeType::RuleStart;
     g.nodes[14].rule_name = "range_word";
-    g.nodes[14].links = {98, 99, 100, 101, 102};
+    g.nodes[14].links = {102, 103, 104, 105, 106};
 
     g.nodes[15].type = NodeType::RuleEnd;
     g.nodes[15].rule_name = "range_word";
 
     g.nodes[16].type = NodeType::RuleStart;
     g.nodes[16].rule_name = "record_body";
-    g.nodes[16].links = {103};
+    g.nodes[16].links = {107};
 
     g.nodes[17].type = NodeType::RuleEnd;
     g.nodes[17].rule_name = "record_body";
 
     g.nodes[18].type = NodeType::RuleStart;
     g.nodes[18].rule_name = "rec_item";
-    g.nodes[18].links = {108, 109};
+    g.nodes[18].links = {112, 113};
 
     g.nodes[19].type = NodeType::RuleEnd;
     g.nodes[19].rule_name = "rec_item";
 
     g.nodes[20].type = NodeType::RuleStart;
     g.nodes[20].rule_name = "record_line";
-    g.nodes[20].links = {110};
+    g.nodes[20].links = {114};
 
     g.nodes[21].type = NodeType::RuleEnd;
     g.nodes[21].rule_name = "record_line";
 
     g.nodes[22].type = NodeType::RuleStart;
     g.nodes[22].rule_name = "stop_word";
-    g.nodes[22].links = {114, 115, 116, 117, 118};
+    g.nodes[22].links = {118, 119, 120, 121, 122, 123};
 
     g.nodes[23].type = NodeType::RuleEnd;
     g.nodes[23].rule_name = "stop_word";
 
     g.nodes[24].type = NodeType::RuleStart;
-    g.nodes[24].rule_name = "spectrum_decl";
-    g.nodes[24].links = {119};
+    g.nodes[24].rule_name = "stop_group";
+    g.nodes[24].links = {124};
 
     g.nodes[25].type = NodeType::RuleEnd;
-    g.nodes[25].rule_name = "spectrum_decl";
+    g.nodes[25].rule_name = "stop_group";
 
     g.nodes[26].type = NodeType::RuleStart;
-    g.nodes[26].rule_name = "assign_header";
-    g.nodes[26].links = {128};
+    g.nodes[26].rule_name = "stop_item";
+    g.nodes[26].links = {129, 130};
 
     g.nodes[27].type = NodeType::RuleEnd;
-    g.nodes[27].rule_name = "assign_header";
+    g.nodes[27].rule_name = "stop_item";
 
     g.nodes[28].type = NodeType::RuleStart;
-    g.nodes[28].rule_name = "plain_header";
-    g.nodes[28].links = {135};
+    g.nodes[28].rule_name = "spectrum_decl";
+    g.nodes[28].links = {131};
 
     g.nodes[29].type = NodeType::RuleEnd;
-    g.nodes[29].rule_name = "plain_header";
+    g.nodes[29].rule_name = "spectrum_decl";
 
     g.nodes[30].type = NodeType::RuleStart;
-    g.nodes[30].rule_name = "subtype";
-    g.nodes[30].links = {143};
+    g.nodes[30].rule_name = "assign_header";
+    g.nodes[30].links = {140};
 
     g.nodes[31].type = NodeType::RuleEnd;
-    g.nodes[31].rule_name = "subtype";
+    g.nodes[31].rule_name = "assign_header";
 
     g.nodes[32].type = NodeType::RuleStart;
-    g.nodes[32].rule_name = "brace_body";
-    g.nodes[32].links = {144};
+    g.nodes[32].rule_name = "plain_header";
+    g.nodes[32].links = {147};
 
     g.nodes[33].type = NodeType::RuleEnd;
-    g.nodes[33].rule_name = "brace_body";
+    g.nodes[33].rule_name = "plain_header";
 
     g.nodes[34].type = NodeType::RuleStart;
-    g.nodes[34].rule_name = "body_item";
-    g.nodes[34].links = {149, 150};
+    g.nodes[34].rule_name = "subtype";
+    g.nodes[34].links = {155};
 
     g.nodes[35].type = NodeType::RuleEnd;
-    g.nodes[35].rule_name = "body_item";
+    g.nodes[35].rule_name = "subtype";
 
     g.nodes[36].type = NodeType::RuleStart;
-    g.nodes[36].rule_name = "stmt";
-    g.nodes[36].links = {151};
+    g.nodes[36].rule_name = "brace_body";
+    g.nodes[36].links = {156};
 
     g.nodes[37].type = NodeType::RuleEnd;
-    g.nodes[37].rule_name = "stmt";
+    g.nodes[37].rule_name = "brace_body";
 
     g.nodes[38].type = NodeType::RuleStart;
-    g.nodes[38].rule_name = "key_tok";
-    g.nodes[38].links = {153, 154, 155};
+    g.nodes[38].rule_name = "body_item";
+    g.nodes[38].links = {161, 162};
 
     g.nodes[39].type = NodeType::RuleEnd;
-    g.nodes[39].rule_name = "key_tok";
+    g.nodes[39].rule_name = "body_item";
 
     g.nodes[40].type = NodeType::RuleStart;
-    g.nodes[40].rule_name = "value";
-    g.nodes[40].links = {156, 157};
+    g.nodes[40].rule_name = "stmt";
+    g.nodes[40].links = {163};
 
     g.nodes[41].type = NodeType::RuleEnd;
-    g.nodes[41].rule_name = "value";
+    g.nodes[41].rule_name = "stmt";
 
     g.nodes[42].type = NodeType::RuleStart;
-    g.nodes[42].rule_name = "override_val";
-    g.nodes[42].links = {158};
+    g.nodes[42].rule_name = "key_tok";
+    g.nodes[42].links = {165, 166, 167};
 
     g.nodes[43].type = NodeType::RuleEnd;
-    g.nodes[43].rule_name = "override_val";
+    g.nodes[43].rule_name = "key_tok";
 
     g.nodes[44].type = NodeType::RuleStart;
-    g.nodes[44].rule_name = "rhs";
-    g.nodes[44].links = {165, 166, 167, 168, 169};
+    g.nodes[44].rule_name = "value";
+    g.nodes[44].links = {168, 169};
 
     g.nodes[45].type = NodeType::RuleEnd;
-    g.nodes[45].rule_name = "rhs";
+    g.nodes[45].rule_name = "value";
 
     g.nodes[46].type = NodeType::RuleStart;
-    g.nodes[46].rule_name = "normal_val";
-    g.nodes[46].links = {171};
+    g.nodes[46].rule_name = "override_val";
+    g.nodes[46].links = {170};
 
     g.nodes[47].type = NodeType::RuleEnd;
-    g.nodes[47].rule_name = "normal_val";
+    g.nodes[47].rule_name = "override_val";
 
     g.nodes[48].type = NodeType::RuleStart;
-    g.nodes[48].rule_name = "val_head";
-    g.nodes[48].links = {182, 183, 184, 185, 186};
+    g.nodes[48].rule_name = "rhs";
+    g.nodes[48].links = {177, 178, 179, 180, 181};
 
     g.nodes[49].type = NodeType::RuleEnd;
-    g.nodes[49].rule_name = "val_head";
+    g.nodes[49].rule_name = "rhs";
 
     g.nodes[50].type = NodeType::RuleStart;
-    g.nodes[50].rule_name = "cont";
-    g.nodes[50].links = {187, 188, 189};
+    g.nodes[50].rule_name = "normal_val";
+    g.nodes[50].links = {183};
 
     g.nodes[51].type = NodeType::RuleEnd;
-    g.nodes[51].rule_name = "cont";
+    g.nodes[51].rule_name = "normal_val";
 
     g.nodes[52].type = NodeType::RuleStart;
-    g.nodes[52].rule_name = "selector";
-    g.nodes[52].links = {190};
+    g.nodes[52].rule_name = "val_head";
+    g.nodes[52].links = {194, 195, 196, 197, 198};
 
     g.nodes[53].type = NodeType::RuleEnd;
-    g.nodes[53].rule_name = "selector";
+    g.nodes[53].rule_name = "val_head";
 
     g.nodes[54].type = NodeType::RuleStart;
-    g.nodes[54].rule_name = "sel_item";
-    g.nodes[54].links = {198, 199, 200};
+    g.nodes[54].rule_name = "cont";
+    g.nodes[54].links = {199, 200, 201};
 
     g.nodes[55].type = NodeType::RuleEnd;
-    g.nodes[55].rule_name = "sel_item";
+    g.nodes[55].rule_name = "cont";
 
     g.nodes[56].type = NodeType::RuleStart;
-    g.nodes[56].rule_name = "sub_array";
-    g.nodes[56].links = {201};
+    g.nodes[56].rule_name = "selector";
+    g.nodes[56].links = {202};
 
     g.nodes[57].type = NodeType::RuleEnd;
-    g.nodes[57].rule_name = "sub_array";
+    g.nodes[57].rule_name = "selector";
 
     g.nodes[58].type = NodeType::RuleStart;
-    g.nodes[58].rule_name = "sel_word";
-    g.nodes[58].links = {206, 207, 208, 209};
+    g.nodes[58].rule_name = "sel_item";
+    g.nodes[58].links = {210, 211, 212};
 
     g.nodes[59].type = NodeType::RuleEnd;
-    g.nodes[59].rule_name = "sel_word";
+    g.nodes[59].rule_name = "sel_item";
 
     g.nodes[60].type = NodeType::RuleStart;
-    g.nodes[60].rule_name = "axistuple";
-    g.nodes[60].links = {210};
+    g.nodes[60].rule_name = "sub_array";
+    g.nodes[60].links = {213};
 
     g.nodes[61].type = NodeType::RuleEnd;
-    g.nodes[61].rule_name = "axistuple";
+    g.nodes[61].rule_name = "sub_array";
 
     g.nodes[62].type = NodeType::RuleStart;
-    g.nodes[62].rule_name = "block";
-    g.nodes[62].links = {211};
+    g.nodes[62].rule_name = "sel_word";
+    g.nodes[62].links = {218, 219, 220, 221};
 
     g.nodes[63].type = NodeType::RuleEnd;
-    g.nodes[63].rule_name = "block";
+    g.nodes[63].rule_name = "sel_word";
 
-    g.nodes[64].type = NodeType::RuleRef;
-    g.nodes[64].value = "item";
-    g.nodes[64].links = {65};
+    g.nodes[64].type = NodeType::RuleStart;
+    g.nodes[64].rule_name = "axistuple";
+    g.nodes[64].links = {222};
 
-    g.nodes[65].type = NodeType::Split;
-    g.nodes[65].links = {64, 66};
+    g.nodes[65].type = NodeType::RuleEnd;
+    g.nodes[65].rule_name = "axistuple";
 
-    g.nodes[66].type = NodeType::Split;
-    g.nodes[66].links = {1};
+    g.nodes[66].type = NodeType::RuleStart;
+    g.nodes[66].rule_name = "block";
+    g.nodes[66].links = {223};
 
-    g.nodes[67].type = NodeType::MatchTok;
-    g.nodes[67].value = "NEWLINE";
-    g.nodes[67].links = {3};
+    g.nodes[67].type = NodeType::RuleEnd;
+    g.nodes[67].rule_name = "block";
 
     g.nodes[68].type = NodeType::RuleRef;
-    g.nodes[68].value = "top_block";
-    g.nodes[68].links = {3};
+    g.nodes[68].value = "item";
+    g.nodes[68].links = {69};
 
-    g.nodes[69].type = NodeType::RuleRef;
-    g.nodes[69].value = "prefer_block";
-    g.nodes[69].links = {5};
+    g.nodes[69].type = NodeType::Split;
+    g.nodes[69].links = {68, 70};
 
-    g.nodes[70].type = NodeType::RuleRef;
-    g.nodes[70].value = "record_decl";
-    g.nodes[70].links = {5};
+    g.nodes[70].type = NodeType::Split;
+    g.nodes[70].links = {1};
 
-    g.nodes[71].type = NodeType::RuleRef;
-    g.nodes[71].value = "spectrum_decl";
-    g.nodes[71].links = {5};
+    g.nodes[71].type = NodeType::MatchTok;
+    g.nodes[71].value = "NEWLINE";
+    g.nodes[71].links = {3};
 
     g.nodes[72].type = NodeType::RuleRef;
-    g.nodes[72].value = "assign_header";
-    g.nodes[72].links = {5};
+    g.nodes[72].value = "top_block";
+    g.nodes[72].links = {3};
 
     g.nodes[73].type = NodeType::RuleRef;
-    g.nodes[73].value = "plain_header";
+    g.nodes[73].value = "prefer_block";
     g.nodes[73].links = {5};
 
-    g.nodes[74].type = NodeType::MatchStr;
-    g.nodes[74].value = "prefer";
-    g.nodes[74].links = {75};
+    g.nodes[74].type = NodeType::RuleRef;
+    g.nodes[74].value = "record_decl";
+    g.nodes[74].links = {5};
 
     g.nodes[75].type = NodeType::RuleRef;
-    g.nodes[75].value = "blank_lines";
-    g.nodes[75].links = {76};
+    g.nodes[75].value = "spectrum_decl";
+    g.nodes[75].links = {5};
 
     g.nodes[76].type = NodeType::RuleRef;
-    g.nodes[76].value = "block_list";
-    g.nodes[76].links = {80};
+    g.nodes[76].value = "assign_header";
+    g.nodes[76].links = {5};
 
-    g.nodes[77].type = NodeType::MatchStr;
-    g.nodes[77].value = "else";
-    g.nodes[77].links = {78};
+    g.nodes[77].type = NodeType::RuleRef;
+    g.nodes[77].value = "plain_header";
+    g.nodes[77].links = {5};
 
-    g.nodes[78].type = NodeType::RuleRef;
-    g.nodes[78].value = "blank_lines";
+    g.nodes[78].type = NodeType::MatchStr;
+    g.nodes[78].value = "prefer";
     g.nodes[78].links = {79};
 
     g.nodes[79].type = NodeType::RuleRef;
-    g.nodes[79].value = "block_list";
+    g.nodes[79].value = "blank_lines";
     g.nodes[79].links = {80};
 
-    g.nodes[80].type = NodeType::Split;
-    g.nodes[80].links = {77, 81};
+    g.nodes[80].type = NodeType::RuleRef;
+    g.nodes[80].value = "block_list";
+    g.nodes[80].links = {84};
 
-    g.nodes[81].type = NodeType::Split;
-    g.nodes[81].links = {7};
+    g.nodes[81].type = NodeType::MatchStr;
+    g.nodes[81].value = "else";
+    g.nodes[81].links = {82};
 
-    g.nodes[82].type = NodeType::MatchStr;
-    g.nodes[82].value = "{";
-    g.nodes[82].links = {84};
+    g.nodes[82].type = NodeType::RuleRef;
+    g.nodes[82].value = "blank_lines";
+    g.nodes[82].links = {83};
 
     g.nodes[83].type = NodeType::RuleRef;
-    g.nodes[83].value = "item";
+    g.nodes[83].value = "block_list";
     g.nodes[83].links = {84};
 
     g.nodes[84].type = NodeType::Split;
-    g.nodes[84].links = {83, 85};
+    g.nodes[84].links = {81, 85};
 
     g.nodes[85].type = NodeType::Split;
-    g.nodes[85].links = {86};
+    g.nodes[85].links = {7};
 
     g.nodes[86].type = NodeType::MatchStr;
-    g.nodes[86].value = "}";
-    g.nodes[86].links = {9};
+    g.nodes[86].value = "{";
+    g.nodes[86].links = {88};
 
-    g.nodes[87].type = NodeType::MatchTok;
-    g.nodes[87].value = "NEWLINE";
+    g.nodes[87].type = NodeType::RuleRef;
+    g.nodes[87].value = "item";
     g.nodes[87].links = {88};
 
     g.nodes[88].type = NodeType::Split;
     g.nodes[88].links = {87, 89};
 
     g.nodes[89].type = NodeType::Split;
-    g.nodes[89].links = {11};
+    g.nodes[89].links = {90};
 
-    g.nodes[90].type = NodeType::MatchTok;
-    g.nodes[90].value = "WORD";
-    g.nodes[90].links = {91};
+    g.nodes[90].type = NodeType::MatchStr;
+    g.nodes[90].value = "}";
+    g.nodes[90].links = {9};
 
-    g.nodes[91].type = NodeType::MatchStr;
-    g.nodes[91].value = "=";
+    g.nodes[91].type = NodeType::MatchTok;
+    g.nodes[91].value = "NEWLINE";
     g.nodes[91].links = {92};
 
-    g.nodes[92].type = NodeType::MatchStr;
-    g.nodes[92].value = "range";
-    g.nodes[92].links = {94};
+    g.nodes[92].type = NodeType::Split;
+    g.nodes[92].links = {91, 93};
 
-    g.nodes[93].type = NodeType::RuleRef;
-    g.nodes[93].value = "range_word";
-    g.nodes[93].links = {94};
+    g.nodes[93].type = NodeType::Split;
+    g.nodes[93].links = {11};
 
-    g.nodes[94].type = NodeType::Split;
-    g.nodes[94].links = {93, 95};
+    g.nodes[94].type = NodeType::MatchTok;
+    g.nodes[94].value = "WORD";
+    g.nodes[94].links = {95};
 
-    g.nodes[95].type = NodeType::Split;
+    g.nodes[95].type = NodeType::MatchStr;
+    g.nodes[95].value = "=";
     g.nodes[95].links = {96};
 
-    g.nodes[96].type = NodeType::RuleRef;
-    g.nodes[96].value = "blank_lines";
-    g.nodes[96].links = {97};
+    g.nodes[96].type = NodeType::MatchStr;
+    g.nodes[96].value = "range";
+    g.nodes[96].links = {98};
 
     g.nodes[97].type = NodeType::RuleRef;
-    g.nodes[97].value = "record_body";
-    g.nodes[97].links = {13};
+    g.nodes[97].value = "range_word";
+    g.nodes[97].links = {98};
 
-    g.nodes[98].type = NodeType::MatchTok;
-    g.nodes[98].value = "NUMWORD";
-    g.nodes[98].links = {15};
+    g.nodes[98].type = NodeType::Split;
+    g.nodes[98].links = {97, 99};
 
-    g.nodes[99].type = NodeType::MatchTok;
-    g.nodes[99].value = "KVWORD";
-    g.nodes[99].links = {15};
+    g.nodes[99].type = NodeType::Split;
+    g.nodes[99].links = {100};
 
-    g.nodes[100].type = NodeType::MatchTok;
-    g.nodes[100].value = "STRING";
-    g.nodes[100].links = {15};
+    g.nodes[100].type = NodeType::RuleRef;
+    g.nodes[100].value = "blank_lines";
+    g.nodes[100].links = {101};
 
-    g.nodes[101].type = NodeType::MatchTok;
-    g.nodes[101].value = "WORD";
-    g.nodes[101].links = {15};
+    g.nodes[101].type = NodeType::RuleRef;
+    g.nodes[101].value = "record_body";
+    g.nodes[101].links = {13};
 
     g.nodes[102].type = NodeType::MatchTok;
-    g.nodes[102].value = "PARENWORD";
+    g.nodes[102].value = "NUMWORD";
     g.nodes[102].links = {15};
 
-    g.nodes[103].type = NodeType::MatchStr;
-    g.nodes[103].value = "[";
-    g.nodes[103].links = {105};
+    g.nodes[103].type = NodeType::MatchTok;
+    g.nodes[103].value = "KVWORD";
+    g.nodes[103].links = {15};
 
-    g.nodes[104].type = NodeType::RuleRef;
-    g.nodes[104].value = "rec_item";
-    g.nodes[104].links = {105};
+    g.nodes[104].type = NodeType::MatchTok;
+    g.nodes[104].value = "STRING";
+    g.nodes[104].links = {15};
 
-    g.nodes[105].type = NodeType::Split;
-    g.nodes[105].links = {104, 106};
+    g.nodes[105].type = NodeType::MatchTok;
+    g.nodes[105].value = "WORD";
+    g.nodes[105].links = {15};
 
-    g.nodes[106].type = NodeType::Split;
-    g.nodes[106].links = {107};
+    g.nodes[106].type = NodeType::MatchTok;
+    g.nodes[106].value = "PARENWORD";
+    g.nodes[106].links = {15};
 
     g.nodes[107].type = NodeType::MatchStr;
-    g.nodes[107].value = "]";
-    g.nodes[107].links = {17};
+    g.nodes[107].value = "[";
+    g.nodes[107].links = {109};
 
-    g.nodes[108].type = NodeType::MatchTok;
-    g.nodes[108].value = "NEWLINE";
-    g.nodes[108].links = {19};
+    g.nodes[108].type = NodeType::RuleRef;
+    g.nodes[108].value = "rec_item";
+    g.nodes[108].links = {109};
 
-    g.nodes[109].type = NodeType::RuleRef;
-    g.nodes[109].value = "record_line";
-    g.nodes[109].links = {19};
+    g.nodes[109].type = NodeType::Split;
+    g.nodes[109].links = {108, 110};
 
-    g.nodes[110].type = NodeType::MatchTok;
-    g.nodes[110].value = "WORD";
-    g.nodes[110].links = {112};
+    g.nodes[110].type = NodeType::Split;
+    g.nodes[110].links = {111};
 
-    g.nodes[111].type = NodeType::RuleRef;
-    g.nodes[111].value = "stop_word";
-    g.nodes[111].links = {112};
+    g.nodes[111].type = NodeType::MatchStr;
+    g.nodes[111].value = "]";
+    g.nodes[111].links = {17};
 
-    g.nodes[112].type = NodeType::Split;
-    g.nodes[112].links = {111, 113};
+    g.nodes[112].type = NodeType::MatchTok;
+    g.nodes[112].value = "NEWLINE";
+    g.nodes[112].links = {19};
 
-    g.nodes[113].type = NodeType::Split;
-    g.nodes[113].links = {21};
+    g.nodes[113].type = NodeType::RuleRef;
+    g.nodes[113].value = "record_line";
+    g.nodes[113].links = {19};
 
     g.nodes[114].type = NodeType::MatchTok;
-    g.nodes[114].value = "NUMWORD";
-    g.nodes[114].links = {23};
+    g.nodes[114].value = "WORD";
+    g.nodes[114].links = {116};
 
-    g.nodes[115].type = NodeType::MatchTok;
-    g.nodes[115].value = "KVWORD";
-    g.nodes[115].links = {23};
+    g.nodes[115].type = NodeType::RuleRef;
+    g.nodes[115].value = "stop_word";
+    g.nodes[115].links = {116};
 
-    g.nodes[116].type = NodeType::MatchTok;
-    g.nodes[116].value = "STRING";
-    g.nodes[116].links = {23};
+    g.nodes[116].type = NodeType::Split;
+    g.nodes[116].links = {115, 117};
 
-    g.nodes[117].type = NodeType::MatchTok;
-    g.nodes[117].value = "WORD";
-    g.nodes[117].links = {23};
+    g.nodes[117].type = NodeType::Split;
+    g.nodes[117].links = {21};
 
     g.nodes[118].type = NodeType::MatchTok;
-    g.nodes[118].value = "PARENWORD";
+    g.nodes[118].value = "NUMWORD";
     g.nodes[118].links = {23};
 
-    g.nodes[119].type = NodeType::MatchStr;
-    g.nodes[119].value = "spectrum";
-    g.nodes[119].links = {121};
+    g.nodes[119].type = NodeType::MatchTok;
+    g.nodes[119].value = "KVWORD";
+    g.nodes[119].links = {23};
 
     g.nodes[120].type = NodeType::MatchTok;
     g.nodes[120].value = "STRING";
-    g.nodes[120].links = {122};
+    g.nodes[120].links = {23};
 
-    g.nodes[121].type = NodeType::Split;
-    g.nodes[121].links = {120, 122};
+    g.nodes[121].type = NodeType::MatchTok;
+    g.nodes[121].value = "WORD";
+    g.nodes[121].links = {23};
 
-    g.nodes[122].type = NodeType::Split;
-    g.nodes[122].links = {124};
+    g.nodes[122].type = NodeType::MatchTok;
+    g.nodes[122].value = "PARENWORD";
+    g.nodes[122].links = {23};
 
     g.nodes[123].type = NodeType::RuleRef;
-    g.nodes[123].value = "subtype";
-    g.nodes[123].links = {125};
+    g.nodes[123].value = "stop_group";
+    g.nodes[123].links = {23};
 
-    g.nodes[124].type = NodeType::Split;
-    g.nodes[124].links = {123, 125};
+    g.nodes[124].type = NodeType::MatchStr;
+    g.nodes[124].value = "[";
+    g.nodes[124].links = {126};
 
-    g.nodes[125].type = NodeType::Split;
+    g.nodes[125].type = NodeType::RuleRef;
+    g.nodes[125].value = "stop_item";
     g.nodes[125].links = {126};
 
-    g.nodes[126].type = NodeType::MatchStr;
-    g.nodes[126].value = "=";
-    g.nodes[126].links = {127};
+    g.nodes[126].type = NodeType::Split;
+    g.nodes[126].links = {125, 127};
 
-    g.nodes[127].type = NodeType::RuleRef;
-    g.nodes[127].value = "value";
-    g.nodes[127].links = {25};
+    g.nodes[127].type = NodeType::Split;
+    g.nodes[127].links = {128};
 
-    g.nodes[128].type = NodeType::MatchTok;
-    g.nodes[128].value = "WORD";
-    g.nodes[128].links = {129};
+    g.nodes[128].type = NodeType::MatchStr;
+    g.nodes[128].value = "]";
+    g.nodes[128].links = {25};
 
-    g.nodes[129].type = NodeType::MatchStr;
-    g.nodes[129].value = "=";
-    g.nodes[129].links = {130};
+    g.nodes[129].type = NodeType::MatchTok;
+    g.nodes[129].value = "NEWLINE";
+    g.nodes[129].links = {27};
 
-    g.nodes[130].type = NodeType::MatchTok;
-    g.nodes[130].value = "WORD";
-    g.nodes[130].links = {132};
+    g.nodes[130].type = NodeType::RuleRef;
+    g.nodes[130].value = "stop_word";
+    g.nodes[130].links = {27};
 
-    g.nodes[131].type = NodeType::RuleRef;
-    g.nodes[131].value = "subtype";
+    g.nodes[131].type = NodeType::MatchStr;
+    g.nodes[131].value = "spectrum";
     g.nodes[131].links = {133};
 
-    g.nodes[132].type = NodeType::Split;
-    g.nodes[132].links = {131, 133};
+    g.nodes[132].type = NodeType::MatchTok;
+    g.nodes[132].value = "STRING";
+    g.nodes[132].links = {134};
 
     g.nodes[133].type = NodeType::Split;
-    g.nodes[133].links = {134};
+    g.nodes[133].links = {132, 134};
 
-    g.nodes[134].type = NodeType::RuleRef;
-    g.nodes[134].value = "brace_body";
-    g.nodes[134].links = {27};
+    g.nodes[134].type = NodeType::Split;
+    g.nodes[134].links = {136};
 
-    g.nodes[135].type = NodeType::MatchTok;
-    g.nodes[135].value = "WORD";
+    g.nodes[135].type = NodeType::RuleRef;
+    g.nodes[135].value = "subtype";
     g.nodes[135].links = {137};
 
-    g.nodes[136].type = NodeType::MatchTok;
-    g.nodes[136].value = "STRING";
-    g.nodes[136].links = {138};
+    g.nodes[136].type = NodeType::Split;
+    g.nodes[136].links = {135, 137};
 
     g.nodes[137].type = NodeType::Split;
-    g.nodes[137].links = {136, 138};
+    g.nodes[137].links = {138};
 
-    g.nodes[138].type = NodeType::Split;
-    g.nodes[138].links = {140};
+    g.nodes[138].type = NodeType::MatchStr;
+    g.nodes[138].value = "=";
+    g.nodes[138].links = {139};
 
     g.nodes[139].type = NodeType::RuleRef;
-    g.nodes[139].value = "subtype";
-    g.nodes[139].links = {141};
+    g.nodes[139].value = "value";
+    g.nodes[139].links = {29};
 
-    g.nodes[140].type = NodeType::Split;
-    g.nodes[140].links = {139, 141};
+    g.nodes[140].type = NodeType::MatchTok;
+    g.nodes[140].value = "WORD";
+    g.nodes[140].links = {141};
 
-    g.nodes[141].type = NodeType::Split;
+    g.nodes[141].type = NodeType::MatchStr;
+    g.nodes[141].value = "=";
     g.nodes[141].links = {142};
 
-    g.nodes[142].type = NodeType::RuleRef;
-    g.nodes[142].value = "brace_body";
-    g.nodes[142].links = {29};
+    g.nodes[142].type = NodeType::MatchTok;
+    g.nodes[142].value = "WORD";
+    g.nodes[142].links = {144};
 
-    g.nodes[143].type = NodeType::MatchTok;
-    g.nodes[143].value = "WORD";
-    g.nodes[143].links = {31};
+    g.nodes[143].type = NodeType::RuleRef;
+    g.nodes[143].value = "subtype";
+    g.nodes[143].links = {145};
 
-    g.nodes[144].type = NodeType::MatchStr;
-    g.nodes[144].value = "{";
-    g.nodes[144].links = {146};
+    g.nodes[144].type = NodeType::Split;
+    g.nodes[144].links = {143, 145};
 
-    g.nodes[145].type = NodeType::RuleRef;
-    g.nodes[145].value = "body_item";
+    g.nodes[145].type = NodeType::Split;
     g.nodes[145].links = {146};
 
-    g.nodes[146].type = NodeType::Split;
-    g.nodes[146].links = {145, 147};
+    g.nodes[146].type = NodeType::RuleRef;
+    g.nodes[146].value = "brace_body";
+    g.nodes[146].links = {31};
 
-    g.nodes[147].type = NodeType::Split;
-    g.nodes[147].links = {148};
+    g.nodes[147].type = NodeType::MatchTok;
+    g.nodes[147].value = "WORD";
+    g.nodes[147].links = {149};
 
-    g.nodes[148].type = NodeType::MatchStr;
-    g.nodes[148].value = "}";
-    g.nodes[148].links = {33};
+    g.nodes[148].type = NodeType::MatchTok;
+    g.nodes[148].value = "STRING";
+    g.nodes[148].links = {150};
 
-    g.nodes[149].type = NodeType::MatchTok;
-    g.nodes[149].value = "NEWLINE";
-    g.nodes[149].links = {35};
+    g.nodes[149].type = NodeType::Split;
+    g.nodes[149].links = {148, 150};
 
-    g.nodes[150].type = NodeType::RuleRef;
-    g.nodes[150].value = "stmt";
-    g.nodes[150].links = {35};
+    g.nodes[150].type = NodeType::Split;
+    g.nodes[150].links = {152};
 
     g.nodes[151].type = NodeType::RuleRef;
-    g.nodes[151].value = "key_tok";
-    g.nodes[151].links = {152};
+    g.nodes[151].value = "subtype";
+    g.nodes[151].links = {153};
 
-    g.nodes[152].type = NodeType::RuleRef;
-    g.nodes[152].value = "value";
-    g.nodes[152].links = {37};
+    g.nodes[152].type = NodeType::Split;
+    g.nodes[152].links = {151, 153};
 
-    g.nodes[153].type = NodeType::MatchTok;
-    g.nodes[153].value = "WORD";
-    g.nodes[153].links = {39};
+    g.nodes[153].type = NodeType::Split;
+    g.nodes[153].links = {154};
 
-    g.nodes[154].type = NodeType::MatchTok;
-    g.nodes[154].value = "NUMWORD";
-    g.nodes[154].links = {39};
+    g.nodes[154].type = NodeType::RuleRef;
+    g.nodes[154].value = "brace_body";
+    g.nodes[154].links = {33};
 
     g.nodes[155].type = NodeType::MatchTok;
-    g.nodes[155].value = "KVWORD";
-    g.nodes[155].links = {39};
+    g.nodes[155].value = "WORD";
+    g.nodes[155].links = {35};
 
-    g.nodes[156].type = NodeType::RuleRef;
-    g.nodes[156].value = "override_val";
-    g.nodes[156].links = {41};
+    g.nodes[156].type = NodeType::MatchStr;
+    g.nodes[156].value = "{";
+    g.nodes[156].links = {158};
 
     g.nodes[157].type = NodeType::RuleRef;
-    g.nodes[157].value = "normal_val";
-    g.nodes[157].links = {41};
+    g.nodes[157].value = "body_item";
+    g.nodes[157].links = {158};
 
-    g.nodes[158].type = NodeType::MatchStr;
-    g.nodes[158].value = "=";
-    g.nodes[158].links = {160};
+    g.nodes[158].type = NodeType::Split;
+    g.nodes[158].links = {157, 159};
 
-    g.nodes[159].type = NodeType::RuleRef;
-    g.nodes[159].value = "rhs";
-    g.nodes[159].links = {161};
+    g.nodes[159].type = NodeType::Split;
+    g.nodes[159].links = {160};
 
-    g.nodes[160].type = NodeType::Split;
-    g.nodes[160].links = {159, 161};
+    g.nodes[160].type = NodeType::MatchStr;
+    g.nodes[160].value = "}";
+    g.nodes[160].links = {37};
 
-    g.nodes[161].type = NodeType::Split;
-    g.nodes[161].links = {163};
+    g.nodes[161].type = NodeType::MatchTok;
+    g.nodes[161].value = "NEWLINE";
+    g.nodes[161].links = {39};
 
     g.nodes[162].type = NodeType::RuleRef;
-    g.nodes[162].value = "selector";
-    g.nodes[162].links = {164};
+    g.nodes[162].value = "stmt";
+    g.nodes[162].links = {39};
 
-    g.nodes[163].type = NodeType::Split;
-    g.nodes[163].links = {162, 164};
+    g.nodes[163].type = NodeType::RuleRef;
+    g.nodes[163].value = "key_tok";
+    g.nodes[163].links = {164};
 
-    g.nodes[164].type = NodeType::Split;
-    g.nodes[164].links = {43};
+    g.nodes[164].type = NodeType::RuleRef;
+    g.nodes[164].value = "value";
+    g.nodes[164].links = {41};
 
     g.nodes[165].type = NodeType::MatchTok;
-    g.nodes[165].value = "STRING";
-    g.nodes[165].links = {45};
+    g.nodes[165].value = "WORD";
+    g.nodes[165].links = {43};
 
     g.nodes[166].type = NodeType::MatchTok;
     g.nodes[166].value = "NUMWORD";
-    g.nodes[166].links = {45};
+    g.nodes[166].links = {43};
 
     g.nodes[167].type = NodeType::MatchTok;
     g.nodes[167].value = "KVWORD";
-    g.nodes[167].links = {45};
+    g.nodes[167].links = {43};
 
-    g.nodes[168].type = NodeType::MatchTok;
-    g.nodes[168].value = "WORD";
+    g.nodes[168].type = NodeType::RuleRef;
+    g.nodes[168].value = "override_val";
     g.nodes[168].links = {45};
 
-    g.nodes[169].type = NodeType::MatchTok;
-    g.nodes[169].value = "PARENWORD";
+    g.nodes[169].type = NodeType::RuleRef;
+    g.nodes[169].value = "normal_val";
     g.nodes[169].links = {45};
 
-    g.nodes[170].type = NodeType::RuleRef;
-    g.nodes[170].value = "val_head";
+    g.nodes[170].type = NodeType::MatchStr;
+    g.nodes[170].value = "=";
     g.nodes[170].links = {172};
 
-    g.nodes[171].type = NodeType::Split;
-    g.nodes[171].links = {170, 172};
+    g.nodes[171].type = NodeType::RuleRef;
+    g.nodes[171].value = "rhs";
+    g.nodes[171].links = {173};
 
     g.nodes[172].type = NodeType::Split;
-    g.nodes[172].links = {174};
+    g.nodes[172].links = {171, 173};
 
-    g.nodes[173].type = NodeType::RuleRef;
-    g.nodes[173].value = "cont";
-    g.nodes[173].links = {174};
+    g.nodes[173].type = NodeType::Split;
+    g.nodes[173].links = {175};
 
-    g.nodes[174].type = NodeType::Split;
-    g.nodes[174].links = {173, 175};
+    g.nodes[174].type = NodeType::RuleRef;
+    g.nodes[174].value = "selector";
+    g.nodes[174].links = {176};
 
     g.nodes[175].type = NodeType::Split;
-    g.nodes[175].links = {177};
+    g.nodes[175].links = {174, 176};
 
-    g.nodes[176].type = NodeType::RuleRef;
-    g.nodes[176].value = "selector";
-    g.nodes[176].links = {178};
+    g.nodes[176].type = NodeType::Split;
+    g.nodes[176].links = {47};
 
-    g.nodes[177].type = NodeType::Split;
-    g.nodes[177].links = {176, 178};
+    g.nodes[177].type = NodeType::MatchTok;
+    g.nodes[177].value = "STRING";
+    g.nodes[177].links = {49};
 
-    g.nodes[178].type = NodeType::Split;
-    g.nodes[178].links = {180};
+    g.nodes[178].type = NodeType::MatchTok;
+    g.nodes[178].value = "NUMWORD";
+    g.nodes[178].links = {49};
 
-    g.nodes[179].type = NodeType::RuleRef;
-    g.nodes[179].value = "block";
-    g.nodes[179].links = {181};
+    g.nodes[179].type = NodeType::MatchTok;
+    g.nodes[179].value = "KVWORD";
+    g.nodes[179].links = {49};
 
-    g.nodes[180].type = NodeType::Split;
-    g.nodes[180].links = {179, 181};
+    g.nodes[180].type = NodeType::MatchTok;
+    g.nodes[180].value = "WORD";
+    g.nodes[180].links = {49};
 
-    g.nodes[181].type = NodeType::Split;
-    g.nodes[181].links = {47};
+    g.nodes[181].type = NodeType::MatchTok;
+    g.nodes[181].value = "PARENWORD";
+    g.nodes[181].links = {49};
 
-    g.nodes[182].type = NodeType::MatchTok;
-    g.nodes[182].value = "STRING";
-    g.nodes[182].links = {49};
+    g.nodes[182].type = NodeType::RuleRef;
+    g.nodes[182].value = "val_head";
+    g.nodes[182].links = {184};
 
-    g.nodes[183].type = NodeType::MatchTok;
-    g.nodes[183].value = "NUMWORD";
-    g.nodes[183].links = {49};
+    g.nodes[183].type = NodeType::Split;
+    g.nodes[183].links = {182, 184};
 
-    g.nodes[184].type = NodeType::MatchTok;
-    g.nodes[184].value = "KVWORD";
-    g.nodes[184].links = {49};
+    g.nodes[184].type = NodeType::Split;
+    g.nodes[184].links = {186};
 
-    g.nodes[185].type = NodeType::MatchTok;
-    g.nodes[185].value = "WORD";
-    g.nodes[185].links = {49};
+    g.nodes[185].type = NodeType::RuleRef;
+    g.nodes[185].value = "cont";
+    g.nodes[185].links = {186};
 
-    g.nodes[186].type = NodeType::MatchTok;
-    g.nodes[186].value = "PARENWORD";
-    g.nodes[186].links = {49};
+    g.nodes[186].type = NodeType::Split;
+    g.nodes[186].links = {185, 187};
 
-    g.nodes[187].type = NodeType::MatchTok;
-    g.nodes[187].value = "NUMWORD";
-    g.nodes[187].links = {51};
+    g.nodes[187].type = NodeType::Split;
+    g.nodes[187].links = {189};
 
-    g.nodes[188].type = NodeType::MatchTok;
-    g.nodes[188].value = "KVWORD";
-    g.nodes[188].links = {51};
+    g.nodes[188].type = NodeType::RuleRef;
+    g.nodes[188].value = "selector";
+    g.nodes[188].links = {190};
 
-    g.nodes[189].type = NodeType::MatchTok;
-    g.nodes[189].value = "STRING";
-    g.nodes[189].links = {51};
+    g.nodes[189].type = NodeType::Split;
+    g.nodes[189].links = {188, 190};
 
-    g.nodes[190].type = NodeType::MatchStr;
-    g.nodes[190].value = "[";
+    g.nodes[190].type = NodeType::Split;
     g.nodes[190].links = {192};
 
     g.nodes[191].type = NodeType::RuleRef;
-    g.nodes[191].value = "sel_item";
-    g.nodes[191].links = {192};
+    g.nodes[191].value = "block";
+    g.nodes[191].links = {193};
 
     g.nodes[192].type = NodeType::Split;
     g.nodes[192].links = {191, 193};
 
     g.nodes[193].type = NodeType::Split;
-    g.nodes[193].links = {194};
+    g.nodes[193].links = {51};
 
-    g.nodes[194].type = NodeType::MatchStr;
-    g.nodes[194].value = "]";
-    g.nodes[194].links = {196};
+    g.nodes[194].type = NodeType::MatchTok;
+    g.nodes[194].value = "STRING";
+    g.nodes[194].links = {53};
 
-    g.nodes[195].type = NodeType::RuleRef;
-    g.nodes[195].value = "axistuple";
-    g.nodes[195].links = {197};
+    g.nodes[195].type = NodeType::MatchTok;
+    g.nodes[195].value = "NUMWORD";
+    g.nodes[195].links = {53};
 
-    g.nodes[196].type = NodeType::Split;
-    g.nodes[196].links = {195, 197};
+    g.nodes[196].type = NodeType::MatchTok;
+    g.nodes[196].value = "KVWORD";
+    g.nodes[196].links = {53};
 
-    g.nodes[197].type = NodeType::Split;
+    g.nodes[197].type = NodeType::MatchTok;
+    g.nodes[197].value = "WORD";
     g.nodes[197].links = {53};
 
     g.nodes[198].type = NodeType::MatchTok;
-    g.nodes[198].value = "NEWLINE";
-    g.nodes[198].links = {55};
+    g.nodes[198].value = "PARENWORD";
+    g.nodes[198].links = {53};
 
-    g.nodes[199].type = NodeType::RuleRef;
-    g.nodes[199].value = "sub_array";
+    g.nodes[199].type = NodeType::MatchTok;
+    g.nodes[199].value = "NUMWORD";
     g.nodes[199].links = {55};
 
-    g.nodes[200].type = NodeType::RuleRef;
-    g.nodes[200].value = "sel_word";
+    g.nodes[200].type = NodeType::MatchTok;
+    g.nodes[200].value = "KVWORD";
     g.nodes[200].links = {55};
 
-    g.nodes[201].type = NodeType::MatchStr;
-    g.nodes[201].value = "[";
-    g.nodes[201].links = {203};
+    g.nodes[201].type = NodeType::MatchTok;
+    g.nodes[201].value = "STRING";
+    g.nodes[201].links = {55};
 
-    g.nodes[202].type = NodeType::RuleRef;
-    g.nodes[202].value = "sel_item";
-    g.nodes[202].links = {203};
+    g.nodes[202].type = NodeType::MatchStr;
+    g.nodes[202].value = "[";
+    g.nodes[202].links = {204};
 
-    g.nodes[203].type = NodeType::Split;
-    g.nodes[203].links = {202, 204};
+    g.nodes[203].type = NodeType::RuleRef;
+    g.nodes[203].value = "sel_item";
+    g.nodes[203].links = {204};
 
     g.nodes[204].type = NodeType::Split;
-    g.nodes[204].links = {205};
+    g.nodes[204].links = {203, 205};
 
-    g.nodes[205].type = NodeType::MatchStr;
-    g.nodes[205].value = "]";
-    g.nodes[205].links = {57};
+    g.nodes[205].type = NodeType::Split;
+    g.nodes[205].links = {206};
 
-    g.nodes[206].type = NodeType::MatchTok;
-    g.nodes[206].value = "NUMWORD";
-    g.nodes[206].links = {59};
+    g.nodes[206].type = NodeType::MatchStr;
+    g.nodes[206].value = "]";
+    g.nodes[206].links = {208};
 
-    g.nodes[207].type = NodeType::MatchTok;
-    g.nodes[207].value = "KVWORD";
-    g.nodes[207].links = {59};
+    g.nodes[207].type = NodeType::RuleRef;
+    g.nodes[207].value = "axistuple";
+    g.nodes[207].links = {209};
 
-    g.nodes[208].type = NodeType::MatchTok;
-    g.nodes[208].value = "WORD";
-    g.nodes[208].links = {59};
+    g.nodes[208].type = NodeType::Split;
+    g.nodes[208].links = {207, 209};
 
-    g.nodes[209].type = NodeType::MatchTok;
-    g.nodes[209].value = "PARENWORD";
-    g.nodes[209].links = {59};
+    g.nodes[209].type = NodeType::Split;
+    g.nodes[209].links = {57};
 
     g.nodes[210].type = NodeType::MatchTok;
-    g.nodes[210].value = "PARENWORD";
-    g.nodes[210].links = {61};
+    g.nodes[210].value = "NEWLINE";
+    g.nodes[210].links = {59};
 
-    g.nodes[211].type = NodeType::MatchStr;
-    g.nodes[211].value = "{";
-    g.nodes[211].links = {213};
+    g.nodes[211].type = NodeType::RuleRef;
+    g.nodes[211].value = "sub_array";
+    g.nodes[211].links = {59};
 
     g.nodes[212].type = NodeType::RuleRef;
-    g.nodes[212].value = "body_item";
-    g.nodes[212].links = {213};
+    g.nodes[212].value = "sel_word";
+    g.nodes[212].links = {59};
 
-    g.nodes[213].type = NodeType::Split;
-    g.nodes[213].links = {212, 214};
+    g.nodes[213].type = NodeType::MatchStr;
+    g.nodes[213].value = "[";
+    g.nodes[213].links = {215};
 
-    g.nodes[214].type = NodeType::Split;
+    g.nodes[214].type = NodeType::RuleRef;
+    g.nodes[214].value = "sel_item";
     g.nodes[214].links = {215};
 
-    g.nodes[215].type = NodeType::MatchStr;
-    g.nodes[215].value = "}";
-    g.nodes[215].links = {63};
+    g.nodes[215].type = NodeType::Split;
+    g.nodes[215].links = {214, 216};
 
-    g.rules["assign_header"] = {26u, 27u};
-    g.rules["axistuple"] = {60u, 61u};
+    g.nodes[216].type = NodeType::Split;
+    g.nodes[216].links = {217};
+
+    g.nodes[217].type = NodeType::MatchStr;
+    g.nodes[217].value = "]";
+    g.nodes[217].links = {61};
+
+    g.nodes[218].type = NodeType::MatchTok;
+    g.nodes[218].value = "NUMWORD";
+    g.nodes[218].links = {63};
+
+    g.nodes[219].type = NodeType::MatchTok;
+    g.nodes[219].value = "KVWORD";
+    g.nodes[219].links = {63};
+
+    g.nodes[220].type = NodeType::MatchTok;
+    g.nodes[220].value = "WORD";
+    g.nodes[220].links = {63};
+
+    g.nodes[221].type = NodeType::MatchTok;
+    g.nodes[221].value = "PARENWORD";
+    g.nodes[221].links = {63};
+
+    g.nodes[222].type = NodeType::MatchTok;
+    g.nodes[222].value = "PARENWORD";
+    g.nodes[222].links = {65};
+
+    g.nodes[223].type = NodeType::MatchStr;
+    g.nodes[223].value = "{";
+    g.nodes[223].links = {225};
+
+    g.nodes[224].type = NodeType::RuleRef;
+    g.nodes[224].value = "body_item";
+    g.nodes[224].links = {225};
+
+    g.nodes[225].type = NodeType::Split;
+    g.nodes[225].links = {224, 226};
+
+    g.nodes[226].type = NodeType::Split;
+    g.nodes[226].links = {227};
+
+    g.nodes[227].type = NodeType::MatchStr;
+    g.nodes[227].value = "}";
+    g.nodes[227].links = {67};
+
+    g.rules["assign_header"] = {30u, 31u};
+    g.rules["axistuple"] = {64u, 65u};
     g.rules["blank_lines"] = {10u, 11u};
-    g.rules["block"] = {62u, 63u};
+    g.rules["block"] = {66u, 67u};
     g.rules["block_list"] = {8u, 9u};
-    g.rules["body_item"] = {34u, 35u};
-    g.rules["brace_body"] = {32u, 33u};
-    g.rules["cont"] = {50u, 51u};
+    g.rules["body_item"] = {38u, 39u};
+    g.rules["brace_body"] = {36u, 37u};
+    g.rules["cont"] = {54u, 55u};
     g.rules["item"] = {2u, 3u};
-    g.rules["key_tok"] = {38u, 39u};
-    g.rules["normal_val"] = {46u, 47u};
-    g.rules["override_val"] = {42u, 43u};
-    g.rules["plain_header"] = {28u, 29u};
+    g.rules["key_tok"] = {42u, 43u};
+    g.rules["normal_val"] = {50u, 51u};
+    g.rules["override_val"] = {46u, 47u};
+    g.rules["plain_header"] = {32u, 33u};
     g.rules["prefer_block"] = {6u, 7u};
     g.rules["range_word"] = {14u, 15u};
     g.rules["rec_item"] = {18u, 19u};
     g.rules["record_body"] = {16u, 17u};
     g.rules["record_decl"] = {12u, 13u};
     g.rules["record_line"] = {20u, 21u};
-    g.rules["rhs"] = {44u, 45u};
+    g.rules["rhs"] = {48u, 49u};
     g.rules["scene_file"] = {0u, 1u};
-    g.rules["sel_item"] = {54u, 55u};
-    g.rules["sel_word"] = {58u, 59u};
-    g.rules["selector"] = {52u, 53u};
-    g.rules["spectrum_decl"] = {24u, 25u};
-    g.rules["stmt"] = {36u, 37u};
+    g.rules["sel_item"] = {58u, 59u};
+    g.rules["sel_word"] = {62u, 63u};
+    g.rules["selector"] = {56u, 57u};
+    g.rules["spectrum_decl"] = {28u, 29u};
+    g.rules["stmt"] = {40u, 41u};
+    g.rules["stop_group"] = {24u, 25u};
+    g.rules["stop_item"] = {26u, 27u};
     g.rules["stop_word"] = {22u, 23u};
-    g.rules["sub_array"] = {56u, 57u};
-    g.rules["subtype"] = {30u, 31u};
+    g.rules["sub_array"] = {60u, 61u};
+    g.rules["subtype"] = {34u, 35u};
     g.rules["top_block"] = {4u, 5u};
-    g.rules["val_head"] = {48u, 49u};
-    g.rules["value"] = {40u, 41u};
+    g.rules["val_head"] = {52u, 53u};
+    g.rules["value"] = {44u, 45u};
 
     g.skip_types = {"COMMENT", "WS"};
     g.start_rule = "scene_file";

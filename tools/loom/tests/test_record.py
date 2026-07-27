@@ -29,9 +29,13 @@ def _fixture_scenes():
 
 
 def _canon(rec: Record):
-    """Comparable structural snapshot: (name, lo, hi, interp, channels)."""
+    """Comparable structural snapshot: (name, lo, hi, interp, channels).
+
+    Uses ``.components`` (not ``.token``) so it works for vector / inline-colour
+    channels too — an arity-3 stop has no single token.
+    """
     return (rec.name, rec.lo, rec.hi, rec.interp,
-            tuple((ch.name, tuple(s.token for s in ch.stops),
+            tuple((ch.name, ch.space, tuple(tuple(s.components) for s in ch.stops),
                    tuple(round(p, 9) for p in rec.positions(ch.name)))
                   for ch in rec.channels))
 
@@ -425,6 +429,97 @@ def test_lower_passes_scalar_and_spectrum_ref_channels_through():
         ["spectrum:steel", "spectrum:gold"]
     assert [s.token for s in low.channel("reflect").stops] == \
         ["spectrum:m_c0", "spectrum:m_c1"]
+
+
+def _comps(rec: Record, chan: str):
+    return [s.components for s in rec.channel(chan).stops]
+
+
+def test_record_body_close_is_bracket_matched_not_first_bracket():
+    # Since the ladder landed, `[` / `]` are legal INSIDE a channel line, so the record
+    # body can't end at the first `]`.  Regression: this used to truncate the body at
+    # `[0 0.5 1]` and blow up with "ladder: unclosed '['".
+    rec = Record.parse("m = range 0-1 [\n"
+                       "  a  [0 0.5 1]\n"
+                       "  b  2 3\n"
+                       "]")
+    assert [ch.name for ch in rec.channels] == ["a", "b"]
+    assert _comps(rec, "a") == [["0"], ["0.5"], ["1"]]
+    assert _comps(rec, "b") == [["2"], ["3"]]
+    # and parse_all must find BOTH records, not stop inside the first one's brackets
+    recs = Record.parse_all("p = range 0-1 [ a  [0 1] ]\nq = range 0-1 [ b  rgb [1 0 0] ]")
+    assert [r.name for r in recs] == ["p", "q"]
+
+
+def test_ladder_spellings_of_a_scalar_channel_agree():
+    # `0 0.5 1` == `[0 0.5 1]` == `0, 0.5, 1`: an untagged flat run with no trailing
+    # comma is N scalar stops however it is delimited (bracketing once is idempotent).
+    rec = Record.parse("m = range 0-1 [\n"
+                       "  a  0 0.5 1\n"
+                       "  b  [0 0.5 1]\n"
+                       "  c  0, 0.5, 1\n"
+                       "]")
+    want = [["0"], ["0.5"], ["1"]]
+    assert _comps(rec, "a") == _comps(rec, "b") == _comps(rec, "c") == want
+
+
+def test_ladder_spellings_of_an_inline_colour_channel_agree():
+    # The tag fixes arity 3, so each group is ONE colour stop.  Comma groups, bracket
+    # groups and a bracketed comma list are the same three stops.
+    rec = Record.parse("m = range 0-1 [\n"
+                       "  a  rgb 0.9 0.1 0.1, 0.1 0.9 0.1\n"
+                       "  b  rgb [0.9 0.1 0.1] [0.1 0.9 0.1]\n"
+                       "  c  rgb [0.9 0.1 0.1, 0.1 0.9 0.1]\n"
+                       "]")
+    want = [["0.9", "0.1", "0.1"], ["0.1", "0.9", "0.1"]]
+    for k in "abc":
+        assert rec.channel(k).space == "rgb"
+        assert _comps(rec, k) == want, k
+
+
+def test_ladder_parens_stay_opaque():
+    # A comma at paren depth > 0 is not a delimiter, so `clamp(u,0,1)` is one leaf and
+    # both lines are three scalar stops.
+    rec = Record.parse("m = range 0-1 [\n"
+                       "  a  0  clamp(u,0,1)  1\n"
+                       "  b  0, clamp(u,0,1), 1\n"
+                       "]")
+    want = [["0"], ["clamp(u,0,1)"], ["1"]]
+    assert _comps(rec, "a") == _comps(rec, "b") == want
+
+
+def test_ladder_accepts_every_ftrace_colour_head():
+    # A tag is handed to ftrace's evalSpectrum verbatim, so any upsampler / emission
+    # head is a legal channel tag — loom must read everything ftrace reads.
+    for head in ("rgb", "hsv", "hsl", "rgbmeng", "rgbsmits", "rgbbox",
+                 "hsvillum", "hslline"):
+        rec = Record.parse(f"m = range 0-1 [ c  {head} 0.1 0.2 0.3, 0.4 0.5 0.6 ]")
+        assert rec.channel("c").space == head
+        assert _comps(rec, "c") == [["0.1", "0.2", "0.3"], ["0.4", "0.5", "0.6"]]
+
+
+def test_lower_passes_upsampler_heads_through_verbatim():
+    # A non-plain head names a specific upsampler, so its components must survive
+    # untouched (no hue conversion) and dedupe on (head, components).
+    rec = Record.parse(
+        "m = range 0-1 [ reflect  rgbmeng 0.15 0.65 0.85, 0.15 0.65 0.85, 1 1 1 ]")
+    decls, low = rec.lower_colours()
+    assert decls == ['spectrum "m_c0" = rgbmeng 0.15 0.65 0.85',
+                     'spectrum "m_c1" = rgbmeng 1 1 1']
+    assert [s.token for s in low.channel("reflect").stops] == \
+        ["spectrum:m_c0", "spectrum:m_c0", "spectrum:m_c1"]
+
+
+def test_lower_does_not_conflate_heads_with_equal_components():
+    # `hsv 0 0 1` lowers to `rgb 1 1 1`, but `hsvmeng 0 0 1` is a different colour
+    # entirely (different head) and must not collapse onto it.
+    rec = Record.parse("m = range 0-1 [\n"
+                       "  a  hsv 0 0 1,\n"
+                       "  b  hsvmeng 0 0 1,\n"
+                       "]")
+    decls, _ = rec.lower_colours()
+    assert decls == ['spectrum "m_c0" = rgb 1 1 1',
+                     'spectrum "m_c1" = hsvmeng 0 0 1']
 
 
 def test_lower_rejects_expression_colour_stops():

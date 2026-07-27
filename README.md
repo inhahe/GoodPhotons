@@ -936,6 +936,35 @@ sphere { center 0 0 0  radius 1  material grad(u) }                   # sweep al
 sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled by noise
 ```
 
+**Inline colour channels.** A colour channel doesn't have to name pre-declared spectra:
+tag the channel with any colour head — `rgb`, `hsv`, `hsl`, or any upsampler/emission
+variant (`rgbmeng`, `rgbsmits`, `hsvillum`, `hslline`, …) — and write the triples inline.
+The tag fixes arity 3, so each group is one stop, and the components go through exactly
+the same evaluator as a top-level `spectrum "x" = rgb …` declaration:
+
+```
+palette = range 0-1 [
+    reflect  rgb 0.9 0.1 0.1, 0.1 0.9 0.1, 0.1 0.1 0.9   # red -> green -> blue
+    tint     rgbmeng 0.15 0.65 0.85                       # a lone stop needs no comma
+]
+```
+
+**Stop delimiters** form a **precedence ladder**: whitespace binds tightest (like `×`),
+comma looser (like `+`), and `[ ]` are the parentheses. Structure comes from the
+delimiters alone — a channel's arity only validates — so these are all the same channel:
+
+```
+reflect  rgb 0.9 0.1 0.1, 0.1 0.9 0.1        # comma-separated triples
+reflect  rgb [0.9 0.1 0.1] [0.1 0.9 0.1]     # bracketed groups
+reflect  rgb [0.9 0.1 0.1, 0.1 0.9 0.1]      # one bracketed comma list
+```
+
+Parens `( )` are *not* a rung — they're reserved for expressions, so a parenthesised run
+is opaque and `0  clamp(u,0,1)  1` stays three stops. A channel line using none of
+`,` `[` `]` and no colour tag reads exactly as it always did, so the ladder is a strict
+addition: no existing scene reparses differently. Position pins are the orthogonal
+`p:<pos>` prefix and work in either spelling.
+
 Bind a record to geometry with the inline `material NAME(driver)` form, where `driver`
 is any pattern expression evaluated per hit (`x y z nx ny nz r u v f`, `noise(…)`, …).
 A record driving the **reflect/albedo** *or* **roughness** slot runs on the **GPU**
@@ -2421,6 +2450,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-check-watertight` / `-airtight` | Audit every named `mesh` and every `isosurface` in the scene for a closed, consistently-oriented surface, print a per-object `[OK]`/`[WARN]` report, then exit (no render). Warns per object about **boundary edges** (holes / open border), **non-manifold edges** (3+ faces share an edge), and **flipped** (inconsistently-wound) facets; a dielectric object is flagged with `!` because a leak breaks its refraction / interior-medium tracking. Isosurfaces are polygonised at `-mesh-res` first. Exit code is non-zero if any object is not airtight. |
 | `-check-airtight` | Audit every `isosurface` by **ray-parity on the marched field** (not a polygonised proxy): fire chords from outside the container and flag any that cross the boundary an odd number of times (a leak — an open cap on an `open` surface, or a `max_gradient`/thin-feature overshoot the marcher skips), plus a dense-reference **overshoot** check. Prints `[OK]`/`[WARN]` and exits non-zero on any leak. See **Auditing the marched field directly**. |
 | `-check-airtight-rays <N>` | Chord count per isosurface for `-check-airtight` (default 4000). |
+| `-parseonly` | Load the scene, print a one-line contents summary (materials / records / emitters / spheres / tris / implicits / textures / patterns / cameras), then exit without rendering. A fast syntax + semantic check — every `.ftsl` diagnostic still fires, so it's the cheap way to sweep a whole scene directory for load errors. |
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |

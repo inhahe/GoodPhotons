@@ -1,0 +1,107 @@
+# Regression scene for the record-stop **delimiter precedence ladder** + **inline
+# colour** channels (ROADMAP_records.md §3.1 / TODO §J3b items 1-2, landed v0.86.0).
+#
+# The ladder is: whitespace binds tightest (like `*`), comma looser (like `+`),
+# `[ ]` are the parentheses.  Structure comes from the delimiters alone; a channel's
+# arity only validates.  Parens `( )` are NOT a rung — a parenthesised run is an
+# opaque expression atom, so `clamp(u,0,1)` stays one leaf and its commas don't split.
+#
+# An **inline colour** channel opts in with a leading colour-head tag word (`rgb`,
+# `hsv`, `hsl`, or any upsampler/emission variant such as `rgbmeng`, `hslline`).  The
+# tag fixes arity 3, so each group is one colour stop and a lone stop needs no trailing
+# comma.  Tagged stops are handed to the same `evalSpectrum` as a top-level
+# `spectrum "x" = rgb …` decl, so every upsampler is available for free.
+#
+# Every channel below is written in a *different* spelling of the same ladder, and the
+# `_same*` record pairs assert the documented equivalences by construction.
+# Parse-check with:  ftrace scenes/_record_ladder.ftsl -parseonly
+scene { units meters }
+
+spectrum "steel" = rgb 0.55 0.57 0.60
+spectrum "gold"  = rgb 0.90 0.75 0.30
+
+# --- the classic (pre-ladder) forms still read exactly as they always did -----------
+# No ladder delimiter and no tag -> the untouched whitespace path.
+classic = range 0-1 [
+    reflect   spectrum:steel  spectrum:gold          # 2 colour stops (`:`-refs)
+    rough     0 0.5 1                                # 3 scalar stops
+    interp    smooth
+]
+
+# --- the ladder spellings of a scalar channel ---------------------------------------
+# `0 0.5 1` == `[0 0.5 1]` == `0, 0.5, 1`: bracketing one level is idempotent, and a
+# flat untagged run with no trailing comma is N scalar stops however it is delimited.
+ladder_scalar = range 0-1 [
+    a   0 0.5 1                                      # whitespace
+    b   [0 0.5 1]                                    # bracketed (idempotent)
+    c   0, 0.5, 1                                    # comma
+    d   p:0 0  p:0.25 0.5  p:1 1                     # pinned, whitespace form
+    e   p:0 0, p:0.25 0.5, p:1 1                     # pinned, comma form
+]
+
+# --- inline colour: one channel, four spellings of three stops ----------------------
+# The tag fixes arity 3, so `0.9 0.1 0.1, 0.1 0.9 0.1` is TWO colours, not six scalars.
+inline_rgb = range 0-1 [
+    a   rgb 0.9 0.1 0.1, 0.1 0.9 0.1, 0.1 0.1 0.9    # comma-separated triples
+    b   rgb [0.9 0.1 0.1] [0.1 0.9 0.1] [0.1 0.1 0.9]  # bracketed groups
+    c   rgb [0.9 0.1 0.1, 0.1 0.9 0.1, 0.1 0.1 0.9]    # one bracketed comma list
+    d   rgb p:0 0.9 0.1 0.1, p:0.5 0.1 0.9 0.1, p:1 0.1 0.1 0.9   # pinned
+    interp linear
+]
+
+# A *lone* colour stop needs no trailing comma — the tag already says "arity 3".
+lone_colour = range 0-1 [
+    tint  rgb 0.8 0.2 0.2
+]
+
+# --- every colour head is available, not just plain rgb -----------------------------
+# The tag is passed through to `evalSpectrum` verbatim, so a record channel can name
+# any upsampler (`smits`, `box`, `meng`, `illum`) or the K3 line-emission form.
+heads = range 0-1 [
+    a   hsv      0.00 0.85 0.90, 0.33 0.85 0.90, 0.66 0.85 0.90
+    b   hsl      0.00 0.85 0.50, 0.50 0.85 0.50
+    c   rgbmeng  0.15 0.65 0.85, 0.90 0.75 0.30
+    d   rgbsmits 0.15 0.65 0.85, 0.90 0.75 0.30
+    e   rgbbox   0.15 0.65 0.85, 0.90 0.75 0.30
+    f   hsvillum 0.10 0.40 1.00, 0.60 0.40 1.00
+]
+
+# --- parens stay opaque -------------------------------------------------------------
+# The comma inside `clamp(u,0,1)` is at paren depth > 0, so it does not split a stop:
+# this is three scalar stops, and the middle one is one expression.
+opaque = range 0-1 [
+    a   0  clamp(u,0,1)  1
+    b   0, clamp(u,0,1), 1                           # same three stops, comma-spelled
+]
+
+# --- the materials that actually use the above --------------------------------------
+material "white" { type diffuse  reflect whitewall 0.75 }
+material "red"   { type diffuse  reflect redwall }
+material "green" { type diffuse  reflect greenwall }
+
+# each sphere reads one stop / sample off an inline-colour record
+material "m_a"  { type diffuse  reflect inline_rgb.a[0] }
+material "m_b"  { type diffuse  reflect inline_rgb.b[1] }
+material "m_c"  { type diffuse  reflect inline_rgb.c(0.5) }
+material "m_d"  { type diffuse  reflect heads.c[0] }
+material "m_e"  { type diffuse  reflect lone_colour.tint[0] }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red }     # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+sphere { center 0.15 0.15 0.55  radius 0.14  material m_a }
+sphere { center 0.35 0.15 0.45  radius 0.14  material m_b }
+sphere { center 0.55 0.15 0.55  radius 0.14  material m_c }
+sphere { center 0.75 0.15 0.45  radius 0.14  material m_d }
+sphere { center 0.90 0.14 0.60  radius 0.13  material m_e }
+
+light area { origin 0.35 0.999 0.35  u 0.3 0 0  v 0 0 0.3  normal 0 -1 0  spd preset:bb6500 }
+
+camera "cam" {
+    eye 0.5 0.5 2.4  look_at 0.5 0.25 0.5  up 0 1 0  fov_y 42
+    mode B
+    film { res 240 240 }
+}

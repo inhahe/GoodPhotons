@@ -4143,6 +4143,7 @@ static void printHelp(const char* prog) {
 "  -interval <sec>       periodic image-write / preview cadence (default: 15)\n"
 "  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C)\n"
 "  -resume               continue an accumulated render from its .ftbuf checkpoint\n"
+"  -parseonly            load the scene, print a contents summary, exit (no render)\n"
 "\n"
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
@@ -4308,6 +4309,17 @@ static int run(int argc, char** argv) {
     const char* inFile = nullptr;
     for (int i = 1; i < argc; ++i)
         if (!std::strcmp(argv[i], "-in") && i + 1 < argc) { inFile = argv[i + 1]; break; }
+    // -parseonly: load the scene, report what it contains, exit 0 — or exit 1 with the
+    // load error. Nothing renders and no device is touched. Prescanned here (rather than
+    // with the other flags below) because the scene load happens before the main argv
+    // pass, and the whole point is to stop the instant that load returns.
+    //
+    // This exists because "does every scene in the tree still load?" is the regression
+    // question a front-end or loader change actually needs answered, and the only way to
+    // ask it before was to render all ~200 of them.
+    bool parseOnly = false;
+    for (int i = 1; i < argc; ++i)
+        if (!std::strcmp(argv[i], "-parseonly")) { parseOnly = true; break; }
     // Positional scene / mesh file: `ftrace scene.ftsl` or `ftrace model.glb` (e.g. a
     // double-click / drag-drop) with no -in. Accept a bare token that ends in a scene
     // extension (loaded directly) OR a mesh extension (.obj/.gltf/.glb/.fbx/.stl/.ply —
@@ -4436,6 +4448,17 @@ static int run(int argc, char** argv) {
         // still proceed (Level-0 uses priority where present, else assumes exterior air).
         for (const std::string& w : pri::audit(ftslScene.scene))
             std::fprintf(stderr, "[priority] WARNING: %s\n", w.c_str());
+        if (parseOnly) {
+            const Scene& sc = ftslScene.scene;
+            std::printf("[parseonly] ok: %zu materials, %zu records, %zu emitters, "
+                        "%zu spheres, %zu tris, %zu implicits, %zu textures, "
+                        "%zu patterns, %zu cameras\n",
+                        sc.mats.size(), sc.records.size(), sc.emitters.size(),
+                        sc.spheres.size(), sc.tris.size(), sc.implicits.size(),
+                        sc.textures.size(), sc.patterns.size(),
+                        ftslScene.cameras.size());
+            return 0;
+        }
         if (ftslScene.photons >= 0)       N = ftslScene.photons;
         if (ftslScene.res > 0)            res = ftslScene.res;
         if (ftslScene.mode)               mode = ftslScene.mode;

@@ -2101,18 +2101,47 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          *(DONE — vector channels + inline `rgb`/`hsv`/`hsl` colour channels with a channel-level tag, plus
          `Record.lower_colours()`/`lower_ftsl()` lowering inline colour to synthesized `spectrum "<name>" = rgb …`
          decls + `spectrum:<name>` refs ftrace can parse.)*
+         **DONE IN FTRACE TOO — 2026-07-27 (v0.86.0).** Inline colour is no longer loom-only: `RecChannel` gained a
+         `space` field, and `Parser::parseChannelStops` strips a leading colour-head tag off a channel line and
+         feeds `{space, comps…}` to the **same `evalSpectrum`** a top-level `spectrum "x" = rgb …` decl uses. That
+         convergence is the whole design: the record path inherits all 18 colour heads (3 spaces × `""`/`line`/
+         `illum`/`smits`/`box`/`meng`) for free, and the Jakob–Hanika coefficient bake + GPU upload never learn
+         that records exist. `isColourHead()` is the single list of accepted tags; loom's `_COLOUR_SPACES` mirrors
+         it exactly, and `Record.lower_colours` now passes a non-plain head through **verbatim** (deduping on
+         `(head, comps)`) instead of mis-converting it as if it were HSL. Lowering is still useful — it dedupes
+         colours and targets a pre-0.86 binary — but is no longer *required*.
+         Only *untagged* vector channels (`D∉{1,3}`) stay loom-only, and deliberately: ftrace has no destination
+         slot to feed an arity-`D` value into, so it emits an error naming the colour tag as the fix.
       2. **Generalized stop grammar** (`ROADMAP_records.md` §3.1) — arbitrary-arity stops with a **delimiter
          precedence ladder** (whitespace binds like `×`, comma like `+`, brackets = parens), so structure is
          recoverable from the delimiters alone and the channel's arity only *validates*: `tint [rgb 0 0 0,
          0 1 0, 1 1 1]` ≡ `tint rgb [0 0 0] [0 1 0] [1 1 1]` (the three ladder delimiters are `[ ]` / `,` /
          whitespace — parens are reserved for expressions + the §3.2 application surface); position pins
-         (`.2:0 0 0`) are an orthogonal `POS:` prefix. **NB: current FTSL cannot parse this** — its tokenizer isn't comma-aware and every
-         whitespace-word is a separate stop, so today an rgb curve is `reflect spectrum:steel spectrum:gold …`
-         (one `:`-ref per stop). loom now implements this as **one backward-compatible grammar** (`loom/record.py`,
-         a single `parse`/`emit` pair): each channel line is dispatched on the presence of a top-level comma, so a
-         comma-free line keeps the exact J3a whitespace meaning and only a comma line opts into the ladder
-         (`tint 0 0 0, 1 1 1` = two arity-3 stops; a lone vector stop takes a trailing comma). It's an *additive
-         superset*, not a breaking change — no existing record reparses differently.
+         (`.2:0 0 0`) are an orthogonal `POS:` prefix. loom implements this as **one backward-compatible grammar**
+         (`loom/record.py`, a single `parse`/`emit` pair): a line with no ladder delimiter keeps the exact J3a
+         whitespace meaning and only a `,`/`[`/`]` opts into the ladder (`tint 0 0 0, 1 1 1` = two arity-3 stops;
+         a lone vector stop takes a trailing comma). It's an *additive superset*, not a breaking change — no
+         existing record reparses differently.
+         **DONE IN FTRACE TOO — 2026-07-27 (v0.86.0).** The old "current FTSL cannot parse this — its tokenizer
+         isn't comma-aware" note was the blocker, and it turned out to be **the reason the ladder was easy, not
+         the reason it was hard**: because `,` is *not* one of ftrace's tokenizer delimiters, a comma survives
+         lexing glued to its word (`0,`), so it can simply be re-split in the loader, paren-aware. (The error
+         `bad stop expression '0,'` came from the *expression compiler*, not the parser.) Only `[` / `]` genuinely
+         delimit, so the grammar change is one rule — `stop_group = '[' stop_item* ']'` in `ftsl_scene.epeg`, with
+         `ftsl_reduce.hpp` flattening it back to `[`/`]` marker words. Everything else lives in
+         **`src/record_ladder.h`** (`recladder::tokenize`/`usesLadder`/`parse`, a sum→product→factor
+         recursive descent), the dependency-free C++ twin of `loom/ladder.py`.
+         Additivity is *structural*, not hopeful: `parseChannelStops` routes a line with no tag and no ladder
+         delimiter through the byte-identical old whitespace loop, and both ways the new path can fire were
+         previously hard errors (a leading `rgb` was never a legal pattern variable; a `,`/`[`/`]` never lexed).
+         `clamp(u,0,1) 0.5` still takes the fast path — its comma is at paren depth > 0.
+         **Verified:** `-parseonly` (new flag) over the whole `scenes/` corpus, 81 scenes, 0 failures; 14 accept +
+         5 reject cases; `scenes/_record_ladder.ftsl` writes the same channel four ways; and
+         `tools/check_record_twins.py` probes ftrace's per-channel stop count via an out-of-range `rec.ch[999]`
+         selector and diffs it against loom's — 27/27 channels agree across all six `_record_*.ftsl` fixtures.
+         That checker exists because a loom↔ftrace stop-boundary disagreement is a *silent wrong render*, not a
+         parse error; it already caught one real divergence (loom ended a record body at the first `]`, which the
+         ladder made ambiguous — now bracket-matched).
       3. **Uniform named-input binding / rebinding** (`ROADMAP_records.md` §3.2) — a property is an expression
          over named inputs (system-provided-with-default like `a`/`u`/`v`, or unbound). Access is *continuous
          only* (no discrete `[i]` — a constant index is just a constant argument `prop(2)`); any input is

@@ -83,6 +83,35 @@ inline std::vector<ftsl::BrItem> bracket_items(const PN* node) {
     return out;
 }
 
+// Flatten a record channel line's stop tokens into the flat `Value::words` list the
+// loader reads, turning each `stop_group` back into a `[` … `]` pair of MARKER words.
+//
+// Records are the one place the language keeps its structure in the *word stream*
+// rather than in a side-channel like `BrItem` — a channel line's shape is defined by
+// the generalized stop grammar's delimiter ladder, whose other two rungs (comma and
+// whitespace) already survive lexing as ordinary word text.  Re-serialising brackets
+// into the same stream keeps all three rungs in one place, so `recladder::parse` sees
+// the author's delimiters exactly as written instead of half a tree plus half a list.
+// The markers can't be confused with content: `[` and `]` are excluded from the
+// character class of every terminal, so no real word is ever spelled either way.
+inline void flatten_stop_words(const PN* node, std::vector<std::string>& out) {
+    for (const auto& c : node->children) {
+        if (c->name == "stop_item") {
+            flatten_stop_words(c.get(), out);
+        } else if (c->name == "stop_word") {
+            const PN* g = c->children.empty() ? nullptr : c->children[0].get();
+            if (g && g->name == "stop_group") {
+                out.push_back("[");
+                flatten_stop_words(g, out);
+                out.push_back("]");
+            } else {
+                const PN* t = leaf_of(c.get());
+                out.push_back(unquote(t->name, t->value));
+            }
+        }
+    }
+}
+
 // The trailing sample call on a selector — `(u)`, `(u,v)` — or "" when absent.
 inline std::string selector_call(const PN* selector) {
     const PN* at = child(selector, "axistuple");
@@ -221,10 +250,7 @@ inline ftsl::Block reduce_top_block(const PN* top_block) {
             const PN* chan = child(rl, "WORD");
             s.key = chan->value;
             s.line = (int)chan->line;
-            for (const PN* sw : children(rl, "stop_word")) {
-                const PN* t = leaf_of(sw);
-                s.val.words.push_back(unquote(t->name, t->value));
-            }
+            flatten_stop_words(rl, s.val.words);
             b.stmts.push_back(std::move(s));
         }
     } else if (k == "prefer_block") {               // 'prefer' block_list ('else' block_list)*

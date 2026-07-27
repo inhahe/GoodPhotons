@@ -674,13 +674,65 @@ grad = range 0-1 [
 - **Stops** are laid out evenly across the domain. Prefix any stop with `p:<pos>` to
   **pin** it to an explicit domain position; unpinned runs redistribute between the
   pinned anchors. Positions must stay in `[lo,hi]` and be non-decreasing.
-- A channel is a **colour** LUT iff its stops are prefixed spectrum refs (they contain
-  `:`, e.g. `spectrum:steel`, `metal:copper`); otherwise it is a **scalar** LUT whose
-  stops are pattern expressions (a literal, or math over `x y z nx ny nz r u v f` and
-  functions like `noise(…)` — the §6.1 language). A channel may not mix the two.
+- A channel is a **colour** LUT if it carries an **inline colour tag** (below) or its
+  stops are prefixed spectrum refs (they contain `:`, e.g. `spectrum:steel`,
+  `metal:copper`); otherwise it is a **scalar** LUT whose stops are pattern expressions
+  (a literal, or math over `x y z nx ny nz r u v f` and functions like `noise(…)` — the
+  §6.1 language). A channel may not mix the two.
 - **`interp nearest|linear|smooth`** selects the sampling mode (default `linear`).
   `smooth` is a monotone (Fritsch–Carlson) cubic — no overshoot. Colour channels
   interpolate in linear RGB, then upsample back to a reflectance spectrum.
+
+#### Inline colour channels
+
+A colour channel doesn't have to name pre-declared spectra. Prefix the stop list with
+any **colour head** — `rgb`, `hsv`, `hsl`, or any of their upsampler / emission variants
+(`…line`, `…illum`, `…smits`, `…box`, `…meng`) — and write the triples inline. The tag
+applies to the whole channel and fixes each stop's arity at 3, so a *lone* stop needs no
+disambiguating comma. Components go through exactly the same evaluator as a top-level
+`spectrum "x" = rgb …` declaration, so every colour head is available here:
+
+```
+palette = range 0-1 [
+    reflect  rgb 0.9 0.1 0.1, 0.1 0.9 0.1, 0.1 0.1 0.9   # red -> green -> blue
+    tint     rgbmeng 0.15 0.65 0.85                       # one stop, smoothest-metamer
+    glow     hslline 0.55 0.9 0.5, 0.10 0.9 0.5           # line-emission head
+]
+```
+
+#### Stop delimiters — the precedence ladder
+
+The three stop delimiters form a fixed **precedence ladder**, not an interchangeable
+set:
+
+| delimiter | binds | analogy |
+|---|---|---|
+| whitespace | tightest | `×` — juxtaposition builds one group |
+| `,` | looser | `+` — opens a new outer level |
+| `[ ]` | anywhere | parentheses — an explicit level |
+
+So `1 1 1, 2 2 2` reads as `(1·1·1) + (2·2·2)`: two groups of three. Because the
+precedence is fixed, **structure comes from the delimiters alone** and a channel's arity
+only *validates* what they already said — which is why these are all the same channel:
+
+```
+reflect  rgb 0.9 0.1 0.1, 0.1 0.9 0.1        # comma-separated triples
+reflect  rgb [0.9 0.1 0.1] [0.1 0.9 0.1]     # bracketed groups
+reflect  rgb [0.9 0.1 0.1, 0.1 0.9 0.1]      # one bracketed comma list
+```
+
+and bracketing one level is idempotent, so `rough 0 0.5 1`, `rough [0 0.5 1]` and
+`rough 0, 0.5, 1` are all the same three scalar stops.
+
+Parens `( )` are **not** a rung — they belong to expressions (§6.1) — so a parenthesised
+run is opaque and its inner commas split nothing: `0  clamp(u,0,1)  1` is three stops.
+`p:<pos>` pins are orthogonal and work in either spelling (`p:0 0, p:0.25 0.5, p:1 1`).
+
+A channel line that uses **none** of `,` `[` `]` and has **no colour tag** is read
+exactly as it always was, so the ladder is a strict addition — no pre-existing scene
+reparses differently. One consequence worth knowing: an *untagged* multi-component stop
+(`tint 0 0 0,`) has no destination slot in ftrace and is an error; tag it
+(`tint rgb 0 0 0`) to say what those three numbers mean.
 
 **Binding a record to geometry** uses the inline `material NAME(driver)` form in any
 primitive's `material` field, where `driver` is a pattern expression evaluated per
