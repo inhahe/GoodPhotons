@@ -74,7 +74,8 @@ from .viewer import (
     load_build, build_scene, introspect, ViewerModel,
 )
 from .spatial import (
-    SpatialExpr, Surface, Image, sexpr, X, Y, Z, U, V, A, T, SPATIAL_PATTERNS,
+    SpatialExpr, Surface, Image, VolumeField, sexpr, X, Y, Z, U, V, A, T,
+    SPATIAL_PATTERNS,
     sin, cos, tan, sqrt, exp, log, floor, fract, sign, saturate, sabs,
     smin, smax, spow, atan2, step, clamp, mix, smoothstep,
 )
@@ -129,7 +130,8 @@ __all__ = [
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
     "PreviewServer", "preview_range",
     "load_build", "build_scene", "introspect", "ViewerModel",
-    "SpatialExpr", "Surface", "Image", "sexpr", "X", "Y", "Z", "U", "V", "A", "T",
+    "SpatialExpr", "Surface", "Image", "VolumeField", "sexpr", "X", "Y", "Z",
+    "U", "V", "A", "T",
     "SPATIAL_PATTERNS",
     "sin", "cos", "tan", "sqrt", "exp", "log", "floor", "fract", "sign",
     "saturate", "sabs", "smin", "smax", "spow", "atan2", "step", "clamp",

@@ -1380,9 +1380,57 @@ and drove two extra tests: an *independent* breadth-first leaf traversal via `mN
 (not the reader's child-offset descent) with a per-voxel index check, and a root-tile-stride test asserting
 the root table ends exactly where the first upper node begins.
 
-**Still open:** **Vec3** grids; sparse-storage transforms; and resampling sparse↔dense. Note loom has no
-NanoVDB *writer* — `.nvdb` support is read-only, and there's no demand for the write end (ftrace reads
-`.vdb` happily, and loom's `.vdb` writer is byte-verified).
+**Volume transforms / read→transform→write — DONE 2026-07-27.** The capability E4 was actually *about* —
+"use an existing volume as a **basis**, transform it, then emit the result" — now exists, and it needed
+almost no new machinery, because the right move was to make a volume a **term in the spatial algebra**
+rather than to invent a volume-transform API. `loom.spatial.VolumeField` is the 3-D twin of the existing
+`Image` leaf: a scalar SpatialExpr whose value at a world point is an imported grid's trilinearly
+interpolated density. (Named `VolumeField`, not `Volume` — `loom.scene.Volume` is already the `medium { }`
+scene element, and shadowing it would have been a trap.)
+
+Everything else then falls out of machinery that was already there:
+- **value ops / modulation** — `cloud * (0.5 + 0.5 * sin(20 * Y))`, mixing two volumes, animated `Signal`
+  coefficients: all just the spatial algebra.
+- **warping** — `x`/`y`/`z` are ordinary sub-expressions exactly like `Image`'s `u`/`v`, so
+  `VolumeField(p, x=X + 0.1 * sin(10 * Z))` bends the volume, and `substitute` reaches inside. (Standard
+  resampler convention: the coordinate expressions map the *destination* point back to the *source*, so a
+  warp is authored as its inverse map — documented loudly.)
+- **meshing** — `mcubes` takes any callable field, so marching cubes over imported data is free.
+- **resampling** — `bake_field`/`write_volume` discretise onto any box/res, which is all "resample a grid"
+  ever meant. Sparse↔dense as *separate storage backings* stays unbuilt, and is now clearly a storage
+  optimisation rather than a capability: nothing is missing from the user's point of view.
+
+**Placement is lossless, and that's the design point.** `translated`/`scaled`/`rotated`/`fitted` do not
+resample — they compose a world-space affine onto the grid's own index→world map via the new
+`VdbTransform.premultiplied` (`A' = M·A`, `t' = M·t + d`). Moving a volume costs zero interpolation because
+a VDB tree is a regular lattice in *index* space and only the transform says where it sits; error enters
+exactly once, at the final bake. That is loom's "keep everything as functions; discretize last" rule
+applied to volumes, and it's test-asserted: rotate 4×90°, rotate 360°, translate-and-back and
+scale-and-back all reproduce the original array (max |Δ| ~1e-15), and `.rotated(37°).read_grid.values is
+g.values` — not one voxel is touched. A complementary test asserts a *single* 37° rotation really does
+change the field (so the round-trips can't pass vacuously) while conserving mass to 5%.
+
+`VolumeField.emit()` deliberately **raises**: ftrace's pattern VM has no volume-sampling opcode, so there
+is no ftsl string it could honestly become. It is bake-only, and the error says so and names
+`write_volume`. Supporting infrastructure added alongside: `VdbTransform.inverse_linear`/`to_index`/
+`premultiplied`/`__eq__`, `ReadGrid.world_box` (AABB of the eight index-box corners — defined for a rotated
+grid, unlike `.box`) and `ReadGrid.with_transform` (shares the array; repositioning copies nothing).
+
+**Found and fixed a real ftrace bug on the way (v0.84.2).** Porting ftrace's sampler into
+`ReadGrid.sample` exposed that `VdbGrid::sample` (`src/vdbgrid.h`) and its CUDA twin `dVdbSample` clamped
+the stencil *indices* to `[0, n-1]` but not the interpolation *fraction*, so in the half-voxel shell just
+below index 0 the sample was dominated by the **second** voxel and got wronger the further out it went.
+Symptom that caught it: a 360° rotation, which must be a no-op, moved the baked field by up to 0.32. Fixed
+in both samplers by clamping the *coordinate* before the floor — bit-identical inside the lattice, and it
+drops three `floor()` calls from the hot path. See `known-issues.md`.
+
+19 new tests (**1150 loom green**); the sampler fix is mutation-verified (reverting to the stencil-only
+clamp fails two tests).
+
+**Still open:** **Vec3** grids; sparse *storage* (as opposed to sparse-source reads, which work) and
+transforms authored directly against it. Note loom has no NanoVDB *writer* — `.nvdb` support is read-only,
+and there's no demand for the write end (ftrace reads `.vdb` happily, and loom's `.vdb` writer is
+byte-verified).
 - **Vec3 grids are BLOCKED on validation data (assessed 2026-07-26).** None of the four real sample files in
   `scraps/` carries a `Tree_vec3s_*` grid (all four are `Tree_float_5_4_3_HalfFloat`), and there is no
   installable OpenVDB Python binding on this platform to synthesise one (`openvdb` / `pyopenvdb` /

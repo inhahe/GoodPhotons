@@ -46,6 +46,20 @@ in ``src/pattern.h``, with the GPU twin in ``render_cuda.cu``) and its
 same ``-0.5`` texel offset, same ``v``-flip, same repeat/clamp/mirror wrapping, same
 mean-of-RGB reduction.  Its ``u``/``v`` arguments are ordinary sub-expressions, so
 the coordinates can themselves be warped or rebound.
+
+:class:`VolumeField` is that leaf's 3-D twin: an imported ``.vdb``/``.nvdb`` grid
+sampled as a scalar term, so a captured volume can be *modulated, warped, meshed
+and re-baked* like any other subexpression.  It is what makes loom's
+read → transform → write volume workflow (roadmap §E4) compose out of machinery
+that already existed — value ops are the algebra, warping is its rebindable
+``x``/``y``/``z`` children, meshing is :mod:`loom.mcubes`, resampling is
+:func:`loom.vdbio.bake_field`.  Its affine *placement* helpers are lossless (they
+compose onto the grid's own index→world transform rather than resampling), so
+discretisation still happens exactly once, at the end.  It is the one leaf here
+that is **single-backend**: ftrace's pattern VM has no volume-sampling opcode, so
+:meth:`VolumeField.emit` raises rather than invent an ftsl string that would mean
+something else — a ``VolumeField`` is baked to a ``.vdb`` and rendered as
+``density vdb:<path>``.
 """
 
 from __future__ import annotations
@@ -407,6 +421,222 @@ class Image(SpatialExpr):
             b = img[y1, x0] * (1 - fx) + img[y1, x1] * fx
             c = a * (1 - fy) + b * fy
         return c.mean(axis=-1)            # Texture::scalarAt = mean of linear rgb
+
+
+class VolumeField(SpatialExpr):
+    """An **imported volume sampled as a term inside a formula** — the 3-D twin
+    of :class:`Image`, and the piece that makes loom's *read → transform → write*
+    volume workflow (roadmap §E4) actually compose.
+
+    ``VolumeField("cloud.nvdb")`` is a scalar leaf whose value at a world point is the
+    grid's trilinearly-interpolated density there, so a real captured volume can
+    be an **operand** rather than a whole asset you can only pass through::
+
+        cloud = VolumeField("cloud.nvdb")
+        write_volume("thick.vdb", box=cloud.box, res=128,
+                     density=cloud * (0.5 + 0.5 * sin(20 * Y)))
+
+    Everything the spatial algebra already does now applies to volumes for free:
+
+    * **value ops / modulation** — multiply, add, threshold, ``mix`` two volumes,
+      drive one by a procedural field or an animated :class:`Signal` coefficient;
+    * **warping** — ``x``/``y``/``z`` are ordinary sub-expressions, exactly like
+      :class:`Image`'s ``u``/``v``, so ``VolumeField(p, x=X + 0.1 * sin(10 * Z))``
+      bends the volume.  Note the convention every resampler uses: the
+      coordinate expressions map the **destination** point back to the point
+      *sampled in the source*, so a warp is authored as its inverse map;
+    * **meshing** — :mod:`loom.mcubes` takes any callable field, so
+      ``mcubes.iso_mesh(VolumeField("cloud.nvdb"), box, res, level=0.5)`` extracts an
+      isosurface of imported data;
+    * **resampling** — :func:`loom.vdbio.bake_field` / ``write_volume`` discretise
+      onto any box and resolution you like, which is all "resample a grid" ever
+      was.
+
+    **Placement is lossless.**  :meth:`translated` / :meth:`scaled` /
+    :meth:`rotated` / :meth:`fitted` do **not** resample: they compose a
+    world-space affine onto the grid's own index→world transform
+    (:meth:`~loom.vdbio.VdbTransform.premultiplied`), so moving a volume around
+    costs no interpolation and no precision.  Error enters exactly once, at the
+    final bake — loom's "keep everything as functions; discretize last" rule.
+
+    **One backend, not two.**  Unlike every other leaf in this module,
+    :meth:`emit` *raises*: ftrace's pattern VM has no volume-sampling opcode, so
+    there is no ftsl string this could honestly become.  Rather than emit
+    something that silently means something else, a ``VolumeField`` is bake-only —
+    render it by writing a ``.vdb`` (``density vdb:<path>``), which is ftrace's
+    actual volume path.  :meth:`eval_np` is a faithful port of ftrace's
+    ``VdbGrid::sample``, so what you bake is what it renders.
+    """
+
+    _cache: dict = {}          # (path, grid) -> ReadGrid
+
+    def __init__(self, path, *, grid: str = None, x=None, y=None, z=None,
+                 outside: float = None, clamp_negative: bool = False,
+                 _read=None) -> None:
+        self.path = str(path).replace("\\", "/")
+        self.grid = grid
+        self.x = _coerce(X if x is None else x)
+        self.y = _coerce(Y if y is None else y)
+        self.z = _coerce(Z if z is None else z)
+        #: Value beyond the lattice; ``None`` means the grid's own background.
+        self.outside = None if outside is None else float(outside)
+        #: Clamp samples to ``>= 0`` as ftrace does for a fog density.
+        self.clamp_negative = bool(clamp_negative)
+        self._read = _read     # an already-placed ReadGrid, if repositioned
+
+    # ---- the decoded grid -------------------------------------------------
+    @classmethod
+    def _load(cls, path: str, grid):
+        """The :class:`~loom.vdbio.ReadGrid` behind ``path``, cached by file.
+
+        Accepts ``.vdb`` and ``.nvdb`` alike — :func:`loom.vdbio.read_vdb_grids`
+        dispatches on the file's magic.
+        """
+        key = (path, grid)
+        hit = cls._cache.get(key)
+        if hit is not None:
+            return hit
+        from .vdbio import read_vdb_grids      # lazy: vdbio is the heavier layer
+        grids = read_vdb_grids(path)
+        if not grids:
+            raise ValueError(f"VolumeField: {path!r} holds no grids")
+        if grid is None:
+            if len(grids) > 1 and "density" in grids:
+                g = grids["density"]           # the conventional default name
+            elif len(grids) > 1:
+                raise ValueError(
+                    f"VolumeField: {path!r} holds {len(grids)} grids "
+                    f"({', '.join(sorted(grids))}) and none is named 'density'; "
+                    "pass grid='<name>' to pick one")
+            else:
+                g = next(iter(grids.values()))
+        else:
+            if grid not in grids:
+                raise ValueError(
+                    f"VolumeField: {path!r} has no grid named {grid!r} "
+                    f"(it has: {', '.join(sorted(grids))})")
+            g = grids[grid]
+        cls._cache[key] = g
+        return g
+
+    @property
+    def read_grid(self):
+        """The :class:`~loom.vdbio.ReadGrid` this leaf samples, including any
+        placement applied by :meth:`translated` & co."""
+        return self._read if self._read is not None else self._load(self.path, self.grid)
+
+    @property
+    def box(self):
+        """The volume's axis-aligned world AABB — a ready-made ``box`` argument
+        for :func:`~loom.vdbio.write_volume` / :mod:`loom.mcubes`.  Defined for a
+        rotated grid too (it bounds the eight index-box corners)."""
+        return self.read_grid.world_box
+
+    # ---- lossless placement ----------------------------------------------
+    def _placed(self, m=None, d=None) -> "VolumeField":
+        g = self.read_grid
+        return VolumeField(
+            self.path, grid=self.grid, x=self.x, y=self.y, z=self.z,
+            outside=self.outside, clamp_negative=self.clamp_negative,
+            _read=g.with_transform(g.transform.premultiplied(m, d)))
+
+    def translated(self, dx: float, dy: float = None, dz: float = None) -> "VolumeField":
+        """This volume moved by ``(dx, dy, dz)`` in world space (no resampling).
+        A single argument shifts all three axes."""
+        if dy is None and dz is None:
+            dy = dz = dx
+        return self._placed(None, (dx, dy, dz))
+
+    def scaled(self, factor, center=None) -> "VolumeField":
+        """This volume scaled about ``center`` (default the world origin).
+        ``factor`` is a scalar or a per-axis triple.  No resampling."""
+        try:
+            sx, sy, sz = (float(v) for v in factor)
+        except TypeError:
+            sx = sy = sz = float(factor)
+        m = (sx, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, sz)
+        c = (0.0, 0.0, 0.0) if center is None else tuple(float(v) for v in center)
+        d = (c[0] - sx * c[0], c[1] - sy * c[1], c[2] - sz * c[2])
+        return self._placed(m, d)
+
+    def rotated(self, degrees: float, axis=(0.0, 1.0, 0.0), center=None) -> "VolumeField":
+        """This volume rotated ``degrees`` about ``axis`` through ``center``
+        (default the volume's own world centre).  No resampling — a rotation
+        only moves the lattice, so not one voxel changes."""
+        import math
+        ax, ay, az = (float(v) for v in axis)
+        n = math.sqrt(ax * ax + ay * ay + az * az)
+        if n == 0.0:
+            raise ValueError("VolumeField.rotated: axis must be nonzero")
+        ax, ay, az = ax / n, ay / n, az / n
+        th = math.radians(float(degrees))
+        c, s = math.cos(th), math.sin(th)
+        k = 1.0 - c
+        m = (c + ax * ax * k,      ax * ay * k - az * s, ax * az * k + ay * s,
+             ay * ax * k + az * s, c + ay * ay * k,      ay * az * k - ax * s,
+             az * ax * k - ay * s, az * ay * k + ax * s, c + az * az * k)
+        if center is None:
+            b = self.box
+            center = ((b[0] + b[3]) * 0.5, (b[1] + b[4]) * 0.5, (b[2] + b[5]) * 0.5)
+        cx, cy, cz = (float(v) for v in center)
+        d = (cx - (m[0] * cx + m[1] * cy + m[2] * cz),
+             cy - (m[3] * cx + m[4] * cy + m[5] * cz),
+             cz - (m[6] * cx + m[7] * cy + m[8] * cz))
+        return self._placed(m, d)
+
+    def fitted(self, box) -> "VolumeField":
+        """This volume scaled and shifted so its world AABB becomes ``box`` —
+        the "drop this asset into my scene's unit cube" op.  ``box`` takes the
+        usual :mod:`loom.mcubes` forms (a half-size scalar, a 3-tuple, or a full
+        6-tuple).  Each axis is fitted **independently**, so the volume fills
+        ``box`` exactly — this is not a uniform scale to the tightest axis, and
+        it will change the aspect ratio if ``box`` has a different one.  No
+        resampling."""
+        from .mcubes import _norm_bounds
+        t = _norm_bounds(box)
+        b = self.box
+        sc, off = [], []
+        for i in range(3):
+            span = b[i + 3] - b[i]
+            want = t[i + 3] - t[i]
+            s = 1.0 if span == 0.0 else want / span
+            sc.append(s)
+            off.append(t[i] - s * b[i])
+        return self._placed((sc[0], 0.0, 0.0, 0.0, sc[1], 0.0, 0.0, 0.0, sc[2]), off)
+
+    # ---- tree -------------------------------------------------------------
+    def children(self):
+        return (self.x, self.y, self.z)
+
+    def _rebuild(self, new_children):
+        return VolumeField(
+            self.path, grid=self.grid, x=new_children[0], y=new_children[1],
+            z=new_children[2], outside=self.outside,
+            clamp_negative=self.clamp_negative, _read=self._read)
+
+    # ---- emit (there isn't one) ------------------------------------------
+    def emit(self, coords, ctx) -> str:
+        raise TypeError(
+            f"VolumeField({self.path!r}) cannot be emitted as an ftsl expression: "
+            "ftrace's pattern VM has no volume-sampling op. Bake it instead — "
+            "loom.vdbio.write_volume(...)/bake_field(...) discretise the field to "
+            "a .vdb that ftrace reads with `density vdb:<path>`.")
+
+    # ---- numpy twin (port of VdbGrid::sample, src/vdbgrid.h) --------------
+    def eval_np(self, coords, clock, cache):
+        if _np is None:              # pragma: no cover
+            raise ImportError("VolumeField.eval_np needs numpy")
+        # `sample` broadcasts internally, so a constant coordinate (or a warp
+        # that collapses one axis) needs no special handling here.
+        return self.read_grid.sample(
+            self.x.eval_np(coords, clock, cache),
+            self.y.eval_np(coords, clock, cache),
+            self.z.eval_np(coords, clock, cache),
+            outside=self.outside, clamp_negative=self.clamp_negative)
+
+    def __repr__(self) -> str:            # pragma: no cover - debugging aid
+        g = f", grid={self.grid!r}" if self.grid else ""
+        return f"VolumeField({self.path!r}{g})"
 
 
 class _Time(SpatialExpr):

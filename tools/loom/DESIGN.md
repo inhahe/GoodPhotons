@@ -590,7 +590,7 @@ tools/loom/
     writes one, as an `AffineMap`. `is_diagonal` compares each off-diagonal against its own
     row's scale, so it is unit-free and tolerates the ~1e-17 crumbs a DCC leaves when it
     composes a 90°/180° rotation in floating point.
-  - **Tests:** `tests/test_vdbio.py` (36) — bit-exact round-trip, world-box↔linspace positions,
+  - **Tests:** `tests/test_vdbio.py` (49) — bit-exact round-trip, world-box↔linspace positions,
     multi-grid named selection, sparse-empty-leaf drop, duplicate-name rejection, bake+write,
     each codec, four real third-party sample files, the rotated set (round-trip through
     `AffineMap`, `read_vdb` refusal, diagonal-`AffineMap` still yielding a box, and the two read
@@ -609,8 +609,36 @@ tools/loom/
     in the same scene through ftrace's *independent* OpenVDB reader — means agree to 0.007%, and
     the per-pixel diff halves at 4× photons (8.65% → 4.35%), i.e. √N noise from the diverged RNG
     streams rather than a volume difference.
+  - **Volume transforms — a volume is a *term*, not an API.** `loom.spatial.VolumeField` is the
+    3-D twin of the `Image` leaf: a scalar `SpatialExpr` whose value at a world point is an
+    imported grid's trilinearly-interpolated density (`ReadGrid.sample`, a port of ftrace's
+    `VdbGrid::sample`). That one decision is what makes E4's *read → transform → write* "basis
+    workflow" fall out of machinery that already existed — value ops and modulation are the
+    spatial algebra, warping is the rebindable `x`/`y`/`z` children (as `Image` has `u`/`v`),
+    meshing is `mcubes` (it takes any callable), and resampling is `bake_field`. Named
+    `VolumeField` because `loom.scene.Volume` is already the `medium { }` scene element.
+    - **Placement is lossless.** `translated`/`scaled`/`rotated`/`fitted` compose a world-space
+      affine onto the grid's own index→world map (`VdbTransform.premultiplied`: `A' = M·A`,
+      `t' = M·t + d`) instead of resampling — a VDB tree is a regular lattice in *index* space, so
+      moving it costs nothing and touches no voxel (`v.rotated(37).read_grid.values is g.values`).
+      Interpolation error enters exactly once, at the final bake: "discretize last", applied to
+      volumes. Test-asserted both ways — 4×90°, 360°, translate-and-back and scale-and-back all
+      reproduce the original array (~1e-15), while a single 37° rotation must *change* the field
+      (so the round-trips can't pass vacuously) and conserve mass to 5%.
+    - **`emit()` deliberately raises.** ftrace's pattern VM has no volume-sampling opcode, so
+      there is no honest ftsl string; a `VolumeField` is bake-only and the error names
+      `write_volume`. This is the one leaf in `spatial.py` that is single-backend.
+    - Support added alongside: `VdbTransform.inverse_linear`/`to_index`/`premultiplied`,
+      `ReadGrid.world_box` (AABB of the eight index-box corners — defined for a rotated grid,
+      unlike `.box`) and `ReadGrid.with_transform` (shares the array).
+    - **Found an ftrace bug** (fixed in v0.84.2): `VdbGrid::sample` and its CUDA twin clamped the
+      stencil *indices* but not the interpolation *fraction*, so the half-voxel shell below index
+      0 was dominated by the **second** voxel. Caught because a 360° rotation — necessarily a
+      no-op — shifted the baked field by 0.32. See `known-issues.md`.
   - **Still open:** **Vec3** grids (blocked — no real vec3 file to validate against, and no
-    consumer: ftrace is scalar-float-only); sparse-storage transforms; resampling sparse↔dense.
+    consumer: ftrace is scalar-float-only); sparse *storage* as a backing, and transforms authored
+    directly against it (now a storage optimisation, not a missing capability — reads of sparse
+    files and every transform on them already work through the dense path).
     Writing `.nvdb` is deliberately not built (ftrace reads loom's `.vdb` directly).
 - **E5 (foundation) — Axis-typed signals (one influence model).** ✅ done (`loom/axes.py`). Resolves E5's
   deferred open-q (node taxonomy + axis-set representation) with a small additive layer *on top of* the

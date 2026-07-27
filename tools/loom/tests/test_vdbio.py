@@ -574,6 +574,220 @@ def test_nvdb_rejects_non_float_grid():
             vdbio.read_nvdb(path)
 
 
+# ---------------------------------------------------------------------------
+# VolumeField — an imported volume as a term in the spatial algebra (E4
+# read -> transform -> write), plus the trilinear sampler it rides on.
+# ---------------------------------------------------------------------------
+
+def _tiny_grid(nx=5, ny=4, nz=3, scale=(0.5, 0.25, 2.0), offset=(-1.0, 3.0, 0.5)):
+    """A small grid with distinct per-voxel values and a non-unit transform, so
+    an index/axis mix-up cannot hide behind symmetry."""
+    vals = np.arange(nx * ny * nz, dtype="<f4").reshape(nx, ny, nz) + 1.0
+    xf = vdbio.VdbTransform.diagonal(scale, offset)
+    return vdbio.ReadGrid("density", vals, (2, -3, 7), xf, background=0.0)
+
+
+def test_transform_inverse_round_trips():
+    for xf in (vdbio.VdbTransform.diagonal((0.5, 0.25, 2.0), (-1.0, 3.0, 0.5)),
+               vdbio.VdbTransform((0.3, 0.1, -0.2, 0.05, 0.4, 0.11,
+                                   -0.07, 0.2, 0.33), (1.0, -2.0, 0.25))):
+        for ijk in ((0, 0, 0), (3.5, -2.25, 8.0), (-11.0, 4.0, 0.5)):
+            w = xf.apply(*ijk)
+            back = xf.to_index(*w)
+            assert all(abs(a - b) < 1e-9 for a, b in zip(ijk, back))
+    with pytest.raises(ValueError, match="singular"):
+        vdbio.VdbTransform((1, 0, 0, 2, 0, 0, 3, 0, 0), (0, 0, 0)).inverse_linear
+
+
+def test_premultiplied_moves_the_lattice_and_composes():
+    xf = vdbio.VdbTransform.diagonal((0.5, 0.25, 2.0), (-1.0, 3.0, 0.5))
+    # A pure translation shifts every sample by exactly d.
+    d = (0.7, -0.2, 4.0)
+    moved = xf.premultiplied(None, d)
+    for ijk in ((0, 0, 0), (3, -2, 8)):
+        a, b = xf.apply(*ijk), moved.apply(*ijk)
+        assert all(abs((y - x) - dd) < 1e-12 for x, y, dd in zip(a, b, d))
+    # Composition is left-multiplication: applying M then M == applying M*M.
+    m = (0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)      # +90 deg about z
+    twice = xf.premultiplied(m).premultiplied(m)
+    for ijk in ((1, 2, 3), (-4, 0, 5)):
+        x, y, z = xf.apply(*ijk)
+        assert all(abs(a - b) < 1e-12
+                   for a, b in zip(twice.apply(*ijk), (-x, -y, z)))
+
+
+def test_sampler_reproduces_the_lattice_exactly():
+    """Sampling at the voxel centres must return the stored voxels bit-for-bit —
+    the property that makes an identity resample a no-op."""
+    g = _tiny_grid()
+    nx, ny, nz = g.shape
+    ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz),
+                             indexing="ij")
+    lo = g.index_lo
+    a, t = g.transform.a, g.transform.t
+    wx = a[0] * (ii + lo[0]) + t[0]
+    wy = a[4] * (jj + lo[1]) + t[1]
+    wz = a[8] * (kk + lo[2]) + t[2]
+    assert np.allclose(g.sample(wx, wy, wz), g.values, rtol=0, atol=1e-12)
+
+
+def test_sampler_interpolates_linearly_between_voxels():
+    g = _tiny_grid()
+    lo, a, t = g.index_lo, g.transform.a, g.transform.t
+    # Halfway along x between (0,0,0) and (1,0,0).
+    wx = a[0] * (lo[0] + 0.5) + t[0]
+    wy = a[4] * lo[1] + t[1]
+    wz = a[8] * lo[2] + t[2]
+    want = 0.5 * (float(g.values[0, 0, 0]) + float(g.values[1, 0, 0]))
+    assert abs(float(g.sample(wx, wy, wz)) - want) < 1e-9
+
+
+def test_sampler_edge_shell_reads_the_edge_voxel_not_the_second():
+    """Regression: ftrace's sampler used to clamp the stencil *indices* but not
+    the coordinate, so a point just below index 0 kept a fraction near 1 and was
+    dominated by the SECOND voxel — growing wronger the further out it went.
+    Both ftrace (src/vdbgrid.h, render_cuda.cu) and this port now clamp the
+    coordinate, so the outer half-voxel shell reads the edge voxel."""
+    g = _tiny_grid()
+    lo, a, t = g.index_lo, g.transform.a, g.transform.t
+    x0 = a[0] * lo[0] + t[0]
+    wy = a[4] * lo[1] + t[1]
+    wz = a[8] * lo[2] + t[2]
+    edge = float(g.values[0, 0, 0])
+    assert float(g.values[1, 0, 0]) != edge      # else the test would be vacuous
+    for frac in (0.0, -0.1, -0.25, -0.49):
+        got = float(g.sample(x0 + frac * a[0], wy, wz))
+        assert abs(got - edge) < 1e-9, f"at {frac} voxels below index 0: {got}"
+    # Just past the half-voxel margin the grid stops existing.
+    assert float(g.sample(x0 - 0.6 * a[0], wy, wz)) == 0.0
+    # The upper shell was always right; check it stayed right.
+    xn = a[0] * (lo[0] + g.shape[0] - 1) + t[0]
+    top = float(g.values[-1, 0, 0])
+    for frac in (0.0, 0.25, 0.49):
+        assert abs(float(g.sample(xn + frac * a[0], wy, wz)) - top) < 1e-9
+
+
+def test_sampler_outside_and_clamp_knobs():
+    g = _tiny_grid()
+    g.background = 0.75
+    far = (1e6, 1e6, 1e6)
+    assert float(g.sample(*far)) == pytest.approx(0.75)      # defaults to background
+    assert float(g.sample(*far, outside=0.0)) == 0.0         # ftrace's convention
+    neg = vdbio.ReadGrid("d", np.full((2, 2, 2), -3.0, dtype="<f4"), (0, 0, 0),
+                         vdbio.VdbTransform.diagonal((1, 1, 1), (0, 0, 0)))
+    assert float(neg.sample(0.5, 0.5, 0.5)) == pytest.approx(-3.0)
+    assert float(neg.sample(0.5, 0.5, 0.5, clamp_negative=True)) == 0.0
+
+
+def test_volume_field_identity_resample_is_a_no_op():
+    """The whole read -> transform -> write path in miniature: bake an imported
+    volume back onto its own lattice and get the original array."""
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    from loom.spatial import VolumeField
+    v = VolumeField(_NVDB_SAMPLE)
+    g = v.read_grid
+    vals, box = vdbio.bake_field(v, v.box, g.shape)
+    assert np.abs(vals - np.asarray(g.values, dtype=np.float64)).max() < 1e-6
+    assert box == pytest.approx(v.box)
+
+
+def test_volume_field_placement_is_lossless():
+    """Placement composes onto the grid transform instead of resampling, so a
+    move and its inverse return the original array — that is the whole point of
+    deferring discretisation to the final bake."""
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    from loom.spatial import VolumeField
+    v = VolumeField(_NVDB_SAMPLE)
+    g = v.read_grid
+    orig = np.asarray(g.values, dtype=np.float64)
+    round_trips = {
+        "rotate 4x90": v.rotated(90.0).rotated(90.0).rotated(90.0).rotated(90.0),
+        "rotate 360": v.rotated(360.0, axis=(0.3, -0.5, 0.8)),
+        "translate": v.translated(0.13, -0.02, 0.4).translated(-0.13, 0.02, -0.4),
+        "scale": v.scaled(3.0).scaled(1.0 / 3.0),
+        "scale/centre": v.scaled((2.0, 0.5, 4.0), center=(0.5, 0.5, 0.5))
+                         .scaled((0.5, 2.0, 0.25), center=(0.5, 0.5, 0.5)),
+    }
+    for name, f in round_trips.items():
+        vals, _ = vdbio.bake_field(f, v.box, g.shape)
+        assert np.abs(vals - orig).max() < 1e-6, name
+    # No voxel is touched by a placement — only the transform moves.
+    assert v.rotated(37.0).read_grid.values is g.values
+
+
+def test_volume_field_rotation_actually_rotates():
+    """The complement of the round-trip test: a single rotation must *change*
+    the baked field (else the loss-free assertions above pass vacuously)."""
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    from loom.spatial import VolumeField
+    v = VolumeField(_NVDB_SAMPLE)
+    base, _ = vdbio.bake_field(v, v.box, (24, 24, 24))
+    turned, _ = vdbio.bake_field(v.rotated(37.0), v.box, (24, 24, 24))
+    assert np.abs(turned - base).max() > 0.05
+    # ...but a rotation conserves the volume's mass to within resampling error.
+    assert turned.sum() == pytest.approx(base.sum(), rel=0.05)
+
+
+def test_volume_field_fitted_lands_on_the_requested_box():
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    from loom.spatial import VolumeField
+    v = VolumeField(_NVDB_SAMPLE)
+    want = (0.0, -2.0, 1.0, 1.0, 3.0, 1.5)
+    assert v.fitted(want).box == pytest.approx(want, abs=1e-9)
+    assert v.fitted(2.0).box == pytest.approx((-2, -2, -2, 2, 2, 2), abs=1e-9)
+
+
+def test_volume_field_composes_with_the_spatial_algebra():
+    """A volume is an ordinary operand: arithmetic and warping both work, and a
+    warp reaches inside the coordinate children."""
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    from loom.spatial import VolumeField
+    v = VolumeField(_NVDB_SAMPLE)
+    box, res = v.box, (16, 16, 16)
+    base, _ = vdbio.bake_field(v, box, res)
+    doubled, _ = vdbio.bake_field(v * 2.0 + 1.0, box, res)
+    assert np.allclose(doubled, 2.0 * base + 1.0)
+    # A coordinate substitution is a warp; shifting x by one voxel must equal
+    # sampling the unshifted field one voxel over.
+    dx = v.read_grid.transform.a[0]
+    warped, _ = vdbio.bake_field(VolumeField(_NVDB_SAMPLE, x=X + dx), box, res)
+    shifted, _ = vdbio.bake_field(v.translated(-dx, 0.0, 0.0), box, res)
+    assert np.abs(warped - shifted).max() < 1e-6
+    assert v.children() == (v.x, v.y, v.z)
+
+
+def test_volume_field_refuses_to_emit_ftsl():
+    """ftrace's pattern VM has no volume op, so there is no honest emit; the
+    error must say what to do instead rather than produce a wrong string."""
+    if not os.path.exists(_NVDB_SAMPLE):
+        pytest.skip("sample cloud.nvdb not present")
+    from loom.spatial import VolumeField
+    with pytest.raises(TypeError, match="write_volume"):
+        VolumeField(_NVDB_SAMPLE).emit(("x", "y", "z"), None)
+
+
+def test_volume_field_grid_selection_and_errors():
+    from loom.spatial import VolumeField
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "two.vdb")
+        box = (0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+        a = np.zeros((4, 4, 4), dtype="<f4"); a[1, 1, 1] = 1.0
+        b = np.zeros((4, 4, 4), dtype="<f4"); b[2, 2, 2] = 5.0
+        vdbio.write_vdb(path, [vdbio.VolumeGrid("density", a, box),
+                               vdbio.VolumeGrid("temperature", b, box)])
+        VolumeField._cache.clear()
+        assert VolumeField(path).read_grid.name == "density"   # the conventional default
+        assert VolumeField(path, grid="temperature").read_grid.name == "temperature"
+        with pytest.raises(ValueError, match="no grid named"):
+            VolumeField(path, grid="nope").read_grid
+        VolumeField._cache.clear()
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

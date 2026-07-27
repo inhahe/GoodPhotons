@@ -186,6 +186,75 @@ class VdbTransform:
                 a[3] * i + a[4] * j + a[5] * k + t[1],
                 a[6] * i + a[7] * j + a[8] * k + t[2])
 
+    @property
+    def inverse_linear(self) -> Tuple[float, ...]:
+        """``A⁻¹`` as a row-major 9-tuple — the **world → index** linear map.
+
+        This is exactly ftrace's ``VdbGrid::ainv`` (``src/vdbgrid.h``), which it
+        obtains the same way: invert the 3×3 and sample at
+        ``ainv · (p - t) - index_lo``.
+        """
+        a = self.a
+        c0 = a[4] * a[8] - a[5] * a[7]
+        c1 = a[5] * a[6] - a[3] * a[8]
+        c2 = a[3] * a[7] - a[4] * a[6]
+        det = a[0] * c0 + a[1] * c1 + a[2] * c2
+        if det == 0.0 or not math.isfinite(det):
+            raise ValueError("VdbTransform: singular linear part, cannot invert")
+        inv = 1.0 / det
+        return (c0 * inv,
+                (a[2] * a[7] - a[1] * a[8]) * inv,
+                (a[1] * a[5] - a[2] * a[4]) * inv,
+                c1 * inv,
+                (a[0] * a[8] - a[2] * a[6]) * inv,
+                (a[2] * a[3] - a[0] * a[5]) * inv,
+                c2 * inv,
+                (a[1] * a[6] - a[0] * a[7]) * inv,
+                (a[0] * a[4] - a[1] * a[3]) * inv)
+
+    def to_index(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
+        """Map one world point to a **fractional** index coordinate (inverse of
+        :meth:`apply`)."""
+        m, t = self.inverse_linear, self.t
+        rx, ry, rz = x - t[0], y - t[1], z - t[2]
+        return (m[0] * rx + m[1] * ry + m[2] * rz,
+                m[3] * rx + m[4] * ry + m[5] * rz,
+                m[6] * rx + m[7] * ry + m[8] * rz)
+
+    def premultiplied(self, m: Sequence[float] = None,
+                      d: Sequence[float] = None) -> "VdbTransform":
+        """Compose a **world-space** affine ``p ↦ M·p + d`` onto this transform.
+
+        Returns ``A' = M·A``, ``t' = M·t + d`` — i.e. the same lattice *moved*
+        in the world.  Nothing is resampled and no value changes: repositioning
+        a grid is exact, because an OpenVDB/NanoVDB tree is a regular lattice in
+        *index* space and the transform alone says where that lattice sits.
+        That is why :class:`~loom.spatial.Volume`'s placement helpers compose
+        here rather than warping coordinates — interpolation error is deferred
+        to the single final bake, per loom's "discretize last" rule.
+        """
+        mm = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0) if m is None \
+            else tuple(float(v) for v in m)
+        if len(mm) != 9:
+            raise ValueError("premultiplied() needs a 9-element row-major matrix")
+        dd = (0.0, 0.0, 0.0) if d is None else tuple(float(v) for v in d)
+        if len(dd) != 3:
+            raise ValueError("premultiplied() needs a 3-element offset")
+        a = self.a
+        na = tuple(sum(mm[r * 3 + q] * a[q * 3 + c] for q in range(3))
+                   for r in range(3) for c in range(3))
+        nt = tuple(sum(mm[r * 3 + q] * self.t[q] for q in range(3)) + dd[r]
+                   for r in range(3))
+        return VdbTransform(na, nt)
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, VdbTransform):
+            return NotImplemented
+        return self.a == other.a and self.t == other.t
+
+    def __hash__(self) -> int:
+        return hash((self.a, self.t))
+
     def __repr__(self) -> str:            # pragma: no cover - debugging aid
         kind = "diagonal" if self.is_diagonal else "rotated"
         return f"VdbTransform({kind}, scale={self.voxel_size}, t={self.t})"
@@ -244,6 +313,98 @@ class ReadGrid:
         x0, y0, z0 = self.transform.apply(*lo)
         x1, y1, z1 = self.transform.apply(*hi)
         return (x0, y0, z0, x1, y1, z1)
+
+    @property
+    def world_box(self) -> Box:
+        """The axis-aligned world AABB of the sample range — like :attr:`box`,
+        but defined for a **rotated** grid too (it AABBs the eight corners of the
+        index box, exactly as ftrace's ``loadVdbGrid`` computes ``wmin``/``wmax``).
+
+        Use this to *bound* a rotated grid (e.g. to pick a bake box); use
+        :attr:`box` only when the lattice really is axis-aligned and you need the
+        corner-to-corner sample range back.
+        """
+        lo, hi = self.index_lo, self.index_hi
+        pts = [self.transform.apply(i, j, k)
+               for i in (lo[0], hi[0]) for j in (lo[1], hi[1]) for k in (lo[2], hi[2])]
+        return (min(p[0] for p in pts), min(p[1] for p in pts), min(p[2] for p in pts),
+                max(p[0] for p in pts), max(p[1] for p in pts), max(p[2] for p in pts))
+
+    def with_transform(self, transform: VdbTransform) -> "ReadGrid":
+        """This grid re-placed under a new index→world map.
+
+        The array is **shared, not copied** — repositioning a volume moves the
+        lattice, it does not touch a single voxel.
+        """
+        return ReadGrid(self.name, self.values, self.index_lo, transform,
+                        self.background)
+
+    def sample(self, x, y, z, *, outside=None, clamp_negative: bool = False):
+        """Trilinearly sample the grid at world points — a numpy-vectorised port
+        of ftrace's ``VdbGrid::sample`` (``src/vdbgrid.h``).
+
+        ``x``/``y``/``z`` are broadcastable arrays (or scalars) of world
+        coordinates; the result has their broadcast shape.  Points are mapped to
+        fractional lattice coordinates by ``A⁻¹·(p - t) - index_lo``, the
+        interpolation stencil is clamped to ``[0, n-1]``, and points further than
+        half a voxel outside the lattice read ``outside``.
+
+        Two knobs cover the gap between "what this grid means" and "what ftrace
+        renders", because the two genuinely differ:
+
+        ``outside``  value beyond the lattice.  Defaults to the grid's
+                     :attr:`background` — the tree's own answer for "no topology
+                     here", which is what a level set needs (its band value).
+                     Pass ``0.0`` for ftrace's convention, where a density grid
+                     simply *does not exist* outside its baked box.
+        ``clamp_negative``  clamp the result to ``≥ 0``, as ftrace does for a fog
+                     density.  Off by default, since clamping would destroy the
+                     inside of a signed level set.
+
+        With ``outside=0.0, clamp_negative=True`` this reproduces ftrace's
+        sampler exactly, up to ftrace storing its lattice as fp16.
+        """
+        import numpy as np
+        bg = self.background if outside is None else float(outside)
+        v = self.values
+        nx, ny, nz = v.shape
+        m = self.transform.inverse_linear
+        t, lo = self.transform.t, self.index_lo
+        rx = np.asarray(x, dtype=np.float64) - t[0]
+        ry = np.asarray(y, dtype=np.float64) - t[1]
+        rz = np.asarray(z, dtype=np.float64) - t[2]
+        fi = m[0] * rx + m[1] * ry + m[2] * rz - lo[0]
+        fj = m[3] * rx + m[4] * ry + m[5] * rz - lo[1]
+        fk = m[6] * rx + m[7] * ry + m[8] * rz - lo[2]
+        fi, fj, fk = np.broadcast_arrays(fi, fj, fk)
+        # Half a voxel of margin, matching ftrace: the medium's own AABB already
+        # clips rays, so this only guards the interpolation edge.
+        inside = ((fi >= -0.5) & (fj >= -0.5) & (fk >= -0.5) &
+                  (fi <= nx - 0.5) & (fj <= ny - 0.5) & (fk <= nz - 0.5))
+        # Clamp the sample COORDINATE to [0, n-1] before the floor, exactly as
+        # ftrace does.  Clamping only the stencil *indices* would leave the
+        # fraction near 1 in the outer half-voxel shell below index 0, so the
+        # sample would be dominated by the second voxel instead of the edge one.
+        # (This also makes the int cast safe for a far-away or NaN point, whose
+        # `inside` flag is False anyway.)
+        ci = np.clip(np.nan_to_num(fi, nan=0.0), 0.0, nx - 1)
+        cj = np.clip(np.nan_to_num(fj, nan=0.0), 0.0, ny - 1)
+        ck = np.clip(np.nan_to_num(fk, nan=0.0), 0.0, nz - 1)
+        i0 = ci.astype(np.int64); j0 = cj.astype(np.int64); k0 = ck.astype(np.int64)
+        tx = ci - i0; ty = cj - j0; tz = ck - k0
+        i1 = np.minimum(i0 + 1, nx - 1)
+        j1 = np.minimum(j0 + 1, ny - 1)
+        k1 = np.minimum(k0 + 1, nz - 1)
+        c00 = v[i0, j0, k0] * (1 - tx) + v[i1, j0, k0] * tx
+        c10 = v[i0, j1, k0] * (1 - tx) + v[i1, j1, k0] * tx
+        c01 = v[i0, j0, k1] * (1 - tx) + v[i1, j0, k1] * tx
+        c11 = v[i0, j1, k1] * (1 - tx) + v[i1, j1, k1] * tx
+        c0 = c00 * (1 - ty) + c10 * ty
+        c1 = c01 * (1 - ty) + c11 * ty
+        out = c0 * (1 - tz) + c1 * tz
+        if clamp_negative:
+            out = np.maximum(out, 0.0)
+        return np.where(inside, out, bg)
 
     def __repr__(self) -> str:            # pragma: no cover - debugging aid
         return (f"ReadGrid({self.name!r}, shape={self.shape}, "
