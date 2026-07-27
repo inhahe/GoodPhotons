@@ -40,7 +40,8 @@ from .vdbio import (
 from .axes import (
     AxSignal, Ax, AConst, Lift, AFn, Sample, select, Reduce,
     CurveSample, RecordSample, sample,
-    Binding, Target, combine, as_ax,
+    Binding, Target, combine, mod, pin, as_ax,
+    Lower, LowerVec, lower,
     ADDITIVE, GAIN, BIPOLAR, AXIS_T, AXIS_S, AXIS_U, AXIS_V,
 )
 from .anim import (
@@ -114,7 +115,8 @@ __all__ = [
     "VolumeGrid", "VdbTransform", "ReadGrid",
     "AxSignal", "Ax", "AConst", "Lift", "AFn", "Sample", "select", "Reduce",
     "CurveSample", "RecordSample", "sample",
-    "Binding", "Target", "combine", "as_ax",
+    "Binding", "Target", "combine", "mod", "pin", "as_ax",
+    "Lower", "LowerVec", "lower",
     "ADDITIVE", "GAIN", "BIPOLAR", "AXIS_T", "AXIS_S", "AXIS_U", "AXIS_V",
     "CurveDrive", "ChannelBinding", "MODE_FLYBY", "MODE_ANIMATION",
     "Slot", "collect_slots", "SceneDriver", "LiveSession", "serve_live",

@@ -188,8 +188,50 @@ class Signal:
         return Neg(self)
 
 
+def lower_axsignal(x, *, dim: Optional[int] = None):
+    """If ``x`` is an axis-typed node (:mod:`loom.axes`), bind it down to a
+    clock-parameterized node at this value-site; otherwise return ``None``.
+
+    This is the single hook that routes roadmap-§E5's influence model into
+    ordinary loom authoring: a :class:`~loom.axes.Target` (the ``pin``/``mod``
+    combine node) handed to *any* scene value-site is lowered here, and its
+    scope check ("free variables ⊆ the axes in scope at this site" — a
+    value-site has only the clock) fires at graph-build time.  Every consumer
+    (:func:`as_signal`, ``VecSignal.of``, ``ftsl_emit.num``/``vecn``, an
+    ``Element``'s ``roots()``) goes through it, so they all agree.
+
+    The lowered node is **memoised on the axis node**, because a value-site must
+    present the *same* node every time: node identity is the per-frame
+    :class:`Cache` key, and ``roots()`` must hand the cycle detector the very
+    node that emission will evaluate.  Imported lazily because :mod:`loom.axes`
+    is built on top of this module.
+    """
+    if isinstance(x, (Signal, int, float)) or not hasattr(x, "axes"):
+        return None
+    from ..axes import AxSignal, lower  # local: axes imports this module
+    if not isinstance(x, AxSignal):
+        return None
+    if dim is not None:
+        return lower(x, dim=dim)
+    node = getattr(x, "_site_node", None)
+    if node is None:
+        node = lower(x)
+        x._site_node = node
+    return node
+
+
 def as_signal(x: Union[Signal, Number]) -> Signal:
-    return x if isinstance(x, Signal) else Const(float(x))
+    if isinstance(x, Signal):
+        return x
+    lowered = lower_axsignal(x)
+    if lowered is not None:
+        if not isinstance(lowered, Signal):
+            raise TypeError(
+                f"a scalar value-site got a {lowered.dim}-vector axis node; "
+                f"pick a component with .comp(i)"
+            )
+        return lowered
+    return Const(float(x))
 
 
 # ---------------------------------------------------------------------------

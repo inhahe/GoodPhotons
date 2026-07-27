@@ -37,6 +37,26 @@ for MP4 and **NumPy** for the mesher / spacetime tools).
    local→world **placement**: the field inverse-maps a world query into the dataset's local
    frame, so a fixed world-space sampling curve reads *different* values as you move / resize
    / skew the data object under it (the curve is decoupled from the object).
+7. **One influence model, on any axis.** `loom.axes` types a signal by its *free axes*
+   (`{t}`, `{s}`, `{s,t}`, …), so broadcast on unshared axes and pointwise on shared ones are
+   implicit and the only cross-axis op is an explicit `Reduce`. Influence is one edge model:
+   `Target(kind, [mod(a), pin(b)], base)` with target-declared neutrals (`ADDITIVE` 0 /
+   `GAIN` 1 / `BIPOLAR` ½). Drop such a node in **any** scene value-site and it's lowered
+   automatically:
+
+   ```python
+   from loom import Sphere, Target, GAIN, mod, Sine, lower, CurveSample, Ax, Ramp
+
+   # a GAIN target driving a radius: base 0.3, modulated by a lifted legacy Signal
+   sphere = Sphere(center=(0, 0, 0), material="gold",
+                   radius=Target(GAIN, [mod(0.6 + 0.4 * Sine())], base=0.3))
+
+   # a spatial curve sampled along its own arclength axis, swept over the loop
+   sphere.center = lower(CurveSample(path_curve, Ax("s")), dim=3, bind={"s": Ramp()})
+   ```
+
+   A value-site has only the clock axis in scope, so any *other* axis must be pinned with
+   `bind={axis: coord-or-Signal}` — an unbound one is a construction-time error naming it.
 
 ---
 
@@ -56,7 +76,7 @@ tools/loom/
 │   ├── sweep.py     sweep engine (rotation-minimizing frames, ribbon/tube/skin_rings, OBJ out)
 │   ├── mcubes.py    adaptive marching cubes (bake a scalar field to a mesh)
 │   ├── vdbio.py     bake a field to a dense grid → OpenVDB .vdb (density/temperature) + read back
-│   ├── axes.py      axis-typed signals: broadcast/pin/mod composition + sample/reduce grammar
+│   ├── axes.py      axis-typed signals: broadcast/pin/mod composition + sample/reduce grammar + lower() onto any scene value-site
 │   ├── anim.py      N-D curve → scene-variable go-between: config + JSON sidecar + value fan-out + named slots + live pipe
 │   ├── material.py  function-driven materials (waves/checker/rings/blobs, mixes)
 │   ├── scene.py     Scene / Camera / Material / Texture (image skins) / geometry / Volume media (all animatable)

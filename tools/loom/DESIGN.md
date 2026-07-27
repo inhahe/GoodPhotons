@@ -421,7 +421,7 @@ tools/loom/
     drive.py                render_range, viewer, assembly, seed (new)
     mcubes.py               marching cubes: bake a field to a mesh (M7)
     vdbio.py                bake a field to a dense grid + write/read .vdb (E4 write)
-    axes.py                 axis-typed signals: broadcast/pin/mod + sample/reduce (E5 core)
+    axes.py                 axis-typed signals: broadcast/pin/mod + sample/reduce + lower-to-value-site (E5)
     anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe (E2 s1–2)
     xvideo.py               two-pass spacetime transform video (M11)
     preview.py              resident ftrace -serve preview client (M12)
@@ -603,8 +603,25 @@ tools/loom/
   binds a `LoopCurve`/`FieldCurve`/`TrackedCurve`'s param axis *and* threads the clock (so an animated spatial
   curve is honestly `{s,t}`, a static one broadcasts over `t`); `RecordSample(record,channel,arg)` binds a
   `Record`'s static driver axis (`{driver}`, no clock); and `sample(obj,arg,…)` dispatches by duck-type. Both
-  thread the loom node into the axis-layer `walk` like `Lift`. Tests: `tests/test_axes.py` (30). Remaining
-  follow-ups: the `.ftsl` projection of axis annotations, and routing scene value-sites (E2) through `Target`.
+  thread the loom node into the axis-layer `walk` like `Lift`.
+  **Follow-up 2 done — scene value-sites route through `Target`.** `Lower`/`LowerVec` are the exact inverse of
+  `Lift`: they bind an `AxSignal` back down to a clock-parameterized `Signal`/`VecSignal`, which is what every
+  loom scene value-site (`Sphere.radius`, `Isosurface.iso`, a material colour, a camera position, …) consumes —
+  so a `Target` reaches a scene variable *through here*, and E5's influence model becomes the authoring model.
+  The site's clock axis (default `'t'`) is fed `clock.t`; every **other** axis the node reads must be pinned via
+  `bind={'s': <coord or Signal>}` — a constant reads one arclength of a spatial curve, a `Signal` sweeps along
+  it over the loop. Records-5a's scope rule ("a node's free variables ⊆ the axes in scope here") is enforced at
+  **construction**, naming the unbound axes, rather than failing deep inside a render. `lower(node)` picks the
+  scalar/vector form by probing at `t=0`; `LowerVec` evaluates the axis graph *once* per frame (the per-component
+  `Lower` nodes still exist so `walk`/`detect_signal_cycle` and ordinary `VecSignal` math see a normal vector).
+  Routing is **one memoised hook**, `signals.core.lower_axsignal`, consumed by `as_signal`, `VecSignal.of`,
+  `ftsl_emit.site_node` (→ `num`/`vecn`/`value_token`) and `Element.roots()` — so no element constructor changed,
+  and *every* value-site accepts an axis node uniformly. Memoising the lowered node on the axis node is required,
+  not cosmetic: node identity is the per-frame `Cache` key **and** `roots()` must hand the cycle detector the very
+  node emission will evaluate. Sugar: `mod(src, gain)`/`pin(src, gain)` build `Binding`s, `Binding` coerces its
+  source via `as_ax` (which now also `Lift`s a legacy `Signal`), and a `GAIN` target with a negative source now
+  raises a domain error instead of silently producing a complex number. Tests: `tests/test_axes.py` (55).
+  Remaining follow-up: the `.ftsl` projection of axis annotations.
 - **E2 (slices 1–2) — N-D curve → scene-variable go-between.** ✅ done (`loom/anim.py`). The channel-a config
   model + JSON sidecar + channel-b value fan-out — the pure-Python core of the animation go-between (resolves
   E2 OPEN Q1/Q2: config in a loom struct with a serialized sidecar; go-between = loom). `CurveDrive(dims,

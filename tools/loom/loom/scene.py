@@ -19,7 +19,7 @@ from .signals.core import Signal, Clock, Cache, Const, detect_signal_cycle
 from .signals.vector import VecSignal
 from .interp import LoopCurve
 from .data import PointPath
-from .ftsl_emit import EmitCtx, num, vec3, fmt, fmt3, value_token
+from .ftsl_emit import EmitCtx, num, vec3, fmt, fmt3, value_token, site_node
 from . import sweep as _sweep
 
 
@@ -41,11 +41,17 @@ class Element:
     xf = None  # Optional[Transform]; applied by the container on emit
 
     def roots(self) -> List:
-        """Every Signal / VecSignal stored on this element (for cycle checking)."""
+        """Every Signal / VecSignal stored on this element (for cycle checking).
+
+        An axis-typed node (:mod:`loom.axes`) contributes the *same* lowered node
+        that emission will evaluate (:func:`~loom.ftsl_emit.site_node` memoises
+        it), so the cycle detector and the viewer's DAG panel see the whole graph.
+        """
         out: List = []
         for v in vars(self).values():
-            if isinstance(v, (Signal, VecSignal)):
-                out.append(v)
+            n = site_node(v)
+            if n is not None:
+                out.append(n)
         return out
 
     def emit(self, ctx: EmitCtx) -> str:
@@ -206,8 +212,9 @@ class Material(Element):
     def roots(self) -> List:
         out: List = []
         for v in self.props.values():
-            if isinstance(v, (Signal, VecSignal)):
-                out.append(v)
+            n = site_node(v)                    # Signal / VecSignal / lowered axis node
+            if n is not None:
+                out.append(n)
             else:
                 for e in (_field_exprs(v) or ()):
                     out.extend(e.time_signals())
@@ -443,8 +450,9 @@ class Sphere(Element):
 
     def roots(self) -> List:
         out: List = [self.center]
-        if isinstance(self.radius, Signal):
-            out.append(self.radius)
+        r = site_node(self.radius)
+        if r is not None:
+            out.append(r)
         return out
 
     def emit(self, ctx: EmitCtx) -> str:
@@ -470,8 +478,9 @@ class Beads(Element):
 
     def roots(self) -> List:
         out: List = [self.curve]
-        if isinstance(self.radius, Signal):
-            out.append(self.radius)
+        r = site_node(self.radius)
+        if r is not None:
+            out.append(r)
         return out
 
     def emit(self, ctx: EmitCtx) -> str:

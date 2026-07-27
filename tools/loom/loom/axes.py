@@ -55,7 +55,8 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Dict, FrozenSet, Mapping, Optional, Sequence, Tuple, Union
 
-from .signals.core import Signal, Clock, alloc_id, Number
+from .signals.core import Signal, Clock, Cache, alloc_id, as_signal, Number
+from .signals.vector import VecSignal
 
 Point = Mapping[str, float]
 Numeric = Union["AxSignal", Number]
@@ -150,9 +151,20 @@ class AxSignal:
         return _Comp(self, int(i))
 
 
-def as_ax(x: Numeric) -> "AxSignal":
-    """Coerce a number to :class:`AConst`; pass an :class:`AxSignal` through."""
-    return x if isinstance(x, AxSignal) else AConst(float(x))
+def as_ax(x) -> "AxSignal":
+    """Coerce into the axis layer.
+
+    - an :class:`AxSignal` passes through;
+    - a legacy scalar :class:`~loom.signals.core.Signal` is **lifted**
+      (:class:`Lift`) into a ``{t}``-typed node, so the whole existing modulator
+      DAG composes into axis expressions and bindings without a manual wrap;
+    - anything else is read as a number (:class:`AConst`, axes ∅).
+    """
+    if isinstance(x, AxSignal):
+        return x
+    if isinstance(x, Signal):
+        return Lift(x)
+    return AConst(float(x))
 
 
 def _safe_div(a: float, b: float) -> float:
@@ -497,7 +509,16 @@ def _accumulate(kind: str, y: float, x: float, gain: float) -> float:
     if kind == ADDITIVE:
         return y + gain * x
     if kind == GAIN:
-        # push in log space: gain=1 → y*=x, gain=0 → no effect
+        # push in log space: gain=1 → y*=x, gain=0 → no effect.  x**gain is only
+        # real for x >= 0, so a negative source (an un-offset oscillator, say) is
+        # a domain error on a GAIN target — say so instead of letting Python
+        # return a complex and failing obscurely two frames later.
+        if x < 0.0:
+            raise ValueError(
+                f"a '{GAIN}' target needs a non-negative source (a gain/scale), "
+                f"got {x}; offset the modulator (e.g. 0.5 + 0.5*sine) or use "
+                f"'{ADDITIVE}'/'{BIPOLAR}'"
+            )
         return y * (x ** gain)
     if kind == BIPOLAR:
         return _clamp01((y - 0.5) + gain * (x - 0.5) + 0.5)
@@ -517,6 +538,26 @@ class Binding:
     source: AxSignal
     mode: str = "mod"
     gain: float = 1.0
+
+    def __post_init__(self) -> None:
+        # Coerce through as_ax so a plain number or a legacy Signal binds
+        # directly (`mod(sine, 0.3)`) without a manual Lift.
+        self.source = as_ax(self.source)
+        self.mode = str(self.mode)
+        self.gain = float(self.gain)
+        if self.mode not in ("pin", "mod"):
+            raise ValueError(
+                f"unknown binding mode {self.mode!r} (expected 'pin' or 'mod')")
+
+
+def mod(source, gain: float = 1.0) -> Binding:
+    """A ``mod`` edge — accumulate toward the target's neutral element."""
+    return Binding(source, "mod", gain)
+
+
+def pin(source, gain: float = 1.0) -> Binding:
+    """A ``pin`` edge — replace (last-write-wins); ``gain`` blends."""
+    return Binding(source, "pin", gain)
 
 
 class Target(AxSignal):
@@ -561,10 +602,189 @@ def combine(kind: str, bindings: Sequence[Binding],
     return Target(kind, bindings, base)
 
 
+# ---------------------------------------------------------------------------
+# The bridge back down: an axis node at a scene value-site
+# ---------------------------------------------------------------------------
+#
+# `Lift` takes a clock-parameterized Signal *up* into the axis layer.  `Lower`
+# is its inverse, and it is what actually routes E5's influence model into
+# authoring: every loom scene value-site (Sphere.radius, Isosurface.iso, a
+# material colour, a camera position, …) consumes a `Signal`/`VecSignal`, so a
+# `Target` — the pin/mod combine node — only reaches a scene variable through
+# here.  `as_signal` / `VecSignal.of` call these automatically, so an AxSignal
+# can be handed to any of those sites directly.
+#
+# A scene value-site has exactly ONE axis in scope: the clock.  The scope check
+# ("a node's free variables must be a subset of the axes in scope here") is
+# therefore enforced at CONSTRUCTION, naming the unbound axes, instead of
+# failing deep inside a render.  `bind=` pins any other axis to a coordinate.
+
+
+def _bind_map(bind) -> Dict[str, Signal]:
+    if not bind:
+        return {}
+    return {str(k): as_signal(v) for k, v in dict(bind).items()}
+
+
+def _site_point(clock: Clock, cache: Optional[Cache], clock_axis: str,
+                bind: Mapping[str, Signal]) -> Dict[str, float]:
+    """The evaluation point a value-site offers: the clock axis, plus binds."""
+    pt: Dict[str, float] = {clock_axis: float(clock.t)}
+    for name, sig in bind.items():
+        pt[name] = sig.at(clock, cache)
+    return pt
+
+
+def _scope_check(node: AxSignal, clock_axis: str, bind: Mapping[str, Signal],
+                 what: str) -> None:
+    free = node.axes - {clock_axis} - set(bind)
+    if free:
+        raise ValueError(
+            f"{what}: this value-site only has axis '{clock_axis}' in scope, but "
+            f"the node depends on {sorted(node.axes)}; {sorted(free)} "
+            f"is/are unbound. Pin them with bind={{'{sorted(free)[0]}': <coord "
+            f"or Signal>}}, or reduce over them first."
+        )
+
+
+def _probe(node: AxSignal, clock_axis: str, bind: Mapping[str, Signal],
+           what: str, *, strict: bool = True):
+    """Evaluate ``node`` once at ``t = 0`` to learn whether it is scalar- or
+    vector-valued (and how wide).  ``strict=False`` swallows a failing probe and
+    returns ``None``, letting the caller fall back to the scalar form."""
+    try:
+        return node._eval(_site_point(Clock(t=0.0), None, clock_axis, bind))
+    except Exception as e:
+        if not strict:
+            return None
+        raise ValueError(
+            f"{what} could not probe {type(node).__name__} at t=0 ({e}); "
+            f"pass dim=<n>"
+        ) from e
+
+
+class Lower(Signal):
+    """Bind an :class:`AxSignal` back down to a clock-parameterized
+    :class:`~loom.signals.core.Signal` — the inverse of :class:`Lift`.
+
+    This is the bridge that lets **any loom scene value-site** be driven by the
+    axis layer, and in particular by a :class:`Target`, so E5's ``pin``/``mod``
+    combine model reaches scene variables.  :func:`~loom.signals.core.as_signal`
+    applies it automatically, so ``Sphere(radius=combine(GAIN, [mod(sine)]))``
+    just works.
+
+    ``clock_axis`` (default ``'t'``) is fed ``clock.t``.  Every *other* axis the
+    node reads must be pinned in ``bind`` — to a constant (``bind={'s': 0.25}``,
+    read one arclength of a spatial curve) or to another ``Signal``
+    (``bind={'s': ramp}``, sweep along it over the loop).  An unbound axis is a
+    **construction-time** error naming it.
+    """
+
+    def __init__(self, node: AxSignal, *, clock_axis: str = AXIS_T,
+                 bind: Optional[Mapping[str, object]] = None) -> None:
+        super().__init__()
+        if not isinstance(node, AxSignal):
+            raise TypeError("Lower needs an AxSignal")
+        self.node = node
+        self.clock_axis = str(clock_axis)
+        self.bind = _bind_map(bind)
+        _scope_check(node, self.clock_axis, self.bind, "Lower")
+
+    def children(self):
+        return (self.node, *self.bind.values())
+
+    def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
+        v = self.node._eval(
+            _site_point(clock, cache, self.clock_axis, self.bind))
+        if isinstance(v, (tuple, list)):
+            raise ValueError(
+                f"Lower got a {len(v)}-vector from {type(self.node).__name__}; "
+                f"use LowerVec for a vector value-site, or .comp(i) to pick one "
+                f"component"
+            )
+        return float(v)
+
+
+class LowerVec(VecSignal):
+    """Vector form of :class:`Lower`: a vector-valued :class:`AxSignal` (a
+    :class:`CurveSample` over a position curve, say) at a vector value-site.
+
+    Evaluates the axis graph **once** per frame and returns the whole tuple; the
+    per-component :class:`Lower` nodes still exist so the graph walk / cycle
+    detector and the ordinary ``VecSignal`` math see a normal vector node.
+    ``dim`` is probed by evaluating at ``t = 0`` when not given.
+    """
+
+    def __init__(self, node: AxSignal, *, dim: Optional[int] = None,
+                 clock_axis: str = AXIS_T,
+                 bind: Optional[Mapping[str, object]] = None) -> None:
+        if not isinstance(node, AxSignal):
+            raise TypeError("LowerVec needs an AxSignal")
+        self.node = node
+        self.clock_axis = str(clock_axis)
+        self.bind = _bind_map(bind)
+        _scope_check(node, self.clock_axis, self.bind, "LowerVec")
+        if dim is None:
+            v = _probe(node, self.clock_axis, self.bind, "LowerVec")
+            if not isinstance(v, (tuple, list)):
+                raise ValueError(
+                    f"LowerVec needs a vector-valued node; "
+                    f"{type(node).__name__} produced the scalar {v!r} — use "
+                    f"Lower for a scalar value-site"
+                )
+            dim = len(v)
+        dim = int(dim)
+        if dim < 1:
+            raise ValueError("LowerVec needs dim >= 1")
+        super().__init__([
+            Lower(node.comp(i), clock_axis=clock_axis, bind=bind)
+            for i in range(dim)
+        ])
+
+    def at(self, clock: Clock, cache: Optional[Cache] = None):
+        if cache is not None:
+            hit = cache.get(self._id, clock.frame)
+            if hit is not None:
+                return hit
+        v = self.node._eval(
+            _site_point(clock, cache, self.clock_axis, self.bind))
+        if not isinstance(v, (tuple, list)) or len(v) != self.dim:
+            raise ValueError(
+                f"LowerVec expected a {self.dim}-vector from "
+                f"{type(self.node).__name__}, got {v!r}"
+            )
+        out = tuple(float(x) for x in v)
+        for x in out:
+            if not math.isfinite(x):
+                raise ValueError("LowerVec produced a non-finite value")
+        if cache is not None:
+            cache.set(self._id, clock.frame, out)
+        return out
+
+
+def lower(node: AxSignal, *, dim: Optional[int] = None,
+          clock_axis: str = AXIS_T,
+          bind: Optional[Mapping[str, object]] = None):
+    """Bind ``node`` to a value-site, picking :class:`Lower` or
+    :class:`LowerVec` by whether it evaluates to a scalar or a vector.
+
+    Pass ``dim=`` to force the vector form without the probe.
+    """
+    if dim is not None:
+        return LowerVec(node, dim=dim, clock_axis=clock_axis, bind=bind)
+    binds = _bind_map(bind)
+    _scope_check(node, str(clock_axis), binds, "lower")
+    v = _probe(node, str(clock_axis), binds, "lower", strict=False)
+    if isinstance(v, (tuple, list)):
+        return LowerVec(node, dim=len(v), clock_axis=clock_axis, bind=bind)
+    return Lower(node, clock_axis=clock_axis, bind=bind)
+
+
 __all__ = [
     "AxSignal", "Ax", "AConst", "Lift", "AFn", "Sample", "select", "Reduce",
     "CurveSample", "RecordSample", "sample",
-    "Binding", "Target", "combine", "as_ax",
+    "Binding", "Target", "combine", "mod", "pin", "as_ax",
+    "Lower", "LowerVec", "lower",
     "ADDITIVE", "GAIN", "BIPOLAR",
     "AXIS_T", "AXIS_S", "AXIS_U", "AXIS_V", "Point",
 ]

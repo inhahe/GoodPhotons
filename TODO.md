@@ -1453,8 +1453,39 @@ nodes thread the loom curve/record into the axis-layer `walk` (like `Lift`), so 
 stays catchable. 9 new tests (`tests/test_axes.py`, 30 total; static-broadcast vs genuine-`{s,t}`, component
 pick, custom clock axis, record scalar/vector, dispatch, `Reduce`-over-`s` compose, walk reaches control
 points). 1023 loom green.
-**Still open (follow-ups):** the on-disk `.ftsl` projection of axis annotations; and routing scene value-sites
-(E2's scene variables) through `Target`. These are additive on top of the `loom.axes` core.
+**FOLLOW-UP 2 DONE 2026-07-26 (`loom.axes` + the coercion path).** *Routing scene value-sites through
+`Target`* — the piece that turns E5 from a self-contained algebra into loom's actual authoring model.
+- **`Lower` / `LowerVec` — the exact inverse of `Lift`.** Every loom scene value-site (`Sphere.radius`,
+  `Isosurface.iso`, a material colour, a camera position, …) consumes a clock-parameterized
+  `Signal`/`VecSignal`, so a `Target` only reaches a scene variable through a node that binds an `AxSignal`
+  back down. The site's clock axis (default `'t'`) is fed `clock.t`; every **other** axis the node reads must
+  be pinned via `bind={'s': <coord or Signal>}` — a constant reads *one* arclength of a spatial curve, a
+  `Signal` **sweeps** along it over the loop. `lower(node)` picks the scalar vs vector form by probing at
+  `t=0` (or pass `dim=`). `LowerVec` evaluates the axis graph **once** per frame and caches the whole tuple,
+  while still exposing per-component `Lower` children so `walk`/`detect_signal_cycle`/`VecSignal` math see an
+  ordinary vector node.
+- **Records-5a's scope rule is enforced at CONSTRUCTION.** "A node's free variables ⊆ the axes in scope at
+  this site" — a scene value-site has exactly one axis in scope (the clock), so an unbound axis raises
+  immediately, *naming* it and suggesting `bind=`, instead of failing deep inside a render.
+- **One memoised hook, not N constructor changes.** `signals.core.lower_axsignal(x)` is the single coercion
+  point, consumed by `as_signal`, `VecSignal.of`, `ftsl_emit.site_node` (→ `num`/`vecn`/`value_token`) and
+  `Element.roots()`. No element constructor changed and *every* value-site accepts an axis node uniformly.
+  The memoisation (`x._site_node`) is **required, not cosmetic**: node identity is the per-frame `Cache` key
+  **and** `roots()` must hand the cycle detector the very node emission will evaluate — lowering twice would
+  silently defeat both.
+- **Sugar + a latent bug.** `mod(src, gain)` / `pin(src, gain)` build `Binding`s; `Binding` now coerces its
+  source through `as_ax`, which also `Lift`s a legacy `Signal` (so `mod(0.6 + 0.4*Sine())` just works); an
+  unknown edge mode is rejected at construction. Found and fixed a pre-existing bug in `_accumulate`: a
+  `GAIN` target with a **negative** source computes `x ** gain`, which Python evaluates to a *complex* number
+  that then blew up in `float()` far from the cause — it now raises a domain error naming the fix.
+25 new tests (`tests/test_axes.py`, 55 total; mod/pin sugar, binding coercion + bad mode, `as_ax` lift, the
+GAIN domain error, `Lower` against the clock, the construction-time unbound-axis error, `bind=` to a constant
+and to a `Signal`, `LowerVec` dim probe / scalar-node / dim-mismatch / per-frame cache / component identity,
+`lower()` dispatch, curve sweep, `as_signal` + `VecSignal.of` coercion both ways, site-node memoisation, and an
+end-to-end `Target`→`Sphere.radius` + swept `CurveSample`→`Sphere.center` round-trip through `emit`).
+1120 loom green.
+**Still open (follow-up):** the on-disk `.ftsl` projection of axis annotations. Additive on top of the
+`loom.axes` core.
 
 ### E6 — Quick mesh viewer: open a bare mesh in a ready-lit scene  ✅ DONE 2026-07-21  *(ftrace; user-proposed 2026-07-19)*
 **Shipped.** A bare positional mesh path — `ftrace model.glb` (also `.obj`/`.gltf`/`.fbx`/`.stl`/`.ply`) —

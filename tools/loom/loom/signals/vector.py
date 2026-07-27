@@ -16,7 +16,8 @@ from __future__ import annotations
 import math
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
-from .core import Signal, Clock, Cache, Const, as_signal, alloc_id, Number
+from .core import (Signal, Clock, Cache, Const, as_signal, lower_axsignal,
+                   alloc_id, Number)
 
 Vecish = Union["VecSignal", Sequence[Union[Signal, Number]]]
 
@@ -55,7 +56,17 @@ class VecSignal:
     # ---- construction helpers ----------------------------------------------
     @classmethod
     def of(cls, v: Vecish) -> "VecSignal":
-        return v if isinstance(v, VecSignal) else cls(list(v))
+        if isinstance(v, VecSignal):
+            return v
+        lowered = lower_axsignal(v)      # a vector-valued loom.axes node
+        if lowered is not None:
+            if not isinstance(lowered, VecSignal):
+                raise TypeError(
+                    "a vector value-site got a scalar axis node; wrap the "
+                    "components yourself, e.g. vec(a, b, c)"
+                )
+            return lowered
+        return cls(list(v))
 
     def __len__(self) -> int:
         return self.dim
