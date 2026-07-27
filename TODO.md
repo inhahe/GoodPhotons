@@ -2223,7 +2223,15 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
 
 ### L-HERO — hero-wavelength spectral sampling *(the genuine remaining work; re-scoped from L2; applies to ALL spectral modes)*
 
-- [ ] **Hero-wavelength Monte-Carlo across every spectral render mode.** Today ftrace carries **one** wavelength per
+- [x] **Hero-wavelength Monte-Carlo across every spectral render mode — DONE 2026-07-26 (through VERSION 0.70.0).**
+      Every render *mode* now carries the bundle on both backends: CPU `A`/`B`/`C`, `R`, `M`/`S`, `D` (BDPT) and
+      `U` (VCM/UPS), plus the GPU megakernel's forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D` and
+      VCM `U`. The only remaining single-λ code path is the GPU **wavefront scheduler** (`-wavefront`), which is
+      not a mode — `-heroc > 1` simply forces the megakernel there — and is left single-λ **by design** (see the
+      sub-item below; port the SoA pool only if the streaming backend ever needs the chroma win). Scenes with
+      participating media, a GRIN volume, or a finite-lens camera also stay single-λ everywhere, also by design.
+      Original scoping text follows.
+      Today ftrace carries **one** wavelength per
       path/photon **everywhere** — the forward light tracers (**A/B/C**, CPU + GPU), the backward tracer (**R**, CPU +
       GPU megakernel), and BDPT (**D**) all sample a single λ and splat `cieX/Y/Z(λ)·L`. README §"spectral" explicitly
       contrasts this single-λ scheme with PBRT-v4 / Mitsuba 3's 4-λ hero-wavelength. **Upgrade every mode it applies
@@ -2626,10 +2634,10 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           the full cross product {`abs_hero_delta`, `abs_hero_mats`, `abs_herosplit`} × {mode B, R, D} ×
           {`-heroc 1`, `-heroc 4`} on CPU (18), plus CPU mode M, mode S and `-herosplit`, plus GPU modes B/R/D at
           `-heroc 4` (6). Renders in `png/heroRefac/`.
-    - [x] **Docs + version — DONE (rolling, through 0.59.0).** README's spectral bullet, the "what ftrace is
+    - [x] **Docs + version — DONE (rolling, through 0.70.0).** README's spectral bullet, the "what ftrace is
           actually good at" §, the renderer-comparison table and the `-heroc <N>` flag row all state the current
-          coverage (CPU `A/B/C`, `R`, `M/S`; GPU megakernel `A/B/C`, `M`-deposit, `R`) and the exclusions
-          (GPU wavefront, BDPT `D`, VCM `U`, and any scene with media / GRIN / a finite-lens camera). The
+          coverage (CPU `A/B/C`, `R`, `M/S`, `D`, `U`; GPU megakernel `A/B/C`, `M`-deposit, `R`, `D`, `U`) and
+          the exclusions (the GPU wavefront scheduler, and any scene with media / GRIN / a finite-lens camera). The
           deliberate secondary-drop is documented everywhere as the de-hero policy (dispersive or
           wavelength-switching interface → secondaries terminated, hero boosted ×C — Wilkie et al. 2014 /
           PBRT-v4 `TerminateSecondary`). VERSION took a minor bump per landing (…→0.59.0 for GPU mode R).
