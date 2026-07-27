@@ -1714,7 +1714,8 @@ or a native-primitive wrap — see below). Two authoring forms:
   `(u,v)` the natural coordinates. The call is required: an *unsaturated* array is a load
   error, as is a ragged one or a wrong coordinate count. Each literal desugars to an
   anonymous `grid` + `pattern`, so it works in **every slot that accepts `pattern:<name>`**
-  and interpolates N-linearly exactly like a grid. Worked example
+  and interpolates N-linearly exactly like a grid — including the `reflect` slot, where
+  `reflect [0 1](u)` is a greyscale albedo ramp (see below). Worked example
   `scenes/pattern_array.ftsl`; reach for a named `grid`/`scatter` when the data is big,
   shared, or worth naming.
 - **Named generator** — `type <gen>` plus params (mirrors material syntax):
@@ -1739,6 +1740,19 @@ paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT
 (mode `D`) now runs pattern-driven diffuse albedo / glossy reflect & roughness, thin-film
 maps, mix `weight_map` masks, colored glass, and frosted (rough) glass on-device too
 (per-hit point threaded through its MIS kernel).)*
+
+**Pattern-driven reflectance.** The `reflect` slot takes a pattern as well, and a scalar in
+a *spectral* slot is a per-hit **multiplier** on whatever the slot otherwise holds. Two
+spellings, one mechanism: `reflect pattern:<name>` (or `reflect [0 1](u)`) leaves the
+pattern alone in the slot, so the base spectrum is a flat 1.0 and the albedo is the
+pattern's own value — a **greyscale reflectance**; `reflect_map pattern:<name>` written
+beside a spectrum or a `reflect texture:<name>` **modulates that** instead. So colour always
+comes from the spectrum or texture and variation from the pattern — a scalar can't invent a
+hue — and the multiplier is clamped to [0,1] so a formula can't manufacture energy. Works
+on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy` and `grating`; on the families
+that read their reflect spectrum directly (`fluorescent`, `thinfilm`, `dielectric`) the
+loader **rejects** it rather than ignore it silently. Same code path on CPU and GPU. Worked
+example `scenes/reflect_pattern.ftsl`. (`transmit` and `emit` don't take a pattern yet.)
 
 **UV on native primitives.** The `u v` pattern variables aren't limited to meshes.
 A native `sphere {}` carries built-in equirectangular (lat/long) UVs, a `quad {}`

@@ -1615,6 +1615,65 @@ private:
         return true;
     }
 
+    // The `reflect` slot, pattern-aware — the spectrum-slot half of §4's procedural
+    // drives. Two spellings, one runtime field (`Material::reflectPat`, a per-hit scalar
+    // multiplier on whatever the slot otherwise evaluates to):
+    //
+    //   reflect pattern:p                       greyscale albedo p(hit)  — the pattern is
+    //   reflect [0 1](u)                        ALONE in the slot, so the base spectrum
+    //                                           becomes a flat 1.0 and the multiply IS
+    //                                           the answer. (An inline array literal
+    //                                           desugars to the `pattern:` form, which is
+    //                                           what makes `reflect [0 1](u)` work.)
+    //   reflect rgb .8 .2 .2                    that tint, modulated per hit — colour from
+    //   reflect_map pattern:p                   the spectrum, variation from the pattern.
+    //   reflect texture:t / reflect_map p       likewise for an image albedo.
+    //
+    // Returning the base spectrum (rather than assigning) keeps every material type's own
+    // default intact; call it wherever `spectrumParam(b, "reflect", …)` used to be called.
+    // `m.type` must already be set — the honoured-family check below reads it.
+    Spectrum reflectParam(const Block& b, Material& m, const Spectrum& dflt) {
+        bindScalarPattern(b, "reflect_map", m.reflectPat);
+        Spectrum base;
+        const Stmt* s = find(b, "reflect");
+        if (s && !s->val.words.empty() && s->val.words[0].rfind("pattern:", 0) == 0) {
+            if (!bindScalarPattern(b, "reflect", m.reflectPat)) return dflt;  // unknown name: failed
+            base = constantSpectrum(1.0);
+        } else {
+            base = spectrumParam(b, "reflect", dflt);
+        }
+        return base;
+    }
+
+    // Which material families route their reflect slot through diffuseReflectance() /
+    // reflectSlot(), the only two accessors that apply reflectPat. Anything else reads
+    // `m.reflect` directly (Fluorescent's fluoroWeights, for instance, which has no hit
+    // to evaluate a pattern at), so a pattern there would be silently dropped — and the
+    // flat-1.0 base that a lone `reflect pattern:` leaves behind would then render as
+    // albedo 1.0, a WRONG image rather than a missing effect. Hence the loader refuses it.
+    static bool reflectPatHonoured(MatType t) {
+        return t == MatType::Diffuse   || t == MatType::DiffuseTransmit ||
+               t == MatType::Mirror    || t == MatType::HalfMirror      ||
+               t == MatType::Glossy    || t == MatType::Grating;
+    }
+
+    // Refuse a reflect pattern on a family that would not apply it. Run from the COMMON
+    // tail of buildMaterial (not from reflectParam) so it also catches the types that
+    // never read `reflect` at all — otherwise `reflect_map` on, say, a thinfilm would be
+    // dropped in silence, which reads as "it worked".
+    void checkReflectPatSupported(const Block& b, Material& m) {
+        if (reflectPatHonoured(m.type)) return;
+        const Stmt* rs = find(b, "reflect");
+        const bool patInReflect = rs && !rs->val.words.empty() &&
+                                  rs->val.words[0].rfind("pattern:", 0) == 0;
+        if (!patInReflect && !find(b, "reflect_map")) return;
+        fail("a reflect pattern is not supported on this material type — only the "
+             "families whose reflect slot goes through the shared per-hit accessors "
+             "(diffuse, translucent, mirror, halfmirror, glossy, grating) apply one; "
+             "elsewhere it would be silently ignored");
+        m.reflectPat = -1;
+    }
+
     // If `<key>`'s value is `texture:<name>`, bind that texture's grayscale value to a
     // NON-albedo scalar material parameter (spec §9.4) and return true; otherwise
     // false (the caller reads a numeric value instead). Used for roughness /
@@ -2487,26 +2546,29 @@ private:
             if (find(b, "film_thickness")) m.filmThickness = dblParam(b, "film_thickness", m.filmThickness);
             if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
                 bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
-            if (find(b, "reflect"))        m.reflect       = spectrumParam(b, "reflect", m.reflect);
+            if (find(b, "reflect") || find(b, "reflect_map"))
+                m.reflect = reflectParam(b, m, m.reflect);
             if (find(b, "ior"))            m.ior           = spectrumParam(b, "ior", m.ior);
+            checkReflectPatSupported(b, m);
             return m;
         }
         std::string type = strOf(b, "type", "diffuse");
         if (type == "diffuse") {
             m.type = MatType::Diffuse;
             // `reflect texture:<name>` binds a spatially-varying albedo; otherwise a
-            // uniform reflectance spectrum. A bound texture leaves m.reflect as the
-            // fallback used where UVs are unavailable (e.g. the CUDA bake path).
-            if (bindReflectTexture(b, m)) m.reflect = constantSpectrum(0.75);
-            else                          m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.75));
+            // uniform reflectance spectrum (or a pattern — see reflectParam). A bound
+            // texture leaves m.reflect as the fallback used where UVs are unavailable
+            // (e.g. the CUDA bake path); `reflect_map` still modulates it.
+            if (bindReflectTexture(b, m)) { bindScalarPattern(b, "reflect_map", m.reflectPat); m.reflect = constantSpectrum(0.75); }
+            else                          m.reflect = reflectParam(b, m, constantSpectrum(0.75));
         } else if (type == "translucent" || type == "diffuse_transmit") {
             // Two-lobe Lambertian: `reflect` (front-hemisphere diffuse albedo) +
             // `transmit` (back-hemisphere diffuse albedo). Both non-specular, so a
             // directly-viewed solid is visible in mode B. reflect+transmit is clamped
             // to <= 1 per wavelength at render time (the remainder is absorbed).
             m.type = MatType::DiffuseTransmit;
-            if (bindReflectTexture(b, m)) m.reflect = constantSpectrum(0.5);
-            else                          m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.4));
+            if (bindReflectTexture(b, m)) { bindScalarPattern(b, "reflect_map", m.reflectPat); m.reflect = constantSpectrum(0.5); }
+            else                          m.reflect = reflectParam(b, m, constantSpectrum(0.4));
             m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.4));
         } else if (type == "dielectric") {
             m.type = MatType::Dielectric;
@@ -2526,10 +2588,10 @@ private:
             m.absorb = spectrumParam(b, "absorb", constantSpectrum(0.0));
         } else if (type == "mirror") {
             m.type = MatType::Mirror;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.95));
+            m.reflect = reflectParam(b, m, constantSpectrum(0.95));
         } else if (type == "halfmirror") {
             m.type = MatType::HalfMirror;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.5));
+            m.reflect = reflectParam(b, m, constantSpectrum(0.5));
         } else if (type == "filter") {
             // Colored gel / Wratten filter: a thin non-scattering absorber. A photon
             // passes straight through, surviving with probability `transmit`(lambda) —
@@ -2541,7 +2603,7 @@ private:
             m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.5));
         } else if (type == "glossy") {
             m.type = MatType::Glossy;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));
+            m.reflect = reflectParam(b, m, constantSpectrum(0.9));
             // `roughness pattern:<name>` (§4) / `texture:<name>` binds a per-hit
             // roughness map (grayscale = roughness directly, both 0..1); else a constant.
             if (bindScalarPattern(b, "roughness", m.roughnessPat)) m.roughness = 0.2;
@@ -2563,13 +2625,13 @@ private:
             m.substrateK = spectrumParam(b, "substrate_k", constantSpectrum(0.0));
         } else if (type == "grating") {
             m.type = MatType::Grating;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));
+            m.reflect = reflectParam(b, m, constantSpectrum(0.9));
             m.grooveSpacing = dblParam(b, "groove_spacing", 1000.0);
             Vec3 gd{0, 1, 0}; vec3Of(b, "groove_dir", gd); m.grooveDir = gd;
             m.gratingMaxOrder = (int)dblParam(b, "max_order", 3);
         } else if (type == "fluorescent") {
             m.type = MatType::Fluorescent;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.1));
+            m.reflect = reflectParam(b, m, constantSpectrum(0.1));
             m.fluoAbsorb = spectrumParam(b, "absorb", shortPass(490.0, 0.15, 1.0));
             m.fluoEmit = spectrumParam(b, "emit", gaussianBand(560.0, 25.0, 1.0));
             m.fluoYield = dblParam(b, "yield", 1.0);
@@ -2628,6 +2690,7 @@ private:
         } else {
             fail("unknown material type '" + type + "'");
         }
+        checkReflectPatSupported(b, m);
         // Nested-dielectric priority (§ nested dielectrics): `priority <N>` — integer,
         // higher wins where dielectric solids overlap. Common to every material type
         // (only consulted for dielectric-like ones); unset => the ahead-of-time audit

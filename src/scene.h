@@ -97,6 +97,16 @@ struct Material {
     int roughnessPat = -1;
     int filmThicknessPat = -1;
     int mixWeightPat = -1;   // drives child-0 selection prob of a 2-child Mix (see mixResolveChild)
+    // Procedural drive on the REFLECT slot: a per-hit MULTIPLIER on whatever the slot
+    // otherwise evaluates to (a driven record, a bound reflectTex, or the constant
+    // `reflect` spectrum), clamped to [0,1]. -1 = unmodulated. Two spellings collapse
+    // here: `reflect pattern:<name>` (also what an inline literal `reflect [0 1](u)`
+    // desugars to) puts the pattern in the slot ALONE, so the base is a flat 1.0 and the
+    // albedo is greyscale straight from the pattern; `reflect_map pattern:<name>` written
+    // beside a spectrum or texture modulates THAT, which is how a pattern gets a tint.
+    // Because it is a scalar multiplier it is wavelength-flat by construction — colour
+    // still comes from the spectrum/texture, never from the pattern.
+    int reflectPat = -1;
 
     // --- Parametric-record drive (§records) ---------------------------------
     // A material's slots can be driven by parametric records (Scene::records). Each
@@ -1406,32 +1416,46 @@ inline bool recordReflectBound(const Scene& scene, const Material& m,
     return true;
 }
 
+// Per-hit multiplier from a bound `reflectPat` (`reflect pattern:<n>` / `reflect_map`),
+// clamped to [0,1] so a runaway formula can never manufacture energy. 1.0 when unbound,
+// which is why both reflect accessors can apply it unconditionally.
+inline double reflectPatMul(const Scene& scene, const Material& m, const Hit& h) {
+    if (m.reflectPat < 0 || m.reflectPat >= (int)scene.patterns.size()) return 1.0;
+    double p = scene.patterns[m.reflectPat].eval(patCtxFromHit(scene, h));
+    return p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);
+}
+
 // Reflect-slot reflectance for the SPECULAR families (Mirror / Glossy / Grating /
 // HalfMirror) whose tint reads the reflect slot directly: a bound record if present,
-// else the constant `reflect` spectrum. (These types never bind a reflect texture,
-// so — unlike diffuseReflectance — there is no texture path.)
+// else the constant `reflect` spectrum — either way scaled by a bound reflect pattern.
+// (These types never bind a reflect texture, so — unlike diffuseReflectance — there is
+// no texture path.)
 inline double reflectSlot(const Scene& scene, const Material& m,
                           const Hit& h, double lambda) {
     double v;
-    if (recordReflectBound(scene, m, h, lambda, v)) return v;
-    return m.reflect(lambda);
+    if (!recordReflectBound(scene, m, h, lambda, v)) v = m.reflect(lambda);
+    return m.reflectPat < 0 ? v : v * reflectPatMul(scene, m, h);
 }
 
 // Diffuse albedo at a hit: a bound parametric record (highest priority), else the
 // material's spatially-varying texture reflectance if one is bound (Phase 3b), else
-// its constant `reflect` spectrum. Shared by the forward tracer and the backward
-// reference so both see identical albedo.
+// its constant `reflect` spectrum — and then scaled by a bound reflect pattern, which
+// is what makes `reflect [0 1](u)` a greyscale ramp (its base spectrum is a flat 1.0).
+// Shared by the forward tracer and the backward reference so both see identical albedo.
 inline double diffuseReflectance(const Scene& scene, const Material& m,
                                  const Hit& h, double lambda) {
     double rv;
-    if (recordReflectBound(scene, m, h, lambda, rv)) return rv;
-    if (m.reflectTex >= 0 && m.reflectTex < (int)scene.textures.size()) {
-        const Texture& tx = scene.textures[m.reflectTex];
-        if (m.triplanarScale > 0.0)
-            return tx.reflectanceTriplanar(h.p, h.ng, m.triplanarScale, lambda);
-        return tx.reflectanceAt(h.u, h.v, lambda);
+    if (!recordReflectBound(scene, m, h, lambda, rv)) {
+        if (m.reflectTex >= 0 && m.reflectTex < (int)scene.textures.size()) {
+            const Texture& tx = scene.textures[m.reflectTex];
+            rv = (m.triplanarScale > 0.0)
+                     ? tx.reflectanceTriplanar(h.p, h.ng, m.triplanarScale, lambda)
+                     : tx.reflectanceAt(h.u, h.v, lambda);
+        } else {
+            rv = m.reflect(lambda);
+        }
     }
-    return m.reflect(lambda);
+    return m.reflectPat < 0 ? rv : rv * reflectPatMul(scene, m, h);
 }
 
 // Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern

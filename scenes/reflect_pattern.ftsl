@@ -1,0 +1,75 @@
+# PATTERN-DRIVEN REFLECTANCE (§4 procedural drives, spectrum-slot half)
+#
+# Until now a `pattern` could drive only the SCALAR material slots (`roughness`,
+# `film_thickness_map`, a mix's `weight_map`). The `reflect` slot is spectral, so it
+# took a spectrum or a `texture:<name>` and nothing else — which meant the most
+# natural spelling of all, `reflect [0 1](u)`, was a load error.
+#
+# It now works, and one runtime field (`Material::reflectPat`) backs two spellings:
+#
+#   reflect pattern:<name>        The pattern is ALONE in the slot, so the base
+#   reflect [ … ](u)              spectrum is a flat 1.0 and the albedo is the
+#                                 pattern's own value — a GREYSCALE reflectance.
+#                                 (An inline array literal desugars to the
+#                                 `pattern:` form, so both are the same thing.)
+#
+#   reflect <spectrum|texture>    The pattern MULTIPLIES whatever the slot already
+#   reflect_map pattern:<name>    holds, per hit. Colour therefore always comes from
+#                                 the spectrum or texture and variation from the
+#                                 pattern — a scalar can't invent a hue.
+#
+# The multiplier is clamped to [0,1], so a runaway formula cannot manufacture energy.
+# Both spellings collapse to a multiply, which is why the lone-pattern case is just
+# the tinted case with the tint left at white.
+#
+# It applies to every family whose reflect slot goes through the two shared per-hit
+# accessors — diffuse, translucent, mirror, halfmirror, glossy, grating. Anything
+# else (fluorescent, thin-film, dielectric) reads its reflect spectrum directly and
+# would drop the pattern silently, so the loader REFUSES it there rather than render
+# a quietly wrong image.
+#
+# Strips, bottom to top:
+#   1  ramp   `reflect [0 1](u)`                     the lone-literal base case
+#   2  rings  `reflect pattern:p_rings`              a real formula, greyscale
+#   3  tint   `reflect rgb … ` + `reflect_map`       the same rings, in red
+#   4  gloss  glossy `reflect [0.15 1](u)`           a SPECULAR family, via reflectSlot
+#
+# Render:  ftrace -in scenes/reflect_pattern.ftsl -o png/reflect_pattern.png -spp 512 -window
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# Concentric rings about the strip's centre, in [0,1]. Nothing new — this is an
+# ordinary §4 pattern; the point is only that `reflect` can now read one.
+pattern "p_rings" { expr "0.5+0.5*cos(2*pi*6*sqrt((u-0.5)*(u-0.5)+(v-0.5)*(v-0.5)))" }
+
+material "wall" { type diffuse reflect whitewall 0.75 }
+
+material "m_ramp"  { type diffuse reflect [0 1](u) }
+material "m_rings" { type diffuse reflect pattern:p_rings }
+material "m_tint"  { type diffuse reflect rgb 0.90 0.22 0.12  reflect_map pattern:p_rings }
+material "m_gloss" { type glossy   reflect [0.15 1](u)  roughness 0.06 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material wall }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material wall }   # ceiling
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material wall }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material wall }   # right
+
+quad { origin 0 0.00 0   u 1 0 0   v 0 0.25 0   material m_ramp }
+quad { origin 0 0.25 0   u 1 0 0   v 0 0.25 0   material m_rings }
+quad { origin 0 0.50 0   u 1 0 0   v 0 0.25 0   material m_tint }
+quad { origin 0 0.75 0   u 1 0 0   v 0 0.25 0   material m_gloss }
+
+light area {
+    origin 0.2 0.999 0.2   u 0.6 0 0   v 0 0 0.6   normal 0 -1 0
+    spd    preset:bb6500
+    power  200
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.2   look_at 0.5 0.5 0.0   up 0 1 0   fov_y 40
+    mode R
+    film { res 512 512   iso 100   shutter 1   exposure 1 }
+}

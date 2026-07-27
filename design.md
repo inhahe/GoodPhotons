@@ -226,6 +226,28 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `dApplyNormalMap` in the device `closestHit`) so every renderer and both devices
   perturb shading identically; tangents transform with instances (`instanceHitToWorld`,
   the device uploading a per-instance `Wm` = toWorld linear).
+
+  **Pattern-driven reflectance (`Material::reflectPat`).** Patterns originally drove only
+  *scalar* slots (`roughness`, `film_thickness_map`, `weight_map`), because `reflect` is
+  spectral and a pattern is a scalar. The resolution is that a scalar in a spectral slot is
+  a per-hit **multiplier**, not a replacement — which is strictly more general than the
+  obvious "greyscale reflectance" reading and degenerates to it: `reflect pattern:<n>` (and
+  `reflect [0 1](u)`, which desugars to it) leaves the pattern alone in the slot, so the
+  loader stores a flat-1.0 base and the multiply *is* the albedo; `reflect_map pattern:<n>`
+  beside an authored spectrum or a bound `reflectTex` modulates that. Colour therefore
+  cannot come from a pattern by construction. The multiplier is clamped to [0,1] (no energy
+  from a formula). It is applied in exactly the two shared accessors that already funnel
+  every renderer's reflect read — `diffuseReflectance` and `reflectSlot` in `scene.h`, plus
+  device twins `dDiffuseRho` / `dReflectSlot` — so all six tracers and both backends pick it
+  up from one edit, and `renderBackwardRGBCuda`'s baked-RGB fast path opts out alongside the
+  existing `reflectTex` opt-out. The families whose reflect slot does *not* go through those
+  accessors (Fluorescent's `fluoroWeights`, which has no hit to evaluate at; ThinFilm;
+  Dielectric) are **rejected at load** rather than silently ignored, because the flat-1.0
+  base a lone `reflect pattern:` leaves behind would otherwise render as albedo 1.0 — a
+  wrong image rather than a missing effect. `transmit` is the obvious next slot but has no
+  shared accessor (`m.transmit(lambda)` is read at 14 sites across 7 renderer headers), so
+  it is gated on writing `transmitSlot()` first; tracked in `known-issues.md`.
+
   **N-D authored-data tables.** A pattern formula can sample arrays of authored numbers in
   1–4 dimensions, via two sibling datatypes ported from loom's `data.py`/`interp.py`:
   `grid:<name>(c0, …)` reads a **regular lattice** (`PatGrid`, samples in C order with axis 0

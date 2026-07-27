@@ -438,6 +438,9 @@ interpolates **N-linearly** just like a grid. The sugar is exact: `scenes/patter
 and a hand-written `grid` + `pattern` twin render bit-for-bit identically. Reach for a
 named `grid`/`scatter` instead when the data is big, shared, or worth naming.
 
+Because the desugared form is a `pattern:`, a literal reaches wherever a pattern reaches —
+including the **`reflect` slot** (§7.2), where `reflect [0 1](u)` is a greyscale albedo ramp.
+
 **Scope and loading (both datatypes).** Grids and scatters load before textures, patterns
 and records, so declaration order never matters — including inside a procedural
 `texture { rgb "…" }`, which may sample either. Scope matches `tex:`: both are available
@@ -493,11 +496,11 @@ Fills a complete material; a few knobs may be overridden afterward
 
 | type | key params (defaults) |
 |---|---|
-| `diffuse` | `reflect <spec>`(whitewall 0.75); `reflect texture:<n>` for a spatially-varying albedo |
+| `diffuse` | `reflect <spec>`(whitewall 0.75); `reflect texture:<n>` for a spatially-varying albedo; `reflect pattern:<n>` for a procedural greyscale one, `reflect_map` to modulate either |
 | `translucent` | `reflect <spec>`(0.4); `transmit <spec>`(0.4) — two-sided Lambertian (diffuse transmission / thin-SSS look). Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; light diffuses THROUGH the surface. `reflect texture:<n>` allowed. Alias: `diffuse_transmit`. `reflect`+`transmit` are energy-clamped to ≤1. |
 | `mirror` | `reflect <spec>`(0.95) |
 | `halfmirror` | `reflect <spec>`(0.5) |
-| `glossy` | `reflect <spec>`(0.9); `roughness <r>`(0.2) or `roughness pattern:/texture:<n>` |
+| `glossy` | `reflect <spec>`(0.9) or `reflect pattern:<n>`/`reflect_map`; `roughness <r>`(0.2) or `roughness pattern:/texture:<n>` |
 | `dielectric` | `ior <spec>`(BK7); `roughness`(0)/map; `absorb <spec>`(0) Beer-Lambert tint per metre |
 | `thinfilm` | `ior`(1.5); `film_ior`(1.30); `film_thickness <nm>`(300)/`film_thickness_map`; `substrate_k <spec>`(0) |
 | `grating` | `reflect`(0.9); `groove_spacing <nm>`(1000); `groove_dir <x y z>`(0,1,0); `max_order`(3) |
@@ -508,6 +511,31 @@ Fills a complete material; a few knobs may be overridden afterward
 
 Scalar-parameter maps: `roughness` / `film_thickness_map` / `weight_map` accept
 `pattern:<name>` (math over x,y,z,normal,u,v) or `texture:<name>` (grayscale UV map).
+
+**Pattern-driven reflectance.** The `reflect` slot takes a pattern too, and a scalar in a
+spectral slot is a per-hit **multiplier** on whatever the slot otherwise holds:
+
+```
+material "ramp"  { type diffuse reflect [0 1](u) }                     # greyscale ramp
+material "rings" { type diffuse reflect pattern:p_rings }              # the same, named
+material "tint"  { type diffuse reflect rgb 0.9 0.22 0.12             # colour from here…
+                                 reflect_map pattern:p_rings }         # …variation from here
+material "skin"  { type diffuse reflect texture:wood                   # an image albedo…
+                                 reflect_map pattern:wear }            # …weathered per hit
+```
+
+A pattern written *into* `reflect` is alone in the slot, so the base spectrum becomes a flat
+1.0 and the albedo is the pattern's own value — a greyscale reflectance, and the reason
+`reflect [0 1](u)` (§6.1) means what it looks like. `reflect_map` instead modulates an
+authored spectrum or texture. Because the pattern is a scalar it can only ever darken or
+brighten: **colour comes from the spectrum/texture, never from the pattern.** The multiplier
+is clamped to [0,1], so a runaway formula cannot manufacture energy.
+
+Supported on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy` and `grating` — the
+families whose reflect slot goes through the shared per-hit accessors. Elsewhere
+(`fluorescent`, `thinfilm`, `dielectric`, …) the reflect spectrum is read directly and a
+pattern would be dropped in silence, so the loader **refuses** it there instead. `transmit`
+and `emit` do not take a pattern yet. Worked example: `scenes/reflect_pattern.ftsl`.
 
 ### 7.3 `mix` — stochastic material blend
 

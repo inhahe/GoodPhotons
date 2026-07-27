@@ -112,7 +112,7 @@ already `__host__ __device__` and shared, so only the plumbing is missing), and 
 stub case with real ones that pop `ndim` coordinates. Then drop this entry and the "surface
 patterns only" caveat from FTSL.md.
 
-### TECH-DEBT — OPEN (2026-07-27): spectrum slots don't accept `pattern:<name>`, so `reflect [0 1](u)` is a load error
+### TECH-DEBT — FIXED for `reflect` (2026-07-27, 0.75.0); `transmit`/`emit` still open
 
 0.73.0 added inline array literals (`roughness [0 1](u)`, FTSL.md §6.1, example
 `scenes/pattern_array.ftsl`). They desugar to `pattern:__arrN` and therefore work at exactly
@@ -125,13 +125,33 @@ expression". That is a clear error rather than a wrong render, but it is the ver
 the feature was designed around, and the same gap blocks `reflect pattern:p` for a
 hand-written pattern.
 
-**Proper fix:** decide what a *scalar* pattern means in a spectrum slot — the obvious
-reading is a greyscale reflectance, i.e. the pattern's scalar times a flat spectrum, matching
-how `texture:` already greys out — and add that binding beside the existing
-spectrum/`texture:` cases in the material builder (`src/ftsl.h`, `spectrumOf` / the `reflect`
-and `transmit` paths). It should also be honoured by the GPU material upload, which already
-carries per-slot pattern ids for the scalar slots. Then extend `scenes/pattern_array.ftsl`
-with a `reflect [ … ](u)` strip and drop this entry.
+**FIXED for `reflect` in 0.75.0.** A scalar pattern in a spectrum slot is a per-hit
+**multiplier** on whatever the slot otherwise evaluates to (`Material::reflectPat` /
+`DMaterial::reflectPat`, clamped to [0,1]). Multiply is strictly more general than the
+"greyscale reflectance" reading and degenerates to it: `reflect pattern:p` leaves the
+pattern *alone* in the slot, so the base spectrum becomes a flat 1.0 and the albedo is
+`p(hit)` — greyscale — while `reflect rgb … ` + `reflect_map pattern:p` modulates a tint
+(or a bound `texture:`). Colour therefore always comes from the spectrum/texture, never
+from the scalar. Applied in the two shared accessors `diffuseReflectance` / `reflectSlot`
+(`scene.h`) and their device twins `dDiffuseRho` / `dReflectSlot`, so every renderer and
+both backends pick it up at once; the RGB-bake fast path opts out like it already does for
+`reflectTex`. Worked example: `scenes/reflect_pattern.ftsl`.
+
+Verified: `reflect [0 1](u)` and `reflect pattern:p` (with `expr "u"`) render
+**bit-identically**; the albedo read-out tracks `u` linearly; GPU-vs-CPU disagreement on
+the pattern scene (RMSE 6.83/255 at 200 spp) is *below* the no-pattern control (7.12), i.e.
+pure Monte Carlo noise.
+
+**Still open — `transmit` and `emit`.** Only the families whose reflect slot goes through
+those two accessors honour a pattern (diffuse, translucent, mirror, halfmirror, glossy,
+grating); the loader hard-*rejects* one elsewhere rather than dropping it silently, since a
+lone `reflect pattern:` leaves a flat-1.0 base that would otherwise render as albedo 1.0 —
+a wrong image, not a missing effect. Extending to `transmit` is a bigger job than it looks:
+`m.transmit(lambda)` is read **directly at 14 call sites across 7 renderer headers** with no
+shared accessor, so the prerequisite is a `transmitSlot(scene, m, h, lambda)` mirroring
+`reflectSlot` — worth doing on its own merits, and only then is the pattern binding a
+two-line change. `emit` is a separate pipeline again (emitter registration + power
+normalisation), so a pattern there needs its own design.
 
 ### BUILD BUG — FIXED (2026-07-26): editing a header did not rebuild the `.cu` files, and the linker could then keep a **stale copy of the function you just changed**
 

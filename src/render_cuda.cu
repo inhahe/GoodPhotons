@@ -316,10 +316,13 @@ struct DMaterial {
     // Procedural (math-driven) scalar drives (§4): index into DScene::patterns, or -1.
     // roughnessPat / filmThicknessPat override the constant/texture value at the hit;
     // mixWeightPat drives child-0 selection of a 2-child D_MIX. Device twins of
-    // Material::roughnessPat / filmThicknessPat / mixWeightPat.
+    // Material::roughnessPat / filmThicknessPat / mixWeightPat. reflectPat instead
+    // MULTIPLIES the reflect slot per hit (device twin of Material::reflectPat) — the
+    // greyscale-albedo half of `reflect pattern:<n>` / `reflect_map pattern:<n>`.
     int    roughnessPat;
     int    filmThicknessPat;
     int    mixWeightPat;
+    int    reflectPat;
     // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
     // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
     // twin of Material::priority.
@@ -3954,27 +3957,39 @@ __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
     return true;
 }
 
+// Per-hit multiplier from a bound reflectPat, clamped to [0,1] (device twin of host
+// reflectPatMul). 1 when unbound, so both reflect accessors apply it unconditionally.
+__device__ static Real dReflectPatMul(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (m.reflectPat < 0) return (Real)1;
+    return (Real)clamp01(dPatternScalarAt(sc, m.reflectPat, h));
+}
+
 // Reflect-slot reflectance for the SPECULAR families (mirror / glossy / grating /
-// halfmirror): a driven record if present, else the constant baked reflect spectrum
-// (device twin of host reflectSlot; these types never bind a reflect texture).
+// halfmirror): a driven record if present, else the constant baked reflect spectrum,
+// scaled by a bound reflect pattern (device twin of host reflectSlot; these types never
+// bind a reflect texture).
 __device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
     Real v;
-    if (dRecordReflect(sc, m, h, lambda, v)) return v;
-    return specLookup(m.reflect, lambda);
+    if (!dRecordReflect(sc, m, h, lambda, v)) v = specLookup(m.reflect, lambda);
+    return m.reflectPat < 0 ? v : v * dReflectPatMul(sc, m, h);
 }
 
 // Diffuse reflectance at a hit: a driven parametric record (highest priority), else a
-// bound texture, else the constant baked reflect spectrum (mirrors host diffuseReflectance).
+// bound texture, else the constant baked reflect spectrum — then scaled by a bound
+// reflect pattern (mirrors host diffuseReflectance).
 __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
     Real rv;
-    if (dRecordReflect(sc, m, h, lambda, rv)) return clamp01(rv);
-    if (m.reflectTex >= 0) {
-        const DTexture& tx = sc.textures[m.reflectTex];
-        if (m.triplanarScale > 0.0)
-            return clamp01(dTexReflTriplanar(tx, h.p, h.ng, m.triplanarScale, lambda));
-        return clamp01(dTexReflAt(tx, h.u, h.v, lambda));
+    if (!dRecordReflect(sc, m, h, lambda, rv)) {
+        if (m.reflectTex >= 0) {
+            const DTexture& tx = sc.textures[m.reflectTex];
+            rv = (m.triplanarScale > 0.0)
+                     ? dTexReflTriplanar(tx, h.p, h.ng, m.triplanarScale, lambda)
+                     : dTexReflAt(tx, h.u, h.v, lambda);
+        } else {
+            rv = specLookup(m.reflect, lambda);
+        }
     }
-    return clamp01(specLookup(m.reflect, lambda));
+    return clamp01(m.reflectPat < 0 ? rv : rv * dReflectPatMul(sc, m, h));
 }
 
 // Sample a Stokes-shifted emission wavelength lambda' ~ M for a fluorescent
@@ -9445,6 +9460,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.roughnessPat = m.roughnessPat;
         d.filmThicknessPat = m.filmThicknessPat;
         d.mixWeightPat = m.mixWeightPat;
+        d.reflectPat = m.reflectPat;
         // --- parametric-record REFLECT binding (§records stage 6a) ---
         // Device twin of recordReflectBound. A constant selStop binding bakes the stop's
         // colour straight into reflect[] (so the plain specLookup path is exact, no device
@@ -10497,6 +10513,7 @@ bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam) {
             default: return false;                                  // dispersion/thin-film/etc -> spectral
         }
         if (m.reflectTex >= 0) return false;                        // textured albedo not baked to RGB
+        if (m.reflectPat >= 0) return false;                        // pattern-modulated albedo, ditto
         if (m.recBindingFor(REC_SLOT_REFLECT)) return false;        // record-driven reflectance
     }
     if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;
