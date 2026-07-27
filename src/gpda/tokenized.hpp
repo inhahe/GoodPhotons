@@ -35,6 +35,57 @@ struct Token {
 };
 
 // ============================================================================
+// ParseError
+// ============================================================================
+
+// A syntax error with everything the caller needs to render a good diagnostic.
+//
+// A GPDA parse dies at a token position where the cursor set is empty, and at
+// that exact moment the engine *knows* the complete set of terminals that would
+// have been accepted (the expanded cursor set holds nothing but terminal nodes)
+// and the chain of rules it was in the middle of (the cursors' rule stacks).
+// Throwing that away and reporting only "unexpected X" wastes the one advantage
+// a chart-style parser has over a recursive-descent one, so it is captured here:
+//
+//   expected  — deduped terminal descriptions, in the graph's own link order
+//               (which is the grammar's ordered choice, so the most likely
+//               continuation tends to come first).  A MatchStr node contributes
+//               its literal in quotes ('{'), a MatchTok node its type (STRING).
+//   context   — enclosing rule names, innermost first, duplicates collapsed;
+//               the "while parsing a …" part of the message.
+//
+// `what()` is a one-line rendering of all of it; a caller that wants to format
+// its own (prefix the filename, print the offending source line with a caret,
+// translate rule names into user-facing nouns) has the fields.
+struct ParseError : std::runtime_error {
+    std::string  token_type;    // offending token's type  ("" if at end of input)
+    std::string  token_value;   // offending token's text  ("" if at end of input)
+    std::uint32_t line = 0;
+    std::uint32_t col  = 0;
+    std::size_t  pos   = 0;     // index into the token vector
+    bool         at_eof = false;
+    std::vector<std::string> expected;
+    std::vector<std::string> context;
+
+    explicit ParseError(const std::string& msg) : std::runtime_error(msg) {}
+};
+
+// Render "'{', '[' or STRING" — the tail of an expected-set message.  Kept
+// out-of-class so callers building their own diagnostics can reuse it.
+inline std::string join_expected(const std::vector<std::string>& e,
+                                 std::size_t max_items = 6) {
+    if (e.empty()) return std::string();
+    const std::size_t n = std::min(e.size(), max_items);
+    std::string s;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i) s += (i + 1 == n && n == e.size()) ? " or " : ", ";
+        s += e[i];
+    }
+    if (n < e.size()) s += ", ...";
+    return s;
+}
+
+// ============================================================================
 // Persistent list (same pattern as the scannerless version)
 // ============================================================================
 
@@ -190,7 +241,34 @@ struct Graph {
 struct ParseNode : gpda_pool::Refcounted<ParseNode> {
     std::string name;   // rule name (for rule matches) or token type (for terminals)
     std::string value;  // token value — set on terminal nodes only
+    // Source position, copied off the matched token.  Terminals only: a rule
+    // node's position is its first terminal descendant's, which the caller can
+    // find with first_pos() rather than have every rule node carry a
+    // redundant copy.  Any front-end built on this needs positions to report
+    // semantic errors ("line 12: unknown property"), so the engine keeps them
+    // instead of forcing callers to re-derive them from the token stream.
+    std::uint32_t line = 0;
+    std::uint32_t col  = 0;
     std::vector<gpda_pool::IntrusivePtr<ParseNode>> children;
+
+    // Line/col of this subtree's first terminal ({0,0} if it has none).
+    // Iterative for the same reason the destructor is: an LR-reconstructed
+    // spine is O(N) deep, so recursion here could blow the stack on a long
+    // expression.
+    std::pair<std::uint32_t, std::uint32_t> first_pos() const {
+        std::vector<const ParseNode*> stack{this};
+        while (!stack.empty()) {
+            const ParseNode* n = stack.back();
+            stack.pop_back();
+            if (n->children.empty()) {
+                if (n->line) return {n->line, n->col};
+                continue;
+            }
+            for (std::size_t i = n->children.size(); i-- > 0; )
+                stack.push_back(n->children[i].get());
+        }
+        return {0, 0};
+    }
 
     static void deallocate(ParseNode* p) noexcept {
         gpda_pool::Pool<ParseNode>::instance().destroy(p);
@@ -258,7 +336,8 @@ public:
     Graph graph;
     std::size_t max_depth = 200;
 
-    // Parse a token list.  Throws std::runtime_error on failure.
+    // Parse a token list.  Throws ParseError (a std::runtime_error) on failure,
+    // carrying the position, the expected-terminal set and the rule context.
     // Any 'EOF'-typed sentinel at the tail is ignored.
     ParseNodePtr parse(const std::vector<Token>& tokens);
 
@@ -336,6 +415,13 @@ private:
 
     bool token_matches(const Node& n, const Token& tok) const;
     std::vector<Cursor> dedup(const std::vector<Cursor>& cursors);
+
+    // Build the ParseError for a dead cursor set.  `expanded` is the fully
+    // epsilon-expanded set at the failure position (terminals only), so it is
+    // exactly the set of continuations the grammar would have accepted; `tok`
+    // is the offending token, or null when the input simply ran out.
+    ParseError make_error(const std::vector<Cursor>& expanded,
+                          const Token* tok, std::size_t pos) const;
 
     StateKey state_key(std::uint32_t node,
                        const PListPtr<StackEntry>& stack) const {

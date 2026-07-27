@@ -136,9 +136,11 @@ inline void reduce_brace_body(const PN* brace_body, ftsl::Block& b) {
         const PN* st = child(bi, "stmt");
         if (!st) continue;
         const PN* kt = child(st, "key_tok");
-        std::string key = leaf_of(kt)->value;      // key_tok is never a STRING
+        const PN* kleaf = leaf_of(kt);
+        std::string key = kleaf->value;            // key_tok is never a STRING
         ftsl::Stmt s;
         s.key = key;
+        s.line = (int)kleaf->line;                 // ftrace stamps the key's line
         b.words.push_back(key);
         const PN* vnode = child(st, "value");
         s.val = reduce_value(vnode, key);
@@ -171,13 +173,19 @@ inline ftsl::Block reduce_top_block(const PN* top_block) {
         if (const PN* st = child(alt, "subtype")) b.subtype = leaf_of(st)->value;
         ftsl::Stmt s;
         s.key = "=";
-        s.val = reduce_value(child(alt, "value"), "=");
+        const PN* sv = child(alt, "value");
+        s.line = (int)sv->first_pos().first;        // ftrace stamps the value's line
+        s.val = reduce_value(sv, "=");
         b.stmts.push_back(std::move(s));
     } else if (k == "record_decl") {                // WORD '=' 'range' range_word* record_body
         b.type = "record";
         b.name = children(alt, "WORD")[0]->value;   // first WORD is the binding NAME
         ftsl::Stmt dom;
         dom.key = "range";
+        {   // ftrace stamps the line of the first token AFTER `range`
+            auto rws = children(alt, "range_word");
+            dom.line = rws.empty() ? 0 : (int)leaf_of(rws[0])->line;
+        }
         for (const PN* rw : children(alt, "range_word")) {
             const PN* t = leaf_of(rw);
             dom.val.words.push_back(unquote(t->name, t->value));
@@ -188,7 +196,9 @@ inline ftsl::Block reduce_top_block(const PN* top_block) {
             const PN* rl = child(ri, "record_line"); // WORD stop_word*
             if (!rl) continue;
             ftsl::Stmt s;
-            s.key = child(rl, "WORD")->value;
+            const PN* chan = child(rl, "WORD");
+            s.key = chan->value;
+            s.line = (int)chan->line;
             for (const PN* sw : children(rl, "stop_word")) {
                 const PN* t = leaf_of(sw);
                 s.val.words.push_back(unquote(t->name, t->value));
@@ -252,6 +262,14 @@ inline void diff_block(const ftsl::Block& a, const ftsl::Block& b,
             const auto& sb = b.stmts[i];
             std::string w = where + ".stmt[" + std::to_string(i) + "]";
             if (sa.key != sb.key) d.add(w, "key '" + sa.key + "' != '" + sb.key + "'");
+            // Stmt::line matters even though nothing reads it yet: it is what a
+            // semantic error ("line 12: unknown property") will quote once the
+            // shared grammar IS the front-end, so the two parsers agreeing on
+            // it is part of the equivalence being proven here.
+            if (sa.line != sb.line) {
+                d.add(w, "line " + std::to_string(sa.line) +
+                      " != " + std::to_string(sb.line));
+            }
             diff_value(sa.val, sb.val, w, d);
         }
     }

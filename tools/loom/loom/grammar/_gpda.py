@@ -5,8 +5,8 @@ This is a pinned, verbatim copy of the GPDA tokenized graph parser, vendored
 into loom so its ``.ftsl`` parsing has no external dependency.
 
     Upstream : D:\\visual studio projects\\GraphParser  (gpda.py)
-    Commit   : 1ac4cbf9b0f50def4f0962156db247b96dc1ad69  (2026-04-14)
-    sha256   : c376d1658c660479…  (first 16 hex of the pinned gpda.py)
+    Commit   : 8c6b749  (2026-07-26)
+    sha256   : c865a4aeb14f1b3c…  (first 16 hex of the pinned gpda.py)
 
 The file is fully self-contained (only ``import re``).  To refresh, re-copy
 ``gpda.py`` from the upstream repo, re-apply this header, and bump the commit /
@@ -201,12 +201,35 @@ class Node:
 
 class ParseNode:
     """A node in the output parse tree."""
-    __slots__ = ('name', 'children', 'value')
+    __slots__ = ('name', 'children', 'value', 'line', 'col')
 
-    def __init__(self, name, children=None, value=None):
+    def __init__(self, name, children=None, value=None, line=0, col=0):
         self.name = name
         self.children = children or []
         self.value = value  # non-None only for terminal (leaf) nodes
+        # Source position, copied off the matched token.  Terminals only; a rule
+        # node's position is its first terminal descendant's, via first_pos().
+        # Any front-end built on this needs positions to report semantic errors
+        # ("line 12: unknown property"), so the engine keeps them instead of
+        # forcing callers to re-derive them from the token stream.
+        self.line = line
+        self.col = col
+
+    def first_pos(self):
+        """(line, col) of this subtree's first terminal, or (0, 0) if none.
+
+        Iterative: an LR-reconstructed spine is O(N) deep, so recursion here
+        could blow the stack on a long expression.
+        """
+        stack = [self]
+        while stack:
+            n = stack.pop()
+            if not n.children:
+                if n.line:
+                    return (n.line, n.col)
+                continue
+            stack.extend(reversed(n.children))
+        return (0, 0)
 
     def __repr__(self):
         if self.value is not None:
@@ -949,7 +972,8 @@ class GraphParser:
             next_cursors = []
             for term_node, stack, acc, caps in expanded:
                 if self._matches(term_node, token):
-                    new_acc = acc + [ParseNode(token.type, value=token.value)]
+                    new_acc = acc + [ParseNode(token.type, value=token.value,
+                                               line=token.line, col=token.col)]
                     for link in term_node.links:
                         next_cursors.append((link, stack, new_acc, caps))
 
@@ -964,10 +988,15 @@ class GraphParser:
         completions = self._find_completions(cursors, end_pos)
         if not completions:
             if real_tokens:
+                # Ran out of input mid-rule.  Re-expand at the end position to
+                # recover what would have let the parse continue — that is the
+                # useful half of an "unexpected end of input" message.
                 last = real_tokens[-1]
-                raise SyntaxError(
-                    f"Unexpected end of input after {last.value!r} "
-                    f"at line {last.line}, col {last.col}")
+                expected, context = self._expected_and_context(
+                    self._expand_all(cursors, end_pos))
+                raise SyntaxError(self._format_error(
+                    f"unexpected end of input after {last.value!r} "
+                    f"(line {last.line}, col {last.col})", expected, context))
             else:
                 completions = self._find_completions(
                     [(start_node, (), [], {})], 0)
@@ -1303,19 +1332,76 @@ class GraphParser:
                 seen[key] = (e[0], merged, e[2], e[3])
         return list(seen.values())
 
-    @staticmethod
-    def _raise_error(token, expanded):
-        expected = set()
+    def _expected_and_context(self, expanded):
+        """The accepted-continuation set and the rule stack at a failure.
+
+        `expanded` holds nothing but terminal cursors (that is all _expand
+        emits), so it IS the exact set of tokens the grammar would have taken
+        next — no FIRST-set approximation needed.  Order is the graph's link
+        order, i.e. the grammar's ordered choice, so the most likely
+        continuation is listed first; duplicates are collapsed in place rather
+        than sorted away.
+
+        Context is the first cursor's rule stack, innermost first.  Cursor 0 is
+        the highest-priority alternative the parser was pursuing, so it is the
+        one a human most likely meant; listing every cursor's stack would be
+        exhaustive but unreadable.  Anonymous helper rules (leading '_', or
+        anything in stripped_names) are compiler artefacts, never shown.
+        """
+        expected = []
         for term_node, *_ in expanded:
             if term_node.type == NT.MATCH_STR:
-                expected.add(f"'{term_node.value}'")
+                item = f"'{term_node.value}'"
             elif term_node.type == NT.MATCH_TOK:
-                expected.add(term_node.value)
-        exp_str = ', '.join(sorted(expected)) if expected else '(nothing)'
-        raise SyntaxError(
-            f"Unexpected {token.type} {token.value!r} "
-            f"at line {token.line}, col {token.col}.  "
-            f"Expected: {exp_str}")
+                item = term_node.value
+            else:
+                continue
+            if item not in expected:
+                expected.append(item)
+
+        context = []
+
+        def push_rule(name):
+            if not name or name.startswith('_') or name in self.stripped_names:
+                return
+            if name not in context:
+                context.append(name)
+
+        if expanded:
+            for frame in reversed(expanded[0][1]):
+                push_rule(frame[0])
+        # The start rule is never pushed on the stack (the parse begins inside
+        # it), so add it as the outermost frame — otherwise a failure at the top
+        # level of the grammar reports no context at all.
+        push_rule(self.start_rule)
+        return expected, context[:4]
+
+    @staticmethod
+    def _format_error(head, expected, context):
+        msg = head
+        if expected:
+            shown = expected[:6]
+            if len(shown) == len(expected) and len(shown) > 1:
+                exp_str = ', '.join(shown[:-1]) + ' or ' + shown[-1]
+            else:
+                exp_str = ', '.join(shown) + (', ...' if len(shown) < len(expected) else '')
+            msg += f"; expected {exp_str}"
+        if context:
+            msg += " (in " + " < ".join(context) + ")"
+        return msg
+
+    def _raise_error(self, token, expanded):
+        expected, context = self._expected_and_context(expanded)
+        # A lexer that auto-generates a type per grammar literal names them
+        # things like `_lit_9`; that is an artefact of compiling the grammar,
+        # meaningless to whoever wrote the input, so such a token is described
+        # by its text alone.  Named types (WORD, STRING, NUMBER) carry meaning
+        # and stay.
+        kind = '' if (not token.type or token.type.startswith('_')) \
+            else f"{token.type} "
+        raise SyntaxError(self._format_error(
+            f"line {token.line}, col {token.col}: "
+            f"unexpected {kind}{token.value!r}", expected, context))
 
 
 # ========================== EPEG Bootstrap Parser ==========================

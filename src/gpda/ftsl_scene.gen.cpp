@@ -50,11 +50,11 @@ gpda_tok::Graph build_ftsl_scene_graph() {
     g.nodes[9].rule_name = "block_list";
 
     g.nodes[10].type = NodeType::RuleStart;
-    g.nodes[10].rule_name = "nlq";
+    g.nodes[10].rule_name = "blank_lines";
     g.nodes[10].links = {82};
 
     g.nodes[11].type = NodeType::RuleEnd;
-    g.nodes[11].rule_name = "nlq";
+    g.nodes[11].rule_name = "blank_lines";
 
     g.nodes[12].type = NodeType::RuleStart;
     g.nodes[12].rule_name = "record_decl";
@@ -260,7 +260,7 @@ gpda_tok::Graph build_ftsl_scene_graph() {
     g.nodes[68].links = {69};
 
     g.nodes[69].type = NodeType::RuleRef;
-    g.nodes[69].value = "nlq";
+    g.nodes[69].value = "blank_lines";
     g.nodes[69].links = {70};
 
     g.nodes[70].type = NodeType::RuleRef;
@@ -272,7 +272,7 @@ gpda_tok::Graph build_ftsl_scene_graph() {
     g.nodes[71].links = {72};
 
     g.nodes[72].type = NodeType::RuleRef;
-    g.nodes[72].value = "nlq";
+    g.nodes[72].value = "blank_lines";
     g.nodes[72].links = {73};
 
     g.nodes[73].type = NodeType::RuleRef;
@@ -336,7 +336,7 @@ gpda_tok::Graph build_ftsl_scene_graph() {
     g.nodes[89].links = {90};
 
     g.nodes[90].type = NodeType::RuleRef;
-    g.nodes[90].value = "nlq";
+    g.nodes[90].value = "blank_lines";
     g.nodes[90].links = {91};
 
     g.nodes[91].type = NodeType::RuleRef;
@@ -716,6 +716,7 @@ gpda_tok::Graph build_ftsl_scene_graph() {
     g.nodes[192].links = {57};
 
     g.rules["assign_header"] = {26u, 27u};
+    g.rules["blank_lines"] = {10u, 11u};
     g.rules["block"] = {56u, 57u};
     g.rules["block_list"] = {8u, 9u};
     g.rules["body_item"] = {34u, 35u};
@@ -723,7 +724,6 @@ gpda_tok::Graph build_ftsl_scene_graph() {
     g.rules["cont"] = {50u, 51u};
     g.rules["item"] = {2u, 3u};
     g.rules["key_tok"] = {38u, 39u};
-    g.rules["nlq"] = {10u, 11u};
     g.rules["normal_val"] = {46u, 47u};
     g.rules["override_val"] = {42u, 43u};
     g.rules["plain_header"] = {28u, 29u};

@@ -52,12 +52,12 @@ item       = NEWLINE | top_block
 top_block  = prefer_block | record_decl | spectrum_decl | assign_header | plain_header
 
 # ---- prefer { … } else { … } ----------------------------------------
-prefer_block = 'prefer' nlq block_list ('else' nlq block_list)*
+prefer_block = 'prefer' blank_lines block_list ('else' blank_lines block_list)*
 block_list   = '{' item* '}'
-nlq          = NEWLINE*
+blank_lines  = NEWLINE*
 
 # ---- parametric record: `NAME = range LO HI [ <lines> ]` -------------
-record_decl  = WORD '=' 'range' range_word* nlq record_body
+record_decl  = WORD '=' 'range' range_word* blank_lines record_body
 range_word   = NUMWORD | KVWORD | STRING | WORD
 record_body  = '[' rec_item* ']'
 rec_item     = NEWLINE | record_line

@@ -501,6 +501,91 @@ ParseNodePtr Parser::reconstruct_lr(const ParseNodePtr& tree) {
 }
 
 // ============================================================================
+// make_error
+// ============================================================================
+
+// `expanded` holds nothing but terminal nodes (expand() only ever emits those),
+// so it IS the accepted-continuation set at this position — no guessing, no
+// separate FIRST-set computation.  Rendering it is the whole trick behind a
+// decent GPDA diagnostic.
+ParseError Parser::make_error(const std::vector<Cursor>& expanded,
+                              const Token* tok, std::size_t pos) const {
+    std::vector<std::string> expected;
+    std::vector<std::string> context;
+
+    // Preserve graph link order (== the grammar's ordered choice), so the most
+    // likely continuation is listed first; collapse duplicates.
+    auto push_unique = [](std::vector<std::string>& v, std::string s) {
+        for (const auto& x : v) if (x == s) return;
+        v.push_back(std::move(s));
+    };
+    for (const auto& e : expanded) {
+        const Node& n = graph.nodes[e.node];
+        if (n.type == NodeType::MatchStr)      push_unique(expected, "'" + n.value + "'");
+        else if (n.type == NodeType::MatchTok) push_unique(expected, n.value);
+    }
+
+    // Rule context, innermost first.  The FIRST cursor's stack is the one
+    // reported: cursors come out of expand() in graph link order, which is the
+    // grammar's ordered choice, so cursor 0 is the highest-priority alternative
+    // the parser was pursuing — the one a human most likely meant.  (Listing
+    // every cursor's stack would be exhaustive but unreadable.)
+    //
+    // Anonymous helpers (`_sub_N` from EBNF subtraction, and anything the
+    // grammar marked stripped) are compiler artefacts, not language concepts —
+    // never show them to a user.
+    auto push_rule = [&](std::uint32_t rid) {
+        if (rid >= graph.rule_names.size()) return;
+        if (rid < graph.rule_stripped.size() && graph.rule_stripped[rid]) return;
+        const std::string& nm = graph.rule_names[rid];
+        if (nm.empty() || nm[0] == '_') return;
+        push_unique(context, nm);
+    };
+    if (!expanded.empty())
+        for (auto s = expanded.front().stack; s; s = s->tail) push_rule(s->head.rule_id);
+    // The start rule is never pushed onto the stack (the parse begins inside
+    // it), so add it explicitly as the outermost frame — otherwise a failure at
+    // the top level of the grammar reports no context at all.
+    push_rule(graph.start_rule_id);
+    if (context.size() > 4) context.resize(4);
+
+    std::ostringstream os;
+    if (tok) {
+        // A lexer that auto-generates a type per grammar literal names them
+        // things like `_lit_9`; that is an artefact of compiling the grammar,
+        // meaningless to whoever wrote the input, so such a token is described
+        // by its text alone ("unexpected '}'" rather than "unexpected _lit_9
+        // '}'").  Named types (WORD, STRING, NUMBER) do carry meaning and stay.
+        const bool anon = tok->type.empty() || tok->type[0] == '_';
+        os << "line " << tok->line << ", col " << tok->col << ": unexpected ";
+        if (!anon) os << tok->type << " ";
+        os << "'" << tok->value << "'";
+    } else {
+        os << "unexpected end of input";
+    }
+    if (!expected.empty()) os << "; expected " << join_expected(expected);
+    if (!context.empty()) {
+        os << " (in " << context[0];
+        for (std::size_t i = 1; i < context.size(); ++i) os << " < " << context[i];
+        os << ")";
+    }
+
+    ParseError err(os.str());
+    if (tok) {
+        err.token_type  = tok->type;
+        err.token_value = tok->value;
+        err.line = tok->line;
+        err.col  = tok->col;
+    } else {
+        err.at_eof = true;
+    }
+    err.pos      = pos;
+    err.expected = std::move(expected);
+    err.context  = std::move(context);
+    return err;
+}
+
+// ============================================================================
 // parse — main entry point
 // ============================================================================
 
@@ -534,6 +619,8 @@ ParseNodePtr Parser::parse(const std::vector<Token>& tokens) {
                 auto leaf = make_parse_node();
                 leaf->name  = tok.type;
                 leaf->value = tok.value;
+                leaf->line  = tok.line;
+                leaf->col   = tok.col;
                 auto new_children = plist_push(e.children, leaf);
                 for (std::uint32_t link : graph.nodes[e.node].links) {
                     next.push_back({link, e.stack, new_children});
@@ -545,10 +632,7 @@ ParseNodePtr Parser::parse(const std::vector<Token>& tokens) {
             // Skip tokens are optional — keep the "was-ignored" cursors too.
             for (const auto& c : cursors) next.push_back(c);
         } else if (next.empty()) {
-            std::ostringstream os;
-            os << "Unexpected " << tok.type << " '" << tok.value
-               << "' at line " << tok.line << ", col " << tok.col;
-            throw std::runtime_error(os.str());
+            throw make_error(expanded, &tok, tok_pos);
         }
 
         cursors = dedup(next);
@@ -557,7 +641,11 @@ ParseNodePtr Parser::parse(const std::vector<Token>& tokens) {
     auto completions = find_completions(cursors,
                                          static_cast<std::uint32_t>(n));
     if (completions.empty()) {
-        throw std::runtime_error("Parse failed: unexpected end of input");
+        // Ran out of input mid-rule.  Re-expand at the end position to recover
+        // what would have let the parse continue — that is the useful half of
+        // an "unexpected end of input" message ("expected '}'").
+        throw make_error(expand_all(cursors, static_cast<std::uint32_t>(n)),
+                         nullptr, n);
     }
 
     ParseNodePtr tree = completions[0];
