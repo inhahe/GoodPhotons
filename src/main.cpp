@@ -3934,9 +3934,6 @@ static void printHelp(const char* prog) {
 "  -view EX,EY,EZ/LX,LY,LZ[/FOV]   ad-hoc eye/look-at[/fovY] camera; renders just it\n"
 "  -exposure|-ev <c>     override every camera's exposure compensation\n"
 "  -exposure-lock        one shared auto-exposure anchor across all rendered cameras\n"
-"  -legacy-parser        parse .ftsl with the retired hand-written parser instead of the\n"
-"                        shared grammar (escape hatch; slated for removal)\n"
-"  -validate-grammar     also parse with the legacy parser and warn on any disagreement\n"
 "\n"
 "Render mode & budget:\n"
 "  -mode <letter>        transport mode (default B; A/B/C forward, R/V/D backward — see README)\n"
@@ -4184,15 +4181,12 @@ static int run(int argc, char** argv) {
     // loader resolves up-front): a `-mode` override forces the mode a branch is judged
     // against, and `-on-unsupported` sets the global policy. Pre-scanning mirrors how
     // -in is found above; the full CLI loop below re-parses them normally.
-    // Same story for the two flags that select the .ftsl front end: the scene is parsed
-    // just below, long before the full CLI loop runs, so they MUST be pre-scanned or they
-    // would be read only after the parse they are supposed to control. (`-validate-grammar`
-    // silently did nothing as a CLI flag before the front-end flip for exactly this
-    // reason — only its FTRACE_VALIDATE_GRAMMAR env var took effect.)
-    for (int i = 1; i < argc; ++i) {
-        if      (!std::strcmp(argv[i], "-legacy-parser"))    ftsl_gpda::legacy_flag()   = true;
-        else if (!std::strcmp(argv[i], "-validate-grammar")) ftsl_gpda::validate_flag() = true;
-    }
+    // Two more flags used to be pre-scanned here for the same reason — `-legacy-parser`
+    // and `-validate-grammar` selected between the shared grammar and a hand-written
+    // parser, and the scene is parsed just below, long before the full CLI loop runs.
+    // 0.79.0 deleted that parser, so both are retired: still ACCEPTED in the CLI loop
+    // below (a script that passes one keeps working) but announced as a no-op rather
+    // than silently ignored.
     char cliModePrescan = 0;
     for (int i = 1; i + 1 < argc; ++i) {
         if (!std::strcmp(argv[i], "-mode")) cliModePrescan = argv[i + 1][0];
@@ -4441,10 +4435,14 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
         else if (!std::strcmp(argv[i], "-serve")) { /* resident loop; driven by main(), ignored here */ }
-        // Both already applied by the pre-scan above (they must be, to affect the parse);
-        // accepted again here so they don't trip the unknown-flag error below.
-        else if (!std::strcmp(argv[i], "-validate-grammar")) { /* pre-scanned */ }
-        else if (!std::strcmp(argv[i], "-legacy-parser"))    { /* pre-scanned */ }
+        // Retired in 0.79.0 along with the hand-written parser they selected. Accepted so
+        // an existing script does not hit the unknown-flag error, but SAID OUT LOUD — a
+        // flag that quietly stopped doing anything is worse than one that is gone.
+        else if (!std::strcmp(argv[i], "-legacy-parser") ||
+                 !std::strcmp(argv[i], "-validate-grammar")) {
+            std::fprintf(stderr, "ftrace: %s was retired in 0.79.0 — the shared grammar "
+                                 "is the only .ftsl front end now; ignoring\n", argv[i]);
+        }
         else if (argv[i][0] == '-') {
             // Any remaining dash-prefixed token is an unrecognized (or malformed, e.g.
             // value-less) option. Fail loudly instead of silently falling through to the

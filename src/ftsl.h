@@ -99,55 +99,15 @@ inline Spectrum glassOrDefault(const char* name, double fallbackN) {
 }
 
 // ---------------------------------------------------------------------------
-// Tokenizer
-// ---------------------------------------------------------------------------
-enum class Tok { Word, String, LBrace, RBrace, LBracket, RBracket, Newline, End };
-struct Token { Tok kind; std::string text; int line; };
-
-inline std::vector<Token> tokenize(const std::string& src) {
-    std::vector<Token> out;
-    int line = 1;
-    size_t i = 0, n = src.size();
-    while (i < n) {
-        char c = src[i];
-        if (c == '\n') { out.push_back({Tok::Newline, "\n", line}); ++line; ++i; continue; }
-        if (c == '\r' || c == ' ' || c == '\t') { ++i; continue; }
-        if (c == '#') { while (i < n && src[i] != '\n') ++i; continue; }
-        if (c == '{') { out.push_back({Tok::LBrace, "{", line}); ++i; continue; }
-        if (c == '}') { out.push_back({Tok::RBrace, "}", line}); ++i; continue; }
-        if (c == '[') { out.push_back({Tok::LBracket, "[", line}); ++i; continue; }
-        if (c == ']') { out.push_back({Tok::RBracket, "]", line}); ++i; continue; }
-        if (c == '"') {
-            ++i; std::string s;
-            while (i < n && src[i] != '"') { if (src[i] == '\n') ++line; s += src[i++]; }
-            if (i < n) ++i;   // closing quote
-            out.push_back({Tok::String, s, line});
-            continue;
-        }
-        // Bareword: accrete until whitespace/brace/comment/quote/newline.
-        std::string w;
-        while (i < n) {
-            char d = src[i];
-            if (d == ' ' || d == '\t' || d == '\r' || d == '\n' ||
-                d == '{' || d == '}' || d == '[' || d == ']' || d == '#' || d == '"') break;
-            w += d; ++i;
-        }
-        out.push_back({Tok::Word, w, line});
-    }
-    out.push_back({Tok::End, "", line});
-    return out;
-}
-
-// ---------------------------------------------------------------------------
 // Parse tree
 // ---------------------------------------------------------------------------
 struct Block;
 
 // One entry inside a `[ … ]` bracket group at a value site: either a bare token or a
-// nested group. Kept as a raw tree by BOTH front ends (the legacy parser and the
-// shared-grammar reducer) so that neither has to decide what the brackets MEAN — that
-// is the loader's job, and keeping the decision in exactly one place is what stops the
-// two parsers drifting apart.
+// nested group. Kept as a RAW tree by the grammar reducer, which therefore never has to
+// decide what the brackets MEAN — that is the loader's job (applyBracketGroup below),
+// and keeping the decision in exactly one place is what let the shared grammar replace
+// the hand-written parser without either side re-deriving the interpretation.
 struct BrItem {
     bool                isGroup = false;
     std::string         word;      // when !isGroup
@@ -173,10 +133,10 @@ struct Value {
 };
 // What does a `[ … ]` group at a value site MEAN?  There are two answers — a record
 // channel's STOP SELECTOR (`REC.chan[2]`) and an inline N-D ARRAY LITERAL (`[0 1](u)`) —
-// and this ONE function is where the question is answered, for BOTH front ends.  Keeping
-// the decision here (rather than duplicating it in Parser::parseValue and in the GPDA
-// reducer) is what stops the two from drifting: the grammar and the hand parser each only
-// have to *collect* the group's raw shape, never interpret it.
+// and this ONE function is where the question is answered.  Keeping the decision at the
+// LOADER level, out of the front end entirely, is deliberate: the grammar only has to
+// *collect* the group's raw shape, never interpret it, which is what made swapping the
+// front end out for the shared grammar a pure parse-tree exercise.
 //
 //   1. a trailing sample call    -> array literal (the call names the coordinates)
 //   2. otherwise nesting present -> array literal, UNSATURATED (an error at load time,
@@ -231,282 +191,16 @@ struct Block {
     std::vector<std::vector<Block>> branches;
 };
 
-struct Parser {
-    std::vector<Token> t;
-    size_t i = 0;
-    std::string err;
-
-    const Token& cur() const { return t[i]; }
-    bool is(Tok k) const { return t[i].kind == k; }
-    void adv() { if (t[i].kind != Tok::End) ++i; }
-    void skipNewlines() { while (is(Tok::Newline)) adv(); }
-    void fail(const std::string& m) { if (err.empty()) err = "line " + std::to_string(cur().line) + ": " + m; }
-
-    // Read the value part of a statement. This must work when several `key value`
-    // pairs share one line (e.g. `quad { origin 0 0 0  u 1 0 0  material white }`),
-    // so a value cannot simply run to the newline. Rule: take the first token
-    // unconditionally (a value always has one — a number, a name, or a spectrum
-    // keyword), then keep consuming *continuation* tokens — numbers or `key=val`
-    // named params (gaussian/shortpass) — and stop at the next bareword, which
-    // begins the next statement's key. A trailing `{` opens a nested brace block
-    // (table/film/…) whose type is the preceding word, or the statement key.
-    // Collect a `[ … ]` group at a value site into its raw item tree, WITHOUT deciding
-    // what it means (that is applyBracketGroup's job). Nested groups become nested items,
-    // which is how an N-D array literal spells its shape; newlines are skipped so a big
-    // literal may be laid out over several lines. Assumes cur() == LBracket.
-    std::vector<BrItem> parseBracketGroup() {
-        adv();                                  // consume '['
-        std::vector<BrItem> items;
-        while (!is(Tok::RBracket) && !is(Tok::End)) {
-            if (is(Tok::Newline)) { adv(); continue; }
-            if (is(Tok::LBracket)) {
-                BrItem g; g.isGroup = true; g.items = parseBracketGroup();
-                items.push_back(std::move(g));
-                continue;
-            }
-            if (!is(Tok::Word)) break;
-            BrItem w; w.word = cur().text; adv();
-            items.push_back(std::move(w));
-        }
-        if (is(Tok::RBracket)) adv(); else fail("bracket group missing ']'");
-        return items;
-    }
-
-    // A sample call immediately after a `]` — `(u)`, `(u,v)`. ftrace's tokenizer does NOT
-    // treat parens as delimiters (that is exactly what keeps an expression value like
-    // `0.5+0.5*sin(2*pi*u)` a single token), so the call arrives as an ordinary Word that
-    // happens to be wholly parenthesised — the same shape the shared grammar's PARENWORD
-    // terminal matches. Returns "" (and consumes nothing) when there is no call.
-    std::string takeAxisTuple() {
-        if (!is(Tok::Word)) return "";
-        const std::string& tx = cur().text;
-        if (tx.size() < 2 || tx.front() != '(' || tx.back() != ')') return "";
-        std::string call = tx; adv();
-        return call;
-    }
-
-    void parseValue(const std::string& key, Value& v) {
-        // Record-override assignment: `slot = <rhs>` (used inside a `material "m" { … }`
-        // record block, §records stage 4). A standalone `=` first token never begins a
-        // normal statement value, so this is unambiguous. The RHS is a single token
-        // (an expression, a channel name, or `REC.chan`), optionally followed by a
-        // `[i]` stop selector — which we fold back into the RHS token (`REC.chan[i]`) so
-        // the bracket tokens don't leak into the generic brace-body statement stream.
-        if (is(Tok::Word) && cur().text == "=") {
-            v.words.push_back("="); adv();
-            if (is(Tok::Word) || is(Tok::String)) { v.words.push_back(cur().text); adv(); }
-            if (is(Tok::LBracket)) {
-                int ln = cur().line;
-                std::vector<BrItem> items = parseBracketGroup();
-                applyBracketGroup(v, std::move(items), takeAxisTuple(), ln, true);
-            }
-            return;
-        }
-        bool firstWasString = false;
-        if (is(Tok::Word) || is(Tok::String)) {
-            firstWasString = is(Tok::String);
-            v.words.push_back(cur().text); adv();
-        }
-        while (is(Tok::Word) || is(Tok::String)) {
-            // A quoted string never begins a new statement (statement keys are always
-            // barewords), so a String that follows the value's tokens is part of THIS
-            // value — e.g. a name argument: `exposure_lock camera "meter"`. (Without this
-            // the string was silently swallowed as a stray statement key.) Barewords only
-            // continue when they are numbers or `key=val` named params; a plain bareword
-            // still ends the value (it begins the next statement's key).
-            if (is(Tok::Word)) {
-                const std::string& tx = cur().text;
-                bool cont = isNumber(tx) || tx.find('=') != std::string::npos;
-                if (!cont) break;
-            }
-            v.words.push_back(cur().text); adv();
-        }
-        // A `[ … ]` group at an ordinary value site: either the record-channel stop
-        // selector `RECORD.channel[i]` (records stage 5a) or an inline array literal
-        // `[0 1](u)`. Collect it raw and let the shared applyBracketGroup decide which —
-        // that decision must live in exactly one place or the two front ends drift.
-        if (is(Tok::LBracket)) {
-            int ln = cur().line;
-            std::vector<BrItem> items = parseBracketGroup();
-            applyBracketGroup(v, std::move(items), takeAxisTuple(), ln);
-        }
-        if (is(Tok::LBrace)) {
-            std::string btype = key, bname;
-            if (!v.words.empty()) {
-                // A single *quoted* word before `{` is the block's NAME (e.g. a nested
-                // `mesh "klein_a" { ... }` inside a group), so the type stays = key.
-                // A bareword before `{` is instead the block's TYPE (e.g. `table { }`,
-                // `light sphere { }`) — the historical behaviour for subtyped blocks.
-                if (v.words.size() == 1 && firstWasString) { bname = v.words.back(); v.words.pop_back(); }
-                else { btype = v.words.back(); v.words.pop_back(); }
-            }
-            v.block = std::make_shared<Block>();
-            v.block->type = btype;
-            v.block->name = bname;
-            parseBraceBody(*v.block);
-        }
-    }
-
-    // Parse "{ ... }" body into stmts (+ flat words). Assumes cur() == LBrace.
-    void parseBraceBody(Block& b) {
-        adv();   // consume '{'
-        while (!is(Tok::RBrace) && !is(Tok::End)) {
-            if (is(Tok::Newline)) { adv(); continue; }
-            Stmt s; s.line = cur().line;
-            s.key = cur().text; adv();
-            b.words.push_back(s.key);
-            parseValue(s.key, s.val);
-            for (const auto& w : s.val.words) b.words.push_back(w);
-            b.stmts.push_back(std::move(s));
-        }
-        if (is(Tok::RBrace)) adv();
-        else fail("unterminated '{'");
-    }
-
-    // Parse a record body `[ <lines> ]` into stmts (one per non-empty line: a channel
-    // name key + its stop tokens). Unlike a brace body, NEWLINES delimit statements and
-    // a value holds many barewords (the stops), so this does NOT use parseValue. Assumes
-    // cur() == LBracket.
-    void parseRecordBody(Block& b) {
-        adv();  // consume '['
-        while (!is(Tok::RBracket) && !is(Tok::End)) {
-            if (is(Tok::Newline)) { adv(); continue; }
-            if (!is(Tok::Word)) { fail("record line must start with a channel name"); return; }
-            Stmt s; s.line = cur().line;
-            s.key = cur().text; adv();
-            while (is(Tok::Word) || is(Tok::String)) { s.val.words.push_back(cur().text); adv(); }
-            b.stmts.push_back(std::move(s));
-        }
-        if (is(Tok::RBracket)) adv();
-        else fail("unterminated '[' in record");
-    }
-
-    // Parse `NAME = range LO-HI [ ... ]` (the leading `NAME = range` already consumed;
-    // `name` is NAME). Stores the domain as a stmt `range <tokens>` plus one stmt per
-    // channel line, all under a Block of type "record".
-    bool parseRecord(Block& b, const std::string& name) {
-        b.type = "record";
-        b.name = name;
-        Stmt dom; dom.key = "range"; dom.line = cur().line;
-        while (is(Tok::Word)) { dom.val.words.push_back(cur().text); adv(); }
-        b.stmts.push_back(std::move(dom));
-        skipNewlines();
-        if (!is(Tok::LBracket)) { fail("record '" + name + "' needs '[ ... ]' after `range LO-HI`"); return false; }
-        parseRecordBody(b);
-        return err.empty();
-    }
-
-    // Parse ONE top-level block (or a `prefer { } else { }` construct) starting at
-    // cur() (which must be a Word). Fills `b`; returns false on a parse error.
-    bool parseOneTopBlock(Block& b) {
-        if (!is(Tok::Word)) { fail("expected a block type"); return false; }
-        b.type = cur().text; adv();
-        if (b.type == "prefer") return parsePrefer(b);
-        // Parametric record: `NAME = range LO-HI [ ... ]` (ROADMAP_records.md). Detected
-        // by a bare first word immediately followed by '=' then `range` — spectrum uses
-        // a *quoted* name before '=', so there is no collision.
-        if (is(Tok::Word) && cur().text == "=") {
-            std::string name = b.type;   // the leading bare word is the binding NAME
-            adv();  // consume '='
-            if (is(Tok::Word) && cur().text == "range") {
-                adv();  // consume 'range'
-                return parseRecord(b, name);
-            }
-            // Unified element header `NAME = KIND { ... }` (the loom-emitted form):
-            // the word after '=' is the block KIND (material/texture/camera/light/
-            // isosurface/pattern/geometry) and NAME is its name. Body parses exactly
-            // like the legacy `KIND "name" { ... }`. Accepted alongside the legacy
-            // spelling during the grammar transition (J3c); one spelling once ftrace's
-            // front-end is ported from the shared grammar.
-            if (is(Tok::Word)) {
-                b.type = cur().text; adv();          // KIND
-                b.name = name;
-                // Optional bareword subtype (`sun = light point { }`); the new grammar
-                // prefers a `kind` property instead, but accept both here.
-                if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
-                if (!is(Tok::LBrace)) { fail("expected '{' after `" + name + " = " + b.type + "`"); return false; }
-                parseBraceBody(b);
-                return true;
-            }
-            fail("unknown '=' declaration '" + name + "' (expected `= range` or `= KIND { ... }`)");
-            return false;
-        }
-        if (is(Tok::String)) { b.name = cur().text; adv(); }
-        // Optional bareword subtype (light area / light collimated), but not '='.
-        if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
-        if (b.type == "spectrum") {
-            if (is(Tok::Word) && cur().text == "=") adv();
-            else { fail("spectrum declaration needs '='"); return false; }
-            Stmt s; s.key = "="; s.line = cur().line;
-            parseValue("=", s.val);
-            b.stmts.push_back(std::move(s));
-        } else {
-            if (!is(Tok::LBrace)) { fail("expected '{' after " + b.type); return false; }
-            parseBraceBody(b);
-        }
-        return true;
-    }
-
-    // Parse a `{ <top-level blocks> }` list (cur() must be LBrace). Consumes the braces.
-    // Used for each branch of a `prefer`/`else` construct.
-    std::vector<Block> parseBlockList() {
-        std::vector<Block> list;
-        adv();   // consume '{'
-        skipNewlines();
-        while (!is(Tok::RBrace) && !is(Tok::End) && err.empty()) {
-            Block b;
-            if (!parseOneTopBlock(b)) break;
-            list.push_back(std::move(b));
-            skipNewlines();
-        }
-        if (is(Tok::RBrace)) adv();
-        else fail("unterminated 'prefer'/'else' block");
-        return list;
-    }
-
-    // Parse `prefer { .. } else { .. } else { .. }` (b.type already == "prefer").
-    // Each brace group becomes one ordered branch in b.branches; `else` chains flatly.
-    bool parsePrefer(Block& b) {
-        skipNewlines();
-        if (!is(Tok::LBrace)) { fail("'prefer' needs '{ ... }'"); return false; }
-        b.branches.push_back(parseBlockList());
-        if (!err.empty()) return false;
-        for (;;) {
-            skipNewlines();
-            if (is(Tok::Word) && cur().text == "else") {
-                adv(); skipNewlines();
-                if (!is(Tok::LBrace)) { fail("'else' needs '{ ... }'"); return false; }
-                b.branches.push_back(parseBlockList());
-                if (!err.empty()) return false;
-            } else break;
-        }
-        return true;
-    }
-
-    // Parse the whole file into a list of top-level blocks.
-    std::vector<Block> parseTop() {
-        std::vector<Block> blocks;
-        skipNewlines();
-        while (!is(Tok::End) && err.empty()) {
-            Block b;
-            if (!parseOneTopBlock(b)) break;
-            blocks.push_back(std::move(b));
-            skipNewlines();
-        }
-        return blocks;
-    }
-};
-
 }  // namespace ftsl  (temporarily closed so the GPDA front end can see
    //                  ftsl::Block/Stmt/Value at global scope)
 
-// The authoritative .ftsl front end: the shared grammar
-// (tools/loom/loom/grammar/ftsl_scene.epeg, compiled to a GPDA graph) plus the
-// reducer that turns its parse tree into the Block tree the hand-written Parser
-// above used to produce.  Included here — after Block/Stmt/Value/Parser are
-// defined — so its inline reducer/differ can reference them.  loadSource() below
-// calls ftsl_gpda::parse() by default; the Parser above survives only as the
-// `-legacy-parser` escape hatch and as `-validate-grammar`'s cross-check.
+// The ONE .ftsl front end: the shared grammar (tools/loom/loom/grammar/ftsl_scene.epeg,
+// compiled to a GPDA graph) plus the reducer that turns its parse tree into the Block
+// tree above.  Included here — after Block/Stmt/Value are defined — so the inline
+// reducer can reference them; loadSource() below calls ftsl_gpda::parse().
+// (Through 0.78 a hand-written recursive-descent Parser lived here too, kept behind
+// `-legacy-parser` while the grammar proved itself; it was deleted in 0.79.0 after the
+// corpus differ held at MATCH 2595/2595 across ten releases.)
 #include "gpda/ftsl_frontend.hpp"
 
 namespace ftsl {
@@ -5484,15 +5178,6 @@ inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
 inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
                        Loaded& L, std::string& err,
                        const SupportFn& supported = {}) {
-    // Parse with the legacy hand-written recursive-descent parser.  Kept as a
-    // callback so it can serve both `-legacy-parser` and `-validate-grammar`.
-    auto legacy_parse = [&src](std::vector<Block>& out, std::string& e) -> bool {
-        Parser p; p.t = tokenize(src);
-        out = p.parseTop();
-        if (!p.err.empty()) { e = p.err; return false; }
-        return true;
-    };
-
     // Report the keys nothing in the loader read. A warning rather than an error:
     // the check is new, and an old scene carrying a stale property should still
     // render — but it must SAY so, because the alternative (today's behaviour) is
@@ -5502,15 +5187,9 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
             std::fprintf(stderr, "[ftsl] warning: %s: %s\n", nameForMsgs.c_str(), w.c_str());
     };
 
+    // The shared grammar (src/gpda/ftsl_frontend.hpp) is the only front end.
     std::vector<Block> blocks;
-    if (ftsl_gpda::use_legacy()) {
-        if (!legacy_parse(blocks, err)) return false;
-    } else {
-        // Authoritative path: the shared grammar (src/gpda/ftsl_frontend.hpp).
-        if (!ftsl_gpda::parse(src, blocks, err)) return false;
-        // Optional cross-check against the legacy parser (`-validate-grammar`).
-        ftsl_gpda::validate(blocks, legacy_parse, nameForMsgs);
-    }
+    if (!ftsl_gpda::parse(src, blocks, err)) return false;
 
     // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
     std::vector<size_t> preferIdx;

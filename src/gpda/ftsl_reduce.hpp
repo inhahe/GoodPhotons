@@ -1,18 +1,21 @@
-// ftsl_reduce.hpp — GPDA ParseNode tree  ->  ftrace ftsl::Block tree, + a
-// structural differ.  This is the back half of ftrace's authoritative .ftsl front
-// end (see ftsl_frontend.hpp): it turns the shared grammar's parse tree into the
-// exact std::vector<ftsl::Block> shape the rest of ftrace consumes.  The differ
-// exists because that shape was originally reverse-engineered from ftrace's
-// hand-written parseTop(); it still backs `-validate-grammar`, which diffs the two
-// front ends block-for-block.
+// ftsl_reduce.hpp — GPDA ParseNode tree  ->  ftrace ftsl::Block tree.  This is the
+// back half of ftrace's .ftsl front end (see ftsl_frontend.hpp): it turns the shared
+// grammar's parse tree into the exact std::vector<ftsl::Block> shape the rest of
+// ftrace consumes.
 //
-// The mapping faithfully mirrors ftrace's legacy Parser (src/ftsl.h):
+// That shape was reverse-engineered from the hand-written recursive-descent parser
+// this front end replaced (deleted in 0.79.0), so the conventions below are its
+// conventions and the loader still depends on every one of them:
 //   * value continuation / record-override `= rhs [i]` / `[i]` selector folding
 //   * nested-block type/name derivation (bareword => type, single quoted => name)
 //   * brace-body flat `words` dump (key, then post-pop value words)
 //   * record `range` stmt + one stmt per channel line; prefer/else branches
-// STRING tokens carry their quotes in the grammar but ftrace's tokenizer strips
+// STRING tokens carry their quotes in the grammar but the old tokenizer stripped
 // them, so every string word/name is unquoted here to match.
+//
+// (A structural differ lived here too, driving the 0.68 corpus comparison to
+// MATCH 2595/2595; it went with `-validate-grammar` in 0.79.0 — with one front end
+// there is nothing left to diff against.)
 #pragma once
 
 #include <algorithm>
@@ -246,124 +249,6 @@ inline std::vector<ftsl::Block> reduce_scene(const PN* scene_file) {
         if (tb) blocks.push_back(reduce_top_block(tb));
     }
     return blocks;
-}
-
-// ---- structural diff ------------------------------------------------------
-
-struct Diff {
-    std::vector<std::string> msgs;
-    bool ok() const { return msgs.empty(); }
-    void add(const std::string& where, const std::string& m) {
-        msgs.push_back(where + ": " + m);
-    }
-};
-
-inline void diff_value(const ftsl::Value& a, const ftsl::Value& b,
-                       const std::string& where, Diff& d);
-
-// Render a bracket item tree back to its source spelling, so a mismatch report shows
-// the shape that actually differs rather than just "arrays differ".
-inline std::string flatten_items(const std::vector<ftsl::BrItem>& items) {
-    std::string s = "[";
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (i) s += " ";
-        s += items[i].isGroup ? flatten_items(items[i].items) : items[i].word;
-    }
-    return s + "]";
-}
-
-inline void diff_block(const ftsl::Block& a, const ftsl::Block& b,
-                       const std::string& where, Diff& d) {
-    if (a.type != b.type) d.add(where, "type '" + a.type + "' != '" + b.type + "'");
-    if (a.subtype != b.subtype) d.add(where, "subtype '" + a.subtype + "' != '" + b.subtype + "'");
-    if (a.name != b.name) d.add(where, "name '" + a.name + "' != '" + b.name + "'");
-    if (a.words != b.words) {
-        std::string as, bs;
-        for (auto& w : a.words) as += "|" + w;
-        for (auto& w : b.words) bs += "|" + w;
-        d.add(where, "words [" + as + " ] != [" + bs + " ]");
-    }
-    if (a.stmts.size() != b.stmts.size()) {
-        d.add(where, "stmt count " + std::to_string(a.stmts.size()) +
-              " != " + std::to_string(b.stmts.size()));
-    } else {
-        for (size_t i = 0; i < a.stmts.size(); ++i) {
-            const auto& sa = a.stmts[i];
-            const auto& sb = b.stmts[i];
-            std::string w = where + ".stmt[" + std::to_string(i) + "]";
-            if (sa.key != sb.key) d.add(w, "key '" + sa.key + "' != '" + sb.key + "'");
-            // Stmt::line matters even though nothing reads it yet: it is what a
-            // semantic error ("line 12: unknown property") will quote once the
-            // shared grammar IS the front-end, so the two parsers agreeing on
-            // it is part of the equivalence being proven here.
-            if (sa.line != sb.line) {
-                d.add(w, "line " + std::to_string(sa.line) +
-                      " != " + std::to_string(sb.line));
-            }
-            diff_value(sa.val, sb.val, w, d);
-        }
-    }
-    if (a.branches.size() != b.branches.size()) {
-        d.add(where, "branch count " + std::to_string(a.branches.size()) +
-              " != " + std::to_string(b.branches.size()));
-    } else {
-        for (size_t i = 0; i < a.branches.size(); ++i) {
-            const auto& ba = a.branches[i];
-            const auto& bb = b.branches[i];
-            std::string w = where + ".branch[" + std::to_string(i) + "]";
-            if (ba.size() != bb.size()) {
-                d.add(w, "block count " + std::to_string(ba.size()) +
-                      " != " + std::to_string(bb.size()));
-            } else {
-                for (size_t j = 0; j < ba.size(); ++j)
-                    diff_block(ba[j], bb[j], w + "[" + std::to_string(j) + "]", d);
-            }
-        }
-    }
-}
-
-inline void diff_value(const ftsl::Value& a, const ftsl::Value& b,
-                       const std::string& where, Diff& d) {
-    if (a.words != b.words) {
-        std::string as, bs;
-        for (auto& w : a.words) as += "|" + w;
-        for (auto& w : b.words) bs += "|" + w;
-        d.add(where, "val.words [" + as + " ] != [" + bs + " ]");
-    }
-    if (static_cast<bool>(a.block) != static_cast<bool>(b.block)) {
-        d.add(where, "one has a nested block, the other doesn't");
-    } else if (a.block && b.block) {
-        diff_block(*a.block, *b.block, where + ".block", d);
-    }
-    if (static_cast<bool>(a.array) != static_cast<bool>(b.array)) {
-        d.add(where, "one has an inline array literal, the other doesn't");
-    } else if (a.array && b.array) {
-        if (a.array->call != b.array->call) {
-            d.add(where, "array call '" + a.array->call + "' != '" + b.array->call + "'");
-        }
-        if (a.array->line != b.array->line) {
-            d.add(where, "array line " + std::to_string(a.array->line) +
-                  " != " + std::to_string(b.array->line));
-        }
-        std::string as = flatten_items(a.array->items), bs = flatten_items(b.array->items);
-        if (as != bs) d.add(where, "array shape " + as + " != " + bs);
-    }
-}
-
-inline Diff diff_scene(const std::vector<ftsl::Block>& a,
-                       const std::vector<ftsl::Block>& b) {
-    Diff d;
-    if (a.size() != b.size()) {
-        d.add("scene", "top-block count " + std::to_string(a.size()) +
-              " != " + std::to_string(b.size()));
-        size_t n = std::min(a.size(), b.size());
-        for (size_t i = 0; i < n; ++i)
-            diff_block(a[i], b[i], "block[" + std::to_string(i) + "]", d);
-        return d;
-    }
-    for (size_t i = 0; i < a.size(); ++i)
-        diff_block(a[i], b[i], "block[" + std::to_string(i) + "]", d);
-    return d;
 }
 
 }  // namespace ftsl_gpda

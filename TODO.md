@@ -2919,6 +2919,24 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-27: **0.79.0 — the hand-written `.ftsl` parser is deleted; the shared grammar is now the *only*
+  front end.** 0.68.0 flipped ftrace over to the grammar
+  (`tools/loom/loom/grammar/ftsl_scene.epeg` → `src/gpda/`) after the corpus differ hit **MATCH 2595/2595**
+  — every `.ftsl` in the tree, structurally identical down to `Stmt::line`. The old recursive-descent
+  parser stayed compiled in behind `-legacy-parser` as an escape hatch and went **ten releases unused**,
+  so it was time. Deleted: the `// Tokenizer` section and the 266-line `struct Parser` from `src/ftsl.h`
+  (`loadSource()` now has one path — `ftsl_gpda::parse()`); `legacy_flag()` / `use_legacy()` /
+  `validate_flag()` / `validate_enabled()` / `validate()` from `src/gpda/ftsl_frontend.hpp`; the
+  structural differ (`Diff` / `diff_block` / `diff_value` / `diff_scene`) from `src/gpda/ftsl_reduce.hpp`,
+  which had nothing left to diff against; and the argv pre-scan in `main.cpp` that existed only because
+  the scene is parsed before the main CLI loop runs. `-legacy-parser` / `-validate-grammar` are **retired,
+  not removed** — still accepted so an existing script keeps working, but each prints
+  `ftrace: <flag> was retired in 0.79.0 …; ignoring` rather than silently doing nothing, which is what
+  keeps this a *minor* bump. Everything downstream of `std::vector<Block>` is shared and untouched, and
+  `applyBracketGroup` stays at the loader level (that layering was the thing that made the flip a pure
+  parse-tree exercise; the comments now say so as design rather than as drift-avoidance). *Verified:* all
+  eleven deterministic self-tests PASS, every scene in `scenes/` still loads, both retired flags render
+  normally after printing the notice.
 - 2026-07-26: **0.78.0 — `grid:`/`scatter:` reach the field formulas, and the not-found guard no longer
   corrupts the eval stack.** Authored-data tables were compile-legal only in *pattern* sites; now the
   FTSL builder also passes `&tableScope_` at the `function` field leaf, a medium's `density` and `ior`

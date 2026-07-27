@@ -8,8 +8,9 @@
 // first-set analysis is never too small and the literal path agrees with the
 // regex it replaces.  If either assumption breaks, the lexer silently produces
 // different tokens — no crash, no diagnostic, just a scene that parses wrong or
-// stops parsing.  The `-validate-grammar` shim would catch it today, but that
-// shim is a transition aid and goes away; this check is the permanent one.
+// stops parsing.  The `-validate-grammar` cross-check against the hand-written
+// parser would once have caught it, but both went away in 0.79.0 — the shared
+// grammar is now the only front end, so this check is the only line of defence.
 //
 // WHAT IT CHECKS.  For every rule in the real FTSL lex table:
 //   1. For each of the 256 leading bytes the analyser *excluded*, ask

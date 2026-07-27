@@ -5,22 +5,6 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### TECH-DEBT — OPEN (2026-07-26): the hand-written `.ftsl` parser is still compiled in behind `-legacy-parser`
-
-0.68.0 flipped ftrace's front end over to the shared grammar
-(`tools/loom/loom/grammar/ftsl_scene.epeg` → `src/gpda/`), gated on the corpus differ
-reaching **MATCH 2595/2595** (every `.ftsl` in the tree, structurally identical down to
-`Stmt::line`). The retired hand-written parser in `src/ftsl.h` (`tokenize`, `Parser`,
-`parseTop`, `parseValue`, `parseBraceBody`, …) is still there, reachable via
-`-legacy-parser` / `FTRACE_LEGACY_PARSER`, as a one-release escape hatch.
-
-**Proper fix:** after 0.68 has had a release's worth of real use with no scene falling
-back, delete the legacy tokenizer + `Parser` from `ftsl.h`, drop `-legacy-parser` and the
-`legacy_flag()` / `use_legacy()` plumbing in `src/gpda/ftsl_frontend.hpp` and the argv
-pre-scan in `main.cpp`, and reduce `-validate-grammar` to a no-op warning (or remove it
-too — with one parser there is nothing to cross-check). Everything downstream of
-`std::vector<Block>` is shared and stays.
-
 ### PERF — OPEN (2026-07-27): scene loading is down 5×, but the graph walk (not the lexer) is what's left
 
 The 0.68 front-end flip made loading measurably slower than the hand-written parser —
@@ -72,6 +56,47 @@ classes with ranges, `.`, unicode classes) in a form a user can read — e.g. co
 header, add an offset→line/col helper to the scannerless `Parser`, and write a
 `describe_matcher(const Node&)` for char-level terminals. Not urgent — no shipped ftrace
 path uses the scannerless engine.
+
+### TECH-DEBT — DONE (2026-07-27, 0.79.0): the hand-written `.ftsl` parser is deleted — one front end, one implementation of the language
+
+0.68.0 flipped ftrace's front end over to the shared grammar
+(`tools/loom/loom/grammar/ftsl_scene.epeg` → `src/gpda/`), gated on the corpus differ
+reaching **MATCH 2595/2595** (every `.ftsl` in the tree, structurally identical down to
+`Stmt::line`). The retired hand-written parser stayed compiled in behind
+`-legacy-parser` / `FTRACE_LEGACY_PARSER` as a one-release escape hatch. It held for
+**ten** releases (0.68 → 0.78) with no scene ever needing the fallback, so the escape
+hatch had earned its retirement.
+
+**Fixed** — everything downstream of `std::vector<Block>` is shared and untouched; only
+the front half went:
+
+- `src/ftsl.h`: deleted the `// Tokenizer` section (`enum class Tok`, `struct Token`,
+  `tokenize`) and the whole 266-line `struct Parser` (`parseValue` / `parseBraceBody` /
+  `parseOneTopBlock` / `parseBlockList` / `parsePrefer` / `parseTop`). `loadSource()` lost
+  its `legacy_parse` lambda and the branch around it; it now just calls
+  `ftsl_gpda::parse()`.
+- `src/gpda/ftsl_frontend.hpp`: deleted `legacy_flag()`, `use_legacy()`,
+  `validate_flag()`, `validate_enabled()` and the `validate()` template. What is left is
+  `parser()`, `lexer()`, `parse()`.
+- `src/gpda/ftsl_reduce.hpp`: deleted the structural differ (`struct Diff`, `diff_block`,
+  `diff_value`, `diff_scene`) that drove the 0.68 corpus comparison — with one front end
+  there is nothing left to diff against.
+- `src/main.cpp`: the argv pre-scan for the two flags is gone (it existed only because
+  the parse happens before the main CLI loop). Both flags are still **accepted** in the
+  CLI loop so an existing script doesn't hit the unknown-option error, but each prints
+  `ftrace: <flag> was retired in 0.79.0 — the shared grammar is the only .ftsl front end
+  now; ignoring`. A flag that quietly stopped doing anything would be worse than one that
+  is gone; this is why the bump is **minor**, not major.
+
+The `BrItem` / `applyBracketGroup` comments were reworded: the "keep the bracket-group
+decision at the loader level, out of the front end" rule was written for two front ends,
+but it is still the right layering and is now documented as such rather than as a
+drift-avoidance measure.
+
+**Verified:** all eleven deterministic self-tests PASS (`-checkbvh`, `-checkimplicit`,
+`-checklens`, `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
+`-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`); every `.ftsl` in
+`scenes/` still loads; both retired flags print the notice and render normally.
 
 ### PAPERCUT — DONE (2026-07-26, 0.77.1): `-o` into a non-existent directory fails every write interval and loses the whole render
 

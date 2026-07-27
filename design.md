@@ -57,12 +57,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   parser in `D:\visual studio projects\GraphParser`) then walk the graph to a parse
   tree, which
   `ftsl_reduce.hpp` reduces to the same `std::vector<ftsl::Block>` the hand-written
-  parser produced. `ftsl_frontend.hpp` is the entry point (`ftsl_gpda::parse`, plus
-  `use_legacy()` / `validate()` behind the two transition flags). loom parses the
+  parser produced. `ftsl_frontend.hpp` is the entry point — since 0.79.0 that is just
+  `ftsl_gpda::parse`. loom parses the
   *same* grammar in Python via the pinned `tools/loom/loom/grammar/_gpda.py`, so
   ftrace and loom cannot disagree about the language. The flip (0.68) was gated on
   `-validate-grammar` reporting zero structural mismatches across all 2595 `.ftsl`
-  files in the tree, down to per-statement line numbers. Loading the largest scene in
+  files in the tree, down to per-statement line numbers; it held there for ten
+  releases, and 0.79.0 deleted the hand-written parser, the `-legacy-parser` escape
+  hatch and the cross-check differ, leaving exactly one implementation of the
+  language. Loading the largest scene in
   the tree (22 KB) costs ~42 ms of lex+parse. `tools/gpda_lexcheck/` is the permanent
   differential validator for the lexer's fast paths: it brute-forces that no rule's
   first-set ever excludes a byte the rule's own regex could match, and that the fast
@@ -70,9 +73,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`scene.h` / `ftsl.h`** — scene model and the FTSL semantic pass
   (cameras, camera_curve/path/orbit, materials, lights, media, implicits, meshes).
   `FTSL.md` documents the language. Everything downstream of
-  `std::vector<Block>` — turning blocks into a `Scene` — lives here and is shared by
-  both front ends; the hand-written *parser* is still compiled in behind
-  `-legacy-parser` as a one-release escape hatch.
+  `std::vector<Block>` — turning blocks into a `Scene` — lives here. Through 0.78 a
+  hand-written recursive-descent tokenizer + `Parser` lived here too, kept compiled in
+  behind `-legacy-parser`; 0.79.0 deleted both, so `loadSource()` now has a single
+  path. Note that `applyBracketGroup` (how a `[ … ]` group becomes a swatch / array
+  literal / index selector) deliberately stays at *this* level rather than in the
+  front end — keeping that decision in one place outside the parser is what let the
+  grammar replace the hand-written parser as a pure parse-tree exercise.
   **Unknown-key reporting** (since 0.77.0) rides on this pass. `Stmt` carries a
   `mutable bool used`, set inside `find(const Block&, const char*)` — the single choke
   point every property read (`strOf`/`vec3Of`/`dblOf`/`spectrumParam`/…) funnels
@@ -347,15 +354,16 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   rendering `scenes/pattern_array.ftsl` against a hand-written `grid` + `pattern` twin
   (bit-identical). Nesting is the shape; the domain is the **unit box** per axis (an inline
   literal has no domain of its own), deliberately unlike the `grid` element's index-lattice
-  default. The syntax reaches the loader through **both** front ends: the shared grammar
-  grows a `PARENWORD` terminal (a token that is *wholly* parenthesised) and one merged
-  `selector = '[' sel_item* ']' axistuple?` production covering both jobs of `[ … ]` at a
-  value site, while the legacy tokenizer needs no change at all — a call arrives as an
-  ordinary bareword because ftrace never treated `(` as a delimiter (which is exactly what
-  keeps `0.5+0.5*sin(2*pi*u)` one token). Critically, **neither parser decides what the
-  brackets mean**: both collect the raw `ftsl::BrItem` tree and hand it to the single
-  shared `ftsl::applyBracketGroup`, which is what stops the two front ends drifting on the
-  one syntax that is genuinely ambiguous (record stop selector vs. array literal).
+  default. In the grammar the syntax is a `PARENWORD` terminal (a token that is *wholly*
+  parenthesised) plus one merged `selector = '[' sel_item* ']' axistuple?` production
+  covering both jobs of `[ … ]` at a value site. (The hand-written tokenizer, retired in
+  0.79.0, needed no change at all — a call arrived as an ordinary bareword because ftrace
+  never treated `(` as a delimiter, which is exactly what keeps `0.5+0.5*sin(2*pi*u)` one
+  token.) Critically, **the front end does not decide what the brackets mean**: it collects
+  the raw `ftsl::BrItem` tree and hands it to `ftsl::applyBracketGroup` at the loader level.
+  That split is what kept the two front ends from drifting on the one syntax that is
+  genuinely ambiguous (record stop selector vs. array literal) while both existed, and it
+  is why the flip needed no loader changes.
 
   The same bracket spelling is accepted for a **`grid`/`scatter` element's own `data`**, and
   there it is *not* sugar: `desugarArrays` deliberately skips those two block types, because
