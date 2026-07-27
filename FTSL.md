@@ -33,8 +33,9 @@ Consequences you must know:
   statements on one line.
 - A trailing option that is a **bareword** starts a *new* statement and will NOT be
   folded back into the previous one. This is why axis/scale options use `key=val`
-  form: `uv planar axis=y` (correct) vs `uv planar y` (the `y` is silently a stray
-  statement). See §9.
+  form: `uv planar axis=y` (correct) vs `uv planar y` (the `y` becomes a stray
+  statement). See §9. The stray no longer passes unnoticed — nothing in the loader
+  reads a key called `y`, so the unknown-key check (§1.3) reports it.
 - A `{` after a value opens a nested block whose *type* is the preceding word (or the
   statement key if none): `film { … }`, `table { … }`, `coat { … }`, `lens { … }`.
 
@@ -48,7 +49,33 @@ blocktype ["name"] [subtype] { … }
 - `light` takes a **subtype** bareword: `light area { … }`, `light spot { … }`, etc.
 - All other blocks are `type ["name"] { … }`.
 
-### 1.3 Conditional blocks (`prefer { … } else { … }`)
+### 1.3 Unknown keys are reported
+
+The loader tracks which statements a builder actually read. Once the scene is built,
+anything nobody looked at is reported to stderr:
+
+```
+[ftsl] warning: myscene.ftsl: sphere: unknown key 'priority' on line 42
+[ftsl] warning: myscene.ftsl: material "gold" > coat: unknown key 'thicknes' on line 51
+```
+
+This is a **warning, not an error** — the scene still renders, so an older file
+carrying a stale property keeps working. But it is worth heeding, because the
+alternative failure mode is the bad one: an unread property does *nothing*, so a
+typo, a property written on the wrong block (`priority` is a **material** slot, not a
+geometry one), or a generator that has drifted from the grammar quietly produces a
+**wrong image** rather than a complaint.
+
+The report names the enclosing block and nests with `>` for inner bodies. When a
+statement itself is unread the loader reports only that line and does not descend into
+its body — the body is unread by construction, and listing every child would bury the
+one line you actually have to fix.
+
+A few bodies are consumed as a flat token dump rather than as key/value statements —
+`data { … }`, `palette { … }`, a spectrum `table { … }`, and a `record` body (whose
+channel names the author invents) — so no key inside them can be "unknown".
+
+### 1.4 Conditional blocks (`prefer { … } else { … }`)
 
 A top-level `prefer` node holds ordered **branches**, each a complete list of top-level
 blocks. The loader trial-builds them in order and keeps the first branch that is

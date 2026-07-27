@@ -70,6 +70,50 @@ def test_sphere_container_and_open():
     assert "open on" in txt
 
 
+def test_march_and_uv_controls_emit():
+    # ftrace's addIsosurface reads samples/accuracy/refine/uv, but loom had no way to
+    # emit any of them, so a sampled march was stuck on the 256-sample default. This
+    # gap was found by the J3c emitter audit (scraps/emit_audit.py).
+    iso = Isosurface("gyroid", freq=2.0, material="m", method="sample",
+                     samples=300, accuracy=0.01, refine="regula_falsi",
+                     uv="planar axis=y")
+    txt = _emit(iso, Clock(t=0.0))
+    for line in ("method sample", "samples 300", "refine regula_falsi",
+                 "uv planar axis=y"):
+        assert line in txt, (line, txt)
+    assert "accuracy 0.01" in txt
+
+
+def test_march_and_uv_controls_omitted_by_default():
+    # None must mean "say nothing" so ftrace's own defaults still apply.
+    txt = _emit(Isosurface("gyroid", freq=2.0, material="m"), Clock(t=0.0))
+    for key in ("samples", "accuracy", "refine", "uv ", "method"):
+        assert key not in txt, (key, txt)
+
+
+def test_bareword_uv_axis_is_rejected():
+    # FTSL.md §2's documented trap: `uv planar y` parses the axis as a stray
+    # statement and is silently dropped, so the surface keeps default UVs. ftrace
+    # now warns about it, but loom must not emit it in the first place.
+    for bad in ("planar y", "planar axis=w", "spherical up", "cubic"):
+        try:
+            Isosurface("gyroid", freq=1.0, material="m", uv=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"uv={bad!r} should have been rejected")
+    for ok in ("planar", "spherical", "cylindrical axis=z"):
+        Isosurface("gyroid", freq=1.0, material="m", uv=ok)
+
+
+def test_bad_refine_and_method_are_rejected():
+    for kw in ({"refine": "newton"}, {"method": "raymarch"}):
+        try:
+            Isosurface("gyroid", freq=1.0, material="m", **kw)
+        except ValueError:
+            continue
+        raise AssertionError(f"{kw} should have been rejected")
+
+
 def test_placement_zero_is_byte_identical():
     # default placement (origin) must emit exactly like the un-placed form.
     a = _emit(gyroid_surface(freq=1.0, material="m"), Clock(t=0.0))

@@ -160,6 +160,19 @@ default demo render. Likewise a bare positional argument that looks like a file
 but isn't a recognized scene or mesh (e.g. `ftrace foo.xyz`) is a hard error, not
 a silent fall-through to the demo scene.
 
+The scene file gets the same treatment, one step softer. The loader tracks which
+properties a builder actually read, and reports the ones nobody looked at:
+
+```
+[ftsl] warning: myscene.ftsl: sphere: unknown key 'priority' on line 42
+```
+
+That's a warning rather than an error, so an older scene carrying a stale property
+still renders — but it's worth fixing, because an unread property does *nothing*. A
+typo, a property written on the wrong block (`priority` is a **material** slot, not a
+geometry one), or a scene generator that has drifted from the grammar would otherwise
+quietly produce a **wrong image** instead of a complaint. See FTSL.md §1.3.
+
 > **Quick mesh viewer.** A bare positional **mesh** path — `ftrace model.glb`
 > (also `.obj` / `.gltf` / `.fbx` / `.stl` / `.ply`) — wraps the mesh in a
 > synthesized, auto-lit scene (a neutral clay fallback material under a soft uniform

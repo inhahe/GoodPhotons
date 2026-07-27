@@ -64,6 +64,26 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `std::vector<Block>` — turning blocks into a `Scene` — lives here and is shared by
   both front ends; the hand-written *parser* is still compiled in behind
   `-legacy-parser` as a one-release escape hatch.
+  **Unknown-key reporting** (since 0.77.0) rides on this pass. `Stmt` carries a
+  `mutable bool used`, set inside `find(const Block&, const char*)` — the single choke
+  point every property read (`strOf`/`vec3Of`/`dblOf`/`spectrumParam`/…) funnels
+  through, so the accounting costs no per-builder changes. `mutable` is required
+  because reads take a `const Block&` and "I was read" isn't part of a block's logical
+  value. The ~17 sites that iterate `b.stmts` directly instead of calling `find` —
+  repeated-key gathers (`point`, `density_at`, `look_point`, `roll_at`/`fov_at`,
+  `layer`, `surface`, `key`), exhaustive dispatch loops (group children, isosurface
+  field elements and their nested CSG recursion, record bodies, record-override
+  materials), and flat-word bodies (`table`, `palette`, `data`) — mark explicitly via
+  `markUsed(b, key)` / `markAllUsed(b)`. After `Builder::build` finishes,
+  `collectUnusedKeys` walks the blocks and records anything still unmarked on
+  `Loaded::unknownKeys`; `loadSource` prints those to stderr before each success
+  return. Warnings are carried on `Loaded` rather than printed inside `build()`
+  because `prefer { } else { }` trial-builds several candidate scenes and discards all
+  but one — only the accepted candidate's warnings are the author's problem. The check
+  warns rather than errors so a scene with a stale property still renders; the point is
+  that an unread key otherwise silently does nothing, turning a typo or a drifted
+  emitter into a wrong image instead of a message. This is what makes the loom
+  emitter-drift audit (`scraps/emit_audit.py`, TODO J3c) mechanically possible at all.
   Lights are `Emitter`s with an `EmitterShape`
   (Quad/Sphere/Spot/Env/Cylinder/**Mesh**); each carries its own SPD and a `power`
   = emitIntegral·geomWeight selection weight. **Mesh area lights** (since 0.41.0): a

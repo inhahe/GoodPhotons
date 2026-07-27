@@ -173,6 +173,10 @@ class Isosurface(Element):
                  radius: float = math.pi,
                  max_gradient: float = 0.0,
                  method: str = "adaptive",
+                 samples: Optional[int] = None,
+                 accuracy: Optional[float] = None,
+                 refine: Optional[str] = None,
+                 uv: Optional[str] = None,
                  open: bool = False,
                  name: str = "iso") -> None:
         self.field: FieldFn = FIELDS[field] if isinstance(field, str) else field
@@ -189,7 +193,32 @@ class Isosurface(Element):
         self.center = tuple(float(c) for c in center)
         self.radius = float(radius)
         self.max_gradient = float(max_gradient)
+        if method not in ("adaptive", "sample", "fixed"):
+            raise ValueError('Isosurface method must be "adaptive", "sample" or "fixed"')
         self.method = method
+        # Fixed-step march controls — only meaningful under method="sample"/"fixed",
+        # where ftrace's step is box-diagonal/`samples`, else `accuracy` (a world
+        # length), else a 256-sample default. Emitting them was previously impossible
+        # from loom, so a sampled march was stuck on that default.
+        self.samples = None if samples is None else int(samples)
+        self.accuracy = None if accuracy is None else float(accuracy)
+        if refine is not None and refine not in ("bisect", "regula_falsi", "falsi", "secant"):
+            raise ValueError('Isosurface refine must be "bisect" or "regula_falsi"')
+        self.refine = refine
+        # Procedural UV wrap for pattern/expression materials on this native surface:
+        # "planar" / "spherical" / "cylindrical", optionally with " axis=x|y|z".
+        # The axis MUST be key=value — a bareword would parse as a stray statement
+        # (see FTSL.md §2), which is why it is validated here rather than passed raw.
+        if uv is not None:
+            parts = str(uv).split()
+            if not parts or parts[0] not in ("planar", "spherical", "cylindrical"):
+                raise ValueError('Isosurface uv must start with "planar", "spherical" '
+                                 f'or "cylindrical" (got {uv!r})')
+            for extra in parts[1:]:
+                if extra not in ("axis=x", "axis=y", "axis=z"):
+                    raise ValueError('Isosurface uv option must be axis=x|y|z '
+                                     f'(got {extra!r}); a bareword axis is silently dropped')
+        self.uv = uv
         self.open = bool(open)
         self.name = name
         # a transient parent Affine frame, set by an enclosing Room during its emit.
@@ -262,6 +291,14 @@ class Isosurface(Element):
             lines.append(f'    max_gradient {fmt(self.max_gradient)}')
         if self.method != "adaptive":
             lines.append(f'    method {self.method}')
+        if self.samples is not None:
+            lines.append(f'    samples {self.samples}')
+        if self.accuracy is not None:
+            lines.append(f'    accuracy {fmt(self.accuracy)}')
+        if self.refine is not None:
+            lines.append(f'    refine {self.refine}')
+        if self.uv is not None:
+            lines.append(f'    uv {self.uv}')
         if self.open:
             lines.append('    open on')
         lines.append('}')

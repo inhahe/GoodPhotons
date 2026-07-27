@@ -227,7 +227,6 @@ group {  # settled by tools/settle_scene.py
         }
         sphere { center 0.369 0.528 0.501  radius 0.067 }
         }
-        contained_by { min 0.08 0.08 0.12   max 0.92 0.92 0.88 }
     }
 }
 
@@ -264,7 +263,6 @@ group {  # settled by tools/settle_scene.py
         }
         sphere { center 0.520 0.500 0.495  radius 0.071 }
         }
-        contained_by { min 0.12 0.12 0.22   max 0.88 0.88 0.78 }
     }
 }
 
@@ -299,7 +297,6 @@ group {  # settled by tools/settle_scene.py
         }
             cylinder { translate 0.5 0.5 0.5  rotate 90 0 0  radius 0.14  height 0.78 }
         }
-        contained_by { min 0.04 0.04 0.04   max 0.96 0.96 0.96 }
     }
 }
 

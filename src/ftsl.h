@@ -210,7 +210,15 @@ inline void applyBracketGroup(Value& v, std::vector<BrItem> items,
     }
 }
 
-struct Stmt { std::string key; Value val; int line = 0; };
+// `used` records that some builder actually READ this statement. Nothing in the
+// loader behaves differently because of it — it exists so that after a scene is
+// built we can report the keys nobody looked at. An unknown key is otherwise
+// silently ignored, which is the worst possible failure mode: a misspelt or
+// drifted property (loom emitting `size` where ftrace wants `scale`, say) renders
+// a *wrong image* rather than raising an error. It is `mutable` because reads go
+// through `find(const Block&, ...)`, and "I was read" is not part of a block's
+// logical value.
+struct Stmt { std::string key; Value val; int line = 0; mutable bool used = false; };
 struct Block {
     std::string type;                  // material / quad / film / table / ...
     std::string subtype;               // light "area" / "collimated"
@@ -516,8 +524,44 @@ inline bool splitEq(const std::string& s, std::string& k, std::string& v) {
 
 // Find the statement with a given key in a block; nullptr if absent.
 inline const Stmt* find(const Block& b, const char* key) {
-    for (const auto& s : b.stmts) if (s.key == key) return &s;
+    for (const auto& s : b.stmts) if (s.key == key) { s.used = true; return &s; }
     return nullptr;
+}
+// Mark every statement with `key` as read. `find` only reaches the first one, so
+// the loops that gather a REPEATED key (`point`, `look_point`, `fwd_at`, a light's
+// `spd` stops, …) call this to account for the rest.
+inline void markUsed(const Block& b, const char* key) {
+    for (const auto& s : b.stmts) if (s.key == key) s.used = true;
+}
+// Mark a whole block read, for bodies whose content is consumed as the flat
+// `words` dump rather than key/value statements (`data { … }`, `palette { … }`,
+// a table's rows). Their "keys" are just the first token of each line, so
+// per-key accounting is meaningless there.
+inline void markAllUsed(const Block& b) {
+    for (const auto& s : b.stmts) s.used = true;
+}
+// Gather every statement no builder read, recursing into nested `{ }` bodies.
+// `where` names the enclosing block for the message ("material \"gold\"", then
+// "material \"gold\" > coat"). When a statement itself is unread we report only
+// it and do NOT descend — its whole body is unread by construction, and listing
+// each child would bury the one line the author actually has to fix.
+inline void collectUnusedKeys(const Block& b, const std::string& where,
+                              std::vector<std::string>& out) {
+    for (const auto& s : b.stmts) {
+        if (!s.used) {
+            out.push_back(where + ": unknown key '" + s.key + "'" +
+                          (s.line > 0 ? " on line " + std::to_string(s.line) : ""));
+            continue;
+        }
+        if (s.val.block) collectUnusedKeys(*s.val.block, where + " > " + s.key, out);
+    }
+}
+// Human-readable label for a top-level block, used by the message above.
+inline std::string blockLabel(const Block& b) {
+    std::string s = b.type;
+    if (!b.subtype.empty()) s += " " + b.subtype;
+    if (!b.name.empty()) s += " \"" + b.name + "\"";
+    return s;
 }
 inline std::string strOf(const Block& b, const char* key, const std::string& dflt = "") {
     const Stmt* s = find(b, key);
@@ -813,6 +857,11 @@ struct Loaded {
     int res = -1;                // -1 = not specified
     std::string device;          // empty = not specified
     std::string out;             // empty = not specified
+    // Keys no builder read (see collectUnusedKeys). Carried on Loaded rather than
+    // printed inside build() because `prefer { } else { }` builds several candidate
+    // scenes and discards all but one — only the accepted candidate's warnings are
+    // the author's problem.
+    std::vector<std::string> unknownKeys;
 };
 
 class Builder {
@@ -858,7 +907,14 @@ public:
 
         // Pass 1: collect named spectra (resolve refs lazily), materials, camera.
         for (const auto& b : blocks)
-            if (b.type == "spectrum") spectraBlocks_[b.name] = &b;
+            if (b.type == "spectrum") {
+                spectraBlocks_[b.name] = &b;
+                // A `spectrum "x" = <expr>` parses to one synthetic `=` statement, read
+                // lazily only if something references the spectrum. Count it as read at
+                // DECLARATION time: an unreferenced spectrum is pointless but legal, and
+                // is not an unknown-key problem.
+                markUsed(b, "=");
+            }
 
         // Pass 1-arr: desugar inline `[ … ](coords)` array literals into anonymous
         // `grid` + `pattern` block pairs, APPENDED to `blocks`. Running it before Pass 1a
@@ -972,6 +1028,14 @@ public:
         // in a light or material silently falls back otherwise). Any recorded error
         // is fatal — surface it instead of rendering a wrong scene.
         if (!err.empty()) return false;
+
+        // Every property has now been read by whichever pass wanted it, so anything
+        // still unmarked is a key nothing in the loader understands — a typo, a
+        // property put on the wrong block, or an emitter that has drifted from the
+        // grammar. Collect them for the caller to report; silently ignoring them is
+        // how a misspelt key turns into a wrong image instead of a message.
+        for (const auto& b : blocks)
+            collectUnusedKeys(b, blockLabel(b), L.unknownKeys);
 
         // build() finalizes tris/BVH and the emitter set (per-emitter samplers were
         // built in addLight; finalizeEmitters computes powers, the selection CDF,
@@ -1298,6 +1362,7 @@ private:
         if (v.block && v.block->type == "table") {
             std::vector<std::pair<double, double>> pairs;
             bool cubic = false;
+            markAllUsed(*v.block);   // a flat `λ:value` list, not key/value statements
             for (const auto& w : v.block->words) {
                 if (w.rfind("interp=", 0) == 0) { cubic = interpIsCubic(w); continue; }
                 auto p = w.find(':');
@@ -1424,6 +1489,18 @@ private:
                      "isn't a spectrum; tag it, e.g. `rgb " + w[0] + " " + w[1] + " " + w[2] + "`");
                 return constantSpectrum(0);
             }
+        }
+        // Reaching here with a `texture:` prefix means the slot has no texture path.
+        // Only the two Lambertian families bind a reflect texture (bindReflectTexture);
+        // the specular ones read the reflect slot directly and have nowhere to sample a
+        // UV from (see reflectSlot in scene.h). Say THAT, rather than making the author
+        // wonder why a texture name isn't a valid spectrum.
+        if (h.rfind("texture:", 0) == 0) {
+            fail("'" + h + "': this slot takes a spectrum, not a texture — only the "
+                 "`reflect` slot of a `diffuse`/`translucent` material binds an image "
+                 "albedo. Use `pattern:<name>` for a procedural drive, or a uniform "
+                 "spectrum here");
+            return constantSpectrum(0);
         }
         fail("unrecognized spectrum expression '" + h + "'");
         return constantSpectrum(0);
@@ -1576,6 +1653,7 @@ private:
             // texture's red channel then selects an entry per texel (nearest, no upsample).
             if (const Stmt* ps = find(b, "palette")) {
                 if (!ps->val.block) { fail("texture '" + b.name + "': palette needs a { } body"); return false; }
+                markAllUsed(*ps->val.block);   // a flat (index, spectrum-ref) list
                 const auto& w = ps->val.block->words;
                 if (w.empty() || (w.size() % 2) != 0) {
                     fail("texture '" + b.name + "': palette needs (index spectrum) pairs"); return false;
@@ -2002,6 +2080,7 @@ private:
             samples.reserve(words.size());
             for (const auto& w : words) samples.push_back((float)num(w));
         } else {
+            if (ds->val.block) markAllUsed(*ds->val.block);   // a flat numeric sample list
             const std::vector<std::string>& dw = ds->val.block ? ds->val.block->words : ds->val.words;
             samples.reserve(dw.size());
             for (const auto& w : dw) {
@@ -2201,6 +2280,7 @@ private:
             flat.reserve(words.size());
             for (const auto& w : words) flat.push_back((float)num(w));
         } else {
+            if (ds->val.block) markAllUsed(*ds->val.block);   // a flat numeric sample list
             const std::vector<std::string>& dw = ds->val.block ? ds->val.block->words : ds->val.words;
             flat.reserve(dw.size());
             for (const auto& w : dw) {
@@ -2281,6 +2361,10 @@ private:
         Record rec;
         rec.name = b.name;
         bool haveRange = false;
+        // Every line of a record body is meaningful — `range`, `interp`, or a CHANNEL
+        // whose name the author invents — so there is no such thing as an unknown key
+        // here and the whole body counts as read.
+        markAllUsed(b);
         for (const auto& s : b.stmts) {
             if (s.key == "range") {
                 if (!parseRecordDomain(s.val.words, rec.lo, rec.hi)) {
@@ -2419,6 +2503,10 @@ private:
         std::unordered_map<std::string, ImportedChan> imported;
         std::unordered_map<std::string, std::pair<int, std::vector<PatNode>>> fromDriver;  // recName -> (idx,drv)
 
+        // This loop is exhaustive — every statement is `type`, `from`, or a `slot = rhs`
+        // assignment, and an unrecognised slot hard-fails below — so nothing here can be
+        // an unread key.
+        markAllUsed(b);
         for (const auto& s : b.stmts) {
             if (s.key == "type") continue;                       // already handled
             if (s.key == "from") {
@@ -2673,6 +2761,7 @@ private:
             m.substrateK = spectrumParam(b, "substrate_k", constantSpectrum(0.0));
             for (const auto& s : b.stmts) {
                 if (s.key != "layer") continue;
+                s.used = true;
                 if (s.val.words.size() < 3) { fail("multilayer 'layer' needs: <n> <k> <thickness_nm>"); return m; }
                 m.layerN.push_back(num(s.val.words[0]));
                 m.layerK.push_back(num(s.val.words[1]));
@@ -2773,6 +2862,7 @@ private:
         double sum = 0.0;
         for (const auto& s : b.stmts) {
             if (s.key != "layer") continue;
+            s.used = true;
             if (s.val.words.size() < 2) { fail("mix 'layer' needs a material name and a weight"); return false; }
             const std::string& cname = s.val.words[0];
             double w = num(s.val.words[1]);
@@ -3255,6 +3345,7 @@ private:
         for (const auto& s : b.stmts) {
             const Block* cb = s.val.block.get();
             if (!cb) continue;
+            s.used = true;   // a child block: dispatched below, or rejected by name
             if      (s.key == "sphere")   { if (!addSphere(*cb, L, world)) return false; }
             else if (s.key == "quad")     { if (!addQuad(*cb, L, world)) return false; }
             else if (s.key == "triangle") { if (!addTriangle(*cb, L, world)) return false; }
@@ -3418,6 +3509,7 @@ private:
         int nChild = 0;
         for (const auto& cs : b->stmts) {
             if (!cs.val.block) continue;              // transform-only / k stmts carry no block
+            cs.used = true;   // a nested field element, validated by name on recursion
             if (!buildFieldStmt(cs, xf, out, exprPool)) return false;
             if (++nChild >= 2) { FieldNode c; c.op = op; c.p[0] = kBlend; out.push_back(c); }
         }
@@ -3436,7 +3528,10 @@ private:
         int nRoot = 0;
         for (const auto& cs : b.stmts) {
             if (!cs.val.block) continue;              // skip material/translate/rotate/scale
-            if (cs.key == "contained_by") continue;   // container box, not a field element
+            // The container box is read below (only the `function { }` branch requires
+            // one, but it is always meaningful), not treated as a field element here.
+            if (cs.key == "contained_by") { cs.used = true; continue; }
+            cs.used = true;   // a field element, validated by name in buildFieldStmt
             if (!buildFieldStmt(cs, rootXf, nodes, exprPool)) return false;
             ++nRoot;
         }
@@ -4342,6 +4437,7 @@ private:
         int nSurf = 0;
         for (const auto& s : lb.stmts) {
             if (s.key != "surface") continue;
+            s.used = true;
             const auto& wds = s.val.words;
             if (wds.size() < 4) { fail("camera '" + cs.name + "' lens: `surface` needs "
                                        "<radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]"); return false; }
@@ -4510,6 +4606,7 @@ private:
         std::vector<Key> keys;
         for (const auto& s : b.stmts) {
             if (s.key != "key") continue;
+            s.used = true;
             const auto& w = s.val.words;
             size_t n = w.size();
             if (n != 4 && n != 5 && n != 7 && n != 8) {
@@ -4710,6 +4807,7 @@ private:
         std::vector<Vec3> pts;
         for (const auto& s : b.stmts) {
             if (s.key != "point") continue;
+            s.used = true;
             if (s.val.words.size() < 3) { fail("camera_curve '" + base + "' point needs x y z"); return false; }
             pts.push_back(P(Vec3{num(s.val.words[0]), num(s.val.words[1]), num(s.val.words[2])}));
         }
@@ -4744,6 +4842,7 @@ private:
         std::vector<DKey> dkeys;
         for (const auto& s : b.stmts) {
             if (s.key != "density_at") continue;
+            s.used = true;
             if (s.val.words.size() < 2) { fail("camera_curve '" + base + "' density_at needs: <t> <rho>"); return false; }
             dkeys.push_back({num(s.val.words[0]), num(s.val.words[1]) / L_});
         }
@@ -4829,6 +4928,7 @@ private:
         std::vector<Vec3> lookPts;
         for (const auto& s : b.stmts) {
             if (s.key != "look_point") continue;
+            s.used = true;
             if (s.val.words.size() < 3) { fail("camera_curve '" + base + "' look_point needs x y z"); return false; }
             lookPts.push_back(P(Vec3{num(s.val.words[0]), num(s.val.words[1]), num(s.val.words[2])}));
         }
@@ -4867,6 +4967,7 @@ private:
             ScalarTrack tk;
             for (const auto& s : b.stmts) {
                 if (s.key != atKey) continue;
+                s.used = true;
                 if (s.val.words.size() < 2) {
                     fail("camera_curve '" + base + "' " + atKey + " needs: <t> <value>");
                     trkOk = false; continue;
@@ -4996,6 +5097,7 @@ private:
             Vec3Track tk;
             for (const auto& s : b.stmts) {
                 if (s.key != atKey) continue;
+                s.used = true;
                 if (s.val.words.size() < 4) {
                     fail("camera_curve '" + base + "' " + atKey + " needs: <t> <x> <y> <z>");
                     vecTrkOk = false; continue;
@@ -5363,6 +5465,15 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
         return true;
     };
 
+    // Report the keys nothing in the loader read. A warning rather than an error:
+    // the check is new, and an old scene carrying a stale property should still
+    // render — but it must SAY so, because the alternative (today's behaviour) is
+    // that the property silently does nothing and the author blames the renderer.
+    auto reportUnknownKeys = [&](const Loaded& out) {
+        for (const std::string& w : out.unknownKeys)
+            std::fprintf(stderr, "[ftsl] warning: %s: %s\n", nameForMsgs.c_str(), w.c_str());
+    };
+
     std::vector<Block> blocks;
     if (ftsl_gpda::use_legacy()) {
         if (!legacy_parse(blocks, err)) return false;
@@ -5381,6 +5492,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     if (preferIdx.empty()) {
         Builder bld;
         if (!bld.build(blocks, L)) { err = bld.err; return false; }
+        reportUnknownKeys(L);
         return true;
     }
 
@@ -5456,6 +5568,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     for (size_t j = 0; j < preferIdx.size(); ++j)
         std::printf("[prefer] using branch %d of %d\n",
                     choice[j] + 1, (int)blocks[preferIdx[j]].branches.size());
+    reportUnknownKeys(L);
     return true;
 }
 

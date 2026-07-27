@@ -2070,6 +2070,23 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       light / camera — DONE), stop extending the loom reader and pivot to (i) porting the grammar into ftrace and
       (ii) J3b item 3. Remaining loom-reader breadth (mesh-ref, `medium`, `pattern`, whole-`scene` wrapper + a
       `Scene` builder) is deferred — see next bullet.
+      **EMITTER-DRIFT AUDIT — DONE (2026-07-26, 0.77.0).** The "audit every `Element.emit` against the live
+      grammar" half is closed, but *not* by inspection: it was unachievable that way, because ftrace silently
+      ignored unknown keys, so a drifted property renders a wrong image rather than raising. The prerequisite
+      was a **diagnostic**, so that got built first — `Stmt::used` marked inside `find()` (the one choke point
+      every property read funnels through), `collectUnusedKeys` at the end of `Builder::build`, reported from
+      `loadSource` as an `[ftsl] warning`. See design.md's `ftsl.h` entry and FTSL.md §1.3. With that in place
+      the audit is mechanical: `scraps/emit_audit.py` builds one scene per Element kind (11: sphere, beads,
+      group, sweptmesh, isosurface, funcpattern, texture, proctexture, mixmaterial, volume, cameracurve) with
+      its drift-prone optional fields exercised, emits it, loads it under `-zzz-stop`, and fails on any
+      unknown-key warning. **Result: all 11 clean**, all 78 checked-in `scenes/*.ftsl` clean, 1083 loom tests
+      green. Real drift found and fixed: loom's `Isosurface` could not emit `samples` / `accuracy` / `refine` /
+      `uv`, so a sampled march was stuck on ftrace's 256-sample default (`tools/loom/loom/iso.py`; `uv` is
+      validated against the bareword-axis trap rather than passed raw). Real corpus bugs found and fixed:
+      `priority` authored on geometry in `scenes/_record_scalar.ftsl` (it is a **material** slot), and 6 dead
+      `contained_by` lines on pure-analytic isosurfaces in the two gallery scenes (the loader only reads it for
+      `function` fields — analytic CSG bounds itself, and a manual clip is spelled `intersect { box … }`).
+      The remaining J3c half — `.ftsl` → loom Element tree — is still open (and see the deferred bullet below).
 - [ ] **FUTURE — loom full `.ftsl` read support** (deferred out of J3c above). Give loom a complete `.ftsl` → `Scene`
       reader (not just per-element round-trip): the whole-file `scene { … }` wrapper rule + a `Scene` builder that
       reassembles textures/patterns/records/materials/geometry/lights/camera into a live `Scene`, plus the lossy
@@ -2878,6 +2895,24 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-26: **0.77.0 — the loader reports unknown keys, and J3c's emitter-drift audit is closed with it.**
+  The audit ("check every `Element.emit` against the live grammar") could not be done by reading code: ftrace
+  silently ignored any key no builder read, so drift produces a *wrong image* rather than an error. Built the
+  missing diagnostic at the one choke point — `Stmt` gained a `mutable bool used` set inside
+  `find(const Block&, const char*)`, which every property read (`strOf`/`vec3Of`/`dblOf`/`spectrumParam`/…)
+  funnels through, so it cost zero per-builder changes. ~17 sites that iterate `b.stmts` directly (repeated-key
+  gathers, exhaustive dispatch loops, flat-word `data`/`palette`/`table` bodies) mark explicitly via
+  `markUsed`/`markAllUsed` — each of those was *discovered* by the corpus sweep naming its own false positive,
+  316 → 89 → 12 → 0. `collectUnusedKeys` runs at the end of `Builder::build` and reports via `Loaded::unknownKeys`
+  (carried, not printed inline, because `prefer { } else { }` trial-builds candidates and discards all but one).
+  A **warning**, not an error: an old scene with a stale property must still render, but it must say so.
+  Also made `evalSpectrum` explain a `texture:` in a non-texture slot instead of "unrecognized spectrum
+  expression". Then ran the audit (`scraps/emit_audit.py`, 11 Element kinds): **all clean**, plus all 78
+  checked-in scenes and 1083 loom tests. Real finds fixed: loom's `Isosurface` couldn't emit
+  `samples`/`accuracy`/`refine`/`uv` (a sampled march was pinned to the 256-sample default — 4 new tests,
+  including the FTSL §2 bareword-axis trap); `priority` authored on geometry in `scenes/_record_scalar.ftsl`
+  (it's a material slot); 6 dead `contained_by` lines on pure-analytic gallery isosurfaces. Docs: FTSL.md §1.3
+  (new; `prefer` renumbered to §1.4), README diagnostics, design.md `ftsl.h`.
 - 2026-07-19: **J3c started (option-a) — GPDA vendored + shared grammar reads the record block.** Stood up
   `loom/grammar/`: vendored the pinned tokenized `gpda.py` as `_gpda.py` (GraphParser commit 1ac4cbf,
   self-contained — only `import re`) with a provenance header; the shared EPEG grammar `ftsl.epeg` (start=`record`,
