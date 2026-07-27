@@ -2976,6 +2976,29 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-27: **0.83.0 — the viewer's Modulator DAG pane now shows the whole graph
+  (adaptive height + wrapping layers + a real zoom).** Reported as "the modular DAG pane doesn't seem to
+  be tall enough to show the whole thing," and it had three independent causes. (1) The pane was a
+  hard-coded 360 px child; it now sizes to `min(extent.y, remaining side-column height)` so it fills
+  whatever the window leaves it. (2) The layout was structurally taller than *any* pane: longest-path
+  layering puts every leaf in level 0, and the stress sidecar has 60 of them — ~6600 px of column no
+  matter how tall the pane is. `measureDag()` now **wraps each level into sub-columns** against the
+  available height, so a wide-and-shallow graph turns into a grid instead of one endless column. The
+  first frame has to *estimate* node boxes (imnodes hasn't laid them out yet), and an estimate that
+  ignores `NodePadding` and the DPI-scaled font overlaps nodes — so after `EndNodeEditor()` the panel
+  reads back `ImNodes::GetNodeDimensions()` for every node and, if any differs, re-wraps next frame from
+  the *real* rects. That settles in two frames and is DPI-correct by construction rather than by fudge
+  factor. (3) Even a full-window pane can't show a graph wider than the canvas, and **this imnodes build
+  has no zoom at all** — only panning. So the panel implements one: ImGui 1.92's dynamic fonts make
+  `PushFont(NULL, style.FontSizeBase * zoom)` a crisp re-raster (not a bitmap stretch), and scaling
+  `ItemSpacing` + `ImNodesStyleVar_NodePadding` by the same factor scales the node boxes with it — a real
+  zoom, at the cost of it being a *re-layout* rather than a transform, which is why the wrap re-measures
+  on zoom. Wheel zooms (15–300%); **fit** runs an iterative solve (the extent isn't a closed-form function
+  of zoom once wrapping is involved) — width-only, `sqrt`-damped, and gated on the read-back having
+  settled, because comparing *height* is useless when wrapping pins `extent.y ≈ availH` by construction.
+  **maximize** re-hosts the same graph in a full-viewport window (Esc/`dock` to return), auto-fits on
+  entry and re-fits on resize. The child uses `NoScrollbar | NoScrollWithMouse` — `NoScrollWithMouse`
+  alone still forwards the wheel to the parent, which scrolled the side column out from under the zoom.
 - 2026-07-27: **0.82.0 — `emit pattern:` / `emit_map` now runs on the CUDA backends; the last 0.80.0
   tech-debt item is closed.** Emission is the one throughput slot read from **both sides of transport** —
   emission-on-hit (the s=0 / direct-hit / specular-arrival strategy) *and* the Le at a point the emitter

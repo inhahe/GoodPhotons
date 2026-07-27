@@ -1464,7 +1464,18 @@ static std::string dagDetail(const minijson::Value& n) {
 struct DagGraph {
     std::vector<DagNode> nodes;
     std::vector<DagEdge> edges;
-    bool laidOut = false;   // grid positions applied on the first frame only
+    std::vector<ImVec2>  pos;             // grid-space position per node (parallel to nodes)
+    std::vector<ImVec2>  realSize;        // node rects imnodes actually produced
+    bool   sizesValid = false;            // realSize populated (after one drawn frame)
+    ImVec2 extent = ImVec2(0.0f, 0.0f);   // laid-out bounding box, grid space
+    float  measuredFont = 0.0f;           // font size the measure ran at (re-measure on DPI change)
+    float  measuredAvailH = -1.0f;        // pane height the wrap was measured against
+    float  zoom = 1.0f;                   // font/padding scale — a real zoom (imnodes has none)
+    int    fitFrames = 0;                 // frames left of an iterative "fit the whole graph" solve
+    bool   fitted = false;                // last fit converged: keep it fitted across resizes
+    float  fitCanvasW = 0.0f;             // canvas width that fit was solved for
+    bool laidOut  = false;                // grid positions applied to imnodes yet?
+    bool maximized = false;               // show the graph full-window instead of in the side column
 };
 
 // imnodes id namespaces (node ids from loom are small; keep pins/links clear of them)
@@ -1500,9 +1511,60 @@ static DagGraph collectDag(const Sidecar& sc) {
     return g;
 }
 
+// Size a node box the way imnodes will: the node grows to its widest ImGui item and
+// to the sum of its rows. Mirroring the exact lines drawDagPanel emits (title, label,
+// axes, detail, one row per input pin) means the layout below can leave real gaps
+// instead of the old fixed 230x95 grid pitch, which overlapped as soon as a node had
+// several input pins and broke outright at >100% DPI (bigger text, same pitch).
+static ImVec2 dagNodeSize(const DagGraph& g, const DagNode& n,
+                          const std::vector<int>* inEdges) {
+    const float lineH = ImGui::GetTextLineHeightWithSpacing();
+    char buf[512];
+    const bool titled = !n.label.empty() && n.label != n.op;
+    snprintf(buf, sizeof buf, "%s  #%d", n.op.c_str(), n.id);
+    float w = ImGui::CalcTextSize(buf).x;
+    int   rows = 1;                                    // title bar
+    if (titled) {
+        snprintf(buf, sizeof buf, "= %s", n.label.c_str());
+        w = std::max(w, ImGui::CalcTextSize(buf).x); ++rows;
+    }
+    if (!n.axes.empty()) {
+        snprintf(buf, sizeof buf, "axes %s", n.axes.c_str());
+        w = std::max(w, ImGui::CalcTextSize(buf).x); ++rows;
+    }
+    if (!n.detail.empty()) {
+        w = std::max(w, ImGui::CalcTextSize(n.detail.c_str()).x); ++rows;
+    }
+    if (inEdges)
+        for (int ei : *inEdges) {
+            const DagEdge& e = g.edges[ei];
+            if (e.mode.empty()) snprintf(buf, sizeof buf, "%s", e.param.c_str());
+            else                snprintf(buf, sizeof buf, "%s x%g", e.param.c_str(), e.gain);
+            w = std::max(w, ImGui::CalcTextSize(buf).x); ++rows;
+        }
+    const ImVec2 pad = ImNodes::GetStyle().NodePadding;
+    // + pin circles either side, + the (empty) output attribute's own row
+    return ImVec2(w + pad.x * 2.0f + lineH * 1.6f,
+                  rows * lineH + pad.y * 2.0f + lineH * 0.5f);
+}
+
 // Longest-path layering (level = max over incoming edges of src level + 1) so the
 // graph reads left→right from leaves (constants/oscillators) to the params they drive.
-static void layoutDag(DagGraph& g) {
+// Purely a measurement pass — no imnodes calls, so it can run before the editor
+// begins and hand the caller a real extent to size the pane with.
+//
+// `availH` is the height the caller can actually show. A level wider than that wraps
+// into side-by-side sub-columns instead of running off the bottom: a typical loom DAG
+// is mostly leaves (a `field.viewer.json` here has 60 of its 78 nodes at level 0), so
+// the old one-column-per-level layout was ~6600 px tall and no pane could ever show it.
+static void measureDag(DagGraph& g, float availH) {
+    g.pos.assign(g.nodes.size(), ImVec2(0.0f, 0.0f));
+    g.extent = ImVec2(0.0f, 0.0f);
+    g.measuredFont  = ImGui::GetFontSize();
+    g.measuredAvailH = availH;
+    g.laidOut = false;                                  // positions still need applying
+    if (g.nodes.empty()) return;
+
     std::unordered_map<int, std::vector<int>> incoming;  // dst -> [src...]
     for (const auto& e : g.edges) incoming[e.dst].push_back(e.src);
     std::unordered_map<int, int> level;
@@ -1520,24 +1582,104 @@ static void layoutDag(DagGraph& g) {
         level[id] = mx;
         return mx;
     };
-    std::map<int, int> rowInLevel;
-    for (const auto& n : g.nodes) {
-        int L = lvl(n.id);
-        int row = rowInLevel[L]++;
-        ImNodes::SetNodeGridSpacePos(n.id, ImVec2((float)L * 230.0f, (float)row * 95.0f));
+    std::unordered_map<int, std::vector<int>> inEdges;   // node id -> [edge index...]
+    for (int i = 0; i < (int)g.edges.size(); ++i) inEdges[g.edges[i].dst].push_back(i);
+
+    std::map<int, std::vector<int>> byLevel;             // level -> [node index...]
+    for (size_t i = 0; i < g.nodes.size(); ++i) byLevel[lvl(g.nodes[i].id)].push_back((int)i);
+
+    // Real rects once imnodes has drawn a frame; the text estimate only has to carry
+    // the very first layout (it can't know imnodes' own padding or the DPI scaling).
+    std::vector<ImVec2> sz(g.nodes.size());
+    for (size_t i = 0; i < g.nodes.size(); ++i) {
+        if (g.sizesValid && g.realSize[i].x > 0.0f && g.realSize[i].y > 0.0f) {
+            sz[i] = g.realSize[i];
+            continue;
+        }
+        auto it = inEdges.find(g.nodes[i].id);
+        sz[i] = dagNodeSize(g, g.nodes[i], it == inEdges.end() ? nullptr : &it->second);
+    }
+
+    const float lineH  = ImGui::GetTextLineHeightWithSpacing();
+    const float colGap = lineH * 2.2f, rowGap = lineH * 0.9f;
+    const float budget = std::max(availH, lineH * 8.0f);   // never wrap after one node
+    float x = 0.0f;
+    for (const auto& lv : byLevel) {
+        float y = 0.0f, colW = 0.0f;
+        for (int idx : lv.second) {
+            if (y > 0.0f && y + sz[idx].y > budget) {      // wrap into a sub-column
+                x += colW + colGap;
+                y = 0.0f; colW = 0.0f;
+            }
+            g.pos[idx] = ImVec2(x, y);
+            y += sz[idx].y + rowGap;
+            colW = std::max(colW, sz[idx].x);
+            g.extent.y = std::max(g.extent.y, y - rowGap);
+        }
+        g.extent.x = std::max(g.extent.x, x + colW);
+        x += colW + colGap;
     }
 }
 
-static void drawDagPanel(DagGraph& g) {
+// Re-measure only when the graph, the text metrics (DPI / font scale) or the height
+// we have to fill changed.
+static void dagEnsureMeasured(DagGraph& g, float availH) {
+    if (g.pos.size() != g.nodes.size() || g.measuredFont != ImGui::GetFontSize() ||
+        std::fabs(g.measuredAvailH - availH) > 1.0f)
+        measureDag(g, availH);
+}
+
+// Non-graph vertical cost of the pane: child border/padding + the hint line + slack.
+static float dagChrome() {
+    return ImGui::GetStyle().WindowPadding.y * 2.0f + ImGui::GetTextLineHeightWithSpacing() * 2.0f;
+}
+
+// availH < 0 means "wrap to whatever this canvas actually is" — used by the maximized
+// view, where the canvas is a function of the window alone, so measuring against it
+// can't feed back into the pane's own size.
+static void drawDagPanel(DagGraph& g, float availH) {
     if (g.nodes.empty()) { ImGui::TextDisabled("(no modulator DAG)"); return; }
-    ImGui::TextDisabled("%d nodes, %d edges - drag to pan, scroll to zoom",
-                        (int)g.nodes.size(), (int)g.edges.size());
+    ImGui::TextDisabled("%d nodes, %d edges - drag to pan, wheel to zoom (%.0f%%)",
+                        (int)g.nodes.size(), (int)g.edges.size(), g.zoom * 100.0f);
+    const float canvasW = ImGui::GetContentRegionAvail().x;
+    const float canvasH = ImGui::GetContentRegionAvail().y;
+    if (availH < 0.0f)   // maximized: wrap to the canvas we were actually given
+        availH = canvasH - ImGui::GetTextLineHeightWithSpacing();
+
+    // Wheel zoom. imnodes has no zoom of its own, but scaling the font and the paddings
+    // shrinks the nodes for real, and the layout follows because it re-wraps from the
+    // rects imnodes reports. The pane is NoScrollbar|NoScrollWithMouse, so the wheel is
+    // ours and never scrolls the column behind it.
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
+        const float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+            g.zoom = std::min(std::max(g.zoom * std::pow(1.12f, wheel), 0.15f), 3.0f);
+            g.fitFrames = 0;
+            g.fitted = false;             // the user is driving the zoom now
+        }
+    }
+    // A pane resize invalidates a previous fit — re-solve so "show me all of it" stays
+    // true when the window changes size or the panel is docked/maximized.
+    if (g.fitted && (std::fabs(g.measuredAvailH - availH) > 1.0f ||
+                     std::fabs(g.fitCanvasW - canvasW) > 1.0f))
+        g.fitFrames = 16;
+    dagEnsureMeasured(g, availH);
     // per-node incoming edges (each becomes a labelled input pin)
     std::unordered_map<int, std::vector<int>> inEdges;   // node id -> [edge index...]
     for (int i = 0; i < (int)g.edges.size(); ++i) inEdges[g.edges[i].dst].push_back(i);
 
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const ImVec2 nodePad = ImNodes::GetStyle().NodePadding;
+    ImGui::PushFont(nullptr, st.FontSizeBase * g.zoom);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(st.ItemSpacing.x * g.zoom, st.ItemSpacing.y * g.zoom));
+    ImNodes::PushStyleVar(ImNodesStyleVar_NodePadding,
+                          ImVec2(nodePad.x * g.zoom, nodePad.y * g.zoom));
     ImNodes::BeginNodeEditor();
-    if (!g.laidOut) layoutDag(g);   // must be inside Begin/EndNodeEditor
+    if (!g.laidOut) {               // must be inside Begin/EndNodeEditor
+        for (size_t i = 0; i < g.nodes.size(); ++i)
+            ImNodes::SetNodeGridSpacePos(g.nodes[i].id, g.pos[i]);
+    }
     for (const auto& n : g.nodes) {
         ImNodes::BeginNode(n.id);
         ImNodes::BeginNodeTitleBar();
@@ -1573,6 +1715,52 @@ static void drawDagPanel(DagGraph& g) {
         ImNodes::Link(i, DAG_OUT_BASE + g.edges[i].src, DAG_IN_BASE + i);
     ImNodes::EndNodeEditor();
     g.laidOut = true;
+    ImNodes::PopStyleVar();
+    ImGui::PopStyleVar();
+    ImGui::PopFont();
+
+    // imnodes now knows each node's true rect (its own padding, the DPI-scaled font,
+    // the pin rows). Adopt those and re-wrap once — otherwise the first-frame text
+    // estimate decides the packing and a column can overhang the bottom of the pane.
+    if (g.realSize.size() != g.nodes.size()) g.realSize.assign(g.nodes.size(), ImVec2(0.0f, 0.0f));
+    bool sizeChanged = false;
+    for (size_t i = 0; i < g.nodes.size(); ++i) {
+        ImVec2 d = ImNodes::GetNodeDimensions(g.nodes[i].id);
+        if (d.x <= 0.0f || d.y <= 0.0f) continue;
+        if (std::fabs(d.x - g.realSize[i].x) > 1.0f || std::fabs(d.y - g.realSize[i].y) > 1.0f) {
+            g.realSize[i] = d;
+            sizeChanged = true;
+        }
+    }
+    if (sizeChanged) { g.sizesValid = true; g.pos.clear(); }   // re-measure next frame
+
+    // "fit": iterate zoom towards the scale at which the whole graph is on screen.
+    // One shot isn't enough — a smaller zoom lets more nodes stack per column, which
+    // changes the wrap and so the width — so it converges over a few (invisible) frames.
+    // Each step waits for the layout to settle (node rects stable, positions current),
+    // otherwise it compounds a correction that hasn't taken effect yet and collapses the
+    // graph to a speck.
+    const bool settled = !sizeChanged && g.pos.size() == g.nodes.size();
+    if (g.fitFrames > 0 && settled && g.extent.x > 1.0f && g.extent.y > 1.0f) {
+        --g.fitFrames;
+        // Only the width is a real constraint: the wrap already pins the height to the
+        // pane, so extent.y ~= availH at every zoom and its ratio says nothing. Step
+        // towards canvasW with a square-root damping, because zooming in also costs
+        // sub-columns (width grows faster than the zoom does).
+        const float s = canvasW / g.extent.x;
+        if (s < 0.98f || s > 1.03f) {
+            const float step = std::min(std::max(std::sqrt(s), 0.6f), 1.5f);
+            // 0.30 is the floor (labels stop being readable) and 1.0 the ceiling (fit
+            // shows the graph, it doesn't magnify it).
+            g.zoom = std::min(std::max(g.zoom * step, 0.30f), 1.0f);
+            g.pos.clear();
+        } else {
+            g.fitFrames = 0;
+            g.fitted = true;
+            g.fitCanvasW = canvasW;
+        }
+        ImNodes::EditorContextResetPanning(ImVec2(0.0f, 0.0f));
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -1853,10 +2041,41 @@ int runViewerGui(const std::string& sidecarPath) {
         if (ImGui::CollapsingHeader("Datasets", ImGuiTreeNodeFlags_DefaultOpen))
             drawDatasetsPanel(sc);
         if (ImGui::CollapsingHeader("Modulator DAG", ImGuiTreeNodeFlags_DefaultOpen)) {
-            // imnodes wants its own non-scrolling area (it pans on drag itself)
-            ImGui::BeginChild("dagpane", ImVec2(0, 360), true);
-            drawDagPanel(dag);
-            ImGui::EndChild();
+            if (ImGui::Button(dag.maximized ? "dock" : "maximize")) {
+                dag.maximized = !dag.maximized;
+                // Going full-window is the "let me see all of it" gesture, so fit there;
+                // coming back to the narrow column, readable 100% beats a thumbnail.
+                if (dag.maximized) dag.fitFrames = 16;
+                else { dag.zoom = 1.0f; dag.fitFrames = 0; dag.fitted = false; dag.pos.clear(); }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("fit")) dag.fitFrames = 16;       // zoom until it all shows
+            ImGui::SameLine();
+            if (ImGui::Button("100%")) {
+                dag.zoom = 1.0f; dag.fitFrames = 0; dag.fitted = false; dag.pos.clear();
+                ImNodes::EditorContextResetPanning(ImVec2(0.0f, 0.0f));
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("re-layout")) {
+                dag.pos.clear();                   // re-measure at the current pane size
+                ImNodes::EditorContextResetPanning(ImVec2(0.0f, 0.0f));
+            }
+            if (dag.maximized) {
+                ImGui::TextDisabled("(shown full-window - Esc to dock)");
+            } else {
+                // imnodes wants its own non-scrolling area (it pans on drag itself).
+                // The pane takes what is left of the side column (so nothing is cut off
+                // the bottom and the column doesn't have to scroll) but no more than the
+                // graph needs — the layout wraps itself to whatever height it gets.
+                const float colAvail  = ImGui::GetContentRegionAvail().y;
+                const float dockAvail = std::max(200.0f, colAvail - dagChrome());
+                dagEnsureMeasured(dag, dockAvail);
+                const float h = std::min(dag.extent.y + dagChrome(), dockAvail + dagChrome());
+                ImGui::BeginChild("dagpane", ImVec2(0, h), ImGuiChildFlags_Borders,
+                                  ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                drawDagPanel(dag, dockAvail);
+                ImGui::EndChild();
+            }
         }
         ImGui::EndChild();
 
@@ -1917,6 +2136,36 @@ int runViewerGui(const std::string& sidecarPath) {
         ImGui::EndChild();
 
         ImGui::End();
+
+        // Maximized DAG: the side column can never be tall enough for a wide graph
+        // (and imnodes has no zoom here), so give it the whole window on demand.
+        if (dag.maximized) {
+            ImGui::SetNextWindowPos(vp->WorkPos);
+            ImGui::SetNextWindowSize(vp->WorkSize);
+            bool open = true;
+            ImGui::Begin("Modulator DAG", &open,
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+            if (ImGui::Button("dock")) dag.maximized = false;
+            ImGui::SameLine();
+            if (ImGui::Button("fit")) dag.fitFrames = 16;
+            ImGui::SameLine();
+            if (ImGui::Button("100%")) {
+                dag.zoom = 1.0f; dag.fitFrames = 0; dag.fitted = false; dag.pos.clear();
+                ImNodes::EditorContextResetPanning(ImVec2(0.0f, 0.0f));
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("re-layout")) {
+                dag.pos.clear();                    // force a re-measure at the canvas size
+                ImNodes::EditorContextResetPanning(ImVec2(0.0f, 0.0f));
+            }
+            ImGui::BeginChild("dagpanefull", ImVec2(0, 0), ImGuiChildFlags_Borders,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            drawDagPanel(dag, -1.0f);               // wrap to the real canvas height
+            ImGui::EndChild();
+            ImGui::End();
+            if (!open || ImGui::IsKeyPressed(ImGuiKey_Escape)) dag.maximized = false;
+        }
 
         ImGui::Render();
         const float clear[4] = { 0.10f, 0.10f, 0.12f, 1.0f };

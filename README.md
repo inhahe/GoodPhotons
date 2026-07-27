@@ -2496,6 +2496,14 @@ reduction consumes (`reduce s (mean, 8 samples)`), or a value-site's axis scope
 (`t from clock, {s} pinned <- {s,t}`) — while an **influence edge** into a target reads
 `mod[0] x0.8` / `pin[1] x0.25` on its input pin, so you can see the pin/mod combine model
 rather than just the call graph. (This needs a **v2** sidecar; a v1 one renders as before.)
+The pane sizes itself to whatever height is left in the side column and **wraps each layer
+into sub-columns** so a graph with dozens of leaves stays inside the visible area instead of
+running off the bottom; the wrap uses the node boxes imnodes actually produced, so nothing
+overlaps at any DPI. Because imnodes has no zoom of its own, the panel implements a real one
+by scaling the font and node padding: **wheel to zoom** (15–300%), **fit** solves for the
+zoom that shows the whole graph, **100%** resets it, **re-layout** redoes the layering, and
+**maximize** throws the graph full-window (auto-fits on entry, re-fits when the window
+resizes, **Esc** to dock it again).
 A **Fields tab** renders `Grid` and
 `Scatter` datasets: their sample points appear in the same 3-D orbit view (grid node
 positions reconstructed from the fixed lattice), coloured either by a **heatmap of a

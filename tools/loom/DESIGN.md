@@ -686,7 +686,12 @@ tools/loom/
   complete:** `_describe_dag` tags every edge with the destination `param` it feeds (identity-matched to
   the attribute the child is stored under), and the viewer compiles vendored **imnodes** to draw a
   **Modulator DAG** panel — nodes titled `<op> #<id>`, one labelled input pin per incoming edge, longest-
-  path layering from leaves to driven params. **F6 is complete:** `_describe_dataset` now emits real field
+  path layering from leaves to driven params. The layering **wraps each level into sub-columns** against
+  the pane's available height (measured from the node rects imnodes actually produced — read back via
+  `GetNodeDimensions()` after `EndNodeEditor()` and re-wrapped once), so a graph with dozens of leaves
+  doesn't run off the bottom; and since this imnodes build has no zoom, the panel supplies one by scaling
+  the ImGui font size + `NodePadding` (wheel 15–300%, `fit` = iterative width-fit solve, `100%`,
+  `re-layout`, and a full-window `maximize` / Esc mode). **F6 is complete:** `_describe_dataset` now emits real field
   geometry — scatter `points`+`values`, grid `axes`+flat C-order `values` (scalar values normalised to
   1-lists) — and the viewer's **Fields tab** (`collectFields`/`drawFieldPane`) renders those sample points
   in the shared 3-D orbit view (grid node positions reconstructed from axes+shape in C-order), with 3-of-N
