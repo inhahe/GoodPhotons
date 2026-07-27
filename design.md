@@ -113,6 +113,24 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.
+  **`PhotonMap` is structure-of-arrays, and that is load-bearing.** Deposit positions
+  live in `pos[]`, everything the gather reads after acceptance in `photons[]`, and the
+  precomputed CIE triple in `cie[]` — three arrays permuted together by the counting
+  sort, so index `k` names one photon in all three. The reason: a radius-`r` query scans
+  the 3×3×3 cell box but keeps only the inscribed sphere, so ~85% of candidates are
+  rejected on a distance test that needs the position and nothing else. Interleaved,
+  that scan strided a fat record and used a fraction of each cache line it pulled; split,
+  it is a dense 24 B/photon stream. This dominates precisely where mode M hurts — a dense
+  map is gigabytes, so the gather is DRAM-bandwidth-bound. `Photon` therefore holds only
+  `n`/`power`/`lambda`; the incident direction it used to carry was never read by any
+  gather (the estimate is Lambertian) and was pure per-photon waste — the device deposit
+  record `DPhoton` lost the same field for the same reason, which matters extra there
+  because its buffer is sized from *free VRAM*, so fewer bytes per record is directly more
+  photons the GPU can hold (44 → 32 B). The GPU's gather record `DGatherPhoton`
+  (render_cuda.cu) is the same idea, and additionally folds
+  `cie*power*norm/pi` into three floats. The `-savemap` cache format is `FTPMP02`
+  (two blocks: positions, then payloads); `FTPMP01` files are rejected with a message
+  telling the user to re-deposit.
 - **`spectrum.h` / `spectral_library.h` / `upsample.h` / `color.h` / `hero.h`** —
   spectral core: measured SPDs/materials, RGB→spectrum upsampling, CIE tables,
   hero-wavelength sampling (`kHeroC=4`: hero λ + 3 stratified secondaries) used by

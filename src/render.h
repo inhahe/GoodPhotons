@@ -320,13 +320,14 @@ struct Renderer {
     // A photon pass runs with nCam==0 (no camera splat) + photonDeposit set: paths bounce
     // and deposit, but energy goes into the map instead of onto a sensor. Null in modes
     // A/B/C, so their splat behaviour is byte-for-byte unchanged.
-    std::vector<Photon>* photonDeposit = nullptr;
+    PhotonBank* photonDeposit = nullptr;
 
     // Append a photon record at a diffuse/translucent vertex (no-op when the map is off).
-    void depositPhoton(const Vec3& p, const Vec3& wtravel, const Vec3& n,
-                       double lambda, double beta) const {
+    // The photon's incident direction is deliberately NOT stored: the density estimate is
+    // Lambertian, so no gather has ever read it (see Photon in photonmap.h).
+    void depositPhoton(const Vec3& p, const Vec3& n, double lambda, double beta) const {
         if (!photonDeposit) return;
-        photonDeposit->push_back(Photon{p, -wtravel, n, (float)beta, (float)lambda});
+        photonDeposit->push(p, n, (float)beta, (float)lambda);
     }
 
     // Model A: map a contact-sensor hit to a pixel and deposit.
@@ -1720,7 +1721,7 @@ struct Renderer {
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Photon-map deposit: incident flux at this translucent vertex.
-                    depositPhoton(h.p, ray.d, h.n, lambda, beta);
+                    depositPhoton(h.p, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
                         camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, wi, lambda, beta, rhoT, rng);
@@ -1751,7 +1752,7 @@ struct Renderer {
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
-                    depositPhoton(h.p, ray.d, h.n, lambda, beta);
+                    depositPhoton(h.p, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
@@ -1965,7 +1966,7 @@ struct Renderer {
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator
                     // stays energy-consistent with the scalar single-λ deposit.
                     for (int i = 0; i < nUp; ++i)
-                        depositPhoton(h.p, ray.d, h.n, lam[i], beta[i]);
+                        depositPhoton(h.p, h.n, lam[i], beta[i]);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, wi, lam, beta, rhoR, nUp, rng);
                         camSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, wi, lam, beta, rhoT, nUp, rng);
@@ -2095,7 +2096,7 @@ struct Renderer {
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator
                     // stays energy-consistent with the scalar single-λ deposit.
                     for (int i = 0; i < nUp; ++i)
-                        depositPhoton(h.p, ray.d, h.n, lam[i], beta[i]);
+                        depositPhoton(h.p, h.n, lam[i], beta[i]);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, wi, lam, beta, rho, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, lam, beta, rho, nUp, rng);

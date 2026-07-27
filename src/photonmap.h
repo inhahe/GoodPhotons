@@ -28,23 +28,52 @@
 #include "linalg.h"
 #include "color.h"
 
-// One deposited photon: where light landed, where it came from, and how much power it
-// carried at what wavelength. `wi` (incident direction, pointing back toward the source
-// of the photon = -ray.d) and `n` (shading normal) are stored for kernel weighting and
-// cross-surface leak rejection; a pure Lambertian estimate only needs pos/power/lambda.
+// One deposited photon's PAYLOAD — everything the gather reads *after* a candidate has
+// passed the distance test. The deposit POSITION deliberately lives in a separate
+// `PhotonMap::pos` array (see below); this struct is what `pos[k]` indexes into.
+//
+// `n` (shading normal) is here for cross-surface leak rejection; a pure Lambertian
+// estimate only needs power/lambda. There is no `wi`: the incident direction was stored
+// for years and never read by any gather (the estimate is Lambertian, so it only needs
+// the normal), which cost 24 dead bytes on every one of what can be tens of millions of
+// records. Don't re-add a field here without a reader — see the size note below.
 struct Photon {
-    Vec3  pos;        // deposit position (world space)
-    Vec3  wi;         // incident direction at deposit (unit, = -photon travel dir)
     Vec3  n;          // shading normal at the deposit surface (unit)
     float power;      // monochromatic power (beta) carried by this photon
     float lambda;     // wavelength (nm)
 };
 
-// Uniform hash grid over deposited photons. After build(), `photons` is reordered into
-// cell-contiguous runs and `cellStart` gives each cell's [begin,end) slice — a flat,
-// pointer-free layout (counting sort) that ports directly to the GPU.
+// A per-thread deposit bank: the split (position, payload) pair that a photon pass appends
+// to, mirroring PhotonMap's own split layout so the concatenation into the map is a plain
+// append of both arrays. The two vectors are always the same length.
+struct PhotonBank {
+    std::vector<Vec3>   pos;
+    std::vector<Photon> payload;
+    size_t size() const { return payload.size(); }
+    void push(const Vec3& p, const Vec3& n, float power, float lambda) {
+        pos.push_back(p);
+        payload.push_back(Photon{n, power, lambda});
+    }
+};
+
+// Uniform hash grid over deposited photons. After build(), the three per-photon arrays
+// are reordered together into cell-contiguous runs and `cellStart` gives each cell's
+// [begin,end) slice — a flat, pointer-free layout (counting sort) that ports directly to
+// the GPU. Index k addresses the same photon in `pos[k]` / `photons[k]` / `cie[k]`.
+//
+// LAYOUT IS STRUCTURE-OF-ARRAYS ON PURPOSE, and it is a load-bearing perf decision.
+// A radius-r query scans the 3x3x3 cell neighbourhood, i.e. a (3r)^3 box, but only keeps
+// what falls inside the radius-r sphere: (4/3 pi r^3)/(27 r^3) = 15% of it. So ~85% of
+// every query's work is a distance test that touches the position and NOTHING else. With
+// position embedded in a fat record, that scan strided over the whole record and pulled
+// cache lines it used a quarter of; splitting positions out makes the reject scan a dense
+// 24 B/photon stream. This matters most exactly where mode M hurts: the record arrays run
+// to gigabytes on a dense map (tens of millions of photons), far past any cache, so the
+// gather is DRAM-bandwidth-bound and the win is close to the bandwidth ratio. Keep `pos`
+// separate, and keep `Photon` free of anything the gather doesn't read.
 struct PhotonMap {
-    std::vector<Photon> photons;   // reordered to cell order by build()
+    std::vector<Vec3>   pos;       // deposit positions (world); the distance-test stream
+    std::vector<Photon> photons;   // payloads, parallel to pos[]; reordered by build()
     // Per-photon CIE XYZ response at photons[i].lambda, filled by build(). The gather
     // estimate weights every photon by cie(lambda_p); evaluating the analytic CIE
     // multi-Gaussians (several exp() each) per photon PER QUERY dominated mode-M render
@@ -82,12 +111,12 @@ struct PhotonMap {
     void build(double r) {
         radius = r;
         cellSize = (r > 0.0) ? r : 1e-6;
-        if (photons.empty()) { nx = ny = nz = 1; cellStart.assign(2, 0); cie.clear(); return; }
+        if (photons.empty()) { nx = ny = nz = 1; cellStart.assign(2, 0); cie.clear(); pos.clear(); return; }
 
-        Vec3 mn = photons[0].pos, mx = photons[0].pos;
-        for (const Photon& ph : photons) {
-            mn.x = std::min(mn.x, ph.pos.x); mn.y = std::min(mn.y, ph.pos.y); mn.z = std::min(mn.z, ph.pos.z);
-            mx.x = std::max(mx.x, ph.pos.x); mx.y = std::max(mx.y, ph.pos.y); mx.z = std::max(mx.z, ph.pos.z);
+        Vec3 mn = pos[0], mx = pos[0];
+        for (const Vec3& p : pos) {
+            mn.x = std::min(mn.x, p.x); mn.y = std::min(mn.y, p.y); mn.z = std::min(mn.z, p.z);
+            mx.x = std::max(mx.x, p.x); mx.y = std::max(mx.y, p.y); mx.z = std::max(mx.z, p.z);
         }
         // Pad by half a cell so floor() never underflows at the low edge.
         lo = mn - Vec3{cellSize, cellSize, cellSize} * 0.5;
@@ -101,7 +130,7 @@ struct PhotonMap {
         std::vector<int> cellOf(photons.size());
         cellStart.assign((size_t)nCells + 1, 0);
         for (size_t i = 0; i < photons.size(); ++i) {
-            int ix, iy, iz; cellCoord(photons[i].pos, ix, iy, iz);
+            int ix, iy, iz; cellCoord(pos[i], ix, iy, iz);
             int c = cellIndex(ix, iy, iz);
             cellOf[i] = c;
             ++cellStart[c + 1];
@@ -109,12 +138,18 @@ struct PhotonMap {
         // Prefix sum -> cellStart[c] = begin offset of cell c.
         for (long long c = 0; c < nCells; ++c) cellStart[c + 1] += cellStart[c];
 
-        // Pass 2: scatter into cell-contiguous order.
+        // Pass 2: scatter into cell-contiguous order. pos[] and photons[] are permuted by
+        // the SAME cursor walk, so index k keeps addressing one photon across both.
         std::vector<Photon> sorted(photons.size());
+        std::vector<Vec3>   sortedPos(pos.size());
         std::vector<int> cursor(cellStart.begin(), cellStart.end() - 1);
-        for (size_t i = 0; i < photons.size(); ++i)
-            sorted[cursor[cellOf[i]]++] = photons[i];
+        for (size_t i = 0; i < photons.size(); ++i) {
+            const int d = cursor[cellOf[i]]++;
+            sorted[d]    = photons[i];
+            sortedPos[d] = pos[i];
+        }
         photons.swap(sorted);
+        pos.swap(sortedPos);
 
         // Precompute each (sorted) photon's CIE XYZ triple once — see `cie` above.
         // Embarrassingly parallel and worth threading: a large map costs several exp()
@@ -159,11 +194,14 @@ struct PhotonMap {
                 for (int dx = -1; dx <= 1; ++dx) {
                     int cx = ix + dx; if (cx < 0 || cx >= nx) continue;
                     int c = cellIndex(cx, cy, cz);
+                    // The reject scan reads ONLY pos[] (see the layout note on PhotonMap):
+                    // ~85% of the candidates in this 3x3x3 box fail the test, and for those
+                    // the fat payload record is never touched at all.
+                    const Vec3* __restrict pp = pos.data();
                     for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
-                        const Photon& ph = photons[k];
-                        Vec3 d = p - ph.pos;
+                        Vec3 d = p - pp[k];
                         double d2 = dot(d, d);
-                        if (d2 <= r2) fn(ph, d2, k);
+                        if (d2 <= r2) fn(photons[k], d2, k);
                     }
                 }
             }

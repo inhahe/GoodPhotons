@@ -51,7 +51,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
                             bool diffraction, PhotonMap& pm, int heroC = hero::kHeroC,
                             uint64_t seedBase = 0) {
     if (nThreads < 1) nThreads = 1;
-    std::vector<std::vector<Photon>> banks(nThreads);
+    std::vector<PhotonBank> banks(nThreads);
     std::vector<long long> emitted(nThreads, 0);
 
     // Hero-wavelength deposit (modes M/S): each traced path deposits its live wavelengths
@@ -78,11 +78,14 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
 
     size_t total = 0;
     for (auto& b : banks) total += b.size();
-    pm.photons.clear();
-    pm.photons.reserve(total);
+    pm.photons.clear();  pm.photons.reserve(total);
+    pm.pos.clear();      pm.pos.reserve(total);
     pm.nEmitted = 0;
     for (int t = 0; t < nThreads; ++t) {
-        pm.photons.insert(pm.photons.end(), banks[t].begin(), banks[t].end());
+        // Append both halves in the same thread order, so pos[k] stays the position of
+        // photons[k] (PhotonMap's split layout — see photonmap.h).
+        pm.photons.insert(pm.photons.end(), banks[t].payload.begin(), banks[t].payload.end());
+        pm.pos.insert(pm.pos.end(), banks[t].pos.begin(), banks[t].pos.end());
         pm.nEmitted += emitted[t];
     }
 }

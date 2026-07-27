@@ -1705,20 +1705,71 @@ including the deposit):
 | 4 M | ~27 M | 369 s (2.66×) |
 | 8 M | ~53 M | killed — no output after ~16 min, 5.4 GB RSS |
 
-So it scales ≈ `N^1.4`, not `N`: the per-cell photon list grows linearly *and* the
-counting-sort/storage cost grows linearly on top. The 8 M case looks like a hang from
-the outside (no progress line during the gather) — it isn't, it's just this curve. Note
-this is **not** a `-heroc`/`-herosplit` regression: it was measured identically with the
-hero bundle off, and hero only multiplies the *stored* count (C deposits per photon),
-which moves you along the same curve faster.
+So it scaled ≈ `N^1.4`, not `N` — and there turned out to be **two independent causes**,
+one of which is now fixed. The 8 M case looks like a hang from the outside (no progress
+line during the gather); it isn't, it's just this curve. Note this is **not** a
+`-heroc`/`-herosplit` regression: it was measured identically with the hero bundle off,
+and hero only multiplies the *stored* count (C deposits per photon), which moves you
+along the same curve faster.
 
-**Proper fix:** make the gather radius a function of density instead of a constant —
+**Cause 2 (the superlinear part) — FIXED 2026-07-26: the map was memory-bound and the
+layout was array-of-structs.** Linear photons-per-cell explains linear growth, not `N^1.4`.
+The excess came from bandwidth: the map was **104 B/photon** (an 80 B `Photon` — `pos`,
+`wi`, `n`, `power`, `lambda` — plus a 24 B `cie` entry), so 27 M stored photons is 2.6 GiB
+and 53 M is 5.1 GiB, matching the observed 5.4 GB RSS exactly. Far past any cache, so the
+gather streamed from DRAM. Two things made that much worse than it needed to be:
+* A radius-`r` query scans the 3×3×3 cell box but keeps only the inscribed sphere —
+  `(4/3·π r³)/(27 r³) = 15.5%`, so **~84% of candidates are rejected on a distance test
+  that reads the position and nothing else**. With `pos` embedded in the record, that scan
+  strided 80 B to use 24 B of it, touching every cache line and wasting 70% of each.
+  `PhotonMap` is now structure-of-arrays: `pos[]`, `photons[]` (payload) and `cie[]`,
+  permuted together by the counting sort so index `k` still names one photon in all three.
+  The reject scan is now a dense 24 B/photon stream — **3.3× less bandwidth** on the
+  dominant path.
+* `Photon::wi` (the incident direction, 24 B) was written by both deposit paths and
+  **never read by any gather** — the density estimate is Lambertian, so it only needs the
+  normal. Deleted. The GPU had already figured this out: its `DGatherPhoton` drops `wi`
+  and folds `cie*power*norm/pi` into three floats.
+
+Net: **104 → 80 B/photon (−23%)**, so 53 M stored photons is 3.95 GiB instead of 5.13 GiB.
+The GPU *deposit* record `DPhoton` lost the same dead `wi` (44 → 32 B); that buffer's
+capacity is computed from free VRAM, so it is directly ~27% more photons the device can
+hold in one pass. Measured back-to-back on `scraps/abs_herosplit.ftsl` (`-device cpu
+-mode M`, 256², wall clock incl. deposit) with nothing else running, and the speedup
+**grows with map size** exactly as a bandwidth explanation predicts:
+
+| `-n` emitted | old | new | speedup |
+|---|---|---|---|
+| 1 M | 65.9 s | 62.4 s | 1.06× |
+| 2 M | 141.8 s | 113.3 s | 1.25× |
+| 4 M | 351.1 s | 259.0 s | 1.36× |
+
+Method note for anyone re-measuring: run the two binaries **strictly serially** and with
+nothing else on the machine. Two concurrent ftrace runs contend for every core and the
+ratio comes out meaningless — that mistake produced three mutually-contradictory 4 M
+numbers (1.77×, 9.35×, 11.51×) before it was caught, so the local harness
+(`scraps/pm_bench.sh`, throwaway/not checked in) now refuses to start if another ftrace is
+live. Bit-identical output, verified on 5 configs (CPU mode M at `-heroc 4` and `-heroc 1`,
+CPU mode S, GPU mode M, GPU mode S) plus a `-savemap` → `-loadmap` round trip. The cache format went `FTPMP01` → `FTPMP02` (two blocks: positions,
+then payloads); old files are refused with a message telling the user to re-deposit and
+fall back to a fresh deposit.
+
+**Cause 1 (the linear part) — STILL OPEN.** The radius remains count-independent, so
+photons-per-cell still grows linearly with `-n` and the gather cost with it; the fix above
+only lowered the constant. The proper fix is to make the radius a function of density:
 either (a) `k`-nearest-neighbour gathers (pick `r` per query so ~`k` photons are found,
-which is what makes classic PPM scale), or (b) at minimum shrink the global radius as
-`r ∝ N^(-1/3)` so photons-per-cell stays constant, which keeps the grid cost flat and
-also sharpens the estimate as you add photons instead of just blurring harder. Until
-then the practical workaround is to pass an explicit smaller `-pmradius` when raising
-`-n`, or to use `-savemap`/`-loadmap` so the expensive part is paid once.
+which is what makes classic PPM scale), or (b) shrink the global default radius with the
+*stored* photon count, which is known before `build()` is called. Note (b) needs a
+deliberate choice of exponent and it is not simply "keep cost flat": `r ∝ N^(-1/2)` does
+hold photons-per-disc (and therefore both cost and variance) constant, but constant
+variance means the image never converges in noise, only in bias. The MSE-optimal 2-D
+kernel bandwidth `r ∝ N^(-1/6)` converges properly and brings cost down to `N^(2/3)`;
+`r ∝ N^(-1/3)` is more aggressive (cost `N^(1/3)`, variance still → 0, bias → 0 faster)
+and is probably the right engineering pick. Either way it **changes default mode-M output**,
+so it wants a VERSION minor bump, a README note, and an opt-out — and modes S/U already do
+per-pass radius reduction (`R0 * pow(it, 0.5*(alpha-1))`), so mode M is the odd one out
+and should reuse that machinery's conventions. Until then the workaround is an explicit
+smaller `-pmradius` when raising `-n`, or `-savemap`/`-loadmap` so the deposit is paid once.
 
 ### Shared FORWARD (A/B) multi-camera pass writes all frames only at the end — FIXED 2026-07-14
 
@@ -1913,6 +1964,22 @@ negligible; the audit is just strict about it.
 _(former `light cylinder` entry moved to Resolved — it was a misdiagnosis.)_
 
 ## Tech debt
+
+### `-savemap` / `-loadmap` are silently ignored on the CPU (GPU-only) — 2026-07-26
+The photon-map disk cache is wired into `renderPhotonMapSharedCuda` only. `main.cpp`
+passes `g_pmapSave`/`g_pmapLoad` at exactly one call site (~line 6638, inside the
+`#ifdef`-guarded GPU branch of the shared-camera mode-M path); the CPU shared path
+immediately below it, and the single-camera mode-M path at ~2721, never look at either
+variable. So `-device cpu -mode M -loadmap foo.ftpm` **silently re-traces the whole photon
+pass** and `-savemap` silently writes nothing — no warning, and the only symptom is the
+deposit line reporting the default `-n` instead of the file's photon count. (This bit a
+validation script: a CPU `-savemap`/`-loadmap` round trip "failed" because neither run had
+loaded anything.) Two things to fix: (1) at minimum warn when either flag is set on a path
+that ignores it — a silently-dropped flag is the worst failure mode; (2) properly, hoist
+the load/save either side of `tracePhotonPass` + `pm.build` in both CPU paths, which is
+easy now that the file format (`FTPMP02`) is just PhotonMap's two arrays — the GPU code in
+`render_cuda.cu` (`savePhotonMap`/`loadPhotonMap`, ~line 10408) is already host-side and
+operates on a `PhotonMap&`, so it can be moved to `photonmap.h` and called from both.
 
 ### Fast RGB backward (`-rgb`) omits media + textured/record albedo — 2026-07-23
 The Stage-2 fast RGB backward path (`renderBackwardRGBCuda`/`bkRadianceRGB` in

@@ -2726,12 +2726,19 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
 // standalone render in distribution only. (A HETEROGENEOUS medium adds a ratio-tracking
 // transmittance draw per connect, so multi-cam model-B also matches only in distribution
 // then — inherent to the estimator, and consistent with the CPU tracer.)
-// One deposited photon (device twin of Photon in photonmap.h): where light landed, the
-// incident direction (= -travel), the shading normal (for cross-surface leak rejection),
-// and the monochromatic power / wavelength it carried. Laid out to round-trip through the
-// host PhotonMap (float here <-> double on the host build).
+// One deposited photon (device twin of Photon + PhotonMap::pos in photonmap.h): where
+// light landed, the shading normal (for cross-surface leak rejection), and the
+// monochromatic power / wavelength it carried. Laid out to round-trip through the host
+// PhotonMap (float here <-> double on the host build).
+//
+// There is NO incident direction: nothing reads one. The density estimate is Lambertian,
+// so neither the device gather (kSppmGatherConvert -> DGatherPhoton) nor the host gather
+// ever looked at it — it was pure freight. This buffer is capacity-limited (depCap is
+// sized from FREE VRAM), so every byte per record is photons the GPU can't hold: dropping
+// it shrinks the record from 44 to 32 bytes, ~27% more photons in the same VRAM. Don't add
+// a field here without a reader.
 struct DPhoton {
-    DVec3 pos, wi, n;
+    DVec3 pos, n;
     float power, lambda;
 };
 
@@ -2758,8 +2765,8 @@ struct DCamSet {
 };
 
 // Gather-tuned photon record: what the mode-M density-estimate kernel actually reads.
-// The deposit-side DPhoton carries (pos, wi, n, power, lambda), but the gather never
-// reads wi, and it weighted every visited photon by cie{X,Y,Z}(lambda_p) * power *
+// The deposit-side DPhoton carries (pos, n, power, lambda); the gather used to weight
+// every visited photon by cie{X,Y,Z}(lambda_p) * power *
 // norm / pi — all per-photon CONSTANTS of the estimate (norm = 1/(pi r^2 nEmitted)).
 // That triple is folded into pX/pY/pZ at upload time (host doubles from PhotonMap::cie
 // times power*norm/pi, rounded to float once), so the per-photon inner loop is just
@@ -2806,13 +2813,15 @@ __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int 
 // (normal renders leave cs.depCount == nullptr, so this compiles away to nothing).
 // Always increments the atomic count (so a null-buffer sizing pass measures the exact
 // deposit total); stores only when a buffer is bound and the slot is within capacity.
-__device__ static void depositPhoton(const DCamSet& cs, const DVec3& p, const DVec3& wtravel,
+// The photon's travel/incident direction is deliberately not a parameter: no gather reads
+// it (see DPhoton), so it isn't stored (matches Renderer::depositPhoton on the host).
+__device__ static void depositPhoton(const DCamSet& cs, const DVec3& p,
                                      const DVec3& n, Real beta, Real lambda) {
     if (!cs.depCount) return;
     unsigned long long i = atomicAdd(cs.depCount, 1ULL);
     if (cs.depPhotons && i < cs.depCap) {
         DPhoton ph;
-        ph.pos = p; ph.wi = -wtravel; ph.n = n;
+        ph.pos = p; ph.n = n;
         ph.power = (float)beta; ph.lambda = (float)lambda;
         cs.depPhotons[i] = ph;
     }
@@ -4350,7 +4359,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
-        depositPhoton(cs, h.p, rd, h.n, beta, lambda);   // photon-map deposit (mode M)
+        depositPhoton(cs, h.p, h.n, beta, lambda);   // photon-map deposit (mode M)
         // Both lobes get the adjoint correction; |cos| in the factor makes it lobe-agnostic,
         // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rhoR, rng);
@@ -4368,7 +4377,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real rho = dDiffuseRho(sc, m, h, lambda);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
-        depositPhoton(cs, h.p, rd, h.n, beta, lambda);   // photon-map deposit (mode M)
+        depositPhoton(cs, h.p, h.n, beta, lambda);   // photon-map deposit (mode M)
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -4602,7 +4611,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
         DVec3 wiPrev = -rd;
-        for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, rd, h.n, beta[i], lam[i]);
+        for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i]);
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
             splatSurfaceAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), wiPrev, lam, beta, rhoT, nUp, rng);
@@ -4697,7 +4706,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, m, h, lam[i]));
     DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     DVec3 wiPrev = -rd;
-    for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, rd, h.n, beta[i], lam[i]);
+    for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i]);
     if (camMode == CAM_A || camMode == CAM_B) {
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
         camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rho, nUp, rng);
@@ -10412,7 +10421,11 @@ static bool savePhotonMap(const char* path, const PhotonMap& pm,
                           const EnergyReport& e, uint64_t guard) {
     std::FILE* f = std::fopen(path, "wb");
     if (!f) { std::fprintf(stderr, "[savemap] cannot open %s for writing\n", path); return false; }
-    const char magic[8] = {'F','T','P','M','P','0','1','\n'};
+    // FTPMP02: positions and payloads are stored as two separate blocks, matching
+    // PhotonMap's split layout (FTPMP01 held one interleaved array that also carried a
+    // never-read incident direction). Bumping the magic makes an old cache fail the
+    // recognition check below rather than being misread as garbage.
+    const char magic[8] = {'F','T','P','M','P','0','2','\n'};
     long long nPh = (long long)pm.photons.size();
     double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
     bool ok = true;
@@ -10421,8 +10434,10 @@ static bool savePhotonMap(const char* path, const PhotonMap& pm,
     ok = ok && std::fwrite(&pm.nEmitted, sizeof pm.nEmitted, 1, f) == 1;
     ok = ok && std::fwrite(en, sizeof en, 1, f) == 1;
     ok = ok && std::fwrite(&nPh, sizeof nPh, 1, f) == 1;
-    if (ok && nPh > 0)
-        ok = std::fwrite(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
+    if (ok && nPh > 0) {
+        ok = std::fwrite(pm.pos.data(), sizeof(Vec3), (size_t)nPh, f) == (size_t)nPh;
+        ok = ok && std::fwrite(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
+    }
     std::fclose(f);
     if (!ok) std::fprintf(stderr, "[savemap] write to %s failed\n", path);
     return ok;
@@ -10435,8 +10450,14 @@ static bool loadPhotonMap(const char* path, PhotonMap& pm,
     char magic[8] = {0};
     long long nEmitted = 0, nPh = 0; double en[5] = {0,0,0,0,0}; uint64_t g = 0;
     bool ok = std::fread(magic, 1, 8, f) == 8;
-    if (!ok || std::memcmp(magic, "FTPMP01\n", 8) != 0) {
-        std::fprintf(stderr, "[loadmap] %s is not a recognised photon-map file; ignoring\n", path);
+    if (!ok || std::memcmp(magic, "FTPMP02\n", 8) != 0) {
+        // Name the stale-version case explicitly: a user with a cache from before the
+        // split layout should be told to re-deposit, not left guessing.
+        if (ok && std::memcmp(magic, "FTPMP01\n", 8) == 0)
+            std::fprintf(stderr, "[loadmap] %s is an old FTPMP01 map (pre split-layout); "
+                                 "re-run with -savemap to rebuild it. Ignoring.\n", path);
+        else
+            std::fprintf(stderr, "[loadmap] %s is not a recognised photon-map file; ignoring\n", path);
         std::fclose(f); return false;
     }
     ok = ok && std::fread(&g, sizeof g, 1, f) == 1;
@@ -10449,11 +10470,16 @@ static bool loadPhotonMap(const char* path, PhotonMap& pm,
         std::fclose(f); return false;
     }
     if (nPh > 0) {
+        pm.pos.resize((size_t)nPh);
         pm.photons.resize((size_t)nPh);
-        ok = std::fread(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
+        ok = std::fread(pm.pos.data(), sizeof(Vec3), (size_t)nPh, f) == (size_t)nPh;
+        ok = ok && std::fread(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
     }
     std::fclose(f);
-    if (!ok) { std::fprintf(stderr, "[loadmap] %s truncated photon data; ignoring\n", path); pm.photons.clear(); return false; }
+    if (!ok) {
+        std::fprintf(stderr, "[loadmap] %s truncated photon data; ignoring\n", path);
+        pm.photons.clear(); pm.pos.clear(); return false;
+    }
     pm.nEmitted = nEmitted;
     e.emitted += en[0]; e.absorbed += en[1]; e.sensor += en[2]; e.escaped += en[3]; e.residual += en[4];
     return true;
@@ -10559,8 +10585,11 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         }
     }
     if (nDep > 0 && d_photons) {
-        // Download + convert to Photon in chunks (never a full host-side DPhoton copy).
+        // Download + convert in chunks (never a full host-side DPhoton copy). Positions
+        // and payloads split into PhotonMap's two parallel arrays (see Photon in
+        // photonmap.h); DPhoton has the same fields, so this is a pure widen + split.
         pm.photons.resize((size_t)nDep);
+        pm.pos.resize((size_t)nDep);
         std::vector<DPhoton> stage;
         for (size_t off = 0; off < (size_t)nDep; off += PM_CHUNK) {
             size_t cnt = std::min(PM_CHUNK, (size_t)nDep - off);
@@ -10570,8 +10599,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             for (size_t i = 0; i < cnt; ++i) {
                 const DPhoton& d = stage[i];
                 Photon& p = pm.photons[off + i];
-                p.pos = Vec3(d.pos.x, d.pos.y, d.pos.z);
-                p.wi  = Vec3(d.wi.x,  d.wi.y,  d.wi.z);
+                pm.pos[off + i] = Vec3(d.pos.x, d.pos.y, d.pos.z);
                 p.n   = Vec3(d.n.x,   d.n.y,   d.n.z);
                 p.power = d.power; p.lambda = d.lambda;
             }
@@ -10619,9 +10647,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             stage.resize(cnt);
             for (size_t i = 0; i < cnt; ++i) {
                 const Photon& p = pm.photons[off + i];
+                const Vec3&  pp = pm.pos[off + i];
                 const Vec3&  ci = pm.cie[off + i];
                 DGatherPhoton& d = stage[i];
-                d.pos = DVec3(p.pos.x, p.pos.y, p.pos.z);
+                d.pos = DVec3(pp.x, pp.y, pp.z);
                 d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
                 const double w = (double)p.power * fold;
                 d.pX = (float)(ci.x * w);

@@ -594,7 +594,13 @@ that converges to the same physical image.
   **without re-tracing a single photon** (the expensive forward pass is skipped entirely).
   A scene-identity guard rejects a stale map built for a different scene, falling back to
   a fresh deposit. (Matches the forward splat modes `A`/`B`/`C` — same forward physics,
-  just measured from a stored map.)
+  just measured from a stored map.) *Scaling caveat:* the gather radius does **not** adapt
+  to `-n`, so photons-per-cell — and hence gather time — still grows with the photon count;
+  at very high `-n` a render can look stalled when it is only working through a huge map.
+  Pass a smaller `-pmradius` when you raise `-n`, or use `-savemap`/`-loadmap` (currently
+  honoured only on `-device gpu`) so the deposit is paid once. (The map itself is 80
+  bytes/photon and its inner query loop is bandwidth-tuned, so this is a milder curve than
+  it used to be — but it is still a curve.)
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the
