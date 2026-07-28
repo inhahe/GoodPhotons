@@ -522,7 +522,42 @@ the `(` is fine as well, and the array itself may be laid out over several lines
 The call is **not optional**: an array with no call is *unsaturated* and is rejected at
 load time, because an uncalled array has no value. A ragged array, a non-numeric entry and
 a coordinate count that disagrees with the nesting are all load errors too, each naming
-what the author wrote.
+what the author wrote — never the anonymous `__arrN` the desugar mints, which is a symbol
+you could not find by searching your own file.
+
+**Leaving an axis for the material's user — `[0 1](a)` … `mat(a=u)`.** A coordinate does
+not have to be a surface intrinsic. Naming **`a`** — the one input with no per-hit meaning
+of its own (§7.6) — spends nothing and turns the axis into a *formal*: the material becomes
+a 1-D lookup whose coordinate whoever **uses** it chooses.
+
+```
+material "ramp" { type diffuse  reflect [0 1](a) }        # 1-D table, axis left open
+
+quad { … material ramp(a=u) }                             # bound at the use site
+material "m" { type diffuse  reflect ramp.reflect(a=u) }  # ...or at a property reference
+material "n" { type diffuse  reflect ramp.reflect(u) }    # ...positionally (sole free input)
+```
+
+All three are exactly `reflect [0 1](u)` — the identity is pinned by `ftrace -checkarray`
+and shown per-tile by `scenes/_array_formal.ftsl`. The binding is the ordinary §7.6 /
+§7.7 argument list, so the driver may be any expression (`ramp(a=0.25+0.5*v)`), several
+axes take one argument each, and a multi-axis rebind is **simultaneous** — a 2-D literal
+`[[0 0.3][0.6 1]](u,v)` transposes under `(u=v, v=u)` rather than collapsing.
+
+That last example is also the answer to "what are a literal's *formals*?": they are the
+driver names written in its own tuple, because that is what a rebind substitutes. An
+inline literal has no second, private namespace of axis names — its axes are anonymous and
+bind by position — so a `formal=driver` argument **inside a literal's own call** is a load
+error, not a silent approximation:
+
+```
+reflect [0 1](a=u)          # error: no formal to bind. Write `[0 1](u)` to spend the
+                            #   axis here, or `[0 1](a)` + `material mat(a=u)` to defer it.
+```
+
+(Accepting it would have to invent a per-material default for `a`, which two literals in
+one material could contradict.) `formal=driver` stays meaningful where the callee really
+does have names of its own: a material, a material property, or a named pattern.
 
 Each literal desugars to an anonymous `grid` plus a one-line `pattern` and the value site
 is rewritten to reference it — which is exactly why a literal works in every slot that

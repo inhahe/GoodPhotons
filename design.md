@@ -484,6 +484,36 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   genuinely ambiguous (record stop selector vs. array literal) while both existed, and it
   is why the flip needed no loader changes.
 
+  **What the sample call's arguments *are*.** `desugarOne` splits the call into top-level
+  comma-separated arguments (`splitCallArgs`, the same "a top-level `=` is unambiguous
+  because the pattern language has no comparison operators" rule `parseBindArgs` uses) and
+  pins one semantics: **an argument is a driver — a coordinate expression — and a literal's
+  axes are anonymous and bind by position.** So `[0 1](a)` is not a special "formal"
+  construct at all; it is an ordinary coordinate that happens to name `a`, the one input
+  with no per-hit intrinsic, which is what makes it survive to the use site where the §7.6
+  material-bundle substitution can rebind it (`ramp(a=u)`, `ramp.reflect(a=u)`, positional
+  `ramp.reflect(u)`). A literal's "formals" are therefore just the driver names in its own
+  tuple, which is exactly what a rebind substitutes, and why a 2-D literal transposes under
+  the simultaneous `(u=v, v=u)`. The corollary is a refusal: `formal=driver` **inside** a
+  literal's own call has no formal to bind and is a load error naming both working
+  spellings, because honouring it would require inventing a per-material default for `a`
+  that two literals in one material could contradict. loom's `values.py` refuses the
+  identical spelling (`_check_args(..., literal_target=True)`) so a scene cannot emit from
+  loom and then fail to load. `-checkarray` pins the identities against independently
+  authored twins (with explicit non-vacuity checks — an unbound grid pool makes every
+  sample 0.0, which would make every identity pass for the wrong reason);
+  `scenes/_array_formal.ftsl` shows them per tile, and `tools/measure_array_formal.py`
+  reduces that render to per-tile mean/gradient numbers recorded in the scene's own header.
+  The render is only the qualitative confirmation — it agrees to within its noise and the
+  room's lighting profile, and the twelve tiles do not sit in a uniform field, so the
+  measurement corrects each tile's horizontal gradient using the four tiles whose albedo is
+  constant in `u` (one per column). `-checkarray` is what pins the identities exactly.
+
+  **Generated blocks are re-attributed.** `desugarArrays` mints `grid`/`pattern` blocks the
+  author never named, so `Builder::genSite_` maps `__arrN` back to the authoring site and
+  `genWho()` is used wherever those blocks can fail. A message about `pattern '__arr3'`
+  would name a symbol that appears nowhere in the scene file.
+
   The same bracket spelling is accepted for a **`grid`/`scatter` element's own `data`**, and
   there it is *not* sugar: `desugarArrays` deliberately skips those two block types, because
   a `data [ … ]` group is the element's samples rather than a value-site literal (there is no

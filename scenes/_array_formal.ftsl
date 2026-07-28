@@ -1,0 +1,158 @@
+# Regression scene for an inline array literal's SAMPLE CALL — the axis tuple on
+# `[0 1](…)`, and what it means to leave an axis open for whoever *uses* the material
+# (TODO "DECISION — color-vector / array syntax": the increment-2 `Deferred:` clause and
+# the `ADDENDUM — call = sample`).
+#
+#     reflect [0 1](u)                 # spend the axis here: sampled at the surface u
+#     reflect [0 1](a)                 # leave it FREE: `a` is the one input with no
+#                                      #   per-hit intrinsic, so it is the formal axis
+#     material mat(a=u)                # ...and the material's USER binds it
+#     src.reflect(a=u)                 # ...or a property reference does
+#
+# --- the pinned semantics --------------------------------------------------------------
+# An inline literal's axes are anonymous and bind by POSITION; the names inside its own
+# tuple are DRIVERS (coordinate expressions), not formals.  `formal=driver` binds a name
+# belonging to the *callee*, and a material / material property / named pattern has such
+# names while a bare literal does not — so `[0 1](a=u)` is a load-time error naming both
+# spellings that do the two things an author could have meant.  Deferring an axis is
+# spelled by naming the free input (`(a)`) and binding it at the use site, NOT by omitting
+# the call: an uncalled literal is refused, because ftrace has no value site that can hold
+# an unsaturated array.
+#
+# --- what is being asserted -------------------------------------------------------------
+# Every claim is an IDENTITY between two independently authored spellings, placed in the
+# same row so the lighting profile cancels:
+#
+#   A1 == A2 == A3   `[0 1](u)`  ==  `arr_a.reflect(a=u)`  ==  `arr_a.reflect(u)`
+#                    (inline, keyword rebind, positional rebind)
+#   A4               `[0 1](v)` — the control: the axis really did move
+#   B1 == B4         `[[0 0.3][0.6 1]](u,v)`  ==  the same read through a bare property ref
+#   B2 == B3         the transposed literal  ==  a SIMULTANEOUS swap `(u=v, v=u)`
+#                    (B2 vs B1 is the negative control: the swap must not be a no-op)
+#   C1 == C2 == C3   a driver EXPRESSION inline == bound at a property ref == bound at the
+#                    geometry `material` field
+#   C4               `[0 1](1-u)` — reversed, the control for row C
+#
+# Tiles in the same ROW are directly comparable; tiles in different rows are not (the two
+# strip lights make illumination vary with height).  Within a row the lighting still varies
+# with x, so a pair is compared on its GRADIENT (du/dv), or on its mean normalised against
+# the backdrop.  Flat camera-facing QUAD tiles, not spheres: addQuad gives a quad UVs
+# spanning the parallelogram, so the material's `u` IS the tile's horizontal axis and a
+# rebound axis visibly ROTATES the gradient — curvature would mix albedo with shading
+# falloff and make that unreadable.  The room is neutral grey so colour bleed cannot
+# contaminate the greyscale albedo being read.
+#
+# --- MEASURED (2026-07-28, v0.91.0) ------------------------------------------------------
+#   ftrace -scene scenes/_array_formal.ftsl -o png/_array_formal.png -time 150 \
+#          -window -keepwindow -interval 15 -checkpoint
+#   python tools/measure_array_formal.py png/_array_formal.png
+#
+# Per tile: mean luminance, the horizontal gradient du = (right half - left half)/mean, and
+# the vertical gradient dv likewise.  The room is not perfectly uniform in x (the strips are
+# full width but the grey side walls bounce), so du carries an AMBIENT term that depends on
+# the COLUMN.  Four tiles have a u-constant albedo — one per column — and measure it:
+#
+#   ambient du by column (C1 C2 C3 A4):   1:+0.042   2:+0.006   3:-0.006   4:-0.042
+#
+#   tile    mean       du   du-amb       dv     spelling
+#   A1     96.14   +0.527   +0.485   +0.048     [0 1](u)
+#   A2    100.43   +0.496   +0.490   +0.042     arr_a.reflect(a=u)
+#   A3    102.13   +0.465   +0.471   +0.043     arr_a.reflect(u)
+#   A4     96.37   -0.042   +0.000   +0.542     [0 1](v)                      CONTROL
+#   B1     86.45   +0.355   +0.313   +0.178     [[0 0.3][0.6 1]](u,v)
+#   B2     91.01   +0.183   +0.177   +0.325     [[0 0.3][0.6 1]](v,u)
+#   B3     91.48   +0.164   +0.170   +0.322     arr_uv.reflect(u=v, v=u)
+#   B4     86.60   +0.283   +0.325   +0.178     arr_uv.reflect
+#   C1     99.60   +0.042   +0.000   +0.174     [0 1](0.25+0.5*v)
+#   C2    104.95   +0.006   +0.000   +0.178     arr_a.reflect(a=0.25+0.5*v)
+#   C3    104.95   -0.006   +0.000   +0.178     material arr_a(a=0.25+0.5*v)
+#   C4     96.12   -0.527   -0.485   -0.048     [0 1](1-u)                    CONTROL
+#
+# Identity margins, as max|d(gradient)| over both axes after the ambient correction:
+#   A1==A2 0.006   A1==A3 0.015   |   A1!=A4 0.494      (a 30-80x separation)
+#   B2==B3 0.007   B1==B4 0.012   |   B1!=B2 0.147      (a 12-20x separation)
+#   C1==C2 0.004   C1==C3 0.004   |   C1!=C4 0.485
+# Row C's correction is self-referential (C1/C2/C3 ARE the estimators for columns 1-3), so
+# read row C off the raw table instead: all three carry dv ~ +0.176 with |du| <= 0.042 while
+# the C4 control is dv -0.048 / du -0.527.  Rows A and B are corrected by tiles outside the
+# pair under comparison, so their margins are not circular.
+#
+# This render is the *qualitative* confirmation — a Monte-Carlo image can only ever agree to
+# within its own noise and the room's lighting profile.  The identities themselves are pinned
+# EXACTLY, and non-vacuously, by `ftrace -checkarray`.
+#
+# Parse-check with:  ftrace scenes/_array_formal.ftsl -parseonly
+# Semantics are pinned deterministically by:  ftrace -checkarray
+scene { units meters }
+
+# --- the bundles -----------------------------------------------------------------------
+# `arr_a` spends nothing: its single axis is driven by the free input `a`, so the material
+# is a 1-D lookup whose coordinate its USER chooses.  Used bare it would sample at the
+# system default a = 1.0; every use below binds it.
+material "arr_a"  { type diffuse  reflect [0 1](a) }
+
+# The same idea in 2-D — the formals here are the driver names `u` and `v` written in the
+# literal's own tuple, which is exactly what `(u=v, v=u)` rebinds.
+material "arr_uv" { type diffuse  reflect [[0 0.3][0.6 1]](u,v) }
+
+material "grey" { type diffuse  reflect 0.5 }    # room
+
+# --- the room: neutral grey, open toward the camera -------------------------------------
+quad { origin 0 0 0     u 1 0 0    v 0 1 0    material grey }   # backdrop (z=0)
+quad { origin 0 0 0     u 1 0 0    v 0 0 1.2  material grey }   # floor
+quad { origin 0 1 0     u 0 0 1.2  v 1 0 0    material grey }   # ceiling
+quad { origin 0 0 0     u 0 0 1.2  v 0 1 0    material grey }   # left
+quad { origin 1 0 0     u 0 1 0    v 0 0 1.2  material grey }   # right
+
+# --- row A (y 0.68..0.90): three spellings of "sample at u" -----------------------------
+# A1 the axis spent inline -> gradient runs left -> right
+material "a1" { type diffuse  reflect [0 1](u) }
+quad { origin 0.04 0.68 0.006  u 0.20 0 0  v 0 0.22 0  material a1 }
+# A2 the formal bound BY NAME at a property reference — MUST match A1
+material "a2" { type diffuse  reflect arr_a.reflect(a=u) }
+quad { origin 0.28 0.68 0.006  u 0.20 0 0  v 0 0.22 0  material a2 }
+# A3 the same bind written POSITIONALLY (`a` is the sole free input) — MUST match A1/A2
+material "a3" { type diffuse  reflect arr_a.reflect(u) }
+quad { origin 0.52 0.68 0.006  u 0.20 0 0  v 0 0.22 0  material a3 }
+# A4 control: the axis really is the thing being chosen -> gradient runs bottom -> top
+material "a4" { type diffuse  reflect [0 1](v) }
+quad { origin 0.76 0.68 0.006  u 0.20 0 0  v 0 0.22 0  material a4 }
+
+# --- row B (y 0.39..0.61): a 2-D literal and a simultaneous axis swap --------------------
+# B1 the literal as authored: dark at (0,0), bright at (1,1), rising faster along v
+material "b1" { type diffuse  reflect [[0 0.3][0.6 1]](u,v) }
+quad { origin 0.04 0.39 0.006  u 0.20 0 0  v 0 0.22 0  material b1 }
+# B2 the TRANSPOSED literal, written out by hand
+material "b2" { type diffuse  reflect [[0 0.3][0.6 1]](v,u) }
+quad { origin 0.28 0.39 0.006  u 0.20 0 0  v 0 0.22 0  material b2 }
+# B3 the same transpose obtained by a SIMULTANEOUS rebind — MUST match B2, and must NOT
+#    match B1 (a sequential u->v then v->u would collapse to a no-op)
+material "b3" { type diffuse  reflect arr_uv.reflect(u=v, v=u) }
+quad { origin 0.52 0.39 0.006  u 0.20 0 0  v 0 0.22 0  material b3 }
+# B4 a bare property reference changes nothing — MUST match B1
+material "b4" { type diffuse  reflect arr_uv.reflect }
+quad { origin 0.76 0.39 0.006  u 0.20 0 0  v 0 0.22 0  material b4 }
+
+# --- row C (y 0.10..0.32): the driver is an ordinary expression --------------------------
+# C1 the expression spent inline -> a compressed gradient over the top half of the table
+material "c1" { type diffuse  reflect [0 1](0.25+0.5*v) }
+quad { origin 0.04 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material c1 }
+# C2 the same expression bound to the formal at a property reference — MUST match C1
+material "c2" { type diffuse  reflect arr_a.reflect(a=0.25+0.5*v) }
+quad { origin 0.28 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material c2 }
+# C3 the same bind at the OTHER use site — the geometry `material` field — MUST match C1
+quad { origin 0.52 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material arr_a(a=0.25+0.5*v) }
+# C4 control: a reversed driver, so row C is not uniformly flat
+material "c4" { type diffuse  reflect [0 1](1-u) }
+quad { origin 0.76 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material c4 }
+
+# --- lighting: two full-width strips aimed at the backdrop ------------------------------
+# Uniform in x (so tiles in a row are comparable) and balanced top/bottom.
+light area { origin 0 0.995 0.10  u 1 0 0  v 0 0 0.40  normal 0 -1 0  spd preset:bb6500 }
+light area { origin 0 0.005 0.10  u 1 0 0  v 0 0 0.40  normal 0  1 0  spd preset:bb6500 }
+
+camera "cam" {
+    eye 0.5 0.5 2.0  look_at 0.5 0.5 0  up 0 1 0  fov_y 32
+    mode B
+    film { res 320 320 }
+}

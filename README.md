@@ -1884,6 +1884,15 @@ or a native-primitive wrap — see below). Two authoring forms:
   `reflect [0 1](u)` is a greyscale albedo ramp (see below). Worked example
   `scenes/pattern_array.ftsl`; reach for a named `grid`/`scatter` when the data is big,
   shared, or worth naming.
+  A coordinate may also be **`a`**, the one input with no per-hit meaning of its own — that
+  spends nothing and leaves the axis as a **formal** for whoever *uses* the material:
+  `material "ramp" { reflect [0 1](a) }` is then bound at the use site by `ramp(a=u)`, at a
+  property reference by `ramp.reflect(a=u)`, or positionally by `ramp.reflect(u)`, all three
+  identical to `reflect [0 1](u)`. Multi-axis rebinds are simultaneous, so a 2-D literal
+  transposes under `(u=v, v=u)`. A literal's *formals* are the driver names in its own tuple;
+  it has no second, private namespace of axis names, so a `formal=driver` argument **inside**
+  a literal's call (`[0 1](a=u)`) is a load error that names both spellings that work.
+  Pinned by `ftrace -checkarray`; per-tile scene `scenes/_array_formal.ftsl`.
 - **Named generator** — `type <gen>` plus params (mirrors material syntax):
 
   | Generator | Parameters | Result |
@@ -2572,7 +2581,7 @@ alone can't restore, so they are not disk-resumable.
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
 `-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`,
-`-checksun`, `-checkbind`, `-checkprop`.
+`-checksun`, `-checkbind`, `-checkprop`, `-checkarray`.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are

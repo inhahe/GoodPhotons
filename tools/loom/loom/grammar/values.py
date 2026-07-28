@@ -162,12 +162,22 @@ def _piece(p):
 # inner node unchanged in that case and a :class:`Call` only when a tuple is
 # actually present.
 
-def _check_args(args: List["Arg"]) -> List["Arg"]:
-    """Positionals-before-keywords and no-duplicate-formals.
+def _check_args(args: List["Arg"], literal_target: bool = False) -> List["Arg"]:
+    """Positionals-before-keywords, no-duplicate-formals, and no keyword argument
+    on an inline array *literal*.
 
-    The grammar deliberately does not enforce either (``arg = NAME '=' coord |
-    coord`` in any order), so that the error can be phrased in terms of axes
-    instead of arriving as an opaque parse failure.
+    The grammar deliberately does not enforce any of these (``arg = NAME '='
+    coord | coord`` in any order), so that the error can be phrased in terms of
+    axes instead of arriving as an opaque parse failure.
+
+    ``literal_target`` says the call's target is a bracket literal rather than a
+    NAME.  ``formal=driver`` binds a name belonging to the *callee*; a material,
+    a material property and a named array all have callee-side input names, so
+    ``mat(a=u)`` is meaningful there.  An inline literal has no such namespace —
+    its axes are positional and anonymous, and the names in its own tuple are
+    *drivers*, not formals.  ftrace refuses the same spelling for the same
+    reason (``Builder::desugarOne``, ``src/ftsl.h``); the two must agree, because
+    a form loom accepts and ftrace rejects is a scene that emits and won't load.
     """
     seen_keyword = False
     formals: set = set()
@@ -178,6 +188,14 @@ def _check_args(args: List["Arg"]) -> List["Arg"]:
                     "positional axis arguments must come before keyword ones: "
                     "write `(u, a=v)`, not `(a=v, u)`")
         else:
+            if literal_target:
+                raise ShapeError(
+                    f"`{a.formal}={a.driver}`: an inline array literal's axes are "
+                    "unnamed and bind by position, so a `formal=driver` argument "
+                    "has no formal to bind - its sample call takes drivers. Write "
+                    f"`[...]({a.driver})` to spend the axis here, or "
+                    f"`[...]({a.formal})` to leave it free and rebind it where the "
+                    f"material is used, `mat({a.formal}={a.driver})`")
             seen_keyword = True
             if a.formal in formals:
                 raise ShapeError(
@@ -198,7 +216,8 @@ def _sampled(vs, space: Optional[str]) -> Node:
     tup = _kid(vs, "axistuple")
     if tup is None:
         return target
-    return Call(target, _check_args([_arg(a, space) for a in _kids(tup, "arg")]))
+    return Call(target, _check_args([_arg(a, space) for a in _kids(tup, "arg")],
+                                    literal_target=vb is not None))
 
 
 def _arg(a, space: Optional[str]) -> "Arg":

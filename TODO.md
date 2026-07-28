@@ -226,6 +226,52 @@ Origin tags point at the authoritative design text for each item.
       - **Deferred:** the keyword-rebind form `(a=u)` (formals don't exist yet — it currently lexes as a call and
         would fail in the expression compiler), and `NAME axistuple` (`ramp(u)`), which needs no work because
         ftrace's expression evaluator already reads `name(args)` as a call.
+        *(Both clauses are now resolved — and the second one was wrong. See the increment-2 remainder below.)*
+    * **STATUS (2026-07-28): increment-2 REMAINDER DONE — formals and the keyword rebind. Shipped as 0.91.0.**
+      The deferral above was **stale in the more interesting direction**: the machinery it was waiting on ("formals
+      don't exist yet") shipped as the §3.3 material bundles (v0.87.0) and §3.2 per-property access (v0.89.0), and
+      it turned out that the *feature* the ADDENDUM asks for had come along with it, unnoticed and unpinned.
+      `[0 1](a)` already compiled to a program with a free `a`, and `mat(a=u)` / `src.reflect(a=u)` /
+      `src.reflect(u)` already rebound it. What this arm actually did was **pin the semantics, close the one
+      genuinely open spelling, and stop the whole thing regressing silently**:
+      - **The semantics TODO asked to pin — "binding site vs literal coordinate source" — resolves to *binding
+        site*, and for a reason that needed no new code.** A material application substitutes ANY input name
+        (`patternSubstitute`), so every driver name in a literal's tuple is rebindable; a literal's "formals" are
+        simply the driver names it wrote, which is exactly what the ADDENDUM's `(u=a, v=x)` example rebinds.
+        Naming `a` is not a special construct — it is an ordinary coordinate that happens to name the one input
+        with no per-hit intrinsic, which is what lets it survive to the use site.
+      - **The one open spelling is REFUSED, loudly.** `formal=driver` *inside a literal's own call* (`[0 1](a=u)`)
+        has no formal to bind: an inline literal's axes are anonymous and positional, and there is no second
+        namespace. Honouring it would have to invent a per-material default for `a` — which two literals in one
+        material could contradict — so it is a load error naming BOTH escapes (`[0 1](u)` to spend the axis,
+        `[0 1](a)` + `material mat(a=u)` to defer it). Previously it reached the pattern lexer and died as
+        `unexpected character '='`. `desugarOne` now splits the call properly (`splitCallArgs`, sharing
+        `parseBindArgs`'s "a top-level `=` is unambiguous" rule) and also names an empty axis by index.
+      - **The unsaturated error now names the deferral route** — the ADDENDUM's "user-side, axis left open" case.
+        ftrace has no value site that can hold an unsaturated array, so leaving an axis open is spelled `(a)`,
+        not by omitting the call; the message says so instead of only offering `(u)`.
+      - **Generated blocks are re-attributed** (`Builder::genSite_` / `genWho`): any error inside the anonymous
+        `grid`/`pattern` a literal desugars to now names the author's site and the literal's call text. The
+        increment-2 bullet above claimed errors "never name the generated `__arrN`", but that only held for the
+        checks `desugarOne` did itself — a bad *coordinate* (`[0 1](nope)`) reported `pattern '__arr0'`.
+      - **loom twin:** `values.py::_check_args` gained `literal_target`, refusing the same spelling with the same
+        two escapes. Without it loom would happily normalize `[0 1](a=u)` into a `Call` and emit a scene ftrace
+        rejects. Three existing tests were retargeted from `[0 1](…)` to `ramp(…)` (a NAME target, where a keyword
+        rebind IS meaningful) plus one new refusal test; suite 1210 → 1211.
+      - **`-checkarray`** (`checkArray()` in `main.cpp`) pins it deterministically against independently authored
+        twins at five probe points chosen so `u != v` (a rebind test on the diagonal passes for the wrong reason):
+        the three bind spellings ≡ the inline literal, a driver *expression* ≡ the same expression inline, the
+        geometry-field use site ≡ the property-reference one, and the 2-D simultaneous swap ≡ the transposed
+        literal **with a negative twin** proving the swap is not a no-op. Plus explicit **non-vacuity** checks —
+        a `PatCtx` without the grid pool bound makes `PatOp::Grid` return 0.0, so every identity would otherwise
+        compare 0 == 0 and pass. Plus eight refusals, each pinning its message.
+      - **Validation:** all 15 self-tests PASS, all 85 scenes parse, the grammar corpus sweep is 85/85, loom is
+        1211/1211, and `scenes/_array_formal.ftsl` renders the three identity rows (flat camera-facing quad tiles,
+        for the `_material_bind.ftsl` reasons).
+      - **Still open, discovered here** (logged in `open-work.md`): a literal cannot yet be *composed*
+        (`[0 1]([0.2 0.8](u))` — the inner brackets break `PARENWORD`), and the `NAME axistuple` arm does NOT in
+        fact work at a value site for a grid/scatter (`reflect grid:ramp(u)` is "unrecognized spectrum
+        expression"); it works only for materials and material properties, where it is a bundle application.
     * **ADDENDUM — call = sample; late-binding & rebinding of the consumed axis (design intent, user).** The
       trailing `(...)` is not just a *label* on a literal — it is the **sample call**, exactly like loom's
       `grid(x, y)`. Two authoring positions, so a material can *define* what an array consumes, or *defer* it to its

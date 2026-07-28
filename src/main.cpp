@@ -1960,6 +1960,220 @@ static int checkProp() {
     return ok ? 0 : 1;
 }
 
+// Deterministic self-test for INLINE ARRAY LITERAL sample calls — the axis tuple on
+// `[0 1](…)` (TODO "DECISION — color-vector / array syntax", the increment-2 `Deferred:`
+// clause and the `ADDENDUM — call = sample`).
+//
+// The claim under test is that an array literal's axis tuple takes DRIVERS, and that
+// leaving an axis open for the material's *user* is spelled by naming the one free input
+// (`[0 1](a)`) and binding it where the material is used (`material mat(a=u)`) — not by a
+// separate formal namespace. That claim is only worth anything if it is an IDENTITY, so
+// every positive case here compares two independently authored scenes whose probe
+// materials must be indistinguishable, exactly like checkProp; nothing is hard-coded.
+//
+// The refusals matter just as much: the one form the design text left open —
+// `formal=driver` *inside a literal's own tuple* — is refused rather than approximated,
+// because an inline literal's axes are anonymous and positional, so there is no formal to
+// bind and accepting it would have to invent a per-material default that two literals in
+// one material could contradict. Each refusal also pins its MESSAGE, because the message
+// is the whole value of a refusal.
+static int checkArray() {
+    bool ok = true;
+    auto chk = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkarray] %-58s BAD\n", what); ok = false; }
+    };
+    // `quadMat` is the geometry field's material *reference*, so a case can exercise the
+    // OTHER use site a bind can appear at — `material probe(a=u)` on the quad itself.
+    auto wrap = [](const char* body, const char* quadMat = "probe") {
+        return "scene { units meters }\n" + std::string(body) + "\n"
+               "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material " + quadMat + " }\n"
+               "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+               "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+    };
+    auto loadMats = [&](const char* body, ftsl::Loaded& L, const char* quadMat = "probe") -> bool {
+        std::string e;
+        if (!ftsl::loadSource(wrap(body, quadMat), "<checkarray>", L, e)) {
+            std::printf("[checkarray] load FAILED: %s\n", e.c_str());
+            return false;
+        }
+        return true;
+    };
+    auto mustReject = [&](const char* what, const char* body, const char* needle) {
+        ftsl::Loaded L; std::string e;
+        if (ftsl::loadSource(wrap(body), "<checkarray>", L, e)) { chk(what, false); return; }
+        if (e.find(needle) == std::string::npos) {
+            std::printf("[checkarray] %-58s BAD (error was: %s)\n", what, e.c_str());
+            ok = false;
+        }
+    };
+    auto probeOf = [&](ftsl::Loaded& L) -> const Material& {
+        int mi = L.scene.tris.empty() ? 0 : L.scene.tris[0].matId;
+        return L.scene.mats[mi];
+    };
+    // Five probe points, so an identity that only holds on the diagonal (u == v, the
+    // classic way a rebind test passes for the wrong reason) cannot slip through.
+    PatCtx pts[5]{};
+    const double us[5] = {0.07, 0.31, 0.50, 0.83, 0.96};
+    const double vs[5] = {0.62, 0.11, 0.50, 0.24, 0.78};
+    for (int k = 0; k < 5; ++k) {
+        pts[k].x = 0.37; pts[k].y = -0.81; pts[k].z = 1.23;
+        pts[k].nx = 0.0; pts[k].ny = 1.0; pts[k].nz = 0.0; pts[k].r = 0.5; pts[k].f = 0.25;
+        pts[k].u = us[k]; pts[k].v = vs[k];
+    }
+    // The grid/scatter POOL has to be bound into the context, or `PatOp::Grid` bails out
+    // and returns 0.0 — and since a desugared array literal is nothing BUT a grid sample,
+    // every comparison here would then be 0 == 0 and pass vacuously. That is why the
+    // `varies` assertions below exist at all.
+    auto reflectAt = [&](ftsl::Loaded& L, const Material& m, const PatCtx& base_c) {
+        PatCtx c = base_c;
+        bindPatScene(c, L.scene);
+        double base = m.reflect(550.0);
+        if (m.reflectPat >= 0 && m.reflectPat < (int)L.scene.patterns.size()) {
+            const auto& p = L.scene.patterns[m.reflectPat].nodes;
+            base *= patternEval(p.data(), (int)p.size(), c);
+        }
+        return base;
+    };
+    auto sameReflect = [&](const char* what, const char* refBody, const char* twinBody) {
+        ftsl::Loaded A, B;
+        if (!loadMats(refBody, A) || !loadMats(twinBody, B)) { chk(what, false); return; }
+        for (int k = 0; k < 5; ++k) {
+            double a = reflectAt(A, probeOf(A), pts[k]), b = reflectAt(B, probeOf(B), pts[k]);
+            if (std::fabs(a - b) > 1e-12) {
+                std::printf("[checkarray] %-58s BAD (pt %d: %.12g vs %.12g)\n", what, k, a, b);
+                ok = false; return;
+            }
+        }
+    };
+    // Also assert the pair is not accidentally CONSTANT — a literal that failed to sample
+    // would compare equal to another that failed the same way.
+    auto varies = [&](const char* what, const char* body) {
+        ftsl::Loaded A;
+        if (!loadMats(body, A)) { chk(what, false); return; }
+        double lo = 1e300, hi = -1e300;
+        for (int k = 0; k < 5; ++k) {
+            double r = reflectAt(A, probeOf(A), pts[k]);
+            lo = std::fmin(lo, r); hi = std::fmax(hi, r);
+        }
+        if (hi - lo <= 1e-6) {
+            std::printf("[checkarray] %-58s BAD (constant: lo=%.12g hi=%.12g, pat=%d)\n",
+                        what, lo, hi, probeOf(A).reflectPat);
+            ok = false;
+        }
+    };
+
+    // (a) The baseline the rest is measured against: a literal really is the grid+pattern
+    //     it desugars to, and it really does vary with its driver.
+    sameReflect("`[0 1](u)` == the hand-written grid + pattern twin",
+        "material \"probe\" { type diffuse  reflect [0 1](u) }",
+        "grid \"g\" { shape 2  lo 0  hi 1  data { 0 1 } }\n"
+        "pattern \"p\" { expr \"grid:g(u)\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:p }");
+    varies("...and the sampled value actually tracks u",
+        "material \"probe\" { type diffuse  reflect [0 1](u) }");
+
+    // (b) THE ITEM. Naming the free input `a` leaves the axis open; binding it at the use
+    //     site must reproduce spending it inline. Both spellings of the bind — the
+    //     keyword form and the positional one — and both use sites (a geometry `material`
+    //     field and a property reference) have to agree with the inline literal.
+    sameReflect("formal `[0 1](a)` + keyword bind `(a=u)` == `[0 1](u)`",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=u) }",
+        "material \"probe\" { type diffuse  reflect [0 1](u) }");
+    sameReflect("formal `[0 1](a)` + POSITIONAL bind `(u)` == the keyword form",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(u) }",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=u) }");
+    {
+        // The other use site a bind can appear at: the geometry field itself,
+        // `material probe(a=u)`. It must land on the same answer as the inline literal.
+        ftsl::Loaded A, B;
+        if (loadMats("material \"probe\" { type diffuse  reflect [0 1](a) }", A, "probe(a=u)") &&
+            loadMats("material \"probe\" { type diffuse  reflect [0 1](u) }", B)) {
+            bool same = true;
+            for (int k = 0; k < 5; ++k)
+                if (std::fabs(reflectAt(A, probeOf(A), pts[k]) -
+                              reflectAt(B, probeOf(B), pts[k])) > 1e-12) same = false;
+            chk("binding a formal at a geometry `material` field agrees too", same);
+        } else ok = false;
+    }
+    varies("a bound formal axis actually varies with its driver",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=u) }");
+
+    // (c) The driver is an ordinary expression, not just a variable name — so the formal
+    //     route composes with arithmetic exactly like the inline route does.
+    sameReflect("a formal bound to an EXPRESSION == that expression written inline",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=0.25+0.5*v) }",
+        "material \"probe\" { type diffuse  reflect [0 1](0.25+0.5*v) }");
+
+    // (d) Multi-axis: the formals of a 2-D literal ARE the driver names in its own tuple
+    //     (the design text's `(u=a, v=x)` case), so a simultaneous swap must transpose the
+    //     lookup — and NOT collapse the way a sequential u->v, v->u rebind would.
+    sameReflect("2-D literal, simultaneous swap `(u=v, v=u)` == the transposed literal",
+        "material \"src\" { type diffuse  reflect [[0 0.3][0.6 1]](u,v) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(u=v, v=u) }",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](v,u) }");
+    {
+        // Negative twin for the same case: the swap must NOT equal the unswapped literal,
+        // or the assert above would pass for a rebind that silently did nothing.
+        ftsl::Loaded A, B;
+        const char* swapped =
+            "material \"src\" { type diffuse  reflect [[0 0.3][0.6 1]](u,v) }\n"
+            "material \"probe\" { type diffuse  reflect src.reflect(u=v, v=u) }";
+        const char* plain = "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](u,v) }";
+        if (loadMats(swapped, A) && loadMats(plain, B)) {
+            bool differs = false;
+            for (int k = 0; k < 5; ++k)
+                if (std::fabs(reflectAt(A, probeOf(A), pts[k]) -
+                              reflectAt(B, probeOf(B), pts[k])) > 1e-9) differs = true;
+            chk("...and the swap is not a silent no-op", differs);
+        } else ok = false;
+    }
+
+    // (e) THE PINNED REFUSAL. `formal=driver` inside a literal's own tuple has no formal
+    //     to bind. The message must carry BOTH escapes, because an author who wrote it
+    //     meant one of exactly two things.
+    mustReject("`[0 1](a=u)` is refused, not approximated",
+        "material \"probe\" { type diffuse  reflect [0 1](a=u) }", "no formal to bind");
+    mustReject("...and the refusal offers the spend-it-here spelling",
+        "material \"probe\" { type diffuse  reflect [0 1](a=u) }", "(u)`");
+    mustReject("...and the leave-it-free spelling",
+        "material \"probe\" { type diffuse  reflect [0 1](a=u) }", "material mat(a=u)");
+    mustReject("a keyword arg is refused after a positional one too",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](u, b=v) }",
+        "no formal to bind");
+
+    // (f) Errors name what the AUTHOR wrote. `__arrN` is a symbol they never chose and
+    //     cannot search the file for, so no message about a literal may mention it.
+    {
+        ftsl::Loaded L; std::string e;
+        ftsl::loadSource(wrap("material \"probe\" { type diffuse  reflect [0 1](nope) }"),
+                         "<checkarray>", L, e);
+        chk("a bad coordinate reports the author's site, not `__arrN`",
+            e.find("__arr") == std::string::npos &&
+            e.find("inline array literal's sample call") != std::string::npos &&
+            e.find("unknown identifier 'nope'") != std::string::npos);
+    }
+
+    // (g) The remaining shape errors, each naming the thing that is wrong.
+    mustReject("an unsaturated literal names the formal-axis escape",
+        "material \"probe\" { type diffuse  reflect [0 1] }", "`[0 1](a)`");
+    mustReject("an empty axis is named by index",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](u,) }", "axis 1");
+    mustReject("coordinate count is checked against the nesting",
+        "material \"probe\" { type diffuse  reflect [0 1](u,v) }", "one per nesting level");
+    mustReject("an unbindable formal name is named at the use site",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(b=u) }",
+        "not a bindable input");
+
+    std::printf("[checkarray] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic distant-sun self-test (EmitterShape::Sun; src/scene.h addSunLight /
 // sampleCone / inCone / geomWeight). No scene file, no renderer, no RNG-seeded image —
 // it pins the four invariants the emitter's correctness rests on:
@@ -4810,6 +5024,7 @@ static int run(int argc, char** argv) {
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
     bool checkPropOnly = false;
+    bool checkArrayOnly = false;
     bool checkSunOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
@@ -5122,6 +5337,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
         else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
+        else if (!std::strcmp(argv[i], "-checkarray")) checkArrayOnly = true;
         else if (!std::strcmp(argv[i], "-checksun")) checkSunOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
@@ -5275,6 +5491,7 @@ static int run(int argc, char** argv) {
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
     if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)
+    if (checkArrayOnly)    return checkArray();    // ditto
     if (checkSunOnly)      return checkSun();      // deterministic, no scene needed
 
     // --- every output directory must exist BEFORE a single photon is traced ----------

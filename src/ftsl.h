@@ -944,6 +944,20 @@ private:
     std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
     std::unordered_map<std::string, int> patternIndex_;   // pattern name -> Scene::patterns index
 
+    // Generated-block name (`__arrN`) -> the AUTHOR-facing site that produced it.
+    // `desugarArrays` mints anonymous `grid`/`pattern` blocks the author never named, so
+    // any error raised while BUILDING one must be re-attributed: a message about
+    // `pattern '__arr3'` names a symbol that appears nowhere in the scene file. Populated
+    // by `desugarOne`, consulted by `genWho` below.
+    std::unordered_map<std::string, std::string> genSite_;
+    // "pattern 'foo'" for an authored block; "line 12: `reflect`: the inline array literal"
+    // for a generated one. Every fail() that can fire on a generated block goes through it.
+    std::string genWho(const char* kind, const std::string& name) const {
+        auto it = genSite_.find(name);
+        if (it != genSite_.end()) return it->second;
+        return std::string(kind) + " '" + name + "'";
+    }
+
     // Texture scope for `tex:<name>(u, v)` samples inside a pattern expression. Passed
     // to compilePatternExpr ONLY at value sites that are evaluated with a shading
     // context (material / pattern / record-driver expressions); leaving it off at the
@@ -2235,7 +2249,7 @@ private:
             // it, and applyMaterial then resolves `a` against THAT material.
             if (!compilePatternExpr(expr, pat.nodes, perr, false, &texScope_,
                                     &tableScope_, /*allowA=*/true)) {
-                fail("pattern '" + b.name + "': " + perr); return false;
+                fail(genWho("pattern", b.name) + ": " + perr); return false;
             }
         } else {
             std::string g = strOf(b, "type", "");
@@ -2317,6 +2331,47 @@ private:
         return true;
     }
 
+    // Split a sample call's `( … )` text into its top-level, comma-separated arguments,
+    // and report whether any of them carries a top-level `=` (the keyword `formal=driver`
+    // form). Top-level means "not inside a nested paren/bracket group", so a composed
+    // coordinate keeps its own commas to itself. As in `parseBindArgs`, a top-level `=`
+    // is unambiguously a binding because the pattern language has no comparison operators.
+    // `kwAt` is the index of the FIRST keyword argument, or -1.
+    static void splitCallArgs(const std::string& call, std::vector<std::string>& out,
+                              int& kwAt, std::string& kwFormal) {
+        out.clear(); kwAt = -1; kwFormal.clear();
+        if (call.size() <= 2) return;                       // `()` — no arguments at all
+        const std::string in = call.substr(1, call.size() - 2);
+        int depth = 0; size_t start = 0;
+        std::vector<std::string> raw;
+        for (size_t i = 0; i <= in.size(); ++i) {
+            if (i == in.size() || (in[i] == ',' && depth == 0)) {
+                raw.push_back(trimWs(in.substr(start, i - start)));
+                start = i + 1;
+                continue;
+            }
+            char c = in[i];
+            if (c == '(' || c == '[') ++depth;
+            else if (c == ')' || c == ']') --depth;
+        }
+        for (size_t k = 0; k < raw.size(); ++k) {
+            const std::string& seg = raw[k];
+            out.push_back(seg);
+            if (kwAt >= 0) continue;
+            int d = 0;
+            for (size_t i = 0; i < seg.size(); ++i) {
+                char c = seg[i];
+                if (c == '(' || c == '[') ++d;
+                else if (c == ')' || c == ']') --d;
+                else if (c == '=' && d == 0) {
+                    kwAt = (int)k;
+                    kwFormal = trimWs(seg.substr(0, i));
+                    break;
+                }
+            }
+        }
+    }
+
     // Turn ONE literal into its `grid` + `pattern` pair (appended to `gen`) and rewrite
     // the statement's value to reference the generated pattern.
     bool desugarOne(Stmt& s, std::vector<Block>& gen, int& n) {
@@ -2324,10 +2379,16 @@ private:
         const std::string nm  = "__arr" + std::to_string(n++);
         const std::string who = "line " + std::to_string(a.line) + ": `" + s.key + "`";
         if (a.call.empty()) {
+            // Two ways to finish an array, and the message names both: SPEND the axis here
+            // (`(u)`), or leave it as a FORMAL for whoever uses the material (`(a)`, bound
+            // at the use site by `mat(a=u)`). The second is the "unsaturated, completed by
+            // the user" case from the design — in ftrace it is spelled by naming `a`, the
+            // one input with no per-hit intrinsic, rather than by omitting the call.
             fail(who + ": an inline array literal needs a trailing sample call naming the "
                  "coordinates it is read at — e.g. `[0 1](u)`, or `[[0 1][2 3]](u,v)` for "
-                 "2-D. Write the call with no spaces inside the parentheses and nothing "
-                 "between it and the `]`.");
+                 "2-D. To leave the choice to whoever USES this material, name the free "
+                 "input instead — `[0 1](a)` — and bind it at the use site with "
+                 "`material mat(a=u)`. Write the call with nothing between it and the `]`.");
             return false;
         }
         if (!s.val.words.empty()) {
@@ -2344,21 +2405,45 @@ private:
                  std::to_string((int)PAT_ND_MAX_DIM) + "-D limit");
             return false;
         }
-        // Arity is checked HERE, not left to the generated grid sample, so the message can
-        // talk about what the author wrote (`[…](u)`) instead of a name they never chose.
+        // Arity and argument SHAPE are checked HERE, not left to the generated grid sample,
+        // so the message can talk about what the author wrote (`[…](u)`) instead of a name
+        // they never chose.
         {
-            int args = 1, depth = 0;
-            for (size_t k = 1; k + 1 < a.call.size(); ++k) {
-                char c = a.call[k];
-                if (c == '(') ++depth;
-                else if (c == ')') --depth;
-                else if (c == ',' && depth == 0) ++args;
+            std::vector<std::string> args;
+            int kwAt = -1; std::string kwFormal;
+            splitCallArgs(a.call, args, kwAt, kwFormal);
+            // Emptiness before arity: `(u,)` is a stray comma, not a 2-D call, and saying so
+            // beats "the array is 1-D but the call gives 2 coordinates".
+            for (size_t k = 0; k < args.size(); ++k) {
+                if (!args[k].empty()) continue;
+                fail(who + ": axis " + std::to_string(k) + " of the sample call `" + a.call +
+                     "` is empty — every axis needs a coordinate expression");
+                return false;
             }
-            if (a.call.size() <= 2) args = 0;           // `()`
-            if (args != (int)shape.size()) {
+            if ((int)args.size() != (int)shape.size()) {
                 fail(who + ": the array is " + std::to_string(shape.size()) +
                      "-D but its sample call `" + a.call + "` gives " +
-                     std::to_string(args) + " coordinate(s) — one per nesting level");
+                     std::to_string(args.size()) + " coordinate(s) — one per nesting level");
+                return false;
+            }
+            // --- PINNED SEMANTICS: an inline literal's axes carry no names ------------
+            // `formal=driver` binds a name belonging to the CALLEE. A material, a material
+            // property and a named pattern all have callee-side input names, so `mat(a=u)`
+            // / `src.reflect(u=v)` are meaningful there. An inline array literal has no
+            // such namespace: its axes are positional and anonymous, and the names in its
+            // own tuple are DRIVERS (coordinate expressions), not formals. Accepting
+            // `[0 1](a=u)` would therefore have to invent a per-material default for `a`,
+            // which two literals in one material could contradict — so it is refused, and
+            // the message names the two spellings that actually do the two things an
+            // author can mean.
+            if (kwAt >= 0) {
+                fail(who + ": `" + args[kwAt] + "` — an inline array literal's axes are "
+                     "positional and unnamed, so a `formal=driver` argument has no formal "
+                     "to bind. Its sample call takes DRIVERS: write `[…](" +
+                     trimWs(args[kwAt].substr(args[kwAt].find('=') + 1)) +
+                     ")` to spend the axis here, or `[…](" + kwFormal +
+                     ")` to leave it free and rebind it where the material is USED — "
+                     "`material mat(" + args[kwAt] + ")`");
                 return false;
             }
         }
@@ -2387,6 +2472,10 @@ private:
         p.name = nm;
         addStmt(p, "expr", {"grid:" + nm + a.call});
         gen.push_back(std::move(p));
+        // Re-attribute anything that goes wrong inside the generated pair (an unknown
+        // identifier in a coordinate, a `tex:` out of scope, …) back to the literal the
+        // author actually wrote — `__arrN` is a name they never chose and cannot search for.
+        genSite_[nm] = who + ": the inline array literal's sample call `" + a.call + "`";
 
         s.val.array.reset();
         s.val.words.push_back("pattern:" + nm);
@@ -2445,7 +2534,7 @@ private:
     bool addGrid(const Block& b, Loaded& L) {
         if (b.name.empty()) { fail("grid needs a \"name\""); return false; }
         if (gridIndex_.count(b.name)) { fail("duplicate grid name '" + b.name + "'"); return false; }
-        const std::string who = "grid '" + b.name + "'";
+        const std::string who = genWho("grid", b.name);
 
         // Samples: a `data { … }` brace body (the flat-word list form `palette {}` uses),
         // an inline `data 1 2 3` line, or a BRACKETED `data [[0 1 2][3 4 5]]` whose nesting

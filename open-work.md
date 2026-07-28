@@ -30,30 +30,44 @@ name), plus `spec:<spectrum>(w)`, which is what makes a *measured basis* express
 than only closed-form arithmetic. Pinned by `-checkupsample` section (h); scene
 `scenes/_upsample.ftsl`; loom twins `NamedSpectrum`/`Upsample`/`UserSpec`/`is_colour_space`.
 
-### Array-literal formals + keyword rebind — `[0 1](a)` … `(a=u)`  *(ftrace; small)*
-*TODO.md "DECISION — color-vector / array syntax", the increment-2 `**Deferred:**` clause and
-the `ADDENDUM — call = sample` bullet.*
+### ~~Array-literal formals + keyword rebind — `[0 1](a)` … `(a=u)`~~  **DONE 2026-07-28 (v0.91.0)**
+*TODO.md "DECISION — color-vector / array syntax" — now closed; see the increment-2 remainder
+STATUS there.*
 
-**The stated blocker is now stale.** Increment 2 (v0.73.0) shipped the array sample call
-`[0 1](u)` but deferred the keyword form with the explicit reason *"formals don't exist yet —
-it currently lexes as a call and would fail in the expression compiler."* Formals and
-`formal=driver` rebinding both exist as of the §3.3 material-bundle work (v0.87.0) and the §3.2
-per-property work (v0.89.0), and the v0.88.0 lexer change made spaced argument lists legal. So
-the machinery this item was waiting on is built; what remains is pointing it at array literals.
+The v0.73.0 deferral was stale in both directions. The feature itself had already arrived with
+the §3.3 material bundles (v0.87.0) and §3.2 per-property access (v0.89.0) — `[0 1](a)` compiled
+to a program with a free `a`, and `mat(a=u)` / `src.reflect(a=u)` / `src.reflect(u)` rebound it —
+but nothing pinned it, and the one genuinely open spelling was still a raw lexer error.
 
-Two halves:
-- **Declaring a formal axis on a literal** — `reflect [0 1](a)` names the axis rather than
-  spending it, so a *user* of the material can bind it.
-- **Rebinding it** — `(a=u)` at the use site, read `formal=driver`. Positional `(u)` rebinds the
-  sole/next axis; keyword targets a named one; multiple axes take one argument each
-  (`(u=a, v=x)`); mix is positionals-first as usual.
+Pinned semantics: a literal's axes are anonymous and bind by **position**, so its "formals" are
+just the driver names in its own tuple (which is what a rebind substitutes; hence the simultaneous
+2-D swap `(u=v, v=u)` transposes). `formal=driver` *inside* a literal's own call is refused with
+both working spellings named, generated `__arrN` blocks are re-attributed to the authoring site,
+the unsaturated message now names the `(a)` deferral route, loom's `values.py` refuses the same
+spelling, and `-checkarray` + `scenes/_array_formal.ftsl` pin the identities (with explicit
+non-vacuity checks).
 
-Semantics `TODO.md` says to pin when building: whether a formal axis name is a **binding site**
-(rebindable) or a **literal coordinate source** (fixed), and the error text when a bare
-unsaturated array reaches the renderer.
+### Composing array literals — `[0 1]([0.2 0.8](u))`  *(ftrace; small)*
+*Discovered 2026-07-28 while closing the item above. TODO.md's grammar sketch has
+`coord = NAME | NUMBER | value`, i.e. "a nested `sampled` gives composition (`n(m(u), v)`)".*
 
-Also noted there as needing no work: `NAME axistuple` (`ramp(u)`), because ftrace's expression
-evaluator already reads `name(args)` as a call.
+ftrace can't do it: `PARENWORD = /\([^ \t\r\n{}\[\]#"]*\)/` excludes `[` and `]`, so the inner
+literal's brackets split the token and the outer literal reports the (misleading) *unsaturated*
+error. loom's value grammar already normalizes the nested form. Workaround today is to name the
+inner table (`grid` + `pattern`) and reference it from the outer call's coordinate expression.
+
+### `NAME axistuple` at a value site — `reflect grid:ramp(u)`  *(ftrace; small)*
+*Discovered 2026-07-28. Corrects a wrong claim in TODO.md's increment-2 `Deferred:` clause.*
+
+That clause says `NAME axistuple` "needs no work because ftrace's expression evaluator already
+reads `name(args)` as a call". True *inside* a pattern expression — but a **value site** is not an
+expression site, and `reflect grid:ramp(u)` is "unrecognized spectrum expression". The form works
+only where the name is a material or material property (`gold(u=v)`, `src.reflect(u=v)`), because
+those go through `applyMaterial`. Closing the gap means hooking the same four chokepoints v0.89.0
+used for `MATERIAL.slot(args)` (`evalSpectrum`, `patternedSpectrumParam`, `dblParam`,
+`bindScalarPattern`); a bare `ramp(u)` must keep meaning a material application, so the scoped
+`grid:` / `scatter:` spelling is the unambiguous one to accept. Workaround: declare the one-line
+`pattern` wrapper by hand, which is exactly what an array literal desugars to.
 
 ---
 
