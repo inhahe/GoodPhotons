@@ -116,7 +116,19 @@ struct EnvMap {
         tex.encoding = TexEncoding::sRGB;   // LDR inputs honour sRGB; .hdr/.pfm force Linear
         if (!tex.load(path, err)) return false;
         if (!tex.valid()) { err = "environment map has no pixels: " + path; return false; }
-        w = tex.w; h = tex.h;
+        return buildFromRgb(tex.rgb, tex.w, tex.h, rotateDeg, intensity, err);
+    }
+
+    // Build directly from an in-memory linear-RGB equirectangular buffer (row-major,
+    // row 0 = up). Shared by the image loader above and analytic generators (e.g. the
+    // Preetham sky in sky.h). `intensity` multiplies every texel; use 1.0 when the
+    // buffer already carries its brightness.
+    bool buildFromRgb(const std::vector<Vec3>& rgbIn, int width, int height,
+                      double rotateDeg, double intensity, std::string& err) {
+        if (width <= 0 || height <= 0 || rgbIn.size() < (size_t)width * height) {
+            err = "environment buffer is empty or undersized"; return false;
+        }
+        w = width; h = height;
         rotOffset = rotateDeg / 360.0;
 
         // Normalise the illuminant so a unit reflectance emits Y = 1 (1 nm grid,
@@ -145,7 +157,7 @@ struct EnvMap {
             double sinT = std::sin(theta);
             for (int col = 0; col < w; ++col) {
                 size_t i = (size_t)row * w + col;
-                Vec3 c = tex.rgb[i] * intensity;
+                Vec3 c = rgbIn[i] * intensity;
                 c.x = std::max(0.0, c.x); c.y = std::max(0.0, c.y); c.z = std::max(0.0, c.z);
                 double m = std::max(c.x, std::max(c.y, c.z));
                 double s = 2.0 * m;                       // PBRT-style: chroma in [0,0.5]

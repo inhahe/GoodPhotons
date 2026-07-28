@@ -39,10 +39,13 @@ inline bool sceneHasGrin(const Scene& scene) {
 // this is never entered for ordinary scenes.
 inline void march(const Scene& scene, Ray& ray) {
     constexpr int GRIN_MAX_STEPS = 200000;   // safety cap on marching steps
+    // Sampled tables, so an `ior` field (or the bounding field selecting the region) can
+    // read a MEASURED index volume — `ior "grin:n(x, y, z)"` — not just a formula.
+    const PatTables tabs = scene.patTables();
     // The GRIN region containing a point (highest-priority membership), or null.
     auto grinAt = [&](const Vec3& p) -> const Medium* {
         for (const auto& md : scene.media)
-            if (md.enabled && md.grin() && md.insideBound(p)) return &md;
+            if (md.enabled && md.grin() && md.insideBound(p, &tabs)) return &md;
         return nullptr;
     };
     for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
@@ -68,8 +71,8 @@ inline void march(const Scene& scene, Ray& ray) {
         if (hs.valid && hs.t <= ds) break;                       // surface within a step
         // Symplectic Eikonal step with optical direction T = n·d (|T| = n):
         //   T += ∇n · ds ;  x += (T/n)·ds ;  d = T/|T|.
-        double n0 = gm->nAt(ray.o);
-        Vec3 T = ray.d * n0 + gm->gradNAt(ray.o, 0.5 * ds) * ds;
+        double n0 = gm->nAt(ray.o, &tabs);
+        Vec3 T = ray.d * n0 + gm->gradNAt(ray.o, 0.5 * ds, &tabs) * ds;
         Vec3 newPos = ray.o + (T / n0) * ds;
         double tl = std::sqrt(dot(T, T));
         Vec3 newDir = (tl > 1e-12) ? T * (1.0 / tl) : ray.d;

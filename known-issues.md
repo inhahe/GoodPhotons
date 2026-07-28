@@ -5,6 +5,517 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PERF — OPEN (2026-07-27): scene loading is down 5×, but the graph walk (not the lexer) is what's left
+
+The 0.68 front-end flip made loading measurably slower than the hand-written parser —
+roughly linear in scene size, ~8.7 µs/byte at first, so the largest scene in the tree
+(`scenes/gallery_settled.ftsl`, 22 KB) spent ~200 ms in the front end before rendering
+started. Two rounds of work took that to **~42 ms** (lex 7.1 ms + parse 34.6 ms),
+measured with `tools/gpda_lexcheck/lexcheck.exe scenes/gallery_settled.ftsl`:
+
+- **Lexer, 47 ms → 7.1 ms.** The naive loop ran all 16 rule regexes at every position and
+  `std::regex` costs ~1 µs a call. `src/gpda/gpda_lexer.hpp` now derives a first-byte set
+  from each pattern and skips rules that cannot start with the current byte, and matches
+  metacharacter-free patterns (9 of the 16) with a string compare. Validated by
+  `tools/gpda_lexcheck/`.
+- **Parser, 66.6 ms → 34.6 ms** (upstream GraphParser `f8ea9a3`, re-vendored): precomputed
+  the per-node `return_links` shared_ptr instead of rebuilding it on each of ~19 RuleRef
+  traversals per token; made the closure's visited set a hash table instead of a linear
+  scan (8.16M key comparisons per parse → 93K); dropped the pointless `std::atomic` on the
+  intrusive refcount (the pool is thread-local, so cross-thread refcounting was already
+  corruption) — that alone was ~20% of parse time.
+
+**What remains.** Measured on that scene: 424K closure steps, 61K `ParseNode`s built (each
+with a heap-allocated `children` vector via `plist_to_vector` plus a rule-name
+`std::string` copy), 140K `plist_push`es — and only ~2.4 of the ~30 expanded terminals per
+token ever match, so most of those nodes belong to derivations that die. The next real win
+is therefore not another micro-optimisation but **not building parse nodes speculatively**:
+keep the children as the persistent list they already are and materialise
+`ParseNode::children` once, lazily, for the tree that actually wins. That changes
+`ParseNode`'s public shape, so it touches `ftsl_reduce.hpp`, both GraphParser test suites
+and loom's mirror. Worth doing only if scene load shows up again — 42 ms on the single
+largest scene, with the median scene well under 5 ms, is no longer near the top.
+
+### TECH-DEBT — OPEN (2026-07-26): `GraphParser/cpp/scannerless.{hpp,cpp}` still throws bare `std::runtime_error`, not the rich `ParseError`
+
+The tokenized engine (the one ftrace uses) throws a `ParseError` carrying line/col, the
+exact accepted-continuation set, and the enclosing rule chain — that diagnostic quality is
+the main reason the front-end flip was worth doing. The **scannerless** engine, which
+shares the same graph-walking core, still throws a plain `std::runtime_error` with no
+position and no expected set.
+
+**Why it wasn't done with the tokenized version:** the tokenized parser gets `line`/`col`
+for free (the lexer stamps every token) and its expected set is a set of *token* patterns,
+which `join_expected` can name directly. Scannerless has neither: it would need
+(a) a byte-offset → line/col map built once per parse from the input text, and (b) an
+expected-set formatter that describes **char-level** matchers (literal strings, char
+classes with ranges, `.`, unicode classes) in a form a user can read — e.g. collapsing
+`[0-9]` back to its source spelling rather than dumping 10 alternatives.
+
+**Proper fix:** hoist `ParseError` + `join_expected` + `escape_token_text` into a shared
+header, add an offset→line/col helper to the scannerless `Parser`, and write a
+`describe_matcher(const Node&)` for char-level terminals. Not urgent — no shipped ftrace
+path uses the scannerless engine.
+
+### TECH-DEBT — DONE (2026-07-27, 0.79.0): the hand-written `.ftsl` parser is deleted — one front end, one implementation of the language
+
+0.68.0 flipped ftrace's front end over to the shared grammar
+(`tools/loom/loom/grammar/ftsl_scene.epeg` → `src/gpda/`), gated on the corpus differ
+reaching **MATCH 2595/2595** (every `.ftsl` in the tree, structurally identical down to
+`Stmt::line`). The retired hand-written parser stayed compiled in behind
+`-legacy-parser` / `FTRACE_LEGACY_PARSER` as a one-release escape hatch. It held for
+**ten** releases (0.68 → 0.78) with no scene ever needing the fallback, so the escape
+hatch had earned its retirement.
+
+**Fixed** — everything downstream of `std::vector<Block>` is shared and untouched; only
+the front half went:
+
+- `src/ftsl.h`: deleted the `// Tokenizer` section (`enum class Tok`, `struct Token`,
+  `tokenize`) and the whole 266-line `struct Parser` (`parseValue` / `parseBraceBody` /
+  `parseOneTopBlock` / `parseBlockList` / `parsePrefer` / `parseTop`). `loadSource()` lost
+  its `legacy_parse` lambda and the branch around it; it now just calls
+  `ftsl_gpda::parse()`.
+- `src/gpda/ftsl_frontend.hpp`: deleted `legacy_flag()`, `use_legacy()`,
+  `validate_flag()`, `validate_enabled()` and the `validate()` template. What is left is
+  `parser()`, `lexer()`, `parse()`.
+- `src/gpda/ftsl_reduce.hpp`: deleted the structural differ (`struct Diff`, `diff_block`,
+  `diff_value`, `diff_scene`) that drove the 0.68 corpus comparison — with one front end
+  there is nothing left to diff against.
+- `src/main.cpp`: the argv pre-scan for the two flags is gone (it existed only because
+  the parse happens before the main CLI loop). Both flags are still **accepted** in the
+  CLI loop so an existing script doesn't hit the unknown-option error, but each prints
+  `ftrace: <flag> was retired in 0.79.0 — the shared grammar is the only .ftsl front end
+  now; ignoring`. A flag that quietly stopped doing anything would be worse than one that
+  is gone; this is why the bump is **minor**, not major.
+
+The `BrItem` / `applyBracketGroup` comments were reworded: the "keep the bracket-group
+decision at the loader level, out of the front end" rule was written for two front ends,
+but it is still the right layering and is now documented as such rather than as a
+drift-avoidance measure.
+
+**Verified:** all eleven deterministic self-tests PASS (`-checkbvh`, `-checkimplicit`,
+`-checklens`, `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
+`-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`); every `.ftsl` in
+`scenes/` still loads; both retired flags print the notice and render normally.
+
+### PAPERCUT — DONE (2026-07-26, 0.77.1): `-o` into a non-existent directory fails every write interval and loses the whole render
+
+`ftrace -o png/nope/out.png …` ran the full render, printed `error: could not write …` at
+each `-interval` tick, and exited having written nothing — the accumulated film was simply
+lost. Hit twice (once with `png/bench/`, once with `png/parserflip/`).
+
+**Fixed** in `src/main.cpp`, right after the `-check*` self-test early-returns (where `out`
+is final — the bare-invocation preview path can still rewrite it, so the check can't move
+into the argument loop itself). An `ensureOutDir` lambda resolves a path's parent and:
+
+- parent empty or already a directory → nothing to do;
+- parent exists but is *not* a directory → `ftrace: output path '…' exists but is not a
+  directory` and `return 2`;
+- otherwise `fs::create_directories` it, printing `[out] created output directory …` so a
+  typo shows up in the log instead of silently making a stray directory; if creation fails,
+  `return 2` with the `std::error_code` message.
+
+Applied to `-o` and to `-savemap` (the one output path not derived from `-o`; a discarded
+photon map costs as much as a discarded film). Everything else this run writes lives beside
+`-o` — the `.ftbuf` checkpoint sidecar (`out + ".ftbuf"`), the per-camera `outFor()`
+variants, the stereo eye pair — so the single `-o` check covers them all.
+
+Verified: `-o png/dirfix/deep/nested/out.png` creates the whole tree and writes both the
+PNG and its `.ftbuf`; `-o png/dirfix_file.png/out.png` (parent is a regular file) fails
+before the scene renders.
+
+### BUG + TECH-DEBT — DONE (2026-07-26, 0.78.0): `grid:` / `scatter:` now reach field / isosurface / density / ior / camera-track formulas — and the guard no longer corrupts the eval stack
+
+Fixed in 0.78.0. Two things turned out to be tangled here, and the second was worse than
+this entry claimed:
+
+1. **The gap.** All four field-formula `compilePatternExpr` sites now pass `&tableScope_`
+   (`src/ftsl.h`: `addFunctionLeaf`, medium `density`, medium `ior`, the `camera_curve`
+   record driver), so a `function` leaf can be a measured height field, a medium density
+   can be a sampled volume, an `ior` field can be a measured index volume, and a flyby
+   track can be driven by tabulated data. `texScope_` is deliberately still withheld at
+   those sites: `tex:` needs a hit's (u,v), which a field formula has no access to, so it
+   remains a clean compile error.
+
+2. **The "unreachable" stub was reachable, and it was a live wrong render — not latent
+   GPU debt.** `medium { density pattern:<p> }` copies a *pattern*'s nodes (compiled WITH
+   a table scope, so `PatOp::Grid` is real) into `med.density`, which `Medium::densityAt`
+   evaluated through a bare `PatCtx` — `c.grids == nullptr`. The guard pushed 0 **without
+   popping** its `ndim` operands, so `patternEval` returned `st[0]`: the first
+   **coordinate**, not the sample. Confirmed by render: `scraps/gridmed.ftsl`
+   (`grid:down(x)`, descending) came out as the *mirror image* of its analytic twin
+   `scraps/gridmed_ref.ftsl` (`density "1 - x"`). Both guards (`pattern.h`, and the FP64
+   `dPatternEval` in `render_cuda.cu`) now `return 0.0` for the whole program instead:
+   the arity is the table's own `ndim`, which is precisely what can't be read when the
+   header wasn't found, so no balanced pop is possible and a placeholder push is never
+   safe.
+
+**How it's plumbed.** Host: a new `PatTables` POD + `patBindTables` (`pattern.h`) and
+`Scene::patTables()`, threaded as a `const PatTables*` parameter through `fieldLeafSDF` /
+`fieldEval` / `fieldGradient` / `Implicit::eval`/`gradient` / `intersectImplicit` /
+`estimateFieldLipschitz` / `marchImplicit` and `Medium::insideField`/`densityAt`/`nAt`/
+`gradNAt`/`insideBound`. Never a member: it points into `Scene`'s vectors and a `Scene` is
+copied and moved, so a cached copy would dangle. `Renderer::sampleMediaCollision` /
+`mediaTransmittance` were retyped from `const std::vector<Medium>&` to `const Scene&` (18
+call sites) so no caller can forget the tables. Device: `dPatternEvalF` gained a
+`const DPatEnv& env` with real `Tex`/`Grid`/`Scatter` cases (coords promoted to double and
+the result demoted, as `PatOp::PovFn` already did), threaded through `dFieldLeafSDF(F)` /
+`dFieldEval(F)` / `dFieldGradient` / `dMedDensityAt` / `dMedInside` / `dMedNAt` /
+`dMedGradN`; `dMediaSampleCollision` / `dMediaTransmittance` likewise now take the whole
+`DScene` (24 call sites).
+
+Verified, three ways:
+
+* **Medium density** — `png/gridmed/grid.png` (`density pattern:rho` where `rho` is
+  `grid:down(x)`, a *descending* ramp) is now **byte-identical** to `png/gridmed/ref.png`
+  (analytic `1 - x`) on **both** backends (`mean|d|=0.000`, `max|d|=0`), where before the
+  fix they were mirror images. The left-right-mirrored comparison is far off
+  (`mean|d|=21.6`), which is exactly the corrupted render the guard used to produce.
+* **Isosurface field** — the scratch pair `scraps/gridiso{,_ref}.ftsl` puts a 2×2 grid holding the bilinear
+  `0.05 + 0.7*x` inside a `function { expr "y - grid:hf(x, z)" }` leaf; against its
+  analytic twin it agrees to `mean|d|=0.46 / max 6` on both backends (the residual is the
+  grid pool's **float** storage: `0.05f` shifts the plane ~7e-9 m, a sub-pixel silhouette
+  jitter), while the mirrored comparison is `mean|d|=60`.
+* **Self-test** — `ftrace -checkgrid` gained sections (f) and (g), which pin the two
+  invariants directly and need no renderer: an unbound table evaluates to **0, never to a
+  coordinate** (1-D and 2-D calls), and `Medium::densityAt` fed `Scene::patTables()`
+  returns the sampled value while omitting the tables returns a clean 0.
+
+The load-time majorant (`density_max` estimate), the isosurface Lipschitz probe and the
+implicit-bound inside-sign detect all evaluate with real tables too — otherwise a
+`grid:`-driven field would majorise/bound to 0 and vanish.
+
+Checked-in worked example: `scenes/grid_field.ftsl` — a 5×5 lattice read as an isosurface
+height field (`expr "y - grid:terrain(x, z)"`) inside a corridor filled by a 1-D
+`density "grid:haze(y)"` profile, i.e. both new sites in one scene.
+
+<details><summary>original entry</summary>
+
+### TECH-DEBT — OPEN (2026-07-27): `grid:<name>(…)` / `scatter:<name>(…)` are *surface-pattern* samplers only — field / isosurface / density formulas can't reach them
+
+0.71.0 added the N-D `grid` datatype and the `grid:<name>(c0, …)` sampler; 0.72.0 added its
+ragged sibling `scatter` and `scatter:<name>(c0, …)` (docs: FTSL.md §6.1, examples:
+`scenes/pattern_grid.ftsl` / `scenes/pattern_scatter.ftsl`, self-tests: `ftrace -checkgrid` /
+`-checkscatter`). Both are wired into every *pattern* site — `pattern`, `texture { rgb … }`,
+record drivers/stops, material overrides — but deliberately **not** into the four
+`compilePatternExpr` call sites that compile scalar *field* formulas (`src/ftsl.h` ~2864
+`function` block, ~3441 density field, ~3560 isosurface `expr`, ~4446 the `allowT` record
+driver): those are compiled with no `PatTableScope`, so `grid:foo(x,y,z)` there fails at
+compile time with `unknown grid` (likewise `unknown scatter`).
+
+That is the safe behaviour, not a silent wrong answer, but it blocks the obvious use: a
+**sampled density volume** or a measured height field driving an isosurface, which is
+exactly what these datatypes are for. The GPU side already reflects the gap —
+`dPatternEvalF` (the FP32 twin in `src/render_cuda.cu` that evaluates field formulas)
+carries a shared `case PatOp::Grid: case PatOp::Scatter:` that pushes `0.0f` **without
+popping its operands**, because the operand count is the table's own `ndim` and is not
+knowable there. It is unreachable today; it would corrupt the eval stack the moment either
+sampler became reachable from a field formula.
+
+**Proper fix:** pass `&tableScope_` at those four sites too, thread the two tables and the
+shared `dataPool` into the FP32 field-eval environment the same way `DPatEnv` threads them
+into `dPatternEval` (the samplers `patGridSample` / `patScatterSample` in `pattern.h` are
+already `__host__ __device__` and shared, so only the plumbing is missing), and replace the
+stub case with real ones that pop `ndim` coordinates. Then drop this entry and the "surface
+patterns only" caveat from FTSL.md.
+
+</details>
+
+### TECH-DEBT — FIXED (`reflect` 0.75.0, `transmit` 0.76.0, `emit` 0.80.0)
+
+0.73.0 added inline array literals (`roughness [0 1](u)`, FTSL.md §6.1, example
+`scenes/pattern_array.ftsl`). They desugar to `pattern:__arrN` and therefore work at exactly
+the set of slots that already bind a scalar pattern — which is *narrow*: `bindScalarPattern`
+is called for `roughness`, `film_thickness_map`, `weight_map` and a coat's `roughness`, and
+nothing else. In particular **spectrum-valued slots** (`reflect`, `transmit`, `emit`, …)
+accept a spectrum expression or a `texture:<name>`, but not a pattern — so the natural
+spelling from the design note, `reflect [0 1](u)`, fails with "unrecognized spectrum
+expression". That is a clear error rather than a wrong render, but it is the very example
+the feature was designed around, and the same gap blocks `reflect pattern:p` for a
+hand-written pattern.
+
+**FIXED for `reflect` in 0.75.0.** A scalar pattern in a spectrum slot is a per-hit
+**multiplier** on whatever the slot otherwise evaluates to (`Material::reflectPat` /
+`DMaterial::reflectPat`, clamped to [0,1]). Multiply is strictly more general than the
+"greyscale reflectance" reading and degenerates to it: `reflect pattern:p` leaves the
+pattern *alone* in the slot, so the base spectrum becomes a flat 1.0 and the albedo is
+`p(hit)` — greyscale — while `reflect rgb … ` + `reflect_map pattern:p` modulates a tint
+(or a bound `texture:`). Colour therefore always comes from the spectrum/texture, never
+from the scalar. Applied in the two shared accessors `diffuseReflectance` / `reflectSlot`
+(`scene.h`) and their device twins `dDiffuseRho` / `dReflectSlot`, so every renderer and
+both backends pick it up at once; the RGB-bake fast path opts out like it already does for
+`reflectTex`. Worked example: `scenes/reflect_pattern.ftsl`.
+
+Verified: `reflect [0 1](u)` and `reflect pattern:p` (with `expr "u"`) render
+**bit-identically**; the albedo read-out tracks `u` linearly; GPU-vs-CPU disagreement on
+the pattern scene (RMSE 6.83/255 at 200 spp) is *below* the no-pattern control (7.12), i.e.
+pure Monte Carlo noise.
+
+Only the families whose reflect slot goes through those two accessors honour a pattern
+(diffuse, translucent, mirror, halfmirror, glossy, grating); the loader hard-*rejects* one
+elsewhere rather than dropping it silently, since a lone `reflect pattern:` leaves a
+flat-1.0 base that would otherwise render as albedo 1.0 — a wrong image, not a missing
+effect.
+
+**FIXED for `transmit` in 0.76.0**, but only after the refactor this entry called for.
+`m.transmit(lambda)` was read as a bare spectrum lookup at **16 host call sites across 6
+renderer headers** (`render.h`, `backward.h`, `bdpt.h`, `vcm.h`, `photonmap_render.h`,
+`sppm_render.h`) and **16 device sites** in `render_cuda.cu`, with no shared accessor. All
+32 now funnel through `transmitSlot(scene, m, h, lambda)` in `scene.h` / `dTransmitSlot` in
+`render_cuda.cu` — the single point of truth for *both* readings of the slot, a `filter`'s
+gel transmittance T(λ) and a `translucent`'s back-hemisphere albedo ρ_T. Callers keep their
+own `clamp01` and the two-lobe callers still apply the ρ_R + ρ_T ≤ 1 energy guard *after*
+the multiplier. There is no record channel and no texture on this slot, so the accessor has
+only the one base path. `Material::transmitPat` / `DMaterial::transmitPat` then bind
+`transmit pattern:<n>` / `transmit [0 1](u)` / `transmit_map`, honoured on `translucent` and
+`filter` and rejected everywhere else (every other type leaves `transmit` at 0 and never
+reads it). The reflect and transmit loader paths collapsed into one shared
+`patternedSpectrumParam` + `checkSlotPatSupported`, and the RGB-bake fast path opts out on
+`transmitPat` alongside `reflectPat`. Worked example: `scenes/transmit_pattern.ftsl`.
+
+Verified: `transmit pattern:p` (flat `expr "0.4"`) and `transmit 0.4 transmit_map
+pattern:p_one` render **bit-identically** to plain `transmit 0.4`; the ramp panel's measured
+brightness tracks `u` and plateaus exactly where the ρ_R + ρ_T guard kicks in; CPU-vs-GPU
+disagreement on the pattern scene (RMSE 6.40/255 at 300 spp) is *below* the no-pattern
+control (9.88), i.e. pure Monte Carlo noise; mode D (BDPT) and mode V agree — V's
+forward-vs-backward best-fit scale is 0.994. All 11 `-check*` self-tests pass and the
+grammar-equivalence sweep is ok=380 / mismatch=0.
+
+**FIXED for `emit` in 0.80.0** — the strict leg. Same two spellings (`emit pattern:<n>` /
+`emit [0 1](u)` alone in the slot, `emit_map pattern:<n>` modulating an authored spectrum),
+plus the `light`-block alias `spd pattern:` / `spd_map pattern:` for the same slot;
+`finalizeEmitters` copies `Material::emitPat` onto the `Emitter` so both spellings converge
+on one runtime field. What makes emission different from reflect/transmit is that it is read
+from **both sides of transport** — emission-on-hit when a camera path lands on the emitter,
+and Le at the point NEE / a light subpath samples — and MIS *combines* the two, so a
+pointwise disagreement is **bias**, not noise. The profile is therefore only legal where the
+sampler's (u,v) provably equals the hit's: `EmitterShape::Quad` (bilinear parameters) and
+`EmitterShape::Mesh` (barycentric UVs; `EmitTri` gained `uv0`/`uvE1`/`uvE2`). Sphere,
+cylinder, spot, collimated and env are **refused at load** — `addLight`'s subtype gate for
+the `light` route, `checkEmitPatsSupported` after `Scene::build()` for the material route.
+Reads funnel through `emitSlot` / `emitterPatMulAt` / `emitterSamplePoint` in `scene.h`.
+The pattern is a pure post-multiplier on radiance / photon beta: `power`, `pdfChoice`,
+`pdfPos`/`pdfA`, `emissionPdfW`, `directPdfW` and every VCM `dVCM`/`dVC`/`dVM` are untouched,
+which is what makes it unbiased by construction. Caveat, documented rather than
+auto-corrected: `power`/`lumens` normalise the *unpatterned* spectrum, so a profile averaging
+0.5 emits about half the requested flux. Worked example: `scenes/emit_pattern.ftsl`.
+
+Verified unbiased at 160×160 against four independent estimators: R vs D (BDPT) global ratio
+1.00268 — and a **control with the pattern removed** shows the same 1.00240 with the same
+corner-shaped tile profile, so that residual is a pre-existing R-vs-D estimator difference,
+not the pattern; B (forward photons, 400M) vs R global 1.00005; U (VCM, 1500 spp) vs R global
+1.00018. Load rejection of `light sphere { spd pattern:p }` confirmed. Fixed a latent
+pre-existing bug on the way: the area light's *second* triangle carried default UVs
+disagreeing with `addQuad`'s, i.e. a diagonal seam for any UV-driven emission pattern **or
+texture** on an area light.
+
+### TECH-DEBT — DONE (0.82.0): the emission pattern (`emitPat`) now runs on the CUDA backends
+
+0.80.0 shipped `emit pattern:` / `emit_map` (and `spd` / `spd_map`) on the CPU only.
+`cudaForwardSupported` returned false if any `Emitter` or `Material` had `emitPat >= 0`, and
+`cudaBackwardRGBSupported` did the same, so a patterned scene silently fell back to the CPU.
+
+That was deliberate, not an oversight: unlike `reflectPat`/`transmitPat` — which funnel
+through one or two shared accessors — the device has roughly **20 emission read sites**, and
+because emission is read from both sides of transport a *partially* ported pattern would
+produce a **biased** image rather than a visibly missing effect. Rejecting the whole scene
+was the safe state until every site could be done at once.
+
+**What landed (0.82.0), all in `src/render_cuda.cu`.** `DEmitter::emitPat` and
+`DMaterial::emitPat` upload; `DEmitTri` carries `uv0`/`uvE1`/`uvE2` and the device
+`emitterSamplePoint` gained optional `uuOut`/`vvOut` (filled for Quad from the bilinear
+`u1,u2` and for Mesh from the chosen `EmitTri`'s barycentric UVs), so a *sampled* point
+reports the same (u,v) the *hit* path interpolates. Three accessors mirror `scene.h`:
+`dEmitPatMul` (the emission-on-hit side, twin of `emitSlot`'s `slotPatMul`),
+`dEmitterPatMulAt` and `dEmitterSamplePointPat` (the sampler side). Every device emission
+read routes through one of them — forward `genPhoton`/`genPhotonHero`; backward
+`bkEmitterGeom` (folded into the λ-independent `G`, so scalar *and* hero NEE pick it up from
+one place, exactly as host `emitterGeom` folds it into `w`), `bkNeeVolume`, `bkNeeLightRGB`,
+`bkRadiance`/`bkRadianceHero`/`bkRadianceRGB`; the three photon-map visible-point sites;
+BDPT's `dGenLightSubpath` + `dConnectBDPT` s=1; and VCM's light subpath + s=0 emission + NEE.
+`DVertex` gained a cached `Real emitPatW` (twin of `bdpt.h Vertex::emitPatW`) read by
+`dVertexLe`, set at all seven construction sites, so every BDPT MIS strategy is covered from
+one place. Unpatterned scenes stay bit-identical: each new factor is either guarded by
+`if (epat != 1.0)` or is an exact multiply by `1.0`, and the extra UV outputs consume no RNG.
+
+Two deviations from the plan sketched above, both deliberate. (1) The planned `dEmitSlot`
+became `dEmitPatMul`: `DMaterial` carries no emit spectrum on the device (emission is read
+from `sc.emitters[li].emitSpd`/`.rgbEmit`), so only the *multiplier* can be factored out.
+(2) The `cudaBackwardRGBSupported` gate was dropped too, not merely left in place — an
+emission pattern is an **achromatic** scalar, so it commutes with the spectral→RGB bake
+(`ep·∫CIE·emitSpd == ∫CIE·ep·emitSpd`) and can be applied to the pre-baked `rgbEmit`. That is
+why it differs from `reflectPat`/`transmitPat`, which genuinely are not evaluated on that
+path and still reject. Deliberately *not* patterned: `dInvPdfLambda`'s
+`g += gw * specLookup(e.emitSpd, lambda)` — a wavelength pdf, matching the host — and the
+spot/env branches, which cannot carry a pattern (refused at load).
+
+**Validation** (`scenes/emit_pattern.ftsl`: two patterned quad area lights + a patterned
+*mesh* emitter, i.e. both UV-carrying shapes; absolute exposure so images compare directly):
+
+- **GPU vs CPU, mode R, 2000 spp, 512²** — mean luminance ratio **0.9999**, median 1.0000,
+  sRGB RMSE 2.36/255, itself below the images' own 2.24% noise floor.
+- **GPU cross-estimator, 160²** — global B/R = **1.00001**, D/R = **0.99995**. U/R = 1.00679,
+  but an **unpatterned control** gives U/R = **1.00706** with the same per-band profile, so
+  that residual is a pre-existing VCM-vs-R estimator difference on this scene, not the
+  pattern. Per luminance band, B/R and D/R are 1.0000 everywhere; the U excess sits only in
+  the dim indirect bands, while the band containing the directly-visible patterned panels —
+  the one place the profile is read most directly — is U/R = 1.0002.
+- **GPU VCM vs CPU VCM on the patterned scene** — mean **0.9998**, median 1.0000 (the direct
+  test that the device VCM pattern path matches the CPU reference).
+- **GPU RGB fast path vs GPU spectral R** — mean **0.9991**, median 1.0000, confirming the
+  achromatic-commutes-with-the-bake argument for dropping that gate.
+- **Photon map, mode M, GPU vs CPU at 30 M photons** — mean **1.0056**, median 1.0000. The
+  larger per-pixel RMSE (10.7/255) is mode M's inherent density-estimate noise — the two
+  backends pick different adaptive gather radii — the same character the M2/M4 validations
+  recorded, not bias.
+- **Forward energy closure**: `sum/emitted = 1.000000` in mode B at 4×10⁹ photons and in
+  mode M at 30 M.
+- **Load rejection still enforced**: `light sphere { spd_map pattern:p }` is refused with the
+  "samples positions that no surface (u,v) corresponds to" diagnostic. The host-side gate
+  that makes the whole feature sound is untouched by the port.
+- All 11 `-check*` self-tests PASS; all 80 `scenes/*.ftsl` load.
+
+Related, and deliberately *still* out of scope: `raster.h` / `raster_cuda.cu` (the preview
+rasteriser) ignore `emitPat`, consistent with their existing behaviour for
+`reflectPat`/`transmitPat` — the preview is a shading approximation, so this is a cosmetic
+mismatch, not bias.
+
+### BUILD BUG — FIXED (2026-07-26): editing a header did not rebuild the `.cu` files, and the linker could then keep a **stale copy of the function you just changed**
+
+**Symptom that exposed it.** A change to `PhotonMap::buildAuto` (a header-inline function in
+`src/photonmap.h`) had no effect on the running binary across *four* consecutive
+`build.bat` runs — including one after deleting `build_cuda2/bin/ftrace.exe` to force a
+relink. A `printf` added inside the edited block never appeared. `main.obj` genuinely
+contained the new code (`grep -a` found the new format string in it); the linked exe did
+not. Touching `src/render_cuda.cu` by hand fixed it instantly.
+
+**Root cause.** MSVC's `ClCompile` records every `#include` it opened (`/showIncludes` →
+`.tlog`) and rebuilds a `.cpp` when any of them changes. MSBuild's **`CudaCompile` task does
+not do this at all** — it compares only the `.cu`'s own timestamp. So a header-only edit
+left `render_cuda.obj` / `raster_cuda.obj` stale while the build reported success.
+
+That is much worse than "the GPU path is one build behind", because `render_cuda.cu` and
+`raster_cuda.cu` include the *same* headers as the C++ TUs (`photonmap.h`, `render.h`,
+`scene.h`, …). Every inline/template function in those headers is emitted as a **COMDAT in
+both objects**, the linker keeps exactly one copy, and it is free to keep the stale one.
+Net effect: **a header-only edit could silently produce a binary running the OLD body of a
+function, pulled from a `.cu` you never touched — even on a CPU-only code path.** Any
+"bit-identical before/after" validation done without touching a `.cu` was potentially
+meaningless.
+
+**Fix.** `CMakeLists.txt` now runs `cmake/touch_stale_cu.cmake` as a `PRE_BUILD` step of the
+`ftrace` target: it bumps the mtime of any `src/*.cu` older than the newest `src/*.h` /
+`src/*.cuh`, which is the one signal `CudaCompile` does honour. `OBJECT_DEPENDS` is **not** a
+usable fix here — CMake's Visual Studio generator emits `<CudaCompile Include="..."/>` items
+with no metadata at all, so the `AdditionalInputs` never reach MSBuild (verified by
+inspecting the generated `ftrace.vcxproj`). The check is deliberately coarse (any header
+newer than a `.cu` rebuilds both `.cu` files, ~1.5 min) and is idempotent, since the touch
+sets the mtime to now. **Verified:** `touch src/photonmap.h` followed by `build.bat` now
+prints `[cuda-deps] photonmap.h is newer than render_cuda.cu — touching it so nvcc rebuilds`
+and recompiles both `.cu` TUs.
+
+**Consequence for past results:** the SoA photon-map change (`fd643ce`) was re-validated
+after this fix — `-nopmauto` output is bit-identical to the pre-change binary
+`scraps/ftrace_base_99a898d.exe` on CPU mode M, CPU mode S, GPU mode M and GPU mode S, so
+that commit's claims stand. Earlier header-only measurements that were never re-checked
+should be treated with suspicion.
+
+### TECH-DEBT — DONE (2026-07-24, v0.49.0): volumetric blackbody emission ("fire", C3) now runs on the GPU forward tracer
+
+**Was:** the emissive-volume path (a `medium` with a `temperature vdb:` grid + `emission blackbody`) ran only
+on the **CPU forward** tracer; `cudaForwardSupported()` returned false for any `emissive()` medium so
+`-device gpu`/`auto` fell back to the CPU (without the gate the device `genPhoton` crashed indexing
+`sc.emitters[0]` on an emissive-only scene with `nEmitters==0`).
+
+**Fix (shipped v0.49.0):** full GPU mirror in `render_cuda.cu`. (1) The VDB brick sampler was refactored into
+a reusable `DVdbGrid` + `dVdbSample()` (density path unchanged, bit-for-bit) and `DMedium` now carries a
+second `tempGrid` + `emissive`/`emitKelvin`/`tempPeak`/`emissionScale`. (2) `DScene` gained a
+`DEmissiveVolume[]` (`mediumIndex`/`bmin`/`bmax`/`meanKe`/`power` + the per-volume Planck-λ CDF `lamCdf`) plus
+`totalEmissionPower`, uploaded from `Scene::emissiveVolumes`. (3) `dBlackbodyEmissionRadiance` /
+`dMedTemperatureAt` / `dMedEmissionAt` port the host emission field. (4) `genPhoton` got a volume-birth branch
+(power-weighted emitter-vs-fire split with NO extra RNG when there are no volumes → non-fire scenes
+unperturbed; uniform-AABB point, λ importance-sampled from `lamCdf`, isotropic dir,
+`β=grandTotal·κ_e/(meanKe·Δλ·p(λ))`) and an isotropic `connectEmissionVolume`/`connectEmissionLensVolume` +
+`camSplatEmissionAll` device splat. (5) The `emissive()` clause was dropped from `cudaForwardSupported`.
+Fire scenes always have media so the hero path (gated on `mediaN==0`) never runs; an emissive-only scene never
+indexes `sc.emitters` because `volumeBirth` is always true when `totalPower==0`. **Verified:** `-device gpu`
+on `scraps/vdb_fire.ftsl` renders without crashing and matches the CPU flame shape/colour in distribution;
+the refactored density path (`scraps/vdb_cloud.ftsl`) still renders correctly with `sum/emitted=1.000000`.
+
+### TECH-DEBT — DONE (2026-07-24): fire emission now importance-samples λ from a blackbody → collapses the magnitude speckle
+
+**Was:** a fire photon drew its wavelength **uniformly** over the band and carried
+`β = grandTotal·κ_e(x,λ)/meanKe`. Because a warm blackbody (default 1500 K) is heavily red-weighted, the
+per-photon β varied wildly with the κ_e *magnitude* across λ, so a partly-converged fire showed coloured
+(notably green) speckle in its hot core.
+
+**Fix (shipped v0.48.1):** each `EmissiveVolume` now carries an `EmissionSampler lamSampler` built in
+`finalizeEmissiveVolumes()` from `blackbody(emitKelvin)` (a per-nm CDF over the band). The volume-birth branch
+in `render.h` draws `λ = ev.lamSampler.sample(rng, pdfLam)` and weights
+`β = grandTotal·κ_e/(meanKe·Δλ·p(λ))`. For a voxel at `emitKelvin`, `κ_e ∝ Planck(emitKelvin) = p(λ)·integral`,
+so β is **exactly constant** across λ — the κ_e magnitude variance is removed entirely (cooler voxels get a
+mild residual, always <1). Unbiased for any `p(λ)>0`; uniform `p=1/Δλ` recovers the old estimator. Verified
+side-by-side: the old uniform render (more converged) is riddled with green specks; the importance-sampled
+render (less converged) is markedly cleaner and red-orange throughout.
+
+**Residual (inherent, not a bug):** the CIE-*shape* variance remains — a rare green-λ photon is still a
+full-brightness green dot because its colour is `CIE(λ)`. This is intrinsic to per-photon spectral splatting and
+only shrinks with more samples (or full hero-wavelength XYZ splatting). Left as-is; converges correctly.
+
+### TECH-DEBT — DONE (2026-07-24): analytic sky (K2) bakes the physical solar disk into the env, so sun-lit surfaces converge slowly in forward modes
+
+**Resolved 2026-07-27 (0.84.0)** by building exactly the proposed proper fix: a first-class
+**`EmitterShape::Sun`** distant directional emitter, exposed as `light sun { elevation … azimuth …
+angle … spd … }` and as a new `sun_disk on|off|separate` option on the Preetham sky block
+(`separate` strips the baked disk out of the map and registers an **energy-matched** `light sun`
+beside the skylight dome).
+
+Forward emission (`Scene::addSunLight` + `render.h` / `render_cuda.cu` `genPhoton`/`genPhotonHero`)
+samples a travel direction in the solar cone (pdf `1/Ω`) and an entry point on a disc of radius
+`R` *perpendicular to it*, pushed upstream to `sceneCenter − dir·R` (pdf `1/πR²`); with
+`geomWeight = envGeom = Ω·πR²` the spawn is exactly analog and **every photon enters the scene**.
+Backward NEE (`backward.h` `neeLight`, device `bkEmitterGeom`/`bkNeeLight`/`bkNeeLightHero`/
+`bkNeeVolume`/`bkNeeLightRGB`) samples the cone with `1/pdfW = Ω`; the directly-viewed disc is
+added on a ray miss **only under the `specularArrival` gate**, which is exactly unbiased with no
+MIS weight because NEE runs precisely at the material types that then clear that flag. The hard
+cone reuses `spotCosInner == spotCosOuter == cos θ` (making `spotOmega` evaluate to `Ω`), so no new
+emitter field was needed on host or device. The authored `spd` is **perpendicular irradiance**, so
+widening `angle` softens the penumbra without touching the exposure. Modes `D`/`U` refuse a sun
+scene (not connectible in area measure), as they already do for `spot`/`env`.
+
+Measured: forward B vs backward R **0.09%**, CPU vs GPU mode R **0.01%**, `-rgb` fast path
+**0.00%**, photon-map M vs R **0.02%**, SPPM S CPU vs GPU **0.16%** (8 passes, radius still
+shrinking), `angle` 0.53°→8° exposure shift **0.019%**, `sun_disk
+separate` vs baked `on` **0.12%** (once the map resolves the disc at res 4096). New deterministic
+self-test **`ftrace -checksun`** pins the four invariants with no scene/renderer/RNG: the spot-field
+reuse really equals the cone solid angle, `L·Ω == E⊥` at every angular diameter (exposure
+invariance), `sampleCone` is uniform in solid angle about both the forward and the NEE axis, and
+`inCone` agrees with it at the rim (so the NEE estimator and the direct-view miss term see the
+same disc and the split cannot double-count). Worst absolute error 5.3e-14.
+
+The convergence win this entry was filed for, measured on the very scene named below
+(`scraps/sky_test.ftsl`, mode B, GPU): **baked** reached only 7.2% noise after 30 s / 2×10⁹
+photons and the image still had *no* warm sunlight and *no* cast shadows (the sun had barely been
+hit), while **`sun_disk separate`** hit the 4% target in **5.5 s / 3.0×10⁸ photons** with the sun
+fully formed — ~**20× fewer photons** for the same noise, and a qualitatively correct picture
+rather than a skylight-only one. Original entry follows.
+
+The Preetham sky (`src/sky.h`, `light env { sky preetham … }`) bakes the solar disk into the
+equirectangular `EnvMap` at its **physical** magnitude (~10⁵× the mean sky luminance). Directly-viewed
+sky (including the sun) is read from the env background and is noise-free, and the diffuse sky dome
+converges normally, but **sun-lit diffuse surfaces are high-dynamic-range** and pick up firefly/shot
+noise that needs a large photon budget to denoise in the forward modes (A/B/C) — e.g. `scraps/sky_test.ftsl`
+at 400×400 did not reach 4% noise in thousands of GPU batches, while the sky itself was clean (CPU==GPU,
+std 2.8). This is **the same limitation ftrace has with any sunny HDRI** (a small ultra-bright env
+feature), not specific to the sky — it is consistent with the "lights like an HDRI" design, so it ships
+as-is. **Proper fix:** add a first-class **distant directional sun** emitter (a new `EmitterShape`) that
+emits *parallel* photons across the scene's projected cross-section in forward mode (every photon enters
+the scene, none wasted) and is next-event-estimated within its angular cone in the backward/MIS paths,
+with the sky dome (no baked hard disk) carrying only skylight. That separates the ~10⁵× sun from the env
+importance sampler and makes daylight scenes converge like any single-light scene. Requires touching the
+emitter enum + forward emission (`render.h`), backward NEE (`backward.h`), and the GPU mirror
+(`render_cuda.cu` `DEmitter` + emission + NEE) — a real feature, logged here until built.
+
 ### TECH-DEBT — DONE (2026-07-23): GPU VCM (mode U) downloads the whole light-vertex slab every pass (memory + PCIe overhead scales with resolution)
 
 **Resolved 2026-07-23 (0.39.1)** by implementing exactly proper-fix option (a): compaction and the
@@ -292,13 +803,16 @@ second 12-byte random-access stream per visit only added traffic. Packing the CI
 into `DPhoton` itself would grow the struct 32→44B and tax every mode's deposit
 bandwidth, so that variant wasn't pursued either. Keep the CPU-side table only.
 
-### TECH-DEBT (2026-07-20): hero-wavelength sampling is on the CPU tracers (R + A/B/C + M/S) and the GPU forward megakernel (A/B/C + M-deposit) — GPU wavefront, GPU backward/BDPT, and VCM (U) still single-λ
+### TECH-DEBT (2026-07-20, updated 2026-07-26): hero-wavelength sampling is on ALL the CPU tracers (R + A/B/C + M/S + BDPT D + VCM U) and the whole GPU megakernel (forward A/B/C + M-deposit, backward R, BDPT D, VCM U) — the GPU wavefront backend is the last single-λ path
 `radianceHero()` in `src/backward.h` gives the **backward reference tracer (`-mode R`, CPU)** and
 `tracePhotonHero()` in `src/render.h` gives the **forward light tracers (`-mode A/B/C`, CPU)** and the
 **CPU photon-mapping modes M (photon map) + S (SPPM)** hero-wavelength spectral sampling (hero λ + 3 stratified
 secondaries, `hero.h` `kHeroC=4`). Its **device twin** (`traceHeroPhoton`/`genPhotonHero`/`shadeStepHero` in
 `src/render_cuda.cu`) now gives the **GPU forward megakernel** the same thing (modes A/B/C and the mode-M photon
-deposit — see the DONE item below). Validated: mode R on `cornell.ftsl` (chroma 0.89× overall / 0.74×
+deposit), `bkRadianceHero()` gives the **GPU backward megakernel** mode R, and the templated `kBdptT<NS>` gives
+the **GPU BDPT megakernel** mode D, and the templated `kVcmLightT<NS>`/`kVcmCameraT<NS>` gives the **GPU VCM/UPS
+session** mode U (all DONE items below).
+Validated: mode R on `cornell.ftsl` (chroma 0.89× overall / 0.74×
 spectral-dominated, luma flat); modes A/B/C on `cornell` mode B (chroma 0.77×, luma 0.97×, energy
 `sum/emitted≈1.0025`, dispersion intact); mode M on `cornell` (energy conserved exactly — auto-exposure identical,
 chroma 0.87×, luma flat); GPU mode B on `cornell` (n=5e7, 300²: `-heroc 4` and `-heroc 1` both converge to
@@ -315,23 +829,283 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
 - **GPU wavefront (streaming) backend** (`render_cuda.cu` `wavefrontTrace`) — still 1 λ/photon; `-wavefront`
   with `-heroc>1` silently falls back to the megakernel (which does carry hero). Port the SoA pool to hold the
   `lam[]`/`beta[]` bundle if the streaming backend ever needs the chroma win on divergent scenes.
-- **GPU backward megakernel** (`renderBackwardCuda`) — mode R on GPU is still single-λ, so `-mode R -device gpu`
-  does *not* get the colour-noise reduction. (The `-device auto` default picks GPU on this machine, so hero only
-  kicks in with `-device cpu`.)
-- **GPU BDPT megakernel** (`kBdpt`) and **BDPT (D)** — still 1 λ/photon.
-  Propagate the same shared wavelength-sampling + de-hero policy rather than copying the logic per mode.
+- **GPU backward megakernel (`renderBackwardCuda`) — DONE 2026-07-26.** `bkRadianceHero()` in
+  `src/render_cuda.cu` is the 1:1 device twin of the CPU `radianceHero` (`bkNeeLightHero`/`bkNeeEnvHero` ↔
+  `neeLightHero`/`neeEnvHero`, `bkInteract` ↔ `interactMaterial`, same de-hero material set, same gate). Four
+  supporting extractions (`dSampleSceneLambdaU`, `bkEmitterGeom`→`BkNeeGeom`, `bkEnvGeom`→`BkEnvGeom`,
+  `bkInteract`) are pure code moves that deliberately return geometric *pieces* rather than fused weights, so the
+  scalar path's fp32 rounding is untouched. `kBackward` branches on a new `heroC`; `renderBackwardCuda` gates on
+  `heroC>1 && mediaN==0 && !hasGrin && !cam.hasLens()`. Validated on `cornell` (dispersive SF10 sphere, so
+  de-hero fires): `-heroc 1` byte-identical to the pre-change binary at `-spp 1`; converged `-heroc 4` vs
+  `-heroc 1` agree to 0.03 % mean luminance (both auto-expose 1.04e-13); chroma noise 0.540→0.416 (0.77×) at
+  C=4 with luma flat; same wall-clock; media/GRIN scenes byte-identical between `-heroc 1` and `-heroc 4`.
+- **BDPT (mode D, CPU) — DONE 2026-07-26.** `src/bdpt.h` carries a `HeroBundle` (the C wavelengths + their
+  `invPdfLambda`, drawn once per sample from ONE stratified base draw) along **both** subpaths: `Vertex` gained
+  `betaSec[kHeroMax-1]` + `nUp`, `randomWalk` propagates the secondaries with a per-material
+  `secRatio[i] = f_{i+1}/f_hero` reweight and de-heros at every delta vertex, and all four `connectBDPT`
+  strategies evaluate `f`/`Le` per-λ into a `Lsec[]` out-parameter. Two design points worth remembering:
+  (a) every *sampling* decision is hero-driven, so **one** `misWeight` serves the whole bundle; (b) the ×C
+  de-hero boost used by the unidirectional tracers is deliberately **not** folded into the vertex throughputs —
+  two independently de-hero'd subpaths would square it — so each vertex records `nUp` and the splat normalises
+  once by `1/min(nUp_light, nUp_eye)`. Because Glossy is *connectible* (non-delta) in BDPT, mode D keeps the
+  bundle alive across glossy bounces, which the unidirectional tracers do not. Validated: `-heroc 1` on
+  `cornell` byte-identical to a pre-change rebuild; energy checked on `scenes/absolute.ftsl` (absolute mode =
+  fixed sensor gain, so the noisy p99 auto-exposure can't confound it) — `-heroc 4` matches `-heroc 1` to
+  **0.002 %** mean luminance at 2048 spp; chroma-noise RMS 0.1564→0.1247 (0.80×) with luma 0.2178→0.1967
+  (0.90×) at 128 spp vs a 2048-spp reference; `_fog_cornell.ftsl` byte-identical across `-heroc 1`/`4`
+  (media gate). Cost 1.19–1.38× wall-clock on these trivially light scenes, so still a win at equal time.
+  *Methodology note for future hero work:* never compare two runs by their printed `auto-exposure` — it is a
+  p99 statistic printed to 3 significant figures, worth ~±1 % on its own. Use an absolute-mode scene.
+- **GPU BDPT megakernel (`kBdptT`) — DONE 2026-07-26.** 1:1 device port of the CPU `HeroBundle`/`nUp` scheme:
+  `DHeroBundle` (C λ + their `invPdfLambda`), `dRandomWalk`/`dGenCameraSubpath`/`dGenLightSubpath`/`dConnectBDPT`
+  all carry the bundle, one `dMisWeight` per connection, `1/min(nUp_light, nUp_eye)` normalisation at the splat.
+  **Design point:** the per-vertex secondary throughputs live in a **parallel array** (`pathSec[v*secStride+i]`)
+  rather than inside `DVertex`, and the kernel is templated on `int NS` (secondary slots) so the scalar
+  instantiation `kBdptT<0>` sizes those arrays at 1 and pays *zero* extra local memory — `DVertex` is ~100 B ×
+  2·`BDPT_MAXV` per thread (~8 KB of spilled frame already), so widening the struct would have cost the scalar
+  path real occupancy. The host `renderBdptCuda(..., int heroC)` gates on
+  `heroC>1 && mediaN==0 && !hasGrin && !cam.hasLens()` and picks the `kBdptT<BDPT_NSEC>` vs `kBdptT<0>`
+  instantiation. Validated: `-heroc 1` byte-identical to a pre-change rebuild (`cornell` 160²/256 spp);
+  energy on `scenes/absolute.ftsl` (absolute mode = fixed gain) `-heroc 4` vs `1` = **−0.008 %** at 2048 spp, and
+  on a new glossy+translucent scratch scene `scraps/abs_hero_mats.ftsl` **−0.000 %** at 4096 spp; chroma noise
+  0.1614→0.1270 (0.79×) / luma 0.2313→0.2087 on `absolute`, 0.1195→0.0955 (0.80×) on `cornell`, and — because
+  Glossy and DiffuseTransmit are both connectible, so the bundle *never* de-heros there — **0.42× chroma AND
+  0.42× luma** on `abs_hero_mats`; cost 1.17–1.18×. Media (`_fog_cornell.ftsl`) and lens (`scenes/realcam.ftsl`)
+  gates byte-identical across `-heroc 1`/`4`. CPU vs GPU hero BDPT agree to **0.03 %** on `absolute` at 2048 spp.
+- **Mirror and Filter no longer de-hero in BDPT (mode D) — DONE 2026-07-26.** `randomWalk`'s old rule was
+  "every delta vertex de-heros", which is right for dielectric / thin-film / multilayer / grating / half-mirror
+  (each picks its continuation by a wavelength-dependent process) but needlessly conservative for `Mirror` and
+  `Filter`, whose outgoing direction does not depend on λ at all. Both now set a `keepBundle` flag that opts
+  them out of the `if (delta) nUp = 1;` collapse and carry the secondaries on a per-λ factor instead (CPU
+  `src/bdpt.h` + GPU `src/render_cuda.cu` `dRandomWalk`, kept 1:1).
+  **This forced a real correctness fix, not just a policy tweak.** The per-λ factor used to be a *ratio* to
+  the hero's (`secRatio[i] = f_i / f_hero`), which is undefined exactly where it matters most: a Wratten gel's
+  `T(λ)` is legitimately **0** across most of the spectrum, so `T(λ_hero) == 0` while a secondary is wide
+  open. The old code's `if (f_hero <= 0) terminate` then dropped the whole bundle including the live
+  secondaries — measured **−4.9 %** energy on a Wratten-58 test scene. The array is now the **absolute**
+  per-λ factor `secF[i] = f_i·cos/pdf_hero` (plus a `secChromatic` flag for the λ-independent cases, which
+  just reuse `betaFactor`), and the early-out became a **max-over-live-λ** test. That also removes the same
+  latent bias for Diffuse / Glossy / DiffuseTransmit, whose spectral albedo can hit exactly 0 at the hero λ.
+  With `nUp == 1` every hero loop is empty and `mxF == betaFactor`, so it is the old scalar test verbatim.
+  **Validated** on a new scratch scene `scraps/abs_hero_delta.ftsl` (absolute mode; a `metal:gold` mirror back
+  wall + sphere and a `filter:wratten-58` gel pane, so nearly every path crosses one):
+  energy `-heroc 4` vs `1` = **−0.006 %** at 2048 spp (was −3.978 % with the ratio formulation, and the two
+  lobes isolated separately gave mirror −0.006 % / filter −4.894 %, pinning it on the filter);
+  noise at 128 spp vs a 32768-spp reference — single-λ chroma 0.1801 / luma 0.3685, hero-4 *before* this
+  change 0.1676 / 0.3522 (0.93× / 0.96× — the bundle died at the first mirror, so hero bought almost
+  nothing), hero-4 *after* **0.0842 / 0.2086 = 0.47× chroma and 0.57× luma**;
+  `-heroc 1` byte-identical to the pre-change build on both backends (`cornell` GPU 160²/256 spp and CPU
+  96²/64 spp, plus `abs_hero_delta` GPU 200²/2048 spp); the earlier BDPT-hero validation scenes are
+  unregressed (`scenes/absolute.ftsl` −0.008 %, `scraps/abs_hero_mats.ftsl` −0.000 %, both exactly as before);
+  smoke sweep `mirror_selfie` / `group` / `material_presets` / `translucency` / `mixmat` clean.
+  The backward tracer got both fixes (next bullet) and the forward tracers after it (the one after that), so
+  every hero tracer now uses the max-over-live-λ rule.
+- **Backward tracer (mode R): achromatic delta lobes keep the bundle, and EVERY Russian roulette is now
+  max-over-live-λ — DONE 2026-07-26 (VERSION 0.63.0).** Two changes to `radianceHero` (`src/backward.h`) and
+  its device twin `bkRadianceHero` (`src/render_cuda.cu`), kept 1:1:
+  1. **Mirror / Filter / Glossy stop de-heroing.** Like the BDPT change above, their outgoing *direction* is
+     λ-independent (a mirror reflects, a gel passes straight through, a glossy lobe is the mirror direction
+     blurred by a λ-independent roughness), so only the per-λ coefficient differs. The unidirectional form is
+     an *analog RR* rather than a throughput multiply, so the survival probability became `q = max_i c_i` with
+     survivors reweighting by `c_i/q ≤ 1`.
+  2. **Diffuse and DiffuseTransmit no longer roll the continuation coin on the hero alone.** The old
+     `if (u >= rho[0]) die; thr[i] *= rho_i/rho_0` *amplifies* a secondary by up to `rho_max/rho_hero` — on
+     the built-in `redWall`/`greenWall` spectra (0.05 … 0.75) that is a **15× weight spike** every diffuse
+     bounce. Now `q = max_i rho_i` and `thr[i] *= rho_i/q ≤ 1`, so no λ is ever amplified. DiffuseTransmit
+     picks its lobe from the per-lobe maxima `qR`/`qT` (proportionally rescaled in the rare case they sum
+     past 1, which the per-λ energy guard allows).
+  At `nUp == 1` both are the scalar code verbatim (`q == c[0]`, every reweight `*= 1.0`, same rng draws in the
+  same order), so `-heroc 1` stays byte-identical.
+  **The second half is what actually made hero pay off in mode R** — change 1 alone *regressed* luma. Noise
+  RMS vs a 262144-spp `-heroc 1` reference, GPU, 256², as (luma / chroma):
+
+  | scene | spp | single-λ | hero-4 before | +keepBundle only | **hero-4 after (both)** |
+  |---|---|---|---|---|---|
+  | `abs_hero_diffuse` (coloured Cornell, no delta lobes) | 4096 | 0.0604 / 0.0714 | 0.0605 / 0.0565 | — | **0.0254 / 0.0254** |
+  | `abs_hero_mats` (glossy sphere + translucent leaf) | 4096 | 0.0875 / 0.1136 | 0.1566 / 0.1110 | — | **0.0398 / 0.0597** |
+  | `abs_hero_delta` (gold mirror + Wratten-58 gel + coloured walls) | 1024 | 0.4197 / 0.2726 | 0.4148 / 0.2659 | 0.4287 / 0.1397 | **0.1853 / 0.0957** |
+  | " | 4096 | 0.2072 / 0.1683 | 0.2021 / 0.1655 | 0.2530 / 0.1015 | **0.0940 / 0.0579** |
+  | " | 16384 | 0.1122 / 0.0955 | 0.1062 / 0.0936 | 0.1305 / 0.0710 | **0.0549 / 0.0393** |
+
+  Read the first two rows: **before this change hero was worth nothing in mode R on a coloured scene** (0.0605
+  vs 0.0604 single-λ) and on the glossy/translucent scene it was actively *worse* (0.1566 vs 0.0875), because
+  the ratio amplification ate the whole stratification win. After, it is ~0.42–0.52× RMS = a **4× variance
+  reduction**, for 1.35× CPU / 1.36× GPU wall-clock (`abs_hero_delta` 4096 spp: 62.1→84.1 s CPU, 1.1→1.5 s
+  GPU) ⇒ **≈2.9× at equal noise**. Energy is unbiased (`−0.015 %` … `+0.034 %` vs the reference).
+  Diagnosis trail worth remembering: an achromatic-wall control scene (`scraps/abs_hero_delta_gray.ftsl`, same
+  geometry, `whitewall 0.75` everywhere) showed change 1 alone going 0.0755→0.0406 luma with *no* regression —
+  which pinned the regression on the coloured diffuse walls rather than on the delta lobes.
+  Validated: `-heroc 1` byte-identical to `scraps/ftrace_base_6b8ca3f.exe` on **both** backends for
+  `abs_hero_delta` and `abs_hero_mats` (256²/64 spp).
+  **Methodology trap (cost an hour):** a reference rendered at 2× the test's spp *shares half its samples* with
+  the test image — seeds are keyed on the absolute sample index (`seedUnit(rng, (sampleBase+s)*nPix+pixIdx)`),
+  so a 32768-spp reference contains the 16384-spp render verbatim. `rms(test − ref)` is then silently
+  discounted by ~0.7× **for whichever estimator produced the reference**, which flatters the baseline. Use a
+  reference at ≥16× the test spp (or a different estimator).
+- **Forward tracers (modes A/B/C + the M/S photon deposit): the same two fixes — DONE 2026-07-26
+  (VERSION 0.64.0).** `tracePhotonHero` (`src/render.h`) and its device twin `shadeStepHero`
+  (`src/render_cuda.cu`) got the identical pair of changes described in the previous bullet: Mirror / Filter /
+  Glossy stop de-heroing (achromatic delta lobes keep the bundle riding), and every continuation Russian
+  roulette — Diffuse, DiffuseTransmit and the new delta group — survives on `q = max_i c_i` with survivors
+  reweighting by `c_i/q ≤ 1` instead of rolling the coin on the hero and reweighting by `c_i/c_hero`.
+  **The forward tracers keep an energy ledger, which the previous bullet's tracer does not — and that
+  ledger caught a real bug in the first attempt.** The reweight `beta[i] *= c_i/q` is *deterministic
+  absorption*, so it has to be booked: without it `sum/emitted` fell to **0.6597** on
+  `scraps/abs_hero_delta.ftsl`. Each reweight loop now does `e.absorbed += beta[i] * (1 - w); beta[i] *= w;`
+  and the ledger closes at `1.000000` again. Booking it makes the ledger *exactly* consistent for the first
+  time: absorb books `Σβᵢ` with probability `1-q`, survivors book `Σβᵢ(1-ρᵢ/q)` and carry `Σβᵢρᵢ/q`, and
+  `(1-q)Σβᵢ + q·Σβᵢ = Σβᵢ` identically. The **old** ratio reweight never closed — it *created* ledger energy
+  (`sum/emitted` 1.00281 `cornell`, 1.00459 `group`, 1.00172 `material_presets`, 1.00743 `mixmat`,
+  1.00713 `abs_hero_diffuse`, 1.00696 `abs_hero_mats`; all now 0.999996 … 1.000003). Note this was a *ledger*
+  inconsistency, not image bias — `E[ρ₀ · βᵢρᵢ/ρ₀] = βᵢρᵢ` is correct, so the old estimator was unbiased in
+  expectation. What the amplification actually cost was **variance**: a very heavy-tailed weight
+  distribution, which is why the old hero-4 mean luminance can still read −0.25 % off at 200 M photons.
+  Noise RMS vs an 8 × 10⁹-photon `-heroc 1` reference, GPU mode B, 256², as (luma / chroma); every test at
+  200 M photons except the last column, which is single-λ given the *same wall-clock* as new hero-4:
+
+  | scene | single-λ | hero-4 before | **hero-4 after** | single-λ at equal time |
+  |---|---|---|---|---|
+  | `abs_hero_delta` (gold mirror + Wratten-58 gel + coloured walls) | 0.0460 / 0.0350 (2.9 s) | 0.0492 / 0.0342 (5.8 s) | **0.0289 / 0.0172** (7.3 s) | 0.0321 / 0.0228 (500 M, 6.8 s) |
+  | `abs_hero_diffuse` (coloured Cornell, no delta lobes) | 0.0407 / 0.0563 (2.9 s) | 0.0514 / 0.0539 (6.1 s) | **0.0254 / 0.0216** (7.8 s) | 0.0269 / 0.0361 (540 M, 7.4 s) |
+  | `abs_hero_mats` (glossy sphere + translucent leaf) | 0.0377 / 0.0587 (3.3 s) | 0.1069 / 0.0443 (7.1 s) | **0.0233 / 0.0239** (9.0 s) | 0.0247 / 0.0423 (545 M, 8.5 s) |
+
+  As in mode R, hero-4 *before* this change was a net **loss** in the forward tracers — worse luma than
+  single-λ at 2–2.5× the cost on all three scenes, catastrophically so on `abs_hero_mats` (0.1069 vs 0.0377,
+  with the mean luminance still −0.251 % off at 200 M photons — heavy tails, not bias). After, it is a genuine
+  win, but a **smaller one than mode R's ≈2.9× at equal noise**: forward hero shares only the *main path's* BVH walk, while the
+  per-λ camera splat / photon deposit costs a full C×, so the equal-time margin is ~1.1× luma and 1.3–1.8×
+  chroma on GPU (the chroma win is the point — that is what hero is for). CPU amortizes better
+  (`abs_hero_mats` 20 M photons: single-λ 0.1148 / 0.0973 in 6.5 s, hero-4 0.0641 / 0.0333 in 12.3 s ⇒ 1.30×
+  luma / 2.13× chroma at equal time). Mean luminance is unbiased (−0.007 % … +0.062 %, all within the tests'
+  own noise). Validated: `sum/emitted = 1.000000` on both backends; `-heroc 1` byte-identical to
+  `scraps/ftrace_base_c64cd9f.exe` on GPU (`abs_hero_delta` 50 M, md5 `c16c9efa…`) and CPU (3 M, md5
+  `145db925…`); **mode M** photon deposit unbiased (`abs_hero_mats` 8 M photons, hero-4 mean +0.002 % vs
+  `-heroc 1`, ledger 1.000000 both).
 - **Photon-mapping modes M (photon map) + S (SPPM) — DONE (CPU).** `tracePhotonHero`'s map deposit now writes
   **all `nUp` live wavelengths** as per-λ photon records (`for (i<nUp) depositPhoton(h.p, ray.d, h.n, lam[i],
   beta[i]);` in `src/render.h`), and the shared `tracePhotonPass` (`src/photonmap_render.h`, used by M and S) sets
   `r.useHero` under the `kHeroC>1 && scene.media.empty() && !sceneHasGrin` gate. The gather keys off each photon's
   own λ (`photonmap_render.h:245`), so the heterogeneous-λ map gathers correctly; C records of `base/C` sum to
   `base` and `nEmitted` counts PATHS, so the estimate is energy-identical to single-λ. Cost: up to C× more stored
-  photons from one shared BVH walk (the intended chroma-noise win). **Mode U (VCM/UPS)** still single-λ — its
-  BDPT-style light-subpath tracing (`src/vcm.h`) needs per-λ merge/connect (same complexity class as BDPT-D).
-- **Two known approximations in the CPU hero path** (both minor, documented for when they're revisited):
+  photons from one shared BVH walk (the intended chroma-noise win). **Mode U (VCM/UPS)** got the same treatment
+  later the same day — see the VCM bullet below.
+- **VCM/UPS (mode U, CPU) — DONE 2026-07-26 (VERSION 0.69.0).** `src/vcm.h` now carries a `bdpt::HeroBundle`
+  along **both** subpaths, so all four strategies (emission `s=0`, NEE `s=1`, vertex *connection*, vertex
+  *merging*) evaluate per-λ. Design points worth remembering:
+  * **One bundle is drawn per *path index*, not per subpath.** `vcmPass` pre-draws `bundles[nPix]` from a single
+    stratified variate each and both the light-tracing and the camera-tracing worker index it by the same `i`,
+    so light path *p* and camera path *p* share the same C wavelengths. That makes the **connection** strategy
+    exact per-λ: `nUpConn = min(nUp_cam, nUp_lightVertex)`, sum over the shared λ, normalise by `1/nUpConn`.
+  * **Merging stays keyed on the LIGHT vertex's own wavelengths.** A merge crosses paths, so there is no shared
+    λ set; the estimator sums over the stored vertex's live λ and divides by its `nUp`, with the BSDF re-evaluated
+    at each stored λ against the camera vertex. That is the pre-existing spectral-photon-mapping approximation
+    generalised, not a new one.
+  * **MIS weights stay the hero's** everywhere. Every *sampling* density in this renderer is λ-independent
+    (cosine / glossy-lobe pdfs don't depend on λ; only throughput *values* do), so one `dVCM`/`dVC`/`dVM`
+    bookkeeping triple serves the whole bundle — same argument as BDPT's single `misWeight`.
+  * **The secondary payload is a parallel array** (`std::vector<LightVertexSec>` indexed in lockstep with
+    `lightVerts`), never extra fields inside `LightVertex`. Stored light vertices are the dominant memory cost
+    of a VCM pass (and of the GPU slab at ~`vcmCap·npix·128 B`), so `-heroc 1` must allocate exactly nothing
+    extra — same reasoning as the GPU BDPT `pathSec[v*secStride+i]` split above.
+  * `scatterSample` gained the **absolute** per-λ `secF[]` block copied verbatim from `bdpt.h::randomWalk`
+    (including `keepBundle` for Mirror/Filter and the max-over-live-λ early-out), and Beer-Lambert absorption in
+    the medium stack is now per-λ on both walks — that *is* the colour of coloured glass.
+  Validated: `-heroc 1` **bit-identical** to the 0.68.1 binary on `cornell` mode U; `scenes/absolute.ftsl`
+  (absolute mode = fixed sensor gain) C=4 vs C=1 at 1600 passes = **−0.001 %** mean, with self-noise RMS
+  3.107→2.284; a new `scraps/_vcm_hero_gel.ftsl` (Wratten-58 gel pane + mirror slab — the `keepBundle` stress
+  case) **+0.016 %** at 3200 passes with self-noise RMS 1.837→0.932 (**0.51×** = ~4× variance reduction).
+  The GPU half followed the same day — see the next bullet.
+- **VCM/UPS (mode U, GPU megakernel) — DONE 2026-07-26 (VERSION 0.70.0).** The device session lives in
+  `src/render_cuda.cu` (NOT a separate `vcm_cuda.cu` — older notes said otherwise), and its two kernels became
+  `kVcmLightT<NS>` / `kVcmCameraT<NS>`, templated on the SECONDARY slot count exactly like `kBdptT<NS>`. The
+  `<0>` instantiation sizes every per-λ array at 1, so every hero loop compiles away to nothing, the C==1 λ draw
+  is literally the old `dSampleSceneLambda(sc, rng, pdfL)` (rng stream untouched), and every hero *term* keeps
+  the ORIGINAL floating-point expression order — hence `-heroc 1` is **bit-identical** (verified `cmp`-clean
+  against the 0.68.1 binary on `cornell` mode U, 160², 64 spp). Design points:
+  * **The secondary payload is a parallel device slab**, `lvSec[(i*vcmCap + k)*secStride + j]` with
+    `secStride == C-1`, never inline in `DVcmLV`. The light-vertex slab is `npix · vcmCap · ~128 B` and is by
+    far the largest allocation in a VCM session, so `-heroc 1` must allocate *zero* extra — same rule (and the
+    same indexing shape) as GPU BDPT's `pathSec`. `kVcmCompactScatter` compacts the sec rows alongside the
+    vertices.
+  * **`DVcmSec` is only 16 B** — `{double beta; float lam;}`. CIE weights are *not* cached per secondary; they
+    are recomputed as `cieX/Y/Z(row[q].lam)` at gather time, which is bit-identical to caching (the hero's own
+    `DVcmLV::cx` is just `(double)cieX(lambda)`) and halves the slab.
+  * **`lamBuf`/`invLamBuf` were widened to stride C** (`lamBuf[i*C + k]`) so the light kernel's bundle for path
+    *i* is handed to the camera kernel for path *i* — that shared-bundle property is what makes the
+    **connection** strategy exact per-λ (`nUpConn = min(nUp_cam, lv.nUp)`).
+  * **Merging stays keyed on the light vertex's `lv.nUp`**, same approximation as the CPU side.
+  * `dVcmScatter` gained the absolute per-λ `secF[]` / `secChromatic` / `keepBundle` block. The `<=0` terminates
+    on Diffuse/Glossy/Mirror/Filter became max-over-live-λ tests, but **Grating's `r<=0` bail was kept** — it
+    gates the RNG-consuming `gratingDiffract`, so removing it would desynchronise the device rng stream.
+  Validated on an RTX 4090 at 200², 2048 spp against 32768-spp single-λ references (luma / chroma / wall-clock,
+  C1 → C4): `absolute` 0.9366→0.8402 / 1.2373→**0.9817 (0.79×)** / 8.0→12.0 s; `abs_hero_delta`
+  0.8714→0.7494 / 1.3584→**1.1138 (0.82×)** / 7.2→10.8 s; `abs_hero_diffuse` 0.8575→0.7502 /
+  1.1000→**0.7961 (0.72×)** / 8.7→13.2 s; `abs_hero_mats` 0.9104→0.7612 / 1.2459→**0.9179 (0.74×)** /
+  11.6→19.6 s. Bias on `scenes/absolute.ftsl` at 4096 passes, C4 vs C1: **+0.011 %**. CPU vs GPU hero VCM
+  (200², 1024 passes, `-heroc 4`) agree to **0.028 %** — and the GPU is 31× faster (5.9 s vs 182.6 s).
+  *Reading the bias numbers:* `abs_hero_diffuse` shows +0.396 % (C1) / +0.418 % (C4) against its reference, but
+  that is the progressive-radius estimator's own convergence bias at 2048 vs 32768 passes — the C4-minus-C1
+  delta is only +0.022 %.
+- **Opt-in split-at-dispersion (`-herosplit`) — DONE 2026-07-26 (VERSION 0.65.0), CPU forward.** The alternative
+  to the default de-hero policy: at a dispersive interface all C wavelengths **continue**, each running the same
+  interaction with its **own** λ (its own Snell direction / grating order / Stokes shift), so one bundle fans out
+  into C independent monochromatic sub-paths. Both estimators are unbiased; splitting resolves a prism / rainbow /
+  dispersive caustic's chromatic spread *geometrically per photon* instead of stochastically across many photons.
+  * **The implementation trick.** The bounce loop of `tracePhotonHero` (`src/render.h`) was extracted verbatim
+    into `tracePhotonHeroLoop(..., ray, stk, lam, beta, secAlive, bounce0, ...)`, and the split branch
+    **re-enters that method recursively**, once per secondary, with `secAlive = false` and `bounce0 = bounce+1`.
+    That keeps all ~20 `return` sites in the loop body working unchanged — no explicit work stack, no CPS
+    rewrite. Because the branch is guarded on `secAlive`, a sub-path can never re-split, so recursion is at most
+    **one level deep**: cost is linear in C, not exponential, and the per-frame footprint (one `MediumStack` copy
+    + two `kHeroMax` double arrays, ~600 B) is bounded. Each sub-path gets its **own copy** of the
+    `MediumStack`, since that is exactly where the sub-paths diverge inside the glass.
+  * **Ledger.** No ×C boost: the C sub-paths keep `base/C` each and the parent zeroes `beta[i]`, so the total
+    equals what the de-hero'd hero would have carried alone and every sub-path books its own terminal fate
+    (`interactPhotonSpecular` already books `e.absorbed += beta` on every `return false`).
+  * **Plumbing.** `hero::gSplit` (in `src/hero.h`) is a single global policy flag set once by `main()` during
+    argv parsing, and `Renderer::heroSplit` default-initialises from it. That is deliberate: `heroC` has to be
+    threaded explicitly because the drivers vary it per pass (the meter pre-pass, the media/GRIN/lens gate),
+    but a whole-run policy choice does not — so modes `A`/`B`/`C` **and** the `M`/`S` deposit picked it up with
+    **zero** call-site churn (`photonmap_render.h`, and `sppm_render.h` through it, just construct a `Renderer`).
+  * **Validated** on a new scene `scraps/abs_herosplit.ftsl` (absolute-exposure Cornell + `glass:SF10` flint
+    sphere, mode B, 256², fixed gain 6, CPU), against a 200 M-photon reference:
+    - flag **off** byte-identical to `scraps/ftrace_base_cc20a46.exe` (3 M photons, md5 `e2eef2cb…` both);
+      `-heroc 1 -herosplit` byte-identical to plain `-heroc 1` (md5 `2b8f0fe8…` both);
+    - flag **on** `sum/emitted = 1.000000` **exactly** (0.999990 off), mean luminance −0.026 % vs the
+      reference (−0.054 % for off) ⇒ both unbiased;
+    - **equal wall clock (180 s each):** caustic-region noise RMS luma 0.0340→**0.0303 (0.89×)**, chroma
+      0.0386→**0.0271 (0.70×)**; whole frame 0.0579→0.0532 (0.92×) and 0.0417→0.0333 (0.80×).
+      (`scraps/region_rms.py`, new — whole-image RMS is dominated by the flat diffuse walls and hides what
+      a change did to the caustic, so it reports a box as well as the full frame.)
+    - **cost 1.11×** per photon (20 M photons back-to-back: 173.3 s off, 192.3 s on). The split PNG is 6 %
+      *smaller* (91 126 vs 97 040 B) — less caustic noise compresses better.
+    **Methodology warning (cost this session ~40 min):** an early measurement read 1.54× (187 s vs 122 s)
+    because the two runs were ~25 min apart and the machine's throughput drifted by 1.6× in between. Never
+    compare wall clock across runs separated in time — run the two policies **back-to-back**, or give both
+    the same `-time` budget and compare photon counts.
+  * **Not covered:** the GPU forward tracer (execution divergence as the fan-out wavelengths take different
+    branches, plus the emission back-pressure / fixed work-pool needed to keep the device photon buffers
+    bounded), and modes `R` / `D` / `U`. Also **not** applied at `Layered` / `Mix` — see the next bullet.
+- **Three known approximations in the CPU hero path** (all minor, documented for when they're revisited):
+  - **A zero hero throughput kills the whole bundle — FIXED everywhere (2026-07-26).** `bdpt.h`'s
+    `randomWalk` (absolute `secF[]` + max-over-live-λ early-out), `backward.h`'s `radianceHero` /
+    `bkRadianceHero`, and `render.h`'s `tracePhotonHero` / `shadeStepHero` all now survive on
+    `q = max_i c_i` rather than on the hero's own coefficient, so a surface that is exactly black at λ₀ but
+    coloured at λ₁ no longer drops the secondaries' contribution there. What remains unfixed is the deeper
+    issue this was a symptom of: the λ pdf is still a scalar hero pdf rather than a per-λ spectrum, so
+    hero sampling still cannot MIS across wavelengths. The proper fix is PBRT-v4's formulation — carry the
+    pdf itself as a per-λ spectrum and MIS across wavelengths — which is an architecture change across
+    every mode, not a local patch.
   - **Mix material stays multi-λ with a shared child selection.** Exact for constant mix weights; for *spectrally
     varying* mix weights with diffuse children it introduces a small bias (the child is picked by the hero λ's
     weight, secondaries ride along). Acceptable vs. de-heroing every Mix; revisit if a spectral-mix scene shows it.
+    `Layered` has the same shape (its coat Fresnel probability is λ-dependent, so it de-heros outright).
+    **`-herosplit` does not cover either.** These are λ-dependent *decisions*, not λ-dependent *directions*, and
+    their natural split point sits *before* any interaction has happened — which does not fit
+    `tracePhotonHeroLoop`'s "resume from a ray" entry shape the way the dispersive case does (there each
+    secondary can just re-run `interactPhotonSpecular` at the same hit with its own λ and hand back a fresh ray).
+    Extending split to them needs a "resume at this hit with this material" entry point; worth doing if a
+    spectral-mix or coated-dielectric scene ever shows the bias, but nothing observed yet.
   - **Equal-*time* benefit is geometry-dependent.** Hero shares one BVH walk across C wavelengths, so its win grows
     with scene complexity. On trivial geometry (Cornell: a few quads + 2 spheres) traversal is nearly free and the
     4× per-λ shading makes hero ~1.6× slower per spp, so at *equal time* single-λ can edge it there. On heavy
@@ -646,22 +1420,44 @@ API, so it would require coupling to scipy's private compiled internals
 the small scatter sizes loom fields realistically use. `neighbors=` (local k-NN RBF) still
 mitigates cost for large point sets.
 
-### DEFERRED (2026-07-18): loom VDB generator/wrapper — author sparse voxel grids from loom
-**Status: intentionally not built (documented for later).** `loom.Volume` (added 2026-07-18)
-can *reference* an existing NanoVDB grid via `density="vdb:<path>"`, but loom has no way to
-*generate* a `.nvdb` from a Python field or to wrap OpenVDB's tooling.
-
-- **What it would be.** A `loom` helper that bakes a loom `SpatialExpr` / `Grid` density field
-  into a NanoVDB `FloatGrid` on disk (dense or sparse), so a procedural cloud authored in loom
-  could ship as a real sparse asset instead of an inline `density "<expr>"`. Optionally a thin
-  wrapper over OpenVDB's `nanovdb_convert` for `.vdb → .nvdb`.
-- **Why we skip it now.** The procedural path already covers loom's sweet spot: an animated
-  density formula emits straight into `medium { density "<expr>" }` and renders unbiased on CPU
-  and GPU (validated by `scraps/_volume_test.py`). Baking to voxels only helps when a field is
-  too costly to evaluate per-sample or must interop with external VDB assets — neither is a
-  current need. The engine already imports `.nvdb` (`scraps/make_nvdb.cpp` makes test assets).
-- **When to revisit.** When a loom scene needs a genuinely sparse, prebaked cloud (huge extent,
-  expensive field, or sharing an asset with a DCC pipeline).
+### MOSTLY DONE (E4, 2026-07-24): loom VDB read/write — `loom.vdbio` (was DEFERRED 2026-07-18)
+**Status: the generator/reader is built (roadmap §E4); a few format variants remain open.**
+Originally deferred; superseded by `tools/loom/loom/vdbio.py`, a **loom-native OpenVDB `.vdb`
+encoder+decoder** (no OpenVDB/NanoVDB dependency — ftrace's reader is under our control too):
+- **Write:** `write_vdb` / `write_volume` / `bake_field` serialise dense `<f4` lattices to a
+  multi-grid `.vdb` ftrace ingests directly (`density vdb:<path>`). Codecs: full float32, **ZIP**
+  (zlib, interchange-only — ftrace is LZ4-only), **blosc** (LZ4+byte-shuffle, read by *both* loom
+  and ftrace → usable on the render path), and **half-float** (`Tree_float_5_4_3_HalfFloat`, read
+  by ftrace via the type suffix).
+- **Read:** `read_vdb` parses the ACTIVE_MASK/full/half/ZIP/blosc value codecs and the
+  axis-aligned transform maps real DCC tools emit (ScaleTranslate/UniformScaleTranslate/
+  UniformScale/Scale/Translation), validated against genuine third-party files
+  (`scraps/_smoke.vdb` Houdini blosc smoke, `_fire.vdb`, `_sphere.vdb`/`_cube.vdb` level sets).
+  Reader is numpy-vectorised (~20 s → 2.8 s on the four real samples).
+- **NanoVDB read (DONE 2026-07-27):** `read_nvdb` ingests `.nvdb` v32.6 float `5_4_3` in both
+  layouts (`FileHeader` container + raw grid buffer); `read_vdb_grids` dispatches on magic.
+  Read-only — loom has no NanoVDB *writer* and no demand for one. Validated against ftrace's
+  independent `src/vdbgrid.cpp` (bbox/AABB/peak match), NanoVDB's own redundant per-node
+  statistics, and an end-to-end render A/B (means agree to 0.007%; per-pixel diff halves at 4×
+  photons → √N noise, not bias). See TODO §E4 for the format notes.
+- **Still open (E4 leftovers, not yet built):**
+  1. ~~**Rotated `AffineMap`/`UnitaryMap` grids**~~ — **DONE 2026-07-26**: `read_vdb_grids` returns
+     `{name: ReadGrid}` with the index array + full `VdbTransform`, so any linear map reads; plain
+     `read_vdb` still refuses a rotated grid rather than hand back a wrong axis-aligned box.
+  2. **Vec3 grids** (`Tree_vec3s_5_4_3`, e.g. velocity/colour fields) — reader handles scalar
+     `Tree_float_5_4_3` only. **Note:** ftrace's volume path also ingests scalar float only
+     (`src/vdb_openvdb.cpp` rejects non-`Tree_float_5_4_3`), and none of the sample `.vdb`s carry
+     Vec3 data, so this is loom-completeness-only with no render-path consumer and no real file to
+     validate against — low priority until a concrete use appears.
+  3. ~~**NanoVDB `.nvdb` ingest in loom**~~ — **DONE 2026-07-27** (see above). What remains
+     unbuilt is the *write* end: loom cannot author a `.nvdb`. No consumer wants it (ftrace reads
+     loom's byte-verified `.vdb` directly), so this is not tracked as debt.
+  4. **Sparse-storage transforms + sparse↔dense resampling** — `vdbio` reads a sparse `.vdb` into a
+     *dense* numpy array; the field-domain transforms E4 envisioned (N-D rotate-and-slice, warps,
+     resample between sparse and dense backings) are not implemented — only straight read/write.
+- **When to revisit each:** (4) when a DCC asset arrives with a genuinely-sparse transform loom must
+  keep, or a volume big enough that a dense bake is untenable; (2) when a loom or ftrace feature
+  actually consumes a vector volume (and a real vec3 file exists to validate against).
 
 ### DEFERRED (2026-07-18): `PatOp::MatMulAdd` — a fused matrix·vec+offset pattern opcode (future optimization)
 **Status: intentionally not built. This is an optimization of an already-working path, not a
@@ -680,12 +1476,56 @@ missing capability.** Why we may want it someday, and why we don't need it now:
   ~6 scalar ops per emitted matrix row (`Const, VarX, Mul, VarY, Mul, Add, …`). Same math, bit-identical
   result — fewer `PatNode`s in the compiled program and a slightly cheaper inner eval. It is **not** a new
   capability.
-- **Why we skip it now.** Per-frame pattern evaluation is not the bottleneck (the sin/cos/`PovFn` terms
-  and the sphere-march dominate the field eval), and the postfix programs are well within any practical
-  size. The payoff is marginal; the cleanest correct implementation still isn't free (see below).
-- **When to revisit.** If a real workload ever makes pattern-eval node count or throughput a measured
-  problem — e.g. very high-D fields with many coupling edges producing enormous postfix programs, or a
-  profile showing the linear ops as a hot fraction of field eval.
+- **Why we skip it now (MEASURED 2026-07-27 — the original reasoning was wrong, the conclusion holds
+  for default workloads).** The 2026-07-18 note claimed "the sin/cos/`PovFn` terms and the sphere-march
+  dominate the field eval". **That is false.** `patternEval` is a pure interpreter costing a measured
+  **~4.7 ns per `PatNode` regardless of opcode** — a `Mul` costs the same as a `sin`. So pattern cost is
+  proportional to *node count*, nothing else, and the baked affine rows (85–89% of every emitted
+  `gyroid_nd` field) are exactly where the nodes are. MatRow really would cut node count ~3.5–4×.
+  The actual reason to skip it is **Amdahl**, not opcode mix: field eval is only a small share of any
+  default workload. Measured end-to-end (probe method below):
+
+  | workload | nodes | field eval | MatRow end-to-end |
+  |---|---|---|---|
+  | `gyroid_nd` default random draw (median of 8, `--dims-range 3 8`, cyclic) | 76 | ~4% | ~3% |
+  | D=8, `--oscillating 6 --harmonics 2`, cyclic — `-raster-gpu` 600² | 162 | 7% | ~5% |
+  | …same scene, `-raster -raster-iso 96` 600² | 162 | 12% | ~9% |
+  | …same scene, `-export-mesh -mesh-res 160` | 162 | 11–14% | ~10% |
+  | **D=16, `--oscillating 16 --harmonics 3 --coupling all`** — `-raster-gpu` 600² | **3917** | **62%** | **47% (1.9×)** |
+
+  So at the sizes anyone actually renders, MatRow buys ~3–9%. It only becomes worthwhile in the
+  fully-coupled high-D regime, which is reachable but not default.
+- **The cost model (use this instead of re-measuring).** GPU iso preview at 600², the field is the only
+  variable: **`time ≈ 3.50 s + 1.452 ms × nodes`**. Field-eval share is therefore a function of node
+  count alone — 10% at ~270 nodes, 25% at ~800, 50% at ~2400. MatRow's node reduction is remarkably
+  stable at **3.5–4.0×** across every configuration tested (because the affine-row fraction barely
+  moves), so the end-to-end win is fully determined by node count. Node count vs the two knobs that
+  drive it (`scraps/g3_sweep.py`, regenerable):
+
+  | D | coupling | nodes | MatRow gain | | D | coupling | nodes | MatRow gain |
+  |---|---|---|---|---|---|---|---|---|
+  | 4 | cyclic | 90 | 3% | | 4 | all | 134 | 4% |
+  | 8 | cyclic | 236 | 7% | | 8 | all | 821 | 19% |
+  | 12 | cyclic | 392 | 10% | | 12 | all | 2147 | 35% |
+  | 16 | cyclic | 536 | 14% | | 16 | all | 4007 | 47% |
+
+  Default `cyclic` coupling grows node count ~linearly in D (edges ~D) and stays under 20% even at
+  D=16. `--coupling all` grows it ~quadratically (edges ~D²) and crosses 20% at D=8.
+- **When to revisit — now a number, not a vibe.** Build MatRow when a real workload's emitted field
+  exceeds **~800 pattern nodes** (≈25% field eval, ≈1.25× win) and that workload is run often enough to
+  matter — in practice that means someone actually rendering `--coupling all` at D≥8, or a long video at
+  D≥12 fully coupled where 1.4–1.9×/frame is real wall-clock. Below ~250 nodes it is measurement noise;
+  don't bother.
+- **How the numbers were measured (reproducible).** The probes are in `scraps/` (git-ignored):
+  `g3_bench.cpp`/`g3_build.bat` (per-opcode ns/node microbenchmark + a `-count` node census built
+  against ftrace's own `src/pattern.h`), `g3_render.py` (end-to-end render probe), `g3_export2.py`
+  (export probe), `g3_sweep.py` (node count vs D/coupling). The trick that makes them valid: change
+  *only* program size while keeping output bit-identical, by rewriting the field `E` as `(E+E)/2`
+  repeatedly — bit-exact in IEEE (adding a value to itself just bumps the exponent) and it adds
+  *realistic* nodes rather than a branch-predictable padding tail. Every run asserts an identical
+  output-PNG md5 / identical triangle count across the x1/x2/x4 variants, so any time difference is
+  pattern eval and nothing else. Fit a line through (nodes, time) → slope is ns/node, intercept is
+  everything that isn't field eval.
 - **How to build it (the design fork), if revisited.** The pattern VM is a single-scalar-stack machine:
   every `PatNode` is a POD `{PatOp op; double a;}` that pops N and pushes **exactly one** scalar. A
   matrix·vec+offset is 12 coefficients in → a **3-vector** out, which doesn't fit that contract. Two ways:
@@ -698,6 +1538,54 @@ missing capability.** Why we may want it someday, and why we don't need it now:
   - **Option B — true multi-output (invasive, not recommended for an ergonomics gain).** Give the stack
     vector semantics so a node can push 3 values. Cleanest for "transform a point," but rewrites the VM's
     fundamental one-scalar-out contract across CPU eval, device eval, arity accounting, and every consumer.
+
+### DEFERRED (2026-07-18, reaffirmed 2026-07-26): GPU marching cubes — export-only mesh extraction (TODO §8 G4)
+**Status: intentionally not built.** Like MatMulAdd above, this is an optimization of an
+already-working path, not a missing capability. It is the last open item in TODO section B
+(the `gyroid_nd` `--oscillate` grammar), which is otherwise complete.
+
+- **What it would be.** Run marching cubes on the GPU to extract an isosurface triangle mesh,
+  instead of the current CPU implementation (`src/isomesh.h`).
+- **Why it is NOT needed for the video path.** The reason per-frame tessellation used to matter
+  was that every animation frame re-marched the field on the CPU. That bottleneck is already
+  gone: **G2** added the GPU primary-ray isosurface preview (`kIsoPreview`, `-raster-gpu`), which
+  sphere-traces the implicit field directly and **never tessellates at all**. `gyroid_nd` routes
+  its frames through it, so the video pipeline does not call marching cubes. G4 would therefore
+  accelerate only the *explicit mesh-export* path (`--export-mesh` / `.obj` output), which is an
+  occasional, offline, one-shot operation rather than a per-frame cost.
+- **Why we skip it now (MEASURED 2026-07-27 — and the measurement moved the target).** Timing the
+  phases of a res-160 gyroid export (21.47 s total, 3.29M tris) by watching when the `.obj` file is
+  created showed the march was **not** where the time went:
+
+  | phase | before | share |
+  |---|---|---|
+  | startup + scene load + march + dedup | 9.70 s | 45% |
+  | …of which pattern/field eval | ~2.4–3.0 s | ~13% |
+  | **ASCII OBJ write** | **11.77 s** | **55%** |
+
+  The single biggest cost in a mesh export was **writing the file**, which GPU marching cubes does
+  nothing about. Even an infinitely fast, free GPU march would only have taken 21.47 s → 11.77 s
+  (1.8× ceiling), and a realistic port — plus a device→host readback of 1.6M verts / 3.3M tris —
+  lands well short of that.
+- **So we fixed the writer instead (DONE 2026-07-27, v0.84.3).** `isomesh::writeObj` was doing one
+  `std::fprintf` per line — ~6.6M calls for this mesh — where FILE locking and format-string
+  reparsing dominate actual I/O (measured **22 MB/s** for a 257 MB file). Rewrote it to format into
+  an 8 MB staging buffer flushed with `fwrite`, with a hand-rolled decimal conversion for the
+  integer-only face lines; float fields still go through `snprintf` with the *same* conversion
+  specifiers, so output is **byte-identical** (verified: same md5 as the old binary's file).
+  Result: **write 11.77 s → 4.66 s (2.5×), whole export 21.47 s → 13.40 s (1.6×)** — a bigger win
+  than MatRow gives on any default scene, for a fraction of the work a CUDA marcher would cost.
+  Multi-group exports (`scenes/implicit.ftsl`, 3 isosurfaces) re-validated structurally.
+- **Remaining headroom in the writer (not taken — diminishing returns).** The write is now 4.66 s /
+  35% of export at 55 MB/s. What's left is ~3.3M `snprintf` calls for the `v`/`vn` float lines
+  (~1.25 µs/line); the face lines are already hand-rolled. Squeezing further means reimplementing
+  printf's `%.6g` float formatting, which risks byte-exactness for a moderate gain — deliberately
+  not done. A binary/compressed mesh format would sidestep it entirely if export size ever matters.
+- **When to revisit G4 itself.** Now that the writer is fixed, the march is the largest remaining
+  block (~8.7 s of 13.4 s, and it scales as res³). Revisit if mesh export becomes a repeated cost —
+  batch-exporting a frame sequence, or interactive export at res ≥ 384 where the CPU march visibly
+  stalls — bearing in mind ~13% of that block is field eval (which MatRow, not G4, would address)
+  and the readback is unavoidable.
 
 ### ~~TECH DEBT (2026-07-18): `-raster-gpu` iso preview shades flat per-material albedo (no textures)~~ — FIXED 2026-07-19 (G5)
 The GPU primary-ray isosurface preview (G2, `kIsoPreview` in `src/render_cuda.cu`,
@@ -1371,7 +2259,7 @@ scene-level control-point fix is still the best-LOOKING result for the gallery (
 removes the sharp reversal geometrically → jerk 6.5°); the engine fix is the general
 safety net so aggressive future paths degrade to a bounded pan instead of a rake.
 
-### Mode-M dense photon map makes per-frame gather slow — PERF NOTE 2026-07-14
+### Mode-M dense photon map makes per-frame gather slow — FIXED 2026-07-26 (noted 2026-07-14)
 
 With a very dense saved map (the 60M-photon gallery map deposits ~58.3M photons), each
 per-camera density-estimate gather is expensive (~90–120 s/frame at 960×540, 48 spp on a
@@ -1381,6 +2269,142 @@ reduction. **Tuning opportunity:** once the map is saved (`-savemap`), re-gather
 `-loadmap` at reduced spp (~16–20) for roughly a 2–3× speedup with near-identical quality
 (the map deposit — the physically expensive part — is skipped entirely). Not a bug; a
 knob worth remembering when iterating on camera angles / radius on a fixed map.
+
+**Root cause, and it is worse than linear (measured 2026-07-26).** The gather radius is
+chosen *independently of the photon count* — `main.cpp:2722` (and the twins at 6130 /
+6205 / 6564) set `radius = g_pmRadiusAbs > 0 ? g_pmRadiusAbs : scene.sceneRadius *
+g_pmRadiusFactor`. `PhotonMap::build(r)` then sizes the uniform grid at `cellSize = r`
+(`photonmap.h:84–97`), so the grid resolution is **frozen** for a given scene+radius no
+matter how many photons land in it — e.g. `scraps/abs_herosplit.ftsl` reports
+`grid 59x59x59` at 500k emitted *and* at 8M emitted. Photons per cell therefore grows
+**linearly** with `-n`, and every pixel's 3×3×3 neighbourhood scan grows with it.
+
+Timed sweep (`-device cpu -mode M`, 256×256, `scraps/abs_herosplit.ftsl`, wall clock
+including the deposit):
+
+| `-n` emitted | photons stored | total |
+|---|---|---|
+| 1 M | ~6.7 M | 65 s |
+| 2 M | 13.4 M | 139 s (2.14×) |
+| 4 M | ~27 M | 369 s (2.66×) |
+| 8 M | ~53 M | killed — no output after ~16 min, 5.4 GB RSS |
+
+So it scaled ≈ `N^1.4`, not `N` — and there turned out to be **two independent causes**,
+both of which are now fixed. The 8 M case looks like a hang from the outside (no progress
+line during the gather); it isn't, it's just this curve. Note this is **not** a
+`-heroc`/`-herosplit` regression: it was measured identically with the hero bundle off,
+and hero only multiplies the *stored* count (C deposits per photon), which moves you
+along the same curve faster.
+
+**Cause 2 (the superlinear part) — FIXED 2026-07-26: the map was memory-bound and the
+layout was array-of-structs.** Linear photons-per-cell explains linear growth, not `N^1.4`.
+The excess came from bandwidth: the map was **104 B/photon** (an 80 B `Photon` — `pos`,
+`wi`, `n`, `power`, `lambda` — plus a 24 B `cie` entry), so 27 M stored photons is 2.6 GiB
+and 53 M is 5.1 GiB, matching the observed 5.4 GB RSS exactly. Far past any cache, so the
+gather streamed from DRAM. Two things made that much worse than it needed to be:
+* A radius-`r` query scans the 3×3×3 cell box but keeps only the inscribed sphere —
+  `(4/3·π r³)/(27 r³) = 15.5%`, so **~84% of candidates are rejected on a distance test
+  that reads the position and nothing else**. With `pos` embedded in the record, that scan
+  strided 80 B to use 24 B of it, touching every cache line and wasting 70% of each.
+  `PhotonMap` is now structure-of-arrays: `pos[]`, `photons[]` (payload) and `cie[]`,
+  permuted together by the counting sort so index `k` still names one photon in all three.
+  The reject scan is now a dense 24 B/photon stream — **3.3× less bandwidth** on the
+  dominant path.
+* `Photon::wi` (the incident direction, 24 B) was written by both deposit paths and
+  **never read by any gather** — the density estimate is Lambertian, so it only needs the
+  normal. Deleted. The GPU had already figured this out: its `DGatherPhoton` drops `wi`
+  and folds `cie*power*norm/pi` into three floats.
+
+Net: **104 → 80 B/photon (−23%)**, so 53 M stored photons is 3.95 GiB instead of 5.13 GiB.
+The GPU *deposit* record `DPhoton` lost the same dead `wi` (44 → 32 B); that buffer's
+capacity is computed from free VRAM, so it is directly ~27% more photons the device can
+hold in one pass. Measured back-to-back on `scraps/abs_herosplit.ftsl` (`-device cpu
+-mode M`, 256², wall clock incl. deposit) with nothing else running, and the speedup
+**grows with map size** exactly as a bandwidth explanation predicts:
+
+| `-n` emitted | old | new | speedup |
+|---|---|---|---|
+| 1 M | 65.9 s | 62.4 s | 1.06× |
+| 2 M | 141.8 s | 113.3 s | 1.25× |
+| 4 M | 351.1 s | 259.0 s | 1.36× |
+
+Method note for anyone re-measuring: run the two binaries **strictly serially** and with
+nothing else on the machine. Two concurrent ftrace runs contend for every core and the
+ratio comes out meaningless — that mistake produced three mutually-contradictory 4 M
+numbers (1.77×, 9.35×, 11.51×) before it was caught, so the local harness
+(`scraps/pm_bench.sh`, throwaway/not checked in) now refuses to start if another ftrace is
+live. Bit-identical output, verified on 5 configs (CPU mode M at `-heroc 4` and `-heroc 1`,
+CPU mode S, GPU mode M, GPU mode S) plus a `-savemap` → `-loadmap` round trip. The cache format went `FTPMP01` → `FTPMP02` (two blocks: positions,
+then payloads); old files are refused with a message telling the user to re-deposit and
+fall back to a fresh deposit.
+
+**Cause 1 (the linear part) — FIXED 2026-07-26: the gather radius is now density-adaptive
+(`PhotonMap::buildAuto`, on by default in mode M).** The radius used to come from the scene
+size alone, so `build(r)` froze the grid at `cellSize = r` and photons-per-cell — plus the
+3×3×3 scan cost — grew linearly with `-n`. Measured populations at the fixed radius were
+perfectly linear: 350 / 1395 / 5623 / 22433 photons per gather at 1.67 M / 6.7 M / 26.7 M /
+107 M stored.
+
+The fix bins once at the starting radius `r0`, **probes the actual density** (median photons
+seen by a sample of real `queryR` calls), then re-bins at
+`r1 = r0 · sqrt(k / n_probe)` where the target population is
+
+```
+k(M) = kAt1M · cbrt(M / 1e6)        (kAt1M = 200, i.e. -pmcount)
+```
+
+so `r ∝ M^(-1/3)`: per-query cost `M^(1/3)`, noise `M^(-1/6)`, bias `M^(-2/3)` — both error
+terms still go to zero, unlike the tempting `r ∝ M^(-1/2)` (constant population ⇒ constant
+*variance* ⇒ the image never converges in noise, only in bias). The MSE-optimal 2-D bandwidth
+would be `M^(-1/6)` (cost `M^(2/3)`); the cube root is the more aggressive engineering pick.
+
+`kAt1M = 200` is **calibrated to the old look**: at the default `-pmradiusfrac` the fixed
+radius already delivered ~185–210 photons per gather at 1 M stored, so ordinary renders keep
+the population (and therefore the styling) they already had — only the runaway tail is cut.
+At 1.67 M / 6.7 M / 26.7 M / 107 M stored the old 311 / 1256 / 5045 / 20221 become
+237 / 377 / 598 / 949.
+
+Measured on `scraps/abs_herosplit.ftsl` (`-device cpu -mode M`, 256², wall clock incl.
+deposit, runs strictly serial):
+
+| `-n` emitted | fixed | adaptive | speedup | fixed µs/M emitted | adaptive µs/M |
+|---|---|---|---|---|---|
+| 500 k | 27.5 s | 13.5 s | 2.03× | 54.9 | 27.0 |
+| 1 M | 52.3 s | 18.6 s | 2.82× | 52.4 | 18.6 |
+| 2 M | 111.8 s | 26.5 s | 4.22× | 55.9 | 13.2 |
+| 4 M | 269.1 s | 36.1 s | 7.45× | 67.3 | 9.0 |
+
+Note the *shape*: cost per emitted photon used to **rise** with `-n` and now **falls**. The
+grid also unfreezes — 72 → 113 → 179 → 282 cells per axis across 250 k → 16 M emitted, where
+it used to sit at 59³ forever.
+
+This trades blur (bias) for grain (variance), so it was validated at **matched wall time**,
+not matched `-n`, against an independent converged BDPT reference (`png/pmref/ref_bdpt.png`,
+scored by the throwaway `scraps/pm_quality.py`). RMSE drops ~20–24% whole-frame and ~32–41%
+on a flat left-wall patch where noise dominates — and adaptive at 29.5 s beats fixed at
+54.5 s. So it is a quality *improvement* even at the small end, not just a speed/quality
+trade.
+
+Requirements from the original entry, all satisfied: VERSION minor bump (0.66.0 → **0.67.0**),
+README note (mode-M bullet + three CLI-table rows), and an opt-out — `-nopmauto` or an
+explicit `-pmradius` (which implies it) reproduces the old output **bit-for-bit**, verified on
+CPU mode M, CPU mode S, GPU mode M, GPU mode S, plus a `-savemap` → `-loadmap` round trip.
+`-pmcount <k>` retunes the target. The GPU shared-map path takes the same target as an `autoK`
+argument to `renderPhotonMapSharedCuda` and adapts identically.
+
+Two implementation notes worth keeping:
+* `build()` was split into `buildGrid()` + `fillCie()` so the probe can bin twice while paying
+  the expensive threaded CIE precompute only once.
+* The probe **must be order-independent**, or `-loadmap` stops reproducing its `-savemap` run.
+  The counting sort is stable, so within-cell photon order differs between a fresh deposit and
+  a reload of the same map; striding over `photons[]` by array index therefore picked different
+  probe points and yielded a different radius (0.008981 vs 0.008977). It now samples by *cell*
+  (geometry-determined) and takes the lexicographically smallest position in the cell as the
+  representative — a set minimum, hence order-free. The cell *centre* will not do: a cell the
+  surface merely clips has its centre off-surface and reports a spuriously empty neighbourhood.
+
+Modes S/U keep their own per-pass radius reduction (`R0 * pow(it, 0.5*(alpha-1))`) and are
+unaffected. `-savemap`/`-loadmap` is still the way to pay a big deposit only once.
 
 ### Shared FORWARD (A/B) multi-camera pass writes all frames only at the end — FIXED 2026-07-14
 
@@ -1460,6 +2484,36 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
    it, and returns for the orderly teardown.
 
 ## Recently fixed
+
+### VDB sampler read the *second* voxel in the low-face half-voxel shell — FIXED 2026-07-27 (v0.84.2)
+
+`VdbGrid::sample` (`src/vdbgrid.h`) and its device twin `dVdbSample` (`src/render_cuda.cu`)
+clamped the interpolation **stencil indices** to `[0, n-1]` but left the interpolation
+**fraction** alone. For a point just below index 0 — `fi ∈ (-0.5, 0)`, which the half-voxel
+margin explicitly admits — `floor(fi)` is `-1`, so `i0` clamped up to `0` and `i1` became `1`,
+while `tx = fi - floor(fi)` stayed in `(0.5, 1)`. The sample was therefore **dominated by the
+second voxel**, and got *wronger the further outside the point was* (at `fi = -0.49` it was
+99% `v[1]`, 1% `v[0]`), which is backwards. The upper shell was fine, because clamping `i1`
+down to `n-1` makes both stencil taps the same voxel there — so the bug was asymmetric and
+only ever hit the x/y/z **min** faces.
+
+Effect: a half-voxel-thick shell on the three low faces of every imported `.vdb`/`.nvdb`
+volume rendered with density taken from the *next* slab in. Usually invisible (a cloud's edge
+voxels are near-zero), but plainly wrong wherever the boundary slab differs from its neighbour
+— on `scraps/cloud.nvdb` the shell read `0.325` where the edge voxel is `0.0`.
+
+**Fix:** clamp the sample *coordinate* to `[0, n-1]` before the floor, which is what the clamp
+was always meant to mean, then derive `i0`/`i1`/`tx` from the clamped coordinate. Inside the
+lattice this is **bit-identical** to the old code (and drops three `floor()` calls from the hot
+path, since `(int)` truncation equals `floor` for a non-negative coordinate). Applied
+identically to the CPU and CUDA samplers so the twins stay in step.
+
+Found by porting the sampler into loom (`ReadGrid.sample`, `loom/vdbio.py`) for the new
+`VolumeField` term and noticing that a **360° rotation** — which must be a no-op — moved the
+baked field by up to 0.32. Regression test:
+`tests/test_vdbio.py::test_sampler_edge_shell_reads_the_edge_voxel_not_the_second`, plus
+`test_volume_field_placement_is_lossless`, which catches it independently; both fail against
+the old stencil-only clamp.
 
 ### Scene grammar: two value-less flag keywords can't share a line — FIXED (docs+scene) 2026-07-14
 
@@ -1575,6 +2629,22 @@ negligible; the audit is just strict about it.
 _(former `light cylinder` entry moved to Resolved — it was a misdiagnosis.)_
 
 ## Tech debt
+
+### `-savemap` / `-loadmap` are silently ignored on the CPU (GPU-only) — 2026-07-26
+The photon-map disk cache is wired into `renderPhotonMapSharedCuda` only. `main.cpp`
+passes `g_pmapSave`/`g_pmapLoad` at exactly one call site (~line 6638, inside the
+`#ifdef`-guarded GPU branch of the shared-camera mode-M path); the CPU shared path
+immediately below it, and the single-camera mode-M path at ~2721, never look at either
+variable. So `-device cpu -mode M -loadmap foo.ftpm` **silently re-traces the whole photon
+pass** and `-savemap` silently writes nothing — no warning, and the only symptom is the
+deposit line reporting the default `-n` instead of the file's photon count. (This bit a
+validation script: a CPU `-savemap`/`-loadmap` round trip "failed" because neither run had
+loaded anything.) Two things to fix: (1) at minimum warn when either flag is set on a path
+that ignores it — a silently-dropped flag is the worst failure mode; (2) properly, hoist
+the load/save either side of `tracePhotonPass` + `pm.build` in both CPU paths, which is
+easy now that the file format (`FTPMP02`) is just PhotonMap's two arrays — the GPU code in
+`render_cuda.cu` (`savePhotonMap`/`loadPhotonMap`, ~line 10408) is already host-side and
+operates on a `PhotonMap&`, so it can be moved to `photonmap.h` and called from both.
 
 ### Fast RGB backward (`-rgb`) omits media + textured/record albedo — 2026-07-23
 The Stage-2 fast RGB backward path (`renderBackwardRGBCuda`/`bkRadianceRGB` in
@@ -1721,10 +2791,12 @@ follow-up, not a bug:
   strength, sheen, specular). A glass glTF loads as an opaque glossy/diffuse, not a
   dielectric. Proper fix: read `extensions.KHR_materials_transmission`/`_ior` → map to
   `MatType::Dielectric` with the given ior; other extensions as feasible.
-- **No `emissiveFactor` import.** Emissive glTF materials load unlit. (Intentionally
-  skipped for now: setting `emit` without registering the tris as a sampled light would
-  desync NEE; doing it right means adding mesh-emitter area lights — tied to ROADMAP §5
-  "emissive triangles".)
+- **No `emissiveFactor` import.** Emissive glTF materials load unlit. The underlying
+  mechanism now exists — mesh-emitter area lights shipped in 0.41.0 (C5): an FTSL `emit`
+  material bound to a `mesh` registers an `EmitterShape::Mesh` sampled light. What's
+  missing is wiring glTF's `emissiveFactor`/`KHR_materials_emissive_strength` into that
+  path (set `Material::emit` from the factor and call `Scene::addMeshLight` for the
+  imported range). Bind an FTSL `emit` material to the mesh as a workaround.
 - **No skinning, morph targets, animation, or sparse accessors.** Static bind pose only.
 - **Non-triangle primitives** (points/lines/strips/fans, `mode != 4`) are skipped with a
   note; only `mode 4` (TRIANGLES) is baked.
@@ -2354,27 +3426,42 @@ correctly on **both** backends.
   optical-depth accumulation along connection rays through dielectrics. Deferred until a
   dispersive-caustic VCM render demands it.
 
-### `.nvdb` volume import (`density vdb:<file>`): dense bake, float-only, uncompressed
+### `.nvdb` / `.vdb` volume import (`density vdb:<file>`): dense bake, float-only
 - **What:** `medium { density vdb:cloud.nvdb }` imports a NanoVDB FloatGrid (`src/vdbgrid.cpp`,
-  the only TU that includes the vendored `NanoVDB.h`). On load the sparse grid is **baked into a
-  dense float lattice** covering its active index-space bounding box (`VdbGrid`, `src/vdbgrid.h`).
-  A CPU+GPU-shared trilinear sampler reads that lattice.
+  the only TU that includes the vendored `NanoVDB.h`) **or a native OpenVDB `.vdb`**
+  (`src/vdb_openvdb.cpp`, no OpenVDB/NanoVDB dependency). `loadVdbGrid` dispatches on the file
+  magic (`"VDB "` → the native reader, else the NanoVDB path). On load the sparse grid is
+  **baked into a dense float lattice** covering its active index-space bounding box (`VdbGrid`,
+  `src/vdbgrid.h`). A CPU+GPU-shared trilinear sampler reads that lattice.
+- **Native `.vdb` reader:** parses the file container (header, grid descriptor, per-grid
+  compression/metadata/transform), the `float 5_4_3` tree topology, and BLOSC+ACTIVE_MASK+
+  HalfFloat leaf/tile buffers by hand. Blosc's **LZ4** codec is decoded with a vendored
+  single-file LZ4 (`src/third_party/lz4.*`) plus a compact reimplementation of blosc1's
+  chunk/block/byte-shuffle framing — validated **bit-for-bit against python-blosc** on the
+  official OpenVDB smoke/sphere/cube samples (`scraps/_vdb_parse.py` reproduces the parse with
+  read-position exactness). Render-validated: `scraps/vdb_smoke_native.ftsl` shows the smoke
+  plume.
 - **Limitations:**
   1. **Dense memory** — RAM/VRAM scales with the index-space AABB (nx·ny·nz·4 bytes), not the
      active voxel count, so a large but mostly-empty sparse volume can blow up. A safety cap
      (512 M voxels) rejects pathological grids with a clear error rather than OOM-ing.
-  2. **Float grids only** — non-float builds (Fp4/Fp8/Fp16/level-set index grids) are rejected
-     with a message. Convert to a float fog volume first.
-  3. **Uncompressed `.nvdb` only** — Blosc/ZIP-compressed files are rejected (we deliberately
-     don't vendor zlib/blosc). Re-export uncompressed (`nanovdb_convert`, or NanoVDB's
-     `writeUncompressedGrids`).
+  2. **Float grids only** — non-float NanoVDB builds (Fp4/Fp8/Fp16/level-set index grids) and
+     non-`Tree_float_5_4_3` `.vdb` grids are rejected with a message. Convert to a float fog
+     volume first.
+  3. **`.nvdb`: uncompressed only** — Blosc/ZIP-compressed `.nvdb` files are rejected (we
+     deliberately don't vendor zlib/blosc for NanoVDB). Re-export uncompressed. **`.vdb`: LZ4
+     blosc only** — the native reader decodes blosc **LZ4** (Houdini's and OpenVDB `-l lz4`
+     default) but not blosc **BloscLZ / Zlib / Zstd** or standalone **ZIP**; those are reported
+     with a clear "re-export with LZ4" message. Vendoring zstd/zlib for the other codecs is a
+     follow-up if an asset needs it.
   4. **Quoted path not accepted** — the FTSL value grammar takes one bareword token, so the path
      must be unquoted: `density vdb:scraps/cloud.nvdb` (no spaces). A quoted `vdb:"..."` form
      would need a small `parseValue` change to consume a trailing String.
   5. No emission/temperature grids (fire), no motion-blur/velocity grids.
-- **Proper fix (if needed):** a native NanoVDB **sparse** device accessor (sample the tree
-  directly on CPU+GPU instead of baking dense) to drop the memory cost and support huge volumes;
-  fp16 dense option; a second float grid for blackbody emission. Deferred until an asset needs it.
+- **Proper fix (if needed):** a native **sparse** device accessor (sample the tree directly on
+  CPU+GPU instead of baking dense) to drop the memory cost and support huge volumes; fp16 dense
+  option; a second float grid for blackbody emission; the remaining blosc codecs. Deferred until
+  an asset needs it.
 
 ### GPU parity for §1–4 features — DONE (implicits + patterns + translucency)
 - **What:** the whole §1–4 CPU feature set is now ported to the GPU forward + backward
@@ -3484,9 +4571,11 @@ correctly on **both** backends.
     smooth dielectric (no rough transmission in FTSL); plastic/roughplastic →
     glossy (diffuse+specular coat merged); bumpmap/normalmap dropped to base BSDF;
     mask opacity ignored; `.ply`/`.serialized` meshes emitted as `mesh` lines but
-    ftrace's loader is OBJ-only (convert first); mesh area-emitters have no FTSL
-    equivalent (emitted as lit geometry, emission dropped); mesh `to_world` with
-    rotation/shear only partly expressible (translate+scale + euler).
+    ftrace's loader is OBJ-only (convert first); mesh `to_world` with
+    rotation/shear only partly expressible (translate+scale + euler). (Mesh
+    area-emitters *do* now have an FTSL equivalent — a `mesh` bound to an `emit`
+    material, since 0.41.0 — so the exporter could emit that instead of dropping the
+    emission; not yet wired up.)
   - **Possible follow-ups:** map `.ply` via an auto OBJ conversion; emissive-mesh
     support (needs an emissive-triangle light primitive in the core); rough
     transmission material.
@@ -3633,3 +4722,23 @@ leading integer (`2`, `8`), rendering a near-black image from a handful of photo
 in `run()` (src/main.cpp): tokens containing `e`/`E`/`.` are now parsed as a double and
 rounded to the nearest count; plain integers still go through `atoll` exactly. Found while
 validating `-stereo`.
+
+## OPEN (minor, 2026-07-26): native `-viewer` Meshes tab ignores a skin's `clamp`/`mirror` wrap mode
+The F4 texture display (`SkinLib` in `src/viewer_gui.cpp`) uploads each skin as a plain
+D3D11 texture and lets **ImGui's own DX11 backend sampler** do the filtering — and that
+sampler is created once, with `D3D11_TEXTURE_ADDRESS_WRAP` on all three axes
+(`imgui_impl_dx11.cpp`, `ImGui_ImplDX11_CreateDeviceObjects`). So a sidecar texture
+declared `wrap="clamp"` or `wrap="mirror"` still *tiles* in the preview whenever a mesh's
+UVs run outside `[0,1]`. Everything else about the skin is faithful (ftrace's own
+`Texture::load` decodes images, ftrace's own pattern VM bakes formula skins), so this is
+the one place the preview can disagree with a real render. The nearest/bilinear `filter`
+mode *is* honoured, but only because the bake resamples through `Texture::sampleRgb` —
+the GPU sampler is always linear on top of that, so a `nearest` skin gets a faint
+smoothing at extreme magnification.
+
+**Proper fix:** stop relying on the shared backend sampler for skins. Either (a) give
+`SkinLib` its own `ID3D11SamplerState` per wrap/filter combination and bind it with an
+`ImDrawList` callback around the mesh draw (`AddCallback` → set sampler → restore), or
+(b) pre-expand the wrap mode into the *UVs* at bake time (clamp/mirror the per-vertex UVs
+on the CPU before `PrimVtx`), which is cheaper but only correct when a triangle doesn't
+straddle the tile boundary. (a) is the real answer.

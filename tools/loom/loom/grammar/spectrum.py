@@ -26,6 +26,15 @@ The accepted forms — exactly ftrace's ``evalSpectrum`` (``src/ftsl.h`` ~1106) 
 * the Jakob-Hanika *illuminant* heads **`rgbillum r g b`** / **`hsvillum …`** /
   **`hslillum …`** → a smooth full-spectrum *emission* SPD reproducing the colour under
   the bare observer (:class:`IllumSpec`), the emitter analogue of ``rgb``;
+* the Smits 1999 reflectance heads **`rgbsmits r g b`** / **`hsvsmits …`** /
+  **`hslsmits …`** → the colour upsampled via the classic tabulated Smits basis
+  (:class:`SmitsSpec`), a selectable lower-fidelity alternative to ``rgb``;
+* the plain 3-box reflectance heads **`rgbbox r g b`** / **`hsvbox …`** /
+  **`hslbox …`** → the colour upsampled to three calibrated rectangular bands
+  (:class:`BoxSpec`), the cheapest selectable alternative to ``rgb``;
+* the Meng 2015 smoothest-spectrum heads **`rgbmeng r g b`** / **`hsvmeng …`** /
+  **`hslmeng …`** → the colour upsampled to the *smoothest* reflectance realising
+  it (:class:`MengSpec`), the highest-fidelity selectable alternative to ``rgb``;
 * a library **reference** — ``glass:`` / ``metal:`` / ``reflectance:`` / ``filter:``
   / ``preset:`` / ``file:`` / ``spectrum:`` followed by a name / path;
 * a **record channel reference** used as a constant — ``RECORD.channel[i]`` or
@@ -52,6 +61,12 @@ _COLOR_HEADS = ("rgb", "hsv", "hsl")
 _LINE_HEADS = {"rgbline": "rgb", "hsvline": "hsv", "hslline": "hsl"}
 # The Jakob-Hanika illuminant (full-spectrum emission) heads (K1): `rgbillum r g b`, etc.
 _ILLUM_HEADS = {"rgbillum": "rgb", "hsvillum": "hsv", "hslillum": "hsl"}
+# The Smits 1999 reflectance upsampler heads (K1): `rgbsmits r g b`, etc.
+_SMITS_HEADS = {"rgbsmits": "rgb", "hsvsmits": "hsv", "hslsmits": "hsl"}
+# The plain calibrated 3-box reflectance upsampler heads (K1): `rgbbox r g b`, etc.
+_BOX_HEADS = {"rgbbox": "rgb", "hsvbox": "hsv", "hslbox": "hsl"}
+# The Meng 2015 smoothest-spectrum upsampler heads (K1): `rgbmeng r g b`, etc.
+_MENG_HEADS = {"rgbmeng": "rgb", "hsvmeng": "hsv", "hslmeng": "hsl"}
 _LIB_PREFIXES = ("glass:", "metal:", "reflectance:", "filter:", "preset:",
                  "file:", "spectrum:")
 
@@ -129,6 +144,43 @@ class IllumSpec:
     whose integral under the bare CIE observer reproduces the colour — ftrace's
     ``rgbToIlluminantJH`` / K1, the emitter analogue of :class:`ColorSpec`.  A *head
     keyword* (not a trailing modifier) for the same parser reason as :class:`LineSpec`."""
+    space: str
+    comps: Tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class SmitsSpec:
+    """The Smits 1999 reflectance form ``rgbsmits r g b`` (and ``hsvsmits``/
+    ``hslsmits``): the colour upsampled to a reflectance via ftrace's classic
+    tabulated Smits basis (``rgbToReflectanceSmits`` / K1) — a selectable,
+    lower-fidelity alternative to the default Jakob-Hanika :class:`ColorSpec`.  A
+    *head keyword* (not a trailing modifier) for the same parser reason as
+    :class:`LineSpec`."""
+    space: str
+    comps: Tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class BoxSpec:
+    """The plain 3-box reflectance form ``rgbbox r g b`` (and ``hsvbox``/
+    ``hslbox``): the colour upsampled to three calibrated rectangular reflectance
+    bands (ftrace's ``rgbToReflectanceBox`` / K1) — the cheapest selectable
+    alternative to the default Jakob-Hanika :class:`ColorSpec`.  A *head keyword*
+    (not a trailing modifier) for the same parser reason as :class:`LineSpec`."""
+    space: str
+    comps: Tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class MengSpec:
+    """The Meng 2015 form ``rgbmeng r g b`` (and ``hsvmeng``/``hslmeng``): the
+    colour upsampled to the *smoothest* reflectance realising it — the minimum
+    of sum (s[i+1]-s[i])^2 over all physical reflectances of that colour, read
+    from ftrace's baked table (``rgbToReflectanceMeng`` / K1).  The
+    highest-fidelity selectable alternative to the default Jakob-Hanika
+    :class:`ColorSpec`, and the one to prefer when a reflectance will be
+    re-illuminated by a strongly non-D65 light or dispersed.  A *head keyword*
+    (not a trailing modifier) for the same parser reason as :class:`LineSpec`."""
     space: str
     comps: Tuple[float, float, float]
 
@@ -233,6 +285,21 @@ def parse_spectrum(text: str):
         space = _ILLUM_HEADS[head]
         _sp, comps = as_color(space + " " + " ".join(words[1:]), default_space=space)
         return IllumSpec(space, comps)
+    if head in _SMITS_HEADS:
+        # `rgbsmits r g b` (hsvsmits/hslsmits) → Smits 1999 reflectance upsample.
+        space = _SMITS_HEADS[head]
+        _sp, comps = as_color(space + " " + " ".join(words[1:]), default_space=space)
+        return SmitsSpec(space, comps)
+    if head in _BOX_HEADS:
+        # `rgbbox r g b` (hsvbox/hslbox) → plain calibrated 3-box reflectance.
+        space = _BOX_HEADS[head]
+        _sp, comps = as_color(space + " " + " ".join(words[1:]), default_space=space)
+        return BoxSpec(space, comps)
+    if head in _MENG_HEADS:
+        # `rgbmeng r g b` (hsvmeng/hslmeng) → Meng 2015 smoothest-spectrum upsample.
+        space = _MENG_HEADS[head]
+        _sp, comps = as_color(space + " " + " ".join(words[1:]), default_space=space)
+        return MengSpec(space, comps)
     if head in _COLOR_HEADS:
         space, comps = as_color(text, default_space=head)
         return ColorSpec(space, comps)

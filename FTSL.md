@@ -33,8 +33,9 @@ Consequences you must know:
   statements on one line.
 - A trailing option that is a **bareword** starts a *new* statement and will NOT be
   folded back into the previous one. This is why axis/scale options use `key=val`
-  form: `uv planar axis=y` (correct) vs `uv planar y` (the `y` is silently a stray
-  statement). See §9.
+  form: `uv planar axis=y` (correct) vs `uv planar y` (the `y` becomes a stray
+  statement). See §9. The stray no longer passes unnoticed — nothing in the loader
+  reads a key called `y`, so the unknown-key check (§1.3) reports it.
 - A `{` after a value opens a nested block whose *type* is the preceding word (or the
   statement key if none): `film { … }`, `table { … }`, `coat { … }`, `lens { … }`.
 
@@ -48,7 +49,33 @@ blocktype ["name"] [subtype] { … }
 - `light` takes a **subtype** bareword: `light area { … }`, `light spot { … }`, etc.
 - All other blocks are `type ["name"] { … }`.
 
-### 1.3 Conditional blocks (`prefer { … } else { … }`)
+### 1.3 Unknown keys are reported
+
+The loader tracks which statements a builder actually read. Once the scene is built,
+anything nobody looked at is reported to stderr:
+
+```
+[ftsl] warning: myscene.ftsl: sphere: unknown key 'priority' on line 42
+[ftsl] warning: myscene.ftsl: material "gold" > coat: unknown key 'thicknes' on line 51
+```
+
+This is a **warning, not an error** — the scene still renders, so an older file
+carrying a stale property keeps working. But it is worth heeding, because the
+alternative failure mode is the bad one: an unread property does *nothing*, so a
+typo, a property written on the wrong block (`priority` is a **material** slot, not a
+geometry one), or a generator that has drifted from the grammar quietly produces a
+**wrong image** rather than a complaint.
+
+The report names the enclosing block and nests with `>` for inner bodies. When a
+statement itself is unread the loader reports only that line and does not descend into
+its body — the body is unread by construction, and listing every child would bury the
+one line you actually have to fix.
+
+A few bodies are consumed as a flat token dump rather than as key/value statements —
+`data { … }`, `palette { … }`, a spectrum `table { … }`, and a `record` body (whose
+channel names the author invents) — so no key inside them can be "unknown".
+
+### 1.4 Conditional blocks (`prefer { … } else { … }`)
 
 A top-level `prefer` node holds ordered **branches**, each a complete list of top-level
 blocks. The loader trial-builds them in order and keeps the first branch that is
@@ -251,6 +278,226 @@ meshes and on native primitives that declare a `uv` wrap, see §9). Constant `pi
 **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
 `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
 
+**Image samples — `tex:<name>(u, v)`:** samples a declared `texture` as a *scalar term
+inside the formula*, so a photograph can be one operand of an expression rather than
+only bound wholesale to a slot:
+
+```
+texture "grime" { file maps/grime.png  encoding linear }
+
+# the photo AND-ed with a procedural ripple — not expressible by binding the image
+pattern "worn" { expr "saturate(tex:grime(u,v) * (0.5 + 0.5*sin(28*u)) * 2)" }
+
+material "wall" { type mix  layer "clean" 0.5  layer "dirty" 0.5  weight_map pattern:worn }
+```
+
+The two arguments are ordinary sub-expressions, so the lookup can be warped
+(`tex:grime(u*2 + 0.1*sin(10*v), v)`). The value is the **mean of the three linear RGB
+channels** at that texel — exactly the sampler a `texture:<name>` scalar-slot binding
+uses (`Texture::scalarAt`) — honouring the texture's own `filter` and `wrap`; prefer
+`encoding linear` when the image is meant as *data* rather than as colour. Any texture
+declared anywhere in the file may be sampled (declaration order does not matter), with
+one exception: a **procedural** `texture { rgb "…" }` is baked while textures are being
+built, so it can only sample images declared *above* it.
+
+Worked example: `scenes/pattern_tex.ftsl` (a photo AND-ed with a sine ripple, a photo
+blended against a world-space band and thresholded, and a warped lookup).
+
+`tex:` is accepted only where a shading context actually exists: `pattern` blocks,
+record scalar-stop and driver expressions, record-override scalar expressions, and
+procedural texture channels. In an isosurface `function { expr }`, a medium
+`density`/`ior` program, or a load-time constant there is no surface to sample, and
+`tex:` is a **compile error** rather than a silent zero.
+
+**Sampled arrays — `grid:<name>(c0, …)`:** a `grid` element declares an **N-dimensional
+regular lattice of numbers** (1-D through 4-D) that any expression can interpolate. Where
+`tex:` reads an *image* in UV space, `grid:` reads *authored data* over an arbitrary
+domain — a measured curve, a lookup table, a small height field, a tabulated response:
+
+```
+grid "ramp" {
+    lo   0
+    hi   1
+    data { 0 0.15 0.55 0.8 1 }         # 5 samples over [0,1]
+}
+
+grid "tile" {
+    shape 3 3                          # axis 0 is the OUTERMOST axis (C order)
+    lo    0 0
+    hi    1 1
+    data {
+        0.02 0.98 0.02
+        0.98 0.02 0.98
+        0.02 0.98 0.02
+    }
+}
+
+pattern "p" { expr "grid:ramp(u) * grid:tile(v, u)" }
+```
+
+| Key | Meaning |
+|---|---|
+| `data { … }` | The samples, in **C order** (axis 0 outermost / slowest). Required. Newlines and grouping inside the body are pure formatting. May instead be written **bracketed** — `data [[0 1 2][3 4 5]]` — and then the **nesting is the shape**, so `shape` becomes unnecessary (see below). |
+| `shape a b …` | Sample count per axis; the number of entries is the dimensionality (max 4). Omitted ⇒ **1-D**, as long as `data`. `product(shape)` must equal the sample count. Redundant when `data` is *nested*: it is then accepted only if it agrees, and the mismatch is reported with both shapes. |
+| `lo` | The box's low corner. Omitted ⇒ **zeros**; one number ⇒ broadcast to every axis; `ndim` numbers ⇒ exact. |
+| `hi` | The high corner. Omitted ⇒ the **unit-spacing index lattice** (`hi[a] = lo[a] + shape[a] - 1`, i.e. coordinates *are* indices); one number ⇒ an **isotropic** lattice whose spacing is set by axis 0; `ndim` numbers ⇒ the exact box. |
+| `outside` | Behaviour beyond the box: `clamp` (default — edge-extend), `wrap` (periodic with period `hi-lo`, so sample `n-1` aliases sample 0), `extrapolate` (the boundary cell's slope continues). |
+
+`data` may also be written **bracketed**, and then the nesting carries the shape — the same
+rule the inline array literal below uses, and the one shape you cannot get wrong, because
+it is not written down twice:
+
+```
+grid "tile" {                          # exactly the grid above, with nothing repeated
+    lo   0 0
+    hi   1 1
+    data [[0.02 0.98 0.02]
+          [0.98 0.02 0.98]
+          [0.02 0.98 0.02]]
+}
+```
+
+A *flat* bracket group (`data [0 1 2 3]`) is just the bracketed spelling of the flat list,
+so an explicit `shape` still folds it; only real nesting infers a shape. A ragged array is
+an error, and a grid's `data` takes no `(…)` sample call — that belongs at a value site
+that *reads* the grid.
+
+The call's **arity is the grid's own dimensionality** — a 2-D grid takes two coordinates,
+in axis order — so `grid:tile(u)` is a compile error, not a silent zero. Interpolation is
+separable **N-linear** (linear / bilinear / trilinear / quadrilinear), so a grid whose
+samples come from a multilinear function reproduces it exactly. Coordinates are in the
+grid's **own units** and are *not* rescaled by the scene's `units` setting (like a
+`pattern`'s `scale`, a grid is unit-agnostic).
+
+`ftrace -checkgrid` runs the deterministic sampler self-test (exact sample recovery,
+C-order flattening, 1-D…4-D multilinear exactness, the three `outside` policies, and the
+compile/arity rules), and `scenes/pattern_grid.ftsl` renders one feature per wall strip
+(plain ramp, 2-D C order, `wrap`, the default index lattice, `extrapolate`) as a direct
+albedo read-out.
+
+**Scattered samples — `scatter:<name>(c0, …)`:** the **ragged sibling** of a grid. A
+`scatter` holds values at *arbitrary* positions — no lattice — and blends them by
+**Shepard inverse-distance weighting**. Reach for it when the data never sat on a grid in
+the first place: a few probe measurements, samples along a path, a handful of authored
+control points.
+
+```
+scatter "pts" {
+    dim   2                            # coordinates per sample (1..4); omitted ⇒ 1
+    power 2                            # inverse-distance exponent; omitted ⇒ 2
+    data {                             # (dim + 1) numbers per sample: position…, value
+        0.15 0.20   0.95
+        0.80 0.25   0.10
+        0.50 0.55   0.70
+    }
+}
+
+pattern "p" { expr "scatter:pts(u, v)" }
+```
+
+| Key | Meaning |
+|---|---|
+| `data { … }` | The samples, each as its **position then its value** — `dim + 1` numbers, repeated. One interleaved list, because a scatter's position and value are not separable the way a lattice's are. Required. May also be written **bracketed**, either flat or with **one group per sample** — `data [[0.15 0.20 0.95][0.80 0.25 0.10]]` — in which case the `dim + 1` stride is checked per group, so a miscount names the offending sample instead of failing on the total. |
+| `dim` | Coordinates per sample, i.e. the call's arity. Omitted ⇒ **1** (so `data` is position/value pairs). Max 4. |
+| `power` | The exponent on distance: weight of a sample is `|q − p|^-power`. Omitted ⇒ **2** (also the fastest path). Higher ⇒ each sample dominates its own neighbourhood, approaching nearest-neighbour / Voronoi; lower ⇒ broader, softer, more global. |
+| `eps` | Squared-distance threshold for "the query **is** this sample". Omitted ⇒ `1e-9`. |
+
+Two behaviours distinguish this from `grid:`'s linear interpolation, and both are
+deliberate: a sample is reproduced **exactly** at its own position and the field arrives
+there with **zero slope** (hence a visible plateau at each sample), and outside the
+samples the field **flattens toward their weighted mean** rather than diverging — the
+scatter counterpart of a grid's `clamp`. Being normalised, it also reproduces a constant
+field exactly, everywhere.
+
+A scatter costs O(count) per sample against a grid's O(2^ndim), and stores a position per
+value — so where data genuinely is regular, a `grid` is both smaller and faster. Use a
+scatter for the data a grid *cannot* represent.
+
+`ftrace -checkscatter` is the deterministic self-test (exact reproduction, 1-D…4-D
+partition of unity, symmetry, the closed-form two-sample weight for several exponents,
+far-field flattening, and the compile/arity/namespace rules), and
+`scenes/pattern_scatter.ftsl` renders one feature per wall strip.
+
+**Inline array literals — `[0 1](u)`:** most of the tables an author actually writes are
+three numbers long and used exactly once, and giving each of those a name, a block and a
+`pattern` wrapper is more ceremony than content. So an array may be written **where it is
+used**, at any value site that accepts a `pattern:<name>`:
+
+```
+material "m" {
+    type      diffuse
+    reflect   whitewall 0.8
+    roughness [0.05 0.4 0.05](u)                 # 1-D: 3 taps across u
+}
+
+material "n" {
+    type       mix   layer "a" 0.5   layer "b" 0.5
+    weight_map [[0 0.5][0.5 1]](u,v)             # 2-D: one nesting level per axis
+}
+```
+
+Two halves. `[ … ]` is the data and **nesting is the shape** — axis 0 outermost, C order,
+exactly as in a `grid`'s `data { … }` — so a shape is never spelled and cannot disagree
+with the data; the array must be **rectangular** (for irregular data, use a `scatter`).
+`(…)` is the **sample call**: it says at which coordinates the array is read, **one
+coordinate per nesting level**, and each coordinate is a full pattern expression — so
+`[0 1](0.5+0.5*sin(2*pi*3*u))` sweeps the ramp back and forth three times. A literal spans
+the **unit interval on every axis** (0 at the first entry, 1 at the last), which is what
+makes `(u)` / `(u,v)` the natural things to write, and is deliberately *different* from a
+`grid` element's index-lattice default: an inline literal has no domain of its own, whereas
+a standalone grid is a data container whose sample spacing is the meaningful thing.
+
+The call **may contain spaces** — `[0 1](0.5*u + 0.5*v)`, `[[0 1][1 0]](u, v)` — because
+the tokenizer treats a *balanced paren group* as part of one token: a space only ends a
+value while no parens are open. (Keeping an unquoted expression a single token is what
+makes `0.5+0.5*sin(2*pi*3*u)` legal as a coordinate in the first place; the balanced rule
+is what lets you put a space in one without splitting the call in two.) A space *before*
+the `(` is fine as well, and the array itself may be laid out over several lines.
+
+The call is **not optional**: an array with no call is *unsaturated* and is rejected at
+load time, because an uncalled array has no value. A ragged array, a non-numeric entry and
+a coordinate count that disagrees with the nesting are all load errors too, each naming
+what the author wrote.
+
+Each literal desugars to an anonymous `grid` plus a one-line `pattern` and the value site
+is rewritten to reference it — which is exactly why a literal works in every slot that
+takes a pattern without any of those slots knowing the syntax exists, and why it
+interpolates **N-linearly** just like a grid. The sugar is exact: `scenes/pattern_array.ftsl`
+and a hand-written `grid` + `pattern` twin render bit-for-bit identically. Reach for a
+named `grid`/`scatter` instead when the data is big, shared, or worth naming.
+
+Because the desugared form is a `pattern:`, a literal reaches wherever a pattern reaches —
+including the **`reflect` slot** (§7.2), where `reflect [0 1](u)` is a greyscale albedo ramp.
+
+**Scope and loading (both datatypes).** Grids and scatters load before textures, patterns
+and records, so declaration order never matters — including inside a procedural
+`texture { rgb "…" }`, which may sample either. Scope is **wider than `tex:`'s**: on top of
+`pattern` blocks, procedural texture channels and record driver/stop/override expressions,
+both reach every scalar **field** formula —
+
+* an isosurface / CSG `function { expr }` leaf, so a field can *be* measured data:
+  `expr "grid:terrain(x, z) - y"` is a height field, `expr "grid:rho(x,y,z) - 0.5"` an
+  isosurface of a measured volume;
+* a medium's `density` program — `density "grid:rho(x, y, z)"` — a measured volume without
+  going through `vdb:`;
+* a medium's `ior` program — `ior "1 + grid:n(x, y, z)"` — a measured refractive-index
+  profile driving GRIN bending (§ media);
+* a `camera_curve` driver, so an authored table can steer a flyby: `fov_from lens.fov(grid:zoom(t))`.
+
+Unlike `tex:`, which needs a *surface* (a hit's `u`,`v`) and so stays a compile error at
+those sites, a table sample needs nothing but coordinates. Everything that consumes such a
+field uses the same tables the renderer does: the isosurface polygoniser, the sphere-trace
+Lipschitz estimate, the medium's majorant-density scan and the GRIN marcher. The one
+remaining exception is a **load-time constant** site, which is evaluated before any table
+view exists, and there a sample is a compile error. Worked example:
+`scenes/grid_field.ftsl` (a 5×5 lattice read as an isosurface height field, plus a 1-D
+profile read as a medium's density). The two names live in **separate namespaces**: a grid
+called `foo` is not reachable as `scatter:foo`.
+
+The whole path is shared with the GPU: the `PatGrid` / `PatScatter` headers and the one
+flat number pool they share upload verbatim and the device runs the *same* sampler
+functions, so either table renders identically on either backend.
+
 **POV-Ray internal functions:** the whole classic `functions.inc` isosurface library is
 built in — `f_torus`, `f_heart`, `f_klein_bottle`, `f_superellipsoid`, `f_dupin_cyclid`,
 `f_helix1`, `f_spiral`, `f_boy_surface`, `f_kummer_surface_v1/v2`, … (~73 functions, exact
@@ -292,11 +539,12 @@ Fills a complete material; a few knobs may be overridden afterward
 
 | type | key params (defaults) |
 |---|---|
-| `diffuse` | `reflect <spec>`(whitewall 0.75); `reflect texture:<n>` for a spatially-varying albedo |
-| `translucent` | `reflect <spec>`(0.4); `transmit <spec>`(0.4) — two-sided Lambertian (diffuse transmission / thin-SSS look). Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; light diffuses THROUGH the surface. `reflect texture:<n>` allowed. Alias: `diffuse_transmit`. `reflect`+`transmit` are energy-clamped to ≤1. |
+| `diffuse` | `reflect <spec>`(whitewall 0.75); `reflect texture:<n>` for a spatially-varying albedo; `reflect pattern:<n>` for a procedural greyscale one, `reflect_map` to modulate either |
+| `translucent` | `reflect <spec>`(0.4); `transmit <spec>`(0.4) — two-sided Lambertian (diffuse transmission / thin-SSS look). Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; light diffuses THROUGH the surface. `reflect texture:<n>` allowed, and both slots take a pattern (`reflect`/`transmit pattern:<n>`, `reflect_map`/`transmit_map`). Alias: `diffuse_transmit`. `reflect`+`transmit` are energy-clamped to ≤1. |
 | `mirror` | `reflect <spec>`(0.95) |
 | `halfmirror` | `reflect <spec>`(0.5) |
-| `glossy` | `reflect <spec>`(0.9); `roughness <r>`(0.2) or `roughness pattern:/texture:<n>` |
+| `glossy` | `reflect <spec>`(0.9) or `reflect pattern:<n>`/`reflect_map`; `roughness <r>`(0.2) or `roughness pattern:/texture:<n>` |
+| `filter` | `transmit <spec>`(0.5) — a colored gel / Wratten filter: a thin non-scattering absorber. A ray passes straight through (no reflection, no refraction) and survives with probability T(λ). Feed T from a measured curve (`transmit filter:red-25`, `transmit file:…csv`) or a primitive (`transmit gaussian center=630 sigma=25`); `transmit pattern:<n>` / `transmit_map` vary it across the surface. |
 | `dielectric` | `ior <spec>`(BK7); `roughness`(0)/map; `absorb <spec>`(0) Beer-Lambert tint per metre |
 | `thinfilm` | `ior`(1.5); `film_ior`(1.30); `film_thickness <nm>`(300)/`film_thickness_map`; `substrate_k <spec>`(0) |
 | `grating` | `reflect`(0.9); `groove_spacing <nm>`(1000); `groove_dir <x y z>`(0,1,0); `max_order`(3) |
@@ -307,6 +555,65 @@ Fills a complete material; a few knobs may be overridden afterward
 
 Scalar-parameter maps: `roughness` / `film_thickness_map` / `weight_map` accept
 `pattern:<name>` (math over x,y,z,normal,u,v) or `texture:<name>` (grayscale UV map).
+
+**Pattern-driven reflectance, transmittance and emission.** The `reflect`, `transmit` and
+`emit` slots take a pattern too, and a scalar in a spectral slot is a per-hit **multiplier**
+on whatever the slot otherwise holds:
+
+```
+material "ramp"  { type diffuse reflect [0 1](u) }                     # greyscale ramp
+material "rings" { type diffuse reflect pattern:p_rings }              # the same, named
+material "tint"  { type diffuse reflect rgb 0.9 0.22 0.12             # colour from here…
+                                 reflect_map pattern:p_rings }         # …variation from here
+material "skin"  { type diffuse reflect texture:wood                   # an image albedo…
+                                 reflect_map pattern:wear }            # …weathered per hit
+material "panel" { type translucent reflect 0.15 transmit [0 1](u) }   # opaque -> clear ramp
+material "gel"   { type filter  transmit gaussian center=630 sigma=40  # colour from here…
+                                transmit_map pattern:p_rings }         # …strength from here
+material "strip" { type diffuse reflect 0.0 emit blackbody 5200        # a lamp's colour…
+                                emit_map pattern:p_rings }             # …brightness profile
+```
+
+A pattern written *into* `reflect` is alone in the slot, so the base spectrum becomes a flat
+1.0 and the albedo is the pattern's own value — a greyscale reflectance, and the reason
+`reflect [0 1](u)` (§6.1) means what it looks like. `reflect_map` instead modulates an
+authored spectrum or texture. Because the pattern is a scalar it can only ever darken or
+brighten: **colour comes from the spectrum/texture, never from the pattern.** The multiplier
+is clamped to [0,1], so a runaway formula cannot manufacture energy.
+
+`transmit` / `transmit_map` work identically on the transmit slot — a `translucent`'s
+back-hemisphere albedo (still energy-guarded so reflect + transmit ≤ 1) or a `filter`'s
+per-wavelength gel transmittance.
+
+Reflect patterns are supported on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy`
+and `grating`; transmit patterns on `translucent` and `filter` — the families whose slot goes
+through the shared per-hit accessor. Elsewhere the spectrum is read directly (or not at all)
+and a pattern would be dropped in silence, so the loader **refuses** it there instead.
+
+**`emit` / `emit_map` — emission profiles.** Same two spellings, same clamped scalar
+multiplier, on the emission slot; a `light` block spells its slot `spd`, so there the pair is
+`spd pattern:<n>` / `spd_map pattern:<n>`. Three things make emission different from the other
+two slots:
+
+* **Only quad and mesh emitters may carry one.** An emission profile is read from *both* sides
+  of transport — once when a camera path lands on the emitter, once at the point NEE / a light
+  subpath samples on it — and MIS combines the two, so if they disagreed the image would be
+  **biased**, not merely noisy. Only a rectangular area light (bilinear parameters) and a mesh
+  emitter (barycentric UVs) can report a sampled (u,v) that provably equals the one a hit
+  interpolates. A `sphere` / `cylinder` / `spot` / `sun` / `env` light is **refused** at load.
+* **`power` / `lumens` normalise the *unpatterned* spectrum.** The pattern is a pure
+  post-multiplier on radiance — which is exactly what keeps every selection and positional pdf
+  untouched, and hence the estimator unbiased — so a profile averaging 0.5 emits about half the
+  requested flux. Scale `power` up to hold total output fixed.
+* **CPU *and* GPU** (ported in 0.82.0). `DMaterial::emitPat` / `DEmitter::emitPat` mirror the
+  host pair, so an emission pattern no longer forces a CPU fallback.
+
+An emissive **material** (`emit` on a `material` block) only becomes a *sampleable* light when
+it is bound to a `mesh {}`; a bare `quad {}` with an emissive material just adds emissive
+triangles that emission-on-hit can see.
+
+Worked examples: `scenes/reflect_pattern.ftsl`, `scenes/transmit_pattern.ftsl`,
+`scenes/emit_pattern.ftsl`.
 
 ### 7.3 `mix` — stochastic material blend
 
@@ -368,13 +675,65 @@ grad = range 0-1 [
 - **Stops** are laid out evenly across the domain. Prefix any stop with `p:<pos>` to
   **pin** it to an explicit domain position; unpinned runs redistribute between the
   pinned anchors. Positions must stay in `[lo,hi]` and be non-decreasing.
-- A channel is a **colour** LUT iff its stops are prefixed spectrum refs (they contain
-  `:`, e.g. `spectrum:steel`, `metal:copper`); otherwise it is a **scalar** LUT whose
-  stops are pattern expressions (a literal, or math over `x y z nx ny nz r u v f` and
-  functions like `noise(…)` — the §6.1 language). A channel may not mix the two.
+- A channel is a **colour** LUT if it carries an **inline colour tag** (below) or its
+  stops are prefixed spectrum refs (they contain `:`, e.g. `spectrum:steel`,
+  `metal:copper`); otherwise it is a **scalar** LUT whose stops are pattern expressions
+  (a literal, or math over `x y z nx ny nz r u v f` and functions like `noise(…)` — the
+  §6.1 language). A channel may not mix the two.
 - **`interp nearest|linear|smooth`** selects the sampling mode (default `linear`).
   `smooth` is a monotone (Fritsch–Carlson) cubic — no overshoot. Colour channels
   interpolate in linear RGB, then upsample back to a reflectance spectrum.
+
+#### Inline colour channels
+
+A colour channel doesn't have to name pre-declared spectra. Prefix the stop list with
+any **colour head** — `rgb`, `hsv`, `hsl`, or any of their upsampler / emission variants
+(`…line`, `…illum`, `…smits`, `…box`, `…meng`) — and write the triples inline. The tag
+applies to the whole channel and fixes each stop's arity at 3, so a *lone* stop needs no
+disambiguating comma. Components go through exactly the same evaluator as a top-level
+`spectrum "x" = rgb …` declaration, so every colour head is available here:
+
+```
+palette = range 0-1 [
+    reflect  rgb 0.9 0.1 0.1, 0.1 0.9 0.1, 0.1 0.1 0.9   # red -> green -> blue
+    tint     rgbmeng 0.15 0.65 0.85                       # one stop, smoothest-metamer
+    glow     hslline 0.55 0.9 0.5, 0.10 0.9 0.5           # line-emission head
+]
+```
+
+#### Stop delimiters — the precedence ladder
+
+The three stop delimiters form a fixed **precedence ladder**, not an interchangeable
+set:
+
+| delimiter | binds | analogy |
+|---|---|---|
+| whitespace | tightest | `×` — juxtaposition builds one group |
+| `,` | looser | `+` — opens a new outer level |
+| `[ ]` | anywhere | parentheses — an explicit level |
+
+So `1 1 1, 2 2 2` reads as `(1·1·1) + (2·2·2)`: two groups of three. Because the
+precedence is fixed, **structure comes from the delimiters alone** and a channel's arity
+only *validates* what they already said — which is why these are all the same channel:
+
+```
+reflect  rgb 0.9 0.1 0.1, 0.1 0.9 0.1        # comma-separated triples
+reflect  rgb [0.9 0.1 0.1] [0.1 0.9 0.1]     # bracketed groups
+reflect  rgb [0.9 0.1 0.1, 0.1 0.9 0.1]      # one bracketed comma list
+```
+
+and bracketing one level is idempotent, so `rough 0 0.5 1`, `rough [0 0.5 1]` and
+`rough 0, 0.5, 1` are all the same three scalar stops.
+
+Parens `( )` are **not** a rung — they belong to expressions (§6.1) — so a parenthesised
+run is opaque and its inner commas split nothing: `0  clamp(u,0,1)  1` is three stops.
+`p:<pos>` pins are orthogonal and work in either spelling (`p:0 0, p:0.25 0.5, p:1 1`).
+
+A channel line that uses **none** of `,` `[` `]` and has **no colour tag** is read
+exactly as it always was, so the ladder is a strict addition — no pre-existing scene
+reparses differently. One consequence worth knowing: an *untagged* multi-component stop
+(`tint 0 0 0,`) has no destination slot in ftrace and is an error; tag it
+(`tint rgb 0 0 0`) to say what those three numbers mean.
 
 **Binding a record to geometry** uses the inline `material NAME(driver)` form in any
 primitive's `material` field, where `driver` is a pattern expression evaluated per
@@ -450,6 +809,125 @@ a constant driver like `palette.reflect(0.3)` is allowed. This is the general ru
 > **GPU note:** record-driven materials currently render on the **CPU only** — a scene
 > that binds a record falls back from the GPU forward/backward tracer automatically
 > (`[device] … -> CPU (…parametric record…)`). GPU parity is a later stage.
+
+### 7.6 Named inputs — materials as parameterized bundles
+
+A material property is an **expression over named inputs**, and a material is a bundle
+of those properties — so the material is itself a **function**, whose free-input set is
+the union of its properties' free inputs. **Applying** it at a use site binds those
+inputs across the whole bundle at once:
+
+```
+pattern "rough_ua" { expr "0.5*a*(0.2+0.8*u)" }        # free inputs: a, u
+
+material "gold" {
+    type glossy
+    reflect spectrum:gold
+    roughness pattern:rough_ua
+    albedo_default 0.5                                  # fallback for an unbound `a`
+}
+
+sphere { center 0 0 0  radius 1  material gold(u=v,a=1) }   # bind u<-v, a<-1
+sphere { center 2 0 0  radius 1  material gold(u=v a=1) }   # identical — same §7.5 ladder
+sphere { center 4 0 0  radius 1  material gold(u=v) }       # partial: a -> albedo_default
+```
+
+The bindable inputs are the surface intrinsics `x y z nx ny nz r u v f` plus **`a`**.
+
+**`a` (albedo)** is the one named input with **no per-hit intrinsic**, so it must be
+resolved at *load* time: either to whatever a use site binds it to, or — unbound — to
+the material's **`albedo_default`** (default `1.0`). It is therefore in scope only where
+a material can resolve it: a `pattern` block's `expr`, a record material driver, a
+`from` driver, and a material override block's slot RHS. Writing `a` anywhere else (an
+implicit field formula, a load-time constant) is a scope error.
+
+**Unbound inputs keep their system defaults** — `u` left unbound is still the surface
+`u`. Only `a` has a load-time fallback rather than a per-hit meaning.
+
+**Positional application** binds the sole *still-free* input, so it needs exactly one to
+remain after the named arguments are taken:
+
+```
+material gold(0.5*u+0.5*v)      # OK only if the bundle has exactly one free input
+material gold(0.5,a=1)          # OK — `a` goes by name, leaving one input for the positional
+material gold(0.5)              # error if two inputs are still free — bind by name
+```
+
+At most one positional argument is allowed, and an argument — positional or the RHS of
+`name=…` — is an **arbitrary expression** evaluated in the *consumer's* scope (so `u=v`
+feeds the consumer's surface `v` into the material's `u`). `a` is **not** in scope in an
+argument, since the consumer is geometry and has no albedo to offer.
+
+> **Syntax note:** the argument list **may contain spaces** — `gold(a=1, u=v)` and
+> `gold(0.5*u + 0.5*v)` are both fine. A space normally ends a value, but the tokenizer
+> matches a *balanced paren group* as part of the token, so a space is only a delimiter
+> while no parens are open. (The group must close on the same line; an unbalanced `(` is
+> an error, not a silent run-on.) The `RECORD(driver)` form gets the same freedom.
+
+Binding is **substitution**: the argument's compiled program is spliced in place of
+every read of the bound input. Because the programs are postfix, a variable node and a
+well-formed program both push exactly one value, so the splice cannot disturb the
+surrounding stack — an applied material is an *ordinary* material, with no environment
+and no runtime indirection. Substitution is **simultaneous**, so `gold(u=v,v=u)` swaps
+the two inputs rather than collapsing both onto one. A material nobody applies is
+bit-identical to before, and identical applications are shared (one material, not one
+per object). `ftrace -checkbind` pins all of this.
+
+### 7.7 Per-property access — `MATERIAL.slot`
+
+§7.6 applies a *whole* bundle at a geometry `material` field. You can also read **one
+property** of an already-declared material and use it as a value anywhere that property's
+type is accepted:
+
+```
+material "src"  { type diffuse  reflect pattern:grad  albedo_default 0.4 }
+
+material "a" { type diffuse  reflect src.reflect          }   # every input at its default
+material "b" { type diffuse  reflect src.reflect(u=v)     }   # ...rebound first
+material "c" { type diffuse  reflect src.reflect(a=1)     }   # ...including `a`
+material "d" { type glossy   roughness other.roughness    }   # a scalar property
+```
+
+The handle is the **slot keyword**. FTSL properties are written with the slot keyword and
+never carry a quoted name (`reflect …`, `roughness …`), so the keyword is the only thing
+that identifies a property — and it is what goes after the dot.
+
+The argument list is the §7.6 argument list, verbatim: same named/positional rules, same
+simultaneous substitution, same memoisation, and the same `a` fallback — with one thing
+worth being explicit about. **An unbound `a` resolves against the SOURCE material's
+`albedo_default`, not the consumer's.** The property carries the source's notion of albedo
+with it, which is what makes `src.reflect` a *value* rather than a fragment that needs the
+reader's context.
+
+| kind | properties |
+|---|---|
+| spectral | `reflect`, `transmit`, `emit`, `ior`, `absorb` |
+| scalar | `roughness`, `film_thickness`, `film_ior`, `groove_spacing`, `yield` |
+
+Cross-slot reads are legal within a kind — `reflect src.transmit` is fine, since what has
+to match is the property's *type*, not its name. Mixing kinds (`reflect src.roughness`) is
+a load error naming both.
+
+A property reference carries **both halves** of the slot it reads: the base spectrum *and*
+its per-hit pattern. If the reading material also writes its own `<slot>_map`, the two are
+**composed** (multiplied) rather than one silently overwriting the other — both spellings
+mean "a multiplier on whatever the slot otherwise evaluates to", so their composition is
+their product.
+
+Three things are refused rather than quietly approximated, because each would otherwise
+hand you a value the source material does not actually use:
+
+* a **record-driven** slot (`reflect` / `roughness` under a `RECORD(driver)`) — the number
+  in the field is a placeholder the per-hit record sampler overwrites;
+* a **texture-bound** slot — a property reference carries a spectrum plus a pattern, and
+  has nowhere to put an image binding;
+* a **pattern-carrying** property read at a slot that cannot apply a per-hit multiplier
+  (e.g. `ior src.reflect`, or a scalar slot with no `_map` sibling).
+
+Records win a name clash: `R.chan` keeps meaning the §5 record reference even if a
+material is also named `R`. `ftrace -checkprop` pins the whole surface — every assert
+compares a reference against the hand-written twin, so nothing is anchored to a literal
+that could drift with the defaults.
 
 ---
 
@@ -596,7 +1074,9 @@ and a Lipschitz bound (`max_gradient`, see §10.3).
   when *defining* a surface and read `0`.
 - **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
   `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args). `noise` is
-  deterministic 3-D value noise in `[0,1]` (same on CPU/GPU).
+  deterministic 3-D value noise in `[0,1]` (same on CPU/GPU). The image sample
+  `tex:<name>(u, v)` (§6.1) is **not** available here — a field expression *defines* a
+  surface, so there is no surface to sample yet; using it is a compile error.
 - **Operators:** `+ - * / % ^` and unary `-`. `^` is `pow` (right-assoc), `%` is
   floating-point modulo. There is **no** `mod()` function — use `%`. Unknown
   identifiers are a hard error.
@@ -679,15 +1159,28 @@ scene to fixed-exposure output (`power` wins if both given). Env lights reject
 
 | subtype | keys (defaults) |
 |---|---|
-| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd` — a rectangle |
+| `area` (default) | `origin` `u` `v` `normal`(from u×v) `spd`, `spd_map` — a rectangle |
 | `collimated` | `dir`(0,0,-1) `origin`(0.5,0.5,0.95) `spd` — a thin pencil beam |
 | `sphere` | `center` `radius`(0.1) `spd` — a glowing ball (also dropped into geometry) |
 | `cylinder` | `center` `axis`(0,1,0) `length`(0.5) `radius`(0.05) `segments`(48) `caps`(off) `spd` — a tube/fluorescent |
 | `spot` | `origin`(0.5,0.99,0.5) `dir`(0,-1,0) `inner_angle`(20°) `outer_angle`(30°) `spd` |
+| `sun` | `elevation`(45°) `azimuth`(0°) *or* `dir`(toward the sun) `angle`(0.53°) `spd` `intensity`(1) |
 | `env` | constant: `spd`. Image-based: `file "sky.hdr"` `rotate`(0°) `intensity`(1) |
 
 `caps on`/`true`/`yes` closes the cylinder (emissive end discs). `spot` angles are
 half-angles in degrees with a smoothstep penumbra between inner and outer.
+
+`sun` is an infinitely-distant directional light — a disc of angular **diameter**
+`angle` degrees whose rays arrive parallel. `spd` is the **perpendicular spectral
+irradiance** (the light hitting a surface facing the sun), so widening `angle` softens
+the penumbra without changing the exposure. `power`/`lumens` are refused (a distant
+light's flux depends on the scene's cross-section, not the light) — use `intensity`.
+Like `spot`/`env`, `sun` is not connectible in modes `D`/`U`, which refuse the scene.
+
+The default rectangular `area` light also accepts an **emission profile** over its
+surface — `spd pattern:<n>` (the pattern *is* the profile, greyscale) or
+`spd_map pattern:<n>` (modulate the authored SPD). Only this subtype and mesh emitters
+can carry one; see §7.2 for why, and for the `power`/`lumens` interaction.
 
 ---
 
@@ -809,15 +1302,18 @@ medium {
   absorption and scattering together), so only the *amount* of fog varies in space,
   not its color.
 - **`density vdb:<path>`** — instead of a formula, sample the density from an imported
-  **NanoVDB** volume. `<path>` is an **unquoted** bareword path to a `.nvdb` file
-  (uncompressed, float grid): `density vdb:scraps/cloud.nvdb`. Convert a `.vdb` to
-  `.nvdb` with OpenVDB's `nanovdb_convert` (or generate a test asset with
-  `scraps/make_nvdb.cpp`). On load the grid is baked into a dense lattice + world→index
-  transform and sampled trilinearly — the *same* sampler on CPU and GPU. The grid's world
-  AABB auto-seeds the medium **bound** and its peak value the **majorant**, so no `bounds`
-  or `density_max` is needed (either still overrides). Values scale `sigma_t` just like the
-  formula form, so dial optical thickness with `sigma_t`. Only float grids; the dense bake
-  is memory-capped (see `known-issues.md`).
+  volume. `<path>` is an **unquoted** bareword path to either a native **OpenVDB** `.vdb`
+  file (read directly by the built-in reader — see §C4/known-issues for the supported blosc
+  codecs) **or** a **NanoVDB** `.nvdb` file (uncompressed, float grid): e.g.
+  `density vdb:scraps/cloud.nvdb` or `density vdb:scraps/_fire.vdb`. The loader dispatches on
+  the file magic, so no manual conversion is needed; `nanovdb_convert` (or `scraps/make_nvdb.cpp`)
+  still produces a `.nvdb` if you prefer. When a file holds **several** grids, the one whose
+  name matches the field is selected — `density vdb:fire.vdb` pulls the grid named `density`.
+  On load the grid is baked into a dense fp16 lattice + world→index transform and sampled
+  trilinearly — the *same* sampler on CPU and GPU. The grid's world AABB auto-seeds the medium
+  **bound** and its peak value the **majorant**, so no `bounds` or `density_max` is needed
+  (either still overrides). Values scale `sigma_t` just like the formula form, so dial optical
+  thickness with `sigma_t`. Only float grids; the dense bake is memory-capped (see `known-issues.md`).
 - **`density_max <v>`** — the delta/ratio-tracking majorant (an upper bound on the
   density over the region). If omitted it is auto-estimated on a 24³ grid over
   `bounds` (×1.3 safety), so a heterogeneous medium needs either a `bounds` box or an
@@ -842,6 +1338,50 @@ to before.
 > P composite treat the medium as a single global homogeneous haze and **ignore** `density`
 > and `bounds` (the renderer warns when you do this). Render heterogeneous fog for those
 > modes with a forward mode instead.
+
+### Volumetric blackbody emission ("fire")
+
+A medium can also **emit** light: give it a `temperature` grid and an `emission` model and
+its hot voxels self-illuminate, so a flame glows with *no external light at all*.
+
+- **`temperature vdb:<path>`** — a second grid (same `.vdb`/`.nvdb` reader as `density`)
+  whose values drive the emission. A multi-grid `.vdb` (the official OpenVDB *fire* sample
+  carries both a `density` soot field and a `temperature` field in one file) is selected
+  **by grid name**: `temperature vdb:fire.vdb` pulls the grid literally named `temperature`
+  while `density vdb:fire.vdb` pulls `density`. The grid's own world AABB auto-seeds the
+  medium bound if none is set.
+- **`emission blackbody`** — make the hot voxels radiate as a Planckian blackbody,
+  hue-shifted by temperature (Wien) at the physical T⁴ magnitude (Stefan–Boltzmann),
+  normalised to a 6500 K / 560 nm reference so magnitudes stay tame. Requires a
+  `temperature` grid (else the loader errors).
+- **`emission_kelvin <K>`** — the temperature (Kelvin) assigned to the *hottest* voxel; the
+  grid is peak-normalised so every voxel's colour scales from this (default **1500**, a warm
+  orange flame). Fire `.vdb` temperature grids store arbitrary *relative* units, so this is
+  what sets the absolute colour temperature.
+- **`emission_scale <s>`** — a plain brightness multiplier on the emitted radiance
+  (default **1**). Dial the flame's overall glow with this.
+
+```
+# Self-illuminating fire — the emissive volume is the only light in the scene.
+medium {
+    sigma_t 8   albedo 0.5   g 0.3
+    density     vdb:fire.vdb        # soot: absorbs / scatters
+    temperature vdb:fire.vdb        # hot field: drives the glow
+    emission    blackbody
+    emission_kelvin 1500
+    emission_scale  4
+}
+```
+
+> **Mode support:** volumetric emission is a **forward-CPU** feature (modes **A/B/C** and the
+> forward layers of V/P). Each emissive medium becomes an isotropic volume emitter: photons are
+> born inside it (position-sampled over the temperature grid's AABB, wavelength-sampled across
+> the band) carrying the local Planck radiance, so the fire both shows directly *and lights the
+> rest of the scene* (soot self-scatter, nearby walls). An emissive volume counts as the scene's
+> light, so a fire needs no separate `light` block. The **GPU** forward tracer does not yet carry
+> the volume-birth branch, so `-device gpu`/`auto` **falls back to the CPU** for any scene with an
+> emissive volume (see `known-issues.md`). The backward reference (R/V) treats media as a single
+> homogeneous haze and never sees the grid, so render fire with a forward mode.
 
 ---
 

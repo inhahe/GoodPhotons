@@ -97,6 +97,35 @@ dataclasses, beat/tempo, wavetable-osc phase machinery if unused).
   (the scribbles3 closed curve, see Layer 3) — everything periodic in `t` ⇒ the
   whole scene loops with no seam.
 - **Deterministic randomness**: a seeded `Rand`/`Noise` leaf (repeatable loops).
+- **Time as a value + retiming** (`signals/retime.py`). Because a `Signal` is a
+  *pure function of a `Clock`*, evaluating one at some other phase is already
+  well-defined — the only thing that ever assumed one-value-per-node-per-frame was
+  the memo. So the whole family comes from two additions:
+  - **`Phase`** — a leaf that returns `clock.t` *as a value*, making time a
+    first-class input rather than an ambient one.
+  - **`Retime(x, when)` / `VecRetime`** — evaluate `x` against
+    `retimed_clock(clock, when)`. Sugar: `freeze(x, at)` (`x` pinned at one phase,
+    and `at` may itself be animated ⇒ a scrubbable hold), `delay(x, dt)`
+    (`x(t−dt)`; wraps on a closed clock so a delayed seamless loop *stays*
+    seamless — negative `dt` looks ahead, which is equally well-defined for a pure
+    function), `warp(x, g)` (`x(g(t))` for a Signal or a plain `f(t)->t'`).
+    `wrap` defaults to *wrap iff `clock.loop`*, keeping an open timeline honest
+    off the end.
+  - **The cache.** `Cache` keys on `(node id, frame)`; a retimed subtree is
+    evaluated at a *different phase inside the same frame*, so its values must not
+    land in that store. Every retime evaluates its child through
+    **`Cache.scope(key)`** — a nested `Cache` keyed `(node id, frame, sample
+    phase)`. Sharing still works *within* one sample point; nothing leaks between
+    sample points or out to the frame. (Chosen over widening the global key, which
+    would have touched every `at()` call site; `scope()` is purely additive and
+    behaviour is unchanged when no retime node exists.)
+  - **Cycles.** Both edges — the retimed subtree *and* the phase driver — are
+    ordinary structural edges reported by `children()`, so `detect_signal_cycle`
+    keeps owning them. A retime is **not** a recurrence: it reads a pure function
+    at another point, it does not read its own past (see the open item below).
+  - The 4-D **time-shear** — a *spatially varying* sample phase — needs a
+    coordinate in scope, so it lives on the spatial tier as `spatial.SigAt`
+    (§ M10.5).
 
 **Open item (documented, not built yet):** *feedback / "elastic" modulators* whose
 output depends on their own past (springs, relaxation). Those need **state across
@@ -139,7 +168,20 @@ value that loops back is caught:
    fixed**. That regular structure is the whole point of a Grid — it is what buys
    the fast **separable N-linear interpolation** — so animating node positions is
    explicitly *not* a Grid feature. If you want moving sample *positions*, that is
-   exactly what **Scatter** is for.
+   exactly what **Scatter** is for. Constructor is `Grid(values, *, shape=None,
+   lo=None, hi=None, channels=None)` (values first; everything else keyword-only).
+   **`shape` is optional** — the *nesting of `values` carries it*: `[[0 1 2][3 4 5]]`
+   is a `(2, 3)` grid, no `shape=` needed. Bare `list`/`tuple`s always mean *axes*;
+   a stored **vector** value is a `vec(...)` (never a bare list), so a nested grid of
+   `vec`s is a vector grid. A flat list is 1-D unless you pass `shape=` to fold it
+   (`Grid([0,1,2,3,4,5], shape=(2,3))`); ragged nesting is rejected (use **Scatter**).
+   **`lo`/`hi` are optional and broadcastable**: `lo=None`→all-zeros, `lo=<scalar>`→broadcast;
+   `hi=None`→a unit-spacing index lattice (`hi[a]=lo[a]+shape[a]-1`, so a coordinate
+   equals a sample index), `hi=<scalar>` (or length-1)→pins **axis 0** and derives every
+   other axis as a **uniform lattice** — one isotropic spacing `h=(hi-lo[0])/(shape[0]-1)`,
+   `hi[a]=lo[a]+h·(shape[a]-1)` (the mathematically pure "single lattice constant" reading,
+   so the interpolated field is geometrically isotropic; a full `hi` tuple gives the exact
+   box, including deliberately anisotropic cells).
 3. **Scatter** — N-D values at arbitrary positions (no lattice). **Both** the
    sample **positions** (each a `VecSignal`) **and** their **values** are modulable,
    so a scatter point can drift *and* pulse; `ScatterField` re-reads every position
@@ -164,7 +206,9 @@ output can feed another modulator — "it's just another function"):
 2. **`GridField`** — grid interpolation → a value anywhere in the volume.
    `interp="linear"` (default, N-linear) or `interp="cubic"` (separable Catmull-Rom
    / tricubic; smoother C1, may overshoot). Boundary phantoms are linearly
-   extrapolated so cubic reproduces linear ramps to the edge.
+   extrapolated so cubic reproduces linear ramps to the edge. Out-of-domain policy
+   `on_outside="clamp"` (default, edge-extend) / `"raise"` / `"wrap"` (periodic fold)
+   / `"extrapolate"` (linearly extend off the boundary cell).
 3. **`ScatterField`** — Shepard inverse-distance interpolation of scatter values
    (robust, C0, flattens toward the mean far from samples).
 3b. **`RbfScatterField`** — radial-basis interpolation (`scipy.interpolate.RBFInterpolator`,
@@ -173,6 +217,16 @@ output can feed another modulator — "it's just another function"):
    convex-hull extrapolation. Rebuilt **only when the sampled positions/values actually
    change** (change-detection cache in `_RbfEngine`): a static field builds once and is
    reused verbatim across the whole animation even as the query moves.
+
+**Datasets are callable as a field of position** (sugar that mirrors ftsl's `n(x,y)`):
+`grid(x, y)` / `scatter(x, y)` — scalar args, `Signal`s, or a single `vec(...)` — builds
+the matching interpolator node (`GridField`/`VecGridField` or `ScatterField`/
+`VecScatterField`), a lazy `Signal` you evaluate with `.at(clock)`; `interp=`/`on_outside=`
+(grid) and `power=`/`eps=` (scatter) pass through. `ds.sample(x, y[, clock=...])` is the
+**eager** form — it builds the field and evaluates it in one call, returning a `float`
+(scalar) or component `tuple` (vector), defaulting to a static frame-0 clock so a
+non-animated dataset reads with no ceremony. (`__call__` lazily imports from `interp` to
+sidestep the `data`↔`interp` cycle, the same pattern `_Transformable.transformed` uses.)
 
 Grids and scatters may hold **vector** values (a `VecSignal` per sample, optionally
 with named `channels=`). `VecGridField` / `VecScatterField` / `VecRbfScatterField`
@@ -244,6 +298,21 @@ Emit an ftsl `isosurface`/`function` block whose input coordinates are pre-trans
 by the Layer-2 slicer (rotate/scale/shear/drift, or true N-D slice if the function
 declares ≥4 inputs). Parameters (frequency, threshold, N-D rotation angles, slice
 anchor) are all `Animatable`.
+
+**Placement (J2).** An `Isosurface` carries an animatable `placement` `VecSignal`
+(default origin). It offsets **both** the coordinate frame (read as `freq*(M·(x −
+placement)) + drift`) **and** the `contained_by` box/sphere, so the container tracks
+the pattern as a blob drifts/tumbles around a scene over the loop (`placement=(0,0,0)`
+stays byte-identical to the un-placed emission). A `Room`/`Group` element gathers
+several placed isosurfaces under one animatable rigid `Affine` frame `P`; on emit it
+folds `P` into each child (frame's rotation into `M` as `M_eff = M·Pᵀ`, its translation
+into the world placement `p_eff = P·p_local + T`), namespaces child names (`room/child`,
+stacking for nested rooms), and emits a box container under a rotating room as the
+conservative world AABB of the rotated local box. The frame must stay **rigid**
+(orthonormal linear part) since the fold assumes `Pᵀ` inverts `P`; seamlessness comes
+from translating on *closed* curves and rotating by integer turns. Factory pattern:
+`make_gyroid(**params) -> Isosurface` + a `Room` driver (see
+`examples/room_of_gyroids.py`).
 
 ### 7c. Function-driven materials
 Reuse Good Photons' existing material-props-by-function (reflectance/color/IOR/etc.
@@ -380,8 +449,12 @@ tools/loom/
     ftsl_emit.py            snapshot → .ftsl text (new)
     drive.py                render_range, viewer, assembly, seed (new)
     mcubes.py               marching cubes: bake a field to a mesh (M7)
+    vdbio.py                bake a field to a dense grid + write/read .vdb, read .nvdb (E4)
+    axes.py                 axis-typed signals: broadcast/pin/mod + sample/reduce + lower-to-value-site (E5)
+    anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe (E2 s1–2)
     xvideo.py               two-pass spacetime transform video (M11)
     preview.py              resident ftrace -serve preview client (M12)
+    viewer.py               native-viewer contract: build() loader + scene-introspection sidecar (F1) + .ftsl source emission (F7) + live re-introspection/emit server (F4/F7)
   examples/                 runnable scripts (ribbon loop, gyroid slice, scribbles3-in-3D)
   tests/                    unit tests (cycle detection, closed-curve seamlessness, slicer)
 ```
@@ -506,6 +579,232 @@ tools/loom/
   accuracy, 2-manifold edges, adaptive==dense, fewer evals, empty-box, callable+SpatialExpr,
   morphing field, IsoMesh emit/static-cache/roots). Demo: `examples/mesh_bake.py` (a breathing
   smooth-min metaball union baked per frame; still validated in ftrace).
+- **E4 — Volume `.vdb` write *and* read.** ✅ done (`loom/vdbio.py`). Bake any loom field to a
+  dense lattice and serialise it as a **loom-native OpenVDB `.vdb`** grid that ftrace ingests
+  directly (`density vdb:<path>` / `temperature vdb:<path>`), and read back both loom's own
+  output and a useful slice of what real DCC tools emit — with **no OpenVDB/NanoVDB dependency**
+  on either end. Tree is `Tree_float_5_4_3` (positive voxels vectorised into 8³ leaves under
+  Internal<4>/<5>, empty leaves dropped).
+  - **Write API:** `write_vdb(path, [VolumeGrid(name, values, box|transform=…), …])`,
+    `bake_field(field, box, res)` (field/isosurface/callable → dense `<f4` + world box, reusing
+    the `mcubes` samplers), `write_volume(path, *, box, res, **fields)` (several named fields
+    over one box/res, e.g. a `density`+`temperature` fire pair). Codecs: `COMPRESS_ACTIVE_MASK`
+    always, optionally `half=` (16-bit, `_HalfFloat` grid type), `zip=` (interchange only —
+    ftrace has no ZIP) or `blosc=` (DCC-standard, and on ftrace's render path). Defaults are
+    **byte-for-byte** the original ACTIVE_MASK/float32 output (test-asserted).
+  - **Read API — two entry points, because the return type is the whole question.**
+    `read_vdb(path)` → `{name: (array, box6)}` as always; `read_vdb_grids(path)` →
+    `{name: ReadGrid}` carrying the index-space array, its `index_lo`, the full
+    `VdbTransform` (index→world `A·i + t`, mirroring ftrace's `readTransform`) and the grid
+    `background`.
+  - **NanoVDB `.nvdb` read** (read-only; loom has no NanoVDB writer). `read_nvdb(path)` handles
+    v32.6 float `5_4_3` in both accepted layouts — a `FileHeader` multi-grid container and a bare
+    raw grid buffer — and `read_vdb_grids` **dispatches on magic**, so a caller wanting "read
+    whatever volume this is" needn't know which it holds. A `.nvdb` is a *memory image*, not a
+    stream: 32-byte-aligned PODs linked by signed byte offsets (`GridData / TreeData / RootData+
+    tiles / Internal<5> / Internal<4> / Leaf<3>`), so the reader indexes at fixed offsets and
+    walks. It mirrors ftrace's `src/vdbgrid.cpp` and therefore produces a **faithful dense bake**
+    — inactive voxels take `background`, every non-child tile is expanded — deliberately unlike
+    `read_vdb`, which keeps only active-positive voxels because it round-trips loom's own writer.
+    That difference is load-bearing: `LeafData::getValue` ignores the value mask and
+    `InternalNode::getValue` returns a tile's value active-or-not, so a mask-filtered read would
+    drop real data (the `cloud.nvdb` sample carries 10 active lower-level tiles).
+  - **Transforms.** All of OpenVDB's linear maps are decoded: the diagonal ones (Scale /
+    Translate / UniformScale and combinations) and the general `AffineMap`/`UnitaryMap`.
+    A **rotation costs the samples nothing** — an OpenVDB tree is a regular lattice in *index*
+    space regardless, and the map only says where that lattice sits — so the dense array is
+    unaffected and only the axis-aligned `box6` becomes inexpressible. Hence `read_vdb` still
+    **rejects** a rotated grid (an approximate box would silently misplace every voxel, the
+    worst failure mode) while `read_vdb_grids` reads it fine. `VolumeGrid(…, transform=…)`
+    writes one, as an `AffineMap`. `is_diagonal` compares each off-diagonal against its own
+    row's scale, so it is unit-free and tolerates the ~1e-17 crumbs a DCC leaves when it
+    composes a 90°/180° rotation in floating point.
+  - **Tests:** `tests/test_vdbio.py` (49) — bit-exact round-trip, world-box↔linspace positions,
+    multi-grid named selection, sparse-empty-leaf drop, duplicate-name rejection, bake+write,
+    each codec, four real third-party sample files, the rotated set (round-trip through
+    `AffineMap`, `read_vdb` refusal, diagonal-`AffineMap` still yielding a box, and the two read
+    entry points agreeing on diagonal files), and the NanoVDB set against the real
+    `scraps/cloud.nvdb` — header metadata, `RootData` statistics, an **independent**
+    breadth-first leaf walk (via `mNodeOffset[0]`, not the reader's child-offset descent) checking
+    per-leaf min/max and every active voxel's landing index, the root-tile stride, the raw-buffer
+    layout, magic dispatch, and the three rejections (non-NanoVDB, compressed, non-float). All
+    **11 layout-constant mutations are caught** — two initially were not, which is what drove the
+    independent-walk and tile-stride tests. Cross-validated through ftrace on CPU+GPU
+    (`scraps/make_loom_vdb.py` → `scraps/loom_smoke.vdb` via `scraps/loom_vdb.ftsl`; sparse
+    device path `1000/1000 bricks active`, energy `sum/emitted=1.000000`), and the rotated path
+    by rendering one asymmetric volume under a diagonal vs a 45°-about-Y map
+    (`scraps/vdb_rot_make.py`). The NanoVDB path was likewise checked end-to-end
+    (`scraps/nvdb_roundtrip.py`): `cloud.nvdb` read by loom, re-emitted as a `.vdb`, and rendered
+    in the same scene through ftrace's *independent* OpenVDB reader — means agree to 0.007%, and
+    the per-pixel diff halves at 4× photons (8.65% → 4.35%), i.e. √N noise from the diverged RNG
+    streams rather than a volume difference.
+  - **Volume transforms — a volume is a *term*, not an API.** `loom.spatial.VolumeField` is the
+    3-D twin of the `Image` leaf: a scalar `SpatialExpr` whose value at a world point is an
+    imported grid's trilinearly-interpolated density (`ReadGrid.sample`, a port of ftrace's
+    `VdbGrid::sample`). That one decision is what makes E4's *read → transform → write* "basis
+    workflow" fall out of machinery that already existed — value ops and modulation are the
+    spatial algebra, warping is the rebindable `x`/`y`/`z` children (as `Image` has `u`/`v`),
+    meshing is `mcubes` (it takes any callable), and resampling is `bake_field`. Named
+    `VolumeField` because `loom.scene.Volume` is already the `medium { }` scene element.
+    - **Placement is lossless.** `translated`/`scaled`/`rotated`/`fitted` compose a world-space
+      affine onto the grid's own index→world map (`VdbTransform.premultiplied`: `A' = M·A`,
+      `t' = M·t + d`) instead of resampling — a VDB tree is a regular lattice in *index* space, so
+      moving it costs nothing and touches no voxel (`v.rotated(37).read_grid.values is g.values`).
+      Interpolation error enters exactly once, at the final bake: "discretize last", applied to
+      volumes. Test-asserted both ways — 4×90°, 360°, translate-and-back and scale-and-back all
+      reproduce the original array (~1e-15), while a single 37° rotation must *change* the field
+      (so the round-trips can't pass vacuously) and conserve mass to 5%.
+    - **`emit()` deliberately raises.** ftrace's pattern VM has no volume-sampling opcode, so
+      there is no honest ftsl string; a `VolumeField` is bake-only and the error names
+      `write_volume`. It is one of the two single-backend leaves in `spatial.py` (the
+      other is `SigAt`, below).
+    - Support added alongside: `VdbTransform.inverse_linear`/`to_index`/`premultiplied`,
+      `ReadGrid.world_box` (AABB of the eight index-box corners — defined for a rotated grid,
+      unlike `.box`) and `ReadGrid.with_transform` (shares the array).
+    - **Found an ftrace bug** (fixed in v0.84.2): `VdbGrid::sample` and its CUDA twin clamped the
+      stencil *indices* but not the interpolation *fraction*, so the half-voxel shell below index
+      0 was dominated by the **second** voxel. Caught because a 360° rotation — necessarily a
+      no-op — shifted the baked field by 0.32. See `known-issues.md`.
+  - **Still open:** **Vec3** grids (blocked — no real vec3 file to validate against, and no
+    consumer: ftrace is scalar-float-only); sparse *storage* as a backing, and transforms authored
+    directly against it (now a storage optimisation, not a missing capability — reads of sparse
+    files and every transform on them already work through the dense path).
+    Writing `.nvdb` is deliberately not built (ftrace reads loom's `.vdb` directly).
+- **E5 (foundation) — Axis-typed signals (one influence model).** ✅ done (`loom/axes.py`). Resolves E5's
+  deferred open-q (node taxonomy + axis-set representation) with a small additive layer *on top of* the
+  scalar `Signal` DAG (no churn; 891 prior tests stay green). An `AxSignal` is a pure function of a **point**
+  (`dict[str,float]`, axis→coord) carrying `.axes` (`frozenset[str]`, its free variables). Composition unions
+  axes ⇒ **broadcast** on unshared axes is implicit (a `{t}` node ignores a point's `s`), **pointwise** on
+  shared ones, and the illegal cross-`t` op is *inexpressible* (no detector, no spatial/temporal type split).
+  Nodes: `Ax`/`AConst`/`Lift` (bridge a legacy `{t}` `Signal`) leaves; `AFn`+arithmetic; `Sample(fn,arg)`
+  (continuous `curve(t)`) + `.comp(i)` (`curve(t).y`) + `select(items,i)` (discrete `R.chan[i]`); the **only**
+  cross-axis node `Reduce(body,axis,samples,op)` (`axes = body.axes − {axis}`, explicit); and the pin/mod edge
+  model `Target(kind,[Binding(source,mode,gain)],base)` with target-declared neutrals (`ADDITIVE` 0 / `GAIN` 1
+  / `BIPOLAR` ½). Reuses `alloc_id`/`children`/`detect_signal_cycle`/`walk`. **Follow-up 1 done** — the
+  sample grammar now folds loom's own clock-parameterized producers: `CurveSample(curve,arg,*,clock_axis='t')`
+  binds a `LoopCurve`/`FieldCurve`/`TrackedCurve`'s param axis *and* threads the clock (so an animated spatial
+  curve is honestly `{s,t}`, a static one broadcasts over `t`); `RecordSample(record,channel,arg)` binds a
+  `Record`'s static driver axis (`{driver}`, no clock); and `sample(obj,arg,…)` dispatches by duck-type. Both
+  thread the loom node into the axis-layer `walk` like `Lift`.
+  **Follow-up 2 done — scene value-sites route through `Target`.** `Lower`/`LowerVec` are the exact inverse of
+  `Lift`: they bind an `AxSignal` back down to a clock-parameterized `Signal`/`VecSignal`, which is what every
+  loom scene value-site (`Sphere.radius`, `Isosurface.iso`, a material colour, a camera position, …) consumes —
+  so a `Target` reaches a scene variable *through here*, and E5's influence model becomes the authoring model.
+  The site's clock axis (default `'t'`) is fed `clock.t`; every **other** axis the node reads must be pinned via
+  `bind={'s': <coord or Signal>}` — a constant reads one arclength of a spatial curve, a `Signal` sweeps along
+  it over the loop. Records-5a's scope rule ("a node's free variables ⊆ the axes in scope here") is enforced at
+  **construction**, naming the unbound axes, rather than failing deep inside a render. `lower(node)` picks the
+  scalar/vector form by probing at `t=0`; `LowerVec` evaluates the axis graph *once* per frame (the per-component
+  `Lower` nodes still exist so `walk`/`detect_signal_cycle` and ordinary `VecSignal` math see a normal vector).
+  Routing is **one memoised hook**, `signals.core.lower_axsignal`, consumed by `as_signal`, `VecSignal.of`,
+  `ftsl_emit.site_node` (→ `num`/`vecn`/`value_token`) and `Element.roots()` — so no element constructor changed,
+  and *every* value-site accepts an axis node uniformly. Memoising the lowered node on the axis node is required,
+  not cosmetic: node identity is the per-frame `Cache` key **and** `roots()` must hand the cycle detector the very
+  node emission will evaluate. Sugar: `mod(src, gain)`/`pin(src, gain)` build `Binding`s, `Binding` coerces its
+  source via `as_ax` (which now also `Lift`s a legacy `Signal`), and a `GAIN` target with a negative source now
+  raises a domain error instead of silently producing a complex number. Tests: `tests/test_axes.py` (55).
+  **Follow-up 3 done — the on-disk projection of axis annotations.** The resolution of the deferred open-q's
+  second half is a *decision plus an implementation*. **`.ftsl` carries no axis annotation, deliberately**: it
+  is a **bound**, per-frame projection — by emit time the clock axis is fixed to `clock.t` and every other axis
+  pinned by `bind=`, so an `{s,t}` node has already collapsed to a number. ftrace renders one frame and has no
+  notion of an axis; annotating its language would make `.ftsl` an animation format and move the animation
+  authority out of loom (core ideas 2 and 5). The on-disk projection that *does* need the annotation is the
+  **viewer introspection sidecar** (F1/F5) — what an editor reads. `loom.axes.axis_annotation(node)` and
+  `binding_edges(target)` are the model's own serialisers (the model owns its projection; `loom.viewer` just
+  merges the dicts), feeding sidecar **v2**: a DAG node carries its free `axes`, plus `target_kind`/`neutral`
+  (a `Target`'s declared quantity), `reduces`/`reduce_op`/`samples` (the one cross-axis node), `component` /
+  `channel` / `leaf_axis`, and — on the two bridge nodes — `site`, `clock_axis`, `bound_axes` and `source_axes`
+  (the value-site's whole axis scope). An edge out of a `Target` carries the `mode` (`pin`/`mod`) and `gain`
+  that a plain child list *cannot* express (sources hang off `Binding` records, so a generic walk saw only
+  anonymous inputs), and is named `mod[i]`/`pin[i]`. `src/viewer_gui.cpp`'s F5 panel renders all of it — an
+  axis chip (`axes {s,t}`), a one-line kind/scope caption, and `mod[0] x0.8` on the input pin. Purely additive:
+  a v1 reader ignores the new keys. Tests: 8 in `tests/test_viewer.py`. **E5 is complete.**
+- **E2 (slices 1–2) — N-D curve → scene-variable go-between.** ✅ done (`loom/anim.py`). The channel-a config
+  model + JSON sidecar + channel-b value fan-out — the pure-Python core of the animation go-between (resolves
+  E2 OPEN Q1/Q2: config in a loom struct with a serialized sidecar; go-between = loom). `CurveDrive(dims,
+  points, bindings, mode, closed)` holds the dimension count, the static starting control points (point
+  *modulation is out* — the editor owns the time axis), and `ChannelBinding(channel, target, mode, gain,
+  kind)` associations whose `mode`/`gain`/`kind` are exactly the E5 pin/mod edge attributes (so E2's
+  value-routing *is* the E5 influence model — the "E5 unifies E2/E4" tie-in). Sidecar `save`/`load` is
+  versioned JSON with an **atomic** temp+`os.replace` write ("scene proposes, editor disposes" round-trip).
+  `sample(t)` is a uniform Catmull-Rom (loom-side preview; ftrace's editor is the live sampling authority);
+  `apply(values, bases)`/`frame(t)` fan the sampled channels out to `{target: value}`, composing
+  multi-channel targets through an E5 `Target` of the declared kind.
+  **Slice 2** resolves "how a binding target names a real scene value-site" via **named animatable slots**
+  (option b, `RefSignal`-style): a `Slot(name, default)` *is* a `Signal`, so dropping it in any signal-valued
+  scene param means the scene's own `roots()`/`walk`/`emit` discovers and bakes it — zero emit-path change.
+  `collect_slots(scene)` groups slots by name; `SceneDriver(scene, drive, bases, strict)` fans a `CurveDrive`
+  out into the named slots (`set_values` pushes, `emit_frame` emits with a **fresh** `Cache` since a slot's
+  value is pushed, not clock-derived) and its `default` doubles as the target's `mod` base. `LiveSession` +
+  `serve_live(session, in, out)` are the editor↔loom **live-value channel**: a newline-delimited-JSON stdio
+  loop (the `PreviewServer` precedent, editor→loom direction) with `frame`/`config`/`bindings`/`points`/
+  `save`/`quit` commands, each a pure `dict`→`dict` `handle()` so the protocol is unit-testable without a
+  pipe. Tests: `tests/test_anim.py` (19) + `tests/test_anim_live.py` (23).
+  Remaining slice: (3) the interactive ftrace `camera_curve` **editor** generalization (seed from / write
+  back the sidecar, drive arbitrary scene variables) — the C++ part, best done with the user present.
+- **F1 (native viewer — the loom↔viewer data contract).** ✅ done (`loom/viewer.py`). The §F native viewer is
+  a C++ process; loom is Python, so (per the locked architecture) loom exposes a scene via a **`build()`
+  load contract** and a **JSON introspection sidecar**, not in-process sharing. `build(clock=None, **params)
+  -> Scene` returns a *fresh* Scene per call (side-effect-free at import — no module-level `scene`), so the
+  viewer re-derives geometry live (scrub/param/re-tessellate). `load_build(path)` imports a scene file and
+  returns its `build`; `ViewerModel(build, **params)` (or `.from_file`) wraps it — `.scene(clock)` builds,
+  `.declared_params()` surfaces the build's keyword defaults as UI controls, `.introspect(clock)` /
+  `.save_sidecar` produce the sidecar. `introspect(scene)` enumerates: `objects` (geometry elements, Groups
+  recursed, each linking the `datasets` it references by node id), `datasets` (every `PointPath`/
+  `TrackedPath`/`Grid`/`Scatter` reachable — dim/shape/channels/etc.), minimal `camera`/`lights`, and the
+  modulator `dag` (`nodes` = id+op+label, `edges` = child→parent; per-edge **param** labels are §F5's job).
+  Tests: `tests/test_viewer.py` (22, incl. the F2-slice-A curve geometry). **F2 slice A (loom)** extends the
+  sidecar so every path/tracked_path dataset carries real geometry: `control_points` (animated control points
+  at the frame's clock) + a display `polyline` (96 samples through the engine's own `eval_curve`, closed
+  spines wrapping). **F2 is complete:** the C++ host is a **`-viewer <sidecar.json>`** mode of the ftrace
+  binary (Win32 + Direct3D 11 + Dear ImGui, `src/viewer_gui.cpp`): it reads the sidecar with ftrace's
+  vendored `minijson` and shows Scene/Objects/Datasets panels + the full N-D curve pane — a **3-of-N dim
+  picker** (view-only re-projection over the curve's full N-D coordinates), **index markers** along the
+  curve, and **stereo** (mono / red-cyan anaglyph / wall-eyed L|R / cross-eyed R|L, with an eye-separation
+  slider). **F3 is complete:** `tracked_path` datasets now also emit a `channels` array (each track
+  sampled along the same curve parameter as the polyline), and the viewer compiles vendored **ImPlot** to
+  draw **scroll-locked strip charts** below the 3-D pane — one per curve dimension + one per channel
+  component, sharing a linked X axis and a draggable index line wired to the 3-D index dot. **F5 is
+  complete:** `_describe_dag` tags every edge with the destination `param` it feeds (identity-matched to
+  the attribute the child is stored under), and the viewer compiles vendored **imnodes** to draw a
+  **Modulator DAG** panel — nodes titled `<op> #<id>`, one labelled input pin per incoming edge, longest-
+  path layering from leaves to driven params. The layering **wraps each level into sub-columns** against
+  the pane's available height (measured from the node rects imnodes actually produced — read back via
+  `GetNodeDimensions()` after `EndNodeEditor()` and re-wrapped once), so a graph with dozens of leaves
+  doesn't run off the bottom; and since this imnodes build has no zoom, the panel supplies one by scaling
+  the ImGui font size + `NodePadding` (wheel 15–300%, `fit` = iterative width-fit solve, `100%`,
+  `re-layout`, and a full-window `maximize` / Esc mode). **F6 is complete:** `_describe_dataset` now emits real field
+  geometry — scatter `points`+`values`, grid `axes`+flat C-order `values` (scalar values normalised to
+  1-lists) — and the viewer's **Fields tab** (`collectFields`/`drawFieldPane`) renders those sample points
+  in the shared 3-D orbit view (grid node positions reconstructed from axes+shape in C-order), with 3-of-N
+  dim pickers, a heatmap-channel / ch0·1·2→RGB colour selector, click-to-inspect, and per-extra-dim slice
+  sliders for N-D grids. **F4 core is complete:** `_describe_element` emits each `SweptMesh`'s tessellated
+  `mesh` (`vertices`/`faces`/`uvs`, from `sweep_rings`+`skin_rings` at the clock), and the viewer's
+  **Meshes tab** (`collectMeshes`/`drawMeshPane`) draws it as a shaded, painter's-depth-sorted triangle
+  surface with two-sided lambert lighting, a wireframe overlay, and grey/per-object/UV-checker/**texture**
+  colouring (orbiting is view-only). **F4 textures are complete:** `introspect` emits a `materials` list
+  (type/props + the resolved `texture` each binds) and a `textures` list — image skins as
+  `file`/`encoding`/`filter`/`wrap`, formula skins as their three `r`/`g`/`b` UV expressions + `res`.
+  `_describe_texture` **bakes** a formula channel to its ftsl source at the clock (`ProcTexture._chan_str`
+  + an `EmitCtx`), because a material *bundle* whose colour slot is a `SpatialExpr` lowers to a
+  `ProcTexture` holding live expression objects — those are neither JSON-serialisable (the sidecar dump
+  used to die outright) nor compilable by the viewer. In C++, `SkinLib` decodes each texture into a D3D11
+  SRV — images through ftrace's own `Texture::load`, formulas baked on the CPU through ftrace's own
+  `compilePatternExpr`/`patternEval` (with a `PatTexScope` so `tex:<name>(u,v)` resolves against images
+  declared above, exactly as in `FtslLoader::addTexture`) — and the Meshes tab draws each triangle at its
+  interpolated per-vertex UVs. Unusable skins degrade to grey with a printed reason. Still deferred:
+  **off-thread re-tessellation when rotating into a parameter dim** (needs the live viewer↔loom channel,
+  since the static sidecar can't re-bake geometry).
+  **F7's MC-mesh fallback is complete:** `_describe_element` bakes each `IsoMesh`'s field to a
+  marching-cubes mesh (`_iso_mesh_geometry`→`mcubes.mesh_field`) into the object's `mesh` key, so the
+  existing Meshes tab draws the isosurface with no C++ change. **F7's primary path is also complete:**
+  `save_sidecar` now emits the scene's `.ftsl` beside the JSON (via `scene.emit`) and records its path
+  under a `source` key (`emit_source=True` by default); `ViewerSession` gains an **`emit`** command that
+  bakes the scene to `.ftsl` for a given clock/params. In C++ the viewer parses that `.ftsl` with ftrace's
+  own `ftsl::load` and adds a **Render tab** that raymarches the real field in-process via
+  `renderIsoPreviewCuda` (the `-raster-gpu` sphere-tracer — no tessellation), driven by an orbit camera and
+  blitted into a D3D11 texture. This closes the last big open §F piece; the `emit` command also lays the
+  groundwork for F4 off-thread re-tessellation over the live channel.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a
@@ -562,6 +861,99 @@ tools/loom/
   semantics vs ftrace ops, `uses_time`/`time_signals`, one expr → both backends, static
   bake, iso integration). Demo: `examples/shared_pattern.py` (a drifting gyroid as both a
   2-D loop and a 3-D isosurface loop).
+  - **J3b item 3 — Surface leaf family + binding-by-substitution.** ✅ (spatial.py
+    foundation). The coordinate leaf `_Coord` is generalised to a public `Surface` family:
+    `X`/`Y`/`Z` (axes 0/1/2, both backends) plus the *surface* params `U`/`V` (the ftrace
+    pattern vars `u`/`v` — **emit-only**, no numpy twin) and the material *albedo* `A` (a
+    pure binding placeholder — ftrace's VM has no `a` variable, so emitting a bare `A`
+    raises; it must be substituted or defaulted first). `SpatialExpr.free_inputs()` reports
+    the bindable named leaves (`{u,v,a}`; `include_coords=True` adds `x/y/z`) and
+    `SpatialExpr.substitute({name: expr})` rewrites them by name (functional — the original
+    tree is untouched). This is the substrate for **materials-as-bundles** (`gold(u=v, a=1)`
+    / `(a=x*.5)` authoring): loom resolves every binding to a concrete field in real ftrace
+    variables **at emit**, so it never writes literal bundle syntax and every intermediate
+    stays renderable — needing **zero** ftrace C++ changes. Tests: `test_spatial.py`
+    (uv-emit, no-numpy-twin, albedo-raises-until-bound, free-inputs, substitute rewrite/
+    partial/nested).
+  - **J3b item 3 — materials-as-bundles.** ✅ (`scene.py`). A `Material` property may now
+    be a `SpatialExpr` field (scalar) or a tuple of them (a colour), making the material a
+    **parameterized bundle**: `Material.free_inputs()` is the union of its fields' bindable
+    leaves and `mat(u=v, a=1)` / `mat(expr)` (positional, sole free input) **applies** it by
+    substituting across every field — pure functional rewrite, so a bound material is an
+    ordinary one whose fields are concrete formulas. Unbound `u`/`v` stay the surface params;
+    an unbound albedo `A` resolves to the material's `albedo_default`. Adding a bundle to a
+    `Scene` **expands** each field to a renderable companion (`Material.expand`): a colour
+    slot (`reflect`/`transmit`/`emit`/…) → a `ProcTexture` baked over surface `u`/`v` (now
+    accepts `SpatialExpr` channels, re-baked per frame with time coefficients folded in, its
+    `roots()` surfacing them for cycle-check); a scalar slot → a live `FuncPattern`. The two
+    slot kinds have genuinely different coordinate reach, and only the colour one is
+    restricted: a colour skin *bakes* into an image indexed by `u`/`v`, so world `x/y/z` in a
+    colour field raises. A scalar slot stays live and ftrace evaluates it via `patCtxFromHit`
+    (`src/scene.h`), which supplies world position, the field value, the hit normal **and**
+    surface `u`/`v` — so a scalar field may mix all of them (`scenes/uv_native.ftsl` ships
+    `weight_map pattern:uvcheck8` over `floor(u*8)`). Validated: a bundle scene emits
+    byte-for-byte renderable `.ftsl` that ftrace parses & renders identically to the
+    hand-authored `func_skin` path. Tests: `tests/test_material_bundle.py` (free-inputs union,
+    keyword/positional/partial application, arbitrary-expr RHS, colour→ProcTexture /
+    scalar→FuncPattern lowering, colour-slot world-coordinate rejection, scalar-slot u/v
+    acceptance, Scene expansion ordering, animated re-bake, roots).
+  - **J3b item 3(b) — `Image`, a photograph as a TERM in a formula.** ✅ (`spatial.py`
+    + `scene.py`, and a new ftrace opcode). The complement of `skin()`: `skin()` binds a
+    whole image to a material slot, whereas `Image("bark.png")` is a scalar *leaf* that
+    composes — `0.05 + 0.9 * Image("grime.png") * (0.5 + 0.5*sin(30*X))`. This is the one
+    part of item 3 that was **not** zero-cost on the renderer: no pattern-VM op could
+    sample a texture, so emitting one would have produced un-renderable `.ftsl`. Added
+    `PatOp::Tex` (`src/pattern.h`), spelled `tex:<name>(u, v)`, with the texture index
+    carried in the existing `PatNode::a` double (the trick `PatOp::PovFn` already uses),
+    so `PatNode` still uploads to the device verbatim. `pattern.h` stays free of
+    `texture.h` — sampling goes through an opaque `PatCtx::texFn` hook that `scene.h`
+    installs (`bindPatTex`). Compile-time resolution is opt-in per value site via a
+    `PatTexScope`, granted only where a shading context exists (pattern blocks, record
+    stops/drivers/overrides, procedural texture channels), so `tex:` in a field formula
+    or medium program is a **clear compile error, never a silent zero**. GPU twin in
+    `dPatternEval` (`render_cuda.cu`) over the existing `dTexScalarAt`.
+    On the loom side: `Image`'s `u`/`v` are ordinary sub-expressions (so the lookup is
+    warpable and `substitute` reaches into it, which is how a bundle's `u=`/`v=` binding
+    flows in); `_auto_name()` derives a deterministic `img_<stem>_<hash>` from path +
+    sampler settings, so identical images share one declaration and differing samplers
+    don't collide; `SpatialExpr.image_textures()` collects the needed `Texture` blocks
+    and `Scene.add` declares them automatically (an explicit declaration of the same name
+    wins in either order) — otherwise every image term would emit a dangling reference.
+    `eval_np` is a faithful port of `Texture::sampleRgb`/`scalarAt` (half-texel offset,
+    `v`-flip, repeat/clamp/mirror, mean-of-linear-RGB), so the two-backend rule holds.
+    `encoding` defaults to `"linear"`, not `"srgb"`: a value used as a *number* wants the
+    stored levels. Validated end-to-end: the loom-emitted `.ftsl` renders **bit-for-bit
+    identically** to the hand-authored `scraps/texop_pattern.ftsl`, and the composed case
+    (`scraps/loom_image_mixed.ftsl`) matches CPU↔GPU to MC noise.
+    Tests: `tests/test_image_term.py` (emit shape, warped/rebound coordinates, auto-name
+    determinism & separation, `image_textures` dedup incl. nested leaves, Scene
+    auto-declaration + ordering + explicit-wins, scalar-slot acceptance, and `eval_np`
+    nearest/bilinear/wrap/sRGB/shape against hand-computed values).
+  - **Retime / 4-D time-shear — `SigAt`.** ✅ (`spatial.py`, on top of
+    `signals/retime.py`, § 4). The spatial half of retiming, and the reason the whole
+    feature was worth building. A bare `Signal` coerced into the spatial algebra becomes
+    `_Sig`, which bakes **one number per frame** — the entire field shares the modulator's
+    current value. `SigAt(sig, when)` instead reads the modulator at a phase that is
+    *itself a field*, so different points of space see different **moments**:
+    `SigAt(Sine(cycles=3), T - X/4.0)` is a wave whose phase lags with distance. It is an
+    ordinary `SpatialExpr` leaf, so warping, `substitute`, meshing (`mesh_field`) and
+    baking (`bake_field`/`write_volume`) all apply unchanged.
+    - **Single-backend, deliberately.** `emit()` raises: ftrace evaluates a pattern per hit
+      and has no access to loom's modulator DAG, so a per-point signal read has no ftsl
+      spelling — and baking one number would silently *drop the shear*, which is the whole
+      effect. The error names the discretise-then-render route (`mesh_field` /
+      `bake_field` / `write_volume`), the same workflow `VolumeField` uses.
+    - **Cost is bounded and stated.** `eval_np` groups the phase field with
+      `np.unique(..., return_inverse=True)`, so the signal graph is evaluated once per
+      *distinct* phase, each inside its own `Cache.scope`; `quantize=k` snaps phases to `k`
+      levels and caps it at `k`. (Wrapped phases that coincide share a scope — on a closed
+      clock `t=1` and `t=0` are one sample.)
+    - Tests: `tests/test_retime.py` (27) — shear-vs-flat anti-vacuity, constant phase ≡ a
+      plain coefficient, quantize call-counts, loop seamlessness, emit-raises, `_is_time`
+      /`_rebuild`, non-finite phase field, and **cache non-poisoning** for a *sub-frame*
+      shear where every sample lands on `clock.frame` (the only case a frame-keyed memo
+      cannot survive). Mutation-checked: degrading `Cache.scope` to the parent cache, or
+      dropping the driver edge from `children()`, each fails a test.
 - **M11 — "transform video" script.** ✅ done (`loom/xvideo.py`). Separate two-pass
   offline tool (§11.8), kept out of the streaming emitter: **materialize** a clip into a
   4-D block `(T,H,W,C)` (`Clip.from_array` / `.from_frames` / `.from_canvas`), **transform**

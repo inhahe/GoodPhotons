@@ -25,20 +25,47 @@ add_executable(ftrace
     src/stb_image_impl.cpp   # compiles vendored stb_image (texture load) + stb_image_write (PNG/JPG output) once
     src/livewindow.cpp       # -window live-preview OS window (Win32 GDI; no-op stub off Windows)
     src/vdbgrid.cpp          # confines vendored NanoVDB.h to one TU; bakes .nvdb -> dense fog grid
+    src/vdb_openvdb.cpp      # native OpenVDB .vdb reader (no OpenVDB/NanoVDB dep); bakes .vdb -> dense fog grid
+    src/third_party/lz4.c    # vendored single-file LZ4 (BSD) for blosc LZ4 decode in the .vdb reader
     src/fbx_load.cpp         # FBX mesh loader (bridge over vendored ufbx); confines ufbx.h to one TU
     src/third_party/ufbx.c   # vendored single-file FBX parser (MIT / public-domain), compiled as C
     src/gpda/tokenized.cpp        # vendored GPDA parser engine (J3c grammar-validation shim)
     src/gpda/ftsl_scene.gen.cpp   # GENERATED (loom.grammar.emit_cpp): shared .ftsl grammar graph + lexer table
+    src/viewer_gui.cpp            # -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
+    # --- vendored Dear ImGui core + Win32/D3D11 backends (the -viewer GUI) ---
+    src/third_party/imgui/imgui.cpp
+    src/third_party/imgui/imgui_draw.cpp
+    src/third_party/imgui/imgui_tables.cpp
+    src/third_party/imgui/imgui_widgets.cpp
+    src/third_party/imgui/backends/imgui_impl_win32.cpp
+    src/third_party/imgui/backends/imgui_impl_dx11.cpp
+    # --- vendored ImPlot (F3 strip charts), built on ImGui ---
+    src/third_party/implot/implot.cpp
+    src/third_party/implot/implot_items.cpp
+    # --- vendored imnodes (F5 modulator-DAG panel), built on ImGui ---
+    src/third_party/imnodes/imnodes.cpp
 )
-target_include_directories(ftrace PRIVATE src src/gpda)
+target_include_directories(ftrace PRIVATE src src/gpda src/third_party/imgui src/third_party/implot src/third_party/imnodes)
 
 # The vendored GPDA engine + generated grammar are third-party/generated code;
 # don't hold them to ftrace's /W4 /permissive- bar (keeps the build-warning
 # signal about our own code).
 if(MSVC)
     set_source_files_properties(
-        src/gpda/tokenized.cpp src/gpda/ftsl_scene.gen.cpp
+        src/gpda/tokenized.cpp src/gpda/ftsl_scene.gen.cpp src/third_party/lz4.c
+        src/third_party/imgui/imgui.cpp src/third_party/imgui/imgui_draw.cpp
+        src/third_party/imgui/imgui_tables.cpp src/third_party/imgui/imgui_widgets.cpp
+        src/third_party/imgui/backends/imgui_impl_win32.cpp
+        src/third_party/imgui/backends/imgui_impl_dx11.cpp
+        src/third_party/implot/implot.cpp src/third_party/implot/implot_items.cpp
+        src/third_party/imnodes/imnodes.cpp
         PROPERTIES COMPILE_OPTIONS "/W0")
+endif()
+
+# The -viewer GUI links Direct3D 11 (+ DXGI). These import libs ship with the
+# Windows SDK, so no extra dependency — just name them on Windows.
+if(WIN32)
+    target_link_libraries(ftrace PRIVATE d3d11 dxgi d3dcompiler dwmapi)
 endif()
 
 # --- Optional CUDA backend (GPU forward light tracer, model B) ---------------
@@ -75,6 +102,20 @@ if(CMAKE_CUDA_COMPILER)
     option(FTRACE_GPU_FP32 "Compute GPU transport in float (mixed precision)" ON)
 
     target_sources(ftrace PRIVATE src/render_cuda.cu src/raster_cuda.cu)
+
+    # Header dependencies for the .cu TUs — DO NOT REMOVE.
+    #
+    # MSBuild's CudaCompile task does not scan #includes, so a header edit leaves the .cu
+    # objects stale AND (because the .cu TUs share headers with the C++ ones) can leave the
+    # linker holding a stale COMDAT of an inline function you just changed. OBJECT_DEPENDS
+    # does not help — the VS generator emits CudaCompile items with no metadata. Instead a
+    # pre-build step bumps the mtime of any .cu older than the headers, which is the one
+    # signal CudaCompile does honour. Full rationale in cmake/touch_stale_cu.cmake.
+    add_custom_command(TARGET ftrace PRE_BUILD
+        COMMAND "${CMAKE_COMMAND}" "-DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/touch_stale_cu.cmake"
+        COMMENT "Checking .cu header dependencies (MSBuild CudaCompile does not)")
+
     target_compile_definitions(ftrace PRIVATE HAVE_CUDA=1)
     # Emit source line-number info in device code (nvcc -lineinfo). This is
     # essentially free at runtime (unlike -G, which disables optimisation) and

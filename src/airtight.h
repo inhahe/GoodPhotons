@@ -93,14 +93,15 @@ inline bool containerSpan(const Implicit& im, const Vec3& o, const Vec3& d,
 // t in [0,1]. Re-invokes intersectImplicit, advancing past each hit, exactly as a
 // path tracer would when marching through the object. Caps count (they are real
 // boundary faces of the marched solid).
-inline int marchHitCount(const Implicit& im, const Vec3& o, const Vec3& d, int maxHits) {
+inline int marchHitCount(const Implicit& im, const Vec3& o, const Vec3& d, int maxHits,
+                         const PatTables* tabs = nullptr) {
     Ray r{o, d};
     double tmin = 0.0;
     int hits = 0;
     for (int i = 0; i <= maxHits; ++i) {
         Hit h;             // h.t = DBL_MAX; clip to the chord end (t = 1)
         h.t = 1.0; h.valid = false;
-        if (!intersectImplicit(r, im, tmin, h)) break;
+        if (!intersectImplicit(r, im, tmin, h, tabs)) break;
         ++hits;
         double nt = h.t + 1e-7;          // nudge past the refined root (parametric)
         if (nt <= tmin) nt = tmin + 1e-7;
@@ -113,13 +114,14 @@ inline int marchHitCount(const Implicit& im, const Vec3& o, const Vec3& d, int m
 // Dense reference: sign-change count of f within [tIn,tOut], sampled finer than the
 // marcher's step so it catches thin features the marcher may overshoot.
 inline int refFieldCrossings(const Implicit& im, const Vec3& o, const Vec3& d,
-                             double tIn, double tOut, int samples) {
+                             double tIn, double tOut, int samples,
+                             const PatTables* tabs = nullptr) {
     if (samples < 2) samples = 2;
-    double prev = im.eval(o + d * tIn);
+    double prev = im.eval(o + d * tIn, tabs);
     int cross = 0;
     for (int i = 1; i <= samples; ++i) {
         double t = tIn + (tOut - tIn) * ((double)i / samples);
-        double f = im.eval(o + d * t);
+        double f = im.eval(o + d * t, tabs);
         if ((prev > 0.0 && f <= 0.0) || (prev < 0.0 && f >= 0.0) ||
             (prev == 0.0 && f != 0.0))
             ++cross;
@@ -130,9 +132,10 @@ inline int refFieldCrossings(const Implicit& im, const Vec3& o, const Vec3& d,
 
 // Sample the container BOUNDARY for interior (f<0) area. For an `open` surface any
 // interior point on the wall is an open cap (a hole); this is the definitive signature.
-inline void sampleBoundary(const Implicit& im, Report& rep, int grid) {
+inline void sampleBoundary(const Implicit& im, Report& rep, int grid,
+                           const PatTables* tabs = nullptr) {
     auto probe = [&](const Vec3& p) {
-        double f = im.eval(p);
+        double f = im.eval(p, tabs);
         ++rep.boundarySamples;
         if (f < 0.0) { ++rep.boundaryInside; if (f < rep.worstMinF) rep.worstMinF = f; }
     };
@@ -169,7 +172,8 @@ inline void sampleBoundary(const Implicit& im, Report& rep, int grid) {
 
 // Run the audit on one Implicit. nChords random exterior->exterior chords through the
 // container's bounding sphere; parity + overshoot + open-cap stats.
-inline Report check(const Implicit& im, long long nChords, unsigned seed) {
+inline Report check(const Implicit& im, long long nChords, unsigned seed,
+                    const PatTables* tabs = nullptr) {
     Report rep;
     rep.open = !im.capped;
 
@@ -212,16 +216,16 @@ inline Report check(const Implicit& im, long long nChords, unsigned seed) {
         if (tOut <= tIn) continue;
         ++rep.chords;
 
-        int hits = marchHitCount(im, p0, d, maxHits);
+        int hits = marchHitCount(im, p0, d, maxHits, tabs);
         if (hits & 1) ++rep.oddParity;
 
-        int refCross = refFieldCrossings(im, p0, d, tIn, tOut, refSamples);
+        int refCross = refFieldCrossings(im, p0, d, tIn, tOut, refSamples, tabs);
         // The marcher's field-crossing tally excludes caps; compare like-for-like by
         // only flagging overshoot when it finds strictly fewer than the reference.
         if (hits < refCross) ++rep.overshoot;
     }
 
-    if (rep.open) sampleBoundary(im, rep, std::max(8, 32));
+    if (rep.open) sampleBoundary(im, rep, std::max(8, 32), tabs);
     return rep;
 }
 

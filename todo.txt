@@ -1,43 +1,27 @@
+did you introduce new CPU-only features that should be also implemented on GPU since we last audited?
 
-"cudaBackwardSupported rejects participating media (fog/haze), environment lights, fluorescence, and spot/collimated emitters." 
-By this do you mean that the CPU mode does those things, but the GPU mode doesn't?
-
-We render one wavelength per sample (spectral), so a colored image needs many spectral samples where POV-Ray resolves RGB in one. That's an inherent 3–30× sampling disadvantage baked into the physically-spectral design.
-
-Mode R is brute-force unbiased path tracing — full GI, up to 32 bounces, noise ∝ 1/√spp. POV-Ray's default is deterministic Whitted shading (direct light + sharp reflection/refraction) with adaptive AA — it "converges in one pass." POV-Ray's radiosity/photons/media are opt-in and also slow.
-
-gallery_settled has heterogeneous volumetric media (VDB/isosurface-bounded fog + global haze) with per-ray free-flight sampling. That's the actual killer — POV-Ray doing equivalent media wouldn't be interactive either.
-
-"okay, let's implement all the cpu features in the gpu mode too. but i also want a renderer that does RGB so we can do it much faster. my original intention for the backward renderer was for it to be very fast. 
-
-for these two things:
-Mode R is brute-force unbiased path tracing — full GI, up to 32 bounces, noise ∝ 1/√spp. POV-Ray's default is deterministic Whitted shading (direct light + sharp reflection/refraction) with adaptive AA — it "converges in one pass." POV-Ray's radiosity/photons/media are opt-in and also slow.
-
-gallery_settled has heterogeneous volumetric media (VDB/isosurface-bounded fog + global haze) with per-ray free-flight sampling. That's the actual killer — POV-Ray doing equivalent media wouldn't be interactive either.
-
-we can have options to ignore certain things in the scene that would slow it down similarly to how the rasterizer does."
-^ doing
-then:
-Opus: Make sure the GPU version of the new RGB raytracer, in both ignoring features mode and not ignoring features mode, is fully implemented on GPU
-Opus: Go through all the rendering modes and see if any of them have CPU fallbacks for unsupported features that could be implemented in GPU mode.
-^ done
+"Two things worth flagging from the test work: my first cache test passed with the bug reintroduced — a coarse delay maps to a different frame index, so the keys never collide. Both cache tests now use a sub-frame retime, where every sample lands on clock.frame. All three mutations (degraded Cache.scope, dropped driver edge, forced wrap=True) now fail a test. Suite: 1150 → 1177, all green."
 
 --
 
-Fable: 
-You are now running model Fable 5.
-The backward raytracer was made to support more features on the GPU path, and a new RGB-mode backward raytracer was made, with options to ignore certain scene features for speed. 
-Also, we did 
-Image-based env NEE in GPU backward — sampler already on device, just wire it into bkNeeEnv. Also unblocks mode P camera-side.
-Env term in the mode-M GPU gather — small kernel addition, unblocks env-lit photon maps.
-GPU SPPM — reuses existing deposit + gather kernels; biggest quality-mode win.
-Mode-M final gather on GPU — high value, more work.
-Longer tail: rainbow media on device, GPU BDPT per-hit BSDFs, GRIN marcher, GPU VCM.
+doing todo.md
 
-Optimize the GPU-intensive spots for the new features in the GPU path for the old backward raytracer and also the CPU- and GPU-intensive spots for the new RGB backward raytracer, CPU and GPU modes, and the GPU-intensive spots of the five other things that were modified. You've already optimized these, but their new modifications may need optimizing.
-When you're done, show me speedup percentages for the specific features you optimized.
+""What remains in those sections is either user-present interactive C++ (E2 slice 3 — generalizing the camera_curve editor to arbitrary scene vars; F4's D3D11 texture display) or design-ambiguous (E5 follow-up 2 — projecting axis annotations into .ftsl, which conflicts with the locked ".ftsl is per-frame and animation-free" decision, so it wants your steer before I guess a format)." 
+
 --
-^ doing
+
+"Or (2) start the full native viewer, and if so which graphics backend do you prefer for the ImGui + CUDA-interop layer?
+"My recommendation: Win32 + Direct3D 11. It's the most mature ImGui backend, adds no new windowing dependency (ftrace is already a Win32 app), and CUDA↔D3D11 interop is well-trodden for zero-copy presenting the sphere-traced frame. And for a first cut we don't even need interop — kIsoPreview already downloads linear RGB to host, so we can just upload that to a D3D11 dynamic texture per frame; zero-copy interop becomes a later optimization."
+
+--
+
+Check the jsonl log if it's not still in the context for when i tell the model it is Claude Fable, Anthropic's latest and greatest model and I tell it to optimize the latest changes (maybe grep case-insensitively for "Fable"), then check the todo to see what was done after that that i could tell Fable to optimize again.
+
+--
+
+should we allow a default span for grids that makes the span for each dimension the number of cells in that dimension?
+
+--
 
 when rendering a flyby / multiple cameras, make sure the terminal shows which stages of the render are being shared between frames (or if none are) and whether grainy noise is shared between cameras, since these seem to differ according to which mode is used
 
@@ -60,6 +44,10 @@ no: the reason drift doesn't grow and shrink the gyroid is that the gyroid actua
 --
 
 make sure cloud1.glb, cloud2.glb, and cloud3.glb are different clouds. if not, get the missing one from meshy.ai.
+
+--
+
+replace the glass gyroid in scenes\gallery.ftsl with a gyroid with a box for a bounding shape instead of a sphere, with skew factors 1:.25:1
 
 --
 

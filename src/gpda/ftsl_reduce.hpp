@@ -1,15 +1,21 @@
-// reduce.hpp — GPDA ParseNode tree  ->  ftrace ftsl::Block tree, + a structural
-// differ.  This is the heart of the J3c validation shim: it turns the shared
-// grammar's parse tree into the exact std::vector<ftsl::Block> shape ftrace's
-// hand-written parseTop() produces, so the two can be diffed block-for-block.
+// ftsl_reduce.hpp — GPDA ParseNode tree  ->  ftrace ftsl::Block tree.  This is the
+// back half of ftrace's .ftsl front end (see ftsl_frontend.hpp): it turns the shared
+// grammar's parse tree into the exact std::vector<ftsl::Block> shape the rest of
+// ftrace consumes.
 //
-// The mapping faithfully mirrors ftrace's Parser (src/ftsl.h):
+// That shape was reverse-engineered from the hand-written recursive-descent parser
+// this front end replaced (deleted in 0.79.0), so the conventions below are its
+// conventions and the loader still depends on every one of them:
 //   * value continuation / record-override `= rhs [i]` / `[i]` selector folding
 //   * nested-block type/name derivation (bareword => type, single quoted => name)
 //   * brace-body flat `words` dump (key, then post-pop value words)
 //   * record `range` stmt + one stmt per channel line; prefer/else branches
-// STRING tokens carry their quotes in the grammar but ftrace's tokenizer strips
+// STRING tokens carry their quotes in the grammar but the old tokenizer stripped
 // them, so every string word/name is unquoted here to match.
+//
+// (A structural differ lived here too, driving the 0.68 corpus comparison to
+// MATCH 2595/2595; it went with `-validate-grammar` in 0.79.0 — with one front end
+// there is nothing left to diff against.)
 #pragma once
 
 #include <algorithm>
@@ -20,12 +26,12 @@
 #include "tokenized.hpp"
 // ftsl::Block / Stmt / Value come from ftrace's front-end.  In-tree this header
 // is included by ftsl.h *after* those types are defined; the standalone de-risk
-// harness (scraps/gpda_shim) defines FTSL_SHIM_STANDALONE to pull a copied slice.
-#ifdef FTSL_SHIM_STANDALONE
+// harness (scraps/gpda_shim) defines FTSL_GPDA_STANDALONE to pull a copied slice.
+#ifdef FTSL_GPDA_STANDALONE
 #include "ftrace_parse_slice.hpp"
 #endif
 
-namespace shim {
+namespace ftsl_gpda {
 
 using PN = gpda_tok::ParseNode;
 
@@ -56,15 +62,66 @@ inline std::string unquote(const std::string& type, const std::string& value) {
     return value;
 }
 
-// Concatenate a selector's sel_word leaves with no separator (ftrace builds the
-// index string by appending each Word token's text).
-inline std::string selector_index(const PN* selector) {
-    std::string idx;
-    for (const PN* sw : children(selector, "sel_word")) {
-        const PN* t = leaf_of(sw);
-        idx += t->value;
+// Collect a `[ … ]` group's raw item tree (bare words, and nested groups for an N-D
+// array literal's inner axes) WITHOUT interpreting it — ftsl::applyBracketGroup owns
+// that decision for both front ends. `node` is a `selector` or a `sub_array`.
+inline std::vector<ftsl::BrItem> bracket_items(const PN* node) {
+    std::vector<ftsl::BrItem> out;
+    for (const auto& c : node->children) {
+        if (c->name == "sel_item") {
+            for (const auto& g : c->children) {
+                if (g->name == "sub_array") {
+                    ftsl::BrItem it; it.isGroup = true; it.items = bracket_items(g.get());
+                    out.push_back(std::move(it));
+                } else if (g->name == "sel_word") {
+                    ftsl::BrItem it; it.word = leaf_of(g.get())->value;
+                    out.push_back(std::move(it));
+                }
+            }
+        }
     }
-    return idx;
+    return out;
+}
+
+// Flatten a record channel line's stop tokens into the flat `Value::words` list the
+// loader reads, turning each `stop_group` back into a `[` … `]` pair of MARKER words.
+//
+// Records are the one place the language keeps its structure in the *word stream*
+// rather than in a side-channel like `BrItem` — a channel line's shape is defined by
+// the generalized stop grammar's delimiter ladder, whose other two rungs (comma and
+// whitespace) already survive lexing as ordinary word text.  Re-serialising brackets
+// into the same stream keeps all three rungs in one place, so `recladder::parse` sees
+// the author's delimiters exactly as written instead of half a tree plus half a list.
+// The markers can't be confused with content: `[` and `]` are excluded from the
+// character class of every terminal, so no real word is ever spelled either way.
+inline void flatten_stop_words(const PN* node, std::vector<std::string>& out) {
+    for (const auto& c : node->children) {
+        if (c->name == "stop_item") {
+            flatten_stop_words(c.get(), out);
+        } else if (c->name == "stop_word") {
+            const PN* g = c->children.empty() ? nullptr : c->children[0].get();
+            if (g && g->name == "stop_group") {
+                out.push_back("[");
+                flatten_stop_words(g, out);
+                out.push_back("]");
+            } else {
+                const PN* t = leaf_of(c.get());
+                out.push_back(unquote(t->name, t->value));
+            }
+        }
+    }
+}
+
+// The trailing sample call on a selector — `(u)`, `(u,v)` — or "" when absent.
+inline std::string selector_call(const PN* selector) {
+    const PN* at = child(selector, "axistuple");
+    return at ? leaf_of(at)->value : std::string();
+}
+
+// Hand the group to the shared decision function (see ftsl::applyBracketGroup).
+inline void apply_selector(ftsl::Value& v, const PN* sel, bool overrideForm) {
+    ftsl::applyBracketGroup(v, bracket_items(sel), selector_call(sel),
+                            (int)sel->first_pos().first, overrideForm);
 }
 
 // ---- forward decls --------------------------------------------------------
@@ -85,12 +142,9 @@ inline ftsl::Value reduce_value(const PN* value_node, const std::string& key) {
         const PN* sel = child(c, "selector");
         if (rhs) {
             const PN* t = leaf_of(rhs);
-            std::string r = unquote(t->name, t->value);
-            if (sel) r += "[" + selector_index(sel) + "]";
-            v.words.push_back(r);
-        } else if (sel && !v.words.empty()) {
-            v.words.back() += "[" + selector_index(sel) + "]";
+            v.words.push_back(unquote(t->name, t->value));
         }
+        if (sel) apply_selector(v, sel, /*overrideForm=*/true);
         return v;
     }
 
@@ -107,10 +161,7 @@ inline ftsl::Value reduce_value(const PN* value_node, const std::string& key) {
         v.words.push_back(unquote(t->name, t->value));
     }
     const PN* sel = child(c, "selector");
-    if (sel && !v.words.empty() &&
-            v.words.back().find('.') != std::string::npos) {
-        v.words.back() += "[" + selector_index(sel) + "]";
-    }
+    if (sel) apply_selector(v, sel, /*overrideForm=*/false);
     const PN* blk = child(c, "block");
     if (blk) {
         std::string btype = key, bname;
@@ -136,9 +187,11 @@ inline void reduce_brace_body(const PN* brace_body, ftsl::Block& b) {
         const PN* st = child(bi, "stmt");
         if (!st) continue;
         const PN* kt = child(st, "key_tok");
-        std::string key = leaf_of(kt)->value;      // key_tok is never a STRING
+        const PN* kleaf = leaf_of(kt);
+        std::string key = kleaf->value;            // key_tok is never a STRING
         ftsl::Stmt s;
         s.key = key;
+        s.line = (int)kleaf->line;                 // ftrace stamps the key's line
         b.words.push_back(key);
         const PN* vnode = child(st, "value");
         s.val = reduce_value(vnode, key);
@@ -171,13 +224,19 @@ inline ftsl::Block reduce_top_block(const PN* top_block) {
         if (const PN* st = child(alt, "subtype")) b.subtype = leaf_of(st)->value;
         ftsl::Stmt s;
         s.key = "=";
-        s.val = reduce_value(child(alt, "value"), "=");
+        const PN* sv = child(alt, "value");
+        s.line = (int)sv->first_pos().first;        // ftrace stamps the value's line
+        s.val = reduce_value(sv, "=");
         b.stmts.push_back(std::move(s));
     } else if (k == "record_decl") {                // WORD '=' 'range' range_word* record_body
         b.type = "record";
         b.name = children(alt, "WORD")[0]->value;   // first WORD is the binding NAME
         ftsl::Stmt dom;
         dom.key = "range";
+        {   // ftrace stamps the line of the first token AFTER `range`
+            auto rws = children(alt, "range_word");
+            dom.line = rws.empty() ? 0 : (int)leaf_of(rws[0])->line;
+        }
         for (const PN* rw : children(alt, "range_word")) {
             const PN* t = leaf_of(rw);
             dom.val.words.push_back(unquote(t->name, t->value));
@@ -188,11 +247,10 @@ inline ftsl::Block reduce_top_block(const PN* top_block) {
             const PN* rl = child(ri, "record_line"); // WORD stop_word*
             if (!rl) continue;
             ftsl::Stmt s;
-            s.key = child(rl, "WORD")->value;
-            for (const PN* sw : children(rl, "stop_word")) {
-                const PN* t = leaf_of(sw);
-                s.val.words.push_back(unquote(t->name, t->value));
-            }
+            const PN* chan = child(rl, "WORD");
+            s.key = chan->value;
+            s.line = (int)chan->line;
+            flatten_stop_words(rl, s.val.words);
             b.stmts.push_back(std::move(s));
         }
     } else if (k == "prefer_block") {               // 'prefer' block_list ('else' block_list)*
@@ -219,90 +277,4 @@ inline std::vector<ftsl::Block> reduce_scene(const PN* scene_file) {
     return blocks;
 }
 
-// ---- structural diff ------------------------------------------------------
-
-struct Diff {
-    std::vector<std::string> msgs;
-    bool ok() const { return msgs.empty(); }
-    void add(const std::string& where, const std::string& m) {
-        msgs.push_back(where + ": " + m);
-    }
-};
-
-inline void diff_value(const ftsl::Value& a, const ftsl::Value& b,
-                       const std::string& where, Diff& d);
-
-inline void diff_block(const ftsl::Block& a, const ftsl::Block& b,
-                       const std::string& where, Diff& d) {
-    if (a.type != b.type) d.add(where, "type '" + a.type + "' != '" + b.type + "'");
-    if (a.subtype != b.subtype) d.add(where, "subtype '" + a.subtype + "' != '" + b.subtype + "'");
-    if (a.name != b.name) d.add(where, "name '" + a.name + "' != '" + b.name + "'");
-    if (a.words != b.words) {
-        std::string as, bs;
-        for (auto& w : a.words) as += "|" + w;
-        for (auto& w : b.words) bs += "|" + w;
-        d.add(where, "words [" + as + " ] != [" + bs + " ]");
-    }
-    if (a.stmts.size() != b.stmts.size()) {
-        d.add(where, "stmt count " + std::to_string(a.stmts.size()) +
-              " != " + std::to_string(b.stmts.size()));
-    } else {
-        for (size_t i = 0; i < a.stmts.size(); ++i) {
-            const auto& sa = a.stmts[i];
-            const auto& sb = b.stmts[i];
-            std::string w = where + ".stmt[" + std::to_string(i) + "]";
-            if (sa.key != sb.key) d.add(w, "key '" + sa.key + "' != '" + sb.key + "'");
-            diff_value(sa.val, sb.val, w, d);
-        }
-    }
-    if (a.branches.size() != b.branches.size()) {
-        d.add(where, "branch count " + std::to_string(a.branches.size()) +
-              " != " + std::to_string(b.branches.size()));
-    } else {
-        for (size_t i = 0; i < a.branches.size(); ++i) {
-            const auto& ba = a.branches[i];
-            const auto& bb = b.branches[i];
-            std::string w = where + ".branch[" + std::to_string(i) + "]";
-            if (ba.size() != bb.size()) {
-                d.add(w, "block count " + std::to_string(ba.size()) +
-                      " != " + std::to_string(bb.size()));
-            } else {
-                for (size_t j = 0; j < ba.size(); ++j)
-                    diff_block(ba[j], bb[j], w + "[" + std::to_string(j) + "]", d);
-            }
-        }
-    }
-}
-
-inline void diff_value(const ftsl::Value& a, const ftsl::Value& b,
-                       const std::string& where, Diff& d) {
-    if (a.words != b.words) {
-        std::string as, bs;
-        for (auto& w : a.words) as += "|" + w;
-        for (auto& w : b.words) bs += "|" + w;
-        d.add(where, "val.words [" + as + " ] != [" + bs + " ]");
-    }
-    if (static_cast<bool>(a.block) != static_cast<bool>(b.block)) {
-        d.add(where, "one has a nested block, the other doesn't");
-    } else if (a.block && b.block) {
-        diff_block(*a.block, *b.block, where + ".block", d);
-    }
-}
-
-inline Diff diff_scene(const std::vector<ftsl::Block>& a,
-                       const std::vector<ftsl::Block>& b) {
-    Diff d;
-    if (a.size() != b.size()) {
-        d.add("scene", "top-block count " + std::to_string(a.size()) +
-              " != " + std::to_string(b.size()));
-        size_t n = std::min(a.size(), b.size());
-        for (size_t i = 0; i < n; ++i)
-            diff_block(a[i], b[i], "block[" + std::to_string(i) + "]", d);
-        return d;
-    }
-    for (size_t i = 0; i < a.size(); ++i)
-        diff_block(a[i], b[i], "block[" + std::to_string(i) + "]", d);
-    return d;
-}
-
-}  // namespace shim
+}  // namespace ftsl_gpda

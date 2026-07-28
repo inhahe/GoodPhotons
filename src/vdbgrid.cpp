@@ -74,9 +74,23 @@ bool invert3x3(const double m[9], double out[9]) {
 
 } // namespace
 
-bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err) {
+bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err,
+                 const std::string& wantName) {
     FILE* fp = std::fopen(path.c_str(), "rb");
     if (!fp) { err = "cannot open '" + path + "'"; return false; }
+
+    // Dispatch on magic: a native OpenVDB `.vdb` begins with the int64 magic
+    // 0x56444220 ("VDB "). Delegate those to the hand-rolled OpenVDB reader (no
+    // NanoVDB); everything else falls through to the NanoVDB `.nvdb` path below.
+    {
+        uint64_t magic = 0;
+        if (std::fread(&magic, 1, 8, fp) == 8 &&
+            (magic & 0xFFFFFFFFull) == 0x56444220ull) {
+            std::fclose(fp);
+            return loadOpenVDBGrid(path, out, err, wantName);
+        }
+        std::fseek(fp, 0, SEEK_SET);
+    }
 
     // Disambiguate the two accepted layouts the same way NanoVDB's own reader does:
     // read the first 40 bytes as GridData; if that looks like a valid grid the file
@@ -117,16 +131,44 @@ bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err) {
         if (head.gridCount == 0) {
             std::fclose(fp); err = "no grids in '" + path + "'"; return false;
         }
-        nanovdb::io::FileMetaData meta{};
-        if (std::fread(&meta, 1, sizeof(meta), fp) != sizeof(meta)) {
-            std::fclose(fp); err = "truncated grid metadata: '" + path + "'"; return false;
+        // Walk the grids: take the first when wantName is empty, else the one whose
+        // name matches (case-insensitive), skipping the others' bodies.
+        auto iequalsAscii = [](const std::string& a, const std::string& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+            return true;
+        };
+        bool found = false;
+        for (uint32_t gi = 0; gi < head.gridCount && !found; ++gi) {
+            nanovdb::io::FileMetaData meta{};
+            if (std::fread(&meta, 1, sizeof(meta), fp) != sizeof(meta)) {
+                std::fclose(fp); err = "truncated grid metadata: '" + path + "'"; return false;
+            }
+            std::string gname;
+            if (meta.nameSize) {
+                gname.resize(meta.nameSize);
+                if (std::fread(&gname[0], 1, (size_t)meta.nameSize, fp) != (size_t)meta.nameSize) {
+                    std::fclose(fp); err = "truncated grid name: '" + path + "'"; return false;
+                }
+                while (!gname.empty() && gname.back() == '\0') gname.pop_back();
+            }
+            if (!wantName.empty() && !iequalsAscii(gname, wantName)) {
+                std::fseek(fp, (long)meta.gridSize, SEEK_CUR);   // skip this grid body
+                continue;
+            }
+            gridSize = meta.gridSize;
+            gridMem = alignedAlloc((size_t)gridSize);
+            if (!gridMem || std::fread(gridMem, 1, (size_t)gridSize, fp) != gridSize) {
+                if (gridMem) alignedFree(gridMem);
+                std::fclose(fp); err = "truncated grid data: '" + path + "'"; return false;
+            }
+            found = true;
         }
-        if (meta.nameSize) std::fseek(fp, (long)meta.nameSize, SEEK_CUR);
-        gridSize = meta.gridSize;
-        gridMem = alignedAlloc((size_t)gridSize);
-        if (!gridMem || std::fread(gridMem, 1, (size_t)gridSize, fp) != gridSize) {
-            if (gridMem) alignedFree(gridMem);
-            std::fclose(fp); err = "truncated grid data: '" + path + "'"; return false;
+        if (!found) {
+            std::fclose(fp);
+            err = "grid '" + wantName + "' not found in '" + path + "'";
+            return false;
         }
     }
     std::fclose(fp);
@@ -183,7 +225,7 @@ bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err) {
 
     out.nx = nx; out.ny = ny; out.nz = nz;
     out.imin = Vec3(lo[0], lo[1], lo[2]);
-    out.data.assign((size_t)voxels, 0.0f);
+    out.data.assign((size_t)voxels, floatToHalfBits(0.0f));
 
     auto acc = grid->getAccessor();
     float mx = 0.0f;
@@ -192,10 +234,12 @@ bool loadVdbGrid(const std::string& path, VdbGrid& out, std::string& err) {
     for (int i = 0; i < nx; ++i) {
         float v = acc.getValue(nanovdb::Coord(lo[0] + i, lo[1] + j, lo[2] + k));
         if (v < 0.0f) v = 0.0f;             // density must be >= 0
-        out.data[(size_t(k) * ny + j) * nx + i] = v;
+        out.data[(size_t(k) * ny + j) * nx + i] = floatToHalfBits(v);
         if (v > mx) mx = v;
     }
-    out.maxVal = mx;
+    // fp16 rounding can nudge a stored value above the exact max by up to one
+    // half-ULP; bump the majorant so it stays a valid delta/ratio-tracking bound.
+    out.maxVal = mx * 1.001f;
 
     auto wb = grid->worldBBox();
     out.wmin = Vec3(wb.min()[0], wb.min()[1], wb.min()[2]);

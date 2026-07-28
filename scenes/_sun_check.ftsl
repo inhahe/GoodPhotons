@@ -1,0 +1,49 @@
+# Distant directional sun — validation scene.
+#
+# A grey Lambertian floor (albedo 0.5, flat) lit ONLY by a `light sun`, with a sphere
+# and a post casting hard shadows. Nothing else emits, so every pixel on the floor
+# should read exactly the textbook Lambertian answer
+#
+#     L_out = rho/PI * E_perp * cos(theta_incidence)
+#
+# where E_perp is the `spd` the sun block authors (perpendicular irradiance) and
+# theta is the angle between the floor normal and the direction to the sun.
+#
+# Things this scene is meant to check:
+#   * forward (mode B) and backward (mode R) agree — the parallel-beam emission pdf
+#     matches the cone NEE estimator;
+#   * widening `angle` softens the shadow penumbra WITHOUT changing the exposure
+#     (the sun is authored by irradiance, not radiance);
+#   * the solar disc itself is directly viewable (aim the camera up at it).
+#
+#   ftrace -in scenes/_sun_check.ftsl -mode R -spp 64 -o png/sun_check_R.png
+#   ftrace -in scenes/_sun_check.ftsl -mode B -time 30 -o png/sun_check_B.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "grey"  { type diffuse reflect 0.5 }
+material "white" { type diffuse reflect 0.8 }
+
+quad { origin -6 0 -6   u 0 0 12   v 12 0 0   material grey }   # cross(u,v) = +y
+
+sphere { center -0.9 0.6 0    radius 0.6   material white }
+sphere { center  1.1 1.1 -0.3 radius 0.35  material white }
+
+# Sun 40 deg above the horizon, coming from the -z / +x quadrant. `spd` is the
+# PERPENDICULAR spectral irradiance; `angle` is the angular diameter in degrees
+# (0.53 = the real sun).
+light sun {
+    elevation 40   azimuth 25
+    angle     0.53
+    spd       preset:bb5800
+    intensity 3
+}
+
+camera "cam" {
+    eye 0 2.2 6   look_at 0 0.7 0   up 0 1 0   fov_y 40
+    mode B
+    film { res 400 300 }
+}

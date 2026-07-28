@@ -244,6 +244,8 @@ struct DTexture {
     const double* coeff;   // 3*w*h Jakob-Hanika coefficients (albedo maps)
     const double* gray;    // w*h per-texel grayscale (mean linear RGB) for scalar maps
                            // (roughness/film-thickness, §9.4) — dTexScalarAt twin
+    const double* rgb;     // 3*w*h linear RGB, uploaded only for NORMAL-MAP textures
+                           // (C6) — dTexNormalAt twin (needs true vector direction)
 };
 
 struct DMaterial {
@@ -277,6 +279,13 @@ struct DMaterial {
     // BDPT kernel (M9: the per-hit point is threaded into dMatRoughness/dMatFilmThickness).
     int    roughnessTex;
     int    filmThicknessTex;
+    // Tangent-space NORMAL MAP (C6), device twin of Material::normalTex/normalStrength.
+    // >=0 => at a hit, perturb the shading normal by the texel's tangent-space normal
+    // (dTexNormalAt) rotated through the surface TBN frame; -1 => geometry normal.
+    // normalStrength scales the tangential perturbation. Applied in the device
+    // closestHit (dApplyNormalMap) so every GPU path sees it consistently.
+    int    normalTex;
+    double normalStrength;
     // Fluorescence (D_FLUORESCENT): fluoAbsorb is the baked excitation probability
     // epsilon(lambda); the dye re-radiates (quantum yield fluoYield) at a Stokes-
     // shifted lambda' drawn from the emission-SPD CDF slice [fluoCdfOffset,
@@ -307,10 +316,20 @@ struct DMaterial {
     // Procedural (math-driven) scalar drives (§4): index into DScene::patterns, or -1.
     // roughnessPat / filmThicknessPat override the constant/texture value at the hit;
     // mixWeightPat drives child-0 selection of a 2-child D_MIX. Device twins of
-    // Material::roughnessPat / filmThicknessPat / mixWeightPat.
+    // Material::roughnessPat / filmThicknessPat / mixWeightPat. reflectPat instead
+    // MULTIPLIES the reflect slot per hit (device twin of Material::reflectPat) — the
+    // greyscale-albedo half of `reflect pattern:<n>` / `reflect_map pattern:<n>`.
+    // transmitPat does the same on the transmit slot (device twin of Material::transmitPat).
     int    roughnessPat;
     int    filmThicknessPat;
     int    mixWeightPat;
+    int    reflectPat;
+    int    transmitPat;
+    // emitPat does the same on the emission slot, for emission-on-hit (device twin of
+    // Material::emitPat). The other half of the slot — Le at a point the emitter SAMPLER
+    // drew — goes through DEmitter::emitPat; the two are constructed to agree pointwise
+    // because MIS combines them.
+    int    emitPat;
     // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
     // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
     // twin of Material::priority.
@@ -388,7 +407,8 @@ struct DMediumStack {
     }
 };
 
-struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId; };
+struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
+                 DVec3 tangent; double bitangentSign; };  // C6 tangent frame for normal mapping
 struct DSphere { DVec3 c; double r; int matId; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 
@@ -406,6 +426,9 @@ struct DInstance {
     // shading/geometric normal local -> world = (toWorld linear)^-T = transpose of
     // toWorld.inverse().m — precomputed on the host so the device does no inverse.
     double Nm[9];
+    // toWorld linear part (local -> world for plain DIRECTIONS): transforms the surface
+    // tangent for normal mapping on instanced meshes (C6). affDir(Wm, tangent).
+    double Wm[9];
     int    blasId;
     int    matOverride;   // >=0 replaces the BLAS triangles' matId (mirrors host)
 };
@@ -474,6 +497,26 @@ struct DImplicit {
 // pattern.h (POD, uploaded verbatim) — no device-specific node type is needed.
 struct DPattern { int off, n; };   // slice into DScene::patNodes
 
+// A NATIVE SPARSE brick grid: the device twin of host VdbGrid, uploaded as a bricked
+// sparse lattice (ROADMAP C2). The dense lattice is partitioned into B^3 bricks; only
+// bricks with a nonzero voxel are uploaded, so VRAM scales with occupied volume, not
+// the bounding box. `brickIndex[(k>>sh)*by*bx + (j>>sh)*bx + (i>>sh)]` gives the brick's
+// slot (or -1 => value 0); the voxel lives at `brickData[slot*B^3 + ((k&mask)*B +
+// (j&mask))*B + (i&mask)]`. `dVdbSample` trilinearly samples it, bit-for-bit like the
+// host VdbGrid::sample (the stencil is clamped to [0,n-1] before any lookup). Used for
+// BOTH the density multiplier and the emissive-volume temperature field.
+struct DVdbGrid {
+    const int32_t*   brickIndex;   // bx*by*bz brick slots (or -1); null => grid absent
+    const uint16_t*  brickData;    // active*B^3 fp16 voxels
+    int              bx, by, bz;   // brick-grid dimensions
+    int              brickB;       // brick edge length (power of two)
+    int              brickShift;   // log2(B): brick = idx>>shift, local = idx&(B-1)
+    int              nx, ny, nz;   // dense lattice dims
+    double           ainv[9];      // world->index linear map (row-major 3x3)
+    DVec3            w0;            // world position of index origin (0,0,0)
+    DVec3            imin;          // integer min-corner of the baked lattice
+};
+
 struct DMedium {
     int    enabled;
     double sigma_a[SPEC_N];
@@ -490,14 +533,21 @@ struct DMedium {
     const PatNode*   density;         // device pool for the density formula (or null)
     int              densityN;        // node count of the density program
     double           densityMax;      // majorant (sup of density over the bound)
-    // --- Optional imported .nvdb volume baked to a dense grid (mirrors VdbGrid) ---
-    // When `vdbData` is non-null the density multiplier is TRILINEARLY sampled from
-    // this uploaded dense lattice instead of the pattern VM; takes precedence.
-    const float*     vdbData;         // nx*ny*nz values, index [(k*ny+j)*nx+i] (or null)
-    int              vdbNx, vdbNy, vdbNz;
-    double           vdbAinv[9];      // world->index linear map (row-major 3x3)
-    DVec3            vdbW0;            // world position of index origin (0,0,0)
-    DVec3            vdbImin;          // integer min-corner of the baked lattice
+    // --- Optional imported .nvdb/.vdb volume, uploaded as a NATIVE SPARSE brick grid ---
+    // When `densGrid.brickData` is non-null the density multiplier is TRILINEARLY
+    // sampled from the sparse lattice (ROADMAP C2) instead of the pattern VM; takes
+    // precedence. See DVdbGrid.
+    DVdbGrid         densGrid;        // density field (brickData null => none)
+    // --- Optional volumetric blackbody EMISSION ("fire", ROADMAP C3) ---------------
+    // When `emissive` a temperature field (tempGrid) drives self-illuminated blackbody
+    // emission: T(x) = emitKelvin * tempGrid(x)/tempPeak (peak-normalised, robust to
+    // whatever units the grid was authored in), and the emission source radiance is
+    // emissionScale * blackbodyEmissionRadiance(T, lambda). Mirrors host Medium.
+    int              emissive;        // 1 => temperature-driven blackbody emission
+    DVdbGrid         tempGrid;        // raw relative temperature field
+    double           emitKelvin;      // Kelvin of the hottest voxel
+    double           tempPeak;        // raw temperature-grid peak (for peak-normalisation)
+    double           emissionScale;   // brightness multiplier on the Planck term
     int              bounded;         // 1 => clip to the bound region
     int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field
     DVec3            bmin, bmax;
@@ -527,16 +577,30 @@ struct DMedium {
     double            rbLam0, rbDLam; // wavelength axis origin/step (nm)
 };
 
+// One triangle of a Mesh emitter (mirrors host EmitTri): v0 + two edge vectors, the
+// unit normal, and the inclusive cumulative-area CDF value used for area sampling.
+// uv0/uvE1/uvE2 mirror the same-named host fields so a sampled point can report the
+// SAME (u,v) the ray-hit path interpolates — only read when an emission pattern is
+// bound, but uploaded unconditionally (they are part of the host EmitTri).
+struct DEmitTri { DVec3 v0, e1, e2, nrm; double cumArea; DVec3 uv0, uvE1, uvE2; };
+
 // One emitter (mirrors host Emitter). `cdfOffset`/`cdfN` index this emitter's
 // wavelength CDF slice inside the flattened lightCdfAll buffer.
 struct DEmitter {
     DVec3  origin, u, v, normal, beamDir;
     double area, power;
     int    collimated;
-    int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder (EmitterShape)
+    int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder, 5 mesh, 6 sun
     double radius;             // sphere radius (shape==1) / tube radius (shape==4)
     int    caps;               // cylinder (shape==4): also emit from the two end discs
-    double spotCosInner, spotCosOuter, spotOmega;   // spot cone (shape==2)
+    // Cone cosines / solid angle. Spot (shape==2): the smoothstep penumbra. Distant sun
+    // (shape==6): inner == outer == cos(halfAngle), so spotOmega = PI*(2-ci-co) is
+    // exactly the solar cone's solid angle 2*PI*(1-cos theta) — the same field reuse the
+    // host Emitter makes, so no extra members are needed on either side.
+    double spotCosInner, spotCosOuter, spotOmega;
+    // Mesh area light (shape==5): device pointer to this emitter's triangle CDF and its
+    // count. nullptr/0 for every other shape. area == sum of the triangle areas.
+    const DEmitTri* meshTris; int meshTriN;
     int    cdfOffset, cdfN;
     double cdfStep;
     // BDPT (mode D) extras. matId links this emitter to its emissive surface material
@@ -544,6 +608,11 @@ struct DEmitter {
     // device can evaluate Le(lambda) directly (DMaterial carries no emit spectrum).
     int    matId;
     double emitSpd[SPEC_N];
+    // Index into DScene::patterns of this emitter's emission profile (device twin of
+    // Emitter::emitPat, itself adopted from the emissive material at registration);
+    // -1 = uniform. Deliberately absent from `power` — the pattern modulates the
+    // radiance at a point, not the emitter's selection weight, exactly as on the host.
+    int    emitPat;
     // Fast RGB backward (mode R -rgb): the emitter's linear-sRGB radiance, baked as
     // xyzToLinearSrgb(integral over lambda of CIE(lambda)*emitSpd(lambda)) — the exact
     // wavelength-integrated radiance the spectral estimator converges to (the
@@ -559,10 +628,40 @@ __device__ static double spotFalloff(double ct, double cosInner, double cosOuter
     return t * t * (3.0 - 2.0 * t);
 }
 
+// ---- distant sun (shape==6) helpers, device twins of host Emitter::sampleCone/inCone --
+// Uniform direction inside the cone of half-angle acos(spotCosOuter) about `axis`
+// (solid-angle pdf 1/spotOmega). Same closed form and same u1/u2 roles as the host, so
+// CPU and GPU agree on the shape of the penumbra.
+__device__ static inline DVec3 dSunSampleCone(const DEmitter& em, const DVec3& axis,
+                                              double u1, double u2) {
+    double ct = em.spotCosOuter + u1 * (1.0 - em.spotCosOuter);
+    double st = sqrt(fmax(0.0, 1.0 - ct * ct));
+    double phi = 2.0 * 3.14159265358979323846 * u2;
+    DVec3 t, b; onb(axis, t, b);
+    return t * (Real)(st * cos(phi)) + b * (Real)(st * sin(phi)) + axis * (Real)ct;
+}
+// Does viewing direction `d` land on this sun's disc? `beamDir` is the TRAVEL direction,
+// so a ray looking AT the sun runs opposite it.
+__device__ static inline bool dInSunCone(const DEmitter& em, const DVec3& d) {
+    return (double)dot(d, em.beamDir) <= -em.spotCosOuter;
+}
+// (dSunRadiance — the summed radiance of every sun whose disc contains a direction — is
+// defined further down, once DScene exists.)
+
 // Sample a surface point + outward normal on an emitter (mirrors host
 // Emitter::samplePoint). Quad draws are unchanged, so quad scenes stay parity.
+//
+// `uuOut`/`vvOut` optionally report the sampled point's TEXTURE coordinates, which an
+// emission pattern needs. As on the host they are filled only for the two shapes that
+// can carry one — Quad (the bilinear parameters) and Mesh (the chosen triangle's
+// barycentric UV, the same interpolation the ray-hit path uses) — and left at 0
+// elsewhere, since sphere / tube / spot / env emitters reject `emit pattern:` at load.
+// Passing null (the default) keeps every existing caller's arithmetic untouched.
 __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double u2,
-                                          DVec3& y, DVec3& nOut) {
+                                          DVec3& y, DVec3& nOut,
+                                          double* uuOut = nullptr, double* vvOut = nullptr) {
+    if (uuOut) *uuOut = 0.0;
+    if (vvOut) *vvOut = 0.0;
     if (em.shape == 1) {
         double z = 1.0 - 2.0 * u1;
         double r = sqrt(fmax(0.0, 1.0 - z * z));
@@ -601,9 +700,37 @@ __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double 
             y = em.origin + em.v * (Real)u1 + rad * (Real)em.radius;
             nOut = rad;
         }
+    } else if (em.shape == 5) {
+        // Mesh area light: pick a triangle with probability proportional to its area
+        // (binary-search u1*area over the cumulative-area CDF), remap the leftover to a
+        // fresh uniform, then sample the chosen triangle barycentrically (mirrors host
+        // Emitter::samplePoint's Mesh branch). pdf = 1/area over the whole surface.
+        double target = u1 * em.area;
+        int lo = 0, hi = em.meshTriN;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (em.meshTris[mid].cumArea < target) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo >= em.meshTriN) lo = em.meshTriN - 1;
+        const DEmitTri& t = em.meshTris[lo];
+        double prev = (lo == 0) ? 0.0 : em.meshTris[lo - 1].cumArea;
+        double span = t.cumArea - prev;
+        double uu = (span > 0.0) ? (target - prev) / span : u1;
+        double su = sqrt(fmax(0.0, uu));
+        double b1 = 1.0 - su;
+        double b2 = u2 * su;
+        y = t.v0 + t.e1 * (Real)b1 + t.e2 * (Real)b2;
+        nOut = t.nrm;
+        // Same barycentric weights the ray-hit path uses, so a bound emission pattern
+        // reads identically from either side of the transport.
+        if (uuOut) *uuOut = t.uv0.x + t.uvE1.x * (Real)b1 + t.uvE2.x * (Real)b2;
+        if (vvOut) *vvOut = t.uv0.y + t.uvE1.y * (Real)b1 + t.uvE2.y * (Real)b2;
     } else {
         y = em.origin + em.u * (Real)u1 + em.v * (Real)u2;
         nOut = em.normal;
+        if (uuOut) *uuOut = u1;
+        if (vvOut) *vvOut = u2;
     }
 }
 
@@ -636,6 +763,21 @@ struct DEnvMap {
 // One scalar-record stop on the device (§records stage 6b): its domain position + a slice
 // of the shared recDrivers PatNode pool holding the stop's per-hit expression program.
 struct DRecScalarStop { double pos; int exprOff; int exprN; };
+
+// One emissive ("fire") volume (device twin of Scene::EmissiveVolume, ROADMAP C3). A
+// photon born inside carries beta = grandTotal*emissionAt(x,lambda)/(meanKe*dLam*p(lambda)),
+// with the position uniform in [bmin,bmax] and lambda importance-sampled from `lamCdf`
+// (a Planck-at-emitKelvin per-nm CDF, `lamN`+1 entries, step `lamStep`; pdf per nm =
+// binMass/step). meanKe/power are MC-estimated on the host (finalizeEmissiveVolumes).
+struct DEmissiveVolume {
+    int    mediumIndex;
+    DVec3  bmin, bmax;
+    double meanKe;
+    double power;
+    const double* lamCdf;   // lamN+1 normalised CDF over [LAMBDA_MIN,LAMBDA_MAX]
+    int           lamN;     // number of bins
+    double        lamStep;  // bin width in nm
+};
 
 struct DScene {
     const DTri*      tris;  int nTris;
@@ -684,6 +826,15 @@ struct DScene {
     double           totalPower;
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
     const DTexture*  textures; int nTex;   // reflectance textures (mat.reflectTex)
+    // N-D data tables (§grids), reached from a pattern as `grid:<name>(c0, …)` (regular
+    // lattice) or `scatter:<name>(c0, …)` (ragged). Uploaded VERBATIM: the host headers
+    // are already POD that refer to their numbers by OFFSET (never a pointer), and
+    // dataPool is the same flat float run the host reads, so patGridSample /
+    // patScatterSample — the shared __host__ __device__ samplers in pattern.h — run here
+    // unchanged and the two backends agree bit-for-bit.
+    const PatGrid*    grids;    int nGrids;
+    const PatScatter* scatters; int nScatters;
+    const float*      dataPool; int dataPoolN;
     const double*    fluoCdfAll;    // flattened per-material fluorescence emission CDFs
     // BDPT shared wavelength sampler (mirrors Scene::emitSampler): the combined
     // g(lambda)=sum_k geomWeight_k*SPD_k CDF, its bin step, and emitG = its integral.
@@ -692,6 +843,10 @@ struct DScene {
     double           emitG;
     const DMedium*   media;    // participating media array (superposed); null if none
     int              mediaN;   // number of media (0 => vacuum)
+    // Volumetric blackbody emission ("fire", ROADMAP C3). Photon birth splits emitter-
+    // vs-fire by power: grandTotal = totalPower + totalEmissionPower. Null/0 => no fire.
+    const DEmissiveVolume* emissiveVolumes; int emissiveVolN;
+    double           totalEmissionPower;
     int              hasGrin;  // 1 => some enabled medium carries an `ior` (GRIN) field.
                                // Gates the per-bounce Eikonal march (grin::sceneHasGrin twin);
                                // 0 keeps ordinary scenes bit-identical (march never entered).
@@ -700,6 +855,9 @@ struct DScene {
     double sceneRadius;              // env (shape==3): bounding-sphere radius
     DEnvMap env;                     // image env tables (env.scale null => constant env)
     int    envIndex;                 // index of the env emitter in `emitters`, or -1 (mirrors Scene::envIndex)
+    int    sunCount;                 // number of shape==6 (distant sun) emitters (mirrors Scene::sunCount);
+                                     // every sun-aware hot path tests this first, so a scene
+                                     // without a sun pays one integer compare
     DVec3  rgbEnv;                    // fast RGB backward: constant-env radiance in linear sRGB (0 if no env)
     // Scene-ignore render params (Stage 3), set by renderBackward[RGB]Cuda from the CLI
     // flags. bkMaxBounce caps the backward path-depth loop (default 32). bkDirectOnly=1
@@ -708,6 +866,37 @@ struct DScene {
     int    bkMaxBounce;
     int    bkDirectOnly;
 };
+
+// Everything the pattern VM (dPatternEval) needs beyond the scalar variables: the
+// SCENE-OWNED sample tables a pattern expression can reach into. Bundled into one
+// struct rather than threaded as loose parameters because the list grows (textures
+// for `tex:`, grids for `grid:`, …) and every growth would otherwise touch all nine
+// call sites and both forward declarations.
+//
+// dPatEnvNone() is the OUT-OF-SCOPE environment used at value sites the host compiler
+// already refuses `tex:`/`grid:` at (implicit field formulas, medium density/ior), so
+// such a node can never actually appear there; the null tables just make the VM
+// total instead of undefined if one ever did.
+struct DPatEnv {
+    const DTexture*   tex;      int nTex;
+    const PatGrid*    grids;    int nGrids;
+    const PatScatter* scatters; int nScatters;
+    const float*      dataPool; int dataPoolN;
+};
+__host__ __device__ static inline DPatEnv dPatEnvNone() {
+    DPatEnv e; e.tex = nullptr; e.nTex = 0;
+    e.grids = nullptr; e.nGrids = 0;
+    e.scatters = nullptr; e.nScatters = 0;
+    e.dataPool = nullptr; e.dataPoolN = 0;
+    return e;
+}
+__host__ __device__ static inline DPatEnv dPatEnvOf(const DScene& sc) {
+    DPatEnv e; e.tex = sc.textures; e.nTex = sc.nTex;
+    e.grids = sc.grids; e.nGrids = sc.nGrids;
+    e.scatters = sc.scatters; e.nScatters = sc.nScatters;
+    e.dataPool = sc.dataPool; e.dataPoolN = sc.dataPoolN;
+    return e;
+}
 
 // Lens-projection radius maps (device twins of camera.h projRadius/Inv/Deriv). The
 // projection tag matches CameraProjection (camera.h): 0 rectilinear, 1 equidistant,
@@ -1056,6 +1245,16 @@ __device__ static Real specLookup(const double* tab, Real lambda) {
     int i = (int)f; Real frac = f - i;
     return (Real)tab[i] * ((Real)1 - frac) + (Real)tab[i + 1] * frac;
 }
+__device__ static inline double dSunRadiance(const DScene& sc, const DVec3& d, Real lambda) {
+    if (sc.sunCount == 0) return 0.0;
+    double L = 0.0;
+    for (int k = 0; k < sc.nEmitters; ++k) {
+        const DEmitter& e = sc.emitters[k];
+        if (e.shape == 6 && dInSunCone(e, d)) L += (double)specLookup(e.emitSpd, lambda);
+    }
+    return L;
+}
+
 __device__ static Real medSigmaT(const DMedium& m, Real lambda) {
     Real a = specLookup(m.sigma_a, lambda), s = specLookup(m.sigma_s, lambda);
     Real v = fmax((Real)0, a) + fmax((Real)0, s);
@@ -1072,57 +1271,122 @@ __device__ static Real medAlbedo(const DMedium& m, Real lambda) {
 __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
-                                      double u, double v);
+                                      double u, double v,
+                                      const DPatEnv& env);
 __device__ static double dFieldEval(const DFieldNode* nodes, int n,
                                     double pwx, double pwy, double pwz,
-                                    const PatNode* exprPool);
+                                    const PatNode* exprPool, const DPatEnv& env);
+
+// IEEE-754 binary16 -> binary32 (device twin of halfBitsToFloat in vdbgrid.h).
+// The uploaded VDB lattice is fp16; this decodes it in the hot density sampler.
+// Portable bit math (no cuda_fp16 dependency, HIP-safe).
+__device__ static inline float dHalfBitsToFloat(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp  = (h >> 10) & 0x1Fu;
+    uint32_t man  = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) { bits = sign; }
+        else {
+            exp = 1;
+            while ((man & 0x400u) == 0) { man <<= 1; --exp; }
+            man &= 0x3FFu;
+            bits = sign | ((uint32_t)(exp + (127 - 15)) << 23) | (man << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (man << 13);
+    } else {
+        bits = sign | ((uint32_t)(exp + (127 - 15)) << 23) | (man << 13);
+    }
+    float f; memcpy(&f, &bits, sizeof(f)); return f;
+}
+
+// Trilinearly sample a sparse brick grid at a world point (>= 0; 0 outside the lattice).
+// Device twin of VdbGrid::sample — bit-for-bit with the host (stencil clamped to
+// [0,n-1]). Shared by the density multiplier and the emissive temperature field.
+__device__ static double dVdbSample(const DVdbGrid& g, const DVec3& p) {
+    double rx = (double)p.x - g.w0.x, ry = (double)p.y - g.w0.y, rz = (double)p.z - g.w0.z;
+    double fi = g.ainv[0]*rx + g.ainv[1]*ry + g.ainv[2]*rz - g.imin.x;
+    double fj = g.ainv[3]*rx + g.ainv[4]*ry + g.ainv[5]*rz - g.imin.y;
+    double fk = g.ainv[6]*rx + g.ainv[7]*ry + g.ainv[8]*rz - g.imin.z;
+    int nx = g.nx, ny = g.ny, nz = g.nz;
+    if (fi < -0.5 || fj < -0.5 || fk < -0.5 ||
+        fi > nx - 0.5 || fj > ny - 0.5 || fk > nz - 0.5) return 0.0;
+    // Clamp the COORDINATE (not just the stencil indices) — see VdbGrid::sample.
+    auto cld = [](double v, double hi) { return v < 0.0 ? 0.0 : (v > hi ? hi : v); };
+    double ci = cld(fi, nx-1), cj = cld(fj, ny-1), ck = cld(fk, nz-1);
+    int i0c = (int)ci, j0c = (int)cj, k0c = (int)ck;   // ci >= 0, so trunc == floor
+    int i1c = i0c + 1 < nx ? i0c + 1 : nx - 1;
+    int j1c = j0c + 1 < ny ? j0c + 1 : ny - 1;
+    int k1c = k0c + 1 < nz ? k0c + 1 : nz - 1;
+    double tx = ci - i0c, ty = cj - j0c, tz = ck - k0c;
+    const int32_t*  BI = g.brickIndex;
+    const uint16_t* BD = g.brickData;
+    const int  sh = g.brickShift, mask = g.brickB - 1;
+    const int  bxN = g.bx, byN = g.by;
+    const size_t B3 = (size_t)g.brickB * g.brickB * g.brickB;
+    auto AT = [&](int i, int j, int k) -> double {
+        int slot = BI[(((size_t)(k>>sh))*byN + (j>>sh))*bxN + (i>>sh)];
+        if (slot < 0) return 0.0;
+        int li = i & mask, lj = j & mask, lk = k & mask;
+        return (double)dHalfBitsToFloat(BD[(size_t)slot*B3 + ((size_t)lk*g.brickB + lj)*g.brickB + li]);
+    };
+    double c00 = AT(i0c,j0c,k0c)*(1-tx) + AT(i1c,j0c,k0c)*tx;
+    double c10 = AT(i0c,j1c,k0c)*(1-tx) + AT(i1c,j1c,k0c)*tx;
+    double c01 = AT(i0c,j0c,k1c)*(1-tx) + AT(i1c,j0c,k1c)*tx;
+    double c11 = AT(i0c,j1c,k1c)*(1-tx) + AT(i1c,j1c,k1c)*tx;
+    double c0 = c00*(1-ty) + c10*ty, c1 = c01*(1-ty) + c11*ty;
+    double v = c0*(1-tz) + c1*tz;
+    return v > 0.0 ? v : 0.0;
+}
 
 // Dimensionless density multiplier at a world point (>= 0). Device twin of
 // Medium::densityAt: the shared pattern VM with x y z r live (f/normal/uv read 0).
 // For an implicit bound the multiplier is 0 outside the field (medium absent there).
-__device__ static double dMedDensityAt(const DMedium& m, const DVec3& p) {
+__device__ static double dMedDensityAt(const DMedium& m, const DVec3& p, const DPatEnv& env) {
     if (m.boundShape == 2 && m.boundField) {   // implicit-field membership carve-out
-        double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr);
+        double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr, env);
         bool inside = m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
         if (!inside) return 0.0;
     }
-    // Imported .nvdb volume: trilinearly sample the uploaded dense grid (device twin
-    // of VdbGrid::sample). Takes precedence over the pattern-VM density formula.
-    if (m.vdbData) {
-        double rx = (double)p.x - m.vdbW0.x, ry = (double)p.y - m.vdbW0.y, rz = (double)p.z - m.vdbW0.z;
-        double fi = m.vdbAinv[0]*rx + m.vdbAinv[1]*ry + m.vdbAinv[2]*rz - m.vdbImin.x;
-        double fj = m.vdbAinv[3]*rx + m.vdbAinv[4]*ry + m.vdbAinv[5]*rz - m.vdbImin.y;
-        double fk = m.vdbAinv[6]*rx + m.vdbAinv[7]*ry + m.vdbAinv[8]*rz - m.vdbImin.z;
-        int nx = m.vdbNx, ny = m.vdbNy, nz = m.vdbNz;
-        if (fi < -0.5 || fj < -0.5 || fk < -0.5 ||
-            fi > nx - 0.5 || fj > ny - 0.5 || fk > nz - 0.5) return 0.0;
-        double ffi = floor(fi), ffj = floor(fj), ffk = floor(fk);
-        int i0 = (int)ffi, j0 = (int)ffj, k0 = (int)ffk;
-        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
-        int i0c = cl(i0, nx-1), i1c = cl(i0+1, nx-1);
-        int j0c = cl(j0, ny-1), j1c = cl(j0+1, ny-1);
-        int k0c = cl(k0, nz-1), k1c = cl(k0+1, nz-1);
-        double tx = fi - ffi, ty = fj - ffj, tz = fk - ffk;
-        tx = tx < 0 ? 0 : (tx > 1 ? 1 : tx);
-        ty = ty < 0 ? 0 : (ty > 1 ? 1 : ty);
-        tz = tz < 0 ? 0 : (tz > 1 ? 1 : tz);
-        const float* D = m.vdbData;
-        auto AT = [&](int i, int j, int k) -> double {
-            return (double)D[((size_t)k * ny + j) * nx + i];
-        };
-        double c00 = AT(i0c,j0c,k0c)*(1-tx) + AT(i1c,j0c,k0c)*tx;
-        double c10 = AT(i0c,j1c,k0c)*(1-tx) + AT(i1c,j1c,k0c)*tx;
-        double c01 = AT(i0c,j0c,k1c)*(1-tx) + AT(i1c,j0c,k1c)*tx;
-        double c11 = AT(i0c,j1c,k1c)*(1-tx) + AT(i1c,j1c,k1c)*tx;
-        double c0 = c00*(1-ty) + c10*ty, c1 = c01*(1-ty) + c11*ty;
-        double v = c0*(1-tz) + c1*tz;
-        return v > 0.0 ? v : 0.0;
-    }
+    // Imported .nvdb/.vdb volume: trilinearly sample the uploaded sparse brick grid.
+    // Takes precedence over the pattern-VM density.
+    if (m.densGrid.brickData) return dVdbSample(m.densGrid, p);
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, env);
     return d > 0.0 ? d : 0.0;
+}
+
+// Planck spectral radiance at temperature `kelvin`, wavelength `lambdaNm` (device twin
+// of blackbodyRadiance, spectrum.h). Kept in double so the exp stays accurate.
+__device__ static double dBlackbodyRadiance(double kelvin, double lambdaNm) {
+    const double h = 6.62607015e-34, c = 2.99792458e8, kb = 1.380649e-23;
+    double l = lambdaNm * 1e-9;
+    double e = exp((h * c) / (l * kb * kelvin)) - 1.0;
+    return (2.0 * h * c * c) / (pow(l, 5.0) * e);
+}
+// Planck radiance normalised against the fixed 6500 K / 560 nm reference (device twin
+// of blackbodyEmissionRadiance). kRef is a compile-time-derivable constant here.
+__device__ static double dBlackbodyEmissionRadiance(double kelvin, double lambdaNm) {
+    const double kRef = dBlackbodyRadiance(6500.0, 560.0);   // matches host kRef exactly
+    return dBlackbodyRadiance(kelvin, lambdaNm) / kRef;
+}
+// Physical temperature (Kelvin) at a world point; 0 outside the grid / cold. Device twin
+// of Medium::temperatureAt (peak-normalised T = emitKelvin * raw/tempPeak).
+__device__ static double dMedTemperatureAt(const DMedium& m, const DVec3& p) {
+    if (!m.emissive || !m.tempGrid.brickData) return 0.0;
+    double raw = dVdbSample(m.tempGrid, p);
+    if (raw <= 0.0) return 0.0;
+    return m.emitKelvin * (raw / (m.tempPeak > 0.0 ? m.tempPeak : 1.0));
+}
+// Volumetric emission SOURCE radiance L_e(x,lambda) (>= 0). Device twin of
+// Medium::emissionAt: emissionScale * blackbodyEmissionRadiance(T(x), lambda).
+__device__ static double dMedEmissionAt(const DMedium& m, const DVec3& p, double lambda) {
+    double T = dMedTemperatureAt(m, p);
+    if (T <= 0.0) return 0.0;
+    return m.emissionScale * dBlackbodyEmissionRadiance(T, lambda);
 }
 
 // Clip ray (o + t*dir, t in [t0,t1]) to the medium bound. Device twin of
@@ -1172,7 +1436,7 @@ __device__ static bool dMedClip(const DMedium& m, const DVec3& o, const DVec3& d
 // with the CPU marcher (grin.h) so CPU and GPU bend rays identically.
 
 // Point-in-bound membership (device twin of Medium::insideBound).
-__device__ static bool dMedInside(const DMedium& m, const DVec3& p) {
+__device__ static bool dMedInside(const DMedium& m, const DVec3& p, const DPatEnv& env) {
     if (!m.bounded) return true;
     if (m.boundShape == 1) {   // sphere
         double dx = (double)p.x - m.bcenter.x, dy = (double)p.y - m.bcenter.y,
@@ -1180,7 +1444,7 @@ __device__ static bool dMedInside(const DMedium& m, const DVec3& p) {
         return dx * dx + dy * dy + dz * dz <= m.bradius * m.bradius;
     }
     if (m.boundShape == 2 && m.boundField) {   // implicit field
-        double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr);
+        double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr, env);
         return m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
     }
     return p.x >= m.bmin.x && p.x <= m.bmax.x && p.y >= m.bmin.y &&
@@ -1189,23 +1453,24 @@ __device__ static bool dMedInside(const DMedium& m, const DVec3& p) {
 
 // Local refractive index n at a world point (device twin of Medium::nAt): the shared
 // pattern VM with x y z r live, floored at 1e-3. 1.0 when this medium is not GRIN.
-__device__ static double dMedNAt(const DMedium& m, const DVec3& p) {
+__device__ static double dMedNAt(const DMedium& m, const DVec3& p, const DPatEnv& env) {
     if (m.iorN <= 0 || !m.ior) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double n = dPatternEval(m.ior, m.iorN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, env);
     return n > 1e-3 ? n : 1e-3;
 }
 
 // ∇n at a world point via central differences with step h (device twin of Medium::gradNAt).
-__device__ static DVec3 dMedGradN(const DMedium& m, const DVec3& p, double h) {
+__device__ static DVec3 dMedGradN(const DMedium& m, const DVec3& p, double h,
+                                  const DPatEnv& env) {
     double inv = 0.5 / h;
     DVec3 xp = p, xm = p; xp.x = (Real)(p.x + h); xm.x = (Real)(p.x - h);
     DVec3 yp = p, ym = p; yp.y = (Real)(p.y + h); ym.y = (Real)(p.y - h);
     DVec3 zp = p, zm = p; zp.z = (Real)(p.z + h); zm.z = (Real)(p.z - h);
-    double gx = dMedNAt(m, xp) - dMedNAt(m, xm);
-    double gy = dMedNAt(m, yp) - dMedNAt(m, ym);
-    double gz = dMedNAt(m, zp) - dMedNAt(m, zm);
+    double gx = dMedNAt(m, xp, env) - dMedNAt(m, xm, env);
+    double gy = dMedNAt(m, yp, env) - dMedNAt(m, ym, env);
+    double gz = dMedNAt(m, zp, env) - dMedNAt(m, zm, env);
     return DVec3{ (Real)(gx * inv), (Real)(gy * inv), (Real)(gz * inv) };
 }
 
@@ -1216,7 +1481,8 @@ __device__ static DVec3 dMedGradN(const DMedium& m, const DVec3& p, double h) {
 // Renderer::sampleMediumCollision: exact analytic free-flight (one draw) for a
 // homogeneous medium (bit-identical to before), else delta (Woodcock) tracking.
 __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, const DVec3& dir,
-                                           Real dMax, Real lambda, DRng& rng, Real& tHit) {
+                                           Real dMax, Real lambda, DRng& rng, Real& tHit,
+                                           const DPatEnv& env) {
     double stBase = (double)medSigmaT(m, lambda);
     if (stBase <= 0.0) return false;
     double ta, tb;
@@ -1233,7 +1499,7 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
         t += -log(1.0 - (double)rng.uniform()) / sigMax;
         if (t >= tb) return false;
         DVec3 pp = o + dir * (Real)t;
-        double sigT = stBase * dMedDensityAt(m, pp);
+        double sigT = stBase * dMedDensityAt(m, pp, env);
         if ((double)rng.uniform() * sigMax < sigT) { tHit = (Real)t; return true; }
     }
 }
@@ -1242,7 +1508,8 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
 // Renderer::mediumTransmittance: exact exp for a homogeneous medium (no RNG draw), else
 // ratio tracking. Homogeneous scenes therefore keep the exact analytic transmittance.
 __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const DVec3& dir,
-                                         Real dist, Real lambda, DRng& rng) {
+                                         Real dist, Real lambda, DRng& rng,
+                                         const DPatEnv& env) {
     double stBase = (double)medSigmaT(m, lambda);
     if (stBase <= 0.0) return (Real)1;
     double ta, tb;
@@ -1255,7 +1522,7 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
         t += -log(1.0 - (double)rng.uniform()) / sigMax;
         if (t >= tb) break;
         DVec3 pp = o + dir * (Real)t;
-        double sigT = stBase * dMedDensityAt(m, pp);
+        double sigT = stBase * dMedDensityAt(m, pp, env);
         Tr *= 1.0 - sigT / sigMax;
     }
     return (Real)Tr;
@@ -1267,13 +1534,18 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
 // per-medium transmittances, and the first collision across all media is the EARLIEST
 // of their independent free-flight samples (Poisson superposition). With one medium
 // these reduce to the exact single-medium paths above.
-__device__ static bool dMediaSampleCollision(const DMedium* media, int n, const DVec3& o,
+// Take the whole DScene (not just media[0..n)) because a density program may sample the
+// scene's grid:/scatter: tables, which live beside the media — same reasoning as the
+// host's Renderer::sampleMediaCollision, and it means no call site can forget them.
+__device__ static bool dMediaSampleCollision(const DScene& sc, const DVec3& o,
                                              const DVec3& dir, Real dMax, Real lambda,
                                              DRng& rng, Real& tHit, int& whichMed) {
+    const DMedium* media = sc.media; const int n = sc.mediaN;
+    const DPatEnv env = dPatEnvOf(sc);
     Real best = dMax; int which = -1;
     for (int i = 0; i < n; ++i) {
         Real t;
-        if (dMedSampleCollision(media[i], o, dir, dMax, lambda, rng, t) && t < best) {
+        if (dMedSampleCollision(media[i], o, dir, dMax, lambda, rng, t, env) && t < best) {
             best = t; which = i;
         }
     }
@@ -1281,11 +1553,12 @@ __device__ static bool dMediaSampleCollision(const DMedium* media, int n, const 
     tHit = best; whichMed = which; return true;
 }
 
-__device__ static Real dMediaTransmittance(const DMedium* media, int n, const DVec3& o,
+__device__ static Real dMediaTransmittance(const DScene& sc, const DVec3& o,
                                            const DVec3& dir, Real dist, Real lambda, DRng& rng) {
+    const DPatEnv env = dPatEnvOf(sc);       // see dMediaSampleCollision
     Real Tr = (Real)1;
-    for (int i = 0; i < n; ++i) {
-        Tr *= dMedTransmittance(media[i], o, dir, dist, lambda, rng);
+    for (int i = 0; i < sc.mediaN; ++i) {
+        Tr *= dMedTransmittance(sc.media[i], o, dir, dist, lambda, rng, env);
         if (Tr <= (Real)0) break;
     }
     return Tr;
@@ -1422,6 +1695,7 @@ struct DHit {
     DVec3 p, n, ng;
     int matId, sensorId;
     Real u, v;   // interpolated surface texture coordinates
+    DVec3 tangent; Real bitangentSign;  // C6 surface tangent frame for normal mapping
 };
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
@@ -1445,14 +1719,20 @@ __device__ static inline float dSmaxF(float a, float b, float k) { return -dSmin
 __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
-                                      double u, double v);
+                                      double u, double v,
+                                      const DPatEnv& env);
 __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float x, float y, float z, float f,
                                       float nx, float ny, float nz, float r,
-                                      float u, float v);
+                                      float u, float v, const DPatEnv& env);
 
+// `env` publishes the scene's texture/grid/scatter tables so a DF_EXPR leaf can BE a
+// sampled volume or height field (`function { expr "grid:terrain(x, z) - y" }`), exactly
+// as the host's fieldLeafSDF takes a PatTables. Pass dPatEnvOf(sc), never dPatEnvNone(),
+// at any site reachable from a real scene: a `grid:` node evaluated without its table
+// makes patternEval bail to 0, i.e. an empty field.
 __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double py, double pz,
-                                       const PatNode* exprPool) {
+                                       const PatNode* exprPool, const DPatEnv& env) {
     switch (nd.op) {
         case DF_SPHERE:
             return sqrt(px*px + py*py + pz*pz) - nd.p[0];
@@ -1460,7 +1740,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
             if (!exprPool) return BIG;
             double r = sqrt(px*px + py*py + pz*pz);
             return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r, 0.0, 0.0);
+                                0.0, 0.0, 0.0, r, 0.0, 0.0, env);
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -1503,7 +1783,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
 // Whole-field SDF at world point (pw) via the postfix scalar stack. Mirrors fieldEval.
 __device__ static double dFieldEval(const DFieldNode* nodes, int n,
                                     double pwx, double pwy, double pwz,
-                                    const PatNode* exprPool) {
+                                    const PatNode* exprPool, const DPatEnv& env) {
     double st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const DFieldNode& nd = nodes[i];
@@ -1518,7 +1798,7 @@ __device__ static double dFieldEval(const DFieldNode* nodes, int n,
                 double plx = nd.inv[0]*pwx + nd.inv[1]*pwy + nd.inv[2]*pwz + nd.tx;
                 double ply = nd.inv[3]*pwx + nd.inv[4]*pwy + nd.inv[5]*pwz + nd.ty;
                 double plz = nd.inv[6]*pwx + nd.inv[7]*pwy + nd.inv[8]*pwz + nd.tz;
-                st[sp++] = dFieldLeafSDF(nd, plx, ply, plz, exprPool) * nd.scale;
+                st[sp++] = dFieldLeafSDF(nd, plx, ply, plz, exprPool, env) * nd.scale;
             }
         }
     }
@@ -1527,7 +1807,7 @@ __device__ static double dFieldEval(const DFieldNode* nodes, int n,
 // ---- FP32 twins of the field VM (see DFieldNodeF): used ONLY by the sphere-trace
 // march/refine in intersectImplicit, where the result is stored in float anyway.
 __device__ static float dFieldLeafSDFF(const DFieldNodeF& nd, float px, float py, float pz,
-                                       const PatNodeF* exprPool) {
+                                       const PatNodeF* exprPool, const DPatEnv& env) {
     switch (nd.op) {
         case DF_SPHERE:
             return sqrtf(px*px + py*py + pz*pz) - nd.p[0];
@@ -1535,7 +1815,7 @@ __device__ static float dFieldLeafSDFF(const DFieldNodeF& nd, float px, float py
             if (!exprPool) return (float)BIG;
             float r = sqrtf(px*px + py*py + pz*pz);
             return dPatternEvalF(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0f,
-                                 0.0f, 0.0f, 0.0f, r, 0.0f, 0.0f);
+                                 0.0f, 0.0f, 0.0f, r, 0.0f, 0.0f, env);
         }
         case DF_BOX: {
             float r = nd.p[3];
@@ -1577,7 +1857,7 @@ __device__ static float dFieldLeafSDFF(const DFieldNodeF& nd, float px, float py
 }
 __device__ static float dFieldEvalF(const DFieldNodeF* nodes, int n,
                                     float pwx, float pwy, float pwz,
-                                    const PatNodeF* exprPool) {
+                                    const PatNodeF* exprPool, const DPatEnv& env) {
     float st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const DFieldNodeF& nd = nodes[i];
@@ -1592,7 +1872,7 @@ __device__ static float dFieldEvalF(const DFieldNodeF* nodes, int n,
                 float plx = nd.inv[0]*pwx + nd.inv[1]*pwy + nd.inv[2]*pwz + nd.tx;
                 float ply = nd.inv[3]*pwx + nd.inv[4]*pwy + nd.inv[5]*pwz + nd.ty;
                 float plz = nd.inv[6]*pwx + nd.inv[7]*pwy + nd.inv[8]*pwz + nd.tz;
-                st[sp++] = dFieldLeafSDFF(nd, plx, ply, plz, exprPool) * nd.scale;
+                st[sp++] = dFieldLeafSDFF(nd, plx, ply, plz, exprPool, env) * nd.scale;
             }
         }
     }
@@ -1602,12 +1882,12 @@ __device__ static float dFieldEvalF(const DFieldNodeF* nodes, int n,
 __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
                                       double px, double py, double pz, double eps,
                                       double& gx, double& gy, double& gz,
-                                      const PatNode* exprPool) {
+                                      const PatNode* exprPool, const DPatEnv& env) {
     // stencil offsets k1(1,-1,-1) k2(-1,-1,1) k3(-1,1,-1) k4(1,1,1)
-    double f1 = dFieldEval(nodes, n, px + eps, py - eps, pz - eps, exprPool);
-    double f2 = dFieldEval(nodes, n, px - eps, py - eps, pz + eps, exprPool);
-    double f3 = dFieldEval(nodes, n, px - eps, py + eps, pz - eps, exprPool);
-    double f4 = dFieldEval(nodes, n, px + eps, py + eps, pz + eps, exprPool);
+    double f1 = dFieldEval(nodes, n, px + eps, py - eps, pz - eps, exprPool, env);
+    double f2 = dFieldEval(nodes, n, px - eps, py - eps, pz + eps, exprPool, env);
+    double f3 = dFieldEval(nodes, n, px - eps, py + eps, pz - eps, exprPool, env);
+    double f4 = dFieldEval(nodes, n, px + eps, py + eps, pz + eps, exprPool, env);
     gx =  f1 - f2 - f3 + f4;
     gy = -f1 - f2 + f3 + f4;
     gz = -f1 + f2 - f3 + f4;
@@ -1655,6 +1935,9 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     const DFieldNodeF* ndF = sc.fieldNodesF + im.nodeOff;
     const PatNodeF* exprPoolF = sc.fieldExprNodesF;
     const int N = im.nodeN;
+    // The scene's texture/grid/scatter tables, so a `function` leaf that samples a
+    // measured volume marches the real field (dPatEnvNone() would read 0 everywhere).
+    const DPatEnv env = dPatEnvOf(sc);
 
     // ---- Container clip: entry/exit params [tEnter, tExit] and the container's OUTWARD
     // normals at those crossings (needed to shade caps). Box (lo/hi) or world sphere.
@@ -1738,7 +2021,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     };
 
     float t = (float)t0;
-    float f = dFieldEvalF(ndF, N, oxF + dxF*t, oyF + dyF*t, ozF + dzF*t, exprPoolF);
+    float f = dFieldEvalF(ndF, N, oxF + dxF*t, oyF + dyF*t, ozF + dzF*t, exprPoolF, env);
     // NEAR CAP: ray enters the container already inside the solid (f<0); the container
     // face is the nearest surface. `open` skips this to reveal the cut edge.
     if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0f)
@@ -1748,7 +2031,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         float tn = t + step;
         bool last = false;
         if (tn >= t1F) { tn = t1F; last = true; }
-        float fn = dFieldEvalF(ndF, N, oxF + dxF*tn, oyF + dyF*tn, ozF + dzF*tn, exprPoolF);
+        float fn = dFieldEvalF(ndF, N, oxF + dxF*tn, oyF + dyF*tn, ozF + dzF*tn, exprPoolF, env);
         bool crossed = (f > 0.0f && fn <= 0.0f) || (f < 0.0f && fn >= 0.0f) || (f == 0.0f && fn != 0.0f);
         if (crossed) {
             float ta = t, tb = tn, fa = f, fb = fn;
@@ -1762,7 +2045,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
                     tm = 0.5f*(ta + tb);
                 }
                 if (tm <= ta || tm >= tb) break;   // float interval exhausted: converged
-                float fm = dFieldEvalF(ndF, N, oxF + dxF*tm, oyF + dyF*tm, ozF + dzF*tm, exprPoolF);
+                float fm = dFieldEvalF(ndF, N, oxF + dxF*tm, oyF + dyF*tm, ozF + dzF*tm, exprPoolF, env);
                 if ((fa > 0.0f) == (fm > 0.0f)) {
                     ta = tm; fa = fm;
                     if (regulaFalsi && rfSide == +1) fb *= 0.5f;
@@ -1777,7 +2060,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             if (th < tmin || th >= (double)hit.t) return false;
             double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
             double eps = fmax(1e-6, 1e-4*th);
-            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool);
+            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env);
             return writeHit(th, px, py, pz, gx, gy, gz);
         }
         if (last) {
@@ -1851,6 +2134,8 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     Real nl = dot(ns, ns);
     ns = (nl > (Real)1e-18) ? ns * ((Real)1 / sqrt(nl)) : tri.gn;
     hit.n = (dot(rd, ns) < 0) ? ns : -ns;
+    hit.tangent = tri.tangent;                 // per-triangle tangent (C6 normal mapping)
+    hit.bitangentSign = (Real)tri.bitangentSign;
     return true;
 }
 // Interface-preserving wrapper (builds the shear inline) for any one-off caller.
@@ -1877,6 +2162,11 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     Real ny = ng.y < (Real)-1 ? (Real)-1 : (ng.y > (Real)1 ? (Real)1 : ng.y);
     hit.u = (Real)0.5 + atan2(ng.z, ng.x) / (Real)(2.0 * DPI);
     hit.v = (Real)0.5 - asin(ny) / (Real)DPI;
+    // Longitude (east) tangent d/du, mirroring the host sphere path (C6).
+    DVec3 tg{-ng.z, (Real)0, ng.x};
+    Real tgl = sqrt(dot(tg, tg));
+    hit.tangent = (tgl > (Real)1e-9) ? tg * ((Real)1 / tgl) : DVec3{(Real)1, (Real)0, (Real)0};
+    hit.bitangentSign = (Real)1;
     return true;
 }
 __device__ static bool boxHit(const DNode& nd, const DVec3& ro, const DVec3& invD,
@@ -1999,6 +2289,10 @@ __device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro
     DVec3 wng = normalize(affDir(inst.Nm, lh.ng));
     lh.ng = wng;
     lh.n  = (dot(rd, wn) < 0) ? wn : -wn;
+    // Map the surface tangent through the instance's toWorld linear part (C6).
+    DVec3 wt = affDir(inst.Wm, lh.tangent);
+    Real wtl = sqrt(dot(wt, wt));
+    if (wtl > (Real)1e-12) lh.tangent = wt * ((Real)1 / wtl);
     if (inst.matOverride >= 0) lh.matId = inst.matOverride;
 }
 
@@ -2007,6 +2301,10 @@ __device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro
 // only cares about "anything within d?" skips nearly the whole tree). Default BIG keeps
 // every existing call site's behaviour bit-identical. Used by dGrinMarch, whose per-step
 // query only consumes hits within one Eikonal step length.
+// Forward decl: the tangent-space normal-map perturbation (C6) is defined below with the
+// texture samplers (which depend on dWrapIndex), but is called from closestHit's tail.
+__device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h);
+
 __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3& rd,
                                    Real tmin = RAY_EPS, Real tCap = BIG) {
     DHit h; h.t = tCap; h.valid = false; h.matId = 0; h.sensorId = -1;
@@ -2055,6 +2353,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
             else if (hR)   { stack[sp] = n.right; tStack[sp] = tR; ++sp; }
         }
     }
+    dApplyNormalMap(sc, h);   // C6: perturb shading normal by a bound normal map
     return h;
 }
 
@@ -2082,13 +2381,16 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd) {
     // lens matches CPU to ~the noise floor (see known-issues.md "mode-R GRIN radial caustic").
     double px = ro.x, py = ro.y, pz = ro.z;
     double dx = rd.x, dy = rd.y, dz = rd.z;
+    // Hoisted out of the (up to 10^5-iteration) march: three pointer copies, so an `ior`
+    // field can read a MEASURED index volume (`ior "1 + grid:n(x, y, z)"`).
+    const DPatEnv env = dPatEnvOf(sc);
     for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
         DVec3 cro{px, py, pz}, crd{dx, dy, dz};   // float snapshot for the geometry queries
         // GRIN region containing ro (first enabled GRIN membership), or -1.
         int gm = -1;
         for (int mi = 0; mi < sc.mediaN; ++mi) {
             const DMedium& md = sc.media[mi];
-            if (md.enabled && md.iorN > 0 && dMedInside(md, cro)) { gm = mi; break; }
+            if (md.enabled && md.iorN > 0 && dMedInside(md, cro, env)) { gm = mi; break; }
         }
         if (gm < 0) {
             // Outside any GRIN region: jump to the nearest GRIN entry before the next
@@ -2126,8 +2428,8 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd) {
         if (hs.valid && (double)hs.t <= ds) break;   // surface within a step
         // Symplectic Eikonal step with optical direction T = n·d (|T| = n):
         //   T += ∇n·ds ;  x += (T/n)·ds ;  d = T/|T|.
-        double n0 = dMedNAt(g, cro);
-        DVec3 grad = dMedGradN(g, cro, 0.5 * ds);
+        double n0 = dMedNAt(g, cro, env);
+        DVec3 grad = dMedGradN(g, cro, 0.5 * ds, env);
         double Tx = dx * n0 + (double)grad.x * ds;
         double Ty = dy * n0 + (double)grad.y * ds;
         double Tz = dz * n0 + (double)grad.z * ds;
@@ -2447,7 +2749,7 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * f * cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
-    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // `med` is the medium that scattered the photon (its phase/albedo); transmittance is
@@ -2468,7 +2770,7 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
     // scattering; normalise by dist^2 * pixelSolidAngle (rectilinear or fisheye).
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * Lambda * ph / (Real)((double)dist2 * solidAngle);
-    contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A (physical camera): next-event splat through the finite lens pupil. Sample a
@@ -2507,7 +2809,7 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     // mode B's radiance*camEq absolute scale. Per-camera constant; auto-exposed scenes
     // stay byte-identical, only absolute-EV A/C are re-seated to mid-tone at gain 6.
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
@@ -2537,7 +2839,7 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     // Same flux->film-irradiance normaliser as connectLens (see there); per-camera
     // constant, so auto-exposed scenes are unaffected.
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-    contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lambda, rng);
+    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 
@@ -2553,12 +2855,19 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
 // standalone render in distribution only. (A HETEROGENEOUS medium adds a ratio-tracking
 // transmittance draw per connect, so multi-cam model-B also matches only in distribution
 // then — inherent to the estimator, and consistent with the CPU tracer.)
-// One deposited photon (device twin of Photon in photonmap.h): where light landed, the
-// incident direction (= -travel), the shading normal (for cross-surface leak rejection),
-// and the monochromatic power / wavelength it carried. Laid out to round-trip through the
-// host PhotonMap (float here <-> double on the host build).
+// One deposited photon (device twin of Photon + PhotonMap::pos in photonmap.h): where
+// light landed, the shading normal (for cross-surface leak rejection), and the
+// monochromatic power / wavelength it carried. Laid out to round-trip through the host
+// PhotonMap (float here <-> double on the host build).
+//
+// There is NO incident direction: nothing reads one. The density estimate is Lambertian,
+// so neither the device gather (kSppmGatherConvert -> DGatherPhoton) nor the host gather
+// ever looked at it — it was pure freight. This buffer is capacity-limited (depCap is
+// sized from FREE VRAM), so every byte per record is photons the GPU can't hold: dropping
+// it shrinks the record from 44 to 32 bytes, ~27% more photons in the same VRAM. Don't add
+// a field here without a reader.
 struct DPhoton {
-    DVec3 pos, wi, n;
+    DVec3 pos, n;
     float power, lambda;
 };
 
@@ -2585,8 +2894,8 @@ struct DCamSet {
 };
 
 // Gather-tuned photon record: what the mode-M density-estimate kernel actually reads.
-// The deposit-side DPhoton carries (pos, wi, n, power, lambda), but the gather never
-// reads wi, and it weighted every visited photon by cie{X,Y,Z}(lambda_p) * power *
+// The deposit-side DPhoton carries (pos, n, power, lambda); the gather used to weight
+// every visited photon by cie{X,Y,Z}(lambda_p) * power *
 // norm / pi — all per-photon CONSTANTS of the estimate (norm = 1/(pi r^2 nEmitted)).
 // That triple is folded into pX/pY/pZ at upload time (host doubles from PhotonMap::cie
 // times power*norm/pi, rounded to float once), so the per-photon inner loop is just
@@ -2633,13 +2942,15 @@ __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int 
 // (normal renders leave cs.depCount == nullptr, so this compiles away to nothing).
 // Always increments the atomic count (so a null-buffer sizing pass measures the exact
 // deposit total); stores only when a buffer is bound and the slot is within capacity.
-__device__ static void depositPhoton(const DCamSet& cs, const DVec3& p, const DVec3& wtravel,
+// The photon's travel/incident direction is deliberately not a parameter: no gather reads
+// it (see DPhoton), so it isn't stored (matches Renderer::depositPhoton on the host).
+__device__ static void depositPhoton(const DCamSet& cs, const DVec3& p,
                                      const DVec3& n, Real beta, Real lambda) {
     if (!cs.depCount) return;
     unsigned long long i = atomicAdd(cs.depCount, 1ULL);
     if (cs.depPhotons && i < cs.depCap) {
         DPhoton ph;
-        ph.pos = p; ph.wi = -wtravel; ph.n = n;
+        ph.pos = p; ph.n = n;
         ph.power = (float)beta; ph.lambda = (float)lambda;
         cs.depPhotons[i] = ph;
     }
@@ -2651,6 +2962,55 @@ __device__ static void splatVolumeAll(const DScene& sc, const DMedium& med, cons
     for (int c = 0; c < cs.nCam; ++c) {
         if (camMode == CAM_B) connectVolume(sc, med, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
         else if (camMode == CAM_A) connectLensVolume(sc, med, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
+    }
+}
+
+// Isotropic volumetric-EMISSION splat (fire) — device twin of Renderer::connectEmission-
+// Volume (render.h). Like connectVolume but the albedo*phase is replaced by the isotropic
+// 1/(4pi): a fire voxel radiates equally in all directions, so the direct term is
+// beta*(1/4pi)/(dist^2*pixelSolidAngle)*transmittance. No incoming direction is needed.
+__device__ static void connectEmissionVolume(const DScene& sc, const DCamera& cam,
+                                             double* film, double* hits,
+                                             const DVec3& p, Real lambda, Real beta, DRng& rng) {
+    DVec3 toCam = cam.eye - p;
+    Real dist = length(toCam);
+    DVec3 wdir = toCam / dist;
+    int px, py; Real cosCam, dist2;
+    if (!cam.project(p, px, py, cosCam, dist2)) return;
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    double solidAngle = cam.pixelSolidAngle(cosCam);
+    Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) / (Real)((double)dist2 * solidAngle);
+    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
+}
+// Model A (finite-lens) isotropic emission splat — device twin of connectEmissionLensVolume.
+// As connectLensVolume but albedo*phase -> 1/(4pi).
+__device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera& cam,
+                                                 double* film, double* hits,
+                                                 const DVec3& p, Real lambda, Real beta, DRng& rng) {
+    Real R  = (Real)cam.apertureR;
+    Real rr = R * sqrt(rng.uniform());
+    Real a  = (Real)(2.0 * DPI) * rng.uniform();
+    DVec3 A = cam.eye + cam.u * (rr * cos(a)) + cam.v * (rr * sin(a));
+    DVec3 toA = A - p;
+    Real dist = length(toA);
+    if (dist < (Real)1e-9) return;
+    DVec3 wdir = toA / dist;
+    Real cosLens = -dot(wdir, cam.w);
+    if (cosLens <= (Real)1e-6) return;
+    int px, py;
+    if (!cam.lensImage(A, wdir, px, py)) return;
+    if (occluded(sc, p + wdir * RAY_EPS, wdir, dist - (Real)2 * RAY_EPS)) return;
+    Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) * cosLens * (Real)DPI * (R * R) / (dist * dist);
+    contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
+    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
+}
+__device__ static void camSplatEmissionAll(const DScene& sc, const DCamSet& cs, int camMode,
+                                            const DVec3& p, Real lambda, Real beta, DRng& rng) {
+    for (int c = 0; c < cs.nCam; ++c) {
+        if (camMode == CAM_B) connectEmissionVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, lambda, beta, rng);
+        else if (camMode == CAM_A) connectEmissionLensVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, lambda, beta, rng);
     }
 }
 
@@ -2913,7 +3273,7 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
         DVec3 wPR = wP.toR();
         if (occluded(sc, (p + wP * 1e-6).toR(), wPR, (Real)(dP - 2e-6))) continue;
         if (sc.mediaN > 0)
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p.toR(), wPR, (Real)dP, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc, p.toR(), wPR, (Real)dP, lambda, rng);
 
         filmAdd(film, hits, cam.resX, px, py, lambda, (Real)contrib);
     }
@@ -3057,8 +3417,8 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         if (occluded(sc, (ch.P1 + wE * 1e-6).toR(), wER, (Real)(dE - 2e-6))) continue;
 
         if (sc.mediaN > 0) {
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p.toR(),   wPR, (Real)dP2, lambda, rng);
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, ch.P1.toR(), wER, (Real)dE, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc, p.toR(),   wPR, (Real)dP2, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc, ch.P1.toR(), wER, (Real)dE, lambda, rng);
         }
         filmAdd(film, hits, cam.resX, px, py, lambda, (Real)contrib);
     }
@@ -3124,6 +3484,20 @@ __device__ static int selectEmitter(const DScene& sc, double u) {
     int lo = 0, hi = sc.nEmitters - 1;
     while (lo < hi) { int mid = (lo + hi) / 2; if (sc.emitCdf[mid] < u) lo = mid + 1; else hi = mid; }
     return lo;
+}
+
+// Invert an emissive volume's Planck-shaped wavelength CDF at uniform u in [0,1).
+// Device twin of EmissionSampler::sampleAt (spectrum.h): returns lambda (nm) and sets
+// pdf = per-nm density = binMass/step. Mirrors the host bit-for-bit.
+__device__ static double dEmissionSampleLambda(const DEmissiveVolume& ev, double u, double& pdf) {
+    const double* cdf = ev.lamCdf;
+    int lo = 0, hi = ev.lamN;   // cdf has lamN+1 entries
+    while (lo + 1 < hi) { int mid = (lo + hi) / 2; (cdf[mid] <= u ? lo : hi) = mid; }
+    double c0 = cdf[lo], c1 = cdf[lo + 1];
+    double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
+    double w = LAMBDA_MIN + (lo + frac) * ev.lamStep;
+    pdf = (c1 - c0) / ev.lamStep;
+    return w;
 }
 
 // --- image-environment device sampling / evaluation (mirror src/envmap.h) --------
@@ -3209,6 +3583,57 @@ __device__ static double dTexScalarAt(const DTexture& tx, Real u, Real v) {
     return a * (1 - fy) + b * fy;
 }
 
+// Tangent-space normal at (u,v) — device twin of Texture::sampleNormalTS (C6). Bilerps
+// the linear RGB, remaps [0,1]->[-1,1], normalizes. v flipped so v=0 is image bottom.
+__device__ static DVec3 dTexNormalAt(const DTexture& tx, Real u, Real v) {
+    if (!tx.rgb) return DVec3{(Real)0, (Real)0, (Real)1};
+    auto texel = [&](int x, int y) -> DVec3 {
+        size_t o = ((size_t)y * tx.w + x) * 3;
+        return DVec3{(Real)tx.rgb[o], (Real)tx.rgb[o + 1], (Real)tx.rgb[o + 2]};
+    };
+    DVec3 c;
+    if (tx.filter == 0) {   // Nearest
+        int x = dWrapIndex((int)floor((double)u * tx.w), tx.w, tx.wrap);
+        int y = dWrapIndex((int)floor((1.0 - (double)v) * tx.h), tx.h, tx.wrap);
+        c = texel(x, y);
+    } else {
+        double tu = (double)u * tx.w - 0.5, tv = (1.0 - (double)v) * tx.h - 0.5;
+        double flx = floor(tu), fly = floor(tv);
+        double fx = tu - flx, fy = tv - fly;
+        int x0 = dWrapIndex((int)flx, tx.w, tx.wrap), x1 = dWrapIndex((int)flx + 1, tx.w, tx.wrap);
+        int y0 = dWrapIndex((int)fly, tx.h, tx.wrap), y1 = dWrapIndex((int)fly + 1, tx.h, tx.wrap);
+        DVec3 a = texel(x0, y0) * (Real)(1 - fx) + texel(x1, y0) * (Real)fx;
+        DVec3 b = texel(x0, y1) * (Real)(1 - fx) + texel(x1, y1) * (Real)fx;
+        c = a * (Real)(1 - fy) + b * (Real)fy;
+    }
+    DVec3 n{(Real)2 * c.x - (Real)1, (Real)2 * c.y - (Real)1, (Real)2 * c.z - (Real)1};
+    Real l = sqrt(dot(n, n));
+    return (l > (Real)1e-12) ? n * ((Real)1 / l) : DVec3{(Real)0, (Real)0, (Real)1};
+}
+
+// Perturb a hit's shading normal by a bound tangent-space normal map (C6), device twin
+// of Scene::applyNormalMap. Builds a TBN from the (ray-oriented) shading normal + the
+// hit tangent, rotates the sampled tangent-space normal into world, replaces h.n. Called
+// from the device closestHit choke point so every GPU path is consistent.
+__device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h) {
+    if (!h.valid || h.matId < 0) return;
+    const DMaterial& m = sc.mats[h.matId];
+    if (m.normalTex < 0 || m.normalTex >= sc.nTex) return;
+    const DTexture& tx = sc.textures[m.normalTex];
+    if (!tx.rgb) return;
+    DVec3 tn = dTexNormalAt(tx, h.u, h.v);
+    DVec3 N = h.n;
+    DVec3 T = h.tangent - N * dot(N, h.tangent);
+    Real tl = sqrt(dot(T, T));
+    if (tl < (Real)1e-9) return;
+    T = T * ((Real)1 / tl);
+    DVec3 B = cross(N, T) * h.bitangentSign;
+    Real s = (Real)m.normalStrength;
+    DVec3 pert = T * (tn.x * s) + B * (tn.y * s) + N * tn.z;
+    Real pl = sqrt(dot(pert, pert));
+    if (pl > (Real)1e-12) h.n = pert * ((Real)1 / pl);
+}
+
 // ---- procedural pattern VM (device twin of pattern.h) ----------------------
 // Deterministic integer-hash 3-D value noise; matches patHash3/patValueNoise so the
 // GPU and CPU produce the same noise field. Output in [0,1].
@@ -3244,10 +3669,14 @@ __device__ static double dPatValueNoise(double x, double y, double z) {
 }
 // Postfix scalar-stack evaluator (exact port of patternEval). PatNode/PatOp are the
 // POD host types (pattern.h), uploaded verbatim; variables come in as scalar args.
+// `tex`/`nTex` back PatOp::Tex samples (the scene's texture table); pass nullptr/0
+// where textures are out of scope (field formulas, medium density/ior) — the host
+// compiler rejects `tex:` at those sites, so such a node can never actually appear.
 __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
-                                      double u, double v) {
+                                      double u, double v,
+                                      const DPatEnv& env) {
     double st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const PatNode& nd = nodes[i];
@@ -3304,6 +3733,47 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                 st[sp++] = povFnEval(id, args);
                 break;
             }
+            case PatOp::Tex: {
+                double vv = st[--sp];                       // args pushed as (u, v)
+                int    ti = (int)nd.a;
+                st[sp-1] = (env.tex && ti >= 0 && ti < env.nTex)
+                             ? dTexScalarAt(env.tex[ti], st[sp-1], vv) : 0.0;
+                break;
+            }
+            case PatOp::Grid: {
+                // Arity is the GRID's own dimensionality; coordinates were pushed in
+                // axis order, so pop them back to front. patGridSample is the SHARED
+                // __host__ __device__ sampler from pattern.h — there is no device
+                // re-implementation to drift from the host one.
+                int gi = (int)nd.a;
+                // A resolved index always names a live table (the host compiler only
+                // accepts `grid:` where a table scope was in scope, and that scope is the
+                // same Scene this DScene was built from), so this can only fire if a call
+                // site passed dPatEnvNone() — a wiring bug. Bail out of the WHOLE program:
+                // the operand count is the table's own ndim, exactly what can't be read
+                // here, so pushing a placeholder would leave the stack unbalanced and
+                // silently return a COORDINATE as the result. Mirrors pattern.h.
+                if (gi < 0 || gi >= env.nGrids || !env.grids) return 0.0;
+                const PatGrid& g = env.grids[gi];
+                int gnd = g.ndim < 1 ? 1 : (g.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : g.ndim);
+                double co[PAT_ND_MAX_DIM];
+                for (int k = gnd - 1; k >= 0; --k) co[k] = st[--sp];
+                st[sp++] = patGridSample(g, env.dataPool, env.dataPoolN, co);
+                break;
+            }
+            case PatOp::Scatter: {
+                // Same contract as Grid, sharing the same flat pool and the same shared
+                // sampler — a scatter just resolves its value by inverse-distance blend
+                // instead of a lattice walk.
+                int si = (int)nd.a;
+                if (si < 0 || si >= env.nScatters || !env.scatters) return 0.0;  // see Grid
+                const PatScatter& s = env.scatters[si];
+                int snd = s.ndim < 1 ? 1 : (s.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : s.ndim);
+                double co[PAT_ND_MAX_DIM];
+                for (int k = snd - 1; k >= 0; --k) co[k] = st[--sp];
+                st[sp++] = patScatterSample(s, env.dataPool, env.dataPoolN, co);
+                break;
+            }
         }
     }
     return sp > 0 ? st[0] : 0.0;
@@ -3343,7 +3813,7 @@ __device__ static float dPatValueNoiseF(float x, float y, float z) {
 __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float x, float y, float z, float f,
                                       float nx, float ny, float nz, float r,
-                                      float u, float v) {
+                                      float u, float v, const DPatEnv& env) {
     float st[64]; int sp = 0;
     for (int i = 0; i < n; ++i) {
         const PatNodeF& nd = nodes[i];
@@ -3400,6 +3870,40 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                 st[sp++] = (float)povFnEval(id, args);
                 break;
             }
+            case PatOp::Tex: {   // args pushed as (u, v); the sampler is double-only, so
+                float vv = st[--sp];                       // promote / demote like PovFn
+                int   ti = (int)nd.a;
+                st[sp-1] = (env.tex && ti >= 0 && ti < env.nTex)
+                             ? (float)dTexScalarAt(env.tex[ti], (double)st[sp-1], (double)vv)
+                             : 0.0f;
+                break;
+            }
+            case PatOp::Grid: {
+                // Arity is the GRID's own dimensionality, so the operands can only be
+                // popped once the header is in hand — which is why the not-found case must
+                // abandon the program rather than push a placeholder (see dPatternEval).
+                // patGridSample is the SHARED __host__ __device__ sampler from pattern.h;
+                // it is double-only, so coordinates are promoted and the result demoted,
+                // exactly as PatOp::PovFn does above.
+                int gi = (int)nd.a;
+                if (gi < 0 || gi >= env.nGrids || !env.grids) return 0.0f;
+                const PatGrid& g = env.grids[gi];
+                int gnd = g.ndim < 1 ? 1 : (g.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : g.ndim);
+                double co[PAT_ND_MAX_DIM];
+                for (int k = gnd - 1; k >= 0; --k) co[k] = (double)st[--sp];
+                st[sp++] = (float)patGridSample(g, env.dataPool, env.dataPoolN, co);
+                break;
+            }
+            case PatOp::Scatter: {   // same contract as Grid, inverse-distance blended
+                int si = (int)nd.a;
+                if (si < 0 || si >= env.nScatters || !env.scatters) return 0.0f;
+                const PatScatter& sc = env.scatters[si];
+                int snd = sc.ndim < 1 ? 1 : (sc.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : sc.ndim);
+                double co[PAT_ND_MAX_DIM];
+                for (int k = snd - 1; k >= 0; --k) co[k] = (double)st[--sp];
+                st[sp++] = (float)patScatterSample(sc, env.dataPool, env.dataPoolN, co);
+                break;
+            }
         }
     }
     return sp > 0 ? st[0] : 0.0f;
@@ -3412,7 +3916,7 @@ __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit&
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, dPatEnvOf(sc));
 }
 
 // Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
@@ -3432,7 +3936,7 @@ __device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, 
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, dPatEnvOf(sc));
 }
 // Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
 // evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
@@ -3479,13 +3983,15 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
     if (m.recRoughMode == 0) {                             // direct scalar expression
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
+                         dPatEnvOf(sc));
     } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
         v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
     } else {                                               // per-hit driven
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
+                                dPatEnvOf(sc));
         v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
                              m.recRoughInterp, h, d);
     }
@@ -3562,33 +4068,101 @@ __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
-                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v);
+                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
+                            dPatEnvOf(sc));
     out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
                      (double)m.recReflLo, (double)m.recReflHi, d, lambda);
     return true;
 }
 
+// Per-hit multiplier from a bound reflectPat, clamped to [0,1] (device twin of host
+// reflectPatMul). 1 when unbound, so both reflect accessors apply it unconditionally.
+__device__ static Real dReflectPatMul(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (m.reflectPat < 0) return (Real)1;
+    return (Real)clamp01(dPatternScalarAt(sc, m.reflectPat, h));
+}
+
 // Reflect-slot reflectance for the SPECULAR families (mirror / glossy / grating /
-// halfmirror): a driven record if present, else the constant baked reflect spectrum
-// (device twin of host reflectSlot; these types never bind a reflect texture).
+// halfmirror): a driven record if present, else the constant baked reflect spectrum,
+// scaled by a bound reflect pattern (device twin of host reflectSlot; these types never
+// bind a reflect texture).
 __device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
     Real v;
-    if (dRecordReflect(sc, m, h, lambda, v)) return v;
-    return specLookup(m.reflect, lambda);
+    if (!dRecordReflect(sc, m, h, lambda, v)) v = specLookup(m.reflect, lambda);
+    return m.reflectPat < 0 ? v : v * dReflectPatMul(sc, m, h);
 }
 
 // Diffuse reflectance at a hit: a driven parametric record (highest priority), else a
-// bound texture, else the constant baked reflect spectrum (mirrors host diffuseReflectance).
+// bound texture, else the constant baked reflect spectrum — then scaled by a bound
+// reflect pattern (mirrors host diffuseReflectance).
 __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
     Real rv;
-    if (dRecordReflect(sc, m, h, lambda, rv)) return clamp01(rv);
-    if (m.reflectTex >= 0) {
-        const DTexture& tx = sc.textures[m.reflectTex];
-        if (m.triplanarScale > 0.0)
-            return clamp01(dTexReflTriplanar(tx, h.p, h.ng, m.triplanarScale, lambda));
-        return clamp01(dTexReflAt(tx, h.u, h.v, lambda));
+    if (!dRecordReflect(sc, m, h, lambda, rv)) {
+        if (m.reflectTex >= 0) {
+            const DTexture& tx = sc.textures[m.reflectTex];
+            rv = (m.triplanarScale > 0.0)
+                     ? dTexReflTriplanar(tx, h.p, h.ng, m.triplanarScale, lambda)
+                     : dTexReflAt(tx, h.u, h.v, lambda);
+        } else {
+            rv = specLookup(m.reflect, lambda);
+        }
     }
-    return clamp01(specLookup(m.reflect, lambda));
+    return clamp01(m.reflectPat < 0 ? rv : rv * dReflectPatMul(sc, m, h));
+}
+
+// Transmit-slot value at a hit (device twin of host transmitSlot): the constant baked
+// transmit spectrum scaled by a bound transmit pattern. Serves BOTH readings of the slot
+// — a filter's gel transmittance T(lambda) and a translucent's back-lobe albedo rhoT —
+// so every device transmit read goes through here, exactly as the host does.
+__device__ static Real dTransmitSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    Real v = specLookup(m.transmit, lambda);
+    if (m.transmitPat < 0) return v;
+    return v * (Real)clamp01(dPatternScalarAt(sc, m.transmitPat, h));
+}
+
+// ---- emission slot: the two halves of `emit pattern:` on the device -----------------
+// Emission is read from BOTH sides of transport — at a hit ON an emissive surface (the
+// s=0 / direct-hit strategy) and at a point the emitter SAMPLER drew (NEE and light
+// subpaths) — and MIS combines them, so the two must agree pointwise. dEmitPatMul covers
+// the first (device twin of host emitSlot's slotPatMul, identical in form to
+// dReflectPatMul) and dEmitterSamplePointPat the second (device twin of host
+// emitterSamplePoint + emitterPatMulAt). Every device emission read goes through one of
+// them; a missed site would bias the image rather than drop a visible effect.
+
+// Per-hit multiplier from a bound emitPat, clamped to [0,1]. 1 when unbound, so callers
+// can multiply unconditionally.
+__device__ static double dEmitPatMul(const DScene& sc, int emitPat, const DHit& h) {
+    if (emitPat < 0 || emitPat >= sc.nPatterns) return 1.0;
+    return clamp01(dPatternScalarAt(sc, emitPat, h));
+}
+
+// The emission-pattern multiplier at a point on `em`, given the point's own texture
+// coordinates (device twin of host emitterPatMulAt). Clamped to [0,1] like the
+// reflect/transmit slot patterns, so a runaway formula can never manufacture light.
+// The implicit field value f is 0, matching dPatternScalarAt and the host's makePatCtx.
+__device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
+                                          const DVec3& y, const DVec3& nOut,
+                                          double uu, double vv) {
+    if (em.emitPat < 0 || em.emitPat >= sc.nPatterns) return 1.0;
+    const DPattern& p = sc.patterns[em.emitPat];
+    double px = y.x, py = y.y, pz = y.z;
+    double r = sqrt(px * px + py * py + pz * pz);
+    return clamp01(dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
+                                nOut.x, nOut.y, nOut.z, r, uu, vv, dPatEnvOf(sc)));
+}
+
+// Draw a point on `em` and return the emission-pattern multiplier there, so a caller can
+// write `Le = specLookup(em.emitSpd, lambda) * invPdfLambda * pmul` (device twin of host
+// emitterSamplePoint(scene, ...)). 1.0 whenever no pattern is bound, which is every scene
+// that does not use the feature — those keep bit-identical draws, since the uv outputs are
+// the only extra work and they do not touch the RNG.
+__device__ static double dEmitterSamplePointPat(const DScene& sc, const DEmitter& em,
+                                                double u1, double u2,
+                                                DVec3& y, DVec3& nOut) {
+    if (em.emitPat < 0) { emitterSamplePoint(em, u1, u2, y, nOut); return 1.0; }
+    double uu = 0.0, vv = 0.0;
+    emitterSamplePoint(em, u1, u2, y, nOut, &uu, &vv);
+    return dEmitterPatMulAt(sc, em, y, nOut, uu, vv);
 }
 
 // Sample a Stokes-shifted emission wavelength lambda' ~ M for a fluorescent
@@ -3693,6 +4267,47 @@ enum { WF_CONTINUE = 0, WF_TERMINATE = 1 };
 __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
                                  int camMode, DRng& rng,
                                  DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted) {
+    // ROADMAP C3: split birth between surface/point/env emitters and volumetric "fire"
+    // emission by power. grandTotal = totalPower + totalEmissionPower; the volumeBirth
+    // test short-circuits (drawing NO extra RNG) when there are no emissive volumes, so
+    // every non-fire scene stays bit-identical to before.
+    const double grandTotal = sc.totalPower + sc.totalEmissionPower;
+    if (grandTotal <= 0.0) return false;
+    const bool volumeBirth = (sc.emissiveVolN > 0) &&
+                             ((double)rng.uniform() * grandTotal < sc.totalEmissionPower);
+    if (volumeBirth) {
+        // Power-weighted emissive-volume selection.
+        double r = (double)rng.uniform() * sc.totalEmissionPower;
+        int vi = 0;
+        for (; vi + 1 < sc.emissiveVolN; ++vi) { r -= sc.emissiveVolumes[vi].power; if (r <= 0.0) break; }
+        const DEmissiveVolume ev = sc.emissiveVolumes[vi];
+        const DMedium& fm = sc.media[ev.mediumIndex];
+        // Uniform position in the grid AABB; lambda importance-sampled from the volume's
+        // Planck-at-emitKelvin CDF. beta = grandTotal*ke/(meanKe*dLam*p(lambda)) so the
+        // isotropic 1/(4pi)/(dist^2*Omega) splat reproduces the emission line-integral
+        // (host twin: render.h tracePhoton volume-birth branch).
+        DVec3 origin = DVec3{ (Real)(ev.bmin.x + (ev.bmax.x - ev.bmin.x) * (double)rng.uniform()),
+                              (Real)(ev.bmin.y + (ev.bmax.y - ev.bmin.y) * (double)rng.uniform()),
+                              (Real)(ev.bmin.z + (ev.bmax.z - ev.bmin.z) * (double)rng.uniform()) };
+        double pdfLam = 0.0;
+        double lam = dEmissionSampleLambda(ev, (double)rng.uniform(), pdfLam);
+        lambda = (Real)lam;
+        double ke = dMedEmissionAt(fm, origin, lam);
+        const double dLamE = LAMBDA_MAX - LAMBDA_MIN;
+        beta = (Real)((ev.meanKe > 0.0 && pdfLam > 0.0)
+                      ? grandTotal * ke / (ev.meanKe * dLamE * pdfLam) : 0.0);
+        eEmitted += beta;
+        if (beta <= (Real)0) return false;   // cold voxel: nothing to emit or transport
+        // Isotropic emission direction.
+        double z = 1.0 - 2.0 * (double)rng.uniform();
+        double sr = sqrt(fmax(0.0, 1.0 - z * z));
+        double phi = 2.0 * DPI * (double)rng.uniform();
+        DVec3 dir = DVec3{ (Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z };
+        // Direct-visibility emission splat (the flame seen directly by the camera).
+        camSplatEmissionAll(sc, cs, camMode, origin, lambda, beta, rng);
+        ro = origin + dir * RAY_EPS; rd = dir;
+        return true;
+    }
     // Power-weighted emitter selection (single emitter draws no randomness).
     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
     const DEmitter em = sc.emitters[ei];
@@ -3700,6 +4315,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     DVec3 origin, emitN, dir;
     Real spotW = (Real)1;                            // spot direction reweight (else 1)
     bool envImage = false; double envPdfW = 0.0;     // image env: reweight below
+    double emitPatW = 1.0;                           // `emit pattern:` factor at the point
     if (em.shape == 2) {
         // Point spot: uniform direction in the outer cone; reweight beta by
         // falloff*(Omega_outer/Omega_eff) to match the smoothstep profile.
@@ -3736,14 +4352,34 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         DVec3 disk = t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
         origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
         emitN = dir;
+    } else if (em.shape == 6) {
+        // Distant directional sun (device twin of render.h). Sample the travel direction
+        // inside the solar cone (pdf 1/Omega), then the entry point on a disk of radius R
+        // perpendicular to it (pdf 1/(pi R^2)) — the same upstream-disk trick the env
+        // uses, but aimed instead of isotropic, so EVERY photon crosses the scene rather
+        // than one in ~10^5. The joint pdf 1/(Omega*pi*R^2) is exactly 1/envGeom, so
+        // beta = emitIntegral*envGeom is analog with no reweight.
+        dir = dSunSampleCone(em, em.beamDir, (double)u1, (double)u2);
+        DVec3 t, b; onb(dir, t, b);
+        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
+        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius
+               + t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
+        emitN = dir;
     } else {
-        emitterSamplePoint(em, u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
+        // quad: constant normal; sphere: surface point. Also returns this point's
+        // `emit pattern:` factor — 1.0 (and a bit-identical draw) when unpatterned.
+        emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
     }
     Real pdfL = 0;
     lambda = sampleLambda(sc, em, rng, pdfL);
     if (pdfL <= 0) return false;
-    beta = (Real)((sc.nEmitters == 1) ? em.power : sc.totalPower);
+    // When emissive volumes exist the emitter-vs-fire split already consumed the
+    // totalPower/grandTotal factor, so a chosen emitter photon carries the full
+    // grandTotal (host twin: render.h). Otherwise the ordinary emitter scaling.
+    beta = (Real)((sc.emissiveVolN > 0) ? grandTotal
+                  : ((sc.nEmitters == 1) ? em.power : sc.totalPower));
     beta *= spotW;                                   // exactly 1 for non-spot
     // Image env: reweight so the photon carries the radiance actually arriving
     // from `dir`, = L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)). The shared
@@ -3755,13 +4391,20 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         double denom = 4.0 * 3.14159265358979323846 * envPdfW * avg;
         beta = (denom > 0.0) ? (Real)((double)beta * rad / denom) : (Real)0;
     }
+    // An emission pattern is a pure post-multiplier on the photon's carried power: the
+    // emitter is still SELECTED by its unpatterned power and the point still drawn
+    // uniformly over its area, so no pdf changes and the estimator stays unbiased
+    // (host twin: render.h). eEmitted is credited the patterned value so the energy
+    // report matches what actually leaves the surface.
+    if (emitPatW != 1.0) beta = (Real)((double)beta * emitPatW);
     eEmitted += beta;
 
     // Connect the emitter itself to the camera (makes the source visible): model
     // B splats to the pinhole, model A splats through the finite lens pupil. Model
     // C instead catches photons that physically arrive. A spot is a point light
-    // with no projected area, so it has no direct term.
-    if (em.shape != 2 && em.shape != 3) {
+    // with no projected area, so it has no direct term; a distant sun's disc is at
+    // infinity, so its direct view is the backend-agnostic addEnvBackground pass.
+    if (em.shape != 2 && em.shape != 3 && em.shape != 6) {
         // Emitter vertex: ns==ng==emitN, so the adjoint correction is identically 1
         // (wi is irrelevant here — pass emitN).
         splatSurfaceAll(sc, cs, camMode, origin, emitN, emitN, emitN, lambda, beta, (Real)1, rng);
@@ -3813,7 +4456,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         // Colored gel / Wratten filter (device twin of render.h MatType::Filter): a thin
         // non-scattering absorber. Pass straight through; survive with prob T(lambda),
         // else absorb. RR on the transmittance keeps beta unchanged and unbiased.
-        Real t = clamp01(specLookup(m.transmit, lambda));
+        Real t = clamp01(dTransmitSlot(sc, m, h, lambda));
         if (rng.uniform() >= t) { eAbsorbed += beta; return WF_TERMINATE; }
         ro = h.p + rd * RAY_EPS;   // straight through, direction unchanged
         return WF_CONTINUE;
@@ -3889,7 +4532,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // exact analytic free-flight if homogeneous); the earliest collision wins and
         // its medium (scatterMed) drives the scatter. Device twin of sampleMediaCollision.
         Real tMed; int which;
-        if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, rng, tMed, which)) {
+        if (dMediaSampleCollision(sc, ro, rd, dSurf, lambda, rng, tMed, which)) {
             mediumEvent = true; scatterMed = which; mp = ro + rd * tMed; dEvent = tMed;
         }
     }
@@ -3934,7 +4577,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real aC = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
         for (int c = 0; c < cs.nCam; ++c) {
             Real tC; int whichC;
-            if (!dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, *crng, tC, whichC))
+            if (!dMediaSampleCollision(sc, ro, rd, dSurf, lambda, *crng, tC, whichC))
                 continue;   // this camera saw no in-scatter along this beam
             DVec3 xc = ro + rd * tC;
             Real betaC = (aC > 0) ? betaPre * exp(-aC * tC) : betaPre;
@@ -3950,7 +4593,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // scatter transmission) so surfaces behind the fog are correctly dimmed; the removed
         // energy (out-scattered + absorbed) is booked as absorbed. Then continue STRAIGHT.
         Real before = beta;
-        beta *= dMediaTransmittance(sc.media, sc.mediaN, ro, rd, dSurf, lambda, *crng);
+        beta *= dMediaTransmittance(sc, ro, rd, dSurf, lambda, *crng);
         eAbsorbed += (double)(before - beta);
     }
 
@@ -3994,13 +4637,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // passing the flipped normal images whichever side the camera is on. Non-specular,
         // so a directly-viewed translucent solid is VISIBLE in model B (unlike dielectric).
         Real rhoR = dDiffuseRho(sc, m, h, lambda);
-        Real rhoT = clamp01(specLookup(m.transmit, lambda));
+        Real rhoT = clamp01(dTransmitSlot(sc, m, h, lambda));
         Real sum = rhoR + rhoT;
         if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
-        depositPhoton(cs, h.p, rd, h.n, beta, lambda);   // photon-map deposit (mode M)
+        depositPhoton(cs, h.p, h.n, beta, lambda);   // photon-map deposit (mode M)
         // Both lobes get the adjoint correction; |cos| in the factor makes it lobe-agnostic,
         // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rhoR, rng);
@@ -4018,7 +4661,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real rho = dDiffuseRho(sc, m, h, lambda);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
-        depositPhoton(cs, h.p, rd, h.n, beta, lambda);   // photon-map deposit (mode M)
+        depositPhoton(cs, h.p, h.n, beta, lambda);   // photon-map deposit (mode M)
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -4058,7 +4701,7 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
     Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
     for (int i = 0; i < nUp; ++i) {
         Real contrib = beta[i] * (rho[i] / (Real)DPI) * geo;
-        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lam[i], rng);
+        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
     }
 }
@@ -4091,7 +4734,7 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
     Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG * cellNorm;
     for (int i = 0; i < nUp; ++i) {
         Real contrib = beta[i] * rho[i] * geo;
-        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc.media, sc.mediaN, p, wdir, dist, lam[i], rng);
+        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
     }
 }
@@ -4128,6 +4771,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
     DVec3 origin, emitN, dir;
     Real spotW = (Real)1;
     bool envImage = false; double envPdfW = 0.0;
+    double emitPatW = 1.0;                           // `emit pattern:` factor at the point
     if (em.shape == 2) {
         origin = em.origin;
         double ct = em.spotCosOuter + (double)u1 * (1.0 - em.spotCosOuter);
@@ -4154,8 +4798,16 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         DVec3 disk = t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
         origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
         emitN = dir;
+    } else if (em.shape == 6) {                       // distant sun — see genPhoton
+        dir = dSunSampleCone(em, em.beamDir, (double)u1, (double)u2);
+        DVec3 t, b; onb(dir, t, b);
+        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
+        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius
+               + t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
+        emitN = dir;
     } else {
-        emitterSamplePoint(em, u1, u2, origin, emitN);
+        emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
     }
 
@@ -4183,13 +4835,16 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
             beta[i] = (denom > 0.0) ? (Real)((double)beta[i] * rad / denom) : (Real)0;
         }
     }
+    // Achromatic post-multiplier — see genPhoton for why this changes no pdf.
+    if (emitPatW != 1.0)
+        for (int i = 0; i < C; ++i) beta[i] = (Real)((double)beta[i] * emitPatW);
     secAlive = (C > 1);
     int nUp = secAlive ? C : 1;
     for (int i = 0; i < nUp; ++i) eEmitted += (double)beta[i];
 
-    // Direct emitter->camera connection (area/quad emitters only; spot/env have no direct
-    // term). No-op for mode C (splat helpers skip it) and the mode-M deposit pass (nCam==0).
-    if (em.shape != 2 && em.shape != 3) {
+    // Direct emitter->camera connection (area/quad emitters only; spot/env/sun have no
+    // direct term). No-op for mode C (splat helpers skip it) and the mode-M deposit pass (nCam==0).
+    if (em.shape != 2 && em.shape != 3 && em.shape != 6) {
         Real rhoOne[hero::kHeroMax]; for (int i = 0; i < nUp; ++i) rhoOne[i] = (Real)1;
         splatSurfaceAllHero(sc, cs, camMode, origin, emitN, emitN, emitN, lam, beta, rhoOne, nUp, rng);
         camSpecularSplatAllHero(sc, cs, camMode, origin, emitN, lam, beta, rhoOne, nUp, rng);
@@ -4201,8 +4856,11 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
 
 // One hero bounce (called only while secAlive, so nUp == C). Handles the model-C catch,
 // escape/sensor bookkeeping, and the diffuse / diffuse-transmit lobes with per-λ deposit +
-// splat + Russian-roulette on the hero (secondaries reweighted by rho[i]/rho[0]). At any of
-// the nine specular / wavelength-switching materials it DE-HEROS (beta[0] *= C, secAlive =
+// splat. EVERY Russian roulette here survives on the MAX over live λ (q = max_i c_i) and
+// reweights survivors by c_i/q <= 1, so no secondary is ever amplified; at nUp == 1 that is
+// exactly the scalar analog RR with a *= 1.0 reweight. Mirror/Filter/Glossy are delta lobes
+// but ACHROMATIC (λ-independent outgoing direction), so the bundle keeps riding through them.
+// At the six dispersive / wavelength-switching materials it DE-HEROS (beta[0] *= C, secAlive =
 // false) and delegates that same hit to the shared scalar interactSpecular — from then on
 // the caller runs the ordinary single-λ shadeStep. No fog/GRIN here (gated out upstream).
 __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int camMode,
@@ -4242,30 +4900,51 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         Real rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
         for (int i = 0; i < nUp; ++i) {
             Real rr = clamp01(dDiffuseRho(sc, m, h, lam[i]));
-            Real rt = clamp01(specLookup(m.transmit, lam[i]));
+            Real rt = clamp01(dTransmitSlot(sc, m, h, lam[i]));
             Real s = rr + rt; if (s > (Real)1) { rr /= s; rt /= s; }   // per-λ energy guard
             rhoR[i] = rr; rhoT[i] = rt;
         }
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
         DVec3 wiPrev = -rd;
-        for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, rd, h.n, beta[i], lam[i]);
+        for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i]);
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
             splatSurfaceAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), wiPrev, lam, beta, rhoT, nUp, rng);
             camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rhoR, nUp, rng);
             camSpecularSplatAllHero(sc, cs, camMode, h.p, nb, lam, beta, rhoT, nUp, rng);
         }
-        Real sumHero = rhoR[0] + rhoT[0];
+        // Lobe pick + RR over the whole bundle (see the diffuse tail): the reflect/transmit
+        // probabilities are the per-lobe MAX over live λ, so no secondary is ever amplified.
+        // The maxima can sum past 1 (each λ alone is guarded), in which case both shrink
+        // proportionally — guarded by nUp > 1 so the scalar path can never take that branch.
+        // At nUp == 1 the two maxima are rhoR[0]/rhoT[0] and every reweight is *= 1.0.
+        Real qR = rhoR[0], qT = rhoT[0];
+        for (int i = 1; i < nUp; ++i) {
+            if (rhoR[i] > qR) qR = rhoR[i];
+            if (rhoT[i] > qT) qT = rhoT[i];
+        }
+        Real sumHero = qR + qT;
+        if (nUp > 1 && sumHero > (Real)1) { qR /= sumHero; qT /= sumHero; sumHero = qR + qT; }
         Real uu = rng.uniform();
-        if (uu < rhoR[0]) {
-            for (int i = 1; i < nUp; ++i) beta[i] *= rhoR[i] / rhoR[0];
+        if (uu < qR) {
+            // The reweight is deterministic absorption — book it, or the energy ledger loses
+            // the difference (sum/emitted would drop well below 1).
+            for (int i = 0; i < nUp; ++i) {
+                Real w = rhoR[i] / qR;
+                eAbsorbed += (double)beta[i] * (double)((Real)1 - w);
+                beta[i] *= w;
+            }
             DVec3 wo = cosineHemisphere(h.n, rng);
             Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
             for (int i = 0; i < nUp; ++i) beta[i] *= corr;
             ro = h.p + h.n * RAY_EPS; rd = wo; return WF_CONTINUE;
         } else if (uu < sumHero) {
-            for (int i = 1; i < nUp; ++i) beta[i] *= rhoT[i] / rhoT[0];
+            for (int i = 0; i < nUp; ++i) {
+                Real w = rhoT[i] / qT;
+                eAbsorbed += (double)beta[i] * (double)((Real)1 - w);
+                beta[i] *= w;
+            }
             DVec3 wo = cosineHemisphere(nb, rng);
             Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
             for (int i = 0; i < nUp; ++i) beta[i] *= corr;
@@ -4275,9 +4954,42 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         return WF_TERMINATE;
     }
 
+    if (m.type == D_MIRROR || m.type == D_FILTER || m.type == D_GLOSSY) {
+        // ACHROMATIC delta lobes (device twin of render.h's Mirror/Filter/Glossy hero case):
+        // specular — so no camera connect, exactly like the scalar path — but the outgoing
+        // DIRECTION does not depend on λ, so the bundle keeps riding and only the per-λ
+        // coefficient differs. The scalar lobe survives by ANALOG Russian roulette on its
+        // coefficient; rolling that coin on the hero alone would kill live secondaries
+        // whenever c_hero == 0 (a Wratten gel is 0 over most of the spectrum) AND amplify by
+        // c_i/c_hero, so the survival probability is the MAX over live λ and survivors
+        // reweight by c_i/q <= 1.
+        Real c[hero::kHeroMax];
+        Real q = (Real)0;
+        for (int i = 0; i < nUp; ++i) {
+            c[i] = (m.type == D_FILTER) ? clamp01(dTransmitSlot(sc, m, h, lam[i]))
+                                        : clamp01(dReflectSlot(sc, m, h, lam[i]));
+            if (c[i] > q) q = c[i];
+        }
+        if (rng.uniform() >= q) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+        for (int i = 0; i < nUp; ++i) {                     // bounded reweight
+            Real w = c[i] / q;
+            eAbsorbed += (double)beta[i] * (double)((Real)1 - w);   // deterministic absorption
+            beta[i] *= w;
+        }
+        if (m.type == D_MIRROR) {
+            DVec3 o = reflectv(rd, h.n); ro = h.p + h.n * RAY_EPS; rd = o;
+        } else if (m.type == D_FILTER) {
+            ro = h.p + rd * RAY_EPS;   // straight through, direction unchanged
+        } else {
+            DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+            if (dot(o, h.n) <= 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+            ro = h.p + h.n * RAY_EPS; rd = o;
+        }
+        return WF_CONTINUE;
+    }
+
     if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER ||
-        m.type == D_MIRROR || m.type == D_GRATING || m.type == D_HALFMIRROR ||
-        m.type == D_FILTER || m.type == D_GLOSSY || m.type == D_FLUORESCENT) {
+        m.type == D_GRATING || m.type == D_HALFMIRROR || m.type == D_FLUORESCENT) {
         // Dispersive / wavelength-switching: terminate secondaries, boost the hero ×C, then
         // run the shared scalar interaction on the (now single-λ) hero channel.
         beta[0] *= (Real)C; secAlive = false;
@@ -4290,14 +5002,24 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, m, h, lam[i]));
     DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
     DVec3 wiPrev = -rd;
-    for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, rd, h.n, beta[i], lam[i]);
+    for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i]);
     if (camMode == CAM_A || camMode == CAM_B) {
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
         camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rho, nUp, rng);
     }
-    Real rhoHero = rho[0];
-    if (rng.uniform() >= rhoHero) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
-    for (int i = 1; i < nUp; ++i) beta[i] *= rho[i] / rhoHero;   // secondary reweight
+    // Continuation RR over the WHOLE bundle: the survival probability is max_i rho_i, not the
+    // hero's own albedo, and every live λ reweights by rho_i/q <= 1. Rolling the coin on the
+    // hero alone (beta[i] *= rho_i/rho_0) amplifies a secondary by up to rho_max/rho_hero — on
+    // a saturated wall (redWall spans 0.05..0.75) a 15x weight spike per bounce, which cancels
+    // the whole stratification win. At nUp == 1, q == rho[0] and beta[0] *= 1.0.
+    Real q = rho[0];
+    for (int i = 1; i < nUp; ++i) if (rho[i] > q) q = rho[i];
+    if (rng.uniform() >= q) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+    for (int i = 0; i < nUp; ++i) {                              // bounded reweight
+        Real w = rho[i] / q;
+        eAbsorbed += (double)beta[i] * (double)((Real)1 - w);    // deterministic absorption
+        beta[i] *= w;
+    }
     DVec3 wo = cosineHemisphere(h.n, rng);
     Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
     for (int i = 0; i < nUp; ++i) beta[i] *= corr;
@@ -4536,6 +5258,34 @@ struct DVertex {
     double mediumG;             // HG asymmetry g at a BV_MEDIUM vertex
     int   mediumId;             // sc.media index at a BV_MEDIUM vertex (-1 otherwise)
     Real  u, v;                 // interpolated surface texcoords (per-hit BSDF eval, M9)
+    // This vertex's `emit pattern:` factor (device twin of bdpt.h Vertex::emitPatW),
+    // cached because dVertexLe is called from several MIS strategies and has no DHit to
+    // re-evaluate the pattern from. 1 for a non-emissive vertex or an unpatterned light,
+    // so every existing scene multiplies by exactly one. A BV_LIGHT vertex gets it from
+    // dEmitterSamplePointPat (the sampled point); a BV_SURFACE vertex from dEmitPatMul at
+    // the hit — the two agree pointwise, which is what keeps s=0 / s=1 MIS unbiased.
+    Real  emitPatW;
+    int   nUp;                  // live hero wavelengths here (1 = single-λ walk / de-hero'd)
+};
+
+// Number of SECONDARY wavelength slots a hero bundle can carry (the hero itself rides in
+// the scalar `beta`). The per-vertex secondary throughputs live in a PARALLEL array
+// (`pathSec`, stride `secStride`) rather than inside DVertex, so the scalar kernel — which
+// declares that array at size 1 — pays no local-memory cost for a feature it never uses
+// (DVertex is already ~100B and there are 2*BDPT_MAXV of them in every thread's frame).
+#define BDPT_NSEC (hero::kHeroMax - 1)
+
+// Hero-wavelength bundle (device twin of bdpt.h HeroBundle). lam[0] is the HERO: it alone
+// drives geometry, every sampling decision, every pdf and therefore every MIS weight — so a
+// connection's MIS weight is shared by the whole bundle and is computed once. lam[1..C-1]
+// are stratified secondaries riding the same BVH walk, carrying only their own throughput.
+// No ×C de-hero boost is folded into any throughput: the two subpaths de-hero
+// independently, so the normalisation is applied once at splat time as
+// 1/min(nUp_light, nUp_eye) — see bdpt.h Vertex::nUp for the derivation.
+struct DHeroBundle {
+    Real   lam[hero::kHeroMax];
+    double invPdf[hero::kHeroMax];
+    int    C;
 };
 
 // Reconstruct a minimal DHit at a surface vertex so the per-hit material helpers
@@ -4608,7 +5358,7 @@ __device__ static inline void dDiffuseTransmitAlbedos(const DScene& sc, const DM
                                                       const DHit& h, Real lambda,
                                                       double& rhoR, double& rhoT) {
     rhoR = clamp01(dDiffuseRho(sc, m, h, lambda));
-    rhoT = clamp01(specLookup(m.transmit, lambda));
+    rhoT = clamp01(dTransmitSlot(sc, m, h, lambda));
     double sum = rhoR + rhoT;
     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; }
 }
@@ -4769,7 +5519,8 @@ __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVe
                                    Real lambda, double invPdfLambda) {
     if (v.lightIdx < 0) return 0.0;
     if (ddot(v.ng, w) <= 0.0) return 0.0;
-    return (double)specLookup(sc.emitters[v.lightIdx].emitSpd, lambda) * invPdfLambda;
+    return (double)specLookup(sc.emitters[v.lightIdx].emitSpd, lambda) * invPdfLambda
+           * (double)v.emitPatW;
 }
 // Emitter that owns an emissive surface material (mirrors Scene::emitterForMat).
 __device__ static int dEmitterForMat(const DScene& sc, int matId) {
@@ -4781,8 +5532,10 @@ __device__ static int dEmitterForMat(const DScene& sc, int matId) {
 // Sample the shared wavelength from the scene emission sampler (mirrors
 // EmissionSampler::sample). Sets pdf (per nm, for the >0 guard); the BDPT weight
 // uses the continuous invPdfLambda below (exactly as the CPU path does).
-__device__ static Real dSampleSceneLambda(const DScene& sc, DRng& rng, double& pdf) {
-    double u = (double)rng.uniform();
+// Inverse-CDF core, split out so the hero-wavelength bundle can push its own stratified
+// u values (base draw + C-1 wrapped strata) through the same sampler the scalar path
+// uses — the device twin of EmissionSampler::sampleAt.
+__device__ static Real dSampleSceneLambdaU(const DScene& sc, double u, double& pdf) {
     const double* cdf = sc.emitSamplerCdf;
     int lo = 0, hi = sc.emitSamplerN;
     while (lo + 1 < hi) { int m = (lo + hi) / 2; if (cdf[m] <= u) lo = m; else hi = m; }
@@ -4790,6 +5543,9 @@ __device__ static Real dSampleSceneLambda(const DScene& sc, DRng& rng, double& p
     double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
     pdf = (c1 - c0) / sc.emitSamplerStep;
     return (Real)(DLMIN + (lo + frac) * sc.emitSamplerStep);
+}
+__device__ static Real dSampleSceneLambda(const DScene& sc, DRng& rng, double& pdf) {
+    return dSampleSceneLambdaU(sc, (double)rng.uniform(), pdf);
 }
 // invPdfLambda(lambda) = emitG / g(lambda), g(lambda) = sum_k geomWeight_k*SPD_k.
 // In BDPT scope every emitter is an area/sphere light, so geomWeight = area*PI.
@@ -4799,9 +5555,11 @@ __device__ static double dInvPdfLambda(const DScene& sc, Real lambda) {
         const DEmitter& e = sc.emitters[k];
         // geomWeight (mirrors Scene::Emitter::geomWeight): area/sphere/cylinder = area*PI;
         // point-spot (shape 2) = spotOmega (falloff-weighted solid angle); env (shape 3) =
-        // envGeom = 4*PI^2*R^2. Collimated beams are gated to the CPU.
+        // envGeom = 4*PI^2*R^2; distant sun (shape 6) = envGeom = Omega*PI*R^2 (the solar
+        // cone times the scene's projected disc). Collimated beams are gated to the CPU.
         double gw = (e.shape == 2) ? e.spotOmega
                   : (e.shape == 3) ? (4.0 * DPI * DPI * sc.sceneRadius * sc.sceneRadius)
+                  : (e.shape == 6) ? (e.spotOmega * DPI * sc.sceneRadius * sc.sceneRadius)
                                    : ((double)e.area * DPI);
         g += gw * (double)specLookup(e.emitSpd, lambda);
     }
@@ -4942,6 +5700,92 @@ __device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real
 // Point matches the BDPT device path; unbiased, an independent noise realization vs
 // the CPU's sphere-cone / cylinder-arc importance sampling). spot/env/collimated are
 // gated to the CPU, so they're skipped here.
+// One emitter connection's SAMPLING + VISIBILITY, factored out of bkNeeLight so the
+// scalar NEE and the hero-wavelength NEE below run the identical geometry off the
+// identical rng stream. Everything here is wavelength-INDEPENDENT; the caller supplies
+// rho/PI and the emitter SPD. The final product is deliberately left to the caller
+// rather than fused into one weight here, so the scalar path's float rounding is
+// unchanged by this refactor (device `Real` is fp32 by default — see FTRACE_GPU_FP32).
+struct BkNeeGeom {
+    DVec3 wi;        // unit direction surface -> sampled light point
+    Real  dist;      // shadow-ray length
+    Real  dist2;     // dist*dist (spot: inverse-square falloff)
+    Real  cosSurf;   // cosine at the shading surface
+    Real  stG;       // Chiang shadow-terminator gate (1 on flat geometry)
+    Real  fall;      // spot cone falloff (spot emitters only)
+    Real  G;         // area-measure geometry term cosSurf*cosLight/dist2 (non-spot)
+    bool  spot;      // point-spot emitter (deterministic connect, draws no rng)
+    bool  sun;       // distant-sun emitter (cone NEE in solid-angle measure)
+    Real  wSun;      // sun only: the complete λ-independent weight cosSurf*Omega*stG
+};
+__device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec3& ngo,
+                                     const DEmitter& em, DRng& rng, BkNeeGeom& g) {
+    if (em.shape == 2) {
+        // Point spot (device twin of emitterGeom's spot branch): deterministic connect
+        // to the light point, cone falloff toward the surface, no rng draw. Peak
+        // intensity/SPD = 1; the falloff scales it toward the cone edge.
+        DVec3 toL = em.origin - h.p;
+        g.dist2 = dot(toL, toL);
+        g.dist  = sqrt(g.dist2);
+        g.wi = toL / g.dist;
+        g.cosSurf = dot(h.n, g.wi);
+        if (g.cosSurf <= (Real)0) return false;
+        g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
+        if (g.stG <= (Real)0) return false;
+        g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
+        if (g.fall <= (Real)0) return false;
+        if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
+        g.G = (Real)0; g.spot = true; g.sun = false;
+        return true;
+    }
+    if (em.shape == 6) {
+        // Distant sun (device twin of emitterGeom's Sun branch): sample wi uniformly in
+        // the solar cone about -beamDir (pdf 1/Omega) and shadow-ray it to the scene exit.
+        // No finite light distance, so no 1/dist^2 and no cosLight: in solid-angle measure
+        // the whole λ-independent weight is cosSurf/pdfW = cosSurf*Omega. Two rng draws,
+        // matching the area path, so adding a sun reshuffles no other emitter's stream.
+        double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
+        g.wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
+        g.cosSurf = dot(h.n, g.wi);
+        if (g.cosSurf <= (Real)0) return false;
+        g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
+        if (g.stG <= (Real)0) return false;
+        g.dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
+        g.dist2 = g.dist * g.dist;
+        if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist)) return false;
+        g.wSun = (Real)((double)g.cosSurf * em.spotOmega * (double)g.stG);
+        g.G = (Real)0; g.fall = (Real)1; g.spot = false; g.sun = true;
+        return true;
+    }
+    Real u1 = rng.uniform(), u2 = rng.uniform();
+    DVec3 y, nL;
+    // Also returns this point's `emit pattern:` multiplier (1.0, and a bit-identical
+    // draw, when there is none). Folding it into the λ-independent geometry weight G
+    // below makes the scalar AND hero NEE pick it up at once, and matches the
+    // emission-on-hit factor at the same surface point — which keeps the MIS pair
+    // consistent (host twin: backward.h emitterGeom).
+    double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
+    DVec3 toL = y - h.p;
+    g.dist2 = dot(toL, toL);
+    g.dist = sqrt(g.dist2);
+    g.wi = toL / g.dist;
+    g.cosSurf = dot(h.n, g.wi);
+    if (g.cosSurf <= 0) return false;
+    // Geometric-hemisphere softening (matches CPU backward.h neeLight): the light must lie
+    // on the geometric front side too, ramped smoothly instead of a hard cutoff (Chiang
+    // 2019). No-op when h.n==h.ng (flat tris / analytic spheres, stG==1); shadow ray offset
+    // along the geometric normal so it clears the true surface.
+    g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
+    if (g.stG <= (Real)0) return false;
+    Real cosLight = dot(nL, -g.wi);               // light is one-sided
+    if (cosLight <= 0) return false;
+    if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, g.dist - (Real)2 * RAY_EPS)) return false;
+    g.G = g.cosSurf * cosLight / g.dist2;
+    if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
+    g.fall = (Real)1; g.spot = false; g.sun = false;
+    return true;
+}
+
 __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                                     double invPdfLambda, Real lambda, DRng& rng) {
     double total = 0.0;
@@ -4950,59 +5794,50 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
     for (int k = 0; k < sc.nEmitters; ++k) {
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnv)
-        if (em.shape == 2) {
-            // Point spot (device twin of emitterGeom's spot branch): deterministic connect
-            // to the light point, cone falloff toward the surface, no rng draw. Peak
-            // intensity/SPD = 1; the falloff scales it toward the cone edge.
-            DVec3 toL = em.origin - h.p;
-            Real dist2 = dot(toL, toL);
-            Real dist  = sqrt(dist2);
-            DVec3 wi = toL / dist;
-            Real cosSurf = dot(h.n, wi);
-            if (cosSurf <= (Real)0) continue;
-            Real stG = dShadowTerminatorG(wi, h.n, ngo0);
-            if (stG <= (Real)0) continue;
-            Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
-            if (fall <= (Real)0) continue;
-            if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
-            double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-            double contrib = (double)(f * fall * cosSurf / dist2 * stG) * emitW;
-            if (sc.mediaN > 0)
-                contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, wi, dist, lambda, rng);
-            total += contrib;
-            continue;
-        }
-        Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 y, nL;
-        emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
-        DVec3 toL = y - h.p;
-        Real dist2 = dot(toL, toL);
-        Real dist = sqrt(dist2);
-        DVec3 wi = toL / dist;
-        Real cosSurf = dot(h.n, wi);
-        if (cosSurf <= 0) continue;
-        // Geometric-hemisphere softening (matches CPU backward.h neeLight): the light must lie
-        // on the geometric front side too, ramped smoothly instead of a hard cutoff (Chiang
-        // 2019). No-op when h.n==h.ng (flat tris / analytic spheres, stG==1); shadow ray offset
-        // along the geometric normal so it clears the true surface.
-        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
-        Real stG = dShadowTerminatorG(wi, h.n, ngo);
-        if (stG <= (Real)0) continue;
-        Real cosLight = dot(nL, -wi);                 // light is one-sided
-        if (cosLight <= 0) continue;
-        if (occluded(sc, h.p + ngo * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
-        Real G = cosSurf * cosLight / dist2;
+        BkNeeGeom g;
+        if (!bkEmitterGeom(sc, h, ngo0, em, rng, g)) continue;
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        double contrib = (double)(f * G) * emitW * (double)em.area * (double)stG;
+        double contrib = g.sun
+            ? (double)(f * g.wSun) * emitW
+            : g.spot
+            ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
+            : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
         // Shadow-ray transmittance through any participating media (superposition;
         // homogeneous = exact exp with no rng draw, heterogeneous = ratio tracking).
         // Matches the forward connectVolume / device volume-NEE transmittance so surface
         // direct light agrees between the forward and backward estimators.
         if (sc.mediaN > 0)
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, wi, dist, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lambda, rng);
         total += contrib;
     }
     return total;
+}
+
+// Hero-wavelength surface NEE (device twin of backward.h neeLightHero): ONE shared
+// visibility sample per emitter — the very rng stream bkNeeLight would draw — evaluated
+// for all `nUp` live wavelengths, accumulating thr[i]*(rho[i]/PI)*SPD(lam[i])*invPdf[i]*w
+// into L[i]. Only reached on the media-free hero fast path, so there is no shadow-ray
+// transmittance term (bkRadianceHero is gated on mediaN == 0).
+__device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Real* rho,
+                                      double* L, const double* thr, const Real* lam,
+                                      const double* invPdf, int nUp, DRng& rng) {
+    DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    for (int k = 0; k < sc.nEmitters; ++k) {
+        const DEmitter& em = sc.emitters[k];
+        if (em.collimated || em.shape == 3) continue;
+        BkNeeGeom g;
+        if (!bkEmitterGeom(sc, h, ngo0, em, rng, g)) continue;
+        for (int i = 0; i < nUp; ++i) {
+            Real f = rho[i] / (Real)DPI;
+            double emitW = (double)specLookup(em.emitSpd, lam[i]) * invPdf[i];
+            double contrib = g.sun
+                ? (double)(f * g.wSun) * emitW
+                : g.spot
+                ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
+                : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+            L[i] += thr[i] * contrib;
+        }
+    }
 }
 
 // Volume next-event estimation (device twin of backward.h neeVolume): connect a fog
@@ -5034,13 +5869,29 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             Real phase = dMedPhase(med, dot(wIn, wi), lambda);
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
             double contrib = (double)(alb * phase * fall / dist2) * emitW;
-            contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, dist, lambda, rng);
+            contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
+            total += contrib;
+            continue;
+        }
+        if (em.shape == 6) {
+            // Distant sun at a volume vertex (device twin of neeVolume's Sun branch):
+            // cone-sampled direction (pdf 1/Omega, so 1/pdfW = Omega), no surface cosine,
+            // transmittance out to the scene exit.
+            double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
+            DVec3 wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
+            Real dist = (Real)((double)length(sc.sceneCenter - p) + sc.sceneRadius);
+            if (occluded(sc, p + wi * RAY_EPS, wi, dist)) continue;
+            Real phase = dMedPhase(med, dot(wIn, wi), lambda);
+            double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+            double contrib = (double)(alb * phase) * emitW * em.spotOmega;
+            contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
             total += contrib;
             continue;
         }
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 y, nL;
-        emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
+        // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
+        double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
         DVec3 toL = y - p;
         Real dist2 = dot(toL, toL);
         Real dist  = sqrt(dist2);
@@ -5052,7 +5903,8 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         Real G = cosLight / dist2;                        // no surface cosine at a volume vertex
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
         double contrib = (double)(alb * phase * G) * emitW * (double)em.area;
-        contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, dist, lambda, rng);
+        if (epat != 1.0) contrib *= epat;                 // no-op without a pattern
+        contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
         total += contrib;
     }
     return total;
@@ -5064,41 +5916,76 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
 // shadow ray to the scene exit carrying media transmittance, and a balance-heuristic
 // MIS weight against the cosine-sampled continuation (MIS'd again on the BSDF-sampled
 // escape in bkRadiance). Returns the contribution (0 if occluded / below the horizon).
-__device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
-                                  double invPdfLambda, Real lambda, DRng& rng) {
-    if (sc.envIndex < 0) return 0.0;
+// The env connection's SAMPLING + VISIBILITY + MIS weight, all wavelength-independent,
+// factored out of bkNeeEnv (device twin of backward.h envGeom) so the scalar and hero
+// env NEE share one direction sample and one shadow ray.
+struct BkEnvGeom {
+    DVec3  wi;        // sampled incoming env direction
+    double pdfW;      // its solid-angle pdf
+    Real   cosSurf;   // cosine at the shading surface
+    Real   stG;       // Chiang shadow-terminator gate
+    double wMis;      // balance heuristic vs. the cosine-sampled continuation
+    double farDist;   // shadow-ray length to the scene exit
+};
+__device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkEnvGeom& g) {
     // Sample an incoming env direction: image env importance-samples the luminance CDF
     // (dEnvSample gives dir + solid-angle pdfW), constant env is uniform on the sphere
     // (pdf 1/4pi). Both draw exactly two uniforms in the same order as the CPU
     // scene.sampleEnvDir, so the estimator matches.
-    DVec3 wi; double pdfW;
-    const bool imageEnv = (sc.env.scale != nullptr);
-    if (imageEnv) {
-        dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), wi, pdfW);
-        if (pdfW <= 0.0) return 0.0;
+    if (sc.env.scale != nullptr) {
+        dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), g.wi, g.pdfW);
+        if (g.pdfW <= 0.0) return false;
     } else {
         double z = 1.0 - 2.0 * (double)rng.uniform();
         double sr = sqrt(fmax(0.0, 1.0 - z * z));
         double phi = 2.0 * DPI * (double)rng.uniform();
-        wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
-        pdfW = 1.0 / (4.0 * DPI);
+        g.wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+        g.pdfW = 1.0 / (4.0 * DPI);
     }
-    Real cosSurf = dot(h.n, wi);
-    if (cosSurf <= (Real)0) return 0.0;                     // below the shading horizon
+    g.cosSurf = dot(h.n, g.wi);
+    if (g.cosSurf <= (Real)0) return false;                 // below the shading horizon
     DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
-    Real stG = dShadowTerminatorG(wi, h.n, ngo);            // Chiang soft terminator (1 if flat)
-    if (stG <= (Real)0) return 0.0;                         // behind true geometry: hard shadow
-    double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
-    if (occluded(sc, h.p + ngo * RAY_EPS, wi, (Real)farDist)) return 0.0;
-    double Lenv = imageEnv ? dEnvRadiance(sc.env, wi, lambda)
-                           : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
+    g.stG = dShadowTerminatorG(g.wi, h.n, ngo);             // Chiang soft terminator (1 if flat)
+    if (g.stG <= (Real)0) return false;                     // behind true geometry: hard shadow
+    g.farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
+    if (occluded(sc, h.p + ngo * RAY_EPS, g.wi, (Real)g.farDist)) return false;
+    double pdfBsdf = (double)g.cosSurf / DPI;               // cosine-hemisphere pdf for wi
+    g.wMis = g.pdfW / (g.pdfW + pdfBsdf);                   // balance heuristic
+    return true;
+}
+
+__device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
+                                  double invPdfLambda, Real lambda, DRng& rng) {
+    if (sc.envIndex < 0) return 0.0;
+    BkEnvGeom g;
+    if (!bkEnvGeom(sc, h, rng, g)) return 0.0;
+    double Lenv = (sc.env.scale != nullptr) ? dEnvRadiance(sc.env, g.wi, lambda)
+                                            : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
-    double pdfBsdf = (double)cosSurf / DPI;                 // cosine-hemisphere pdf for wi
-    double wMis = pdfW / (pdfW + pdfBsdf);                  // balance heuristic
-    double contrib = ((double)rho / DPI) * Lenv * (double)cosSurf * invPdfLambda / pdfW * wMis * (double)stG;
+    double contrib = ((double)rho / DPI) * Lenv * (double)g.cosSurf * invPdfLambda / g.pdfW
+                     * g.wMis * (double)g.stG;
     if (sc.mediaN > 0)                                      // Beer-Lambert to the scene exit
-        contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, h.p, wi, (Real)farDist, lambda, rng);
+        contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, (Real)g.farDist, lambda, rng);
     return contrib;
+}
+
+// Hero-wavelength environment NEE (device twin of backward.h neeEnvHero): one shared env
+// direction + shadow ray, evaluated for all `nUp` live wavelengths. Media-free hero fast
+// path, so no transmittance term.
+__device__ static void bkNeeEnvHero(const DScene& sc, const DHit& h, const Real* rho,
+                                    double* L, const double* thr, const Real* lam,
+                                    const double* invPdf, int nUp, DRng& rng) {
+    if (sc.envIndex < 0) return;
+    BkEnvGeom g;
+    if (!bkEnvGeom(sc, h, rng, g)) return;
+    const bool imageEnv = (sc.env.scale != nullptr);
+    for (int i = 0; i < nUp; ++i) {
+        double Lenv = imageEnv ? dEnvRadiance(sc.env, g.wi, lam[i])
+                               : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]);
+        if (Lenv <= 0.0) continue;
+        L[i] += thr[i] * (((double)rho[i] / DPI) * Lenv * (double)g.cosSurf * invPdf[i]
+                          / g.pdfW * g.wMis * (double)g.stG);
+    }
 }
 
 // Environment NEE at a fog scattering vertex (device twin of backward.h neeEnvVolume,
@@ -5131,8 +6018,156 @@ __device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const 
     Real phase = dMedPhase(med, dot(wIn, wi), lambda);      // phase == its own pdf (HG or rainbow)
     double wMis = pdfW / (pdfW + (double)phase);            // balance heuristic
     double contrib = (double)alb * (double)phase * Lenv * invPdfLambda / pdfW * wMis;
-    contrib *= (double)dMediaTransmittance(sc.media, sc.mediaN, p, wi, (Real)farDist, lambda, rng);
+    contrib *= (double)dMediaTransmittance(sc, p, wi, (Real)farDist, lambda, rng);
     return contrib;
+}
+
+// Handle ONE surface material interaction on a single wavelength — the whole material
+// switch, factored out of bkRadiance (device twin of backward.h interactMaterial) so the
+// scalar tracer and the hero tracer (which de-heros before calling this) share one copy.
+// `mp` is the resolved leaf material (Mix already peeled by the caller); the surface's own
+// emission is handled by the caller BEFORE this call. All path state is in/out. Returns
+// true if the path continues (ray + state updated), false if it terminated (L already
+// holds this path's final value): a `break` in the old switch maps to `return true`, a
+// `return L` to `return false`.
+__device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const DHit& h,
+                                  int matId, int diffraction, bool directOnly,
+                                  DVec3& ro, DVec3& rd, Real& lambda, double& invPdfLambda,
+                                  double& thr, double& L, bool& specularArrival,
+                                  double& contBsdfPdf, DMediumStack& stk, DRng& rng) {
+    switch (mp->type) {
+        case D_DIELECTRIC: {
+            DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd);
+            ro = nro; rd = nrd; specularArrival = true; return true;
+        }
+        case D_THINFILM: {
+            DVec3 nro, nrd;
+            if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd)) return false;
+            ro = nro; rd = nrd; specularArrival = true; return true;
+        }
+        case D_MULTILAYER: {
+            DVec3 nro, nrd;
+            if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd)) return false;
+            ro = nro; rd = nrd; specularArrival = true; return true;
+        }
+        case D_MIRROR: {
+            Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
+            if (rng.uniform() >= r) return false;   // RR absorb
+            ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; return true;
+        }
+        case D_GRATING: {
+            Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
+            if (rng.uniform() >= r) return false;
+            DVec3 nro, nrd;
+            if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) return false;
+            ro = nro; rd = nrd; specularArrival = true; return true;
+        }
+        case D_HALFMIRROR: {
+            Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
+            if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
+            else                   { ro = h.p + rd * RAY_EPS; }
+            specularArrival = true; return true;
+        }
+        case D_FILTER: {
+            // Colored gel filter: pass straight through, survive with prob T(lambda).
+            Real t = clamp01(dTransmitSlot(sc, *mp, h, lambda));
+            if (rng.uniform() >= t) return false;   // absorbed
+            ro = h.p + rd * RAY_EPS;                // direction unchanged
+            specularArrival = true; return true;
+        }
+        case D_GLOSSY: {
+            Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
+            if (rng.uniform() >= r) return false;
+            DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
+            if (dot(o, h.n) <= 0) return false;
+            ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; return true;
+        }
+        case D_DIFFUSETRANSMIT: {
+            // Two-lobe Lambertian (device twin of backward.h DiffuseTransmit): NEE the
+            // reflect lobe against lights in the front (+n) hemisphere and the transmit
+            // lobe in the back (-n) hemisphere (a normal-flipped Hit reuses bkNeeLight),
+            // then continue reflect / transmit / absorb (throughput unchanged on survival).
+            Real rhoR = clamp01(dDiffuseRho(sc, *mp, h, lambda));
+            Real rhoT = clamp01(dTransmitSlot(sc, *mp, h, lambda));
+            Real sum = rhoR + rhoT;
+            if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
+            DVec3 nb = h.n * (Real)(-1);
+            L += thr * bkNeeLight(sc, h, rhoR, invPdfLambda, lambda, rng);   // front lobe
+            if (sc.envIndex >= 0)
+                L += thr * bkNeeEnv(sc, h, rhoR, invPdfLambda, lambda, rng);
+            DHit hb = h; hb.n = nb;
+            L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng);  // back lobe
+            if (sc.envIndex >= 0)
+                L += thr * bkNeeEnv(sc, hb, rhoT, invPdfLambda, lambda, rng);
+            if (directOnly) return false;            // Whitted: no diffuse indirect
+            Real u = rng.uniform();
+            if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; return true; }
+            else if (u < sum) { DVec3 wOut = cosineHemisphere(nb,  rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, nb )) / DPI; ro = h.p + nb  * RAY_EPS; rd = wOut; specularArrival = false; return true; }
+            return false;                            // absorbed
+        }
+        case D_FLUORESCENT: {
+            // Bispectral reradiation — device adjoint of backward.h MatType::Fluorescent.
+            // Elastic base reflects at the output wavelength; the fluorescent channel
+            // excites at a separately-sampled lambdaIn (Stokes shift). Both channels NEE;
+            // one stochastic continuation carries the indirect term.
+            double rhoEl = clamp01((double)specLookup(mp->reflect, lambda));   // elastic base @lambda(out)
+            L += thr * bkNeeLight(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
+            if (sc.envIndex >= 0)
+                L += thr * bkNeeEnv(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
+            double Mint = mp->fluoMint;
+            bool haveFluoro = (Mint > 0.0 && mp->fluoYield > (Real)0);
+            double gOut = 0.0, rhoFluo = 0.0, invPdfIn = 0.0;
+            Real lambdaIn = 0;
+            if (haveFluoro) {
+                gOut = ((double)specLookup(mp->fluoEmitSpec, lambda) / Mint) * invPdfLambda;
+                double pin = 0.0;
+                lambdaIn = dSampleSceneLambda(sc, rng, pin);
+                if (pin > 0.0) {
+                    invPdfIn = dInvPdfLambda(sc, lambdaIn);
+                    double rhoIn = clamp01((double)specLookup(mp->reflect, lambdaIn));
+                    double eps   = clamp01((double)specLookup(mp->fluoAbsorb, lambdaIn));
+                    double aEffIn = fmin(eps, fmax(0.0, 1.0 - rhoIn));
+                    rhoFluo = aEffIn * (double)mp->fluoYield;                 // reradiation albedo @lambdaIn
+                    if (rhoFluo > 0.0) {                                      // fluoro DIRECT NEE
+                        L += thr * gOut * bkNeeLight(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
+                        if (sc.envIndex >= 0)
+                            L += thr * gOut * bkNeeEnv(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
+                    }
+                }
+            }
+            if (directOnly) return false;                                    // Whitted: no indirect (elastic or fluoro)
+            double wFluo = gOut * rhoFluo;                                    // natural indirect-fluoro weight
+            double pF = (wFluo > 0.0) ? fmin(fmax(0.0, 1.0 - rhoEl), wFluo) : 0.0;
+            double u = rng.uniform();
+            if (u < rhoEl) {                                                  // elastic continuation
+                DVec3 wOut = cosineHemisphere(h.n, rng);
+                contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+                ro = h.p + h.n * RAY_EPS; rd = wOut;
+                specularArrival = false; return true;
+            } else if (u < rhoEl + pF) {                                      // fluoro (wavelength-switched)
+                thr *= wFluo / pF;
+                lambda = lambdaIn;                                            // Stokes shift (to the input wl)
+                invPdfLambda = invPdfIn;
+                DVec3 wOut = cosineHemisphere(h.n, rng);
+                contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+                ro = h.p + h.n * RAY_EPS; rd = wOut;
+                specularArrival = false; return true;
+            }
+            return false;                                                     // absorbed / terminated
+        }
+        case D_DIFFUSE:
+        default: {
+            Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
+            L += thr * bkNeeLight(sc, h, rho, invPdfLambda, lambda, rng);
+            if (sc.envIndex >= 0)                   // env-NEE toward the sky (MIS'd on miss)
+                L += thr * bkNeeEnv(sc, h, rho, invPdfLambda, lambda, rng);
+            if (directOnly) return false;           // Whitted: no diffuse indirect
+            if (rng.uniform() >= rho) return false; // RR on albedo
+            DVec3 wOut = cosineHemisphere(h.n, rng);
+            contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+            ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; return true;
+        }
+    }
 }
 
 // Estimate spectral-weighted radiance for one wavelength along a camera ray (port of
@@ -5164,7 +6199,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // Mirrors backward.h radiance() so the two estimators agree.
         if (sc.mediaN > 0) {
             Real tMed; int whichMed;
-            if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, dSurf, lambda, rng, tMed, whichMed)) {
+            if (dMediaSampleCollision(sc, ro, rd, dSurf, lambda, rng, tMed, whichMed)) {
                 DVec3 p = ro + rd * tMed;
                 int cm = stk.topMat();     // Beer-Lambert over the in-glass free-flight leg
                 Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
@@ -5202,6 +6237,12 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                     L += thr * Lenv * wMis;
                 }
             }
+            // Directly-viewed solar disc: camera / specular arrivals only. A diffuse or
+            // volume vertex already spent its one estimator on the sun via NEE
+            // (bkEmitterGeom / bkNeeVolume) and sets specularArrival = false, so this is
+            // a clean single-strategy split, not a missing MIS weight (host twin: backward.h).
+            if (sc.sunCount > 0 && specularArrival)
+                L += thr * dSunRadiance(sc, rd, lambda) * invPdfLambda;
             return L;
         }
         // Beer-Lambert attenuation over the in-glass segment up to this surface
@@ -5218,146 +6259,208 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             if (child < 0) return L;                    // absorbed
             mp = &sc.mats[child]; matId = child;
         }
-        // Emission on specular/camera arrival (NEE covers diffuse arrivals).
+        // Emission on specular/camera arrival (NEE covers diffuse arrivals), scaled by
+        // this hit's `emit pattern:` factor — the same value the NEE side gets from the
+        // sampler at this point (device twin of host emitSlot).
         int li = dEmitterForMat(sc, matId);
         if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
-            L += thr * (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda;
+            L += thr * (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda
+                     * dEmitPatMul(sc, mp->emitPat, h);
+
+        if (!bkInteract(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
+                        invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk, rng))
+            return L;                                   // path terminated in the interaction
+    }
+    return L;
+}
+
+// Hero-wavelength variant of bkRadiance — the device twin of backward.h radianceHero.
+// Carries C wavelengths (hero + C-1 stratified secondaries) down ONE camera path: index 0
+// is the hero and drives every sampling decision off the same rng stream a single-λ path
+// would, while the secondaries ride the identical vertices and are reweighted per-λ. At a
+// dispersive / wavelength-switching material (anything but Diffuse/DiffuseTransmit) the
+// secondaries de-hero (terminate) and the hero is boosted xC so it alone carries an
+// unbiased single-λ estimate onward — PBRT-v4's TerminateSecondary convention. The caller
+// gates this to scenes WITHOUT participating media / GRIN / a physical lens, so those
+// branches are absent here. Fills Lout[0..C).
+__device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
+                                      const Real* lamIn, const double* invPdfIn, int C,
+                                      double* Lout, DRng& rng) {
+    Real   lam[hero::kHeroMax];
+    double invPdf[hero::kHeroMax], thr[hero::kHeroMax];
+    for (int i = 0; i < C; ++i) { lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = 1.0; Lout[i] = 0.0; }
+    double* L = Lout;                                  // accumulate straight into the output
+    bool secAlive = (C > 1);
+    bool specularArrival = true;                       // camera ray may see a light directly
+    double contBsdfPdf = 0.0;                          // solid-angle pdf of the continuation (env MIS)
+    DMediumStack stk; stk.clear();                     // dielectric priority (Beer-Lambert on the hero λ)
+    const int maxBounce = sc.bkMaxBounce;
+    const bool directOnly = (sc.bkDirectOnly != 0);
+
+    for (int b = 0; b < maxBounce; ++b) {
+        int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
+        DHit h = closestHit(sc, ro, rd);
+
+        // Beer-Lambert over the in-glass segment. A non-empty stack implies we already
+        // de-hero'd (a dielectric entry de-heros), so nUp == 1 whenever absorption is
+        // non-zero; the loop still handles the general case.
+        if (h.valid) {
+            int cm = stk.topMat();
+            if (cm >= 0)
+                for (int i = 0; i < nUp; ++i) {
+                    Real a = (Real)specLookup(sc.mats[cm].absorb, lam[i]);
+                    if (a > 0) thr[i] *= exp(-(double)a * (double)h.t);
+                }
+        }
+
+        if (!h.valid) {                                // escaped: env radiance per λ
+            if (sc.envIndex >= 0) {
+                const bool imageEnv = (sc.env.scale != nullptr);
+                double wMis = 1.0;
+                if (!specularArrival) {                // MIS against the env-NEE at the last vertex
+                    double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
+                    wMis = (contBsdfPdf + pdfEnv > 0.0) ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
+                }
+                for (int i = 0; i < nUp; ++i) {
+                    double Lenv = (imageEnv ? dEnvRadiance(sc.env, rd, lam[i])
+                                            : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]))
+                                  * invPdf[i];
+                    L[i] += thr[i] * Lenv * wMis;
+                }
+            }
+            if (sc.sunCount > 0 && specularArrival)     // directly-viewed solar disc
+                for (int i = 0; i < nUp; ++i)
+                    L[i] += thr[i] * dSunRadiance(sc, rd, lam[i]) * invPdf[i];
+            return;
+        }
+
+        const DMaterial* mp = &sc.mats[h.matId];
+        int matId = h.matId;
+        if (mp->type == D_MIX) {                       // resolve stochastic mix
+            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+            if (child < 0) return;                      // absorbed
+            mp = &sc.mats[child]; matId = child;
+        }
+        // Surface emission on a specular/camera arrival (NEE covers diffuse arrivals).
+        // The `emit pattern:` factor is achromatic, so one eval serves the whole bundle.
+        int li = dEmitterForMat(sc, matId);
+        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0) {
+            double ep = dEmitPatMul(sc, mp->emitPat, h);
+            for (int i = 0; i < nUp; ++i)
+                L[i] += thr[i] * (double)specLookup(sc.emitters[li].emitSpd, lam[i]) * invPdf[i] * ep;
+        }
 
         switch (mp->type) {
-            case D_DIELECTRIC: {
-                DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd);
-                ro = nro; rd = nrd; specularArrival = true; break;
-            }
-            case D_THINFILM: {
-                DVec3 nro, nrd;
-                if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd)) return L;
-                ro = nro; rd = nrd; specularArrival = true; break;
-            }
-            case D_MULTILAYER: {
-                DVec3 nro, nrd;
-                if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd)) return L;
-                ro = nro; rd = nrd; specularArrival = true; break;
-            }
-            case D_MIRROR: {
-                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-                if (rng.uniform() >= r) return L;       // RR absorb
-                ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; break;
-            }
-            case D_GRATING: {
-                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-                if (rng.uniform() >= r) return L;
-                DVec3 nro, nrd;
-                if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) return L;
-                ro = nro; rd = nrd; specularArrival = true; break;
-            }
-            case D_HALFMIRROR: {
-                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-                if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
-                else                   { ro = h.p + rd * RAY_EPS; }
-                specularArrival = true; break;
-            }
-            case D_FILTER: {
-                // Colored gel filter: pass straight through, survive with prob T(lambda).
-                Real t = clamp01(specLookup(mp->transmit, lambda));
-                if (rng.uniform() >= t) return L;   // absorbed
-                ro = h.p + rd * RAY_EPS;            // direction unchanged
-                specularArrival = true; break;
-            }
-            case D_GLOSSY: {
-                Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-                if (rng.uniform() >= r) return L;
-                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
-                if (dot(o, h.n) <= 0) return L;
-                ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; break;
-            }
             case D_DIFFUSETRANSMIT: {
-                // Two-lobe Lambertian (device twin of backward.h DiffuseTransmit): NEE the
-                // reflect lobe against lights in the front (+n) hemisphere and the transmit
-                // lobe in the back (-n) hemisphere (a normal-flipped Hit reuses bkNeeLight),
-                // then continue reflect / transmit / absorb (throughput unchanged on survival).
-                Real rhoR = clamp01(dDiffuseRho(sc, *mp, h, lambda));
-                Real rhoT = clamp01(specLookup(mp->transmit, lambda));
-                Real sum = rhoR + rhoT;
-                if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
+                Real rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
+                for (int i = 0; i < nUp; ++i) {
+                    Real rr = clamp01(dDiffuseRho(sc, *mp, h, lam[i]));
+                    Real rt = clamp01(dTransmitSlot(sc, *mp, h, lam[i]));
+                    Real s = rr + rt;
+                    if (s > (Real)1) { rr /= s; rt /= s; }        // per-λ energy guard
+                    rhoR[i] = rr; rhoT[i] = rt;
+                }
                 DVec3 nb = h.n * (Real)(-1);
-                L += thr * bkNeeLight(sc, h, rhoR, invPdfLambda, lambda, rng);   // front lobe
-                if (sc.envIndex >= 0)
-                    L += thr * bkNeeEnv(sc, h, rhoR, invPdfLambda, lambda, rng);
-                DHit hb = h; hb.n = nb;
-                L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng);  // back lobe
-                if (sc.envIndex >= 0)
-                    L += thr * bkNeeEnv(sc, hb, rhoT, invPdfLambda, lambda, rng);
-                if (directOnly) return L;                // Whitted: no diffuse indirect
+                bkNeeLightHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng);      // front lobe
+                if (sc.envIndex >= 0) bkNeeEnvHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng);
+                DHit hb = h; hb.n = nb;                            // back hemisphere (transmit lobe)
+                bkNeeLightHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                if (sc.envIndex >= 0) bkNeeEnvHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                if (directOnly) return;                            // Whitted: no diffuse indirect
+                // Lobe pick + RR over the whole bundle (see D_DIFFUSE): the reflect/transmit
+                // probabilities are the per-lobe MAX over live λ, so no secondary is ever
+                // amplified. The maxima can sum past 1 (each λ alone is guarded), in which
+                // case both shrink proportionally. At nUp == 1 this is the scalar code.
+                Real qR = rhoR[0], qT = rhoT[0];
+                for (int i = 1; i < nUp; ++i) {
+                    if (rhoR[i] > qR) qR = rhoR[i];
+                    if (rhoT[i] > qT) qT = rhoT[i];
+                }
+                Real sumHero = qR + qT;
+                if (nUp > 1 && sumHero > (Real)1) { qR /= sumHero; qT /= sumHero; sumHero = qR + qT; }
                 Real u = rng.uniform();
-                if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break; }
-                else if (u < sum) { DVec3 wOut = cosineHemisphere(nb,  rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, nb )) / DPI; ro = h.p + nb  * RAY_EPS; rd = wOut; specularArrival = false; break; }
-                return L;                                // absorbed
+                if (u < qR) {                                      // reflect (front)
+                    for (int i = 0; i < nUp; ++i) thr[i] *= (double)rhoR[i] / (double)qR;
+                    DVec3 wOut = cosineHemisphere(h.n, rng);
+                    contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
+                    ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
+                } else if (u < sumHero) {                          // transmit (back)
+                    for (int i = 0; i < nUp; ++i) thr[i] *= (double)rhoT[i] / (double)qT;
+                    DVec3 wOut = cosineHemisphere(nb, rng);
+                    contBsdfPdf = fmax(0.0, (double)dot(wOut, nb)) / DPI;
+                    ro = h.p + nb * RAY_EPS; rd = wOut; specularArrival = false; break;
+                }
+                return;                                            // absorbed
             }
+            case D_MIRROR: case D_FILTER: case D_GLOSSY: {
+                // ACHROMATIC delta lobes (device twin of backward.h): specular, so no NEE
+                // and specularArrival stays true, but the outgoing DIRECTION is the same
+                // for every λ — a mirror reflects, a gel passes straight through, a glossy
+                // lobe is the mirror direction blurred by a λ-independent roughness. So the
+                // bundle keeps riding and only the per-λ coefficient differs.
+                // The scalar path survives by ANALOG Russian roulette on the hero's own
+                // coefficient; rolling that coin on the hero alone would kill live
+                // secondaries whenever c_hero == 0 (a Wratten gel is 0 over most of the
+                // spectrum), so the survival probability is the MAX over live λ and the
+                // survivors reweight by c_i/q. At nUp == 1, q == c[0] and thr[0] *= 1.0,
+                // i.e. the scalar code verbatim (same rng draws, same order).
+                Real c[hero::kHeroMax];
+                double q = 0.0;
+                for (int i = 0; i < nUp; ++i) {
+                    c[i] = (mp->type == D_FILTER) ? clamp01(dTransmitSlot(sc, *mp, h, lam[i]))
+                                                  : clamp01(dReflectSlot(sc, *mp, h, lam[i]));
+                    if ((double)c[i] > q) q = (double)c[i];
+                }
+                if (rng.uniform() >= q) return;                    // RR absorb (q == 0 -> always)
+                for (int i = 0; i < nUp; ++i) thr[i] *= (double)c[i] / q;
+                if (mp->type == D_MIRROR) {
+                    ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n);
+                } else if (mp->type == D_FILTER) {
+                    ro = h.p + rd * RAY_EPS;                       // direction unchanged
+                } else {
+                    DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
+                    if (dot(o, h.n) <= 0) return;
+                    ro = h.p + h.n * RAY_EPS; rd = o;
+                }
+                specularArrival = true;
+                break;
+            }
+            case D_DIELECTRIC: case D_THINFILM: case D_MULTILAYER:
+            case D_GRATING:    case D_HALFMIRROR:
             case D_FLUORESCENT: {
-                // Bispectral reradiation — device adjoint of backward.h MatType::Fluorescent.
-                // Elastic base reflects at the output wavelength; the fluorescent channel
-                // excites at a separately-sampled lambdaIn (Stokes shift). Both channels NEE;
-                // one stochastic continuation carries the indirect term.
-                double rhoEl = clamp01((double)specLookup(mp->reflect, lambda));   // elastic base @lambda(out)
-                L += thr * bkNeeLight(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
-                if (sc.envIndex >= 0)
-                    L += thr * bkNeeEnv(sc, h, (Real)rhoEl, invPdfLambda, lambda, rng);
-                double Mint = mp->fluoMint;
-                bool haveFluoro = (Mint > 0.0 && mp->fluoYield > (Real)0);
-                double gOut = 0.0, rhoFluo = 0.0, invPdfIn = 0.0;
-                Real lambdaIn = 0;
-                if (haveFluoro) {
-                    gOut = ((double)specLookup(mp->fluoEmitSpec, lambda) / Mint) * invPdfLambda;
-                    double pin = 0.0;
-                    lambdaIn = dSampleSceneLambda(sc, rng, pin);
-                    if (pin > 0.0) {
-                        invPdfIn = dInvPdfLambda(sc, lambdaIn);
-                        double rhoIn = clamp01((double)specLookup(mp->reflect, lambdaIn));
-                        double eps   = clamp01((double)specLookup(mp->fluoAbsorb, lambdaIn));
-                        double aEffIn = fmin(eps, fmax(0.0, 1.0 - rhoIn));
-                        rhoFluo = aEffIn * (double)mp->fluoYield;                 // reradiation albedo @lambdaIn
-                        if (rhoFluo > 0.0) {                                      // fluoro DIRECT NEE
-                            L += thr * gOut * bkNeeLight(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
-                            if (sc.envIndex >= 0)
-                                L += thr * gOut * bkNeeEnv(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng);
-                        }
-                    }
-                }
-                if (directOnly) return L;                                        // Whitted: no indirect (elastic or fluoro)
-                double wFluo = gOut * rhoFluo;                                    // natural indirect-fluoro weight
-                double pF = (wFluo > 0.0) ? fmin(fmax(0.0, 1.0 - rhoEl), wFluo) : 0.0;
-                double u = rng.uniform();
-                if (u < rhoEl) {                                                  // elastic continuation
-                    DVec3 wOut = cosineHemisphere(h.n, rng);
-                    contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                    ro = h.p + h.n * RAY_EPS; rd = wOut;
-                    specularArrival = false; break;
-                } else if (u < rhoEl + pF) {                                      // fluoro (wavelength-switched)
-                    thr *= wFluo / pF;
-                    lambda = lambdaIn;                                            // Stokes shift (to the input wl)
-                    invPdfLambda = invPdfIn;
-                    DVec3 wOut = cosineHemisphere(h.n, rng);
-                    contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                    ro = h.p + h.n * RAY_EPS; rd = wOut;
-                    specularArrival = false; break;
-                }
-                return L;                                                         // absorbed / terminated
+                // Dispersive / wavelength-switching: terminate the secondaries (boosting
+                // the hero xC so the estimate stays unbiased), then run the shared scalar
+                // interaction on the hero channel alone. Note bkInteract may itself switch
+                // lam[0]/invPdf[0] (a fluorescent Stokes shift) — legal now that index 0 is
+                // the only live wavelength.
+                if (secAlive) { thr[0] *= (double)C; secAlive = false; }
+                if (!bkInteract(sc, mp, h, matId, diffraction, directOnly, ro, rd, lam[0],
+                                invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk, rng))
+                    return;
+                break;
             }
             case D_DIFFUSE:
             default: {
-                Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
-                L += thr * bkNeeLight(sc, h, rho, invPdfLambda, lambda, rng);
-                if (sc.envIndex >= 0)                   // env-NEE toward the sky (MIS'd on miss)
-                    L += thr * bkNeeEnv(sc, h, rho, invPdfLambda, lambda, rng);
-                if (directOnly) return L;               // Whitted: no diffuse indirect
-                if (rng.uniform() >= rho) return L;     // RR on albedo
+                Real rho[hero::kHeroMax];
+                for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, *mp, h, lam[i]));
+                bkNeeLightHero(sc, h, rho, L, thr, lam, invPdf, nUp, rng);
+                if (sc.envIndex >= 0) bkNeeEnvHero(sc, h, rho, L, thr, lam, invPdf, nUp, rng);
+                if (directOnly) return;                            // Whitted: no diffuse indirect
+                // Continuation RR over the WHOLE bundle: survival probability is max_i rho_i,
+                // not the hero's own albedo, and every live λ reweights by rho_i/q <= 1.
+                // Rolling the coin on the hero alone (thr[i] *= rho_i/rho_0) amplifies a
+                // secondary by up to rho_max/rho_hero — on a saturated wall (redWall spans
+                // 0.05..0.75) a 15x weight spike. At nUp == 1, q == rho[0] and thr[0] *= 1.0.
+                Real q = rho[0];
+                for (int i = 1; i < nUp; ++i) if (rho[i] > q) q = rho[i];
+                if (rng.uniform() >= q) return;                    // RR absorb
+                for (int i = 0; i < nUp; ++i) thr[i] *= (double)rho[i] / (double)q;
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
                 ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; break;
             }
         }
     }
-    return L;
 }
 
 // Backward reference megakernel (GPU mode R). Grid-strides over res*res*spp samples;
@@ -5369,10 +6472,14 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
 // index (pixel * sppTotal + sampleBase + localSample) so a render split into any number
 // of chunks draws exactly the same union of streams as one single-shot pass of sppTotal
 // samples — chunked progress is therefore bit-identical to the monolithic render.
+// `heroC` > 1 selects the hero-wavelength bundle (bkRadianceHero): one stratified base
+// draw yields C wavelengths that share a single BVH walk, each splatting L/C. heroC == 1
+// runs the classic single-λ estimator bit-for-bit (the host gates heroC to 1 whenever the
+// scene has media / GRIN / a physical lens, which bkRadianceHero does not cover).
 __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
                           long long totalSamples, long long chunkSpp, long long sppTotal,
                           long long sampleBase, int resX,
-                          int diffraction, unsigned long long seedBase) {
+                          int diffraction, unsigned long long seedBase, int heroC) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     for (long long idx = g; idx < totalSamples; idx += G) {
@@ -5381,6 +6488,40 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
+        size_t o = ((size_t)py * resX + px) * 3;
+
+        if (heroC > 1) {
+            // One stratified base draw -> hero + C-1 secondary wavelengths, all from the
+            // scene emission CDF (device twin of BackwardRenderer::renderRows). The hero
+            // (index 0) must have a valid pdf; a dead secondary carries invPdf 0 and
+            // splats nothing. Hero is gated off for a physical lens, so no lens weight.
+            Real   lam[hero::kHeroMax];
+            double invPdf[hero::kHeroMax];
+            double u = (double)rng.uniform(), pdf0 = 0.0;
+            lam[0] = dSampleSceneLambdaU(sc, u, pdf0);
+            if (pdf0 <= 0.0) continue;
+            invPdf[0] = dInvPdfLambda(sc, lam[0]);
+            for (int i = 1; i < heroC; ++i) {
+                double uu = u + (double)i / heroC;
+                if (uu >= 1.0) uu -= 1.0;              // wrap into [0,1)
+                double pdfi = 0.0;
+                lam[i] = dSampleSceneLambdaU(sc, uu, pdfi);
+                invPdf[i] = (pdfi > 0.0) ? dInvPdfLambda(sc, lam[i]) : 0.0;
+            }
+            DVec3 hro, hrd;
+            Real jx = rng.uniform(), jy = rng.uniform();
+            dGenRay(cam, px, py, jx, jy, hro, hrd);
+            double Lh[hero::kHeroMax];
+            bkRadianceHero(sc, diffraction, hro, hrd, lam, invPdf, heroC, Lh, rng);
+            for (int i = 0; i < heroC; ++i) {
+                double w = Lh[i] / (double)heroC;
+                atomicAdd(&film[o + 0], (double)cieX(lam[i]) * w);
+                atomicAdd(&film[o + 1], (double)cieY(lam[i]) * w);
+                atomicAdd(&film[o + 2], (double)cieZ(lam[i]) * w);
+            }
+            if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
+            continue;
+        }
 
         double pdf = 0.0;
         Real lambda = dSampleSceneLambda(sc, rng, pdf);
@@ -5401,7 +6542,6 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         }
         double Lval = bkRadiance(sc, diffraction, ro, rd, lambda, invPdfLambda, rng);
         double w = Lval * wLens;
-        size_t o = ((size_t)py * resX + px) * 3;
         atomicAdd(&film[o + 0], (double)cieX(lambda) * w);
         atomicAdd(&film[o + 1], (double)cieY(lambda) * w);
         atomicAdd(&film[o + 2], (double)cieZ(lambda) * w);
@@ -5447,9 +6587,23 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             total = total + hadamard(f * (fall * cosSurf / dist2 * stG), em.rgbEmit);
             continue;
         }
+        if (em.shape == 6) {                           // distant sun: cone NEE, 1/pdfW = Omega
+            double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
+            DVec3 wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
+            Real cosSurf = dot(h.n, wi);
+            if (cosSurf <= (Real)0) continue;
+            Real stG = dShadowTerminatorG(wi, h.n, ngo0);
+            if (stG <= (Real)0) continue;
+            Real dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
+            if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist)) continue;
+            total = total + hadamard(f * (Real)((double)(cosSurf * stG) * em.spotOmega), em.rgbEmit);
+            continue;
+        }
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 y, nL;
-        emitterSamplePoint(em, (double)u1, (double)u2, y, nL);
+        // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
+        // The pattern is achromatic, so it scales the baked RGB radiance directly.
+        double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
         DVec3 toL = y - h.p;
         Real dist2 = dot(toL, toL);
         Real dist = sqrt(dist2);
@@ -5462,6 +6616,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         if (cosLight <= 0) continue;
         if (occluded(sc, h.p + ngo0 * RAY_EPS, wi, dist - (Real)2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
+        if (epat != 1.0) G = (Real)((double)G * epat);   // no-op without a pattern
         total = total + hadamard(f * (G * em.area * stG), em.rgbEmit);
     }
     return total;
@@ -5517,6 +6672,14 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                     L = L + hadamard(beta, sc.rgbEnv) * (Real)wMis;
                 }
             }
+            // Directly-viewed solar disc (camera / specular arrivals only, as in the
+            // spectral walk). rgbEmit already carries the sun's wavelength-integrated
+            // radiance, so no per-λ term is needed here.
+            if (sc.sunCount > 0 && specularArrival)
+                for (int k = 0; k < sc.nEmitters; ++k) {
+                    const DEmitter& e = sc.emitters[k];
+                    if (e.shape == 6 && dInSunCone(e, rd)) L = L + hadamard(beta, e.rgbEmit);
+                }
             return L;
         }
         // Beer-Lambert attenuation over the in-glass segment (3-tap RGB sigma_a).
@@ -5538,8 +6701,11 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             mp = &sc.mats[child]; matId = child;
         }
         int li = dEmitterForMat(sc, matId);
-        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
-            L = L + hadamard(beta, sc.emitters[li].rgbEmit);
+        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0) {
+            // The emission pattern is achromatic, so it scales the baked RGB radiance.
+            double ep = dEmitPatMul(sc, mp->emitPat, h);
+            L = L + hadamard(beta * (Real)ep, sc.emitters[li].rgbEmit);
+        }
 
         switch (mp->type) {
             case D_DIELECTRIC: {
@@ -5808,12 +6974,27 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
 // `importance` marks the LIGHT (particle) subpath: only then is the Veach adjoint
 // shading-normal correction applied at each non-specular vertex (mode==Importance in
 // bdpt.h). The eye (Radiance) subpath smooth-shades for free and passes false.
+//
+// Hero-wavelength bundle: `hb` supplies the C wavelengths, `betaSecIn`/`nUpIn` the incoming
+// secondary throughputs (nUpIn == 1 for a plain single-λ walk, which takes exactly the
+// original code path — every added loop has an empty trip count). Only the THROUGHPUT is
+// per-λ; every direction, pdf, Russian-roulette draw and MIS density comes from the hero,
+// so each secondary reweights by the ratio of its own scattering albedo to the hero's. At a
+// delta (dispersive / wavelength-switching) interface the secondaries can no longer follow
+// the hero's refracted direction, so the bundle DE-HEROS: nUp drops to 1 for this and every
+// later vertex. Secondary throughputs are written into pathSec[vertexIndex*secStride + i].
 __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int diffraction,
-                                   DVec3 ro, DVec3 rd, double beta, double pdfDir, Real lambda,
-                                   int maxDepth, DRng& rng, DVertex* path, int& n,
-                                   bool importance) {
+                                   DVec3 ro, DVec3 rd, double beta, double pdfDir,
+                                   const DHeroBundle& hb, int maxDepth, DRng& rng,
+                                   DVertex* path, double* pathSec, int secStride, int& n,
+                                   bool importance, const double* betaSecIn, int nUpIn) {
+    const Real lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;
+    // Live secondary throughputs. betaSec[i] tracks wavelength hb.lam[i+1].
+    double betaSec[BDPT_NSEC];
+    int nUp = nUpIn < 1 ? 1 : nUpIn;
+    for (int i = 0; i + 1 < nUp; ++i) betaSec[i] = betaSecIn[i];
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack for exterior-IOR resolution
     for (int bounces = 0;;) {
         DHit h = closestHit(sc, ro, rd);
@@ -5827,7 +7008,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         double tMed = 0.0; bool mediumEvent = false; int scatterMed = -1;
         if (sc.mediaN > 0) {
             Real tm; int which;
-            if (dMediaSampleCollision(sc.media, sc.mediaN, ro, rd, (Real)dSurf, lambda, rng, tm, which)) {
+            if (dMediaSampleCollision(sc, ro, rd, (Real)dSurf, lambda, rng, tm, which)) {
                 tMed = (double)tm; mediumEvent = true; scatterMed = which;
             }
         }
@@ -5840,6 +7021,13 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             int cm = stk.topMat();
             double a = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
             if (a > 0.0) beta *= exp(-a * (mediumEvent ? tMed : dSurf));
+            // Per-λ absorption for the bundle. A non-empty stack means we are inside a
+            // dielectric, and entering one de-heros — so nUp is always 1 whenever `a` can be
+            // non-zero and this loop never actually runs. Kept for generality.
+            if (cm >= 0) for (int i = 0; i + 1 < nUp; ++i) {
+                double ai = (double)specLookup(sc.mats[cm].absorb, hb.lam[i + 1]);
+                if (ai > 0.0) betaSec[i] *= exp(-ai * (mediumEvent ? tMed : dSurf));
+            }
         }
 
         // Medium collision precedes the surface: append a volume in-scatter vertex, then
@@ -5855,10 +7043,13 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             DVertex v;
             v.type = BV_MEDIUM; v.p = mpos; v.ns = rd; v.ng = rd;
             v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
-            v.matId = -1; v.lightIdx = -1;
+            v.matId = -1; v.lightIdx = -1; v.emitPatW = (Real)1;
             v.mediumG = sm.g; v.mediumId = scatterMed;
+            // Hero is gated off for scenes with media, so nUp is 1 here in practice.
+            v.nUp = nUp;
             v.pdfFwd = dConvertDensity(pdfFwd, path[prevIdx], v);
             path[n] = v; int cur = n; n++;
+            for (int i = 0; i + 1 < nUp; ++i) pathSec[cur * secStride + i] = betaSec[i];
             if (++bounces >= maxDepth) return;
             if (rng.uniform() >= (double)medAlbedo(sm, lambda)) return;   // absorbed (vertex retained)
             DVec3 wo = normalize(path[prevIdx].p - path[cur].p);          // toward previous vertex
@@ -5886,14 +7077,31 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
         v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
         v.matId = matId; v.lightIdx = dEmitterForMat(sc, matId);
+        // Emission-on-hit half of the slot, evaluated once here where the DHit is in hand
+        // (dVertexLe is called later from several MIS strategies with no hit available).
+        // Host twin: bdpt.h's slotPatMul at the same hit.
+        v.emitPatW = (mp->emitPat >= 0) ? (Real)dEmitPatMul(sc, mp->emitPat, h) : (Real)1;
         v.mediumG = 0.0; v.mediumId = -1;
         v.u = h.u; v.v = h.v;   // per-hit texcoords for textured/patterned/record BSDF eval (M9)
+        v.nUp = nUp;
         v.pdfFwd = dConvertDensity(pdfFwd, path[n - 1], v);
         path[n] = v; int cur = n; n++;
+        for (int i = 0; i + 1 < nUp; ++i) pathSec[cur * secStride + i] = betaSec[i];
         if (++bounces >= maxDepth) return;
 
         DVec3 wo = normalize(path[cur - 1].p - path[cur].p);
         DVec3 wi; double pdfW = 0, pdfRevW = 0, betaFactor = 0; int delta = 0; bool terminate = false;
+        // Mirror / Filter are delta but choose their continuation WITHOUT consulting λ,
+        // so the secondaries can ride through them; they set keepBundle to opt out of
+        // the `if (delta) nUp = 1` collapse below (device twin of bdpt.h).
+        bool keepBundle = false;
+        // Hero bundle: per-secondary throughput factor secF[i] = f_{i+1}·cos/pdf for the
+        // lobe the hero actually sampled (pdf is always the hero's). ABSOLUTE, not a ratio
+        // to the hero's — a ratio is undefined exactly where it matters most, a chromatic
+        // lobe whose hero value is 0 while a secondary's is not. Wavelength-INDEPENDENT
+        // cases leave `secChromatic` false and reuse `betaFactor`. Ignored when nUp == 1.
+        double secF[BDPT_NSEC];
+        bool secChromatic = false;
         switch (mp->type) {
             case D_DIFFUSE:
             case D_FLUORESCENT: {
@@ -5903,7 +7111,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = rho;
-                if (rho <= 0) terminate = true;
+                secChromatic = true;                  // rho <= 0 is caught by the max test
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(dDiffuseRho(sc, *mp, h, hb.lam[i + 1]));
                 break;
             }
             case D_GLOSSY: {
@@ -5914,7 +7124,14 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = r;
-                if (r <= 0 || pdfW <= 0) terminate = true;
+                if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the max test
+                // The glossy LOBE (mirror direction + roughness exponent) carries no
+                // wavelength dependence, so the whole bundle follows the sampled direction
+                // and only the reflectance differs per λ. (The unidirectional hero tracers
+                // de-hero here instead — see known-issues.md.)
+                secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(dReflectSlot(sc, *mp, h, hb.lam[i + 1]));
                 break;
             }
             case D_DIFFUSETRANSMIT: {
@@ -5926,19 +7143,33 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 double tot = rhoR + rhoT;
                 if (tot <= 0) { terminate = true; break; }
                 DVec3 nb = path[cur].ns * (Real)(-1);
-                if (rng.uniform() < rhoR / tot) wi = cosineHemisphere(path[cur].ns, rng);
-                else                            wi = cosineHemisphere(nb, rng);
+                const bool reflLobe = (rng.uniform() < rhoR / tot);
+                if (reflLobe) wi = cosineHemisphere(path[cur].ns, rng);
+                else          wi = cosineHemisphere(nb, rng);
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 if (pdfW <= 0) { terminate = true; break; }
                 // f*|cos|/pdf = rho_lobe/PI * |cos| / (pSel*|cos|/PI) = rho_lobe/pSel = tot.
                 betaFactor = tot;
+                // The lobe was CHOSEN by the hero's albedo split, so each secondary divides
+                // by the HERO's albedo for that lobe, not its own:
+                // f_i·cos/pdf_hero = rho_i(lobe) · tot_hero / rho_hero(lobe).
+                secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i) {
+                    double rR, rT; dDiffuseTransmitAlbedos(sc, *mp, h, hb.lam[i + 1], rR, rT);
+                    double num = reflLobe ? rR   : rT;
+                    double den = reflLobe ? rhoR : rhoT;
+                    secF[i] = (den > 0.0) ? num * tot / den : 0.0;
+                }
                 break;
             }
             case D_MIRROR: {
                 double r = clamp01(specLookup(mp->reflect, lambda));
                 wi = reflectv(rd, path[cur].ns); betaFactor = r; delta = 1;
-                if (r <= 0) terminate = true;
+                // Mirror direction is λ-independent: keep the bundle, reweight per-λ.
+                keepBundle = true; secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(specLookup(mp->reflect, hb.lam[i + 1]));
                 break;
             }
             case D_DIELECTRIC: {
@@ -5956,9 +7187,14 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             case D_FILTER: {
                 // Colored gel filter: straight-through delta, throughput ×= T(lambda).
-                double t = clamp01(specLookup(mp->transmit, lambda));
+                double t = clamp01(dTransmitSlot(sc, *mp, h, lambda));
                 wi = rd; betaFactor = t; delta = 1;
-                if (t <= 0) terminate = true;
+                // Straight-through for every λ: keep the bundle, reweight per-λ. This is
+                // the case with the widest per-λ spread (a Wratten gel is 0 over most of
+                // the spectrum), and the reason secF is absolute rather than a ratio.
+                keepBundle = true; secChromatic = true;
+                for (int i = 0; i + 1 < nUp; ++i)
+                    secF[i] = clamp01(dTransmitSlot(sc, *mp, h, hb.lam[i + 1]));
                 break;
             }
             case D_THINFILM: {
@@ -5983,19 +7219,35 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             default: terminate = true; break;
         }
-        if (terminate || betaFactor <= 0.0) return;
+        // Kill the walk only when EVERY live wavelength is dead: the hero's own factor can
+        // legitimately be 0 while a secondary's is not (gel filter, saturated spectral
+        // reflectance), and dropping the bundle there biases low. nUp == 1 -> empty loop ->
+        // mxF == betaFactor, i.e. exactly the old scalar test.
+        double mxF = betaFactor;
+        if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
+        if (terminate || mxF <= 0.0) return;
 
         path[cur].delta = delta;
         if (delta) { pdfW = 0.0; pdfRevW = 0.0; }
         path[cur - 1].pdfRev = dConvertDensity(pdfRevW, path[cur], path[cur - 1]);
 
         beta *= betaFactor;
+        for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
         // Veach adjoint shading-normal correction on the LIGHT subpath only (1 when
         // ns==ng). wo = toward previous (light-side) vertex; wi = sampled continuation.
         if (importance && !delta) {
             DVec3 ngo = (dot(path[cur].ng, path[cur].ns) >= 0.0) ? path[cur].ng : path[cur].ng * (Real)(-1);
-            beta *= (double)dShadingAdjointCorr(wo, normalize(wi), path[cur].ns, ngo);
+            const double adj = (double)dShadingAdjointCorr(wo, normalize(wi), path[cur].ns, ngo);
+            beta *= adj;                                        // purely geometric: same for all λ
+            for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= adj;
         }
+        // DE-HERO. Every delta interface (dielectric / thin-film / grating / multilayer /
+        // half-mirror ...) picks a direction the secondaries cannot follow, so the bundle
+        // collapses to the hero from here on. The vertex JUST pushed keeps its full nUp (it
+        // really was reached by all C wavelengths); only its continuation is single-λ.
+        // EXCEPTION: Mirror and Filter are delta but wavelength-INDEPENDENT in direction,
+        // so they set keepBundle and carry the secondaries on a per-λ secF instead.
+        if (delta && !keepBundle) nUp = 1;
         double sgn = dot(wi, path[cur].ng) >= 0.0 ? 1.0 : -1.0;
         ro = path[cur].p + path[cur].ng * (Real)(sgn * 1e-6);
         rd = normalize(wi);
@@ -6013,16 +7265,24 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 // delta means its direction pdf only enters the excluded t=1 term, so the placeholder
 // dCameraPdfDir seed is never used in a retained MIS ratio. Mirrors bdpt.h.
 __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, int diffraction,
-                                        int px, int py, Real lambda, int maxDepth,
-                                        DRng& rng, DVertex* path) {
+                                        int px, int py, const DHeroBundle& hb, int maxDepth,
+                                        DRng& rng, DVertex* path, double* pathSec, int secStride) {
+    const Real lambda = hb.lam[0];
+    // The camera vertex sees every wavelength at unit throughput: the bundle starts at full
+    // width with all secondary throughputs 1 (importance leaves the camera achromatic).
+    double betaSec0[BDPT_NSEC];
+    for (int i = 0; i + 1 < hb.C; ++i) betaSec0[i] = 1.0;
     DVertex c;
     c.type = BV_CAMERA; c.ns = cam.w; c.ng = cam.w;
     c.beta = 1.0; c.pdfFwd = 0; c.pdfRev = 0; c.delta = 0; c.matId = -1; c.lightIdx = -1;
-    c.mediumG = 0.0; c.mediumId = -1;
+    c.emitPatW = (Real)1;
+    c.mediumG = 0.0; c.mediumId = -1; c.nUp = hb.C;
+    for (int i = 0; i + 1 < hb.C; ++i) pathSec[i] = 1.0;
     if (cam.hasLens) {
         Real jx = rng.uniform(), jy = rng.uniform();
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 ro, rd; Real wl = 0;
+        c.nUp = 1;               // lensed cameras are single-λ (the hero gate excludes them)
         if (!dGenLensRay(cam, px, py, jx, jy, u1, u2, lambda, ro, rd, wl) || wl <= 0) {
             // Vignetted: lone delta camera vertex (nE=1) contributes 0 (t=1 off, t>=2 needs a
             // scene vertex we never added).
@@ -6034,7 +7294,8 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         c.delta = 1;             // no closed-form lens inverse: not connectible (t=1 off)
         path[0] = c; int n = 1;
         double pdfDir = dCameraPdfDir(cam, ddot(rd, cam.w));   // MIS-irrelevant placeholder
-        dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, lambda, maxDepth - 1, rng, path, n, false);
+        dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, hb, maxDepth - 1, rng,
+                    path, pathSec, secStride, n, false, betaSec0, 1);
         return n;
     }
     c.p = cam.eye;
@@ -6045,20 +7306,27 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     DVec3 rd = normalize(cam.w + cam.u * ((sx + (Real)cam.frustumShiftX) * (Real)cam.tanHalfX) + cam.v * (sy * (Real)cam.tanHalfY));
     double cosCam = ddot(rd, cam.w);
     double pdfDir = dCameraPdfDir(cam, cosCam);
-    dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, lambda, maxDepth - 1, rng, path, n, false);
+    dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, hb, maxDepth - 1, rng,
+                path, pathSec, secStride, n, false, betaSec0, hb.C);
     return n;
 }
 // Sample a light subpath. path[0] is the light endpoint (beta = Le).
 __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int diffraction,
-                                       Real lambda, double invPdfLambda, int maxDepth,
-                                       DRng& rng, DVertex* path) {
+                                       const DHeroBundle& hb, int maxDepth,
+                                       DRng& rng, DVertex* path, double* pathSec, int secStride) {
+    const Real lambda = hb.lam[0];
+    const double invPdfLambda = hb.invPdf[0];
     if (sc.nEmitters == 0 || sc.totalPower <= 0.0) return 0;
     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
     const DEmitter& em = sc.emitters[ei];
-    if (em.shape == 2 || em.shape == 3 || em.collimated) return 0;
+    if (em.shape == 2 || em.shape == 3 || em.shape == 6 || em.collimated) return 0;
     Real u1 = rng.uniform(), u2 = rng.uniform();
-    DVec3 y, nOut; emitterSamplePoint(em, u1, u2, y, nOut);
-    double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+    DVec3 y, nOut;
+    // `emitPatW` is this point's `emit pattern:` factor (1.0, and a bit-identical draw,
+    // when the emitter is unpatterned). It scales the emitted radiance the subpath starts
+    // with, exactly as the emission-on-hit side scales the s=0 strategy's radiance.
+    double emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
+    double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
     if (Le <= 0.0) return 0;
     double pdfChoice = em.power / sc.totalPower;
     double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
@@ -6067,15 +7335,24 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     L0.type = BV_LIGHT; L0.p = y; L0.ns = nOut; L0.ng = nOut;
     L0.beta = Le; L0.pdfFwd = pdfChoice * pdfPos; L0.pdfRev = 0; L0.delta = 0;
     L0.matId = em.matId; L0.lightIdx = ei;
+    L0.emitPatW = (Real)emitPatW;
     L0.mediumG = 0.0; L0.mediumId = -1;
+    // The light endpoint carries each wavelength's own emitted radiance Le(λ)/pdf(λ).
+    L0.nUp = hb.C;
+    for (int i = 0; i + 1 < hb.C; ++i)
+        pathSec[i] = (double)specLookup(em.emitSpd, hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
     path[0] = L0; int n = 1;
     DVec3 dir = cosineHemisphere(nOut, rng);
     double cosLight = ddot(nOut, dir);
     if (cosLight <= 0.0) return 1;
     double pdfDir = cosLight / DPI;
     double betaWalk = Le * cosLight / (pdfChoice * pdfPos * pdfDir);
+    double betaWalkSec[BDPT_NSEC];
+    for (int i = 0; i + 1 < hb.C; ++i)
+        betaWalkSec[i] = pathSec[i] * cosLight / (pdfChoice * pdfPos * pdfDir);
     DVec3 ro = y + nOut * (Real)1e-6;
-    dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, lambda, maxDepth - 1, rng, path, n, true);
+    dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, hb, maxDepth - 1, rng,
+                path, pathSec, secStride, n, true, betaWalkSec, hb.C);
     return n;
 }
 
@@ -6135,19 +7412,34 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
     return 1.0 / (1.0 + (double)sumRi);
 }
 
-// Connect strategy (s,t); returns the MIS-weighted radiance. For t==1 the result is a
-// light-image splat to (outPx,outPy) with isSplat=1. Direct port of bdpt.h connectBDPT.
+// Connect strategy (s,t); returns the MIS-weighted radiance of the HERO wavelength. For
+// t==1 the result is a light-image splat to (outPx,outPy) with isSplat=1. Direct port of
+// bdpt.h connectBDPT.
+//
+// Hero bundle: `Lsec[i]` receives the C-1 secondaries' MIS-weighted radiance and `nUpConn`
+// how many wavelengths this connection actually carries — min(nUp of the two endpoints),
+// since either subpath may have de-hero'd independently. `nUpConn == 0` means "no
+// contribution" (every early-out leaves it 0), which is how the caller detects a reject.
+// Because every SAMPLING decision was hero-driven, the MIS weight is identical for all
+// wavelengths, so dMisWeight runs ONCE and multiplies the whole bundle.
 __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
-                                      const DVertex* light, const DVertex* eye, int s, int t,
-                                      Real lambda, double invPdfLambda, DRng& rng,
-                                      int& outPx, int& outPy, int& isSplat) {
+                                      const DVertex* light, const DVertex* eye,
+                                      const double* lightSec, const double* eyeSec, int secStride,
+                                      int s, int t, const DHeroBundle& hb, DRng& rng,
+                                      int& outPx, int& outPy, int& isSplat,
+                                      double* Lsec, int& nUpConn) {
+    const Real lambda = hb.lam[0];
+    const double invPdfLambda = hb.invPdf[0];
     isSplat = 0;
+    nUpConn = 0;                    // set to the real width only once a contribution exists
     if (t > 1 && s != 0 && dIsLightVertex(eye[t - 1])) return 0.0;
 
     double L = 0.0;
+    int nUp = 1;                    // live wavelengths for THIS connection (set per branch)
     DVertex sampled;
     sampled.type = BV_SURFACE; sampled.beta = 0; sampled.pdfFwd = 0; sampled.pdfRev = 0;
     sampled.delta = 0; sampled.matId = -1; sampled.lightIdx = -1;
+    sampled.emitPatW = (Real)1;
     sampled.mediumG = 0.0; sampled.mediumId = -1; sampled.u = 0; sampled.v = 0;
 
     if (s == 0) {
@@ -6155,9 +7447,18 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         const DVertex& pt = eye[t - 1];
         if (!dIsLightVertex(pt)) return 0.0;
         DVec3 wo = normalize(eye[t - 2].p - pt.p);
+        nUp = pt.nUp;
         double Le = dVertexLe(sc, pt, wo, lambda, invPdfLambda);
-        if (Le <= 0.0) return 0.0;
+        // The reject tests the max over the live wavelengths — identical to `Le <= 0` when
+        // nUp == 1, so the single-λ path is unchanged bit-for-bit.
+        double LeSec[BDPT_NSEC], mxLe = Le;
+        for (int i = 0; i + 1 < nUp; ++i) {
+            LeSec[i] = dVertexLe(sc, pt, wo, hb.lam[i + 1], hb.invPdf[i + 1]);
+            if (LeSec[i] > mxLe) mxLe = LeSec[i];
+        }
+        if (mxLe <= 0.0) return 0.0;
         L = pt.beta * Le;
+        for (int i = 0; i + 1 < nUp; ++i) Lsec[i] = eyeSec[(t - 1) * secStride + i] * LeSec[i];
     } else if (t == 1) {
         // Realistic lens (Plan B): the light-image splat needs a world->sensor projection
         // the multi-element lens map can't provide (no closed-form inverse), so it's
@@ -6173,9 +7474,13 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         DVec3 wcam = (cam.eye - qs.p) * (Real)(1.0 / dist);
         DVec3 wo = normalize(light[s - 2].p - qs.p);
         // Medium endpoint: phase*albedo, cosine 1, occlusion from the exact point.
+        nUp = qs.nUp;
+        double fSec[BDPT_NSEC];
         double cosSurf, f; DVec3 o;
         if (qs.type == BV_MEDIUM) {
             cosSurf = 1.0; f = dMediumScatterF(sc, qs, wo, wcam, lambda); o = qs.p;
+            for (int i = 0; i + 1 < nUp; ++i)
+                fSec[i] = dMediumScatterF(sc, qs, wo, wcam, hb.lam[i + 1]);
         } else {
             cosSurf = ddot(qs.ns, wcam);
             // Reflect-only vertices require the +ns side; a two-sided (DiffuseTransmit)
@@ -6194,17 +7499,32 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // Adjoint correction on the LIGHT-subpath vertex qs (particle side, outgoing
             // toward camera). 1 when ns==ng. wo = toward previous (light-side) vertex.
             // |cos| inside dShadingAdjointCorr makes it lobe-agnostic (serves the transmit lobe).
-            f *= (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ) * stG;
+            // Purely geometric, so the same factor serves every wavelength.
+            const double adj = (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ) * stG;
+            f *= adj;
+            for (int i = 0; i + 1 < nUp; ++i)
+                fSec[i] = dBsdfF(sc, qs, wo, wcam, hb.lam[i + 1]) * adj;
             double sgn = ddot(qs.ng, wcam) >= 0.0 ? 1.0 : -1.0;
             o = qs.p + qs.ng * (Real)(sgn * 1e-6);
         }
-        if (f <= 0.0) return 0.0;
+        {   // max over live wavelengths (identical to `f <= 0` when nUp == 1)
+            double mxF = f;
+            for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
+            if (mxF <= 0.0) return 0.0;
+        }
         if (occluded(sc, o, wcam, (Real)(dist - 2e-6))) return 0.0;
         double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
-        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, qs.p, wcam, (Real)dist, lambda, rng) : 1.0;
+        // Hero-only transmittance: the hero gate excludes any medium, so Tr is exactly 1
+        // whenever nUp > 1.
+        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, qs.p, wcam, (Real)dist, lambda, rng) : 1.0;
         double G = fabs(cosSurf) * cosCam / dist2;
         L = qs.beta * f * G * dCameraWe(cam, cosCam) * Tr;
-        if (L <= 0.0) return 0.0;
+        for (int i = 0; i + 1 < nUp; ++i)
+            Lsec[i] = lightSec[(s - 1) * secStride + i] * fSec[i] * G * dCameraWe(cam, cosCam) * Tr;
+        {   double mxL = L;
+            for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mxL) mxL = Lsec[i];
+            if (mxL <= 0.0) return 0.0;
+        }
         sampled.type = BV_CAMERA; sampled.p = cam.eye; sampled.ns = cam.w; sampled.ng = cam.w;
         sampled.beta = 1.0;
         outPx = px; outPy = py; isSplat = 1;
@@ -6213,16 +7533,28 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         if (!dVertConnectible(sc, pt)) return 0.0;
         int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
         const DEmitter& em = sc.emitters[ei];
-        if (em.shape == 2 || em.shape == 3 || em.collimated) return 0.0;
+        if (em.shape == 2 || em.shape == 3 || em.shape == 6 || em.collimated) return 0.0;
         Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 y, nOut; emitterSamplePoint(em, u1, u2, y, nOut);
+        DVec3 y, nOut;
+        // The sampled point's `emit pattern:` factor scales the radiance this strategy
+        // sees; s=0 applies the pointwise-equal emission-on-hit factor, which is what
+        // keeps the two MIS-combined strategies consistent.
+        double emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
         DVec3 toL = y - pt.p; double dist2 = ddot(toL, toL);
         if (dist2 <= 0.0) return 0.0;
         double dist = sqrt(dist2); DVec3 wi = toL * (Real)(1.0 / dist);
         double cosLight = ddot(nOut, wi * (Real)-1);
         if (cosLight <= 0.0) return 0.0;               // emitter stays one-sided
-        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        if (Le <= 0.0) return 0.0;
+        nUp = pt.nUp;
+        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
+        double LeSec[BDPT_NSEC];
+        {   double mxLe = Le;
+            for (int i = 0; i + 1 < nUp; ++i) {
+                LeSec[i] = (double)specLookup(em.emitSpd, hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
+                if (LeSec[i] > mxLe) mxLe = LeSec[i];
+            }
+            if (mxLe <= 0.0) return 0.0;
+        }
         DVec3 wo = normalize(eye[t - 2].p - pt.p);
         // Cheap sidedness/terminator rejects and the shadow ray run FIRST; the BSDF/phase
         // eval (texture fetches, lobe math) is deferred until the connection is known
@@ -6251,20 +7583,37 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         if (occluded(sc, o, wi, (Real)(dist - 2e-6))) return 0.0;
         double f = (pt.type == BV_MEDIUM) ? dMediumScatterF(sc, pt, wo, wi, lambda)
                                           : dBsdfF(sc, pt, wo, wi, lambda) * stG;
-        if (f <= 0.0) return 0.0;
+        double fSec[BDPT_NSEC];
+        for (int i = 0; i + 1 < nUp; ++i)
+            fSec[i] = (pt.type == BV_MEDIUM) ? dMediumScatterF(sc, pt, wo, wi, hb.lam[i + 1])
+                                             : dBsdfF(sc, pt, wo, wi, hb.lam[i + 1]) * stG;
+        {   // max over live wavelengths (identical to `f <= 0` when nUp == 1)
+            double mxF = f;
+            for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
+            if (mxF <= 0.0) return 0.0;
+        }
         double pdfChoice = em.power / sc.totalPower;
         double pdfA = pdfChoice / em.area;
         if (pdfA <= 0.0) return 0.0;
-        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, pt.p, wi, (Real)dist, lambda, rng) : 1.0;
+        // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
+        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, pt.p, wi, (Real)dist, lambda, rng) : 1.0;
         double G = fabs(cosSurf) * cosLight / dist2;
         L = pt.beta * f * Le * G / pdfA * Tr;
-        if (L <= 0.0) return 0.0;
+        for (int i = 0; i + 1 < nUp; ++i)
+            Lsec[i] = eyeSec[(t - 1) * secStride + i] * fSec[i] * LeSec[i] * G / pdfA * Tr;
+        {   double mxL = L;
+            for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mxL) mxL = Lsec[i];
+            if (mxL <= 0.0) return 0.0;
+        }
         sampled.type = BV_LIGHT; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
         sampled.lightIdx = ei; sampled.matId = em.matId; sampled.beta = Le / pdfA; sampled.pdfFwd = pdfA;
+        sampled.emitPatW = (Real)emitPatW;   // so dVertexLe on this sampled vertex agrees
     } else {
         const DVertex& qs = light[s - 1];
         const DVertex& pt = eye[t - 1];
         if (!dVertConnectible(sc, qs) || !dVertConnectible(sc, pt)) return 0.0;
+        // The two subpaths de-hero independently; the connection carries the narrower bundle.
+        nUp = (qs.nUp < pt.nUp) ? qs.nUp : pt.nUp;
         DVec3 d = qs.p - pt.p; double dist2 = ddot(d, d);
         if (dist2 <= 0.0) return 0.0;
         double dist = sqrt(dist2); DVec3 w = d * (Real)(1.0 / dist);   // pt -> qs
@@ -6313,27 +7662,56 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         }
         if (occluded(sc, o, w, (Real)(dist - 2e-6))) return 0.0;
         double fE, fL;
+        double fESec[BDPT_NSEC], fLSec[BDPT_NSEC];
         if (pt.type == BV_MEDIUM) {
             fE = dMediumScatterF(sc, pt, woE, w, lambda);
+            for (int i = 0; i + 1 < nUp; ++i)
+                fESec[i] = dMediumScatterF(sc, pt, woE, w, hb.lam[i + 1]);
         } else {
             fE = dBsdfF(sc, pt, woE, w, lambda) * stGE;
+            for (int i = 0; i + 1 < nUp; ++i)
+                fESec[i] = dBsdfF(sc, pt, woE, w, hb.lam[i + 1]) * stGE;
         }
         if (qs.type == BV_MEDIUM) {
             fL = dMediumScatterF(sc, qs, woL, w * (Real)-1, lambda);
+            for (int i = 0; i + 1 < nUp; ++i)
+                fLSec[i] = dMediumScatterF(sc, qs, woL, w * (Real)-1, hb.lam[i + 1]);
         } else {
             fL = dBsdfF(sc, qs, woL, w * (Real)-1, lambda) * stGL;
             // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
             // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
             // |cos| inside dShadingAdjointCorr makes it lobe-agnostic (serves the transmit lobe).
-            fL *= (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
+            // Purely geometric, so the same factor serves every wavelength.
+            const double adjL = (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
+            fL *= adjL;
+            for (int i = 0; i + 1 < nUp; ++i)
+                fLSec[i] = dBsdfF(sc, qs, woL, w * (Real)-1, hb.lam[i + 1]) * stGL * adjL;
         }
-        if (fE <= 0.0 || fL <= 0.0) return 0.0;
-        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc.media, sc.mediaN, pt.p, w, (Real)dist, lambda, rng) : 1.0;
+        {   // max over live wavelengths on each side (identical to the scalar tests at nUp==1)
+            double mxE = fE, mxL = fL;
+            for (int i = 0; i + 1 < nUp; ++i) {
+                if (fESec[i] > mxE) mxE = fESec[i];
+                if (fLSec[i] > mxL) mxL = fLSec[i];
+            }
+            if (mxE <= 0.0 || mxL <= 0.0) return 0.0;
+        }
+        // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
+        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, pt.p, w, (Real)dist, lambda, rng) : 1.0;
         double G = fabs(cosE) * fabs(cosL) / dist2;
         L = pt.beta * fE * fL * qs.beta * G * Tr;
+        for (int i = 0; i + 1 < nUp; ++i)
+            Lsec[i] = eyeSec[(t - 1) * secStride + i] * fESec[i] * fLSec[i]
+                    * lightSec[(s - 1) * secStride + i] * G * Tr;
     }
-    if (L <= 0.0) return 0.0;
-    return L * dMisWeight(sc, cam, light, eye, sampled, s, t, lambda);
+    // One shared reject and ONE shared MIS weight for the whole bundle: every sampling
+    // decision was hero-driven, so the balance-heuristic ratios do not depend on λ.
+    double mx = L;
+    for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mx) mx = Lsec[i];
+    if (mx <= 0.0) return 0.0;
+    const double mis = dMisWeight(sc, cam, light, eye, sampled, s, t, lambda);
+    for (int i = 0; i + 1 < nUp; ++i) Lsec[i] *= mis;
+    nUpConn = nUp;
+    return L * mis;
 }
 
 // BDPT megakernel: one thread renders one (pixel,sample), grid-stride over all
@@ -6347,13 +7725,23 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 // blocks (256 threads) resident per SM. Capping at 3 blocks/SM (<=170 regs) trades a few
 // extra spills for +50% latency hiding; the kernel is latency-bound on spilled/local
 // state (8KB stack/thread), so occupancy wins.
+//
+// Templated on NS = the number of SECONDARY hero wavelength slots, so the scalar
+// instantiation (kBdptT<0>) allocates the per-vertex secondary-throughput arrays at one
+// element and is bit-for-bit the original single-λ kernel: every hero loop it contains has
+// an empty trip count, and every added reject is a max over one value. The hero
+// instantiation (kBdptT<BDPT_NSEC>) pays 2*BDPT_MAXV*BDPT_NSEC doubles (~1.2 KB) of extra
+// per-thread local state for the bundle.
+template <int NS>
 __global__ void __launch_bounds__(128, 3)
-kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
+kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                       long long totalSamples, long long chunkSpp, long long sppTotal,
                       long long sampleBase, int resX, int maxDepth,
-                      int diffraction, unsigned long long seedBase) {
+                      int diffraction, unsigned long long seedBase, int heroC) {
+    enum { SECN = (NS > 0 ? NS : 1) };
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
+    const int C = (NS > 0) ? heroC : 1;
     for (long long idx = g; idx < totalSamples; idx += G) {
         long long pix = idx / chunkSpp;
         long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
@@ -6361,33 +7749,71 @@ kBdpt(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
 
-        double pdfLam = 0.0;
-        Real lambda = dSampleSceneLambda(sc, rng, pdfLam);
-        if (pdfLam <= 0.0) continue;
-        double invPdfLambda = dInvPdfLambda(sc, lambda);
+        // Hero + C-1 stratified secondaries from ONE base uniform (u + i/C wrapped into
+        // [0,1)), pushed through the same inverse-CDF the scalar path uses. The hero must
+        // have a valid pdf; a dead secondary simply carries invPdf 0 (contributes nothing).
+        DHeroBundle hb;
+        if (C > 1) {
+            double u = (double)rng.uniform(), pdf0 = 0.0;
+            hb.lam[0] = dSampleSceneLambdaU(sc, u, pdf0);
+            if (pdf0 <= 0.0) continue;
+            hb.invPdf[0] = dInvPdfLambda(sc, hb.lam[0]);
+            hb.C = C;
+            for (int i = 1; i < C; ++i) {
+                double uu = u + (double)i / C;
+                if (uu >= 1.0) uu -= 1.0;
+                double pdfI = 0.0;
+                hb.lam[i] = dSampleSceneLambdaU(sc, uu, pdfI);
+                hb.invPdf[i] = (pdfI > 0.0) ? dInvPdfLambda(sc, hb.lam[i]) : 0.0;
+            }
+        } else {
+            double pdfLam = 0.0;
+            hb.lam[0] = dSampleSceneLambda(sc, rng, pdfLam);
+            if (pdfLam <= 0.0) continue;
+            hb.invPdf[0] = dInvPdfLambda(sc, hb.lam[0]);
+            hb.C = 1;
+        }
+        const Real lambda = hb.lam[0];
 
         DVertex eye[BDPT_MAXV], light[BDPT_MAXV];
-        int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, lambda, maxDepth + 1, rng, eye);
-        int nL = dGenLightSubpath(sc, cam, diffraction, lambda, invPdfLambda, maxDepth + 1, rng, light);
+        double eyeSec[BDPT_MAXV * SECN], lightSec[BDPT_MAXV * SECN];
+        int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, hb, maxDepth + 1, rng, eye, eyeSec, NS);
+        int nL = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS);
 
         Real cx = cieX(lambda), cy = cieY(lambda), cz = cieZ(lambda);
+        Real cxS[SECN], cyS[SECN], czS[SECN];
+        for (int i = 0; i + 1 < hb.C; ++i) {
+            cxS[i] = cieX(hb.lam[i + 1]); cyS[i] = cieY(hb.lam[i + 1]); czS[i] = cieZ(hb.lam[i + 1]);
+        }
         for (int t = 1; t <= nE; ++t)
             for (int s = 0; s <= nL; ++s) {
                 int depth = t + s - 2;
                 if ((s == 1 && t == 1) || depth < 0 || depth > maxDepth) continue;
-                int spx = 0, spy = 0, isSplat = 0;
-                double c = dConnectBDPT(sc, cam, light, eye, s, t, lambda, invPdfLambda, rng, spx, spy, isSplat);
-                if (c <= 0.0) continue;
+                int spx = 0, spy = 0, isSplat = 0, nUpConn = 0;
+                double Lsec[SECN];
+                double c = dConnectBDPT(sc, cam, light, eye, lightSec, eyeSec, NS,
+                                        s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn);
+                if (nUpConn <= 0) continue;
+                // The ×C de-hero boost is applied ONCE here, as 1/min(nUp_light, nUp_eye):
+                // folding it into either subpath's throughput would square it whenever both
+                // sides stayed multi-λ. nUpConn == 1 reproduces the scalar accumulation exactly.
+                double ax = cx * c, ay = cy * c, az = cz * c;
+                for (int i = 0; i + 1 < nUpConn; ++i) {
+                    ax += cxS[i] * Lsec[i]; ay += cyS[i] * Lsec[i]; az += czS[i] * Lsec[i];
+                }
+                if (nUpConn > 1) {
+                    double inv = 1.0 / nUpConn; ax *= inv; ay *= inv; az *= inv;
+                }
                 if (isSplat) {
                     size_t o = ((size_t)spy * resX + spx) * 3;
-                    atomicAdd(&splatFilm[o + 0], (double)(cx * c));
-                    atomicAdd(&splatFilm[o + 1], (double)(cy * c));
-                    atomicAdd(&splatFilm[o + 2], (double)(cz * c));
+                    atomicAdd(&splatFilm[o + 0], ax);
+                    atomicAdd(&splatFilm[o + 1], ay);
+                    atomicAdd(&splatFilm[o + 2], az);
                 } else {
                     size_t o = ((size_t)py * resX + px) * 3;
-                    atomicAdd(&camFilm[o + 0], (double)(cx * c));
-                    atomicAdd(&camFilm[o + 1], (double)(cy * c));
-                    atomicAdd(&camFilm[o + 2], (double)(cz * c));
+                    atomicAdd(&camFilm[o + 0], ax);
+                    atomicAdd(&camFilm[o + 1], ay);
+                    atomicAdd(&camFilm[o + 2], az);
                 }
             }
     }
@@ -6451,7 +7877,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
         if (li >= 0) {                                   // emitter
             if (specularSeen) {                          // specular-direct: NEE can't reach it
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
-                double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * rhoV * invPdfL;
+                double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * rhoV * invPdfL
+                         * dEmitPatMul(sc, m.emitPat, h);   // `emit pattern:` at this hit
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
             return;                                       // else: direct handled by NEE at vis
@@ -6507,7 +7934,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm, 
                 break;
             }
             case D_FILTER: {
-                thr *= (double)clamp01(specLookup(m.transmit, lambda));
+                thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
                 ro = h.p + rd * RAY_EPS; break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
@@ -6562,6 +7989,16 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 oY += (double)cieY(lambda) * e;
                 oZ += (double)cieZ(lambda) * e;
             }
+            // Directly-viewed solar disc. This walk terminates at the first diffuse
+            // vertex (the density estimate returns there), so any escape reaching here
+            // is a camera ray or a specular chain — never a diffuse continuation that
+            // the map / NEE already credited with the sun. (Host twin: photonmap_render.h.)
+            if (sc.sunCount > 0) {
+                double e = thr * dSunRadiance(sc, rd, lambda) * invPdfL;
+                oX += (double)cieX(lambda) * e;
+                oY += (double)cieY(lambda) * e;
+                oZ += (double)cieZ(lambda) * e;
+            }
             return;
         }
 
@@ -6576,7 +8013,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
 
         int li = dEmitterForMat(sc, matId);
         if (li >= 0) {                                   // directly-viewed / specular-seen emitter
-            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL;
+            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL
+                     * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
             oX += (double)cieX(lambda) * e;
             oY += (double)cieY(lambda) * e;
             oZ += (double)cieZ(lambda) * e;
@@ -6665,7 +8103,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm, int
                 break;
             }
             case D_FILTER: {
-                thr *= (double)clamp01(specLookup(m.transmit, lambda));
+                thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
                 ro = h.p + rd * RAY_EPS; break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
@@ -6748,6 +8186,15 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 dY += (double)cieY(lambda) * e;
                 dZ += (double)cieZ(lambda) * e;
             }
+            // Directly-viewed solar disc (camera / specular escapes only — a diffuse
+            // vertex stores a hit point and returns before it can reach here).
+            // Host twin: sppm_render.h.
+            if (sc.sunCount > 0) {
+                double e = thr * dSunRadiance(sc, rd, lambda) * invPdfL;
+                dX += (double)cieX(lambda) * e;
+                dY += (double)cieY(lambda) * e;
+                dZ += (double)cieZ(lambda) * e;
+            }
             return;
         }
         const DMaterial* mp = &sc.mats[h.matId];
@@ -6761,7 +8208,8 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
 
         int li = dEmitterForMat(sc, matId);
         if (li >= 0) {                                   // directly-viewed / specular-seen emitter
-            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL;
+            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL
+                     * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
             dX += (double)cieX(lambda) * e;
             dY += (double)cieY(lambda) * e;
             dZ += (double)cieZ(lambda) * e;
@@ -6795,7 +8243,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 break;
             }
             case D_FILTER: {
-                thr *= (double)clamp01(specLookup(m.transmit, lambda));
+                thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
                 ro = h.p + rd * RAY_EPS; break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
@@ -6952,6 +8400,19 @@ struct DVcmLV {
     float  lambda;
     int    matId, edges;
     Real   u, v;
+    int    nUp;            // hero wavelengths still live here (1 == de-hero'd / single-λ)
+};
+
+// The SECONDARY hero wavelengths of a stored light vertex, one slot per secondary. Kept in a
+// PARALLEL slab (`lvSec[(i*vcmCap + k)*secStride + j]`, secStride == C-1) rather than inline in
+// DVcmLV, exactly like GPU BDPT's `pathSec`: the light-vertex slab is `npix * vcmCap * 128 B`
+// and is by far the largest allocation in a VCM session, so a single-λ run (`-heroc 1`) must
+// allocate the sec slab at zero and pay nothing. Only `beta` and `lam` are stored — cie(λ) is
+// recomputed at gather time, which is bit-identical to caching it (DVcmLV::cx is likewise just
+// `(double)cieX(lambda)`) and halves the slot to 16 B.
+struct DVcmSec {
+    double beta;
+    float  lam;
 };
 
 // Uniform hash grid over the compacted light vertices (device twin of vcm.h VcmGrid). `lv`
@@ -6977,11 +8438,13 @@ struct DVcmCtx {
 __device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
     DVertex v; v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = matId; v.lightIdx = -1;
+    v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.mediumG = 0; v.mediumId = -1; v.u = h.u; v.v = h.v; return v;
 }
 __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
     DVertex v; v.type = BV_SURFACE; v.p = lv.p; v.ns = lv.ns; v.ng = lv.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = lv.matId; v.lightIdx = -1;
+    v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.mediumG = 0; v.mediumId = -1; v.u = lv.u; v.v = lv.v; return v;
 }
 
@@ -6989,16 +8452,37 @@ __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
 // Returns wi/betaFactor/pdfW/pdfRevW/cosThetaOut/delta/terminate. Uses per-hit slots
 // (dReflectSlot / dMatRoughness / dDiffuseRho) so it matches the CPU VCM exactly. Media are
 // out of scope; `stk` still resolves the nested-dielectric exterior IOR (dDielectricStep).
+//
+// HERO BUNDLE (Wilkie 2014; the four shared policies live in hero.h). When `nUp > 1` the caller
+// carries nUp wavelengths on this one ray: `lamAll` is the bundle (lamAll[0] == the hero ==
+// `lambda`) and on return `secF[i]` is the ABSOLUTE throughput factor for secondary i — NOT a
+// ratio to the hero's, which is undefined exactly where it matters most (a gel whose T(λ_hero)
+// is 0 while a secondary is wide open). `secChromatic` says secF was filled at all; the
+// λ-independent lobes leave it false and the caller reuses `betaFactor` for every λ.
+// `keepBundle` marks the delta lobes that nevertheless pick their continuation WITHOUT
+// consulting λ (Mirror reflects, Filter passes straight through), so they opt out of the
+// caller's `if (delta) nUp = 1` collapse.
+//
+// NOTE the `<= 0` early terminations the scalar version did for a zero reflectance /
+// transmittance are GONE from the chromatic lobes: the caller applies a max-over-live-λ test
+// instead, which at nUp == 1 is exactly the old scalar test (`mxF == betaFactor`). Grating
+// keeps its `r <= 0` bail because it gates an RNG consumer (gratingDiffract).
 __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const DHit& h,
                                    const DVec3& rd, Real lambda, DRng& rng, int matId,
                                    DMediumStack& stk, int diffraction,
                                    DVec3& wi, double& betaFactor, double& pdfW, double& pdfRevW,
-                                   double& cosThetaOut, bool& delta, bool& terminate) {
+                                   double& cosThetaOut, bool& delta, bool& terminate,
+                                   const Real* lamAll = nullptr, int nUp = 1,
+                                   double* secF = nullptr, bool* secChromatic = nullptr,
+                                   bool* keepBundle = nullptr) {
     DVertex vt = dVertFromHit(h, matId);
     const DVec3& ns = h.n;
     DVec3 wo = normalize(rd * (Real)-1);
     wi = DVec3(0, 0, 0); betaFactor = 0; pdfW = 0; pdfRevW = 0; cosThetaOut = 0;
     delta = false; terminate = false;
+    const int nSec = (secF && lamAll && nUp > 1) ? nUp - 1 : 0;   // secondaries to fill
+    if (secChromatic) *secChromatic = false;
+    if (keepBundle)   *keepBundle = false;
     switch (m.type) {
         case D_DIFFUSE:
         case D_FLUORESCENT: {
@@ -7007,8 +8491,12 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             double rho = clamp01(dDiffuseRho(sc, m, h, lambda));
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
-            betaFactor = rho;
-            if (rho <= 0) terminate = true;
+            betaFactor = rho;                     // rho <= 0 is caught by the caller's max test
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(dDiffuseRho(sc, m, h, lamAll[i + 1]));
+            }
             break;
         }
         case D_GLOSSY: {
@@ -7019,25 +8507,51 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
             betaFactor = r;
-            if (r <= 0 || pdfW <= 0) terminate = true;
+            if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test
+            // The glossy LOBE (mirror direction + roughness exponent) carries no wavelength
+            // dependence, so the whole bundle follows the sampled direction and only the
+            // reflectance differs per λ.
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(dReflectSlot(sc, m, h, lamAll[i + 1]));
+            }
             break;
         }
         case D_DIFFUSETRANSMIT: {
             double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
             double tot = rhoR + rhoT;
             if (tot <= 0.0) { terminate = true; break; }
-            if (rng.uniform() * tot < rhoR) wi = cosineHemisphere(ns, rng);
-            else                            wi = cosineHemisphere(ns * (Real)-1, rng);
+            const bool reflLobe = (rng.uniform() * tot < rhoR);
+            if (reflLobe) wi = cosineHemisphere(ns, rng);
+            else          wi = cosineHemisphere(ns * (Real)-1, rng);
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
             betaFactor = tot;
             if (pdfW <= 0) terminate = true;
+            // The lobe was CHOSEN by the hero's albedo split, so each secondary divides by the
+            // HERO's albedo for that lobe: f_i·cos/pdf_hero = rho_i(lobe)·tot_hero/rho_hero(lobe).
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i) {
+                    double rR, rT; dDiffuseTransmitAlbedos(sc, m, h, lamAll[i + 1], rR, rT);
+                    double num = reflLobe ? rR   : rT;
+                    double den = reflLobe ? rhoR : rhoT;
+                    secF[i] = (den > 0.0) ? num * tot / den : 0.0;
+                }
+            }
             break;
         }
         case D_MIRROR: {
             double r = clamp01(dReflectSlot(sc, m, h, lambda));
             wi = reflectv(rd, ns); betaFactor = r; delta = true;
-            if (r <= 0) terminate = true;
+            // The mirror direction is the same for every λ, so the bundle survives; only the
+            // reflectance is per-λ (cf. Glossy, the rough version of this).
+            if (nSec) {
+                *keepBundle = true; *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(dReflectSlot(sc, m, h, lamAll[i + 1]));
+            }
             break;
         }
         case D_DIELECTRIC: {
@@ -7052,9 +8566,18 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             break;
         }
         case D_FILTER: {
-            double t = clamp01(specLookup(m.transmit, lambda));
-            wi = rd; betaFactor = t; delta = true;
-            if (t <= 0) terminate = true;
+            double t = clamp01(dTransmitSlot(sc, m, h, lambda));
+            wi = rd; betaFactor = t; delta = true;   // t <= 0 -> caller's max test
+            // Straight-through for every λ, so the bundle survives — and a gel filter is
+            // exactly where the per-λ transmittance spread is largest, i.e. the case that
+            // benefits most from NOT de-heroing, AND the case that forces the absolute
+            // (rather than ratio) secF, since T(λ_hero) is legitimately 0 across most of a
+            // Wratten passband.
+            if (nSec) {
+                *keepBundle = true; *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(dTransmitSlot(sc, m, h, lamAll[i + 1]));
+            }
             break;
         }
         case D_THINFILM: {
@@ -7084,12 +8607,21 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
 
 // Phase 1: one light subpath per pixel. Stores connectible vertices into the per-path slab
 // `lvSlab[i*vcmCap + k]` (count in `lvCount[i]`), splats connect-to-camera contributions into
-// `splat` (atomic, W*H*3 XYZ), and records this path index's wavelength (shared with the
-// camera path) into lamBuf/invLamBuf. Device twin of vcm.h traceLightSubpath.
-__global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
-                          DVcmLV* lvSlab, int* lvCount, double* splat,
-                          Real* lamBuf, double* invLamBuf, int resX, int resY, int vcmCap,
-                          unsigned long long seedBase, long long passIdx) {
+// `splat` (atomic, W*H*3 XYZ), and records this path index's wavelength BUNDLE (shared with the
+// camera path of the SAME index) into lamBuf/invLamBuf at stride C. Device twin of vcm.h
+// traceLightSubpath.
+//
+// Templated on the number of SECONDARY hero slots exactly like kBdptT: the scalar
+// instantiation kVcmLightT<0> sizes every per-λ array at 1, so a `-heroc 1` run pays zero extra
+// registers/local memory and stays bit-identical to the pre-hero kernel.
+template <int NS>
+__global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
+                           DVcmLV* lvSlab, DVcmSec* lvSec, int secStride, int heroC,
+                           int* lvCount, double* splat,
+                           Real* lamBuf, double* invLamBuf, int resX, int resY, int vcmCap,
+                           unsigned long long seedBase, long long passIdx) {
+    constexpr int SECN = (NS > 0) ? NS : 1;
+    const int C = (NS > 0) ? heroC : 1;
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
@@ -7099,20 +8631,54 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                              + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL;
         DRng rng; rng.seed(s * 2 + 55, seedBase ^ s);
 
-        double pdfL = 0.0;
-        Real lambda = dSampleSceneLambda(sc, rng, pdfL);
-        double invPdfLambda = (pdfL > 0.0) ? dInvPdfLambda(sc, lambda) : 0.0;
-        lamBuf[i] = lambda; invLamBuf[i] = invPdfLambda;
+        // Hero + C-1 stratified secondaries from ONE base uniform (u + k/C wrapped into [0,1)),
+        // pushed through the same inverse CDF as the scalar draw — so C == 1 consumes the
+        // identical single rng variate the pre-hero kernel did.
+        Real lamAll[SECN + 1];
+        double invAll[SECN + 1];
+        {
+            double pdfL = 0.0;
+            if (C > 1) {
+                double u = (double)rng.uniform();
+                lamAll[0] = dSampleSceneLambdaU(sc, u, pdfL);
+                invAll[0] = (pdfL > 0.0) ? dInvPdfLambda(sc, lamAll[0]) : 0.0;
+                for (int k = 1; k < C; ++k) {
+                    double uu = u + (double)k / C;
+                    if (uu >= 1.0) uu -= 1.0;
+                    double pdfK = 0.0;
+                    lamAll[k] = dSampleSceneLambdaU(sc, uu, pdfK);
+                    invAll[k] = (pdfK > 0.0) ? dInvPdfLambda(sc, lamAll[k]) : 0.0;
+                }
+            } else {
+                lamAll[0] = dSampleSceneLambda(sc, rng, pdfL);
+                invAll[0] = (pdfL > 0.0) ? dInvPdfLambda(sc, lamAll[0]) : 0.0;
+            }
+        }
+        const Real lambda = lamAll[0];
+        const double invPdfLambda = invAll[0];
+        for (int k = 0; k < C; ++k) { lamBuf[i * C + k] = lamAll[k]; invLamBuf[i * C + k] = invAll[k]; }
         if (invPdfLambda <= 0.0) continue;
         if (sc.nEmitters == 0 || sc.totalPower <= 0.0) continue;
+        int nUp = C;                                  // wavelengths still riding this ray
 
         int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
         const DEmitter& em = sc.emitters[ei];
-        if (em.shape == 2 || em.shape == 3 || em.collimated) continue;
+        if (em.shape == 2 || em.shape == 3 || em.shape == 6 || em.collimated) continue;
         Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 y, nOut; emitterSamplePoint(em, u1, u2, y, nOut);
-        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        if (Le <= 0.0) continue;
+        DVec3 y, nOut;
+        // The sampled point's `emit pattern:` factor (1.0, and a bit-identical draw, when
+        // unpatterned) scales the radiance the light subpath starts with — the MIS pdfs
+        // are untouched, exactly as in dGenLightSubpath.
+        double emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
+        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
+        // Max-over-live-λ: the hero can legitimately sit in a gap of the emission spectrum
+        // while a secondary is on it. nUp == 1 -> empty loop -> mxLe == Le, the old test.
+        double LeSec[SECN], mxLe = Le;
+        for (int k = 0; k + 1 < nUp; ++k) {
+            LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1] * emitPatW;
+            if (LeSec[k] > mxLe) mxLe = LeSec[k];
+        }
+        if (mxLe <= 0.0) continue;
         double pdfChoice = em.power / sc.totalPower;
         double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
         if (pdfPos <= 0.0 || pdfChoice <= 0.0) continue;
@@ -7126,10 +8692,21 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         double directPdfW = pdfChoice * pdfPos;
 
         double beta = Le * cosLight / emissionPdfW;
+        // MIS bookkeeping is the HERO's for the whole bundle: every sampling density in this
+        // renderer (cosine / glossy-lobe / emitter pdfs) is wavelength-INDEPENDENT, so one
+        // dVCM/dVC/dVM triple serves every λ — only the throughput VALUES differ.
         double dVCM = directPdfW / emissionPdfW;
         double dVC  = cosLight / emissionPdfW;
         double dVM  = dVC * ctx.misVcWeight;
 
+        double betaSec[SECN];
+        double cieSx[SECN], cieSy[SECN], cieSz[SECN];
+        for (int k = 0; k + 1 < nUp; ++k) {
+            betaSec[k] = LeSec[k] * cosLight / emissionPdfW;
+            cieSx[k] = (double)cieX(lamAll[k + 1]);
+            cieSy[k] = (double)cieY(lamAll[k + 1]);
+            cieSz[k] = (double)cieZ(lamAll[k + 1]);
+        }
         double cieLx = (double)cieX(lambda), cieLy = (double)cieY(lambda), cieLz = (double)cieZ(lambda);
         DMediumStack stk; stk.clear();
         DVec3 prevP = y;
@@ -7144,6 +8721,12 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 int cm = stk.topMat();
                 double a = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
                 if (a > 0.0) beta *= exp(-a * (double)h.t);
+                // Per-λ absorption: this IS the colour of coloured glass, so it must not be
+                // evaluated at the hero alone.
+                for (int k = 0; k + 1 < nUp; ++k) {
+                    double ak = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lamAll[k + 1]) : 0.0;
+                    if (ak > 0.0) betaSec[k] *= exp(-ak * (double)h.t);
+                }
             }
             double dist = h.t;
             DVec3 rdCur = rd;
@@ -7173,7 +8756,12 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     lv.cx = cieLx; lv.cy = cieLy; lv.cz = cieLz;
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
                     lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v;
+                    lv.nUp = nUp;
                     lvSlab[i * vcmCap + stored] = lv;
+                    if (NS > 0 && lvSec) {
+                        DVcmSec* row = lvSec + (size_t)(i * vcmCap + stored) * secStride;
+                        for (int k = 0; k + 1 < nUp; ++k) { row[k].beta = betaSec[k]; row[k].lam = (float)lamAll[k + 1]; }
+                    }
                     stored++;
                 }
                 // Connect this vertex to the pinhole camera (t=1 light-image splat).
@@ -7197,9 +8785,16 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                 DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
                                 if (!occluded(sc, oo, wcam, (Real)(distc - 2e-6))) {
                                     DVertex vt = dVertFromHit(h, matId);
-                                    double f = dBsdfF(sc, vt, wo, wcam, lambda);
-                                    f *= (double)dShadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
-                                    if (f > 0.0) {
+                                    // The adjoint correction and shadow-terminator G are purely
+                                    // geometric, so they scale every λ the same way.
+                                    double geo = (double)dShadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
+                                    double f = dBsdfF(sc, vt, wo, wcam, lambda) * geo;
+                                    double fSec[SECN], mxf = f;
+                                    for (int k = 0; k + 1 < nUp; ++k) {
+                                        fSec[k] = dBsdfF(sc, vt, wo, wcam, lamAll[k + 1]) * geo;
+                                        if (fSec[k] > mxf) mxf = fSec[k];
+                                    }
+                                    if (mxf > 0.0) {
                                         double bsdfRevPdfW = dBsdfPdf(sc, vt, wcam, wo, lambda);
                                         double imgPtDist = ctx.imagePlaneDist / cosAtCamera;
                                         double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
@@ -7207,12 +8802,23 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                         double wLight = (imgToSurf / ctx.nLightPaths) *
                                                         (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW);
                                         double misW = 1.0 / (wLight + 1.0);
+                                        double ax = 0, ay = 0, az = 0;
                                         double contrib = misW * beta * f * imgToSurf / ctx.nLightPaths;
                                         if (contrib > 0.0) {
+                                            ax = cieLx * contrib; ay = cieLy * contrib; az = cieLz * contrib;
+                                        }
+                                        for (int k = 0; k + 1 < nUp; ++k) {
+                                            double cs = misW * betaSec[k] * fSec[k] * imgToSurf / ctx.nLightPaths;
+                                            if (cs > 0.0) { ax += cieSx[k] * cs; ay += cieSy[k] * cs; az += cieSz[k] * cs; }
+                                        }
+                                        // The C wavelengths are C samples of ONE spectral
+                                        // estimate, so the bundle averages (see hero.h).
+                                        if (nUp > 1) { double inv = 1.0 / nUp; ax *= inv; ay *= inv; az *= inv; }
+                                        if (ax != 0.0 || ay != 0.0 || az != 0.0) {
                                             size_t o2 = ((size_t)py * resX + px) * 3;
-                                            atomicAdd(&splat[o2 + 0], cieLx * contrib);
-                                            atomicAdd(&splat[o2 + 1], cieLy * contrib);
-                                            atomicAdd(&splat[o2 + 2], cieLz * contrib);
+                                            atomicAdd(&splat[o2 + 0], ax);
+                                            atomicAdd(&splat[o2 + 1], ay);
+                                            atomicAdd(&splat[o2 + 2], az);
                                         }
                                     }
                                 }
@@ -7225,9 +8831,14 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             if (edges == ctx.maxDepth) break;
 
             DVec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
+            double secF[SECN]; bool secChromatic = false, keepBundle = false;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, diffraction,
-                        wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate);
-            if (terminate || betaFactor <= 0.0) break;
+                        wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
+                        lamAll, nUp, secF, &secChromatic, &keepBundle);
+            // Kill the walk only when EVERY live λ is dead (nUp == 1 -> mxF == betaFactor).
+            double mxF = betaFactor;
+            if (secChromatic) for (int k = 0; k + 1 < nUp; ++k) if (secF[k] > mxF) mxF = secF[k];
+            if (terminate || mxF <= 0.0) break;
             if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) break;
 
             // misScatter(delta, cosThetaOut, pdfW, pdfRevW)
@@ -7239,7 +8850,16 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 dVCM = 1.0 / pdfW;
             }
             beta *= betaFactor;
-            if (!delta) beta *= (double)dShadingAdjointCorr(wo, normalize(wi), h.n, ngo);
+            for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= secChromatic ? secF[k] : betaFactor;
+            if (!delta) {
+                double adj = (double)dShadingAdjointCorr(wo, normalize(wi), h.n, ngo);
+                beta *= adj;
+                for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= adj;
+            }
+            // De-hero at a λ-DEPENDENT direction change (dielectric / thin-film / multilayer /
+            // grating / half-mirror). Mirror and Filter set keepBundle: their outgoing direction
+            // does not consult λ at all, so the secondaries ride on.
+            if (delta && !keepBundle) nUp = 1;
             prevP = h.p;
             double sgn2 = ddot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
             ro = h.p + h.ng * (Real)(sgn2 * 1e-6);
@@ -7253,21 +8873,32 @@ __global__ void kVcmLight(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 // the PAIRED light subpath [pathBegin[i],pathEnd[i]) and merging over the grid, then adds this
 // pass's per-pixel radiance (camera result + the light splat) into the persistent `accum` sum.
 // Device twin of vcm.h traceCameraSubpath. `grid.lv` is the compact light-vertex array.
-__global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx, DVcmGrid grid,
-                           const int* pathBegin, const int* pathEnd, const double* splat,
-                           double* accum, const Real* lamBuf, const double* invLamBuf,
-                           int resX, int resY, unsigned long long seedBase, long long passIdx) {
+template <int NS>
+__global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx, DVcmGrid grid,
+                            const DVcmSec* lvSec, int secStride, int heroC,
+                            const int* pathBegin, const int* pathEnd, const double* splat,
+                            double* accum, const Real* lamBuf, const double* invLamBuf,
+                            int resX, int resY, unsigned long long seedBase, long long passIdx) {
+    constexpr int SECN = (NS > 0) ? NS : 1;
+    const int C = (NS > 0) ? heroC : 1;
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
     for (long long i = g; i < npix; i += G) {
         double sxl = splat[i * 3 + 0], syl = splat[i * 3 + 1], szl = splat[i * 3 + 2];
-        double invPdfLambda = invLamBuf[i];
+        double invPdfLambda = invLamBuf[i * C];
         if (invPdfLambda <= 0.0) {                         // no valid wavelength: only the splat
             accum[i * 3 + 0] += sxl; accum[i * 3 + 1] += syl; accum[i * 3 + 2] += szl;
             continue;
         }
-        Real lambda = lamBuf[i];
+        // THE bundle of path index i — the SAME C wavelengths the light kernel walked for this
+        // index. That pairing is what makes strategy (c) (connection to the paired light
+        // subpath) exact per-λ rather than an approximation: both ends share the λ set.
+        Real lamAll[SECN + 1];
+        double invAll[SECN + 1];
+        for (int k = 0; k < C; ++k) { lamAll[k] = lamBuf[i * C + k]; invAll[k] = invLamBuf[i * C + k]; }
+        Real lambda = lamAll[0];
+        int nUp = C;
         int px = (int)(i % resX), py = (int)(i / resX);
         unsigned long long s = (unsigned long long)i * 0xC2B2AE3D27D4EB4FULL
                              + (unsigned long long)passIdx * 0xA24BAED4963EE407ULL;
@@ -7275,6 +8906,14 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 
         double rx = 0, ry = 0, rz = 0;
         double cieCx = (double)cieX(lambda), cieCy = (double)cieY(lambda), cieCz = (double)cieZ(lambda);
+        double betaSec[SECN];
+        double cieSx[SECN], cieSy[SECN], cieSz[SECN];
+        for (int k = 0; k + 1 < C; ++k) {
+            betaSec[k] = 1.0;                              // camera vertex beta == 1 for every λ
+            cieSx[k] = (double)cieX(lamAll[k + 1]);
+            cieSy[k] = (double)cieY(lamAll[k + 1]);
+            cieSz[k] = (double)cieZ(lamAll[k + 1]);
+        }
 
         DVec3 ro, rd;
         Real jx = rng.uniform(), jy = rng.uniform();
@@ -7299,6 +8938,10 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 int cm = stk.topMat();
                 double a = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
                 if (a > 0.0) beta *= exp(-a * (double)h.t);
+                for (int k = 0; k + 1 < nUp; ++k) {       // per-λ: the colour of coloured glass
+                    double ak = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lamAll[k + 1]) : 0.0;
+                    if (ak > 0.0) betaSec[k] *= exp(-ak * (double)h.t);
+                }
             }
             double dist = h.t;
             DVec3 rdCur = rd;
@@ -7323,8 +8966,16 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             if (li >= 0) {
                 double cosLight = ddot(h.ng, wo);
                 if (cosLight > 0.0) {
-                    double Le = (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda;
-                    if (Le > 0.0) {
+                    // Achromatic `emit pattern:` factor at this hit — the same value the
+                    // light-subpath / NEE sides get from the sampler at this point.
+                    double ep = dEmitPatMul(sc, mp->emitPat, h);
+                    double Le = (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda * ep;
+                    double LeSec[SECN], mxLe = Le;
+                    for (int k = 0; k + 1 < nUp; ++k) {
+                        LeSec[k] = (double)specLookup(sc.emitters[li].emitSpd, lamAll[k + 1]) * invAll[k + 1] * ep;
+                        if (LeSec[k] > mxLe) mxLe = LeSec[k];
+                    }
+                    if (mxLe > 0.0) {
                         double misW = 1.0;
                         const DEmitter& em = sc.emitters[li];
                         if (em.area > 0.0 && sc.totalPower > 0.0 && edges >= 2) {
@@ -7335,7 +8986,13 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                             misW = 1.0 / (1.0 + wCamera);
                         }
                         double e = beta * Le * misW;
-                        rx += cieCx * e; ry += cieCy * e; rz += cieCz * e;
+                        double ax = cieCx * e, ay = cieCy * e, az = cieCz * e;
+                        for (int k = 0; k + 1 < nUp; ++k) {
+                            double ek = betaSec[k] * LeSec[k] * misW;
+                            ax += cieSx[k] * ek; ay += cieSy[k] * ek; az += cieSz[k] * ek;
+                        }
+                        if (nUp > 1) { double inv = 1.0 / nUp; ax *= inv; ay *= inv; az *= inv; }
+                        rx += ax; ry += ay; rz += az;
                     }
                 }
                 break;                                    // can't scatter off a light
@@ -7350,9 +9007,11 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 if (edges + 1 <= ctx.maxDepth && sc.nEmitters > 0 && sc.totalPower > 0.0) {
                     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
                     const DEmitter& em = sc.emitters[ei];
-                    if (!(em.shape == 2 || em.shape == 3 || em.collimated)) {
+                    if (!(em.shape == 2 || em.shape == 3 || em.shape == 6 || em.collimated)) {
                         Real u1 = rng.uniform(), u2 = rng.uniform();
-                        DVec3 yL, nL; emitterSamplePoint(em, u1, u2, yL, nL);
+                        DVec3 yL, nL;
+                        // Sampled point's emission-pattern factor (1.0 when unpatterned).
+                        double epat = dEmitterSamplePointPat(sc, em, u1, u2, yL, nL);
                         DVec3 toL = yL - h.p; double dist2 = ddot(toL, toL);
                         if (dist2 > 1e-12) {
                             double distL = sqrt(dist2); DVec3 wiL = toL * (Real)(1.0 / distL);
@@ -7363,14 +9022,31 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                             if (cosAtLight > 0.0 && sideOk) {
                                 // Cheap gates + shadow ray first, BSDF eval after (bit-
                                 // identical: no RNG in either; skips the eval when shadowed).
-                                double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+                                double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * epat;
+                                double LeSec[SECN], mxLe = Le;
+                                for (int k = 0; k + 1 < nUp; ++k) {
+                                    LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1] * epat;
+                                    if (LeSec[k] > mxLe) mxLe = LeSec[k];
+                                }
                                 double sgn = ddot(h.ng, wiL) >= 0.0 ? 1.0 : -1.0;
                                 DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
-                                double f = 0.0;
-                                if (Le > 0.0 && em.area > 0.0 &&
-                                    !occluded(sc, oo, wiL, (Real)(distL - 2e-6)))
+                                double f = 0.0, fSec[SECN];
+                                for (int k = 0; k + 1 < nUp; ++k) fSec[k] = 0.0;
+                                if (mxLe > 0.0 && em.area > 0.0 &&
+                                    !occluded(sc, oo, wiL, (Real)(distL - 2e-6))) {
                                     f = dBsdfF(sc, vt, wo, wiL, lambda) * stG;
-                                if (f > 0.0) {
+                                    for (int k = 0; k + 1 < nUp; ++k)
+                                        fSec[k] = dBsdfF(sc, vt, wo, wiL, lamAll[k + 1]) * stG;
+                                }
+                                // Fuse BSDF x Le per-λ before the max test: either factor may
+                                // vanish at the hero while the product is alive at a secondary.
+                                // At nUp == 1 this is exactly the old `f > 0` gate.
+                                double mxfLe = f * Le;
+                                for (int k = 0; k + 1 < nUp; ++k) {
+                                    double p = fSec[k] * LeSec[k];
+                                    if (p > mxfLe) mxfLe = p;
+                                }
+                                if (mxfLe > 0.0) {
                                     double pdfChoice = em.power / sc.totalPower;
                                     double invArea = 1.0 / em.area;
                                     double directPdfW = invArea * dist2 / cosAtLight;
@@ -7384,10 +9060,21 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                     double misW = 1.0 / (wLight + 1.0 + wCamera);
                                     double contrib = misW * fabs(cosToLight) /
                                                      (pdfChoice * directPdfW) * Le * f;
+                                    double ax = 0, ay = 0, az = 0;
                                     if (contrib > 0.0) {
                                         double e = beta * contrib;
-                                        rx += cieCx * e; ry += cieCy * e; rz += cieCz * e;
+                                        ax = cieCx * e; ay = cieCy * e; az = cieCz * e;
                                     }
+                                    for (int k = 0; k + 1 < nUp; ++k) {
+                                        double ck = misW * fabs(cosToLight) /
+                                                    (pdfChoice * directPdfW) * LeSec[k] * fSec[k];
+                                        if (ck > 0.0) {
+                                            double ek = betaSec[k] * ck;
+                                            ax += cieSx[k] * ek; ay += cieSy[k] * ek; az += cieSz[k] * ek;
+                                        }
+                                    }
+                                    if (nUp > 1) { double inv = 1.0 / nUp; ax *= inv; ay *= inv; az *= inv; }
+                                    rx += ax; ry += ay; rz += az;
                                 }
                             }
                         }
@@ -7421,10 +9108,26 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
                     if (occluded(sc, oo, w, (Real)(distc - 2e-6))) continue;
                     DVertex lvt = dVertFromLV(lv);
+                    double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
                     double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;
                     double fLit = dBsdfF(sc, lvt, lv.wo, w * (Real)-1, lambda);
-                    fLit *= (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
-                    if (fCam <= 0.0 || fLit <= 0.0) continue;
+                    fLit *= adjLit;
+                    // The camera path and the stored light path share this pass's bundle (same
+                    // path index i), so a connection is EXACT per-λ over the wavelengths still
+                    // live at BOTH ends. `lv.nUp` is 1 whenever the light walk de-hero'd.
+                    const int lvUp = (NS > 0) ? lv.nUp : 1;
+                    const int nUpConn = (nUp < lvUp) ? nUp : lvUp;
+                    double fProdSec[SECN], mxProd = fCam * fLit;
+                    const DVcmSec* lsRow = ((NS > 0) && lvSec) ? (lvSec + (size_t)j * secStride) : nullptr;
+                    for (int k = 0; k + 1 < nUpConn; ++k) {
+                        double fc = dBsdfF(sc, vt, wo, w, lamAll[k + 1]) * stGCam;
+                        double fl = dBsdfF(sc, lvt, lv.wo, w * (Real)-1, lamAll[k + 1]) * adjLit;
+                        fProdSec[k] = fc * fl;
+                        if (fProdSec[k] > mxProd) mxProd = fProdSec[k];
+                    }
+                    // At nUpConn == 1 this is exactly the old `fCam <= 0 || fLit <= 0` bail
+                    // (both factors are non-negative, so the product is 0 iff either is).
+                    if (mxProd <= 0.0) continue;
                     double camDirPdfW = dBsdfPdf(sc, vt, wo, w, lambda);
                     double camRevPdfW = dBsdfPdf(sc, vt, w, wo, lambda);
                     double litDirPdfW = dBsdfPdf(sc, lvt, lv.wo, w * (Real)-1, lambda);
@@ -7436,7 +9139,14 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     double misW = 1.0 / (wLight + 1.0 + wCamera);
                     double Gt = fabs(cosCam) * fabs(cosLit) / dist2;
                     double contrib = misW * Gt * fCam * fLit * beta * lv.beta;
-                    if (contrib > 0.0) { rx += cieCx * contrib; ry += cieCy * contrib; rz += cieCz * contrib; }
+                    double ax = 0, ay = 0, az = 0;
+                    if (contrib > 0.0) { ax = cieCx * contrib; ay = cieCy * contrib; az = cieCz * contrib; }
+                    for (int k = 0; k + 1 < nUpConn; ++k) {
+                        double ck = misW * Gt * fProdSec[k] * betaSec[k] * lsRow[k].beta;
+                        if (ck > 0.0) { ax += cieSx[k] * ck; ay += cieSy[k] * ck; az += cieSz[k] * ck; }
+                    }
+                    if (nUpConn > 1) { double inv = 1.0 / nUpConn; ax *= inv; ay *= inv; az *= inv; }
+                    rx += ax; ry += ay; rz += az;
                 }
 
                 // (d) Vertex merging — gather nearby light vertices from ALL paths (XYZ estimate).
@@ -7461,8 +9171,22 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                               if (edges + lv.edges > ctx.maxDepth) continue;
                               DVec3 wMerge = lv.wo;
                               Real lam = (Real)lv.lambda;
+                              // A MERGE crosses paths, so the two ends carry DIFFERENT bundles
+                              // and there is no shared λ set. The estimate therefore stays keyed
+                              // on the LIGHT vertex's own wavelengths (the pre-existing spectral
+                              // photon-mapping approximation, generalised from 1 λ to lv.nUp):
+                              // sum over its live λ, divide by lv.nUp, and let the camera's HERO
+                              // throughput/MIS weight scale the whole gather as before.
+                              const int lvUp = (NS > 0) ? lv.nUp : 1;
+                              const DVcmSec* row = ((NS > 0) && lvSec)
+                                                 ? (lvSec + (size_t)idx * secStride) : nullptr;
                               double fCam = dBsdfF(sc, vt, wo, wMerge, lam);
-                              if (fCam <= 0.0) continue;
+                              double fSec[SECN], mxF = fCam;
+                              for (int q = 0; q + 1 < lvUp; ++q) {
+                                  fSec[q] = dBsdfF(sc, vt, wo, wMerge, (Real)row[q].lam);
+                                  if (fSec[q] > mxF) mxF = fSec[q];
+                              }
+                              if (mxF <= 0.0) continue;   // == the old `fCam <= 0` at lvUp == 1
                               double denom = fabs(ddot(wMerge, ngoCam));
                               double gcorr = (denom <= 1e-8) ? 1.0 : fabs(ddot(wMerge, h.n)) / denom;
                               fCam *= gcorr;
@@ -7472,7 +9196,16 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                               double wCamera = dVCM * ctx.misVcWeight + dVM * camRevPdfW;
                               double misW = 1.0 / (wLight + 1.0 + wCamera);
                               double wgt = misW * fCam * lv.beta;
-                              mx += lv.cx * wgt; my += lv.cy * wgt; mz += lv.cz * wgt;
+                              double ax = lv.cx * wgt, ay = lv.cy * wgt, az = lv.cz * wgt;
+                              for (int q = 0; q + 1 < lvUp; ++q) {
+                                  double wq = misW * fSec[q] * gcorr * row[q].beta;
+                                  Real lq = (Real)row[q].lam;
+                                  ax += (double)cieX(lq) * wq;
+                                  ay += (double)cieY(lq) * wq;
+                                  az += (double)cieZ(lq) * wq;
+                              }
+                              if (lvUp > 1) { double inv = 1.0 / lvUp; ax *= inv; ay *= inv; az *= inv; }
+                              mx += ax; my += ay; mz += az;
                           }
                     }}}
                     double bn = beta * ctx.vmNorm;
@@ -7483,9 +9216,13 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             if (edges == ctx.maxDepth) break;
 
             DVec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
+            double secF[SECN]; bool secChromatic = false, keepBundle = false;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, diffraction,
-                        wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate);
-            if (terminate || betaFactor <= 0.0) break;
+                        wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
+                        lamAll, nUp, secF, &secChromatic, &keepBundle);
+            double mxF = betaFactor;
+            if (secChromatic) for (int k = 0; k + 1 < nUp; ++k) if (secF[k] > mxF) mxF = secF[k];
+            if (terminate || mxF <= 0.0) break;
             if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) break;
 
             if (delta) { dVCM = 0.0; dVC *= cosThetaOut; dVM *= cosThetaOut; }
@@ -7496,6 +9233,8 @@ __global__ void kVcmCamera(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 dVCM = 1.0 / pdfW;
             }
             beta *= betaFactor;                           // camera side: no adjoint on continuation
+            for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= secChromatic ? secF[k] : betaFactor;
+            if (delta && !keepBundle) nUp = 1;             // λ-dependent direction change
             prevP = h.p;
             double sgn2 = ddot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
             ro = h.p + h.ng * (Real)(sgn2 * 1e-6);
@@ -7571,14 +9310,25 @@ struct SppmRMaxF {
 struct MaxD { HD double operator()(double a, double b) const { return a < b ? b : a; } };
 
 // Scatter each light path's stored slab vertices into the compact array at its scanned
-// offset (device twin of the old host compaction loop; per-path order preserved).
-__global__ void kVcmCompactScatter(const DVcmLV* slab, const int* lvCount, const int* pathBegin,
-                                   DVcmLV* compact, int npix, int vcmCap) {
+// offset (device twin of the old host compaction loop; per-path order preserved). The hero
+// secondary rows ride along in lockstep so `secCompact[j*secStride + q]` stays paired with
+// `compact[j]`; `secSlab == nullptr` (a `-heroc 1` session) skips that entirely.
+__global__ void kVcmCompactScatter(const DVcmLV* slab, const DVcmSec* secSlab, int secStride,
+                                   const int* lvCount, const int* pathBegin,
+                                   DVcmLV* compact, DVcmSec* secCompact, int npix, int vcmCap) {
     int stride = gridDim.x * blockDim.x;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < npix; i += stride) {
         int cnt = lvCount[i], b = pathBegin[i];
         const DVcmLV* src = slab + (size_t)i * vcmCap;
         for (int k = 0; k < cnt; ++k) compact[b + k] = src[k];
+        if (secSlab) {
+            const DVcmSec* ssrc = secSlab + (size_t)i * vcmCap * secStride;
+            for (int k = 0; k < cnt; ++k) {
+                int nu = src[k].nUp;
+                DVcmSec* dst = secCompact + (size_t)(b + k) * secStride;
+                for (int q = 0; q + 1 < nu; ++q) dst[q] = ssrc[(size_t)k * secStride + q];
+            }
+        }
     }
 }
 
@@ -7774,6 +9524,12 @@ bool cudaForwardSupported(const Scene& scene) {
     for (const auto& t : scene.tris)      if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres)   if (unsupported(s.matId)) return false;
     for (const auto& im : scene.implicits) if (unsupported(im.matId)) return false;
+    // `emit pattern:` / `emit_map` runs on the device (0.82.0). Unlike reflect/transmit it
+    // is not a one-sided throughput slot: the same profile has to be applied on BOTH sides
+    // of transport — emission-on-hit AND the Le at an emitter-sampled point — because MIS
+    // combines them, so every device emission read goes through dEmitPatMul (the hit side)
+    // or dEmitterSamplePointPat (the sampler side) rather than reading emitSpd raw. No
+    // fallback needed; a patterned scene renders on the GPU in every supported mode.
     // Spectral water-droplet (rainbow) phase is now on the device: the (lambda x mu) Airy
     // table + per-lambda CDF (rainbow.h) is uploaded per medium and dMedPhase / dMedPhaseSample
     // reproduce the bow bit-closely against the CPU tracer (M10). No fallback needed.
@@ -7783,6 +9539,16 @@ bool cudaForwardSupported(const Scene& scene) {
     // env (lat-long map: the 2D luminance CDF, per-texel JH coeff/scale, and mean
     // coeff/scale are uploaded, and the sampler/reweight are ported to the device) are
     // supported (increments 1b and 2c).
+    // Volumetric blackbody emission ("fire": a medium with a `temperature` grid +
+    // `emission`, ROADMAP C3) is now supported on-device: the temperature field is
+    // uploaded as a sparse brick grid, DScene carries the emissive-volume table + per-
+    // volume Planck-λ CDF, and genPhoton has a volume-birth branch + isotropic emission
+    // splat mirroring the CPU tracer. An emissive-only scene (nEmitters==0) never indexes
+    // sc.emitters because volumeBirth is always true when totalPower==0.
+    // A distant `sun` emitter (shape==6) is supported too: genPhoton/genPhotonHero have a
+    // parallel-beam birth branch over the scene cross-section, bkEmitterGeom/bkNeeLight/
+    // bkNeeVolume/bkNeeLightRGB do the cone NEE, and the ray-miss paths add the directly-
+    // viewed solar disc under the same `specularArrival` gate as the CPU tracer.
     return true;
 }
 
@@ -7838,6 +9604,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.n0 = {t.n0.x, t.n0.y, t.n0.z};
         d.n1 = {t.n1.x, t.n1.y, t.n1.z};
         d.n2 = {t.n2.x, t.n2.y, t.n2.z};
+        d.tangent = {t.tangent.x, t.tangent.y, t.tangent.z};
+        d.bitangentSign = t.bitangentSign;
         d.matId = t.matId; d.sensorId = t.sensorId;
         return d;
     };
@@ -7907,6 +9675,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.Nm[0] = inv.m[0]; d.Nm[1] = inv.m[3]; d.Nm[2] = inv.m[6];
         d.Nm[3] = inv.m[1]; d.Nm[4] = inv.m[4]; d.Nm[5] = inv.m[7];
         d.Nm[6] = inv.m[2]; d.Nm[7] = inv.m[5]; d.Nm[8] = inv.m[8];
+        for (int k = 0; k < 9; ++k) d.Wm[k] = in.toWorld.m[k];   // tangent local->world (C6)
         d.blasId = in.blasId; d.matOverride = in.matOverride;
     }
     (void)haveInstances;
@@ -8041,6 +9810,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.filmIor = m.filmIor; d.filmThickness = m.filmThickness;
         d.roughnessTex = m.roughnessTex;
         d.filmThicknessTex = m.filmThicknessTex;
+        d.normalTex = m.normalTex;
+        d.normalStrength = m.normalStrength;
         d.layerCount = (int)m.layerN.size();
         if (d.layerCount > D_MAXLAYERS) d.layerCount = D_MAXLAYERS;
         for (int k = 0; k < d.layerCount; ++k) {
@@ -8056,6 +9827,9 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.roughnessPat = m.roughnessPat;
         d.filmThicknessPat = m.filmThicknessPat;
         d.mixWeightPat = m.mixWeightPat;
+        d.reflectPat = m.reflectPat;
+        d.transmitPat = m.transmitPat;
+        d.emitPat = m.emitPat;
         // --- parametric-record REFLECT binding (§records stage 6a) ---
         // Device twin of recordReflectBound. A constant selStop binding bakes the stop's
         // colour straight into reflect[] (so the plain specLookup path is exact, no device
@@ -8189,15 +9963,40 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.shape = (e.shape == EmitterShape::Sphere)   ? 1
                  : (e.shape == EmitterShape::Spot)     ? 2
                  : (e.shape == EmitterShape::Env)      ? 3
-                 : (e.shape == EmitterShape::Cylinder) ? 4 : 0;
+                 : (e.shape == EmitterShape::Cylinder) ? 4
+                 : (e.shape == EmitterShape::Mesh)     ? 5
+                 : (e.shape == EmitterShape::Sun)      ? 6 : 0;
         de.radius = e.radius;
         de.caps = e.caps ? 1 : 0;
+        // Mesh area light: upload this emitter's triangle CDF to the device and point the
+        // DEmitter at it (device pointer inside a POD later uploaded to device memory).
+        // Every non-mesh emitter keeps a null pointer so nothing dereferences garbage.
+        de.meshTris = nullptr; de.meshTriN = 0;
+        if (e.shape == EmitterShape::Mesh && !e.meshTris.empty()) {
+            std::vector<DEmitTri> dtris(e.meshTris.size());
+            for (size_t i = 0; i < e.meshTris.size(); ++i) {
+                const EmitTri& s = e.meshTris[i];
+                dtris[i].v0  = {(Real)s.v0.x,  (Real)s.v0.y,  (Real)s.v0.z};
+                dtris[i].e1  = {(Real)s.e1.x,  (Real)s.e1.y,  (Real)s.e1.z};
+                dtris[i].e2  = {(Real)s.e2.x,  (Real)s.e2.y,  (Real)s.e2.z};
+                dtris[i].nrm = {(Real)s.nrm.x, (Real)s.nrm.y, (Real)s.nrm.z};
+                dtris[i].cumArea = s.cumArea;
+                // Source-triangle UVs, so a sampled point reports the same (u,v) the
+                // ray-hit path interpolates (an emission pattern reads both sides).
+                dtris[i].uv0  = {(Real)s.uv0.x,  (Real)s.uv0.y,  (Real)s.uv0.z};
+                dtris[i].uvE1 = {(Real)s.uvE1.x, (Real)s.uvE1.y, (Real)s.uvE1.z};
+                dtris[i].uvE2 = {(Real)s.uvE2.x, (Real)s.uvE2.y, (Real)s.uvE2.z};
+            }
+            de.meshTris = (const DEmitTri*)keep(uploadVec(dtris));
+            de.meshTriN = (int)dtris.size();
+        }
         de.spotCosInner = e.spotCosInner; de.spotCosOuter = e.spotCosOuter;
         de.spotOmega = e.spotOmega;
         de.cdfOffset = (int)cdfAll.size();
         de.cdfN = (int)e.spd.cdf.size();
         de.cdfStep = e.spd.step;
         de.matId = e.matId;                 // BDPT: link to emissive surface material
+        de.emitPat = e.emitPat;             // `emit pattern:` profile over this emitter
         bakeSpec(e.spdFn, de.emitSpd);       // BDPT: baked emission SPD for Le(lambda)
         { Vec3 le = rgbbake::emitToRgb(e.spdFn); de.rgbEmit = {le.x, le.y, le.z}; }  // fast RGB backward
         cdfAll.insert(cdfAll.end(), e.spd.cdf.begin(), e.spd.cdf.end());
@@ -8253,7 +10052,14 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     }
 
     // --- reflectance textures (per-texel Jakob-Hanika coefficients) ---
+    // Which textures are bound as tangent-space normal maps (C6)? Only those need the
+    // full RGB direction uploaded (dTexNormalAt); everything else just needs coeff/gray.
+    std::vector<char> usedAsNormal(scene.textures.size(), 0);
+    for (const auto& m : scene.mats)
+        if (m.normalTex >= 0 && m.normalTex < (int)scene.textures.size())
+            usedAsNormal[m.normalTex] = 1;
     std::vector<DTexture> dtex;
+    size_t txIdx = 0;
     for (const auto& tx : scene.textures) {
         DTexture dt;
         dt.w = tx.w; dt.h = tx.h;
@@ -8281,7 +10087,20 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         } else {
             dt.gray = nullptr;
         }
+        // Full linear RGB, only for normal-map textures (C6): raw [0,1] vector data.
+        if (usedAsNormal[txIdx] && !tx.rgb.empty()) {
+            std::vector<double> rgb3(tx.rgb.size() * 3);
+            for (size_t i = 0; i < tx.rgb.size(); ++i) {
+                rgb3[3 * i + 0] = tx.rgb[i].x;
+                rgb3[3 * i + 1] = tx.rgb[i].y;
+                rgb3[3 * i + 2] = tx.rgb[i].z;
+            }
+            dt.rgb = (double*)keep(uploadVec(rgb3));
+        } else {
+            dt.rgb = nullptr;
+        }
         dtex.push_back(dt);
+        ++txIdx;
     }
     DTexture* d_tex     = dtex.empty()       ? nullptr : (DTexture*)keep(uploadVec(dtex));
     double*   d_fluoCdf = fluoCdfAll.empty() ? nullptr : (double*)keep(uploadVec(fluoCdfAll));
@@ -8302,6 +10121,16 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     sc.lightCdfAll = d_cdfAll;
     sc.textures = d_tex; sc.nTex = (int)dtex.size();
+    // N-D data tables upload VERBATIM — the host PatGrid / PatScatter headers refer to
+    // their numbers by offset into the shared pool, never by pointer, so no fix-up is
+    // needed and the device samplers are literally the same functions the host runs.
+    // One pool serves both kinds, so this is one allocation however many tables.
+    sc.grids     = scene.grids.empty()    ? nullptr : (const PatGrid*)keep(uploadVec(scene.grids));
+    sc.nGrids    = (int)scene.grids.size();
+    sc.scatters  = scene.scatters.empty() ? nullptr : (const PatScatter*)keep(uploadVec(scene.scatters));
+    sc.nScatters = (int)scene.scatters.size();
+    sc.dataPool  = scene.dataPool.empty() ? nullptr : (const float*)keep(uploadVec(scene.dataPool));
+    sc.dataPoolN = (int)scene.dataPool.size();
     sc.fluoCdfAll = d_fluoCdf;
     sc.emitSamplerCdf = d_emitSamp;
     sc.emitSamplerN = (int)(emitSampCdf.empty() ? 0 : emitSampCdf.size() - 1);
@@ -8310,6 +10139,49 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     // Participating media array (superposed). Each medium's density program is uploaded
     // separately; then the flat DMedium array is uploaded once. Empty => media=null, mediaN=0.
     {
+        // Upload a host VdbGrid as a NATIVE SPARSE brick grid (ROADMAP C2) into a DVdbGrid.
+        // Shared by the density field and the emissive-volume temperature field. An empty
+        // grid leaves DVdbGrid inert (brickData=null, identity transform). `label` tags the
+        // once-per-grid VRAM report.
+        auto uploadVdbGrid = [&](const VdbGrid& g, DVdbGrid& out, const char* label) {
+            const int B = 8;
+            std::vector<int32_t> bidx; std::vector<uint16_t> bdata; int bx, by, bz;
+            int nActive = g.buildBricks(B, bx, by, bz, bidx, bdata);
+            out.brickIndex = (const int32_t*)keep(uploadVec(bidx));
+            out.brickData  = (const uint16_t*)keep(uploadVec(bdata));
+            out.bx = bx; out.by = by; out.bz = bz;
+            out.brickB = B; out.brickShift = 3;   // 3 == log2(8)
+            out.nx = g.nx; out.ny = g.ny; out.nz = g.nz;
+            for (int k = 0; k < 9; ++k) out.ainv[k] = g.ainv[k];
+            out.w0   = {g.w0.x, g.w0.y, g.w0.z};
+            out.imin = {g.imin.x, g.imin.y, g.imin.z};
+            size_t denseB  = (size_t)g.nx * g.ny * g.nz * sizeof(uint16_t);
+            size_t sparseB = bdata.size() * sizeof(uint16_t) + bidx.size() * sizeof(int32_t);
+            int nBricks = bx * by * bz;
+            // The scene is re-uploaded on every progressive refresh; report each distinct
+            // grid's sparse footprint only once to avoid log spam.
+            static std::vector<const void*> reportedVdb;
+            const void* vkey = (const void*)&g;
+            bool seen = false;
+            for (const void* p : reportedVdb) if (p == vkey) { seen = true; break; }
+            if (!seen) {
+                reportedVdb.push_back(vkey);
+                std::fprintf(stderr,
+                    "[vdb] sparse device grid (%s): %d/%d bricks active (%.1f%%), "
+                    "%.1f MB -> %.1f MB VRAM (%.1fx)\n",
+                    label, nActive, nBricks, nBricks ? 100.0 * nActive / nBricks : 0.0,
+                    denseB / 1048576.0, sparseB / 1048576.0,
+                    sparseB ? (double)denseB / sparseB : 1.0);
+            }
+        };
+        auto clearVdbGrid = [](DVdbGrid& out) {
+            out.brickIndex = nullptr; out.brickData = nullptr;
+            out.bx = out.by = out.bz = 0;
+            out.brickB = 0; out.brickShift = 0;
+            out.nx = out.ny = out.nz = 0;
+            for (int k = 0; k < 9; ++k) out.ainv[k] = (k % 4 == 0) ? 1.0 : 0.0;
+            out.w0 = {0,0,0}; out.imin = {0,0,0};
+        };
         std::vector<DMedium> dmeds(scene.media.size());
         for (size_t i = 0; i < scene.media.size(); ++i) {
             const Medium& m = scene.media[i];
@@ -8322,20 +10194,17 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.density  = m.density.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.density));
             dm.densityN = (int)m.density.size();
             dm.densityMax = m.densityMax;
-            // Imported .nvdb volume: upload the baked dense grid + world->index affine.
-            if (m.vdb && !m.vdb->empty()) {
-                const VdbGrid& g = *m.vdb;
-                dm.vdbData = (const float*)keep(uploadVec(g.data));
-                dm.vdbNx = g.nx; dm.vdbNy = g.ny; dm.vdbNz = g.nz;
-                for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = g.ainv[k];
-                dm.vdbW0   = {g.w0.x, g.w0.y, g.w0.z};
-                dm.vdbImin = {g.imin.x, g.imin.y, g.imin.z};
-            } else {
-                dm.vdbData = nullptr;
-                dm.vdbNx = dm.vdbNy = dm.vdbNz = 0;
-                for (int k = 0; k < 9; ++k) dm.vdbAinv[k] = (k % 4 == 0) ? 1.0 : 0.0;
-                dm.vdbW0 = {0,0,0}; dm.vdbImin = {0,0,0};
-            }
+            // Imported .nvdb/.vdb volume: upload a NATIVE SPARSE brick grid (ROADMAP C2).
+            if (m.vdb && !m.vdb->empty()) uploadVdbGrid(*m.vdb, dm.densGrid, "density");
+            else                          clearVdbGrid(dm.densGrid);
+            // Volumetric blackbody emission ("fire", ROADMAP C3): upload the temperature
+            // field + emission params so the device genPhoton can birth fire photons.
+            dm.emissive = (m.emissive() && m.temperature && !m.temperature->empty()) ? 1 : 0;
+            if (dm.emissive) uploadVdbGrid(*m.temperature, dm.tempGrid, "temperature");
+            else             clearVdbGrid(dm.tempGrid);
+            dm.emitKelvin    = m.emitKelvin;
+            dm.tempPeak      = m.tempPeak;
+            dm.emissionScale = m.emissionScale;
             dm.bounded  = m.bounded ? 1 : 0;
             dm.boundShape = (m.boundShape == MediumBound::Sphere)   ? 1
                           : (m.boundShape == MediumBound::Implicit) ? 2 : 0;
@@ -8372,6 +10241,25 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
         sc.mediaN = (int)dmeds.size();
         sc.hasGrin = grin::sceneHasGrin(scene) ? 1 : 0;   // gate for dGrinMarch (host twin)
+        // Emissive "fire" volumes (ROADMAP C3): upload the AABB/meanKe/power + the per-
+        // volume Planck-at-emitKelvin wavelength CDF, and the total emission power for the
+        // emitter-vs-fire birth split. Empty => emissiveVolumes=null, totalEmissionPower=0.
+        std::vector<DEmissiveVolume> devs(scene.emissiveVolumes.size());
+        for (size_t v = 0; v < scene.emissiveVolumes.size(); ++v) {
+            const Scene::EmissiveVolume& ev = scene.emissiveVolumes[v];
+            DEmissiveVolume& d = devs[v];
+            d.mediumIndex = ev.mediumIndex;
+            d.bmin = {ev.bmin.x, ev.bmin.y, ev.bmin.z};
+            d.bmax = {ev.bmax.x, ev.bmax.y, ev.bmax.z};
+            d.meanKe = ev.meanKe;
+            d.power  = ev.power;
+            d.lamCdf  = (const double*)keep(uploadVec(ev.lamSampler.cdf));
+            d.lamN    = (int)ev.lamSampler.cdf.size() - 1;   // cdf has N+1 entries
+            d.lamStep = ev.lamSampler.step;
+        }
+        sc.emissiveVolumes    = devs.empty() ? nullptr : (const DEmissiveVolume*)keep(uploadVec(devs));
+        sc.emissiveVolN       = (int)devs.size();
+        sc.totalEmissionPower = scene.totalEmissionPower;
     }
     sc.sensorOrigin = {scene.sensor.origin.x, scene.sensor.origin.y, scene.sensor.origin.z};
     sc.sensorUAxis  = {scene.sensor.uAxis.x,  scene.sensor.uAxis.y,  scene.sensor.uAxis.z};
@@ -8380,6 +10268,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sceneRadius = scene.sceneRadius;
     sc.env = denv;
     sc.envIndex = scene.envIndex;
+    sc.sunCount = scene.sunCount;      // >0 enables the direct-view solar-disc miss term
     // Fast RGB backward: constant-env radiance in linear sRGB (0 when there's no env).
     if (scene.envIndex >= 0 && scene.envIndex < (int)scene.emitters.size()) {
         Vec3 le = rgbbake::emitToRgb(scene.emitters[scene.envIndex].spdFn);
@@ -8825,7 +10714,8 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
 }
 
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
-                    long long spp, int maxDepth, bool diffraction, const SppProgress* prog) {
+                    long long spp, int maxDepth, bool diffraction, const SppProgress* prog,
+                    int heroC) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
@@ -8833,6 +10723,16 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 
     DUpload up;
     buildUpload(scene, cam, resX, resY, up);
+
+    // Hero-wavelength gate — the same one the CPU BDPT applies (bdpt.h BdptRenderer::
+    // renderRows): a participating medium makes the shadow-ray transmittance wavelength-
+    // dependent, GRIN bends each λ differently, and a physical lens disperses the primary
+    // ray, so all three fall back to the single-λ kernel. (GRIN never reaches here at all —
+    // cudaBdptSupported rejects it outright.)
+    int C = heroC;
+    if (C > hero::kHeroMax) C = hero::kHeroMax;
+    if (C < 1) C = 1;
+    const bool useHero = (C > 1) && up.sc.mediaN == 0 && !up.sc.hasGrin && !cam.hasLens();
 
     const size_t npix = (size_t)resX * resY;
     double* d_cam   = nullptr; CUDA_CHECK(cudaMalloc(&d_cam,   npix * 3 * sizeof(double)));
@@ -8855,8 +10755,12 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     };
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
-        kBdpt<<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base, resX,
-                             maxDepth, diffraction ? 1 : 0, seed);
+        if (useHero)
+            kBdptT<BDPT_NSEC><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+                                             resX, maxDepth, diffraction ? 1 : 0, seed, C);
+        else
+            kBdptT<0><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1);
         cudaCheckKernel("bdpt");
     };
 
@@ -8907,7 +10811,7 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
 
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction, const SppProgress* prog,
-                        int maxBounce, bool directOnly) {
+                        int maxBounce, bool directOnly, int heroC) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBackwardSupported(scene, cam)) return out;
@@ -8916,6 +10820,13 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     buildUpload(scene, cam, resX, resY, up);
     if (maxBounce >= 1) up.sc.bkMaxBounce = maxBounce;   // Stage 3: -max-bounce cap
     up.sc.bkDirectOnly = directOnly ? 1 : 0;             // Stage 3: -direct-only (Whitted)
+    // Hero-wavelength bundle (`-heroc N`). bkRadianceHero covers the plain surface walk
+    // only, so fall back to the single-λ estimator when the scene needs a branch it does
+    // not carry: participating media, gradient-index bending, or a physical lens (whose
+    // per-λ refraction would give each wavelength its own camera ray). Same gate as the
+    // CPU BackwardRenderer::renderRows, so CPU and GPU mode R agree on when hero applies.
+    const int effHeroC = (heroC > 1 && up.sc.mediaN == 0 && !up.sc.hasGrin && !cam.hasLens())
+                             ? ((heroC > hero::kHeroMax) ? hero::kHeroMax : heroC) : 1;
 
     const size_t npix = (size_t)resX * resY;
     double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
@@ -8937,7 +10848,7 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
         kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, spp, base, resX,
-                                 diffraction ? 1 : 0, seed);
+                                 diffraction ? 1 : 0, seed, effHeroC);
         cudaCheckKernel("backward");
     };
 
@@ -8979,6 +10890,11 @@ bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam) {
             default: return false;                                  // dispersion/thin-film/etc -> spectral
         }
         if (m.reflectTex >= 0) return false;                        // textured albedo not baked to RGB
+        if (m.reflectPat >= 0) return false;                        // pattern-modulated albedo, ditto
+        if (m.transmitPat >= 0) return false;                       // pattern-modulated transmittance, ditto
+        // emitPat is fine here: an emission pattern is an ACHROMATIC scalar, so it
+        // commutes with the spectral->RGB bake — ep*integral(CIE*emitSpd) is exactly
+        // integral(CIE*ep*emitSpd). bkNeeLightRGB / bkRadianceRGB apply it to rgbEmit.
         if (m.recBindingFor(REC_SLOT_REFLECT)) return false;        // record-driven reflectance
     }
     if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;
@@ -9276,7 +11192,11 @@ static bool savePhotonMap(const char* path, const PhotonMap& pm,
                           const EnergyReport& e, uint64_t guard) {
     std::FILE* f = std::fopen(path, "wb");
     if (!f) { std::fprintf(stderr, "[savemap] cannot open %s for writing\n", path); return false; }
-    const char magic[8] = {'F','T','P','M','P','0','1','\n'};
+    // FTPMP02: positions and payloads are stored as two separate blocks, matching
+    // PhotonMap's split layout (FTPMP01 held one interleaved array that also carried a
+    // never-read incident direction). Bumping the magic makes an old cache fail the
+    // recognition check below rather than being misread as garbage.
+    const char magic[8] = {'F','T','P','M','P','0','2','\n'};
     long long nPh = (long long)pm.photons.size();
     double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
     bool ok = true;
@@ -9285,8 +11205,10 @@ static bool savePhotonMap(const char* path, const PhotonMap& pm,
     ok = ok && std::fwrite(&pm.nEmitted, sizeof pm.nEmitted, 1, f) == 1;
     ok = ok && std::fwrite(en, sizeof en, 1, f) == 1;
     ok = ok && std::fwrite(&nPh, sizeof nPh, 1, f) == 1;
-    if (ok && nPh > 0)
-        ok = std::fwrite(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
+    if (ok && nPh > 0) {
+        ok = std::fwrite(pm.pos.data(), sizeof(Vec3), (size_t)nPh, f) == (size_t)nPh;
+        ok = ok && std::fwrite(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
+    }
     std::fclose(f);
     if (!ok) std::fprintf(stderr, "[savemap] write to %s failed\n", path);
     return ok;
@@ -9299,8 +11221,14 @@ static bool loadPhotonMap(const char* path, PhotonMap& pm,
     char magic[8] = {0};
     long long nEmitted = 0, nPh = 0; double en[5] = {0,0,0,0,0}; uint64_t g = 0;
     bool ok = std::fread(magic, 1, 8, f) == 8;
-    if (!ok || std::memcmp(magic, "FTPMP01\n", 8) != 0) {
-        std::fprintf(stderr, "[loadmap] %s is not a recognised photon-map file; ignoring\n", path);
+    if (!ok || std::memcmp(magic, "FTPMP02\n", 8) != 0) {
+        // Name the stale-version case explicitly: a user with a cache from before the
+        // split layout should be told to re-deposit, not left guessing.
+        if (ok && std::memcmp(magic, "FTPMP01\n", 8) == 0)
+            std::fprintf(stderr, "[loadmap] %s is an old FTPMP01 map (pre split-layout); "
+                                 "re-run with -savemap to rebuild it. Ignoring.\n", path);
+        else
+            std::fprintf(stderr, "[loadmap] %s is not a recognised photon-map file; ignoring\n", path);
         std::fclose(f); return false;
     }
     ok = ok && std::fread(&g, sizeof g, 1, f) == 1;
@@ -9313,11 +11241,16 @@ static bool loadPhotonMap(const char* path, PhotonMap& pm,
         std::fclose(f); return false;
     }
     if (nPh > 0) {
+        pm.pos.resize((size_t)nPh);
         pm.photons.resize((size_t)nPh);
-        ok = std::fread(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
+        ok = std::fread(pm.pos.data(), sizeof(Vec3), (size_t)nPh, f) == (size_t)nPh;
+        ok = ok && std::fread(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
     }
     std::fclose(f);
-    if (!ok) { std::fprintf(stderr, "[loadmap] %s truncated photon data; ignoring\n", path); pm.photons.clear(); return false; }
+    if (!ok) {
+        std::fprintf(stderr, "[loadmap] %s truncated photon data; ignoring\n", path);
+        pm.photons.clear(); pm.pos.clear(); return false;
+    }
     pm.nEmitted = nEmitted;
     e.emitted += en[0]; e.absorbed += en[1]; e.sensor += en[2]; e.escaped += en[3]; e.residual += en[4];
     return true;
@@ -9336,7 +11269,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const SppProgress* prog,
                                             const std::function<bool(int, const Film&)>* onFrame,
                                             const char* mapLoad, const char* mapSave, int heroC,
-                                            int fgRays) {
+                                            int fgRays, double autoK) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -9358,13 +11291,27 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // trace and optionally persist it (-savemap). The map is view-independent, so a loaded
     // one is re-gathered for any camera/radius without re-tracing a photon.
     PhotonMap pm;
+
+    // Bin the map, honouring the density-adaptive radius (autoK > 0). Say out loud what
+    // radius it settled on: the one printed before the deposit is only a starting point and
+    // a silently-different one would be baffling when comparing renders. The gather below
+    // reads pm.radius, so nothing else needs to know which branch ran.
+    auto buildMap = [&]() {
+        if (autoK <= 0.0) { pm.build(radius); return; }
+        double nProbe = 0.0, kTarget = 0.0;
+        const double r = pm.buildAuto(radius, autoK, &nProbe, &kTarget);
+        std::printf("[gpu] adaptive gather radius: %.4g -> %.4g (a typical gather saw %.0f "
+                    "photons at the starting radius; target %.0f for %zu stored)\n",
+                    radius, r, nProbe, kTarget, pm.photons.size());
+    };
+
     bool mapLoaded = false;
     if (mapLoad && *mapLoad) {
         mapLoaded = loadPhotonMap(mapLoad, pm, eOut, photonMapGuard(scene, diffraction));
         if (mapLoaded) {
             std::printf("[loadmap] %s: %zu photons from %lld emitted -- deposit skipped\n",
                         mapLoad, pm.photons.size(), (long long)pm.nEmitted);
-            pm.build(radius);                   // (re)build the grid at the requested radius
+            buildMap();                         // (re)build the grid at the requested radius
         } else {
             std::fprintf(stderr, "[loadmap] falling back to a fresh deposit\n");
         }
@@ -9423,8 +11370,11 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         }
     }
     if (nDep > 0 && d_photons) {
-        // Download + convert to Photon in chunks (never a full host-side DPhoton copy).
+        // Download + convert in chunks (never a full host-side DPhoton copy). Positions
+        // and payloads split into PhotonMap's two parallel arrays (see Photon in
+        // photonmap.h); DPhoton has the same fields, so this is a pure widen + split.
         pm.photons.resize((size_t)nDep);
+        pm.pos.resize((size_t)nDep);
         std::vector<DPhoton> stage;
         for (size_t off = 0; off < (size_t)nDep; off += PM_CHUNK) {
             size_t cnt = std::min(PM_CHUNK, (size_t)nDep - off);
@@ -9434,15 +11384,14 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             for (size_t i = 0; i < cnt; ++i) {
                 const DPhoton& d = stage[i];
                 Photon& p = pm.photons[off + i];
-                p.pos = Vec3(d.pos.x, d.pos.y, d.pos.z);
-                p.wi  = Vec3(d.wi.x,  d.wi.y,  d.wi.z);
+                pm.pos[off + i] = Vec3(d.pos.x, d.pos.y, d.pos.z);
                 p.n   = Vec3(d.n.x,   d.n.y,   d.n.z);
                 p.power = d.power; p.lambda = d.lambda;
             }
         }
     }
     if (d_photons) cudaFree(d_photons);
-    pm.build(radius);                       // host counting sort -> cell-contiguous runs
+    buildMap();                             // host counting sort -> cell-contiguous runs
 
     double energy[5] = {0,0,0,0,0};
     CUDA_CHECK(cudaMemcpy(energy, d_energy, 5 * sizeof(double), cudaMemcpyDeviceToHost));
@@ -9483,9 +11432,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             stage.resize(cnt);
             for (size_t i = 0; i < cnt; ++i) {
                 const Photon& p = pm.photons[off + i];
+                const Vec3&  pp = pm.pos[off + i];
                 const Vec3&  ci = pm.cie[off + i];
                 DGatherPhoton& d = stage[i];
-                d.pos = DVec3(p.pos.x, p.pos.y, p.pos.z);
+                d.pos = DVec3(pp.x, pp.y, pp.z);
                 d.n   = DVec3(p.n.x,   p.n.y,   p.n.z);
                 const double w = (double)p.power * fold;
                 d.pX = (float)(ci.x * w);
@@ -9881,18 +11831,22 @@ struct VcmSession {
     int  diffraction = 0;
     int  maxDepth = 8;
     int  vcmCap = 8;              // max stored connectible vertices per light subpath (== maxDepth)
+    int  heroC = 1;               // hero bundle width (1 == classic single-λ session)
+    int  secStride = 0;           // heroC-1 secondary slots per stored vertex (0 when heroC==1)
     long long passes = 0;
     // Persistent (allocated once in Begin):
     gpu::DVcmLV* d_lvSlab = nullptr;   // npix * vcmCap
+    gpu::DVcmSec* d_lvSecSlab = nullptr;  // npix*vcmCap*secStride (NULL unless heroC>1)
     int*    d_lvCount = nullptr;       // npix
     double* d_splat   = nullptr;       // npix*3 (this pass's connect-to-camera XYZ)
     double* d_accum   = nullptr;       // npix*3 (running SUM over passes)
-    gpu::Real* d_lamBuf = nullptr;     // npix   (per-path wavelength, shared light<->camera)
-    double* d_invLam  = nullptr;       // npix   (invPdfLambda; <=0 marks "no valid wavelength")
+    gpu::Real* d_lamBuf = nullptr;     // npix*heroC (per-path BUNDLE, shared light<->camera)
+    double* d_invLam  = nullptr;       // npix*heroC (invPdfLambda; [i*C]<=0 marks "no wavelength")
     int*    d_pathBegin = nullptr;     // npix (device-scanned per-pass)
     int*    d_pathEnd   = nullptr;     // npix
     // Grow-only device scratch for the on-device compaction + grid build (no per-pass malloc):
     gpu::DVcmLV* d_lvCompact = nullptr; size_t lvCompactCap = 0;
+    gpu::DVcmSec* d_lvSecCompact = nullptr; size_t lvSecCompactCap = 0;
     int*    d_cellKey   = nullptr;      size_t cellKeyCap = 0;
     int*    d_order     = nullptr;      size_t orderCap = 0;
     int*    d_cellStart = nullptr;      size_t cellStartCap = 0;  // entries (nCells+1)
@@ -9910,22 +11864,31 @@ bool cudaVcmSupported(const Scene& scene) {
 }
 
 VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
-                            bool diffraction, int maxDepth) {
+                            bool diffraction, int maxDepth, int heroC) {
     if (!cudaAvailable() || !cudaVcmSupported(scene)) return nullptr;
     VcmSession* s = new VcmSession();
     s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
     s->diffraction = diffraction ? 1 : 0;
     s->maxDepth = (maxDepth > 0) ? maxDepth : 8;
     s->vcmCap = s->maxDepth;
+    // Hero bundle width. The kernels are templated on the SECONDARY slot count, so a C==1
+    // session instantiates kVcm*T<0>: no sec slab, no per-λ arrays, no extra registers.
+    int C = (heroC < 1) ? 1 : heroC;
+    if (C > BDPT_NSEC + 1) C = BDPT_NSEC + 1;
+    s->heroC = C;
+    s->secStride = C - 1;
     buildUploadScene(scene, s->up);
     s->cam = bakeCamera(scene, cam, resX, resY, s->up);
     const size_t np = s->npix;
     CUDA_CHECK(cudaMalloc(&s->d_lvSlab,  np * (size_t)s->vcmCap * sizeof(gpu::DVcmLV)));
+    if (s->secStride > 0)
+        CUDA_CHECK(cudaMalloc(&s->d_lvSecSlab,
+                              np * (size_t)s->vcmCap * (size_t)s->secStride * sizeof(gpu::DVcmSec)));
     CUDA_CHECK(cudaMalloc(&s->d_lvCount, np * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s->d_splat,   np * 3 * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&s->d_accum,   np * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&s->d_lamBuf,  np * sizeof(gpu::Real)));
-    CUDA_CHECK(cudaMalloc(&s->d_invLam,  np * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_lamBuf,  np * (size_t)C * sizeof(gpu::Real)));
+    CUDA_CHECK(cudaMalloc(&s->d_invLam,  np * (size_t)C * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&s->d_pathBegin, np * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s->d_pathEnd,   np * sizeof(int)));
     CUDA_CHECK(cudaMemset(s->d_accum, 0, np * 3 * sizeof(double)));
@@ -9955,9 +11918,16 @@ void vcmSessionPass(VcmSession* s, double radius) {
     CUDA_CHECK(cudaMemset(s->d_splat, 0, np * 3 * sizeof(double)));
     unsigned long long seedL = 0xD1B54A32D192ED03ULL
                              ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL);
-    kVcmLight<<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
-                             s->d_lvSlab, s->d_lvCount, s->d_splat,
-                             s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, seedL, passIdx);
+    if (s->secStride > 0)
+        kVcmLightT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
+                                 s->d_lvSlab, s->d_lvSecSlab, s->secStride, s->heroC,
+                                 s->d_lvCount, s->d_splat,
+                                 s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, seedL, passIdx);
+    else
+        kVcmLightT<0><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
+                                 s->d_lvSlab, nullptr, 0, 1,
+                                 s->d_lvCount, s->d_splat,
+                                 s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, seedL, passIdx);
     cudaCheckKernel("vcm-light");
 
     // (2) Compact the slab ON DEVICE into contiguous per-path ranges: exclusive-scan the
@@ -9975,8 +11945,11 @@ void vcmSessionPass(VcmSession* s, double radius) {
     const size_t nLV = (size_t)((nLVi > 0) ? nLVi : 0);
     if (nLV > 0) {
         ensureDevCap(s->d_lvCompact, s->lvCompactCap, nLV);
-        kVcmCompactScatter<<<2048, 128>>>(s->d_lvSlab, s->d_lvCount, s->d_pathBegin,
-                                          s->d_lvCompact, (int)np, s->vcmCap);
+        if (s->secStride > 0)
+            ensureDevCap(s->d_lvSecCompact, s->lvSecCompactCap, nLV * (size_t)s->secStride);
+        kVcmCompactScatter<<<2048, 128>>>(s->d_lvSlab, s->d_lvSecSlab, s->secStride,
+                                          s->d_lvCount, s->d_pathBegin,
+                                          s->d_lvCompact, s->d_lvSecCompact, (int)np, s->vcmCap);
         cudaCheckKernel("vcm-compact");
     }
 
@@ -10027,7 +12000,14 @@ void vcmSessionPass(VcmSession* s, double radius) {
     // (5) Camera pass — one camera subpath per pixel; adds this pass's radiance into accum.
     unsigned long long seedC = 0xC2B2AE3D27D4EB4FULL
                              ^ ((unsigned long long)(passIdx + 1) * 0xA24BAED4963EE407ULL);
-    kVcmCamera<<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
+    if (s->secStride > 0)
+        kVcmCameraT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
+                              (nLV > 0) ? s->d_lvSecCompact : nullptr, s->secStride, s->heroC,
+                              s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
+                              s->d_lamBuf, s->d_invLam, W, H, seedC, passIdx);
+    else
+        kVcmCameraT<0><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
+                              nullptr, 0, 1,
                               s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
                               s->d_lamBuf, s->d_invLam, W, H, seedC, passIdx);
     cudaCheckKernel("vcm-camera");
@@ -10056,6 +12036,8 @@ void vcmSessionEnd(VcmSession* s) {
     if (!s) return;
     cudaFree(s->d_lvSlab); cudaFree(s->d_lvCount); cudaFree(s->d_splat); cudaFree(s->d_accum);
     cudaFree(s->d_lamBuf); cudaFree(s->d_invLam); cudaFree(s->d_pathBegin); cudaFree(s->d_pathEnd);
+    if (s->d_lvSecSlab)    cudaFree(s->d_lvSecSlab);
+    if (s->d_lvSecCompact) cudaFree(s->d_lvSecCompact);
     if (s->d_lvCompact) cudaFree(s->d_lvCompact);
     if (s->d_cellKey)   cudaFree(s->d_cellKey);
     if (s->d_cellStart) cudaFree(s->d_cellStart);

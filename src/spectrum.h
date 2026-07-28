@@ -16,14 +16,30 @@ using Spectrum = std::function<double(double)>; // lambda (nm) -> value
 // --- Builtins ---------------------------------------------------------------
 inline Spectrum constantSpectrum(double v) { return [v](double) { return v; }; }
 
+// Planck spectral radiance at temperature `kelvin` and wavelength `lambdaNm`
+// (SI, W·m⁻³·sr⁻¹ up to the usual constant). Free function so hot loops
+// (per-voxel volumetric blackbody emission, fire) can evaluate it inline
+// without constructing a std::function per point.
+inline double blackbodyRadiance(double kelvin, double lambdaNm) {
+    const double h = 6.62607015e-34, c = 2.99792458e8, kb = 1.380649e-23;
+    double l = lambdaNm * 1e-9;
+    double e = std::exp((h * c) / (l * kb * kelvin)) - 1.0;
+    return (2.0 * h * c * c) / (std::pow(l, 5.0) * e);
+}
+
 inline Spectrum blackbody(double kelvin) {
     // Planck's law (relative). Returns spectral radiance up to a constant.
-    return [kelvin](double lambdaNm) {
-        const double h = 6.62607015e-34, c = 2.99792458e8, kb = 1.380649e-23;
-        double l = lambdaNm * 1e-9;
-        double e = std::exp((h * c) / (l * kb * kelvin)) - 1.0;
-        return (2.0 * h * c * c) / (std::pow(l, 5.0) * e);
-    };
+    return [kelvin](double lambdaNm) { return blackbodyRadiance(kelvin, lambdaNm); };
+}
+
+// Blackbody radiance normalized against a fixed 6500 K / 560 nm reference, so a
+// volumetric emitter's `emission_scale ~ O(1)` maps to a usable glow for typical
+// flame temperatures (~1000–3000 K) while PRESERVING the physical relative
+// brightness (Stefan–Boltzmann T⁴) and hue shift (Wien's law) between voxels of
+// different temperature. The denominator is a compile-once constant.
+inline double blackbodyEmissionRadiance(double kelvin, double lambdaNm) {
+    static const double kRef = blackbodyRadiance(6500.0, 560.0);
+    return blackbodyRadiance(kelvin, lambdaNm) / kRef;
 }
 
 // Smooth "colored wall" reflectances (plausible, not measured — fine for Phase 0).

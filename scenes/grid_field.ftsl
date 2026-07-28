@@ -1,0 +1,78 @@
+# Authored data driving the two SCALAR FIELD sites (0.78.0).
+#
+# `grid:` / `scatter:` used to be pattern-only samplers — legal wherever a shading
+# context existed, a compile error in a field formula. They now reach every scalar
+# field, because a table sample needs nothing but coordinates (unlike `tex:`, which
+# needs a hit's u,v and so is still refused here). This scene uses both new sites:
+#
+#   * `terrain` is a 5x5 lattice of heights read by an isosurface `function` leaf, so
+#     the surface IS the authored data — `expr "y - grid:terrain(x, z)"` is a height
+#     field, N-linearly interpolated exactly as the renderer sphere-traces it;
+#   * `haze` is a 1-D density profile read by a medium's `density` program, so a
+#     measured volume needs no `.vdb` at all.
+#
+# See also: scenes/pattern_grid.ftsl (the sampler itself, as surface albedo) and
+# scenes/pattern_scatter.ftsl (the ragged sibling).
+
+scene {
+    units    meters
+    spectral 360 830 5
+}
+
+# Axis 0 is x, axis 1 is z (C order, axis 0 outermost). A ridge running along z,
+# highest at the back-left, with a dip a third of the way in.
+grid "terrain" {
+    lo   0 0
+    hi   1 1
+    data [[0.55 0.50 0.38 0.22 0.10]
+          [0.40 0.30 0.16 0.08 0.05]
+          [0.20 0.10 0.05 0.06 0.12]
+          [0.08 0.06 0.12 0.28 0.42]
+          [0.05 0.12 0.28 0.48 0.60]]
+}
+
+# Haze that thins with height: 5 samples over y in [0, 1].
+grid "haze" {
+    lo   0
+    hi   1
+    data { 1.0 0.62 0.3 0.1 0.0 }
+}
+
+material "rock" { type diffuse  reflect rgb 0.78 0.70 0.58 }
+material "wall" { type diffuse  reflect whitewall 0.12 }
+
+isosurface {
+    material rock
+    function { expr "y - grid:terrain(x, z)" }
+    contained_by { min 0 0 0   max 1 0.7 1 }
+}
+
+medium "haze" {
+    sigma_t     0.25
+    albedo      0.9
+    density     "grid:haze(y)"
+    density_max 1.0
+    bounds { min 0 0 0   max 1 1 2.6 }
+}
+
+# A corridor box: the terrain occupies its far end (z in [0,1]) and the walls run back
+# past the camera, so nothing in frame is empty space.
+quad { origin 0 0 0   u 1 0 0   v 0 0 2.6   material rock }   # floor, under the terrain
+quad { origin 0 0 0   u 0 0 2.6   v 0 1 0   material wall }   # left    (x=0)
+quad { origin 1 0 0   u 0 1 0    v 0 0 2.6  material wall }   # right   (x=1)
+quad { origin 0 0 0   u 1 0 0    v 0 1 0    material wall }   # far     (z=0)
+quad { origin 0 1 0   u 1 0 0    v 0 0 2.6  material wall }   # ceiling
+
+# Small, on the ceiling BETWEEN the camera and the terrain, so the slopes facing the
+# camera are the lit ones and the height field reads as relief.
+light area {
+    origin 0.30 0.985 1.35   u 0.4 0 0   v 0 0 0.3   normal 0 -1 0
+    spd    preset:bb6500
+    power  250
+}
+
+camera "cam" {
+    eye 0.5 0.55 2.3   look_at 0.5 0.18 0.4   up 0 1 0   fov_y 45
+    mode D
+    film { res 400 400   iso 100   shutter 1   exposure 1 }
+}

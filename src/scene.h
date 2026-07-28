@@ -83,6 +83,13 @@ struct Material {
     // the interpolated per-vertex UVs (no triplanar for scalar params yet).
     int roughnessTex = -1;
     int filmThicknessTex = -1;
+    // Tangent-space NORMAL MAP (C6): index into Scene::textures, or -1. When set, the
+    // shading normal at a hit is perturbed by the texel's tangent-space normal rotated
+    // through the surface TBN frame (see Scene::closestHit). `normalStrength` scales the
+    // tangential (x,y) perturbation — 0 disables, 1 is the authored map, >1 exaggerates.
+    // The bound texture must be `encoding linear` (a normal map is raw vector data).
+    int normalTex = -1;
+    double normalStrength = 1.0;
     // Procedural (math-driven) scalar drives (§4): index into Scene::patterns, or -1.
     // A bound pattern is evaluated at the hit point (x,y,z,f,normal,r) and OVERRIDES
     // the constant/texture value — this is how implicit surfaces (which carry no UVs)
@@ -90,6 +97,45 @@ struct Material {
     int roughnessPat = -1;
     int filmThicknessPat = -1;
     int mixWeightPat = -1;   // drives child-0 selection prob of a 2-child Mix (see mixResolveChild)
+    // Procedural drive on the REFLECT slot: a per-hit MULTIPLIER on whatever the slot
+    // otherwise evaluates to (a driven record, a bound reflectTex, or the constant
+    // `reflect` spectrum), clamped to [0,1]. -1 = unmodulated. Two spellings collapse
+    // here: `reflect pattern:<name>` (also what an inline literal `reflect [0 1](u)`
+    // desugars to) puts the pattern in the slot ALONE, so the base is a flat 1.0 and the
+    // albedo is greyscale straight from the pattern; `reflect_map pattern:<name>` written
+    // beside a spectrum or texture modulates THAT, which is how a pattern gets a tint.
+    // Because it is a scalar multiplier it is wavelength-flat by construction — colour
+    // still comes from the spectrum/texture, never from the pattern.
+    int reflectPat = -1;
+    // Same idea on the TRANSMIT slot, read through transmitSlot(): a per-hit multiplier
+    // on the constant `transmit` spectrum, clamped to [0,1]. `transmit pattern:<name>`
+    // (or `transmit [0 1](u)`) puts the pattern in the slot alone over a flat-1.0 base;
+    // `transmit_map pattern:<name>` beside a spectrum modulates that. On a Filter this
+    // makes the gel's transmittance vary across its face; on a translucent (two-lobe
+    // Lambertian) it varies the back-hemisphere albedo, still under the rhoR+rhoT <= 1
+    // energy guard, which is applied AFTER the multiplier at every call site.
+    int transmitPat = -1;
+    // Same idea on the EMIT slot, read through emitSlot(): a per-point multiplier on the
+    // emitted radiance, clamped to [0,1] — a gobo / stained-glass / video-wall profile on
+    // an area light. `emit pattern:<name>` (or `emit [0 1](u)`) puts the pattern in the
+    // slot alone over a flat-1.0 base; `emit_map pattern:<name>` beside an SPD modulates
+    // that, so colour still comes from the spectrum.
+    //
+    // Emission is the one slot read from BOTH sides of the light transport — as
+    // emission-on-hit (a path lands on the emissive surface, PatCtx from the Hit) and as
+    // Le at a point drawn by the emitter sampler (NEE / BDPT / forward photon birth,
+    // PatCtx from Emitter::samplePointUV). MIS combines those two estimators, so they
+    // MUST agree pointwise or the image is biased, not just noisy. That is why the
+    // pattern is only accepted where the emitter sampler's (u,v) provably equals the
+    // geometry's hit (u,v): a rectangular area light (whose two tris now carry the same
+    // corner UVs addQuad uses) and a mesh area light (whose EmitTri carries the source
+    // triangle's UVs). Sphere / tube / spot / env emitters are rejected at load.
+    //
+    // The multiplier is deliberately NOT folded into Emitter::power, so no selection or
+    // positional pdf changes anywhere: it is a pure post-multiplier on radiance and on a
+    // born photon's beta, which keeps every estimator unbiased by construction. The cost
+    // is variance — a mostly-dark pattern still gets sampled as if it were fully on.
+    int emitPat = -1;
 
     // --- Parametric-record drive (§records) ---------------------------------
     // A material's slots can be driven by parametric records (Scene::records). Each
@@ -295,6 +341,47 @@ struct Medium {
     // its peak value seeds densityMax. Takes precedence over the `density` formula.
     std::shared_ptr<VdbGrid> vdb;
 
+    // --- Optional volumetric blackbody EMISSION (fire) ----------------------
+    // When `temperature` is set (a second imported grid giving T in Kelvin per
+    // voxel, e.g. the "temperature" grid of a multi-grid fire `.vdb`), the medium
+    // EMITS thermal radiation: the local emission SOURCE radiance is
+    //   L_e(x,λ) = emissionScale · blackbodyEmissionRadiance(T(x), λ)
+    // added to the volume rendering equation as the emission term σ_a·L_e
+    // (Kirchhoff's law: the same soot that absorbs also radiates), so hot dense
+    // regions glow. This turns an imported fire `.vdb` into a self-illuminating
+    // volumetric emitter. Null `temperature` => no emission (unchanged media).
+    // Imported temperature grids typically store RELATIVE temperature in arbitrary
+    // units (e.g. this OpenVDB fire sample peaks at ~46, not ~1500 K), so we map the
+    // raw grid value to a physical Kelvin by peak-normalising: T(x) =
+    // emitKelvin · grid(x)/tempPeak. `emitKelvin` (grammar `emission_kelvin`) is the
+    // temperature of the HOTTEST voxel (default 1500 K — a yellow flame); cooler
+    // voxels scale down linearly (redder + dimmer, Wien + Stefan-Boltzmann). This is
+    // robust to whatever units the grid was authored in. `tempPeak` is the grid's raw
+    // maxVal, captured at load.
+    std::shared_ptr<VdbGrid> temperature;   // raw relative temperature grid (0 => cold)
+    double tempPeak    = 1.0;               // raw grid peak (for peak-normalisation)
+    double emitKelvin  = 1500.0;            // Kelvin of the hottest voxel
+    double emissionScale = 1.0;             // brightness multiplier on the Planck term
+
+    bool emissive() const { return (bool)temperature; }
+
+    // Physical temperature (Kelvin) at a world point; 0 outside the grid / cold.
+    double temperatureAt(const Vec3& p) const {
+        if (!temperature) return 0.0;
+        double raw = temperature->sample(p);
+        if (raw <= 0.0) return 0.0;
+        return emitKelvin * (raw / (tempPeak > 0.0 ? tempPeak : 1.0));
+    }
+    // Volumetric emission SOURCE radiance L_e(x,λ) (>= 0). This is the emitted
+    // radiance BEFORE the σ_a weighting of the RTE emission term; callers that
+    // want the full emission coefficient multiply by the local σ_a(x,λ).
+    double emissionAt(const Vec3& p, double lambda) const {
+        double T = temperatureAt(p);
+        if (T <= 0.0) return 0.0;
+        double Le = emissionScale * blackbodyEmissionRadiance(T, lambda);
+        return Le > 0.0 ? Le : 0.0;
+    }
+
     // --- Optional spatial bound (localized / per-object fog) ----------------
     // When `bounded`, the medium exists only inside a region: an axis-aligned box
     // [bmin,bmax] (`boundShape == Box`) or a sphere centered `bcenter` radius
@@ -329,9 +416,9 @@ struct Medium {
     }
 
     // Inside-test for an implicit-shaped bound: is world point p within the field?
-    bool insideField(const Vec3& p) const {
+    bool insideField(const Vec3& p, const PatTables* tabs = nullptr) const {
         double f = fieldEval(boundField.data(), (int)boundField.size(), p,
-                             boundFieldExpr.data());
+                             boundFieldExpr.data(), tabs);
         return boundInsideNeg ? (f < 0.0) : (f > 0.0);
     }
 
@@ -347,11 +434,15 @@ struct Medium {
     // medium. Evaluated by the shared pattern VM (x y z r live; f/normal/uv read 0).
     // For an implicit bound the multiplier is 0 outside the field (the medium simply
     // does not exist there), so delta/ratio tracking carves out the exact iso-shape.
-    double densityAt(const Vec3& p) const {
-        if (boundShape == MediumBound::Implicit && !insideField(p)) return 0.0;
+    // `tabs` publishes the scene's `grid:`/`scatter:` tables, so a density field can be
+    // a SAMPLED volume (`density "grid:rho(x, y, z)"`) rather than only a formula. It is
+    // a parameter, not a member, because it points into Scene's vectors — see PatTables.
+    double densityAt(const Vec3& p, const PatTables* tabs = nullptr) const {
+        if (boundShape == MediumBound::Implicit && !insideField(p, tabs)) return 0.0;
         if (vdb) return vdb->sample(p);   // imported .nvdb volume (trilinear)
         if (density.empty()) return 1.0;
         PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
+        patBindTables(c, tabs);
         double d = patternEval(density.data(), (int)density.size(), c);
         return d > 0.0 ? d : 0.0;
     }
@@ -361,29 +452,30 @@ struct Medium {
 
     // Local refractive index n at a world point (>= a small floor). 1 when this
     // is not a GRIN medium. Evaluated by the shared pattern VM (x y z r live).
-    double nAt(const Vec3& p) const {
+    double nAt(const Vec3& p, const PatTables* tabs = nullptr) const {
         if (ior.empty()) return 1.0;
         PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
+        patBindTables(c, tabs);
         double n = patternEval(ior.data(), (int)ior.size(), c);
         return n > 1e-3 ? n : 1e-3;
     }
     // ∇n at a world point via central differences with step h (world units).
-    Vec3 gradNAt(const Vec3& p, double h) const {
+    Vec3 gradNAt(const Vec3& p, double h, const PatTables* tabs = nullptr) const {
         double inv = 0.5 / h;
-        double gx = nAt(p + Vec3(h, 0, 0)) - nAt(p - Vec3(h, 0, 0));
-        double gy = nAt(p + Vec3(0, h, 0)) - nAt(p - Vec3(0, h, 0));
-        double gz = nAt(p + Vec3(0, 0, h)) - nAt(p - Vec3(0, 0, h));
+        double gx = nAt(p + Vec3(h, 0, 0), tabs) - nAt(p - Vec3(h, 0, 0), tabs);
+        double gy = nAt(p + Vec3(0, h, 0), tabs) - nAt(p - Vec3(0, h, 0), tabs);
+        double gz = nAt(p + Vec3(0, 0, h), tabs) - nAt(p - Vec3(0, 0, h), tabs);
         return Vec3(gx, gy, gz) * inv;
     }
     // Point-in-bound test (a GRIN region must be bounded). Mirrors clipToBounds'
     // membership: sphere chord / AABB / implicit field. Unbounded => everywhere.
-    bool insideBound(const Vec3& p) const {
+    bool insideBound(const Vec3& p, const PatTables* tabs = nullptr) const {
         if (!bounded) return true;
         if (boundShape == MediumBound::Sphere) {
             Vec3 d = p - bcenter;
             return dot(d, d) <= bradius * bradius;
         }
-        if (boundShape == MediumBound::Implicit) return insideField(p);
+        if (boundShape == MediumBound::Implicit) return insideField(p, tabs);
         return p.x >= bmin.x && p.x <= bmax.x && p.y >= bmin.y &&
                p.y <= bmax.y && p.z >= bmin.z && p.z <= bmax.z;
     }
@@ -446,7 +538,21 @@ struct Sensor {
 // phase-space volume 4*PI^2*R^2 (R = scene bounding radius), so total power =
 // emitIntegral*4*PI^2*R^2; forward photons are emitted from a disk of radius R on
 // the bounding sphere and the backward tracer picks it up on ray misses.
-enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder };
+// A Mesh emitter is an arbitrary emissive triangle soup sharing one SPD/material:
+// samplePoint area-samples uniformly across all its triangles (pick a tri by a
+// cumulative-area CDF, then barycentric point), so a glowing OBJ / tessellated shape
+// acts as one area light. Its "geometric weight" is the same area*PI as a quad.
+// A Sun emitter is a DISTANT DIRECTIONAL light: an infinitely-far disc of angular
+// radius `theta` about `beamDir`, so every point of the scene sees it in the same
+// direction and at the same radiance. It is the counterpart of Env for a *small*
+// bright feature: forward emission fires PARALLEL photons across the scene's
+// projected cross-section (every photon enters the scene — none are wasted aiming
+// at a 6.8e-5 sr feature from a uniform sphere), and the backward/photon-map tracers
+// next-event-estimate it inside its cone with pdf 1/Omega. That is what separates a
+// ~1e5x-brighter-than-sky sun from the env importance sampler, which is why a daylight
+// scene lit by `light sun` converges like any single-light scene while the same sun
+// baked into an HDRI produces fireflies (see known-issues, K2 follow-up).
+enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder, Mesh, Sun };
 
 // Smoothstep spotlight falloff as a function of cos(angle-off-axis). 1 inside the
 // inner cone, 0 outside the outer cone, cubic-smooth (3t^2-2t^3) in the penumbra.
@@ -462,6 +568,20 @@ inline double spotFalloff(double ct, double cosInner, double cosOuter) {
 // power-weighted CDF. The geometric weight is area*PI for area/sphere lights and
 // the falloff-weighted solid angle spotOmega for a spot. For a collimated Quad
 // every photon fires along `beamDir` from that quad (the prism demo).
+// One triangle of a Mesh emitter, precomputed for uniform area sampling: v0 is a
+// vertex, e1/e2 are the two edge vectors from it, nrm is the unit geometric normal,
+// and cumArea is the running (inclusive) sum of triangle areas up to and including
+// this one — so a binary search over cumArea picks a triangle in proportion to area.
+struct EmitTri {
+    Vec3 v0, e1, e2, nrm;
+    double cumArea = 0.0;
+    // The source triangle's texture coordinates, so a sampled point can report the SAME
+    // (u,v) the ray-hit path interpolates (geometry.h: uv = b0*uv0 + b1*uv1 + b2*uv2).
+    // Only read when an emission pattern is bound; stored as uv0 + the two uv edges to
+    // mirror the v0/e1/e2 layout above.
+    Vec3 uv0{0, 0, 0}, uvE1{1, 0, 0}, uvE2{1, 1, 0};
+};
+
 struct Emitter {
     Vec3 origin, u, v, normal;
     double area = 0.0;
@@ -483,18 +603,30 @@ struct Emitter {
     Vec3 beamDir{1, 0, 0};    // collimated fire direction / spot axis
     double spotCosInner = 1.0, spotCosOuter = 1.0; // spot penumbra cosines (Spot)
     double spotOmega = 0.0;   // spot falloff-weighted solid angle = PI*(2-ci-co)
-    double envGeom = 0.0;     // env phase-space weight 4*PI^2*R^2 (Env; set in build())
+    // Env: phase-space weight 4*PI^2*R^2. Sun: the same quantity for a cone light,
+    // Omega*PI*R^2 (cone solid angle x the scene's projected disc). Both set in build()
+    // because both depend on the scene bounding sphere.
+    double envGeom = 0.0;
+    // Sun only: the directly-viewed XYZ of this light, integral(CIE(lam)*L(lam) dlam).
+    // Precomputed in build() because the direct-view path (a camera/specular ray that
+    // escapes into the sun's cone) is evaluated per pixel and must not re-integrate.
+    Vec3 viewXYZ{0, 0, 0};
+    std::vector<EmitTri> meshTris; // Mesh: per-triangle area CDF for uniform sampling
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
     double power = 0.0;       // emitIntegral * geomWeight (selection weight)
+    // Index into Scene::patterns of an emission profile over this emitter's surface,
+    // copied from the emissive material's `emitPat` at registration; -1 = uniform.
+    // Deliberately absent from `power` above — see Material::emitPat for why.
+    int emitPat = -1;
 
     // Per-emitter spectral/geometric weight fed into the combined backward
     // wavelength sampler and the power law: area*PI for surfaces, spotOmega for a
     // spot. (Area/sphere keep the exact area*PI expression for bit-identity.)
     double geomWeight() const {
         if (shape == EmitterShape::Spot) return spotOmega;
-        if (shape == EmitterShape::Env)  return envGeom;
+        if (shape == EmitterShape::Env || shape == EmitterShape::Sun) return envGeom;
         return area * PI;
     }
 
@@ -503,7 +635,18 @@ struct Emitter {
     // draws to the pre-sphere engine, so quad scenes stay bit-identical). Sphere:
     // a uniformly-distributed surface point (pdf = 1/area for both shapes). Not
     // used for Spot (a point light — see the forward/backward spot paths).
-    void samplePoint(double u1, double u2, Vec3& y, Vec3& nOut) const {
+    //
+    // `uuOut`/`vvOut` optionally report the sampled point's TEXTURE coordinates, which
+    // an emission pattern needs (emitterPatMul). They are filled only for the two shapes
+    // that can carry one — Quad (the bilinear parameters, which addAreaLight's two tris
+    // are UV'd to match) and Mesh (the chosen EmitTri's barycentric UV, the same
+    // interpolation geometry.h does at a hit) — and left at 0 elsewhere, since sphere /
+    // tube / spot / env emitters reject `emit pattern:` at load. Passing null (the
+    // default) keeps every existing caller's arithmetic untouched.
+    void samplePoint(double u1, double u2, Vec3& y, Vec3& nOut,
+                     double* uuOut = nullptr, double* vvOut = nullptr) const {
+        if (uuOut) *uuOut = 0.0;
+        if (vvOut) *vvOut = 0.0;
         if (shape == EmitterShape::Sphere) {
             double z = 1.0 - 2.0 * u1;                 // cos(theta) uniform in [-1,1]
             double r = std::sqrt(std::max(0.0, 1.0 - z * z));
@@ -545,11 +688,58 @@ struct Emitter {
                 y = origin + v * u1 + rad * radius;
                 nOut = rad;                            // unit outward normal
             }
+        } else if (shape == EmitterShape::Mesh) {
+            // Uniform over the whole triangle soup: pick a triangle with probability
+            // proportional to its area (binary-search u1*area over the cumulative-area
+            // CDF), remap the leftover to a fresh [0,1) uniform, then sample the chosen
+            // triangle barycentrically. Combined density is 1/area over the surface, so
+            // the caller's pdf = 1/area law holds exactly as for a quad.
+            double target = u1 * area;
+            // Lower-bound: first triangle whose inclusive cumArea >= target.
+            size_t lo = 0, hi = meshTris.size();
+            while (lo < hi) {
+                size_t mid = (lo + hi) >> 1;
+                if (meshTris[mid].cumArea < target) lo = mid + 1;
+                else hi = mid;
+            }
+            if (lo >= meshTris.size()) lo = meshTris.size() - 1;
+            const EmitTri& t = meshTris[lo];
+            double prev = (lo == 0) ? 0.0 : meshTris[lo - 1].cumArea;
+            double span = t.cumArea - prev;
+            double uu = (span > 0.0) ? (target - prev) / span : u1; // remap within tri
+            double su = std::sqrt(std::max(0.0, uu));
+            double b1 = 1.0 - su;
+            double b2 = u2 * su;
+            y = t.v0 + t.e1 * b1 + t.e2 * b2;
+            nOut = t.nrm;
+            // Same barycentric weights the ray-hit path uses, so a bound emission
+            // pattern reads identically from either side of the transport.
+            if (uuOut) *uuOut = t.uv0.x + t.uvE1.x * b1 + t.uvE2.x * b2;
+            if (vvOut) *vvOut = t.uv0.y + t.uvE1.y * b1 + t.uvE2.y * b2;
         } else {
             y = origin + u * u1 + v * u2;
             nOut = normal;
+            if (uuOut) *uuOut = u1;
+            if (vvOut) *vvOut = u2;
         }
     }
+
+    // Sun: sample a direction uniformly inside the angular cone about `axis`
+    // (solid-angle pdf 1/spotOmega, exact for any half-angle). Called with
+    // axis = beamDir for forward emission (the direction a photon travels) and
+    // axis = -beamDir for a next-event connection (the direction a shading point
+    // looks toward the sun). A Sun stores spotCosInner == spotCosOuter == cos(theta),
+    // which makes the shared spotOmega = PI*(2-ci-co) expression evaluate to exactly
+    // the cone solid angle 2*PI*(1-cos theta) — so no extra field is needed.
+    Vec3 sampleCone(const Vec3& axis, double u1, double u2) const {
+        double ct = spotCosOuter + u1 * (1.0 - spotCosOuter);
+        double st = std::sqrt(std::max(0.0, 1.0 - ct * ct));
+        double phi = 2.0 * PI * u2;
+        Vec3 t, b; onb(axis, t, b);
+        return t * (st * std::cos(phi)) + b * (st * std::sin(phi)) + axis * ct;
+    }
+    // Sun: does the escaping ray direction `d` (unit) look back into the solar disc?
+    bool inCone(const Vec3& d) const { return dot(d, beamDir) <= -spotCosOuter; }
 
     // Solid-angle (cone) importance sampling of a sphere emitter as seen from a
     // reference point `ref` (PBRT's Sphere::Sample_Li). Samples a direction `wi`
@@ -702,6 +892,29 @@ struct Scene {
     std::vector<Texture> textures;   // image textures referenced by materials (Phase 3b)
     std::vector<Pattern> patterns;   // procedural scalar fields for math-driven material props (§4)
     std::vector<Record>  records;    // parametric records: named per-channel LUTs (§records)
+    // N-D data tables, sampled from a pattern expression: regular lattices as
+    // `grid:<name>(c0, …)` and scattered samples as `scatter:<name>(c0, …)`. Headers
+    // and numbers are split so ALL of them share ONE flat pool: a table refers to its
+    // run by offset (never by pointer, which would dangle when the pool grows), and
+    // that is also the exact shape the GPU uploads — one array however many tables.
+    std::vector<PatGrid>    grids;
+    std::vector<PatScatter> scatters;
+    std::vector<float>      dataPool;
+    // Non-owning view of the three vectors above, for evaluators that only forward the
+    // tables onward (implicit fields, medium density/ior programs). Cheap enough to
+    // build once per ray/traversal, which is the ONLY correct lifetime: a Scene is
+    // copied and moved (buildCornell returns by value), so a stored PatTables would
+    // dangle. Never cache it in a member — pass it as a parameter.
+    PatTables patTables() const {
+        PatTables t;
+        t.grids     = grids.empty()    ? nullptr : grids.data();
+        t.nGrids    = (int)grids.size();
+        t.scatters  = scatters.empty() ? nullptr : scatters.data();
+        t.nScatters = (int)scatters.size();
+        t.dataPool  = dataPool.empty() ? nullptr : dataPool.data();
+        t.dataPoolN = (int)dataPool.size();
+        return t;
+    }
     Sensor sensor;
     // Participating media. Zero or more independent regions (global haze, bounded
     // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
@@ -740,6 +953,70 @@ struct Scene {
     EmissionSampler emitSampler;
     double emitG = 0.0;
 
+    // --- Volumetric blackbody emitters (fire) --------------------------------
+    // Any medium carrying a `temperature` grid is ALSO a self-illuminating
+    // isotropic volume emitter. Forward tracing treats each as a pseudo-emitter:
+    // with probability totalEmissionPower/(totalPower+totalEmissionPower) a photon
+    // is born inside the volume (uniform position in the grid's world AABB, uniform
+    // wavelength, isotropic direction) carrying beta = grandTotal·κ_e(x,λ)/meanKe,
+    // where κ_e = the medium's emissionAt(). The `power`/`meanKe` are estimated at
+    // build() by Monte-Carlo sampling the emission field; `power` only tunes the
+    // photon light-vs-fire split (it cancels in the physics), so the absolute fire
+    // brightness is set purely by emissionAt (i.e. by `emission_scale`).
+    struct EmissiveVolume {
+        int    mediumIndex = -1;
+        Vec3   bmin{0,0,0}, bmax{0,0,0};   // uniform-sampling AABB (temperature grid)
+        double meanKe = 0.0;               // mean emissionAt over bbox×band (β normaliser)
+        double power  = 0.0;               // 4π·V·meanKe·Δλ (selection weight)
+        // Blackbody wavelength importance sampler (at the medium's peak temperature,
+        // emitKelvin). Sampling λ ~ Planck(emitKelvin) instead of uniformly makes the
+        // per-photon β nearly constant across λ — collapsing the spectral colour
+        // speckle a uniform draw leaves in the hot core (variance-only; unbiased).
+        EmissionSampler lamSampler;
+    };
+    std::vector<EmissiveVolume> emissiveVolumes;
+    double totalEmissionPower = 0.0;
+
+    // Estimate each emissive medium's mean emission and selection power. Called by
+    // build() after finalizeEmitters(). Cheap Monte-Carlo over the grid AABB × band.
+    void finalizeEmissiveVolumes() {
+        emissiveVolumes.clear();
+        totalEmissionPower = 0.0;
+        const double lamMin = LAMBDA_MIN, lamMax = LAMBDA_MAX, dLam = lamMax - lamMin;
+        for (size_t mi = 0; mi < media.size(); ++mi) {
+            const Medium& m = media[mi];
+            if (!m.emissive() || !m.temperature) continue;
+            const VdbGrid& g = *m.temperature;
+            Vec3 lo = g.wmin, hi = g.wmax;
+            double V = (hi.x-lo.x) * (hi.y-lo.y) * (hi.z-lo.z);
+            if (V <= 0.0) continue;
+            // Stratified-ish MC of emissionAt over the AABB × spectral band.
+            Pcg32 rng(0x1234abcdu ^ (uint32_t)mi, 0x9e3779b9u);
+            const int NS = 20000;
+            double sum = 0.0;
+            for (int s = 0; s < NS; ++s) {
+                Vec3 p{ lo.x + (hi.x-lo.x)*rng.uniform(),
+                        lo.y + (hi.y-lo.y)*rng.uniform(),
+                        lo.z + (hi.z-lo.z)*rng.uniform() };
+                double lam = lamMin + dLam * rng.uniform();
+                sum += m.emissionAt(p, lam);
+            }
+            double meanKe = sum / NS;
+            if (meanKe <= 0.0) continue;   // grid is entirely cold → no emission
+            EmissiveVolume ev;
+            ev.mediumIndex = (int)mi;
+            ev.bmin = lo; ev.bmax = hi;
+            ev.meanKe = meanKe;
+            ev.power = 4.0 * PI * V * meanKe * dLam;
+            // Build the λ importance sampler from a representative blackbody at the
+            // medium's peak temperature. Sampling λ ~ Planck(emitKelvin) makes the
+            // per-photon β nearly constant across the band (collapses colour speckle).
+            ev.lamSampler.build(blackbody(m.emitKelvin), 1.0);
+            totalEmissionPower += ev.power;
+            emissiveVolumes.push_back(ev);
+        }
+    }
+
     // Environment lighting. envIndex is the index into `emitters` of the single Env
     // emitter (or -1 if none). The scene bounding sphere (sceneCenter, sceneRadius,
     // from the BVH root) sizes forward env photon emission. `envMap` is non-null for
@@ -752,6 +1029,10 @@ struct Scene {
     double sceneRadius = 0.0;
     Vec3 envXYZ{0, 0, 0};
     std::shared_ptr<EnvMap> envMap;   // image-based env (null => constant env)
+    // Number of EmitterShape::Sun emitters, recounted by finalizeEmitters(). Every
+    // sun-aware hot path (ray miss, background pass) tests this first so a scene
+    // without a sun pays one integer compare.
+    int sunCount = 0;
 
     // Environment radiance from direction `d` at wavelength lambda (0 if no env).
     // Constant env ignores `d`; an image env samples the lat-long map.
@@ -763,6 +1044,29 @@ struct Scene {
     Vec3 envXYZForDir(const Vec3& d) const {
         if (envIndex < 0) return Vec3{0, 0, 0};
         return envMap ? envMap->xyz(d) : envXYZ;
+    }
+    // Radiance of every distant sun whose disc contains direction `d` (0 when the ray
+    // escapes into empty sky). Added ONLY on a camera / specular arrival: at a diffuse
+    // or volume vertex the sun is covered by NEE (emitterGeom / neeVolume) and the
+    // continuation ray must not count it a second time — the same single-estimator split
+    // the Spot light already uses, which is why no MIS weight appears anywhere for a sun.
+    // (MIS'ing the two would be a pure variance win over a 6.8e-5 sr target, not a
+    // correctness fix; logged as a follow-up rather than done here.)
+    double sunRadiance(const Vec3& d, double lambda) const {
+        if (sunCount == 0) return 0.0;
+        double L = 0.0;
+        for (const auto& e : emitters)
+            if (e.shape == EmitterShape::Sun && e.inCone(d)) L += e.spdFn(lambda);
+        return L;
+    }
+    // Directly-viewed sun XYZ in direction `d`, for the forward tracers' background
+    // pass (which composites colour, not per-wavelength radiance).
+    Vec3 sunXYZForDir(const Vec3& d) const {
+        Vec3 s{0, 0, 0};
+        if (sunCount == 0) return s;
+        for (const auto& e : emitters)
+            if (e.shape == EmitterShape::Sun && e.inCone(d)) s += e.viewXYZ;
+        return s;
     }
     // Reciprocal of the sampled-wavelength pdf-weighted mean env radiance shape used
     // by the forward emission reweight (== the env emitter's spdFn).
@@ -819,6 +1123,43 @@ struct Scene {
         emitters.push_back(std::move(e));
     }
 
+    // Register a mesh area light over the triangles Scene::tris[triStart, triStart+
+    // triCount): the whole emissive triangle soup acts as one area light with a shared
+    // SPD. Builds a cumulative-area CDF from the triangles (skipping any degenerate
+    // zero-area ones) so samplePoint draws uniformly over the total surface; area = sum
+    // of triangle areas feeds the same power law (power = emitIntegral*area*PI) and the
+    // same 1/area point-sampling pdf as a quad. Call after the triangles are appended
+    // to Scene::tris. If every triangle is degenerate, registers nothing.
+    void addMeshLight(size_t triStart, size_t triCount, const Spectrum& spd,
+                      double stepNm, int matId = -1) {
+        Emitter e;
+        e.shape = EmitterShape::Mesh; e.matId = matId;
+        double total = 0.0;
+        size_t end = triStart + triCount;
+        if (end > tris.size()) end = tris.size();
+        for (size_t i = triStart; i < end; ++i) {
+            const Tri& t = tris[i];
+            Vec3 e1 = t.v1 - t.v0, e2 = t.v2 - t.v0;
+            Vec3 nc = cross(e1, e2);
+            double a = 0.5 * length(nc);
+            if (a <= 0.0) continue;               // skip degenerate triangles
+            total += a;
+            EmitTri et;
+            et.v0 = t.v0; et.e1 = e1; et.e2 = e2;
+            et.nrm = nc / (2.0 * a);              // == normalize(cross(e1,e2))
+            et.cumArea = total;
+            // Carry the source triangle's UVs as uv0 + edges, so a sampled point can
+            // report the same (u,v) the ray-hit path interpolates — required for an
+            // emission pattern to agree across NEE and emission-on-hit.
+            et.uv0 = t.uv0; et.uvE1 = t.uv1 - t.uv0; et.uvE2 = t.uv2 - t.uv0;
+            e.meshTris.push_back(et);
+        }
+        if (e.meshTris.empty() || total <= 0.0) return; // nothing emissive
+        e.area = total;
+        e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
+        emitters.push_back(std::move(e));
+    }
+
     // Map a hit surface's material index back to the emitter registered on that
     // geometry (or nullptr if none). Linear scan over the few emitters; used by the
     // BDPT s=0 MIS term when a camera subpath lands on a light surface directly.
@@ -841,6 +1182,37 @@ struct Scene {
         e.spotCosInner = cosInner; e.spotCosOuter = cosOuter;
         e.spotOmega = PI * (2.0 - cosInner - cosOuter);
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
+        emitters.push_back(std::move(e));
+    }
+
+    // Register a distant directional sun. `toSun` points FROM the scene TOWARD the sun
+    // (the natural authoring convention, matching sky::SunDisk::dir and the sky block's
+    // `sun_dir`); it is negated into `beamDir`, which everywhere else in the engine is
+    // the direction light TRAVELS. `halfAngle` is the angular radius of the solar
+    // disc in radians (the real sun is 0.00465 rad = 0.53 deg across). `irradiance`
+    // is the spectrum of the irradiance falling on a surface FACING the sun, in the
+    // same per-nm units every other emitter's `spd` uses.
+    //
+    // The stored `spdFn` is the sun's RADIANCE, irradiance/Omega, because every
+    // consumer (NEE, the direct view, the forward reweight) wants radiance. Dividing
+    // here rather than at each site is also what makes the light's brightness
+    // INDEPENDENT of `halfAngle`: widening the disc to soften shadows spreads the same
+    // irradiance over a larger cone instead of scaling the scene's exposure.
+    // geomWeight (envGeom = Omega*PI*R^2) depends on the scene bounds, so build()
+    // fills it in — exactly like the env light.
+    void addSunLight(const Vec3& toSun, double halfAngle, const Spectrum& irradiance,
+                     double stepNm) {
+        Emitter e;
+        e.shape = EmitterShape::Sun;
+        e.beamDir = normalize(toSun) * -1.0;
+        double ct = std::cos(halfAngle);
+        e.spotCosInner = e.spotCosOuter = ct;
+        e.spotOmega = PI * (2.0 - ct - ct);          // == 2*PI*(1-cos theta), the cone
+        const double invOmega = (e.spotOmega > 0.0) ? 1.0 / e.spotOmega : 0.0;
+        Spectrum rad = [irradiance, invOmega](double lambda) {
+            return irradiance(lambda) * invOmega;
+        };
+        e.spd.build(rad, stepNm); e.spdFn = rad; e.emitIntegral = e.spd.integral;
         emitters.push_back(std::move(e));
     }
 
@@ -891,6 +1263,17 @@ struct Scene {
     // wavelength sampler. Idempotent; called by build().
     void finalizeEmitters(double stepNm = 1.0) {
         totalPower = 0.0;
+        // Adopt each emitter's emission profile from the material on its geometry. Done
+        // here — one place, after every registration path — rather than threading an
+        // extra argument through addAreaLight / addMeshLight / the built-in scenes.
+        // NOT folded into `power` below: the pattern is a pure post-multiplier on
+        // radiance, so no selection or positional pdf anywhere has to change.
+        for (auto& e : emitters)
+            e.emitPat = (e.matId >= 0 && e.matId < (int)mats.size()) ? mats[e.matId].emitPat : -1;
+        // Recount the distant suns here (not in addSunLight) so the flag survives every
+        // path that rebuilds the emitter list, including applyIgnoreFlags' filtering.
+        sunCount = 0;
+        for (const auto& e : emitters) if (e.shape == EmitterShape::Sun) ++sunCount;
         emitterCdf.assign(emitters.size(), 0.0);
         for (size_t i = 0; i < emitters.size(); ++i) {
             // Area/sphere keep the exact emitIntegral*area*PI expression so those
@@ -898,7 +1281,8 @@ struct Scene {
             emitters[i].power =
                 (emitters[i].shape == EmitterShape::Spot)
                     ? emitters[i].emitIntegral * emitters[i].spotOmega
-                : (emitters[i].shape == EmitterShape::Env)
+                : (emitters[i].shape == EmitterShape::Env ||
+                   emitters[i].shape == EmitterShape::Sun)
                     ? emitters[i].emitIntegral * emitters[i].envGeom
                 : emitters[i].emitIntegral * emitters[i].area * PI;
             totalPower += emitters[i].power;
@@ -954,6 +1338,16 @@ struct Scene {
             sceneCenter = b.center();
             sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
         }
+        // Distant suns are sized by the same bounding sphere: a photon is born on a
+        // disc of radius R perpendicular to its (cone-sampled) travel direction, so the
+        // phase-space weight is the cone solid angle times that disc's area.
+        for (auto& e : emitters)
+            if (e.shape == EmitterShape::Sun) {
+                e.envGeom = e.spotOmega * PI * sceneRadius * sceneRadius;
+                e.viewXYZ = Vec3{0, 0, 0};
+                for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0)
+                    e.viewXYZ += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * e.spdFn(lam);
+            }
         if (envIndex >= 0) {
             emitters[envIndex].envGeom = 4.0 * PI * PI * sceneRadius * sceneRadius;
             // Directly-viewed background colour: integral of L_env(lambda)*CIE dlambda.
@@ -963,6 +1357,7 @@ struct Scene {
                           * emitters[envIndex].spdFn(lam);
         }
         finalizeEmitters();
+        finalizeEmissiveVolumes();
     }
     void finalizeTris() { build(); }   // kept for existing call sites
 
@@ -1046,7 +1441,38 @@ struct Scene {
         Vec3 wng = normalize(inst.toWorld.applyNormal(lh.ng));
         lh.ng = wng;
         lh.n  = (dot(r.d, wn) < 0.0) ? wn : -wn;
+        // Map the surface tangent through the instance transform too (C6 normal maps
+        // on instanced meshes). The tangent is a direction, so it uses applyDir (not
+        // applyNormal); handedness (bitangentSign) is preserved for proper transforms.
+        Vec3 wt = inst.toWorld.applyDir(lh.tangent);
+        double wtl = std::sqrt(dot(wt, wt));
+        if (wtl > 1e-12) lh.tangent = wt * (1.0 / wtl);
         if (inst.matOverride >= 0) lh.matId = inst.matOverride;
+    }
+
+    // Perturb the shading normal by a bound tangent-space normal map (C6). Builds a
+    // TBN frame from the (ray-oriented) shading normal and the hit's surface tangent,
+    // rotates the sampled tangent-space normal into world, and replaces h.n. A no-op
+    // unless the hit's material carries a valid normalTex. Applied at the single
+    // closestHit choke point so every CPU renderer (backward, forward, BDPT, VCM,
+    // SPPM, photon map, GRIN) sees the perturbed normal identically.
+    void applyNormalMap(Hit& h) const {
+        if (!h.valid || h.matId < 0 || h.matId >= (int)mats.size()) return;
+        const Material& m = mats[h.matId];
+        if (m.normalTex < 0 || m.normalTex >= (int)textures.size()) return;
+        const Texture& tx = textures[m.normalTex];
+        if (!tx.valid()) return;
+        Vec3 tn = tx.sampleNormalTS(h.u, h.v);          // tangent-space normal
+        Vec3 N = h.n;                                   // oriented against the ray
+        Vec3 T = h.tangent - N * dot(N, h.tangent);     // re-orthogonalize per-hit
+        double tl = std::sqrt(dot(T, T));
+        if (tl < 1e-9) return;                          // degenerate frame: leave n as-is
+        T = T * (1.0 / tl);
+        Vec3 B = cross(N, T) * h.bitangentSign;
+        double s = m.normalStrength;
+        Vec3 pert = T * (tn.x * s) + B * (tn.y * s) + N * tn.z;
+        double pl = std::sqrt(dot(pert, pert));
+        if (pl > 1e-12) h.n = pert * (1.0 / pl);
     }
 
     Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr) const {
@@ -1056,10 +1482,14 @@ struct Scene {
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
         const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
+        // Sampled tables, in case an implicit's field formula reads `grid:`/`scatter:`.
+        // Built once per ray, not per implicit hit: three pointer copies either way, and
+        // the lambda is called many times.
+        const PatTables tabs = patTables();
         bvh.traverseClosest(r, tmin, tMax, [&](int prim, double& tm) {
             if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
-            else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h)) tm = h.t; }
+            else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs)) tm = h.t; }
             else {
                 const MeshInstance& inst = instances[prim - nT - nS - nI];
                 Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
@@ -1070,6 +1500,7 @@ struct Scene {
                 }
             }
         }, stats);
+        applyNormalMap(h);
         return h;
     }
 
@@ -1085,11 +1516,12 @@ struct Scene {
         const size_t nI = implicits.size();
         const double seg = maxDist - tmin;
         const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
+        const PatTables tabs = patTables();      // see closestHit
         return bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
             if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
-            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h);
+            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs);
             const MeshInstance& inst = instances[prim - nT - nS - nI];
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             return blasList[inst.blasId].occludedLocal(lr, tmin, seg);  // world seg == local seg
@@ -1102,7 +1534,8 @@ struct Scene {
         const TriShear sh = makeTriShear(r.d);
         for (const auto& t : tris)     intersectTri(sh, r, t, tmin, h);
         for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
-        for (const auto& im : implicits) intersectImplicit(r, im, tmin, h);
+        const PatTables tabs = patTables();
+        for (const auto& im : implicits) intersectImplicit(r, im, tmin, h, &tabs);
         for (const auto& inst : instances) {
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             Hit lh; lh.t = h.t;
@@ -1111,13 +1544,56 @@ struct Scene {
                 h = lh;
             }
         }
+        applyNormalMap(h);
         return h;
     }
 };
 
+// PatOp::Tex sampler: the LINEAR grayscale value of one of the Scene's image
+// textures (Texture::scalarAt — the same sampler roughness / film-thickness maps
+// use, and the exact twin of the device's dTexScalarAt). Installed into a PatCtx by
+// bindPatTex so pattern.h itself never has to know what a Texture is.
+inline double scenePatTexSample(const void* self, int idx, double u, double v) {
+    const Scene& s = *static_cast<const Scene*>(self);
+    if (idx < 0 || idx >= (int)s.textures.size()) return 0.0;
+    return s.textures[idx].scalarAt(u, v);
+}
+inline void bindPatTex(PatCtx& c, const Scene& s) {
+    c.texFn = &scenePatTexSample;
+    c.texSelf = &s;
+}
+
+// PatOp::Grid / PatOp::Scatter tables. Unlike textures these need no callback: the
+// samplers live in pattern.h and read plain POD (headers + one flat float pool), which
+// is exactly the layout the GPU uploads, so host and device share one code path.
+//
+// Two shapes of the same three pointers, because there are two kinds of caller:
+//  - `Scene::patTables()` for code that only forwards the tables onward — the field /
+//    isosurface / medium evaluators, which take a `const PatTables*` and build their
+//    PatCtx internally.
+//  - `bindPatData(c, scene)` for code holding a PatCtx it built itself.
+inline void bindPatData(PatCtx& c, const Scene& s) {
+    PatTables t = s.patTables();
+    patBindTables(c, &t);
+}
+
+// Publish every scene-owned pattern table into a context. Call this (not the
+// individual binders) wherever a PatCtx is built by hand, so a newly added table
+// can't be silently missed at one site.
+inline void bindPatScene(PatCtx& c, const Scene& s) {
+    bindPatTex(c, s);
+    bindPatData(c, s);
+}
+
 // Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
-// implicit field value f (0 on non-implicit surfaces), oriented normal, and radius.
-inline PatCtx patCtxFromHit(const Hit& h) { return makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v); }
+// implicit field value f (0 on non-implicit surfaces), oriented normal, radius, and
+// the scene's pattern tables (so `tex:<name>(u,v)` and `grid:<name>(…)` sampling
+// inside a pattern work).
+inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
+    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v);
+    bindPatScene(c, scene);
+    return c;
+}
 
 // Reflect-slot reflectance from a bound parametric record, if the material has a
 // REC_SLOT_REFLECT binding. Returns true and sets `out` (constant-stop selector, or
@@ -1135,45 +1611,110 @@ inline bool recordReflectBound(const Scene& scene, const Material& m,
         out = ch.stops[rb->selStop].color(lambda);            // constant stop selector
     } else {
         double d = patternEval(rb->driver.data(), (int)rb->driver.size(),
-                               patCtxFromHit(h));
+                               patCtxFromHit(scene, h));
         out = recReflectanceAt(rec, ch, d, lambda);
     }
     return true;
 }
 
+// Per-hit multiplier from a scalar pattern bound to a SPECTRAL slot (`reflectPat` /
+// `transmitPat`), clamped to [0,1] so a runaway formula can never manufacture energy.
+// 1.0 when unbound, which is why the slot accessors can apply it unconditionally.
+inline double slotPatMul(const Scene& scene, int pat, const Hit& h) {
+    if (pat < 0 || pat >= (int)scene.patterns.size()) return 1.0;
+    double p = scene.patterns[pat].eval(patCtxFromHit(scene, h));
+    return p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);
+}
+
+inline double reflectPatMul(const Scene& scene, const Material& m, const Hit& h) {
+    return slotPatMul(scene, m.reflectPat, h);
+}
+
 // Reflect-slot reflectance for the SPECULAR families (Mirror / Glossy / Grating /
 // HalfMirror) whose tint reads the reflect slot directly: a bound record if present,
-// else the constant `reflect` spectrum. (These types never bind a reflect texture,
-// so — unlike diffuseReflectance — there is no texture path.)
+// else the constant `reflect` spectrum — either way scaled by a bound reflect pattern.
+// (These types never bind a reflect texture, so — unlike diffuseReflectance — there is
+// no texture path.)
 inline double reflectSlot(const Scene& scene, const Material& m,
                           const Hit& h, double lambda) {
     double v;
-    if (recordReflectBound(scene, m, h, lambda, v)) return v;
-    return m.reflect(lambda);
+    if (!recordReflectBound(scene, m, h, lambda, v)) v = m.reflect(lambda);
+    return m.reflectPat < 0 ? v : v * reflectPatMul(scene, m, h);
 }
 
 // Diffuse albedo at a hit: a bound parametric record (highest priority), else the
 // material's spatially-varying texture reflectance if one is bound (Phase 3b), else
-// its constant `reflect` spectrum. Shared by the forward tracer and the backward
-// reference so both see identical albedo.
+// its constant `reflect` spectrum — and then scaled by a bound reflect pattern, which
+// is what makes `reflect [0 1](u)` a greyscale ramp (its base spectrum is a flat 1.0).
+// Shared by the forward tracer and the backward reference so both see identical albedo.
 inline double diffuseReflectance(const Scene& scene, const Material& m,
                                  const Hit& h, double lambda) {
     double rv;
-    if (recordReflectBound(scene, m, h, lambda, rv)) return rv;
-    if (m.reflectTex >= 0 && m.reflectTex < (int)scene.textures.size()) {
-        const Texture& tx = scene.textures[m.reflectTex];
-        if (m.triplanarScale > 0.0)
-            return tx.reflectanceTriplanar(h.p, h.ng, m.triplanarScale, lambda);
-        return tx.reflectanceAt(h.u, h.v, lambda);
+    if (!recordReflectBound(scene, m, h, lambda, rv)) {
+        if (m.reflectTex >= 0 && m.reflectTex < (int)scene.textures.size()) {
+            const Texture& tx = scene.textures[m.reflectTex];
+            rv = (m.triplanarScale > 0.0)
+                     ? tx.reflectanceTriplanar(h.p, h.ng, m.triplanarScale, lambda)
+                     : tx.reflectanceAt(h.u, h.v, lambda);
+        } else {
+            rv = m.reflect(lambda);
+        }
     }
-    return m.reflect(lambda);
+    return m.reflectPat < 0 ? rv : rv * reflectPatMul(scene, m, h);
+}
+
+// Transmit-slot value at a hit — the single point of truth for BOTH readings of the
+// slot: a Filter's per-wavelength gel transmittance T(lambda), and a DiffuseTransmit's
+// back-hemisphere Lambertian albedo rhoT. The constant `transmit` spectrum scaled by a
+// bound transmit pattern (there is no record channel and no texture on this slot, so
+// unlike diffuseReflectance there is only the one base path). Callers still clamp01 and,
+// for the two-lobe case, still apply the rhoR+rhoT <= 1 energy guard afterwards.
+inline double transmitSlot(const Scene& scene, const Material& m,
+                           const Hit& h, double lambda) {
+    double v = m.transmit(lambda);
+    return m.transmitPat < 0 ? v : v * slotPatMul(scene, m.transmitPat, h);
+}
+
+// Emitted radiance at a hit ON an emissive surface, i.e. emission-on-hit: the material's
+// `emit` SPD scaled by a bound emission pattern. The single point of truth for that half
+// of the emission slot; the other half — Le at a point the emitter SAMPLER drew — goes
+// through emitterSamplePoint() below, and the two are constructed to agree pointwise
+// because MIS combines them (see Material::emitPat).
+inline double emitSlot(const Scene& scene, const Material& m,
+                       const Hit& h, double lambda) {
+    double v = m.emit(lambda);
+    return m.emitPat < 0 ? v : v * slotPatMul(scene, m.emitPat, h);
+}
+
+// The emission-pattern multiplier at a point on `em`, given the point's own texture
+// coordinates. Clamped to [0,1] like the reflect/transmit slot patterns, so a runaway
+// formula can never manufacture light.
+inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
+                              const Vec3& y, const Vec3& nOut, double uu, double vv) {
+    if (em.emitPat < 0 || em.emitPat >= (int)scene.patterns.size()) return 1.0;
+    PatCtx c = makePatCtx(y, 0.0, nOut, uu, vv);
+    bindPatScene(c, scene);
+    double p = scene.patterns[em.emitPat].eval(c);
+    return p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);
+}
+
+// Draw a point on `em` and return the emission-pattern multiplier there, so a caller can
+// write `Le = em.spdFn(lambda) * invPdfLambda * pmul`. 1.0 whenever no pattern is bound,
+// which is every scene that does not use the feature — those keep bit-identical draws
+// (samplePoint's uv outputs are the only extra work and they do not touch the RNG).
+inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
+                                 double u1, double u2, Vec3& y, Vec3& nOut) {
+    if (em.emitPat < 0) { em.samplePoint(u1, u2, y, nOut); return 1.0; }
+    double uu = 0.0, vv = 0.0;
+    em.samplePoint(u1, u2, y, nOut, &uu, &vv);
+    return emitterPatMulAt(scene, em, y, nOut, uu, vv);
 }
 
 // Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern
 // value, or `dflt` if `pat` is out of range.
 inline double patternScalarAt(const Scene& scene, int pat, const Hit& h, double dflt) {
     if (pat >= 0 && pat < (int)scene.patterns.size())
-        return scene.patterns[pat].eval(patCtxFromHit(h));
+        return scene.patterns[pat].eval(patCtxFromHit(scene, h));
     return dflt;
 }
 
@@ -1183,7 +1724,7 @@ inline double patternScalarAt(const Scene& scene, int pat, const Hit& h, double 
 // SAME roughness at a hit — otherwise the density and the sample diverge.
 inline double materialRoughness(const Scene& scene, const Material& m, const Hit& h) {
     if (const RecBinding* rb = m.recBindingFor(REC_SLOT_ROUGHNESS)) {
-        PatCtx c = patCtxFromHit(h);
+        PatCtx c = patCtxFromHit(scene, h);
         double r = 0.0;
         if (rb->recordIndex < 0) {
             // direct scalar expression, e.g. `roughness = sin(v*3.14159)`
@@ -1202,7 +1743,7 @@ inline double materialRoughness(const Scene& scene, const Material& m, const Hit
         return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
     }
     if (m.roughnessPat >= 0 && m.roughnessPat < (int)scene.patterns.size()) {
-        double r = scene.patterns[m.roughnessPat].eval(patCtxFromHit(h));
+        double r = scene.patterns[m.roughnessPat].eval(patCtxFromHit(scene, h));
         return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
     }
     if (m.roughnessTex >= 0 && m.roughnessTex < (int)scene.textures.size())
@@ -1216,7 +1757,7 @@ inline double materialRoughness(const Scene& scene, const Material& m, const Hit
 // hit, else the constant thickness. Spatially varies §3.2 iridescence.
 inline double materialFilmThickness(const Scene& scene, const Material& m, const Hit& h) {
     if (m.filmThicknessPat >= 0 && m.filmThicknessPat < (int)scene.patterns.size())
-        return scene.patterns[m.filmThicknessPat].eval(patCtxFromHit(h)) * m.filmThickness;
+        return scene.patterns[m.filmThicknessPat].eval(patCtxFromHit(scene, h)) * m.filmThickness;
     if (m.filmThicknessTex >= 0 && m.filmThicknessTex < (int)scene.textures.size())
         return scene.textures[m.filmThicknessTex].scalarAt(h.u, h.v) * m.filmThickness;
     return m.filmThickness;
@@ -1234,7 +1775,7 @@ inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, 
         (m.mixWeightPat >= 0 || m.mixWeightTex >= 0)) {
         double t;
         if (m.mixWeightPat >= 0 && m.mixWeightPat < (int)scene.patterns.size())
-            t = scene.patterns[m.mixWeightPat].eval(patCtxFromHit(h));
+            t = scene.patterns[m.mixWeightPat].eval(patCtxFromHit(scene, h));
         else
             t = scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
         if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;

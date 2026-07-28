@@ -14,12 +14,14 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
 
 - **Spectral transport** — continuous per-photon wavelengths over a configurable band
   (e.g. `spectral 360 830 1`); per-wavelength refraction gives dispersion and
-  chromatic aberration with no extra code. On the **CPU** the tracers use
+  chromatic aberration with no extra code. On the **CPU** tracers (`A/B/C`, `R`, `M/S`,
+  BDPT `D` and VCM `U`) *and* the **GPU
+  megakernel** (forward `A/B/C` + `M`, the backward reference `R`, and BDPT `D`) they use
   **hero-wavelength sampling** (4 stratified λ share one BVH walk, cutting colour
   noise ~0.77×), collapsing to a **single continuous λ** the moment dispersion
   matters — so dispersive **caustics** (light focused through a prism, a lens, or a
   glass of water) still split into true spectral colour instead of smearing an
-  averaged RGB, for more physically realistic focusing. (`kHeroC=1` reverts to one
+  averaged RGB, for more physically realistic focusing. (`-heroc 1` reverts to one
   λ per photon, bit-identically.)
 - **Forward *and* backward** engines that validate each other (mode `V` reports
   the residual between them).
@@ -35,11 +37,21 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
   Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous
   **density fields** — either formula-defined blobs with soft edges *or* imported
-  **`.nvdb` (NanoVDB) volumes** (`density vdb:<file>`) — via unbiased delta/ratio
+  **OpenVDB `.vdb` / NanoVDB `.nvdb` volumes** (`density vdb:<file>`, read by a
+  built-in reader that dispatches on the file magic) — via unbiased delta/ratio
   tracking on the forward modes (CPU and GPU) **and the backward reference (mode
   `R`) on both CPU and GPU** (GPU backward runs homogeneous *and* heterogeneous
   media natively, including spectral **rainbow-phase** media, and **gradient-index
   (GRIN) media** on the backward reference now run on GPU too).
+- **Volumetric blackbody emission ("fire")** — a medium with a `temperature vdb:`
+  grid + `emission blackbody` turns its hot voxels into a self-illuminating,
+  isotropic **volume emitter**: the flame glows (Planckian, temperature-hue-shifted)
+  and lights the rest of the scene with **no external light**. Multi-grid `.vdb`
+  files (the official OpenVDB *fire* sample's `density` + `temperature` grids) are
+  selected **by grid name**; `emission_kelvin`/`emission_scale` tune the colour
+  temperature and glow. Runs on both the **CPU and GPU** forward tracers (modes
+  A/B/C, V/P forward layers); the per-photon wavelength is importance-sampled from a
+  Planck blackbody so the flame colour converges cleanly.
 - **Gradient-index (GRIN) media** — a bounded region carrying an `ior "n(x,y,z)"`
   field bends rays continuously along the Eikonal ray equation (mirages, gradient
   lenses, hot-air shimmer) via a shared symplectic marcher. Works on the forward
@@ -147,6 +159,19 @@ unrecognized `-flag` (e.g. a typo) is a hard error — ftrace prints
 default demo render. Likewise a bare positional argument that looks like a file
 but isn't a recognized scene or mesh (e.g. `ftrace foo.xyz`) is a hard error, not
 a silent fall-through to the demo scene.
+
+The scene file gets the same treatment, one step softer. The loader tracks which
+properties a builder actually read, and reports the ones nobody looked at:
+
+```
+[ftsl] warning: myscene.ftsl: sphere: unknown key 'priority' on line 42
+```
+
+That's a warning rather than an error, so an older scene carrying a stale property
+still renders — but it's worth fixing, because an unread property does *nothing*. A
+typo, a property written on the wrong block (`priority` is a **material** slot, not a
+geometry one), or a scene generator that has drifted from the grammar would otherwise
+quietly produce a **wrong image** instead of a complaint. See FTSL.md §1.3.
 
 > **Quick mesh viewer.** A bare positional **mesh** path — `ftrace model.glb`
 > (also `.obj` / `.gltf` / `.fbx` / `.stl` / `.ply`) — wraps the mesh in a
@@ -582,7 +607,22 @@ that converges to the same physical image.
   **without re-tracing a single photon** (the expensive forward pass is skipped entirely).
   A scene-identity guard rejects a stale map built for a different scene, falling back to
   a fresh deposit. (Matches the forward splat modes `A`/`B`/`C` — same forward physics,
-  just measured from a stored map.)
+  just measured from a stored map.) The gather radius is **density-adaptive by default**:
+  after the deposit ftrace measures how many photons a typical gather actually sees, then
+  re-bins the grid at the radius that hits a target population — a target that grows only as
+  the *cube root* of the stored photon count. Without this the radius came from the scene
+  size alone, so photons-per-cell (and gather time) grew linearly with `-n`, and a high-`-n`
+  render could look stalled when it was only grinding through a huge map. Measured on a
+  Cornell-style test scene, cost per emitted photon used to **rise** with `-n`
+  (54.9 → 67.3 µs/M going from 500k to 4M) and now **falls** (27.0 → 9.0 µs/M) — a 7.5×
+  wall-clock win at `-n 4000000` (269 s → 36 s). Quality improves too, because the same wall clock now buys
+  far more photons: scored against a converged BDPT reference at **matched render time**,
+  RMSE drops ~20–24% overall and ~32–41% on flat wall areas where noise dominates. Controls:
+  `-pmcount <k>` sets the target population at 1 M stored photons (default `200`, calibrated
+  so ordinary renders keep the look they already had — raise for smoother/blurrier, lower
+  for sharper/grainier); `-nopmauto` restores the old fixed-radius behaviour exactly
+  (bit-identical), as does passing an explicit `-pmradius`. `-savemap`/`-loadmap` (currently
+  honoured only on `-device gpu`) still lets the deposit be paid just once.
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the
@@ -804,11 +844,11 @@ Declared with `material "name" { type <type> … }`.
 | Type | Description | Key parameters |
 |---|---|---|
 | `diffuse` | Lambertian reflector | `reflect` (spectrum or `texture:<name>`) |
-| `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). Both lobes and the back-hemisphere connections run **on the GPU in mode D** (BDPT, M9). Alias `diffuse_transmit` | `reflect` (spectrum or `texture:<name>`), `transmit` (spectrum); the two are energy-clamped so `reflect+transmit ≤ 1` |
+| `translucent` | Two-sided Lambertian (**diffuse transmission** / thin-subsurface look) — light diffuses THROUGH the surface, so a backlit sheet glows softly. Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; non-specular, so it connects/renders in every mode (A/B/C/R/V/D/P). Both lobes and the back-hemisphere connections run **on the GPU in mode D** (BDPT, M9). Alias `diffuse_transmit` | `reflect` (spectrum, `texture:<name>` or `pattern:`/`reflect_map`), `transmit` (spectrum or `pattern:`/`transmit_map`); the two are energy-clamped so `reflect+transmit ≤ 1` |
 | `dielectric` | Refractive glass with dispersion, optional **frosting**, **colored-glass tint** and **nested-dielectric priority** | `ior` (Sellmeier glass or constant); `roughness` (constant or `pattern:`/`texture:` map) frosts the reflected & transmitted lobes; `absorb` (spectrum, σₐ per metre) tints via Beer–Lambert interior absorption; `priority <N>` (integer) disambiguates overlapping dielectrics — see below |
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
-| `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`) |
+| `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`; also `pattern:<name>` / `transmit_map` for a transmittance that varies across the gel) |
 | `glossy` | Rough microfacet reflector | `reflect`, `roughness` (constant or `texture:<name>` map) |
 | `thinfilm` | Single-layer interference (iridescence) | `ior`, `film_ior`, `film_thickness` (nm), `film_thickness_map texture:<name>`, `substrate_k` |
 | `multilayer` | N-layer Abelès transfer-matrix stack | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>` |
@@ -896,6 +936,35 @@ sphere { center 0 0 0  radius 1  material grad(u) }                   # sweep al
 sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled by noise
 ```
 
+**Inline colour channels.** A colour channel doesn't have to name pre-declared spectra:
+tag the channel with any colour head — `rgb`, `hsv`, `hsl`, or any upsampler/emission
+variant (`rgbmeng`, `rgbsmits`, `hsvillum`, `hslline`, …) — and write the triples inline.
+The tag fixes arity 3, so each group is one stop, and the components go through exactly
+the same evaluator as a top-level `spectrum "x" = rgb …` declaration:
+
+```
+palette = range 0-1 [
+    reflect  rgb 0.9 0.1 0.1, 0.1 0.9 0.1, 0.1 0.1 0.9   # red -> green -> blue
+    tint     rgbmeng 0.15 0.65 0.85                       # a lone stop needs no comma
+]
+```
+
+**Stop delimiters** form a **precedence ladder**: whitespace binds tightest (like `×`),
+comma looser (like `+`), and `[ ]` are the parentheses. Structure comes from the
+delimiters alone — a channel's arity only validates — so these are all the same channel:
+
+```
+reflect  rgb 0.9 0.1 0.1, 0.1 0.9 0.1        # comma-separated triples
+reflect  rgb [0.9 0.1 0.1] [0.1 0.9 0.1]     # bracketed groups
+reflect  rgb [0.9 0.1 0.1, 0.1 0.9 0.1]      # one bracketed comma list
+```
+
+Parens `( )` are *not* a rung — they're reserved for expressions, so a parenthesised run
+is opaque and `0  clamp(u,0,1)  1` stays three stops. A channel line using none of
+`,` `[` `]` and no colour tag reads exactly as it always did, so the ladder is a strict
+addition: no existing scene reparses differently. Position pins are the orthogonal
+`p:<pos>` prefix and work in either spelling.
+
 Bind a record to geometry with the inline `material NAME(driver)` form, where `driver`
 is any pattern expression evaluated per hit (`x y z nx ny nz r u v f`, `noise(…)`, …).
 A record driving the **reflect/albedo** *or* **roughness** slot runs on the **GPU**
@@ -903,6 +972,41 @@ forward, backward, **and BDPT (`D`)** tracers (the LUT/stop programs + driver up
 the device and are sampled by device twins of the CPU sampler; mode `D`'s connection BSDF
 reconstructs the per-hit point to sample the driver). Fallback is automatic. See FTSL.md
 §7.5 for the full grammar.
+
+**Materials are parameterized bundles.** A material property is an expression over
+*named inputs*, so a material is itself a function whose free-input set is the union of
+its properties' free inputs. Applying it at a use site binds those inputs across the
+whole bundle at once:
+
+```
+pattern "rough_ua" { expr "0.5*a*(0.2+0.8*u)" }        # free inputs: a, u
+material "gold" { type glossy  reflect spectrum:gold
+                  roughness pattern:rough_ua  albedo_default 0.5 }
+
+sphere { center 0 0 0  radius 1  material gold(u=v,a=1) }  # bind u<-v, a<-1
+sphere { center 2 0 0  radius 1  material gold(u=v a=1) }  # identical — same ladder
+sphere { center 4 0 0  radius 1  material gold(u=v) }      # partial: a -> albedo_default
+sphere { center 6 0 0  radius 1  material gold(0.5,a=1) }  # positional binds the last free input
+```
+
+Bindable inputs are the surface intrinsics `x y z nx ny nz r u v f` plus **`a`** —
+albedo, the one input with no per-hit intrinsic, resolved at load time either to what a
+use site binds or to the material's `albedo_default` (default `1.0`). Binding is pure
+substitution into the postfix program, so an applied material is an *ordinary* material:
+no environment, no runtime indirection, and a material nobody applies is bit-identical
+to before. `ftrace -checkbind` pins the algebra (splice == inlining, simultaneity,
+identity). See FTSL.md §7.6.
+
+You can also read **one property** off an already-declared material and use it as a value
+elsewhere — `reflect src.reflect`, `reflect src.reflect(u=v)`, `roughness other.roughness`.
+The handle is the **slot keyword**, since FTSL properties are written with the slot keyword
+and never carry a quoted name. The argument list is the same one above, so an unbound `a`
+resolves against the **source** material's `albedo_default` — the property carries the
+source's notion of albedo with it. A reference carries both the base spectrum *and* the
+slot's per-hit pattern, and composes (multiplies) with the reader's own `<slot>_map` rather
+than clobbering it; a record-driven, texture-bound, or un-appliable pattern slot is refused
+rather than approximated. `ftrace -checkprop` pins it against hand-written twins. See
+FTSL.md §7.7.
 
 ---
 
@@ -953,6 +1057,32 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   broadband source, not a monochromatic spike, so it reads as a natural coloured light
   rather than a laser line. Meant for **lights** (`spd rgbillum 1 0.6 0.2`); accepted
   anywhere a spectrum is.
+- **`rgbsmits r g b`** (also `hsvsmits …`, `hslsmits …`) — the classic **Smits 1999**
+  RGB→reflectance upsampler: the colour is decomposed additively over seven tabulated
+  basis reflectances (white / C M Y / R G B) sampled at 10 wavelengths. A **selectable,
+  lower-fidelity alternative** to the default `rgb` (Jakob–Hanika) fit — cheaper and
+  historically standard, but rounds sRGB back to within only ~0.07 (vs `rgb`'s <0.001).
+  Produces a valid `[0,1]` reflectance, so it's a *material* upsampler like `rgb`; offered
+  for comparison / when a scene wants the Smits basis specifically.
+- **`rgbbox r g b`** (also `hsvbox …`, `hslbox …`) — the simplest RGB→reflectance
+  upsampler: a **calibrated 3-box** spectrum, one flat step per band (blue 400–500,
+  green 500–600, red 600–700 nm) whose three heights are solved from a fixed 3×3 matrix
+  so the reflectance integrates back to the requested linear-sRGB colour *exactly*
+  (round-trips to <0.02 — the tightest of the reflectance upsamplers). Cheap and analytic
+  but blocky (hard band edges, no smoothness), so it's the baseline against which `rgb`
+  (Jakob–Hanika) and `rgbsmits` trade fidelity for smoothness. A valid `[0,1]`-clamped
+  *material* reflectance like the others.
+- **`rgbmeng r g b`** (also `hsvmeng …`, `hslmeng …`) — the **Meng 2015** upsampler: of
+  all physical reflectances that produce the requested colour, take the **smoothest** one
+  (the minimum of `Σ(s[i+1]−s[i])²`), read from a baked table over the sRGB chromaticity
+  triangle. This is the **highest-fidelity** of the four: it round-trips sRGB to <0.0001
+  *and* is provably smoother than the `rgb` (Jakob–Hanika) fit for the same colour, since
+  smoothness is exactly what it minimises. That matters whenever a reflectance is seen
+  under a strongly **non-D65** light or **dispersed** — all four upsamplers agree under
+  D65 by construction, but only the reconstructed *shape* decides the colour under a
+  tungsten or sodium source, and a smooth shape is what real pigments have. Slightly more
+  memory than the analytic fits (a ~140 KB table) and a table lookup instead of a solve.
+  A valid `[0,1]`-clamped *material* reflectance like the others.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum. Interpolated
   **piecewise-linear** by default; add an **`interp=cubic`** flag among the entries
   (`table { interp=cubic  400:0.05 … }`) for a **monotone cubic (PCHIP)** curve —
@@ -1025,23 +1155,68 @@ second:**
   ones (PBRT-v4, Mitsuba 3) reach it with *less* noise by carrying four wavelengths
   per path. **We claim no edge on this axis** — and ftrace now closes the noise gap on
   the **CPU** tracers — the **backward reference tracer (`-mode R`)**, the
-  **forward light tracers (`-mode A/B/C`)**, and the **photon-mapping modes (`-mode M/S`)** —
-  plus the **GPU forward megakernel** (modes `A/B/C` and the `M` photon-map deposit)
+  **forward light tracers (`-mode A/B/C`)**, the **photon-mapping modes (`-mode M/S`)** and
+  **BDPT (`-mode D`)** — plus the **GPU megakernel** (forward modes `A/B/C`, the `M`
+  photon-map deposit, the backward reference `R`, and BDPT `D`)
   all use hero-wavelength sampling (a hero λ plus 3 stratified secondaries riding one
   shared BVH walk, secondaries de-hero'd at the first dispersive interface — Wilkie et
   al. 2014 / PBRT-v4 `TerminateSecondary`), so they reach a given colour-noise level in
   fewer samples (measured ~0.77× chroma-noise RMS at equal photons in the light tracers,
-  ~0.87× in the photon map, luma unchanged) while dispersion stays bit-for-bit intact.
+  ~0.87× in the photon map, ~0.77× in GPU mode `R`, ~0.80× in BDPT on a glass-sphere
+  Cornell box — which de-heros at the glass — and as low as **0.38–0.49× chroma with
+  0.55–0.63× luma** on saturated coloured interiors where the bundle rides the whole
+  path) while dispersion stays bit-for-bit intact.
   For photon mapping each traced path deposits all its live wavelengths as per-λ photon
-  records, so total stored energy is unchanged. Hero collapses to a single continuous
+  records, so total stored energy is unchanged. In BDPT *both* subpaths carry the same
+  bundle and every connection is evaluated per-λ with a single shared MIS weight (all the
+  pdfs are hero-driven); glossy vertices are connectible there, so — unlike the
+  unidirectional tracers — mode `D` keeps the bundle alive across glossy bounces, and it
+  likewise rides straight through **mirrors** and **gel filters**, whose outgoing direction
+  doesn't depend on λ either (worth **0.47× chroma / 0.57× luma** noise on a
+  mirror-and-Wratten-gel box, where de-heroing at the first mirror had left hero buying
+  almost nothing). Mode `D`
+  is hero-capable on **both** backends, and the CPU and GPU BDPT agree to 0.03%.
+  The **backward tracer (`-mode R`)** and the **forward tracers (`A/B/C`, and the `M`/`S`
+  photon deposit)** do the same on both backends: mirrors, gel filters and glossy lobes
+  keep the bundle, and — more importantly — every Russian
+  roulette along the path survives on the *strongest* live wavelength rather than on the
+  hero's own, so no wavelength is ever amplified by a `ρ(λᵢ)/ρ(λ_hero)` ratio. On
+  saturated (strongly coloured) diffuse interiors that ratio used to cancel the whole
+  benefit; mode `R` there went from "hero buys nothing in luma" to **0.42–0.52× noise
+  RMS on luma *and* chroma** — a 4× variance cut for 1.35× the time, i.e. ~2.9× faster
+  to a given noise level. The forward tracers gain less, because they share only the
+  main path's BVH walk while the per-λ camera splat / photon deposit costs a full 4×:
+  ~1.1× luma and 1.3–1.8× chroma at equal GPU time (1.3× / 2.1× on CPU). Before the
+  fix hero was a net *loss* in both — up to 2.8× the luma noise of plain single-λ on a
+  glossy/translucent interior.
+  Hero collapses to a single continuous
   wavelength the instant dispersion matters, so it *keeps* the forward photon map's true
-  caustic splitting (below) rather than trading it away. Still single-λ **by design or
-  pending work**: the **GPU wavefront** backend (hero forces the megakernel), the **GPU
-  backward / BDPT megakernels**, **BDPT (`-mode D`)**, and **VCM/UPS (`-mode U`)** — these
-  carry one λ per photon for now (hero for U is planned; see `known-issues.md`). The bundle
-  size is runtime-configurable with **`-heroc N`** (default 4, range 1–8); `-heroc 1` turns
-  hero off, reducing every hero tracer (CPU and the GPU forward megakernel) bit-identically
-  to the classic single-λ estimator.
+  caustic splitting (below) rather than trading it away. **VCM/UPS (`-mode U`)** carries the
+  bundle too, on **CPU *and* GPU**: both subpaths of a path index are drawn from one bundle, so its
+  vertex *connections* are exact per-λ like BDPT's, while its vertex *merges* — the one
+  strategy that crosses paths — key off each stored light vertex's own wavelengths. Measured
+  on a Wratten-58 gel + mirror box, **0.51× noise RMS** at equal passes, agreeing with the
+  single-λ estimator to 0.02 %; on the GPU it is **0.72–0.82× chroma noise** for 1.5–1.7× the
+  time across four stress scenes, and the two backends agree to 0.03 %. Still single-λ **by
+  design or pending work**: the **GPU wavefront** backend (`-wavefront` — hero forces the
+  megakernel). Scenes with
+  participating media, a GRIN volume, or a finite-lens camera also stay single-λ everywhere.
+  The bundle size is runtime-configurable with **`-heroc N`** (default 4, range 1–8);
+  `-heroc 1` turns hero off, reducing every hero tracer (CPU and the GPU megakernel)
+  bit-identically to the classic single-λ estimator.
+  **`-herosplit`** changes the dispersive-event policy from terminate-secondaries to
+  **split**: all `N` wavelengths carry on, each refracting along its *own* per-λ
+  direction, so one bundle fans out into `N` monochromatic sub-paths through the glass.
+  Both policies are unbiased and converge to the same image; splitting resolves the
+  chromatic spread of a prism / rainbow / dispersive caustic *geometrically* instead of
+  stochastically over many photons. On a dispersive `glass:SF10` flint-sphere Cornell box
+  that is worth **0.70× the chroma noise and 0.89× the luma noise inside the caustic** (and
+  0.80× / 0.92× over the whole frame) **at equal wall clock** — the extra traversal past
+  the split is linear, not exponential (once monochromatic a sub-path never re-splits) and
+  is paid only by the photons that actually reach the glass, so it costs just **1.11×** per
+  photon there. It stays opt-in because that ratio is scene-dependent: a scene that is
+  mostly glass pays much more of it. CPU forward modes `A`/`B`/`C` and the `M`/`S` photon
+  deposit today; the backward tracer and the GPU can adopt the same flag later.
 - **Dispersion — colours actually splitting** through a prism / lens / water. Only
   the single-λ (ours) and hero-wavelength (PBRT-v4, Mitsuba 3) schemes get this right;
   co-sampled spectral (PBRT-v3, Mitsuba 0.x) and every RGB pipeline cannot.
@@ -1051,7 +1226,7 @@ see sources below):
 
 | Renderer (engine) | Default colour | Spectral mode | Per-path/photon carrier |
 |---|---|---|---|
-| **ftrace (this — forward photon)** | spectral | always | **hero wavelength, 4 λ/photon (CPU A/B/C, R & photon-map M/S); 1 λ on GPU / BDPT / VCM (U)** — true dispersive caustics either way |
+| **ftrace (this — forward photon)** | spectral | always | **hero wavelength, 4 λ/photon (CPU A/B/C, R, photon-map M/S, BDPT D & VCM U; GPU megakernel A/B/C, M, R, BDPT D & VCM U); 1 λ on the GPU wavefront only** — true dispersive caustics either way |
 | PBRT-v3 (SPPM photon map) | RGB | compile-time (`SampledSpectrum`, ~30 bins @ 10 nm) | **co-sampled: all bins on one photon** — no split |
 | Mitsuba 0.x (`ptracer`/`ppm`/`sppm`) | RGB | compile-time (`SPECTRUM_SAMPLES`, e.g. 15–30) | **co-sampled: all bins per sample** — no split |
 | PBRT-v4 | spectral | always | hero wavelength, 4 λ/path (default, recompilable) |
@@ -1107,7 +1282,63 @@ per-path carrier is left unqualified here.
 | `cylinder` | Cylindrical tube light | `center`, `axis`, `length`, `radius`, `caps`, `spd` |
 | `spot` | Cone spotlight with penumbra | `origin`, `dir`, `inner_angle`, `outer_angle`, `spd` |
 | `collimated` | Parallel beam (3 cm pencil, ×enclosing group scale), centered on `origin` | `origin`, `dir`, `spd` |
-| `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity` |
+| `sun` | Distant directional sun (parallel beam over the whole scene, soft-edged disc) | `elevation` + `azimuth` (or `dir`), `angle`, `spd`, `intensity` |
+| `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity`, **or `sky`** (analytic sky, below) |
+
+**Distant sun.** `light sun { … }` is a first-class **directional** emitter: an
+infinitely-distant disc of angular diameter `angle` (degrees; default `0.53`, the real
+sun) whose rays arrive parallel. Aim it with `elevation <deg>` + `azimuth <deg>`
+(azimuth from +x toward +z, the same convention as the sky block) or a raw
+`dir <x y z>` pointing *toward* the sun.
+
+Its `spd` is the **perpendicular spectral irradiance** — the light falling on a surface
+that faces the sun — so a grey Lambertian floor reads exactly `ρ/π · E⊥ · cos θ`, and
+widening `angle` softens the shadow penumbra **without changing the exposure**
+(verified: 0.53° → 8° shifts the lit-floor level by 0.02%). Because a distant light's
+total flux depends on the scene's cross-section rather than the light, absolute
+`power` / `lumens` is refused here; scale with `intensity <s>` instead.
+
+Unlike every other light, the sun costs nothing in forward modes: photons are born on a
+disc the size of the scene's own cross-section, aimed down the beam, so **every** photon
+enters the scene instead of most missing it. Backward modes next-event-estimate it
+inside its cone, and the disc itself is directly viewable (aim a camera at it). Runs on
+both CPU and GPU in modes A/B/C/R/P/M/S (mode `D`/`U` refuse it, like `spot` and `env`).
+See `scenes/_sun_check.ftsl`, and `ftrace -checksun` for the deterministic self-test
+(cone solid angle, exposure invariance, uniform-in-solid-angle cone sampling, and
+NEE/direct-view rim agreement).
+
+**Analytic physical sky.** An `env` light can synthesise a **Preetham daylight sky**
+instead of loading an HDRI — write `sky preetham` (or just supply `turbidity` /
+`sun_dir` / `sun_elevation`, which implies it). ftrace bakes an equirectangular sky
+image from the [Preetham et al. 2002] analytic model — a blue dome that whitens toward
+the horizon and the sun, plus a **spectrally attenuated solar disk** (a 5778 K blackbody
+extinguished by Rayleigh + Ångström-aerosol optical depth over the sun's air mass, so a
+low sun reddens into a proper orange sunset) — and feeds it through the same `EnvMap`
+pipeline as an image env, so it importance-samples, upsamples to spectra, and runs on
+both the CPU and GPU exactly like an HDRI. Parameters: `turbidity <t>` (≈2 clear
+deep-blue … ≈10 hazy/milky, default 2.5), the sun via either `sun_dir <x y z>` or
+`sun_elevation <deg>` + `sun_azimuth <deg>` (azimuth from +x toward +z), `ground_albedo
+<a>` (tints the below-horizon hemisphere, default 0.3), `intensity <s>` (scales the
+normalised mean sky luminance, default 1), `res <px>` (equirect width, height = res/2,
+default 1024), and `rotate <deg>`. Because the solar disk is physically ~10⁵× brighter
+than the sky (as in any real sunny HDRI), sun-lit diffuse surfaces are high-dynamic-range
+and benefit from a generous photon budget / higher `-noise` target in forward modes; the
+sky background itself is read directly and is noise-free. See `scraps/sky_test.ftsl`
+(daytime) and `scraps/sky_sunset.ftsl` (low-sun reddening).
+
+**`sun_disk on | off | separate`** controls how that solar disk is delivered. The
+default `on` bakes it into the equirect map (accurate but slow to converge in forward
+modes, since a photon must randomly land on a disc covering ~10⁻⁵ of the sphere).
+`separate` instead strips the disk out of the map and registers an equal-energy
+`light sun` alongside the skylight dome — same picture, but the sun is now
+parallel-emitted and cone-NEE'd, which is dramatically faster to converge. On
+`scraps/sky_test.ftsl` (mode B, GPU): **baked** reached only 7.2% noise after 30 s /
+2×10⁹ photons and the image still showed *no* warm sunlight and *no* cast shadows (the
+sun had barely been hit at all), while **`separate`** hit the 4% target in **5.5 s /
+3.0×10⁸ photons** with the sun fully formed — about **20× fewer photons** for the same
+noise, and a qualitatively correct picture instead of a skylight-only one. `off` drops
+the disk entirely (skylight only). The `separate` split is energy-matched to the baked
+profile (measured agreement 0.12% once the map resolves the disc).
 
 **Absolute power.** Any non-env light may author a real physical output —
 `power <watts>` (radiometric radiant flux) or `lumens <lm>` (photometric luminous
@@ -1116,6 +1347,26 @@ auto-exposure. Authoring either on *any* light puts the whole scene in **absolut
 mode**: the film is physically linear, the auto-exposure is replaced by a fixed
 sensor gain, and `iso`/`shutter`/`exposure` become true absolute stops (doubling
 `power` is exactly one stop brighter). See `scenes/absolute.ftsl`.
+
+**Emissive meshes (mesh area lights).** Any material may carry an **`emit <spd>`**
+spectrum (e.g. `material "glow" { type diffuse reflect rgb 0.02 0.02 0.02 emit
+preset:bb6500 }`). A `mesh` bound to such a material becomes a real **area light**:
+every triangle it appended radiates `emit(λ)` from its front face, and the whole
+triangle soup is registered as one emitter that next-event estimation, forward
+photon emission and BDPT all sample uniformly by triangle area (pick a triangle from
+a cumulative-area CDF, then a barycentric point; pdf = 1/total-area, the same law as
+a quad light). So an arbitrary glowing shape — a torus ring, a tessellated logo, an
+imported OBJ — lights the scene like a physically-sized luminaire, on both CPU and
+GPU. An optional `power`/`lumens` on the mesh block rescales the SPD to that flux
+over the mesh's total area (cloning the material so a shared material isn't
+disturbed). Emission is **one-sided** (front face only); a closed shell whose
+triangles happen to be wound *inward* (common in imported OBJs) would otherwise
+radiate into its own interior and look black, so such shells are auto-oriented
+outward at load — the loader flips the winding of any emissive mesh that encloses a
+volume with inward orientation, leaving flat/open sheets (which enclose no volume)
+exactly as authored. Emissive meshes count as lights, so a scene lit *only* by one
+needs no separate `light` block. (Meshes that import their own materials — glTF/GLB —
+are not auto-lit; bind an FTSL `emit` material instead.)
 
 ---
 
@@ -1508,6 +1759,19 @@ spectra, looked up nearest (CPU only; GPU falls back). A 2-child `mix` can take 
 **blend mask** (`weight_map texture:<name>`) that selects child 0 vs child 1 per hit.
 A scalar map on `ior` remains future work.
 
+Any material can also carry a **tangent-space normal map** — `normal_map
+texture:<name> strength <s>` — that perturbs the shading normal per hit without adding
+geometry, so a flat surface picks up per-texel highlights and self-shadowing. The map
+must be declared `encoding linear` (it stores raw XYZ vectors, not sRGB colour; the
+loader warns if it isn't). Per-triangle tangents are derived from the UV gradients
+(with a stored handedness sign), the sampled `[0,1]` texel is remapped to a
+`[-1,1]` vector, rotated through the surface TBN frame, and blended toward the
+geometric normal by `strength` (1.0 = full). Tangents follow mesh instances, and the
+perturbed normal is applied at the single intersection choke point so **every**
+renderer — backward, forward, BDPT, VCM, SPPM, photon-map — and both the CPU and GPU
+paths shade identically. See `scraps/ripple_test.ftsl` (a flat wall reading as
+corrugated under grazing light).
+
 A texture's albedo can also be **procedural in UV space**: in place of `file`, give
 three quoted ftsl expressions of the surface UV — `rgb "r(u,v)" "g(u,v)" "b(u,v)"`
 (the pattern infix grammar; variables `u v`, constant `pi`; each output clamped to
@@ -1531,7 +1795,65 @@ or a native-primitive wrap — see below). Two authoring forms:
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
   math, `pi`, and functions `abs sqrt sin cos tan exp log floor fract sign saturate min
-  max atan2 step pow clamp mix smoothstep noise`.
+  max atan2 step pow clamp mix smoothstep noise`. It can also **sample a declared image
+  as a term**: `tex:<name>(u, v)` returns the mean of the texel's three linear RGB
+  channels (the same `Texture::scalarAt` sampler a `texture:<name>` slot binding uses,
+  honouring that texture's `filter`/`wrap`), so a photo can be one *operand* of a formula
+  — `expr "saturate(tex:grime(u,v) * (0.5 + 0.5*sin(28*u)) * 2)"` — instead of only being
+  pasted over a slot. Its coordinates are ordinary sub-expressions, so the lookup can be
+  warped. `tex:` needs a real surface, so it is a **compile error** in an isosurface
+  `function { expr }`, in a medium `density`/`ior` program, and at load-time constant
+  sites — never a silent zero. Worked example: `scenes/pattern_tex.ftsl`.
+  It can equally **sample an N-D array of authored numbers**: a `grid "name" { shape …
+  lo … hi … outside … data { … } }` block declares a **regular lattice in 1–4
+  dimensions** (samples in C order, axis 0 outermost), and `grid:<name>(c0, …)` reads it
+  back with separable **N-linear** interpolation — so a measured curve, a lookup table or
+  a small height field becomes a term in a formula. The call's **arity is the grid's own
+  dimensionality**, so a wrong argument count is a compile error rather than a silent
+  zero. `lo` defaults to zeros and `hi` to the unit-spacing *index* lattice (coordinates
+  are then literally indices); a single `hi` number gives an isotropic lattice. Outside
+  the box, `outside` picks `clamp` (default), `wrap` (period `hi-lo`) or `extrapolate`.
+  `data` can also be written **bracketed**, and then the **nesting is the shape**
+  (`data [[0 1 2][3 4 5]]` is a 2×3 grid), so `shape` need not be written at all — the one
+  shape you can't get wrong, because it isn't written down twice.
+  Grids upload verbatim to the GPU and both backends run the *same* sampler, so a grid
+  renders identically either way; `ftrace -checkgrid` is the deterministic self-test and
+  `scenes/pattern_grid.ftsl` the worked example (one feature per wall strip).
+  For data that never sat on a lattice there is the **ragged sibling**: a
+  `scatter "name" { dim … power … data { … } }` block holds values at **arbitrary
+  positions** in 1–4 dimensions (one interleaved `p0 … p_{n-1} value` run per sample),
+  and `scatter:<name>(c0, …)` blends them by **Shepard inverse-distance weighting** —
+  the interpolant for a handful of probe measurements, authored control points or
+  samples along a path. Like `grid:`, the call's arity is the table's own `dim`. Every
+  sample is reproduced *exactly* at its own position and with zero slope (the
+  characteristic plateau), and `power` is the locality knob: low values blend broadly,
+  high values approach a nearest-neighbour/Voronoi look. Self-test `ftrace -checkscatter`,
+  worked example `scenes/pattern_scatter.ftsl`.
+  Unlike `tex:`, a table sample needs no surface — only coordinates — so `grid:`/`scatter:`
+  are legal in **scalar field formulas** too: an isosurface / CSG `function { expr }` leaf
+  (`expr "grid:terrain(x, z) - y"` is a measured height field), a medium's `density`
+  program (a measured volume without going through `vdb:`), a medium's `ior` program
+  (`ior "1 + grid:n(x, y, z)"` — a measured refractive-index profile that bends rays, see
+  GRIN media), and a `camera_curve` driver (`fov_from lens.fov(grid:zoom(t))`). Everything
+  downstream reads the same tables: the isosurface polygoniser, the sphere-trace Lipschitz
+  bound, the medium's majorant scan and the GRIN marcher. Only a **load-time constant**
+  site — evaluated before the tables are visible — remains a compile error. Worked example
+  `scenes/grid_field.ftsl` (a 5×5 lattice as an isosurface height field, plus a 1-D
+  profile as a medium's density).
+- **Inline array literal** — a tiny table written *where it is used*, with no block, no
+  name and no `pattern` wrapper: `roughness [0.05 0.4 0.05](u)`. The `[ … ]` is the data
+  and **nesting is the shape** (axis 0 outermost, C order, as in a `grid`'s `data`), so a
+  shape is never spelled and cannot disagree with the data; `[[0 0.5][0.5 1]](u,v)` is
+  2-D. The trailing `(…)` is the **sample call** — one coordinate per nesting level, each
+  a full pattern expression (`[0 1](0.5+0.5*sin(2*pi*3*u))` sweeps the ramp back and
+  forth). A literal spans the **unit interval on every axis**, which is what makes `(u)` /
+  `(u,v)` the natural coordinates. The call is required: an *unsaturated* array is a load
+  error, as is a ragged one or a wrong coordinate count. Each literal desugars to an
+  anonymous `grid` + `pattern`, so it works in **every slot that accepts `pattern:<name>`**
+  and interpolates N-linearly exactly like a grid — including the `reflect` slot, where
+  `reflect [0 1](u)` is a greyscale albedo ramp (see below). Worked example
+  `scenes/pattern_array.ftsl`; reach for a named `grid`/`scatter` when the data is big,
+  shared, or worth naming.
 - **Named generator** — `type <gen>` plus params (mirrors material syntax):
 
   | Generator | Parameters | Result |
@@ -1554,6 +1876,50 @@ paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT
 (mode `D`) now runs pattern-driven diffuse albedo / glossy reflect & roughness, thin-film
 maps, mix `weight_map` masks, colored glass, and frosted (rough) glass on-device too
 (per-hit point threaded through its MIS kernel).)*
+
+**Pattern-driven reflectance.** The `reflect` slot takes a pattern as well, and a scalar in
+a *spectral* slot is a per-hit **multiplier** on whatever the slot otherwise holds. Two
+spellings, one mechanism: `reflect pattern:<name>` (or `reflect [0 1](u)`) leaves the
+pattern alone in the slot, so the base spectrum is a flat 1.0 and the albedo is the
+pattern's own value — a **greyscale reflectance**; `reflect_map pattern:<name>` written
+beside a spectrum or a `reflect texture:<name>` **modulates that** instead. So colour always
+comes from the spectrum or texture and variation from the pattern — a scalar can't invent a
+hue — and the multiplier is clamped to [0,1] so a formula can't manufacture energy. Works
+on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy` and `grating`; on the families
+that read their reflect spectrum directly (`fluorescent`, `thinfilm`, `dielectric`) the
+loader **rejects** it rather than ignore it silently. Same code path on CPU and GPU. Worked
+example `scenes/reflect_pattern.ftsl`.
+
+**Pattern-driven transmittance.** The same two spellings on the `transmit` slot —
+`transmit pattern:<name>` / `transmit [0 1](u)` alone in the slot, or `transmit_map
+pattern:<name>` modulating an authored spectrum. That varies a `translucent` surface's
+back-hemisphere albedo across its face (still energy-guarded so reflect + transmit ≤ 1), or
+a `filter`'s per-wavelength gel transmittance — a colored gel whose density is painted by a
+formula. Those two families are the only ones that read the slot at all, so a transmit
+pattern anywhere else is a load error, same policy as `reflect`. Worked example
+`scenes/transmit_pattern.ftsl`.
+
+**Pattern-driven emission.** The same two spellings again, on the `emit` slot —
+`emit pattern:<name>` alone (the pattern *is* the greyscale emission profile) or
+`emit_map pattern:<name>` beside a spectrum (the lamp keeps its colour, the pattern meters
+its brightness). A `light` block spells its emission slot `spd`, so there the pair reads
+`spd pattern:<name>` / `spd_map pattern:<name>`. Paint a stained-glass window, a filament's
+hot spot, an LED matrix or a gobo straight onto a lamp's surface.
+
+Emission is stricter than the other two slots for a reason: the profile is read from **both
+sides of transport** — once when a camera path lands on the emitter, once at the point NEE
+or a light subpath samples on it — and MIS combines the two, so if the two readings ever
+disagreed the render would be **biased**, not merely noisy. It is therefore only allowed on
+the two emitter shapes whose sampled (u,v) provably equals the (u,v) a hit interpolates: a
+rectangular **area** light and a **mesh** emitter. A sphere / cylinder / spot / env light is
+refused at load. Two more consequences worth knowing: `power`/`lumens` normalise the
+*unpatterned* spectrum (the pattern is a pure post-multiplier on radiance — which is exactly
+what leaves every pdf untouched — so a profile averaging 0.5 emits about half the requested
+flux), and since **0.82.0** the **GPU megakernel** implements *both* of those readings —
+forward `A`/`B`/`C`, backward `R` (spectral, hero, and the fast RGB path), the photon-map
+deposit and gather, BDPT `D` and VCM `U` — so a patterned lamp renders on-device in every
+supported mode instead of falling back to the CPU. Worked example
+`scenes/emit_pattern.ftsl`.
 
 **UV on native primitives.** The `u v` pattern variables aren't limited to meshes.
 A native `sphere {}` carries built-in equirectangular (lat/long) UVs, a `quad {}`
@@ -1633,19 +1999,30 @@ the balance heuristic is a partition of unity so the estimator stays unbiased re
 The backward reference (R/V) and the P composite treat the medium as a single global homogeneous haze
 and warn if you author `density`/`bounds` for them. See `FTSL.md` §12.1.
 
-**Imported volumes (`.nvdb`).** Instead of a formula, point the density field at a real
-sparse volume: `density vdb:<path.nvdb>` imports a NanoVDB **FloatGrid** (the compact,
-GPU-friendly form of an OpenVDB volume — convert a `.vdb` with OpenVDB's `nanovdb_convert`,
-uncompressed). On load the grid is **baked into a dense lattice** plus a world→index affine,
-so the *identical* trilinear sampler runs on the CPU and the GPU (`dMedDensityAt` reads the
-uploaded lattice) and any affine map (translation/scale/rotation) is honored. The grid's
+**Imported volumes (`.nvdb` / `.vdb`).** Instead of a formula, point the density field at a
+real sparse volume: `density vdb:<path>` imports either a NanoVDB **FloatGrid** (`.nvdb`, the
+compact GPU-friendly form) **or a native OpenVDB `.vdb`** directly — the loader dispatches on
+the file magic. The native `.vdb` path is a **self-contained reader** (no OpenVDB/NanoVDB
+dependency): it parses the file container, tree topology (`float 5_4_3`) and
+BLOSC+ACTIVE_MASK+HalfFloat leaf buffers by hand, decoding blosc's **LZ4** codec with a
+vendored single-file LZ4. (Other blosc codecs — BloscLZ/Zlib/Zstd — and ZIP are reported with
+a clear "re-export with LZ4" message; validated bit-for-bit against python-blosc on the
+official OpenVDB smoke/sphere/cube samples.) On load the grid is **baked into a dense lattice**
+(stored as **fp16 half-floats** to halve host RAM and GPU VRAM — density fields tolerate half
+precision's ~0.05% error easily) plus a world→index affine,
+so the *identical* trilinear sampler runs on the CPU and the GPU and any affine map
+(translation/scale/rotation) is honored. On the **GPU the lattice is uploaded as a native
+sparse brick grid** (8³ bricks; only bricks with a nonzero voxel reach the device, plus a small
+int32 brick-index), so **VRAM scales with occupied volume, not the bounding box** — a mostly-empty
+plume can drop to a fraction of the dense footprint (a startup line reports the ratio). The sparse
+sampler is bit-for-bit identical to the dense one. The grid's
 world AABB auto-seeds the medium bound and its peak value the delta-tracking majorant — so
 `medium { sigma_t 40  albedo 0.9  density vdb:cloud.nvdb }` is all it takes to light an
 imported cloud. Values are treated as a dimensionless density multiplier on `sigma_t`, so
-you still dial the optical thickness with `sigma_t`. Only **float** grids are supported and
-the bake is **dense** (memory ~ the grid's index-space bounding box), so very large sparse
-volumes are bounded by a safety cap; a native sparse device sampler is a future
-optimization. Works in the forward modes (A/B/C) and BDPT `D` on CPU and GPU, exactly like a
+you still dial the optical thickness with `sigma_t`. Only **float** grids are supported; the
+host bake is **dense** (host RAM ~ the grid's index-space bounding box, bounded by a safety cap)
+while the **GPU sampler is natively sparse** (bricked, see above). Works in the forward modes
+(A/B/C) and BDPT `D` on CPU and GPU, exactly like a
 `density` formula. Generate a test asset with `scraps/make_nvdb.cpp`.
 
 **Gradient-index (GRIN) media — bending light.** Give a
@@ -2004,20 +2381,40 @@ useful flags: `--resume` (skip already-rendered frames), `--start/--end/--step` 
 `--no-encode`, `--keep-frames`, `--crf`/`--codec`/`--pix-fmt`, and `--dry-run`. Run with
 `--help` for the full list.
 
-### Grammar cross-check (`-validate-grammar`)
+### The shared grammar
 
-FTSL has two front-ends: ftrace's authoritative hand-written parser (`src/ftsl.h`)
-and a **shared grammar** — the same `.ftsl` syntax written once as a formal grammar
-(`tools/loom/loom/grammar/ftsl_scene.epeg`, compiled to a parser graph consumed by
-loom *and* vendored into ftrace as generated C++). The `-validate-grammar` flag runs
-the shared grammar alongside the hand-written parser on the scene you load,
-structurally diffs the two block trees, and prints any disagreement to stderr as a
-`[validate-grammar] …` warning. It is **non-authoritative and off by default**:
-ftrace always renders from its own parse, so the flag adds only a diagnostic (also
-enabled by setting the `FTRACE_VALIDATE_GRAMMAR` environment variable to a non-empty,
-non-`0` value). The goal is to drive the mismatch count to zero across the whole
-scene corpus before eventually flipping the front-end over to the shared grammar as
-the single source of truth. With no flag there is zero cost.
+FTSL's syntax is written **once**, as a formal grammar:
+`tools/loom/loom/grammar/ftsl_scene.epeg`. It is compiled to a parser graph that both
+loom (in Python) and ftrace (as generated C++, `src/gpda/ftsl_scene.gen.cpp`) consume,
+so the language has exactly one definition and the two tools cannot drift apart.
+**As of 0.68 the shared grammar is ftrace's front end** — it parses every scene you
+load, and the `.epeg` file is the single source of truth for what FTSL accepts. As of
+**0.79 it is the *only* front end**: the hand-written parser it replaced is gone from
+the source tree entirely.
+
+Besides removing the drift risk, the grammar parser gives much better errors. Because
+it walks a graph of cursors and expands only to *terminals*, at a failure the live
+cursor set is exactly the set of continuations the grammar would have accepted, and
+the cursor stacks name the enclosing rules:
+
+```
+scene.ftsl:1:15: unexpected NEWLINE '\n'; expected '{'
+    (in brace_body < plain_header < top_block < item)
+```
+
+where the retired hand-written parser could only manage `line 1: expected '{' after
+material`.
+
+**The transition is over.** Two flags covered it while the two parsers ran side by
+side — `-legacy-parser` (parse with the old hand-written parser instead) and
+`-validate-grammar` (parse *both* ways and structurally diff the block trees). The
+differ is what earned the flip: the two parsers agreed on **all 2595 `.ftsl` files in
+the tree**, structurally identical down to per-statement line numbers, and held there
+for ten releases with `-legacy-parser` available and unused. **0.79.0 deleted the old
+parser, the escape hatch and the differ.** Both flags (and the `FTRACE_LEGACY_PARSER` /
+`FTRACE_VALIDATE_GRAMMAR` environment variables) are retired: the flags are still
+*accepted* on the command line so an existing script doesn't break, but they print a
+one-line "retired … ignoring" notice and do nothing.
 
 ### Importing Mitsuba scenes
 
@@ -2053,18 +2450,21 @@ add-on), this doubles as a Blender → FTSL path.
 | `-scene <name>` | Built-in scene (e.g. `cornell`) |
 | `-n <photons>` | Trace exactly this many photons/samples |
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
-| `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension) |
+| `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension). Missing parent directories are created before the render starts (reported as `[out] created output directory …`), so a render aimed at a fresh `png/<series>/` subdir can't be traced to completion and then lost at write time. Mode `V` produces a *pair* of images (the two independent estimates it cross-checks) and writes them as `<out>_forward` / `<out>_backward` beside the given path |
 | `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
 | `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
 | `-on-unsupported error\|fallback\|strip` | What to do when the selected mode can't render a scene feature (GRIN media, or a fisheye camera in mode `D`/`U`). `error` (default) prints a diagnostic and aborts; `fallback` renders that camera in mode `R` (backward reference) instead; `strip` removes the offending feature (e.g. drops the GRIN `ior`, turning the medium into a plain one) and renders in the requested mode anyway. Complements `prefer { … } else { … }` in the scene file, which resolves the mode/feature mismatch *before* this policy is consulted |
-| `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier |
+| `-pmradius <r>` / `-pmradiusfrac <f>` | Mode `M`/`S`/`U` photon-map/merge gather radius (initial radius for `S`/`U`): absolute world units, or a fraction of the scene radius (default `0.02`). Smaller = sharper contact shadows but noisier. In mode `M` this is the *starting* radius the density adaptation refines from — except `-pmradius`, which pins it exactly (implies `-nopmauto`) |
+| `-pmcount <k>` | Mode `M` density-adaptive gather radius: target number of photons a typical gather should see, at 1 M stored photons (default `200`; the target grows as the cube root of the stored count). Implies `-pmauto`. Higher = smoother/blurrier and slower, lower = sharper/grainier and faster |
+| `-pmauto` / `-nopmauto` | Turn the mode-`M` density-adaptive gather radius on (default) or off. `-nopmauto` reproduces the old fixed-radius output bit-for-bit |
 | `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
-| `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene |
+| `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene. Like `-o`, a missing parent directory for `-savemap` is created up front rather than discovered after the deposit |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
-| `-heroc <N>` | Hero-wavelength bundle size on the **CPU** spectral tracers (modes `A`/`B`/`C`, `R`, and photon-map `M`/`S`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). GPU / BDPT (`D`) / VCM (`U`) ignore it (still single-λ) |
+| `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S`, BDPT `D` and VCM `U`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D`, and VCM `U`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. VCM (`U`) does the same on **both** backends: one bundle per path index feeds both its light and camera subpath, so its *connections* are exact per-λ while its *merges* key off each stored light vertex's own wavelengths — **0.51× noise RMS** at equal passes on a gel + mirror box (CPU), **0.72–0.82× chroma noise** for 1.5–1.7× the time on the GPU, matching the single-λ estimator to 0.02 % and each other to 0.03 %. In modes `R` and `A`/`B`/`C` (and the `M`/`S` deposit) the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors in `R` and ~1.1× luma / 1.3–1.8× chroma at equal time in the forward modes. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`) and by any scene with participating media, a GRIN volume, or a finite-lens camera |
+| `-herosplit` | **Split-at-dispersion** instead of the default de-hero policy. Normally a dispersive event (dielectric refraction, grating order, fluorescent Stokes shift) *terminates* the `N-1` secondary wavelengths and boosts the hero ×`N`, because they can no longer follow one shared direction. With `-herosplit` all `N` wavelengths **continue**, each running the same interaction with its own λ — refracting along its own Snell direction, diffracting into its own grating order — so the bundle fans out into `N` independent monochromatic sub-paths. Same mean (both estimators are unbiased; verified `sum/emitted = 1.000000` and converged luminance matching a 200 M-photon reference to 0.03 %), but the chromatic spread of a prism / rainbow / dispersive caustic is resolved **geometrically per photon** instead of stochastically across many. Measured on a dispersive `glass:SF10` flint-sphere Cornell box, **at equal wall clock**: **0.70× chroma / 0.89× luma noise RMS inside the caustic**, 0.80× / 0.92× over the whole frame. The extra traversal past the split is linear, not exponential (a monochromatic sub-path never re-splits) and is paid only by photons that actually reach the glass — **1.11×** per photon there — but that ratio is scene-dependent, which is why it stays opt-in. No-op with `-heroc 1`. **CPU forward modes `A`/`B`/`C` + the `M`/`S` photon deposit** only — ignored by the GPU backends, the backward tracer (`R`), BDPT (`D`) and VCM (`U`). |
 | `-beams` / `-photonbeams` | **Decorrelated single-scatter volumetrics** for the shared forward mode-`B` multi-camera / flyby pass. Normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Deliberately omits the multiple-scatter haze wash (crisper bow). Runs on **CPU and GPU** (ported to the CUDA forward tracer; spectral-rainbow-phase media stay CPU-tabulated and fall back to CPU); needs ≥2 shared cameras + a scattering `medium`. No effect otherwise. |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
 | `-view EX,EY,EZ/LX,LY,LZ[/FOV]` | Render a brand-new ad-hoc camera (eye → look, optional vertical FOV; `,` and `/` are interchangeable separators) instead of the scene's cameras — a quick way to preview a scene from an arbitrary angle. Works with `-in` scenes and built-in `-scene`s. |
@@ -2085,6 +2485,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-check-watertight` / `-airtight` | Audit every named `mesh` and every `isosurface` in the scene for a closed, consistently-oriented surface, print a per-object `[OK]`/`[WARN]` report, then exit (no render). Warns per object about **boundary edges** (holes / open border), **non-manifold edges** (3+ faces share an edge), and **flipped** (inconsistently-wound) facets; a dielectric object is flagged with `!` because a leak breaks its refraction / interior-medium tracking. Isosurfaces are polygonised at `-mesh-res` first. Exit code is non-zero if any object is not airtight. |
 | `-check-airtight` | Audit every `isosurface` by **ray-parity on the marched field** (not a polygonised proxy): fire chords from outside the container and flag any that cross the boundary an odd number of times (a leak — an open cap on an `open` surface, or a `max_gradient`/thin-feature overshoot the marcher skips), plus a dense-reference **overshoot** check. Prints `[OK]`/`[WARN]` and exits non-zero on any leak. See **Auditing the marched field directly**. |
 | `-check-airtight-rays <N>` | Chord count per isosurface for `-check-airtight` (default 4000). |
+| `-parseonly` | Load the scene, print a one-line contents summary (materials / records / emitters / spheres / tris / implicits / textures / patterns / cameras), then exit without rendering. A fast syntax + semantic check — every `.ftsl` diagnostic still fires, so it's the cheap way to sweep a whole scene directory for load errors. |
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
@@ -2140,7 +2541,12 @@ alone can't restore, so they are not disk-resumable.
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
-`-thinfilmswatch`, `-checkgrating`, `-checkupsample`.
+`-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`,
+`-checksun`, `-checkbind`, `-checkprop`.
+
+**Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
+configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are
+still accepted but print a notice and do nothing. See **The shared grammar** above.
 
 ---
 
@@ -2181,6 +2587,60 @@ drive any renderer).
 
 See **[`tools/loom/README.md`](tools/loom/README.md)** for the tour, and
 `tools/loom/DESIGN.md` for the architecture.
+
+**Native viewer (`-viewer`).** ftrace doubles as loom's native scene viewer:
+`ftrace -viewer <scene.viewer.json>` opens a Dear ImGui / Direct3D 11 window on a loom
+**scene-introspection sidecar** (written by `loom.viewer.ViewerModel.save_sidecar`). It
+shows the scene's objects, datasets, camera/lights and modulator-DAG summary, and draws
+each curve dataset in a full **N-D curve pane** — a structural view of the Python model with
+no browser/WebGL round-trip. The pane orbits (drag) and zooms (wheel), picks **any 3 of the
+curve's N dimensions** to map to screen X/Y/Z (view-only re-projection), marks progression
+with **index markers** along the curve, and supports **stereoscopic viewing** — red-cyan
+anaglyph and wall-eyed / cross-eyed side-by-side, with an eye-separation slider. Below the
+3-D pane sit **scroll-locked strip charts** (ImPlot) — one per curve dimension and one per
+tacked-on `TrackedPath` channel; they share a linked X axis (paging scrolls them all
+together) and a draggable index line wired to the 3-D index dot. A **Modulator DAG**
+panel (imnodes) lays out the scene's signal graph — each node titled `<op> #<id>` with
+one labelled input pin per incoming edge (the parameter that upstream node feeds), leaves
+on the left and the params they drive on the right. An **axis-typed** modulator
+(loom's `loom.axes` layer) additionally shows its **free axes** (`axes {s,t}`; `{}` for a
+constant, which broadcasts everywhere) and a one-line caption naming what kind of node it
+is in that model — a target's declared quantity (`gain target (neutral 1)`), the axis a
+reduction consumes (`reduce s (mean, 8 samples)`), or a value-site's axis scope
+(`t from clock, {s} pinned <- {s,t}`) — while an **influence edge** into a target reads
+`mod[0] x0.8` / `pin[1] x0.25` on its input pin, so you can see the pin/mod combine model
+rather than just the call graph. (This needs a **v2** sidecar; a v1 one renders as before.)
+The pane sizes itself to whatever height is left in the side column and **wraps each layer
+into sub-columns** so a graph with dozens of leaves stays inside the visible area instead of
+running off the bottom; the wrap uses the node boxes imnodes actually produced, so nothing
+overlaps at any DPI. Because imnodes has no zoom of its own, the panel implements a real one
+by scaling the font and node padding: **wheel to zoom** (15–300%), **fit** solves for the
+zoom that shows the whole graph, **100%** resets it, **re-layout** redoes the layering, and
+**maximize** throws the graph full-window (auto-fits on entry, re-fits when the window
+resizes, **Esc** to dock it again).
+A **Fields tab** renders `Grid` and
+`Scatter` datasets: their sample points appear in the same 3-D orbit view (grid node
+positions reconstructed from the fixed lattice), coloured either by a **heatmap of a
+selectable channel** or by **channels 0/1/2 → RGB**; **click any point to inspect** its
+position and every channel value, and for N-D grids **per-extra-dim slice sliders** collapse
+the dims you're not viewing to a chosen lattice index. A **Meshes tab** draws `SweptMesh`
+surfaces (tubes, ribbons, blobs) as a **shaded, depth-sorted triangle mesh** — flat two-sided
+lambert lighting, an optional wireframe overlay, and grey / per-object-tint / UV-checker /
+**texture** colouring; orbiting spins the existing tessellation (view-only). In **texture**
+mode (the default) each mesh wears its **real skin**, sampled at the interpolated per-vertex
+UVs: an image texture is decoded with ftrace's own loader (paths resolve relative to the
+sidecar), and a procedural `r`/`g`/`b` formula skin is baked on the CPU through ftrace's own
+pattern VM — including `tex:<name>(u,v)` sampling of an image declared above it — so the
+preview matches what the renderer would produce. A mesh with no skin, or a skin that fails to
+load or compile, falls back to grey and the reason is printed under the pane. `IsoMesh`
+isosurfaces are baked to a marching-cubes mesh and shown in the same Meshes tab. When the sidecar carries a
+`source` key — the `.ftsl` `save_sidecar` emits beside it — a **Render tab** raymarches the
+*real* isosurface **field** in-process: it parses the `.ftsl` with ftrace's own `ftsl::load`
+and sphere-traces the field bytecode via `renderIsoPreviewCuda` (the `-raster-gpu` preview
+kernel — no tessellation), driven by an orbit camera (drag to rotate, wheel to dolly) with
+resolution and FOV controls, blitting each converged frame into a D3D11 texture. This is the
+actual field rather than the static marching-cubes mesh. (Still in progress: live
+re-tessellation when you rotate *into* a parameter dimension — see §F in `TODO.md`.)
 
 ---
 

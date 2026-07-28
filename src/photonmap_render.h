@@ -51,7 +51,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
                             bool diffraction, PhotonMap& pm, int heroC = hero::kHeroC,
                             uint64_t seedBase = 0) {
     if (nThreads < 1) nThreads = 1;
-    std::vector<std::vector<Photon>> banks(nThreads);
+    std::vector<PhotonBank> banks(nThreads);
     std::vector<long long> emitted(nThreads, 0);
 
     // Hero-wavelength deposit (modes M/S): each traced path deposits its live wavelengths
@@ -78,11 +78,14 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
 
     size_t total = 0;
     for (auto& b : banks) total += b.size();
-    pm.photons.clear();
-    pm.photons.reserve(total);
+    pm.photons.clear();  pm.photons.reserve(total);
+    pm.pos.clear();      pm.pos.reserve(total);
     pm.nEmitted = 0;
     for (int t = 0; t < nThreads; ++t) {
-        pm.photons.insert(pm.photons.end(), banks[t].begin(), banks[t].end());
+        // Append both halves in the same thread order, so pos[k] stays the position of
+        // photons[k] (PhotonMap's split layout — see photonmap.h).
+        pm.photons.insert(pm.photons.end(), banks[t].payload.begin(), banks[t].payload.end());
+        pm.pos.insert(pm.pos.end(), banks[t].pos.begin(), banks[t].pos.end());
         pm.nEmitted += emitted[t];
     }
 }
@@ -154,7 +157,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             if (specularSeen) {                          // specular-direct: NEE can't reach it
                 double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                     * (thr * rhoV * m.emit(lambda) * invPdfL);
+                     * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL);
             }
             return L;                                     // else: direct handled by NEE at vis
         }
@@ -239,7 +242,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
             case MatType::Filter: {
-                thr *= clamp01(m.transmit(lambda));
+                thr *= clamp01(transmitSlot(scene, m, h, lambda));
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
@@ -287,6 +290,13 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             if (scene.envIndex >= 0)
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                      * (thr * scene.envRadiance(ray.d, lambda) * invPdfL);
+            // Directly-viewed solar disc. This walk terminates at the first diffuse
+            // vertex (the density estimate returns there), so any escape reaching here
+            // is a camera ray or a specular chain — never a diffuse continuation that
+            // the map / NEE already credited with the sun.
+            if (scene.sunCount > 0)
+                L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                     * (thr * scene.sunRadiance(ray.d, lambda) * invPdfL);
             return L;
         }
         const Material* mp = &scene.mats[h.matId];
@@ -303,7 +313,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
 
         if (m.isLight) {                                 // directly-viewed emitter
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                 * (thr * m.emit(lambda) * invPdfL);
+                 * (thr * emitSlot(scene, m, h, lambda) * invPdfL);
             return L;
         }
 
@@ -415,7 +425,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 break;
             }
             case MatType::Filter: {
-                double t = clamp01(m.transmit(lambda));
+                double t = clamp01(transmitSlot(scene, m, h, lambda));
                 thr *= t;
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;

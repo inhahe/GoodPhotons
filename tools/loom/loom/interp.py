@@ -280,12 +280,13 @@ class TrackedCurve:
 # vector field pays for the domain math exactly once per frame, then reuses the
 # weights across every channel.
 
-_GRID_OUTSIDE = frozenset(("clamp", "raise", "wrap"))
+_GRID_OUTSIDE = frozenset(("clamp", "raise", "wrap", "extrapolate"))
 _GRID_OOB_TOL = 1e-9
 
 
 def _parse_on_outside(on_outside: str) -> str:
-    """Validate a Grid out-of-domain policy name (``clamp``/``raise``/``wrap``)."""
+    """Validate a Grid out-of-domain policy name
+    (``clamp``/``raise``/``wrap``/``extrapolate``)."""
     key = str(on_outside).lower()
     if key not in _GRID_OUTSIDE:
         raise ValueError(f"unknown on_outside {on_outside!r}; "
@@ -301,7 +302,10 @@ def _cell_base_frac(grid: Grid, axis: int, coord: float,
     ``on_outside`` picks the out-of-domain behaviour: ``"clamp"`` (default) pins to
     the boundary cell (edge-extend); ``"raise"`` errors past the domain; ``"wrap"``
     folds the coordinate periodically (period ``hi-lo``, so sample ``n-1`` aliases
-    sample ``0`` — the stencil index wrap is applied by the callers)."""
+    sample ``0`` — the stencil index wrap is applied by the callers); ``"extrapolate"``
+    keeps the boundary cell but returns an **unclamped** fraction (``f<0`` below the
+    domain, ``f>1`` above), so the interpolation stencil linearly extrapolates off the
+    edge cell instead of edge-extending."""
     n = grid.shape[axis]
     lo, hi = grid.lo[axis], grid.hi[axis]
     if hi == lo:
@@ -318,11 +322,15 @@ def _cell_base_frac(grid: Grid, axis: int, coord: float,
         if on_outside == "raise" and p < -_GRID_OOB_TOL:
             raise ValueError(f"grid query {coord} is below axis {axis} domain "
                              f"[{lo}, {hi}] (on_outside='raise')")
+        if on_outside == "extrapolate" and p < 0.0:
+            return 0, p                            # unclamped negative fraction
         return 0, 0.0
     if p >= n - 1:
         if on_outside == "raise" and p > (n - 1) + _GRID_OOB_TOL:
             raise ValueError(f"grid query {coord} is above axis {axis} domain "
                              f"[{lo}, {hi}] (on_outside='raise')")
+        if on_outside == "extrapolate" and p > n - 1:
+            return n - 2, p - (n - 2)              # unclamped fraction > 1
         return n - 2, 1.0
     i = int(math.floor(p))
     return i, p - i
@@ -466,8 +474,9 @@ class GridField(Signal):
     ``"linear"`` (default, separable N-linear) or ``"cubic"`` (separable
     Catmull-Rom / tricubic — smoother, C1, may overshoot).  ``on_outside`` picks the
     out-of-domain policy: ``"clamp"`` (default, edge-extend), ``"raise"`` (error past
-    the domain — the guard you want when a curve must stay inside the box), or
-    ``"wrap"`` (periodic fold, apt for a triply-periodic field like a gyroid).  For a
+    the domain — the guard you want when a curve must stay inside the box),
+    ``"wrap"`` (periodic fold, apt for a triply-periodic field like a gyroid), or
+    ``"extrapolate"`` (linearly extend off the boundary cell).  For a
     vector-valued grid use :class:`VecGridField`.
     """
 
@@ -502,7 +511,8 @@ class VecGridField(VecSignal):
     per frame), so this is a true vector field — not N independent scalar fields
     recomputing the domain math.  ``interp`` is ``"linear"`` (default) or ``"cubic"``
     (Catmull-Rom / tricubic).  ``on_outside`` picks the out-of-domain policy
-    (``"clamp"`` default / ``"raise"`` / ``"wrap"``, see :class:`GridField`).
+    (``"clamp"`` default / ``"raise"`` / ``"wrap"`` / ``"extrapolate"``, see
+    :class:`GridField`).
     ``.channel(name_or_index)`` returns a scalar view of one channel (by name if the
     grid was built with ``channels=``, else by index).
     """

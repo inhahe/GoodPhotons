@@ -24,11 +24,37 @@ struct Tri {
     // shading). Zero-length => "not supplied": finalize() falls them back to the
     // geometric normal, so any tri without OBJ `vn` data stays exactly flat-shaded.
     Vec3 n0{0, 0, 0}, n1{0, 0, 0}, n2{0, 0, 0};
+    // Per-triangle TANGENT frame for tangent-space normal mapping (C6). `tangent`
+    // is the surface direction of increasing texture u (unit, orthogonal to gn);
+    // `bitangentSign` (+1/-1) encodes the handedness so the bitangent is
+    // cross(N, tangent)*bitangentSign (handles mirrored UVs). Derived once in
+    // finalize() from the UV gradient (Lengyel's method); a degenerate/zero-area UV
+    // parameterization falls back to an arbitrary basis around gn.
+    Vec3   tangent{1, 0, 0};
+    double bitangentSign = 1.0;
     void finalize() {
         gn = normalize(cross(v1 - v0, v2 - v0));
         if (dot(n0, n0) < 1e-12) n0 = gn;
         if (dot(n1, n1) < 1e-12) n1 = gn;
         if (dot(n2, n2) < 1e-12) n2 = gn;
+        // Tangent from the UV gradient (Lengyel). Solve for the world direction along
+        // which texture-u increases, then Gram-Schmidt it against gn and record the
+        // bitangent handedness. Falls back to onb(gn) when UVs are degenerate.
+        Vec3 e1 = v1 - v0, e2 = v2 - v0;
+        double du1 = uv1.x - uv0.x, dv1 = uv1.y - uv0.y;
+        double du2 = uv2.x - uv0.x, dv2 = uv2.y - uv0.y;
+        double det = du1 * dv2 - du2 * dv1;
+        if (std::fabs(det) > 1e-20) {
+            double r = 1.0 / det;
+            Vec3 T = (e1 * dv2 - e2 * dv1) * r;
+            Vec3 B = (e2 * du1 - e1 * du2) * r;
+            T = T - gn * dot(gn, T);               // orthogonalize against the normal
+            double tl = std::sqrt(dot(T, T));
+            if (tl > 1e-12) {
+                tangent = T * (1.0 / tl);
+                bitangentSign = (dot(cross(gn, tangent), B) < 0.0) ? -1.0 : 1.0;
+            } else { Vec3 bb; onb(gn, tangent, bb); bitangentSign = 1.0; }
+        } else { Vec3 bb; onb(gn, tangent, bb); bitangentSign = 1.0; }
     }
 };
 
@@ -46,6 +72,11 @@ struct Hit {
     double u = 0, v = 0;   // interpolated surface texture coordinates
     double fieldVal = 0;   // implicit field value at the hit (~0 on a surface; 0 for
                            // non-implicit hits). Exposed to procedural patterns as `f`.
+    // Surface tangent frame at the hit, for tangent-space normal mapping (C6).
+    // `tangent` is the world direction of increasing texture-u; `bitangentSign`
+    // (+1/-1) gives the bitangent handedness (B = cross(n, tangent)*bitangentSign).
+    Vec3   tangent{1, 0, 0};
+    double bitangentSign = 1.0;
 };
 
 // Geometric surface normal oriented onto the SAME side as the (ray-oriented) shading
@@ -207,6 +238,8 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     double nl = dot(ns, ns);
     ns = (nl > 1e-18) ? ns * (1.0 / std::sqrt(nl)) : tri.gn;
     hit.n = (dot(r.d, ns) < 0.0) ? ns : -ns;
+    hit.tangent = tri.tangent;             // per-triangle tangent (constant across the face)
+    hit.bitangentSign = tri.bitangentSign; // for tangent-space normal mapping (C6)
     return true;
 }
 
@@ -235,6 +268,13 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     // Equirectangular (lat/long) UV so spheres can be textured (globes, eyeballs).
     hit.u = 0.5 + std::atan2(ng.z, ng.x) / (2.0 * PI);
     hit.v = 0.5 - std::asin(std::clamp(ng.y, -1.0, 1.0)) / PI;
+    // Tangent = the east-pointing longitude direction d/du (C6). d/du of the
+    // equirectangular map is proportional to (-sin, 0, cos) of the longitude, i.e.
+    // perpendicular to both world-up and the normal; degenerates to +x at the poles.
+    Vec3 T{-ng.z, 0.0, ng.x};
+    double tl = std::sqrt(dot(T, T));
+    hit.tangent = (tl > 1e-9) ? T * (1.0 / tl) : Vec3{1, 0, 0};
+    hit.bitangentSign = 1.0;
     return true;
 }
 

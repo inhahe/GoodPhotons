@@ -125,6 +125,31 @@ cam_film = 'film' '{' 'res' NUMBER NUMBER '}'
 # their own way until this is wired in).
 value    = vrun (',' vrun)*
 vrun     = vpiece+
-vpiece   = colour_tag | vbracket | vnums
-vbracket = '[' value ']'
+vpiece   = colour_tag | vsampled | vnums
 vnums    = (NUMBER | REF)+
+vbracket = '[' value ']'
+
+# ---- axis-labelled arrays: the sample call --------------------------
+# (design intent 2026-07-20; TODO "ADDENDUM — axis-labelled arrays" and
+# "ADDENDUM — call = sample").  A trailing tuple on an array is not a label,
+# it is the *sample call* — the same operation as loom's `grid(x, y)`:
+#
+#   reflect [0 1](u)              # 1-D array sampled at the surface u
+#   [[0,1,2][3,4,5][6,7,8]](u,v)  # 2-D, sampled at (u, v)
+#   reflect [0 1]                 # UNSATURATED — legal to declare, an error
+#                                 # to render until a user site calls it
+#   [0 1](a=u)                    # keyword rebind: bind driver u to formal a
+#   n(m(u), v)                    # composition — a coord may itself be a call
+#
+# The tuple hangs off a *piece*, not off the whole value, so a call composes
+# inside a bigger value (`[[0 1](u), [2 3](v)]`).  A bare NAME is only a value
+# when it is called — `vsampled = NAME axistuple` — so adding this cannot make
+# a stray bareword parse as a value.
+#
+# Positional args bind axes left to right; `formal=driver` targets a named
+# axis.  Mixing is the usual rule (positionals first), which the grammar does
+# NOT enforce — the normalizer does, so the error can say what it means.
+vsampled  = vbracket axistuple? | NAME axistuple
+axistuple = '(' arg (',' arg)* ')'
+arg       = NAME '=' coord | coord
+coord     = vsampled | NAME | NUMBER

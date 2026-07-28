@@ -96,16 +96,38 @@ class Cache:
     Shared sub-graphs (a modulator feeding several parameters) are then
     evaluated once per frame.  Pass a fresh :class:`Cache` per frame, or reuse
     one keyed by frame index.
+
+    **Retimed sub-evaluations get their own scope.**  The ``(node id, frame)``
+    key assumes *one value per node per frame*, which is exactly the assumption
+    a :class:`~loom.signals.retime.Retime` node breaks: it evaluates its subtree
+    at a *different* phase within the same frame, so writing those values into
+    the frame-keyed store would poison every other reader of the same node.
+    :meth:`scope` hands out a **nested** cache keyed by the continuous sample
+    point, so sharing still happens *within* one retimed evaluation (a diamond
+    under the retime node is computed once) and never leaks across sample
+    points.  Scopes live as long as their parent cache — with the documented
+    one-cache-per-frame usage that is one dict per retime node per frame.
     """
 
     def __init__(self) -> None:
         self._store: Dict[Tuple[int, int], object] = {}
+        self._scopes: Dict[object, "Cache"] = {}
 
     def get(self, node_id: int, frame: int):
         return self._store.get((node_id, frame))
 
     def set(self, node_id: int, frame: int, value) -> None:
         self._store[(node_id, frame)] = value
+
+    def scope(self, key) -> "Cache":
+        """A nested cache for one retimed sample point (``key`` must be hashable
+        and must include whatever distinguishes the sample — node id, frame and
+        the continuous phase)."""
+        sub = self._scopes.get(key)
+        if sub is None:
+            sub = Cache()
+            self._scopes[key] = sub
+        return sub
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +210,50 @@ class Signal:
         return Neg(self)
 
 
+def lower_axsignal(x, *, dim: Optional[int] = None):
+    """If ``x`` is an axis-typed node (:mod:`loom.axes`), bind it down to a
+    clock-parameterized node at this value-site; otherwise return ``None``.
+
+    This is the single hook that routes roadmap-§E5's influence model into
+    ordinary loom authoring: a :class:`~loom.axes.Target` (the ``pin``/``mod``
+    combine node) handed to *any* scene value-site is lowered here, and its
+    scope check ("free variables ⊆ the axes in scope at this site" — a
+    value-site has only the clock) fires at graph-build time.  Every consumer
+    (:func:`as_signal`, ``VecSignal.of``, ``ftsl_emit.num``/``vecn``, an
+    ``Element``'s ``roots()``) goes through it, so they all agree.
+
+    The lowered node is **memoised on the axis node**, because a value-site must
+    present the *same* node every time: node identity is the per-frame
+    :class:`Cache` key, and ``roots()`` must hand the cycle detector the very
+    node that emission will evaluate.  Imported lazily because :mod:`loom.axes`
+    is built on top of this module.
+    """
+    if isinstance(x, (Signal, int, float)) or not hasattr(x, "axes"):
+        return None
+    from ..axes import AxSignal, lower  # local: axes imports this module
+    if not isinstance(x, AxSignal):
+        return None
+    if dim is not None:
+        return lower(x, dim=dim)
+    node = getattr(x, "_site_node", None)
+    if node is None:
+        node = lower(x)
+        x._site_node = node
+    return node
+
+
 def as_signal(x: Union[Signal, Number]) -> Signal:
-    return x if isinstance(x, Signal) else Const(float(x))
+    if isinstance(x, Signal):
+        return x
+    lowered = lower_axsignal(x)
+    if lowered is not None:
+        if not isinstance(lowered, Signal):
+            raise TypeError(
+                f"a scalar value-site got a {lowered.dim}-vector axis node; "
+                f"pick a component with .comp(i)"
+            )
+        return lowered
+    return Const(float(x))
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +284,21 @@ class TimeFn(Signal):
     def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
         t = clock.t - math.floor(clock.t) if self.periodic else clock.t
         return float(self.fn(t))
+
+
+class Phase(Signal):
+    """The clock's own normalized phase ``t``, **as a value**.
+
+    This is what makes time a first-class input rather than an ambient one: a
+    graph can do arithmetic on ``t`` and hand the result to
+    :class:`~loom.signals.retime.Retime` to sample another sub-graph at that
+    phase (``delay`` is ``Retime(x, Phase() - dt)``).  Evaluating it is exactly
+    ``clock.t`` — no wrapping, no shaping (``Ramp(0, 1)`` is numerically the
+    same thing, but reads as an *animation* rather than as the clock).
+    """
+
+    def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
+        return clock.t
 
 
 # ---------------------------------------------------------------------------

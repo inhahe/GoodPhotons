@@ -17,6 +17,7 @@
 #include "color.h"
 #include "spectrum.h"
 #include "lights.h"
+#include "meng_table.h"
 
 namespace upsample {
 
@@ -253,6 +254,209 @@ inline DomWL rgbToDominantWavelength(double r, double g, double b) {
     return out;   // no crossing found (degenerate) -> defaults
 }
 
+// --- Smits 1999 RGB->reflectance basis ------------------------------------
+// Brian Smits, "An RGB-to-Spectrum Conversion for Reflectances" (1999): seven
+// tabulated basis reflectances (white / C M Y / R G B) sampled at 10 wavelengths
+// evenly spanning [380,720] nm. An RGB triple is decomposed additively —
+// white·min + one secondary + one primary — so the reconstruction stays smooth
+// and (unlike a naive box) round-trips RGB reasonably. Classic, cheaper and
+// lower-fidelity than Jakob-Hanika; offered as a selectable alternative (K1).
+struct SmitsBasis {
+    static constexpr int N = 10;
+    double lam[N];
+    double white[N], cyan[N], magenta[N], yellow[N], red[N], green[N], blue[N];
+    SmitsBasis() {
+        const double W[N]  = {1.0000,1.0000,0.9999,0.9993,0.9992,0.9998,1.0000,1.0000,1.0000,1.0000};
+        const double C[N]  = {0.9710,0.9426,1.0007,1.0007,1.0007,1.0007,0.1564,0.0000,0.0000,0.0000};
+        const double M[N]  = {1.0000,1.0000,0.9685,0.2229,0.0000,0.0458,0.8369,1.0000,1.0000,0.9959};
+        const double Y[N]  = {0.0001,0.0000,0.1088,0.6651,1.0000,1.0000,0.9996,0.9586,0.9685,0.9840};
+        const double R[N]  = {0.1012,0.0515,0.0000,0.0000,0.0000,0.0000,0.8325,1.0149,1.0149,1.0149};
+        const double G[N]  = {0.0000,0.0000,0.0273,0.7937,1.0000,0.9418,0.1719,0.0000,0.0000,0.0025};
+        const double B[N]  = {1.0000,1.0000,0.8916,0.3323,0.0000,0.0000,0.0003,0.0369,0.0483,0.0496};
+        for (int i = 0; i < N; ++i) {
+            lam[i] = 380.0 + (720.0 - 380.0) * i / (N - 1);
+            white[i]=W[i]; cyan[i]=C[i]; magenta[i]=M[i]; yellow[i]=Y[i];
+            red[i]=R[i]; green[i]=G[i]; blue[i]=B[i];
+        }
+    }
+};
+inline const SmitsBasis& smitsBasis() { static SmitsBasis b; return b; }
+
+// Additive Smits decomposition of a clamped RGB triple into the 10-sample lattice.
+inline std::array<double, SmitsBasis::N> smitsCombine(double r, double g, double b) {
+    const SmitsBasis& B = smitsBasis();
+    std::array<double, SmitsBasis::N> ret{};   // value-initialised to 0
+    auto add = [&](const double* basis, double w) {
+        for (int i = 0; i < SmitsBasis::N; ++i) ret[i] += w * basis[i];
+    };
+    if (r <= g && r <= b) {
+        add(B.white, r);
+        if (g <= b) { add(B.cyan, g - r);    add(B.blue,  b - g); }
+        else        { add(B.cyan, b - r);    add(B.green, g - b); }
+    } else if (g <= r && g <= b) {
+        add(B.white, g);
+        if (r <= b) { add(B.magenta, r - g); add(B.blue,  b - r); }
+        else        { add(B.magenta, b - g); add(B.red,   r - b); }
+    } else {
+        add(B.white, b);
+        if (r <= g) { add(B.yellow, r - b);  add(B.green, g - r); }
+        else        { add(B.yellow, g - b);  add(B.red,   r - g); }
+    }
+    for (auto& v : ret) v = std::clamp(v, 0.0, 1.0);   // guarantee a physical reflectance
+    return ret;
+}
+
+// --- Plain 3-box RGB->reflectance ------------------------------------------
+// The simplest possible upsampler: three fixed rectangular reflectance bands
+// (B [400,500), G [500,600), R [600,700) nm). Rather than dumping r,g,b straight
+// into the boxes (which would badly mis-reproduce the colour), the three band
+// heights are *calibrated* — each unit band's response under D65 through the CIE
+// observer is precomputed as a column of a 3x3, and its inverse maps a target
+// linear-sRGB triple to the heights that reconstruct it. So a plain box still
+// round-trips as well as a 3-primary basis can (heights clamped to [0,1], so very
+// saturated colours degrade gracefully). Cheapest option; sharp band edges make
+// it handy for testing dispersion/spectral response (K1).
+struct BoxBasis {
+    static constexpr double edges[4] = {400.0, 500.0, 600.0, 700.0};   // B, G, R
+    double Minv[9];   // linear-sRGB target -> (hBlue, hGreen, hRed)
+    BoxBasis() {
+        const Basis& B = basis();
+        double M[9];   // columns: linear-sRGB response of each unit band
+        for (int band = 0; band < 3; ++band) {
+            double lo = edges[band], hi = edges[band + 1];
+            double X = 0, Y = 0, Z = 0;
+            for (int i = 0; i < B.N; ++i) {
+                if (B.lam[i] >= lo && B.lam[i] < hi) { X += B.wX[i]; Y += B.wY[i]; Z += B.wZ[i]; }
+            }
+            Vec3 lin = xyzToLinearSrgb(Vec3{X, Y, Z});
+            M[0 * 3 + band] = lin.x; M[1 * 3 + band] = lin.y; M[2 * 3 + band] = lin.z;
+        }
+        // 3x3 inverse (cofactor / determinant); identity fallback if singular.
+        double d = M[0]*(M[4]*M[8]-M[5]*M[7]) - M[1]*(M[3]*M[8]-M[5]*M[6]) + M[2]*(M[3]*M[7]-M[4]*M[6]);
+        if (std::fabs(d) < 1e-12) { for (int i = 0; i < 9; ++i) Minv[i] = (i % 4 == 0) ? 1.0 : 0.0; return; }
+        double id = 1.0 / d;
+        Minv[0] =  (M[4]*M[8]-M[5]*M[7]) * id;
+        Minv[1] = -(M[1]*M[8]-M[2]*M[7]) * id;
+        Minv[2] =  (M[1]*M[5]-M[2]*M[4]) * id;
+        Minv[3] = -(M[3]*M[8]-M[5]*M[6]) * id;
+        Minv[4] =  (M[0]*M[8]-M[2]*M[6]) * id;
+        Minv[5] = -(M[0]*M[5]-M[2]*M[3]) * id;
+        Minv[6] =  (M[3]*M[7]-M[4]*M[6]) * id;
+        Minv[7] = -(M[0]*M[7]-M[1]*M[6]) * id;
+        Minv[8] =  (M[0]*M[4]-M[1]*M[3]) * id;
+    }
+};
+inline const BoxBasis& boxBasis() { static BoxBasis b; return b; }
+
+// --- Meng 2015 "smoothest spectrum" grid -----------------------------------
+// Meng, Simon, Hanika & Dachsbacher, "Physically Meaningful Rendering using
+// Tristimulus Colours" (EGSR 2015): rather than fitting an analytic shape (JH)
+// or mixing fixed basis curves (Smits/box), tabulate the *smoothest* reflectance
+// — the one minimising roughness sum (s[i+1]-s[i])^2 — that realises a given
+// chromaticity at the greatest attainable brightness, then interpolate the table
+// and rescale to the requested luminance. Smoothness matters because a smooth
+// reflectance is what real pigments look like, so re-illuminating it under a
+// non-D65 light (or dispersing it) behaves plausibly instead of ringing.
+//
+// The table (meng_table.h) is OURS: the paper's supplemental data carries no
+// licence, so tools/bake_meng.py re-solves the same optimisation from scratch
+// against ftrace's own observer/D65. Three departures from the paper's grid,
+// all of which make the result *exact* rather than approximate (details and
+// derivations in bake_meng.py):
+//   * the lattice is barycentric over the sRGB primary triangle rather than a
+//     rotated grid over the whole locus — legitimate because every colour
+//     ftrace upsamples comes from `rgb r g b`, so the enclosing cell follows in
+//     closed form from the colour itself: no search, no inside/outside test;
+//   * vertex k is weighted by bary_k/T_k with T_k = X+Y+Z of its spectrum,
+//     which lands the mix on the requested chromaticity exactly (a chromaticity
+//     is an (X+Y+Z)-weighted mean, so unweighted blending drifts off-hue);
+//   * the tabulated spectra are normalised to unit luminance and solved with NO
+//     upper bound, so scaling by the requested Y is exactly optimal (the cone
+//     {s >= 0} is scale-invariant; the box {0 <= s <= 1} is not, and clamping
+//     the table to it costs real smoothness — see bake_meng.py's smoothest()).
+// Measured against a from-scratch solve of the same colour, the result is the
+// true global minimum-roughness reflectance to ~0.2%, with zero colour error.
+//
+// X+Y+Z of each unit sRGB primary — the factor converting a linear-sRGB
+// component into its share of the chromaticity mix (column sums of linSrgbToXyz).
+inline constexpr double MENG_PRIM_SUM[3] = {
+    0.4124 + 0.2126 + 0.0193,
+    0.3576 + 0.7152 + 0.1192,
+    0.1805 + 0.0722 + 0.9505,
+};
+
+// Row-major index of lattice point (a,b), a+b <= MENG_ORDER. Clamped so a
+// degenerate cell on the triangle's edge can never index out of the table (the
+// offending corner always carries weight 0 there anyway).
+inline int mengVertex(int a, int b) {
+    a = std::clamp(a, 0, MENG_ORDER);
+    b = std::clamp(b, 0, MENG_ORDER - a);
+    return a * (MENG_ORDER + 1) - (a * (a - 1)) / 2 + b;
+}
+
+// The interpolated, luminance-matched reflectance samples for a linear-sRGB
+// colour, on the table's own 5 nm lattice. Empty (all-zero) for black.
+inline std::array<double, MENG_N> mengSamples(double r, double g, double b) {
+    std::array<double, MENG_N> out{};
+    r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
+
+    // Barycentric coordinates in the primary triangle: component * primary sum.
+    double lr = r * MENG_PRIM_SUM[0], lg = g * MENG_PRIM_SUM[1], lb = b * MENG_PRIM_SUM[2];
+    double tot = lr + lg + lb;
+    if (tot < 1e-12) return out;                       // black -> zero reflectance
+    lr /= tot; lg /= tot;
+
+    // Locate the enclosing sub-triangle of the order-N lattice.
+    double u = lr * MENG_ORDER, v = lg * MENG_ORDER;
+    int i = std::min((int)u, MENG_ORDER - 1);
+    int j = std::min((int)v, MENG_ORDER - 1);
+    double fu = u - i, fv = v - j;
+    int   ia[3]; int jb[3]; double wt[3];
+    if (fu + fv <= 1.0) {                              // lower ("upright") triangle
+        ia[0]=i;   jb[0]=j;   wt[0]=1.0 - fu - fv;
+        ia[1]=i+1; jb[1]=j;   wt[1]=fu;
+        ia[2]=i;   jb[2]=j+1; wt[2]=fv;
+    } else {                                           // upper ("inverted") triangle
+        ia[0]=i+1; jb[0]=j;   wt[0]=1.0 - fv;
+        ia[1]=i;   jb[1]=j+1; wt[1]=1.0 - fu;
+        ia[2]=i+1; jb[2]=j+1; wt[2]=fu + fv - 1.0;
+    }
+
+    // Mix, dividing each vertex by its own X+Y+Z so the result's chromaticity is
+    // exactly the barycentric mix of the corners' (a chromaticity is an
+    // (X+Y+Z)-weighted mean, so unweighted blending would drift off-hue).
+    double wsum = 0.0;
+    for (int k = 0; k < 3; ++k) {
+        if (wt[k] <= 0.0) continue;
+        int idx = mengVertex(ia[k], jb[k]);
+        double w = wt[k] / MENG_SUM[idx];
+        for (int s = 0; s < MENG_N; ++s) out[s] += w * MENG_SPECTRA[idx][s];
+        wsum += w;
+    }
+    if (wsum <= 0.0) return out;
+    for (double& s : out) s /= wsum;
+
+    // Rescale to the requested luminance, then clamp to a physical reflectance.
+    // The vertices carry Y = 1, so this is a pure scale — and because they were
+    // solved without an upper bound over the scale-invariant cone {s >= 0}, the
+    // scaled result is still the exact optimum. Clamping (the paper's own
+    // simplest fix-up) therefore only bites for colours brighter than ANY smooth
+    // reflectance of that chromaticity can be — e.g. pure sRGB white, whose
+    // chromaticity differs from that of a flat reflectance under ftrace's D65.
+    double tX, tY, tZ; linSrgbToXyz(r, g, b, tX, tY, tZ);
+    const Basis& B = basis();
+    double mixY = 0.0;
+    for (int n = 0; n < B.N; ++n) {
+        int s = std::clamp((int)std::lround((B.lam[n] - MENG_LAMBDA_MIN) / MENG_LAMBDA_STEP),
+                           0, MENG_N - 1);
+        mixY += out[s] * B.wY[n];
+    }
+    if (mixY < 1e-12) { out.fill(0.0); return out; }
+    double scale = tY / mixY;
+    for (double& s : out) s = std::clamp(s * scale, 0.0, 1.0);
+    return out;
+}
+
 } // namespace upsample
 
 // Build a near-monochromatic *emission* Spectrum from a linear-sRGB triple: a
@@ -272,6 +476,60 @@ inline Spectrum rgbToLineEmission(double r, double g, double b, double sigmaOver
     double sigma = (sigmaOverride > 0.0) ? sigmaOverride
                                          : 5.0 + 125.0 * (1.0 - d.purity);
     return gaussianBand(d.lambda, sigma, 1.0);
+}
+
+// Build a reflectance Spectrum from a linear-sRGB triple (Smits 1999). The 10
+// tabulated samples are combined additively then linearly interpolated in λ;
+// outside [380,720] nm the endpoint value is held.
+inline Spectrum rgbToReflectanceSmits(double r, double g, double b) {
+    r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
+    auto vals = upsample::smitsCombine(r, g, b);
+    const upsample::SmitsBasis& B = upsample::smitsBasis();
+    std::array<double, upsample::SmitsBasis::N> lam;
+    for (int i = 0; i < upsample::SmitsBasis::N; ++i) lam[i] = B.lam[i];
+    return [vals, lam](double w) -> double {
+        const int N = upsample::SmitsBasis::N;
+        if (w <= lam[0])     return vals[0];
+        if (w >= lam[N - 1]) return vals[N - 1];
+        int i = 0; while (i < N - 1 && w > lam[i + 1]) ++i;
+        double t = (w - lam[i]) / (lam[i + 1] - lam[i]);
+        return vals[i] * (1.0 - t) + vals[i + 1] * t;
+    };
+}
+
+// Build a reflectance Spectrum from a linear-sRGB triple (plain calibrated 3-box).
+// Three rectangular bands whose heights are solved to reproduce the colour under
+// D65; heights clamped to [0,1]. Zero outside [400,700) nm.
+inline Spectrum rgbToReflectanceBox(double r, double g, double b) {
+    r = std::clamp(r, 0.0, 1.0); g = std::clamp(g, 0.0, 1.0); b = std::clamp(b, 0.0, 1.0);
+    const upsample::BoxBasis& BB = upsample::boxBasis();
+    std::array<double, 3> h;
+    for (int i = 0; i < 3; ++i)
+        h[i] = std::clamp(BB.Minv[i*3+0]*r + BB.Minv[i*3+1]*g + BB.Minv[i*3+2]*b, 0.0, 1.0);
+    return [h](double w) -> double {
+        if (w >= 400.0 && w < 500.0) return h[0];   // blue band
+        if (w >= 500.0 && w < 600.0) return h[1];   // green band
+        if (w >= 600.0 && w < 700.0) return h[2];   // red band
+        return 0.0;
+    };
+}
+
+// Build a reflectance Spectrum from a linear-sRGB triple (Meng 2015 smoothest-
+// spectrum grid). The 81 tabulated samples are linearly interpolated in lambda;
+// outside [380,780] nm the endpoint value is held — which is exactly the
+// convention tools/bake_meng.py folded into the weights it solved against, so
+// the round-trip through reflectanceToLinearSrgbD65 is exact (not approximate).
+inline Spectrum rgbToReflectanceMeng(double r, double g, double b) {
+    auto vals = upsample::mengSamples(r, g, b);
+    return [vals](double w) -> double {
+        constexpr int N = upsample::MENG_N;
+        double t = (w - upsample::MENG_LAMBDA_MIN) / upsample::MENG_LAMBDA_STEP;
+        if (t <= 0.0)      return vals[0];
+        if (t >= N - 1)    return vals[N - 1];
+        int i = (int)t;
+        double f = t - i;
+        return vals[i] * (1.0 - f) + vals[i + 1] * f;
+    };
 }
 
 // Build a reflectance Spectrum from a linear-sRGB triple (Jakob-Hanika fit).

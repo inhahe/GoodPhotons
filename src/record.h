@@ -36,6 +36,11 @@ struct RecStop {
     double      pos    = 0.0;    // domain position in [lo,hi] after redistribution
     bool        pinned = false;  // author gave an explicit p:<pos> prefix
     std::string token;           // raw value token (number / expression / spectrum:ref)
+    // Arity-D stop: the component tokens, for a channel written with the generalized
+    // stop grammar's delimiter ladder (`reflect rgb 0 0 0, 1 1 1` -> two 3-component
+    // stops). Empty for an ordinary arity-1 stop, where `token` is the whole value —
+    // so every pre-existing reader of `token` keeps working untouched.
+    std::vector<std::string> comps;
     // --- compiled forms (stage 2) ---
     std::vector<PatNode> expr;   // Scalar channel: program evaluated per-hit (Const for a literal)
     Spectrum             color;  // Spectrum channel: resolved reflectance
@@ -46,6 +51,12 @@ struct RecStop {
 struct RecChannel {
     std::string          name;
     ChanKind             kind = ChanKind::Scalar;
+    // Inline-colour channels only: the channel-level colour head written once before
+    // the stops (`reflect rgb 0 0 0, 1 1 1`), e.g. "rgb" / "hsvmeng". Empty for a
+    // scalar channel or for the `spectrum:`-ref colour form, where each stop names its
+    // own spectrum. Purely a load-time record of how the author wrote it — by the time
+    // stage 2 finishes, an inline-colour channel is indistinguishable from a ref one.
+    std::string          space;
     std::vector<RecStop> stops;  // author order == ascending pos after redistribution
     // Spectrum channels only: baked JH sigmoid coeffs over the driver domain (filled
     // by recBakeSpectrumChannels). Empty for scalar channels (they evaluate live).

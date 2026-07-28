@@ -119,6 +119,26 @@ struct BackwardRenderer {
             w = fall * cosSurf / dist2 * stG;                // I(w)/dist^2 (× BRDF & SPD by caller)
             return true;
         }
+        if (em.shape == EmitterShape::Sun) {
+            // Distant directional sun: sample wi uniformly in the solar cone about
+            // -beamDir (solid-angle pdf 1/Omega) and shadow-ray it to the scene exit —
+            // there is no finite light distance, so no 1/dist^2 and no cosLight. In
+            // solid-angle measure w = cos(surf)/pdfW = cos(surf)*Omega, and since spdFn
+            // is the sun's RADIANCE the caller's (rho/PI)*SPD*w reproduces the textbook
+            // (rho/PI)*E_perp*cos(surf) for the irradiance the light was authored with.
+            // Two rng draws, matching the area-light path below, so adding a sun does
+            // not reshuffle any other emitter's stream.
+            double s1 = rng.uniform(), s2 = rng.uniform();
+            Vec3 wi = em.sampleCone(-em.beamDir, s1, s2);
+            double cosSurf = dot(h.n, wi);
+            if (cosSurf <= 0) return false;
+            double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
+            if (stG <= 0.0) return false;                    // behind true geometry: hard shadow
+            dist = length(scene.sceneCenter - h.p) + scene.sceneRadius;   // to the scene exit
+            if (scene.occluded(h.p + ngo * 1e-6, wi, dist)) return false;
+            w = cosSurf * em.spotOmega * stG;
+            return true;
+        }
         double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 y, nLight, wi;
         double pdfW = 0.0;
@@ -146,7 +166,14 @@ struct BackwardRenderer {
             w = cosSurf / pdfW * stG;                        // solid-angle measure
             return true;
         }
-        if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
+        // quad / mesh / interior-sphere / cylinder fallback. emitterSamplePoint also
+        // returns this point's `emit pattern:` multiplier (1.0 when there is none, so
+        // every unpatterned scene stays bit-identical); folding it into the λ-independent
+        // geometry weight `w` makes both the scalar and hero NEE pick it up at once, and
+        // matches the emitSlot() factor the emission-on-hit side applies at the same
+        // surface point — which is what keeps the MIS pair consistent.
+        double epat = 1.0;
+        if (!cylVisible) epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
         Vec3 toL = y - h.p;
         double dist2 = dot(toL, toL);
         dist = std::sqrt(dist2);
@@ -160,6 +187,7 @@ struct BackwardRenderer {
         if (scene.occluded(h.p + ngo * 1e-6, wi, dist - 2e-6)) return false;
         double G = cosSurf * cosLight / dist2;           // geometry term
         w = G * effArea * stG;                           // pdf_area = 1/effArea (visible area for cylinder)
+        if (epat != 1.0) w *= epat;                      // no-op (and bit-identical) without a pattern
         return true;
     }
 
@@ -249,6 +277,20 @@ struct BackwardRenderer {
                 total += albedo * phase * emitW * fall / dist2 * T;
                 continue;
             }
+            if (em.shape == EmitterShape::Sun) {
+                // Distant sun at a volume vertex: cone-sampled direction (pdf 1/Omega),
+                // no surface cosine, transmittance to the scene exit. 1/pdfW = Omega.
+                double s1 = rng.uniform(), s2 = rng.uniform();
+                Vec3 wi = em.sampleCone(-em.beamDir, s1, s2);
+                double dist = length(scene.sceneCenter - p) + scene.sceneRadius;
+                if (scene.occluded(p + wi * 1e-6, wi, dist)) continue;
+                double phase  = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
+                double albedo = scene.backwardMedium().albedo(lambda);
+                double T = std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
+                double emitW = (cached ? spdV : em.spdFn(lambda)) * invPdfLambda;
+                total += albedo * phase * emitW * em.spotOmega * T;
+                continue;
+            }
             double u1 = rng.uniform(), u2 = rng.uniform();
             Vec3 y, nLight, wi;
             double dist = 0.0, pdfW = 0.0;
@@ -268,7 +310,10 @@ struct BackwardRenderer {
                 double phase = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
                 contrib = albedo * phase * emitW / pdfW;   // solid-angle measure
             } else {
-                if (!cylVisible) em.samplePoint(u1, u2, y, nLight);   // quad / interior-sphere / cylinder fallback
+                // quad / mesh / interior-sphere / cylinder fallback; also returns the
+                // sampled point's emission-pattern factor (1.0 when unpatterned).
+                double epat = 1.0;
+                if (!cylVisible) epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
                 Vec3 toL = y - p;
                 double dist2 = dot(toL, toL);
                 dist = std::sqrt(dist2);
@@ -279,6 +324,7 @@ struct BackwardRenderer {
                 double phase = scene.backwardMedium().phaseValue(dot(wIn, wi), lambda);
                 double G = cosLight / dist2;               // no surface cosine at a volume vertex
                 contrib = albedo * phase * emitW * G * effArea;
+                if (epat != 1.0) contrib *= epat;
             }
             contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
             total += contrib;
@@ -460,7 +506,7 @@ struct BackwardRenderer {
             }
             case MatType::Filter: {
                 // Colored gel filter: pass straight through, survive with prob T(lambda).
-                double t = clamp01(m.transmit(lambda));
+                double t = clamp01(transmitSlot(scene, m, h, lambda));
                 if (rng.uniform() >= t) return false;      // absorbed
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
                 specularArrival = true; return true;
@@ -527,7 +573,7 @@ struct BackwardRenderer {
                 // Two-lobe Lambertian: NEE the reflect lobe in the front hemisphere and
                 // the transmit lobe in the back (a normal-flipped Hit reuses neeLight/env).
                 double rhoR = clamp01(diffuseReflectance(scene, m, h, lambda));
-                double rhoT = clamp01(m.transmit(lambda));
+                double rhoT = clamp01(transmitSlot(scene, m, h, lambda));
                 double sum = rhoR + rhoT;
                 if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }   // energy guard
                 L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng, spdCache);
@@ -666,6 +712,12 @@ struct BackwardRenderer {
                         L += thr * Lenv * wMis;
                     }
                 }
+                // Directly-viewed solar disc: camera / specular arrivals only. A diffuse
+                // or volume vertex already spent its one estimator on the sun via
+                // NEE (emitterGeom / neeVolume) and sets specularArrival = false, so
+                // this is a clean single-strategy split, not a missing MIS weight.
+                if (scene.sunCount > 0 && specularArrival)
+                    L += thr * scene.sunRadiance(ray.d, lambda) * invPdfLambda;
                 return L;
             }
             const Material* mp = &scene.mats[h.matId];
@@ -698,10 +750,13 @@ struct BackwardRenderer {
             const Material& m = *mp;
 
             // Emission (add only on specular/camera arrival; NEE covers diffuse).
-            // The surface's own emitted radiance Le=m.emit(lambda), weighted by the
+            // The surface's own emitted radiance Le=emitSlot(...), weighted by the
             // reciprocal wavelength pdf (= its SPD integral for a single light).
+            // emitSlot applies any `emit pattern:` at this hit; the NEE side below
+            // applies the SAME profile via emitterSamplePoint, which is what keeps the
+            // two estimators consistent (see Material::emitPat).
             if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0)
-                L += thr * m.emit(lambda) * invPdfLambda;
+                L += thr * emitSlot(scene, m, h, lambda) * invPdfLambda;
 
             if (!interactMaterial(scene, m, h, mats, ray, lambda, invPdfLambda, thr, L,
                                   specularArrival, contBsdfPdf, stk, rng, spdCache))
@@ -768,6 +823,9 @@ struct BackwardRenderer {
                             L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i] * wMis;
                     }
                 }
+                if (scene.sunCount > 0 && specularArrival)   // directly-viewed solar disc
+                    for (int i = 0; i < nUp; ++i)
+                        L[i] += thr[i] * scene.sunRadiance(ray.d, lam[i]) * invPdf[i];
                 finish(); return;
             }
 
@@ -797,16 +855,20 @@ struct BackwardRenderer {
             const Material& m = *mp;
 
             // Surface emission on a specular/camera arrival (NEE covers diffuse).
-            if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0)
+            // An `emit pattern:` is achromatic, so evaluate it ONCE for the whole hero
+            // bundle rather than per-wavelength inside emitSlot.
+            if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0) {
+                double ep = (m.emitPat < 0) ? 1.0 : slotPatMul(scene, m.emitPat, h);
                 for (int i = 0; i < nUp; ++i)
-                    L[i] += thr[i] * m.emit(lam[i]) * invPdf[i];
+                    L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
+            }
 
             switch (m.type) {
                 case MatType::DiffuseTransmit: {
                     double rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i) {
                         double rr = clamp01(diffuseReflectance(scene, m, h, lam[i]));
-                        double rt = clamp01(m.transmit(lam[i]));
+                        double rt = clamp01(transmitSlot(scene, m, h, lam[i]));
                         double s = rr + rt;
                         if (s > 1.0) { rr /= s; rt /= s; }       // per-λ energy guard
                         rhoR[i] = rr; rhoT[i] = rt;
@@ -819,16 +881,24 @@ struct BackwardRenderer {
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
                     if (directOnly) { finish(); return; }        // Whitted: no diffuse indirect
-                    double sumHero = rhoR[0] + rhoT[0];
+                    // Lobe pick + RR over the whole bundle (see the Diffuse case): the
+                    // reflect/transmit probabilities are the per-lobe MAX over live λ, so no
+                    // secondary is ever amplified. The maxima can sum past 1 (each λ alone is
+                    // guarded), in which case both shrink proportionally. At nUp == 1 the two
+                    // maxima are rhoR[0]/rhoT[0], their sum is already <= 1, and every
+                    // reweight is *= 1.0 — the scalar code verbatim.
+                    double qR = hero::maxOf(rhoR, nUp), qT = hero::maxOf(rhoT, nUp);
+                    double sumHero = qR + qT;
+                    if (nUp > 1 && sumHero > 1.0) { qR /= sumHero; qT /= sumHero; sumHero = qR + qT; }
                     double u = rng.uniform();
-                    if (u < rhoR[0]) {                           // reflect (front)
-                        for (int i = 1; i < nUp; ++i) thr[i] *= rhoR[i] / rhoR[0];
+                    if (u < qR) {                                // reflect (front)
+                        for (int i = 0; i < nUp; ++i) thr[i] *= rhoR[i] / qR;
                         Vec3 wOut = cosineHemisphere(h.n, rng);
                         contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
                         ray = Ray{h.p + h.n * 1e-6, wOut};
                         specularArrival = false; break;
                     } else if (u < sumHero) {                    // transmit (back)
-                        for (int i = 1; i < nUp; ++i) thr[i] *= rhoT[i] / rhoT[0];
+                        for (int i = 0; i < nUp; ++i) thr[i] *= rhoT[i] / qT;
                         Vec3 wOut = cosineHemisphere(-h.n, rng);
                         contBsdfPdf = std::max(0.0, dot(wOut, -h.n)) / PI;
                         ray = Ray{h.p - h.n * 1e-6, wOut};
@@ -836,14 +906,48 @@ struct BackwardRenderer {
                     }
                     finish(); return;                            // absorbed
                 }
+                case MatType::Mirror:
+                case MatType::Filter:
+                case MatType::Glossy: {
+                    // ACHROMATIC delta lobes: specular (so no NEE, specularArrival stays
+                    // true) but the outgoing DIRECTION does not depend on λ — a mirror
+                    // reflects, a gel passes straight through, a glossy lobe is the mirror
+                    // direction blurred by a λ-independent roughness. So the bundle keeps
+                    // riding; only the per-λ coefficient differs. Without this the hero
+                    // bundle died at the first chrome/gel surface, which on a mirror-heavy
+                    // scene left hero buying almost nothing (see known-issues.md).
+                    //
+                    // The scalar path survives by ANALOG Russian roulette on the hero's own
+                    // coefficient with thr unchanged. Rolling that coin on the hero alone
+                    // would kill live secondaries whenever c_hero == 0 (a Wratten gel is 0
+                    // across most of the spectrum), so the survival probability is the MAX
+                    // over live λ and the survivors reweight by c_i/q. With nUp == 1,
+                    // q == c[0] and thr[0] *= 1.0, so this is the scalar code verbatim —
+                    // same rng draws, same order, bit-identical.
+                    double c[hero::kHeroMax];
+                    for (int i = 0; i < nUp; ++i)
+                        c[i] = (m.type == MatType::Filter) ? clamp01(transmitSlot(scene, m, h, lam[i]))
+                                                           : clamp01(reflectSlot(scene, m, h, lam[i]));
+                    const double q = hero::maxOf(c, nUp);
+                    if (rng.uniform() >= q) { finish(); return; }   // RR absorb (q == 0 always absorbs)
+                    for (int i = 0; i < nUp; ++i) thr[i] *= c[i] / q;
+                    if (m.type == MatType::Mirror) {
+                        ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                    } else if (m.type == MatType::Filter) {
+                        ray = Ray{h.p + ray.d * 1e-6, ray.d};       // direction unchanged
+                    } else {
+                        Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
+                        if (dot(o, h.n) <= 0) { finish(); return; }
+                        ray = Ray{h.p + h.n * 1e-6, o};
+                    }
+                    specularArrival = true;
+                    break;
+                }
                 case MatType::Dielectric:
                 case MatType::ThinFilm:
                 case MatType::Multilayer:
-                case MatType::Mirror:
                 case MatType::Grating:
                 case MatType::HalfMirror:
-                case MatType::Filter:
-                case MatType::Glossy:
                 case MatType::Fluorescent: {
                     // Dispersive / wavelength-switching: terminate secondaries, then run
                     // the shared scalar interaction on the (boosted) hero channel.
@@ -861,9 +965,16 @@ struct BackwardRenderer {
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng);
                     if (directOnly) { finish(); return; }         // Whitted: no diffuse indirect
-                    double rhoHero = rho[0];
-                    if (rng.uniform() >= rhoHero) { finish(); return; }   // hero RR absorb
-                    for (int i = 1; i < nUp; ++i) thr[i] *= rho[i] / rhoHero;  // secondary reweight
+                    // Continuation RR over the WHOLE bundle: the survival probability is
+                    // max_i rho_i, not the hero's own albedo, and every live λ reweights by
+                    // rho_i/q <= 1. Rolling the coin on the hero alone (thr[i] *= rho_i/rho_0)
+                    // amplifies a secondary by up to rho_max/rho_hero — on a saturated wall
+                    // (redWall spans 0.05..0.75) that is a 15x weight spike, and the noise it
+                    // injects grew once the bundle started surviving mirrors/gels. With
+                    // nUp == 1, q == rho[0] and thr[0] *= 1.0 — the scalar code verbatim.
+                    const double q = hero::maxOf(rho, nUp);
+                    if (rng.uniform() >= q) { finish(); return; }         // RR absorb
+                    for (int i = 0; i < nUp; ++i) thr[i] *= rho[i] / q;   // bounded reweight
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
                     ray = Ray{h.p + h.n * 1e-6, wOut};
@@ -905,20 +1016,13 @@ struct BackwardRenderer {
                              0xD1B54A32D192ED03ULL);
                     if (useHero) {
                         // One stratified base draw → hero + C-1 secondary wavelengths,
-                        // all from the emission CDF. The hero (index 0) must have a
-                        // valid pdf; dead secondaries (pdf 0) carry invPdf 0 and splat 0.
-                        double u = rng.uniform();
+                        // all from the emission CDF (hero.h policy 1). The hero (index 0)
+                        // must have a valid pdf; dead secondaries (pdf 0) carry invPdf 0
+                        // and splat 0.
                         double lamA[hero::kHeroMax], invA[hero::kHeroMax];
                         double pdfA[hero::kHeroMax];
-                        pdfA[0] = 0.0;
-                        lamA[0] = scene.emitSampler.sampleAt(u, pdfA[0]);
-                        if (pdfA[0] <= 0) continue;
-                        for (int i = 1; i < C; ++i) {
-                            double uu = u + (double)i / C;
-                            if (uu >= 1.0) uu -= 1.0;            // wrap into [0,1)
-                            pdfA[i] = 0.0;
-                            lamA[i] = scene.emitSampler.sampleAt(uu, pdfA[i]);
-                        }
+                        if (!hero::sampleBundle(scene.emitSampler, rng.uniform(), C,
+                                                lamA, pdfA)) continue;
                         // Fill the per-sample SPD table, then derive invA from it by
                         // replicating Scene::invPdfLambda on the cached values (same
                         // emitter order, same zero guard — bit-identical). The NEE

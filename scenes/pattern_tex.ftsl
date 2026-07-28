@@ -1,0 +1,66 @@
+# pattern_tex.ftsl — sampling an image as a TERM inside a pattern expression,
+# with the `tex:<name>(u, v)` pattern-VM op (see FTSL.md §6.1).
+#
+# Binding an image to a slot (`reflect texture:gray`) pastes the picture on. `tex:`
+# instead makes the picture one *operand* of a formula, so it can be masked, warped,
+# thresholded and blended like any other subexpression. None of the three surfaces
+# below is expressible by binding the image directly to a slot.
+#
+# The image (scenes/graychecker.ppm, from scraps/gen_graychecker.py) is a grayscale
+# checker with a horizontal ramp laid over it, so it has both hard edges and smooth
+# structure. Note `encoding linear`: the value is DATA here, not colour, so we want
+# the stored levels rather than an sRGB decode.
+#
+#   ftrace -in scenes/pattern_tex.ftsl -n 40000000 -window -keepwindow \
+#          -o png/pattern_tex.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+texture "gray" {
+    file     scenes/graychecker.ppm
+    encoding linear
+    filter   nearest
+    wrap     repeat
+}
+
+# BACK WALL — the image AND-ed with a procedural sine ripple, so the checker only
+# shows through inside the bright bands. Two independent sources, one weight.
+pattern "rippled" { expr "saturate(tex:gray(u, v) * (0.5 + 0.5*sin(26*v)) * 2)" }
+
+# FLOOR — the image blended against a WORLD-space band and then thresholded: the
+# formula mixes surface data with scene-space geometry, which a slot cannot do.
+pattern "masked"  { expr "smoothstep(0.35, 0.65, mix(tex:gray(u, v), 0.5 + 0.5*sin(24*x), 0.45))" }
+
+# LEFT WALL — a warped lookup. The sampler's coordinates are themselves expressions,
+# so the checker ripples along v.
+pattern "warped"  { expr "tex:gray(u + 0.05*sin(16*v), v)" }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "green" { type diffuse reflect greenwall }
+material "dark"  { type diffuse reflect rgb 0.06 0.07 0.28 }
+material "lite"  { type diffuse reflect rgb 0.93 0.93 0.93 }
+material "warm"  { type diffuse reflect rgb 0.88 0.46 0.14 }
+
+material "backwall" { type mix  layer "lite" 0.5  layer "dark" 0.5  weight_map pattern:rippled }
+material "floormat" { type mix  layer "lite" 0.5  layer "warm" 0.5  weight_map pattern:masked  }
+material "leftwall" { type mix  layer "lite" 0.5  layer "dark" 0.5  weight_map pattern:warped  }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material floormat }
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material backwall }
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material leftwall }
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 400 400 }
+}

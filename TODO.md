@@ -96,6 +96,196 @@ Origin tags point at the authoritative design text for each item.
     * These land with **N-D scatterpoint + N-D grid datatypes ported into ftrace** (mirroring loom's `data.Grid` /
       scatter + `interp.py` curves) — see the loom→ftrace data-port item. Grammar first (shared `.epeg`), then the
       C++ front-end at the J3c port, then the runtime sampler.
+    * **STATUS (2026-07-26): the N-D GRID datatype + sampler is DONE in ftrace (VERSION 0.71.0).** Increment 3's
+      regular-lattice half shipped ahead of the axis-tuple *syntax* (increment 2) by taking the call form the
+      lexer already supports — `grid:<name>(c0, …)`, the `tex:<name>(u,v)` precedent — so the runtime exists before
+      the sugar. What landed:
+      - `src/pattern.h`: `PatOp::Grid`, `PatGrid` (ndim ≤ `PAT_GRID_MAX_DIM` = 4, `shape`/`lo`/`hi`/`outside` +
+        `off`/`count` into a shared pool), `PatGridOutside {Clamp, Wrap, Extrapolate}`, and the shared
+        `__host__ __device__` `patGridCellFrac` / `patGridSample` (separable N-linear over 2^ndim corners, C order
+        with axis 0 outermost). Samples are addressed by **offset into one flat pool**, never by pointer, so the
+        pool can grow and the header uploads to the GPU verbatim.
+      - `PatGridScope` + tokenizer/compiler support: `grid:` scans as ONE identifier like `tex:`, but its **arity is
+        the grid's own `ndim`**, resolved at compile time — the first op whose argument count is not a property of
+        the function name. Wrong arity, unknown name, an uncalled `grid:<name>` and a bare `grid` are all compile
+        errors.
+      - `Scene::grids` / `Scene::gridPool`, published via `bindPatScene` (which now also covers `bindPatTex`, so a
+        future table can't be missed at one of the hand-built-PatCtx sites).
+      - `src/ftsl.h`: the `grid "name" { shape … lo … hi … outside … data { … } }` element, loaded in a new **Pass
+        1a** (before textures, so a procedural `texture { rgb "…" }` can sample one). `lo`/`hi` implement loom's
+        `_resolve_lo`/`_resolve_hi` defaults exactly (absent-`hi` ⇒ unit-spacing index lattice; scalar-`hi` ⇒
+        isotropic lattice from axis 0). `data { … }` uses the flat-word brace body the `palette {}` precedent
+        already parses, so the **shared grammar needed no change**.
+      - `src/render_cuda.cu`: `DScene.grids/gridPool` upload verbatim and `dPatternEval` gained a `PatOp::Grid` case
+        that calls the *same* `patGridSample`. The old `(const DTexture* tex, int nTex)` parameter pair became a
+        `DPatEnv` bundle across all 9 call sites + both forward declarations, so the next table costs one field
+        instead of nine edits.
+      - `ftrace -checkgrid`: deterministic self-test — exact sample recovery, C-order flattening, 1-D…4-D
+        multilinear exactness (worst error 1e-8, float-pool storage), all three `outside` policies, and the
+        compile/arity/scope rules. Cross-backend: `scraps/grid_test.ftsl` at 16384 spp agrees CPU↔GPU to **0.003 %**
+        mean (RMS 0.99/255 — pure MC noise).
+      **Still open here:** the `[[…][…]](u,v)` *authoring* sugar (increment 2) reaching this same datatype.
+      (Several names above were generalized by the scatter port immediately below — `PAT_GRID_MAX_DIM` →
+      `PAT_ND_MAX_DIM`, `PatGridScope` → `PatTableScope`, `Scene::gridPool` → `Scene::dataPool`.)
+    * **STATUS (2026-07-27): increment 3's RAGGED half — the N-D `scatter` datatype + sampler — is DONE
+      (VERSION 0.72.0).** Ported from loom's `data.Scatter` / `interp.ScatterField`: N values at arbitrary
+      positions, blended by **Shepard inverse-distance weighting** `w_i = 1/(d²)^(power/2)`, with a coincident
+      sample (`d² ≤ eps`) returned *exactly* — which is both the correct limit and the singularity guard.
+      Defaults `power = 2` (the cheap `1/d²` path), `eps = 1e-9`. loom's vector-valued `VecScatterField` and its
+      `_local_query` transform were deliberately **not** ported (ftrace's tables are scalar and unit-agnostic).
+      The port was done by **generalizing the grid machinery rather than cloning it**, on the same reasoning as
+      the earlier `DPatEnv` bundling: adding the *next* datatype should cost an enumerator, not a new parameter
+      on `compilePatternExpr` and edits at all its call sites. Concretely:
+      - `src/pattern.h`: `PatOp::Scatter`, `PatScatter` (`ndim`/`count`/`off` into the shared pool + `power`/`eps`),
+        and the shared `__host__ __device__` `patScatterSample`. Samples are **interleaved** at stride `ndim+1`
+        (`p0 … p_{ndim-1}, value`) — one `data { … }` list, because a scatter's positions and values are not
+        separable the way a lattice's are. `PatGridScope` became `PatTableScope` + `PatTableKind {Grid, Scatter}`
+        and `Tok::gridId/gridDim` became `tableId/tableDim`, so one kind-dispatching resolver serves both
+        namespaces (and they *are* separate namespaces: `grid:pts(…)` cannot see a scatter, and vice versa —
+        both directions are covered by the self-tests' must-reject lists).
+      - `Scene::gridPool` became **`Scene::dataPool` — ONE flat float pool shared by both datatypes**, so a scene
+        costs exactly one GPU allocation for its tables however many it declares, of either kind.
+      - `src/ftsl.h`: the `scatter "name" { dim … power … eps … data { … } }` element, loaded in the same Pass 1a
+        as grids; again **no grammar change** was needed (verified by grep: `ftsl_scene.epeg` names neither
+        `grid` nor `scatter` — `plain_header` + the flat-word brace body already cover both).
+      - `src/render_cuda.cu`: `DScene`/`DPatEnv` gained the scatter table beside the grid one and share the
+        renamed pool; `dPatternEval` calls the *same* `patScatterSample`.
+      - `ftrace -checkscatter`: deterministic self-test built on properties that are analytically independent of
+        the implementation — exact reproduction at every sample, 1-D…4-D partition of unity, midpoint == plain
+        mean by symmetry at two powers, the closed-form two-sample weight `(1-q)^p/(q^p+(1-q)^p)` at four powers
+        plus a "higher power sharpens" monotonicity check, and the far-field → mean limit. Worst error 1.4e-7
+        (float-pool storage). Plus the compile/arity/scope/namespace rules. All 11 self-tests pass.
+      - Validation: `scenes/pattern_scatter.ftsl` (five strips: the S-curve two-sample case, the same at power 8
+        collapsing to a step, four irregular 1-D stops showing the plateau at each, and a 5-point 2-D field at
+        powers 2 and 1). Rendered albedo — recovered by dividing out illumination with a flat-0.75 twin render —
+        tracks the analytic IDW at all 81 probe points; CPU↔GPU agree to **0.18/255 mean, 0.81/255 worst** (pure
+        MC noise).
+    * **STATUS (2026-07-26): increment 1 of 3 DONE — the shared grammar + loom's canonical tree parse the call.**
+      `tools/loom/loom/grammar/ftsl.epeg` now carries the axis tuple, and `loom/grammar/values.py` normalizes it
+      (11 new cases in `tests/test_grammar_values.py`; suite 1072 → 1083):
+      ```
+      vpiece    = colour_tag | vsampled | vnums
+      vsampled  = vbracket axistuple? | NAME axistuple
+      axistuple = '(' arg (',' arg)* ')'
+      arg       = NAME '=' coord | coord
+      coord     = vsampled | NAME | NUMBER
+      ```
+      Two deliberate refinements of the sketch below: the tuple hangs off a **piece**, not off the whole `value`, so
+      a call composes *inside* a bigger value (`[[0 1](u), [2 3](v)]`); and a bare `NAME` is a value **only when
+      called**, so adding this cannot make a stray bareword parse as a value. Canonical tree gains `Call(target,
+      args)` / `Arg(formal, driver)` (`target` = an array literal or a called NAME; `driver` = a name, a constant,
+      or a nested `Call`). Argument *order* is intentionally not a grammar rule — the normalizer enforces
+      positionals-before-keywords and no-duplicate-formals so the error can name the axis. `as_sampled()` is where
+      the **unsaturated** error lives (a bare array reaching a field that samples).
+      (Increment 3 is now complete on both halves — the regular `grid` in 0.71.0 and the ragged `scatter` in
+      0.72.0; see the two STATUS blocks above.)
+    * **STATUS (2026-07-27): increment 2 DONE — ftrace parses and RENDERS `[0 1](u)`. Shipped as 0.73.0.**
+      Inline array literals now work at every value site that accepts a `pattern:<name>`, in **both** front ends.
+      - **No lexer change was needed after all** — the "emit `(` as a delimiter only after a `]`" plan below was
+        dropped, because it is context-sensitive and therefore inexpressible in the shared grammar's regex
+        auto-lexer, and because it turned out to be unnecessary. Instead the grammar gained a context-*free*
+        terminal `PARENWORD = /\([^ \t\r\n{}\[\]#"]*\)/` — a token that is *wholly* parenthesised. Longest-match
+        keeps every expression safe: `(a+b)*c` is 7 chars of `WORD` against only 5 of `PARENWORD`, so `WORD` wins.
+        ftrace's legacy tokenizer needs **zero** changes: a call arrives as an ordinary bareword that happens to
+        start `(` and end `)`, which is exactly what `Parser::takeAxisTuple` tests for.
+      - **One production, both meanings.** `selector = '[' sel_item* ']' axistuple?` (with `sel_item = NEWLINE |
+        sub_array | sel_word`) covers *both* jobs of `[ … ]` at a value site — the record stop selector
+        `REC.chan[2]` and an array literal — so exactly one production starts with `[` there and the grammar stays
+        unambiguous. `NEWLINE` as a `sel_item` lets a big literal be laid out over several lines.
+      - **Neither parser decides what the brackets mean.** Both collect the raw shape into the new
+        `ftsl::BrItem` tree (`ftsl::ArrayLit` = items + call text + line) and hand it to the single shared
+        `ftsl::applyBracketGroup`, which applies the five-rule decision (call ⇒ array; else nesting ⇒ unsaturated
+        array; else a dotted/override predecessor ⇒ stop-selector fold; else all-numeric with nothing before ⇒
+        unsaturated array; else drop). Keeping that decision in one place is what stops the two front ends
+        drifting on the one genuinely ambiguous syntax. `diff_value` now compares `Value::array` too.
+      - **The literal is pure sugar.** `Builder::desugarArrays` (a pre-pass run immediately before Pass 1a) turns
+        each literal into an anonymous `grid "__arrN"` + `pattern "__arrN" { expr "grid:__arrN<call>" }` appended
+        to the block list, and rewrites the site to `pattern:__arrN` — so every slot that already takes a pattern
+        works with **no per-site change**. Nesting is the shape (C order, axis 0 outermost, rectangular enforced);
+        the domain is the **unit box** per axis, deliberately unlike the `grid` element's index-lattice default
+        (an inline literal has no domain of its own and is read at normalized `u`/`v`).
+      - **Errors name what the author wrote**, never the generated `__arrN`: unsaturated (with the "no spaces
+        inside the parentheses" rule spelled out), ragged, mixed numbers/groups, non-numeric entry, coordinate
+        count vs nesting level, literal-follows-another-token, and >4 nested axes.
+      - **Validation:** the corpus sweep is unchanged at ok=362 / mismatch=0 (both front ends still agree on all
+        367 authored scenes), all 11 self-tests pass, and — the decisive one — `scenes/pattern_array.ftsl` and a
+        hand-written `grid` + `pattern` twin (`scraps/array_explicit.ftsl`) render **bit-for-bit identically**,
+        which proves the desugar is exactly the sugar it claims to be. A flat-0.75-twin albedo read-out
+        (`scraps/array_profile.py`) additionally confirms the five strips track the analytic N-linear values.
+      - **Deferred:** the keyword-rebind form `(a=u)` (formals don't exist yet — it currently lexes as a call and
+        would fail in the expression compiler), and `NAME axistuple` (`ramp(u)`), which needs no work because
+        ftrace's expression evaluator already reads `name(args)` as a call.
+    * **ADDENDUM — call = sample; late-binding & rebinding of the consumed axis (design intent, user).** The
+      trailing `(...)` is not just a *label* on a literal — it is the **sample call**, exactly like loom's
+      `grid(x, y)`. Two authoring positions, so a material can *define* what an array consumes, or *defer* it to its
+      user:
+      - **Material-side (the array already names its own axis).** `reflect [0 1](u)` bakes the consumed coordinate
+        into the material: the reflectance is `[0 1]` sampled at the surface `u`. The material's author has spent
+        the axis; a user of the material supplies nothing.
+      - **User-side (a bare array, axis left open).** A material may expose an array parameter *un-called*
+        — `reflect [0 1]` — declaring "this is a 1-D array, you pick what drives it." Whoever *instantiates* the
+        material then completes it by calling it: `reflect [0 1](u)` (or `(v)`, `(x)`, a record channel, …). A bare
+        array with no call is an **unsaturated** value — legal to declare, an error to actually *render* until some
+        site saturates it.
+      - **Rebinding an already-named axis: `(a=u)`.** If the material *did* name an axis — say it declared the
+        parameter with a formal axis `a` (`reflect [0 1](a)`) — a user who wants to feed a *different* driver than
+        the formal name uses the **keyword form** `(a=u)` — read `formal=driver` — "bind my `u` to the array's `a`
+        axis." Positional `(u)` rebinds the sole/next axis; keyword `formal=driver` targets a named one. **Keyword
+        rebinds take multiple arguments**, one per axis — e.g. a 2-D array whose formals are `u,v` is rebound to the
+        drivers `a,x` as `(u=a, v=x)` (and `(a=u, b=v)` likewise for formals `a,b`). Mix is allowed the usual way
+        (positionals first, then keywords). This is ordinary call-site argument binding — positional or by-name —
+        lifted onto the array-sample. Semantics to pin when built: whether a formal axis name is a *binding site*
+        (rebindable) vs a *literal coordinate source* (fixed), and the error when a bare array reaches the renderer
+        unsaturated.
+    * **Grammar sketch (shared `.epeg`, one production reused by array / grid / scatter).** The axis tuple hangs off
+      any value; args are positional coords or `name=coord` rebinds:
+      ```
+      sampled   = value axistuple?
+      axistuple = '(' arg (',' arg)* ')'
+      arg       = NAME '=' coord      # keyword rebind  (a=u)
+                | coord                # positional      (u)
+      coord     = NAME | NUMBER | value   # an axis driver: a var (u/v/x), a constant, or a nested sampled value
+      ```
+      Notes: `value` is the existing context-free array/vec tree (`values.py`); `axistuple` is optional, so an
+      un-called array stays a plain `value` (the *unsaturated* case). The `arg (',' arg)*` repetition is what makes
+      multi-axis calls work — positional `(u, v)` or keyword `(u=a, v=x)` (and mixes, positionals first). `coord`
+      allowing a nested `sampled` gives composition (`n( m(u), v )`). Reuse the **same** `axistuple` on the N-D grid
+      and scatter element grammars so literal-array / grid / scatter all sample identically.
+    * **Carry loom's constructor conveniences into the ftsl grid/scatter datatype** (already shipped in loom
+      `data.py`, port them alongside the datatype):
+      - **`shape=` is redundant when the data is nested.** The nesting *is* the shape — `[[0 1 2][3 4 5]]` is a
+        `(2, 3)` grid — so the grid element must infer shape from the value tree and only need an explicit shape to
+        fold a *flat* list. (This is also exactly why `[[0,1,2][3,4,5][6,7,8]]` reads as a 2-D grid above.) Bare
+        `[...]` always means an axis; a stored **vector** sample is a `vec(...)`/tagged colour, never a bare list.
+      - **`lo`/`hi` domain shortcuts (optional + broadcastable).** The sample lattice's world box need not be spelled
+        in full: `lo` omitted → all-zeros; `lo=<scalar>` → broadcast to every axis. `hi` omitted → a **unit-spacing
+        index lattice** (`hi[a]=lo[a]+shape[a]-1`, so a query coordinate equals a sample index); `hi=<scalar>` (or a
+        length-1 tuple) → pins **axis 0** and derives every other axis as a **uniform lattice** (one isotropic
+        spacing `h=(hi-lo[0])/(shape[0]-1)`, `hi[a]=lo[a]+h·(shape[a]-1)` — the mathematically pure "single lattice
+        constant" reading, keeping the interpolated field geometrically isotropic); a full `hi` tuple → the exact box
+        (allows deliberately anisotropic cells). Whatever surface syntax the grid element grows for domain must offer
+        these same defaults so common grids stay terse.
+
+      **STATUS (2026-07-27): DONE — shipped in 0.74.0.**
+      - The **`lo`/`hi` half was already shipped** with the datatype itself (0.71.0): `addGrid` implements exactly the
+        rules above — `lo` omitted → zeros, `lo <scalar>` → broadcast; `hi` omitted → unit-spacing index lattice,
+        `hi <scalar>` → one isotropic lattice constant derived off axis 0, full tuple → the exact box. Nothing to do.
+      - The **nested-`data` half shipped here.** A `grid`/`scatter` element's `data` may now be written **bracketed**,
+        and for a grid the **nesting is the shape**: `data [[0 1 2][3 4 5]]` is a 2×3 grid with no `shape` line at
+        all. Writing a `shape` that disagrees with the nesting is an error that prints both. A *flat* bracket group
+        carries no shape (it is just the bracketed spelling of the flat list), so `shape 2 2  data [0 1 2 3]` still
+        folds as before — nothing in the corpus changed meaning. For a `scatter`, a bracketed `data` is one group per
+        sample, each exactly `dim+1` numbers wide (coords then value), checked per group.
+      - Implementation: the increment-2 machinery is reused wholesale. `Builder::desugarArrays` now **skips `grid` and
+        `scatter` blocks** — their `data` is the element's own samples, not a value-site literal — and `addGrid` /
+        `addScatter` read the `ftsl::BrItem` tree directly through the shared `flattenArray` (which already proves the
+        tree rectangular and numeric). A sample call on an element's `data` (`data [0 1](u)`) is a dedicated error
+        naming where the call *does* belong. No grammar change was needed: `data`'s value site already goes through
+        the merged `selector` production.
+      - Verified: all seven bracketed forms load; eight error paths produce clear messages; `scraps/array_nestdata.ftsl`
+        (nested `data`) renders **bit-identically** to `scraps/array_explicit.ftsl` (`shape` + flat `data { … }`);
+        corpus equivalence sweep still ok=362 / mismatch=0 / parsefail=5 (pre-existing); `-checkgrid` / `-checkscatter`
+        / `-checkbvh` / `-checkimplicit` all PASS.
   - **ADDENDUM — case-insensitive *keywords* (future intent, 2026-07-20; user).** The user wants FTSL keywords to
     (maybe, later) be **case-insensitive** — but **only keywords** (block kinds, property names, enum/mode values,
     spectrum/colour heads like `rgb`/`blackbody`/`gaussian`), **never custom identifiers** (record/material/light
@@ -190,6 +380,29 @@ Origin tags point at the authoritative design text for each item.
     reconciliations (logged): record-driven whole-material override block (ftrace `isRecordOverrideBlock`, not emitted
     by loom); loom Light `color`/`size`/`turbidity` props ftrace ignores; stale `absorb 3 0.5 0.3` comment
     (`ftsl.h` ~1838, see known-issues.md).
+  - **DONE (2026-07-26): the flip landed — the shared grammar IS ftrace's front end.** VERSION 0.67.0 → **0.68.0**.
+    - *Gate met:* the corpus differ reached **MATCH 2595/2595** (`old_fail=0 gpda_fail=0 mismatch=0`) — every `.ftsl`
+      in the tree, structurally identical down to `Stmt::line` (which required threading token line/col through the
+      parse tree, upstream GraphParser `7432f42`). loom's own suite: 1072/1072.
+    - *Code:* `ftsl_shim.hpp` → **`src/gpda/ftsl_frontend.hpp`** (namespace `shim` → `ftsl_gpda`), and `loadSource`
+      now calls `ftsl_gpda::parse()` by default. `-legacy-parser` / `FTRACE_LEGACY_PARSER` selects the retired
+      hand-written parser (one-release escape hatch); `-validate-grammar` still cross-checks both.
+      Both flags needed a **pre-scan** in `main.cpp` — the scene loads (~3813) *before* the argv loop (~3837), so
+      `-validate-grammar` had silently never worked as a CLI flag (only via the env var).
+    - *Error quality* is the visible win: `line 1, col 15: unexpected NEWLINE '\n'; expected '{'
+      (in brace_body < plain_header < top_block < item)` vs the legacy `line 1: expected '{' after material`.
+    - *Verified:* bit-identical renders GPDA vs `-legacy-parser` on `_ellipsoid_test.ftsl` (mode B/GPU) and
+      `mirror_selfie.ftsl` (mode R/GPU), `-validate-grammar` silent, exit 0.
+    - *Two lifetime bugs the flip exposed* (fixed upstream in GraphParser `284244f`, re-vendored):
+      (1) `Parser::acquire_visited()` returned a reference into a `std::vector<Visited>` that a recursing predicate
+      could reallocate — a use-after-free that showed up as a permanently retained cursor; elements are `unique_ptr`
+      now. (2) `Visited` only cleared on *acquire*, so a Parser outliving a parse kept the pool's cursor stacks alive
+      and they were destroyed after the `thread_local` pool at exit (heap corruption; ftrace segfaulted on exit).
+      `parse()` now runs `reset_scratch()` on the way out, and the pool is owned through a deleter that frees it only
+      when drained. Same latent pattern fixed in `scannerless.{hpp,cpp}`.
+    - *Legacy parser: deleted in 0.79.0* (nothing in `src/` references it any more).
+    - *Still open:* port the rich `ParseError` to `scannerless`
+      (needs char-level expected sets + offset→line/col mapping).
 
 ---
 
@@ -300,6 +513,17 @@ instead of per block. loom exposes the same per-axis `frame` and emits it into e
 
 Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--oscillate`/`--lock`/
 `--couple` axis grammar. Each phase is independently committable and keeps tests green.
+
+> **SECTION CLOSED 2026-07-26.** Everything in B that delivers a capability is built and green
+> (1046 loom tests pass): Phase 1 (P1.1–P1.5), Phase 2 (P2.1), Phase 3 (P3.1–P3.3, slices S1–S7),
+> and §8 G1 / G2 / G5. The two remaining unchecked items — **G3** (`PatOp::MatMulAdd`) and **G4**
+> (GPU marching cubes) — are **deliberate deferrals, not pending work**: both are optimizations of
+> paths that already work correctly, and neither unlocks anything. G3 only *compresses* the pattern
+> encoding (the N-D rotation matrix already compiles to scalar bytecode and ray-marches on the GPU
+> today); G4 only speeds up *offline mesh export* (the video path no longer tessellates at all,
+> since G2's `-raster-gpu` sphere-traces the field directly). Each has a written revisit trigger and
+> a full build plan in `known-issues.md` ("Deferred: `PatOp::MatMulAdd`" and "Deferred: GPU marching
+> cubes"). **Do not treat B as unfinished** — reopen only if one of those triggers actually fires.
 
 ### Phase 1 — the `--oscillate`/`--lock` core (§5 steps 1–5)
 - [x] **P1.1 Parser + model, no behavior change.** `--oscillate`/`--lock` grammar →
@@ -624,11 +848,32 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       `(a)*x+(b)*y+(c)*z`, which ftrace compiles straight to `Const/VarX/Mul/Add` bytecode and evaluates
       directly (including on the GPU: `-raster-gpu` ray-marches D=8 tumble gyroids today). So MatMulAdd
       only *compresses* the encoding (one fused opcode vs ~6 scalar ops per row) — a compactness /
-      marginal-speed win, **not** a new capability. Revisit only if per-frame pattern eval becomes a
-      real bottleneck (it isn't — sin/cos/PovFn + the sphere-march dominate). See known-issues.md
-      "Deferred: `PatOp::MatMulAdd`". Prefer the contained single-output "matrow" form (Option A) if so.
-- [ ] **G4 (deferred, export-only)** GPU marching cubes — *only* to accelerate mesh export, not the
-      video path. Build only if mesh-export throughput becomes a pain point.
+      marginal-speed win, **not** a new capability.
+      **MEASURED 2026-07-27.** The old stated reason ("sin/cos/PovFn + the sphere-march dominate") is
+      **wrong**: `patternEval` costs ~4.7 ns/node *regardless of opcode*, so cost ∝ node count, and the
+      affine rows are 85–89% of every emitted field — MatRow would genuinely cut nodes 3.5–4×. The real
+      reason to defer is **Amdahl**: field eval is only 7% of a `-raster-gpu` render, 12% of `-raster`,
+      11–14% of an export at the D=8 sizes actually rendered (and ~4% for a default random draw), so
+      MatRow buys ~3–9% end-to-end. It *does* pay off in the fully-coupled high-D regime — measured
+      **D=16 `--coupling all`: 3917 nodes, 62% field eval, 1.9× faster with MatRow**.
+      **Sharpened trigger:** build it when a real workload's field exceeds **~800 pattern nodes**
+      (≈25% field eval) — in practice `--coupling all` at D≥8, or a long video at D≥12 fully coupled.
+      Default `cyclic` coupling stays under 20% even at D=16. Cost model: `time ≈ 3.50 s + 1.452 ms ×
+      nodes` (GPU iso, 600²). See known-issues.md "Deferred: `PatOp::MatMulAdd`" for the full tables and
+      the probe method. Prefer the contained single-output "matrow" form (Option A).
+- [ ] **G4 (deferred, export-only — but the bottleneck it assumed turned out to be elsewhere)** GPU
+      marching cubes, *only* for mesh export, not the video path. **MEASURED 2026-07-27:** a res-160
+      export was **55% ASCII OBJ write** (11.77 s of 21.47 s), not marching — so even a free GPU march
+      capped out at 1.8×. Fixed the writer instead (see G4b); the march is now the largest remaining
+      block (~8.7 s of 13.4 s, scaling as res³). Revisit only for repeated export cost — batch-exporting
+      a frame sequence, or interactive export at res ≥ 384.
+- [x] **G4b — fast OBJ writer.** **DONE 2026-07-27 (v0.84.3).** `isomesh::writeObj` did one
+      `std::fprintf` per line (~6.6M calls for a 3.3M-tri mesh), where FILE locking + format reparsing
+      dominate I/O — measured 22 MB/s on a 257 MB file. Now formats into an 8 MB staging buffer flushed
+      with `fwrite`, with hand-rolled decimal conversion for the integer-only face lines; floats keep the
+      same `snprintf` conversion specifiers so output is **byte-identical** (verified by md5 against the
+      previous binary). **Write 11.77 s → 4.66 s (2.5×); whole export 21.47 s → 13.40 s (1.6×).**
+      Multi-group export (`scenes/implicit.ftsl`, 3 isosurfaces) re-validated.
 - [x] **G5 — `-raster-gpu` / `kIsoPreview` textured shading** *(user-requested 2026-07-19; also logged
       in known-issues.md).* **DONE 2026-07-19.** Ported the CPU rasterizer's textured-preview path
       (`Texture::sampleRgb`/`sampleRgbTriplanar`) into `kIsoPreview`: a shared flattened linear-RGB texel
@@ -664,13 +909,114 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       GPU caveat (separate, lesser item): the shared GPU mode-M path still falls back to CPU when
       `-pmfg` is set — porting the final-gather sub-ray pass to CUDA is future work, tracked in
       known-issues.md.*
-- [ ] **C2 VDB: native sparse device sampler.** Today the NanoVDB grid is baked to a **dense** float
-      lattice for the device sampler; a native sparse GPU sampler is the follow-up.
-- [ ] **C3 VDB: fp16 + emission/temperature grids** (fire) — currently float density grids only.
-- [ ] **C4 VDB: native `.vdb` front-end** — validated against a downloaded official OpenVDB sample
-      (only `.nvdb` is ingested today; `.vdb→.nvdb` is a manual step).
-- [ ] **C5 Mesh: emissive triangles** (mesh area lights).
-- [ ] **C6 Mesh: tangent-space normal maps.**
+- [x] **C2 VDB: native sparse device sampler.** **DONE 2026-07-24 (v0.47.0).** The GPU no longer uploads
+      the dense lattice; instead the baked grid is partitioned into **8³ bricks** and only bricks holding a
+      nonzero voxel reach the device, so VRAM tracks *occupied volume* rather than the bounding box.
+      `VdbGrid::buildBricks(B, …)` (`vdbgrid.h`) emits a compact `brickIndex` (bx·by·bz int32 slots, −1 for an
+      empty brick) plus contiguous `brickData` (B³ fp16 voxels per active brick); the uploader
+      (`render_cuda.cu`) uploads those two arrays and the device sampler `dMedDensityAt` does a per-corner
+      brick lookup (`brickIndex[(k≫3)·by·bx + (j≫3)·bx + (i≫3)]`, then `brickData[slot·512 + (lk·8+lj)·8+li]`).
+      **Bit-for-bit identical** to the dense sampler — the trilinear stencil is clamped to [0,n-1] before any
+      lookup, so per-brick padding voxels are never addressed. Validated on the smoke plume
+      (`scraps/vdb_smoke_native.ftsl`): 3074/5488 bricks active (56 %), 5.3 MB → 3.0 MB VRAM (1.7×), and GPU
+      (sparse) vs CPU (dense) energy balance identical (absorbed 0.0294 both). A one-line
+      `[vdb] sparse device grid: …` footprint report prints once per grid. *(Host RAM still keeps the dense
+      lattice for the CPU sampler; a sparse host representation is a possible future RAM win.)*
+- [x] **C3 VDB: fp16 + emission/temperature grids** (fire). **DONE 2026-07-24** (fp16 + forward-CPU fire).
+      - [x] **fp16 dense-grid storage — DONE 2026-07-24.** The baked dense lattice (`VdbGrid::data`)
+        is now `std::vector<uint16_t>` half-floats instead of `float`, halving host RAM and GPU VRAM
+        for every imported `.vdb`/`.nvdb` volume. `vdbgrid.h` gains portable IEEE-754 binary16↔binary32
+        helpers (`halfBitsToFloat`/`floatToHalfBits`, round-to-nearest-even, full subnormal/inf
+        handling); both bake sites (`vdb_openvdb.cpp`, `vdbgrid.cpp`) store `floatToHalfBits(v)` and
+        the trilinear samplers (`VdbGrid::sample`) decode via `halfBitsToFloat`. The majorant `maxVal`
+        is bumped ×1.001 so half-rounding can't push a stored value above the delta/ratio-tracking
+        bound. GPU: `DMedium::vdbData` is `const uint16_t*`, uploaded as-is, with a matching
+        `__device__ dHalfBitsToFloat` in the hot density sampler (portable bit math, no cuda_fp16
+        dependency, HIP-safe). Validated on the native smoke plume (`scraps/vdb_smoke_native.ftsl`):
+        CPU vs GPU energy balance identical (absorbed 0.0294 both) and plume-region mean colour agrees
+        to ~0.05% relative — within Monte-Carlo noise — confirming both half-decoders are correct.
+      - [x] **emission/temperature grids (fire) — DONE 2026-07-24 (forward CPU).** A medium may now
+        carry a `temperature vdb:<path>` grid + `emission blackbody` (+ `emission_kelvin`/`emission_scale`),
+        turning its hot voxels into a self-illuminating isotropic volume emitter. Multi-grid `.vdb` files
+        (the official OpenVDB *fire* sample: one `density` + one `temperature` float grid) are selected
+        **by grid name** — `loadOpenVDBGrid`/`loadVdbGrid`/vdbgrid.cpp take a `wantName` and the OpenVDB
+        reader now seeks each descriptor to the previous grid's `endPos` (descriptors are interleaved with
+        bodies, NOT contiguous — this was the bug that made the 2nd grid fail to load). `spectrum.h` adds
+        `blackbodyRadiance`/`blackbodyEmissionRadiance` (Planck normalised to a 6500 K/560 nm reference,
+        preserving physical T⁴ + Wien hue). `scene.h` `Medium` gains `temperature`/`tempPeak`/`emitKelvin`/
+        `emissionScale` + `emissive()`/`temperatureAt()`/`emissionAt()` (peak-normalised T=emitKelvin·raw/
+        tempPeak, default 1500 K); `Scene` gains `EmissiveVolume` + `finalizeEmissiveVolumes()` (a 20k-sample
+        Monte-Carlo estimate of each grid's mean emission `meanKe` and selection `power`=4π·V·meanKe·Δλ, plus
+        `totalEmissionPower`). Forward `tracePhoton` (render.h) picks emitter-vs-fire birth by power
+        (`grandTotal=totalPower+totalEmissionPower`; short-circuits with NO extra RNG when there are no
+        emissive volumes, so every non-fire scene stays bit-identical), and a fire photon is born at a
+        uniform AABB point + isotropic direction with **λ importance-sampled from `blackbody(emitKelvin)`**
+        (per-volume `EmissionSampler lamSampler`, built in `finalizeEmissiveVolumes`), carrying
+        **β=grandTotal·κ_e(x,λ)/(meanKe·Δλ·p(λ))** — derived so the isotropic `1/(4π)/(dist²·Ω)` direct splat
+        (`connectEmissionVolume`/`connectEmissionLensVolume`/`camSplatEmissionAll`) reproduces the emission
+        line-integral exactly, and (for a voxel at emitKelvin) β is constant across λ so the spectral
+        colour-magnitude speckle collapses (v0.48.1; uniform p=1/Δλ recovers the plain β=grandTotal·κ_e/meanKe).
+        The "scene has no light" guard (ftsl.h) now accepts an emissive volume. Validated on the official
+        fire sample (`scraps/vdb_fire.ftsl`, `png/vdb_fire.png`): the flame glows self-lit with the correct
+        red-edge/hot-core shape and no external light. **GPU mirror DONE (v0.49.0):** `render_cuda.cu`
+        factors the VDB brick sampler into a reusable `DVdbGrid`/`dVdbSample` (density path bit-for-bit),
+        `DMedium` gains a `tempGrid` + emission params, `DScene` gains a `DEmissiveVolume[]` (+ per-volume
+        Planck-λ CDF) + `totalEmissionPower`, and `genPhoton` has the same power-split volume-birth branch +
+        `connectEmissionVolume`/`camSplatEmissionAll` device splat; `cudaForwardSupported` no longer rejects
+        fire. Verified `-device gpu` matches the CPU flame in distribution and the density path still
+        conserves energy (`scraps/vdb_cloud.ftsl`, sum/emitted=1.0). (Backward R/V is N/A: it treats media as
+        one homogeneous haze and never samples the grid.)
+- [x] **C4 VDB: native `.vdb` front-end** — DONE. `loadVdbGrid` dispatches on the file magic; a
+      self-contained OpenVDB reader (`src/vdb_openvdb.cpp`, no OpenVDB/NanoVDB dep) parses the file
+      container, `float 5_4_3` tree topology and BLOSC+ACTIVE_MASK+HalfFloat leaf buffers by hand,
+      decoding blosc's LZ4 codec with a vendored single-file LZ4. Validated bit-for-bit against
+      python-blosc on the official OpenVDB smoke/sphere/cube samples and render-validated
+      (`scraps/vdb_smoke_native.ftsl`). Other blosc codecs (BloscLZ/Zlib/Zstd) + ZIP report a clear
+      "re-export with LZ4" message — see known-issues.md.
+- [x] **C5 Mesh: emissive triangles** (mesh area lights).  **DONE 2026-07-24**.
+      Any material may carry an `emit <spd>` spectrum; a `mesh` bound to it becomes an
+      `EmitterShape::Mesh` area light. `scene.h` adds `EmitTri`/`Emitter::meshTris` (a
+      per-triangle cumulative-area CDF), a `samplePoint` Mesh branch (binary-search a
+      triangle by area, then barycentric sample; pdf = 1/total-area), and
+      `Scene::addMeshLight`. Emission-on-hit was already generic (`m.isLight`/`m.emit`);
+      NEE / forward emission / BDPT s=0 all consume the new emitter through the existing
+      `samplePoint` + 1/area paths — no per-renderer changes. `ftsl.h`: `buildMaterial`
+      parses `emit` (sets `isLight`); `addMesh` auto-registers the emitter and, with a
+      mesh-block `power`/`lumens`, rescales the SPD over the mesh area (clones the
+      material + rebinds the range's triangles so a shared material is untouched); the
+      "scene has no light" guard now also accepts an emissive mesh. GPU: `DEmitter`
+      gains a device `DEmitTri*` CDF + `emitterSamplePoint` shape-5 branch + per-emitter
+      upload (fixes a crash where a Mesh emitter fell through to the quad path with a
+      null CDF). Emission is one-sided (front face only), so a CLOSED emissive mesh
+      whose triangles are wound INWARD (e.g. an imported `torus.obj`, every face facing
+      the interior) would radiate into its own hollow and look black; `addMesh` now
+      auto-orients such shells outward at load — signed volume about the centroid < 0
+      (thresholded against area^1.5 so planar/open sheets are never touched) reverses
+      every triangle's winding (swap v1↔v2 + uv/normal, re-`finalize()`) before emitter
+      registration, so both the per-Tri geometric normals used by emission-on-hit and
+      the `addMeshLight` sampler normals point outward. Validated CPU **and** GPU: an
+      emissive quad mesh reproduces an equivalent `light area` visually
+      (`scraps/cmp_meshlight.ftsl` vs `cmp_arealight.ftsl`), and a 16384-tri inward-wound
+      emissive torus (`scraps/mesh_light.ftsl`) now glows and lights the Cornell box on
+      both backends with matching results (overall/torus/red-wall/green-wall means agree
+      to <1%). glTF/GLB meshes that import their own materials are not auto-lit (bind an
+      FTSL `emit` material) — noted in known-issues.
+- [x] **C6 Mesh: tangent-space normal maps.**  **DONE 2026-07-24**.
+      A material may bind a normal-map texture (`normal_map texture:<name> strength <s>`); at every hit
+      the shading normal is perturbed by the tangent-space normal sampled from the map, rotated through
+      the surface TBN frame. Per-triangle tangents are built in `Tri::finalize()` via Lengyel's UV-gradient
+      method (Gram-Schmidt against the geometric normal + a stored `bitangentSign` for handedness); the
+      sphere path derives a longitude tangent. The perturbation is applied at the single CPU intersection
+      choke point (`Scene::applyNormalMap`, called from both `closestHit` and `closestHitLinear`) so ALL
+      CPU renderers (backward/forward/bdpt/vcm/sppm/photonmap/grin) get it for free, and at the matching
+      GPU choke point (`dApplyNormalMap` in `closestHit`). Tangents transform with instances
+      (`instanceHitToWorld` on both paths; the device uploads a per-instance `Wm` = toWorld linear).
+      Normal maps must be declared `encoding linear` (raw vector data, not sRGB colour) — the loader warns
+      otherwise. The device uploads the raw RGB only for textures actually used as normal maps
+      (`usedAsNormal` pass) to save memory. **Validated:** `scraps/ripple_test.ftsl` (a flat wall quad
+      textured with a strong horizontal-corrugation normal map under a grazing area light) renders clear
+      vertical light/dark banding; CPU and GPU outputs are numerically identical (col-profile std 6.11 vs
+      6.10, row std 3.43 vs 3.43, mean 7.888 vs 7.891) — proving the two paths perturb shading identically.
 - [x] **C7 Mesh: watertight ray–triangle test** to kill grazing-edge cracks.  **DONE 2026-07-18**.
       Replaced Möller–Trumbore with the Woop/Benthin/Wald/Áfra watertight test (JCGT 2013) on BOTH the
       CPU double path (`src/geometry.h`) and the GPU float path (`src/render_cuda.cu`). Per-ray the test
@@ -703,8 +1049,8 @@ Replaces `--transform`/`--bloom*`/`--tumble*`/`--coupling`/`--pair` with one `--
       render-checked. **Scope now:** baked triangle geometry + normals + first UV set. **Not yet
       consumed** (follow-ups, logged in known-issues): FBX materials, skinning/blend-shapes, animation,
       multiple UV sets, per-face materials.
-- [ ] **C9 Alembic (`.abc`) import** — heavy SDK (Imath + HDF5/Ogawa); **deferred**, decide if an
-      OBJ/glTF/FBX sequence suffices before taking the build weight.
+- [~] **C9 Alembic (`.abc`) import** — **DON'T DO FOR NOW (user, 2026-07-24).** Heavy SDK (Imath +
+      HDF5/Ogawa); an OBJ/glTF/FBX sequence suffices for now. Revisit only if a real `.abc` asset needs it.
 
 ---
 
@@ -838,6 +1184,56 @@ user's design:
     decoupled/restartable processes are wanted); config over the **sidecar file**. Decide the final wire
     format when E2 is scheduled.
 
+**SLICE 1 DONE 2026-07-24 (`loom.anim`).** The channel-a config model + its sidecar projection + the
+channel-b value fan-out — the pure-Python go-between core, resolving OPEN Q1/Q2 (config lives in a loom
+struct with a JSON sidecar; the go-between is loom). Built on the E5 influence model (`loom.axes`), so E2
+value-routing *is* the E5 pin/mod edge model — the "E5 unifies E2/E4" tie-in made concrete. Pieces:
+- **`CurveDrive(dims, points, bindings, *, mode, closed, name)`** — the authoritative in-memory config:
+  dimension count, static starting control `points` (each a `dims`-tuple; point *modulation is out* per the
+  design — the editor owns the time axis), and `ChannelBinding` associations. `mode ∈ {MODE_FLYBY,
+  MODE_ANIMATION}`. Validates point dims and channel ranges.
+- **`ChannelBinding(channel, target, mode, gain, kind)`** — one channel→scene-variable edge; `mode`
+  (`pin`/`mod`), `gain`, and quantity `kind` (`ADDITIVE`/`GAIN`/`BIPOLAR`) are the E5 edge attributes.
+- **Sidecar round-trip** — `to_dict`/`from_dict` + `save`/`load` (versioned JSON, **atomic** temp-file +
+  `os.replace` so the editor never reads a half-written config; "scene proposes, editor disposes" —
+  associations round-trip through this file).
+- **`sample(t)`** — uniform Catmull-Rom over the control points (loom-side preview/tests; ftrace's editor is
+  the sampling authority in a live session), interpolating knots, closed-wrap or clamped-open.
+- **`apply(values, bases)`** / **`frame(t, bases)`** — fan the current sampled channel values out to
+  `{target: value}` via the bindings: several channels co-driving one target compose through an E5 `Target`
+  of the declared kind (domain-correct accumulate), with an optional authored `base` per target.
+
+19 tests (`tests/test_anim.py`: construction/validation, sidecar faithfulness + atomic write + version guard,
+Catmull-Rom knot/linear/closed/clamp, pin/mod/bipolar fan-out, multi-channel-one-target, base offset).
+**SLICE 2 DONE 2026-07-24 (`loom.anim`).** Named animatable slots + the editor↔loom live-value channel,
+resolving the slice-1 "how does a binding target name a real scene value-site" open item via **option (b):
+named `RefSignal`-style slots** (no emit-path change). Pieces:
+- **`Slot(name, default)`** — a `Signal` leaf holding a mutable current value. Drop it anywhere a scene
+  parameter accepts a `Signal` (a material prop, a transform field, a signal-valued isosurface param, …);
+  because it *is* a Signal the scene's `roots()`/`walk`/`emit` machinery discovers and bakes it per frame,
+  so binding-by-name needs zero change to the emit grammar. `default` doubles as the authored `mod` base.
+  The one controlled escape from clock-purity: its value is *pushed* by the live channel, not computed from
+  the clock — so each scrub frame is emitted with a **fresh** `Cache` (a stale cache pins the old value).
+- **`collect_slots(scene)`** — walks every modulator in the scene (`_all_elements` → `element_roots` →
+  `walk`) and groups the `Slot`s by name.
+- **`SceneDriver(scene, drive, *, bases, strict)`** — binds a `CurveDrive`'s fan-out to the scene's named
+  slots. `set_values(values)` fans channels out (each slot's `default` is the target's `mod` base unless
+  overridden) and pushes each resolved value into its same-named slots; `emit_frame(values, clock)` does
+  that then emits with a fresh cache. `strict` raises on a target with no matching slot (typo'd binding
+  fails loudly).
+- **`LiveSession(driver)` / `serve_live(session, in, out)`** — the loom side of E2 channel-b: a
+  newline-delimited-JSON stdio message loop (the `loom.PreviewServer` precedent, editor→loom direction).
+  Commands: `frame` (set values or `sample` at `t`, emit that frame's `.ftsl` to `out`), `config` (return
+  the sidecar dict to seed the editor), `bindings`/`points` (editor disposes — replace the associations /
+  control points), `save`, `quit`. Each command is a pure `dict`→`dict` `handle()` so the protocol is
+  unit-testable without a real pipe; errors are reported in the ack, never crash the loop.
+
+23 tests (`tests/test_anim_live.py`: slot value/stale-cache semantics, discovery + same-name grouping,
+driver base defaults/override/strict, set_values fan-out + mod-on-base, emit-frame fresh-cache, every
+LiveSession command + bad-input acks, `serve_live` stop-on-quit + bad-json).
+**Remaining E2 slice:** (3) generalize ftrace's C++ `camera_curve` **editor** to seed from / write back the
+sidecar and target arbitrary scene variables (the interactive C++ part — best done with the user present).
+
 ### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; **DONE 2026-07-18**)*
 **Idea / decision.** loom should be able to *generate audio files* procedurally. Two candidate output
 models — (1) emit one sample value per time tick, vs. (2) random-access a sample array (`buf[t] += v`,
@@ -905,7 +1301,168 @@ and vice-versa). **Open q (defer to scheduling):** on-disk formats for the write
 ftrace's ingest; dense raw/`.vdb`?), and whether sparse-write goes through an OpenVDB/NanoVDB dependency
 or a loom-native sparse encoder.
 
-### E5 — Axis-typed signals: one influence model (broadcast / pointwise / reduce) + mod·pin + sample·select grammar  *(loom; LARGE, design; unifies E2/E4 and records-5a)*
+**WRITE side — DONE 2026-07-24 (`loom.vdbio`).** The open format question resolved to a **loom-native
+OpenVDB `.vdb` encoder** (no NanoVDB/OpenVDB dependency on either end — I control ftrace's reader too):
+uncompressed **`Tree_float_5_4_3`**, `COMPRESS_ACTIVE_MASK` only (no blosc/ZIP/half), full float32, a
+`ScaleTranslateMap` transform matching numpy `linspace` endpoint-inclusive bakes. `tools/loom/loom/vdbio.py`
+adds:
+- **`write_vdb(path, [VolumeGrid(name, values, box), …])`** — serialise one or more dense `<f4` lattices
+  to a multi-grid `.vdb` ftrace ingests directly (`density vdb:<path>` / `temperature vdb:<path>`). Positive
+  voxels are vectorised into 8³ leaves under Internal<4>/<5> nodes; empty leaves are dropped (sparse).
+- **`bake_field(field, box, res)`** — discretise any loom field/isosurface/callable to a dense `<f4` grid +
+  world box (reuses the `mcubes` samplers), and **`write_volume(path, *, box, res, **fields)`** — bake each
+  named field over a shared box/res and write them as named grids in one file (e.g. a `density`+`temperature`
+  fire pair).
+- **`read_vdb(path)`** — parses back the ACTIVE_MASK / full-float / **half** / **ZIP** subset (see the
+  codec slice below) over a ScaleTranslate map into `{name: (dense_array, box6)}`.
+
+Validated: loom round-trip is **bit-exact** (full float32, no lossy step); 6 tests in `tests/test_vdbio.py`
+(891 loom green); and cross-validated end-to-end through ftrace — `scraps/make_loom_vdb.py` bakes a smoke
+field to `scraps/loom_smoke.vdb`, and `scraps/loom_vdb.ftsl` renders it on both CPU and GPU (sparse device
+path `1000/1000 bricks active`, energy `sum/emitted=1.000000`).
+
+**READ codecs — half + ZIP + blosc + diagonal maps DONE 2026-07-24 (`loom.vdbio`).** The general read side:
+loom now reads (and writes) the OpenVDB value codecs and axis-aligned transform maps real DCC tools emit —
+**validated against genuine third-party files** (`scraps/_smoke.vdb` Houdini blosc smoke, `_fire.vdb`
+density+temperature, `_sphere.vdb`/`_cube.vdb` UniformScaleMap level sets all read):
+- **half-float** (`half=True`) — 16-bit voxels, grid type `Tree_float_5_4_3_HalfFloat`. Halves the file and
+  is **read directly by ftrace** (which flags half by the type suffix). Cross-validated: ftrace ingests
+  `scraps/loom_smoke_half.vdb` (`peak 0.9174` vs loom 0.9165; 1.16 MB vs 2.19 MB) and renders it.
+- **ZIP** (`zip=True`) — value buffers zlib-deflated (OpenVDB int64 length prefix, negative = uncompressed).
+  **Bit-exact** round-trip; read by any OpenVDB tool but *not* ftrace (LZ4-only) → interchange-only.
+- **blosc** (`blosc=True`) — the DCC-standard codec. **Read** via the installed `blosc` package (handles
+  BloscLZ/LZ4/Zlib/Zstd + shuffle — the full range; soft dep, clear install hint if absent). **Written** as
+  LZ4 + byte-shuffle so it's read by **both** loom and ftrace → usable on the render path. Cross-validated:
+  ftrace ingests `scraps/loom_smoke_blosc.vdb` (`peak 0.9173`) and reads the real Houdini `_smoke.vdb`.
+- **Transform maps**: ScaleTranslate/UniformScaleTranslate/UniformScale/Scale/Translation (the diagonal,
+  axis-aligned maps that keep samples on a regular lattice); a rotated `AffineMap` is rejected (can't land on
+  a dense axis-aligned array). OpenVDB `0x1e` unique-name suffixes are stripped.
+- The codec/map layer mirrors ftrace's `io::readData`/`readCompressedValues`/`readTransform`
+  (`src/vdb_openvdb.cpp`); default output stays **byte-for-byte** the original file (test-asserted). The
+  reader's per-voxel mask-expand + dense-fill loops were **vectorised** (numpy `unpackbits` + boolean scatter,
+  bit-identical) — reading all four real samples dropped ~20 s → 2.8 s. 13 new tests (995 loom green).
+
+**Rotated `AffineMap` — DONE 2026-07-26.** loom now decodes (and writes) every OpenVDB *linear* map,
+closing a real asymmetry: ftrace's `readTransform` has always accepted `AffineMap`/`UnitaryMap` and
+genuinely honours them (it inverts the 3×3 for world→index sampling and AABBs the index box's 8 corners),
+while loom rejected them. The key realisation is that **a rotation costs the samples nothing** — an
+OpenVDB tree is a regular lattice in *index* space either way, and the map only says where that lattice
+sits — so the dense array is unaffected and the only casualty is the axis-aligned `box6`. That drove the
+API shape: `read_vdb(path)` keeps returning `{name: (array, box6)}` and still **refuses** a rotated grid
+(handing back an approximate box would silently misplace every voxel — the failure mode this project keeps
+choosing against), while the new `read_vdb_grids(path)` returns `{name: ReadGrid}` with the index-space
+array, its `index_lo`, and the full `VdbTransform` (`world = A·index + t`, mirroring ftrace's `A`/`T`).
+`VolumeGrid(name, values, transform=…)` writes one back out as an `AffineMap`, so the path round-trips.
+`is_diagonal` measures each off-diagonal against its own row's scale — unit-free, and tolerant of the
+~1e-17 crumbs a DCC leaves when it composes a 90°/180° rotation in floating point. 8 new tests (1095 loom
+green) plus an ftrace interop check: one asymmetric L-shaped volume written twice, diagonal vs 45°-about-Y
+(`scraps/vdb_rot_make.py`), renders visibly rotated in ftrace with identical voxels.
+
+**NanoVDB `.nvdb` ingest — DONE 2026-07-27.** `loom.vdbio.read_nvdb(path)` reads NanoVDB v32.6 float
+`5_4_3` grids in **both** accepted layouts — a `FileHeader`-prefixed multi-grid container and a bare raw
+grid buffer — and `read_vdb_grids` now **dispatches on magic**, so a caller that just wants "read whatever
+volume this is" no longer has to know which format it holds. The item was unblocked (unlike Vec3, below)
+because `scraps/cloud.nvdb` is *genuine third-party data* and `src/vdbgrid.cpp` is a completely independent
+reader to check against — the same "must meet a real file" bar this module has held throughout.
+
+The format is not a serialised stream but a **memory image**: a linear buffer of 32-byte-aligned PODs
+referring to each other by *signed byte offsets*, laid out `GridData / TreeData / RootData+tiles /
+Internal<5>… / Internal<4>… / Leaf<3>…`. Nothing to decompress — you index at fixed offsets and walk.
+Every struct offset was byte-verified against the vendored `src/third_party/nanovdb/NanoVDB.h` *and* the
+real file before a line of parser was written. Three details mattered:
+
+- **Tiles are real data.** `LeafData::getValue(i)` returns `mValues[i]` with **no mask check**, and
+  `InternalNode::getValue` returns `mTable[n].value` whenever `childMask` is off — active or not. So the
+  bake must write every stored leaf voxel and expand every non-child tile, exactly as ftrace's
+  accessor-driven bake does; `cloud.nvdb` has 10 active lower-level tiles (10 × 8³ voxels) that a
+  mask-filtered read would silently drop. Hence the **deliberate convention split**, documented in the
+  module docstring: `read_vdb` keeps only active-positive voxels (it round-trips loom's own writer),
+  while `read_nvdb` is a faithful dense bake over the tree's active index bbox with inactive =
+  `background`. `ReadGrid` gained a `background` slot for this (0 for fog, the half-band width for a level
+  set, 0.03 in `cloud.nvdb`).
+- **Bit/coord order is plain.** `Mask::isOn(n) = mWords[n>>6] & (1<<(n&63))` is little-endian over the byte
+  array, so one `np.unpackbits(bitorder="little")` recovers it with no per-word shuffle; and the leaf slot
+  `((i&7)<<6)|((j&7)<<3)|(k&7)` is *exactly* C order for an `(8,8,8)` reshape.
+- **The transform carries over untransposed.** NanoVDB's `matMult` is row-major column-vector — the same
+  convention `VdbTransform.a` stores — unlike OpenVDB's row-vector `AffineMap`, which needs the transpose.
+
+**Validated three ways.** (1) Against ftrace's own reader: index bbox `41³ @ (30,30,30)`, world AABB
+`0.3..0.71` and `peak 1.001` match ftrace's `[vdb]` line exactly. (2) Against NanoVDB's own redundantly
+stored statistics: array min/max match `RootData`'s, every leaf's active min/max matches its
+`mMinimum`/`mMaximum`, and `active_total + tiles[0]·8³ + tiles[1]·128³ == mVoxelCount` (33401) holds
+exactly. (3) End-to-end through the renderer (`scraps/nvdb_roundtrip.py`): the `.nvdb` re-emitted as a
+`.vdb` and rendered in the same scene by ftrace's *independent* OpenVDB reader agrees to **0.007%** in the
+mean, and the per-pixel relative diff **halves with 4× photons** (8.65% → 4.35%, ratio 1.99) — √N, i.e.
+pure independent-MC noise, not a volume difference. (The `.vdb` comes back 39³ rather than 41³ because
+`write_vdb` trims the zero outer shell by design; that write-side trim shifts the AABB, which diverges the
+RNG streams and is the whole source of the per-pixel noise.) 9 new tests (**1137 loom green**), and all
+**11 layout-constant mutations are caught** — two (`_LF_VALUES`, `_RD_TILE_SIZE`) initially slipped through
+and drove two extra tests: an *independent* breadth-first leaf traversal via `mNodeOffset[0]` + stride 2144
+(not the reader's child-offset descent) with a per-voxel index check, and a root-tile-stride test asserting
+the root table ends exactly where the first upper node begins.
+
+**Volume transforms / read→transform→write — DONE 2026-07-27.** The capability E4 was actually *about* —
+"use an existing volume as a **basis**, transform it, then emit the result" — now exists, and it needed
+almost no new machinery, because the right move was to make a volume a **term in the spatial algebra**
+rather than to invent a volume-transform API. `loom.spatial.VolumeField` is the 3-D twin of the existing
+`Image` leaf: a scalar SpatialExpr whose value at a world point is an imported grid's trilinearly
+interpolated density. (Named `VolumeField`, not `Volume` — `loom.scene.Volume` is already the `medium { }`
+scene element, and shadowing it would have been a trap.)
+
+Everything else then falls out of machinery that was already there:
+- **value ops / modulation** — `cloud * (0.5 + 0.5 * sin(20 * Y))`, mixing two volumes, animated `Signal`
+  coefficients: all just the spatial algebra.
+- **warping** — `x`/`y`/`z` are ordinary sub-expressions exactly like `Image`'s `u`/`v`, so
+  `VolumeField(p, x=X + 0.1 * sin(10 * Z))` bends the volume, and `substitute` reaches inside. (Standard
+  resampler convention: the coordinate expressions map the *destination* point back to the *source*, so a
+  warp is authored as its inverse map — documented loudly.)
+- **meshing** — `mcubes` takes any callable field, so marching cubes over imported data is free.
+- **resampling** — `bake_field`/`write_volume` discretise onto any box/res, which is all "resample a grid"
+  ever meant. Sparse↔dense as *separate storage backings* stays unbuilt, and is now clearly a storage
+  optimisation rather than a capability: nothing is missing from the user's point of view.
+
+**Placement is lossless, and that's the design point.** `translated`/`scaled`/`rotated`/`fitted` do not
+resample — they compose a world-space affine onto the grid's own index→world map via the new
+`VdbTransform.premultiplied` (`A' = M·A`, `t' = M·t + d`). Moving a volume costs zero interpolation because
+a VDB tree is a regular lattice in *index* space and only the transform says where it sits; error enters
+exactly once, at the final bake. That is loom's "keep everything as functions; discretize last" rule
+applied to volumes, and it's test-asserted: rotate 4×90°, rotate 360°, translate-and-back and
+scale-and-back all reproduce the original array (max |Δ| ~1e-15), and `.rotated(37°).read_grid.values is
+g.values` — not one voxel is touched. A complementary test asserts a *single* 37° rotation really does
+change the field (so the round-trips can't pass vacuously) while conserving mass to 5%.
+
+`VolumeField.emit()` deliberately **raises**: ftrace's pattern VM has no volume-sampling opcode, so there
+is no ftsl string it could honestly become. It is bake-only, and the error says so and names
+`write_volume`. Supporting infrastructure added alongside: `VdbTransform.inverse_linear`/`to_index`/
+`premultiplied`/`__eq__`, `ReadGrid.world_box` (AABB of the eight index-box corners — defined for a rotated
+grid, unlike `.box`) and `ReadGrid.with_transform` (shares the array; repositioning copies nothing).
+
+**Found and fixed a real ftrace bug on the way (v0.84.2).** Porting ftrace's sampler into
+`ReadGrid.sample` exposed that `VdbGrid::sample` (`src/vdbgrid.h`) and its CUDA twin `dVdbSample` clamped
+the stencil *indices* to `[0, n-1]` but not the interpolation *fraction*, so in the half-voxel shell just
+below index 0 the sample was dominated by the **second** voxel and got wronger the further out it went.
+Symptom that caught it: a 360° rotation, which must be a no-op, moved the baked field by up to 0.32. Fixed
+in both samplers by clamping the *coordinate* before the floor — bit-identical inside the lattice, and it
+drops three `floor()` calls from the hot path. See `known-issues.md`.
+
+19 new tests (**1150 loom green**); the sampler fix is mutation-verified (reverting to the stencil-only
+clamp fails two tests).
+
+**Still open:** **Vec3** grids; sparse *storage* (as opposed to sparse-source reads, which work) and
+transforms authored directly against it. Note loom has no NanoVDB *writer* — `.nvdb` support is read-only,
+and there's no demand for the write end (ftrace reads `.vdb` happily, and loom's `.vdb` writer is
+byte-verified).
+- **Vec3 grids are BLOCKED on validation data (assessed 2026-07-26).** None of the four real sample files in
+  `scraps/` carries a `Tree_vec3s_*` grid (all four are `Tree_float_5_4_3_HalfFloat`), and there is no
+  installable OpenVDB Python binding on this platform to synthesise one (`openvdb` / `pyopenvdb` /
+  `openvdb-python` all fail to resolve on PyPI). Writing the reader blind against the spec would produce
+  something validated only against loom's own writer — precisely the "works until it meets a real file"
+  failure this module has so far avoided by testing against third-party output. Also note there is **no
+  consumer**: ftrace supports scalar float grids only, so a Vec3 read would serve loom-internal use
+  (velocity/advection) that isn't designed yet. Unblock by sourcing one real vec3 `.vdb` (a DCC export or an
+  openvdb.org sample), then the tree walk is the existing one with a 3-wide value stride.
+
+### E5 — Axis-typed signals: one influence model (broadcast / pointwise / reduce) + mod·pin + sample·select grammar  ✅ DONE 2026-07-26  *(loom; LARGE, design; unifies E2/E4 and records-5a)*
 **Idea / decision (design-captured 2026-07-18, from a design bounce).** The whole "what can modulate what,
 and does t-influencing-t break?" question collapses into **one** model: every value-producing node in the
 loom signal DAG is **a function of a named set of axes** (its free variables) — e.g. a purely spatial
@@ -972,6 +1529,104 @@ driver's free variables must be ⊆ the axes in scope there (`R(u)` errors in a 
 in that site's axis set). **Open q (defer to scheduling):** the concrete `Animatable<T>` node taxonomy and
 how axis-set inference/annotation is represented in the loom struct + the on-disk projection; where the
 explicit reduction node and the video node sit in that taxonomy.
+
+**FOUNDATION DONE 2026-07-24 (`loom.axes`).** The deferred open-q (concrete node taxonomy + axis-set
+representation) is resolved with a small additive node set that sits *on top of* the existing scalar
+`Signal` DAG (no churn — all 891 prior tests stay green; 912 total now). An **`AxSignal`** is a pure
+function of a **point** (a `dict[str, float]` mapping axis names → coords) and carries `.axes`
+(`frozenset[str]`, its free variables). The four E5 pillars are implemented and tested
+(`tests/test_axes.py`, 21 tests):
+- **Axis-set inference + broadcast/pointwise** — `Ax(name)` coordinate leaves, `AConst` (axes ∅),
+  `AFn`/arithmetic compose with `axes = union(children)`. Evaluating at a point with *extra* axes ignores
+  them (broadcast, implicit); a *missing* required axis errors. Shared axes combine pointwise; the illegal
+  cross-`t` op is inexpressible (a node only ever sees the current point). No `t`-influences-`t` detector,
+  no spatial/temporal type split — exactly as the design demands.
+- **pin/mod edges + target-declared neutrals** — `Target(kind, [Binding(source, mode, gain)], base)` with
+  `kind ∈ {ADDITIVE (neutral 0, y+=g·x), GAIN (neutral 1, y*=x**g), BIPOLAR (neutral ½, ½-centred clamped)}`;
+  `mode='mod'` accumulates toward the neutral, `mode='pin'` is last-write-wins (gain blends). The target
+  declares its normalization, not the edge — so "mod" is one authoring mode resolving to the domain-correct
+  operator.
+- **sample/select grammar** — `Sample(fn, arg)` is the continuous `curve(t)` form (binds the curve's param
+  axis to `arg`, so `axes = arg.axes` and it broadcasts); `.comp(i)` picks a component (`curve(t).y`);
+  `select(items, i)` is the discrete constant `R.chan[i]` selector.
+- **The one cross-axis node** — `Reduce(body, axis, samples, op)` (`sum|mean|min|max|integral`) is the only
+  node that reads other points along an axis; `axes = body.axes - {axis}`. Explicit by construction; a plain
+  `AFn` can never smuggle in a cross-index read. (The cross-`t` "video node" already lives in `loom.xvideo`.)
+- **Bridge** — `Lift(signal)` wraps any legacy `{t}`-typed `Signal` into the axis layer, so the new model
+  composes with the whole existing DAG; `detect_signal_cycle`/`walk` duck-type over axial nodes too.
+
+**FOLLOW-UP 1 DONE 2026-07-24 (`loom.axes`).** Folded the existing clock-parameterized interp curves and
+records into the sample grammar so it binds *their* param axis directly rather than forcing a pre-baked bare
+callable (which could not thread the clock the control points depend on). Pieces: **`CurveSample(curve, arg,
+*, clock_axis='t', loop=True)`** wraps any loom curve exposing `.sample(u, clock, cache)` (`LoopCurve`,
+`TrackedCurve` tracks, `FieldCurve` position) — `arg` binds the curve's param axis and the node *additionally*
+depends on the clock axis, so an **animated** spatial curve types as `{s,t}` (its shape moves over time) while
+a static one broadcasts trivially over `t`; **`RecordSample(record, channel, arg)`** binds a `Record`'s driver
+axis (a static `{driver}` LUT — no clock, via `Record.sample_vec`); and a unified **`sample(obj, arg, …)`**
+dispatcher picks `RecordSample` / `CurveSample` / `Sample` by duck-type (Record needs `channel=`). Both new
+nodes thread the loom curve/record into the axis-layer `walk` (like `Lift`), so a cycle through a control point
+stays catchable. 9 new tests (`tests/test_axes.py`, 30 total; static-broadcast vs genuine-`{s,t}`, component
+pick, custom clock axis, record scalar/vector, dispatch, `Reduce`-over-`s` compose, walk reaches control
+points). 1023 loom green.
+**FOLLOW-UP 2 DONE 2026-07-26 (`loom.axes` + the coercion path).** *Routing scene value-sites through
+`Target`* — the piece that turns E5 from a self-contained algebra into loom's actual authoring model.
+- **`Lower` / `LowerVec` — the exact inverse of `Lift`.** Every loom scene value-site (`Sphere.radius`,
+  `Isosurface.iso`, a material colour, a camera position, …) consumes a clock-parameterized
+  `Signal`/`VecSignal`, so a `Target` only reaches a scene variable through a node that binds an `AxSignal`
+  back down. The site's clock axis (default `'t'`) is fed `clock.t`; every **other** axis the node reads must
+  be pinned via `bind={'s': <coord or Signal>}` — a constant reads *one* arclength of a spatial curve, a
+  `Signal` **sweeps** along it over the loop. `lower(node)` picks the scalar vs vector form by probing at
+  `t=0` (or pass `dim=`). `LowerVec` evaluates the axis graph **once** per frame and caches the whole tuple,
+  while still exposing per-component `Lower` children so `walk`/`detect_signal_cycle`/`VecSignal` math see an
+  ordinary vector node.
+- **Records-5a's scope rule is enforced at CONSTRUCTION.** "A node's free variables ⊆ the axes in scope at
+  this site" — a scene value-site has exactly one axis in scope (the clock), so an unbound axis raises
+  immediately, *naming* it and suggesting `bind=`, instead of failing deep inside a render.
+- **One memoised hook, not N constructor changes.** `signals.core.lower_axsignal(x)` is the single coercion
+  point, consumed by `as_signal`, `VecSignal.of`, `ftsl_emit.site_node` (→ `num`/`vecn`/`value_token`) and
+  `Element.roots()`. No element constructor changed and *every* value-site accepts an axis node uniformly.
+  The memoisation (`x._site_node`) is **required, not cosmetic**: node identity is the per-frame `Cache` key
+  **and** `roots()` must hand the cycle detector the very node emission will evaluate — lowering twice would
+  silently defeat both.
+- **Sugar + a latent bug.** `mod(src, gain)` / `pin(src, gain)` build `Binding`s; `Binding` now coerces its
+  source through `as_ax`, which also `Lift`s a legacy `Signal` (so `mod(0.6 + 0.4*Sine())` just works); an
+  unknown edge mode is rejected at construction. Found and fixed a pre-existing bug in `_accumulate`: a
+  `GAIN` target with a **negative** source computes `x ** gain`, which Python evaluates to a *complex* number
+  that then blew up in `float()` far from the cause — it now raises a domain error naming the fix.
+25 new tests (`tests/test_axes.py`, 55 total; mod/pin sugar, binding coercion + bad mode, `as_ax` lift, the
+GAIN domain error, `Lower` against the clock, the construction-time unbound-axis error, `bind=` to a constant
+and to a `Signal`, `LowerVec` dim probe / scalar-node / dim-mismatch / per-frame cache / component identity,
+`lower()` dispatch, curve sweep, `as_signal` + `VecSignal.of` coercion both ways, site-node memoisation, and an
+end-to-end `Target`→`Sphere.radius` + swept `CurveSample`→`Sphere.center` round-trip through `emit`).
+1120 loom green.
+**FOLLOW-UP 3 DONE 2026-07-26 (`loom.axes` + the viewer sidecar + `src/viewer_gui.cpp`) — E5 IS COMPLETE.**
+*The on-disk projection of axis annotations* — the second half of the deferred open-q. It resolves into a
+**decision** and an **implementation**.
+- **The decision: `.ftsl` carries no axis annotation, and shouldn't.** `.ftsl` is a **bound**, per-frame
+  projection. By the time a scene emits, the clock axis has been fixed to `clock.t` and every other axis
+  pinned by `bind=`, so an `{s,t}` node has already collapsed to a *number*. ftrace renders one frame and has
+  no notion of an axis; annotating its language would turn `.ftsl` into an animation format and move the
+  animation authority out of loom — against loom's core ideas 2 ("discretize LAST, per frame") and 5
+  ("emit-`.ftsl`-first"). This is written down in `loom/axes.py` beside the code so it stops being re-litigated.
+- **The implementation: the viewer introspection sidecar, v1 → v2.** That is the on-disk representation an
+  *editor* reads (F1/F5), and it is where the annotation belongs. `axis_annotation(node)` and
+  `binding_edges(target)` live in `loom/axes.py` — the model owns its own serialisation and `loom.viewer` just
+  merges the dicts in.
+  - **Nodes** gain their free `axes` (`{s,t}`; `[]` for a constant, which broadcasts everywhere), plus
+    `target_kind` + `neutral` (a `Target`'s declared quantity type), `reduces` + `reduce_op` + `samples` (the
+    *only* cross-axis node — worth surfacing), `component` / `channel` / `leaf_axis`, and on the two bridge
+    nodes `site` (scalar/vector), `clock_axis`, `bound_axes` and `source_axes` — together the value-site's
+    entire axis scope ("`t` from the clock, `{s}` pinned, reading an `{s,t}` node").
+  - **Edges** out of a `Target` gain `mode` (`pin`/`mod`) and `gain`, and are named `mod[i]`/`pin[i]` instead
+    of an anonymous `in<i>`. This is the piece a plain child list **cannot** express: the sources hang off
+    `Binding` records, so a generic DAG walk saw only unlabelled inputs and an editor could not tell a `mod`
+    from a `pin`, let alone at what gain.
+  - **`src/viewer_gui.cpp`'s F5 panel renders all of it** — an `axes {s,t}` chip on the node, a one-line
+    kind/scope caption (`gain target (neutral 1)`, `reduce s (mean, 8 samples)`, `t from clock, {s} pinned <-
+    {s,t}`), and `mod[0] x0.8` on the input pin. Verified on a live viewer window.
+  - Purely **additive**: a v1 reader ignores the new keys, and an unannotated (legacy-`Signal`) node renders
+    exactly as before.
+8 new tests (`tests/test_viewer.py`, 58 total). 1128 loom green.
 
 ### E6 — Quick mesh viewer: open a bare mesh in a ready-lit scene  ✅ DONE 2026-07-21  *(ftrace; user-proposed 2026-07-19)*
 **Shipped.** A bare positional mesh path — `ftrace model.glb` (also `.obj`/`.gltf`/`.fbx`/`.stl`/`.ply`) —
@@ -1050,44 +1705,193 @@ replacement for the renderer or the primary editing tool.**
   `Scene` whenever it needs to re-derive geometry.
 
 **Tasks:**
-- [ ] **F1 — scene/object enumeration + `build()` load contract.** Load a loom file, call its
-      `build(clock, **params)`, walk the resulting `Scene`, and present a selectable list of objects
-      (curves, SweptMeshes, isosurfaces, scatter/grid fields). Selecting one drives the panes below.
-      Define + document the `build()` contract (signature, that it must be side-effect-free at import,
-      how params are surfaced to the UI).
-- [ ] **F2 — N-D curve 3-D view.** Show an N-D curve by picking **3 of N** dims to display. **Rotating
+- [x] **F1 — scene/object enumeration + `build()` load contract.** ✅ 2026-07-24 (**loom side**, `loom/viewer.py`).
+      Load a loom file, call its `build(clock, **params)`, walk the resulting `Scene`, and produce the
+      selectable-object data the viewer needs. Since the viewer is C++ and loom is Python, the loom side is
+      the **load contract + a JSON introspection sidecar** (the C++ host that renders the list/panes is F2–F7).
+      - **`build()` contract (documented in `viewer.py`):** `def build(clock=None, **params) -> Scene` —
+        returns a **fresh** Scene each call (no module-level `scene`; **side-effect-free at import** — importing
+        never renders/emits/opens windows), so the viewer re-derives geometry live. `clock` optional (viewer's
+        scrub frame; `None` ⇒ frame-0). Keyword params with defaults are surfaced as UI controls.
+      - **`load_build(path, func="build")`** imports a scene file → its `build`; **`ViewerModel(build, **params)`**
+        / `.from_file(path)` wraps it: `.scene(clock, **overrides)` builds, `.declared_params()` returns the
+        build's advertised keyword defaults, `.introspect(clock)` / `.save_sidecar(path, clock)` emit the sidecar
+        (atomic write). `build_scene(build, clock, **params)` passes `clock` only when the signature accepts it.
+      - **`introspect(scene)` sidecar:** `version`, `frame`; `objects` (geometry elements — Sphere/Beads/
+        SweptMesh/IsoMesh/Group/Volume/Raw/Isosurface — Groups recursed, each linking the `datasets` it
+        references by node id + kind-specific meta: name/material/count/res/iso/closed_*); `datasets` (every
+        `PointPath`/`TrackedPath`/`Grid`/`Scatter` reachable from geometry **or** materials/lights/camera, with
+        dim/shape/lo/hi/channels/tracks); minimal `camera`/`lights`; and `dag` (modulator graph — `nodes` =
+        id+op+label, `edges` = child→parent; per-edge parameter labels deferred to F5). 20 tests
+        (`tests/test_viewer.py`): contract loader (missing/non-callable/custom-name), clock passing/param
+        forwarding, object kinds + dataset linking, path/grid/scatter coverage, DAG node/edge integrity,
+        ViewerModel scene/introspect/declared-params/from-file/save-sidecar. 972 loom green.
+      - **C++ host DONE (F2 complete):** the viewer is a **`-viewer <sidecar.json>`** mode of the ftrace
+        binary — **Win32 + Direct3D 11 + Dear ImGui** (vendored `src/third_party/imgui/`, added to the
+        `ftrace` CMake target, dispatched from `main()` → `src/viewer_gui.cpp`). It reads the sidecar via the
+        vendored `minijson` parser and shows the Scene/Objects/Datasets panels + the full N-D curve pane
+        (3-of-N dim picker, index markers, mono/anaglyph/wall/cross stereo). ImPlot & imnodes are vendored
+        but not yet compiled (reserved for F3/F5). Remaining panes are F3–F7.
+- [x] **F2 — N-D curve 3-D view.** ✅ 2026-07-24 Show an N-D curve by picking **3 of N** dims to display. **Rotating
       the displayed dims = a view-only transform** (no recompute); **rotating into other dims = recompute
       the projection.** Index markers along the curve show curve progression. **Stereoscopic viewing:**
       wall-eyed (L|R) and cross-eyed (R|L) side-by-side, plus **red-cyan anaglyph** — using the §I
       off-axis stereo machinery (shared with the renderer's still/movie stereo).
-- [ ] **F3 — scroll-locked strip charts (ImPlot).** Below the 3-D pane, one strip chart **per curve
-      dimension** and one **per tacked-on channel** (TrackedCurve). Shared index markers along the bottom
-      cross-reference the 3-D index dot. **All charts scroll left/right together (scroll-locked, never
-      individually)** to page through the whole curve. Hover/click on a chart cross-highlights the 3-D
+      - **Slice A (loom) DONE** — the introspection sidecar now carries real curve geometry: every
+        path/tracked_path dataset gets `control_points` (the animated control points at the frame's clock)
+        and a display `polyline` (96 samples via the same `eval_curve` midpoint-quadratic-Bezier the engine
+        uses; a closed spine repeats its first point to wrap). Tested in `tools/loom/tests/test_viewer.py`.
+      - **Slice B (C++ host) DONE** — the native viewer now exists as a **`-viewer <sidecar.json>`** mode of
+        the ftrace binary (Dear ImGui + Win32 + Direct3D 11; vendored under `src/third_party/imgui/`, wired
+        into the `ftrace` CMake target, dispatched from `main()` in `src/viewer_gui.cpp`). It reads the F1/F2
+        sidecar with the vendored `minijson` parser and shows a Scene summary (camera/frame/lights/DAG
+        counts), an **Objects** table (name/kind/material/linked-dataset-ids), a **Datasets** table
+        (id/kind/detail), and a right-hand **curve pane** that draws every dataset's sampled polyline (with
+        control-point markers) in a drag-to-orbit / wheel-to-zoom orthographic projection.
+      - **Slice C (C++) DONE** — the curve pane is now the real N-D pane. **Dim picker:** three combos map
+        any of the curve's N dims to screen X/Y/Z (loom curves are full N-D — the sidecar carries every
+        coordinate, verified on a 5-D test curve); reassigning them is a pure view-only re-projection (no
+        recompute), and the widest curve dimensionality in the scene drives the choices. An **index slider**
+        highlights a position along the curve, with progression dots drawn every ⅛ of arclength. **Stereo:**
+        a mode combo selects mono / **red-cyan anaglyph** / **wall-eyed (L|R)** / **cross-eyed (R|L)**
+        side-by-side, with an eye-separation slider; each eye re-renders the same curve at a small yaw offset
+        (anaglyph tints the two eyes red/cyan and overlays them; wall/cross split the canvas into two
+        half-width viewports). Shares the §I off-axis stereo idea.
+- [x] **F3 — scroll-locked strip charts (ImPlot).** ✅ 2026-07-24 Below the 3-D pane, one strip chart
+      **per curve dimension** and one **per tacked-on channel** (TrackedCurve). Shared index markers along
+      the bottom cross-reference the 3-D index dot. **All charts scroll left/right together (scroll-locked,
+      never individually)** to page through the whole curve. Hover/click on a chart cross-highlights the 3-D
       index dot and vice-versa.
-- [ ] **F4 — SweptMesh tessellated view + textures + decoupled re-tessellation.** Tessellate the
-      SweptMesh and show it in the 3-D pane with **any texture it defines (image *or* formula** — needs
-      **G5**). **Rotation rule:** rotating an isometry of the 3 displayed spatial dims = **view-only**
-      transform (just spin the existing mesh, no re-tessellate); rotating **into a parameter/extra
-      dimension** = **re-tessellate off the UI thread** via a **latest-wins job queue** (drop stale bakes
-      during a slider drag so the UI stays responsive). If loom couldn't define textures this would add
-      it — but loom already has `Texture`/`skin` (image) and `ProcTexture`/`func_skin` (formula, E1 DONE),
-      so this consumes them.
-- [ ] **F5 — modulator-DAG panel (imnodes).** Introspect the signal DAG via loom's `walk()` and lay it
-      out well. Each node shows the **op/function that modulates it** and a **stable identifier**; each
-      **edge is labeled with the parameter name it feeds**, so you can tell which variable in a node's
+      - **loom side:** the sidecar's `tracked_path` datasets now carry a `channels` array — each track
+        (`speed`, `aim`, …) sampled along the **same** curve parameter as the display polyline (scalar
+        tracks → 1-vectors, vector tracks → N-vectors; closed paths wrap), so the strip charts line up
+        sample-for-sample with the 3-D curve. Tested in `tools/loom/tests/test_viewer.py`.
+      - **C++ side:** vendored **ImPlot** (`src/third_party/implot/`) is now compiled into the ftrace
+        target. The `-viewer` right pane splits into the 3-D curve pane (top) and a stack of strip charts
+        (bottom): one per polyline dimension **d0…dN** plus one per channel component. All charts share a
+        **linked X axis** (`SetupAxisLinks`) so panning/zooming any one pages them all together, and each
+        carries a **draggable yellow index line** wired bidirectionally to the 3-D pane's index dot
+        (dragging a chart line moves the dot; the index slider moves every line).
+- [~] **F4 — SweptMesh tessellated view + textures + decoupled re-tessellation.** ✅ core done
+      2026-07-24 (VERSION 0.55.0). Slice A (loom, `b13122f`): each `swept_mesh` object record now
+      carries a `mesh` key with the tessellated triangle mesh at the clock — `vertices` (flat
+      3-vectors), `faces` (0-based index triples), per-vertex `uvs` (u along spine, v around profile),
+      `rings`/`profile_count` — mirroring `SweptMesh.emit`'s `sweep_rings`+`skin_rings` without writing
+      an OBJ. 2 new tests. Slice B (C++ viewer): a **Meshes tab** (`collectMeshes`/`drawMeshPane`,
+      `MeshView`) draws the surface as a **shaded, depth-sorted (painter's-algorithm) triangle mesh** in
+      a 3-D orbit pane, with **flat two-sided lambert shading**, a **wireframe** overlay, and a colour
+      selector (grey / per-object tint / **UV checker**). Orbiting the 3 spatial dims is the **view-only
+      re-projection** the rotation rule calls for. A swept-mesh scene opens on the Meshes tab by default
+      (its spine curves still populate the Curves tab). Verified via PrintWindow screenshot.
+      - **(1) textures** (image *or* formula) — ✅ **DONE 2026-07-26 (VERSION 0.58.0).** **Loom half
+        2026-07-24** — the sidecar emits a `materials` list (each material's `type`/`props` +
+        the `texture` skin it binds, animated props evaluated at the clock) and a `textures` list
+        (image `file`/encoding/filter/wrap, or formula `r`/`g`/`b`/`res` — `Texture` vs
+        `ProcTexture`), so the viewer sees *which* skin a mesh wears and where to get it.
+        4 new tests. A 5th test landed 2026-07-26 with the fix for a real serialisation bug: a
+        material *bundle* whose colour slot is a `SpatialExpr` lowers to a `ProcTexture` whose
+        channels are **live expression objects**, so the whole sidecar dump died with
+        `Object of type _Bin is not JSON serializable`; `_describe_texture` now bakes each channel
+        to its ftsl source at the clock via `ProcTexture._chan_str`, i.e. the viewer compiles the
+        *identical* string ftrace would. **C++ half 2026-07-26** — `SkinLib`/`Skin` in
+        `src/viewer_gui.cpp` decode every sidecar texture into a D3D11 SRV and the Meshes tab
+        gained a 4th colour mode, **texture** (now the default), which draws each triangle with
+        `PrimReserve`/`PrimVtx` at its **interpolated per-vertex UVs** (batching `PushTexture` per
+        material rather than per triangle) modulated by the lambert shade. Image skins go through
+        ftrace's own `Texture::load` (path tried verbatim, then relative to the sidecar dir);
+        formula skins are baked on the CPU through ftrace's own pattern VM
+        (`compilePatternExpr`/`patternEval`), a line-for-line mirror of `FtslLoader::addTexture`,
+        so the preview can't drift from the renderer. A `PatTexScope`/`PatCtx::texFn` pair lets a
+        formula sample an already-decoded image with `tex:<name>(u,v)` — same "images must be
+        declared above" ordering rule as ftrace. Linear texels are sRGB-encoded on upload
+        (IMMUTABLE `R8G8B8A8_UNORM`, ≤2048 px edge). Anything unusable — missing file, syntax
+        error, unknown `tex:` name — degrades to grey lambert and prints a red per-skin reason
+        under the pane instead of crashing or drawing black. `runViewerGui` also now calls
+        `ImGui_ImplWin32_EnableDpiAwareness()` + `ScaleAllSizes(dpi)`/`FontScaleDpi` so the whole
+        GUI renders at native resolution instead of being DWM-upscaled and blurry. Verified by
+        PrintWindow screenshot on a purpose-built 4-tube scene covering all four paths (image
+        skin, procedural formula, formula-sampling-an-image, no texture) plus a deliberately
+        broken sidecar for the error path.
+      - **Still open (deferred):** (2) **Re-tessellation when rotating *into* a parameter/extra
+        dimension** via a latest-wins off-thread job queue. **Loom half DONE 2026-07-24** — the
+        viewer↔loom **live re-introspection channel** (`ViewerSession`/`serve_viewer` in
+        `loom.viewer`, plus a `python -m loom.viewer <scene.py>` CLI entry): a resident loom process
+        holds a `ViewerModel` and answers newline-delimited-JSON `introspect {clock,params}` requests
+        with a fresh sidecar (the thing the frozen sidecar can't do), mirroring `loom.anim.serve_live`
+        in the viewer→loom direction. 9 new tests (`tests/test_viewer.py`, 1004 loom green). The channel
+        also gained an **`emit`** command 2026-07-24 (re-emit `.ftsl` for a clock/params) that **F7's
+        in-process primary path (v0.56.0) already uses the static form of** — the viewer parses loom's
+        emitted `.ftsl` and raymarches it live. **C++ half still open** (best done with the user present):
+        wire the `-viewer` GUI to spawn that process (or reuse the in-process `ViewerModel` bridge F7
+        established) and request re-introspection/`emit` on rotate/scrub, feeding the new **mesh** geometry
+        through a latest-wins job queue into the Meshes tab. Same channel unblocks F7's live field edit.
+- [x] **F5 — modulator-DAG panel (imnodes).** ✅ 2026-07-24 Introspect the signal DAG via loom's `walk()`
+      and lay it out well. Each node shows the **op/function that modulates it** and a **stable identifier**;
+      each **edge is labeled with the parameter name it feeds**, so you can tell which variable in a node's
       function refers to which upstream node.
-- [ ] **F6 — scatter + grid field display & inspection.** **Scatter:** show the actual defined points
-      (no volume fill) using the same 3-D-view/stereo mechanism, colored by a **channel selector
-      (default)** or channels 0/1/2 → RGB; **click any point to inspect its location + all channel
-      values**; glyphs later. **Grid:** show a **3-D slice** with **sliders for the extra dims**; same
-      click-to-inspect. Coloring must handle **multi-valued** points (hence the channel selector, not a
-      single fixed mapping).
-- [ ] **F7 — isosurfaces via `-raster-gpu` raymarch (primary) + MC-mesh fallback.** Show a loom
-      isosurface in the 3-D pane by **raymarching it through `-raster-gpu`** (primary path — the whole
-      reason for the native viewer; lets the user *modify* the isosurface and see it re-evaluated fast
-      with no re-tessellation). Keep the existing marching-cubes mesh (`mcubes.mesh_field` / `IsoMesh`)
-      only as an **optional static-rotate fallback**. Textures via **G5**.
+      - **loom side:** `_describe_dag` now tags every edge with a `param` label — the name of the input on
+        the destination node that the upstream child feeds, derived by identity-matching the child to the
+        attribute it's stored under (`a`/`b` for arithmetic operands, `cycles`/`phase`/`amp`/`bias` for a
+        `Sine`, `components[i]` for a `VecSignal`; positional `in<i>` only when nested out of reach). Tested
+        in `tools/loom/tests/test_viewer.py`.
+      - **C++ side:** vendored **imnodes** (`src/third_party/imnodes/`) is compiled into the ftrace target.
+        A **Modulator DAG** panel in the `-viewer` left column renders the graph with imnodes: each node is
+        a box titled `<op> #<id>` (with its constant/leaf value shown when distinct), one **labelled input
+        pin per incoming edge** (the param name), and one output pin; links connect upstream outputs into
+        those labelled inputs. A longest-path layering places leaves (constants/oscillators) on the left and
+        the params they drive on the right; pan/zoom to explore.
+- [x] **F6 — scatter + grid field display & inspection.** ✅ 2026-07-24 Slice A (loom,
+      `dea2abd`): `_describe_dataset` now emits real field geometry — scatter `points` (sample
+      positions) + `values` (per-sample channel-vectors), grid `axes` (per-axis lattice coords) +
+      flat C-order `values`; scalar values normalised to 1-lists so the C++ side sees uniform
+      channel-vectors. 3 new tests (grid geometry, scalar scatter, vector-rgb scatter). Slice B
+      (C++ viewer): a new **Fields tab** in the right pane (`drawFieldPane`/`collectFields`,
+      `FieldView`) renders scatter/grid sample points in the shared 3-D orbit view (grid node
+      positions reconstructed from axes+shape in C-order), **3-of-N dim pickers**, a **colour
+      selector** (heatmap of a chosen channel — with a channel slider for multi-valued fields — or
+      **ch0/1/2 → RGB**), **click-to-inspect** (nearest projected point within 14 px → prints its
+      position + every channel value), and **per-extra-dim slice sliders** for N-D grids (dims not
+      shown collapse to a chosen lattice index). Tabs auto-hide when their kind is absent so the
+      present one is default-selected. VERSION → 0.54.0. Verified via PrintWindow screenshot.
+      *(No glyphs yet — points only, as speced; deferred as a later polish.)*
+- [x] **F7 — isosurfaces via `-raster-gpu` raymarch (primary) + MC-mesh fallback.** ✅ **primary path
+      DONE 2026-07-24** (v0.56.0), ✅ MC-mesh fallback done 2026-07-24.
+      - **Primary path (in-process raymarch) — DONE 2026-07-24 (v0.56.0).** Took the **in-process**
+        route rather than the `-serve` subprocess: the `-viewer` **is** the ftrace binary, so it already
+        contains both the `.ftsl` parser (`ftsl::load`) and `renderIsoPreviewCuda`. loom's
+        `ViewerModel.save_sidecar` now emits the scene's **`.ftsl` beside the sidecar** and records its
+        absolute path under a new sidecar **`"source"`** key (and a matching `ViewerSession` **`emit`**
+        command re-emits `.ftsl` for a new clock/params over the live channel — for scrub/param/edit).
+        `viewer_gui.cpp` parses `source` with `ftsl::load` and adds a **"Render" tab** (default-selected,
+        the primary view) that calls `renderIsoPreviewCuda(scene, orbitCam, W, H, …)` in-process, blits
+        the RGB frame into a **D3D11 dynamic texture** (`ImGui::…AddImage`), and drives an **orbit camera**
+        (drag = yaw/pitch, wheel = dolly) around the scene bounding sphere; re-renders only on camera
+        change (idle pane is free). Validated end-to-end: a gyroid `build()` → sidecar+`.ftsl` → the
+        viewer's Render tab sphere-traces the real field (identical to `-raster-gpu`, **no tessellation**).
+        This replaces F7's static MC-mesh with the actual field for the native viewer too. New loom tests
+        (6) + the whole loom suite green; C++ compiled with the new `ftsl.h`/`render_cuda.h` includes.
+        *Deferred within F7:* the `-serve` streaming path (only needed if the raymarch is ever pushed to a
+        separate process). (F4's C++ texture display — image/formula → sampled D3D11 texture at mesh UVs —
+        was still open when this was written; it landed 2026-07-26, see §F4.)
+      - **How the primary path used to be scoped — RE-SCOPED 2026-07-24 after an architecture audit.** The
+        field-raymarcher itself **already exists and already ships**: `-raster-gpu` (feature **G2**) casts
+        primary rays straight at the implicit **with NO tessellation** — `renderIsoPreviewCuda` →
+        `kIsoPreview` → `closestHit` → `intersectImplicit` sphere-traces the postfix field bytecode
+        (`render_cuda.cu` ~L1801/2201), the *same* field VM the full path tracer uses. And it is already
+        the **shared** preview renderer: the `rasterOne` lambda (`main.cpp` ~L4923) routes *every* preview
+        consumer through it — single stills, flyby frames, **and the interactive `-explore`/`-fly` loop +
+        the camera-curve editor inside it**. So `-explore`/`-fly`/the editor **already raymarch the field
+        live, no re-tessellation**, whenever launched with `-raster-gpu`. The one consumer NOT yet using it
+        is the **native ImGui `-viewer`**, which still shows F7's static **MC-mesh fallback**.
+      - **So F7's remaining work is NOT a new raymarcher** (and NOT a duplicate D3D11/HLSL field VM in the
+        viewer — that would fork the evaluator). It's a **bridge**: drive the existing `-raster-gpu`
+        raymarcher over the **`ftrace -serve` pipe** and blit its frames into the viewer pane, reusing the
+        §F4/§F7 **live re-introspection channel** (`ViewerSession`/`serve_viewer`, loom half done
+        2026-07-24) + the M12 resident `-serve` server. When the user edits the field, loom re-emits the
+        `.ftsl` (the `function { expr }` `Isosurface.emit` already produces) → the resident `-raster-gpu
+        -serve` re-renders instantly. This is **C++ interactive-viewer work** (spawn/drive the resident
+        process, present its frames, wire scrub/param/edit) — best done with the user present; the MC mesh
+        is the working stand-in until then. Textures via **G5** + the F4 material/texture sidecar (done).
 
 ---
 
@@ -1216,8 +2020,11 @@ raise `query dim != grid ndim`, and `FieldCurve` builds the field eagerly), so n
       where the curve must stay inside the box.
 - [x] **`"wrap"`** — periodic fold (period `hi-lo`; sample `n-1` aliases `0`), for both linear and
       Catmull-Rom stencils. Apt for a gyroid (2π-periodic) → seamless tour.
-- [ ] optional **`"extrapolate"`** — linear extrapolation off the boundary cell. **Deferred** (not needed
-      yet; the cubic phantom-point machinery already exists if we want it).
+- [x] optional **`"extrapolate"`** — linear extrapolation off the boundary cell. **DONE 2026-07-24**
+      (`tools/loom/loom/interp.py`): `_cell_base_frac` returns an *unclamped* fraction (`f<0` below,
+      `f>1` above) on the boundary cell, so the linear stencil extends the edge cell's slope instead of
+      edge-extending; cubic reuses the same unclamped fraction through the existing phantom-point machinery
+      (reproduces linear ramps off-edge exactly). 3 tests in `test_gridinterp.py`.
 - [x] Re-raise the `FieldCurve` dimension-mismatch `ValueError` with FieldCurve context (names the curve's
       dim). *(J1 complete bar the optional extrapolate mode.)*
 
@@ -1229,22 +2036,24 @@ the container moves but the pattern does not follow. (A translation is *expressi
 loom already has the affine machinery to fix this cleanly: `mathnd.Affine` (`linear @ x + offset`, both
 animatable, composable) and `spatial._offset`.
 
-**Decision (the two missing primitives):**
-- [ ] **Placement on `Isosurface`** — a `center`/`Affine` that offsets **both** the coordinate frame
-      (`freq*(M·(x − center))+drift`) **and** the `contained_by` box/sphere, animatable, so a blob can
-      drift/tumble around the room over the loop.
-- [ ] **`Room`/`Group` `Element`** — owns a child list + an animatable `Affine` frame, emits each child with
-      the composed placement (`room_frame ∘ child_placement`), namespaces child names (`room/gyroidA`) so
-      the emitted `isosurface "…"` names don't collide; may emit the shell (box / 6 planes) + shared
-      materials/lights.
-- [ ] **Driver pattern / factory** — refactor `gyroid_nd.py` to expose a factory (`make_gyroid(**params) ->
-      Isosurface`); a new driver script builds a `Room`, instances the factory N times with different
-      params/materials, and assigns each a placement (static, on a closed `LoopCurve`, or from a
-      `VecGridField`/`Scatter` of placements).
-- **Caveats to design in:** seamless loop (translations on *closed* curves, rotations by integer turns,
-  drift by 2π·k); overlap (separate `contained_by` boxes keep blobs disjoint & cheap; union/blend is a
-  CSG question ftrace-side); validate ftrace stays efficient with many overlapping sphere-traced
-  isosurface containers.
+**Decision (the two missing primitives):** — **J2 DONE (2026-07-24).**
+- [x] **Placement on `Isosurface`** — added an animatable `placement` `VecSignal` that offsets **both** the
+      coordinate frame (`freq*(M·(x − placement))+drift`) **and** the `contained_by` box/sphere; a transient
+      `_parent` `Affine` (set by an enclosing `Room`) folds a room frame in (`M_eff = M·Pᵀ`,
+      `p_eff = P·p_local + T`, box → conservative world AABB). `placement=(0,0,0)` is byte-identical to the
+      un-placed emission. (`iso.py`; tests in `test_iso.py`.)
+- [x] **`Room`/`Group` `Element`** — `loom.Room` owns a child list + an animatable rigid `Affine` frame;
+      on emit it hands each child the composed frame as its `_parent` (`room_frame ∘ child_placement`),
+      namespaces child names (`hall/gyroidA`, stacking for nested rooms), and restores child state after.
+      (Shared materials/lights + shell are authored in the driver, not the Room, keeping it a pure group.)
+- [x] **Driver pattern / factory** — `examples/room_of_gyroids.py` exposes `make_gyroid(**params) ->
+      Isosurface` and a driver that instances four different minimal surfaces on a *closed* circular orbit
+      inside a slowly-tumbling `Room`. (Left the 4124-line CLI `gyroid_nd.py` untouched — it predates the
+      Room API and isn't a clean factory; the new focused example is the canonical J2 driver.)
+- **Caveats handled:** seamless loop verified (frame48==frame0 with closed-curve orbits + integer-turn room
+  rotation + 2π drift). Overlap kept cheap via separate sphere containers; CSG union/blend remains an
+  ftrace-side question (not needed here). *(Not yet stress-tested: many (dozens+) overlapping sphere-traced
+  containers in one frame — validate ftrace throughput if a driver ever instances that many.)*
 
 ### J3 — Port the FTSL **parametric-record** data structure into loom (large; the user's real ask)
 **Clarified intent (2026-07-19).** *Not* loom's existing `Grid`/`Scatter`. The user wants a **loom twin of
@@ -1292,18 +2101,47 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          *(DONE — vector channels + inline `rgb`/`hsv`/`hsl` colour channels with a channel-level tag, plus
          `Record.lower_colours()`/`lower_ftsl()` lowering inline colour to synthesized `spectrum "<name>" = rgb …`
          decls + `spectrum:<name>` refs ftrace can parse.)*
+         **DONE IN FTRACE TOO — 2026-07-27 (v0.86.0).** Inline colour is no longer loom-only: `RecChannel` gained a
+         `space` field, and `Parser::parseChannelStops` strips a leading colour-head tag off a channel line and
+         feeds `{space, comps…}` to the **same `evalSpectrum`** a top-level `spectrum "x" = rgb …` decl uses. That
+         convergence is the whole design: the record path inherits all 18 colour heads (3 spaces × `""`/`line`/
+         `illum`/`smits`/`box`/`meng`) for free, and the Jakob–Hanika coefficient bake + GPU upload never learn
+         that records exist. `isColourHead()` is the single list of accepted tags; loom's `_COLOUR_SPACES` mirrors
+         it exactly, and `Record.lower_colours` now passes a non-plain head through **verbatim** (deduping on
+         `(head, comps)`) instead of mis-converting it as if it were HSL. Lowering is still useful — it dedupes
+         colours and targets a pre-0.86 binary — but is no longer *required*.
+         Only *untagged* vector channels (`D∉{1,3}`) stay loom-only, and deliberately: ftrace has no destination
+         slot to feed an arity-`D` value into, so it emits an error naming the colour tag as the fix.
       2. **Generalized stop grammar** (`ROADMAP_records.md` §3.1) — arbitrary-arity stops with a **delimiter
          precedence ladder** (whitespace binds like `×`, comma like `+`, brackets = parens), so structure is
          recoverable from the delimiters alone and the channel's arity only *validates*: `tint [rgb 0 0 0,
          0 1 0, 1 1 1]` ≡ `tint rgb [0 0 0] [0 1 0] [1 1 1]` (the three ladder delimiters are `[ ]` / `,` /
          whitespace — parens are reserved for expressions + the §3.2 application surface); position pins
-         (`.2:0 0 0`) are an orthogonal `POS:` prefix. **NB: current FTSL cannot parse this** — its tokenizer isn't comma-aware and every
-         whitespace-word is a separate stop, so today an rgb curve is `reflect spectrum:steel spectrum:gold …`
-         (one `:`-ref per stop). loom now implements this as **one backward-compatible grammar** (`loom/record.py`,
-         a single `parse`/`emit` pair): each channel line is dispatched on the presence of a top-level comma, so a
-         comma-free line keeps the exact J3a whitespace meaning and only a comma line opts into the ladder
-         (`tint 0 0 0, 1 1 1` = two arity-3 stops; a lone vector stop takes a trailing comma). It's an *additive
-         superset*, not a breaking change — no existing record reparses differently.
+         (`.2:0 0 0`) are an orthogonal `POS:` prefix. loom implements this as **one backward-compatible grammar**
+         (`loom/record.py`, a single `parse`/`emit` pair): a line with no ladder delimiter keeps the exact J3a
+         whitespace meaning and only a `,`/`[`/`]` opts into the ladder (`tint 0 0 0, 1 1 1` = two arity-3 stops;
+         a lone vector stop takes a trailing comma). It's an *additive superset*, not a breaking change — no
+         existing record reparses differently.
+         **DONE IN FTRACE TOO — 2026-07-27 (v0.86.0).** The old "current FTSL cannot parse this — its tokenizer
+         isn't comma-aware" note was the blocker, and it turned out to be **the reason the ladder was easy, not
+         the reason it was hard**: because `,` is *not* one of ftrace's tokenizer delimiters, a comma survives
+         lexing glued to its word (`0,`), so it can simply be re-split in the loader, paren-aware. (The error
+         `bad stop expression '0,'` came from the *expression compiler*, not the parser.) Only `[` / `]` genuinely
+         delimit, so the grammar change is one rule — `stop_group = '[' stop_item* ']'` in `ftsl_scene.epeg`, with
+         `ftsl_reduce.hpp` flattening it back to `[`/`]` marker words. Everything else lives in
+         **`src/record_ladder.h`** (`recladder::tokenize`/`usesLadder`/`parse`, a sum→product→factor
+         recursive descent), the dependency-free C++ twin of `loom/ladder.py`.
+         Additivity is *structural*, not hopeful: `parseChannelStops` routes a line with no tag and no ladder
+         delimiter through the byte-identical old whitespace loop, and both ways the new path can fire were
+         previously hard errors (a leading `rgb` was never a legal pattern variable; a `,`/`[`/`]` never lexed).
+         `clamp(u,0,1) 0.5` still takes the fast path — its comma is at paren depth > 0.
+         **Verified:** `-parseonly` (new flag) over the whole `scenes/` corpus, 81 scenes, 0 failures; 14 accept +
+         5 reject cases; `scenes/_record_ladder.ftsl` writes the same channel four ways; and
+         `tools/check_record_twins.py` probes ftrace's per-channel stop count via an out-of-range `rec.ch[999]`
+         selector and diffs it against loom's — 27/27 channels agree across all six `_record_*.ftsl` fixtures.
+         That checker exists because a loom↔ftrace stop-boundary disagreement is a *silent wrong render*, not a
+         parse error; it already caught one real divergence (loom ended a record body at the first `]`, which the
+         ladder made ambiguous — now bracket-matched).
       3. **Uniform named-input binding / rebinding** (`ROADMAP_records.md` §3.2) — a property is an expression
          over named inputs (system-provided-with-default like `a`/`u`/`v`, or unbound). Access is *continuous
          only* (no discrete `[i]` — a constant index is just a constant argument `prop(2)`); any input is
@@ -1333,6 +2171,64 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          exposed as `sabs` in Python to dodge the builtin shadow, but it *emits* `abs`), so loom's function
          vocabulary is a subset of ftrace's by construction — which is why export is clean and J3c's shared
          grammar can be the single enforcement point.
+         **DONE — parts (a),(c),(d) 2026-07-26.** (a) `loom/spatial.py`: the coordinate leaf `_Coord` is
+         generalised to a public **`Surface`** family — `X Y Z` (axes, both backends), `U V` (surface params,
+         ftrace `u`/`v`, **emit-only**), `A` (albedo placeholder — no ftrace var, so a bare `A` raises until
+         substituted/defaulted); `SpatialExpr.free_inputs()` + `.substitute({name: expr})` (functional rewrite).
+         (c) binding-by-substitution: `gold(u=v)` swaps the `U` leaf at emit — loom always resolves to a concrete
+         field in real ftrace variables, **never** literal bundle syntax (so the J3c SEQUENCING concern is
+         sidestepped: **zero** ftrace changes, renderable at every commit). (d) `loom/scene.py`:
+         **materials-as-bundles** — a `Material` property may be a `SpatialExpr` field; `Material.free_inputs()`
+         is the union; `mat(u=v, a=1)` / positional `mat(expr)` applies by substituting across the bundle; unbound
+         `A`→`albedo_default`; `Scene.add` **expands** each field into a renderable companion (colour slot →
+         `ProcTexture` over `u/v`; scalar slot → `FuncPattern` over `x/y/z`), with coordinate-family validation.
+         Validated: a bundle scene emits `.ftsl` ftrace parses & renders identically to the hand-authored
+         `func_skin` path. Tests: `test_spatial.py` (+9), `test_material_bundle.py` (14). **Remaining:** item 4
+         (N-D input domain).
+         **DONE — part (b) 2026-07-26 (v0.57.0).** The scoping below was right that it needed a renderer change, so
+         the op was built first and the loom leaf second. **ftrace:** new `PatOp::Tex`, appended at the END of the
+         enum so `patternHasFreeVars`'s `VarX..VarV` range is unperturbed, spelled **`tex:<name>(u, v)`** — the
+         tokenizer scans `tex:foo` as one identifier and `funcOp` reports arity 2. The texture index rides in the
+         existing `PatNode::a` double (the same trick `PatOp::PovFn` uses for its internal id), so the struct layout
+         and the verbatim device upload are unchanged. `pattern.h` stays free of `texture.h` (which drags
+         `upsample.h`/`spectrum.h`/`color.h` into every TU, nvcc's included): sampling goes through an opaque
+         `PatCtx::texFn`/`texSelf` hook installed by `scene.h`'s `bindPatTex`, and `patCtxFromHit` now takes the
+         `Scene`. Compile-time name resolution is **opt-in per value site** via a new `PatTexScope`, handed to
+         `compilePatternExpr` only where a shading context exists (pattern blocks, record scalar stops / drivers /
+         overrides, procedural texture channels) — so `tex:` in an isosurface `function { expr }`, a medium
+         `density`/`ior` program or a load-time constant is a **specific compile error, never a silent 0.0**
+         (9 error paths verified). GPU twin in `dPatternEval` over the existing `dTexScalarAt`, with the two new
+         params threaded through all 8 call sites (no default args — it's forward-declared twice). Ordering: Pass 1b
+         builds textures before patterns/records/materials, so file order is irrelevant for those; the one rule is
+         that a *procedural* `texture { rgb "…" }` bakes during 1b and can only sample images declared above it.
+         **loom:** `Image(path, u=…, v=…, encoding=…, filter=…, wrap=…)` in `spatial.py` — coordinates are ordinary
+         sub-expressions (warpable, and `substitute` reaches into them so a bundle's `u=`/`v=` binding flows in);
+         `_auto_name()` gives a deterministic `img_<stem>_<hash8>` over path+sampler so identical images share one
+         declaration and different samplers don't collide; `SpatialExpr.image_textures()` + `Scene._add_image_textures`
+         auto-declare the companion `texture` block (an explicit one of the same name wins in either order), without
+         which every image term would emit a dangling reference; `eval_np` is a faithful port of
+         `Texture::sampleRgb`/`scalarAt` (half-texel offset, v-flip, repeat/clamp/mirror, mean-of-linear-RGB).
+         `encoding` defaults to `linear` — a value used as a NUMBER wants the stored levels.
+         **Also fixed en route:** `Material.expand`'s scalar-slot guard rejected `{u,v}`, which was simply wrong
+         about ftrace — a scalar slot is a *live* pattern evaluated through `patCtxFromHit`, which supplies u/v
+         (`scenes/uv_native.ftsl` ships `weight_map pattern:uvcheck8` over `floor(u*8)`). Only the *colour* slot is
+         coordinate-restricted, and for the opposite reason (it bakes into a u/v-indexed image).
+         **Validated:** the loom-emitted `.ftsl` renders **bit-for-bit identical** to hand-authored
+         `scraps/texop_pattern.ftsl`, which in turn is bit-for-bit identical to the shipped `texture:<name>` slot
+         binding on both CPU and GPU; the composed case (`scraps/loom_image_mixed.ftsl` / `texop_mixed.ftsl`) matches
+         CPU↔GPU to MC noise. Tests: `tools/loom/tests/test_image_term.py` (25), suite 1046 → 1071.
+         Docs: README.md, FTSL.md §6.1 + isosurface section, loom DESIGN.md/README.md.
+         **[superseded scoping, kept for the record] PART (b) IS NOT ZERO-COST — needs an ftrace pattern-VM texture-sample op (2026-07-26).** Unlike
+         a/c/d, an `Image` leaf sampled *inside* a pattern/isosurface expression has **no** shipped ftrace target:
+         `src/pattern.h` `funcOp` has no texture/image builtin (only abs/sqrt/sin/…/noise), so emitting a `tex(...)`
+         call would be un-renderable — violating the "renderable at every commit" rule. The proper fix is a new
+         `PatOp::Tex` (a texture-sample-at-(u,v) op) threaded through: pattern compile (resolve `tex:<name>` →
+         texture index, needs the texture-index map in pattern scope), `PatNode` carrying the index, CPU eval
+         (reuse `Texture::scalarAt`), and the GPU pattern interpreter in `render_cuda.cu` (`dPatternEval`, which
+         already handles `VarU`/`VarV`; reuse the existing device sampler `dScalarAt`, render_cuda.cu:3426; upload
+         the per-pattern texture-index table). Bounded but cross-cutting + GPU + **VERSION bump** — a distinct
+         workstream from the pure-loom a/c/d, to be done as its own focused pass (in lockstep, it also wants the
+         numpy twin: PIL load + bilinear sample where coordinates permit).
          **`t` IS A FIRST-CLASS REBINDABLE INPUT (2026-07-19).** Don't treat `t` (clock time) as a magic ambient
          parameter — make it just one named input among `{t, x, y, z, u, v, a}`, rebindable by the same
          substitution as `u`/`v`/`a`. This unifies the Signal (temporal) and Surface (spatial) tiers *at the
@@ -1350,7 +2246,137 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          is irrelevant; a cycle needs a *recurrent/stateful* node, which loom has none of). **Caveat:** unifying
          the *grammar* (one node type, `t` an input) is clean, but the two *executors* stay distinct strategies on
          that node — scalar-per-frame (frame-keyed cache) vs numpy-array-over-space — don't pretend they're one call.
+         **DONE IN FTRACE TOO — §3.3 materials-as-bundles arm, 2026-07-27 (v0.87.0).** Binding is **substitution**,
+         and on a *postfix* program substitution is a pure **splice**: a variable node pushes exactly one value and
+         so does a well-formed program, so `patternSubstitute` (in `src/pattern.h`, alongside `varName` /
+         `patternUsesVar` / `patternCollectVars`) just replaces each `VarU` node with the replacement program's
+         nodes. No environment, no closure, no runtime indirection — an applied material is an **ordinary**
+         `Material` over ordinary patterns, so the GPU upload, the CPU evaluator, `patternHasFreeVars` and the
+         record samplers are all untouched. Substitution is **simultaneous** (`gold(u=v,v=u)` swaps).
+         `PatOp::VarA` is appended at the END of the enum (the `PatOp::Tex` precedent) so the `VarX..VarV`
+         intrinsic range is unperturbed; `a` is the one named input with **no per-hit intrinsic**, so an unbound
+         `a` must resolve at LOAD time — to what the use site binds, else to the material's `albedo_default`
+         (system default 1.0). That default lives in the loader (`Parser::albedoDefault_`), *not* on `Material`,
+         because `Material` is uploaded verbatim to the device. `a` is also **scope-gated**: `compilePatternExpr`
+         takes a new trailing `allowA`, true at exactly the four material-reachable value sites (pattern block,
+         record material driver, record `from` driver, record-override slot RHS) and false everywhere else, so
+         `a` in an isosurface or a medium program is a specific compile error, never a silent 0.0.
+         Application is **lazy and memoised**: *every* by-name material reference routes through
+         `Parser::lookupMaterial` → `applyMaterial(idx, argText)`, which returns the ORIGINAL index for a no-op
+         call and caches on `"<idx>(<args>)"`, so identical applications share one clone and a material nobody
+         applies is bit-identical to before (additivity is structural, not hopeful — 83 scenes parse, 0 failures).
+         `parseBindArgs` finds argument boundaries from the `=` signs plus top-level commas; that is unambiguous
+         only because the pattern language has **no comparison operators**, so a top-level `=` is always a binding.
+         Named args are resolved *before* positional ones and a positional binds the sole **still-free** input
+         (loom `Material.apply` parity: `gold(v,a=1)` legal, `gold(v)` on a two-input bundle rejected, >1
+         positional rejected). Routing plain lookups through `applyMaterial` can append to `Scene::mats`, so
+         `resolveMixChildren` was refactored to take a material **index** rather than a `Material&` — a stored
+         reference would have dangled on reallocation.
+         **Spaces in an argument list** were initially not allowed and that was fixed in the same arm (see the
+         separate v0.88.0 entry below): the shared grammar's `WORD`/`PARENWORD` now match a *balanced paren group*
+         as part of the token, so `gold(0.5*u + 0.5*v)` and `gold(a=1, u=v)` lex as one word.
+         **Pinned deterministically** by the new `-checkbind` self-test (`checkBind()` in `main.cpp`): splice ==
+         textual inlining over 10 input types, simultaneity with negative assertions against *both* sequential
+         collapse directions, identity for empty/absent binds, introspection, and `a` scope-gating.
+         Regression scene `scenes/_material_bind.ftsl` — a 4×3 grid of camera-facing **quad tiles**, not spheres:
+         `addQuad` gives a quad UVs spanning the parallelogram, so the material's `u` IS the tile's horizontal axis
+         and `v` its vertical one, and rebinding `u=v` visibly ROTATES the gradient. (The first cut used spheres and
+         was useless — curvature mixes albedo with shading falloff, so flat brightness couldn't be compared across
+         surfaces at all, and a rotated gradient on a sphere is unreadable. The room is neutral grey for the same
+         reason: colour bleed would contaminate the greyscale albedo being read.) It carries three **identity pairs**
+         that are the actual asserts — `flat_a(a=0.5)` ≡ literal `reflect 0.5`, named `u=v` ≡ positional `(v)`, and
+         comma ≡ comma-less argument lists. Measured at 120 s / 320²: normalising each tile against the backdrop
+         strip below it (also albedo 0.5, which cancels the lighting profile) the pairs agree to 0.3% / 0.1% / 2.4%,
+         `A1 0.610 < A2 1.103 < A3 1.522` tracks `0.15 < 0.5 < 1.0`, and the gradients come out horizontal (du=+39,
+         dv=0) / vertical (du=0, dv=+37) / reversed (du=−38) / 45° diagonal (du=+15, dv=+14) as authored.
+         Docs: FTSL.md §7.6, README.md, design.md.
+         **Remaining in ftrace:** none — see the §3.2 follow-up below.
+
+         **FOLLOW-UP — §3.2 per-property access, 2026-07-27 (v0.89.0).** `MATERIAL.slot` and
+         `MATERIAL.slot(args)` now read ONE property off an already-declared material:
+         `reflect src.reflect`, `reflect src.reflect(u=v)`, `roughness steel.roughness`, `ior glass.ior`.
+         **The slot keyword IS the dot-handle.** §3.2 writes a property as `<slot keyword> ["name"] = <value>`
+         and makes the quoted name *optional* — the slot keyword alone binds the property to its slot, and the
+         name exists only to mint an external handle. ftrace properties are spelled with the slot keyword and
+         have never carried a quoted name, so **the optional-property-name arm is vacuously already ftrace's
+         status quo**: every ftrace property is anonymous, and the handle is therefore the slot keyword. That is
+         why there is no separate work item for it.
+         **Resolution routes through `applyMaterial`** (`materialPropRef` in `src/ftsl.h`), so a property
+         reference *cannot diverge* from "apply the bundle, then read the slot" — same binding rules, same memo
+         key, same `a` fallback, by construction rather than by a parallel implementation. In particular an
+         unbound `a` resolves against the **SOURCE** material's `albedo_default`, not the reader's and not the
+         system 1.0.
+         **Four chokepoints** are hooked, because a value site in ftrace is reached four different ways:
+         `evalSpectrum` (pattern-less spectral), `patternedSpectrumParam`, `dblParam` (pattern-less scalar), and
+         `bindScalarPattern`. `patternedSpectrumParam` is **the only site that can carry both halves** of a
+         spectral slot (base spectrum *and* companion per-hit pattern), which is why the pattern-aware path lives
+         there and the other three refuse a pattern-carrying source with an explicit message rather than silently
+         dropping the pattern.
+         **Composition, not clobbering:** when the reader also writes its own `reflect_map`, `composePatterns`
+         appends `[a…, b…, Mul]` in postfix so the two multiply. Both spellings mean "a per-hit multiplier on
+         whatever the slot otherwise evaluates to", and letting one win would have made the result depend on
+         statement order.
+         **Three loud refusals** (the lesson from the item-3 review: a new limitation must fail, never
+         approximate): a **record-driven** slot has no load-time value; a **texture-bound** slot cannot be carried
+         by a property reference; and a **pattern-carrying** source at a site that cannot hold a pattern is
+         rejected with "write it on the matching `_map` slot instead".
+         **Records win a name clash** (`recordIndex_` is consulted first), so `R.chan` cannot change meaning in an
+         existing scene just because some material is named `R` — necessary because `bindScalarPattern` reaches
+         materials before records.
+         **`loadedRef_`** is a pointer to the owning `Loaded`, never to an element: `applyMaterial` may append to
+         `Scene::mats` and `Scene::patterns`, and both vectors reallocate.
+         **loom twin:** `Material.prop(name, *args, **binds)` in `tools/loom/loom/scene.py`, keeping the
+         `apply`/`free_inputs`/`albedo_default`/`prop` ↔ `applyMaterial`/`materialFreeInputs`/`albedoDefaultFor`/
+         `materialPropRef` correspondence intact; 5 new tests in `tools/loom/tests/test_material_bundle.py`.
+         **Pinned deterministically** by the new `-checkprop` self-test (`checkProp()` in `main.cpp`): ten groups
+         comparing two independently-authored loaded scenes field-by-field — bare ref reproduces a pattern-driven
+         and a constant slot, `u=v` == the hand-written twin, unbound `a` → source `albedo_default` 0.4, `a=1`
+         overrides, composition with `reflect_map`, cross-slot `transmit`→`reflect`, scalar read-back, memo
+         sharing — plus six `mustReject` cases and the record-name-clash case.
+         Regression scene `scenes/_material_prop.ftsl` (flat camera-facing quads, same reasoning as
+         `_material_bind.ftsl`). The **scalar arm is deliberately not in the image**: a glossy/thin-film tile
+         under those two grazing strip lights renders essentially black, so a tile pair would assert nothing —
+         `-checkprop`'s field-by-field comparison is the stronger assert. Row E alternates the two spellings
+         `E1 E2 E1 E2` on purpose: an identity reads as a smooth left-to-right profile (just the lighting) and a
+         difference reads as a zigzag, which needs no normalisation to see.
+         Docs: FTSL.md §7.7, README.md, design.md.
+
+         **FOLLOW-UP — spaces inside a paren group, 2026-07-27 (v0.88.0).** The item-3 arm shipped with an
+         argument list that had to be a single *unspaced* token (`gold(0.5*u+0.5*v)` yes, `gold(0.5*u + 0.5*v)`
+         no), because a value ends at the first plain bareword (`cont = NUMWORD | KVWORD | STRING`). That was
+         defensible only as "pre-existing" — the shipped `RECORD(driver)` and array-literal sample-call forms had
+         it too — and the user rightly called it flimsy, so it is gone. The fix is purely **lexical** and lives in
+         the one shared grammar, `tools/loom/loom/grammar/ftsl_scene.epeg`: `WORD` and `PARENWORD` now match a
+         **balanced paren group** as part of a token, with the group's interior character class allowing `' '` and
+         `'\t'` while `WORD`'s own class still does not. So a space is a delimiter exactly while no parens are
+         open. Fixing it in the lexer rather than in `matFieldId` was the only real option — once the tokens are
+         split, the rest of the line has already been consumed as *other statements* and cannot be recovered.
+         Three deliberate design points. (a) **Balanced, not greedy.** A `\([^)]*\)` that may cross spaces would
+         happily swallow `(a) roughness 0.2` up to a `)` in a *different statement* — a silently wrong parse
+         instead of an error. Regexes cannot count, so the nesting is written out to depth 4; that is not a real
+         ceiling, because `WORD`'s fallback alternative still matches a bare paren as an ordinary char, so deeper
+         nesting simply degrades to the old behaviour (outer parens consumed as chars, the group covering the
+         innermost spaced run). (b) **Group alternative FIRST.** ECMAScript/Python regexes are leftmost-*first*,
+         not leftmost-longest, so the engine must be told to prefer "consume the whole balanced group" over
+         "consume `(` as an ordinary char and stop at the next space". (c) **Backward-compatible by construction:**
+         the fallback alternative is byte-identical to the historical `WORD` class, so the group alternative can
+         only ever *extend* a token across a space that sits inside parens — precisely the case that used to raise
+         "missing ')'". Verified by replaying the old and new rule tables over the whole scene corpus with a
+         faithful reimplementation of the longest-match/declaration-order lexer: **83 scenes, 26 805 tokens,
+         exactly one differing token** — the intended one in `_material_bind.ftsl`. Regenerating
+         `src/gpda/ftsl_scene.gen.cpp` touched **4 lines in 2 lexer rules and left the parse graph untouched**,
+         which is the structural proof that the change is lexical only. Adversarial backtracking checked (40
+         unclosed parens, 40 nested, an 840-char flat expression): max 33 µs, no blow-up. `parseBindArgs` needed no
+         change, and `parenHint()` was rewritten — reaching "missing ')'" now genuinely means unbalanced parens.
+         `_material_bind.ftsl` C4 is now deliberately spelled `grad_ua(u=0.5*u + 0.5*v)` so the scene regresses
+         this, and still measures as the authored 45° diagonal. All 13 `-check*` self-tests pass; 83/83 scenes
+         parse. Docs: FTSL.md §7.6 and the array-literal sample-call note (which carried the same stale warning).
       4. **N-D *input* domain** (several named driver *axes*, not one `range` scalar).
+         **NOT SCHEDULED (user, 2026-07-25)** — items 1/2/3 are all done, so this is the only thing keeping J3b
+         open, and it is deliberately left out. It is also the piece most entangled with the axis-labelled-array
+         work above (§"ADDENDUM — axis-labelled arrays"): an N-D *record* input domain is the same "several named
+         driver axes" idea the sample call already introduces on the value side, so doing it before that lands
+         would build a second, competing spelling.
       Each emits down to the J3a form or a documented construct (e.g. lower a `D=3` channel to `spectrum:`-refs +
       synthesised `spectrum` decls); non-lowerable forms stay loom-only representation.
 - [ ] **J3c — full-scene `.ftsl` parser + emitter reconciliation.** Add `.ftsl -> loom Element tree` to
@@ -1394,6 +2420,23 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       light / camera — DONE), stop extending the loom reader and pivot to (i) porting the grammar into ftrace and
       (ii) J3b item 3. Remaining loom-reader breadth (mesh-ref, `medium`, `pattern`, whole-`scene` wrapper + a
       `Scene` builder) is deferred — see next bullet.
+      **EMITTER-DRIFT AUDIT — DONE (2026-07-26, 0.77.0).** The "audit every `Element.emit` against the live
+      grammar" half is closed, but *not* by inspection: it was unachievable that way, because ftrace silently
+      ignored unknown keys, so a drifted property renders a wrong image rather than raising. The prerequisite
+      was a **diagnostic**, so that got built first — `Stmt::used` marked inside `find()` (the one choke point
+      every property read funnels through), `collectUnusedKeys` at the end of `Builder::build`, reported from
+      `loadSource` as an `[ftsl] warning`. See design.md's `ftsl.h` entry and FTSL.md §1.3. With that in place
+      the audit is mechanical: `scraps/emit_audit.py` builds one scene per Element kind (11: sphere, beads,
+      group, sweptmesh, isosurface, funcpattern, texture, proctexture, mixmaterial, volume, cameracurve) with
+      its drift-prone optional fields exercised, emits it, loads it under `-zzz-stop`, and fails on any
+      unknown-key warning. **Result: all 11 clean**, all 78 checked-in `scenes/*.ftsl` clean, 1083 loom tests
+      green. Real drift found and fixed: loom's `Isosurface` could not emit `samples` / `accuracy` / `refine` /
+      `uv`, so a sampled march was stuck on ftrace's 256-sample default (`tools/loom/loom/iso.py`; `uv` is
+      validated against the bareword-axis trap rather than passed raw). Real corpus bugs found and fixed:
+      `priority` authored on geometry in `scenes/_record_scalar.ftsl` (it is a **material** slot), and 6 dead
+      `contained_by` lines on pure-analytic isosurfaces in the two gallery scenes (the loader only reads it for
+      `function` fields — analytic CSG bounds itself, and a manual clip is spelled `intersect { box … }`).
+      The remaining J3c half — `.ftsl` → loom Element tree — is still open (and see the deferred bullet below).
 - [ ] **FUTURE — loom full `.ftsl` read support** (deferred out of J3c above). Give loom a complete `.ftsl` → `Scene`
       reader (not just per-element round-trip): the whole-file `scene { … }` wrapper rule + a `Scene` builder that
       reassembles textures/patterns/records/materials/geometry/lights/camera into a live `Scene`, plus the lossy
@@ -1401,7 +2444,9 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       `camera_curve`). **Motivating consumer: an editor/GUI** (load an existing `.ftsl`, manipulate in loom's object
       model, re-emit) and possibly the raster preview loading authored scenes. Not on any current critical path — the
       grammar's real job is ftrace's parser — so this waits until a concrete editor need exists.
-- [ ] **PROPOSAL — unify element headers to `name = KIND { … }` (and anonymous `KIND { … }`).** Today elements
+- [x] **PROPOSAL — unify element headers to `name = KIND { … }` — DONE 2026-07-19 (v0.9.1).** Superseded by the
+      actionable **NEXT UP** entry at the top of this file, which shipped exactly this; kept for the rationale.
+      Today elements
       spell their name inconsistently: records already use `NAME = range LO-HI [ … ]` (a `name = kind …` binding),
       but materials/textures/cameras use `KIND "name" { … }`. The cleaner, more programmatic form (per user, 2026-07-19)
       is to make *every* named element a binding — `hero = camera { … }`, `gold = material { … }`, `hide = texture
@@ -1410,13 +2455,64 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       `range` kind), reads like assignment, and makes anonymity natural. Touches both loom's emitters (§ scene.py
       `emit`) and the shared grammar in lockstep; do it **before** the grammar ossifies into ftrace's C++ front-end so
       both sides adopt the new header at once. Decide alongside item 3 / the ftrace port.
-- [ ] **SHIP — bundle GPDA with the ftrace release.** The GraphParser (GPDA) is becoming ftrace's scene front-end,
-      so the shipped product now depends on it. Ensure `release.bat` / the release artifact carries the GPDA parser
-      (vendored into ftrace's build, like loom vendored `_gpda.py`) and that a clean checkout builds/ships without an
-      external GraphParser checkout. (Reminder logged 2026-07-19.)
+- [x] **SHIP — bundle GPDA with the ftrace release — DONE 2026-07-26 (verified, no code change needed).** The
+      GraphParser (GPDA) is ftrace's scene front-end shim, so the shipped product depends on it. Verified fully
+      vendored and self-contained:
+      * All 7 files in `src/gpda/` are git-tracked (`ftsl_reduce.hpp`, `ftsl_scene.gen.cpp`, `ftsl_shim.hpp`,
+        `gpda_lexer.hpp`, `pool.hpp`, `tokenized.cpp`, `tokenized.hpp`) — the parser engine (`tokenized.*`,
+        `pool.hpp`) copied verbatim from `GraphParser/cpp`, the grammar **pre-compiled to C++** by
+        `loom.grammar.emit_cpp` into `ftsl_scene.gen.cpp`. Nothing is loaded from a `.epeg` at runtime, so the
+        release artifact needs no data files.
+      * `CMakeLists.txt` compiles the two vendored `.cpp` in both targets (lines 32–33 and 55) and adds
+        `src/gpda` to the include dirs (line 48). Every `src/**.cpp|.cu|.c` named in `CMakeLists.txt` is
+        git-tracked (checked mechanically against `git ls-files`) ⇒ a clean checkout has all sources.
+      * The only include reaching outside `src/gpda` is `ftrace_parse_slice.hpp` in `ftsl_reduce.hpp`, and it is
+        guarded by `#ifdef FTSL_SHIM_STANDALONE` — used solely by the throwaway `scraps/gpda_shim` de-risk
+        harness, never by the in-tree build (in-tree, `ftsl.h` includes the header after the real `ftsl::Block`
+        types are defined).
+      * `build.bat`, `release.bat` and `CMakeLists.txt` contain **zero** references to
+        `D:\visual studio projects\GraphParser`; `release.bat` ships one self-contained `ftrace.exe`.
+      (Reminder logged 2026-07-19.)
 - **Dependency note:** the FTSL record itself (§0) is fully implemented (Stages 1–6 + GPU parity DONE), so
   this is a loom-side mirror + parser effort, not blocked on ftrace.
-- [ ] **FUTURE — loom retime / 4D time-shear node** (deferred; unlocked once `t` is a first-class input, J3b item 3).
+- [x] **loom retime / 4D time-shear node — DONE 2026-07-27** (unblocked when J3b item 3 landed `t` as a first-class
+      input, 2026-07-26). Shipped as designed below; what the build actually decided:
+      * **`signals/retime.py`** (new) — `retimed_clock(clock, t, wrap)`, `Retime` (scalar), `VecRetime` (a vector
+        retimed *as a whole*, so every component reads the same sample phase and shared sub-graphs are evaluated
+        once per sample point; `.as_vec()` re-exposes it as a plain `VecSignal`), the `retime()` dispatcher, and
+        the sugar `freeze(x, at)` / `delay(x, dt)` / `warp(x, g)`. Plus **`Phase`** in `signals/core.py` — the
+        clock's own `t` *as a value*, which is what makes the family expressible at all (`delay` is literally
+        `Retime(x, Phase() - dt)`).
+      * **`wrap` defaults to "wrap iff `clock.loop`"** — that one default is what keeps `sig(t−dt)` seamless on a
+        closed loop (it's the same loop, rotated) while leaving an open timeline honest off the end. Negative `dt`
+        looks *ahead*, which is equally well-defined: the graph is a pure function of the clock, not a stream.
+      * **(1) cache — took the "scope a nested cache" option**, not the "widen the key" one: `Cache.scope(key)`
+        returns a nested `Cache` keyed `(node id, frame, sample phase)`, and every retime evaluates its child
+        through it. Widening the global `(node_id, frame)` key would have touched every `at()` call site and put
+        1150 passing tests at risk; `scope()` is purely additive and behaviour is byte-identical when no retime
+        node exists. Off-current-`t` sampling is *not* restricted anywhere.
+      * **(2) cycles — confirmed (2a) alone suffices and (2b) stays deferred.** Both retime edges (the retimed
+        subtree **and** the phase driver) are ordinary structural edges reported by `children()`, so
+        `detect_signal_cycle` keeps owning them unchanged. A retime is **not** a recurrence — it reads a pure
+        function at another point, it does not read its own past — so no causality validator was needed or built.
+      * **The headline 4-D shear is `spatial.SigAt`** (spatial tier, because a coordinate must be in scope):
+        `SigAt(sig, when)` reads a modulator at a phase that is *itself a field*, e.g.
+        `SigAt(Sine(cycles=3), T - X/c)`. This is the thing that could not be faked — a bare `Signal` used as a
+        spatial term (`_Sig`) bakes **one number per frame** shared by the whole field. `emit()` deliberately
+        raises (ftrace evaluates a pattern per hit with no access to loom's modulator DAG; baking one number would
+        silently drop the shear), so it joins `VolumeField` as the second **single-backend** leaf in `spatial.py` —
+        discretise-then-render via `mesh_field` / `bake_field` / `write_volume`. Cost is bounded and stated: one
+        graph evaluation per *distinct* phase (`np.unique` + inverse), with `quantize=k` capping it at `k`.
+      * Tests: **`tools/loom/tests/test_retime.py`** (27; suite 1150 → 1177). Mutation-checked three ways —
+        degrading `Cache.scope` to the parent cache, dropping the driver edge from `children()`, and forcing
+        `wrap=True` each fail a test. The cache tests specifically use a **sub-frame** retime/shear, where the
+        retimed phase lands on the *same* `clock.frame`; a coarser delay maps to a different frame index and the
+        keys never collide, so the first version of the test passed even with the bug reintroduced.
+      * Docs: `tools/loom/design.md` § 4 + M10.5, `tools/loom/README.md` layout. Demo:
+        `tools/loom/examples/time_shear.py` (tabulates the family; `--render2d` renders the travelling wave as a
+        seamless loop — spatial frequency `k = w/c` falls out rather than being authored).
+      * Still not built, on purpose: recurrent / stateful (delayed-feedback) nodes — see (2b) below.
+  *Original entry (deferred; unlocked once `t` is a first-class input, J3b item 3).*
   Once `t` is a passable *value* (not just the ambient clock), add a node that samples a subgraph at a
   **shifted / warped / per-point** time. Because a Signal is a pure stateless function of a Clock, sampling at
   an arbitrary `t` is well-defined and cheap (build a Clock at that `t`, evaluate). Capabilities this unlocks,
@@ -1468,10 +2564,107 @@ ftrace's own language). Two follow-ups were captured:
           mirrored in loom's spectrum grammar (`IllumSpec`). The Gauss-Newton solver was refactored into a shared
           `fitSigmoid()` so reflectance and illuminant fits share bit-identical arithmetic. Validated by
           `scraps/illum_test.ftsl` → `png/illum_test.png`.
-    - [ ] **Still open:** other upsamplers (Smits 1999, Meng 2015, plain box/3-lobe) and a **named user mapping**
-          — a `(r,g,b) -> spectrum` function registered in the spectral-envelope store and referenced by name.
+    - [x] **Smits 1999 upsampler landed** *(2026-07-24, v0.45.0).* The classic tabulated Smits RGB→reflectance
+          basis is in `upsample.h` (`SmitsBasis` — seven basis spectra white/C M Y/R G B at 10 samples over
+          [380,720] nm; `smitsCombine` does the additive white+secondary+primary decomposition, clamped to a
+          physical `[0,1]` reflectance; `rgbToReflectanceSmits` linearly interpolates in λ). Surface: **head
+          keywords** `rgbsmits`/`hsvsmits`/`hslsmits` (parallel to the `…illum`/`…line` heads), wired through
+          `evalSpectrum` (`ftsl.h`) and mirrored in loom's spectrum grammar (`SmitsSpec` in
+          `tools/loom/loom/grammar/spectrum.py`, with tests). Validated by `-checkupsample` (Smits round-trips
+          sRGB to <0.07 max, all reflectances in [0,1]) and a render (`scraps/smits_test.ftsl`, Smits vs
+          Jakob-Hanika panels side by side). A reflectance upsampler, so no GPU change (upsampling is a host-side
+          bake into the spectral tables).
+    - [x] **Plain calibrated 3-box upsampler landed** *(2026-07-24, v0.46.0).* The simplest reflectance
+          upsampler: one flat step per band (blue 400–500, green 500–600, red 600–700 nm) whose three heights
+          are solved from a fixed 3×3 matrix (`BoxBasis`/`boxBasis()` in `upsample.h` precompute `Minv`, the
+          inverse of the per-band linear-sRGB response) so `rgbToReflectanceBox` integrates back to the
+          requested colour *exactly* — round-trips sRGB to <0.02 max, the tightest of the reflectance
+          upsamplers, though blocky (hard band edges). Surface: **head keywords** `rgbbox`/`hsvbox`/`hslbox`
+          wired through `evalSpectrum` (`ftsl.h`) and mirrored in loom (`BoxSpec`, with tests). Validated by
+          `-checkupsample` (box section, err <0.02, all reflectances clamped `[0,1]`). Reflectance upsampler →
+          host-side bake, no GPU change.
+    - [x] **Meng 2015 smoothest-spectrum upsampler landed** *(2026-07-27, v0.85.0).* Of all physical
+          reflectances that produce a given colour, take the **smoothest** (minimum `Σ(s[i+1]−s[i])²`),
+          tabulated over chromaticity and interpolated. Surface: **head keywords**
+          `rgbmeng`/`hsvmeng`/`hslmeng` through `evalSpectrum` (`ftsl.h`), mirrored in loom (`MengSpec`,
+          with tests). *This was previously logged as BLOCKED on the paper's published precomputed table
+          ("external data we don't vendor") — that framing was simply wrong on both halves.* First, the
+          supplemental carries **no licence and no copyright notice anywhere** (verified against the real
+          137 MB zip), and this repo has no LICENSE of its own to reconcile it with — so there was never a
+          licensing obstacle to begin with. Second, and more to the point, we don't *want* their table:
+          the method is published in full, so we bake our own (`tools/bake_meng.py` → `src/meng_table.h`,
+          order 16 / 153 vertices / 81 samples / ~138 KB) with two departures that make ours **more**
+          accurate than the paper's grid for our use — a grid barycentric in the sRGB primary triangle
+          (every colour we upsample already lies inside it, so no search or cell classification), and
+          vertices solved at `Y=1` **unbounded above** rather than under an active `s ≤ 1` bound. The
+          second is essential, not cosmetic: min-roughness is linear in target XYZ only over a *cone*, and
+          `{0 ≤ s ≤ 1}` isn't one — tabulating against a live upper bound destroys the tabulated property,
+          which is precisely the bug that first made `-checkupsample` call Meng *rougher* than JH.
+          Validated by `-checkupsample` (section g): round-trip max error **0.00005** (white 0.01208,
+          itself better than JH's 0.01647 — pure white is genuinely infeasible as a bounded reflectance
+          under our blackbody-6504 "D65"), all samples in `[0,1]`, and roughness provably below JH's on
+          every test colour. Render: `scraps/meng_test.ftsl` (four upsamplers, same colour, lit by
+          illuminant A — a D65 wash cannot distinguish them by construction). Reflectance upsampler →
+          host-side bake, no GPU change.
+    - **Residual (deliberately not scheduled):** a **user-supplied custom basis**. The **named user
+          mapping** is already covered — `spectrum "name" = <expr>` registers a reusable named spectrum
+          referenced via `spectrum:name` (ftsl.h ~335/1239), and the
+          `rgb`/`rgbsmits`/`rgbbox`/`rgbillum`/`rgbline`/`rgbmeng` heads are exactly named
+          `(r,g,b)->spectrum` functions. So the only thing left is letting a scene bring its own basis
+          curves, which is low-value given the five built-ins and stays out unless a scene needs it.
 
-- [ ] **K2 — Analytic physical sky (`turbidity`).** ftrace has **no** procedural sky: environment lighting is only
+- [x] **K2 — Analytic physical sky (`turbidity`).** **DONE 2026-07-24.** Implemented the **Preetham et al. 2002**
+      analytic daylight model as an `env` sub-kind: `light env { sky preetham  turbidity t  sun_dir …  (or
+      sun_elevation/sun_azimuth)  ground_albedo a  intensity s  res px  rotate d }`. `src/sky.h`
+      (`generatePreethamSky`) evaluates the Perez five-parameter distribution for luminance Y and CIE xy (turbidity-
+      dependent coefficients + zenith Yz/xz/yz from the solar elevation), converts xyY→XYZ→linear-sRGB per texel, and
+      bakes an equirectangular sky image (row0=up, matching `EnvMap`'s convention). The **solar disk** is baked on top:
+      a 5778 K blackbody attenuated by Rayleigh (∝λ⁻⁴) + Ångström-aerosol (β from turbidity) optical depth over the
+      Kasten–Young air mass, integrated to XYZ and scaled to a physical clear-air disk luminance (~1.6e9 cd/m²·
+      transmittance) — so a low sun **reddens into a proper orange sunset automatically**. Magnitudes are physical,
+      then the whole image is normalised so the mean above-horizon sky luminance = `intensity`. Rather than a bespoke
+      construct, the sky is fed through `EnvMap::buildFromRgb` (refactored out of `EnvMap::load`), so it **reuses the
+      entire env pipeline**: luminance-importance sampling, per-texel Jakob–Hanika spectral upsampling, direct-view
+      background, and the GPU `DEnvMap` upload — an analytic sky lights the scene exactly like an HDRI on **both CPU
+      and GPU**. **Validated:** `scraps/sky_test.ftsl` (daytime — blue overhead 148/184/234, whitening toward the sun,
+      cool sky-lit ground; CPU and GPU byte-agree on the sky) and `scraps/sky_sunset.ftsl` (low sun — visible solar
+      disk on the horizon, strongly reddened orange sky with blue crushed by Rayleigh extinction). **Follow-up logged**
+      (known-issues): the physical solar disk is ~10⁵× the sky, so sun-lit diffuse surfaces are HDR and converge slowly
+      in forward modes (same as any sunny HDRI) — an efficient distant-directional-sun emitter (parallel forward
+      emission + backward NEE) would fix this and is the proper enhancement.
+
+- [x] **K2 follow-up — first-class distant directional sun (`EmitterShape::Sun`).** **DONE 2026-07-27 (0.84.0).**
+      Built the enhancement K2 logged. New light subtype `light sun { elevation … azimuth … (or dir …) angle 0.53
+      spd … intensity … }` registers an infinitely-distant disc emitter whose rays arrive **parallel**, plus a new
+      **`sun_disk on | off | separate`** switch on the Preetham sky block: `separate` strips the baked disk out of
+      the equirect map and registers an **energy-matched** `light sun` beside the skylight dome (the baked profile's
+      `∫t dΩ = 0.8133·πR²` is converted to an equivalent hard cone `θ = acos(1 − Ω_eff/2π)`, and the disk spectrum —
+      the air-mass-attenuated 5778 K blackbody — is scaled to the same luminance the map carried).
+      **Radiometry:** the authored `spd` is *perpendicular spectral irradiance*, stored internally as radiance
+      `E⊥/Ω`, so widening `angle` softens the penumbra without changing exposure. **Forward:** photons are born on a
+      disc the size of the scene's cross-section, aimed down the beam (joint pdf `1/(Ω·πR²) = 1/envGeom`, exactly
+      analog), so every photon enters the scene. **Backward:** cone NEE with `1/pdfW = Ω`, and the directly-viewed
+      disc added on a ray miss under the `specularArrival` gate — unbiased with **no** MIS weight, because NEE runs
+      at exactly the material types that then clear that flag. The hard cone reuses `spotCosInner == spotCosOuter`
+      so `spotOmega` evaluates to `Ω` — **no new emitter field** on host or device. Touched: `scene.h` (`addSunLight`,
+      `sunRadiance`/`sunXYZForDir`, `geomWeight`, `finalizeEmitters`), `sky.h` (`SunDisk` + extended generator),
+      `ftsl.h` (subtype + `sun_disk`), `backward.h`, `photonmap_render.h`, `sppm_render.h`, `main.cpp`
+      (`addEnvBackground`, mode-D/U guard), `raster.h` (preview shading), `bdpt.h`/`vcm.h` (reject), and the full
+      **CUDA mirror** in `render_cuda.cu`. Modes `D`/`U` refuse a sun scene (not area-connectible), as for
+      `spot`/`env`; everything else (A/B/C/R/`-rgb`/P/M/S) runs on **CPU and GPU**. **Validated** with
+      `scenes/_sun_check.ftsl`: forward B vs backward R **0.09%**, CPU vs GPU mode R **0.01%**, `-rgb` **0.00%**,
+      photon-map M vs R **0.02%**, `angle` 0.53°→8° exposure shift **0.019%**, `sun_disk separate` vs baked
+      **0.12%**. The payoff, on `scraps/sky_test.ftsl` (mode B, GPU): **baked** reached only 7.2% noise after
+      30 s / 2×10⁹ photons and *still* had no warm sunlight and no cast shadows, while **`sun_disk separate`**
+      hit the 4% target in **5.5 s / 3.0×10⁸ photons** with the sun fully formed — ~**20× fewer photons** for
+      the same noise, and a qualitatively correct picture instead of a skylight-only one. New deterministic
+      self-test **`-checksun`** (0.84.1) pins the cone solid angle, `L·Ω == E⊥` exposure invariance,
+      uniform-in-solid-angle cone sampling about both axes, and NEE/direct-view rim agreement — worst error
+      5.3e-14, and it caught a real sign error on its first run. All 12 `-check*` self-tests pass.
+
+  <details><summary>original K2 scope</summary>
+
+- ~~**K2 — Analytic physical sky (`turbidity`).**~~ ftrace has **no** procedural sky: environment lighting is only
       an image-based env map (`env { file … }`) or a constant-radiance env. `turbidity` (atmospheric haze: ~2 = clear
       deep-blue sky, ~10 = milky/hazy) only means something inside a physically-based **sky+sun** model
       (Preetham 2002 or Hošek-Wilkie 2012), which *generates directional radiance from a sun position* — i.e. it is
@@ -1482,6 +2675,8 @@ ftrace's own language). Two follow-ups were captured:
       first-class feature. This is the latter. Deferred as its own feature to greenlight on its own merits, not to be
       folded into reconciliation work. Bundles naturally with K1's illuminant upsample (the sky model wants proper
       emission spectra).
+
+  </details>
 
 - [x] **K3 — RGB→wavelength map for lights (single dominant λ).** *(DONE 2026-07-20, v0.10.0.)* Distinct from K1's *upsampling* (RGB → a full
       spectral power distribution): this maps an (r,g,b) colour to **one dominant wavelength** — a monochromatic /
@@ -1593,7 +2788,15 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
 
 ### L-HERO — hero-wavelength spectral sampling *(the genuine remaining work; re-scoped from L2; applies to ALL spectral modes)*
 
-- [ ] **Hero-wavelength Monte-Carlo across every spectral render mode.** Today ftrace carries **one** wavelength per
+- [x] **Hero-wavelength Monte-Carlo across every spectral render mode — DONE 2026-07-26 (through VERSION 0.70.0).**
+      Every render *mode* now carries the bundle on both backends: CPU `A`/`B`/`C`, `R`, `M`/`S`, `D` (BDPT) and
+      `U` (VCM/UPS), plus the GPU megakernel's forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D` and
+      VCM `U`. The only remaining single-λ code path is the GPU **wavefront scheduler** (`-wavefront`), which is
+      not a mode — `-heroc > 1` simply forces the megakernel there — and is left single-λ **by design** (see the
+      sub-item below; port the SoA pool only if the streaming backend ever needs the chroma win). Scenes with
+      participating media, a GRIN volume, or a finite-lens camera also stay single-λ everywhere, also by design.
+      Original scoping text follows.
+      Today ftrace carries **one** wavelength per
       path/photon **everywhere** — the forward light tracers (**A/B/C**, CPU + GPU), the backward tracer (**R**, CPU +
       GPU megakernel), and BDPT (**D**) all sample a single λ and splat `cieX/Y/Z(λ)·L`. README §"spectral" explicitly
       contrasts this single-λ scheme with PBRT-v4 / Mitsuba 3's 4-λ hero-wavelength. **Upgrade every mode it applies
@@ -1633,7 +2836,8 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           conserved exactly** (`-heroc 4` and `-heroc 1` both converge to auto-exposure 1.06e-13), and `-heroc 1`
           reproduces the classic single-λ device stream bit-for-bit.
           **Still TODO:** the GPU forward wavefront path (streaming backend) — hero forces the megakernel there;
-          and the GPU backward/BDPT megakernels (below).
+          and the GPU BDPT megakernel (below). (The GPU *backward* megakernel landed 2026-07-26 — see the
+          next entry.)
     - [x] **R (backward) — CPU DONE.** `radianceHero()` in `src/backward.h` samples a hero λ + 3 stratified
           secondaries (`hero.h`, `kHeroC=4`), rides them along one shared BVH walk, evaluates materials/NEE per-λ
           (`neeLightHero`/`neeEnvHero`, shared `interactMaterial`/`emitterGeom`/`envGeom` helpers) and splats 4
@@ -1642,7 +2846,39 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           convention. Gated on: `kHeroC>1 && no fog/GRIN/lens` (those stay scalar, C=1 is bit-identical). Validated
           on `cornell.ftsl`: converged image unchanged, glass-sphere dispersion intact, **luma noise flat (1.03×),
           chroma noise down (0.89× overall, 0.74× in spectral-dominated neutral regions)** at equal spp.
-          **Still TODO:** the GPU backward megakernel (`renderBackwardCuda`) — mode R on GPU is still single-λ.
+    - [x] **R (backward) — GPU DONE 2026-07-26 (VERSION 0.59.0).** `bkRadianceHero()` in `src/render_cuda.cu` is
+          the device twin of the CPU `radianceHero`, mirroring it 1:1 so the two can be diffed and neither can
+          drift: `bkNeeLightHero`/`bkNeeEnvHero` ↔ `neeLightHero`/`neeEnvHero`, `bkInteract` ↔ `interactMaterial`,
+          same de-hero material set, same gate. Four supporting refactors, each a pure code move that leaves the
+          scalar path's fp32 rounding untouched (device `Real` is `float` by default — see `FTRACE_GPU_FP32`):
+          (1) `dSampleSceneLambdaU(sc, u, pdf)` split out of `dSampleSceneLambda` so the bundle can push its own
+          stratified `u` values (base draw + C−1 wrapped strata) through the same inverse-CDF sampler;
+          (2) `bkEmitterGeom` → `BkNeeGeom` and (3) `bkEnvGeom` → `BkEnvGeom`, which return the geometric *pieces*
+          (`wi`/`dist2`/`cosSurf`/`G`/`stG`/…) rather than a fused weight, so each caller re-forms the original
+          float product verbatim; (4) the whole material switch hoisted verbatim out of `bkRadiance` into
+          `bkInteract`, shared by the scalar path and by hero's de-hero fallthrough. `kBackward` takes a new
+          `heroC` parameter and draws the bundle per sample; `renderBackwardCuda` gates on
+          `heroC>1 && mediaN==0 && !hasGrin && !cam.hasLens()` (clamped to `hero::kHeroMax`) and is fed `g_heroC`
+          from all four `main.cpp` call sites (progressive, chunked, and the two meter frames).
+          **Validated** on `cornell.ftsl` (which carries a dispersive SF10 glass sphere, so the de-hero branch
+          fires) at 300², GPU:
+          • **`-heroc 1` is arithmetically bit-identical to the pre-change binary** — byte-for-byte equal at
+            `-spp 1` (one `atomicAdd` per pixel, so accumulation order can't matter). At `-spp 64` exactly one
+            channel of one pixel out of 270 000 differs by 1 LSB; that is `atomicAdd(double)` summation order
+            shifting with the recompiled kernel's warp scheduling, not an arithmetic change (each binary is
+            self-deterministic on rerun).
+          • **Energy conserved:** converged (`-spp 131072`) `-heroc 4` vs `-heroc 1` agree to **0.03 %** in mean
+            linear luminance, both auto-exposing to 1.04e-13 — so the ×C de-hero boost is exact.
+          • **Chroma noise down, luma flat** at equal spp (64) against a 131 072-spp reference: rms chroma
+            0.540 (C=1) → 0.477 (C=2) → **0.416 (C=4, −23 %)** → 0.404 (C=8); rms luma 0.829 → 0.803 (flat).
+          • **Free:** 70.4 s (C=1) vs 68.9 s (C=4) for 131 072 spp — the bundle rides one BVH walk.
+          • **Gate verified:** `_fog_cornell` (media) and `grin_lens` (GRIN) are byte-identical between
+            `-heroc 1` and `-heroc 4`, i.e. they correctly fall back to single-λ.
+          • **CPU ↔ GPU agree** to 0.29 % mean luminance at 2048 spp / 200² (noise-level).
+          • Smoke-clean on `iridescent`, `multilayer`, `layered`, `_fluo_cornell`, `mixmat`, `translucency`,
+            `material_presets`.
+          **Still TODO:** the GPU backward **wavefront** path (`-wavefront`) is still single-λ, like the forward
+          wavefront backend; hero forces the megakernel.
     - [x] **M (photon map) + S (SPPM) — CPU DONE.** The shared forward photon pass (`tracePhotonPass` in
           `src/photonmap_render.h`, used by both modes M and S) now sets `r.useHero` under the same gate as the
           forward tracers (`kHeroC>1 && scene.media.empty() && !sceneHasGrin`), so each traced path runs
@@ -1657,8 +2893,8 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           conserved exactly** (auto-exposure identical, 1.11e-13, hero 9.09M vs single 2.80M photons), **chroma
           noise down 0.87×**, luma flat, against a 1.5e7 single-λ reference. (Milder chroma win than A/B/C's 0.77×
           because the gather already averages many photons.) Modes S (SPPM) inherits it via `tracePhotonPass`.
-          **Still TODO:** mode U (VCM/UPS) — its BDPT-style light-subpath tracing (`src/vcm.h`) is the same
-          complexity class as BDPT-D below; and all GPU photon-mapping paths.
+          **Still TODO:** all GPU photon-mapping paths. (Mode U's CPU half — the same complexity class as
+          BDPT-D below — landed 2026-07-26, 0.69.0; see the U entry.)
     - [x] **Runtime `-heroc N` flag — DONE.** The bundle size is now a runtime CLI knob (`hero.h`: `kHeroC=4`
           default, new `kHeroMax=8` compile-time cap for the fixed stack arrays). `main.cpp` parses `-heroc N`
           (clamped 1..kHeroMax) into `g_heroC` and threads it to every CPU hero path: `Renderer::heroC`
@@ -1667,7 +2903,51 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           hero gate is now `heroC>1`. Verified on `cornell` mode M: `-heroc 1` is bit-identical to a `kHeroC=1`
           rebuild (2.80M photons, auto-exposure 1.11e-13), `-heroc 4` matches the default (9.09M, 1.11e-13),
           `-heroc 2`/`8` interpolate and run clean; mode B `-heroc 1` gives `sum/emitted=1.000000`.
-    - [ ] **Optional split-at-dispersion (crisp dispersive caustics)** — an *alternative* to the default de-hero
+    - [x] **Optional split-at-dispersion (crisp dispersive caustics) — DONE 2026-07-26 (VERSION 0.65.0), CPU
+          forward.** Shipped as `-herosplit` (off by default). Implementation:
+          * `src/hero.h`: new `hero::gSplit` runtime flag. Unlike `heroC` — which the drivers vary per pass (the
+            meter pre-pass, the media/GRIN/lens gate) and therefore thread explicitly through every renderer entry
+            point — this is one global policy choice, so `main()` sets it once while parsing argv and
+            `Renderer::heroSplit` default-initialises from it. That is why modes `A`/`B`/`C` **and** the `M`/`S`
+            photon deposit all picked it up with zero call-site churn (`photonmap_render.h` and, through it,
+            `sppm_render.h` both just construct a `Renderer`).
+          * `src/render.h`: the bounce loop of `tracePhotonHero` was extracted verbatim into a new
+            `tracePhotonHeroLoop(..., ray, stk, lam, beta, secAlive, bounce0, ...)`. That is the whole trick — the
+            split branch **re-enters that method recursively**, once per secondary, so the ~20 `return` sites in
+            the loop body keep working unchanged and no explicit work stack / CPS rewrite was needed. Each
+            secondary runs `interactPhotonSpecular` with its **own** λ (its own Snell direction / grating order /
+            Stokes shift) on a **copy** of the `MediumStack` (sub-paths diverge from that vertex), then continues
+            from `bounce + 1` with `secAlive = false`. Because the branch is guarded on `secAlive`, a sub-path can
+            never re-split: recursion is at most **one level deep**, so cost is linear in C, not exponential, and
+            the per-frame footprint is a bounded ~600 B.
+          * **Weights / ledger.** No ×C boost: the C sub-paths keep `base/C` each and the parent zeroes
+            `beta[i]`, so the total is exactly what the de-hero'd hero would have carried alone and every
+            sub-path books its own terminal fate. `interactPhotonSpecular` already books `e.absorbed += beta` on
+            every `return false`, so nothing leaks.
+          * `main.cpp`: `-herosplit` parse, a startup notice naming the supported modes (and warning that it is a
+            no-op under `-heroc 1`), plus new `-heroc`/`-herosplit` lines in the usage text (`-heroc` had never
+            been listed there).
+          * **Validation** on a new scene `scraps/abs_herosplit.ftsl` (absolute-exposure Cornell box with a
+            dispersive `glass:SF10` flint sphere, mode B, 256², fixed gain 6, CPU), vs a 200M-photon reference:
+            flag **off** byte-identical to `scraps/ftrace_base_cc20a46.exe` (md5 `e2eef2cb…`) and
+            `-heroc 1 -herosplit` byte-identical to plain `-heroc 1` (md5 `2b8f0fe8…`); flag **on**
+            `sum/emitted = 1.000000` exactly (0.999990 off) with mean luminance −0.026 % vs the reference
+            (off −0.054 %) ⇒ both unbiased. **At equal wall clock (180 s):** caustic-region noise RMS luma
+            0.0340→**0.0303 (0.89×)**, chroma 0.0386→**0.0271 (0.70×)**; whole frame 0.92× / 0.80×. Cost
+            **1.11×** per photon (20M back-to-back: 173.3 s off, 192.3 s on). The split PNG is 6 % *smaller*
+            (91 126 vs 97 040 B). New helper `scraps/region_rms.py` reports RMS inside a box as well as over
+            the whole frame — whole-image RMS is dominated by the flat diffuse walls and hides the caustic.
+            **Methodology warning:** an early reading of 1.54× cost was wrong — the two runs were ~25 min apart
+            and machine throughput drifted 1.6× in between. Compare timings **back-to-back** only, or give both
+            policies the same `-time` budget and compare photon counts.
+          * Still de-hero (not split) at `Layered` and `Mix`: those are λ-dependent *decisions* (coat Fresnel
+            probability, child selection) rather than λ-dependent *directions*, and their split point sits
+            before any interaction so it doesn't fit the resume-from-a-ray shape. Logged in `known-issues.md`.
+          * NOT done (deliberately, both noted in the README and the startup notice): the GPU forward tracer
+            (execution divergence as the fan-out wavelengths take different branches — and the emission
+            back-pressure / fixed work-pool needed to keep the photon buffers bounded), and the backward tracer
+            `R` / BDPT `D` / VCM `U`.
+          Original note: an *alternative* to the default de-hero
           policy, exposed as an opt-in flag (e.g. `-herosplit`, off by default). At a dispersive dielectric interface,
           instead of terminating the secondaries (`beta[0] *= C; secAlive = false`), **continue all C wavelengths**,
           each refracting along its *own* per-λ direction from that point — turning one bundle into C now-monochromatic
@@ -1683,14 +2963,250 @@ more efficient. The ask: add a native backward path-tracer mode as a first-class
           the flag *off* the image is bit-identical to today, and *on* it converges to the same converged energy
           (de-hero is unbiased; splitting is a different, also-unbiased estimator — same mean, sharper caustics, more
           work per path). README + a `-herosplit` flag-table row; VERSION minor bump when shipped.
-    - [ ] **U (VCM/UPS)** — carry the N λ along the light subpath and merge/connect per-λ (BDPT-level MIS). CPU + GPU.
-    - [ ] **D (BDPT)** — carry the N λ along both subpaths; the connection term evaluates per-λ. GPU megakernel too.
-    - [ ] **Shared plumbing** — a small `HeroLambda` struct (hero + 3 secondaries + per-λ pdf/MIS weights) threaded
-          through the spectral evaluation sites, so the four modes share one wavelength-sampling + de-hero policy
-          rather than four copies. Validate: every mode's converged image is unchanged vs the single-λ baseline (same
-          tone-map) but reaches a given colour-noise level in ~fewer samples; dispersion/thin-film unaffected.
-    - [ ] **Docs + version** — README §"spectral" updated (ftrace becomes hero-wavelength, 4 λ/path); VERSION minor
-          bump; note any mode where the secondaries are deliberately dropped (e.g. hard-specular chains).
+    - [x] **U (VCM/UPS) — DONE 2026-07-26 (CPU 0.69.0, GPU 0.70.0).** Both subpaths carry the N λ and all four
+          strategies (emission, NEE, connection, merging) evaluate per-λ with BDPT-level MIS. CPU *and* GPU
+          (sub-items below).
+        - [x] **CPU (`src/vcm.h`) — DONE 2026-07-26 (VERSION 0.69.0).** Both subpaths now carry the bundle.
+              `vcmPass` draws one `bdpt::HeroBundle` per **path index** (replacing the single `lam[i]`/`invLam[i]`
+              draw) so light path *p* and camera path *p* share the same C wavelengths — which is exactly what
+              makes strategy (c), the paired vertex connection, EXACT per-λ, as in BDPT. `hero::sampleBundle`
+              with `C == 1` is literally `emitSampler.sampleAt(rng.uniform(), pdf)`, so `-heroc 1` consumes the
+              same rng draws in the same order and is bit-identical (verified against the 0.68.1 binary on
+              `cornell` mode U: `cmp` clean).
+              `scatterSample` gained the `bdpt.h::randomWalk` secondary block verbatim — per-λ `secF[]` for
+              Diffuse/Fluorescent, Glossy, DiffuseTransmit (dividing by the HERO's lobe albedo, since the hero
+              chose the lobe), Mirror and Filter (`keepBundle`: delta but λ-independent in direction), and the
+              de-hero collapse `if (delta && !keepBundle) nUp = 1` for Dielectric/HalfMirror/ThinFilm/
+              Multilayer/Grating. Every `<= 0` early-out became a max-over-live-λ test (hero.h policy 3), and
+              Beer-Lambert absorption in the nested-dielectric stack is now per-λ on both walks (that IS the
+              colour of coloured glass). All four strategies are per-λ: (a) emission, (b) NEE, (c) connection
+              at `nUp = min(camera, light-vertex)`, each normalised by `1/nUp` at the accumulate — the same
+              average-the-bundle rule bdpt.h uses at its splat, NOT a ×C boost, which two independently
+              de-hero'd subpaths would square.
+              (d) **merging** is the one strategy that crosses paths, so — exactly as the single-λ version
+              already keyed on `LightVertex::lambda` — it stays keyed on the LIGHT vertex's wavelengths: the
+              camera BSDF is evaluated at each of the light vertex's live λ, weighted by that λ's stored
+              throughput and cached CIE, and averaged over `nUp_lightvertex`. The MIS weights everywhere stay
+              the hero's, since every sampling density in this renderer is wavelength-INDEPENDENT.
+              **Memory:** the secondaries live in a *parallel* `std::vector<LightVertexSec>` indexed in lockstep
+              with `lightVerts`, never inside `LightVertex` — stored light vertices are the dominant cost of a
+              VCM pass (and of the GPU slab), so a `-heroc 1` run allocates exactly nothing extra.
+              **Validated** on `scenes/absolute.ftsl` (absolute units ⇒ physically-linear film, so two runs are
+              directly comparable): C=1 vs C=4 at 1600 passes agree to a mean bias of **−0.001 %** (rms 1.36/255,
+              below either estimator's own 400→1600 self-noise), while C=4's self-noise drops from rms 3.11 to
+              2.28 (~1.85× variance reduction). On a purpose-built Wratten-58 gel + mirror box — the `keepBundle`
+              stress case — C=1 vs C=4 at 3200 passes agree to **+0.016 %** and C=4 halves the RMS noise
+              (1.84 → 0.93, ~4× variance reduction), which is the ideal C=4 win.
+        - [x] **GPU (`src/render_cuda.cu` — the device session lives there, not in a `vcm_cuda.cu`) — DONE
+              2026-07-26 (VERSION 0.70.0).** `kVcmLight`/`kVcmCamera` became `kVcmLightT<NS>`/`kVcmCameraT<NS>`,
+              templated on the secondary slot count exactly like `kBdptT<NS>`, so the `<0>` instantiation sizes
+              every per-λ array at 1, compiles all hero loops away, and keeps `-heroc 1` **bit-identical**
+              (`cmp`-clean vs the 0.68.1 binary on `cornell` mode U). As predicted above, the secondary payload
+              is a **parallel** slab `lvSec[(i*vcmCap+k)*secStride + j]`, `secStride == C-1`, never inline in
+              `DVcmLV` — and each slot is only 16 B (`{double beta; float lam;}`) because the CIE weights are
+              recomputed from `lam` at gather time (bit-identical to caching them, since the hero's own
+              `DVcmLV::cx` is just `(double)cieX(lambda)`). `lamBuf`/`invLamBuf` were widened to stride C so
+              light path *p* and camera path *p* share the bundle, which is what makes the connection strategy
+              exact per-λ (`nUpConn = min(nUp_cam, lv.nUp)`); merging stays keyed on `lv.nUp`. `dVcmScatter`
+              gained the absolute per-λ `secF[]`/`secChromatic`/`keepBundle` block, with Grating's `r<=0` bail
+              deliberately kept (it gates the RNG-consuming `gratingDiffract`).
+              **Validated** on an RTX 4090 at 200², 2048 spp vs 32768-spp single-λ references (luma / chroma,
+              C1 → C4): `absolute` 0.94→0.84 / 1.24→**0.98 (0.79×)**; `abs_hero_delta` 0.87→0.75 /
+              1.36→**1.11 (0.82×)**; `abs_hero_diffuse` 0.86→0.75 / 1.10→**0.80 (0.72×)**; `abs_hero_mats`
+              0.91→0.76 / 1.25→**0.92 (0.74×)**; cost 1.50–1.69×. C4-vs-C1 bias on `absolute` at 4096 passes
+              **+0.011 %**, and CPU vs GPU hero VCM agree to **0.028 %** (GPU 31× faster: 5.9 s vs 182.6 s).
+    - [x] **D (BDPT) — DONE 2026-07-26 (CPU 0.60.0, GPU 0.61.0).** Both subpaths carry the N λ; the connection
+          term evaluates per-λ. CPU *and* GPU megakernel (sub-items below).
+        - [x] **CPU (`src/bdpt.h`) — DONE 2026-07-26 (VERSION 0.60.0).** Both subpaths now carry the bundle.
+              `HeroBundle` (the C wavelengths + their `invPdfLambda`) is drawn once per sample from ONE stratified
+              base draw (`u + i/C` wrapped, through `scene.emitSampler.sampleAt`) and handed to
+              `generateCameraSubpath` / `generateLightSubpath` / `connectBDPT`, so both sides of every connection
+              speak about the same λ's. `Vertex` gained `betaSec[kHeroMax-1]` + `nUp`; `randomWalk` propagates the
+              secondaries with a per-material `secRatio[i] = f_{i+1}/f_hero` reweight (Diffuse/Fluorescent
+              `rho_i/rho_hero`, Glossy `r_i/r_hero`, DiffuseTransmit `rho_i(lobe)/rho_hero(lobe)` for the lobe the
+              hero's coin picked) and **de-heros at every delta vertex** (`nUp = 1`). All four `connectBDPT`
+              strategies (s==0 pure eye, t==1 light-image splat, s==1 NEE, interior) evaluate `f`/`Le` per-λ and
+              fill a `Lsec[]` out-parameter; every zero early-out became a max-over-live-λ test, since the hero can
+              legitimately be black where a secondary is not.
+              **The key derivation:** because every *sampling* decision (emitter pick, direction, NEE point, RR)
+              is hero-driven, the MIS weight is identical for all λ — so `misWeight` is computed **once** and
+              applied to the whole bundle. And the ×C de-hero boost the unidirectional tracers use is **NOT**
+              folded into the vertex throughputs here: two independently de-hero'd subpaths would square it.
+              Instead each vertex records `nUp` and the splat normalises once by
+              `1/min(nUp_light, nUp_eye)` — which collapses to exactly the scalar estimator when either side
+              de-hero'd, and is unbiased either way. Side benefit: **Glossy is non-delta in BDPT**, so unlike the
+              unidirectional tracers (which de-hero there) mode D keeps the full bundle across glossy bounces.
+              Gate mirrors `BackwardRenderer`: `heroC>1 && !scene.backwardMedium().enabled && !sceneHasGrin &&
+              !cam.hasLens()`; `main.cpp` wires `br.heroC = g_heroC`. **Validated** (all CPU, on scenes whose
+              dispersive SF10 sphere makes de-hero fire):
+              (a) `-heroc 1` on `cornell` at 200²/8 spp is **byte-identical** to a pre-change rebuild;
+              (b) **energy** — `scenes/absolute.ftsl` renders in absolute mode (fixed sensor gain, so the
+              tone-map is identical between runs and the noisy p99 auto-exposure can't confound the
+              comparison): at 2048 spp `-heroc 4` matches `-heroc 1` to **0.002 %** mean luminance;
+              (c) **noise** — vs a 2048-spp reference, at 128 spp chroma-noise RMS falls 0.1564→0.1247
+              (**0.80×**) and luma 0.2178→0.1967 (0.90×); the same measurement on `cornell` at 256 spp vs a
+              4096-spp reference gives 0.1119→0.0908 (0.81×) / 0.1603→0.1445 (0.90×) — consistent;
+              (d) **gate** — a media scene (`_fog_cornell.ftsl`) is byte-identical at `-heroc 1` and `-heroc 4`;
+              (e) smoke sweep over `material_presets` / `translucency` / `mixmat` / `textured` / `absolute`
+              runs clean. Cost 1.19–1.38× wall-clock (18.2s→21.6s at 256 spp on cornell), so still a win at
+              *equal time*; these are trivially light scenes, and the shared-BVH amortisation grows with
+              geometry. **Caveat:** don't compare hero runs by their printed `auto-exposure` — it is a p99
+              statistic printed to 3 significant figures, so two runs of the *same* estimator can differ by
+              ~1 % for reasons that have nothing to do with energy (this is why (b) uses absolute mode).
+        - [x] **GPU BDPT megakernel — DONE 2026-07-26 (VERSION 0.61.0).** 1:1 device port of the CPU scheme, so
+              the two can be diffed and neither drifts: `DHeroBundle` (C λ + their `invPdfLambda`, one stratified
+              base draw) is threaded through `dGenCameraSubpath` / `dGenLightSubpath` / `dRandomWalk` /
+              `dConnectBDPT`; same per-material `secRatio` set, same `if (delta) nUp = 1;` de-hero, one
+              `dMisWeight` for the whole bundle, and the same `1/min(nUp_light, nUp_eye)` normalisation at the
+              splat (not a ×C boost folded into `beta`). Same gate as the host CPU renderer:
+              `heroC>1 && mediaN==0 && !hasGrin && !cam.hasLens()`, applied inside `renderBdptCuda(..., int heroC)`
+              which `main.cpp` feeds `g_heroC`.
+              **The GPU-specific design point:** the per-vertex secondary throughputs live in a **parallel array**
+              (`pathSec[vertexIdx*secStride + i]`) instead of inside `DVertex`, and `kBdpt` became a template
+              `kBdptT<int NS>` on the secondary-slot count, so the scalar instantiation `kBdptT<0>` sizes those
+              arrays at 1 and costs **nothing**. This matters: `DVertex` is ~100 B and a thread frame holds
+              `2*BDPT_MAXV` = 22 of them (~8 KB of spilled local state already, at `__launch_bounds__(128,3)`), so
+              widening the struct would have cost the *scalar* path real occupancy. The hero instantiation adds
+              ~1.2 KB. **Validated:**
+              (a) `-heroc 1` on `cornell` 160²/256 spp is **byte-identical** to a pre-change rebuild;
+              (b) **energy** (absolute mode = fixed sensor gain) — `scenes/absolute.ftsl` at 2048 spp,
+              `-heroc 4` vs `1` = **−0.008 %** mean luminance; and on a new scratch scene
+              `scraps/abs_hero_mats.ftsl` (a `glossy` sphere + a `translucent` quad, chosen to exercise the two
+              per-λ reweights `absolute.ftsl` doesn't) **−0.000 %** at 4096 spp;
+              (c) **noise** — `absolute` at 128 spp vs a 32768-spp reference: chroma 0.1614→0.1270 (**0.79×**),
+              luma 0.2313→0.2087 (0.90×); `cornell` 200²/256 spp vs a 16384-spp reference: chroma
+              0.1195→0.0955 (**0.80×**), luma 0.1792→0.1645 (0.92×); and `abs_hero_mats` — where Glossy and
+              DiffuseTransmit are *both connectible*, so the bundle **never de-heros** — chroma 0.1794→0.0761
+              and luma 0.1508→0.0634, i.e. **0.42× on both**, a far bigger win than the dispersive scenes;
+              (d) **gates** — `_fog_cornell.ftsl` (media) and `scenes/realcam.ftsl` (finite lens) are each
+              byte-identical across `-heroc 1`/`4`;
+              (e) **cross-backend** — CPU vs GPU hero BDPT agree to **0.03 %** mean luminance on `absolute` at
+              2048 spp;
+              (f) smoke sweep `material_presets` / `translucency` / `mixmat` / `textured` at `-heroc 4` clean.
+              Cost 1.17–1.18× wall-clock, so a clear win at equal time. Renders in `png/bdpt_hero_gpu/`.
+        - [x] **Mirror / Filter keep the bundle — DONE 2026-07-26 (VERSION 0.62.0).** `Mirror` and `Filter`
+              are delta, but neither consults λ to pick its continuation (a mirror reflects, a gel passes
+              straight through), so the "every delta vertex de-heros" rule was leaving free chroma-noise on
+              the table in mirror-heavy scenes. Both now set a `keepBundle` flag that skips the
+              `if (delta) nUp = 1;` collapse (CPU `bdpt.h` + GPU `render_cuda.cu`, kept 1:1).
+              **This exposed a genuine bias in the ratio formulation.** The per-λ factor was `secRatio[i] =
+              f_i / f_hero`, which is undefined precisely where it matters: a Wratten gel's `T(λ)` is
+              legitimately **0** across most of the spectrum, so `T(λ_hero) == 0` while a secondary is wide
+              open — and the old `if (f_hero <= 0) terminate` then threw away the live secondaries too
+              (measured **−4.9 %** energy). The array is now the **absolute** factor
+              `secF[i] = f_i·cos/pdf_hero` (with a `secChromatic` flag so the λ-independent lobes just reuse
+              `betaFactor`), and the early-out became a **max-over-live-λ** test — which also removes the
+              same latent bias for Diffuse / Glossy / DiffuseTransmit when a spectral albedo hits exactly 0
+              at the hero λ. At `nUp == 1` every hero loop is empty and `mxF == betaFactor`, i.e. the old
+              scalar test verbatim. **Validated** on a new scene `scraps/abs_hero_delta.ftsl` (absolute mode,
+              `metal:gold` mirror back wall + sphere, `filter:wratten-58` gel pane):
+              energy `-heroc 4` vs `1` = **−0.006 %** at 2048 spp (−3.978 % with the ratio form; isolating
+              the lobes gave mirror −0.006 %, filter −4.894 %, pinning it on the filter);
+              noise at 128 spp vs a 32768-spp reference — single-λ chroma 0.1801 / luma 0.3685, hero-4
+              *before* 0.1676 / 0.3522 (**0.93× / 0.96×** — the bundle died at the first mirror, so hero
+              bought almost nothing), hero-4 *after* 0.0842 / 0.2086 = **0.47× chroma, 0.57× luma**;
+              `-heroc 1` byte-identical to the pre-change build on GPU (`cornell` 160²/256 spp,
+              `abs_hero_delta` 200²/2048 spp) and CPU (`cornell` 96²/64 spp); the earlier scenes unregressed
+              (`absolute` −0.008 %, `abs_hero_mats` −0.000 %, both exactly as before); smoke sweep
+              `mirror_selfie` / `group` / `material_presets` / `translucency` / `mixmat` clean.
+              Renders in `png/hero_delta/`. Ported to the **backward** tracer in the next item and to the
+              **forward** tracers in the one after that, so every hero tracer now keeps the bundle here.
+        - [x] **Backward tracer (R): achromatic delta lobes + max-over-λ Russian roulette — DONE 2026-07-26
+              (VERSION 0.63.0).** Two changes to `radianceHero` (`src/backward.h`) and its device twin
+              `bkRadianceHero` (`src/render_cuda.cu`), kept 1:1. (1) `Mirror`/`Filter`/`Glossy` stop
+              de-heroing — their outgoing *direction* is λ-independent, so the bundle rides on; since the
+              unidirectional form is an *analog RR* rather than a throughput multiply, the survival
+              probability became `q = max_i c_i` with survivors reweighting `thr[i] *= c_i/q ≤ 1`.
+              (2) **The diffuse continuation stops rolling its coin on the hero alone.** The old
+              `if (u >= rho[0]) die; thr[i] *= rho_i/rho_0` *amplifies* a secondary by up to
+              `rho_max/rho_hero` — on the built-in `redWall`/`greenWall` spectra (0.05 … 0.75) a **15× weight
+              spike per diffuse bounce**. Now `q = max_i rho_i`, `thr[i] *= rho_i/q ≤ 1`; DiffuseTransmit
+              picks its lobe from the per-lobe maxima (rescaled if they sum past 1). At `nUp == 1` both are
+              the scalar code verbatim, so `-heroc 1` stays byte-identical (verified on both backends for
+              `abs_hero_delta` and `abs_hero_mats`, 256²/64 spp).
+              **(2) is what made hero actually pay off in mode R — (1) alone regressed luma.** Noise RMS
+              (luma / chroma) vs a 262144-spp `-heroc 1` reference, GPU 256²:
+              `scraps/abs_hero_diffuse.ftsl` (coloured Cornell, no delta lobes) at 4096 spp — single-λ
+              0.0604 / 0.0714, hero-4 *before* 0.0605 / 0.0565 (**hero was worth nothing in luma**), *after*
+              **0.0254 / 0.0254**; `scraps/abs_hero_mats.ftsl` at 4096 spp — 0.0875 / 0.1136, before
+              0.1566 / 0.1110 (**worse than single-λ**), after **0.0398 / 0.0597**;
+              `scraps/abs_hero_delta.ftsl` at 16384 spp — 0.1122 / 0.0955, before 0.1062 / 0.0936,
+              keepBundle-only 0.1305 / 0.0710, after **0.0549 / 0.0393**. That is ≈0.42–0.52× RMS = a **4×
+              variance cut** for 1.35× CPU / 1.36× GPU wall-clock ⇒ **≈2.9× at equal noise**; energy
+              unbiased (−0.015 % … +0.034 %). Diagnosis trail: an achromatic-wall control
+              (`scraps/abs_hero_delta_gray.ftsl`) showed change (1) alone going 0.0755→0.0406 luma with no
+              regression, pinning it on the coloured diffuse walls. Renders in `png/hero_achroma2/`,
+              `png/hero_diff/`, `png/hero_mats/`, `png/hero_gray/`. Full write-up in known-issues.md,
+              including the reference-correlation measurement trap.
+        - [x] **Same two fixes for the FORWARD tracers — DONE 2026-07-26 (VERSION 0.64.0).**
+              `tracePhotonHero` (`src/render.h`) and its device twin `shadeStepHero`
+              (`src/render_cuda.cu`) got the identical pair: Mirror/Filter/Glossy stop de-heroing, and
+              Diffuse / DiffuseTransmit / the new delta group all survive on `q = max_i c_i` with
+              survivors reweighting `beta[i] *= c_i/q ≤ 1`.
+              **The forward tracers keep an energy ledger, and it caught a bug the backward port could not
+              have:** the reweight is *deterministic absorption*, so it must be booked — without
+              `e.absorbed += beta[i]*(1-w)` the ledger fell to `sum/emitted = 0.6597`. With it the ledger
+              closes *exactly* for the first time — the **old** ratio reweight created ledger energy on
+              every scene tried (`sum/emitted` 1.00281 `cornell`, 1.00459 `group`, 1.00172
+              `material_presets`, 1.00743 `mixmat`, 1.00713 `abs_hero_diffuse`, 1.00696 `abs_hero_mats`;
+              all now 0.999996 … 1.000003). That was a ledger inconsistency, not image bias
+              (`E[ρ₀·βᵢρᵢ/ρ₀] = βᵢρᵢ` is correct); what the amplification cost was **variance**.
+              Noise RMS (luma / chroma) vs an 8e9-photon `-heroc 1` reference, GPU mode B 256², all tests
+              at 200 M photons: `abs_hero_delta` — single-λ 0.0460 / 0.0350 (2.9 s), hero-4 *before*
+              0.0492 / 0.0342 (5.8 s), *after* **0.0289 / 0.0172** (7.3 s), single-λ at equal time
+              0.0321 / 0.0228; `abs_hero_diffuse` — 0.0407 / 0.0563, before 0.0514 / 0.0539, after
+              **0.0254 / 0.0216**, equal-time single-λ 0.0269 / 0.0361; `abs_hero_mats` — 0.0377 / 0.0587,
+              before **0.1069** / 0.0443 (mean luminance still −0.251 % off — heavy tails), after
+              **0.0233 / 0.0239**, equal-time single-λ 0.0247 / 0.0423. So hero was a net *loss* in the
+              forward tracers too, and is now a win — but a **smaller** one than mode R's ≈2.9×, because
+              forward hero shares only the main path's BVH walk while the per-λ camera splat / photon
+              deposit costs a full C×: ~1.1× luma and 1.3–1.8× chroma at equal GPU time (CPU amortizes
+              better — `abs_hero_mats` 20 M: 0.1148 / 0.0973 in 6.5 s vs 0.0641 / 0.0333 in 12.3 s ⇒ 1.30×
+              luma / 2.13× chroma). `sum/emitted = 1.000000` on both backends, `-heroc 1` byte-identical,
+              mode M deposit unbiased (+0.002 %). Renders in `png/heroFwd/`, `png/heroFwdD/`,
+              `png/heroFwdM/`. Full write-up in known-issues.md.
+    - [x] **Shared plumbing — DONE 2026-07-26 (no VERSION bump: zero observable change).** Landed as the
+          *achievable* subset of the original idea, after surveying what is actually duplicated. Two helpers plus
+          one comment block went into `src/hero.h`:
+          * **`hero::sampleBundle(sampler, u, C, lam, pdf)`** — POLICY (1), the stratified λ draw itself (hero
+            takes `u`, secondary i takes `u + i/C` wrapped, all through the same emission CDF; returns false iff
+            the *hero's* pdf is non-positive, since only it must be valid). It was three near-identical copies;
+            now one. Templated on the sampler so the header stays dependency-free and both callers fit: the
+            forward tracer samples one `Emitter::spd`, the backward/BDPT tracers the scene-wide
+            `Scene::emitSampler` (both `EmissionSampler`).
+          * **`hero::maxOf(a, n)`** — POLICIES (3)/(4), the max over live λ, used both as the analog-RR survival
+            probability and as the "is the whole bundle black?" early-out. Replaced 6 hand-rolled loops
+            (`render.h` ×3 including the DiffuseTransmit per-lobe pair, `backward.h` ×3).
+          * **A single authoritative POLICY block** at the top of `hero.h` stating all four rules — (1)
+            stratification, (2) which lobes de-hero, and that the criterion is a *λ-dependent direction* rather
+            than merely being delta, (3) analog RR is max-over-live-λ never hero-only (with both failure modes:
+            `c_hero == 0` kills live secondaries, and hero-only ratios amplify by up to 15× per diffuse bounce),
+            (4) per-λ factors are absolute never ratios — plus the two rules that deliberately are *not* shared
+            (the forward tracers must book the reweight as absorption in their energy ledger and nobody else may;
+            BDPT normalises a connection by `1/min(nUp_light, nUp_eye)` at the splat instead of folding a ×C
+            de-hero boost into vertex throughputs, since two independently de-hero'd subpaths would square it).
+            This is the part that actually pays: the prose was duplicated near-verbatim across three files, and
+            each of the two real bugs in this section's history had to be found and fixed independently in two-to-
+            four places.
+          **Why NOT the original "small `HeroLambda` struct threaded through every spectral evaluation site":**
+          the four tracers are genuinely different *estimators*, not four copies of one. The forward tracers
+          multiply throughputs and keep an energy ledger; the backward tracer runs analog RR on a radiometric
+          weight and books nothing; BDPT stores an absolute per-λ factor per vertex, computes ONE MIS weight for
+          the whole bundle, and must not de-hero-boost at all. Forcing them behind one struct would have produced
+          a struct whose fields each tracer reinterprets — worse than the duplication it removed. The GPU twins
+          in `render_cuda.cu` stay separate on purpose, as decided earlier in this section.
+          **Validated as a pure refactor: 24/24 renders byte-identical** to `scraps/ftrace_base_99a898d.exe` —
+          the full cross product {`abs_hero_delta`, `abs_hero_mats`, `abs_herosplit`} × {mode B, R, D} ×
+          {`-heroc 1`, `-heroc 4`} on CPU (18), plus CPU mode M, mode S and `-herosplit`, plus GPU modes B/R/D at
+          `-heroc 4` (6). Renders in `png/heroRefac/`.
+    - [x] **Docs + version — DONE (rolling, through 0.70.0).** README's spectral bullet, the "what ftrace is
+          actually good at" §, the renderer-comparison table and the `-heroc <N>` flag row all state the current
+          coverage (CPU `A/B/C`, `R`, `M/S`, `D`, `U`; GPU megakernel `A/B/C`, `M`-deposit, `R`, `D`, `U`) and
+          the exclusions (the GPU wavefront scheduler, and any scene with media / GRIN / a finite-lens camera). The
+          deliberate secondary-drop is documented everywhere as the de-hero policy (dispersive or
+          wavelength-switching interface → secondaries terminated, hero boosted ×C — Wilkie et al. 2014 /
+          PBRT-v4 `TerminateSecondary`). VERSION took a minor bump per landing (…→0.59.0 for GPU mode R).
+          Re-check this box's wording whenever a further mode gains hero.
 
 Sequencing note: L1/L3/L4 are done (mode R). The remaining L-HERO work is a real, cross-mode spectral-core upgrade;
 start with the backward tracer (R) as the reference, then propagate the shared `HeroLambda` plumbing to A/B/C and D
@@ -1819,6 +3335,262 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ---
 
 ## Progress log
+- 2026-07-27: **Measured G3/G4 instead of guessing — overturned both deferrals' stated reasons, and the
+  measurement pointed at a third thing that was actually the bottleneck (v0.84.3).** Built a probe method
+  that changes *only* program size while keeping output bit-identical (rewrite the field `E` as `(E+E)/2`
+  — bit-exact in IEEE, and unlike a padding tail it adds *realistic* nodes), asserting identical output
+  md5 / triangle counts across x1/x2/x4 variants, so any time delta is pattern eval and nothing else.
+  Findings: (1) `patternEval` costs **~4.7 ns/node regardless of opcode** — a `Mul` costs what a `sin`
+  does — so G3's premise "sin/cos + the sphere-march dominate" is **false**; cost is purely node count,
+  and affine rows are 85–89% of every emitted field, so MatRow really would cut nodes 3.5–4×. (2) But
+  field eval is only **7% of `-raster-gpu`, 12% of `-raster`, 11–14% of an export** at the sizes actually
+  rendered (~4% for a default random draw) — so G3 stays deferred on **Amdahl**, not opcode mix, with a
+  new numeric trigger (**>800 nodes**, i.e. `--coupling all` at D≥8; measured D=16 fully coupled = 3917
+  nodes, 62% field eval, 1.9× win). (3) G4's premise was also wrong: a res-160 export was **55% ASCII OBJ
+  write**, not marching, capping even a *free* GPU march at 1.8×. So the right fix was the writer, not a
+  CUDA port — `isomesh::writeObj` was doing one `fprintf` per line (~6.6M calls, 22 MB/s); it now formats
+  into an 8 MB buffer flushed with `fwrite` plus hand-rolled integer conversion for face lines, keeping
+  the same `snprintf` specifiers for floats so output is **byte-identical** (md5-verified against the old
+  binary). **Write 11.77 s → 4.66 s (2.5×), export 21.47 s → 13.40 s (1.6×)** — a bigger real win than
+  MatRow gives on any default scene, for a fraction of G4's cost.
+- 2026-07-27: **loom retime + the 4-D time-shear — time is now a value you can pass, not just the frame
+  you happen to be on.** (loom-only; no `ftrace.exe` change, so no `VERSION` bump.) A `Signal` was always a
+  *pure function of a `Clock`*, so evaluating one at another phase was already well-defined and cheap —
+  the only thing that ever assumed one-value-per-node-per-frame was the **memo**. So the whole family fell
+  out of two additions: **`Phase`** (a leaf returning `clock.t` *as a value*) and **`Retime(x, when)`**
+  (evaluate `x` against `retimed_clock(clock, when)`), plus `VecRetime` for retiming a vector as a whole.
+  Sugar on top: `freeze` (a hold — and `at` may itself be animated, so a *scrubbable* hold is free),
+  `delay` (`x(t−dt)`; wraps iff the clock is closed, so a delayed seamless loop stays seamless, and a
+  negative `dt` legitimately looks *ahead*), `warp` (`x(g(t))`). The cache problem the roadmap flagged was
+  solved by **`Cache.scope(key)`** — a nested cache keyed `(node id, frame, sample phase)` — rather than
+  widening the global key, which would have touched every `at()` call site; sharing still works *within*
+  one sample point and nothing leaks out to the frame. The cycle question resolved to "nothing to add":
+  both retime edges are ordinary structural `children()`, and a retime is **not** a recurrence (it reads a
+  pure function elsewhere, not its own past), so `detect_signal_cycle` still owns it and the temporal
+  causality guard stays deferred until an actual stateful node exists. The payoff is the spatial-tier
+  **`SigAt`**: a modulator sampled at a phase that is *itself a field* — `SigAt(Sine(cycles=3), T − X/c)`
+  is a wave whose phase lags with distance, i.e. a genuine shear of the spacetime block, and the one thing
+  that could not be faked by animating a coefficient (a bare `Signal` used as a spatial term bakes one
+  number per frame for the *whole* field). `SigAt.emit()` deliberately raises — ftrace evaluates a pattern
+  per hit with no access to loom's modulator DAG, and baking one number would silently drop the shear —
+  making it the second single-backend leaf in `spatial.py` alongside `VolumeField`; the workflow is
+  discretise-then-render. Cost is one graph evaluation per *distinct* phase, with `quantize=k` capping it.
+  27 new tests (1150 → **1177**), mutation-checked three ways; notably the cache tests had to be rewritten
+  to use a **sub-frame** retime — with a coarser delay the retimed phase maps to a *different* frame index,
+  the keys never collide, and the first version of the test passed even with the bug put back.
+  `tools/loom/{loom/signals/retime.py,loom/signals/core.py,loom/spatial.py,tests/test_retime.py,
+  examples/time_shear.py,design.md,README.md}`.
+- 2026-07-27: **0.83.0 — the viewer's Modulator DAG pane now shows the whole graph
+  (adaptive height + wrapping layers + a real zoom).** Reported as "the modular DAG pane doesn't seem to
+  be tall enough to show the whole thing," and it had three independent causes. (1) The pane was a
+  hard-coded 360 px child; it now sizes to `min(extent.y, remaining side-column height)` so it fills
+  whatever the window leaves it. (2) The layout was structurally taller than *any* pane: longest-path
+  layering puts every leaf in level 0, and the stress sidecar has 60 of them — ~6600 px of column no
+  matter how tall the pane is. `measureDag()` now **wraps each level into sub-columns** against the
+  available height, so a wide-and-shallow graph turns into a grid instead of one endless column. The
+  first frame has to *estimate* node boxes (imnodes hasn't laid them out yet), and an estimate that
+  ignores `NodePadding` and the DPI-scaled font overlaps nodes — so after `EndNodeEditor()` the panel
+  reads back `ImNodes::GetNodeDimensions()` for every node and, if any differs, re-wraps next frame from
+  the *real* rects. That settles in two frames and is DPI-correct by construction rather than by fudge
+  factor. (3) Even a full-window pane can't show a graph wider than the canvas, and **this imnodes build
+  has no zoom at all** — only panning. So the panel implements one: ImGui 1.92's dynamic fonts make
+  `PushFont(NULL, style.FontSizeBase * zoom)` a crisp re-raster (not a bitmap stretch), and scaling
+  `ItemSpacing` + `ImNodesStyleVar_NodePadding` by the same factor scales the node boxes with it — a real
+  zoom, at the cost of it being a *re-layout* rather than a transform, which is why the wrap re-measures
+  on zoom. Wheel zooms (15–300%); **fit** runs an iterative solve (the extent isn't a closed-form function
+  of zoom once wrapping is involved) — width-only, `sqrt`-damped, and gated on the read-back having
+  settled, because comparing *height* is useless when wrapping pins `extent.y ≈ availH` by construction.
+  **maximize** re-hosts the same graph in a full-viewport window (Esc/`dock` to return), auto-fits on
+  entry and re-fits on resize. The child uses `NoScrollbar | NoScrollWithMouse` — `NoScrollWithMouse`
+  alone still forwards the wheel to the parent, which scrolled the side column out from under the zoom.
+- 2026-07-27: **0.82.0 — `emit pattern:` / `emit_map` now runs on the CUDA backends; the last 0.80.0
+  tech-debt item is closed.** Emission is the one throughput slot read from **both sides of transport** —
+  emission-on-hit (the s=0 / direct-hit / specular-arrival strategy) *and* the Le at a point the emitter
+  *sampler* drew (NEE, light subpaths) — and MIS **combines** them, so the two must agree pointwise. That
+  is exactly why 0.80.0 shipped it CPU-only behind a whole-scene reject: a *partially* ported pattern
+  biases the image instead of dropping a visible effect, and the device has ~20 emission read sites rather
+  than the one or two `reflectPat`/`transmitPat` funnel through. All of them landed at once.
+  `DEmitter::emitPat` / `DMaterial::emitPat` upload; `DEmitTri` carries `uv0`/`uvE1`/`uvE2` and the device
+  `emitterSamplePoint` gained optional `uuOut`/`vvOut` (Quad: the bilinear `u1,u2`; Mesh: the chosen
+  `EmitTri`'s barycentric UVs) so a *sampled* point reports the same (u,v) a *hit* interpolates — the
+  property that makes the profile legal on those two shapes and refused on sphere/cylinder/spot/env.
+  Three accessors mirror `scene.h`: `dEmitPatMul` (hit side), `dEmitterPatMulAt` /
+  `dEmitterSamplePointPat` (sampler side). Two structural choices kept the site count down: the sampler
+  factor folds into `bkEmitterGeom`'s λ-independent `G`, so scalar **and** hero NEE pick it up from one
+  place (host twin: `emitterGeom` folding into `w`); and a cached `Real emitPatW` on `DVertex` (twin of
+  `bdpt.h Vertex::emitPatW`), read by `dVertexLe`, covers every BDPT MIS strategy from one place. The
+  pattern remains a pure post-multiplier on carried radiance/beta — the emitter is still *selected* by its
+  unpatterned `power` and the point still drawn uniformly over its area, so **no pdf anywhere changes**
+  and the estimator is unbiased by construction (only variance rises). Unpatterned scenes stay
+  bit-identical: every new factor is guarded by `if (epat != 1.0)` or is an exact multiply by `1.0`, and
+  the extra UV outputs consume no RNG, so draw sequences are unchanged. Both `Supported` gates dropped —
+  including the **RGB fast path**, which unlike `reflectPat`/`transmitPat` is safe because an *achromatic*
+  scalar commutes with the spectral→RGB bake (`ep·∫CIE·emitSpd == ∫CIE·ep·emitSpd`), so it applies
+  straight to the pre-baked `rgbEmit`. Two deliberate non-sites: `dInvPdfLambda` (a wavelength pdf,
+  matching the host) and the spot/env branches (refused at load). **Validated** on
+  `scenes/emit_pattern.ftsl` (two patterned quad area lights + a patterned *mesh* emitter, i.e. both
+  UV-carrying shapes): GPU-vs-CPU mode R at 2000 spp / 512² mean ratio **0.9999** (median 1.0000, sRGB
+  RMSE 2.36/255, under the images' own 2.24% noise floor); GPU cross-estimator global B/R **1.00001** and
+  D/R **0.99995**; GPU-VCM-vs-CPU-VCM **0.9998**; RGB fast path vs spectral R **0.9991**; mode-M photon
+  map GPU-vs-CPU **1.0056** (median 1.0000; the residual is M's own density-estimate noise, as in M2/M4);
+  forward energy closure `sum/emitted = 1.000000` at 4×10⁹ photons. U/R came in at 1.00679, but an **unpatterned control**
+  gives 1.00706 with the same per-band profile — a pre-existing VCM-vs-R estimator difference on this
+  scene, not the pattern (the band holding the directly-visible patterned panels is U/R = 1.0002). 11/11
+  `-check*` self-tests pass; all 80 `scenes/*.ftsl` load. `raster.h`/`raster_cuda.cu` still ignore
+  `emitPat`, deliberately and consistently with `reflectPat`/`transmitPat` — a cosmetic preview mismatch,
+  not bias.
+- 2026-07-26: **0.81.0 — E5 is complete: scene value-sites route through `Target`, and the viewer shows the
+  axis model.** Two follow-ups, both loom-side plus one C++ panel.
+  *(1) Routing.* `Lift` took a clock-parameterized `Signal` **up** into the axis layer; nothing brought one
+  back **down**, so `Target` — the pin/mod combine node — was a self-contained algebra that could not
+  actually drive `Sphere.radius` or a camera position. `Lower`/`LowerVec` are the exact inverse: the site's
+  clock axis is fed `clock.t`, and every *other* axis must be pinned with `bind={'s': <coord or Signal>}` (a
+  constant reads one arclength of a spatial curve; a `Signal` sweeps along it over the loop). Records-5a's
+  scope rule is enforced at **construction**, naming the unbound axes, instead of failing deep inside a
+  render. Routing is **one memoised hook** (`signals.core.lower_axsignal`) consumed by `as_signal`,
+  `VecSignal.of`, `ftsl_emit.site_node` and `Element.roots()` — no element constructor changed, and every
+  value-site accepts an axis node uniformly. Memoising the lowered node is *required*: node identity is the
+  per-frame `Cache` key **and** `roots()` must hand the cycle detector the very node emission will evaluate.
+  Also `mod()`/`pin()` sugar, `as_ax` now lifts a legacy `Signal`, and a latent bug is fixed — a `GAIN`
+  target with a negative source computed `x ** gain`, which Python returns as a **complex**, blowing up far
+  from the cause; it now raises a domain error naming the fix.
+  *(2) The on-disk projection.* Decided **`.ftsl` carries no axis annotation** — it is a *bound* per-frame
+  snapshot (every axis already collapsed to a number), and annotating it would make ftrace's language an
+  animation format. The projection belongs in the **viewer introspection sidecar** (v1 → **v2**), which is
+  what an editor reads: nodes gain their free `axes` plus target-kind / reduced-axis / value-site-scope
+  detail, and an edge into a `Target` gains the `mode` + `gain` a plain child list cannot express (sources
+  hang off `Binding` records, so a generic walk saw only anonymous inputs). `src/viewer_gui.cpp`'s F5 panel
+  renders all of it (`axes {s,t}`, `gain target (neutral 1)`, `mod[0] x0.8`), verified live. Purely additive.
+  33 new tests; 1128 loom green.
+- 2026-07-27: **0.80.0 — `emit pattern:` / `emit_map`: the reflect / transmit / emit trio is complete.**
+  Same mechanism as 0.75.0/0.76.0 — a scalar pattern in a spectral slot is a per-hit **multiplier**
+  clamped to [0,1], so `emit pattern:<n>` (and `emit [0 1](u)`) leaves the pattern alone in the slot and
+  the base collapses to a flat 1.0 (a greyscale emission profile), while `emit <spectrum>` + `emit_map
+  pattern:<n>` modulates that spectrum so the lamp keeps its colour and only its brightness varies. A
+  `light` block spells the same slot `spd`, so the pair there is `spd pattern:` / `spd_map pattern:`;
+  `finalizeEmitters` copies `Material::emitPat` onto the registered `Emitter`, so both spellings converge
+  on one runtime field. **Emission is the strict leg**, and that drove every design choice: it is read
+  from *both sides of transport* — emission-on-hit (PatCtx from the `Hit`) and Le at the point NEE / a
+  light subpath samples (PatCtx from `Emitter::samplePoint`) — and MIS **combines** the two, so a
+  pointwise disagreement is **bias**, not noise. So (a) the profile is only legal where the sampler's
+  (u,v) provably equals the hit's — `EmitterShape::Quad` (bilinear parameters) and `EmitterShape::Mesh`
+  (barycentric UVs; `EmitTri` gained `uv0`/`uvE1`/`uvE2`) — with sphere/cylinder/spot/collimated/env
+  **refused at load** at two points (`addLight`'s subtype gate, `checkEmitPatsSupported` after
+  `Scene::build()`); (b) all reads funnel through three new accessors in `scene.h` (`emitSlot`,
+  `emitterPatMulAt`, `emitterSamplePoint`, the last sampling *and* returning the multiplier in one call),
+  wired into all six tracers — `backward.h` (scalar + hero emission-on-hit, `emitterGeom`, `neeVolume`),
+  `render.h` (both `genPhoton` variants), `photonmap_render.h`, `sppm_render.h`, `bdpt.h` (a new
+  `Vertex::emitPatW` threaded through `Le`, `randomWalk`, `generateLightSubpath` and the `s == 1` branch)
+  and `vcm.h`; and (c) it is a **pure post-multiplier on radiance / photon beta** — `power`, `pdfChoice`,
+  `pdfPos`/`pdfA`, `emissionPdfW`, `directPdfW` and every VCM `dVCM`/`dVC`/`dVM` are deliberately
+  untouched, which is precisely what makes it unbiased by construction. Fixed a latent pre-existing bug on
+  the way: the area light's *second* triangle carried default UVs disagreeing with `addQuad`'s — a
+  diagonal seam for any UV-driven emission pattern **or texture** on an area light. Caveat, documented
+  rather than auto-corrected: `power`/`lumens` normalise the *unpatterned* spectrum, so a profile
+  averaging 0.5 emits about half the requested flux (folding the mean into `power` would need a
+  compensating 1/mean on photon beta *and* on BDPT's `pdfChoice`). **CPU-only**: the device has ~20
+  emission read sites and a partial port would be *biased* rather than visibly incomplete, so
+  `cudaForwardSupported` / `cudaBackwardRGBSupported` reject the whole scene and the three GPU-fallback
+  "why" strings name the emission profile; the port is logged in `known-issues.md`. *Verified unbiased at
+  160×160 against four independent estimators:* R vs D (BDPT) global ratio 1.00268 — and a **control with
+  the pattern removed** reproduces the same 1.00240 with the same corner-shaped tile profile, so that
+  residual is a pre-existing R-vs-D estimator difference, not the pattern; B (forward photons, 400M) vs R
+  global **1.00005** (tiles 0.9990–1.0024); U (VCM, 1500 spp) vs R global **1.00018** (tiles
+  0.9973–1.0028). Load rejection of `light sphere { spd pattern:p }` confirmed; all eleven deterministic
+  self-tests pass and every scene in `scenes/` still loads. Worked example: `scenes/emit_pattern.ftsl`
+  (a `spd_map` ring lamp, a lone-`spd pattern:` checkerboard, and an `emit_map` material on a mesh
+  emitter via the new `meshes/uvquad.obj`).
+- 2026-07-27: **0.79.0 — the hand-written `.ftsl` parser is deleted; the shared grammar is now the *only*
+  front end.** 0.68.0 flipped ftrace over to the grammar
+  (`tools/loom/loom/grammar/ftsl_scene.epeg` → `src/gpda/`) after the corpus differ hit **MATCH 2595/2595**
+  — every `.ftsl` in the tree, structurally identical down to `Stmt::line`. The old recursive-descent
+  parser stayed compiled in behind `-legacy-parser` as an escape hatch and went **ten releases unused**,
+  so it was time. Deleted: the `// Tokenizer` section and the 266-line `struct Parser` from `src/ftsl.h`
+  (`loadSource()` now has one path — `ftsl_gpda::parse()`); `legacy_flag()` / `use_legacy()` /
+  `validate_flag()` / `validate_enabled()` / `validate()` from `src/gpda/ftsl_frontend.hpp`; the
+  structural differ (`Diff` / `diff_block` / `diff_value` / `diff_scene`) from `src/gpda/ftsl_reduce.hpp`,
+  which had nothing left to diff against; and the argv pre-scan in `main.cpp` that existed only because
+  the scene is parsed before the main CLI loop runs. `-legacy-parser` / `-validate-grammar` are **retired,
+  not removed** — still accepted so an existing script keeps working, but each prints
+  `ftrace: <flag> was retired in 0.79.0 …; ignoring` rather than silently doing nothing, which is what
+  keeps this a *minor* bump. Everything downstream of `std::vector<Block>` is shared and untouched, and
+  `applyBracketGroup` stays at the loader level (that layering was the thing that made the flip a pure
+  parse-tree exercise; the comments now say so as design rather than as drift-avoidance). *Verified:* all
+  eleven deterministic self-tests PASS, every scene in `scenes/` still loads, both retired flags render
+  normally after printing the notice.
+- 2026-07-26: **0.78.0 — `grid:`/`scatter:` reach the field formulas, and the not-found guard no longer
+  corrupts the eval stack.** Authored-data tables were compile-legal only in *pattern* sites; now the
+  FTSL builder also passes `&tableScope_` at the `function` field leaf, a medium's `density` and `ior`
+  programs, and `camera_curve` drivers — so `expr "grid:terrain(x, z) - y"` is a measured height field,
+  `ior "1 + grid:n(x, y, z)"` a measured GRIN profile. (`tex:` stays a compile error there: it needs a
+  hit's u,v, which a field formula has none of.) Evaluation was the real work: a compiled `PatOp::Grid`
+  node holds an index into `Scene::grids`, so a non-owning `PatTables` view (`Scene::patTables()`;
+  device `dPatEnvOf`) is threaded as a **parameter** through `Implicit::eval`/`gradient`,
+  `intersectImplicit`, `estimateFieldLipschitz`, `Medium::densityAt`/`nAt`/`gradNAt`/`insideBound`,
+  the GRIN marcher, `isomesh::marchImplicit` and `airtight::check` — never a member, since a `Scene`
+  is copied and moved and a stored view would dangle. The multi-medium wrappers were retyped from
+  `media` to the whole `Scene`/`DScene` (18 host + 24 device call sites) so no caller can *forget* the
+  tables. The load-time consumers get them too: the Lipschitz bound, the majorant-density scan and the
+  `boundInsideNeg` sign test all previously read a grid-driven field as identically 0. **This was a
+  live wrong render, not latent debt:** `medium { density pattern:<p> }` copies a table-scoped
+  pattern's nodes into a medium that was evaluated without tables, and the guard pushed 0 *without
+  popping its operands*, so `patternEval` returned the first **coordinate** as the sample. Proven with
+  a descending grid (`data { 1 0 }`) whose analytic twin is `density "1 - x"`: before the fix the two
+  renders were mirror images, after it they are byte-identical (`mean|d|=0.000`) on **both** backends
+  while the mirrored comparison is far off. Both guards now `return 0` — abandoning the whole program
+  is the only balanced option, since the operand count is the missing table's own `ndim`. The FP32
+  device VM's `Tex`/`Grid`/`Scatter` stubs were implemented at the same time (promote/demote around
+  the double-only samplers, as `PovFn` already did). Pinned by two new `-checkgrid` sections — an
+  unbound table evaluates to **0, never to a coordinate**, and `Medium::densityAt` fed
+  `Scene::patTables()` returns the sample while omitting the tables returns a clean 0 — and by a
+  matching isosurface pair (`scraps/gridiso{,_ref}.ftsl`, a 2×2 lattice holding a bilinear plane;
+  agrees to the grid pool's float storage, ~7e-9 m of silhouette, on both backends). New worked
+  example `scenes/grid_field.ftsl` exercises both new sites at once.
+- 2026-07-26: **0.77.1 — a missing `-o` directory no longer eats the whole render.** `known-issues.md`'s
+  oldest papercut (hit twice): `-o png/nope/out.png` traced every photon, printed `error: could not write …`
+  at each `-interval` tick, and exited with nothing — the film was reachable only by the writers, which run
+  *after* it exists. Fixed with an `ensureOutDir` precheck in `main.cpp`, placed after the `-check*`
+  self-test early-returns because that's the earliest point where `out` is final (the bare-invocation
+  preview path can still rewrite it to a `$TEMP` name). It creates the missing parent (announced as
+  `[out] created output directory …`, so a typo shows up in the log rather than silently) and exits 2 with a
+  named error if it can't, or if the parent exists but isn't a directory. Policy is *create*, not *refuse*,
+  because renders are routinely aimed at a fresh `png/<series>/`. One check on `-o` covers the `.ftbuf`
+  sidecar, the per-camera `outFor()` names and the stereo eye pair (all share its directory); `-savemap` is
+  the only independent output path and gets the same treatment. Verified both ways: a 3-deep nested `-o`
+  creates the tree and writes PNG + `.ftbuf`, and a parent that is a regular file fails before the scene
+  renders.
+- 2026-07-26: **E4 — loom reads and writes rotated `.vdb` transforms.** Closed a real loom↔ftrace
+  asymmetry: ftrace's `readTransform` has always accepted `AffineMap`/`UnitaryMap` and honours them
+  properly (inverting the 3×3 for world→index sampling, AABB'ing the index box's 8 corners), while loom's
+  reader rejected them outright. The insight that shaped the API: **a rotation costs the samples nothing**
+  — an OpenVDB tree is a regular lattice in *index* space regardless — so the dense array is untouched and
+  only the axis-aligned `box6` is inexpressible. So `read_vdb` is unchanged and still refuses a rotated
+  grid (an approximate box would silently misplace every voxel), and the new `read_vdb_grids` returns
+  `ReadGrid` records carrying the index-space array + `index_lo` + a full `VdbTransform`; `VolumeGrid(…,
+  transform=…)` writes one as an `AffineMap`. Refactoring the map decode into `_read_map` left all 19
+  pre-existing tests passing untouched, incl. the four real third-party sample files and the
+  byte-for-byte default-output assertion. 8 new tests (1095 loom green); ftrace interop verified by
+  rendering one asymmetric L-shaped volume diagonal vs 45°-about-Y (`scraps/vdb_rot_make.py` →
+  `png/vdbrot/{flat,rot}.png`) — identical voxels, visibly rotated. loom `DESIGN.md`'s E4 entry was also
+  stale from before the codec work and is now current.
+- 2026-07-26: **0.77.0 — the loader reports unknown keys, and J3c's emitter-drift audit is closed with it.**
+  The audit ("check every `Element.emit` against the live grammar") could not be done by reading code: ftrace
+  silently ignored any key no builder read, so drift produces a *wrong image* rather than an error. Built the
+  missing diagnostic at the one choke point — `Stmt` gained a `mutable bool used` set inside
+  `find(const Block&, const char*)`, which every property read (`strOf`/`vec3Of`/`dblOf`/`spectrumParam`/…)
+  funnels through, so it cost zero per-builder changes. ~17 sites that iterate `b.stmts` directly (repeated-key
+  gathers, exhaustive dispatch loops, flat-word `data`/`palette`/`table` bodies) mark explicitly via
+  `markUsed`/`markAllUsed` — each of those was *discovered* by the corpus sweep naming its own false positive,
+  316 → 89 → 12 → 0. `collectUnusedKeys` runs at the end of `Builder::build` and reports via `Loaded::unknownKeys`
+  (carried, not printed inline, because `prefer { } else { }` trial-builds candidates and discards all but one).
+  A **warning**, not an error: an old scene with a stale property must still render, but it must say so.
+  Also made `evalSpectrum` explain a `texture:` in a non-texture slot instead of "unrecognized spectrum
+  expression". Then ran the audit (`scraps/emit_audit.py`, 11 Element kinds): **all clean**, plus all 78
+  checked-in scenes and 1083 loom tests. Real finds fixed: loom's `Isosurface` couldn't emit
+  `samples`/`accuracy`/`refine`/`uv` (a sampled march was pinned to the 256-sample default — 4 new tests,
+  including the FTSL §2 bareword-axis trap); `priority` authored on geometry in `scenes/_record_scalar.ftsl`
+  (it's a material slot); 6 dead `contained_by` lines on pure-analytic gallery isosurfaces. Docs: FTSL.md §1.3
+  (new; `prefer` renumbered to §1.4), README diagnostics, design.md `ftsl.h`.
 - 2026-07-19: **J3c started (option-a) — GPDA vendored + shared grammar reads the record block.** Stood up
   `loom/grammar/`: vendored the pinned tokenized `gpda.py` as `_gpda.py` (GraphParser commit 1ac4cbf,
   self-contained — only `import re`) with a provenance header; the shared EPEG grammar `ftsl.epeg` (start=`record`,

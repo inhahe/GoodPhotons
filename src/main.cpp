@@ -148,6 +148,7 @@
 #include "mesh.h"
 #include "ftsl.h"
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
+#include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
                                // header also pulls it in, but CPU-only builds need it too
 #ifdef HAVE_CUDA
@@ -922,14 +923,991 @@ static int checkUpsample() {
     }
     bool passD = illumErr < 2e-3;
 
-    bool pass = passA && passB && passW && passC && passD;
+    // (e) Smits 1999 reflectance upsample round-trips: build the tabulated basis
+    // reflectance, integrate under D65 through the CIE observer, and compare to the
+    // input. Smits is an approximate classic (lower fidelity than Jakob-Hanika), so
+    // the tolerance is deliberately looser — this just guards gross regressions.
+    double smitsErr = 0.0; bool smitsPhysical = true;
+    for (const C& c : tests) {
+        Spectrum spd = rgbToReflectanceSmits(c.r, c.g, c.b);
+        for (int i = 0; i < B.N; ++i) {
+            double s = spd(B.lam[i]);
+            if (s < -1e-9 || s > 1.0 + 1e-9) smitsPhysical = false;
+        }
+        Vec3 lin = reflectanceToLinearSrgbD65(spd);
+        double e = std::max({std::fabs(lin.x - c.r), std::fabs(lin.y - c.g), std::fabs(lin.z - c.b)});
+        smitsErr = std::max(smitsErr, e);
+        std::printf("[checkupsample] smits %-8s (%.2f %.2f %.2f) -> (%.4f %.4f %.4f)  err=%.5f\n",
+                    c.name, c.r, c.g, c.b, lin.x, lin.y, lin.z, e);
+    }
+    bool passE = smitsPhysical && smitsErr < 0.20;   // approximate by design
+
+    // (f) Plain calibrated 3-box reflectance round-trips: since the band heights are
+    // solved from the inverse response matrix, unsaturated colours reconstruct nearly
+    // exactly; saturated ones clamp (heights in [0,1]) and drift. Guards the calibration.
+    double boxErr = 0.0; bool boxPhysical = true;
+    for (const C& c : tests) {
+        Spectrum spd = rgbToReflectanceBox(c.r, c.g, c.b);
+        for (int i = 0; i < B.N; ++i) {
+            double s = spd(B.lam[i]);
+            if (s < -1e-9 || s > 1.0 + 1e-9) boxPhysical = false;
+        }
+        Vec3 lin = reflectanceToLinearSrgbD65(spd);
+        double e = std::max({std::fabs(lin.x - c.r), std::fabs(lin.y - c.g), std::fabs(lin.z - c.b)});
+        boxErr = std::max(boxErr, e);
+        std::printf("[checkupsample] box   %-8s (%.2f %.2f %.2f) -> (%.4f %.4f %.4f)  err=%.5f\n",
+                    c.name, c.r, c.g, c.b, lin.x, lin.y, lin.z, e);
+    }
+    bool passF = boxPhysical && boxErr < 0.30;   // crude basis; saturated colours clamp
+
+    // (g) Meng 2015 smoothest-spectrum grid. Because the interpolation weights are
+    // divided by each vertex's X+Y+Z, the mix lands on the requested chromaticity
+    // *exactly*, so the only error is the brightness clamp — near-zero for anything
+    // a smooth reflectance can actually be that bright. The second check is the one
+    // that matters for the method: the result must be SMOOTHER (lower sum of squared
+    // first differences) than the Jakob-Hanika fit of the same colour, since that is
+    // the entire property being tabulated.
+    double mengErr = 0.0, mengWhiteErr = 0.0; bool mengPhysical = true, mengSmoother = true;
+    for (const C& c : tests) {
+        if (c.r == 0.0 && c.g == 0.0 && c.b == 0.0) continue;   // black -> zero
+        Spectrum spd = rgbToReflectanceMeng(c.r, c.g, c.b);
+        Spectrum jh  = rgbToReflectanceJH(c.r, c.g, c.b);
+        double roughM = 0.0, roughJ = 0.0, prevM = spd(B.lam[0]), prevJ = jh(B.lam[0]);
+        for (int i = 0; i < B.N; ++i) {
+            double s = spd(B.lam[i]);
+            if (s < -1e-9 || s > 1.0 + 1e-9) mengPhysical = false;
+            double dM = s - prevM, dJ = jh(B.lam[i]) - prevJ;
+            roughM += dM * dM; roughJ += dJ * dJ;
+            prevM = s; prevJ = jh(B.lam[i]);
+        }
+        if (roughM > roughJ) mengSmoother = false;
+        Vec3 lin = reflectanceToLinearSrgbD65(spd);
+        double e = std::max({std::fabs(lin.x - c.r), std::fabs(lin.y - c.g), std::fabs(lin.z - c.b)});
+        if (c.r == 1.0 && c.g == 1.0 && c.b == 1.0) mengWhiteErr = e; else mengErr = std::max(mengErr, e);
+        std::printf("[checkupsample] meng  %-8s (%.2f %.2f %.2f) -> (%.4f %.4f %.4f)  err=%.5f  rough=%.5f (jh %.5f)\n",
+                    c.name, c.r, c.g, c.b, lin.x, lin.y, lin.z, e, roughM, roughJ);
+    }
+    // Tabulated + interpolated, so allow a hair more slack than the analytic fits;
+    // white is capped by the brightest smooth reflectance of that chromaticity.
+    bool passG = mengPhysical && mengSmoother && mengErr < 5e-3 && mengWhiteErr < 0.02;
+
+    bool pass = passA && passB && passW && passC && passD && passE && passF && passG;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
     std::printf("[checkupsample] mid-grey round-trip = %.6f  (%s)\n", greyErr, passC ? "ok" : "BAD");
     std::printf("[checkupsample] illuminant round-trip max error = %.5f  (%s)\n", illumErr, passD ? "ok" : "BAD");
+    std::printf("[checkupsample] smits round-trip max error = %.5f (<0.20 expected)  (%s)\n", smitsErr, passE ? "ok" : "BAD");
+    std::printf("[checkupsample] box round-trip max error = %.5f (<0.30 expected)  (%s)\n", boxErr, passF ? "ok" : "BAD");
+    std::printf("[checkupsample] meng round-trip max error = %.5f (excl. white %.5f); smoother than JH: %s  (%s)\n",
+                mengErr, mengWhiteErr, mengSmoother ? "yes" : "NO", passG ? "ok" : "BAD");
     std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
+}
+
+// Deterministic N-D grid sampler self-test (src/pattern.h: PatGrid / patGridSample,
+// reached from a pattern expression as `grid:<name>(c0, …)`). Validates, with no
+// scene and no renderer:
+//   (a) sample points reproduce the stored samples EXACTLY (no off-by-one, no drift);
+//   (b) C-order flattening — axis 0 is the OUTERMOST axis, matching loom's data.Grid
+//       and the nesting-is-the-shape authoring rule;
+//   (c) separable N-linear interpolation is exact for a multilinear function, in 1-D
+//       through 4-D (the strongest available analytic check on the corner weights);
+//   (d) the three out-of-box policies: clamp (edge-extend), wrap (period hi-lo, with
+//       sample n-1 aliasing sample 0) and extrapolate (the boundary cell continues);
+//   (e) the compile path: `grid:<name>(…)` resolves through a PatTableScope, takes the
+//       GRID's own dimensionality as its arity, and pushes coordinates in axis order.
+static int checkGrid() {
+    auto mk = [](int ndim, const int* shape, const double* lo, const double* hi,
+                 PatGridOutside os, int off, int count) {
+        PatGrid g;
+        g.ndim = ndim;
+        for (int a = 0; a < ndim; ++a) { g.shape[a] = shape[a]; g.lo[a] = lo[a]; g.hi[a] = hi[a]; }
+        g.outside = os; g.off = off; g.count = count;
+        return g;
+    };
+    double worst = 0.0;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkgrid] %-34s got %.9f want %.9f  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    bool ok = true;
+
+    // ---- (a)+(b) exact sample recovery and C-order on a 2x3 grid -------------
+    // data laid out row-major: value at (i, j) == i*3 + j.
+    std::vector<float> pool;
+    const int off23 = (int)pool.size();
+    for (int i = 0; i < 2; ++i) for (int j = 0; j < 3; ++j) pool.push_back((float)(i * 3 + j));
+    const int    sh23[2] = {2, 3};
+    const double lo23[2] = {0, 0}, hi23[2] = {1, 2};   // unit-spacing index lattice
+    PatGrid g23 = mk(2, sh23, lo23, hi23, PatGridOutside::Clamp, off23, 6);
+    for (int i = 0; i < 2; ++i) for (int j = 0; j < 3; ++j) {
+        double c[2] = {(double)i, (double)j};
+        ok &= chk("2x3 sample recovery (C order)", patGridSample(g23, pool.data(), (int)pool.size(), c),
+                  (double)(i * 3 + j), 1e-12);
+    }
+    // Midpoint between (0,0)=0 and (0,1)=1 is 0.5; between (0,0) and (1,0)=3 is 1.5.
+    { double c[2] = {0.0, 0.5}; ok &= chk("2x3 bilinear mid (axis 1)", patGridSample(g23, pool.data(), (int)pool.size(), c), 0.5, 1e-12); }
+    { double c[2] = {0.5, 0.0}; ok &= chk("2x3 bilinear mid (axis 0)", patGridSample(g23, pool.data(), (int)pool.size(), c), 1.5, 1e-12); }
+
+    // ---- (c) N-linear exactness for a multilinear function, 1-D .. 4-D -------
+    // f(t0..t_{n-1}) = prod(0.3 + 0.7*t_a) is multilinear, so N-linear interpolation
+    // of its corner values must reproduce it EXACTLY at every interior point.
+    for (int nd = 1; nd <= PAT_ND_MAX_DIM; ++nd) {
+        int    shape[PAT_ND_MAX_DIM];
+        double lo[PAT_ND_MAX_DIM], hi[PAT_ND_MAX_DIM];
+        int    n = 1;
+        for (int a = 0; a < nd; ++a) { shape[a] = 2; lo[a] = -1.0; hi[a] = 3.0; n *= 2; }
+        const int offN = (int)pool.size();
+        for (int c = 0; c < n; ++c) {
+            // C order: axis 0 is the OUTERMOST, so its index is the high bit.
+            double f = 1.0;
+            for (int a = 0; a < nd; ++a) {
+                int up = (c >> (nd - 1 - a)) & 1;
+                f *= 0.3 + 0.7 * (double)up;
+            }
+            pool.push_back((float)f);
+        }
+        PatGrid g = mk(nd, shape, lo, hi, PatGridOutside::Clamp, offN, n);
+        const double ts[3] = {0.125, 0.5, 0.875};
+        for (int s = 0; s < 3; ++s) {
+            double co[PAT_ND_MAX_DIM], want = 1.0;
+            for (int a = 0; a < nd; ++a) {
+                double t = ts[(s + a) % 3];
+                co[a] = lo[a] + t * (hi[a] - lo[a]);
+                want *= 0.3 + 0.7 * t;
+            }
+            char lbl[64]; std::snprintf(lbl, sizeof lbl, "%d-D multilinear exactness", nd);
+            ok &= chk(lbl, patGridSample(g, pool.data(), (int)pool.size(), co), want, 1e-6);
+        }
+    }
+
+    // ---- (d) out-of-box policies on a 1-D ramp over [0,1] --------------------
+    const int offR = (int)pool.size();
+    pool.push_back(0.25f); pool.push_back(0.75f);       // data { 0.25 0.75 }, lo 0, hi 1
+    const int    shR[1] = {2};
+    const double loR[1] = {0.0}, hiR[1] = {1.0};
+    PatGrid gClamp = mk(1, shR, loR, hiR, PatGridOutside::Clamp, offR, 2);
+    PatGrid gExtra = mk(1, shR, loR, hiR, PatGridOutside::Extrapolate, offR, 2);
+    { double c[1] = {0.5};  ok &= chk("clamp: interior",       patGridSample(gClamp, pool.data(), (int)pool.size(), c), 0.50, 1e-9); }
+    { double c[1] = {-2.0}; ok &= chk("clamp: below lo",       patGridSample(gClamp, pool.data(), (int)pool.size(), c), 0.25, 1e-9); }
+    { double c[1] = {5.0};  ok &= chk("clamp: above hi",       patGridSample(gClamp, pool.data(), (int)pool.size(), c), 0.75, 1e-9); }
+    { double c[1] = {-1.0}; ok &= chk("extrapolate: below lo", patGridSample(gExtra, pool.data(), (int)pool.size(), c), -0.25, 1e-9); }
+    { double c[1] = {2.0};  ok &= chk("extrapolate: above hi", patGridSample(gExtra, pool.data(), (int)pool.size(), c), 1.25, 1e-9); }
+
+    // Wrap: 5 samples over [0,1] with sample 4 aliasing sample 0 -> a period-1 sawtooth.
+    const int offW = (int)pool.size();
+    const float saw[5] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
+    for (float f : saw) pool.push_back(f);
+    const int    shW[1] = {5};
+    const double loW[1] = {0.0}, hiW[1] = {1.0};
+    PatGrid gWrap = mk(1, shW, loW, hiW, PatGridOutside::Wrap, offW, 5);
+    { double c[1] = {0.375};  ok &= chk("wrap: interior",  patGridSample(gWrap, pool.data(), (int)pool.size(), c), 0.375, 1e-6); }
+    { double c[1] = {1.375};  ok &= chk("wrap: +1 period", patGridSample(gWrap, pool.data(), (int)pool.size(), c), 0.375, 1e-6); }
+    { double c[1] = {-0.625}; ok &= chk("wrap: -1 period", patGridSample(gWrap, pool.data(), (int)pool.size(), c), 0.375, 1e-6); }
+    { double c[1] = {1.0};    ok &= chk("wrap: seam aliases sample 0", patGridSample(gWrap, pool.data(), (int)pool.size(), c), 0.0, 1e-6); }
+
+    // ---- (e) the `grid:<name>(…)` compile + eval path ------------------------
+    // A two-entry scope: "ramp" is the 1-D clamp ramp, "tbl" is the 2x3 C-order grid.
+    struct Scope {
+        static int lookup(const void*, PatTableKind kind, const char* name, int* ndim) {
+            if (kind != PatTableKind::Grid) return -1;
+            if (!std::strcmp(name, "ramp")) { if (ndim) *ndim = 1; return 0; }
+            if (!std::strcmp(name, "tbl"))  { if (ndim) *ndim = 2; return 1; }
+            return -1;
+        }
+    };
+    PatTableScope scope; scope.self = nullptr; scope.lookup = &Scope::lookup;
+    PatGrid grids[2] = {gClamp, g23};
+
+    struct Case { const char* expr; double u, v; double want; };
+    const Case cases[] = {
+        {"grid:ramp(u)",             0.5,  0.0, 0.50},
+        {"grid:ramp(2*u)",           0.25, 0.0, 0.50},
+        {"grid:tbl(0, 1)",           0.0,  0.0, 1.00},   // C order: (i=0, j=1) -> 1
+        {"grid:tbl(1, 0)",           0.0,  0.0, 3.00},   // (i=1, j=0) -> 3
+        {"grid:tbl(u, v) + 1",       1.0,  2.0, 6.00},   // corner (1,2) = 5
+        {"grid:ramp(grid:tbl(0,0))", 0.0,  0.0, 0.25},   // nested: tbl(0,0)=0 -> ramp(0)
+    };
+    for (const Case& cs : cases) {
+        std::vector<PatNode> prog; std::string perr;
+        if (!compilePatternExpr(cs.expr, prog, perr, false, nullptr, &scope)) {
+            std::printf("[checkgrid] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+            ok = false; continue;
+        }
+        PatCtx c;
+        c.u = cs.u; c.v = cs.v;
+        c.grids = grids; c.nGrids = 2;
+        c.dataPool = pool.data(); c.dataPoolN = (int)pool.size();
+        char lbl[80]; std::snprintf(lbl, sizeof lbl, "expr %s", cs.expr);
+        ok &= chk(lbl, patternEval(prog.data(), (int)prog.size(), c), cs.want, 1e-9);
+    }
+    // Arity is the GRID's dimensionality, so a wrong argument count must be an error,
+    // and an out-of-scope / unknown grid must not silently compile to 0.
+    struct Bad { const char* expr; const char* why; };
+    const Bad bads[] = {
+        {"grid:tbl(u)",     "2-D grid called with 1 argument"},
+        {"grid:ramp(u, v)", "1-D grid called with 2 arguments"},
+        {"grid:nope(u)",    "unknown grid name"},
+        {"grid:ramp",       "grid referenced without a call"},
+        {"grid(u)",         "bare `grid` with no name"},
+        {"scatter:ramp(u)", "a grid name is NOT visible in the scatter namespace"},
+    };
+    for (const Bad& bd : bads) {
+        std::vector<PatNode> prog; std::string perr;
+        if (compilePatternExpr(bd.expr, prog, perr, false, nullptr, &scope)) {
+            std::printf("[checkgrid] `%s` compiled but should be rejected (%s)  BAD\n", bd.expr, bd.why);
+            ok = false;
+        }
+    }
+    // With no grid scope at all (a load-time constant site), `grid:` must be refused.
+    {
+        std::vector<PatNode> prog; std::string perr;
+        if (compilePatternExpr("grid:ramp(u)", prog, perr, false, nullptr, nullptr)) {
+            std::printf("[checkgrid] `grid:ramp(u)` compiled with no grid scope  BAD\n");
+            ok = false;
+        }
+    }
+
+    // ---- (f) the not-found guard ABANDONS the program, it does not corrupt the stack --
+    // A `grid:` node whose tables aren't bound used to push 0 WITHOUT popping its
+    // operands, so patternEval returned st[0] — the first COORDINATE — as the sample.
+    // That was reachable for real (`medium { density pattern:<p> }` copies a
+    // table-scoped pattern's nodes into a medium), and it silently rendered a mirrored
+    // field. Pin it: an unbound table evaluates to 0, never to a coordinate.
+    {
+        struct Unbound { const char* expr; double u, v; };
+        const Unbound ubs[] = {
+            {"grid:ramp(u)",    0.8, 0.0},     // stack-corrupt answer would be 0.8
+            {"grid:tbl(u, v)",  0.7, 1.0},     // ... and 0.7 for the 2-D call
+        };
+        for (const Unbound& b : ubs) {
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(b.expr, prog, perr, false, nullptr, &scope)) {
+                std::printf("[checkgrid] compile `%s` FAILED: %s\n", b.expr, perr.c_str());
+                ok = false; continue;
+            }
+            PatCtx c;
+            c.u = b.u; c.v = b.v;                       // grids deliberately left unbound
+            c.dataPool = pool.data(); c.dataPoolN = (int)pool.size();
+            char lbl[96];
+            std::snprintf(lbl, sizeof lbl, "unbound `%s` -> 0, not a coord", b.expr);
+            ok &= chk(lbl, patternEval(prog.data(), (int)prog.size(), c), 0.0, 1e-12);
+        }
+    }
+
+    // ---- (g) end-to-end through a medium's density field ---------------------
+    // `density "grid:ramp(x)"` is a SAMPLED volume, and Scene::patTables() is the view
+    // that carries the tables all the way to Medium::densityAt. Verify the hand-off,
+    // and that omitting it fails as a clean 0 rather than as the x coordinate.
+    {
+        Scene sc;
+        sc.dataPool.assign(pool.begin(), pool.end());
+        sc.grids.push_back(gClamp);                     // index 0 == "ramp" in `scope`
+        sc.grids.push_back(g23);                        // index 1 == "tbl"
+        Medium med; std::string perr;
+        if (!compilePatternExpr("grid:ramp(x)", med.density, perr, false, nullptr, &scope)) {
+            std::printf("[checkgrid] compile medium density FAILED: %s\n", perr.c_str());
+            ok = false;
+        } else {
+            const PatTables tabs = sc.patTables();
+            const Vec3 p(0.8, 0.0, 0.0);                // ramp(0.8) = 0.25 + 0.8*0.5
+            ok &= chk("medium density `grid:ramp(x)`", med.densityAt(p, &tabs), 0.65, 1e-6);
+            ok &= chk("medium density, tables omitted", med.densityAt(p, nullptr), 0.0, 1e-12);
+        }
+    }
+
+    std::printf("[checkgrid] worst absolute error = %.3g\n", worst);
+    std::printf("[checkgrid] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Deterministic N-D scatter sampler self-test (src/pattern.h: PatScatter /
+// patScatterSample, reached from a pattern expression as `scatter:<name>(c0, …)`).
+// The ragged sibling of -checkgrid; validates, with no scene and no renderer:
+//   (a) EXACT reproduction at each sample position — the property that makes Shepard
+//       an interpolant rather than merely an approximation (and the branch that
+//       removes the 1/0 singularity there);
+//   (b) partition of unity: a constant-valued sample set reads back as that constant
+//       EVERYWHERE, in 1-D through 4-D. This is the analytic check on normalisation;
+//   (c) symmetry — equidistant samples blend to their plain mean, independent of
+//       `power`, which pins the weight formula's distance handling;
+//   (d) `power` actually sharpens: a higher exponent pulls a query nearer the closer
+//       sample, checked against the closed-form two-sample weight;
+//   (e) far-field behaviour: at large distance the blend tends to the plain mean
+//       (it flattens rather than diverging — a scatter's answer to a grid's `clamp`);
+//   (f) the compile path: `scatter:<name>(…)` resolves through a PatTableScope, takes
+//       the SCATTER's own dimensionality as its arity, and lives in a namespace
+//       separate from `grid:`.
+static int checkScatter() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkscatter] %-40s got %.9f want %.9f  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    // Build a scatter from (position, value) tuples into the shared flat pool.
+    std::vector<float> pool;
+    auto add = [&](int ndim, const std::vector<double>& flat, double power) {
+        PatScatter s;
+        s.ndim = ndim; s.power = power; s.eps = 1e-9;
+        s.off = (int)pool.size();
+        s.count = (int)(flat.size() / (size_t)(ndim + 1));
+        for (double d : flat) pool.push_back((float)d);
+        return s;
+    };
+    auto smp = [&](const PatScatter& s, const double* q) {
+        return patScatterSample(s, pool.data(), (int)pool.size(), q);
+    };
+
+    // ---- (a) exact reproduction at every sample position ---------------------
+    // Four samples in 2-D with deliberately unequal values; each must read back exactly.
+    const std::vector<double> quad = {
+        0.0, 0.0,  0.10,
+        1.0, 0.0,  0.90,
+        0.0, 1.0,  0.40,
+        1.0, 1.0,  0.70,
+    };
+    PatScatter s2 = add(2, quad, 2.0);
+    for (int i = 0; i < 4; ++i) {
+        double q[2] = {quad[i * 3 + 0], quad[i * 3 + 1]};
+        char lbl[80]; std::snprintf(lbl, sizeof lbl, "exact at sample %d", i);
+        // 1e-6, not 0: the pool stores FLOATS, so an authored 0.10 is only float-exact.
+        // "Exact" here means "the stored sample, with no interpolation error on top".
+        ok &= chk(lbl, smp(s2, q), quad[i * 3 + 2], 1e-6);
+    }
+
+    // ---- (b) partition of unity, 1-D .. 4-D ----------------------------------
+    // Every sample carries the SAME value, so a normalised blend must return it at any
+    // query — including one far outside the samples' own extent.
+    const double kConst = 0.375;
+    for (int nd = 1; nd <= PAT_ND_MAX_DIM; ++nd) {
+        std::vector<double> flat;
+        // 2^nd samples on the unit cube's corners, all valued kConst.
+        for (int c = 0; c < (1 << nd); ++c) {
+            for (int a = 0; a < nd; ++a) flat.push_back(((c >> a) & 1) ? 1.0 : 0.0);
+            flat.push_back(kConst);
+        }
+        PatScatter s = add(nd, flat, 2.0);
+        const double qs[3][4] = {{0.5, 0.5, 0.5, 0.5}, {0.2, 0.7, 0.1, 0.9}, {7.0, -3.0, 5.0, 2.0}};
+        for (int k = 0; k < 3; ++k) {
+            char lbl[80]; std::snprintf(lbl, sizeof lbl, "%d-D partition of unity, q%d", nd, k);
+            ok &= chk(lbl, smp(s, qs[k]), kConst, 1e-9);
+        }
+    }
+
+    // ---- (c) symmetry: equidistant samples blend to the plain mean -----------
+    // Midpoint of the 2-D quad above: all four are equidistant, so the answer is the
+    // mean of the values regardless of the exponent.
+    const double quadMean = (0.10 + 0.90 + 0.40 + 0.70) / 4.0;
+    { double q[2] = {0.5, 0.5}; ok &= chk("2-D midpoint == mean (power 2)", smp(s2, q), quadMean, 1e-6); }
+    {
+        PatScatter s2p = add(2, quad, 6.0);
+        double q[2] = {0.5, 0.5};
+        ok &= chk("2-D midpoint == mean (power 6)", smp(s2p, q), quadMean, 1e-6);
+    }
+
+    // ---- (d) `power` sharpens, matching the closed-form two-sample weight -----
+    // Samples at 0 and 1 valued 0 and 1: at q the weights are q^-p and (1-q)^-p, so the
+    // result is (1-q)^p / (q^p + (1-q)^p) — an independent formula, not a re-derivation
+    // of the implementation.
+    const std::vector<double> pair = {0.0, 0.0,   1.0, 1.0};
+    const double q1 = 0.25;
+    for (double p : {1.0, 2.0, 3.0, 8.0}) {
+        PatScatter s1 = add(1, pair, p);
+        double q[1] = {q1};
+        const double wa = std::pow(q1, -p), wb = std::pow(1.0 - q1, -p);
+        const double want = wb / (wa + wb);          // value 0 at a, 1 at b
+        char lbl[80]; std::snprintf(lbl, sizeof lbl, "1-D two-sample, power %.0f", p);
+        ok &= chk(lbl, smp(s1, q), want, 1e-9);
+    }
+    // Sharper exponent must move the answer TOWARD the nearer sample (value 0 at 0.0).
+    {
+        PatScatter sSoft = add(1, pair, 1.0), sHard = add(1, pair, 8.0);
+        double q[1] = {q1};
+        if (!(smp(sHard, q) < smp(sSoft, q))) {
+            std::printf("[checkscatter] higher power did not sharpen toward the nearer sample  BAD\n");
+            ok = false;
+        }
+    }
+
+    // ---- (e) far field tends to the plain mean -------------------------------
+    // At a great distance every sample is essentially equidistant, so the blend
+    // flattens to the unweighted mean instead of diverging.
+    { double q[2] = {1e6, 1e6}; ok &= chk("far field -> mean", smp(s2, q), quadMean, 1e-4); }
+
+    // ---- (f) the `scatter:<name>(…)` compile + eval path ----------------------
+    // "pts" is the 2-D quad; "line" is the 1-D pair. Grid lookups must MISS: the two
+    // datatypes share the scope object but not the namespace.
+    struct Scope {
+        static int lookup(const void*, PatTableKind kind, const char* name, int* ndim) {
+            if (kind != PatTableKind::Scatter) return -1;
+            if (!std::strcmp(name, "pts"))  { if (ndim) *ndim = 2; return 0; }
+            if (!std::strcmp(name, "line")) { if (ndim) *ndim = 1; return 1; }
+            return -1;
+        }
+    };
+    PatTableScope scope; scope.self = nullptr; scope.lookup = &Scope::lookup;
+    PatScatter tables[2] = {s2, add(1, pair, 2.0)};
+
+    struct Case { const char* expr; double u, v; double want; };
+    const double wa = std::pow(0.25, -2.0), wb = std::pow(0.75, -2.0);
+    const Case cases[] = {
+        {"scatter:pts(0, 0)",              0.0,  0.0, 0.10},        // exact at a sample
+        {"scatter:pts(u, v)",              1.0,  1.0, 0.70},        // ... via variables
+        {"scatter:pts(0.5, 0.5)",          0.0,  0.0, quadMean},    // equidistant -> mean
+        {"scatter:line(0.25)",             0.0,  0.0, wb / (wa + wb)},
+        {"scatter:line(u) * 2",            0.25, 0.0, 2.0 * wb / (wa + wb)},
+        {"scatter:line(scatter:pts(0,0))", 0.0,  0.0,               // nested: pts(0,0) = 0.1
+             std::pow(0.1, -2.0) * 0.0 / (std::pow(0.1, -2.0) + std::pow(0.9, -2.0)) +
+             std::pow(0.9, -2.0) * 1.0 / (std::pow(0.1, -2.0) + std::pow(0.9, -2.0))},
+    };
+    for (const Case& cs : cases) {
+        std::vector<PatNode> prog; std::string perr;
+        if (!compilePatternExpr(cs.expr, prog, perr, false, nullptr, &scope)) {
+            std::printf("[checkscatter] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+            ok = false; continue;
+        }
+        PatCtx c;
+        c.u = cs.u; c.v = cs.v;
+        c.scatters = tables; c.nScatters = 2;
+        c.dataPool = pool.data(); c.dataPoolN = (int)pool.size();
+        char lbl[96]; std::snprintf(lbl, sizeof lbl, "expr %s", cs.expr);
+        ok &= chk(lbl, patternEval(prog.data(), (int)prog.size(), c), cs.want, 1e-6);
+    }
+    struct Bad { const char* expr; const char* why; };
+    const Bad bads[] = {
+        {"scatter:pts(u)",      "2-D scatter called with 1 argument"},
+        {"scatter:line(u, v)",  "1-D scatter called with 2 arguments"},
+        {"scatter:nope(u)",     "unknown scatter name"},
+        {"scatter:pts",         "scatter referenced without a call"},
+        {"scatter(u)",          "bare `scatter` with no name"},
+        {"grid:pts(u, v)",      "a scatter name is NOT visible in the grid namespace"},
+    };
+    for (const Bad& bd : bads) {
+        std::vector<PatNode> prog; std::string perr;
+        if (compilePatternExpr(bd.expr, prog, perr, false, nullptr, &scope)) {
+            std::printf("[checkscatter] `%s` compiled but should be rejected (%s)  BAD\n", bd.expr, bd.why);
+            ok = false;
+        }
+    }
+    // With no table scope at all (a load-time constant site), `scatter:` must be refused.
+    {
+        std::vector<PatNode> prog; std::string perr;
+        if (compilePatternExpr("scatter:pts(u, v)", prog, perr, false, nullptr, nullptr)) {
+            std::printf("[checkscatter] `scatter:pts(u,v)` compiled with no table scope  BAD\n");
+            ok = false;
+        }
+    }
+
+    std::printf("[checkscatter] worst absolute error = %.3g\n", worst);
+    std::printf("[checkscatter] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Deterministic self-test for NAMED-INPUT BINDING BY SUBSTITUTION (src/pattern.h;
+// ROADMAP_records.md §3.2/§3.3). No scene file and no renderer — it pins the algebraic
+// properties the whole material-application feature rests on:
+//   (a) substitution is a pure SPLICE — binding an input to an expression gives the same
+//       number as textually inlining that expression, for every input;
+//   (b) it is SIMULTANEOUS, not sequential: `(u=v, v=u)` swaps the two inputs instead of
+//       collapsing both onto one, which a naive left-to-right rewrite would get wrong;
+//   (c) it is IDENTITY when nothing is bound (the additive-superset guarantee: a material
+//       nobody applies must be bit-identical to before);
+//   (d) introspection agrees with the program — patternCollectVars finds exactly the
+//       inputs present, and varName/varOp round-trip;
+//   (e) `a` (albedo) parses only where a material can resolve it, and binding it to a
+//       constant is what turns a symbolic program into a concrete one.
+static int checkBind() {
+    using namespace pattern_detail;
+    bool ok = true;
+    auto chk = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkbind] %-52s BAD\n", what); ok = false; }
+    };
+    auto compile = [&](const char* src, std::vector<PatNode>& out, bool allowA) {
+        std::string e;
+        bool good = compilePatternExpr(src, out, e, /*allowT=*/false, nullptr, nullptr, allowA);
+        if (!good) std::printf("[checkbind] compile `%s` FAILED: %s\n", src, e.c_str());
+        return good;
+    };
+    // A context with distinct, non-degenerate values so an accidental swap is visible.
+    PatCtx c{};
+    c.x = 0.37; c.y = -0.81; c.z = 1.23; c.u = 0.19; c.v = 0.64;
+    c.nx = 0.0; c.ny = 1.0; c.nz = 0.0; c.r = 0.5; c.f = 0.25;
+    auto ev = [&](const std::vector<PatNode>& p) {
+        return patternEval(p.data(), (int)p.size(), c);
+    };
+
+    // (a) splice == textual inlining, for every bindable input.
+    struct { const char* var; const char* arg; } cases[] = {
+        {"u", "0.5*v+0.25"}, {"v", "x*2"},   {"x", "sin(u)"},
+        {"y", "z-1"},        {"z", "r*3"},   {"r", "abs(y)"},
+        {"f", "u*v"},        {"nx", "0.5"},  {"ny", "nz+1"}, {"nz", "0.125"},
+    };
+    for (auto& cs : cases) {
+        std::string body = std::string("2.0*") + cs.var + " + sin(" + cs.var + ") + 1.5";
+        std::string inl  = std::string("2.0*(") + cs.arg + ") + sin(" + cs.arg + ") + 1.5";
+        std::vector<PatNode> prog, want, arg;
+        if (!compile(body.c_str(), prog, false) || !compile(inl.c_str(), want, false) ||
+            !compile(cs.arg, arg, false)) { ok = false; continue; }
+        PatOp var;
+        chk("varOp resolves the input name", varOp(cs.var, var));
+        chk("varName round-trips", varName(var) && !std::strcmp(varName(var), cs.var));
+        std::vector<PatBind> b{{var, arg}};
+        double got = ev(patternSubstitute(prog, b)), wanted = ev(want);
+        if (std::fabs(got - wanted) > 1e-12) {
+            std::printf("[checkbind] bind %-3s <- %-12s got %.12g want %.12g  BAD\n",
+                        cs.var, cs.arg, got, wanted);
+            ok = false;
+        }
+    }
+
+    // (b) SIMULTANEOUS: `u*10 + v` with (u=v, v=u) must become `v*10 + u`, NOT `u*10+u`
+    //     (sequential rewriting) and NOT `v*10+v`.
+    {
+        std::vector<PatNode> prog, swapped, uOnly, vOnly, au, av;
+        if (compile("u*10 + v", prog, false) && compile("v*10 + u", swapped, false) &&
+            compile("u*10 + u", uOnly, false) && compile("v*10 + v", vOnly, false) &&
+            compile("u", au, false) && compile("v", av, false)) {
+            std::vector<PatBind> b{{PatOp::VarU, av}, {PatOp::VarV, au}};
+            double got = ev(patternSubstitute(prog, b));
+            chk("simultaneous bind swaps u and v", std::fabs(got - ev(swapped)) < 1e-12);
+            chk("swap is not a sequential u-collapse", std::fabs(got - ev(uOnly)) > 1e-9);
+            chk("swap is not a sequential v-collapse", std::fabs(got - ev(vOnly)) > 1e-9);
+        } else ok = false;
+    }
+
+    // (c) identity when nothing binds — same nodes, not merely the same value.
+    {
+        std::vector<PatNode> prog, arg;
+        if (compile("u*2 + sin(v)", prog, false) && compile("9.0", arg, false)) {
+            std::vector<PatBind> none;
+            std::vector<PatBind> unrelated{{PatOp::VarZ, arg}};   // z does not appear
+            auto a = patternSubstitute(prog, none), b2 = patternSubstitute(prog, unrelated);
+            chk("empty bind list is identity", a.size() == prog.size());
+            chk("binding an absent input is identity", b2.size() == prog.size());
+            chk("identity preserves the value", std::fabs(ev(b2) - ev(prog)) < 1e-15);
+        } else ok = false;
+    }
+
+    // (d) introspection matches the program.
+    {
+        std::vector<PatNode> prog;
+        if (compile("u*v + u - 3", prog, false)) {
+            std::vector<PatOp> vars;
+            patternCollectVars(prog, vars);
+            chk("collectVars finds exactly {u, v}", vars.size() == 2);
+            chk("collectVars is in order of first use",
+                vars.size() == 2 && vars[0] == PatOp::VarU && vars[1] == PatOp::VarV);
+            chk("collectVars dedupes a repeated input", !vars.empty() && vars[0] == PatOp::VarU);
+            chk("usesVar agrees (present)", patternUsesVar(prog, PatOp::VarU));
+            chk("usesVar agrees (absent)",  !patternUsesVar(prog, PatOp::VarZ));
+        } else ok = false;
+    }
+
+    // (e) `a` is scoped, and binding it to a constant concretises the program.
+    {
+        std::vector<PatNode> prog, unusedProg;
+        std::string e;
+        chk("`a` is rejected where no material can resolve it",
+            !compilePatternExpr("0.5*a", unusedProg, e, false, nullptr, nullptr, /*allowA=*/false));
+        if (compile("0.5*a", prog, /*allowA=*/true)) {
+            std::vector<PatOp> vars;
+            patternCollectVars(prog, vars);
+            chk("`a` shows up as a free input", vars.size() == 1 && vars[0] == PatOp::VarA);
+            PatNode k; k.op = PatOp::Const; k.a = 0.8;
+            std::vector<PatBind> b{{PatOp::VarA, {k}}};
+            auto bound = patternSubstitute(prog, b);
+            std::vector<PatOp> after;
+            patternCollectVars(bound, after);
+            chk("binding `a` leaves no free inputs", after.empty());
+            chk("bound `a` evaluates to 0.5*0.8", std::fabs(ev(bound) - 0.4) < 1e-12);
+        } else ok = false;
+    }
+
+    std::printf("[checkbind] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Deterministic self-test for PER-PROPERTY ACCESS (`MATERIAL.slot` / `MATERIAL.slot(args)`;
+// ROADMAP_records.md §3.2). Unlike checkBind, which is pure algebra over pattern programs,
+// this one has to run the LOADER — the whole point of the feature is that a value site
+// resolves a reference to another material's slot, so the property under test is a property
+// of loading, not of substitution. Scenes are built in memory and compared against
+// hand-written TWINS, so every assert is "the reference produced exactly what writing it out
+// by hand produces" rather than a hard-coded number that could drift with the defaults.
+static int checkProp() {
+    bool ok = true;
+    auto chk = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkprop] %-56s BAD\n", what); ok = false; }
+    };
+    // Load a scene fragment. Every fragment gets the same trivial camera + light so the
+    // loader's renderability checks are satisfied; only the materials differ.
+    auto loadMats = [&](const char* body, ftsl::Loaded& L) -> bool {
+        std::string src =
+            "scene { units meters }\n"
+            + std::string(body) + "\n"
+            "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+            "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+        std::string e;
+        if (!ftsl::loadSource(src, "<checkprop>", L, e)) {
+            std::printf("[checkprop] load FAILED: %s\n", e.c_str());
+            return false;
+        }
+        return true;
+    };
+    // A scene that must NOT load, and whose error must mention `needle`.
+    auto mustReject = [&](const char* what, const char* body, const char* needle) {
+        ftsl::Loaded L;
+        std::string src =
+            "scene { units meters }\n" + std::string(body) + "\n"
+            "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+            "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+        std::string e;
+        bool loaded = ftsl::loadSource(src, "<checkprop>", L, e);
+        if (loaded)                                   { chk(what, false); return; }
+        if (e.find(needle) == std::string::npos) {
+            std::printf("[checkprop] %-56s BAD (error was: %s)\n", what, e.c_str());
+            ok = false;
+        }
+    };
+    // Find a material by name is not possible post-load (names are not kept on Material),
+    // so the fragments below always put the material under test LAST among the declared
+    // ones and reach it through the probe. Instead of guessing indices, compare the two
+    // scenes' probe materials: `probe` is always the material the quad uses.
+    auto probeOf = [&](ftsl::Loaded& L) -> const Material& {
+        // The quad's two triangles carry the resolved material index.
+        int mi = L.scene.tris.empty() ? 0 : L.scene.tris[0].matId;
+        return L.scene.mats[mi];
+    };
+    // Evaluate a material's reflect slot as (base spectrum at 550nm) * (pattern at ctx).
+    PatCtx c{};
+    c.x = 0.37; c.y = -0.81; c.z = 1.23; c.u = 0.19; c.v = 0.64;
+    c.nx = 0.0; c.ny = 1.0; c.nz = 0.0; c.r = 0.5; c.f = 0.25;
+    auto reflectAt = [&](ftsl::Loaded& L, const Material& m) {
+        double base = m.reflect(550.0);
+        if (m.reflectPat >= 0 && m.reflectPat < (int)L.scene.patterns.size()) {
+            const auto& p = L.scene.patterns[m.reflectPat].nodes;
+            base *= patternEval(p.data(), (int)p.size(), c);
+        }
+        return base;
+    };
+    // The core assert shape: two scenes whose probe materials must be indistinguishable.
+    auto sameReflect = [&](const char* what, const char* refBody, const char* twinBody) {
+        ftsl::Loaded A, B;
+        if (!loadMats(refBody, A) || !loadMats(twinBody, B)) { chk(what, false); return; }
+        double a = reflectAt(A, probeOf(A)), b = reflectAt(B, probeOf(B));
+        if (std::fabs(a - b) > 1e-12) {
+            std::printf("[checkprop] %-56s BAD (%.12g vs %.12g)\n", what, a, b);
+            ok = false;
+        }
+    };
+
+    // (a) A bare reference reproduces the source slot — BOTH halves of it, the flat-1.0
+    //     base a lone `pattern:` leaves behind AND the pattern itself.
+    sameReflect("bare ref reproduces a pattern-driven reflect slot",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect }",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:p }");
+
+    // (b) A reference to a plain-spectrum slot carries the spectrum and no pattern.
+    sameReflect("bare ref reproduces a constant reflect slot",
+        "material \"src\" { type diffuse  reflect 0.37 }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect }",
+        "material \"probe\" { type diffuse  reflect 0.37 }");
+
+    // (c) Rebinding inside the reference is the SAME machinery §3.3 uses at a use site:
+    //     `src.reflect(u=v)` must equal a hand-written program with u replaced by v.
+    sameReflect("ref rebinding u=v == the hand-written twin",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(u=v) }",
+        "pattern \"q\" { expr \"0.05+0.9*v\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:q }");
+
+    // (d) An unbound `a` resolves against the SOURCE material's albedo_default, not the
+    //     consumer's and not the system 1.0 — the reference does not change whose default
+    //     applies. Twin: the same program with `a` written out as the source's 0.4.
+    sameReflect("unbound `a` falls back to the SOURCE albedo_default",
+        "pattern \"p\" { expr \"a*(0.05+0.9*u)\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p  albedo_default 0.4 }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect }",
+        "pattern \"q\" { expr \"0.4*(0.05+0.9*u)\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:q }");
+    sameReflect("`a` bound at the reference overrides that default",
+        "pattern \"p\" { expr \"a*(0.05+0.9*u)\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p  albedo_default 0.4 }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=1) }",
+        "pattern \"q\" { expr \"1*(0.05+0.9*u)\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:q }");
+
+    // (e) A reference COMPOSES with the consumer's own `_map` instead of clobbering it.
+    //     Both spellings mean "a per-hit multiplier on the slot", so the answer is their
+    //     product — the case a naive assignment would silently get wrong in one direction
+    //     or the other depending on statement order.
+    sameReflect("ref composes with the consumer's own reflect_map",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "pattern \"h\" { expr \"0.5\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect  reflect_map pattern:h }",
+        "pattern \"q\" { expr \"(0.05+0.9*u)*0.5\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:q }");
+
+    // (f) Cross-slot references are legal as long as the TYPE matches: transmit is a
+    //     spectral slot like reflect, so reading one into the other is fine.
+    sameReflect("cross-slot spectral ref (transmit -> reflect)",
+        "material \"src\" { type translucent  reflect 0.1  transmit 0.62 }\n"
+        "material \"probe\" { type diffuse  reflect src.transmit }",
+        "material \"probe\" { type diffuse  reflect 0.62 }");
+
+    // (g) Scalar properties, read back through the scalar ladder
+    //     (bindScalarPattern -> bindScalarTexture -> dblParam).
+    {
+        ftsl::Loaded A, B;
+        if (loadMats("material \"src\" { type glossy  reflect 0.6  roughness 0.35 }\n"
+                     "material \"probe\" { type glossy  reflect 0.6  roughness src.roughness }", A) &&
+            loadMats("material \"probe\" { type glossy  reflect 0.6  roughness 0.35 }", B)) {
+            chk("scalar property read back == the authored literal",
+                std::fabs(probeOf(A).roughness - probeOf(B).roughness) < 1e-12);
+        } else ok = false;
+    }
+    {
+        ftsl::Loaded A;
+        if (loadMats("material \"src\" { type thinfilm  film_ior 1.42  film_thickness 275 }\n"
+                     "material \"probe\" { type thinfilm  film_ior src.film_ior  "
+                     "film_thickness src.film_thickness }", A)) {
+            chk("film_ior read back", std::fabs(probeOf(A).filmIor - 1.42) < 1e-12);
+            chk("film_thickness read back", std::fabs(probeOf(A).filmThickness - 275.0) < 1e-12);
+        } else ok = false;
+    }
+    // A pattern-driven scalar property carries its pattern through the reference.
+    {
+        ftsl::Loaded A, B;
+        if (loadMats("pattern \"p\" { expr \"0.2+0.5*u\" }\n"
+                     "material \"src\" { type glossy  reflect 0.6  roughness pattern:p }\n"
+                     "material \"probe\" { type glossy  reflect 0.6  roughness src.roughness }", A) &&
+            loadMats("pattern \"p\" { expr \"0.2+0.5*u\" }\n"
+                     "material \"probe\" { type glossy  reflect 0.6  roughness pattern:p }", B)) {
+            const Material& ma = probeOf(A);
+            const Material& mb = probeOf(B);
+            chk("pattern-driven scalar property keeps its pattern",
+                ma.roughnessPat >= 0 && mb.roughnessPat >= 0);
+            if (ma.roughnessPat >= 0 && mb.roughnessPat >= 0) {
+                const auto& pa = A.scene.patterns[ma.roughnessPat].nodes;
+                const auto& pb = B.scene.patterns[mb.roughnessPat].nodes;
+                chk("...and evaluates identically",
+                    std::fabs(patternEval(pa.data(), (int)pa.size(), c) -
+                              patternEval(pb.data(), (int)pb.size(), c)) < 1e-12);
+            }
+        } else ok = false;
+    }
+
+    // (h) A no-op reference is SHARED, not duplicated: `src.reflect` written twice must
+    //     not grow the material table, since applyMaterial memoises on (material, args).
+    {
+        ftsl::Loaded A, B;
+        if (loadMats("pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+                     "material \"src\" { type diffuse  reflect pattern:p }\n"
+                     "material \"probe\" { type diffuse  reflect src.reflect(u=v) }\n"
+                     "material \"probe2\" { type diffuse  reflect src.reflect(u=v) }", A) &&
+            loadMats("pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+                     "material \"src\" { type diffuse  reflect pattern:p }\n"
+                     "material \"probe\" { type diffuse  reflect src.reflect(u=v) }", B)) {
+            // One extra declared material, but the APPLIED material and its substituted
+            // pattern are shared, so the pattern table must be the same size.
+            chk("identical references share one applied material + pattern",
+                A.scene.patterns.size() == B.scene.patterns.size() &&
+                A.scene.mats.size() == B.scene.mats.size() + 1);
+        } else ok = false;
+    }
+
+    // (i) The type system is real, in both directions, and unknown properties are named.
+    mustReject("a scalar property is refused at a spectral slot",
+        "material \"src\" { type glossy  reflect 0.6  roughness 0.35 }\n"
+        "material \"probe\" { type diffuse  reflect src.roughness }", "scalar property");
+    mustReject("a spectral property is refused at a scalar slot",
+        "material \"src\" { type diffuse  reflect 0.6 }\n"
+        "material \"probe\" { type glossy  reflect 0.6  roughness src.reflect }",
+        "spectral property");
+    mustReject("an unknown property names the material and lists the slots",
+        "material \"src\" { type diffuse  reflect 0.6 }\n"
+        "material \"probe\" { type diffuse  reflect src.colour }", "has no property");
+    // A pattern-carrying source at a slot that cannot apply one is refused, not flattened.
+    mustReject("a pattern-carrying property is refused where it cannot be applied",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p }\n"
+        "material \"probe\" { type dielectric  ior src.reflect }", "per-hit pattern");
+    // An unbalanced argument list is an error rather than a run-on, which is the whole
+    // point of lexing the group BALANCED (see the v0.88.0 grammar change).
+    mustReject("an unbalanced argument list is an error, not a silent run-on",
+        "material \"src\" { type diffuse  reflect 0.6 }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=1 }", "unbalanced");
+    // A texture-bound slot is an IMAGE sampled at the hit UV; a property reference carries
+    // a spectrum plus a per-hit pattern and has nowhere to put a texture binding. Refusing
+    // it beats handing the consumer the fallback constant, which looks like it worked.
+    mustReject("a texture-bound property is refused rather than flattened",
+        "texture \"t\" { file scenes/graychecker.ppm  encoding linear }\n"
+        "material \"src\" { type diffuse  reflect texture:t }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect }", "bound to a texture");
+    // A material application error inside the reference surfaces as itself, not swallowed.
+    mustReject("a bad rebinding inside a reference reports the binding error",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(bogus=1) }",
+        "not a bindable input");
+
+    // (j) Records keep priority over materials on a name clash, so an existing scene's
+    //     `R.chan` cannot change meaning just because a material was named `R`.
+    {
+        ftsl::Loaded A;
+        if (loadMats("R = range 0-1 [\n  k  0.2 0.8\n]\n"
+                     "material \"R\" { type diffuse  reflect 0.9 }\n"
+                     "material \"probe\" { type glossy  reflect 0.6  roughness R.k(0.0) }", A)) {
+            chk("a record wins a name clash with a material",
+                std::fabs(probeOf(A).roughness - 0.2) < 1e-9);
+        } else ok = false;
+    }
+
+    std::printf("[checkprop] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Deterministic distant-sun self-test (EmitterShape::Sun; src/scene.h addSunLight /
+// sampleCone / inCone / geomWeight). No scene file, no renderer, no RNG-seeded image —
+// it pins the four invariants the emitter's correctness rests on:
+//   (a) the shared spot field reuse really does produce the cone solid angle:
+//       spotOmega == 2*PI*(1 - cos theta) for every authored `angle`;
+//   (b) EXPOSURE INVARIANCE — the authored `spd` is perpendicular irradiance, so the
+//       stored radiance times the solid angle must reproduce it exactly, independent of
+//       the angular diameter. This is the property that lets you widen `angle` to soften
+//       a penumbra without re-grading the shot;
+//   (c) sampleCone is uniform in SOLID ANGLE about its axis — every direction lands
+//       inside the cone, the mean cosine matches (1+cos theta)/2, and the fraction inside
+//       an inner sub-cone matches its solid-angle share. Forward emission (axis = beamDir)
+//       and NEE (axis = -beamDir) both consume this, so a bias here breaks the B/R match;
+//   (d) inCone agrees with sampleCone (every sampled NEE direction reads back as ON the
+//       disc, and a direction just outside the rim reads back as off it) — the direct-view
+//       miss term and the NEE estimator must see the same disc or the split double-counts.
+static int checkSun() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checksun] %-42s got %.9f want %.9f  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+
+    // A flat unit "irradiance" spectrum makes the radiometry checks read directly:
+    // stored radiance must come back as 1/Omega at every wavelength.
+    Spectrum flat = [](double) { return 1.0; };
+    const double toSun[3][3] = {{0.0, 1.0, 0.0}, {0.6, 0.5, 0.3}, {-0.2, 0.05, -1.0}};
+    const double diamDeg[] = {0.53, 2.0, 8.0, 45.0, 120.0};
+
+    for (int a = 0; a < 3; ++a) {
+        for (double dd : diamDeg) {
+            Scene sc;
+            const double theta = 0.5 * dd * PI / 180.0;
+            Vec3 aim = normalize(Vec3{toSun[a][0], toSun[a][1], toSun[a][2]});
+            sc.addSunLight(aim, theta, flat, 1.0);
+            const Emitter& e = sc.emitters.back();
+            char lbl[96];
+
+            // (a) the spot-field reuse must land exactly on the cone solid angle.
+            const double omega = 2.0 * PI * (1.0 - std::cos(theta));
+            std::snprintf(lbl, sizeof lbl, "spotOmega == cone SA (%.2f deg)", dd);
+            ok &= chk(lbl, e.spotOmega, omega, 1e-12);
+
+            // beamDir is the TRAVEL direction: exactly opposite the authored aim.
+            std::snprintf(lbl, sizeof lbl, "beamDir == -toSun (%.2f deg)", dd);
+            ok &= chk(lbl, dot(e.beamDir, aim), -1.0, 1e-12);
+
+            // (b) radiance * Omega == the authored perpendicular irradiance, at any
+            // angular diameter. This is the exposure-invariance guarantee.
+            for (double lam : {380.0, 550.0, 780.0}) {
+                std::snprintf(lbl, sizeof lbl, "L*Omega == E_perp @%.0fnm (%.2f deg)", lam, dd);
+                ok &= chk(lbl, e.spdFn(lam) * e.spotOmega, 1.0, 1e-12);
+            }
+
+            // (c) sampleCone: uniform in solid angle about BOTH the forward axis
+            // (beamDir) and the NEE axis (-beamDir). Stratified u1/u2 over the unit
+            // square, so this is deterministic — no RNG, no flaky tolerance.
+            const int NS = 200;                       // 200x200 = 40000 strata
+            const double ci = std::cos(theta);
+            const double inner = 0.5 * (1.0 + ci);    // an inner sub-cone: cos = midpoint
+            for (int side = 0; side < 2; ++side) {
+                Vec3 axis = (side == 0) ? e.beamDir : e.beamDir * -1.0;
+                double sumCos = 0.0; long long nIn = 0, nInner = 0, nOnDisc = 0;
+                for (int i = 0; i < NS; ++i)
+                    for (int j = 0; j < NS; ++j) {
+                        double u1 = (i + 0.5) / NS, u2 = (j + 0.5) / NS;
+                        Vec3 d = sc.emitters.back().sampleCone(axis, u1, u2);
+                        double c = dot(d, axis);
+                        sumCos += c;
+                        if (c >= ci - 1e-12) ++nIn;
+                        if (c >= inner - 1e-12) ++nInner;
+                        // (d) a NEE draw (axis = -beamDir, so `d` already points TOWARD
+                        // the sun — the same sense as an escaping camera ray) must read
+                        // back as ON the disc.
+                        if (side == 1 && sc.emitters.back().inCone(d)) ++nOnDisc;
+                        // unit length is what makes every cosine above meaningful
+                        if (std::fabs(length(d) - 1.0) > 1e-9) ok = false;
+                    }
+                const double N = (double)NS * NS;
+                const char* wh = (side == 0) ? "fwd" : "nee";
+                std::snprintf(lbl, sizeof lbl, "%s: all draws inside cone (%.2f deg)", wh, dd);
+                ok &= chk(lbl, (double)nIn / N, 1.0, 1e-12);
+                // Uniform-in-solid-angle => cos is uniform on [cos theta, 1].
+                std::snprintf(lbl, sizeof lbl, "%s: mean cos == (1+cos)/2 (%.2f deg)", wh, dd);
+                ok &= chk(lbl, sumCos / N, 0.5 * (1.0 + ci), 1e-3);
+                // ...so the inner sub-cone's share is its solid-angle share, = 1/2 here.
+                std::snprintf(lbl, sizeof lbl, "%s: inner sub-cone share (%.2f deg)", wh, dd);
+                ok &= chk(lbl, (double)nInner / N, 0.5, 2e-3);
+                if (side == 1) {
+                    std::snprintf(lbl, sizeof lbl, "nee draw reads back inCone (%.2f deg)", dd);
+                    ok &= chk(lbl, (double)nOnDisc / N, 1.0, 1e-12);
+                }
+            }
+
+            // (d) the rim is where the direct-view term and NEE must agree. A direction
+            // a hair INSIDE the rim is on the disc; a hair outside is not.
+            {
+                Vec3 t, b; onb(aim, t, b);
+                for (double eps : {-1e-4, 1e-4}) {
+                    double th = theta + eps;
+                    Vec3 look = aim * std::cos(th) + t * std::sin(th);   // ray TOWARD the sun
+                    bool want = (eps < 0.0);
+                    if (sc.emitters.back().inCone(look) != want) {
+                        std::printf("[checksun] rim test failed at %.2f deg, eps=%+.0e  BAD\n", dd, eps);
+                        ok = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // A degenerate scene bound must not make the emitter's power NaN/inf: geomWeight
+    // is Omega*PI*R^2 and is only filled by build(), so an unbuilt emitter reads 0.
+    {
+        Scene sc;
+        sc.addSunLight(Vec3{0, 1, 0}, 0.5 * 0.53 * PI / 180.0, flat, 1.0);
+        ok &= chk("unbuilt sun geomWeight == 0", sc.emitters.back().geomWeight(), 0.0, 0.0);
+    }
+
+    std::printf("[checksun] worst absolute error = %.3g\n", worst);
+    std::printf("[checksun] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
 }
 
 // The film accumulates radiance in an arbitrary (non-absolute) radiometric scale
@@ -1057,6 +2035,35 @@ static int g_previewRows = 0;   // terminal lines the last preview occupied (for
 // radius = smoother but blurrier estimate.
 static double g_pmRadiusAbs = 0.0;
 static double g_pmRadiusFactor = 0.02;
+
+// Density-adaptive gather radius (mode M). ON by default: the radius above is only a
+// starting point, and PhotonMap::buildAuto measures how many photons a typical gather
+// actually sees and rescales the radius so that population lands on
+// `g_pmAutoCount * cbrt(stored/1e6)`. Without this the radius is independent of `-n`, so
+// photons-per-cell — and gather time — grows linearly with the photon count and mode M
+// gets *slower per sample* the more photons you ask for (see known-issues.md). The target
+// grows sublinearly on purpose so that noise AND bias both still converge; see the long
+// note on PhotonMap::buildAuto for the exponent argument.
+//
+// An explicit `-pmradius <r>` means "use exactly this radius" and turns the adaptation off
+// (that was the documented workaround for the scaling problem, so it must keep working);
+// `-pmauto` forces it back on, `-nopmauto` off, `-pmcount <k>` sets the target and implies on.
+static bool   g_pmAutoRadius = true;
+static double g_pmAutoCount  = 200.0;   // calibrated to today's look — see PhotonMap::buildAuto
+
+// Bin a freshly-deposited (or freshly-loaded) photon map, honouring the adaptive-radius
+// setting, and say out loud what radius it settled on — the radius printed before the
+// deposit is only the starting point, and a silently-different one would be baffling when
+// comparing renders. Returns the radius actually used.
+static double buildPhotonMap(PhotonMap& pm, double radius, const char* tag) {
+    if (!g_pmAutoRadius) { pm.build(radius); return radius; }
+    double nProbe = 0.0, kTarget = 0.0;
+    const double r = pm.buildAuto(radius, g_pmAutoCount, &nProbe, &kTarget);
+    std::printf("%s adaptive gather radius: %.4g -> %.4g (a typical gather saw %.0f photons "
+                "at the starting radius; target %.0f for %zu stored)\n",
+                tag, radius, r, nProbe, kTarget, pm.photons.size());
+    return r;
+}
 
 // Mode-M final gather (CLI -pmfg <K>). 0 = off: read the density estimate directly at the
 // visible point (fast, but the estimate's blur softens contact shadows / fine detail right
@@ -1214,13 +2221,24 @@ static void thinFilmSwatch(double n1, double n2) {
 // surfaces; this pass supplies the *direct view* of the sky behind the geometry.
 // No-op unless the scene has an env light. Silhouette pixels are classified by the
 // pixel center (a sub-pixel edge approximation, like mode P's classifier).
+// A distant `sun` light is handled here too: a forward photon fired into the solar
+// cone never travels *toward* the camera (the disc is at infinity), so the direct
+// view of the solar disc — like the sky behind the geometry — is a pure camera-ray
+// term. `sunXYZForDir` returns 0 outside every sun's cone, so this costs nothing
+// for a scene without one.
 static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
-    if (scene.envIndex < 0) return;
+    const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
+    if (!haveEnv && !haveSun) return;
     for (int py = 0; py < film.resY; ++py)
         for (int px = 0; px < film.resX; ++px) {
             Ray r = cam.genRay(px, py, 0.5, 0.5);
             Hit h = scene.closestHit(r);
-            if (!h.valid) film.add(px, py, scene.envXYZForDir(r.d) * (double)N);
+            if (!h.valid) {
+                Vec3 bg{0, 0, 0};
+                if (haveEnv) bg += scene.envXYZForDir(r.d);
+                if (haveSun) bg += scene.sunXYZForDir(r.d);
+                film.add(px, py, bg * (double)N);
+            }
         }
 }
 
@@ -1387,6 +2405,7 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY
     std::vector<Film> camBands(nThreads), splatBands(nThreads);
     auto worker = [&](int tid) {
         bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;
+        br.heroC = g_heroC;   // renderRows applies the media/GRIN/lens gate itself
         Film& cf = camBands[tid]; cf.resX = resX; cf.resY = resY; cf.alloc();
         Film& sf = splatBands[tid]; sf.resX = resX; sf.resY = resY; sf.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
@@ -1663,6 +2682,18 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
 
 static std::string checkpointPath(const std::string& outPath) { return outPath + ".ftbuf"; }
 
+// "png/foo.png" + "_forward" -> "png/foo_forward.png". Inserts a suffix before the
+// extension, keeping the directory (so a companion image lands next to -o rather than in
+// the CWD) and the format (writeImage dispatches on the extension). No extension, or a
+// dot that belongs to a directory component, appends instead.
+static std::string pathWithSuffix(const std::string& path, const char* suffix) {
+    size_t dot = path.find_last_of('.');
+    size_t sep = path.find_last_of("/\\");
+    if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
+        return path + suffix;
+    return path.substr(0, dot) + suffix + path.substr(dot);
+}
+
 static bool writeCheckpoint(const std::string& outPath, const Checkpoint& c,
                             uint64_t guard, char mode) {
     std::ofstream o(checkpointPath(outPath), std::ios::binary);
@@ -1928,8 +2959,9 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
         if (matUsed[i] && scene.mats[i].type == MatType::Layered)
             return "layered materials";
     for (const auto& em : scene.emitters)
-        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
-            return "spot / environment / collimated lights";
+        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
+            em.shape == EmitterShape::Sun || em.collimated)
+            return "spot / environment / sun / collimated lights";
     return nullptr;
 }
 
@@ -2300,7 +3332,7 @@ static int runCompositeProgressive(
                 SppProgress bp; bp.sampleBase = acc.spp;   // mixes into the device seed
                 bp.report = [](const Film&, long long, bool) { return false; };
                 r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp,
-                                       g_maxBounceOverride, g_directOnly);
+                                       g_maxBounceOverride, g_directOnly, g_heroC);
             } else
 #endif
                 r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
@@ -2487,9 +3519,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (!cudaBdptSupported(scene)) {
                 const char* why = "scene has a BDPT-GPU-unsupported feature "
                                   "(fluorescent/oversized-mix material, fog, "
-                                  "spot/env/collimated light, or a per-hit BSDF the GPU "
-                                  "BDPT can't MIS: a procedural pattern or frosted/colored "
-                                  "glass)";
+                                  "spot/env/collimated light, an `emit pattern:` emission "
+                                  "profile, or a per-hit BSDF the GPU BDPT can't MIS: a "
+                                  "procedural pattern or frosted/colored glass)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -2506,8 +3538,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // light (M1). Collimated beams still fall back to the CPU backward tracer.
             if (!cudaBackwardSupported(scene, cam)) {
                 const char* why = "scene has a backward-GPU-unsupported feature "
-                                  "(collimated light, or a lens deeper than the "
-                                  "device cap)";
+                                  "(collimated light, an `emit pattern:` emission "
+                                  "profile, or a lens deeper than the device cap)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -2527,8 +3559,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             }
         } else if (!cudaForwardSupported(scene)) {
             const char* why = "GPU-unsupported feature (layered material, indexed "
-                              "palette, parametric record, or oversized multilayer/mix "
-                              "material)";
+                              "palette, parametric record, oversized multilayer/mix "
+                              "material, or an emissive 'fire' volume)";
             if (wantGpu) std::fprintf(stderr, "[device] scene has a %s; using CPU\n", why);
             else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else {
@@ -2591,7 +3623,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (rgbFast)      return renderBackwardRGBCuda(scene, cam, res, resY, sppTarget, diffraction, p,
                                                            g_maxBounceOverride, g_directOnly);
             if (gpuBackward)  return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p,
-                                                        g_maxBounceOverride, g_directOnly);
+                                                        g_maxBounceOverride, g_directOnly, g_heroC);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -2628,8 +3660,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     e.absorbed / e.emitted, e.sensor / e.emitted, e.escaped / e.emitted,
                     e.residual / e.emitted, tot / e.emitted);
         compareFilms(fwd, N, ref, spp);
-        writeFilm("validate_forward.ppm", fwd, (double)N);
-        writeFilm("validate_backward.ppm", ref, (double)spp);
+        // Mode V produces a PAIR of images (the two independent estimates), so it derives
+        // `<out>_forward` / `<out>_backward` from -o instead of writing one -o file. It
+        // used to hard-code `validate_forward.ppm` / `validate_backward.ppm` in the CWD,
+        // which ignored -o entirely and scattered output into the repo root.
+        const std::string vFwd = pathWithSuffix(outPath, "_forward");
+        const std::string vBk  = pathWithSuffix(outPath, "_backward");
+        writeFilm(vFwd.c_str(), fwd, (double)N);
+        writeFilm(vBk.c_str(),  ref, (double)spp);
         return 0;
     }
 
@@ -2651,7 +3689,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // through the same unified progress driver as the forward and mode-R renders.
         auto renderChunked = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
-            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth, diffraction, p);
+            // g_heroC > 1 enables the hero-wavelength bundle on both subpaths; the kernel
+            // applies the media/GRIN/lens gate itself (matching the CPU BdptRenderer).
+            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth, diffraction, p, g_heroC);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -2687,7 +3727,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
         tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC);
-        pm.build(radius);
+        radius = buildPhotonMap(pm, radius, "mode M:");
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %.1fs; "
                     "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
@@ -2799,6 +3839,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         int maxDepth = 8;   // full path length in edges
         double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                           : scene.sceneRadius * g_pmRadiusFactor;
+        // Hero-wavelength bundle (Wilkie 2014). Mode U's scene scope already excludes
+        // everything the hero gate would reject — vcmUnsupportedFeature refuses media,
+        // GRIN and lens cameras — so `-heroc N > 1` is the whole condition. CPU only for
+        // now; the GPU session below is still the single-wavelength estimator.
+        const int vcmHeroC = g_heroC;
 #ifdef HAVE_CUDA
         // GPU VCM (M12): resident device session mirroring vcm.h's vcmPass. Each pass traces
         // one light + one camera subpath per pixel, combining BDPT vertex connections with
@@ -2811,11 +3856,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const bool wantAuto = !std::strcmp(device, "auto");
             if ((wantGpu || wantAuto) && !cam.hasLens() &&
                 cudaAvailable() && cudaVcmSupported(scene)) {
-                VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxDepth);
+                VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxDepth,
+                                                   vcmHeroC);
                 if (sess) {
                     std::printf("mode U: VCM/UPS on %s — connections + merging, R0=%.4g, "
-                                "alpha=%.2f at %dx%d (maxDepth=%d, light=%s) ...\n",
-                                cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxDepth, lightLabel);
+                                "alpha=%.2f at %dx%d (maxDepth=%d, light=%s, %s) ...\n",
+                                cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxDepth, lightLabel,
+                                vcmHeroC > 1
+                                    ? (std::string("hero C=") + std::to_string(vcmHeroC)).c_str()
+                                    : "single-lambda");
                     auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
                         Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
                         for (long long pass = 0; pass < passTarget; ++pass) {
@@ -2847,8 +3896,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         }
 #endif
         std::printf("mode U: VCM/UPS — connections + merging, R0=%.4g, alpha=%.2f at %dx%d on "
-                    "%d CPU threads (maxDepth=%d, light=%s) ...\n",
-                    R0, g_vcmAlpha, res, resY, nThreads, maxDepth, lightLabel);
+                    "%d CPU threads (maxDepth=%d, light=%s, %s) ...\n",
+                    R0, g_vcmAlpha, res, resY, nThreads, maxDepth, lightLabel,
+                    vcmHeroC > 1 ? (std::string("hero C=") + std::to_string(vcmHeroC)).c_str()
+                                 : "single-lambda");
         vcm::VcmState st; st.init(res, resY);
         auto renderChunked = [&](long long passTarget, const SppProgress* p) -> Film {
             Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
@@ -2858,7 +3909,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 double radius = R0 * std::pow(it, 0.5 * (g_vcmAlpha - 1.0));
                 if (radius <= 0.0) radius = R0;
                 vcm::vcmPass(scene, cam, st, radius, nThreads, diffraction, maxDepth,
-                             (uint64_t)(st.passes + 1));
+                             (uint64_t)(st.passes + 1), vcmHeroC);
                 disp = vcm::vcmResolve(st);
                 for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
                 if (p->report(disp, st.passes, st.passes >= passTarget)) break;
@@ -3441,6 +4492,10 @@ static void printHelp(const char* prog) {
 "  -device auto|cpu|gpu  compute device (default: auto); -wavefront = streaming GPU backend\n"
 "  -rgb                  mode R fast RGB (non-spectral) backward preview on the GPU (much\n"
 "                        faster; drops dispersion/thin-film/fluorescence — Option B)\n"
+"  -heroc <N>            hero-wavelength bundle size, 1..8 (default 4); 1 = single-λ, hero off\n"
+"  -herosplit            at a dispersive interface fan the bundle into N monochromatic\n"
+"                        sub-paths (crisp prism/rainbow caustics) instead of de-hero'ing;\n"
+"                        costs ~N× traversal past the split (CPU forward modes A/B/C, M/S)\n"
 "  -t <n>                CPU thread count\n"
 "\n"
 "Scene-ignore (faster preview — strip expensive features, like the rasterizer):\n"
@@ -3459,6 +4514,7 @@ static void printHelp(const char* prog) {
 "  -interval <sec>       periodic image-write / preview cadence (default: 15)\n"
 "  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C)\n"
 "  -resume               continue an accumulated render from its .ftbuf checkpoint\n"
+"  -parseonly            load the scene, print a contents summary, exit (no render)\n"
 "\n"
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
@@ -3478,6 +4534,7 @@ static void printHelp(const char* prog) {
 "  -review <base>        play a rendered frame sequence on the live window\n"
 "  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
+"  -viewer <s.json>      open the loom native viewer on a scene-introspection sidecar\n"
 "  -h | --help           show this help and exit\n"
 "\n"
 "See README.md for the complete flag list (fog, thin-film, meshes, diagnostics, …).\n",
@@ -3571,6 +4628,11 @@ static int run(int argc, char** argv) {
     bool diffraction = true;      // MatType::Grating diffraction on/off (-diffraction)
     bool checkGratingOnly = false;
     bool checkUpsampleOnly = false;
+    bool checkGridOnly = false;
+    bool checkScatterOnly = false;
+    bool checkBindOnly = false;
+    bool checkPropOnly = false;
+    bool checkSunOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
     bool rgbBackward = false;      // -rgb: fast RGB (non-spectral) backward preview (mode R, GPU)
@@ -3620,6 +4682,17 @@ static int run(int argc, char** argv) {
     const char* inFile = nullptr;
     for (int i = 1; i < argc; ++i)
         if (!std::strcmp(argv[i], "-in") && i + 1 < argc) { inFile = argv[i + 1]; break; }
+    // -parseonly: load the scene, report what it contains, exit 0 — or exit 1 with the
+    // load error. Nothing renders and no device is touched. Prescanned here (rather than
+    // with the other flags below) because the scene load happens before the main argv
+    // pass, and the whole point is to stop the instant that load returns.
+    //
+    // This exists because "does every scene in the tree still load?" is the regression
+    // question a front-end or loader change actually needs answered, and the only way to
+    // ask it before was to render all ~200 of them.
+    bool parseOnly = false;
+    for (int i = 1; i < argc; ++i)
+        if (!std::strcmp(argv[i], "-parseonly")) { parseOnly = true; break; }
     // Positional scene / mesh file: `ftrace scene.ftsl` or `ftrace model.glb` (e.g. a
     // double-click / drag-drop) with no -in. Accept a bare token that ends in a scene
     // extension (loaded directly) OR a mesh extension (.obj/.gltf/.glb/.fbx/.stl/.ply —
@@ -3667,6 +4740,12 @@ static int run(int argc, char** argv) {
     // loader resolves up-front): a `-mode` override forces the mode a branch is judged
     // against, and `-on-unsupported` sets the global policy. Pre-scanning mirrors how
     // -in is found above; the full CLI loop below re-parses them normally.
+    // Two more flags used to be pre-scanned here for the same reason — `-legacy-parser`
+    // and `-validate-grammar` selected between the shared grammar and a hand-written
+    // parser, and the scene is parsed just below, long before the full CLI loop runs.
+    // 0.79.0 deleted that parser, so both are retired: still ACCEPTED in the CLI loop
+    // below (a script that passes one keeps working) but announced as a no-op rather
+    // than silently ignored.
     char cliModePrescan = 0;
     for (int i = 1; i + 1 < argc; ++i) {
         if (!std::strcmp(argv[i], "-mode")) cliModePrescan = argv[i + 1][0];
@@ -3742,6 +4821,17 @@ static int run(int argc, char** argv) {
         // still proceed (Level-0 uses priority where present, else assumes exterior air).
         for (const std::string& w : pri::audit(ftslScene.scene))
             std::fprintf(stderr, "[priority] WARNING: %s\n", w.c_str());
+        if (parseOnly) {
+            const Scene& sc = ftslScene.scene;
+            std::printf("[parseonly] ok: %zu materials, %zu records, %zu emitters, "
+                        "%zu spheres, %zu tris, %zu implicits, %zu textures, "
+                        "%zu patterns, %zu cameras\n",
+                        sc.mats.size(), sc.records.size(), sc.emitters.size(),
+                        sc.spheres.size(), sc.tris.size(), sc.implicits.size(),
+                        sc.textures.size(), sc.patterns.size(),
+                        ftslScene.cameras.size());
+            return 0;
+        }
         if (ftslScene.photons >= 0)       N = ftslScene.photons;
         if (ftslScene.res > 0)            res = ftslScene.res;
         if (ftslScene.mode)               mode = ftslScene.mode;
@@ -3772,8 +4862,14 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
-        else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) g_pmRadiusAbs = std::atof(argv[++i]);
+        // An explicit absolute radius pins the radius: don't then adapt it out from under
+        // the user (this was the documented workaround for mode M's scaling problem).
+        // -pmradiusfrac only rescales the STARTING radius, so it leaves adaptation on.
+        else if (!std::strcmp(argv[i], "-pmradius") && i + 1 < argc) { g_pmRadiusAbs = std::atof(argv[++i]); g_pmAutoRadius = false; }
         else if (!std::strcmp(argv[i], "-pmradiusfrac") && i + 1 < argc) g_pmRadiusFactor = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-pmauto")) g_pmAutoRadius = true;
+        else if (!std::strcmp(argv[i], "-nopmauto")) g_pmAutoRadius = false;
+        else if (!std::strcmp(argv[i], "-pmcount") && i + 1 < argc) { g_pmAutoCount = std::atof(argv[++i]); g_pmAutoRadius = true; }
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
         else if (!std::strcmp(argv[i], "-savemap") && i + 1 < argc) g_pmapSave = argv[++i];
         else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
@@ -3784,6 +4880,10 @@ static int run(int argc, char** argv) {
             if (g_heroC < 1) g_heroC = 1;
             if (g_heroC > hero::kHeroMax) g_heroC = hero::kHeroMax;
         }
+        // Split-at-dispersion instead of de-hero. A single global policy flag read by
+        // every CPU forward tracer via Renderer::heroSplit's default initialiser, so it
+        // needs no plumbing through the renderer entry points (see hero.h).
+        else if (!std::strcmp(argv[i], "-herosplit")) hero::gSplit = true;
         else if ((!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev")) && i + 1 < argc) exposureCli = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
@@ -3840,6 +4940,11 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-nodiffraction")) diffraction = false;
         else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
+        else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
+        else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
+        else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
+        else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
+        else if (!std::strcmp(argv[i], "-checksun")) checkSunOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
         else if (!std::strcmp(argv[i], "-rgb")) rgbBackward = true;
@@ -3903,7 +5008,14 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
         else if (!std::strcmp(argv[i], "-serve")) { /* resident loop; driven by main(), ignored here */ }
-        else if (!std::strcmp(argv[i], "-validate-grammar")) ftsl_shim::enabled_flag() = true;
+        // Retired in 0.79.0 along with the hand-written parser they selected. Accepted so
+        // an existing script does not hit the unknown-flag error, but SAID OUT LOUD — a
+        // flag that quietly stopped doing anything is worse than one that is gone.
+        else if (!std::strcmp(argv[i], "-legacy-parser") ||
+                 !std::strcmp(argv[i], "-validate-grammar")) {
+            std::fprintf(stderr, "ftrace: %s was retired in 0.79.0 — the shared grammar "
+                                 "is the only .ftsl front end now; ignoring\n", argv[i]);
+        }
         else if (argv[i][0] == '-') {
             // Any remaining dash-prefixed token is an unrecognized (or malformed, e.g.
             // value-less) option. Fail loudly instead of silently falling through to the
@@ -3981,6 +5093,57 @@ static int run(int argc, char** argv) {
     if (thinFilmSwatchOnly) { thinFilmSwatch(filmIor, 1.5); return 0; } // visual diagnostic
     if (checkGratingOnly)  return checkGrating();  // deterministic, no scene needed
     if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed
+    if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
+    if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
+    if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
+    if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)
+    if (checkSunOnly)      return checkSun();      // deterministic, no scene needed
+
+    // --- every output directory must exist BEFORE a single photon is traced ----------
+    // Otherwise a mistyped/not-yet-created output directory used to be discovered only
+    // by the first writer: the render ran to completion, printed "error: could not
+    // write ..." at every -interval tick, and exited having thrown the entire
+    // accumulated film away. Resolve the parents once, here, where `out` is final (the
+    // bare-invocation preview path above can still rewrite it).
+    //
+    // `-o` covers most of it: the `.ftbuf` checkpoint sidecar (`out + ".ftbuf"`), the
+    // per-camera `outFor()` variants and the stereo eye pair all live beside it.
+    // `-savemap` is the one independent path, and a discarded photon map costs just as
+    // much as a discarded film.
+    //
+    // Policy: create the directory. Renders are routinely aimed at a fresh per-series
+    // subdirectory (png/<setname>/), and refusing to make one would be a pointless
+    // extra step. But say so on stdout, so a typo shows up as a surprise directory in
+    // the log rather than silently; and if creation fails, bail NOW with a clear
+    // message instead of rendering into the void.
+    {
+        namespace fs = std::filesystem;
+        auto ensureOutDir = [](const char* what, const std::string& file) -> bool {
+            std::error_code ec;
+            fs::path parent = fs::path(file).parent_path();
+            if (parent.empty() || fs::is_directory(parent, ec)) return true;
+            if (fs::exists(parent, ec)) {
+                std::fprintf(stderr, "ftrace: %s path '%s' exists but is not a directory "
+                                     "(from %s)\n",
+                             what, parent.string().c_str(), file.c_str());
+                return false;
+            }
+            ec.clear();
+            fs::create_directories(parent, ec);
+            if (ec || !fs::is_directory(parent)) {
+                std::fprintf(stderr, "ftrace: %s directory '%s' does not exist and could "
+                                     "not be created: %s\n",
+                             what, parent.string().c_str(),
+                             ec ? ec.message().c_str() : "unknown error");
+                return false;
+            }
+            std::printf("[out] created %s directory %s\n", what, parent.string().c_str());
+            return true;
+        };
+        if (!ensureOutDir("output", out)) return 2;
+        if (!g_pmapSave.empty() && !ensureOutDir("-savemap", g_pmapSave)) return 2;
+    }
+
     bool prism     = !std::strcmp(sceneName, "prism");
     bool materials = !std::strcmp(sceneName, "materials");
     bool fluoro    = !std::strcmp(sceneName, "fluoro");
@@ -4039,6 +5202,15 @@ static int run(int argc, char** argv) {
     g_directOnly = directOnly;
     if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);
     if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
+    // -herosplit only reaches the CPU forward tracer; say so rather than silently
+    // ignoring it, and point out that it is a no-op without a bundle to split.
+    if (hero::gSplit) {
+        if (g_heroC <= 1)
+            std::printf("[hero] -herosplit has no effect with -heroc 1 (no secondaries to split)\n");
+        else
+            std::printf("[hero] split-at-dispersion ON (C=%d fan-out; CPU forward modes A/B/C + "
+                        "photon-map M/S only)\n", g_heroC);
+    }
 
     if (checkBvhOnly) {
         // Bound the linear-reference work (~O(rays * prims)) so the self-test
@@ -4093,7 +5265,8 @@ static int run(int argc, char** argv) {
             const Implicit& im = scene.implicits[k];
             std::string name = im.name.empty() ? ("isosurface_" + std::to_string(k)) : im.name;
             isomesh::Options mo; mo.res = std::max(2, exportMeshRes);
-            isomesh::Mesh m = isomesh::marchImplicit(im, mo);
+            const PatTables tabs = scene.patTables();
+            isomesh::Mesh m = isomesh::marchImplicit(im, mo, &tabs);
             watertight::Report r = watertight::check(m.pos, m.tri);
             report("isosurface", name, im.matId, r);
         }
@@ -4128,7 +5301,8 @@ static int run(int argc, char** argv) {
         for (size_t k = 0; k < scene.implicits.size(); ++k) {
             const Implicit& im = scene.implicits[k];
             std::string name = im.name.empty() ? ("isosurface_" + std::to_string(k)) : im.name;
-            airtight::Report r = airtight::check(im, airtightRays, 0x9E3779B97F4A7C15ull + k);
+            const PatTables tabs = scene.patTables();
+            airtight::Report r = airtight::check(im, airtightRays, 0x9E3779B97F4A7C15ull + k, &tabs);
             bool glass = dielectric(im.matId);
             if (r.degenerate) {
                 std::printf("  [SKIP] \"%s\"  degenerate/unbounded container — no valid chords\n",
@@ -4194,7 +5368,8 @@ static int run(int argc, char** argv) {
         for (size_t k = 0; k < scene.implicits.size(); ++k) {
             std::printf("[export-mesh] marching isosurface %zu/%zu at res %d ...\n",
                         k + 1, scene.implicits.size(), mo.res);
-            isomesh::Mesh m = isomesh::marchImplicit(scene.implicits[k], mo);
+            const PatTables tabs = scene.patTables();
+            isomesh::Mesh m = isomesh::marchImplicit(scene.implicits[k], mo, &tabs);
             std::printf("[export-mesh]   marched: %zu verts, %zu tris\n",
                         m.pos.size(), m.tri.size() / 3);
             if (mo.adaptive && !m.tri.empty()) {
@@ -6039,7 +7214,7 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
                 if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
                     mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
-                                            g_maxBounceOverride, g_directOnly);
+                                            g_maxBounceOverride, g_directOnly, g_heroC);
                     onGpu = true;
                 }
 #endif
@@ -6069,7 +7244,7 @@ static int run(int argc, char** argv) {
                     double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                                           : scene.sceneRadius * g_pmRadiusFactor;
                     tracePhotonPass(scene, meterN, nThreads, diffraction, meterPmap, g_heroC);
-                    meterPmap.build(radius);
+                    buildPhotonMap(meterPmap, radius, "[meter]");
                     meterPmapBuilt = true;
                 }
                 mf = renderPhotonCamera(scene, mc.cam, W, H, meterPmap, meterSpp, nThreads,
@@ -6088,7 +7263,7 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
                 if (meterGpu && cudaBackwardSupported(scene, mc.cam)) {
                     ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
-                                             g_maxBounceOverride, g_directOnly);
+                                             g_maxBounceOverride, g_directOnly, g_heroC);
                     refGpu = true;
                 }
 #endif
@@ -6156,7 +7331,8 @@ static int run(int argc, char** argv) {
                     };
                 renderPhotonMapSharedCuda(scene, mcams, rxs, rys, meterN, radius, e,
                                           diffraction, meterSpp, nullptr, &onFrame,
-                                          nullptr, nullptr, g_heroC, g_pmFinalGather);
+                                          nullptr, nullptr, g_heroC, g_pmFinalGather,
+                                          g_pmAutoRadius ? g_pmAutoCount : 0.0);
                 metered = true;   // a black meter falls into the no-anchor warning below
             }
         }
@@ -6576,7 +7752,8 @@ static int run(int argc, char** argv) {
                                           g_showWindow ? &liveProg : nullptr, &writeFrame,
                                           g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
                                           g_pmapSave.empty() ? nullptr : g_pmapSave.c_str(), g_heroC,
-                                          g_pmFinalGather);
+                                          g_pmFinalGather,
+                                          g_pmAutoRadius ? g_pmAutoCount : 0.0);
                 if (e.emitted > 0.0)
                     std::printf("[energy] absorbed=%.4f escaped=%.4f residual=%.4f (sum/emitted=%.6f)\n",
                                 e.absorbed / e.emitted, e.escaped / e.emitted, e.residual / e.emitted,
@@ -6592,7 +7769,7 @@ static int run(int argc, char** argv) {
         PhotonMap pm;
         auto tp0 = std::chrono::steady_clock::now();
         tracePhotonPass(scene, N, nThreads, diffraction, pm, g_heroC);
-        pm.build(radius);
+        buildPhotonMap(pm, radius, "[camera]");
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("[camera] photon map: %zu photons from %lld emitted in %.1fs, "
                     "grid %dx%dx%d — gathering %zu cameras ...\n",
@@ -6733,6 +7910,17 @@ int main(int argc, char** argv) {
     // window closed" BSOD). Draining + resetting here closes that window.
     int rc;
     try {
+        // Native loom viewer (-viewer <sidecar.json>): open the ImGui/D3D11 GUI on a
+        // scene-introspection sidecar instead of rendering. Short-circuits the renderer.
+        for (int i = 1; i < argc; ++i) {
+            if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
+                    return 1;
+                }
+                return runViewerGui(argv[i + 1]);
+            }
+        }
         // Resident preview server (-serve): keep the process alive and re-render each
         // scene path streamed on stdin. Find the -in value slot to swap per frame.
         bool serve = false;

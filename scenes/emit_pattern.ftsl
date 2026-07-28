@@ -1,0 +1,87 @@
+# Pattern-driven EMISSION — the `emit` slot takes a scalar pattern, completing the
+# reflect / transmit / emit trio (see scenes/reflect_pattern.ftsl, transmit_pattern.ftsl).
+#
+# Two spellings, one mechanism (a per-point MULTIPLIER on the slot, clamped to [0,1]):
+#
+#   emit pattern:<name>        the pattern is ALONE in the slot, so the base spectrum
+#   emit [0 1](u)              becomes a flat 1.0 and the pattern IS the (greyscale)
+#                              emission profile.
+#
+#   emit <spectrum>            the pattern MODULATES that spectrum, so the lamp keeps its
+#   emit_map pattern:<name>    colour and only its brightness varies across the surface.
+#
+# A `light` block spells its emission slot `spd`, so there the pair is `spd pattern:<n>`
+# and `spd_map pattern:<n>` — same mechanism, same field.
+#
+# WHY IT IS RESTRICTED. Unlike reflect/transmit, an emission profile is read from BOTH
+# sides of transport: once when a camera path lands on the emitter (emission-on-hit) and
+# once at the point NEE / the light subpath samples on it. MIS combines the two, so if
+# they ever disagreed the image would be BIASED, not just noisy. The profile is therefore
+# only allowed on the two emitter shapes whose sampled (u,v) provably equals the (u,v) a
+# hit interpolates — a rectangular area light (bilinear parameters) and a mesh emitter
+# (barycentric UVs). A sphere / cylinder / spot / env light is refused at load.
+#
+# Also note: `power` / `lumens` normalise the UNPATTERNED spectrum. The pattern is a pure
+# post-multiplier on radiance, which is exactly what makes it unbiased (no selection or
+# positional pdf changes anywhere), but it means a profile averaging 0.5 emits about half
+# the requested flux. Scale `power` up if you want to hold total output fixed.
+#
+#   ftrace -in scenes/emit_pattern.ftsl -mode R -device cpu -spp 400 \
+#          -o png/emit_pattern.png -window -keepwindow
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse  reflect whitewall 0.75 }
+material "grey"  { type diffuse  reflect 0.35 }
+
+# Concentric rings in the emitter's own UV space.
+pattern "p_rings" {
+    expr "0.5+0.5*cos(2*pi*6*sqrt((u-0.5)*(u-0.5)+(v-0.5)*(v-0.5)))"
+}
+# A soft checkerboard (smooth, so the pattern's [0,1] clamp never bites).
+pattern "p_check" {
+    expr "0.5+0.5*sin(2*pi*4*u)*sin(2*pi*4*v)"
+}
+
+# --- box (open toward the camera) ---
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material grey  }   # back wall
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material white }   # left wall
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material white }   # right wall
+
+# LEFT: a warm lamp MODULATED by the ring field. The hue is the blackbody spectrum's;
+# the rings only meter how much of it leaves each point.
+light area {
+    origin 0.06 0.30 0.80   u 0.40 0 0   v 0 0.45 0   normal 0 0 1
+    power 45   spd preset:bb3000
+    spd_map pattern:p_rings
+}
+
+# RIGHT: the pattern ALONE in the slot — the spectrum collapses to a flat 1.0, so this
+# panel emits an equal-energy (neutral) checkerboard.
+light area {
+    origin 0.54 0.30 0.80   u 0.40 0 0   v 0 0.45 0   normal 0 0 1
+    power 45   spd pattern:p_check
+}
+
+# The MATERIAL route, on a mesh emitter: an emissive material whose `emit_map` varies
+# along the mesh's own UVs. A `mesh {}` block with an emissive material registers a
+# sampleable Mesh area light (a bare `quad {}` block would only add emissive triangles),
+# which is why this uses the tiny UV'd quad mesh rather than a `quad` primitive.
+material "strip" {
+    type diffuse   reflect 0.0
+    emit blackbody 5200
+    emit_map pattern:p_rings
+}
+mesh {
+    file "meshes/uvquad.obj"
+    scale 0.5 0.18 1   translate 0.25 0.06 0.55
+    material strip   power 12
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.3   look_at 0.5 0.5 0.0   up 0 1 0   fov_y 40
+    mode R
+    film { res 512 512   iso 100   shutter 1   exposure 1 }
+}

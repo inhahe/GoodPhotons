@@ -12,11 +12,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union
 
-from .signals.core import Signal, Clock, Cache, Number
+from .signals.core import Signal, Clock, Cache, Number, lower_axsignal
 from .signals.vector import VecSignal
 from .color import Color
 
 Animatable = Union[Signal, VecSignal, Number, Sequence[Number], str]
+
+
+def site_node(x):
+    """The :class:`Signal` / :class:`VecSignal` a value-site sees for ``x``.
+
+    Passes a Signal/VecSignal straight through and **lowers** an axis-typed
+    node (:mod:`loom.axes` — a ``Target``, a ``CurveSample``, …) into one, so
+    every scene value-site accepts the E5 influence model uniformly.  Returns
+    ``None`` for a plain number / sequence / string, which the callers format
+    directly.
+    """
+    if isinstance(x, (Signal, VecSignal)):
+        return x
+    return lower_axsignal(x)
 
 
 @dataclass
@@ -42,12 +56,22 @@ class EmitCtx:
 
 
 def num(x: Union[Signal, Number], clock: Clock, cache: Optional[Cache] = None) -> float:
-    return x.at(clock, cache) if isinstance(x, Signal) else float(x)
+    n = site_node(x)
+    if n is None:
+        return float(x)
+    if isinstance(n, VecSignal):
+        raise ValueError(
+            f"a scalar value-site got a {n.dim}-vector; pick a component "
+            f"(e.g. .comp(1) on an axis node)")
+    return n.at(clock, cache)
 
 
 def vecn(x, clock: Clock, cache: Optional[Cache] = None) -> Tuple[float, ...]:
-    if isinstance(x, VecSignal):
-        return x.at(clock, cache)
+    n = site_node(x)
+    if isinstance(n, VecSignal):
+        return n.at(clock, cache)
+    if isinstance(n, Signal):
+        raise ValueError("a vector value-site got a scalar")
     return tuple(num(c, clock, cache) for c in x)
 
 
@@ -72,10 +96,11 @@ def value_token(v, clock: Clock, cache: Optional[Cache] = None) -> str:
         return v
     if isinstance(v, Color):
         return v.token(clock, cache)            # "rgb r g b" or "hsv h s v"
-    if isinstance(v, VecSignal):
-        return fmt3(v.at(clock, cache))
-    if isinstance(v, Signal):
-        return fmt(v.at(clock, cache))
+    n = site_node(v)                            # lowers an axis-typed node
+    if isinstance(n, VecSignal):
+        return fmt3(n.at(clock, cache))
+    if isinstance(n, Signal):
+        return fmt(n.at(clock, cache))
     if isinstance(v, (list, tuple)):
         return " ".join(fmt(num(c, clock, cache)) for c in v)
     return fmt(float(v))

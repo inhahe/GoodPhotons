@@ -119,6 +119,27 @@ struct LightVertex {
     int    edges = 0;     // number of edges from the light emitter to this vertex
 };
 
+// The hero bundle's SECONDARY wavelengths for a stored light vertex. Deliberately a
+// SEPARATE array indexed in lockstep with `lightVerts` rather than extra fields inside
+// LightVertex: stored light vertices are the dominant memory cost of a VCM pass (and of
+// the GPU slab), so a plain single-wavelength run (`-heroc 1`, and every scene the hero
+// gate rejects) must allocate exactly nothing extra and stay byte-identical. The whole
+// array is left empty in that case.
+//
+// `lam[i]` mirrors the path's bundle, so a light vertex and the camera vertex it is
+// CONNECTED to always speak about the same wavelengths (both subpaths of path index p are
+// drawn from one bundle — see vcmPass). The MERGE strategy gathers vertices from other
+// paths, so it reads these wavelengths on their own terms, exactly as it already does for
+// the single stored `LightVertex::lambda`.
+struct LightVertexSec {
+    double beta[hero::kHeroMax - 1] = {0};   // per-secondary geometric throughput
+    double cx[hero::kHeroMax - 1] = {0};     // cieX/Y/Z(lam[i]) cached at store time, for
+    double cy[hero::kHeroMax - 1] = {0};     // the same reason LightVertex caches the
+    double cz[hero::kHeroMax - 1] = {0};     // hero's: the merge reads it per gather.
+    float  lam[hero::kHeroMax - 1] = {0};    // the secondary wavelengths
+    int    nUp = 1;                          // wavelengths still live at this vertex
+};
+
 // Uniform hash grid over the stored light vertices (indices into a flat array), mirroring
 // photonmap.h's counting-sort layout. Cell size == merge radius, so a radius query only
 // touches the 3x3x3 neighbourhood.
@@ -235,15 +256,39 @@ inline void misScatter(bool specular, double cosThetaOut, double bsdfDirPdfW, do
 // `delta` the specular flag. `terminate` requests ending the walk. `stk` is the nested-
 // dielectric medium stack the path carries (colored-glass Beer-Lambert + exterior IOR at
 // each interface; Schmidt & Budge 2002). Media are out of VCM scope.
+//
+// HERO BUNDLE (Wilkie et al. 2014; the four shared policies live in hero.h). When `nUp > 1`
+// the caller is carrying nUp wavelengths on one ray: `lamAll` is the bundle (lamAll[0] is
+// the hero == `lambda`), and on return `secF[i]` is the ABSOLUTE throughput factor for
+// secondary i — f_{i+1}·cos/pdf for the lobe the HERO sampled — whenever `secChromatic` is
+// set. Absolute, never a ratio to the hero's: a ratio is undefined exactly where it matters
+// most (a gel filter whose hero value is 0 while a secondary's is not). Wavelength-
+// INDEPENDENT outcomes (all the geometry, the specular interfaces) leave `secChromatic`
+// false, and the caller reuses `betaFactor` for every λ. `keepBundle` marks the delta lobes
+// that nevertheless pick their continuation WITHOUT consulting λ (Mirror reflects, Filter
+// passes straight through), so the secondaries may keep riding the hero's ray past them;
+// every other delta lobe de-heroes (the caller collapses nUp to 1). All five outputs are
+// ignored when nUp == 1, so a single-wavelength run is bit-identical to before.
+//
+// NOTE the `<= 0` early terminations that the scalar version used to do for a zero
+// reflectance/transmittance are GONE: with a bundle the hero can be dark while a secondary
+// is not, so killing the walk on the hero alone biases low. The caller applies the
+// max-over-live-λ test instead, which for nUp == 1 is exactly the old scalar test.
 inline void scatterSample(const Scene& scene, const Renderer& mats, const Material* mp,
                           const Hit& h, const Vec3& rayDir, double lambda, Pcg32& rng,
                           Vec3& wi, double& betaFactor, double& pdfW, double& pdfRevW,
                           double& cosThetaOut, bool& delta, bool& terminate,
-                          MediumStack& stk) {
+                          MediumStack& stk,
+                          const double* lamAll = nullptr, int nUp = 1,
+                          double* secF = nullptr, bool* secChromatic = nullptr,
+                          bool* keepBundle = nullptr) {
     const Vec3 ns = h.n;
     const Vec3 wo = normalize(rayDir * -1.0);
     wi = Vec3{0, 0, 0}; betaFactor = 0.0; pdfW = 0.0; pdfRevW = 0.0; cosThetaOut = 0.0;
     delta = false; terminate = false;
+    const int nSec = (secF && lamAll && nUp > 1) ? nUp - 1 : 0;   // secondaries to fill
+    if (secChromatic) *secChromatic = false;
+    if (keepBundle)   *keepBundle = false;
     switch (mp->type) {
         case MatType::Diffuse:
         case MatType::Fluorescent: {
@@ -252,8 +297,12 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             double rho = clamp01(diffuseReflectance(scene, *mp, h, lambda));
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
-            betaFactor = rho;
-            if (rho <= 0) terminate = true;
+            betaFactor = rho;                     // rho <= 0 is caught by the caller's max test
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(diffuseReflectance(scene, *mp, h, lamAll[i + 1]));
+            }
             break;
         }
         case MatType::Glossy: {
@@ -264,25 +313,53 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
             betaFactor = r;
-            if (r <= 0 || pdfW <= 0) terminate = true;
+            if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test
+            // The glossy LOBE (mirror direction + roughness exponent) carries no wavelength
+            // dependence, so the whole bundle follows the sampled direction and only the
+            // reflectance differs per λ.
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(reflectSlot(scene, *mp, h, lamAll[i + 1]));
+            }
             break;
         }
         case MatType::DiffuseTransmit: {
             double rhoR, rhoT; bdpt::diffuseTransmitAlbedos(*mp, lambda, scene, &h, rhoR, rhoT);
             double tot = rhoR + rhoT;
             if (tot <= 0.0) { terminate = true; break; }
-            if (rng.uniform() * tot < rhoR) wi = cosineHemisphere(ns, rng);
-            else                            wi = cosineHemisphere(ns * -1.0, rng);
+            const bool reflLobe = (rng.uniform() * tot < rhoR);
+            if (reflLobe) wi = cosineHemisphere(ns, rng);
+            else          wi = cosineHemisphere(ns * -1.0, rng);
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
             betaFactor = tot;
             if (pdfW <= 0) terminate = true;
+            // The lobe was CHOSEN by the hero's albedo split, so each secondary divides by
+            // the HERO's albedo for that lobe, not its own:
+            //   f_i·cos/pdf_hero = rho_i(lobe) · tot_hero / rho_hero(lobe).
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i) {
+                    double rR, rT;
+                    bdpt::diffuseTransmitAlbedos(*mp, lamAll[i + 1], scene, &h, rR, rT);
+                    double num = reflLobe ? rR   : rT;
+                    double den = reflLobe ? rhoR : rhoT;
+                    secF[i] = (den > 0.0) ? num * tot / den : 0.0;
+                }
+            }
             break;
         }
         case MatType::Mirror: {
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
             wi = reflect(rayDir, ns); betaFactor = r; delta = true;
-            if (r <= 0) terminate = true;
+            // The mirror direction is the same for every λ, so the bundle survives; only
+            // the reflectance is per-λ (cf. Glossy, the rough version of this).
+            if (nSec) {
+                *keepBundle = true; *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(reflectSlot(scene, *mp, h, lamAll[i + 1]));
+            }
             break;
         }
         case MatType::Dielectric: {
@@ -337,9 +414,18 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::Filter: {
-            double t = clamp01(mp->transmit(lambda));
-            wi = rayDir; betaFactor = t; delta = true;
-            if (t <= 0) terminate = true;
+            double t = clamp01(transmitSlot(scene, *mp, h, lambda));
+            wi = rayDir; betaFactor = t; delta = true;   // t <= 0 -> caller's max test
+            // Straight-through for every λ, so the bundle survives — and a gel filter is
+            // exactly where the per-λ transmittance spread is largest, i.e. the case that
+            // benefits most from NOT de-heroing, AND the case that forces the absolute
+            // (rather than ratio) secF, since T(λ_hero) is legitimately 0 across most of
+            // a Wratten passband.
+            if (nSec) {
+                *keepBundle = true; *secChromatic = true;
+                for (int i = 0; i < nSec; ++i)
+                    secF[i] = clamp01(transmitSlot(scene, *mp, h, lamAll[i + 1]));
+            }
             break;
         }
         case MatType::ThinFilm: {
@@ -385,18 +471,40 @@ struct PassCtx {
 // vertices carry their own edge counts. Returns nothing (the caller records out.size()
 // before/after to slice this path's range).
 inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
-                              const PassCtx& ctx, double lambda, double invPdfLambda,
+                              const PassCtx& ctx, const bdpt::HeroBundle& hb,
                               Pcg32& rng, std::vector<LightVertex>& out,
+                              std::vector<LightVertexSec>& outSec,
                               std::vector<Vec3>& splat, int W) {
+    const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
+    const int C = hb.C;                 // bundle width (1 == plain single-λ)
+    int nUp = C;                        // wavelengths still riding this ray
+    double betaSec[hero::kHeroMax - 1] = {0};
+    Vec3   cieSec[hero::kHeroMax - 1];
+    for (int i = 0; i + 1 < C; ++i)
+        cieSec[i] = Vec3(cieX(hb.lam[i + 1]), cieY(hb.lam[i + 1]), cieZ(hb.lam[i + 1]));
+
     if (scene.emitters.empty() || scene.totalPower <= 0.0) return;
     int ei = scene.selectEmitter(rng);
     const Emitter& em = scene.emitters[ei];
-    if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated) return;
+    if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
+        em.shape == EmitterShape::Sun || em.collimated) return;
 
     double u1 = rng.uniform(), u2 = rng.uniform();
-    Vec3 y, nOut; em.samplePoint(u1, u2, y, nOut);
-    double Le = em.spdFn(lambda) * invPdfLambda;
-    if (Le <= 0.0) return;
+    Vec3 y, nOut;
+    // `emit pattern:` factor at the sampled point (1.0 without one). It scales the
+    // emitted radiance ONLY: directPdfW / emissionPdfW below — and therefore every dVCM
+    // / dVC / dVM MIS quantity derived from them — stay exactly as the camera side's
+    // s=0/s=1 terms assume, which is what keeps VCM's weights consistent.
+    double emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
+    double Le = em.spdFn(lambda) * invPdfLambda * emitPatW;
+    // Max over the LIVE wavelengths, never the hero alone (hero.h policy 3): a spiky
+    // emission spectrum can be dark at the hero and bright at a secondary.
+    double LeSec[hero::kHeroMax - 1] = {0}, mxLe = Le;
+    for (int i = 0; i + 1 < C; ++i) {
+        LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
+        if (LeSec[i] > mxLe) mxLe = LeSec[i];
+    }
+    if (mxLe <= 0.0) return;
     double pdfChoice = em.power / scene.totalPower;
     double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
     if (pdfPos <= 0.0 || pdfChoice <= 0.0) return;
@@ -409,8 +517,10 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     if (emissionPdfW <= 0.0) return;
     double directPdfW = pdfChoice * pdfPos;               // area density of the emitter point
 
-    // Geometric throughput leaving the light (Le carries the spectral radiance).
+    // Geometric throughput leaving the light (Le carries the spectral radiance). Every
+    // factor but Le is purely geometric, so the secondaries share it exactly.
     double beta = Le * cosLight / emissionPdfW;
+    for (int i = 0; i + 1 < C; ++i) betaSec[i] = LeSec[i] * cosLight / emissionPdfW;
 
     // Running MIS quantities (SmallVCM GenerateLightSample).
     double dVCM = Mis(directPdfW / emissionPdfW);
@@ -427,8 +537,16 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         if (!h.valid) return;                    // escaped (no env in scope)
         {
             int mi = stk.topMat();
-            double a = (mi >= 0) ? scene.mats[mi].absorb(lambda) : 0.0;
-            if (a > 0.0) beta *= std::exp(-a * h.t);
+            if (mi >= 0) {
+                double a = scene.mats[mi].absorb(lambda);
+                if (a > 0.0) beta *= std::exp(-a * h.t);
+                // Beer-Lambert is per-λ (that IS the colour of coloured glass), so each
+                // live secondary attenuates by its own absorption coefficient.
+                for (int i = 0; i + 1 < nUp; ++i) {
+                    double ai = scene.mats[mi].absorb(hb.lam[i + 1]);
+                    if (ai > 0.0) betaSec[i] *= std::exp(-ai * h.t);
+                }
+            }
         }
         double dist = h.t;
         const Vec3 rd = ray.d;
@@ -462,6 +580,15 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
             lv.matId = h.matId; lv.mat = mp; lv.hit = h; lv.edges = edges;
             out.push_back(lv);
+            if (C > 1) {                              // lockstep secondary payload
+                LightVertexSec ls; ls.nUp = nUp;
+                for (int i = 0; i + 1 < nUp; ++i) {
+                    ls.lam[i] = (float)hb.lam[i + 1];
+                    ls.beta[i] = betaSec[i];
+                    ls.cx[i] = cieX(ls.lam[i]); ls.cy[i] = cieY(ls.lam[i]); ls.cz[i] = cieZ(ls.lam[i]);
+                }
+                outSec.push_back(ls);
+            }
 
             // Connect this vertex to the pinhole camera (light-image splat, t=1). The
             // path here has (edges + 1) edges: skip if it would exceed maxDepth.
@@ -483,9 +610,17 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                     if (sideOk && cosAtCamera > 1e-9) {
                         int px, py; double cc, d2c;
                         if (cam.project(h.p, px, py, cc, d2c)) {
-                            double f = bsdfF(*mp, h.n, wo, wcam, lambda, scene, &h);
-                            f *= shadingAdjointCorr(wo, wcam, h.n, ngo) * stG;   // adjoint (→camera) + soft terminator
-                            if (f > 0.0 &&
+                            // The adjoint + soft-terminator corrections are purely
+                            // geometric, so the whole bundle shares them; only the BSDF
+                            // value is per-λ (hero.h policy 4: absolute, not a ratio).
+                            const double geo = shadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
+                            double f = bsdfF(*mp, h.n, wo, wcam, lambda, scene, &h) * geo;
+                            double fSec[hero::kHeroMax - 1] = {0}, mxF = f;
+                            for (int i = 0; i + 1 < nUp; ++i) {
+                                fSec[i] = bsdfF(*mp, h.n, wo, wcam, hb.lam[i + 1], scene, &h) * geo;
+                                if (fSec[i] > mxF) mxF = fSec[i];
+                            }
+                            if (mxF > 0.0 &&
                                 !scene.occluded(offsetOrigin(h.p, h.ng, wcam), wcam, distc - 2e-6)) {
                                 double bsdfRevPdfW = bsdfPdf(*mp, h.n, wcam, wo, lambda, scene, &h);
                                 double imgPtDist = ctx.imagePlaneDist / cosAtCamera;
@@ -494,10 +629,18 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                                 double wLight = Mis(imgToSurf / ctx.nLightPaths) *
                                                 (ctx.misVmWeight + dVCM + dVC * Mis(bsdfRevPdfW));
                                 double misW = 1.0 / (wLight + 1.0);
-                                // contrib = misW * beta * f * (cameraAreaPdf / nLightPaths)
-                                double contrib = misW * beta * f * imgToSurf / ctx.nLightPaths;
-                                if (contrib > 0.0)
-                                    splat[(size_t)py * W + px] += cie * contrib;
+                                // contrib = misW * beta * f * (cameraAreaPdf / nLightPaths).
+                                // The MIS weight and every density above are the HERO's
+                                // (all sampling densities here are λ-independent), so the
+                                // bundle differs only in beta*f. De-hero by averaging the
+                                // nUp live wavelengths — the same 1/nUp normalisation
+                                // bdpt.h applies at its splat, NOT a ×C boost.
+                                double k = misW * imgToSurf / ctx.nLightPaths;
+                                Vec3 add = cie * (k * beta * f);
+                                for (int i = 0; i + 1 < nUp; ++i)
+                                    add = add + cieSec[i] * (k * betaSec[i] * fSec[i]);
+                                if (nUp > 1) add = add * (1.0 / (double)nUp);
+                                splat[(size_t)py * W + px] += add;
                             }
                         }
                     }
@@ -509,15 +652,33 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
 
         // Sample a continuation direction.
         Vec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
+        double secF[hero::kHeroMax - 1]; bool secChromatic = false, keepBundle = false;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
-                      cosThetaOut, delta, terminate, stk);
-        if (terminate || betaFactor <= 0.0) return;
+                      cosThetaOut, delta, terminate, stk,
+                      hb.lam, nUp, secF, &secChromatic, &keepBundle);
+        // Kill the walk only when EVERY live wavelength is dead (hero.h policy 3). With
+        // nUp == 1 the loop is empty and mxF == betaFactor: the old scalar test exactly.
+        double mxF = betaFactor;
+        if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
+        if (terminate || mxF <= 0.0) return;
         if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) return;
 
         misScatter(delta, cosThetaOut, pdfW, pdfRevW, ctx.misVcWeight, ctx.misVmWeight,
                    dVCM, dVC, dVM);
         beta *= betaFactor;
-        if (!delta) beta *= shadingAdjointCorr(wo, normalize(wi), h.n, ngo);  // adjoint (continuation)
+        for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
+        if (!delta) {
+            const double adj = shadingAdjointCorr(wo, normalize(wi), h.n, ngo);  // adjoint (continuation)
+            beta *= adj;                                     // purely geometric: same for every λ
+            for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= adj;
+        }
+        // DE-HERO (hero.h policy 2). A delta vertex that picked its continuation by a
+        // λ-DEPENDENT specular process (dielectric refraction, grating order, thin-film /
+        // multilayer interface, the half-mirror's r(λ) coin) cannot carry the secondaries
+        // along the hero's outgoing ray any further. Mirror and Filter are delta but
+        // λ-independent in direction, so they set keepBundle and ride on. The vertex JUST
+        // stored keeps its full nUp — it really was reached by all C wavelengths.
+        if (delta && !keepBundle) nUp = 1;
         prevP = h.p;
         double sgn = dot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
         ray = Ray{h.p + h.ng * (sgn * 1e-6), normalize(wi)};
@@ -529,10 +690,21 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
 // paired light subpath's slice (for exact same-lambda vertex connections); `grid` gathers
 // vertices from ALL paths for merging. Returns the pixel's accumulated XYZ radiance.
 inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
-                               const PassCtx& ctx, int px, int py, double lambda, double invPdfLambda,
+                               const PassCtx& ctx, int px, int py, const bdpt::HeroBundle& hb,
                                Pcg32& rng, const std::vector<LightVertex>& lightVerts,
+                               const std::vector<LightVertexSec>& lightSec,
                                int pathBegin, int pathEnd, const VcmGrid& grid) {
     Vec3 result{0, 0, 0};
+    const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
+    const int C = hb.C;                 // bundle width (1 == plain single-λ)
+    const bool heroOn = (C > 1);
+    int nUp = C;                        // wavelengths still riding this ray
+    double betaSec[hero::kHeroMax - 1] = {0};
+    Vec3   cieSec[hero::kHeroMax - 1];
+    for (int i = 0; i + 1 < C; ++i) {
+        betaSec[i] = 1.0;               // camera vertex beta == 1 for every λ
+        cieSec[i] = Vec3(cieX(hb.lam[i + 1]), cieY(hb.lam[i + 1]), cieZ(hb.lam[i + 1]));
+    }
     const Vec3 cie(cieX(lambda), cieY(lambda), cieZ(lambda));
 
     Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
@@ -554,8 +726,14 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         }
         {
             int mi = stk.topMat();
-            double a = (mi >= 0) ? scene.mats[mi].absorb(lambda) : 0.0;
-            if (a > 0.0) beta *= std::exp(-a * h.t);
+            if (mi >= 0) {
+                double a = scene.mats[mi].absorb(lambda);
+                if (a > 0.0) beta *= std::exp(-a * h.t);
+                for (int i = 0; i + 1 < nUp; ++i) {     // per-λ Beer-Lambert (coloured glass)
+                    double ai = scene.mats[mi].absorb(hb.lam[i + 1]);
+                    if (ai > 0.0) betaSec[i] *= std::exp(-ai * h.t);
+                }
+            }
         }
         double dist = h.t;
         const Vec3 rd = ray.d;
@@ -577,8 +755,16 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         if (mp->isLight) {
             double cosLight = dot(h.ng, wo);
             if (cosLight > 0.0) {
-                double Le = mp->emit(lambda) * invPdfLambda;
-                if (Le > 0.0) {
+                // Achromatic `emit pattern:` factor at this hit — the same value the
+                // light-subpath / NEE sides get from emitterSamplePoint at this point.
+                double ep = (mp->emitPat < 0) ? 1.0 : slotPatMul(scene, mp->emitPat, h);
+                double Le = mp->emit(lambda) * invPdfLambda * ep;
+                double LeSec[hero::kHeroMax - 1] = {0}, mxLe = Le;
+                for (int i = 0; i + 1 < nUp; ++i) {
+                    LeSec[i] = mp->emit(hb.lam[i + 1]) * hb.invPdf[i + 1] * ep;
+                    if (LeSec[i] > mxLe) mxLe = LeSec[i];
+                }
+                if (mxLe > 0.0) {
                     double misW = 1.0;
                     const Emitter* em = scene.emitterForMat(h.matId);
                     if (em && em->area > 0.0 && scene.totalPower > 0.0 && edges >= 2) {
@@ -588,7 +774,14 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         double wCamera = Mis(directPdfA) * dVCM + Mis(emissionPdfW) * dVC;
                         misW = 1.0 / (1.0 + wCamera);
                     }
-                    result += cie * (beta * Le * misW);
+                    // Densities are λ-independent, so the bundle shares misW; only the
+                    // emitted radiance and the carried throughput are per-λ. De-hero by
+                    // averaging the live wavelengths (1/nUp, not a ×C boost).
+                    Vec3 add = cie * (beta * Le * misW);
+                    for (int i = 0; i + 1 < nUp; ++i)
+                        add = add + cieSec[i] * (betaSec[i] * LeSec[i] * misW);
+                    if (nUp > 1) add = add * (1.0 / (double)nUp);
+                    result += add;
                 }
             }
             return result;   // can't scatter off a light
@@ -600,9 +793,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             if (edges + 1 <= ctx.maxDepth && !scene.emitters.empty() && scene.totalPower > 0.0) {
                 int ei = scene.selectEmitter(rng);
                 const Emitter& em = scene.emitters[ei];
-                if (!(em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)) {
+                if (!(em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
+                      em.shape == EmitterShape::Sun || em.collimated)) {
                     double u1 = rng.uniform(), u2 = rng.uniform();
-                    Vec3 yL, nL; em.samplePoint(u1, u2, yL, nL);
+                    Vec3 yL, nL;
+                    double epat = emitterSamplePoint(scene, em, u1, u2, yL, nL);
                     Vec3 toL = yL - h.p; double dist2 = dot(toL, toL);
                     if (dist2 > 1e-12) {
                         double distL = std::sqrt(dist2); Vec3 wi = toL / distL;
@@ -618,8 +813,17 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                           : (cosToLight > 0.0 && stG > 0.0);
                         if (cosAtLight > 0.0 && sideOk) {
                             double f = bsdfF(*mp, h.n, wo, wi, lambda, scene, &h) * stG;
-                            double Le = em.spdFn(lambda) * invPdfLambda;
-                            if (f > 0.0 && Le > 0.0 && em.area > 0.0 &&
+                            double Le = em.spdFn(lambda) * invPdfLambda * epat;
+                            // Per-λ BSDF × emitted radiance; the emitter-sampling densities
+                            // below are λ-independent and stay the hero's (the pattern
+                            // scales radiance only, never a pdf).
+                            double fLeSec[hero::kHeroMax - 1] = {0}, mxfLe = f * Le;
+                            for (int i = 0; i + 1 < nUp; ++i) {
+                                fLeSec[i] = bsdfF(*mp, h.n, wo, wi, hb.lam[i + 1], scene, &h) * stG *
+                                            em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * epat;
+                                if (fLeSec[i] > mxfLe) mxfLe = fLeSec[i];
+                            }
+                            if (mxfLe > 0.0 && em.area > 0.0 &&
                                 !scene.occluded(offsetOrigin(h.p, h.ng, wi), wi, distL - 2e-6)) {
                                 double pdfChoice = em.power / scene.totalPower;
                                 double invArea = 1.0 / em.area;
@@ -632,9 +836,12 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                                      (directPdfW * cosAtLight)) *
                                                  (ctx.misVmWeight + dVCM + dVC * Mis(bsdfRevPdfW));
                                 double misW = 1.0 / (wLight + 1.0 + wCamera);
-                                double contrib = misW * std::fabs(cosToLight) /
-                                                 (pdfChoice * directPdfW) * Le * f;
-                                if (contrib > 0.0) result += cie * (beta * contrib);
+                                double k = misW * std::fabs(cosToLight) / (pdfChoice * directPdfW);
+                                Vec3 add = cie * (beta * k * Le * f);
+                                for (int i = 0; i + 1 < nUp; ++i)
+                                    add = add + cieSec[i] * (betaSec[i] * k * fLeSec[i]);
+                                if (nUp > 1) add = add * (1.0 / (double)nUp);
+                                result += add;
                             }
                         }
                     }
@@ -668,8 +875,25 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 // Adjoint correction on the LIGHT-subpath endpoint lv only (particle side;
                 // outgoing = -w toward the camera vertex). fCam is the Radiance side — none.
                 // Uses lv.ng oriented to lv.ns (ngoLit above); a no-op when the mesh is flat.
-                fLit *= shadingAdjointCorr(lv.wo, w * -1.0, lv.ns, ngoLit) * stGLit;
-                if (fCam <= 0.0 || fLit <= 0.0) continue;
+                const double adjLit = shadingAdjointCorr(lv.wo, w * -1.0, lv.ns, ngoLit) * stGLit;
+                fLit *= adjLit;
+                // HERO CONNECTION. Both subpaths of this path index were drawn from ONE
+                // bundle (see vcmPass), so lv's secondaries are hb.lam[i+1] as well and the
+                // connection is exact per-λ — no cross-wavelength approximation, exactly as
+                // in bdpt.h. Only the wavelengths live on BOTH ends can be connected, so the
+                // number of usable λ is min(camera nUp, light-vertex nUp); the estimator
+                // averages them (1/nUpConn) rather than boosting by C.
+                const int lvUp = heroOn ? lightSec[(size_t)j].nUp : 1;
+                const int nUpConn = (nUp < lvUp) ? nUp : lvUp;
+                double fProdSec[hero::kHeroMax - 1] = {0}, mxProd = fCam * fLit;
+                for (int i = 0; i + 1 < nUpConn; ++i) {
+                    const double li = hb.lam[i + 1];
+                    double fc = bsdfF(*mp, h.n, wo, w, li, scene, &h) * stGCam;
+                    double fl = bsdfF(*lv.mat, lv.ns, lv.wo, w * -1.0, li, scene, &lv.hit) * adjLit;
+                    fProdSec[i] = fc * fl;
+                    if (fProdSec[i] > mxProd) mxProd = fProdSec[i];
+                }
+                if (mxProd <= 0.0) continue;
                 double camDirPdfW = bsdfPdf(*mp, h.n, wo, w, lambda, scene, &h);
                 double camRevPdfW = bsdfPdf(*mp, h.n, w, wo, lambda, scene, &h);
                 double litDirPdfW = bsdfPdf(*lv.mat, lv.ns, lv.wo, w * -1.0, lambda, scene, &lv.hit);
@@ -681,8 +905,15 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double misW = 1.0 / (wLight + 1.0 + wCamera);
                 if (scene.occluded(offsetOrigin(h.p, h.ng, w), w, distc - 2e-6)) continue;
                 double G = std::fabs(cosCam) * std::fabs(cosLit) / dist2;
-                double contrib = misW * G * fCam * fLit * beta * lv.beta;
-                if (contrib > 0.0) result += cie * contrib;
+                double k = misW * G;
+                Vec3 add = cie * (k * fCam * fLit * beta * lv.beta);
+                if (nUpConn > 1) {
+                    const LightVertexSec& ls = lightSec[(size_t)j];
+                    for (int i = 0; i + 1 < nUpConn; ++i)
+                        add = add + cieSec[i] * (k * fProdSec[i] * betaSec[i] * ls.beta[i]);
+                    add = add * (1.0 / (double)nUpConn);
+                }
+                result += add;
             }
 
             // (d) Vertex merging: gather nearby light vertices from ALL paths (XYZ estimate).
@@ -695,19 +926,46 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // camera BSDF evaluated at the light vertex's wavelength (XYZ estimate).
                     double lam = (double)lv.lambda;
                     double fCam = bsdfF(*mp, h.n, wo, wMerge, lam, scene, &h);
-                    if (fCam <= 0.0) return;
+                    // HERO MERGE. Unlike the connection above, a merge gathers vertices from
+                    // OTHER paths, i.e. other bundles — so it is keyed on the LIGHT VERTEX's
+                    // wavelengths (its hero plus its live secondaries), exactly as the
+                    // single-λ version already keyed on lv.lambda. The camera-side throughput
+                    // stays the hero's (the standard spectral-photon-mapping approximation,
+                    // see the SPECTRAL NOTE at the top of this file); the per-λ part is the
+                    // camera BSDF and the light vertex's own throughput. Averaged over the
+                    // light vertex's live λ, so the merge is normalised like every other
+                    // strategy here.
+                    const int lvUp = heroOn ? lightSec[(size_t)idx].nUp : 1;
+                    double fSec[hero::kHeroMax - 1] = {0}, mxF = fCam;
+                    for (int k = 0; k + 1 < lvUp; ++k) {
+                        fSec[k] = bsdfF(*mp, h.n, wo, wMerge,
+                                        (double)lightSec[(size_t)idx].lam[k], scene, &h);
+                        if (fSec[k] > mxF) mxF = fSec[k];
+                    }
+                    if (mxF <= 0.0) return;
                     // Gather-side shading-normal correction (cos_s/cos_g at the merge point):
                     // rebalances the geometric-cosine density estimate onto the shading cosine
                     // so a smooth mesh merges smoothly like mode R. 1 when h.n==h.ng (flat).
                     Vec3 ngoCam = (dot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * -1.0;
-                    fCam *= vmGatherCorr(wMerge, h.n, ngoCam);
+                    const double gcorr = vmGatherCorr(wMerge, h.n, ngoCam);
+                    fCam *= gcorr;
+                    // The merge MIS weight is built from λ-independent densities, evaluated
+                    // once at the light vertex's hero and shared by its secondaries.
                     double camDirPdfW = bsdfPdf(*mp, h.n, wo, wMerge, lam, scene, &h);
                     double camRevPdfW = bsdfPdf(*mp, h.n, wMerge, wo, lam, scene, &h);
                     double wLight = lv.dVCM * ctx.misVcWeight + lv.dVM * Mis(camDirPdfW);
                     double wCamera = dVCM * ctx.misVcWeight + dVM * Mis(camRevPdfW);
                     double misW = 1.0 / (wLight + 1.0 + wCamera);
                     Vec3 cieL(lv.cx, lv.cy, lv.cz);   // cached at store time (bit-identical)
-                    mergeXYZ += cieL * (misW * fCam * lv.beta);
+                    Vec3 add = cieL * (misW * fCam * lv.beta);
+                    if (lvUp > 1) {
+                        const LightVertexSec& ls = lightSec[(size_t)idx];
+                        for (int k = 0; k + 1 < lvUp; ++k)
+                            add = add + Vec3(ls.cx[k], ls.cy[k], ls.cz[k]) *
+                                        (misW * fSec[k] * gcorr * ls.beta[k]);
+                        add = add * (1.0 / (double)lvUp);
+                    }
+                    mergeXYZ += add;
                 });
                 result += mergeXYZ * (beta * ctx.vmNorm);
             }
@@ -717,14 +975,20 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
 
         // Sample a continuation direction.
         Vec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
+        double secF[hero::kHeroMax - 1]; bool secChromatic = false, keepBundle = false;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
-                      cosThetaOut, delta, terminate, stk);
-        if (terminate || betaFactor <= 0.0) return result;
+                      cosThetaOut, delta, terminate, stk,
+                      hb.lam, nUp, secF, &secChromatic, &keepBundle);
+        double mxF = betaFactor;      // max over live λ, never the hero alone (policy 3)
+        if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
+        if (terminate || mxF <= 0.0) return result;
         if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) return result;
 
         misScatter(delta, cosThetaOut, pdfW, pdfRevW, ctx.misVcWeight, ctx.misVmWeight,
                    dVCM, dVC, dVM);
         beta *= betaFactor;
+        for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
+        if (delta && !keepBundle) nUp = 1;      // de-hero (see traceLightSubpath)
         prevP = h.p;
         double sgn = dot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
         ray = Ray{h.p + h.ng * (sgn * 1e-6), normalize(wi)};
@@ -736,8 +1000,14 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
 // vertices + connect-to-camera splats), builds the grid, then traces nLightPaths camera
 // subpaths (one per pixel) accumulating all strategies. Adds this pass's full per-pixel
 // XYZ into st.accum and increments st.passes.
+// `heroC` bundles that many wavelengths onto every traced ray (Wilkie et al. 2014; 1 == the
+// plain single-λ estimator, bit-identical to before). The bundle is drawn ONCE PER PATH
+// INDEX and shared by light path p and camera path p, so the vertex-connection strategies
+// stay exact per-λ; merging, which crosses paths, is keyed on the light vertex's own
+// wavelengths (see traceCameraSubpath).
 inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double radius,
-                    int nThreads, bool diffraction, int maxDepth, uint64_t passSeed) {
+                    int nThreads, bool diffraction, int maxDepth, uint64_t passSeed,
+                    int heroC = 1) {
     if (nThreads < 1) nThreads = 1;
     const int W = st.resX, H = st.resY;
     const long long nPix = (long long)W * H;
@@ -753,19 +1023,30 @@ inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double 
     ctx.maxDepth = maxDepth;
     ctx.diffraction = diffraction;
 
-    // One wavelength per PATH INDEX (shared by light path p and camera path p so their
-    // vertex connections are exact). Sampled up front from the emission importance.
-    std::vector<double> lam((size_t)nPix), invLam((size_t)nPix);
+    // One wavelength BUNDLE per PATH INDEX (shared by light path p and camera path p so
+    // their vertex connections are exact). Sampled up front from the emission importance.
+    // heroC == 1 draws the single hero exactly as before (hero::sampleBundle with C == 1
+    // is the plain emitSampler draw), so this path is bit-identical.
+    const int C = (heroC < 1) ? 1 : (heroC > hero::kHeroMax ? hero::kHeroMax : heroC);
+    std::vector<bdpt::HeroBundle> bundles((size_t)nPix);
     {
         Pcg32 rng; rng.seed(passSeed * 0x2545F4914F6CDD1DULL + 7, 0x9E3779B97F4A7C15ULL ^ passSeed);
         for (long long i = 0; i < nPix; ++i) {
-            double pdfL = 0.0; double l = scene.emitSampler.sample(rng, pdfL);
-            lam[i] = l; invLam[i] = (pdfL > 0.0) ? scene.invPdfLambda(l) : 0.0;
+            bdpt::HeroBundle& hb = bundles[(size_t)i];
+            hb.C = C;
+            double pdfA[hero::kHeroMax] = {0};
+            if (!hero::sampleBundle(scene.emitSampler, rng.uniform(), C, hb.lam, pdfA)) {
+                hb.C = 0;                      // dead bundle: skipped by both passes
+                continue;
+            }
+            for (int k = 0; k < C; ++k)
+                hb.invPdf[k] = (pdfA[k] > 0.0) ? scene.invPdfLambda(hb.lam[k]) : 0.0;
         }
     }
 
     // (1) Light pass — per-thread local vertex + splat buffers, concatenated in path order.
     std::vector<std::vector<LightVertex>> tVerts(nThreads);
+    std::vector<std::vector<LightVertexSec>> tSec(nThreads);   // empty unless C > 1
     std::vector<std::vector<int>> tPathCount(nThreads);  // per-path stored-vertex count
     std::vector<std::vector<Vec3>> tSplat(nThreads);
     {
@@ -775,12 +1056,14 @@ inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double 
                                 0xD1B54A32D192ED03ULL ^ ((uint64_t)tid << 7) ^ (passSeed << 1));
             long long i0 = nPix * tid / nThreads, i1 = nPix * (tid + 1) / nThreads;
             auto& verts = tVerts[tid]; auto& counts = tPathCount[tid];
+            auto& secs = tSec[tid];
             auto& splat = tSplat[tid]; splat.assign((size_t)nPix, Vec3{0, 0, 0});
             counts.assign((size_t)(i1 - i0), 0);
             for (long long i = i0; i < i1; ++i) {
-                if (invLam[i] <= 0.0) { continue; }
+                const bdpt::HeroBundle& hb = bundles[(size_t)i];
+                if (hb.C <= 0 || hb.invPdf[0] <= 0.0) { continue; }
                 size_t before = verts.size();
-                traceLightSubpath(scene, cam, mats, ctx, lam[i], invLam[i], rng, verts, splat, W);
+                traceLightSubpath(scene, cam, mats, ctx, hb, rng, verts, secs, splat, W);
                 counts[(size_t)(i - i0)] = (int)(verts.size() - before);
             }
         };
@@ -791,9 +1074,11 @@ inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double 
 
     // Concatenate per-thread vertex buffers in path (pixel) order; build per-path ranges.
     std::vector<LightVertex> lightVerts;
+    std::vector<LightVertexSec> lightSec;      // parallel to lightVerts; empty when C == 1
     {
         size_t total = 0; for (auto& v : tVerts) total += v.size();
         lightVerts.reserve(total);
+        if (C > 1) lightSec.reserve(total);
     }
     std::vector<int> pathBegin((size_t)nPix, 0), pathEnd((size_t)nPix, 0);
     for (int t = 0; t < nThreads; ++t) {
@@ -806,6 +1091,7 @@ inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double 
             cursor += cnt;
         }
         for (auto& lv : tVerts[t]) lightVerts.push_back(lv);
+        for (auto& ls : tSec[t]) lightSec.push_back(ls);
     }
 
     // (2) Build the merge grid over all stored light vertices.
@@ -826,9 +1112,10 @@ inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double 
             for (int y = y0; y < y1; ++y)
                 for (int x = 0; x < W; ++x) {
                     long long i = (long long)y * W + x;
-                    if (invLam[i] <= 0.0) continue;
-                    Vec3 c = traceCameraSubpath(scene, cam, mats, ctx, x, y, lam[i], invLam[i],
-                                                rng, lightVerts, pathBegin[(size_t)i],
+                    const bdpt::HeroBundle& hb = bundles[(size_t)i];
+                    if (hb.C <= 0 || hb.invPdf[0] <= 0.0) continue;
+                    Vec3 c = traceCameraSubpath(scene, cam, mats, ctx, x, y, hb,
+                                                rng, lightVerts, lightSec, pathBegin[(size_t)i],
                                                 pathEnd[(size_t)i], grid);
                     passImg[(size_t)i] += c;
                 }

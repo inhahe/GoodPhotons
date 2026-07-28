@@ -37,9 +37,104 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   allow, CPU fallback otherwise; all-M pinhole groups meter in one batched
   `renderPhotonMapSharedCuda` pass with `MeterConverge` early-stop via `onFrame`),
   PNG/PPM output.
-- **`scene.h` / `ftsl.h`** — scene model and the FTSL scene-language parser
+  **Output-directory precheck:** an `ensureOutDir` lambda runs once after the `-check*`
+  self-test early-returns — the earliest point where `out` is final, since the
+  bare-invocation preview path can still rewrite it to a `$TEMP` name — and creates
+  `-o`'s (and `-savemap`'s) missing parent directory, or exits 2 with a named error.
+  It has to be a precheck rather than a per-write fallback because every writer is
+  reached only *after* the film exists: a bad directory used to be discovered at the
+  first `-interval` tick and threw the whole accumulated render away. One check on `-o`
+  suffices for the `.ftbuf` sidecar, the per-camera `outFor()` names and the stereo eye
+  pair, which all share its directory; `-savemap` is the only independent path.
+- **`src/gpda/`** — the FTSL front end. `ftsl_scene.epeg` (in
+  `tools/loom/loom/grammar/`) is the **single source of truth** for FTSL's syntax;
+  `loom.grammar.emit_cpp` compiles it to `ftsl_scene.gen.cpp` — a parser graph plus
+  the lexer's rule table. `gpda_lexer.hpp` (hand-written, *not* generated) turns
+  source text into tokens by longest match over those rules; it derives a first-byte
+  set from each rule's pattern and takes a literal fast path where it can, so a token
+  costs one or two `std::regex` calls rather than one per rule.
+  `tokenized.{hpp,cpp}` + `pool.hpp` (verbatim vendored copies of the upstream GPDA
+  parser in `D:\visual studio projects\GraphParser`) then walk the graph to a parse
+  tree, which
+  `ftsl_reduce.hpp` reduces to the same `std::vector<ftsl::Block>` the hand-written
+  parser produced. `ftsl_frontend.hpp` is the entry point — since 0.79.0 that is just
+  `ftsl_gpda::parse`. loom parses the
+  *same* grammar in Python via the pinned `tools/loom/loom/grammar/_gpda.py`, so
+  ftrace and loom cannot disagree about the language. The flip (0.68) was gated on
+  `-validate-grammar` reporting zero structural mismatches across all 2595 `.ftsl`
+  files in the tree, down to per-statement line numbers; it held there for ten
+  releases, and 0.79.0 deleted the hand-written parser, the `-legacy-parser` escape
+  hatch and the cross-check differ, leaving exactly one implementation of the
+  language. Loading the largest scene in
+  the tree (22 KB) costs ~42 ms of lex+parse. `tools/gpda_lexcheck/` is the permanent
+  differential validator for the lexer's fast paths: it brute-forces that no rule's
+  first-set ever excludes a byte the rule's own regex could match, and that the fast
+  lexer's token stream is identical to a naive all-regex one.
+- **`scene.h` / `ftsl.h`** — scene model and the FTSL semantic pass
   (cameras, camera_curve/path/orbit, materials, lights, media, implicits, meshes).
-  `FTSL.md` documents the language.
+  `FTSL.md` documents the language. Everything downstream of
+  `std::vector<Block>` — turning blocks into a `Scene` — lives here. Through 0.78 a
+  hand-written recursive-descent tokenizer + `Parser` lived here too, kept compiled in
+  behind `-legacy-parser`; 0.79.0 deleted both, so `loadSource()` now has a single
+  path. Note that `applyBracketGroup` (how a `[ … ]` group becomes a swatch / array
+  literal / index selector) deliberately stays at *this* level rather than in the
+  front end — keeping that decision in one place outside the parser is what let the
+  grammar replace the hand-written parser as a pure parse-tree exercise.
+  **Unknown-key reporting** (since 0.77.0) rides on this pass. `Stmt` carries a
+  `mutable bool used`, set inside `find(const Block&, const char*)` — the single choke
+  point every property read (`strOf`/`vec3Of`/`dblOf`/`spectrumParam`/…) funnels
+  through, so the accounting costs no per-builder changes. `mutable` is required
+  because reads take a `const Block&` and "I was read" isn't part of a block's logical
+  value. The ~17 sites that iterate `b.stmts` directly instead of calling `find` —
+  repeated-key gathers (`point`, `density_at`, `look_point`, `roll_at`/`fov_at`,
+  `layer`, `surface`, `key`), exhaustive dispatch loops (group children, isosurface
+  field elements and their nested CSG recursion, record bodies, record-override
+  materials), and flat-word bodies (`table`, `palette`, `data`) — mark explicitly via
+  `markUsed(b, key)` / `markAllUsed(b)`. After `Builder::build` finishes,
+  `collectUnusedKeys` walks the blocks and records anything still unmarked on
+  `Loaded::unknownKeys`; `loadSource` prints those to stderr before each success
+  return. Warnings are carried on `Loaded` rather than printed inside `build()`
+  because `prefer { } else { }` trial-builds several candidate scenes and discards all
+  but one — only the accepted candidate's warnings are the author's problem. The check
+  warns rather than errors so a scene with a stale property still renders; the point is
+  that an unread key otherwise silently does nothing, turning a typo or a drifted
+  emitter into a wrong image instead of a message. This is what makes the loom
+  emitter-drift audit (`scraps/emit_audit.py`, TODO J3c) mechanically possible at all.
+  Lights are `Emitter`s with an `EmitterShape`
+  (Quad/Sphere/Spot/Env/Cylinder/**Mesh**/**Sun**); each carries its own SPD and a `power`
+  = emitIntegral·geomWeight selection weight. **Distant sun** (since 0.84.0):
+  `EmitterShape::Sun` (`Scene::addSunLight`, `light sun { … }`) is an infinitely-distant
+  disc whose rays arrive parallel. It reuses the spot fields with
+  `spotCosInner == spotCosOuter == cos θ`, so `spotOmega` evaluates to the cone solid
+  angle `Ω` and no new field is needed on host or device; `geomWeight = Ω·πR²`. The
+  authored SPD is *perpendicular irradiance*, stored as radiance `E⊥/Ω` (so `angle`
+  changes the penumbra, not the exposure). Forward emission samples the cone then an
+  entry disc of radius `R` perpendicular to the sampled direction — joint pdf
+  `1/(Ω·πR²) = 1/geomWeight`, exactly analog, so **every** photon enters the scene.
+  Backward does cone NEE and adds the direct disc view on a ray miss only when
+  `specularArrival` is true — a single unbiased estimator with **no MIS weight**, since
+  NEE runs at precisely the material types that then clear that flag. `Scene::sunCount`
+  gates all of it, so sun-free scenes are untouched. Not area-connectible, so `bdpt.h` /
+  `vcm.h` reject it like Spot/Env. The Preetham sky's `sun_disk separate` option
+  (`sky::SunDisk`) unbakes the solar disc from the env map and registers an
+  energy-matched Sun instead — the same picture, converging ~20× faster in forward modes.
+  **Mesh area lights** (since 0.41.0): a
+  material with an `emit` spectrum bound to a `mesh` registers an
+  `EmitterShape::Mesh` emitter (`Scene::addMeshLight`) holding a per-triangle
+  cumulative-area CDF (`Emitter::meshTris`, `EmitTri`); `samplePoint` binary-searches
+  the CDF to pick a triangle by area then samples it barycentrically (pdf = 1/total
+  area — the same law as a quad, so NEE / forward emission / BDPT s=0 all consume it
+  through the existing generic paths). `ftsl.h addMesh` auto-registers it and, with a
+  mesh-block `power`/`lumens`, rescales the SPD over the mesh area (cloning the
+  material + rebinding the range's triangles so a shared material is untouched).
+  Emission is one-sided (front face), so `addMesh` auto-orients a *closed* emissive
+  shell outward before registration: it computes the signed volume about the range's
+  centroid and, if it is negative (inward winding) and large enough to be a real
+  enclosed volume (thresholded vs area^1.5, so planar/open sheets are left alone),
+  reverses every triangle (swap v1↔v2 + uv/shading-normal, re-`finalize()`). This
+  keeps an inward-wound import (e.g. `torus.obj`) from radiating into its own hollow.
+  The GPU mirrors the sampler: `DEmitter` gains a device `DEmitTri*` CDF +
+  `emitterSamplePoint` shape-5 branch, uploaded per emitter.
 - **`geometry.h` / `bvh.h`** — primitives + SAH BVH (split plane by SAH, always
   recurse to LEAF_SIZE, median fallback; front-to-back traversal, ray-slab test
   unrolled; `tEnter` pruning).
@@ -52,17 +147,113 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   serial — bit-identical to the old serial code by construction. Per-implicit
   marching also runs in parallel across objects.
 - **`render.h`** — CPU forward tracer (modes A/B/C + photon deposit for M/S/P):
-  per-photon loop, Russian roulette, sphere-scan cos/sin tables, splatting.
-- **`backward.h`** — CPU backward reference tracer (`radianceHero`).
+  per-photon loop, Russian roulette, sphere-scan cos/sin tables, splatting. The hero
+  variant `tracePhotonHero` follows the same **max over live λ** RR rule as
+  `backward.h` below (Diffuse, DiffuseTransmit's lobe pick, and the achromatic delta
+  lobes Mirror/Filter/Glossy, which keep the bundle) — with one extra obligation the
+  backward tracer doesn't have: the forward tracer keeps an **energy ledger**
+  (`emitted = absorbed + sensor + escaped + residual`), and the survivors' reweight
+  `beta[i] *= c_i/q` is *deterministic absorption*, so each reweight books
+  `e.absorbed += beta[i] * (1 - c_i/q)`. Omit that and `sum/emitted` collapses
+  (measured 0.66); the old ratio reweight *created* ledger energy (up to 1.007). With
+  the booking the ledger closes identically, which it never did before.
+  The bounce loop lives in **`tracePhotonHeroLoop`**, split out of `tracePhotonHero`
+  so the opt-in `-herosplit` policy can **re-enter it recursively** — once per
+  secondary — at a dispersive interface, instead of de-hero'ing. Each sub-path
+  re-runs the same interaction with its own λ (its own Snell direction / grating
+  order) on its own `MediumStack` copy, then continues monochromatically; the branch
+  is guarded on `secAlive`, so a sub-path never re-splits and recursion is at most
+  one level deep (cost linear in C, bounded stack). Weights are untouched — the C
+  sub-paths keep `base/C` each and the parent zeroes them — so the ledger stays
+  exact. The policy is a whole-run choice, so it rides on the `hero::gSplit` global
+  that `Renderer::heroSplit` default-initialises from, rather than being threaded
+  through every entry point the way per-pass `heroC` must be.
+- **`backward.h`** — CPU backward reference tracer (`radianceHero`). Every Russian
+  roulette in the hero path uses the **max over live λ** as its survival
+  probability, with survivors reweighting `thr[i] *= c_i/q ≤ 1` — never the hero's
+  own coefficient with a `c_i/c_hero` ratio, which amplifies a secondary whenever
+  the hero λ is the dark one (a saturated wall spectrum makes that a 15× weight
+  spike). That applies to Diffuse, DiffuseTransmit's lobe pick, and the achromatic
+  delta lobes Mirror/Filter/Glossy, which for the same reason as BDPT's
+  `keepBundle` do **not** de-hero (their outgoing direction ignores λ). At
+  `nUp == 1` every one of these is the scalar code verbatim.
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
+  Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,
+  per-λ connection terms under one shared hero-driven MIS weight; the splat
+  normalises by `1/min(nUp_light, nUp_eye)` instead of a per-subpath ×C boost).
+  The per-λ scatter factor `secF[]` is **absolute** (`f_i·cos/pdf_hero`), never a
+  ratio to the hero's, and the walk's early-out is a max over live λ — so a lobe
+  whose hero value is 0 (a gel filter, a saturated albedo) can't drop live
+  secondaries. Delta vertices de-hero *except* Mirror and Filter, which pick their
+  continuation without consulting λ and so set `keepBundle`.
 - **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.
+  **`PhotonMap` is structure-of-arrays, and that is load-bearing.** Deposit positions
+  live in `pos[]`, everything the gather reads after acceptance in `photons[]`, and the
+  precomputed CIE triple in `cie[]` — three arrays permuted together by the counting
+  sort, so index `k` names one photon in all three. The reason: a radius-`r` query scans
+  the 3×3×3 cell box but keeps only the inscribed sphere, so ~85% of candidates are
+  rejected on a distance test that needs the position and nothing else. Interleaved,
+  that scan strided a fat record and used a fraction of each cache line it pulled; split,
+  it is a dense 24 B/photon stream. This dominates precisely where mode M hurts — a dense
+  map is gigabytes, so the gather is DRAM-bandwidth-bound. `Photon` therefore holds only
+  `n`/`power`/`lambda`; the incident direction it used to carry was never read by any
+  gather (the estimate is Lambertian) and was pure per-photon waste — the device deposit
+  record `DPhoton` lost the same field for the same reason, which matters extra there
+  because its buffer is sized from *free VRAM*, so fewer bytes per record is directly more
+  photons the GPU can hold (44 → 32 B). The GPU's gather record `DGatherPhoton`
+  (render_cuda.cu) is the same idea, and additionally folds
+  `cie*power*norm/pi` into three floats. The `-savemap` cache format is `FTPMP02`
+  (two blocks: positions, then payloads); `FTPMP01` files are rejected with a message
+  telling the user to re-deposit.
+  **The mode-M gather radius is density-adaptive** (`PhotonMap::buildAuto`, default on;
+  `-nopmauto` or an explicit `-pmradius` opts out bit-identically). `build(r)` sizes the grid
+  at `cellSize == r`, so a radius chosen from scene size alone freezes the grid and makes
+  photons-per-cell — and gather cost — grow *linearly* with `-n`. `buildAuto` therefore bins
+  once at the requested radius as a probe, asks `medianNeighborCount()` what a typical gather
+  actually sees, and re-bins at `r·sqrt(k/n)` for a target `k = kAt1M·cbrt(M/1e6)`, `M` =
+  stored photons. The cube root is a deliberate choice, not a free parameter: holding the
+  disc population *constant* (`r ∝ M^-1/2`) would hold variance constant too, so the image
+  would never converge in noise, only in bias. `r ∝ M^-1/3` gives per-query cost `M^1/3`,
+  noise `M^-1/6` and bias `M^-2/3` — both error terms → 0, with a mild cost curve.
+  `build` is split into `buildGrid` + `fillCie` for this, since the probe needs a second
+  counting sort but only one (expensive, threaded) CIE pass.
+  **`medianNeighborCount` samples by cell, not by array index** — cells are fixed by the
+  bbox and cell size, i.e. by geometry, whereas the counting sort is stable and so preserves
+  a within-cell order that differs between a fresh deposit and a `-loadmap` of the same map.
+  Sampling by array position therefore made `-loadmap` stop reproducing its `-savemap` run.
+  Within a sampled cell the representative is the lexicographically smallest position (a
+  set-minimum, hence order-free); the cell *centre* would not do, because a cell that the
+  surface merely clips has its centre off-surface and reports a spuriously empty
+  neighbourhood.
+  The GPU shared path gets the same treatment via `renderPhotonMapSharedCuda`'s `autoK`
+  argument (0 = off) — it must, since that is the high-photon-count path where a
+  count-independent radius collapses worst. The gather reads `pm.radius` after the build, so
+  the adapted value needs no further plumbing.
 - **`spectrum.h` / `spectral_library.h` / `upsample.h` / `color.h` / `hero.h`** —
   spectral core: measured SPDs/materials, RGB→spectrum upsampling, CIE tables,
   hero-wavelength sampling (`kHeroC=4`: hero λ + 3 stratified secondaries) used by
-  R, A/B/C, M/S on CPU and the GPU forward megakernel. Emitter SPD sampling is
+  R, A/B/C, M/S and BDPT D on CPU and the GPU forward/backward/BDPT megakernels
+  (the GPU BDPT keeps its per-vertex secondaries in a parallel array and templates
+  `kBdptT<NS>` on the slot count, so the scalar instantiation costs no extra local
+  memory). `hero.h` is deliberately thin and dependency-free: it owns the two shared
+  constants, the stratified bundle draw `sampleBundle()` (templated on the sampler so
+  it serves both the forward tracer's per-emitter `Emitter::spd` and the
+  backward/BDPT tracers' scene-wide `Scene::emitSampler`), the live-λ maximum
+  `maxOf()`, the `gSplit` policy flag, and — most importantly — the **single
+  authoritative statement of the four hero policies** (stratification; which lobes
+  de-hero and why the criterion is a λ-*dependent direction* rather than mere
+  delta-ness; analog RR is max-over-live-λ; per-λ factors are absolute not ratios),
+  along with the two rules that are deliberately per-tracer (the forward energy
+  ledger must book the RR reweight as absorption; BDPT normalises by
+  `1/min(nUp_light, nUp_eye)` instead of a ×C boost). The four tracers are different
+  *estimators* rather than four copies of one, so they are **not** unified behind a
+  shared `HeroLambda` struct — only the genuinely identical pieces and the policy
+  prose are shared, because that prose going stale in three files is what let each
+  of this feature's two real bugs be fixed independently two-to-four times.
+  Emitter SPD sampling is
   cached per light. Tabulated curves (FTSL `table { }` / `file:`) build a
   `Spectrum` via `tabulatedSpectrum` (piecewise-linear, default) or
   `tabulatedSpectrumMono` (opt-in `interp=cubic`: monotone Fritsch–Carlson/PCHIP —
@@ -72,16 +263,251 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   doesn't span the 360–830 nm render range. Since `Spectrum` is
   `std::function<double(double)>` evaluated at each photon's exact λ, the interpolant
   shape shows directly (there's no pre-binning), which is why overshoot matters.
+- **`upsample.h` — the RGB→spectrum upsampler family.** Five reconstructions of a
+  spectrum from a colour triple, each reached by its own FTSL head keyword
+  (`rgb`/`hsv`/`hsl` + suffix), all sharing one `upsample::Basis` (95 samples,
+  360–830 nm at 5 nm; weights `k·D65(λ)·CMF(λ)·Δλ`, `k` normalised so unit
+  reflectance integrates to `Y=1`). They differ in what they optimise, which is why
+  more than one is kept: **Jakob–Hanika** (`rgb`, the default) fits a 3-parameter
+  sigmoid — always in `[0,1]`, cheap, but the *shape* is whatever the sigmoid
+  family allows; **JH illuminant** (`rgbillum`) is the same fit renormalised for
+  emission; **Smits 1999** (`rgbsmits`) mixes seven fixed basis curves; **3-box**
+  (`rgbbox`) solves a 3×3 for one flat step per band — exact round-trip but blocky;
+  **Meng 2015** (`rgbmeng`) is the *smoothest* physical reflectance producing the
+  colour. Only under a non-D65 illuminant (or under dispersion) does the choice show
+  in the render — every upsampler round-trips its own colour under D65 by
+  construction, so it is the reconstructed *shape*, not the colour, that differs
+  (`scraps/meng_test.ftsl` makes this visible by lighting four identical panels with
+  illuminant A). `-checkupsample` validates all five: round-trip error, `[0,1]`
+  physicality, and — for Meng specifically — that its roughness is provably below
+  JH's on every test colour.
+  Meng is table-driven, and the table (`src/meng_table.h`, ~140 KB) is **baked by us**
+  (`tools/bake_meng.py`), not transcribed from the authors' supplemental — the method
+  is published, the published data carries no licence. Two deliberate departures from
+  the paper make the bake much simpler *and* more accurate for our use:
+  (a) the grid is barycentric **in the sRGB primary triangle** rather than over the
+  spectral locus, because every colour ftrace upsamples arrives as `rgb r g b` with
+  components in `[0,1]` and therefore already lies inside that triangle — the
+  barycentric coordinates are just `(r·S_R, g·S_G, b·S_B)` normalised (`S_i` = column
+  sums of `linSrgbToXyz`), so there is no search, no cell classification, no locus
+  polygon; and (b) each vertex is solved at **`Y=1` with no upper bound**, not at some
+  fraction of max brightness with `s ≤ 1`. (b) is the load-bearing one: the
+  minimum-roughness solution is linear in the target XYZ only if the feasible set is a
+  *cone*, and `{s ≥ 0}` is while `{0 ≤ s ≤ 1}` is not. Tabulating against an active
+  upper bound silently destroys the very property being tabulated — scaling the stored
+  spectrum down to a darker colour stops being optimal — which is exactly the bug that
+  first made `-checkupsample` report Meng as *rougher* than JH. The renderer scales to
+  the requested luminance and clamps at use time. Interpolation weights each cell
+  vertex by `bary_k / T_k` (`T_k = X+Y+Z` of its spectrum) rather than by `bary_k`
+  alone, because a chromaticity is an `(X+Y+Z)`-weighted mean — that is what makes the
+  interpolated chromaticity *exact* rather than merely close.
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.
 - **`materials.h` / `pattern.h` / `texture.h` / `layered`** — BSDFs (diffuse,
   mirror, glossy, dielectric w/ nested IOR, diffuse-transmission, filter gels,
   fluorescence, layered), procedural patterns (POV-derived `pov_noise.h` /
-  `pov_functions.h`), UV texturing.
-- **`medium_stack.h` / `phase.h` / `grin.h` / `rainbow.h` / `vdbgrid.*`** —
+  `pov_functions.h`), UV texturing. **Tangent-space normal maps** (`normal_map
+  texture:<name> strength <s>`): per-triangle tangents are built in `Tri::finalize()`
+  from the UV gradients (Gram-Schmidt vs the geometric normal + a stored
+  `bitangentSign`); `Scene::applyNormalMap` remaps the linear-`encoding` map's texel
+  to a `[-1,1]` vector and rotates it through the surface TBN frame. It is invoked at
+  the single intersection choke point (`closestHit`/`closestHitLinear` on the CPU,
+  `dApplyNormalMap` in the device `closestHit`) so every renderer and both devices
+  perturb shading identically; tangents transform with instances (`instanceHitToWorld`,
+  the device uploading a per-instance `Wm` = toWorld linear).
+
+  **Pattern-driven reflectance (`Material::reflectPat`).** Patterns originally drove only
+  *scalar* slots (`roughness`, `film_thickness_map`, `weight_map`), because `reflect` is
+  spectral and a pattern is a scalar. The resolution is that a scalar in a spectral slot is
+  a per-hit **multiplier**, not a replacement — which is strictly more general than the
+  obvious "greyscale reflectance" reading and degenerates to it: `reflect pattern:<n>` (and
+  `reflect [0 1](u)`, which desugars to it) leaves the pattern alone in the slot, so the
+  loader stores a flat-1.0 base and the multiply *is* the albedo; `reflect_map pattern:<n>`
+  beside an authored spectrum or a bound `reflectTex` modulates that. Colour therefore
+  cannot come from a pattern by construction. The multiplier is clamped to [0,1] (no energy
+  from a formula). It is applied in exactly the two shared accessors that already funnel
+  every renderer's reflect read — `diffuseReflectance` and `reflectSlot` in `scene.h`, plus
+  device twins `dDiffuseRho` / `dReflectSlot` — so all six tracers and both backends pick it
+  up from one edit, and `renderBackwardRGBCuda`'s baked-RGB fast path opts out alongside the
+  existing `reflectTex` opt-out. The families whose reflect slot does *not* go through those
+  accessors (Fluorescent's `fluoroWeights`, which has no hit to evaluate at; ThinFilm;
+  Dielectric) are **rejected at load** rather than silently ignored, because the flat-1.0
+  base a lone `reflect pattern:` leaves behind would otherwise render as albedo 1.0 — a
+  wrong image rather than a missing effect.
+
+  **Pattern-driven transmittance (`Material::transmitPat`).** The same mechanism on the
+  `transmit` slot: `transmit pattern:<n>` / `transmit [0 1](u)` alone in the slot, or
+  `transmit_map pattern:<n>` modulating an authored spectrum. Reaching it needed a
+  refactor first — unlike `reflect`, the transmit slot had **no shared accessor** and was
+  read as a bare `m.transmit(lambda)` at 16 sites across 7 renderer headers (`render.h`,
+  `backward.h`, `bdpt.h`, `vcm.h`, `photonmap_render.h`, `sppm_render.h`) plus 16 device
+  sites in `render_cuda.cu`. Those now all funnel through `transmitSlot(scene, m, h,
+  lambda)` in `scene.h` (device twin `dTransmitSlot`), which is the single point of truth
+  for **both** readings of the slot: a `filter`'s per-wavelength gel transmittance
+  T(λ), and a `translucent`'s back-hemisphere Lambertian albedo ρ_T. Callers keep their
+  own `clamp01` and, for the two-lobe case, still apply the ρ_R + ρ_T ≤ 1 energy guard
+  *after* the multiplier. There is no record channel and no texture on this slot, so the
+  accessor has only the one base path (simpler than `diffuseReflectance`). Only those two
+  families are honoured — every other type leaves `transmit` at its 0 default and never
+  reads it — so a transmit pattern anywhere else is a load error, same policy as
+  `reflect`. The reflect and transmit loader paths are themselves now one function
+  (`patternedSpectrumParam` + `checkSlotPatSupported`, keyed on the slot name), and
+  `renderBackwardRGBCuda` opts out of its baked-RGB fast path on `transmitPat` too.
+
+  **Pattern-driven emission (`Material::emitPat` / `Emitter::emitPat`).** The third leg of
+  the trio, and the strict one. Spellings match: `emit pattern:<n>` alone in the slot (base
+  collapses to flat 1.0 ⇒ the pattern *is* a greyscale emission profile) or `emit_map
+  pattern:<n>` modulating an authored spectrum; a `light` block spells the same slot `spd`,
+  so there the pair is `spd pattern:` / `spd_map pattern:`. `finalizeEmitters` copies the
+  material's `emitPat` onto the `Emitter` it registers, so the two spellings converge on one
+  runtime field. Emission is stricter than reflect/transmit because it is read from **both
+  sides of transport**: once when a camera path lands on the emitter (emission-on-hit, PatCtx
+  built from the `Hit`) and once at the point NEE / a light subpath samples on it (PatCtx
+  built from `Emitter::samplePoint`). MIS *combines* those two estimates, so if they ever
+  disagreed pointwise the image would be **biased**, not merely noisy. The profile is
+  therefore only legal where the sampler's (u,v) provably equals the (u,v) a hit interpolates
+  — `EmitterShape::Quad` (bilinear parameters) and `EmitterShape::Mesh` (barycentric UVs on
+  `EmitTri`, which gained `uv0`/`uvE1`/`uvE2`). Every other shape (sphere, cylinder, spot,
+  sun, collimated, env) is **refused at load**, at two points: `addLight`'s subtype gate, and
+  `checkEmitPatsSupported` after `Scene::build()` for the material route. Making the quad
+  agree required fixing a latent pre-existing bug — the area light's *second* triangle
+  carried default UVs disagreeing with `addQuad`'s, i.e. a diagonal seam for any UV-driven
+  emission pattern **or texture** on an area light. `Emitter::samplePoint` gained optional
+  `uuOut`/`vvOut`, and the read is funnelled through three accessors in `scene.h`:
+  `emitSlot` (emission-on-hit), `emitterPatMulAt`, and `emitterSamplePoint` (sample + return
+  the multiplier in one call). The pattern is a **pure post-multiplier on radiance / photon
+  beta**: `Emitter::power`, `pdfChoice`, `pdfPos`/`pdfA`, `emissionPdfW`, `directPdfW` and
+  every VCM `dVCM`/`dVC`/`dVM` are deliberately untouched, which is exactly what makes it
+  unbiased by construction (no selection or positional pdf changes anywhere). The cost is
+  variance on a mostly-dark profile, and the fact that `power`/`lumens` normalise the
+  *unpatterned* spectrum, so a profile averaging 0.5 emits about half the requested flux —
+  documented rather than auto-corrected, since folding the mean into `power` would need a
+  compensating 1/mean on photon beta and on BDPT's `pdfChoice`. Verified unbiased at 160×160
+  against four independent estimators (R vs D within 0.3%, with a pattern-free control
+  showing the *same* residual, so it is a pre-existing R-vs-D difference; B/400M photons
+  within 0.005%; U/VCM within 0.02%). **CPU-only in 0.80.0**: the device has ~20 emission
+  read sites, and a partial port would be *biased* rather than visibly incomplete, so
+  `cudaForwardSupported` (and `cudaBackwardRGBSupported`) reject the whole scene and the CPU
+  renders it; the port is tracked in `known-issues.md`. The preview rasteriser ignores
+  `emitPat`, consistent with its existing treatment of `reflectPat`/`transmitPat`.
+
+  **N-D authored-data tables.** A pattern formula can sample arrays of authored numbers in
+  1–4 dimensions, via two sibling datatypes ported from loom's `data.py`/`interp.py`:
+  `grid:<name>(c0, …)` reads a **regular lattice** (`PatGrid`, samples in C order with axis 0
+  outermost, separable N-linear over 2^ndim corners, `clamp`/`wrap`/`extrapolate` outside the
+  box), and `scatter:<name>(c0, …)` reads **arbitrary positions** (`PatScatter`, Shepard
+  inverse-distance weighting `1/(d²)^(power/2)`, a coincident sample returned exactly).
+  Both live in `pattern.h` as `__host__ __device__` samplers (`patGridSample` /
+  `patScatterSample`) so there is no device re-implementation to drift. Architectural notes:
+  (a) both are the only ops whose **arity is not a property of the function name** — it is the
+  table's own `ndim`, resolved at tokenize time through a `PatTableScope` (a kind-dispatching
+  `{Grid, Scatter}` callback the FTSL builder installs), so a wrong argument count is a
+  compile error rather than a silent zero; (b) tables address their numbers by `int off` +
+  `int count` into **one flat `Scene::dataPool` shared by both kinds** — never by pointer,
+  since the pool grows as later tables load — which is also exactly the layout the GPU
+  uploads, so a scene costs one allocation for its tables however many it declares. The
+  scopes are separate namespaces (a grid `foo` is not `scatter:foo`).
+
+  **Reaching the field formulas (0.78.0).** Unlike `tex:`, which genuinely needs a hit's
+  (u,v) and so stays a compile error outside a shading context, a table sample needs only
+  coordinates — so the FTSL builder passes `&tableScope_` at four further compile sites:
+  the `function` field leaf, a medium's `density` and `ior` programs, and `camera_curve`
+  drivers. Evaluation is the harder half: a compiled `PatOp::Grid` node carries an index
+  into `Scene::grids`, so **every** evaluation site must be able to see those vectors.
+  The mechanism is `PatTables` — a non-owning `{grids, scatters, dataPool}` view built by
+  `Scene::patTables()` (device: `dPatEnvOf(DScene&)`) and threaded as a **parameter**
+  through `Implicit::eval`/`gradient`, `intersectImplicit`, `estimateFieldLipschitz`,
+  `Medium::densityAt`/`nAt`/`gradNAt`/`insideBound`, the GRIN marcher, `isomesh::marchImplicit`
+  and `airtight::check`. It is deliberately *never* a member: a `Scene` is copied and moved
+  (`buildCornell` returns by value), so a stored view would dangle. The two multi-medium
+  wrappers (`sampleMediaCollision` / `mediaTransmittance`, and their device twins) were
+  retyped to take the whole `Scene`/`DScene` rather than `media`, so no caller can *forget*
+  the tables. Load-time consumers use the real tables too — the Lipschitz bound, the
+  majorant-density scan and the `boundInsideNeg` sign test would otherwise all read a
+  grid-driven field as identically 0.
+
+  The evaluator's "table not found" guards **abandon the program** (`return 0`) rather than
+  pushing a placeholder, because the operand count is the missing table's own `ndim`: a push
+  would leave the stack unbalanced and quietly return a *coordinate* as the result. That was
+  a live wrong render before 0.78.0, reachable via `medium { density pattern:<p> }`, which
+  copies a table-scoped pattern's nodes into a medium evaluated without tables.
+
+  **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
+  the write-it-where-you-use-it spelling of the same thing, and they are implemented as
+  **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the
+  grid/scatter pass) turns each literal into an anonymous `grid "__arrN"` plus a one-line
+  `pattern "__arrN" { expr "grid:__arrN<call>" }` appended to the block list, and rewrites
+  the value site to `pattern:__arrN`. That is why a literal works at *every* slot that
+  already accepts a pattern without any of those slots changing, and it is verified by
+  rendering `scenes/pattern_array.ftsl` against a hand-written `grid` + `pattern` twin
+  (bit-identical). Nesting is the shape; the domain is the **unit box** per axis (an inline
+  literal has no domain of its own), deliberately unlike the `grid` element's index-lattice
+  default. In the grammar the syntax is a `PARENWORD` terminal (a token that is *wholly*
+  parenthesised) plus one merged `selector = '[' sel_item* ']' axistuple?` production
+  covering both jobs of `[ … ]` at a value site. (The hand-written tokenizer, retired in
+  0.79.0, needed no change at all — a call arrived as an ordinary bareword because ftrace
+  never treated `(` as a delimiter, which is exactly what keeps `0.5+0.5*sin(2*pi*u)` one
+  token.) Critically, **the front end does not decide what the brackets mean**: it collects
+  the raw `ftsl::BrItem` tree and hands it to `ftsl::applyBracketGroup` at the loader level.
+  That split is what kept the two front ends from drifting on the one syntax that is
+  genuinely ambiguous (record stop selector vs. array literal) while both existed, and it
+  is why the flip needed no loader changes.
+
+  The same bracket spelling is accepted for a **`grid`/`scatter` element's own `data`**, and
+  there it is *not* sugar: `desugarArrays` deliberately skips those two block types, because
+  a `data [ … ]` group is the element's samples rather than a value-site literal (there is no
+  sample call to make — one there is an error naming the right place to put it). `addGrid`
+  and `addScatter` read the `BrItem` tree directly through the shared `flattenArray`. For a
+  grid the **nesting is the shape**, so `shape` need not be written at all (writing one that
+  disagrees is an error printing both); a *flat* group carries no shape, so `shape 2 2` still
+  folds `data [0 1 2 3]`. For a scatter, one group per sample, each `dim+1` numbers wide.
+  This is loom's `data.py` constructor convenience carried over verbatim in spirit, and it is
+  verified bit-identical against the `shape` + flat-`data` spelling.
+- **`envmap.h` / `sky.h`** — infinite environment lighting. `EnvMap` turns an
+  equirectangular linear-RGB buffer into an importance-sampled directional emitter
+  (per-texel Jakob–Hanika spectral upsampling + a luminance·sinθ 2-D sampler);
+  `buildFromRgb` is the shared entry so both the image loader and analytic generators
+  use it. `sky.h` is the **Preetham analytic daylight sky**: the Perez five-parameter
+  distribution for luminance + CIE xy, scaled by turbidity/sun-elevation zenith values,
+  baked to an equirect image with a spectrally attenuated (Rayleigh + Ångström aerosol)
+  5778 K solar disk, then handed to `EnvMap::buildFromRgb` — so an analytic sky reuses
+  the entire env pipeline, including the GPU `DEnvMap` upload, for free. Magnitudes are
+  physical (the sun is ~10⁵× the sky) then normalised to a mean sky luminance of
+  `intensity`. (Efficient-directional-sun forward sampling is a logged follow-up.)
+- **`medium_stack.h` / `phase.h` / `grin.h` / `rainbow.h` / `vdbgrid.*` / `vdb_openvdb.cpp`** —
   participating media (bounded, density fields, superposition), HG + water-droplet
-  (rainbow) phase functions, gradient-index bending, NanoVDB density import.
+  (rainbow) phase functions, gradient-index bending, NanoVDB (`.nvdb`) + native OpenVDB
+  (`.vdb`, self-contained BLOSC/LZ4 reader) density import. Imported volumes are baked to a
+  dense lattice stored as **fp16 half-floats** (`halfBitsToFloat`/`floatToHalfBits` in
+  `vdbgrid.h`, mirrored by a `__device__` decoder in `render_cuda.cu`) to halve host/GPU memory.
+  The GPU sampler is **natively sparse**: `VdbGrid::buildBricks` partitions the lattice into 8³
+  bricks and uploads only occupied bricks + an int32 brick-index (empty brick → density 0), so
+  VRAM scales with filled volume, not the bounding box — bit-for-bit identical to the dense
+  sampler (the trilinear stencil is clamped before lookup). The host keeps the dense lattice.
+  A multi-grid `.vdb` selects a grid **by name** (`loadVdbGrid(..., wantName)`; the OpenVDB reader
+  seeks each descriptor to the previous grid's `endPos`, since descriptors interleave with bodies).
+- **Volumetric blackbody emission ("fire")** — a `Medium` may carry a second `temperature` grid
+  (`Medium::temperature`/`tempPeak`/`emitKelvin`/`emissionScale`; `emissive()`/`temperatureAt()`/
+  `emissionAt()` in `scene.h`), turning its hot voxels into a self-illuminating isotropic volume
+  emitter. `spectrum.h` supplies `blackbodyEmissionRadiance` (Planck normalised to a 6500 K/560 nm
+  reference — physical T⁴ + Wien hue, tame magnitudes); temperature is peak-normalised
+  (T=emitKelvin·raw/tempPeak). `Scene::finalizeEmissiveVolumes()` (called from `build()`) MC-estimates
+  each grid's mean emission `meanKe` + selection `power`=4π·V·meanKe·Δλ into `Scene::emissiveVolumes`
+  (+`totalEmissionPower`). Forward `tracePhoton` (`render.h`) splits birth emitter-vs-fire by power
+  (`grandTotal=totalPower+totalEmissionPower`; no extra RNG when there are no emissive volumes, so
+  non-fire scenes stay bit-identical); a fire photon is born uniform-in-AABB, isotropic-dir, with λ
+  **importance-sampled from `blackbody(emitKelvin)`** via a per-volume `EmissionSampler lamSampler` (built
+  in `finalizeEmissiveVolumes`), carrying **β=grandTotal·κ_e/(meanKe·Δλ·p(λ))** — for a voxel at emitKelvin
+  β is constant across λ, collapsing the colour-magnitude speckle (uniform p=1/Δλ recovers the plain
+  β=grandTotal·κ_e/meanKe). The isotropic `1/(4π)/(dist²·Ω)` splat
+  (`connectEmissionVolume`/`connectEmissionLensVolume`/`camSplatEmissionAll`) reproduces the emission
+  line-integral. **Forward CPU AND GPU** (A/B/C, V/P forward layers): the GPU mirror lives in
+  `render_cuda.cu` — the VDB brick sampler is factored into a reusable `DVdbGrid`/`dVdbSample`, `DMedium`
+  gains a `tempGrid` + emission params, `DScene` gains a `DEmissiveVolume[]` (+ per-volume Planck-λ CDF)
+  and `totalEmissionPower`, and `genPhoton` has the same power-split volume-birth branch +
+  `connectEmissionVolume`/`camSplatEmissionAll` device splat (validated GPU-vs-CPU on `scraps/vdb_fire.ftsl`).
+  The backward reference (mode R/V) never samples the grid — it treats media as one homogeneous haze.
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.
@@ -255,8 +681,99 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `raster_cuda.cu` = GPU raster (own section below).
 - **`livewindow.*`** — Win32 GDI live preview (`-window`/`-keepwindow`), interactive
   fly viewer input, camera-path timeline panel.
-- **`record.h` / `render_progress.h`** — run records, live status line
-  (`[live] … photons, ~N% noise`), noise estimation for `-noise` budgets.
+- **`record.h` / `record_ladder.h`** — **parametric records**: a named bank of per-channel
+  look-up tables over a shared scalar domain `[lo,hi]`, sampled by one per-hit driver
+  scalar so a single expression sweeps a whole material at once. `record.h` holds the
+  structural model (`RecChannel` → `RecStop`s with a redistributed domain position) plus
+  stop compilation and sampling (`recSampleScalar` / `recSampleSpectrum`, nearest /
+  linear / smooth Fritsch–Carlson). Channels are named **by destination**, so a channel
+  whose name matches a material slot auto-binds and one that doesn't is still reachable
+  by dot.
+  `record_ladder.h` is the **delimiter precedence ladder** a channel line's stops are
+  written in: whitespace binds tightest (like `×`), comma looser (like `+`), `[ ]` are
+  the parentheses — so `1 1 1, 2 2 2` reads as `(1·1·1)+(2·2·2)`, two groups of three.
+  Structure is recoverable from the delimiters alone; the channel's arity only
+  *validates*, which is why `[1 1 1] [2 2 2]` and `1 1 1, 2 2 2` denote the same tree.
+  Parens `( )` are deliberately **not** a rung — they belong to expressions and the
+  named-input application surface — so a parenthesised run is an opaque atom and
+  `clamp(x,0,1)` stays one leaf.
+  The ladder lives in the **loader, not the grammar**, and that is the point: `,` is not
+  one of the lexer's delimiters, so a comma survives lexing glued to its word (`0,`) and
+  is simply re-split here, paren-aware. Only `[` / `]` genuinely delimit, so the grammar
+  carries exactly one extra rule (`stop_group`) whose markers `ftsl_reduce.hpp` flattens
+  back into `[`/`]` words. `Parser::parseChannelStops` (`ftsl.h`) drives it and preserves
+  additivity **structurally**: a line with no colour tag and no `,`/`[`/`]` takes the
+  byte-identical pre-ladder whitespace loop, so no existing record can reparse
+  differently.
+  The same function strips an optional **inline colour head** (`rgb`/`hsv`/`hsl` and
+  every upsampler/emission variant — `isColourHead` is the one list) into
+  `RecChannel::space`, then hands `{space, comps…}` to the *same* `evalSpectrum` a
+  top-level `spectrum "x" = rgb …` declaration uses. Converging on that one evaluator is
+  what makes inline colour nearly free: the record path inherits all 18 colour heads, and
+  the Jakob–Hanika coefficient bake and the GPU upload never learn that records exist.
+  `tools/loom/loom/ladder.py` + `record.py` are the declared Python twins; a stop-boundary
+  disagreement between them would be a *silent wrong render* rather than a parse error, so
+  `tools/check_record_twins.py` diffs ftrace's per-channel stop count (probed via an
+  out-of-range `rec.ch[999]` selector) against loom's across the `scenes/_record_*.ftsl`
+  fixtures.
+- **Named-input binding (`pattern.h` + `Parser::applyMaterial` in `ftsl.h`)** — a material
+  property is an expression over **named inputs**, so a material is a *bundle* of
+  slot→expression bindings and is itself a **function** whose free-input set is the union
+  of its properties' (`materialFreeInputs`, the twin of loom's `Material.free_inputs`).
+  Applying it at a use site — `material gold(u=v,a=1)` — binds those inputs across the
+  whole bundle at once.
+  The mechanism is **binding by substitution**, and postfix is what makes it nearly free:
+  a variable node pushes exactly one value and so does a well-formed program, so
+  `patternSubstitute` is a pure **splice** that cannot disturb the surrounding stack
+  discipline. The consequence is the load-bearing one — a bound material is an *ordinary*
+  material, with no environment, no closure and no runtime indirection, so the CPU
+  evaluator, the verbatim GPU upload, `patternHasFreeVars` and every record sampler stay
+  untouched. Substitution is **simultaneous**, so `gold(u=v,v=u)` swaps rather than
+  collapsing.
+  `PatOp::VarA` (`a`, albedo) is the one named input with **no per-hit intrinsic**, so it
+  must be resolved at LOAD time — to whatever a use site binds, else to the material's
+  `albedoDefault_` (loader-side, *not* on `Material`, which is uploaded to the device).
+  Because an unresolved `a` would silently evaluate to 0, **every** by-name material
+  reference routes through `lookupMaterial`, which memoises the empty application; that
+  is also why `resolveMixChildren` takes a material **index** rather than a `Material&`
+  (a lookup can append to `Scene::mats` and reallocate). `applyCache_` keys on
+  `"<matIdx>(<args>)"`, so one application shared by N objects builds ONE material, and a
+  no-op application returns the original index — the additive-superset guarantee.
+  `a` is scope-gated by `compilePatternExpr`'s `allowA` (appended *last* so only the four
+  material-reachable sites opt in), and `VarA` is appended at the END of `PatOp` so
+  `patternHasFreeVars`' `VarX..VarV` intrinsic range is unperturbed. `parseBindArgs`
+  reuses the record ladder (comma == space) and finds argument boundaries from the `=`
+  signs rather than the whitespace, which is sound only because the pattern language has
+  **no comparison operators** — a top-level `=` can only mean a binding. Named arguments
+  bind before a positional one, so a positional takes the sole *still-free* input (loom's
+  `free_inputs() - set(binds)`). `-checkbind` pins the algebra (splice == textual
+  inlining, simultaneity, identity, introspection).
+  **Per-property access** (§3.2, `materialPropRef`) reads ONE slot off an already-declared
+  material — `src.reflect`, `src.reflect(u=v)` — with the *slot keyword* as the dot-handle,
+  because FTSL properties are identified solely by slot keyword and never carry a quoted
+  name (§3.2's "naming is optional" arm is therefore already the ftrace status quo,
+  vacuously; what was missing was the handle to read one back out). It resolves by calling
+  `applyMaterial(idx, args, L)` and then reading the slot off the *result*, so a reference
+  cannot diverge from applying the bundle and reading the slot — same binding rules, same
+  memo, same `a` -> **source** `albedo_default` fallback. Four value-site chokepoints carry
+  it, one per shape the value can take: `patternedSpectrumParam` (the only site that can
+  hold BOTH the base spectrum and the slot's per-hit pattern, so a source pattern and the
+  reader's own `<slot>_map` are **composed** there via `composePatterns`, appending
+  `[a…, b…, Mul]` — valid postfix for the same "each program pushes one value" reason the
+  splice is), `evalSpectrum` (pattern-less spectral sites), `bindScalarPattern` (reports
+  "handled" only when the source actually carries a pattern, so the call sites' existing
+  `bindScalarPattern -> bindScalarTexture -> dblParam` ladder routes both shapes without
+  knowing the form exists), and `dblParam`. Record-driven, texture-bound, and un-appliable
+  pattern slots are **refused**, never approximated, since each would hand the reader a
+  number the source does not use. `recordIndex_` is checked first so `R.chan` cannot change
+  meaning when a material is named `R`. Reaching those sites needs a `Loaded&` they were
+  never given, hence the `loadedRef_` member — a pointer to the owner, never to an element,
+  because `applyMaterial` reallocates `Scene::mats`/`patterns`. loom twin:
+  `Material.prop(name, *args, **binds)` (`tools/loom/loom/scene.py`). `-checkprop` pins it
+  by loading in-memory scenes and comparing each reference against a hand-written twin.
+- **`render_progress.h`** — progress hook for chunked samples-per-pixel renderers (modes
+  `R`, `D`): the live status line (`[live] … photons, ~N% noise`) and noise estimation for
+  `-noise` budgets.
 
 ## GPU raster pipeline (`raster_cuda.cu`)
 

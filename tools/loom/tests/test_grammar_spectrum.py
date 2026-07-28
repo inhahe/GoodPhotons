@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 from loom.grammar.spectrum import (  # noqa: E402
-    Band, Blackbody, ColorSpec, Const, IllumSpec, Ior, LibRef, LineSpec,
-    NamedWall, RecordRef, WhiteWall, as_spectrum, parse_spectrum,
+    Band, Blackbody, BoxSpec, ColorSpec, Const, IllumSpec, Ior, LibRef, LineSpec, MengSpec,
+    NamedWall, RecordRef, SmitsSpec, WhiteWall, as_spectrum, parse_spectrum,
 )
 from loom.grammar.values import ShapeError  # noqa: E402
 
@@ -119,6 +119,48 @@ def test_illum_heads_parse():
 def test_illum_head_wrong_arity_is_shape_error():
     with pytest.raises(ShapeError):
         parse_spectrum("rgbillum 0 1")         # needs 3 components
+
+
+# ---- Smits 1999 reflectance heads (K1) -------------------------------------
+
+def test_smits_heads_parse():
+    # `rgbsmits r g b` (and hsvsmits/hslsmits) → SmitsSpec
+    assert parse_spectrum("rgbsmits 0.8 0.1 0.1") == SmitsSpec("rgb", (0.8, 0.1, 0.1))
+    assert parse_spectrum("hsvsmits 0.1 0.8 0.9") == SmitsSpec("hsv", (0.1, 0.8, 0.9))
+    assert parse_spectrum("hslsmits 0.6 0.7 0.5") == SmitsSpec("hsl", (0.6, 0.7, 0.5))
+
+
+def test_smits_head_wrong_arity_is_shape_error():
+    with pytest.raises(ShapeError):
+        parse_spectrum("rgbsmits 0 1")         # needs 3 components
+
+
+# ---- plain 3-box reflectance heads (K1) ------------------------------------
+
+def test_box_heads_parse():
+    # `rgbbox r g b` (and hsvbox/hslbox) → BoxSpec
+    assert parse_spectrum("rgbbox 0.8 0.1 0.1") == BoxSpec("rgb", (0.8, 0.1, 0.1))
+    assert parse_spectrum("hsvbox 0.1 0.8 0.9") == BoxSpec("hsv", (0.1, 0.8, 0.9))
+    assert parse_spectrum("hslbox 0.6 0.7 0.5") == BoxSpec("hsl", (0.6, 0.7, 0.5))
+
+
+def test_box_head_wrong_arity_is_shape_error():
+    with pytest.raises(ShapeError):
+        parse_spectrum("rgbbox 0 1")           # needs 3 components
+
+
+# ---- Meng 2015 smoothest-spectrum heads (K1) -------------------------------
+
+def test_meng_heads_parse():
+    # `rgbmeng r g b` (and hsvmeng/hslmeng) → MengSpec
+    assert parse_spectrum("rgbmeng 0.8 0.1 0.1") == MengSpec("rgb", (0.8, 0.1, 0.1))
+    assert parse_spectrum("hsvmeng 0.1 0.8 0.9") == MengSpec("hsv", (0.1, 0.8, 0.9))
+    assert parse_spectrum("hslmeng 0.6 0.7 0.5") == MengSpec("hsl", (0.6, 0.7, 0.5))
+
+
+def test_meng_head_wrong_arity_is_shape_error():
+    with pytest.raises(ShapeError):
+        parse_spectrum("rgbmeng 0 1")          # needs 3 components
 
 
 # ---- untagged bare colour is NOT a spectrum (matches ftrace) ---------------

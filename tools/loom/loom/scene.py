@@ -19,7 +19,7 @@ from .signals.core import Signal, Clock, Cache, Const, detect_signal_cycle
 from .signals.vector import VecSignal
 from .interp import LoopCurve
 from .data import PointPath
-from .ftsl_emit import EmitCtx, num, vec3, fmt, fmt3, value_token
+from .ftsl_emit import EmitCtx, num, vec3, fmt, fmt3, value_token, site_node
 from . import sweep as _sweep
 
 
@@ -41,11 +41,17 @@ class Element:
     xf = None  # Optional[Transform]; applied by the container on emit
 
     def roots(self) -> List:
-        """Every Signal / VecSignal stored on this element (for cycle checking)."""
+        """Every Signal / VecSignal stored on this element (for cycle checking).
+
+        An axis-typed node (:mod:`loom.axes`) contributes the *same* lowered node
+        that emission will evaluate (:func:`~loom.ftsl_emit.site_node` memoises
+        it), so the cycle detector and the viewer's DAG panel see the whole graph.
+        """
         out: List = []
         for v in vars(self).values():
-            if isinstance(v, (Signal, VecSignal)):
-                out.append(v)
+            n = site_node(v)
+            if n is not None:
+                out.append(n)
         return out
 
     def emit(self, ctx: EmitCtx) -> str:
@@ -137,16 +143,227 @@ class Texture(Element):
                 f'wrap {self.wrap} }}')
 
 
+# colour-valued material slots — a field here lowers to a ``ProcTexture`` over the
+# surface u/v; every other slot is a scalar knob lowering to a world-space pattern.
+_COLOR_SLOTS = ("reflect", "transmit", "emit", "emission", "color", "tint")
+
+
+def _spatial_fields(el):
+    """Every :class:`~loom.spatial.SpatialExpr` reachable from an element's own
+    attributes (one container level deep).
+
+    Deliberately duck-typed rather than a per-class hook: a spatial field can sit on
+    a :class:`~loom.material.FuncPattern`'s ``template``, on a :class:`ProcTexture`'s
+    ``r``/``g``/``b``, in a :class:`Material`'s ``props`` dict, or on an
+    ``Isosurface``'s template — one scan covers all of them and any future holder."""
+    from .spatial import SpatialExpr
+    out = []
+    for v in vars(el).values():
+        if isinstance(v, SpatialExpr):
+            out.append(v)
+        elif isinstance(v, (list, tuple)):
+            out.extend(c for c in v if isinstance(c, SpatialExpr))
+        elif isinstance(v, dict):
+            for c in v.values():
+                if isinstance(c, SpatialExpr):
+                    out.append(c)
+                elif isinstance(c, (list, tuple)):
+                    out.extend(g for g in c if isinstance(g, SpatialExpr))
+    return out
+
+
+def _field_exprs(v):
+    """If ``v`` is a scalar :class:`~loom.spatial.SpatialExpr` field or a tuple of
+    them (mixing plain numbers), return the list of components (numbers coerced);
+    otherwise ``None`` (a plain scalar/Signal/string property)."""
+    from .spatial import SpatialExpr, sexpr
+    if isinstance(v, SpatialExpr):
+        return [v]
+    if isinstance(v, (list, tuple)) and any(isinstance(c, SpatialExpr) for c in v):
+        return [sexpr(c) for c in v]
+    return None
+
+
 class Material(Element):
-    def __init__(self, name: str, mtype: str = "diffuse", **props) -> None:
+    """A material.  Any property may be a plain value (number / :class:`Signal` /
+    string / colour) **or** a loom :class:`~loom.spatial.SpatialExpr` *field* over
+    the named surface inputs — this is what makes a material a **parameterized
+    bundle** (J3b item 3 / ``ROADMAP_records.md`` §3.3).
+
+    A bundle exposes its *free inputs* (:meth:`free_inputs` — the union of its
+    properties' :data:`U`/:data:`V`/:data:`A` leaves) and is **applied** by binding
+    them at the use site: ``gold(u=v, a=1)`` / ``gold(v)`` (positional, single free
+    input only).  Binding is pure **substitution** on the field expressions, so the
+    result is an ordinary material whose fields are concrete formulas in real ftrace
+    variables — never literal bundle syntax.  A field property lowers to a renderable
+    companion element when the material is added to a :class:`Scene` (:meth:`expand`):
+    a colour slot → a :class:`ProcTexture` baked over ``u``/``v``; a scalar slot → a
+    live :class:`~loom.material.FuncPattern` evaluated per hit (world ``x``/``y``/``z``,
+    the field value, the hit normal and ``u``/``v`` are all in scope).  The albedo
+    input :data:`A`, left unbound, resolves to the material's ``albedo_default``."""
+
+    def __init__(self, name: str, mtype: str = "diffuse", *,
+                 albedo_default: Number = 1.0, **props) -> None:
         self.name = name
         self.mtype = mtype
         self.props = props
+        self.albedo_default = albedo_default
 
     def roots(self) -> List:
-        return [v for v in self.props.values() if isinstance(v, (Signal, VecSignal))]
+        out: List = []
+        for v in self.props.values():
+            n = site_node(v)                    # Signal / VecSignal / lowered axis node
+            if n is not None:
+                out.append(n)
+            else:
+                for e in (_field_exprs(v) or ()):
+                    out.extend(e.time_signals())
+        return out
+
+    # ---- bundle: free inputs + application (binding by substitution) ------
+    def free_inputs(self, include_coords: bool = False) -> "frozenset[str]":
+        """The union of every field property's bindable inputs (``{u, v, a}``;
+        ``include_coords=True`` also reports the spatial ``x``/``y``/``z``)."""
+        acc = set()
+        for v in self.props.values():
+            for e in (_field_exprs(v) or ()):
+                acc |= e.free_inputs(include_coords=include_coords)
+        return frozenset(acc)
+
+    def apply(self, *args, **binds) -> "Material":
+        """Bind free inputs across the bundle and return a new material.  Keyword
+        form ``gold(u=v, a=1)``; positional ``gold(expr)`` binds the sole free
+        input (an error if there is not exactly one unbound).  Unbound inputs fall
+        back to their system defaults (``u``/``v`` stay the surface params; ``a``
+        resolves to ``albedo_default`` at emit).  Each RHS is any coercible value —
+        a number, :class:`Signal`, or :class:`~loom.spatial.SpatialExpr`."""
+        from .spatial import sexpr
+        binds = dict(binds)
+        if args:
+            if len(args) != 1:
+                raise TypeError("positional material binding takes one expression")
+            free = self.free_inputs() - set(binds)
+            if len(free) != 1:
+                raise TypeError(
+                    f"positional binding needs exactly one free input; "
+                    f"'{self.name}' has {sorted(free)} — bind by name")
+            binds[next(iter(free))] = args[0]
+        mapping = {k: sexpr(v) for k, v in binds.items()}
+        new_props = {}
+        for k, v in self.props.items():
+            exprs = _field_exprs(v)
+            if exprs is None:
+                new_props[k] = v
+            elif isinstance(v, (list, tuple)):
+                new_props[k] = tuple(e.substitute(mapping) for e in exprs)
+            else:
+                new_props[k] = exprs[0].substitute(mapping)
+        return Material(self.name, self.mtype,
+                        albedo_default=self.albedo_default, **new_props)
+
+    def __call__(self, *args, **binds) -> "Material":
+        return self.apply(*args, **binds)
+
+    # ---- §3.2 per-property access ----------------------------------------
+    def prop(self, name: str, *args, **binds):
+        """The value of ONE property of this bundle — ``ROADMAP_records.md`` §3.2's
+        per-property access, the twin of ftrace's ``MATERIAL.slot`` /
+        ``MATERIAL.slot(args)`` (``Builder::materialPropRef`` in ``src/ftsl.h``).
+
+        ``gold.prop("reflect")`` reads the slot with every named input at its
+        default; ``gold.prop("reflect", u=v)`` / ``gold.prop("reflect", a=1)``
+        rebinds first.  Rebinding routes through :meth:`apply`, so it is exactly the
+        same substitution the bundle uses at a use site — a property reference can
+        never diverge from applying the whole material and then reading the slot.
+
+        An unbound :data:`A` resolves against **this** material's
+        ``albedo_default``, not the consumer's: the property carries the source's
+        notion of albedo with it, which is what makes the reference a *value* rather
+        than a fragment needing the consumer's context.
+
+        §3.2 makes the property NAME optional (the leading type/slot keyword is what
+        binds a property to its slot; the name only mints an external dot-handle).
+        loom keeps properties in a plain ``**props`` dict keyed by slot, so the key
+        IS the handle here — the same choice ftrace makes for the same reason."""
+        m = self.apply(*args, **binds) if (args or binds) else self
+        if name not in m.props:
+            raise KeyError(
+                f"material '{self.name}' has no property '{name}' "
+                f"(has {sorted(m.props)})")
+        v = m.props[name]
+        exprs = _field_exprs(v)
+        if exprs is None:
+            return v                                  # a plain value / Signal / colour
+        if isinstance(v, (list, tuple)):
+            return tuple(m._resolve_albedo(e) for e in exprs)
+        return m._resolve_albedo(exprs[0])
+
+    def _resolve_albedo(self, e):
+        """Substitute an unbound albedo leaf :data:`A` with the material default."""
+        if "a" in e.free_inputs():
+            return e.substitute({"a": float(self.albedo_default)})
+        return e
+
+    def has_fields(self) -> bool:
+        return any(_field_exprs(v) is not None for v in self.props.values())
+
+    def expand(self, prefix: str) -> Tuple[List[Element], "Material"]:
+        """Lower every field property to a renderable companion element and return
+        ``(companions, resolved_material)`` where the material's field slots now
+        reference the companions (``reflect texture:<p>_reflect`` /
+        ``roughness pattern:<p>_roughness``).  Colour slots bake over surface
+        ``u``/``v`` (a :class:`ProcTexture`) and may therefore use *only* ``u``/``v``
+        — anything else raises.  Scalar slots stay live (a
+        :class:`~loom.material.FuncPattern`) and are evaluated per hit, so they may
+        use world ``x/y/z``, the field value, the hit normal and ``u``/``v`` in any
+        combination."""
+        from .material import FuncPattern
+        comps: List[Element] = []
+        new_props = {}
+        for k, v in self.props.items():
+            exprs = _field_exprs(v)
+            if exprs is None:
+                new_props[k] = v
+                continue
+            exprs = [self._resolve_albedo(e) for e in exprs]
+            if k in _COLOR_SLOTS:
+                for e in exprs:
+                    bad = e.free_inputs(include_coords=True) - {"u", "v"}
+                    if bad:
+                        raise ValueError(
+                            f"material '{self.name}' colour slot '{k}' field uses "
+                            f"{sorted(bad)}; a colour skin bakes surface u/v only — "
+                            f"bind them (e.g. u=..., a=...) or use a scalar slot")
+                if len(exprs) == 1:
+                    exprs = exprs * 3            # scalar field -> grayscale rgb
+                texname = f"{prefix}_{k}"
+                comps.append(ProcTexture(texname, exprs[0], exprs[1], exprs[2]))
+                new_props[k] = f"texture:{texname}"
+            else:
+                # No coordinate restriction here, deliberately.  A scalar slot lowers
+                # to a *live* pattern, and ftrace evaluates it through
+                # `patCtxFromHit` (src/scene.h), which fills x/y/z, the field value,
+                # the hit normal AND surface u/v — so a scalar field may draw on any
+                # of them, and mix them freely.  (`scenes/uv_native.ftsl` ships
+                # exactly that: `weight_map pattern:uvcheck8` over floor(u*8).)  The
+                # asymmetry with a colour slot is real but runs the other way: a
+                # colour skin is *baked* into an image indexed by u/v, so u/v is all
+                # it can ever see.
+                e = exprs[0]
+                patname = f"{prefix}_{k}"
+                comps.append(FuncPattern(patname, e))
+                new_props[k] = f"pattern:{patname}"
+        resolved = Material(self.name, self.mtype,
+                            albedo_default=self.albedo_default, **new_props)
+        return comps, resolved
 
     def emit(self, ctx: EmitCtx) -> str:
+        if self.has_fields():
+            raise ValueError(
+                f"material '{self.name}' still carries field properties "
+                f"{sorted(k for k, v in self.props.items() if _field_exprs(v))}; "
+                f"add it to a Scene (which expands bundle fields into companion "
+                f"pattern/texture elements) before emitting")
         parts = [f"type {self.mtype}"]
         for k, v in self.props.items():
             parts.append(f"{k} {value_token(v, ctx.clock, ctx.cache)}")
@@ -169,12 +386,17 @@ class ProcTexture(Element):
     :func:`func_skin` to make the texture *and* its material together.
     """
 
-    def __init__(self, name: str, r: str, g: str, b: str, *, res: int = 512,
+    def __init__(self, name: str, r, g, b, *, res: int = 512,
                  filter: str = "bilinear", wrap: str = "clamp") -> None:
         self.name = name
-        self.r = str(r)
-        self.g = str(g)
-        self.b = str(b)
+        # Each channel is a literal ftsl string *or* a loom SpatialExpr over the
+        # surface params ``u``/``v`` (a material-bundle colour field).  A
+        # SpatialExpr is baked per frame (its time coefficients fold into the
+        # texture string, so an animated albedo re-bakes each frame); anything
+        # else (a string / number) is coerced to a literal string once.
+        def _chan(c):
+            return c if hasattr(c, "emit") else str(c)
+        self.r, self.g, self.b = _chan(r), _chan(g), _chan(b)
         res = int(res)
         if res < 1:
             raise ValueError("texture res must be >= 1")
@@ -186,11 +408,30 @@ class ProcTexture(Element):
         self.filter = filter
         self.wrap = wrap
 
+    def _channels(self):
+        return (self.r, self.g, self.b)
+
     def roots(self) -> List:
-        return []
+        # a SpatialExpr channel exposes its temporal coefficients for cycle checking
+        out: List = []
+        for c in self._channels():
+            if hasattr(c, "time_signals"):
+                out.extend(c.time_signals())
+        return out
+
+    @staticmethod
+    def _chan_str(c, ctx: EmitCtx) -> str:
+        # a SpatialExpr colour field is a function of the surface u/v only (X/Y/Z
+        # are rejected at bundle-expand time, so the coord args are never read)
+        if hasattr(c, "emit"):
+            return c.emit(("u", "v", "0"), ctx)
+        return str(c)
 
     def emit(self, ctx: EmitCtx) -> str:
-        return (f'{self.name} = texture {{ rgb "{self.r}" "{self.g}" "{self.b}"  '
+        r = self._chan_str(self.r, ctx)
+        g = self._chan_str(self.g, ctx)
+        b = self._chan_str(self.b, ctx)
+        return (f'{self.name} = texture {{ rgb "{r}" "{g}" "{b}"  '
                 f'res {self.res}  filter {self.filter}  wrap {self.wrap} }}')
 
 
@@ -243,8 +484,9 @@ class Sphere(Element):
 
     def roots(self) -> List:
         out: List = [self.center]
-        if isinstance(self.radius, Signal):
-            out.append(self.radius)
+        r = site_node(self.radius)
+        if r is not None:
+            out.append(r)
         return out
 
     def emit(self, ctx: EmitCtx) -> str:
@@ -270,8 +512,9 @@ class Beads(Element):
 
     def roots(self) -> List:
         out: List = [self.curve]
-        if isinstance(self.radius, Signal):
-            out.append(self.radius)
+        r = site_node(self.radius)
+        if r is not None:
+            out.append(r)
         return out
 
     def emit(self, ctx: EmitCtx) -> str:
@@ -833,9 +1076,39 @@ class Scene:
         self.elements: List[Element] = []
         self.lights: List[Light] = []
 
+    def _add_image_textures(self, e: Element) -> None:
+        """Declare the ``texture`` blocks any :class:`~loom.spatial.Image` term
+        inside ``e`` needs.
+
+        An ``Image`` leaf emits ftrace's ``tex:<name>(u, v)`` pattern-VM call, which
+        only resolves if a texture of that name is declared — so collecting the
+        companion declaration has to be automatic, or every image *term* would emit
+        a dangling reference and fail to load.  The scan is duck-typed over the
+        element's attributes (a spatial field may live on ``template``, on an
+        ``r``/``g``/``b`` channel, or inside ``props``) and names are deduped, so
+        several fields sampling the same file share one block.
+
+        Each block is tagged ``_auto_image`` so that an *explicit* declaration of the
+        same name added later replaces it rather than emitting a second block with a
+        duplicate name (see :meth:`add`) — the author's own ``Texture`` always wins."""
+        have = {getattr(t, "name", None) for t in self.textures}
+        for src in _spatial_fields(e):
+            for tex in src.image_textures():
+                if tex.name not in have:
+                    have.add(tex.name)
+                    tex._auto_image = True
+                    self.textures.append(tex)
+
     def add(self, *elems: Element) -> "Scene":
         from .record import Record as _Record  # lazy: record.py imports scene.Element
         for e in elems:
+            self._add_image_textures(e)
+            if isinstance(e, (Texture, ProcTexture)):
+                # An explicit declaration supersedes one auto-collected from an
+                # Image term, whichever order they were added in.
+                self.textures = [t for t in self.textures
+                                 if not (getattr(t, "_auto_image", False)
+                                         and getattr(t, "name", None) == e.name)]
             # Textures/patterns/records are emitted before the materials that bind
             # them (ftrace resolves them in an earlier pass, but keep the text tidy).
             if isinstance(e, (Texture, ProcTexture)):
@@ -845,7 +1118,15 @@ class Scene:
             elif isinstance(e, _Record):
                 self.records.append(e)
             elif isinstance(e, Material):
-                self.materials.append(e)
+                # A bundle material with field properties expands into companion
+                # pattern/texture elements (emitted before it) plus a resolved
+                # material that references them — see Material.expand.
+                if getattr(e, "props", None) and e.has_fields():
+                    comps, resolved = e.expand(e.name)
+                    self.add(*comps)               # routes ProcTexture / Pattern
+                    self.materials.append(resolved)
+                else:
+                    self.materials.append(e)
             elif isinstance(e, Light):
                 self.lights.append(e)
             else:

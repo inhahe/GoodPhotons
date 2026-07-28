@@ -30,6 +30,31 @@ COMMENT = /#[^\n]*/ @skip           # `# …` to end of line
 NEWLINE = /\n/                      # significant: delimits statements / blocks
 
 STRING  = /"[^"]*"/                                 # quoted name / path / expression
+# A wholly-parenthesised run — `(u)`, `(u,v)`, `(0.5+0.5*sin(2*pi*u))`.  Carved off
+# the front of WORD ONLY so an array literal's *sample call* has a token type of its
+# own: `[0 1](u)`.  ftrace's tokenizer deliberately does NOT treat parens as
+# delimiters — that is exactly what keeps an expression value like
+# `0.5+0.5*sin(2*pi*8*u)` a single token — so making `(` a delimiter would shatter
+# every expression in the language.  A context-free terminal that matches a token
+# which is ENTIRELY parenthesised (starts '(', ends ')', no delimiter between) names
+# the call position without touching them: longest-match keeps expressions safe,
+# since `(a+b)*c` is 7 chars of WORD against only 5 of PARENWORD, so WORD wins.
+# Declared before KVWORD so the keyword-rebind form `(a=u)` lexes as a call rather
+# than as a `key=val` value continuation.
+#
+# A paren group may contain SPACES (`f(0.5*u + 0.5*v)`, `gold(a=1, u=v)`).  That is why
+# the interior class below allows ' ' and '\t' but the WORD class still does not: a space
+# is only "inside a token" while parens are open.  The group is therefore matched
+# BALANCED rather than by a greedy `[^)]*\)`, because a greedy run that may cross spaces
+# would happily swallow `(a) roughness 0.2` up to a later `)` in a *different* statement —
+# a silently wrong parse.  Balanced matching stops dead at the closing paren.
+# Regexes cannot count, so nesting is written out to depth 4:
+#     interior := [^\r\n(){}[]#"]                 (spaces yes, structure no)
+#     G1 := \( interior* \)   G(k+1) := \( (interior|Gk)* \)
+# Depth is not a real ceiling: WORD below is `(G|wordchar)+` and a wordchar still matches
+# a bare paren, so an expression nested deeper simply falls back to today's behaviour
+# (outer parens consumed as ordinary chars, G covering the innermost spaced group).
+PARENWORD = /\((?:[^\r\n(){}\[\]#"]|\((?:[^\r\n(){}\[\]#"]|\((?:[^\r\n(){}\[\]#"]|\([^\r\n(){}\[\]#"]*\))*\))*\))*\)/
 # A strtod-complete numeric literal (ftrace's isNumber): a value *continuation*.
 # `0-1` / `1-2` are NOT numbers (strtod stops at the inner dash) — longest-match
 # then makes them plain WORDs, exactly as ftrace's isNumber returns false.
@@ -39,9 +64,18 @@ NUMWORD = /[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?/
 # falls through to WORD and is matched by the `'='` literal — keeping the
 # `NAME = KIND` header and record-override `slot = rhs` forms unambiguous.
 KVWORD  = /[^ \t\r\n{}\[\]#"=]+=[^ \t\r\n{}\[\]#"]*/
-# The catch-all bareword: any run of non-delimiter chars.  Declared LAST so it
-# loses longest-match ties to NUMWORD / KVWORD / STRING (numbers & k=v win).
-WORD    = /[^ \t\r\n{}\[\]#"]+/
+# The catch-all bareword: any run of non-delimiter chars, where a BALANCED PAREN GROUP
+# counts as one such "char" and may contain spaces.  Declared LAST so it loses
+# longest-match ties to NUMWORD / KVWORD / STRING (numbers & k=v win).
+#
+# The group alternative is written FIRST because ECMAScript/Python regexes are
+# leftmost-FIRST, not leftmost-longest: the engine must prefer "consume the whole
+# balanced group" over "consume '(' as an ordinary char and stop at the next space".
+# The second alternative is exactly the historical WORD class (parens included), so
+# every token that lexed before still lexes identically — the group alternative can only
+# ever EXTEND a token across a space that sits inside parens, which previously truncated
+# the value mid-expression and raised "missing ')'".
+WORD    = /(?:\((?:[^\r\n(){}\[\]#"]|\((?:[^\r\n(){}\[\]#"]|\((?:[^\r\n(){}\[\]#"]|\([^\r\n(){}\[\]#"]*\))*\))*\))*\)|[^ \t\r\n{}\[\]#"])+/
 
 # ---- file = a list of top-level blocks (newlines optional between) ---
 scene_file = item*
@@ -52,17 +86,30 @@ item       = NEWLINE | top_block
 top_block  = prefer_block | record_decl | spectrum_decl | assign_header | plain_header
 
 # ---- prefer { … } else { … } ----------------------------------------
-prefer_block = 'prefer' nlq block_list ('else' nlq block_list)*
+prefer_block = 'prefer' blank_lines block_list ('else' blank_lines block_list)*
 block_list   = '{' item* '}'
-nlq          = NEWLINE*
+blank_lines  = NEWLINE*
 
 # ---- parametric record: `NAME = range LO HI [ <lines> ]` -------------
-record_decl  = WORD '=' 'range' range_word* nlq record_body
-range_word   = NUMWORD | KVWORD | STRING | WORD
+record_decl  = WORD '=' 'range' range_word* blank_lines record_body
+range_word   = NUMWORD | KVWORD | STRING | WORD | PARENWORD
 record_body  = '[' rec_item* ']'
 rec_item     = NEWLINE | record_line
 record_line  = WORD stop_word*                 # channel name + stop tokens
-stop_word    = NUMWORD | KVWORD | STRING | WORD
+# A stop token, or an explicit `[ … ]` GROUP — the bracket rung of the generalized
+# stop grammar's delimiter precedence ladder (whitespace binds tightest like `×`,
+# comma looser like `+`, brackets are the ladder's parentheses).  Commas need no rule
+# here: `,` is NOT one of ftrace's tokenizer delimiters, so `0 0 0, 1 1 1` already
+# lexes as words with the comma riding along (`0,`) and the loader's ladder re-splits
+# them paren-aware — which is precisely what keeps an expression like `clamp(x,0,1)`
+# a single leaf.  Brackets DO delimit, so the group has to be spelled out; the reducer
+# flattens it back into the word list with `[` / `]` marker words (no real word can
+# ever equal one, since both are excluded from every terminal's character class).
+# NEWLINE inside a group lets a long gradient be laid out over several lines, exactly
+# as `selector` already allows for an array literal.
+stop_word    = NUMWORD | KVWORD | STRING | WORD | PARENWORD | stop_group
+stop_group   = '[' stop_item* ']'
+stop_item    = NEWLINE | stop_word
 
 # ---- spectrum decl: `spectrum "name" [subtype] = <value>` -----------
 # The one block form with an `=` value instead of a brace body.
@@ -85,13 +132,26 @@ key_tok    = WORD | NUMWORD | KVWORD
 
 # parseValue: the record-override `= rhs [i]` form, or a normal value — a first
 # token (any), then continuations (numbers / k=v / strings), an optional
-# `[i]` selector, and an optional trailing nested `{ … }` block.
+# `[…]` bracket group, and an optional trailing nested `{ … }` block.
 value       = override_val | normal_val
 override_val = '=' rhs? selector?
-rhs         = STRING | NUMWORD | KVWORD | WORD
+rhs         = STRING | NUMWORD | KVWORD | WORD | PARENWORD
 normal_val  = val_head? cont* selector? block?
-val_head    = STRING | NUMWORD | KVWORD | WORD
+val_head    = STRING | NUMWORD | KVWORD | WORD | PARENWORD
 cont        = NUMWORD | KVWORD | STRING        # NOT a plain WORD (that ends the value)
-selector    = '[' sel_word* ']'
-sel_word    = NUMWORD | KVWORD | WORD
+# ONE production covers both jobs of `[ … ]` at a value site, because there is only
+# ever one way to read a bracket group here and keeping them merged is what keeps the
+# grammar unambiguous:
+#   * the record-channel STOP SELECTOR, `REC.chan[2]` — a flat run of words that the
+#     reducer folds back into the preceding dotted word; and
+#   * an inline N-D ARRAY LITERAL, `[0 1](u)` / `[[0 1 2][3 4 5]](u,v)` — nesting is
+#     the shape, and the trailing `axistuple` is the *sample call* that says at which
+#     coordinates the array is read.  An uncalled array is legal to write but
+#     `unsaturated`; that error lives in the loader, not here.
+# NEWLINE is a sel_item so a big array literal can be laid out over several lines.
+selector    = '[' sel_item* ']' axistuple?
+sel_item    = NEWLINE | sub_array | sel_word
+sub_array   = '[' sel_item* ']'                # nested axis of an array literal
+sel_word    = NUMWORD | KVWORD | WORD | PARENWORD
+axistuple   = PARENWORD                        # the sample call: `(u)`, `(u,v)`
 block       = '{' body_item* '}'

@@ -6,7 +6,7 @@ interpolators.
 """
 
 from .signals import (
-    Signal, Clock, Cache, Const, TimeFn,
+    Signal, Clock, Cache, Const, TimeFn, Phase,
     Add, Sub, Mul, Div, Neg, Clamp, Rectify, Power, MapRange, Mix, RefSignal,
     Sin, Cos,
     as_signal, Number,
@@ -14,6 +14,7 @@ from .signals import (
     VecSignal, vec, lerp,
     Sine, Cosine, LoopNoise,
     Ramp, Ease,
+    Retime, VecRetime, retime, retimed_clock, freeze, delay, warp,
 )
 from .data import PointPath, TrackedPath, Grid, Scatter
 from .color import (
@@ -33,6 +34,21 @@ from .scene import (
 )
 from .transform import Transform
 from .mcubes import mesh_field
+from .vdbio import (
+    write_vdb, read_vdb, read_vdb_grids, bake_field, write_volume, VolumeGrid,
+    VdbTransform, ReadGrid,
+)
+from .axes import (
+    AxSignal, Ax, AConst, Lift, AFn, Sample, select, Reduce,
+    CurveSample, RecordSample, sample,
+    Binding, Target, combine, mod, pin, as_ax,
+    Lower, LowerVec, lower,
+    ADDITIVE, GAIN, BIPOLAR, AXIS_T, AXIS_S, AXIS_U, AXIS_V,
+)
+from .anim import (
+    CurveDrive, ChannelBinding, MODE_FLYBY, MODE_ANIMATION,
+    Slot, collect_slots, SceneDriver, LiveSession, serve_live,
+)
 from .material import (
     FuncPattern, MixMaterial, PATTERNS,
     waves, checker, rings, blobs,
@@ -44,7 +60,7 @@ from .sweep import (
     write_obj,
 )
 from .iso import (
-    Isosurface, gyroid_surface, phase_drift, FIELDS,
+    Isosurface, Room, gyroid_surface, phase_drift, FIELDS,
     gyroid, schwarz_p, schwarz_d, neovius,
 )
 from .pov import (
@@ -55,8 +71,12 @@ from .drive import (
     render_range, render_still, emit_frames, assemble_gif, find_ftrace,
 )
 from .preview import PreviewServer, preview_range
+from .viewer import (
+    load_build, build_scene, introspect, ViewerModel,
+)
 from .spatial import (
-    SpatialExpr, sexpr, X, Y, Z, T, SPATIAL_PATTERNS,
+    SpatialExpr, Surface, Image, VolumeField, SigAt, sexpr, X, Y, Z, U, V, A, T,
+    SPATIAL_PATTERNS,
     sin, cos, tan, sqrt, exp, log, floor, fract, sign, saturate, sabs,
     smin, smax, spow, atan2, step, clamp, mix, smoothstep,
 )
@@ -68,7 +88,7 @@ from .xvideo import Clip, spacetime_rotate, spacetime_shear
 from .audio import SampleBuffer
 
 __all__ = [
-    "Signal", "Clock", "Cache", "Const", "TimeFn",
+    "Signal", "Clock", "Cache", "Const", "TimeFn", "Phase",
     "Add", "Sub", "Mul", "Div", "Neg", "Clamp", "Rectify", "Power",
     "MapRange", "Mix", "RefSignal", "Sin", "Cos",
     "as_signal", "Number",
@@ -76,6 +96,7 @@ __all__ = [
     "VecSignal", "vec", "lerp",
     "Sine", "Cosine", "LoopNoise",
     "Ramp", "Ease",
+    "Retime", "VecRetime", "retime", "retimed_clock", "freeze", "delay", "warp",
     "PointPath", "TrackedPath", "Grid", "Scatter",
     "Color", "rgb", "hsv", "hsl",
     "hsv_to_rgb", "rgb_to_hsv", "hsl_to_rgb", "rgb_to_hsl",
@@ -93,15 +114,27 @@ __all__ = [
     "parse_ladder", "emit_ladder", "ladder_shape",
     "SweptMesh", "IsoMesh", "ribbon", "tube", "blob", "fan", "Volume",
     "mesh_field",
+    "write_vdb", "read_vdb", "read_vdb_grids", "bake_field", "write_volume",
+    "VolumeGrid", "VdbTransform", "ReadGrid",
+    "AxSignal", "Ax", "AConst", "Lift", "AFn", "Sample", "select", "Reduce",
+    "CurveSample", "RecordSample", "sample",
+    "Binding", "Target", "combine", "mod", "pin", "as_ax",
+    "Lower", "LowerVec", "lower",
+    "ADDITIVE", "GAIN", "BIPOLAR", "AXIS_T", "AXIS_S", "AXIS_U", "AXIS_V",
+    "CurveDrive", "ChannelBinding", "MODE_FLYBY", "MODE_ANIMATION",
+    "Slot", "collect_slots", "SceneDriver", "LiveSession", "serve_live",
     "rmf_frames", "tangents", "sweep_rings", "skin_rings", "circle_profile",
     "line_profile", "write_obj",
-    "Isosurface", "gyroid_surface", "phase_drift", "FIELDS",
+    "Isosurface", "Room", "gyroid_surface", "phase_drift", "FIELDS",
     "gyroid", "schwarz_p", "schwarz_d", "neovius",
     "pov", "PovFn", "POV_FUNCS", "POV_ND_GENERALIZABLE", "POV_PARAMS", "pov_params",
     "nd_field_expr", "nd_field_eval", "nd_grad_bound_xi",
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
     "PreviewServer", "preview_range",
-    "SpatialExpr", "sexpr", "X", "Y", "Z", "T", "SPATIAL_PATTERNS",
+    "load_build", "build_scene", "introspect", "ViewerModel",
+    "SpatialExpr", "Surface", "Image", "VolumeField", "SigAt", "sexpr",
+    "X", "Y", "Z", "U", "V", "A", "T",
+    "SPATIAL_PATTERNS",
     "sin", "cos", "tan", "sqrt", "exp", "log", "floor", "fract", "sign",
     "saturate", "sabs", "smin", "smax", "spow", "atan2", "step", "clamp",
     "mix", "smoothstep",

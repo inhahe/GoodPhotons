@@ -59,7 +59,12 @@ struct Mesh {
 };
 
 // ---- Uniform marching tetrahedra over one implicit (container-capped) -------
-inline Mesh marchImplicit(const Implicit& im, const Options& opt) {
+// `tabs` publishes the scene's grid:/scatter: tables, so an isosurface whose field
+// formula samples a measured volume polygonises the SAME surface the ray tracer
+// sphere-traces. Pass scene.patTables(); omitting it on a sampling field would
+// march a field that evaluates to 0 everywhere (patternEval bails).
+inline Mesh marchImplicit(const Implicit& im, const Options& opt,
+                          const PatTables* tabs = nullptr) {
     Mesh m;
     Aabb capBox = im.bounds;              // sampling domain (= container AABB); caps here
     Vec3 ext0 = capBox.hi - capBox.lo;
@@ -112,7 +117,7 @@ inline Mesh marchImplicit(const Implicit& im, const Options& opt) {
     // see-through look), bounded only where the field exits the sampling lattice.
     const bool doCap = im.capped;
     auto augEval = [&](const Vec3& p)->double {
-        double f = im.eval(p);
+        double f = im.eval(p, tabs);
         return doCap ? std::max(f, contSDF(p)) : f;
     };
     double eps = maxe / std::max(NX, std::max(NY, NZ)) * 0.5;
@@ -474,29 +479,89 @@ inline void decimateAdaptive(Mesh& m, double ratio, const Implicit& im) {
 }
 
 // ---- OBJ writer (v / vn / f v//vn), multiple groups ------------------------
+// Hot path: a mid-size export is millions of lines (a res-160 gyroid is 1.6M
+// verts + 1.6M normals + 3.3M faces), and one std::fprintf per line spends far
+// more time in FILE locking + format-string reparsing than on actual I/O --
+// measured 22 MB/s, which made the write 55% of the whole export.  So format
+// into one big buffer and fwrite it in large blocks instead.  Float fields
+// still go through snprintf with the *same* conversion specifiers, so the
+// bytes are identical to the fprintf version; face lines are pure integers and
+// get a hand-rolled decimal conversion.
+namespace objdetail {
+
+// Decimal form of `v`, appended in place -- avoids a snprintf per index.
+inline void appendLong(std::string& b, long v) {
+    char tmp[24];
+    int n = 0;
+    if (v < 0) { b.push_back('-'); v = -v; }
+    do { tmp[n++] = char('0' + (v % 10)); v /= 10; } while (v);
+    while (n) b.push_back(tmp[--n]);
+}
+
+} // namespace objdetail
+
 inline bool writeObj(const std::string& path,
                      const std::vector<std::pair<std::string, Mesh>>& groups,
                      const std::function<void(const std::string&)>& log) {
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) { if (log) log("[export-mesh] ERROR: cannot open " + path); return false; }
-    std::fprintf(f, "# forward-raytracer isosurface export\n");
+
+    constexpr size_t kBuf   = size_t(8) << 20;           // 8 MB staging buffer
+    constexpr size_t kFlush = kBuf - (size_t(64) << 10); // headroom for one line
+    std::string buf;
+    buf.reserve(kBuf);
+    bool ok = true;
+    // Push the buffer out whenever it nears capacity (or at the very end).
+    auto flush = [&](bool force) {
+        if (!ok || buf.empty() || (!force && buf.size() < kFlush)) return;
+        if (std::fwrite(buf.data(), 1, buf.size(), f) != buf.size()) ok = false;
+        buf.clear();
+    };
+
+    buf += "# forward-raytracer isosurface export\n";
     size_t vbase = 0, totV = 0, totT = 0;
+    char line[128];
     for (const auto& g : groups) {
         const Mesh& m = g.second;
-        std::fprintf(f, "o %s\n", g.first.c_str());
-        for (const auto& p : m.pos) std::fprintf(f, "v %.6g %.6g %.6g\n", p.x, p.y, p.z);
-        for (const auto& n : m.nrm) std::fprintf(f, "vn %.5f %.5f %.5f\n", n.x, n.y, n.z);
-        for (size_t t = 0; t + 2 < m.tri.size(); t += 3) {
-            long a = (long)(vbase + m.tri[t]   + 1);
-            long b = (long)(vbase + m.tri[t+1] + 1);
-            long c = (long)(vbase + m.tri[t+2] + 1);
-            std::fprintf(f, "f %ld//%ld %ld//%ld %ld//%ld\n", a,a, b,b, c,c);
+        buf += "o "; buf += g.first; buf += '\n';
+        for (const auto& p : m.pos) {
+            int n = std::snprintf(line, sizeof line, "v %.6g %.6g %.6g\n", p.x, p.y, p.z);
+            if (n < 0 || n >= (int)sizeof line) { ok = false; break; }
+            buf.append(line, (size_t)n);
+            flush(false);
+        }
+        for (const auto& nv : m.nrm) {
+            if (!ok) break;
+            int n = std::snprintf(line, sizeof line, "vn %.5f %.5f %.5f\n", nv.x, nv.y, nv.z);
+            if (n < 0 || n >= (int)sizeof line) { ok = false; break; }
+            buf.append(line, (size_t)n);
+            flush(false);
+        }
+        for (size_t t = 0; ok && t + 2 < m.tri.size(); t += 3) {
+            const long idx[3] = { (long)(vbase + m.tri[t]   + 1),
+                                  (long)(vbase + m.tri[t+1] + 1),
+                                  (long)(vbase + m.tri[t+2] + 1) };
+            buf += 'f';
+            for (int k = 0; k < 3; ++k) {            // "f a//a b//b c//c"
+                buf += ' ';
+                objdetail::appendLong(buf, idx[k]);
+                buf += "//";
+                objdetail::appendLong(buf, idx[k]);
+            }
+            buf += '\n';
+            flush(false);
         }
         vbase += m.pos.size();
         totV  += m.pos.size();
         totT  += m.tri.size() / 3;
+        if (!ok) break;
     }
-    std::fclose(f);
+    flush(true);
+    if (std::fclose(f) != 0) ok = false;
+    if (!ok) {
+        if (log) log("[export-mesh] ERROR: failed writing " + path + " (disk full?)");
+        return false;
+    }
     if (log) log("[export-mesh] wrote " + path + "  (" + std::to_string(totV) +
                  " verts, " + std::to_string(totT) + " tris, " +
                  std::to_string(groups.size()) + " objects)");

@@ -163,10 +163,18 @@ bool cudaPhotonMapSupported(const Scene& scene);
 // deposited map is the expensive result of the forward photon trace and is independent of
 // camera and gather radius, so it is worth persisting: `mapSave` writes it after the deposit,
 // and `mapLoad` reloads it and SKIPS the deposit entirely — re-gathering new camera angles /
-// a new radius for free, without re-tracing a photon. The file (magic "FTPMP01\n") holds the
+// a new radius for free, without re-tracing a photon. The file (magic "FTPMP02\n") holds the
 // raw photon set + emitted count + energy; the grid is rebuilt on load at the requested
 // `radius`, so one file serves any radius. A scene-identity guard rejects a stale map built
 // for a different scene (it falls back to a fresh deposit). Both default null (no caching).
+//
+// `autoK` > 0 turns on the density-adaptive gather radius: `radius` becomes only a STARTING
+// point, and the grid is rebuilt at whatever radius makes a typical gather see the target
+// population (PhotonMap::buildAuto, photonmap.h — see there for why the target scales as the
+// cube root of the stored count). 0 = off, use `radius` exactly. This must be honoured on the
+// GPU too, not just the CPU: the shared-map path IS the high-photon-count path, which is
+// exactly where a count-independent radius collapses. The gather reads pm.radius (not this
+// argument) after the build, so the adapted value flows through with no further plumbing.
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
@@ -174,7 +182,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const SppProgress* prog = nullptr,
                                             const std::function<bool(int, const Film&)>* onFrame = nullptr,
                                             const char* mapLoad = nullptr, const char* mapSave = nullptr,
-                                            int heroC = 1, int fgRays = 0);
+                                            int heroC = 1, int fgRays = 0, double autoK = 0.0);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/
@@ -192,9 +200,14 @@ bool cudaBdptSupported(const Scene& scene);
 // progress / request an early stop. A null `prog` renders all spp in one launch (the
 // historical path). Either way the result is bit-identical for a given spp (the RNG is
 // seeded on the global sample index, so chunking never changes the image).
+// `heroC` (`-heroc N`) > 1 carries a hero wavelength plus C-1 stratified secondaries down
+// BOTH subpaths of every sample (one shared BVH walk, one shared MIS weight, sharply lower
+// chroma noise). It is clamped to hero::kHeroMax and silently dropped to 1 for scenes the
+// hero walk does not cover (participating media, GRIN, a physical lens) — the same gate the
+// CPU BDPT applies. heroC <= 1 reproduces the original single-λ kernel bit-for-bit.
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction,
-                    const SppProgress* prog = nullptr);
+                    const SppProgress* prog = nullptr, int heroC = 1);
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
 // (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.
@@ -218,10 +231,14 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 // seeded on the global sample index, so chunking never changes the image).
 // maxBounce (< 1 => leave the device default of 32) caps the backward path depth
 // (-max-bounce); directOnly (-direct-only) renders direct + specular recursion only.
+// heroC (`-heroc N`) > 1 carries a hero wavelength plus C-1 stratified secondaries down
+// each camera path (one shared BVH walk, sharply lower chroma noise); it is clamped to
+// hero::kHeroMax and silently dropped to 1 for scenes the hero walk does not cover
+// (participating media, GRIN, a physical lens) — the same gate the CPU tracer applies.
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction,
                         const SppProgress* prog = nullptr,
-                        int maxBounce = 32, bool directOnly = false);
+                        int maxBounce = 32, bool directOnly = false, int heroC = 1);
 
 // True if this scene + camera can be rendered by the FAST RGB backward megakernel
 // (mode R `-rgb`, Option B in gpu-backward-fast.md): the reduced non-spectral tracer
@@ -315,8 +332,11 @@ struct VcmSession;   // opaque; lives in render_cuda.cu
 bool cudaVcmSupported(const Scene& scene);
 // Returns nullptr if CUDA is unavailable or the scene is out of scope. `maxDepth` (<1 =>
 // default 8) is the full path length in edges (also the per-light-subpath stored-vertex cap).
+// `heroC` > 1 carries a hero-wavelength bundle of that width along BOTH subpaths (clamped to
+// hero::kHeroMax); 1 is the classic single-λ session, which the templated kernels reproduce
+// bit-identically and without allocating the per-vertex secondary slab at all.
 VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
-                            bool diffraction, int maxDepth);
+                            bool diffraction, int maxDepth, int heroC = 1);
 // Run one VCM pass at the given merge `radius` (the caller shrinks it per the progressive
 // schedule r_i = R0 * i^((alpha-1)/2)), accumulating into the resident per-pixel sum.
 void vcmSessionPass(VcmSession* s, double radius);

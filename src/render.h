@@ -296,6 +296,12 @@ struct Renderer {
                                  // useHero is on (hero + heroC-1 secondaries). Runtime-
                                  // configurable via -heroc N, clamped to [1, kHeroMax];
                                  // defaults to kHeroC. C==1 collapses to single-λ.
+    bool heroSplit    = hero::gSplit; // SPLIT-AT-DISPERSION policy (-herosplit): at a
+                                 // dispersive interface, fan the bundle out into C
+                                 // monochromatic sub-paths (each refracting along its own
+                                 // per-λ direction) instead of de-hero'ing to the hero
+                                 // alone. Off by default; costs C× traversal past the
+                                 // split but resolves chromatic spread geometrically.
     bool beamGather   = false;   // PHOTON-BEAMS gather for the shared multi-camera pass
                                  // (CLI -beams). When on and nCam>1, each camera samples
                                  // its OWN collision point along every medium beam segment
@@ -314,13 +320,14 @@ struct Renderer {
     // A photon pass runs with nCam==0 (no camera splat) + photonDeposit set: paths bounce
     // and deposit, but energy goes into the map instead of onto a sensor. Null in modes
     // A/B/C, so their splat behaviour is byte-for-byte unchanged.
-    std::vector<Photon>* photonDeposit = nullptr;
+    PhotonBank* photonDeposit = nullptr;
 
     // Append a photon record at a diffuse/translucent vertex (no-op when the map is off).
-    void depositPhoton(const Vec3& p, const Vec3& wtravel, const Vec3& n,
-                       double lambda, double beta) const {
+    // The photon's incident direction is deliberately NOT stored: the density estimate is
+    // Lambertian, so no gather has ever read it (see Photon in photonmap.h).
+    void depositPhoton(const Vec3& p, const Vec3& n, double lambda, double beta) const {
         if (!photonDeposit) return;
-        photonDeposit->push_back(Photon{p, -wtravel, n, (float)beta, (float)lambda});
+        photonDeposit->push(p, n, (float)beta, (float)lambda);
     }
 
     // Model A: map a contact-sensor hit to a pixel and deposit.
@@ -345,8 +352,12 @@ struct Renderer {
     // dMax first. Delta (Woodcock) tracking for a heterogeneous medium: candidate
     // collisions at rate sigma_max, accepted as real with prob sigmaT(x)/sigma_max
     // (a rejected "null collision" just continues) — unbiased, throughput unchanged.
+    // `tabs` are the scene's grid:/scatter: tables, required (not defaulted) so a
+    // density program that samples a measured volume can never be silently evaluated
+    // without them — the two wrappers below are the only callers and both have a Scene.
     bool sampleMediumCollision(const Medium& med, const Vec3& o, const Vec3& dir,
-                               double dMax, double lambda, Pcg32& rng, double& tHit) const {
+                               double dMax, double lambda, Pcg32& rng, double& tHit,
+                               const PatTables* tabs) const {
         double stBase = med.sigmaT(lambda);
         if (stBase <= 0.0) return false;
         double ta, tb;
@@ -362,7 +373,7 @@ struct Renderer {
         for (;;) {
             t += -std::log(1.0 - rng.uniform()) / sigMax;
             if (t >= tb) return false;
-            double sigT = stBase * med.densityAt(o + dir * t);
+            double sigT = stBase * med.densityAt(o + dir * t, tabs);
             if (rng.uniform() * sigMax < sigT) { tHit = t; return true; }  // real collision
         }                                                                 // else null collision
     }
@@ -371,7 +382,8 @@ struct Renderer {
     // homogeneous medium (clipped to its bound); ratio tracking otherwise (candidate
     // collisions at rate sigma_max, each scaling the estimate by 1 - sigmaT(x)/sigma_max).
     double mediumTransmittance(const Medium& med, const Vec3& o, const Vec3& dir,
-                               double dist, double lambda, Pcg32& rng) const {
+                               double dist, double lambda, Pcg32& rng,
+                               const PatTables* tabs) const {
         double stBase = med.sigmaT(lambda);
         if (stBase <= 0.0) return 1.0;
         double ta, tb;
@@ -384,7 +396,7 @@ struct Renderer {
         for (;;) {
             t += -std::log(1.0 - rng.uniform()) / sigMax;
             if (t >= tb) break;
-            double sigT = stBase * med.densityAt(o + dir * t);
+            double sigT = stBase * med.densityAt(o + dir * t, tabs);
             Tr *= 1.0 - sigT / sigMax;
         }
         return Tr;
@@ -407,13 +419,20 @@ struct Renderer {
 
     // Earliest real collision across all media within [0,dMax]. On a hit, `tHit` is the
     // distance and `whichMed` the index of the scattering medium. false if none.
-    bool sampleMediaCollision(const std::vector<Medium>& media, const Vec3& o,
+    //
+    // Takes the whole Scene rather than just `scene.media` because a density program may
+    // sample the scene's `grid:`/`scatter:` tables (`density "grid:rho(x, y, z)"`), which
+    // live beside the media in the Scene. Deriving the tables here means no caller can
+    // forget to pass them — and every caller already had the Scene in hand.
+    bool sampleMediaCollision(const Scene& scene, const Vec3& o,
                               const Vec3& dir, double dMax, double lambda, Pcg32& rng,
                               double& tHit, int& whichMed) const {
+        const std::vector<Medium>& media = scene.media;
+        const PatTables tabs = scene.patTables();
         double best = dMax; int which = -1;
         for (int i = 0; i < (int)media.size(); ++i) {
             double t;
-            if (sampleMediumCollision(media[i], o, dir, dMax, lambda, rng, t) && t < best) {
+            if (sampleMediumCollision(media[i], o, dir, dMax, lambda, rng, t, &tabs) && t < best) {
                 best = t; which = i;
             }
         }
@@ -422,11 +441,12 @@ struct Renderer {
     }
 
     // Combined transmittance through all media = product of per-medium transmittances.
-    double mediaTransmittance(const std::vector<Medium>& media, const Vec3& o,
+    double mediaTransmittance(const Scene& scene, const Vec3& o,
                               const Vec3& dir, double dist, double lambda, Pcg32& rng) const {
+        const PatTables tabs = scene.patTables();   // see sampleMediaCollision
         double Tr = 1.0;
-        for (const Medium& m : media) {
-            Tr *= mediumTransmittance(m, o, dir, dist, lambda, rng);
+        for (const Medium& m : scene.media) {
+            Tr *= mediumTransmittance(m, o, dir, dist, lambda, rng, &tabs);
             if (Tr <= 0.0) break;
         }
         return Tr;
@@ -489,7 +509,7 @@ struct Renderer {
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
         if (!scene.media.empty())
-            contrib *= mediaTransmittance(scene.media, p, g.wdir, g.dist, lambda, rng);
+            contrib *= mediaTransmittance(scene, p, g.wdir, g.dist, lambda, rng);
         film.add(g.px, g.py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -506,7 +526,7 @@ struct Renderer {
             double f = rho[i] / PI;
             double contrib = beta[i] * f * g.cosSurf * g.corr / g.denom * g.stG;
             if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene.media, p, g.wdir, g.dist, lam[i], rng);
+                contrib *= mediaTransmittance(scene, p, g.wdir, g.dist, lam[i], rng);
             film.add(g.px, g.py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -530,7 +550,7 @@ struct Renderer {
         double Lambda = med.albedo(lambda);
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
-        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);   // fog transmittance (all media)
+        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);   // fog transmittance (all media)
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -591,7 +611,7 @@ struct Renderer {
         // land mid-tone at ABS_EXPOSURE_GAIN, matching B.
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         if (!scene.media.empty())
-            contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);
+            contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -628,7 +648,7 @@ struct Renderer {
             double contrib = beta[i] * rho[i] * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
             contrib *= cellNorm;
             if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene.media, p, wdir, dist, lam[i], rng);
+                contrib *= mediaTransmittance(scene, p, wdir, dist, lam[i], rng);
             film.add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -661,8 +681,63 @@ struct Renderer {
         // matches B's absolute scale in absolute-EV modes (per-camera constant; auto-
         // exposed scenes unaffected).
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= mediaTransmittance(scene.media, p, wdir, dist, lambda, rng);   // all media
+        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);   // all media
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Model B camera splat for a VOLUME EMISSION vertex (blackbody "fire"). Identical
+    // geometry to connectVolume, but the in-scatter term albedo*phase is replaced by
+    // isotropic emission 1/(4π): the hot voxel radiates equally in all directions, so
+    // there is no incoming direction and no phase. `beta` already carries the emission
+    // strength (grandTotal·κ_e(x,λ)/meanKe); the /(dist²·Ω) converts the volume-birth
+    // integral into the emission line-integral seen by the pixel. Fog transmittance
+    // still applies (the flame's own soot self-absorbs its glow).
+    void connectEmissionVolume(const Scene& scene, const Camera& cam, Film& film,
+                               const Vec3& p, double lambda, double beta, Pcg32& rng) const {
+        Vec3 toCam = cam.eye - p;
+        double dist = length(toCam);
+        Vec3 wdir = toCam / dist;
+        int px, py; double cosCam, dist2;
+        if (!cam.project(p, px, py, cosCam, dist2)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        double omega = cam.pixelSolidAngle(cosCam);
+        double contrib = beta * (1.0 / (4.0 * PI)) / (dist2 * omega);
+        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Model A (finite-lens) camera splat for a volume emission vertex. As
+    // connectLensVolume, with the albedo*phase in-scatter term replaced by the isotropic
+    // 1/(4π) emission term.
+    void connectEmissionLensVolume(const Scene& scene, const Camera& cam, Film& film,
+                                   const Vec3& p, double lambda, double beta, Pcg32& rng) const {
+        double R = cam.apertureR;
+        double rr = R * std::sqrt(rng.uniform());
+        double a  = 2.0 * PI * rng.uniform();
+        Vec3 A = cam.eye + cam.u * (rr * std::cos(a)) + cam.v * (rr * std::sin(a));
+        Vec3 toA = A - p;
+        double dist = length(toA);
+        if (dist < 1e-9) return;
+        Vec3 wdir = toA / dist;
+        double cosLens = -dot(wdir, cam.w);
+        if (cosLens <= 1e-6) return;
+        int px, py;
+        if (!cam.lensImage(A, wdir, px, py)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6)) return;
+        double contrib = beta * (1.0 / (4.0 * PI)) * cosLens * (PI * R * R) / (dist * dist);
+        contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
+        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Splat a volume-emission vertex to every camera (pinhole B or finite lens A).
+    void camSplatEmissionAll(const Scene& scene, const CamTarget* cams, int nCam,
+                             const Vec3& p, double lambda, double beta, Pcg32& rng) const {
+        for (int c = 0; c < nCam; ++c)
+            if (cams[c].cam && cams[c].film) {
+                if (lensMode) connectEmissionLensVolume(scene, *cams[c].cam, *cams[c].film, p, lambda, beta, rng);
+                else          connectEmissionVolume(scene, *cams[c].cam, *cams[c].film, p, lambda, beta, rng);
+            }
     }
 
     // Route a camera connection to the pinhole (model B) or the finite lens (model A).
@@ -922,8 +997,8 @@ struct Renderer {
             // Fog transmittance on the two outer (vacuum-side) segments only; the
             // interior segment is solid glass (its absorption is the Beer-Lambert above).
             if (!scene.media.empty()) {
-                contrib *= mediaTransmittance(scene.media, p,     wP, dP2, lambda, rng);
-                contrib *= mediaTransmittance(scene.media, ch.P1, wE, dE,  lambda, rng);
+                contrib *= mediaTransmittance(scene, p,     wP, dP2, lambda, rng);
+                contrib *= mediaTransmittance(scene, ch.P1, wE, dE,  lambda, rng);
             }
             film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
         }
@@ -1073,7 +1148,7 @@ struct Renderer {
 
             // Fog transmittance on the exterior segment only (interior is solid glass).
             if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene.media, p, wP, dP, lambda, rng);
+                contrib *= mediaTransmittance(scene, p, wP, dP, lambda, rng);
 
             film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
         }
@@ -1257,7 +1332,7 @@ struct Renderer {
                 // the wavelength-dependent survival IS the colored transmission.
                 // Specular straight-through, so no camera connect (like clear glass):
                 // you see the filter's effect on whatever lies behind it.
-                double t = clamp01(m.transmit(lambda));
+                double t = clamp01(transmitSlot(scene, m, h, lambda));
                 if (rng.uniform() >= t) { e.absorbed += beta; return false; }
                 ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight, unchanged
                 return true;
@@ -1319,13 +1394,72 @@ struct Renderer {
         // selection] reproduces each emitter's true power (unbiased). For a single
         // emitter selectEmitter() draws no randomness, keeping the RNG stream (and
         // thus the image) bit-identical to the pre-multi-light engine.
+        // A photon is born on a surface/environment EMITTER or inside a volumetric
+        // blackbody EMITTER ("fire"). grandTotal folds both power pools; the class is
+        // chosen with probability proportional to power (P(fire)=totalEmissionPower/
+        // grandTotal) and the photon carries beta=grandTotal so E[beta] reproduces each
+        // source's true power (unbiased carry-total scheme). When there are no emissive
+        // volumes the `&&` short-circuits WITHOUT drawing an RNG, so ordinary scenes stay
+        // bit-for-bit identical to the pre-fire engine.
+        const double grandTotal = scene.totalPower + scene.totalEmissionPower;
+        if (grandTotal <= 0.0) return;
+        Vec3 origin, dir;
+        double lambda, beta;
+        const bool volumeBirth = !scene.emissiveVolumes.empty() &&
+                                 (rng.uniform() * grandTotal < scene.totalEmissionPower);
+        if (volumeBirth) {
+            // --- Volumetric blackbody birth (fire) ---
+            // Select an emissive volume proportional to its power (linear CDF walk).
+            double r = rng.uniform() * scene.totalEmissionPower;
+            int vi = 0;
+            for (; vi + 1 < (int)scene.emissiveVolumes.size(); ++vi) {
+                r -= scene.emissiveVolumes[vi].power;
+                if (r <= 0.0) break;
+            }
+            const Scene::EmissiveVolume& ev = scene.emissiveVolumes[vi];
+            const Medium& fm = scene.media[ev.mediumIndex];
+            // Uniform position in the grid AABB; wavelength importance-sampled from a
+            // representative blackbody (Planck at emitKelvin) via ev.lamSampler.
+            // beta = grandTotal·κ_e(x,λ)/(meanKe·Δλ·p(λ)) reproduces the emission
+            // line-integral when splatted with the isotropic 1/(4π)/(dist²·Ω) direct
+            // term (derived). With p(λ) uniform (=1/Δλ) this collapses to the plain
+            // grandTotal·κ_e/meanKe; matching p(λ) to the Planck shape makes β nearly
+            // constant across the band, killing the spectral colour speckle.
+            origin = Vec3{ ev.bmin.x + (ev.bmax.x - ev.bmin.x) * rng.uniform(),
+                           ev.bmin.y + (ev.bmax.y - ev.bmin.y) * rng.uniform(),
+                           ev.bmin.z + (ev.bmax.z - ev.bmin.z) * rng.uniform() };
+            double pdfLam = 0.0;
+            lambda = ev.lamSampler.sample(rng, pdfLam);
+            double ke = fm.emissionAt(origin, lambda);
+            const double dLamE = LAMBDA_MAX - LAMBDA_MIN;
+            beta = (ev.meanKe > 0.0 && pdfLam > 0.0)
+                 ? grandTotal * ke / (ev.meanKe * dLamE * pdfLam) : 0.0;
+            e.emitted += beta;
+            if (beta <= 0.0) return;             // cold voxel: nothing to emit or transport
+            // Isotropic emission direction.
+            double z = 1.0 - 2.0 * rng.uniform();
+            double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
+            double phi = 2.0 * PI * rng.uniform();
+            dir = Vec3{ sr * std::cos(phi), sr * std::sin(phi), z };
+            // Direct-visibility emission splat (the flame seen directly by the camera).
+            if (nCam > 0 && !forwardCatch)
+                camSplatEmissionAll(scene, cams, nCam, origin, lambda, beta, rng);
+            // Fall through to the shared transport loop so the emitted light also
+            // illuminates the rest of the scene (self-scatter in the soot, walls, etc.).
+        } else {
+        // Power-weighted emitter selection: photon selects emitter k with prob
+        // power_k/totalPower and carries beta = totalPower, so E[beta over the
+        // selection] reproduces each emitter's true power (unbiased). For a single
+        // emitter selectEmitter() draws no randomness, keeping the RNG stream (and
+        // thus the image) bit-identical to the pre-multi-light engine.
         if (scene.emitters.empty()) return;
         int ei = scene.selectEmitter(rng);
         const Emitter& em = scene.emitters[ei];
         double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 origin, emitN, dir;
+        Vec3 emitN;
         double spotW = 1.0;                      // spot: p_e/p_u direction reweight (else 1)
         double envPdfW = 0.0;                    // env: solid-angle pdf of the sampled dir
+        double emitPatW = 1.0;                   // `emit pattern:` factor at the sampled point
         if (em.shape == EmitterShape::Spot) {
             // Point spot: sample a direction uniformly in the outer cone, then
             // reweight beta by falloff*(Omega_outer/Omega_eff) so the emitted
@@ -1364,16 +1498,35 @@ struct Renderer {
             Vec3 disk = t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
             origin = scene.sceneCenter - dir * scene.sceneRadius + disk;
             emitN = dir;
+        } else if (em.shape == EmitterShape::Sun) {
+            // Distant directional sun. Sample the travel direction inside the solar
+            // cone (pdf 1/Omega), then the entry point on a disk of radius R
+            // perpendicular to it (pdf 1/(pi R^2)) — the same upstream-disk trick the
+            // env uses, but aimed instead of isotropic, so EVERY photon crosses the
+            // scene rather than one in ~10^5. The joint pdf 1/(Omega*pi*R^2) is exactly
+            // 1/envGeom, so beta = emitIntegral*envGeom is analog with no reweight.
+            dir = em.sampleCone(em.beamDir, u1, u2);
+            Vec3 t, b; onb(dir, t, b);
+            double rd = scene.sceneRadius * std::sqrt(rng.uniform());
+            double pd = 2.0 * PI * rng.uniform();
+            origin = scene.sceneCenter - dir * scene.sceneRadius
+                   + t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
+            emitN = dir;
         } else {
-            em.samplePoint(u1, u2, origin, emitN);   // quad: constant normal; sphere: surface point
+            // quad: constant normal; sphere: surface point. emitterSamplePoint also
+            // returns this point's `emit pattern:` factor — 1.0 (and a bit-identical
+            // call) when the emitter carries no pattern.
+            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
         double pdfL = 0.0;
-        double lambda = em.spd.sample(rng, pdfL);
+        lambda = em.spd.sample(rng, pdfL);
         if (pdfL <= 0) return;
-        // Single emitter: beta = its own power (== old lightEmitIntegral*area*PI).
-        // Multiple: beta = totalPower (see selection note above).
-        double beta = (scene.emitters.size() == 1) ? em.power : scene.totalPower;
+        // Single emitter (no fire): beta = its own power (== old lightEmitIntegral*
+        // area*PI). Multiple emitters: beta = totalPower. When fire volumes coexist the
+        // emitter class carries grandTotal (carry-total split, see above).
+        beta = !scene.emissiveVolumes.empty() ? grandTotal
+             : ((scene.emitters.size() == 1) ? em.power : scene.totalPower);
         beta *= spotW;   // exactly 1.0 for non-spot emitters (no bit change)
         // Image env: replace the flat power with the directional estimator. The base
         // beta carries the mean env power; multiply by L(dir,lambda)/(4pi*pdfW*mean)
@@ -1383,6 +1536,13 @@ struct Renderer {
             double denom = 4.0 * PI * envPdfW * em.spdFn(lambda);
             beta = (denom > 0.0) ? beta * (scene.envMap->radiance(dir, lambda) / denom) : 0.0;
         }
+        // An emission pattern is a pure post-multiplier on the photon's carried power:
+        // the emitter is still SELECTED by its unpatterned power and the point still
+        // drawn uniformly over its area, so no pdf anywhere changes and the estimator
+        // stays unbiased. The cost is variance — a mostly-dark pattern spends most of
+        // its photons on near-zero beta. `emitted` is credited the patterned value so
+        // the energy report matches what actually leaves the surface.
+        if (emitPatW != 1.0) beta *= emitPatW;
         e.emitted += beta;
 
         // Direct light -> camera: makes the source itself visible. The Lambertian
@@ -1390,11 +1550,15 @@ struct Renderer {
         // (Skipped in forward-catch mode; there the aperture test below handles it.)
         // A spot is a point light with no projected area, so it has no such direct
         // term (its cone illuminates surfaces, which then connect to the camera).
+        // A Sun is excluded for the same reason as the env: it has no finite surface to
+        // connect to, and the disc's direct view is composited by addEnvBackground.
         if (nCam > 0 && !forwardCatch &&
-            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env) {
+            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env &&
+            em.shape != EmitterShape::Sun) {
             camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, 1.0, rng);
             camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
         }
+        }   // end emitter-birth branch
 
         Ray ray{origin + dir * 1e-6, dir};
         // Nested-dielectric medium stack: the solids the photon is currently inside.
@@ -1444,7 +1608,7 @@ struct Renderer {
             // scatter independently below — so skip the analog collision sampling here.
             if (!scene.media.empty() && !doBeamGather) {
                 double tMed; int which;
-                if (sampleMediaCollision(scene.media, ray.o, ray.d, dSurf, lambda, rng, tMed, which)) {
+                if (sampleMediaCollision(scene, ray.o, ray.d, dSurf, lambda, rng, tMed, which)) {
                     dEvent = tMed; mediumEvent = true; scatterMed = which; mp = ray.o + ray.d * tMed;
                 }
             }
@@ -1496,7 +1660,7 @@ struct Renderer {
                     for (int c = 0; c < nCam; ++c) {
                         if (!(cams[c].cam && cams[c].film)) continue;
                         double tC; int whichC;
-                        if (!sampleMediaCollision(scene.media, ray.o, ray.d, dSurf, lambda, crng, tC, whichC))
+                        if (!sampleMediaCollision(scene, ray.o, ray.d, dSurf, lambda, crng, tC, whichC))
                             continue;   // this camera saw no in-scatter along this beam
                         Vec3 xc = ray.o + ray.d * tC;
                         double betaC = (aC > 0.0) ? betaPre * std::exp(-aC * tC) : betaPre;
@@ -1511,7 +1675,7 @@ struct Renderer {
                 // dimmed direct light; the removed energy (out-scattered + absorbed) is booked
                 // as absorbed. The photon then continues STRAIGHT to the surface below.
                 double before = beta;
-                beta *= mediaTransmittance(scene.media, ray.o, ray.d, dSurf, lambda, crng);
+                beta *= mediaTransmittance(scene, ray.o, ray.d, dSurf, lambda, crng);
                 e.absorbed += (before - beta);
             }
 
@@ -1592,13 +1756,13 @@ struct Renderer {
                     // camera is on. Because both lobes are non-specular, a directly-viewed
                     // translucent solid is VISIBLE in mode B (unlike clear dielectric).
                     double rhoR = clamp01(diffuseReflectance(scene, m, h, lambda));
-                    double rhoT = clamp01(m.transmit(lambda));
+                    double rhoT = clamp01(transmitSlot(scene, m, h, lambda));
                     double sum = rhoR + rhoT;
                     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }  // energy guard
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Photon-map deposit: incident flux at this translucent vertex.
-                    depositPhoton(h.p, ray.d, h.n, lambda, beta);
+                    depositPhoton(h.p, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
                         camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, wi, lambda, beta, rhoT, rng);
@@ -1629,7 +1793,7 @@ struct Renderer {
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
-                    depositPhoton(h.p, ray.d, h.n, lambda, beta);
+                    depositPhoton(h.p, h.n, lambda, beta);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
@@ -1669,6 +1833,7 @@ struct Renderer {
         Vec3 origin, emitN, dir;
         double spotW = 1.0;
         double envPdfW = 0.0;
+        double emitPatW = 1.0;                   // `emit pattern:` factor at the sampled point
         if (em.shape == EmitterShape::Spot) {
             origin = em.origin;
             double ct = em.spotCosOuter + u1 * (1.0 - em.spotCosOuter);
@@ -1694,25 +1859,25 @@ struct Renderer {
             Vec3 disk = t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
             origin = scene.sceneCenter - dir * scene.sceneRadius + disk;
             emitN = dir;
+        } else if (em.shape == EmitterShape::Sun) {
+            // Distant directional sun — see the scalar tracer for the pdf argument.
+            dir = em.sampleCone(em.beamDir, u1, u2);
+            Vec3 t, b; onb(dir, t, b);
+            double rd = scene.sceneRadius * std::sqrt(rng.uniform());
+            double pd = 2.0 * PI * rng.uniform();
+            origin = scene.sceneCenter - dir * scene.sceneRadius
+                   + t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
+            emitN = dir;
         } else {
-            em.samplePoint(u1, u2, origin, emitN);
+            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
             dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
         }
 
-        // Hero + stratified secondary wavelengths from this emitter's SPD (one base draw,
-        // C-1 wrapped strata). The hero must have a valid pdf; a dead secondary carries
-        // beta 0 and simply splats nothing.
-        double lam[hero::kHeroMax];
-        double u = rng.uniform();
-        double pdf0 = 0.0;
-        lam[0] = em.spd.sampleAt(u, pdf0);
-        if (pdf0 <= 0) return;
-        for (int i = 1; i < C; ++i) {
-            double uu = u + (double)i / C;
-            if (uu >= 1.0) uu -= 1.0;                 // wrap into [0,1)
-            double pdfi = 0.0;
-            lam[i] = em.spd.sampleAt(uu, pdfi);
-        }
+        // Hero + stratified secondary wavelengths from this emitter's SPD (hero.h policy 1:
+        // one base draw, C-1 wrapped strata). The hero must have a valid pdf; a dead
+        // secondary carries beta 0 and simply splats nothing, so its pdf goes unread.
+        double lam[hero::kHeroMax], pdfLam[hero::kHeroMax];
+        if (!hero::sampleBundle(em.spd, rng.uniform(), C, lam, pdfLam)) return;
         // Per-λ throughput: base power split C ways. Image-env reweights each λ by the
         // directional radiance estimator (no-op for a constant env).
         double base = (scene.emitters.size() == 1) ? em.power : scene.totalPower;
@@ -1725,16 +1890,19 @@ struct Renderer {
                 beta[i] = (denom > 0.0) ? beta[i] * (scene.envMap->radiance(dir, lam[i]) / denom) : 0.0;
             }
         }
+        // Achromatic post-multiplier — see the scalar tracer above for why this changes
+        // no pdf and therefore introduces no bias.
+        if (emitPatW != 1.0) for (int i = 0; i < C; ++i) beta[i] *= emitPatW;
 
         bool secAlive = (C > 1);
         auto activeSum = [&]() { double s = 0.0; int n = secAlive ? C : 1;
                                  for (int i = 0; i < n; ++i) s += beta[i]; return s; };
-        auto deHero = [&]() { if (!secAlive) return; beta[0] *= (double)C; secAlive = false; };
         e.emitted += activeSum();
 
         // Direct light -> camera (area/quad emitters only; matches the scalar tracer).
         if (nCam > 0 && !forwardCatch &&
-            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env) {
+            em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env &&
+            em.shape != EmitterShape::Sun) {
             double rhoOne[hero::kHeroMax]; for (int i = 0; i < C; ++i) rhoOne[i] = 1.0;
             camSplatAllHero(scene, cams, nCam, origin, emitN, emitN, emitN, lam, beta, rhoOne, C, rng);
             camSpecularSplatAllHero(scene, cams, nCam, origin, emitN, lam, beta, rhoOne, C, rng);
@@ -1742,8 +1910,35 @@ struct Renderer {
 
         Ray ray{origin + dir * 1e-6, dir};
         MediumStack stk;                 // dielectric priority (Beer-Lambert uses hero λ)
+        tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, ray, stk, lam, beta,
+                            secAlive, /*bounce0=*/0, rng, e);
+    }
 
-        for (int bounce = 0; bounce < maxBounce; ++bounce) {
+    // Bounce loop for a hero bundle that is already sitting at (`ray`, `stk`) with
+    // `secAlive ? heroC : 1` live wavelengths carrying `lamIn[]`/`betaIn[]`, resuming at
+    // bounce index `bounce0`. Split out of tracePhotonHero so the `-herosplit` policy can
+    // RE-ENTER it once per monochromatic sub-path that a dispersive interface fans out
+    // (see the dispersive case below). Every such sub-path is spawned with
+    // `secAlive == false`, and the split branch is guarded on `secAlive`, so a sub-path
+    // can never split again — recursion is at most one level deep and the per-frame
+    // footprint (a MediumStack plus two kHeroMax double arrays) is bounded.
+    void tracePhotonHeroLoop(const Scene& scene, const CamTarget* cams, int nCam,
+                             Film* sensorFilm, Ray ray, MediumStack stk,
+                             const double* lamIn, const double* betaIn, bool secAlive,
+                             int bounce0, Pcg32& rng, EnergyReport& e) const {
+        const int C = heroC;
+        double lam[hero::kHeroMax], beta[hero::kHeroMax];
+        // Copy only the LIVE entries: a monochromatic sub-path spawned by -herosplit only
+        // fills slot 0 of its lamIn/betaIn, so reading all C would read indeterminate
+        // values (harmless today since nUp==1 ignores them, but still UB).
+        const int nLive = secAlive ? C : 1;
+        for (int i = 0; i < nLive; ++i) { lam[i] = lamIn[i]; beta[i] = betaIn[i]; }
+        for (int i = nLive; i < C; ++i) { lam[i] = 0.0; beta[i] = 0.0; }
+        auto activeSum = [&]() { double s = 0.0; int n = secAlive ? C : 1;
+                                 for (int i = 0; i < n; ++i) s += beta[i]; return s; };
+        auto deHero = [&]() { if (!secAlive) return; beta[0] *= (double)C; secAlive = false; };
+
+        for (int bounce = bounce0; bounce < maxBounce; ++bounce) {
             int nUp = secAlive ? C : 1;
             Hit h = scene.closestHit(ray);
             double dEvent = h.valid ? h.t : 1e30;
@@ -1814,7 +2009,7 @@ struct Renderer {
                     double rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i) {
                         double rr = clamp01(diffuseReflectance(scene, m, h, lam[i]));
-                        double rt = clamp01(m.transmit(lam[i]));
+                        double rt = clamp01(transmitSlot(scene, m, h, lam[i]));
                         double s = rr + rt;
                         if (s > 1.0) { rr /= s; rt /= s; }        // per-λ energy guard
                         rhoR[i] = rr; rhoT[i] = rt;
@@ -1826,23 +2021,40 @@ struct Renderer {
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator
                     // stays energy-consistent with the scalar single-λ deposit.
                     for (int i = 0; i < nUp; ++i)
-                        depositPhoton(h.p, ray.d, h.n, lam[i], beta[i]);
+                        depositPhoton(h.p, h.n, lam[i], beta[i]);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, wi, lam, beta, rhoR, nUp, rng);
                         camSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, wi, lam, beta, rhoT, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p,  h.n, lam, beta, rhoR, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p, -h.n, lam, beta, rhoT, nUp, rng);
                     }
-                    double sumHero = rhoR[0] + rhoT[0];
+                    // Lobe pick + RR over the whole bundle (see the Diffuse case): the
+                    // reflect/transmit probabilities are the per-lobe MAX over live λ, so no
+                    // secondary is ever amplified. The maxima can sum past 1 (each λ alone is
+                    // guarded), in which case both shrink proportionally. At nUp == 1 the two
+                    // maxima are rhoR[0]/rhoT[0] and every reweight is *= 1.0.
+                    double qR = hero::maxOf(rhoR, nUp), qT = hero::maxOf(rhoT, nUp);
+                    double sumHero = qR + qT;
+                    if (nUp > 1 && sumHero > 1.0) { qR /= sumHero; qT /= sumHero; sumHero = qR + qT; }
                     double uu = rng.uniform();
-                    if (uu < rhoR[0]) {                           // reflect (front)
-                        for (int i = 1; i < nUp; ++i) beta[i] *= rhoR[i] / rhoR[0];
+                    if (uu < qR) {                                // reflect (front)
+                        // The reweight is deterministic absorption — book it, or the energy
+                        // ledger loses the difference (sum/emitted would drop well below 1).
+                        for (int i = 0; i < nUp; ++i) {
+                            double w = rhoR[i] / qR;
+                            e.absorbed += beta[i] * (1.0 - w);
+                            beta[i] *= w;
+                        }
                         Vec3 wo = cosineHemisphere(h.n, rng);
                         double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
                         ray = Ray{h.p + h.n * 1e-6, wo}; continue;
                     } else if (uu < sumHero) {                    // transmit (back)
-                        for (int i = 1; i < nUp; ++i) beta[i] *= rhoT[i] / rhoT[0];
+                        for (int i = 0; i < nUp; ++i) {
+                            double w = rhoT[i] / qT;
+                            e.absorbed += beta[i] * (1.0 - w);
+                            beta[i] *= w;
+                        }
                         Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
                         double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
@@ -1850,17 +2062,78 @@ struct Renderer {
                     }
                     e.absorbed += activeSum(); return;
                 }
+                case MatType::Mirror:
+                case MatType::Filter:
+                case MatType::Glossy: {
+                    // ACHROMATIC delta lobes (mirrors the backward tracer's radianceHero):
+                    // specular — so no camera connect, exactly like the scalar path — but the
+                    // outgoing DIRECTION does not depend on λ, so the bundle keeps riding and
+                    // only the per-λ coefficient differs. The scalar lobe survives by ANALOG
+                    // Russian roulette on its coefficient; rolling that coin on the hero alone
+                    // would kill live secondaries whenever c_hero == 0 (a Wratten gel is 0 over
+                    // most of the spectrum) AND amplify by c_i/c_hero, so the survival
+                    // probability is the MAX over live λ and survivors reweight by c_i/q <= 1.
+                    double c[hero::kHeroMax];
+                    for (int i = 0; i < nUp; ++i)
+                        c[i] = (m.type == MatType::Filter) ? clamp01(transmitSlot(scene, m, h, lam[i]))
+                                                           : clamp01(reflectSlot(scene, m, h, lam[i]));
+                    const double q = hero::maxOf(c, nUp);
+                    if (rng.uniform() >= q) { e.absorbed += activeSum(); return; }  // RR absorb
+                    for (int i = 0; i < nUp; ++i) {                                // bounded reweight
+                        double w = c[i] / q;
+                        e.absorbed += beta[i] * (1.0 - w);   // deterministic part of the absorption
+                        beta[i] *= w;
+                    }
+                    if (m.type == MatType::Mirror) {
+                        ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                    } else if (m.type == MatType::Filter) {
+                        ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
+                    } else {
+                        Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
+                        if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }  // below surface
+                        ray = Ray{h.p + h.n * 1e-6, o};
+                    }
+                    continue;
+                }
                 case MatType::Dielectric:
                 case MatType::ThinFilm:
                 case MatType::Multilayer:
-                case MatType::Mirror:
                 case MatType::Grating:
                 case MatType::HalfMirror:
-                case MatType::Filter:
-                case MatType::Glossy:
                 case MatType::Fluorescent: {
-                    // Dispersive / wavelength-switching: terminate secondaries, then run
-                    // the shared scalar interaction on the (boosted) hero channel.
+                    // Dispersive / wavelength-switching: the outgoing direction (and, for a
+                    // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
+                    // cannot keep riding one shared direction past this interface.
+                    if (heroSplit && secAlive && nUp > 1) {
+                        // SPLIT-AT-DISPERSION (-herosplit): fan out instead of de-hero'ing.
+                        // Each secondary runs the SAME interaction with its OWN λ — so it
+                        // refracts along its own Snell direction / diffracts into its own
+                        // grating order — and then continues as an independent monochromatic
+                        // sub-path from this vertex. Weights are untouched (no ×C boost): the
+                        // C sub-paths still carry base/C each, so they sum to the same total
+                        // power the de-hero'd hero would have carried alone, and the energy
+                        // ledger stays exact because every sub-path books its own fate.
+                        for (int i = 1; i < nUp; ++i) {
+                            if (beta[i] <= 0.0) continue;   // dead secondary: nothing to carry
+                            double cl[hero::kHeroMax], cb[hero::kHeroMax];
+                            cl[0] = lam[i]; cb[0] = beta[i];
+                            MediumStack cstk = stk;         // sub-paths diverge from here on
+                            Ray cray = ray;
+                            if (interactPhotonSpecular(scene, cams, nCam, m, h, cray, cb[0],
+                                                       cl[0], cstk, rng, e))
+                                tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, cray, cstk,
+                                                    cl, cb, /*secAlive=*/false, bounce + 1,
+                                                    rng, e);
+                            beta[i] = 0.0;                  // its energy is now that sub-path's
+                        }
+                        secAlive = false;                   // hero carries on alone, UNBOOSTED
+                        if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0],
+                                                    lam[0], stk, rng, e))
+                            return;
+                        continue;
+                    }
+                    // Default policy: terminate secondaries, then run the shared scalar
+                    // interaction on the (boosted) hero channel.
                     deHero();
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0], lam[0], stk, rng, e))
                         return;
@@ -1878,14 +2151,24 @@ struct Renderer {
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator
                     // stays energy-consistent with the scalar single-λ deposit.
                     for (int i = 0; i < nUp; ++i)
-                        depositPhoton(h.p, ray.d, h.n, lam[i], beta[i]);
+                        depositPhoton(h.p, h.n, lam[i], beta[i]);
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, wi, lam, beta, rho, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, lam, beta, rho, nUp, rng);
                     }
-                    double rhoHero = rho[0];
-                    if (rng.uniform() >= rhoHero) { e.absorbed += activeSum(); return; }  // hero RR absorb
-                    for (int i = 1; i < nUp; ++i) beta[i] *= rho[i] / rhoHero;            // secondary reweight
+                    // Continuation RR over the WHOLE bundle: the survival probability is
+                    // max_i rho_i, not the hero's own albedo, and every live λ reweights by
+                    // rho_i/q <= 1. Rolling the coin on the hero alone (beta[i] *= rho_i/rho_0)
+                    // amplifies a secondary by up to rho_max/rho_hero — on a saturated wall
+                    // (redWall spans 0.05..0.75) a 15x weight spike per bounce, which cancels
+                    // the whole stratification win. At nUp == 1, q == rho[0] and beta[0] *= 1.0.
+                    const double q = hero::maxOf(rho, nUp);
+                    if (rng.uniform() >= q) { e.absorbed += activeSum(); return; }        // RR absorb
+                    for (int i = 0; i < nUp; ++i) {                                       // bounded reweight
+                        double w = rho[i] / q;
+                        e.absorbed += beta[i] * (1.0 - w);   // deterministic part of the absorption
+                        beta[i] *= w;
+                    }
                     Vec3 wo = cosineHemisphere(h.n, rng);
                     double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
                     for (int i = 0; i < nUp; ++i) beta[i] *= corr;

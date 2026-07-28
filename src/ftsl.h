@@ -70,6 +70,8 @@
 #include "fbx.h"
 #include "upsample.h"
 #include "color.h"
+#include "sky.h"
+#include "record_ladder.h"   // generalized record-stop delimiter ladder (J3b item 2)
 
 namespace ftsl {
 
@@ -81,6 +83,27 @@ inline bool isNumber(const std::string& s) {
     return end == s.c_str() + s.size();
 }
 inline double num(const std::string& s) { return std::strtod(s.c_str(), nullptr); }
+
+// The arity-3 COLOUR HEADS: every spectrum expression of the form `<head> a b c`,
+// across all three colour spaces and all the upsamplers/emission forms. Kept as one
+// list because two very different sites need the same answer: `evalSpectrum` (which
+// consumes them as a value head) and a record channel's inline-colour TAG (where the
+// head is written once for the whole channel and each stop supplies only the triple).
+// Splitting the list would let the two drift, and the failure mode is silent — a head
+// the tag accepts but `evalSpectrum` doesn't would turn a colour stop into a mystery
+// scalar-expression error pointing at the wrong token.
+inline bool isColourHead(const std::string& h) {
+    static const char* kHeads[] = {
+        "rgb",      "hsv",      "hsl",
+        "rgbline",  "hsvline",  "hslline",     // dominant-wavelength emission (K3)
+        "rgbillum", "hsvillum", "hslillum",    // Jakob-Hanika illuminant (K1)
+        "rgbsmits", "hsvsmits", "hslsmits",    // Smits 1999 reflectance (K1)
+        "rgbbox",   "hsvbox",   "hslbox",      // calibrated 3-box reflectance (K1)
+        "rgbmeng",  "hsvmeng",  "hslmeng",     // Meng 2015 smoothest reflectance (K1)
+    };
+    for (const char* k : kHeads) if (h == k) return true;
+    return false;
+}
 
 // NOTE: the measured-SPD CSV loader (`loadSpdCsv`) that used to live here now lives
 // in spectral_library.h as `speclib::loadSpdCsv` — a single implementation shared by
@@ -98,54 +121,86 @@ inline Spectrum glassOrDefault(const char* name, double fallbackN) {
 }
 
 // ---------------------------------------------------------------------------
-// Tokenizer
-// ---------------------------------------------------------------------------
-enum class Tok { Word, String, LBrace, RBrace, LBracket, RBracket, Newline, End };
-struct Token { Tok kind; std::string text; int line; };
-
-inline std::vector<Token> tokenize(const std::string& src) {
-    std::vector<Token> out;
-    int line = 1;
-    size_t i = 0, n = src.size();
-    while (i < n) {
-        char c = src[i];
-        if (c == '\n') { out.push_back({Tok::Newline, "\n", line}); ++line; ++i; continue; }
-        if (c == '\r' || c == ' ' || c == '\t') { ++i; continue; }
-        if (c == '#') { while (i < n && src[i] != '\n') ++i; continue; }
-        if (c == '{') { out.push_back({Tok::LBrace, "{", line}); ++i; continue; }
-        if (c == '}') { out.push_back({Tok::RBrace, "}", line}); ++i; continue; }
-        if (c == '[') { out.push_back({Tok::LBracket, "[", line}); ++i; continue; }
-        if (c == ']') { out.push_back({Tok::RBracket, "]", line}); ++i; continue; }
-        if (c == '"') {
-            ++i; std::string s;
-            while (i < n && src[i] != '"') { if (src[i] == '\n') ++line; s += src[i++]; }
-            if (i < n) ++i;   // closing quote
-            out.push_back({Tok::String, s, line});
-            continue;
-        }
-        // Bareword: accrete until whitespace/brace/comment/quote/newline.
-        std::string w;
-        while (i < n) {
-            char d = src[i];
-            if (d == ' ' || d == '\t' || d == '\r' || d == '\n' ||
-                d == '{' || d == '}' || d == '[' || d == ']' || d == '#' || d == '"') break;
-            w += d; ++i;
-        }
-        out.push_back({Tok::Word, w, line});
-    }
-    out.push_back({Tok::End, "", line});
-    return out;
-}
-
-// ---------------------------------------------------------------------------
 // Parse tree
 // ---------------------------------------------------------------------------
 struct Block;
+
+// One entry inside a `[ … ]` bracket group at a value site: either a bare token or a
+// nested group. Kept as a RAW tree by the grammar reducer, which therefore never has to
+// decide what the brackets MEAN — that is the loader's job (applyBracketGroup below),
+// and keeping the decision in exactly one place is what let the shared grammar replace
+// the hand-written parser without either side re-deriving the interpretation.
+struct BrItem {
+    bool                isGroup = false;
+    std::string         word;      // when !isGroup
+    std::vector<BrItem> items;     // when isGroup
+};
+
+// An inline N-D array literal at a value site — `[0 1](u)`, `[[0 1 2][3 4 5]](u,v)`.
+// The NESTING is the shape (axis 0 outermost, C order — the same layout a `grid`
+// element's `data { … }` uses), so a shape need never be spelled. `call` is the raw
+// text of the trailing sample call INCLUDING its parens, and is empty when the array
+// was written UNSATURATED — legal to author, an error to render, with the fix in the
+// message. The loader desugars each of these into an anonymous grid + pattern.
+struct ArrayLit {
+    std::vector<BrItem> items;
+    std::string         call;
+    int                 line = 0;
+};
+
 struct Value {
     std::vector<std::string> words;    // scalar / vector / expression tokens
     std::shared_ptr<Block> block;      // nested brace block (table/film/coat/body/...)
+    std::shared_ptr<ArrayLit> array;   // inline `[ … ](coords)` array literal, if any
 };
-struct Stmt { std::string key; Value val; int line = 0; };
+// What does a `[ … ]` group at a value site MEAN?  There are two answers — a record
+// channel's STOP SELECTOR (`REC.chan[2]`) and an inline N-D ARRAY LITERAL (`[0 1](u)`) —
+// and this ONE function is where the question is answered.  Keeping the decision at the
+// LOADER level, out of the front end entirely, is deliberate: the grammar only has to
+// *collect* the group's raw shape, never interpret it, which is what made swapping the
+// front end out for the shared grammar a pure parse-tree exercise.
+//
+//   1. a trailing sample call    -> array literal (the call names the coordinates)
+//   2. otherwise nesting present -> array literal, UNSATURATED (an error at load time,
+//                                   but a parse-level array all the same)
+//   3. otherwise something foldable before the group -> the record stop selector; append
+//      the words to that token (`REC.chan` + `[2]`), exactly as before.  "Foldable" is a
+//      dotted word, or — inside the `= rhs [i]` record-override form, where a selector is
+//      the only thing brackets can possibly mean — any preceding token at all.
+//   4. otherwise nothing before the group and every item a number -> array literal,
+//      unsaturated (`roughness [0 1]` — the author forgot the `(u)`)
+//   5. otherwise -> drop it (a stray bracket group; unchanged legacy behaviour)
+inline void applyBracketGroup(Value& v, std::vector<BrItem> items,
+                              const std::string& call, int line,
+                              bool overrideForm = false) {
+    bool nested = false, allNum = !items.empty();
+    for (const auto& it : items) {
+        if (it.isGroup) { nested = true; allNum = false; }
+        else if (!isNumber(it.word)) allNum = false;
+    }
+    bool dotted = !v.words.empty() &&
+                  (overrideForm || v.words.back().find('.') != std::string::npos);
+    if (!call.empty() || nested || (v.words.empty() && allNum)) {
+        v.array = std::make_shared<ArrayLit>();
+        v.array->items = std::move(items);
+        v.array->call  = call;
+        v.array->line  = line;
+    } else if (dotted) {
+        std::string idx;
+        for (const auto& it : items) idx += it.word;
+        v.words.back() += "[" + idx + "]";
+    }
+}
+
+// `used` records that some builder actually READ this statement. Nothing in the
+// loader behaves differently because of it — it exists so that after a scene is
+// built we can report the keys nobody looked at. An unknown key is otherwise
+// silently ignored, which is the worst possible failure mode: a misspelt or
+// drifted property (loom emitting `size` where ftrace wants `scale`, say) renders
+// a *wrong image* rather than raising an error. It is `mutable` because reads go
+// through `find(const Block&, ...)`, and "I was read" is not part of a block's
+// logical value.
+struct Stmt { std::string key; Value val; int line = 0; mutable bool used = false; };
 struct Block {
     std::string type;                  // material / quad / film / table / ...
     std::string subtype;               // light "area" / "collimated"
@@ -158,250 +213,17 @@ struct Block {
     std::vector<std::vector<Block>> branches;
 };
 
-struct Parser {
-    std::vector<Token> t;
-    size_t i = 0;
-    std::string err;
-
-    const Token& cur() const { return t[i]; }
-    bool is(Tok k) const { return t[i].kind == k; }
-    void adv() { if (t[i].kind != Tok::End) ++i; }
-    void skipNewlines() { while (is(Tok::Newline)) adv(); }
-    void fail(const std::string& m) { if (err.empty()) err = "line " + std::to_string(cur().line) + ": " + m; }
-
-    // Read the value part of a statement. This must work when several `key value`
-    // pairs share one line (e.g. `quad { origin 0 0 0  u 1 0 0  material white }`),
-    // so a value cannot simply run to the newline. Rule: take the first token
-    // unconditionally (a value always has one — a number, a name, or a spectrum
-    // keyword), then keep consuming *continuation* tokens — numbers or `key=val`
-    // named params (gaussian/shortpass) — and stop at the next bareword, which
-    // begins the next statement's key. A trailing `{` opens a nested brace block
-    // (table/film/…) whose type is the preceding word, or the statement key.
-    void parseValue(const std::string& key, Value& v) {
-        // Record-override assignment: `slot = <rhs>` (used inside a `material "m" { … }`
-        // record block, §records stage 4). A standalone `=` first token never begins a
-        // normal statement value, so this is unambiguous. The RHS is a single token
-        // (an expression, a channel name, or `REC.chan`), optionally followed by a
-        // `[i]` stop selector — which we fold back into the RHS token (`REC.chan[i]`) so
-        // the bracket tokens don't leak into the generic brace-body statement stream.
-        if (is(Tok::Word) && cur().text == "=") {
-            v.words.push_back("="); adv();
-            if (is(Tok::Word) || is(Tok::String)) { v.words.push_back(cur().text); adv(); }
-            if (is(Tok::LBracket)) {
-                adv();
-                std::string idx;
-                while (is(Tok::Word)) { idx += cur().text; adv(); }
-                if (is(Tok::RBracket)) adv(); else fail("record-override selector missing ']'");
-                if (!v.words.empty()) v.words.back() += "[" + idx + "]";
-            }
-            return;
-        }
-        bool firstWasString = false;
-        if (is(Tok::Word) || is(Tok::String)) {
-            firstWasString = is(Tok::String);
-            v.words.push_back(cur().text); adv();
-        }
-        while (is(Tok::Word) || is(Tok::String)) {
-            // A quoted string never begins a new statement (statement keys are always
-            // barewords), so a String that follows the value's tokens is part of THIS
-            // value — e.g. a name argument: `exposure_lock camera "meter"`. (Without this
-            // the string was silently swallowed as a stray statement key.) Barewords only
-            // continue when they are numbers or `key=val` named params; a plain bareword
-            // still ends the value (it begins the next statement's key).
-            if (is(Tok::Word)) {
-                const std::string& tx = cur().text;
-                bool cont = isNumber(tx) || tx.find('=') != std::string::npos;
-                if (!cont) break;
-            }
-            v.words.push_back(cur().text); adv();
-        }
-        // Records stage 5a: a trailing `[i]` stop selector on a record-channel ref
-        // (`RECORD.channel[i]`) at an ordinary value site — fold the bracket tokens back
-        // into the preceding word so they don't leak into the brace-body statement stream
-        // (the `=` override path above already does this). Only when the preceding word
-        // looks like a dotted reference, so a stray `[` elsewhere still surfaces as an error.
-        if (is(Tok::LBracket) && !v.words.empty() && v.words.back().find('.') != std::string::npos) {
-            adv();
-            std::string idx;
-            while (is(Tok::Word)) { idx += cur().text; adv(); }
-            if (is(Tok::RBracket)) adv(); else fail("record selector missing ']'");
-            v.words.back() += "[" + idx + "]";
-        }
-        if (is(Tok::LBrace)) {
-            std::string btype = key, bname;
-            if (!v.words.empty()) {
-                // A single *quoted* word before `{` is the block's NAME (e.g. a nested
-                // `mesh "klein_a" { ... }` inside a group), so the type stays = key.
-                // A bareword before `{` is instead the block's TYPE (e.g. `table { }`,
-                // `light sphere { }`) — the historical behaviour for subtyped blocks.
-                if (v.words.size() == 1 && firstWasString) { bname = v.words.back(); v.words.pop_back(); }
-                else { btype = v.words.back(); v.words.pop_back(); }
-            }
-            v.block = std::make_shared<Block>();
-            v.block->type = btype;
-            v.block->name = bname;
-            parseBraceBody(*v.block);
-        }
-    }
-
-    // Parse "{ ... }" body into stmts (+ flat words). Assumes cur() == LBrace.
-    void parseBraceBody(Block& b) {
-        adv();   // consume '{'
-        while (!is(Tok::RBrace) && !is(Tok::End)) {
-            if (is(Tok::Newline)) { adv(); continue; }
-            Stmt s; s.line = cur().line;
-            s.key = cur().text; adv();
-            b.words.push_back(s.key);
-            parseValue(s.key, s.val);
-            for (const auto& w : s.val.words) b.words.push_back(w);
-            b.stmts.push_back(std::move(s));
-        }
-        if (is(Tok::RBrace)) adv();
-        else fail("unterminated '{'");
-    }
-
-    // Parse a record body `[ <lines> ]` into stmts (one per non-empty line: a channel
-    // name key + its stop tokens). Unlike a brace body, NEWLINES delimit statements and
-    // a value holds many barewords (the stops), so this does NOT use parseValue. Assumes
-    // cur() == LBracket.
-    void parseRecordBody(Block& b) {
-        adv();  // consume '['
-        while (!is(Tok::RBracket) && !is(Tok::End)) {
-            if (is(Tok::Newline)) { adv(); continue; }
-            if (!is(Tok::Word)) { fail("record line must start with a channel name"); return; }
-            Stmt s; s.line = cur().line;
-            s.key = cur().text; adv();
-            while (is(Tok::Word) || is(Tok::String)) { s.val.words.push_back(cur().text); adv(); }
-            b.stmts.push_back(std::move(s));
-        }
-        if (is(Tok::RBracket)) adv();
-        else fail("unterminated '[' in record");
-    }
-
-    // Parse `NAME = range LO-HI [ ... ]` (the leading `NAME = range` already consumed;
-    // `name` is NAME). Stores the domain as a stmt `range <tokens>` plus one stmt per
-    // channel line, all under a Block of type "record".
-    bool parseRecord(Block& b, const std::string& name) {
-        b.type = "record";
-        b.name = name;
-        Stmt dom; dom.key = "range"; dom.line = cur().line;
-        while (is(Tok::Word)) { dom.val.words.push_back(cur().text); adv(); }
-        b.stmts.push_back(std::move(dom));
-        skipNewlines();
-        if (!is(Tok::LBracket)) { fail("record '" + name + "' needs '[ ... ]' after `range LO-HI`"); return false; }
-        parseRecordBody(b);
-        return err.empty();
-    }
-
-    // Parse ONE top-level block (or a `prefer { } else { }` construct) starting at
-    // cur() (which must be a Word). Fills `b`; returns false on a parse error.
-    bool parseOneTopBlock(Block& b) {
-        if (!is(Tok::Word)) { fail("expected a block type"); return false; }
-        b.type = cur().text; adv();
-        if (b.type == "prefer") return parsePrefer(b);
-        // Parametric record: `NAME = range LO-HI [ ... ]` (ROADMAP_records.md). Detected
-        // by a bare first word immediately followed by '=' then `range` — spectrum uses
-        // a *quoted* name before '=', so there is no collision.
-        if (is(Tok::Word) && cur().text == "=") {
-            std::string name = b.type;   // the leading bare word is the binding NAME
-            adv();  // consume '='
-            if (is(Tok::Word) && cur().text == "range") {
-                adv();  // consume 'range'
-                return parseRecord(b, name);
-            }
-            // Unified element header `NAME = KIND { ... }` (the loom-emitted form):
-            // the word after '=' is the block KIND (material/texture/camera/light/
-            // isosurface/pattern/geometry) and NAME is its name. Body parses exactly
-            // like the legacy `KIND "name" { ... }`. Accepted alongside the legacy
-            // spelling during the grammar transition (J3c); one spelling once ftrace's
-            // front-end is ported from the shared grammar.
-            if (is(Tok::Word)) {
-                b.type = cur().text; adv();          // KIND
-                b.name = name;
-                // Optional bareword subtype (`sun = light point { }`); the new grammar
-                // prefers a `kind` property instead, but accept both here.
-                if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
-                if (!is(Tok::LBrace)) { fail("expected '{' after `" + name + " = " + b.type + "`"); return false; }
-                parseBraceBody(b);
-                return true;
-            }
-            fail("unknown '=' declaration '" + name + "' (expected `= range` or `= KIND { ... }`)");
-            return false;
-        }
-        if (is(Tok::String)) { b.name = cur().text; adv(); }
-        // Optional bareword subtype (light area / light collimated), but not '='.
-        if (is(Tok::Word) && cur().text != "=") { b.subtype = cur().text; adv(); }
-        if (b.type == "spectrum") {
-            if (is(Tok::Word) && cur().text == "=") adv();
-            else { fail("spectrum declaration needs '='"); return false; }
-            Stmt s; s.key = "="; s.line = cur().line;
-            parseValue("=", s.val);
-            b.stmts.push_back(std::move(s));
-        } else {
-            if (!is(Tok::LBrace)) { fail("expected '{' after " + b.type); return false; }
-            parseBraceBody(b);
-        }
-        return true;
-    }
-
-    // Parse a `{ <top-level blocks> }` list (cur() must be LBrace). Consumes the braces.
-    // Used for each branch of a `prefer`/`else` construct.
-    std::vector<Block> parseBlockList() {
-        std::vector<Block> list;
-        adv();   // consume '{'
-        skipNewlines();
-        while (!is(Tok::RBrace) && !is(Tok::End) && err.empty()) {
-            Block b;
-            if (!parseOneTopBlock(b)) break;
-            list.push_back(std::move(b));
-            skipNewlines();
-        }
-        if (is(Tok::RBrace)) adv();
-        else fail("unterminated 'prefer'/'else' block");
-        return list;
-    }
-
-    // Parse `prefer { .. } else { .. } else { .. }` (b.type already == "prefer").
-    // Each brace group becomes one ordered branch in b.branches; `else` chains flatly.
-    bool parsePrefer(Block& b) {
-        skipNewlines();
-        if (!is(Tok::LBrace)) { fail("'prefer' needs '{ ... }'"); return false; }
-        b.branches.push_back(parseBlockList());
-        if (!err.empty()) return false;
-        for (;;) {
-            skipNewlines();
-            if (is(Tok::Word) && cur().text == "else") {
-                adv(); skipNewlines();
-                if (!is(Tok::LBrace)) { fail("'else' needs '{ ... }'"); return false; }
-                b.branches.push_back(parseBlockList());
-                if (!err.empty()) return false;
-            } else break;
-        }
-        return true;
-    }
-
-    // Parse the whole file into a list of top-level blocks.
-    std::vector<Block> parseTop() {
-        std::vector<Block> blocks;
-        skipNewlines();
-        while (!is(Tok::End) && err.empty()) {
-            Block b;
-            if (!parseOneTopBlock(b)) break;
-            blocks.push_back(std::move(b));
-            skipNewlines();
-        }
-        return blocks;
-    }
-};
-
-}  // namespace ftsl  (temporarily closed so the validation shim can see
+}  // namespace ftsl  (temporarily closed so the GPDA front end can see
    //                  ftsl::Block/Stmt/Value at global scope)
 
-// J3c grammar-validation shim: the shared .ftsl grammar (GPDA) run alongside the
-// hand-written Parser above.  Included here — after Block/Stmt/Value/Parser are
-// defined — so its inline reducer/differ can reference them.  Non-authoritative;
-// see the header for details.
-#include "gpda/ftsl_shim.hpp"
+// The ONE .ftsl front end: the shared grammar (tools/loom/loom/grammar/ftsl_scene.epeg,
+// compiled to a GPDA graph) plus the reducer that turns its parse tree into the Block
+// tree above.  Included here — after Block/Stmt/Value are defined — so the inline
+// reducer can reference them; loadSource() below calls ftsl_gpda::parse().
+// (Through 0.78 a hand-written recursive-descent Parser lived here too, kept behind
+// `-legacy-parser` while the grammar proved itself; it was deleted in 0.79.0 after the
+// corpus differ held at MATCH 2595/2595 across ten releases.)
+#include "gpda/ftsl_frontend.hpp"
 
 namespace ftsl {
 
@@ -418,8 +240,44 @@ inline bool splitEq(const std::string& s, std::string& k, std::string& v) {
 
 // Find the statement with a given key in a block; nullptr if absent.
 inline const Stmt* find(const Block& b, const char* key) {
-    for (const auto& s : b.stmts) if (s.key == key) return &s;
+    for (const auto& s : b.stmts) if (s.key == key) { s.used = true; return &s; }
     return nullptr;
+}
+// Mark every statement with `key` as read. `find` only reaches the first one, so
+// the loops that gather a REPEATED key (`point`, `look_point`, `fwd_at`, a light's
+// `spd` stops, …) call this to account for the rest.
+inline void markUsed(const Block& b, const char* key) {
+    for (const auto& s : b.stmts) if (s.key == key) s.used = true;
+}
+// Mark a whole block read, for bodies whose content is consumed as the flat
+// `words` dump rather than key/value statements (`data { … }`, `palette { … }`,
+// a table's rows). Their "keys" are just the first token of each line, so
+// per-key accounting is meaningless there.
+inline void markAllUsed(const Block& b) {
+    for (const auto& s : b.stmts) s.used = true;
+}
+// Gather every statement no builder read, recursing into nested `{ }` bodies.
+// `where` names the enclosing block for the message ("material \"gold\"", then
+// "material \"gold\" > coat"). When a statement itself is unread we report only
+// it and do NOT descend — its whole body is unread by construction, and listing
+// each child would bury the one line the author actually has to fix.
+inline void collectUnusedKeys(const Block& b, const std::string& where,
+                              std::vector<std::string>& out) {
+    for (const auto& s : b.stmts) {
+        if (!s.used) {
+            out.push_back(where + ": unknown key '" + s.key + "'" +
+                          (s.line > 0 ? " on line " + std::to_string(s.line) : ""));
+            continue;
+        }
+        if (s.val.block) collectUnusedKeys(*s.val.block, where + " > " + s.key, out);
+    }
+}
+// Human-readable label for a top-level block, used by the message above.
+inline std::string blockLabel(const Block& b) {
+    std::string s = b.type;
+    if (!b.subtype.empty()) s += " " + b.subtype;
+    if (!b.name.empty()) s += " \"" + b.name + "\"";
+    return s;
 }
 inline std::string strOf(const Block& b, const char* key, const std::string& dflt = "") {
     const Stmt* s = find(b, key);
@@ -715,14 +573,22 @@ struct Loaded {
     int res = -1;                // -1 = not specified
     std::string device;          // empty = not specified
     std::string out;             // empty = not specified
+    // Keys no builder read (see collectUnusedKeys). Carried on Loaded rather than
+    // printed inside build() because `prefer { } else { }` builds several candidate
+    // scenes and discards all but one — only the accepted candidate's warnings are
+    // the author's problem.
+    std::vector<std::string> unknownKeys;
 };
 
 class Builder {
 public:
     std::string err;
 
-    bool build(const std::vector<Block>& blocks, Loaded& L) {
+    bool build(std::vector<Block>& blocks, Loaded& L) {
         records_ = &L.scene.records;   // stable handle for record refs at value sites (records added in Pass 1d)
+        loadedRef_ = &L;               // ditto for §3.2 material-property refs (which may apply a material)
+        gridsRef_    = &L.scene.grids;      // ditto for N-D table arity lookups
+        scattersRef_ = &L.scene.scatters;   // (both kinds are added in Pass 1a)
         // Pass 0: global scene settings — the length unit and spectral range. All
         // authored lengths are scaled to the internal unit (metres) at load time,
         // so a scene authored in cm and one in m render identically.
@@ -758,7 +624,32 @@ public:
 
         // Pass 1: collect named spectra (resolve refs lazily), materials, camera.
         for (const auto& b : blocks)
-            if (b.type == "spectrum") spectraBlocks_[b.name] = &b;
+            if (b.type == "spectrum") {
+                spectraBlocks_[b.name] = &b;
+                // A `spectrum "x" = <expr>` parses to one synthetic `=` statement, read
+                // lazily only if something references the spectrum. Count it as read at
+                // DECLARATION time: an unreferenced spectrum is pointless but legal, and
+                // is not an unknown-key problem.
+                markUsed(b, "=");
+            }
+
+        // Pass 1-arr: desugar inline `[ … ](coords)` array literals into anonymous
+        // `grid` + `pattern` block pairs, APPENDED to `blocks`. Running it before Pass 1a
+        // is what makes an inline literal work at every slot that already accepts a
+        // `pattern:` — the rest of the loader never learns the syntax exists.
+        if (!desugarArrays(blocks)) return false;
+
+        // Pass 1a: N-D data tables (regular `grid`s and ragged `scatter`s). FIRST of the
+        // table passes, because a procedural `texture { rgb "…" }` bakes during Pass 1b
+        // and may sample `grid:<name>(…)` / `scatter:<name>(…)`.
+        for (const auto& b : blocks) {
+            if (b.type != "grid") continue;
+            if (!addGrid(b, L)) return false;
+        }
+        for (const auto& b : blocks) {
+            if (b.type != "scatter") continue;
+            if (!addScatter(b, L)) return false;
+        }
 
         // Pass 1b: image textures (must exist before materials that bind them).
         for (const auto& b : blocks) {
@@ -787,6 +678,8 @@ public:
             if (!err.empty()) return false;
             L.scene.mats.push_back(m);
             matIndex_[b.name] = id;
+            // §3.3: the fallback for a free `a` at any use site that doesn't bind it.
+            if (find(b, "albedo_default")) albedoDefault_[id] = dblOf(b, "albedo_default", 1.0);
         }
 
         // Pass 2b: resolve Mix / Layered body child references (now that every name
@@ -797,7 +690,7 @@ public:
             int id = matIndex_[b.name];
             MatType t = L.scene.mats[id].type;
             if (t != MatType::Mix && t != MatType::Layered) continue;
-            if (!resolveMixChildren(b, L.scene.mats[id], L)) return false;
+            if (!resolveMixChildren(b, id, L)) return false;
         }
 
         // Pass 2.5: mesh assets (shared instanced geometry). Loaded before the
@@ -830,32 +723,144 @@ public:
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
                      b.type == "texture" || b.type == "pattern" || b.type == "record" ||
+                     b.type == "grid" || b.type == "scatter" ||
                      b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
         for (const Block* mb : mediaBlocks) { if (!addMedium(*mb, L)) return false; }
-        if (!haveLight) { fail("scene has no 'light' block"); return false; }
+        // A scene is lit if it has an explicit `light` block OR any emitter was
+        // registered implicitly — e.g. an emissive mesh (a material with `emit` bound
+        // to a mesh registers a Mesh area light in addMesh) — OR it contains a
+        // self-illuminating volume (a medium with a `temperature` grid + `emission`),
+        // i.e. "fire": the hot voxels are the only light source.
+        bool haveVolumeEmission = false;
+        for (const Medium& m : L.scene.media)
+            if (m.emissive()) { haveVolumeEmission = true; break; }
+        if (!haveLight && L.scene.emitters.empty() && !haveVolumeEmission) {
+            fail("scene has no light: add a 'light' block, an emissive ('emit') mesh, "
+                 "or an emissive volume ('temperature' + 'emission blackbody')");
+            return false;
+        }
         // Catch errors recorded via fail() inside add* helpers that returned true
         // without re-checking `err` (e.g. an unknown `spd preset:`/`spectrum:` name
         // in a light or material silently falls back otherwise). Any recorded error
         // is fatal — surface it instead of rendering a wrong scene.
         if (!err.empty()) return false;
 
+        // Every property has now been read by whichever pass wanted it, so anything
+        // still unmarked is a key nothing in the loader understands — a typo, a
+        // property put on the wrong block, or an emitter that has drifted from the
+        // grammar. Collect them for the caller to report; silently ignoring them is
+        // how a misspelt key turns into a wrong image instead of a message.
+        for (const auto& b : blocks)
+            collectUnusedKeys(b, blockLabel(b), L.unknownKeys);
+
         // build() finalizes tris/BVH and the emitter set (per-emitter samplers were
         // built in addLight; finalizeEmitters computes powers, the selection CDF,
         // and the combined backward wavelength sampler).
         L.scene.build();
+        // build() -> finalizeEmitters() has now adopted each emitter's emitPat from the
+        // material on its geometry, so this is the first moment the SHAPE of every
+        // emission pattern's emitter is known. Reject the shapes that cannot honour one.
+        if (!checkEmitPatsSupported(L)) return false;
+        return true;
+    }
+
+    // An emission pattern is read from BOTH sides of transport — emission-on-hit (a
+    // PatCtx built from a Hit) and the Le at an emitter-sampled point (a PatCtx built
+    // from Emitter::samplePoint) — and MIS combines the two. If they disagree even
+    // slightly the render is BIASED, not merely noisy, so a pattern is only legal on the
+    // shapes where samplePoint can report exactly the (u,v) a hit would interpolate:
+    // Quad (bilinear parameters, matched by addAreaLight's two UV'd tris) and Mesh (the
+    // EmitTri's barycentric UVs, the same interpolation geometry.h does). A sphere/tube/
+    // spot/env emitter has no such correspondence, so refuse loudly rather than render
+    // a wrong image — the same rule checkSlotPatSupported applies to reflect/transmit.
+    bool checkEmitPatsSupported(Loaded& L) {
+        for (const auto& e : L.scene.emitters) {
+            if (e.emitPat < 0) continue;
+            if (e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh) continue;
+            const char* what = (e.shape == EmitterShape::Sphere)   ? "sphere"
+                             : (e.shape == EmitterShape::Cylinder) ? "cylinder"
+                             : (e.shape == EmitterShape::Spot)     ? "spot"
+                             : (e.shape == EmitterShape::Env)      ? "env"
+                             : (e.shape == EmitterShape::Sun)      ? "sun" : "this";
+            fail(std::string("an emit pattern is not supported on a ") + what +
+                 " light — only quad and mesh emitters sample a (u,v) that matches the "
+                 "one emission-on-hit interpolates, and a mismatch would bias the image");
+            return false;
+        }
         return true;
     }
 
 private:
     std::unordered_map<std::string, const Block*> spectraBlocks_;
     std::unordered_map<std::string, int> matIndex_;
+
+    // §3.3 material application. `albedoDefault_` is the per-material fallback for the
+    // named input `a` — the one input with NO per-hit intrinsic, so an unbound `a` has
+    // to be resolved at LOAD time (mirrors loom's Material.albedo_default, same 1.0
+    // default). Kept loader-side rather than on Material because Material is uploaded
+    // to the device and `a` never survives past load. `applyCache_` memoises
+    // "<matIdx>(<args>)" -> materialised index so one application shared by N objects
+    // builds ONE material.
+    std::unordered_map<int, double>      albedoDefault_;
+    std::unordered_map<std::string, int> applyCache_;
+
     std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
     std::unordered_map<std::string, int> patternIndex_;   // pattern name -> Scene::patterns index
+
+    // Texture scope for `tex:<name>(u, v)` samples inside a pattern expression. Passed
+    // to compilePatternExpr ONLY at value sites that are evaluated with a shading
+    // context (material / pattern / record-driver expressions); leaving it off at the
+    // others (implicit field formulas, medium density/ior, load-time constant sites)
+    // is what turns an unperformable sample into a clear compile error. Resolution
+    // reads textureIndex_, which Pass 1b fills before patterns / records / materials
+    // are built — so file order does not matter for those. The one ordering rule is
+    // texture-samples-texture: a procedural `texture { rgb "…" }` bakes DURING Pass
+    // 1b, so it can only sample textures declared ABOVE it (and never itself, which
+    // therefore fails cleanly as "unknown texture" rather than recursing).
+    static int texScopeThunk_(const void* self, const char* name) {
+        const auto& idx = static_cast<const Builder*>(self)->textureIndex_;
+        auto it = idx.find(name);
+        return (it == idx.end()) ? -1 : it->second;
+    }
+    PatTexScope texScope_{ this, &Builder::texScopeThunk_ };
+
+    // N-D table scope for `grid:<name>(c0, …)` and `scatter:<name>(c0, …)` samples
+    // inside a pattern expression. Same deal as texScope_, with one extra job: it also
+    // reports the table's DIMENSIONALITY, because the call arity is a property of the
+    // table itself (a 2-D grid takes two coordinates), not of the function name — so
+    // the compiler can only check the argument count once the name resolves. Filled by
+    // the data pass, which runs before textures/patterns/records, so authoring order
+    // doesn't matter for those.
+    std::unordered_map<std::string, int> gridIndex_;         // name -> Scene::grids index
+    std::unordered_map<std::string, int> scatterIndex_;      // name -> Scene::scatters index
+    const std::vector<PatGrid>*    gridsRef_    = nullptr;   // -> L.scene.grids    (ndim report)
+    const std::vector<PatScatter>* scattersRef_ = nullptr;   // -> L.scene.scatters (ndim report)
+    static int tableScopeThunk_(const void* self, PatTableKind kind, const char* name, int* ndim) {
+        const Builder* bl = static_cast<const Builder*>(self);
+        if (kind == PatTableKind::Grid) {
+            auto it = bl->gridIndex_.find(name);
+            if (it == bl->gridIndex_.end()) return -1;
+            if (ndim && bl->gridsRef_ && it->second < (int)bl->gridsRef_->size())
+                *ndim = (*bl->gridsRef_)[it->second].ndim;
+            return it->second;
+        }
+        auto it = bl->scatterIndex_.find(name);
+        if (it == bl->scatterIndex_.end()) return -1;
+        if (ndim && bl->scattersRef_ && it->second < (int)bl->scattersRef_->size())
+            *ndim = (*bl->scattersRef_)[it->second].ndim;
+        return it->second;
+    }
+    PatTableScope tableScope_{ this, &Builder::tableScopeThunk_ };
     std::unordered_map<std::string, int> recordIndex_;    // record name  -> Scene::records index
     const std::vector<Record>* records_ = nullptr;        // -> L.scene.records (set in build; for record refs at value sites)
+    // -> the Loaded being built. Needed by materialPropRef, which reaches value sites
+    // (evalSpectrum / dblParam / bindScalarPattern) that were never handed a `Loaded&`,
+    // yet may APPEND to Scene::mats and Scene::patterns via applyMaterial. Deliberately a
+    // pointer to the owner, never to an element: the vectors reallocate.
+    Loaded* loadedRef_ = nullptr;
     std::unordered_map<std::string, Spectrum> spdFileCache_; // path -> loaded measured SPD
 
     // Named-object registries for `medium { bounds { object "name" } }` resolution.
@@ -925,13 +930,250 @@ private:
         m.reflect = constantSpectrum(0.75);
         std::vector<PatNode> drv;
         std::string cerr;
-        if (!compilePatternExpr(driverExpr, drv, cerr)) {
+        if (!compilePatternExpr(driverExpr, drv, cerr, /*allowT=*/false, &texScope_,
+                                &tableScope_, /*allowA=*/true)) {
             fail("record material driver '" + driverExpr + "': " + cerr);
             return -1;
         }
         applyFrom(m, recIdx, drv, L.scene.records[recIdx]);
         int id = (int)L.scene.mats.size();
         L.scene.mats.push_back(std::move(m));
+        return id;
+    }
+
+    // ===================== §3.3 materials as parameterized bundles ==============
+    // A material is a bundle of slot->expression bindings, and is itself a FUNCTION:
+    // its free-input set is the union of its slots' free inputs. Applying it at a use
+    // site — `material gold(u=v, a=1)` — binds those inputs across the whole bundle at
+    // once (ROADMAP_records.md §3.3), which is §3.2's per-property rebinding lifted to
+    // bundle granularity.
+    //
+    // Implemented as BINDING BY SUBSTITUTION. Every slot program is POSTFIX, so a
+    // variable node pushes exactly one value and so does a well-formed argument
+    // program: binding is a pure splice (patternSubstitute). No environment, no
+    // closure, no runtime indirection — an applied material is just another Material,
+    // so the device upload, the CPU evaluator and every sampler stay untouched. That
+    // is what keeps the feature additive: a material nobody applies is bit-identical
+    // to before, and `applyMaterial` returns the ORIGINAL index for a no-op call.
+
+    // The material's free-input set: the union of the inputs read by its pattern slots
+    // and by its record bindings' drivers, in order of first use (so diagnostics list
+    // inputs the way the author wrote them). Keep the slot list in sync with
+    // Material's `*Pat` members (scene.h).
+    static void materialFreeInputs(const Material& m, const Loaded& L,
+                                   std::vector<PatOp>& out) {
+        out.clear();
+        const int pats[6] = { m.roughnessPat, m.filmThicknessPat, m.mixWeightPat,
+                              m.reflectPat,   m.transmitPat,      m.emitPat };
+        for (int pi : pats)
+            if (pi >= 0 && pi < (int)L.scene.patterns.size())
+                patternCollectVars(L.scene.patterns[pi].nodes, out);
+        for (const RecBinding& rb : m.recBindings) patternCollectVars(rb.driver, out);
+    }
+
+    // An argument list MAY contain spaces (`f(0.5*u + 0.5*v)`, `gold(a=1, u=v)`): the
+    // shared grammar lexes a balanced paren group as part of one WORD, so the value is
+    // no longer truncated at the first space. Reaching a "missing ')'" now means the
+    // parens really are unbalanced — say so plainly.
+    static std::string parenHint(const std::string& raw) {
+        if (raw.find(')') != std::string::npos) return "";
+        return " — the parentheses are unbalanced (a group must close on the same line)";
+    }
+
+    // The fallback value of the named input `a` for material `matIdx` — its authored
+    // `albedo_default <x>`, or 1.0.
+    double albedoDefaultFor(int matIdx) const {
+        auto it = albedoDefault_.find(matIdx);
+        return (it == albedoDefault_.end()) ? 1.0 : it->second;
+    }
+
+    static std::string trimWs(const std::string& s) {
+        size_t a = 0, b = s.size();
+        while (a < b && isspace((unsigned char)s[a])) ++a;
+        while (b > a && isspace((unsigned char)s[b - 1])) --b;
+        return s.substr(a, b - a);
+    }
+
+    // Split a material application's argument text into (name, expr) pieces; an empty
+    // name means a POSITIONAL argument. Uses the same delimiter ladder as record stops
+    // (§3.1) — a top-level comma and a run of whitespace are equally valid separators,
+    // so `gold(u=v, a=1)` and `gold(u=v a=1)` are identical. `(` `)` and `[` `]` nest,
+    // so an argument may itself be a call.
+    //
+    // Boundaries are found from the `=` signs rather than from the whitespace, because
+    // an argument is an ARBITRARY EXPRESSION that may contain spaces (`gold(u = v * 2)`).
+    // Every top-level `=` starts a named argument whose name is the identifier just to
+    // its left, so the argument begins at that identifier. This is unambiguous: the
+    // pattern language has NO comparison operators, so a top-level `=` can only ever
+    // mean a binding and never continues an expression.
+    bool parseBindArgs(const std::string& text,
+                       std::vector<std::pair<std::string, std::string>>& out,
+                       std::string& e) {
+        out.clear();
+        const size_t n = text.size();
+        auto isIdent  = [](char c) { return isalnum((unsigned char)c) || c == '_'; };
+        auto isIdent0 = [](char c) { return isalpha((unsigned char)c) || c == '_'; };
+
+        std::vector<size_t> starts;      // where each argument begins
+        starts.push_back(0);
+        int depth = 0;
+        for (size_t i = 0; i < n; ++i) {
+            char c = text[i];
+            if (c == '(' || c == '[') { ++depth; continue; }
+            if (c == ')' || c == ']') {
+                if (--depth < 0) { e = "unbalanced ')' in argument list"; return false; }
+                continue;
+            }
+            if (depth) continue;
+            if (c == ',') { starts.push_back(i + 1); continue; }
+            if (c != '=') continue;
+            size_t j = i;                                   // back over spaces before `=`
+            while (j > 0 && isspace((unsigned char)text[j - 1])) --j;
+            size_t k = j;                                   // back over the input name
+            while (k > 0 && isIdent(text[k - 1])) --k;
+            if (k == j)          { e = "'=' with no input name on its left"; return false; }
+            if (!isIdent0(text[k])) {
+                e = "invalid input name '" + text.substr(k, j - k) + "'"; return false;
+            }
+            starts.push_back(k);
+        }
+        if (depth) { e = "unbalanced '(' in argument list"; return false; }
+
+        std::sort(starts.begin(), starts.end());
+        starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+        for (size_t s = 0; s < starts.size(); ++s) {
+            size_t b = starts[s], en = (s + 1 < starts.size()) ? starts[s + 1] : n;
+            std::string seg = trimWs(text.substr(b, en - b));
+            if (!seg.empty() && seg.back() == ',') seg = trimWs(seg.substr(0, seg.size() - 1));
+            if (seg.empty()) continue;
+            // A named piece always carries its `=` at top level (that `=` is what cut here).
+            size_t eq = std::string::npos;
+            int d = 0;
+            for (size_t i = 0; i < seg.size(); ++i) {
+                char c = seg[i];
+                if (c == '(' || c == '[') ++d;
+                else if (c == ')' || c == ']') --d;
+                else if (c == '=' && d == 0) { eq = i; break; }
+            }
+            if (eq == std::string::npos) { out.emplace_back(std::string(), seg); continue; }
+            std::string nm = trimWs(seg.substr(0, eq)), ex = trimWs(seg.substr(eq + 1));
+            if (nm.empty()) { e = "'=' with no input name on its left"; return false; }
+            if (ex.empty()) { e = "input '" + nm + "' bound to an empty expression"; return false; }
+            out.emplace_back(nm, ex);
+        }
+        return true;
+    }
+
+    // Apply material `matIdx` at a use site, binding its named inputs. Clones the
+    // material, splices each argument program into every slot that reads the bound
+    // input, resolves any still-free `a` (albedo — the one input with no per-hit
+    // intrinsic) to the material's `albedo_default`, and returns the new index.
+    // Returns `matIdx` UNCHANGED when the application binds nothing, so an ordinary
+    // use costs nothing. Results are memoised on (material, argument text) so
+    // `gold(u=v)` shared by 500 spheres builds ONE material, not 500.
+    int applyMaterial(int matIdx, const std::string& argText, Loaded& L) {
+        std::string key = std::to_string(matIdx) + "(" + trimWs(argText) + ")";
+        auto cit = applyCache_.find(key);
+        if (cit != applyCache_.end()) return cit->second;
+
+        std::vector<std::pair<std::string, std::string>> args;
+        std::string e;
+        if (!parseBindArgs(argText, args, e)) {
+            fail("material application '" + argText + "': " + e); return -1;
+        }
+        std::vector<PatOp> freeIn;
+        materialFreeInputs(L.scene.mats[matIdx], L, freeIn);
+
+        std::vector<PatBind> binds;
+        auto alreadyBound = [&](PatOp v) {
+            for (const PatBind& b : binds) if (b.var == v) return true;
+            return false;
+        };
+        // NAMED arguments are resolved first, whatever order they were written in, so a
+        // positional argument sees only the inputs still unbound — loom's
+        // `free_inputs() - set(binds)` rule (Material.apply, tools/loom/loom/scene.py).
+        // That makes `gold(0.5, a=1)` legal for a two-input bundle: `a` is taken by name,
+        // leaving exactly one free input for the positional.
+        std::vector<std::pair<std::string, std::string>> ordered;
+        for (auto& a : args) if (!a.first.empty()) ordered.push_back(a);
+        size_t nPositional = 0;
+        for (auto& a : args) if (a.first.empty()) { ordered.push_back(a); ++nPositional; }
+        if (nPositional > 1) {
+            fail("material application '" + argText +
+                 "': at most one positional argument (bind the rest by name)");
+            return -1;
+        }
+        for (auto& a : ordered) {
+            PatOp var;
+            if (a.first.empty()) {
+                // Positional. Fragile with several inputs, so §3.3 allows it only when
+                // exactly one input is still free (matching `RECORD(driver)`).
+                std::vector<PatOp> rest;
+                for (PatOp v : freeIn) if (!alreadyBound(v)) rest.push_back(v);
+                if (rest.size() != 1) {
+                    std::string names;
+                    for (size_t i = 0; i < rest.size(); ++i)
+                        names += (i ? ", " : "") + std::string(varName(rest[i]));
+                    fail("material application '" + argText + "': a positional argument "
+                         "needs exactly one still-free input, but there are " +
+                         std::to_string(rest.size()) +
+                         (rest.empty() ? "" : " (" + names + ")") +
+                         " — bind by name");
+                    return -1;
+                }
+                var = rest[0];
+            } else if (!varOp(a.first, var)) {
+                fail("material application '" + argText + "': '" + a.first +
+                     "' is not a bindable input"); return -1;
+            }
+            if (alreadyBound(var)) {
+                fail("material application '" + argText + "': input '" +
+                     std::string(varName(var)) + "' bound twice"); return -1;
+            }
+            // The RHS is evaluated in the CONSUMER's scope, so `a` is not in scope here
+            // (the consumer is geometry, which has no albedo to offer).
+            PatBind pb; pb.var = var;
+            std::string cerr;
+            if (!compilePatternExpr(a.second, pb.repl, cerr, /*allowT=*/false,
+                                    &texScope_, &tableScope_)) {
+                fail("material application '" + argText + "': binding '" +
+                     std::string(varName(var)) + "=" + a.second + "': " + cerr);
+                return -1;
+            }
+            binds.push_back(std::move(pb));
+        }
+
+        // `a` is the one named input with NO per-hit intrinsic, so an unbound `a` must
+        // be resolved at LOAD time or it would silently read 0. Fall back to the
+        // material's `albedo_default` (mirrors loom's Material.albedo_default).
+        bool aFree = false;
+        for (PatOp v : freeIn) if (v == PatOp::VarA) { aFree = true; break; }
+        if (aFree && !alreadyBound(PatOp::VarA)) {
+            PatBind pb; pb.var = PatOp::VarA;
+            PatNode nd; nd.op = PatOp::Const; nd.a = albedoDefaultFor(matIdx);
+            pb.repl.push_back(nd);
+            binds.push_back(std::move(pb));
+        }
+        if (binds.empty()) { applyCache_[key] = matIdx; return matIdx; }
+
+        Material m = L.scene.mats[matIdx];
+        int* slots[6] = { &m.roughnessPat, &m.filmThicknessPat, &m.mixWeightPat,
+                          &m.reflectPat,   &m.transmitPat,      &m.emitPat };
+        for (int* pi : slots) {
+            if (*pi < 0 || *pi >= (int)L.scene.patterns.size()) continue;
+            const std::vector<PatNode>& src = L.scene.patterns[*pi].nodes;
+            bool touched = false;
+            for (const PatBind& b : binds) if (patternUsesVar(src, b.var)) { touched = true; break; }
+            if (!touched) continue;                      // share the original program
+            Pattern np; np.nodes = patternSubstitute(src, binds);
+            *pi = (int)L.scene.patterns.size();
+            L.scene.patterns.push_back(std::move(np));
+        }
+        for (RecBinding& rb : m.recBindings) rb.driver = patternSubstitute(rb.driver, binds);
+
+        int id = (int)L.scene.mats.size();
+        L.scene.mats.push_back(std::move(m));
+        applyCache_[key] = id;
         return id;
     }
 
@@ -956,16 +1198,180 @@ private:
             if (rit != recordIndex_.end()) {
                 size_t rp = raw.rfind(')');
                 if (rp == std::string::npos || rp <= lp) {
-                    fail("record material '" + raw + "': missing ')'");
+                    fail("record material '" + raw + "': missing ')'" + parenHint(raw));
                     return -1;
                 }
                 std::string driver = raw.substr(lp + 1, rp - lp - 1);
                 return buildRecordMaterial(rit->second, driver, L);
             }
+            // Not a record: a §3.3 material application, `gold(u=v, a=1)`.
+            auto mit = matIndex_.find(trimWs(name));
+            if (mit != matIndex_.end()) {
+                size_t rp = raw.rfind(')');
+                if (rp == std::string::npos || rp <= lp) {
+                    fail("material application '" + raw + "': missing ')'" + parenHint(raw));
+                    return -1;
+                }
+                return applyMaterial(mit->second, raw.substr(lp + 1, rp - lp - 1), L);
+            }
         }
-        auto it = matIndex_.find(raw);
-        if (it == matIndex_.end()) { fail("unknown material '" + raw + "'"); return -1; }
-        return it->second;
+        int id = lookupMaterial(raw, L);
+        if (id < 0) { fail("unknown material '" + raw + "'"); return -1; }
+        return id;
+    }
+
+    // Resolve a plain material NAME to a usable Scene::mats index. Every by-name
+    // reference goes through here so that a material with a free `a` resolves it to
+    // its `albedo_default` exactly once (applyMaterial memoises the empty application),
+    // instead of silently reading 0. Returns -1 if the name is unknown.
+    int lookupMaterial(const std::string& name, Loaded& L) {
+        auto it = matIndex_.find(name);
+        if (it == matIndex_.end()) return -1;
+        return applyMaterial(it->second, "", L);
+    }
+
+    // ---- §3.2 per-property access: `MATERIAL.slot` / `MATERIAL.slot(args)` -------
+    // The value of ONE property of an already-declared material, readable at any value
+    // site that takes that property's type. `gold.reflect` reads the slot with every
+    // named input at its default; `gold.reflect(u=v)` / `gold.reflect(a=0.3)` rebinds
+    // first. Rebinding goes through `applyMaterial`, so it is the *same* machinery §3.3
+    // uses at a geometry `material` field — including the `a` -> `albedo_default`
+    // fallback and the (material, argtext) memo, so `gold.reflect(u=v)` written in five
+    // places builds one applied material, not five.
+    //
+    // WHY THE SLOT KEYWORD IS THE HANDLE. §3.2 writes a property as `<type/slot keyword>
+    // ["name"] = <value>` and makes the quoted name OPTIONAL, because the slot keyword
+    // alone already binds the property to its slot; the name exists only to mint an
+    // external dot-handle. ftrace properties are spelled with the slot keyword and have
+    // never carried a quoted name — every ftrace property is already anonymous, so the
+    // "naming is optional" arm is the ftrace status quo, vacuously. With no names to use
+    // as handles, the handle here IS the slot keyword: `gold.reflect`, `gold.roughness`.
+    struct MatProp {
+        bool        ok       = false;                    // resolved (false => fail() was set)
+        bool        spectral = false;                    // spectral slot (else scalar)
+        Spectrum    spec     = constantSpectrum(0.0);
+        double      scalar   = 0.0;
+        int         pat      = -1;                       // companion per-hit pattern, or -1
+        std::string slot;
+    };
+
+    // Recognise + resolve. Returns FALSE when `tok` is not this form at all (the caller
+    // falls through to its other spellings); TRUE when it was recognised, in which case
+    // `out` is filled or `fail()` has been set. Deliberately keyed on "the head names a
+    // known MATERIAL", exactly like the record refs below key on "names a known record",
+    // so the two dotted forms never contend: a name cannot be both.
+    bool materialPropRef(const std::string& tok, MatProp& out) {
+        if (!loadedRef_) return false;
+        Loaded& L = *loadedRef_;
+        size_t dot = tok.find('.');
+        if (dot == std::string::npos || dot == 0) return false;
+        std::string head = tok.substr(0, dot);
+        // Records win a name clash, so `R.chan` keeps meaning the shipped record ref at
+        // EVERY value site — including the ones (bindScalarPattern) that reach materials
+        // before records. Without this, declaring a material named after a record would
+        // silently change what an existing scene's `R.chan` resolves to.
+        if (recordIndex_.count(head)) return false;
+        auto mit = matIndex_.find(head);
+        if (mit == matIndex_.end()) return false;        // not a material -> not our form
+        // `slot` or `slot(args)`; the arg list may contain spaces (balanced-paren lexing).
+        std::string rest = tok.substr(dot + 1), slot = trimWs(rest), args;
+        size_t lp = rest.find('(');
+        if (lp != std::string::npos) {
+            size_t rp = rest.rfind(')');
+            if (rp == std::string::npos || rp <= lp) {
+                fail("material property '" + tok + "': missing ')'" + parenHint(tok)); return true;
+            }
+            std::string tail = trimWs(rest.substr(rp + 1));
+            if (!tail.empty()) {
+                fail("material property '" + tok + "': unexpected '" + tail + "' after ')'"); return true;
+            }
+            slot = trimWs(rest.substr(0, lp));
+            args = rest.substr(lp + 1, rp - lp - 1);
+        }
+        if (slot.empty()) { fail("material property '" + tok + "': no property after '.'"); return true; }
+
+        int src = applyMaterial(mit->second, args, L);   // -1 => applyMaterial already failed
+        if (src < 0 || src >= (int)L.scene.mats.size()) return true;
+        const Material& sm = L.scene.mats[src];
+        out.slot = slot;
+        // A record-DRIVEN slot has no load-time value at all: the constant sitting in the
+        // field is a placeholder the per-hit record sampler overwrites. Reading it would
+        // hand the consumer a number the source material never actually uses.
+        auto recDriven = [&](int recSlot) {
+            for (const RecBinding& rb : sm.recBindings) if (rb.slot == recSlot) return true;
+            return false;
+        };
+        auto refuseRec = [&](int recSlot) {
+            if (!recDriven(recSlot)) return false;
+            fail("material property '" + tok + "': '" + head + "." + slot + "' is driven by a "
+                 "record, so it has no load-time value — reference the record channel "
+                 "directly instead");
+            return true;
+        };
+        // Likewise a texture-bound slot: the value is an image sampled at the hit UV, and
+        // a property reference carries a spectrum + a pattern, not a texture binding.
+        auto refuseTex = [&](int tex) {
+            if (tex < 0) return false;
+            fail("material property '" + tok + "': '" + head + "." + slot + "' is bound to a "
+                 "texture, which a property reference cannot carry — bind the texture at "
+                 "the use site instead");
+            return true;
+        };
+        if (slot == "reflect") {
+            if (refuseRec(REC_SLOT_REFLECT) || refuseTex(sm.reflectTex)) return true;
+            out.spectral = true; out.spec = sm.reflect;  out.pat = sm.reflectPat;
+        } else if (slot == "transmit") {
+            out.spectral = true; out.spec = sm.transmit; out.pat = sm.transmitPat;
+        } else if (slot == "emit") {
+            out.spectral = true; out.spec = sm.emit;     out.pat = sm.emitPat;
+        } else if (slot == "ior") {
+            out.spectral = true; out.spec = sm.ior;
+        } else if (slot == "absorb") {
+            out.spectral = true; out.spec = sm.absorb;
+        } else if (slot == "roughness") {
+            if (refuseRec(REC_SLOT_ROUGHNESS) || refuseTex(sm.roughnessTex)) return true;
+            out.scalar = sm.roughness;      out.pat = sm.roughnessPat;
+        } else if (slot == "film_thickness") {
+            if (refuseTex(sm.filmThicknessTex)) return true;
+            out.scalar = sm.filmThickness;  out.pat = sm.filmThicknessPat;
+        } else if (slot == "film_ior") {
+            out.scalar = sm.filmIor;
+        } else if (slot == "groove_spacing") {
+            out.scalar = sm.grooveSpacing;
+        } else if (slot == "yield") {
+            out.scalar = sm.fluoYield;
+        } else {
+            fail("material property '" + tok + "': material '" + head + "' has no property '" +
+                 slot + "' (spectral: reflect, transmit, emit, ior, absorb; scalar: roughness, "
+                 "film_thickness, film_ior, groove_spacing, yield)");
+            return true;
+        }
+        out.ok = true;
+        return true;
+    }
+
+    // Combine two per-hit scalar patterns into one. Both spellings a pattern index can
+    // arrive from — the source slot of a property reference and the consumer's own
+    // `<slot>_map` — mean "a multiplier on whatever the slot otherwise evaluates to", so
+    // the composition of the two IS their product. Appending `[a…, b…, Mul]` is valid
+    // postfix because each program pushes exactly one value (the same invariant that
+    // makes §3.3's substitution a pure splice). Returns the surviving index when only
+    // one is real, so the common case allocates nothing.
+    int composePatterns(int a, int b, Loaded& L) {
+        if (a < 0) return b;
+        if (b < 0) return a;
+        if (a >= (int)L.scene.patterns.size() || b >= (int)L.scene.patterns.size()) return a;
+        Pattern np;
+        const std::vector<PatNode>& pa = L.scene.patterns[a].nodes;
+        const std::vector<PatNode>& pb = L.scene.patterns[b].nodes;
+        np.nodes.reserve(pa.size() + pb.size() + 1);
+        np.nodes.insert(np.nodes.end(), pa.begin(), pa.end());
+        np.nodes.insert(np.nodes.end(), pb.begin(), pb.end());
+        PatNode mul; mul.op = PatOp::Mul;
+        np.nodes.push_back(mul);
+        int id = (int)L.scene.patterns.size();
+        L.scene.patterns.push_back(std::move(np));
+        return id;
     }
 
     // Records stage 5a: resolve a record channel reference used as a CONSTANT spectrum
@@ -1122,6 +1528,7 @@ private:
         if (v.block && v.block->type == "table") {
             std::vector<std::pair<double, double>> pairs;
             bool cubic = false;
+            markAllUsed(*v.block);   // a flat `λ:value` list, not key/value statements
             for (const auto& w : v.block->words) {
                 if (w.rfind("interp=", 0) == 0) { cubic = interpIsCubic(w); continue; }
                 auto p = w.find(':');
@@ -1147,6 +1554,26 @@ private:
         if (w.size() == 1) {
             Spectrum rs;
             if (recordConstSpectrumRef(h, rs)) return rs;
+            // §3.2 per-property access — `MATERIAL.slot` / `MATERIAL.slot(args)`. This is
+            // the PATTERN-LESS spectral site (`ior`, `absorb`, a light's `spd`, a
+            // top-level `spectrum`): it can hold a spectrum but has nowhere to put a
+            // per-hit multiplier, so a pattern-carrying source is refused rather than
+            // silently flattened. The pattern-aware slots (reflect/transmit/emit) are
+            // intercepted earlier, in patternedSpectrumParam, and never reach here.
+            MatProp mp;
+            if (materialPropRef(h, mp)) {
+                if (!mp.ok) return constantSpectrum(0);            // fail() already set
+                if (!mp.spectral) {
+                    fail("material property '" + h + "': '" + mp.slot + "' is a scalar "
+                         "property, but a spectrum is needed here");
+                    return constantSpectrum(0);
+                }
+                if (mp.pat >= 0)
+                    fail("material property '" + h + "': '" + mp.slot + "' carries a per-hit "
+                         "pattern, which this slot cannot apply — reference a material whose "
+                         + mp.slot + " is a plain spectrum");
+                return mp.spec;
+            }
         }
 
         if (h == "blackbody")  return blackbody(w.size() > 1 ? num(w[1]) : 6500.0);
@@ -1178,12 +1605,22 @@ private:
         // of `rgb`, right for coloured lights (`spd rgbillum 1 0.6 0.2`). Meant for lights;
         // accepted anywhere a spectrum is. (Head keywords, not trailing modifiers, because
         // the parser stops a value at the next bareword.)
+        // The `…smits` heads (`rgbsmits`/…) take the classic Smits 1999 basis, the
+        // `…box` heads (`rgbbox`/…) a plain calibrated 3-box, and the `…meng` heads
+        // (`rgbmeng`/…) the Meng 2015 smoothest-spectrum grid, instead of the default
+        // Jakob-Hanika fit — selectable alternative upsamplers (K1). `…meng` is the
+        // one to reach for when a reflectance will be re-illuminated by a strongly
+        // non-D65 light or dispersed, since it is the *smoothest* spectrum of that
+        // colour rather than a shape-constrained fit.
         {
             bool isLine  = (h == "rgbline"  || h == "hsvline"  || h == "hslline");
             bool isIllum = (h == "rgbillum" || h == "hsvillum" || h == "hslillum");
-            if (h == "rgb" || h == "hsv" || h == "hsl" || isLine || isIllum) {
+            bool isSmits = (h == "rgbsmits" || h == "hsvsmits" || h == "hslsmits");
+            bool isBox   = (h == "rgbbox"   || h == "hsvbox"   || h == "hslbox");
+            bool isMeng  = (h == "rgbmeng"  || h == "hsvmeng"  || h == "hslmeng");
+            if (isColourHead(h)) {
                 if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
-                std::string space = (isLine || isIllum) ? h.substr(0, 3) : h;
+                std::string space = (isLine || isIllum || isSmits || isBox || isMeng) ? h.substr(0, 3) : h;
                 Vec3 c;
                 if      (space == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
                 else if (space == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
@@ -1193,6 +1630,9 @@ private:
                     return rgbToLineEmission(c.x, c.y, c.z, sigma);
                 }
                 if (isIllum) return rgbToIlluminantJH(c.x, c.y, c.z);
+                if (isSmits) return rgbToReflectanceSmits(c.x, c.y, c.z);
+                if (isBox)   return rgbToReflectanceBox(c.x, c.y, c.z);
+                if (isMeng)  return rgbToReflectanceMeng(c.x, c.y, c.z);
                 return rgbToReflectanceJH(c.x, c.y, c.z);
             }
         }
@@ -1241,6 +1681,18 @@ private:
                      "isn't a spectrum; tag it, e.g. `rgb " + w[0] + " " + w[1] + " " + w[2] + "`");
                 return constantSpectrum(0);
             }
+        }
+        // Reaching here with a `texture:` prefix means the slot has no texture path.
+        // Only the two Lambertian families bind a reflect texture (bindReflectTexture);
+        // the specular ones read the reflect slot directly and have nowhere to sample a
+        // UV from (see reflectSlot in scene.h). Say THAT, rather than making the author
+        // wonder why a texture name isn't a valid spectrum.
+        if (h.rfind("texture:", 0) == 0) {
+            fail("'" + h + "': this slot takes a spectrum, not a texture — only the "
+                 "`reflect` slot of a `diffuse`/`translucent` material binds an image "
+                 "albedo. Use `pattern:<name>` for a procedural drive, or a uniform "
+                 "spectrum here");
+            return constantSpectrum(0);
         }
         fail("unrecognized spectrum expression '" + h + "'");
         return constantSpectrum(0);
@@ -1315,6 +1767,25 @@ private:
         if (w0.find('.') != std::string::npos && !isNumber(w0)) {
             double rv;
             if (recordConstScalarRef(w0, rv)) return rv;             // record ref (or a fail was set)
+            // §3.2 per-property access at a scalar slot: `roughness gold.roughness`,
+            // `film_ior coat.film_ior`. A pattern-carrying source is refused here rather
+            // than dropped — the slots that CAN hold a per-hit pattern try
+            // bindScalarPattern first (which takes the pattern), so reaching dblParam
+            // with one in hand means this particular slot has nowhere to put it.
+            MatProp mp;
+            if (materialPropRef(w0, mp)) {
+                if (!mp.ok) return dflt;                             // fail() already set
+                if (mp.spectral) {
+                    fail(std::string(key) + " " + w0 + ": '" + mp.slot + "' is a spectral "
+                         "property, but this slot takes a scalar");
+                    return dflt;
+                }
+                if (mp.pat >= 0)
+                    fail(std::string(key) + " " + w0 + ": '" + mp.slot + "' carries a per-hit "
+                         "pattern, which the '" + key + "' slot cannot apply — write it on the "
+                         "matching '_map' slot instead");
+                return mp.scalar;
+            }
         }
         return num(w0);
     }
@@ -1354,22 +1825,24 @@ private:
                 fail("texture '" + b.name + "': rgb needs three quoted exprs: rgb \"r(u,v)\" \"g(u,v)\" \"b(u,v)\""); return false;
             }
             std::vector<PatNode> pr, pg, pb; std::string perr;
-            if (!compilePatternExpr(rgbS->val.words[0], pr, perr)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
-            if (!compilePatternExpr(rgbS->val.words[1], pg, perr)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
-            if (!compilePatternExpr(rgbS->val.words[2], pb, perr)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[0], pr, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[1], pg, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
+            if (!compilePatternExpr(rgbS->val.words[2], pb, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
             int res = (int)dblOf(b, "res", 512.0);
             if (res < 1) res = 1; else if (res > 8192) res = 8192;
             tex.encoding = TexEncoding::Linear;   // expr outputs are linear albedo already
             tex.w = res; tex.h = res;
             tex.rgb.assign((size_t)res * res, Vec3{0, 0, 0});
             auto cl = [](double t) { return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t); };
+            // Bind the scene's pattern tables once; only (u,v) vary per texel.
+            PatCtx c; bindPatScene(c, L.scene);
             for (int y = 0; y < res; ++y) {
                 // Invert v to match sampleRgb's (1-v) flip so f(u,v) reads back at the
                 // surface UV (top-left storage, v=0 at image bottom / OBJ convention).
                 double v = 1.0 - (y + 0.5) / res;
                 for (int x = 0; x < res; ++x) {
                     double u = (x + 0.5) / res;
-                    PatCtx c; c.u = u; c.v = v;
+                    c.u = u; c.v = v;
                     double rr = patternEval(pr.data(), (int)pr.size(), c);
                     double gg = patternEval(pg.data(), (int)pg.size(), c);
                     double bb = patternEval(pb.data(), (int)pb.size(), c);
@@ -1391,6 +1864,7 @@ private:
             // texture's red channel then selects an entry per texel (nearest, no upsample).
             if (const Stmt* ps = find(b, "palette")) {
                 if (!ps->val.block) { fail("texture '" + b.name + "': palette needs a { } body"); return false; }
+                markAllUsed(*ps->val.block);   // a flat (index, spectrum-ref) list
                 const auto& w = ps->val.block->words;
                 if (w.empty() || (w.size() % 2) != 0) {
                     fail("texture '" + b.name + "': palette needs (index spectrum) pairs"); return false;
@@ -1430,6 +1904,112 @@ private:
         return true;
     }
 
+    // The `reflect` slot, pattern-aware — the spectrum-slot half of §4's procedural
+    // drives. Two spellings, one runtime field (`Material::reflectPat`, a per-hit scalar
+    // multiplier on whatever the slot otherwise evaluates to):
+    //
+    //   reflect pattern:p                       greyscale albedo p(hit)  — the pattern is
+    //   reflect [0 1](u)                        ALONE in the slot, so the base spectrum
+    //                                           becomes a flat 1.0 and the multiply IS
+    //                                           the answer. (An inline array literal
+    //                                           desugars to the `pattern:` form, which is
+    //                                           what makes `reflect [0 1](u)` work.)
+    //   reflect rgb .8 .2 .2                    that tint, modulated per hit — colour from
+    //   reflect_map pattern:p                   the spectrum, variation from the pattern.
+    //   reflect texture:t / reflect_map p       likewise for an image albedo.
+    //
+    // Returning the base spectrum (rather than assigning) keeps every material type's own
+    // default intact; call it wherever `spectrumParam(b, "reflect", …)` used to be called.
+    // `m.type` must already be set — the honoured-family check below reads it.
+    // The shared mechanism, keyed on the slot name: `<key> pattern:p` puts the pattern
+    // ALONE in the slot (base becomes a flat 1.0), `<mapKey> pattern:p` modulates whatever
+    // `<key>` otherwise says. Identical for `reflect`/`reflect_map` and `transmit`/
+    // `transmit_map`, hence one implementation.
+    Spectrum patternedSpectrumParam(const Block& b, const char* key, const char* mapKey,
+                                    int& patOut, const Spectrum& dflt) {
+        bindScalarPattern(b, mapKey, patOut);
+        const Stmt* s = find(b, key);
+        if (s && !s->val.words.empty() && s->val.words[0].rfind("pattern:", 0) == 0) {
+            if (!bindScalarPattern(b, key, patOut)) return dflt;   // unknown name: failed
+            return constantSpectrum(1.0);
+        }
+        // §3.2 per-property access at a PATTERN-AWARE spectral slot: `reflect gold.reflect`
+        // / `reflect gold.reflect(u=v)`. This is the only site that can carry BOTH halves
+        // of the source slot — the base spectrum and its per-hit multiplier — which is why
+        // the hook lives here rather than in evalSpectrum. If the consumer also wrote its
+        // own `<key>_map`, the two are COMPOSED (both spellings mean "a multiplier on
+        // whatever the slot otherwise evaluates to", so their composition is the product)
+        // instead of one silently clobbering the other.
+        if (s && s->val.words.size() == 1 && loadedRef_) {
+            MatProp mp;
+            if (materialPropRef(s->val.words[0], mp)) {
+                if (!mp.ok) return dflt;                           // fail() already set
+                if (!mp.spectral) {
+                    fail(std::string(key) + " " + s->val.words[0] + ": '" + mp.slot +
+                         "' is a scalar property, but this slot takes a spectrum");
+                    return dflt;
+                }
+                patOut = composePatterns(patOut, mp.pat, *loadedRef_);
+                return mp.spec;
+            }
+        }
+        return spectrumParam(b, key, dflt);
+    }
+
+    Spectrum reflectParam(const Block& b, Material& m, const Spectrum& dflt) {
+        return patternedSpectrumParam(b, "reflect", "reflect_map", m.reflectPat, dflt);
+    }
+
+    // Same for the transmit slot (read through transmitSlot() by Filter's gel
+    // transmittance and DiffuseTransmit's back-lobe albedo).
+    Spectrum transmitParam(const Block& b, Material& m, const Spectrum& dflt) {
+        return patternedSpectrumParam(b, "transmit", "transmit_map", m.transmitPat, dflt);
+    }
+
+    // Which material families route their reflect slot through diffuseReflectance() /
+    // reflectSlot(), the only two accessors that apply reflectPat. Anything else reads
+    // `m.reflect` directly (Fluorescent's fluoroWeights, for instance, which has no hit
+    // to evaluate a pattern at), so a pattern there would be silently dropped — and the
+    // flat-1.0 base that a lone `reflect pattern:` leaves behind would then render as
+    // albedo 1.0, a WRONG image rather than a missing effect. Hence the loader refuses it.
+    static bool reflectPatHonoured(MatType t) {
+        return t == MatType::Diffuse   || t == MatType::DiffuseTransmit ||
+               t == MatType::Mirror    || t == MatType::HalfMirror      ||
+               t == MatType::Glossy    || t == MatType::Grating;
+    }
+
+    // The transmit slot is only ever READ by these two: a colored gel's T(lambda) and a
+    // translucent's back-hemisphere albedo. Every other type leaves `transmit` at its 0
+    // default and never looks at it, so a pattern there is meaningless.
+    static bool transmitPatHonoured(MatType t) {
+        return t == MatType::Filter || t == MatType::DiffuseTransmit;
+    }
+
+    // Refuse a slot pattern on a family that would not apply it.
+    void checkSlotPatSupported(const Block& b, const char* key, const char* mapKey,
+                               bool honoured, int& patOut, const char* families) {
+        if (honoured) return;
+        const Stmt* s = find(b, key);
+        const bool patInSlot = s && !s->val.words.empty() &&
+                               s->val.words[0].rfind("pattern:", 0) == 0;
+        if (!patInSlot && !find(b, mapKey)) return;
+        fail(std::string("a ") + key + " pattern is not supported on this material type — "
+             "only the families whose " + key + " slot goes through the shared per-hit "
+             "accessor (" + families + ") apply one; elsewhere it would be silently ignored");
+        patOut = -1;
+    }
+
+    // Run from the COMMON tail of buildMaterial (not from reflectParam/transmitParam) so
+    // it also catches the types that never read the slot at all — otherwise `reflect_map`
+    // on, say, a thinfilm would be dropped in silence, which reads as "it worked".
+    void checkSlotPatsSupported(const Block& b, Material& m) {
+        checkSlotPatSupported(b, "reflect", "reflect_map", reflectPatHonoured(m.type),
+                              m.reflectPat,
+                              "diffuse, translucent, mirror, halfmirror, glossy, grating");
+        checkSlotPatSupported(b, "transmit", "transmit_map", transmitPatHonoured(m.type),
+                              m.transmitPat, "translucent, filter");
+    }
+
     // If `<key>`'s value is `texture:<name>`, bind that texture's grayscale value to a
     // NON-albedo scalar material parameter (spec §9.4) and return true; otherwise
     // false (the caller reads a numeric value instead). Used for roughness /
@@ -1457,6 +2037,22 @@ private:
         const Stmt* s = find(b, key);
         if (!s || s->val.words.empty()) return false;
         const std::string& w0 = s->val.words[0];
+        // §3.2 per-property access carrying a pattern: `roughness gold.roughness` where
+        // gold's roughness is itself pattern-driven. Reported as "handled" ONLY when the
+        // source actually has a pattern, so a plain-constant source falls through to
+        // dblParam and still reads its value — which is what makes the call sites'
+        // existing `bindScalarPattern(...) else dblParam(...)` ladder do the right thing
+        // for both shapes without any of them knowing this form exists.
+        if (w0.rfind("pattern:", 0) != 0 && w0.find('.') != std::string::npos &&
+            !isNumber(w0) && loadedRef_) {
+            MatProp mp;
+            if (materialPropRef(w0, mp)) {
+                if (!mp.ok || mp.spectral || mp.pat < 0) return false;
+                patOut = composePatterns(patOut, mp.pat, *loadedRef_);
+                return true;
+            }
+            return false;
+        }
         if (w0.rfind("pattern:", 0) != 0) return false;
         std::string nm = w0.substr(8);
         auto it = patternIndex_.find(nm);
@@ -1494,7 +2090,10 @@ private:
             std::string expr;
             for (size_t k = 0; k < es->val.words.size(); ++k) { if (k) expr += " "; expr += es->val.words[k]; }
             std::string perr;
-            if (!compilePatternExpr(expr, pat.nodes, perr)) {
+            // `a` is legal here: a named pattern stays unresolved until a material uses
+            // it, and applyMaterial then resolves `a` against THAT material.
+            if (!compilePatternExpr(expr, pat.nodes, perr, false, &texScope_,
+                                    &tableScope_, /*allowA=*/true)) {
                 fail("pattern '" + b.name + "': " + perr); return false;
             }
         } else {
@@ -1522,6 +2121,437 @@ private:
         int id = (int)L.scene.patterns.size();
         L.scene.patterns.push_back(std::move(pat));
         patternIndex_[b.name] = id;
+        return true;
+    }
+
+    // ---- inline array literals: `[0 1](u)` / `[[0 1 2][3 4 5]](u,v)` ----
+    // The shorthand for "a tiny lookup table, written where it is used". It is pure
+    // SUGAR: each literal becomes an anonymous `grid` + a one-line `pattern` that samples
+    // it, and the value site is rewritten to `pattern:<gen>`. That is why the literal
+    // works in every slot that already takes a pattern without any of those slots
+    // knowing the syntax exists — and why the two front ends only ever have to carry the
+    // literal's raw shape (ftsl::BrItem), never its meaning.
+    //
+    // The NESTING is the shape (axis 0 outermost, C order — the same layout `grid`'s
+    // `data { … }` uses), so a shape need never be spelled; the array must be rectangular.
+    // The domain is the UNIT box per axis (lo 0, hi 1), NOT the `grid` element's default
+    // index lattice: an inline literal has no domain of its own and is overwhelmingly
+    // read at normalized coordinates (`u`, `v`), whereas a standalone `grid` is a data
+    // container whose sample spacing is the meaningful thing.
+
+    // Walk the raw bracket tree in C order, proving it RECTANGULAR (every group at a
+    // given depth the same length) while collecting the per-axis extents.
+    bool flattenArray(const std::vector<BrItem>& items, int depth,
+                      std::vector<int>& shape, std::vector<std::string>& out,
+                      const std::string& who, const char* raggedHint = "") {
+        if (items.empty()) { fail(who + ": empty `[ ]` group"); return false; }
+        const bool grouped = items[0].isGroup;
+        for (const auto& it : items) {
+            if (it.isGroup != grouped) {
+                fail(who + ": axis " + std::to_string(depth) +
+                     " mixes numbers with nested `[ … ]` groups");
+                return false;
+            }
+        }
+        if ((int)shape.size() == depth) shape.push_back((int)items.size());
+        else if (shape[depth] != (int)items.size()) {
+            fail(who + ": ragged — axis " + std::to_string(depth) + " has both " +
+                 std::to_string(shape[depth]) + " and " + std::to_string(items.size()) +
+                 " entries; every group at the same nesting level must be the same length" +
+                 raggedHint);
+            return false;
+        }
+        if (!grouped) {
+            for (const auto& it : items) {
+                if (!isNumber(it.word)) {
+                    fail(who + ": non-numeric entry '" + it.word + "' in an inline array");
+                    return false;
+                }
+                out.push_back(it.word);
+            }
+            return true;
+        }
+        for (const auto& it : items)
+            if (!flattenArray(it.items, depth + 1, shape, out, who)) return false;
+        return true;
+    }
+
+    // Turn ONE literal into its `grid` + `pattern` pair (appended to `gen`) and rewrite
+    // the statement's value to reference the generated pattern.
+    bool desugarOne(Stmt& s, std::vector<Block>& gen, int& n) {
+        const ArrayLit& a = *s.val.array;
+        const std::string nm  = "__arr" + std::to_string(n++);
+        const std::string who = "line " + std::to_string(a.line) + ": `" + s.key + "`";
+        if (a.call.empty()) {
+            fail(who + ": an inline array literal needs a trailing sample call naming the "
+                 "coordinates it is read at — e.g. `[0 1](u)`, or `[[0 1][2 3]](u,v)` for "
+                 "2-D. Write the call with no spaces inside the parentheses and nothing "
+                 "between it and the `]`.");
+            return false;
+        }
+        if (!s.val.words.empty()) {
+            fail(who + ": an inline array literal must be the whole value, but it follows '" +
+                 s.val.words.back() + "'");
+            return false;
+        }
+        std::vector<int> shape;
+        std::vector<std::string> flat;
+        if (!flattenArray(a.items, 0, shape, flat, who,
+                          " (use a named `scatter` element for irregular data)")) return false;
+        if ((int)shape.size() > PAT_ND_MAX_DIM) {
+            fail(who + ": " + std::to_string(shape.size()) + " nested axes exceeds the " +
+                 std::to_string((int)PAT_ND_MAX_DIM) + "-D limit");
+            return false;
+        }
+        // Arity is checked HERE, not left to the generated grid sample, so the message can
+        // talk about what the author wrote (`[…](u)`) instead of a name they never chose.
+        {
+            int args = 1, depth = 0;
+            for (size_t k = 1; k + 1 < a.call.size(); ++k) {
+                char c = a.call[k];
+                if (c == '(') ++depth;
+                else if (c == ')') --depth;
+                else if (c == ',' && depth == 0) ++args;
+            }
+            if (a.call.size() <= 2) args = 0;           // `()`
+            if (args != (int)shape.size()) {
+                fail(who + ": the array is " + std::to_string(shape.size()) +
+                     "-D but its sample call `" + a.call + "` gives " +
+                     std::to_string(args) + " coordinate(s) — one per nesting level");
+                return false;
+            }
+        }
+
+        Block g;
+        g.type = "grid";
+        g.name = nm;
+        auto addStmt = [&](Block& blk, const char* key, std::vector<std::string> words) {
+            Stmt t; t.key = key; t.line = a.line; t.val.words = std::move(words);
+            blk.words.push_back(t.key);
+            for (const auto& w : t.val.words) blk.words.push_back(w);
+            blk.stmts.push_back(std::move(t));
+        };
+        {
+            std::vector<std::string> sh;
+            for (int d : shape) sh.push_back(std::to_string(d));
+            addStmt(g, "shape", sh);
+            addStmt(g, "lo", std::vector<std::string>(shape.size(), "0"));
+            addStmt(g, "hi", std::vector<std::string>(shape.size(), "1"));
+            addStmt(g, "data", flat);
+        }
+        gen.push_back(std::move(g));
+
+        Block p;
+        p.type = "pattern";
+        p.name = nm;
+        addStmt(p, "expr", {"grid:" + nm + a.call});
+        gen.push_back(std::move(p));
+
+        s.val.array.reset();
+        s.val.words.push_back("pattern:" + nm);
+        return true;
+    }
+
+    bool desugarArrays(std::vector<Block>& blocks) {
+        std::vector<Block> gen;
+        int n = 0;
+        // A block's flat `words` dump is a mirror of its statements (key, then value
+        // words), so any block whose statements changed has to be re-mirrored — some
+        // bodies (`palette`, `data`) are read through `words` rather than `stmts`.
+        std::function<bool(Block&)> visit = [&](Block& b) -> bool {
+            // A `grid`/`scatter` element's own `data [ … ]` is that element's samples, not
+            // a value-site literal: nesting there is the element's shape and there is no
+            // sample call to make. Its bracket group is read by addGrid / addScatter.
+            if (b.type == "grid" || b.type == "scatter") return true;
+            bool touched = false;
+            for (auto& s : b.stmts) {
+                if (s.val.array) { if (!desugarOne(s, gen, n)) return false; touched = true; }
+                if (s.val.block) { if (!visit(*s.val.block)) return false; }
+            }
+            if (touched && !b.words.empty()) {
+                b.words.clear();
+                for (const auto& s : b.stmts) {
+                    b.words.push_back(s.key);
+                    for (const auto& w : s.val.words) b.words.push_back(w);
+                }
+            }
+            return true;
+        };
+        for (auto& b : blocks) if (!visit(b)) return false;
+        for (auto& g : gen) blocks.push_back(std::move(g));
+        return true;
+    }
+
+    // ---- N-D sampled arrays (`grid`) ----
+    //   grid "name" {
+    //       shape 3 4                 # sample counts per axis, axis 0 outermost (C order)
+    //       lo 0 0                    # box corner: absent -> zeros, one number -> broadcast
+    //       hi 1 1                    # absent -> unit-spacing index lattice, one -> isotropic
+    //       outside clamp             # clamp (default) | wrap | extrapolate
+    //       data { 0 1 2  3 4 5  … }  # product(shape) numbers, C order
+    //   }
+    // Sampled from any pattern expression as `grid:<name>(c0, …)` with one coordinate
+    // per axis. Coordinates are the grid's OWN units and are NOT scaled by the scene's
+    // `units` setting — like `pattern`'s `scale`/`size`, a grid is unit-agnostic; author
+    // `lo`/`hi` in whatever the expression feeding it produces (metres, u/v, …).
+    static bool parseGridOutside(const std::string& s, PatGridOutside& out) {
+        if (s == "clamp" || s == "edge")   { out = PatGridOutside::Clamp;       return true; }
+        if (s == "wrap"  || s == "repeat") { out = PatGridOutside::Wrap;        return true; }
+        if (s == "extrapolate" || s == "extend") { out = PatGridOutside::Extrapolate; return true; }
+        return false;
+    }
+
+    bool addGrid(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("grid needs a \"name\""); return false; }
+        if (gridIndex_.count(b.name)) { fail("duplicate grid name '" + b.name + "'"); return false; }
+        const std::string who = "grid '" + b.name + "'";
+
+        // Samples: a `data { … }` brace body (the flat-word list form `palette {}` uses),
+        // an inline `data 1 2 3` line, or a BRACKETED `data [[0 1 2][3 4 5]]` whose nesting
+        // IS the shape (loom's data.Grid constructor rule — a shape you cannot get wrong,
+        // because it is not written down twice). In the two flat forms, nesting/newlines
+        // inside the body are pure formatting and C order is the shape.
+        const Stmt* ds = find(b, "data");
+        if (!ds) { fail(who + " needs a `data { … }` list of numbers"); return false; }
+        std::vector<int> shape;            // filled from the nesting when `data` is bracketed
+        std::vector<float> samples;
+        if (ds->val.array) {
+            if (!ds->val.array->call.empty()) {
+                fail(who + ": `data` is this grid's own samples, so it takes no `" +
+                     ds->val.array->call + "` sample call — the call belongs at a value site "
+                     "that reads the grid, e.g. `grid:" + b.name + "(u)`");
+                return false;
+            }
+            std::vector<std::string> words;
+            if (!flattenArray(ds->val.array->items, 0, shape, words, who + " `data`")) return false;
+            // Only NESTING carries a shape. A single flat `data [0 1 2 3]` is just the
+            // bracketed spelling of the flat list, so an explicit `shape` still folds it.
+            if (shape.size() < 2) shape.clear();
+            samples.reserve(words.size());
+            for (const auto& w : words) samples.push_back((float)num(w));
+        } else {
+            if (ds->val.block) markAllUsed(*ds->val.block);   // a flat numeric sample list
+            const std::vector<std::string>& dw = ds->val.block ? ds->val.block->words : ds->val.words;
+            samples.reserve(dw.size());
+            for (const auto& w : dw) {
+                if (!isNumber(w)) { fail(who + ": non-numeric sample '" + w + "' in `data`"); return false; }
+                samples.push_back((float)num(w));
+            }
+        }
+        if (samples.empty()) { fail(who + ": `data` is empty"); return false; }
+
+        // Shape. Absent means "1-D, as long as the data" — the common ramp/LUT case. An
+        // explicit `shape` is how a FLAT list is folded; alongside bracketed data it is
+        // redundant, so it is accepted only when it agrees (and named when it doesn't).
+        if (const Stmt* ss = find(b, "shape")) {
+            std::vector<int> given;
+            for (const auto& w : ss->val.words) {
+                if (!isNumber(w)) { fail(who + ": non-numeric `shape` entry '" + w + "'"); return false; }
+                int n = (int)num(w);
+                if (n < 1) { fail(who + ": `shape` entries must be >= 1"); return false; }
+                given.push_back(n);
+            }
+            if (!shape.empty() && given != shape) {
+                auto join = [](const std::vector<int>& v) {
+                    std::string s;
+                    for (size_t k = 0; k < v.size(); ++k) { if (k) s += " "; s += std::to_string(v[k]); }
+                    return s;
+                };
+                fail(who + ": `shape " + join(given) + "` disagrees with the nesting of `data`, "
+                     "which is " + join(shape) + " — with bracketed data the shape is the nesting, "
+                     "so just drop the `shape` line");
+                return false;
+            }
+            if (shape.empty()) shape = given;
+        }
+        if (shape.empty()) shape.push_back((int)samples.size());
+        if ((int)shape.size() > PAT_ND_MAX_DIM) {
+            fail(who + ": " + std::to_string(shape.size()) + " axes exceeds the " +
+                 std::to_string((int)PAT_ND_MAX_DIM) + "-D limit");
+            return false;
+        }
+        long long need = 1;
+        for (int n : shape) need *= (long long)n;
+        if (need != (long long)samples.size()) {
+            fail(who + ": `shape` wants " + std::to_string(need) + " samples but `data` has " +
+                 std::to_string(samples.size()));
+            return false;
+        }
+
+        PatGrid g;
+        g.ndim = (int)shape.size();
+        for (int a = 0; a < g.ndim; ++a) g.shape[a] = shape[a];
+
+        // Read an axis-vector setting: absent -> `have=false`, one number -> broadcast,
+        // exactly ndim numbers -> per-axis. Anything else is an authoring error.
+        auto axisVec = [&](const char* key, double* out, bool& have, bool& scalar) -> bool {
+            have = false; scalar = false;
+            const Stmt* s = find(b, key);
+            if (!s) return true;
+            std::vector<double> v;
+            for (const auto& w : s->val.words) {
+                if (!isNumber(w)) { fail(who + std::string(": non-numeric `") + key + "` entry '" + w + "'"); return false; }
+                v.push_back(num(w));
+            }
+            if (v.empty()) return true;
+            if ((int)v.size() == 1) { scalar = true; for (int a = 0; a < g.ndim; ++a) out[a] = v[0]; }
+            else if ((int)v.size() == g.ndim) { for (int a = 0; a < g.ndim; ++a) out[a] = v[a]; }
+            else {
+                fail(who + std::string(": `") + key + "` needs 1 or " + std::to_string(g.ndim) + " numbers");
+                return false;
+            }
+            have = true;
+            return true;
+        };
+
+        bool haveLo = false, loScalar = false, haveHi = false, hiScalar = false;
+        double lo[PAT_ND_MAX_DIM] = {0, 0, 0, 0};
+        double hi[PAT_ND_MAX_DIM] = {0, 0, 0, 0};
+        if (!axisVec("lo", lo, haveLo, loScalar)) return false;
+        if (!axisVec("hi", hi, haveHi, hiScalar)) return false;
+        (void)loScalar;
+        // `hi` defaults mirror loom's Grid._resolve_hi:
+        //   absent  -> the unit-spacing INDEX lattice, hi[a] = lo[a] + shape[a] - 1
+        //   scalar  -> an ISOTROPIC lattice: spacing is set by axis 0, other axes follow
+        //   vector  -> the exact box
+        if (!haveHi) {
+            for (int a = 0; a < g.ndim; ++a) hi[a] = lo[a] + double(g.shape[a] - 1);
+        } else if (hiScalar) {
+            const double h = (g.shape[0] > 1) ? (hi[0] - lo[0]) / double(g.shape[0] - 1) : 0.0;
+            for (int a = 0; a < g.ndim; ++a) hi[a] = lo[a] + h * double(g.shape[a] - 1);
+        }
+        for (int a = 0; a < g.ndim; ++a) {
+            if (g.shape[a] > 1 && hi[a] == lo[a]) {
+                fail(who + ": axis " + std::to_string(a) + " has " + std::to_string(g.shape[a]) +
+                     " samples but a zero-width extent (lo == hi)");
+                return false;
+            }
+            g.lo[a] = lo[a];
+            g.hi[a] = hi[a];
+        }
+
+        std::string os = strOf(b, "outside", "clamp");
+        if (!parseGridOutside(os, g.outside)) {
+            fail(who + ": unknown `outside` '" + os + "' (clamp|wrap|extrapolate)");
+            return false;
+        }
+
+        // Samples go into ONE shared pool; the header points at its run by OFFSET, never
+        // by pointer — the pool grows as later grids load, and that is also the exact
+        // flat layout the GPU uploads.
+        g.off   = (int)L.scene.dataPool.size();
+        g.count = (int)samples.size();
+        L.scene.dataPool.insert(L.scene.dataPool.end(), samples.begin(), samples.end());
+        int id = (int)L.scene.grids.size();
+        L.scene.grids.push_back(g);
+        gridIndex_[b.name] = id;
+        return true;
+    }
+
+    // ---- N-D scattered samples (the ragged sibling of `grid`) ----
+    //   scatter "name" {
+    //       dim   2                   # coordinates per sample; absent -> 1
+    //       power 2                   # Shepard exponent (absent -> 2); higher = tighter
+    //       eps   1e-9                # squared-distance "this IS that sample" threshold
+    //       data {                    # (dim + 1) numbers per sample: position…, value
+    //           0 0   0.1
+    //           1 0   0.9
+    //           0.5 1 0.4
+    //       }
+    //   }
+    // Sampled as `scatter:<name>(c0, …)` with one coordinate per dimension, exactly like
+    // a grid — and like a grid, its coordinates are its OWN units, unscaled by `units`.
+    // Use this where the data does NOT sit on a lattice; a `grid` is both smaller and
+    // cheaper (O(2^ndim) vs O(count) per sample) whenever the data actually is regular.
+    bool addScatter(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("scatter needs a \"name\""); return false; }
+        if (scatterIndex_.count(b.name)) { fail("duplicate scatter name '" + b.name + "'"); return false; }
+        const std::string who = "scatter '" + b.name + "'";
+
+        PatScatter s;
+        if (const Stmt* ds = find(b, "dim")) {
+            if (ds->val.words.empty() || !isNumber(ds->val.words[0])) {
+                fail(who + ": `dim` needs a number"); return false;
+            }
+            s.ndim = (int)num(ds->val.words[0]);
+            if (s.ndim < 1 || s.ndim > PAT_ND_MAX_DIM) {
+                fail(who + ": `dim` must be 1.." + std::to_string((int)PAT_ND_MAX_DIM));
+                return false;
+            }
+        }
+
+        if (const Stmt* ps = find(b, "power")) {
+            if (ps->val.words.empty() || !isNumber(ps->val.words[0])) {
+                fail(who + ": `power` needs a number"); return false;
+            }
+            s.power = num(ps->val.words[0]);
+            if (!(s.power > 0.0)) { fail(who + ": `power` must be > 0"); return false; }
+        }
+        if (const Stmt* es = find(b, "eps")) {
+            if (es->val.words.empty() || !isNumber(es->val.words[0])) {
+                fail(who + ": `eps` needs a number"); return false;
+            }
+            s.eps = num(es->val.words[0]);
+            if (s.eps < 0.0) { fail(who + ": `eps` must be >= 0"); return false; }
+        }
+
+        // Samples: same flat-word `data { … }` body a grid uses, but read in strides of
+        // (dim + 1) — the position's coordinates followed by that sample's value. One
+        // interleaved list keeps a sample's position and value visually together, which
+        // is the whole point of a scatter (they are not separable the way a lattice is).
+        // Brackets are also accepted, and there the nesting carries the same meaning it
+        // does for a grid: `data [[0 0 0.1][1 0 0.9]]` is one group PER SAMPLE, so the
+        // stride is checked per group and a miscount names the offending sample.
+        const Stmt* ds = find(b, "data");
+        if (!ds) { fail(who + " needs a `data { … }` list of numbers"); return false; }
+        const int stride = s.ndim + 1;
+        std::vector<float> flat;
+        if (ds->val.array) {
+            if (!ds->val.array->call.empty()) {
+                fail(who + ": `data` is this scatter's own samples, so it takes no `" +
+                     ds->val.array->call + "` sample call — the call belongs at a value site "
+                     "that reads it, e.g. `scatter:" + b.name + "(u)`");
+                return false;
+            }
+            std::vector<int> shape;
+            std::vector<std::string> words;
+            if (!flattenArray(ds->val.array->items, 0, shape, words, who + " `data`")) return false;
+            if (shape.size() > 2) {
+                fail(who + ": `data` nests " + std::to_string(shape.size()) + " deep, but a "
+                     "scatter's samples are a flat list or ONE group per sample");
+                return false;
+            }
+            if (shape.size() == 2 && shape[1] != stride) {
+                fail(who + ": each `data` group has " + std::to_string(shape[1]) + " numbers but "
+                     "dim+1 = " + std::to_string(stride) + " (each sample is " +
+                     std::to_string(s.ndim) + " coordinate(s) then its value)");
+                return false;
+            }
+            flat.reserve(words.size());
+            for (const auto& w : words) flat.push_back((float)num(w));
+        } else {
+            if (ds->val.block) markAllUsed(*ds->val.block);   // a flat numeric sample list
+            const std::vector<std::string>& dw = ds->val.block ? ds->val.block->words : ds->val.words;
+            flat.reserve(dw.size());
+            for (const auto& w : dw) {
+                if (!isNumber(w)) { fail(who + ": non-numeric entry '" + w + "' in `data`"); return false; }
+                flat.push_back((float)num(w));
+            }
+        }
+        if (flat.empty()) { fail(who + ": `data` is empty"); return false; }
+        if ((int)(flat.size() % (size_t)stride) != 0) {
+            fail(who + ": `data` has " + std::to_string(flat.size()) + " numbers, which is not a " +
+                 "multiple of dim+1 = " + std::to_string(stride) + " (each sample is " +
+                 std::to_string(s.ndim) + " coordinate(s) then its value)");
+            return false;
+        }
+
+        s.count = (int)(flat.size() / (size_t)stride);
+        s.off   = (int)L.scene.dataPool.size();
+        L.scene.dataPool.insert(L.scene.dataPool.end(), flat.begin(), flat.end());
+        int id = (int)L.scene.scatters.size();
+        L.scene.scatters.push_back(s);
+        scatterIndex_[b.name] = id;
         return true;
     }
 
@@ -1572,6 +2602,140 @@ private:
         }
     }
 
+    // Read one record channel line's stops — the **generalized stop grammar** (J3b
+    // item 2, `src/record_ladder.h`). Three delimiters form a fixed precedence ladder:
+    // whitespace binds tightest (juxtaposition -> a vector), comma looser (a new stop),
+    // brackets are its parentheses. So structure comes from the delimiters alone and
+    // the channel's arity only *validates*:
+    //
+    //     reflect  spectrum:steel spectrum:gold      # 2 colour-ref stops (as always)
+    //     rough    0 0.4 1                           # 3 scalar stops    (as always)
+    //     reflect  rgb 0 0 0, 1 1 1                  # 2 inline-colour stops (J3b item 1)
+    //     reflect  rgb [0 0 0] [1 1 1]               # ...the same thing, bracket form
+    //     tint     0 0 0,                            # ONE arity-3 stop (trailing comma)
+    //
+    // The whole thing is a strict ADDITIVE SUPERSET: a line using none of the ladder
+    // delimiters and carrying no colour tag takes a path that is behaviourally the old
+    // one — every word its own stop — so no record in the tree can reparse differently.
+    // That is deliberate rather than incidental: records are data, and a silent change
+    // in how an existing gradient is chopped into stops would show up only as a subtly
+    // wrong render, which is exactly the class of regression worth designing out.
+    //
+    // A leading colour head (`rgb`/`hsv`/`hsl` and every upsampler variant — see
+    // `isColourHead`) is the channel-level INLINE-COLOUR TAG: it fixes arity 3, so each
+    // comma group (or the lone group) is one colour written in place, instead of a chain
+    // of `spectrum:<name>` refs that each need their own top-level declaration.
+    bool parseChannelStops(const std::string& recName, RecChannel& ch,
+                           const std::vector<std::string>& words) {
+        auto bad = [&](const std::string& m) {
+            fail("record '" + recName + "' channel '" + ch.name + "': " + m);
+            return false;
+        };
+        if (words.empty()) return bad("has no stops");
+
+        // A leading colour head tags the whole channel and is not itself a stop.
+        size_t first = 0;
+        if (isColourHead(words[0])) {
+            ch.space = words[0];
+            first = 1;
+            if (words.size() == 1) return bad("'" + ch.space + "' tag with no stops");
+        }
+        const std::vector<std::string> body(words.begin() + first, words.end());
+
+        std::vector<std::string> toks;
+        recladder::tokenize(body, toks);
+
+        // Fast path: no ladder delimiter and no tag -> the plain whitespace list, read
+        // exactly as it always was (a `p:<pos>` word pins the stop that follows it).
+        if (ch.space.empty() && !recladder::usesLadder(toks)) {
+            bool havePin = false; double pinPos = 0.0;
+            for (const auto& w : toks) {
+                if (w.rfind("p:", 0) == 0) {
+                    if (!isNumber(w.substr(2))) return bad("bad p:<pos> '" + w + "'");
+                    havePin = true; pinPos = num(w.substr(2));
+                    continue;
+                }
+                RecStop st; st.token = w;
+                if (havePin) { st.pinned = true; st.pos = pinPos; havePin = false; }
+                ch.stops.push_back(std::move(st));
+            }
+            if (havePin) return bad("trailing p:<pos> with no value");
+            if (ch.stops.empty()) return bad("has no stops");
+            return true;
+        }
+
+        recladder::Value v;
+        bool trailingComma = false;
+        std::string lerr;
+        if (!recladder::parse(toks, v, trailingComma, lerr)) return bad(lerr);
+
+        // Turn the parsed ladder into a stop list. A leading `p:<pos>` component pins
+        // the stop it introduces (the ladder is purely structural, so the pin prefix
+        // stays an orthogonal concern peeled off here).
+        auto stopFrom = [&](const recladder::Value& g, RecStop& st) -> bool {
+            std::vector<std::string> comps;
+            if (g.isLeaf) comps.push_back(g.leaf);
+            else for (const auto& c : g.items) {
+                if (!c.isLeaf) return bad("stop is nested more than two levels deep");
+                comps.push_back(c.leaf);
+            }
+            if (!comps.empty() && comps[0].rfind("p:", 0) == 0) {
+                if (!isNumber(comps[0].substr(2))) return bad("bad p:<pos> '" + comps[0] + "'");
+                st.pinned = true; st.pos = num(comps[0].substr(2));
+                comps.erase(comps.begin());
+                if (comps.empty()) return bad("p:<pos> with no value");
+            }
+            st.token = comps[0];
+            if (comps.size() > 1) st.comps = comps;
+            return true;
+        };
+
+        const int depth = v.depth();
+        if (depth >= 2) {                       // a group per stop — the general shape
+            for (const auto& g : v.items) {
+                RecStop st;
+                if (!stopFrom(g, st)) return false;
+                ch.stops.push_back(std::move(st));
+            }
+        } else if (!ch.space.empty() || trailingComma) {
+            // One juxtaposed run that is ONE stop, not N: either the arity-3 tag says so
+            // (`reflect rgb .5 .5 .5`) or the author's trailing comma does (`tint 0 0 0,`).
+            RecStop st;
+            if (!stopFrom(v, st)) return false;
+            ch.stops.push_back(std::move(st));
+        } else {
+            // Untagged, comma-free, but bracketed — `rough [0] [1]`. Brackets around a
+            // single value are idempotent, so this is still the whitespace reading.
+            if (v.isLeaf) { RecStop st; if (!stopFrom(v, st)) return false; ch.stops.push_back(std::move(st)); }
+            else for (const auto& g : v.items) {
+                RecStop st;
+                if (!stopFrom(g, st)) return false;
+                ch.stops.push_back(std::move(st));
+            }
+        }
+        if (ch.stops.empty()) return bad("has no stops");
+
+        // Validate arity against the channel's kind. ftrace materializes exactly two
+        // kinds of channel — scalar and colour — so an arity-D vector channel has no
+        // destination here even though the grammar happily describes one. Say that
+        // outright rather than failing later with a confusing per-stop message.
+        for (const auto& st : ch.stops) {
+            const size_t arity = st.comps.empty() ? 1 : st.comps.size();
+            if (!ch.space.empty()) {
+                if (arity != 3)
+                    return bad("'" + ch.space + "' stops need 3 components, got " +
+                               std::to_string(arity));
+            } else if (arity != 1) {
+                return bad("arity-" + std::to_string(arity) + " vector stops have no "
+                           "destination in ftrace — tag the channel with a colour head "
+                           "(e.g. `" + ch.name + " rgb " + st.comps[0] + " " + st.comps[1] +
+                           " " + st.comps[2 % st.comps.size()] + ", ...`) to make it a "
+                           "colour channel, or write one value per stop for a scalar one");
+            }
+        }
+        return true;
+    }
+
     // Build one Record from a `NAME = range LO-HI [ ... ]` block: parse the domain,
     // interp, channels and stops; redistribute positions (stage 1); then compile each
     // stop into a scalar pattern program or a resolved colour + linear-RGB (stage 2).
@@ -1581,6 +2745,10 @@ private:
         Record rec;
         rec.name = b.name;
         bool haveRange = false;
+        // Every line of a record body is meaningful — `range`, `interp`, or a CHANNEL
+        // whose name the author invents — so there is no such thing as an unknown key
+        // here and the whole body counts as read.
+        markAllUsed(b);
         for (const auto& s : b.stmts) {
             if (s.key == "range") {
                 if (!parseRecordDomain(s.val.words, rec.lo, rec.hi)) {
@@ -1598,32 +2766,10 @@ private:
                 else { fail("record '" + rec.name + "': interp must be nearest|linear|smooth"); return false; }
                 continue;
             }
-            // Otherwise: a channel line. Its words are the stops, with optional `p:<pos>`
-            // prefixes pinning the position of the following value.
+            // Otherwise: a channel line, read by the generalized stop grammar.
             RecChannel ch;
             ch.name = s.key;
-            bool havePin = false; double pinPos = 0.0;
-            for (const auto& w : s.val.words) {
-                if (w.rfind("p:", 0) == 0) {
-                    if (!isNumber(w.substr(2))) {
-                        fail("record '" + rec.name + "' channel '" + ch.name + "': bad p:<pos> '" + w + "'");
-                        return false;
-                    }
-                    havePin = true; pinPos = num(w.substr(2));
-                    continue;
-                }
-                RecStop st; st.token = w;
-                if (havePin) { st.pinned = true; st.pos = pinPos; havePin = false; }
-                ch.stops.push_back(std::move(st));
-            }
-            if (havePin) {
-                fail("record '" + rec.name + "' channel '" + ch.name + "': trailing p:<pos> with no value");
-                return false;
-            }
-            if (ch.stops.empty()) {
-                fail("record '" + rec.name + "' channel '" + ch.name + "' has no stops");
-                return false;
-            }
+            if (!parseChannelStops(rec.name, ch, s.val.words)) return false;
             redistributeStops(ch, rec.lo, rec.hi);
             rec.channels.push_back(std::move(ch));
         }
@@ -1645,30 +2791,45 @@ private:
                 }
             }
         }
-        // Stage 2: compile stop tokens. A stop is a COLOUR iff its token is a prefixed
-        // spectrum ref (contains ':', e.g. spectrum:steel / metal:copper / rgb:... );
-        // otherwise it is a SCALAR pattern expression (a literal, or math over
-        // intrinsics x y z nx ny nz r u v f + functions). A channel must be homogeneous.
+        // Stage 2: compile stop tokens. A channel is a COLOUR channel two ways — either
+        // it carries an inline-colour TAG (`reflect rgb 0 0 0, 1 1 1`), or its stops are
+        // prefixed spectrum refs (`spectrum:steel` / `metal:copper` — anything with a
+        // ':'). Otherwise every stop is a SCALAR pattern expression (a literal, or math
+        // over intrinsics x y z nx ny nz r u v f + functions). A channel must be
+        // homogeneous. Note the two colour forms CONVERGE here: a tagged stop is handed
+        // to the very same `evalSpectrum` as `rgb 0 0 0` written at any other value
+        // site, so it inherits every upsampler and colour space for free and nothing
+        // downstream (the JH coeff bake, the CPU sampler, the GPU upload) can tell the
+        // two apart.
         for (auto& ch : rec.channels) {
-            bool anyColour = false, anyScalar = false;
-            for (const auto& st : ch.stops)
-                (st.token.find(':') != std::string::npos ? anyColour : anyScalar) = true;
-            if (anyColour && anyScalar) {
-                fail("record '" + rec.name + "' channel '" + ch.name +
-                     "': mixes colour (spectrum:...) and scalar stops");
-                return false;
+            if (!ch.space.empty()) {
+                ch.kind = ChanKind::Spectrum;
+            } else {
+                bool anyColour = false, anyScalar = false;
+                for (const auto& st : ch.stops)
+                    (st.token.find(':') != std::string::npos ? anyColour : anyScalar) = true;
+                if (anyColour && anyScalar) {
+                    fail("record '" + rec.name + "' channel '" + ch.name +
+                         "': mixes colour (spectrum:...) and scalar stops");
+                    return false;
+                }
+                ch.kind = anyColour ? ChanKind::Spectrum : ChanKind::Scalar;
             }
-            ch.kind = anyColour ? ChanKind::Spectrum : ChanKind::Scalar;
             for (auto& st : ch.stops) {
                 if (ch.kind == ChanKind::Scalar) {
                     std::string cerr;
-                    if (!compilePatternExpr(st.token, st.expr, cerr)) {
+                    if (!compilePatternExpr(st.token, st.expr, cerr, false, &texScope_, &tableScope_)) {
                         fail("record '" + rec.name + "' channel '" + ch.name +
                              "': bad stop expression '" + st.token + "': " + cerr);
                         return false;
                     }
                 } else {
-                    Value v; v.words = { st.token };
+                    Value v;
+                    if (ch.space.empty()) v.words = { st.token };
+                    else {
+                        v.words.push_back(ch.space);
+                        for (const auto& c : st.comps) v.words.push_back(c);
+                    }
                     st.color = evalSpectrum(v);
                     if (!err.empty()) return false;   // evalSpectrum already set the message
                     st.rgb = reflectanceToLinearSrgbD65(st.color);
@@ -1719,6 +2880,10 @@ private:
         std::unordered_map<std::string, ImportedChan> imported;
         std::unordered_map<std::string, std::pair<int, std::vector<PatNode>>> fromDriver;  // recName -> (idx,drv)
 
+        // This loop is exhaustive — every statement is `type`, `from`, or a `slot = rhs`
+        // assignment, and an unrecognised slot hard-fails below — so nothing here can be
+        // an unread key.
+        markAllUsed(b);
         for (const auto& s : b.stmts) {
             if (s.key == "type") continue;                       // already handled
             if (s.key == "from") {
@@ -1734,7 +2899,8 @@ private:
                 auto rit = recordIndex_.find(rname);
                 if (rit == recordIndex_.end()) { fail("`from`: unknown record '" + rname + "'"); return m; }
                 std::vector<PatNode> drv; std::string cerr;
-                if (!compilePatternExpr(dexpr, drv, cerr)) {
+                if (!compilePatternExpr(dexpr, drv, cerr, false, &texScope_,
+                                        &tableScope_, /*allowA=*/true)) {
                     fail("`from " + rname + "` driver '" + dexpr + "': " + cerr); return m;
                 }
                 const Record& rec = L.scene.records[rit->second];
@@ -1844,7 +3010,8 @@ private:
                 if (selStop >= 0) { fail("record-override `" + slot + " = " + rhs +
                     "`: a stop selector needs a record channel"); return m; }
                 std::string cerr;
-                if (!compilePatternExpr(rhs, rb.driver, cerr)) {
+                if (!compilePatternExpr(rhs, rb.driver, cerr, false, &texScope_,
+                                        &tableScope_, /*allowA=*/true)) {
                     fail("record-override `" + slot + " = " + rhs + "`: " + cerr); return m;
                 }
                 rb.recordIndex = -1;
@@ -1873,27 +3040,30 @@ private:
             if (find(b, "film_thickness")) m.filmThickness = dblParam(b, "film_thickness", m.filmThickness);
             if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
                 bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
-            if (find(b, "reflect"))        m.reflect       = spectrumParam(b, "reflect", m.reflect);
+            if (find(b, "reflect") || find(b, "reflect_map"))
+                m.reflect = reflectParam(b, m, m.reflect);
             if (find(b, "ior"))            m.ior           = spectrumParam(b, "ior", m.ior);
+            checkSlotPatsSupported(b, m);
             return m;
         }
         std::string type = strOf(b, "type", "diffuse");
         if (type == "diffuse") {
             m.type = MatType::Diffuse;
             // `reflect texture:<name>` binds a spatially-varying albedo; otherwise a
-            // uniform reflectance spectrum. A bound texture leaves m.reflect as the
-            // fallback used where UVs are unavailable (e.g. the CUDA bake path).
-            if (bindReflectTexture(b, m)) m.reflect = constantSpectrum(0.75);
-            else                          m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.75));
+            // uniform reflectance spectrum (or a pattern — see reflectParam). A bound
+            // texture leaves m.reflect as the fallback used where UVs are unavailable
+            // (e.g. the CUDA bake path); `reflect_map` still modulates it.
+            if (bindReflectTexture(b, m)) { bindScalarPattern(b, "reflect_map", m.reflectPat); m.reflect = constantSpectrum(0.75); }
+            else                          m.reflect = reflectParam(b, m, constantSpectrum(0.75));
         } else if (type == "translucent" || type == "diffuse_transmit") {
             // Two-lobe Lambertian: `reflect` (front-hemisphere diffuse albedo) +
             // `transmit` (back-hemisphere diffuse albedo). Both non-specular, so a
             // directly-viewed solid is visible in mode B. reflect+transmit is clamped
             // to <= 1 per wavelength at render time (the remainder is absorbed).
             m.type = MatType::DiffuseTransmit;
-            if (bindReflectTexture(b, m)) m.reflect = constantSpectrum(0.5);
-            else                          m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.4));
-            m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.4));
+            if (bindReflectTexture(b, m)) { bindScalarPattern(b, "reflect_map", m.reflectPat); m.reflect = constantSpectrum(0.5); }
+            else                          m.reflect = reflectParam(b, m, constantSpectrum(0.4));
+            m.transmit = transmitParam(b, m, constantSpectrum(0.4));
         } else if (type == "dielectric") {
             m.type = MatType::Dielectric;
             m.ior = spectrumParam(b, "ior", glassOrDefault("BK7", 1.5168));
@@ -1912,10 +3082,10 @@ private:
             m.absorb = spectrumParam(b, "absorb", constantSpectrum(0.0));
         } else if (type == "mirror") {
             m.type = MatType::Mirror;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.95));
+            m.reflect = reflectParam(b, m, constantSpectrum(0.95));
         } else if (type == "halfmirror") {
             m.type = MatType::HalfMirror;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.5));
+            m.reflect = reflectParam(b, m, constantSpectrum(0.5));
         } else if (type == "filter") {
             // Colored gel / Wratten filter: a thin non-scattering absorber. A photon
             // passes straight through, surviving with probability `transmit`(lambda) —
@@ -1924,10 +3094,10 @@ private:
             // (`transmit file:data/filter/rosco-red.csv` / `transmit filter:red-25`)
             // or a primitive (`transmit gaussian center=630 sigma=25`).
             m.type = MatType::Filter;
-            m.transmit = spectrumParam(b, "transmit", constantSpectrum(0.5));
+            m.transmit = transmitParam(b, m, constantSpectrum(0.5));
         } else if (type == "glossy") {
             m.type = MatType::Glossy;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));
+            m.reflect = reflectParam(b, m, constantSpectrum(0.9));
             // `roughness pattern:<name>` (§4) / `texture:<name>` binds a per-hit
             // roughness map (grayscale = roughness directly, both 0..1); else a constant.
             if (bindScalarPattern(b, "roughness", m.roughnessPat)) m.roughness = 0.2;
@@ -1949,13 +3119,13 @@ private:
             m.substrateK = spectrumParam(b, "substrate_k", constantSpectrum(0.0));
         } else if (type == "grating") {
             m.type = MatType::Grating;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.9));
+            m.reflect = reflectParam(b, m, constantSpectrum(0.9));
             m.grooveSpacing = dblParam(b, "groove_spacing", 1000.0);
             Vec3 gd{0, 1, 0}; vec3Of(b, "groove_dir", gd); m.grooveDir = gd;
             m.gratingMaxOrder = (int)dblParam(b, "max_order", 3);
         } else if (type == "fluorescent") {
             m.type = MatType::Fluorescent;
-            m.reflect = spectrumParam(b, "reflect", constantSpectrum(0.1));
+            m.reflect = reflectParam(b, m, constantSpectrum(0.1));
             m.fluoAbsorb = spectrumParam(b, "absorb", shortPass(490.0, 0.15, 1.0));
             m.fluoEmit = spectrumParam(b, "emit", gaussianBand(560.0, 25.0, 1.0));
             m.fluoYield = dblParam(b, "yield", 1.0);
@@ -1970,6 +3140,7 @@ private:
             m.substrateK = spectrumParam(b, "substrate_k", constantSpectrum(0.0));
             for (const auto& s : b.stmts) {
                 if (s.key != "layer") continue;
+                s.used = true;
                 if (s.val.words.size() < 3) { fail("multilayer 'layer' needs: <n> <k> <thickness_nm>"); return m; }
                 m.layerN.push_back(num(s.val.words[0]));
                 m.layerK.push_back(num(s.val.words[1]));
@@ -2014,36 +3185,94 @@ private:
         } else {
             fail("unknown material type '" + type + "'");
         }
+        checkSlotPatsSupported(b, m);
         // Nested-dielectric priority (§ nested dielectrics): `priority <N>` — integer,
         // higher wins where dielectric solids overlap. Common to every material type
         // (only consulted for dielectric-like ones); unset => the ahead-of-time audit
         // warns if this material overlaps another dielectric without a priority.
         if (find(b, "priority")) m.priority = (int)std::lround(dblOf(b, "priority", 0.0));
+        // Emissive surfaces (§ mesh area lights): any material may carry an `emit`
+        // spectrum, turning every triangle it is bound to into a light that radiates
+        // `emit(lambda)` from its front face. This drives emission-on-hit generically
+        // (m.isLight + m.emit, already consumed by every renderer); a mesh bound to
+        // such a material is additionally registered as a Mesh area emitter in addMesh
+        // so NEE / forward emission sample it. The SPD is radiance per unit solid angle
+        // per unit area (absolute if the scene is absolute); a mesh block's optional
+        // `power`/`lumens` rescales it there to hit a target flux over the mesh area.
+        // `emit` takes the same two pattern spellings as `reflect`/`transmit` (0.80.0):
+        // `emit pattern:p` makes the pattern the whole emission profile (greyscale, base
+        // spectrum flat 1.0), `emit_map pattern:p` modulates whatever `emit` otherwise
+        // says. Unlike those two the pattern is read from BOTH sides of transport —
+        // emission-on-hit and the Le at an emitter-sampled point — so it is only legal
+        // where the two provably agree on (u,v); checkEmitPatSupported (run after the
+        // scene is built, when the emitter shapes are known) enforces that.
+        if (find(b, "emit") || find(b, "emit_map")) {
+            m.emit = patternedSpectrumParam(b, "emit", "emit_map", m.emitPat,
+                                            constantSpectrum(0.0));
+            m.isLight = true;
+        }
+        // Tangent-space NORMAL MAP (C6): `normal_map texture:<name> [strength <s>]`.
+        // Common to every material type. Binds a declared (linear-encoded) texture as
+        // the material's normal map and reads an optional perturbation strength (default
+        // 1). The shading normal is perturbed at closestHit via the surface TBN frame.
+        bindNormalTexture(b, m, L);
         return m;
+    }
+
+    // Bind a `normal_map texture:<name> [strength <s>]` on a material (C6). The value
+    // must reference a declared texture (loaded `encoding linear` — a normal map is raw
+    // vector data, not colour). Sets m.normalTex + m.normalStrength; warns if the map is
+    // not linear-encoded (a common authoring mistake that de-gammas the vectors). The
+    // optional `strength <s>` is a trailing token of the same statement.
+    void bindNormalTexture(const Block& b, Material& m, Loaded& L) {
+        const Stmt* s = find(b, "normal_map");
+        if (!s || s->val.words.empty()) return;
+        const std::string& w0 = s->val.words[0];
+        std::string nm = (w0.rfind("texture:", 0) == 0) ? w0.substr(8) : w0;  // bare name tolerated
+        auto it = textureIndex_.find(nm);
+        if (it == textureIndex_.end()) { fail("normal_map references unknown texture '" + nm + "'"); return; }
+        m.normalTex = it->second;
+        if (it->second >= 0 && it->second < (int)L.scene.textures.size() &&
+            L.scene.textures[it->second].encoding != TexEncoding::Linear)
+            std::fprintf(stderr, "[ftsl] warning: normal_map texture '%s' is not "
+                         "'encoding linear' — normal vectors will be de-gammaed\n", nm.c_str());
+        // Optional trailing `strength <s>` token on the normal_map statement.
+        for (size_t i = 1; i + 1 < s->val.words.size(); ++i)
+            if (s->val.words[i] == "strength") m.normalStrength = num(s->val.words[i + 1]);
     }
 
     // Second material pass: resolve a Mix material's `layer "name" weight` entries
     // to child indices + weights. Called after every material name is registered,
     // so a mix may reference children declared before OR after it. Nested mixes are
     // rejected to keep resolution single-step (and the CUDA CDF bounded).
-    bool resolveMixChildren(const Block& b, Material& m, Loaded& L) {
+    // Takes the child material by INDEX, not by reference: resolving a layer name goes
+    // through lookupMaterial(), which may append to L.scene.mats (a material with a
+    // free `a` materialises its albedo_default clone on first use), and a `Material&`
+    // held across that would dangle on reallocation.
+    bool resolveMixChildren(const Block& b, int matIdx, Loaded& L) {
         double sum = 0.0;
+        std::vector<int>    kids;
+        std::vector<double> wts;
         for (const auto& s : b.stmts) {
             if (s.key != "layer") continue;
+            s.used = true;
             if (s.val.words.size() < 2) { fail("mix 'layer' needs a material name and a weight"); return false; }
             const std::string& cname = s.val.words[0];
             double w = num(s.val.words[1]);
-            auto it = matIndex_.find(cname);
-            if (it == matIndex_.end()) { fail("mix layer references unknown material '" + cname + "'"); return false; }
-            if (L.scene.mats[it->second].type == MatType::Mix ||
-                L.scene.mats[it->second].type == MatType::Layered) {
+            int child = lookupMaterial(cname, L);
+            if (child < 0) { fail("mix layer references unknown material '" + cname + "'"); return false; }
+            if (L.scene.mats[child].type == MatType::Mix ||
+                L.scene.mats[child].type == MatType::Layered) {
                 fail("layer '" + cname + "' is itself a mix/layered (nesting is not allowed)"); return false;
             }
             if (w < 0.0) { fail("mix layer weight must be >= 0"); return false; }
-            m.mixChildren.push_back(it->second);
-            m.mixWeights.push_back(w);
+            kids.push_back(child);
+            wts.push_back(w);
             sum += w;
         }
+        Material& m = L.scene.mats[matIdx];   // safe: no more mats appends below
+        m.mixChildren = std::move(kids);
+        m.mixWeights  = std::move(wts);
         if (m.mixChildren.empty()) { fail("mix material has no 'layer' entries"); return false; }
         if (sum > 1.0 + 1e-9) { fail("mix layer weights sum to " + std::to_string(sum) + " (> 1)"); return false; }
         // Optional per-hit blend mask: `weight_map pattern:<name>` (§4, math-driven
@@ -2223,9 +3452,8 @@ private:
         // default `material`). Two-token maps can't survive the statement splitter,
         // so name-matching is the grammar-friendly convention (mirrors `uv use_mesh`).
         bool useNames = (strOf(b, "usemtl") == "use_names");
-        MtlResolver resolver = [this](const std::string& nm) -> int {
-            auto it = matIndex_.find(nm);
-            return (it == matIndex_.end()) ? -1 : it->second;
+        MtlResolver resolver = [this, &L](const std::string& nm) -> int {
+            return lookupMaterial(nm, L);   // resolves a free `a` to albedo_default
         };
         size_t triStart = L.scene.tris.size();
         // Dispatch by file extension: .gltf/.glb use the glTF loader (which imports
@@ -2275,6 +3503,77 @@ private:
             g.matId    = id;
             L.scene.meshGroups.push_back(std::move(g));
         }
+        // Emissive mesh → register a Mesh area light (§ mesh area lights). When the
+        // bound material carries an `emit` spectrum, the triangles just appended form
+        // one area light: emission-on-hit already works via m.isLight/m.emit, and this
+        // adds the emitter so NEE / forward emission sample the mesh. An optional
+        // `power`/`lumens` on the mesh block rescales the SPD to a target flux over the
+        // mesh's total area; to keep emission-on-hit consistent (and not disturb the
+        // material if it is shared with a non-emissive or differently-scaled mesh), the
+        // scaled case clones the material, rebinds this range's triangles to the clone,
+        // and registers the emitter against the clone. Only the single-material OBJ/FBX
+        // path is handled (glTF meshes that import their own materials are not auto-lit).
+        if (id >= 0 && id < (int)L.scene.mats.size() && L.scene.mats[id].isLight &&
+            L.scene.tris.size() > triStart) {
+            size_t triEnd = L.scene.tris.size();
+            // Orient a CLOSED emissive mesh outward. Emission is one-sided (radiates
+            // along each triangle's geometric normal / front face only), so an
+            // inward-wound imported shell — e.g. torus.obj, all faces wound toward the
+            // interior — would emit into its own hollow and look black from outside.
+            // Detect closure via the signed volume about the centroid: for a closed
+            // shell |V| = enclosed volume and sign follows the winding (negative =
+            // inward); for a planar/open sheet V≈0. If V is negative AND large enough to
+            // be a real enclosed volume (thresholded against area^1.5 so open meshes are
+            // never touched), reverse every triangle's winding so its front face — and
+            // thus its emission — points OUTWARD. This runs before emitter registration
+            // so both the per-Tri geometric normals used by emission-on-hit and the
+            // addMeshLight sampler normals come out consistent.
+            {
+                size_t n = triEnd - triStart;
+                Vec3 cen{0, 0, 0};
+                for (size_t t = triStart; t < triEnd; ++t) {
+                    const Tri& tr = L.scene.tris[t];
+                    cen = cen + tr.v0 + tr.v1 + tr.v2;
+                }
+                cen = cen / (3.0 * (double)n);
+                double vol = 0.0, area2 = 0.0;
+                for (size_t t = triStart; t < triEnd; ++t) {
+                    const Tri& tr = L.scene.tris[t];
+                    Vec3 a = tr.v0 - cen, bb = tr.v1 - cen, cc = tr.v2 - cen;
+                    vol += dot(a, cross(bb, cc));
+                    area2 += length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
+                }
+                vol /= 6.0;
+                double area = 0.5 * area2;
+                if (vol < -1e-6 * std::pow(area, 1.5)) {
+                    for (size_t t = triStart; t < triEnd; ++t) {
+                        Tri& tr = L.scene.tris[t];
+                        std::swap(tr.v1, tr.v2);
+                        std::swap(tr.uv1, tr.uv2);
+                        std::swap(tr.n1, tr.n2);
+                        tr.finalize();
+                    }
+                }
+            }
+            if (find(b, "power") || find(b, "lumens")) {
+                // Total front-facing area of the range → power law geomW = area*PI.
+                double area = 0.0;
+                for (size_t t = triStart; t < triEnd; ++t) {
+                    const Tri& tr = L.scene.tris[t];
+                    area += 0.5 * length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
+                }
+                Spectrum scaled = absPower(b, L.scene.mats[id].emit, area * PI, L);
+                Material clone = L.scene.mats[id];
+                clone.emit = scaled;
+                int newId = (int)L.scene.mats.size();
+                L.scene.mats.push_back(std::move(clone));
+                for (size_t t = triStart; t < triEnd; ++t) L.scene.tris[t].matId = newId;
+                L.scene.addMeshLight(triStart, triEnd - triStart, scaled, binWidth_, newId);
+            } else {
+                L.scene.addMeshLight(triStart, triEnd - triStart,
+                                     L.scene.mats[id].emit, binWidth_, id);
+            }
+        }
         // Record the loaded mesh's world AABB for object-name fog bounds (a mesh bound
         // is approximated by its box — true containment is deferred, see known-issues).
         if (!b.name.empty() && L.scene.tris.size() > triStart) {
@@ -2306,9 +3605,8 @@ private:
 
         bool loadUV = (strOf(b, "uv") == "use_mesh");
         bool useNames = (strOf(b, "usemtl") == "use_names");
-        MtlResolver resolver = [this](const std::string& nm) -> int {
-            auto it = matIndex_.find(nm);
-            return (it == matIndex_.end()) ? -1 : it->second;
+        MtlResolver resolver = [this, &L](const std::string& nm) -> int {
+            return lookupMaterial(nm, L);   // resolves a free `a` to albedo_default
         };
         // Load into local space (identity transform) at the END of Scene::tris, then
         // move those triangles out into a private BLAS. The unit scale is NOT folded in
@@ -2441,6 +3739,7 @@ private:
         for (const auto& s : b.stmts) {
             const Block* cb = s.val.block.get();
             if (!cb) continue;
+            s.used = true;   // a child block: dispatched below, or rejected by name
             if      (s.key == "sphere")   { if (!addSphere(*cb, L, world)) return false; }
             else if (s.key == "quad")     { if (!addQuad(*cb, L, world)) return false; }
             else if (s.key == "triangle") { if (!addTriangle(*cb, L, world)) return false; }
@@ -2554,7 +3853,13 @@ private:
         std::string expr;
         for (size_t k = 0; k < es->val.words.size(); ++k) { if (k) expr += " "; expr += es->val.words[k]; }
         std::vector<PatNode> prog; std::string perr;
-        if (!compilePatternExpr(expr, prog, perr)) { fail("function expr: " + perr); return false; }
+        // `&tableScope_` (but NOT texScope_): the field evaluators are handed the scene's
+        // grid:/scatter: tables, so a `function` leaf can BE a measured volume or height
+        // field — `expr "grid:terrain(x, z) - y"`. There is no shading context here, so
+        // `tex:` (which needs u,v from a hit) stays unavailable and fails to compile.
+        if (!compilePatternExpr(expr, prog, perr, /*allowT=*/false, nullptr, &tableScope_)) {
+            fail("function expr: " + perr); return false;
+        }
         Affine L2W;
         for (int k = 0; k < 9; ++k) L2W.m[k] = L_ * authoredXf.m[k];
         L2W.t = authoredXf.t * L_;
@@ -2604,6 +3909,7 @@ private:
         int nChild = 0;
         for (const auto& cs : b->stmts) {
             if (!cs.val.block) continue;              // transform-only / k stmts carry no block
+            cs.used = true;   // a nested field element, validated by name on recursion
             if (!buildFieldStmt(cs, xf, out, exprPool)) return false;
             if (++nChild >= 2) { FieldNode c; c.op = op; c.p[0] = kBlend; out.push_back(c); }
         }
@@ -2622,7 +3928,10 @@ private:
         int nRoot = 0;
         for (const auto& cs : b.stmts) {
             if (!cs.val.block) continue;              // skip material/translate/rotate/scale
-            if (cs.key == "contained_by") continue;   // container box, not a field element
+            // The container box is read below (only the `function { }` branch requires
+            // one, but it is always meaningful), not treated as a field element here.
+            if (cs.key == "contained_by") { cs.used = true; continue; }
+            cs.used = true;   // a field element, validated by name in buildFieldStmt
             if (!buildFieldStmt(cs, rootXf, nodes, exprPool)) return false;
             ++nRoot;
         }
@@ -2691,8 +4000,14 @@ private:
                           !(openV == "off" || openV == "false" || openV == "no" || openV == "0");
             im.capped = !isOpen;
             double mg = dblOf(b, "max_gradient", 0.0);
+            // The Lipschitz probe must see the SAME field the marcher will: a
+            // `grid:`-sampling formula evaluated without the tables reads 0 everywhere,
+            // whose estimated slope is 0 — an unusably tiny bound. The data pass runs
+            // before geometry, so the tables are already loaded here.
+            const PatTables tabs = L.scene.patTables();
             im.lipschitz = (mg > 0.0) ? mg
-                                      : 1.3 * estimateFieldLipschitz(im.nodes, im.exprNodes, box);
+                                      : 1.3 * estimateFieldLipschitz(im.nodes, im.exprNodes, box,
+                                                                     /*grid=*/24, &tabs);
             double acc = dblOf(b, "accuracy", 0.0);
             im.minStep = (acc > 0.0) ? acc * L_ : implicitMinStep(box);
         } else {
@@ -2792,7 +4107,26 @@ private:
         // When no bareword subtype was parsed (empty), fall back to the property.
         // Old default point/area lights have no `kind`, so they stay empty as before.
         if (subtype.empty()) subtype = strOf(b, "kind", "");
-        Spectrum spd = spectrumParam(b, "spd", blackbody(6500.0));
+        // A light block's emission slot is spelled `spd`, so its pattern spellings are
+        // `spd pattern:p` (the pattern IS the profile) and `spd_map pattern:p` (modulate
+        // the authored SPD) — the same pair a material spells `emit` / `emit_map`. Only
+        // the default rectangular quad below can carry one: it is the one light subtype
+        // whose emitter samples a (u,v) that provably matches the geometry it drops into
+        // the scene. Note `power`/`lumens` still normalise the UNPATTERNED SPD, so a
+        // pattern that averages 0.5 emits half the requested flux (see Material::emitPat).
+        int spdPat = -1;
+        Spectrum spd = patternedSpectrumParam(b, "spd", "spd_map", spdPat, blackbody(6500.0));
+        // Everything NOT in this list falls through to the rectangular quad at the
+        // bottom (`` and `area` both spell the default), which is the only subtype that
+        // can honour a pattern.
+        if (spdPat >= 0 && (subtype == "collimated" || subtype == "sphere" ||
+                            subtype == "cylinder" || subtype == "spot" ||
+                            subtype == "env" || subtype == "sun")) {
+            fail("an spd pattern is only supported on the default rectangular area light — "
+                 "a '" + subtype + "' light samples positions that no surface (u,v) "
+                 "corresponds to, so the pattern would be silently ignored");
+            return false;
+        }
         // Uniform scale of the enclosing group chain (spheres/pencils scale by it;
         // a non-uniform scale is only meaningful for the flat quad/mesh emitters).
         bool nonUniform = false; double s = xf.uniformScale(nonUniform);
@@ -2893,6 +4227,40 @@ private:
             L.scene.addSpotLight(P(xf.apply(o)), normalize(xf.applyDir(dir)), cosInner, cosOuter, spd, binWidth_);
             return true;
         }
+        if (subtype == "sun") {
+            // Distant directional sun: an infinitely-far disc of angular radius
+            // `angle`/2 about `dir`, so every point of the scene sees it in the same
+            // direction at the same radiance. Aim it either with `dir` (pointing TO the
+            // sun, like the sky block's `sun_dir`) or with `elevation`/`azimuth` in
+            // degrees. `angle` is the full angular DIAMETER in degrees (default 0.53,
+            // the real sun); widening it only softens shadows, because `spd` is the
+            // perpendicular IRRADIANCE, which is what fixes the exposure.
+            Vec3 dir{0.3, 0.6, 0.2};
+            if (!vec3Of(b, "dir", dir)) {
+                double el = dblOf(b, "elevation", 45.0) * PI / 180.0;
+                double az = dblOf(b, "azimuth", 0.0) * PI / 180.0;
+                dir = Vec3{std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az)};
+            }
+            if (find(b, "power") || find(b, "lumens")) {
+                fail("sun light: absolute `power`/`lumens` is not supported (a distant "
+                     "light's flux depends on the scene's cross-section); use `spd` "
+                     "(perpendicular irradiance) or `intensity` instead");
+                return false;
+            }
+            double halfAng = 0.5 * dblOf(b, "angle", 0.53) * PI / 180.0;
+            if (halfAng <= 0.0) {
+                fail("sun light: `angle` (angular diameter, degrees) must be > 0"); return false;
+            }
+            if (halfAng >= PI * 0.5) {
+                fail("sun light: `angle` must be under 180 degrees (it is a cone, not a "
+                     "whole sphere — use an `env` light for that)"); return false;
+            }
+            double inten = dblOf(b, "intensity", 1.0);
+            Spectrum irr = (inten == 1.0) ? spd
+                                          : Spectrum([spd, inten](double w) { return spd(w) * inten; });
+            L.scene.addSunLight(normalize(xf.applyDir(dir)), halfAng, irr, binWidth_);
+            return true;
+        }
         if (subtype == "env") {
             // Environment light. With a `file` it is an image-based (lat-long) env:
             // each texel is upsampled to a physical emission spectrum and directions
@@ -2904,6 +4272,63 @@ private:
                 fail("env light: absolute `power`/`lumens` is not supported (the env's "
                      "phase-space weight depends on scene bounds); use `intensity` or "
                      "scale the `spd` instead"); return false;
+            }
+            // Analytic physical sky (Preetham): `sky preetham` / `kind preetham`, or
+            // simply the presence of `turbidity` / `sun_dir` / `sun_elevation`. Bakes
+            // an equirectangular Preetham daylight sky (with a spectrally attenuated
+            // solar disk) into an EnvMap, so it lights the scene exactly like an HDRI.
+            std::string kind = strOf(b, "kind"); if (kind.empty()) kind = strOf(b, "sky");
+            bool isSky = (kind == "preetham" || kind == "sky") ||
+                         find(b, "turbidity") || find(b, "sun_dir") || find(b, "sun_elevation");
+            if (isSky) {
+                Vec3 sunDir{0.3, 0.6, 0.2};
+                if (!vec3Of(b, "sun_dir", sunDir)) {
+                    // Elevation (deg above horizon) + azimuth (deg from +x toward +z).
+                    double el = dblOf(b, "sun_elevation", 45.0) * PI / 180.0;
+                    double az = dblOf(b, "sun_azimuth", 0.0) * PI / 180.0;
+                    sunDir = Vec3{std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az)};
+                }
+                double turb = dblOf(b, "turbidity", 2.5);
+                double gAlb = dblOf(b, "ground_albedo", 0.3);
+                double inten = dblOf(b, "intensity", 1.0);
+                int res = (int)dblOf(b, "res", 1024.0);
+                if (res < 16) res = 16; if (res > 8192) res = 8192;
+                int sw = res, sh = res / 2;
+                // `sun_disk on` (default) bakes the solar disk into the map, as before.
+                // `sun_disk off` leaves the map as pure skylight; `sun_disk separate`
+                // ALSO registers an equivalent first-class `sun` emitter, which is the
+                // fast-converging form: the ~10^5x brighter sun is then sampled
+                // directly instead of having to be found inside 6.8e-5 sr of texels.
+                std::string diskStr = strOf(b, "sun_disk", "on");
+                bool diskOn = (diskStr == "on" || diskStr == "true" || diskStr == "yes" ||
+                               diskStr == "baked");
+                bool diskSep = (diskStr == "separate" || diskStr == "light" ||
+                                diskStr == "emitter");
+                bool diskOff = (diskStr == "off" || diskStr == "false" || diskStr == "no" ||
+                                diskStr == "none");
+                if (!diskOn && !diskSep && !diskOff) {
+                    fail("env sky: `sun_disk` must be one of on / off / separate (got '" +
+                         diskStr + "')"); return false;
+                }
+                sky::SunDisk disk;
+                std::vector<Vec3> img = sky::generatePreethamSky(sw, sh, sunDir, turb, gAlb,
+                                                                 inten, diskOn, &disk);
+                auto map = std::make_shared<EnvMap>();
+                std::string eerr;
+                if (!map->buildFromRgb(img, sw, sh, dblOf(b, "rotate", 0.0), 1.0, eerr)) {
+                    fail("env sky: " + eerr); return false;
+                }
+                L.scene.addEnvLight(std::move(map), binWidth_);
+                if (diskSep && disk.present) {
+                    // The map was rotated about +y by `rotate`; rotate the sun with it so
+                    // the separate emitter still lands where the sky says it does.
+                    double rot = dblOf(b, "rotate", 0.0) * PI / 180.0;
+                    double cs = std::cos(rot), sn = std::sin(rot);
+                    Vec3 d = disk.dir;
+                    Vec3 dRot{d.x * cs - d.z * sn, d.y, d.x * sn + d.z * cs};
+                    L.scene.addSunLight(dRot, disk.halfAngle, disk.irradiance, binWidth_);
+                }
+                return true;
             }
             std::string file = strOf(b, "file");
             if (!file.empty()) {
@@ -2932,10 +4357,18 @@ private:
         Vec3 nw = normalize(xf.applyDir(nrm));
         spd = absPower(b, spd, length(cross(us, vs)) * PI, L);
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
+        lm.emitPat = spdPat;
         int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
         Vec3 a = os, bb = os + us, cc = os + us + vs, dd = os + vs;
+        // UVs must equal the emitter's own (u,v) parameterisation — Emitter::samplePoint
+        // returns the bilinear (u1,u2) of `origin + us*u1 + vs*u2`, so corner a is (0,0),
+        // bb is (1,0), cc is (1,1) and dd is (0,1). The first tri's defaults already say
+        // that; the second's did NOT (it inherited (0,0),(1,0),(1,1) for corners a,cc,dd),
+        // which put a seam down the diagonal of any UV-driven emission pattern — and,
+        // before this change, of any texture applied to an area light's quad.
         L.scene.tris.push_back(Tri{a, bb, cc, id, -1, {}});
-        L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {}});
+        L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {},
+                                   Vec3{0, 0, 0}, Vec3{1, 1, 0}, Vec3{0, 1, 0}});
         L.scene.addAreaLight(os, us, vs, nw, length(cross(us, vs)), spd, binWidth_,
                              /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/id);
         return true;
@@ -3011,7 +4444,8 @@ private:
                     // Inside-sign auto-detect: SDF/CSG fields are negative inside, so a
                     // point deep in the AABB (its center) reads f<0 => inside == (f<0).
                     Vec3 ctr = (im.bounds.lo + im.bounds.hi) * 0.5;
-                    med.boundInsideNeg = (im.eval(ctr) <= 0.0);
+                    const PatTables btabs = L.scene.patTables();   // field may sample grid:/scatter:
+                    med.boundInsideNeg = (im.eval(ctr, &btabs) <= 0.0);
                 } else if (auto mit = meshAabbByName_.find(onm); mit != meshAabbByName_.end()) {
                     const Aabb& box = mit->second;
                     med.bounded = true;
@@ -3070,6 +4504,11 @@ private:
                         fail("medium density: " + verr); return false;
                     }
                     med.vdb = grid;
+                    std::fprintf(stderr,
+                        "[vdb] density '%s': %dx%dx%d, world AABB [%.3g %.3g %.3g]..[%.3g %.3g %.3g], peak %.4g\n",
+                        path.c_str(), grid->nx, grid->ny, grid->nz,
+                        grid->wmin.x, grid->wmin.y, grid->wmin.z,
+                        grid->wmax.x, grid->wmax.y, grid->wmax.z, (double)grid->maxVal);
                     // Seed the bound from the grid's world AABB unless one is authored.
                     if (!med.bounded) {
                         med.bounded = true;
@@ -3080,9 +4519,10 @@ private:
                     double dmax = dblOf(b, "density_max", 0.0);
                     med.densityMax = (dmax > 0.0) ? dmax
                                                   : std::max(1e-6, (double)grid->maxVal * 1.05);
-                    L.scene.media.push_back(std::move(med));
-                    return true;
-                }
+                    // NOTE: fall through (no early return) so a `temperature vdb:` /
+                    // `emission` block below can add volumetric blackbody emission to
+                    // this same imported volume (fire).
+                } else {
                 std::vector<PatNode> prog;
                 if (w0.rfind("pattern:", 0) == 0) {
                     std::string nm = w0.substr(8);
@@ -3095,7 +4535,11 @@ private:
                     std::string expr;
                     for (size_t k = 0; k < ds->val.words.size(); ++k) { if (k) expr += " "; expr += ds->val.words[k]; }
                     std::string perr;
-                    if (!compilePatternExpr(expr, prog, perr)) {
+                    // `&tableScope_`, no texScope_: densityAt is handed the scene's tables
+                    // (see Medium::densityAt), so `density "grid:rho(x, y, z)"` samples a
+                    // measured volume without going through `vdb:`; there is no hit here,
+                    // so `tex:` remains a compile error.
+                    if (!compilePatternExpr(expr, prog, perr, /*allowT=*/false, nullptr, &tableScope_)) {
                         fail("medium density: " + perr); return false;
                     }
                 }
@@ -3116,19 +4560,83 @@ private:
                     const Vec3& hi = med.bmax;
                     const int NS = 24;
                     double peak = 0.0;
+                    const PatTables tabs = L.scene.patTables();
                     for (int iz = 0; iz <= NS; ++iz)
                     for (int iy = 0; iy <= NS; ++iy)
                     for (int ix = 0; ix <= NS; ++ix) {
                         Vec3 p{ lo.x + (hi.x - lo.x) * ix / NS,
                                 lo.y + (hi.y - lo.y) * iy / NS,
                                 lo.z + (hi.z - lo.z) * iz / NS };
-                        peak = std::max(peak, med.densityAt(p));
+                        // Real tables: the majorant must be estimated from the SAME field
+                        // the renderer samples, or a `grid:`-driven density would majorise
+                        // to 0 and the medium would vanish. The data pass runs before this
+                        // one, so L.scene.grids/scatters/dataPool are already populated.
+                        peak = std::max(peak, med.densityAt(p, &tabs));
                     }
                     dmax = 1.3 * peak;
                 }
                 med.densityMax = (dmax > 0.0) ? dmax : 1.0;
+                }   // end else (formula density)
             }
         }
+
+        // ---- Optional volumetric blackbody EMISSION (fire) -----------------------
+        // `temperature vdb:"fire.vdb"` (or `vdb:fire.vdb`) imports a second grid
+        // giving per-voxel temperature in Kelvin; combined with `emission blackbody`
+        // it makes the medium a self-illuminating volumetric emitter (hot voxels
+        // glow, Planck-shaped by their temperature). `emission_scale <v>` scales the
+        // glow (default 1). A fire `.vdb` typically carries both a "density" and a
+        // "temperature" float grid, so the usual authoring is:
+        //     medium { density vdb:fire.vdb  temperature vdb:fire.vdb
+        //              emission blackbody  emission_scale 2.0 }
+        // where each `vdb:` selects the like-named grid out of the multi-grid file.
+        if (const Stmt* ts = find(b, "temperature")) {
+            if (ts->val.words.empty()) { fail("medium `temperature` needs a `vdb:<file>`"); return false; }
+            const std::string& w0 = ts->val.words[0];
+            if (!(w0 == "vdb:" || w0.rfind("vdb:", 0) == 0)) {
+                fail("medium `temperature` only supports an imported grid: `temperature vdb:<file>`");
+                return false;
+            }
+            std::string path = (w0 == "vdb:")
+                ? (ts->val.words.size() > 1 ? ts->val.words[1] : std::string())
+                : w0.substr(4);
+            if (path.empty()) { fail("medium `temperature vdb:` needs a file path"); return false; }
+            auto tgrid = std::make_shared<VdbGrid>();
+            std::string verr;
+            // Select the "temperature" grid by name out of the (possibly multi-grid) file.
+            if (!loadVdbGrid(path, *tgrid, verr, "temperature")) {
+                fail("medium temperature: " + verr); return false;
+            }
+            med.temperature = tgrid;
+            med.tempPeak = std::max(1e-6, (double)tgrid->maxVal);
+            std::fprintf(stderr,
+                "[vdb] temperature '%s': %dx%dx%d, world AABB [%.3g %.3g %.3g]..[%.3g %.3g %.3g], peak %.4gK\n",
+                path.c_str(), tgrid->nx, tgrid->ny, tgrid->nz,
+                tgrid->wmin.x, tgrid->wmin.y, tgrid->wmin.z,
+                tgrid->wmax.x, tgrid->wmax.y, tgrid->wmax.z, (double)tgrid->maxVal);
+            // If nothing else seeded the medium's bound, use the temperature grid's AABB.
+            if (!med.bounded) {
+                med.bounded = true;
+                med.boundShape = MediumBound::Box;
+                med.bmin = tgrid->wmin;
+                med.bmax = tgrid->wmax;
+            }
+        }
+        // `emission blackbody` (the only model today) turns emission on; it is also
+        // implied whenever a `temperature` grid is present. `emission_scale` tunes it.
+        if (const Stmt* es = find(b, "emission")) {
+            std::string kind = es->val.words.empty() ? std::string("blackbody") : es->val.words[0];
+            if (kind != "blackbody") {
+                fail("medium `emission " + kind + "` is not a known emission model (use `blackbody`)");
+                return false;
+            }
+            if (!med.temperature) {
+                fail("medium `emission blackbody` needs a `temperature vdb:<file>` grid to emit from");
+                return false;
+            }
+        }
+        med.emissionScale = dblOf(b, "emission_scale", med.emissionScale);
+        med.emitKelvin    = dblOf(b, "emission_kelvin", med.emitKelvin);
 
         // ---- Optional gradient-index (GRIN) refractive field n(x,y,z) ------------
         // `ior pattern:<name>` (a named pattern) or `ior "<expr>"` (inline infix
@@ -3155,7 +4663,10 @@ private:
                 std::string expr;
                 for (size_t k = 0; k < is->val.words.size(); ++k) { if (k) expr += " "; expr += is->val.words[k]; }
                 std::string perr;
-                if (!compilePatternExpr(expr, prog, perr)) {
+                // `&tableScope_`, no texScope_: the Eikonal marcher hands nAt/gradNAt the
+                // scene's tables, so a MEASURED index volume can bend rays —
+                // `ior "1 + grid:n(x, y, z)"` (an atmospheric profile, a GRIN lens blank).
+                if (!compilePatternExpr(expr, prog, perr, /*allowT=*/false, nullptr, &tableScope_)) {
                     fail("medium ior: " + perr); return false;
                 }
             }
@@ -3433,6 +4944,7 @@ private:
         int nSurf = 0;
         for (const auto& s : lb.stmts) {
             if (s.key != "surface") continue;
+            s.used = true;
             const auto& wds = s.val.words;
             if (wds.size() < 4) { fail("camera '" + cs.name + "' lens: `surface` needs "
                                        "<radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]"); return false; }
@@ -3601,6 +5113,7 @@ private:
         std::vector<Key> keys;
         for (const auto& s : b.stmts) {
             if (s.key != "key") continue;
+            s.used = true;
             const auto& w = s.val.words;
             size_t n = w.size();
             if (n != 4 && n != 5 && n != 7 && n != 8) {
@@ -3801,6 +5314,7 @@ private:
         std::vector<Vec3> pts;
         for (const auto& s : b.stmts) {
             if (s.key != "point") continue;
+            s.used = true;
             if (s.val.words.size() < 3) { fail("camera_curve '" + base + "' point needs x y z"); return false; }
             pts.push_back(P(Vec3{num(s.val.words[0]), num(s.val.words[1]), num(s.val.words[2])}));
         }
@@ -3835,6 +5349,7 @@ private:
         std::vector<DKey> dkeys;
         for (const auto& s : b.stmts) {
             if (s.key != "density_at") continue;
+            s.used = true;
             if (s.val.words.size() < 2) { fail("camera_curve '" + base + "' density_at needs: <t> <rho>"); return false; }
             dkeys.push_back({num(s.val.words[0]), num(s.val.words[1]) / L_});
         }
@@ -3920,6 +5435,7 @@ private:
         std::vector<Vec3> lookPts;
         for (const auto& s : b.stmts) {
             if (s.key != "look_point") continue;
+            s.used = true;
             if (s.val.words.size() < 3) { fail("camera_curve '" + base + "' look_point needs x y z"); return false; }
             lookPts.push_back(P(Vec3{num(s.val.words[0]), num(s.val.words[1]), num(s.val.words[2])}));
         }
@@ -3958,6 +5474,7 @@ private:
             ScalarTrack tk;
             for (const auto& s : b.stmts) {
                 if (s.key != atKey) continue;
+                s.used = true;
                 if (s.val.words.size() < 2) {
                     fail("camera_curve '" + base + "' " + atKey + " needs: <t> <value>");
                     trkOk = false; continue;
@@ -4038,7 +5555,9 @@ private:
                     recOk = false; return;
                 }
             std::vector<PatNode> drv; std::string cerr;
-            if (!compilePatternExpr(dexpr, drv, cerr, /*allowT=*/true)) {
+            // `&tableScope_`: recSample below binds the scene's tables, so a flyby track
+            // can be driven by MEASURED data over the timeline — `fov_from lens.fov(grid:zoom(t))`.
+            if (!compilePatternExpr(dexpr, drv, cerr, /*allowT=*/true, nullptr, &tableScope_)) {
                 fail("camera_curve '" + base + "' " + key + " driver '" + dexpr + "': " + cerr);
                 recOk = false; return;
             }
@@ -4061,6 +5580,7 @@ private:
         // the PatCtx only needs `t`.
         auto recSample = [&](const RecTrack& rt, double fr) -> double {
             PatCtx c{}; c.t = fr;
+            bindPatData(c, L.scene);   // grid:/scatter: in the driver (see the compile site)
             double d = rt.driver.empty() ? fr : patternEval(rt.driver.data(), (int)rt.driver.size(), c);
             const Record& rec = L.scene.records[(size_t)rt.recIdx];
             return recSampleScalar(rec, rec.channels[(size_t)rt.chanIdx], d, c);
@@ -4087,6 +5607,7 @@ private:
             Vec3Track tk;
             for (const auto& s : b.stmts) {
                 if (s.key != atKey) continue;
+                s.used = true;
                 if (s.val.words.size() < 4) {
                     fail("camera_curve '" + base + "' " + atKey + " needs: <t> <x> <y> <z>");
                     vecTrkOk = false; continue;
@@ -4445,12 +5966,18 @@ inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
 inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
                        Loaded& L, std::string& err,
                        const SupportFn& supported = {}) {
-    Parser p; p.t = tokenize(src);
-    std::vector<Block> blocks = p.parseTop();
-    if (!p.err.empty()) { err = p.err; return false; }
+    // Report the keys nothing in the loader read. A warning rather than an error:
+    // the check is new, and an old scene carrying a stale property should still
+    // render — but it must SAY so, because the alternative (today's behaviour) is
+    // that the property silently does nothing and the author blames the renderer.
+    auto reportUnknownKeys = [&](const Loaded& out) {
+        for (const std::string& w : out.unknownKeys)
+            std::fprintf(stderr, "[ftsl] warning: %s: %s\n", nameForMsgs.c_str(), w.c_str());
+    };
 
-    // J3c validation shim (non-authoritative); see load() below and src/gpda/ftsl_shim.hpp.
-    ftsl_shim::validate(src, blocks, nameForMsgs);
+    // The shared grammar (src/gpda/ftsl_frontend.hpp) is the only front end.
+    std::vector<Block> blocks;
+    if (!ftsl_gpda::parse(src, blocks, err)) return false;
 
     // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
     std::vector<size_t> preferIdx;
@@ -4460,6 +5987,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     if (preferIdx.empty()) {
         Builder bld;
         if (!bld.build(blocks, L)) { err = bld.err; return false; }
+        reportUnknownKeys(L);
         return true;
     }
 
@@ -4535,6 +6063,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     for (size_t j = 0; j < preferIdx.size(); ++j)
         std::printf("[prefer] using branch %d of %d\n",
                     choice[j] + 1, (int)blocks[preferIdx[j]].branches.size());
+    reportUnknownKeys(L);
     return true;
 }
 

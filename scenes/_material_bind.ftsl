@@ -1,0 +1,128 @@
+# Regression scene for **materials as parameterized bundles** — the uniform named-input
+# binding / rebinding surface (ROADMAP_records.md §3.2/§3.3, TODO §J3b item 3).
+#
+# A material is a bundle of slot->expression bindings and is itself a FUNCTION: its
+# free-input set is the union of its slots' free inputs.  Applying it at a use site
+# binds those inputs across the whole bundle at once:
+#
+#     material = gold(u=v,a=1)      # bind u<-v, a<-1
+#     material = gold(u=v a=1)      # identical -- the arg list uses the same §7.5 ladder
+#     material = gold(u=v)          # partial: `a` falls back to `albedo_default`
+#     material = gold(v*2)          # positional: binds the sole still-free input
+#
+# `a` (albedo) is the one named input with NO per-hit intrinsic, so an unbound `a` is
+# resolved at LOAD time to the material's `albedo_default` (default 1.0).
+#
+# The argument list MAY contain spaces (`gold(a=1, u=v)`, `gold(0.5*u + 0.5*v)`): the
+# shared grammar lexes a BALANCED paren group as part of one WORD, so a space only ends a
+# value while no parens are open.  C4 below is deliberately spelled with spaces so this
+# scene regresses that; it must measure identically to the unspaced spelling.
+#
+# --- why FLAT TILES and not spheres ---------------------------------------------------
+# Every test surface is a camera-facing QUAD, because `addQuad` gives a quad UVs that span
+# the parallelogram (origin=(0,0), +u=(1,0), +v=(0,1)).  So the material's `u` input IS the
+# tile's horizontal axis and `v` IS its vertical axis: rebinding `u=v` visibly ROTATES the
+# gradient from left-right to bottom-top.  On a sphere the same rebinding is nearly
+# unreadable, and a curved surface mixes albedo with shading falloff so flat brightness
+# can't be compared across tiles at all.  Every material here is DIFFUSE with a greyscale
+# pattern albedo, so a binding reads directly as tile BRIGHTNESS / gradient DIRECTION.
+#
+# The room is neutral grey on purpose — no coloured walls, because colour bleed would
+# contaminate the very thing being read.  The two full-width strip lights (ceiling + floor,
+# aimed at the backdrop) make illumination roughly uniform in x and balanced in y, so
+# tiles in the same row are directly comparable.
+#
+# --- the three IDENTITY PAIRS (the actual regression asserts) -------------------------
+#   A2 == A4   binding `a=0.5` must look exactly like a literal `reflect 0.5`
+#   B2 == B3   named `u=v` must look exactly like the positional `(v)`
+#   C1 == C2   comma and comma-less argument lists must be identical
+# Any visible difference within a pair is a bug.
+#
+# --- MEASURED at v0.87.0 (mode B, 120 s, 320^2) ---------------------------------------
+# Tile means normalised against the backdrop strip just below each row (the backdrop is
+# also albedo 0.5, so the ratio cancels the lighting profile).  Within a row, tiles share
+# a y and so are directly comparable; across rows they are not (the strip lights make
+# illumination vary with height).
+#     A1 0.610   A2 1.103   A3 1.522   A4 1.106      -> A1<A2<A3 tracks 0.15<0.5<1.0,
+#                                                       and A2 vs A4 agree to 0.3%
+#     B1 du=+39 dv= 0   B2 du= 0 dv=+37              -> bare = horizontal, u=v = vertical
+#     B3 du= 0 dv=+37   B4 du=-38 dv= 0              -> B2 vs B3 agree to 0.1%; 1-u flips
+#     C1/C2 dv=+21 @a=0.3   C3 dv=+36 @a=1           -> C1 vs C2 agree to 2.4%
+#     C4 du=+15 dv=+14                               -> 0.5*u+0.5*v is a 45-degree diagonal
+# (du = mean(right half) - mean(left half); dv = mean(top half) - mean(bottom half).)
+#
+# Parse-check with:  ftrace scenes/_material_bind.ftsl -parseonly
+# Semantics are pinned deterministically by:  ftrace -checkbind
+scene { units meters }
+
+# --- patterns that leave named inputs FREE -------------------------------------------
+# `a` stays unresolved until a material uses the pattern; applyMaterial then resolves it
+# against THAT material, so one pattern can serve several different albedos.
+pattern "alb_a"  { expr "a"                 }   # free: a        -> flat albedo
+pattern "alb_u"  { expr "0.05+0.9*u"        }   # free: u        -> gradient along u
+pattern "alb_ua" { expr "a*(0.05+0.9*u)"    }   # free: a, u     -> scaled gradient
+
+# --- the bundles ----------------------------------------------------------------------
+# One free input (`a`), with an authored fallback.  Used bare, `a` -> 0.15 (dark).
+material "flat_a" { type diffuse  reflect pattern:alb_a  albedo_default 0.15 }
+
+# One free input (`a`) and NO albedo_default -> the system default 1.0 (bright).
+material "flat_a1" { type diffuse  reflect pattern:alb_a }
+
+# One free input (`u`) -> positional application is legal.
+material "grad_u" { type diffuse  reflect pattern:alb_u }
+
+# Two free inputs (`a`, `u`) -> a lone positional is an error; bind by name (or bind one
+# by name and let the positional take the one that is left).
+material "grad_ua" { type diffuse  reflect pattern:alb_ua  albedo_default 0.9 }
+
+material "grey"  { type diffuse  reflect 0.5 }    # room
+material "ref05" { type diffuse  reflect 0.5 }    # literal reference tile for A2
+
+# --- the room: neutral grey, open toward the camera -----------------------------------
+quad { origin 0 0 0     u 1 0 0    v 0 1 0    material grey }   # backdrop (z=0)
+quad { origin 0 0 0     u 1 0 0    v 0 0 1.2  material grey }   # floor
+quad { origin 0 1 0     u 0 0 1.2  v 1 0 0    material grey }   # ceiling
+quad { origin 0 0 0     u 0 0 1.2  v 0 1 0    material grey }   # left
+quad { origin 1 0 0     u 0 1 0    v 0 0 1.2  material grey }   # right
+
+# --- row A (y 0.68..0.90): binding `a` is visible as flat BRIGHTNESS -------------------
+# A1 bare use -> albedo_default 0.15 (darkest)
+quad { origin 0.04 0.68 0.006  u 0.20 0 0  v 0 0.22 0  material flat_a }
+# A2 rebinding `a` at the use site overrides the default -> 0.5
+quad { origin 0.28 0.68 0.006  u 0.20 0 0  v 0 0.22 0  material flat_a(a=0.5) }
+# A3 no albedo_default authored -> `a` = 1.0 (brightest)
+quad { origin 0.52 0.68 0.006  u 0.20 0 0  v 0 0.22 0  material flat_a1 }
+# A4 literal 0.5 — MUST be indistinguishable from A2
+quad { origin 0.76 0.68 0.006  u 0.20 0 0  v 0 0.22 0  material ref05 }
+
+# --- row B (y 0.39..0.61): binding `u` is visible as gradient DIRECTION ----------------
+# B1 bare: gradient runs along the tile's u axis (left -> right)
+quad { origin 0.04 0.39 0.006  u 0.20 0 0  v 0 0.22 0  material grad_u }
+# B2 rebound to v: the same gradient now runs bottom -> top
+quad { origin 0.28 0.39 0.006  u 0.20 0 0  v 0 0.22 0  material grad_u(u=v) }
+# B3 positional == named, since grad_u has exactly one free input — MUST match B2
+quad { origin 0.52 0.39 0.006  u 0.20 0 0  v 0 0.22 0  material grad_u(v) }
+# B4 bound to an arbitrary EXPRESSION of the consumer's own inputs -> gradient reversed
+quad { origin 0.76 0.39 0.006  u 0.20 0 0  v 0 0.22 0  material grad_u(1-u) }
+
+# --- row C (y 0.10..0.32): two inputs, several spellings ------------------------------
+# C1/C2 comma and comma-less argument lists are identical (the §7.5 ladder)
+quad { origin 0.04 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material grad_ua(a=0.3,u=v) }
+quad { origin 0.28 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material grad_ua(a=0.3 u=v) }
+# C3 named `a` leaves exactly one free input, so a positional may take `u`
+quad { origin 0.52 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material grad_ua(v,a=1) }
+# C4 partial: `u` bound to an expression, `a` falls back to albedo_default 0.9 -> diagonal.
+# Spelled with SPACES on purpose — must measure identically to `grad_ua(u=0.5*u+0.5*v)`.
+quad { origin 0.76 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material grad_ua(u=0.5*u + 0.5*v) }
+
+# --- lighting: two full-width strips aimed at the backdrop ----------------------------
+# Uniform in x (so tiles in a row are comparable) and balanced top/bottom.
+light area { origin 0 0.995 0.10  u 1 0 0  v 0 0 0.40  normal 0 -1 0  spd preset:bb6500 }
+light area { origin 0 0.005 0.10  u 1 0 0  v 0 0 0.40  normal 0  1 0  spd preset:bb6500 }
+
+camera "cam" {
+    eye 0.5 0.5 2.0  look_at 0.5 0.5 0  up 0 1 0  fov_y 32
+    mode B
+    film { res 320 320 }
+}
