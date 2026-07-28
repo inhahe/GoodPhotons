@@ -5,7 +5,7 @@ long prose blocks whose opening paragraph reads like a plan but whose later
 `**STATUS (date) … DONE**` sub-paragraph says it landed. That makes "what's actually left?"
 expensive to answer.
 
-**This file is the actionable extract, as of 2026-07-28 (ftrace v0.89.0).** It carries only
+**This file is the actionable extract, as of 2026-07-28 (ftrace v0.90.0).** It carries only
 work that is genuinely undone *and* not explicitly ruled out. `TODO.md` remains the
 authoritative design text — every item below names its section/item ID there, and the full
 rationale, prior art and scoping live in that entry, not here.
@@ -20,20 +20,15 @@ without asking.
 
 ## 1. Unblocked — nothing external is stopping these
 
-### K1 remainder — user-supplied named RGB→spectral mapping  *(ftrace; small–medium)*
-*TODO.md §K, item K1.*
+### ~~K1 remainder — user-supplied named RGB→spectral mapping~~  **DONE 2026-07-28 (v0.90.0)**
+*TODO.md §K, item K1 — now closed.*
 
-All five **built-in** upsamplers have landed: Jakob-Hanika reflectance (the original default),
-JH illuminant (v0.10.3), Smits 1999 (v0.45.0), the plain calibrated 3-box (v0.46.0), and
-Meng 2015 smoothest-spectrum (v0.85.0). Selecting among them from a scene works.
-
-What's left is the last clause of the original proposal: a **named user mapping** — a function
-`(r, g, b) -> spectrum` registered in the spectral-envelope store and referenced by name, so a
-scene can plug in its own upsampler rather than picking from the built-in set.
-
-Scope: a registration path in the spectral-envelope store + a name lookup wired through
-`evalSpectrum`'s `rgb`/`hsv`/`hsl` handlers (the same chokepoint the existing method tag goes
-through); mirror in loom's spectrum grammar. Observable → README + VERSION bump.
+Shipped as `upsample "<name>" { expr "f(r, g, b, w)" }`, named by the colon head
+`rgb:<name> r g b` (also `hsv:`/`hsl:`). The body is a pattern-VM expression over a vocabulary
+disjoint from the surface one (`r` is RED here, not radius — surface names are rejected by
+name), plus `spec:<spectrum>(w)`, which is what makes a *measured basis* expressible rather
+than only closed-form arithmetic. Pinned by `-checkupsample` section (h); scene
+`scenes/_upsample.ftsl`; loom twins `NamedSpectrum`/`Upsample`/`UserSpec`/`is_colour_space`.
 
 ### Array-literal formals + keyword rebind — `[0 1](a)` … `(a=u)`  *(ftrace; small)*
 *TODO.md "DECISION — color-vector / array syntax", the increment-2 `**Deferred:**` clause and

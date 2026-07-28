@@ -937,8 +937,9 @@ sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled 
 ```
 
 **Inline colour channels.** A colour channel doesn't have to name pre-declared spectra:
-tag the channel with any colour head — `rgb`, `hsv`, `hsl`, or any upsampler/emission
-variant (`rgbmeng`, `rgbsmits`, `hsvillum`, `hslline`, …) — and write the triples inline.
+tag the channel with any colour head — `rgb`, `hsv`, `hsl`, any upsampler/emission
+variant (`rgbmeng`, `rgbsmits`, `hsvillum`, `hslline`, …), or a user upsampler
+(`rgb:<name>`) — and write the triples inline.
 The tag fixes arity 3, so each group is one stop, and the components go through exactly
 the same evaluator as a top-level `spectrum "x" = rgb …` declaration:
 
@@ -1083,6 +1084,35 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   tungsten or sodium source, and a smooth shape is what real pigments have. Slightly more
   memory than the analytic fits (a ~140 KB table) and a table lookup instead of a solve.
   A valid `[0,1]`-clamped *material* reflectance like the others.
+- **`rgb:<name> r g b`** (also `hsv:<name> …`, `hsl:<name> …`) — **your own upsampler**.
+  The five heads above are a closed set of built-in fits; this one names an
+  `upsample "<name>" { expr "f(r, g, b, w)" }` block declared in the scene, so a scene
+  that needs a mapping none of them provides supplies the function itself rather than
+  picking the least-wrong built-in:
+
+  ```
+  spectrum "prim_r" = gaussian center=620 sigma=40
+  spectrum "prim_g" = gaussian center=540 sigma=40
+  spectrum "prim_b" = gaussian center=460 sigma=40
+  upsample "basis" { expr "r*spec:prim_r(w) + g*spec:prim_g(w) + b*spec:prim_b(w)" }
+  material "m" { type diffuse  reflect rgb:basis 0.25 0.55 0.85 }
+  ```
+
+  The body is a pattern-VM expression over a **disjoint** vocabulary — there is no hit
+  point here, so it sees only `r`, `g`, `b` (the colour, linear sRGB), `w` (wavelength
+  in nm), `pi`, the usual functions, and **`spec:<spectrum>(w)`**, which samples a
+  declared `spectrum` block at the queried wavelength. That last one is what makes a
+  **measured basis** expressible (weight real primary curves by the three channels)
+  rather than only closed-form arithmetic; it is in scope *only* inside an `upsample`
+  body, since an ordinary pattern has a hit point but no wavelength. Because `r` means
+  RED here and radius in the surface vocabulary, every surface/shading variable is
+  rejected **by name** with a message saying so, rather than silently reinterpreted.
+  The triple is converted to linear sRGB *before* the body runs, so all three heads
+  feed identical `r, g, b`. Evaluated per queried wavelength, not pre-tabulated, so a
+  narrow emission line isn't quietly band-limited. Blocks resolve lazily by name
+  (declaration order is irrelevant). Usable everywhere a colour head is, including a
+  record channel's inline-colour tag. See `scenes/_upsample.ftsl`; pinned by
+  `-checkupsample`.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum. Interpolated
   **piecewise-linear** by default; add an **`interp=cubic`** flag among the entries
   (`table { interp=cubic  400:0.05 … }`) for a **monotone cubic (PCHIP)** curve —

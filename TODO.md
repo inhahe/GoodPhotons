@@ -2552,7 +2552,9 @@ Fallout from the loom↔ftrace light-schema reconciliation (known-issues "RESOLV
 loom's `color=` now emits `spd rgb …` and `size`/`turbidity` were dropped from loom (a light is authored in
 ftrace's own language). Two follow-ups were captured:
 
-- [ ] **K1 — Multiple RGB→spectral upsampling methods (incl. a user-supplied mapping).** Today there is exactly
+- [x] **K1 — Multiple RGB→spectral upsampling methods (incl. a user-supplied mapping).** **DONE 2026-07-28
+      (v0.90.0)** — five built-in upsamplers *and* the user-supplied mapping; see the sub-entries below, the last
+      of which closes the final clause. Today there is exactly
       **one** RGB→spectrum path, shared by *materials and lights alike*: `rgb r g b` → `rgbToReflectanceJH`
       (`src/upsample.h`), the Jakob-Hanika 2019 sigmoid-of-quadratic **reflectance** fit — coefficients solved by
       Gauss-Newton so the spectrum, viewed **under D65 through the CIE observer**, reproduces the target linear-sRGB
@@ -2617,12 +2619,58 @@ ftrace's own language). Two follow-ups were captured:
           every test colour. Render: `scraps/meng_test.ftsl` (four upsamplers, same colour, lit by
           illuminant A — a D65 wash cannot distinguish them by construction). Reflectance upsampler →
           host-side bake, no GPU change.
-    - **Residual (deliberately not scheduled):** a **user-supplied custom basis**. The **named user
-          mapping** is already covered — `spectrum "name" = <expr>` registers a reusable named spectrum
-          referenced via `spectrum:name` (ftsl.h ~335/1239), and the
-          `rgb`/`rgbsmits`/`rgbbox`/`rgbillum`/`rgbline`/`rgbmeng` heads are exactly named
-          `(r,g,b)->spectrum` functions. So the only thing left is letting a scene bring its own basis
-          curves, which is low-value given the five built-ins and stays out unless a scene needs it.
+    - [x] **User-supplied named mapping landed** *(2026-07-28, v0.90.0)* — the last clause of the original
+          proposal, and the item's close. Surface: `upsample "<name>" { expr "f(r, g, b, w)" }` declared at
+          top level and named by the **colon head** `rgb:<name> r g b` (also `hsv:`/`hsl:`, converted to
+          linear sRGB *before* the body runs so all three feed identical `r,g,b`). A colon rather than yet
+          another glued suffix because the built-in suffixes are a closed set a reader can memorise while a
+          user name is open-ended, and `:` is already this grammar's namespace marker (`spectrum:`, `metal:`,
+          `tex:`, `grid:`). Wired through `evalSpectrum`'s existing colour-head chokepoint (`ftsl.h`), so the
+          head works at *every* spectral site and, because `isColourHead` gained one shape-only arm
+          (`isCustomColourHead`), at a record channel's inline-colour tag too — the one list stays one list.
+          *This entry replaces a previous "Residual (deliberately not scheduled)" bullet that claimed the named
+          user mapping was "already covered" by `spectrum "name" = <expr>` + the built-in heads. That was
+          wrong: a named spectrum is a fixed curve, and a built-in head is a fixed function — neither lets a
+          scene supply `(r,g,b) -> spectrum` itself, which is what the proposal asked for.*
+          Three design decisions carried it, each chosen so a limitation fails loudly instead of approximating:
+          **(a) the body's variable vocabulary is DISJOINT from the surface one, not additive**
+          (`PatVarMode::Upsample`, `pattern.h`). `r` already means *radius* in a surface program and has to
+          mean *red* here; an additive design would make one spelling silently mean two things depending on
+          site. So in upsample mode every surface name (`x y z u v f nx ny nz r t`) is rejected **by name**
+          with a message that says the spelling changed meaning, and `r`/`g`/`b`/`w` reuse the
+          `VarX`/`VarY`/`VarZ`/`VarU` slots as a pure register assignment (invisible, since the surface
+          spellings are unreachable in this mode). `pi` is deliberately left shared — it is a constant, not a
+          context. **(b) `spec:<spectrum>(w)` (`PatOp::Spec` + `PatSpecScope`)** samples a declared `spectrum`
+          block at the queried wavelength. This is what makes the feature more than syntax sugar: it makes a
+          **measured basis** expressible (`r*spec:red(w) + g*spec:green(w) + b*spec:blue(w)`) rather than only
+          closed-form arithmetic — and it is why the expression form was chosen over a basis-only design,
+          which it strictly subsumes. Resolution is compile-time through a scope object exactly like
+          `tex:`/`grid:`/`scatter:`, so `spec:` outside an upsample body and `tex:`/`grid:` inside one are
+          both compile errors naming the scope rule (an ordinary pattern has a hit point but no wavelength;
+          an upsample body the reverse). Spectra are memoised into an **append-only** vector so an index
+          handed out at compile time survives later growth. `PatOp::Spec` never reaches the device: an
+          upsample program is consumed at load time and is never stored on a `Material` or in
+          `Scene::patterns`. **(c) the result is a live closure, not a baked table.** A user upsampler is free
+          to be a narrow emission line, and pre-tabulating at the loader would quietly band-limit it; the
+          renderer already tabulates where it must (`double reflect[SPEC_N]`), at a resolution it chooses. The
+          closure captures the compiled program and the spectrum vector by `shared_ptr`, and the sampler
+          thunk's `self` is the *vector* rather than the Builder, so the produced `Spectrum` outlives the
+          loader (it ends up on a `Material` the `Scene` owns). Programs compile once per name and are shared
+          by every colour that names them. Refusals are loud and specific: unknown upsampler, `upsample` with
+          no `expr`, surface variable, unknown identifier (listing the vocabulary), unknown spectrum in
+          `spec:`, an uncalled `spec:` reference, and both halves of the scope rule. Validated by
+          `-checkupsample` **section (h)**: 14 asserts run through the real loader (constant body; r/g/b/w
+          each reaching their own slot; `hsv:` ≡ the converted `rgb:`; `spec:` matching the gaussian's closed
+          form at five wavelengths; a three-spectrum basis matching by hand; and the eight refusals) — every
+          number computed in the test rather than hard-coded, and every sample taken *after* the `Loaded`
+          scope exits, which is what pins (c). Visual companion `scenes/_upsample.ftsl` →
+          `png/_upsample.png` (six spheres, one authored colour, six upsamplers, plus a record channel
+          tagged `rgb:basis`). loom twins: `NamedSpectrum`/`Upsample` elements (`scene.py`, emitted ahead of
+          textures/patterns/materials), `UserSpec` (`grammar/spectrum.py`) and `is_colour_space`
+          (`record.py`, replacing the closed `_COLOUR_SPACES` membership test at both sites that asked) —
+          `tools/loom/tests/test_upsample.py`, 13 tests. Host-side only, so no GPU change.
+    - **Still deliberately out:** nothing. A "user-supplied custom *basis*" (bring your own basis curves)
+          is now expressible as a `spec:`-weighted body, which is what that phrasing was reaching for.
 
 - [x] **K2 — Analytic physical sky (`turbidity`).** **DONE 2026-07-24.** Implemented the **Preetham et al. 2002**
       analytic daylight model as an `env` sub-kind: `light env { sky preetham  turbidity t  sun_dir …  (or

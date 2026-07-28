@@ -991,7 +991,184 @@ static int checkUpsample() {
     // white is capped by the brightest smooth reflectance of that chromaticity.
     bool passG = mengPhysical && mengSmoother && mengErr < 5e-3 && mengWhiteErr < 0.02;
 
-    bool pass = passA && passB && passW && passC && passD && passE && passF && passG;
+    // (h) USER-DECLARED upsamplers (K1 remainder): `upsample "n" { expr "f(r,g,b,w)" }`
+    // named as `rgb:n` / `hsv:n` / `hsl:n`. Unlike (a)-(g), which test closed-form fits
+    // that can be evaluated directly, this one has to run the LOADER — the feature IS the
+    // binding of a name to a colour head, so what's under test is a property of loading.
+    // Every assert compares against a value computed here in C++ from the same inputs, so
+    // the test pins the semantics (which variable is which, when the space conversion
+    // happens, what `spec:` samples) rather than a number that could drift with defaults.
+    bool passH = true;
+    {
+        auto uchk = [&](const char* what, bool cond) {
+            if (!cond) { std::printf("[checkupsample] user %-46s BAD\n", what); passH = false; }
+        };
+        // Load a fragment and hand back the probe material's reflect spectrum. The probe
+        // quad always uses `probe`, so the resolved index comes off its first triangle.
+        auto probeReflect = [&](const std::string& decls, Spectrum& out) -> bool {
+            std::string src =
+                "scene { units meters }\n" + decls + "\n"
+                "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+                "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+                "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+            ftsl::Loaded L; std::string e;
+            if (!ftsl::loadSource(src, "<checkupsample>", L, e)) {
+                std::printf("[checkupsample] user load FAILED: %s\n", e.c_str());
+                return false;
+            }
+            int mi = L.scene.tris.empty() ? 0 : L.scene.tris[0].matId;
+            out = L.scene.mats[mi].reflect;
+            // NOTE: `L` dies here. The returned Spectrum must still work — that is the
+            // whole point of applyUpsample capturing shared_ptrs rather than the Builder,
+            // and every sample below is taken AFTER this scope exits.
+            return true;
+        };
+        // A scene that must NOT load, and whose error mentions `needle`.
+        auto uReject = [&](const char* what, const std::string& decls, const char* needle) {
+            std::string src =
+                "scene { units meters }\n" + decls + "\n"
+                "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+                "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+                "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+            ftsl::Loaded L; std::string e;
+            if (ftsl::loadSource(src, "<checkupsample>", L, e)) { uchk(what, false); return; }
+            if (e.find(needle) == std::string::npos) {
+                std::printf("[checkupsample] user %-46s BAD (error was: %s)\n", what, e.c_str());
+                passH = false;
+            }
+        };
+        const double lams[] = { 380.0, 450.0, 550.0, 632.8, 780.0 };
+
+        // h1. A constant body is that constant at every wavelength — the smallest possible
+        //     proof that the program is compiled, stored and evaluated at all.
+        {
+            Spectrum s;
+            if (probeReflect("upsample \"k\" { expr \"0.375\" }\n"
+                             "material \"probe\" { type diffuse  reflect rgb:k 0.2 0.5 0.9 }", s)) {
+                bool okc = true;
+                for (double w : lams) okc = okc && std::fabs(s(w) - 0.375) < 1e-12;
+                uchk("constant body is constant in wavelength", okc);
+            } else passH = false;
+        }
+
+        // h2. r/g/b are the LINEAR sRGB triple and w is the wavelength in nm, each landing
+        //     in its own slot. The formula weights all four differently so a swapped pair
+        //     cannot pass by coincidence.
+        {
+            Spectrum s;
+            const double R = 0.2, G = 0.5, B = 0.9;
+            if (probeReflect("upsample \"m\" { expr \"r*1 + g*10 + b*100 + w*0.001\" }\n"
+                             "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }", s)) {
+                bool okc = true;
+                for (double w : lams)
+                    okc = okc && std::fabs(s(w) - (R + G * 10 + B * 100 + w * 0.001)) < 1e-9;
+                uchk("r,g,b,w each reach their own slot", okc);
+            } else passH = false;
+        }
+
+        // h3. The space conversion runs BEFORE the body, so an `hsv:` head and the `rgb:`
+        //     head fed the converted triple are indistinguishable. This is the invariant
+        //     that lets an author pick a colour space without re-reading the upsampler.
+        {
+            Spectrum a, b;
+            Vec3 c = hsvToRgb(0.3, 0.8, 0.6);
+            char rgbDecl[256];
+            std::snprintf(rgbDecl, sizeof rgbDecl,
+                          "upsample \"m\" { expr \"r*1 + g*10 + b*100\" }\n"
+                          "material \"probe\" { type diffuse  reflect rgb:m %.17g %.17g %.17g }",
+                          c.x, c.y, c.z);
+            if (probeReflect("upsample \"m\" { expr \"r*1 + g*10 + b*100\" }\n"
+                             "material \"probe\" { type diffuse  reflect hsv:m 0.3 0.8 0.6 }", a) &&
+                probeReflect(rgbDecl, b)) {
+                uchk("hsv: head converts to linear sRGB before the body",
+                     std::fabs(a(550.0) - b(550.0)) < 1e-9);
+            } else passH = false;
+        }
+
+        // h4. `spec:<name>(w)` samples a declared spectrum AT THE PASSED WAVELENGTH. The
+        //     gaussian is checked against its own closed form, so this pins both that the
+        //     right curve was resolved and that `w` really is the argument (a constant
+        //     would match at the centre only).
+        {
+            Spectrum s;
+            const double R = 0.8;
+            if (probeReflect("spectrum \"g\" = gaussian center=550 sigma=30 amp=1\n"
+                             "upsample \"basis\" { expr \"r*spec:g(w)\" }\n"
+                             "material \"probe\" { type diffuse  reflect rgb:basis 0.8 0.1 0.1 }", s)) {
+                bool okc = true;
+                for (double w : lams) {
+                    double t = (w - 550.0) / 30.0;
+                    okc = okc && std::fabs(s(w) - R * std::exp(-0.5 * t * t)) < 1e-9;
+                }
+                uchk("spec:<name>(w) samples the named spectrum at w", okc);
+            } else passH = false;
+        }
+
+        // h5. A MEASURED BASIS — the reason `spec:` exists at all. Three named spectra
+        //     weighted by the three channels is the classic linear-basis upsampler, and it
+        //     must equal the same sum computed here. Also proves the spectrum vector stays
+        //     valid across several resolved indices (it is append-only for exactly this).
+        {
+            Spectrum s;
+            const double R = 0.3, G = 0.6, B = 0.1;
+            if (probeReflect("spectrum \"sr\" = gaussian center=620 sigma=40 amp=1\n"
+                             "spectrum \"sg\" = gaussian center=540 sigma=40 amp=1\n"
+                             "spectrum \"sb\" = gaussian center=460 sigma=40 amp=1\n"
+                             "upsample \"basis\" { expr \"r*spec:sr(w) + g*spec:sg(w) + b*spec:sb(w)\" }\n"
+                             "material \"probe\" { type diffuse  reflect rgb:basis 0.3 0.6 0.1 }", s)) {
+                bool okc = true;
+                for (double w : lams) {
+                    auto gau = [&](double c0) { double t = (w - c0) / 40.0; return std::exp(-0.5 * t * t); };
+                    okc = okc && std::fabs(s(w) - (R * gau(620) + G * gau(540) + B * gau(460))) < 1e-9;
+                }
+                uchk("three-spectrum measured basis matches by hand", okc);
+            } else passH = false;
+        }
+
+        // h6. Loud refusals. Each of these has a specific failure the author needs named,
+        //     and the alternative in every case is a silent wrong answer.
+        uReject("an unknown upsampler names itself",
+                "material \"probe\" { type diffuse  reflect rgb:nope 0.2 0.5 0.9 }",
+                "unknown upsampler");
+        uReject("an upsample with no expr is refused",
+                "upsample \"m\" { }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "no `expr`");
+        // The trap this exists for: `r` is RADIUS in the surface vocabulary and RED here.
+        // Any surface name must be rejected BY NAME, never silently read as something else.
+        uReject("a surface variable in an upsample body is refused",
+                "upsample \"m\" { expr \"x + y\" }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "surface/shading variable");
+        uReject("an unknown identifier lists the upsample vocabulary",
+                "upsample \"m\" { expr \"q*2\" }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "unknown identifier");
+        uReject("spec: naming a missing spectrum says which",
+                "upsample \"m\" { expr \"spec:ghost(w)\" }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "unknown spectrum 'ghost'");
+        uReject("an uncalled spec: reference asks for the wavelength",
+                "spectrum \"g\" = gaussian center=550 sigma=30 amp=1\n"
+                "upsample \"m\" { expr \"spec:g\" }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "must be called with a wavelength");
+        // `tex:` has no hit point to sample at here; refusing beats silently returning 0.
+        uReject("a texture sample in an upsample body is out of scope",
+                "texture \"t\" { file scenes/graychecker.ppm  encoding linear }\n"
+                "upsample \"m\" { expr \"tex:t(0.5, 0.5)\" }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "out of scope");
+        // And the same `spec:` is NOT in scope in an ordinary pattern, which has a hit
+        // point but no wavelength — the symmetric half of the scope rule.
+        uReject("spec: outside an upsample body is out of scope",
+                "spectrum \"g\" = gaussian center=550 sigma=30 amp=1\n"
+                "pattern \"p\" { expr \"spec:g(550)\" }\n"
+                "material \"probe\" { type diffuse  reflect pattern:p }",
+                "out of scope");
+    }
+
+    bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
@@ -1001,6 +1178,7 @@ static int checkUpsample() {
     std::printf("[checkupsample] box round-trip max error = %.5f (<0.30 expected)  (%s)\n", boxErr, passF ? "ok" : "BAD");
     std::printf("[checkupsample] meng round-trip max error = %.5f (excl. white %.5f); smoother than JH: %s  (%s)\n",
                 mengErr, mengWhiteErr, mengSmoother ? "yes" : "NO", passG ? "ok" : "BAD");
+    std::printf("[checkupsample] user-declared `upsample` blocks  (%s)\n", passH ? "ok" : "BAD");
     std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

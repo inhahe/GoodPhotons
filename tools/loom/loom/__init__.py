@@ -31,6 +31,7 @@ from .scene import (
     Scene, Material, Texture, skin, ProcTexture, func_skin, Sphere, Beads, Raw,
     Light, Camera, CameraCurve, Element, Group,
     Pattern, SweptMesh, IsoMesh, ribbon, tube, blob, fan, Volume,
+    NamedSpectrum, Upsample,
 )
 from .transform import Transform
 from .mcubes import mesh_field
@@ -109,6 +110,7 @@ __all__ = [
     "Sphere", "Beads", "Raw", "Light",
     "Camera", "CameraCurve", "Element", "Group", "Transform",
     "Pattern", "FuncPattern", "MixMaterial", "PATTERNS",
+    "NamedSpectrum", "Upsample",
     "waves", "checker", "rings", "blobs",
     "Record", "RecordChannel", "RecordStop",
     "parse_ladder", "emit_ladder", "ladder_shape",

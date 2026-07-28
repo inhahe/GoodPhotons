@@ -301,6 +301,36 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   vertex by `bary_k / T_k` (`T_k = X+Y+Z` of its spectrum) rather than by `bary_k`
   alone, because a chromaticity is an `(X+Y+Z)`-weighted mean — that is what makes the
   interpolated chromaticity *exact* rather than merely close.
+- **User-supplied upsamplers (`upsample "n" { expr … }`, head `rgb:<n>`).** The sixth
+  member of the family, and the only open-ended one: the scene supplies the function.
+  Deliberately *not* in `upsample.h` — the five above are numerical fits, this is a
+  compiled pattern-VM program, so it lives at the loader (`ftsl.h`: `upsampleBlocks_`,
+  `applyUpsample`) with `pattern.h` supplying two new pieces. Three decisions carry it:
+  (a) **the body's vocabulary is disjoint from the surface one, not additive**
+  (`PatVarMode::Upsample`). `r` already means *radius* in a surface program and must
+  mean *red* here, so an additive design would make one spelling silently mean two
+  things. Instead every surface name is rejected by name with a message saying so, and
+  `r`/`g`/`b`/`w` internally reuse the `VarX`/`VarY`/`VarZ`/`VarU` slots as a pure
+  register assignment — invisible, because the surface spellings are unreachable in
+  this mode. (b) **`spec:<name>(w)` (`PatOp::Spec`)** samples a declared `spectrum` at
+  the queried wavelength, which is what makes a *measured basis* expressible
+  (`r*spec:red(w) + …`) rather than only closed-form arithmetic; it resolves its index
+  at compile time through a `PatSpecScope`, exactly like `tex:`/`grid:`, and is a
+  compile error outside an upsample body (an ordinary pattern has a hit point but no
+  wavelength — and symmetrically `tex:`/`grid:` are errors *inside* one). `PatOp::Spec`
+  never reaches the device: an upsample program is consumed at load time and is never
+  stored on a `Material` or in `Scene::patterns`. (c) **the result is a live closure,
+  not a baked table** — a user upsampler may be a narrow emission line, and
+  pre-tabulating here would band-limit it; the renderer already tabulates where it
+  needs to (`double reflect[SPEC_N]`), at a resolution it chooses. The closure captures
+  the compiled program and the spectrum vector by `shared_ptr` (and the sampler thunk's
+  `self` is the *vector*, not the Builder), so the produced `Spectrum` outlives the
+  loader; the vector is append-only so an index handed out at compile time survives
+  later growth. `isColourHead` gained one shape-only arm (`isCustomColourHead`) so the
+  head is accepted at both sites that share that list — value site and record-channel
+  inline-colour tag. Pinned by `-checkupsample` section (h); `scenes/_upsample.ftsl`
+  is the visual companion; loom's twins are `NamedSpectrum`/`Upsample` (`scene.py`),
+  `UserSpec` (`grammar/spectrum.py`) and `is_colour_space` (`record.py`).
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.
@@ -709,8 +739,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   every upsampler/emission variant — `isColourHead` is the one list) into
   `RecChannel::space`, then hands `{space, comps…}` to the *same* `evalSpectrum` a
   top-level `spectrum "x" = rgb …` declaration uses. Converging on that one evaluator is
-  what makes inline colour nearly free: the record path inherits all 18 colour heads, and
-  the Jakob–Hanika coefficient bake and the GPU upload never learn that records exist.
+  what makes inline colour nearly free: the record path inherits all 18 built-in colour
+  heads *and* the open-ended `rgb:<upsampler>` one, and the Jakob–Hanika coefficient bake
+  and the GPU upload never learn that records exist.
   `tools/loom/loom/ladder.py` + `record.py` are the declared Python twins; a stop-boundary
   disagreement between them would be a *silent wrong render* rather than a parse error, so
   `tools/check_record_twins.py` diffs ftrace's per-channel stop count (probed via an

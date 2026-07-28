@@ -144,7 +144,8 @@ A spectrum expression appears after `spd`, `reflect`, `ior`, `absorb`, `emit`,
 | `redwall` / `greenwall` | the Cornell-box side-wall reflectances |
 | `gaussian center=<nm> sigma=<nm> amp=<a>` | a Gaussian emission/reflectance band |
 | `shortpass edge=<nm> slope=<nm> amp=<a>` | a soft short-pass edge |
-| `rgb <r> <g> <b>` | sRGB-linear triple → reflectance via Jakob-Hanika upsampling |
+| `rgb <r> <g> <b>` | sRGB-linear triple → reflectance via Jakob-Hanika upsampling (see §3.5 for the other heads) |
+| `rgb:<name> <r> <g> <b>` | the triple through a scene-declared `upsample "<name>"` (see §3.6) |
 | `glass:<name>` | dispersive glass IOR curve (see §3.1) |
 | `metal:<name>` | measured metal reflectance (see §3.2) |
 | `reflectance:<name>` | measured natural diffuse reflectance (see §3.3) |
@@ -178,6 +179,70 @@ A spectrum expression appears after `spd`, `reflect`, `ior`, `absorb`, `emit`,
 - Named: `sun`, `daylight`/`d65`, `a`/`incandescent`, `led`, `led-warm`,
   `fluorescent`/`cfl`, `f2`/`cool-white`, `f7`/`daylight-fl`, `f11`/`triphosphor`,
   `hps`/`sodium`, `lps`/`sodium-low`, `mercury`/`hg`, `metal-halide`/`mh`.
+
+### 3.5 Colour heads — picking an upsampler
+
+A colour is three numbers; a spectrum is a curve. Turning one into the other is
+**upsampling**, and there is no single right answer — so the head you write picks the
+method. Each comes in all three colour spaces (`rgb…` / `hsv…` / `hsl…`; hue is in
+turns and wraps, s/v/l in `[0,1]`).
+
+| head | method | reach for it when |
+|---|---|---|
+| `rgb` | Jakob-Hanika sigmoid fit | the default; smooth, physical, accurate |
+| `rgbmeng` | Meng 2015 smoothest metamer | the reflectance will be re-lit by a strongly non-D65 source, or dispersed — it is the *smoothest* spectrum of that colour, so it has the fewest features to exaggerate |
+| `rgbsmits` | Smits 1999 tabulated basis | matching a classic renderer's look; lower fidelity by design |
+| `rgbbox` | calibrated 3-box | cheapest; three rectangular bands |
+| `rgbillum` | Jakob-Hanika illuminant | the colour is an **emitter**, not a reflectance — unbounded magnitude, integrates under the bare observer |
+| `rgbline` | dominant-wavelength line | near-monochromatic emission, so glass will disperse it into a spectrum (`rgbline r g b [sigma]`) |
+| `rgb:<name>` | your own — see §3.6 | none of the above is what the scene means |
+
+The first five are reflectances (bounded in `[0,1]`); `rgbillum` and `rgbline` are
+emission forms. Every head is accepted everywhere a spectrum expression is, *and* as a
+record channel's inline-colour tag (§9.2) — one shared list, so the two can't drift.
+
+### 3.6 `upsample` — supplying your own
+
+```
+spectrum "prim_r" = gaussian center=620 sigma=40
+spectrum "prim_g" = gaussian center=540 sigma=40
+spectrum "prim_b" = gaussian center=460 sigma=40
+
+upsample "basis" { expr "r*spec:prim_r(w) + g*spec:prim_g(w) + b*spec:prim_b(w)" }
+
+material "m" { type diffuse  reflect rgb:basis 0.25 0.55 0.85 }
+```
+
+`expr` is a §6.1 pattern expression, but over a **disjoint vocabulary** — there is no
+hit point here:
+
+| name | meaning |
+|---|---|
+| `r`, `g`, `b` | the colour, **linear sRGB** |
+| `w` | the wavelength being asked about, in **nm** |
+| `spec:<name>(w)` | sample a declared `spectrum "<name>"` at `w` |
+| `pi`, the usual functions | as everywhere else |
+
+Two consequences worth stating plainly:
+
+- **`r` means RED here, not radius.** Every surface/shading variable (`x`, `y`, `z`,
+  `u`, `v`, `f`, `nx`…, and `r` in its surface sense) is rejected *by name* with a
+  message saying so, rather than silently meaning something else.
+- **The space conversion happens first.** `hsv:basis 0.58 0.71 0.85` and the equivalent
+  `rgb:basis …` feed the body identical `r, g, b`, so an upsampler never has to know
+  which head was written.
+
+`spec:` is the reason this is more than syntax sugar: it makes a **measured basis**
+expressible (weight real primary curves by the three channels), not just closed-form
+arithmetic. Conversely `spec:` is *only* in scope inside an `upsample` body — an
+ordinary pattern has a hit point but no wavelength, and asking there is an error, not a
+guess. `tex:` / `grid:` / `scatter:` are correspondingly out of scope inside a body.
+
+The result is evaluated at each queried wavelength, not pre-tabulated, so an upsampler
+is free to be a narrow emission line without being quietly band-limited. Blocks resolve
+lazily by name (declaration order is irrelevant), and an unreferenced one is legal.
+
+See `scenes/_upsample.ftsl`; numerically pinned by `ftrace -checkupsample`.
 
 ---
 
@@ -687,8 +752,9 @@ grad = range 0-1 [
 #### Inline colour channels
 
 A colour channel doesn't have to name pre-declared spectra. Prefix the stop list with
-any **colour head** — `rgb`, `hsv`, `hsl`, or any of their upsampler / emission variants
-(`…line`, `…illum`, `…smits`, `…box`, `…meng`) — and write the triples inline. The tag
+any **colour head** — `rgb`, `hsv`, `hsl`, any of their upsampler / emission variants
+(`…line`, `…illum`, `…smits`, `…box`, `…meng`), or a user upsampler `rgb:<name>` (§3.6)
+— and write the triples inline. The tag
 applies to the whole channel and fixes each stop's arity at 3, so a *lone* stop needs no
 disambiguating comma. Components go through exactly the same evaluator as a top-level
 `spectrum "x" = rgb …` declaration, so every colour head is available here:

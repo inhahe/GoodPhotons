@@ -1,0 +1,85 @@
+# User-supplied RGB->spectral upsamplers (K1 remainder).
+#
+# ftrace ships five BUILT-IN upsamplers, each reached by a glued colour head:
+# `rgb` (Jakob-Hanika reflectance), `rgbillum` (JH illuminant), `rgbsmits`,
+# `rgbbox` and `rgbmeng`. This scene exercises the sixth, open-ended one: an
+# `upsample "<name>" { expr "f(r, g, b, w)" }` block named by the colon head
+# `rgb:<name>` (or `hsv:<name>` / `hsl:<name>` — the triple is converted to
+# linear sRGB BEFORE the body runs, so the body never has to know which).
+#
+# The body's free variables are r, g, b (the colour, linear sRGB) and w
+# (wavelength, nm) — a DISJOINT vocabulary from the surface/shading one, since
+# there is no hit point here and `r` means RED, not radius. `spec:<name>(w)`
+# samples a declared `spectrum` block, which is what lets an upsampler be a
+# MEASURED BASIS rather than a closed form.
+#
+# Numerically pinned by `ftrace -checkupsample` (section h). This scene is the
+# visual companion: six spheres in a row, same authored colour, six upsamplers.
+#
+#   ftrace -in scenes/_upsample.ftsl -window -keepwindow -time 30 -o png/_upsample.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# Three narrow bands standing in for a measured RGB primary set.
+spectrum "prim_r" = gaussian center=620 sigma=40 amp=1
+spectrum "prim_g" = gaussian center=540 sigma=40 amp=1
+spectrum "prim_b" = gaussian center=460 sigma=40 amp=1
+
+# (1) A measured LINEAR BASIS — the motivating case for `spec:`. This is the
+#     classic three-primary upsampler, and it cannot be written without a way to
+#     sample a named spectrum at the queried wavelength.
+upsample "basis" { expr "r*spec:prim_r(w) + g*spec:prim_g(w) + b*spec:prim_b(w)" }
+
+# (2) A CLOSED FORM: three overlapping cosine lobes, no spectra involved. Shows
+#     the body is a full pattern-VM expression, not a basis-weighting template.
+upsample "lobes" {
+    expr "clamp(r*max(0, cos((w-620)/70)) + g*max(0, cos((w-540)/70)) + b*max(0, cos((w-460)/70)), 0, 1)"
+}
+
+# (3) A deliberately DEGENERATE one: ignores the colour entirely and returns a
+#     flat mid grey. Legal, and the smallest proof the body really is arbitrary.
+upsample "flat" { expr "0.5" }
+
+material "m_jh"    { type diffuse  reflect rgb        0.25 0.55 0.85 }
+material "m_meng"  { type diffuse  reflect rgbmeng    0.25 0.55 0.85 }
+material "m_basis" { type diffuse  reflect rgb:basis  0.25 0.55 0.85 }
+material "m_lobes" { type diffuse  reflect rgb:lobes  0.25 0.55 0.85 }
+material "m_flat"  { type diffuse  reflect rgb:flat   0.25 0.55 0.85 }
+# The same colour written in HSV through the same upsampler must be
+# indistinguishable from `m_basis` — the space conversion happens first.
+material "m_hsv"   { type diffuse  reflect hsv:basis  0.5847 0.7059 0.85 }
+
+material "wall" { type diffuse  reflect 0.6 }
+
+# A record channel may carry a user head as its inline-colour TAG, exactly as it
+# may carry `rgbmeng` — ftrace shares one `isColourHead` between the value site
+# and the tag site so the two cannot drift.
+grad = range 0 1 [
+    reflect  rgb:basis 0.85 0.2 0.2, 0.2 0.85 0.2, 0.2 0.2 0.85
+]
+material "m_grad" { type diffuse  reflect grad.reflect(0.5) }
+
+quad { origin -1 0 -1   u 6 0 0   v 0 0 3   material wall }    # floor
+quad { origin -1 0 -1   u 6 0 0   v 0 3 0   material wall }    # back
+
+sphere { center 0.0 0.4 0.0  radius 0.35  material m_jh    }
+sphere { center 0.8 0.4 0.0  radius 0.35  material m_meng  }
+sphere { center 1.6 0.4 0.0  radius 0.35  material m_basis }
+sphere { center 2.4 0.4 0.0  radius 0.35  material m_lobes }
+sphere { center 3.2 0.4 0.0  radius 0.35  material m_flat  }
+sphere { center 4.0 0.4 0.0  radius 0.35  material m_hsv   }
+sphere { center 2.0 1.2 0.4  radius 0.30  material m_grad  }
+
+light area {
+    origin 0.5 2.4 0.4   u 3 0 0   v 0 0 1   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 2.0 1.1 4.2   look_at 2.0 0.55 0.0   up 0 1 0   fov_y 40
+    mode B
+    film { res 640 320 }
+}

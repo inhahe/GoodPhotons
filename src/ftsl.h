@@ -84,6 +84,14 @@ inline bool isNumber(const std::string& s) {
 }
 inline double num(const std::string& s) { return std::strtod(s.c_str(), nullptr); }
 
+// `<space>:<upsampler>` with a non-empty name. Split out so isColourHead and evalSpectrum
+// cannot drift on what counts as one.
+inline bool isCustomColourHead(const std::string& h) {
+    return h.size() > 4 && h[3] == ':' &&
+           (h.compare(0, 3, "rgb") == 0 || h.compare(0, 3, "hsv") == 0 ||
+            h.compare(0, 3, "hsl") == 0);
+}
+
 // The arity-3 COLOUR HEADS: every spectrum expression of the form `<head> a b c`,
 // across all three colour spaces and all the upsamplers/emission forms. Kept as one
 // list because two very different sites need the same answer: `evalSpectrum` (which
@@ -102,7 +110,17 @@ inline bool isColourHead(const std::string& h) {
         "rgbmeng",  "hsvmeng",  "hslmeng",     // Meng 2015 smoothest reflectance (K1)
     };
     for (const char* k : kHeads) if (h == k) return true;
-    return false;
+    // `rgb:<name>` / `hsv:<name>` / `hsl:<name>` — a USER-DECLARED upsampler (K1), named
+    // by an `upsample "<name>"` block. A colon rather than yet another glued suffix
+    // because the built-in suffixes are a closed set the reader can memorise while a user
+    // name is open-ended, and `:` is already this grammar's namespace marker everywhere
+    // else (`spectrum:`, `metal:`, `glass:`, `preset:`, `tex:`, `grid:`).
+    //
+    // Only the SHAPE is checked here; whether the name resolves is evalSpectrum's job.
+    // That split matters: this predicate also gates a record channel's inline-colour tag,
+    // and a head accepted here but rejected there would report an unknown upsampler as a
+    // mystery scalar-expression error pointing at the wrong token.
+    return isCustomColourHead(h);
 }
 
 // NOTE: the measured-SPD CSV loader (`loadSpdCsv`) that used to live here now lives
@@ -633,6 +651,17 @@ public:
                 markUsed(b, "=");
             }
 
+        // Named RGB->spectral upsamplers (K1): `upsample "name" { expr "<f(r,g,b,w)>" }`.
+        // Collected here, beside spectra and for the same reason: an upsampler is only
+        // ever reached BY NAME from an `rgb:<name>` colour head, so it is compiled lazily
+        // on first use. Declaration order therefore does not matter, and an unreferenced
+        // upsampler is legal (pointless, but not an unknown-key problem).
+        for (const auto& b : blocks)
+            if (b.type == "upsample") {
+                upsampleBlocks_[b.name] = &b;
+                markUsed(b, "expr");
+            }
+
         // Pass 1-arr: desugar inline `[ … ](coords)` array literals into anonymous
         // `grid` + `pattern` block pairs, APPENDED to `blocks`. Running it before Pass 1a
         // is what makes an inline literal work at every slot that already accepts a
@@ -724,6 +753,7 @@ public:
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
                      b.type == "texture" || b.type == "pattern" || b.type == "record" ||
                      b.type == "grid" || b.type == "scatter" ||
+                     b.type == "upsample" ||
                      b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
@@ -796,6 +826,110 @@ public:
 private:
     std::unordered_map<std::string, const Block*> spectraBlocks_;
     std::unordered_map<std::string, int> matIndex_;
+
+    // ---- K1: user-supplied named RGB->spectral upsamplers -----------------------------
+    // `upsample "name" { expr "<f of r,g,b,w>" }`, referenced as `rgb:<name> r g b`.
+    // The declaration blocks, and the COMPILED program per name (compiled once on first
+    // use, then reused for every colour that names it — an upsampler is typically named
+    // by many colours, and the compile is pure overhead after the first).
+    // Both the program and the spectrum table are held by shared_ptr because the
+    // Spectrum this produces must OUTLIVE the Builder (it ends up on a Material, which
+    // the Scene owns), while N colours naming the same upsampler should share one copy
+    // of each rather than carrying their own.
+    std::unordered_map<std::string, const Block*>                             upsampleBlocks_;
+    std::unordered_map<std::string, std::shared_ptr<const std::vector<PatNode>>> upsampleProg_;
+    // Spectra reachable from an upsample body as `spec:<name>(w)`. A resolved index is
+    // into this vector, which is APPEND-ONLY — that is what makes an index handed out at
+    // compile time still valid after a later name resolves, even though the vector
+    // reallocates. Shared with every closure produced, so a `spec:` sample stays live.
+    std::shared_ptr<std::vector<Spectrum>> upsampleSpecs_ =
+        std::make_shared<std::vector<Spectrum>>();
+    std::unordered_map<std::string, int>  upsampleSpecIndex_;
+
+    // Resolve `spec:<name>` to an index, evaluating the named spectrum block on first
+    // reference. Returns -1 for an unknown name, which the tokenizer turns into a compile
+    // error naming the spectrum.
+    //
+    // NOTE the const_cast: a PatSpecScope lookup is a C function pointer taking `const
+    // void*`, but resolution genuinely MUTATES — it memoises the evaluated spectrum.
+    // (texScopeThunk_ has the same shape but only reads.) Resolving lazily like this is
+    // the point: pre-evaluating every spectrum in the scene just in case an upsampler
+    // wanted one would do real work for scenes that declare no upsampler at all.
+    static int specScopeThunk_(const void* self, const char* name) {
+        Builder* B = const_cast<Builder*>(static_cast<const Builder*>(self));
+        auto hit = B->upsampleSpecIndex_.find(name);
+        if (hit != B->upsampleSpecIndex_.end()) return hit->second;
+        auto bit = B->spectraBlocks_.find(name);
+        if (bit == B->spectraBlocks_.end()) return -1;
+        const Stmt* e = find(*bit->second, "=");
+        if (!e) return -1;
+        Spectrum s = B->evalSpectrum(e->val, 1);
+        int idx = (int)B->upsampleSpecs_->size();
+        B->upsampleSpecs_->push_back(std::move(s));
+        B->upsampleSpecIndex_[name] = idx;
+        return idx;
+    }
+    // Sampler hook. `self` is the SPECTRUM VECTOR, not the Builder — that is what lets a
+    // produced Spectrum outlive the loader.
+    static double specSampleThunk_(const void* self, int idx, double w) {
+        const auto& v = *static_cast<const std::vector<Spectrum>*>(self);
+        return (idx >= 0 && idx < (int)v.size() && v[idx]) ? v[idx](w) : 0.0;
+    }
+    PatSpecScope specScope_{ this, &Builder::specScopeThunk_ };
+
+    // Turn a colour into a Spectrum through a named upsampler.
+    Spectrum applyUpsample(const std::string& name, const Vec3& c) {
+        auto bit = upsampleBlocks_.find(name);
+        if (bit == upsampleBlocks_.end()) {
+            fail("unknown upsampler '" + name + "' — declare it as `upsample \"" + name +
+                 "\" { expr \"…\" }`");
+            return constantSpectrum(0.0);
+        }
+        auto pit = upsampleProg_.find(name);
+        if (pit == upsampleProg_.end()) {
+            const Stmt* e = find(*bit->second, "expr");
+            if (!e || e->val.words.empty()) {
+                fail("upsample '" + name + "': no `expr`"); return constantSpectrum(0.0);
+            }
+            std::string expr;
+            for (size_t k = 0; k < e->val.words.size(); ++k) { if (k) expr += " "; expr += e->val.words[k]; }
+            std::vector<PatNode> prog; std::string perr;
+            // PatVarMode::Upsample swaps in the r/g/b/w vocabulary and locks the surface
+            // one out; `&specScope_` is what makes `spec:<name>(w)` legal. No texScope_ or
+            // tableScope_: there is no hit here, so `tex:` stays a compile error — and a
+            // `grid:`/`scatter:` sample, while conceivable, would be a second spelling for
+            // what `spec:` already does better (a spectrum knows its own wavelength
+            // domain; a grid would make the author restate it).
+            if (!compilePatternExpr(expr, prog, perr, /*allowT=*/false, nullptr, nullptr,
+                                    /*allowA=*/false, PatVarMode::Upsample, &specScope_)) {
+                fail("upsample '" + name + "': " + perr); return constantSpectrum(0.0);
+            }
+            pit = upsampleProg_.emplace(
+                name, std::make_shared<const std::vector<PatNode>>(std::move(prog))).first;
+        }
+        // The closure evaluates the program at each queried wavelength, exactly like the
+        // built-in upsamplers evaluate their own fits — deliberately NOT pre-tabulated.
+        // A user upsampler is free to be a narrow emission line or any other sharp
+        // feature, and baking it to a fixed grid here would quietly band-limit it; the
+        // renderer already tabulates spectra where it needs to (the device tables), at a
+        // resolution it chooses.
+        //
+        // Captures are all by value and own their targets, so the result is independent
+        // of this Builder: `prog` and `specs` are shared_ptrs, and `specSelf` points at
+        // the shared vector rather than at the loader.
+        auto prog  = pit->second;
+        auto specs = upsampleSpecs_;
+        Vec3 col = c;
+        return [prog, specs, col](double w) -> double {
+            PatCtx q;
+            q.x = col.x; q.y = col.y; q.z = col.z;   // r, g, b  (see PatVarMode)
+            q.u = w;                                 // w = wavelength, nm
+            q.specFn  = &Builder::specSampleThunk_;
+            q.specSelf = specs.get();
+            double v = patternEval(prog->data(), (int)prog->size(), q);
+            return std::isfinite(v) ? v : 0.0;
+        };
+    }
 
     // §3.3 material application. `albedoDefault_` is the per-material fallback for the
     // named input `a` — the one input with NO per-hit intrinsic, so an unbound `a` has
@@ -1618,9 +1752,11 @@ private:
             bool isSmits = (h == "rgbsmits" || h == "hsvsmits" || h == "hslsmits");
             bool isBox   = (h == "rgbbox"   || h == "hsvbox"   || h == "hslbox");
             bool isMeng  = (h == "rgbmeng"  || h == "hsvmeng"  || h == "hslmeng");
+            bool isUser  = isCustomColourHead(h);   // `rgb:<name>` — user `upsample` block
             if (isColourHead(h)) {
                 if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
-                std::string space = (isLine || isIllum || isSmits || isBox || isMeng) ? h.substr(0, 3) : h;
+                std::string space = (isLine || isIllum || isSmits || isBox || isMeng || isUser)
+                                        ? h.substr(0, 3) : h;
                 Vec3 c;
                 if      (space == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
                 else if (space == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
@@ -1629,6 +1765,11 @@ private:
                     double sigma = (w.size() > 4 && isNumber(w[4])) ? num(w[4]) : -1.0;
                     return rgbToLineEmission(c.x, c.y, c.z, sigma);
                 }
+                // A user upsampler runs AFTER the space conversion, so it always sees
+                // linear sRGB in (r, g, b) regardless of which of the three heads was
+                // written — same contract as every built-in, so `hsv:mine 0.3 1 1` and
+                // the equivalent `rgb:mine …` cannot disagree.
+                if (isUser) return applyUpsample(h.substr(4), c);
                 if (isIllum) return rgbToIlluminantJH(c.x, c.y, c.z);
                 if (isSmits) return rgbToReflectanceSmits(c.x, c.y, c.z);
                 if (isBox)   return rgbToReflectanceBox(c.x, c.y, c.z);
