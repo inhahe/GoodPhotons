@@ -8,6 +8,15 @@ status back into the originating file (`DESIGN.md`, `ROADMAP.md`, `OSCILLATE_GRA
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done.
 Origin tags point at the authoritative design text for each item.
 
+> **Looking for what's still left? Read [`open-work.md`](open-work.md) first.**
+> This file has become mostly a *record of what shipped*: most entries are long prose blocks
+> whose opening paragraph reads like a plan but whose later `**STATUS (date) … DONE**`
+> sub-paragraph says it landed, so an entry must be read to the end before it can be called
+> open. `open-work.md` is the actionable extract — the handful of genuinely-undone items, each
+> pointing back here for the full design text. **This file stays authoritative for design and
+> history; that one is authoritative for "what's next".** When an item lands or a new open item
+> appears, update both.
+
 ---
 
 ## NEXT UP — unify element headers to `name = KIND { … }` (do before the ftrace grammar port)
@@ -124,7 +133,9 @@ Origin tags point at the authoritative design text for each item.
         multilinear exactness (worst error 1e-8, float-pool storage), all three `outside` policies, and the
         compile/arity/scope rules. Cross-backend: `scraps/grid_test.ftsl` at 16384 spp agrees CPU↔GPU to **0.003 %**
         mean (RMS 0.99/255 — pure MC noise).
-      **Still open here:** the `[[…][…]](u,v)` *authoring* sugar (increment 2) reaching this same datatype.
+      *(Was: "still open here — the `[[…][…]](u,v)` authoring sugar (increment 2) reaching this same datatype."
+      **That shipped in v0.73.0** — see the increment-2 STATUS block below. The only piece of the sample call
+      still open is the keyword-rebind form `(a=u)`; it is listed in `open-work.md`.)*
       (Several names above were generalized by the scatter port immediately below — `PAT_GRID_MAX_DIM` →
       `PAT_ND_MAX_DIM`, `PatGridScope` → `PatTableScope`, `Scene::gridPool` → `Scene::dataPool`.)
     * **STATUS (2026-07-27): increment 3's RAGGED half — the N-D `scatter` datatype + sampler — is DONE
