@@ -944,6 +944,44 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `R`, `D`): the live status line (`[live] … photons, ~N% noise`) and noise estimation for
   `-noise` budgets.
 
+## Watertight raster coverage (shared by both backends, 0.98.2)
+
+Both rasterizers decide pixel coverage with **canonical edge functions**, so a pixel lying
+exactly on a shared triangle edge is claimed by exactly one of the two sharers — no hairline
+crack, no double-cover. `makeEdge` (raster.h) / `makeEdgeD` (raster_cuda.cu) build the rule:
+
+- **Canonical endpoint order.** Each edge's two endpoints are sorted lexicographically by
+  `(sx, sy)`. Both sharers therefore construct the same `P` and the same `Q - P` bit for bit,
+  whichever way round their own vertex list runs.
+- **Sign folded into the deltas.** `sf = sign(area) * flip`, and the stored deltas are
+  `sf * (Q - P)`. The two sharers always receive opposite `sf` — consistent winding flips
+  `flip`, inconsistent winding flips `sign(area)` instead — so their edge values are exact
+  negatives. This is what lets the engine keep accepting **either** winding, which it must,
+  because a mesh's triangle order may disagree with its vertex normals. (A classic
+  fixed-point + top-left fill rule would have required enforcing one winding.)
+- **Tie rule.** An exact zero is accepted only when `sf > 0` (cached as `tie`), true for
+  exactly one sharer. Non-zero values are unambiguous by construction, so no epsilon and no
+  fixed-point grid are needed.
+- **Anchored at `P`.** `v = dx*(py - Py) - dy*(px - Px)`, with the row term hoisted out of
+  the x-loop. The expanded affine form's constant (`Px*Qy - Py*Qx`) is ~W·H even for a short
+  edge; in `float` its ulp alone displaces the edge line ~1e-3 px, which does not break
+  shared *edges* but perturbs the three edges meeting at a shared *vertex* independently and
+  leaves an unclaimed sliver there.
+- **No incremental stepping, no derived third weight.** All three weights are evaluated
+  directly. Stepping would seed each sharer from its own `xlo`, destroying bitwise identity;
+  `w2 = 1 - w0 - w1` rounds asymmetrically for the same reason.
+- **CUDA defeats FMA contraction** with `edgeRow`/`edgeAt` (`__fmul_rn`/`__fsub_rn`). nvcc's
+  default `-fmad=true` would fuse `r - dy*ax`, leaving `r`'s rounding residual instead of a
+  clean zero — and it fuses *inconsistently*, since the two sharers test the edge under
+  different indices (`e0` vs `e1`). MSVC's default `/fp:precise` does not contract (the build
+  sets no `/fp:` flag), so raster.h needs no intrinsics.
+
+Five call sites share the rule: `fillTriangleG` and `fillTriangleClear` (raster.h), and
+`rasterRow`, `kShade`'s barycentric resolve, and `kClear` (raster_cuda.cu). It matters most
+in the clear pass, which *multiplies* into `clearT`/`milkT` — a doubly-covered edge would
+darken a seam twice, an uncovered one leaves a hairline of un-tinted glass. Costs ~4% on the
+CPU rasterizer; GPU unchanged. History and measurements in `known-issues.md`.
+
 ## GPU raster pipeline (`raster_cuda.cu`)
 
 Powers `-raster -device gpu` and the interactive explorer's per-frame redraws;

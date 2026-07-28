@@ -492,10 +492,94 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
 // Pass B: rasterize each valid slot into the 64-bit visibility buffer. Each covered pixel
 // packs (1/depth as float bits) << 32 | slotIdx; atomicMax keeps the nearest (largest
 // 1/depth) surface. Mirrors fillTriangleG's barycentric coverage + perspective 1/depth.
-// Per-slot rasterization setup: cull checks, clamped pixel bbox, area/derivatives.
+// --- Watertight coverage: canonical edge functions (device twin of raster.h's EdgeFn) ---
+//
+// The old incremental normalized barycentrics were not watertight: two triangles sharing
+// an edge seeded from different `xlo`, scaled by different 1/area and derived the third
+// weight as 1-w0-w1, so they computed different values for the same shared edge — and a
+// pixel centre landing exactly on it could be rejected by BOTH, leaving a crack. Instead
+// the edge's endpoints are put in a canonical (lexicographic) order before the
+// coefficients are formed, so both sharers build bitwise-identical P and Q-P, and the
+// value is the plain cross product about P — dx*(py-Py) - dy*(px-Px) — evaluated directly
+// so it never depends on where the span started. The winding sign sf = sign(area) * flip
+// is folded into dx/dy; the two sharers always get opposite sf (consistent winding flips
+// `flip`, inconsistent winding flips sign(area) instead), so their values are exact
+// negatives and exactly one accepts. Exact zeros are broken by `tie`, likewise true for
+// exactly one of the pair.
+//
+// Anchoring at P (instead of expanding to c + px*ex + py*ey) matters far more in float
+// than in double: the expanded constant Px*Qy - Py*Qx is ~W*H in magnitude even for a
+// short edge, and at 1080p its float ulp alone displaces the edge line by ~1e-3 px. That
+// never cracks a shared EDGE — both sharers are displaced identically — but the three
+// edges meeting at a shared VERTEX are perturbed independently, so a wide displacement
+// leaves a sliver there that no triangle claims (measured: one stray pixel per frame on
+// the cornell box's corners). Anchored at P every operand is a local offset and the
+// displacement drops to the point where no such pixel appears.
+// See the long comment on raster.h's EdgeFn for the full argument.
+struct DEdge { float Px, Py, dx, dy; bool tie; };
+
+__device__ inline DEdge makeEdgeD(float Px, float Py, float Qx, float Qy, float s) {
+    float flip = 1.0f;
+    if (Qx < Px || (Qx == Px && Qy < Py)) {                 // canonicalize the endpoint order
+        float tx = Px; Px = Qx; Qx = tx;
+        float ty = Py; Py = Qy; Qy = ty;
+        flip = -1.0f;
+    }
+    const float sf = s * flip;
+    DEdge e;
+    e.Px  = Px;  e.Py = Py;
+    e.dx  = sf * (Qx - Px);
+    e.dy  = sf * (Qy - Py);
+    e.tie = sf > 0.0f;
+    return e;
+}
+
+// Evaluate the edge function, split into a per-row part and a per-pixel part.
+//
+// These MUST use the explicit round-to-nearest intrinsics rather than the natural
+// `r - e.dy * (p - e.Px)`. nvcc defaults to -fmad=true and would contract that into an
+// FMA, which evaluates dy*ax exactly and subtracts it from the ALREADY-ROUNDED r, leaving
+// r's rounding residual behind: a pixel sitting exactly on the edge then comes out as
+// ±0.5 ulp instead of 0. On its own that would still be harmless — the residual is
+// antisymmetric, so one sharer would get + and the other −. What breaks is that the two
+// sharers test the same edge under DIFFERENT indices (e0 for one triangle, e1 for the
+// other, since the edge sits opposite a different vertex in each), and those are separate
+// expressions the compiler may contract independently. Measured on the cornell box's
+// bottom-back-right corner at 640×480: the floor triangle's e0 came out -9.24e-07 (a
+// contracted FMA's residual) while the right wall's e1 came out exactly 0 with tie=false,
+// so BOTH rejected and the corner pixel was a hole.
+//
+// With separately rounded products the two products of a true tie are roundings of the
+// same real number, hence bit-identical, hence the difference is exactly 0 — and every
+// operation is exactly antisymmetric under negating dx/dy, whatever the compiler does
+// with the surrounding code. (The CPU twin in raster.h needs no intrinsics because MSVC's
+// default /fp:precise does not contract; the build sets no /fp: flag.)
+__device__ inline float edgeRow(const DEdge& e, float py) {
+    return __fmul_rn(e.dx, py - e.Py);
+}
+__device__ inline float edgeAt(const DEdge& e, float r, float px) {
+    return __fsub_rn(r, __fmul_rn(e.dy, px - e.Px));
+}
+
+// The three edge functions of a projected sub-triangle, plus 1/|area| to normalize the
+// edge values into barycentric weights (edge i sits opposite vertex i, so its value IS
+// that vertex's unnormalized weight).
+struct DEdges { DEdge e0, e1, e2; float invA; };
+
+__device__ inline DEdges makeEdgesD(const DGeo& t, float area) {
+    const float s = (area > 0.0f) ? 1.0f : -1.0f;
+    DEdges E;
+    E.e0 = makeEdgeD(t.sx1, t.sy1, t.sx2, t.sy2, s);
+    E.e1 = makeEdgeD(t.sx2, t.sy2, t.sx0, t.sy0, s);
+    E.e2 = makeEdgeD(t.sx0, t.sy0, t.sx1, t.sy1, s);
+    E.invA = (fabsf(area) > 1e-12f) ? 1.0f / fabsf(area) : 0.0f;
+    return E;
+}
+
+// Per-slot rasterization setup: cull checks, clamped pixel bbox, edge functions.
 // This is the exact preamble of the old monolithic kRaster, factored out so the
 // classifier and all three binned kernels compute identical values.
-struct SlotSetup { int xlo, xhi, ylo, yhi; float inv, dw0dx, dw1dx; };
+struct SlotSetup { int xlo, xhi, ylo, yhi; DEdges E; };
 
 __device__ inline bool setupSlot(const DGeo& t, int flg, int W, int H, int seeThrough, SlotSetup& s) {
     if (!(flg & kSlotValid)) return false;
@@ -509,26 +593,31 @@ __device__ inline bool setupSlot(const DGeo& t, int flg, int W, int H, int seeTh
     if (s.xlo > s.xhi || s.ylo > s.yhi) return false;
     float area = (t.sx1 - t.sx0) * (t.sy2 - t.sy0) - (t.sy1 - t.sy0) * (t.sx2 - t.sx0);
     if (fabsf(area) < 1e-9f) return false;
-    s.inv = 1.0f / area;
-    s.dw0dx = (t.sy1 - t.sy2) * s.inv;
-    s.dw1dx = (t.sy2 - t.sy0) * s.inv;
+    s.E = makeEdgesD(t, area);
     return true;
 }
 
-// Rasterize ONE bbox row of one sub-triangle: seed the barycentrics at the row's left
-// edge by direct evaluation (exactly as the old kernel did per row) and step
-// incrementally along x. The float arithmetic per (slot,row) is identical no matter
-// which thread executes it, and the atomicMax visibility merge is order-independent,
-// so any distribution of rows across threads yields bit-identical output.
+// Rasterize ONE bbox row of one sub-triangle: evaluate the three canonical edge functions
+// at each pixel centre from the row constant, with no incremental stepping (which is what
+// makes shared edges watertight — see DEdge above). The float arithmetic per (slot,row) is
+// identical no matter which thread executes it, and the atomicMax visibility merge is
+// order-independent, so any distribution of rows across threads yields bit-identical output.
 __device__ inline void rasterRow(const DGeo& t, int slot, int y, const SlotSetup& s,
                                  int W, unsigned long long* vis) {
-    float py = y + 0.5f, pxL = s.xlo + 0.5f;
-    float w0 = ((t.sx1 - pxL) * (t.sy2 - py) - (t.sy1 - py) * (t.sx2 - pxL)) * s.inv;
-    float w1 = ((t.sx2 - pxL) * (t.sy0 - py) - (t.sy2 - py) * (t.sx0 - pxL)) * s.inv;
+    const float py = y + 0.5f;
+    const float r0 = edgeRow(s.E.e0, py);            // row constants: shared bitwise by both sharers
+    const float r1 = edgeRow(s.E.e1, py);
+    const float r2 = edgeRow(s.E.e2, py);
     unsigned long long row = (unsigned long long)y * W + s.xlo;
-    for (int x = s.xlo; x <= s.xhi; ++x, ++row, w0 += s.dw0dx, w1 += s.dw1dx) {
-        float w2 = 1.0f - w0 - w1;
-        if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+    for (int x = s.xlo; x <= s.xhi; ++x, ++row) {
+        const float px = x + 0.5f;
+        const float v0 = edgeAt(s.E.e0, r0, px);
+        if (v0 < 0.0f || (v0 == 0.0f && !s.E.e0.tie)) continue;
+        const float v1 = edgeAt(s.E.e1, r1, px);
+        if (v1 < 0.0f || (v1 == 0.0f && !s.E.e1.tie)) continue;
+        const float v2 = edgeAt(s.E.e2, r2, px);
+        if (v2 < 0.0f || (v2 == 0.0f && !s.E.e2.tie)) continue;
+        const float w0 = v0 * s.E.invA, w1 = v1 * s.E.invA, w2 = v2 * s.E.invA;
         float invd = w0 * t.invd0 + w1 * t.invd1 + w2 * t.invd2;   // 1/depth
         if (invd <= 0.0f) continue;
         unsigned long long packed =
@@ -646,15 +735,17 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     int slot = (int)(unsigned int)(v & 0xffffffffULL);
     const DGeo& t = geos[slot];
 
-    // Recompute barycentrics at this pixel's centre.
+    // Recompute barycentrics at this pixel's centre. Evaluating the SAME canonical edge
+    // functions rasterRow used, in the same order, reproduces its weights bit for bit —
+    // so the 1/depth stored here is exactly the one that won the atomicMax.
     int px = (int)(i % (unsigned long long)W);
     int py = (int)(i / (unsigned long long)W);
     float fx = px + 0.5f, fy = py + 0.5f;
     float area = (t.sx1 - t.sx0) * (t.sy2 - t.sy0) - (t.sy1 - t.sy0) * (t.sx2 - t.sx0);
-    float inv = (fabsf(area) > 1e-12f) ? 1.0f / area : 0.0f;
-    float w0 = ((t.sx1 - fx) * (t.sy2 - fy) - (t.sy1 - fy) * (t.sx2 - fx)) * inv;
-    float w1 = ((t.sx2 - fx) * (t.sy0 - fy) - (t.sy2 - fy) * (t.sx0 - fx)) * inv;
-    float w2 = 1.0f - w0 - w1;
+    DEdges E = makeEdgesD(t, area);
+    float w0 = edgeAt(E.e0, edgeRow(E.e0, fy), fx) * E.invA;
+    float w1 = edgeAt(E.e1, edgeRow(E.e1, fy), fx) * E.invA;
+    float w2 = edgeAt(E.e2, edgeRow(E.e2, fy), fx) * E.invA;
     float invd = w0 * t.invd0 + w1 * t.invd1 + w2 * t.invd2;
     zbuf[i] = invd;
 
@@ -759,19 +850,27 @@ __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
 
     float area = (t.sx1 - t.sx0) * (t.sy2 - t.sy0) - (t.sy1 - t.sy0) * (t.sx2 - t.sx0);
     if (fabsf(area) < 1e-9f) return;
-    float inv = 1.0f / area;
-    const float dw0dx = (t.sy1 - t.sy2) * inv;
-    const float dw1dx = (t.sy2 - t.sy0) * inv;
+    // Same watertight coverage as rasterRow. It matters even more here: the clear pass
+    // MULTIPLIES into clearT/milkT, so an edge covered by both sharers would darken a seam
+    // line twice, and one covered by neither would leave a hairline of un-tinted glass.
+    const DEdges E = makeEdgesD(t, area);
     const float tau = clarity;
 
     for (int y = ylo; y <= yhi; ++y) {
-        float py = y + 0.5f, pxL = xlo + 0.5f;
-        float w0 = ((t.sx1 - pxL) * (t.sy2 - py) - (t.sy1 - py) * (t.sx2 - pxL)) * inv;
-        float w1 = ((t.sx2 - pxL) * (t.sy0 - py) - (t.sy2 - py) * (t.sx0 - pxL)) * inv;
+        const float py = y + 0.5f;
+        const float r0 = edgeRow(E.e0, py);
+        const float r1 = edgeRow(E.e1, py);
+        const float r2 = edgeRow(E.e2, py);
         int row = y * W + xlo;
-        for (int x = xlo; x <= xhi; ++x, ++row, w0 += dw0dx, w1 += dw1dx) {
-            float w2 = 1.0f - w0 - w1;
-            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+        for (int x = xlo; x <= xhi; ++x, ++row) {
+            const float px = x + 0.5f;
+            const float v0 = edgeAt(E.e0, r0, px);
+            if (v0 < 0.0f || (v0 == 0.0f && !E.e0.tie)) continue;
+            const float v1 = edgeAt(E.e1, r1, px);
+            if (v1 < 0.0f || (v1 == 0.0f && !E.e1.tie)) continue;
+            const float v2 = edgeAt(E.e2, r2, px);
+            if (v2 < 0.0f || (v2 == 0.0f && !E.e2.tie)) continue;
+            const float w0 = v0 * E.invA, w1 = v1 * E.invA, w2 = v2 * E.invA;
             float invd = w0 * t.invd0 + w1 * t.invd1 + w2 * t.invd2;   // 1/depth
             if (invd <= zbuf[row]) continue;   // behind (or at) the opaque surface: occluded
             // Grazing term from the interpolated normal for a silhouette milk rim.

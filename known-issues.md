@@ -86,7 +86,7 @@ took over both. Measured @ 3840²: host `render 21.97 + tail 4.17 = 26.1 ms` vs 
 `WM_PRINTCLIENT` captures (bit-identical), and the fallbacks were exercised individually
 (forward photon mode B, `FTRACE_LIVE_GDI=1`, window resize → re-register, `+Pt` overlay).
 
-### BUG — open: the CPU rasterizer leaks a hairline CRACK along a shared triangle edge (the GPU one doesn't)
+### BUG — DONE (2026-07-28, v0.98.2): the CPU rasterizer leaks a hairline CRACK along a shared triangle edge (the GPU one doesn't)
 
 **Symptom.** In the `-raster` preview a thin dark diagonal streak cuts across the cornell
 box's ceiling/right-wall seam. Reproduce:
@@ -126,35 +126,71 @@ being decided by floating-point noise:
   non-negative where `double` lands them negative. It is not more correct, just differently
   wrong, and another scene/resolution could crack it too.
 
-**Fix.** Make the coverage decision **exact**, then break the tie by rule:
+**Fix as implemented — canonical edge functions (no fixed point, no top-left rule).**
+The fixed-point/top-left plan sketched originally was dropped: it needs consistent winding,
+which this codebase deliberately does *not* enforce (it accepts either sign of `area`
+because a mesh's winding may disagree with its vertex normals). The shipped fix gets exact
+tie *detection* out of plain floating point instead, by making the two sharers of an edge
+evaluate it from **bitwise-identical operands**:
 
-1. Snap screen-space X/Y to a fixed-point subpixel grid (1/16 or 1/256 px, as D3D/GL do)
-   and compute the three edge functions in **64-bit integers**. Both triangles then derive
-   a shared edge from the *same two endpoint values*, so their edge functions are exact
-   negations — a tie becomes a real, detectable tie instead of noise. Compute all three
-   edges directly; drop the derived `w2 = 1 - w0 - w1` asymmetry.
-2. Apply a **top-left fill rule**: bias each edge by `-1` fixed-point unit unless it is a
-   top or left edge, then accept on `E >= 0`. The two triangles sharing an edge traverse it
-   in opposite directions, so it is top-left for exactly one of them — exactly one claims
-   the pixel. No crack, no double-cover.
-3. This needs **consistent winding**, which the code does not currently enforce (it accepts
-   either sign of `area` and normalizes by dividing by it). Swap two vertices when
-   `area < 0` before building the edges, or negate the edges and mirror the predicate.
-4. Keep attribute interpolation in floating point exactly as now — only accept/reject needs
-   exactness — and keep the incremental stepping (integer stepping is exact, so it also
-   removes the current per-row drift).
-5. Apply the identical change to **all four sites**: `fillTriangleG` and the see-through
-   fill in raster.h, and `rasterRow`/`kShade`'s resolve/`kClear` in raster_cuda.cu.
+1. **Canonicalize each edge's endpoint order** lexicographically by `(sx, sy)`
+   (`makeEdge` / `makeEdgeD`). Both sharers then build the same `P` and the same `Q - P`,
+   bit for bit, regardless of which way round their own vertex list runs.
+2. **Fold the orientation sign into the deltas**: `sf = sign(area) * flip`, and store
+   `dx, dy = sf * (Q - P)`. The two sharers *always* get opposite `sf` — consistent winding
+   flips `flip`, inconsistent winding flips `sign(area)` instead — so their edge values are
+   exact negatives of each other. Negation is exact in IEEE and round-to-nearest is
+   symmetric under it, so this costs no accuracy and no extra register.
+3. **Tie rule**: accept an exact zero only when `sf > 0` (stored as `tie`). That holds for
+   exactly one of the two sharers, so a pixel dead-on the edge is claimed exactly once —
+   no crack, no double-cover. Non-zero values are unambiguous by construction.
+4. **Anchor the evaluation at `P`**: `v = dx*(py - Py) - dy*(px - Px)`, with the `dx*(py-Py)`
+   term hoisted per row. The expanded affine form's constant `Px*Qy - Py*Qx` is ~W·H in
+   magnitude even for a short edge — in `float` its ulp alone displaces the edge line by
+   ~1e-3 px. Shared *edges* stay watertight either way, but the three edges meeting at a
+   shared *vertex* are perturbed independently, and that leaves an unclaimed sliver there.
+   Anchored at `P`, every operand is a local offset. (Measured: the affine form left 1 hole
+   at 3 of 6 test resolutions; the anchored form leaves none.)
+5. **Drop the incremental stepping and the derived `w2 = 1 - w0 - w1`.** Each of the three
+   weights is now evaluated directly. Stepping cannot be kept: each sharer would seed its
+   accumulator from its own `xlo`, so the values would no longer be bitwise identical.
+6. **CUDA only — defeat FMA contraction.** nvcc defaults to `-fmad=true` and contracts
+   `r - dy*(px - Px)` into an FMA, which evaluates `dy*ax` exactly and subtracts it from the
+   *already rounded* `r`, leaving `r`'s ±0.5-ulp rounding residual instead of a clean zero.
+   Worse, it applies inconsistently: the two sharers test the same edge under *different*
+   indices (`e0` vs `e1`), separate expressions the compiler contracts independently.
+   Measured at the cornell box's bottom-back-right corner at 640×480, the floor's `e0` came
+   out `-9.24e-07` while the right wall's `e1` was exactly `0` with `tie == false` — both
+   rejected. Fixed with `edgeRow`/`edgeAt` wrapping `__fmul_rn`/`__fsub_rn`. The CPU twin
+   needs no intrinsics: MSVC's default `/fp:precise` does not contract, and the build sets
+   no `/fp:` flag — which is exactly why the CPU was clean here and the GPU was not.
+7. Applied to **all five sites**: `fillTriangleG` and `fillTriangleClear` in raster.h, and
+   `rasterRow` / `kShade`'s barycentric resolve / `kClear` in raster_cuda.cu. It matters
+   most in the clear pass, which *multiplies* into `clearT`/`milkT`: a doubly-covered edge
+   would darken a seam line twice, an uncovered one leaves a hairline of un-tinted glass.
 
 Rejected alternative: widening the accept to `w > -eps` turns cracks into double-coverage
 (mostly harmless here, since the z-test's strict `>` lets the first writer win). But the
-epsilon is scale-dependent and it only moves the failure rather than removing it — the
-project rule is the proper fix.
+epsilon is scale-dependent and it only moves the failure rather than removing it.
 
-**Wider implication.** The CPU and GPU rasterizers are **not** pixel-identical today, so
-`-device` is not a pure performance switch for `-raster`. Fixing the fill rule on both
-sides is what would make it one — and it *will* change output bytes, so any golden images
-need regenerating in the same commit.
+**Verification.** Interior holes at 800×600 went **127 → 0** on the CPU, and both backends
+now report **0 interior holes at all eight tested resolutions** (800×600, 801×600, 800×601,
+1024×768, 1280×720, 640×480, 1920×1080, 3840×2160). Hole detection is
+`scraps/_crack.py` (a clear-coloured pixel with non-clear neighbours on left+right or
+up+down).
+
+**Cost.** ~4% on the CPU rasterizer (crystalloop, 120 frames at 1920×1080: 13.15 s → 13.70 s);
+GPU unchanged within noise (0.92 s → 0.90 s). That is the price of evaluating three edge
+functions per pixel instead of stepping two — it cannot be recovered without giving up the
+bitwise identity the fix depends on.
+
+**Wider implication.** The CPU and GPU rasterizers are still not *byte*-identical — CPU
+evaluates in `double`, GPU in `float`, so at resolutions where an edge lands dead-on many
+pixel centres the two can hand a tie pixel to different (but always to *some*) triangle.
+Residual cornell-box disagreement: 188 px at 800×600, 2 px at 801×600, 6 px at 800×601,
+1183 px at 3840×2160 — and **none of them involve the clear colour**, i.e. every one is one
+real surface vs another, never a hole. So `-device` is now a safe switch for `-raster`
+coverage, but not a bit-exact one. Output bytes changed, so golden images need regenerating.
 
 ### BUG — DONE (2026-07-28, v0.98.1): a dark fringe of speckles on the tessellated sphere's silhouette (both backends, identically)
 
