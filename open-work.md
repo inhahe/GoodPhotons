@@ -89,13 +89,24 @@ is not to burn expensive photon-map renders on a room/flyby that hasn't been app
 
 Once you say "I like it", D2/D3 unblock.
 
-### E2 slice 3 — generalize the C++ `camera_curve` editor  *(ftrace; interactive)*
+### E2 slice 3b — the editor's LIVE channel + binding panel  *(ftrace; interactive)*
 *TODO.md §E2.*
 
 Slices 1–2 landed 2026-07-24 (config model + the live-value channel: `collect_slots`,
-`SceneDriver`, `LiveSession`/`serve_live`, 23 tests). Slice 3 is the C++ half — make the editor
-seed from and write back the sidecar, and target **arbitrary scene variables** rather than just
-the camera curve.
+`SceneDriver`, `LiveSession`/`serve_live`). **Slice 3a landed 2026-07-28 (v0.94.0)**: `ftrace
+-anim <sidecar.json>` makes the fly editor edit loom's N-D *drive* — control points seed from the
+sidecar (channels 0–2 spatial, 3.. carried per point), and Save writes the reshaped curve back
+atomically with every channel→variable binding preserved (`src/curvedrive.h`, +10 loom `anim`
+tests for the Python side: `slots`, `dims`, the `--config` default and the `python -m loom.anim`
+CLI).
+
+What's left is the interactive-feel half:
+- **live values** — spawn `python -m loom.anim <scene.py> --config <sidecar>` from the editor and
+  push a `frame` message per scrub position (one-slot latest-wins worker, the `LoomLink` /
+  `LoomBridge` pattern already in `src/viewer_gui.cpp`), reloading the returned `.ftsl` so the
+  viewport shows the *bound scene variables* moving, not just the camera.
+- **binding panel** — add/remove/retarget channel bindings from a pick-list fed by the `slots`
+  command (no text entry in the GDI panel), plus `dims` grow/shrink.
 
 `TODO.md` flags this as *"best done with the user present"* — it's an interactive UI whose feel
 can't be validated headlessly. Not blocked technically; blocked on being worth doing together.

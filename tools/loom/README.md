@@ -78,6 +78,8 @@ tools/loom/
 │   ├── vdbio.py     bake a field to a dense grid → OpenVDB .vdb (density/temperature); reads .vdb and NanoVDB .nvdb
 │   ├── axes.py      axis-typed signals: broadcast/pin/mod composition + sample/reduce grammar + lower() onto any scene value-site
 │   ├── anim.py      N-D curve → scene-variable go-between: config + JSON sidecar + value fan-out + named slots + live pipe
+│   │                (`python -m loom.anim scene.py --config drive.json` serves the live loop over stdio;
+│   │                 ftrace reshapes the same sidecar in its fly editor with `ftrace scene.ftsl -anim drive.json`)
 │   ├── material.py  function-driven materials (waves/checker/rings/blobs, mixes)
 │   ├── scene.py     Scene / Camera / Material / Texture (image skins) / geometry / Volume media (all animatable)
 │   ├── transform.py per-object Transform (translate/rotate/scale/skew, animatable) → ftsl group{}; dataset inverse-map

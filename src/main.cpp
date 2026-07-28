@@ -147,6 +147,7 @@
 #include "lights.h"
 #include "mesh.h"
 #include "ftsl.h"
+#include "curvedrive.h"         // -anim: loom CurveDrive JSON sidecar (E2 channel a) read/write
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
@@ -4913,6 +4914,8 @@ static void printHelp(const char* prog) {
 "  -raster-iso <n>       marching-cubes resolution for isosurfaces (0 = skip)\n"
 "  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T for a live path-traced preview\n"
 "  -noclip|-nocollide    start the fly viewer with wall collision off\n"
+"  -anim <file.json>     edit a loom CurveDrive sidecar in the fly viewer (implies -explore);\n"
+"                        control points seed from it and Save writes the reshaped curve back\n"
 "  -see-through|-glass   render clear dielectrics as see-through; -glass-clarity <0..1>\n"
 "\n"
 "Stereoscopic 3-D output:\n"
@@ -5055,6 +5058,7 @@ static int run(int argc, char** argv) {
     bool exploreMode = false;     // -explore/-fly: raster + interactive fly viewer seeded at the first selected frame (no full render)
     bool noMeter     = false;     // -no-meter/-nometer: skip the exposure-lock metering pre-pass (frames auto-expose instead)
     bool viewerNoclip = false;    // -noclip/-nocollide: start the interactive fly-viewer with collision OFF (fly through walls)
+    std::string animSidecar;      // -anim <file.json>: loom CurveDrive sidecar the curve editor seeds from / saves back to (E2 channel a)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
     bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
     int  rasterBench = 0;         // -raster-bench <n>: render the first camera n times, report steady-state ms/frame (explorer metric)
@@ -5364,6 +5368,13 @@ static int run(int argc, char** argv) {
             // The exposure-lock metering pre-pass is pointless here (the viewer auto-exposes
             // per frame), and metering a whole flyby's frames just to fly one is wasteful,
             // so explore implies -no-meter.
+            exploreMode = true; doRaster = true; g_showWindow = true; g_keepWindow = true; noMeter = true;
+        }
+        else if (!std::strcmp(argv[i], "-anim") && i + 1 < argc) {
+            // Edit a loom `CurveDrive` sidecar (E2 channel a) instead of a bare camera
+            // path: the editor's control points ARE the drive's N-D curve, and Save
+            // writes the reshaped curve back to this file. Implies the fly editor.
+            animSidecar = argv[++i];
             exploreMode = true; doRaster = true; g_showWindow = true; g_keepWindow = true; noMeter = true;
         }
         else if (!std::strcmp(argv[i], "-no-meter") || !std::strcmp(argv[i], "-nometer")) noMeter = true;
@@ -6851,11 +6862,52 @@ static int run(int argc, char** argv) {
             // curve's natural pace, >1 faster / <1 slower. Kept in lockstep with editPts and
             // exported on Save as `density_at` keyframes (camera density = inverse speed).
             std::vector<double> ptSpeed;
+            // ---- loom CurveDrive sidecar (-anim, E2 "channel a") ----------------------
+            // With `-anim <file.json>` the editor is reshaping loom's N-dimensional DRIVE
+            // curve, not merely a camera path: the control points ARE the drive's points.
+            // Channels 0..2 are what the viewport draws and the mouse moves (for a flyby
+            // drive that is literally the camera eye); channels 3.. are values no 3-D
+            // viewport can show, so they ride along per point in `ptExtra` and are written
+            // back untouched. `animDrive` holds everything the editor does NOT own — the
+            // drive's name, mode, closed flag and its channel->scene-variable bindings — so
+            // saving a reshaped curve never drops associations loom put there.
+            curvedrive::Drive animDrive;
+            bool animActive = false;                   // -anim given (sidecar loaded or to be created)
+            int  animDims   = 0;                       // drive channel count (0 = not driving a sidecar)
+            std::vector<std::vector<double>> ptExtra;  // per point, channels 3.. (each animDims-3 long)
+            auto animExtraCount = [&]() -> size_t { return (size_t)std::max(0, animDims - 3); };
+            // editPts carries two parallel per-point side tracks (the painted speed
+            // multiplier and the anim extra channels). Every add/insert/erase goes through
+            // these two helpers so a track can never drift out of alignment with the points
+            // it annotates — a silent misalignment would mis-assign speeds and channels to
+            // the wrong points on the next Save.
+            auto trackInsert = [&](size_t i) {
+                ptSpeed.insert(ptSpeed.begin() + std::min(i, ptSpeed.size()), 1.0);
+                size_t ne = animExtraCount();
+                if (!ne) { ptExtra.insert(ptExtra.begin() + std::min(i, ptExtra.size()), std::vector<double>()); return; }
+                // A new point inherits its unseen channels from its neighbours (midpoint in
+                // the middle, a copy at either end); zeroing them would silently punch a
+                // hole in every non-spatial channel the drive carries.
+                const std::vector<double>* a = (i > 0 && i - 1 < ptExtra.size()) ? &ptExtra[i - 1] : nullptr;
+                const std::vector<double>* b = (i < ptExtra.size()) ? &ptExtra[i] : nullptr;
+                std::vector<double> ex(ne, 0.0);
+                for (size_t c = 0; c < ne; ++c) {
+                    double va = (a && c < a->size()) ? (*a)[c] : 0.0;
+                    double vb = (b && c < b->size()) ? (*b)[c] : 0.0;
+                    ex[c] = (a && b) ? 0.5 * (va + vb) : (a ? va : vb);
+                }
+                ptExtra.insert(ptExtra.begin() + std::min(i, ptExtra.size()), std::move(ex));
+            };
+            auto trackErase = [&](size_t i) {
+                if (i < ptSpeed.size()) ptSpeed.erase(ptSpeed.begin() + i);
+                if (i < ptExtra.size()) ptExtra.erase(ptExtra.begin() + i);
+            };
             // Current free pose as a control-point frame.
             auto poseNow = [&]() -> PathFrame { return PathFrame{eye, fwd, worldUp, fovY}; };
             // Regenerate the preview path (explorePath) + timeline from the control points.
             auto rebuildPath = [&]() {
-                ptSpeed.resize(editPts.size(), 1.0);   // safety: keep the speed track sized to the points
+                ptSpeed.resize(editPts.size(), 1.0);   // safety: keep the side tracks sized to the points
+                ptExtra.resize(editPts.size(), std::vector<double>(animExtraCount(), 0.0));
                 int oldCount = pathCount;
                 explorePath.clear();
                 int n = (int)editPts.size();
@@ -6937,6 +6989,69 @@ static int run(int argc, char** argv) {
                             n, ac.name.c_str());
                 std::fflush(stdout);
             }
+            // -anim: seed from the loom CurveDrive sidecar. This runs AFTER the camera_curve
+            // seed above so an explicitly-named drive wins over whatever curve the scene
+            // happened to carry. A sidecar that does not exist yet is not an error — that is
+            // how you START a drive from the editor: keep whatever points the scene seeded
+            // (or none) and let the first Save create the file.
+            if (!animSidecar.empty()) {
+                animActive = true;
+                std::string err;
+                curvedrive::Drive d;
+                if (curvedrive::load(animSidecar, d, err)) {
+                    animDrive = d;
+                    animDims  = d.dims;
+                    int n = (int)d.points.size();
+                    editPts.clear(); editPts.reserve((size_t)n);
+                    ptExtra.assign((size_t)n, std::vector<double>(animExtraCount(), 0.0));
+                    for (int i = 0; i < n; ++i) {
+                        const std::vector<double>& p = d.points[(size_t)i];
+                        Vec3 e{p.size() > 0 ? p[0] : 0.0, p.size() > 1 ? p[1] : 0.0, p.size() > 2 ? p[2] : 0.0};
+                        editPts.push_back(PathFrame{e, fwd, worldUp, fovY});
+                        for (size_t c = 3; c < p.size(); ++c) ptExtra[(size_t)i][c - 3] = p[c];
+                    }
+                    // A drive is a curve of VALUES, so the sidecar stores no orientation. Aim
+                    // each point down the chord to its successor (the last one keeps its
+                    // predecessor's aim) — the same direction `look curve` would produce, and
+                    // any of it can be re-aimed by orientation painting.
+                    for (int i = 0; i < n; ++i) {
+                        int a = (i + 1 < n) ? i : i - 1, b = (i + 1 < n) ? i + 1 : i;
+                        if (a < 0 || b < 0) break;
+                        Vec3 ch = editPts[(size_t)b].eye - editPts[(size_t)a].eye;
+                        if (dot(ch, ch) > 1e-18) editPts[(size_t)i].fwd = norml(ch);
+                    }
+                    ptSpeed.assign((size_t)n, 1.0);
+                    rebuildPath();
+                    if (g_liveWin) g_liveWin->setEditState(false, n);
+                    std::printf("[editor] -anim: drive \"%s\" (%s) — %d points x %d channels, %zu binding(s) from %s\n",
+                                d.name.c_str(), d.mode.c_str(), n, d.dims,
+                                d.bindings.size(), animSidecar.c_str());
+                    if (!d.bindings.empty()) {
+                        for (const auto& b : d.bindings)
+                            std::printf("[editor]   ch%d -> %s (%s, gain %.4g, %s)\n",
+                                        b.channel, b.target.c_str(), b.mode.c_str(), b.gain, b.kind.c_str());
+                    }
+                    if (d.dims > 3)
+                        std::printf("[editor]   channels 3..%d are not spatial — carried per point and saved unchanged\n",
+                                    d.dims - 1);
+                } else {
+                    // Fresh drive: the editor's own points are the camera path, so label it a
+                    // flyby (loom's "channels collapse to camera pose") with the three spatial
+                    // channels. Bindings can be added later by loom or a future panel.
+                    animDims = 3;
+                    animDrive = curvedrive::Drive();
+                    animDrive.dims = 3;
+                    animDrive.mode = curvedrive::kModeFlyby;
+                    { std::string b = inFile ? std::string(inFile) : std::string("scene");
+                      size_t sl = b.find_last_of("/\\"); if (sl != std::string::npos) b = b.substr(sl + 1);
+                      size_t dt = b.find_last_of('.');   if (dt != std::string::npos) b = b.substr(0, dt);
+                      animDrive.name = b + "_drive"; }
+                    ptExtra.assign(editPts.size(), std::vector<double>());
+                    std::printf("[editor] -anim: starting a new drive \"%s\" (%s) — Save writes %s\n",
+                                animDrive.name.c_str(), err.c_str(), animSidecar.c_str());
+                }
+                std::fflush(stdout);
+            }
             // Write the authored control points as a camera_curve .ftsl block, next to the
             // scene file AND echoed to stdout so it can be pasted straight into a scene.
             auto saveCurveFn = [&]() {
@@ -7011,6 +7126,37 @@ static int run(int argc, char** argv) {
                     std::printf("[editor] FAILED to write %s — block echoed below only\n", outPath.c_str());
                 }
                 std::printf("%s", blk.c_str());
+                // -anim: write the reshaped drive back to its sidecar (E2 channel a). The
+                // editor owns only the point LIST — each point's spatial channels come from
+                // its eye, its non-spatial channels from the values it carried in. Name,
+                // mode, closed flag, dims and every channel->variable binding are copied
+                // from whatever the sidecar last held, so an editing pass here reshapes the
+                // curve without ever dropping an association loom authored.
+                if (animActive) {
+                    curvedrive::Drive d = animDrive;
+                    d.dims = std::max(1, animDims);
+                    d.points.clear(); d.points.reserve(editPts.size());
+                    for (size_t i = 0; i < editPts.size(); ++i) {
+                        std::vector<double> row((size_t)d.dims, 0.0);
+                        const Vec3& e = editPts[i].eye;
+                        if (d.dims > 0) row[0] = e.x;
+                        if (d.dims > 1) row[1] = e.y;
+                        if (d.dims > 2) row[2] = e.z;
+                        for (int c = 3; c < d.dims; ++c)
+                            row[(size_t)c] = (i < ptExtra.size() && (size_t)(c - 3) < ptExtra[i].size())
+                                           ? ptExtra[i][(size_t)(c - 3)] : 0.0;
+                        d.points.push_back(std::move(row));
+                    }
+                    std::string serr;
+                    if (curvedrive::save(animSidecar, d, serr)) {
+                        animDrive = d;   // the sidecar and the editor now agree
+                        std::printf("[editor] saved drive \"%s\" (%zu points x %d channels, %zu binding(s)) to %s\n",
+                                    d.name.c_str(), d.points.size(), d.dims, d.bindings.size(),
+                                    animSidecar.c_str());
+                    } else {
+                        std::printf("[editor] FAILED to write sidecar %s: %s\n", animSidecar.c_str(), serr.c_str());
+                    }
+                }
                 std::fflush(stdout);
             };
             // The currently SELECTED control point — the target Del removes and the overlay
@@ -7288,7 +7434,7 @@ static int run(int argc, char** argv) {
                         std::printf("[editor] recording flythrough (fly around; press Rec again to stop)\n");
                     } else {
                         std::vector<PathFrame> got = (!recRaw && recTol > 0.0) ? simplify(recRawBuf, recTol) : recRawBuf;
-                        for (const auto& g : got) { editPts.push_back(g); ptSpeed.push_back(1.0); }
+                        for (const auto& g : got) { editPts.push_back(g); trackInsert(editPts.size() - 1); }
                         rebuildPath();
                         std::printf("[editor] recorded %zu control points from %zu raw samples (tol %.4g, %s)\n",
                                     got.size(), recRawBuf.size(), recTol, recRaw ? "raw" : "simplified");
@@ -7297,14 +7443,14 @@ static int run(int argc, char** argv) {
                     std::fflush(stdout); changed = true;
                 }
                 if (nav.addPoint) {
-                    editPts.push_back(poseNow()); ptSpeed.push_back(1.0);
+                    editPts.push_back(poseNow()); trackInsert(editPts.size() - 1);
                     rebuildPath();
                     g_liveWin->setEditState(recording, (int)editPts.size());
                     std::printf("[editor] +point %zu at eye(%s)\n", editPts.size(), fmt3(eye).c_str());
                     std::fflush(stdout); changed = true;
                 }
                 if (nav.insPoint) {
-                    if (editPts.size() < 2) { editPts.push_back(poseNow()); ptSpeed.push_back(1.0); }
+                    if (editPts.size() < 2) { editPts.push_back(poseNow()); trackInsert(editPts.size() - 1); }
                     else {
                         // Insert between the two control points bracketing the current scrub
                         // position. bracket() normalizes by the ACTUAL explorePath length, so this
@@ -7313,7 +7459,7 @@ static int run(int argc, char** argv) {
                         int seg; double fr; bracket(pathPos, seg, fr);
                         seg = std::clamp(seg, 0, (int)editPts.size() - 2);
                         editPts.insert(editPts.begin() + seg + 1, poseNow());
-                        ptSpeed.insert(ptSpeed.begin() + std::min((size_t)seg + 1, ptSpeed.size()), 1.0);
+                        trackInsert((size_t)seg + 1);
                     }
                     rebuildPath();
                     g_liveWin->setEditState(recording, (int)editPts.size());
@@ -7324,7 +7470,7 @@ static int run(int argc, char** argv) {
                     int best = selectedPoint();   // the highlighted (selected) point — scrub to choose it
                     if (best < 0) best = 0;
                     editPts.erase(editPts.begin() + best);
-                    if ((size_t)best < ptSpeed.size()) ptSpeed.erase(ptSpeed.begin() + best);
+                    trackErase((size_t)best);
                     if (pathPos > std::max(0, pathCount - 1)) pathPos = std::max(0, pathCount - 1);
                     rebuildPath();
                     pathPos = clampPos(pathPos);

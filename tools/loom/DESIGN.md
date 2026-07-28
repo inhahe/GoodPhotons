@@ -519,7 +519,7 @@ tools/loom/
     mcubes.py               marching cubes: bake a field to a mesh (M7)
     vdbio.py                bake a field to a dense grid + write/read .vdb, read .nvdb (E4)
     axes.py                 axis-typed signals: broadcast/pin/mod + sample/reduce + lower-to-value-site (E5)
-    anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe (E2 s1–2)
+    anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe + `python -m loom.anim` (E2 s1–3a)
     xvideo.py               two-pass spacetime transform video (M11)
     preview.py              resident ftrace -serve preview client (M12)
     viewer.py               native-viewer contract: build() loader + scene-introspection sidecar (F1) + .ftsl source emission (F7) + live re-introspection/emit server (F4/F7)
@@ -807,9 +807,22 @@ tools/loom/
   `serve_live(session, in, out)` are the editor↔loom **live-value channel**: a newline-delimited-JSON stdio
   loop (the `PreviewServer` precedent, editor→loom direction) with `frame`/`config`/`bindings`/`points`/
   `save`/`quit` commands, each a pure `dict`→`dict` `handle()` so the protocol is unit-testable without a
-  pipe. Tests: `tests/test_anim.py` (19) + `tests/test_anim_live.py` (23).
-  Remaining slice: (3) the interactive ftrace `camera_curve` **editor** generalization (seed from / write
-  back the sidecar, drive arbitrary scene variables) — the C++ part, best done with the user present.
+  pipe.
+  **Slice 3a** is the sidecar round-trip against the real editor. loom side: `LiveSession(driver,
+  config_path=…)` remembers its sidecar so `save` needs no `path`; two new commands — **`slots`** (the
+  bindable variable names + their defaults, so the editor can offer a *pick-list* instead of asking for typed
+  names) and **`dims`** (grow/shrink the channel count, padding points with a neutral channel and reporting
+  the bindings it had to drop) — plus `default_drive(scene)` and a **`python -m loom.anim <scene.py>
+  [--config s.json] [--func build] [--dims N] [--strict]`** entry point that loads the sidecar (or the scene
+  module's own `drive`, or a default) and serves the live loop on stdio. ftrace side (`src/curvedrive.h`,
+  `-anim <sidecar.json>`): the fly editor's control points *are* the drive's points — channels 0–2 spatial,
+  3.. carried per point — and Save writes the reshaped curve back, preserving name/mode/dims and every
+  binding. The C++ reader re-checks the same invariants `CurveDrive.__init__` does, so neither side can hand
+  the other a config it would reject.
+  Tests: `tests/test_anim.py` (19) + `tests/test_anim_live.py` (33).
+  Remaining slice: (3b) the editor's **live** channel (spawn `python -m loom.anim`, push a `frame` per scrub
+  position, reload the returned `.ftsl`) + a panel for editing bindings from the `slots` pick-list — the
+  interactive C++ part, best done with the user present.
 - **F1 (native viewer — the loom↔viewer data contract).** ✅ done (`loom/viewer.py`). The §F native viewer is
   a C++ process; loom is Python, so (per the locked architecture) loom exposes a scene via a **`build()`
   load contract** and a **JSON introspection sidecar**, not in-process sharing. `build(clock=None, **params)

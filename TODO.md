@@ -1288,8 +1288,41 @@ named `RefSignal`-style slots** (no emit-path change). Pieces:
 23 tests (`tests/test_anim_live.py`: slot value/stale-cache semantics, discovery + same-name grouping,
 driver base defaults/override/strict, set_values fan-out + mod-on-base, emit-frame fresh-cache, every
 LiveSession command + bad-input acks, `serve_live` stop-on-quit + bad-json).
-**Remaining E2 slice:** (3) generalize ftrace's C++ `camera_curve` **editor** to seed from / write back the
-sidecar and target arbitrary scene variables (the interactive C++ part — best done with the user present).
+**SLICE 3a DONE 2026-07-28 (`ftrace -anim`, v0.94.0).** The C++ editor now *edits the drive itself* — the
+sidecar round-trip half of slice 3. Pieces:
+- **`src/curvedrive.h`** — a header-only reader/writer for loom's `CurveDrive` JSON sidecar, on
+  `src/third_party/json.h` (minijson). It re-checks **the same invariants `CurveDrive.__init__` does**
+  (`dims >= 1`, `>= 2` points, every point exactly `dims` wide, every binding channel in range, valid
+  `mode`/`kind`) on **both** load and save, so ftrace can neither accept nor write a sidecar loom would
+  reject. Writes atomically (temp file + `std::filesystem::rename`, the C++ twin of `mkstemp` +
+  `os.replace`), and prints shortest-round-tripping numbers so an edit that moved one point leaves every
+  other coordinate byte-identical.
+- **`-anim <file.json>`** (implies `-explore`) — the fly editor's control points ARE the drive's N-D
+  points. Channels 0–2 are what the viewport draws and the mouse moves (for a flyby drive, literally the
+  camera eye); channels 3.. are values no 3-D viewport can show, so they ride along **per point** and are
+  written back untouched. Point *orientation* is derived on seed from the chord to the successor (a drive
+  is a curve of values and stores no orientation), then re-aimable by the existing orientation painting.
+- **Save writes both** — the `camera_curve` `.ftsl` block as before, *and* the reshaped drive back to its
+  sidecar. The editor owns only the point LIST; `name`, `mode`, `closed`, `dims` and every
+  channel→variable **binding** are copied from whatever the sidecar last held, so an editing pass never
+  drops an association loom authored ("scene proposes, editor disposes" in the ftrace direction).
+- **A sidecar that doesn't exist yet is not an error** — that's how you *start* a drive from the editor:
+  whatever points the scene seeded (e.g. an authored `camera_curve`) become a fresh 3-channel
+  `mode flyby` drive that the first Save creates.
+- **`trackInsert`/`trackErase`** — `editPts`' parallel per-point side tracks (the painted speed multiplier
+  and now the extra channels) are mutated **only** through these, so a track can never drift out of
+  alignment with the points it annotates. A new point inherits its unseen channels from its neighbours
+  (midpoint in the middle, a copy at either end) rather than snapping them to 0.
+
+Verified end-to-end by driving the real GDI panel buttons (`scraps/click_button.ps1` → `BM_CLICK`): a
+loom-written 5-channel drive with 3 bindings seeds, `+Pt`/`Ins`/`Del`/`Save` reshape it, and loom re-loads
+the ftrace-written file with the extra channels interpolated exactly as designed and every binding intact.
+
+**Remaining E2 slice:** (3b) the **live** channel — spawn `python -m loom.anim <scene.py> --config
+<sidecar>` from the editor and push a `frame` message per scrub position (one-slot latest-wins worker, the
+`LoomLink`/`LoomBridge` pattern in `src/viewer_gui.cpp`), reloading the returned `.ftsl`; plus panel UI for
+editing the channel→variable bindings from the `slots` pick-list. Both are interactive UI whose feel is
+best validated with the user present.
 
 ### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; **DONE 2026-07-18**)*
 **Idea / decision.** loom should be able to *generate audio files* procedurally. Two candidate output
