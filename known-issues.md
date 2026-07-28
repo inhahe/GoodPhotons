@@ -5,6 +5,34 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG + TECH-DEBT — OPEN (2026-07-28): the loom viewer's 3-D panes are a CPU painter's-algorithm sort, not a z-buffer — on a D3D11 device that is already running
+
+`viewer_gui.cpp`'s mesh pane (~1179–1357) collects every triangle across every mesh,
+CPU-projects it, **sorts back-to-front by centroid depth** and emits `AddTriangleFilled`
+into an ImGui draw list. Two problems:
+
+1. **Correctness.** A painter's sort by triangle centroid *cannot* resolve interpenetrating
+   or mutually-overlapping geometry — a long triangle passing through a small one is drawn
+   wholly in front of or behind it. Any loom scene with intersecting swept meshes renders
+   visibly wrong, silently. The curve/field panes share the same CPU `project3` approach.
+2. **Cost.** An O(n log n) sort plus per-triangle CPU projection **every frame**, on the
+   thread that also runs the UI.
+
+The irony is that `viewer_gui.cpp` already creates a **D3D11 device + swap chain** (for
+ImGui) — the hardware pipeline is sitting right there, used only for 2-D. The proper fix is
+a vertex/index buffer + depth-stencil view and a trivial shader for the 3-D panes: correct
+by construction (real z-buffer), no per-frame sort, and the orbit becomes a matrix update.
+
+**Not** to be confused with the main explorer's rasterizer, which is *already* resident
+("upload once, re-project per frame" — `raster_cuda.h upload()`); that one is a deliberate
+CUDA compute rasterizer whose device tail is byte-identical to the CPU path, and it measures
+9.12 ms/frame median at 1920×1920 on a 5.17 M-triangle scene (109.6 fps; per-pass: project
+1.14, raster 2.36, shade 0.16, expose+encode 1.14, **download 1.09**). Porting *that* to a
+graphics API would trade the byte-identical-backends guarantee and the non-matrix
+fisheye/panoramic projections for a few ms — measure before touching it. The readback +
+GDI blit (the 1.09 ms download, plus the blit) is the part worth attacking first, and can be
+done with CUDA↔D3D interop without adding a third rasterizer.
+
 ### BUG — DONE (2026-07-28, v0.95.0): `python -m loom.anim` served an *empty* slot list — a module that is both `__main__` and importable is two different classes
 
 **Symptom.** `ftrace -anim … -loom <scene.py>` came up with `0 bindable scene variable(s)`
