@@ -712,9 +712,12 @@ class IsoMesh(Element):
 
     ftrace root-finds isosurfaces directly, so most fields should be an
     :class:`~loom.iso.Isosurface` (emitted as a ``function { expr }`` string) —
-    that is sharper and needs no baking.  Use ``IsoMesh`` only when a field must
-    become geometry: a numpy-only field with no ftsl twin, a sampled volume, or a
-    mesh destined for another tool.
+    that is sharper and needs no baking.  Use ``IsoMesh`` when a field must become
+    real geometry: a numpy-only field with no ftsl twin, a sampled volume, a mesh
+    destined for another tool — or a field you want to **inspect in the native
+    viewer**, whose Meshes tab draws (and, on a parameter sweep, re-bakes) exactly
+    this element's triangles via :func:`loom.viewer._iso_mesh_geometry`; an
+    ``Isosurface`` has no triangles for it to show.
 
     ``field`` is a :class:`~loom.spatial.SpatialExpr` (baked at the clock) or a
     vectorised ``f(X, Y, Z) -> ndarray``.  ``bounds``/``res``/``iso``/``adaptive``

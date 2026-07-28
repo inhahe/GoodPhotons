@@ -146,6 +146,29 @@ round-trip byte-identically, 65 of 97 corpus files parse and 64 of those re-emit
 other 32 are full-ftrace-language forms `ftsl.epeg` deliberately doesn't model — see the
 scope-boundary note in TODO.md §J3c and loom's `design.md` §8b), 1243 loom tests green.
 
+### loom `Grid` has no `.ftsl` emitter — grids can only be sampled in Python  *(loom; medium)*
+*Noticed 2026-07-28 while auditing the loom element emitters.*
+
+ftsl has a first-class **`grid { shape / lo / hi / data }`** dataset block plus `n(x, y)`
+sampling inside a spatial expression (`src/ftsl.h`, and array literals desugar into exactly
+that block — see `g.type = "grid"` ~2452). loom has a `Grid` dataset (`loom/data.py`) and a
+`GridField`/`VecGridField` interpolator (`loom/interp.py`) — but **no path from one to the
+other**. `GridField._eval` interpolates in *Python* and bakes to a number, and nothing in
+`loom/ftsl_emit.py` ever writes a `grid` block, so:
+
+- `grid(X, Y)` (sampling a grid by ftsl's *spatial* coordinates) raises
+  `TypeError: float() argument must be … not 'Surface'` — the field can only be sampled at
+  numbers, never at a coordinate the renderer supplies;
+- a grid-driven field can therefore only reach `.ftsl` **fully baked per frame**, losing both
+  the render-time interpolation and the compact `data …` representation ftrace already has.
+
+Proper fix: a `Grid.emit(ctx)` (or an emitting wrapper element) that writes the `grid` block —
+`shape`, `lo`, `hi`, `data` with the values baked at `ctx.clock` — plus a `GridField` spelling
+that lowers to `name(x, y)` in the emitted expression when its query is a `SpatialExpr`. The
+Python evaluator stays as the loom-side preview, exactly as `sample(t)` is for `CurveDrive`.
+
+No current consumer is blocked on it — logged so it isn't rediscovered.
+
 ### FUTURE — loom full `.ftsl` read support  *(loom; large)*
 *TODO.md, the `FUTURE` bullet under §J3c.*
 
