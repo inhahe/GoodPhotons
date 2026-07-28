@@ -5,23 +5,45 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### BUG + TECH-DEBT — OPEN (2026-07-28): the loom viewer's 3-D panes are a CPU painter's-algorithm sort, not a z-buffer — on a D3D11 device that is already running
+### BUG + TECH-DEBT — DONE for the mesh pane (2026-07-28, v0.96.0): the loom viewer's 3-D panes were a CPU painter's-algorithm sort, not a z-buffer — on a D3D11 device that was already running
 
-`viewer_gui.cpp`'s mesh pane (~1179–1357) collects every triangle across every mesh,
-CPU-projects it, **sorts back-to-front by centroid depth** and emits `AddTriangleFilled`
-into an ImGui draw list. Two problems:
+`viewer_gui.cpp`'s mesh pane collected every triangle across every mesh, CPU-projected it,
+**sorted back-to-front by centroid depth** and emitted `AddTriangleFilled` into an ImGui
+draw list. Two problems:
 
 1. **Correctness.** A painter's sort by triangle centroid *cannot* resolve interpenetrating
    or mutually-overlapping geometry — a long triangle passing through a small one is drawn
-   wholly in front of or behind it. Any loom scene with intersecting swept meshes renders
-   visibly wrong, silently. The curve/field panes share the same CPU `project3` approach.
+   wholly in front of or behind it. Any loom scene with intersecting swept meshes rendered
+   visibly wrong, silently. (`examples/viewer_live.py` is exactly this: an `orbit` tube
+   threading a gyroid ball.)
 2. **Cost.** An O(n log n) sort plus per-triangle CPU projection **every frame**, on the
    thread that also runs the UI.
 
-The irony is that `viewer_gui.cpp` already creates a **D3D11 device + swap chain** (for
-ImGui) — the hardware pipeline is sitting right there, used only for 2-D. The proper fix is
-a vertex/index buffer + depth-stencil view and a trivial shader for the 3-D panes: correct
-by construction (real z-buffer), no per-frame sort, and the orbit becomes a matrix update.
+The irony was that `viewer_gui.cpp` already creates a **D3D11 device + swap chain** (for
+ImGui) — the hardware pipeline sitting right there, used only for 2-D.
+
+**Fixed for the mesh pane** by `MeshGpu` (`viewer_gui.cpp`): one interleaved vertex buffer +
+index buffer for the whole sidecar (per-mesh `firstIndex/indexCount/baseVertex` ranges, so
+each mesh keeps its own skin and tint as its own draw call), rendered into an offscreen
+RTV + **D32_FLOAT depth-stencil view** with runtime-compiled HLSL, then shown with
+`ImGui::Image` — the pattern the Render pane already used. Consequences:
+
+- Geometry uploads **once per tessellation** (`MeshView::geomGen`, bumped in `adoptSidecar`),
+  so an orbit / zoom / colour-mode change is a 144-byte constant-buffer write and nothing else.
+  Union bounds are baked with the upload rather than rescanned per frame.
+- Flat two-sided lambert is *preserved exactly* (`0.30 + 0.70*|n.z|`), with the face normal
+  recovered per-pixel from `cross(ddx(vp), ddy(vp))`; under the orthographic orbit projection
+  that is exact, not an approximation.
+- The wireframe is now a **real second depth-tested pass** (`D3D11_FILL_WIREFRAME`,
+  LESS_EQUAL + a small negative depth bias) instead of relying on fill/wire interleaving.
+- The UV checker is now evaluated **per-pixel** at the interpolated UV instead of once at the
+  triangle centroid — the deliberate one behaviour change, since the point of a UV checker is
+  to show distortion *within* a face.
+
+**Still open:** the **curve and field panes** keep the same CPU `project3` + draw-list
+approach. They draw lines/points rather than solid surfaces, so the occlusion bug does not
+bite the same way, but the per-frame CPU projection cost is the same and they should get the
+same treatment.
 
 **Not** to be confused with the main explorer's rasterizer, which is *already* resident
 ("upload once, re-project per frame" — `raster_cuda.h upload()`); that one is a deliberate

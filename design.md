@@ -780,6 +780,22 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   companion `.ftsl` with ftrace's own `ftsl::load` and calling `renderIsoPreviewCuda`, and
   the **Meshes** pane bakes procedural skins through ftrace's own pattern VM — so the
   preview and the renderer share one implementation rather than two that can drift.
+  The Meshes pane is **z-buffered on the GPU** (`MeshGpu`): the sidecar's tessellation is
+  uploaded once into one interleaved vertex buffer + index buffer (per-mesh
+  `firstIndex/indexCount/baseVertex` ranges, so each mesh is still its own draw call with
+  its own skin and tint) and drawn into an offscreen render target that carries a
+  `D32_FLOAT` depth-stencil view, shown with `ImGui::Image`. This replaced a CPU
+  painter's-algorithm centroid sort that could not resolve interpenetrating surfaces —
+  which loom produces routinely (a swept tube threading an isosurface). Because the
+  buffers are keyed on `MeshView::geomGen` (bumped only where `adoptSidecar` installs a new
+  tessellation), an orbit / zoom / colour-mode change costs one 144-byte constant-buffer
+  write, not a re-projection of every vertex. The union bounds used to frame the view are
+  baked with the upload for the same reason. Shading stays the flat two-sided lambert
+  `0.30 + 0.70*|n.z|` of the CPU path, with the face normal taken per-pixel from
+  `cross(ddx(vp), ddy(vp))` — exact under this orthographic projection — and the wireframe
+  is a real second depth-tested `D3D11_FILL_WIREFRAME` pass. The **curve and field panes
+  still project on the CPU**; they draw lines rather than solid surfaces, so the occlusion
+  bug does not bite them, but they are the same port waiting to happen.
   **Live re-derivation (§F4 item 2, `-loom <scene.py>`)** uses `LoomLink` (a child
   `python -m loom.viewer` speaking newline-delimited JSON over stdio; `PYTHONPATH` is set
   to `<exeDir>\tools\loom`, which is why only the repo-root `ftrace.exe` can find loom) and

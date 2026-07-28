@@ -1891,11 +1891,27 @@ replacement for the renderer or the primary editing tool.**
       3-vectors), `faces` (0-based index triples), per-vertex `uvs` (u along spine, v around profile),
       `rings`/`profile_count` — mirroring `SweptMesh.emit`'s `sweep_rings`+`skin_rings` without writing
       an OBJ. 2 new tests. Slice B (C++ viewer): a **Meshes tab** (`collectMeshes`/`drawMeshPane`,
-      `MeshView`) draws the surface as a **shaded, depth-sorted (painter's-algorithm) triangle mesh** in
-      a 3-D orbit pane, with **flat two-sided lambert shading**, a **wireframe** overlay, and a colour
+      `MeshView`) draws the surface as a **shaded triangle mesh** in a 3-D orbit pane, with **flat
+      two-sided lambert shading**, a **wireframe** overlay, and a colour
       selector (grey / per-object tint / **UV checker**). Orbiting the 3 spatial dims is the **view-only
       re-projection** the rotation rule calls for. A swept-mesh scene opens on the Meshes tab by default
       (its spine curves still populate the Curves tab). Verified via PrintWindow screenshot.
+      - **(3) real z-buffer** — ✅ **DONE 2026-07-28 (VERSION 0.96.0).** The pane shipped as a CPU
+        **painter's-algorithm** centroid sort into an ImGui draw list, which cannot resolve
+        interpenetrating surfaces (loom's own `examples/viewer_live.py` — an `orbit` tube threading a
+        gyroid ball — rendered wrong) and re-sorted every triangle on the UI thread every frame.
+        `MeshGpu` now uploads the tessellation **once** into one vertex + index buffer (per-mesh
+        `firstIndex/indexCount/baseVertex` ranges keep the per-mesh skin/tint draw calls) and renders
+        it into an offscreen RTV with a **`D32_FLOAT` depth-stencil view** via runtime-compiled HLSL,
+        shown with `ImGui::Image` — the pattern the Render pane already used. Re-upload is keyed on
+        `MeshView::geomGen` (bumped in `adoptSidecar`), so an orbit is one 144-byte cbuffer write;
+        union bounds are baked with the upload instead of rescanned per frame. Shading is preserved
+        exactly (`0.30 + 0.70*|n.z|`, face normal from `cross(ddx,ddy)` — exact under the orthographic
+        orbit), the wireframe became a real depth-tested `D3D11_FILL_WIREFRAME` pass, and the UV
+        checker moved from a per-triangle centroid sample to **per-pixel** (the one deliberate
+        behaviour change; a UV checker exists to show distortion *within* a face). Verified by
+        PrintWindow screenshots of all four colour modes, wireframe, zoom, a window resize and a live
+        `-loom` re-derive. The **curve and field panes still project on the CPU** — same port pending.
       - **(1) textures** (image *or* formula) — ✅ **DONE 2026-07-26 (VERSION 0.58.0).** **Loom half
         2026-07-24** — the sidecar emits a `materials` list (each material's `type`/`props` +
         the `texture` skin it binds, animated props evaluated at the clock) and a `textures` list

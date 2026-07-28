@@ -2703,9 +2703,13 @@ positions reconstructed from the fixed lattice), coloured either by a **heatmap 
 selectable channel** or by **channels 0/1/2 → RGB**; **click any point to inspect** its
 position and every channel value, and for N-D grids **per-extra-dim slice sliders** collapse
 the dims you're not viewing to a chosen lattice index. A **Meshes tab** draws `SweptMesh`
-surfaces (tubes, ribbons, blobs) as a **shaded, depth-sorted triangle mesh** — flat two-sided
-lambert lighting, an optional wireframe overlay, and grey / per-object-tint / UV-checker /
-**texture** colouring; orbiting spins the existing tessellation (view-only). In **texture**
+surfaces (tubes, ribbons, blobs) as a **shaded, GPU z-buffered triangle mesh** — flat two-sided
+lambert lighting, an optional depth-tested wireframe overlay, and grey / per-object-tint /
+UV-checker / **texture** colouring; orbiting spins the existing tessellation (view-only) and is
+free, since the geometry is uploaded once and re-uploaded only when the tessellation itself
+changes. Being a real depth buffer, **interpenetrating surfaces** — a swept tube threading an
+isosurface, two crossing tubes — come out right instead of being ordered a whole triangle at a
+time. In **texture**
 mode (the default) each mesh wears its **real skin**, sampled at the interpolated per-vertex
 UVs: an image texture is decoded with ftrace's own loader (paths resolve relative to the
 sidecar), and a procedural `r`/`g`/`b` formula skin is baked on the CPU through ftrace's own

@@ -50,7 +50,10 @@ int runViewerGui(const std::string&, const std::string&) {
 #include "ftsl.h"
 #include "render_cuda.h"
 
+#include <d3dcompiler.h>           // the mesh pane's z-buffered shaders (runtime-compiled)
+
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 
 // ImGui's Win32 backend provides this handler; declare it (the header guards it
 // behind a macro we don't want to define project-wide).
@@ -1176,7 +1179,332 @@ static void drawFieldPane(const std::vector<FieldGeom>& fields, FieldView& view)
 }
 
 // --------------------------------------------------------------------------
-// F4 — mesh pane: SweptMesh tessellated surfaces as a shaded, depth-sorted
+// F4 — the mesh pane's z-buffered D3D11 renderer.
+//
+// The pane used to sort triangles back-to-front by centroid depth and hand them
+// to ImGui's draw list — a painter's algorithm. That is simply wrong for
+// interpenetrating geometry, which is exactly what loom's swept / blobby
+// surfaces produce (two tubes crossing, a skin passing through a spine), and it
+// re-sorted every triangle on the UI thread every frame. The viewer is already
+// running on a D3D11 device, so the honest fix is a real depth buffer: upload
+// the tessellation once into a vertex/index buffer, draw it into an offscreen
+// render target that has a depth-stencil view, and show that target with
+// ImGui::Image — the same trick the Render pane uses for its raymarch.
+//
+// Shading is kept identical to the old CPU path: flat two-sided lambert
+// 0.30 + 0.70*|n.z| with n the FACE normal in the rotated view basis. The GPU
+// recovers that per-pixel from screen-space derivatives of the view-space
+// position; under the orthographic projection used here that is exact, not an
+// approximation. The one deliberate improvement is the UV checker, which is now
+// evaluated per-pixel at the interpolated UV instead of once at the triangle
+// centroid — the whole point of a UV checker is to show UV distortion *within* a
+// face, which a flat centroid sample cannot do.
+// --------------------------------------------------------------------------
+struct MeshGpu {
+    // pipeline objects (created once, on first use)
+    ID3D11VertexShader*      vs      = nullptr;
+    ID3D11PixelShader*       ps      = nullptr;
+    ID3D11InputLayout*       layout  = nullptr;
+    ID3D11Buffer*            cb      = nullptr;
+    ID3D11RasterizerState*   rsSolid = nullptr;
+    ID3D11RasterizerState*   rsWire  = nullptr;
+    ID3D11DepthStencilState* dsSolid = nullptr;   // LESS, writes depth
+    ID3D11DepthStencilState* dsWire  = nullptr;   // LESS_EQUAL, no depth write
+    ID3D11BlendState*        blend   = nullptr;
+    ID3D11SamplerState*      samp    = nullptr;
+    bool                     pipeReady = false;
+
+    // geometry (rebuilt only when the sidecar hands over a new tessellation)
+    ID3D11Buffer* vb = nullptr;
+    ID3D11Buffer* ib = nullptr;
+    struct Range { UINT firstIndex = 0, indexCount = 0; INT baseVertex = 0; };
+    std::vector<Range> ranges;      // one per MeshGeom, parallel to `meshes`
+    unsigned geomGen = ~0u;         // MeshView::geomGen the buffers were built from
+    bool     geomReady = false;
+    float    mid[3] = { 0, 0, 0 };  // union-bounds centre / extents, baked with the upload
+    float    ext = 1.0f, diag = 1.0f;
+
+    // offscreen colour + depth target, resized to the pane
+    ID3D11Texture2D*          colorTex = nullptr;
+    ID3D11RenderTargetView*   rtv      = nullptr;
+    ID3D11ShaderResourceView* srv      = nullptr;
+    ID3D11Texture2D*          depthTex = nullptr;
+    ID3D11DepthStencilView*   dsv      = nullptr;
+    int texW = 0, texH = 0;
+
+    std::string err;                // non-empty => the pane says so instead of drawing
+
+    struct Vert { float x, y, z, u, v; };
+    // Must match the cbuffer in the shader below (144 B, a multiple of 16).
+    struct CB {
+        float mvp[16];
+        float rot0[4], rot1[4], rot2[4];   // xyz = view-basis row, w = -(row . mid)
+        float baseColor[4];
+        float opts[4];                     // x = shade on, y = colour mode
+    };
+
+    void releaseGeom() {
+        if (vb) { vb->Release(); vb = nullptr; }
+        if (ib) { ib->Release(); ib = nullptr; }
+        ranges.clear();
+        geomReady = false;
+        geomGen = ~0u;
+    }
+    void releaseTargets() {
+        if (srv)      { srv->Release();      srv = nullptr; }
+        if (rtv)      { rtv->Release();      rtv = nullptr; }
+        if (colorTex) { colorTex->Release(); colorTex = nullptr; }
+        if (dsv)      { dsv->Release();      dsv = nullptr; }
+        if (depthTex) { depthTex->Release(); depthTex = nullptr; }
+        texW = texH = 0;
+    }
+    void release() {
+        releaseGeom();
+        releaseTargets();
+        if (samp)    { samp->Release();    samp = nullptr; }
+        if (blend)   { blend->Release();   blend = nullptr; }
+        if (dsWire)  { dsWire->Release();  dsWire = nullptr; }
+        if (dsSolid) { dsSolid->Release(); dsSolid = nullptr; }
+        if (rsWire)  { rsWire->Release();  rsWire = nullptr; }
+        if (rsSolid) { rsSolid->Release(); rsSolid = nullptr; }
+        if (cb)      { cb->Release();      cb = nullptr; }
+        if (layout)  { layout->Release();  layout = nullptr; }
+        if (ps)      { ps->Release();      ps = nullptr; }
+        if (vs)      { vs->Release();      vs = nullptr; }
+        pipeReady = false;
+    }
+
+    bool buildPipeline(ID3D11Device* dev) {
+        if (pipeReady) return true;
+        if (!dev) { err = "no D3D11 device"; return false; }
+
+        static const char* kVS = R"HLSL(
+cbuffer CB : register(b0) {
+    row_major float4x4 mvp;
+    float4 rot0, rot1, rot2;
+    float4 baseColor;
+    float4 opts;
+};
+struct VSIn  { float3 p : POSITION; float2 uv : TEXCOORD0; };
+struct VSOut { float4 pos : SV_Position; float3 vp : TEXCOORD1; float2 uv : TEXCOORD0; };
+VSOut main(VSIn i) {
+    VSOut o;
+    o.pos = mul(mvp, float4(i.p, 1.0));
+    // view-space position, used ONLY for the flat face normal via ddx/ddy
+    o.vp  = float3(dot(rot0.xyz, i.p) + rot0.w,
+                   dot(rot1.xyz, i.p) + rot1.w,
+                   dot(rot2.xyz, i.p) + rot2.w);
+    o.uv  = i.uv;
+    return o;
+}
+)HLSL";
+
+        static const char* kPS = R"HLSL(
+cbuffer CB : register(b0) {
+    row_major float4x4 mvp;
+    float4 rot0, rot1, rot2;
+    float4 baseColor;
+    float4 opts;
+};
+Texture2D    tex0  : register(t0);
+SamplerState samp0 : register(s0);
+struct VSOut { float4 pos : SV_Position; float3 vp : TEXCOORD1; float2 uv : TEXCOORD0; };
+float4 main(VSOut i) : SV_Target {
+    float3 base = baseColor.rgb;
+    int mode = (int)opts.y;
+    if (mode == 2) {
+        // UV checker, per-pixel (8 cells across the unit square)
+        float2 c = floor(i.uv * 8.0);
+        float  s = frac((c.x + c.y) * 0.5);
+        base = (s > 0.25) ? float3(210.0, 210.0, 220.0) / 255.0
+                          : float3( 90.0,  95.0, 110.0) / 255.0;
+    } else if (mode == 3) {
+        // v is flipped because Texture::sampleRgb treats v=0 as the image BOTTOM
+        // while the uploaded D3D texture has v=0 at its top row.
+        base *= tex0.Sample(samp0, float2(i.uv.x, 1.0 - i.uv.y)).rgb;
+    }
+    float sh = 1.0;
+    if (opts.x > 0.5) {
+        float3 n = normalize(cross(ddx(i.vp), ddy(i.vp)));
+        sh = 0.30 + 0.70 * abs(n.z);          // two-sided lambert, flat per face
+    }
+    return float4(base * sh, baseColor.a);
+}
+)HLSL";
+
+        auto fail = [&](const char* what, ID3DBlob* e) {
+            err = what;
+            if (e) { err += ": "; err.append((const char*)e->GetBufferPointer()); e->Release(); }
+            release();
+            return false;
+        };
+        ID3DBlob* vsb = nullptr; ID3DBlob* psb = nullptr; ID3DBlob* eb = nullptr;
+        if (FAILED(D3DCompile(kVS, strlen(kVS), nullptr, nullptr, nullptr, "main", "vs_4_0", 0, 0, &vsb, &eb)))
+            return fail("mesh VS compile failed", eb);
+        if (FAILED(dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs))) {
+            vsb->Release(); return fail("CreateVertexShader failed", nullptr);
+        }
+        if (FAILED(D3DCompile(kPS, strlen(kPS), nullptr, nullptr, nullptr, "main", "ps_4_0", 0, 0, &psb, &eb))) {
+            vsb->Release(); return fail("mesh PS compile failed", eb);
+        }
+        if (FAILED(dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps))) {
+            vsb->Release(); psb->Release(); return fail("CreatePixelShader failed", nullptr);
+        }
+        psb->Release();
+        const D3D11_INPUT_ELEMENT_DESC il[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        };
+        HRESULT hr = dev->CreateInputLayout(il, 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &layout);
+        vsb->Release();
+        if (FAILED(hr)) return fail("CreateInputLayout failed", nullptr);
+
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = sizeof(CB);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(dev->CreateBuffer(&bd, nullptr, &cb))) return fail("CreateBuffer(cb) failed", nullptr);
+
+        D3D11_RASTERIZER_DESC rd = {};
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;          // surfaces are drawn two-sided
+        rd.DepthClipEnable = TRUE;
+        if (FAILED(dev->CreateRasterizerState(&rd, &rsSolid))) return fail("rasterizer(solid) failed", nullptr);
+        rd.FillMode = D3D11_FILL_WIREFRAME;
+        // The wire pass draws the SAME triangles, so pull it a hair toward the eye;
+        // LESS_EQUAL alone would still lose to rasterization rounding on the edges.
+        rd.DepthBias = -800;
+        rd.SlopeScaledDepthBias = -1.0f;
+        if (FAILED(dev->CreateRasterizerState(&rd, &rsWire))) return fail("rasterizer(wire) failed", nullptr);
+
+        D3D11_DEPTH_STENCIL_DESC dd = {};
+        dd.DepthEnable = TRUE;
+        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        dd.DepthFunc = D3D11_COMPARISON_LESS;
+        if (FAILED(dev->CreateDepthStencilState(&dd, &dsSolid))) return fail("depth state(solid) failed", nullptr);
+        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+        if (FAILED(dev->CreateDepthStencilState(&dd, &dsWire))) return fail("depth state(wire) failed", nullptr);
+
+        D3D11_BLEND_DESC bl = {};
+        bl.RenderTarget[0].BlendEnable = TRUE;
+        bl.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        bl.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        bl.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(dev->CreateBlendState(&bl, &blend))) return fail("CreateBlendState failed", nullptr);
+
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        sd.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        if (FAILED(dev->CreateSamplerState(&sd, &samp))) return fail("CreateSamplerState failed", nullptr);
+
+        err.clear();
+        pipeReady = true;
+        return true;
+    }
+
+    bool ensureTargets(ID3D11Device* dev, int W, int H) {
+        if (W < 1) W = 1;
+        if (H < 1) H = 1;
+        if (colorTex && texW == W && texH == H) return true;
+        releaseTargets();
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = W; td.Height = H; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &colorTex))) { err = "mesh colour target failed"; return false; }
+        if (FAILED(dev->CreateRenderTargetView(colorTex, nullptr, &rtv))) { releaseTargets(); err = "mesh RTV failed"; return false; }
+        if (FAILED(dev->CreateShaderResourceView(colorTex, nullptr, &srv))) { releaseTargets(); err = "mesh SRV failed"; return false; }
+        td.Format = DXGI_FORMAT_D32_FLOAT;
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &depthTex))) { releaseTargets(); err = "mesh depth target failed"; return false; }
+        if (FAILED(dev->CreateDepthStencilView(depthTex, nullptr, &dsv))) { releaseTargets(); err = "mesh DSV failed"; return false; }
+        texW = W; texH = H;
+        return true;
+    }
+
+    // One interleaved vertex buffer + one index buffer for the whole sidecar, with a
+    // per-mesh (firstIndex, count, baseVertex) range so each mesh is still its own
+    // draw call (it needs its own skin and tint).
+    bool uploadGeometry(ID3D11Device* dev, const std::vector<MeshGeom>& meshes, unsigned gen) {
+        releaseGeom();
+        std::vector<Vert>     verts;
+        std::vector<uint32_t> idx;
+        ranges.resize(meshes.size());
+        for (size_t mi = 0; mi < meshes.size(); ++mi) {
+            const MeshGeom& m = meshes[mi];
+            Range r;
+            r.baseVertex = (INT)verts.size();
+            r.firstIndex = (UINT)idx.size();
+            bool hasUv = (int)m.uvs.size() >= 2 * m.nverts;
+            for (int i = 0; i < m.nverts; ++i) {
+                Vert v;
+                v.x = m.verts[(size_t)i * 3 + 0];
+                v.y = m.verts[(size_t)i * 3 + 1];
+                v.z = m.verts[(size_t)i * 3 + 2];
+                v.u = hasUv ? m.uvs[(size_t)i * 2 + 0] : 0.0f;
+                v.v = hasUv ? m.uvs[(size_t)i * 2 + 1] : 0.0f;
+                verts.push_back(v);
+            }
+            for (int f = 0; f < m.nfaces; ++f) {
+                int f0 = m.faces[(size_t)f * 3 + 0], f1 = m.faces[(size_t)f * 3 + 1],
+                    f2 = m.faces[(size_t)f * 3 + 2];
+                if (f0 < 0 || f1 < 0 || f2 < 0 || f0 >= m.nverts || f1 >= m.nverts || f2 >= m.nverts)
+                    continue;   // a malformed face is skipped, exactly as before
+                idx.push_back((uint32_t)f0); idx.push_back((uint32_t)f1); idx.push_back((uint32_t)f2);
+            }
+            r.indexCount = (UINT)idx.size() - r.firstIndex;
+            ranges[mi] = r;
+        }
+        // Union bounds, computed once with the upload rather than per frame: they
+        // depend only on the tessellation, and an orbit must not re-scan 5M verts.
+        float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+        for (const auto& m : meshes)
+            for (int i = 0; i < m.nverts; ++i)
+                for (int k = 0; k < 3; ++k) {
+                    float v = m.verts[(size_t)i * 3 + k];
+                    lo[k] = std::min(lo[k], v); hi[k] = std::max(hi[k], v);
+                }
+        ext = 1.0f; diag = 0.0f;
+        for (int k = 0; k < 3; ++k) {
+            float d = (hi[k] > lo[k]) ? (hi[k] - lo[k]) : 0.0f;
+            ext = std::max(ext, d);
+            diag += d * d;
+            mid[k] = (hi[k] >= lo[k]) ? 0.5f * (lo[k] + hi[k]) : 0.0f;
+        }
+        diag = 0.5f * std::sqrt(diag) + 1e-3f;   // depth half-range in the rotated basis
+
+        geomGen = gen;
+        if (verts.empty() || idx.empty()) { geomReady = true; return true; }   // nothing to draw, but valid
+
+        D3D11_BUFFER_DESC bd = {};
+        D3D11_SUBRESOURCE_DATA sd = {};
+        bd.ByteWidth = (UINT)(verts.size() * sizeof(Vert));
+        bd.Usage = D3D11_USAGE_IMMUTABLE;
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        sd.pSysMem = verts.data();
+        if (FAILED(dev->CreateBuffer(&bd, &sd, &vb))) { err = "mesh vertex buffer failed"; releaseGeom(); return false; }
+        bd.ByteWidth = (UINT)(idx.size() * sizeof(uint32_t));
+        bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        sd.pSysMem = idx.data();
+        if (FAILED(dev->CreateBuffer(&bd, &sd, &ib))) { err = "mesh index buffer failed"; releaseGeom(); return false; }
+        geomGen = gen;
+        geomReady = true;
+        return true;
+    }
+};
+
+// --------------------------------------------------------------------------
+// F4 — mesh pane: SweptMesh tessellated surfaces as a shaded, z-buffered
 // triangle mesh. Orbiting the 3 spatial dims is a view-only re-projection (no
 // re-tessellation, exactly as the F4 rule specifies for isometries of the shown
 // dims). Colour: flat lambert shading, per-object tint, a UV checker, or the
@@ -1187,10 +1515,15 @@ struct MeshView {
     bool  shade = true;         // flat lambert lighting
     bool  wire = false;         // wireframe overlay
     int   colorBy = 3;          // 0 grey, 1 per-object tint, 2 UV checker, 3 texture
+    // Bumped whenever loom hands over a NEW tessellation; the GPU buffers are
+    // rebuilt only when it changes, so an orbit costs nothing but a cbuffer write.
+    unsigned geomGen = 0;
+    MeshGpu  gpu;
 };
 
 static bool drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
-                         const SkinLib& skins, LivePanel* live) {
+                         const SkinLib& skins, LivePanel* live,
+                         ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     bool swept = false;   // the parameter axis moved -> the surface must be re-baked
     ImGui::TextUnformatted("Meshes - drag to orbit, wheel to zoom (view-only re-projection)");
     liveSweepHint(live);
@@ -1228,145 +1561,156 @@ static bool drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
     if (hovered) { float w = ImGui::GetIO().MouseWheel; if (w != 0.0f) view.zoom *= (1.0f + w * 0.1f); }
     if (view.zoom < 0.05f) view.zoom = 0.05f;
 
+    MeshGpu& gpu = view.gpu;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 br(origin.x + avail.x, origin.y + avail.y);
-    dl->AddRectFilled(origin, br, IM_COL32(14, 16, 20, 255));
-    dl->PushClipRect(origin, br, true);
 
-    // shared rotation basis: rotate each world vertex to (X screen-right, Y up, Z toward viewer)
-    float cy = std::cos(view.yaw),   sy = std::sin(view.yaw);
-    float cx = std::cos(view.pitch), sx = std::sin(view.pitch);
-    auto rot = [&](float x, float y, float z, float& X, float& Y, float& Z) {
-        float x1 =  cy * x + sy * z;
-        float z1 = -sy * x + cy * z;
-        X = x1;
-        Y = cx * y - sx * z1;
-        Z = sx * y + cx * z1;   // depth toward viewer
-    };
+    // Pipeline once, geometry once per tessellation, targets once per pane size.
+    bool ok = gpu.buildPipeline(dev);
+    if (ok && (!gpu.geomReady || gpu.geomGen != view.geomGen))
+        ok = gpu.uploadGeometry(dev, meshes, view.geomGen);
+    if (ok) ok = gpu.ensureTargets(dev, (int)(avail.x + 0.5f), (int)(avail.y + 0.5f));
 
-    // union bounds (centre + extent) over all meshes
-    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
-    for (const auto& m : meshes)
-        for (int i = 0; i < m.nverts; ++i)
-            for (int k = 0; k < 3; ++k) {
-                float v = m.verts[(size_t)i * 3 + k];
-                lo[k] = std::min(lo[k], v); hi[k] = std::max(hi[k], v);
+    if (ok) {
+        // ---- the orthographic orbit projection, as one 4x4 -------------------
+        // Rows of the rotation taking a world point to (X screen-right, Y up,
+        // Z toward the viewer) — the exact basis the old CPU projector used.
+        float cy = std::cos(view.yaw),   sy = std::sin(view.yaw);
+        float cx = std::cos(view.pitch), sx = std::sin(view.pitch);
+        const float R[3][3] = {
+            {  cy,        0.0f,  sy      },
+            {  sx * sy,   cx,   -sx * cy },
+            { -cx * sy,   sx,    cx * cy },
+        };
+        float scale = 0.42f * std::min(avail.x, avail.y) / (0.5f * gpu.ext + 1e-3f);
+        float s  = scale * view.zoom;
+        // The pane's own pixel box IS the render target, so the screen mapping
+        // collapses to a pure scale: the centre of the box is NDC (0,0).
+        float ax = (avail.x > 0.0f) ? 2.0f * s / avail.x : 0.0f;
+        float ay = (avail.y > 0.0f) ? 2.0f * s / avail.y : 0.0f;
+        float kz = 0.5f / gpu.diag;      // rotated Z in [-diag,+diag] -> depth 0(near)..1(far)
+        auto dotMid = [&](int r) {
+            return R[r][0] * gpu.mid[0] + R[r][1] * gpu.mid[1] + R[r][2] * gpu.mid[2];
+        };
+        MeshGpu::CB c = {};
+        const float rowScale[3] = { ax, ay, -kz };
+        for (int r = 0; r < 3; ++r)
+            for (int k = 0; k < 3; ++k) c.mvp[r * 4 + k] = rowScale[r] * R[r][k];
+        c.mvp[0 * 4 + 3] = -ax * dotMid(0);
+        c.mvp[1 * 4 + 3] = -ay * dotMid(1);
+        c.mvp[2 * 4 + 3] =  kz * dotMid(2) + 0.5f;
+        c.mvp[3 * 4 + 3] = 1.0f;
+        for (int r = 0; r < 3; ++r) {
+            float* dst = (r == 0) ? c.rot0 : (r == 1) ? c.rot1 : c.rot2;
+            dst[0] = R[r][0]; dst[1] = R[r][1]; dst[2] = R[r][2]; dst[3] = -dotMid(r);
+        }
+
+        auto setCB = [&](const float rgba[4], float shadeOn, float mode) {
+            for (int k = 0; k < 4; ++k) c.baseColor[k] = rgba[k];
+            c.opts[0] = shadeOn; c.opts[1] = mode; c.opts[2] = c.opts[3] = 0.0f;
+            D3D11_MAPPED_SUBRESOURCE ms;
+            if (ctx->Map(gpu.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms) == S_OK) {
+                std::memcpy(ms.pData, &c, sizeof(c));
+                ctx->Unmap(gpu.cb, 0);
             }
-    float ext = 1.0f;
-    for (int k = 0; k < 3; ++k) if (hi[k] > lo[k]) ext = std::max(ext, hi[k] - lo[k]);
-    float mid[3] = { 0, 0, 0 };
-    for (int k = 0; k < 3; ++k) if (hi[k] >= lo[k]) mid[k] = 0.5f * (lo[k] + hi[k]);
-    ImVec2 center(origin.x + avail.x * 0.5f, origin.y + avail.y * 0.5f);
-    float scale = 0.42f * std::min(avail.x, avail.y) / (0.5f * ext + 1e-3f);
+        };
 
-    const ImU32 tints[] = {
-        IM_COL32(150, 190, 235, 255), IM_COL32(235, 175, 130, 255),
-        IM_COL32(160, 225, 165, 255), IM_COL32(225, 155, 200, 255),
-    };
+        // ---- render the pane offscreen, with a real depth buffer -------------
+        const float clearCol[4] = { 14 / 255.0f, 16 / 255.0f, 20 / 255.0f, 1.0f };
+        ctx->ClearRenderTargetView(gpu.rtv, clearCol);
+        ctx->ClearDepthStencilView(gpu.dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+        if (gpu.vb && gpu.ib) {
+            ID3D11RenderTargetView* rtvs[1] = { gpu.rtv };
+            ctx->OMSetRenderTargets(1, rtvs, gpu.dsv);
+            D3D11_VIEWPORT vp = {};
+            vp.Width = (float)gpu.texW; vp.Height = (float)gpu.texH; vp.MaxDepth = 1.0f;
+            ctx->RSSetViewports(1, &vp);
+            UINT stride = sizeof(MeshGpu::Vert), voff = 0;
+            ctx->IASetInputLayout(gpu.layout);
+            ctx->IASetVertexBuffers(0, 1, &gpu.vb, &stride, &voff);
+            ctx->IASetIndexBuffer(gpu.ib, DXGI_FORMAT_R32_UINT, 0);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx->VSSetShader(gpu.vs, nullptr, 0);
+            ctx->PSSetShader(gpu.ps, nullptr, 0);
+            ctx->GSSetShader(nullptr, nullptr, 0);
+            ctx->HSSetShader(nullptr, nullptr, 0);
+            ctx->DSSetShader(nullptr, nullptr, 0);
+            ctx->VSSetConstantBuffers(0, 1, &gpu.cb);
+            ctx->PSSetConstantBuffers(0, 1, &gpu.cb);
+            ctx->PSSetSamplers(0, 1, &gpu.samp);
+            const float bf[4] = { 0, 0, 0, 0 };
+            ctx->OMSetBlendState(gpu.blend, bf, 0xffffffff);
+            ctx->RSSetState(gpu.rsSolid);
+            ctx->OMSetDepthStencilState(gpu.dsSolid, 0);
 
-    // rotate every vertex once, project to screen + keep depth
-    struct SV { ImVec2 s; float d; float X, Y, Z; };
-    // collect all triangles across meshes into one depth-sorted list (painter's algo)
-    struct Tri { int mi; ImVec2 a, b, c; float depth; float shade; float ua, va, ub, vb, uc, vc; };
-    std::vector<Tri> tris;
-    std::vector<std::vector<SV>> proj(meshes.size());
-    for (size_t mi = 0; mi < meshes.size(); ++mi) {
-        const MeshGeom& m = meshes[mi];
-        proj[mi].resize(m.nverts);
-        for (int i = 0; i < m.nverts; ++i) {
-            float X, Y, Z;
-            rot(m.verts[(size_t)i*3+0] - mid[0], m.verts[(size_t)i*3+1] - mid[1],
-                m.verts[(size_t)i*3+2] - mid[2], X, Y, Z);
-            SV sv;
-            sv.X = X; sv.Y = Y; sv.Z = Z; sv.d = Z;
-            sv.s = ImVec2(center.x + X * scale * view.zoom, center.y - Y * scale * view.zoom);
-            proj[mi][i] = sv;
-        }
-        for (int f = 0; f < m.nfaces; ++f) {
-            int ia = m.faces[(size_t)f*3+0], ib = m.faces[(size_t)f*3+1], ic = m.faces[(size_t)f*3+2];
-            if (ia < 0 || ib < 0 || ic < 0 || ia >= m.nverts || ib >= m.nverts || ic >= m.nverts) continue;
-            const SV& A = proj[mi][ia]; const SV& B = proj[mi][ib]; const SV& C = proj[mi][ic];
-            // face normal in rotated space -> Z component = facing the viewer
-            float ux = B.X - A.X, uy = B.Y - A.Y, uz = B.Z - A.Z;
-            float vx = C.X - A.X, vy = C.Y - A.Y, vz = C.Z - A.Z;
-            float nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
-            float nl = std::sqrt(nx*nx + ny*ny + nz*nz) + 1e-9f;
-            float facing = nz / nl;                       // -1..1, +1 = toward viewer
-            Tri t;
-            t.mi = (int)mi;
-            t.a = A.s; t.b = B.s; t.c = C.s;
-            t.depth = (A.d + B.d + C.d) / 3.0f;
-            t.shade = 0.30f + 0.70f * std::fabs(facing);  // two-sided lambert
-            if ((int)m.uvs.size() >= 2 * m.nverts) {
-                t.ua = m.uvs[(size_t)ia*2]; t.va = m.uvs[(size_t)ia*2+1];
-                t.ub = m.uvs[(size_t)ib*2]; t.vb = m.uvs[(size_t)ib*2+1];
-                t.uc = m.uvs[(size_t)ic*2]; t.vc = m.uvs[(size_t)ic*2+1];
-            } else { t.ua = t.va = t.ub = t.vb = t.uc = t.vc = 0.0f; }
-            tris.push_back(t);
+            static const float tints[4][3] = {
+                { 150 / 255.0f, 190 / 255.0f, 235 / 255.0f },
+                { 235 / 255.0f, 175 / 255.0f, 130 / 255.0f },
+                { 160 / 255.0f, 225 / 255.0f, 165 / 255.0f },
+                { 225 / 255.0f, 155 / 255.0f, 200 / 255.0f },
+            };
+            size_t n = std::min(gpu.ranges.size(), meshes.size());
+            for (size_t mi = 0; mi < n; ++mi) {
+                const MeshGpu::Range& r = gpu.ranges[mi];
+                if (!r.indexCount) continue;
+                // Which skin this mesh wears (mesh -> material -> texture). A mesh
+                // with no UVs can't be textured however good its skin, so it stays grey.
+                ID3D11ShaderResourceView* skinSrv = nullptr;
+                if (view.colorBy == 3) {
+                    const Skin* sk = skins.skinFor(meshes[mi].material);
+                    if (sk && sk->srv && (int)meshes[mi].uvs.size() >= 2 * meshes[mi].nverts)
+                        skinSrv = sk->srv;
+                }
+                float rgba[4] = { 180 / 255.0f, 185 / 255.0f, 195 / 255.0f, 1.0f };
+                float mode = 0.0f;
+                if (skinSrv) {
+                    // White base modulated by the lambert term, so the shading scales
+                    // the skin instead of replacing it (what the old vertex colour did).
+                    rgba[0] = rgba[1] = rgba[2] = 1.0f;
+                    mode = 3.0f;
+                } else if (view.colorBy == 1) {
+                    for (int k = 0; k < 3; ++k) rgba[k] = tints[mi % 4][k];
+                } else if (view.colorBy == 2) {
+                    mode = 2.0f;
+                }
+                setCB(rgba, view.shade ? 1.0f : 0.0f, mode);
+                ID3D11ShaderResourceView* srvs[1] = { skinSrv };
+                ctx->PSSetShaderResources(0, 1, srvs);
+                ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
+            }
+
+            if (view.wire) {
+                // A second, depth-tested wireframe pass: nearer faces hide farther
+                // edges for real now, instead of relying on the fill/wire interleave
+                // that the painter's-algorithm version needed.
+                ctx->RSSetState(gpu.rsWire);
+                ctx->OMSetDepthStencilState(gpu.dsWire, 0);
+                ID3D11ShaderResourceView* none[1] = { nullptr };
+                ctx->PSSetShaderResources(0, 1, none);
+                const float wireCol[4] = { 30 / 255.0f, 30 / 255.0f, 36 / 255.0f, 120 / 255.0f };
+                setCB(wireCol, 0.0f, 0.0f);
+                for (size_t mi = 0; mi < n; ++mi) {
+                    const MeshGpu::Range& r = gpu.ranges[mi];
+                    if (r.indexCount) ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
+                }
+            }
+
+            // Unbind before ImGui samples this very texture as an SRV later in the frame.
+            ID3D11ShaderResourceView* none[1] = { nullptr };
+            ctx->PSSetShaderResources(0, 1, none);
+            ID3D11RenderTargetView* noRtv[1] = { nullptr };
+            ctx->OMSetRenderTargets(1, noRtv, nullptr);
         }
     }
-    // back-to-front so nearer triangles overdraw farther ones
-    std::sort(tris.begin(), tris.end(), [](const Tri& p, const Tri& q){ return p.depth < q.depth; });
 
-    // Which skin each mesh wears (mesh -> material -> texture), resolved once. A mesh
-    // with no UVs can't be textured however good its skin, so drop those to grey.
-    std::vector<ID3D11ShaderResourceView*> meshSrv(meshes.size(), nullptr);
-    if (view.colorBy == 3)
-        for (size_t mi = 0; mi < meshes.size(); ++mi) {
-            const Skin* sk = skins.skinFor(meshes[mi].material);
-            if (sk && sk->srv && (int)meshes[mi].uvs.size() >= 2 * meshes[mi].nverts)
-                meshSrv[mi] = sk->srv;
-        }
-
-    // Textured triangles go through the raw primitive API with per-VERTEX UVs, so the
-    // skin is interpolated across the face rather than sampled once at the centroid
-    // (what the UV-checker placeholder did). ImDrawList batches by texture, so we
-    // push a texture only when it actually changes along the depth order.
-    ID3D11ShaderResourceView* cur = nullptr;
-    for (const Tri& t : tris) {
-        ID3D11ShaderResourceView* want = meshSrv.empty() ? nullptr : meshSrv[t.mi];
-        if (want != cur) {
-            if (cur)  dl->PopTexture();
-            if (want) dl->PushTexture((ImTextureID)(intptr_t)want);
-            cur = want;
-        }
-        float s = view.shade ? t.shade : 1.0f;
-        if (cur) {
-            // White modulated by the lambert term: ImGui multiplies vertex colour by
-            // the texel, so this shades the skin instead of replacing it. The v is
-            // flipped back because Texture::sampleRgb treats v=0 as the image BOTTOM
-            // while the uploaded D3D texture has v=0 at its top row.
-            int g = (int)(255.0f * s);
-            ImU32 col = IM_COL32(g, g, g, 255);
-            dl->PrimReserve(3, 3);
-            dl->PrimVtx(t.a, ImVec2(t.ua, 1.0f - t.va), col);
-            dl->PrimVtx(t.b, ImVec2(t.ub, 1.0f - t.vb), col);
-            dl->PrimVtx(t.c, ImVec2(t.uc, 1.0f - t.vc), col);
-        } else {
-            ImU32 base;
-            if (view.colorBy == 1)        base = tints[t.mi % 4];
-            else if (view.colorBy == 2) {  // UV checker at the triangle centroid
-                float u = (t.ua + t.ub + t.uc) / 3.0f, v = (t.va + t.vb + t.vc) / 3.0f;
-                int cu = (int)std::floor(u * 8.0f), cv = (int)std::floor(v * 8.0f);
-                bool on = ((cu + cv) & 1) != 0;
-                base = on ? IM_COL32(210, 210, 220, 255) : IM_COL32(90, 95, 110, 255);
-            } else                        base = IM_COL32(180, 185, 195, 255);
-            int r = (int)(((base >> IM_COL32_R_SHIFT) & 0xFF) * s);
-            int g = (int)(((base >> IM_COL32_G_SHIFT) & 0xFF) * s);
-            int b = (int)(((base >> IM_COL32_B_SHIFT) & 0xFF) * s);
-            dl->AddTriangleFilled(t.a, t.b, t.c, IM_COL32(r, g, b, 255));
-        }
-        if (view.wire) {
-            // A line is drawn from the atlas' white pixel, so it must NOT inherit a
-            // skin binding (it would come out tinted by whatever texel that UV lands
-            // on). Unbind first; the next textured triangle re-pushes. Wires stay
-            // interleaved with the fills, so nearer faces still hide farther edges.
-            if (cur) { dl->PopTexture(); cur = nullptr; }
-            dl->AddTriangle(t.a, t.b, t.c, IM_COL32(30, 30, 36, 120), 1.0f);
-        }
+    if (ok && gpu.srv) {
+        dl->AddImage((ImTextureID)(intptr_t)gpu.srv, origin, br);
+    } else {
+        dl->AddRectFilled(origin, br, IM_COL32(14, 16, 20, 255));
+        if (!gpu.err.empty())
+            dl->AddText(ImVec2(origin.x + 8.0f, origin.y + 8.0f),
+                        IM_COL32(240, 140, 110, 255), gpu.err.c_str());
     }
-    if (cur) dl->PopTexture();
-    dl->PopClipRect();
 
     int totalTris = 0, totalV = 0;
     for (const auto& m : meshes) { totalTris += m.nfaces; totalV += m.nverts; }
@@ -2612,6 +2956,7 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
         strips = buildStrips(curves);
         fields = collectFields(sc);
         meshes = collectMeshes(sc);
+        ++mview.geomGen;   // a NEW tessellation -> the mesh pane must re-upload its buffers
         for (const auto& c : curves) view.maxDim  = std::max(view.maxDim,  c.dim);
         for (const auto& f : fields) fview.maxDim = std::max(fview.maxDim, f.dim);
 
@@ -2808,7 +3153,8 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
                 // unless the live Render tab is present, which takes priority.
                 ImGuiTabItemFlags mf = (firstFrame && !haveRender) ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem("Meshes", nullptr, mf)) {
-                    if (drawMeshPane(meshes, mview, skins, live.up ? &live : nullptr)
+                    if (drawMeshPane(meshes, mview, skins, live.up ? &live : nullptr,
+                                     g_pd3dDevice, g_pd3dDeviceContext)
                         && live.autoApply)
                         livePost = true;
                     ImGui::EndTabItem();
@@ -2874,6 +3220,7 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
     rpane.release();   // free the raymarch texture before the D3D device goes away
 #endif
     skins.release();   // ditto for the F4 skin textures
+    mview.gpu.release();   // and the mesh pane's shaders / buffers / offscreen target
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImNodes::DestroyContext();
