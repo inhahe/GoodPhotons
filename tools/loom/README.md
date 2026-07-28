@@ -85,6 +85,10 @@ tools/loom/
 │   ├── audio.py     procedural audio: one sample-buffer back-end → WAV (offline)
 │   ├── xvideo.py    two-pass spacetime transforms (rotate/shear a 4-D block)
 │   ├── ftsl_emit.py .ftsl emission
+│   ├── block.py     layout-preserving generic element (Block/Stmt) for the baked kinds
+│   ├── grammar/     the shared EPEG .ftsl grammar + the read direction:
+│   │                `parse_element` / `parse_elements` rebuild loom elements from .ftsl
+│   │                text, byte-identically re-emittable (layout, alignment, comments)
 │   ├── drive.py     drivers: render a frame range → ftrace → GIF/MP4 assembly
 │   ├── preview.py   resident preview server (keeps ftrace + GPU context warm)
 │   └── viewer.py    native-viewer contract: build() loader + scene-introspection JSON sidecar (§F1),
@@ -115,6 +119,30 @@ python examples/transform_video.py
 Most examples take `--help`. Rendering shells out to the `ftrace` binary (found
 automatically via `loom.drive.find_ftrace`); build it first (see the top-level
 [README](../../README.md#building)).
+
+### Reading `.ftsl` back
+
+`loom.grammar.reader` goes the other way — text to elements — for editing an existing
+scene:
+
+```python
+from loom import Cache, Clock
+from loom.ftsl_emit import EmitCtx
+from loom.grammar.reader import parse_document
+
+doc = parse_document(open("scenes/gyroid.ftsl").read())
+doc.blocks("isosurface")[0].set("resolution", "128")
+open("scenes/gyroid.ftsl", "w").write(doc.emit(EmitCtx(clock=Clock(t=0), cache=Cache())))
+```
+
+This is **not** the inverse of `emit` — loom bakes its `Signal`s at a clock, so a `.ftsl`
+file is a static snapshot and the authoring object that wrote it is unrecoverable. What it
+guarantees is **round-trip fidelity**: every line you don't touch comes back byte for
+byte, keeping its layout, column alignment, comments and blank lines (a `Document` also
+holds the text *between* elements, which belongs to neither of them). Kinds that map onto
+an authoring class without loss (`material`, `texture`, `sphere`, `light`, `camera`,
+`spectrum`, records) come back as that class and re-emit in loom's canonical form; the
+rest come back as a generic ordered `Block` that re-emits its source layout exactly.
 
 ---
 

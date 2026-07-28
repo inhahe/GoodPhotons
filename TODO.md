@@ -2453,7 +2453,8 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          would build a second, competing spelling.
       Each emits down to the J3a form or a documented construct (e.g. lower a `D=3` channel to `spectrum:`-refs +
       synthesised `spectrum` decls); non-lowerable forms stay loom-only representation.
-- [ ] **J3c — full-scene `.ftsl` parser + emitter reconciliation.** Add `.ftsl -> loom Element tree` to
+- [x] **J3c — full-scene `.ftsl` parser + emitter reconciliation. DONE (emitter-drift audit 2026-07-26 / read
+      direction 2026-07-28, 0.93.0 — see the two DONE blocks below).** Add `.ftsl -> loom Element tree` to
       complement the emitters so a whole scene round-trips (semantic re-emit). Audit every `Element.emit`
       against the live grammar and reconcile drift (e.g. `box { translate … size … round … }`,
       `uv planar axis=`, `type mix layer … weight_map pattern:…`, record `from`/dot-override blocks).
@@ -2510,7 +2511,50 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       `priority` authored on geometry in `scenes/_record_scalar.ftsl` (it is a **material** slot), and 6 dead
       `contained_by` lines on pure-analytic isosurfaces in the two gallery scenes (the loader only reads it for
       `function` fields — analytic CSG bounds itself, and a manual clip is spelled `intersect { box … }`).
-      The remaining J3c half — `.ftsl` → loom Element tree — is still open (and see the deferred bullet below).
+      **READ DIRECTION — DONE (2026-07-28, 0.93.0).** `.ftsl` → loom Element tree landed, but *not* as
+      emit's inverse, because it cannot be: loom's emitters **bake** Signals at a clock, so a `.ftsl` file is a
+      static snapshot and an `Isosurface`'s field/freq/rotation/drift/placement/threshold are all flattened into
+      one `function { expr "…" }` string. The property that IS achievable, and the one now proven, is
+      **round-trip fidelity**: `parse_document(src).emit(ctx)` reproduces the source **byte for byte** — line layout,
+      alignment padding, brace columns, 2-vs-3-space gaps, comments and blank lines included — which is exactly
+      what an editor needs (load a scene, change one block, write it back, leave every other line untouched).
+      Faithful kinds still build their real class (`material` incl. `type mix` → `MixMaterial`, `texture`,
+      `proctexture`, `sphere`, `light`, `camera`, `spectrum "n" = …`, `range` records); the **baked** kinds fall
+      back to a new layout-preserving generic element `loom/block.py` (`Block`/`Stmt`: ordered entries so
+      duplicate keys survive — `camera_curve`'s repeated `point`, `mix`'s repeated `layer` — valueless keywords,
+      nested blocks, `get`/`has`/`stmts`/`find`/`set`/`add`/`remove`/`same_as`, `roots() == []`).
+      *(Mechanism: whitespace and comments are lexer `@skip`s and simply are not in the tree, so **every**
+      formatting decision is recovered from source spans — `ParseNode.line/col` against a line-offset table —
+      into per-entry `gap`/`own_line`, block `indent`/`brace_gap`/`pad`, a verbatim `raw` slice per statement
+      dropped on `set()`, and `before`/`trail`/`tail_before` trivia lines.)*
+      `parse_elements(text)` reads a whole file in order via a `start_rule = "elements"` override, so
+      `parse_element` keeps rejecting text holding more than one element; `parse_document(text)` returns a
+      **`Document`** = those elements *plus the literal text between them*, because a file is also the blank
+      lines that group its elements and the top-level comments that head its sections, and those belong to
+      *neither* neighbouring element (`Document.gaps` is one longer than `.elements`; `insert`/`append`/`pop`
+      keep the file's head and tail in place). Grammar work en route: `KVWORD`
+      relaxed toward ftrace's own spelling (`axis=y` / `wrap=clamp` are as real as `center=560`; parens excluded
+      because loom's value grammar spells the sample call explicitly), the value grammar's `arg`/`kwarg`/`kwrest`
+      rewritten so `a=u` inside a tuple still splits, `block` split into `block = nl? bcore nl?` so a nested
+      block does not eat the separating newline, and `bhead` kept as ftrace's two distinct header shapes
+      (`binder NAME subtype?` vs `NAME STRING? subtype?` — a bound element takes no quoted name).
+      **Two real drift bugs found by the corpus round-trip and fixed** (see `known-issues.md`): the `type mix`
+      dict-fold that dropped all but the last layer, and `as_color_binding` rejecting `pattern:<name>` in a
+      colour slot that **loom itself emits** and ftrace accepts (`patternedSpectrumParam`, `src/ftsl.h` ~2083).
+      Verification: 1243 loom tests green (26 new in `tests/test_grammar_block.py`); all **11** loom-emitted
+      element kinds (`scraps/emit_audit/*.ftsl`) round-trip byte-identically; **65 of 97** corpus files parse and
+      **64 of those 65** re-emit byte-identically as a *whole file*. The 65th is the one documented normalisation:
+      a typed element re-emits through its own emitter, i.e. in loom's **canonical** form, so hand-alignment
+      *inside* one is not preserved (`spectrum "steel"   = rgb …` loses the padding before `=`; it is a fixed
+      point after the first save). Layout fidelity is a `Block` property, by construction.
+      **SCOPE BOUNDARY (deliberate, do not "fix"):** the 32 non-parsing files are hand-authored *full-ftrace-
+      language* constructs `ftsl.epeg` does not model — `/`-containing names (`hall/g0 = isosurface {`), §3.2
+      per-property access (`arr_a.reflect(a=u)`), expression arguments (`grad_u(1-u)`), `[…]` array literals at
+      block value sites. `ftsl.epeg` is loom's **typed** grammar and keeps real `NUMBER`/`REF`/`PIN`/`STRING`
+      terminals so the record/material/spectrum validators can shape-check; adopting ftrace's catch-all `WORD`
+      tokenizer would erase exactly those. The whole-language surface's home is `ftsl_scene.epeg` (the grammar
+      compiled into ftrace). The whole-file `scene { … }` → live `Scene` builder likewise stays FUTURE — see the
+      next bullet.
 - [ ] **FUTURE — loom full `.ftsl` read support** (deferred out of J3c above). Give loom a complete `.ftsl` → `Scene`
       reader (not just per-element round-trip): the whole-file `scene { … }` wrapper rule + a `Scene` builder that
       reassembles textures/patterns/records/materials/geometry/lights/camera into a live `Scene`, plus the lossy

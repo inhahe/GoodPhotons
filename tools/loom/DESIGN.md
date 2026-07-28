@@ -407,6 +407,64 @@ and the channels now hold `spectrum:<name>` refs (pins preserved). `lower_ftsl()
 the decls + record as one self-contained parseable block. The remaining J3b item-1 piece
 is wiring these synthesized spectra into a full-scene emit path (part of J3c).
 
+### 8b. Reading `.ftsl` back — `Block` + `grammar/reader.py` (J3c)
+
+The emitters run one way. A `.ftsl` file is a **baked** snapshot of one frame: an
+`Isosurface`'s field, freq, rotation, drift, placement and threshold are all flattened
+into a single `function { expr "…" }` string at a clock, so no reader can recover the
+authoring object that wrote it. The read direction therefore does **not** try to invert
+`emit`. What it guarantees instead is **round-trip fidelity**:
+
+> `parse_document(src).emit(ctx)` reproduces the source **byte for byte** — line layout,
+> alignment padding, brace columns, 2-vs-3-space gaps, comments and blank lines included.
+
+That is the property an editor actually needs: load a scene, change one block, write it
+back, and every line nobody touched is untouched.
+
+- **`parse_element(text)`** builds one element; **`parse_elements(text)`** reads a whole
+  file in order (via a `start_rule = "elements"` override on the same grammar, so
+  `parse_element` keeps rejecting text holding more than one element);
+  **`parse_document(text)`** returns a **`Document`** = those elements *plus* the literal
+  text between them. The gaps matter because a file is also the blank lines that group its
+  elements and the top-level comments that head its sections, and those belong to *neither*
+  neighbouring element — nothing but the document can hold them. `Document.gaps` is always
+  one longer than `.elements` (leading text, then one separator after each), and
+  `insert`/`append`/`pop` keep the file's head and tail in place.
+- **Faithful kinds build their real class.** A block that maps onto an authoring class
+  without loss — `material` (incl. `type mix` → `MixMaterial`), `texture`, `proctexture`,
+  `sphere`, `light`, `camera`, `spectrum "n" = …`, `range` records — is built as that
+  class, validated through `grammar/bindings.py` + `grammar/spectrum.py`. These re-emit
+  through their own emitter, i.e. in loom's **canonical** form rather than the source's,
+  so hand-alignment *inside* a typed element is the one thing a round-trip normalises
+  (`spectrum "steel"   = rgb …` loses the padding before `=`). It is a fixed point after
+  the first save, and it costs exactly one line across the whole checked-in corpus.
+- **Baked kinds fall back to `Block`** (`block.py`): a generic ordered `kind`/`name`/
+  `subtype` + list of `Stmt` entries and nested `Block`s. Ordered, so **duplicate keys
+  survive** (`camera_curve`'s repeated `point` lines, `mix`'s repeated `layer` lines —
+  folding a body into a dict would silently keep only the last). Valueless keywords
+  (`closed`) are present-with-empty-value. `get`/`has`/`stmts`/`find`/`set`/`add`/
+  `remove`/`same_as` are the mutation surface; `same_as` compares content and ignores
+  layout. `Block.roots()` is `[]` — baked text holds no Signals.
+- **Layout comes from source spans, never from the tree.** Whitespace and comments are
+  lexer `@skip`s and simply do not exist in the parse tree, so the builder recovers every
+  formatting decision from `ParseNode.line/col` against a line-offset table (`_Src`):
+  per-entry `gap` and `own_line`, the block's `indent`, `brace_gap` and inner `pad`,
+  a verbatim `raw` slice per statement (dropped the moment `set()` rewrites it), and
+  `before`/`trail`/`tail_before` trivia lines carrying comments and blank lines.
+
+**Scope boundary (deliberate).** `ftsl.epeg` is loom's *typed* grammar of the kinds loom
+emits — it keeps real `NUMBER`/`REF`/`PIN`/`STRING` terminals so the record, material and
+spectrum validators can do shape checking. It is **not** the whole ftrace language, and
+must not become it: adopting ftrace's catch-all `WORD` tokenizer would erase exactly the
+terminals those validators depend on. The whole-language surface lives in
+`ftsl_scene.epeg` (the grammar compiled into ftrace). Consequences, measured over the
+checked-in corpus (65 of 97 files parse; **64 of those 65 re-emit byte-identically as a
+whole file**, the 65th being the hand-aligned `spectrum` decl above; all 11 loom-emitted
+element kinds are exact): `/`-containing names (`hall/g0 = isosurface {`), §3.2 per-property access
+(`arr_a.reflect(a=u)`), expression arguments (`grad_u(1-u)`) and `[…]` array literals at
+block value sites are hand-authored full-language forms `ftsl.epeg` does not model. The
+whole-file `scene { … }` → live `Scene` builder is likewise still FUTURE (§TODO J3c).
+
 ---
 
 ## 9. Layer 6 — Drivers / IO
@@ -445,6 +503,16 @@ tools/loom/
     material.py             function-driven material emit (new)
     record.py               parametric record twin: emit + parse + sample (J3a)
     ladder.py               delimiter-precedence-ladder parser (J3b item 2)
+    block.py                layout-preserving generic element (Block/Stmt) for baked kinds (J3c)
+    grammar/                shared EPEG .ftsl grammar + the read direction (J3c)
+      _gpda.py              vendored GraphParser (pinned, self-contained)
+      ftsl.epeg             loom's typed grammar of the element kinds loom emits
+      ftsl_scene.epeg       generic mirror of ftrace's front-end (compiled into ftrace)
+      reader.py             ParseNode → Element builders; parse_element / parse_elements
+      values.py             value-site grammar (sample calls, kwargs, axis tuples)
+      bindings.py           slot-shape validators (colour / scalar / map binds)
+      spectrum.py           spectrum-expression validator
+      emit_cpp.py           grammar → ftrace C++ front-end
     scene.py                Scene, evaluate(), serialize/round-trip (new)
     ftsl_emit.py            snapshot → .ftsl text (new)
     drive.py                render_range, viewer, assembly, seed (new)

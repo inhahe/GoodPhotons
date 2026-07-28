@@ -116,17 +116,24 @@ Also listed there as still open: sparse *storage* (sparse-source *reads* already
 
 ## 3. Open but with no current driver
 
-### J3c second half — `.ftsl` → loom Element tree  *(loom; large)*
-*TODO.md §J3c.*
+### ~~J3c second half — `.ftsl` → loom Element tree~~  **DONE 2026-07-28 (v0.93.0)**
+*TODO.md §J3c — now closed, both halves.*
 
-The **emitter-reconciliation** half shipped: the unused-key warning
+The **emitter-reconciliation** half shipped 2026-07-26: the unused-key warning
 (`Stmt::used` → `collectUnusedKeys` → an `[ftsl] warning` from `loadSource`) turned a silent
 drift into a loud one, and the audit came back clean on all 11 element kinds and all 78
 checked-in scenes, fixing real drift on the way (`Isosurface` couldn't emit
 `samples`/`accuracy`/`refine`/`uv`; a misplaced `priority`; 6 dead `contained_by` lines).
 
-Still open: the reader direction — parsing a whole `.ftsl` back into a loom Element tree so a
-scene round-trips semantically.
+The **reader** half shipped 2026-07-28. It is not emit's inverse — it can't be, since loom
+bakes Signals at a clock — so the property proven instead is **round-trip fidelity**:
+`parse_document(src).emit(ctx)` reproduces the source byte for byte (layout, alignment,
+comments, blank lines, and the text *between* elements), which is what an editor actually
+needs. Faithful kinds build their real class; baked kinds fall back to the new
+layout-preserving `loom/block.py` (`Block`/`Stmt`/`Document`). All 11 loom-emitted kinds
+round-trip byte-identically, 65 of 97 corpus files parse and 64 of those re-emit exactly (the
+other 32 are full-ftrace-language forms `ftsl.epeg` deliberately doesn't model — see the
+scope-boundary note in TODO.md §J3c and loom's `design.md` §8b), 1243 loom tests green.
 
 ### FUTURE — loom full `.ftsl` read support  *(loom; large)*
 *TODO.md, the `FUTURE` bullet under §J3c.*

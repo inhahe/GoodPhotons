@@ -2485,6 +2485,34 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
 
 ## Recently fixed
 
+### loom rejected its own `reflect pattern:<name>` emission — FIXED 2026-07-28 (v0.93.0)
+
+`loom/grammar/bindings.py::as_color_binding` treated a `pattern:<name>` value as an error in
+every colour slot, so loom's own reader raised `ShapeError: unrecognized spectrum expression
+'pattern:p_rings'` on `.ftsl` that **loom itself emits** for a `FuncPattern`-driven material
+(`scenes/reflect_pattern.ftsl`, `scenes/transmit_pattern.ftsl`). ftrace accepts it — see
+`patternedSpectrumParam` in `src/ftsl.h` (~2083): a lone `pattern:` in a colour slot *is* the
+albedo, over a flat 1.0 base. The validator, not the emitter, held the wrong belief, and two
+tests (`test_color_binding_rejects_pattern`, `test_reflect_rejects_pattern_bind`) encoded it.
+
+Found by round-tripping the checked-in `scenes/*.ftsl` corpus through the new reader (J3c).
+**Fix:** `as_color_binding` accepts `pattern:` in any colour slot and grew a `texture=` keyword
+so the *texture* restriction stays exact — only `reflect` binds an image albedo, everything else
+(`transmit`, `absorb`, …) rejects `texture:` with an explanatory message. `reader.py` moved
+`transmit` out of `_SPECTRAL_ONLY_FIELDS` into a new `_PATTERNED_SPECTRAL_FIELDS`. The two
+tests were rewritten to assert the correct behaviour, plus `test_transmit_rejects_texture_bind`.
+
+### `type mix` lost every layer but the last on read — FIXED 2026-07-28 (v0.93.0)
+
+`loom/grammar/reader.py::_build_material` folded a material body into a `dict`, so the repeated
+`layer "<name>" <weight>` lines of a `type mix` material collapsed to one entry and the reader
+silently built a **one-layer mix** from a two-layer source. Same class of bug as a dict-folded
+`camera_curve` body (repeated `point` lines). **Fix:** `_props()` returns an *ordered list* of
+`(key, tokens)` and `_build_mix()` reads the repeated `layer` lines off it into a real
+`MixMaterial`; the generic `Block` fallback is ordered for the same reason. Regression tests:
+`tests/test_grammar_block.py::test_mix_material_reads_its_repeated_layer_lines` and
+`::test_duplicate_keys_are_kept_in_order`.
+
 ### VDB sampler read the *second* voxel in the low-face half-voxel shell — FIXED 2026-07-27 (v0.84.2)
 
 `VdbGrid::sample` (`src/vdbgrid.h`) and its device twin `dVdbSample` (`src/render_cuda.cu`)

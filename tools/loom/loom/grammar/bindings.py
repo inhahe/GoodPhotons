@@ -4,10 +4,12 @@ more than a bare spectrum (``src/ftsl.h``, ``buildMaterial`` / ``bindReflectText
 
 Three fields (and their kin) accept a **union** of forms, not a single value grammar:
 
-* **colour bind** — ``reflect``: ``texture:<name>`` (``bindReflectTexture``) **or** a
-  spectrum expression (:mod:`loom.grammar.spectrum`).  It does *not* accept
-  ``pattern:`` (only a UV texture can drive an albedo) — a bare ``pattern:foo`` would
-  fall through to ``spectrumParam`` and be rejected, so we reject it here too.
+* **colour bind** — ``reflect``: ``texture:<name>`` (``bindReflectTexture``),
+  ``pattern:<name>`` (``patternedSpectrumParam`` — the pattern goes in the slot alone
+  and the base spectrum becomes a flat 1.0) **or** a spectrum expression
+  (:mod:`loom.grammar.spectrum`).  ``transmit`` is the same union minus the texture:
+  ftrace binds an image albedo only on the ``reflect`` slot of a Lambertian family,
+  and says so explicitly when a ``texture:`` turns up anywhere else.
 * **scalar bind** — ``roughness``: ``pattern:<name>`` (``bindScalarPattern``) **or**
   ``texture:<name>`` (``bindScalarTexture``, grayscale) **or** a single scalar number
   (``dblParam``).  Not a full spectrum — ftrace reads one ``num(words[0])``.
@@ -56,10 +58,19 @@ def _is_scalar(value: str) -> bool:
         return False
 
 
-def as_color_binding(value: str):
-    """Validate a colour-bindable field (``reflect``): a ``texture:<name>`` bind or a
-    spectrum expression.  Returns ``("texture", name)`` or the spectrum node."""
+def as_color_binding(value: str, *, texture: bool = True):
+    """Validate a colour-bindable field: a ``pattern:<name>`` drive, a
+    ``texture:<name>`` image albedo (``reflect`` only — pass ``texture=False`` for
+    ``transmit``), or a spectrum expression.  Returns ``("pattern"|"texture", name)``
+    or the spectrum node."""
+    if value.startswith("pattern:"):
+        return ("pattern", _ref_name(value, "pattern:"))
     if value.startswith("texture:"):
+        if not texture:
+            raise ShapeError(
+                f"'{value.strip()}': this slot takes a spectrum, not a texture — only "
+                "the `reflect` slot of a `diffuse`/`translucent` material binds an "
+                "image albedo. Use 'pattern:<name>' for a procedural drive")
         return ("texture", _ref_name(value, "texture:"))
     from .spectrum import as_spectrum   # lazy: spectrum -> values -> (reader) cycle
     return as_spectrum(value)

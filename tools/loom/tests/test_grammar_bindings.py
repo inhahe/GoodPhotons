@@ -24,7 +24,7 @@ from loom.grammar.bindings import (  # noqa: E402
 from loom.grammar.spectrum import ColorSpec, Const, LibRef, WhiteWall  # noqa: E402
 
 
-# ---- colour bind (reflect): texture: | spectrum ---------------------------
+# ---- colour bind (reflect): pattern: | texture: | spectrum ----------------
 
 def test_color_binding_texture():
     assert as_color_binding("texture:hide") == ("texture", "hide")
@@ -37,10 +37,19 @@ def test_color_binding_spectrum_forms():
     assert as_color_binding("0.75") == Const(0.75)
 
 
-def test_color_binding_rejects_pattern():
-    # reflect binds only a UV texture, not a pattern (pattern: is not a spectrum head).
+def test_color_binding_accepts_pattern():
+    # `reflect pattern:p` is ftrace's patternedSpectrumParam form (src/ftsl.h): the
+    # pattern sits in the slot alone and the base spectrum becomes a flat 1.0.  loom
+    # emits exactly this for a FuncPattern-driven material, so the reader must take it.
+    assert as_color_binding("pattern:wiggle") == ("pattern", "wiggle")
+
+
+def test_color_binding_texture_is_reflect_only():
+    # `transmit` shares the union minus the image albedo — only the `reflect` slot of a
+    # Lambertian family binds a texture, and ftrace says so by name when it doesn't.
+    assert as_color_binding("pattern:wiggle", texture=False) == ("pattern", "wiggle")
     with pytest.raises(ValueError):
-        as_color_binding("pattern:wiggle")
+        as_color_binding("texture:hide", texture=False)
 
 
 def test_color_binding_rejects_untagged_triple():
