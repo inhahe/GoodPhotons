@@ -67,16 +67,47 @@ now reports the tail directly: **9.02 ms → 1.32 ms median** at 1920² on this 
 with byte-identical output. `FTRACE_LIVE_GDI=1` restores the old path for A/B or if a
 driver misbehaves.
 
-**Still open:** the CUDA rasterizer's own **1.09 ms device→host download** remains. Now
-that D3D owns the image texture, the zero-copy finish is available —
-`cudaGraphicsD3D11RegisterResource(..., cudaGraphicsRegisterFlagsSurfaceLoadStore)` plus
-a `surf2Dwrite` in the tonemap kernel, so `renderFrame`'s `cudaMemcpy` disappears for the
-live-preview path. Constraints to respect when doing it: the CUDA device and the D3D
-device must be on the same adapter (`cudaD3D11GetDevice`; hybrid iGPU/dGPU laptops will
-mismatch and must fall back); the ~10 host-RGB `update()` call sites (forward photon
-modes A/B/C, the `filmToRgb8` path-traced `T` preview, any `drawOverlay`-annotated frame)
-still need the upload path; and `drawOverlay` draws control-point markers into the host
-buffer, so the zero-copy path either skips the overlay or moves it onto the GPU.
+**And the download itself is now gone too — DONE (2026-07-28, v0.98.0).** With D3D owning
+the image texture, the zero-copy finish became available and has been taken:
+`raster_cuda::bindPresentTarget` registers the live window's texture with
+`cudaGraphicsD3D11RegisterResource(..., cudaGraphicsRegisterFlagsSurfaceLoadStore)`, and
+`renderFrameToTarget` ends in a `surf2Dwrite` tone-map kernel, so the image never crosses
+the bus for the GPU-rasterized explorer. Every constraint listed above is respected:
+adapter mismatch is detected at registration and **latched off** (`Scene::gfxOff`) so a
+doomed register isn't retried per frame; the host-RGB `update()` call sites are untouched
+and `main.cpp`'s `rasterPresent` declines the fast path (falling back to render+`update()`)
+for the implicit-ray iso preview and for any frame `drawOverlay` must annotate. Byte
+identity is guaranteed *by construction* rather than by testing: passes A–C are literally
+the same code (`renderCore`), and the tone-map's per-pixel body — RN double intrinsics and
+all — is one shared `__device__ inline` that both the buffer and surface kernels call. The
+download used to double as the frame's fence and error check; `cudaStreamSynchronize(0)`
+took over both. Measured @ 3840²: host `render 21.97 + tail 4.17 = 26.1 ms` vs zero-copy
+**9.67 ms** (per-pass download `4.06 → 0.10 ms`). Verified against the download path with
+`WM_PRINTCLIENT` captures (bit-identical), and the fallbacks were exercised individually
+(forward photon mode B, `FTRACE_LIVE_GDI=1`, window resize → re-register, `+Pt` overlay).
+
+### BUG — open: dark speckles / a short dark diagonal streak along tessellated-sphere silhouettes in the raster preview
+
+**Symptom.** In the `-raster` solid-shaded preview, the silhouette of a tessellated sphere
+(e.g. `scenes/cornell.ftsl`'s sphere) is fringed with isolated dark pixels, plus a short
+dark diagonal line segment near the upper-left of the silhouette. Reproduce with
+`ftrace scenes/cornell.ftsl -raster -explore -r 800 600 -device gpu -window` and look at
+the sphere's edge, or just at `cornell.ppm`.
+
+**What's known.** It is **not** a zero-copy/interop regression and **not** a backend
+difference: 800×600 captures of the download path and the surface path are bit-identical
+in that region, so both GPU tone-map paths agree, and the artifact predates v0.98.0. That
+places it in the **shared visibility/shading stage** (pass B `kRaster*`'s `atomicMax`
+visibility merge or pass C `kShade`'s resolve), not in exposure/encode/present. Likely
+candidates: a coverage/edge rule that lets a pixel on a shared triangle edge resolve to a
+*back*-facing or far slot (an `invd` tie broken the wrong way in the packed
+`(invd_bits<<32)|slot` key), or a normal picked from the wrong slot at the silhouette
+where adjacent triangles' shading normals diverge most.
+
+**Next step.** Check whether the CPU rasterizer (`-device cpu`) shows the same speckles at
+the same pixels. If it does, the bug is in the shared coverage/shading rule in `raster.h`;
+if it doesn't, diff the two frames and inspect the `vis` slot ids at the offending pixels
+to see which triangle won.
 
 ### BUG — DONE (2026-07-28, v0.95.0): `python -m loom.anim` served an *empty* slot list — a module that is both `__main__` and importable is two different classes
 

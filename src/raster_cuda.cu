@@ -96,6 +96,25 @@
   #include <cuda_runtime.h>
 #endif
 
+// --- Optional CUDA <-> Direct3D 11 interop (zero-copy present) ----------------------
+// When the live window is presenting with D3D11 (see livewindow.cpp), the tonemap can
+// write its RGBA8 bytes STRAIGHT into the texture D3D samples, so the finished frame
+// never crosses the PCIe bus or touches host memory at all. Windows + real CUDA only:
+// a HIP build or a non-Windows host simply omits the extra entry points and keeps the
+// download path (renderFrameToTarget then reports failure and the caller falls back).
+#if defined(_WIN32) && !defined(FTRACE_USE_HIP) && !defined(__HIP_PLATFORM_AMD__)
+  #define FTRACE_D3D11_INTEROP 1
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>
+  #include <d3d11.h>
+  #include <cuda_d3d11_interop.h>
+#endif
+
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -807,19 +826,21 @@ __device__ inline unsigned char encodeSrgb(double c, const unsigned char* lut) {
     return lut[(int)__dadd_rn(__dmul_rn(c, 4096.0), 0.5)];
 }
 
-// Tonemap + encode, one thread per pixel — the host tonemap loop operation-for-operation.
+// One pixel of tonemap + encode — the host tonemap loop operation-for-operation.
 // Every arithmetic op is an explicit round-to-nearest DOUBLE intrinsic so nvcc cannot
 // contract mul+add into FMA: the host build (MSVC /fp:precise, no AVX2 codegen) performs
 // plain IEEE mul/add there, and matching that sequence exactly is what keeps the output
 // bytes identical. Background pixels (zbuf<=0) keep the unexposed bg tint; the
 // see-through composite applies to ALL pixels (background included), as on the host.
-__global__ void kToneMap(const float3* accum, const float* zbuf, size_t n,
-                         double finalExp, int seeThrough,
-                         const float* clearT, const float* milkT,
-                         double milkX, double milkY, double milkZ,
-                         const unsigned char* lut, unsigned char* img) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+//
+// Factored out of the kernel so the RGB8-buffer and D3D-surface writers below are the
+// SAME maths by construction — the zero-copy present path cannot drift from the download
+// path (or from the host tail) no matter what is done to either kernel's plumbing.
+__device__ inline uchar3 tonemapPixel(const float3* accum, const float* zbuf, size_t i,
+                                      double finalExp, int seeThrough,
+                                      const float* clearT, const float* milkT,
+                                      double milkX, double milkY, double milkZ,
+                                      const unsigned char* lut) {
     float3 a = accum[i];
     double cx = (double)a.x, cy = (double)a.y, cz = (double)a.z;
     if (zbuf[i] > 0.0f) {                          // hit pixels get the exposure
@@ -836,10 +857,42 @@ __global__ void kToneMap(const float3* accum, const float* zbuf, size_t n,
             cz = __dadd_rn(__dmul_rn(cz, (double)T), __dmul_rn(milkZ, m));
         }
     }
-    img[i * 3 + 0] = encodeSrgb(cx, lut);
-    img[i * 3 + 1] = encodeSrgb(cy, lut);
-    img[i * 3 + 2] = encodeSrgb(cz, lut);
+    return make_uchar3(encodeSrgb(cx, lut), encodeSrgb(cy, lut), encodeSrgb(cz, lut));
 }
+
+// Tonemap + encode into the downloadable RGB8 frame, one thread per pixel.
+__global__ void kToneMap(const float3* accum, const float* zbuf, size_t n,
+                         double finalExp, int seeThrough,
+                         const float* clearT, const float* milkT,
+                         double milkX, double milkY, double milkZ,
+                         const unsigned char* lut, unsigned char* img) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uchar3 c = tonemapPixel(accum, zbuf, i, finalExp, seeThrough, clearT, milkT,
+                            milkX, milkY, milkZ, lut);
+    img[i * 3 + 0] = c.x;
+    img[i * 3 + 1] = c.y;
+    img[i * 3 + 2] = c.z;
+}
+
+#ifdef FTRACE_D3D11_INTEROP
+// Tonemap + encode STRAIGHT INTO the live window's D3D11 texture (RGBA8, opaque alpha).
+// Identical maths to kToneMap — only the store differs, so the pixels D3D shows are the
+// same bytes the download path would have produced. `W` maps the linear pixel index onto
+// the surface's (x,y); the byte x-offset surf2Dwrite wants is x * sizeof(uchar4).
+__global__ void kToneMapSurf(const float3* accum, const float* zbuf, size_t n, int W,
+                             double finalExp, int seeThrough,
+                             const float* clearT, const float* milkT,
+                             double milkX, double milkY, double milkZ,
+                             const unsigned char* lut, cudaSurfaceObject_t surf) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uchar3 c = tonemapPixel(accum, zbuf, i, finalExp, seeThrough, clearT, milkT,
+                            milkX, milkY, milkZ, lut);
+    int x = (int)(i % (size_t)W), y = (int)(i / (size_t)W);
+    surf2Dwrite(make_uchar4(c.x, c.y, c.z, 255u), surf, x * (int)sizeof(uchar4), y);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Host side.
@@ -895,6 +948,15 @@ struct Scene {
     // Per-pass profiling events (stream marks; see renderFrame). [0]=frame start,
     // then after: clearvis, project, raster, shade, clear, tonemap, download.
     cudaEvent_t ev[8] = {};
+#ifdef FTRACE_D3D11_INTEROP
+    // Zero-copy present target: the live window's D3D11 texture registered with CUDA.
+    // Registration is expensive and the texture is stable between resizes, so it is kept
+    // here and only redone when bindPresentTarget() is handed a different texture/size.
+    cudaGraphicsResource* gfxRes = nullptr;
+    void*                 gfxTex = nullptr;   // the ID3D11Texture2D* gfxRes was made from
+    int                   gfxW = 0, gfxH = 0;
+    bool                  gfxOff = false;     // registration failed once -> stop retrying
+#endif
 };
 
 static float3 toF3(const Vec3& v) { return make_float3((float)v.x, (float)v.y, (float)v.z); }
@@ -916,6 +978,11 @@ static bool tryMallocHost(void** p, size_t bytes) {
 
 void destroy(Scene* sc) {
     if (!sc) return;
+#ifdef FTRACE_D3D11_INTEROP
+    // Unregister before anything else: the D3D texture may outlive the scene, and CUDA
+    // holds a reference on it until this returns.
+    if (sc->gfxRes) cudaGraphicsUnregisterResource(sc->gfxRes);
+#endif
     if (sc->dtris)    cudaFree(sc->dtris);
     if (sc->dgeos)    cudaFree(sc->dgeos);
     if (sc->dattrs)   cudaFree(sc->dattrs);
@@ -1082,14 +1149,39 @@ static inline void paddEv(double& acc, cudaEvent_t a, cudaEvent_t b) {
     if (cudaEventElapsedTime(&ms, a, b) == cudaSuccess) acc += ms;
 }
 
-std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
-                                 double exposure, bool autoExpose, double* lockAnchor,
-                                 bool seeThrough, double glassClarity) {
-    std::vector<uint8_t> empty;
-    (void)nThreads;   // whole frame (incl. expose/tonemap) runs on the device now
-    if (!sc || sc->nTris == 0 || W <= 0 || H <= 0) return empty;
+// The see-through composite's milk (haze) tint — raster::renderFrame's constant. File
+// scope because renderCore stops before the tonemap and both tonemap callers need it.
+static const Vec3 kMilkColor{0.52, 0.55, 0.60};
+
+// Resolve the per-pass event pairs into the profiling tally. Call only after something
+// has fenced the frame (the image download, or the interop unmap's stream sync).
+static void profResolve(Scene* sc) {
+    if (!g_prof) return;
+    if (cudaEventSynchronize(sc->ev[7]) == cudaSuccess) {
+        paddEv(g_profAcc.clearvis_ms, sc->ev[0], sc->ev[1]);
+        paddEv(g_profAcc.project_ms,  sc->ev[1], sc->ev[2]);
+        paddEv(g_profAcc.raster_ms,   sc->ev[2], sc->ev[3]);
+        paddEv(g_profAcc.shade_ms,    sc->ev[3], sc->ev[4]);
+        paddEv(g_profAcc.clear_ms,    sc->ev[4], sc->ev[5]);
+        paddEv(g_profAcc.expose_ms,   sc->ev[5], sc->ev[6]);
+        paddEv(g_profAcc.download_ms, sc->ev[6], sc->ev[7]);
+    }
+    ++g_profAcc.frames;
+}
+
+// Everything a frame needs EXCEPT the final tonemap store: geometry projection, raster,
+// shading, the optional see-through pass, and the auto-exposure anchor. Split out so the
+// two ways of delivering the pixels — download an RGB8 buffer (renderFrame) or write the
+// live window's D3D texture in place (renderFrameToTarget) — share one implementation and
+// differ only in their last kernel. `finalExp` receives the exposure the tonemap applies.
+// Returns false on any device failure (the caller then falls back to the CPU rasterizer).
+static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
+                       double exposure, bool autoExpose, double* lockAnchor,
+                       bool seeThrough, double glassClarity,
+                       double& finalExp, int& gPix, int& TPBout) {
+    if (!sc || sc->nTris == 0 || W <= 0 || H <= 0) return false;
     const size_t N = (size_t)W * H;
-    if (!ensurePix(sc, N)) return empty;
+    if (!ensurePix(sc, N)) return false;
 
     DCam dc;
     dc.eye = toF3(cam.eye); dc.u = toF3(cam.u); dc.v = toF3(cam.v); dc.w = toF3(cam.w);
@@ -1103,19 +1195,19 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     // See-through (clear-glass) preview parameters — identical to raster::renderFrame's.
     const double kMilkPerSurface = std::max(0.0, (1.0 - glassClarity)) * 0.55;
     const double kRimStrength    = 0.55;
-    const Vec3   kMilkColor{0.52, 0.55, 0.60};
 
     // Per-pass stream marks (no-ops unless profiling; resolved after the download).
     auto rec = [&](int i) { if (g_prof) cudaEventRecord(sc->ev[i], 0); };
 
     rec(0);
-    if (cudaMemset(sc->vis, 0, sizeof(unsigned long long) * N) != cudaSuccess) return empty;
+    if (cudaMemset(sc->vis, 0, sizeof(unsigned long long) * N) != cudaSuccess) return false;
     rec(1);
 
-    int TPB = 256;
+    const int TPB = 256;
     int gTris  = (sc->nTris + TPB - 1) / TPB;
     int gSlots = (2 * sc->nTris + TPB - 1) / TPB;
-    int gPix   = (int)((N + TPB - 1) / TPB);
+    gPix   = (int)((N + TPB - 1) / TPB);
+    TPBout = TPB;
 
     kProject<<<gTris, TPB>>>(sc->dtris, sc->nTris, dc, W, H, sc->dgeos, sc->dattrs, sc->dflags);
     rec(2);
@@ -1123,7 +1215,7 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     // (thread / warp / block per sub-triangle). Every (slot,row) runs the exact row maths
     // of the old single kernel and atomicMax merges order-independently, so the result is
     // bit-identical while a screen-filling quad no longer serializes on one thread.
-    if (cudaMemset(sc->dbinCnt, 0, 5 * sizeof(int)) != cudaSuccess) return empty;   // counts + tickets
+    if (cudaMemset(sc->dbinCnt, 0, 5 * sizeof(int)) != cudaSuccess) return false;   // counts + tickets
     kClassify<<<gSlots, TPB>>>(sc->dgeos, sc->dflags, 2 * sc->nTris, W, H, seeThrough ? 1 : 0,
                                sc->dbinSmall, sc->dbinMed, sc->dbinLarge, sc->dbinCnt);
     // The raster kernels read their bin count from dbinCnt, so nothing here waits on
@@ -1172,13 +1264,13 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
             unsigned int cut[2] = {0, 0};           // winning top-16 / low-16 bin
             size_t total = 0, rank = 0;
             for (int round = 0; round < 2; ++round) {
-                if (cudaMemset(sc->dhist, 0, 65536 * sizeof(unsigned int)) != cudaSuccess) return empty;
+                if (cudaMemset(sc->dhist, 0, 65536 * sizeof(unsigned int)) != cudaSuccess) return false;
                 if (round == 0)
                     kLumHist1<<<gPix, TPB>>>(sc->accum, sc->zbuf, sc->emis, N, sc->dhist);
                 else
                     kLumHist2<<<gPix, TPB>>>(sc->accum, sc->zbuf, sc->emis, N, cut[0], sc->dhist);
                 if (cudaMemcpy(sc->h_hist, sc->dhist, 65536 * sizeof(unsigned int),
-                               cudaMemcpyDeviceToHost) != cudaSuccess) return empty;   // syncs
+                               cudaMemcpyDeviceToHost) != cudaSuccess) return false;   // syncs
                 if (round == 0) {
                     for (int b = 0; b < 65536; ++b) total += sc->h_hist[b];
                     if (total == 0) break;          // no lit surfaces: eAuto stays 1
@@ -1201,32 +1293,119 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
             if (lockAnchor) *lockAnchor = eAuto;     // first frame sets the anchor
         }
     }
-    const double finalExp = eAuto * expComp;
+    finalExp = eAuto * expComp;
+    return true;
+}
+
+std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
+                                 double exposure, bool autoExpose, double* lockAnchor,
+                                 bool seeThrough, double glassClarity) {
+    std::vector<uint8_t> empty;
+    (void)nThreads;   // whole frame (incl. expose/tonemap) runs on the device now
+    double finalExp = 1.0;
+    int gPix = 0, TPB = 0;
+    if (!renderCore(sc, cam, W, H, exposure, autoExpose, lockAnchor, seeThrough,
+                    glassClarity, finalExp, gPix, TPB)) return empty;
+    const size_t N = (size_t)W * H;
+
     kToneMap<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, finalExp, seeThrough ? 1 : 0,
                             sc->clearT, sc->milkT, kMilkColor.x, kMilkColor.y, kMilkColor.z,
                             sc->dlut, sc->dimg);
-    rec(6);
+    if (g_prof) cudaEventRecord(sc->ev[6], 0);
 
     // Download ONLY the finished RGB8 frame through the pinned staging buffer. This
     // blocking copy fences every pass enqueued above; a poisoned context surfaces in
     // its return code (or the earlier readbacks'), and the sticky-error sweep below
     // catches kernel-launch failures that never poisoned a blocking call.
     if (cudaMemcpy(sc->h_img, sc->dimg, N * 3, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-    rec(7);
+    if (g_prof) cudaEventRecord(sc->ev[7], 0);
     if (cudaGetLastError() != cudaSuccess) return empty;
-    if (g_prof) {
-        if (cudaEventSynchronize(sc->ev[7]) == cudaSuccess) {
-            paddEv(g_profAcc.clearvis_ms, sc->ev[0], sc->ev[1]);
-            paddEv(g_profAcc.project_ms,  sc->ev[1], sc->ev[2]);
-            paddEv(g_profAcc.raster_ms,   sc->ev[2], sc->ev[3]);
-            paddEv(g_profAcc.shade_ms,    sc->ev[3], sc->ev[4]);
-            paddEv(g_profAcc.clear_ms,    sc->ev[4], sc->ev[5]);
-            paddEv(g_profAcc.expose_ms,   sc->ev[5], sc->ev[6]);
-            paddEv(g_profAcc.download_ms, sc->ev[6], sc->ev[7]);
-        }
-        ++g_profAcc.frames;
-    }
+    profResolve(sc);
     return std::vector<uint8_t>(sc->h_img, sc->h_img + N * 3);
 }
+
+// ---------------------------------------------------------------------------
+// Zero-copy present: render straight into the live window's D3D11 texture.
+
+#ifdef FTRACE_D3D11_INTEROP
+
+bool bindPresentTarget(Scene* sc, void* d3d11Device, void* d3d11Texture, int W, int H) {
+    if (!sc || !d3d11Texture || W <= 0 || H <= 0) return false;
+    (void)d3d11Device;   // the texture carries its device; kept in the API for clarity
+    // Already registered to this exact texture at this size? Nothing to do — registration
+    // is far too expensive to redo per frame. (The comparison is safe even though the old
+    // texture may have been released: CUDA holds a reference on a registered resource, so a
+    // NEW texture can never land on a still-registered one's address.)
+    if (sc->gfxRes && sc->gfxTex == d3d11Texture && sc->gfxW == W && sc->gfxH == H) return true;
+    if (sc->gfxOff) return false;   // known-unavailable: don't pay for a doomed register per frame
+    if (sc->gfxRes) {
+        cudaGraphicsUnregisterResource(sc->gfxRes);
+        sc->gfxRes = nullptr; sc->gfxTex = nullptr; sc->gfxW = sc->gfxH = 0;
+    }
+    // A failure here is the normal, expected outcome when D3D picked a DIFFERENT adapter
+    // than the CUDA device (hybrid iGPU/dGPU laptops): the texture lives on a GPU this
+    // context cannot touch. The caller then keeps using the download path.
+    cudaError_t e = cudaGraphicsD3D11RegisterResource(
+        &sc->gfxRes, (ID3D11Resource*)d3d11Texture, cudaGraphicsRegisterFlagsSurfaceLoadStore);
+    if (e != cudaSuccess) {
+        sc->gfxRes = nullptr;
+        sc->gfxOff = true;           // the cause (wrong adapter) doesn't heal; stop trying
+        cudaGetLastError();          // clear the sticky error so later frames aren't poisoned
+        return false;
+    }
+    sc->gfxTex = d3d11Texture; sc->gfxW = W; sc->gfxH = H;
+    return true;
+}
+
+bool renderFrameToTarget(Scene* sc, const Camera& cam, int W, int H, int nThreads,
+                         double exposure, bool autoExpose, double* lockAnchor,
+                         bool seeThrough, double glassClarity) {
+    (void)nThreads;
+    if (!sc || !sc->gfxRes || sc->gfxW != W || sc->gfxH != H) return false;
+    double finalExp = 1.0;
+    int gPix = 0, TPB = 0;
+    if (!renderCore(sc, cam, W, H, exposure, autoExpose, lockAnchor, seeThrough,
+                    glassClarity, finalExp, gPix, TPB)) return false;
+    const size_t N = (size_t)W * H;
+
+    // Map the D3D texture into CUDA's address space, grab its array, and write the
+    // tonemapped bytes into it directly. D3D is blocked from the texture between map and
+    // unmap — which is why the caller must hold the presenter's device lock across this.
+    if (cudaGraphicsMapResources(1, &sc->gfxRes, 0) != cudaSuccess) { cudaGetLastError(); return false; }
+    cudaArray_t arr = nullptr;
+    bool okFrame = false;
+    if (cudaGraphicsSubResourceGetMappedArray(&arr, sc->gfxRes, 0, 0) == cudaSuccess && arr) {
+        cudaResourceDesc rd{};
+        rd.resType = cudaResourceTypeArray;
+        rd.res.array.array = arr;
+        cudaSurfaceObject_t surf = 0;
+        if (cudaCreateSurfaceObject(&surf, &rd) == cudaSuccess) {
+            kToneMapSurf<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, W, finalExp, seeThrough ? 1 : 0,
+                                        sc->clearT, sc->milkT,
+                                        kMilkColor.x, kMilkColor.y, kMilkColor.z,
+                                        sc->dlut, surf);
+            if (g_prof) cudaEventRecord(sc->ev[6], 0);
+            cudaDestroySurfaceObject(surf);
+            okFrame = true;
+        }
+    }
+    if (cudaGraphicsUnmapResources(1, &sc->gfxRes, 0) != cudaSuccess) okFrame = false;
+    if (g_prof) cudaEventRecord(sc->ev[7], 0);   // "download" window: ~0, nothing crosses the bus
+    // The blocking download used to be the frame's fence AND its error check; with the
+    // image never leaving the device, this sync takes over both jobs. It also guarantees
+    // the tonemap has actually landed in the texture before D3D presents it.
+    if (cudaStreamSynchronize(0) != cudaSuccess) okFrame = false;
+    if (cudaGetLastError() != cudaSuccess) okFrame = false;
+    profResolve(sc);
+    return okFrame;
+}
+
+#else   // no interop on this platform/toolchain: always fail so callers use the download path
+
+bool bindPresentTarget(Scene*, void*, void*, int, int) { return false; }
+bool renderFrameToTarget(Scene*, const Camera&, int, int, int, double, bool, double*,
+                         bool, double) { return false; }
+
+#endif
 
 }  // namespace raster_cuda

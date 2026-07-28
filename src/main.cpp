@@ -6602,6 +6602,33 @@ static int run(int argc, char** argv) {
                 }
             }
 #ifdef HAVE_CUDA
+            raster_cuda::Prof profHost = raster_cuda::profTake();   // phase 1's per-pass tally
+            // ---- Phase 2: the same frame delivered ZERO-COPY -----------------------------
+            // Identical render work, but the tonemap writes the live window's D3D11 texture
+            // in place, so there is no device->host download, no copy out of the pinned
+            // buffer, and no re-upload. Timed end to end (render + show) so it can be read
+            // straight against phase 1's render time + present tail, which is the same job
+            // routed through host memory.
+            std::vector<double> zc;
+            bool zcTried = false;
+            if (gpuRaster && g_showWindow && g_liveWin) {
+                zcTried = true;
+                zc.reserve(rasterBench);
+                for (int it = 0; it < rasterBench && !g_stopRequested; ++it) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    bool ok = g_liveWin->renderShared(W, H, [&](void* dev, void* tex) -> bool {
+                        if (!raster_cuda::bindPresentTarget(gpuRaster, dev, tex, W, H)) return false;
+                        return raster_cuda::renderFrameToTarget(gpuRaster, rc.cam, W, H, nThreads,
+                                                                ev, autoExp, nullptr,
+                                                                rasterSeeThrough, rasterClarity);
+                    });
+                    if (!ok) { zc.clear(); break; }   // no interop here: report it, don't fake it
+                    zc.push_back(std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - t0).count());
+                    if (g_liveWin->closed()) g_stopRequested = 1;
+                }
+            }
+            raster_cuda::Prof profZc = raster_cuda::profTake();     // phase 2's per-pass tally
             raster_cuda::profEnable(false);
 #endif
             if (!ms.empty()) {
@@ -6626,15 +6653,31 @@ static int run(int argc, char** argv) {
             }
 #ifdef HAVE_CUDA
             {
-                raster_cuda::Prof p = raster_cuda::profTake();
-                if (p.frames > 0) {
+                auto passLine = [](const char* what, const raster_cuda::Prof& p) {
+                    if (p.frames <= 0) return;
                     double f = 1.0 / p.frames;
-                    std::printf("[raster-bench] GPU per-pass avg ms: clearvis %.2f  project %.2f  "
+                    std::printf("[raster-bench] GPU per-pass avg ms (%s): clearvis %.2f  project %.2f  "
                                 "raster %.2f  shade %.2f  clear %.2f  expose+encode %.2f  "
                                 "download %.2f\n",
-                                p.clearvis_ms * f, p.project_ms * f, p.raster_ms * f,
+                                what, p.clearvis_ms * f, p.project_ms * f, p.raster_ms * f,
                                 p.shade_ms * f, p.clear_ms * f, p.expose_ms * f,
                                 p.download_ms * f);
+                };
+                passLine("download", profHost);
+                if (!zc.empty()) {
+                    std::vector<double> s = zc;
+                    std::sort(s.begin(), s.end());
+                    double mean = 0;
+                    for (double v : zc) mean += v;
+                    mean /= zc.size();
+                    std::printf("[raster-bench] zero-copy render+present: min %.2f ms  median %.2f ms  "
+                                "mean %.2f ms  (%.1f fps @ median)\n",
+                                s.front(), s[s.size() / 2], mean,
+                                s[s.size() / 2] > 0 ? 1000.0 / s[s.size() / 2] : 0.0);
+                    passLine("zero-copy", profZc);
+                } else if (zcTried) {
+                    std::printf("[raster-bench] zero-copy present unavailable "
+                                "(GDI window, or D3D on a different adapter than the CUDA device)\n");
                 }
             }
 #endif
@@ -7243,6 +7286,46 @@ static int run(int argc, char** argv) {
                 int sel = selectedPoint();
                 for (size_t i = 0; i < editPts.size(); ++i)
                     marker(editPts[i].eye, 255, ((int)i == sel) ? 60 : 220, ((int)i == sel) ? 60 : 40);  // yellow / red-selected
+            };
+            // ---- ZERO-COPY present (CUDA <-> Direct3D 11) -----------------------------
+            // The fastest way to show a GPU-rastered frame is not to move it: the tonemap
+            // writes its bytes straight into the texture the live window's D3D11 presenter
+            // samples, so the image never crosses the PCIe bus and no host code ever touches
+            // a pixel. That skips, per frame, the device->host download, the vector copy out
+            // of the pinned buffer, and the host->device re-upload the presenter would do.
+            //
+            // It only applies when nothing needs the pixels on the HOST — i.e. the curve
+            // editor's overlay (control-point markers + spline polyline, drawn with putpx into
+            // the RGB buffer) is not active. Every other case, and any failure at any step
+            // (no CUDA, CPU rasterizer, GDI window, D3D on a different adapter than the CUDA
+            // device), returns false and the caller renders the ordinary way.
+            int zeroCopyOn = -1;   // last reported state: -1 = unreported, 0 = host path, 1 = zero-copy
+            auto rasterPresent = [&](const Camera& c, int w, int h, double expo, bool autoExp_) -> bool {
+#ifdef HAVE_CUDA
+                if (!g_liveWin || !gpuRaster) return false;
+                if (useGpuIso && !c.hasLens()) return false;      // implicit-ray preview owns this frame
+                if (!(explorePath.size() < 2 && editPts.empty())) return false;   // overlay needs host pixels
+                bool zc = g_liveWin->renderShared(w, h, [&](void* dev, void* tex) -> bool {
+                    if (!raster_cuda::bindPresentTarget(gpuRaster, dev, tex, w, h)) return false;
+                    return raster_cuda::renderFrameToTarget(gpuRaster, c, w, h, nThreads, expo,
+                                                            autoExp_, nullptr,
+                                                            rasterSeeThrough, rasterClarity);
+                });
+                // Say which way the pixels are actually flowing — whether the interop engaged
+                // is invisible otherwise (both paths show the same image), and it can legitimately
+                // be off (GDI window, or D3D on a different adapter than the CUDA device).
+                if ((int)zc != zeroCopyOn) {
+                    zeroCopyOn = (int)zc;
+                    std::printf(zc ? "[raster] zero-copy present: the tonemap writes the live window's "
+                                     "D3D11 texture directly (no host readback)\n"
+                                   : "[raster] zero-copy present off: frames travel through host memory\n");
+                    std::fflush(stdout);
+                }
+                return zc;
+#else
+                (void)c; (void)w; (void)h; (void)expo; (void)autoExp_;
+                return false;
+#endif
             };
             // ---- Speed / orientation PAINTING (Phase 2/3) -----------------------------
             // The painted tracks are anchored to the CONTROL POINTS: speed is a per-point
@@ -7907,9 +7990,11 @@ static int run(int argc, char** argv) {
                     }
                     if (changed) {
                         // Camera moved: show the responsive raster and mark the trace stale.
-                        std::vector<uint8_t> img = rasterOne(c, VW, VH, ev, autoExp, nullptr);
-                        drawOverlay(c, VW, VH, img);
-                        g_liveWin->update(VW, VH, img);
+                        if (!rasterPresent(c, VW, VH, ev, autoExp)) {
+                            std::vector<uint8_t> img = rasterOne(c, VW, VH, ev, autoExp, nullptr);
+                            drawOverlay(c, VW, VH, img);
+                            g_liveWin->update(VW, VH, img);
+                        }
                         g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")  [trace: move to re-aim]");
                         traceDirty = true;
@@ -7939,13 +8024,21 @@ static int run(int argc, char** argv) {
                 if (!traceMode && (changed || warmOnly)) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
-                    std::vector<uint8_t> img =
-                        rasterOne(c, VW, VH, ev, autoExp, nullptr);
-                    if (changed) {   // only a real change repaints the window
-                        drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
-                        g_liveWin->update(VW, VH, img);
+                    // A warm-only frame renders solely to hold the boost clock and must NOT
+                    // repaint, so the zero-copy present (which renders AND shows) is for real
+                    // changes only; the warm frame keeps taking the ordinary render path.
+                    if (changed && rasterPresent(c, VW, VH, ev, autoExp)) {
                         g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")");
+                    } else {
+                        std::vector<uint8_t> img =
+                            rasterOne(c, VW, VH, ev, autoExp, nullptr);
+                        if (changed) {   // only a real change repaints the window
+                            drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
+                            g_liveWin->update(VW, VH, img);
+                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                                                ")  dir(" + fmt3(fwd) + ")");
+                        }
                     }
                     changed = false;
                 }

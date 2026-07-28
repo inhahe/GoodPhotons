@@ -762,6 +762,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   memory. `LivePresenter` serialises its own device context with a mutex, because both
   the render thread (upload + present) and the UI thread (re-present after a resize or
   expose) drive it.
+  **`renderShared(w, h, fn)` is the zero-copy entry point** (0.98.0): instead of handing
+  the presenter finished host bytes, the caller is handed the presenter's own D3D11 device
+  and RGBA8 image texture (both as `void*`, so the header stays API-agnostic) and fills the
+  texture on the GPU; `renderShared` then presents it. It is a **callback rather than an
+  exposed lock/unlock pair** because the whole map/render/unmap must run under
+  `LivePresenter::mtx` — the CUDA↔D3D interop the callback performs drives D3D's immediate
+  context, which is not thread-safe and is shared with the UI thread's repaints — and a
+  callback makes that impossible to get wrong. It returns false **without calling `fn`**
+  whenever the fast path is unavailable (GDI fallback, stub build, lost device), and false
+  after a failed `fn`, so the caller always has a well-defined fallback to
+  `render → update()`. `ensureImg` may hand back a *different* texture after a resolution
+  change, which is exactly why the CUDA side re-registers on pointer identity.
   With `-anim … -loom` the window grows a fourth
   panel row, the **loom bind row** (channel combo → slot combo → Bind/Unbind, a `chans:`
   count box, a status readout). Child HWNDs may only be created and moved on the window's
@@ -971,6 +983,43 @@ surface through the blocking copies' return codes plus one sticky
 `cudaGetLastError()` sweep per frame. Per-pass profiling (`-raster-bench`'s
 breakdown) records CUDA events into the stream between passes and resolves them
 once after the download — zero overhead when disabled.
+
+**Zero-copy present (CUDA ↔ D3D11 interop, 0.98.0).** In the interactive explorer the
+finished frame no longer crosses the bus at all: `bindPresentTarget` registers the live
+window's own image texture with `cudaGraphicsD3D11RegisterResource(…SurfaceLoadStore)`,
+and `renderFrameToTarget` runs the identical pipeline but ends in `kToneMapSurf`, which
+`surf2Dwrite`s each pixel straight into that texture (map → kernel → unmap, all inside
+`LiveWindow::renderShared`'s device lock). That removes the D2H image copy, the H2D
+re-upload, and every host touch of the pixels in between. Design points:
+
+- **Byte-identity by construction.** Passes A–C are literally the same code (`renderCore`,
+  factored out of `renderFrame`), and the tonemap's per-pixel body — including the explicit
+  RN double intrinsics that stop nvcc contracting to FMA — lives in one shared
+  `__device__ inline tonemapPixel()` that both `kToneMap` (writes RGB8 to a buffer) and
+  `kToneMapSurf` (writes RGBA8 to the surface) call. The two paths cannot drift.
+- **The download was also the frame's fence and error check**; with it gone,
+  `cudaStreamSynchronize(0)` takes over both jobs, and the profiling event that bracketed
+  the download now honestly reports ~0.
+- **Registration is latched off after one failure** (`gfxOff`). The real-world failure is
+  D3D choosing a different adapter than the CUDA device (hybrid iGPU/dGPU laptops) — a
+  condition that never heals — so retrying per frame would be pure cost; the sticky CUDA
+  error is cleared so later frames aren't poisoned.
+- **Re-registration is keyed on texture pointer + size.** Comparing pointers is safe
+  because a registered resource holds a COM reference, so a new texture can never be
+  allocated on a still-registered one's address.
+- **Fallbacks are explicit, not silent.** `main.cpp`'s `rasterPresent` declines the fast
+  path (returning false so the caller renders to host memory and calls `update()`) when
+  there is no live window or GPU scene, when the implicit-ray iso preview owns the frame,
+  or when a camera-path/edit-point overlay needs to draw into host pixels. It prints a
+  one-line state change the first time each way, so a silent fallback can't masquerade as
+  working interop. Warm-only clock-keeping frames deliberately keep the ordinary path
+  (they must render without repainting).
+
+Measured @ 3840² (RTX 4090): host path `render 21.97 + present tail 4.17 = 26.1 ms`
+vs zero-copy `9.67 ms min`; the per-pass download line drops `4.06 ms → 0.10 ms`.
+(`-raster-bench` medians pin at exactly 16.67 ms / 60.0 fps on the zero-copy phase —
+that's flip-model `Present(0,0)` blocking on vblank with `BufferCount 2`, i.e. the
+display refresh, not the pipeline; read `min` for the true cost.)
 
 Perf state (2026-07 campaign, opts 1–8, RTX 4090 @1600×900): cornell **1.97 ms**
 (508 fps), gallery (5.08 M tris) **~4.45 ms** (~225 fps), glassgal **5.12 ms** —

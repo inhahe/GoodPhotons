@@ -59,6 +59,33 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
                                  double* lockAnchor = nullptr,
                                  bool seeThrough = false, double glassClarity = 0.85);
 
+// ---- Zero-copy present (CUDA <-> Direct3D 11 interop) ----------------------------
+// When the live preview window is presenting with D3D11 (see LiveWindow::renderShared),
+// the finished frame does not have to come back to the host at all: CUDA can be given
+// the very texture D3D samples and the tonemap can write its bytes into it in place.
+// That removes the device->host image copy, the host->device re-upload, and every host
+// touch of the pixels between them.
+//
+// bindPresentTarget() registers `d3d11Texture` (an ID3D11Texture2D*, RGBA8, W x H, from
+// `d3d11Device`) with this scene, and is cheap to call every frame — it re-registers only
+// when handed a different texture or size. It returns false when interop is unavailable:
+// a non-Windows/HIP build, or (the common real case) D3D chose a different adapter than
+// the CUDA device, as on hybrid iGPU/dGPU laptops.
+//
+// renderFrameToTarget() then renders exactly as renderFrame does — same geometry, same
+// shading, same auto-exposure handshake, same tonemap maths, byte-for-byte — but stores
+// the result into the registered texture instead of a downloadable buffer. It returns
+// false on any failure, so the caller can fall back to renderFrame + update().
+//
+// Both must be called with the presenter's device lock held (LiveWindow::renderShared
+// does this): the interop drives D3D's immediate context, which is not thread-safe, and
+// D3D must not touch the texture between map and unmap.
+bool bindPresentTarget(Scene* sc, void* d3d11Device, void* d3d11Texture, int W, int H);
+bool renderFrameToTarget(Scene* sc, const Camera& cam, int W, int H, int nThreads,
+                         double exposure = 1.0, bool autoExpose = true,
+                         double* lockAnchor = nullptr,
+                         bool seeThrough = false, double glassClarity = 0.85);
+
 // Optional per-pass profiling (used by -raster-bench). While enabled, renderFrame
 // records CUDA events into the stream between passes and accumulates each pass's
 // GPU-timeline milliseconds into an internal tally (resolved once per frame after

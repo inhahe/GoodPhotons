@@ -6,6 +6,7 @@ struct LiveWindow::Impl {};
 LiveWindow::LiveWindow(int, int, const char*) : impl_(nullptr) {}
 LiveWindow::~LiveWindow() {}
 void LiveWindow::update(int, int, const std::vector<uint8_t>&) {}
+bool LiveWindow::renderShared(int, int, const std::function<bool(void*, void*)>&) { return false; }
 void LiveWindow::setTitle(const std::string&) {}
 bool LiveWindow::closed() const { return false; }
 NavInput LiveWindow::drainNav() { return {}; }
@@ -1346,6 +1347,22 @@ void LiveWindow::update(int w, int h, const std::vector<uint8_t>& rgb) {
         }
     }
     impl_->dirty.store(true);
+}
+
+// Zero-copy frame: hand the caller the presenter's own image texture, let it fill it on the
+// GPU, then present. The device lock is held across the whole callback — the CUDA interop it
+// runs inside drives D3D's immediate context, which the UI thread also uses to repaint.
+bool LiveWindow::renderShared(int w, int h, const std::function<bool(void*, void*)>& fn) {
+    if (!impl_ || w <= 0 || h <= 0 || !fn) return false;
+    if (!impl_->d3dOk.load()) return false;
+    LivePresenter& p = impl_->pres;
+    std::lock_guard<std::mutex> lk(p.mtx);
+    if (!p.ok) return false;
+    // ensureImg may hand back a DIFFERENT texture than last frame (resolution change); the
+    // caller detects that by pointer and re-registers its interop mapping.
+    if (!p.ensureImg(w, h)) { impl_->d3dOk.store(false); return false; }
+    if (!fn(p.dev, p.imgTex)) return false;   // caller falls back to update(); texture is stale
+    return p.present(impl_->viewW.load(), impl_->viewH.load());
 }
 
 void LiveWindow::setTitle(const std::string& utf8) {

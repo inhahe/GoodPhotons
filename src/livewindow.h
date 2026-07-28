@@ -11,6 +11,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <functional>
 
 // Interactive FLY-CAMERA input, accumulated since the last drainNav(). The window
 // reports raw device input only (it doesn't know the scene/camera); the render loop
@@ -117,6 +118,24 @@ public:
     // immediately. w/h may differ from the ctor size (the window stretches to fit,
     // preserving aspect with letterboxing).
     void update(int w, int h, const std::vector<uint8_t>& rgb);
+
+    // ZERO-COPY frame: let the caller draw straight into the window's own image texture,
+    // then present it — no host round-trip at all. `fn(d3dDevice, d3dTexture)` is called with
+    // the presenter's D3D11 device (ID3D11Device*) and its RGBA8 image texture
+    // (ID3D11Texture2D*, exactly w x h), both as void* so this header stays platform- and
+    // API-agnostic; return true from `fn` if the texture now holds a finished frame. The call
+    // is made with the presenter's device lock HELD, because the CUDA<->D3D interop the caller
+    // performs inside it (map / kernel / unmap) touches D3D's immediate context, which is not
+    // thread-safe and is shared with the UI thread's repaints. That is also why this is a
+    // callback rather than an exposed lock/unlock pair.
+    //
+    // Returns false — WITHOUT having called `fn`, or after `fn` failed — whenever the
+    // zero-copy path is unavailable (no D3D presenter, stub build, lost device). The caller
+    // must then fall back to rendering to host memory and calling update().
+    //
+    // The texture pointer is stable until the render size changes; a caller that caches CUDA
+    // interop registrations should re-register whenever it sees a different pointer.
+    bool renderShared(int w, int h, const std::function<bool(void*, void*)>& fn);
 
     // Replace the title-bar text (UTF-8). Safe to call from the render thread; the
     // change is marshalled to the window's own message-pump thread. Used to show the
