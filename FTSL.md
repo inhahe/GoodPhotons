@@ -809,6 +809,69 @@ a constant driver like `palette.reflect(0.3)` is allowed. This is the general ru
 > that binds a record falls back from the GPU forward/backward tracer automatically
 > (`[device] … -> CPU (…parametric record…)`). GPU parity is a later stage.
 
+### 7.6 Named inputs — materials as parameterized bundles
+
+A material property is an **expression over named inputs**, and a material is a bundle
+of those properties — so the material is itself a **function**, whose free-input set is
+the union of its properties' free inputs. **Applying** it at a use site binds those
+inputs across the whole bundle at once:
+
+```
+pattern "rough_ua" { expr "0.5*a*(0.2+0.8*u)" }        # free inputs: a, u
+
+material "gold" {
+    type glossy
+    reflect spectrum:gold
+    roughness pattern:rough_ua
+    albedo_default 0.5                                  # fallback for an unbound `a`
+}
+
+sphere { center 0 0 0  radius 1  material gold(u=v,a=1) }   # bind u<-v, a<-1
+sphere { center 2 0 0  radius 1  material gold(u=v a=1) }   # identical — same §7.5 ladder
+sphere { center 4 0 0  radius 1  material gold(u=v) }       # partial: a -> albedo_default
+```
+
+The bindable inputs are the surface intrinsics `x y z nx ny nz r u v f` plus **`a`**.
+
+**`a` (albedo)** is the one named input with **no per-hit intrinsic**, so it must be
+resolved at *load* time: either to whatever a use site binds it to, or — unbound — to
+the material's **`albedo_default`** (default `1.0`). It is therefore in scope only where
+a material can resolve it: a `pattern` block's `expr`, a record material driver, a
+`from` driver, and a material override block's slot RHS. Writing `a` anywhere else (an
+implicit field formula, a load-time constant) is a scope error.
+
+**Unbound inputs keep their system defaults** — `u` left unbound is still the surface
+`u`. Only `a` has a load-time fallback rather than a per-hit meaning.
+
+**Positional application** binds the sole *still-free* input, so it needs exactly one to
+remain after the named arguments are taken:
+
+```
+material gold(0.5*u+0.5*v)      # OK only if the bundle has exactly one free input
+material gold(0.5,a=1)          # OK — `a` goes by name, leaving one input for the positional
+material gold(0.5)              # error if two inputs are still free — bind by name
+```
+
+At most one positional argument is allowed, and an argument — positional or the RHS of
+`name=…` — is an **arbitrary expression** evaluated in the *consumer's* scope (so `u=v`
+feeds the consumer's surface `v` into the material's `u`). `a` is **not** in scope in an
+argument, since the consumer is geometry and has no albedo to offer.
+
+> **Syntax note:** the argument list must be a **single unspaced token** —
+> `gold(u=v,a=1)` or `gold(0.5*u+0.5*v)`, not `gold(0.5*u + 0.5*v)`. A value ends at the
+> first plain bareword, so an unquoted space would truncate the field. A word containing
+> `=` is a value *continuation*, which is why `u=v, a=1` survives. This is the same
+> constraint the `RECORD(driver)` form already has.
+
+Binding is **substitution**: the argument's compiled program is spliced in place of
+every read of the bound input. Because the programs are postfix, a variable node and a
+well-formed program both push exactly one value, so the splice cannot disturb the
+surrounding stack — an applied material is an *ordinary* material, with no environment
+and no runtime indirection. Substitution is **simultaneous**, so `gold(u=v,v=u)` swaps
+the two inputs rather than collapsing both onto one. A material nobody applies is
+bit-identical to before, and identical applications are shared (one material, not one
+per object). `ftrace -checkbind` pins all of this.
+
 ---
 
 ## 8. Geometry primitives

@@ -677,6 +677,8 @@ public:
             if (!err.empty()) return false;
             L.scene.mats.push_back(m);
             matIndex_[b.name] = id;
+            // §3.3: the fallback for a free `a` at any use site that doesn't bind it.
+            if (find(b, "albedo_default")) albedoDefault_[id] = dblOf(b, "albedo_default", 1.0);
         }
 
         // Pass 2b: resolve Mix / Layered body child references (now that every name
@@ -687,7 +689,7 @@ public:
             int id = matIndex_[b.name];
             MatType t = L.scene.mats[id].type;
             if (t != MatType::Mix && t != MatType::Layered) continue;
-            if (!resolveMixChildren(b, L.scene.mats[id], L)) return false;
+            if (!resolveMixChildren(b, id, L)) return false;
         }
 
         // Pass 2.5: mesh assets (shared instanced geometry). Loaded before the
@@ -793,6 +795,17 @@ public:
 private:
     std::unordered_map<std::string, const Block*> spectraBlocks_;
     std::unordered_map<std::string, int> matIndex_;
+
+    // §3.3 material application. `albedoDefault_` is the per-material fallback for the
+    // named input `a` — the one input with NO per-hit intrinsic, so an unbound `a` has
+    // to be resolved at LOAD time (mirrors loom's Material.albedo_default, same 1.0
+    // default). Kept loader-side rather than on Material because Material is uploaded
+    // to the device and `a` never survives past load. `applyCache_` memoises
+    // "<matIdx>(<args>)" -> materialised index so one application shared by N objects
+    // builds ONE material.
+    std::unordered_map<int, double>      albedoDefault_;
+    std::unordered_map<std::string, int> applyCache_;
+
     std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
     std::unordered_map<std::string, int> patternIndex_;   // pattern name -> Scene::patterns index
 
@@ -911,13 +924,252 @@ private:
         m.reflect = constantSpectrum(0.75);
         std::vector<PatNode> drv;
         std::string cerr;
-        if (!compilePatternExpr(driverExpr, drv, cerr, /*allowT=*/false, &texScope_, &tableScope_)) {
+        if (!compilePatternExpr(driverExpr, drv, cerr, /*allowT=*/false, &texScope_,
+                                &tableScope_, /*allowA=*/true)) {
             fail("record material driver '" + driverExpr + "': " + cerr);
             return -1;
         }
         applyFrom(m, recIdx, drv, L.scene.records[recIdx]);
         int id = (int)L.scene.mats.size();
         L.scene.mats.push_back(std::move(m));
+        return id;
+    }
+
+    // ===================== §3.3 materials as parameterized bundles ==============
+    // A material is a bundle of slot->expression bindings, and is itself a FUNCTION:
+    // its free-input set is the union of its slots' free inputs. Applying it at a use
+    // site — `material gold(u=v, a=1)` — binds those inputs across the whole bundle at
+    // once (ROADMAP_records.md §3.3), which is §3.2's per-property rebinding lifted to
+    // bundle granularity.
+    //
+    // Implemented as BINDING BY SUBSTITUTION. Every slot program is POSTFIX, so a
+    // variable node pushes exactly one value and so does a well-formed argument
+    // program: binding is a pure splice (patternSubstitute). No environment, no
+    // closure, no runtime indirection — an applied material is just another Material,
+    // so the device upload, the CPU evaluator and every sampler stay untouched. That
+    // is what keeps the feature additive: a material nobody applies is bit-identical
+    // to before, and `applyMaterial` returns the ORIGINAL index for a no-op call.
+
+    // The material's free-input set: the union of the inputs read by its pattern slots
+    // and by its record bindings' drivers, in order of first use (so diagnostics list
+    // inputs the way the author wrote them). Keep the slot list in sync with
+    // Material's `*Pat` members (scene.h).
+    static void materialFreeInputs(const Material& m, const Loaded& L,
+                                   std::vector<PatOp>& out) {
+        out.clear();
+        const int pats[6] = { m.roughnessPat, m.filmThicknessPat, m.mixWeightPat,
+                              m.reflectPat,   m.transmitPat,      m.emitPat };
+        for (int pi : pats)
+            if (pi >= 0 && pi < (int)L.scene.patterns.size())
+                patternCollectVars(L.scene.patterns[pi].nodes, out);
+        for (const RecBinding& rb : m.recBindings) patternCollectVars(rb.driver, out);
+    }
+
+    // A value ends at the first plain bareword (grammar `cont`), which mirrors ftrace's
+    // tokenizer: an unquoted SPACE inside `NAME( … )` therefore truncates the field at
+    // the space, and the `)` lands in the next statement. That bites the moment an
+    // argument is a spaced expression, so say so rather than just "missing ')'".
+    static std::string parenHint(const std::string& raw) {
+        if (raw.find(')') != std::string::npos) return "";
+        return " — an argument list must be a single unspaced token "
+               "(write `f(0.5*u+0.5*v)`, not `f(0.5*u + 0.5*v)`), because a value "
+               "ends at the first bareword";
+    }
+
+    // The fallback value of the named input `a` for material `matIdx` — its authored
+    // `albedo_default <x>`, or 1.0.
+    double albedoDefaultFor(int matIdx) const {
+        auto it = albedoDefault_.find(matIdx);
+        return (it == albedoDefault_.end()) ? 1.0 : it->second;
+    }
+
+    static std::string trimWs(const std::string& s) {
+        size_t a = 0, b = s.size();
+        while (a < b && isspace((unsigned char)s[a])) ++a;
+        while (b > a && isspace((unsigned char)s[b - 1])) --b;
+        return s.substr(a, b - a);
+    }
+
+    // Split a material application's argument text into (name, expr) pieces; an empty
+    // name means a POSITIONAL argument. Uses the same delimiter ladder as record stops
+    // (§3.1) — a top-level comma and a run of whitespace are equally valid separators,
+    // so `gold(u=v, a=1)` and `gold(u=v a=1)` are identical. `(` `)` and `[` `]` nest,
+    // so an argument may itself be a call.
+    //
+    // Boundaries are found from the `=` signs rather than from the whitespace, because
+    // an argument is an ARBITRARY EXPRESSION that may contain spaces (`gold(u = v * 2)`).
+    // Every top-level `=` starts a named argument whose name is the identifier just to
+    // its left, so the argument begins at that identifier. This is unambiguous: the
+    // pattern language has NO comparison operators, so a top-level `=` can only ever
+    // mean a binding and never continues an expression.
+    bool parseBindArgs(const std::string& text,
+                       std::vector<std::pair<std::string, std::string>>& out,
+                       std::string& e) {
+        out.clear();
+        const size_t n = text.size();
+        auto isIdent  = [](char c) { return isalnum((unsigned char)c) || c == '_'; };
+        auto isIdent0 = [](char c) { return isalpha((unsigned char)c) || c == '_'; };
+
+        std::vector<size_t> starts;      // where each argument begins
+        starts.push_back(0);
+        int depth = 0;
+        for (size_t i = 0; i < n; ++i) {
+            char c = text[i];
+            if (c == '(' || c == '[') { ++depth; continue; }
+            if (c == ')' || c == ']') {
+                if (--depth < 0) { e = "unbalanced ')' in argument list"; return false; }
+                continue;
+            }
+            if (depth) continue;
+            if (c == ',') { starts.push_back(i + 1); continue; }
+            if (c != '=') continue;
+            size_t j = i;                                   // back over spaces before `=`
+            while (j > 0 && isspace((unsigned char)text[j - 1])) --j;
+            size_t k = j;                                   // back over the input name
+            while (k > 0 && isIdent(text[k - 1])) --k;
+            if (k == j)          { e = "'=' with no input name on its left"; return false; }
+            if (!isIdent0(text[k])) {
+                e = "invalid input name '" + text.substr(k, j - k) + "'"; return false;
+            }
+            starts.push_back(k);
+        }
+        if (depth) { e = "unbalanced '(' in argument list"; return false; }
+
+        std::sort(starts.begin(), starts.end());
+        starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+        for (size_t s = 0; s < starts.size(); ++s) {
+            size_t b = starts[s], en = (s + 1 < starts.size()) ? starts[s + 1] : n;
+            std::string seg = trimWs(text.substr(b, en - b));
+            if (!seg.empty() && seg.back() == ',') seg = trimWs(seg.substr(0, seg.size() - 1));
+            if (seg.empty()) continue;
+            // A named piece always carries its `=` at top level (that `=` is what cut here).
+            size_t eq = std::string::npos;
+            int d = 0;
+            for (size_t i = 0; i < seg.size(); ++i) {
+                char c = seg[i];
+                if (c == '(' || c == '[') ++d;
+                else if (c == ')' || c == ']') --d;
+                else if (c == '=' && d == 0) { eq = i; break; }
+            }
+            if (eq == std::string::npos) { out.emplace_back(std::string(), seg); continue; }
+            std::string nm = trimWs(seg.substr(0, eq)), ex = trimWs(seg.substr(eq + 1));
+            if (nm.empty()) { e = "'=' with no input name on its left"; return false; }
+            if (ex.empty()) { e = "input '" + nm + "' bound to an empty expression"; return false; }
+            out.emplace_back(nm, ex);
+        }
+        return true;
+    }
+
+    // Apply material `matIdx` at a use site, binding its named inputs. Clones the
+    // material, splices each argument program into every slot that reads the bound
+    // input, resolves any still-free `a` (albedo — the one input with no per-hit
+    // intrinsic) to the material's `albedo_default`, and returns the new index.
+    // Returns `matIdx` UNCHANGED when the application binds nothing, so an ordinary
+    // use costs nothing. Results are memoised on (material, argument text) so
+    // `gold(u=v)` shared by 500 spheres builds ONE material, not 500.
+    int applyMaterial(int matIdx, const std::string& argText, Loaded& L) {
+        std::string key = std::to_string(matIdx) + "(" + trimWs(argText) + ")";
+        auto cit = applyCache_.find(key);
+        if (cit != applyCache_.end()) return cit->second;
+
+        std::vector<std::pair<std::string, std::string>> args;
+        std::string e;
+        if (!parseBindArgs(argText, args, e)) {
+            fail("material application '" + argText + "': " + e); return -1;
+        }
+        std::vector<PatOp> freeIn;
+        materialFreeInputs(L.scene.mats[matIdx], L, freeIn);
+
+        std::vector<PatBind> binds;
+        auto alreadyBound = [&](PatOp v) {
+            for (const PatBind& b : binds) if (b.var == v) return true;
+            return false;
+        };
+        // NAMED arguments are resolved first, whatever order they were written in, so a
+        // positional argument sees only the inputs still unbound — loom's
+        // `free_inputs() - set(binds)` rule (Material.apply, tools/loom/loom/scene.py).
+        // That makes `gold(0.5, a=1)` legal for a two-input bundle: `a` is taken by name,
+        // leaving exactly one free input for the positional.
+        std::vector<std::pair<std::string, std::string>> ordered;
+        for (auto& a : args) if (!a.first.empty()) ordered.push_back(a);
+        size_t nPositional = 0;
+        for (auto& a : args) if (a.first.empty()) { ordered.push_back(a); ++nPositional; }
+        if (nPositional > 1) {
+            fail("material application '" + argText +
+                 "': at most one positional argument (bind the rest by name)");
+            return -1;
+        }
+        for (auto& a : ordered) {
+            PatOp var;
+            if (a.first.empty()) {
+                // Positional. Fragile with several inputs, so §3.3 allows it only when
+                // exactly one input is still free (matching `RECORD(driver)`).
+                std::vector<PatOp> rest;
+                for (PatOp v : freeIn) if (!alreadyBound(v)) rest.push_back(v);
+                if (rest.size() != 1) {
+                    std::string names;
+                    for (size_t i = 0; i < rest.size(); ++i)
+                        names += (i ? ", " : "") + std::string(varName(rest[i]));
+                    fail("material application '" + argText + "': a positional argument "
+                         "needs exactly one still-free input, but there are " +
+                         std::to_string(rest.size()) +
+                         (rest.empty() ? "" : " (" + names + ")") +
+                         " — bind by name");
+                    return -1;
+                }
+                var = rest[0];
+            } else if (!varOp(a.first, var)) {
+                fail("material application '" + argText + "': '" + a.first +
+                     "' is not a bindable input"); return -1;
+            }
+            if (alreadyBound(var)) {
+                fail("material application '" + argText + "': input '" +
+                     std::string(varName(var)) + "' bound twice"); return -1;
+            }
+            // The RHS is evaluated in the CONSUMER's scope, so `a` is not in scope here
+            // (the consumer is geometry, which has no albedo to offer).
+            PatBind pb; pb.var = var;
+            std::string cerr;
+            if (!compilePatternExpr(a.second, pb.repl, cerr, /*allowT=*/false,
+                                    &texScope_, &tableScope_)) {
+                fail("material application '" + argText + "': binding '" +
+                     std::string(varName(var)) + "=" + a.second + "': " + cerr);
+                return -1;
+            }
+            binds.push_back(std::move(pb));
+        }
+
+        // `a` is the one named input with NO per-hit intrinsic, so an unbound `a` must
+        // be resolved at LOAD time or it would silently read 0. Fall back to the
+        // material's `albedo_default` (mirrors loom's Material.albedo_default).
+        bool aFree = false;
+        for (PatOp v : freeIn) if (v == PatOp::VarA) { aFree = true; break; }
+        if (aFree && !alreadyBound(PatOp::VarA)) {
+            PatBind pb; pb.var = PatOp::VarA;
+            PatNode nd; nd.op = PatOp::Const; nd.a = albedoDefaultFor(matIdx);
+            pb.repl.push_back(nd);
+            binds.push_back(std::move(pb));
+        }
+        if (binds.empty()) { applyCache_[key] = matIdx; return matIdx; }
+
+        Material m = L.scene.mats[matIdx];
+        int* slots[6] = { &m.roughnessPat, &m.filmThicknessPat, &m.mixWeightPat,
+                          &m.reflectPat,   &m.transmitPat,      &m.emitPat };
+        for (int* pi : slots) {
+            if (*pi < 0 || *pi >= (int)L.scene.patterns.size()) continue;
+            const std::vector<PatNode>& src = L.scene.patterns[*pi].nodes;
+            bool touched = false;
+            for (const PatBind& b : binds) if (patternUsesVar(src, b.var)) { touched = true; break; }
+            if (!touched) continue;                      // share the original program
+            Pattern np; np.nodes = patternSubstitute(src, binds);
+            *pi = (int)L.scene.patterns.size();
+            L.scene.patterns.push_back(std::move(np));
+        }
+        for (RecBinding& rb : m.recBindings) rb.driver = patternSubstitute(rb.driver, binds);
+
+        int id = (int)L.scene.mats.size();
+        L.scene.mats.push_back(std::move(m));
+        applyCache_[key] = id;
         return id;
     }
 
@@ -942,16 +1194,36 @@ private:
             if (rit != recordIndex_.end()) {
                 size_t rp = raw.rfind(')');
                 if (rp == std::string::npos || rp <= lp) {
-                    fail("record material '" + raw + "': missing ')'");
+                    fail("record material '" + raw + "': missing ')'" + parenHint(raw));
                     return -1;
                 }
                 std::string driver = raw.substr(lp + 1, rp - lp - 1);
                 return buildRecordMaterial(rit->second, driver, L);
             }
+            // Not a record: a §3.3 material application, `gold(u=v, a=1)`.
+            auto mit = matIndex_.find(trimWs(name));
+            if (mit != matIndex_.end()) {
+                size_t rp = raw.rfind(')');
+                if (rp == std::string::npos || rp <= lp) {
+                    fail("material application '" + raw + "': missing ')'" + parenHint(raw));
+                    return -1;
+                }
+                return applyMaterial(mit->second, raw.substr(lp + 1, rp - lp - 1), L);
+            }
         }
-        auto it = matIndex_.find(raw);
-        if (it == matIndex_.end()) { fail("unknown material '" + raw + "'"); return -1; }
-        return it->second;
+        int id = lookupMaterial(raw, L);
+        if (id < 0) { fail("unknown material '" + raw + "'"); return -1; }
+        return id;
+    }
+
+    // Resolve a plain material NAME to a usable Scene::mats index. Every by-name
+    // reference goes through here so that a material with a free `a` resolves it to
+    // its `albedo_default` exactly once (applyMaterial memoises the empty application),
+    // instead of silently reading 0. Returns -1 if the name is unknown.
+    int lookupMaterial(const std::string& name, Loaded& L) {
+        auto it = matIndex_.find(name);
+        if (it == matIndex_.end()) return -1;
+        return applyMaterial(it->second, "", L);
     }
 
     // Records stage 5a: resolve a record channel reference used as a CONSTANT spectrum
@@ -1595,7 +1867,10 @@ private:
             std::string expr;
             for (size_t k = 0; k < es->val.words.size(); ++k) { if (k) expr += " "; expr += es->val.words[k]; }
             std::string perr;
-            if (!compilePatternExpr(expr, pat.nodes, perr, false, &texScope_, &tableScope_)) {
+            // `a` is legal here: a named pattern stays unresolved until a material uses
+            // it, and applyMaterial then resolves `a` against THAT material.
+            if (!compilePatternExpr(expr, pat.nodes, perr, false, &texScope_,
+                                    &tableScope_, /*allowA=*/true)) {
                 fail("pattern '" + b.name + "': " + perr); return false;
             }
         } else {
@@ -2401,7 +2676,8 @@ private:
                 auto rit = recordIndex_.find(rname);
                 if (rit == recordIndex_.end()) { fail("`from`: unknown record '" + rname + "'"); return m; }
                 std::vector<PatNode> drv; std::string cerr;
-                if (!compilePatternExpr(dexpr, drv, cerr, false, &texScope_, &tableScope_)) {
+                if (!compilePatternExpr(dexpr, drv, cerr, false, &texScope_,
+                                        &tableScope_, /*allowA=*/true)) {
                     fail("`from " + rname + "` driver '" + dexpr + "': " + cerr); return m;
                 }
                 const Record& rec = L.scene.records[rit->second];
@@ -2511,7 +2787,8 @@ private:
                 if (selStop >= 0) { fail("record-override `" + slot + " = " + rhs +
                     "`: a stop selector needs a record channel"); return m; }
                 std::string cerr;
-                if (!compilePatternExpr(rhs, rb.driver, cerr, false, &texScope_, &tableScope_)) {
+                if (!compilePatternExpr(rhs, rb.driver, cerr, false, &texScope_,
+                                        &tableScope_, /*allowA=*/true)) {
                     fail("record-override `" + slot + " = " + rhs + "`: " + cerr); return m;
                 }
                 rb.recordIndex = -1;
@@ -2745,25 +3022,34 @@ private:
     // to child indices + weights. Called after every material name is registered,
     // so a mix may reference children declared before OR after it. Nested mixes are
     // rejected to keep resolution single-step (and the CUDA CDF bounded).
-    bool resolveMixChildren(const Block& b, Material& m, Loaded& L) {
+    // Takes the child material by INDEX, not by reference: resolving a layer name goes
+    // through lookupMaterial(), which may append to L.scene.mats (a material with a
+    // free `a` materialises its albedo_default clone on first use), and a `Material&`
+    // held across that would dangle on reallocation.
+    bool resolveMixChildren(const Block& b, int matIdx, Loaded& L) {
         double sum = 0.0;
+        std::vector<int>    kids;
+        std::vector<double> wts;
         for (const auto& s : b.stmts) {
             if (s.key != "layer") continue;
             s.used = true;
             if (s.val.words.size() < 2) { fail("mix 'layer' needs a material name and a weight"); return false; }
             const std::string& cname = s.val.words[0];
             double w = num(s.val.words[1]);
-            auto it = matIndex_.find(cname);
-            if (it == matIndex_.end()) { fail("mix layer references unknown material '" + cname + "'"); return false; }
-            if (L.scene.mats[it->second].type == MatType::Mix ||
-                L.scene.mats[it->second].type == MatType::Layered) {
+            int child = lookupMaterial(cname, L);
+            if (child < 0) { fail("mix layer references unknown material '" + cname + "'"); return false; }
+            if (L.scene.mats[child].type == MatType::Mix ||
+                L.scene.mats[child].type == MatType::Layered) {
                 fail("layer '" + cname + "' is itself a mix/layered (nesting is not allowed)"); return false;
             }
             if (w < 0.0) { fail("mix layer weight must be >= 0"); return false; }
-            m.mixChildren.push_back(it->second);
-            m.mixWeights.push_back(w);
+            kids.push_back(child);
+            wts.push_back(w);
             sum += w;
         }
+        Material& m = L.scene.mats[matIdx];   // safe: no more mats appends below
+        m.mixChildren = std::move(kids);
+        m.mixWeights  = std::move(wts);
         if (m.mixChildren.empty()) { fail("mix material has no 'layer' entries"); return false; }
         if (sum > 1.0 + 1e-9) { fail("mix layer weights sum to " + std::to_string(sum) + " (> 1)"); return false; }
         // Optional per-hit blend mask: `weight_map pattern:<name>` (§4, math-driven
@@ -2943,9 +3229,8 @@ private:
         // default `material`). Two-token maps can't survive the statement splitter,
         // so name-matching is the grammar-friendly convention (mirrors `uv use_mesh`).
         bool useNames = (strOf(b, "usemtl") == "use_names");
-        MtlResolver resolver = [this](const std::string& nm) -> int {
-            auto it = matIndex_.find(nm);
-            return (it == matIndex_.end()) ? -1 : it->second;
+        MtlResolver resolver = [this, &L](const std::string& nm) -> int {
+            return lookupMaterial(nm, L);   // resolves a free `a` to albedo_default
         };
         size_t triStart = L.scene.tris.size();
         // Dispatch by file extension: .gltf/.glb use the glTF loader (which imports
@@ -3097,9 +3382,8 @@ private:
 
         bool loadUV = (strOf(b, "uv") == "use_mesh");
         bool useNames = (strOf(b, "usemtl") == "use_names");
-        MtlResolver resolver = [this](const std::string& nm) -> int {
-            auto it = matIndex_.find(nm);
-            return (it == matIndex_.end()) ? -1 : it->second;
+        MtlResolver resolver = [this, &L](const std::string& nm) -> int {
+            return lookupMaterial(nm, L);   // resolves a free `a` to albedo_default
         };
         // Load into local space (identity transform) at the END of Scene::tris, then
         // move those triangles out into a private BLAS. The unit scale is NOT folded in

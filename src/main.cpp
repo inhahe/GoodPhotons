@@ -1411,6 +1411,130 @@ static int checkScatter() {
     return ok ? 0 : 1;
 }
 
+// Deterministic self-test for NAMED-INPUT BINDING BY SUBSTITUTION (src/pattern.h;
+// ROADMAP_records.md §3.2/§3.3). No scene file and no renderer — it pins the algebraic
+// properties the whole material-application feature rests on:
+//   (a) substitution is a pure SPLICE — binding an input to an expression gives the same
+//       number as textually inlining that expression, for every input;
+//   (b) it is SIMULTANEOUS, not sequential: `(u=v, v=u)` swaps the two inputs instead of
+//       collapsing both onto one, which a naive left-to-right rewrite would get wrong;
+//   (c) it is IDENTITY when nothing is bound (the additive-superset guarantee: a material
+//       nobody applies must be bit-identical to before);
+//   (d) introspection agrees with the program — patternCollectVars finds exactly the
+//       inputs present, and varName/varOp round-trip;
+//   (e) `a` (albedo) parses only where a material can resolve it, and binding it to a
+//       constant is what turns a symbolic program into a concrete one.
+static int checkBind() {
+    using namespace pattern_detail;
+    bool ok = true;
+    auto chk = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkbind] %-52s BAD\n", what); ok = false; }
+    };
+    auto compile = [&](const char* src, std::vector<PatNode>& out, bool allowA) {
+        std::string e;
+        bool good = compilePatternExpr(src, out, e, /*allowT=*/false, nullptr, nullptr, allowA);
+        if (!good) std::printf("[checkbind] compile `%s` FAILED: %s\n", src, e.c_str());
+        return good;
+    };
+    // A context with distinct, non-degenerate values so an accidental swap is visible.
+    PatCtx c{};
+    c.x = 0.37; c.y = -0.81; c.z = 1.23; c.u = 0.19; c.v = 0.64;
+    c.nx = 0.0; c.ny = 1.0; c.nz = 0.0; c.r = 0.5; c.f = 0.25;
+    auto ev = [&](const std::vector<PatNode>& p) {
+        return patternEval(p.data(), (int)p.size(), c);
+    };
+
+    // (a) splice == textual inlining, for every bindable input.
+    struct { const char* var; const char* arg; } cases[] = {
+        {"u", "0.5*v+0.25"}, {"v", "x*2"},   {"x", "sin(u)"},
+        {"y", "z-1"},        {"z", "r*3"},   {"r", "abs(y)"},
+        {"f", "u*v"},        {"nx", "0.5"},  {"ny", "nz+1"}, {"nz", "0.125"},
+    };
+    for (auto& cs : cases) {
+        std::string body = std::string("2.0*") + cs.var + " + sin(" + cs.var + ") + 1.5";
+        std::string inl  = std::string("2.0*(") + cs.arg + ") + sin(" + cs.arg + ") + 1.5";
+        std::vector<PatNode> prog, want, arg;
+        if (!compile(body.c_str(), prog, false) || !compile(inl.c_str(), want, false) ||
+            !compile(cs.arg, arg, false)) { ok = false; continue; }
+        PatOp var;
+        chk("varOp resolves the input name", varOp(cs.var, var));
+        chk("varName round-trips", varName(var) && !std::strcmp(varName(var), cs.var));
+        std::vector<PatBind> b{{var, arg}};
+        double got = ev(patternSubstitute(prog, b)), wanted = ev(want);
+        if (std::fabs(got - wanted) > 1e-12) {
+            std::printf("[checkbind] bind %-3s <- %-12s got %.12g want %.12g  BAD\n",
+                        cs.var, cs.arg, got, wanted);
+            ok = false;
+        }
+    }
+
+    // (b) SIMULTANEOUS: `u*10 + v` with (u=v, v=u) must become `v*10 + u`, NOT `u*10+u`
+    //     (sequential rewriting) and NOT `v*10+v`.
+    {
+        std::vector<PatNode> prog, swapped, uOnly, vOnly, au, av;
+        if (compile("u*10 + v", prog, false) && compile("v*10 + u", swapped, false) &&
+            compile("u*10 + u", uOnly, false) && compile("v*10 + v", vOnly, false) &&
+            compile("u", au, false) && compile("v", av, false)) {
+            std::vector<PatBind> b{{PatOp::VarU, av}, {PatOp::VarV, au}};
+            double got = ev(patternSubstitute(prog, b));
+            chk("simultaneous bind swaps u and v", std::fabs(got - ev(swapped)) < 1e-12);
+            chk("swap is not a sequential u-collapse", std::fabs(got - ev(uOnly)) > 1e-9);
+            chk("swap is not a sequential v-collapse", std::fabs(got - ev(vOnly)) > 1e-9);
+        } else ok = false;
+    }
+
+    // (c) identity when nothing binds — same nodes, not merely the same value.
+    {
+        std::vector<PatNode> prog, arg;
+        if (compile("u*2 + sin(v)", prog, false) && compile("9.0", arg, false)) {
+            std::vector<PatBind> none;
+            std::vector<PatBind> unrelated{{PatOp::VarZ, arg}};   // z does not appear
+            auto a = patternSubstitute(prog, none), b2 = patternSubstitute(prog, unrelated);
+            chk("empty bind list is identity", a.size() == prog.size());
+            chk("binding an absent input is identity", b2.size() == prog.size());
+            chk("identity preserves the value", std::fabs(ev(b2) - ev(prog)) < 1e-15);
+        } else ok = false;
+    }
+
+    // (d) introspection matches the program.
+    {
+        std::vector<PatNode> prog;
+        if (compile("u*v + u - 3", prog, false)) {
+            std::vector<PatOp> vars;
+            patternCollectVars(prog, vars);
+            chk("collectVars finds exactly {u, v}", vars.size() == 2);
+            chk("collectVars is in order of first use",
+                vars.size() == 2 && vars[0] == PatOp::VarU && vars[1] == PatOp::VarV);
+            chk("collectVars dedupes a repeated input", !vars.empty() && vars[0] == PatOp::VarU);
+            chk("usesVar agrees (present)", patternUsesVar(prog, PatOp::VarU));
+            chk("usesVar agrees (absent)",  !patternUsesVar(prog, PatOp::VarZ));
+        } else ok = false;
+    }
+
+    // (e) `a` is scoped, and binding it to a constant concretises the program.
+    {
+        std::vector<PatNode> prog, unusedProg;
+        std::string e;
+        chk("`a` is rejected where no material can resolve it",
+            !compilePatternExpr("0.5*a", unusedProg, e, false, nullptr, nullptr, /*allowA=*/false));
+        if (compile("0.5*a", prog, /*allowA=*/true)) {
+            std::vector<PatOp> vars;
+            patternCollectVars(prog, vars);
+            chk("`a` shows up as a free input", vars.size() == 1 && vars[0] == PatOp::VarA);
+            PatNode k; k.op = PatOp::Const; k.a = 0.8;
+            std::vector<PatBind> b{{PatOp::VarA, {k}}};
+            auto bound = patternSubstitute(prog, b);
+            std::vector<PatOp> after;
+            patternCollectVars(bound, after);
+            chk("binding `a` leaves no free inputs", after.empty());
+            chk("bound `a` evaluates to 0.5*0.8", std::fabs(ev(bound) - 0.4) < 1e-12);
+        } else ok = false;
+    }
+
+    std::printf("[checkbind] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic distant-sun self-test (EmitterShape::Sun; src/scene.h addSunLight /
 // sampleCone / inCone / geomWeight). No scene file, no renderer, no RNG-seeded image —
 // it pins the four invariants the emitter's correctness rests on:
@@ -4259,6 +4383,7 @@ static int run(int argc, char** argv) {
     bool checkUpsampleOnly = false;
     bool checkGridOnly = false;
     bool checkScatterOnly = false;
+    bool checkBindOnly = false;
     bool checkSunOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
@@ -4569,6 +4694,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
+        else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
         else if (!std::strcmp(argv[i], "-checksun")) checkSunOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
@@ -4720,6 +4846,7 @@ static int run(int argc, char** argv) {
     if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed
     if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
+    if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
     if (checkSunOnly)      return checkSun();      // deterministic, no scene needed
 
     // --- every output directory must exist BEFORE a single photon is traced ----------

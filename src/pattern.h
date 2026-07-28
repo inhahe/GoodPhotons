@@ -92,6 +92,19 @@ enum class PatOp : int {
     // Grid cannot represent. `a` holds the scatter-table index; the arity is likewise
     // the scatter's own dimensionality.
     Scatter,
+    // ALBEDO input `a` — a *named input with no per-hit intrinsic* (ROADMAP_records.md
+    // §3.2). Every other variable above is system-provided, so leaving one unbound means
+    // "read it from the shading point", which is exactly "don't substitute". `a` has no
+    // such source, so it is resolved at LOAD time instead — either to the expression a
+    // use site binds it to (`gold(a=0.3*u)`) or, unbound, to the material's
+    // `albedo_default` constant. It therefore never reaches the evaluator or the device;
+    // the evaluator case below exists only to keep the switch exhaustive.
+    //
+    // Deliberately appended at the END of the enum, like Tex/Grid/Scatter before it, so
+    // patternHasFreeVars' "surface intrinsic" range VarX..VarV is unperturbed — and
+    // correctly so: once resolved, a program whose only variable was `a` IS a load-time
+    // constant, so it stays legal at a constant value site.
+    VarA,
 };
 
 // One postfix node. POD (no std:: members) so it uploads to the GPU verbatim.
@@ -419,6 +432,9 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
             case PatOp::VarU:     st[sp++] = c.u;  break;
             case PatOp::VarV:     st[sp++] = c.v;  break;
             case PatOp::VarT:     st[sp++] = c.t;  break;
+            // `a` is resolved at load time (bound at the use site, or to the material's
+            // albedo_default) and so is unreachable here; 0 keeps the switch total.
+            case PatOp::VarA:     st[sp++] = 0.0;  break;
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = std::fabs(st[sp-1]); break;
             case PatOp::Sqrt:     st[sp-1] = std::sqrt(std::fmax(0.0, st[sp-1])); break;
@@ -541,8 +557,10 @@ inline bool varOp(const std::string& s, PatOp& out) {
     if (s == "r")  { out = PatOp::VarR;  return true; }
     if (s == "u")  { out = PatOp::VarU;  return true; }
     if (s == "v")  { out = PatOp::VarV;  return true; }
+    if (s == "a")  { out = PatOp::VarA;  return true; }   // albedo — resolved at load time
     return false;
 }
+
 
 // Function name -> (opcode, arity[, povId]). Returns false if not a known function.
 // For exact POV-Ray internal functions (f_torus, f_heart, ...) out=PatOp::PovFn and
@@ -613,7 +631,7 @@ inline PatOp binOp(char c) {
 
 inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& err,
                      bool allowT = false, const PatTexScope* tex = nullptr,
-                     const PatTableScope* tables = nullptr) {
+                     const PatTableScope* tables = nullptr, bool allowA = false) {
     size_t i = 0, n = s.size();
     bool prevValue = false;   // was the previous token a value/RParen (for unary minus)
     while (i < n) {
@@ -704,6 +722,16 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
                 err = "variable 't' (flyby timeline) is only in scope inside a camera_curve "
                       "record track (fov_from/roll_from/zoom_from/fstop_from/focus_from)"; return false;
             }
+            if (id == "a") {
+                // The albedo input has no per-hit source, so unlike every other variable it
+                // is only meaningful where a MATERIAL will later resolve it — bound at the
+                // use site (`gold(a=0.3)`) or falling back to `albedo_default`. Outside that
+                // scope it could only ever read as a silent 0, so say so instead.
+                if (allowA) { Tok t; t.kind = Tok::Var; t.var = PatOp::VarA; out.push_back(t); prevValue = true; continue; }
+                err = "input 'a' (albedo) is only in scope where a material can resolve it — "
+                      "a pattern/texture-free expression in a `pattern` block, a record stop, "
+                      "or a material slot"; return false;
+            }
             if (varOp(id, vop)) {
                 Tok t; t.kind = Tok::Var; t.var = vop; out.push_back(t);
                 prevValue = true; continue;
@@ -726,6 +754,81 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
 
 }  // namespace pattern_detail
 
+// ---------------------------------------------------------------------------
+// Named inputs: introspection + binding by substitution (ROADMAP_records.md §3.2/§3.3)
+// ---------------------------------------------------------------------------
+// A property is an expression over NAMED INPUTS, and "nothing is ever closed": any
+// input can be rebound where the property is used. The mechanism is pure substitution,
+// which postfix makes a straight SPLICE — a variable node is a leaf that pushes exactly
+// one value, and so is a well-formed program, so swapping one for the other cannot
+// disturb the surrounding stack discipline.
+//
+// The consequence is that a bound material is an ORDINARY material: its programs are
+// concrete formulas in real per-hit variables, with no environment, no closure and no
+// runtime indirection. Everything downstream — the CPU evaluator, the verbatim GPU
+// upload, patternHasFreeVars, the record samplers — keeps working untouched, and a
+// material nobody binds is bit-identical to before. That is what makes this feature
+// additive rather than a re-plumbing of the shading path.
+
+// Input NAME -> opcode. Published out of pattern_detail because binding a material's
+// inputs at a use site (`gold(u=v)`) has to resolve an author-written name.
+using pattern_detail::varOp;
+
+// The name of a bindable input, or nullptr if `op` is not a variable. Inverse of varOp.
+inline const char* varName(PatOp op) {
+    switch (op) {
+        case PatOp::VarX:  return "x";   case PatOp::VarY:  return "y";
+        case PatOp::VarZ:  return "z";   case PatOp::VarF:  return "f";
+        case PatOp::VarNx: return "nx";  case PatOp::VarNy: return "ny";
+        case PatOp::VarNz: return "nz";  case PatOp::VarR:  return "r";
+        case PatOp::VarU:  return "u";   case PatOp::VarV:  return "v";
+        case PatOp::VarA:  return "a";   default: return nullptr;
+    }
+}
+
+// True if `prog` reads the input `var` anywhere.
+inline bool patternUsesVar(const std::vector<PatNode>& prog, PatOp var) {
+    for (const PatNode& nd : prog) if (nd.op == var) return true;
+    return false;
+}
+
+// Every input `prog` reads, appended to `out` without duplicates (order of first use, so
+// diagnostics list inputs the way the author wrote them).
+inline void patternCollectVars(const std::vector<PatNode>& prog, std::vector<PatOp>& out) {
+    for (const PatNode& nd : prog) {
+        if (!varName(nd.op)) continue;
+        bool seen = false;
+        for (PatOp o : out) if (o == nd.op) { seen = true; break; }
+        if (!seen) out.push_back(nd.op);
+    }
+}
+
+// One input binding: replace every read of `var` with the program `repl`.
+struct PatBind {
+    PatOp                var;
+    std::vector<PatNode> repl;
+};
+
+// Rewrite `prog`, splicing each bound input's replacement in place of its variable node.
+// Substitution is SIMULTANEOUS, not sequential: a replacement's own variable nodes are
+// copied through untouched, so `gold(u=v, v=u)` swaps the two inputs instead of
+// collapsing both to `u`. Bindings whose input never appears cost nothing.
+inline std::vector<PatNode> patternSubstitute(const std::vector<PatNode>& prog,
+                                              const std::vector<PatBind>& binds) {
+    bool any = false;
+    for (const PatBind& b : binds) if (patternUsesVar(prog, b.var)) { any = true; break; }
+    if (!any) return prog;
+    std::vector<PatNode> out;
+    out.reserve(prog.size());
+    for (const PatNode& nd : prog) {
+        const std::vector<PatNode>* repl = nullptr;
+        for (const PatBind& b : binds) if (b.var == nd.op) { repl = &b.repl; break; }
+        if (repl) out.insert(out.end(), repl->begin(), repl->end());
+        else      out.push_back(nd);
+    }
+    return out;
+}
+
 // Compile an infix expression string into a postfix pattern program.
 // `allowT` publishes the flyby-timeline variable `t` as in-scope (camera_curve record
 // tracks only). Default false: every other call site keeps `t` an out-of-scope error,
@@ -733,13 +836,18 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
 // `tex` publishes the scene's named image textures for `tex:<name>(u, v)` samples;
 // null (the default) makes any such sample a scope error — see PatTexScope.
 // `tables` does the same for the N-D datatypes `grid:<name>(…)` / `scatter:<name>(…)`.
+// `allowA` publishes the albedo input `a` (ROADMAP_records.md §3.2) — the one named input
+// with no per-hit source, so it is only in scope where a material will resolve it at load
+// time. It is LAST in the list on purpose: defaulting to false keeps every existing call
+// site's scope exactly as it was, so only the handful of material-reachable sites opt in.
 inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& out,
                                std::string& err, bool allowT = false,
                                const PatTexScope* tex = nullptr,
-                               const PatTableScope* tables = nullptr) {
+                               const PatTableScope* tables = nullptr,
+                               bool allowA = false) {
     using namespace pattern_detail;
     std::vector<Tok> toks;
-    if (!tokenize(expr, toks, err, allowT, tex, tables)) return false;
+    if (!tokenize(expr, toks, err, allowT, tex, tables, allowA)) return false;
 
     std::vector<PatNode> queue;             // output (postfix)
     std::vector<Tok>     ops;               // operator stack (Op / Func / LParen)

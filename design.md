@@ -716,6 +716,38 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `tools/check_record_twins.py` diffs ftrace's per-channel stop count (probed via an
   out-of-range `rec.ch[999]` selector) against loom's across the `scenes/_record_*.ftsl`
   fixtures.
+- **Named-input binding (`pattern.h` + `Parser::applyMaterial` in `ftsl.h`)** — a material
+  property is an expression over **named inputs**, so a material is a *bundle* of
+  slot→expression bindings and is itself a **function** whose free-input set is the union
+  of its properties' (`materialFreeInputs`, the twin of loom's `Material.free_inputs`).
+  Applying it at a use site — `material gold(u=v,a=1)` — binds those inputs across the
+  whole bundle at once.
+  The mechanism is **binding by substitution**, and postfix is what makes it nearly free:
+  a variable node pushes exactly one value and so does a well-formed program, so
+  `patternSubstitute` is a pure **splice** that cannot disturb the surrounding stack
+  discipline. The consequence is the load-bearing one — a bound material is an *ordinary*
+  material, with no environment, no closure and no runtime indirection, so the CPU
+  evaluator, the verbatim GPU upload, `patternHasFreeVars` and every record sampler stay
+  untouched. Substitution is **simultaneous**, so `gold(u=v,v=u)` swaps rather than
+  collapsing.
+  `PatOp::VarA` (`a`, albedo) is the one named input with **no per-hit intrinsic**, so it
+  must be resolved at LOAD time — to whatever a use site binds, else to the material's
+  `albedoDefault_` (loader-side, *not* on `Material`, which is uploaded to the device).
+  Because an unresolved `a` would silently evaluate to 0, **every** by-name material
+  reference routes through `lookupMaterial`, which memoises the empty application; that
+  is also why `resolveMixChildren` takes a material **index** rather than a `Material&`
+  (a lookup can append to `Scene::mats` and reallocate). `applyCache_` keys on
+  `"<matIdx>(<args>)"`, so one application shared by N objects builds ONE material, and a
+  no-op application returns the original index — the additive-superset guarantee.
+  `a` is scope-gated by `compilePatternExpr`'s `allowA` (appended *last* so only the four
+  material-reachable sites opt in), and `VarA` is appended at the END of `PatOp` so
+  `patternHasFreeVars`' `VarX..VarV` intrinsic range is unperturbed. `parseBindArgs`
+  reuses the record ladder (comma == space) and finds argument boundaries from the `=`
+  signs rather than the whitespace, which is sound only because the pattern language has
+  **no comparison operators** — a top-level `=` can only mean a binding. Named arguments
+  bind before a positional one, so a positional takes the sole *still-free* input (loom's
+  `free_inputs() - set(binds)`). `-checkbind` pins the algebra (splice == textual
+  inlining, simultaneity, identity, introspection).
 - **`render_progress.h`** — progress hook for chunked samples-per-pixel renderers (modes
   `R`, `D`): the live status line (`[live] … photons, ~N% noise`) and noise estimation for
   `-noise` budgets.

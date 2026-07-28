@@ -973,6 +973,30 @@ the device and are sampled by device twins of the CPU sampler; mode `D`'s connec
 reconstructs the per-hit point to sample the driver). Fallback is automatic. See FTSL.md
 §7.5 for the full grammar.
 
+**Materials are parameterized bundles.** A material property is an expression over
+*named inputs*, so a material is itself a function whose free-input set is the union of
+its properties' free inputs. Applying it at a use site binds those inputs across the
+whole bundle at once:
+
+```
+pattern "rough_ua" { expr "0.5*a*(0.2+0.8*u)" }        # free inputs: a, u
+material "gold" { type glossy  reflect spectrum:gold
+                  roughness pattern:rough_ua  albedo_default 0.5 }
+
+sphere { center 0 0 0  radius 1  material gold(u=v,a=1) }  # bind u<-v, a<-1
+sphere { center 2 0 0  radius 1  material gold(u=v a=1) }  # identical — same ladder
+sphere { center 4 0 0  radius 1  material gold(u=v) }      # partial: a -> albedo_default
+sphere { center 6 0 0  radius 1  material gold(0.5,a=1) }  # positional binds the last free input
+```
+
+Bindable inputs are the surface intrinsics `x y z nx ny nz r u v f` plus **`a`** —
+albedo, the one input with no per-hit intrinsic, resolved at load time either to what a
+use site binds or to the material's `albedo_default` (default `1.0`). Binding is pure
+substitution into the postfix program, so an applied material is an *ordinary* material:
+no environment, no runtime indirection, and a material nobody applies is bit-identical
+to before. `ftrace -checkbind` pins the algebra (splice == inlining, simultaneity,
+identity). See FTSL.md §7.6.
+
 ---
 
 ## Spectra (SPDs, reflectances, indices)
@@ -2507,7 +2531,7 @@ alone can't restore, so they are not disk-resumable.
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
 `-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`,
-`-checksun`.
+`-checksun`, `-checkbind`.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are

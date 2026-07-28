@@ -2246,6 +2246,54 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          is irrelevant; a cycle needs a *recurrent/stateful* node, which loom has none of). **Caveat:** unifying
          the *grammar* (one node type, `t` an input) is clean, but the two *executors* stay distinct strategies on
          that node — scalar-per-frame (frame-keyed cache) vs numpy-array-over-space — don't pretend they're one call.
+         **DONE IN FTRACE TOO — §3.3 materials-as-bundles arm, 2026-07-27 (v0.87.0).** Binding is **substitution**,
+         and on a *postfix* program substitution is a pure **splice**: a variable node pushes exactly one value and
+         so does a well-formed program, so `patternSubstitute` (in `src/pattern.h`, alongside `varName` /
+         `patternUsesVar` / `patternCollectVars`) just replaces each `VarU` node with the replacement program's
+         nodes. No environment, no closure, no runtime indirection — an applied material is an **ordinary**
+         `Material` over ordinary patterns, so the GPU upload, the CPU evaluator, `patternHasFreeVars` and the
+         record samplers are all untouched. Substitution is **simultaneous** (`gold(u=v,v=u)` swaps).
+         `PatOp::VarA` is appended at the END of the enum (the `PatOp::Tex` precedent) so the `VarX..VarV`
+         intrinsic range is unperturbed; `a` is the one named input with **no per-hit intrinsic**, so an unbound
+         `a` must resolve at LOAD time — to what the use site binds, else to the material's `albedo_default`
+         (system default 1.0). That default lives in the loader (`Parser::albedoDefault_`), *not* on `Material`,
+         because `Material` is uploaded verbatim to the device. `a` is also **scope-gated**: `compilePatternExpr`
+         takes a new trailing `allowA`, true at exactly the four material-reachable value sites (pattern block,
+         record material driver, record `from` driver, record-override slot RHS) and false everywhere else, so
+         `a` in an isosurface or a medium program is a specific compile error, never a silent 0.0.
+         Application is **lazy and memoised**: *every* by-name material reference routes through
+         `Parser::lookupMaterial` → `applyMaterial(idx, argText)`, which returns the ORIGINAL index for a no-op
+         call and caches on `"<idx>(<args>)"`, so identical applications share one clone and a material nobody
+         applies is bit-identical to before (additivity is structural, not hopeful — 83 scenes parse, 0 failures).
+         `parseBindArgs` finds argument boundaries from the `=` signs plus top-level commas; that is unambiguous
+         only because the pattern language has **no comparison operators**, so a top-level `=` is always a binding.
+         Named args are resolved *before* positional ones and a positional binds the sole **still-free** input
+         (loom `Material.apply` parity: `gold(v,a=1)` legal, `gold(v)` on a two-input bundle rejected, >1
+         positional rejected). Routing plain lookups through `applyMaterial` can append to `Scene::mats`, so
+         `resolveMixChildren` was refactored to take a material **index** rather than a `Material&` — a stored
+         reference would have dangled on reallocation.
+         **Known syntax constraint (pre-existing, not new):** an argument list must be a single *unspaced* token —
+         a value ends at the first plain bareword (`cont = NUMWORD | KVWORD | STRING` in the EPEG grammar), so
+         `gold(0.5*u + 0.5*v)` truncates. `u=v,a=1` survives because a word containing `=` is a value
+         *continuation*. The shipped `RECORD(driver)` inline form has the identical constraint; both diagnostics
+         now share a `parenHint()` that explains it.
+         **Pinned deterministically** by the new `-checkbind` self-test (`checkBind()` in `main.cpp`): splice ==
+         textual inlining over 10 input types, simultaneity with negative assertions against *both* sequential
+         collapse directions, identity for empty/absent binds, introspection, and `a` scope-gating.
+         Regression scene `scenes/_material_bind.ftsl` — a 4×3 grid of camera-facing **quad tiles**, not spheres:
+         `addQuad` gives a quad UVs spanning the parallelogram, so the material's `u` IS the tile's horizontal axis
+         and `v` its vertical one, and rebinding `u=v` visibly ROTATES the gradient. (The first cut used spheres and
+         was useless — curvature mixes albedo with shading falloff, so flat brightness couldn't be compared across
+         surfaces at all, and a rotated gradient on a sphere is unreadable. The room is neutral grey for the same
+         reason: colour bleed would contaminate the greyscale albedo being read.) It carries three **identity pairs**
+         that are the actual asserts — `flat_a(a=0.5)` ≡ literal `reflect 0.5`, named `u=v` ≡ positional `(v)`, and
+         comma ≡ comma-less argument lists. Measured at 120 s / 320²: normalising each tile against the backdrop
+         strip below it (also albedo 0.5, which cancels the lighting profile) the pairs agree to 0.3% / 0.1% / 2.4%,
+         `A1 0.610 < A2 1.103 < A3 1.522` tracks `0.15 < 0.5 < 1.0`, and the gradients come out horizontal (du=+39,
+         dv=0) / vertical (du=0, dv=+37) / reversed (du=−38) / 45° diagonal (du=+15, dv=+14) as authored.
+         Docs: FTSL.md §7.6, README.md, design.md.
+         **Remaining in ftrace:** §3.2's per-property access (`gold.color(u=x)` — ftrace has `RECORD.channel`
+         dot-access but no `MATERIAL.property`) and the optional-property-name arm (`spectrum = …` anonymous).
       4. **N-D *input* domain** (several named driver *axes*, not one `range` scalar).
          **NOT SCHEDULED (user, 2026-07-25)** — items 1/2/3 are all done, so this is the only thing keeping J3b
          open, and it is deliberately left out. It is also the piece most entangled with the axis-labelled-array
