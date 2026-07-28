@@ -828,7 +828,7 @@ tools/loom/
   on a FIFO that never drops and is drained first (a lost `bindings` would leave loom rendering against a
   binding set the editor no longer has). The panel row edits bindings straight from the `slots` pick-list and
   drives `dims` grow/shrink, and Save writes both back through the same sidecar round-trip as 3a.
-  Tests: `tests/test_anim.py` (19) + `tests/test_anim_live.py` (34).
+  Tests: `tests/test_anim.py` (17) + `tests/test_anim_live.py` (34).
   **The `-m` identity trap (fixed + pinned in 3b).** A module that is both a `python -m` entry point *and*
   an importable API is executed **twice** — once as `__main__`, once as `loom.anim` — producing two distinct
   copies of every class. `isinstance` across that boundary fails silently, and the observable was `0 bindable
