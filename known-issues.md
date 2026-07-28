@@ -106,14 +106,55 @@ GPU fills each with the correct wall colour (e.g. `(216,195,191)` at `(476,223)`
 CPU has clear). The remaining 53 disagreements are ordinary ±1-pixel edge-coverage
 differences along wall silhouettes.
 
-**Fix direction.** `raster.h`'s per-pixel inside test needs a proper **top-left fill rule**
-(or an equivalent consistent tie-break on the edge function's sign at exactly zero) so a
-pixel landing precisely on a shared edge is claimed by exactly one of the two triangles.
-Half-open edge handling must use the *same* comparison for both triangles — a `> 0` on one
-and a `>= 0` on the other is what produces both cracks and double-shading. Note the wider
-implication: the CPU and GPU rasterizers are **not** pixel-identical today, so `-device`
-is not a pure performance switch for `-raster`; nailing the fill rule on both sides is what
-would make it one.
+**Mechanism (confirmed empirically).** Both rasterizers use the *same* coverage rule —
+normalized barycentrics with `if (w0 < 0 || w1 < 0 || w2 < 0) continue;` (raster.h:447,
+raster_cuda.cu:515/753). That test is *inclusive* on all three edges, which with exact
+arithmetic would double-cover a shared edge, never crack it. The crack comes from the tie
+being decided by floating-point noise:
+
+- At 800×600 the box's quad diagonals are **exactly 45°** and their line equations land on
+  `x - y = 100` / `x + y = 699`. Since sample points are `px = x+0.5, py = y+0.5`, such an
+  edge passes **dead-on through ~220 consecutive pixel centres** — every one an exact tie.
+- The two triangles sharing that edge do *not* evaluate it identically: `w0`/`w1` are
+  incrementally stepped from each triangle's own `xlo` (so different accumulation lengths
+  at the same pixel), scaled by each triangle's own `1/area`, and the third weight is the
+  *derived* `w2 = 1 - w0 - w1`, which rounds differently again. So the "same" edge can come
+  out as a tiny negative in **both** triangles, and both reject.
+- **Proof:** rendering the identical scene at 801×600 or 800×601 — which moves the edge off
+  exact pixel centres — drops interior holes from **127 to 0**. Nothing else changed.
+- The GPU escapes it only by *luck*: `float`'s coarser rounding happens to land these ties
+  non-negative where `double` lands them negative. It is not more correct, just differently
+  wrong, and another scene/resolution could crack it too.
+
+**Fix.** Make the coverage decision **exact**, then break the tie by rule:
+
+1. Snap screen-space X/Y to a fixed-point subpixel grid (1/16 or 1/256 px, as D3D/GL do)
+   and compute the three edge functions in **64-bit integers**. Both triangles then derive
+   a shared edge from the *same two endpoint values*, so their edge functions are exact
+   negations — a tie becomes a real, detectable tie instead of noise. Compute all three
+   edges directly; drop the derived `w2 = 1 - w0 - w1` asymmetry.
+2. Apply a **top-left fill rule**: bias each edge by `-1` fixed-point unit unless it is a
+   top or left edge, then accept on `E >= 0`. The two triangles sharing an edge traverse it
+   in opposite directions, so it is top-left for exactly one of them — exactly one claims
+   the pixel. No crack, no double-cover.
+3. This needs **consistent winding**, which the code does not currently enforce (it accepts
+   either sign of `area` and normalizes by dividing by it). Swap two vertices when
+   `area < 0` before building the edges, or negate the edges and mirror the predicate.
+4. Keep attribute interpolation in floating point exactly as now — only accept/reject needs
+   exactness — and keep the incremental stepping (integer stepping is exact, so it also
+   removes the current per-row drift).
+5. Apply the identical change to **all four sites**: `fillTriangleG` and the see-through
+   fill in raster.h, and `rasterRow`/`kShade`'s resolve/`kClear` in raster_cuda.cu.
+
+Rejected alternative: widening the accept to `w > -eps` turns cracks into double-coverage
+(mostly harmless here, since the z-test's strict `>` lets the first writer win). But the
+epsilon is scale-dependent and it only moves the failure rather than removing it — the
+project rule is the proper fix.
+
+**Wider implication.** The CPU and GPU rasterizers are **not** pixel-identical today, so
+`-device` is not a pure performance switch for `-raster`. Fixing the fill rule on both
+sides is what would make it one — and it *will* change output bytes, so any golden images
+need regenerating in the same commit.
 
 ### BUG — open: a dark fringe of speckles on the tessellated sphere's silhouette (both backends, identically)
 
