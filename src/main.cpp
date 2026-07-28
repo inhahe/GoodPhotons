@@ -6581,7 +6581,9 @@ static int run(int argc, char** argv) {
             (void)raster_cuda::profTake();
 #endif
             std::vector<double> ms;
+            std::vector<double> tail;                 // host-side present cost, timed separately
             ms.reserve(rasterBench);
+            tail.reserve(rasterBench);
             for (int it = 0; it < rasterBench && !g_stopRequested; ++it) {
                 auto t0 = std::chrono::steady_clock::now();
                 img = rasterOne(rc.cam, W, H, ev, autoExp, nullptr);
@@ -6589,7 +6591,13 @@ static int run(int argc, char** argv) {
                                  std::chrono::steady_clock::now() - t0).count());
                 if (g_showWindow) {
                     if (!g_liveWin) g_liveWin = std::make_unique<LiveWindow>(W, H, g_windowTitle.c_str());
+                    // The present tail used to dwarf the render itself (a per-pixel RGB->BGRA
+                    // repack plus a HALFTONE StretchDIBits, both charged to the render thread),
+                    // so report it: a faster backend is only a real speedup if this stays small.
+                    auto t1 = std::chrono::steady_clock::now();
                     g_liveWin->update(W, H, img);
+                    tail.push_back(std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - t1).count());
                     if (g_liveWin->closed()) g_stopRequested = 1;
                 }
             }
@@ -6606,6 +6614,15 @@ static int run(int argc, char** argv) {
                 std::printf("[raster-bench] %zu frames %dx%d: min %.2f ms  median %.2f ms  "
                             "mean %.2f ms  (%.1f fps @ median)\n",
                             ms.size(), W, H, mn, md, mean, md > 0 ? 1000.0 / md : 0.0);
+            }
+            if (!tail.empty()) {
+                std::vector<double> s = tail;
+                std::sort(s.begin(), s.end());
+                double mean = 0;
+                for (double v : tail) mean += v;
+                mean /= tail.size();
+                std::printf("[raster-bench] live-window present tail: min %.2f ms  median %.2f ms  "
+                            "mean %.2f ms\n", s.front(), s[s.size() / 2], mean);
             }
 #ifdef HAVE_CUDA
             {

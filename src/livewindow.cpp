@@ -25,6 +25,9 @@ void LiveWindow::setBindState(const std::vector<std::string>&, const char*) {}
 #include <windows.h>
 #include <windowsx.h>          // GET_X_LPARAM / GET_Y_LPARAM
 #include <commctrl.h>          // trackbar (msctls_trackbar32) for the timeline
+#include <d3d11.h>             // the image area's swap chain (replaces the GDI StretchDIBits tail)
+#include <dxgi1_2.h>           // CreateSwapChainForHwnd / flip-model presentation
+#include <d3dcompiler.h>       // the two present shaders, compiled at runtime
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -32,6 +35,9 @@ void LiveWindow::setBindState(const std::vector<std::string>&, const char*) {}
 #include <cstdlib>             // strtod / atoi for the speed inputs
 #include <algorithm>
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 
 // Convert a UTF-8 byte string to UTF-16 for the Win32 *W APIs. The old code did a
 // naive `assign(begin, end)` byte-widen, which mangles any non-ASCII: an em dash
@@ -64,6 +70,364 @@ static std::string wideToUtf8(const std::wstring& w) {
     std::string s((size_t)n, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
     return s;
+}
+
+// =====================================================================================
+//                      D3D11 presenter for the live image area
+// =====================================================================================
+// Why this exists: the old present path was pure CPU + GDI, and it cost far more than
+// the render it was displaying. Per frame it did
+//
+//   1. a scalar per-pixel RGB8 -> BGRA repack in LiveWindow::update(), and
+//   2. CreateCompatibleDC/Bitmap + FillRect + SetStretchBltMode(HALFTONE) +
+//      StretchDIBits + BitBlt in WM_PAINT,
+//
+// and because paint() held the same mutex update() needs, step 2 sat squarely on the
+// render thread's critical path. Measured on this machine (scraps/tailbench.cpp,
+// reproducing both steps byte-for-byte):
+//
+//   image -> client            repack    HALFTONE blit
+//   1920x1920 -> 1264x1264     5.07 ms       23.99 ms
+//   1264x1264 -> 1264x1264     2.35 ms        7.83 ms
+//   1920x1080 -> 1920x1080     2.94 ms       12.37 ms
+//
+// — i.e. 10-29 ms of host work behind a GPU raster frame that takes 9.12 ms in total.
+// So the tail, not the render, was the frame-rate limiter.
+//
+// The replacement uploads the renderer's RGB8 bytes untouched (no repack: there is no
+// RGB8 DXGI format, so the buffer goes up as an R8 texture 3x as wide and a pixel
+// shader deswizzles it into an RGBA8 image texture), then presents that texture through
+// a flip-model swap chain with a letterboxed viewport and a linear sampler — the GPU
+// doing the scale GDI's HALFTONE was doing on the CPU.
+//
+// It is also the prerequisite for the zero-copy path: once D3D owns the image texture,
+// the CUDA rasterizer can write it directly (cudaGraphicsD3D11RegisterResource +
+// surf2Dwrite) and the device->host download disappears too.
+//
+// Threading: every entry point locks `mtx`, because ID3D11DeviceContext is not
+// thread-safe and both the render thread (upload+present from update()) and the UI
+// thread (re-present on resize/expose) drive it.
+//
+// Fallback: any failure here leaves `ok` false and LiveWindow keeps using the original
+// GDI path, which is retained in full anyway — WM_PRINTCLIENT capture (PrintWindow
+// cannot see swap-chain content) still goes through it, fed by a GPU readback.
+
+// One shared vertex shader: a full-screen triangle generated from SV_VertexID, so no
+// vertex/index buffer and no input layout is needed.
+static const char* kPresentVS =
+    "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "VSOut main(uint id : SV_VertexID) {\n"
+    "    VSOut o;\n"
+    "    float2 t = float2((id << 1) & 2, id & 2);\n"   // (0,0) (2,0) (0,2)
+    "    o.uv  = t;\n"
+    "    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+    "    return o;\n"
+    "}\n";
+
+// Pass 1: RGB8 -> RGBA8. The source is bound as an R8 texture of width 3*W, so pixel
+// (x,y) of the image is bytes (3x, 3x+1, 3x+2) of row y. Load() (not Sample) because
+// the addressing is exact texel indexing, and filtering across the interleaved channels
+// would be meaningless.
+static const char* kDeswizzlePS =
+    "Texture2D<float> packed : register(t0);\n"
+    "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "float4 main(VSOut i) : SV_Target {\n"
+    "    int3 p = int3((int)i.pos.x * 3, (int)i.pos.y, 0);\n"
+    "    return float4(packed.Load(p),\n"
+    "                  packed.Load(p + int3(1, 0, 0)),\n"
+    "                  packed.Load(p + int3(2, 0, 0)), 1.0);\n"
+    "}\n";
+
+// Pass 2: the image texture stretched into the letterboxed viewport, bilinear.
+static const char* kBlitPS =
+    "Texture2D    img   : register(t0);\n"
+    "SamplerState samp0 : register(s0);\n"
+    "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "float4 main(VSOut i) : SV_Target { return float4(img.Sample(samp0, i.uv).rgb, 1.0); }\n";
+
+template <class T> static void relCom(T*& p) { if (p) { p->Release(); p = nullptr; } }
+
+struct LivePresenter {
+    std::mutex               mtx;                 // guards EVERYTHING below (ctx is not thread-safe)
+    bool                     ok = false;          // pipeline usable; false => caller must use GDI
+    ID3D11Device*            dev  = nullptr;
+    ID3D11DeviceContext*     ctx  = nullptr;
+    IDXGISwapChain1*         swap = nullptr;
+    ID3D11RenderTargetView*  backRTV = nullptr;
+    int                      swapW = 0, swapH = 0;
+    ID3D11VertexShader*      vs = nullptr;
+    ID3D11PixelShader*       psDeswizzle = nullptr, *psBlit = nullptr;
+    ID3D11SamplerState*      samp = nullptr;
+    ID3D11RasterizerState*   rsNoCull = nullptr;
+    // Upload staging: the renderer's RGB8 rows, as an R8 texture 3x as wide.
+    ID3D11Texture2D*         packTex = nullptr;
+    ID3D11ShaderResourceView* packSRV = nullptr;
+    int                      packW = 0, packH = 0;
+    // The image itself, in the only layout D3D can filter. Also the surface CUDA will
+    // eventually write into directly.
+    ID3D11Texture2D*         imgTex = nullptr;
+    ID3D11RenderTargetView*  imgRTV = nullptr;
+    ID3D11ShaderResourceView* imgSRV = nullptr;
+    int                      imgW = 0, imgH = 0;
+    ID3D11Texture2D*         readTex = nullptr;   // STAGING copy, allocated only when a capture asks
+
+    bool init(HWND hview);
+    void release();
+    bool ensureImg(int w, int h);
+    bool ensurePack(int w, int h);
+    bool ensureSwap(int w, int h);
+    void fullScreenPass(ID3D11PixelShader* ps, ID3D11ShaderResourceView* srv,
+                        ID3D11RenderTargetView* rtv,
+                        float vx, float vy, float vw, float vh, bool clear);
+    bool uploadHost(int w, int h, const uint8_t* rgb);
+    bool present(int viewW, int viewH);
+    bool readbackBgra(std::vector<uint8_t>& bgra, int& w, int& h);
+};
+
+static ID3DBlob* compileShader(const char* src, const char* target) {
+    ID3DBlob* code = nullptr; ID3DBlob* err = nullptr;
+    HRESULT hr = D3DCompile(src, strlen(src), nullptr, nullptr, nullptr, "main", target,
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    if (err) err->Release();
+    if (FAILED(hr)) { relCom(code); return nullptr; }
+    return code;
+}
+
+bool LivePresenter::init(HWND hview) {
+    if (!hview) return false;
+    D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+                                 D3D_FEATURE_LEVEL_10_0 };
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                                   want, (UINT)std::size(want), D3D11_SDK_VERSION,
+                                   &dev, nullptr, &ctx);
+    if (FAILED(hr)) { release(); return false; }
+
+    // Reach the factory through the device's own adapter, so the swap chain is created
+    // on the same GPU the device lives on (matters on hybrid iGPU/dGPU laptops).
+    IDXGIDevice*  dxgiDev = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    IDXGIFactory2* factory = nullptr;
+    if (FAILED(dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev)) ||
+        FAILED(dxgiDev->GetAdapter(&adapter)) ||
+        FAILED(adapter->GetParent(__uuidof(IDXGIFactory2), (void**)&factory))) {
+        relCom(factory); relCom(adapter); relCom(dxgiDev); release(); return false;
+    }
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    sd.Width  = 0; sd.Height = 0;                  // 0 => track the HWND's client size
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.Scaling     = DXGI_SCALING_STRETCH;
+    sd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.AlphaMode   = DXGI_ALPHA_MODE_IGNORE;
+    hr = factory->CreateSwapChainForHwnd(dev, hview, &sd, nullptr, nullptr, &swap);
+    if (FAILED(hr)) {
+        // Pre-Win10 (or a driver without flip-discard): fall back to the bitblt model.
+        sd.SwapEffect  = DXGI_SWAP_EFFECT_DISCARD;
+        sd.BufferCount = 1;
+        sd.Scaling     = DXGI_SCALING_STRETCH;
+        hr = factory->CreateSwapChainForHwnd(dev, hview, &sd, nullptr, nullptr, &swap);
+    }
+    // Alt-Enter must not turn the preview into an exclusive-fullscreen surprise.
+    factory->MakeWindowAssociation(hview, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+    relCom(factory); relCom(adapter); relCom(dxgiDev);
+    if (FAILED(hr)) { release(); return false; }
+
+    ID3DBlob* bvs = compileShader(kPresentVS,   "vs_4_0");
+    ID3DBlob* bd  = compileShader(kDeswizzlePS, "ps_4_0");
+    ID3DBlob* bb  = compileShader(kBlitPS,      "ps_4_0");
+    bool shOk = bvs && bd && bb &&
+        SUCCEEDED(dev->CreateVertexShader(bvs->GetBufferPointer(), bvs->GetBufferSize(), nullptr, &vs)) &&
+        SUCCEEDED(dev->CreatePixelShader (bd->GetBufferPointer(),  bd->GetBufferSize(),  nullptr, &psDeswizzle)) &&
+        SUCCEEDED(dev->CreatePixelShader (bb->GetBufferPointer(),  bb->GetBufferSize(),  nullptr, &psBlit));
+    relCom(bvs); relCom(bd); relCom(bb);
+    if (!shOk) { release(); return false; }
+
+    D3D11_SAMPLER_DESC sda{};
+    sda.Filter   = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sda.AddressU = sda.AddressV = sda.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sda.MaxLOD   = D3D11_FLOAT32_MAX;
+    if (FAILED(dev->CreateSamplerState(&sda, &samp))) { release(); return false; }
+
+    // The full-screen triangle's winding depends on nothing but SV_VertexID, so rather
+    // than reason about it, disable culling.
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    if (FAILED(dev->CreateRasterizerState(&rd, &rsNoCull))) { release(); return false; }
+
+    ok = true;
+    return true;
+}
+
+void LivePresenter::release() {
+    ok = false;
+    relCom(readTex);
+    relCom(imgSRV); relCom(imgRTV); relCom(imgTex); imgW = imgH = 0;
+    relCom(packSRV); relCom(packTex); packW = packH = 0;
+    relCom(rsNoCull); relCom(samp);
+    relCom(psBlit); relCom(psDeswizzle); relCom(vs);
+    relCom(backRTV); swapW = swapH = 0;
+    relCom(swap);
+    if (ctx) { ctx->ClearState(); ctx->Flush(); }
+    relCom(ctx); relCom(dev);
+}
+
+// The image texture: RGBA8, render-targetable (pass 1 writes it) and samplable (pass 2
+// reads it). Recreated only when the render resolution changes.
+bool LivePresenter::ensureImg(int w, int h) {
+    if (imgTex && imgW == w && imgH == h) return true;
+    relCom(readTex);                      // its size is tied to the image's
+    relCom(imgSRV); relCom(imgRTV); relCom(imgTex);
+    imgW = imgH = 0;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = (UINT)w; td.Height = (UINT)h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(dev->CreateTexture2D(&td, nullptr, &imgTex))) return false;
+    if (FAILED(dev->CreateRenderTargetView(imgTex, nullptr, &imgRTV)) ||
+        FAILED(dev->CreateShaderResourceView(imgTex, nullptr, &imgSRV))) {
+        relCom(imgSRV); relCom(imgRTV); relCom(imgTex); return false;
+    }
+    imgW = w; imgH = h;
+    return true;
+}
+
+// The upload staging texture: DYNAMIC R8, 3*W wide, so the renderer's tightly-packed
+// RGB8 rows go up as-is with one memcpy per row and no channel shuffling on the CPU.
+bool LivePresenter::ensurePack(int w, int h) {
+    if (packTex && packW == w && packH == h) return true;
+    relCom(packSRV); relCom(packTex); packW = packH = 0;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = (UINT)w; td.Height = (UINT)h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DYNAMIC;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(dev->CreateTexture2D(&td, nullptr, &packTex))) return false;
+    if (FAILED(dev->CreateShaderResourceView(packTex, nullptr, &packSRV))) {
+        relCom(packTex); return false;
+    }
+    packW = w; packH = h;
+    return true;
+}
+
+bool LivePresenter::ensureSwap(int w, int h) {
+    if (backRTV && swapW == w && swapH == h) return true;
+    relCom(backRTV);                                   // must drop every buffer reference first
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    // Compare against the buffers' ACTUAL size rather than a cached one: at creation the
+    // swap chain sized itself from the HWND, so the first acquire usually needs no resize.
+    if (SUCCEEDED(swap->GetDesc1(&sd)) && ((int)sd.Width != w || (int)sd.Height != h)) {
+        if (FAILED(swap->ResizeBuffers(0, (UINT)w, (UINT)h, DXGI_FORMAT_UNKNOWN, 0))) return false;
+    }
+    ID3D11Texture2D* back = nullptr;
+    if (FAILED(swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back))) return false;
+    HRESULT hr = dev->CreateRenderTargetView(back, nullptr, &backRTV);
+    back->Release();
+    if (FAILED(hr)) return false;
+    swapW = w; swapH = h;
+    return true;
+}
+
+// One full-screen-triangle pass. `clear` blacks the target first (the letterbox bars).
+void LivePresenter::fullScreenPass(ID3D11PixelShader* ps, ID3D11ShaderResourceView* srv,
+                                   ID3D11RenderTargetView* rtv,
+                                   float vx, float vy, float vw, float vh, bool clear) {
+    ID3D11ShaderResourceView* noSrv = nullptr;
+    ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    if (clear) { const float black[4] = {0, 0, 0, 1}; ctx->ClearRenderTargetView(rtv, black); }
+    D3D11_VIEWPORT vp{ vx, vy, vw, vh, 0.0f, 1.0f };
+    ctx->RSSetViewports(1, &vp);
+    ctx->RSSetState(rsNoCull);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(vs, nullptr, 0);
+    ctx->PSSetShader(ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, &srv);
+    ctx->PSSetSamplers(0, 1, &samp);
+    ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->Draw(3, 0);
+    ctx->PSSetShaderResources(0, 1, &noSrv);      // never leave the target bound as input
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+}
+
+// Hand the renderer's RGB8 frame to the GPU. Caller holds mtx.
+bool LivePresenter::uploadHost(int w, int h, const uint8_t* rgb) {
+    if (!ok || w <= 0 || h <= 0) return false;
+    if (!ensurePack(w * 3, h) || !ensureImg(w, h)) return false;
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    if (FAILED(ctx->Map(packTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) return false;
+    const size_t rowBytes = (size_t)w * 3;
+    if (ms.RowPitch == rowBytes) {
+        memcpy(ms.pData, rgb, rowBytes * (size_t)h);       // one shot when the pitch matches
+    } else {
+        uint8_t* dst = (uint8_t*)ms.pData;
+        for (int y = 0; y < h; ++y) memcpy(dst + (size_t)y * ms.RowPitch, rgb + (size_t)y * rowBytes, rowBytes);
+    }
+    ctx->Unmap(packTex, 0);
+    fullScreenPass(psDeswizzle, packSRV, imgRTV, 0.0f, 0.0f, (float)w, (float)h, false);
+    return true;
+}
+
+// Draw the image texture, aspect-fit and letterboxed, into the swap chain. Caller holds mtx.
+bool LivePresenter::present(int viewW, int viewH) {
+    if (!ok || viewW <= 0 || viewH <= 0) return false;
+    if (!ensureSwap(viewW, viewH)) return false;
+    if (imgW > 0 && imgH > 0) {
+        double s = std::min((double)viewW / imgW, (double)viewH / imgH);
+        int dw = std::max(1, (int)(imgW * s)), dh = std::max(1, (int)(imgH * s));
+        fullScreenPass(psBlit, imgSRV, backRTV,
+                       (float)((viewW - dw) / 2), (float)((viewH - dh) / 2),
+                       (float)dw, (float)dh, true);
+    } else {
+        const float black[4] = {0, 0, 0, 1};
+        ctx->ClearRenderTargetView(backRTV, black);
+    }
+    // Present(0): never block the render thread on vblank. DWM composites, so this does
+    // not tear; at worst a frame is superseded before it is shown.
+    HRESULT hr = swap->Present(0, 0);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) { ok = false; return false; }
+    return true;
+}
+
+// Pull the current image back to host BGRA for a GDI capture (WM_PRINTCLIENT). Rare —
+// PrintWindow cannot see swap-chain content, so this is how off-screen grabs of the
+// preview keep working now that the image never touches host memory in BGRA form.
+bool LivePresenter::readbackBgra(std::vector<uint8_t>& bgra, int& w, int& h) {
+    if (!ok || !imgTex || imgW <= 0 || imgH <= 0) return false;
+    if (!readTex) {
+        D3D11_TEXTURE2D_DESC td{};
+        imgTex->GetDesc(&td);
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        td.MiscFlags = 0;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &readTex))) return false;
+    }
+    ctx->CopyResource(readTex, imgTex);
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    if (FAILED(ctx->Map(readTex, 0, D3D11_MAP_READ, 0, &ms))) return false;
+    bgra.resize((size_t)imgW * imgH * 4);
+    for (int y = 0; y < imgH; ++y) {
+        const uint8_t* src = (const uint8_t*)ms.pData + (size_t)y * ms.RowPitch;
+        uint8_t*       dst = bgra.data() + (size_t)y * imgW * 4;
+        for (int x = 0; x < imgW; ++x) {
+            dst[x * 4 + 0] = src[x * 4 + 2];   // B
+            dst[x * 4 + 1] = src[x * 4 + 1];   // G
+            dst[x * 4 + 2] = src[x * 4 + 0];   // R
+            dst[x * 4 + 3] = 255;
+        }
+    }
+    ctx->Unmap(readTex, 0);
+    w = imgW; h = imgH;
+    return true;
 }
 
 // ---- Control-panel constants ----
@@ -99,6 +463,15 @@ struct LiveWindow::Impl {
     // since-reused handle belonging to another window/thread must never receive our WM_CLOSE/
     // WM_SETTEXT. Readers load() once and null-check before use.
     std::atomic<HWND>    hwnd{nullptr};
+    // ---- D3D11 presenter (the image area only; the control strip stays GDI) ----
+    // The swap chain lives on its OWN child window covering the image area, because a
+    // flip-model swap chain and overlapping GDI child controls cannot share one HWND.
+    // The child is hit-test transparent (HTTRANSPARENT), so every mouse message still
+    // reaches the parent's fly-camera handlers with unchanged client coordinates.
+    HWND                 hview = nullptr;          // created/destroyed on the UI thread
+    LivePresenter        pres;
+    std::atomic<bool>    d3dOk{false};             // presenter live => GDI image path is skipped
+    std::atomic<int>     viewW{0}, viewH{0};       // child client size (UI thread writes, presenter reads)
     int                  initW = 0, initH = 0;
     int                  minW = 640, minH = 300;   // readable floor so the title bar stays legible
     std::wstring         title;
@@ -173,8 +546,12 @@ struct LiveWindow::Impl {
     std::vector<std::string> reqSlots; int reqDims = 0;
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
+    static LRESULT CALLBACK ViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
-    void paint(HDC hdc, const RECT& client);
+    void makeView(HWND parent);                     // create the image child + init D3D (UI thread)
+    void layoutView(HWND parent);                   // fit the child to the image area (UI thread)
+    void presentNow();                              // re-present the last frame (any thread)
+    void paint(HDC hdc, const RECT& client, bool forCapture);
     void endLook();                                 // cursor left / focus lost: stop steering cleanly
     void buildPanel(HWND h);                        // create child controls + grow window (UI thread)
     void layoutPanel(HWND h);                       // position child controls in the strip (UI thread)
@@ -421,9 +798,112 @@ void LiveWindow::Impl::applyPathCount(int pc) {
     showPathGroup(pc >= 2);
 }
 
-void LiveWindow::Impl::paint(HDC hdc, const RECT& client) {
+// ---- The image child window -----------------------------------------------------------
+// Nothing but a surface for the swap chain. It answers WM_NCHITTEST with HTTRANSPARENT so
+// the hit test falls through to the parent (same thread), which keeps all of the fly-camera
+// mouse handling — hover-look, wheel dolly, the dead zone measured from the image centre —
+// working on unchanged coordinates: the child sits at the parent client origin, so the two
+// coordinate spaces coincide over the image area.
+LRESULT CALLBACK LiveWindow::Impl::ViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_CREATE) {
+        auto cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        return 0;
+    }
+    auto self = reinterpret_cast<Impl*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    switch (msg) {
+        case WM_NCHITTEST:  return HTTRANSPARENT;    // mouse belongs to the parent
+        case WM_ERASEBKGND: return 1;                // the swap chain owns every pixel
+        case WM_PAINT: {
+            PAINTSTRUCT ps; BeginPaint(h, &ps); EndPaint(h, &ps);
+            // A flip-model swap chain keeps showing its last frame through occlusion and
+            // moves, so an expose costs nothing — but after a RESIZE the buffers must be
+            // rebuilt, and the render thread may be seconds away from its next frame.
+            if (self) self->presentNow();
+            return 0;
+        }
+        case WM_SIZE:
+            if (self) { self->viewW.store(LOWORD(lp)); self->viewH.store(HIWORD(lp)); }
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// Create the image child and bring up D3D on it. Runs on the UI thread, before the ctor
+// is unblocked, so the render thread cannot race the first frame against initialisation.
+// Any failure simply leaves d3dOk false and the original GDI path in charge.
+void LiveWindow::Impl::makeView(HWND parent) {
+    // Escape hatch: FTRACE_LIVE_GDI=1 forces the original CPU/GDI present path. Useful for
+    // A/B measurement, and as a way out if a driver/remote-session ever makes the swap
+    // chain misbehave on a machine where the GDI path still works.
+    if (const char* e = std::getenv("FTRACE_LIVE_GDI")) { if (*e && *e != '0') return; }
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = ViewProc;
+    wc.hInstance     = GetModuleHandleW(nullptr);
+    wc.hCursor       = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = L"FtraceLiveView";
+    RegisterClassExW(&wc);
+    RECT cr; GetClientRect(parent, &cr);
+    int cw = std::max(1, (int)(cr.right - cr.left));
+    int ch = std::max(1, (int)(cr.bottom - cr.top) - panelH);
+    hview = CreateWindowExW(0, wc.lpszClassName, L"", WS_CHILD | WS_VISIBLE,
+                            0, 0, cw, ch, parent, nullptr, wc.hInstance, this);
+    if (!hview) return;
+    viewW.store(cw); viewH.store(ch);
+    if (pres.init(hview)) {
+        d3dOk.store(true);
+    } else {
+        DestroyWindow(hview);                       // fall all the way back to GDI
+        hview = nullptr;
+    }
+}
+
+// Keep the child exactly over the image area (client minus the control strip).
+void LiveWindow::Impl::layoutView(HWND parent) {
+    if (!hview) return;
+    RECT cr; GetClientRect(parent, &cr);
+    int cw = std::max(1, (int)(cr.right - cr.left));
+    int ch = std::max(1, (int)(cr.bottom - cr.top) - panelH);
+    MoveWindow(hview, 0, 0, cw, ch, TRUE);
+}
+
+// Re-draw the last uploaded frame. Safe from either thread: LivePresenter serialises the
+// device context internally, and this never sends a message, so it cannot deadlock against
+// the UI thread.
+void LiveWindow::Impl::presentNow() {
+    if (!d3dOk.load()) return;
+    std::lock_guard<std::mutex> lk(pres.mtx);
+    if (pres.ok) pres.present(viewW.load(), viewH.load());
+}
+
+// `forCapture` distinguishes the two remaining GDI callers. On screen, when the presenter
+// is live, the image area belongs to the child window and the parent must not draw over it
+// (it is clipped out by WS_CLIPCHILDREN anyway) — only the control strip is painted here.
+// A capture (WM_PRINTCLIENT / PrintWindow) is different: it renders into someone else's DC,
+// which the swap chain is invisible to, so the full image has to be drawn the old way —
+// pulling the pixels back off the GPU first if that is where they live.
+void LiveWindow::Impl::paint(HDC hdc, const RECT& client, bool forCapture) {
     int cw = client.right - client.left;
     int ch = (client.bottom - client.top) - panelH;   // image area = client minus the control strip
+    if (!forCapture && d3dOk.load()) {
+        if (panelH > 0 && cw > 0) {
+            RECT strip{0, std::max(0, ch), cw, client.bottom - client.top};
+            FillRect(hdc, &strip, GetSysColorBrush(COLOR_BTNFACE));
+        }
+        return;
+    }
+    if (forCapture && d3dOk.load()) {
+        // Refresh the host mirror from the GPU so the DIB below has something current.
+        std::vector<uint8_t> px; int rw = 0, rh = 0;
+        bool got = false;
+        { std::lock_guard<std::mutex> lk(pres.mtx); got = pres.readbackBgra(px, rw, rh); }
+        if (got) {
+            std::lock_guard<std::mutex> lk(mtx);
+            bgra.swap(px); imgW = rw; imgH = rh;
+        }
+    }
     if (cw <= 0 || ch <= 0) {
         // Degenerate (window dragged shorter than the panel): just fill with the toolbar face.
         if (panelH > 0) {
@@ -483,14 +963,15 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
         case WM_PAINT: {
             PAINTSTRUCT ps; HDC hdc = BeginPaint(h, &ps);
             RECT cr; GetClientRect(h, &cr);
-            if (self) self->paint(hdc, cr);
+            if (self) self->paint(hdc, cr, false);
             EndPaint(h, &ps);
             return 0;
         }
         case WM_PRINTCLIENT: {
             // Render the current frame into the caller's DC so PrintWindow() captures the
             // live image even when the window is occluded (used for off-screen grabs).
-            if (self) { RECT cr; GetClientRect(h, &cr); self->paint((HDC)wp, cr); }
+            // PrintWindow cannot see swap-chain content, so this always takes the GDI path.
+            if (self) { RECT cr; GetClientRect(h, &cr); self->paint((HDC)wp, cr, true); }
             return 0;
         }
         case WM_MKPANEL:
@@ -503,7 +984,10 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             if (self) self->buildBindRow(h);          // build the loom bind row + grow window (UI thread)
             return 0;
         case WM_SIZE:
-            if (self) self->layoutPanel(h);          // reflow the control strip to the new width
+            if (self) {
+                self->layoutPanel(h);                // reflow the control strip to the new width
+                self->layoutView(h);                 // and keep the D3D child over the image area
+            }
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_MOUSEMOVE:
@@ -732,7 +1216,17 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             }
             return 0;
         case WM_CLOSE:
-            if (self) { self->endLook(); self->closedFlag.store(true); }
+            if (self) {
+                self->endLook();
+                self->closedFlag.store(true);
+                // Retire the presenter BEFORE the child HWND dies. Clearing d3dOk stops new
+                // presents; taking and dropping the presenter lock then waits out any that
+                // is already in flight on the render thread, so the swap chain is never
+                // driven at a destroyed window.
+                self->d3dOk.store(false);
+                { std::lock_guard<std::mutex> lk(self->pres.mtx); self->pres.release(); }
+                self->hview = nullptr;               // destroyed with the parent below
+            }
             DestroyWindow(h);
             return 0;
         case WM_DESTROY:
@@ -756,8 +1250,10 @@ void LiveWindow::Impl::threadMain() {
     RegisterClassExW(&wc);                          // benign if already registered
 
     RECT  r{0, 0, initW, initH};
-    DWORD style = WS_OVERLAPPEDWINDOW;
-    AdjustWindowRect(&r, style, FALSE);
+    // WS_CLIPCHILDREN: the image area is a child window hosting the swap chain, so the
+    // parent must never paint through it (that would fight the presenter and flicker).
+    DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     int ww = r.right - r.left, wh = r.bottom - r.top;
 
     HWND hw = CreateWindowExW(0, wc.lpszClassName, title.c_str(), style,
@@ -765,9 +1261,10 @@ void LiveWindow::Impl::threadMain() {
                               nullptr, nullptr, wc.hInstance, this);
     hwnd.store(hw);
     if (hw) {
+        makeView(hw);                              // D3D child over the image area (may fail -> GDI)
         ShowWindow(hw, SW_SHOWNORMAL);
         UpdateWindow(hw);
-        SetTimer(hw, 1, 33, nullptr);              // ~30 fps repaint poll
+        SetTimer(hw, 1, 33, nullptr);              // ~30 fps repaint poll (GDI fallback path)
     }
     if (readyEvent) SetEvent(readyEvent);          // unblock the ctor
     if (!hw) { closedFlag.store(true); return; }
@@ -812,6 +1309,10 @@ LiveWindow::~LiveWindow() {
     HWND hw = impl_->hwnd.load();
     if (hw) PostMessageW(hw, WM_CLOSE, 0, 0);
     if (impl_->ui.joinable()) impl_->ui.join();
+    // Normally WM_CLOSE already retired the presenter; this covers the case where the UI
+    // thread never got that far (window creation failed, or it was destroyed some other
+    // way). release() is idempotent.
+    impl_->pres.release();
     if (impl_->readyEvent) CloseHandle(impl_->readyEvent);
     delete impl_;
 }
@@ -819,6 +1320,20 @@ LiveWindow::~LiveWindow() {
 void LiveWindow::update(int w, int h, const std::vector<uint8_t>& rgb) {
     if (!impl_ || w <= 0 || h <= 0) return;
     if ((size_t)w * h * 3 > rgb.size()) return;
+    if (impl_->d3dOk.load()) {
+        // GPU path: the bytes go up exactly as the renderer produced them (one memcpy per
+        // row into a mapped R8 texture), a shader turns RGB8 into RGBA8, and the swap chain
+        // does the letterboxed scale. No repack, no DIB, no StretchDIBits — and no host
+        // BGRA mirror, which is why WM_PRINTCLIENT reads back from the GPU instead.
+        std::lock_guard<std::mutex> lk(impl_->pres.mtx);
+        if (impl_->pres.ok && impl_->pres.uploadHost(w, h, rgb.data())) {
+            impl_->pres.present(impl_->viewW.load(), impl_->viewH.load());
+            return;
+        }
+        // Upload failed (device lost / OOM): drop to GDI for good rather than freeze the
+        // preview on a stale frame.
+        impl_->d3dOk.store(false);
+    }
     {
         std::lock_guard<std::mutex> lk(impl_->mtx);
         impl_->imgW = w; impl_->imgH = h;

@@ -739,8 +739,30 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   loop (measured: +80% photons/s on 16 cams @ 640×360, +22% on 2 cams @ 320×240);
   `renderForwardSharedCuda` survives as a one-shot wrapper over the session.
   `raster_cuda.cu` = GPU raster (own section below).
-- **`livewindow.*`** — Win32 GDI live preview (`-window`/`-keepwindow`), interactive
-  fly viewer input, camera-path timeline panel. With `-anim … -loom` it grows a fourth
+- **`livewindow.*`** — Win32 live preview (`-window`/`-keepwindow`), interactive
+  fly viewer input, camera-path timeline panel.
+  The **image area is presented by D3D11**, the control strip below it by GDI.
+  `LivePresenter` owns a D3D11 device and a flip-model `IDXGISwapChain1` on a **child
+  HWND covering the image area** — a separate HWND because a flip-model swap chain and
+  overlapping GDI child controls cannot share one window; the parent therefore carries
+  `WS_CLIPCHILDREN`. The child answers `WM_NCHITTEST` with `HTTRANSPARENT`, so every
+  mouse message still lands on the parent's fly-camera handlers, at unchanged
+  coordinates (the child sits at the parent's client origin). `update()` uploads the
+  renderer's RGB8 bytes **as-is** — there is no RGB8 DXGI format, so they go up as an
+  `R8_UNORM` texture three times as wide and a pixel shader deswizzles them into an
+  RGBA8 image texture — and a second full-screen pass scales that into a letterboxed
+  viewport with a linear sampler. This replaced a per-pixel RGB→BGRA repack plus a
+  `SetStretchBltMode(HALFTONE)` + `StretchDIBits` blit that together cost **9.0 ms per
+  frame** against a **1.3 ms** present now (`-raster-bench` reports the tail), and that
+  sat on the render thread's critical path because `paint()` held the same mutex
+  `update()` needed. The GDI path is retained in full: `FTRACE_LIVE_GDI=1` forces it,
+  any D3D failure falls back to it permanently, and **`WM_PRINTCLIENT` always uses it**
+  because `PrintWindow` cannot see swap-chain content — that capture pulls the current
+  frame back off the GPU (`readbackBgra`) since the image no longer exists in host
+  memory. `LivePresenter` serialises its own device context with a mutex, because both
+  the render thread (upload + present) and the UI thread (re-present after a resize or
+  expose) drive it.
+  With `-anim … -loom` the window grows a fourth
   panel row, the **loom bind row** (channel combo → slot combo → Bind/Unbind, a `chans:`
   count box, a status readout). Child HWNDs may only be created and moved on the window's
   own message-pump thread, so the row is built by marshalling `WM_MKBINDROW` (`WM_APP+3`)

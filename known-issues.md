@@ -51,9 +51,32 @@ CUDA compute rasterizer whose device tail is byte-identical to the CPU path, and
 9.12 ms/frame median at 1920×1920 on a 5.17 M-triangle scene (109.6 fps; per-pass: project
 1.14, raster 2.36, shade 0.16, expose+encode 1.14, **download 1.09**). Porting *that* to a
 graphics API would trade the byte-identical-backends guarantee and the non-matrix
-fisheye/panoramic projections for a few ms — measure before touching it. The readback +
-GDI blit (the 1.09 ms download, plus the blit) is the part worth attacking first, and can be
-done with CUDA↔D3D interop without adding a third rasterizer.
+fisheye/panoramic projections for a few ms — measure before touching it.
+
+**The present tail, however, was worth attacking, and has been — DONE (2026-07-28,
+v0.97.0).** Measuring it first was the whole point: the 1.09 ms download everyone
+(including this note) had been eyeing was a *small* part of the problem. `LiveWindow`'s
+host-side tail — a scalar per-pixel RGB8→BGRA repack plus a `HALFTONE` `StretchDIBits`
+double-buffer — measured **10–29 ms per frame** (`scraps/tailbench.cpp`: 5.07 + 23.99 ms
+at 1920×1920→1264×1264; 2.35 + 7.83 ms at 1264² 1:1; 2.94 + 12.37 ms at 1920×1080 1:1),
+i.e. *2.5–3× the entire GPU render*, and it serialised with the render thread because
+`paint()` held the same mutex `update()` needed. The image area is now presented by a
+D3D11 flip-model swap chain on its own child HWND, with the RGB8 bytes uploaded
+untouched and deswizzled in a shader (see `design.md`, `livewindow.*`). `-raster-bench`
+now reports the tail directly: **9.02 ms → 1.32 ms median** at 1920² on this machine,
+with byte-identical output. `FTRACE_LIVE_GDI=1` restores the old path for A/B or if a
+driver misbehaves.
+
+**Still open:** the CUDA rasterizer's own **1.09 ms device→host download** remains. Now
+that D3D owns the image texture, the zero-copy finish is available —
+`cudaGraphicsD3D11RegisterResource(..., cudaGraphicsRegisterFlagsSurfaceLoadStore)` plus
+a `surf2Dwrite` in the tonemap kernel, so `renderFrame`'s `cudaMemcpy` disappears for the
+live-preview path. Constraints to respect when doing it: the CUDA device and the D3D
+device must be on the same adapter (`cudaD3D11GetDevice`; hybrid iGPU/dGPU laptops will
+mismatch and must fall back); the ~10 host-RGB `update()` call sites (forward photon
+modes A/B/C, the `filmToRgb8` path-traced `T` preview, any `drawOverlay`-annotated frame)
+still need the upload path; and `drawOverlay` draws control-point markers into the host
+buffer, so the zero-copy path either skips the overlay or moves it onto the GPU.
 
 ### BUG — DONE (2026-07-28, v0.95.0): `python -m loom.anim` served an *empty* slot list — a module that is both `__main__` and importable is two different classes
 
