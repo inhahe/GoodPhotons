@@ -2272,11 +2272,9 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          positional rejected). Routing plain lookups through `applyMaterial` can append to `Scene::mats`, so
          `resolveMixChildren` was refactored to take a material **index** rather than a `Material&` — a stored
          reference would have dangled on reallocation.
-         **Known syntax constraint (pre-existing, not new):** an argument list must be a single *unspaced* token —
-         a value ends at the first plain bareword (`cont = NUMWORD | KVWORD | STRING` in the EPEG grammar), so
-         `gold(0.5*u + 0.5*v)` truncates. `u=v,a=1` survives because a word containing `=` is a value
-         *continuation*. The shipped `RECORD(driver)` inline form has the identical constraint; both diagnostics
-         now share a `parenHint()` that explains it.
+         **Spaces in an argument list** were initially not allowed and that was fixed in the same arm (see the
+         separate v0.88.0 entry below): the shared grammar's `WORD`/`PARENWORD` now match a *balanced paren group*
+         as part of the token, so `gold(0.5*u + 0.5*v)` and `gold(a=1, u=v)` lex as one word.
          **Pinned deterministically** by the new `-checkbind` self-test (`checkBind()` in `main.cpp`): splice ==
          textual inlining over 10 input types, simultaneity with negative assertions against *both* sequential
          collapse directions, identity for empty/absent binds, introspection, and `a` scope-gating.
@@ -2294,6 +2292,37 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          Docs: FTSL.md §7.6, README.md, design.md.
          **Remaining in ftrace:** §3.2's per-property access (`gold.color(u=x)` — ftrace has `RECORD.channel`
          dot-access but no `MATERIAL.property`) and the optional-property-name arm (`spectrum = …` anonymous).
+
+         **FOLLOW-UP — spaces inside a paren group, 2026-07-27 (v0.88.0).** The item-3 arm shipped with an
+         argument list that had to be a single *unspaced* token (`gold(0.5*u+0.5*v)` yes, `gold(0.5*u + 0.5*v)`
+         no), because a value ends at the first plain bareword (`cont = NUMWORD | KVWORD | STRING`). That was
+         defensible only as "pre-existing" — the shipped `RECORD(driver)` and array-literal sample-call forms had
+         it too — and the user rightly called it flimsy, so it is gone. The fix is purely **lexical** and lives in
+         the one shared grammar, `tools/loom/loom/grammar/ftsl_scene.epeg`: `WORD` and `PARENWORD` now match a
+         **balanced paren group** as part of a token, with the group's interior character class allowing `' '` and
+         `'\t'` while `WORD`'s own class still does not. So a space is a delimiter exactly while no parens are
+         open. Fixing it in the lexer rather than in `matFieldId` was the only real option — once the tokens are
+         split, the rest of the line has already been consumed as *other statements* and cannot be recovered.
+         Three deliberate design points. (a) **Balanced, not greedy.** A `\([^)]*\)` that may cross spaces would
+         happily swallow `(a) roughness 0.2` up to a `)` in a *different statement* — a silently wrong parse
+         instead of an error. Regexes cannot count, so the nesting is written out to depth 4; that is not a real
+         ceiling, because `WORD`'s fallback alternative still matches a bare paren as an ordinary char, so deeper
+         nesting simply degrades to the old behaviour (outer parens consumed as chars, the group covering the
+         innermost spaced run). (b) **Group alternative FIRST.** ECMAScript/Python regexes are leftmost-*first*,
+         not leftmost-longest, so the engine must be told to prefer "consume the whole balanced group" over
+         "consume `(` as an ordinary char and stop at the next space". (c) **Backward-compatible by construction:**
+         the fallback alternative is byte-identical to the historical `WORD` class, so the group alternative can
+         only ever *extend* a token across a space that sits inside parens — precisely the case that used to raise
+         "missing ')'". Verified by replaying the old and new rule tables over the whole scene corpus with a
+         faithful reimplementation of the longest-match/declaration-order lexer: **83 scenes, 26 805 tokens,
+         exactly one differing token** — the intended one in `_material_bind.ftsl`. Regenerating
+         `src/gpda/ftsl_scene.gen.cpp` touched **4 lines in 2 lexer rules and left the parse graph untouched**,
+         which is the structural proof that the change is lexical only. Adversarial backtracking checked (40
+         unclosed parens, 40 nested, an 840-char flat expression): max 33 µs, no blow-up. `parseBindArgs` needed no
+         change, and `parenHint()` was rewritten — reaching "missing ')'" now genuinely means unbalanced parens.
+         `_material_bind.ftsl` C4 is now deliberately spelled `grad_ua(u=0.5*u + 0.5*v)` so the scene regresses
+         this, and still measures as the authored 45° diagonal. All 13 `-check*` self-tests pass; 83/83 scenes
+         parse. Docs: FTSL.md §7.6 and the array-literal sample-call note (which carried the same stale warning).
       4. **N-D *input* domain** (several named driver *axes*, not one `range` scalar).
          **NOT SCHEDULED (user, 2026-07-25)** — items 1/2/3 are all done, so this is the only thing keeping J3b
          open, and it is deliberately left out. It is also the piece most entangled with the axis-labelled-array

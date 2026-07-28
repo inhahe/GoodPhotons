@@ -447,11 +447,12 @@ makes `(u)` / `(u,v)` the natural things to write, and is deliberately *differen
 `grid` element's index-lattice default: an inline literal has no domain of its own, whereas
 a standalone grid is a data container whose sample spacing is the meaningful thing.
 
-Write the call with **no spaces inside the parentheses**, and nothing between it and the
-`]`. (ftrace's tokenizer keeps an unquoted expression as a single token — that is what
-makes `0.5+0.5*sin(2*pi*3*u)` legal as a coordinate in the first place — so a space would
-split the call in two.) A space *before* the `(` is fine; the array itself may be laid out
-over several lines.
+The call **may contain spaces** — `[0 1](0.5*u + 0.5*v)`, `[[0 1][1 0]](u, v)` — because
+the tokenizer treats a *balanced paren group* as part of one token: a space only ends a
+value while no parens are open. (Keeping an unquoted expression a single token is what
+makes `0.5+0.5*sin(2*pi*3*u)` legal as a coordinate in the first place; the balanced rule
+is what lets you put a space in one without splitting the call in two.) A space *before*
+the `(` is fine as well, and the array itself may be laid out over several lines.
 
 The call is **not optional**: an array with no call is *unsaturated* and is rejected at
 load time, because an uncalled array has no value. A ragged array, a non-numeric entry and
@@ -857,11 +858,11 @@ At most one positional argument is allowed, and an argument — positional or th
 feeds the consumer's surface `v` into the material's `u`). `a` is **not** in scope in an
 argument, since the consumer is geometry and has no albedo to offer.
 
-> **Syntax note:** the argument list must be a **single unspaced token** —
-> `gold(u=v,a=1)` or `gold(0.5*u+0.5*v)`, not `gold(0.5*u + 0.5*v)`. A value ends at the
-> first plain bareword, so an unquoted space would truncate the field. A word containing
-> `=` is a value *continuation*, which is why `u=v, a=1` survives. This is the same
-> constraint the `RECORD(driver)` form already has.
+> **Syntax note:** the argument list **may contain spaces** — `gold(a=1, u=v)` and
+> `gold(0.5*u + 0.5*v)` are both fine. A space normally ends a value, but the tokenizer
+> matches a *balanced paren group* as part of the token, so a space is only a delimiter
+> while no parens are open. (The group must close on the same line; an unbalanced `(` is
+> an error, not a silent run-on.) The `RECORD(driver)` form gets the same freedom.
 
 Binding is **substitution**: the argument's compiled program is spliced in place of
 every read of the bound input. Because the programs are postfix, a variable node and a

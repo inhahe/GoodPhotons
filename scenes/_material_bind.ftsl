@@ -13,10 +13,10 @@
 # `a` (albedo) is the one named input with NO per-hit intrinsic, so an unbound `a` is
 # resolved at LOAD time to the material's `albedo_default` (default 1.0).
 #
-# The argument list must be a single UNSPACED token (`gold(u=v,a=1)`, `gold(0.5*u+0.5*v)`):
-# a value ends at the first plain bareword, so a space would truncate the field.  This is
-# the same constraint the shipped `RECORD(driver)` inline form already has.  `u=v,a=1`
-# survives because a word containing `=` is a value *continuation*.
+# The argument list MAY contain spaces (`gold(a=1, u=v)`, `gold(0.5*u + 0.5*v)`): the
+# shared grammar lexes a BALANCED paren group as part of one WORD, so a space only ends a
+# value while no parens are open.  C4 below is deliberately spelled with spaces so this
+# scene regresses that; it must measure identically to the unspaced spelling.
 #
 # --- why FLAT TILES and not spheres ---------------------------------------------------
 # Every test surface is a camera-facing QUAD, because `addQuad` gives a quad UVs that span
@@ -112,8 +112,9 @@ quad { origin 0.04 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material grad_ua(a=0.3,u=
 quad { origin 0.28 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material grad_ua(a=0.3 u=v) }
 # C3 named `a` leaves exactly one free input, so a positional may take `u`
 quad { origin 0.52 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material grad_ua(v,a=1) }
-# C4 partial: `u` bound to an expression, `a` falls back to albedo_default 0.9 -> diagonal
-quad { origin 0.76 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material grad_ua(u=0.5*u+0.5*v) }
+# C4 partial: `u` bound to an expression, `a` falls back to albedo_default 0.9 -> diagonal.
+# Spelled with SPACES on purpose — must measure identically to `grad_ua(u=0.5*u+0.5*v)`.
+quad { origin 0.76 0.10 0.006  u 0.20 0 0  v 0 0.22 0  material grad_ua(u=0.5*u + 0.5*v) }
 
 # --- lighting: two full-width strips aimed at the backdrop ----------------------------
 # Uniform in x (so tiles in a row are comparable) and balanced top/bottom.

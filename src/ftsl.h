@@ -965,15 +965,13 @@ private:
         for (const RecBinding& rb : m.recBindings) patternCollectVars(rb.driver, out);
     }
 
-    // A value ends at the first plain bareword (grammar `cont`), which mirrors ftrace's
-    // tokenizer: an unquoted SPACE inside `NAME( … )` therefore truncates the field at
-    // the space, and the `)` lands in the next statement. That bites the moment an
-    // argument is a spaced expression, so say so rather than just "missing ')'".
+    // An argument list MAY contain spaces (`f(0.5*u + 0.5*v)`, `gold(a=1, u=v)`): the
+    // shared grammar lexes a balanced paren group as part of one WORD, so the value is
+    // no longer truncated at the first space. Reaching a "missing ')'" now means the
+    // parens really are unbalanced — say so plainly.
     static std::string parenHint(const std::string& raw) {
         if (raw.find(')') != std::string::npos) return "";
-        return " — an argument list must be a single unspaced token "
-               "(write `f(0.5*u+0.5*v)`, not `f(0.5*u + 0.5*v)`), because a value "
-               "ends at the first bareword";
+        return " — the parentheses are unbalanced (a group must close on the same line)";
     }
 
     // The fallback value of the named input `a` for material `matIdx` — its authored
