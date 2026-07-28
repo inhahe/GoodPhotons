@@ -784,8 +784,22 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
         };
         for (size_t ti = a; ti < b; ++ti) {
             const PTri& t = tris[ti];
-            VtxCS cs[3] = { toCS(t.p0, t.n0, t.uv0), toCS(t.p1, t.n1, t.uv1),
-                            toCS(t.p2, t.n2, t.uv2) };
+            // Two-sided shading, decided ONCE for the whole triangle. A surface whose
+            // normals point away from the eye (the cornell box's walls are wound outward
+            // and viewed from inside) must be lit as if they faced us; but the test has to
+            // be per-TRIANGLE, not per-pixel. Done per pixel on the interpolated normal it
+            // inverts a 1-px band at every silhouette, because there dot(N,V) grazes
+            // through zero while the surface is still genuinely front-facing.
+            // A triangle counts as back-facing only when ALL THREE vertices agree: a
+            // silhouette triangle straddles the horizon (some vertices front, some back)
+            // and must keep its smooth normals, while geometry truly seen from behind has
+            // every vertex facing away and still flips exactly as it did before.
+            const bool back = dot(t.n0, cam.eye - t.p0) < 0.0 &&
+                              dot(t.n1, cam.eye - t.p1) < 0.0 &&
+                              dot(t.n2, cam.eye - t.p2) < 0.0;
+            VtxCS cs[3] = { toCS(t.p0, back ? -t.n0 : t.n0, t.uv0),
+                            toCS(t.p1, back ? -t.n1 : t.n1, t.uv1),
+                            toCS(t.p2, back ? -t.n2 : t.n2, t.uv2) };
             if (rect) {
                 VtxCS poly[8]; int np = 0;
                 auto emit = [&](const VtxCS& a2){ if (np < 8) poly[np++] = a2; };
@@ -918,9 +932,12 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                     ? tx.sampleRgbTriplanar(g.wpos[i], g.wn[i], (double)g.tpScale[i])
                     : tx.sampleRgb(g.uv[i].x, g.uv[i].y);
             }
+            // No two-sided flip here: it is decided ONCE PER TRIANGLE at projection time
+            // (see projectRange). Testing the smoothly-interpolated normal per pixel used
+            // to invert it in a 1-px band at every silhouette, where dot(N,V) legitimately
+            // grazes through zero — that produced dark speckles on the sphere's rim.
             Vec3 N3 = normalize(g.wn[i]);
             Vec3 V = normalize(cam.eye - g.wpos[i]);     // toward camera
-            if (dot(N3, V) < 0.0) N3 = -N3;              // two-sided
             double lit = 0.0;
             for (const auto& lp : light.lights) {
                 Vec3 d = lp.pos - g.wpos[i];

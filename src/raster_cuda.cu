@@ -198,6 +198,13 @@ struct DAttr {
 constexpr int kSlotValid   = 1;   // bit0: slot holds a projected sub-triangle
 constexpr int kSlotClear   = 2;   // bit1: see-through transmissive surface
 constexpr int kSlotClipped = 4;   // bit2: verts were lerped by the near clip -> attrs in DAttr
+// bit3: the whole source triangle faces away from the eye, so its shading normals must be
+// negated ("two-sided"). Decided ONCE per triangle in kProject and carried here rather than
+// re-tested per pixel: the per-pixel test on the interpolated normal inverts a 1-px band at
+// every silhouette, where dot(N,V) grazes through zero on a genuinely front-facing surface.
+// Kept as a flag (not baked into the stored normals) because an unclipped slot has no DAttr
+// record at all — kShade reads its attributes bit-verbatim from the source DPTri.
+constexpr int kSlotBack    = 8;
 
 // A camera-space vertex carrying the interpolated attributes (mirrors raster::VtxCS).
 struct DVtxCS { float x, y, z; float3 wpos, wn; float2 uv; };
@@ -381,7 +388,7 @@ __device__ inline DVtxCS clipNear(const DVtxCS& A, const DVtxCS& B, float zn) {
 // bit-verbatim copy of tris[idx >> 1]'s fields and the shade/clear passes read the
 // source triangle directly.
 __device__ inline void emitSlot(DGeo* geos, DAttr* attrs, int* flags, int idx,
-                                const DPTri& t, int W, int H, bool clipped,
+                                const DPTri& t, int W, int H, bool clipped, bool back,
                                 const PV& A, const PV& B, const PV& C) {
     float minx = floorf(fminf(A.sx, fminf(B.sx, C.sx)));
     float maxx = ceilf (fmaxf(A.sx, fmaxf(B.sx, C.sx)));
@@ -406,7 +413,8 @@ __device__ inline void emitSlot(DGeo* geos, DAttr* attrs, int* flags, int idx,
         a.emissive = t.emissive;
         attrs[idx] = a;
     }
-    flags[idx] = kSlotValid | (t.clear ? kSlotClear : 0) | (clipped ? kSlotClipped : 0);
+    flags[idx] = kSlotValid | (t.clear ? kSlotClear : 0) | (clipped ? kSlotClipped : 0)
+               | (back ? kSlotBack : 0);
 }
 
 __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
@@ -417,6 +425,14 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
     // Invalidate both output slots up front (dense, coalesced — adjacent threads write
     // adjacent flag pairs).
     flags[2*i] = 0; flags[2*i+1] = 0;
+
+    // Two-sided decision for the whole triangle (mirrors raster.h projectRange). A triangle
+    // counts as back-facing only when ALL THREE vertices face away: a silhouette triangle
+    // straddles the horizon and must keep its smooth normals, while geometry genuinely seen
+    // from behind (outward-wound walls viewed from inside the box) has every vertex agreeing.
+    const bool back = dot3(t.n0, cam.eye - t.p0) < 0.0f &&
+                      dot3(t.n1, cam.eye - t.p1) < 0.0f &&
+                      dot3(t.n2, cam.eye - t.p2) < 0.0f;
 
     // World -> camera space.
     DVtxCS c0 = toCS(cam, t.p0, t.n0, t.uv0);
@@ -436,7 +452,7 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
         PV A = projectPV(cam, c0, W, H);
         PV B = projectPV(cam, c1, W, H);
         PV C = projectPV(cam, c2, W, H);
-        emitSlot(geos, attrs, flags, 2*i, t, W, H, /*clipped=*/false, A, B, C);
+        emitSlot(geos, attrs, flags, 2*i, t, W, H, /*clipped=*/false, back, A, B, C);
         return;
     }
 
@@ -465,10 +481,10 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
     PV A = projectPV(cam, q0, W, H);
     PV B = projectPV(cam, q1, W, H);
     PV C = projectPV(cam, q2, W, H);
-    emitSlot(geos, attrs, flags, 2*i + 0, t, W, H, clipped, A, B, C);
+    emitSlot(geos, attrs, flags, 2*i + 0, t, W, H, clipped, back, A, B, C);
     if (np == 4) {
         PV D = projectPV(cam, q3, W, H);
-        emitSlot(geos, attrs, flags, 2*i + 1, t, W, H, clipped, A, C, D);
+        emitSlot(geos, attrs, flags, 2*i + 1, t, W, H, clipped, back, A, C, D);
     }
 }
 
@@ -660,6 +676,9 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         wp2 = s.p2; wn2 = s.n2; uv2 = s.uv2;
         color = s.color; tex = s.tex; tps = s.triplanarScale; emissive = s.emissive;
     }
+    if (flags[slot] & kSlotBack) {           // two-sided: the whole triangle faces away
+        wn0 = wn0 * -1.0f; wn1 = wn1 * -1.0f; wn2 = wn2 * -1.0f;
+    }
     emis[i] = emissive ? 1 : 0;
     if (emissive) { accum[i] = color * emisBoost; return; }   // raw emitter radiance
 
@@ -681,9 +700,11 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         }
     }
 
+    // No two-sided flip here: decided once per triangle in kProject, exactly as the CPU
+    // rasterizer does (see raster.h projectRange). Flipping the interpolated normal per
+    // pixel inverted a 1-px band at every silhouette, where dot(N,V) grazes through zero.
     float3 N3 = normalize3(wn);
     float3 V  = normalize3(cam.eye - wpos);
-    if (dot3(N3, V) < 0.0f) N3 = N3 * -1.0f;             // two-sided
     float lit = 0.0f;
     for (int li = 0; li < nLights; ++li) {
         const DLight& lp = lights[li];

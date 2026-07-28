@@ -156,7 +156,7 @@ project rule is the proper fix.
 sides is what would make it one — and it *will* change output bytes, so any golden images
 need regenerating in the same commit.
 
-### BUG — open: a dark fringe of speckles on the tessellated sphere's silhouette (both backends, identically)
+### BUG — DONE (2026-07-28, v0.98.1): a dark fringe of speckles on the tessellated sphere's silhouette (both backends, identically)
 
 **Symptom.** Isolated very dark pixels sit on the sphere's silhouette in the `-raster`
 preview, e.g. at `(354,287)`, `(445,287)`, `(344,294)`, `(455,294)`, `(327,312)`,
@@ -174,11 +174,38 @@ normal is nearly perpendicular to the view and `N·L` collapses.
 It is **not** a zero-copy/interop regression: the download path and the surface path are
 bit-identical here, and the artifact predates v0.98.0.
 
-**Next step.** Dump the resolved slot id and the interpolated normal at one of those pixels
-and compare against its neighbours — if the normal is fine but `N·L` is simply grazing, the
-fix is in the preview's shading model (clamp/ambient at grazing angles); if the normal
-belongs to a different facet than its neighbours, it's the tessellator's shared-vertex
-normal averaging at the sphere's ring boundaries.
+**Cause (found by probing the winning fragment).** The interpolated normal was *correct*.
+The winning facet at `(327,312)` has vertex normals `(-0.747,0.643,0.170)`,
+`(-0.866,0.500,0.000)`, `(-0.766,0.643,0.000)` and barycentrics `(0.073,0.436,0.491)`,
+giving an interpolated normal of `(-0.808,0.581,0.012)` — outward, as it should be. What
+inverted it was the **two-sided flip**, `if (dot(N3,V) < 0) N3 = -N3;`, applied *per pixel*
+to the smoothly-interpolated normal. At a silhouette `dot(N,V)` legitimately grazes through
+zero (here `-0.0497`) while the surface is still genuinely front-facing, so the flip fired
+and produced `N = (0.812,-0.584,-0.013)`, for which `N·L <= 0` at every light. `lit`
+collapsed to exactly 0 and only ambient survived (`k` 0.277 → 0.103) — a 1-px dark band
+along every silhouette, showing as speckles wherever the band is isolated in both axes.
+
+**Fix.** The two-sided decision is now made **once per triangle**, at projection time
+(`projectRange` in raster.h, `kProject` in raster_cuda.cu), and the per-pixel flip is gone.
+A triangle counts as back-facing only when **all three vertices** face away: a silhouette
+triangle straddles the horizon (here `+0.11 / -0.068 / -0.058`) and keeps its smooth
+normals, while geometry genuinely seen from behind — the cornell box's walls are wound
+outward and viewed from inside, so they *rely* on the flip — has every vertex agreeing and
+still flips exactly as before. Being per-triangle it is also constant across each facet, so
+it cannot reintroduce an intra-triangle discontinuity.
+
+Note what does *not* work, since both look plausible: the screen-space area sign is
+useless here (the back wall's winner is `+9.3e4` and the sphere's rim winner `+7.0` — the
+same sign, yet they need opposite treatment, because this scene's wall winding disagrees
+with its vertex normals), and the *geometric* facet normal grazes at the rim just as the
+shading normal does. The vertex normals are the only reliable signal, and unanimity is
+what makes them decisive.
+
+**Verified:** isolated dark pixels on cornell 800×600 go 8 → **0** on the GPU and the 8
+shared ones vanish on the CPU (its remaining 22 are the separate fill-rule crack above).
+On the CUDA side the decision rides in a new `kSlotBack` flag bit rather than being baked
+into stored normals, because an unclipped slot has no `DAttr` record — `kShade` reads its
+attributes bit-verbatim from the source `DPTri`.
 
 ### BUG — DONE (2026-07-28, v0.95.0): `python -m loom.anim` served an *empty* slot list — a module that is both `__main__` and importable is two different classes
 
