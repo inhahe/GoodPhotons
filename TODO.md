@@ -1159,7 +1159,7 @@ pattern inputs when a pattern is bound in a *texture* slot, (2) a `texture "name
 of a bitmap, (3) loom `FuncSkin`/`skin(expr=…)` emit, (4) tests + a render. Low risk, high reuse. Open
 sub-q: also expose bump/normal-from-UV-gradient for free (the derivative is analytic on the bytecode).
 
-### E2 — General N-D curve → scene-variable animation via the rasterizer curve editor  *(loom + ftrace; LARGE, design; extends §A)*
+### E2 — General N-D curve → scene-variable animation via the rasterizer curve editor  ✅ DONE 2026-07-28 (all 3 slices)  *(loom + ftrace; LARGE, design; extends §A)*
 **Idea.** Generalize ftrace's existing interactive **camera_curve editor** (drop control points,
 scrub/play, paint local speed, edit-in-place, save a real `camera_curve` block — `main.cpp` ~4473+)
 from "edit a camera flyby" into "edit an **N-D curve through a grid/scatterplot** whose curve variables
@@ -1318,11 +1318,33 @@ Verified end-to-end by driving the real GDI panel buttons (`scraps/click_button.
 loom-written 5-channel drive with 3 bindings seeds, `+Pt`/`Ins`/`Del`/`Save` reshape it, and loom re-loads
 the ftrace-written file with the extra channels interpolated exactly as designed and every binding intact.
 
-**Remaining E2 slice:** (3b) the **live** channel — spawn `python -m loom.anim <scene.py> --config
-<sidecar>` from the editor and push a `frame` message per scrub position (one-slot latest-wins worker, the
-`LoomLink`/`LoomBridge` pattern in `src/viewer_gui.cpp`), reloading the returned `.ftsl`; plus panel UI for
-editing the channel→variable bindings from the `slots` pick-list. Both are interactive UI whose feel is
-best validated with the user present.
+**SLICE 3b DONE 2026-07-28 (`-anim` + `-loom`, v0.95.0) — E2 IS NOW CLOSED END TO END.** The live
+editor↔loom value channel plus the binding-editing panel row. Pieces:
+- **`-anim <sidecar.json> -loom <scene.py>`** — the editor spawns
+  `python -X utf8 -u -m loom.anim <scene.py> --config <sidecar>` and drives a `LiveSession` over
+  newline-delimited JSON. **ftrace does not sample the curve; loom does** — the editor pushes the control
+  *points* and then asks by parameter `t`, so what the viewport shows cannot drift from what loom will
+  render for the video. Each ack names an emitted `.ftsl`, which replaces the scene wholesale (every bit of
+  derived state — `plight`, `prims`, the GPU's baked triangles, the resident RGB-backward session — is
+  dropped and rebuilt, because all of it is a function of the scene).
+- **Two-queue bridge policy.** `frame` messages are **latest-wins on one slot** (scrubbing fast must not
+  build a backlog of stale poses), while `points`/`bindings`/`dims` go on a **FIFO that never drops** and
+  is drained before every frame — losing a control message would leave loom rendering against a curve or a
+  binding set the editor no longer has.
+- **The bind row** (a fourth panel row, built on demand once the live channel is up): a channel combo, a
+  slot combo seeded from the `slots` command (pick-only, `(none)` first, so "this channel drives nothing"
+  is expressible without reaching for Unbind), **Bind** / **Unbind**, a `chans:` grow/shrink box, and a
+  status readout that answers "what does this channel do right now?" — `ch 0 → ball_r | live — 4 baked,
+  2 ms`. Growing `dims` widens every point; shrinking it drops the bindings on the vanished channels,
+  mirroring what loom itself does rather than leaving the sidecar holding an association loom has already
+  forgotten. Save writes the edited dims *and* bindings back.
+
+Verified end-to-end through the real GDI controls (`scraps/bindtest.ps1` → `CB_SETCURSEL` +
+`CBN_SELCHANGE`, `BM_CLICK`, `WM_SETTEXT`), with a deliberately **static camera** drive
+(`scraps/anim_static.json`: three identical eye points, channel 3 = 0.20/0.95/0.20 → `ball_r`) so that any
+change in the image is provably the *driven variable* and not camera motion — the middle ball breathes
+while the two static posts hold still. Bind/Unbind flip it live; `chans:` 4→7→5→3 reshapes the drive and
+Save round-trips the result.
 
 ### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; **DONE 2026-07-18**)*
 **Idea / decision.** loom should be able to *generate audio files* procedurally. Two candidate output

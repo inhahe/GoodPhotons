@@ -819,10 +819,22 @@ tools/loom/
   3.. carried per point — and Save writes the reshaped curve back, preserving name/mode/dims and every
   binding. The C++ reader re-checks the same invariants `CurveDrive.__init__` does, so neither side can hand
   the other a config it would reject.
-  Tests: `tests/test_anim.py` (19) + `tests/test_anim_live.py` (33).
-  Remaining slice: (3b) the editor's **live** channel (spawn `python -m loom.anim`, push a `frame` per scrub
-  position, reload the returned `.ftsl`) + a panel for editing bindings from the `slots` pick-list — the
-  interactive C++ part, best done with the user present.
+  **Slice 3b** (2026-07-28, ftrace v0.95.0) closes E2: the editor's **live** channel and the binding panel.
+  `ftrace -anim <sidecar> -loom <scene.py>` spawns this module's `-m` entry point and pushes a `frame` per
+  scrub position. The load-bearing decision is that **loom samples the curve, not ftrace**: the editor sends
+  the control *points* (`points` / `dims`) and then asks by parameter `t`, so the editor's preview and the
+  video loom finally renders are one computation rather than two that can drift. The C++ bridge is
+  deliberately two queues — frames latest-wins on one slot (fast scrubbing must collapse), control messages
+  on a FIFO that never drops and is drained first (a lost `bindings` would leave loom rendering against a
+  binding set the editor no longer has). The panel row edits bindings straight from the `slots` pick-list and
+  drives `dims` grow/shrink, and Save writes both back through the same sidecar round-trip as 3a.
+  Tests: `tests/test_anim.py` (19) + `tests/test_anim_live.py` (34).
+  **The `-m` identity trap (fixed + pinned in 3b).** A module that is both a `python -m` entry point *and*
+  an importable API is executed **twice** — once as `__main__`, once as `loom.anim` — producing two distinct
+  copies of every class. `isinstance` across that boundary fails silently, and the observable was `0 bindable
+  scene variable(s)` on a scene that clearly has one. In-process tests are structurally incapable of catching
+  it (they only ever have one module identity), so `test_anim_live.py` and `test_viewer.py` each now spawn a
+  **real subprocess** and assert on the emitted artifact, not just on the ack.
 - **F1 (native viewer — the loom↔viewer data contract).** ✅ done (`loom/viewer.py`). The §F native viewer is
   a C++ process; loom is Python, so (per the locked architecture) loom exposes a scene via a **`build()`
   load contract** and a **JSON introspection sidecar**, not in-process sharing. `build(clock=None, **params)

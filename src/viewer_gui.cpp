@@ -29,6 +29,7 @@ int runViewerGui(const std::string&, const std::string&) {
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 #include "third_party/json.h"      // minijson: the vendored JSON parser
+#include "loomlink.h"              // the shared `python -m loom.<server>` child link
 #include <map>
 #include <unordered_map>
 #include <functional>
@@ -140,14 +141,7 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 // --------------------------------------------------------------------------
 namespace {
 
-std::wstring utf8ToWide(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return std::wstring(s.begin(), s.end());
-    std::wstring w(n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
-    return w;
-}
+using loomlink::utf8ToWide;   // shared with the child-process link (loomlink.h)
 
 // Render a JSON scalar (string OR number) as a display string. loom emits dataset
 // ids as integer node ids, so a plain asString() would fall back to the default.
@@ -2066,199 +2060,11 @@ static bool drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
 // already has, and folds a result in on whatever frame it lands.
 // --------------------------------------------------------------------------
 
-// minijson parses but does not serialise, and the request lines are small fixed
-// shapes, so build them by hand over this escape.
-static std::string jsonEsc(const std::string& s) {
-    std::string o;
-    o.reserve(s.size() + 8);
-    for (unsigned char c : s) {
-        switch (c) {
-        case '"':  o += "\\\""; break;
-        case '\\': o += "\\\\"; break;
-        case '\n': o += "\\n";  break;
-        case '\r': o += "\\r";  break;
-        case '\t': o += "\\t";  break;
-        default:
-            if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); o += b; }
-            else o += (char)c;
-        }
-    }
-    return o;
-}
-
-// The child's environment: ours, with `<exeDir>\tools\loom` prepended to PYTHONPATH.
-// loom's package root sits there in a working copy; an installed loom is found the
-// normal way and the extra entry is inert. Entries are kept in order (the `=X:=…`
-// drive-cwd pseudo-variables must stay first), any inherited PYTHONPATH is folded
-// into ours rather than dropped.
-static std::wstring childEnvBlock(const std::wstring& extraPyPath) {
-    std::wstring out, oldPP;
-    if (LPWCH env = GetEnvironmentStringsW()) {
-        for (LPWCH p = env; *p; ) {
-            std::wstring entry(p);
-            p += entry.size() + 1;
-            std::wstring head = entry.substr(0, 11);
-            for (auto& c : head) c = (wchar_t)towupper(c);
-            if (head == L"PYTHONPATH=") { oldPP = entry.substr(11); continue; }
-            out += entry;
-            out.push_back(L'\0');
-        }
-        FreeEnvironmentStringsW(env);
-    }
-    std::wstring pp = L"PYTHONPATH=" + extraPyPath;
-    if (!oldPP.empty()) pp += L";" + oldPP;
-    out += pp;
-    out.push_back(L'\0');
-    out.push_back(L'\0');
-    return out;
-}
-
-// Directory holding this executable (where `tools\loom` lives in a working copy).
-static std::wstring exeDirW() {
-    wchar_t buf[MAX_PATH * 2];
-    DWORD n = GetModuleFileNameW(nullptr, buf, (DWORD)(sizeof buf / sizeof buf[0]));
-    if (n == 0) return std::wstring();
-    std::wstring p(buf, n);
-    size_t cut = p.find_last_of(L"\\/");
-    return cut == std::wstring::npos ? std::wstring() : p.substr(0, cut);
-}
-
-struct LoomLink {
-    HANDLE proc = nullptr;
-    HANDLE wr   = nullptr;      // -> child stdin
-    HANDLE rd   = nullptr;      // <- child stdout
-    std::string rx;             // bytes read past the last complete line
-    std::string cmdline;        // shown in the panel's status row
-
-    bool alive() const { return proc != nullptr; }
-
-    bool start(const std::string& scenePy, std::string& err) {
-        SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
-        HANDLE inRd = nullptr, inWr = nullptr, outRd = nullptr, outWr = nullptr;
-        if (!CreatePipe(&inRd, &inWr, &sa, 0)) { err = "CreatePipe(stdin) failed"; return false; }
-        if (!CreatePipe(&outRd, &outWr, &sa, 0)) {
-            CloseHandle(inRd); CloseHandle(inWr);
-            err = "CreatePipe(stdout) failed"; return false;
-        }
-        // Our ends must NOT be inherited: if the child held the write end of its own
-        // stdout, our read would never see EOF when the child dies and a crashed loom
-        // would hang the worker thread forever instead of reporting.
-        SetHandleInformation(inWr,  HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(outRd, HANDLE_FLAG_INHERIT, 0);
-
-        // -u: unbuffered, so a traceback on the way down is not swallowed (serve_viewer
-        // flushes its own acks). -X utf8: the sidecar and any scene text are UTF-8.
-        cmdline = "python -X utf8 -u -m loom.viewer \"" + scenePy + "\"";
-        std::wstring wcmd = utf8ToWide(cmdline);
-        std::vector<wchar_t> mutcmd(wcmd.begin(), wcmd.end());
-        mutcmd.push_back(L'\0');                 // CreateProcessW may write to it
-
-        std::wstring loomPath = exeDirW();
-        if (!loomPath.empty()) loomPath += L"\\tools\\loom";
-        std::wstring env = childEnvBlock(loomPath);
-
-        STARTUPINFOW si{};
-        si.cb = sizeof si;
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput  = inRd;
-        si.hStdOutput = outWr;
-        // loom's stderr rides our console so a scene-file traceback is readable; if we
-        // have no console the child simply gets none.
-        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-        if (si.hStdError && si.hStdError != INVALID_HANDLE_VALUE)
-            SetHandleInformation(si.hStdError, HANDLE_FLAG_INHERIT, TRUE);
-        else
-            si.hStdError = outWr;   // never leave it unset — the child would inherit ours
-
-        PROCESS_INFORMATION pi{};
-        BOOL ok = CreateProcessW(nullptr, mutcmd.data(), nullptr, nullptr, TRUE,
-                                 CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                                 (LPVOID)env.data(), nullptr, &si, &pi);
-        CloseHandle(inRd);
-        CloseHandle(outWr);
-        if (!ok) {
-            CloseHandle(inWr); CloseHandle(outRd);
-            char b[64]; std::snprintf(b, sizeof b, " (error %lu)", GetLastError());
-            err = "cannot start `" + cmdline + "`" + b + " - is python on PATH?";
-            return false;
-        }
-        CloseHandle(pi.hThread);
-        proc = pi.hProcess;
-        wr = inWr;
-        rd = outRd;
-        return true;
-    }
-
-    void stop() {
-        if (wr) {
-            // A clean `quit` lets loom exit on its own; closing stdin is the backstop
-            // (serve_viewer's loop ends at EOF).
-            const char* bye = "{\"cmd\":\"quit\"}\n";
-            DWORD done = 0;
-            WriteFile(wr, bye, (DWORD)std::strlen(bye), &done, nullptr);
-            CloseHandle(wr); wr = nullptr;
-        }
-        if (proc) {
-            if (WaitForSingleObject(proc, 3000) != WAIT_OBJECT_0)
-                TerminateProcess(proc, 1);      // wedged in user code — don't leak it
-            CloseHandle(proc); proc = nullptr;
-        }
-        if (rd) { CloseHandle(rd); rd = nullptr; }
-        rx.clear();
-    }
-
-    bool readLine(std::string& line, std::string& err) {
-        for (;;) {
-            size_t nl = rx.find('\n');
-            if (nl != std::string::npos) {
-                line = rx.substr(0, nl);
-                rx.erase(0, nl + 1);
-                return true;
-            }
-            char buf[8192];
-            DWORD got = 0;
-            if (!ReadFile(rd, buf, (DWORD)sizeof buf, &got, nullptr) || got == 0) {
-                err = "loom link: the python process closed its output"
-                      " (see its traceback on stderr)";
-                return false;
-            }
-            rx.append(buf, got);
-        }
-    }
-
-    // One request/ack round trip. A transport failure tears the link down (there is
-    // no resynchronising a half-written pipe); a protocol-level `ok:false` leaves it
-    // up, since loom reports scene errors that way and stays serving.
-    bool call(const std::string& line, minijson::Value& ack, std::string& err) {
-        if (!alive()) { err = "loom link is not running"; return false; }
-        std::string msg = line;
-        msg.push_back('\n');
-        for (size_t off = 0; off < msg.size(); ) {
-            DWORD done = 0;
-            if (!WriteFile(wr, msg.data() + off, (DWORD)(msg.size() - off), &done, nullptr)
-                || done == 0) {
-                err = "loom link: write failed (the python process exited?)";
-                stop();
-                return false;
-            }
-            off += done;
-        }
-        std::string reply;
-        if (!readLine(reply, err)) { stop(); return false; }
-        std::string perr;
-        if (!minijson::parse(reply, ack, perr)) {
-            err = "loom link: unparsable ack (" + perr + ")";
-            return false;
-        }
-        const minijson::Value* okv = ack.find("ok");
-        if (!okv || !okv->asBool(false)) {
-            const minijson::Value* e = ack.find("error");
-            err = "loom: " + (e && e->isString() ? e->str : std::string("request failed"));
-            return false;
-        }
-        return true;
-    }
-};
+// The transport itself (the pipes, the PYTHONPATH-augmented child environment, one
+// JSON round trip per call) is shared with the fly editor's E2 live channel and now
+// lives in loomlink.h; what stays here is only the viewer's own job policy.
+using loomlink::jsonEsc;
+using LoomLink = loomlink::Link;
 
 // One re-derivation request. `params` values are raw JSON text so any declared type
 // round-trips unchanged (an int stays `8`, not `8.0` — see loom's `types` ack).
@@ -2292,7 +2098,7 @@ struct LoomBridge {
 
     // ---- UI thread ----
     bool start(const std::string& scenePy, std::string& err) {
-        if (!link_.start(scenePy, err)) return false;
+        if (!link_.start("loom.viewer", scenePy, {}, err)) return false;
         // Ask for the controls synchronously, before the worker owns the link.
         minijson::Value ack;
         if (!link_.call("{\"cmd\":\"params\"}", ack, err)) { link_.stop(); return false; }

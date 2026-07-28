@@ -740,7 +740,37 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `renderForwardSharedCuda` survives as a one-shot wrapper over the session.
   `raster_cuda.cu` = GPU raster (own section below).
 - **`livewindow.*`** — Win32 GDI live preview (`-window`/`-keepwindow`), interactive
-  fly viewer input, camera-path timeline panel.
+  fly viewer input, camera-path timeline panel. With `-anim … -loom` it grows a fourth
+  panel row, the **loom bind row** (channel combo → slot combo → Bind/Unbind, a `chans:`
+  count box, a status readout). Child HWNDs may only be created and moved on the window's
+  own message-pump thread, so the row is built by marshalling `WM_MKBINDROW` (`WM_APP+3`)
+  with `SendMessageW`; `hasBindRow` publishes its validity to the render thread, and — the
+  subtle part — it must be stored *before* the first `layoutPanel`, since `layoutPanel`
+  skips the row unless it is set. Programmatic control changes (`CB_SETCURSEL`,
+  `SetWindowTextW`) raise **no** notification, so any value the code sets is also cached
+  by hand; only genuine user action produces the `CBN_SELCHANGE` / `EN_CHANGE` the
+  `WM_COMMAND` handler turns into `NavInput` edges.
+- **`curvedrive.h`** — header-only reader/writer for loom's `CurveDrive` JSON sidecar
+  (`-anim <file.json>`), on `src/third_party/json.h`. It re-checks **the same invariants
+  `CurveDrive.__init__` does** (`dims >= 1`, ≥ 2 points, every point exactly `dims` wide,
+  every binding channel in range, valid `mode`/`kind`) on both load *and* save, so ftrace
+  can neither accept nor write a sidecar loom would reject. Saves atomically (temp file +
+  `std::filesystem::rename`) with shortest-round-tripping numbers, so editing one point
+  leaves every other coordinate byte-identical.
+- **`loomlink.h` / `animlive.h`** — the two live loom channels. `loomlink.h` is the shared
+  child-process transport (spawn `python -X utf8 -u -m loom.<module>`, newline-delimited
+  JSON over stdio, `PYTHONPATH` → `<exeDir>\tools\loom`, plus JSON escaping helpers);
+  `animlive.h` is the `-anim … -loom <scene.py>` session on top of it. **ftrace never
+  samples the drive** — it pushes the control *points* and asks by parameter `t`, so the
+  editor's preview and loom's final render are the same computation rather than two that
+  can drift. The bridge is deliberately **two queues**: `frame` messages are latest-wins on
+  a single slot (fast scrubbing must collapse, not backlog), while `points` / `bindings` /
+  `dims` ride a FIFO that never drops and is drained before every frame — a lost control
+  message would leave loom rendering against a curve the editor no longer has. Each ack
+  names an emitted `.ftsl` that replaces the scene **wholesale**, because everything
+  downstream (`plight`, `prims`, the GPU's baked triangles, the resident RGB-backward
+  session) is derived state and a partial swap would leave halves disagreeing. Name-keyed
+  incremental re-tessellation is a possible later optimization, to be *measured* first.
 - **`viewer_gui.*`** — the **native loom viewer** (`-viewer <sidecar.json>`), a Dear
   ImGui / Direct3D 11 window that short-circuits the renderer in `main`. It reads loom's
   scene-introspection sidecar (`loom.viewer.ViewerModel.save_sidecar`) into flat geometry
@@ -750,10 +780,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   companion `.ftsl` with ftrace's own `ftsl::load` and calling `renderIsoPreviewCuda`, and
   the **Meshes** pane bakes procedural skins through ftrace's own pattern VM — so the
   preview and the renderer share one implementation rather than two that can drift.
-  **Live re-derivation (§F4 item 2, `-loom <scene.py>`)** adds `LoomLink` (a child
+  **Live re-derivation (§F4 item 2, `-loom <scene.py>`)** uses `LoomLink` (a child
   `python -m loom.viewer` speaking newline-delimited JSON over stdio; `PYTHONPATH` is set
   to `<exeDir>\tools\loom`, which is why only the repo-root `ftrace.exe` can find loom) and
-  `LoomBridge`, a **one worker thread + one-slot pending job** queue. `post()` overwrites an
+  `LoomBridge`, a **one worker thread + one-slot pending job** queue. Both were lifted out
+  of `viewer_gui.cpp` into `src/loomlink.h` when the fly editor grew its own loom session
+  (§E2 slice 3b) — two live loom channels, one transport, so a protocol or lifetime fix
+  lands in both. `post()` overwrites an
   unstarted job, so a drag that moves a parameter every frame costs one bake of the final
   value — latest-wins, and the UI never blocks. Each bake writes a fresh sidecar + `.ftsl`
   into a per-process `%TEMP%\ftrace_viewer_<pid>` scratch dir; the bridge tracks the

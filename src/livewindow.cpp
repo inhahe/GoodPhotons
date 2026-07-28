@@ -15,6 +15,8 @@ void LiveWindow::setPanelState(int, bool, bool, const char*) {}
 void LiveWindow::setPathCount(int) {}
 void LiveWindow::setEditState(bool, int) {}
 void LiveWindow::setSpeedLabel(double) {}
+void LiveWindow::enableBindRow(const std::vector<std::string>&, int) {}
+void LiveWindow::setBindState(const std::vector<std::string>&, const char*) {}
 
 #else
 // ------------------------------- Win32 GDI window ----------------------------------
@@ -44,6 +46,26 @@ static std::wstring utf8ToWide(const std::string& s) {
     return w;
 }
 
+// The inverse of utf8ToWide: needed to read a name back OUT of a combo box (the loom bind row's
+// slot list), since a scene variable's name is UTF-8 everywhere else in ftrace.
+static std::string wideToUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) {
+        // Unreachable for valid UTF-16, but a bind-row slot name must never come back EMPTY
+        // (that would read as "(none)" and silently unbind the channel), so salvage the ASCII
+        // subset rather than returning nothing. The cast is explicit: this narrowing is the
+        // intent, not an accident.
+        std::string s;
+        s.reserve(w.size());
+        for (wchar_t c : w) s.push_back((c < 0x80) ? (char)c : '?');
+        return s;
+    }
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
 // ---- Control-panel constants ----
 // Child-window command IDs (WM_COMMAND LOWORD) + the trackbar. Kept out of the low
 // range Windows reserves for standard dialog buttons.
@@ -53,12 +75,16 @@ enum {
     // ---- curve-editor row ----
     ID_REC, ID_ADDPT, ID_INSPT, ID_DELPT, ID_SAVE, ID_TOL, ID_RAW,
     // ---- paint-mode controls (speed + orientation painting) ----
-    ID_PAINT, ID_FLAT
+    ID_PAINT, ID_FLAT,
+    // ---- loom bind row (drive channel -> named scene variable) ----
+    ID_BCH, ID_BSLOT, ID_BIND, ID_BCLEAR, ID_BDIMS
 };
-static const int kPanelH = 92;              // reserved control-strip height (px): buttons + timeline + editor rows
+static const int kRowH   = 28;              // one panel row: button height (24) + 4px gap
+static const int kPanelH = 92;              // control-strip height (px) WITHOUT the bind row: buttons + timeline + editor rows
 // Marshal cross-thread panel ops onto the window's own message-pump thread.
 #define WM_MKPANEL      (WM_APP + 1)        // build the control panel (params staged in Impl)
 #define WM_SETPATHCOUNT (WM_APP + 2)        // retune the timeline range/visibility (wParam = new count)
+#define WM_MKBINDROW    (WM_APP + 3)        // build + reveal the loom bind row (params staged in Impl)
 
 struct LiveWindow::Impl {
     std::thread          ui;
@@ -110,6 +136,15 @@ struct LiveWindow::Impl {
          hPtLbl=nullptr, hRaw=nullptr, hTolLbl=nullptr, hTol=nullptr;
     // ---- paint-mode controls (on the timeline row, shown with the path group) ----
     HWND hPaint=nullptr, hFlat=nullptr, hSpdLbl=nullptr;
+    // ---- loom bind row (row 4; built on demand by enableBindRow, absent otherwise) ----
+    HWND hBLbl=nullptr, hBCh=nullptr, hBArrow=nullptr, hBSlot=nullptr, hBind=nullptr,
+         hBClear=nullptr, hBDimsLbl=nullptr, hBDims=nullptr, hBStat=nullptr;
+    std::atomic<bool>    hasBindRow{false};         // bind-row child HWNDs valid (release/acquire)
+    // Channel count the channel combo is currently populated for. Atomic because setChannelCombo
+    // is reached from the UI thread (buildBindRow) AND the render thread (setBindState, when the
+    // drive's channel count changes) — the combo messages themselves marshal, but this bookkeeping
+    // int would otherwise be a plain cross-thread read/write.
+    std::atomic<int>     bindDims{0};
     HFONT panelFont = nullptr;
     // Staged enablePanel() params (set under inMtx before WM_MKPANEL is sent).
     int                  reqPathCount = 0; double reqDefFps = 0.0; std::string reqCollide;
@@ -126,6 +161,16 @@ struct LiveWindow::Impl {
     bool                 rawVal = false;            // "raw" checkbox: keep every sample vs. simplify
     bool                 paintVal = false;          // "Paint" checkbox: speed/orientation painting on (persistent)
     bool                 flatReq = false;           // "Flat" button: reset painted speed (one-shot)
+    // ---- Bind-row outputs (guarded by inMtx) ----
+    bool                 bindReq = false, bclearReq = false;   // Bind / Unbind edges (one-shot)
+    int                  bindDimsVal = 0;           // channel-count box (current value; 0 = absent/unchanged)
+    // Combo selections are CACHED on CBN_SELCHANGE rather than read at drain time: drainNav runs
+    // on the RENDER thread, and CB_GETCURSEL would be a blocking SendMessage into the UI thread
+    // on every single frame just to learn something that changes only when the user clicks.
+    int                  bindChVal = -1;            // channel combo selection (>=0), else -1
+    std::string          bindSlotVal;               // slot combo selection ("" = the "(none)" entry)
+    // Staged enableBindRow() params (set under inMtx before WM_MKBINDROW is sent).
+    std::vector<std::string> reqSlots; int reqDims = 0;
 
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
@@ -135,6 +180,8 @@ struct LiveWindow::Impl {
     void layoutPanel(HWND h);                       // position child controls in the strip (UI thread)
     void applyPathCount(int pc);                    // retune/show/hide the timeline group (UI thread)
     void showPathGroup(bool vis);                   // toggle visibility of the path (timeline) controls
+    void buildBindRow(HWND h);                      // create the loom bind row + grow window (UI thread)
+    void setChannelCombo(int dims);                 // repopulate the channel combo for `dims` (UI thread)
 };
 
 // Stop hover-look steering: called when the cursor leaves the client area or the window loses
@@ -216,6 +263,78 @@ void LiveWindow::Impl::buildPanel(HWND h) {
     InvalidateRect(h, nullptr, TRUE);
 }
 
+// Populate the channel combo with 0..dims-1, preserving the current selection where it still
+// exists (shrinking the drive can delete the selected channel; then fall back to the last one).
+// UI thread only.
+void LiveWindow::Impl::setChannelCombo(int dims) {
+    if (!hBCh || dims <= 0 || dims == bindDims.load()) return;
+    int sel = (int)SendMessageW(hBCh, CB_GETCURSEL, 0, 0);
+    SendMessageW(hBCh, CB_RESETCONTENT, 0, 0);
+    for (int c = 0; c < dims; ++c) {
+        wchar_t b[16]; swprintf(b, 16, L"ch %d", c);
+        SendMessageW(hBCh, CB_ADDSTRING, 0, (LPARAM)b);
+    }
+    // CB_SETCURSEL does NOT raise CBN_SELCHANGE (only a user pick does), so the cached selection
+    // has to be updated by hand — otherwise a shrunk drive would leave `bindChVal` pointing at a
+    // channel that no longer exists and Bind would target it.
+    int keep = std::min(std::max(sel, 0), dims - 1);
+    SendMessageW(hBCh, CB_SETCURSEL, (WPARAM)keep, 0);
+    { std::lock_guard<std::mutex> lk(inMtx); bindChVal = keep; }
+    bindDims.store(dims);
+}
+
+// Build the loom bind row (row 4) and grow the window by one row so the image keeps its size.
+// Runs on the UI thread (via WM_MKBINDROW) and reads the staged reqSlots/reqDims. Sets
+// hasBindRow=true LAST, after every HWND is valid, so setBindState sees a fully-formed row.
+void LiveWindow::Impl::buildBindRow(HWND h) {
+    if (!hasPanel.load() || hasBindRow.load()) return;
+    std::vector<std::string> slots; int dims;
+    { std::lock_guard<std::mutex> lk(inMtx); slots = reqSlots; dims = reqDims; }
+    HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(h, GWLP_HINSTANCE);
+    auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD style, int id) -> HWND {
+        HWND c = CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
+                                 0, 0, 10, 10, h, (HMENU)(INT_PTR)id, hi, nullptr);
+        if (c) SendMessageW(c, WM_SETFONT, (WPARAM)panelFont, TRUE);
+        return c;
+    };
+    hBLbl  = mk(L"STATIC", L"loom:", SS_LEFT | SS_CENTERIMAGE, 0);
+    // The combos are DROPDOWNLIST (pick-only): a channel index and a slot name must both be
+    // things the drive/scene actually has, so free text would only invite typos loom rejects.
+    // Their creation height is the DROPPED height, not the closed one — hence the tall value.
+    hBCh   = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_BCH);
+    hBArrow= mk(L"STATIC", L"\u2192", SS_CENTER | SS_CENTERIMAGE, 0);
+    hBSlot = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, ID_BSLOT);
+    hBind  = mk(L"BUTTON", L"Bind",   BS_PUSHBUTTON, ID_BIND);
+    hBClear= mk(L"BUTTON", L"Unbind", BS_PUSHBUTTON, ID_BCLEAR);
+    hBDimsLbl = mk(L"STATIC", L"chans:", SS_RIGHT | SS_CENTERIMAGE, 0);
+    wchar_t db[16]; swprintf(db, 16, L"%d", dims);
+    hBDims = mk(L"EDIT", db, ES_NUMBER | ES_RIGHT | WS_BORDER, ID_BDIMS);
+    hBStat = mk(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS, 0);
+    // Slot pick-list: "(none)" first, so Bind can also express "this channel drives nothing"
+    // without reaching for Unbind.
+    SendMessageW(hBSlot, CB_ADDSTRING, 0, (LPARAM)L"(none)");
+    for (const std::string& s : slots) {
+        std::wstring w = utf8ToWide(s);
+        SendMessageW(hBSlot, CB_ADDSTRING, 0, (LPARAM)w.c_str());
+    }
+    SendMessageW(hBSlot, CB_SETCURSEL, 0, 0);
+    setChannelCombo(dims);
+    { std::lock_guard<std::mutex> lk(inMtx); bindDimsVal = dims; }
+    // Grow by one row so the image area is unchanged (same contract as buildPanel).
+    panelH += kRowH;
+    // Publish BEFORE laying out: layoutPanel skips row 4 unless hasBindRow is set, so storing it
+    // afterwards (the order buildPanel uses for hasPanel) would leave every bind-row control
+    // parked at its 10x10 creation rect in the window's top-left corner. Safe here for the same
+    // reason it is safe there — every child HWND above is already valid; only the *positions*
+    // are still pending, and nothing outside this thread can observe them before we return.
+    hasBindRow.store(true);
+    RECT wr; GetWindowRect(h, &wr);
+    SetWindowPos(h, nullptr, 0, 0, wr.right - wr.left, (wr.bottom - wr.top) + kRowH,
+                 SWP_NOMOVE | SWP_NOZORDER);
+    layoutPanel(h);
+    InvalidateRect(h, nullptr, TRUE);
+}
+
 // Position the panel children within the bottom strip. Row 1 = buttons + speed inputs + switch;
 // row 2 = the full-width timeline. Called on build and on every WM_SIZE. UI thread only.
 void LiveWindow::Impl::layoutPanel(HWND h) {
@@ -262,6 +381,23 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     place(hTolLbl,34, row3, bh);
     place(hTol,   56, row3, bh);
     place(hSave,  56, row3, bh);
+    // Row 4 (only when the loom live channel exists): channel -> slot binding + a status line.
+    if (hasBindRow.load()) {
+        int row4 = top + 5 + 3 * (bh + 4);
+        x = pad;
+        place(hBLbl,    38, row4, bh);
+        // A combo's height is its DROPPED height; the closed box is one line tall regardless.
+        place(hBCh,     70, row4, bh + 120);
+        place(hBArrow,  16, row4, bh);
+        place(hBSlot,  130, row4, bh + 120);
+        place(hBind,    50, row4, bh);
+        place(hBClear,  62, row4, bh);
+        place(hBDimsLbl,44, row4, bh);
+        place(hBDims,   40, row4, bh);
+        // The status readout takes whatever width is left (it is SS_ENDELLIPSIS, so a long
+        // loom error truncates cleanly instead of overrunning the strip).
+        if (hBStat) MoveWindow(hBStat, x, row4, std::max(40, W - pad - x), bh, TRUE);
+    }
 }
 
 // Show/hide the path (timeline) controls as a group — the timeline only makes sense once a
@@ -362,6 +498,9 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             return 0;
         case WM_SETPATHCOUNT:
             if (self && self->hasPanel.load()) { self->applyPathCount((int)wp); InvalidateRect(h, nullptr, FALSE); }
+            return 0;
+        case WM_MKBINDROW:
+            if (self) self->buildBindRow(h);          // build the loom bind row + grow window (UI thread)
             return 0;
         case WM_SIZE:
             if (self) self->layoutPanel(h);          // reflow the control strip to the new width
@@ -477,6 +616,42 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                         }
                         break;
                     case ID_FLAT:  { std::lock_guard<std::mutex> lk(self->inMtx); self->flatReq = true; } break;
+                    // ---- loom bind row: cache the two combo selections, raise the button edges ----
+                    case ID_BCH:
+                        if (code == CBN_SELCHANGE && self->hBCh) {
+                            int sel = (int)SendMessageW(self->hBCh, CB_GETCURSEL, 0, 0);
+                            std::lock_guard<std::mutex> lk(self->inMtx);
+                            self->bindChVal = (sel == CB_ERR) ? -1 : sel;
+                        }
+                        break;
+                    case ID_BSLOT:
+                        if (code == CBN_SELCHANGE && self->hBSlot) {
+                            int sel = (int)SendMessageW(self->hBSlot, CB_GETCURSEL, 0, 0);
+                            std::string name;                       // index 0 is "(none)"
+                            if (sel != CB_ERR && sel > 0) {
+                                int n = (int)SendMessageW(self->hBSlot, CB_GETLBTEXTLEN, (WPARAM)sel, 0);
+                                if (n > 0) {
+                                    std::wstring w((size_t)n + 1, L'\0');
+                                    SendMessageW(self->hBSlot, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)&w[0]);
+                                    w.resize((size_t)n);
+                                    name = wideToUtf8(w);
+                                }
+                            }
+                            std::lock_guard<std::mutex> lk(self->inMtx);
+                            self->bindSlotVal = name;
+                        }
+                        break;
+                    case ID_BIND:   { std::lock_guard<std::mutex> lk(self->inMtx); self->bindReq   = true; } break;
+                    case ID_BCLEAR: { std::lock_guard<std::mutex> lk(self->inMtx); self->bclearReq = true; } break;
+                    case ID_BDIMS:
+                        if (code == EN_CHANGE && self->hBDims) {
+                            wchar_t b[32]; GetWindowTextW(self->hBDims, b, 32);
+                            int v = _wtoi(b);
+                            // 0 is what an empty box reads as (mid-edit); it means "unchanged",
+                            // never "a drive with no channels".
+                            if (v >= 1) { std::lock_guard<std::mutex> lk(self->inMtx); self->bindDimsVal = v; }
+                        }
+                        break;
                     default: break;
                 }
             }
@@ -695,12 +870,17 @@ NavInput LiveWindow::drainNav() {
     n.simplifyTol = impl_->tolVal;  n.rawRecord = impl_->rawVal;
     // Paint-mode outputs: persistent checkbox state + one-shot Flat edge.
     n.paintMode = impl_->paintVal;  n.speedReset = impl_->flatReq;
+    // Loom bind-row outputs: cached combo selections + one-shot Bind/Unbind edges.
+    n.bindChannel = impl_->bindChVal;  n.bindTarget = impl_->bindSlotVal;
+    n.bindApply   = impl_->bindReq;    n.bindClear  = impl_->bclearReq;
+    n.dimsReq     = impl_->bindDimsVal;
     impl_->wheelAcc = impl_->wheelSpeedAcc = 0.0;
     impl_->resetReq = impl_->printReq = impl_->collideReq = impl_->traceReq = false;
     impl_->pathReq = impl_->playReq = false;
     impl_->scrubReq = -1;
     impl_->recReq = impl_->addReq = impl_->insReq = impl_->delReq = impl_->saveReq = false;
     impl_->flatReq = false;
+    impl_->bindReq = impl_->bclearReq = false;
     return n;
 }
 
@@ -762,6 +942,44 @@ void LiveWindow::setSpeedLabel(double speedX) {
     if (!impl_ || !impl_->hasPanel.load() || !impl_->hSpdLbl) return;
     wchar_t b[32]; swprintf(b, 32, L"%.2fx", speedX);
     SetWindowTextW(impl_->hSpdLbl, b);   // marshals to the UI thread; no feedback edge
+}
+
+void LiveWindow::enableBindRow(const std::vector<std::string>& slotNames, int dims) {
+    HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
+    if (!hw || !impl_->hasPanel.load() || impl_->hasBindRow.load()) return;
+    {
+        std::lock_guard<std::mutex> lk(impl_->inMtx);
+        impl_->reqSlots = slotNames;
+        impl_->reqDims  = std::max(1, dims);
+    }
+    // Build on the window's own thread (synchronous, so the child HWNDs exist on return).
+    SendMessageW(hw, WM_MKBINDROW, 0, 0);
+}
+
+void LiveWindow::setBindState(const std::vector<std::string>& targets, const char* status) {
+    if (!impl_ || !impl_->hasBindRow.load()) return;
+    // Retune the channel list first: a drive that grew/shrank changes what can be selected.
+    // (SendMessage marshals to the UI thread, so touching the combo from here is safe.)
+    int dims = (int)targets.size();
+    if (dims > 0 && dims != impl_->bindDims.load()) {
+        impl_->setChannelCombo(dims);
+        wchar_t db[16]; swprintf(db, 16, L"%d", dims);
+        SetWindowTextW(impl_->hBDims, db);   // EN_CHANGE re-caches the same value: harmless
+    }
+    // The status line carries the CURRENT channel's binding as well as the link health, so the
+    // row answers "what does this channel do right now?" without a second lookup.
+    std::string line;
+    int ch;
+    { std::lock_guard<std::mutex> lk(impl_->inMtx); ch = impl_->bindChVal; }
+    if (ch >= 0 && ch < dims)
+        // NOTE the arrow is written as explicit UTF-8 BYTES, not a \u2192 escape: this is a
+        // NARROW literal that utf8ToWide later decodes, and MSVC would try to transcode the
+        // escape into the cp1252 execution charset (warning C4566) and emit a junk byte.
+        line = "ch " + std::to_string(ch) + (targets[(size_t)ch].empty()
+                   ? " unbound" : " \xE2\x86\x92 " + targets[(size_t)ch]);
+    if (status && *status) line += (line.empty() ? "" : "   |   ") + std::string(status);
+    std::wstring w = utf8ToWide(line);
+    SetWindowTextW(impl_->hBStat, w.c_str());
 }
 
 #endif // _WIN32

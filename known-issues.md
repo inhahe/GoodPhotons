@@ -5,6 +5,46 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — DONE (2026-07-28, v0.95.0): `python -m loom.anim` served an *empty* slot list — a module that is both `__main__` and importable is two different classes
+
+**Symptom.** `ftrace -anim … -loom <scene.py>` came up with `0 bindable scene variable(s)`
+on a scene that plainly declares one, so the bind row had nothing to offer and the live
+channel drove nothing. The same code path exercised **in-process** (the `_run_cli` test
+harness) worked perfectly, which is exactly why the test suite never caught it.
+
+**Cause.** Running `python -m loom.anim` executes the module a second time under the name
+`__main__`, *in addition to* the `loom.anim` that `import loom.anim` binds. Each execution
+creates its own class objects, so the `SceneDriver` (etc.) that `__main__` constructs is
+**not** the `SceneDriver` the imported half's `isinstance` checks test against. Every such
+check silently fails, and the failure mode is a *quiet empty result*, not an exception.
+
+**Fix + regression pin.** Beyond the fix in `loom/anim.py`, the bug is now pinned by tests
+that spawn a **real subprocess** — `test_cli_subprocess_sees_the_scenes_slots_and_drives_them`
+(`tests/test_anim_live.py`) and `test_viewer_m_entry_point_serves_the_same_session`
+(`tests/test_viewer.py`). An in-process harness *cannot* reproduce this class of bug, since
+it only ever has one module identity; only `subprocess.run([sys.executable, "-m", …])` does.
+Both assert on the emitted artifact, not just the ack — the anim one checks the written
+`.ftsl` actually contains `roughness 0.75`, so an ack that lies is still caught. Verified by
+temporarily reverting the fix: the test failed with `assert {} == {'rough': 0.3 ± 3e-07}`.
+
+**Generalisation worth remembering:** any module that is *both* a `-m` entry point and an
+importable API needs at least one subprocess test. Everything else tests the wrong object.
+
+### TOOLING — NOT A BUG (2026-07-28): `SetWindowTextW` on a control in **another process** silently does nothing
+
+Cost roughly an hour of chasing a phantom bug in the bind row's `chans:` box: the box looked
+inert from an external PowerShell driver, while every other control worked. `SetWindowTextW`
+across a process boundary does not reach the control — it updates only the window text USER32
+caches on our side, so the EDIT's own buffer never changes and it never raises `EN_CHANGE`.
+Worse, it reads back *consistently*: the external `GetWindowTextW` returns that same cached
+text, so the harness "confirms" a value the target process cannot see (its in-process
+`GetWindowTextW` sends `WM_GETTEXT` and gets the real, unchanged buffer).
+
+**Use `SendMessageW(hCtl, WM_SETTEXT, 0, L"…")`** — the message a keystroke actually produces;
+it updates the control and raises `EN_CHANGE` by itself, with nothing to synthesize.
+`scraps/bindtest.ps1` carries this note inline so the next harness doesn't repeat it. The
+`chans:` box itself was never broken (`[anim] channels 4 → 7 → 5 → 3` all verified).
+
 ### PERF — OPEN (2026-07-27): scene loading is down 5×, but the graph walk (not the lexer) is what's left
 
 The 0.68 front-end flip made loading measurably slower than the hand-written parser —

@@ -405,6 +405,43 @@ def test_cli_writes_back_to_the_sidecar_it_was_seeded_from(monkeypatch, tmp_path
     assert len(CurveDrive.load(cfg).points) == 3        # the edit round-tripped
 
 
+def test_cli_subprocess_sees_the_scenes_slots_and_drives_them(tmp_path):
+    """`python -m loom.anim` must behave exactly like the in-process CLI.
+
+    Regression test for the dual-module-identity bug: running a module with `-m`
+    executes the file a *second* time under the name `__main__`, so `__main__.Slot`
+    and `loom.anim.Slot` become two distinct classes.  The scene imports the
+    canonical one; `collect_slots`, running out of `__main__`, then matched
+    nothing.  Every binding still acked `ok` (the ack reports the drive's resolved
+    map, not what any slot received) while the emitted `.ftsl` silently carried
+    the slot *default* — a no-op live channel.  Only a real subprocess can
+    reproduce it; the in-process `_run_cli` harness has one module identity.
+    """
+    import subprocess
+    import sys as _sys
+    from loom import anim as _anim
+
+    pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(_anim.__file__)))
+    scene = _scene_file(tmp_path)
+    out = str(tmp_path / "f0000.ftsl")
+    msgs = [{"cmd": "slots"},
+            {"cmd": "frame", "values": [0.0, 0.75], "frame": 0,
+             "frames": 1, "out": out},
+            {"cmd": "quit"}]
+    env = dict(os.environ, PYTHONPATH=pkg_parent, PYTHONIOENCODING="utf-8")
+    proc = subprocess.run([_sys.executable, "-X", "utf8", "-u", "-m", "loom.anim", scene],
+                          input="".join(json.dumps(m) + "\n" for m in msgs),
+                          capture_output=True, text=True, cwd=pkg_parent, env=env,
+                          timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    acks = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+    assert acks[0]["slots"] == {"rough": pytest.approx(0.3)}, \
+        "the -m entry point lost the scene's slots"
+    assert acks[1]["ok"] and acks[1]["targets"]["rough"] == pytest.approx(0.75)
+    # The ack alone is not proof — the emitted scene must carry the DRIVEN value.
+    assert "roughness 0.75" in open(out).read()
+
+
 def test_cli_falls_back_to_a_default_drive(monkeypatch, tmp_path):
     p = tmp_path / "plain.py"
     p.write_text("from loom.scene import Scene, Camera\n"

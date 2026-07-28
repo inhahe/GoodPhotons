@@ -89,28 +89,6 @@ is not to burn expensive photon-map renders on a room/flyby that hasn't been app
 
 Once you say "I like it", D2/D3 unblock.
 
-### E2 slice 3b — the editor's LIVE channel + binding panel  *(ftrace; interactive)*
-*TODO.md §E2.*
-
-Slices 1–2 landed 2026-07-24 (config model + the live-value channel: `collect_slots`,
-`SceneDriver`, `LiveSession`/`serve_live`). **Slice 3a landed 2026-07-28 (v0.94.0)**: `ftrace
--anim <sidecar.json>` makes the fly editor edit loom's N-D *drive* — control points seed from the
-sidecar (channels 0–2 spatial, 3.. carried per point), and Save writes the reshaped curve back
-atomically with every channel→variable binding preserved (`src/curvedrive.h`, +10 loom `anim`
-tests for the Python side: `slots`, `dims`, the `--config` default and the `python -m loom.anim`
-CLI).
-
-What's left is the interactive-feel half:
-- **live values** — spawn `python -m loom.anim <scene.py> --config <sidecar>` from the editor and
-  push a `frame` message per scrub position (one-slot latest-wins worker, the `LoomLink` /
-  `LoomBridge` pattern already in `src/viewer_gui.cpp`), reloading the returned `.ftsl` so the
-  viewport shows the *bound scene variables* moving, not just the camera.
-- **binding panel** — add/remove/retarget channel bindings from a pick-list fed by the `slots`
-  command (no text entry in the GDI panel), plus `dims` grow/shrink.
-
-`TODO.md` flags this as *"best done with the user present"* — it's an interactive UI whose feel
-can't be validated headlessly. Not blocked technically; blocked on being worth doing together.
-
 ### E4 — Vec3 volume grids  *(loom)*
 *TODO.md §E4, "Still open".*
 
@@ -126,6 +104,31 @@ Also listed there as still open: sparse *storage* (sparse-source *reads* already
 ---
 
 ## 3. Open but with no current driver
+
+### ~~E2 slice 3b — the editor's LIVE channel + binding panel~~  **DONE 2026-07-28 (v0.95.0)**
+*TODO.md §E2 — E2 is now closed end to end.*
+
+Slices 1–2 landed 2026-07-24 (config model + the live-value channel: `collect_slots`,
+`SceneDriver`, `LiveSession`/`serve_live`). Slice 3a landed 2026-07-28 (v0.94.0): `ftrace
+-anim <sidecar.json>` makes the fly editor edit loom's N-D *drive*.
+
+Slice 3b closed the interactive half:
+- **live values** — `ftrace -anim <sidecar> -loom <scene.py>` spawns
+  `python -X utf8 -u -m loom.anim <scene.py> --config <sidecar>` and pushes a `frame` message per
+  scrub position (frames latest-wins on one slot; `points`/`bindings`/`dims` on a FIFO that is
+  drained first and never drops). Loom samples the curve — ftrace sends control points and asks by
+  parameter `t` — so the preview cannot drift from the video loom renders. The returned `.ftsl`
+  replaces the scene wholesale, so the viewport shows the *bound scene variables* moving, not just
+  the camera. Verified with a deliberately static camera: identical eye/dir at every scrub point,
+  and the ball still breathes (`ball_r` 0.20 → 0.95 → 0.20).
+- **binding panel** — a fourth panel row: channel combo → slot combo (fed by `slots`, pick-only,
+  `(none)` first), Bind / Unbind, a `chans:` grow/shrink box, and a live status readout
+  (`ch 0 → ball_r | live — 4 baked, 2 ms`). Save writes the edited dims *and* bindings back to the
+  sidecar; shrinking dims drops the bindings on the vanished channels, matching what loom does.
+
+Name-keyed incremental re-tessellation (instead of the wholesale scene swap) is a later,
+*measured* optimization — a cost/continuity question about derived state (`plight`, `prims`, GPU
+baked triangles, the resident RGB session), not a semantics one.
 
 ### ~~J3c second half — `.ftsl` → loom Element tree~~  **DONE 2026-07-28 (v0.93.0)**
 *TODO.md §J3c — now closed, both halves.*

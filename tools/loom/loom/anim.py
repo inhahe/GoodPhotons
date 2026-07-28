@@ -612,4 +612,13 @@ __all__ = [
 
 
 if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    # `python -m loom.anim` runs THIS FILE a second time, under the name `__main__`,
+    # so `__main__.Slot` and `loom.anim.Slot` become two distinct classes. A scene
+    # does `from loom.anim import Slot` and gets the canonical one; `collect_slots`
+    # running out of `__main__` tests `isinstance(n, __main__.Slot)` and matches
+    # nothing. Every binding then acks "ok" while changing precisely nothing — a
+    # silent no-op, which is exactly how it presented (the editor's live preview
+    # never moved). Delegate to the imported module so the code that actually runs
+    # is the canonical one and both halves agree on class identity.
+    from loom.anim import main as _main
+    raise SystemExit(_main())

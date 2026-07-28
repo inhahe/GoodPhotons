@@ -148,6 +148,7 @@
 #include "mesh.h"
 #include "ftsl.h"
 #include "curvedrive.h"         // -anim: loom CurveDrive JSON sidecar (E2 channel a) read/write
+#include "animlive.h"           // -anim -loom: the live editor<->loom value channel (E2 channel b)
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
@@ -5059,6 +5060,7 @@ static int run(int argc, char** argv) {
     bool noMeter     = false;     // -no-meter/-nometer: skip the exposure-lock metering pre-pass (frames auto-expose instead)
     bool viewerNoclip = false;    // -noclip/-nocollide: start the interactive fly-viewer with collision OFF (fly through walls)
     std::string animSidecar;      // -anim <file.json>: loom CurveDrive sidecar the curve editor seeds from / saves back to (E2 channel a)
+    std::string animLoomScene;    // -loom <scene.py>: with -anim, the build file the LIVE channel re-derives from (E2 channel b)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
     bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
     int  rasterBench = 0;         // -raster-bench <n>: render the first camera n times, report steady-state ms/frame (explorer metric)
@@ -5155,6 +5157,18 @@ static int run(int argc, char** argv) {
         }
     }
 
+    // The prefer/else resolver asks this predicate whether a branch renders; when the
+    // policy is fallback/strip we accept every branch (the policy handles it later at
+    // render time), so the FIRST/most-preferred branch always wins. Function-scoped
+    // because the initial load is not the only one: the fly editor's loom live channel
+    // (-anim -loom) re-loads an emitted .ftsl mid-flight and must resolve prefer/else
+    // exactly the way the scene it is replacing did.
+    ftsl::SupportFn supportFn = (g_onUnsupported == OnUnsupported::Error)
+        ? ftsl::SupportFn([cliModePrescan](const ftsl::Loaded& L) -> const char* {
+              return sceneModeUnsupported(L, cliModePrescan);
+          })
+        : ftsl::SupportFn{};
+
     ftsl::Loaded ftslScene;
     bool fromFtsl = false;
     if (positionalMesh) {
@@ -5199,14 +5213,6 @@ static int run(int argc, char** argv) {
         }
     } else if (inFile) {
         std::string ferr;
-        // The prefer/else resolver asks this predicate whether a branch renders; when the
-        // policy is fallback/strip we accept every branch (the policy handles it later at
-        // render time), so the FIRST/most-preferred branch always wins.
-        ftsl::SupportFn supportFn = (g_onUnsupported == OnUnsupported::Error)
-            ? ftsl::SupportFn([cliModePrescan](const ftsl::Loaded& L) -> const char* {
-                  return sceneModeUnsupported(L, cliModePrescan);
-              })
-            : ftsl::SupportFn{};
         if (!ftsl::load(inFile, ftslScene, ferr, supportFn)) {
             std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
             return 1;
@@ -5376,6 +5382,13 @@ static int run(int argc, char** argv) {
             // writes the reshaped curve back to this file. Implies the fly editor.
             animSidecar = argv[++i];
             exploreMode = true; doRaster = true; g_showWindow = true; g_keepWindow = true; noMeter = true;
+        }
+        else if ((!std::strcmp(argv[i], "-loom") || !std::strcmp(argv[i], "--loom")) && i + 1 < argc) {
+            // With -anim, the loom build file to open the E2 **live** channel against:
+            // the editor spawns `python -m loom.anim <scene.py> --config <sidecar>` and
+            // every scrub position becomes a freshly-emitted .ftsl. (With -viewer the
+            // same flag names the F4 re-introspection scene; that pre-scan runs earlier.)
+            animLoomScene = argv[++i];
         }
         else if (!std::strcmp(argv[i], "-no-meter") || !std::strcmp(argv[i], "-nometer")) noMeter = true;
         else if (!std::strcmp(argv[i], "-noclip") || !std::strcmp(argv[i], "-nocollide")) viewerNoclip = true;
@@ -6875,6 +6888,11 @@ static int run(int argc, char** argv) {
             bool animActive = false;                   // -anim given (sidecar loaded or to be created)
             int  animDims   = 0;                       // drive channel count (0 = not driving a sidecar)
             std::vector<std::vector<double>> ptExtra;  // per point, channels 3.. (each animDims-3 long)
+            // Set by every curve mutation (rebuildPath); consumed by the live channel to
+            // resend the points before the next frame. Declared here, with the rest of the
+            // anim state, so rebuildPath() can reach it — the live bridge itself is set up
+            // much further down, just before the interactive loop.
+            bool animPtsDirty = false;
             auto animExtraCount = [&]() -> size_t { return (size_t)std::max(0, animDims - 3); };
             // editPts carries two parallel per-point side tracks (the painted speed
             // multiplier and the anim extra channels). Every add/insert/erase goes through
@@ -6908,6 +6926,7 @@ static int run(int argc, char** argv) {
             auto rebuildPath = [&]() {
                 ptSpeed.resize(editPts.size(), 1.0);   // safety: keep the side tracks sized to the points
                 ptExtra.resize(editPts.size(), std::vector<double>(animExtraCount(), 0.0));
+                animPtsDirty = true;   // the drive curve moved: the live channel must resend it
                 int oldCount = pathCount;
                 explorePath.clear();
                 int n = (int)editPts.size();
@@ -7337,6 +7356,203 @@ static int run(int argc, char** argv) {
                 std::printf("[viewer] path-trace preview ('T') unavailable (scene/camera outside fast-RGB GPU scope)\n");
             std::fflush(stdout);
 #endif
+            // ---- loom LIVE channel (-anim + -loom, E2 "channel b") --------------------
+            // With a loom build file the editor stops being a sidecar editor and becomes a
+            // live one: each scrub position is pushed to a resident `python -m loom.anim`,
+            // which applies the drive's channel->variable bindings and emits that frame's
+            // .ftsl; we load it and preview the actual animated scene.
+            //
+            // LOOM samples the curve — we push our control points and ask by parameter `t`
+            // (see animlive.h). Sampling here instead would risk the preview disagreeing
+            // with the video loom finally renders, which is the whole point of the channel.
+            animlive::Bridge animBridge;
+            bool animLive        = false;   // the live channel is up
+            double animLastT     = -1.0;    // last curve position we asked loom for
+            long long animBaked  = 0;       // frames loom has emitted this session
+            double animLastMs    = 0.0;
+            std::string animLastErr;
+            // Last bind-row state pushed to the panel, so the mirror only fires on a real change.
+            std::string animLastStatus;
+            std::vector<std::string> animLastTargets;
+            int animLastBindCh = -2;        // -2 = "never sent" (-1 is a legitimate "no selection")
+            if (animActive && !animLoomScene.empty()) {
+                std::string lerr;
+                if (animBridge.start(animLoomScene, animSidecar, lerr)) {
+                    animLive = true;
+                    animPtsDirty = true;    // seed loom with the curve we actually loaded
+                    std::printf("[anim] live channel up: %s\n", animBridge.command().c_str());
+                    const auto& sl = animBridge.slots();
+                    std::printf("[anim] %zu bindable scene variable(s)%s", sl.size(),
+                                sl.empty() ? "\n" : ": ");
+                    for (size_t i = 0; i < sl.size() && i < 12; ++i)
+                        std::printf("%s%s", sl[i].first.c_str(),
+                                    (i + 1 < sl.size() && i < 11) ? ", " : "\n");
+                    if (sl.size() > 12) std::printf("[anim]   (+%zu more)\n", sl.size() - 12);
+                    // Reveal the bind row: only now do we know what the scene actually exposes,
+                    // and a pick-list is the only honest way to offer it (a typed name would
+                    // just be a typo loom silently ignores).
+                    if (g_liveWin) {
+                        std::vector<std::string> names;
+                        names.reserve(sl.size());
+                        for (const auto& s : sl) names.push_back(s.first);
+                        g_liveWin->enableBindRow(names, std::max(1, animDims));
+                    }
+                } else {
+                    std::fprintf(stderr, "[anim] live channel unavailable: %s\n", lerr.c_str());
+                    std::fprintf(stderr, "[anim] continuing as a sidecar-only editor "
+                                         "(the curve still saves; the preview stays static)\n");
+                }
+                std::fflush(stdout);
+            } else if (animActive) {
+                std::printf("[anim] no -loom <scene.py>: sidecar-only editor "
+                            "(add -loom to preview the animation live)\n");
+                std::fflush(stdout);
+            }
+            // Push the editor's control points to loom (all channels: eye + the carried
+            // extras). A control message, not a sample — it must never be dropped, or the
+            // next frame would be emitted against a curve that no longer exists.
+            auto animSendPoints = [&]() {
+                if (!animLive) return;
+                int dims = std::max(1, animDims);
+                std::string js = "{\"cmd\":\"points\",\"points\":[";
+                for (size_t i = 0; i < editPts.size(); ++i) {
+                    if (i) js += ",";
+                    js += "[";
+                    const Vec3& e = editPts[i].eye;
+                    for (int c = 0; c < dims; ++c) {
+                        if (c) js += ",";
+                        double v = (c == 0) ? e.x : (c == 1) ? e.y : (c == 2) ? e.z
+                                 : ((i < ptExtra.size() && (size_t)(c - 3) < ptExtra[i].size())
+                                        ? ptExtra[i][(size_t)(c - 3)] : 0.0);
+                        char b[40]; std::snprintf(b, sizeof b, "%.17g", v);
+                        js += b;
+                    }
+                    js += "]";
+                }
+                js += "]}";
+                animBridge.control(js);
+                animPtsDirty = false;
+            };
+            // Push `animDrive.bindings` to loom. Sent WHOLESALE rather than as a delta: the
+            // binding set is tiny and loom's `bindings` command replaces it outright, so there
+            // is no incremental protocol to get out of step with.
+            auto animSendBindings = [&]() {
+                if (!animLive) return;
+                std::string js = "{\"cmd\":\"bindings\",\"bindings\":[";
+                for (size_t i = 0; i < animDrive.bindings.size(); ++i) {
+                    const curvedrive::Binding& b = animDrive.bindings[i];
+                    char g[40]; std::snprintf(g, sizeof g, "%.17g", b.gain);
+                    if (i) js += ",";
+                    js += "{\"channel\":" + std::to_string(b.channel)
+                        + ",\"target\":\"" + loomlink::jsonEsc(b.target) + "\""
+                        + ",\"mode\":\"" + loomlink::jsonEsc(b.mode) + "\""
+                        + ",\"gain\":" + g
+                        + ",\"kind\":\"" + loomlink::jsonEsc(b.kind) + "\"}";
+                }
+                js += "]}";
+                animBridge.control(js);
+            };
+            // The bind row's per-channel view of the drive: entry c is channel c's target, or
+            // "" when nothing binds it. Rebuilt from `animDrive` (the editor's authority for
+            // everything that is not the curve's geometry) rather than cached, so it cannot
+            // drift from what a Save would write.
+            auto animTargets = [&]() {
+                std::vector<std::string> t((size_t)std::max(1, animDims));
+                for (const curvedrive::Binding& b : animDrive.bindings)
+                    if (b.channel >= 0 && (size_t)b.channel < t.size()) t[(size_t)b.channel] = b.target;
+                return t;
+            };
+            // Bind (or re-target) one channel. An empty target UNBINDS it — the "(none)" entry
+            // in the slot pick-list — so Bind and Unbind are the same operation and cannot
+            // disagree about what "no binding" means.
+            auto animBind = [&](int channel, const std::string& target) {
+                if (channel < 0 || channel >= std::max(1, animDims)) return;
+                auto& bs = animDrive.bindings;
+                auto it = std::find_if(bs.begin(), bs.end(),
+                                       [&](const curvedrive::Binding& b) { return b.channel == channel; });
+                if (target.empty()) {
+                    if (it == bs.end()) return;                  // already unbound: nothing to say
+                    std::printf("[anim] ch%d unbound (was %s)\n", channel, it->target.c_str());
+                    bs.erase(it);
+                } else if (it != bs.end()) {
+                    if (it->target == target) return;            // idempotent: no rebake for a no-op
+                    std::printf("[anim] ch%d -> %s (was %s)\n", channel, target.c_str(), it->target.c_str());
+                    it->target = target;
+                } else {
+                    curvedrive::Binding b;                       // defaults: pin / gain 1 / additive
+                    b.channel = channel;
+                    b.target  = target;
+                    std::printf("[anim] ch%d -> %s (%s, gain %.4g, %s)\n",
+                                channel, target.c_str(), b.mode.c_str(), b.gain, b.kind.c_str());
+                    bs.push_back(b);
+                }
+                std::fflush(stdout);
+                animSendBindings();
+                animLastT = -1.0;    // force a rebake: the same curve position now means something else
+            };
+            // Grow or shrink the drive's channel count. Growing appends zeroed channels to every
+            // control point; SHRINKING DISCARDS them — and loom drops any binding that lived on a
+            // channel that no longer exists, so we mirror that here rather than let the sidecar
+            // keep a binding loom has already forgotten.
+            auto animSetDims = [&](int nd) {
+                nd = std::max(1, nd);
+                if (nd == animDims) return;
+                int old = animDims;
+                animDims = nd;
+                size_t ne = animExtraCount();
+                for (auto& ex : ptExtra) ex.resize(ne, 0.0);
+                animDrive.dims = nd;
+                size_t before = animDrive.bindings.size();
+                animDrive.bindings.erase(
+                    std::remove_if(animDrive.bindings.begin(), animDrive.bindings.end(),
+                                   [&](const curvedrive::Binding& b) { return b.channel >= nd; }),
+                    animDrive.bindings.end());
+                size_t dropped = before - animDrive.bindings.size();
+                // Keep the suffix in a NAMED string: building it inline as an argument would
+                // hand printf a c_str() into a temporary already destroyed at the sequence point.
+                std::string note = dropped ? "  (" + std::to_string(dropped) + " binding(s) dropped)"
+                                           : std::string();
+                std::printf("[anim] channels %d -> %d%s\n", old, nd, note.c_str());
+                std::fflush(stdout);
+                if (animLive) {
+                    animBridge.control("{\"cmd\":\"dims\",\"dims\":" + std::to_string(nd) + "}");
+                    animSendBindings();
+                    animSendPoints();
+                    animLastT = -1.0;
+                }
+            };
+            // Swap in a scene loom just emitted. Everything downstream of `scene` is
+            // derived state and every bit of it has to be dropped: the preview light, the
+            // tessellation, the GPU rasterizer's baked triangles, and the resident
+            // RGB-backward session (which bakes the scene at begin() — setCamera only
+            // re-aims, so a swap needs a full End/Begin). The user's POSE is deliberately
+            // untouched: the scene changed under them, they did not move.
+            auto animAdoptScene = [&](const std::string& path, std::string& aerr) -> bool {
+                ftsl::Loaded nl;
+                if (!ftsl::load(path, nl, aerr, supportFn)) return false;
+                scene = std::move(nl.scene);
+                plight = raster::deriveLight(scene);
+                prims.clear();
+                tessellated = false;
+#ifdef HAVE_CUDA
+                // Re-upload the GPU rasterizer only if it was the path in use; the CPU
+                // and primary-ray-iso paths both want `prims` left lazy so a scrub the
+                // user immediately supersedes never pays for a tessellation.
+                if (gpuRaster) {
+                    raster_cuda::destroy(gpuRaster);
+                    gpuRaster = nullptr;
+                    ensurePrims();
+                    gpuRaster = raster_cuda::upload(prims, plight, &scene.textures);
+                    if (!gpuRaster)
+                        std::fprintf(stderr, "[anim] GPU re-upload failed; using the CPU rasterizer\n");
+                }
+                // The RGB-backward session bakes the scene at begin() — setCamera only
+                // re-aims — so a scene swap needs a full End/Begin, not a re-aim.
+                if (traceSess) { backwardRGBSessionEnd(traceSess); traceSess = nullptr; }
+                traceDirty = true;
+#endif
+                return true;
+            };
             while (!g_liveWin->closed() && !g_stopRequested) {
                 // Match the render resolution to the live window: a user resize re-renders
                 // at the new size (smaller = faster, larger = crisper).
@@ -7347,6 +7563,43 @@ static int run(int argc, char** argv) {
                       std::fflush(stdout);
                   } }
                 NavInput nav = g_liveWin->drainNav();
+
+                // Fold in whatever loom finished since the last iteration. The editor
+                // never blocks on an emit: it keeps flying the scene it already has and
+                // adopts the new one on whatever iteration it lands.
+                if (animLive) {
+                    animlive::Result ar;
+                    if (animBridge.take(ar)) {
+                        animLastMs = ar.ms;
+                        if (ar.ok) {
+                            std::string aerr;
+                            if (animAdoptScene(ar.ftslPath, aerr)) {
+                                ++animBaked;
+                                animLastErr.clear();
+                                changed = true;          // repaint on the new geometry
+                            } else {
+                                // A re-derived scene ftrace cannot load is a real error and
+                                // has to be said out loud, not silently left on stale
+                                // geometry the user would read as "my edit did nothing".
+                                animLastErr = "ftsl: " + aerr;
+                                std::fprintf(stderr, "[anim] emitted scene did not load: %s\n",
+                                             aerr.c_str());
+                            }
+                        } else {
+                            animLastErr = ar.err;
+                            std::fprintf(stderr, "[anim] %s\n", ar.err.c_str());
+                        }
+                        animBridge.reap(ar.ftslPath);
+                        std::fflush(stderr);
+                    }
+                    if (!animBridge.linkUp() && animLastErr != animBridge.deadReason()) {
+                        animLastErr = animBridge.deadReason();
+                        animLive = false;
+                        std::fprintf(stderr, "[anim] live channel lost: %s\n", animLastErr.c_str());
+                        std::fprintf(stderr, "[anim] continuing as a sidecar-only editor\n");
+                        std::fflush(stderr);
+                    }
+                }
 
                 // Wall-clock delta for rate-mode (cameras/second) path traversal.
                 auto nowT = clock::now();
@@ -7485,6 +7738,15 @@ static int run(int argc, char** argv) {
                     std::printf("[editor] speed reset to flat (1.00x everywhere)\n"); std::fflush(stdout);
                     changed = true;
                 }
+                // ---- loom bind row: retarget/unbind a channel, or resize the drive ----------
+                // Only reachable when the row exists (it is built only for a live -loom editor),
+                // so these are inert in a sidecar-only session.
+                if (animActive) {
+                    if (nav.bindApply) animBind(nav.bindChannel, nav.bindTarget);
+                    if (nav.bindClear) animBind(nav.bindChannel, std::string());
+                    // The box reports its CURRENT value every drain, so act only on a real change.
+                    if (nav.dimsReq >= 1 && nav.dimsReq != animDims) animSetDims(nav.dimsReq);
+                }
 
                 // The render camera's up vector and fov: fixed authored values while flying
                 // free; the current path frame's own up/fov while locked to the path.
@@ -7573,6 +7835,29 @@ static int run(int argc, char** argv) {
                     bool take = !haveRecPos;
                     if (haveRecPos) { Vec3 d = eye - lastRecPos; take = dot(d, d) >= (sceneR * 0.008) * (sceneR * 0.008); }
                     if (take) { recRawBuf.push_back(poseNow()); lastRecPos = eye; haveRecPos = true; }
+                }
+
+                // Ask loom for the frame at the current curve position. Latest-wins, so a
+                // fast drag leaves at most one emit in flight and one waiting; the
+                // positions swept through in between are dropped rather than queued into
+                // a backlog the user would have to sit through. Only post when the
+                // position (or the curve itself) actually changed — an idle editor must
+                // not spin loom re-emitting the same frame forever.
+                if (animLive && pathCount >= 2) {
+                    double denom = (double)(pathCount - 1);
+                    double t = (denom > 0.0) ? std::clamp(pathPos / denom, 0.0, 1.0) : 0.0;
+                    // A reshaped curve means the frame we are showing was emitted against
+                    // points that no longer exist, so re-ask even if the position is
+                    // unchanged (t is in [0,1]; -1 can never compare equal).
+                    if (animPtsDirty) { animSendPoints(); animLastT = -1.0; }
+                    if (t != animLastT) {
+                        animlive::Job j;
+                        j.t      = t;
+                        j.frame  = (int)std::lround(pathPos);
+                        j.frames = pathCount;
+                        animBridge.post(j);
+                        animLastT = t;
+                    }
                 }
 
                 Vec3 tgt = eye + fwd * lookDist;   // look_at point on the view ray (for readout/print)
@@ -7671,6 +7956,33 @@ static int run(int argc, char** argv) {
                     if (pathMode) {
                         double sp = speedAt(pathPos);
                         if (std::fabs(sp - lastSpdSent) > 5e-3) { g_liveWin->setSpeedLabel(sp); lastSpdSent = sp; }
+                    }
+                    // Mirror the loom bind row: what the selected channel drives, plus the live
+                    // channel's health. Recomputed and diffed rather than pushed on every event,
+                    // because the SELECTION also changes it and a combo pick raises no edge here.
+                    if (animActive) {
+                        std::string st;
+                        if (!animLive)
+                            st = animLastErr.empty() ? "offline (sidecar only)" : "offline: " + animLastErr;
+                        else if (!animLastErr.empty())
+                            st = animLastErr;
+                        else {
+                            char b[96];
+                            // Explicit UTF-8 bytes, not \u2014: a narrow literal escape would be
+                            // transcoded to cp1252 (C4566) and land in the panel as junk.
+                            std::snprintf(b, sizeof b, "live \xE2\x80\x94 %lld baked, %.0f ms",
+                                          animBaked, animLastMs);
+                            st = b;
+                        }
+                        std::vector<std::string> tg = animTargets();
+                        // The row also reports the SELECTED channel's binding, and picking a
+                        // channel raises no edge out here — so the selection is part of the diff.
+                        if (st != animLastStatus || tg != animLastTargets ||
+                            nav.bindChannel != animLastBindCh) {
+                            g_liveWin->setBindState(tg, st.c_str());
+                            animLastStatus = st; animLastTargets = tg;
+                            animLastBindCh = nav.bindChannel;
+                        }
                     }
                 }
                 // Sleep policy. While a throttle key is held, the mouse is steering, or the
@@ -8479,11 +8791,19 @@ int main(int argc, char** argv) {
             if (viewerSidecar)
                 return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "");
             if (viewerLoom) {
-                // -loom without -viewer has no meaning; say so rather than let the
-                // renderer's arg loop silently eat it as an unknown flag.
-                std::fprintf(stderr, "error: -loom <scene.py> is only meaningful with "
-                                     "-viewer <sidecar.json>\n");
-                return 1;
+                // -loom names a live channel, and there are two of them: the viewer's F4
+                // re-introspection (-viewer) and the fly editor's E2 value channel
+                // (-anim), which the renderer's own arg loop parses. Only reject the flag
+                // when NEITHER host asked for it, rather than letting it fall through to
+                // be silently eaten as an unknown flag.
+                bool withAnim = false;
+                for (int i = 1; i < argc; ++i)
+                    if (!std::strcmp(argv[i], "-anim")) { withAnim = true; break; }
+                if (!withAnim) {
+                    std::fprintf(stderr, "error: -loom <scene.py> is only meaningful with "
+                                         "-viewer <sidecar.json> or -anim <drive.json>\n");
+                    return 1;
+                }
             }
         }
         // Resident preview server (-serve): keep the process alive and re-render each

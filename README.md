@@ -448,6 +448,30 @@ paths they can capture at all**.
 > sidecar is plain, human-diffable JSON that loom reads and writes with `loom.anim`
 > (`python -m loom.anim <scene.py> --config <sidecar.json>`), so either side can author it.
 >
+> **Watching the drive actually drive the scene (`-anim … -loom <scene.py>`).** Add `-loom
+> <scene.py>` and the editor stops previewing just a camera path: it starts a live loom
+> session on that scene and, every time you scrub, asks loom for the scene **as of that
+> point on the curve**. The bound scene variables move in the viewport — a radius breathes,
+> a light dims, a material shifts — even if the camera never budges. ftrace deliberately
+> does *not* sample the curve itself; it sends loom the control points and asks by
+> parameter, so what you see while editing is what loom will render for the video. Scrubbing
+> fast is safe: only the newest position is kept (stale ones are dropped, never queued),
+> while edits to the points/bindings/channel count are queued losslessly ahead of it.
+>
+> With the live session up, the panel grows a **loom bind row**:
+>
+> | Control | What it does |
+> |---|---|
+> | `ch N` | Which drive channel you're inspecting or editing. |
+> | slot list | The scene variables loom reports as bindable (`loom.anim`'s `slots`). Pick-only — no typing — plus `(none)`. |
+> | **Bind** | Binds the chosen channel to the chosen slot (or to nothing, with `(none)`). |
+> | **Unbind** | Drops the chosen channel's binding. |
+> | `chans:` | The drive's channel count. Growing it widens every control point; shrinking it drops the bindings on the channels that no longer exist — the same thing loom does — rather than leaving a stale association behind. |
+> | status | What the current channel does *right now*, plus link health: `ch 0 → ball_r  \|  live — 4 baked, 2 ms`. |
+>
+> Every edit takes effect immediately in the preview, and **Save** writes the channel count
+> and the bindings back to the sidecar along with the points.
+>
 > **Reviewing a rendered flyby (`-review <base>`).** Once a flyby has actually been
 > *rendered* to a directory of images, `ftrace -review <base>` plays that sequence back
 > on the same live window + timeline — so you can watch the real rendered result (not the
@@ -2583,6 +2607,7 @@ alone can't restore, so they are not disk-resumable.
 | `-no-meter` / `-nometer` | Skip the **exposure-lock metering pre-pass**. Normally a locked `camera_curve`/`camera_path`/`camera_orbit` group meters (up to 64 of) its frames up front to compute one shared exposure anchor, so the flyby doesn't flicker. With this flag that pre-pass is skipped and each frame **auto-exposes on its own** — faster startup (no metering the whole path), at the cost of possible frame-to-frame brightness flicker on an animated flyby. Implied by `-explore` (the interactive viewer auto-exposes per frame, so metering a whole flyby just to fly one frame is wasted work). |
 | `-noclip` / `-nocollide` | Start the interactive fly-viewer with **wall collision off** (fly through geometry) — for placing a camera *outside* the room or *inside* glass. Collision is **on by default** (you can't fly through walls); press `C` in the viewer to cycle `slide` → `stop` → `noclip` live. See the fly-camera controls under **Interactive fly camera**. |
 | `-anim <file.json>` | Edit a **loom `CurveDrive` sidecar** in the interactive fly editor (implies `-explore`). The editor's control points become the drive's N-dimensional points: channels 0–2 are the point you see and move in 3-D, channels 3+ are non-spatial values carried along per point. **Save** writes the reshaped curve back to the sidecar atomically, preserving the drive's name/mode/dims and every channel → scene-variable **binding**. A sidecar that doesn't exist yet is created on the first Save (from whatever control points the scene seeded), so this is also how you start a drive. See **Editing a loom animation drive** under **Interactive fly camera**. |
+| `-loom <scene.py>` | Keep a **live loom process** alongside the window so the scene can be *re-derived*, not merely re-viewed. With `-anim` it turns the fly editor into a real animation editor: scrubbing asks loom for the scene as of that point on the drive, so the **bound scene variables** move in the viewport (loom does the curve sampling, so the preview can't drift from the final render), and the panel grows a **loom bind row** for editing channel → variable bindings and the channel count live. With `-viewer` it drives the loom sidecar viewer's **Live (loom)** panel instead (one control per `build()` parameter, plus the sweep axis). See **Editing a loom animation drive** and **Live re-derivation**. |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |

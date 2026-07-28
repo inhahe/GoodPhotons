@@ -88,9 +88,22 @@ struct NavInput {
     // (reset the painted speed track to uniform).
     bool   paintMode  = false;           // "Paint" checkbox: wheel=speed, mouse=orientation on the path (persistent)
     bool   speedReset = false;           // "Flat" button: reset painted speed to uniform (one-shot)
+    // ---- Loom BIND-row outputs (only meaningful when `-anim ... -loom scene.py` is live) ----
+    // The bind row edits which DRIVE CHANNEL feeds which named scene variable (a loom `Slot`),
+    // plus how many channels the drive has. `bindChannel`/`bindTarget` are the row's CURRENT
+    // selection (a channel index and a slot name, "" = the "(none)" entry); the two buttons are
+    // one-shot edges that act on that selection. `dimsReq` is the channel-count box's current
+    // value (0 = unchanged) — the render loop only forwards it when it actually differs, since
+    // shrinking the drive DROPS channels (and any binding on them) in loom.
+    int         bindChannel = -1;        // channel picked in the bind row (>=0), else -1 (no row / none)
+    std::string bindTarget;              // slot name picked in the bind row ("" = none selected)
+    bool        bindApply = false;       // "Bind" button: bind bindChannel -> bindTarget (one-shot)
+    bool        bindClear = false;       // "Unbind" button: drop any binding on bindChannel (one-shot)
+    int         dimsReq   = 0;           // channel-count box (current value; 0 = unchanged/absent)
     bool   any() const { return lookX || lookY || wheel || wheelSpeed || fwd || back || reset || print
                                 || cycleCollide || toggleTrace || togglePath || togglePlay || scrubTo >= 0
-                                || recToggle || addPoint || insPoint || delPoint || saveCurve || speedReset; }
+                                || recToggle || addPoint || insPoint || delPoint || saveCurve || speedReset
+                                || bindApply || bindClear; }
 };
 
 class LiveWindow {
@@ -139,6 +152,22 @@ public:
     // (Rec/Stop) and `pointCount` updates the control-point readout. Marshalled to the UI
     // thread; no feedback edge. No-op if the panel isn't enabled.
     void setEditState(bool recording, int pointCount);
+
+    // Reveal the LOOM BIND ROW — the editing UI for the `-anim <drive.json> -loom <scene.py>`
+    // live channel. It is hidden by default (a plain camera-curve edit has no scene variables to
+    // bind), and shown only once loom has reported what the scene exposes. `slotNames` is that
+    // pick-list of bindable variable names and `dims` the drive's current channel count; the row
+    // is a channel combo, a slot combo, Bind / Unbind buttons, a channel-count box, and a status
+    // readout. Selections and button edges come back through NavInput. Marshalled to the UI
+    // thread; safe to call from the render thread. No-op if the panel isn't enabled.
+    void enableBindRow(const std::vector<std::string>& slotNames, int dims);
+
+    // Mirror the drive onto the bind row: `targets` is the per-channel binding target (entry i is
+    // channel i's slot name, "" = unbound), which also sets the channel count, and `status` is a
+    // short health/throughput line for the live channel (e.g. "live: 12 bakes, 34 ms" or an
+    // error). Marshalled to the UI thread; setting these never re-emits a NavInput edge. No-op if
+    // the bind row isn't shown.
+    void setBindState(const std::vector<std::string>& targets, const char* status);
 
     // Update the panel's painted-speed readout (the "Paint" mode shows the local traversal-speed
     // multiplier at the current scrub position, e.g. "1.35x"). Marshalled to the UI thread; no

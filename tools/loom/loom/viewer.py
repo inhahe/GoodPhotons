@@ -837,4 +837,9 @@ __all__ = [
 
 
 if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    # See the note in loom/anim.py: `python -m loom.viewer` re-executes this file as
+    # `__main__`, giving every class defined here a second identity, while a scene's
+    # `from loom.viewer import ...` gets the canonical one. Any isinstance test
+    # across that boundary then silently fails. Delegate to the imported module.
+    from loom.viewer import main as _main
+    raise SystemExit(_main())
