@@ -86,28 +86,58 @@ took over both. Measured @ 3840²: host `render 21.97 + tail 4.17 = 26.1 ms` vs 
 `WM_PRINTCLIENT` captures (bit-identical), and the fallbacks were exercised individually
 (forward photon mode B, `FTRACE_LIVE_GDI=1`, window resize → re-register, `+Pt` overlay).
 
-### BUG — open: dark speckles / a short dark diagonal streak along tessellated-sphere silhouettes in the raster preview
+### BUG — open: the CPU rasterizer leaks a hairline CRACK along a shared triangle edge (the GPU one doesn't)
 
-**Symptom.** In the `-raster` solid-shaded preview, the silhouette of a tessellated sphere
-(e.g. `scenes/cornell.ftsl`'s sphere) is fringed with isolated dark pixels, plus a short
-dark diagonal line segment near the upper-left of the silhouette. Reproduce with
-`ftrace scenes/cornell.ftsl -raster -explore -r 800 600 -device gpu -window` and look at
-the sphere's edge, or just at `cornell.ppm`.
+**Symptom.** In the `-raster` preview a thin dark diagonal streak cuts across the cornell
+box's ceiling/right-wall seam. Reproduce:
+`ftrace scenes/cornell.ftsl -raster -r 800 600 -device cpu -o ppm/x.ppm -window`.
 
-**What's known.** It is **not** a zero-copy/interop regression and **not** a backend
-difference: 800×600 captures of the download path and the surface path are bit-identical
-in that region, so both GPU tone-map paths agree, and the artifact predates v0.98.0. That
-places it in the **shared visibility/shading stage** (pass B `kRaster*`'s `atomicMax`
-visibility merge or pass C `kShade`'s resolve), not in exposure/encode/present. Likely
-candidates: a coverage/edge rule that lets a pixel on a shared triangle edge resolve to a
-*back*-facing or far slot (an `invd` tie broken the wrong way in the packed
-`(invd_bits<<32)|slot` key), or a normal picked from the wrong slot at the silhouette
-where adjacent triangles' shading normals diverge most.
+**It is a hole, not a shading artifact.** Every pixel on the streak is *exactly*
+`(69,75,85)` — bit-for-bit the frame's clear colour, the same value the empty corners
+outside the box carry. No triangle covered those pixels at all. The streak is a perfect
+45° line (`x + y == 699` for every one of them, running the full image height from
+`(100,599)` to `(699,0)`, 220 pixels), which is the projected shared edge between the two
+triangles of a box face. So the CPU rasterizer's coverage rule is **not watertight**: on
+this edge both adjacent triangles reject the pixel instead of exactly one accepting it.
 
-**Next step.** Check whether the CPU rasterizer (`-device cpu`) shows the same speckles at
-the same pixels. If it does, the bug is in the shared coverage/shading rule in `raster.h`;
-if it doesn't, diff the two frames and inspect the `vis` slot ids at the offending pixels
-to see which triangle won.
+**The GPU rasterizer gets it right**, which is how this was isolated: of the 210 pixels
+where the two backends disagree on this frame, **157 are on that single seam**, and the
+GPU fills each with the correct wall colour (e.g. `(216,195,191)` at `(476,223)` where the
+CPU has clear). The remaining 53 disagreements are ordinary ±1-pixel edge-coverage
+differences along wall silhouettes.
+
+**Fix direction.** `raster.h`'s per-pixel inside test needs a proper **top-left fill rule**
+(or an equivalent consistent tie-break on the edge function's sign at exactly zero) so a
+pixel landing precisely on a shared edge is claimed by exactly one of the two triangles.
+Half-open edge handling must use the *same* comparison for both triangles — a `> 0` on one
+and a `>= 0` on the other is what produces both cracks and double-shading. Note the wider
+implication: the CPU and GPU rasterizers are **not** pixel-identical today, so `-device`
+is not a pure performance switch for `-raster`; nailing the fill rule on both sides is what
+would make it one.
+
+### BUG — open: a dark fringe of speckles on the tessellated sphere's silhouette (both backends, identically)
+
+**Symptom.** Isolated very dark pixels sit on the sphere's silhouette in the `-raster`
+preview, e.g. at `(354,287)`, `(445,287)`, `(344,294)`, `(455,294)`, `(327,312)`,
+`(472,312)`, `(325,315)`, `(474,315)` in the 800×600 cornell frame.
+
+**What's known.** Unlike the crack above, these are **byte-identical in the CPU and the GPU
+renders** (same positions, same `(93,83,81)`), so this is in shared geometry/shading, not in
+either rasterizer's coverage rule. They are also **not** holes — `(93,83,81)` is a genuine
+shaded colour, not the clear colour — and they are **mirror-symmetric in pairs about the
+sphere's vertical axis** (`x=399.5`), with the half-width growing monotonically down the
+arc. That symmetry rules out any race or thread-mapping effect and points at deterministic
+geometry: the shading normal used at the extreme silhouette facets, where the interpolated
+normal is nearly perpendicular to the view and `N·L` collapses.
+
+It is **not** a zero-copy/interop regression: the download path and the surface path are
+bit-identical here, and the artifact predates v0.98.0.
+
+**Next step.** Dump the resolved slot id and the interpolated normal at one of those pixels
+and compare against its neighbours — if the normal is fine but `N·L` is simply grazing, the
+fix is in the preview's shading model (clamp/ambient at grazing angles); if the normal
+belongs to a different facet than its neighbours, it's the tessellator's shared-vertex
+normal averaging at the sphere's ring boundaries.
 
 ### BUG — DONE (2026-07-28, v0.95.0): `python -m loom.anim` served an *empty* slot list — a module that is both `__main__` and importable is two different classes
 
