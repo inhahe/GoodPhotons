@@ -741,6 +741,31 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `raster_cuda.cu` = GPU raster (own section below).
 - **`livewindow.*`** — Win32 GDI live preview (`-window`/`-keepwindow`), interactive
   fly viewer input, camera-path timeline panel.
+- **`viewer_gui.*`** — the **native loom viewer** (`-viewer <sidecar.json>`), a Dear
+  ImGui / Direct3D 11 window that short-circuits the renderer in `main`. It reads loom's
+  scene-introspection sidecar (`loom.viewer.ViewerModel.save_sidecar`) into flat geometry
+  structs — `CurveGeom` / `FieldGeom` / `MeshGeom` / `DagGraph` — and draws N-D curve,
+  field, mesh and modulator-DAG panes. Two of its panes are *not* sidecar replays: the
+  **Render** pane sphere-traces the real isosurface field by parsing the sidecar's
+  companion `.ftsl` with ftrace's own `ftsl::load` and calling `renderIsoPreviewCuda`, and
+  the **Meshes** pane bakes procedural skins through ftrace's own pattern VM — so the
+  preview and the renderer share one implementation rather than two that can drift.
+  **Live re-derivation (§F4 item 2, `-loom <scene.py>`)** adds `LoomLink` (a child
+  `python -m loom.viewer` speaking newline-delimited JSON over stdio; `PYTHONPATH` is set
+  to `<exeDir>\tools\loom`, which is why only the repo-root `ftrace.exe` can find loom) and
+  `LoomBridge`, a **one worker thread + one-slot pending job** queue. `post()` overwrites an
+  unstarted job, so a drag that moves a parameter every frame costs one bake of the final
+  value — latest-wins, and the UI never blocks. Each bake writes a fresh sidecar + `.ftsl`
+  into a per-process `%TEMP%\ftrace_viewer_<pid>` scratch dir; the bridge tracks the
+  outstanding files and deletes each as it is consumed (a superseded result's files are
+  dropped unread), then sweeps and removes the whole directory in `stop()`. Startup also
+  reclaims `ftrace_viewer_<pid>` dirs whose pid is no longer alive (`OpenProcess` failing
+  with `ERROR_INVALID_PARAMETER`), since a crashed or killed viewer can't clean up after
+  itself and only the next run ever can. Results are
+  adopted on whatever frame they land, preserving the user's orbit, zoom, active tab and
+  DAG layout. **Third-party note:** `src/third_party/imnodes/imnodes.cpp` carries
+  `[ftrace patch]` edits for imgui #7543 — see `known-issues.md`; re-vendoring imnodes must
+  re-apply them or the DAG pane crashes in `PrimReserve`.
 - **`record.h` / `record_ladder.h`** — **parametric records**: a named bank of per-channel
   look-up tables over a shared scalar domain `[lo,hi]`, sampled by one per-hit driver
   scalar so a single expression sweeps a whole material at once. `record.h` holds the

@@ -792,9 +792,15 @@ tools/loom/
   SRV — images through ftrace's own `Texture::load`, formulas baked on the CPU through ftrace's own
   `compilePatternExpr`/`patternEval` (with a `PatTexScope` so `tex:<name>(u,v)` resolves against images
   declared above, exactly as in `FtslLoader::addTexture`) — and the Meshes tab draws each triangle at its
-  interpolated per-vertex UVs. Unusable skins degrade to grey with a printed reason. Still deferred:
-  **off-thread re-tessellation when rotating into a parameter dim** (needs the live viewer↔loom channel,
-  since the static sidecar can't re-bake geometry).
+  interpolated per-vertex UVs. Unusable skins degrade to grey with a printed reason.
+  **F4 off-thread re-tessellation is complete (2026-07-28, ftrace 0.92.0):** `ftrace -viewer <s.json>
+  -loom <scene.py>` spawns `python -X utf8 -u -m loom.viewer <scene.py>` and drives this module's
+  `ViewerSession` live. The C++ side (`LoomLink`/`LoomBridge`, `src/viewer_gui.cpp`) runs bakes on one
+  worker thread with a **one-slot** pending job, so posting overwrites anything not yet started — a fast
+  drag costs one `introspect`+`emit` of wherever the user ends up rather than one per frame. A **Live
+  (loom)** panel drives the clock and one control per keyword param `build()` declares, and the chosen
+  **sweep axis** turns a right-drag on any 3-D pane into motion along that parameter dimension — which is
+  what the static sidecar could never do, since the extra dimension only exists once someone re-bakes.
   **F7's MC-mesh fallback is complete:** `_describe_element` bakes each `IsoMesh`'s field to a
   marching-cubes mesh (`_iso_mesh_geometry`→`mcubes.mesh_field`) into the object's `mesh` key, so the
   existing Meshes tab draws the isosurface with no C++ change. **F7's primary path is also complete:**

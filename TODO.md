@@ -1829,7 +1829,8 @@ replacement for the renderer or the primary editing tool.**
         **linked X axis** (`SetupAxisLinks`) so panning/zooming any one pages them all together, and each
         carries a **draggable yellow index line** wired bidirectionally to the 3-D pane's index dot
         (dragging a chart line moves the dot; the index slider moves every line).
-- [~] **F4 — SweptMesh tessellated view + textures + decoupled re-tessellation.** ✅ core done
+- [x] **F4 — SweptMesh tessellated view + textures + decoupled re-tessellation.** ✅ fully done
+      2026-07-28 (VERSION 0.92.0) with sub-item (2); ✅ core done
       2026-07-24 (VERSION 0.55.0). Slice A (loom, `b13122f`): each `swept_mesh` object record now
       carries a `mesh` key with the tessellated triangle mesh at the clock — `vertices` (flat
       3-vectors), `faces` (0-based index triples), per-vertex `uvs` (u along spine, v around profile),
@@ -1869,8 +1870,8 @@ replacement for the renderer or the primary editing tool.**
         PrintWindow screenshot on a purpose-built 4-tube scene covering all four paths (image
         skin, procedural formula, formula-sampling-an-image, no texture) plus a deliberately
         broken sidecar for the error path.
-      - **Still open (deferred):** (2) **Re-tessellation when rotating *into* a parameter/extra
-        dimension** via a latest-wins off-thread job queue. **Loom half DONE 2026-07-24** — the
+      - **(2) Re-tessellation when rotating *into* a parameter/extra dimension** via a latest-wins
+        off-thread job queue — ✅ **DONE 2026-07-28 (VERSION 0.92.0).** **Loom half DONE 2026-07-24** — the
         viewer↔loom **live re-introspection channel** (`ViewerSession`/`serve_viewer` in
         `loom.viewer`, plus a `python -m loom.viewer <scene.py>` CLI entry): a resident loom process
         holds a `ViewerModel` and answers newline-delimited-JSON `introspect {clock,params}` requests
@@ -1878,10 +1879,26 @@ replacement for the renderer or the primary editing tool.**
         in the viewer→loom direction. 9 new tests (`tests/test_viewer.py`, 1004 loom green). The channel
         also gained an **`emit`** command 2026-07-24 (re-emit `.ftsl` for a clock/params) that **F7's
         in-process primary path (v0.56.0) already uses the static form of** — the viewer parses loom's
-        emitted `.ftsl` and raymarches it live. **C++ half still open** (best done with the user present):
-        wire the `-viewer` GUI to spawn that process (or reuse the in-process `ViewerModel` bridge F7
-        established) and request re-introspection/`emit` on rotate/scrub, feeding the new **mesh** geometry
-        through a latest-wins job queue into the Meshes tab. Same channel unblocks F7's live field edit.
+        emitted `.ftsl` and raymarches it live. **C++ half 2026-07-28** — a new `-loom <scene.py>` flag
+        (paired with `-viewer`; the sidecar's own `build` provenance key is the fallback) has
+        `runViewerGui` spawn `python -X utf8 -u -m loom.viewer <scene.py>` and hold the channel open:
+        `LoomLink` owns the child + pipes, `LoomBridge` owns **one worker thread and a one-slot pending
+        job** so `post()` overwrites anything not yet started — the latest-wins rule, which makes a
+        continuous drag cost one bake of the final value instead of one per frame. A **Live (loom)**
+        panel in the left column exposes link state, a clock scrub, one typed control per declared
+        keyword param, an `auto` / `re-derive now` switch for slow scenes, and `posted / baked`
+        counters (`posted > baked` = the collapsing working). Marking one continuous param the **sweep
+        axis** makes a **right-drag on any 3-D pane rotate into that dimension** — the gesture this item
+        existed for. Each bake asks for `introspect` **and** `emit`, so the returned sidecar refreshes
+        Curves/Fields/**Meshes** while the returned `.ftsl` re-seeds F7's Render pane; results are
+        adopted on whatever frame they land, preserving orbit, zoom, active tab and DAG layout, and a
+        failed bake shows its error while the last good geometry stays on screen. Scratch sidecars/
+        `.ftsl`/`.obj` go to a per-process `%TEMP%\ftrace_viewer_<pid>` dir that the bridge prunes as
+        results are consumed and removes wholesale on exit. Verified end-to-end plus a 20-round
+        scripted sweep with no crash and no memory growth. Two real bugs fell out of that validation
+        and are fixed + written up in `known-issues.md` (the imgui #7543 / imnodes node-rect crash, and
+        the DAG pane re-packing itself when clipped to zero height). Same channel unblocks F7's live
+        field edit.
 - [x] **F5 — modulator-DAG panel (imnodes).** ✅ 2026-07-24 Introspect the signal DAG via loom's `walk()`
       and lay it out well. Each node shows the **op/function that modulates it** and a **stable identifier**;
       each **edge is labeled with the parameter name it feeds**, so you can tell which variable in a node's

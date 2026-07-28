@@ -3,7 +3,7 @@
 #ifndef _WIN32
 // -------- Non-Windows stub: the native viewer needs Win32 + D3D11 --------------
 #include <cstdio>
-int runViewerGui(const std::string&) {
+int runViewerGui(const std::string&, const std::string&) {
     std::fprintf(stderr, "error: -viewer is only available on Windows builds.\n");
     return 1;
 }
@@ -33,6 +33,11 @@ int runViewerGui(const std::string&) {
 #include <unordered_map>
 #include <functional>
 #include <thread>
+#include <mutex>                   // F4 item 2: the live re-introspection job queue
+#include <condition_variable>
+#include <cstring>
+#include <cstdlib>                 // strtoul: parsing the pid out of a scratch dir name
+#include <cwctype>
 
 // Bridge to ftrace's own scene loader + GPU field raymarcher (F7 primary path).
 // The viewer IS the ftrace binary, so it can parse loom's emitted `.ftsl` with the
@@ -192,6 +197,13 @@ struct Sidecar {
     // viewer then shows only the static sidecar geometry (no live raymarch).
     std::string source() const {
         const minijson::Value* v = root.find("source");
+        return (v && v->isString()) ? v->str : std::string();
+    }
+    // Absolute path of the loom file the `build()` came from (F4 item 2). This is the
+    // sidecar's provenance, and it is what lets `-viewer <sidecar>` reopen the LIVE
+    // re-introspection channel without being told the scene file a second time.
+    std::string buildFile() const {
+        const minijson::Value* v = root.find("build");
         return (v && v->isString()) ? v->str : std::string();
     }
 };
@@ -613,6 +625,88 @@ struct SkinLib {
 };
 
 } // namespace
+
+// --------------------------------------------------------------------------
+// F4 item 2 — live parameter state, declared up here because the geometry panes
+// below carry the "rotate into a parameter dimension" gesture. The transport that
+// fills this in (LoomLink / LoomBridge) lives further down, next to the entry point.
+//
+// The distinction this whole feature turns on: the three dims a pane SHOWS can be
+// re-projected for free by rotating the view, but a parameter dimension is not in
+// the geometry at all — moving along it means loom has to re-derive (re-tessellate)
+// the scene. So the spatial orbit stays on the left mouse button and is instant,
+// and the parameter sweep is on the right button and costs a round trip.
+// --------------------------------------------------------------------------
+
+// One live control. `toJson` is what actually gets sent, so a param the build
+// declared as an int stays an int (JSON has no such distinction; loom tells us).
+struct LiveParam {
+    std::string name;
+    int  kind = 0;            // 0 float, 1 int, 2 bool, 3 opaque (shown read-only)
+    double num = 0.0;
+    bool   bval = false;
+    std::string text;         // opaque/str params: echoed back verbatim
+    double speed = 0.01;      // drag sensitivity, seeded from the default's magnitude
+
+    bool continuous() const { return kind == 0 || kind == 1; }
+
+    std::string toJson() const {
+        char b[64];
+        switch (kind) {
+        case 1: std::snprintf(b, sizeof b, "%lld", (long long)llround(num)); return b;
+        case 2: return bval ? "true" : "false";
+        case 3: return text;
+        default: std::snprintf(b, sizeof b, "%.10g", num); return b;
+        }
+    }
+};
+
+struct LivePanel {
+    bool up = false;                 // the bridge started and the link is serving
+    std::string startErr;            // ...or why it isn't
+    int  frame = 0, frames = 1;      // the clock, itself a parameter dimension
+    std::vector<LiveParam> params;
+    int  sweep = -1;                 // index into params: the axis a canvas drag moves
+    bool autoApply = true;           // re-derive on every change vs. on the button
+    // Latest-wins accounting, and the whole point of the panel's counter line: `posted`
+    // is how many jobs the UI handed to the bridge, `baked` how many loom actually ran,
+    // `appliedSeq` which job the panes are showing. posted > baked is the mechanism
+    // working (a fast drag collapses to one bake), not jobs being lost.
+    long long posted = 0, baked = 0, appliedSeq = 0;
+    double lastMs = 0.0;
+    std::string lastErr;
+};
+
+// The canvas gesture: right-drag sweeps the chosen parameter axis. Call it directly
+// after the pane's InvisibleButton (it reads that item's active state). Returns true
+// when the value actually moved, which is what schedules a re-derivation.
+static bool liveSweepDrag(LivePanel* lp) {
+    if (!lp || !lp->up) return false;
+    if (lp->sweep < 0 || lp->sweep >= (int)lp->params.size()) return false;
+    if (!ImGui::IsItemActive() || !ImGui::IsMouseDragging(ImGuiMouseButton_Right)) return false;
+    float dx = ImGui::GetIO().MouseDelta.x;
+    if (dx == 0.0f) return false;
+    LiveParam& p = lp->params[lp->sweep];
+    double before = p.num;
+    p.num += dx * p.speed;
+    if (p.kind == 1) p.num = (double)llround(p.num);
+    return p.num != before;          // an int axis only ticks once per whole step
+}
+
+// The line under a pane's banner naming the sweep axis, so the gesture is discoverable.
+// Deliberately NOT SameLine'd onto the banner: the banners are already near the width
+// of the right-hand column, so appending to them pushed the hint — the part that says
+// which key the drag actually turns — off the right edge at any normal window size.
+static void liveSweepHint(const LivePanel* lp) {
+    if (!lp || !lp->up) return;
+    if (lp->sweep >= 0 && lp->sweep < (int)lp->params.size()) {
+        const LiveParam& p = lp->params[lp->sweep];
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 1.0f, 1.0f), "right-drag sweeps %s = %.4g",
+                           p.name.c_str(), p.num);
+    } else {
+        ImGui::TextDisabled("(no sweep axis - pick one in Live)");
+    }
+}
 
 // --------------------------------------------------------------------------
 // Curve pane: a simple orthographic projection drawn with ImDrawList.
@@ -1101,9 +1195,11 @@ struct MeshView {
     int   colorBy = 3;          // 0 grey, 1 per-object tint, 2 UV checker, 3 texture
 };
 
-static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
-                         const SkinLib& skins) {
+static bool drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
+                         const SkinLib& skins, LivePanel* live) {
+    bool swept = false;   // the parameter axis moved -> the surface must be re-baked
     ImGui::TextUnformatted("Meshes - drag to orbit, wheel to zoom (view-only re-projection)");
+    liveSweepHint(live);
     ImGui::Checkbox("shade", &view.shade); ImGui::SameLine();
     ImGui::Checkbox("wireframe", &view.wire); ImGui::SameLine();
     ImGui::SetNextItemWidth(150);
@@ -1126,8 +1222,10 @@ static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
     avail.y -= footer * ImGui::GetTextLineHeightWithSpacing();
     if (avail.y < 80.0f) avail.y = 80.0f;
     ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton("mesh_canvas", avail);
+    ImGui::InvisibleButton("mesh_canvas", avail,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
     bool hovered = ImGui::IsItemHovered();
+    swept = liveSweepDrag(live);   // right-drag: rotate INTO the parameter dimension
     if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         ImVec2 d = ImGui::GetIO().MouseDelta;
         view.yaw   += d.x * 0.01f;
@@ -1287,6 +1385,7 @@ static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
             ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.45f, 1.0f),
                                "skin '%s' (%s): %s", sk.name.c_str(),
                                sk.kind.c_str(), sk.err.c_str());
+    return swept;
 }
 
 // --------------------------------------------------------------------------
@@ -1722,16 +1821,31 @@ static void drawDagPanel(DagGraph& g, float availH) {
     // imnodes now knows each node's true rect (its own padding, the DPI-scaled font,
     // the pin rows). Adopt those and re-wrap once — otherwise the first-frame text
     // estimate decides the packing and a column can overhang the bottom of the pane.
+    //
+    // ...but only when the editor actually drew. The pane lives at the bottom of a
+    // scrolling side column, so it is routinely clipped to zero height; imgui then sets
+    // SkipItems on the canvas and every ImGui::Text inside a node returns without
+    // measuring anything. imnodes still reports a rect — the node origin expanded by
+    // NodePadding — and adopting *that* would silently re-pack the graph at 16 px per
+    // node, so the layout is wrong the moment the user scrolls the pane into view. A
+    // node always draws at least its title, so a content width of zero means "not
+    // measured", never "an empty node".
     if (g.realSize.size() != g.nodes.size()) g.realSize.assign(g.nodes.size(), ImVec2(0.0f, 0.0f));
-    bool sizeChanged = false;
-    for (size_t i = 0; i < g.nodes.size(); ++i) {
-        ImVec2 d = ImNodes::GetNodeDimensions(g.nodes[i].id);
-        if (d.x <= 0.0f || d.y <= 0.0f) continue;
-        if (std::fabs(d.x - g.realSize[i].x) > 1.0f || std::fabs(d.y - g.realSize[i].y) > 1.0f) {
-            g.realSize[i] = d;
-            sizeChanged = true;
-        }
+    const float minRealW = nodePad.x * 2.0f * g.zoom + 1.0f;
+    std::vector<ImVec2> fresh(g.nodes.size());
+    bool measured = true;
+    for (size_t i = 0; i < g.nodes.size() && measured; ++i) {
+        fresh[i] = ImNodes::GetNodeDimensions(g.nodes[i].id);
+        measured = fresh[i].x > minRealW && fresh[i].y > 0.0f;
     }
+    bool sizeChanged = false;
+    if (measured)
+        for (size_t i = 0; i < g.nodes.size(); ++i)
+            if (std::fabs(fresh[i].x - g.realSize[i].x) > 1.0f ||
+                std::fabs(fresh[i].y - g.realSize[i].y) > 1.0f) {
+                g.realSize[i] = fresh[i];
+                sizeChanged = true;
+            }
     if (sizeChanged) { g.sizesValid = true; g.pos.clear(); }   // re-measure next frame
 
     // "fit": iterate zoom towards the scale at which the whole graph is on screen.
@@ -1740,7 +1854,7 @@ static void drawDagPanel(DagGraph& g, float availH) {
     // Each step waits for the layout to settle (node rects stable, positions current),
     // otherwise it compounds a correction that hasn't taken effect yet and collapses the
     // graph to a speck.
-    const bool settled = !sizeChanged && g.pos.size() == g.nodes.size();
+    const bool settled = measured && !sizeChanged && g.pos.size() == g.nodes.size();
     if (g.fitFrames > 0 && settled && g.extent.x > 1.0f && g.extent.y > 1.0f) {
         --g.fitFrames;
         // Only the width is a real constraint: the wrap already pins the height to the
@@ -1860,20 +1974,23 @@ struct RenderPane {
 };
 
 // The Render tab body: orbit controls + the blitted raymarch image.
-static void drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
+static bool drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
                            const std::string& sceneErr,
-                           ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+                           ID3D11Device* dev, ID3D11DeviceContext* ctx,
+                           LivePanel* live) {
+    bool swept = false;   // the parameter axis moved -> loom must re-derive the field
     if (!sceneOk) {
         ImGui::TextWrapped("No live scene to raymarch.");
         if (!sceneErr.empty()) ImGui::TextWrapped("(%s)", sceneErr.c_str());
         ImGui::TextWrapped("The sidecar carries no `source` .ftsl (older loom, or "
                            "emit_source was off). Re-save it with a current loom to "
                            "enable the in-process field raymarch.");
-        return;
+        return false;
     }
     if (!rp.inited) rp.initFrom(scene);
 
     ImGui::TextUnformatted("GPU field raymarch (renderIsoPreviewCuda) - drag to orbit, wheel to zoom");
+    liveSweepHint(live);
     ImGui::SetNextItemWidth(120);
     if (ImGui::SliderInt("res", &rp.resLong, 128, 1024)) rp.dirty = true;
     ImGui::SameLine();
@@ -1886,7 +2003,9 @@ static void drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.y < 80.0f) avail.y = 80.0f;
     ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton("render_canvas", avail);
+    ImGui::InvisibleButton("render_canvas", avail,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    swept = liveSweepDrag(live);   // right-drag: rotate INTO the parameter dimension
     if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         ImVec2 d = ImGui::GetIO().MouseDelta;
         rp.yaw   -= d.x * 0.01f;
@@ -1913,13 +2032,647 @@ static void drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
         ImGui::GetWindowDrawList()->AddRectFilled(
             origin, ImVec2(origin.x + avail.x, origin.y + avail.y), IM_COL32(18, 18, 22, 255));
     }
+    return swept;
 }
 #endif // HAVE_CUDA
 
 // --------------------------------------------------------------------------
+// F4 item 2 — the live re-introspection link and its latest-wins job queue.
+//
+// A frozen sidecar can *display* geometry but cannot **re-derive** it. Orbiting
+// the three shown spatial dims is a view-only re-projection (drawMeshPane says so
+// in its own banner), but rotating into a **parameter dimension** — moving along
+// one of the build's declared keyword params, or along the clock — changes the
+// geometry itself, so the surface has to be re-tessellated by loom. That is what
+// this section wires up: the C++ half of the §F4/§F7 channel whose loom half is
+// `loom.viewer.ViewerSession` / `serve_viewer`.
+//
+//   * LoomLink   — spawns `python -m loom.viewer <scene.py>` and does one
+//                  newline-delimited-JSON request/ack round trip over its pipes.
+//                  Touched ONLY by the worker thread once the bridge is running.
+//   * LoomBridge — that worker thread plus a **one-slot** pending job. Posting
+//                  overwrites whatever was queued, so a fast param drag leaves at
+//                  most one job in flight and one waiting; the values swept through
+//                  in between are dropped rather than queued into a backlog the
+//                  user would then have to sit through frame by frame. That is the
+//                  latest-wins rule, and it is the whole reason this is a queue and
+//                  not a plain synchronous call.
+//   * LivePanel  — the UI: connection state, a clock scrub, one control per
+//                  declared param, and a chosen **sweep axis** that the mesh /
+//                  render canvas drags along with the right mouse button.
+//
+// Re-derivation is not free (a marching-cubes IsoMesh bake is comfortably a
+// second), so the UI never blocks on it: it posts, keeps drawing the geometry it
+// already has, and folds a result in on whatever frame it lands.
+// --------------------------------------------------------------------------
+
+// minijson parses but does not serialise, and the request lines are small fixed
+// shapes, so build them by hand over this escape.
+static std::string jsonEsc(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+        case '"':  o += "\\\""; break;
+        case '\\': o += "\\\\"; break;
+        case '\n': o += "\\n";  break;
+        case '\r': o += "\\r";  break;
+        case '\t': o += "\\t";  break;
+        default:
+            if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+            else o += (char)c;
+        }
+    }
+    return o;
+}
+
+// The child's environment: ours, with `<exeDir>\tools\loom` prepended to PYTHONPATH.
+// loom's package root sits there in a working copy; an installed loom is found the
+// normal way and the extra entry is inert. Entries are kept in order (the `=X:=…`
+// drive-cwd pseudo-variables must stay first), any inherited PYTHONPATH is folded
+// into ours rather than dropped.
+static std::wstring childEnvBlock(const std::wstring& extraPyPath) {
+    std::wstring out, oldPP;
+    if (LPWCH env = GetEnvironmentStringsW()) {
+        for (LPWCH p = env; *p; ) {
+            std::wstring entry(p);
+            p += entry.size() + 1;
+            std::wstring head = entry.substr(0, 11);
+            for (auto& c : head) c = (wchar_t)towupper(c);
+            if (head == L"PYTHONPATH=") { oldPP = entry.substr(11); continue; }
+            out += entry;
+            out.push_back(L'\0');
+        }
+        FreeEnvironmentStringsW(env);
+    }
+    std::wstring pp = L"PYTHONPATH=" + extraPyPath;
+    if (!oldPP.empty()) pp += L";" + oldPP;
+    out += pp;
+    out.push_back(L'\0');
+    out.push_back(L'\0');
+    return out;
+}
+
+// Directory holding this executable (where `tools\loom` lives in a working copy).
+static std::wstring exeDirW() {
+    wchar_t buf[MAX_PATH * 2];
+    DWORD n = GetModuleFileNameW(nullptr, buf, (DWORD)(sizeof buf / sizeof buf[0]));
+    if (n == 0) return std::wstring();
+    std::wstring p(buf, n);
+    size_t cut = p.find_last_of(L"\\/");
+    return cut == std::wstring::npos ? std::wstring() : p.substr(0, cut);
+}
+
+struct LoomLink {
+    HANDLE proc = nullptr;
+    HANDLE wr   = nullptr;      // -> child stdin
+    HANDLE rd   = nullptr;      // <- child stdout
+    std::string rx;             // bytes read past the last complete line
+    std::string cmdline;        // shown in the panel's status row
+
+    bool alive() const { return proc != nullptr; }
+
+    bool start(const std::string& scenePy, std::string& err) {
+        SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+        HANDLE inRd = nullptr, inWr = nullptr, outRd = nullptr, outWr = nullptr;
+        if (!CreatePipe(&inRd, &inWr, &sa, 0)) { err = "CreatePipe(stdin) failed"; return false; }
+        if (!CreatePipe(&outRd, &outWr, &sa, 0)) {
+            CloseHandle(inRd); CloseHandle(inWr);
+            err = "CreatePipe(stdout) failed"; return false;
+        }
+        // Our ends must NOT be inherited: if the child held the write end of its own
+        // stdout, our read would never see EOF when the child dies and a crashed loom
+        // would hang the worker thread forever instead of reporting.
+        SetHandleInformation(inWr,  HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(outRd, HANDLE_FLAG_INHERIT, 0);
+
+        // -u: unbuffered, so a traceback on the way down is not swallowed (serve_viewer
+        // flushes its own acks). -X utf8: the sidecar and any scene text are UTF-8.
+        cmdline = "python -X utf8 -u -m loom.viewer \"" + scenePy + "\"";
+        std::wstring wcmd = utf8ToWide(cmdline);
+        std::vector<wchar_t> mutcmd(wcmd.begin(), wcmd.end());
+        mutcmd.push_back(L'\0');                 // CreateProcessW may write to it
+
+        std::wstring loomPath = exeDirW();
+        if (!loomPath.empty()) loomPath += L"\\tools\\loom";
+        std::wstring env = childEnvBlock(loomPath);
+
+        STARTUPINFOW si{};
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput  = inRd;
+        si.hStdOutput = outWr;
+        // loom's stderr rides our console so a scene-file traceback is readable; if we
+        // have no console the child simply gets none.
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        if (si.hStdError && si.hStdError != INVALID_HANDLE_VALUE)
+            SetHandleInformation(si.hStdError, HANDLE_FLAG_INHERIT, TRUE);
+        else
+            si.hStdError = outWr;   // never leave it unset — the child would inherit ours
+
+        PROCESS_INFORMATION pi{};
+        BOOL ok = CreateProcessW(nullptr, mutcmd.data(), nullptr, nullptr, TRUE,
+                                 CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                                 (LPVOID)env.data(), nullptr, &si, &pi);
+        CloseHandle(inRd);
+        CloseHandle(outWr);
+        if (!ok) {
+            CloseHandle(inWr); CloseHandle(outRd);
+            char b[64]; std::snprintf(b, sizeof b, " (error %lu)", GetLastError());
+            err = "cannot start `" + cmdline + "`" + b + " - is python on PATH?";
+            return false;
+        }
+        CloseHandle(pi.hThread);
+        proc = pi.hProcess;
+        wr = inWr;
+        rd = outRd;
+        return true;
+    }
+
+    void stop() {
+        if (wr) {
+            // A clean `quit` lets loom exit on its own; closing stdin is the backstop
+            // (serve_viewer's loop ends at EOF).
+            const char* bye = "{\"cmd\":\"quit\"}\n";
+            DWORD done = 0;
+            WriteFile(wr, bye, (DWORD)std::strlen(bye), &done, nullptr);
+            CloseHandle(wr); wr = nullptr;
+        }
+        if (proc) {
+            if (WaitForSingleObject(proc, 3000) != WAIT_OBJECT_0)
+                TerminateProcess(proc, 1);      // wedged in user code — don't leak it
+            CloseHandle(proc); proc = nullptr;
+        }
+        if (rd) { CloseHandle(rd); rd = nullptr; }
+        rx.clear();
+    }
+
+    bool readLine(std::string& line, std::string& err) {
+        for (;;) {
+            size_t nl = rx.find('\n');
+            if (nl != std::string::npos) {
+                line = rx.substr(0, nl);
+                rx.erase(0, nl + 1);
+                return true;
+            }
+            char buf[8192];
+            DWORD got = 0;
+            if (!ReadFile(rd, buf, (DWORD)sizeof buf, &got, nullptr) || got == 0) {
+                err = "loom link: the python process closed its output"
+                      " (see its traceback on stderr)";
+                return false;
+            }
+            rx.append(buf, got);
+        }
+    }
+
+    // One request/ack round trip. A transport failure tears the link down (there is
+    // no resynchronising a half-written pipe); a protocol-level `ok:false` leaves it
+    // up, since loom reports scene errors that way and stays serving.
+    bool call(const std::string& line, minijson::Value& ack, std::string& err) {
+        if (!alive()) { err = "loom link is not running"; return false; }
+        std::string msg = line;
+        msg.push_back('\n');
+        for (size_t off = 0; off < msg.size(); ) {
+            DWORD done = 0;
+            if (!WriteFile(wr, msg.data() + off, (DWORD)(msg.size() - off), &done, nullptr)
+                || done == 0) {
+                err = "loom link: write failed (the python process exited?)";
+                stop();
+                return false;
+            }
+            off += done;
+        }
+        std::string reply;
+        if (!readLine(reply, err)) { stop(); return false; }
+        std::string perr;
+        if (!minijson::parse(reply, ack, perr)) {
+            err = "loom link: unparsable ack (" + perr + ")";
+            return false;
+        }
+        const minijson::Value* okv = ack.find("ok");
+        if (!okv || !okv->asBool(false)) {
+            const minijson::Value* e = ack.find("error");
+            err = "loom: " + (e && e->isString() ? e->str : std::string("request failed"));
+            return false;
+        }
+        return true;
+    }
+};
+
+// One re-derivation request. `params` values are raw JSON text so any declared type
+// round-trips unchanged (an int stays `8`, not `8.0` — see loom's `types` ack).
+struct LoomJob {
+    long long seq = 0;
+    int  frame = 0, frames = 1;
+    std::vector<std::pair<std::string, std::string>> params;
+    bool wantSidecar = true;    // re-introspect: curves / fields / MESH geometry
+    bool wantSource  = true;    // re-emit .ftsl: the Render tab's raymarched field
+};
+
+struct LoomResult {
+    long long   seq = 0;
+    bool        ok  = false;
+    std::string err;
+    std::string sidecarPath;    // temp file loom wrote (empty when not requested)
+    std::string sourcePath;
+    double      ms = 0.0;
+};
+
+struct LoomBridge {
+    LoomBridge() = default;
+    // Owns a thread, a child process and three handles: not copyable, and destroying it
+    // MUST stop the worker. `runViewerGui` has early returns after the bridge is
+    // started (the D3D-device failure path), and ~std::thread on a joinable thread
+    // calls std::terminate — an "the device didn't come up" message would have become
+    // an abort instead.
+    LoomBridge(const LoomBridge&) = delete;
+    LoomBridge& operator=(const LoomBridge&) = delete;
+    ~LoomBridge() { stop(); }
+
+    // ---- UI thread ----
+    bool start(const std::string& scenePy, std::string& err) {
+        if (!link_.start(scenePy, err)) return false;
+        // Ask for the controls synchronously, before the worker owns the link.
+        minijson::Value ack;
+        if (!link_.call("{\"cmd\":\"params\"}", ack, err)) { link_.stop(); return false; }
+        if (const minijson::Value* p = ack.find("params"); p && p->isObject())
+            for (const auto& kv : p->obj) paramDefaults_.push_back({kv.first, kv.second});
+        if (const minijson::Value* t = ack.find("types"); t && t->isObject())
+            for (const auto& kv : t->obj) paramTypes_[kv.first] = kv.second.asString("float");
+        if (!makeTempDir(err)) { link_.stop(); return false; }
+        worker_ = std::thread([this] { workerMain(); });
+        return true;
+    }
+
+    // Idempotent: the destructor calls it too, and an explicit stop() before the
+    // viewer's normal teardown is still the common path.
+    void stop() {
+        if (worker_.joinable()) {
+            { std::lock_guard<std::mutex> lk(m_); quit_ = true; }
+            cv_.notify_one();
+            worker_.join();
+        }
+        link_.stop();
+        if (!tempDir_.empty()) {
+            std::lock_guard<std::mutex> lk(m_);
+            for (const auto& f : temps_) DeleteFileA(f.c_str());
+            temps_.clear();
+            // Sweep the whole scratch directory, not just the files we named: emitting
+            // an .ftsl also drops the mesh assets it references (loom's `asset_path`
+            // writes .obj next to `out`), and RemoveDirectory fails on a non-empty dir.
+            WIN32_FIND_DATAA fd{};
+            HANDLE h = FindFirstFileA((tempDir_ + "\\*").c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    DeleteFileA((tempDir_ + "\\" + fd.cFileName).c_str());
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+            RemoveDirectoryA(tempDir_.c_str());
+            tempDir_.clear();
+        }
+    }
+
+    // LATEST WINS: this overwrites any job that has not started yet.
+    void post(LoomJob j) {
+        std::lock_guard<std::mutex> lk(m_);
+        j.seq = ++seq_;
+        pending_ = std::move(j);
+        hasPending_ = true;
+        cv_.notify_one();
+    }
+
+    bool take(LoomResult& out) {
+        std::lock_guard<std::mutex> lk(m_);
+        if (!hasResult_) return false;
+        out = result_;
+        hasResult_ = false;
+        return true;
+    }
+
+    // "a re-derivation is happening or is about to" — drives the UI's spinner and
+    // keeps a drag from being reported as idle between two jobs.
+    bool busy() const {
+        std::lock_guard<std::mutex> lk(m_);
+        return running_ || hasPending_;
+    }
+    bool linkUp() const {
+        std::lock_guard<std::mutex> lk(m_);
+        return !dead_;
+    }
+    std::string deadReason() const {
+        std::lock_guard<std::mutex> lk(m_);
+        return deadErr_;
+    }
+    const std::vector<std::pair<std::string, minijson::Value>>& paramDefaults() const {
+        return paramDefaults_;
+    }
+    std::string paramType(const std::string& name) const {
+        auto it = paramTypes_.find(name);
+        return it == paramTypes_.end() ? std::string("float") : it->second;
+    }
+    const std::string& command() const { return link_.cmdline; }
+
+    // temp scratch files the UI has finished reading
+    void reap(const std::string& path) {
+        if (path.empty()) return;
+        DeleteFileA(path.c_str());
+        std::lock_guard<std::mutex> lk(m_);
+        forgetLocked(path);
+    }
+
+private:
+    // `temps_` is the outstanding-scratch-file set, not a log: a long sweep posts
+    // hundreds of jobs, so entries must leave it as the files are deleted or it (and
+    // the %TEMP% directory it mirrors) would grow without bound for the session.
+    void forgetLocked(const std::string& path) {
+        for (size_t i = 0; i < temps_.size(); ++i)
+            if (temps_[i] == path) { temps_[i] = temps_.back(); temps_.pop_back(); return; }
+    }
+
+    void dropLocked(const std::string& path) {
+        if (path.empty()) return;
+        DeleteFileA(path.c_str());
+        forgetLocked(path);
+    }
+
+    // Delete `ftrace_viewer_<pid>` directories left behind by viewers that died without
+    // running stop() — a crash, or the user killing the process. `stop()` handles the
+    // orderly exit, but nothing can clean up after a kill except the *next* run, and a
+    // scene bake drops a multi-megabyte sidecar plus its .obj assets each time, so
+    // without this %TEMP% accumulates them for as long as the machine stands. A PID is
+    // reused eventually, hence the liveness probe rather than an age heuristic:
+    // OpenProcess failing with ERROR_INVALID_PARAMETER is Windows saying "no such pid".
+    static void sweepOrphanTempDirs(const char* tmp) {
+        char pat[MAX_PATH + 64];
+        std::snprintf(pat, sizeof pat, "%sftrace_viewer_*", tmp);
+        WIN32_FIND_DATAA fd{};
+        HANDLE h = FindFirstFileA(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            const char* pidTxt = std::strrchr(fd.cFileName, '_');
+            if (!pidTxt || !pidTxt[1]) continue;
+            const DWORD pid = (DWORD)std::strtoul(pidTxt + 1, nullptr, 10);
+            if (pid == 0 || pid == GetCurrentProcessId()) continue;
+            HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (ph) { CloseHandle(ph); continue; }               // still running: leave it
+            if (GetLastError() != ERROR_INVALID_PARAMETER) continue;  // exists, just not ours
+            std::string dir = std::string(tmp) + fd.cFileName;
+            WIN32_FIND_DATAA f2{};
+            HANDLE h2 = FindFirstFileA((dir + "\\*").c_str(), &f2);
+            if (h2 != INVALID_HANDLE_VALUE) {
+                do {
+                    if (f2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    DeleteFileA((dir + "\\" + f2.cFileName).c_str());
+                } while (FindNextFileA(h2, &f2));
+                FindClose(h2);
+            }
+            RemoveDirectoryA(dir.c_str());
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+
+    bool makeTempDir(std::string& err) {
+        char tmp[MAX_PATH + 1];
+        DWORD n = GetTempPathA(MAX_PATH, tmp);
+        if (n == 0 || n > MAX_PATH) { err = "GetTempPath failed"; return false; }
+        sweepOrphanTempDirs(tmp);
+        char dir[MAX_PATH + 64];
+        std::snprintf(dir, sizeof dir, "%sftrace_viewer_%lu", tmp, GetCurrentProcessId());
+        if (!CreateDirectoryA(dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+            err = "cannot create the viewer scratch directory"; return false;
+        }
+        tempDir_ = dir;
+        return true;
+    }
+
+    // Called on the worker thread, so the bookkeeping must take the lock (tempDir_ is
+    // written once, before the worker exists, and is only cleared after it is joined).
+    std::string scratch(long long seq, const char* ext) {
+        char b[MAX_PATH + 64];
+        std::snprintf(b, sizeof b, "%s\\live_%lld%s", tempDir_.c_str(), seq, ext);
+        std::string p = b;
+        { std::lock_guard<std::mutex> lk(m_); temps_.push_back(p); }
+        return p;
+    }
+
+    std::string requestLine(const char* cmd, const LoomJob& j, const std::string& out) {
+        std::string s = "{\"cmd\":\"";
+        s += cmd;
+        s += "\",\"clock\":{\"frame\":" + std::to_string(j.frame)
+           + ",\"frames\":" + std::to_string(j.frames) + "},\"params\":{";
+        for (size_t i = 0; i < j.params.size(); ++i) {
+            if (i) s += ",";
+            s += "\"" + jsonEsc(j.params[i].first) + "\":" + j.params[i].second;
+        }
+        s += "},\"out\":\"" + jsonEsc(out) + "\"}";
+        return s;
+    }
+
+    void workerMain() {
+        for (;;) {
+            LoomJob job;
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [this] { return quit_ || hasPending_; });
+                if (quit_) return;
+                job = pending_;
+                hasPending_ = false;     // whatever else was posted meanwhile is gone
+                running_ = true;
+            }
+            LoomResult r;
+            r.seq = job.seq;
+            LARGE_INTEGER f, t0, t1;
+            QueryPerformanceFrequency(&f);
+            QueryPerformanceCounter(&t0);
+            std::string err;
+            bool ok = true;
+            minijson::Value ack;
+            // A failed request may still have left a partial file behind: drop it here
+            // rather than let it sit in temps_ until the viewer exits.
+            if (ok && job.wantSidecar) {
+                std::string out = scratch(job.seq, ".json");
+                ok = link_.call(requestLine("introspect", job, out), ack, err);
+                if (ok) r.sidecarPath = out;
+                else { std::lock_guard<std::mutex> lk(m_); dropLocked(out); }
+            }
+            if (ok && job.wantSource) {
+                std::string out = scratch(job.seq, ".ftsl");
+                ok = link_.call(requestLine("emit", job, out), ack, err);
+                if (ok) r.sourcePath = out;
+                else { std::lock_guard<std::mutex> lk(m_); dropLocked(out); }
+            }
+            QueryPerformanceCounter(&t1);
+            r.ms = f.QuadPart ? 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart) : 0.0;
+            r.ok = ok;
+            r.err = err;
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                // A result must never overwrite a FRESHER one the UI has not read yet;
+                // with one job in flight at a time that can't happen, but the guard
+                // makes the invariant explicit rather than incidental.
+                if (!hasResult_ || r.seq >= result_.seq) {
+                    // Superseding an unread result: the UI will never call reap() for
+                    // its files, so they have to go here or a fast sweep leaves one
+                    // scratch pair per skipped bake behind in %TEMP%.
+                    if (hasResult_) {
+                        dropLocked(result_.sidecarPath);
+                        dropLocked(result_.sourcePath);
+                    }
+                    result_ = r;
+                    hasResult_ = true;
+                } else {
+                    dropLocked(r.sidecarPath);
+                    dropLocked(r.sourcePath);
+                }
+                running_ = false;
+                if (!ok && !link_.alive()) { dead_ = true; deadErr_ = err; }
+            }
+        }
+    }
+
+    LoomLink link_;
+    std::thread worker_;
+    mutable std::mutex m_;
+    std::condition_variable cv_;
+    LoomJob    pending_;
+    LoomResult result_;
+    bool hasPending_ = false, hasResult_ = false, running_ = false, quit_ = false;
+    bool dead_ = false;
+    std::string deadErr_;
+    long long seq_ = 0;
+    std::string tempDir_;
+    std::vector<std::string> temps_;
+    std::vector<std::pair<std::string, minijson::Value>> paramDefaults_;
+    std::map<std::string, std::string> paramTypes_;
+};
+
+// Seed the controls from what loom advertised.
+static void liveSeedParams(LivePanel& lp, const LoomBridge& br) {
+    for (const auto& kv : br.paramDefaults()) {
+        LiveParam p;
+        p.name = kv.first;
+        const std::string ty = br.paramType(kv.first);
+        const minijson::Value& v = kv.second;
+        if (ty == "bool")       { p.kind = 2; p.bval = v.asBool(false); }
+        else if (ty == "int")   { p.kind = 1; p.num  = v.asNumber(0.0); }
+        else if (ty == "float") { p.kind = 0; p.num  = v.asNumber(0.0); }
+        else if (ty == "str")   { p.kind = 3; p.text = "\"" + jsonEsc(v.asString("")) + "\""; }
+        else                    { p.kind = 3; p.text = "null"; }
+        // A drag should cross the interesting range in a screen-width of travel, so
+        // scale it to the default's own magnitude (and never to exactly zero).
+        double mag = std::abs(p.num);
+        p.speed = (p.kind == 1) ? std::max(1.0, mag * 0.02)
+                                : std::max(1e-4, mag * 0.005);
+        lp.params.push_back(std::move(p));
+    }
+    // Default the sweep axis to the first continuous control — the one "rotating into
+    // a parameter dimension" actually means something for.
+    for (size_t i = 0; i < lp.params.size(); ++i)
+        if (lp.params[i].kind == 0 || lp.params[i].kind == 1) { lp.sweep = (int)i; break; }
+}
+
+static LoomJob liveJob(const LivePanel& lp, bool wantSidecar, bool wantSource) {
+    LoomJob j;
+    j.frame = lp.frame;
+    j.frames = std::max(1, lp.frames);
+    j.wantSidecar = wantSidecar;
+    j.wantSource = wantSource;
+    for (const auto& p : lp.params) j.params.push_back({p.name, p.toJson()});
+    return j;
+}
+
+// The left-column "Live (loom)" section. Returns true when something the geometry
+// depends on moved this frame.
+static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
+    bool changed = false;
+    if (!lp.up) {
+        ImGui::TextWrapped("Not connected - the viewer is showing the static sidecar.");
+        if (!lp.startErr.empty())
+            ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "%s", lp.startErr.c_str());
+        ImGui::TextDisabled("Pass -loom <scene.py> (or use a sidecar carrying a `build` "
+                            "key) to re-derive geometry live.");
+        return false;
+    }
+    if (!br.linkUp()) {
+        ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "loom link lost");
+        std::string why = br.deadReason();
+        if (!why.empty()) ImGui::TextWrapped("%s", why.c_str());
+        return false;
+    }
+    ImGui::TextDisabled("%s", br.command().c_str());
+    if (br.busy()) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.5f, 0.9f, 1, 1), "[re-deriving]"); }
+    ImGui::Text("posted %lld / baked %lld", lp.posted, lp.baked);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(last #%lld, %.0f ms)", lp.appliedSeq, lp.lastMs);
+    if (!lp.lastErr.empty())
+        ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "%s", lp.lastErr.c_str());
+
+    // `changed` = a control moved; `forced` = the user asked for it outright. With
+    // auto off, a drag still updates the displayed value but costs no bake until the
+    // button is pressed — which is the point of the switch on a slow scene.
+    bool forced = false;
+    ImGui::Checkbox("auto", &lp.autoApply);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("re-derive on every change; off = only on `re-derive now`");
+    ImGui::SameLine();
+    if (ImGui::Button("re-derive now")) forced = true;
+
+    // --- the clock, which is a parameter dimension like any other ---
+    ImGui::SetNextItemWidth(140);
+    if (ImGui::SliderInt("frame", &lp.frame, 0, std::max(0, lp.frames - 1))) changed = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    if (ImGui::DragInt("frames", &lp.frames, 1.0f, 1, 100000)) {
+        if (lp.frames < 1) lp.frames = 1;
+        if (lp.frame >= lp.frames) lp.frame = lp.frames - 1;
+        changed = true;
+    }
+
+    // --- the build's declared params ---
+    if (lp.params.empty()) {
+        ImGui::TextDisabled("(the build declares no keyword params)");
+    } else {
+        for (size_t i = 0; i < lp.params.size(); ++i) {
+            LiveParam& p = lp.params[i];
+            ImGui::PushID((int)i);
+            bool isAxis = ((int)i == lp.sweep);
+            if (p.kind == 0 || p.kind == 1) {
+                if (ImGui::RadioButton("##axis", isAxis)) lp.sweep = isAxis ? -1 : (int)i;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("make this the canvas sweep axis (right-drag to rotate into it)");
+                ImGui::SameLine();
+            } else {
+                ImGui::Dummy(ImVec2(ImGui::GetFrameHeight(), 0));
+                ImGui::SameLine();
+            }
+            ImGui::SetNextItemWidth(150);
+            if (p.kind == 2) {
+                if (ImGui::Checkbox(p.name.c_str(), &p.bval)) changed = true;
+            } else if (p.kind == 3) {
+                ImGui::LabelText(p.name.c_str(), "%s", p.text.c_str());
+            } else if (p.kind == 1) {
+                int v = (int)llround(p.num);
+                if (ImGui::DragInt(p.name.c_str(), &v, (float)p.speed)) { p.num = v; changed = true; }
+            } else {
+                float v = (float)p.num;
+                if (ImGui::DragFloat(p.name.c_str(), &v, (float)p.speed, 0.0f, 0.0f, "%.4g")) {
+                    p.num = v; changed = true;
+                }
+            }
+            ImGui::PopID();
+        }
+    }
+    return forced || (lp.autoApply && changed);
+}
+
+// --------------------------------------------------------------------------
 // Entry point
 // --------------------------------------------------------------------------
-int runViewerGui(const std::string& sidecarPath) {
+int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
     Sidecar sc;
     if (!sc.load(sidecarPath)) {
         std::fprintf(stderr, "error: -viewer: %s\n", sc.err.c_str());
@@ -1951,7 +2704,35 @@ int runViewerGui(const std::string& sidecarPath) {
     }
 #ifdef HAVE_CUDA
     RenderPane rpane;
+    const bool liveWantSource = true;
+#else
+    // No raymarch pane to feed, so don't make loom emit an .ftsl nobody reads.
+    const bool liveWantSource = false;
 #endif
+
+    // --- F4 item 2: the live re-introspection channel -------------------------
+    // Which loom file to talk to: an explicit `-loom` wins, else the sidecar's own
+    // `build` provenance key (loom records the file its `build()` came from). Neither
+    // present — or python/loom not importable — is NOT an error: the viewer stays
+    // frozen on the static sidecar and the Live panel says exactly why.
+    LoomBridge bridge;
+    LivePanel  live;
+    {
+        if (const minijson::Value* fr = sc.root.find("frame"); fr && fr->isObject()) {
+            live.frame  = fr->intAt("frame", 0);
+            live.frames = std::max(1, fr->intAt("frames", 1));
+        }
+        const std::string scenePy = loomScene.empty() ? sc.buildFile() : loomScene;
+        if (!scenePy.empty()) {
+            if (bridge.start(scenePy, live.startErr)) {
+                live.up = true;
+                liveSeedParams(live, bridge);
+            } else {
+                std::fprintf(stderr, "[viewer] live channel unavailable: %s\n",
+                             live.startErr.c_str());
+            }
+        }
+    }
 
     // --- window ---
     // MUST precede window creation. Without it Windows DPI-*virtualizes* the process on
@@ -1999,13 +2780,61 @@ int runViewerGui(const std::string& sidecarPath) {
 
     // F4 skins — needs the device, so it happens after CreateDeviceD3D. Relative
     // image paths in the sidecar fall back to the sidecar's own directory.
-    SkinLib skins;
+    // baseDir is hoisted out because a live re-derivation rebuilds the skins against
+    // the SAME directory — loom's scratch sidecar lives in %TEMP%, but the image paths
+    // in it are still relative to the original scene, not to the scratch file.
+    std::string baseDir;
     {
-        std::string baseDir;
         size_t cut = sidecarPath.find_last_of("/\\");
         if (cut != std::string::npos) baseDir = sidecarPath.substr(0, cut + 1);
-        skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
     }
+    SkinLib skins;
+    skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
+
+    // Fold a freshly re-derived sidecar into the panes (F4 item 2). What loom re-derived
+    // is the GEOMETRY; the VIEW is ours, so orbit / zoom / dim selection / tab choice are
+    // deliberately preserved — a parameter sweep that snapped the camera back to its
+    // default on every bake would be unusable.
+    auto adoptSidecar = [&](const std::string& path) -> bool {
+        Sidecar ns;
+        if (!ns.load(path)) { live.lastErr = "sidecar: " + ns.err; return false; }
+        std::vector<int> oldIds;
+        for (const auto& n : dag.nodes) oldIds.push_back(n.id);
+
+        sc = std::move(ns);
+        curves = collectCurves(sc);
+        strips = buildStrips(curves);
+        fields = collectFields(sc);
+        meshes = collectMeshes(sc);
+        for (const auto& c : curves) view.maxDim  = std::max(view.maxDim,  c.dim);
+        for (const auto& f : fields) fview.maxDim = std::max(fview.maxDim, f.dim);
+
+        DagGraph nd = collectDag(sc);
+        std::vector<int> newIds;
+        for (const auto& n : nd.nodes) newIds.push_back(n.id);
+        // Same node set = the same graph with new values, so keep the layout the user
+        // panned/zoomed to. A different node set is a different graph: re-lay it out,
+        // carrying over only the docked-vs-maximized choice (which is about the window,
+        // not the graph).
+        if (newIds == oldIds) {
+            nd.pos            = dag.pos;
+            nd.realSize       = dag.realSize;
+            nd.sizesValid     = dag.sizesValid;
+            nd.extent         = dag.extent;
+            nd.measuredFont   = dag.measuredFont;
+            nd.measuredAvailH = dag.measuredAvailH;
+            nd.zoom           = dag.zoom;
+            nd.fitted         = dag.fitted;
+            nd.fitCanvasW     = dag.fitCanvasW;
+            nd.laidOut        = dag.laidOut;
+        }
+        nd.maximized = dag.maximized;
+        dag = std::move(nd);
+
+        skins.release();
+        skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
+        return true;
+    };
 
     bool done = false;
     bool firstFrame = true;   // one-shot: default-select the primary geometry tab
@@ -2017,6 +2846,45 @@ int runViewerGui(const std::string& sidecarPath) {
             if (msg.message == WM_QUIT) done = true;
         }
         if (done) break;
+
+        // Fold in whatever loom finished since the last frame. The UI never waits on a
+        // bake — it keeps drawing the geometry it already has and adopts the new one on
+        // whatever frame it lands.
+        if (live.up) {
+            LoomResult r;
+            if (bridge.take(r)) {
+                live.appliedSeq = r.seq;
+                ++live.baked;
+                live.lastMs  = r.ms;
+                live.lastErr = r.ok ? std::string() : r.err;
+                if (r.ok) {
+                    if (!r.sidecarPath.empty()) adoptSidecar(r.sidecarPath);
+                    if (!r.sourcePath.empty()) {
+                        ftsl::Loaded nl;
+                        std::string  nerr;
+                        if (ftsl::load(r.sourcePath, nl, nerr)) {
+                            loaded  = std::move(nl);
+                            sceneOk = true;
+                            sceneErr.clear();
+#ifdef HAVE_CUDA
+                            // Re-frame on the new bounds but keep yaw/pitch/dist: the
+                            // user's orbit survives the sweep (initFrom touches only
+                            // center/radius, and marks the pane dirty).
+                            rpane.initFrom(loaded.scene);
+#endif
+                        } else {
+                            // A re-derived scene ftrace cannot load is a real error and
+                            // must be said out loud, not silently left on stale geometry.
+                            sceneOk      = false;
+                            sceneErr     = nerr;
+                            live.lastErr = "ftsl: " + nerr;
+                        }
+                    }
+                }
+                bridge.reap(r.sidecarPath);
+                bridge.reap(r.sourcePath);
+            }
+        }
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -2032,8 +2900,13 @@ int runViewerGui(const std::string& sidecarPath) {
         ImGui::Text("sidecar: %s", sidecarPath.c_str());
         ImGui::Separator();
 
+        bool livePost = false;    // something the geometry depends on moved this frame
+
         float leftW = ImGui::GetContentRegionAvail().x * 0.42f;
         ImGui::BeginChild("left", ImVec2(leftW, 0), true);
+        if (ImGui::CollapsingHeader("Live (loom)",
+                                    live.up ? ImGuiTreeNodeFlags_DefaultOpen : 0))
+            livePost = drawLivePanel(live, bridge);
         if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen))
             drawScenePanel(sc);
         if (ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen))
@@ -2097,8 +2970,10 @@ int runViewerGui(const std::string& sidecarPath) {
                 // point of the viewer, so it opens selected.
                 ImGuiTabItemFlags rf = firstFrame ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem("Render", nullptr, rf)) {
-                    drawRenderPane(rpane, loaded.scene, sceneOk, sceneErr,
-                                   g_pd3dDevice, g_pd3dDeviceContext);
+                    if (drawRenderPane(rpane, loaded.scene, sceneOk, sceneErr,
+                                       g_pd3dDevice, g_pd3dDeviceContext,
+                                       live.up ? &live : nullptr) && live.autoApply)
+                        livePost = true;
                     ImGui::EndTabItem();
                 }
             }
@@ -2127,7 +3002,9 @@ int runViewerGui(const std::string& sidecarPath) {
                 // unless the live Render tab is present, which takes priority.
                 ImGuiTabItemFlags mf = (firstFrame && !haveRender) ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem("Meshes", nullptr, mf)) {
-                    drawMeshPane(meshes, mview, skins);
+                    if (drawMeshPane(meshes, mview, skins, live.up ? &live : nullptr)
+                        && live.autoApply)
+                        livePost = true;
                     ImGui::EndTabItem();
                 }
             }
@@ -2167,6 +3044,14 @@ int runViewerGui(const std::string& sidecarPath) {
             if (!open || ImGui::IsKeyPressed(ImGuiKey_Escape)) dag.maximized = false;
         }
 
+        // At most one post per frame, and posting OVERWRITES any job that has not
+        // started: a fast sweep drag therefore costs one bake of wherever the user
+        // ends up, not one bake per intermediate frame. That is the latest-wins rule.
+        if (livePost && live.up && bridge.linkUp()) {
+            bridge.post(liveJob(live, /*wantSidecar=*/true, liveWantSource));
+            ++live.posted;
+        }
+
         ImGui::Render();
         const float clear[4] = { 0.10f, 0.10f, 0.12f, 1.0f };
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRTV, nullptr);
@@ -2176,6 +3061,9 @@ int runViewerGui(const std::string& sidecarPath) {
         firstFrame = false;
     }
 
+    // Ask loom to quit and join the worker BEFORE tearing D3D down — a result landing
+    // mid-shutdown would otherwise rebuild skins against a released device.
+    bridge.stop();
 #ifdef HAVE_CUDA
     rpane.release();   // free the raymarch texture before the D3D device goes away
 #endif

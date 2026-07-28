@@ -4742,3 +4742,84 @@ smoothing at extreme magnification.
 (b) pre-expand the wrap mode into the *UVs* at bake time (clamp/mirror the per-vertex UVs
 on the CPU before `PrimVtx`), which is cheaper but only correct when a triangle doesn't
 straddle the tile boundary. (a) is the real answer.
+
+## OPEN (cosmetic, 2026-07-28): `python -m loom.viewer` prints a runpy double-import RuntimeWarning
+Starting the F4 live channel spawns `python -X utf8 -u -m loom.viewer <scene.py>`, and
+Python's `runpy` prints to stderr:
+
+```
+RuntimeWarning: 'loom.viewer' found in sys.modules after import of package 'loom',
+but prior to execution of 'loom.viewer'; this may result in unpredictable behaviour
+```
+
+Cause: `tools/loom/loom/__init__.py` re-exports the viewer API (`from .viewer import
+ViewerModel, serve_viewer, ...`), so importing the *package* `loom` — which `-m
+loom.viewer` does first — already puts `loom.viewer` in `sys.modules`; runpy then
+executes the same file a second time as `__main__`. It is harmless here (the module has
+no import-time side effects and the duplicate module object is never handed out), but
+`LoomLink` deliberately gives the child ftrace's own stderr so a scene traceback is
+readable, which means the warning lands on the user's console on every viewer launch.
+
+**Proper fix:** give the CLI its own entry module — `tools/loom/loom/__main__.py`-style
+`loom/viewer_main.py` (or a `console_scripts`-shaped `loom.viewer.__main__`) that only
+does `from .viewer import serve_viewer; serve_viewer(...)`, and switch `LoomLink::start`
+and the documented invocation to it. `-m loom.viewer` should keep working (deprecated),
+so the ftrace side must not hard-depend on the new name until the docs are updated
+together.
+
+## DONE (2026-07-28, 0.92.0): the DAG panel crashed in `PrimReserve` — imgui #7543 vs. imnodes node rects
+
+The viewer's Graph pane died intermittently with an access violation writing to `0x20`,
+always on the same stack: `drawDagPanel` → `ImNodes::EndNodeEditor` → `DrawLink` →
+`ImDrawList::AddBezierCubic` → `PrimReserve` → `memcpy`. Working set at the fault was
+~9.9 GB.
+
+**Root cause** — an upstream ImGui behaviour change that imnodes was never updated for.
+Since 1.90.7 (imgui #7543) `EndGroup()` folds `g.LastItemData.Rect.Max` into the group's
+bounding box as a workaround for `EndTable()` undershooting `CursorMaxPos`:
+
+```cpp
+ImRect group_bb(group_data.BackupCursorPos,
+                ImMax(ImMax(window->DC.CursorMaxPos, g.LastItemData.Rect.Max),
+                      group_data.BackupCursorPos));
+```
+
+`BeginGroup()` backs up and resets `CursorMaxPos`, but it never clears `LastItemData`.
+For normal stacked layout that is harmless — the previous item is above and to the left.
+imnodes is the pathological case: it hard-positions every node anywhere on the canvas via
+`SetCursorPos`, so "the previous item" is *the previously drawn node*, and each node's
+reported rect became the running maximum of every earlier node's right/bottom edge.
+ftrace then feeds `GetNodeDimensions()` back into `measureDag` to lay the graph out, so
+the extent grew geometrically frame over frame (748 → 5443 → 110498 → …) until a link was
+~1e8 px long. `GetCubicBezier` scales `NumSegments` with link length at 0.1/px and never
+bounds it, so that one link asked for ~80M segments → ~322M `ImDrawVert` (~6.9 GB);
+`PrimReserve`'s allocation returned null and the following `memcpy` wrote through it.
+
+**Fix** (three parts, all in `src/third_party/imnodes/imnodes.cpp`, marked
+`[ftrace patch]`): a `ResetLastItemForGroup()` helper called immediately before every
+`ImGui::BeginGroup()` in imnodes (`BeginNodeEditor`, `BeginNode`, `BeginNodeTitleBar`,
+`BeginPinAttribute`, `BeginStaticAttribute`); an explicit `LastItemData.Rect` override in
+`EndNodeTitleBar`, because `GetNodeTitleRect()` is as wide as *last frame's* node and
+leaving it as the last item would latch a node to its historical maximum width so it could
+never shrink again (e.g. on zoom-out); and a `ImClamp(..., 1, 4096)` on
+`GetCubicBezier`'s segment count as defence in depth, so a single stray coordinate can
+never again turn one link into a multi-gigabyte vertex request.
+
+Verified: working set 9882 MB → 256 MB, extent stable at 748×198.2, and a 20-round
+scripted right-drag sweep (`scraps/viewer_hammer.ps1`) ran to completion with memory
+oscillating 315–821 MB and no monotone growth.
+
+## DONE (2026-07-28, 0.92.0): the DAG panel re-packed itself when its pane was scrolled out of view
+
+Second bug, found while validating the fix above. `drawDagPanel` adopts imnodes'
+`GetNodeDimensions()` as the authoritative node size, but the Graph pane sits at the
+bottom of a scrolling side column and is routinely clipped to **zero height**. ImGui then
+sets `SkipItems` on the canvas window and every `ImGui::Text` inside a node returns without
+measuring anything — yet imnodes still reports a rect, namely the node origin expanded by
+`NodePadding`. Adopting that re-packed the whole graph at ~16×32 px per node, so the layout
+was visibly wrong the moment the user scrolled the pane back into view.
+
+**Fix:** reject the entire frame's measurements unless *every* node's reported content
+width exceeds `2 * NodePadding.x * zoom`. A node always draws at least its title, so a
+content width of zero means "not measured this frame", never "an empty node". The previous
+frame's sizes are kept until a frame that actually drew comes along.

@@ -2678,8 +2678,29 @@ isosurfaces are baked to a marching-cubes mesh and shown in the same Meshes tab.
 and sphere-traces the field bytecode via `renderIsoPreviewCuda` (the `-raster-gpu` preview
 kernel — no tessellation), driven by an orbit camera (drag to rotate, wheel to dolly) with
 resolution and FOV controls, blitting each converged frame into a D3D11 texture. This is the
-actual field rather than the static marching-cubes mesh. (Still in progress: live
-re-tessellation when you rotate *into* a parameter dimension — see §F in `TODO.md`.)
+actual field rather than the static marching-cubes mesh.
+
+**Live re-derivation (`-loom <scene.py>`).** Everything above reads a sidecar that was
+frozen when loom wrote it, so orbiting can only re-project geometry that already exists.
+Add `-loom <scene.py>` (or open a sidecar that carries a `build` provenance key) and the
+viewer keeps a **loom process alive alongside itself** — `python -m loom.viewer <scene.py>`
+over a newline-delimited-JSON channel — so it can *re-derive* the scene instead of merely
+re-viewing it. A **Live (loom)** section in the left column shows the link state, a
+`frame`/`frames` clock scrub, and one control per keyword parameter the scene's
+`build(clock=None, **params)` declares — float and int drags, checkboxes, string labels —
+typed from the values loom reports. Moving any of them re-runs `build()`, re-emits the
+`.ftsl` plus its mesh assets, and the Curves / Fields / Meshes / Render panes all adopt the
+new geometry on whatever frame it lands, keeping your orbit, zoom, tab and DAG layout.
+Pick one continuous parameter as the **sweep axis** (the radio button beside it) and
+**right-dragging any 3-D pane rotates into that dimension** — the gesture the static viewer
+could never offer, since the extra dimension isn't in the sidecar until someone bakes it.
+Bakes run on a worker thread and are **latest-wins**: a job that hasn't started yet is
+overwritten, so a fast drag costs one bake of wherever you end up rather than one per
+intermediate frame, and the UI never blocks on loom. The panel's `posted / baked` counters
+make that visible (`posted > baked` is the collapsing working), alongside the last bake's
+sequence number and wall time. `auto` off defers bakes to the **re-derive now** button for
+scenes too slow to rebuild interactively; a scene that raises, or emits an `.ftsl` ftrace
+can't load, reports the error in the panel and leaves the last good geometry on screen.
 
 ---
 

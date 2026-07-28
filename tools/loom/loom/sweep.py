@@ -17,6 +17,8 @@ scene-level :class:`~loom.scene.SweptMesh` element wires it to emission.
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 from typing import List, Sequence, Tuple
 
 Vec3 = Tuple[float, float, float]
@@ -211,7 +213,29 @@ def line_profile(half_width: float = 0.5) -> List[Vec2]:
 
 
 def write_obj(path, verts: Sequence[Vec3], faces: Sequence[Tuple[int, int, int]]) -> None:
+    """Write an OBJ **atomically** (temp file in the same directory + ``os.replace``).
+
+    A plain ``open(path, "w")`` truncates first and fills in afterwards, so anything
+    reading the file meanwhile sees an empty or half-written mesh whose ``f`` lines
+    reference vertices that aren't there yet.  That window is not hypothetical: the
+    live viewer channel (§F4) re-emits a scene on a worker thread while ftrace is
+    still loading the *previous* emission's assets out of the same directory.
+    Replacing the whole file in one step makes a reader see either the old mesh or
+    the new one, never a splice of the two.
+    """
     lines = [f"v {v[0]:.6g} {v[1]:.6g} {v[2]:.6g}" for v in verts]
     lines += [f"f {a + 1} {b + 1} {c + 1}" for (a, b, c) in faces]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    text = "\n".join(lines) + "\n"
+    path = str(path)
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(suffix=".obj.tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise

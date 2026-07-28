@@ -5,7 +5,7 @@ long prose blocks whose opening paragraph reads like a plan but whose later
 `**STATUS (date) … DONE**` sub-paragraph says it landed. That makes "what's actually left?"
 expensive to answer.
 
-**This file is the actionable extract, as of 2026-07-28 (ftrace v0.90.0).** It carries only
+**This file is the actionable extract, as of 2026-07-28 (ftrace v0.92.0).** It carries only
 work that is genuinely undone *and* not explicitly ruled out. `TODO.md` remains the
 authoritative design text — every item below names its section/item ID there, and the full
 rationale, prior art and scoping live in that entry, not here.
@@ -141,17 +141,23 @@ Explicitly parked: *"the grammar's real job is ftrace's parser — so this waits
 editor need exists."* The motivating consumer would be an editor/GUI (load an existing `.ftsl`,
 manipulate in loom's object model, re-emit).
 
-### F4 item 2 — re-tessellation when rotating into a parameter dimension  *(C++ viewer)*
-*TODO.md §F4, "Still open (deferred)".*
+### ~~F4 item 2 — re-tessellation when rotating into a parameter dimension~~  **DONE 2026-07-28 (v0.92.0)**
+*TODO.md §F4 item (2) — now closed, which closes §F4 entirely.*
 
-The **loom half is done** (2026-07-24): the viewer↔loom live re-introspection channel —
-`ViewerSession`/`serve_viewer` in `loom.viewer` plus a `python -m loom.viewer <scene.py>` CLI —
-holds a resident `ViewerModel` and answers `introspect {clock, params}` with a *fresh* sidecar,
-which is exactly what a frozen sidecar can't do. It also gained an `emit` command.
+The loom half had been done since 2026-07-24 (`ViewerSession`/`serve_viewer` + the
+`python -m loom.viewer <scene.py>` CLI). The C++ half shipped as `-loom <scene.py>` alongside
+`-viewer`: `LoomLink` holds the child process, `LoomBridge` is one worker thread with a
+**one-slot** pending job so `post()` overwrites anything unstarted (latest-wins — a fast drag
+costs one bake of the final value, and the UI never blocks). A **Live (loom)** panel exposes
+the clock, one typed control per declared keyword param, `auto` / `re-derive now`, and
+`posted / baked` counters; marking a continuous param the **sweep axis** makes a right-drag on
+any 3-D pane rotate into that dimension. Each bake returns a sidecar *and* an `.ftsl`, so
+Curves/Fields/Meshes and F7's Render pane all refresh, preserving orbit/zoom/tab/DAG layout.
 
-Still open: the **C++ viewer half** — consuming that channel to re-tessellate when the user
-rotates into a parameter/extra dimension, via a latest-wins off-thread job queue (so a fast
-drag doesn't queue up a backlog of stale tessellations).
+Two real bugs surfaced during validation and were fixed (written up in `known-issues.md`): the
+imgui #7543 `EndGroup()` change corrupting imnodes node rects into a multi-gigabyte
+`PrimReserve`, and the DAG pane re-packing itself from degenerate measurements when clipped to
+zero height.
 
 ---
 

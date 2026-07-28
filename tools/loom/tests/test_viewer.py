@@ -1,6 +1,7 @@
 """§F1 — the loom↔viewer data contract: load_build + scene introspection sidecar."""
 
 import json
+import os
 import sys
 import textwrap
 
@@ -614,6 +615,50 @@ def test_session_params_advertises_declared_controls():
     ack = _session().handle({"cmd": "params"})
     assert ack["ok"] is True
     assert ack["params"] == {"radius": 0.12}
+
+
+# --- F4 item 2: what the C++ viewer's live parameter UI needs ---------------
+
+def test_declared_param_types_distinguish_int_float_bool_str():
+    # JSON erases Python's int/float split, so a viewer that round-trips `rings=8`
+    # as 8.0 breaks a build doing `range(rings)`.  The type tag is what lets the
+    # C++ side send an integer literal back.  bool must NOT read as int.
+    def b(clock=None, rings=8, scale=0.5, closed=True, mode="ribbon", extra=None):
+        return None
+    vm = ViewerModel(b)
+    assert vm.declared_param_types() == {
+        "rings": "int", "scale": "float", "closed": "bool",
+        "mode": "str", "extra": "other"}
+
+
+def test_session_params_carries_types_and_build_path():
+    ack = _session().handle({"cmd": "params"})
+    assert ack["types"] == {"radius": "float"}
+    assert ack["build"] == os.path.abspath(__file__)   # `build` is defined in this file
+
+
+def test_build_path_names_the_file_the_build_came_from(tmp_path):
+    path = _write_scene_file(tmp_path, """
+        from loom.scene import Scene, Camera, Sphere, Material
+        def build(clock=None):
+            sc = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+            sc.add(Material("m", "diffuse"), Sphere((0, 0, 0), 1.0, "m"))
+            return sc
+    """)
+    vm = ViewerModel.from_file(path)
+    assert vm.build_path() == os.path.abspath(path)
+
+
+def test_sidecar_records_its_build_provenance(tmp_path):
+    # Handed only a sidecar, the C++ -viewer must be able to reopen the LIVE channel
+    # (`python -m loom.viewer <build>`) without being told the scene file twice.
+    out = tmp_path / "scene.viewer.json"
+    ViewerModel(build).save_sidecar(str(out))
+    d = json.loads(out.read_text())
+    assert d["build"] == os.path.abspath(__file__)
+    # ...and the inline re-introspection path carries it too
+    ack = _session().handle({"cmd": "introspect"})
+    assert ack["sidecar"]["build"] == os.path.abspath(__file__)
 
 
 # --------------------------------------------------------------------------

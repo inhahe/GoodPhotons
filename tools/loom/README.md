@@ -87,7 +87,9 @@ tools/loom/
 │   ├── ftsl_emit.py .ftsl emission
 │   ├── drive.py     drivers: render a frame range → ftrace → GIF/MP4 assembly
 │   ├── preview.py   resident preview server (keeps ftrace + GPU context warm)
-│   └── viewer.py    native-viewer contract: build() loader + scene-introspection JSON sidecar (§F1)
+│   └── viewer.py    native-viewer contract: build() loader + scene-introspection JSON sidecar (§F1),
+│                    plus the resident live channel (`python -m loom.viewer <scene.py>`) that
+│                    `ftrace -viewer <s.json> -loom <scene.py>` drives to re-derive geometry (§F4)
 ├── examples/        runnable scripts (see below)
 ├── tests/           pytest suite
 └── DESIGN.md        the architecture / roadmap document

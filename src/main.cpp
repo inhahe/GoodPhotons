@@ -4927,6 +4927,7 @@ static void printHelp(const char* prog) {
 "  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
 "  -viewer <s.json>      open the loom native viewer on a scene-introspection sidecar\n"
+"  -loom <scene.py>      with -viewer: re-derive geometry live from this loom build\n"
 "  -h | --help           show this help and exit\n"
 "\n"
 "See README.md for the complete flag list (fog, thin-film, meshes, diagnostics, …).\n",
@@ -8307,13 +8308,36 @@ int main(int argc, char** argv) {
     try {
         // Native loom viewer (-viewer <sidecar.json>): open the ImGui/D3D11 GUI on a
         // scene-introspection sidecar instead of rendering. Short-circuits the renderer.
-        for (int i = 1; i < argc; ++i) {
-            if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
-                if (i + 1 >= argc) {
-                    std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
-                    return 1;
+        // `-loom <scene.py>` names the loom build file the viewer opens its LIVE
+        // re-introspection channel against (§F4 item 2); without it the viewer falls
+        // back to the sidecar's own `build` provenance key, and without that too it
+        // shows the sidecar frozen.
+        {
+            const char* viewerSidecar = nullptr;
+            const char* viewerLoom    = nullptr;
+            for (int i = 1; i < argc; ++i) {
+                if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
+                    if (i + 1 >= argc) {
+                        std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
+                        return 1;
+                    }
+                    viewerSidecar = argv[++i];
+                } else if (!std::strcmp(argv[i], "-loom") || !std::strcmp(argv[i], "--loom")) {
+                    if (i + 1 >= argc) {
+                        std::fprintf(stderr, "error: -loom needs a loom scene .py path\n");
+                        return 1;
+                    }
+                    viewerLoom = argv[++i];
                 }
-                return runViewerGui(argv[i + 1]);
+            }
+            if (viewerSidecar)
+                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "");
+            if (viewerLoom) {
+                // -loom without -viewer has no meaning; say so rather than let the
+                // renderer's arg loop silently eat it as an unknown flag.
+                std::fprintf(stderr, "error: -loom <scene.py> is only meaningful with "
+                                     "-viewer <sidecar.json>\n");
+                return 1;
             }
         }
         // Resident preview server (-serve): keep the process alive and re-render each
