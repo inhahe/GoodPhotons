@@ -2290,8 +2290,56 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          `A1 0.610 < A2 1.103 < A3 1.522` tracks `0.15 < 0.5 < 1.0`, and the gradients come out horizontal (du=+39,
          dv=0) / vertical (du=0, dv=+37) / reversed (du=−38) / 45° diagonal (du=+15, dv=+14) as authored.
          Docs: FTSL.md §7.6, README.md, design.md.
-         **Remaining in ftrace:** §3.2's per-property access (`gold.color(u=x)` — ftrace has `RECORD.channel`
-         dot-access but no `MATERIAL.property`) and the optional-property-name arm (`spectrum = …` anonymous).
+         **Remaining in ftrace:** none — see the §3.2 follow-up below.
+
+         **FOLLOW-UP — §3.2 per-property access, 2026-07-27 (v0.89.0).** `MATERIAL.slot` and
+         `MATERIAL.slot(args)` now read ONE property off an already-declared material:
+         `reflect src.reflect`, `reflect src.reflect(u=v)`, `roughness steel.roughness`, `ior glass.ior`.
+         **The slot keyword IS the dot-handle.** §3.2 writes a property as `<slot keyword> ["name"] = <value>`
+         and makes the quoted name *optional* — the slot keyword alone binds the property to its slot, and the
+         name exists only to mint an external handle. ftrace properties are spelled with the slot keyword and
+         have never carried a quoted name, so **the optional-property-name arm is vacuously already ftrace's
+         status quo**: every ftrace property is anonymous, and the handle is therefore the slot keyword. That is
+         why there is no separate work item for it.
+         **Resolution routes through `applyMaterial`** (`materialPropRef` in `src/ftsl.h`), so a property
+         reference *cannot diverge* from "apply the bundle, then read the slot" — same binding rules, same memo
+         key, same `a` fallback, by construction rather than by a parallel implementation. In particular an
+         unbound `a` resolves against the **SOURCE** material's `albedo_default`, not the reader's and not the
+         system 1.0.
+         **Four chokepoints** are hooked, because a value site in ftrace is reached four different ways:
+         `evalSpectrum` (pattern-less spectral), `patternedSpectrumParam`, `dblParam` (pattern-less scalar), and
+         `bindScalarPattern`. `patternedSpectrumParam` is **the only site that can carry both halves** of a
+         spectral slot (base spectrum *and* companion per-hit pattern), which is why the pattern-aware path lives
+         there and the other three refuse a pattern-carrying source with an explicit message rather than silently
+         dropping the pattern.
+         **Composition, not clobbering:** when the reader also writes its own `reflect_map`, `composePatterns`
+         appends `[a…, b…, Mul]` in postfix so the two multiply. Both spellings mean "a per-hit multiplier on
+         whatever the slot otherwise evaluates to", and letting one win would have made the result depend on
+         statement order.
+         **Three loud refusals** (the lesson from the item-3 review: a new limitation must fail, never
+         approximate): a **record-driven** slot has no load-time value; a **texture-bound** slot cannot be carried
+         by a property reference; and a **pattern-carrying** source at a site that cannot hold a pattern is
+         rejected with "write it on the matching `_map` slot instead".
+         **Records win a name clash** (`recordIndex_` is consulted first), so `R.chan` cannot change meaning in an
+         existing scene just because some material is named `R` — necessary because `bindScalarPattern` reaches
+         materials before records.
+         **`loadedRef_`** is a pointer to the owning `Loaded`, never to an element: `applyMaterial` may append to
+         `Scene::mats` and `Scene::patterns`, and both vectors reallocate.
+         **loom twin:** `Material.prop(name, *args, **binds)` in `tools/loom/loom/scene.py`, keeping the
+         `apply`/`free_inputs`/`albedo_default`/`prop` ↔ `applyMaterial`/`materialFreeInputs`/`albedoDefaultFor`/
+         `materialPropRef` correspondence intact; 5 new tests in `tools/loom/tests/test_material_bundle.py`.
+         **Pinned deterministically** by the new `-checkprop` self-test (`checkProp()` in `main.cpp`): ten groups
+         comparing two independently-authored loaded scenes field-by-field — bare ref reproduces a pattern-driven
+         and a constant slot, `u=v` == the hand-written twin, unbound `a` → source `albedo_default` 0.4, `a=1`
+         overrides, composition with `reflect_map`, cross-slot `transmit`→`reflect`, scalar read-back, memo
+         sharing — plus six `mustReject` cases and the record-name-clash case.
+         Regression scene `scenes/_material_prop.ftsl` (flat camera-facing quads, same reasoning as
+         `_material_bind.ftsl`). The **scalar arm is deliberately not in the image**: a glossy/thin-film tile
+         under those two grazing strip lights renders essentially black, so a tile pair would assert nothing —
+         `-checkprop`'s field-by-field comparison is the stronger assert. Row E alternates the two spellings
+         `E1 E2 E1 E2` on purpose: an identity reads as a smooth left-to-right profile (just the lighting) and a
+         difference reads as a zigzag, which needs no normalisation to see.
+         Docs: FTSL.md §7.7, README.md, design.md.
 
          **FOLLOW-UP — spaces inside a paren group, 2026-07-27 (v0.88.0).** The item-3 arm shipped with an
          argument list that had to be a single *unspaced* token (`gold(0.5*u+0.5*v)` yes, `gold(0.5*u + 0.5*v)`

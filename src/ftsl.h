@@ -586,6 +586,7 @@ public:
 
     bool build(std::vector<Block>& blocks, Loaded& L) {
         records_ = &L.scene.records;   // stable handle for record refs at value sites (records added in Pass 1d)
+        loadedRef_ = &L;               // ditto for §3.2 material-property refs (which may apply a material)
         gridsRef_    = &L.scene.grids;      // ditto for N-D table arity lookups
         scattersRef_ = &L.scene.scatters;   // (both kinds are added in Pass 1a)
         // Pass 0: global scene settings — the length unit and spectral range. All
@@ -855,6 +856,11 @@ private:
     PatTableScope tableScope_{ this, &Builder::tableScopeThunk_ };
     std::unordered_map<std::string, int> recordIndex_;    // record name  -> Scene::records index
     const std::vector<Record>* records_ = nullptr;        // -> L.scene.records (set in build; for record refs at value sites)
+    // -> the Loaded being built. Needed by materialPropRef, which reaches value sites
+    // (evalSpectrum / dblParam / bindScalarPattern) that were never handed a `Loaded&`,
+    // yet may APPEND to Scene::mats and Scene::patterns via applyMaterial. Deliberately a
+    // pointer to the owner, never to an element: the vectors reallocate.
+    Loaded* loadedRef_ = nullptr;
     std::unordered_map<std::string, Spectrum> spdFileCache_; // path -> loaded measured SPD
 
     // Named-object registries for `medium { bounds { object "name" } }` resolution.
@@ -1224,6 +1230,150 @@ private:
         return applyMaterial(it->second, "", L);
     }
 
+    // ---- §3.2 per-property access: `MATERIAL.slot` / `MATERIAL.slot(args)` -------
+    // The value of ONE property of an already-declared material, readable at any value
+    // site that takes that property's type. `gold.reflect` reads the slot with every
+    // named input at its default; `gold.reflect(u=v)` / `gold.reflect(a=0.3)` rebinds
+    // first. Rebinding goes through `applyMaterial`, so it is the *same* machinery §3.3
+    // uses at a geometry `material` field — including the `a` -> `albedo_default`
+    // fallback and the (material, argtext) memo, so `gold.reflect(u=v)` written in five
+    // places builds one applied material, not five.
+    //
+    // WHY THE SLOT KEYWORD IS THE HANDLE. §3.2 writes a property as `<type/slot keyword>
+    // ["name"] = <value>` and makes the quoted name OPTIONAL, because the slot keyword
+    // alone already binds the property to its slot; the name exists only to mint an
+    // external dot-handle. ftrace properties are spelled with the slot keyword and have
+    // never carried a quoted name — every ftrace property is already anonymous, so the
+    // "naming is optional" arm is the ftrace status quo, vacuously. With no names to use
+    // as handles, the handle here IS the slot keyword: `gold.reflect`, `gold.roughness`.
+    struct MatProp {
+        bool        ok       = false;                    // resolved (false => fail() was set)
+        bool        spectral = false;                    // spectral slot (else scalar)
+        Spectrum    spec     = constantSpectrum(0.0);
+        double      scalar   = 0.0;
+        int         pat      = -1;                       // companion per-hit pattern, or -1
+        std::string slot;
+    };
+
+    // Recognise + resolve. Returns FALSE when `tok` is not this form at all (the caller
+    // falls through to its other spellings); TRUE when it was recognised, in which case
+    // `out` is filled or `fail()` has been set. Deliberately keyed on "the head names a
+    // known MATERIAL", exactly like the record refs below key on "names a known record",
+    // so the two dotted forms never contend: a name cannot be both.
+    bool materialPropRef(const std::string& tok, MatProp& out) {
+        if (!loadedRef_) return false;
+        Loaded& L = *loadedRef_;
+        size_t dot = tok.find('.');
+        if (dot == std::string::npos || dot == 0) return false;
+        std::string head = tok.substr(0, dot);
+        // Records win a name clash, so `R.chan` keeps meaning the shipped record ref at
+        // EVERY value site — including the ones (bindScalarPattern) that reach materials
+        // before records. Without this, declaring a material named after a record would
+        // silently change what an existing scene's `R.chan` resolves to.
+        if (recordIndex_.count(head)) return false;
+        auto mit = matIndex_.find(head);
+        if (mit == matIndex_.end()) return false;        // not a material -> not our form
+        // `slot` or `slot(args)`; the arg list may contain spaces (balanced-paren lexing).
+        std::string rest = tok.substr(dot + 1), slot = trimWs(rest), args;
+        size_t lp = rest.find('(');
+        if (lp != std::string::npos) {
+            size_t rp = rest.rfind(')');
+            if (rp == std::string::npos || rp <= lp) {
+                fail("material property '" + tok + "': missing ')'" + parenHint(tok)); return true;
+            }
+            std::string tail = trimWs(rest.substr(rp + 1));
+            if (!tail.empty()) {
+                fail("material property '" + tok + "': unexpected '" + tail + "' after ')'"); return true;
+            }
+            slot = trimWs(rest.substr(0, lp));
+            args = rest.substr(lp + 1, rp - lp - 1);
+        }
+        if (slot.empty()) { fail("material property '" + tok + "': no property after '.'"); return true; }
+
+        int src = applyMaterial(mit->second, args, L);   // -1 => applyMaterial already failed
+        if (src < 0 || src >= (int)L.scene.mats.size()) return true;
+        const Material& sm = L.scene.mats[src];
+        out.slot = slot;
+        // A record-DRIVEN slot has no load-time value at all: the constant sitting in the
+        // field is a placeholder the per-hit record sampler overwrites. Reading it would
+        // hand the consumer a number the source material never actually uses.
+        auto recDriven = [&](int recSlot) {
+            for (const RecBinding& rb : sm.recBindings) if (rb.slot == recSlot) return true;
+            return false;
+        };
+        auto refuseRec = [&](int recSlot) {
+            if (!recDriven(recSlot)) return false;
+            fail("material property '" + tok + "': '" + head + "." + slot + "' is driven by a "
+                 "record, so it has no load-time value — reference the record channel "
+                 "directly instead");
+            return true;
+        };
+        // Likewise a texture-bound slot: the value is an image sampled at the hit UV, and
+        // a property reference carries a spectrum + a pattern, not a texture binding.
+        auto refuseTex = [&](int tex) {
+            if (tex < 0) return false;
+            fail("material property '" + tok + "': '" + head + "." + slot + "' is bound to a "
+                 "texture, which a property reference cannot carry — bind the texture at "
+                 "the use site instead");
+            return true;
+        };
+        if (slot == "reflect") {
+            if (refuseRec(REC_SLOT_REFLECT) || refuseTex(sm.reflectTex)) return true;
+            out.spectral = true; out.spec = sm.reflect;  out.pat = sm.reflectPat;
+        } else if (slot == "transmit") {
+            out.spectral = true; out.spec = sm.transmit; out.pat = sm.transmitPat;
+        } else if (slot == "emit") {
+            out.spectral = true; out.spec = sm.emit;     out.pat = sm.emitPat;
+        } else if (slot == "ior") {
+            out.spectral = true; out.spec = sm.ior;
+        } else if (slot == "absorb") {
+            out.spectral = true; out.spec = sm.absorb;
+        } else if (slot == "roughness") {
+            if (refuseRec(REC_SLOT_ROUGHNESS) || refuseTex(sm.roughnessTex)) return true;
+            out.scalar = sm.roughness;      out.pat = sm.roughnessPat;
+        } else if (slot == "film_thickness") {
+            if (refuseTex(sm.filmThicknessTex)) return true;
+            out.scalar = sm.filmThickness;  out.pat = sm.filmThicknessPat;
+        } else if (slot == "film_ior") {
+            out.scalar = sm.filmIor;
+        } else if (slot == "groove_spacing") {
+            out.scalar = sm.grooveSpacing;
+        } else if (slot == "yield") {
+            out.scalar = sm.fluoYield;
+        } else {
+            fail("material property '" + tok + "': material '" + head + "' has no property '" +
+                 slot + "' (spectral: reflect, transmit, emit, ior, absorb; scalar: roughness, "
+                 "film_thickness, film_ior, groove_spacing, yield)");
+            return true;
+        }
+        out.ok = true;
+        return true;
+    }
+
+    // Combine two per-hit scalar patterns into one. Both spellings a pattern index can
+    // arrive from — the source slot of a property reference and the consumer's own
+    // `<slot>_map` — mean "a multiplier on whatever the slot otherwise evaluates to", so
+    // the composition of the two IS their product. Appending `[a…, b…, Mul]` is valid
+    // postfix because each program pushes exactly one value (the same invariant that
+    // makes §3.3's substitution a pure splice). Returns the surviving index when only
+    // one is real, so the common case allocates nothing.
+    int composePatterns(int a, int b, Loaded& L) {
+        if (a < 0) return b;
+        if (b < 0) return a;
+        if (a >= (int)L.scene.patterns.size() || b >= (int)L.scene.patterns.size()) return a;
+        Pattern np;
+        const std::vector<PatNode>& pa = L.scene.patterns[a].nodes;
+        const std::vector<PatNode>& pb = L.scene.patterns[b].nodes;
+        np.nodes.reserve(pa.size() + pb.size() + 1);
+        np.nodes.insert(np.nodes.end(), pa.begin(), pa.end());
+        np.nodes.insert(np.nodes.end(), pb.begin(), pb.end());
+        PatNode mul; mul.op = PatOp::Mul;
+        np.nodes.push_back(mul);
+        int id = (int)L.scene.patterns.size();
+        L.scene.patterns.push_back(std::move(np));
+        return id;
+    }
+
     // Records stage 5a: resolve a record channel reference used as a CONSTANT spectrum
     // value — `RECORD.channel[i]` (the channel's i-th stop colour) or `RECORD.channel(c)`
     // (sample the colour channel at a constant driver `c`). Accepted anywhere a spectrum
@@ -1404,6 +1554,26 @@ private:
         if (w.size() == 1) {
             Spectrum rs;
             if (recordConstSpectrumRef(h, rs)) return rs;
+            // §3.2 per-property access — `MATERIAL.slot` / `MATERIAL.slot(args)`. This is
+            // the PATTERN-LESS spectral site (`ior`, `absorb`, a light's `spd`, a
+            // top-level `spectrum`): it can hold a spectrum but has nowhere to put a
+            // per-hit multiplier, so a pattern-carrying source is refused rather than
+            // silently flattened. The pattern-aware slots (reflect/transmit/emit) are
+            // intercepted earlier, in patternedSpectrumParam, and never reach here.
+            MatProp mp;
+            if (materialPropRef(h, mp)) {
+                if (!mp.ok) return constantSpectrum(0);            // fail() already set
+                if (!mp.spectral) {
+                    fail("material property '" + h + "': '" + mp.slot + "' is a scalar "
+                         "property, but a spectrum is needed here");
+                    return constantSpectrum(0);
+                }
+                if (mp.pat >= 0)
+                    fail("material property '" + h + "': '" + mp.slot + "' carries a per-hit "
+                         "pattern, which this slot cannot apply — reference a material whose "
+                         + mp.slot + " is a plain spectrum");
+                return mp.spec;
+            }
         }
 
         if (h == "blackbody")  return blackbody(w.size() > 1 ? num(w[1]) : 6500.0);
@@ -1597,6 +1767,25 @@ private:
         if (w0.find('.') != std::string::npos && !isNumber(w0)) {
             double rv;
             if (recordConstScalarRef(w0, rv)) return rv;             // record ref (or a fail was set)
+            // §3.2 per-property access at a scalar slot: `roughness gold.roughness`,
+            // `film_ior coat.film_ior`. A pattern-carrying source is refused here rather
+            // than dropped — the slots that CAN hold a per-hit pattern try
+            // bindScalarPattern first (which takes the pattern), so reaching dblParam
+            // with one in hand means this particular slot has nowhere to put it.
+            MatProp mp;
+            if (materialPropRef(w0, mp)) {
+                if (!mp.ok) return dflt;                             // fail() already set
+                if (mp.spectral) {
+                    fail(std::string(key) + " " + w0 + ": '" + mp.slot + "' is a spectral "
+                         "property, but this slot takes a scalar");
+                    return dflt;
+                }
+                if (mp.pat >= 0)
+                    fail(std::string(key) + " " + w0 + ": '" + mp.slot + "' carries a per-hit "
+                         "pattern, which the '" + key + "' slot cannot apply — write it on the "
+                         "matching '_map' slot instead");
+                return mp.scalar;
+            }
         }
         return num(w0);
     }
@@ -1744,6 +1933,26 @@ private:
             if (!bindScalarPattern(b, key, patOut)) return dflt;   // unknown name: failed
             return constantSpectrum(1.0);
         }
+        // §3.2 per-property access at a PATTERN-AWARE spectral slot: `reflect gold.reflect`
+        // / `reflect gold.reflect(u=v)`. This is the only site that can carry BOTH halves
+        // of the source slot — the base spectrum and its per-hit multiplier — which is why
+        // the hook lives here rather than in evalSpectrum. If the consumer also wrote its
+        // own `<key>_map`, the two are COMPOSED (both spellings mean "a multiplier on
+        // whatever the slot otherwise evaluates to", so their composition is the product)
+        // instead of one silently clobbering the other.
+        if (s && s->val.words.size() == 1 && loadedRef_) {
+            MatProp mp;
+            if (materialPropRef(s->val.words[0], mp)) {
+                if (!mp.ok) return dflt;                           // fail() already set
+                if (!mp.spectral) {
+                    fail(std::string(key) + " " + s->val.words[0] + ": '" + mp.slot +
+                         "' is a scalar property, but this slot takes a spectrum");
+                    return dflt;
+                }
+                patOut = composePatterns(patOut, mp.pat, *loadedRef_);
+                return mp.spec;
+            }
+        }
         return spectrumParam(b, key, dflt);
     }
 
@@ -1828,6 +2037,22 @@ private:
         const Stmt* s = find(b, key);
         if (!s || s->val.words.empty()) return false;
         const std::string& w0 = s->val.words[0];
+        // §3.2 per-property access carrying a pattern: `roughness gold.roughness` where
+        // gold's roughness is itself pattern-driven. Reported as "handled" ONLY when the
+        // source actually has a pattern, so a plain-constant source falls through to
+        // dblParam and still reads its value — which is what makes the call sites'
+        // existing `bindScalarPattern(...) else dblParam(...)` ladder do the right thing
+        // for both shapes without any of them knowing this form exists.
+        if (w0.rfind("pattern:", 0) != 0 && w0.find('.') != std::string::npos &&
+            !isNumber(w0) && loadedRef_) {
+            MatProp mp;
+            if (materialPropRef(w0, mp)) {
+                if (!mp.ok || mp.spectral || mp.pat < 0) return false;
+                patOut = composePatterns(patOut, mp.pat, *loadedRef_);
+                return true;
+            }
+            return false;
+        }
         if (w0.rfind("pattern:", 0) != 0) return false;
         std::string nm = w0.substr(8);
         auto it = patternIndex_.find(nm);

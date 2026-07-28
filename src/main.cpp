@@ -1535,6 +1535,253 @@ static int checkBind() {
     return ok ? 0 : 1;
 }
 
+// Deterministic self-test for PER-PROPERTY ACCESS (`MATERIAL.slot` / `MATERIAL.slot(args)`;
+// ROADMAP_records.md §3.2). Unlike checkBind, which is pure algebra over pattern programs,
+// this one has to run the LOADER — the whole point of the feature is that a value site
+// resolves a reference to another material's slot, so the property under test is a property
+// of loading, not of substitution. Scenes are built in memory and compared against
+// hand-written TWINS, so every assert is "the reference produced exactly what writing it out
+// by hand produces" rather than a hard-coded number that could drift with the defaults.
+static int checkProp() {
+    bool ok = true;
+    auto chk = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkprop] %-56s BAD\n", what); ok = false; }
+    };
+    // Load a scene fragment. Every fragment gets the same trivial camera + light so the
+    // loader's renderability checks are satisfied; only the materials differ.
+    auto loadMats = [&](const char* body, ftsl::Loaded& L) -> bool {
+        std::string src =
+            "scene { units meters }\n"
+            + std::string(body) + "\n"
+            "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+            "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+        std::string e;
+        if (!ftsl::loadSource(src, "<checkprop>", L, e)) {
+            std::printf("[checkprop] load FAILED: %s\n", e.c_str());
+            return false;
+        }
+        return true;
+    };
+    // A scene that must NOT load, and whose error must mention `needle`.
+    auto mustReject = [&](const char* what, const char* body, const char* needle) {
+        ftsl::Loaded L;
+        std::string src =
+            "scene { units meters }\n" + std::string(body) + "\n"
+            "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+            "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+        std::string e;
+        bool loaded = ftsl::loadSource(src, "<checkprop>", L, e);
+        if (loaded)                                   { chk(what, false); return; }
+        if (e.find(needle) == std::string::npos) {
+            std::printf("[checkprop] %-56s BAD (error was: %s)\n", what, e.c_str());
+            ok = false;
+        }
+    };
+    // Find a material by name is not possible post-load (names are not kept on Material),
+    // so the fragments below always put the material under test LAST among the declared
+    // ones and reach it through the probe. Instead of guessing indices, compare the two
+    // scenes' probe materials: `probe` is always the material the quad uses.
+    auto probeOf = [&](ftsl::Loaded& L) -> const Material& {
+        // The quad's two triangles carry the resolved material index.
+        int mi = L.scene.tris.empty() ? 0 : L.scene.tris[0].matId;
+        return L.scene.mats[mi];
+    };
+    // Evaluate a material's reflect slot as (base spectrum at 550nm) * (pattern at ctx).
+    PatCtx c{};
+    c.x = 0.37; c.y = -0.81; c.z = 1.23; c.u = 0.19; c.v = 0.64;
+    c.nx = 0.0; c.ny = 1.0; c.nz = 0.0; c.r = 0.5; c.f = 0.25;
+    auto reflectAt = [&](ftsl::Loaded& L, const Material& m) {
+        double base = m.reflect(550.0);
+        if (m.reflectPat >= 0 && m.reflectPat < (int)L.scene.patterns.size()) {
+            const auto& p = L.scene.patterns[m.reflectPat].nodes;
+            base *= patternEval(p.data(), (int)p.size(), c);
+        }
+        return base;
+    };
+    // The core assert shape: two scenes whose probe materials must be indistinguishable.
+    auto sameReflect = [&](const char* what, const char* refBody, const char* twinBody) {
+        ftsl::Loaded A, B;
+        if (!loadMats(refBody, A) || !loadMats(twinBody, B)) { chk(what, false); return; }
+        double a = reflectAt(A, probeOf(A)), b = reflectAt(B, probeOf(B));
+        if (std::fabs(a - b) > 1e-12) {
+            std::printf("[checkprop] %-56s BAD (%.12g vs %.12g)\n", what, a, b);
+            ok = false;
+        }
+    };
+
+    // (a) A bare reference reproduces the source slot — BOTH halves of it, the flat-1.0
+    //     base a lone `pattern:` leaves behind AND the pattern itself.
+    sameReflect("bare ref reproduces a pattern-driven reflect slot",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect }",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:p }");
+
+    // (b) A reference to a plain-spectrum slot carries the spectrum and no pattern.
+    sameReflect("bare ref reproduces a constant reflect slot",
+        "material \"src\" { type diffuse  reflect 0.37 }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect }",
+        "material \"probe\" { type diffuse  reflect 0.37 }");
+
+    // (c) Rebinding inside the reference is the SAME machinery §3.3 uses at a use site:
+    //     `src.reflect(u=v)` must equal a hand-written program with u replaced by v.
+    sameReflect("ref rebinding u=v == the hand-written twin",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(u=v) }",
+        "pattern \"q\" { expr \"0.05+0.9*v\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:q }");
+
+    // (d) An unbound `a` resolves against the SOURCE material's albedo_default, not the
+    //     consumer's and not the system 1.0 — the reference does not change whose default
+    //     applies. Twin: the same program with `a` written out as the source's 0.4.
+    sameReflect("unbound `a` falls back to the SOURCE albedo_default",
+        "pattern \"p\" { expr \"a*(0.05+0.9*u)\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p  albedo_default 0.4 }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect }",
+        "pattern \"q\" { expr \"0.4*(0.05+0.9*u)\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:q }");
+    sameReflect("`a` bound at the reference overrides that default",
+        "pattern \"p\" { expr \"a*(0.05+0.9*u)\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p  albedo_default 0.4 }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=1) }",
+        "pattern \"q\" { expr \"1*(0.05+0.9*u)\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:q }");
+
+    // (e) A reference COMPOSES with the consumer's own `_map` instead of clobbering it.
+    //     Both spellings mean "a per-hit multiplier on the slot", so the answer is their
+    //     product — the case a naive assignment would silently get wrong in one direction
+    //     or the other depending on statement order.
+    sameReflect("ref composes with the consumer's own reflect_map",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "pattern \"h\" { expr \"0.5\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect  reflect_map pattern:h }",
+        "pattern \"q\" { expr \"(0.05+0.9*u)*0.5\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:q }");
+
+    // (f) Cross-slot references are legal as long as the TYPE matches: transmit is a
+    //     spectral slot like reflect, so reading one into the other is fine.
+    sameReflect("cross-slot spectral ref (transmit -> reflect)",
+        "material \"src\" { type translucent  reflect 0.1  transmit 0.62 }\n"
+        "material \"probe\" { type diffuse  reflect src.transmit }",
+        "material \"probe\" { type diffuse  reflect 0.62 }");
+
+    // (g) Scalar properties, read back through the scalar ladder
+    //     (bindScalarPattern -> bindScalarTexture -> dblParam).
+    {
+        ftsl::Loaded A, B;
+        if (loadMats("material \"src\" { type glossy  reflect 0.6  roughness 0.35 }\n"
+                     "material \"probe\" { type glossy  reflect 0.6  roughness src.roughness }", A) &&
+            loadMats("material \"probe\" { type glossy  reflect 0.6  roughness 0.35 }", B)) {
+            chk("scalar property read back == the authored literal",
+                std::fabs(probeOf(A).roughness - probeOf(B).roughness) < 1e-12);
+        } else ok = false;
+    }
+    {
+        ftsl::Loaded A;
+        if (loadMats("material \"src\" { type thinfilm  film_ior 1.42  film_thickness 275 }\n"
+                     "material \"probe\" { type thinfilm  film_ior src.film_ior  "
+                     "film_thickness src.film_thickness }", A)) {
+            chk("film_ior read back", std::fabs(probeOf(A).filmIor - 1.42) < 1e-12);
+            chk("film_thickness read back", std::fabs(probeOf(A).filmThickness - 275.0) < 1e-12);
+        } else ok = false;
+    }
+    // A pattern-driven scalar property carries its pattern through the reference.
+    {
+        ftsl::Loaded A, B;
+        if (loadMats("pattern \"p\" { expr \"0.2+0.5*u\" }\n"
+                     "material \"src\" { type glossy  reflect 0.6  roughness pattern:p }\n"
+                     "material \"probe\" { type glossy  reflect 0.6  roughness src.roughness }", A) &&
+            loadMats("pattern \"p\" { expr \"0.2+0.5*u\" }\n"
+                     "material \"probe\" { type glossy  reflect 0.6  roughness pattern:p }", B)) {
+            const Material& ma = probeOf(A);
+            const Material& mb = probeOf(B);
+            chk("pattern-driven scalar property keeps its pattern",
+                ma.roughnessPat >= 0 && mb.roughnessPat >= 0);
+            if (ma.roughnessPat >= 0 && mb.roughnessPat >= 0) {
+                const auto& pa = A.scene.patterns[ma.roughnessPat].nodes;
+                const auto& pb = B.scene.patterns[mb.roughnessPat].nodes;
+                chk("...and evaluates identically",
+                    std::fabs(patternEval(pa.data(), (int)pa.size(), c) -
+                              patternEval(pb.data(), (int)pb.size(), c)) < 1e-12);
+            }
+        } else ok = false;
+    }
+
+    // (h) A no-op reference is SHARED, not duplicated: `src.reflect` written twice must
+    //     not grow the material table, since applyMaterial memoises on (material, args).
+    {
+        ftsl::Loaded A, B;
+        if (loadMats("pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+                     "material \"src\" { type diffuse  reflect pattern:p }\n"
+                     "material \"probe\" { type diffuse  reflect src.reflect(u=v) }\n"
+                     "material \"probe2\" { type diffuse  reflect src.reflect(u=v) }", A) &&
+            loadMats("pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+                     "material \"src\" { type diffuse  reflect pattern:p }\n"
+                     "material \"probe\" { type diffuse  reflect src.reflect(u=v) }", B)) {
+            // One extra declared material, but the APPLIED material and its substituted
+            // pattern are shared, so the pattern table must be the same size.
+            chk("identical references share one applied material + pattern",
+                A.scene.patterns.size() == B.scene.patterns.size() &&
+                A.scene.mats.size() == B.scene.mats.size() + 1);
+        } else ok = false;
+    }
+
+    // (i) The type system is real, in both directions, and unknown properties are named.
+    mustReject("a scalar property is refused at a spectral slot",
+        "material \"src\" { type glossy  reflect 0.6  roughness 0.35 }\n"
+        "material \"probe\" { type diffuse  reflect src.roughness }", "scalar property");
+    mustReject("a spectral property is refused at a scalar slot",
+        "material \"src\" { type diffuse  reflect 0.6 }\n"
+        "material \"probe\" { type glossy  reflect 0.6  roughness src.reflect }",
+        "spectral property");
+    mustReject("an unknown property names the material and lists the slots",
+        "material \"src\" { type diffuse  reflect 0.6 }\n"
+        "material \"probe\" { type diffuse  reflect src.colour }", "has no property");
+    // A pattern-carrying source at a slot that cannot apply one is refused, not flattened.
+    mustReject("a pattern-carrying property is refused where it cannot be applied",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p }\n"
+        "material \"probe\" { type dielectric  ior src.reflect }", "per-hit pattern");
+    // An unbalanced argument list is an error rather than a run-on, which is the whole
+    // point of lexing the group BALANCED (see the v0.88.0 grammar change).
+    mustReject("an unbalanced argument list is an error, not a silent run-on",
+        "material \"src\" { type diffuse  reflect 0.6 }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=1 }", "unbalanced");
+    // A texture-bound slot is an IMAGE sampled at the hit UV; a property reference carries
+    // a spectrum plus a per-hit pattern and has nowhere to put a texture binding. Refusing
+    // it beats handing the consumer the fallback constant, which looks like it worked.
+    mustReject("a texture-bound property is refused rather than flattened",
+        "texture \"t\" { file scenes/graychecker.ppm  encoding linear }\n"
+        "material \"src\" { type diffuse  reflect texture:t }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect }", "bound to a texture");
+    // A material application error inside the reference surfaces as itself, not swallowed.
+    mustReject("a bad rebinding inside a reference reports the binding error",
+        "pattern \"p\" { expr \"0.05+0.9*u\" }\n"
+        "material \"src\" { type diffuse  reflect pattern:p }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(bogus=1) }",
+        "not a bindable input");
+
+    // (j) Records keep priority over materials on a name clash, so an existing scene's
+    //     `R.chan` cannot change meaning just because a material was named `R`.
+    {
+        ftsl::Loaded A;
+        if (loadMats("R = range 0-1 [\n  k  0.2 0.8\n]\n"
+                     "material \"R\" { type diffuse  reflect 0.9 }\n"
+                     "material \"probe\" { type glossy  reflect 0.6  roughness R.k(0.0) }", A)) {
+            chk("a record wins a name clash with a material",
+                std::fabs(probeOf(A).roughness - 0.2) < 1e-9);
+        } else ok = false;
+    }
+
+    std::printf("[checkprop] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic distant-sun self-test (EmitterShape::Sun; src/scene.h addSunLight /
 // sampleCone / inCone / geomWeight). No scene file, no renderer, no RNG-seeded image —
 // it pins the four invariants the emitter's correctness rests on:
@@ -4384,6 +4631,7 @@ static int run(int argc, char** argv) {
     bool checkGridOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
+    bool checkPropOnly = false;
     bool checkSunOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
@@ -4695,6 +4943,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
+        else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
         else if (!std::strcmp(argv[i], "-checksun")) checkSunOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
@@ -4847,6 +5096,7 @@ static int run(int argc, char** argv) {
     if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
+    if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)
     if (checkSunOnly)      return checkSun();      // deterministic, no scene needed
 
     // --- every output directory must exist BEFORE a single photon is traced ----------

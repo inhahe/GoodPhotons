@@ -190,6 +190,67 @@ def test_bundle_roots_expose_field_time_signals():
     assert any(r is s for r in m.roots())
 
 
+# ---------------------------------------------------------------------------
+# per-property access (ROADMAP_records.md §3.2) — the twin of ftrace's
+# `MATERIAL.slot` / `MATERIAL.slot(args)` (Builder::materialPropRef, src/ftsl.h).
+# ---------------------------------------------------------------------------
+
+def _txt(e):
+    """The canonical text of a spatial expression — `emit` is loom's serializer, and
+    two expressions are the same iff they emit the same .ftsl."""
+    return e.emit(("x", "y", "z"), None)
+
+
+def test_prop_reads_one_slot_of_the_bundle():
+    m = Material("m", "diffuse", reflect=0.05 + 0.9 * U, roughness=0.35)
+    assert m.prop("roughness") == 0.35                  # a plain value passes through
+    # a field property comes back as the expression itself
+    assert _txt(m.prop("reflect")) == _txt(0.05 + 0.9 * U)
+
+
+def test_prop_rebinding_equals_applying_then_reading():
+    """The whole point: a property reference can never diverge from applying the
+    material and then reading the slot, because it IS that."""
+    m = Material("m", "diffuse", reflect=0.05 + 0.9 * U, roughness=A)
+    assert _txt(m.prop("reflect", u=V)) == _txt(m.apply(u=V).props["reflect"])
+    # positional binding works through prop() too (one free input after `a` is named)
+    assert _txt(m.prop("reflect", V, a=1)) == _txt(m.apply(V, a=1).props["reflect"])
+
+
+def test_prop_resolves_an_unbound_albedo_against_the_SOURCE_default():
+    """`a` follows the material it was read from, not the consumer — which is what
+    makes a property reference a value rather than a fragment needing context."""
+    m = Material("m", "diffuse", reflect=A * U, albedo_default=0.4)
+    assert _txt(m.prop("reflect")) == _txt(0.4 * U)
+    # Resolving `a` is exactly what prop() adds on top of apply(): apply() leaves the
+    # albedo leaf symbolic, and a symbolic `a` REFUSES to emit rather than silently
+    # becoming 0 -- so prop() is what makes a property reference a usable value.
+    try:
+        _txt(m.apply().props["reflect"])
+    except Exception as e:                                    # noqa: BLE001
+        assert "albedo" in str(e) or "'a'" in str(e)
+    else:
+        raise AssertionError("an unresolved albedo leaf should refuse to emit")
+    assert _txt(m.prop("reflect", a=1)) == _txt(1 * U)
+
+
+def test_prop_names_the_material_and_lists_its_slots_when_unknown():
+    m = Material("m", "diffuse", reflect=0.5)
+    try:
+        m.prop("colour")
+    except KeyError as e:
+        assert "colour" in str(e) and "reflect" in str(e)
+    else:
+        raise AssertionError("expected a KeyError for an unknown property")
+
+
+def test_prop_of_a_tuple_slot_resolves_every_component():
+    m = Material("m", "diffuse", reflect=(A * U, A * V, A), albedo_default=0.25)
+    got = m.prop("reflect")
+    assert isinstance(got, tuple) and len(got) == 3
+    assert all("0.25" in _txt(g) for g in got)
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

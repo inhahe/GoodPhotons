@@ -264,6 +264,40 @@ class Material(Element):
     def __call__(self, *args, **binds) -> "Material":
         return self.apply(*args, **binds)
 
+    # ---- §3.2 per-property access ----------------------------------------
+    def prop(self, name: str, *args, **binds):
+        """The value of ONE property of this bundle — ``ROADMAP_records.md`` §3.2's
+        per-property access, the twin of ftrace's ``MATERIAL.slot`` /
+        ``MATERIAL.slot(args)`` (``Builder::materialPropRef`` in ``src/ftsl.h``).
+
+        ``gold.prop("reflect")`` reads the slot with every named input at its
+        default; ``gold.prop("reflect", u=v)`` / ``gold.prop("reflect", a=1)``
+        rebinds first.  Rebinding routes through :meth:`apply`, so it is exactly the
+        same substitution the bundle uses at a use site — a property reference can
+        never diverge from applying the whole material and then reading the slot.
+
+        An unbound :data:`A` resolves against **this** material's
+        ``albedo_default``, not the consumer's: the property carries the source's
+        notion of albedo with it, which is what makes the reference a *value* rather
+        than a fragment needing the consumer's context.
+
+        §3.2 makes the property NAME optional (the leading type/slot keyword is what
+        binds a property to its slot; the name only mints an external dot-handle).
+        loom keeps properties in a plain ``**props`` dict keyed by slot, so the key
+        IS the handle here — the same choice ftrace makes for the same reason."""
+        m = self.apply(*args, **binds) if (args or binds) else self
+        if name not in m.props:
+            raise KeyError(
+                f"material '{self.name}' has no property '{name}' "
+                f"(has {sorted(m.props)})")
+        v = m.props[name]
+        exprs = _field_exprs(v)
+        if exprs is None:
+            return v                                  # a plain value / Signal / colour
+        if isinstance(v, (list, tuple)):
+            return tuple(m._resolve_albedo(e) for e in exprs)
+        return m._resolve_albedo(exprs[0])
+
     def _resolve_albedo(self, e):
         """Substitute an unbound albedo leaf :data:`A` with the material default."""
         if "a" in e.free_inputs():

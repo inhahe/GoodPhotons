@@ -873,6 +873,62 @@ the two inputs rather than collapsing both onto one. A material nobody applies i
 bit-identical to before, and identical applications are shared (one material, not one
 per object). `ftrace -checkbind` pins all of this.
 
+### 7.7 Per-property access — `MATERIAL.slot`
+
+§7.6 applies a *whole* bundle at a geometry `material` field. You can also read **one
+property** of an already-declared material and use it as a value anywhere that property's
+type is accepted:
+
+```
+material "src"  { type diffuse  reflect pattern:grad  albedo_default 0.4 }
+
+material "a" { type diffuse  reflect src.reflect          }   # every input at its default
+material "b" { type diffuse  reflect src.reflect(u=v)     }   # ...rebound first
+material "c" { type diffuse  reflect src.reflect(a=1)     }   # ...including `a`
+material "d" { type glossy   roughness other.roughness    }   # a scalar property
+```
+
+The handle is the **slot keyword**. FTSL properties are written with the slot keyword and
+never carry a quoted name (`reflect …`, `roughness …`), so the keyword is the only thing
+that identifies a property — and it is what goes after the dot.
+
+The argument list is the §7.6 argument list, verbatim: same named/positional rules, same
+simultaneous substitution, same memoisation, and the same `a` fallback — with one thing
+worth being explicit about. **An unbound `a` resolves against the SOURCE material's
+`albedo_default`, not the consumer's.** The property carries the source's notion of albedo
+with it, which is what makes `src.reflect` a *value* rather than a fragment that needs the
+reader's context.
+
+| kind | properties |
+|---|---|
+| spectral | `reflect`, `transmit`, `emit`, `ior`, `absorb` |
+| scalar | `roughness`, `film_thickness`, `film_ior`, `groove_spacing`, `yield` |
+
+Cross-slot reads are legal within a kind — `reflect src.transmit` is fine, since what has
+to match is the property's *type*, not its name. Mixing kinds (`reflect src.roughness`) is
+a load error naming both.
+
+A property reference carries **both halves** of the slot it reads: the base spectrum *and*
+its per-hit pattern. If the reading material also writes its own `<slot>_map`, the two are
+**composed** (multiplied) rather than one silently overwriting the other — both spellings
+mean "a multiplier on whatever the slot otherwise evaluates to", so their composition is
+their product.
+
+Three things are refused rather than quietly approximated, because each would otherwise
+hand you a value the source material does not actually use:
+
+* a **record-driven** slot (`reflect` / `roughness` under a `RECORD(driver)`) — the number
+  in the field is a placeholder the per-hit record sampler overwrites;
+* a **texture-bound** slot — a property reference carries a spectrum plus a pattern, and
+  has nowhere to put an image binding;
+* a **pattern-carrying** property read at a slot that cannot apply a per-hit multiplier
+  (e.g. `ior src.reflect`, or a scalar slot with no `_map` sibling).
+
+Records win a name clash: `R.chan` keeps meaning the §5 record reference even if a
+material is also named `R`. `ftrace -checkprop` pins the whole surface — every assert
+compares a reference against the hand-written twin, so nothing is anchored to a literal
+that could drift with the defaults.
+
 ---
 
 ## 8. Geometry primitives

@@ -997,6 +997,17 @@ no environment, no runtime indirection, and a material nobody applies is bit-ide
 to before. `ftrace -checkbind` pins the algebra (splice == inlining, simultaneity,
 identity). See FTSL.md §7.6.
 
+You can also read **one property** off an already-declared material and use it as a value
+elsewhere — `reflect src.reflect`, `reflect src.reflect(u=v)`, `roughness other.roughness`.
+The handle is the **slot keyword**, since FTSL properties are written with the slot keyword
+and never carry a quoted name. The argument list is the same one above, so an unbound `a`
+resolves against the **source** material's `albedo_default` — the property carries the
+source's notion of albedo with it. A reference carries both the base spectrum *and* the
+slot's per-hit pattern, and composes (multiplies) with the reader's own `<slot>_map` rather
+than clobbering it; a record-driven, texture-bound, or un-appliable pattern slot is refused
+rather than approximated. `ftrace -checkprop` pins it against hand-written twins. See
+FTSL.md §7.7.
+
 ---
 
 ## Spectra (SPDs, reflectances, indices)
@@ -2531,7 +2542,7 @@ alone can't restore, so they are not disk-resumable.
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
 `-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`,
-`-checksun`, `-checkbind`.
+`-checksun`, `-checkbind`, `-checkprop`.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are

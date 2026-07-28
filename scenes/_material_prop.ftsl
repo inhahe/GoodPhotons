@@ -1,0 +1,121 @@
+# Regression scene for **per-property access** — reading ONE property off an
+# already-declared material (ROADMAP_records.md §3.2, TODO §J3b item 3 follow-up).
+#
+#     reflect   gold.reflect          # gold's reflect slot, every input at its default
+#     reflect   gold.reflect(u=v)     # ...rebound first (the §3.3 argument list, verbatim)
+#     roughness steel.roughness       # a scalar property
+#     ior       glass.ior             # a spectral property from a different slot
+#
+# --- why the slot keyword is the handle ------------------------------------------------
+# §3.2 writes a property as `<slot keyword> ["name"] = <value>` and makes the quoted name
+# OPTIONAL: the slot keyword alone binds the property to its slot, and the name exists only
+# to mint an external dot-handle.  ftrace properties are spelled with the slot keyword and
+# have never carried a quoted name — every ftrace property is *already* anonymous — so the
+# handle here IS the slot keyword.
+#
+# --- what is being asserted ------------------------------------------------------------
+# Rebinding at a property reference must be the SAME machinery §3.3 uses at a geometry
+# `material` field, so every pair below has an independently-authored twin that must be
+# indistinguishable:
+#
+#   A1 == A2   `reflect src_grad.reflect` reproduces the source slot (base *and* pattern)
+#   B1 == B2   `src_grad.reflect(u=v)` == a tile whose material is `src_grad(u=v)`
+#   D1 == D2   a property reference composed with the consumer's own `reflect_map`
+#              == the product written out by hand
+#   E1 == E2   a CROSS-SLOT spectral read (`reflect src_tr.transmit`) == the literal.
+#              Alternated E1 E2 E1 E2 across the row on purpose: an identity shows up as a
+#              SMOOTH left-to-right profile (just the lighting), and any difference between
+#              the two spellings shows up as a ZIGZAG, which needs no normalisation to see.
+#
+# Tiles in the same ROW are directly comparable; tiles in different rows are not, because
+# the two strip lights make illumination vary with height.  Within a row the lighting still
+# varies with x, so a pair is compared on its GRADIENT (du/dv), or on its mean normalised
+# against the backdrop strip below it — the backdrop is albedo 0.5 everywhere, so the ratio
+# cancels the lighting profile.  Each identity pair is placed in the same row for that
+# reason.
+#
+# The SCALAR arm (`roughness src.roughness`, `film_ior`, `film_thickness`) is deliberately
+# NOT in this image: a glossy/thinfilm tile under these two grazing strip lights renders
+# essentially black, so a tile pair would assert nothing.  `ftrace -checkprop` pins the
+# scalar arm exactly instead — it compares loaded scenes field-by-field, which is a
+# stronger assert than any render.
+#
+# Flat camera-facing quads for the same reason as `_material_bind.ftsl`: a quad's UVs span
+# the parallelogram, so the material's `u` IS the tile's horizontal axis and a rebinding
+# reads directly as gradient DIRECTION, with no curvature mixing albedo into shading.
+#
+# Parse-check with:  ftrace scenes/_material_prop.ftsl -parseonly
+# Semantics are pinned deterministically by:  ftrace -checkprop
+scene { units meters }
+
+pattern "p_u"  { expr "0.05+0.9*u"     }   # free: u
+pattern "p_v"  { expr "0.05+0.9*v"     }   # the hand-written twin of p_u with u:=v
+pattern "p_ua" { expr "a*(0.05+0.9*u)" }   # free: a, u
+pattern "half" { expr "0.5"            }   # a plain modulator for the compose test
+pattern "p_uh" { expr "(0.05+0.9*u)*0.5" } # the hand-written twin of p_u * half
+
+# --- sources: the materials whose properties get read ---------------------------------
+material "src_grad" { type diffuse  reflect pattern:p_u }
+material "src_amp"  { type diffuse  reflect pattern:p_ua  albedo_default 0.4 }
+material "src_tr"   { type translucent  reflect 0.1  transmit 0.62 }
+
+material "grey" { type diffuse  reflect 0.5 }
+
+# --- A: a bare property reference reproduces the source slot ---------------------------
+# A1 reads gold's reflect (a lone `pattern:` => flat-1.0 base + the pattern); A2 is the
+# source material used directly.  Both must render as the same left->right gradient.
+material "A1" { type diffuse  reflect src_grad.reflect }
+
+# --- B: rebinding at the reference == rebinding at the use site ------------------------
+# B1 rebinds inside the property reference; B2's twin is written out by hand as p_v.
+material "B1" { type diffuse  reflect src_grad.reflect(u=v) }
+material "B2" { type diffuse  reflect pattern:p_v }
+
+# `a` resolves against the SOURCE material, so an unbound `a` falls back to src_amp's
+# own albedo_default 0.4 — not to the consumer's, and not to the system 1.0.
+material "B3" { type diffuse  reflect src_amp.reflect }
+material "B4" { type diffuse  reflect src_amp.reflect(a=1) }
+
+# --- E: a CROSS-SLOT spectral read ------------------------------------------------------
+# `transmit` and `reflect` are both spectral, so reading one into the other is legal: the
+# type that matters is the property's, not the slot's name.  Reads as flat brightness.
+material "E1" { type diffuse  reflect src_tr.transmit }
+material "E2" { type diffuse  reflect 0.62 }
+
+# --- D: a property reference COMPOSES with the consumer's own map ----------------------
+# Both spellings mean "a per-hit multiplier on whatever the slot otherwise evaluates to",
+# so the two multiply rather than one clobbering the other.
+material "D1" { type diffuse  reflect src_grad.reflect  reflect_map pattern:half }
+material "D2" { type diffuse  reflect pattern:p_uh }
+
+# --- the room --------------------------------------------------------------------------
+quad { origin 0 0 0  u 1 0 0  v 0 1 0    material grey }   # backdrop
+quad { origin 0 0 0  u 1 0 0  v 0 0 1.2  material grey }   # floor
+quad { origin 0 1 0  u 0 0 1.2  v 1 0 0  material grey }   # ceiling
+
+# --- row A/B (y 0.55..0.77): gradient direction reads the rebinding --------------------
+quad { origin 0.04 0.55 0.006  u 0.20 0 0  v 0 0.22 0  material A1 }
+quad { origin 0.28 0.55 0.006  u 0.20 0 0  v 0 0.22 0  material src_grad }
+quad { origin 0.52 0.55 0.006  u 0.20 0 0  v 0 0.22 0  material B1 }
+quad { origin 0.76 0.55 0.006  u 0.20 0 0  v 0 0.22 0  material B2 }
+
+# --- row B'/D (y 0.30..0.52): albedo fallback + pattern composition --------------------
+quad { origin 0.04 0.30 0.006  u 0.20 0 0  v 0 0.22 0  material B3 }
+quad { origin 0.28 0.30 0.006  u 0.20 0 0  v 0 0.22 0  material B4 }
+quad { origin 0.52 0.30 0.006  u 0.20 0 0  v 0 0.22 0  material D1 }
+quad { origin 0.76 0.30 0.006  u 0.20 0 0  v 0 0.22 0  material D2 }
+
+# --- row E (y 0.05..0.27): cross-slot spectral read, side by side with its literal -------
+quad { origin 0.04 0.05 0.006  u 0.20 0 0  v 0 0.22 0  material E1 }
+quad { origin 0.28 0.05 0.006  u 0.20 0 0  v 0 0.22 0  material E2 }
+quad { origin 0.52 0.05 0.006  u 0.20 0 0  v 0 0.22 0  material E1 }
+quad { origin 0.76 0.05 0.006  u 0.20 0 0  v 0 0.22 0  material E2 }
+
+light area { origin 0 0.995 0.10  u 1 0 0  v 0 0 0.40  normal 0 -1 0  spd preset:bb6500 }
+light area { origin 0 0.005 0.10  u 1 0 0  v 0 0 0.40  normal 0  1 0  spd preset:bb6500 }
+
+camera "cam" {
+    eye 0.5 0.5 2.0  look_at 0.5 0.5 0  up 0 1 0  fov_y 32
+    mode B
+    film { res 320 320 }
+}

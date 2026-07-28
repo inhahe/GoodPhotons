@@ -748,6 +748,29 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   bind before a positional one, so a positional takes the sole *still-free* input (loom's
   `free_inputs() - set(binds)`). `-checkbind` pins the algebra (splice == textual
   inlining, simultaneity, identity, introspection).
+  **Per-property access** (§3.2, `materialPropRef`) reads ONE slot off an already-declared
+  material — `src.reflect`, `src.reflect(u=v)` — with the *slot keyword* as the dot-handle,
+  because FTSL properties are identified solely by slot keyword and never carry a quoted
+  name (§3.2's "naming is optional" arm is therefore already the ftrace status quo,
+  vacuously; what was missing was the handle to read one back out). It resolves by calling
+  `applyMaterial(idx, args, L)` and then reading the slot off the *result*, so a reference
+  cannot diverge from applying the bundle and reading the slot — same binding rules, same
+  memo, same `a` -> **source** `albedo_default` fallback. Four value-site chokepoints carry
+  it, one per shape the value can take: `patternedSpectrumParam` (the only site that can
+  hold BOTH the base spectrum and the slot's per-hit pattern, so a source pattern and the
+  reader's own `<slot>_map` are **composed** there via `composePatterns`, appending
+  `[a…, b…, Mul]` — valid postfix for the same "each program pushes one value" reason the
+  splice is), `evalSpectrum` (pattern-less spectral sites), `bindScalarPattern` (reports
+  "handled" only when the source actually carries a pattern, so the call sites' existing
+  `bindScalarPattern -> bindScalarTexture -> dblParam` ladder routes both shapes without
+  knowing the form exists), and `dblParam`. Record-driven, texture-bound, and un-appliable
+  pattern slots are **refused**, never approximated, since each would hand the reader a
+  number the source does not use. `recordIndex_` is checked first so `R.chan` cannot change
+  meaning when a material is named `R`. Reaching those sites needs a `Loaded&` they were
+  never given, hence the `loadedRef_` member — a pointer to the owner, never to an element,
+  because `applyMaterial` reallocates `Scene::mats`/`patterns`. loom twin:
+  `Material.prop(name, *args, **binds)` (`tools/loom/loom/scene.py`). `-checkprop` pins it
+  by loading in-memory scenes and comparing each reference against a hand-written twin.
 - **`render_progress.h`** — progress hook for chunked samples-per-pixel renderers (modes
   `R`, `D`): the live status line (`[live] … photons, ~N% noise`) and noise estimation for
   `-noise` budgets.
