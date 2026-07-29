@@ -5,6 +5,34 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — DONE (2026-07-29, v0.102.1): `-exposure`/`-ev` was silently ignored by `-topng`
+
+`ftrace -topng in.ftbuf out.png -ev 3` produced a file byte-identical to the one
+without `-ev`: the flag parsed as a no-op and nothing warned. Cause: `-topng` is
+dispatched from `main()` at `argv[1]` *before* the main argument loop runs (it is
+deliberately a pure, scene-free utility path), and `exposureCli` is a local of that
+loop — so nothing on the conversion path ever saw the flag. `convertToPng()` called
+`writeFilm(out, f, N)` and took the `expComp = 0.0` default.
+
+This mattered because re-developing a checkpoint is exactly when you want an exposure
+override. A `.ftbuf` holds *linear* film, and the p99 auto-exposure anchors on the
+brightest 1% — so any scene with a small, very bright source (an arc lamp, a filament)
+develops with everything else crushed. `scenes/mirror_sphere_interior.ftsl` lands at a
+median of 33/255 for that reason. Without the flag the only way to re-develop brighter
+was to re-render, which for that scene is 30 minutes for an image already sitting on
+disk.
+
+Fixed by scanning `argv[4..]` for `-exposure`/`-ev` inside the `-topng` branch and
+threading it into `convertToPng(in, out, expComp)` → `writeFilm(..., expComp)`. Verified:
+`exposure=4.67e-13 (auto 1.56e-13 x 3EV-comp)`, median 33 → 60. Because a `.ppm` is
+already 8-bit sRGB there is nothing to re-expose, so that input now prints an explicit
+`warning: -ev ignored for a .ppm input` rather than pretending to work — and its output
+is confirmed byte-identical with and without the flag.
+
+Note the flag stays a *multiplier*, not stops (`-ev 3` is 3x, not 3 EV), consistent with
+`-ev` everywhere else in the CLI. That naming is itself mildly misleading but is not
+worth a breaking rename.
+
 ### BUG — DONE (2026-07-29, v0.102.0): `-max-bounce` was silently ignored by mode D (BDPT) and mode U (VCM)
 
 `-max-bounce N` parsed fine and was honoured by the unidirectional/forward paths, but the

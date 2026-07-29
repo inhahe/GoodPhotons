@@ -3568,7 +3568,8 @@ static bool readCompositeCheckpoint(const std::string& outPath, int res, int res
 //     sidecar does not persist the exposure mode, so this uses the same p99 auto-
 //     exposure as a non-absolute render; an absolute (power/lumens) scene may look
 //     brighter/darker than its original -o image. Re-run the render for an
-//     exposure-exact PNG.
+//     exposure-exact PNG. A trailing `-ev <c>` scales that auto-exposure, which is
+//     how you re-develop a finished render brighter without paying for it again.
 //   * .ftsl — NOT handled here (it is a scene, not an image): render it with -in.
 
 // Read a binary P6 (8-bit) PPM into a top-row-first RGB byte buffer. Returns false
@@ -3605,7 +3606,11 @@ static bool readBinaryPPM(const std::string& path, int& W, int& H,
     return (bool)in && in.gcount() == (std::streamsize)rgb.size();
 }
 
-static int convertToPng(const std::string& inPath, const std::string& outPath) {
+// `expComp` is the -exposure/-ev multiplier applied on top of the auto-exposure
+// (<= 0 means "plain auto"). It only affects a .ftbuf, whose linear film is still
+// tone-mapped here; a .ppm is already 8-bit sRGB and is copied through verbatim.
+static int convertToPng(const std::string& inPath, const std::string& outPath,
+                        double expComp = 0.0) {
     if (endsWithCI(inPath, ".ppm")) {
         int W = 0, H = 0; std::vector<uint8_t> rgb;
         if (!readBinaryPPM(inPath, W, H, rgb)) {
@@ -3640,9 +3645,9 @@ static int convertToPng(const std::string& inPath, const std::string& outPath) {
         in.read((char*)f.xyz.data(),  (std::streamsize)(f.xyz.size()  * sizeof(Vec3)));
         in.read((char*)f.hits.data(), (std::streamsize)(f.hits.size() * sizeof(double)));
         if (!in) { std::fprintf(stderr, "error: %s truncated\n", inPath.c_str()); return 1; }
-        // Tone-map with the default p99 auto-exposure (see note above). writeFilm prints
-        // the "wrote <out> ..." line.
-        return writeFilm(outPath.c_str(), f, (double)std::max<long long>(Nph, 1)) ? 0 : 1;
+        // Tone-map with the p99 auto-exposure (see note above), scaled by -ev if given.
+        // writeFilm prints the "wrote <out> ..." line, including the comp when != 1.
+        return writeFilm(outPath.c_str(), f, (double)std::max<long long>(Nph, 1), expComp) ? 0 : 1;
     }
     std::fprintf(stderr,
         "error: -topng converts .ppm and .ftbuf inputs; got '%s'.\n"
@@ -5280,7 +5285,8 @@ static void printHelp(const char* prog) {
 "  -dpi <n|auto>         screen pixel density; -convergence <m> = convergence-plane distance\n"
 "\n"
 "Utilities (exit after running):\n"
-"  -topng|-convert <in> <out.png>   convert .ppm/.ftbuf to PNG\n"
+"  -topng|-convert <in> <out.png> [-ev <c>]   convert .ppm/.ftbuf to PNG\n"
+"                        (-ev re-develops a .ftbuf brighter/darker, no re-render)\n"
 "  -review <base>        play a rendered frame sequence on the live window\n"
 "  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
@@ -5320,11 +5326,22 @@ static int run(int argc, char** argv) {
     // checkpoint). Kept before all scene/CLI setup so it is a pure utility path.
     if (argc >= 2 && (!std::strcmp(argv[1], "-topng") || !std::strcmp(argv[1], "-convert"))) {
         if (argc < 4) {
-            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> <output.png>\n",
+            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> [-ev <c>] <output.png>\n",
                          argv[0]);
             return 2;
         }
-        return convertToPng(argv[2], argv[3]);
+        // This branch runs before the main parse loop, so -exposure/-ev has to be picked
+        // up here or it is silently ignored (it was, until 0.102.1). Only meaningful for
+        // .ftbuf, which still holds linear film and is tone-mapped on the way out; a .ppm
+        // is already 8-bit sRGB and is copied through untouched.
+        double convExp = 0.0;   // <=0 = plain p99 auto-exposure
+        for (int i = 4; i + 1 < argc; ++i)
+            if (!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev"))
+                convExp = std::atof(argv[++i]);
+        if (convExp > 0.0 && endsWithCI(argv[2], ".ppm"))
+            std::fprintf(stderr, "warning: -ev ignored for a .ppm input (already 8-bit sRGB); "
+                                 "it only applies to a .ftbuf's linear film\n");
+        return convertToPng(argv[2], argv[3], convExp);
     }
     // Rendered-sequence review player (no rendering): `ftrace -review <base>`.
     // Plays a directory of `<base><digits>.<ext>` frames on the live window/timeline,

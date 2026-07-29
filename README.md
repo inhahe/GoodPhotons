@@ -2545,7 +2545,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-n <photons>` | Trace exactly this many photons/samples |
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension). Missing parent directories are created before the render starts (reported as `[out] created output directory …`), so a render aimed at a fresh `png/<series>/` subdir can't be traced to completion and then lost at write time. Mode `V` produces a *pair* of images (the two independent estimates it cross-checks) and writes them as `<out>_forward` / `<out>_backward` beside the given path |
-| `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
+| `-topng <in> <out.png> [-ev <c>]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker. See **Output** |
 | `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
@@ -2662,6 +2662,19 @@ an artifact to a 24-bit PNG *without re-rendering*:
   default p99 auto-exposure — the sidecar doesn't store the exposure mode, so an
   absolute/lumens scene may read brighter or darker than its original `-o` image;
   re-render for an exposure-exact PNG).
+
+A trailing **`-ev <c>`** scales that auto-exposure, so you can **re-develop a finished
+render brighter or darker without paying to render it again** — useful when a scene's
+p99 anchor is dominated by a small very bright source (an arc, a filament) and leaves
+the rest of the frame too dark:
+
+```
+ftrace -topng out.png.ftbuf out_bright.png -ev 3
+```
+
+`-ev` applies only to a `.ftbuf` (which still holds linear film); on a `.ppm` input it
+warns and is ignored, since that file is already 8-bit sRGB. *(Before 0.102.1 `-ev` was
+silently dropped on this path — `-topng` runs before the main argument loop.)*
 
 A `.ftsl` is a *scene*, not an image — render it with `-in scene.ftsl -o out.png`.
 Three drag-and-drop Windows helpers in the repo root wrap this: **`ppm_to_png.bat`**,

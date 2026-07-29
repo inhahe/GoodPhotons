@@ -24,6 +24,19 @@
 #   ftrace -in scenes/mirror_sphere_interior.ftsl -mode D -max-bounce 64 -time 1800 \
 #          -interval 30 -checkpoint -o png/mirrorsphere/mirrorsphere.png -window -keepwindow
 #
+# Then develop it about 3x brighter, straight off the checkpoint, no re-render:
+#
+#   ftrace -topng png/mirrorsphere/mirrorsphere.png.ftbuf \
+#          png/mirrorsphere/mirrorsphere_ev3.png -ev 3
+#
+# The boost is not a fudge, it is forced by the scene: auto-exposure anchors on the
+# 99th luminance percentile, and here that percentile IS the bare arc, which is orders
+# of magnitude brighter than silver-bounced light. Anchoring to it leaves the shell at
+# a median of 33/255. x3 puts the median at 60 and the recursive rings actually read,
+# at the cost of clipping 1.7% of pixels -- essentially just the arc itself, which is
+# a 6000 K point source and *should* blow out. (Until 0.102.1 `-topng` silently dropped
+# -ev, so this took a full re-render; that fix is what makes the one-liner above work.)
+#
 # `-max-bounce 64` is NOT optional here, it is the single setting the whole image depends
 # on. Mode D defaults to 8 edges; a 97%-reflective silver cavity needs ~33 before the light
 # rattling around inside it has actually been absorbed, and the quartz envelope spends ~4
