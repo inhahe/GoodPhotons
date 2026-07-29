@@ -121,7 +121,7 @@ scene { units meters  spectral 360 830 1 }
 |---|---|---|---|
 | `units` | `meters`/`m`, `centimeters`/`cm`, `millimeters`/`mm`, `inches`/`in`, `feet`/`ft` | `meters` | all authored **lengths/positions** are scaled to internal metres at load time |
 | `spectral` | `<lo> <hi> <binWidth>` | `360 830 1` | only the **bin width** is applied; the engine range is fixed at 360–830 nm (a warning prints if `lo/hi` differ) |
-| `default_mode` | a mode letter (`A`/`B`/`C`/`D`/`U`/`M`/`R`/`P`/…) | *(none)* | the render mode used when nothing else picks one. Resolution order: `-mode` (CLI) → a camera's own `mode` → `default_mode` → built-in `B` |
+| `default_mode` | a mode letter (`A`/`B`/`C`/`D`/`U`/`M`/`R`/`W`/`P`/…) | *(none)* | the render mode used when nothing else picks one. Resolution order: `-mode` (CLI) → a camera's own `mode` → `default_mode` → built-in `B`. `W` is not a transport mode of its own — the loader rewrites it to `R` and switches on the deterministic Whitted estimators for the whole run (a CLI `-mode` still overrides it) |
 | `fps` | `<n>` | *(none)* | default playback rate for flyby animations, read by assembly tooling (e.g. `showcase_flyby.py` when `--fps` is omitted). Overridable per-flyby with `fps <n>` on the `camera_curve`/`camera_path`/`camera_orbit` block. Playback hint only — does not affect rendering |
 
 Directions (`up`, `normal`, `dir`, `axis`) are **not** unit-scaled — only points and
@@ -1557,7 +1557,7 @@ camera "cam" {
 | `fov_y` | 40 | vertical FOV in degrees |
 | `aperture` | 0.02 | thin-lens radius (metres) |
 | `focus` | 0 (∞) | focus distance |
-| `mode` | inherit CLI | `A` finite-lens forward splat, `B` pinhole splat, `C` finite-aperture catch, `R` backward reference, `D` BDPT |
+| `mode` | inherit CLI | `A` finite-lens forward splat, `B` pinhole splat, `C` finite-aperture catch, `R` backward reference, `W` deterministic (POV-Ray-style) preview — mode `R` with fixed quadratures instead of random draws, noise-free at 1 spp, `D` BDPT |
 | `lens <mm>` | — | focal length; sets fov_y = 2·atan(filmH/2f); overrides `fov_y` |
 | `fstop <N>` | — | aperture radius = focal/2N; seats film at image distance for A/C DoF |
 | `zoom <x>` | 1 | multiplies focal length (x>1 tele/narrower) |

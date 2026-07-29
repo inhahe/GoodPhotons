@@ -610,6 +610,14 @@ struct Loaded {
                                  //   don't author their own `mode` (0 = not specified). Unlike
                                  //   `mode` above (which trails the last camera/render block),
                                  //   this is a stable, camera-immune default.
+    // `mode W` is not a transport mode of its own: it is mode R plus the deterministic
+    // Whitted estimators (backward.h `whitted`). Normalise it to 'R' AT PARSE TIME and
+    // raise this flag, so nothing downstream ever has to know about a 'W' — the letter
+    // reaching the render dispatch used to fall through to the forward default and
+    // silently produce a black image. main.cpp ORs this into g_whitted. It is a
+    // whole-run switch (like -heroc), so one camera authoring `mode W` turns it on for
+    // the run; mixing W and R cameras in one file is not meaningful.
+    bool whitted = false;
     double defaultFps = 0.0;     // scene { fps N }: default flyby playback fps (0 = not specified)
     long long photons = -1;      // -1 = not specified (CLI default wins)
     int res = -1;                // -1 = not specified
@@ -621,6 +629,15 @@ struct Loaded {
     // the author's problem.
     std::vector<std::string> unknownKeys;
 };
+
+// Normalise an authored mode letter: `W` is mode R plus the deterministic Whitted
+// estimators, not a transport mode of its own, so it never survives the parse.
+// See Loaded::whitted.
+inline char normMode(const std::string& md, Loaded& L) {
+    char m = md[0];
+    if (m == 'W' || m == 'w') { L.whitted = true; return 'R'; }
+    return m;
+}
 
 class Builder {
 public:
@@ -659,7 +676,7 @@ public:
             // path/orbit doesn't set its own `fps`. Both are pure defaults — a per-camera
             // `mode`/`fps` and the CLI still override them.
             std::string dm = strOf(b, "default_mode");
-            if (!dm.empty()) L.defaultMode = dm[0];
+            if (!dm.empty()) L.defaultMode = normMode(dm, L);
             double dfps = dblOf(b, "fps", 0.0);
             if (dfps > 0.0) L.defaultFps = dfps;
         }
@@ -5518,7 +5535,7 @@ private:
         if (!readProjection(b, cs)) return false;     // projection/fisheye
         if (!readLens(b, cs)) return false;           // optional physical `lens { ... }` block
         std::string md = strOf(b, "mode");
-        if (!md.empty()) cs.mode = md[0];
+        if (!md.empty()) cs.mode = normMode(md, L);
         L.cameras.push_back(cs);
 
         // Mirror the first camera into the flat fields + global mode/res (defaults
@@ -5598,7 +5615,7 @@ private:
         shared.fov = dblOf(b, "fov_y", 40.0);
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
-        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = normMode(md, L);
         shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
@@ -5709,7 +5726,7 @@ private:
         shared.fov = dblOf(b, "fov_y", 40.0);
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
-        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = normMode(md, L);
         shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
@@ -5821,7 +5838,7 @@ private:
         shared.fov = dblOf(b, "fov_y", 40.0);
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
-        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = normMode(md, L);
         shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
@@ -6437,7 +6454,7 @@ private:
         std::string dev = strOf(b, "device");
         if (!dev.empty()) L.device = dev;
         std::string md = strOf(b, "mode");
-        if (!md.empty()) L.mode = md[0];
+        if (!md.empty()) L.mode = normMode(md, L);
         std::string o = strOf(b, "out");
         if (!o.empty()) L.out = o;
         const Stmt* r = find(b, "res");

@@ -205,8 +205,9 @@ def main() -> int:
     # A *noise* budget (not a time one) keeps every frame equally grainy, which is what
     # stops the loop from shimmering: a fixed -time would let a cheap frame come out
     # clean and an expensive one come out speckled, and the eye reads that difference
-    # as flicker.  4% costs ~105 s/frame on this GPU (~4.4 h for the 150) and survives
-    # the GIF's 256-colour quantisation; 2.5% costs ~5x that for no visible gain.
+    # as flicker.  4% costs ~190 s/frame on this GPU (~8 h for the 150, measured over an
+    # uncontended stretch) and survives the GIF's 256-colour quantisation; 2.5% costs ~5x
+    # that for no visible gain.  `--resume` picks up from the frames already on disk.
     noise = 4.0
     for a in sys.argv:
         if a.startswith("--noise="):

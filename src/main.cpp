@@ -6052,6 +6052,11 @@ static int run(int argc, char** argv) {
     // Publish the depth cap / direct-only mode to the tracer wrappers (globals, like
     // g_heroC), so every render (incl. the meter pre-pass) honours them.
     g_maxBounceOverride = maxBounceOverride;
+    // An authored `mode W` is normalised to 'R' by the loader (ftsl::normMode); this is
+    // the half that turns the deterministic estimators on. A CLI `-mode <x>` forces every
+    // camera, so it also overrides the scene's choice of W — otherwise `-mode R` on a W
+    // scene would silently still render the biased preview.
+    if (ftslScene.whitted && !modeFromCli) g_whitted = true;
     g_directOnly = directOnly || g_whitted;   // -mode W implies it
     if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);
     if (g_whitted) {
