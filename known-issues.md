@@ -5,27 +5,45 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### BUG — OPEN (2026-07-28): `-max-bounce` is silently ignored by mode D (BDPT) and mode U (VCM)
+### BUG — DONE (2026-07-29, v0.102.0): `-max-bounce` was silently ignored by mode D (BDPT) and mode U (VCM)
 
-`-max-bounce N` parses fine (`main.cpp:5360`, stored in `g_maxBounceOverride` at 2502) and is
-honoured by the unidirectional/forward paths (2674 / 2733 / 2777), but the bidirectional modes
-never read it: mode D hard-codes `int maxDepth = 8;` at `main.cpp:4078` and mode U the same at
-`main.cpp:4233`. On the GPU the bound is baked in harder still — `#define BDPT_MAXDEPTH 8` /
-`BDPT_MAXV (BDPT_MAXDEPTH+3)` at `render_cuda.cu:5242`, used to size the *per-thread* stack
-arrays `DVertex eye[BDPT_MAXV], light[BDPT_MAXV]` in `kBdptT<NS>` (7778-79), with a clamp at
-10722. So `ftrace -mode D -max-bounce 64` renders at depth 8 and prints `maxDepth=8` without
-any diagnostic.
+`-max-bounce N` parsed fine and was honoured by the unidirectional/forward paths, but the
+bidirectional modes never read it: mode D hard-coded `int maxDepth = 8;` in `main.cpp` and mode
+U the same. On the GPU the bound was baked in harder still — `#define BDPT_MAXDEPTH 8` /
+`BDPT_MAXV (BDPT_MAXDEPTH+3)`, used to size the *per-thread* stack arrays
+`DVertex eye[BDPT_MAXV], light[BDPT_MAXV]` in `kBdptT<NS>`, with a clamp in `renderBdptCuda`.
+So `ftrace -mode D -max-bounce 64` rendered at depth 8 and printed `maxDepth=8` without any
+diagnostic.
 
-Repro: `ftrace -in scenes/silver_sphere_xenon.ftsl -mode D -max-bounce 64 -n 16` and read the
-`maxDepth=` field of the startup line. (Measured impact on that scene: mode R at cap 8 vs 64 is
-only ~2x, so this is a correctness/UX bug, not the cause of any particular dark render.)
+The original entry judged this "a correctness/UX bug, not the cause of any particular dark
+render" — that was **wrong**, and `scenes/mirror_sphere_interior.ftsl` is the counter-example.
+A 97%-reflective silver cavity has a photon mean free path of ~1/(1-0.97) = 33 bounces, so
+truncating at 8 does not dim the image, it deletes it. Measured on that frame at equal time,
+fraction of pixels at *exactly* 0.0:
 
-Proper fix: `kBdptT` is *already* templated on `NS`, so template it on the depth bound as well
-and thread `maxV` through `dRandomWalk` / `dGenCameraSubpath` / `dGenLightSubpath` instead of
-reading the `#define`. Instantiate a deep variant only when `-max-bounce` asks for it, so the
-default launch keeps its current local-memory footprint (the stack arrays are the whole reason
-the constant is baked in). At minimum, until that lands, `main.cpp` should *warn* when
-`g_maxBounceOverride` is set in a mode that cannot honour it, rather than silently dropping it.
+| `-max-bounce` | black pixels |
+|---|---|
+| 8 (the old hard-coded value) | 96.9% |
+| 48 | 67.4% |
+| 64 | 28.9% |
+
+Fixed as the entry proposed: `kBdptT` is now templated on the depth bound too
+(`template <int NS, int MAXD>`), `maxV` is threaded through `dRandomWalk` /
+`dGenCameraSubpath` / `dGenLightSubpath` instead of reading the `#define`, and only two
+variants are instantiated — `BDPT_MAXDEPTH` (8, bit-for-bit the old kernel and still the
+default) and `BDPT_DEEPDEPTH` (64), the deep one launched only when `-max-bounce` asks for
+more than 8. `main.cpp` mode D and mode U now read `g_maxBounceOverride`.
+
+Two things to know about the deep variant. It is **~15x slower per sample** — the BDPT
+connection double-loop is O(depth²) — which is inherent, not a regression. And GPU mode U
+sizes its light-vertex slab as `npix * vcmCap * sizeof(DVcmLV)`, which at `vcmCap = maxDepth
+= 64` and 1100x733 would be 6.6 GB; `vcmSessionBegin` now bounds `vcmCap` by a 768 MB slab
+budget and prints when it clamps. That only limits how many light-subpath vertices are
+*stored for merging* (subpaths still walk to `maxDepth`, and connections are unaffected), so
+the estimator stays unbiased.
+
+Remaining limitation: past 64 the GPU still clamps. Going deeper needs another instantiation,
+and the per-thread local-memory footprint is already ~13 KB there.
 
 ### BUG — OPEN (2026-07-28): `light env { spd ... intensity N }` silently ignores `intensity`
 

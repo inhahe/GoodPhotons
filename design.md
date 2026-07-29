@@ -765,6 +765,21 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   wrappers. `directOnly` (terminate after the first non-specular NEE, specular chains
   still recurse) is scoped to the camera path tracers (R spectral + RGB, P's backward
   layer); forward B and the photon/BDPT modes honour only `maxBounce`.
+  Since 0.102.0 the **bidirectional** modes honour `maxBounce` too (they previously
+  hard-coded 8 and silently dropped the flag). Their default stays 8 — the BDPT connection
+  double-loop is O(depth²) and the per-thread vertex stack is thread-local memory — so for
+  D/U the flag *raises* the bound as often as it caps it. On the GPU that bound is a
+  template parameter, not a `#define`: `kBdptT<int NS, int MAXD>` sizes
+  `DVertex eye[MAXV]/light[MAXV]` from `MAXD`, `maxV` is threaded through
+  `dRandomWalk`/`dGenCameraSubpath`/`dGenLightSubpath`, and exactly two variants are
+  instantiated — `BDPT_MAXDEPTH` (8, bit-for-bit the old kernel, still the default launch)
+  and `BDPT_DEEPDEPTH` (64), the deep one launched only when `-max-bounce > 8`. GPU mode U
+  additionally bounds its light-vertex slab (`npix * vcmCap * sizeof(DVcmLV)`) by a 768 MB
+  budget and reports when `vcmCap < maxDepth`; that only drops merge candidates at the
+  deepest vertices, leaving the estimator unbiased. Why it matters: a specular cavity has a
+  photon mean free path of `1/(1-R)` bounces — ~33 for silver — so truncating at 8 does not
+  dim such a scene, it deletes it (`scenes/mirror_sphere_interior.ftsl` goes from 97% pure
+  black at depth 8 to 29% at depth 64).
   Since 0.29.0 the interactive `-explore` fly-viewer can toggle (key **`T`**) a live
   **path-traced preview** using the fast RGB backward tracer instead of the flat raster:
   a resident `BackwardRGBSession` (render_cuda.cu) bakes/uploads the scene ONCE

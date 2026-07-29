@@ -2653,8 +2653,11 @@ static int g_heroC = hero::kHeroC;
 
 // Scene-ignore render params (Stage 3), set once at arg-parse and read by the tracer
 // wrappers (like g_heroC). g_maxBounceOverride < 0 leaves each tracer's own default
-// (32); >= 1 caps the path-depth loop and is honoured UNIVERSALLY (forward B, backward
-// R/RGB, BDPT, photon/SPPM, P). g_directOnly renders direct lighting + specular recursion
+// (32 for the unidirectional tracers, 8 for the bidirectional D/U estimators, whose
+// connection cost grows ~depth^2); >= 1 SETS the path-depth loop and is honoured
+// UNIVERSALLY (forward B, backward R/RGB, BDPT D, VCM U, photon/SPPM, P). Note that for
+// D/U it can RAISE the depth as well as cap it, which is what a specular-only cavity
+// needs. g_directOnly renders direct lighting + specular recursion
 // only (no diffuse indirect bounce) — a Whitted-style near-1-spp preview — in the CAMERA
 // path tracers where it is well-defined: backward R, the RGB fast path, and the backward
 // camera side of the P composite. The forward light tracer (B) and the photon /
@@ -4417,7 +4420,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                  "(backward) instead.\n", unsupported);
             return 1;
         }
-        int maxDepth = 8;   // path length in edges; connection cost grows ~depth^2
+        // Path length in edges; connection cost grows ~depth^2, so the default stays
+        // low. `-max-bounce` raises it: a specular-only cavity (a mirror-lined sphere,
+        // a kaleidoscope, nested dielectrics) needs far more than 8 edges before the
+        // recursive images stop truncating to black, and specular vertices are cheap
+        // because a delta BSDF has no connection to make.
+        int maxDepth = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
         std::printf("mode D: bidirectional path tracing at %dx%d on %s (maxDepth=%d, light=%s) ...\n",
                     res, resY, useGpu ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str(),
                     maxDepth, lightLabel);
@@ -4572,7 +4580,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                  "or D (BDPT) instead.\n", unsupported);
             return 1;
         }
-        int maxDepth = 8;   // full path length in edges
+        int maxDepth = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;  // full path length in edges
         double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                           : scene.sceneRadius * g_pmRadiusFactor;
         // Hero-wavelength bundle (Wilkie 2014). Mode U's scene scope already excludes
@@ -5238,7 +5246,8 @@ static void printHelp(const char* prog) {
 "  -no-media             drop all participating media (haze/fog/volumes)\n"
 "  -no-env               remove the environment (sky/IBL) light\n"
 "  -no-fluoro            demote fluorescent materials to plain diffuse\n"
-"  -max-bounce <n>       cap path depth at n bounces (default 32)\n"
+"  -max-bounce <n>       set path depth to n bounces (default 32; modes D/U default 8,\n"
+"                        where raising it is what a mirror-lined cavity needs)\n"
 "  -direct-only          Whitted: direct + specular recursion only, no diffuse indirect\n"
 "                        (near-1-spp preview; camera modes R/RGB and P's backward side)\n"
 "\n"
