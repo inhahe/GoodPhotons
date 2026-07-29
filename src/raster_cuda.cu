@@ -96,6 +96,25 @@
   #include <cuda_runtime.h>
 #endif
 
+// --- Optional CUDA <-> Direct3D 11 interop (zero-copy present) ----------------------
+// When the live window is presenting with D3D11 (see livewindow.cpp), the tonemap can
+// write its RGBA8 bytes STRAIGHT into the texture D3D samples, so the finished frame
+// never crosses the PCIe bus or touches host memory at all. Windows + real CUDA only:
+// a HIP build or a non-Windows host simply omits the extra entry points and keeps the
+// download path (renderFrameToTarget then reports failure and the caller falls back).
+#if defined(_WIN32) && !defined(FTRACE_USE_HIP) && !defined(__HIP_PLATFORM_AMD__)
+  #define FTRACE_D3D11_INTEROP 1
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>
+  #include <d3d11.h>
+  #include <cuda_d3d11_interop.h>
+#endif
+
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -179,6 +198,13 @@ struct DAttr {
 constexpr int kSlotValid   = 1;   // bit0: slot holds a projected sub-triangle
 constexpr int kSlotClear   = 2;   // bit1: see-through transmissive surface
 constexpr int kSlotClipped = 4;   // bit2: verts were lerped by the near clip -> attrs in DAttr
+// bit3: the whole source triangle faces away from the eye, so its shading normals must be
+// negated ("two-sided"). Decided ONCE per triangle in kProject and carried here rather than
+// re-tested per pixel: the per-pixel test on the interpolated normal inverts a 1-px band at
+// every silhouette, where dot(N,V) grazes through zero on a genuinely front-facing surface.
+// Kept as a flag (not baked into the stored normals) because an unclipped slot has no DAttr
+// record at all — kShade reads its attributes bit-verbatim from the source DPTri.
+constexpr int kSlotBack    = 8;
 
 // A camera-space vertex carrying the interpolated attributes (mirrors raster::VtxCS).
 struct DVtxCS { float x, y, z; float3 wpos, wn; float2 uv; };
@@ -362,7 +388,7 @@ __device__ inline DVtxCS clipNear(const DVtxCS& A, const DVtxCS& B, float zn) {
 // bit-verbatim copy of tris[idx >> 1]'s fields and the shade/clear passes read the
 // source triangle directly.
 __device__ inline void emitSlot(DGeo* geos, DAttr* attrs, int* flags, int idx,
-                                const DPTri& t, int W, int H, bool clipped,
+                                const DPTri& t, int W, int H, bool clipped, bool back,
                                 const PV& A, const PV& B, const PV& C) {
     float minx = floorf(fminf(A.sx, fminf(B.sx, C.sx)));
     float maxx = ceilf (fmaxf(A.sx, fmaxf(B.sx, C.sx)));
@@ -387,7 +413,8 @@ __device__ inline void emitSlot(DGeo* geos, DAttr* attrs, int* flags, int idx,
         a.emissive = t.emissive;
         attrs[idx] = a;
     }
-    flags[idx] = kSlotValid | (t.clear ? kSlotClear : 0) | (clipped ? kSlotClipped : 0);
+    flags[idx] = kSlotValid | (t.clear ? kSlotClear : 0) | (clipped ? kSlotClipped : 0)
+               | (back ? kSlotBack : 0);
 }
 
 __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
@@ -398,6 +425,14 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
     // Invalidate both output slots up front (dense, coalesced — adjacent threads write
     // adjacent flag pairs).
     flags[2*i] = 0; flags[2*i+1] = 0;
+
+    // Two-sided decision for the whole triangle (mirrors raster.h projectRange). A triangle
+    // counts as back-facing only when ALL THREE vertices face away: a silhouette triangle
+    // straddles the horizon and must keep its smooth normals, while geometry genuinely seen
+    // from behind (outward-wound walls viewed from inside the box) has every vertex agreeing.
+    const bool back = dot3(t.n0, cam.eye - t.p0) < 0.0f &&
+                      dot3(t.n1, cam.eye - t.p1) < 0.0f &&
+                      dot3(t.n2, cam.eye - t.p2) < 0.0f;
 
     // World -> camera space.
     DVtxCS c0 = toCS(cam, t.p0, t.n0, t.uv0);
@@ -417,7 +452,7 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
         PV A = projectPV(cam, c0, W, H);
         PV B = projectPV(cam, c1, W, H);
         PV C = projectPV(cam, c2, W, H);
-        emitSlot(geos, attrs, flags, 2*i, t, W, H, /*clipped=*/false, A, B, C);
+        emitSlot(geos, attrs, flags, 2*i, t, W, H, /*clipped=*/false, back, A, B, C);
         return;
     }
 
@@ -446,10 +481,10 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
     PV A = projectPV(cam, q0, W, H);
     PV B = projectPV(cam, q1, W, H);
     PV C = projectPV(cam, q2, W, H);
-    emitSlot(geos, attrs, flags, 2*i + 0, t, W, H, clipped, A, B, C);
+    emitSlot(geos, attrs, flags, 2*i + 0, t, W, H, clipped, back, A, B, C);
     if (np == 4) {
         PV D = projectPV(cam, q3, W, H);
-        emitSlot(geos, attrs, flags, 2*i + 1, t, W, H, clipped, A, C, D);
+        emitSlot(geos, attrs, flags, 2*i + 1, t, W, H, clipped, back, A, C, D);
     }
 }
 
@@ -457,10 +492,94 @@ __global__ void kProject(const DPTri* tris, int nTris, DCam cam, int W, int H,
 // Pass B: rasterize each valid slot into the 64-bit visibility buffer. Each covered pixel
 // packs (1/depth as float bits) << 32 | slotIdx; atomicMax keeps the nearest (largest
 // 1/depth) surface. Mirrors fillTriangleG's barycentric coverage + perspective 1/depth.
-// Per-slot rasterization setup: cull checks, clamped pixel bbox, area/derivatives.
+// --- Watertight coverage: canonical edge functions (device twin of raster.h's EdgeFn) ---
+//
+// The old incremental normalized barycentrics were not watertight: two triangles sharing
+// an edge seeded from different `xlo`, scaled by different 1/area and derived the third
+// weight as 1-w0-w1, so they computed different values for the same shared edge — and a
+// pixel centre landing exactly on it could be rejected by BOTH, leaving a crack. Instead
+// the edge's endpoints are put in a canonical (lexicographic) order before the
+// coefficients are formed, so both sharers build bitwise-identical P and Q-P, and the
+// value is the plain cross product about P — dx*(py-Py) - dy*(px-Px) — evaluated directly
+// so it never depends on where the span started. The winding sign sf = sign(area) * flip
+// is folded into dx/dy; the two sharers always get opposite sf (consistent winding flips
+// `flip`, inconsistent winding flips sign(area) instead), so their values are exact
+// negatives and exactly one accepts. Exact zeros are broken by `tie`, likewise true for
+// exactly one of the pair.
+//
+// Anchoring at P (instead of expanding to c + px*ex + py*ey) matters far more in float
+// than in double: the expanded constant Px*Qy - Py*Qx is ~W*H in magnitude even for a
+// short edge, and at 1080p its float ulp alone displaces the edge line by ~1e-3 px. That
+// never cracks a shared EDGE — both sharers are displaced identically — but the three
+// edges meeting at a shared VERTEX are perturbed independently, so a wide displacement
+// leaves a sliver there that no triangle claims (measured: one stray pixel per frame on
+// the cornell box's corners). Anchored at P every operand is a local offset and the
+// displacement drops to the point where no such pixel appears.
+// See the long comment on raster.h's EdgeFn for the full argument.
+struct DEdge { float Px, Py, dx, dy; bool tie; };
+
+__device__ inline DEdge makeEdgeD(float Px, float Py, float Qx, float Qy, float s) {
+    float flip = 1.0f;
+    if (Qx < Px || (Qx == Px && Qy < Py)) {                 // canonicalize the endpoint order
+        float tx = Px; Px = Qx; Qx = tx;
+        float ty = Py; Py = Qy; Qy = ty;
+        flip = -1.0f;
+    }
+    const float sf = s * flip;
+    DEdge e;
+    e.Px  = Px;  e.Py = Py;
+    e.dx  = sf * (Qx - Px);
+    e.dy  = sf * (Qy - Py);
+    e.tie = sf > 0.0f;
+    return e;
+}
+
+// Evaluate the edge function, split into a per-row part and a per-pixel part.
+//
+// These MUST use the explicit round-to-nearest intrinsics rather than the natural
+// `r - e.dy * (p - e.Px)`. nvcc defaults to -fmad=true and would contract that into an
+// FMA, which evaluates dy*ax exactly and subtracts it from the ALREADY-ROUNDED r, leaving
+// r's rounding residual behind: a pixel sitting exactly on the edge then comes out as
+// ±0.5 ulp instead of 0. On its own that would still be harmless — the residual is
+// antisymmetric, so one sharer would get + and the other −. What breaks is that the two
+// sharers test the same edge under DIFFERENT indices (e0 for one triangle, e1 for the
+// other, since the edge sits opposite a different vertex in each), and those are separate
+// expressions the compiler may contract independently. Measured on the cornell box's
+// bottom-back-right corner at 640×480: the floor triangle's e0 came out -9.24e-07 (a
+// contracted FMA's residual) while the right wall's e1 came out exactly 0 with tie=false,
+// so BOTH rejected and the corner pixel was a hole.
+//
+// With separately rounded products the two products of a true tie are roundings of the
+// same real number, hence bit-identical, hence the difference is exactly 0 — and every
+// operation is exactly antisymmetric under negating dx/dy, whatever the compiler does
+// with the surrounding code. (The CPU twin in raster.h needs no intrinsics because MSVC's
+// default /fp:precise does not contract; the build sets no /fp: flag.)
+__device__ inline float edgeRow(const DEdge& e, float py) {
+    return __fmul_rn(e.dx, py - e.Py);
+}
+__device__ inline float edgeAt(const DEdge& e, float r, float px) {
+    return __fsub_rn(r, __fmul_rn(e.dy, px - e.Px));
+}
+
+// The three edge functions of a projected sub-triangle, plus 1/|area| to normalize the
+// edge values into barycentric weights (edge i sits opposite vertex i, so its value IS
+// that vertex's unnormalized weight).
+struct DEdges { DEdge e0, e1, e2; float invA; };
+
+__device__ inline DEdges makeEdgesD(const DGeo& t, float area) {
+    const float s = (area > 0.0f) ? 1.0f : -1.0f;
+    DEdges E;
+    E.e0 = makeEdgeD(t.sx1, t.sy1, t.sx2, t.sy2, s);
+    E.e1 = makeEdgeD(t.sx2, t.sy2, t.sx0, t.sy0, s);
+    E.e2 = makeEdgeD(t.sx0, t.sy0, t.sx1, t.sy1, s);
+    E.invA = (fabsf(area) > 1e-12f) ? 1.0f / fabsf(area) : 0.0f;
+    return E;
+}
+
+// Per-slot rasterization setup: cull checks, clamped pixel bbox, edge functions.
 // This is the exact preamble of the old monolithic kRaster, factored out so the
 // classifier and all three binned kernels compute identical values.
-struct SlotSetup { int xlo, xhi, ylo, yhi; float inv, dw0dx, dw1dx; };
+struct SlotSetup { int xlo, xhi, ylo, yhi; DEdges E; };
 
 __device__ inline bool setupSlot(const DGeo& t, int flg, int W, int H, int seeThrough, SlotSetup& s) {
     if (!(flg & kSlotValid)) return false;
@@ -474,26 +593,31 @@ __device__ inline bool setupSlot(const DGeo& t, int flg, int W, int H, int seeTh
     if (s.xlo > s.xhi || s.ylo > s.yhi) return false;
     float area = (t.sx1 - t.sx0) * (t.sy2 - t.sy0) - (t.sy1 - t.sy0) * (t.sx2 - t.sx0);
     if (fabsf(area) < 1e-9f) return false;
-    s.inv = 1.0f / area;
-    s.dw0dx = (t.sy1 - t.sy2) * s.inv;
-    s.dw1dx = (t.sy2 - t.sy0) * s.inv;
+    s.E = makeEdgesD(t, area);
     return true;
 }
 
-// Rasterize ONE bbox row of one sub-triangle: seed the barycentrics at the row's left
-// edge by direct evaluation (exactly as the old kernel did per row) and step
-// incrementally along x. The float arithmetic per (slot,row) is identical no matter
-// which thread executes it, and the atomicMax visibility merge is order-independent,
-// so any distribution of rows across threads yields bit-identical output.
+// Rasterize ONE bbox row of one sub-triangle: evaluate the three canonical edge functions
+// at each pixel centre from the row constant, with no incremental stepping (which is what
+// makes shared edges watertight — see DEdge above). The float arithmetic per (slot,row) is
+// identical no matter which thread executes it, and the atomicMax visibility merge is
+// order-independent, so any distribution of rows across threads yields bit-identical output.
 __device__ inline void rasterRow(const DGeo& t, int slot, int y, const SlotSetup& s,
                                  int W, unsigned long long* vis) {
-    float py = y + 0.5f, pxL = s.xlo + 0.5f;
-    float w0 = ((t.sx1 - pxL) * (t.sy2 - py) - (t.sy1 - py) * (t.sx2 - pxL)) * s.inv;
-    float w1 = ((t.sx2 - pxL) * (t.sy0 - py) - (t.sy2 - py) * (t.sx0 - pxL)) * s.inv;
+    const float py = y + 0.5f;
+    const float r0 = edgeRow(s.E.e0, py);            // row constants: shared bitwise by both sharers
+    const float r1 = edgeRow(s.E.e1, py);
+    const float r2 = edgeRow(s.E.e2, py);
     unsigned long long row = (unsigned long long)y * W + s.xlo;
-    for (int x = s.xlo; x <= s.xhi; ++x, ++row, w0 += s.dw0dx, w1 += s.dw1dx) {
-        float w2 = 1.0f - w0 - w1;
-        if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+    for (int x = s.xlo; x <= s.xhi; ++x, ++row) {
+        const float px = x + 0.5f;
+        const float v0 = edgeAt(s.E.e0, r0, px);
+        if (v0 < 0.0f || (v0 == 0.0f && !s.E.e0.tie)) continue;
+        const float v1 = edgeAt(s.E.e1, r1, px);
+        if (v1 < 0.0f || (v1 == 0.0f && !s.E.e1.tie)) continue;
+        const float v2 = edgeAt(s.E.e2, r2, px);
+        if (v2 < 0.0f || (v2 == 0.0f && !s.E.e2.tie)) continue;
+        const float w0 = v0 * s.E.invA, w1 = v1 * s.E.invA, w2 = v2 * s.E.invA;
         float invd = w0 * t.invd0 + w1 * t.invd1 + w2 * t.invd2;   // 1/depth
         if (invd <= 0.0f) continue;
         unsigned long long packed =
@@ -611,15 +735,17 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     int slot = (int)(unsigned int)(v & 0xffffffffULL);
     const DGeo& t = geos[slot];
 
-    // Recompute barycentrics at this pixel's centre.
+    // Recompute barycentrics at this pixel's centre. Evaluating the SAME canonical edge
+    // functions rasterRow used, in the same order, reproduces its weights bit for bit —
+    // so the 1/depth stored here is exactly the one that won the atomicMax.
     int px = (int)(i % (unsigned long long)W);
     int py = (int)(i / (unsigned long long)W);
     float fx = px + 0.5f, fy = py + 0.5f;
     float area = (t.sx1 - t.sx0) * (t.sy2 - t.sy0) - (t.sy1 - t.sy0) * (t.sx2 - t.sx0);
-    float inv = (fabsf(area) > 1e-12f) ? 1.0f / area : 0.0f;
-    float w0 = ((t.sx1 - fx) * (t.sy2 - fy) - (t.sy1 - fy) * (t.sx2 - fx)) * inv;
-    float w1 = ((t.sx2 - fx) * (t.sy0 - fy) - (t.sy2 - fy) * (t.sx0 - fx)) * inv;
-    float w2 = 1.0f - w0 - w1;
+    DEdges E = makeEdgesD(t, area);
+    float w0 = edgeAt(E.e0, edgeRow(E.e0, fy), fx) * E.invA;
+    float w1 = edgeAt(E.e1, edgeRow(E.e1, fy), fx) * E.invA;
+    float w2 = edgeAt(E.e2, edgeRow(E.e2, fy), fx) * E.invA;
     float invd = w0 * t.invd0 + w1 * t.invd1 + w2 * t.invd2;
     zbuf[i] = invd;
 
@@ -640,6 +766,9 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         wp1 = s.p1; wn1 = s.n1; uv1 = s.uv1;
         wp2 = s.p2; wn2 = s.n2; uv2 = s.uv2;
         color = s.color; tex = s.tex; tps = s.triplanarScale; emissive = s.emissive;
+    }
+    if (flags[slot] & kSlotBack) {           // two-sided: the whole triangle faces away
+        wn0 = wn0 * -1.0f; wn1 = wn1 * -1.0f; wn2 = wn2 * -1.0f;
     }
     emis[i] = emissive ? 1 : 0;
     if (emissive) { accum[i] = color * emisBoost; return; }   // raw emitter radiance
@@ -662,9 +791,11 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         }
     }
 
+    // No two-sided flip here: decided once per triangle in kProject, exactly as the CPU
+    // rasterizer does (see raster.h projectRange). Flipping the interpolated normal per
+    // pixel inverted a 1-px band at every silhouette, where dot(N,V) grazes through zero.
     float3 N3 = normalize3(wn);
     float3 V  = normalize3(cam.eye - wpos);
-    if (dot3(N3, V) < 0.0f) N3 = N3 * -1.0f;             // two-sided
     float lit = 0.0f;
     for (int li = 0; li < nLights; ++li) {
         const DLight& lp = lights[li];
@@ -719,19 +850,27 @@ __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
 
     float area = (t.sx1 - t.sx0) * (t.sy2 - t.sy0) - (t.sy1 - t.sy0) * (t.sx2 - t.sx0);
     if (fabsf(area) < 1e-9f) return;
-    float inv = 1.0f / area;
-    const float dw0dx = (t.sy1 - t.sy2) * inv;
-    const float dw1dx = (t.sy2 - t.sy0) * inv;
+    // Same watertight coverage as rasterRow. It matters even more here: the clear pass
+    // MULTIPLIES into clearT/milkT, so an edge covered by both sharers would darken a seam
+    // line twice, and one covered by neither would leave a hairline of un-tinted glass.
+    const DEdges E = makeEdgesD(t, area);
     const float tau = clarity;
 
     for (int y = ylo; y <= yhi; ++y) {
-        float py = y + 0.5f, pxL = xlo + 0.5f;
-        float w0 = ((t.sx1 - pxL) * (t.sy2 - py) - (t.sy1 - py) * (t.sx2 - pxL)) * inv;
-        float w1 = ((t.sx2 - pxL) * (t.sy0 - py) - (t.sy2 - py) * (t.sx0 - pxL)) * inv;
+        const float py = y + 0.5f;
+        const float r0 = edgeRow(E.e0, py);
+        const float r1 = edgeRow(E.e1, py);
+        const float r2 = edgeRow(E.e2, py);
         int row = y * W + xlo;
-        for (int x = xlo; x <= xhi; ++x, ++row, w0 += dw0dx, w1 += dw1dx) {
-            float w2 = 1.0f - w0 - w1;
-            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+        for (int x = xlo; x <= xhi; ++x, ++row) {
+            const float px = x + 0.5f;
+            const float v0 = edgeAt(E.e0, r0, px);
+            if (v0 < 0.0f || (v0 == 0.0f && !E.e0.tie)) continue;
+            const float v1 = edgeAt(E.e1, r1, px);
+            if (v1 < 0.0f || (v1 == 0.0f && !E.e1.tie)) continue;
+            const float v2 = edgeAt(E.e2, r2, px);
+            if (v2 < 0.0f || (v2 == 0.0f && !E.e2.tie)) continue;
+            const float w0 = v0 * E.invA, w1 = v1 * E.invA, w2 = v2 * E.invA;
             float invd = w0 * t.invd0 + w1 * t.invd1 + w2 * t.invd2;   // 1/depth
             if (invd <= zbuf[row]) continue;   // behind (or at) the opaque surface: occluded
             // Grazing term from the interpolated normal for a silhouette milk rim.
@@ -807,19 +946,21 @@ __device__ inline unsigned char encodeSrgb(double c, const unsigned char* lut) {
     return lut[(int)__dadd_rn(__dmul_rn(c, 4096.0), 0.5)];
 }
 
-// Tonemap + encode, one thread per pixel — the host tonemap loop operation-for-operation.
+// One pixel of tonemap + encode — the host tonemap loop operation-for-operation.
 // Every arithmetic op is an explicit round-to-nearest DOUBLE intrinsic so nvcc cannot
 // contract mul+add into FMA: the host build (MSVC /fp:precise, no AVX2 codegen) performs
 // plain IEEE mul/add there, and matching that sequence exactly is what keeps the output
 // bytes identical. Background pixels (zbuf<=0) keep the unexposed bg tint; the
 // see-through composite applies to ALL pixels (background included), as on the host.
-__global__ void kToneMap(const float3* accum, const float* zbuf, size_t n,
-                         double finalExp, int seeThrough,
-                         const float* clearT, const float* milkT,
-                         double milkX, double milkY, double milkZ,
-                         const unsigned char* lut, unsigned char* img) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+//
+// Factored out of the kernel so the RGB8-buffer and D3D-surface writers below are the
+// SAME maths by construction — the zero-copy present path cannot drift from the download
+// path (or from the host tail) no matter what is done to either kernel's plumbing.
+__device__ inline uchar3 tonemapPixel(const float3* accum, const float* zbuf, size_t i,
+                                      double finalExp, int seeThrough,
+                                      const float* clearT, const float* milkT,
+                                      double milkX, double milkY, double milkZ,
+                                      const unsigned char* lut) {
     float3 a = accum[i];
     double cx = (double)a.x, cy = (double)a.y, cz = (double)a.z;
     if (zbuf[i] > 0.0f) {                          // hit pixels get the exposure
@@ -836,10 +977,42 @@ __global__ void kToneMap(const float3* accum, const float* zbuf, size_t n,
             cz = __dadd_rn(__dmul_rn(cz, (double)T), __dmul_rn(milkZ, m));
         }
     }
-    img[i * 3 + 0] = encodeSrgb(cx, lut);
-    img[i * 3 + 1] = encodeSrgb(cy, lut);
-    img[i * 3 + 2] = encodeSrgb(cz, lut);
+    return make_uchar3(encodeSrgb(cx, lut), encodeSrgb(cy, lut), encodeSrgb(cz, lut));
 }
+
+// Tonemap + encode into the downloadable RGB8 frame, one thread per pixel.
+__global__ void kToneMap(const float3* accum, const float* zbuf, size_t n,
+                         double finalExp, int seeThrough,
+                         const float* clearT, const float* milkT,
+                         double milkX, double milkY, double milkZ,
+                         const unsigned char* lut, unsigned char* img) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uchar3 c = tonemapPixel(accum, zbuf, i, finalExp, seeThrough, clearT, milkT,
+                            milkX, milkY, milkZ, lut);
+    img[i * 3 + 0] = c.x;
+    img[i * 3 + 1] = c.y;
+    img[i * 3 + 2] = c.z;
+}
+
+#ifdef FTRACE_D3D11_INTEROP
+// Tonemap + encode STRAIGHT INTO the live window's D3D11 texture (RGBA8, opaque alpha).
+// Identical maths to kToneMap — only the store differs, so the pixels D3D shows are the
+// same bytes the download path would have produced. `W` maps the linear pixel index onto
+// the surface's (x,y); the byte x-offset surf2Dwrite wants is x * sizeof(uchar4).
+__global__ void kToneMapSurf(const float3* accum, const float* zbuf, size_t n, int W,
+                             double finalExp, int seeThrough,
+                             const float* clearT, const float* milkT,
+                             double milkX, double milkY, double milkZ,
+                             const unsigned char* lut, cudaSurfaceObject_t surf) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uchar3 c = tonemapPixel(accum, zbuf, i, finalExp, seeThrough, clearT, milkT,
+                            milkX, milkY, milkZ, lut);
+    int x = (int)(i % (size_t)W), y = (int)(i / (size_t)W);
+    surf2Dwrite(make_uchar4(c.x, c.y, c.z, 255u), surf, x * (int)sizeof(uchar4), y);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Host side.
@@ -895,6 +1068,15 @@ struct Scene {
     // Per-pass profiling events (stream marks; see renderFrame). [0]=frame start,
     // then after: clearvis, project, raster, shade, clear, tonemap, download.
     cudaEvent_t ev[8] = {};
+#ifdef FTRACE_D3D11_INTEROP
+    // Zero-copy present target: the live window's D3D11 texture registered with CUDA.
+    // Registration is expensive and the texture is stable between resizes, so it is kept
+    // here and only redone when bindPresentTarget() is handed a different texture/size.
+    cudaGraphicsResource* gfxRes = nullptr;
+    void*                 gfxTex = nullptr;   // the ID3D11Texture2D* gfxRes was made from
+    int                   gfxW = 0, gfxH = 0;
+    bool                  gfxOff = false;     // registration failed once -> stop retrying
+#endif
 };
 
 static float3 toF3(const Vec3& v) { return make_float3((float)v.x, (float)v.y, (float)v.z); }
@@ -916,6 +1098,11 @@ static bool tryMallocHost(void** p, size_t bytes) {
 
 void destroy(Scene* sc) {
     if (!sc) return;
+#ifdef FTRACE_D3D11_INTEROP
+    // Unregister before anything else: the D3D texture may outlive the scene, and CUDA
+    // holds a reference on it until this returns.
+    if (sc->gfxRes) cudaGraphicsUnregisterResource(sc->gfxRes);
+#endif
     if (sc->dtris)    cudaFree(sc->dtris);
     if (sc->dgeos)    cudaFree(sc->dgeos);
     if (sc->dattrs)   cudaFree(sc->dattrs);
@@ -1082,14 +1269,39 @@ static inline void paddEv(double& acc, cudaEvent_t a, cudaEvent_t b) {
     if (cudaEventElapsedTime(&ms, a, b) == cudaSuccess) acc += ms;
 }
 
-std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
-                                 double exposure, bool autoExpose, double* lockAnchor,
-                                 bool seeThrough, double glassClarity) {
-    std::vector<uint8_t> empty;
-    (void)nThreads;   // whole frame (incl. expose/tonemap) runs on the device now
-    if (!sc || sc->nTris == 0 || W <= 0 || H <= 0) return empty;
+// The see-through composite's milk (haze) tint — raster::renderFrame's constant. File
+// scope because renderCore stops before the tonemap and both tonemap callers need it.
+static const Vec3 kMilkColor{0.52, 0.55, 0.60};
+
+// Resolve the per-pass event pairs into the profiling tally. Call only after something
+// has fenced the frame (the image download, or the interop unmap's stream sync).
+static void profResolve(Scene* sc) {
+    if (!g_prof) return;
+    if (cudaEventSynchronize(sc->ev[7]) == cudaSuccess) {
+        paddEv(g_profAcc.clearvis_ms, sc->ev[0], sc->ev[1]);
+        paddEv(g_profAcc.project_ms,  sc->ev[1], sc->ev[2]);
+        paddEv(g_profAcc.raster_ms,   sc->ev[2], sc->ev[3]);
+        paddEv(g_profAcc.shade_ms,    sc->ev[3], sc->ev[4]);
+        paddEv(g_profAcc.clear_ms,    sc->ev[4], sc->ev[5]);
+        paddEv(g_profAcc.expose_ms,   sc->ev[5], sc->ev[6]);
+        paddEv(g_profAcc.download_ms, sc->ev[6], sc->ev[7]);
+    }
+    ++g_profAcc.frames;
+}
+
+// Everything a frame needs EXCEPT the final tonemap store: geometry projection, raster,
+// shading, the optional see-through pass, and the auto-exposure anchor. Split out so the
+// two ways of delivering the pixels — download an RGB8 buffer (renderFrame) or write the
+// live window's D3D texture in place (renderFrameToTarget) — share one implementation and
+// differ only in their last kernel. `finalExp` receives the exposure the tonemap applies.
+// Returns false on any device failure (the caller then falls back to the CPU rasterizer).
+static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
+                       double exposure, bool autoExpose, double* lockAnchor,
+                       bool seeThrough, double glassClarity,
+                       double& finalExp, int& gPix, int& TPBout) {
+    if (!sc || sc->nTris == 0 || W <= 0 || H <= 0) return false;
     const size_t N = (size_t)W * H;
-    if (!ensurePix(sc, N)) return empty;
+    if (!ensurePix(sc, N)) return false;
 
     DCam dc;
     dc.eye = toF3(cam.eye); dc.u = toF3(cam.u); dc.v = toF3(cam.v); dc.w = toF3(cam.w);
@@ -1103,19 +1315,19 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     // See-through (clear-glass) preview parameters — identical to raster::renderFrame's.
     const double kMilkPerSurface = std::max(0.0, (1.0 - glassClarity)) * 0.55;
     const double kRimStrength    = 0.55;
-    const Vec3   kMilkColor{0.52, 0.55, 0.60};
 
     // Per-pass stream marks (no-ops unless profiling; resolved after the download).
     auto rec = [&](int i) { if (g_prof) cudaEventRecord(sc->ev[i], 0); };
 
     rec(0);
-    if (cudaMemset(sc->vis, 0, sizeof(unsigned long long) * N) != cudaSuccess) return empty;
+    if (cudaMemset(sc->vis, 0, sizeof(unsigned long long) * N) != cudaSuccess) return false;
     rec(1);
 
-    int TPB = 256;
+    const int TPB = 256;
     int gTris  = (sc->nTris + TPB - 1) / TPB;
     int gSlots = (2 * sc->nTris + TPB - 1) / TPB;
-    int gPix   = (int)((N + TPB - 1) / TPB);
+    gPix   = (int)((N + TPB - 1) / TPB);
+    TPBout = TPB;
 
     kProject<<<gTris, TPB>>>(sc->dtris, sc->nTris, dc, W, H, sc->dgeos, sc->dattrs, sc->dflags);
     rec(2);
@@ -1123,7 +1335,7 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
     // (thread / warp / block per sub-triangle). Every (slot,row) runs the exact row maths
     // of the old single kernel and atomicMax merges order-independently, so the result is
     // bit-identical while a screen-filling quad no longer serializes on one thread.
-    if (cudaMemset(sc->dbinCnt, 0, 5 * sizeof(int)) != cudaSuccess) return empty;   // counts + tickets
+    if (cudaMemset(sc->dbinCnt, 0, 5 * sizeof(int)) != cudaSuccess) return false;   // counts + tickets
     kClassify<<<gSlots, TPB>>>(sc->dgeos, sc->dflags, 2 * sc->nTris, W, H, seeThrough ? 1 : 0,
                                sc->dbinSmall, sc->dbinMed, sc->dbinLarge, sc->dbinCnt);
     // The raster kernels read their bin count from dbinCnt, so nothing here waits on
@@ -1172,13 +1384,13 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
             unsigned int cut[2] = {0, 0};           // winning top-16 / low-16 bin
             size_t total = 0, rank = 0;
             for (int round = 0; round < 2; ++round) {
-                if (cudaMemset(sc->dhist, 0, 65536 * sizeof(unsigned int)) != cudaSuccess) return empty;
+                if (cudaMemset(sc->dhist, 0, 65536 * sizeof(unsigned int)) != cudaSuccess) return false;
                 if (round == 0)
                     kLumHist1<<<gPix, TPB>>>(sc->accum, sc->zbuf, sc->emis, N, sc->dhist);
                 else
                     kLumHist2<<<gPix, TPB>>>(sc->accum, sc->zbuf, sc->emis, N, cut[0], sc->dhist);
                 if (cudaMemcpy(sc->h_hist, sc->dhist, 65536 * sizeof(unsigned int),
-                               cudaMemcpyDeviceToHost) != cudaSuccess) return empty;   // syncs
+                               cudaMemcpyDeviceToHost) != cudaSuccess) return false;   // syncs
                 if (round == 0) {
                     for (int b = 0; b < 65536; ++b) total += sc->h_hist[b];
                     if (total == 0) break;          // no lit surfaces: eAuto stays 1
@@ -1201,32 +1413,119 @@ std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int
             if (lockAnchor) *lockAnchor = eAuto;     // first frame sets the anchor
         }
     }
-    const double finalExp = eAuto * expComp;
+    finalExp = eAuto * expComp;
+    return true;
+}
+
+std::vector<uint8_t> renderFrame(Scene* sc, const Camera& cam, int W, int H, int nThreads,
+                                 double exposure, bool autoExpose, double* lockAnchor,
+                                 bool seeThrough, double glassClarity) {
+    std::vector<uint8_t> empty;
+    (void)nThreads;   // whole frame (incl. expose/tonemap) runs on the device now
+    double finalExp = 1.0;
+    int gPix = 0, TPB = 0;
+    if (!renderCore(sc, cam, W, H, exposure, autoExpose, lockAnchor, seeThrough,
+                    glassClarity, finalExp, gPix, TPB)) return empty;
+    const size_t N = (size_t)W * H;
+
     kToneMap<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, finalExp, seeThrough ? 1 : 0,
                             sc->clearT, sc->milkT, kMilkColor.x, kMilkColor.y, kMilkColor.z,
                             sc->dlut, sc->dimg);
-    rec(6);
+    if (g_prof) cudaEventRecord(sc->ev[6], 0);
 
     // Download ONLY the finished RGB8 frame through the pinned staging buffer. This
     // blocking copy fences every pass enqueued above; a poisoned context surfaces in
     // its return code (or the earlier readbacks'), and the sticky-error sweep below
     // catches kernel-launch failures that never poisoned a blocking call.
     if (cudaMemcpy(sc->h_img, sc->dimg, N * 3, cudaMemcpyDeviceToHost) != cudaSuccess) return empty;
-    rec(7);
+    if (g_prof) cudaEventRecord(sc->ev[7], 0);
     if (cudaGetLastError() != cudaSuccess) return empty;
-    if (g_prof) {
-        if (cudaEventSynchronize(sc->ev[7]) == cudaSuccess) {
-            paddEv(g_profAcc.clearvis_ms, sc->ev[0], sc->ev[1]);
-            paddEv(g_profAcc.project_ms,  sc->ev[1], sc->ev[2]);
-            paddEv(g_profAcc.raster_ms,   sc->ev[2], sc->ev[3]);
-            paddEv(g_profAcc.shade_ms,    sc->ev[3], sc->ev[4]);
-            paddEv(g_profAcc.clear_ms,    sc->ev[4], sc->ev[5]);
-            paddEv(g_profAcc.expose_ms,   sc->ev[5], sc->ev[6]);
-            paddEv(g_profAcc.download_ms, sc->ev[6], sc->ev[7]);
-        }
-        ++g_profAcc.frames;
-    }
+    profResolve(sc);
     return std::vector<uint8_t>(sc->h_img, sc->h_img + N * 3);
 }
+
+// ---------------------------------------------------------------------------
+// Zero-copy present: render straight into the live window's D3D11 texture.
+
+#ifdef FTRACE_D3D11_INTEROP
+
+bool bindPresentTarget(Scene* sc, void* d3d11Device, void* d3d11Texture, int W, int H) {
+    if (!sc || !d3d11Texture || W <= 0 || H <= 0) return false;
+    (void)d3d11Device;   // the texture carries its device; kept in the API for clarity
+    // Already registered to this exact texture at this size? Nothing to do — registration
+    // is far too expensive to redo per frame. (The comparison is safe even though the old
+    // texture may have been released: CUDA holds a reference on a registered resource, so a
+    // NEW texture can never land on a still-registered one's address.)
+    if (sc->gfxRes && sc->gfxTex == d3d11Texture && sc->gfxW == W && sc->gfxH == H) return true;
+    if (sc->gfxOff) return false;   // known-unavailable: don't pay for a doomed register per frame
+    if (sc->gfxRes) {
+        cudaGraphicsUnregisterResource(sc->gfxRes);
+        sc->gfxRes = nullptr; sc->gfxTex = nullptr; sc->gfxW = sc->gfxH = 0;
+    }
+    // A failure here is the normal, expected outcome when D3D picked a DIFFERENT adapter
+    // than the CUDA device (hybrid iGPU/dGPU laptops): the texture lives on a GPU this
+    // context cannot touch. The caller then keeps using the download path.
+    cudaError_t e = cudaGraphicsD3D11RegisterResource(
+        &sc->gfxRes, (ID3D11Resource*)d3d11Texture, cudaGraphicsRegisterFlagsSurfaceLoadStore);
+    if (e != cudaSuccess) {
+        sc->gfxRes = nullptr;
+        sc->gfxOff = true;           // the cause (wrong adapter) doesn't heal; stop trying
+        cudaGetLastError();          // clear the sticky error so later frames aren't poisoned
+        return false;
+    }
+    sc->gfxTex = d3d11Texture; sc->gfxW = W; sc->gfxH = H;
+    return true;
+}
+
+bool renderFrameToTarget(Scene* sc, const Camera& cam, int W, int H, int nThreads,
+                         double exposure, bool autoExpose, double* lockAnchor,
+                         bool seeThrough, double glassClarity) {
+    (void)nThreads;
+    if (!sc || !sc->gfxRes || sc->gfxW != W || sc->gfxH != H) return false;
+    double finalExp = 1.0;
+    int gPix = 0, TPB = 0;
+    if (!renderCore(sc, cam, W, H, exposure, autoExpose, lockAnchor, seeThrough,
+                    glassClarity, finalExp, gPix, TPB)) return false;
+    const size_t N = (size_t)W * H;
+
+    // Map the D3D texture into CUDA's address space, grab its array, and write the
+    // tonemapped bytes into it directly. D3D is blocked from the texture between map and
+    // unmap — which is why the caller must hold the presenter's device lock across this.
+    if (cudaGraphicsMapResources(1, &sc->gfxRes, 0) != cudaSuccess) { cudaGetLastError(); return false; }
+    cudaArray_t arr = nullptr;
+    bool okFrame = false;
+    if (cudaGraphicsSubResourceGetMappedArray(&arr, sc->gfxRes, 0, 0) == cudaSuccess && arr) {
+        cudaResourceDesc rd{};
+        rd.resType = cudaResourceTypeArray;
+        rd.res.array.array = arr;
+        cudaSurfaceObject_t surf = 0;
+        if (cudaCreateSurfaceObject(&surf, &rd) == cudaSuccess) {
+            kToneMapSurf<<<gPix, TPB>>>(sc->accum, sc->zbuf, N, W, finalExp, seeThrough ? 1 : 0,
+                                        sc->clearT, sc->milkT,
+                                        kMilkColor.x, kMilkColor.y, kMilkColor.z,
+                                        sc->dlut, surf);
+            if (g_prof) cudaEventRecord(sc->ev[6], 0);
+            cudaDestroySurfaceObject(surf);
+            okFrame = true;
+        }
+    }
+    if (cudaGraphicsUnmapResources(1, &sc->gfxRes, 0) != cudaSuccess) okFrame = false;
+    if (g_prof) cudaEventRecord(sc->ev[7], 0);   // "download" window: ~0, nothing crosses the bus
+    // The blocking download used to be the frame's fence AND its error check; with the
+    // image never leaving the device, this sync takes over both jobs. It also guarantees
+    // the tonemap has actually landed in the texture before D3D presents it.
+    if (cudaStreamSynchronize(0) != cudaSuccess) okFrame = false;
+    if (cudaGetLastError() != cudaSuccess) okFrame = false;
+    profResolve(sc);
+    return okFrame;
+}
+
+#else   // no interop on this platform/toolchain: always fail so callers use the download path
+
+bool bindPresentTarget(Scene*, void*, void*, int, int) { return false; }
+bool renderFrameToTarget(Scene*, const Camera&, int, int, int, double, bool, double*,
+                         bool, double) { return false; }
+
+#endif
 
 }  // namespace raster_cuda

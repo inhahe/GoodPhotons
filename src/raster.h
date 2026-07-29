@@ -414,6 +414,71 @@ struct GBuffer {
     std::vector<float>   tpScale; // winning triangle's triplanar scale (0 = UV)
 };
 
+// --- Watertight coverage: canonical edge functions -------------------------------------
+//
+// A pixel is inside a triangle when all three edge functions agree in sign. The naive
+// version (incremental normalized barycentrics seeded per row from the bbox's left
+// column) is NOT watertight: two triangles sharing an edge seed from different `xlo`,
+// scale by different 1/area, and derive the third weight as 1-w0-w1, so they compute
+// *different* floating-point values for the same shared edge. When a pixel centre lands
+// exactly on that edge both can come out a hair negative and BOTH reject — a crack.
+// This is not hypothetical: at 800x600 the cornell box's quad diagonals are exactly 45
+// degrees, so the edge line passes dead-on through ~220 consecutive pixel centres and
+// leaves a visible one-pixel seam of background (measured: 127 holes at 800x600, 0 at
+// 801x600 — a pure exact-tie artefact).
+//
+// The fix is to make both sharers evaluate the SAME expression on the SAME operands, so
+// their results are bitwise identical and the sign is guaranteed opposite:
+//
+//   * the edge's two endpoints are put in a canonical (lexicographic by screen x, then y)
+//     order before the coefficients are formed, so both triangles build identical P and
+//     Q-P no matter which way round they traverse the edge;
+//   * `flip` records whether this triangle traverses the edge in canonical order, and
+//     recovers its own signed edge function as flip * E;
+//   * E is evaluated as the plain cross product about the canonical endpoint P —
+//     `E = dx*(py-Py) - dy*(px-Px)` — never incrementally, so the value at a pixel does
+//     not depend on where the scanline span started.
+//
+// Combined with the triangle's area sign as sf = sign(area) * flip, the two sharers of an
+// edge always have OPPOSITE sf (consistent winding flips `flip`; inconsistent winding
+// flips `sign(area)` instead), so exactly one of them sees a positive value. The remaining
+// exact-zero case is broken deterministically by taking the pixel only when sf > 0, which
+// is likewise true for exactly one of the pair. No epsilon, no fixed-point, no top-left
+// rule, and it tolerates meshes whose winding disagrees with their vertex normals.
+//
+// Anchoring at P rather than at the origin matters for CONDITIONING, which is what decides
+// how tight the fit is around a shared vertex. The expanded affine form needs the constant
+// Px*Qy - Py*Qx, whose magnitude is ~W*H even for a short edge, so its rounding displaces
+// the edge line by ~ulp(W*H)/|Q-P|; anchored at P every operand is a local offset instead,
+// which on the CUDA side (float) shrinks that displacement by orders of magnitude. Two
+// sharers always agree exactly either way, so a shared EDGE is watertight regardless — but
+// the three edges meeting at a shared VERTEX are perturbed independently, and a wide
+// perturbation can leave a sliver there that no triangle claims.
+//
+// sf (+-1) is folded straight into the stored dx/dy so the inner loop needs no extra
+// multiply. That is still exactly antisymmetric between the two sharers: IEEE negation is
+// exact and round-to-nearest is symmetric under negation, so negating every operand
+// negates the result bit for bit (true for a contracted FMA as well). v then doubles as
+// the unnormalized barycentric weight of the vertex opposite the edge, and w = v / |area|.
+struct EdgeFn {
+    double Px, Py;      // canonical first endpoint = the evaluation origin
+    double dx, dy;      // sf * (Q - P)
+    bool   tie;         // this triangle takes the pixel when v is exactly 0
+};
+inline EdgeFn makeEdge(double Px, double Py, double Qx, double Qy, double s) {
+    double flip = 1.0;
+    if (Qx < Px || (Qx == Px && Qy < Py)) {                 // canonicalize the endpoint order
+        std::swap(Px, Qx); std::swap(Py, Qy); flip = -1.0;
+    }
+    const double sf = s * flip;
+    EdgeFn e;
+    e.Px  = Px;  e.Py = Py;
+    e.dx  = sf * (Qx - Px);
+    e.dy  = sf * (Qy - Py);
+    e.tie = sf > 0.0;
+    return e;
+}
+
 // Rasterize one screen-space triangle into the deferred G-buffer over rows [y0,y1).
 // Only geometry/albedo is stored here — shading is deferred to a single later pass so
 // each covered pixel is shaded exactly once regardless of overdraw. Attributes are
@@ -429,22 +494,30 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
     if (xlo > xhi || ylo > yhi) return;
     double area = (B.sx - A.sx) * (C.sy - A.sy) - (B.sy - A.sy) * (C.sx - A.sx);
     if (std::fabs(area) < 1e-9) return;
-    double inv = 1.0 / area;
-    // Incremental barycentric edge functions: w0,w1 are affine in x, so step them along
-    // each row with a single add instead of recomputing the full cross products per
-    // sample. Rows recompute w0/w1 exactly from px=xlo+0.5, so only the x-derivative is
-    // needed: d w0/d px = (B.sy - C.sy)*inv, d w1/d px = (C.sy - A.sy)*inv.
-    const double dw0dx = (B.sy - C.sy) * inv;
-    const double dw1dx = (C.sy - A.sy) * inv;
+    // Watertight coverage (see EdgeFn above): edge i is the one OPPOSITE vertex i, so its
+    // value is the unnormalized barycentric weight of that vertex. sf folds in the winding
+    // sign so an accepted pixel always has v >= 0, and w = v / |area|.
+    const double invA = 1.0 / std::fabs(area);
+    const double s = (area > 0.0) ? 1.0 : -1.0;
+    const EdgeFn E0 = makeEdge(B.sx, B.sy, C.sx, C.sy, s);
+    const EdgeFn E1 = makeEdge(C.sx, C.sy, A.sx, A.sy, s);
+    const EdgeFn E2 = makeEdge(A.sx, A.sy, B.sx, B.sy, s);
     const uint8_t triEmis = t.emissive ? 1 : 0;
     for (int y = ylo; y <= yhi; ++y) {
-        double py = y + 0.5, pxL = xlo + 0.5;
-        double w0 = ((B.sx - pxL) * (C.sy - py) - (B.sy - py) * (C.sx - pxL)) * inv;
-        double w1 = ((C.sx - pxL) * (A.sy - py) - (C.sy - py) * (A.sx - pxL)) * inv;
+        const double py = y + 0.5;
+        const double r0 = E0.dx * (py - E0.Py);   // row constants: identical for both sharers
+        const double r1 = E1.dx * (py - E1.Py);
+        const double r2 = E2.dx * (py - E2.Py);
         size_t row = (size_t)y * W + xlo;
-        for (int x = xlo; x <= xhi; ++x, ++row, w0 += dw0dx, w1 += dw1dx) {
-            double w2 = 1.0 - w0 - w1;
-            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+        for (int x = xlo; x <= xhi; ++x, ++row) {
+            const double px = x + 0.5;
+            const double v0 = r0 - E0.dy * (px - E0.Px);
+            if (v0 < 0.0 || (v0 == 0.0 && !E0.tie)) continue;
+            const double v1 = r1 - E1.dy * (px - E1.Px);
+            if (v1 < 0.0 || (v1 == 0.0 && !E1.tie)) continue;
+            const double v2 = r2 - E2.dy * (px - E2.Px);
+            if (v2 < 0.0 || (v2 == 0.0 && !E2.tie)) continue;
+            const double w0 = v0 * invA, w1 = v1 * invA, w2 = v2 * invA;
             double invd = w0 * A.invd + w1 * B.invd + w2 * C.invd;   // = 1/depth
             if (invd <= g.zbuf[row]) continue;   // farther than (or equal to) stored
             g.zbuf[row] = (float)invd;
@@ -482,18 +555,30 @@ inline void fillTriangleClear(const STri& t, const Camera& cam, int W, int H, in
     if (xlo > xhi || ylo > yhi) return;
     double area = (B.sx - A.sx) * (C.sy - A.sy) - (B.sy - A.sy) * (C.sx - A.sx);
     if (std::fabs(area) < 1e-9) return;
-    double inv = 1.0 / area;
-    const double dw0dx = (B.sy - C.sy) * inv;
-    const double dw1dx = (C.sy - A.sy) * inv;
+    // Same watertight coverage as fillTriangleG. It matters even more here: the clear pass
+    // MULTIPLIES into clearT/milkT, so a shared edge covered by both sharers would darken a
+    // seam line twice, and one covered by neither would leave a hairline of un-tinted glass.
+    const double invA = 1.0 / std::fabs(area);
+    const double s = (area > 0.0) ? 1.0 : -1.0;
+    const EdgeFn E0 = makeEdge(B.sx, B.sy, C.sx, C.sy, s);
+    const EdgeFn E1 = makeEdge(C.sx, C.sy, A.sx, A.sy, s);
+    const EdgeFn E2 = makeEdge(A.sx, A.sy, B.sx, B.sy, s);
     const float tau = (float)clarity;
     for (int y = ylo; y <= yhi; ++y) {
-        double py = y + 0.5, pxL = xlo + 0.5;
-        double w0 = ((B.sx - pxL) * (C.sy - py) - (B.sy - py) * (C.sx - pxL)) * inv;
-        double w1 = ((C.sx - pxL) * (A.sy - py) - (C.sy - py) * (A.sx - pxL)) * inv;
+        const double py = y + 0.5;
+        const double r0 = E0.dx * (py - E0.Py);
+        const double r1 = E1.dx * (py - E1.Py);
+        const double r2 = E2.dx * (py - E2.Py);
         size_t row = (size_t)y * W + xlo;
-        for (int x = xlo; x <= xhi; ++x, ++row, w0 += dw0dx, w1 += dw1dx) {
-            double w2 = 1.0 - w0 - w1;
-            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+        for (int x = xlo; x <= xhi; ++x, ++row) {
+            const double px = x + 0.5;
+            const double v0 = r0 - E0.dy * (px - E0.Px);
+            if (v0 < 0.0 || (v0 == 0.0 && !E0.tie)) continue;
+            const double v1 = r1 - E1.dy * (px - E1.Px);
+            if (v1 < 0.0 || (v1 == 0.0 && !E1.tie)) continue;
+            const double v2 = r2 - E2.dy * (px - E2.Px);
+            if (v2 < 0.0 || (v2 == 0.0 && !E2.tie)) continue;
+            const double w0 = v0 * invA, w1 = v1 * invA, w2 = v2 * invA;
             double invd = w0 * A.invd + w1 * B.invd + w2 * C.invd;   // = 1/depth
             if (invd <= g.zbuf[row]) continue;   // behind (or at) the opaque surface: occluded
             // Grazing term from the interpolated normal for a silhouette milk rim.
@@ -784,8 +869,22 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
         };
         for (size_t ti = a; ti < b; ++ti) {
             const PTri& t = tris[ti];
-            VtxCS cs[3] = { toCS(t.p0, t.n0, t.uv0), toCS(t.p1, t.n1, t.uv1),
-                            toCS(t.p2, t.n2, t.uv2) };
+            // Two-sided shading, decided ONCE for the whole triangle. A surface whose
+            // normals point away from the eye (the cornell box's walls are wound outward
+            // and viewed from inside) must be lit as if they faced us; but the test has to
+            // be per-TRIANGLE, not per-pixel. Done per pixel on the interpolated normal it
+            // inverts a 1-px band at every silhouette, because there dot(N,V) grazes
+            // through zero while the surface is still genuinely front-facing.
+            // A triangle counts as back-facing only when ALL THREE vertices agree: a
+            // silhouette triangle straddles the horizon (some vertices front, some back)
+            // and must keep its smooth normals, while geometry truly seen from behind has
+            // every vertex facing away and still flips exactly as it did before.
+            const bool back = dot(t.n0, cam.eye - t.p0) < 0.0 &&
+                              dot(t.n1, cam.eye - t.p1) < 0.0 &&
+                              dot(t.n2, cam.eye - t.p2) < 0.0;
+            VtxCS cs[3] = { toCS(t.p0, back ? -t.n0 : t.n0, t.uv0),
+                            toCS(t.p1, back ? -t.n1 : t.n1, t.uv1),
+                            toCS(t.p2, back ? -t.n2 : t.n2, t.uv2) };
             if (rect) {
                 VtxCS poly[8]; int np = 0;
                 auto emit = [&](const VtxCS& a2){ if (np < 8) poly[np++] = a2; };
@@ -918,9 +1017,12 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                     ? tx.sampleRgbTriplanar(g.wpos[i], g.wn[i], (double)g.tpScale[i])
                     : tx.sampleRgb(g.uv[i].x, g.uv[i].y);
             }
+            // No two-sided flip here: it is decided ONCE PER TRIANGLE at projection time
+            // (see projectRange). Testing the smoothly-interpolated normal per pixel used
+            // to invert it in a 1-px band at every silhouette, where dot(N,V) legitimately
+            // grazes through zero — that produced dark speckles on the sphere's rim.
             Vec3 N3 = normalize(g.wn[i]);
             Vec3 V = normalize(cam.eye - g.wpos[i]);     // toward camera
-            if (dot(N3, V) < 0.0) N3 = -N3;              // two-sided
             double lit = 0.0;
             for (const auto& lp : light.lights) {
                 Vec3 d = lp.pos - g.wpos[i];

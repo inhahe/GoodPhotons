@@ -193,7 +193,24 @@ def test_bare_name_is_only_a_value_when_called():
 
 
 def test_keyword_rebind_targets_a_named_axis():
-    assert parse_value("[0 1](a=u)") == Call(Vec([0.0, 1.0]), [Arg("a", "u")])
+    # `formal=driver` binds a name belonging to the CALLEE, so the target has to be
+    # something that HAS callee-side names: a material, a material property, or a
+    # named array.  (An inline literal has no such namespace — see the test below.)
+    assert parse_value("ramp(a=u)") == Call("ramp", [Arg("a", "u")])
+
+
+def test_keyword_rebind_is_refused_on_an_inline_literal():
+    # An inline literal's axes are anonymous and bind by position, and the names in
+    # its own tuple are DRIVERS, not formals — so there is nothing for `a=` to bind.
+    # ftrace refuses the identical spelling in `Builder::desugarOne` (src/ftsl.h);
+    # a form loom accepted and ftrace rejected would be a scene that emits and then
+    # fails to load, which is the exact drift the twin discipline exists to stop.
+    with pytest.raises(ShapeError) as ei:
+        parse_value("[0 1](a=u)")
+    msg = str(ei.value)
+    assert "no formal to bind" in msg
+    assert "[...](u)" in msg          # ...spend the axis here
+    assert "mat(a=u)" in msg          # ...or leave it free and bind it at the use site
 
 
 def test_coordinate_may_be_a_constant_or_a_nested_call():
@@ -211,13 +228,13 @@ def test_call_composes_inside_a_bigger_value():
 
 def test_positionals_must_precede_keywords():
     with pytest.raises(ShapeError) as ei:
-        parse_value("[0 1](a=u, 3)")
-    assert "positional" in str(ei.value)
+        parse_value("ramp(a=u, 3)")
+    assert "must come before keyword" in str(ei.value)
 
 
 def test_an_axis_cannot_be_bound_twice():
     with pytest.raises(ShapeError) as ei:
-        parse_value("[0 1](a=u, a=v)")
+        parse_value("ramp(a=u, a=v)")
     assert "twice" in str(ei.value)
 
 

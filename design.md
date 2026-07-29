@@ -301,6 +301,36 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   vertex by `bary_k / T_k` (`T_k = X+Y+Z` of its spectrum) rather than by `bary_k`
   alone, because a chromaticity is an `(X+Y+Z)`-weighted mean — that is what makes the
   interpolated chromaticity *exact* rather than merely close.
+- **User-supplied upsamplers (`upsample "n" { expr … }`, head `rgb:<n>`).** The sixth
+  member of the family, and the only open-ended one: the scene supplies the function.
+  Deliberately *not* in `upsample.h` — the five above are numerical fits, this is a
+  compiled pattern-VM program, so it lives at the loader (`ftsl.h`: `upsampleBlocks_`,
+  `applyUpsample`) with `pattern.h` supplying two new pieces. Three decisions carry it:
+  (a) **the body's vocabulary is disjoint from the surface one, not additive**
+  (`PatVarMode::Upsample`). `r` already means *radius* in a surface program and must
+  mean *red* here, so an additive design would make one spelling silently mean two
+  things. Instead every surface name is rejected by name with a message saying so, and
+  `r`/`g`/`b`/`w` internally reuse the `VarX`/`VarY`/`VarZ`/`VarU` slots as a pure
+  register assignment — invisible, because the surface spellings are unreachable in
+  this mode. (b) **`spec:<name>(w)` (`PatOp::Spec`)** samples a declared `spectrum` at
+  the queried wavelength, which is what makes a *measured basis* expressible
+  (`r*spec:red(w) + …`) rather than only closed-form arithmetic; it resolves its index
+  at compile time through a `PatSpecScope`, exactly like `tex:`/`grid:`, and is a
+  compile error outside an upsample body (an ordinary pattern has a hit point but no
+  wavelength — and symmetrically `tex:`/`grid:` are errors *inside* one). `PatOp::Spec`
+  never reaches the device: an upsample program is consumed at load time and is never
+  stored on a `Material` or in `Scene::patterns`. (c) **the result is a live closure,
+  not a baked table** — a user upsampler may be a narrow emission line, and
+  pre-tabulating here would band-limit it; the renderer already tabulates where it
+  needs to (`double reflect[SPEC_N]`), at a resolution it chooses. The closure captures
+  the compiled program and the spectrum vector by `shared_ptr` (and the sampler thunk's
+  `self` is the *vector*, not the Builder), so the produced `Spectrum` outlives the
+  loader; the vector is append-only so an index handed out at compile time survives
+  later growth. `isColourHead` gained one shape-only arm (`isCustomColourHead`) so the
+  head is accepted at both sites that share that list — value site and record-channel
+  inline-colour tag. Pinned by `-checkupsample` section (h); `scenes/_upsample.ftsl`
+  is the visual companion; loom's twins are `NamedSpectrum`/`Upsample` (`scene.py`),
+  `UserSpec` (`grammar/spectrum.py`) and `is_colour_space` (`record.py`).
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.
@@ -453,6 +483,97 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   That split is what kept the two front ends from drifting on the one syntax that is
   genuinely ambiguous (record stop selector vs. array literal) while both existed, and it
   is why the flip needed no loader changes.
+
+  **What the sample call's arguments *are*.** `desugarOne` splits the call into top-level
+  comma-separated arguments (`splitCallArgs`, the same "a top-level `=` is unambiguous
+  because the pattern language has no comparison operators" rule `parseBindArgs` uses) and
+  pins one semantics: **an argument is a driver — a coordinate expression — and a literal's
+  axes are anonymous and bind by position.** So `[0 1](a)` is not a special "formal"
+  construct at all; it is an ordinary coordinate that happens to name `a`, the one input
+  with no per-hit intrinsic, which is what makes it survive to the use site where the §7.6
+  material-bundle substitution can rebind it (`ramp(a=u)`, `ramp.reflect(a=u)`, positional
+  `ramp.reflect(u)`). A literal's "formals" are therefore just the driver names in its own
+  tuple, which is exactly what a rebind substitutes, and why a 2-D literal transposes under
+  the simultaneous `(u=v, v=u)`. The corollary is a refusal: `formal=driver` **inside** a
+  literal's own call has no formal to bind and is a load error naming both working
+  spellings, because honouring it would require inventing a per-material default for `a`
+  that two literals in one material could contradict. loom's `values.py` refuses the
+  identical spelling (`_check_args(..., literal_target=True)`) so a scene cannot emit from
+  loom and then fail to load. `-checkarray` pins the identities against independently
+  authored twins (with explicit non-vacuity checks — an unbound grid pool makes every
+  sample 0.0, which would make every identity pass for the wrong reason);
+  `scenes/_array_formal.ftsl` shows them per tile, and `tools/measure_array_formal.py`
+  reduces that render to per-tile mean/gradient numbers recorded in the scene's own header.
+  The render is only the qualitative confirmation — it agrees to within its noise and the
+  room's lighting profile, and the twelve tiles do not sit in a uniform field, so the
+  measurement corrects each tile's horizontal gradient using the four tiles whose albedo is
+  constant in `u` (one per column). `-checkarray` is what pins the identities exactly.
+
+  **Composed literals** (`[0 1]([0.2 0.8](u))`, 0.100.0) fall straight out of "an argument
+  is a coordinate expression": a coordinate may itself be a sampled value, so a literal is
+  legal wherever one is. The implementation is deliberately asymmetric with the value-site
+  case. `Builder::buildArrayGrid` emits the anonymous `grid` for both, but a composed
+  literal gets **no `pattern` wrapper** — `grid:__arrN(coords)` is already a legal
+  pattern-expression term, so the composition is spelled by textual substitution into the
+  outer call (`Builder::desugarNestedLiterals`, recursive, so nesting is unbounded) and the
+  outer expression ends up as `grid:__arr1(grid:__arr0(u))`. Only the value site needs a
+  name for a *statement* to reference, and only it pays for a second block.
+
+  The reason this needed a grammar change is worth recording, because it is the one place
+  the lexer's design leaks. A sample call is a single `PARENWORD` token, and that terminal's
+  interior class excluded `[` / `]` until 0.100.0 — so an inner literal's brackets split the
+  outer token and the outer literal reported the (very misleading) *unsaturated* error. The
+  fix widens the interior class only; the terminal's **balance guarantee rests entirely on
+  `(` and `)` staying excluded** (two paren groups on one line cannot merge, because merging
+  would have to consume the intervening `)` as an interior char), so admitting brackets
+  costs nothing there. Brackets inside a call are therefore *captured but not
+  balance-checked by the lexer*, which is the right trade: `desugarNestedLiterals` parses
+  the argument text itself (`Builder::parseArrayText`, reproducing the tokenizer's own
+  splitting rule) and reports an unbalanced or call-less inner literal against the author's
+  source, instead of surfacing as a token that mysteriously fails to match. It also refuses
+  a literal written flush against an identifier (`f[0 1](u)`) *before* substituting, since
+  the rewrite would otherwise glue the author's token to a generated name and complain about
+  an "unknown identifier `fgrid`" that appears nowhere in their file. The pattern language
+  has no bracket syntax of its own, which is what makes "a `[` here always opens a literal"
+  safe to assume. Note this touched `ftsl_scene.epeg` only — loom's reader uses the sibling
+  typed `ftsl.epeg` — so loom's 1255-test suite is the regression check that the shared
+  grammar tooling still round-trips.
+
+  **A table call is a value in its own right** (`reflect grid:ramp(u)`, 0.101.0). TODO.md's
+  increment-2 `Deferred:` clause claimed `NAME axistuple` "needs no work because ftrace's
+  expression evaluator already reads `name(args)` as a call" — true *inside* a pattern
+  expression, but a **value site is not an expression site**, and the slot readers only ever
+  recognised `pattern:<name>` there, so `reflect grid:ramp(u)` was an "unrecognized spectrum
+  expression". Closing it hooks the same four chokepoints v0.89.0 used for
+  `MATERIAL.slot(args)`: `bindScalarPattern` and `patternedSpectrumParam` (the two per-hit
+  readers) route a `grid:` / `scatter:` head through `Builder::tableCallPattern`, which
+  compiles the token with the ordinary `compilePatternExpr` and appends the result to
+  `scene.patterns` — the slot ends up holding exactly the index a hand-written one-line
+  `pattern { expr "grid:ramp(u)" }` would have produced, so there is no second evaluation
+  path to keep in step. `dblParam` and `evalSpectrum` are the load-time-constant readers and
+  **refuse**, each naming the slots that can take a per-hit value.
+
+  Two consequences are worth recording. First, **only the scoped spelling is accepted**: a
+  bare `ramp(u)` at a value site already means the §7.6 material-bundle application, so
+  accepting it for tables would make a scene's meaning depend on which namespace happens to
+  hold the name — `isTableCallHead` therefore tests for the `grid:` / `scatter:` prefix and
+  nothing else, and a call-less `grid:ramp` is a refusal that prints the `(u)` to add rather
+  than a silent constant. Second, a table call's coordinates are expressions like any other,
+  so a **composed array literal** must work inside one (`grid:ramp([0.2 0.8](u))`).
+  `Builder::desugarTableCall` reuses `desugarNestedLiterals` on the token before it is
+  compiled, and `desugarArrays`' visit loop dispatches to it on the cheap
+  `isTableCallHead && contains('[')` test so a scene with no literals pays nothing. That in
+  turn needed the *second* grammar change: a **named** table's call lexes as a `WORD`, not a
+  `PARENWORD`, so `WORD`'s balanced-group alternative had to be widened to
+  character-for-character `PARENWORD`'s body, brackets included. Only the group *interior*
+  admits them — `WORD`'s fallback class still excludes `[` / `]`, so a bracket outside parens
+  is a delimiter exactly as before and `REC.chan[2]` still stops the word at the `[`.
+
+  **Generated blocks are re-attributed.** `desugarArrays` mints `grid`/`pattern` blocks the
+  author never named, so `Builder::genSite_` maps `__arrN` back to the authoring site and
+  `genWho()` is used wherever those blocks can fail. A message about `pattern '__arr3'`
+  would name a symbol that appears nowhere in the scene file. A composed literal registers
+  its own site too, so a bad coordinate two levels down still names what the author wrote.
 
   The same bracket spelling is accepted for a **`grid`/`scatter` element's own `data`**, and
   there it is *not* sugar: `desugarArrays` deliberately skips those two block types, because
@@ -644,6 +765,21 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   wrappers. `directOnly` (terminate after the first non-specular NEE, specular chains
   still recurse) is scoped to the camera path tracers (R spectral + RGB, P's backward
   layer); forward B and the photon/BDPT modes honour only `maxBounce`.
+  Since 0.102.0 the **bidirectional** modes honour `maxBounce` too (they previously
+  hard-coded 8 and silently dropped the flag). Their default stays 8 — the BDPT connection
+  double-loop is O(depth²) and the per-thread vertex stack is thread-local memory — so for
+  D/U the flag *raises* the bound as often as it caps it. On the GPU that bound is a
+  template parameter, not a `#define`: `kBdptT<int NS, int MAXD>` sizes
+  `DVertex eye[MAXV]/light[MAXV]` from `MAXD`, `maxV` is threaded through
+  `dRandomWalk`/`dGenCameraSubpath`/`dGenLightSubpath`, and exactly two variants are
+  instantiated — `BDPT_MAXDEPTH` (8, bit-for-bit the old kernel, still the default launch)
+  and `BDPT_DEEPDEPTH` (64), the deep one launched only when `-max-bounce > 8`. GPU mode U
+  additionally bounds its light-vertex slab (`npix * vcmCap * sizeof(DVcmLV)`) by a 768 MB
+  budget and reports when `vcmCap < maxDepth`; that only drops merge candidates at the
+  deepest vertices, leaving the estimator unbiased. Why it matters: a specular cavity has a
+  photon mean free path of `1/(1-R)` bounces — ~33 for silver — so truncating at 8 does not
+  dim such a scene, it deletes it (`scenes/mirror_sphere_interior.ftsl` goes from 97% pure
+  black at depth 8 to 29% at depth 64).
   Since 0.29.0 the interactive `-explore` fly-viewer can toggle (key **`T`**) a live
   **path-traced preview** using the fast RGB backward tracer instead of the flat raster:
   a resident `BackwardRGBSession` (render_cuda.cu) bakes/uploads the scene ONCE
@@ -679,8 +815,116 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   loop (measured: +80% photons/s on 16 cams @ 640×360, +22% on 2 cams @ 320×240);
   `renderForwardSharedCuda` survives as a one-shot wrapper over the session.
   `raster_cuda.cu` = GPU raster (own section below).
-- **`livewindow.*`** — Win32 GDI live preview (`-window`/`-keepwindow`), interactive
+- **`livewindow.*`** — Win32 live preview (`-window`/`-keepwindow`), interactive
   fly viewer input, camera-path timeline panel.
+  The **image area is presented by D3D11**, the control strip below it by GDI.
+  `LivePresenter` owns a D3D11 device and a flip-model `IDXGISwapChain1` on a **child
+  HWND covering the image area** — a separate HWND because a flip-model swap chain and
+  overlapping GDI child controls cannot share one window; the parent therefore carries
+  `WS_CLIPCHILDREN`. The child answers `WM_NCHITTEST` with `HTTRANSPARENT`, so every
+  mouse message still lands on the parent's fly-camera handlers, at unchanged
+  coordinates (the child sits at the parent's client origin). `update()` uploads the
+  renderer's RGB8 bytes **as-is** — there is no RGB8 DXGI format, so they go up as an
+  `R8_UNORM` texture three times as wide and a pixel shader deswizzles them into an
+  RGBA8 image texture — and a second full-screen pass scales that into a letterboxed
+  viewport with a linear sampler. This replaced a per-pixel RGB→BGRA repack plus a
+  `SetStretchBltMode(HALFTONE)` + `StretchDIBits` blit that together cost **9.0 ms per
+  frame** against a **1.3 ms** present now (`-raster-bench` reports the tail), and that
+  sat on the render thread's critical path because `paint()` held the same mutex
+  `update()` needed. The GDI path is retained in full: `FTRACE_LIVE_GDI=1` forces it,
+  any D3D failure falls back to it permanently, and **`WM_PRINTCLIENT` always uses it**
+  because `PrintWindow` cannot see swap-chain content — that capture pulls the current
+  frame back off the GPU (`readbackBgra`) since the image no longer exists in host
+  memory. `LivePresenter` serialises its own device context with a mutex, because both
+  the render thread (upload + present) and the UI thread (re-present after a resize or
+  expose) drive it.
+  **`renderShared(w, h, fn)` is the zero-copy entry point** (0.98.0): instead of handing
+  the presenter finished host bytes, the caller is handed the presenter's own D3D11 device
+  and RGBA8 image texture (both as `void*`, so the header stays API-agnostic) and fills the
+  texture on the GPU; `renderShared` then presents it. It is a **callback rather than an
+  exposed lock/unlock pair** because the whole map/render/unmap must run under
+  `LivePresenter::mtx` — the CUDA↔D3D interop the callback performs drives D3D's immediate
+  context, which is not thread-safe and is shared with the UI thread's repaints — and a
+  callback makes that impossible to get wrong. It returns false **without calling `fn`**
+  whenever the fast path is unavailable (GDI fallback, stub build, lost device), and false
+  after a failed `fn`, so the caller always has a well-defined fallback to
+  `render → update()`. `ensureImg` may hand back a *different* texture after a resolution
+  change, which is exactly why the CUDA side re-registers on pointer identity.
+  With `-anim … -loom` the window grows a fourth
+  panel row, the **loom bind row** (channel combo → slot combo → Bind/Unbind, a `chans:`
+  count box, a status readout). Child HWNDs may only be created and moved on the window's
+  own message-pump thread, so the row is built by marshalling `WM_MKBINDROW` (`WM_APP+3`)
+  with `SendMessageW`; `hasBindRow` publishes its validity to the render thread, and — the
+  subtle part — it must be stored *before* the first `layoutPanel`, since `layoutPanel`
+  skips the row unless it is set. Programmatic control changes (`CB_SETCURSEL`,
+  `SetWindowTextW`) raise **no** notification, so any value the code sets is also cached
+  by hand; only genuine user action produces the `CBN_SELCHANGE` / `EN_CHANGE` the
+  `WM_COMMAND` handler turns into `NavInput` edges.
+- **`curvedrive.h`** — header-only reader/writer for loom's `CurveDrive` JSON sidecar
+  (`-anim <file.json>`), on `src/third_party/json.h`. It re-checks **the same invariants
+  `CurveDrive.__init__` does** (`dims >= 1`, ≥ 2 points, every point exactly `dims` wide,
+  every binding channel in range, valid `mode`/`kind`) on both load *and* save, so ftrace
+  can neither accept nor write a sidecar loom would reject. Saves atomically (temp file +
+  `std::filesystem::rename`) with shortest-round-tripping numbers, so editing one point
+  leaves every other coordinate byte-identical.
+- **`loomlink.h` / `animlive.h`** — the two live loom channels. `loomlink.h` is the shared
+  child-process transport (spawn `python -X utf8 -u -m loom.<module>`, newline-delimited
+  JSON over stdio, `PYTHONPATH` → `<exeDir>\tools\loom`, plus JSON escaping helpers);
+  `animlive.h` is the `-anim … -loom <scene.py>` session on top of it. **ftrace never
+  samples the drive** — it pushes the control *points* and asks by parameter `t`, so the
+  editor's preview and loom's final render are the same computation rather than two that
+  can drift. The bridge is deliberately **two queues**: `frame` messages are latest-wins on
+  a single slot (fast scrubbing must collapse, not backlog), while `points` / `bindings` /
+  `dims` ride a FIFO that never drops and is drained before every frame — a lost control
+  message would leave loom rendering against a curve the editor no longer has. Each ack
+  names an emitted `.ftsl` that replaces the scene **wholesale**, because everything
+  downstream (`plight`, `prims`, the GPU's baked triangles, the resident RGB-backward
+  session) is derived state and a partial swap would leave halves disagreeing. Name-keyed
+  incremental re-tessellation is a possible later optimization, to be *measured* first.
+- **`viewer_gui.*`** — the **native loom viewer** (`-viewer <sidecar.json>`), a Dear
+  ImGui / Direct3D 11 window that short-circuits the renderer in `main`. It reads loom's
+  scene-introspection sidecar (`loom.viewer.ViewerModel.save_sidecar`) into flat geometry
+  structs — `CurveGeom` / `FieldGeom` / `MeshGeom` / `DagGraph` — and draws N-D curve,
+  field, mesh and modulator-DAG panes. Two of its panes are *not* sidecar replays: the
+  **Render** pane sphere-traces the real isosurface field by parsing the sidecar's
+  companion `.ftsl` with ftrace's own `ftsl::load` and calling `renderIsoPreviewCuda`, and
+  the **Meshes** pane bakes procedural skins through ftrace's own pattern VM — so the
+  preview and the renderer share one implementation rather than two that can drift.
+  The Meshes pane is **z-buffered on the GPU** (`MeshGpu`): the sidecar's tessellation is
+  uploaded once into one interleaved vertex buffer + index buffer (per-mesh
+  `firstIndex/indexCount/baseVertex` ranges, so each mesh is still its own draw call with
+  its own skin and tint) and drawn into an offscreen render target that carries a
+  `D32_FLOAT` depth-stencil view, shown with `ImGui::Image`. This replaced a CPU
+  painter's-algorithm centroid sort that could not resolve interpenetrating surfaces —
+  which loom produces routinely (a swept tube threading an isosurface). Because the
+  buffers are keyed on `MeshView::geomGen` (bumped only where `adoptSidecar` installs a new
+  tessellation), an orbit / zoom / colour-mode change costs one 144-byte constant-buffer
+  write, not a re-projection of every vertex. The union bounds used to frame the view are
+  baked with the upload for the same reason. Shading stays the flat two-sided lambert
+  `0.30 + 0.70*|n.z|` of the CPU path, with the face normal taken per-pixel from
+  `cross(ddx(vp), ddy(vp))` — exact under this orthographic projection — and the wireframe
+  is a real second depth-tested `D3D11_FILL_WIREFRAME` pass. The **curve and field panes
+  still project on the CPU**; they draw lines rather than solid surfaces, so the occlusion
+  bug does not bite them, but they are the same port waiting to happen.
+  **Live re-derivation (§F4 item 2, `-loom <scene.py>`)** uses `LoomLink` (a child
+  `python -m loom.viewer` speaking newline-delimited JSON over stdio; `PYTHONPATH` is set
+  to `<exeDir>\tools\loom`, which is why only the repo-root `ftrace.exe` can find loom) and
+  `LoomBridge`, a **one worker thread + one-slot pending job** queue. Both were lifted out
+  of `viewer_gui.cpp` into `src/loomlink.h` when the fly editor grew its own loom session
+  (§E2 slice 3b) — two live loom channels, one transport, so a protocol or lifetime fix
+  lands in both. `post()` overwrites an
+  unstarted job, so a drag that moves a parameter every frame costs one bake of the final
+  value — latest-wins, and the UI never blocks. Each bake writes a fresh sidecar + `.ftsl`
+  into a per-process `%TEMP%\ftrace_viewer_<pid>` scratch dir; the bridge tracks the
+  outstanding files and deletes each as it is consumed (a superseded result's files are
+  dropped unread), then sweeps and removes the whole directory in `stop()`. Startup also
+  reclaims `ftrace_viewer_<pid>` dirs whose pid is no longer alive (`OpenProcess` failing
+  with `ERROR_INVALID_PARAMETER`), since a crashed or killed viewer can't clean up after
+  itself and only the next run ever can. Results are
+  adopted on whatever frame they land, preserving the user's orbit, zoom, active tab and
+  DAG layout. **Third-party note:** `src/third_party/imnodes/imnodes.cpp` carries
+  `[ftrace patch]` edits for imgui #7543 — see `known-issues.md`; re-vendoring imnodes must
+  re-apply them or the DAG pane crashes in `PrimReserve`.
 - **`record.h` / `record_ladder.h`** — **parametric records**: a named bank of per-channel
   look-up tables over a shared scalar domain `[lo,hi]`, sampled by one per-hit driver
   scalar so a single expression sweeps a whole material at once. `record.h` holds the
@@ -709,8 +953,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   every upsampler/emission variant — `isColourHead` is the one list) into
   `RecChannel::space`, then hands `{space, comps…}` to the *same* `evalSpectrum` a
   top-level `spectrum "x" = rgb …` declaration uses. Converging on that one evaluator is
-  what makes inline colour nearly free: the record path inherits all 18 colour heads, and
-  the Jakob–Hanika coefficient bake and the GPU upload never learn that records exist.
+  what makes inline colour nearly free: the record path inherits all 18 built-in colour
+  heads *and* the open-ended `rgb:<upsampler>` one, and the Jakob–Hanika coefficient bake
+  and the GPU upload never learn that records exist.
   `tools/loom/loom/ladder.py` + `record.py` are the declared Python twins; a stop-boundary
   disagreement between them would be a *silent wrong render* rather than a parse error, so
   `tools/check_record_twins.py` diffs ftrace's per-channel stop count (probed via an
@@ -775,6 +1020,44 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `R`, `D`): the live status line (`[live] … photons, ~N% noise`) and noise estimation for
   `-noise` budgets.
 
+## Watertight raster coverage (shared by both backends, 0.98.2)
+
+Both rasterizers decide pixel coverage with **canonical edge functions**, so a pixel lying
+exactly on a shared triangle edge is claimed by exactly one of the two sharers — no hairline
+crack, no double-cover. `makeEdge` (raster.h) / `makeEdgeD` (raster_cuda.cu) build the rule:
+
+- **Canonical endpoint order.** Each edge's two endpoints are sorted lexicographically by
+  `(sx, sy)`. Both sharers therefore construct the same `P` and the same `Q - P` bit for bit,
+  whichever way round their own vertex list runs.
+- **Sign folded into the deltas.** `sf = sign(area) * flip`, and the stored deltas are
+  `sf * (Q - P)`. The two sharers always receive opposite `sf` — consistent winding flips
+  `flip`, inconsistent winding flips `sign(area)` instead — so their edge values are exact
+  negatives. This is what lets the engine keep accepting **either** winding, which it must,
+  because a mesh's triangle order may disagree with its vertex normals. (A classic
+  fixed-point + top-left fill rule would have required enforcing one winding.)
+- **Tie rule.** An exact zero is accepted only when `sf > 0` (cached as `tie`), true for
+  exactly one sharer. Non-zero values are unambiguous by construction, so no epsilon and no
+  fixed-point grid are needed.
+- **Anchored at `P`.** `v = dx*(py - Py) - dy*(px - Px)`, with the row term hoisted out of
+  the x-loop. The expanded affine form's constant (`Px*Qy - Py*Qx`) is ~W·H even for a short
+  edge; in `float` its ulp alone displaces the edge line ~1e-3 px, which does not break
+  shared *edges* but perturbs the three edges meeting at a shared *vertex* independently and
+  leaves an unclaimed sliver there.
+- **No incremental stepping, no derived third weight.** All three weights are evaluated
+  directly. Stepping would seed each sharer from its own `xlo`, destroying bitwise identity;
+  `w2 = 1 - w0 - w1` rounds asymmetrically for the same reason.
+- **CUDA defeats FMA contraction** with `edgeRow`/`edgeAt` (`__fmul_rn`/`__fsub_rn`). nvcc's
+  default `-fmad=true` would fuse `r - dy*ax`, leaving `r`'s rounding residual instead of a
+  clean zero — and it fuses *inconsistently*, since the two sharers test the edge under
+  different indices (`e0` vs `e1`). MSVC's default `/fp:precise` does not contract (the build
+  sets no `/fp:` flag), so raster.h needs no intrinsics.
+
+Five call sites share the rule: `fillTriangleG` and `fillTriangleClear` (raster.h), and
+`rasterRow`, `kShade`'s barycentric resolve, and `kClear` (raster_cuda.cu). It matters most
+in the clear pass, which *multiplies* into `clearT`/`milkT` — a doubly-covered edge would
+darken a seam twice, an uncovered one leaves a hairline of un-tinted glass. Costs ~4% on the
+CPU rasterizer; GPU unchanged. History and measurements in `known-issues.md`.
+
 ## GPU raster pipeline (`raster_cuda.cu`)
 
 Powers `-raster -device gpu` and the interactive explorer's per-frame redraws;
@@ -815,6 +1098,43 @@ surface through the blocking copies' return codes plus one sticky
 breakdown) records CUDA events into the stream between passes and resolves them
 once after the download — zero overhead when disabled.
 
+**Zero-copy present (CUDA ↔ D3D11 interop, 0.98.0).** In the interactive explorer the
+finished frame no longer crosses the bus at all: `bindPresentTarget` registers the live
+window's own image texture with `cudaGraphicsD3D11RegisterResource(…SurfaceLoadStore)`,
+and `renderFrameToTarget` runs the identical pipeline but ends in `kToneMapSurf`, which
+`surf2Dwrite`s each pixel straight into that texture (map → kernel → unmap, all inside
+`LiveWindow::renderShared`'s device lock). That removes the D2H image copy, the H2D
+re-upload, and every host touch of the pixels in between. Design points:
+
+- **Byte-identity by construction.** Passes A–C are literally the same code (`renderCore`,
+  factored out of `renderFrame`), and the tonemap's per-pixel body — including the explicit
+  RN double intrinsics that stop nvcc contracting to FMA — lives in one shared
+  `__device__ inline tonemapPixel()` that both `kToneMap` (writes RGB8 to a buffer) and
+  `kToneMapSurf` (writes RGBA8 to the surface) call. The two paths cannot drift.
+- **The download was also the frame's fence and error check**; with it gone,
+  `cudaStreamSynchronize(0)` takes over both jobs, and the profiling event that bracketed
+  the download now honestly reports ~0.
+- **Registration is latched off after one failure** (`gfxOff`). The real-world failure is
+  D3D choosing a different adapter than the CUDA device (hybrid iGPU/dGPU laptops) — a
+  condition that never heals — so retrying per frame would be pure cost; the sticky CUDA
+  error is cleared so later frames aren't poisoned.
+- **Re-registration is keyed on texture pointer + size.** Comparing pointers is safe
+  because a registered resource holds a COM reference, so a new texture can never be
+  allocated on a still-registered one's address.
+- **Fallbacks are explicit, not silent.** `main.cpp`'s `rasterPresent` declines the fast
+  path (returning false so the caller renders to host memory and calls `update()`) when
+  there is no live window or GPU scene, when the implicit-ray iso preview owns the frame,
+  or when a camera-path/edit-point overlay needs to draw into host pixels. It prints a
+  one-line state change the first time each way, so a silent fallback can't masquerade as
+  working interop. Warm-only clock-keeping frames deliberately keep the ordinary path
+  (they must render without repainting).
+
+Measured @ 3840² (RTX 4090): host path `render 21.97 + present tail 4.17 = 26.1 ms`
+vs zero-copy `9.67 ms min`; the per-pass download line drops `4.06 ms → 0.10 ms`.
+(`-raster-bench` medians pin at exactly 16.67 ms / 60.0 fps on the zero-copy phase —
+that's flip-model `Present(0,0)` blocking on vblank with `BufferCount 2`, i.e. the
+display refresh, not the pipeline; read `min` for the true cost.)
+
 Perf state (2026-07 campaign, opts 1–8, RTX 4090 @1600×900): cornell **1.97 ms**
 (508 fps), gallery (5.08 M tris) **~4.45 ms** (~225 fps), glassgal **5.12 ms** —
 ~22–25× vs the 0.19.0 baseline. Passes sit near memory-bandwidth floors; the
@@ -851,6 +1171,49 @@ work units pull atomically from a shared counter in chunks. Determinism comes fr
 per-unit RNG seeding (above) plus order-independent accumulation per band/tile;
 film merges are structured so paired runs differ only by summation-order ulps at
 worst (mode R) or are bit-identical (fixed splits).
+
+## Stopping a render (`g_stopRequested`, `-stop`)
+
+One flag drives every clean stop: `g_stopRequested` (`main.cpp`). It is raised by the
+first Ctrl-C (a second restores `SIG_DFL` and force-quits), by the live window being
+closed, and — since 0.99.0 — by an **external** `-stop`. Every render loop polls it at a
+chunk/frame boundary and, on seeing it, writes the final image + `.ftbuf` checkpoint and
+returns normally, so the process unwinds through `cudaGracefulShutdown()`.
+
+That last exit path is the point of the whole mechanism: **force-killing ftrace while
+CUDA kernels are in flight can wedge the NVIDIA driver into a TDR/bugcheck**, so nothing
+in this project may be stopped with `taskkill /F`.
+
+`-stop` supplies the trigger a detached render (no console to Ctrl-C into) previously
+lacked. It is a **sentinel file** under `<temp>/ftrace/`, not a named kernel event,
+because renders run in the interactive Console session while the shell signalling them
+may be in a different session / window station (the same split that makes `-window`
+invisible under a sandboxed shell) and `Local\` objects are per-session.
+
+- `<pid>.run` — published by `stopChannelStart()` for the whole process lifetime
+  (including the `-keepwindow` hold), holding a `scene -> output` line; removed by
+  `stopChannelEnd()`. A stale one left by a hard kill is reaped by the next `-stop`,
+  which probes the pid first.
+- `<pid>.stop` — written by `ftrace -stop <pid>`; a 250 ms watcher thread in the target
+  consumes it once, sets `g_extStopRequested` **and** `g_stopRequested`, then exits.
+- `g_extStopRequested` is separate from `g_stopRequested` because the latter is cleared
+  per frame by the `-serve` loop; an external stop means "shut the process down", so it
+  must survive that clear — and it also breaks the `-keepwindow` hold.
+
+`-stop all` targets every live render, a bare `-stop` lists them, and both wait (≤120 s)
+for the targets to actually exit so a rebuild can be scripted immediately after.
+
+## GPU support gates fail safe, never coerce
+
+`cudaForwardSupported()` (`render_cuda.cu`) is the single gatekeeper — all eight GPU
+gates chain to it — and the rule it enforces is that anything the device kernels cannot
+do sends the scene to the CPU tracer. Host→device enum mappings must therefore be
+**closed whitelists shared with the upload**, not open ternary chains with a default
+arm: `deviceEmitterShapeCode()` is the model (a `switch` with no `default`, so a new
+enumerator trips MSVC C4062, plus a `-1` runtime fail-safe). Silently coercing an
+unrecognised value into some other device code hands a kernel malformed geometry, and
+malformed geometry inside a kernel does not fail cleanly — it can fault the display
+driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
 
 ## Benchmarks & perf discipline
 

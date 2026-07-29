@@ -3,7 +3,9 @@
 // string/array/object. Objects preserve insertion order isn't needed here, so a
 // std::map keyed by string is used for O(log n) member lookup. Numbers are parsed as
 // double (glTF indices fit exactly in a double's 53-bit mantissa). Not a general
-// high-performance parser — just correct and small. Used only by src/gltf.h.
+// high-performance parser — just correct and small. Used by src/gltf.h (glTF/GLB),
+// src/viewer_gui.cpp (the loom bridge protocol) and src/curvedrive.h (the loom
+// CurveDrive sidecar).
 #pragma once
 #include <string>
 #include <vector>

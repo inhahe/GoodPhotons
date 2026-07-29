@@ -170,6 +170,22 @@ _COLOUR_SPACES = tuple(
     for _p in _PLAIN_SPACES
 )
 
+# ``<space>:<name>`` — a USER-declared upsampler head (K1), naming an
+# ``upsample "<name>"`` block.  Open-ended, so it can't join the closed tuple above; it
+# is a *predicate* arm of the same question, mirroring ftrace's ``isCustomColourHead``.
+_USER_SPACE_RE = re.compile(r"^(?:rgb|hsv|hsl):\w+$")
+
+
+def is_colour_space(tag: str) -> bool:
+    """Is ``tag`` a legal channel-level inline-colour head?
+
+    The twin of ftrace's ``isColourHead`` (``src/ftsl.h``) — and, like it, deliberately
+    ONE function shared by the two sites that ask (the ``RecordChannel`` validator and
+    the ``.ftsl`` channel-line reader).  Splitting them would let the two drift, and the
+    failure mode is silent: a head one accepts and the other doesn't turns a colour stop
+    into a mystery scalar-expression error pointing at the wrong token."""
+    return tag in _COLOUR_SPACES or bool(_USER_SPACE_RE.match(tag))
+
 
 @dataclass
 class RecordChannel:
@@ -188,10 +204,11 @@ class RecordChannel:
     space: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if self.space is not None and self.space not in _COLOUR_SPACES:
+        if self.space is not None and not is_colour_space(self.space):
             raise ValueError(
                 f"record channel {self.name!r}: colour space must be one of "
-                f"{_COLOUR_SPACES} (got {self.space!r})")
+                f"{_COLOUR_SPACES}, or `<rgb|hsv|hsl>:<upsampler>` naming an "
+                f"`upsample` block (got {self.space!r})")
 
     @property
     def is_inline_colour(self) -> bool:
@@ -757,7 +774,7 @@ class Record(Element):
             # comma-group (or the lone group) is one colour stop.
             space: Optional[str] = None
             tag_split = value_text.split(None, 1)
-            if tag_split[0] in _COLOUR_SPACES:
+            if is_colour_space(tag_split[0]):
                 space = tag_split[0]
                 value_text = tag_split[1].strip() if len(tag_split) > 1 else ""
                 if not value_text:

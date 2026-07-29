@@ -30,14 +30,47 @@ NUMBER  = /-?[0-9]+(\.[0-9]+)?([eE][+\-]?[0-9]+)?/
 PIN     = /p:-?[0-9]+(\.[0-9]+)?/          # `p:<pos>` position pin prefix
 REF     = /[A-Za-z_][A-Za-z0-9_]*:[A-Za-z0-9_]+/   # e.g. spectrum:steel, metal:gold
 STRING  = /"[^"]*"/                                 # quoted name / path / expression
-# A `key=value` band parameter word (`gaussian center=560 sigma=25`), matched whole
-# like ftrace's whitespace `v.words`.  The value must start with a digit/sign so this
-# never swallows a `NAME = KIND` header's spaced-or-unspaced `=` (that stays NAME '=').
-KVWORD  = /[A-Za-z_][A-Za-z0-9_]*=-?[0-9][^ \t\r\n}]*/
+# A `key=value` parameter word (`gaussian center=560 sigma=25`, `planar axis=y`),
+# matched whole like ftrace's whitespace `v.words`.  The character classes mirror
+# ftrace's own KVWORD (ftsl_scene.epeg): no restriction on the *value*, because
+# `axis=y` / `wrap=clamp` are as real as `center=560` and an earlier "value must start
+# with a digit" rule silently split them into NAME '=' NAME — which then matched
+# `bentry`'s `block` alternative as a binder and demanded a `{`.
+#
+# The `NAME = KIND` header stays unambiguous without help from the lexer: a lone `=`
+# has no key characters in front of it, so it can never lex as a KVWORD and is matched
+# by the `'='` literal instead.  That means the *spaced* binder (`m = material {`) —
+# the only form loom emits and the only one ftrace accepts, since its tokenizer folds
+# `m=material` into one word too — parses exactly as before.  A comma is excluded from
+# both classes so it keeps working as a record-line delimiter, and so are the parens:
+# unlike ftrace (whose lexer keeps a whole `(…)` run inside one word and carves off a
+# PARENWORD terminal for the sample call), loom's value grammar spells the call out as
+# `'(' arg (',' arg)* ')'`, so a KVWORD that could swallow a paren would turn the
+# keyword-rebind form `ramp(a=u)` into a single meaningless token.
+KVWORD  = /[^ \t\r\n(){}\[\]#",=]+=[^ \t\r\n(){}\[\]#",]*/
 NAME    = /[A-Za-z_][A-Za-z0-9_]*/
 
 # ---- top-level element ----------------------------------------------
-element = record | material | texture | sphere | light | camera
+# The specific rules come first and `block` is the fallback, so a shape with a
+# faithful loom class (a `Material`, a `Sphere`, …) still builds that class and only
+# the baked-snapshot kinds fall through to the structure-preserving generic block.
+# A sphere written in an order the fixed `sphere` rule doesn't accept still parses —
+# as a `Block` — rather than failing outright.
+element = record | spectrum_decl | material | texture | sphere | light | camera | block
+
+# ---- named spectrum decl --------------------------------------------
+# `spectrum "name" = <expr>` (loom's NamedSpectrum) — the one element that is a
+# *statement*, not a brace block, so it needs its own rule rather than falling
+# through to the generic one.  It comes before `block` for the same reason `material`
+# does: it has a faithful loom class, so the reader can rebuild the real thing.
+spectrum_decl = nl? 'spectrum' STRING '=' pvalue nl?
+
+# A whole file of top-level elements, reached by an `elements` start-rule override
+# (:func:`loom.grammar.reader.parse_elements`) rather than by making it the default
+# start, so `parse_element` keeps rejecting text that holds more than one element.
+# Each `element` alternative already carries its own `nl?` padding, so the only extra
+# newlines to absorb are a file that opens or closes with blank lines.
+elements = nl? element* nl?
 
 # ---- record block ---------------------------------------------------
 # NEWLINE stays significant (one channel line = one channel), but the newlines
@@ -84,10 +117,16 @@ prop     = NAME pvalue
 # `reflect blackbody 6500  roughness 0.2` splits into two props, not one long value.
 # The grammar stays permissive (an untagged triple `0.8 0.7 0.2` parses); the spectral
 # shape/semantic check (loom.grammar.spectrum) is what rejects a non-spectrum value.
-pvalue   = STRING+ | pwords
-pwords   = phead ptail*
-phead    = REF | NUMBER | NAME
-ptail    = NUMBER | KVWORD
+#
+# A STRING is both a legal head and a legal tail, because a value can *mix* the two:
+# `layer "glass" 0.5` (a mix material's layer) and `density_at 0 1` differ only in
+# whether the first word is quoted.  Before that, `pvalue` was `STRING+ | pwords`, so a
+# quoted word could not be followed by a number and loom's own MixMaterial emission was
+# unparseable by the shared grammar — drift in the direction the unused-key audit can't
+# see, since ftrace reads it fine and only the *reader* was wrong.
+pvalue   = phead ptail*
+phead    = STRING | REF | NUMBER | NAME
+ptail    = STRING | NUMBER | KVWORD
 
 # ---- geometry primitives --------------------------------------------
 # A sphere is a fixed-shape block: `sphere { center X Y Z  radius R  material "n" }`.
@@ -110,6 +149,57 @@ cam_view = 'eye' vec3n 'look_at' vec3n 'up' vec3n 'fov_y' NUMBER
 vec3n    = NUMBER NUMBER NUMBER
 cam_mode = NAME
 cam_film = 'film' '{' 'res' NUMBER NUMBER '}'
+
+# ---- generic block (the read direction, J3c second half) ------------
+# Every remaining `.ftsl` block shares one shape: an optional binder or quoted
+# name, a kind keyword, and a brace body of statements that are each either a
+# `key value…` property or a nested block.  One rule therefore reads all of
+# them — `isosurface`, `medium`, `pattern`, `camera_curve`, `mesh`, `group`,
+# `quad`, `box`, `torus`, the CSG combinators, `upsample`, the `scene` header,
+# and the nested `film` / `bounds` / `contained_by` / `function` bodies.
+#
+# Why one generic rule instead of a rule per kind: the emitted form is a *baked*
+# snapshot, so a per-kind rule buys nothing.  `isosurface` is the clearest case —
+# its field function, freq, rotation, drift, placement and threshold are all
+# flattened into a single `function { expr "…" }` string, so no amount of grammar
+# can recover the authoring `Isosurface(field="gyroid", freq=3, …)`.  What a reader
+# *can* do faithfully is preserve the block's structure and re-emit it, which is
+# what `loom.block.Block` is for (and what TODO's FUTURE bullet already proposed
+# for `mesh { file … }` as a "lightweight element that re-emits the same block").
+#
+# `bentry` tries `block` before `bprop` so `sphere { … }` inside `contained_by`
+# reads as a child block; a property is the fallback.  `bprop`'s value is optional
+# because valueless keyword statements are real (`closed`, `exposure_lock`, and
+# `open on`'s sibling forms), and duplicate keys are normal rather than an error —
+# `camera_curve` is a *list* of `point` / `roll_at` / `fov_at` lines and a mix
+# material a list of `layer` lines, which is why the reader keeps entries ordered
+# instead of folding them into a dict.
+# The block *core* is factored out of the surrounding newline padding on purpose.
+# With a single `block = nl? bhead '{' bbody '}' nl?` rule, a nested block consumed the
+# newline that *followed* it via its own trailing `nl?`, so that newline never reached
+# `bbody`'s separator slot and the next statement was recorded as sharing the nested
+# block's line — `bounds { … }  density "…"` came back out on one line.  Only the
+# top-level `block` pads; `bentry` uses the bare core and lets `bbody` own every
+# separator, which is what keeps line layout (and therefore diffs) intact.
+block   = nl? bcore nl?
+bcore   = bhead '{' bbody '}'
+# The two header shapes ftrace has, kept apart exactly as it keeps them
+# (`assign_header = WORD '=' WORD subtype?` vs `plain_header = WORD STRING? subtype?`):
+# a bound element takes no quoted name, and an anonymous one may take either a quoted
+# name or a bareword *subtype*.  `light area { … }` and `mesh "duck" obj { … }` are
+# legacy spellings loom doesn't emit (it writes the subtype as a `kind` property) but
+# which hand-authored scenes still use, and a reader that choked on them could not open
+# a real scene file.  The binder form is tried first so `m = material {` doesn't match
+# `NAME` and then die on the `=`.
+bhead   = binder NAME subtype? | NAME STRING? subtype?
+subtype = NAME
+bbody   = (nl? bentry)* nl?
+bentry  = bcore | bprop
+# ftrace takes *any* token as a statement key (`s.key = cur().text`), so a flat-list
+# body with numeric "keys" — `palette { 0 spectrum:navy  1 spectrum:crimson }` — is an
+# ordinary sequence of `key value` statements to it, and has to be here too.
+bprop   = bkey pvalue?
+bkey    = NAME | NUMBER
 
 # ---- generic value tree (color-vector / array syntax) ---------------
 # Context-free value grammar (design locked 2026-07-19; TODO "DECISION —
@@ -151,5 +241,13 @@ vbracket = '[' value ']'
 # NOT enforce — the normalizer does, so the error can say what it means.
 vsampled  = vbracket axistuple? | NAME axistuple
 axistuple = '(' arg (',' arg)* ')'
-arg       = NAME '=' coord | coord
+# The keyword form is ONE token, not three: `a=u` matches KVWORD (which is what lets
+# `axis=y` survive a material round-trip), so the tuple has to read it back that way
+# and split it in the normalizer.  A driver that continues past the word — `a=m(u)`
+# (composition) or `a=[0 1](u)` (an inline literal driver) — leaves the KVWORD holding
+# just `a=m` / `a=`, and `kwrest` picks up the remainder.  The hand-spaced `a = u`
+# spelling keeps its own alternative, since a lone `=` never lexes as a KVWORD.
+arg       = kwarg | coord
+kwarg     = KVWORD kwrest? | NAME '=' coord
+kwrest    = axistuple | vsampled
 coord     = vsampled | NAME | NUMBER

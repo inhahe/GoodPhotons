@@ -162,12 +162,22 @@ def _piece(p):
 # inner node unchanged in that case and a :class:`Call` only when a tuple is
 # actually present.
 
-def _check_args(args: List["Arg"]) -> List["Arg"]:
-    """Positionals-before-keywords and no-duplicate-formals.
+def _check_args(args: List["Arg"], literal_target: bool = False) -> List["Arg"]:
+    """Positionals-before-keywords, no-duplicate-formals, and no keyword argument
+    on an inline array *literal*.
 
-    The grammar deliberately does not enforce either (``arg = NAME '=' coord |
-    coord`` in any order), so that the error can be phrased in terms of axes
-    instead of arriving as an opaque parse failure.
+    The grammar deliberately does not enforce any of these (``arg = NAME '='
+    coord | coord`` in any order), so that the error can be phrased in terms of
+    axes instead of arriving as an opaque parse failure.
+
+    ``literal_target`` says the call's target is a bracket literal rather than a
+    NAME.  ``formal=driver`` binds a name belonging to the *callee*; a material,
+    a material property and a named array all have callee-side input names, so
+    ``mat(a=u)`` is meaningful there.  An inline literal has no such namespace —
+    its axes are positional and anonymous, and the names in its own tuple are
+    *drivers*, not formals.  ftrace refuses the same spelling for the same
+    reason (``Builder::desugarOne``, ``src/ftsl.h``); the two must agree, because
+    a form loom accepts and ftrace rejects is a scene that emits and won't load.
     """
     seen_keyword = False
     formals: set = set()
@@ -178,6 +188,14 @@ def _check_args(args: List["Arg"]) -> List["Arg"]:
                     "positional axis arguments must come before keyword ones: "
                     "write `(u, a=v)`, not `(a=v, u)`")
         else:
+            if literal_target:
+                raise ShapeError(
+                    f"`{a.formal}={a.driver}`: an inline array literal's axes are "
+                    "unnamed and bind by position, so a `formal=driver` argument "
+                    "has no formal to bind - its sample call takes drivers. Write "
+                    f"`[...]({a.driver})` to spend the axis here, or "
+                    f"`[...]({a.formal})` to leave it free and rebind it where the "
+                    f"material is used, `mat({a.formal}={a.driver})`")
             seen_keyword = True
             if a.formal in formals:
                 raise ShapeError(
@@ -198,15 +216,49 @@ def _sampled(vs, space: Optional[str]) -> Node:
     tup = _kid(vs, "axistuple")
     if tup is None:
         return target
-    return Call(target, _check_args([_arg(a, space) for a in _kids(tup, "arg")]))
+    return Call(target, _check_args([_arg(a, space) for a in _kids(tup, "arg")],
+                                    literal_target=vb is not None))
 
 
 def _arg(a, space: Optional[str]) -> "Arg":
-    """One ``arg`` -> :class:`Arg`.  A direct ``NAME`` child (as opposed to one
-    nested under ``coord``) is the keyword form's *formal*."""
-    formal = _kid(a, "NAME")
-    return Arg(formal.value if formal is not None else None,
-               _coord(_kid(a, "coord"), space))
+    """One ``arg`` -> :class:`Arg` — positional (a bare ``coord``) or keyword."""
+    kw = _kid(a, "kwarg")
+    if kw is not None:
+        return _kwarg(kw, space)
+    return Arg(None, _coord(_kid(a, "coord"), space))
+
+
+def _kwarg(k, space: Optional[str]) -> "Arg":
+    """A ``formal=driver`` argument -> :class:`Arg`.
+
+    ``a=u`` arrives as a *single* KVWORD token (the same token that keeps `axis=y` in
+    one piece when a material property is read back), so the split happens here rather
+    than in the grammar.  A driver that continues past that token — ``a=m(u)``,
+    ``a=[0 1](u)`` — leaves the KVWORD holding only the part up to the paren/bracket,
+    and ``kwrest`` carries the rest.
+    """
+    nm = _kid(k, "NAME")
+    if nm is not None:                              # hand-spaced `a = u`
+        return Arg(nm.value, _coord(_kid(k, "coord"), space))
+    formal, _, driver = _kid(k, "KVWORD").value.partition("=")
+    rest = _kid(k, "kwrest")
+    if rest is None:
+        if not driver:
+            raise ShapeError(f"axis argument '{formal}=' has no driver")
+        return Arg(formal, _word_coord(driver))
+    tup = _kid(rest, "axistuple")
+    if tup is not None:                             # `a=m(u)` — a composed call
+        return Arg(formal, Call(driver, _check_args(
+            [_arg(x, space) for x in _kids(tup, "arg")])))
+    return Arg(formal, _sampled(_kid(rest, "vsampled"), space))
+
+
+def _word_coord(w: str) -> "Coord":
+    """A KVWORD's driver half: a number when it reads as one, else a driver name."""
+    try:
+        return float(w)
+    except ValueError:
+        return w
 
 
 def _coord(c, space: Optional[str]) -> "Coord":

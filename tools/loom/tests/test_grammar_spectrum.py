@@ -21,7 +21,7 @@ import pytest  # noqa: E402
 
 from loom.grammar.spectrum import (  # noqa: E402
     Band, Blackbody, BoxSpec, ColorSpec, Const, IllumSpec, Ior, LibRef, LineSpec, MengSpec,
-    NamedWall, RecordRef, SmitsSpec, WhiteWall, as_spectrum, parse_spectrum,
+    NamedWall, RecordRef, SmitsSpec, UserSpec, WhiteWall, as_spectrum, parse_spectrum,
 )
 from loom.grammar.values import ShapeError  # noqa: E402
 
@@ -184,6 +184,42 @@ def test_untagged_triple_is_rejected():
 ])
 def test_library_references(text, kind, name):
     assert parse_spectrum(text) == LibRef(kind, name)
+
+
+# ---- user-declared upsampler heads (K1) ------------------------------------
+# `<space>:<name> r g b` names an `upsample "<name>"` block.  These pin three things
+# ftrace's loader also pins: the head shape, that the name is kept VERBATIM (loom does
+# not resolve it — an unknown upsampler is a scene error, not a grammar error), and
+# that hsv:/hsl: still convert their triple to linear sRGB first, exactly as the plain
+# heads do, so the body sees the same r,g,b whichever head was written.
+
+def test_user_upsampler_head_rgb():
+    assert parse_spectrum("rgb:mine 0.2 0.5 0.9") == UserSpec(
+        "rgb", "mine", (0.2, 0.5, 0.9))
+
+
+def test_user_upsampler_head_hsv_converts_like_the_plain_head():
+    got = parse_spectrum("hsv:mine 0.3 0.8 0.6")
+    assert isinstance(got, UserSpec) and got.space == "hsv" and got.name == "mine"
+    # the same triple through the plain `hsv` head lands on the same components
+    assert got.comps == parse_spectrum("hsv 0.3 0.8 0.6").comps
+
+
+def test_user_upsampler_name_is_not_resolved_here():
+    # A name loom has never heard of parses fine: resolution is the loader's job, and
+    # a grammar that guessed would reject scenes ftrace renders happily.
+    assert parse_spectrum("rgb:never_declared 1 0 0").name == "never_declared"
+
+
+def test_user_upsampler_head_does_not_shadow_a_builtin():
+    # The built-ins are GLUED suffixes and a user head is colon-separated, so the two
+    # spellings can never collide — check the built-in still wins its own spelling.
+    assert isinstance(parse_spectrum("rgbmeng 0.2 0.5 0.9"), MengSpec)
+
+
+def test_bare_space_colon_is_not_a_head():
+    with pytest.raises(ShapeError):
+        parse_spectrum("rgb: 1 0 0")
 
 
 # ---- record channel reference (constant value site) ------------------------

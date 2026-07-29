@@ -3,7 +3,7 @@
 #ifndef _WIN32
 // -------- Non-Windows stub: the native viewer needs Win32 + D3D11 --------------
 #include <cstdio>
-int runViewerGui(const std::string&) {
+int runViewerGui(const std::string&, const std::string&) {
     std::fprintf(stderr, "error: -viewer is only available on Windows builds.\n");
     return 1;
 }
@@ -29,10 +29,16 @@ int runViewerGui(const std::string&) {
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 #include "third_party/json.h"      // minijson: the vendored JSON parser
+#include "loomlink.h"              // the shared `python -m loom.<server>` child link
 #include <map>
 #include <unordered_map>
 #include <functional>
 #include <thread>
+#include <mutex>                   // F4 item 2: the live re-introspection job queue
+#include <condition_variable>
+#include <cstring>
+#include <cstdlib>                 // strtoul: parsing the pid out of a scratch dir name
+#include <cwctype>
 
 // Bridge to ftrace's own scene loader + GPU field raymarcher (F7 primary path).
 // The viewer IS the ftrace binary, so it can parse loom's emitted `.ftsl` with the
@@ -44,7 +50,10 @@ int runViewerGui(const std::string&) {
 #include "ftsl.h"
 #include "render_cuda.h"
 
+#include <d3dcompiler.h>           // the mesh pane's z-buffered shaders (runtime-compiled)
+
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 
 // ImGui's Win32 backend provides this handler; declare it (the header guards it
 // behind a macro we don't want to define project-wide).
@@ -135,14 +144,7 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 // --------------------------------------------------------------------------
 namespace {
 
-std::wstring utf8ToWide(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return std::wstring(s.begin(), s.end());
-    std::wstring w(n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
-    return w;
-}
+using loomlink::utf8ToWide;   // shared with the child-process link (loomlink.h)
 
 // Render a JSON scalar (string OR number) as a display string. loom emits dataset
 // ids as integer node ids, so a plain asString() would fall back to the default.
@@ -192,6 +194,13 @@ struct Sidecar {
     // viewer then shows only the static sidecar geometry (no live raymarch).
     std::string source() const {
         const minijson::Value* v = root.find("source");
+        return (v && v->isString()) ? v->str : std::string();
+    }
+    // Absolute path of the loom file the `build()` came from (F4 item 2). This is the
+    // sidecar's provenance, and it is what lets `-viewer <sidecar>` reopen the LIVE
+    // re-introspection channel without being told the scene file a second time.
+    std::string buildFile() const {
+        const minijson::Value* v = root.find("build");
         return (v && v->isString()) ? v->str : std::string();
     }
 };
@@ -613,6 +622,88 @@ struct SkinLib {
 };
 
 } // namespace
+
+// --------------------------------------------------------------------------
+// F4 item 2 — live parameter state, declared up here because the geometry panes
+// below carry the "rotate into a parameter dimension" gesture. The transport that
+// fills this in (LoomLink / LoomBridge) lives further down, next to the entry point.
+//
+// The distinction this whole feature turns on: the three dims a pane SHOWS can be
+// re-projected for free by rotating the view, but a parameter dimension is not in
+// the geometry at all — moving along it means loom has to re-derive (re-tessellate)
+// the scene. So the spatial orbit stays on the left mouse button and is instant,
+// and the parameter sweep is on the right button and costs a round trip.
+// --------------------------------------------------------------------------
+
+// One live control. `toJson` is what actually gets sent, so a param the build
+// declared as an int stays an int (JSON has no such distinction; loom tells us).
+struct LiveParam {
+    std::string name;
+    int  kind = 0;            // 0 float, 1 int, 2 bool, 3 opaque (shown read-only)
+    double num = 0.0;
+    bool   bval = false;
+    std::string text;         // opaque/str params: echoed back verbatim
+    double speed = 0.01;      // drag sensitivity, seeded from the default's magnitude
+
+    bool continuous() const { return kind == 0 || kind == 1; }
+
+    std::string toJson() const {
+        char b[64];
+        switch (kind) {
+        case 1: std::snprintf(b, sizeof b, "%lld", (long long)llround(num)); return b;
+        case 2: return bval ? "true" : "false";
+        case 3: return text;
+        default: std::snprintf(b, sizeof b, "%.10g", num); return b;
+        }
+    }
+};
+
+struct LivePanel {
+    bool up = false;                 // the bridge started and the link is serving
+    std::string startErr;            // ...or why it isn't
+    int  frame = 0, frames = 1;      // the clock, itself a parameter dimension
+    std::vector<LiveParam> params;
+    int  sweep = -1;                 // index into params: the axis a canvas drag moves
+    bool autoApply = true;           // re-derive on every change vs. on the button
+    // Latest-wins accounting, and the whole point of the panel's counter line: `posted`
+    // is how many jobs the UI handed to the bridge, `baked` how many loom actually ran,
+    // `appliedSeq` which job the panes are showing. posted > baked is the mechanism
+    // working (a fast drag collapses to one bake), not jobs being lost.
+    long long posted = 0, baked = 0, appliedSeq = 0;
+    double lastMs = 0.0;
+    std::string lastErr;
+};
+
+// The canvas gesture: right-drag sweeps the chosen parameter axis. Call it directly
+// after the pane's InvisibleButton (it reads that item's active state). Returns true
+// when the value actually moved, which is what schedules a re-derivation.
+static bool liveSweepDrag(LivePanel* lp) {
+    if (!lp || !lp->up) return false;
+    if (lp->sweep < 0 || lp->sweep >= (int)lp->params.size()) return false;
+    if (!ImGui::IsItemActive() || !ImGui::IsMouseDragging(ImGuiMouseButton_Right)) return false;
+    float dx = ImGui::GetIO().MouseDelta.x;
+    if (dx == 0.0f) return false;
+    LiveParam& p = lp->params[lp->sweep];
+    double before = p.num;
+    p.num += dx * p.speed;
+    if (p.kind == 1) p.num = (double)llround(p.num);
+    return p.num != before;          // an int axis only ticks once per whole step
+}
+
+// The line under a pane's banner naming the sweep axis, so the gesture is discoverable.
+// Deliberately NOT SameLine'd onto the banner: the banners are already near the width
+// of the right-hand column, so appending to them pushed the hint — the part that says
+// which key the drag actually turns — off the right edge at any normal window size.
+static void liveSweepHint(const LivePanel* lp) {
+    if (!lp || !lp->up) return;
+    if (lp->sweep >= 0 && lp->sweep < (int)lp->params.size()) {
+        const LiveParam& p = lp->params[lp->sweep];
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 1.0f, 1.0f), "right-drag sweeps %s = %.4g",
+                           p.name.c_str(), p.num);
+    } else {
+        ImGui::TextDisabled("(no sweep axis - pick one in Live)");
+    }
+}
 
 // --------------------------------------------------------------------------
 // Curve pane: a simple orthographic projection drawn with ImDrawList.
@@ -1088,7 +1179,332 @@ static void drawFieldPane(const std::vector<FieldGeom>& fields, FieldView& view)
 }
 
 // --------------------------------------------------------------------------
-// F4 — mesh pane: SweptMesh tessellated surfaces as a shaded, depth-sorted
+// F4 — the mesh pane's z-buffered D3D11 renderer.
+//
+// The pane used to sort triangles back-to-front by centroid depth and hand them
+// to ImGui's draw list — a painter's algorithm. That is simply wrong for
+// interpenetrating geometry, which is exactly what loom's swept / blobby
+// surfaces produce (two tubes crossing, a skin passing through a spine), and it
+// re-sorted every triangle on the UI thread every frame. The viewer is already
+// running on a D3D11 device, so the honest fix is a real depth buffer: upload
+// the tessellation once into a vertex/index buffer, draw it into an offscreen
+// render target that has a depth-stencil view, and show that target with
+// ImGui::Image — the same trick the Render pane uses for its raymarch.
+//
+// Shading is kept identical to the old CPU path: flat two-sided lambert
+// 0.30 + 0.70*|n.z| with n the FACE normal in the rotated view basis. The GPU
+// recovers that per-pixel from screen-space derivatives of the view-space
+// position; under the orthographic projection used here that is exact, not an
+// approximation. The one deliberate improvement is the UV checker, which is now
+// evaluated per-pixel at the interpolated UV instead of once at the triangle
+// centroid — the whole point of a UV checker is to show UV distortion *within* a
+// face, which a flat centroid sample cannot do.
+// --------------------------------------------------------------------------
+struct MeshGpu {
+    // pipeline objects (created once, on first use)
+    ID3D11VertexShader*      vs      = nullptr;
+    ID3D11PixelShader*       ps      = nullptr;
+    ID3D11InputLayout*       layout  = nullptr;
+    ID3D11Buffer*            cb      = nullptr;
+    ID3D11RasterizerState*   rsSolid = nullptr;
+    ID3D11RasterizerState*   rsWire  = nullptr;
+    ID3D11DepthStencilState* dsSolid = nullptr;   // LESS, writes depth
+    ID3D11DepthStencilState* dsWire  = nullptr;   // LESS_EQUAL, no depth write
+    ID3D11BlendState*        blend   = nullptr;
+    ID3D11SamplerState*      samp    = nullptr;
+    bool                     pipeReady = false;
+
+    // geometry (rebuilt only when the sidecar hands over a new tessellation)
+    ID3D11Buffer* vb = nullptr;
+    ID3D11Buffer* ib = nullptr;
+    struct Range { UINT firstIndex = 0, indexCount = 0; INT baseVertex = 0; };
+    std::vector<Range> ranges;      // one per MeshGeom, parallel to `meshes`
+    unsigned geomGen = ~0u;         // MeshView::geomGen the buffers were built from
+    bool     geomReady = false;
+    float    mid[3] = { 0, 0, 0 };  // union-bounds centre / extents, baked with the upload
+    float    ext = 1.0f, diag = 1.0f;
+
+    // offscreen colour + depth target, resized to the pane
+    ID3D11Texture2D*          colorTex = nullptr;
+    ID3D11RenderTargetView*   rtv      = nullptr;
+    ID3D11ShaderResourceView* srv      = nullptr;
+    ID3D11Texture2D*          depthTex = nullptr;
+    ID3D11DepthStencilView*   dsv      = nullptr;
+    int texW = 0, texH = 0;
+
+    std::string err;                // non-empty => the pane says so instead of drawing
+
+    struct Vert { float x, y, z, u, v; };
+    // Must match the cbuffer in the shader below (144 B, a multiple of 16).
+    struct CB {
+        float mvp[16];
+        float rot0[4], rot1[4], rot2[4];   // xyz = view-basis row, w = -(row . mid)
+        float baseColor[4];
+        float opts[4];                     // x = shade on, y = colour mode
+    };
+
+    void releaseGeom() {
+        if (vb) { vb->Release(); vb = nullptr; }
+        if (ib) { ib->Release(); ib = nullptr; }
+        ranges.clear();
+        geomReady = false;
+        geomGen = ~0u;
+    }
+    void releaseTargets() {
+        if (srv)      { srv->Release();      srv = nullptr; }
+        if (rtv)      { rtv->Release();      rtv = nullptr; }
+        if (colorTex) { colorTex->Release(); colorTex = nullptr; }
+        if (dsv)      { dsv->Release();      dsv = nullptr; }
+        if (depthTex) { depthTex->Release(); depthTex = nullptr; }
+        texW = texH = 0;
+    }
+    void release() {
+        releaseGeom();
+        releaseTargets();
+        if (samp)    { samp->Release();    samp = nullptr; }
+        if (blend)   { blend->Release();   blend = nullptr; }
+        if (dsWire)  { dsWire->Release();  dsWire = nullptr; }
+        if (dsSolid) { dsSolid->Release(); dsSolid = nullptr; }
+        if (rsWire)  { rsWire->Release();  rsWire = nullptr; }
+        if (rsSolid) { rsSolid->Release(); rsSolid = nullptr; }
+        if (cb)      { cb->Release();      cb = nullptr; }
+        if (layout)  { layout->Release();  layout = nullptr; }
+        if (ps)      { ps->Release();      ps = nullptr; }
+        if (vs)      { vs->Release();      vs = nullptr; }
+        pipeReady = false;
+    }
+
+    bool buildPipeline(ID3D11Device* dev) {
+        if (pipeReady) return true;
+        if (!dev) { err = "no D3D11 device"; return false; }
+
+        static const char* kVS = R"HLSL(
+cbuffer CB : register(b0) {
+    row_major float4x4 mvp;
+    float4 rot0, rot1, rot2;
+    float4 baseColor;
+    float4 opts;
+};
+struct VSIn  { float3 p : POSITION; float2 uv : TEXCOORD0; };
+struct VSOut { float4 pos : SV_Position; float3 vp : TEXCOORD1; float2 uv : TEXCOORD0; };
+VSOut main(VSIn i) {
+    VSOut o;
+    o.pos = mul(mvp, float4(i.p, 1.0));
+    // view-space position, used ONLY for the flat face normal via ddx/ddy
+    o.vp  = float3(dot(rot0.xyz, i.p) + rot0.w,
+                   dot(rot1.xyz, i.p) + rot1.w,
+                   dot(rot2.xyz, i.p) + rot2.w);
+    o.uv  = i.uv;
+    return o;
+}
+)HLSL";
+
+        static const char* kPS = R"HLSL(
+cbuffer CB : register(b0) {
+    row_major float4x4 mvp;
+    float4 rot0, rot1, rot2;
+    float4 baseColor;
+    float4 opts;
+};
+Texture2D    tex0  : register(t0);
+SamplerState samp0 : register(s0);
+struct VSOut { float4 pos : SV_Position; float3 vp : TEXCOORD1; float2 uv : TEXCOORD0; };
+float4 main(VSOut i) : SV_Target {
+    float3 base = baseColor.rgb;
+    int mode = (int)opts.y;
+    if (mode == 2) {
+        // UV checker, per-pixel (8 cells across the unit square)
+        float2 c = floor(i.uv * 8.0);
+        float  s = frac((c.x + c.y) * 0.5);
+        base = (s > 0.25) ? float3(210.0, 210.0, 220.0) / 255.0
+                          : float3( 90.0,  95.0, 110.0) / 255.0;
+    } else if (mode == 3) {
+        // v is flipped because Texture::sampleRgb treats v=0 as the image BOTTOM
+        // while the uploaded D3D texture has v=0 at its top row.
+        base *= tex0.Sample(samp0, float2(i.uv.x, 1.0 - i.uv.y)).rgb;
+    }
+    float sh = 1.0;
+    if (opts.x > 0.5) {
+        float3 n = normalize(cross(ddx(i.vp), ddy(i.vp)));
+        sh = 0.30 + 0.70 * abs(n.z);          // two-sided lambert, flat per face
+    }
+    return float4(base * sh, baseColor.a);
+}
+)HLSL";
+
+        auto fail = [&](const char* what, ID3DBlob* e) {
+            err = what;
+            if (e) { err += ": "; err.append((const char*)e->GetBufferPointer()); e->Release(); }
+            release();
+            return false;
+        };
+        ID3DBlob* vsb = nullptr; ID3DBlob* psb = nullptr; ID3DBlob* eb = nullptr;
+        if (FAILED(D3DCompile(kVS, strlen(kVS), nullptr, nullptr, nullptr, "main", "vs_4_0", 0, 0, &vsb, &eb)))
+            return fail("mesh VS compile failed", eb);
+        if (FAILED(dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs))) {
+            vsb->Release(); return fail("CreateVertexShader failed", nullptr);
+        }
+        if (FAILED(D3DCompile(kPS, strlen(kPS), nullptr, nullptr, nullptr, "main", "ps_4_0", 0, 0, &psb, &eb))) {
+            vsb->Release(); return fail("mesh PS compile failed", eb);
+        }
+        if (FAILED(dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps))) {
+            vsb->Release(); psb->Release(); return fail("CreatePixelShader failed", nullptr);
+        }
+        psb->Release();
+        const D3D11_INPUT_ELEMENT_DESC il[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        };
+        HRESULT hr = dev->CreateInputLayout(il, 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &layout);
+        vsb->Release();
+        if (FAILED(hr)) return fail("CreateInputLayout failed", nullptr);
+
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = sizeof(CB);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(dev->CreateBuffer(&bd, nullptr, &cb))) return fail("CreateBuffer(cb) failed", nullptr);
+
+        D3D11_RASTERIZER_DESC rd = {};
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;          // surfaces are drawn two-sided
+        rd.DepthClipEnable = TRUE;
+        if (FAILED(dev->CreateRasterizerState(&rd, &rsSolid))) return fail("rasterizer(solid) failed", nullptr);
+        rd.FillMode = D3D11_FILL_WIREFRAME;
+        // The wire pass draws the SAME triangles, so pull it a hair toward the eye;
+        // LESS_EQUAL alone would still lose to rasterization rounding on the edges.
+        rd.DepthBias = -800;
+        rd.SlopeScaledDepthBias = -1.0f;
+        if (FAILED(dev->CreateRasterizerState(&rd, &rsWire))) return fail("rasterizer(wire) failed", nullptr);
+
+        D3D11_DEPTH_STENCIL_DESC dd = {};
+        dd.DepthEnable = TRUE;
+        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        dd.DepthFunc = D3D11_COMPARISON_LESS;
+        if (FAILED(dev->CreateDepthStencilState(&dd, &dsSolid))) return fail("depth state(solid) failed", nullptr);
+        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+        if (FAILED(dev->CreateDepthStencilState(&dd, &dsWire))) return fail("depth state(wire) failed", nullptr);
+
+        D3D11_BLEND_DESC bl = {};
+        bl.RenderTarget[0].BlendEnable = TRUE;
+        bl.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        bl.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        bl.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(dev->CreateBlendState(&bl, &blend))) return fail("CreateBlendState failed", nullptr);
+
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        sd.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        if (FAILED(dev->CreateSamplerState(&sd, &samp))) return fail("CreateSamplerState failed", nullptr);
+
+        err.clear();
+        pipeReady = true;
+        return true;
+    }
+
+    bool ensureTargets(ID3D11Device* dev, int W, int H) {
+        if (W < 1) W = 1;
+        if (H < 1) H = 1;
+        if (colorTex && texW == W && texH == H) return true;
+        releaseTargets();
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = W; td.Height = H; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &colorTex))) { err = "mesh colour target failed"; return false; }
+        if (FAILED(dev->CreateRenderTargetView(colorTex, nullptr, &rtv))) { releaseTargets(); err = "mesh RTV failed"; return false; }
+        if (FAILED(dev->CreateShaderResourceView(colorTex, nullptr, &srv))) { releaseTargets(); err = "mesh SRV failed"; return false; }
+        td.Format = DXGI_FORMAT_D32_FLOAT;
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &depthTex))) { releaseTargets(); err = "mesh depth target failed"; return false; }
+        if (FAILED(dev->CreateDepthStencilView(depthTex, nullptr, &dsv))) { releaseTargets(); err = "mesh DSV failed"; return false; }
+        texW = W; texH = H;
+        return true;
+    }
+
+    // One interleaved vertex buffer + one index buffer for the whole sidecar, with a
+    // per-mesh (firstIndex, count, baseVertex) range so each mesh is still its own
+    // draw call (it needs its own skin and tint).
+    bool uploadGeometry(ID3D11Device* dev, const std::vector<MeshGeom>& meshes, unsigned gen) {
+        releaseGeom();
+        std::vector<Vert>     verts;
+        std::vector<uint32_t> idx;
+        ranges.resize(meshes.size());
+        for (size_t mi = 0; mi < meshes.size(); ++mi) {
+            const MeshGeom& m = meshes[mi];
+            Range r;
+            r.baseVertex = (INT)verts.size();
+            r.firstIndex = (UINT)idx.size();
+            bool hasUv = (int)m.uvs.size() >= 2 * m.nverts;
+            for (int i = 0; i < m.nverts; ++i) {
+                Vert v;
+                v.x = m.verts[(size_t)i * 3 + 0];
+                v.y = m.verts[(size_t)i * 3 + 1];
+                v.z = m.verts[(size_t)i * 3 + 2];
+                v.u = hasUv ? m.uvs[(size_t)i * 2 + 0] : 0.0f;
+                v.v = hasUv ? m.uvs[(size_t)i * 2 + 1] : 0.0f;
+                verts.push_back(v);
+            }
+            for (int f = 0; f < m.nfaces; ++f) {
+                int f0 = m.faces[(size_t)f * 3 + 0], f1 = m.faces[(size_t)f * 3 + 1],
+                    f2 = m.faces[(size_t)f * 3 + 2];
+                if (f0 < 0 || f1 < 0 || f2 < 0 || f0 >= m.nverts || f1 >= m.nverts || f2 >= m.nverts)
+                    continue;   // a malformed face is skipped, exactly as before
+                idx.push_back((uint32_t)f0); idx.push_back((uint32_t)f1); idx.push_back((uint32_t)f2);
+            }
+            r.indexCount = (UINT)idx.size() - r.firstIndex;
+            ranges[mi] = r;
+        }
+        // Union bounds, computed once with the upload rather than per frame: they
+        // depend only on the tessellation, and an orbit must not re-scan 5M verts.
+        float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+        for (const auto& m : meshes)
+            for (int i = 0; i < m.nverts; ++i)
+                for (int k = 0; k < 3; ++k) {
+                    float v = m.verts[(size_t)i * 3 + k];
+                    lo[k] = std::min(lo[k], v); hi[k] = std::max(hi[k], v);
+                }
+        ext = 1.0f; diag = 0.0f;
+        for (int k = 0; k < 3; ++k) {
+            float d = (hi[k] > lo[k]) ? (hi[k] - lo[k]) : 0.0f;
+            ext = std::max(ext, d);
+            diag += d * d;
+            mid[k] = (hi[k] >= lo[k]) ? 0.5f * (lo[k] + hi[k]) : 0.0f;
+        }
+        diag = 0.5f * std::sqrt(diag) + 1e-3f;   // depth half-range in the rotated basis
+
+        geomGen = gen;
+        if (verts.empty() || idx.empty()) { geomReady = true; return true; }   // nothing to draw, but valid
+
+        D3D11_BUFFER_DESC bd = {};
+        D3D11_SUBRESOURCE_DATA sd = {};
+        bd.ByteWidth = (UINT)(verts.size() * sizeof(Vert));
+        bd.Usage = D3D11_USAGE_IMMUTABLE;
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        sd.pSysMem = verts.data();
+        if (FAILED(dev->CreateBuffer(&bd, &sd, &vb))) { err = "mesh vertex buffer failed"; releaseGeom(); return false; }
+        bd.ByteWidth = (UINT)(idx.size() * sizeof(uint32_t));
+        bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        sd.pSysMem = idx.data();
+        if (FAILED(dev->CreateBuffer(&bd, &sd, &ib))) { err = "mesh index buffer failed"; releaseGeom(); return false; }
+        geomGen = gen;
+        geomReady = true;
+        return true;
+    }
+};
+
+// --------------------------------------------------------------------------
+// F4 — mesh pane: SweptMesh tessellated surfaces as a shaded, z-buffered
 // triangle mesh. Orbiting the 3 spatial dims is a view-only re-projection (no
 // re-tessellation, exactly as the F4 rule specifies for isometries of the shown
 // dims). Colour: flat lambert shading, per-object tint, a UV checker, or the
@@ -1099,11 +1515,18 @@ struct MeshView {
     bool  shade = true;         // flat lambert lighting
     bool  wire = false;         // wireframe overlay
     int   colorBy = 3;          // 0 grey, 1 per-object tint, 2 UV checker, 3 texture
+    // Bumped whenever loom hands over a NEW tessellation; the GPU buffers are
+    // rebuilt only when it changes, so an orbit costs nothing but a cbuffer write.
+    unsigned geomGen = 0;
+    MeshGpu  gpu;
 };
 
-static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
-                         const SkinLib& skins) {
+static bool drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
+                         const SkinLib& skins, LivePanel* live,
+                         ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    bool swept = false;   // the parameter axis moved -> the surface must be re-baked
     ImGui::TextUnformatted("Meshes - drag to orbit, wheel to zoom (view-only re-projection)");
+    liveSweepHint(live);
     ImGui::Checkbox("shade", &view.shade); ImGui::SameLine();
     ImGui::Checkbox("wireframe", &view.wire); ImGui::SameLine();
     ImGui::SetNextItemWidth(150);
@@ -1126,8 +1549,10 @@ static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
     avail.y -= footer * ImGui::GetTextLineHeightWithSpacing();
     if (avail.y < 80.0f) avail.y = 80.0f;
     ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton("mesh_canvas", avail);
+    ImGui::InvisibleButton("mesh_canvas", avail,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
     bool hovered = ImGui::IsItemHovered();
+    swept = liveSweepDrag(live);   // right-drag: rotate INTO the parameter dimension
     if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         ImVec2 d = ImGui::GetIO().MouseDelta;
         view.yaw   += d.x * 0.01f;
@@ -1136,145 +1561,156 @@ static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
     if (hovered) { float w = ImGui::GetIO().MouseWheel; if (w != 0.0f) view.zoom *= (1.0f + w * 0.1f); }
     if (view.zoom < 0.05f) view.zoom = 0.05f;
 
+    MeshGpu& gpu = view.gpu;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 br(origin.x + avail.x, origin.y + avail.y);
-    dl->AddRectFilled(origin, br, IM_COL32(14, 16, 20, 255));
-    dl->PushClipRect(origin, br, true);
 
-    // shared rotation basis: rotate each world vertex to (X screen-right, Y up, Z toward viewer)
-    float cy = std::cos(view.yaw),   sy = std::sin(view.yaw);
-    float cx = std::cos(view.pitch), sx = std::sin(view.pitch);
-    auto rot = [&](float x, float y, float z, float& X, float& Y, float& Z) {
-        float x1 =  cy * x + sy * z;
-        float z1 = -sy * x + cy * z;
-        X = x1;
-        Y = cx * y - sx * z1;
-        Z = sx * y + cx * z1;   // depth toward viewer
-    };
+    // Pipeline once, geometry once per tessellation, targets once per pane size.
+    bool ok = gpu.buildPipeline(dev);
+    if (ok && (!gpu.geomReady || gpu.geomGen != view.geomGen))
+        ok = gpu.uploadGeometry(dev, meshes, view.geomGen);
+    if (ok) ok = gpu.ensureTargets(dev, (int)(avail.x + 0.5f), (int)(avail.y + 0.5f));
 
-    // union bounds (centre + extent) over all meshes
-    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
-    for (const auto& m : meshes)
-        for (int i = 0; i < m.nverts; ++i)
-            for (int k = 0; k < 3; ++k) {
-                float v = m.verts[(size_t)i * 3 + k];
-                lo[k] = std::min(lo[k], v); hi[k] = std::max(hi[k], v);
+    if (ok) {
+        // ---- the orthographic orbit projection, as one 4x4 -------------------
+        // Rows of the rotation taking a world point to (X screen-right, Y up,
+        // Z toward the viewer) — the exact basis the old CPU projector used.
+        float cy = std::cos(view.yaw),   sy = std::sin(view.yaw);
+        float cx = std::cos(view.pitch), sx = std::sin(view.pitch);
+        const float R[3][3] = {
+            {  cy,        0.0f,  sy      },
+            {  sx * sy,   cx,   -sx * cy },
+            { -cx * sy,   sx,    cx * cy },
+        };
+        float scale = 0.42f * std::min(avail.x, avail.y) / (0.5f * gpu.ext + 1e-3f);
+        float s  = scale * view.zoom;
+        // The pane's own pixel box IS the render target, so the screen mapping
+        // collapses to a pure scale: the centre of the box is NDC (0,0).
+        float ax = (avail.x > 0.0f) ? 2.0f * s / avail.x : 0.0f;
+        float ay = (avail.y > 0.0f) ? 2.0f * s / avail.y : 0.0f;
+        float kz = 0.5f / gpu.diag;      // rotated Z in [-diag,+diag] -> depth 0(near)..1(far)
+        auto dotMid = [&](int r) {
+            return R[r][0] * gpu.mid[0] + R[r][1] * gpu.mid[1] + R[r][2] * gpu.mid[2];
+        };
+        MeshGpu::CB c = {};
+        const float rowScale[3] = { ax, ay, -kz };
+        for (int r = 0; r < 3; ++r)
+            for (int k = 0; k < 3; ++k) c.mvp[r * 4 + k] = rowScale[r] * R[r][k];
+        c.mvp[0 * 4 + 3] = -ax * dotMid(0);
+        c.mvp[1 * 4 + 3] = -ay * dotMid(1);
+        c.mvp[2 * 4 + 3] =  kz * dotMid(2) + 0.5f;
+        c.mvp[3 * 4 + 3] = 1.0f;
+        for (int r = 0; r < 3; ++r) {
+            float* dst = (r == 0) ? c.rot0 : (r == 1) ? c.rot1 : c.rot2;
+            dst[0] = R[r][0]; dst[1] = R[r][1]; dst[2] = R[r][2]; dst[3] = -dotMid(r);
+        }
+
+        auto setCB = [&](const float rgba[4], float shadeOn, float mode) {
+            for (int k = 0; k < 4; ++k) c.baseColor[k] = rgba[k];
+            c.opts[0] = shadeOn; c.opts[1] = mode; c.opts[2] = c.opts[3] = 0.0f;
+            D3D11_MAPPED_SUBRESOURCE ms;
+            if (ctx->Map(gpu.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms) == S_OK) {
+                std::memcpy(ms.pData, &c, sizeof(c));
+                ctx->Unmap(gpu.cb, 0);
             }
-    float ext = 1.0f;
-    for (int k = 0; k < 3; ++k) if (hi[k] > lo[k]) ext = std::max(ext, hi[k] - lo[k]);
-    float mid[3] = { 0, 0, 0 };
-    for (int k = 0; k < 3; ++k) if (hi[k] >= lo[k]) mid[k] = 0.5f * (lo[k] + hi[k]);
-    ImVec2 center(origin.x + avail.x * 0.5f, origin.y + avail.y * 0.5f);
-    float scale = 0.42f * std::min(avail.x, avail.y) / (0.5f * ext + 1e-3f);
+        };
 
-    const ImU32 tints[] = {
-        IM_COL32(150, 190, 235, 255), IM_COL32(235, 175, 130, 255),
-        IM_COL32(160, 225, 165, 255), IM_COL32(225, 155, 200, 255),
-    };
+        // ---- render the pane offscreen, with a real depth buffer -------------
+        const float clearCol[4] = { 14 / 255.0f, 16 / 255.0f, 20 / 255.0f, 1.0f };
+        ctx->ClearRenderTargetView(gpu.rtv, clearCol);
+        ctx->ClearDepthStencilView(gpu.dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+        if (gpu.vb && gpu.ib) {
+            ID3D11RenderTargetView* rtvs[1] = { gpu.rtv };
+            ctx->OMSetRenderTargets(1, rtvs, gpu.dsv);
+            D3D11_VIEWPORT vp = {};
+            vp.Width = (float)gpu.texW; vp.Height = (float)gpu.texH; vp.MaxDepth = 1.0f;
+            ctx->RSSetViewports(1, &vp);
+            UINT stride = sizeof(MeshGpu::Vert), voff = 0;
+            ctx->IASetInputLayout(gpu.layout);
+            ctx->IASetVertexBuffers(0, 1, &gpu.vb, &stride, &voff);
+            ctx->IASetIndexBuffer(gpu.ib, DXGI_FORMAT_R32_UINT, 0);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx->VSSetShader(gpu.vs, nullptr, 0);
+            ctx->PSSetShader(gpu.ps, nullptr, 0);
+            ctx->GSSetShader(nullptr, nullptr, 0);
+            ctx->HSSetShader(nullptr, nullptr, 0);
+            ctx->DSSetShader(nullptr, nullptr, 0);
+            ctx->VSSetConstantBuffers(0, 1, &gpu.cb);
+            ctx->PSSetConstantBuffers(0, 1, &gpu.cb);
+            ctx->PSSetSamplers(0, 1, &gpu.samp);
+            const float bf[4] = { 0, 0, 0, 0 };
+            ctx->OMSetBlendState(gpu.blend, bf, 0xffffffff);
+            ctx->RSSetState(gpu.rsSolid);
+            ctx->OMSetDepthStencilState(gpu.dsSolid, 0);
 
-    // rotate every vertex once, project to screen + keep depth
-    struct SV { ImVec2 s; float d; float X, Y, Z; };
-    // collect all triangles across meshes into one depth-sorted list (painter's algo)
-    struct Tri { int mi; ImVec2 a, b, c; float depth; float shade; float ua, va, ub, vb, uc, vc; };
-    std::vector<Tri> tris;
-    std::vector<std::vector<SV>> proj(meshes.size());
-    for (size_t mi = 0; mi < meshes.size(); ++mi) {
-        const MeshGeom& m = meshes[mi];
-        proj[mi].resize(m.nverts);
-        for (int i = 0; i < m.nverts; ++i) {
-            float X, Y, Z;
-            rot(m.verts[(size_t)i*3+0] - mid[0], m.verts[(size_t)i*3+1] - mid[1],
-                m.verts[(size_t)i*3+2] - mid[2], X, Y, Z);
-            SV sv;
-            sv.X = X; sv.Y = Y; sv.Z = Z; sv.d = Z;
-            sv.s = ImVec2(center.x + X * scale * view.zoom, center.y - Y * scale * view.zoom);
-            proj[mi][i] = sv;
-        }
-        for (int f = 0; f < m.nfaces; ++f) {
-            int ia = m.faces[(size_t)f*3+0], ib = m.faces[(size_t)f*3+1], ic = m.faces[(size_t)f*3+2];
-            if (ia < 0 || ib < 0 || ic < 0 || ia >= m.nverts || ib >= m.nverts || ic >= m.nverts) continue;
-            const SV& A = proj[mi][ia]; const SV& B = proj[mi][ib]; const SV& C = proj[mi][ic];
-            // face normal in rotated space -> Z component = facing the viewer
-            float ux = B.X - A.X, uy = B.Y - A.Y, uz = B.Z - A.Z;
-            float vx = C.X - A.X, vy = C.Y - A.Y, vz = C.Z - A.Z;
-            float nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
-            float nl = std::sqrt(nx*nx + ny*ny + nz*nz) + 1e-9f;
-            float facing = nz / nl;                       // -1..1, +1 = toward viewer
-            Tri t;
-            t.mi = (int)mi;
-            t.a = A.s; t.b = B.s; t.c = C.s;
-            t.depth = (A.d + B.d + C.d) / 3.0f;
-            t.shade = 0.30f + 0.70f * std::fabs(facing);  // two-sided lambert
-            if ((int)m.uvs.size() >= 2 * m.nverts) {
-                t.ua = m.uvs[(size_t)ia*2]; t.va = m.uvs[(size_t)ia*2+1];
-                t.ub = m.uvs[(size_t)ib*2]; t.vb = m.uvs[(size_t)ib*2+1];
-                t.uc = m.uvs[(size_t)ic*2]; t.vc = m.uvs[(size_t)ic*2+1];
-            } else { t.ua = t.va = t.ub = t.vb = t.uc = t.vc = 0.0f; }
-            tris.push_back(t);
+            static const float tints[4][3] = {
+                { 150 / 255.0f, 190 / 255.0f, 235 / 255.0f },
+                { 235 / 255.0f, 175 / 255.0f, 130 / 255.0f },
+                { 160 / 255.0f, 225 / 255.0f, 165 / 255.0f },
+                { 225 / 255.0f, 155 / 255.0f, 200 / 255.0f },
+            };
+            size_t n = std::min(gpu.ranges.size(), meshes.size());
+            for (size_t mi = 0; mi < n; ++mi) {
+                const MeshGpu::Range& r = gpu.ranges[mi];
+                if (!r.indexCount) continue;
+                // Which skin this mesh wears (mesh -> material -> texture). A mesh
+                // with no UVs can't be textured however good its skin, so it stays grey.
+                ID3D11ShaderResourceView* skinSrv = nullptr;
+                if (view.colorBy == 3) {
+                    const Skin* sk = skins.skinFor(meshes[mi].material);
+                    if (sk && sk->srv && (int)meshes[mi].uvs.size() >= 2 * meshes[mi].nverts)
+                        skinSrv = sk->srv;
+                }
+                float rgba[4] = { 180 / 255.0f, 185 / 255.0f, 195 / 255.0f, 1.0f };
+                float mode = 0.0f;
+                if (skinSrv) {
+                    // White base modulated by the lambert term, so the shading scales
+                    // the skin instead of replacing it (what the old vertex colour did).
+                    rgba[0] = rgba[1] = rgba[2] = 1.0f;
+                    mode = 3.0f;
+                } else if (view.colorBy == 1) {
+                    for (int k = 0; k < 3; ++k) rgba[k] = tints[mi % 4][k];
+                } else if (view.colorBy == 2) {
+                    mode = 2.0f;
+                }
+                setCB(rgba, view.shade ? 1.0f : 0.0f, mode);
+                ID3D11ShaderResourceView* srvs[1] = { skinSrv };
+                ctx->PSSetShaderResources(0, 1, srvs);
+                ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
+            }
+
+            if (view.wire) {
+                // A second, depth-tested wireframe pass: nearer faces hide farther
+                // edges for real now, instead of relying on the fill/wire interleave
+                // that the painter's-algorithm version needed.
+                ctx->RSSetState(gpu.rsWire);
+                ctx->OMSetDepthStencilState(gpu.dsWire, 0);
+                ID3D11ShaderResourceView* none[1] = { nullptr };
+                ctx->PSSetShaderResources(0, 1, none);
+                const float wireCol[4] = { 30 / 255.0f, 30 / 255.0f, 36 / 255.0f, 120 / 255.0f };
+                setCB(wireCol, 0.0f, 0.0f);
+                for (size_t mi = 0; mi < n; ++mi) {
+                    const MeshGpu::Range& r = gpu.ranges[mi];
+                    if (r.indexCount) ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
+                }
+            }
+
+            // Unbind before ImGui samples this very texture as an SRV later in the frame.
+            ID3D11ShaderResourceView* none[1] = { nullptr };
+            ctx->PSSetShaderResources(0, 1, none);
+            ID3D11RenderTargetView* noRtv[1] = { nullptr };
+            ctx->OMSetRenderTargets(1, noRtv, nullptr);
         }
     }
-    // back-to-front so nearer triangles overdraw farther ones
-    std::sort(tris.begin(), tris.end(), [](const Tri& p, const Tri& q){ return p.depth < q.depth; });
 
-    // Which skin each mesh wears (mesh -> material -> texture), resolved once. A mesh
-    // with no UVs can't be textured however good its skin, so drop those to grey.
-    std::vector<ID3D11ShaderResourceView*> meshSrv(meshes.size(), nullptr);
-    if (view.colorBy == 3)
-        for (size_t mi = 0; mi < meshes.size(); ++mi) {
-            const Skin* sk = skins.skinFor(meshes[mi].material);
-            if (sk && sk->srv && (int)meshes[mi].uvs.size() >= 2 * meshes[mi].nverts)
-                meshSrv[mi] = sk->srv;
-        }
-
-    // Textured triangles go through the raw primitive API with per-VERTEX UVs, so the
-    // skin is interpolated across the face rather than sampled once at the centroid
-    // (what the UV-checker placeholder did). ImDrawList batches by texture, so we
-    // push a texture only when it actually changes along the depth order.
-    ID3D11ShaderResourceView* cur = nullptr;
-    for (const Tri& t : tris) {
-        ID3D11ShaderResourceView* want = meshSrv.empty() ? nullptr : meshSrv[t.mi];
-        if (want != cur) {
-            if (cur)  dl->PopTexture();
-            if (want) dl->PushTexture((ImTextureID)(intptr_t)want);
-            cur = want;
-        }
-        float s = view.shade ? t.shade : 1.0f;
-        if (cur) {
-            // White modulated by the lambert term: ImGui multiplies vertex colour by
-            // the texel, so this shades the skin instead of replacing it. The v is
-            // flipped back because Texture::sampleRgb treats v=0 as the image BOTTOM
-            // while the uploaded D3D texture has v=0 at its top row.
-            int g = (int)(255.0f * s);
-            ImU32 col = IM_COL32(g, g, g, 255);
-            dl->PrimReserve(3, 3);
-            dl->PrimVtx(t.a, ImVec2(t.ua, 1.0f - t.va), col);
-            dl->PrimVtx(t.b, ImVec2(t.ub, 1.0f - t.vb), col);
-            dl->PrimVtx(t.c, ImVec2(t.uc, 1.0f - t.vc), col);
-        } else {
-            ImU32 base;
-            if (view.colorBy == 1)        base = tints[t.mi % 4];
-            else if (view.colorBy == 2) {  // UV checker at the triangle centroid
-                float u = (t.ua + t.ub + t.uc) / 3.0f, v = (t.va + t.vb + t.vc) / 3.0f;
-                int cu = (int)std::floor(u * 8.0f), cv = (int)std::floor(v * 8.0f);
-                bool on = ((cu + cv) & 1) != 0;
-                base = on ? IM_COL32(210, 210, 220, 255) : IM_COL32(90, 95, 110, 255);
-            } else                        base = IM_COL32(180, 185, 195, 255);
-            int r = (int)(((base >> IM_COL32_R_SHIFT) & 0xFF) * s);
-            int g = (int)(((base >> IM_COL32_G_SHIFT) & 0xFF) * s);
-            int b = (int)(((base >> IM_COL32_B_SHIFT) & 0xFF) * s);
-            dl->AddTriangleFilled(t.a, t.b, t.c, IM_COL32(r, g, b, 255));
-        }
-        if (view.wire) {
-            // A line is drawn from the atlas' white pixel, so it must NOT inherit a
-            // skin binding (it would come out tinted by whatever texel that UV lands
-            // on). Unbind first; the next textured triangle re-pushes. Wires stay
-            // interleaved with the fills, so nearer faces still hide farther edges.
-            if (cur) { dl->PopTexture(); cur = nullptr; }
-            dl->AddTriangle(t.a, t.b, t.c, IM_COL32(30, 30, 36, 120), 1.0f);
-        }
+    if (ok && gpu.srv) {
+        dl->AddImage((ImTextureID)(intptr_t)gpu.srv, origin, br);
+    } else {
+        dl->AddRectFilled(origin, br, IM_COL32(14, 16, 20, 255));
+        if (!gpu.err.empty())
+            dl->AddText(ImVec2(origin.x + 8.0f, origin.y + 8.0f),
+                        IM_COL32(240, 140, 110, 255), gpu.err.c_str());
     }
-    if (cur) dl->PopTexture();
-    dl->PopClipRect();
 
     int totalTris = 0, totalV = 0;
     for (const auto& m : meshes) { totalTris += m.nfaces; totalV += m.nverts; }
@@ -1287,6 +1723,7 @@ static void drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
             ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.45f, 1.0f),
                                "skin '%s' (%s): %s", sk.name.c_str(),
                                sk.kind.c_str(), sk.err.c_str());
+    return swept;
 }
 
 // --------------------------------------------------------------------------
@@ -1722,16 +2159,31 @@ static void drawDagPanel(DagGraph& g, float availH) {
     // imnodes now knows each node's true rect (its own padding, the DPI-scaled font,
     // the pin rows). Adopt those and re-wrap once — otherwise the first-frame text
     // estimate decides the packing and a column can overhang the bottom of the pane.
+    //
+    // ...but only when the editor actually drew. The pane lives at the bottom of a
+    // scrolling side column, so it is routinely clipped to zero height; imgui then sets
+    // SkipItems on the canvas and every ImGui::Text inside a node returns without
+    // measuring anything. imnodes still reports a rect — the node origin expanded by
+    // NodePadding — and adopting *that* would silently re-pack the graph at 16 px per
+    // node, so the layout is wrong the moment the user scrolls the pane into view. A
+    // node always draws at least its title, so a content width of zero means "not
+    // measured", never "an empty node".
     if (g.realSize.size() != g.nodes.size()) g.realSize.assign(g.nodes.size(), ImVec2(0.0f, 0.0f));
-    bool sizeChanged = false;
-    for (size_t i = 0; i < g.nodes.size(); ++i) {
-        ImVec2 d = ImNodes::GetNodeDimensions(g.nodes[i].id);
-        if (d.x <= 0.0f || d.y <= 0.0f) continue;
-        if (std::fabs(d.x - g.realSize[i].x) > 1.0f || std::fabs(d.y - g.realSize[i].y) > 1.0f) {
-            g.realSize[i] = d;
-            sizeChanged = true;
-        }
+    const float minRealW = nodePad.x * 2.0f * g.zoom + 1.0f;
+    std::vector<ImVec2> fresh(g.nodes.size());
+    bool measured = true;
+    for (size_t i = 0; i < g.nodes.size() && measured; ++i) {
+        fresh[i] = ImNodes::GetNodeDimensions(g.nodes[i].id);
+        measured = fresh[i].x > minRealW && fresh[i].y > 0.0f;
     }
+    bool sizeChanged = false;
+    if (measured)
+        for (size_t i = 0; i < g.nodes.size(); ++i)
+            if (std::fabs(fresh[i].x - g.realSize[i].x) > 1.0f ||
+                std::fabs(fresh[i].y - g.realSize[i].y) > 1.0f) {
+                g.realSize[i] = fresh[i];
+                sizeChanged = true;
+            }
     if (sizeChanged) { g.sizesValid = true; g.pos.clear(); }   // re-measure next frame
 
     // "fit": iterate zoom towards the scale at which the whole graph is on screen.
@@ -1740,7 +2192,7 @@ static void drawDagPanel(DagGraph& g, float availH) {
     // Each step waits for the layout to settle (node rects stable, positions current),
     // otherwise it compounds a correction that hasn't taken effect yet and collapses the
     // graph to a speck.
-    const bool settled = !sizeChanged && g.pos.size() == g.nodes.size();
+    const bool settled = measured && !sizeChanged && g.pos.size() == g.nodes.size();
     if (g.fitFrames > 0 && settled && g.extent.x > 1.0f && g.extent.y > 1.0f) {
         --g.fitFrames;
         // Only the width is a real constraint: the wrap already pins the height to the
@@ -1860,20 +2312,23 @@ struct RenderPane {
 };
 
 // The Render tab body: orbit controls + the blitted raymarch image.
-static void drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
+static bool drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
                            const std::string& sceneErr,
-                           ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+                           ID3D11Device* dev, ID3D11DeviceContext* ctx,
+                           LivePanel* live) {
+    bool swept = false;   // the parameter axis moved -> loom must re-derive the field
     if (!sceneOk) {
         ImGui::TextWrapped("No live scene to raymarch.");
         if (!sceneErr.empty()) ImGui::TextWrapped("(%s)", sceneErr.c_str());
         ImGui::TextWrapped("The sidecar carries no `source` .ftsl (older loom, or "
                            "emit_source was off). Re-save it with a current loom to "
                            "enable the in-process field raymarch.");
-        return;
+        return false;
     }
     if (!rp.inited) rp.initFrom(scene);
 
     ImGui::TextUnformatted("GPU field raymarch (renderIsoPreviewCuda) - drag to orbit, wheel to zoom");
+    liveSweepHint(live);
     ImGui::SetNextItemWidth(120);
     if (ImGui::SliderInt("res", &rp.resLong, 128, 1024)) rp.dirty = true;
     ImGui::SameLine();
@@ -1886,7 +2341,9 @@ static void drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.y < 80.0f) avail.y = 80.0f;
     ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton("render_canvas", avail);
+    ImGui::InvisibleButton("render_canvas", avail,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    swept = liveSweepDrag(live);   // right-drag: rotate INTO the parameter dimension
     if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         ImVec2 d = ImGui::GetIO().MouseDelta;
         rp.yaw   -= d.x * 0.01f;
@@ -1913,13 +2370,459 @@ static void drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
         ImGui::GetWindowDrawList()->AddRectFilled(
             origin, ImVec2(origin.x + avail.x, origin.y + avail.y), IM_COL32(18, 18, 22, 255));
     }
+    return swept;
 }
 #endif // HAVE_CUDA
 
 // --------------------------------------------------------------------------
+// F4 item 2 — the live re-introspection link and its latest-wins job queue.
+//
+// A frozen sidecar can *display* geometry but cannot **re-derive** it. Orbiting
+// the three shown spatial dims is a view-only re-projection (drawMeshPane says so
+// in its own banner), but rotating into a **parameter dimension** — moving along
+// one of the build's declared keyword params, or along the clock — changes the
+// geometry itself, so the surface has to be re-tessellated by loom. That is what
+// this section wires up: the C++ half of the §F4/§F7 channel whose loom half is
+// `loom.viewer.ViewerSession` / `serve_viewer`.
+//
+//   * LoomLink   — spawns `python -m loom.viewer <scene.py>` and does one
+//                  newline-delimited-JSON request/ack round trip over its pipes.
+//                  Touched ONLY by the worker thread once the bridge is running.
+//   * LoomBridge — that worker thread plus a **one-slot** pending job. Posting
+//                  overwrites whatever was queued, so a fast param drag leaves at
+//                  most one job in flight and one waiting; the values swept through
+//                  in between are dropped rather than queued into a backlog the
+//                  user would then have to sit through frame by frame. That is the
+//                  latest-wins rule, and it is the whole reason this is a queue and
+//                  not a plain synchronous call.
+//   * LivePanel  — the UI: connection state, a clock scrub, one control per
+//                  declared param, and a chosen **sweep axis** that the mesh /
+//                  render canvas drags along with the right mouse button.
+//
+// Re-derivation is not free (a marching-cubes IsoMesh bake is comfortably a
+// second), so the UI never blocks on it: it posts, keeps drawing the geometry it
+// already has, and folds a result in on whatever frame it lands.
+// --------------------------------------------------------------------------
+
+// The transport itself (the pipes, the PYTHONPATH-augmented child environment, one
+// JSON round trip per call) is shared with the fly editor's E2 live channel and now
+// lives in loomlink.h; what stays here is only the viewer's own job policy.
+using loomlink::jsonEsc;
+using LoomLink = loomlink::Link;
+
+// One re-derivation request. `params` values are raw JSON text so any declared type
+// round-trips unchanged (an int stays `8`, not `8.0` — see loom's `types` ack).
+struct LoomJob {
+    long long seq = 0;
+    int  frame = 0, frames = 1;
+    std::vector<std::pair<std::string, std::string>> params;
+    bool wantSidecar = true;    // re-introspect: curves / fields / MESH geometry
+    bool wantSource  = true;    // re-emit .ftsl: the Render tab's raymarched field
+};
+
+struct LoomResult {
+    long long   seq = 0;
+    bool        ok  = false;
+    std::string err;
+    std::string sidecarPath;    // temp file loom wrote (empty when not requested)
+    std::string sourcePath;
+    double      ms = 0.0;
+};
+
+struct LoomBridge {
+    LoomBridge() = default;
+    // Owns a thread, a child process and three handles: not copyable, and destroying it
+    // MUST stop the worker. `runViewerGui` has early returns after the bridge is
+    // started (the D3D-device failure path), and ~std::thread on a joinable thread
+    // calls std::terminate — an "the device didn't come up" message would have become
+    // an abort instead.
+    LoomBridge(const LoomBridge&) = delete;
+    LoomBridge& operator=(const LoomBridge&) = delete;
+    ~LoomBridge() { stop(); }
+
+    // ---- UI thread ----
+    bool start(const std::string& scenePy, std::string& err) {
+        if (!link_.start("loom.viewer", scenePy, {}, err)) return false;
+        // Ask for the controls synchronously, before the worker owns the link.
+        minijson::Value ack;
+        if (!link_.call("{\"cmd\":\"params\"}", ack, err)) { link_.stop(); return false; }
+        if (const minijson::Value* p = ack.find("params"); p && p->isObject())
+            for (const auto& kv : p->obj) paramDefaults_.push_back({kv.first, kv.second});
+        if (const minijson::Value* t = ack.find("types"); t && t->isObject())
+            for (const auto& kv : t->obj) paramTypes_[kv.first] = kv.second.asString("float");
+        if (!makeTempDir(err)) { link_.stop(); return false; }
+        worker_ = std::thread([this] { workerMain(); });
+        return true;
+    }
+
+    // Idempotent: the destructor calls it too, and an explicit stop() before the
+    // viewer's normal teardown is still the common path.
+    void stop() {
+        if (worker_.joinable()) {
+            { std::lock_guard<std::mutex> lk(m_); quit_ = true; }
+            cv_.notify_one();
+            worker_.join();
+        }
+        link_.stop();
+        if (!tempDir_.empty()) {
+            std::lock_guard<std::mutex> lk(m_);
+            for (const auto& f : temps_) DeleteFileA(f.c_str());
+            temps_.clear();
+            // Sweep the whole scratch directory, not just the files we named: emitting
+            // an .ftsl also drops the mesh assets it references (loom's `asset_path`
+            // writes .obj next to `out`), and RemoveDirectory fails on a non-empty dir.
+            WIN32_FIND_DATAA fd{};
+            HANDLE h = FindFirstFileA((tempDir_ + "\\*").c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    DeleteFileA((tempDir_ + "\\" + fd.cFileName).c_str());
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+            RemoveDirectoryA(tempDir_.c_str());
+            tempDir_.clear();
+        }
+    }
+
+    // LATEST WINS: this overwrites any job that has not started yet.
+    void post(LoomJob j) {
+        std::lock_guard<std::mutex> lk(m_);
+        j.seq = ++seq_;
+        pending_ = std::move(j);
+        hasPending_ = true;
+        cv_.notify_one();
+    }
+
+    bool take(LoomResult& out) {
+        std::lock_guard<std::mutex> lk(m_);
+        if (!hasResult_) return false;
+        out = result_;
+        hasResult_ = false;
+        return true;
+    }
+
+    // "a re-derivation is happening or is about to" — drives the UI's spinner and
+    // keeps a drag from being reported as idle between two jobs.
+    bool busy() const {
+        std::lock_guard<std::mutex> lk(m_);
+        return running_ || hasPending_;
+    }
+    bool linkUp() const {
+        std::lock_guard<std::mutex> lk(m_);
+        return !dead_;
+    }
+    std::string deadReason() const {
+        std::lock_guard<std::mutex> lk(m_);
+        return deadErr_;
+    }
+    const std::vector<std::pair<std::string, minijson::Value>>& paramDefaults() const {
+        return paramDefaults_;
+    }
+    std::string paramType(const std::string& name) const {
+        auto it = paramTypes_.find(name);
+        return it == paramTypes_.end() ? std::string("float") : it->second;
+    }
+    const std::string& command() const { return link_.cmdline; }
+
+    // temp scratch files the UI has finished reading
+    void reap(const std::string& path) {
+        if (path.empty()) return;
+        DeleteFileA(path.c_str());
+        std::lock_guard<std::mutex> lk(m_);
+        forgetLocked(path);
+    }
+
+private:
+    // `temps_` is the outstanding-scratch-file set, not a log: a long sweep posts
+    // hundreds of jobs, so entries must leave it as the files are deleted or it (and
+    // the %TEMP% directory it mirrors) would grow without bound for the session.
+    void forgetLocked(const std::string& path) {
+        for (size_t i = 0; i < temps_.size(); ++i)
+            if (temps_[i] == path) { temps_[i] = temps_.back(); temps_.pop_back(); return; }
+    }
+
+    void dropLocked(const std::string& path) {
+        if (path.empty()) return;
+        DeleteFileA(path.c_str());
+        forgetLocked(path);
+    }
+
+    // Delete `ftrace_viewer_<pid>` directories left behind by viewers that died without
+    // running stop() — a crash, or the user killing the process. `stop()` handles the
+    // orderly exit, but nothing can clean up after a kill except the *next* run, and a
+    // scene bake drops a multi-megabyte sidecar plus its .obj assets each time, so
+    // without this %TEMP% accumulates them for as long as the machine stands. A PID is
+    // reused eventually, hence the liveness probe rather than an age heuristic:
+    // OpenProcess failing with ERROR_INVALID_PARAMETER is Windows saying "no such pid".
+    static void sweepOrphanTempDirs(const char* tmp) {
+        char pat[MAX_PATH + 64];
+        std::snprintf(pat, sizeof pat, "%sftrace_viewer_*", tmp);
+        WIN32_FIND_DATAA fd{};
+        HANDLE h = FindFirstFileA(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            const char* pidTxt = std::strrchr(fd.cFileName, '_');
+            if (!pidTxt || !pidTxt[1]) continue;
+            const DWORD pid = (DWORD)std::strtoul(pidTxt + 1, nullptr, 10);
+            if (pid == 0 || pid == GetCurrentProcessId()) continue;
+            HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (ph) { CloseHandle(ph); continue; }               // still running: leave it
+            if (GetLastError() != ERROR_INVALID_PARAMETER) continue;  // exists, just not ours
+            std::string dir = std::string(tmp) + fd.cFileName;
+            WIN32_FIND_DATAA f2{};
+            HANDLE h2 = FindFirstFileA((dir + "\\*").c_str(), &f2);
+            if (h2 != INVALID_HANDLE_VALUE) {
+                do {
+                    if (f2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    DeleteFileA((dir + "\\" + f2.cFileName).c_str());
+                } while (FindNextFileA(h2, &f2));
+                FindClose(h2);
+            }
+            RemoveDirectoryA(dir.c_str());
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+
+    bool makeTempDir(std::string& err) {
+        char tmp[MAX_PATH + 1];
+        DWORD n = GetTempPathA(MAX_PATH, tmp);
+        if (n == 0 || n > MAX_PATH) { err = "GetTempPath failed"; return false; }
+        sweepOrphanTempDirs(tmp);
+        char dir[MAX_PATH + 64];
+        std::snprintf(dir, sizeof dir, "%sftrace_viewer_%lu", tmp, GetCurrentProcessId());
+        if (!CreateDirectoryA(dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+            err = "cannot create the viewer scratch directory"; return false;
+        }
+        tempDir_ = dir;
+        return true;
+    }
+
+    // Called on the worker thread, so the bookkeeping must take the lock (tempDir_ is
+    // written once, before the worker exists, and is only cleared after it is joined).
+    std::string scratch(long long seq, const char* ext) {
+        char b[MAX_PATH + 64];
+        std::snprintf(b, sizeof b, "%s\\live_%lld%s", tempDir_.c_str(), seq, ext);
+        std::string p = b;
+        { std::lock_guard<std::mutex> lk(m_); temps_.push_back(p); }
+        return p;
+    }
+
+    std::string requestLine(const char* cmd, const LoomJob& j, const std::string& out) {
+        std::string s = "{\"cmd\":\"";
+        s += cmd;
+        s += "\",\"clock\":{\"frame\":" + std::to_string(j.frame)
+           + ",\"frames\":" + std::to_string(j.frames) + "},\"params\":{";
+        for (size_t i = 0; i < j.params.size(); ++i) {
+            if (i) s += ",";
+            s += "\"" + jsonEsc(j.params[i].first) + "\":" + j.params[i].second;
+        }
+        s += "},\"out\":\"" + jsonEsc(out) + "\"}";
+        return s;
+    }
+
+    void workerMain() {
+        for (;;) {
+            LoomJob job;
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [this] { return quit_ || hasPending_; });
+                if (quit_) return;
+                job = pending_;
+                hasPending_ = false;     // whatever else was posted meanwhile is gone
+                running_ = true;
+            }
+            LoomResult r;
+            r.seq = job.seq;
+            LARGE_INTEGER f, t0, t1;
+            QueryPerformanceFrequency(&f);
+            QueryPerformanceCounter(&t0);
+            std::string err;
+            bool ok = true;
+            minijson::Value ack;
+            // A failed request may still have left a partial file behind: drop it here
+            // rather than let it sit in temps_ until the viewer exits.
+            if (ok && job.wantSidecar) {
+                std::string out = scratch(job.seq, ".json");
+                ok = link_.call(requestLine("introspect", job, out), ack, err);
+                if (ok) r.sidecarPath = out;
+                else { std::lock_guard<std::mutex> lk(m_); dropLocked(out); }
+            }
+            if (ok && job.wantSource) {
+                std::string out = scratch(job.seq, ".ftsl");
+                ok = link_.call(requestLine("emit", job, out), ack, err);
+                if (ok) r.sourcePath = out;
+                else { std::lock_guard<std::mutex> lk(m_); dropLocked(out); }
+            }
+            QueryPerformanceCounter(&t1);
+            r.ms = f.QuadPart ? 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart) : 0.0;
+            r.ok = ok;
+            r.err = err;
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                // A result must never overwrite a FRESHER one the UI has not read yet;
+                // with one job in flight at a time that can't happen, but the guard
+                // makes the invariant explicit rather than incidental.
+                if (!hasResult_ || r.seq >= result_.seq) {
+                    // Superseding an unread result: the UI will never call reap() for
+                    // its files, so they have to go here or a fast sweep leaves one
+                    // scratch pair per skipped bake behind in %TEMP%.
+                    if (hasResult_) {
+                        dropLocked(result_.sidecarPath);
+                        dropLocked(result_.sourcePath);
+                    }
+                    result_ = r;
+                    hasResult_ = true;
+                } else {
+                    dropLocked(r.sidecarPath);
+                    dropLocked(r.sourcePath);
+                }
+                running_ = false;
+                if (!ok && !link_.alive()) { dead_ = true; deadErr_ = err; }
+            }
+        }
+    }
+
+    LoomLink link_;
+    std::thread worker_;
+    mutable std::mutex m_;
+    std::condition_variable cv_;
+    LoomJob    pending_;
+    LoomResult result_;
+    bool hasPending_ = false, hasResult_ = false, running_ = false, quit_ = false;
+    bool dead_ = false;
+    std::string deadErr_;
+    long long seq_ = 0;
+    std::string tempDir_;
+    std::vector<std::string> temps_;
+    std::vector<std::pair<std::string, minijson::Value>> paramDefaults_;
+    std::map<std::string, std::string> paramTypes_;
+};
+
+// Seed the controls from what loom advertised.
+static void liveSeedParams(LivePanel& lp, const LoomBridge& br) {
+    for (const auto& kv : br.paramDefaults()) {
+        LiveParam p;
+        p.name = kv.first;
+        const std::string ty = br.paramType(kv.first);
+        const minijson::Value& v = kv.second;
+        if (ty == "bool")       { p.kind = 2; p.bval = v.asBool(false); }
+        else if (ty == "int")   { p.kind = 1; p.num  = v.asNumber(0.0); }
+        else if (ty == "float") { p.kind = 0; p.num  = v.asNumber(0.0); }
+        else if (ty == "str")   { p.kind = 3; p.text = "\"" + jsonEsc(v.asString("")) + "\""; }
+        else                    { p.kind = 3; p.text = "null"; }
+        // A drag should cross the interesting range in a screen-width of travel, so
+        // scale it to the default's own magnitude (and never to exactly zero).
+        double mag = std::abs(p.num);
+        p.speed = (p.kind == 1) ? std::max(1.0, mag * 0.02)
+                                : std::max(1e-4, mag * 0.005);
+        lp.params.push_back(std::move(p));
+    }
+    // Default the sweep axis to the first continuous control — the one "rotating into
+    // a parameter dimension" actually means something for.
+    for (size_t i = 0; i < lp.params.size(); ++i)
+        if (lp.params[i].kind == 0 || lp.params[i].kind == 1) { lp.sweep = (int)i; break; }
+}
+
+static LoomJob liveJob(const LivePanel& lp, bool wantSidecar, bool wantSource) {
+    LoomJob j;
+    j.frame = lp.frame;
+    j.frames = std::max(1, lp.frames);
+    j.wantSidecar = wantSidecar;
+    j.wantSource = wantSource;
+    for (const auto& p : lp.params) j.params.push_back({p.name, p.toJson()});
+    return j;
+}
+
+// The left-column "Live (loom)" section. Returns true when something the geometry
+// depends on moved this frame.
+static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
+    bool changed = false;
+    if (!lp.up) {
+        ImGui::TextWrapped("Not connected - the viewer is showing the static sidecar.");
+        if (!lp.startErr.empty())
+            ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "%s", lp.startErr.c_str());
+        ImGui::TextDisabled("Pass -loom <scene.py> (or use a sidecar carrying a `build` "
+                            "key) to re-derive geometry live.");
+        return false;
+    }
+    if (!br.linkUp()) {
+        ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "loom link lost");
+        std::string why = br.deadReason();
+        if (!why.empty()) ImGui::TextWrapped("%s", why.c_str());
+        return false;
+    }
+    ImGui::TextDisabled("%s", br.command().c_str());
+    if (br.busy()) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.5f, 0.9f, 1, 1), "[re-deriving]"); }
+    ImGui::Text("posted %lld / baked %lld", lp.posted, lp.baked);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(last #%lld, %.0f ms)", lp.appliedSeq, lp.lastMs);
+    if (!lp.lastErr.empty())
+        ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "%s", lp.lastErr.c_str());
+
+    // `changed` = a control moved; `forced` = the user asked for it outright. With
+    // auto off, a drag still updates the displayed value but costs no bake until the
+    // button is pressed — which is the point of the switch on a slow scene.
+    bool forced = false;
+    ImGui::Checkbox("auto", &lp.autoApply);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("re-derive on every change; off = only on `re-derive now`");
+    ImGui::SameLine();
+    if (ImGui::Button("re-derive now")) forced = true;
+
+    // --- the clock, which is a parameter dimension like any other ---
+    ImGui::SetNextItemWidth(140);
+    if (ImGui::SliderInt("frame", &lp.frame, 0, std::max(0, lp.frames - 1))) changed = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    if (ImGui::DragInt("frames", &lp.frames, 1.0f, 1, 100000)) {
+        if (lp.frames < 1) lp.frames = 1;
+        if (lp.frame >= lp.frames) lp.frame = lp.frames - 1;
+        changed = true;
+    }
+
+    // --- the build's declared params ---
+    if (lp.params.empty()) {
+        ImGui::TextDisabled("(the build declares no keyword params)");
+    } else {
+        for (size_t i = 0; i < lp.params.size(); ++i) {
+            LiveParam& p = lp.params[i];
+            ImGui::PushID((int)i);
+            bool isAxis = ((int)i == lp.sweep);
+            if (p.kind == 0 || p.kind == 1) {
+                if (ImGui::RadioButton("##axis", isAxis)) lp.sweep = isAxis ? -1 : (int)i;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("make this the canvas sweep axis (right-drag to rotate into it)");
+                ImGui::SameLine();
+            } else {
+                ImGui::Dummy(ImVec2(ImGui::GetFrameHeight(), 0));
+                ImGui::SameLine();
+            }
+            ImGui::SetNextItemWidth(150);
+            if (p.kind == 2) {
+                if (ImGui::Checkbox(p.name.c_str(), &p.bval)) changed = true;
+            } else if (p.kind == 3) {
+                ImGui::LabelText(p.name.c_str(), "%s", p.text.c_str());
+            } else if (p.kind == 1) {
+                int v = (int)llround(p.num);
+                if (ImGui::DragInt(p.name.c_str(), &v, (float)p.speed)) { p.num = v; changed = true; }
+            } else {
+                float v = (float)p.num;
+                if (ImGui::DragFloat(p.name.c_str(), &v, (float)p.speed, 0.0f, 0.0f, "%.4g")) {
+                    p.num = v; changed = true;
+                }
+            }
+            ImGui::PopID();
+        }
+    }
+    return forced || (lp.autoApply && changed);
+}
+
+// --------------------------------------------------------------------------
 // Entry point
 // --------------------------------------------------------------------------
-int runViewerGui(const std::string& sidecarPath) {
+int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
     Sidecar sc;
     if (!sc.load(sidecarPath)) {
         std::fprintf(stderr, "error: -viewer: %s\n", sc.err.c_str());
@@ -1951,7 +2854,35 @@ int runViewerGui(const std::string& sidecarPath) {
     }
 #ifdef HAVE_CUDA
     RenderPane rpane;
+    const bool liveWantSource = true;
+#else
+    // No raymarch pane to feed, so don't make loom emit an .ftsl nobody reads.
+    const bool liveWantSource = false;
 #endif
+
+    // --- F4 item 2: the live re-introspection channel -------------------------
+    // Which loom file to talk to: an explicit `-loom` wins, else the sidecar's own
+    // `build` provenance key (loom records the file its `build()` came from). Neither
+    // present — or python/loom not importable — is NOT an error: the viewer stays
+    // frozen on the static sidecar and the Live panel says exactly why.
+    LoomBridge bridge;
+    LivePanel  live;
+    {
+        if (const minijson::Value* fr = sc.root.find("frame"); fr && fr->isObject()) {
+            live.frame  = fr->intAt("frame", 0);
+            live.frames = std::max(1, fr->intAt("frames", 1));
+        }
+        const std::string scenePy = loomScene.empty() ? sc.buildFile() : loomScene;
+        if (!scenePy.empty()) {
+            if (bridge.start(scenePy, live.startErr)) {
+                live.up = true;
+                liveSeedParams(live, bridge);
+            } else {
+                std::fprintf(stderr, "[viewer] live channel unavailable: %s\n",
+                             live.startErr.c_str());
+            }
+        }
+    }
 
     // --- window ---
     // MUST precede window creation. Without it Windows DPI-*virtualizes* the process on
@@ -1999,13 +2930,62 @@ int runViewerGui(const std::string& sidecarPath) {
 
     // F4 skins — needs the device, so it happens after CreateDeviceD3D. Relative
     // image paths in the sidecar fall back to the sidecar's own directory.
-    SkinLib skins;
+    // baseDir is hoisted out because a live re-derivation rebuilds the skins against
+    // the SAME directory — loom's scratch sidecar lives in %TEMP%, but the image paths
+    // in it are still relative to the original scene, not to the scratch file.
+    std::string baseDir;
     {
-        std::string baseDir;
         size_t cut = sidecarPath.find_last_of("/\\");
         if (cut != std::string::npos) baseDir = sidecarPath.substr(0, cut + 1);
-        skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
     }
+    SkinLib skins;
+    skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
+
+    // Fold a freshly re-derived sidecar into the panes (F4 item 2). What loom re-derived
+    // is the GEOMETRY; the VIEW is ours, so orbit / zoom / dim selection / tab choice are
+    // deliberately preserved — a parameter sweep that snapped the camera back to its
+    // default on every bake would be unusable.
+    auto adoptSidecar = [&](const std::string& path) -> bool {
+        Sidecar ns;
+        if (!ns.load(path)) { live.lastErr = "sidecar: " + ns.err; return false; }
+        std::vector<int> oldIds;
+        for (const auto& n : dag.nodes) oldIds.push_back(n.id);
+
+        sc = std::move(ns);
+        curves = collectCurves(sc);
+        strips = buildStrips(curves);
+        fields = collectFields(sc);
+        meshes = collectMeshes(sc);
+        ++mview.geomGen;   // a NEW tessellation -> the mesh pane must re-upload its buffers
+        for (const auto& c : curves) view.maxDim  = std::max(view.maxDim,  c.dim);
+        for (const auto& f : fields) fview.maxDim = std::max(fview.maxDim, f.dim);
+
+        DagGraph nd = collectDag(sc);
+        std::vector<int> newIds;
+        for (const auto& n : nd.nodes) newIds.push_back(n.id);
+        // Same node set = the same graph with new values, so keep the layout the user
+        // panned/zoomed to. A different node set is a different graph: re-lay it out,
+        // carrying over only the docked-vs-maximized choice (which is about the window,
+        // not the graph).
+        if (newIds == oldIds) {
+            nd.pos            = dag.pos;
+            nd.realSize       = dag.realSize;
+            nd.sizesValid     = dag.sizesValid;
+            nd.extent         = dag.extent;
+            nd.measuredFont   = dag.measuredFont;
+            nd.measuredAvailH = dag.measuredAvailH;
+            nd.zoom           = dag.zoom;
+            nd.fitted         = dag.fitted;
+            nd.fitCanvasW     = dag.fitCanvasW;
+            nd.laidOut        = dag.laidOut;
+        }
+        nd.maximized = dag.maximized;
+        dag = std::move(nd);
+
+        skins.release();
+        skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
+        return true;
+    };
 
     bool done = false;
     bool firstFrame = true;   // one-shot: default-select the primary geometry tab
@@ -2017,6 +2997,45 @@ int runViewerGui(const std::string& sidecarPath) {
             if (msg.message == WM_QUIT) done = true;
         }
         if (done) break;
+
+        // Fold in whatever loom finished since the last frame. The UI never waits on a
+        // bake — it keeps drawing the geometry it already has and adopts the new one on
+        // whatever frame it lands.
+        if (live.up) {
+            LoomResult r;
+            if (bridge.take(r)) {
+                live.appliedSeq = r.seq;
+                ++live.baked;
+                live.lastMs  = r.ms;
+                live.lastErr = r.ok ? std::string() : r.err;
+                if (r.ok) {
+                    if (!r.sidecarPath.empty()) adoptSidecar(r.sidecarPath);
+                    if (!r.sourcePath.empty()) {
+                        ftsl::Loaded nl;
+                        std::string  nerr;
+                        if (ftsl::load(r.sourcePath, nl, nerr)) {
+                            loaded  = std::move(nl);
+                            sceneOk = true;
+                            sceneErr.clear();
+#ifdef HAVE_CUDA
+                            // Re-frame on the new bounds but keep yaw/pitch/dist: the
+                            // user's orbit survives the sweep (initFrom touches only
+                            // center/radius, and marks the pane dirty).
+                            rpane.initFrom(loaded.scene);
+#endif
+                        } else {
+                            // A re-derived scene ftrace cannot load is a real error and
+                            // must be said out loud, not silently left on stale geometry.
+                            sceneOk      = false;
+                            sceneErr     = nerr;
+                            live.lastErr = "ftsl: " + nerr;
+                        }
+                    }
+                }
+                bridge.reap(r.sidecarPath);
+                bridge.reap(r.sourcePath);
+            }
+        }
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -2032,8 +3051,13 @@ int runViewerGui(const std::string& sidecarPath) {
         ImGui::Text("sidecar: %s", sidecarPath.c_str());
         ImGui::Separator();
 
+        bool livePost = false;    // something the geometry depends on moved this frame
+
         float leftW = ImGui::GetContentRegionAvail().x * 0.42f;
         ImGui::BeginChild("left", ImVec2(leftW, 0), true);
+        if (ImGui::CollapsingHeader("Live (loom)",
+                                    live.up ? ImGuiTreeNodeFlags_DefaultOpen : 0))
+            livePost = drawLivePanel(live, bridge);
         if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen))
             drawScenePanel(sc);
         if (ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen))
@@ -2097,8 +3121,10 @@ int runViewerGui(const std::string& sidecarPath) {
                 // point of the viewer, so it opens selected.
                 ImGuiTabItemFlags rf = firstFrame ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem("Render", nullptr, rf)) {
-                    drawRenderPane(rpane, loaded.scene, sceneOk, sceneErr,
-                                   g_pd3dDevice, g_pd3dDeviceContext);
+                    if (drawRenderPane(rpane, loaded.scene, sceneOk, sceneErr,
+                                       g_pd3dDevice, g_pd3dDeviceContext,
+                                       live.up ? &live : nullptr) && live.autoApply)
+                        livePost = true;
                     ImGui::EndTabItem();
                 }
             }
@@ -2127,7 +3153,10 @@ int runViewerGui(const std::string& sidecarPath) {
                 // unless the live Render tab is present, which takes priority.
                 ImGuiTabItemFlags mf = (firstFrame && !haveRender) ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem("Meshes", nullptr, mf)) {
-                    drawMeshPane(meshes, mview, skins);
+                    if (drawMeshPane(meshes, mview, skins, live.up ? &live : nullptr,
+                                     g_pd3dDevice, g_pd3dDeviceContext)
+                        && live.autoApply)
+                        livePost = true;
                     ImGui::EndTabItem();
                 }
             }
@@ -2167,6 +3196,14 @@ int runViewerGui(const std::string& sidecarPath) {
             if (!open || ImGui::IsKeyPressed(ImGuiKey_Escape)) dag.maximized = false;
         }
 
+        // At most one post per frame, and posting OVERWRITES any job that has not
+        // started: a fast sweep drag therefore costs one bake of wherever the user
+        // ends up, not one bake per intermediate frame. That is the latest-wins rule.
+        if (livePost && live.up && bridge.linkUp()) {
+            bridge.post(liveJob(live, /*wantSidecar=*/true, liveWantSource));
+            ++live.posted;
+        }
+
         ImGui::Render();
         const float clear[4] = { 0.10f, 0.10f, 0.12f, 1.0f };
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRTV, nullptr);
@@ -2176,10 +3213,14 @@ int runViewerGui(const std::string& sidecarPath) {
         firstFrame = false;
     }
 
+    // Ask loom to quit and join the worker BEFORE tearing D3D down — a result landing
+    // mid-shutdown would otherwise rebuild skins against a released device.
+    bridge.stop();
 #ifdef HAVE_CUDA
     rpane.release();   // free the raymarch texture before the D3D device goes away
 #endif
     skins.release();   // ditto for the F4 skin textures
+    mview.gpu.release();   // and the mesh pane's shaders / buffers / offscreen target
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImNodes::DestroyContext();

@@ -49,12 +49,24 @@ STRING  = /"[^"]*"/                                 # quoted name / path / expre
 # would happily swallow `(a) roughness 0.2` up to a later `)` in a *different* statement —
 # a silently wrong parse.  Balanced matching stops dead at the closing paren.
 # Regexes cannot count, so nesting is written out to depth 4:
-#     interior := [^\r\n(){}[]#"]                 (spaces yes, structure no)
+#     interior := [^\r\n(){}#"]                   (spaces yes, parens/braces no)
 #     G1 := \( interior* \)   G(k+1) := \( (interior|Gk)* \)
 # Depth is not a real ceiling: WORD below is `(G|wordchar)+` and a wordchar still matches
 # a bare paren, so an expression nested deeper simply falls back to today's behaviour
 # (outer parens consumed as ordinary chars, G covering the innermost spaced group).
-PARENWORD = /\((?:[^\r\n(){}\[\]#"]|\((?:[^\r\n(){}\[\]#"]|\((?:[^\r\n(){}\[\]#"]|\([^\r\n(){}\[\]#"]*\))*\))*\))*\)/
+#
+# `[` and `]` ARE interior characters (they were excluded until 0.100.0), so a sample call
+# can carry a COMPOSED coordinate whose driver is itself an array literal —
+# `[0 1]([0.2 0.8](u))`, TODO.md's `coord = NAME | NUMBER | value`.  Without this the
+# inner literal's brackets split the token and the outer literal reported the (very
+# misleading) *unsaturated* error.  This does NOT weaken the balance guarantee above,
+# which rests entirely on `)` and `(` staying OUT of the interior class: two paren groups
+# on one line still cannot merge, because merging would have to consume the intervening
+# `)` as an interior char.  Brackets inside the group are therefore captured but not
+# balance-checked by the lexer -- the loader parses the argument text and reports an
+# unbalanced one against the author's own source (see desugarNestedLiterals in ftsl.h),
+# which gives a far better message than a token that silently fails to match.
+PARENWORD = /\((?:[^\r\n(){}#"]|\((?:[^\r\n(){}#"]|\((?:[^\r\n(){}#"]|\([^\r\n(){}#"]*\))*\))*\))*\)/
 # A strtod-complete numeric literal (ftrace's isNumber): a value *continuation*.
 # `0-1` / `1-2` are NOT numbers (strtod stops at the inner dash) — longest-match
 # then makes them plain WORDs, exactly as ftrace's isNumber returns false.
@@ -75,7 +87,15 @@ KVWORD  = /[^ \t\r\n{}\[\]#"=]+=[^ \t\r\n{}\[\]#"]*/
 # every token that lexed before still lexes identically — the group alternative can only
 # ever EXTEND a token across a space that sits inside parens, which previously truncated
 # the value mid-expression and raised "missing ')'".
-WORD    = /(?:\((?:[^\r\n(){}\[\]#"]|\((?:[^\r\n(){}\[\]#"]|\((?:[^\r\n(){}\[\]#"]|\([^\r\n(){}\[\]#"]*\))*\))*\))*\)|[^ \t\r\n{}\[\]#"])+/
+#
+# The group alternative is now character-for-character PARENWORD's body, brackets included
+# (0.100.0), so a NAMED table's sample call can carry a composed array literal exactly as an
+# inline literal's can: `reflect grid:ramp([0.2 0.8](u))`.  Only the group interior admits
+# `[` / `]` — the fallback class below still excludes them, so a bracket OUTSIDE parens is
+# a delimiter as it always was, and `REC.chan[2]` still stops the word at the `[`.  Two
+# tokens on one line cannot merge for the same reason PARENWORD's cannot: merging would
+# have to consume the intervening `)` as an interior char, and `)` is excluded.
+WORD    = /(?:\((?:[^\r\n(){}#"]|\((?:[^\r\n(){}#"]|\((?:[^\r\n(){}#"]|\([^\r\n(){}#"]*\))*\))*\))*\)|[^ \t\r\n{}\[\]#"])+/
 
 # ---- file = a list of top-level blocks (newlines optional between) ---
 scene_file = item*

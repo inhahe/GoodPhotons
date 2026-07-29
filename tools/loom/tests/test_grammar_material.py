@@ -152,11 +152,21 @@ def test_reflect_accepts_texture_bind_and_spectrum():
         .props["reflect"] == "rgb 0.8 0.7 0.2"
 
 
-def test_reflect_rejects_pattern_bind():
-    # `reflect` binds only a UV texture (bindReflectTexture), never a `pattern:` — a
-    # bare pattern ref would fall through to spectrumParam and be rejected.
+def test_reflect_accepts_pattern_bind():
+    # ftrace's reflect slot is pattern-aware (patternedSpectrumParam): a lone
+    # `pattern:<name>` IS the albedo, over a flat 1.0 base.  loom emits this itself for
+    # a FuncPattern-driven material, so its own reader has to read it back.
+    assert parse_element("m = material { type diffuse  reflect pattern:wiggle }") \
+        .props["reflect"] == "pattern:wiggle"
+    assert parse_element("m = material { type filter  transmit pattern:wiggle }") \
+        .props["transmit"] == "pattern:wiggle"
+
+
+def test_transmit_rejects_texture_bind():
+    # Only `reflect` binds an image albedo; a `texture:` anywhere else is an error in
+    # ftrace ("this slot takes a spectrum, not a texture").
     with pytest.raises(ValueError):
-        parse_element("m = material { type diffuse  reflect pattern:wiggle }")
+        parse_element("m = material { type filter  transmit texture:hide }")
 
 
 def test_roughness_accepts_scalar_and_binds():

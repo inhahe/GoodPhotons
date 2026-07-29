@@ -5239,8 +5239,16 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
 // and area/sphere lights only (spot/env/collimated/fog scenes fall back to the CPU
 // via cudaBdptSupported). See bdpt.h for the derivation of every quantity below.
 
-#define BDPT_MAXDEPTH 8
+// Per-thread vertex-stack bound. `kBdptT` is templated on it (MAXD) because the two
+// subpath arrays are THREAD-LOCAL: doubling the depth doubles ~100 B/vertex of local
+// memory, so the default launch must not pay for a depth it will not use. BDPT_MAXDEPTH
+// is the DEFAULT instantiation; BDPT_DEEPDEPTH is the opt-in one that `-max-bounce N`
+// selects for N > 8. A specular cavity (mirror-lined sphere, kaleidoscope, deeply nested
+// dielectrics) needs the deep variant: at 8 edges its recursive images truncate to black.
+#define BDPT_MAXDEPTH  8
+#define BDPT_DEEPDEPTH 64
 #define BDPT_MAXV     (BDPT_MAXDEPTH + 3)   // path[0] endpoint + up to MAXDEPTH surfaces + slack
+#define BDPT_MAXV_OF(d) ((d) + 3)
 enum { BV_CAMERA = 0, BV_LIGHT = 1, BV_SURFACE = 2, BV_MEDIUM = 3 };
 
 // A path vertex. Mirrors bdpt.h Vertex, but stores INDICES (matId into sc.mats,
@@ -6986,7 +6994,7 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
 __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int diffraction,
                                    DVec3 ro, DVec3 rd, double beta, double pdfDir,
                                    const DHeroBundle& hb, int maxDepth, DRng& rng,
-                                   DVertex* path, double* pathSec, int secStride, int& n,
+                                   DVertex* path, double* pathSec, int secStride, int maxV, int& n,
                                    bool importance, const double* betaSecIn, int nUpIn) {
     const Real lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
@@ -7036,7 +7044,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // only the phase direction density; the free-flight distance pdf and transmittance
         // are omitted here AND in dVertexPdf, so they cancel pairwise in every MIS ratio.
         if (mediumEvent) {
-            if (n >= BDPT_MAXV) return;
+            if (n >= maxV) return;
             const DMedium& sm = sc.media[scatterMed];
             DVec3 mpos = ro + rd * (Real)tMed;
             int prevIdx = n - 1;
@@ -7072,7 +7080,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             if (child < 0) return;
             mp = &sc.mats[child]; matId = child;
         }
-        if (n >= BDPT_MAXV) return;
+        if (n >= maxV) return;
         DVertex v;
         v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
         v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
@@ -7266,7 +7274,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 // dCameraPdfDir seed is never used in a retained MIS ratio. Mirrors bdpt.h.
 __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, int diffraction,
                                         int px, int py, const DHeroBundle& hb, int maxDepth,
-                                        DRng& rng, DVertex* path, double* pathSec, int secStride) {
+                                        DRng& rng, DVertex* path, double* pathSec, int secStride,
+                                        int maxV) {
     const Real lambda = hb.lam[0];
     // The camera vertex sees every wavelength at unit throughput: the bundle starts at full
     // width with all secondary throughputs 1 (importance leaves the camera achromatic).
@@ -7295,7 +7304,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         path[0] = c; int n = 1;
         double pdfDir = dCameraPdfDir(cam, ddot(rd, cam.w));   // MIS-irrelevant placeholder
         dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, hb, maxDepth - 1, rng,
-                    path, pathSec, secStride, n, false, betaSec0, 1);
+                    path, pathSec, secStride, maxV, n, false, betaSec0, 1);
         return n;
     }
     c.p = cam.eye;
@@ -7307,13 +7316,14 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     double cosCam = ddot(rd, cam.w);
     double pdfDir = dCameraPdfDir(cam, cosCam);
     dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, hb, maxDepth - 1, rng,
-                path, pathSec, secStride, n, false, betaSec0, hb.C);
+                path, pathSec, secStride, maxV, n, false, betaSec0, hb.C);
     return n;
 }
 // Sample a light subpath. path[0] is the light endpoint (beta = Le).
 __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int diffraction,
                                        const DHeroBundle& hb, int maxDepth,
-                                       DRng& rng, DVertex* path, double* pathSec, int secStride) {
+                                       DRng& rng, DVertex* path, double* pathSec, int secStride,
+                                       int maxV) {
     const Real lambda = hb.lam[0];
     const double invPdfLambda = hb.invPdf[0];
     if (sc.nEmitters == 0 || sc.totalPower <= 0.0) return 0;
@@ -7352,7 +7362,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         betaWalkSec[i] = pathSec[i] * cosLight / (pdfChoice * pdfPos * pdfDir);
     DVec3 ro = y + nOut * (Real)1e-6;
     dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, hb, maxDepth - 1, rng,
-                path, pathSec, secStride, n, true, betaWalkSec, hb.C);
+                path, pathSec, secStride, maxV, n, true, betaWalkSec, hb.C);
     return n;
 }
 
@@ -7727,18 +7737,27 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 // state (8KB stack/thread), so occupancy wins.
 //
 // Templated on NS = the number of SECONDARY hero wavelength slots, so the scalar
-// instantiation (kBdptT<0>) allocates the per-vertex secondary-throughput arrays at one
+// instantiation (kBdptT<0, MAXD>) allocates the per-vertex secondary-throughput arrays at one
 // element and is bit-for-bit the original single-λ kernel: every hero loop it contains has
 // an empty trip count, and every added reject is a max over one value. The hero
-// instantiation (kBdptT<BDPT_NSEC>) pays 2*BDPT_MAXV*BDPT_NSEC doubles (~1.2 KB) of extra
+// instantiation (kBdptT<BDPT_NSEC, MAXD>) pays 2*MAXV*BDPT_NSEC doubles (~1.2 KB) of extra
 // per-thread local state for the bundle.
-template <int NS>
+//
+// Also templated on MAXD = the per-thread vertex-stack depth bound. `eye`/`light` are
+// thread-local arrays of ~100 B DVertex, so this is the one knob that sets the kernel's
+// local-memory footprint: the MAXD = BDPT_MAXDEPTH instantiation is bit-for-bit the
+// original kernel, and the MAXD = BDPT_DEEPDEPTH one is only instantiated — and only
+// launched — when `-max-bounce N` asks for N > BDPT_MAXDEPTH. The connection double-loop
+// below is O(MAXD^2), so the deep variant is genuinely slower per sample; that, plus the
+// local-memory cost, is why it is opt-in rather than the default.
+template <int NS, int MAXD>
 __global__ void __launch_bounds__(128, 3)
 kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                       long long totalSamples, long long chunkSpp, long long sppTotal,
                       long long sampleBase, int resX, int maxDepth,
                       int diffraction, unsigned long long seedBase, int heroC) {
-    enum { SECN = (NS > 0 ? NS : 1) };
+    enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD) };
+    if (maxDepth > MAXD) maxDepth = MAXD;   // device array bound (host picks the variant)
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     const int C = (NS > 0) ? heroC : 1;
@@ -7775,10 +7794,10 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
         }
         const Real lambda = hb.lam[0];
 
-        DVertex eye[BDPT_MAXV], light[BDPT_MAXV];
-        double eyeSec[BDPT_MAXV * SECN], lightSec[BDPT_MAXV * SECN];
-        int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, hb, maxDepth + 1, rng, eye, eyeSec, NS);
-        int nL = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS);
+        DVertex eye[MAXV], light[MAXV];
+        double eyeSec[MAXV * SECN], lightSec[MAXV * SECN];
+        int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, hb, maxDepth + 1, rng, eye, eyeSec, NS, MAXV);
+        int nL = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS, MAXV);
 
         Real cx = cieX(lambda), cy = cieY(lambda), cz = cieZ(lambda);
         Real cxS[SECN], cyS[SECN], czS[SECN];
@@ -9447,6 +9466,37 @@ void cudaGracefulShutdown() {
     teardownLog("cuda: cudaDeviceReset returned");
 }
 
+// --- Emitter shapes the device kernels actually implement ----------------------
+// Single source of truth for the host EmitterShape -> DEmitter::shape mapping, shared
+// by BOTH the support gate below and the DEmitter upload, so the two can never drift.
+// Returns the device shape code, or -1 for a shape the device has no branch for.
+//
+// This is deliberately a CLOSED whitelist that fails SAFE: a shape the kernels don't
+// implement sends the scene to the CPU tracer instead of being coerced into a
+// different shape. It replaces a ternary chain in the upload that ended in `: 0` --
+// "anything I don't recognise is a Quad" -- so a shape added host-side but not yet
+// implemented device-side would reach the kernel as a Quad with a garbage (typically
+// all-zero) origin/u/v basis. Malformed geometry inside a kernel does not fail cleanly:
+// an out-of-range/degenerate sample can fault the display driver and take the whole
+// machine down with it (see the teardown/BSOD logging above), so the mapping must be
+// exhaustive by construction rather than by convention.
+//
+// The switch lists every enumerator and has NO default, so ADDING a new EmitterShape
+// raises a compiler warning here (MSVC C4062) rather than silently falling through;
+// the `return -1` after it is the fail-safe should one slip past anyway.
+static int deviceEmitterShapeCode(EmitterShape s) {
+    switch (s) {
+        case EmitterShape::Quad:     return 0;
+        case EmitterShape::Sphere:   return 1;
+        case EmitterShape::Spot:     return 2;
+        case EmitterShape::Env:      return 3;
+        case EmitterShape::Cylinder: return 4;
+        case EmitterShape::Mesh:     return 5;
+        case EmitterShape::Sun:      return 6;
+    }
+    return -1;   // unknown / newly-added shape: CPU fallback, never a silent coercion
+}
+
 bool cudaForwardSupported(const Scene& scene) {
     // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
     // device too (DImplicit + intersectImplicit); their materials are checked by the
@@ -9549,6 +9599,18 @@ bool cudaForwardSupported(const Scene& scene) {
     // parallel-beam birth branch over the scene cross-section, bkEmitterGeom/bkNeeLight/
     // bkNeeVolume/bkNeeLightRGB do the cone NEE, and the ray-miss paths add the directly-
     // viewed solar disc under the same `specularArrival` gate as the CPU tracer.
+    // Emitter shapes: a shape the device kernels have no branch for must send the scene to
+    // the CPU tracer rather than be coerced into a different shape at upload time. Handing
+    // a kernel an emitter with a zeroed origin/u/v basis does not fail cleanly -- it can
+    // fault the display driver -- so this gate is the safety net for every GPU mode (all
+    // the other *Supported() gates chain to this one).
+    // A Mesh emitter additionally REQUIRES a non-empty triangle CDF: the device sampler's
+    // shape==5 branch indexes em.meshTris unconditionally, and with meshTriN==0 it clamps
+    // to index -1 on a null pointer. Degenerate/empty mesh lights therefore go to the CPU.
+    for (const auto& e : scene.emitters) {
+        if (deviceEmitterShapeCode(e.shape) < 0) return false;
+        if (e.shape == EmitterShape::Mesh && e.meshTris.empty()) return false;
+    }
     return true;
 }
 
@@ -9960,12 +10022,21 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.beamDir = {e.beamDir.x, e.beamDir.y, e.beamDir.z};
         de.area = e.area; de.power = e.power;
         de.collimated = e.collimated ? 1 : 0;
-        de.shape = (e.shape == EmitterShape::Sphere)   ? 1
-                 : (e.shape == EmitterShape::Spot)     ? 2
-                 : (e.shape == EmitterShape::Env)      ? 3
-                 : (e.shape == EmitterShape::Cylinder) ? 4
-                 : (e.shape == EmitterShape::Mesh)     ? 5
-                 : (e.shape == EmitterShape::Sun)      ? 6 : 0;
+        // Shared whitelist (see deviceEmitterShapeCode) -- NEVER coerce an unknown shape to
+        // a Quad here. cudaForwardSupported() already rejects such a scene, so reaching this
+        // branch means the gate and the upload have drifted apart: say so loudly and emit a
+        // dead emitter (zero power/area, so it is never selected) instead of feeding the
+        // kernel a zeroed-basis Quad that could fault the display driver.
+        int shapeCode = deviceEmitterShapeCode(e.shape);
+        if (shapeCode < 0) {
+            std::fprintf(stderr,
+                "[cuda] INTERNAL: emitter shape %d has no device implementation; "
+                "disabling this emitter (the GPU support gate should have prevented this)\n",
+                (int)e.shape);
+            shapeCode = 0;
+            de.area = 0.0; de.power = 0.0;
+        }
+        de.shape = shapeCode;
         de.radius = e.radius;
         de.caps = e.caps ? 1 : 0;
         // Mesh area light: upload this emitter's triangle CDF to the device and point the
@@ -9989,6 +10060,15 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             }
             de.meshTris = (const DEmitTri*)keep(uploadVec(dtris));
             de.meshTriN = (int)dtris.size();
+        }
+        // Same fail-safe for the other half of the mesh contract: shape 5 with no triangles
+        // would have the device sampler clamp to index -1 on a null pointer. The gate above
+        // rejects such a scene, so this only fires if the two ever drift apart.
+        if (de.shape == 5 && de.meshTriN == 0) {
+            std::fprintf(stderr,
+                "[cuda] INTERNAL: mesh emitter has no triangles; disabling it "
+                "(the GPU support gate should have prevented this)\n");
+            de.shape = 0; de.area = 0.0; de.power = 0.0;
         }
         de.spotCosInner = e.spotCosInner; de.spotCosOuter = e.spotCosOuter;
         de.spotOmega = e.spotOmega;
@@ -10719,7 +10799,11 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
-    if (maxDepth > BDPT_MAXDEPTH) maxDepth = BDPT_MAXDEPTH;   // device array bound
+    // Two kernel variants: the default shallow stack, and a deep one for scenes that need
+    // it. Anything past BDPT_DEEPDEPTH still clamps — going deeper would need another
+    // instantiation, and the local-memory footprint is already ~13 KB/thread there.
+    const bool deep = (maxDepth > BDPT_MAXDEPTH);
+    if (maxDepth > BDPT_DEEPDEPTH) maxDepth = BDPT_DEEPDEPTH;   // device array bound
 
     DUpload up;
     buildUpload(scene, cam, resX, resY, up);
@@ -10755,12 +10839,18 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     };
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
-        if (useHero)
-            kBdptT<BDPT_NSEC><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
-                                             resX, maxDepth, diffraction ? 1 : 0, seed, C);
+        if (useHero && deep)
+            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C);
+        else if (useHero)
+            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+                                                            resX, maxDepth, diffraction ? 1 : 0, seed, C);
+        else if (deep)
+            kBdptT<0, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1);
         else
-            kBdptT<0><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
-                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1);
+            kBdptT<0, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+                                                    resX, maxDepth, diffraction ? 1 : 0, seed, 1);
         cudaCheckKernel("bdpt");
     };
 
@@ -11870,7 +11960,21 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
     s->diffraction = diffraction ? 1 : 0;
     s->maxDepth = (maxDepth > 0) ? maxDepth : 8;
-    s->vcmCap = s->maxDepth;
+    // The light-vertex slab is npix * vcmCap * sizeof(DVcmLV) (~128 B) of DEVICE memory, so
+    // vcmCap == maxDepth would ask for 6.6 GB at 1100x733 and -max-bounce 64. Bound the slab
+    // by a byte budget instead and say so: a smaller cap only means the deepest light-subpath
+    // vertices are not STORED for merging (paths still walk to maxDepth and still connect),
+    // so the estimator stays unbiased, it just loses some of the merge strategies down there.
+    {
+        const size_t kSlabBudget = (size_t)768 << 20;   // 768 MB
+        int capByMem = (int)(kSlabBudget / (s->npix * sizeof(gpu::DVcmLV)));
+        if (capByMem < 4) capByMem = 4;
+        s->vcmCap = (s->maxDepth < capByMem) ? s->maxDepth : capByMem;
+        if (s->vcmCap < s->maxDepth)
+            std::printf("[mode U] light-vertex store capped at %d of %d vertices/subpath "
+                        "(slab budget %zu MB at %dx%d)\n",
+                        s->vcmCap, s->maxDepth, kSlabBudget >> 20, resX, resY);
+    }
     // Hero bundle width. The kernels are templated on the SECONDARY slot count, so a C==1
     // session instantiates kVcm*T<0>: no sec slab, no per-λ arrays, no extra registers.
     int C = (heroC < 1) ? 1 : heroC;

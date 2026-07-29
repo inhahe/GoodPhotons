@@ -84,6 +84,14 @@ inline bool isNumber(const std::string& s) {
 }
 inline double num(const std::string& s) { return std::strtod(s.c_str(), nullptr); }
 
+// `<space>:<upsampler>` with a non-empty name. Split out so isColourHead and evalSpectrum
+// cannot drift on what counts as one.
+inline bool isCustomColourHead(const std::string& h) {
+    return h.size() > 4 && h[3] == ':' &&
+           (h.compare(0, 3, "rgb") == 0 || h.compare(0, 3, "hsv") == 0 ||
+            h.compare(0, 3, "hsl") == 0);
+}
+
 // The arity-3 COLOUR HEADS: every spectrum expression of the form `<head> a b c`,
 // across all three colour spaces and all the upsamplers/emission forms. Kept as one
 // list because two very different sites need the same answer: `evalSpectrum` (which
@@ -102,7 +110,17 @@ inline bool isColourHead(const std::string& h) {
         "rgbmeng",  "hsvmeng",  "hslmeng",     // Meng 2015 smoothest reflectance (K1)
     };
     for (const char* k : kHeads) if (h == k) return true;
-    return false;
+    // `rgb:<name>` / `hsv:<name>` / `hsl:<name>` — a USER-DECLARED upsampler (K1), named
+    // by an `upsample "<name>"` block. A colon rather than yet another glued suffix
+    // because the built-in suffixes are a closed set the reader can memorise while a user
+    // name is open-ended, and `:` is already this grammar's namespace marker everywhere
+    // else (`spectrum:`, `metal:`, `glass:`, `preset:`, `tex:`, `grid:`).
+    //
+    // Only the SHAPE is checked here; whether the name resolves is evalSpectrum's job.
+    // That split matters: this predicate also gates a record channel's inline-colour tag,
+    // and a head accepted here but rejected there would report an unknown upsampler as a
+    // mystery scalar-expression error pointing at the wrong token.
+    return isCustomColourHead(h);
 }
 
 // NOTE: the measured-SPD CSV loader (`loadSpdCsv`) that used to live here now lives
@@ -633,6 +651,17 @@ public:
                 markUsed(b, "=");
             }
 
+        // Named RGB->spectral upsamplers (K1): `upsample "name" { expr "<f(r,g,b,w)>" }`.
+        // Collected here, beside spectra and for the same reason: an upsampler is only
+        // ever reached BY NAME from an `rgb:<name>` colour head, so it is compiled lazily
+        // on first use. Declaration order therefore does not matter, and an unreferenced
+        // upsampler is legal (pointless, but not an unknown-key problem).
+        for (const auto& b : blocks)
+            if (b.type == "upsample") {
+                upsampleBlocks_[b.name] = &b;
+                markUsed(b, "expr");
+            }
+
         // Pass 1-arr: desugar inline `[ … ](coords)` array literals into anonymous
         // `grid` + `pattern` block pairs, APPENDED to `blocks`. Running it before Pass 1a
         // is what makes an inline literal work at every slot that already accepts a
@@ -724,6 +753,7 @@ public:
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
                      b.type == "texture" || b.type == "pattern" || b.type == "record" ||
                      b.type == "grid" || b.type == "scatter" ||
+                     b.type == "upsample" ||
                      b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
@@ -797,6 +827,110 @@ private:
     std::unordered_map<std::string, const Block*> spectraBlocks_;
     std::unordered_map<std::string, int> matIndex_;
 
+    // ---- K1: user-supplied named RGB->spectral upsamplers -----------------------------
+    // `upsample "name" { expr "<f of r,g,b,w>" }`, referenced as `rgb:<name> r g b`.
+    // The declaration blocks, and the COMPILED program per name (compiled once on first
+    // use, then reused for every colour that names it — an upsampler is typically named
+    // by many colours, and the compile is pure overhead after the first).
+    // Both the program and the spectrum table are held by shared_ptr because the
+    // Spectrum this produces must OUTLIVE the Builder (it ends up on a Material, which
+    // the Scene owns), while N colours naming the same upsampler should share one copy
+    // of each rather than carrying their own.
+    std::unordered_map<std::string, const Block*>                             upsampleBlocks_;
+    std::unordered_map<std::string, std::shared_ptr<const std::vector<PatNode>>> upsampleProg_;
+    // Spectra reachable from an upsample body as `spec:<name>(w)`. A resolved index is
+    // into this vector, which is APPEND-ONLY — that is what makes an index handed out at
+    // compile time still valid after a later name resolves, even though the vector
+    // reallocates. Shared with every closure produced, so a `spec:` sample stays live.
+    std::shared_ptr<std::vector<Spectrum>> upsampleSpecs_ =
+        std::make_shared<std::vector<Spectrum>>();
+    std::unordered_map<std::string, int>  upsampleSpecIndex_;
+
+    // Resolve `spec:<name>` to an index, evaluating the named spectrum block on first
+    // reference. Returns -1 for an unknown name, which the tokenizer turns into a compile
+    // error naming the spectrum.
+    //
+    // NOTE the const_cast: a PatSpecScope lookup is a C function pointer taking `const
+    // void*`, but resolution genuinely MUTATES — it memoises the evaluated spectrum.
+    // (texScopeThunk_ has the same shape but only reads.) Resolving lazily like this is
+    // the point: pre-evaluating every spectrum in the scene just in case an upsampler
+    // wanted one would do real work for scenes that declare no upsampler at all.
+    static int specScopeThunk_(const void* self, const char* name) {
+        Builder* B = const_cast<Builder*>(static_cast<const Builder*>(self));
+        auto hit = B->upsampleSpecIndex_.find(name);
+        if (hit != B->upsampleSpecIndex_.end()) return hit->second;
+        auto bit = B->spectraBlocks_.find(name);
+        if (bit == B->spectraBlocks_.end()) return -1;
+        const Stmt* e = find(*bit->second, "=");
+        if (!e) return -1;
+        Spectrum s = B->evalSpectrum(e->val, 1);
+        int idx = (int)B->upsampleSpecs_->size();
+        B->upsampleSpecs_->push_back(std::move(s));
+        B->upsampleSpecIndex_[name] = idx;
+        return idx;
+    }
+    // Sampler hook. `self` is the SPECTRUM VECTOR, not the Builder — that is what lets a
+    // produced Spectrum outlive the loader.
+    static double specSampleThunk_(const void* self, int idx, double w) {
+        const auto& v = *static_cast<const std::vector<Spectrum>*>(self);
+        return (idx >= 0 && idx < (int)v.size() && v[idx]) ? v[idx](w) : 0.0;
+    }
+    PatSpecScope specScope_{ this, &Builder::specScopeThunk_ };
+
+    // Turn a colour into a Spectrum through a named upsampler.
+    Spectrum applyUpsample(const std::string& name, const Vec3& c) {
+        auto bit = upsampleBlocks_.find(name);
+        if (bit == upsampleBlocks_.end()) {
+            fail("unknown upsampler '" + name + "' — declare it as `upsample \"" + name +
+                 "\" { expr \"…\" }`");
+            return constantSpectrum(0.0);
+        }
+        auto pit = upsampleProg_.find(name);
+        if (pit == upsampleProg_.end()) {
+            const Stmt* e = find(*bit->second, "expr");
+            if (!e || e->val.words.empty()) {
+                fail("upsample '" + name + "': no `expr`"); return constantSpectrum(0.0);
+            }
+            std::string expr;
+            for (size_t k = 0; k < e->val.words.size(); ++k) { if (k) expr += " "; expr += e->val.words[k]; }
+            std::vector<PatNode> prog; std::string perr;
+            // PatVarMode::Upsample swaps in the r/g/b/w vocabulary and locks the surface
+            // one out; `&specScope_` is what makes `spec:<name>(w)` legal. No texScope_ or
+            // tableScope_: there is no hit here, so `tex:` stays a compile error — and a
+            // `grid:`/`scatter:` sample, while conceivable, would be a second spelling for
+            // what `spec:` already does better (a spectrum knows its own wavelength
+            // domain; a grid would make the author restate it).
+            if (!compilePatternExpr(expr, prog, perr, /*allowT=*/false, nullptr, nullptr,
+                                    /*allowA=*/false, PatVarMode::Upsample, &specScope_)) {
+                fail("upsample '" + name + "': " + perr); return constantSpectrum(0.0);
+            }
+            pit = upsampleProg_.emplace(
+                name, std::make_shared<const std::vector<PatNode>>(std::move(prog))).first;
+        }
+        // The closure evaluates the program at each queried wavelength, exactly like the
+        // built-in upsamplers evaluate their own fits — deliberately NOT pre-tabulated.
+        // A user upsampler is free to be a narrow emission line or any other sharp
+        // feature, and baking it to a fixed grid here would quietly band-limit it; the
+        // renderer already tabulates spectra where it needs to (the device tables), at a
+        // resolution it chooses.
+        //
+        // Captures are all by value and own their targets, so the result is independent
+        // of this Builder: `prog` and `specs` are shared_ptrs, and `specSelf` points at
+        // the shared vector rather than at the loader.
+        auto prog  = pit->second;
+        auto specs = upsampleSpecs_;
+        Vec3 col = c;
+        return [prog, specs, col](double w) -> double {
+            PatCtx q;
+            q.x = col.x; q.y = col.y; q.z = col.z;   // r, g, b  (see PatVarMode)
+            q.u = w;                                 // w = wavelength, nm
+            q.specFn  = &Builder::specSampleThunk_;
+            q.specSelf = specs.get();
+            double v = patternEval(prog->data(), (int)prog->size(), q);
+            return std::isfinite(v) ? v : 0.0;
+        };
+    }
+
     // §3.3 material application. `albedoDefault_` is the per-material fallback for the
     // named input `a` — the one input with NO per-hit intrinsic, so an unbound `a` has
     // to be resolved at LOAD time (mirrors loom's Material.albedo_default, same 1.0
@@ -809,6 +943,20 @@ private:
 
     std::unordered_map<std::string, int> textureIndex_;   // texture name -> Scene::textures index
     std::unordered_map<std::string, int> patternIndex_;   // pattern name -> Scene::patterns index
+
+    // Generated-block name (`__arrN`) -> the AUTHOR-facing site that produced it.
+    // `desugarArrays` mints anonymous `grid`/`pattern` blocks the author never named, so
+    // any error raised while BUILDING one must be re-attributed: a message about
+    // `pattern '__arr3'` names a symbol that appears nowhere in the scene file. Populated
+    // by `desugarOne`, consulted by `genWho` below.
+    std::unordered_map<std::string, std::string> genSite_;
+    // "pattern 'foo'" for an authored block; "line 12: `reflect`: the inline array literal"
+    // for a generated one. Every fail() that can fire on a generated block goes through it.
+    std::string genWho(const char* kind, const std::string& name) const {
+        auto it = genSite_.find(name);
+        if (it != genSite_.end()) return it->second;
+        return std::string(kind) + " '" + name + "'";
+    }
 
     // Texture scope for `tex:<name>(u, v)` samples inside a pattern expression. Passed
     // to compilePatternExpr ONLY at value sites that are evaluated with a shading
@@ -1255,6 +1403,62 @@ private:
         std::string slot;
     };
 
+    // ---- a table sampled DIRECTLY at a value site --------------------------------
+    // `roughness grid:bumps(u,v)`, `reflect scatter:swatch(u,v)` — the NAMED counterpart
+    // of an inline array literal, and the same thing semantically: an inline `[0 1](u)`
+    // desugars to exactly this expression wrapped in an anonymous `pattern`, so the two
+    // spellings must produce the same binding. That symmetry is the whole feature; the
+    // workaround it retires is writing the one-line `pattern` wrapper by hand.
+    //
+    // A value site is NOT an expression site, which is why this needs code at all: ftrace's
+    // expression compiler has always read `grid:name(args)` as a call, but only *inside* a
+    // pattern body. At a value site the token previously reached the spectrum reader and
+    // died as "unrecognized spectrum expression".
+    //
+    // The **scoped** spelling is the one accepted, deliberately. A bare `ramp(u)` at a value
+    // site already means "apply the material `ramp`" (§7.6 bundles), so accepting it for
+    // tables too would make the meaning depend on which namespace happens to hold the name —
+    // and a scene could change meaning by gaining a material. `grid:` / `scatter:` cannot
+    // collide with that.
+    //
+    // Returns the new pattern's index, or -1 with fail() already set. Callers test the
+    // prefix themselves (it is two string compares) so that each can phrase its own
+    // refusal when its slot has nowhere to put a per-hit value.
+    static bool isTableCallHead(const std::string& t) {
+        return t.rfind("grid:", 0) == 0 || t.rfind("scatter:", 0) == 0;
+    }
+    int tableCallPattern(const std::string& tok, const std::string& who) {
+        if (!loadedRef_) {                    // no scene to append the pattern to
+            fail(who + ": `" + tok + "` cannot be used here");
+            return -1;
+        }
+        const bool isGrid = (tok[0] == 'g');
+        const std::string kind = isGrid ? "grid" : "scatter";
+        // The call is required for the same reason an array literal's is: a table is a
+        // function of its coordinates, and a slot holds a value, so naming one without
+        // saying where it is read is incomplete rather than defaulted. Refusing beats
+        // inventing `(u)`, which would silently pick an axis for a 2-D table.
+        if (tok.find('(') == std::string::npos || tok.back() != ')') {
+            fail(who + ": `" + tok + "` names a " + kind + " but does not sample it — a "
+                 "table is read AT coordinates, so write `" + tok + "(u)`, one coordinate "
+                 "per axis (`" + tok + "(u,v)` for a 2-D table)");
+            return -1;
+        }
+        Pattern p;
+        std::string perr;
+        // `a` is allowed for the same reason a named `pattern` block allows it: the axis can
+        // be left free here and rebound where the material is USED (`mat(a=u)`), which is
+        // exactly the deferral route an inline literal spells `[0 1](a)`.
+        if (!compilePatternExpr(tok, p.nodes, perr, false, &texScope_,
+                                &tableScope_, /*allowA=*/true)) {
+            fail(who + " `" + tok + "`: " + perr);
+            return -1;
+        }
+        Loaded& L = *loadedRef_;
+        L.scene.patterns.push_back(std::move(p));
+        return (int)L.scene.patterns.size() - 1;
+    }
+
     // Recognise + resolve. Returns FALSE when `tok` is not this form at all (the caller
     // falls through to its other spellings); TRUE when it was recognised, in which case
     // `out` is filled or `fail()` has been set. Deliberately keyed on "the head names a
@@ -1552,6 +1756,17 @@ private:
         // `RECORD.channel[i]` / `RECORD.channel(const)`. Fires only when h's head names
         // a known record; otherwise falls through to the ordinary spectrum forms below.
         if (w.size() == 1) {
+            // A table sample at a PATTERN-LESS spectral site (`ior`, `absorb`, a light's
+            // `spd`, a top-level `spectrum`). The pattern-aware slots intercept it in
+            // patternedSpectrumParam and never arrive here, so reaching this point means the
+            // slot holds one spectrum evaluated at load time and has nowhere to put a per-hit
+            // sample — the same refusal a pattern-carrying material property gets below.
+            if (isTableCallHead(h)) {
+                fail("`" + h + "`: a table is sampled per hit, but this slot holds one "
+                     "spectrum fixed at load time — the per-hit spectral slots are "
+                     "`reflect`, `transmit` and `emit` (and their `_map` companions)");
+                return constantSpectrum(0);
+            }
             Spectrum rs;
             if (recordConstSpectrumRef(h, rs)) return rs;
             // §3.2 per-property access — `MATERIAL.slot` / `MATERIAL.slot(args)`. This is
@@ -1618,9 +1833,11 @@ private:
             bool isSmits = (h == "rgbsmits" || h == "hsvsmits" || h == "hslsmits");
             bool isBox   = (h == "rgbbox"   || h == "hsvbox"   || h == "hslbox");
             bool isMeng  = (h == "rgbmeng"  || h == "hsvmeng"  || h == "hslmeng");
+            bool isUser  = isCustomColourHead(h);   // `rgb:<name>` — user `upsample` block
             if (isColourHead(h)) {
                 if (w.size() < 4) { fail(h + " needs 3 components"); return constantSpectrum(0); }
-                std::string space = (isLine || isIllum || isSmits || isBox || isMeng) ? h.substr(0, 3) : h;
+                std::string space = (isLine || isIllum || isSmits || isBox || isMeng || isUser)
+                                        ? h.substr(0, 3) : h;
                 Vec3 c;
                 if      (space == "rgb") c = {num(w[1]), num(w[2]), num(w[3])};
                 else if (space == "hsv") c = hsvToRgb(num(w[1]), num(w[2]), num(w[3]));
@@ -1629,6 +1846,11 @@ private:
                     double sigma = (w.size() > 4 && isNumber(w[4])) ? num(w[4]) : -1.0;
                     return rgbToLineEmission(c.x, c.y, c.z, sigma);
                 }
+                // A user upsampler runs AFTER the space conversion, so it always sees
+                // linear sRGB in (r, g, b) regardless of which of the three heads was
+                // written — same contract as every built-in, so `hsv:mine 0.3 1 1` and
+                // the equivalent `rgb:mine …` cannot disagree.
+                if (isUser) return applyUpsample(h.substr(4), c);
                 if (isIllum) return rgbToIlluminantJH(c.x, c.y, c.z);
                 if (isSmits) return rgbToReflectanceSmits(c.x, c.y, c.z);
                 if (isBox)   return rgbToReflectanceBox(c.x, c.y, c.z);
@@ -1764,6 +1986,16 @@ private:
         const Stmt* s = find(b, key);
         if (!s || s->val.words.empty()) return dflt;
         const std::string& w0 = s->val.words[0];
+        // Reaching dblParam with a table sample in hand means THIS slot has nowhere to put a
+        // per-hit value: the slots that can hold one try bindScalarPattern first and take it
+        // there. Refused rather than silently read as `num("grid:…") == 0`.
+        if (isTableCallHead(w0)) {
+            fail(std::string("`") + key + " " + w0 + "`: a table is sampled per hit, but '" +
+                 key + "' takes one number fixed at load time — the per-hit slots are "
+                 "`roughness`, `film_thickness_map`, `weight_map`, and the `_map` companion "
+                 "of a spectral slot");
+            return dflt;
+        }
         if (w0.find('.') != std::string::npos && !isNumber(w0)) {
             double rv;
             if (recordConstScalarRef(w0, rv)) return rv;             // record ref (or a fail was set)
@@ -1929,6 +2161,15 @@ private:
                                     int& patOut, const Spectrum& dflt) {
         bindScalarPattern(b, mapKey, patOut);
         const Stmt* s = find(b, key);
+        // `reflect grid:ramp(u)` — same slot semantics as `reflect pattern:p`: the sampled
+        // table goes ALONE into the slot and the base spectrum becomes flat 1.0, so the
+        // table's own values are the greyscale albedo. Handled here rather than in
+        // evalSpectrum because this is the only spectral site with somewhere to put a
+        // per-hit multiplier.
+        if (s && !s->val.words.empty() && isTableCallHead(s->val.words[0])) {
+            if (!bindScalarPattern(b, key, patOut)) return dflt;   // fail() already set
+            return constantSpectrum(1.0);
+        }
         if (s && !s->val.words.empty() && s->val.words[0].rfind("pattern:", 0) == 0) {
             if (!bindScalarPattern(b, key, patOut)) return dflt;   // unknown name: failed
             return constantSpectrum(1.0);
@@ -2037,6 +2278,15 @@ private:
         const Stmt* s = find(b, key);
         if (!s || s->val.words.empty()) return false;
         const std::string& w0 = s->val.words[0];
+        // A table sampled at a value site IS a pattern, so it binds here exactly like
+        // `pattern:<name>` does — which is what makes `roughness grid:bumps(u,v)` and the
+        // inline `roughness [ … ](u,v)` the same statement written two ways.
+        if (isTableCallHead(w0)) {
+            int p = tableCallPattern(w0, std::string("`") + key + "`");
+            if (p < 0) return false;                          // fail() already set
+            patOut = p;
+            return true;
+        }
         // §3.2 per-property access carrying a pattern: `roughness gold.roughness` where
         // gold's roughness is itself pattern-driven. Reported as "handled" ONLY when the
         // source actually has a pattern, so a plain-constant source falls through to
@@ -2094,7 +2344,7 @@ private:
             // it, and applyMaterial then resolves `a` against THAT material.
             if (!compilePatternExpr(expr, pat.nodes, perr, false, &texScope_,
                                     &tableScope_, /*allowA=*/true)) {
-                fail("pattern '" + b.name + "': " + perr); return false;
+                fail(genWho("pattern", b.name) + ": " + perr); return false;
             }
         } else {
             std::string g = strOf(b, "type", "");
@@ -2176,48 +2426,154 @@ private:
         return true;
     }
 
-    // Turn ONE literal into its `grid` + `pattern` pair (appended to `gen`) and rewrite
-    // the statement's value to reference the generated pattern.
-    bool desugarOne(Stmt& s, std::vector<Block>& gen, int& n) {
-        const ArrayLit& a = *s.val.array;
-        const std::string nm  = "__arr" + std::to_string(n++);
-        const std::string who = "line " + std::to_string(a.line) + ": `" + s.key + "`";
-        if (a.call.empty()) {
-            fail(who + ": an inline array literal needs a trailing sample call naming the "
-                 "coordinates it is read at — e.g. `[0 1](u)`, or `[[0 1][2 3]](u,v)` for "
-                 "2-D. Write the call with no spaces inside the parentheses and nothing "
-                 "between it and the `]`.");
-            return false;
+    // Split a sample call's `( … )` text into its top-level, comma-separated arguments,
+    // and report whether any of them carries a top-level `=` (the keyword `formal=driver`
+    // form). Top-level means "not inside a nested paren/bracket group", so a composed
+    // coordinate keeps its own commas to itself. As in `parseBindArgs`, a top-level `=`
+    // is unambiguously a binding because the pattern language has no comparison operators.
+    // `kwAt` is the index of the FIRST keyword argument, or -1.
+    static void splitCallArgs(const std::string& call, std::vector<std::string>& out,
+                              int& kwAt, std::string& kwFormal) {
+        out.clear(); kwAt = -1; kwFormal.clear();
+        if (call.size() <= 2) return;                       // `()` — no arguments at all
+        const std::string in = call.substr(1, call.size() - 2);
+        int depth = 0; size_t start = 0;
+        std::vector<std::string> raw;
+        for (size_t i = 0; i <= in.size(); ++i) {
+            if (i == in.size() || (in[i] == ',' && depth == 0)) {
+                raw.push_back(trimWs(in.substr(start, i - start)));
+                start = i + 1;
+                continue;
+            }
+            char c = in[i];
+            if (c == '(' || c == '[') ++depth;
+            else if (c == ')' || c == ']') --depth;
         }
-        if (!s.val.words.empty()) {
-            fail(who + ": an inline array literal must be the whole value, but it follows '" +
-                 s.val.words.back() + "'");
-            return false;
+        for (size_t k = 0; k < raw.size(); ++k) {
+            const std::string& seg = raw[k];
+            out.push_back(seg);
+            if (kwAt >= 0) continue;
+            int d = 0;
+            for (size_t i = 0; i < seg.size(); ++i) {
+                char c = seg[i];
+                if (c == '(' || c == '[') ++d;
+                else if (c == ')' || c == ']') --d;
+                else if (c == '=' && d == 0) {
+                    kwAt = (int)k;
+                    kwFormal = trimWs(seg.substr(0, i));
+                    break;
+                }
+            }
         }
+    }
+
+    // Parse an array literal's `[ … ]` TEXT back into the same BrItem tree the grammar
+    // builds at a value site. Needed because a literal COMPOSED inside another one's
+    // sample call — `[0 1]([0.2 0.8](u))` — reaches the loader as raw characters inside a
+    // single PARENWORD token, not as a reduced bracket group: the lexer deliberately does
+    // not treat `(` as a delimiter (that is exactly what keeps an expression like
+    // `sin(2*pi*u)` one token), so everything between a call's parens is text by
+    // construction. The splitting rule here is the tokenizer's own — whitespace separates
+    // entries, `[`/`]` nest, and a paren group is held together so `[f(a b) 2]` keeps its
+    // call whole — which is what makes a composed literal read identically to a written-out
+    // one. On success `i` sits one past the closing `]`; on failure `err` says why.
+    static bool parseArrayText(const std::string& t, size_t& i,
+                               std::vector<BrItem>& out, std::string& err) {
+        ++i;                                         // past the '['
+        for (;;) {
+            while (i < t.size() && (t[i] == ' ' || t[i] == '\t')) ++i;
+            if (i >= t.size()) { err = "unbalanced `[`"; return false; }
+            if (t[i] == ']') { ++i; return true; }
+            if (t[i] == '[') {
+                BrItem g; g.isGroup = true;
+                if (!parseArrayText(t, i, g.items, err)) return false;
+                out.push_back(std::move(g));
+                continue;
+            }
+            const size_t s = i;
+            int d = 0;
+            while (i < t.size()) {
+                const char c = t[i];
+                if (c == '(') ++d;
+                else if (c == ')') {
+                    if (d == 0) { err = "unbalanced `)`"; return false; }
+                    --d;
+                } else if (d == 0 && (c == ' ' || c == '\t' || c == '[' || c == ']')) break;
+                ++i;
+            }
+            BrItem w; w.word = t.substr(s, i - s);
+            out.push_back(std::move(w));
+        }
+    }
+
+    static void addGenStmt(Block& blk, const char* key, std::vector<std::string> words, int line) {
+        Stmt t; t.key = key; t.line = line; t.val.words = std::move(words);
+        blk.words.push_back(t.key);
+        for (const auto& w : t.val.words) blk.words.push_back(w);
+        blk.stmts.push_back(std::move(t));
+    }
+
+    // Flatten ONE literal into an anonymous `grid __arrN` block (appended to `gen`) and
+    // check its sample call against the nesting. Shared by the two places a literal can
+    // appear: at a VALUE SITE (desugarOne, which additionally wraps the grid in a
+    // `pattern` so a statement has a name to reference) and COMPOSED inside another
+    // literal's sample call (desugarNestedLiterals), which needs the grid ALONE — because
+    // `grid:NAME(coords)` is already a legal pattern-expression term, so a composed
+    // literal costs one block instead of two and needs no name at the ftsl level at all.
+    // `call` is always the AUTHOR's text: arity and shape are checked, and errors phrased,
+    // against what they wrote — never against the rewritten text the composer produces.
+    bool buildArrayGrid(const std::vector<BrItem>& items, const std::string& call,
+                        const std::string& who, int line,
+                        std::vector<Block>& gen, int& n, std::string& outName) {
+        const std::string nm = "__arr" + std::to_string(n++);
         std::vector<int> shape;
         std::vector<std::string> flat;
-        if (!flattenArray(a.items, 0, shape, flat, who,
+        if (!flattenArray(items, 0, shape, flat, who,
                           " (use a named `scatter` element for irregular data)")) return false;
         if ((int)shape.size() > PAT_ND_MAX_DIM) {
             fail(who + ": " + std::to_string(shape.size()) + " nested axes exceeds the " +
                  std::to_string((int)PAT_ND_MAX_DIM) + "-D limit");
             return false;
         }
-        // Arity is checked HERE, not left to the generated grid sample, so the message can
-        // talk about what the author wrote (`[…](u)`) instead of a name they never chose.
+        // Arity and argument SHAPE are checked HERE, not left to the generated grid sample,
+        // so the message can talk about what the author wrote (`[…](u)`) instead of a name
+        // they never chose.
         {
-            int args = 1, depth = 0;
-            for (size_t k = 1; k + 1 < a.call.size(); ++k) {
-                char c = a.call[k];
-                if (c == '(') ++depth;
-                else if (c == ')') --depth;
-                else if (c == ',' && depth == 0) ++args;
+            std::vector<std::string> args;
+            int kwAt = -1; std::string kwFormal;
+            splitCallArgs(call, args, kwAt, kwFormal);
+            // Emptiness before arity: `(u,)` is a stray comma, not a 2-D call, and saying so
+            // beats "the array is 1-D but the call gives 2 coordinates".
+            for (size_t k = 0; k < args.size(); ++k) {
+                if (!args[k].empty()) continue;
+                fail(who + ": axis " + std::to_string(k) + " of the sample call `" + call +
+                     "` is empty — every axis needs a coordinate expression");
+                return false;
             }
-            if (a.call.size() <= 2) args = 0;           // `()`
-            if (args != (int)shape.size()) {
+            if ((int)args.size() != (int)shape.size()) {
                 fail(who + ": the array is " + std::to_string(shape.size()) +
-                     "-D but its sample call `" + a.call + "` gives " +
-                     std::to_string(args) + " coordinate(s) — one per nesting level");
+                     "-D but its sample call `" + call + "` gives " +
+                     std::to_string(args.size()) + " coordinate(s) — one per nesting level");
+                return false;
+            }
+            // --- PINNED SEMANTICS: an inline literal's axes carry no names ------------
+            // `formal=driver` binds a name belonging to the CALLEE. A material, a material
+            // property and a named pattern all have callee-side input names, so `mat(a=u)`
+            // / `src.reflect(u=v)` are meaningful there. An inline array literal has no
+            // such namespace: its axes are positional and anonymous, and the names in its
+            // own tuple are DRIVERS (coordinate expressions), not formals. Accepting
+            // `[0 1](a=u)` would therefore have to invent a per-material default for `a`,
+            // which two literals in one material could contradict — so it is refused, and
+            // the message names the two spellings that actually do the two things an
+            // author can mean.
+            if (kwAt >= 0) {
+                fail(who + ": `" + args[kwAt] + "` — an inline array literal's axes are "
+                     "positional and unnamed, so a `formal=driver` argument has no formal "
+                     "to bind. Its sample call takes DRIVERS: write `[…](" +
+                     trimWs(args[kwAt].substr(args[kwAt].find('=') + 1)) +
+                     ")` to spend the axis here, or `[…](" + kwFormal +
+                     ")` to leave it free and rebind it where the material is USED — "
+                     "`material mat(" + args[kwAt] + ")`");
                 return false;
             }
         }
@@ -2225,30 +2581,151 @@ private:
         Block g;
         g.type = "grid";
         g.name = nm;
-        auto addStmt = [&](Block& blk, const char* key, std::vector<std::string> words) {
-            Stmt t; t.key = key; t.line = a.line; t.val.words = std::move(words);
-            blk.words.push_back(t.key);
-            for (const auto& w : t.val.words) blk.words.push_back(w);
-            blk.stmts.push_back(std::move(t));
-        };
         {
             std::vector<std::string> sh;
             for (int d : shape) sh.push_back(std::to_string(d));
-            addStmt(g, "shape", sh);
-            addStmt(g, "lo", std::vector<std::string>(shape.size(), "0"));
-            addStmt(g, "hi", std::vector<std::string>(shape.size(), "1"));
-            addStmt(g, "data", flat);
+            addGenStmt(g, "shape", sh, line);
+            addGenStmt(g, "lo", std::vector<std::string>(shape.size(), "0"), line);
+            addGenStmt(g, "hi", std::vector<std::string>(shape.size(), "1"), line);
+            addGenStmt(g, "data", flat, line);
         }
         gen.push_back(std::move(g));
+        // Re-attribute anything that goes wrong inside the generated block (an unknown
+        // identifier in a coordinate, a `tex:` out of scope, …) back to the literal the
+        // author actually wrote — `__arrN` is a name they never chose and cannot search
+        // for. The grid and its wrapping pattern share the one name, so one entry covers
+        // both.
+        genSite_[nm] = who + ": the inline array literal's sample call `" + call + "`";
+        outName = nm;
+        return true;
+    }
+
+    // Rewrite a sample call's text, replacing every array literal COMPOSED inside it with
+    // a reference to its own freshly-generated grid, so that `[0 1]([0.2 0.8](u))` ends up
+    // as `grid:__arr1(grid:__arr0(u))` — TODO.md's `coord = NAME | NUMBER | value`, where
+    // a coordinate may itself be a sampled value. Recursion is on the call text, so the
+    // composition nests to any depth.
+    //
+    // The inner grids are emitted BEFORE the outer block that references them; ordering is
+    // not actually load-bearing (the data pass registers every grid before any pattern
+    // compiles), but emitting a definition before its use keeps the generated scene
+    // readable when dumped.
+    //
+    // This is also the only place that can diagnose a malformed composed literal: the lexer
+    // captures the whole call as one PARENWORD without balance-checking the brackets inside
+    // it (see ftsl_scene.epeg), precisely so that the complaint can be phrased against the
+    // author's own source instead of surfacing as a token that mysteriously fails to match.
+    bool desugarNestedLiterals(const std::string& text, const std::string& who, int line,
+                               std::vector<Block>& gen, int& n, std::string& out) {
+        out.clear();
+        for (size_t i = 0; i < text.size(); ) {
+            if (text[i] != '[') { out += text[i++]; continue; }
+            const size_t at = i;
+            // The pattern language has NO bracket syntax of its own, so a `[` here always
+            // opens a composed literal — but one written flush against an identifier
+            // (`f[0 1](u)`) is a typo, not a composition. Caught before the substitution
+            // rather than after, because the rewrite would otherwise glue the author's
+            // token to the generated name and report an "unknown identifier `fgrid`" that
+            // appears nowhere in their file.
+            if (at > 0) {
+                const char p = text[at - 1];
+                if (std::isalnum((unsigned char)p) || p == '_' || p == '.' || p == ':') {
+                    fail(who + ": an array literal composed into a sample call has to stand "
+                         "on its own as a coordinate, but this one directly follows `" +
+                         std::string(1, p) + "` — separate them, or drop the stray text");
+                    return false;
+                }
+            }
+            std::vector<BrItem> items;
+            std::string err;
+            if (!parseArrayText(text, i, items, err)) {
+                fail(who + ": " + err + " in the array literal composed into the sample call "
+                     "at `" + text.substr(at) + "`");
+                return false;
+            }
+            const std::string lit = text.substr(at, i - at);
+            if (i >= text.size() || text[i] != '(') {
+                fail(who + ": the array literal `" + lit + "` composed into a sample call "
+                     "needs its own trailing call naming the coordinates it is read at — "
+                     "e.g. `" + lit + "(u)`");
+                return false;
+            }
+            const size_t cs = i;
+            int d = 0;
+            for (; i < text.size(); ++i) {
+                if (text[i] == '(') ++d;
+                else if (text[i] == ')' && --d == 0) { ++i; break; }
+            }
+            if (d != 0) {
+                fail(who + ": unbalanced `(` in the sample call of the composed array "
+                     "literal `" + lit + "` at `" + text.substr(cs) + "`");
+                return false;
+            }
+            const std::string innerCall = text.substr(cs, i - cs);
+            std::string innerOut;
+            if (!desugarNestedLiterals(innerCall, who, line, gen, n, innerOut)) return false;
+            std::string nm;
+            if (!buildArrayGrid(items, innerCall, who, line, gen, n, nm)) return false;
+            out += "grid:" + nm + innerOut;
+        }
+        return true;
+    }
+
+    // Turn ONE literal into its `grid` + `pattern` pair (appended to `gen`) and rewrite
+    // the statement's value to reference the generated pattern.
+    bool desugarOne(Stmt& s, std::vector<Block>& gen, int& n) {
+        const ArrayLit& a = *s.val.array;
+        const std::string who = "line " + std::to_string(a.line) + ": `" + s.key + "`";
+        if (a.call.empty()) {
+            // Two ways to finish an array, and the message names both: SPEND the axis here
+            // (`(u)`), or leave it as a FORMAL for whoever uses the material (`(a)`, bound
+            // at the use site by `mat(a=u)`). The second is the "unsaturated, completed by
+            // the user" case from the design — in ftrace it is spelled by naming `a`, the
+            // one input with no per-hit intrinsic, rather than by omitting the call.
+            fail(who + ": an inline array literal needs a trailing sample call naming the "
+                 "coordinates it is read at — e.g. `[0 1](u)`, or `[[0 1][2 3]](u,v)` for "
+                 "2-D. To leave the choice to whoever USES this material, name the free "
+                 "input instead — `[0 1](a)` — and bind it at the use site with "
+                 "`material mat(a=u)`. Write the call with nothing between it and the `]`.");
+            return false;
+        }
+        if (!s.val.words.empty()) {
+            fail(who + ": an inline array literal must be the whole value, but it follows '" +
+                 s.val.words.back() + "'");
+            return false;
+        }
+        // A literal composed INSIDE this one's sample call becomes its own grid first, and
+        // the call text is rewritten to reference it. The rewritten text is used ONLY for
+        // the generated expression: every message stays phrased against `a.call`, which is
+        // what the author actually wrote.
+        std::string emitCall;
+        if (!desugarNestedLiterals(a.call, who, a.line, gen, n, emitCall)) return false;
+
+        std::string nm;
+        if (!buildArrayGrid(a.items, a.call, who, a.line, gen, n, nm)) return false;
 
         Block p;
         p.type = "pattern";
         p.name = nm;
-        addStmt(p, "expr", {"grid:" + nm + a.call});
+        addGenStmt(p, "expr", {"grid:" + nm + emitCall}, a.line);
         gen.push_back(std::move(p));
 
         s.val.array.reset();
         s.val.words.push_back("pattern:" + nm);
+        return true;
+    }
+
+    // The mirror of the case above: an array literal composed into a NAMED table's sample
+    // call, `reflect grid:ramp([0.2 0.8](u))`. Here there is no `ArrayLit` at all — the
+    // whole thing lexed as one WORD — so the rewrite happens on the token text, and what
+    // comes out (`grid:ramp(grid:__arrN(u))`) is compiled by `tableCallPattern` later.
+    // Both directions of composition therefore run through the one `desugarNestedLiterals`.
+    bool desugarTableCall(Stmt& s, std::vector<Block>& gen, int& n) {
+        std::string& w0 = s.val.words[0];
+        const std::string who = "line " + std::to_string(s.line) + ": `" + s.key + "`";
+        std::string out;
+        if (!desugarNestedLiterals(w0, who, s.line, gen, n, out)) return false;
+        w0 = out;
         return true;
     }
 
@@ -2266,6 +2743,11 @@ private:
             bool touched = false;
             for (auto& s : b.stmts) {
                 if (s.val.array) { if (!desugarOne(s, gen, n)) return false; touched = true; }
+                else if (!s.val.words.empty() && isTableCallHead(s.val.words[0]) &&
+                         s.val.words[0].find('[') != std::string::npos) {
+                    if (!desugarTableCall(s, gen, n)) return false;
+                    touched = true;
+                }
                 if (s.val.block) { if (!visit(*s.val.block)) return false; }
             }
             if (touched && !b.words.empty()) {
@@ -2304,7 +2786,7 @@ private:
     bool addGrid(const Block& b, Loaded& L) {
         if (b.name.empty()) { fail("grid needs a \"name\""); return false; }
         if (gridIndex_.count(b.name)) { fail("duplicate grid name '" + b.name + "'"); return false; }
-        const std::string who = "grid '" + b.name + "'";
+        const std::string who = genWho("grid", b.name);
 
         // Samples: a `data { … }` brace body (the flat-word list form `palette {}` uses),
         // an inline `data 1 2 3` line, or a BRACKETED `data [[0 1 2][3 4 5]]` whose nesting

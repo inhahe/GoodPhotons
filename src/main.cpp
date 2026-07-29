@@ -129,6 +129,7 @@
 #include <map>
 #include <set>
 #include <memory>
+#include <atomic>              // -stop: cross-thread flags for the external stop channel
 #include <filesystem>          // -review: scan a directory of rendered frames
 #include "scene.h"
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
@@ -147,6 +148,8 @@
 #include "lights.h"
 #include "mesh.h"
 #include "ftsl.h"
+#include "curvedrive.h"         // -anim: loom CurveDrive JSON sidecar (E2 channel a) read/write
+#include "animlive.h"           // -anim -loom: the live editor<->loom value channel (E2 channel b)
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
@@ -991,7 +994,184 @@ static int checkUpsample() {
     // white is capped by the brightest smooth reflectance of that chromaticity.
     bool passG = mengPhysical && mengSmoother && mengErr < 5e-3 && mengWhiteErr < 0.02;
 
-    bool pass = passA && passB && passW && passC && passD && passE && passF && passG;
+    // (h) USER-DECLARED upsamplers (K1 remainder): `upsample "n" { expr "f(r,g,b,w)" }`
+    // named as `rgb:n` / `hsv:n` / `hsl:n`. Unlike (a)-(g), which test closed-form fits
+    // that can be evaluated directly, this one has to run the LOADER — the feature IS the
+    // binding of a name to a colour head, so what's under test is a property of loading.
+    // Every assert compares against a value computed here in C++ from the same inputs, so
+    // the test pins the semantics (which variable is which, when the space conversion
+    // happens, what `spec:` samples) rather than a number that could drift with defaults.
+    bool passH = true;
+    {
+        auto uchk = [&](const char* what, bool cond) {
+            if (!cond) { std::printf("[checkupsample] user %-46s BAD\n", what); passH = false; }
+        };
+        // Load a fragment and hand back the probe material's reflect spectrum. The probe
+        // quad always uses `probe`, so the resolved index comes off its first triangle.
+        auto probeReflect = [&](const std::string& decls, Spectrum& out) -> bool {
+            std::string src =
+                "scene { units meters }\n" + decls + "\n"
+                "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+                "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+                "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+            ftsl::Loaded L; std::string e;
+            if (!ftsl::loadSource(src, "<checkupsample>", L, e)) {
+                std::printf("[checkupsample] user load FAILED: %s\n", e.c_str());
+                return false;
+            }
+            int mi = L.scene.tris.empty() ? 0 : L.scene.tris[0].matId;
+            out = L.scene.mats[mi].reflect;
+            // NOTE: `L` dies here. The returned Spectrum must still work — that is the
+            // whole point of applyUpsample capturing shared_ptrs rather than the Builder,
+            // and every sample below is taken AFTER this scope exits.
+            return true;
+        };
+        // A scene that must NOT load, and whose error mentions `needle`.
+        auto uReject = [&](const char* what, const std::string& decls, const char* needle) {
+            std::string src =
+                "scene { units meters }\n" + decls + "\n"
+                "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+                "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+                "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+            ftsl::Loaded L; std::string e;
+            if (ftsl::loadSource(src, "<checkupsample>", L, e)) { uchk(what, false); return; }
+            if (e.find(needle) == std::string::npos) {
+                std::printf("[checkupsample] user %-46s BAD (error was: %s)\n", what, e.c_str());
+                passH = false;
+            }
+        };
+        const double lams[] = { 380.0, 450.0, 550.0, 632.8, 780.0 };
+
+        // h1. A constant body is that constant at every wavelength — the smallest possible
+        //     proof that the program is compiled, stored and evaluated at all.
+        {
+            Spectrum s;
+            if (probeReflect("upsample \"k\" { expr \"0.375\" }\n"
+                             "material \"probe\" { type diffuse  reflect rgb:k 0.2 0.5 0.9 }", s)) {
+                bool okc = true;
+                for (double w : lams) okc = okc && std::fabs(s(w) - 0.375) < 1e-12;
+                uchk("constant body is constant in wavelength", okc);
+            } else passH = false;
+        }
+
+        // h2. r/g/b are the LINEAR sRGB triple and w is the wavelength in nm, each landing
+        //     in its own slot. The formula weights all four differently so a swapped pair
+        //     cannot pass by coincidence.
+        {
+            Spectrum s;
+            const double R = 0.2, G = 0.5, B = 0.9;
+            if (probeReflect("upsample \"m\" { expr \"r*1 + g*10 + b*100 + w*0.001\" }\n"
+                             "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }", s)) {
+                bool okc = true;
+                for (double w : lams)
+                    okc = okc && std::fabs(s(w) - (R + G * 10 + B * 100 + w * 0.001)) < 1e-9;
+                uchk("r,g,b,w each reach their own slot", okc);
+            } else passH = false;
+        }
+
+        // h3. The space conversion runs BEFORE the body, so an `hsv:` head and the `rgb:`
+        //     head fed the converted triple are indistinguishable. This is the invariant
+        //     that lets an author pick a colour space without re-reading the upsampler.
+        {
+            Spectrum a, b;
+            Vec3 c = hsvToRgb(0.3, 0.8, 0.6);
+            char rgbDecl[256];
+            std::snprintf(rgbDecl, sizeof rgbDecl,
+                          "upsample \"m\" { expr \"r*1 + g*10 + b*100\" }\n"
+                          "material \"probe\" { type diffuse  reflect rgb:m %.17g %.17g %.17g }",
+                          c.x, c.y, c.z);
+            if (probeReflect("upsample \"m\" { expr \"r*1 + g*10 + b*100\" }\n"
+                             "material \"probe\" { type diffuse  reflect hsv:m 0.3 0.8 0.6 }", a) &&
+                probeReflect(rgbDecl, b)) {
+                uchk("hsv: head converts to linear sRGB before the body",
+                     std::fabs(a(550.0) - b(550.0)) < 1e-9);
+            } else passH = false;
+        }
+
+        // h4. `spec:<name>(w)` samples a declared spectrum AT THE PASSED WAVELENGTH. The
+        //     gaussian is checked against its own closed form, so this pins both that the
+        //     right curve was resolved and that `w` really is the argument (a constant
+        //     would match at the centre only).
+        {
+            Spectrum s;
+            const double R = 0.8;
+            if (probeReflect("spectrum \"g\" = gaussian center=550 sigma=30 amp=1\n"
+                             "upsample \"basis\" { expr \"r*spec:g(w)\" }\n"
+                             "material \"probe\" { type diffuse  reflect rgb:basis 0.8 0.1 0.1 }", s)) {
+                bool okc = true;
+                for (double w : lams) {
+                    double t = (w - 550.0) / 30.0;
+                    okc = okc && std::fabs(s(w) - R * std::exp(-0.5 * t * t)) < 1e-9;
+                }
+                uchk("spec:<name>(w) samples the named spectrum at w", okc);
+            } else passH = false;
+        }
+
+        // h5. A MEASURED BASIS — the reason `spec:` exists at all. Three named spectra
+        //     weighted by the three channels is the classic linear-basis upsampler, and it
+        //     must equal the same sum computed here. Also proves the spectrum vector stays
+        //     valid across several resolved indices (it is append-only for exactly this).
+        {
+            Spectrum s;
+            const double R = 0.3, G = 0.6, B = 0.1;
+            if (probeReflect("spectrum \"sr\" = gaussian center=620 sigma=40 amp=1\n"
+                             "spectrum \"sg\" = gaussian center=540 sigma=40 amp=1\n"
+                             "spectrum \"sb\" = gaussian center=460 sigma=40 amp=1\n"
+                             "upsample \"basis\" { expr \"r*spec:sr(w) + g*spec:sg(w) + b*spec:sb(w)\" }\n"
+                             "material \"probe\" { type diffuse  reflect rgb:basis 0.3 0.6 0.1 }", s)) {
+                bool okc = true;
+                for (double w : lams) {
+                    auto gau = [&](double c0) { double t = (w - c0) / 40.0; return std::exp(-0.5 * t * t); };
+                    okc = okc && std::fabs(s(w) - (R * gau(620) + G * gau(540) + B * gau(460))) < 1e-9;
+                }
+                uchk("three-spectrum measured basis matches by hand", okc);
+            } else passH = false;
+        }
+
+        // h6. Loud refusals. Each of these has a specific failure the author needs named,
+        //     and the alternative in every case is a silent wrong answer.
+        uReject("an unknown upsampler names itself",
+                "material \"probe\" { type diffuse  reflect rgb:nope 0.2 0.5 0.9 }",
+                "unknown upsampler");
+        uReject("an upsample with no expr is refused",
+                "upsample \"m\" { }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "no `expr`");
+        // The trap this exists for: `r` is RADIUS in the surface vocabulary and RED here.
+        // Any surface name must be rejected BY NAME, never silently read as something else.
+        uReject("a surface variable in an upsample body is refused",
+                "upsample \"m\" { expr \"x + y\" }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "surface/shading variable");
+        uReject("an unknown identifier lists the upsample vocabulary",
+                "upsample \"m\" { expr \"q*2\" }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "unknown identifier");
+        uReject("spec: naming a missing spectrum says which",
+                "upsample \"m\" { expr \"spec:ghost(w)\" }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "unknown spectrum 'ghost'");
+        uReject("an uncalled spec: reference asks for the wavelength",
+                "spectrum \"g\" = gaussian center=550 sigma=30 amp=1\n"
+                "upsample \"m\" { expr \"spec:g\" }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "must be called with a wavelength");
+        // `tex:` has no hit point to sample at here; refusing beats silently returning 0.
+        uReject("a texture sample in an upsample body is out of scope",
+                "texture \"t\" { file scenes/graychecker.ppm  encoding linear }\n"
+                "upsample \"m\" { expr \"tex:t(0.5, 0.5)\" }\n"
+                "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }",
+                "out of scope");
+        // And the same `spec:` is NOT in scope in an ordinary pattern, which has a hit
+        // point but no wavelength — the symmetric half of the scope rule.
+        uReject("spec: outside an upsample body is out of scope",
+                "spectrum \"g\" = gaussian center=550 sigma=30 amp=1\n"
+                "pattern \"p\" { expr \"spec:g(550)\" }\n"
+                "material \"probe\" { type diffuse  reflect pattern:p }",
+                "out of scope");
+    }
+
+    bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
@@ -1001,6 +1181,7 @@ static int checkUpsample() {
     std::printf("[checkupsample] box round-trip max error = %.5f (<0.30 expected)  (%s)\n", boxErr, passF ? "ok" : "BAD");
     std::printf("[checkupsample] meng round-trip max error = %.5f (excl. white %.5f); smoother than JH: %s  (%s)\n",
                 mengErr, mengWhiteErr, mengSmoother ? "yes" : "NO", passG ? "ok" : "BAD");
+    std::printf("[checkupsample] user-declared `upsample` blocks  (%s)\n", passH ? "ok" : "BAD");
     std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
@@ -1782,6 +1963,379 @@ static int checkProp() {
     return ok ? 0 : 1;
 }
 
+// Deterministic self-test for INLINE ARRAY LITERAL sample calls — the axis tuple on
+// `[0 1](…)` (TODO "DECISION — color-vector / array syntax", the increment-2 `Deferred:`
+// clause and the `ADDENDUM — call = sample`).
+//
+// The claim under test is that an array literal's axis tuple takes DRIVERS, and that
+// leaving an axis open for the material's *user* is spelled by naming the one free input
+// (`[0 1](a)`) and binding it where the material is used (`material mat(a=u)`) — not by a
+// separate formal namespace. That claim is only worth anything if it is an IDENTITY, so
+// every positive case here compares two independently authored scenes whose probe
+// materials must be indistinguishable, exactly like checkProp; nothing is hard-coded.
+//
+// The refusals matter just as much: the one form the design text left open —
+// `formal=driver` *inside a literal's own tuple* — is refused rather than approximated,
+// because an inline literal's axes are anonymous and positional, so there is no formal to
+// bind and accepting it would have to invent a per-material default that two literals in
+// one material could contradict. Each refusal also pins its MESSAGE, because the message
+// is the whole value of a refusal.
+static int checkArray() {
+    bool ok = true;
+    auto chk = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkarray] %-58s BAD\n", what); ok = false; }
+    };
+    // `quadMat` is the geometry field's material *reference*, so a case can exercise the
+    // OTHER use site a bind can appear at — `material probe(a=u)` on the quad itself.
+    auto wrap = [](const char* body, const char* quadMat = "probe") {
+        return "scene { units meters }\n" + std::string(body) + "\n"
+               "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material " + quadMat + " }\n"
+               "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500 }\n"
+               "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32  film { res 8 8 } }\n";
+    };
+    auto loadMats = [&](const char* body, ftsl::Loaded& L, const char* quadMat = "probe") -> bool {
+        std::string e;
+        if (!ftsl::loadSource(wrap(body, quadMat), "<checkarray>", L, e)) {
+            std::printf("[checkarray] load FAILED: %s\n", e.c_str());
+            return false;
+        }
+        return true;
+    };
+    auto mustReject = [&](const char* what, const char* body, const char* needle) {
+        ftsl::Loaded L; std::string e;
+        if (ftsl::loadSource(wrap(body), "<checkarray>", L, e)) { chk(what, false); return; }
+        if (e.find(needle) == std::string::npos) {
+            std::printf("[checkarray] %-58s BAD (error was: %s)\n", what, e.c_str());
+            ok = false;
+        }
+    };
+    auto probeOf = [&](ftsl::Loaded& L) -> const Material& {
+        int mi = L.scene.tris.empty() ? 0 : L.scene.tris[0].matId;
+        return L.scene.mats[mi];
+    };
+    // Five probe points, so an identity that only holds on the diagonal (u == v, the
+    // classic way a rebind test passes for the wrong reason) cannot slip through.
+    PatCtx pts[5]{};
+    const double us[5] = {0.07, 0.31, 0.50, 0.83, 0.96};
+    const double vs[5] = {0.62, 0.11, 0.50, 0.24, 0.78};
+    for (int k = 0; k < 5; ++k) {
+        pts[k].x = 0.37; pts[k].y = -0.81; pts[k].z = 1.23;
+        pts[k].nx = 0.0; pts[k].ny = 1.0; pts[k].nz = 0.0; pts[k].r = 0.5; pts[k].f = 0.25;
+        pts[k].u = us[k]; pts[k].v = vs[k];
+    }
+    // The grid/scatter POOL has to be bound into the context, or `PatOp::Grid` bails out
+    // and returns 0.0 — and since a desugared array literal is nothing BUT a grid sample,
+    // every comparison here would then be 0 == 0 and pass vacuously. That is why the
+    // `varies` assertions below exist at all.
+    auto reflectAt = [&](ftsl::Loaded& L, const Material& m, const PatCtx& base_c) {
+        PatCtx c = base_c;
+        bindPatScene(c, L.scene);
+        double base = m.reflect(550.0);
+        if (m.reflectPat >= 0 && m.reflectPat < (int)L.scene.patterns.size()) {
+            const auto& p = L.scene.patterns[m.reflectPat].nodes;
+            base *= patternEval(p.data(), (int)p.size(), c);
+        }
+        return base;
+    };
+    // `tol` defaults to the bit-identity the rebind cases demand: those twins are the SAME
+    // grid sampled two ways, so any difference at all is a real one. A twin that spells the
+    // coordinate ARITHMETICALLY instead (section h) is a different claim — grid samples are
+    // stored as float32 while an expression evaluates in double, so the two agree only to
+    // float precision (~1e-8 here), and demanding more would be pinning the storage format
+    // rather than the semantics.
+    auto sameReflect = [&](const char* what, const char* refBody, const char* twinBody,
+                           double tol = 1e-12) {
+        ftsl::Loaded A, B;
+        if (!loadMats(refBody, A) || !loadMats(twinBody, B)) { chk(what, false); return; }
+        for (int k = 0; k < 5; ++k) {
+            double a = reflectAt(A, probeOf(A), pts[k]), b = reflectAt(B, probeOf(B), pts[k]);
+            if (std::fabs(a - b) > tol) {
+                std::printf("[checkarray] %-58s BAD (pt %d: %.12g vs %.12g)\n", what, k, a, b);
+                ok = false; return;
+            }
+        }
+    };
+    // Also assert the pair is not accidentally CONSTANT — a literal that failed to sample
+    // would compare equal to another that failed the same way.
+    auto varies = [&](const char* what, const char* body) {
+        ftsl::Loaded A;
+        if (!loadMats(body, A)) { chk(what, false); return; }
+        double lo = 1e300, hi = -1e300;
+        for (int k = 0; k < 5; ++k) {
+            double r = reflectAt(A, probeOf(A), pts[k]);
+            lo = std::fmin(lo, r); hi = std::fmax(hi, r);
+        }
+        if (hi - lo <= 1e-6) {
+            std::printf("[checkarray] %-58s BAD (constant: lo=%.12g hi=%.12g, pat=%d)\n",
+                        what, lo, hi, probeOf(A).reflectPat);
+            ok = false;
+        }
+    };
+
+    // (a) The baseline the rest is measured against: a literal really is the grid+pattern
+    //     it desugars to, and it really does vary with its driver.
+    sameReflect("`[0 1](u)` == the hand-written grid + pattern twin",
+        "material \"probe\" { type diffuse  reflect [0 1](u) }",
+        "grid \"g\" { shape 2  lo 0  hi 1  data { 0 1 } }\n"
+        "pattern \"p\" { expr \"grid:g(u)\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:p }");
+    varies("...and the sampled value actually tracks u",
+        "material \"probe\" { type diffuse  reflect [0 1](u) }");
+
+    // (b) THE ITEM. Naming the free input `a` leaves the axis open; binding it at the use
+    //     site must reproduce spending it inline. Both spellings of the bind — the
+    //     keyword form and the positional one — and both use sites (a geometry `material`
+    //     field and a property reference) have to agree with the inline literal.
+    sameReflect("formal `[0 1](a)` + keyword bind `(a=u)` == `[0 1](u)`",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=u) }",
+        "material \"probe\" { type diffuse  reflect [0 1](u) }");
+    sameReflect("formal `[0 1](a)` + POSITIONAL bind `(u)` == the keyword form",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(u) }",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=u) }");
+    {
+        // The other use site a bind can appear at: the geometry field itself,
+        // `material probe(a=u)`. It must land on the same answer as the inline literal.
+        ftsl::Loaded A, B;
+        if (loadMats("material \"probe\" { type diffuse  reflect [0 1](a) }", A, "probe(a=u)") &&
+            loadMats("material \"probe\" { type diffuse  reflect [0 1](u) }", B)) {
+            bool same = true;
+            for (int k = 0; k < 5; ++k)
+                if (std::fabs(reflectAt(A, probeOf(A), pts[k]) -
+                              reflectAt(B, probeOf(B), pts[k])) > 1e-12) same = false;
+            chk("binding a formal at a geometry `material` field agrees too", same);
+        } else ok = false;
+    }
+    varies("a bound formal axis actually varies with its driver",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=u) }");
+
+    // (c) The driver is an ordinary expression, not just a variable name — so the formal
+    //     route composes with arithmetic exactly like the inline route does.
+    sameReflect("a formal bound to an EXPRESSION == that expression written inline",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(a=0.25+0.5*v) }",
+        "material \"probe\" { type diffuse  reflect [0 1](0.25+0.5*v) }");
+
+    // (d) Multi-axis: the formals of a 2-D literal ARE the driver names in its own tuple
+    //     (the design text's `(u=a, v=x)` case), so a simultaneous swap must transpose the
+    //     lookup — and NOT collapse the way a sequential u->v, v->u rebind would.
+    sameReflect("2-D literal, simultaneous swap `(u=v, v=u)` == the transposed literal",
+        "material \"src\" { type diffuse  reflect [[0 0.3][0.6 1]](u,v) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(u=v, v=u) }",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](v,u) }");
+    {
+        // Negative twin for the same case: the swap must NOT equal the unswapped literal,
+        // or the assert above would pass for a rebind that silently did nothing.
+        ftsl::Loaded A, B;
+        const char* swapped =
+            "material \"src\" { type diffuse  reflect [[0 0.3][0.6 1]](u,v) }\n"
+            "material \"probe\" { type diffuse  reflect src.reflect(u=v, v=u) }";
+        const char* plain = "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](u,v) }";
+        if (loadMats(swapped, A) && loadMats(plain, B)) {
+            bool differs = false;
+            for (int k = 0; k < 5; ++k)
+                if (std::fabs(reflectAt(A, probeOf(A), pts[k]) -
+                              reflectAt(B, probeOf(B), pts[k])) > 1e-9) differs = true;
+            chk("...and the swap is not a silent no-op", differs);
+        } else ok = false;
+    }
+
+    // (e) THE PINNED REFUSAL. `formal=driver` inside a literal's own tuple has no formal
+    //     to bind. The message must carry BOTH escapes, because an author who wrote it
+    //     meant one of exactly two things.
+    mustReject("`[0 1](a=u)` is refused, not approximated",
+        "material \"probe\" { type diffuse  reflect [0 1](a=u) }", "no formal to bind");
+    mustReject("...and the refusal offers the spend-it-here spelling",
+        "material \"probe\" { type diffuse  reflect [0 1](a=u) }", "(u)`");
+    mustReject("...and the leave-it-free spelling",
+        "material \"probe\" { type diffuse  reflect [0 1](a=u) }", "material mat(a=u)");
+    mustReject("a keyword arg is refused after a positional one too",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](u, b=v) }",
+        "no formal to bind");
+
+    // (f) Errors name what the AUTHOR wrote. `__arrN` is a symbol they never chose and
+    //     cannot search the file for, so no message about a literal may mention it.
+    {
+        ftsl::Loaded L; std::string e;
+        ftsl::loadSource(wrap("material \"probe\" { type diffuse  reflect [0 1](nope) }"),
+                         "<checkarray>", L, e);
+        chk("a bad coordinate reports the author's site, not `__arrN`",
+            e.find("__arr") == std::string::npos &&
+            e.find("inline array literal's sample call") != std::string::npos &&
+            e.find("unknown identifier 'nope'") != std::string::npos);
+    }
+
+    // (g) The remaining shape errors, each naming the thing that is wrong.
+    mustReject("an unsaturated literal names the formal-axis escape",
+        "material \"probe\" { type diffuse  reflect [0 1] }", "`[0 1](a)`");
+    mustReject("an empty axis is named by index",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](u,) }", "axis 1");
+    mustReject("coordinate count is checked against the nesting",
+        "material \"probe\" { type diffuse  reflect [0 1](u,v) }", "one per nesting level");
+    mustReject("an unbindable formal name is named at the use site",
+        "material \"src\" { type diffuse  reflect [0 1](a) }\n"
+        "material \"probe\" { type diffuse  reflect src.reflect(b=u) }",
+        "not a bindable input");
+
+    // (h) COMPOSITION — a coordinate may itself be a sampled value, so a literal can be
+    //     written directly into another's sample call. Every identity here is checked
+    //     against a twin whose coordinate is spelled out ARITHMETICALLY, which is the
+    //     strongest available statement: the composed form is not merely self-consistent,
+    //     it agrees with what the inner grid's interpolation is defined to mean.
+    //     (A 2-sample grid over lo=0 hi=1 interpolates linearly, so `[0.5 1](u)` IS
+    //     `0.5+0.5*u` — that equivalence is what makes these twins non-circular.)
+    sameReflect("`[0 1]([0.2 0.8](u))` == the composed coordinate written inline",
+        "material \"probe\" { type diffuse  reflect [0 1]([0.2 0.8](u)) }",
+        "material \"probe\" { type diffuse  reflect [0 1](0.2+0.6*u) }", 1e-6);
+    varies("...and a composed literal actually tracks its innermost driver",
+        "material \"probe\" { type diffuse  reflect [0 1]([0.2 0.8](u)) }");
+    // A NON-identity outer array, so the case cannot pass by the outer grid being a
+    // no-op that returns its own coordinate: here the outer is a 3-sample tent, and
+    // sampling it over the inner's [0.5,1] half gives the falling edge, `1-u`.
+    sameReflect("a non-identity outer array composes correctly (`[0 1 0]([0.5 1](u))`)",
+        "material \"probe\" { type diffuse  reflect [0 1 0]([0.5 1](u)) }",
+        "material \"probe\" { type diffuse  reflect [1 0](u) }", 1e-6);
+    sameReflect("composition nests to depth 3",
+        "material \"probe\" { type diffuse  reflect [0 1]([0 1]([0.2 0.8](u))) }",
+        "material \"probe\" { type diffuse  reflect [0.2 0.8](u) }", 1e-6);
+    sameReflect("a composed literal is one AXIS of a multi-axis call, not the whole call",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]]([0.5 1](u), v) }",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](0.5+0.5*u, v) }", 1e-6);
+    sameReflect("a composed literal is a TERM in a coordinate expression",
+        "material \"probe\" { type diffuse  reflect [0 1](0.5*[0.5 1](u)+0.25) }",
+        "material \"probe\" { type diffuse  reflect [0 1](0.5*(0.5+0.5*u)+0.25) }", 1e-6);
+    // The refusals. A composed literal reaches the loader as raw TEXT inside one token
+    // (the lexer cannot balance-check brackets it is deliberately holding together), so
+    // the loader is the only place these can be diagnosed — and it must diagnose them
+    // against the author's own source rather than let a mangled name reach the compiler.
+    mustReject("a composed literal needs its own sample call",
+        "material \"probe\" { type diffuse  reflect [0 1]([0.2 0.8]) }",
+        "needs its own trailing call");
+    mustReject("an unbalanced composed literal is named, not silently re-lexed",
+        "material \"probe\" { type diffuse  reflect [0 1]([0.2 0.8 (u)) }",
+        "unbalanced");
+    mustReject("the composed literal's OWN arity is checked against its nesting",
+        "material \"probe\" { type diffuse  reflect [0 1]([[0 1][2 3]](u)) }",
+        "one per nesting level");
+    mustReject("a literal glued to an identifier is a typo, not a composition",
+        "material \"probe\" { type diffuse  reflect [0 1](x[0.2 0.8](u)) }",
+        "stand on its own");
+    {
+        // Same rule as (f), one level deeper: the generated names multiply under
+        // composition, so this is exactly where a leak would show up first.
+        ftsl::Loaded L; std::string e;
+        ftsl::loadSource(wrap("material \"probe\" { type diffuse  reflect [0 1]([0.2 0.8](nope)) }"),
+                         "<checkarray>", L, e);
+        chk("a bad coordinate INSIDE a composition still names the author's site",
+            e.find("__arr") == std::string::npos &&
+            e.find("unknown identifier 'nope'") != std::string::npos);
+    }
+
+    // (i) A NAMED table sampled directly at a value site — `reflect grid:ramp(u)`. This is
+    //     the same statement as an inline literal written the other way round: an inline
+    //     `[0 1](u)` desugars to precisely this expression wrapped in an anonymous pattern,
+    //     so the two spellings must be INDISTINGUISHABLE. That is the claim under test, and
+    //     it is why these pins live in `-checkarray` rather than a suite of their own.
+    //     Only the *scoped* spelling is accepted: a bare `ramp(u)` at a value site already
+    //     means "apply the material `ramp`", so `grid:` / `scatter:` is what keeps the
+    //     meaning from depending on which namespace happens to hold the name.
+    const std::string gramp = "grid \"g\" { shape 2  lo 0  hi 1  data { 0 1 } }\n";
+    const std::string ghalf = "grid \"h\" { shape 2  lo 0  hi 1  data { 0.5 1 } }\n";
+    const std::string gcall = gramp + "material \"probe\" { type diffuse  reflect grid:g(u) }";
+    sameReflect("`reflect grid:g(u)` == the inline literal it desugars to",
+        gcall.c_str(), "material \"probe\" { type diffuse  reflect [0 1](u) }");
+    varies("...and it actually tracks its coordinate", gcall.c_str());
+    sameReflect("a 2-D table call matches the 2-D literal",
+        "grid \"g2\" { shape 2 2  lo 0  hi 1  data { 0 0.3  0.6 1 } }\n"
+        "material \"probe\" { type diffuse  reflect grid:g2(u,v) }",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](u,v) }");
+    sameReflect("a `scatter:` call is accepted at a value site too",
+        "scatter \"s\" { dim 1  power 2  data { 0 0   1 1 } }\n"
+        "material \"probe\" { type diffuse  reflect scatter:s(u) }",
+        "scatter \"s\" { dim 1  power 2  data { 0 0   1 1 } }\n"
+        "pattern \"p\" { expr \"scatter:s(u)\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:p }");
+    // The deferral route works here for the same reason it works for a literal: `a` is an
+    // ordinary coordinate that survives to the use site, where the bundle substitution
+    // rebinds it. Nothing about it is special-cased for tables.
+    {
+        const std::string deferred = gramp +
+            "material \"src\" { type diffuse  reflect grid:g(a) }\n"
+            "material \"probe\" { type diffuse  reflect src.reflect(a=u) }";
+        sameReflect("`grid:g(a)` + a use-site bind == spending the axis inline",
+            deferred.c_str(), gcall.c_str());
+    }
+    // Composition runs BOTH directions — a literal inside a named table's call and a table
+    // call inside a literal's — because both go through the one `desugarNestedLiterals`.
+    // The second uses a non-identity outer table, so it cannot pass by the outer being a
+    // no-op: `[0 1 0]` sampled over `h`'s [0.5,1] half is the tent's falling edge, `1-u`.
+    {
+        const std::string litIn = gramp +
+            "material \"probe\" { type diffuse  reflect grid:g([0.5 1](u)) }";
+        sameReflect("a literal composes INTO a named table's call", litIn.c_str(),
+            "material \"probe\" { type diffuse  reflect [0 1](0.5+0.5*u) }", 1e-6);
+        const std::string callIn = ghalf +
+            "material \"probe\" { type diffuse  reflect [0 1 0](grid:h(u)) }";
+        sameReflect("...and a named table's call composes INTO a literal", callIn.c_str(),
+            "material \"probe\" { type diffuse  reflect [1 0](u) }", 1e-6);
+    }
+    {
+        // A SCALAR slot: `roughness` takes the sampled table as its per-hit pattern, exactly
+        // as the inline literal does. Compared by evaluating the two bound patterns, since
+        // `reflectAt` only reaches the reflect slot.
+        auto roughAt = [&](ftsl::Loaded& L, const PatCtx& base_c) {
+            PatCtx c = base_c;
+            bindPatScene(c, L.scene);
+            int pat = probeOf(L).roughnessPat;
+            if (pat < 0 || pat >= (int)L.scene.patterns.size()) return -1e300;
+            const auto& p = L.scene.patterns[pat].nodes;
+            return patternEval(p.data(), (int)p.size(), c);
+        };
+        ftsl::Loaded A, B;
+        const std::string rc = gramp + "material \"probe\" { type glossy  roughness grid:g(u) }";
+        if (loadMats(rc.c_str(), A) &&
+            loadMats("material \"probe\" { type glossy  roughness [0 1](u) }", B)) {
+            bool same = true, live = false;
+            const double a0 = roughAt(A, pts[0]);
+            for (int k = 0; k < 5; ++k) {
+                double a = roughAt(A, pts[k]), b = roughAt(B, pts[k]);
+                if (a < -1e299 || std::fabs(a - b) > 1e-12) same = false;
+                if (k && std::fabs(a - a0) > 1e-6) live = true;
+            }
+            chk("a table call binds a SCALAR slot's pattern like the literal does", same);
+            chk("...and that scalar pattern is not a constant", live);
+        } else ok = false;
+    }
+    // The refusals. Two of them are the whole point of hooking four separate value sites
+    // rather than one: a slot that cannot hold a per-hit value has to SAY so, instead of
+    // reading `grid:g(u)` as the number zero or as an unrecognized spectrum expression.
+    {
+        const std::string iorCall = gramp +
+            "material \"probe\" { type dielectric  ior grid:g(u) }";
+        mustReject("a per-hit table is refused at a load-time SPECTRAL slot",
+            iorCall.c_str(), "fixed at load time");
+        const std::string filmCall = gramp +
+            "material \"probe\" { type thinfilm  film_ior grid:g(u) }";
+        mustReject("a per-hit table is refused at a load-time SCALAR slot",
+            filmCall.c_str(), "fixed at load time");
+        const std::string bare = gramp + "material \"probe\" { type diffuse  reflect grid:g }";
+        mustReject("naming a table without sampling it is refused, not defaulted",
+            bare.c_str(), "does not sample it");
+        const std::string arity = gramp +
+            "material \"probe\" { type diffuse  reflect grid:g(u,v) }";
+        mustReject("the call's arity is checked against the table's own dimensionality",
+            arity.c_str(), "expects 1 arg");
+    }
+    mustReject("an unknown table is named",
+        "material \"probe\" { type diffuse  reflect grid:nope(u) }", "unknown grid");
+
+    std::printf("[checkarray] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic distant-sun self-test (EmitterShape::Sun; src/scene.h addSunLight /
 // sampleCone / inCone / geomWeight). No scene file, no renderer, no RNG-seeded image —
 // it pins the four invariants the emitter's correctness rests on:
@@ -2099,8 +2653,11 @@ static int g_heroC = hero::kHeroC;
 
 // Scene-ignore render params (Stage 3), set once at arg-parse and read by the tracer
 // wrappers (like g_heroC). g_maxBounceOverride < 0 leaves each tracer's own default
-// (32); >= 1 caps the path-depth loop and is honoured UNIVERSALLY (forward B, backward
-// R/RGB, BDPT, photon/SPPM, P). g_directOnly renders direct lighting + specular recursion
+// (32 for the unidirectional tracers, 8 for the bidirectional D/U estimators, whose
+// connection cost grows ~depth^2); >= 1 SETS the path-depth loop and is honoured
+// UNIVERSALLY (forward B, backward R/RGB, BDPT D, VCM U, photon/SPPM, P). Note that for
+// D/U it can RAISE the depth as well as cap it, which is what a specular-only cavity
+// needs. g_directOnly renders direct lighting + specular recursion
 // only (no diffuse indirect bounce) — a Whitted-style near-1-spp preview — in the CAMERA
 // path tracers where it is well-defined: backward R, the RGB fast path, and the backward
 // camera side of the P composite. The forward light tracer (B) and the photon /
@@ -2594,6 +3151,188 @@ static void onInterrupt(int sig) {
     g_stopRequested = 1;
 }
 
+// --- External graceful stop (`ftrace -stop [<pid>|all]`) -----------------------
+// Ctrl-C only reaches a render that owns the console it was started from. A render
+// launched detached, or from a tool that isn't its parent, previously had no way to
+// be stopped except `taskkill /F` -- and killing ftrace while CUDA kernels are in
+// flight is a well-known way to wedge the NVIDIA display driver (TDR / bugcheck).
+// "Just kill it" is therefore not an acceptable stop for this program. This channel
+// delivers the exact same CLEAN stop Ctrl-C delivers -- finish the current chunk,
+// write the final image + .ftbuf checkpoint, unwind through cudaGracefulShutdown()
+// -- but triggerable from outside the process.
+//
+// The channel is a sentinel FILE, deliberately, rather than a named event or socket:
+// renders run in the interactive Console session while whatever wants to stop them
+// may live in a different session / window station (the same split that makes
+// -window invisible when launched from a sandboxed shell), and `Local\` kernel
+// objects are per-session. The filesystem is the one namespace both sides share.
+//
+//   <temp>/ftrace/<pid>.run    exists while this process runs; holds a one-line
+//                              "scene -> output" description. `-stop` with no
+//                              argument lists these, `-stop all` targets them all.
+//                              Removed on exit; one left behind by a hard kill is
+//                              reaped by the next -stop (the pid is probed first).
+//   <temp>/ftrace/<pid>.stop   created by `ftrace -stop <pid>`. The target's watcher
+//                              thread sees it within ~250 ms, deletes it, and raises
+//                              the very same g_stopRequested flag Ctrl-C raises.
+//                              Nothing is force-killed, ever.
+static std::atomic<bool>     g_extStopRequested{false};  // also breaks the -keepwindow hold
+static std::atomic<bool>     g_stopWatchQuit{false};
+static std::thread           g_stopWatchThread;
+static std::filesystem::path g_stopRunFile, g_stopSentinelFile;
+
+// <temp>/ftrace, created on demand. Empty path = no usable temp dir (channel disabled).
+static std::filesystem::path stopChannelDir() {
+    std::error_code ec;
+    std::filesystem::path d = std::filesystem::temp_directory_path(ec);
+    if (ec) return {};
+    d /= "ftrace";
+    std::filesystem::create_directories(d, ec);
+    return ec ? std::filesystem::path{} : d;
+}
+
+static long ftraceCurrentPid() {
+#ifdef _WIN32
+    return (long)GetCurrentProcessId();
+#else
+    return (long)getpid();
+#endif
+}
+
+// Is that pid still alive? Only used to reap a .run file whose owner died hard, so a
+// conservative "yes" off Windows just means stale entries linger in the -stop listing.
+static bool ftraceProcessAlive(long pid) {
+#ifdef _WIN32
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+    if (!h) return false;                                   // gone (or not ours to touch)
+    bool alive = (WaitForSingleObject(h, 0) == WAIT_TIMEOUT);
+    CloseHandle(h);
+    return alive;
+#else
+    (void)pid; return true;
+#endif
+}
+
+// Publish this process in the stop channel and start watching for its sentinel.
+static void stopChannelStart(const std::string& what) {
+    std::filesystem::path dir = stopChannelDir();
+    if (dir.empty()) return;                     // no temp dir: run without the channel
+    const long pid = ftraceCurrentPid();
+    g_stopRunFile      = dir / (std::to_string(pid) + ".run");
+    g_stopSentinelFile = dir / (std::to_string(pid) + ".stop");
+    std::error_code ec;
+    // A sentinel already sitting here belongs to a dead process whose pid we've been
+    // recycled into; clear it so we don't stop the instant we start.
+    std::filesystem::remove(g_stopSentinelFile, ec);
+    { std::ofstream f(g_stopRunFile); f << what << "\n"; }
+    g_stopWatchQuit.store(false);
+    g_stopWatchThread = std::thread([] {
+        while (!g_stopWatchQuit.load(std::memory_order_relaxed)) {
+            std::error_code e;
+            if (std::filesystem::exists(g_stopSentinelFile, e)) {
+                std::filesystem::remove(g_stopSentinelFile, e);
+                // Deliberately true whether a render is in flight (finish the chunk, write,
+                // exit) or the process is just holding a -keepwindow preview open.
+                std::printf("\n[stop] external stop requested — stopping cleanly "
+                            "(any render in progress writes its image + checkpoint first).\n");
+                std::fflush(stdout);
+                g_extStopRequested.store(true);
+                g_stopRequested = 1;   // the one flag every render loop already polls
+                return;                // one-shot: never re-arm behind a later frame
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    });
+}
+
+static void stopChannelEnd() {
+    g_stopWatchQuit.store(true);
+    if (g_stopWatchThread.joinable()) g_stopWatchThread.join();
+    std::error_code ec;
+    if (!g_stopRunFile.empty()) std::filesystem::remove(g_stopRunFile, ec);
+}
+
+// `ftrace -stop [<pid>|all]`: list running renders, or ask one/all of them to finish
+// cleanly. Never loads a scene, never touches the GPU; returns a process exit code.
+static int runStopCommand(const char* who) {
+    std::filesystem::path dir = stopChannelDir();
+    if (dir.empty()) {
+        std::fprintf(stderr, "error: -stop cannot reach the ftrace stop-channel directory\n");
+        return 1;
+    }
+    // Every live render, reaping .run files whose owner is gone (hard kill / crash).
+    std::vector<std::pair<long, std::string>> live;
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+        if (de.path().extension() != ".run") continue;
+        const long pid = std::strtol(de.path().stem().string().c_str(), nullptr, 10);
+        if (pid <= 0) continue;
+        if (!ftraceProcessAlive(pid)) { std::filesystem::remove(de.path(), ec); continue; }
+        std::string what;
+        { std::ifstream f(de.path()); std::getline(f, what); }
+        live.emplace_back(pid, what);
+    }
+    std::sort(live.begin(), live.end());
+
+    if (!who) {                                   // bare -stop: just list what's running
+        if (live.empty()) { std::printf("[stop] no ftrace renders are running.\n"); return 0; }
+        std::printf("[stop] running renders — stop one with `ftrace -stop <pid>`, "
+                    "all with `ftrace -stop all`:\n");
+        for (const auto& p : live) std::printf("    pid %-7ld %s\n", p.first, p.second.c_str());
+        return 0;
+    }
+
+    std::vector<long> targets;
+    if (!std::strcmp(who, "all")) {
+        for (const auto& p : live) targets.push_back(p.first);
+        if (targets.empty()) { std::printf("[stop] no ftrace renders are running.\n"); return 0; }
+    } else {
+        char* end = nullptr;
+        const long pid = std::strtol(who, &end, 10);
+        if (!end || *end || pid <= 0) {
+            std::fprintf(stderr, "error: -stop takes a pid or 'all' (got \"%s\")\n", who);
+            return 1;
+        }
+        bool known = false;
+        for (const auto& p : live) if (p.first == pid) known = true;
+        if (!known)
+            std::printf("[stop] warning: pid %ld isn't a running ftrace render "
+                        "(dropping the sentinel anyway)\n", pid);
+        targets.push_back(pid);
+    }
+
+    for (long pid : targets) {
+        const std::filesystem::path s = dir / (std::to_string(pid) + ".stop");
+        std::ofstream f(s);
+        if (!f) { std::fprintf(stderr, "error: cannot write %s\n", s.string().c_str()); return 1; }
+        f << "stop\n";
+        std::printf("[stop] asked pid %ld to finish and exit cleanly.\n", pid);
+    }
+    std::fflush(stdout);
+
+    // Wait for them to actually go. A render only notices at a chunk boundary and then
+    // still has to write its image + checkpoint, so this can legitimately take up to
+    // one -interval (default 15 s) plus the write; give it a generous ceiling and say
+    // so rather than leaving the caller guessing whether the stop took.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    std::vector<long> pending = targets;
+    while (!pending.empty() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        std::vector<long> still;
+        for (long pid : pending)
+            if (ftraceProcessAlive(pid) &&
+                std::filesystem::exists(dir / (std::to_string(pid) + ".run"), ec))
+                still.push_back(pid);
+        pending.swap(still);
+    }
+    if (pending.empty()) { std::printf("[stop] done — stopped cleanly.\n"); return 0; }
+    std::printf("[stop] still running after 120s:");
+    for (long pid : pending) std::printf(" %ld", pid);
+    std::printf("\n[stop] it may be mid-write, or in a long non-chunked batch "
+                "(a bare -n render with no -window/-time/-noise budget writes only at the end).\n");
+    return 2;
+}
+
 // --- Live preview window (-window) --------------------------------------------
 // When enabled, the render drivers periodically push the current tone-mapped frame
 // to a real OS window (Win32 GDI; no-op stub off Windows) so the image is watched as
@@ -2829,7 +3568,8 @@ static bool readCompositeCheckpoint(const std::string& outPath, int res, int res
 //     sidecar does not persist the exposure mode, so this uses the same p99 auto-
 //     exposure as a non-absolute render; an absolute (power/lumens) scene may look
 //     brighter/darker than its original -o image. Re-run the render for an
-//     exposure-exact PNG.
+//     exposure-exact PNG. A trailing `-ev <c>` scales that auto-exposure, which is
+//     how you re-develop a finished render brighter without paying for it again.
 //   * .ftsl — NOT handled here (it is a scene, not an image): render it with -in.
 
 // Read a binary P6 (8-bit) PPM into a top-row-first RGB byte buffer. Returns false
@@ -2866,7 +3606,11 @@ static bool readBinaryPPM(const std::string& path, int& W, int& H,
     return (bool)in && in.gcount() == (std::streamsize)rgb.size();
 }
 
-static int convertToPng(const std::string& inPath, const std::string& outPath) {
+// `expComp` is the -exposure/-ev multiplier applied on top of the auto-exposure
+// (<= 0 means "plain auto"). It only affects a .ftbuf, whose linear film is still
+// tone-mapped here; a .ppm is already 8-bit sRGB and is copied through verbatim.
+static int convertToPng(const std::string& inPath, const std::string& outPath,
+                        double expComp = 0.0) {
     if (endsWithCI(inPath, ".ppm")) {
         int W = 0, H = 0; std::vector<uint8_t> rgb;
         if (!readBinaryPPM(inPath, W, H, rgb)) {
@@ -2901,9 +3645,9 @@ static int convertToPng(const std::string& inPath, const std::string& outPath) {
         in.read((char*)f.xyz.data(),  (std::streamsize)(f.xyz.size()  * sizeof(Vec3)));
         in.read((char*)f.hits.data(), (std::streamsize)(f.hits.size() * sizeof(double)));
         if (!in) { std::fprintf(stderr, "error: %s truncated\n", inPath.c_str()); return 1; }
-        // Tone-map with the default p99 auto-exposure (see note above). writeFilm prints
-        // the "wrote <out> ..." line.
-        return writeFilm(outPath.c_str(), f, (double)std::max<long long>(Nph, 1)) ? 0 : 1;
+        // Tone-map with the p99 auto-exposure (see note above), scaled by -ev if given.
+        // writeFilm prints the "wrote <out> ..." line, including the comp when != 1.
+        return writeFilm(outPath.c_str(), f, (double)std::max<long long>(Nph, 1), expComp) ? 0 : 1;
     }
     std::fprintf(stderr,
         "error: -topng converts .ppm and .ftbuf inputs; got '%s'.\n"
@@ -3681,7 +4425,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                  "(backward) instead.\n", unsupported);
             return 1;
         }
-        int maxDepth = 8;   // path length in edges; connection cost grows ~depth^2
+        // Path length in edges; connection cost grows ~depth^2, so the default stays
+        // low. `-max-bounce` raises it: a specular-only cavity (a mirror-lined sphere,
+        // a kaleidoscope, nested dielectrics) needs far more than 8 edges before the
+        // recursive images stop truncating to black, and specular vertices are cheap
+        // because a delta BSDF has no connection to make.
+        int maxDepth = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
         std::printf("mode D: bidirectional path tracing at %dx%d on %s (maxDepth=%d, light=%s) ...\n",
                     res, resY, useGpu ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str(),
                     maxDepth, lightLabel);
@@ -3836,7 +4585,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                  "or D (BDPT) instead.\n", unsupported);
             return 1;
         }
-        int maxDepth = 8;   // full path length in edges
+        int maxDepth = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;  // full path length in edges
         double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                           : scene.sceneRadius * g_pmRadiusFactor;
         // Hero-wavelength bundle (Wilkie 2014). Mode U's scene scope already excludes
@@ -4502,7 +5251,8 @@ static void printHelp(const char* prog) {
 "  -no-media             drop all participating media (haze/fog/volumes)\n"
 "  -no-env               remove the environment (sky/IBL) light\n"
 "  -no-fluoro            demote fluorescent materials to plain diffuse\n"
-"  -max-bounce <n>       cap path depth at n bounces (default 32)\n"
+"  -max-bounce <n>       set path depth to n bounces (default 32; modes D/U default 8,\n"
+"                        where raising it is what a mirror-lined cavity needs)\n"
 "  -direct-only          Whitted: direct + specular recursion only, no diffuse indirect\n"
 "                        (near-1-spp preview; camera modes R/RGB and P's backward side)\n"
 "\n"
@@ -4515,12 +5265,17 @@ static void printHelp(const char* prog) {
 "  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C)\n"
 "  -resume               continue an accumulated render from its .ftbuf checkpoint\n"
 "  -parseonly            load the scene, print a contents summary, exit (no render)\n"
+"  -stop [<pid>|all]     ask a RUNNING ftrace to finish cleanly (image + checkpoint\n"
+"                        written, CUDA torn down) instead of killing it; bare -stop\n"
+"                        lists running renders. Never force-kill a CUDA render.\n"
 "\n"
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
 "  -raster-iso <n>       marching-cubes resolution for isosurfaces (0 = skip)\n"
 "  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T for a live path-traced preview\n"
 "  -noclip|-nocollide    start the fly viewer with wall collision off\n"
+"  -anim <file.json>     edit a loom CurveDrive sidecar in the fly viewer (implies -explore);\n"
+"                        control points seed from it and Save writes the reshaped curve back\n"
 "  -see-through|-glass   render clear dielectrics as see-through; -glass-clarity <0..1>\n"
 "\n"
 "Stereoscopic 3-D output:\n"
@@ -4530,11 +5285,13 @@ static void printHelp(const char* prog) {
 "  -dpi <n|auto>         screen pixel density; -convergence <m> = convergence-plane distance\n"
 "\n"
 "Utilities (exit after running):\n"
-"  -topng|-convert <in> <out.png>   convert .ppm/.ftbuf to PNG\n"
+"  -topng|-convert <in> <out.png> [-ev <c>]   convert .ppm/.ftbuf to PNG\n"
+"                        (-ev re-develops a .ftbuf brighter/darker, no re-render)\n"
 "  -review <base>        play a rendered frame sequence on the live window\n"
 "  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
 "  -viewer <s.json>      open the loom native viewer on a scene-introspection sidecar\n"
+"  -loom <scene.py>      with -viewer: re-derive geometry live from this loom build\n"
 "  -h | --help           show this help and exit\n"
 "\n"
 "See README.md for the complete flag list (fog, thin-film, meshes, diagnostics, …).\n",
@@ -4569,11 +5326,22 @@ static int run(int argc, char** argv) {
     // checkpoint). Kept before all scene/CLI setup so it is a pure utility path.
     if (argc >= 2 && (!std::strcmp(argv[1], "-topng") || !std::strcmp(argv[1], "-convert"))) {
         if (argc < 4) {
-            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> <output.png>\n",
+            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> [-ev <c>] <output.png>\n",
                          argv[0]);
             return 2;
         }
-        return convertToPng(argv[2], argv[3]);
+        // This branch runs before the main parse loop, so -exposure/-ev has to be picked
+        // up here or it is silently ignored (it was, until 0.102.1). Only meaningful for
+        // .ftbuf, which still holds linear film and is tone-mapped on the way out; a .ppm
+        // is already 8-bit sRGB and is copied through untouched.
+        double convExp = 0.0;   // <=0 = plain p99 auto-exposure
+        for (int i = 4; i + 1 < argc; ++i)
+            if (!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev"))
+                convExp = std::atof(argv[++i]);
+        if (convExp > 0.0 && endsWithCI(argv[2], ".ppm"))
+            std::fprintf(stderr, "warning: -ev ignored for a .ppm input (already 8-bit sRGB); "
+                                 "it only applies to a .ftbuf's linear film\n");
+        return convertToPng(argv[2], argv[3], convExp);
     }
     // Rendered-sequence review player (no rendering): `ftrace -review <base>`.
     // Plays a directory of `<base><digits>.<ext>` frames on the live window/timeline,
@@ -4632,6 +5400,7 @@ static int run(int argc, char** argv) {
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
     bool checkPropOnly = false;
+    bool checkArrayOnly = false;
     bool checkSunOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
@@ -4661,6 +5430,8 @@ static int run(int argc, char** argv) {
     bool exploreMode = false;     // -explore/-fly: raster + interactive fly viewer seeded at the first selected frame (no full render)
     bool noMeter     = false;     // -no-meter/-nometer: skip the exposure-lock metering pre-pass (frames auto-expose instead)
     bool viewerNoclip = false;    // -noclip/-nocollide: start the interactive fly-viewer with collision OFF (fly through walls)
+    std::string animSidecar;      // -anim <file.json>: loom CurveDrive sidecar the curve editor seeds from / saves back to (E2 channel a)
+    std::string animLoomScene;    // -loom <scene.py>: with -anim, the build file the LIVE channel re-derives from (E2 channel b)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
     bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
     int  rasterBench = 0;         // -raster-bench <n>: render the first camera n times, report steady-state ms/frame (explorer metric)
@@ -4757,6 +5528,18 @@ static int run(int argc, char** argv) {
         }
     }
 
+    // The prefer/else resolver asks this predicate whether a branch renders; when the
+    // policy is fallback/strip we accept every branch (the policy handles it later at
+    // render time), so the FIRST/most-preferred branch always wins. Function-scoped
+    // because the initial load is not the only one: the fly editor's loom live channel
+    // (-anim -loom) re-loads an emitted .ftsl mid-flight and must resolve prefer/else
+    // exactly the way the scene it is replacing did.
+    ftsl::SupportFn supportFn = (g_onUnsupported == OnUnsupported::Error)
+        ? ftsl::SupportFn([cliModePrescan](const ftsl::Loaded& L) -> const char* {
+              return sceneModeUnsupported(L, cliModePrescan);
+          })
+        : ftsl::SupportFn{};
+
     ftsl::Loaded ftslScene;
     bool fromFtsl = false;
     if (positionalMesh) {
@@ -4801,14 +5584,6 @@ static int run(int argc, char** argv) {
         }
     } else if (inFile) {
         std::string ferr;
-        // The prefer/else resolver asks this predicate whether a branch renders; when the
-        // policy is fallback/strip we accept every branch (the policy handles it later at
-        // render time), so the FIRST/most-preferred branch always wins.
-        ftsl::SupportFn supportFn = (g_onUnsupported == OnUnsupported::Error)
-            ? ftsl::SupportFn([cliModePrescan](const ftsl::Loaded& L) -> const char* {
-                  return sceneModeUnsupported(L, cliModePrescan);
-              })
-            : ftsl::SupportFn{};
         if (!ftsl::load(inFile, ftslScene, ferr, supportFn)) {
             std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
             return 1;
@@ -4944,6 +5719,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
         else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
+        else if (!std::strcmp(argv[i], "-checkarray")) checkArrayOnly = true;
         else if (!std::strcmp(argv[i], "-checksun")) checkSunOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
@@ -4970,6 +5746,20 @@ static int run(int argc, char** argv) {
             // per frame), and metering a whole flyby's frames just to fly one is wasteful,
             // so explore implies -no-meter.
             exploreMode = true; doRaster = true; g_showWindow = true; g_keepWindow = true; noMeter = true;
+        }
+        else if (!std::strcmp(argv[i], "-anim") && i + 1 < argc) {
+            // Edit a loom `CurveDrive` sidecar (E2 channel a) instead of a bare camera
+            // path: the editor's control points ARE the drive's N-D curve, and Save
+            // writes the reshaped curve back to this file. Implies the fly editor.
+            animSidecar = argv[++i];
+            exploreMode = true; doRaster = true; g_showWindow = true; g_keepWindow = true; noMeter = true;
+        }
+        else if ((!std::strcmp(argv[i], "-loom") || !std::strcmp(argv[i], "--loom")) && i + 1 < argc) {
+            // With -anim, the loom build file to open the E2 **live** channel against:
+            // the editor spawns `python -m loom.anim <scene.py> --config <sidecar>` and
+            // every scrub position becomes a freshly-emitted .ftsl. (With -viewer the
+            // same flag names the F4 re-introspection scene; that pre-scan runs earlier.)
+            animLoomScene = argv[++i];
         }
         else if (!std::strcmp(argv[i], "-no-meter") || !std::strcmp(argv[i], "-nometer")) noMeter = true;
         else if (!std::strcmp(argv[i], "-noclip") || !std::strcmp(argv[i], "-nocollide")) viewerNoclip = true;
@@ -5097,6 +5887,7 @@ static int run(int argc, char** argv) {
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
     if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)
+    if (checkArrayOnly)    return checkArray();    // ditto
     if (checkSunOnly)      return checkSun();      // deterministic, no scene needed
 
     // --- every output directory must exist BEFORE a single photon is traced ----------
@@ -6161,7 +6952,9 @@ static int run(int argc, char** argv) {
             (void)raster_cuda::profTake();
 #endif
             std::vector<double> ms;
+            std::vector<double> tail;                 // host-side present cost, timed separately
             ms.reserve(rasterBench);
+            tail.reserve(rasterBench);
             for (int it = 0; it < rasterBench && !g_stopRequested; ++it) {
                 auto t0 = std::chrono::steady_clock::now();
                 img = rasterOne(rc.cam, W, H, ev, autoExp, nullptr);
@@ -6169,11 +6962,44 @@ static int run(int argc, char** argv) {
                                  std::chrono::steady_clock::now() - t0).count());
                 if (g_showWindow) {
                     if (!g_liveWin) g_liveWin = std::make_unique<LiveWindow>(W, H, g_windowTitle.c_str());
+                    // The present tail used to dwarf the render itself (a per-pixel RGB->BGRA
+                    // repack plus a HALFTONE StretchDIBits, both charged to the render thread),
+                    // so report it: a faster backend is only a real speedup if this stays small.
+                    auto t1 = std::chrono::steady_clock::now();
                     g_liveWin->update(W, H, img);
+                    tail.push_back(std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - t1).count());
                     if (g_liveWin->closed()) g_stopRequested = 1;
                 }
             }
 #ifdef HAVE_CUDA
+            raster_cuda::Prof profHost = raster_cuda::profTake();   // phase 1's per-pass tally
+            // ---- Phase 2: the same frame delivered ZERO-COPY -----------------------------
+            // Identical render work, but the tonemap writes the live window's D3D11 texture
+            // in place, so there is no device->host download, no copy out of the pinned
+            // buffer, and no re-upload. Timed end to end (render + show) so it can be read
+            // straight against phase 1's render time + present tail, which is the same job
+            // routed through host memory.
+            std::vector<double> zc;
+            bool zcTried = false;
+            if (gpuRaster && g_showWindow && g_liveWin) {
+                zcTried = true;
+                zc.reserve(rasterBench);
+                for (int it = 0; it < rasterBench && !g_stopRequested; ++it) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    bool ok = g_liveWin->renderShared(W, H, [&](void* dev, void* tex) -> bool {
+                        if (!raster_cuda::bindPresentTarget(gpuRaster, dev, tex, W, H)) return false;
+                        return raster_cuda::renderFrameToTarget(gpuRaster, rc.cam, W, H, nThreads,
+                                                                ev, autoExp, nullptr,
+                                                                rasterSeeThrough, rasterClarity);
+                    });
+                    if (!ok) { zc.clear(); break; }   // no interop here: report it, don't fake it
+                    zc.push_back(std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - t0).count());
+                    if (g_liveWin->closed()) g_stopRequested = 1;
+                }
+            }
+            raster_cuda::Prof profZc = raster_cuda::profTake();     // phase 2's per-pass tally
             raster_cuda::profEnable(false);
 #endif
             if (!ms.empty()) {
@@ -6187,17 +7013,42 @@ static int run(int argc, char** argv) {
                             "mean %.2f ms  (%.1f fps @ median)\n",
                             ms.size(), W, H, mn, md, mean, md > 0 ? 1000.0 / md : 0.0);
             }
+            if (!tail.empty()) {
+                std::vector<double> s = tail;
+                std::sort(s.begin(), s.end());
+                double mean = 0;
+                for (double v : tail) mean += v;
+                mean /= tail.size();
+                std::printf("[raster-bench] live-window present tail: min %.2f ms  median %.2f ms  "
+                            "mean %.2f ms\n", s.front(), s[s.size() / 2], mean);
+            }
 #ifdef HAVE_CUDA
             {
-                raster_cuda::Prof p = raster_cuda::profTake();
-                if (p.frames > 0) {
+                auto passLine = [](const char* what, const raster_cuda::Prof& p) {
+                    if (p.frames <= 0) return;
                     double f = 1.0 / p.frames;
-                    std::printf("[raster-bench] GPU per-pass avg ms: clearvis %.2f  project %.2f  "
+                    std::printf("[raster-bench] GPU per-pass avg ms (%s): clearvis %.2f  project %.2f  "
                                 "raster %.2f  shade %.2f  clear %.2f  expose+encode %.2f  "
                                 "download %.2f\n",
-                                p.clearvis_ms * f, p.project_ms * f, p.raster_ms * f,
+                                what, p.clearvis_ms * f, p.project_ms * f, p.raster_ms * f,
                                 p.shade_ms * f, p.clear_ms * f, p.expose_ms * f,
                                 p.download_ms * f);
+                };
+                passLine("download", profHost);
+                if (!zc.empty()) {
+                    std::vector<double> s = zc;
+                    std::sort(s.begin(), s.end());
+                    double mean = 0;
+                    for (double v : zc) mean += v;
+                    mean /= zc.size();
+                    std::printf("[raster-bench] zero-copy render+present: min %.2f ms  median %.2f ms  "
+                                "mean %.2f ms  (%.1f fps @ median)\n",
+                                s.front(), s[s.size() / 2], mean,
+                                s[s.size() / 2] > 0 ? 1000.0 / s[s.size() / 2] : 0.0);
+                    passLine("zero-copy", profZc);
+                } else if (zcTried) {
+                    std::printf("[raster-bench] zero-copy present unavailable "
+                                "(GDI window, or D3D on a different adapter than the CUDA device)\n");
                 }
             }
 #endif
@@ -6455,11 +7306,58 @@ static int run(int argc, char** argv) {
             // curve's natural pace, >1 faster / <1 slower. Kept in lockstep with editPts and
             // exported on Save as `density_at` keyframes (camera density = inverse speed).
             std::vector<double> ptSpeed;
+            // ---- loom CurveDrive sidecar (-anim, E2 "channel a") ----------------------
+            // With `-anim <file.json>` the editor is reshaping loom's N-dimensional DRIVE
+            // curve, not merely a camera path: the control points ARE the drive's points.
+            // Channels 0..2 are what the viewport draws and the mouse moves (for a flyby
+            // drive that is literally the camera eye); channels 3.. are values no 3-D
+            // viewport can show, so they ride along per point in `ptExtra` and are written
+            // back untouched. `animDrive` holds everything the editor does NOT own — the
+            // drive's name, mode, closed flag and its channel->scene-variable bindings — so
+            // saving a reshaped curve never drops associations loom put there.
+            curvedrive::Drive animDrive;
+            bool animActive = false;                   // -anim given (sidecar loaded or to be created)
+            int  animDims   = 0;                       // drive channel count (0 = not driving a sidecar)
+            std::vector<std::vector<double>> ptExtra;  // per point, channels 3.. (each animDims-3 long)
+            // Set by every curve mutation (rebuildPath); consumed by the live channel to
+            // resend the points before the next frame. Declared here, with the rest of the
+            // anim state, so rebuildPath() can reach it — the live bridge itself is set up
+            // much further down, just before the interactive loop.
+            bool animPtsDirty = false;
+            auto animExtraCount = [&]() -> size_t { return (size_t)std::max(0, animDims - 3); };
+            // editPts carries two parallel per-point side tracks (the painted speed
+            // multiplier and the anim extra channels). Every add/insert/erase goes through
+            // these two helpers so a track can never drift out of alignment with the points
+            // it annotates — a silent misalignment would mis-assign speeds and channels to
+            // the wrong points on the next Save.
+            auto trackInsert = [&](size_t i) {
+                ptSpeed.insert(ptSpeed.begin() + std::min(i, ptSpeed.size()), 1.0);
+                size_t ne = animExtraCount();
+                if (!ne) { ptExtra.insert(ptExtra.begin() + std::min(i, ptExtra.size()), std::vector<double>()); return; }
+                // A new point inherits its unseen channels from its neighbours (midpoint in
+                // the middle, a copy at either end); zeroing them would silently punch a
+                // hole in every non-spatial channel the drive carries.
+                const std::vector<double>* a = (i > 0 && i - 1 < ptExtra.size()) ? &ptExtra[i - 1] : nullptr;
+                const std::vector<double>* b = (i < ptExtra.size()) ? &ptExtra[i] : nullptr;
+                std::vector<double> ex(ne, 0.0);
+                for (size_t c = 0; c < ne; ++c) {
+                    double va = (a && c < a->size()) ? (*a)[c] : 0.0;
+                    double vb = (b && c < b->size()) ? (*b)[c] : 0.0;
+                    ex[c] = (a && b) ? 0.5 * (va + vb) : (a ? va : vb);
+                }
+                ptExtra.insert(ptExtra.begin() + std::min(i, ptExtra.size()), std::move(ex));
+            };
+            auto trackErase = [&](size_t i) {
+                if (i < ptSpeed.size()) ptSpeed.erase(ptSpeed.begin() + i);
+                if (i < ptExtra.size()) ptExtra.erase(ptExtra.begin() + i);
+            };
             // Current free pose as a control-point frame.
             auto poseNow = [&]() -> PathFrame { return PathFrame{eye, fwd, worldUp, fovY}; };
             // Regenerate the preview path (explorePath) + timeline from the control points.
             auto rebuildPath = [&]() {
-                ptSpeed.resize(editPts.size(), 1.0);   // safety: keep the speed track sized to the points
+                ptSpeed.resize(editPts.size(), 1.0);   // safety: keep the side tracks sized to the points
+                ptExtra.resize(editPts.size(), std::vector<double>(animExtraCount(), 0.0));
+                animPtsDirty = true;   // the drive curve moved: the live channel must resend it
                 int oldCount = pathCount;
                 explorePath.clear();
                 int n = (int)editPts.size();
@@ -6541,6 +7439,69 @@ static int run(int argc, char** argv) {
                             n, ac.name.c_str());
                 std::fflush(stdout);
             }
+            // -anim: seed from the loom CurveDrive sidecar. This runs AFTER the camera_curve
+            // seed above so an explicitly-named drive wins over whatever curve the scene
+            // happened to carry. A sidecar that does not exist yet is not an error — that is
+            // how you START a drive from the editor: keep whatever points the scene seeded
+            // (or none) and let the first Save create the file.
+            if (!animSidecar.empty()) {
+                animActive = true;
+                std::string err;
+                curvedrive::Drive d;
+                if (curvedrive::load(animSidecar, d, err)) {
+                    animDrive = d;
+                    animDims  = d.dims;
+                    int n = (int)d.points.size();
+                    editPts.clear(); editPts.reserve((size_t)n);
+                    ptExtra.assign((size_t)n, std::vector<double>(animExtraCount(), 0.0));
+                    for (int i = 0; i < n; ++i) {
+                        const std::vector<double>& p = d.points[(size_t)i];
+                        Vec3 e{p.size() > 0 ? p[0] : 0.0, p.size() > 1 ? p[1] : 0.0, p.size() > 2 ? p[2] : 0.0};
+                        editPts.push_back(PathFrame{e, fwd, worldUp, fovY});
+                        for (size_t c = 3; c < p.size(); ++c) ptExtra[(size_t)i][c - 3] = p[c];
+                    }
+                    // A drive is a curve of VALUES, so the sidecar stores no orientation. Aim
+                    // each point down the chord to its successor (the last one keeps its
+                    // predecessor's aim) — the same direction `look curve` would produce, and
+                    // any of it can be re-aimed by orientation painting.
+                    for (int i = 0; i < n; ++i) {
+                        int a = (i + 1 < n) ? i : i - 1, b = (i + 1 < n) ? i + 1 : i;
+                        if (a < 0 || b < 0) break;
+                        Vec3 ch = editPts[(size_t)b].eye - editPts[(size_t)a].eye;
+                        if (dot(ch, ch) > 1e-18) editPts[(size_t)i].fwd = norml(ch);
+                    }
+                    ptSpeed.assign((size_t)n, 1.0);
+                    rebuildPath();
+                    if (g_liveWin) g_liveWin->setEditState(false, n);
+                    std::printf("[editor] -anim: drive \"%s\" (%s) — %d points x %d channels, %zu binding(s) from %s\n",
+                                d.name.c_str(), d.mode.c_str(), n, d.dims,
+                                d.bindings.size(), animSidecar.c_str());
+                    if (!d.bindings.empty()) {
+                        for (const auto& b : d.bindings)
+                            std::printf("[editor]   ch%d -> %s (%s, gain %.4g, %s)\n",
+                                        b.channel, b.target.c_str(), b.mode.c_str(), b.gain, b.kind.c_str());
+                    }
+                    if (d.dims > 3)
+                        std::printf("[editor]   channels 3..%d are not spatial — carried per point and saved unchanged\n",
+                                    d.dims - 1);
+                } else {
+                    // Fresh drive: the editor's own points are the camera path, so label it a
+                    // flyby (loom's "channels collapse to camera pose") with the three spatial
+                    // channels. Bindings can be added later by loom or a future panel.
+                    animDims = 3;
+                    animDrive = curvedrive::Drive();
+                    animDrive.dims = 3;
+                    animDrive.mode = curvedrive::kModeFlyby;
+                    { std::string b = inFile ? std::string(inFile) : std::string("scene");
+                      size_t sl = b.find_last_of("/\\"); if (sl != std::string::npos) b = b.substr(sl + 1);
+                      size_t dt = b.find_last_of('.');   if (dt != std::string::npos) b = b.substr(0, dt);
+                      animDrive.name = b + "_drive"; }
+                    ptExtra.assign(editPts.size(), std::vector<double>());
+                    std::printf("[editor] -anim: starting a new drive \"%s\" (%s) — Save writes %s\n",
+                                animDrive.name.c_str(), err.c_str(), animSidecar.c_str());
+                }
+                std::fflush(stdout);
+            }
             // Write the authored control points as a camera_curve .ftsl block, next to the
             // scene file AND echoed to stdout so it can be pasted straight into a scene.
             auto saveCurveFn = [&]() {
@@ -6615,6 +7576,37 @@ static int run(int argc, char** argv) {
                     std::printf("[editor] FAILED to write %s — block echoed below only\n", outPath.c_str());
                 }
                 std::printf("%s", blk.c_str());
+                // -anim: write the reshaped drive back to its sidecar (E2 channel a). The
+                // editor owns only the point LIST — each point's spatial channels come from
+                // its eye, its non-spatial channels from the values it carried in. Name,
+                // mode, closed flag, dims and every channel->variable binding are copied
+                // from whatever the sidecar last held, so an editing pass here reshapes the
+                // curve without ever dropping an association loom authored.
+                if (animActive) {
+                    curvedrive::Drive d = animDrive;
+                    d.dims = std::max(1, animDims);
+                    d.points.clear(); d.points.reserve(editPts.size());
+                    for (size_t i = 0; i < editPts.size(); ++i) {
+                        std::vector<double> row((size_t)d.dims, 0.0);
+                        const Vec3& e = editPts[i].eye;
+                        if (d.dims > 0) row[0] = e.x;
+                        if (d.dims > 1) row[1] = e.y;
+                        if (d.dims > 2) row[2] = e.z;
+                        for (int c = 3; c < d.dims; ++c)
+                            row[(size_t)c] = (i < ptExtra.size() && (size_t)(c - 3) < ptExtra[i].size())
+                                           ? ptExtra[i][(size_t)(c - 3)] : 0.0;
+                        d.points.push_back(std::move(row));
+                    }
+                    std::string serr;
+                    if (curvedrive::save(animSidecar, d, serr)) {
+                        animDrive = d;   // the sidecar and the editor now agree
+                        std::printf("[editor] saved drive \"%s\" (%zu points x %d channels, %zu binding(s)) to %s\n",
+                                    d.name.c_str(), d.points.size(), d.dims, d.bindings.size(),
+                                    animSidecar.c_str());
+                    } else {
+                        std::printf("[editor] FAILED to write sidecar %s: %s\n", animSidecar.c_str(), serr.c_str());
+                    }
+                }
                 std::fflush(stdout);
             };
             // The currently SELECTED control point — the target Del removes and the overlay
@@ -6665,6 +7657,46 @@ static int run(int argc, char** argv) {
                 int sel = selectedPoint();
                 for (size_t i = 0; i < editPts.size(); ++i)
                     marker(editPts[i].eye, 255, ((int)i == sel) ? 60 : 220, ((int)i == sel) ? 60 : 40);  // yellow / red-selected
+            };
+            // ---- ZERO-COPY present (CUDA <-> Direct3D 11) -----------------------------
+            // The fastest way to show a GPU-rastered frame is not to move it: the tonemap
+            // writes its bytes straight into the texture the live window's D3D11 presenter
+            // samples, so the image never crosses the PCIe bus and no host code ever touches
+            // a pixel. That skips, per frame, the device->host download, the vector copy out
+            // of the pinned buffer, and the host->device re-upload the presenter would do.
+            //
+            // It only applies when nothing needs the pixels on the HOST — i.e. the curve
+            // editor's overlay (control-point markers + spline polyline, drawn with putpx into
+            // the RGB buffer) is not active. Every other case, and any failure at any step
+            // (no CUDA, CPU rasterizer, GDI window, D3D on a different adapter than the CUDA
+            // device), returns false and the caller renders the ordinary way.
+            int zeroCopyOn = -1;   // last reported state: -1 = unreported, 0 = host path, 1 = zero-copy
+            auto rasterPresent = [&](const Camera& c, int w, int h, double expo, bool autoExp_) -> bool {
+#ifdef HAVE_CUDA
+                if (!g_liveWin || !gpuRaster) return false;
+                if (useGpuIso && !c.hasLens()) return false;      // implicit-ray preview owns this frame
+                if (!(explorePath.size() < 2 && editPts.empty())) return false;   // overlay needs host pixels
+                bool zc = g_liveWin->renderShared(w, h, [&](void* dev, void* tex) -> bool {
+                    if (!raster_cuda::bindPresentTarget(gpuRaster, dev, tex, w, h)) return false;
+                    return raster_cuda::renderFrameToTarget(gpuRaster, c, w, h, nThreads, expo,
+                                                            autoExp_, nullptr,
+                                                            rasterSeeThrough, rasterClarity);
+                });
+                // Say which way the pixels are actually flowing — whether the interop engaged
+                // is invisible otherwise (both paths show the same image), and it can legitimately
+                // be off (GDI window, or D3D on a different adapter than the CUDA device).
+                if ((int)zc != zeroCopyOn) {
+                    zeroCopyOn = (int)zc;
+                    std::printf(zc ? "[raster] zero-copy present: the tonemap writes the live window's "
+                                     "D3D11 texture directly (no host readback)\n"
+                                   : "[raster] zero-copy present off: frames travel through host memory\n");
+                    std::fflush(stdout);
+                }
+                return zc;
+#else
+                (void)c; (void)w; (void)h; (void)expo; (void)autoExp_;
+                return false;
+#endif
             };
             // ---- Speed / orientation PAINTING (Phase 2/3) -----------------------------
             // The painted tracks are anchored to the CONTROL POINTS: speed is a per-point
@@ -6795,6 +7827,203 @@ static int run(int argc, char** argv) {
                 std::printf("[viewer] path-trace preview ('T') unavailable (scene/camera outside fast-RGB GPU scope)\n");
             std::fflush(stdout);
 #endif
+            // ---- loom LIVE channel (-anim + -loom, E2 "channel b") --------------------
+            // With a loom build file the editor stops being a sidecar editor and becomes a
+            // live one: each scrub position is pushed to a resident `python -m loom.anim`,
+            // which applies the drive's channel->variable bindings and emits that frame's
+            // .ftsl; we load it and preview the actual animated scene.
+            //
+            // LOOM samples the curve — we push our control points and ask by parameter `t`
+            // (see animlive.h). Sampling here instead would risk the preview disagreeing
+            // with the video loom finally renders, which is the whole point of the channel.
+            animlive::Bridge animBridge;
+            bool animLive        = false;   // the live channel is up
+            double animLastT     = -1.0;    // last curve position we asked loom for
+            long long animBaked  = 0;       // frames loom has emitted this session
+            double animLastMs    = 0.0;
+            std::string animLastErr;
+            // Last bind-row state pushed to the panel, so the mirror only fires on a real change.
+            std::string animLastStatus;
+            std::vector<std::string> animLastTargets;
+            int animLastBindCh = -2;        // -2 = "never sent" (-1 is a legitimate "no selection")
+            if (animActive && !animLoomScene.empty()) {
+                std::string lerr;
+                if (animBridge.start(animLoomScene, animSidecar, lerr)) {
+                    animLive = true;
+                    animPtsDirty = true;    // seed loom with the curve we actually loaded
+                    std::printf("[anim] live channel up: %s\n", animBridge.command().c_str());
+                    const auto& sl = animBridge.slots();
+                    std::printf("[anim] %zu bindable scene variable(s)%s", sl.size(),
+                                sl.empty() ? "\n" : ": ");
+                    for (size_t i = 0; i < sl.size() && i < 12; ++i)
+                        std::printf("%s%s", sl[i].first.c_str(),
+                                    (i + 1 < sl.size() && i < 11) ? ", " : "\n");
+                    if (sl.size() > 12) std::printf("[anim]   (+%zu more)\n", sl.size() - 12);
+                    // Reveal the bind row: only now do we know what the scene actually exposes,
+                    // and a pick-list is the only honest way to offer it (a typed name would
+                    // just be a typo loom silently ignores).
+                    if (g_liveWin) {
+                        std::vector<std::string> names;
+                        names.reserve(sl.size());
+                        for (const auto& s : sl) names.push_back(s.first);
+                        g_liveWin->enableBindRow(names, std::max(1, animDims));
+                    }
+                } else {
+                    std::fprintf(stderr, "[anim] live channel unavailable: %s\n", lerr.c_str());
+                    std::fprintf(stderr, "[anim] continuing as a sidecar-only editor "
+                                         "(the curve still saves; the preview stays static)\n");
+                }
+                std::fflush(stdout);
+            } else if (animActive) {
+                std::printf("[anim] no -loom <scene.py>: sidecar-only editor "
+                            "(add -loom to preview the animation live)\n");
+                std::fflush(stdout);
+            }
+            // Push the editor's control points to loom (all channels: eye + the carried
+            // extras). A control message, not a sample — it must never be dropped, or the
+            // next frame would be emitted against a curve that no longer exists.
+            auto animSendPoints = [&]() {
+                if (!animLive) return;
+                int dims = std::max(1, animDims);
+                std::string js = "{\"cmd\":\"points\",\"points\":[";
+                for (size_t i = 0; i < editPts.size(); ++i) {
+                    if (i) js += ",";
+                    js += "[";
+                    const Vec3& e = editPts[i].eye;
+                    for (int c = 0; c < dims; ++c) {
+                        if (c) js += ",";
+                        double v = (c == 0) ? e.x : (c == 1) ? e.y : (c == 2) ? e.z
+                                 : ((i < ptExtra.size() && (size_t)(c - 3) < ptExtra[i].size())
+                                        ? ptExtra[i][(size_t)(c - 3)] : 0.0);
+                        char b[40]; std::snprintf(b, sizeof b, "%.17g", v);
+                        js += b;
+                    }
+                    js += "]";
+                }
+                js += "]}";
+                animBridge.control(js);
+                animPtsDirty = false;
+            };
+            // Push `animDrive.bindings` to loom. Sent WHOLESALE rather than as a delta: the
+            // binding set is tiny and loom's `bindings` command replaces it outright, so there
+            // is no incremental protocol to get out of step with.
+            auto animSendBindings = [&]() {
+                if (!animLive) return;
+                std::string js = "{\"cmd\":\"bindings\",\"bindings\":[";
+                for (size_t i = 0; i < animDrive.bindings.size(); ++i) {
+                    const curvedrive::Binding& b = animDrive.bindings[i];
+                    char g[40]; std::snprintf(g, sizeof g, "%.17g", b.gain);
+                    if (i) js += ",";
+                    js += "{\"channel\":" + std::to_string(b.channel)
+                        + ",\"target\":\"" + loomlink::jsonEsc(b.target) + "\""
+                        + ",\"mode\":\"" + loomlink::jsonEsc(b.mode) + "\""
+                        + ",\"gain\":" + g
+                        + ",\"kind\":\"" + loomlink::jsonEsc(b.kind) + "\"}";
+                }
+                js += "]}";
+                animBridge.control(js);
+            };
+            // The bind row's per-channel view of the drive: entry c is channel c's target, or
+            // "" when nothing binds it. Rebuilt from `animDrive` (the editor's authority for
+            // everything that is not the curve's geometry) rather than cached, so it cannot
+            // drift from what a Save would write.
+            auto animTargets = [&]() {
+                std::vector<std::string> t((size_t)std::max(1, animDims));
+                for (const curvedrive::Binding& b : animDrive.bindings)
+                    if (b.channel >= 0 && (size_t)b.channel < t.size()) t[(size_t)b.channel] = b.target;
+                return t;
+            };
+            // Bind (or re-target) one channel. An empty target UNBINDS it — the "(none)" entry
+            // in the slot pick-list — so Bind and Unbind are the same operation and cannot
+            // disagree about what "no binding" means.
+            auto animBind = [&](int channel, const std::string& target) {
+                if (channel < 0 || channel >= std::max(1, animDims)) return;
+                auto& bs = animDrive.bindings;
+                auto it = std::find_if(bs.begin(), bs.end(),
+                                       [&](const curvedrive::Binding& b) { return b.channel == channel; });
+                if (target.empty()) {
+                    if (it == bs.end()) return;                  // already unbound: nothing to say
+                    std::printf("[anim] ch%d unbound (was %s)\n", channel, it->target.c_str());
+                    bs.erase(it);
+                } else if (it != bs.end()) {
+                    if (it->target == target) return;            // idempotent: no rebake for a no-op
+                    std::printf("[anim] ch%d -> %s (was %s)\n", channel, target.c_str(), it->target.c_str());
+                    it->target = target;
+                } else {
+                    curvedrive::Binding b;                       // defaults: pin / gain 1 / additive
+                    b.channel = channel;
+                    b.target  = target;
+                    std::printf("[anim] ch%d -> %s (%s, gain %.4g, %s)\n",
+                                channel, target.c_str(), b.mode.c_str(), b.gain, b.kind.c_str());
+                    bs.push_back(b);
+                }
+                std::fflush(stdout);
+                animSendBindings();
+                animLastT = -1.0;    // force a rebake: the same curve position now means something else
+            };
+            // Grow or shrink the drive's channel count. Growing appends zeroed channels to every
+            // control point; SHRINKING DISCARDS them — and loom drops any binding that lived on a
+            // channel that no longer exists, so we mirror that here rather than let the sidecar
+            // keep a binding loom has already forgotten.
+            auto animSetDims = [&](int nd) {
+                nd = std::max(1, nd);
+                if (nd == animDims) return;
+                int old = animDims;
+                animDims = nd;
+                size_t ne = animExtraCount();
+                for (auto& ex : ptExtra) ex.resize(ne, 0.0);
+                animDrive.dims = nd;
+                size_t before = animDrive.bindings.size();
+                animDrive.bindings.erase(
+                    std::remove_if(animDrive.bindings.begin(), animDrive.bindings.end(),
+                                   [&](const curvedrive::Binding& b) { return b.channel >= nd; }),
+                    animDrive.bindings.end());
+                size_t dropped = before - animDrive.bindings.size();
+                // Keep the suffix in a NAMED string: building it inline as an argument would
+                // hand printf a c_str() into a temporary already destroyed at the sequence point.
+                std::string note = dropped ? "  (" + std::to_string(dropped) + " binding(s) dropped)"
+                                           : std::string();
+                std::printf("[anim] channels %d -> %d%s\n", old, nd, note.c_str());
+                std::fflush(stdout);
+                if (animLive) {
+                    animBridge.control("{\"cmd\":\"dims\",\"dims\":" + std::to_string(nd) + "}");
+                    animSendBindings();
+                    animSendPoints();
+                    animLastT = -1.0;
+                }
+            };
+            // Swap in a scene loom just emitted. Everything downstream of `scene` is
+            // derived state and every bit of it has to be dropped: the preview light, the
+            // tessellation, the GPU rasterizer's baked triangles, and the resident
+            // RGB-backward session (which bakes the scene at begin() — setCamera only
+            // re-aims, so a swap needs a full End/Begin). The user's POSE is deliberately
+            // untouched: the scene changed under them, they did not move.
+            auto animAdoptScene = [&](const std::string& path, std::string& aerr) -> bool {
+                ftsl::Loaded nl;
+                if (!ftsl::load(path, nl, aerr, supportFn)) return false;
+                scene = std::move(nl.scene);
+                plight = raster::deriveLight(scene);
+                prims.clear();
+                tessellated = false;
+#ifdef HAVE_CUDA
+                // Re-upload the GPU rasterizer only if it was the path in use; the CPU
+                // and primary-ray-iso paths both want `prims` left lazy so a scrub the
+                // user immediately supersedes never pays for a tessellation.
+                if (gpuRaster) {
+                    raster_cuda::destroy(gpuRaster);
+                    gpuRaster = nullptr;
+                    ensurePrims();
+                    gpuRaster = raster_cuda::upload(prims, plight, &scene.textures);
+                    if (!gpuRaster)
+                        std::fprintf(stderr, "[anim] GPU re-upload failed; using the CPU rasterizer\n");
+                }
+                // The RGB-backward session bakes the scene at begin() — setCamera only
+                // re-aims — so a scene swap needs a full End/Begin, not a re-aim.
+                if (traceSess) { backwardRGBSessionEnd(traceSess); traceSess = nullptr; }
+                traceDirty = true;
+#endif
+                return true;
+            };
             while (!g_liveWin->closed() && !g_stopRequested) {
                 // Match the render resolution to the live window: a user resize re-renders
                 // at the new size (smaller = faster, larger = crisper).
@@ -6805,6 +8034,43 @@ static int run(int argc, char** argv) {
                       std::fflush(stdout);
                   } }
                 NavInput nav = g_liveWin->drainNav();
+
+                // Fold in whatever loom finished since the last iteration. The editor
+                // never blocks on an emit: it keeps flying the scene it already has and
+                // adopts the new one on whatever iteration it lands.
+                if (animLive) {
+                    animlive::Result ar;
+                    if (animBridge.take(ar)) {
+                        animLastMs = ar.ms;
+                        if (ar.ok) {
+                            std::string aerr;
+                            if (animAdoptScene(ar.ftslPath, aerr)) {
+                                ++animBaked;
+                                animLastErr.clear();
+                                changed = true;          // repaint on the new geometry
+                            } else {
+                                // A re-derived scene ftrace cannot load is a real error and
+                                // has to be said out loud, not silently left on stale
+                                // geometry the user would read as "my edit did nothing".
+                                animLastErr = "ftsl: " + aerr;
+                                std::fprintf(stderr, "[anim] emitted scene did not load: %s\n",
+                                             aerr.c_str());
+                            }
+                        } else {
+                            animLastErr = ar.err;
+                            std::fprintf(stderr, "[anim] %s\n", ar.err.c_str());
+                        }
+                        animBridge.reap(ar.ftslPath);
+                        std::fflush(stderr);
+                    }
+                    if (!animBridge.linkUp() && animLastErr != animBridge.deadReason()) {
+                        animLastErr = animBridge.deadReason();
+                        animLive = false;
+                        std::fprintf(stderr, "[anim] live channel lost: %s\n", animLastErr.c_str());
+                        std::fprintf(stderr, "[anim] continuing as a sidecar-only editor\n");
+                        std::fflush(stderr);
+                    }
+                }
 
                 // Wall-clock delta for rate-mode (cameras/second) path traversal.
                 auto nowT = clock::now();
@@ -6892,7 +8158,7 @@ static int run(int argc, char** argv) {
                         std::printf("[editor] recording flythrough (fly around; press Rec again to stop)\n");
                     } else {
                         std::vector<PathFrame> got = (!recRaw && recTol > 0.0) ? simplify(recRawBuf, recTol) : recRawBuf;
-                        for (const auto& g : got) { editPts.push_back(g); ptSpeed.push_back(1.0); }
+                        for (const auto& g : got) { editPts.push_back(g); trackInsert(editPts.size() - 1); }
                         rebuildPath();
                         std::printf("[editor] recorded %zu control points from %zu raw samples (tol %.4g, %s)\n",
                                     got.size(), recRawBuf.size(), recTol, recRaw ? "raw" : "simplified");
@@ -6901,14 +8167,14 @@ static int run(int argc, char** argv) {
                     std::fflush(stdout); changed = true;
                 }
                 if (nav.addPoint) {
-                    editPts.push_back(poseNow()); ptSpeed.push_back(1.0);
+                    editPts.push_back(poseNow()); trackInsert(editPts.size() - 1);
                     rebuildPath();
                     g_liveWin->setEditState(recording, (int)editPts.size());
                     std::printf("[editor] +point %zu at eye(%s)\n", editPts.size(), fmt3(eye).c_str());
                     std::fflush(stdout); changed = true;
                 }
                 if (nav.insPoint) {
-                    if (editPts.size() < 2) { editPts.push_back(poseNow()); ptSpeed.push_back(1.0); }
+                    if (editPts.size() < 2) { editPts.push_back(poseNow()); trackInsert(editPts.size() - 1); }
                     else {
                         // Insert between the two control points bracketing the current scrub
                         // position. bracket() normalizes by the ACTUAL explorePath length, so this
@@ -6917,7 +8183,7 @@ static int run(int argc, char** argv) {
                         int seg; double fr; bracket(pathPos, seg, fr);
                         seg = std::clamp(seg, 0, (int)editPts.size() - 2);
                         editPts.insert(editPts.begin() + seg + 1, poseNow());
-                        ptSpeed.insert(ptSpeed.begin() + std::min((size_t)seg + 1, ptSpeed.size()), 1.0);
+                        trackInsert((size_t)seg + 1);
                     }
                     rebuildPath();
                     g_liveWin->setEditState(recording, (int)editPts.size());
@@ -6928,7 +8194,7 @@ static int run(int argc, char** argv) {
                     int best = selectedPoint();   // the highlighted (selected) point — scrub to choose it
                     if (best < 0) best = 0;
                     editPts.erase(editPts.begin() + best);
-                    if ((size_t)best < ptSpeed.size()) ptSpeed.erase(ptSpeed.begin() + best);
+                    trackErase((size_t)best);
                     if (pathPos > std::max(0, pathCount - 1)) pathPos = std::max(0, pathCount - 1);
                     rebuildPath();
                     pathPos = clampPos(pathPos);
@@ -6942,6 +8208,15 @@ static int run(int argc, char** argv) {
                     std::fill(ptSpeed.begin(), ptSpeed.end(), 1.0);
                     std::printf("[editor] speed reset to flat (1.00x everywhere)\n"); std::fflush(stdout);
                     changed = true;
+                }
+                // ---- loom bind row: retarget/unbind a channel, or resize the drive ----------
+                // Only reachable when the row exists (it is built only for a live -loom editor),
+                // so these are inert in a sidecar-only session.
+                if (animActive) {
+                    if (nav.bindApply) animBind(nav.bindChannel, nav.bindTarget);
+                    if (nav.bindClear) animBind(nav.bindChannel, std::string());
+                    // The box reports its CURRENT value every drain, so act only on a real change.
+                    if (nav.dimsReq >= 1 && nav.dimsReq != animDims) animSetDims(nav.dimsReq);
                 }
 
                 // The render camera's up vector and fov: fixed authored values while flying
@@ -7033,6 +8308,29 @@ static int run(int argc, char** argv) {
                     if (take) { recRawBuf.push_back(poseNow()); lastRecPos = eye; haveRecPos = true; }
                 }
 
+                // Ask loom for the frame at the current curve position. Latest-wins, so a
+                // fast drag leaves at most one emit in flight and one waiting; the
+                // positions swept through in between are dropped rather than queued into
+                // a backlog the user would have to sit through. Only post when the
+                // position (or the curve itself) actually changed — an idle editor must
+                // not spin loom re-emitting the same frame forever.
+                if (animLive && pathCount >= 2) {
+                    double denom = (double)(pathCount - 1);
+                    double t = (denom > 0.0) ? std::clamp(pathPos / denom, 0.0, 1.0) : 0.0;
+                    // A reshaped curve means the frame we are showing was emitted against
+                    // points that no longer exist, so re-ask even if the position is
+                    // unchanged (t is in [0,1]; -1 can never compare equal).
+                    if (animPtsDirty) { animSendPoints(); animLastT = -1.0; }
+                    if (t != animLastT) {
+                        animlive::Job j;
+                        j.t      = t;
+                        j.frame  = (int)std::lround(pathPos);
+                        j.frames = pathCount;
+                        animBridge.post(j);
+                        animLastT = t;
+                    }
+                }
+
                 Vec3 tgt = eye + fwd * lookDist;   // look_at point on the view ray (for readout/print)
                 // A real, display-changing frame vs a GPU keep-warm-only frame. `changed`
                 // is set by any actual input; a keep-warm frame renders solely to hold the
@@ -7063,9 +8361,11 @@ static int run(int argc, char** argv) {
                     }
                     if (changed) {
                         // Camera moved: show the responsive raster and mark the trace stale.
-                        std::vector<uint8_t> img = rasterOne(c, VW, VH, ev, autoExp, nullptr);
-                        drawOverlay(c, VW, VH, img);
-                        g_liveWin->update(VW, VH, img);
+                        if (!rasterPresent(c, VW, VH, ev, autoExp)) {
+                            std::vector<uint8_t> img = rasterOne(c, VW, VH, ev, autoExp, nullptr);
+                            drawOverlay(c, VW, VH, img);
+                            g_liveWin->update(VW, VH, img);
+                        }
                         g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")  [trace: move to re-aim]");
                         traceDirty = true;
@@ -7095,13 +8395,21 @@ static int run(int argc, char** argv) {
                 if (!traceMode && (changed || warmOnly)) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
-                    std::vector<uint8_t> img =
-                        rasterOne(c, VW, VH, ev, autoExp, nullptr);
-                    if (changed) {   // only a real change repaints the window
-                        drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
-                        g_liveWin->update(VW, VH, img);
+                    // A warm-only frame renders solely to hold the boost clock and must NOT
+                    // repaint, so the zero-copy present (which renders AND shows) is for real
+                    // changes only; the warm frame keeps taking the ordinary render path.
+                    if (changed && rasterPresent(c, VW, VH, ev, autoExp)) {
                         g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")");
+                    } else {
+                        std::vector<uint8_t> img =
+                            rasterOne(c, VW, VH, ev, autoExp, nullptr);
+                        if (changed) {   // only a real change repaints the window
+                            drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
+                            g_liveWin->update(VW, VH, img);
+                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                                                ")  dir(" + fmt3(fwd) + ")");
+                        }
                     }
                     changed = false;
                 }
@@ -7129,6 +8437,33 @@ static int run(int argc, char** argv) {
                     if (pathMode) {
                         double sp = speedAt(pathPos);
                         if (std::fabs(sp - lastSpdSent) > 5e-3) { g_liveWin->setSpeedLabel(sp); lastSpdSent = sp; }
+                    }
+                    // Mirror the loom bind row: what the selected channel drives, plus the live
+                    // channel's health. Recomputed and diffed rather than pushed on every event,
+                    // because the SELECTION also changes it and a combo pick raises no edge here.
+                    if (animActive) {
+                        std::string st;
+                        if (!animLive)
+                            st = animLastErr.empty() ? "offline (sidecar only)" : "offline: " + animLastErr;
+                        else if (!animLastErr.empty())
+                            st = animLastErr;
+                        else {
+                            char b[96];
+                            // Explicit UTF-8 bytes, not \u2014: a narrow literal escape would be
+                            // transcoded to cp1252 (C4566) and land in the panel as junk.
+                            std::snprintf(b, sizeof b, "live \xE2\x80\x94 %lld baked, %.0f ms",
+                                          animBaked, animLastMs);
+                            st = b;
+                        }
+                        std::vector<std::string> tg = animTargets();
+                        // The row also reports the SELECTED channel's binding, and picking a
+                        // channel raises no edge out here — so the selection is part of the diff.
+                        if (st != animLastStatus || tg != animLastTargets ||
+                            nav.bindChannel != animLastBindCh) {
+                            g_liveWin->setBindState(tg, st.c_str());
+                            animLastStatus = st; animLastTargets = tg;
+                            animLastBindCh = nav.bindChannel;
+                        }
                     }
                 }
                 // Sleep policy. While a throttle key is held, the mouse is steering, or the
@@ -7883,6 +9218,9 @@ static int runServe(int argc, char** argv, int inValPos) {
         // storage for the duration of this run() call.
         pathBuf = line;
         argv[inValPos] = const_cast<char*>(pathBuf.c_str());
+        // An EXTERNAL stop (-stop) means "shut this process down", not "abandon this
+        // frame", so it must not be cleared and re-entered like a per-frame Ctrl-C.
+        if (g_extStopRequested.load()) break;
         g_stopRequested = 0;   // clear any prior clean-stop request before the new frame
         try {
             rc = run(argc, argv);
@@ -7903,6 +9241,14 @@ static int runServe(int argc, char** argv, int inValPos) {
 // spectral-library resolver) into a clean message + non-zero exit, instead of a
 // silent fall-through to a default illuminant that would render the wrong thing.
 int main(int argc, char** argv) {
+    // `-stop [<pid>|all]`: talk to ALREADY-RUNNING renders and exit. Handled before
+    // anything else so it works from a bare command line -- it loads no scene, opens
+    // no window and creates no CUDA context, so there is nothing here to tear down.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "-stop") && std::strcmp(argv[i], "--stop")) continue;
+        const char* who = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : nullptr;
+        return runStopCommand(who);
+    }
     // Tear the CUDA context down synchronously, in-process, on EVERY exit path (normal
     // return or exception). Leaving it for the driver to reclaim implicitly after main()
     // returns triggers an asynchronous nvlddmkm DPC teardown that, on buggy driver
@@ -7912,13 +9258,44 @@ int main(int argc, char** argv) {
     try {
         // Native loom viewer (-viewer <sidecar.json>): open the ImGui/D3D11 GUI on a
         // scene-introspection sidecar instead of rendering. Short-circuits the renderer.
-        for (int i = 1; i < argc; ++i) {
-            if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
-                if (i + 1 >= argc) {
-                    std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
+        // `-loom <scene.py>` names the loom build file the viewer opens its LIVE
+        // re-introspection channel against (§F4 item 2); without it the viewer falls
+        // back to the sidecar's own `build` provenance key, and without that too it
+        // shows the sidecar frozen.
+        {
+            const char* viewerSidecar = nullptr;
+            const char* viewerLoom    = nullptr;
+            for (int i = 1; i < argc; ++i) {
+                if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
+                    if (i + 1 >= argc) {
+                        std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
+                        return 1;
+                    }
+                    viewerSidecar = argv[++i];
+                } else if (!std::strcmp(argv[i], "-loom") || !std::strcmp(argv[i], "--loom")) {
+                    if (i + 1 >= argc) {
+                        std::fprintf(stderr, "error: -loom needs a loom scene .py path\n");
+                        return 1;
+                    }
+                    viewerLoom = argv[++i];
+                }
+            }
+            if (viewerSidecar)
+                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "");
+            if (viewerLoom) {
+                // -loom names a live channel, and there are two of them: the viewer's F4
+                // re-introspection (-viewer) and the fly editor's E2 value channel
+                // (-anim), which the renderer's own arg loop parses. Only reject the flag
+                // when NEITHER host asked for it, rather than letting it fall through to
+                // be silently eaten as an unknown flag.
+                bool withAnim = false;
+                for (int i = 1; i < argc; ++i)
+                    if (!std::strcmp(argv[i], "-anim")) { withAnim = true; break; }
+                if (!withAnim) {
+                    std::fprintf(stderr, "error: -loom <scene.py> is only meaningful with "
+                                         "-viewer <sidecar.json> or -anim <drive.json>\n");
                     return 1;
                 }
-                return runViewerGui(argv[i + 1]);
             }
         }
         // Resident preview server (-serve): keep the process alive and re-render each
@@ -7929,6 +9306,19 @@ int main(int argc, char** argv) {
             if (!std::strcmp(argv[i], "-serve")) serve = true;
             else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) inValPos = i + 1;
         }
+        // Publish this render in the stop channel (see `-stop` above) so it can be asked
+        // to finish cleanly from outside, and keep the watcher alive across the whole
+        // run INCLUDING the -keepwindow hold below. stopChannelEnd() unpublishes it on
+        // every exit path, normal or exceptional.
+        {
+            const char* inPath = nullptr; const char* outPath = nullptr;
+            for (int i = 1; i < argc; ++i) {
+                if (!std::strcmp(argv[i], "-in") && i + 1 < argc)      inPath  = argv[i + 1];
+                else if (!std::strcmp(argv[i], "-o") && i + 1 < argc)  outPath = argv[i + 1];
+            }
+            stopChannelStart(std::string(inPath ? inPath : "(no -in)") + " -> " +
+                             (outPath ? outPath : "(default output)"));
+        }
         rc = serve ? runServe(argc, argv, inValPos) : run(argc, argv);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
@@ -7937,12 +9327,18 @@ int main(int argc, char** argv) {
     // -keepwindow / -hold: keep the finished image on screen. The live window runs its
     // own UI thread, so we just block here until the user closes it (or it's already gone)
     // rather than letting process exit tear it down the instant the render completes.
-    if (g_keepWindow && g_liveWin && !g_liveWin->closed()) {
-        std::printf("[window] render done — close the preview window to exit.\n");
+    // (An external -stop means "exit now", so it skips the hold entirely rather than
+    // announcing a wait it's about to break out of.)
+    if (g_keepWindow && g_liveWin && !g_liveWin->closed() && !g_extStopRequested.load()) {
+        std::printf("[window] render done — close the preview window to exit "
+                    "(or run: ftrace -stop %ld).\n", ftraceCurrentPid());
         std::fflush(stdout);
-        while (!g_liveWin->closed())
+        // The hold ends on the window closing OR on an external -stop, so a held window
+        // on an unattended machine is never a reason to reach for taskkill.
+        while (!g_liveWin->closed() && !g_extStopRequested.load())
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+    stopChannelEnd();
 #ifdef HAVE_CUDA
     cudaGracefulShutdown();
 #endif

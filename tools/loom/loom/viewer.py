@@ -573,13 +573,57 @@ class ViewerModel:
                 out[p.name] = p.default
         return out
 
+    def declared_param_types(self) -> Dict[str, str]:
+        """Per-param **type tag** for :meth:`declared_params` — ``"int"``, ``"float"``,
+        ``"bool"``, ``"str"`` or ``"other"``.
+
+        JSON erases Python's int/float distinction on the way to the viewer (both are
+        just numbers), but a build that takes ``rings=8`` and gets ``8.0`` back can
+        fail outright (``range(8.0)``).  A viewer that knows the tag can render an
+        integer drag and send an integer literal.  Note ``bool`` is checked before
+        ``int`` — in Python ``True`` *is* an ``int``, and a checkbox is what the author
+        meant.
+        """
+        out: Dict[str, str] = {}
+        for k, v in self.declared_params().items():
+            if isinstance(v, bool):     # before int: bool subclasses int
+                out[k] = "bool"
+            elif isinstance(v, int):
+                out[k] = "int"
+            elif isinstance(v, float):
+                out[k] = "float"
+            elif isinstance(v, str):
+                out[k] = "str"
+            else:
+                out[k] = "other"
+        return out
+
+    def build_path(self) -> Optional[str]:
+        """Absolute path of the file the ``build`` callable was defined in, or ``None``
+        when it has no source file (a lambda in a REPL, a C function).  Recorded in the
+        sidecar as ``"build"`` so a viewer handed only the sidecar can reconnect the
+        **live** re-introspection channel (``python -m loom.viewer <that path>``) without
+        being told the scene file a second time."""
+        try:
+            src = inspect.getsourcefile(self.build) or inspect.getfile(self.build)
+        except (TypeError, OSError):
+            return None
+        return os.path.abspath(src) if src else None
+
     def scene(self, clock: Optional[Clock] = None, **overrides: Any):
         p = dict(self.params)
         p.update(overrides)
         return build_scene(self.build, clock, **p)
 
     def introspect(self, clock: Optional[Clock] = None, **overrides: Any) -> Dict[str, Any]:
-        return introspect(self.scene(clock, **overrides), clock=clock)
+        """The introspection sidecar for this model, plus a ``"build"`` key naming the
+        file the ``build`` callable came from (see :meth:`build_path`) — the sidecar's
+        own provenance, and what lets a viewer reopen the live channel from it."""
+        data = introspect(self.scene(clock, **overrides), clock=clock)
+        bp = self.build_path()
+        if bp is not None:
+            data["build"] = bp
+        return data
 
     def save_sidecar(self, path: str, clock: Optional[Clock] = None,
                      *, emit_source: bool = True, **overrides: Any) -> None:
@@ -593,6 +637,9 @@ class ViewerModel:
         """
         scene = self.scene(clock, **overrides)
         data = introspect(scene, clock=clock)
+        bp = self.build_path()
+        if bp is not None:
+            data["build"] = bp      # provenance: reopens the live channel from the sidecar
         if emit_source:
             src = self._emit_source(scene, path, clock)
             if src is not None:
@@ -666,8 +713,10 @@ class ViewerSession:
       there (atomically) and the ack is ``{ok, out}``; else the source text rides
       back inline as ``{ok, source}``.  This is what the viewer calls on
       rotate/scrub/param-edit to get freshly re-tessellated geometry (F4).
-    * ``params`` — ack ``{ok, params}``: the build's declared keyword controls
-      (name→default), so the viewer can build its parameter UI.
+    * ``params`` — ack ``{ok, params, types, build}``: the build's declared keyword
+      controls (name→default) so the viewer can build its parameter UI, each one's
+      type tag (``int``/``float``/``bool``/``str``/``other`` — JSON erases int-vs-float
+      and a build taking ``rings=8`` breaks on ``8.0``), and the build file's path.
     * ``quit`` — stop the serve loop; ack ``{ok, bye:true}``.
     """
 
@@ -682,7 +731,10 @@ class ViewerSession:
             if cmd == "emit":
                 return self._emit(msg)
             if cmd == "params":
-                return {"ok": True, "params": self.model.declared_params()}
+                return {"ok": True,
+                        "params": self.model.declared_params(),
+                        "types": self.model.declared_param_types(),
+                        "build": self.model.build_path()}
             if cmd == "quit":
                 return {"ok": True, "bye": True}
             return {"ok": False, "error": f"unknown cmd {cmd!r}"}
@@ -785,4 +837,9 @@ __all__ = [
 
 
 if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    # See the note in loom/anim.py: `python -m loom.viewer` re-executes this file as
+    # `__main__`, giving every class defined here a second identity, while a scene's
+    # `from loom.viewer import ...` gets the canonical one. Any isinstance test
+    # across that boundary then silently fails. Delegate to the imported module.
+    from loom.viewer import main as _main
+    raise SystemExit(_main())

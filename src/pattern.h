@@ -105,7 +105,43 @@ enum class PatOp : int {
     // correctly so: once resolved, a program whose only variable was `a` IS a load-time
     // constant, so it stays legal at a constant value site.
     VarA,
+    // Named-spectrum sample: pops a wavelength (nm) and pushes the value of a declared
+    // `spectrum "<name>"` there. The node's `a` holds an index into the compiling
+    // loader's own spectrum vector, resolved at compile time from `spec:<name>(w)`.
+    //
+    // This exists for ONE caller: a user-supplied RGB->spectral upsampler
+    // (`upsample "<name>" { expr "…" }`, K1), where it is what lets an upsampler be a
+    // *measured basis* — `r*spec:red(w) + g*spec:green(w) + b*spec:blue(w)` — and not
+    // merely closed-form arithmetic. Like `tex:` it needs a table that exists in only
+    // one context, so the compiler accepts it only where a PatSpecScope is in scope,
+    // which is exactly an upsample body.
+    //
+    // It NEVER reaches the device, and cannot: an upsample program is consumed at LOAD
+    // time (each authored colour is baked through it into an ordinary tabulated
+    // Spectrum) and is never stored on a Material or in Scene::patterns, which are the
+    // only things uploaded. That is a structural guarantee, not a convention — the same
+    // one that keeps `albedo_default` loader-side.
+    Spec,
 };
+
+// Which variable vocabulary an expression is compiled against. The default surface
+// vocabulary (x/y/z/f/n*/r/u/v, plus the scoped `t` and `a`) describes a point being
+// shaded. An UPSAMPLE body has no shading point at all — it is a function from a colour
+// and a wavelength to a spectral value — so it gets a DISJOINT vocabulary rather than a
+// superset: `r`, `g`, `b` (the colour, linear sRGB) and `w` (wavelength, nm).
+//
+// Disjoint, not additive, and that is the whole point. `r` already means RADIUS in the
+// surface vocabulary, so an upsampler that could see both would give one spelling two
+// meanings depending on where it was written — the silent-wrong-value failure this
+// codebase refuses. In Upsample mode every surface name is REJECTED BY NAME with a
+// message saying so, so no spelling's meaning quietly depends on its context.
+//
+// Internally the four upsample variables reuse the VarX/VarY/VarZ/VarU opcode slots —
+// a register assignment, not an aliasing of meaning: the surface names that normally
+// occupy those slots cannot be written here, so no program can observe the overlap.
+// That keeps the enum, `patternHasFreeVars`' VarX..VarV range, and the device switch
+// untouched by a feature that never runs on the device.
+enum class PatVarMode : int { Surface = 0, Upsample };
 
 // One postfix node. POD (no std:: members) so it uploads to the GPU verbatim.
 struct PatNode {
@@ -308,6 +344,13 @@ struct PatCtx {
     int nScatters = 0;
     const float* dataPool = nullptr;
     int dataPoolN = 0;
+    // PatOp::Spec sampler hook, for `spec:<name>(w)` inside an upsample body. Same
+    // opaque-callback shape (and the same reason) as texFn: a Spectrum is a host
+    // std::function living in spectrum.h, which pattern.h deliberately does not know
+    // about. Null => Spec reads 0, which can only happen at a site where the compiler
+    // already refused `spec:` outright.
+    double (*specFn)(const void* self, int idx, double w) = nullptr;
+    const void* specSelf = nullptr;
 };
 
 // The SCENE-OWNED half of a PatCtx, with none of the per-hit coordinates: just the N-D
@@ -343,6 +386,16 @@ inline void patBindTables(PatCtx& c, const PatTables* t) {
 // program or a load-time constant site can never smuggle in a sample it could not
 // actually perform. Kept as self+thunk (not std::function) to keep this header light.
 struct PatTexScope {
+    const void* self = nullptr;
+    int (*lookup)(const void* self, const char* name) = nullptr;   // -> index, or -1
+    int resolve(const char* n) const { return lookup ? lookup(self, n) : -1; }
+};
+
+// Compile-time name resolution for `spec:<name>(w)` — the named-spectrum sampler. Same
+// shape and the same scope rule as PatTexScope: a site with no spectrum table at eval
+// time passes nothing, which turns the sample into a legible compile error instead of a
+// silent zero. In practice exactly one site passes it: an `upsample` body.
+struct PatSpecScope {
     const void* self = nullptr;
     int (*lookup)(const void* self, const char* name) = nullptr;   // -> index, or -1
     int resolve(const char* n) const { return lookup ? lookup(self, n) : -1; }
@@ -480,6 +533,9 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 st[sp-1] = c.texFn ? c.texFn(c.texSelf, (int)nd.a, st[sp-1], vv) : 0.0;
                 break;
             }
+            case PatOp::Spec:                               // one arg: the wavelength
+                st[sp-1] = c.specFn ? c.specFn(c.specSelf, (int)nd.a, st[sp-1]) : 0.0;
+                break;
             case PatOp::Grid: {
                 int gi = (int)nd.a;
                 // A resolved index always names a live table: the compiler accepts
@@ -574,6 +630,9 @@ inline bool gridFuncName(const std::string& s) {
 inline bool scatterFuncName(const std::string& s) {
     return s.size() > 8 && s.compare(0, 8, "scatter:") == 0;
 }
+inline bool specFuncName(const std::string& s) {
+    return s.size() > 5 && s.compare(0, 5, "spec:") == 0;
+}
 // The `<kind>:` prefix length of an N-D table call, for stripping off the name.
 inline size_t tablePrefixLen(PatTableKind k) { return k == PatTableKind::Grid ? 5 : 8; }
 inline const char* tableKindName(PatTableKind k) { return k == PatTableKind::Grid ? "grid" : "scatter"; }
@@ -584,6 +643,10 @@ inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
     // token (the tokenizer scans `tex:foo` as one identifier), so arity is fixed at
     // 2 and the index is resolved separately against the call site's PatTexScope.
     if (texFuncName(s)) { out = PatOp::Tex; arity = 2; return true; }
+    // `spec:<name>(w)` — sample a named spectrum at a wavelength. Fixed arity 1 (a
+    // spectrum is a function of one variable); the index resolves against the call
+    // site's PatSpecScope, which only an upsample body supplies.
+    if (specFuncName(s)) { out = PatOp::Spec; arity = 1; return true; }
     // `grid:<name>(c0, …)` / `scatter:<name>(c0, …)` — sample a named N-D table. Arity
     // is the TABLE's own ndim, which this name-only lookup cannot know, so it reports 0
     // and every caller that needs the real arity takes it from the token's resolved
@@ -629,9 +692,22 @@ inline PatOp binOp(char c) {
     }
 }
 
+// Map an identifier to a variable opcode in the UPSAMPLE vocabulary. See PatVarMode:
+// this vocabulary is disjoint from the surface one, and the opcode slots it borrows are
+// unreachable by name here, so the reuse is invisible to any program.
+inline bool upsampleVarOp(const std::string& s, PatOp& out) {
+    if (s == "r") { out = PatOp::VarX; return true; }   // red   (linear sRGB)
+    if (s == "g") { out = PatOp::VarY; return true; }   // green
+    if (s == "b") { out = PatOp::VarZ; return true; }   // blue
+    if (s == "w") { out = PatOp::VarU; return true; }   // wavelength, nm
+    return false;
+}
+
 inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& err,
                      bool allowT = false, const PatTexScope* tex = nullptr,
-                     const PatTableScope* tables = nullptr, bool allowA = false) {
+                     const PatTableScope* tables = nullptr, bool allowA = false,
+                     PatVarMode vars = PatVarMode::Surface,
+                     const PatSpecScope* specs = nullptr) {
     size_t i = 0, n = s.size();
     bool prevValue = false;   // was the previous token a value/RParen (for unary minus)
     while (i < n) {
@@ -653,7 +729,8 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
             // A texture reference `tex:<name>` scans as ONE identifier, so a sample
             // reads as a plain two-argument call `tex:<name>(u, v)` and reuses the
             // very same `tex:` spelling that material slots already use for images.
-            if ((id == "tex" || id == "grid" || id == "scatter") && j < n && s[j] == ':') {
+            if ((id == "tex" || id == "grid" || id == "scatter" || id == "spec") &&
+                j < n && s[j] == ':') {
                 size_t e = j + 1;
                 while (e < n && isIdentCh(s[e])) ++e;
                 id = s.substr(i, e - i);
@@ -677,6 +754,18 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
                     }
                     t.texId = tex->resolve(nm.c_str());
                     if (t.texId < 0) { err = "unknown texture '" + nm + "' in " + id + "(u, v)"; return false; }
+                }
+                if (fop == PatOp::Spec) {
+                    std::string nm = id.substr(5);
+                    if (!specs) {
+                        err = "spectrum sample '" + id + "' is out of scope here — a named "
+                              "spectrum can only be sampled inside an `upsample` body, which is "
+                              "the one place a wavelength is the free variable";
+                        return false;
+                    }
+                    t.texId = specs->resolve(nm.c_str());
+                    if (t.texId < 0) { err = "unknown spectrum '" + nm + "' in " + id + "(w) — "
+                                             "`spec:` names a declared `spectrum \"<name>\"` block"; return false; }
                 }
                 if (fop == PatOp::Grid || fop == PatOp::Scatter) {
                     const PatTableKind kind = (fop == PatOp::Grid) ? PatTableKind::Grid
@@ -702,17 +791,47 @@ inline bool tokenize(const std::string& s, std::vector<Tok>& out, std::string& e
                 err = "texture sample '" + id + "' must be called with coordinates, e.g. " + id + "(u, v)";
                 return false;
             }
+            if (specFuncName(id)) {
+                err = "spectrum sample '" + id + "' must be called with a wavelength, e.g. " + id + "(w)";
+                return false;
+            }
             if (gridFuncName(id) || scatterFuncName(id)) {
                 err = std::string(gridFuncName(id) ? "grid" : "scatter") + " sample '" + id +
                       "' must be called with one coordinate per axis, e.g. " + id + "(u)";
                 return false;
             }
             if (id == "tex") { err = "texture sample needs a name: tex:<texture>(u, v)"; return false; }
+            if (id == "spec") { err = "spectrum sample needs a name: spec:<spectrum>(w)"; return false; }
             if (id == "grid") { err = "grid sample needs a name: grid:<grid>(c0, ...)"; return false; }
             if (id == "scatter") { err = "scatter sample needs a name: scatter:<scatter>(c0, ...)"; return false; }
             if (id == "pi") {
                 Tok t; t.kind = Tok::Num; t.num = 3.14159265358979323846;
                 out.push_back(t); prevValue = true; continue;
+            }
+            // An UPSAMPLE body has a disjoint vocabulary (see PatVarMode), so it is decided
+            // here — BEFORE the surface names below, which must not be reachable at all.
+            // `pi` above is deliberately left shared: it is a constant, not a context.
+            if (vars == PatVarMode::Upsample) {
+                if (upsampleVarOp(id, vop)) {
+                    Tok t; t.kind = Tok::Var; t.var = vop; out.push_back(t);
+                    prevValue = true; continue;
+                }
+                // Name every surface variable explicitly rather than letting it fall through
+                // to a bare "unknown identifier". The trap this guards is real and would
+                // otherwise be silent-ish: `r` is RADIUS in the surface vocabulary and RED
+                // here, so an author porting a formula between the two needs to be told the
+                // spelling changed meaning, not just that something is unknown.
+                PatOp dummy;
+                if (varOp(id, dummy) || id == "t") {
+                    err = "variable '" + id + "' is a surface/shading variable and has no meaning "
+                          "in an `upsample` expression — there is no hit point here. An upsampler "
+                          "sees only r, g, b (the colour, linear sRGB) and w (wavelength, nm)"
+                          + (id == "r" ? std::string(" — note 'r' means RED here, not radius") : std::string());
+                    return false;
+                }
+                err = "unknown identifier '" + id + "' — an `upsample` expression has r, g, b "
+                      "(the colour, linear sRGB), w (wavelength in nm), pi, the usual functions, "
+                      "and spec:<spectrum>(w)"; return false;
             }
             if (id == "t") {
                 // The flyby timeline is in scope ONLY inside a camera_curve record track.
@@ -844,10 +963,12 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
                                std::string& err, bool allowT = false,
                                const PatTexScope* tex = nullptr,
                                const PatTableScope* tables = nullptr,
-                               bool allowA = false) {
+                               bool allowA = false,
+                               PatVarMode vars = PatVarMode::Surface,
+                               const PatSpecScope* specs = nullptr) {
     using namespace pattern_detail;
     std::vector<Tok> toks;
-    if (!tokenize(expr, toks, err, allowT, tex, tables, allowA)) return false;
+    if (!tokenize(expr, toks, err, allowT, tex, tables, allowA, vars, specs)) return false;
 
     std::vector<PatNode> queue;             // output (postfix)
     std::vector<Tok>     ops;               // operator stack (Op / Func / LParen)
@@ -863,6 +984,7 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
             PatNode nd; nd.op = op;
             if      (op == PatOp::PovFn) nd.a = (double)povId;
             else if (op == PatOp::Tex)   nd.a = (double)t.texId;    // resolved at tokenize
+            else if (op == PatOp::Spec)  nd.a = (double)t.texId;    // shares the resolved-index slot
             else if (op == PatOp::Grid || op == PatOp::Scatter)
                                          nd.a = (double)t.tableId;  // resolved at tokenize
             queue.push_back(nd);

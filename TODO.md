@@ -8,6 +8,15 @@ status back into the originating file (`DESIGN.md`, `ROADMAP.md`, `OSCILLATE_GRA
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done.
 Origin tags point at the authoritative design text for each item.
 
+> **Looking for what's still left? Read [`open-work.md`](open-work.md) first.**
+> This file has become mostly a *record of what shipped*: most entries are long prose blocks
+> whose opening paragraph reads like a plan but whose later `**STATUS (date) … DONE**`
+> sub-paragraph says it landed, so an entry must be read to the end before it can be called
+> open. `open-work.md` is the actionable extract — the handful of genuinely-undone items, each
+> pointing back here for the full design text. **This file stays authoritative for design and
+> history; that one is authoritative for "what's next".** When an item lands or a new open item
+> appears, update both.
+
 ---
 
 ## NEXT UP — unify element headers to `name = KIND { … }` (do before the ftrace grammar port)
@@ -124,7 +133,9 @@ Origin tags point at the authoritative design text for each item.
         multilinear exactness (worst error 1e-8, float-pool storage), all three `outside` policies, and the
         compile/arity/scope rules. Cross-backend: `scraps/grid_test.ftsl` at 16384 spp agrees CPU↔GPU to **0.003 %**
         mean (RMS 0.99/255 — pure MC noise).
-      **Still open here:** the `[[…][…]](u,v)` *authoring* sugar (increment 2) reaching this same datatype.
+      *(Was: "still open here — the `[[…][…]](u,v)` authoring sugar (increment 2) reaching this same datatype."
+      **That shipped in v0.73.0** — see the increment-2 STATUS block below. The only piece of the sample call
+      still open is the keyword-rebind form `(a=u)`; it is listed in `open-work.md`.)*
       (Several names above were generalized by the scatter port immediately below — `PAT_GRID_MAX_DIM` →
       `PAT_ND_MAX_DIM`, `PatGridScope` → `PatTableScope`, `Scene::gridPool` → `Scene::dataPool`.)
     * **STATUS (2026-07-27): increment 3's RAGGED half — the N-D `scatter` datatype + sampler — is DONE
@@ -215,6 +226,120 @@ Origin tags point at the authoritative design text for each item.
       - **Deferred:** the keyword-rebind form `(a=u)` (formals don't exist yet — it currently lexes as a call and
         would fail in the expression compiler), and `NAME axistuple` (`ramp(u)`), which needs no work because
         ftrace's expression evaluator already reads `name(args)` as a call.
+        *(Both clauses are now resolved — and the second one was wrong. See the increment-2 remainder below.)*
+    * **STATUS (2026-07-28): increment-2 REMAINDER DONE — formals and the keyword rebind. Shipped as 0.91.0.**
+      The deferral above was **stale in the more interesting direction**: the machinery it was waiting on ("formals
+      don't exist yet") shipped as the §3.3 material bundles (v0.87.0) and §3.2 per-property access (v0.89.0), and
+      it turned out that the *feature* the ADDENDUM asks for had come along with it, unnoticed and unpinned.
+      `[0 1](a)` already compiled to a program with a free `a`, and `mat(a=u)` / `src.reflect(a=u)` /
+      `src.reflect(u)` already rebound it. What this arm actually did was **pin the semantics, close the one
+      genuinely open spelling, and stop the whole thing regressing silently**:
+      - **The semantics TODO asked to pin — "binding site vs literal coordinate source" — resolves to *binding
+        site*, and for a reason that needed no new code.** A material application substitutes ANY input name
+        (`patternSubstitute`), so every driver name in a literal's tuple is rebindable; a literal's "formals" are
+        simply the driver names it wrote, which is exactly what the ADDENDUM's `(u=a, v=x)` example rebinds.
+        Naming `a` is not a special construct — it is an ordinary coordinate that happens to name the one input
+        with no per-hit intrinsic, which is what lets it survive to the use site.
+      - **The one open spelling is REFUSED, loudly.** `formal=driver` *inside a literal's own call* (`[0 1](a=u)`)
+        has no formal to bind: an inline literal's axes are anonymous and positional, and there is no second
+        namespace. Honouring it would have to invent a per-material default for `a` — which two literals in one
+        material could contradict — so it is a load error naming BOTH escapes (`[0 1](u)` to spend the axis,
+        `[0 1](a)` + `material mat(a=u)` to defer it). Previously it reached the pattern lexer and died as
+        `unexpected character '='`. `desugarOne` now splits the call properly (`splitCallArgs`, sharing
+        `parseBindArgs`'s "a top-level `=` is unambiguous" rule) and also names an empty axis by index.
+      - **The unsaturated error now names the deferral route** — the ADDENDUM's "user-side, axis left open" case.
+        ftrace has no value site that can hold an unsaturated array, so leaving an axis open is spelled `(a)`,
+        not by omitting the call; the message says so instead of only offering `(u)`.
+      - **Generated blocks are re-attributed** (`Builder::genSite_` / `genWho`): any error inside the anonymous
+        `grid`/`pattern` a literal desugars to now names the author's site and the literal's call text. The
+        increment-2 bullet above claimed errors "never name the generated `__arrN`", but that only held for the
+        checks `desugarOne` did itself — a bad *coordinate* (`[0 1](nope)`) reported `pattern '__arr0'`.
+      - **loom twin:** `values.py::_check_args` gained `literal_target`, refusing the same spelling with the same
+        two escapes. Without it loom would happily normalize `[0 1](a=u)` into a `Call` and emit a scene ftrace
+        rejects. Three existing tests were retargeted from `[0 1](…)` to `ramp(…)` (a NAME target, where a keyword
+        rebind IS meaningful) plus one new refusal test; suite 1210 → 1211.
+      - **`-checkarray`** (`checkArray()` in `main.cpp`) pins it deterministically against independently authored
+        twins at five probe points chosen so `u != v` (a rebind test on the diagonal passes for the wrong reason):
+        the three bind spellings ≡ the inline literal, a driver *expression* ≡ the same expression inline, the
+        geometry-field use site ≡ the property-reference one, and the 2-D simultaneous swap ≡ the transposed
+        literal **with a negative twin** proving the swap is not a no-op. Plus explicit **non-vacuity** checks —
+        a `PatCtx` without the grid pool bound makes `PatOp::Grid` return 0.0, so every identity would otherwise
+        compare 0 == 0 and pass. Plus eight refusals, each pinning its message.
+      - **Validation:** all 15 self-tests PASS, all 85 scenes parse, the grammar corpus sweep is 85/85, loom is
+        1211/1211, and `scenes/_array_formal.ftsl` renders the three identity rows (flat camera-facing quad tiles,
+        for the `_material_bind.ftsl` reasons).
+      - **Still open, discovered here** (logged in `open-work.md`): a literal cannot yet be *composed*
+        (`[0 1]([0.2 0.8](u))` — the inner brackets break `PARENWORD`), and the `NAME axistuple` arm does NOT in
+        fact work at a value site for a grid/scatter (`reflect grid:ramp(u)` is "unrecognized spectrum
+        expression"); it works only for materials and material properties, where it is a bundle application.
+        *(Both are now closed — see the composition and table-call STATUS blocks below.)*
+    * **STATUS (2026-07-28): COMPOSITION DONE — `coord = … | value`, the last unimplemented arm of the grammar
+      sketch above. Shipped as 0.100.0.**
+      A coordinate may now itself be a sampled value, so a literal composes into another's call to any depth:
+      `[0 1]([0.2 0.8](u))`, on any single axis of a multi-axis call (`[[0 0.3][0.6 1]]([0.5 1](u), v)`), and as a
+      term inside coordinate arithmetic. The idiom it buys is remapping — the inner table is the transfer curve
+      applied before the outer lookup.
+      - **The blocker was the LEXER, not the loader.** `splitCallArgs` already tracked bracket depth, so the outer
+        call's arguments would have split correctly; what failed was that `PARENWORD`'s interior class excluded
+        `[` / `]`, so the inner literal's brackets split the token and the outer literal reported the (misleading)
+        *unsaturated* error. Widening the class is safe because the terminal's **balance guarantee rests entirely
+        on `(` and `)` staying excluded** — two paren groups on one line still cannot merge, since merging would
+        have to consume the intervening `)` as an interior char. Longest-match still prefers `PARENWORD`, because
+        `WORD`'s own group alternative keeps brackets out and so matches only the bare `(`.
+      - **A composed literal costs ONE block, not two.** `desugarOne`'s core is now `Builder::buildArrayGrid`
+        (flatten + arity/shape checks + the anonymous `grid`), and only the *value-site* form wraps it in a
+        `pattern` — a composed one is spelled by substituting `grid:__arrN(coords)` into the outer call text
+        (`Builder::desugarNestedLiterals`, recursive), which is already a legal pattern-expression term.
+      - **The loader diagnoses what the lexer deliberately stopped checking.** Brackets inside a call are captured
+        but not balance-checked, so `Builder::parseArrayText` re-parses the argument text with the tokenizer's own
+        splitting rule and names an unbalanced group, a call-less inner literal, or a wrong inner arity against the
+        author's source. A literal glued to an identifier (`f[0 1](u)`) is refused **before** substitution, or the
+        rewrite would report an "unknown identifier `fgrid`" appearing nowhere in the file. Errors two levels deep
+        still name the authoring site, never `__arrN`.
+      - **`-checkarray` section (h)** pins five identities against twins whose coordinate is spelled
+        *arithmetically* — non-circular, since a 2-sample grid over `lo 0 hi 1` interpolates linearly, so
+        `[0.5 1](u)` **is** `0.5+0.5*u`. Includes a deliberately non-identity outer array (a 3-sample tent, whose
+        composition with `[0.5 1](u)` must equal `[1 0](u)`), so no case can pass by the outer lookup being a
+        no-op. `sameReflect` grew a tolerance argument: those twins agree to float precision (~1e-8), because grid
+        samples are stored as float32 while an expression evaluates in double — demanding the bit-identity the
+        rebind twins use would pin the storage format rather than the semantics.
+      - **Validation:** all 15 self-tests PASS, all 87 scenes parse, loom is 1255/1255 (the change is confined to
+        `ftsl_scene.epeg`; loom's reader uses the sibling typed `ftsl.epeg`), and `scraps/arr_compose.ftsl` renders
+        **bit-for-bit identically** to its direct-literal twin, with the tent case likewise bit-identical to its
+        analytic equivalent and demonstrably different from the identity case.
+    * **STATUS (2026-07-28): `NAME axistuple` AT A VALUE SITE DONE — the increment-2 `Deferred:` clause's second
+      arm, which was simply wrong. Shipped as 0.101.0.**
+      That clause (line ~227) said `NAME axistuple` "needs no work because ftrace's expression evaluator already
+      reads `name(args)` as a call". True *inside* a pattern expression — but a **value site is not an expression
+      site**: the slot readers only recognised `pattern:<name>` there, so `reflect grid:ramp(u)` was an
+      "unrecognized spectrum expression". Now every per-hit slot takes a table call directly.
+      - **The same four chokepoints v0.89.0 used for `MATERIAL.slot(args)`.** `bindScalarPattern` and
+        `patternedSpectrumParam` (the per-hit readers) send a `grid:` / `scatter:` head through
+        `Builder::tableCallPattern`, which compiles it with the ordinary `compilePatternExpr` and appends to
+        `scene.patterns` — so the slot holds *exactly* the index a hand-written one-line
+        `pattern { expr "grid:ramp(u)" }` would have produced, and there is no second evaluation path.
+        `dblParam` and `evalSpectrum` are the load-time-constant readers and **refuse**, each naming the slots
+        that can hold a per-hit value.
+      - **Only the scoped spelling is accepted.** A bare `ramp(u)` at a value site already means the §7.6 material
+        bundle application, so accepting it for tables would make meaning depend on which namespace holds the
+        name. `isTableCallHead` tests for the `grid:` / `scatter:` prefix and nothing else. A call-less
+        `grid:ramp` is refused with the `(u)` to add — a table is read AT coordinates — rather than silently
+        becoming a constant.
+      - **Composition works inside a table call too** (`reflect grid:ramp([0.2 0.8](u))`), because a coordinate is
+        an expression here as everywhere: `Builder::desugarTableCall` runs `desugarNestedLiterals` over the token
+        before it compiles, dispatched from `desugarArrays`' visit loop on the cheap
+        `isTableCallHead && contains('[')` test. This needed the *second* grammar change: a **named** table's call
+        lexes as a `WORD`, not a `PARENWORD`, so `WORD`'s balanced-group alternative was widened to
+        character-for-character `PARENWORD`'s body. Only the group *interior* admits brackets — `WORD`'s fallback
+        class still excludes them, so a bracket outside parens is a delimiter as before and `REC.chan[2]` still
+        stops the word at the `[`.
+      - **`-checkarray` section (i)** pins `reflect grid:g(u)` ≡ `[0 1](u)` (with a non-constant check, since an
+        unbound grid pool would make both 0.0), the 2-D `grid:g2(u,v)` form, `scatter:s(u)` ≡ a hand-written
+        `pattern` twin, the formal route (`grid:g(a)` + `src.reflect(a=u)` ≡ `grid:g(u)`), both composition
+        directions, and the SCALAR-slot binding via a `roughness` probe. Plus five refusals: two "fixed at load
+        time" (`film_ior`, `ior`), "does not sample it", "unknown grid" and "expects 1 arg".
+      - **Validation:** all 15 self-tests PASS, all 87 scenes parse, the grammar corpus sweep is 87/87, and loom is
+        1255/1255 (again confined to `ftsl_scene.epeg`).
     * **ADDENDUM — call = sample; late-binding & rebinding of the consumed axis (design intent, user).** The
       trailing `(...)` is not just a *label* on a literal — it is the **sample call**, exactly like loom's
       `grid(x, y)`. Two authoring positions, so a material can *define* what an array consumes, or *defer* it to its
@@ -1102,7 +1227,7 @@ pattern inputs when a pattern is bound in a *texture* slot, (2) a `texture "name
 of a bitmap, (3) loom `FuncSkin`/`skin(expr=…)` emit, (4) tests + a render. Low risk, high reuse. Open
 sub-q: also expose bump/normal-from-UV-gradient for free (the derivative is analytic on the bytecode).
 
-### E2 — General N-D curve → scene-variable animation via the rasterizer curve editor  *(loom + ftrace; LARGE, design; extends §A)*
+### E2 — General N-D curve → scene-variable animation via the rasterizer curve editor  ✅ DONE 2026-07-28 (all 3 slices)  *(loom + ftrace; LARGE, design; extends §A)*
 **Idea.** Generalize ftrace's existing interactive **camera_curve editor** (drop control points,
 scrub/play, paint local speed, edit-in-place, save a real `camera_curve` block — `main.cpp` ~4473+)
 from "edit a camera flyby" into "edit an **N-D curve through a grid/scatterplot** whose curve variables
@@ -1231,8 +1356,63 @@ named `RefSignal`-style slots** (no emit-path change). Pieces:
 23 tests (`tests/test_anim_live.py`: slot value/stale-cache semantics, discovery + same-name grouping,
 driver base defaults/override/strict, set_values fan-out + mod-on-base, emit-frame fresh-cache, every
 LiveSession command + bad-input acks, `serve_live` stop-on-quit + bad-json).
-**Remaining E2 slice:** (3) generalize ftrace's C++ `camera_curve` **editor** to seed from / write back the
-sidecar and target arbitrary scene variables (the interactive C++ part — best done with the user present).
+**SLICE 3a DONE 2026-07-28 (`ftrace -anim`, v0.94.0).** The C++ editor now *edits the drive itself* — the
+sidecar round-trip half of slice 3. Pieces:
+- **`src/curvedrive.h`** — a header-only reader/writer for loom's `CurveDrive` JSON sidecar, on
+  `src/third_party/json.h` (minijson). It re-checks **the same invariants `CurveDrive.__init__` does**
+  (`dims >= 1`, `>= 2` points, every point exactly `dims` wide, every binding channel in range, valid
+  `mode`/`kind`) on **both** load and save, so ftrace can neither accept nor write a sidecar loom would
+  reject. Writes atomically (temp file + `std::filesystem::rename`, the C++ twin of `mkstemp` +
+  `os.replace`), and prints shortest-round-tripping numbers so an edit that moved one point leaves every
+  other coordinate byte-identical.
+- **`-anim <file.json>`** (implies `-explore`) — the fly editor's control points ARE the drive's N-D
+  points. Channels 0–2 are what the viewport draws and the mouse moves (for a flyby drive, literally the
+  camera eye); channels 3.. are values no 3-D viewport can show, so they ride along **per point** and are
+  written back untouched. Point *orientation* is derived on seed from the chord to the successor (a drive
+  is a curve of values and stores no orientation), then re-aimable by the existing orientation painting.
+- **Save writes both** — the `camera_curve` `.ftsl` block as before, *and* the reshaped drive back to its
+  sidecar. The editor owns only the point LIST; `name`, `mode`, `closed`, `dims` and every
+  channel→variable **binding** are copied from whatever the sidecar last held, so an editing pass never
+  drops an association loom authored ("scene proposes, editor disposes" in the ftrace direction).
+- **A sidecar that doesn't exist yet is not an error** — that's how you *start* a drive from the editor:
+  whatever points the scene seeded (e.g. an authored `camera_curve`) become a fresh 3-channel
+  `mode flyby` drive that the first Save creates.
+- **`trackInsert`/`trackErase`** — `editPts`' parallel per-point side tracks (the painted speed multiplier
+  and now the extra channels) are mutated **only** through these, so a track can never drift out of
+  alignment with the points it annotates. A new point inherits its unseen channels from its neighbours
+  (midpoint in the middle, a copy at either end) rather than snapping them to 0.
+
+Verified end-to-end by driving the real GDI panel buttons (`scraps/click_button.ps1` → `BM_CLICK`): a
+loom-written 5-channel drive with 3 bindings seeds, `+Pt`/`Ins`/`Del`/`Save` reshape it, and loom re-loads
+the ftrace-written file with the extra channels interpolated exactly as designed and every binding intact.
+
+**SLICE 3b DONE 2026-07-28 (`-anim` + `-loom`, v0.95.0) — E2 IS NOW CLOSED END TO END.** The live
+editor↔loom value channel plus the binding-editing panel row. Pieces:
+- **`-anim <sidecar.json> -loom <scene.py>`** — the editor spawns
+  `python -X utf8 -u -m loom.anim <scene.py> --config <sidecar>` and drives a `LiveSession` over
+  newline-delimited JSON. **ftrace does not sample the curve; loom does** — the editor pushes the control
+  *points* and then asks by parameter `t`, so what the viewport shows cannot drift from what loom will
+  render for the video. Each ack names an emitted `.ftsl`, which replaces the scene wholesale (every bit of
+  derived state — `plight`, `prims`, the GPU's baked triangles, the resident RGB-backward session — is
+  dropped and rebuilt, because all of it is a function of the scene).
+- **Two-queue bridge policy.** `frame` messages are **latest-wins on one slot** (scrubbing fast must not
+  build a backlog of stale poses), while `points`/`bindings`/`dims` go on a **FIFO that never drops** and
+  is drained before every frame — losing a control message would leave loom rendering against a curve or a
+  binding set the editor no longer has.
+- **The bind row** (a fourth panel row, built on demand once the live channel is up): a channel combo, a
+  slot combo seeded from the `slots` command (pick-only, `(none)` first, so "this channel drives nothing"
+  is expressible without reaching for Unbind), **Bind** / **Unbind**, a `chans:` grow/shrink box, and a
+  status readout that answers "what does this channel do right now?" — `ch 0 → ball_r | live — 4 baked,
+  2 ms`. Growing `dims` widens every point; shrinking it drops the bindings on the vanished channels,
+  mirroring what loom itself does rather than leaving the sidecar holding an association loom has already
+  forgotten. Save writes the edited dims *and* bindings back.
+
+Verified end-to-end through the real GDI controls (`scraps/bindtest.ps1` → `CB_SETCURSEL` +
+`CBN_SELCHANGE`, `BM_CLICK`, `WM_SETTEXT`), with a deliberately **static camera** drive
+(`scraps/anim_static.json`: three identical eye points, channel 3 = 0.20/0.95/0.20 → `ball_r`) so that any
+change in the image is provably the *driven variable* and not camera motion — the middle ball breathes
+while the two static posts hold still. Bind/Unbind flip it live; `chans:` 4→7→5→3 reshapes the drive and
+Save round-trips the result.
 
 ### E3 — loom procedural audio: one buffer back-end, per-tick as a thin front-end  *(loom; medium; **DONE 2026-07-18**)*
 **Idea / decision.** loom should be able to *generate audio files* procedurally. Two candidate output
@@ -1772,17 +1952,34 @@ replacement for the renderer or the primary editing tool.**
         **linked X axis** (`SetupAxisLinks`) so panning/zooming any one pages them all together, and each
         carries a **draggable yellow index line** wired bidirectionally to the 3-D pane's index dot
         (dragging a chart line moves the dot; the index slider moves every line).
-- [~] **F4 — SweptMesh tessellated view + textures + decoupled re-tessellation.** ✅ core done
+- [x] **F4 — SweptMesh tessellated view + textures + decoupled re-tessellation.** ✅ fully done
+      2026-07-28 (VERSION 0.92.0) with sub-item (2); ✅ core done
       2026-07-24 (VERSION 0.55.0). Slice A (loom, `b13122f`): each `swept_mesh` object record now
       carries a `mesh` key with the tessellated triangle mesh at the clock — `vertices` (flat
       3-vectors), `faces` (0-based index triples), per-vertex `uvs` (u along spine, v around profile),
       `rings`/`profile_count` — mirroring `SweptMesh.emit`'s `sweep_rings`+`skin_rings` without writing
       an OBJ. 2 new tests. Slice B (C++ viewer): a **Meshes tab** (`collectMeshes`/`drawMeshPane`,
-      `MeshView`) draws the surface as a **shaded, depth-sorted (painter's-algorithm) triangle mesh** in
-      a 3-D orbit pane, with **flat two-sided lambert shading**, a **wireframe** overlay, and a colour
+      `MeshView`) draws the surface as a **shaded triangle mesh** in a 3-D orbit pane, with **flat
+      two-sided lambert shading**, a **wireframe** overlay, and a colour
       selector (grey / per-object tint / **UV checker**). Orbiting the 3 spatial dims is the **view-only
       re-projection** the rotation rule calls for. A swept-mesh scene opens on the Meshes tab by default
       (its spine curves still populate the Curves tab). Verified via PrintWindow screenshot.
+      - **(3) real z-buffer** — ✅ **DONE 2026-07-28 (VERSION 0.96.0).** The pane shipped as a CPU
+        **painter's-algorithm** centroid sort into an ImGui draw list, which cannot resolve
+        interpenetrating surfaces (loom's own `examples/viewer_live.py` — an `orbit` tube threading a
+        gyroid ball — rendered wrong) and re-sorted every triangle on the UI thread every frame.
+        `MeshGpu` now uploads the tessellation **once** into one vertex + index buffer (per-mesh
+        `firstIndex/indexCount/baseVertex` ranges keep the per-mesh skin/tint draw calls) and renders
+        it into an offscreen RTV with a **`D32_FLOAT` depth-stencil view** via runtime-compiled HLSL,
+        shown with `ImGui::Image` — the pattern the Render pane already used. Re-upload is keyed on
+        `MeshView::geomGen` (bumped in `adoptSidecar`), so an orbit is one 144-byte cbuffer write;
+        union bounds are baked with the upload instead of rescanned per frame. Shading is preserved
+        exactly (`0.30 + 0.70*|n.z|`, face normal from `cross(ddx,ddy)` — exact under the orthographic
+        orbit), the wireframe became a real depth-tested `D3D11_FILL_WIREFRAME` pass, and the UV
+        checker moved from a per-triangle centroid sample to **per-pixel** (the one deliberate
+        behaviour change; a UV checker exists to show distortion *within* a face). Verified by
+        PrintWindow screenshots of all four colour modes, wireframe, zoom, a window resize and a live
+        `-loom` re-derive. The **curve and field panes still project on the CPU** — same port pending.
       - **(1) textures** (image *or* formula) — ✅ **DONE 2026-07-26 (VERSION 0.58.0).** **Loom half
         2026-07-24** — the sidecar emits a `materials` list (each material's `type`/`props` +
         the `texture` skin it binds, animated props evaluated at the clock) and a `textures` list
@@ -1812,8 +2009,8 @@ replacement for the renderer or the primary editing tool.**
         PrintWindow screenshot on a purpose-built 4-tube scene covering all four paths (image
         skin, procedural formula, formula-sampling-an-image, no texture) plus a deliberately
         broken sidecar for the error path.
-      - **Still open (deferred):** (2) **Re-tessellation when rotating *into* a parameter/extra
-        dimension** via a latest-wins off-thread job queue. **Loom half DONE 2026-07-24** — the
+      - **(2) Re-tessellation when rotating *into* a parameter/extra dimension** via a latest-wins
+        off-thread job queue — ✅ **DONE 2026-07-28 (VERSION 0.92.0).** **Loom half DONE 2026-07-24** — the
         viewer↔loom **live re-introspection channel** (`ViewerSession`/`serve_viewer` in
         `loom.viewer`, plus a `python -m loom.viewer <scene.py>` CLI entry): a resident loom process
         holds a `ViewerModel` and answers newline-delimited-JSON `introspect {clock,params}` requests
@@ -1821,10 +2018,26 @@ replacement for the renderer or the primary editing tool.**
         in the viewer→loom direction. 9 new tests (`tests/test_viewer.py`, 1004 loom green). The channel
         also gained an **`emit`** command 2026-07-24 (re-emit `.ftsl` for a clock/params) that **F7's
         in-process primary path (v0.56.0) already uses the static form of** — the viewer parses loom's
-        emitted `.ftsl` and raymarches it live. **C++ half still open** (best done with the user present):
-        wire the `-viewer` GUI to spawn that process (or reuse the in-process `ViewerModel` bridge F7
-        established) and request re-introspection/`emit` on rotate/scrub, feeding the new **mesh** geometry
-        through a latest-wins job queue into the Meshes tab. Same channel unblocks F7's live field edit.
+        emitted `.ftsl` and raymarches it live. **C++ half 2026-07-28** — a new `-loom <scene.py>` flag
+        (paired with `-viewer`; the sidecar's own `build` provenance key is the fallback) has
+        `runViewerGui` spawn `python -X utf8 -u -m loom.viewer <scene.py>` and hold the channel open:
+        `LoomLink` owns the child + pipes, `LoomBridge` owns **one worker thread and a one-slot pending
+        job** so `post()` overwrites anything not yet started — the latest-wins rule, which makes a
+        continuous drag cost one bake of the final value instead of one per frame. A **Live (loom)**
+        panel in the left column exposes link state, a clock scrub, one typed control per declared
+        keyword param, an `auto` / `re-derive now` switch for slow scenes, and `posted / baked`
+        counters (`posted > baked` = the collapsing working). Marking one continuous param the **sweep
+        axis** makes a **right-drag on any 3-D pane rotate into that dimension** — the gesture this item
+        existed for. Each bake asks for `introspect` **and** `emit`, so the returned sidecar refreshes
+        Curves/Fields/**Meshes** while the returned `.ftsl` re-seeds F7's Render pane; results are
+        adopted on whatever frame they land, preserving orbit, zoom, active tab and DAG layout, and a
+        failed bake shows its error while the last good geometry stays on screen. Scratch sidecars/
+        `.ftsl`/`.obj` go to a per-process `%TEMP%\ftrace_viewer_<pid>` dir that the bridge prunes as
+        results are consumed and removes wholesale on exit. Verified end-to-end plus a 20-round
+        scripted sweep with no crash and no memory growth. Two real bugs fell out of that validation
+        and are fixed + written up in `known-issues.md` (the imgui #7543 / imnodes node-rect crash, and
+        the DAG pane re-packing itself when clipped to zero height). Same channel unblocks F7's live
+        field edit.
 - [x] **F5 — modulator-DAG panel (imnodes).** ✅ 2026-07-24 Introspect the signal DAG via loom's `walk()`
       and lay it out well. Each node shows the **op/function that modulates it** and a **stable identifier**;
       each **edge is labeled with the parameter name it feeds**, so you can tell which variable in a node's
@@ -2379,7 +2592,8 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
          would build a second, competing spelling.
       Each emits down to the J3a form or a documented construct (e.g. lower a `D=3` channel to `spectrum:`-refs +
       synthesised `spectrum` decls); non-lowerable forms stay loom-only representation.
-- [ ] **J3c — full-scene `.ftsl` parser + emitter reconciliation.** Add `.ftsl -> loom Element tree` to
+- [x] **J3c — full-scene `.ftsl` parser + emitter reconciliation. DONE (emitter-drift audit 2026-07-26 / read
+      direction 2026-07-28, 0.93.0 — see the two DONE blocks below).** Add `.ftsl -> loom Element tree` to
       complement the emitters so a whole scene round-trips (semantic re-emit). Audit every `Element.emit`
       against the live grammar and reconcile drift (e.g. `box { translate … size … round … }`,
       `uv planar axis=`, `type mix layer … weight_map pattern:…`, record `from`/dot-override blocks).
@@ -2436,7 +2650,50 @@ re-emit `.ftsl` scenes** (copy an existing `.ftsl`).
       `priority` authored on geometry in `scenes/_record_scalar.ftsl` (it is a **material** slot), and 6 dead
       `contained_by` lines on pure-analytic isosurfaces in the two gallery scenes (the loader only reads it for
       `function` fields — analytic CSG bounds itself, and a manual clip is spelled `intersect { box … }`).
-      The remaining J3c half — `.ftsl` → loom Element tree — is still open (and see the deferred bullet below).
+      **READ DIRECTION — DONE (2026-07-28, 0.93.0).** `.ftsl` → loom Element tree landed, but *not* as
+      emit's inverse, because it cannot be: loom's emitters **bake** Signals at a clock, so a `.ftsl` file is a
+      static snapshot and an `Isosurface`'s field/freq/rotation/drift/placement/threshold are all flattened into
+      one `function { expr "…" }` string. The property that IS achievable, and the one now proven, is
+      **round-trip fidelity**: `parse_document(src).emit(ctx)` reproduces the source **byte for byte** — line layout,
+      alignment padding, brace columns, 2-vs-3-space gaps, comments and blank lines included — which is exactly
+      what an editor needs (load a scene, change one block, write it back, leave every other line untouched).
+      Faithful kinds still build their real class (`material` incl. `type mix` → `MixMaterial`, `texture`,
+      `proctexture`, `sphere`, `light`, `camera`, `spectrum "n" = …`, `range` records); the **baked** kinds fall
+      back to a new layout-preserving generic element `loom/block.py` (`Block`/`Stmt`: ordered entries so
+      duplicate keys survive — `camera_curve`'s repeated `point`, `mix`'s repeated `layer` — valueless keywords,
+      nested blocks, `get`/`has`/`stmts`/`find`/`set`/`add`/`remove`/`same_as`, `roots() == []`).
+      *(Mechanism: whitespace and comments are lexer `@skip`s and simply are not in the tree, so **every**
+      formatting decision is recovered from source spans — `ParseNode.line/col` against a line-offset table —
+      into per-entry `gap`/`own_line`, block `indent`/`brace_gap`/`pad`, a verbatim `raw` slice per statement
+      dropped on `set()`, and `before`/`trail`/`tail_before` trivia lines.)*
+      `parse_elements(text)` reads a whole file in order via a `start_rule = "elements"` override, so
+      `parse_element` keeps rejecting text holding more than one element; `parse_document(text)` returns a
+      **`Document`** = those elements *plus the literal text between them*, because a file is also the blank
+      lines that group its elements and the top-level comments that head its sections, and those belong to
+      *neither* neighbouring element (`Document.gaps` is one longer than `.elements`; `insert`/`append`/`pop`
+      keep the file's head and tail in place). Grammar work en route: `KVWORD`
+      relaxed toward ftrace's own spelling (`axis=y` / `wrap=clamp` are as real as `center=560`; parens excluded
+      because loom's value grammar spells the sample call explicitly), the value grammar's `arg`/`kwarg`/`kwrest`
+      rewritten so `a=u` inside a tuple still splits, `block` split into `block = nl? bcore nl?` so a nested
+      block does not eat the separating newline, and `bhead` kept as ftrace's two distinct header shapes
+      (`binder NAME subtype?` vs `NAME STRING? subtype?` — a bound element takes no quoted name).
+      **Two real drift bugs found by the corpus round-trip and fixed** (see `known-issues.md`): the `type mix`
+      dict-fold that dropped all but the last layer, and `as_color_binding` rejecting `pattern:<name>` in a
+      colour slot that **loom itself emits** and ftrace accepts (`patternedSpectrumParam`, `src/ftsl.h` ~2083).
+      Verification: 1243 loom tests green (26 new in `tests/test_grammar_block.py`); all **11** loom-emitted
+      element kinds (`scraps/emit_audit/*.ftsl`) round-trip byte-identically; **65 of 97** corpus files parse and
+      **64 of those 65** re-emit byte-identically as a *whole file*. The 65th is the one documented normalisation:
+      a typed element re-emits through its own emitter, i.e. in loom's **canonical** form, so hand-alignment
+      *inside* one is not preserved (`spectrum "steel"   = rgb …` loses the padding before `=`; it is a fixed
+      point after the first save). Layout fidelity is a `Block` property, by construction.
+      **SCOPE BOUNDARY (deliberate, do not "fix"):** the 32 non-parsing files are hand-authored *full-ftrace-
+      language* constructs `ftsl.epeg` does not model — `/`-containing names (`hall/g0 = isosurface {`), §3.2
+      per-property access (`arr_a.reflect(a=u)`), expression arguments (`grad_u(1-u)`), `[…]` array literals at
+      block value sites. `ftsl.epeg` is loom's **typed** grammar and keeps real `NUMBER`/`REF`/`PIN`/`STRING`
+      terminals so the record/material/spectrum validators can shape-check; adopting ftrace's catch-all `WORD`
+      tokenizer would erase exactly those. The whole-language surface's home is `ftsl_scene.epeg` (the grammar
+      compiled into ftrace). The whole-file `scene { … }` → live `Scene` builder likewise stays FUTURE — see the
+      next bullet.
 - [ ] **FUTURE — loom full `.ftsl` read support** (deferred out of J3c above). Give loom a complete `.ftsl` → `Scene`
       reader (not just per-element round-trip): the whole-file `scene { … }` wrapper rule + a `Scene` builder that
       reassembles textures/patterns/records/materials/geometry/lights/camera into a live `Scene`, plus the lossy
@@ -2541,7 +2798,9 @@ Fallout from the loom↔ftrace light-schema reconciliation (known-issues "RESOLV
 loom's `color=` now emits `spd rgb …` and `size`/`turbidity` were dropped from loom (a light is authored in
 ftrace's own language). Two follow-ups were captured:
 
-- [ ] **K1 — Multiple RGB→spectral upsampling methods (incl. a user-supplied mapping).** Today there is exactly
+- [x] **K1 — Multiple RGB→spectral upsampling methods (incl. a user-supplied mapping).** **DONE 2026-07-28
+      (v0.90.0)** — five built-in upsamplers *and* the user-supplied mapping; see the sub-entries below, the last
+      of which closes the final clause. Today there is exactly
       **one** RGB→spectrum path, shared by *materials and lights alike*: `rgb r g b` → `rgbToReflectanceJH`
       (`src/upsample.h`), the Jakob-Hanika 2019 sigmoid-of-quadratic **reflectance** fit — coefficients solved by
       Gauss-Newton so the spectrum, viewed **under D65 through the CIE observer**, reproduces the target linear-sRGB
@@ -2606,12 +2865,58 @@ ftrace's own language). Two follow-ups were captured:
           every test colour. Render: `scraps/meng_test.ftsl` (four upsamplers, same colour, lit by
           illuminant A — a D65 wash cannot distinguish them by construction). Reflectance upsampler →
           host-side bake, no GPU change.
-    - **Residual (deliberately not scheduled):** a **user-supplied custom basis**. The **named user
-          mapping** is already covered — `spectrum "name" = <expr>` registers a reusable named spectrum
-          referenced via `spectrum:name` (ftsl.h ~335/1239), and the
-          `rgb`/`rgbsmits`/`rgbbox`/`rgbillum`/`rgbline`/`rgbmeng` heads are exactly named
-          `(r,g,b)->spectrum` functions. So the only thing left is letting a scene bring its own basis
-          curves, which is low-value given the five built-ins and stays out unless a scene needs it.
+    - [x] **User-supplied named mapping landed** *(2026-07-28, v0.90.0)* — the last clause of the original
+          proposal, and the item's close. Surface: `upsample "<name>" { expr "f(r, g, b, w)" }` declared at
+          top level and named by the **colon head** `rgb:<name> r g b` (also `hsv:`/`hsl:`, converted to
+          linear sRGB *before* the body runs so all three feed identical `r,g,b`). A colon rather than yet
+          another glued suffix because the built-in suffixes are a closed set a reader can memorise while a
+          user name is open-ended, and `:` is already this grammar's namespace marker (`spectrum:`, `metal:`,
+          `tex:`, `grid:`). Wired through `evalSpectrum`'s existing colour-head chokepoint (`ftsl.h`), so the
+          head works at *every* spectral site and, because `isColourHead` gained one shape-only arm
+          (`isCustomColourHead`), at a record channel's inline-colour tag too — the one list stays one list.
+          *This entry replaces a previous "Residual (deliberately not scheduled)" bullet that claimed the named
+          user mapping was "already covered" by `spectrum "name" = <expr>` + the built-in heads. That was
+          wrong: a named spectrum is a fixed curve, and a built-in head is a fixed function — neither lets a
+          scene supply `(r,g,b) -> spectrum` itself, which is what the proposal asked for.*
+          Three design decisions carried it, each chosen so a limitation fails loudly instead of approximating:
+          **(a) the body's variable vocabulary is DISJOINT from the surface one, not additive**
+          (`PatVarMode::Upsample`, `pattern.h`). `r` already means *radius* in a surface program and has to
+          mean *red* here; an additive design would make one spelling silently mean two things depending on
+          site. So in upsample mode every surface name (`x y z u v f nx ny nz r t`) is rejected **by name**
+          with a message that says the spelling changed meaning, and `r`/`g`/`b`/`w` reuse the
+          `VarX`/`VarY`/`VarZ`/`VarU` slots as a pure register assignment (invisible, since the surface
+          spellings are unreachable in this mode). `pi` is deliberately left shared — it is a constant, not a
+          context. **(b) `spec:<spectrum>(w)` (`PatOp::Spec` + `PatSpecScope`)** samples a declared `spectrum`
+          block at the queried wavelength. This is what makes the feature more than syntax sugar: it makes a
+          **measured basis** expressible (`r*spec:red(w) + g*spec:green(w) + b*spec:blue(w)`) rather than only
+          closed-form arithmetic — and it is why the expression form was chosen over a basis-only design,
+          which it strictly subsumes. Resolution is compile-time through a scope object exactly like
+          `tex:`/`grid:`/`scatter:`, so `spec:` outside an upsample body and `tex:`/`grid:` inside one are
+          both compile errors naming the scope rule (an ordinary pattern has a hit point but no wavelength;
+          an upsample body the reverse). Spectra are memoised into an **append-only** vector so an index
+          handed out at compile time survives later growth. `PatOp::Spec` never reaches the device: an
+          upsample program is consumed at load time and is never stored on a `Material` or in
+          `Scene::patterns`. **(c) the result is a live closure, not a baked table.** A user upsampler is free
+          to be a narrow emission line, and pre-tabulating at the loader would quietly band-limit it; the
+          renderer already tabulates where it must (`double reflect[SPEC_N]`), at a resolution it chooses. The
+          closure captures the compiled program and the spectrum vector by `shared_ptr`, and the sampler
+          thunk's `self` is the *vector* rather than the Builder, so the produced `Spectrum` outlives the
+          loader (it ends up on a `Material` the `Scene` owns). Programs compile once per name and are shared
+          by every colour that names them. Refusals are loud and specific: unknown upsampler, `upsample` with
+          no `expr`, surface variable, unknown identifier (listing the vocabulary), unknown spectrum in
+          `spec:`, an uncalled `spec:` reference, and both halves of the scope rule. Validated by
+          `-checkupsample` **section (h)**: 14 asserts run through the real loader (constant body; r/g/b/w
+          each reaching their own slot; `hsv:` ≡ the converted `rgb:`; `spec:` matching the gaussian's closed
+          form at five wavelengths; a three-spectrum basis matching by hand; and the eight refusals) — every
+          number computed in the test rather than hard-coded, and every sample taken *after* the `Loaded`
+          scope exits, which is what pins (c). Visual companion `scenes/_upsample.ftsl` →
+          `png/_upsample.png` (six spheres, one authored colour, six upsamplers, plus a record channel
+          tagged `rgb:basis`). loom twins: `NamedSpectrum`/`Upsample` elements (`scene.py`, emitted ahead of
+          textures/patterns/materials), `UserSpec` (`grammar/spectrum.py`) and `is_colour_space`
+          (`record.py`, replacing the closed `_COLOUR_SPACES` membership test at both sites that asked) —
+          `tools/loom/tests/test_upsample.py`, 13 tests. Host-side only, so no GPU change.
+    - **Still deliberately out:** nothing. A "user-supplied custom *basis*" (bring your own basis curves)
+          is now expressible as a `spec:`-weighted body, which is what that phrasing was reaching for.
 
 - [x] **K2 — Analytic physical sky (`turbidity`).** **DONE 2026-07-24.** Implemented the **Preetham et al. 2002**
       analytic daylight model as an `env` sub-kind: `light env { sky preetham  turbidity t  sun_dir …  (or

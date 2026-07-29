@@ -129,7 +129,14 @@ inline CubicBezier GetCubicBezier(
     cubic_bezier.P1 = start + offset;
     cubic_bezier.P2 = end - offset;
     cubic_bezier.P3 = end;
-    cubic_bezier.NumSegments = ImMax(static_cast<int>(link_length * line_segments_per_length), 1);
+    // [ftrace patch] clamp the tessellation. Upstream scales the segment count with the
+    // link length and never bounds it, so a single degenerate coordinate (a NaN, or a
+    // caller-supplied node position that ran away) turns one link into a request for
+    // hundreds of millions of ImDrawVert — ImDrawList::PrimReserve then either OOMs the
+    // process or writes through a null buffer. 4096 segments is already far past the
+    // point where a curve is pixel-exact on any real canvas.
+    cubic_bezier.NumSegments =
+        ImClamp(static_cast<int>(link_length * line_segments_per_length), 1, 4096);
     return cubic_bezier;
 }
 
@@ -1303,6 +1310,38 @@ ImOptionalIndex ResolveHoveredLink(
 
 inline ImRect GetItemRect() { return ImRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax()); }
 
+// [ftrace patch] imgui >= 1.90.7 compatibility.
+//
+// ImGui::EndGroup() now folds `g.LastItemData.Rect.Max` into the group's bounding box
+// (a workaround for EndTable() under-reporting CursorMaxPos, imgui #7543):
+//
+//     ImRect group_bb(BackupCursorPos, ImMax(ImMax(DC.CursorMaxPos, g.LastItemData.Rect.Max), ...));
+//
+// BeginGroup() does *not* clear LastItemData, so a group inherits the extent of
+// whatever item was submitted before it. In normal imgui code that item is a sibling
+// just above, so the damage is invisible. imnodes, though, hard-positions every node
+// anywhere on the canvas with SetCursorPos, so "the previous item" is the previously
+// drawn *node* — which may sit thousands of pixels to the right. Every node's rect
+// then stretches to the right/bottom edge of everything drawn before it, and
+// GetNodeDimensions() reports garbage.
+//
+// That is not merely cosmetic for a caller that lays nodes out from the reported
+// dimensions (ftrace's modulator-DAG panel does): the inflated widths feed back into
+// the next frame's layout, the graph extent grows geometrically, and within a couple
+// of seconds a link is ~1e8 px long. imnodes tessellates links at
+// Style.LinkLineSegmentsPerLength (0.1/px) segments, so ImDrawList::PrimReserve then
+// asks for hundreds of millions of vertices, the allocation fails, and imgui
+// dereferences the null buffer -> access violation.
+//
+// Fix: collapse LastItemData to a degenerate rect at the cursor before every
+// BeginGroup() imnodes makes, so a group only ever measures its own contents.
+inline void ResetLastItemForGroup()
+{
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    const ImVec2  p = ImGui::GetCurrentWindow()->DC.CursorPos;
+    g.LastItemData.Rect = ImRect(p, p);
+}
+
 inline ImVec2 GetNodeTitleBarOrigin(const ImNodeData& node)
 {
     return node.Origin + node.LayoutStyle.Padding;
@@ -1650,6 +1689,7 @@ void BeginPinAttribute(
     IM_ASSERT(GImNodes->CurrentScope == ImNodesScope_Node);
     GImNodes->CurrentScope = ImNodesScope_Attribute;
 
+    ResetLastItemForGroup();   // [ftrace patch] see ResetLastItemForGroup()
     ImGui::BeginGroup();
     ImGui::PushID(id);
 
@@ -2252,6 +2292,7 @@ void BeginNodeEditor()
 
     GImNodes->ActiveAttribute = false;
 
+    ResetLastItemForGroup();   // [ftrace patch] see ResetLastItemForGroup()
     ImGui::BeginGroup();
     {
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(1.f, 1.f));
@@ -2493,6 +2534,7 @@ void BeginNode(const int node_id)
     DrawListActivateCurrentNodeForeground();
 
     ImGui::PushID(node.Id);
+    ResetLastItemForGroup();   // [ftrace patch] see ResetLastItemForGroup()
     ImGui::BeginGroup();
 }
 
@@ -2532,6 +2574,7 @@ ImVec2 GetNodeDimensions(int node_id)
 void BeginNodeTitleBar()
 {
     IM_ASSERT(GImNodes->CurrentScope == ImNodesScope_Node);
+    ResetLastItemForGroup();   // [ftrace patch] see ResetLastItemForGroup()
     ImGui::BeginGroup();
 }
 
@@ -2545,6 +2588,18 @@ void EndNodeTitleBar()
     node.TitleBarContentRect = GetItemRect();
 
     ImGui::ItemAdd(GetNodeTitleRect(node), ImGui::GetID("title_bar"));
+
+    // [ftrace patch] GetNodeTitleRect() is as wide as *last frame's* node.Rect. Since
+    // imgui >= 1.90.7 folds LastItemData into the enclosing group's bounding box (see
+    // ResetLastItemForGroup), leaving that rect as the last item would latch the node
+    // to its historical maximum width and it could never shrink again — e.g. when the
+    // caller zooms out. Report the title bar's own measured extent instead.
+    {
+        ImGuiContext& g = *ImGui::GetCurrentContext();
+        ImRect        title_bb = node.TitleBarContentRect;
+        title_bb.Expand(node.LayoutStyle.Padding);
+        g.LastItemData.Rect = title_bb;
+    }
 
     ImGui::SetCursorPos(GridSpaceToEditorSpace(editor, GetNodeContentOrigin(node)));
 }
@@ -2571,6 +2626,7 @@ void BeginStaticAttribute(const int id)
 
     GImNodes->CurrentAttributeId = id;
 
+    ResetLastItemForGroup();   // [ftrace patch] see ResetLastItemForGroup()
     ImGui::BeginGroup();
     ImGui::PushID(id);
 }

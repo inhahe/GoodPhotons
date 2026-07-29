@@ -35,6 +35,10 @@ The accepted forms — exactly ftrace's ``evalSpectrum`` (``src/ftsl.h`` ~1106) 
 * the Meng 2015 smoothest-spectrum heads **`rgbmeng r g b`** / **`hsvmeng …`** /
   **`hslmeng …`** → the colour upsampled to the *smoothest* reflectance realising
   it (:class:`MengSpec`), the highest-fidelity selectable alternative to ``rgb``;
+* the **user-declared** upsampler heads **`rgb:<name> r g b`** / **`hsv:<name> …`** /
+  **`hsl:<name> …`** → the colour upsampled by a scene-declared
+  ``upsample "<name>" { expr "f(r,g,b,w)" }`` block (:class:`UserSpec`), the open-ended
+  counterpart to the five built-in upsamplers above;
 * a library **reference** — ``glass:`` / ``metal:`` / ``reflectance:`` / ``filter:``
   / ``preset:`` / ``file:`` / ``spectrum:`` followed by a name / path;
 * a **record channel reference** used as a constant — ``RECORD.channel[i]`` or
@@ -69,6 +73,12 @@ _BOX_HEADS = {"rgbbox": "rgb", "hsvbox": "hsv", "hslbox": "hsl"}
 _MENG_HEADS = {"rgbmeng": "rgb", "hsvmeng": "hsv", "hslmeng": "hsl"}
 _LIB_PREFIXES = ("glass:", "metal:", "reflectance:", "filter:", "preset:",
                  "file:", "spectrum:")
+# A USER-declared upsampler head (K1): `<space>:<name> r g b`, naming an
+# `upsample "<name>"` block.  A colon rather than yet another glued suffix because the
+# built-in suffixes are a closed set a reader can memorise while a user name is
+# open-ended — mirrors ftrace's `isCustomColourHead` (src/ftsl.h), which is likewise
+# SHAPE-only: whether the name resolves is a scene-level question, not a grammar one.
+_USER_HEAD_RE = re.compile(r"^(rgb|hsv|hsl):(\w+)$")
 
 # A record channel reference used as a constant value: `RECORD.channel`, optionally
 # indexed `[i]` or driven `(expr)`.  Matched as a whole single word.
@@ -182,6 +192,25 @@ class MengSpec:
     re-illuminated by a strongly non-D65 light or dispersed.  A *head keyword*
     (not a trailing modifier) for the same parser reason as :class:`LineSpec`."""
     space: str
+    comps: Tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class UserSpec:
+    """A USER-declared upsampler: ``rgb:<name> r g b`` (and ``hsv:``/``hsl:``), naming
+    an ``upsample "<name>" { expr "f(r,g,b,w)" }`` block in the same scene — ftrace's
+    ``applyUpsample`` / K1.  The last of the K1 upsamplers and the open-ended one: the
+    other five name a *built-in* fit, this one names a scene-supplied function of the
+    colour and the wavelength, so a scene can plug in e.g. a measured three-spectrum
+    basis (``r*spec:red(w) + g*spec:green(w) + b*spec:blue(w)``).
+
+    ``space`` is the colour space of the *written* triple; ftrace converts to linear
+    sRGB **before** calling the body, so all three heads feed the same ``r, g, b`` and
+    an upsampler never has to know which was used.  ``name`` is kept verbatim and is
+    NOT resolved here — mirroring ftrace, which likewise checks only the shape at the
+    grammar level and reports an unknown upsampler from the loader."""
+    space: str
+    name: str
     comps: Tuple[float, float, float]
 
 
@@ -300,6 +329,15 @@ def parse_spectrum(text: str):
         space = _MENG_HEADS[head]
         _sp, comps = as_color(space + " " + " ".join(words[1:]), default_space=space)
         return MengSpec(space, comps)
+    m = _USER_HEAD_RE.match(head)
+    if m:
+        # `rgb:<name> r g b` (hsv:/hsl:) → a scene-declared `upsample` block.  Checked
+        # after every built-in head so a future built-in can never be shadowed by a
+        # user name — the built-ins are glued suffixes and these are colon-separated,
+        # so the two spellings cannot collide, but the ordering makes that explicit.
+        space, name = m.group(1), m.group(2)
+        _sp, comps = as_color(space + " " + " ".join(words[1:]), default_space=space)
+        return UserSpec(space, name, comps)
     if head in _COLOR_HEADS:
         space, comps = as_color(text, default_space=head)
         return ColorSpec(space, comps)

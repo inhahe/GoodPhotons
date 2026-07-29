@@ -103,6 +103,77 @@ class Pattern(Element):
 
 
 # ---------------------------------------------------------------------------
+# Spectra and colour upsampling
+# ---------------------------------------------------------------------------
+
+class NamedSpectrum(Element):
+    """A named spectral curve: ``spectrum "name" = <expr>``.
+
+    ``expr`` is a `.ftsl` **spectrum expression** — anything
+    :func:`loom.grammar.spectrum.parse_spectrum` accepts (``gaussian center=550
+    sigma=30``, ``preset:d65``, ``file:curve.csv``, ``metal:gold``, a bare number, …) —
+    and is validated on construction so a typo fails in Python rather than at render
+    time.  Two things reference one by name: a material slot's ``spectrum:<name>`` and,
+    inside an :class:`Upsample` body, ``spec:<name>(w)``.  The latter is what makes a
+    *measured basis* upsampler expressible (see :class:`Upsample`).
+    """
+
+    def __init__(self, name: str, expr: str) -> None:
+        from .grammar.spectrum import parse_spectrum
+        self.name = name
+        self.expr = str(expr).strip()
+        parse_spectrum(self.expr)      # raises ShapeError on a bad expression
+        # NOTE: no `interp=` / `table { … }` block form here.  Those are the two
+        # spectrum spellings that are not a single expression, and a scene that needs
+        # one writes it as `file:` instead (which is what a table is *for*).
+
+    def roots(self) -> List:
+        return []
+
+    def emit(self, ctx: EmitCtx) -> str:
+        return f'spectrum "{self.name}" = {self.expr}'
+
+
+class Upsample(Element):
+    """A user-supplied RGB→spectral upsampler: ``upsample "name" { expr "…" }`` (K1).
+
+    ftrace has five *built-in* upsamplers, each reached by a glued colour head
+    (``rgb``= Jakob-Hanika, ``rgbillum``, ``rgbsmits``, ``rgbbox``, ``rgbmeng``).  This
+    is the open-ended sixth: the scene supplies the function itself, and a material
+    slot reaches it by the colon-separated head ``rgb:<name> r g b`` (or
+    ``hsv:<name>`` / ``hsl:<name>`` — ftrace converts to linear sRGB *before* calling
+    the body, so the body always sees the same ``r, g, b``).
+
+    The body is a pattern-VM expression whose free variables are exactly ``r``, ``g``,
+    ``b`` (the colour, linear sRGB) and ``w`` (wavelength, nm), plus ``pi``, the usual
+    functions and ``spec:<spectrum>(w)``.  Note this vocabulary is **disjoint** from the
+    surface/shading one — there is no hit point here, and ``r`` means RED, not radius;
+    ftrace rejects every surface name explicitly rather than silently reinterpreting it.
+
+    The ``spec:`` sampler is the reason this is more than syntax sugar: it lets an
+    upsampler be a **measured basis** rather than a closed form::
+
+        scene.add(NamedSpectrum("sr", "gaussian center=620 sigma=40"),
+                  NamedSpectrum("sg", "gaussian center=540 sigma=40"),
+                  NamedSpectrum("sb", "gaussian center=460 sigma=40"),
+                  Upsample("basis", "r*spec:sr(w) + g*spec:sg(w) + b*spec:sb(w)"),
+                  Material("m", "diffuse", reflect="rgb:basis 0.3 0.6 0.1"))
+    """
+
+    def __init__(self, name: str, expr: str) -> None:
+        self.name = name
+        self.expr = str(expr).strip()
+        if not self.expr:
+            raise ValueError(f"upsample {name!r}: empty expression")
+
+    def roots(self) -> List:
+        return []
+
+    def emit(self, ctx: EmitCtx) -> str:
+        return f'upsample "{self.name}" {{ expr "{self.expr}" }}'
+
+
+# ---------------------------------------------------------------------------
 # Materials
 # ---------------------------------------------------------------------------
 
@@ -641,9 +712,12 @@ class IsoMesh(Element):
 
     ftrace root-finds isosurfaces directly, so most fields should be an
     :class:`~loom.iso.Isosurface` (emitted as a ``function { expr }`` string) —
-    that is sharper and needs no baking.  Use ``IsoMesh`` only when a field must
-    become geometry: a numpy-only field with no ftsl twin, a sampled volume, or a
-    mesh destined for another tool.
+    that is sharper and needs no baking.  Use ``IsoMesh`` when a field must become
+    real geometry: a numpy-only field with no ftsl twin, a sampled volume, a mesh
+    destined for another tool — or a field you want to **inspect in the native
+    viewer**, whose Meshes tab draws (and, on a parameter sweep, re-bakes) exactly
+    this element's triangles via :func:`loom.viewer._iso_mesh_geometry`; an
+    ``Isosurface`` has no triangles for it to show.
 
     ``field`` is a :class:`~loom.spatial.SpatialExpr` (baked at the clock) or a
     vectorised ``f(X, Y, Z) -> ndarray``.  ``bounds``/``res``/``iso``/``adaptive``
@@ -1069,6 +1143,11 @@ class Scene:
         self.camera = camera
         self.units = units
         self.spectral = spectral
+        # Spectra and upsamplers come first in the emitted text: an `upsample` body may
+        # sample a `spectrum` by name, and a material head may name an upsampler. ftrace
+        # resolves all three lazily so the order is not load-bearing — it just reads.
+        self.spectra: List[Element] = []
+        self.upsamplers: List[Element] = []
         self.textures: List[Element] = []
         self.patterns: List[Element] = []
         self.records: List[Element] = []
@@ -1111,7 +1190,11 @@ class Scene:
                                          and getattr(t, "name", None) == e.name)]
             # Textures/patterns/records are emitted before the materials that bind
             # them (ftrace resolves them in an earlier pass, but keep the text tidy).
-            if isinstance(e, (Texture, ProcTexture)):
+            if isinstance(e, NamedSpectrum):
+                self.spectra.append(e)
+            elif isinstance(e, Upsample):
+                self.upsamplers.append(e)
+            elif isinstance(e, (Texture, ProcTexture)):
                 self.textures.append(e)
             elif isinstance(e, Pattern):
                 self.patterns.append(e)
@@ -1134,8 +1217,9 @@ class Scene:
         return self
 
     def _all_elements(self) -> List[Element]:
-        return [*self.textures, *self.patterns, *self.records, *self.materials,
-                *self.elements, *self.lights, self.camera]
+        return [*self.spectra, *self.upsamplers, *self.textures, *self.patterns,
+                *self.records, *self.materials, *self.elements, *self.lights,
+                self.camera]
 
     def check_cycles(self) -> None:
         """Run the loop detector over every modulator in the scene."""
@@ -1149,6 +1233,14 @@ class Scene:
         lo, hi, step = self.spectral
         header = f"scene {{ units {self.units}  spectral {fmt(lo)} {fmt(hi)} {fmt(step)} }}"
         blocks = [header, ""]
+        for sp in self.spectra:
+            blocks.append(sp.emit(ctx))
+        if self.spectra:
+            blocks.append("")
+        for up in self.upsamplers:
+            blocks.append(up.emit(ctx))
+        if self.upsamplers:
+            blocks.append("")
         for tx in self.textures:
             blocks.append(tx.emit(ctx))
         if self.textures:

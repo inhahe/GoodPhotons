@@ -1,0 +1,156 @@
+# INSIDE a mirrored sphere. Nothing in the world but two objects and the light they
+# make: the gallery's xenon short-arc lamp, and a vintage rangefinder camera -- and the
+# rangefinder IS the camera we are looking out of.
+#
+# The render camera's entrance pupil is placed ON the mesh's own front lens element and
+# aimed down the mesh's own optical axis, so the body, the bellows and the chrome barrel
+# are all BEHIND the eye and never appear directly in frame. What you see of the camera
+# is its REFLECTION -- which is the whole point of putting it inside a mirror.
+#
+# The render camera is INSIDE the sphere, so there is no outside, no room, no floor and
+# no horizon -- the silver shell is the entire universe. A sphere seen from within is a
+# CONCAVE mirror, so it does not just repeat the two objects, it wraps them: the lamp
+# and the camera reappear inverted and smeared around the whole field of view, and every
+# copy is lit by the same single arc.
+#
+# `look_at 0 0 0` aims the axis at the sphere's centre, so the central ray hits the shell
+# perpendicular and RETROREFLECTS straight back down its own path: the camera photographs
+# itself, dead centre. With f = R/2 = 0.20 m and an object distance u = |P| + R = 0.517 m,
+# the self-portrait forms INVERTED at 0.63x, about 25 deg across, 0.19 m in front of the
+# lens. The pupil sits near the sphere's centre on purpose -- magnification -> -1 as
+# |P| -> 0, so a central eye makes the self-image as large as it can be (25 deg here
+# versus ~9 deg if the camera hugged the wall).
+#
+#   ftrace -in scenes/mirror_sphere_interior.ftsl -mode D -max-bounce 64 -time 1800 \
+#          -interval 30 -checkpoint -o png/mirrorsphere/mirrorsphere.png -window -keepwindow
+#
+# Then develop it about 3x brighter, straight off the checkpoint, no re-render:
+#
+#   ftrace -topng png/mirrorsphere/mirrorsphere.png.ftbuf \
+#          png/mirrorsphere/mirrorsphere_ev3.png -ev 3
+#
+# The boost is not a fudge, it is forced by the scene: auto-exposure anchors on the
+# 99th luminance percentile, and here that percentile IS the bare arc, which is orders
+# of magnitude brighter than silver-bounced light. Anchoring to it leaves the shell at
+# a median of 33/255. x3 puts the median at 60 and the recursive rings actually read,
+# at the cost of clipping 1.7% of pixels -- essentially just the arc itself, which is
+# a 6000 K point source and *should* blow out. (Until 0.102.1 `-topng` silently dropped
+# -ev, so this took a full re-render; that fix is what makes the one-liner above work.)
+#
+# `-max-bounce 64` is NOT optional here, it is the single setting the whole image depends
+# on. Mode D defaults to 8 edges; a 97%-reflective silver cavity needs ~33 before the light
+# rattling around inside it has actually been absorbed, and the quartz envelope spends ~4
+# vertices before a photon even gets out of the bulb. Measured on this exact frame, at
+# equal render time:
+#
+#     -max-bounce  8   97% of pixels exactly 0.0   (a lamp floating in black)
+#     -max-bounce 48   67%                          (the first ring of images appears)
+#     -max-bounce 64   29%                          (the hall of mirrors)
+#
+# 64 is also the deepest the GPU kernel goes (BDPT_DEEPDEPTH in render_cuda.cu) -- the
+# per-thread vertex stack is the binding constraint. Expect ~15x fewer samples/second than
+# the default depth: the BDPT connection loop is O(depth^2). That is what the 1800 s is for.
+# (Until 0.102.0 mode D hard-coded 8 and silently dropped -max-bounce, so this scene simply
+# could not be rendered; the fix is what these numbers came out of.)
+#
+# A perfect mirror is a DELTA BSDF -- the reflected direction is not sampled, it is
+# computed -- so the hall of mirrors itself costs almost no variance. The noise budget
+# is spent entirely on the lamp: the arc sits behind a quartz wall, and you cannot
+# next-event-connect a shading point to a light through a refracting interface, so every
+# photon has to random-walk out through the glass. That is why this is mode D (BDPT) and
+# not mode R -- the light subpath starts INSIDE the envelope and walks out, which is the
+# only cheap way through.
+
+scene { units meters  spectral 360 830 1 }
+
+# --- the shell -----------------------------------------------------------------
+# Measured Ag reflectance, mirror-smooth. Smooth and not satin on purpose: a rough lining
+# blurs the recursive images into a flat grey soup after two bounces, which is exactly what
+# an integrating sphere is designed to do and the opposite of the picture. The concentric
+# rings of repeated lamps you see are the payoff, and they only survive a DELTA BSDF.
+#
+# Silver's reflectance is ~0.97, so the mean free path of a photon in here is ~1/(1-0.97)
+# = 33 bounces. That number, not the geometry, is what sets the render settings: at the
+# default depth of 8 this frame is 97% pure black, at 48 it is 67% black, at 64 it is 29%
+# black and the hall of mirrors is actually there. See the -max-bounce note in the header.
+material "mirrorskin" { type mirror  reflect metal:silver }
+sphere { center 0 0 0  radius 0.40  material mirrorskin }
+
+# --- the xenon short-arc lamp (verbatim from scenes/gallery.ftsl) ---------------
+# Nested dielectrics, Schmidt-Budge priority: a quartz envelope with a higher-priority
+# copy of the same mesh at 0.94x carving the interior to xenon gas at operating
+# pressure, so the (1 - 0.94) gap IS the glass wall thickness.
+material "lamp_quartz"   { type dielectric ior glass:fused-silica  priority 20 }
+material "lamp_xenon"    { type dielectric ior glass:xenon-lamp    priority 30 }
+material "lamp_electrode"{ type glossy reflect metal:chrome roughness 0.28 }
+material "lamp_cordmat"  { type diffuse reflect rgb 0.05 0.05 0.06 }
+
+# Native mesh orientation: electrode axis = X, cord = +Y. Gallery's 0.11 scale gives an
+# envelope radius ~0.046 m -- a real short-arc envelope, and about a third of the
+# camera's body width, which is the size relation that makes the pairing read.
+#
+# Placed 29.3 deg off the optical axis at 0.300 m, where its envelope subtends 8.7 deg of
+# radius: the bulb's inner edge lands 20.6 deg out, clear of the 25-deg-wide self-image by
+# 8 deg, so the lamp reads as a separate object sitting beside the camera's own portrait
+# instead of blazing through it. The offset is swung mostly SIDEWAYS rather than up --
+# the frame is 99 deg wide but only 76 deg tall, so the same angle that clipped off the
+# top when aimed straight up lands the bulb comfortably inside the left edge.
+#
+# `rotate 0 25 0` swings the electrode axis (local X) from 50 deg off the view direction
+# to 37 deg, foreshortening the long electrode stems to 60% of their broadside length so
+# the whole lamp fits in frame instead of running out past the left edge. Not turned any
+# further: end-on, the near electrode would eclipse the arc.
+mesh "lamp_bulb" { file "assets/lamp/bulb.obj"  rotate 0 25 0  translate -0.017 0.132 -0.157  scale 0.11    material lamp_quartz }
+mesh "lamp_xe"   { file "assets/lamp/bulb.obj"  rotate 0 25 0  translate -0.017 0.132 -0.157  scale 0.1034  material lamp_xenon }
+mesh "lamp_elec" { file "assets/lamp/inner.obj" rotate 0 25 0  translate -0.017 0.132 -0.157  scale 0.11    material lamp_electrode }
+# The cord is stretched only along its LENGTH (x/z stay at the assembly's 0.11) so the
+# lamp actually hangs from the shell instead of trailing a pigtail into thin air:
+# cord.obj is 1.0005 long, and 0.2354 lands its top at y=0.3675, which is exactly where
+# the sphere's surface sits above (x,z) = (-0.017, -0.157). (The cord runs along local Y,
+# which the Y-rotation leaves alone, so it still hangs straight up.)
+mesh "lamp_cord" { file "assets/lamp/cord.obj"  rotate 0 25 0  translate -0.017 0.132 -0.157  scale 0.11 0.2354 0.11   material lamp_cordmat }
+
+# The arc: a tiny emitter in the electrode gap at the mesh centre. This is the only
+# light in the scene -- everything else you see is silver bouncing it back.
+light sphere { center -0.017 0.132 -0.157   radius 0.008   spd blackbody 6000 }
+
+# --- the vintage camera --------------------------------------------------------
+# Purple folding rangefinder (FED/Zorki lineage), the same asset the `vintage` camera
+# PRESET was specced from. The GLB carries its own PBR materials, so no material line.
+# Raw mesh is 4.765 units across and the node transforms compose to unit scale, so
+# 0.0285 puts the body at 0.136 m -- the real thing.
+#
+# THE PLACEMENT IS SOLVED, NOT EYEBALLED. The barrel is a surface of revolution about
+# local (x,y) = (0.439, -0.190) running along local +Z, with the frontmost glass at
+# z = 1.330. ftrace composes a mesh transform as scale, Rx, Ry, Rz, translate (see
+# src/mesh.h), so the rotation below is the inverse solve that takes the mesh's local
+# +Z onto the world viewing direction A = (0.641, 0.556, -0.530), and the translation
+# is whatever then lands the front element exactly on the pupil P.
+#   pupil P    = (-0.075, -0.065, 0.062),  |P| = 0.117
+#   rotate     = -33.742 129.579 0
+#   translate  = (-0.09373, -0.08163, 0.09372)
+# Verified numerically: the front element lands on P to 5 decimals, the body's farthest
+# point is |p| = 0.215 < R = 0.40 so nothing pokes through the shell, and the widest ray
+# in a 76-deg cone is 49.5 deg off-axis -- under 90, so no part of the body clips the
+# frame. (`preset vintage` was deliberately NOT used: its 27-deg coverage would fill the
+# frame with the self-image and show nothing else.)
+#
+# The `material` line is a required FALLBACK, not the look: glTF/GLB import their own
+# pbrMetallicRoughness materials by default (that is what carries the purple leatherette
+# and the chrome barrel), and the FTSL material is only consulted under
+# `import_materials no`.
+material "camfallback" { type diffuse  reflect rgb 0.42 0.40 0.46 }
+mesh "vcam" {
+    file "cameras/vintage_camera.glb"
+    material camfallback
+    scale 0.0285
+    rotate -33.742 129.579 0
+    translate -0.09373 -0.08163 0.09372
+}
+
+# --- the taking camera: the eye IS the rangefinder's front element --------------
+camera "cam" {
+    eye -0.075 -0.065 0.062   look_at 0 0 0   up 0 1 0   fov_y 76
+    mode D
+    film { res 1100 733 }
+}

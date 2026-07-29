@@ -78,6 +78,10 @@ tools/loom/
 │   ├── vdbio.py     bake a field to a dense grid → OpenVDB .vdb (density/temperature); reads .vdb and NanoVDB .nvdb
 │   ├── axes.py      axis-typed signals: broadcast/pin/mod composition + sample/reduce grammar + lower() onto any scene value-site
 │   ├── anim.py      N-D curve → scene-variable go-between: config + JSON sidecar + value fan-out + named slots + live pipe
+│   │                (`python -m loom.anim scene.py --config drive.json` serves the live loop over stdio;
+│   │                 ftrace reshapes the same sidecar in its fly editor with `ftrace scene.ftsl -anim drive.json`,
+│   │                 and `… -anim drive.json -loom scene.py` scrubs it LIVE — loom samples the curve and
+│   │                 re-emits the scene, so the bound variables move in the viewport, bindable from a panel row)
 │   ├── material.py  function-driven materials (waves/checker/rings/blobs, mixes)
 │   ├── scene.py     Scene / Camera / Material / Texture (image skins) / geometry / Volume media (all animatable)
 │   ├── transform.py per-object Transform (translate/rotate/scale/skew, animatable) → ftsl group{}; dataset inverse-map
@@ -85,9 +89,15 @@ tools/loom/
 │   ├── audio.py     procedural audio: one sample-buffer back-end → WAV (offline)
 │   ├── xvideo.py    two-pass spacetime transforms (rotate/shear a 4-D block)
 │   ├── ftsl_emit.py .ftsl emission
+│   ├── block.py     layout-preserving generic element (Block/Stmt) for the baked kinds
+│   ├── grammar/     the shared EPEG .ftsl grammar + the read direction:
+│   │                `parse_element` / `parse_elements` rebuild loom elements from .ftsl
+│   │                text, byte-identically re-emittable (layout, alignment, comments)
 │   ├── drive.py     drivers: render a frame range → ftrace → GIF/MP4 assembly
 │   ├── preview.py   resident preview server (keeps ftrace + GPU context warm)
-│   └── viewer.py    native-viewer contract: build() loader + scene-introspection JSON sidecar (§F1)
+│   └── viewer.py    native-viewer contract: build() loader + scene-introspection JSON sidecar (§F1),
+│                    plus the resident live channel (`python -m loom.viewer <scene.py>`) that
+│                    `ftrace -viewer <s.json> -loom <scene.py>` drives to re-derive geometry (§F4)
 ├── examples/        runnable scripts (see below)
 ├── tests/           pytest suite
 └── DESIGN.md        the architecture / roadmap document
@@ -113,6 +123,30 @@ python examples/transform_video.py
 Most examples take `--help`. Rendering shells out to the `ftrace` binary (found
 automatically via `loom.drive.find_ftrace`); build it first (see the top-level
 [README](../../README.md#building)).
+
+### Reading `.ftsl` back
+
+`loom.grammar.reader` goes the other way — text to elements — for editing an existing
+scene:
+
+```python
+from loom import Cache, Clock
+from loom.ftsl_emit import EmitCtx
+from loom.grammar.reader import parse_document
+
+doc = parse_document(open("scenes/gyroid.ftsl").read())
+doc.blocks("isosurface")[0].set("resolution", "128")
+open("scenes/gyroid.ftsl", "w").write(doc.emit(EmitCtx(clock=Clock(t=0), cache=Cache())))
+```
+
+This is **not** the inverse of `emit` — loom bakes its `Signal`s at a clock, so a `.ftsl`
+file is a static snapshot and the authoring object that wrote it is unrecoverable. What it
+guarantees is **round-trip fidelity**: every line you don't touch comes back byte for
+byte, keeping its layout, column alignment, comments and blank lines (a `Document` also
+holds the text *between* elements, which belongs to neither of them). Kinds that map onto
+an authoring class without loss (`material`, `texture`, `sphere`, `light`, `camera`,
+`spectrum`, records) come back as that class and re-emit in loom's canonical form; the
+rest come back as a generic ordered `Block` that re-emits its source layout exactly.
 
 ---
 

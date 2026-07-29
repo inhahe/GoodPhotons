@@ -384,16 +384,31 @@ class LiveSession:
       set the channel values (or ``sample`` at ``t``), emit that frame's
       ``.ftsl`` to ``out``; ack ``{ok, out, targets}``.
     * ``config`` — ack ``{ok, config}`` (the sidecar dict, to seed the editor).
+    * ``slots`` — ack ``{ok, slots:{name: default}}`` — the **menu** of bindable
+      scene variables the scene actually exposes.  "Scene proposes, editor
+      disposes" needs both halves: ``config`` is what the scene proposes, this is
+      what it *could* propose, so the editor can offer a pick-list instead of
+      making the user type a target name into a GDI panel.
     * ``bindings`` — ``{bindings:[…]}``: replace the associations (editor
       disposes); ack ``{ok}``.
     * ``points`` — ``{points:[…]}``: replace the static control points; ack ``{ok}``.
-    * ``save`` — ``{path}``: persist the sidecar; ack ``{ok}``.
+    * ``dims`` — ``{dims:N}``: re-dimension the curve (the editor may change the
+      dimension count too).  Points are padded with zeros / truncated and any
+      binding left pointing past the new last channel is dropped; ack
+      ``{ok, dims, dropped:[…]}``.
+    * ``save`` — ``{path}`` (optional; defaults to the sidecar this session was
+      seeded from): persist the sidecar; ack ``{ok, path}``.
     * ``quit`` — stop the serve loop; ack ``{ok, bye:true}``.
     """
 
-    def __init__(self, driver: SceneDriver) -> None:
+    def __init__(self, driver: SceneDriver, *,
+                 config_path: Optional[str] = None) -> None:
         self.driver = driver
         self.drive = driver.drive
+        # Where a pathless `save` writes: the sidecar this session was seeded from.
+        # The editor asks to save the config it is editing without having to know
+        # (or re-send) the path loom was launched with.
+        self.config_path = config_path
 
     def handle(self, msg: dict) -> dict:
         cmd = msg.get("cmd")
@@ -402,6 +417,12 @@ class LiveSession:
                 return self._frame(msg)
             if cmd == "config":
                 return {"ok": True, "config": self.drive.to_dict()}
+            if cmd == "slots":
+                return {"ok": True,
+                        "slots": {name: slots[0].default
+                                  for name, slots in sorted(self.driver.slots.items())}}
+            if cmd == "dims":
+                return self._dims(msg)
             if cmd == "bindings":
                 self.drive.bindings = [ChannelBinding.from_dict(b)
                                        for b in msg["bindings"]]
@@ -419,13 +440,38 @@ class LiveSession:
                 self.drive.points = pts
                 return {"ok": True}
             if cmd == "save":
-                self.drive.save(msg["path"])
-                return {"ok": True}
+                path = msg.get("path") or self.config_path
+                if not path:
+                    raise ValueError("save needs a `path` (no sidecar path for this session)")
+                self.drive.save(path)
+                return {"ok": True, "path": path}
             if cmd == "quit":
                 return {"ok": True, "bye": True}
             return {"ok": False, "error": f"unknown cmd {cmd!r}"}
         except Exception as e:  # report, don't crash the pipe loop
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    def _dims(self, msg: dict) -> dict:
+        """Re-dimension the curve in place (``dims`` command).
+
+        Growing pads every control point with zeros — a *neutral* new channel, so
+        the curve the editor is looking at does not move when a dimension is added.
+        Shrinking truncates and drops the bindings that would now point past the
+        last channel; they are named in the ack rather than silently discarded, so
+        the editor can tell the user what its edit cost.
+        """
+        dims = int(msg["dims"])
+        if dims < 1:
+            raise ValueError("dims must be >= 1")
+        old = self.drive.dims
+        if dims != old:
+            self.drive.points = [tuple(list(p[:dims]) + [0.0] * max(0, dims - len(p)))
+                                 for p in self.drive.points]
+            self.drive.dims = dims
+        dropped = [b.to_dict() for b in self.drive.bindings if b.channel >= dims]
+        if dropped:
+            self.drive.bindings = [b for b in self.drive.bindings if b.channel < dims]
+        return {"ok": True, "dims": dims, "dropped": dropped}
 
     def _frame(self, msg: dict) -> dict:
         if "values" in msg:
@@ -480,8 +526,99 @@ def _atomic_write_text(path: str, text: str) -> None:
         raise
 
 
+# ===========================================================================
+# CLI — the resident go-between an editor spawns  (E2 slice 3)
+# ===========================================================================
+
+def default_drive(scene, *, dims: int = 3, name: str = "drive") -> "CurveDrive":
+    """A minimal starting :class:`CurveDrive` for a scene that proposes none.
+
+    Two control points on the x axis and no bindings: enough for the editor to be
+    a valid live session from the first frame, and it is immediately replaced by
+    whatever the user records — the *scene's* own proposal (a module-level
+    ``drive`` / ``DRIVE``, or a sidecar) always wins over this.
+    """
+    pts = [tuple([0.0] * dims), tuple([1.0] + [0.0] * (dims - 1))]
+    return CurveDrive(dims, pts, [], name=name)
+
+
+def _scene_drive(module) -> Optional["CurveDrive"]:
+    """The drive a scene module *proposes*, if any: a module-level ``drive`` or
+    ``DRIVE`` that is (or returns) a :class:`CurveDrive`."""
+    for attr in ("drive", "DRIVE", "curve_drive"):
+        obj = getattr(module, attr, None)
+        if callable(obj) and not isinstance(obj, CurveDrive):
+            try:
+                obj = obj()
+            except TypeError:
+                continue
+        if isinstance(obj, CurveDrive):
+            return obj
+    return None
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """``python -m loom.anim <scene.py> [--config sidecar.json]`` — serve one live
+    session on stdin/stdout for an editor to drive (E2 channel-b), seeded from the
+    sidecar (channel-a) when one is given.
+
+    The editor (ftrace's curve editor, ``-anim``) spawns this, asks for ``config``
+    and ``slots``, then pushes a ``frame`` per scrub position and gets a ``.ftsl``
+    back.  Config precedence is *sidecar file* → *scene proposal* → a default, so
+    an existing edit always survives a re-launch.
+    """
+    import argparse
+    import sys
+
+    from .viewer import build_scene, load_build
+
+    ap = argparse.ArgumentParser(
+        prog="python -m loom.anim",
+        description="serve an E2 live animation session (editor -> loom -> .ftsl)")
+    ap.add_argument("scene", help="loom scene file exposing build()")
+    ap.add_argument("--config", default=None,
+                    help="CurveDrive sidecar JSON to seed from (and save back to)")
+    ap.add_argument("--func", default="build", help="contract function (default build)")
+    ap.add_argument("--dims", type=int, default=3,
+                    help="dimension count for a default drive (ignored when seeded)")
+    ap.add_argument("--strict", action="store_true",
+                    help="fail on a binding whose target has no Slot in the scene")
+    args = ap.parse_args(list(argv) if argv is not None else None)
+
+    build = load_build(args.scene, func=args.func)
+    scene = build_scene(build)
+    module = sys.modules.get(build.__module__)
+
+    drive = None
+    if args.config and os.path.exists(args.config):
+        drive = CurveDrive.load(args.config)
+    if drive is None and module is not None:
+        drive = _scene_drive(module)
+    if drive is None:
+        drive = default_drive(scene, dims=args.dims)
+
+    session = LiveSession(SceneDriver(scene, drive, strict=args.strict),
+                          config_path=args.config)
+    serve_live(session, sys.stdin, sys.stdout)
+    return 0
+
+
 __all__ = [
     "CurveDrive", "ChannelBinding",
     "MODE_FLYBY", "MODE_ANIMATION", "SIDECAR_VERSION",
     "Slot", "collect_slots", "SceneDriver", "LiveSession", "serve_live",
+    "default_drive", "main",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover
+    # `python -m loom.anim` runs THIS FILE a second time, under the name `__main__`,
+    # so `__main__.Slot` and `loom.anim.Slot` become two distinct classes. A scene
+    # does `from loom.anim import Slot` and gets the canonical one; `collect_slots`
+    # running out of `__main__` tests `isinstance(n, __main__.Slot)` and matches
+    # nothing. Every binding then acks "ok" while changing precisely nothing — a
+    # silent no-op, which is exactly how it presented (the editor's live preview
+    # never moved). Delegate to the imported module so the code that actually runs
+    # is the canonical one and both halves agree on class identity.
+    from loom.anim import main as _main
+    raise SystemExit(_main())

@@ -8,8 +8,10 @@
 /build_plain/
 /build_prof/
 /out/
-# ftrace.exe copied into the repo root by build.bat (build artifact)
+# ftrace.exe copied into the repo root by build.bat (build artifact). A RelWithDebInfo
+# binary copied there for debugging drags its .pdb along, so ignore that too.
 /ftrace.exe
+/ftrace.pdb
 *.ppm
 *.exr
 *.png
@@ -60,6 +62,13 @@
 
 # Scratch / throwaway scripts and test outputs
 /scraps/
+/tools/loom/scraps/
+
+# Run artifacts of the loom examples: only the `.py` is source. Running one emits an
+# `.ftsl` (plus `.obj` mesh sidecars, already covered above) and, for a viewable
+# `build()` example, a multi-megabyte introspection `.json`. All regenerable.
+/tools/loom/examples/*.ftsl
+/tools/loom/examples/*.json
 
 # Raw upstream data dumps (kept locally; derived + attributed CSVs live in data/)
 /data_raw/

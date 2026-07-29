@@ -407,6 +407,64 @@ and the channels now hold `spectrum:<name>` refs (pins preserved). `lower_ftsl()
 the decls + record as one self-contained parseable block. The remaining J3b item-1 piece
 is wiring these synthesized spectra into a full-scene emit path (part of J3c).
 
+### 8b. Reading `.ftsl` back — `Block` + `grammar/reader.py` (J3c)
+
+The emitters run one way. A `.ftsl` file is a **baked** snapshot of one frame: an
+`Isosurface`'s field, freq, rotation, drift, placement and threshold are all flattened
+into a single `function { expr "…" }` string at a clock, so no reader can recover the
+authoring object that wrote it. The read direction therefore does **not** try to invert
+`emit`. What it guarantees instead is **round-trip fidelity**:
+
+> `parse_document(src).emit(ctx)` reproduces the source **byte for byte** — line layout,
+> alignment padding, brace columns, 2-vs-3-space gaps, comments and blank lines included.
+
+That is the property an editor actually needs: load a scene, change one block, write it
+back, and every line nobody touched is untouched.
+
+- **`parse_element(text)`** builds one element; **`parse_elements(text)`** reads a whole
+  file in order (via a `start_rule = "elements"` override on the same grammar, so
+  `parse_element` keeps rejecting text holding more than one element);
+  **`parse_document(text)`** returns a **`Document`** = those elements *plus* the literal
+  text between them. The gaps matter because a file is also the blank lines that group its
+  elements and the top-level comments that head its sections, and those belong to *neither*
+  neighbouring element — nothing but the document can hold them. `Document.gaps` is always
+  one longer than `.elements` (leading text, then one separator after each), and
+  `insert`/`append`/`pop` keep the file's head and tail in place.
+- **Faithful kinds build their real class.** A block that maps onto an authoring class
+  without loss — `material` (incl. `type mix` → `MixMaterial`), `texture`, `proctexture`,
+  `sphere`, `light`, `camera`, `spectrum "n" = …`, `range` records — is built as that
+  class, validated through `grammar/bindings.py` + `grammar/spectrum.py`. These re-emit
+  through their own emitter, i.e. in loom's **canonical** form rather than the source's,
+  so hand-alignment *inside* a typed element is the one thing a round-trip normalises
+  (`spectrum "steel"   = rgb …` loses the padding before `=`). It is a fixed point after
+  the first save, and it costs exactly one line across the whole checked-in corpus.
+- **Baked kinds fall back to `Block`** (`block.py`): a generic ordered `kind`/`name`/
+  `subtype` + list of `Stmt` entries and nested `Block`s. Ordered, so **duplicate keys
+  survive** (`camera_curve`'s repeated `point` lines, `mix`'s repeated `layer` lines —
+  folding a body into a dict would silently keep only the last). Valueless keywords
+  (`closed`) are present-with-empty-value. `get`/`has`/`stmts`/`find`/`set`/`add`/
+  `remove`/`same_as` are the mutation surface; `same_as` compares content and ignores
+  layout. `Block.roots()` is `[]` — baked text holds no Signals.
+- **Layout comes from source spans, never from the tree.** Whitespace and comments are
+  lexer `@skip`s and simply do not exist in the parse tree, so the builder recovers every
+  formatting decision from `ParseNode.line/col` against a line-offset table (`_Src`):
+  per-entry `gap` and `own_line`, the block's `indent`, `brace_gap` and inner `pad`,
+  a verbatim `raw` slice per statement (dropped the moment `set()` rewrites it), and
+  `before`/`trail`/`tail_before` trivia lines carrying comments and blank lines.
+
+**Scope boundary (deliberate).** `ftsl.epeg` is loom's *typed* grammar of the kinds loom
+emits — it keeps real `NUMBER`/`REF`/`PIN`/`STRING` terminals so the record, material and
+spectrum validators can do shape checking. It is **not** the whole ftrace language, and
+must not become it: adopting ftrace's catch-all `WORD` tokenizer would erase exactly the
+terminals those validators depend on. The whole-language surface lives in
+`ftsl_scene.epeg` (the grammar compiled into ftrace). Consequences, measured over the
+checked-in corpus (65 of 97 files parse; **64 of those 65 re-emit byte-identically as a
+whole file**, the 65th being the hand-aligned `spectrum` decl above; all 11 loom-emitted
+element kinds are exact): `/`-containing names (`hall/g0 = isosurface {`), §3.2 per-property access
+(`arr_a.reflect(a=u)`), expression arguments (`grad_u(1-u)`) and `[…]` array literals at
+block value sites are hand-authored full-language forms `ftsl.epeg` does not model. The
+whole-file `scene { … }` → live `Scene` builder is likewise still FUTURE (§TODO J3c).
+
 ---
 
 ## 9. Layer 6 — Drivers / IO
@@ -445,13 +503,23 @@ tools/loom/
     material.py             function-driven material emit (new)
     record.py               parametric record twin: emit + parse + sample (J3a)
     ladder.py               delimiter-precedence-ladder parser (J3b item 2)
+    block.py                layout-preserving generic element (Block/Stmt) for baked kinds (J3c)
+    grammar/                shared EPEG .ftsl grammar + the read direction (J3c)
+      _gpda.py              vendored GraphParser (pinned, self-contained)
+      ftsl.epeg             loom's typed grammar of the element kinds loom emits
+      ftsl_scene.epeg       generic mirror of ftrace's front-end (compiled into ftrace)
+      reader.py             ParseNode → Element builders; parse_element / parse_elements
+      values.py             value-site grammar (sample calls, kwargs, axis tuples)
+      bindings.py           slot-shape validators (colour / scalar / map binds)
+      spectrum.py           spectrum-expression validator
+      emit_cpp.py           grammar → ftrace C++ front-end
     scene.py                Scene, evaluate(), serialize/round-trip (new)
     ftsl_emit.py            snapshot → .ftsl text (new)
     drive.py                render_range, viewer, assembly, seed (new)
     mcubes.py               marching cubes: bake a field to a mesh (M7)
     vdbio.py                bake a field to a dense grid + write/read .vdb, read .nvdb (E4)
     axes.py                 axis-typed signals: broadcast/pin/mod + sample/reduce + lower-to-value-site (E5)
-    anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe (E2 s1–2)
+    anim.py                 curve→scene-variable go-between: config + sidecar + fan-out + named slots + live pipe + `python -m loom.anim` (E2 s1–3a)
     xvideo.py               two-pass spacetime transform video (M11)
     preview.py              resident ftrace -serve preview client (M12)
     viewer.py               native-viewer contract: build() loader + scene-introspection sidecar (F1) + .ftsl source emission (F7) + live re-introspection/emit server (F4/F7)
@@ -739,9 +807,34 @@ tools/loom/
   `serve_live(session, in, out)` are the editor↔loom **live-value channel**: a newline-delimited-JSON stdio
   loop (the `PreviewServer` precedent, editor→loom direction) with `frame`/`config`/`bindings`/`points`/
   `save`/`quit` commands, each a pure `dict`→`dict` `handle()` so the protocol is unit-testable without a
-  pipe. Tests: `tests/test_anim.py` (19) + `tests/test_anim_live.py` (23).
-  Remaining slice: (3) the interactive ftrace `camera_curve` **editor** generalization (seed from / write
-  back the sidecar, drive arbitrary scene variables) — the C++ part, best done with the user present.
+  pipe.
+  **Slice 3a** is the sidecar round-trip against the real editor. loom side: `LiveSession(driver,
+  config_path=…)` remembers its sidecar so `save` needs no `path`; two new commands — **`slots`** (the
+  bindable variable names + their defaults, so the editor can offer a *pick-list* instead of asking for typed
+  names) and **`dims`** (grow/shrink the channel count, padding points with a neutral channel and reporting
+  the bindings it had to drop) — plus `default_drive(scene)` and a **`python -m loom.anim <scene.py>
+  [--config s.json] [--func build] [--dims N] [--strict]`** entry point that loads the sidecar (or the scene
+  module's own `drive`, or a default) and serves the live loop on stdio. ftrace side (`src/curvedrive.h`,
+  `-anim <sidecar.json>`): the fly editor's control points *are* the drive's points — channels 0–2 spatial,
+  3.. carried per point — and Save writes the reshaped curve back, preserving name/mode/dims and every
+  binding. The C++ reader re-checks the same invariants `CurveDrive.__init__` does, so neither side can hand
+  the other a config it would reject.
+  **Slice 3b** (2026-07-28, ftrace v0.95.0) closes E2: the editor's **live** channel and the binding panel.
+  `ftrace -anim <sidecar> -loom <scene.py>` spawns this module's `-m` entry point and pushes a `frame` per
+  scrub position. The load-bearing decision is that **loom samples the curve, not ftrace**: the editor sends
+  the control *points* (`points` / `dims`) and then asks by parameter `t`, so the editor's preview and the
+  video loom finally renders are one computation rather than two that can drift. The C++ bridge is
+  deliberately two queues — frames latest-wins on one slot (fast scrubbing must collapse), control messages
+  on a FIFO that never drops and is drained first (a lost `bindings` would leave loom rendering against a
+  binding set the editor no longer has). The panel row edits bindings straight from the `slots` pick-list and
+  drives `dims` grow/shrink, and Save writes both back through the same sidecar round-trip as 3a.
+  Tests: `tests/test_anim.py` (17) + `tests/test_anim_live.py` (34).
+  **The `-m` identity trap (fixed + pinned in 3b).** A module that is both a `python -m` entry point *and*
+  an importable API is executed **twice** — once as `__main__`, once as `loom.anim` — producing two distinct
+  copies of every class. `isinstance` across that boundary fails silently, and the observable was `0 bindable
+  scene variable(s)` on a scene that clearly has one. In-process tests are structurally incapable of catching
+  it (they only ever have one module identity), so `test_anim_live.py` and `test_viewer.py` each now spawn a
+  **real subprocess** and assert on the emitted artifact, not just on the ack.
 - **F1 (native viewer — the loom↔viewer data contract).** ✅ done (`loom/viewer.py`). The §F native viewer is
   a C++ process; loom is Python, so (per the locked architecture) loom exposes a scene via a **`build()`
   load contract** and a **JSON introspection sidecar**, not in-process sharing. `build(clock=None, **params)
@@ -792,9 +885,15 @@ tools/loom/
   SRV — images through ftrace's own `Texture::load`, formulas baked on the CPU through ftrace's own
   `compilePatternExpr`/`patternEval` (with a `PatTexScope` so `tex:<name>(u,v)` resolves against images
   declared above, exactly as in `FtslLoader::addTexture`) — and the Meshes tab draws each triangle at its
-  interpolated per-vertex UVs. Unusable skins degrade to grey with a printed reason. Still deferred:
-  **off-thread re-tessellation when rotating into a parameter dim** (needs the live viewer↔loom channel,
-  since the static sidecar can't re-bake geometry).
+  interpolated per-vertex UVs. Unusable skins degrade to grey with a printed reason.
+  **F4 off-thread re-tessellation is complete (2026-07-28, ftrace 0.92.0):** `ftrace -viewer <s.json>
+  -loom <scene.py>` spawns `python -X utf8 -u -m loom.viewer <scene.py>` and drives this module's
+  `ViewerSession` live. The C++ side (`LoomLink`/`LoomBridge`, `src/viewer_gui.cpp`) runs bakes on one
+  worker thread with a **one-slot** pending job, so posting overwrites anything not yet started — a fast
+  drag costs one `introspect`+`emit` of wherever the user ends up rather than one per frame. A **Live
+  (loom)** panel drives the clock and one control per keyword param `build()` declares, and the chosen
+  **sweep axis** turns a right-drag on any 3-D pane into motion along that parameter dimension — which is
+  what the static sidecar could never do, since the extra dimension only exists once someone re-bakes.
   **F7's MC-mesh fallback is complete:** `_describe_element` bakes each `IsoMesh`'s field to a
   marching-cubes mesh (`_iso_mesh_geometry`→`mcubes.mesh_field`) into the object's `mesh` key, so the
   existing Meshes tab draws the isosurface with no C++ change. **F7's primary path is also complete:**

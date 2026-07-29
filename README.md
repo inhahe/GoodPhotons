@@ -434,6 +434,44 @@ paths they can capture at all**.
 > first edit. When a scene defines **several** `camera_curve`s, the editor seeds from the
 > one you're actually flying (chosen with `-camera <name>`), not blindly the first.
 >
+> **Editing a loom animation drive (`-anim <file.json>`).** The same editor can reshape a
+> loom **`CurveDrive`** — an N-dimensional curve whose dimensions ("channels") drive
+> arbitrary *scene variables*, not just the camera. Pass `-anim <sidecar.json>` (it implies
+> `-explore`) and the editor's control points become the drive's points: channels 0–2 are
+> the point you see and move in 3-D (for a camera drive that *is* the eye position), while
+> channels 3 and up are values no viewport can show, so they ride along with each point.
+> **Save** then writes the reshaped curve back to the sidecar — atomically, keeping the
+> drive's name, mode, dimension count and every **channel → scene-variable binding**
+> exactly as they were, so an editing pass never drops associations loom authored. Pointing
+> `-anim` at a file that doesn't exist yet is how you *start* a drive: whatever control
+> points the scene seeded become a new 3-channel drive that the first Save creates. The
+> sidecar is plain, human-diffable JSON that loom reads and writes with `loom.anim`
+> (`python -m loom.anim <scene.py> --config <sidecar.json>`), so either side can author it.
+>
+> **Watching the drive actually drive the scene (`-anim … -loom <scene.py>`).** Add `-loom
+> <scene.py>` and the editor stops previewing just a camera path: it starts a live loom
+> session on that scene and, every time you scrub, asks loom for the scene **as of that
+> point on the curve**. The bound scene variables move in the viewport — a radius breathes,
+> a light dims, a material shifts — even if the camera never budges. ftrace deliberately
+> does *not* sample the curve itself; it sends loom the control points and asks by
+> parameter, so what you see while editing is what loom will render for the video. Scrubbing
+> fast is safe: only the newest position is kept (stale ones are dropped, never queued),
+> while edits to the points/bindings/channel count are queued losslessly ahead of it.
+>
+> With the live session up, the panel grows a **loom bind row**:
+>
+> | Control | What it does |
+> |---|---|
+> | `ch N` | Which drive channel you're inspecting or editing. |
+> | slot list | The scene variables loom reports as bindable (`loom.anim`'s `slots`). Pick-only — no typing — plus `(none)`. |
+> | **Bind** | Binds the chosen channel to the chosen slot (or to nothing, with `(none)`). |
+> | **Unbind** | Drops the chosen channel's binding. |
+> | `chans:` | The drive's channel count. Growing it widens every control point; shrinking it drops the bindings on the channels that no longer exist — the same thing loom does — rather than leaving a stale association behind. |
+> | status | What the current channel does *right now*, plus link health: `ch 0 → ball_r  \|  live — 4 baked, 2 ms`. |
+>
+> Every edit takes effect immediately in the preview, and **Save** writes the channel count
+> and the bindings back to the sidecar along with the points.
+>
 > **Reviewing a rendered flyby (`-review <base>`).** Once a flyby has actually been
 > *rendered* to a directory of images, `ftrace -review <base>` plays that sequence back
 > on the same live window + timeline — so you can watch the real rendered result (not the
@@ -937,8 +975,9 @@ sphere { center 2 0 0  radius 1  material grad(noise(9*x,9*y,9*z)) }  # mottled 
 ```
 
 **Inline colour channels.** A colour channel doesn't have to name pre-declared spectra:
-tag the channel with any colour head — `rgb`, `hsv`, `hsl`, or any upsampler/emission
-variant (`rgbmeng`, `rgbsmits`, `hsvillum`, `hslline`, …) — and write the triples inline.
+tag the channel with any colour head — `rgb`, `hsv`, `hsl`, any upsampler/emission
+variant (`rgbmeng`, `rgbsmits`, `hsvillum`, `hslline`, …), or a user upsampler
+(`rgb:<name>`) — and write the triples inline.
 The tag fixes arity 3, so each group is one stop, and the components go through exactly
 the same evaluator as a top-level `spectrum "x" = rgb …` declaration:
 
@@ -1083,6 +1122,35 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   tungsten or sodium source, and a smooth shape is what real pigments have. Slightly more
   memory than the analytic fits (a ~140 KB table) and a table lookup instead of a solve.
   A valid `[0,1]`-clamped *material* reflectance like the others.
+- **`rgb:<name> r g b`** (also `hsv:<name> …`, `hsl:<name> …`) — **your own upsampler**.
+  The five heads above are a closed set of built-in fits; this one names an
+  `upsample "<name>" { expr "f(r, g, b, w)" }` block declared in the scene, so a scene
+  that needs a mapping none of them provides supplies the function itself rather than
+  picking the least-wrong built-in:
+
+  ```
+  spectrum "prim_r" = gaussian center=620 sigma=40
+  spectrum "prim_g" = gaussian center=540 sigma=40
+  spectrum "prim_b" = gaussian center=460 sigma=40
+  upsample "basis" { expr "r*spec:prim_r(w) + g*spec:prim_g(w) + b*spec:prim_b(w)" }
+  material "m" { type diffuse  reflect rgb:basis 0.25 0.55 0.85 }
+  ```
+
+  The body is a pattern-VM expression over a **disjoint** vocabulary — there is no hit
+  point here, so it sees only `r`, `g`, `b` (the colour, linear sRGB), `w` (wavelength
+  in nm), `pi`, the usual functions, and **`spec:<spectrum>(w)`**, which samples a
+  declared `spectrum` block at the queried wavelength. That last one is what makes a
+  **measured basis** expressible (weight real primary curves by the three channels)
+  rather than only closed-form arithmetic; it is in scope *only* inside an `upsample`
+  body, since an ordinary pattern has a hit point but no wavelength. Because `r` means
+  RED here and radius in the surface vocabulary, every surface/shading variable is
+  rejected **by name** with a message saying so, rather than silently reinterpreted.
+  The triple is converted to linear sRGB *before* the body runs, so all three heads
+  feed identical `r, g, b`. Evaluated per queried wavelength, not pre-tabulated, so a
+  narrow emission line isn't quietly band-limited. Blocks resolve lazily by name
+  (declaration order is irrelevant). Usable everywhere a colour head is, including a
+  record channel's inline-colour tag. See `scenes/_upsample.ftsl`; pinned by
+  `-checkupsample`.
 - **`table { 400:0.05 450:0.12 … }`** — a measured/tabulated spectrum. Interpolated
   **piecewise-linear** by default; add an **`interp=cubic`** flag among the entries
   (`table { interp=cubic  400:0.05 … }`) for a **monotone cubic (PCHIP)** curve —
@@ -1840,6 +1908,18 @@ or a native-primitive wrap — see below). Two authoring forms:
   site — evaluated before the tables are visible — remains a compile error. Worked example
   `scenes/grid_field.ftsl` (a 5×5 lattice as an isosurface height field, plus a 1-D
   profile as a medium's density).
+  A table sample is finally legal **at a value site directly**, with no `pattern` wrapper
+  to write: `reflect grid:ramp(u)`, `roughness scatter:probe(u,v)`. The slot takes the
+  sample exactly as if you had written the one-line `pattern { expr "grid:ramp(u)" }` and
+  pasted its name in, so every per-hit slot that accepts `pattern:<name>` accepts a table
+  call too, and the coordinates are ordinary expressions — including a composed array
+  literal, `reflect grid:ramp([0.2 0.8](u))`. The **scoped** spelling is the one that
+  works: a bare `ramp(u)` at a value site already means "apply the material `ramp`, with
+  `u` bound to its formal" (see material bundles), so only `grid:` / `scatter:` name a
+  table unambiguously. The call is required — `reflect grid:ramp` says which table but
+  not *where* to read it, and is a load error that shows you the `(u)` to add — and a
+  **load-time constant** slot (`film_ior`, a fixed `ior`) still refuses a per-hit value,
+  naming the slots that can take one.
 - **Inline array literal** — a tiny table written *where it is used*, with no block, no
   name and no `pattern` wrapper: `roughness [0.05 0.4 0.05](u)`. The `[ … ]` is the data
   and **nesting is the shape** (axis 0 outermost, C order, as in a `grid`'s `data`), so a
@@ -1854,6 +1934,20 @@ or a native-primitive wrap — see below). Two authoring forms:
   `reflect [0 1](u)` is a greyscale albedo ramp (see below). Worked example
   `scenes/pattern_array.ftsl`; reach for a named `grid`/`scatter` when the data is big,
   shared, or worth naming.
+  A coordinate may also be **`a`**, the one input with no per-hit meaning of its own — that
+  spends nothing and leaves the axis as a **formal** for whoever *uses* the material:
+  `material "ramp" { reflect [0 1](a) }` is then bound at the use site by `ramp(a=u)`, at a
+  property reference by `ramp.reflect(a=u)`, or positionally by `ramp.reflect(u)`, all three
+  identical to `reflect [0 1](u)`. Multi-axis rebinds are simultaneous, so a 2-D literal
+  transposes under `(u=v, v=u)`. A literal's *formals* are the driver names in its own tuple;
+  it has no second, private namespace of axis names, so a `formal=driver` argument **inside**
+  a literal's call (`[0 1](a=u)`) is a load error that names both spellings that work.
+  Because a coordinate is a full expression, a literal may also be **composed** into
+  another's call — `[0 1]([0.2 0.8](u))` reads the outer table at a coordinate the inner
+  one produces, to any depth, on any single axis of a multi-axis call
+  (`[[0 0.3][0.6 1]]([0.5 1](u), v)`), and as a term inside coordinate arithmetic. That is
+  the general remapping idiom: an inner table becomes the transfer curve applied before the
+  outer lookup. Pinned by `ftrace -checkarray`; per-tile scene `scenes/_array_formal.ftsl`.
 - **Named generator** — `type <gen>` plus params (mirrors material syntax):
 
   | Generator | Parameters | Result |
@@ -2451,7 +2545,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-n <photons>` | Trace exactly this many photons/samples |
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension). Missing parent directories are created before the render starts (reported as `[out] created output directory …`), so a render aimed at a fresh `png/<series>/` subdir can't be traced to completion and then lost at write time. Mode `V` produces a *pair* of images (the two independent estimates it cross-checks) and writes them as `<out>_forward` / `<out>_backward` beside the given path |
-| `-topng <in> <out.png>` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); see **Output** |
+| `-topng <in> <out.png> [-ev <c>]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker. See **Output** |
 | `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
@@ -2502,7 +2596,7 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-no-media` / `-nomedia` | Drop all participating-media volumes (fog / homogeneous / heterogeneous). Also un-gates the fast `-rgb` backward, which otherwise falls back to spectral on any medium. |
 | `-no-env` / `-noenv` | Remove the environment light (constant or image-based): the scene renders against black, and the emitter CDF is rebuilt without it. |
 | `-no-fluoro` / `-nofluoro` | Demote every fluorescent material to a plain diffuse (using its elastic reflectance albedo) — skips the wavelength-shifting re-emission. |
-| `-max-bounce <N>` | Cap path depth at `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, and the photon modes). Default is the tracer's own cap (32). |
+| `-max-bounce <N>` | Set path depth to `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, the photon modes, and the bidirectional `D`/`U`). Default is the tracer's own cap: **32** for the unidirectional tracers, **8** for `D`/`U`, whose connection cost grows ~depth². For `D`/`U` the flag therefore *raises* the depth as often as it caps it — a specular-only cavity (a mirror-lined sphere, a kaleidoscope, deeply nested dielectrics) truncates its recursive images to black at 8 edges and wants `-max-bounce 24`–`48` before the hall of mirrors fills in. Specular vertices are cheap there: a delta BSDF has no connection to make. |
 | `-direct-only` / `-directonly` | **Whitted mode:** after a non-specular vertex (diffuse / diffuse-transmit / elastic-fluorescent / fog single-scatter) does its direct-lighting NEE, stop — no diffuse indirect (no colour bleeding, black shadows). Specular chains (mirror / glass / glossy / filter) still recurse. Scoped to the **camera** path tracers (`R` spectral + `-rgb`, and `P`'s backward layer); forward `B` and the photon/BDPT modes honour `-max-bounce` but ignore this. |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
@@ -2518,18 +2612,21 @@ alone can't restore, so they are not disk-resumable.
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
-| `-window` | Open a real OS window (Win32 GDI; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>`, then the transport mode driving that frame (`mode B (pinhole)`, `mode D (BDPT)`, `mode M (photon map)`, …; a per-camera flight shows the mode of the frame currently on screen), then the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing, how it's being rendered, and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
+| `-window` | Open a real OS window (Win32; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. The image is **presented by Direct3D 11** (a flip-model swap chain; the control strip below it stays GDI), which is what keeps a fast renderer fast: the previous CPU present — a per-pixel RGB→BGRA repack plus a `HALFTONE` `StretchDIBits` — cost **9 ms/frame** at 1920², more than the render it was displaying, and charged it to the render thread; it is now **~1.3 ms**. In the GPU-rasterized interactive explorer (`-raster -explore -device gpu`) the frame skips host memory **entirely**: CUDA is handed the window's own D3D11 texture and the tone-map kernel writes the finished pixels straight into it, so there is no device→host download, no re-upload, and no host touch of the image at all (measured at 3840²: **26.1 ms → 9.7 ms** per displayed frame). ftrace prints one line saying which way it's presenting; the copy path is used automatically whenever the fast one can't be (notably when D3D picks a different adapter than the CUDA device, as on hybrid iGPU/dGPU laptops, or when a flypath overlay has to be drawn into the pixels). `FTRACE_LIVE_GDI=1` forces the old GDI path (and ftrace falls back to it automatically if D3D can't start). Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>`, then the transport mode driving that frame (`mode B (pinhole)`, `mode D (BDPT)`, `mode M (photon map)`, …; a per-camera flight shows the mode of the frame currently on screen), then the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing, how it's being rendered, and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
 | `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still). Implies `-window`. |
 | `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
 | `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
-| `-raster-bench <n>` | Raster **frame-rate benchmark**: after the scene is built (and uploaded, on the GPU), re-render the first selected camera `n` times and report steady-state **ms/frame** (min/median/mean + fps) — the interactive explorer's per-move cost, measured independently of startup. With `-device gpu` also prints a per-pass breakdown (clearvis/project/raster/shade/clear/expose+encode/download, timed with CUDA events on the GPU timeline). Writes the last frame to `-o` so backends/builds can be byte-compared. |
+| `-raster-bench <n>` | Raster **frame-rate benchmark**: after the scene is built (and uploaded, on the GPU), re-render the first selected camera `n` times and report steady-state **ms/frame** (min/median/mean + fps) — the interactive explorer's per-move cost, measured independently of startup. With `-device gpu` also prints a per-pass breakdown (clearvis/project/raster/shade/clear/expose+encode/download, timed with CUDA events on the GPU timeline). Add `-window` and it also reports the **live-window present tail** — what handing each finished frame to the preview costs the render thread — because that tail used to be larger than the render itself and a backend speedup is only real if it stays small. With `-device gpu -window` it then runs a **second, zero-copy phase**: the same `n` frames rendered directly into the window's D3D11 texture, reported as one combined `render+present` figure (there is no separate tail to report — there is no handoff) plus its own per-pass breakdown, so the two presentation paths can be compared pass by pass on one run. Note that the zero-copy *median* pins at the display refresh (16.67 ms / 60.0 fps) because presenting blocks on vblank once both back buffers are queued — read **min** for the true pipeline cost. Writes the last frame to `-o` so backends/builds can be byte-compared. |
 | `-see-through` / `-seethrough` / `-glass` | In `-raster`, render **clear** materials (dielectric / thin-film / filter / diffuse-transmit) as actually see-through instead of solid ghosts: each clear surface between the camera and the opaque background **dims** and **milkily hazes** what's behind it, cumulative with the number of clear surfaces crossed (no refraction, no coloured absorption). Order-independent, so overlapping glass needs no sort. See the preview note under **Render modes**. |
 | `-glass-clarity <0..1>` | Per-surface transmittance for `-see-through` (default `0.85`; higher = clearer / less dimming). Passing it implies `-see-through`. |
 | `-explore` / `-fly` | **Interactive fly-through** of a multi-frame flyby without rendering it. Seeds the interactive raster viewer at the **first frame** of the selected `-camera` path (e.g. `-camera fly`) and hands control to you: Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `T` = live path-traced preview (see below), `0` resets the view, `P` prints a paste-ready camera block, close the window to finish. The flyby's frames are kept as a **camera-path timeline** in the panel below the image: **scrub/play/pause** across them, **lock** the camera onto the path (travel forward/back along it at a **cams/update** or **cams/second** speed), or release to fly freely — see **Interactive camera** for the full panel. Implies `-raster -window -keepwindow -no-meter`. Use it to preview/author a flyby camera without watching or writing every frame. **`T` — live path-traced preview:** toggles the still view between the flat raster (default, instant) and a **progressively path-traced** image rendered with the fast **RGB backward** tracer (the Stage-2 `-rgb` walk). While the camera holds still the image **converges in place** (the window title shows the accumulated `spp`); the moment you move it drops back to the responsive raster and **re-aims**, so navigation stays fluid while a paused view refines to a real render. GPU-only, and available when the scene+camera are inside the fast-RGB scope (same scope as `-rgb`); the scene-ignore flags (`-no-media`/`-no-env`/`-no-fluoro`, `-max-bounce`, `-direct-only`) apply to it too, so you can strip/cap the scene for a faster preview. |
 | `-no-meter` / `-nometer` | Skip the **exposure-lock metering pre-pass**. Normally a locked `camera_curve`/`camera_path`/`camera_orbit` group meters (up to 64 of) its frames up front to compute one shared exposure anchor, so the flyby doesn't flicker. With this flag that pre-pass is skipped and each frame **auto-exposes on its own** — faster startup (no metering the whole path), at the cost of possible frame-to-frame brightness flicker on an animated flyby. Implied by `-explore` (the interactive viewer auto-exposes per frame, so metering a whole flyby just to fly one frame is wasted work). |
 | `-noclip` / `-nocollide` | Start the interactive fly-viewer with **wall collision off** (fly through geometry) — for placing a camera *outside* the room or *inside* glass. Collision is **on by default** (you can't fly through walls); press `C` in the viewer to cycle `slide` → `stop` → `noclip` live. See the fly-camera controls under **Interactive fly camera**. |
+| `-anim <file.json>` | Edit a **loom `CurveDrive` sidecar** in the interactive fly editor (implies `-explore`). The editor's control points become the drive's N-dimensional points: channels 0–2 are the point you see and move in 3-D, channels 3+ are non-spatial values carried along per point. **Save** writes the reshaped curve back to the sidecar atomically, preserving the drive's name/mode/dims and every channel → scene-variable **binding**. A sidecar that doesn't exist yet is created on the first Save (from whatever control points the scene seeded), so this is also how you start a drive. See **Editing a loom animation drive** under **Interactive fly camera**. |
+| `-loom <scene.py>` | Keep a **live loom process** alongside the window so the scene can be *re-derived*, not merely re-viewed. With `-anim` it turns the fly editor into a real animation editor: scrubbing asks loom for the scene as of that point on the drive, so the **bound scene variables** move in the viewport (loom does the curve sampling, so the preview can't drift from the final render), and the panel grows a **loom bind row** for editing channel → variable bindings and the channel count live. With `-viewer` it drives the loom sidecar viewer's **Live (loom)** panel instead (one control per `build()` parameter, plus the sweep axis). See **Editing a loom animation drive** and **Live re-derivation**. |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
+| `-stop [<pid>\|all]` | **Stop a running render cleanly, from another shell.** `ftrace -stop <pid>` asks that render to do exactly what Ctrl-C does — finish the current chunk, write the final image **and** `.ftbuf` checkpoint, release the CUDA context through the graceful-shutdown path — then waits (up to 120 s) for it to actually exit, so it's safe to script a rebuild right after. `-stop all` targets every running render; a bare `-stop` just **lists** them (pid + scene → output). This exists because a render launched detached has no console to Ctrl-C into, and **force-killing ftrace mid-CUDA is a known way to wedge the NVIDIA driver into a TDR/bugcheck** — so never `taskkill /F` a render, use this. It also releases a window being held open by `-keepwindow`. Implemented as a sentinel file under `<temp>/ftrace/` (a `<pid>.run` entry per live render, a `<pid>.stop` to signal it), which — unlike a named kernel event — crosses the session / window-station boundary between a detached render and the shell signalling it. |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
 | `-stereo <mode>` | **3-D stereoscopic output** (stills *and* movies). Renders each camera **twice** — a Left/Right eye pair — and composites them into the `-o` image. `mode` picks the fusion: `sbs` (side-by-side **wall-eyed**, L\|R), `cross` (side-by-side **cross-eyed**, R\|L), `anaglyph` (**red-cyan** Dubois glasses, the default kind), or `anaglyph-gm` (**green-magenta** Dubois). Uses the correct **off-axis** rig — two *parallel* cameras offset along the camera right axis with **asymmetric (sheared) frusta** sharing a convergence plane, so there's **no vertical parallax** (toe-in's eye-strain cause). Both eyes share one auto-exposure anchor, so L/R — and every frame of an exposure-locked `camera_path` — tone-map identically. Rectilinear cameras only (a fisheye camera renders mono, with a warning). See **Stereoscopic 3-D** below. |
@@ -2542,7 +2639,7 @@ alone can't restore, so they are not disk-resumable.
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
 `-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
 `-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`,
-`-checksun`, `-checkbind`, `-checkprop`.
+`-checksun`, `-checkbind`, `-checkprop`, `-checkarray`.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are
@@ -2565,6 +2662,19 @@ an artifact to a 24-bit PNG *without re-rendering*:
   default p99 auto-exposure — the sidecar doesn't store the exposure mode, so an
   absolute/lumens scene may read brighter or darker than its original `-o` image;
   re-render for an exposure-exact PNG).
+
+A trailing **`-ev <c>`** scales that auto-exposure, so you can **re-develop a finished
+render brighter or darker without paying to render it again** — useful when a scene's
+p99 anchor is dominated by a small very bright source (an arc, a filament) and leaves
+the rest of the frame too dark:
+
+```
+ftrace -topng out.png.ftbuf out_bright.png -ev 3
+```
+
+`-ev` applies only to a `.ftbuf` (which still holds linear film); on a `.ppm` input it
+warns and is ignored, since that file is already 8-bit sRGB. *(Before 0.102.1 `-ev` was
+silently dropped on this path — `-topng` runs before the main argument loop.)*
 
 A `.ftsl` is a *scene*, not an image — render it with `-in scene.ftsl -o out.png`.
 Three drag-and-drop Windows helpers in the repo root wrap this: **`ppm_to_png.bat`**,
@@ -2624,9 +2734,13 @@ positions reconstructed from the fixed lattice), coloured either by a **heatmap 
 selectable channel** or by **channels 0/1/2 → RGB**; **click any point to inspect** its
 position and every channel value, and for N-D grids **per-extra-dim slice sliders** collapse
 the dims you're not viewing to a chosen lattice index. A **Meshes tab** draws `SweptMesh`
-surfaces (tubes, ribbons, blobs) as a **shaded, depth-sorted triangle mesh** — flat two-sided
-lambert lighting, an optional wireframe overlay, and grey / per-object-tint / UV-checker /
-**texture** colouring; orbiting spins the existing tessellation (view-only). In **texture**
+surfaces (tubes, ribbons, blobs) as a **shaded, GPU z-buffered triangle mesh** — flat two-sided
+lambert lighting, an optional depth-tested wireframe overlay, and grey / per-object-tint /
+UV-checker / **texture** colouring; orbiting spins the existing tessellation (view-only) and is
+free, since the geometry is uploaded once and re-uploaded only when the tessellation itself
+changes. Being a real depth buffer, **interpenetrating surfaces** — a swept tube threading an
+isosurface, two crossing tubes — come out right instead of being ordered a whole triangle at a
+time. In **texture**
 mode (the default) each mesh wears its **real skin**, sampled at the interpolated per-vertex
 UVs: an image texture is decoded with ftrace's own loader (paths resolve relative to the
 sidecar), and a procedural `r`/`g`/`b` formula skin is baked on the CPU through ftrace's own
@@ -2639,8 +2753,29 @@ isosurfaces are baked to a marching-cubes mesh and shown in the same Meshes tab.
 and sphere-traces the field bytecode via `renderIsoPreviewCuda` (the `-raster-gpu` preview
 kernel — no tessellation), driven by an orbit camera (drag to rotate, wheel to dolly) with
 resolution and FOV controls, blitting each converged frame into a D3D11 texture. This is the
-actual field rather than the static marching-cubes mesh. (Still in progress: live
-re-tessellation when you rotate *into* a parameter dimension — see §F in `TODO.md`.)
+actual field rather than the static marching-cubes mesh.
+
+**Live re-derivation (`-loom <scene.py>`).** Everything above reads a sidecar that was
+frozen when loom wrote it, so orbiting can only re-project geometry that already exists.
+Add `-loom <scene.py>` (or open a sidecar that carries a `build` provenance key) and the
+viewer keeps a **loom process alive alongside itself** — `python -m loom.viewer <scene.py>`
+over a newline-delimited-JSON channel — so it can *re-derive* the scene instead of merely
+re-viewing it. A **Live (loom)** section in the left column shows the link state, a
+`frame`/`frames` clock scrub, and one control per keyword parameter the scene's
+`build(clock=None, **params)` declares — float and int drags, checkboxes, string labels —
+typed from the values loom reports. Moving any of them re-runs `build()`, re-emits the
+`.ftsl` plus its mesh assets, and the Curves / Fields / Meshes / Render panes all adopt the
+new geometry on whatever frame it lands, keeping your orbit, zoom, tab and DAG layout.
+Pick one continuous parameter as the **sweep axis** (the radio button beside it) and
+**right-dragging any 3-D pane rotates into that dimension** — the gesture the static viewer
+could never offer, since the extra dimension isn't in the sidecar until someone bakes it.
+Bakes run on a worker thread and are **latest-wins**: a job that hasn't started yet is
+overwritten, so a fast drag costs one bake of wherever you end up rather than one per
+intermediate frame, and the UI never blocks on loom. The panel's `posted / baked` counters
+make that visible (`posted > baked` is the collapsing working), alongside the last bake's
+sequence number and wall time. `auto` off defers bakes to the **re-derive now** button for
+scenes too slow to rebuild interactively; a scene that raises, or emits an `.ftsl` ftrace
+can't load, reports the error in the panel and leaves the last good geometry on screen.
 
 ---
 

@@ -5,6 +5,417 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — DONE (2026-07-29, v0.102.1): `-exposure`/`-ev` was silently ignored by `-topng`
+
+`ftrace -topng in.ftbuf out.png -ev 3` produced a file byte-identical to the one
+without `-ev`: the flag parsed as a no-op and nothing warned. Cause: `-topng` is
+dispatched from `main()` at `argv[1]` *before* the main argument loop runs (it is
+deliberately a pure, scene-free utility path), and `exposureCli` is a local of that
+loop — so nothing on the conversion path ever saw the flag. `convertToPng()` called
+`writeFilm(out, f, N)` and took the `expComp = 0.0` default.
+
+This mattered because re-developing a checkpoint is exactly when you want an exposure
+override. A `.ftbuf` holds *linear* film, and the p99 auto-exposure anchors on the
+brightest 1% — so any scene with a small, very bright source (an arc lamp, a filament)
+develops with everything else crushed. `scenes/mirror_sphere_interior.ftsl` lands at a
+median of 33/255 for that reason. Without the flag the only way to re-develop brighter
+was to re-render, which for that scene is 30 minutes for an image already sitting on
+disk.
+
+Fixed by scanning `argv[4..]` for `-exposure`/`-ev` inside the `-topng` branch and
+threading it into `convertToPng(in, out, expComp)` → `writeFilm(..., expComp)`. Verified:
+`exposure=4.67e-13 (auto 1.56e-13 x 3EV-comp)`, median 33 → 60. Because a `.ppm` is
+already 8-bit sRGB there is nothing to re-expose, so that input now prints an explicit
+`warning: -ev ignored for a .ppm input` rather than pretending to work — and its output
+is confirmed byte-identical with and without the flag.
+
+Note the flag stays a *multiplier*, not stops (`-ev 3` is 3x, not 3 EV), consistent with
+`-ev` everywhere else in the CLI. That naming is itself mildly misleading but is not
+worth a breaking rename.
+
+### BUG — DONE (2026-07-29, v0.102.0): `-max-bounce` was silently ignored by mode D (BDPT) and mode U (VCM)
+
+`-max-bounce N` parsed fine and was honoured by the unidirectional/forward paths, but the
+bidirectional modes never read it: mode D hard-coded `int maxDepth = 8;` in `main.cpp` and mode
+U the same. On the GPU the bound was baked in harder still — `#define BDPT_MAXDEPTH 8` /
+`BDPT_MAXV (BDPT_MAXDEPTH+3)`, used to size the *per-thread* stack arrays
+`DVertex eye[BDPT_MAXV], light[BDPT_MAXV]` in `kBdptT<NS>`, with a clamp in `renderBdptCuda`.
+So `ftrace -mode D -max-bounce 64` rendered at depth 8 and printed `maxDepth=8` without any
+diagnostic.
+
+The original entry judged this "a correctness/UX bug, not the cause of any particular dark
+render" — that was **wrong**, and `scenes/mirror_sphere_interior.ftsl` is the counter-example.
+A 97%-reflective silver cavity has a photon mean free path of ~1/(1-0.97) = 33 bounces, so
+truncating at 8 does not dim the image, it deletes it. Measured on that frame at equal time,
+fraction of pixels at *exactly* 0.0:
+
+| `-max-bounce` | black pixels |
+|---|---|
+| 8 (the old hard-coded value) | 96.9% |
+| 48 | 67.4% |
+| 64 | 28.9% |
+
+Fixed as the entry proposed: `kBdptT` is now templated on the depth bound too
+(`template <int NS, int MAXD>`), `maxV` is threaded through `dRandomWalk` /
+`dGenCameraSubpath` / `dGenLightSubpath` instead of reading the `#define`, and only two
+variants are instantiated — `BDPT_MAXDEPTH` (8, bit-for-bit the old kernel and still the
+default) and `BDPT_DEEPDEPTH` (64), the deep one launched only when `-max-bounce` asks for
+more than 8. `main.cpp` mode D and mode U now read `g_maxBounceOverride`.
+
+Two things to know about the deep variant. It is **~15x slower per sample** — the BDPT
+connection double-loop is O(depth²) — which is inherent, not a regression. And GPU mode U
+sizes its light-vertex slab as `npix * vcmCap * sizeof(DVcmLV)`, which at `vcmCap = maxDepth
+= 64` and 1100x733 would be 6.6 GB; `vcmSessionBegin` now bounds `vcmCap` by a 768 MB slab
+budget and prints when it clamps. That only limits how many light-subpath vertices are
+*stored for merging* (subpaths still walk to `maxDepth`, and connections are unaffected), so
+the estimator stays unbiased.
+
+Remaining limitation: past 64 the GPU still clamps. Going deeper needs another instantiation,
+and the per-thread local-memory footprint is already ~13 KB there.
+
+### BUG — OPEN (2026-07-28): `light env { spd ... intensity N }` silently ignores `intensity`
+
+In `ftsl.h` (~4563-4573) the env-light block parses `intensity` but only applies it on the
+`file`-based (image env map) path; the analytic-SPD path calls `addEnvLight(spd, binWidth_)`
+and drops the scale on the floor. An authored `intensity 40` therefore changes nothing, with no
+warning. Proper fix: scale the spectrum by `intensity` (or pass it through to `addEnvLight`) on
+the SPD path too, so both forms of `light env` mean the same thing.
+
+### TECH-DEBT / DOC — OPEN (2026-07-28): a field leaf's `center` is applied *before* its `rotate`
+
+`addFieldLeaf` composes the leaf transform as `authoredXf . TRS(center)`, i.e. `center` sits on
+the *inside*. So `cylinder { center 0 -0.169 0.363   rotate 115 0 0  ... }` does **not** place a
+cylinder at that point and then tilt it in place — it offsets first and the subsequent rotation
+swings the whole thing onto a completely different axis. Authors have to use `translate` (read
+in `fieldXf`, applied *after*) to get the intuitive "put it here, then tilt it" behaviour. This
+cost real debugging time on `scenes/silver_sphere_xenon.ftsl` (see the comment above the port
+cylinder there).
+
+It is arguably not a bug — `center` is a leaf-local parameter, and reversing it now would break
+existing scenes — but it is undocumented and surprising. Fix: document the composition order in
+the FTSL reference next to `center` / `translate` / `rotate`, and say plainly that
+`center` + `rotate` on the same leaf is almost never what the author means.
+
+### BUG — DONE (2026-07-28, v0.99.0): the CUDA emitter upload silently coerced any unknown `EmitterShape` into a zeroed-basis Quad
+
+`buildUploadScene` in `render_cuda.cu` mapped the host `EmitterShape` to `DEmitter::shape`
+with an **open** ternary chain ending in `: 0` — "anything I don't recognise is a Quad" — and
+`cudaForwardSupported()` had **no emitter-shape check at all**. So a shape added host-side
+before the device kernels grew a branch for it did not fall back to the CPU and did not
+error: it reached the kernel as a Quad whose `origin`/`u`/`v` basis was garbage. Malformed
+geometry inside a kernel does not fail cleanly — it can fault the display driver and take the
+machine down (this is the class of failure the `teardownLog` / BSOD instrumentation at
+`render_cuda.cu:9440` was added for). A second, live instance of the same hazard: a `Mesh`
+emitter with an **empty** triangle list got `shape = 5` with `meshTris == nullptr`, and the
+device sampler's shape-5 branch clamps to index `-1` and dereferences it unconditionally.
+
+Fixed by `deviceEmitterShapeCode()` (`render_cuda.cu`, just above `cudaForwardSupported`): one
+**closed whitelist** shared by the support gate and the upload, so the two cannot drift. It is
+a `switch` over every enumerator with **no `default`**, so adding an `EmitterShape` now raises
+MSVC C4062 at compile time; `-1` after the switch is the runtime fail-safe. `cudaForwardSupported`
+rejects any unimplemented shape (and any empty-triangle `Mesh`) so the scene renders on the CPU —
+and since all eight GPU gates (`cudaBdptSupported`, `cudaBackwardSupported`, `cudaBackwardRGBSupported`,
+`cudaIsoPreviewSupported`, `cudaPhotonMapSupported`, `cudaSppmSupported`, `cudaVcmSupported`)
+chain to it, one guard covers every GPU entry point. The upload keeps a loud `stderr` diagnostic
++ dead-emitter fallback should the gate and the upload ever disagree.
+
+Verified: `scraps/mesh_light.ftsl` renders identically on `-device cpu` and `-device gpu`
+(absorbed 0.6591 vs 0.6588; mean |Δ| 1.9/255, pure MC noise).
+
+### FEATURE — DONE (2026-07-28, v0.99.0): `ftrace -stop <pid>|all` — never force-kill a CUDA render again
+
+Related to the above, and the other half of the same incident: force-killing ftrace mid-CUDA
+(`taskkill /F`, e.g. because a `-keepwindow` preview was holding the exe open and blocking a
+rebuild) is a well-known way to wedge the NVIDIA driver into a TDR/bugcheck. ftrace's *graceful*
+stop already existed end to end — `g_stopRequested`, the SIGINT/SIGBREAK handlers, the poll sites
+in every render loop, the final image + `.ftbuf` write — but it could only be triggered by Ctrl-C
+from the owning console, which a detached render doesn't have.
+
+`-stop` adds the missing external trigger: a sentinel file under `<temp>/ftrace/` (`<pid>.run`
+published per live render, `<pid>.stop` to signal one), polled by a 250 ms watcher thread that
+raises the *same* `g_stopRequested`. A file rather than a named event because renders run in the
+interactive Console session while the shell signalling them may be in another session/window
+station, and `Local\` kernel objects are per-session. `-stop` also releases a `-keepwindow` hold,
+and waits (≤120 s) for the target to actually exit so a rebuild can be scripted right after.
+
+### BUG + TECH-DEBT — DONE for the mesh pane (2026-07-28, v0.96.0): the loom viewer's 3-D panes were a CPU painter's-algorithm sort, not a z-buffer — on a D3D11 device that was already running
+
+`viewer_gui.cpp`'s mesh pane collected every triangle across every mesh, CPU-projected it,
+**sorted back-to-front by centroid depth** and emitted `AddTriangleFilled` into an ImGui
+draw list. Two problems:
+
+1. **Correctness.** A painter's sort by triangle centroid *cannot* resolve interpenetrating
+   or mutually-overlapping geometry — a long triangle passing through a small one is drawn
+   wholly in front of or behind it. Any loom scene with intersecting swept meshes rendered
+   visibly wrong, silently. (`examples/viewer_live.py` is exactly this: an `orbit` tube
+   threading a gyroid ball.)
+2. **Cost.** An O(n log n) sort plus per-triangle CPU projection **every frame**, on the
+   thread that also runs the UI.
+
+The irony was that `viewer_gui.cpp` already creates a **D3D11 device + swap chain** (for
+ImGui) — the hardware pipeline sitting right there, used only for 2-D.
+
+**Fixed for the mesh pane** by `MeshGpu` (`viewer_gui.cpp`): one interleaved vertex buffer +
+index buffer for the whole sidecar (per-mesh `firstIndex/indexCount/baseVertex` ranges, so
+each mesh keeps its own skin and tint as its own draw call), rendered into an offscreen
+RTV + **D32_FLOAT depth-stencil view** with runtime-compiled HLSL, then shown with
+`ImGui::Image` — the pattern the Render pane already used. Consequences:
+
+- Geometry uploads **once per tessellation** (`MeshView::geomGen`, bumped in `adoptSidecar`),
+  so an orbit / zoom / colour-mode change is a 144-byte constant-buffer write and nothing else.
+  Union bounds are baked with the upload rather than rescanned per frame.
+- Flat two-sided lambert is *preserved exactly* (`0.30 + 0.70*|n.z|`), with the face normal
+  recovered per-pixel from `cross(ddx(vp), ddy(vp))`; under the orthographic orbit projection
+  that is exact, not an approximation.
+- The wireframe is now a **real second depth-tested pass** (`D3D11_FILL_WIREFRAME`,
+  LESS_EQUAL + a small negative depth bias) instead of relying on fill/wire interleaving.
+- The UV checker is now evaluated **per-pixel** at the interpolated UV instead of once at the
+  triangle centroid — the deliberate one behaviour change, since the point of a UV checker is
+  to show distortion *within* a face.
+
+**Still open:** the **curve and field panes** keep the same CPU `project3` + draw-list
+approach. They draw lines/points rather than solid surfaces, so the occlusion bug does not
+bite the same way, but the per-frame CPU projection cost is the same and they should get the
+same treatment.
+
+**Not** to be confused with the main explorer's rasterizer, which is *already* resident
+("upload once, re-project per frame" — `raster_cuda.h upload()`); that one is a deliberate
+CUDA compute rasterizer whose device tail is byte-identical to the CPU path, and it measures
+9.12 ms/frame median at 1920×1920 on a 5.17 M-triangle scene (109.6 fps; per-pass: project
+1.14, raster 2.36, shade 0.16, expose+encode 1.14, **download 1.09**). Porting *that* to a
+graphics API would trade the byte-identical-backends guarantee and the non-matrix
+fisheye/panoramic projections for a few ms — measure before touching it.
+
+**The present tail, however, was worth attacking, and has been — DONE (2026-07-28,
+v0.97.0).** Measuring it first was the whole point: the 1.09 ms download everyone
+(including this note) had been eyeing was a *small* part of the problem. `LiveWindow`'s
+host-side tail — a scalar per-pixel RGB8→BGRA repack plus a `HALFTONE` `StretchDIBits`
+double-buffer — measured **10–29 ms per frame** (`scraps/tailbench.cpp`: 5.07 + 23.99 ms
+at 1920×1920→1264×1264; 2.35 + 7.83 ms at 1264² 1:1; 2.94 + 12.37 ms at 1920×1080 1:1),
+i.e. *2.5–3× the entire GPU render*, and it serialised with the render thread because
+`paint()` held the same mutex `update()` needed. The image area is now presented by a
+D3D11 flip-model swap chain on its own child HWND, with the RGB8 bytes uploaded
+untouched and deswizzled in a shader (see `design.md`, `livewindow.*`). `-raster-bench`
+now reports the tail directly: **9.02 ms → 1.32 ms median** at 1920² on this machine,
+with byte-identical output. `FTRACE_LIVE_GDI=1` restores the old path for A/B or if a
+driver misbehaves.
+
+**And the download itself is now gone too — DONE (2026-07-28, v0.98.0).** With D3D owning
+the image texture, the zero-copy finish became available and has been taken:
+`raster_cuda::bindPresentTarget` registers the live window's texture with
+`cudaGraphicsD3D11RegisterResource(..., cudaGraphicsRegisterFlagsSurfaceLoadStore)`, and
+`renderFrameToTarget` ends in a `surf2Dwrite` tone-map kernel, so the image never crosses
+the bus for the GPU-rasterized explorer. Every constraint listed above is respected:
+adapter mismatch is detected at registration and **latched off** (`Scene::gfxOff`) so a
+doomed register isn't retried per frame; the host-RGB `update()` call sites are untouched
+and `main.cpp`'s `rasterPresent` declines the fast path (falling back to render+`update()`)
+for the implicit-ray iso preview and for any frame `drawOverlay` must annotate. Byte
+identity is guaranteed *by construction* rather than by testing: passes A–C are literally
+the same code (`renderCore`), and the tone-map's per-pixel body — RN double intrinsics and
+all — is one shared `__device__ inline` that both the buffer and surface kernels call. The
+download used to double as the frame's fence and error check; `cudaStreamSynchronize(0)`
+took over both. Measured @ 3840²: host `render 21.97 + tail 4.17 = 26.1 ms` vs zero-copy
+**9.67 ms** (per-pass download `4.06 → 0.10 ms`). Verified against the download path with
+`WM_PRINTCLIENT` captures (bit-identical), and the fallbacks were exercised individually
+(forward photon mode B, `FTRACE_LIVE_GDI=1`, window resize → re-register, `+Pt` overlay).
+
+### BUG — DONE (2026-07-28, v0.98.2): the CPU rasterizer leaks a hairline CRACK along a shared triangle edge (the GPU one doesn't)
+
+**Symptom.** In the `-raster` preview a thin dark diagonal streak cuts across the cornell
+box's ceiling/right-wall seam. Reproduce:
+`ftrace scenes/cornell.ftsl -raster -r 800 600 -device cpu -o ppm/x.ppm -window`.
+
+**It is a hole, not a shading artifact.** Every pixel on the streak is *exactly*
+`(69,75,85)` — bit-for-bit the frame's clear colour, the same value the empty corners
+outside the box carry. No triangle covered those pixels at all. The streak is a perfect
+45° line (`x + y == 699` for every one of them, running the full image height from
+`(100,599)` to `(699,0)`, 220 pixels), which is the projected shared edge between the two
+triangles of a box face. So the CPU rasterizer's coverage rule is **not watertight**: on
+this edge both adjacent triangles reject the pixel instead of exactly one accepting it.
+
+**The GPU rasterizer gets it right**, which is how this was isolated: of the 210 pixels
+where the two backends disagree on this frame, **157 are on that single seam**, and the
+GPU fills each with the correct wall colour (e.g. `(216,195,191)` at `(476,223)` where the
+CPU has clear). The remaining 53 disagreements are ordinary ±1-pixel edge-coverage
+differences along wall silhouettes.
+
+**Mechanism (confirmed empirically).** Both rasterizers use the *same* coverage rule —
+normalized barycentrics with `if (w0 < 0 || w1 < 0 || w2 < 0) continue;` (raster.h:447,
+raster_cuda.cu:515/753). That test is *inclusive* on all three edges, which with exact
+arithmetic would double-cover a shared edge, never crack it. The crack comes from the tie
+being decided by floating-point noise:
+
+- At 800×600 the box's quad diagonals are **exactly 45°** and their line equations land on
+  `x - y = 100` / `x + y = 699`. Since sample points are `px = x+0.5, py = y+0.5`, such an
+  edge passes **dead-on through ~220 consecutive pixel centres** — every one an exact tie.
+- The two triangles sharing that edge do *not* evaluate it identically: `w0`/`w1` are
+  incrementally stepped from each triangle's own `xlo` (so different accumulation lengths
+  at the same pixel), scaled by each triangle's own `1/area`, and the third weight is the
+  *derived* `w2 = 1 - w0 - w1`, which rounds differently again. So the "same" edge can come
+  out as a tiny negative in **both** triangles, and both reject.
+- **Proof:** rendering the identical scene at 801×600 or 800×601 — which moves the edge off
+  exact pixel centres — drops interior holes from **127 to 0**. Nothing else changed.
+- The GPU escapes it only by *luck*: `float`'s coarser rounding happens to land these ties
+  non-negative where `double` lands them negative. It is not more correct, just differently
+  wrong, and another scene/resolution could crack it too.
+
+**Fix as implemented — canonical edge functions (no fixed point, no top-left rule).**
+The fixed-point/top-left plan sketched originally was dropped: it needs consistent winding,
+which this codebase deliberately does *not* enforce (it accepts either sign of `area`
+because a mesh's winding may disagree with its vertex normals). The shipped fix gets exact
+tie *detection* out of plain floating point instead, by making the two sharers of an edge
+evaluate it from **bitwise-identical operands**:
+
+1. **Canonicalize each edge's endpoint order** lexicographically by `(sx, sy)`
+   (`makeEdge` / `makeEdgeD`). Both sharers then build the same `P` and the same `Q - P`,
+   bit for bit, regardless of which way round their own vertex list runs.
+2. **Fold the orientation sign into the deltas**: `sf = sign(area) * flip`, and store
+   `dx, dy = sf * (Q - P)`. The two sharers *always* get opposite `sf` — consistent winding
+   flips `flip`, inconsistent winding flips `sign(area)` instead — so their edge values are
+   exact negatives of each other. Negation is exact in IEEE and round-to-nearest is
+   symmetric under it, so this costs no accuracy and no extra register.
+3. **Tie rule**: accept an exact zero only when `sf > 0` (stored as `tie`). That holds for
+   exactly one of the two sharers, so a pixel dead-on the edge is claimed exactly once —
+   no crack, no double-cover. Non-zero values are unambiguous by construction.
+4. **Anchor the evaluation at `P`**: `v = dx*(py - Py) - dy*(px - Px)`, with the `dx*(py-Py)`
+   term hoisted per row. The expanded affine form's constant `Px*Qy - Py*Qx` is ~W·H in
+   magnitude even for a short edge — in `float` its ulp alone displaces the edge line by
+   ~1e-3 px. Shared *edges* stay watertight either way, but the three edges meeting at a
+   shared *vertex* are perturbed independently, and that leaves an unclaimed sliver there.
+   Anchored at `P`, every operand is a local offset. (Measured: the affine form left 1 hole
+   at 3 of 6 test resolutions; the anchored form leaves none.)
+5. **Drop the incremental stepping and the derived `w2 = 1 - w0 - w1`.** Each of the three
+   weights is now evaluated directly. Stepping cannot be kept: each sharer would seed its
+   accumulator from its own `xlo`, so the values would no longer be bitwise identical.
+6. **CUDA only — defeat FMA contraction.** nvcc defaults to `-fmad=true` and contracts
+   `r - dy*(px - Px)` into an FMA, which evaluates `dy*ax` exactly and subtracts it from the
+   *already rounded* `r`, leaving `r`'s ±0.5-ulp rounding residual instead of a clean zero.
+   Worse, it applies inconsistently: the two sharers test the same edge under *different*
+   indices (`e0` vs `e1`), separate expressions the compiler contracts independently.
+   Measured at the cornell box's bottom-back-right corner at 640×480, the floor's `e0` came
+   out `-9.24e-07` while the right wall's `e1` was exactly `0` with `tie == false` — both
+   rejected. Fixed with `edgeRow`/`edgeAt` wrapping `__fmul_rn`/`__fsub_rn`. The CPU twin
+   needs no intrinsics: MSVC's default `/fp:precise` does not contract, and the build sets
+   no `/fp:` flag — which is exactly why the CPU was clean here and the GPU was not.
+7. Applied to **all five sites**: `fillTriangleG` and `fillTriangleClear` in raster.h, and
+   `rasterRow` / `kShade`'s barycentric resolve / `kClear` in raster_cuda.cu. It matters
+   most in the clear pass, which *multiplies* into `clearT`/`milkT`: a doubly-covered edge
+   would darken a seam line twice, an uncovered one leaves a hairline of un-tinted glass.
+
+Rejected alternative: widening the accept to `w > -eps` turns cracks into double-coverage
+(mostly harmless here, since the z-test's strict `>` lets the first writer win). But the
+epsilon is scale-dependent and it only moves the failure rather than removing it.
+
+**Verification.** Interior holes at 800×600 went **127 → 0** on the CPU, and both backends
+now report **0 interior holes at all eight tested resolutions** (800×600, 801×600, 800×601,
+1024×768, 1280×720, 640×480, 1920×1080, 3840×2160). Hole detection is
+`scraps/_crack.py` (a clear-coloured pixel with non-clear neighbours on left+right or
+up+down).
+
+**Cost.** ~4% on the CPU rasterizer (crystalloop, 120 frames at 1920×1080: 13.15 s → 13.70 s);
+GPU unchanged within noise (0.92 s → 0.90 s). That is the price of evaluating three edge
+functions per pixel instead of stepping two — it cannot be recovered without giving up the
+bitwise identity the fix depends on.
+
+**Wider implication.** The CPU and GPU rasterizers are still not *byte*-identical — CPU
+evaluates in `double`, GPU in `float`, so at resolutions where an edge lands dead-on many
+pixel centres the two can hand a tie pixel to different (but always to *some*) triangle.
+Residual cornell-box disagreement: 188 px at 800×600, 2 px at 801×600, 6 px at 800×601,
+1183 px at 3840×2160 — and **none of them involve the clear colour**, i.e. every one is one
+real surface vs another, never a hole. So `-device` is now a safe switch for `-raster`
+coverage, but not a bit-exact one. Output bytes changed, so golden images need regenerating.
+
+### BUG — DONE (2026-07-28, v0.98.1): a dark fringe of speckles on the tessellated sphere's silhouette (both backends, identically)
+
+**Symptom.** Isolated very dark pixels sit on the sphere's silhouette in the `-raster`
+preview, e.g. at `(354,287)`, `(445,287)`, `(344,294)`, `(455,294)`, `(327,312)`,
+`(472,312)`, `(325,315)`, `(474,315)` in the 800×600 cornell frame.
+
+**What's known.** Unlike the crack above, these are **byte-identical in the CPU and the GPU
+renders** (same positions, same `(93,83,81)`), so this is in shared geometry/shading, not in
+either rasterizer's coverage rule. They are also **not** holes — `(93,83,81)` is a genuine
+shaded colour, not the clear colour — and they are **mirror-symmetric in pairs about the
+sphere's vertical axis** (`x=399.5`), with the half-width growing monotonically down the
+arc. That symmetry rules out any race or thread-mapping effect and points at deterministic
+geometry: the shading normal used at the extreme silhouette facets, where the interpolated
+normal is nearly perpendicular to the view and `N·L` collapses.
+
+It is **not** a zero-copy/interop regression: the download path and the surface path are
+bit-identical here, and the artifact predates v0.98.0.
+
+**Cause (found by probing the winning fragment).** The interpolated normal was *correct*.
+The winning facet at `(327,312)` has vertex normals `(-0.747,0.643,0.170)`,
+`(-0.866,0.500,0.000)`, `(-0.766,0.643,0.000)` and barycentrics `(0.073,0.436,0.491)`,
+giving an interpolated normal of `(-0.808,0.581,0.012)` — outward, as it should be. What
+inverted it was the **two-sided flip**, `if (dot(N3,V) < 0) N3 = -N3;`, applied *per pixel*
+to the smoothly-interpolated normal. At a silhouette `dot(N,V)` legitimately grazes through
+zero (here `-0.0497`) while the surface is still genuinely front-facing, so the flip fired
+and produced `N = (0.812,-0.584,-0.013)`, for which `N·L <= 0` at every light. `lit`
+collapsed to exactly 0 and only ambient survived (`k` 0.277 → 0.103) — a 1-px dark band
+along every silhouette, showing as speckles wherever the band is isolated in both axes.
+
+**Fix.** The two-sided decision is now made **once per triangle**, at projection time
+(`projectRange` in raster.h, `kProject` in raster_cuda.cu), and the per-pixel flip is gone.
+A triangle counts as back-facing only when **all three vertices** face away: a silhouette
+triangle straddles the horizon (here `+0.11 / -0.068 / -0.058`) and keeps its smooth
+normals, while geometry genuinely seen from behind — the cornell box's walls are wound
+outward and viewed from inside, so they *rely* on the flip — has every vertex agreeing and
+still flips exactly as before. Being per-triangle it is also constant across each facet, so
+it cannot reintroduce an intra-triangle discontinuity.
+
+Note what does *not* work, since both look plausible: the screen-space area sign is
+useless here (the back wall's winner is `+9.3e4` and the sphere's rim winner `+7.0` — the
+same sign, yet they need opposite treatment, because this scene's wall winding disagrees
+with its vertex normals), and the *geometric* facet normal grazes at the rim just as the
+shading normal does. The vertex normals are the only reliable signal, and unanimity is
+what makes them decisive.
+
+**Verified:** isolated dark pixels on cornell 800×600 go 8 → **0** on the GPU and the 8
+shared ones vanish on the CPU (its remaining 22 are the separate fill-rule crack above).
+On the CUDA side the decision rides in a new `kSlotBack` flag bit rather than being baked
+into stored normals, because an unclipped slot has no `DAttr` record — `kShade` reads its
+attributes bit-verbatim from the source `DPTri`.
+
+### BUG — DONE (2026-07-28, v0.95.0): `python -m loom.anim` served an *empty* slot list — a module that is both `__main__` and importable is two different classes
+
+**Symptom.** `ftrace -anim … -loom <scene.py>` came up with `0 bindable scene variable(s)`
+on a scene that plainly declares one, so the bind row had nothing to offer and the live
+channel drove nothing. The same code path exercised **in-process** (the `_run_cli` test
+harness) worked perfectly, which is exactly why the test suite never caught it.
+
+**Cause.** Running `python -m loom.anim` executes the module a second time under the name
+`__main__`, *in addition to* the `loom.anim` that `import loom.anim` binds. Each execution
+creates its own class objects, so the `SceneDriver` (etc.) that `__main__` constructs is
+**not** the `SceneDriver` the imported half's `isinstance` checks test against. Every such
+check silently fails, and the failure mode is a *quiet empty result*, not an exception.
+
+**Fix + regression pin.** Beyond the fix in `loom/anim.py`, the bug is now pinned by tests
+that spawn a **real subprocess** — `test_cli_subprocess_sees_the_scenes_slots_and_drives_them`
+(`tests/test_anim_live.py`) and `test_viewer_m_entry_point_serves_the_same_session`
+(`tests/test_viewer.py`). An in-process harness *cannot* reproduce this class of bug, since
+it only ever has one module identity; only `subprocess.run([sys.executable, "-m", …])` does.
+Both assert on the emitted artifact, not just the ack — the anim one checks the written
+`.ftsl` actually contains `roughness 0.75`, so an ack that lies is still caught. Verified by
+temporarily reverting the fix: the test failed with `assert {} == {'rough': 0.3 ± 3e-07}`.
+
+**Generalisation worth remembering:** any module that is *both* a `-m` entry point and an
+importable API needs at least one subprocess test. Everything else tests the wrong object.
+
+### TOOLING — NOT A BUG (2026-07-28): `SetWindowTextW` on a control in **another process** silently does nothing
+
+Cost roughly an hour of chasing a phantom bug in the bind row's `chans:` box: the box looked
+inert from an external PowerShell driver, while every other control worked. `SetWindowTextW`
+across a process boundary does not reach the control — it updates only the window text USER32
+caches on our side, so the EDIT's own buffer never changes and it never raises `EN_CHANGE`.
+Worse, it reads back *consistently*: the external `GetWindowTextW` returns that same cached
+text, so the harness "confirms" a value the target process cannot see (its in-process
+`GetWindowTextW` sends `WM_GETTEXT` and gets the real, unchanged buffer).
+
+**Use `SendMessageW(hCtl, WM_SETTEXT, 0, L"…")`** — the message a keystroke actually produces;
+it updates the control and raises `EN_CHANGE` by itself, with nothing to synthesize.
+`scraps/bindtest.ps1` carries this note inline so the next harness doesn't repeat it. The
+`chans:` box itself was never broken (`[anim] channels 4 → 7 → 5 → 3` all verified).
+
 ### PERF — OPEN (2026-07-27): scene loading is down 5×, but the graph walk (not the lexer) is what's left
 
 The 0.68 front-end flip made loading measurably slower than the hand-written parser —
@@ -2485,6 +2896,34 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
 
 ## Recently fixed
 
+### loom rejected its own `reflect pattern:<name>` emission — FIXED 2026-07-28 (v0.93.0)
+
+`loom/grammar/bindings.py::as_color_binding` treated a `pattern:<name>` value as an error in
+every colour slot, so loom's own reader raised `ShapeError: unrecognized spectrum expression
+'pattern:p_rings'` on `.ftsl` that **loom itself emits** for a `FuncPattern`-driven material
+(`scenes/reflect_pattern.ftsl`, `scenes/transmit_pattern.ftsl`). ftrace accepts it — see
+`patternedSpectrumParam` in `src/ftsl.h` (~2083): a lone `pattern:` in a colour slot *is* the
+albedo, over a flat 1.0 base. The validator, not the emitter, held the wrong belief, and two
+tests (`test_color_binding_rejects_pattern`, `test_reflect_rejects_pattern_bind`) encoded it.
+
+Found by round-tripping the checked-in `scenes/*.ftsl` corpus through the new reader (J3c).
+**Fix:** `as_color_binding` accepts `pattern:` in any colour slot and grew a `texture=` keyword
+so the *texture* restriction stays exact — only `reflect` binds an image albedo, everything else
+(`transmit`, `absorb`, …) rejects `texture:` with an explanatory message. `reader.py` moved
+`transmit` out of `_SPECTRAL_ONLY_FIELDS` into a new `_PATTERNED_SPECTRAL_FIELDS`. The two
+tests were rewritten to assert the correct behaviour, plus `test_transmit_rejects_texture_bind`.
+
+### `type mix` lost every layer but the last on read — FIXED 2026-07-28 (v0.93.0)
+
+`loom/grammar/reader.py::_build_material` folded a material body into a `dict`, so the repeated
+`layer "<name>" <weight>` lines of a `type mix` material collapsed to one entry and the reader
+silently built a **one-layer mix** from a two-layer source. Same class of bug as a dict-folded
+`camera_curve` body (repeated `point` lines). **Fix:** `_props()` returns an *ordered list* of
+`(key, tokens)` and `_build_mix()` reads the repeated `layer` lines off it into a real
+`MixMaterial`; the generic `Block` fallback is ordered for the same reason. Regression tests:
+`tests/test_grammar_block.py::test_mix_material_reads_its_repeated_layer_lines` and
+`::test_duplicate_keys_are_kept_in_order`.
+
 ### VDB sampler read the *second* voxel in the low-face half-voxel shell — FIXED 2026-07-27 (v0.84.2)
 
 `VdbGrid::sample` (`src/vdbgrid.h`) and its device twin `dVdbSample` (`src/render_cuda.cu`)
@@ -4742,3 +5181,84 @@ smoothing at extreme magnification.
 (b) pre-expand the wrap mode into the *UVs* at bake time (clamp/mirror the per-vertex UVs
 on the CPU before `PrimVtx`), which is cheaper but only correct when a triangle doesn't
 straddle the tile boundary. (a) is the real answer.
+
+## OPEN (cosmetic, 2026-07-28): `python -m loom.viewer` prints a runpy double-import RuntimeWarning
+Starting the F4 live channel spawns `python -X utf8 -u -m loom.viewer <scene.py>`, and
+Python's `runpy` prints to stderr:
+
+```
+RuntimeWarning: 'loom.viewer' found in sys.modules after import of package 'loom',
+but prior to execution of 'loom.viewer'; this may result in unpredictable behaviour
+```
+
+Cause: `tools/loom/loom/__init__.py` re-exports the viewer API (`from .viewer import
+ViewerModel, serve_viewer, ...`), so importing the *package* `loom` — which `-m
+loom.viewer` does first — already puts `loom.viewer` in `sys.modules`; runpy then
+executes the same file a second time as `__main__`. It is harmless here (the module has
+no import-time side effects and the duplicate module object is never handed out), but
+`LoomLink` deliberately gives the child ftrace's own stderr so a scene traceback is
+readable, which means the warning lands on the user's console on every viewer launch.
+
+**Proper fix:** give the CLI its own entry module — `tools/loom/loom/__main__.py`-style
+`loom/viewer_main.py` (or a `console_scripts`-shaped `loom.viewer.__main__`) that only
+does `from .viewer import serve_viewer; serve_viewer(...)`, and switch `LoomLink::start`
+and the documented invocation to it. `-m loom.viewer` should keep working (deprecated),
+so the ftrace side must not hard-depend on the new name until the docs are updated
+together.
+
+## DONE (2026-07-28, 0.92.0): the DAG panel crashed in `PrimReserve` — imgui #7543 vs. imnodes node rects
+
+The viewer's Graph pane died intermittently with an access violation writing to `0x20`,
+always on the same stack: `drawDagPanel` → `ImNodes::EndNodeEditor` → `DrawLink` →
+`ImDrawList::AddBezierCubic` → `PrimReserve` → `memcpy`. Working set at the fault was
+~9.9 GB.
+
+**Root cause** — an upstream ImGui behaviour change that imnodes was never updated for.
+Since 1.90.7 (imgui #7543) `EndGroup()` folds `g.LastItemData.Rect.Max` into the group's
+bounding box as a workaround for `EndTable()` undershooting `CursorMaxPos`:
+
+```cpp
+ImRect group_bb(group_data.BackupCursorPos,
+                ImMax(ImMax(window->DC.CursorMaxPos, g.LastItemData.Rect.Max),
+                      group_data.BackupCursorPos));
+```
+
+`BeginGroup()` backs up and resets `CursorMaxPos`, but it never clears `LastItemData`.
+For normal stacked layout that is harmless — the previous item is above and to the left.
+imnodes is the pathological case: it hard-positions every node anywhere on the canvas via
+`SetCursorPos`, so "the previous item" is *the previously drawn node*, and each node's
+reported rect became the running maximum of every earlier node's right/bottom edge.
+ftrace then feeds `GetNodeDimensions()` back into `measureDag` to lay the graph out, so
+the extent grew geometrically frame over frame (748 → 5443 → 110498 → …) until a link was
+~1e8 px long. `GetCubicBezier` scales `NumSegments` with link length at 0.1/px and never
+bounds it, so that one link asked for ~80M segments → ~322M `ImDrawVert` (~6.9 GB);
+`PrimReserve`'s allocation returned null and the following `memcpy` wrote through it.
+
+**Fix** (three parts, all in `src/third_party/imnodes/imnodes.cpp`, marked
+`[ftrace patch]`): a `ResetLastItemForGroup()` helper called immediately before every
+`ImGui::BeginGroup()` in imnodes (`BeginNodeEditor`, `BeginNode`, `BeginNodeTitleBar`,
+`BeginPinAttribute`, `BeginStaticAttribute`); an explicit `LastItemData.Rect` override in
+`EndNodeTitleBar`, because `GetNodeTitleRect()` is as wide as *last frame's* node and
+leaving it as the last item would latch a node to its historical maximum width so it could
+never shrink again (e.g. on zoom-out); and a `ImClamp(..., 1, 4096)` on
+`GetCubicBezier`'s segment count as defence in depth, so a single stray coordinate can
+never again turn one link into a multi-gigabyte vertex request.
+
+Verified: working set 9882 MB → 256 MB, extent stable at 748×198.2, and a 20-round
+scripted right-drag sweep (`scraps/viewer_hammer.ps1`) ran to completion with memory
+oscillating 315–821 MB and no monotone growth.
+
+## DONE (2026-07-28, 0.92.0): the DAG panel re-packed itself when its pane was scrolled out of view
+
+Second bug, found while validating the fix above. `drawDagPanel` adopts imnodes'
+`GetNodeDimensions()` as the authoritative node size, but the Graph pane sits at the
+bottom of a scrolling side column and is routinely clipped to **zero height**. ImGui then
+sets `SkipItems` on the canvas window and every `ImGui::Text` inside a node returns without
+measuring anything — yet imnodes still reports a rect, namely the node origin expanded by
+`NodePadding`. Adopting that re-packed the whole graph at ~16×32 px per node, so the layout
+was visibly wrong the moment the user scrolled the pane back into view.
+
+**Fix:** reject the entire frame's measurements unless *every* node's reported content
+width exceeds `2 * NodePadding.x * zoom`. A node always draws at least its title, so a
+content width of zero means "not measured this frame", never "an empty node". The previous
+frame's sizes are kept until a frame that actually drew comes along.

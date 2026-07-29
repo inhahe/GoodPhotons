@@ -1,6 +1,7 @@
 """§F1 — the loom↔viewer data contract: load_build + scene introspection sidecar."""
 
 import json
+import os
 import sys
 import textwrap
 
@@ -616,6 +617,50 @@ def test_session_params_advertises_declared_controls():
     assert ack["params"] == {"radius": 0.12}
 
 
+# --- F4 item 2: what the C++ viewer's live parameter UI needs ---------------
+
+def test_declared_param_types_distinguish_int_float_bool_str():
+    # JSON erases Python's int/float split, so a viewer that round-trips `rings=8`
+    # as 8.0 breaks a build doing `range(rings)`.  The type tag is what lets the
+    # C++ side send an integer literal back.  bool must NOT read as int.
+    def b(clock=None, rings=8, scale=0.5, closed=True, mode="ribbon", extra=None):
+        return None
+    vm = ViewerModel(b)
+    assert vm.declared_param_types() == {
+        "rings": "int", "scale": "float", "closed": "bool",
+        "mode": "str", "extra": "other"}
+
+
+def test_session_params_carries_types_and_build_path():
+    ack = _session().handle({"cmd": "params"})
+    assert ack["types"] == {"radius": "float"}
+    assert ack["build"] == os.path.abspath(__file__)   # `build` is defined in this file
+
+
+def test_build_path_names_the_file_the_build_came_from(tmp_path):
+    path = _write_scene_file(tmp_path, """
+        from loom.scene import Scene, Camera, Sphere, Material
+        def build(clock=None):
+            sc = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+            sc.add(Material("m", "diffuse"), Sphere((0, 0, 0), 1.0, "m"))
+            return sc
+    """)
+    vm = ViewerModel.from_file(path)
+    assert vm.build_path() == os.path.abspath(path)
+
+
+def test_sidecar_records_its_build_provenance(tmp_path):
+    # Handed only a sidecar, the C++ -viewer must be able to reopen the LIVE channel
+    # (`python -m loom.viewer <build>`) without being told the scene file twice.
+    out = tmp_path / "scene.viewer.json"
+    ViewerModel(build).save_sidecar(str(out))
+    d = json.loads(out.read_text())
+    assert d["build"] == os.path.abspath(__file__)
+    # ...and the inline re-introspection path carries it too
+    ack = _session().handle({"cmd": "introspect"})
+    assert ack["sidecar"]["build"] == os.path.abspath(__file__)
+
+
 # --------------------------------------------------------------------------
 # F7 primary path — the .ftsl source the C++ viewer raymarches
 # --------------------------------------------------------------------------
@@ -735,3 +780,38 @@ def test_viewer_main_smoke(tmp_path, capsys):
     outlines = [json.loads(x) for x in capsys.readouterr().out.splitlines() if x.strip()]
     assert outlines[0]["params"] == {"r": 1.0}   # declared default, not the seed
     assert outlines[-1]["bye"] is True
+
+
+def test_viewer_m_entry_point_serves_the_same_session(tmp_path):
+    """`python -m loom.viewer` — the form ftrace's F4 channel actually spawns.
+
+    `-m` re-executes viewer.py as `__main__`, so every class defined there gains a
+    second identity while a scene's `from loom.viewer import ...` gets the canonical
+    one; any isinstance test across that boundary silently fails (see the same bug
+    in loom/anim.py, where it made the live-value channel a no-op).  The entry
+    point delegates to the imported module to keep one identity — this pins it.
+    """
+    import os
+    import subprocess
+    import loom.viewer as vmod
+
+    pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(vmod.__file__)))
+    path = _write_scene_file(tmp_path, """
+        from loom.scene import Scene, Camera, Sphere, Material
+        def build(clock=None, *, r=1.0):
+            sc = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0)))
+            sc.add(Material("m", "diffuse"), Sphere((0, 0, 0), r, "m"))
+            return sc
+    """)
+    msgs = [{"cmd": "params"}, {"cmd": "introspect"}, {"cmd": "quit"}]
+    env = dict(os.environ, PYTHONPATH=pkg_parent, PYTHONIOENCODING="utf-8")
+    proc = subprocess.run([sys.executable, "-X", "utf8", "-u", "-m", "loom.viewer", path],
+                          input="".join(json.dumps(m) + "\n" for m in msgs),
+                          capture_output=True, text=True, cwd=pkg_parent, env=env,
+                          timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    acks = [json.loads(x) for x in proc.stdout.splitlines() if x.strip()]
+    assert acks[0]["params"] == {"r": 1.0}
+    sidecar = acks[1]["sidecar"]
+    assert [o["kind"] for o in sidecar["objects"]] == ["sphere"]
+    assert acks[-1]["bye"] is True
