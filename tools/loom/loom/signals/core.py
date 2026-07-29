@@ -272,8 +272,21 @@ class Const(Signal):
 class TimeFn(Signal):
     """Wrap an arbitrary ``f(t) -> float`` of the normalized loop phase.
 
-    If ``periodic`` (default) ``t`` is wrapped into ``[0, 1)`` first, which
-    keeps user shapes loop-safe.
+    If ``periodic`` (default) ``t`` is folded into ``[0, 1)`` first, which keeps
+    user shapes loop-safe — but **only on a closed clock**, following the same rule
+    as :func:`~loom.signals.retime.retimed_clock`: wrap iff ``clock.loop``.
+
+    That qualifier is not a nicety.  A closed clock never leaves ``[0, 1)`` on its
+    own, so folding is a no-op there and the wrap's *only* reachable effect used to
+    be on an **open** timeline, whose last frame sits at exactly ``t == 1`` — which
+    folded to 0 and snapped the whole animation back to its first frame.  Any ramp
+    that is not itself periodic in value (:func:`~loom.phase_drift`, say) lost its
+    final frame that way, silently, on precisely the timeline that documents its
+    endpoints as *distinct* (DESIGN.md §11.6).
+
+    Wrapping still fires where it was actually wanted: a retimed / warped
+    sub-evaluation on a **looping** clock, which can push ``t`` off either end.
+    Pass ``periodic=False`` to opt out entirely.
     """
 
     def __init__(self, fn: Callable[[float], float], *, periodic: bool = True) -> None:
@@ -282,7 +295,9 @@ class TimeFn(Signal):
         self.periodic = bool(periodic)
 
     def _eval(self, clock: Clock, cache: Optional[Cache]) -> float:
-        t = clock.t - math.floor(clock.t) if self.periodic else clock.t
+        t = clock.t
+        if self.periodic and clock.loop:
+            t -= math.floor(t)
         return float(self.fn(t))
 
 

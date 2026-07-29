@@ -47,12 +47,8 @@ container cut with a flat mirrored face instead of opening into the labyrinth),
 
 from __future__ import annotations
 
-import math
 import os
-import shutil
-import subprocess
 import sys
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -168,28 +164,6 @@ def build(clock=None, res=RES, freq: float = FREQ,
 build_scene = build
 
 
-# ---------------------------------------------------------------------------
-# GIF assembly via ffmpeg (palettegen/paletteuse -> a proper 256-colour palette)
-# ---------------------------------------------------------------------------
-
-def assemble_gif_ffmpeg(frames_dir: Path, stem: str, out_gif: Path,
-                        fps: float = FPS, digits: int = 3) -> Path:
-    ff = shutil.which("ffmpeg")
-    if ff is None:
-        raise SystemExit("ffmpeg not found on PATH")
-    pattern = f"{stem}%0{digits}d.png"
-    vf = (f"fps={fps:g},split[a][b];"
-          f"[a]palettegen=max_colors=256:stats_mode=diff[p];"
-          f"[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle")
-    cmd = [ff, "-y", "-framerate", f"{fps:g}", "-i", pattern,
-           "-filter_complex", vf, "-loop", "0", str(out_gif)]
-    print(f"[gif] {' '.join(cmd)}  (cwd={frames_dir})", flush=True)
-    r = subprocess.run(cmd, cwd=str(frames_dir))
-    if r.returncode != 0:
-        raise SystemExit(f"ffmpeg failed (exit {r.returncode})")
-    return out_gif
-
-
 def main() -> int:
     freq, res = FREQ, RES
     open_cut = OPEN_CUT and "--capped" not in sys.argv
@@ -225,7 +199,7 @@ def main() -> int:
         print(scene.emit(Clock.at_frame(0, FRAMES, FPS), Cache()))
         return 0
 
-    from loom import render_range
+    from loom import render_range, assemble_gif_ffmpeg, assemble_mp4
     from loom.drive import default_outdir
     outdir = default_outdir(NAME)
     # A *noise* budget (not a time one) keeps every frame equally grainy, which is what
@@ -241,9 +215,13 @@ def main() -> int:
                         noise=noise, interval=6.0, loop=True,
                         skip_existing="--resume" in sys.argv,
                         extra_args=["-rgb", "-device", device])
-    gif = assemble_gif_ffmpeg(outdir, NAME, outdir / f"{NAME}.gif", fps=FPS,
-                              digits=max(3, len(str(FRAMES - 1))))
-    print(f"[done] {len(pngs)} frames -> {gif}")
+    gif = assemble_gif_ffmpeg(pngs, outdir / f"{NAME}.gif", fps=FPS)
+    # ... and an MP4 beside it: a 150-frame gyroid lattice is about as GIF-hostile as
+    # imagery gets (high-frequency detail defeats LZW, and 256 colours can't hold gold's
+    # gradients), so the video is both smaller and truer.  The loop is identical — an
+    # MP4 just has no loop flag, so looping is the player's job.
+    mp4 = assemble_mp4(pngs, outdir / f"{NAME}.mp4", fps=FPS)
+    print(f"[done] {len(pngs)} frames -> {gif}  +  {mp4}")
     return 0
 
 

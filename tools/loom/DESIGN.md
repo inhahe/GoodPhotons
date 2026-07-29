@@ -80,6 +80,13 @@ dataclasses, beat/tempo, wavetable-osc phase machinery if unused).
 **Keep as-is (reused):**
 - `Signal` base (a DAG node = pure function of a clock), `children()`, per-block
   cache, operator overloading (`+ - * neg`), `Const`, `TimeFn`.
+  - `TimeFn(fn, periodic=True)` folds `t` into `[0,1)` **only when `clock.loop`** —
+    the same "wrap iff the clock is closed" rule `retimed_clock` uses (§11.6 below).
+    It used to fold unconditionally, which was invisible on a closed clock (`t`
+    never leaves `[0,1)` anyway) but on an **open** timeline silently mapped the
+    last frame — exactly `t == 1` — back onto frame 0, deleting the final frame of
+    every non-value-periodic ramp (`phase_drift`) on the one timeline documented as
+    having *distinct* endpoints. Caught by `tests/test_drive.py`.
 - `Add/Sub/Mul/Neg/Clamp/Rectify/Power/MapRange/Mix/Smooth`.
 - `RefSignal` (shared/named sub-graph).
 - **`detect_signal_cycle(root)`** — the loop detector (3-color DFS →
@@ -504,8 +511,23 @@ whole-file `scene { … }` → live `Scene` builder is likewise still FUTURE (§
   crash-safe flags per project rules), collect PNG.
 - **Live viewer** (cheap GUI value): emit → raster preview so you can watch loops
   while tuning. Passive; no editing.
-- **Assembly**: reuse existing `tools/obj_sequence_to_video.py`-style helpers to build
-  a seamless GIF/MP4.
+- **Assembly**: `assemble_gif` (Pillow, no external dep), `assemble_gif_ffmpeg`
+  (`palettegen stats_mode=diff` + `paletteuse`, far better than Pillow's global
+  256-colour quantisation) and `assemble_mp4` (libx264, `yuv420p`, auto-pads odd
+  dimensions since 4:2:0 cannot represent them). All three take an explicit frame
+  *list*, so the caller's order — not `sort()` — is what gets encoded.
+  - **Seamlessness is the whole point, and the obvious ffmpeg route breaks it.**
+    Feeding an arbitrary file list normally means the `concat` demuxer, but concat
+    only applies a `duration` to an entry if that entry is **repeated**, and the
+    repeat is a *real extra frame*. On a closed loop that duplicates the pre-seam
+    frame and shows as a hitch every cycle. So `_stage_frames()` hard-links (falling
+    back to copy across volumes) the list into a temp dir as `f%06d.png` and uses the
+    `image2` demuxer, which is exactly one output frame per input.
+  - **GIF delays are integer centiseconds**, so only rates dividing 100 are exact:
+    25 fps → 4 cs lands on the grid; 60 fps asks 1.67, rounds to 2, and silently
+    plays back at 50. Prefer 25/50 for anything that must loop cleanly.
+  - GIF `loop=0` means *forever*; **play-once is the absence of the NETSCAPE block**,
+    not a value — `loop=-1` makes ffmpeg omit it (`tests/test_drive.py` pins this).
 - **Determinism**: a global `--seed`; a given seed reproduces a loop exactly.
 - **Optional in-tool adaptive marching cubes** (only where a field must be baked to a
   mesh): octree/dual-contouring that subdivides more where the field changes fast and

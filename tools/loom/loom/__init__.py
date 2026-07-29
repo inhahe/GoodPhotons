@@ -71,7 +71,8 @@ from .pov import (
 )
 from .pov_nd import nd_field_expr, nd_field_eval, nd_grad_bound_xi
 from .drive import (
-    render_range, render_still, emit_frames, assemble_gif, find_ftrace,
+    render_range, render_still, emit_frames, assemble_gif,
+    assemble_gif_ffmpeg, assemble_mp4, find_ftrace,
 )
 from .preview import PreviewServer, preview_range
 from .viewer import (
@@ -135,7 +136,8 @@ __all__ = [
     "gyroid_n", "schwarz_p_n", "schwarz_d_n", "neovius_n",
     "pov", "PovFn", "POV_FUNCS", "POV_ND_GENERALIZABLE", "POV_PARAMS", "pov_params",
     "nd_field_expr", "nd_field_eval", "nd_grad_bound_xi",
-    "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
+    "render_range", "render_still", "emit_frames", "assemble_gif",
+    "assemble_gif_ffmpeg", "assemble_mp4", "find_ftrace",
     "PreviewServer", "preview_range",
     "load_build", "build_scene", "introspect", "ViewerModel",
     "SpatialExpr", "Surface", "Image", "VolumeField", "SigAt", "sexpr",

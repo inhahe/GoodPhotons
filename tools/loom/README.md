@@ -124,6 +124,30 @@ Most examples take `--help`. Rendering shells out to the `ftrace` binary (found
 automatically via `loom.drive.find_ftrace`); build it first (see the top-level
 [README](../../README.md#building)).
 
+### Rendering and assembling a loop
+
+```python
+from loom import render_range, assemble_gif_ffmpeg, assemble_mp4
+
+pngs = render_range(scene, frames=150, outdir="png/myloop", name="myloop", loop=True)
+assemble_gif_ffmpeg(pngs, "png/myloop/myloop.gif", fps=25.0)   # needs ffmpeg
+assemble_mp4(pngs, "png/myloop/myloop.mp4", fps=25.0)          # needs ffmpeg
+```
+
+`assemble_gif` is the dependency-free fallback (Pillow only); `assemble_gif_ffmpeg`
+builds a per-loop optimised palette and looks considerably better on detailed
+imagery. Both default to `loop=0` — GIF for "repeat forever"; pass `loop=-1` for
+play-once.
+
+Two things to know if the loop must be **seamless**:
+
+- **Use a frame rate that divides 100.** A GIF stores its inter-frame delay in whole
+  centiseconds, so 25 fps (4 cs) is exact while 60 fps rounds 1.67 → 2 and plays back
+  at 50 fps. MP4 doesn't care.
+- **Render with `loop=True`.** That maps frame `k` to `t = k/frames`, so frame
+  `frames` *is* frame 0 and is correctly left out — the encoders emit exactly one
+  frame per input, never duplicating one at the seam.
+
 ### Reading `.ftsl` back
 
 `loom.grammar.reader` goes the other way — text to elements — for editing an existing
