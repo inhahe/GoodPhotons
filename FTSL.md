@@ -1083,7 +1083,32 @@ upsampled to a reflectance spectrum, `metallicFactor ≥ 0.5` → a glossy (meta
 BSDF tinted by the base color, else diffuse, with `roughnessFactor` as the lobe
 width. Add `import_materials no` to ignore glTF's materials and paint every
 primitive with the block's FTSL `material` instead. The block `material` is always
-the fallback for primitives that carry no material. *Not supported* (see
+the fallback for primitives that carry no material.
+
+`skip_material <substr>[,<substr>…]` **drops** every primitive whose glTF material
+*name* contains one of the given substrings (case-insensitive). Asset-store models
+routinely bundle a backdrop into the same file as the subject — a ground plane, a
+studio sweep, a display pedestal — and there is no way to subtract geometry after
+it is loaded, so the filter has to run at load time. The loader prints
+`(skip_material dropped N prims)` so you can confirm it matched something.
+
+To list several substrings, **comma-join them or repeat the statement** — the two
+forms are unioned. A *space*-separated list does not work: the parser starts a new
+statement at the second bareword, so `skip_material ground backdrop` would filter on
+`ground` only and warn about an unknown key `backdrop`.
+
+```
+mesh "cam" {
+    file "cameras/cinema_camera.glb"
+    material fallback
+    skip_material ground,backdrop   # this asset ships its own floor plane
+    # equivalently:
+    #   skip_material ground
+    #   skip_material backdrop
+}
+```
+
+Works in `mesh_asset` too. *Not supported* (see
 known-issues): textures, KHR extensions (transmission/clearcoat/…), skinning,
 morph targets, sparse accessors, animation, and non-triangle primitives (skipped).
 
@@ -1101,6 +1126,7 @@ mesh_asset "ball" {           # load ONCE into local space (no world transform)
     uv use_mesh               # optional: read OBJ vt
     usemtl use_names          # optional: per-usemtl-group material by name
     import_materials no       # optional (glTF): ignore glTF materials
+    skip_material ground      # optional (glTF): drop prims by material name
 }
 
 mesh_instance {               # cheap placement of a named asset

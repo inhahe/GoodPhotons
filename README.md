@@ -1445,6 +1445,9 @@ and Autodesk FBX** import — the loader dispatches on file extension). glTF bri
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
 roughness → lobe width; `import_materials no` forces the FTSL `material` instead).
+`skip_material <substr>[,…]` (repeatable) drops glTF primitives whose material name
+matches — the way to strip the ground plane / studio backdrop that asset-store models
+bundle in with the subject, since geometry can't be subtracted after it loads.
 **FBX** (`.fbx`, via the vendored MIT/public-domain [`ufbx`](https://github.com/ufbx/ufbx)
 library) imports baked triangle geometry — every mesh instance's faces are
 triangulated and baked through ufbx's world transform, with generated-if-missing

@@ -267,6 +267,30 @@ inline const Stmt* find(const Block& b, const char* key) {
 inline void markUsed(const Block& b, const char* key) {
     for (const auto& s : b.stmts) if (s.key == key) s.used = true;
 }
+// Gather every substring listed under a REPEATED, comma-splittable key (currently
+// `skip_material`). FTSL's statement splitter starts a NEW statement at the second
+// bareword, so `skip_material a b` would silently keep only `a` (and warn about a
+// stray key `b`). Both spellings that survive the splitter are therefore accepted and
+// unioned: repeat the statement (`skip_material a` / `skip_material b`) or comma-join
+// one token (`skip_material a,b`). Marks every match read, like markUsed.
+inline std::vector<std::string> wordListOf(const Block& b, const char* key) {
+    std::vector<std::string> out;
+    for (const auto& s : b.stmts) {
+        if (s.key != key) continue;
+        s.used = true;
+        for (const std::string& w : s.val.words) {
+            size_t start = 0;
+            for (;;) {
+                size_t c = w.find(',', start);
+                std::string piece = w.substr(start, (c == std::string::npos) ? c : c - start);
+                if (!piece.empty()) out.push_back(piece);
+                if (c == std::string::npos) break;
+                start = c + 1;
+            }
+        }
+    }
+    return out;
+}
 // Mark a whole block read, for bodies whose content is consumed as the flat
 // `words` dump rather than key/value statements (`data { … }`, `palette { … }`,
 // a table's rows). Their "keys" are just the first token of each line, so
@@ -3949,8 +3973,17 @@ private:
         }
         if (ext == ".gltf" || ext == ".glb") {
             bool importMats = (strOf(b, "import_materials") != "no");
+            // `skip_material <substr>[,<substr>…]` (glTF/GLB only), repeatable: drop
+            // every primitive whose glTF material name contains one of these, matched
+            // case-insensitively. Asset-store models routinely bundle a ground plane
+            // or studio backdrop into the same file as the subject, and there is no
+            // way to subtract geometry after loading. NOTE: list several by repeating
+            // the statement or comma-joining them — a space-separated `a b` would be
+            // split into a separate statement by the parser (see wordListOf).
+            std::vector<std::string> skipMats = wordListOf(b, "skip_material");
             std::string gerr;
-            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
+            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats) == 0
+                && !gerr.empty()) {
                 fail("mesh: " + gerr); return false;
             }
         } else if (ext == ".fbx") {
@@ -4073,7 +4106,7 @@ private:
 
     // ---- mesh_asset (shared instanced geometry) ----
     // `mesh_asset "name" { file "asset.obj|gltf|glb"  material <m>  [import_materials no]
-    //  [uv use_mesh]  [usemtl use_names] }` loads a mesh ONCE into its own local
+    //  [skip_material <substr>[,…]]  [uv use_mesh]  [usemtl use_names] }` loads a mesh ONCE into its own local
     //  (authored) space as a BLAS (Scene::blasList). It bakes NO world transform and
     //  emits NO triangles into Scene::tris — placement is done by `mesh_instance`,
     //  which references the asset by name. Multiple instances share this one BLAS,
@@ -4104,7 +4137,9 @@ private:
         if (ext == ".gltf" || ext == ".glb") {
             bool importMats = (strOf(b, "import_materials") != "no");
             std::string gerr;
-            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
+            std::vector<std::string> skipMats = wordListOf(b, "skip_material");  // see the mesh block
+            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats) == 0
+                && !gerr.empty()) {
                 fail("mesh_asset: " + gerr); return false;
             }
         } else if (ext == ".fbx") {
