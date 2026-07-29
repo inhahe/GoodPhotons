@@ -1096,6 +1096,49 @@ per-unit RNG seeding (above) plus order-independent accumulation per band/tile;
 film merges are structured so paired runs differ only by summation-order ulps at
 worst (mode R) or are bit-identical (fixed splits).
 
+## Stopping a render (`g_stopRequested`, `-stop`)
+
+One flag drives every clean stop: `g_stopRequested` (`main.cpp`). It is raised by the
+first Ctrl-C (a second restores `SIG_DFL` and force-quits), by the live window being
+closed, and — since 0.99.0 — by an **external** `-stop`. Every render loop polls it at a
+chunk/frame boundary and, on seeing it, writes the final image + `.ftbuf` checkpoint and
+returns normally, so the process unwinds through `cudaGracefulShutdown()`.
+
+That last exit path is the point of the whole mechanism: **force-killing ftrace while
+CUDA kernels are in flight can wedge the NVIDIA driver into a TDR/bugcheck**, so nothing
+in this project may be stopped with `taskkill /F`.
+
+`-stop` supplies the trigger a detached render (no console to Ctrl-C into) previously
+lacked. It is a **sentinel file** under `<temp>/ftrace/`, not a named kernel event,
+because renders run in the interactive Console session while the shell signalling them
+may be in a different session / window station (the same split that makes `-window`
+invisible under a sandboxed shell) and `Local\` objects are per-session.
+
+- `<pid>.run` — published by `stopChannelStart()` for the whole process lifetime
+  (including the `-keepwindow` hold), holding a `scene -> output` line; removed by
+  `stopChannelEnd()`. A stale one left by a hard kill is reaped by the next `-stop`,
+  which probes the pid first.
+- `<pid>.stop` — written by `ftrace -stop <pid>`; a 250 ms watcher thread in the target
+  consumes it once, sets `g_extStopRequested` **and** `g_stopRequested`, then exits.
+- `g_extStopRequested` is separate from `g_stopRequested` because the latter is cleared
+  per frame by the `-serve` loop; an external stop means "shut the process down", so it
+  must survive that clear — and it also breaks the `-keepwindow` hold.
+
+`-stop all` targets every live render, a bare `-stop` lists them, and both wait (≤120 s)
+for the targets to actually exit so a rebuild can be scripted immediately after.
+
+## GPU support gates fail safe, never coerce
+
+`cudaForwardSupported()` (`render_cuda.cu`) is the single gatekeeper — all eight GPU
+gates chain to it — and the rule it enforces is that anything the device kernels cannot
+do sends the scene to the CPU tracer. Host→device enum mappings must therefore be
+**closed whitelists shared with the upload**, not open ternary chains with a default
+arm: `deviceEmitterShapeCode()` is the model (a `switch` with no `default`, so a new
+enumerator trips MSVC C4062, plus a `-1` runtime fail-safe). Silently coercing an
+unrecognised value into some other device code hands a kernel malformed geometry, and
+malformed geometry inside a kernel does not fail cleanly — it can fault the display
+driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
+
 ## Benchmarks & perf discipline
 
 - `scraps/bench.py` — 19 standard configs (13 CPU + 6 GPU; cornell + gallery

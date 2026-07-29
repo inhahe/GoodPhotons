@@ -129,6 +129,7 @@
 #include <map>
 #include <set>
 #include <memory>
+#include <atomic>              // -stop: cross-thread flags for the external stop channel
 #include <filesystem>          // -review: scan a directory of rendered frames
 #include "scene.h"
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
@@ -2988,6 +2989,188 @@ static void onInterrupt(int sig) {
     g_stopRequested = 1;
 }
 
+// --- External graceful stop (`ftrace -stop [<pid>|all]`) -----------------------
+// Ctrl-C only reaches a render that owns the console it was started from. A render
+// launched detached, or from a tool that isn't its parent, previously had no way to
+// be stopped except `taskkill /F` -- and killing ftrace while CUDA kernels are in
+// flight is a well-known way to wedge the NVIDIA display driver (TDR / bugcheck).
+// "Just kill it" is therefore not an acceptable stop for this program. This channel
+// delivers the exact same CLEAN stop Ctrl-C delivers -- finish the current chunk,
+// write the final image + .ftbuf checkpoint, unwind through cudaGracefulShutdown()
+// -- but triggerable from outside the process.
+//
+// The channel is a sentinel FILE, deliberately, rather than a named event or socket:
+// renders run in the interactive Console session while whatever wants to stop them
+// may live in a different session / window station (the same split that makes
+// -window invisible when launched from a sandboxed shell), and `Local\` kernel
+// objects are per-session. The filesystem is the one namespace both sides share.
+//
+//   <temp>/ftrace/<pid>.run    exists while this process runs; holds a one-line
+//                              "scene -> output" description. `-stop` with no
+//                              argument lists these, `-stop all` targets them all.
+//                              Removed on exit; one left behind by a hard kill is
+//                              reaped by the next -stop (the pid is probed first).
+//   <temp>/ftrace/<pid>.stop   created by `ftrace -stop <pid>`. The target's watcher
+//                              thread sees it within ~250 ms, deletes it, and raises
+//                              the very same g_stopRequested flag Ctrl-C raises.
+//                              Nothing is force-killed, ever.
+static std::atomic<bool>     g_extStopRequested{false};  // also breaks the -keepwindow hold
+static std::atomic<bool>     g_stopWatchQuit{false};
+static std::thread           g_stopWatchThread;
+static std::filesystem::path g_stopRunFile, g_stopSentinelFile;
+
+// <temp>/ftrace, created on demand. Empty path = no usable temp dir (channel disabled).
+static std::filesystem::path stopChannelDir() {
+    std::error_code ec;
+    std::filesystem::path d = std::filesystem::temp_directory_path(ec);
+    if (ec) return {};
+    d /= "ftrace";
+    std::filesystem::create_directories(d, ec);
+    return ec ? std::filesystem::path{} : d;
+}
+
+static long ftraceCurrentPid() {
+#ifdef _WIN32
+    return (long)GetCurrentProcessId();
+#else
+    return (long)getpid();
+#endif
+}
+
+// Is that pid still alive? Only used to reap a .run file whose owner died hard, so a
+// conservative "yes" off Windows just means stale entries linger in the -stop listing.
+static bool ftraceProcessAlive(long pid) {
+#ifdef _WIN32
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+    if (!h) return false;                                   // gone (or not ours to touch)
+    bool alive = (WaitForSingleObject(h, 0) == WAIT_TIMEOUT);
+    CloseHandle(h);
+    return alive;
+#else
+    (void)pid; return true;
+#endif
+}
+
+// Publish this process in the stop channel and start watching for its sentinel.
+static void stopChannelStart(const std::string& what) {
+    std::filesystem::path dir = stopChannelDir();
+    if (dir.empty()) return;                     // no temp dir: run without the channel
+    const long pid = ftraceCurrentPid();
+    g_stopRunFile      = dir / (std::to_string(pid) + ".run");
+    g_stopSentinelFile = dir / (std::to_string(pid) + ".stop");
+    std::error_code ec;
+    // A sentinel already sitting here belongs to a dead process whose pid we've been
+    // recycled into; clear it so we don't stop the instant we start.
+    std::filesystem::remove(g_stopSentinelFile, ec);
+    { std::ofstream f(g_stopRunFile); f << what << "\n"; }
+    g_stopWatchQuit.store(false);
+    g_stopWatchThread = std::thread([] {
+        while (!g_stopWatchQuit.load(std::memory_order_relaxed)) {
+            std::error_code e;
+            if (std::filesystem::exists(g_stopSentinelFile, e)) {
+                std::filesystem::remove(g_stopSentinelFile, e);
+                // Deliberately true whether a render is in flight (finish the chunk, write,
+                // exit) or the process is just holding a -keepwindow preview open.
+                std::printf("\n[stop] external stop requested — stopping cleanly "
+                            "(any render in progress writes its image + checkpoint first).\n");
+                std::fflush(stdout);
+                g_extStopRequested.store(true);
+                g_stopRequested = 1;   // the one flag every render loop already polls
+                return;                // one-shot: never re-arm behind a later frame
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    });
+}
+
+static void stopChannelEnd() {
+    g_stopWatchQuit.store(true);
+    if (g_stopWatchThread.joinable()) g_stopWatchThread.join();
+    std::error_code ec;
+    if (!g_stopRunFile.empty()) std::filesystem::remove(g_stopRunFile, ec);
+}
+
+// `ftrace -stop [<pid>|all]`: list running renders, or ask one/all of them to finish
+// cleanly. Never loads a scene, never touches the GPU; returns a process exit code.
+static int runStopCommand(const char* who) {
+    std::filesystem::path dir = stopChannelDir();
+    if (dir.empty()) {
+        std::fprintf(stderr, "error: -stop cannot reach the ftrace stop-channel directory\n");
+        return 1;
+    }
+    // Every live render, reaping .run files whose owner is gone (hard kill / crash).
+    std::vector<std::pair<long, std::string>> live;
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+        if (de.path().extension() != ".run") continue;
+        const long pid = std::strtol(de.path().stem().string().c_str(), nullptr, 10);
+        if (pid <= 0) continue;
+        if (!ftraceProcessAlive(pid)) { std::filesystem::remove(de.path(), ec); continue; }
+        std::string what;
+        { std::ifstream f(de.path()); std::getline(f, what); }
+        live.emplace_back(pid, what);
+    }
+    std::sort(live.begin(), live.end());
+
+    if (!who) {                                   // bare -stop: just list what's running
+        if (live.empty()) { std::printf("[stop] no ftrace renders are running.\n"); return 0; }
+        std::printf("[stop] running renders — stop one with `ftrace -stop <pid>`, "
+                    "all with `ftrace -stop all`:\n");
+        for (const auto& p : live) std::printf("    pid %-7ld %s\n", p.first, p.second.c_str());
+        return 0;
+    }
+
+    std::vector<long> targets;
+    if (!std::strcmp(who, "all")) {
+        for (const auto& p : live) targets.push_back(p.first);
+        if (targets.empty()) { std::printf("[stop] no ftrace renders are running.\n"); return 0; }
+    } else {
+        char* end = nullptr;
+        const long pid = std::strtol(who, &end, 10);
+        if (!end || *end || pid <= 0) {
+            std::fprintf(stderr, "error: -stop takes a pid or 'all' (got \"%s\")\n", who);
+            return 1;
+        }
+        bool known = false;
+        for (const auto& p : live) if (p.first == pid) known = true;
+        if (!known)
+            std::printf("[stop] warning: pid %ld isn't a running ftrace render "
+                        "(dropping the sentinel anyway)\n", pid);
+        targets.push_back(pid);
+    }
+
+    for (long pid : targets) {
+        const std::filesystem::path s = dir / (std::to_string(pid) + ".stop");
+        std::ofstream f(s);
+        if (!f) { std::fprintf(stderr, "error: cannot write %s\n", s.string().c_str()); return 1; }
+        f << "stop\n";
+        std::printf("[stop] asked pid %ld to finish and exit cleanly.\n", pid);
+    }
+    std::fflush(stdout);
+
+    // Wait for them to actually go. A render only notices at a chunk boundary and then
+    // still has to write its image + checkpoint, so this can legitimately take up to
+    // one -interval (default 15 s) plus the write; give it a generous ceiling and say
+    // so rather than leaving the caller guessing whether the stop took.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    std::vector<long> pending = targets;
+    while (!pending.empty() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        std::vector<long> still;
+        for (long pid : pending)
+            if (ftraceProcessAlive(pid) &&
+                std::filesystem::exists(dir / (std::to_string(pid) + ".run"), ec))
+                still.push_back(pid);
+        pending.swap(still);
+    }
+    if (pending.empty()) { std::printf("[stop] done — stopped cleanly.\n"); return 0; }
+    std::printf("[stop] still running after 120s:");
+    for (long pid : pending) std::printf(" %ld", pid);
+    std::printf("\n[stop] it may be mid-write, or in a long non-chunked batch "
+                "(a bare -n render with no -window/-time/-noise budget writes only at the end).\n");
+    return 2;
+}
+
 // --- Live preview window (-window) --------------------------------------------
 // When enabled, the render drivers periodically push the current tone-mapped frame
 // to a real OS window (Win32 GDI; no-op stub off Windows) so the image is watched as
@@ -4909,6 +5092,9 @@ static void printHelp(const char* prog) {
 "  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C)\n"
 "  -resume               continue an accumulated render from its .ftbuf checkpoint\n"
 "  -parseonly            load the scene, print a contents summary, exit (no render)\n"
+"  -stop [<pid>|all]     ask a RUNNING ftrace to finish cleanly (image + checkpoint\n"
+"                        written, CUDA torn down) instead of killing it; bare -stop\n"
+"                        lists running renders. Never force-kill a CUDA render.\n"
 "\n"
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
@@ -8847,6 +9033,9 @@ static int runServe(int argc, char** argv, int inValPos) {
         // storage for the duration of this run() call.
         pathBuf = line;
         argv[inValPos] = const_cast<char*>(pathBuf.c_str());
+        // An EXTERNAL stop (-stop) means "shut this process down", not "abandon this
+        // frame", so it must not be cleared and re-entered like a per-frame Ctrl-C.
+        if (g_extStopRequested.load()) break;
         g_stopRequested = 0;   // clear any prior clean-stop request before the new frame
         try {
             rc = run(argc, argv);
@@ -8867,6 +9056,14 @@ static int runServe(int argc, char** argv, int inValPos) {
 // spectral-library resolver) into a clean message + non-zero exit, instead of a
 // silent fall-through to a default illuminant that would render the wrong thing.
 int main(int argc, char** argv) {
+    // `-stop [<pid>|all]`: talk to ALREADY-RUNNING renders and exit. Handled before
+    // anything else so it works from a bare command line -- it loads no scene, opens
+    // no window and creates no CUDA context, so there is nothing here to tear down.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "-stop") && std::strcmp(argv[i], "--stop")) continue;
+        const char* who = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : nullptr;
+        return runStopCommand(who);
+    }
     // Tear the CUDA context down synchronously, in-process, on EVERY exit path (normal
     // return or exception). Leaving it for the driver to reclaim implicitly after main()
     // returns triggers an asynchronous nvlddmkm DPC teardown that, on buggy driver
@@ -8924,6 +9121,19 @@ int main(int argc, char** argv) {
             if (!std::strcmp(argv[i], "-serve")) serve = true;
             else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) inValPos = i + 1;
         }
+        // Publish this render in the stop channel (see `-stop` above) so it can be asked
+        // to finish cleanly from outside, and keep the watcher alive across the whole
+        // run INCLUDING the -keepwindow hold below. stopChannelEnd() unpublishes it on
+        // every exit path, normal or exceptional.
+        {
+            const char* inPath = nullptr; const char* outPath = nullptr;
+            for (int i = 1; i < argc; ++i) {
+                if (!std::strcmp(argv[i], "-in") && i + 1 < argc)      inPath  = argv[i + 1];
+                else if (!std::strcmp(argv[i], "-o") && i + 1 < argc)  outPath = argv[i + 1];
+            }
+            stopChannelStart(std::string(inPath ? inPath : "(no -in)") + " -> " +
+                             (outPath ? outPath : "(default output)"));
+        }
         rc = serve ? runServe(argc, argv, inValPos) : run(argc, argv);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
@@ -8932,12 +9142,18 @@ int main(int argc, char** argv) {
     // -keepwindow / -hold: keep the finished image on screen. The live window runs its
     // own UI thread, so we just block here until the user closes it (or it's already gone)
     // rather than letting process exit tear it down the instant the render completes.
-    if (g_keepWindow && g_liveWin && !g_liveWin->closed()) {
-        std::printf("[window] render done — close the preview window to exit.\n");
+    // (An external -stop means "exit now", so it skips the hold entirely rather than
+    // announcing a wait it's about to break out of.)
+    if (g_keepWindow && g_liveWin && !g_liveWin->closed() && !g_extStopRequested.load()) {
+        std::printf("[window] render done — close the preview window to exit "
+                    "(or run: ftrace -stop %ld).\n", ftraceCurrentPid());
         std::fflush(stdout);
-        while (!g_liveWin->closed())
+        // The hold ends on the window closing OR on an external -stop, so a held window
+        // on an unattended machine is never a reason to reach for taskkill.
+        while (!g_liveWin->closed() && !g_extStopRequested.load())
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+    stopChannelEnd();
 #ifdef HAVE_CUDA
     cudaGracefulShutdown();
 #endif

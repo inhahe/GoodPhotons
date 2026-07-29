@@ -5,6 +5,93 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — OPEN (2026-07-28): `-max-bounce` is silently ignored by mode D (BDPT) and mode U (VCM)
+
+`-max-bounce N` parses fine (`main.cpp:5360`, stored in `g_maxBounceOverride` at 2502) and is
+honoured by the unidirectional/forward paths (2674 / 2733 / 2777), but the bidirectional modes
+never read it: mode D hard-codes `int maxDepth = 8;` at `main.cpp:4078` and mode U the same at
+`main.cpp:4233`. On the GPU the bound is baked in harder still — `#define BDPT_MAXDEPTH 8` /
+`BDPT_MAXV (BDPT_MAXDEPTH+3)` at `render_cuda.cu:5242`, used to size the *per-thread* stack
+arrays `DVertex eye[BDPT_MAXV], light[BDPT_MAXV]` in `kBdptT<NS>` (7778-79), with a clamp at
+10722. So `ftrace -mode D -max-bounce 64` renders at depth 8 and prints `maxDepth=8` without
+any diagnostic.
+
+Repro: `ftrace -in scenes/silver_sphere_xenon.ftsl -mode D -max-bounce 64 -n 16` and read the
+`maxDepth=` field of the startup line. (Measured impact on that scene: mode R at cap 8 vs 64 is
+only ~2x, so this is a correctness/UX bug, not the cause of any particular dark render.)
+
+Proper fix: `kBdptT` is *already* templated on `NS`, so template it on the depth bound as well
+and thread `maxV` through `dRandomWalk` / `dGenCameraSubpath` / `dGenLightSubpath` instead of
+reading the `#define`. Instantiate a deep variant only when `-max-bounce` asks for it, so the
+default launch keeps its current local-memory footprint (the stack arrays are the whole reason
+the constant is baked in). At minimum, until that lands, `main.cpp` should *warn* when
+`g_maxBounceOverride` is set in a mode that cannot honour it, rather than silently dropping it.
+
+### BUG — OPEN (2026-07-28): `light env { spd ... intensity N }` silently ignores `intensity`
+
+In `ftsl.h` (~4563-4573) the env-light block parses `intensity` but only applies it on the
+`file`-based (image env map) path; the analytic-SPD path calls `addEnvLight(spd, binWidth_)`
+and drops the scale on the floor. An authored `intensity 40` therefore changes nothing, with no
+warning. Proper fix: scale the spectrum by `intensity` (or pass it through to `addEnvLight`) on
+the SPD path too, so both forms of `light env` mean the same thing.
+
+### TECH-DEBT / DOC — OPEN (2026-07-28): a field leaf's `center` is applied *before* its `rotate`
+
+`addFieldLeaf` composes the leaf transform as `authoredXf . TRS(center)`, i.e. `center` sits on
+the *inside*. So `cylinder { center 0 -0.169 0.363   rotate 115 0 0  ... }` does **not** place a
+cylinder at that point and then tilt it in place — it offsets first and the subsequent rotation
+swings the whole thing onto a completely different axis. Authors have to use `translate` (read
+in `fieldXf`, applied *after*) to get the intuitive "put it here, then tilt it" behaviour. This
+cost real debugging time on `scenes/silver_sphere_xenon.ftsl` (see the comment above the port
+cylinder there).
+
+It is arguably not a bug — `center` is a leaf-local parameter, and reversing it now would break
+existing scenes — but it is undocumented and surprising. Fix: document the composition order in
+the FTSL reference next to `center` / `translate` / `rotate`, and say plainly that
+`center` + `rotate` on the same leaf is almost never what the author means.
+
+### BUG — DONE (2026-07-28, v0.99.0): the CUDA emitter upload silently coerced any unknown `EmitterShape` into a zeroed-basis Quad
+
+`buildUploadScene` in `render_cuda.cu` mapped the host `EmitterShape` to `DEmitter::shape`
+with an **open** ternary chain ending in `: 0` — "anything I don't recognise is a Quad" — and
+`cudaForwardSupported()` had **no emitter-shape check at all**. So a shape added host-side
+before the device kernels grew a branch for it did not fall back to the CPU and did not
+error: it reached the kernel as a Quad whose `origin`/`u`/`v` basis was garbage. Malformed
+geometry inside a kernel does not fail cleanly — it can fault the display driver and take the
+machine down (this is the class of failure the `teardownLog` / BSOD instrumentation at
+`render_cuda.cu:9440` was added for). A second, live instance of the same hazard: a `Mesh`
+emitter with an **empty** triangle list got `shape = 5` with `meshTris == nullptr`, and the
+device sampler's shape-5 branch clamps to index `-1` and dereferences it unconditionally.
+
+Fixed by `deviceEmitterShapeCode()` (`render_cuda.cu`, just above `cudaForwardSupported`): one
+**closed whitelist** shared by the support gate and the upload, so the two cannot drift. It is
+a `switch` over every enumerator with **no `default`**, so adding an `EmitterShape` now raises
+MSVC C4062 at compile time; `-1` after the switch is the runtime fail-safe. `cudaForwardSupported`
+rejects any unimplemented shape (and any empty-triangle `Mesh`) so the scene renders on the CPU —
+and since all eight GPU gates (`cudaBdptSupported`, `cudaBackwardSupported`, `cudaBackwardRGBSupported`,
+`cudaIsoPreviewSupported`, `cudaPhotonMapSupported`, `cudaSppmSupported`, `cudaVcmSupported`)
+chain to it, one guard covers every GPU entry point. The upload keeps a loud `stderr` diagnostic
++ dead-emitter fallback should the gate and the upload ever disagree.
+
+Verified: `scraps/mesh_light.ftsl` renders identically on `-device cpu` and `-device gpu`
+(absorbed 0.6591 vs 0.6588; mean |Δ| 1.9/255, pure MC noise).
+
+### FEATURE — DONE (2026-07-28, v0.99.0): `ftrace -stop <pid>|all` — never force-kill a CUDA render again
+
+Related to the above, and the other half of the same incident: force-killing ftrace mid-CUDA
+(`taskkill /F`, e.g. because a `-keepwindow` preview was holding the exe open and blocking a
+rebuild) is a well-known way to wedge the NVIDIA driver into a TDR/bugcheck. ftrace's *graceful*
+stop already existed end to end — `g_stopRequested`, the SIGINT/SIGBREAK handlers, the poll sites
+in every render loop, the final image + `.ftbuf` write — but it could only be triggered by Ctrl-C
+from the owning console, which a detached render doesn't have.
+
+`-stop` adds the missing external trigger: a sentinel file under `<temp>/ftrace/` (`<pid>.run`
+published per live render, `<pid>.stop` to signal one), polled by a 250 ms watcher thread that
+raises the *same* `g_stopRequested`. A file rather than a named event because renders run in the
+interactive Console session while the shell signalling them may be in another session/window
+station, and `Local\` kernel objects are per-session. `-stop` also releases a `-keepwindow` hold,
+and waits (≤120 s) for the target to actually exit so a rebuild can be scripted right after.
+
 ### BUG + TECH-DEBT — DONE for the mesh pane (2026-07-28, v0.96.0): the loom viewer's 3-D panes were a CPU painter's-algorithm sort, not a z-buffer — on a D3D11 device that was already running
 
 `viewer_gui.cpp`'s mesh pane collected every triangle across every mesh, CPU-projected it,

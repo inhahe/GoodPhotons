@@ -9447,6 +9447,37 @@ void cudaGracefulShutdown() {
     teardownLog("cuda: cudaDeviceReset returned");
 }
 
+// --- Emitter shapes the device kernels actually implement ----------------------
+// Single source of truth for the host EmitterShape -> DEmitter::shape mapping, shared
+// by BOTH the support gate below and the DEmitter upload, so the two can never drift.
+// Returns the device shape code, or -1 for a shape the device has no branch for.
+//
+// This is deliberately a CLOSED whitelist that fails SAFE: a shape the kernels don't
+// implement sends the scene to the CPU tracer instead of being coerced into a
+// different shape. It replaces a ternary chain in the upload that ended in `: 0` --
+// "anything I don't recognise is a Quad" -- so a shape added host-side but not yet
+// implemented device-side would reach the kernel as a Quad with a garbage (typically
+// all-zero) origin/u/v basis. Malformed geometry inside a kernel does not fail cleanly:
+// an out-of-range/degenerate sample can fault the display driver and take the whole
+// machine down with it (see the teardown/BSOD logging above), so the mapping must be
+// exhaustive by construction rather than by convention.
+//
+// The switch lists every enumerator and has NO default, so ADDING a new EmitterShape
+// raises a compiler warning here (MSVC C4062) rather than silently falling through;
+// the `return -1` after it is the fail-safe should one slip past anyway.
+static int deviceEmitterShapeCode(EmitterShape s) {
+    switch (s) {
+        case EmitterShape::Quad:     return 0;
+        case EmitterShape::Sphere:   return 1;
+        case EmitterShape::Spot:     return 2;
+        case EmitterShape::Env:      return 3;
+        case EmitterShape::Cylinder: return 4;
+        case EmitterShape::Mesh:     return 5;
+        case EmitterShape::Sun:      return 6;
+    }
+    return -1;   // unknown / newly-added shape: CPU fallback, never a silent coercion
+}
+
 bool cudaForwardSupported(const Scene& scene) {
     // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
     // device too (DImplicit + intersectImplicit); their materials are checked by the
@@ -9549,6 +9580,18 @@ bool cudaForwardSupported(const Scene& scene) {
     // parallel-beam birth branch over the scene cross-section, bkEmitterGeom/bkNeeLight/
     // bkNeeVolume/bkNeeLightRGB do the cone NEE, and the ray-miss paths add the directly-
     // viewed solar disc under the same `specularArrival` gate as the CPU tracer.
+    // Emitter shapes: a shape the device kernels have no branch for must send the scene to
+    // the CPU tracer rather than be coerced into a different shape at upload time. Handing
+    // a kernel an emitter with a zeroed origin/u/v basis does not fail cleanly -- it can
+    // fault the display driver -- so this gate is the safety net for every GPU mode (all
+    // the other *Supported() gates chain to this one).
+    // A Mesh emitter additionally REQUIRES a non-empty triangle CDF: the device sampler's
+    // shape==5 branch indexes em.meshTris unconditionally, and with meshTriN==0 it clamps
+    // to index -1 on a null pointer. Degenerate/empty mesh lights therefore go to the CPU.
+    for (const auto& e : scene.emitters) {
+        if (deviceEmitterShapeCode(e.shape) < 0) return false;
+        if (e.shape == EmitterShape::Mesh && e.meshTris.empty()) return false;
+    }
     return true;
 }
 
@@ -9960,12 +10003,21 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.beamDir = {e.beamDir.x, e.beamDir.y, e.beamDir.z};
         de.area = e.area; de.power = e.power;
         de.collimated = e.collimated ? 1 : 0;
-        de.shape = (e.shape == EmitterShape::Sphere)   ? 1
-                 : (e.shape == EmitterShape::Spot)     ? 2
-                 : (e.shape == EmitterShape::Env)      ? 3
-                 : (e.shape == EmitterShape::Cylinder) ? 4
-                 : (e.shape == EmitterShape::Mesh)     ? 5
-                 : (e.shape == EmitterShape::Sun)      ? 6 : 0;
+        // Shared whitelist (see deviceEmitterShapeCode) -- NEVER coerce an unknown shape to
+        // a Quad here. cudaForwardSupported() already rejects such a scene, so reaching this
+        // branch means the gate and the upload have drifted apart: say so loudly and emit a
+        // dead emitter (zero power/area, so it is never selected) instead of feeding the
+        // kernel a zeroed-basis Quad that could fault the display driver.
+        int shapeCode = deviceEmitterShapeCode(e.shape);
+        if (shapeCode < 0) {
+            std::fprintf(stderr,
+                "[cuda] INTERNAL: emitter shape %d has no device implementation; "
+                "disabling this emitter (the GPU support gate should have prevented this)\n",
+                (int)e.shape);
+            shapeCode = 0;
+            de.area = 0.0; de.power = 0.0;
+        }
+        de.shape = shapeCode;
         de.radius = e.radius;
         de.caps = e.caps ? 1 : 0;
         // Mesh area light: upload this emitter's triangle CDF to the device and point the
@@ -9989,6 +10041,15 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             }
             de.meshTris = (const DEmitTri*)keep(uploadVec(dtris));
             de.meshTriN = (int)dtris.size();
+        }
+        // Same fail-safe for the other half of the mesh contract: shape 5 with no triangles
+        // would have the device sampler clamp to index -1 on a null pointer. The gate above
+        // rejects such a scene, so this only fires if the two ever drift apart.
+        if (de.shape == 5 && de.meshTriN == 0) {
+            std::fprintf(stderr,
+                "[cuda] INTERNAL: mesh emitter has no triangles; disabling it "
+                "(the GPU support gate should have prevented this)\n");
+            de.shape = 0; de.area = 0.0; de.power = 0.0;
         }
         de.spotCosInner = e.spotCosInner; de.spotCosOuter = e.spotCosOuter;
         de.spotOmega = e.spotOmega;
