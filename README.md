@@ -1908,6 +1908,18 @@ or a native-primitive wrap — see below). Two authoring forms:
   site — evaluated before the tables are visible — remains a compile error. Worked example
   `scenes/grid_field.ftsl` (a 5×5 lattice as an isosurface height field, plus a 1-D
   profile as a medium's density).
+  A table sample is finally legal **at a value site directly**, with no `pattern` wrapper
+  to write: `reflect grid:ramp(u)`, `roughness scatter:probe(u,v)`. The slot takes the
+  sample exactly as if you had written the one-line `pattern { expr "grid:ramp(u)" }` and
+  pasted its name in, so every per-hit slot that accepts `pattern:<name>` accepts a table
+  call too, and the coordinates are ordinary expressions — including a composed array
+  literal, `reflect grid:ramp([0.2 0.8](u))`. The **scoped** spelling is the one that
+  works: a bare `ramp(u)` at a value site already means "apply the material `ramp`, with
+  `u` bound to its formal" (see material bundles), so only `grid:` / `scatter:` name a
+  table unambiguously. The call is required — `reflect grid:ramp` says which table but
+  not *where* to read it, and is a load error that shows you the `(u)` to add — and a
+  **load-time constant** slot (`film_ior`, a fixed `ior`) still refuses a per-hit value,
+  naming the slots that can take one.
 - **Inline array literal** — a tiny table written *where it is used*, with no block, no
   name and no `pattern` wrapper: `roughness [0.05 0.4 0.05](u)`. The `[ … ]` is the data
   and **nesting is the shape** (axis 0 outermost, C order, as in a `grid`'s `data`), so a

@@ -539,6 +539,36 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   typed `ftsl.epeg` — so loom's 1255-test suite is the regression check that the shared
   grammar tooling still round-trips.
 
+  **A table call is a value in its own right** (`reflect grid:ramp(u)`, 0.101.0). TODO.md's
+  increment-2 `Deferred:` clause claimed `NAME axistuple` "needs no work because ftrace's
+  expression evaluator already reads `name(args)` as a call" — true *inside* a pattern
+  expression, but a **value site is not an expression site**, and the slot readers only ever
+  recognised `pattern:<name>` there, so `reflect grid:ramp(u)` was an "unrecognized spectrum
+  expression". Closing it hooks the same four chokepoints v0.89.0 used for
+  `MATERIAL.slot(args)`: `bindScalarPattern` and `patternedSpectrumParam` (the two per-hit
+  readers) route a `grid:` / `scatter:` head through `Builder::tableCallPattern`, which
+  compiles the token with the ordinary `compilePatternExpr` and appends the result to
+  `scene.patterns` — the slot ends up holding exactly the index a hand-written one-line
+  `pattern { expr "grid:ramp(u)" }` would have produced, so there is no second evaluation
+  path to keep in step. `dblParam` and `evalSpectrum` are the load-time-constant readers and
+  **refuse**, each naming the slots that can take a per-hit value.
+
+  Two consequences are worth recording. First, **only the scoped spelling is accepted**: a
+  bare `ramp(u)` at a value site already means the §7.6 material-bundle application, so
+  accepting it for tables would make a scene's meaning depend on which namespace happens to
+  hold the name — `isTableCallHead` therefore tests for the `grid:` / `scatter:` prefix and
+  nothing else, and a call-less `grid:ramp` is a refusal that prints the `(u)` to add rather
+  than a silent constant. Second, a table call's coordinates are expressions like any other,
+  so a **composed array literal** must work inside one (`grid:ramp([0.2 0.8](u))`).
+  `Builder::desugarTableCall` reuses `desugarNestedLiterals` on the token before it is
+  compiled, and `desugarArrays`' visit loop dispatches to it on the cheap
+  `isTableCallHead && contains('[')` test so a scene with no literals pays nothing. That in
+  turn needed the *second* grammar change: a **named** table's call lexes as a `WORD`, not a
+  `PARENWORD`, so `WORD`'s balanced-group alternative had to be widened to
+  character-for-character `PARENWORD`'s body, brackets included. Only the group *interior*
+  admits them — `WORD`'s fallback class still excludes `[` / `]`, so a bracket outside parens
+  is a delimiter exactly as before and `REC.chan[2]` still stops the word at the `[`.
+
   **Generated blocks are re-attributed.** `desugarArrays` mints `grid`/`pattern` blocks the
   author never named, so `Builder::genSite_` maps `__arrN` back to the authoring site and
   `genWho()` is used wherever those blocks can fail. A message about `pattern '__arr3'`

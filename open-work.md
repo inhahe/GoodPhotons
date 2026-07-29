@@ -5,7 +5,7 @@ long prose blocks whose opening paragraph reads like a plan but whose later
 `**STATUS (date) … DONE**` sub-paragraph says it landed. That makes "what's actually left?"
 expensive to answer.
 
-**This file is the actionable extract, as of 2026-07-28 (ftrace v0.100.0).** It carries only
+**This file is the actionable extract, as of 2026-07-28 (ftrace v0.101.0).** It carries only
 work that is genuinely undone *and* not explicitly ruled out. `TODO.md` remains the
 authoritative design text — every item below names its section/item ID there, and the full
 rationale, prior art and scoping live in that entry, not here.
@@ -60,18 +60,23 @@ wrapper), since `grid:__arrN(coords)` is already a legal expression term. Bracke
 captured but not balance-checked by the lexer, so the loader re-parses the argument text and reports
 a malformed inner literal against the author's source. Pinned by `-checkarray` section (h).
 
-### `NAME axistuple` at a value site — `reflect grid:ramp(u)`  *(ftrace; small)*
-*Discovered 2026-07-28. Corrects a wrong claim in TODO.md's increment-2 `Deferred:` clause.*
+### ~~`NAME axistuple` at a value site — `reflect grid:ramp(u)`~~  **DONE 2026-07-28 (v0.101.0)**
+*Corrected a wrong claim in TODO.md's increment-2 `Deferred:` clause — now closed by that
+section's table-call STATUS block.*
 
-That clause says `NAME axistuple` "needs no work because ftrace's expression evaluator already
-reads `name(args)` as a call". True *inside* a pattern expression — but a **value site** is not an
-expression site, and `reflect grid:ramp(u)` is "unrecognized spectrum expression". The form works
-only where the name is a material or material property (`gold(u=v)`, `src.reflect(u=v)`), because
-those go through `applyMaterial`. Closing the gap means hooking the same four chokepoints v0.89.0
-used for `MATERIAL.slot(args)` (`evalSpectrum`, `patternedSpectrumParam`, `dblParam`,
-`bindScalarPattern`); a bare `ramp(u)` must keep meaning a material application, so the scoped
-`grid:` / `scatter:` spelling is the unambiguous one to accept. Workaround: declare the one-line
-`pattern` wrapper by hand, which is exactly what an array literal desugars to.
+A **value site is not an expression site**: the slot readers only recognised `pattern:<name>`, so
+`reflect grid:ramp(u)` was "unrecognized spectrum expression". The two per-hit readers
+(`bindScalarPattern`, `patternedSpectrumParam`) now route a `grid:` / `scatter:` head through
+`Builder::tableCallPattern`, which compiles it with the ordinary `compilePatternExpr` and appends
+to `scene.patterns` — the slot holds exactly the index a hand-written one-line `pattern` wrapper
+would have produced. The two load-time-constant readers (`dblParam`, `evalSpectrum`) refuse,
+naming the slots that can take a per-hit value. Only the **scoped** spelling is accepted, since a
+bare `ramp(u)` already means a material-bundle application; a call-less `grid:ramp` is refused with
+the `(u)` to add. A composed array literal works inside a table call too
+(`grid:ramp([0.2 0.8](u))`), which needed `WORD`'s balanced-group alternative widened to match
+`PARENWORD`'s body. Pinned by `-checkarray` section (i).
+
+**Section 1 is now empty of actionable ftrace items.**
 
 ---
 

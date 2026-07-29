@@ -87,7 +87,15 @@ KVWORD  = /[^ \t\r\n{}\[\]#"=]+=[^ \t\r\n{}\[\]#"]*/
 # every token that lexed before still lexes identically — the group alternative can only
 # ever EXTEND a token across a space that sits inside parens, which previously truncated
 # the value mid-expression and raised "missing ')'".
-WORD    = /(?:\((?:[^\r\n(){}\[\]#"]|\((?:[^\r\n(){}\[\]#"]|\((?:[^\r\n(){}\[\]#"]|\([^\r\n(){}\[\]#"]*\))*\))*\))*\)|[^ \t\r\n{}\[\]#"])+/
+#
+# The group alternative is now character-for-character PARENWORD's body, brackets included
+# (0.100.0), so a NAMED table's sample call can carry a composed array literal exactly as an
+# inline literal's can: `reflect grid:ramp([0.2 0.8](u))`.  Only the group interior admits
+# `[` / `]` — the fallback class below still excludes them, so a bracket OUTSIDE parens is
+# a delimiter as it always was, and `REC.chan[2]` still stops the word at the `[`.  Two
+# tokens on one line cannot merge for the same reason PARENWORD's cannot: merging would
+# have to consume the intervening `)` as an interior char, and `)` is excluded.
+WORD    = /(?:\((?:[^\r\n(){}#"]|\((?:[^\r\n(){}#"]|\((?:[^\r\n(){}#"]|\([^\r\n(){}#"]*\))*\))*\))*\)|[^ \t\r\n{}\[\]#"])+/
 
 # ---- file = a list of top-level blocks (newlines optional between) ---
 scene_file = item*

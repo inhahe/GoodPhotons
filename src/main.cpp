@@ -2234,6 +2234,104 @@ static int checkArray() {
             e.find("unknown identifier 'nope'") != std::string::npos);
     }
 
+    // (i) A NAMED table sampled directly at a value site — `reflect grid:ramp(u)`. This is
+    //     the same statement as an inline literal written the other way round: an inline
+    //     `[0 1](u)` desugars to precisely this expression wrapped in an anonymous pattern,
+    //     so the two spellings must be INDISTINGUISHABLE. That is the claim under test, and
+    //     it is why these pins live in `-checkarray` rather than a suite of their own.
+    //     Only the *scoped* spelling is accepted: a bare `ramp(u)` at a value site already
+    //     means "apply the material `ramp`", so `grid:` / `scatter:` is what keeps the
+    //     meaning from depending on which namespace happens to hold the name.
+    const std::string gramp = "grid \"g\" { shape 2  lo 0  hi 1  data { 0 1 } }\n";
+    const std::string ghalf = "grid \"h\" { shape 2  lo 0  hi 1  data { 0.5 1 } }\n";
+    const std::string gcall = gramp + "material \"probe\" { type diffuse  reflect grid:g(u) }";
+    sameReflect("`reflect grid:g(u)` == the inline literal it desugars to",
+        gcall.c_str(), "material \"probe\" { type diffuse  reflect [0 1](u) }");
+    varies("...and it actually tracks its coordinate", gcall.c_str());
+    sameReflect("a 2-D table call matches the 2-D literal",
+        "grid \"g2\" { shape 2 2  lo 0  hi 1  data { 0 0.3  0.6 1 } }\n"
+        "material \"probe\" { type diffuse  reflect grid:g2(u,v) }",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](u,v) }");
+    sameReflect("a `scatter:` call is accepted at a value site too",
+        "scatter \"s\" { dim 1  power 2  data { 0 0   1 1 } }\n"
+        "material \"probe\" { type diffuse  reflect scatter:s(u) }",
+        "scatter \"s\" { dim 1  power 2  data { 0 0   1 1 } }\n"
+        "pattern \"p\" { expr \"scatter:s(u)\" }\n"
+        "material \"probe\" { type diffuse  reflect pattern:p }");
+    // The deferral route works here for the same reason it works for a literal: `a` is an
+    // ordinary coordinate that survives to the use site, where the bundle substitution
+    // rebinds it. Nothing about it is special-cased for tables.
+    {
+        const std::string deferred = gramp +
+            "material \"src\" { type diffuse  reflect grid:g(a) }\n"
+            "material \"probe\" { type diffuse  reflect src.reflect(a=u) }";
+        sameReflect("`grid:g(a)` + a use-site bind == spending the axis inline",
+            deferred.c_str(), gcall.c_str());
+    }
+    // Composition runs BOTH directions — a literal inside a named table's call and a table
+    // call inside a literal's — because both go through the one `desugarNestedLiterals`.
+    // The second uses a non-identity outer table, so it cannot pass by the outer being a
+    // no-op: `[0 1 0]` sampled over `h`'s [0.5,1] half is the tent's falling edge, `1-u`.
+    {
+        const std::string litIn = gramp +
+            "material \"probe\" { type diffuse  reflect grid:g([0.5 1](u)) }";
+        sameReflect("a literal composes INTO a named table's call", litIn.c_str(),
+            "material \"probe\" { type diffuse  reflect [0 1](0.5+0.5*u) }", 1e-6);
+        const std::string callIn = ghalf +
+            "material \"probe\" { type diffuse  reflect [0 1 0](grid:h(u)) }";
+        sameReflect("...and a named table's call composes INTO a literal", callIn.c_str(),
+            "material \"probe\" { type diffuse  reflect [1 0](u) }", 1e-6);
+    }
+    {
+        // A SCALAR slot: `roughness` takes the sampled table as its per-hit pattern, exactly
+        // as the inline literal does. Compared by evaluating the two bound patterns, since
+        // `reflectAt` only reaches the reflect slot.
+        auto roughAt = [&](ftsl::Loaded& L, const PatCtx& base_c) {
+            PatCtx c = base_c;
+            bindPatScene(c, L.scene);
+            int pat = probeOf(L).roughnessPat;
+            if (pat < 0 || pat >= (int)L.scene.patterns.size()) return -1e300;
+            const auto& p = L.scene.patterns[pat].nodes;
+            return patternEval(p.data(), (int)p.size(), c);
+        };
+        ftsl::Loaded A, B;
+        const std::string rc = gramp + "material \"probe\" { type glossy  roughness grid:g(u) }";
+        if (loadMats(rc.c_str(), A) &&
+            loadMats("material \"probe\" { type glossy  roughness [0 1](u) }", B)) {
+            bool same = true, live = false;
+            const double a0 = roughAt(A, pts[0]);
+            for (int k = 0; k < 5; ++k) {
+                double a = roughAt(A, pts[k]), b = roughAt(B, pts[k]);
+                if (a < -1e299 || std::fabs(a - b) > 1e-12) same = false;
+                if (k && std::fabs(a - a0) > 1e-6) live = true;
+            }
+            chk("a table call binds a SCALAR slot's pattern like the literal does", same);
+            chk("...and that scalar pattern is not a constant", live);
+        } else ok = false;
+    }
+    // The refusals. Two of them are the whole point of hooking four separate value sites
+    // rather than one: a slot that cannot hold a per-hit value has to SAY so, instead of
+    // reading `grid:g(u)` as the number zero or as an unrecognized spectrum expression.
+    {
+        const std::string iorCall = gramp +
+            "material \"probe\" { type dielectric  ior grid:g(u) }";
+        mustReject("a per-hit table is refused at a load-time SPECTRAL slot",
+            iorCall.c_str(), "fixed at load time");
+        const std::string filmCall = gramp +
+            "material \"probe\" { type thinfilm  film_ior grid:g(u) }";
+        mustReject("a per-hit table is refused at a load-time SCALAR slot",
+            filmCall.c_str(), "fixed at load time");
+        const std::string bare = gramp + "material \"probe\" { type diffuse  reflect grid:g }";
+        mustReject("naming a table without sampling it is refused, not defaulted",
+            bare.c_str(), "does not sample it");
+        const std::string arity = gramp +
+            "material \"probe\" { type diffuse  reflect grid:g(u,v) }";
+        mustReject("the call's arity is checked against the table's own dimensionality",
+            arity.c_str(), "expects 1 arg");
+    }
+    mustReject("an unknown table is named",
+        "material \"probe\" { type diffuse  reflect grid:nope(u) }", "unknown grid");
+
     std::printf("[checkarray] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

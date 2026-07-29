@@ -1403,6 +1403,62 @@ private:
         std::string slot;
     };
 
+    // ---- a table sampled DIRECTLY at a value site --------------------------------
+    // `roughness grid:bumps(u,v)`, `reflect scatter:swatch(u,v)` — the NAMED counterpart
+    // of an inline array literal, and the same thing semantically: an inline `[0 1](u)`
+    // desugars to exactly this expression wrapped in an anonymous `pattern`, so the two
+    // spellings must produce the same binding. That symmetry is the whole feature; the
+    // workaround it retires is writing the one-line `pattern` wrapper by hand.
+    //
+    // A value site is NOT an expression site, which is why this needs code at all: ftrace's
+    // expression compiler has always read `grid:name(args)` as a call, but only *inside* a
+    // pattern body. At a value site the token previously reached the spectrum reader and
+    // died as "unrecognized spectrum expression".
+    //
+    // The **scoped** spelling is the one accepted, deliberately. A bare `ramp(u)` at a value
+    // site already means "apply the material `ramp`" (§7.6 bundles), so accepting it for
+    // tables too would make the meaning depend on which namespace happens to hold the name —
+    // and a scene could change meaning by gaining a material. `grid:` / `scatter:` cannot
+    // collide with that.
+    //
+    // Returns the new pattern's index, or -1 with fail() already set. Callers test the
+    // prefix themselves (it is two string compares) so that each can phrase its own
+    // refusal when its slot has nowhere to put a per-hit value.
+    static bool isTableCallHead(const std::string& t) {
+        return t.rfind("grid:", 0) == 0 || t.rfind("scatter:", 0) == 0;
+    }
+    int tableCallPattern(const std::string& tok, const std::string& who) {
+        if (!loadedRef_) {                    // no scene to append the pattern to
+            fail(who + ": `" + tok + "` cannot be used here");
+            return -1;
+        }
+        const bool isGrid = (tok[0] == 'g');
+        const std::string kind = isGrid ? "grid" : "scatter";
+        // The call is required for the same reason an array literal's is: a table is a
+        // function of its coordinates, and a slot holds a value, so naming one without
+        // saying where it is read is incomplete rather than defaulted. Refusing beats
+        // inventing `(u)`, which would silently pick an axis for a 2-D table.
+        if (tok.find('(') == std::string::npos || tok.back() != ')') {
+            fail(who + ": `" + tok + "` names a " + kind + " but does not sample it — a "
+                 "table is read AT coordinates, so write `" + tok + "(u)`, one coordinate "
+                 "per axis (`" + tok + "(u,v)` for a 2-D table)");
+            return -1;
+        }
+        Pattern p;
+        std::string perr;
+        // `a` is allowed for the same reason a named `pattern` block allows it: the axis can
+        // be left free here and rebound where the material is USED (`mat(a=u)`), which is
+        // exactly the deferral route an inline literal spells `[0 1](a)`.
+        if (!compilePatternExpr(tok, p.nodes, perr, false, &texScope_,
+                                &tableScope_, /*allowA=*/true)) {
+            fail(who + " `" + tok + "`: " + perr);
+            return -1;
+        }
+        Loaded& L = *loadedRef_;
+        L.scene.patterns.push_back(std::move(p));
+        return (int)L.scene.patterns.size() - 1;
+    }
+
     // Recognise + resolve. Returns FALSE when `tok` is not this form at all (the caller
     // falls through to its other spellings); TRUE when it was recognised, in which case
     // `out` is filled or `fail()` has been set. Deliberately keyed on "the head names a
@@ -1700,6 +1756,17 @@ private:
         // `RECORD.channel[i]` / `RECORD.channel(const)`. Fires only when h's head names
         // a known record; otherwise falls through to the ordinary spectrum forms below.
         if (w.size() == 1) {
+            // A table sample at a PATTERN-LESS spectral site (`ior`, `absorb`, a light's
+            // `spd`, a top-level `spectrum`). The pattern-aware slots intercept it in
+            // patternedSpectrumParam and never arrive here, so reaching this point means the
+            // slot holds one spectrum evaluated at load time and has nowhere to put a per-hit
+            // sample — the same refusal a pattern-carrying material property gets below.
+            if (isTableCallHead(h)) {
+                fail("`" + h + "`: a table is sampled per hit, but this slot holds one "
+                     "spectrum fixed at load time — the per-hit spectral slots are "
+                     "`reflect`, `transmit` and `emit` (and their `_map` companions)");
+                return constantSpectrum(0);
+            }
             Spectrum rs;
             if (recordConstSpectrumRef(h, rs)) return rs;
             // §3.2 per-property access — `MATERIAL.slot` / `MATERIAL.slot(args)`. This is
@@ -1919,6 +1986,16 @@ private:
         const Stmt* s = find(b, key);
         if (!s || s->val.words.empty()) return dflt;
         const std::string& w0 = s->val.words[0];
+        // Reaching dblParam with a table sample in hand means THIS slot has nowhere to put a
+        // per-hit value: the slots that can hold one try bindScalarPattern first and take it
+        // there. Refused rather than silently read as `num("grid:…") == 0`.
+        if (isTableCallHead(w0)) {
+            fail(std::string("`") + key + " " + w0 + "`: a table is sampled per hit, but '" +
+                 key + "' takes one number fixed at load time — the per-hit slots are "
+                 "`roughness`, `film_thickness_map`, `weight_map`, and the `_map` companion "
+                 "of a spectral slot");
+            return dflt;
+        }
         if (w0.find('.') != std::string::npos && !isNumber(w0)) {
             double rv;
             if (recordConstScalarRef(w0, rv)) return rv;             // record ref (or a fail was set)
@@ -2084,6 +2161,15 @@ private:
                                     int& patOut, const Spectrum& dflt) {
         bindScalarPattern(b, mapKey, patOut);
         const Stmt* s = find(b, key);
+        // `reflect grid:ramp(u)` — same slot semantics as `reflect pattern:p`: the sampled
+        // table goes ALONE into the slot and the base spectrum becomes flat 1.0, so the
+        // table's own values are the greyscale albedo. Handled here rather than in
+        // evalSpectrum because this is the only spectral site with somewhere to put a
+        // per-hit multiplier.
+        if (s && !s->val.words.empty() && isTableCallHead(s->val.words[0])) {
+            if (!bindScalarPattern(b, key, patOut)) return dflt;   // fail() already set
+            return constantSpectrum(1.0);
+        }
         if (s && !s->val.words.empty() && s->val.words[0].rfind("pattern:", 0) == 0) {
             if (!bindScalarPattern(b, key, patOut)) return dflt;   // unknown name: failed
             return constantSpectrum(1.0);
@@ -2192,6 +2278,15 @@ private:
         const Stmt* s = find(b, key);
         if (!s || s->val.words.empty()) return false;
         const std::string& w0 = s->val.words[0];
+        // A table sampled at a value site IS a pattern, so it binds here exactly like
+        // `pattern:<name>` does — which is what makes `roughness grid:bumps(u,v)` and the
+        // inline `roughness [ … ](u,v)` the same statement written two ways.
+        if (isTableCallHead(w0)) {
+            int p = tableCallPattern(w0, std::string("`") + key + "`");
+            if (p < 0) return false;                          // fail() already set
+            patOut = p;
+            return true;
+        }
         // §3.2 per-property access carrying a pattern: `roughness gold.roughness` where
         // gold's roughness is itself pattern-driven. Reported as "handled" ONLY when the
         // source actually has a pattern, so a plain-constant source falls through to
@@ -2620,6 +2715,20 @@ private:
         return true;
     }
 
+    // The mirror of the case above: an array literal composed into a NAMED table's sample
+    // call, `reflect grid:ramp([0.2 0.8](u))`. Here there is no `ArrayLit` at all — the
+    // whole thing lexed as one WORD — so the rewrite happens on the token text, and what
+    // comes out (`grid:ramp(grid:__arrN(u))`) is compiled by `tableCallPattern` later.
+    // Both directions of composition therefore run through the one `desugarNestedLiterals`.
+    bool desugarTableCall(Stmt& s, std::vector<Block>& gen, int& n) {
+        std::string& w0 = s.val.words[0];
+        const std::string who = "line " + std::to_string(s.line) + ": `" + s.key + "`";
+        std::string out;
+        if (!desugarNestedLiterals(w0, who, s.line, gen, n, out)) return false;
+        w0 = out;
+        return true;
+    }
+
     bool desugarArrays(std::vector<Block>& blocks) {
         std::vector<Block> gen;
         int n = 0;
@@ -2634,6 +2743,11 @@ private:
             bool touched = false;
             for (auto& s : b.stmts) {
                 if (s.val.array) { if (!desugarOne(s, gen, n)) return false; touched = true; }
+                else if (!s.val.words.empty() && isTableCallHead(s.val.words[0]) &&
+                         s.val.words[0].find('[') != std::string::npos) {
+                    if (!desugarTableCall(s, gen, n)) return false;
+                    touched = true;
+                }
                 if (s.val.block) { if (!visit(*s.val.block)) return false; }
             }
             if (touched && !b.words.empty()) {

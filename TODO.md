@@ -272,7 +272,7 @@ Origin tags point at the authoritative design text for each item.
         (`[0 1]([0.2 0.8](u))` — the inner brackets break `PARENWORD`), and the `NAME axistuple` arm does NOT in
         fact work at a value site for a grid/scatter (`reflect grid:ramp(u)` is "unrecognized spectrum
         expression"); it works only for materials and material properties, where it is a bundle application.
-        *(The first of the two is now closed — see the composition STATUS below.)*
+        *(Both are now closed — see the composition and table-call STATUS blocks below.)*
     * **STATUS (2026-07-28): COMPOSITION DONE — `coord = … | value`, the last unimplemented arm of the grammar
       sketch above. Shipped as 0.100.0.**
       A coordinate may now itself be a sampled value, so a literal composes into another's call to any depth:
@@ -307,6 +307,39 @@ Origin tags point at the authoritative design text for each item.
         `ftsl_scene.epeg`; loom's reader uses the sibling typed `ftsl.epeg`), and `scraps/arr_compose.ftsl` renders
         **bit-for-bit identically** to its direct-literal twin, with the tent case likewise bit-identical to its
         analytic equivalent and demonstrably different from the identity case.
+    * **STATUS (2026-07-28): `NAME axistuple` AT A VALUE SITE DONE — the increment-2 `Deferred:` clause's second
+      arm, which was simply wrong. Shipped as 0.101.0.**
+      That clause (line ~227) said `NAME axistuple` "needs no work because ftrace's expression evaluator already
+      reads `name(args)` as a call". True *inside* a pattern expression — but a **value site is not an expression
+      site**: the slot readers only recognised `pattern:<name>` there, so `reflect grid:ramp(u)` was an
+      "unrecognized spectrum expression". Now every per-hit slot takes a table call directly.
+      - **The same four chokepoints v0.89.0 used for `MATERIAL.slot(args)`.** `bindScalarPattern` and
+        `patternedSpectrumParam` (the per-hit readers) send a `grid:` / `scatter:` head through
+        `Builder::tableCallPattern`, which compiles it with the ordinary `compilePatternExpr` and appends to
+        `scene.patterns` — so the slot holds *exactly* the index a hand-written one-line
+        `pattern { expr "grid:ramp(u)" }` would have produced, and there is no second evaluation path.
+        `dblParam` and `evalSpectrum` are the load-time-constant readers and **refuse**, each naming the slots
+        that can hold a per-hit value.
+      - **Only the scoped spelling is accepted.** A bare `ramp(u)` at a value site already means the §7.6 material
+        bundle application, so accepting it for tables would make meaning depend on which namespace holds the
+        name. `isTableCallHead` tests for the `grid:` / `scatter:` prefix and nothing else. A call-less
+        `grid:ramp` is refused with the `(u)` to add — a table is read AT coordinates — rather than silently
+        becoming a constant.
+      - **Composition works inside a table call too** (`reflect grid:ramp([0.2 0.8](u))`), because a coordinate is
+        an expression here as everywhere: `Builder::desugarTableCall` runs `desugarNestedLiterals` over the token
+        before it compiles, dispatched from `desugarArrays`' visit loop on the cheap
+        `isTableCallHead && contains('[')` test. This needed the *second* grammar change: a **named** table's call
+        lexes as a `WORD`, not a `PARENWORD`, so `WORD`'s balanced-group alternative was widened to
+        character-for-character `PARENWORD`'s body. Only the group *interior* admits brackets — `WORD`'s fallback
+        class still excludes them, so a bracket outside parens is a delimiter as before and `REC.chan[2]` still
+        stops the word at the `[`.
+      - **`-checkarray` section (i)** pins `reflect grid:g(u)` ≡ `[0 1](u)` (with a non-constant check, since an
+        unbound grid pool would make both 0.0), the 2-D `grid:g2(u,v)` form, `scatter:s(u)` ≡ a hand-written
+        `pattern` twin, the formal route (`grid:g(a)` + `src.reflect(a=u)` ≡ `grid:g(u)`), both composition
+        directions, and the SCALAR-slot binding via a `roughness` probe. Plus five refusals: two "fixed at load
+        time" (`film_ior`, `ior`), "does not sample it", "unknown grid" and "expects 1 arg".
+      - **Validation:** all 15 self-tests PASS, all 87 scenes parse, the grammar corpus sweep is 87/87, and loom is
+        1255/1255 (again confined to `ftsl_scene.epeg`).
     * **ADDENDUM — call = sample; late-binding & rebinding of the consumed axis (design intent, user).** The
       trailing `(...)` is not just a *label* on a literal — it is the **sample call**, exactly like loom's
       `grid(x, y)`. Two authoring positions, so a material can *define* what an array consumes, or *defer* it to its
