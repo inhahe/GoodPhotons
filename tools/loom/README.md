@@ -70,7 +70,7 @@ tools/loom/
 │   ├── data.py      datasets: PointPath | TrackedPath | Grid | Scatter (N-D, DAG nodes)
 │   ├── color.py     colour model: RGB + HSV + HSL (animatable, seamless hue loops)
 │   ├── interp.py    interpolators (loop curve | tracked multi-curve | grid field | scatter field)
-│   ├── iso.py       isosurfaces: gyroid / Schwarz-P / Schwarz-D / Neovius + N-D slicing
+│   ├── iso.py       isosurfaces: gyroid / Schwarz-P / Schwarz-D / Neovius, in 3-D and true N-D (`SliceField`)
 │   ├── pov.py       POV-Ray function library, with which are N-D-generalizable
 │   ├── spatial.py   spatial expression DSL (X, Y, Z, U, V, T + math + Image/VolumeField/SigAt terms) → ftsl `expr`
 │   ├── sweep.py     sweep engine (rotation-minimizing frames, ribbon/tube/skin_rings, OBJ out)
@@ -159,6 +159,7 @@ rest come back as a generic ordered `Block` that re-emits its source layout exac
 | `gyroid_loop.py` | a seamless looping **gyroid** isosurface |
 | `pov_loop.py` | a seamless looping **POV-Ray function** isosurface |
 | `gyroid_nd.py` | **higher-dimensional gyroid slices** — a randomized N-D gyroid whose hidden dimensions drift / rotate / *bloom*; gold or clear-glass; per-run output dirs (a full sub-tool, see its `--help`) |
+| `gold_gyroids.py` | two gold gyroids in a closed room **rotating in 4-D and 5-D** (`SliceField`), assembled into a seamlessly looping GIF |
 | `material_loop.py` | a seamless looping **function-driven material** |
 | `mesh_bake.py` | **bake a scalar field to a mesh** with marching cubes |
 | `open_timeline.py` | a **one-shot, non-looping** animation (distinct endpoints) |

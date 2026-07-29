@@ -314,6 +314,28 @@ from translating on *closed* curves and rotating by integer turns. Factory patte
 `make_gyroid(**params) -> Isosurface` + a `Room` driver (see
 `examples/room_of_gyroids.py`).
 
+**True N-D fields (`SliceField`).** The ≥4-input case is *implemented*, not deferred to
+meshing. `iso.py` carries N-D generalizations of all four TPMS templates — `gyroid_n`
+(cyclic `Σ sin cᵢ·cos cᵢ₊₁`), `schwarz_p_n`, `schwarz_d_n` (all odd-sine-count products,
+`2ⁿ⁻¹` terms), `neovius_n` — each reducing **exactly** to its 3-D form at `n == 3`, so
+raising the dimension is a strict extension. `SliceField(field, dim=, rotation=, offset=)`
+plugs in as an `Isosurface`'s `field` (the duck-typed `build`/`param_signals` protocol,
+same as `PovFn`): it embeds the host's `(cx, cy, cz)` in `dim` dimensions at `offset`,
+applies an animatable `dim×dim` `Mat`, and evaluates the N-D field there. Every N-D
+coordinate is an **affine form in x/y/z** with coefficients baked per frame, so the
+result is still a plain `expr` isosurface that ftrace sphere-traces natively — a real
+4-D/5-D rotation needs no new renderer path. Rotating in a plane that touches an axis
+*outside* the slice sweeps the hyperplane through the field, so the surface genuinely
+reconnects and changes topology (a 3-input field under an N-D rotation can only ever be
+an affine remap — §11.7). Zero/unit coefficients and a zero offset are pruned from
+the emitted string (decided on the *formatted* value, so text and pruning can't
+disagree), which roughly halves the expression the marcher re-evaluates per step.
+`nd_grad_bound(field, dim, freq, sigma)` gives the rigorous `max_gradient` the
+sphere-marcher needs (`σ_max(A)·|∇_c F|`), since a mixed N-D slice can defeat ftrace's
+sampled Lipschitz estimate. Seamlessness: an integer number of turns per rotation plane
+returns the matrix to the identity at the wrap, which is also what lets the host's `2π`
+`drift` survive the N-D mix. Demo: `examples/gold_gyroids.py` (4-D + 5-D gyroids).
+
 ### 7c. Function-driven materials
 Reuse Good Photons' existing material-props-by-function (reflectance/color/IOR/etc.
 over `x,y,z`/UV). Loom emits those expressions; adding `t` makes any property animate.

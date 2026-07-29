@@ -91,12 +91,18 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                  window: bool = True, interval: float = 5.0,
                  noise: Optional[float] = None, time_s: Optional[float] = None,
                  n: Optional[int] = None, loop: bool = True,
+                 skip_existing: bool = False,
                  extra_args: Sequence[str] = ()) -> List[Path]:
     """Emit and render a frame range; return the rendered PNG paths.
 
     ``loop=True`` (default) renders a **seamless closed loop**; ``loop=False``
     renders an **open** one-shot timeline with distinct endpoints (§11.6).
     ``noise``/``time_s``/``n`` pick the per-frame stop budget (default: 3% noise).
+
+    ``skip_existing=True`` leaves already-rendered PNGs alone, so a long sequence
+    interrupted by a crash (or a Ctrl-C) resumes instead of starting over.  It is
+    opt-in precisely because it cannot tell a stale frame from a fresh one — clear
+    the directory when the scene changes.
     """
     outdir = Path(outdir) if outdir is not None else default_outdir(name)
     ftrace = find_ftrace()
@@ -105,6 +111,11 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     pngs: List[Path] = []
     for i, fp in enumerate(ftsl_paths):
         png = fp.with_suffix(".png")
+        if skip_existing and png.is_file() and png.stat().st_size > 0:
+            print(f"[loom] frame {i + 1}/{len(ftsl_paths)}: {png.name} exists, skipping",
+                  flush=True)
+            pngs.append(png)
+            continue
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png),
                "-interval", f"{interval:g}", "-checkpoint", *budget]
         if window:

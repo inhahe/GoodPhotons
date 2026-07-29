@@ -63,6 +63,8 @@ from .sweep import (
 from .iso import (
     Isosurface, Room, gyroid_surface, phase_drift, FIELDS,
     gyroid, schwarz_p, schwarz_d, neovius,
+    SliceField, ND_FIELDS, nd_grad_bound,
+    gyroid_n, schwarz_p_n, schwarz_d_n, neovius_n,
 )
 from .pov import (
     pov, PovFn, POV_FUNCS, POV_ND_GENERALIZABLE, POV_PARAMS, pov_params,
@@ -129,6 +131,8 @@ __all__ = [
     "line_profile", "write_obj",
     "Isosurface", "Room", "gyroid_surface", "phase_drift", "FIELDS",
     "gyroid", "schwarz_p", "schwarz_d", "neovius",
+    "SliceField", "ND_FIELDS", "nd_grad_bound",
+    "gyroid_n", "schwarz_p_n", "schwarz_d_n", "neovius_n",
     "pov", "PovFn", "POV_FUNCS", "POV_ND_GENERALIZABLE", "POV_PARAMS", "pov_params",
     "nd_field_expr", "nd_field_eval", "nd_grad_bound_xi",
     "render_range", "render_still", "emit_frames", "assemble_gif", "find_ftrace",
