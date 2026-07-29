@@ -1930,7 +1930,12 @@ or a native-primitive wrap — see below). Two authoring forms:
   transposes under `(u=v, v=u)`. A literal's *formals* are the driver names in its own tuple;
   it has no second, private namespace of axis names, so a `formal=driver` argument **inside**
   a literal's call (`[0 1](a=u)`) is a load error that names both spellings that work.
-  Pinned by `ftrace -checkarray`; per-tile scene `scenes/_array_formal.ftsl`.
+  Because a coordinate is a full expression, a literal may also be **composed** into
+  another's call — `[0 1]([0.2 0.8](u))` reads the outer table at a coordinate the inner
+  one produces, to any depth, on any single axis of a multi-axis call
+  (`[[0 0.3][0.6 1]]([0.5 1](u), v)`), and as a term inside coordinate arithmetic. That is
+  the general remapping idiom: an inner table becomes the transfer curve applied before the
+  outer lookup. Pinned by `ftrace -checkarray`; per-tile scene `scenes/_array_formal.ftsl`.
 - **Named generator** — `type <gen>` plus params (mirrors material syntax):
 
   | Generator | Parameters | Result |

@@ -272,6 +272,41 @@ Origin tags point at the authoritative design text for each item.
         (`[0 1]([0.2 0.8](u))` — the inner brackets break `PARENWORD`), and the `NAME axistuple` arm does NOT in
         fact work at a value site for a grid/scatter (`reflect grid:ramp(u)` is "unrecognized spectrum
         expression"); it works only for materials and material properties, where it is a bundle application.
+        *(The first of the two is now closed — see the composition STATUS below.)*
+    * **STATUS (2026-07-28): COMPOSITION DONE — `coord = … | value`, the last unimplemented arm of the grammar
+      sketch above. Shipped as 0.100.0.**
+      A coordinate may now itself be a sampled value, so a literal composes into another's call to any depth:
+      `[0 1]([0.2 0.8](u))`, on any single axis of a multi-axis call (`[[0 0.3][0.6 1]]([0.5 1](u), v)`), and as a
+      term inside coordinate arithmetic. The idiom it buys is remapping — the inner table is the transfer curve
+      applied before the outer lookup.
+      - **The blocker was the LEXER, not the loader.** `splitCallArgs` already tracked bracket depth, so the outer
+        call's arguments would have split correctly; what failed was that `PARENWORD`'s interior class excluded
+        `[` / `]`, so the inner literal's brackets split the token and the outer literal reported the (misleading)
+        *unsaturated* error. Widening the class is safe because the terminal's **balance guarantee rests entirely
+        on `(` and `)` staying excluded** — two paren groups on one line still cannot merge, since merging would
+        have to consume the intervening `)` as an interior char. Longest-match still prefers `PARENWORD`, because
+        `WORD`'s own group alternative keeps brackets out and so matches only the bare `(`.
+      - **A composed literal costs ONE block, not two.** `desugarOne`'s core is now `Builder::buildArrayGrid`
+        (flatten + arity/shape checks + the anonymous `grid`), and only the *value-site* form wraps it in a
+        `pattern` — a composed one is spelled by substituting `grid:__arrN(coords)` into the outer call text
+        (`Builder::desugarNestedLiterals`, recursive), which is already a legal pattern-expression term.
+      - **The loader diagnoses what the lexer deliberately stopped checking.** Brackets inside a call are captured
+        but not balance-checked, so `Builder::parseArrayText` re-parses the argument text with the tokenizer's own
+        splitting rule and names an unbalanced group, a call-less inner literal, or a wrong inner arity against the
+        author's source. A literal glued to an identifier (`f[0 1](u)`) is refused **before** substitution, or the
+        rewrite would report an "unknown identifier `fgrid`" appearing nowhere in the file. Errors two levels deep
+        still name the authoring site, never `__arrN`.
+      - **`-checkarray` section (h)** pins five identities against twins whose coordinate is spelled
+        *arithmetically* — non-circular, since a 2-sample grid over `lo 0 hi 1` interpolates linearly, so
+        `[0.5 1](u)` **is** `0.5+0.5*u`. Includes a deliberately non-identity outer array (a 3-sample tent, whose
+        composition with `[0.5 1](u)` must equal `[1 0](u)`), so no case can pass by the outer lookup being a
+        no-op. `sameReflect` grew a tolerance argument: those twins agree to float precision (~1e-8), because grid
+        samples are stored as float32 while an expression evaluates in double — demanding the bit-identity the
+        rebind twins use would pin the storage format rather than the semantics.
+      - **Validation:** all 15 self-tests PASS, all 87 scenes parse, loom is 1255/1255 (the change is confined to
+        `ftsl_scene.epeg`; loom's reader uses the sibling typed `ftsl.epeg`), and `scraps/arr_compose.ftsl` renders
+        **bit-for-bit identically** to its direct-literal twin, with the tent case likewise bit-identical to its
+        analytic equivalent and demonstrably different from the identity case.
     * **ADDENDUM — call = sample; late-binding & rebinding of the consumed axis (design intent, user).** The
       trailing `(...)` is not just a *label* on a literal — it is the **sample call**, exactly like loom's
       `grid(x, y)`. Two authoring positions, so a material can *define* what an array consumes, or *defer* it to its

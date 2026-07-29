@@ -509,10 +509,41 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   measurement corrects each tile's horizontal gradient using the four tiles whose albedo is
   constant in `u` (one per column). `-checkarray` is what pins the identities exactly.
 
+  **Composed literals** (`[0 1]([0.2 0.8](u))`, 0.100.0) fall straight out of "an argument
+  is a coordinate expression": a coordinate may itself be a sampled value, so a literal is
+  legal wherever one is. The implementation is deliberately asymmetric with the value-site
+  case. `Builder::buildArrayGrid` emits the anonymous `grid` for both, but a composed
+  literal gets **no `pattern` wrapper** — `grid:__arrN(coords)` is already a legal
+  pattern-expression term, so the composition is spelled by textual substitution into the
+  outer call (`Builder::desugarNestedLiterals`, recursive, so nesting is unbounded) and the
+  outer expression ends up as `grid:__arr1(grid:__arr0(u))`. Only the value site needs a
+  name for a *statement* to reference, and only it pays for a second block.
+
+  The reason this needed a grammar change is worth recording, because it is the one place
+  the lexer's design leaks. A sample call is a single `PARENWORD` token, and that terminal's
+  interior class excluded `[` / `]` until 0.100.0 — so an inner literal's brackets split the
+  outer token and the outer literal reported the (very misleading) *unsaturated* error. The
+  fix widens the interior class only; the terminal's **balance guarantee rests entirely on
+  `(` and `)` staying excluded** (two paren groups on one line cannot merge, because merging
+  would have to consume the intervening `)` as an interior char), so admitting brackets
+  costs nothing there. Brackets inside a call are therefore *captured but not
+  balance-checked by the lexer*, which is the right trade: `desugarNestedLiterals` parses
+  the argument text itself (`Builder::parseArrayText`, reproducing the tokenizer's own
+  splitting rule) and reports an unbalanced or call-less inner literal against the author's
+  source, instead of surfacing as a token that mysteriously fails to match. It also refuses
+  a literal written flush against an identifier (`f[0 1](u)`) *before* substituting, since
+  the rewrite would otherwise glue the author's token to a generated name and complain about
+  an "unknown identifier `fgrid`" that appears nowhere in their file. The pattern language
+  has no bracket syntax of its own, which is what makes "a `[` here always opens a literal"
+  safe to assume. Note this touched `ftsl_scene.epeg` only — loom's reader uses the sibling
+  typed `ftsl.epeg` — so loom's 1255-test suite is the regression check that the shared
+  grammar tooling still round-trips.
+
   **Generated blocks are re-attributed.** `desugarArrays` mints `grid`/`pattern` blocks the
   author never named, so `Builder::genSite_` maps `__arrN` back to the authoring site and
   `genWho()` is used wherever those blocks can fail. A message about `pattern '__arr3'`
-  would name a symbol that appears nowhere in the scene file.
+  would name a symbol that appears nowhere in the scene file. A composed literal registers
+  its own site too, so a bad coordinate two levels down still names what the author wrote.
 
   The same bracket spelling is accepted for a **`grid`/`scatter` element's own `data`**, and
   there it is *not* sugar: `desugarArrays` deliberately skips those two block types, because

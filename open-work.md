@@ -5,7 +5,7 @@ long prose blocks whose opening paragraph reads like a plan but whose later
 `**STATUS (date) … DONE**` sub-paragraph says it landed. That makes "what's actually left?"
 expensive to answer.
 
-**This file is the actionable extract, as of 2026-07-28 (ftrace v0.92.0).** It carries only
+**This file is the actionable extract, as of 2026-07-28 (ftrace v0.100.0).** It carries only
 work that is genuinely undone *and* not explicitly ruled out. `TODO.md` remains the
 authoritative design text — every item below names its section/item ID there, and the full
 rationale, prior art and scoping live in that entry, not here.
@@ -47,14 +47,18 @@ the unsaturated message now names the `(a)` deferral route, loom's `values.py` r
 spelling, and `-checkarray` + `scenes/_array_formal.ftsl` pin the identities (with explicit
 non-vacuity checks).
 
-### Composing array literals — `[0 1]([0.2 0.8](u))`  *(ftrace; small)*
-*Discovered 2026-07-28 while closing the item above. TODO.md's grammar sketch has
-`coord = NAME | NUMBER | value`, i.e. "a nested `sampled` gives composition (`n(m(u), v)`)".*
+### ~~Composing array literals — `[0 1]([0.2 0.8](u))`~~  **DONE 2026-07-28 (v0.100.0)**
+*TODO.md "DECISION — color-vector / array syntax", composition STATUS — now closed. This was
+the last unimplemented arm of that section's grammar sketch (`coord = NAME | NUMBER | value`).*
 
-ftrace can't do it: `PARENWORD = /\([^ \t\r\n{}\[\]#"]*\)/` excludes `[` and `]`, so the inner
-literal's brackets split the token and the outer literal reports the (misleading) *unsaturated*
-error. loom's value grammar already normalizes the nested form. Workaround today is to name the
-inner table (`grid` + `pattern`) and reference it from the outer call's coordinate expression.
+The blocker was the **lexer**, not the loader: `splitCallArgs` already tracked bracket depth, but
+`PARENWORD`'s interior class excluded `[` / `]`, so the inner literal's brackets split the token.
+Widening the class is safe because the terminal's balance guarantee rests entirely on `(` / `)`
+staying excluded. Composition nests to any depth, works on one axis of a multi-axis call, and works
+as a term inside coordinate arithmetic; a composed literal emits only a `grid` (no `pattern`
+wrapper), since `grid:__arrN(coords)` is already a legal expression term. Brackets inside a call are
+captured but not balance-checked by the lexer, so the loader re-parses the argument text and reports
+a malformed inner literal against the author's source. Pinned by `-checkarray` section (h).
 
 ### `NAME axistuple` at a value site — `reflect grid:ramp(u)`  *(ftrace; small)*
 *Discovered 2026-07-28. Corrects a wrong claim in TODO.md's increment-2 `Deferred:` clause.*

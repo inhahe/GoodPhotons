@@ -2372,33 +2372,68 @@ private:
         }
     }
 
-    // Turn ONE literal into its `grid` + `pattern` pair (appended to `gen`) and rewrite
-    // the statement's value to reference the generated pattern.
-    bool desugarOne(Stmt& s, std::vector<Block>& gen, int& n) {
-        const ArrayLit& a = *s.val.array;
-        const std::string nm  = "__arr" + std::to_string(n++);
-        const std::string who = "line " + std::to_string(a.line) + ": `" + s.key + "`";
-        if (a.call.empty()) {
-            // Two ways to finish an array, and the message names both: SPEND the axis here
-            // (`(u)`), or leave it as a FORMAL for whoever uses the material (`(a)`, bound
-            // at the use site by `mat(a=u)`). The second is the "unsaturated, completed by
-            // the user" case from the design — in ftrace it is spelled by naming `a`, the
-            // one input with no per-hit intrinsic, rather than by omitting the call.
-            fail(who + ": an inline array literal needs a trailing sample call naming the "
-                 "coordinates it is read at — e.g. `[0 1](u)`, or `[[0 1][2 3]](u,v)` for "
-                 "2-D. To leave the choice to whoever USES this material, name the free "
-                 "input instead — `[0 1](a)` — and bind it at the use site with "
-                 "`material mat(a=u)`. Write the call with nothing between it and the `]`.");
-            return false;
+    // Parse an array literal's `[ … ]` TEXT back into the same BrItem tree the grammar
+    // builds at a value site. Needed because a literal COMPOSED inside another one's
+    // sample call — `[0 1]([0.2 0.8](u))` — reaches the loader as raw characters inside a
+    // single PARENWORD token, not as a reduced bracket group: the lexer deliberately does
+    // not treat `(` as a delimiter (that is exactly what keeps an expression like
+    // `sin(2*pi*u)` one token), so everything between a call's parens is text by
+    // construction. The splitting rule here is the tokenizer's own — whitespace separates
+    // entries, `[`/`]` nest, and a paren group is held together so `[f(a b) 2]` keeps its
+    // call whole — which is what makes a composed literal read identically to a written-out
+    // one. On success `i` sits one past the closing `]`; on failure `err` says why.
+    static bool parseArrayText(const std::string& t, size_t& i,
+                               std::vector<BrItem>& out, std::string& err) {
+        ++i;                                         // past the '['
+        for (;;) {
+            while (i < t.size() && (t[i] == ' ' || t[i] == '\t')) ++i;
+            if (i >= t.size()) { err = "unbalanced `[`"; return false; }
+            if (t[i] == ']') { ++i; return true; }
+            if (t[i] == '[') {
+                BrItem g; g.isGroup = true;
+                if (!parseArrayText(t, i, g.items, err)) return false;
+                out.push_back(std::move(g));
+                continue;
+            }
+            const size_t s = i;
+            int d = 0;
+            while (i < t.size()) {
+                const char c = t[i];
+                if (c == '(') ++d;
+                else if (c == ')') {
+                    if (d == 0) { err = "unbalanced `)`"; return false; }
+                    --d;
+                } else if (d == 0 && (c == ' ' || c == '\t' || c == '[' || c == ']')) break;
+                ++i;
+            }
+            BrItem w; w.word = t.substr(s, i - s);
+            out.push_back(std::move(w));
         }
-        if (!s.val.words.empty()) {
-            fail(who + ": an inline array literal must be the whole value, but it follows '" +
-                 s.val.words.back() + "'");
-            return false;
-        }
+    }
+
+    static void addGenStmt(Block& blk, const char* key, std::vector<std::string> words, int line) {
+        Stmt t; t.key = key; t.line = line; t.val.words = std::move(words);
+        blk.words.push_back(t.key);
+        for (const auto& w : t.val.words) blk.words.push_back(w);
+        blk.stmts.push_back(std::move(t));
+    }
+
+    // Flatten ONE literal into an anonymous `grid __arrN` block (appended to `gen`) and
+    // check its sample call against the nesting. Shared by the two places a literal can
+    // appear: at a VALUE SITE (desugarOne, which additionally wraps the grid in a
+    // `pattern` so a statement has a name to reference) and COMPOSED inside another
+    // literal's sample call (desugarNestedLiterals), which needs the grid ALONE — because
+    // `grid:NAME(coords)` is already a legal pattern-expression term, so a composed
+    // literal costs one block instead of two and needs no name at the ftsl level at all.
+    // `call` is always the AUTHOR's text: arity and shape are checked, and errors phrased,
+    // against what they wrote — never against the rewritten text the composer produces.
+    bool buildArrayGrid(const std::vector<BrItem>& items, const std::string& call,
+                        const std::string& who, int line,
+                        std::vector<Block>& gen, int& n, std::string& outName) {
+        const std::string nm = "__arr" + std::to_string(n++);
         std::vector<int> shape;
         std::vector<std::string> flat;
-        if (!flattenArray(a.items, 0, shape, flat, who,
+        if (!flattenArray(items, 0, shape, flat, who,
                           " (use a named `scatter` element for irregular data)")) return false;
         if ((int)shape.size() > PAT_ND_MAX_DIM) {
             fail(who + ": " + std::to_string(shape.size()) + " nested axes exceeds the " +
@@ -2411,18 +2446,18 @@ private:
         {
             std::vector<std::string> args;
             int kwAt = -1; std::string kwFormal;
-            splitCallArgs(a.call, args, kwAt, kwFormal);
+            splitCallArgs(call, args, kwAt, kwFormal);
             // Emptiness before arity: `(u,)` is a stray comma, not a 2-D call, and saying so
             // beats "the array is 1-D but the call gives 2 coordinates".
             for (size_t k = 0; k < args.size(); ++k) {
                 if (!args[k].empty()) continue;
-                fail(who + ": axis " + std::to_string(k) + " of the sample call `" + a.call +
+                fail(who + ": axis " + std::to_string(k) + " of the sample call `" + call +
                      "` is empty — every axis needs a coordinate expression");
                 return false;
             }
             if ((int)args.size() != (int)shape.size()) {
                 fail(who + ": the array is " + std::to_string(shape.size()) +
-                     "-D but its sample call `" + a.call + "` gives " +
+                     "-D but its sample call `" + call + "` gives " +
                      std::to_string(args.size()) + " coordinate(s) — one per nesting level");
                 return false;
             }
@@ -2451,31 +2486,134 @@ private:
         Block g;
         g.type = "grid";
         g.name = nm;
-        auto addStmt = [&](Block& blk, const char* key, std::vector<std::string> words) {
-            Stmt t; t.key = key; t.line = a.line; t.val.words = std::move(words);
-            blk.words.push_back(t.key);
-            for (const auto& w : t.val.words) blk.words.push_back(w);
-            blk.stmts.push_back(std::move(t));
-        };
         {
             std::vector<std::string> sh;
             for (int d : shape) sh.push_back(std::to_string(d));
-            addStmt(g, "shape", sh);
-            addStmt(g, "lo", std::vector<std::string>(shape.size(), "0"));
-            addStmt(g, "hi", std::vector<std::string>(shape.size(), "1"));
-            addStmt(g, "data", flat);
+            addGenStmt(g, "shape", sh, line);
+            addGenStmt(g, "lo", std::vector<std::string>(shape.size(), "0"), line);
+            addGenStmt(g, "hi", std::vector<std::string>(shape.size(), "1"), line);
+            addGenStmt(g, "data", flat, line);
         }
         gen.push_back(std::move(g));
+        // Re-attribute anything that goes wrong inside the generated block (an unknown
+        // identifier in a coordinate, a `tex:` out of scope, …) back to the literal the
+        // author actually wrote — `__arrN` is a name they never chose and cannot search
+        // for. The grid and its wrapping pattern share the one name, so one entry covers
+        // both.
+        genSite_[nm] = who + ": the inline array literal's sample call `" + call + "`";
+        outName = nm;
+        return true;
+    }
+
+    // Rewrite a sample call's text, replacing every array literal COMPOSED inside it with
+    // a reference to its own freshly-generated grid, so that `[0 1]([0.2 0.8](u))` ends up
+    // as `grid:__arr1(grid:__arr0(u))` — TODO.md's `coord = NAME | NUMBER | value`, where
+    // a coordinate may itself be a sampled value. Recursion is on the call text, so the
+    // composition nests to any depth.
+    //
+    // The inner grids are emitted BEFORE the outer block that references them; ordering is
+    // not actually load-bearing (the data pass registers every grid before any pattern
+    // compiles), but emitting a definition before its use keeps the generated scene
+    // readable when dumped.
+    //
+    // This is also the only place that can diagnose a malformed composed literal: the lexer
+    // captures the whole call as one PARENWORD without balance-checking the brackets inside
+    // it (see ftsl_scene.epeg), precisely so that the complaint can be phrased against the
+    // author's own source instead of surfacing as a token that mysteriously fails to match.
+    bool desugarNestedLiterals(const std::string& text, const std::string& who, int line,
+                               std::vector<Block>& gen, int& n, std::string& out) {
+        out.clear();
+        for (size_t i = 0; i < text.size(); ) {
+            if (text[i] != '[') { out += text[i++]; continue; }
+            const size_t at = i;
+            // The pattern language has NO bracket syntax of its own, so a `[` here always
+            // opens a composed literal — but one written flush against an identifier
+            // (`f[0 1](u)`) is a typo, not a composition. Caught before the substitution
+            // rather than after, because the rewrite would otherwise glue the author's
+            // token to the generated name and report an "unknown identifier `fgrid`" that
+            // appears nowhere in their file.
+            if (at > 0) {
+                const char p = text[at - 1];
+                if (std::isalnum((unsigned char)p) || p == '_' || p == '.' || p == ':') {
+                    fail(who + ": an array literal composed into a sample call has to stand "
+                         "on its own as a coordinate, but this one directly follows `" +
+                         std::string(1, p) + "` — separate them, or drop the stray text");
+                    return false;
+                }
+            }
+            std::vector<BrItem> items;
+            std::string err;
+            if (!parseArrayText(text, i, items, err)) {
+                fail(who + ": " + err + " in the array literal composed into the sample call "
+                     "at `" + text.substr(at) + "`");
+                return false;
+            }
+            const std::string lit = text.substr(at, i - at);
+            if (i >= text.size() || text[i] != '(') {
+                fail(who + ": the array literal `" + lit + "` composed into a sample call "
+                     "needs its own trailing call naming the coordinates it is read at — "
+                     "e.g. `" + lit + "(u)`");
+                return false;
+            }
+            const size_t cs = i;
+            int d = 0;
+            for (; i < text.size(); ++i) {
+                if (text[i] == '(') ++d;
+                else if (text[i] == ')' && --d == 0) { ++i; break; }
+            }
+            if (d != 0) {
+                fail(who + ": unbalanced `(` in the sample call of the composed array "
+                     "literal `" + lit + "` at `" + text.substr(cs) + "`");
+                return false;
+            }
+            const std::string innerCall = text.substr(cs, i - cs);
+            std::string innerOut;
+            if (!desugarNestedLiterals(innerCall, who, line, gen, n, innerOut)) return false;
+            std::string nm;
+            if (!buildArrayGrid(items, innerCall, who, line, gen, n, nm)) return false;
+            out += "grid:" + nm + innerOut;
+        }
+        return true;
+    }
+
+    // Turn ONE literal into its `grid` + `pattern` pair (appended to `gen`) and rewrite
+    // the statement's value to reference the generated pattern.
+    bool desugarOne(Stmt& s, std::vector<Block>& gen, int& n) {
+        const ArrayLit& a = *s.val.array;
+        const std::string who = "line " + std::to_string(a.line) + ": `" + s.key + "`";
+        if (a.call.empty()) {
+            // Two ways to finish an array, and the message names both: SPEND the axis here
+            // (`(u)`), or leave it as a FORMAL for whoever uses the material (`(a)`, bound
+            // at the use site by `mat(a=u)`). The second is the "unsaturated, completed by
+            // the user" case from the design — in ftrace it is spelled by naming `a`, the
+            // one input with no per-hit intrinsic, rather than by omitting the call.
+            fail(who + ": an inline array literal needs a trailing sample call naming the "
+                 "coordinates it is read at — e.g. `[0 1](u)`, or `[[0 1][2 3]](u,v)` for "
+                 "2-D. To leave the choice to whoever USES this material, name the free "
+                 "input instead — `[0 1](a)` — and bind it at the use site with "
+                 "`material mat(a=u)`. Write the call with nothing between it and the `]`.");
+            return false;
+        }
+        if (!s.val.words.empty()) {
+            fail(who + ": an inline array literal must be the whole value, but it follows '" +
+                 s.val.words.back() + "'");
+            return false;
+        }
+        // A literal composed INSIDE this one's sample call becomes its own grid first, and
+        // the call text is rewritten to reference it. The rewritten text is used ONLY for
+        // the generated expression: every message stays phrased against `a.call`, which is
+        // what the author actually wrote.
+        std::string emitCall;
+        if (!desugarNestedLiterals(a.call, who, a.line, gen, n, emitCall)) return false;
+
+        std::string nm;
+        if (!buildArrayGrid(a.items, a.call, who, a.line, gen, n, nm)) return false;
 
         Block p;
         p.type = "pattern";
         p.name = nm;
-        addStmt(p, "expr", {"grid:" + nm + a.call});
+        addGenStmt(p, "expr", {"grid:" + nm + emitCall}, a.line);
         gen.push_back(std::move(p));
-        // Re-attribute anything that goes wrong inside the generated pair (an unknown
-        // identifier in a coordinate, a `tex:` out of scope, …) back to the literal the
-        // author actually wrote — `__arrN` is a name they never chose and cannot search for.
-        genSite_[nm] = who + ": the inline array literal's sample call `" + a.call + "`";
 
         s.val.array.reset();
         s.val.words.push_back("pattern:" + nm);

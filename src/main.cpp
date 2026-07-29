@@ -2037,12 +2037,19 @@ static int checkArray() {
         }
         return base;
     };
-    auto sameReflect = [&](const char* what, const char* refBody, const char* twinBody) {
+    // `tol` defaults to the bit-identity the rebind cases demand: those twins are the SAME
+    // grid sampled two ways, so any difference at all is a real one. A twin that spells the
+    // coordinate ARITHMETICALLY instead (section h) is a different claim — grid samples are
+    // stored as float32 while an expression evaluates in double, so the two agree only to
+    // float precision (~1e-8 here), and demanding more would be pinning the storage format
+    // rather than the semantics.
+    auto sameReflect = [&](const char* what, const char* refBody, const char* twinBody,
+                           double tol = 1e-12) {
         ftsl::Loaded A, B;
         if (!loadMats(refBody, A) || !loadMats(twinBody, B)) { chk(what, false); return; }
         for (int k = 0; k < 5; ++k) {
             double a = reflectAt(A, probeOf(A), pts[k]), b = reflectAt(B, probeOf(B), pts[k]);
-            if (std::fabs(a - b) > 1e-12) {
+            if (std::fabs(a - b) > tol) {
                 std::printf("[checkarray] %-58s BAD (pt %d: %.12g vs %.12g)\n", what, k, a, b);
                 ok = false; return;
             }
@@ -2172,6 +2179,60 @@ static int checkArray() {
         "material \"src\" { type diffuse  reflect [0 1](a) }\n"
         "material \"probe\" { type diffuse  reflect src.reflect(b=u) }",
         "not a bindable input");
+
+    // (h) COMPOSITION — a coordinate may itself be a sampled value, so a literal can be
+    //     written directly into another's sample call. Every identity here is checked
+    //     against a twin whose coordinate is spelled out ARITHMETICALLY, which is the
+    //     strongest available statement: the composed form is not merely self-consistent,
+    //     it agrees with what the inner grid's interpolation is defined to mean.
+    //     (A 2-sample grid over lo=0 hi=1 interpolates linearly, so `[0.5 1](u)` IS
+    //     `0.5+0.5*u` — that equivalence is what makes these twins non-circular.)
+    sameReflect("`[0 1]([0.2 0.8](u))` == the composed coordinate written inline",
+        "material \"probe\" { type diffuse  reflect [0 1]([0.2 0.8](u)) }",
+        "material \"probe\" { type diffuse  reflect [0 1](0.2+0.6*u) }", 1e-6);
+    varies("...and a composed literal actually tracks its innermost driver",
+        "material \"probe\" { type diffuse  reflect [0 1]([0.2 0.8](u)) }");
+    // A NON-identity outer array, so the case cannot pass by the outer grid being a
+    // no-op that returns its own coordinate: here the outer is a 3-sample tent, and
+    // sampling it over the inner's [0.5,1] half gives the falling edge, `1-u`.
+    sameReflect("a non-identity outer array composes correctly (`[0 1 0]([0.5 1](u))`)",
+        "material \"probe\" { type diffuse  reflect [0 1 0]([0.5 1](u)) }",
+        "material \"probe\" { type diffuse  reflect [1 0](u) }", 1e-6);
+    sameReflect("composition nests to depth 3",
+        "material \"probe\" { type diffuse  reflect [0 1]([0 1]([0.2 0.8](u))) }",
+        "material \"probe\" { type diffuse  reflect [0.2 0.8](u) }", 1e-6);
+    sameReflect("a composed literal is one AXIS of a multi-axis call, not the whole call",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]]([0.5 1](u), v) }",
+        "material \"probe\" { type diffuse  reflect [[0 0.3][0.6 1]](0.5+0.5*u, v) }", 1e-6);
+    sameReflect("a composed literal is a TERM in a coordinate expression",
+        "material \"probe\" { type diffuse  reflect [0 1](0.5*[0.5 1](u)+0.25) }",
+        "material \"probe\" { type diffuse  reflect [0 1](0.5*(0.5+0.5*u)+0.25) }", 1e-6);
+    // The refusals. A composed literal reaches the loader as raw TEXT inside one token
+    // (the lexer cannot balance-check brackets it is deliberately holding together), so
+    // the loader is the only place these can be diagnosed — and it must diagnose them
+    // against the author's own source rather than let a mangled name reach the compiler.
+    mustReject("a composed literal needs its own sample call",
+        "material \"probe\" { type diffuse  reflect [0 1]([0.2 0.8]) }",
+        "needs its own trailing call");
+    mustReject("an unbalanced composed literal is named, not silently re-lexed",
+        "material \"probe\" { type diffuse  reflect [0 1]([0.2 0.8 (u)) }",
+        "unbalanced");
+    mustReject("the composed literal's OWN arity is checked against its nesting",
+        "material \"probe\" { type diffuse  reflect [0 1]([[0 1][2 3]](u)) }",
+        "one per nesting level");
+    mustReject("a literal glued to an identifier is a typo, not a composition",
+        "material \"probe\" { type diffuse  reflect [0 1](x[0.2 0.8](u)) }",
+        "stand on its own");
+    {
+        // Same rule as (f), one level deeper: the generated names multiply under
+        // composition, so this is exactly where a leak would show up first.
+        ftsl::Loaded L; std::string e;
+        ftsl::loadSource(wrap("material \"probe\" { type diffuse  reflect [0 1]([0.2 0.8](nope)) }"),
+                         "<checkarray>", L, e);
+        chk("a bad coordinate INSIDE a composition still names the author's site",
+            e.find("__arr") == std::string::npos &&
+            e.find("unknown identifier 'nope'") != std::string::npos);
+    }
 
     std::printf("[checkarray] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
