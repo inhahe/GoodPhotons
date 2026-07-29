@@ -201,12 +201,62 @@ paths they can capture at all**.
 | `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera; independent photons | CPU + **GPU** |
 | `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU + GPU |
 | `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU + **GPU** |
+| `W` | Deterministic preview | Mode `R` with **every estimator replaced by a fixed quadrature** — a POV-Ray-style Whitted render that is noise-free at `-spp 1` and ~2 orders of magnitude faster than converging `R`. Trades diffuse GI (see `-ambient`) and unbiasedness for speed | CPU |
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
 | `M` | Photon map | Builds a **view-independent** photon map once, then gathers the camera image from it — a direct radius density estimate at the first diffuse hit, or a Jensen final gather one bounce away with `-pmfg <K>` (reusable across cameras) | CPU + **GPU** (direct estimate) |
 | `S` | SPPM | Stochastic **progressive** photon mapping: repeated photon passes with a shrinking per-pixel radius — converges (unbiased in the limit), bounded memory, excels at caustics | CPU + **GPU** |
 | `U` | VCM/UPS | Vertex **connection and merging**: BDPT vertex connections **and** SPPM photon merging combined under one MIS weight — robust across diffuse GI, glossy, and caustics in a single estimator | CPU + **GPU** |
+
+### Mode `W` — the deterministic (POV-Ray-style) preview
+
+Every other backward mode here is **Monte Carlo**, so its images are noisy until you
+spend samples: mode `R` draws a random point on each area light, a random direction in
+each glossy lobe, a random Russian-roulette coin at each specular vertex, a random
+subpixel offset, and a random wavelength. That's why `-mode R` looks grainy even with
+`-rgb` — `-rgb` only removes the *wavelength* dimension, not the other four.
+
+The classic ray tracers (POV-Ray, and Whitted's original) are noise-free precisely
+because they replace all of those draws with **fixed quadratures**, and `-mode W` does
+the same on top of ftrace's mode-R walk:
+
+| Mode `R` (random) | Mode `W` (fixed) |
+|---|---|
+| one random point per area light | an **N×N lattice** over the light (`-whitted-grid`, default 4 → 16 shadow rays) |
+| random direction in the glossy lobe | the **mirror direction**, weighted by the lobe's reflectance |
+| Russian roulette at specular vertices | **attenuate the throughput** instead, and stop below an `adc_bailout`-style 1/512 cutoff |
+| random branch at half-mirrors / layers / mixes | the **dominant** branch, weighted (mixes hard-threshold at ½) |
+| random wavelength per sample | a fixed lattice of **8 hero wavelengths** riding one BVH walk |
+| random subpixel jitter | a progressive low-discrepancy pattern, **identical in every pixel** (sample 0 is the pixel centre) |
+| stochastic diffuse indirect | dropped — implies `-direct-only`; see `-ambient` |
+
+The last row is the point: neighbouring pixels differ only by their *geometry*, never by
+their *luck*, so there is nothing to average out. On a 420² test scene, mode `R` on the
+CPU needs ~625 spp (~80 min) to reach 4 % graininess; mode `W` produces a clean image in
+**14.6 s at `-spp 1`** — about **300×**. In mode `W`, `-spp` stops meaning "less noise"
+and starts meaning *finer antialiasing and a denser spectrum*; the picture gets sharper,
+never less grainy, and the progress line reads `deterministic` instead of a noise figure.
+
+**`-ambient <v>` — the GI stand-in.** With the diffuse indirect bounce gone, a *closed*
+room previews with black shadows, because everything not directly facing the light is lit
+purely by bounce. `-ambient` adds POV-Ray's flat fill at every diffuse vertex; it is
+dimensionless — a fraction of a light's own radiance — so the same value works in any
+scene regardless of its absolute radiometric scale. `0.02..0.2` is the useful band
+(on the closed gold-gyroid room, `0.05` roughly halves the error against the full-GI
+reference). It is physically a lie, and it is what makes the mode usable indoors.
+
+**Honest limits.** Mode `W` is a *preview*, not a reference: it is biased. It is CPU-only
+(the GPU backward megakernel keeps the stochastic path). Rough glossy metal renders
+sharper than it really is, because one mirror ray can't spread a lobe. A half-mirror or
+layered coat picks its dominant branch instead of forking, and a pattern-driven material
+mix hard-thresholds instead of dithering. Dielectrics still choose reflect-vs-refract
+stochastically, so glass keeps a little noise (see `known-issues.md`). And no ambient
+constant is colour bleeding. When you want the truth, that's what `R`/`D`/`U` are for.
+
+```sh
+ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -window -keepwindow -o png/preview.png
+```
 
 > **Quick preview — `-raster` (not a transport mode).** To eyeball *composition*
 > and *camera motion* before committing to a full render, `-raster` skips light
@@ -530,6 +580,7 @@ that converges to the same physical image.
 | `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
 | `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
 | `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
+| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1` | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: no diffuse GI (use `-ambient`), rough glossy over-sharpened, CPU only |
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
 | `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / spot / env lights |
@@ -2601,6 +2652,8 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-no-fluoro` / `-nofluoro` | Demote every fluorescent material to a plain diffuse (using its elastic reflectance albedo) — skips the wavelength-shifting re-emission. |
 | `-max-bounce <N>` | Set path depth to `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, the photon modes, and the bidirectional `D`/`U`). Default is the tracer's own cap: **32** for the unidirectional tracers, **8** for `D`/`U`, whose connection cost grows ~depth². For `D`/`U` the flag therefore *raises* the depth as often as it caps it — a specular-only cavity (a mirror-lined sphere, a kaleidoscope, deeply nested dielectrics) truncates its recursive images to black at 8 edges and wants `-max-bounce 24`–`48` before the hall of mirrors fills in. Specular vertices are cheap there: a delta BSDF has no connection to make. |
 | `-direct-only` / `-directonly` | **Whitted mode:** after a non-specular vertex (diffuse / diffuse-transmit / elastic-fluorescent / fog single-scatter) does its direct-lighting NEE, stop — no diffuse indirect (no colour bleeding, black shadows). Specular chains (mirror / glass / glossy / filter) still recurse. Scoped to the **camera** path tracers (`R` spectral + `-rgb`, and `P`'s backward layer); forward `B` and the photon/BDPT modes honour `-max-bounce` but ignore this. |
+| `-whitted-grid <n>` | **Mode `W` only.** Fire an `n`×`n` fixed lattice of shadow rays at every area light instead of one random point (default `4` → 16 rays). This is the single knob that decides how smooth a soft shadow is; a point/spot/collimated light is a deterministic connection already and ignores it. |
+| `-ambient <v>` / `-amb <v>` | **Mode `W` only.** Flat ambient fill added at every diffuse vertex (POV-Ray's `ambient`) — the cheap stand-in for the diffuse GI mode `W` drops, without which a **closed** room previews with black shadows. **Dimensionless:** `v` is a fraction of a light's own radiance (internally scaled by `Scene::ambientRef()`), so the same value behaves the same in any scene whatever its absolute radiometric scale. Default `0`; `0.02..0.2` is the useful band. |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,

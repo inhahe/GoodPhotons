@@ -5,6 +5,39 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### DEBT (2026-07-29, v0.105.0): mode `W` still samples dielectrics stochastically
+
+`-mode W` replaced every other Monte-Carlo estimator on the backward walk with a fixed
+quadrature (light grid, mirror direction, throughput attenuation instead of Russian
+roulette, dominant branch at half-mirrors/layers/mixes, fixed λ lattice, fixed subpixel
+pattern), but **`refractOrReflect` was deliberately left alone**: it still draws
+`rng.uniform()` to choose reflect vs refract at a dielectric interface. So a scene with
+glass in it is noise-free everywhere *except* the glass, which is exactly where the eye
+goes.
+
+*Proper fix:* the same treatment `MatType::HalfMirror` got — take the branch with the
+larger Fresnel weight and multiply the throughput by that weight, stopping under
+`kWhittedCutoff`. The complication is that a dielectric is the one place where forking
+*both* branches genuinely matters (a window shows a reflection and what's behind it at
+once), so "dominant only" will visibly drop one of them near the Brewster/grazing region;
+the honest version forks up to a small depth budget, POV-Ray-style. That needs
+`radiance`/`radianceHero` to grow a recursive branch, which they currently avoid (both
+are iterative single-path loops). Until then the README documents mode `W` on glass as
+"still a little noisy".
+
+### DEBT (2026-07-29, v0.105.0): mode `W` over-sharpens rough glossy metal
+
+`interactMaterial` sends a mode-`W` glossy vertex along the exact mirror direction,
+weighted by the lobe's reflectance. That is near-exact for the tight lobes this engine's
+metals usually use (the gold in `gold_gyroids` is roughness 0.045 and reads essentially
+identically to full GI) and it is why the mode converges at 1 spp — but a genuinely rough
+metal (roughness ≳ 0.2) previews crisper than it renders.
+
+*Proper fix:* a small fixed lattice of lobe directions — the same trick `-whitted-grid`
+plays for area lights. N deterministic offsets around the mirror direction, weighted by
+the lobe, with N scaled off the roughness so smooth metals stay at one ray. Cost is
+linear in N, and only on specular chains.
+
 ### BUG — DONE (2026-07-29, v0.102.1): `-exposure`/`-ev` was silently ignored by `-topng`
 
 `ftrace -topng in.ftbuf out.png -ev 3` produced a file byte-identical to the one

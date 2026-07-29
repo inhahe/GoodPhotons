@@ -2650,6 +2650,11 @@ static double g_vcmAlpha = 0.75;
 // Set once at arg-parse; clamped to [1, hero::kHeroMax]. N==1 turns hero off (bit-identical
 // single-λ). Defaults to hero::kHeroC (4). GPU / BDPT / VCM paths ignore it (still single-λ).
 static int g_heroC = hero::kHeroC;
+// Was -heroc given explicitly? Mode W raises the default to the full kHeroMax bundle
+// (the C wavelengths ride ONE shared BVH walk, so a wider bundle is very nearly free,
+// while it is the only thing that buys spectral accuracy at 1 spp) — but never over an
+// explicit user choice.
+static bool g_heroCSet = false;
 
 // Scene-ignore render params (Stage 3), set once at arg-parse and read by the tracer
 // wrappers (like g_heroC). g_maxBounceOverride < 0 leaves each tracer's own default
@@ -2664,6 +2669,19 @@ static int g_heroC = hero::kHeroC;
 // bidirectional modes (M/S/D) honour maxBounce but ignore directOnly.
 static int  g_maxBounceOverride = -1;
 static bool g_directOnly = false;
+
+// -mode W: the DETERMINISTIC Whitted preview. g_directOnly alone still leaves every
+// estimator stochastic (one random light point, one random glossy direction, a Russian-
+// roulette coin per specular bounce), so it needs tens of spp to look clean and buys
+// only ~3x over full GI. g_whitted additionally swaps all three for their deterministic
+// equivalents, which is what lets it converge at ONE sample per pixel -- the actual
+// order-of-magnitude win, and what POV-Ray does. g_whittedGrid is the NxN shadow-ray
+// lattice per area light; g_ambient is the flat GI stand-in (POV-Ray's `ambient`),
+// without which a CLOSED room previews with black shadows, since everything there that
+// isn't facing the key light is lit purely by the bounce this mode drops.
+static bool g_whitted = false;
+static int  g_whittedGrid = 4;
+static double g_ambient = 0.0;
 
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
@@ -2939,6 +2957,10 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         BackwardRenderer br; br.diffraction = diffraction; br.heroC = g_heroC;
         if (g_maxBounceOverride >= 1) br.maxBounce = g_maxBounceOverride;
         br.directOnly = g_directOnly;
+        br.whitted = g_whitted; br.lightGrid = g_whittedGrid;
+        // -ambient is dimensionless (fraction of a light's own radiance); convert to
+        // this scene's absolute radiance scale here. See Scene::ambientRef().
+        br.ambient = g_ambient * scene.ambientRef();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
         br.renderRows(scene, cam, out, y0, y1, spp, sampleBase);
     };
@@ -3919,9 +3941,15 @@ static int runSppProgressive(
         // Every pixel receives exactly totalSpp samples, so the Monte-Carlo relative error
         // ~ 1/sqrt(samples) gives an honest graininess ballpark straight from the count.
         double noisePct = totalSpp > 0 ? 100.0 / std::sqrt((double)totalSpp) : 0.0;
+        // Mode W has no Monte-Carlo noise to report (every estimator is a fixed
+        // quadrature), so quoting 1/sqrt(spp) there would be pure fiction; spp only
+        // buys antialiasing and spectral resolution. Say so instead.
+        char nz[32];
+        if (g_whitted) std::snprintf(nz, sizeof nz, "deterministic");
+        else           std::snprintf(nz, sizeof nz, "~%.2f%% noise", noisePct);
         bool stopped  = g_stopRequested != 0;
         bool timeUp   = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
-        bool noiseMet = (noiseTarget > 0.0 && totalSpp > 0 && noisePct <= noiseTarget);
+        bool noiseMet = (!g_whitted && noiseTarget > 0.0 && totalSpp > 0 && noisePct <= noiseTarget);
         if (noiseMet) metNoise = true;
         bool stop = stopped || timeUp || noiseMet;
         bool done = stop || final;
@@ -3944,17 +3972,17 @@ static int runSppProgressive(
             const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
             char st[220];
             if (runForever)
-                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld spp, ~%.2f%% noise%s",
-                              elapsed, totalSpp, noisePct, why);
+                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld spp, %s%s",
+                              elapsed, totalSpp, nz, why);
             else if (timeBudgetSec > 0.0)
-                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld spp, ~%.2f%% noise%s",
-                              elapsed, timeBudgetSec, totalSpp, noisePct, why);
+                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld spp, %s%s",
+                              elapsed, timeBudgetSec, totalSpp, nz, why);
             else if (noiseTarget > 0.0)
-                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld spp, ~%.2f%% noise%s",
-                              noiseTarget, elapsed, totalSpp, noisePct, why);
+                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld spp, %s%s",
+                              noiseTarget, elapsed, totalSpp, nz, why);
             else
-                std::snprintf(st, sizeof st, "[spp] %lld / %lld, %.1fs, ~%.2f%% noise",
-                              totalSpp, baseSpp + sppReq, elapsed, noisePct);
+                std::snprintf(st, sizeof st, "[spp] %lld / %lld, %.1fs, %s",
+                              totalSpp, baseSpp + sppReq, elapsed, nz);
             if (preview) ansiPreview(*shown, (double)totalSpp, manualExposure, st);
             else { std::printf("%s\n", st); std::fflush(stdout); }
             liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute, st);
@@ -4223,7 +4251,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     const bool gpuForwardMode =
         (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
     const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
-    const bool gpuBackwardMode = (mode == 'R');   // GPU backward reference megakernel (own check)
+    // GPU backward reference megakernel (own check). -mode W is excluded: the device
+    // megakernel has its own twin of the NEE / RR / lobe sampling (render_cuda.cu), none
+    // of which knows about the deterministic estimators, so running it would silently
+    // give back the noisy image the mode exists to avoid. Whitted stays on the CPU --
+    // which it can afford, being ~1 spp.
+    const bool gpuBackwardMode = (mode == 'R' && !g_whitted);
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
     const bool fisheyeCam = (cam.projection != CAM_RECTILINEAR);
@@ -5230,6 +5263,9 @@ static void printHelp(const char* prog) {
 "\n"
 "Render mode & budget:\n"
 "  -mode <letter>        transport mode (default B; A/B/C forward, R/V/D backward — see README)\n"
+"  -mode W               deterministic POV-Ray-style preview: mode R with every estimator\n"
+"                        replaced by a fixed quadrature, so it is noise-free at -spp 1\n"
+"                        (CPU only). See -whitted-grid / -ambient below\n"
 "  -n <count>            photon/sample count (accepts 2e8, 1.5e9)\n"
 "  -r <W> [H]            resolution (square if H omitted)\n"
 "  -time <sec>           wall-clock budget (progressive)\n"
@@ -5255,6 +5291,14 @@ static void printHelp(const char* prog) {
 "                        where raising it is what a mirror-lined cavity needs)\n"
 "  -direct-only          Whitted: direct + specular recursion only, no diffuse indirect\n"
 "                        (near-1-spp preview; camera modes R/RGB and P's backward side)\n"
+"\n"
+"Mode W (deterministic preview) tuning:\n"
+"  -whitted-grid <n>     n×n fixed shadow rays per area light (default 4 = 16 rays);\n"
+"                        this is what makes a soft shadow smooth instead of noisy\n"
+"  -ambient|-amb <v>     flat ambient fill, as a fraction of a light's own radiance\n"
+"                        (default 0; try 0.02..0.2). The stand-in for the diffuse GI\n"
+"                        mode W drops — without it a CLOSED room previews with black\n"
+"                        shadows, since everything there is lit by bounce\n"
 "\n"
 "Output, preview & checkpointing:\n"
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
@@ -5519,7 +5563,15 @@ static int run(int argc, char** argv) {
     // than silently ignored.
     char cliModePrescan = 0;
     for (int i = 1; i + 1 < argc; ++i) {
-        if (!std::strcmp(argv[i], "-mode")) cliModePrescan = argv[i + 1][0];
+        if (!std::strcmp(argv[i], "-mode")) {
+            cliModePrescan = argv[i + 1][0];
+            // -mode W is the deterministic Whitted preview. It is not a separate
+            // transport: it reuses the backward tracer's traversal wholesale and only
+            // swaps the stochastic estimators for deterministic ones, so it normalises
+            // to 'R' HERE -- before any of the dozen `mode == 'R'` capability checks
+            // downstream -- and carries its difference in g_whitted instead.
+            if (cliModePrescan == 'W' || cliModePrescan == 'w') cliModePrescan = 'R';
+        }
         else if (!std::strcmp(argv[i], "-on-unsupported")) {
             std::string v = argv[i + 1];
             if      (v == "fallback" || v == "fall") g_onUnsupported = OnUnsupported::Fallback;
@@ -5635,7 +5687,16 @@ static int run(int argc, char** argv) {
                 resYCli = std::atoi(argv[++i]);
         }
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
-        else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
+        else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) {
+            mode = argv[++i][0]; modeFromCli = true;
+            if (mode == 'W' || mode == 'w') { mode = 'R'; g_whitted = true; }   // see the prescan
+        }
+        else if (!std::strcmp(argv[i], "-whitted-grid") && i + 1 < argc) {
+            g_whittedGrid = std::max(1, std::atoi(argv[++i]));
+        }
+        else if ((!std::strcmp(argv[i], "-ambient") || !std::strcmp(argv[i], "-amb")) && i + 1 < argc) {
+            g_ambient = std::max(0.0, std::atof(argv[++i]));
+        }
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         // An explicit absolute radius pins the radius: don't then adapt it out from under
         // the user (this was the documented workaround for mode M's scaling problem).
@@ -5654,6 +5715,7 @@ static int run(int argc, char** argv) {
             g_heroC = std::atoi(argv[++i]);
             if (g_heroC < 1) g_heroC = 1;
             if (g_heroC > hero::kHeroMax) g_heroC = hero::kHeroMax;
+            g_heroCSet = true;
         }
         // Split-at-dispersion instead of de-hero. A single global policy flag read by
         // every CPU forward tracer via Renderer::heroSplit's default initialiser, so it
@@ -5990,9 +6052,18 @@ static int run(int argc, char** argv) {
     // Publish the depth cap / direct-only mode to the tracer wrappers (globals, like
     // g_heroC), so every render (incl. the meter pre-pass) honours them.
     g_maxBounceOverride = maxBounceOverride;
-    g_directOnly = directOnly;
+    g_directOnly = directOnly || g_whitted;   // -mode W implies it
     if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);
-    if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
+    if (g_whitted) {
+        // Widen the spectral bundle by default (see g_heroCSet): at 1 spp the C hero
+        // wavelengths ARE the whole spectral quadrature, and they share one BVH walk,
+        // so this is the cheapest accuracy in the mode.
+        if (!g_heroCSet) g_heroC = hero::kHeroMax;
+        std::printf("[mode W] deterministic Whitted preview: %dx%d shadow rays/light, "
+                    "%d wavelengths/sample, ambient %.3g\n",
+                    g_whittedGrid, g_whittedGrid, g_heroC, g_ambient);
+    }
+    else if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
     // -herosplit only reaches the CPU forward tracer; say so rather than silently
     // ignoring it, and point out that it is a no-op without a bundle to split.
     if (hero::gSplit) {

@@ -248,6 +248,23 @@ inline int mixPickChild(const Material& m, double u) {
     return -1;   // leftover slice -> absorbed
 }
 
+// Deterministic counterpart of mixPickChild for the Whitted preview (-mode W), which
+// cannot flip a coin without reintroducing the per-pixel noise the mode exists to
+// avoid: return the HEAVIEST child (the lobe that carries most of the material's
+// response), or -1 if the leftover absorption slice outweighs every child. Ties go to
+// the first child, so the choice is stable frame to frame.
+inline int mixDominantChild(const Material& m) {
+    int best = -1;
+    double bestW = 0.0;
+    for (size_t k = 0; k < m.mixChildren.size(); ++k) {
+        if (m.mixWeights[k] > bestW) { bestW = m.mixWeights[k]; best = m.mixChildren[k]; }
+    }
+    double sum = 0.0;
+    for (size_t k = 0; k < m.mixWeights.size(); ++k) sum += m.mixWeights[k];
+    if (1.0 - sum > bestW) return -1;   // leftover absorbs more than any single lobe
+    return best;
+}
+
 // A classic "green highlighter" fluorophore: absorbs blue/violet strongly, glows
 // green (~560 nm). Shared by the fluoro demo scene and the -checkfluoro self-test
 // so both exercise the exact same material definition (single source of truth).
@@ -1310,6 +1327,24 @@ struct Scene {
         return lo;
     }
 
+    // Reference radiance for the Whitted preview's flat ambient term (backward.h).
+    // The geomWeight-weighted mean emitter radiance, expressed in exactly the units
+    // an NEE connection carries (spd(lambda) * invPdfLambda(lambda)): for a single
+    // light that product is emitG/geomWeight identically, independent of lambda, so
+    // this is a wavelength-flat "one light's worth of radiance".
+    //
+    // Why it exists: this renderer works in absolute spectral radiance, where a
+    // plausible fill level can be 1e13, so an ambient given as a raw radiance would
+    // be unusable and scene-specific. Scaling by this makes `-ambient 0.1` mean
+    // "fill the scene uniformly with a tenth of a light's own radiance" in ANY
+    // scene. A key light usually subtends well under a steradian as seen from the
+    // surfaces it lights, so useful values live in roughly 0.01 .. 0.3.
+    double ambientRef() const {
+        double wSum = 0.0;
+        for (const auto& e : emitters) wSum += e.geomWeight();
+        return (wSum > 0.0) ? emitG / wSum : 0.0;
+    }
+
     // Per-lambda weight for the backward reference: emitG / g(lambda), i.e. the
     // reciprocal of the sampled wavelength pdf. Reduces to a single light's
     // emitIntegral once multiplied by that light's SPD(lambda).
@@ -1782,4 +1817,23 @@ inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, 
         return (u < t) ? m.mixChildren[0] : m.mixChildren[1];
     }
     return mixPickChild(m, u);
+}
+
+// Deterministic mixResolveChild for the Whitted preview (-mode W). A pattern/texture
+// driven two-way mix picks whichever child dominates AT THIS POINT, so the blend
+// becomes a hard threshold at t == 0.5 rather than a stochastic dither: the preview
+// shows a crisp boundary where the render shows a smooth gradient. That is the honest
+// cost of one deterministic sample per pixel, and it stays put frame to frame.
+inline int mixResolveDominant(const Scene& scene, const Material& m, const Hit& h) {
+    if (m.mixChildren.size() == 2 &&
+        (m.mixWeightPat >= 0 || m.mixWeightTex >= 0)) {
+        double t;
+        if (m.mixWeightPat >= 0 && m.mixWeightPat < (int)scene.patterns.size())
+            t = scene.patterns[m.mixWeightPat].eval(patCtxFromHit(scene, h));
+        else
+            t = scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
+        if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
+        return (t >= 0.5) ? m.mixChildren[0] : m.mixChildren[1];
+    }
+    return mixDominantChild(m);
 }

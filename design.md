@@ -15,6 +15,7 @@ this file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `B` | forward light tracing, splat through pinhole/lens to film (flagship) | `render.h` |
 | `C` | forward + contact sensor | `render.h` |
 | `R` | backward (unidirectional) path tracer — the reference | `backward.h` |
+| `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased, CPU only) | `backward.h` (`whitted`) |
 | `P` | composite: forward B + backward R passes merged | `main.cpp` orchestration |
 | `D` | bidirectional path tracer (BDPT, MIS) | `bdpt.h` |
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather) | `photonmap.h`, `photonmap_render.h` |
@@ -177,6 +178,29 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   delta lobes Mirror/Filter/Glossy, which for the same reason as BDPT's
   `keepBundle` do **not** de-hero (their outgoing direction ignores λ). At
   `nUp == 1` every one of these is the scalar code verbatim.
+
+  **Mode `W` (the `whitted` flag)** shares this whole walk and swaps only the
+  *estimators*, which is why it is a flag and not a second tracer. Every stochastic
+  decision on the path gets a deterministic replacement: the area-light NEE point
+  becomes an N×N lattice (`lightGrid`, `-whitted-grid`); the glossy lobe becomes the
+  mirror direction weighted by its reflectance; Russian roulette on Mirror / Filter /
+  Grating / specular-bundle survival becomes `whittedAttenuate` (multiply the
+  throughput by the weight, stop under `kWhittedCutoff` = 1/512 — POV-Ray's
+  `adc_bailout`); HalfMirror / Layered take the dominant branch weighted, and a Mix
+  hard-thresholds via `mixResolveDominant` (`scene.h`); the wavelength and the
+  subpixel offset come off radical-inverse sequences instead of the rng. It implies
+  `directOnly`, with `ambient` (a flat term at each diffuse vertex) as the GI
+  stand-in — pre-scaled by `Scene::ambientRef()` so the CLI value is dimensionless.
+
+  Two invariants matter here. (1) **Every pixel uses the same offsets** — that is
+  what makes the mode noise-free, since neighbours then differ only by geometry, not
+  by luck. (2) The sample sequences are indexed by the **absolute** sample index and
+  are *progressive*, exactly like the rng stream's `seedUnit`, so the image is
+  independent of the chunk split. A per-chunk `(s+½)/spp` lattice would silently
+  collapse to "sample 0 forever" under `-window` (which chunks into 1-spp batches)
+  and make `-spp` a no-op on the image — this was a real bug, fixed in 0.105.0.
+  Mode `W` also raises the default hero bundle to `kHeroMax`, since at 1 spp the C
+  wavelengths *are* the whole spectral quadrature and they share one BVH walk.
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,
@@ -765,6 +789,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   wrappers. `directOnly` (terminate after the first non-specular NEE, specular chains
   still recurse) is scoped to the camera path tracers (R spectral + RGB, P's backward
   layer); forward B and the photon/BDPT modes honour only `maxBounce`.
+  Mode `W` rides the same pattern with three more globals — `g_whitted` (set by the
+  `-mode W` → `'R'` normalization, which must happen in **both** `cliModePrescan` and
+  the main parse loop), `g_whittedGrid` (`-whitted-grid`) and `g_ambient`
+  (`-ambient`, multiplied by `Scene::ambientRef()` at the call site so the CLI value
+  is scene-scale-independent). `g_whitted` also forces `g_directOnly` and excludes
+  the GPU backward megakernel (`gpuBackwardMode = mode == 'R' && !g_whitted`), since
+  the device path keeps the stochastic estimators.
   Since 0.102.0 the **bidirectional** modes honour `maxBounce` too (they previously
   hard-coded 8 and silently dropped the flag). Their default stays 8 — the BDPT connection
   double-loop is O(depth²) and the per-thread vertex stack is thread-local memory — so for
