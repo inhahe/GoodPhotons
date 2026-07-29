@@ -312,25 +312,42 @@ def test_slicefield_extra_axis_is_a_real_input():
 
 
 def test_nd_grad_bound_is_conservative():
-    # max_gradient must bound the real slope or the sphere-marcher tunnels.
+    # max_gradient must bound the real slope or the sphere-marcher tunnels.  The
+    # per-component bounds are deliberately tight (gyroid's sqrt(2) is attained to
+    # within 0.1%), so sample the *sliced* gradient densely in several dims.
     freq = 2.0
     for name in sorted(ND_FIELDS):
-        sf = SliceField(name, dim=4, rotation=rotations(4, [(1, 3, 0.9), (0, 2, 0.4)]),
-                        offset=[0.0, 0.0, 0.0, 0.7])
-        expr = sf.build(*(f"({freq}*{v})" for v in "xyz"),
-                        ctx=EmitCtx(clock=Clock(t=0.0), cache=Cache()))
-        bound = sf.grad_bound(freq)
-        assert abs(bound - nd_grad_bound(name, 4, freq)) < 1e-12
-        h, worst = 1e-5, 0.0
-        for k in range(40):
-            p = [math.sin(k * 1.7) * 2.0, math.cos(k * 2.3) * 2.0, math.sin(k * 0.9) * 2.0]
-            g = []
-            for ax in range(3):
-                q = list(p); q[ax] += h; hi = _ndeval(expr, *q)
-                q = list(p); q[ax] -= h; lo = _ndeval(expr, *q)
-                g.append((hi - lo) / (2 * h))
-            worst = max(worst, math.sqrt(sum(c * c for c in g)))
-        assert worst <= bound * (1 + 1e-6), (name, worst, bound)
+        for dim in (3, 4, 5):
+            planes = [(1, dim - 1, 0.9), (0, 2, 0.4)]
+            sf = SliceField(name, dim=dim, rotation=rotations(dim, planes),
+                            offset=[0.0, 0.0, 0.0, 0.7, 1.3][:dim])
+            expr = sf.build(*(f"({freq}*{v})" for v in "xyz"),
+                            ctx=EmitCtx(clock=Clock(t=0.0), cache=Cache()))
+            bound = sf.grad_bound(freq)
+            assert abs(bound - nd_grad_bound(name, dim, freq)) < 1e-12
+            h, worst = 1e-5, 0.0
+            for k in range(200):
+                p = [math.sin(k * 1.7) * 2.0, math.cos(k * 2.3) * 2.0,
+                     math.sin(k * 0.9) * 2.0]
+                g = []
+                for ax in range(3):
+                    q = list(p); q[ax] += h; hi = _ndeval(expr, *q)
+                    q = list(p); q[ax] -= h; lo = _ndeval(expr, *q)
+                    g.append((hi - lo) / (2 * h))
+                worst = max(worst, math.sqrt(sum(c * c for c in g)))
+            assert worst <= bound * (1 + 1e-6), (name, dim, worst, bound)
+
+
+def test_nd_grad_bound_tracks_the_tightened_component_bounds():
+    # Regression pins: these are the *proved* per-coordinate bounds (see the template
+    # docstrings), not the naive term counts they replaced (2, and 2**(n-1)).
+    assert abs(nd_grad_bound("gyroid", 4) - math.sqrt(2.0) * 2.0) < 1e-12
+    assert abs(nd_grad_bound("schwarz_p", 4) - 2.0) < 1e-12
+    assert abs(nd_grad_bound("schwarz_d", 5) - 4.0 * math.sqrt(5.0)) < 1e-12
+    assert abs(nd_grad_bound("neovius", 3) - 7.0 * math.sqrt(3.0)) < 1e-12
+    # freq and the pre-transform's largest singular value both scale it linearly
+    assert abs(nd_grad_bound("gyroid", 4, freq=3.0, sigma=0.5)
+               - 1.5 * math.sqrt(2.0) * 2.0) < 1e-12
 
 
 def test_slicefield_animates_and_wraps_seamlessly():

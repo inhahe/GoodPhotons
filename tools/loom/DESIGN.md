@@ -332,9 +332,17 @@ the emitted string (decided on the *formatted* value, so text and pruning can't
 disagree), which roughly halves the expression the marcher re-evaluates per step.
 `nd_grad_bound(field, dim, freq, sigma)` gives the rigorous `max_gradient` the
 sphere-marcher needs (`σ_max(A)·|∇_c F|`), since a mixed N-D slice can defeat ftrace's
-sampled Lipschitz estimate. Seamlessness: an integer number of turns per rotation plane
+sampled Lipschitz estimate. The per-coordinate factors are *proved*, not term counts:
+`gyroid` is **√2** (`∂f/∂cᵢ = a·cos cᵢ + b·sin cᵢ` with `|a|,|b| ≤ 1`, so the two terms
+can never saturate together), `schwarz_p` 1, `schwarz_d` **2^((n−1)/2)** (splitting on
+slot `i` gives `cos cᵢ·E − sin cᵢ·O` with `E±O = Π(cos ± sin)`, so
+`E²+O² = ((E+O)²+(E−O)²)/2 ≤ 2ⁿ⁻¹` — exponentially below the naive `2ⁿ⁻¹`), `neovius` 7.
+That matters for throughput as well as correctness: a loose bound shrinks every march
+step, and tightening `gyroid` 2 → √2 measured ~1.14× more samples/second on the
+`gold_gyroids` scene. Seamlessness: an integer number of turns per rotation plane
 returns the matrix to the identity at the wrap, which is also what lets the host's `2π`
-`drift` survive the N-D mix. Demo: `examples/gold_gyroids.py` (4-D + 5-D gyroids).
+`drift` survive the N-D mix. Demo: `examples/gold_gyroids.py` (4-D + 5-D gyroids,
+150 frames at the GIF-exact 25 fps, `-noise 4` per frame).
 
 ### 7c. Function-driven materials
 Reuse Good Photons' existing material-props-by-function (reflectance/color/IOR/etc.

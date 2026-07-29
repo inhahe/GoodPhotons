@@ -100,7 +100,11 @@ def gyroid_n(coords: Sequence[str]) -> str:
     """N-D Schoen gyroid: the cyclic sum ``sum_i sin(c_i) * cos(c_{i+1})``.
 
     At ``n == 3`` this is ``sin x cos y + sin y cos z + sin z cos x`` — the classic
-    gyroid.  Per-coordinate gradient bound 2 (two terms, each <= 1)."""
+    gyroid.  ``c_i`` occurs in exactly two terms, so
+    ``df/dc_i = cos(c_i)*cos(c_{i+1}) - sin(c_i)*sin(c_{i-1}) = a*cos(c_i) + b*sin(c_i)``
+    with ``|a|,|b| <= 1``; that is a single sinusoid of amplitude ``sqrt(a^2+b^2)``, so the
+    per-coordinate gradient bound is **sqrt(2)**, not 2 — the two terms can never
+    saturate together."""
     n = _nd_check(coords)
     return "+".join(f"sin({coords[i]})*cos({coords[(i + 1) % n]})" for i in range(n))
 
@@ -114,7 +118,14 @@ def schwarz_p_n(coords: Sequence[str]) -> str:
 def schwarz_d_n(coords: Sequence[str]) -> str:
     """N-D Schwarz D: the sum of all ``sin``/``cos`` products with an **odd** number
     of sines.  At ``n == 3`` that is ``sss + scc + csc + ccs`` — the classic D
-    surface.  Costs ``2^(n-1)`` terms, so keep ``n`` small."""
+    surface.  Costs ``2^(n-1)`` terms, so keep ``n`` small.
+
+    Gradient: splitting on slot ``i`` gives ``df/dc_i = cos(c_i)*E - sin(c_i)*O`` where
+    ``E``/``O`` sum the even/odd-sine products of the *other* ``n-1`` coordinates.  Since
+    ``E+O = prod(cos+sin)`` and ``E-O = prod(cos-sin)`` are each bounded by
+    ``2^((n-1)/2)``, ``E^2+O^2 = ((E+O)^2+(E-O)^2)/2 <= 2^(n-1)``, and Cauchy-Schwarz
+    gives the per-coordinate bound ``sqrt(E^2+O^2) <= 2^((n-1)/2)`` — exponentially
+    tighter than the naive term count ``2^(n-1)``."""
     n = _nd_check(coords)
     terms = []
     for mask in range(1 << n):
@@ -142,9 +153,9 @@ ND_FIELDS: dict = {
 
 # |df/dc_i| bounds, one per named N-D template (see each docstring).
 _ND_COMP_GRAD = {
-    "gyroid": lambda n: 2.0,
+    "gyroid": lambda n: math.sqrt(2.0),
     "schwarz_p": lambda n: 1.0,
-    "schwarz_d": lambda n: float(1 << (n - 1)),
+    "schwarz_d": lambda n: 2.0 ** ((n - 1) / 2.0),
     "neovius": lambda n: 7.0,
 }
 

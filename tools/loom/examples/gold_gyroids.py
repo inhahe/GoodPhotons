@@ -1,5 +1,5 @@
 """Two gold gyroids in a closed room, **rotating in higher dimensions** -> a
-3 s / 60 fps seamlessly looping GIF.
+6 s / 25 fps seamlessly looping GIF.
 
 The animation is not a 3-D spin.  Each blob is a slice of a genuinely N-input
 gyroid field (:class:`loom.SliceField`): the renderer's world is the 3-D
@@ -23,7 +23,7 @@ ceiling) with a broad ceiling area light, so the gold picks up soft bounce light
 every side instead of the harsh single-source highlights it gets in open void.  The
 camera sits *inside* the box, in front of the near wall.
 
-Everything closes exactly at the wrap (frame 180 == frame 0), which is what makes the
+Everything closes exactly at the wrap (frame 150 == frame 0), which is what makes the
 GIF loop seamlessly:
   * every rotation angle is a ramp of a whole ``2*pi``, so each N-D rotation matrix
     returns to the identity it started at;
@@ -37,7 +37,7 @@ Rendered with the fast RGB backward path tracer (`-mode R` + `-rgb`).
 
   python examples/gold_gyroids.py                  # print frame 0's .ftsl
   python examples/gold_gyroids.py --still          # one held preview frame
-  python examples/gold_gyroids.py --render         # all 180 frames + the GIF
+  python examples/gold_gyroids.py --render         # all 150 frames + the GIF
   python examples/gold_gyroids.py --render --resume  # ... continue an interrupted run
 
 Flags: ``--cpu`` (CPU backend), ``--freq=N`` (lattice density), ``--capped`` (seal the
@@ -63,8 +63,13 @@ from loom import (  # noqa: E402
 )
 
 NAME = "gold_gyroids"
-FRAMES = 180          # 3 s at 60 fps
-FPS = 60.0
+# 25 fps is a GIF-*exact* rate: a GIF stores its inter-frame delay in centiseconds,
+# so 1/25 s == 4 cs lands on the grid and ffmpeg's `fps=` filter neither drops nor
+# duplicates a frame.  (60 fps would ask for 1.67 cs, be rounded to 2, and play back
+# at 50 fps — a silent 1.2x speed-up plus resampling judder.)  6 s is also long enough
+# to watch the surface actually reconnect instead of flickering past.
+FRAMES = 150          # 6 s at 25 fps
+FPS = 25.0
 RES = (420, 420)
 FREQ = 17.0           # lattice frequency (rad per unit); ~5 cells across each blob
 OPEN_CUT = True       # don't cap the container cut — look into the labyrinth
@@ -223,7 +228,12 @@ def main() -> int:
     from loom import render_range
     from loom.drive import default_outdir
     outdir = default_outdir(NAME)
-    noise = 2.5
+    # A *noise* budget (not a time one) keeps every frame equally grainy, which is what
+    # stops the loop from shimmering: a fixed -time would let a cheap frame come out
+    # clean and an expensive one come out speckled, and the eye reads that difference
+    # as flicker.  4% costs ~105 s/frame on this GPU (~4.4 h for the 150) and survives
+    # the GIF's 256-colour quantisation; 2.5% costs ~5x that for no visible gain.
+    noise = 4.0
     for a in sys.argv:
         if a.startswith("--noise="):
             noise = float(a[8:])
