@@ -1641,6 +1641,22 @@ byte-verified).
   consumer**: ftrace supports scalar float grids only, so a Vec3 read would serve loom-internal use
   (velocity/advection) that isn't designed yet. Unblock by sourcing one real vec3 `.vdb` (a DCC export or an
   openvdb.org sample), then the tree walk is the existing one with a 3-wide value stride.
+  - **The openvdb.org sample corpus is exhausted — re-checked exhaustively 2026-07-29.** The "or an
+    openvdb.org sample" half of the unblock above is now closed off: all **24** files in
+    `AcademySoftwareFoundation/openvdb-website/download/models` were probed by HTTP range-reading each
+    file's first 128 KB (the grid descriptors sit at the head, so this costs ~3 MB, not ~2 GB) and
+    grepping the type strings. Result: 20 are `Tree_float_5_4_3` or `…_HalfFloat`, 4 (`boat_points`,
+    `bunny_points`, `sphere_points`, `waterfall_points`) are `Tree_ptdataidx32_5_4_3` point-data grids.
+    **Zero `Tree_vec3s_*`** — including `explosion`/`smoke`/`smoke2`/`fire`, the ones most likely to have
+    shipped a velocity field. PyPI was re-checked too: `openvdb` / `pyopenvdb` / `openvdb-python` / `vdb`
+    still do not resolve.
+  - **Remaining unblock paths, in preference order.** (1) A **DCC export** — Houdini/Blender writing a
+    fluid cache with `velocity`. Blender's `bpy` *is* pip-installable and does write vec3s velocity
+    grids, but it is a ~1 GB install, so **ask before pulling it in** (and it only earns its keep if
+    something downstream actually wants vector volumes). (2) Any genuine third-party vec3s `.vdb` the
+    user happens to have. Until one of those lands, the reader stays unwritten **by choice** — a
+    spec-only implementation validated against loom's own writer is exactly the failure mode this
+    module has avoided all along, and with no ftrace consumer there is nothing to trade that risk for.
 
 ### E5 — Axis-typed signals: one influence model (broadcast / pointwise / reduce) + mod·pin + sample·select grammar  ✅ DONE 2026-07-26  *(loom; LARGE, design; unifies E2/E4 and records-5a)*
 **Idea / decision (design-captured 2026-07-18, from a design bounce).** The whole "what can modulate what,
