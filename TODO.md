@@ -3655,6 +3655,81 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 
 ---
 
+## N. Mode W (deterministic preview) — estimator fixes, then the GPU port  *(ftrace renderer; greenlit by user 2026-07-29)*
+
+Mode W (`-mode W`, the POV-Ray-style deterministic Whitted preview, v0.105.0; `-gi`/`-ambient`
+v0.106.0; promoted to the `-explore` viewer's lit preview v0.107.0) is the **only render mode with
+no GPU backend** — `main.cpp:4292`'s `(mode == 'R' && !g_whitted)` routes it to the CPU
+unconditionally. Continues §L (the backward tracer) and §M (GPU fallback closure, M1–M12 all done).
+
+**Order matters:** N1/N2 change mode W's *estimator*, so they come before the port — porting an
+estimator that is about to change means writing the hand-maintained device twin twice.
+
+Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this plan rests on:
+
+| scene | mode | CPU | GPU | note |
+|---|---|---|---|---|
+| `cornell.ftsl` | R, 32 spp, `-heroc 8` | 1.8 s | 0.2 s | ~9× |
+| `_room_of_gyroids_f12.ftsl` | R, 8 spp, `-heroc 8` | 14.5 s | 1.7 s | ~8.5× |
+| `_room_of_gyroids_f12.ftsl` | **W, 1 spp** | **5.0 s** | (none) | the gap this section closes |
+| `cornell.ftsl` | R, 1024 spp, GPU | `-rgb` 0.7 s | spectral 1.2 s | spectral penalty only **1.7×** |
+| `_room_of_gyroids_f12.ftsl` | R, 64 spp, GPU | `-rgb` 9.5 s | spectral 12.1 s | spectral penalty only **1.27×** |
+
+- [ ] **N1. Split the hero bundle at a de-hero vertex instead of collapsing it.** *(CPU; the
+      highest-value item, and a prerequisite for judging N5.)* Today a Dielectric/ThinFilm/
+      Multilayer/Grating/HalfMirror/Fluorescent vertex terminates the secondary wavelengths and
+      continues the hero channel alone (each λ refracts differently). Combined with mode W's
+      *shared* λ-lattice invariant (every pixel uses the same offsets — that is what makes it
+      noise-free), at `-spp 1` the **entire frame** collapses onto ONE wavelength, so dispersive
+      objects come out strongly mistinted. Currently worked around in the viewer by
+      `wNeedSpp` → up to 16 accumulation passes (`main.cpp` ~7990), i.e. a ~16× cost on any glass
+      scene. **Fix:** split the bundle at the de-hero vertex and continue each wavelength on its own
+      branch — `hero::gSplit` / `-herosplit` (`src/hero.h`) is the existing prior art for exactly
+      this. Then drop the dielectric terms from `wNeedSpp`. Logged as DEBT in `known-issues.md`.
+- [ ] **N2. Deterministic glossy-lobe lattice.** *(CPU.)* Measurement showed that on rough gold the
+      residual error is dominated by the **glossy lobe**, not by missing diffuse GI — mode W currently
+      collapses a rough specular to the single mirror direction. **Do not fork** the lobe (N^depth
+      blowup in a labyrinth scene): keep ONE direction but drive it from the low-discrepancy sequence
+      indexed by (absolute sample index, bounce), and *omit* `rot05` on the polar coordinate so that
+      sample 0 is exactly today's mirror direction (i.e. `-spp 1` stays bit-identical to v0.107.0 and
+      only higher spp improves). Preserves both mode-W invariants: shared offsets per pixel, and
+      indexing by the **absolute** sample index so the image stays chunk-split-independent.
+- [ ] **N3. Port spectral mode W to the device.** Add `bkWhitted` / `bkGrid` / `bkGiGrid` /
+      `bkAmbient` to `DScene` (matching the existing `bkDirectOnly` convention), port the ~30
+      `whitted` branches of `src/backward.h` into `bkInteract` + the `kBackward` light loop, drop the
+      `&& !g_whitted` at `main.cpp:4292`, and gate on a new `cudaBackwardWhittedSupported()`. Build it
+      on the **spectral** `kBackward`, *not* `kBackwardRGB`: the spectral device scope (media,
+      fluorescence, textured albedo, constant env, lens) is far wider than the RGB one, so this also
+      gives the viewer a much broader-scope GPU preview than `-rgb` reaches today. Nothing to do on
+      the CPU side — all four knobs already ship there (`-mode W`, `-whitted-grid N`, `-gi`/
+      `-radiosity`, `-ambient`/`-amb`); the `bk*` names are device struct fields for a pure port.
+      **Expected to beat the 8.5× above,** because that ratio is strikingly low for a 4090 over 12
+      threads (the spectral megakernel is divergence/register-bound), and mode W is *more* coherent
+      than mode R by construction: fixed `lightGrid²` quadrature instead of one random shadow ray,
+      `whittedAttenuate`'s deterministic cutoff instead of Russian roulette (warps now terminate
+      together), mirror/lattice direction instead of a sampled lobe, dominant branch instead of a
+      Fresnel coin flip.
+- [ ] **N4. Bit-exact CPU-vs-GPU A/B as N3's acceptance test.** Unlike every prior port in §M, the
+      usual escape hatch does **not** apply: `render_cuda.h` explicitly permits the stochastic modes
+      to be "an independent noise realization that agrees to within Monte-Carlo noise", but mode W has
+      no noise to hide a mismatch behind. Any disagreement in the quadrature, the radical-inverse
+      lattices (`whittedSample` / `whittedLambdaU`, including the `rot05` offsets), or the de-hero
+      point is a *visible deterministic* CPU/GPU difference. So N3 must be validated **bit-exact**
+      (0 differing pixels), not statistically — a stricter bar than M1–M12 despite the simpler logic.
+- [ ] **N5. Re-measure spectral vs `-rgb`, then judge whether an RGB mode W is worth a second
+      kernel.** *(Prediction: it is not — resolve this by measurement, not by building it.)* At mode
+      W's 1 spp there is no noise, so `-rgb`'s usual convergence advantage evaporates and only the
+      measured 1.27–1.7× per-sample cost remains. Its one real advantage is dodging the de-hero
+      collapse — worth ~20× on a glass scene, since plain `MatType::Dielectric` *is* in the RGB scope
+      (`render_cuda.cu:10976`) — but **that is an argument for N1, not for a second megakernel.** Once
+      N1 lands, spectral mode W is 1-spp-clean on glass too and `-rgb`'s entire remaining edge is
+      1.27–1.7×, which does not justify another hand-written kernel that must stay bit-exact with the
+      CPU forever (N4). Note also that N1–N3 serve the wide-scope cases `-rgb` structurally *cannot*:
+      thin-film, gratings, multilayer, fluorescence, media and textured albedo are all outside the RGB
+      gate and inside the spectral one.
+
+---
+
 ## Progress log
 - 2026-07-27: **Measured G3/G4 instead of guessing — overturned both deferrals' stated reasons, and the
   measurement pointed at a third thing that was actually the bottleneck (v0.84.3).** Built a probe method
