@@ -5,7 +5,37 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### NOT A BUG, but a sharp edge worth a knob (2026-07-30, v0.116.0): mode W's `-gi` gather ALIASES a caustic into thin bright contour curves
+### BUG — FIXED (2026-07-30, v0.117.0): `scraps/gi_collapse.ftsl`, the `-gi` normalisation regression test, was VACUOUS — auto-exposure divided out the very error it tests for
+
+Found while validating `-gi-clamp`. The scene tests the gather's cosine-normalisation invariant:
+in a scene where every gather ray escapes, `-gi 32` must be pixel-identical to `-gi 0`, or
+"turning `-gi` on would step the exposure of every scene". Its documented invocation passed
+`-exposure 1`, which is not an absolute exposure — it is a **compensation multiplier on top of a
+p99 auto-exposure** (`main.cpp` ~2518). The scene renders one flat uniform diffuse quad, so the
+p99 anchor normalises away **any** overall scale factor. The test therefore passed regardless of
+how badly the estimator mis-scaled: exactly the failure mode it exists to catch. Confirmed
+directly — `-ambient 0.05` and `-ambient 0.1` produced **byte-identical** PPMs.
+
+This also invalidated a validation result recorded during N3c ("collapse invariant holds") and
+briefly sent me chasing a phantom: `-gi-clamp 0.05` under `-ambient 0.1` came back identical to
+`-gi 0`, contradicting a caveat I had just written into three files. The caveat was right; the
+test was blind.
+
+**Fix.** The light now carries `lumens 8000`, which puts the scene in **absolute** mode
+(`ftsl.h` ~4679 — a fixed sensor gain instead of an auto-exposure anchor), and the header says
+so in capitals, drops `-exposure` from the documented invocation, and carries a
+**discrimination check**: `-ambient 0.05` must render exactly half as bright as `-ambient 0.1`
+(centre pixel `0x2a` vs `0x3c`), so the test cannot silently go vacuous again. Re-verified with
+the fix in place: the invariant genuinely holds, pixel-identical, on both the CPU and the GPU.
+
+**Lesson worth generalising:** any regression test that compares *tone-mapped* frames is only
+measuring what the tone mapper did not remove. `scraps/cor_gi.ftsl` already had this right and
+says so in its header — a flat-fill sweep there made a constant ambient look like it made the
+image *worse* because the anchor swung 5× across the sweep. Prefer `lumens`/`power` (absolute
+mode) in any scene used for a numeric comparison, and never `-exposure` as a stand-in for it.
+`scraps/gi_firefly.ftsl`, added for `-gi-clamp`, follows the same rule.
+
+### NOT A BUG, but a sharp edge worth a knob — KNOB SHIPPED (2026-07-30, v0.117.0): mode W's `-gi` gather ALIASES a caustic into thin bright contour curves
 
 Noticed on the v0.116.0 showcase render (`scenes/cornell.ftsl`, `-mode W -gi 64 -spp 4`, 900×900):
 the floor around the SF10 glass ball, and the side walls, carry a family of thin, blown-out,
@@ -35,17 +65,48 @@ boundary is a single coherent contour in image space, where a stochastic rendere
 same discontinuity into grain. The dashes are plain aliasing — the contour is sub-pixel-thin in
 places and only registers where it passes near a pixel centre.
 
-**Status: documented, not changed.** Behaviour is correct and converges; README's "Honest limits"
-now names it alongside the rough-glossy and `grating` cases, with `-spp` and `-gi-bounce 1` as the
-two levers.
+**Status: RESOLVED in v0.117.0 by an opt-in `-gi-clamp <x>`** (user asked for it). The behaviour
+was never wrong — it is correct and it converges — so the clamp is **off by default and bit-for-bit
+inert when off** (verified: `cmp` against the v0.116.0 baseline PNG is byte-identical). README's
+"Honest limits" now names three levers, cheapest last: `-spp 64`, `-gi-bounce 1`, and
+`-gi-clamp 0.1`.
 
-**Possible improvement if it ever annoys anyone (needs a user decision, so not done unilaterally):**
-an opt-in **`-gi-clamp <x>`** ceiling on a single gather ray's returned radiance. That is the
-standard firefly clamp, bounded and explicit bias, and it would kill the spikes at 1 spp while
-keeping essentially all of the energy. Rejected alternatives: (a) suppressing emission-on-hit for
-gather rays entirely — kills the artifact but silently discards a real caustic and would make
-`-gi` darker than correct; (b) forcing `giBounce = 1` by default — same energy loss, and it would
-change existing images.
+`-gi-clamp x` caps the radiance **one** gather ray may return at `x` times
+`Scene::ambientRef()` — the same dimensionless "multiple of one light's own radiance" units as
+`-ambient`, so one number works at any scene scale. Implementation notes (full rationale on
+`BackwardRenderer::giClamp`, `src/backward.h`; device twin `DScene::bkGiClamp`):
+
+* **Per wavelength, not per bundle.** The scalar twin `giGather()` carries a single λ and has
+  nothing to take a max over, so a bundle-wide rule would make the hero and single-λ paths
+  disagree on the same scene. Costs a hue shift on a clamped ray, which is the point.
+* **`wSum` is not clamped.** A clamped direction keeps its weight `c`, so the estimator still
+  normalises by the realised sum of cosines and the collapse invariant survives.
+* **It also caps the far-field `ambient` tail** an escaping gather ray returns. Not a bug, but it
+  couples the two knobs: the gather's fill is exactly `min(ambient, giClamp)`. Pinned in
+  `scraps/gi_collapse.ftsl` — `-gi 32 -gi-clamp c` is pixel-identical to
+  `-gi 0 -ambient min(ambient, c)`. Hence "keep it above `-ambient`", or you darken the whole
+  scene instead of capping fireflies. `-gi-clamp` without `-gi` prints an `[ignore]` notice.
+
+**Measured** on `scraps/gi_firefly.ftsl` (added for this — the absolute-mode Cornell box *with*
+the glass ball, the deliberate counterpart to all-diffuse `cor_gi.ftsl`), `-gi 32 -spp 1
+-ambient 0.05`, 240², GPU:
+
+| `-gi-clamp` | frame Δluma | pixels > 250 codes |
+|---|---|---|
+| `0` (off) | — | 1689 |
+| `0.05` | −0.86 % | 1350 |
+| `0.1` | **−0.31 %** | 1350 |
+| `0.2` | −0.20 % | 1356 |
+| `0.5` | −0.04 % | 1600 |
+
+So the curves cost ~0.3 % of the frame's light to remove, and the caustic survives as a soft
+highlight rather than a blown-out spike. (The `0.05` row is dearer only because it is *at*
+`-ambient` and has started eating the fill.) CPU↔GPU with the clamp on: 98.7 % bit-identical,
+max 20-px-block |dLuma| 0.328 code against a 1.5-code bar. All 15 self-tests pass.
+
+**Rejected alternatives:** (a) suppressing emission-on-hit for gather rays entirely — kills the
+artifact but silently discards a real caustic and makes `-gi` darker than correct; (b) forcing
+`giBounce = 1` by default — same energy loss, and it would change existing images.
 
 ### BUG — FIXED (2026-07-30, v0.116.0): the GPU's *watertight* triangle test CRACKS, because nvcc contracts its edge functions into FMAs
 

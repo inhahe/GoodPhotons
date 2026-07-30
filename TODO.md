@@ -3747,7 +3747,8 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       indexing by the **absolute** sample index so the image stays chunk-split-independent.
       </details>
 - [x] **N3. Port spectral mode W to the device.** *(DONE — N3a 2026-07-29, v0.110.0; N3b
-      2026-07-29, v0.111.0; N3c 2026-07-30, v0.116.0.)*
+      2026-07-29, v0.111.0; N3c 2026-07-30, v0.116.0; N3h, the `-gi-clamp` follow-up the port's
+      first showcase render exposed, 2026-07-30, v0.117.0.)*
   - [x] **N3a — knobs, lattice helpers, quadrature, non-dispersive materials, flat `bkAmbient`.**
         `WhittedOpts` (`src/render_cuda.h`, the twin of `BackwardRenderer`'s mode-W fields with
         `ambient` pre-scaled by `Scene::ambientRef()`) is passed as a trailing
@@ -4140,6 +4141,39 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       Remaining de-hero: only the scalar bundle-free path (media / GRIN / `-heroc 1`), plus `Mix`'s
       shared child selection (a documented bias, not a collapse). `Mix` could take the same
       re-enter-this-vertex treatment if it ever matters.
+    - [x] **N3h — `-gi-clamp`: an opt-in firefly ceiling on ONE gather ray, because the shared
+      direction lattice aliases a caustic into thin contour CURVES rather than into grain.**
+      **DONE (2026-07-30, v0.117.0.)** User-requested after spotting the artifact on the v0.116.0
+      showcase render. Diagnosed by bisection first (`-gi 0` clean → it is the gather;
+      `-gi-bounce 1` clean → it needs the second bounce; `-spp 64` clean → the estimator is
+      unbiased; CPU vs GPU max \|dLuma\| 0.123 → not a porting bug), then confirmed in code: the
+      path is *diffuse floor → gather ray → glass ball → lamp*, and a dielectric resets
+      `specularArrival` to `true` so the emitter hit contributes the lamp's **full** radiance.
+      That is correct — NEE structurally cannot sample a lamp behind a refracting surface — so the
+      fix could not be to suppress it. See `known-issues.md` for the full write-up, the rejected
+      alternatives, and the measured table.
+      Three implementation choices carry the weight: clamp **per wavelength** (the scalar twin
+      `giGather()` has one λ and nothing to take a max over, so a bundle-wide rule would let the
+      hero and single-λ paths disagree); **do not clamp `wSum`** (a clamped direction keeps its
+      weight, so the realised-cosine normalisation and hence the collapse invariant survive); and
+      accept that the clamp **also caps the far-field `ambient` tail**, which makes the gather's
+      fill exactly `min(ambient, giClamp)` and is why the docs say to keep `-gi-clamp` above
+      `-ambient`. Anchored to `Scene::ambientRef()` like `-ambient`, so one number works at any
+      scene scale.
+      | check | result |
+      |---|---|
+      | `-gi-clamp 0` (default) vs the v0.116.0 baseline PNG | **byte-identical** (`cmp`) — inert when off |
+      | `-gi 32 -gi-clamp c` vs `-gi 0 -ambient min(ambient,c)`, `gi_collapse.ftsl` | pixel-identical, CPU **and** GPU — pins the ambient-tail coupling |
+      | collapse invariant `-gi 0` == `-gi 32`, with and without a clamp above `-ambient` | pixel-identical, CPU and GPU |
+      | CPU↔GPU, `cor_gi.ftsl` 240², `-gi 32 -spp 1 -gi-clamp 0.1` | 98.7 % bit-identical, max block \|dLuma\| **0.328** / \|dChroma\| 0.295 vs a 1.5-code bar — PASS |
+      | cost of removing the curves (`gi_firefly.ftsl`, `-gi-clamp 0.1`) | **−0.31 %** frame luma; >250-code pixels 1689 → 1350; caustic survives as a soft highlight |
+      | all 15 physics self-tests | PASS |
+      Two new scratch scenes: `scraps/gi_firefly.ftsl` (the absolute-mode Cornell box **with** the
+      glass ball — the deliberate counterpart to all-diffuse `cor_gi.ftsl`, and the repro case), and
+      a **fix to `scraps/gi_collapse.ftsl`, which was silently vacuous** — it compared tone-mapped
+      frames of a flat uniform patch under a p99 auto-exposure that divides out any overall scale,
+      i.e. exactly the error it tests for. Logged in `known-issues.md`; it now forces absolute mode
+      via `lumens` and carries a discrimination check so it cannot go blind again.
 - [ ] **N4. Deterministic CPU-vs-GPU A/B as N3's acceptance test.** *(Part (b) is in place and
       passing for the **full** N3 scope — N3a, N3b, N3c (`-gi`) and N3d — via `scraps/n3_check.py`
       plus the block-mean `scraps/n3b_check.py`; see those items' numbers. It was re-run against the

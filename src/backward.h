@@ -108,6 +108,37 @@ struct BackwardRenderer {
                         // chain: gold is ~0.9 reflective, so kWhittedCutoff alone would
                         // let a gather ray ricochet ~60 times inside a gold lattice.
 
+    // Firefly clamp on ONE gather ray's returned radiance, per wavelength; 0 = off.
+    // Absolute spectral radiance, pre-scaled by Scene::ambientRef() at the call site
+    // exactly as `ambient` is (main.cpp), so the user-facing `-gi-clamp x` means "x times
+    // one light's own radiance" in any scene.
+    //
+    // What it is for: a gather ray that reaches a lamp THROUGH a specular surface (glass
+    // ball, mirror) carries that lamp's full radiance, while a gather ray that merely
+    // bounced off a wall carries ~rho/pi times a small solid angle of it -- two orders of
+    // magnitude less. That caustic is real and NEE cannot sample it (the lamp is behind a
+    // refracting surface, so the emitter hit is its only estimator), but `giDirs` fixed
+    // directions cannot resolve where it lands. Because every pixel shares those directions
+    // (the invariant that makes this mode noise-free), the "does direction k reach the lamp
+    // through the ball" boundary is a coherent CONTOUR in the image rather than the grain a
+    // stochastic renderer would show -- i.e. thin, blown-out, dashed curves at 1 spp. This
+    // caps them. See known-issues.md.
+    //
+    // Per-wavelength, not per-bundle: the scalar twin giGather() has one lambda and nothing
+    // to take a max over, so a bundle-wide clamp would make the hero and scalar paths
+    // disagree on the same scene -- and this file works hard to keep those two from
+    // drifting apart. Costs a hue shift on a clamped ray, which is the point (it is being
+    // pulled toward its neighbourhood).
+    //
+    // Keep it WELL ABOVE `ambient`. A gather ray that escapes the scene returns the flat
+    // `ambient` far-field tail (see radianceHero), and the clamp is applied to that too, so
+    // the gather's own fill level is effectively min(ambient, giClamp): a clamp below
+    // `-ambient` darkens the whole scene uniformly instead of only capping fireflies. This
+    // is exact, not approximate -- scraps/gi_collapse.ftsl pins it down: in a scene where
+    // every gather ray escapes, `-gi 32 -gi-clamp c` is PIXEL-IDENTICAL to
+    // `-gi 0 -ambient min(ambient, c)` on both the CPU and the GPU.
+    double giClamp = 0.0;
+
     // Where a path sits relative to the gather. `depth == 0` is a camera path (it does
     // the gather); `depth == 1` is a gather ray (it does NOT recurse, uses `giGrid`, and
     // terminates its own diffuse vertices on the flat `ambient` tail). `sIdx` is the
@@ -603,6 +634,11 @@ struct BackwardRenderer {
             double Lg[hero::kHeroMax];
             radianceHero(scene, Ray{h.p + ngo * 1e-6, d}, lam, invPdf, nUp, Lg, rng,
                          spdCache, sub);
+            // Firefly clamp (see giClamp). NOT applied to wSum: the weight of a clamped
+            // direction stays c, so the estimator still normalises by the realised sum of
+            // cosines and an unclamped gather is untouched bit-for-bit.
+            if (giClamp > 0.0)
+                for (int i = 0; i < nUp; ++i) if (Lg[i] > giClamp) Lg[i] = giClamp;
             for (int i = 0; i < nUp; ++i) acc[i] += c * Lg[i];
         }
         if (wSum <= 0.0) return;
@@ -627,8 +663,10 @@ struct BackwardRenderer {
             if (c <= 0.0) continue;
             if (dot(ngo, d) <= 0.0) continue;
             wSum += c;
-            acc += c * radiance(scene, Ray{h.p + ngo * 1e-6, d}, lambda, invPdfLambda,
-                                rng, spdCache, sub);
+            double Lg = radiance(scene, Ray{h.p + ngo * 1e-6, d}, lambda, invPdfLambda,
+                                 rng, spdCache, sub);
+            if (giClamp > 0.0 && Lg > giClamp) Lg = giClamp;   // see giClamp
+            acc += c * Lg;
         }
         return (wSum > 0.0) ? rho * (acc / wSum) : 0.0;
     }

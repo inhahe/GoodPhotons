@@ -388,9 +388,15 @@ estimation structurally cannot sample (the lamp is behind a refracting surface),
 estimator for it is the emitter hit itself. They read as *curves* rather than as grain because
 sharing one direction lattice across every pixel is the whole point of the mode: "does gather
 direction #k reach the lamp through the ball?" flips at one coherent contour in the image instead
-of dissolving into per-pixel noise. They integrate away — invisible by `-spp 64` — and
-`-gi-bounce 1` removes them outright at 1 spp by denying a gather ray the second bounce a
-caustic needs, keeping the colour bleed and losing only the caustic.
+of dissolving into per-pixel noise. Three levers, cheapest last: they integrate away —
+invisible by `-spp 64`; `-gi-bounce 1` removes them outright at 1 spp by denying a gather ray the
+second bounce a caustic needs, keeping the colour bleed and losing only the caustic; or
+**`-gi-clamp 0.1`** caps one gather ray's returned radiance and keeps the caustic as a *soft*
+highlight for free. The clamp is the usual answer — measured on the repro scene at `-gi 32 -spp 1`
+it costs **0.31 % of frame luminance** and, because it is applied per wavelength rather than per
+bundle, cannot make the hero and single-λ paths disagree. Keep it above `-ambient`, though: an
+escaping gather ray returns the flat `-ambient` far-field fill and the clamp caps that too, so the
+gather's fill is effectively `min(-ambient, x)` and a smaller `x` simply darkens the whole scene.
 A half-mirror or layered coat picks its dominant branch instead of forking, and a
 pattern-driven material mix hard-thresholds instead of dithering. **Glass is free at 1 spp** — mode `W` always
 **splits the hero bundle at a dispersive vertex** (see `-herosplit`), fanning it into one
@@ -2838,6 +2844,7 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-gi <n>` / `-radiosity <n>` | **Mode `W` only.** Replace the flat `-ambient` term with a real **deterministic one-bounce hemisphere gather**: `n` rays per diffuse vertex along a fixed world-space lattice, each carrying whatever mode-`W` radiance it finds. Brings back the two things a constant cannot — **contact darkening** in crevices and **colour bleeding** (a gold object actually tints the room). Default `0` (off); `16..64` is the useful band. Unlike POV-Ray's radiosity there is **no irradiance cache**, so nothing depends on render order or on which sample points the geometry happened to trigger — which is what makes it safe for a **seamless animated loop**. Residual error shows as low-frequency banding rather than noise; `-spp` rotates the lattice, so it refines progressively. |
 | `-gi-grid <n>` | **Mode `W` only.** `n`×`n` shadow rays at a *gather* vertex (default `1`). Separate from `-whitted-grid` because a gather vertex's soft-shadow detail is averaged over `-gi` directions anyway, so paying the full grid there multiplies the gather's cost for almost no visible return. |
 | `-gi-bounce <n>` | **Mode `W` only.** Max bounces along one gather ray (default `4`). Bounds the cost of a specular chain: gold is ~0.9 reflective, so the `adc_bailout` cutoff alone would let a single gather direction ricochet ~60 times inside a gold lattice. |
+| `-gi-clamp <x>` | **Mode `W` only.** Firefly ceiling on the radiance **one** gather ray may return, as a multiple of one light's own radiance — same dimensionless units as `-ambient`, so the same number works at any scene scale. `0` (default) is off and bit-for-bit inert. Fixes the thin bright dashed curves a glass ball or mirror casts onto nearby diffuse surfaces at low `-spp`: those are gather rays reaching the lamp *through* the specular surface, carrying its full radiance, and the shared direction lattice turns the on/off boundary into an image-space contour instead of noise (see "Honest limits"). Try `0.05`–`0.2`; keep it above `-ambient`, which the clamp also caps. Clamped per wavelength, not per bundle, so the hero and single-λ paths cannot drift apart; the weight of a clamped direction is left alone, so the gather still normalises by the realised sum of cosines. |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,

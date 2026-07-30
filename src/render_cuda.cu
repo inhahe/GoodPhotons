@@ -878,8 +878,11 @@ struct DScene {
     // estimator on the path with fixed quadrature; the rest are only read when it is set.
     // bkGrid / bkGiGrid: the N of the N*N area-light NEE lattice at a primary / gather
     // vertex. bkGiDirs: deterministic one-bounce gather ray count (0 = off, use bkAmbient
-    // only). bkGiBounce: path-depth cap on a gather ray. bkAmbient: flat fill added at each
-    // diffuse vertex, already pre-scaled by Scene::ambientRef() on the host.
+    // only). bkGiBounce: path-depth cap on a gather ray. bkGiClamp: per-wavelength firefly
+    // ceiling on one gather ray's returned radiance, 0 = off (twin of
+    // BackwardRenderer::giClamp — the caustic-through-the-gather aliasing fix; see the long
+    // comment there). bkAmbient: flat fill added at each diffuse vertex. bkGiClamp and
+    // bkAmbient are both already pre-scaled by Scene::ambientRef() on the host.
     // bkHeroSplit is the ONE knob here that is NOT mode-W-only: it fans the hero bundle into
     // monochromatic sub-paths at a dispersive vertex (bkRadianceHeroLoop<true>), and plain
     // mode R takes it from `-herosplit` while mode W forces it on — see design.md.
@@ -890,6 +893,7 @@ struct DScene {
     int    bkGiBounce;
     int    bkHeroSplit;
     double bkAmbient;
+    double bkGiClamp;
 };
 
 // Everything the pattern VM (dPatternEval) needs beyond the scalar variables: the
@@ -7200,6 +7204,11 @@ __device__ static void bkGiGatherHero(const DScene& sc, int diffraction, const D
         double Lg[hero::kHeroMax];
         bkRadianceHero<1>(sc, diffraction, h.p + ngo * RAY_EPS, d, lam, invPdf, nUp, Lg,
                           rng, sub);
+        // Firefly clamp (see bkGiClamp). NOT applied to wSum: a clamped direction keeps its
+        // weight c, so the estimator still normalises by the realised sum of cosines and an
+        // unclamped gather is untouched bit-for-bit.
+        if (sc.bkGiClamp > 0.0)
+            for (int i = 0; i < nUp; ++i) if (Lg[i] > sc.bkGiClamp) Lg[i] = sc.bkGiClamp;
         for (int i = 0; i < nUp; ++i) acc[i] += c * Lg[i];
     }
     if (wSum <= 0.0) return;
@@ -7222,8 +7231,10 @@ __device__ static double bkGiGather(const DScene& sc, int diffraction, const DHi
         if (c <= 0.0) continue;
         if (dot(ngo, d) <= 0) continue;
         wSum += c;
-        acc += c * bkRadiance<1>(sc, diffraction, h.p + ngo * RAY_EPS, d, lambda, invPdfLambda,
-                                 rng, sub);
+        double Lg = bkRadiance<1>(sc, diffraction, h.p + ngo * RAY_EPS, d, lambda, invPdfLambda,
+                                  rng, sub);
+        if (sc.bkGiClamp > 0.0 && Lg > sc.bkGiClamp) Lg = sc.bkGiClamp;   // see bkGiClamp
+        acc += c * Lg;
     }
     return (wSum > 0.0) ? (double)rho * (acc / wSum) : 0.0;
 }
@@ -11164,6 +11175,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.bkGiDirs    = 0;
     sc.bkGiGrid    = 1;
     sc.bkGiBounce  = 4;
+    sc.bkGiClamp   = 0.0;
     // Split-at-dispersion is NOT a mode-W-only knob: `-herosplit` applies to plain mode R too
     // (see BackwardRenderer::heroSplit, which takes the same default), so default it from the
     // global rather than to 0. Before v0.111.0 the device could not split at all and GPU mode
@@ -11751,6 +11763,7 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
         up.sc.bkGiDirs    = whitted->giDirs;
         up.sc.bkGiGrid    = whitted->giGrid;
         up.sc.bkGiBounce  = whitted->giBounce;
+        up.sc.bkGiClamp   = whitted->giClamp;
         up.sc.bkHeroSplit = whitted->heroSplit ? 1 : 0;
         up.sc.bkAmbient   = whitted->ambient;
     }

@@ -236,6 +236,10 @@ struct WhittedOpts {
                              // Ported to the device in v0.111.0 as bkRadianceHeroLoop<true>;
                              // plain mode R takes the same policy from `-herosplit`.
     double ambient   = 0.0;  // -ambient, ALREADY pre-scaled by Scene::ambientRef()
+    double giClamp   = 0.0;  // -gi-clamp: per-lambda firefly ceiling on ONE gather ray's
+                             // returned radiance, 0 = off. Also pre-scaled by ambientRef().
+                             // Caps the caustic-through-the-gather contour aliasing; the
+                             // rationale is on BackwardRenderer::giClamp (src/backward.h).
 };
 
 // True if this scene + camera can be rendered by the GPU mode-W megakernel with the given

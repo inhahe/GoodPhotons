@@ -2744,6 +2744,11 @@ static double g_ambient = 0.0;
 static int g_gi = 0;
 static int g_giGrid = 1;
 static int g_giBounce = 4;
+// -gi-clamp, dimensionless like -ambient (a multiple of one light's own radiance, scaled by
+// Scene::ambientRef() at the two hand-off sites below). 0 = off. Caps one gather ray's
+// returned radiance, which is what tames the caustic-through-the-gather contour aliasing.
+// See BackwardRenderer::giClamp for the full rationale.
+static double g_giClamp = 0.0;
 
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
@@ -3049,6 +3054,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         // this scene's absolute radiance scale here. See Scene::ambientRef().
         br.ambient = g_ambient * scene.ambientRef();
         br.giDirs = g_gi; br.giGrid = g_giGrid; br.giBounce = g_giBounce;
+        br.giClamp = g_giClamp * scene.ambientRef();   // same scaling as -ambient above
         int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
         br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
     };
@@ -4382,6 +4388,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     whittedOpts.giBounce  = g_giBounce;
     whittedOpts.heroSplit = hero::gSplit || g_whitted;
     whittedOpts.ambient   = g_ambient * scene.ambientRef();
+    whittedOpts.giClamp   = g_giClamp * scene.ambientRef();   // same scaling as ambient
 #endif
     bool useGpu = false;
     if (!wantGpu && !wantAuto && std::strcmp(device, "cpu"))
@@ -5435,6 +5442,16 @@ static void printHelp(const char* prog) {
 "                        knob; the gather averages over n directions anyway\n"
 "  -gi-bounce <n>        max bounces along one gather ray (default 4). Bounds the cost\n"
 "                        of a specular chain inside a highly reflective lattice\n"
+"  -gi-clamp <x>         firefly ceiling on ONE gather ray, as a multiple of one light's\n"
+"                        own radiance (same units as -ambient; 0 = off, the default).\n"
+"                        Fixes the thin bright dashed curves a glass ball or mirror puts\n"
+"                        on nearby diffuse surfaces at low -spp: those are gather rays\n"
+"                        that reach the lamp THROUGH the specular surface, carrying its\n"
+"                        full radiance, and the shared direction lattice turns the\n"
+"                        on/off boundary into a contour instead of noise. Try 0.05-0.2.\n"
+"                        Keep it ABOVE -ambient: the clamp also caps the far-field tail an\n"
+"                        escaping gather ray returns, so the gather's fill is effectively\n"
+"                        min(-ambient, x) and a smaller x just darkens the whole scene\n"
 "\n"
 "Output, preview & checkpointing:\n"
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
@@ -5843,6 +5860,9 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-gi-bounce") && i + 1 < argc) {
             g_giBounce = std::max(1, std::atoi(argv[++i]));
         }
+        else if (!std::strcmp(argv[i], "-gi-clamp") && i + 1 < argc) {
+            g_giClamp = std::max(0.0, std::atof(argv[++i]));
+        }
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         // An explicit absolute radius pins the radius: don't then adapt it out from under
         // the user (this was the documented workaround for mode M's scaling problem).
@@ -6222,10 +6242,14 @@ static int run(int argc, char** argv) {
                     "%d wavelengths/sample%s, ambient %.3g\n",
                     g_whittedGrid, g_whittedGrid, g_heroC,
                     g_heroC > 1 ? " (split at dispersion)" : "", g_ambient);
-        if (g_gi > 0)
+        if (g_gi > 0) {
             std::printf("[mode W] one-bounce gather: %d rays/diffuse vertex, %dx%d shadow "
                         "rays at gather vertices, <=%d bounces/gather ray (cacheless, so "
                         "temporally stable)\n", g_gi, g_giGrid, g_giGrid, g_giBounce);
+            if (g_giClamp > 0.0)
+                std::printf("[mode W] gather firefly clamp: one gather ray capped at %.3g "
+                            "of a light's own radiance\n", g_giClamp);
+        }
     }
     else if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
     // Kept out of the chain above: rejecting -gi is independent of whether the run is
@@ -6238,6 +6262,12 @@ static int run(int argc, char** argv) {
                     "diffuse transport at all)\n", g_gi);
         g_gi = 0;
     }
+    // -gi-clamp only ever reads inside the gather, so it is dead without -gi. Say so rather
+    // than letting someone tune a value that cannot do anything (and note that g_gi may have
+    // just been zeroed above, which is exactly one of the ways to get here).
+    if (g_giClamp > 0.0 && g_gi == 0)
+        std::printf("[ignore] -gi-clamp %.3g does nothing without -gi (it caps a GATHER "
+                    "ray; the flat -ambient fill is not clamped)\n", g_giClamp);
     // -herosplit reaches the CPU forward tracer, the photon maps, and the backward tracer
     // (modes R/W) on BOTH the CPU and the GPU (the device split is bkRadianceHeroLoop<true>,
     // v0.111.0). The GPU FORWARD megakernel still de-heros, so name the layers rather than

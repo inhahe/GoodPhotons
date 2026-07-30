@@ -351,7 +351,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   exactly back to `rho * ambient`, so switching `-gi` on never steps the exposure.
   `scraps/gi_collapse.ftsl` is the regression test for that normalisation — a lone diffuse
   quad lit only by `ambient`, where `-gi 32` and `-gi 0` must be **pixel-identical**
-  (verified: 0 of 25600 pixels differ). Note the two hemisphere rejections (`cos <= 0` on
+  (verified: 0 of 25600 pixels differ, on the CPU and the GPU).
+  That scene's `lumens` is load-bearing and must not be removed: it forces **absolute**
+  mode, i.e. a fixed sensor gain. Until 2026-07-30 it lacked one and the test was run with
+  `-exposure 1`, which made it **vacuous** — the image is a flat uniform patch, so the p99
+  auto-exposure anchor divided out *any* overall scale factor and the test passed no matter
+  how badly the estimator mis-scaled, which is the one failure it exists to catch. The
+  header now carries a discrimination check (`-ambient 0.05` must render exactly half as
+  bright as `-ambient 0.1`) so the test cannot silently go vacuous again.
+  Note the two hemisphere rejections (`cos <= 0` on
   the shading normal, and on the oriented geometric normal so a smoothed normal cannot
   gather through the true back face) drop directions *without* adding them to `wSum`, which
   is what keeps that collapse exact on a smooth-shaded surface rather than darkening it.
@@ -380,6 +388,37 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   in for the *tail of the series*, and `-gi 32` plus a small tail beats `-gi 256` alone.
   Temporal stability is verified in `scraps/gi_temporal.py` (normalised second difference
   1.907 for `-gi 32` vs a 1.851 direct-only control).
+
+  **The firefly clamp (`giClamp`, `-gi-clamp`, 0.117.0)** is the price of that shared
+  lattice. The gather's dynamic range is enormous: a ray that bounced off a wall returns
+  ~`rho/pi` times a small solid angle of the lamp, while one that reaches the lamp *through*
+  a glass ball returns the lamp's **full** radiance — two orders of magnitude more. That
+  caustic path is real and the emitter hit is its only estimator (NEE structurally cannot
+  sample a lamp behind a refracting surface, and `specularArrival` is deliberately set back
+  to `true` by the dielectric so the hit counts). But `giDirs` fixed directions cannot
+  *resolve* where the caustic lands, and because every pixel shares those directions, "does
+  direction `k` reach the lamp through the ball?" is a step function whose boundary is one
+  coherent image-space **contour** — so the error surfaces as thin, blown-out, dashed curves
+  rather than as the grain a stochastic renderer would show. `-gi-clamp x` caps one gather
+  ray's return at `x` times `Scene::ambientRef()`. Three choices are load-bearing:
+  *per wavelength, not per bundle*, because the scalar twin `giGather()` carries a single λ
+  and has nothing to take a max over, so a bundle-wide rule would make the hero and single-λ
+  paths disagree on the same scene (this file works hard to keep those two identical);
+  *`wSum` is left untouched*, so a clamped direction keeps its weight `c`, the estimator
+  still normalises by the realised cosine sum, and an unclamped gather is bit-for-bit
+  unchanged (verified against the 0.116.0 baseline PNG with `cmp`); and *the clamp also caps
+  the far-field `ambient` tail an escaping ray returns*, which is not a bug but does couple
+  the two knobs — the gather's fill level is exactly `min(ambient, giClamp)`, pinned in
+  `scraps/gi_collapse.ftsl` where `-gi 32 -gi-clamp c` is pixel-identical to
+  `-gi 0 -ambient min(ambient, c)`. Hence the documented rule "keep it above `-ambient`":
+  below that it darkens the whole scene instead of only capping fireflies.
+  Measured on `scraps/gi_firefly.ftsl` (the absolute-mode Cornell box *with* the glass ball,
+  the deliberate counterpart to all-diffuse `cor_gi.ftsl`) at `-gi 32 -spp 1 -ambient 0.05`:
+  `-gi-clamp 0.1` costs **0.31 %** of frame luminance and drops the >250-code pixel count
+  from 1689 to 1350, while the caustic survives as a soft highlight; `0.2` costs 0.20 %,
+  `0.5` costs 0.04 %. The `-gi-clamp 0.05` row costs 0.86 % precisely because it is *at*
+  `-ambient` and starts eating the fill. CPU↔GPU agreement with the clamp on is 98.7 %
+  bit-identical, max block |dLuma| 0.328 code (`scraps/n3b_check.py`, 1.5-code bar).
 
   Two evaluation traps worth remembering, both of which produced confidently wrong numbers
   before being caught. (1) **Auto-exposure hides `-ambient` entirely**: the anchor is the
@@ -1138,9 +1177,14 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `-mode W` → `'R'` normalization, which must happen in **both** `cliModePrescan` and
   the main parse loop), `g_whittedGrid` (`-whitted-grid`) and `g_ambient`
   (`-ambient`, multiplied by `Scene::ambientRef()` at the call site so the CLI value
-  is scene-scale-independent), plus three for the one-bounce gather — `g_gi` (`-gi` /
-  `-radiosity`), `g_giGrid` (`-gi-grid`) and `g_giBounce` (`-gi-bounce`) → `giDirs` /
-  `giGrid` / `giBounce`. `g_gi` is zeroed with a message outside mode `W`.
+  is scene-scale-independent), plus four for the one-bounce gather — `g_gi` (`-gi` /
+  `-radiosity`), `g_giGrid` (`-gi-grid`), `g_giBounce` (`-gi-bounce`) and `g_giClamp`
+  (`-gi-clamp`) → `giDirs` / `giGrid` / `giBounce` / `giClamp`. `g_gi` is zeroed with a
+  message outside mode `W`; `g_giClamp` only ever reads inside the gather, so it gets an
+  `[ignore]` notice when set without `-gi` rather than silently doing nothing.
+  `g_giClamp` shares `g_ambient`'s scaling by `Scene::ambientRef()` — deliberately, since
+  the two knobs interact (see `BackwardRenderer::giClamp`) and a user reasoning about
+  "one light's own radiance" should not have to switch units between them.
   `g_whitted` also forces `g_directOnly` and excludes
   the GPU backward megakernel (`gpuBackwardMode = mode == 'R' && !g_whitted`), since
   the device path keeps the stochastic estimators.
