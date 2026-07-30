@@ -6070,7 +6070,42 @@ estimator, so it would return exactly the noise mode W exists to remove.
 - **Alternative worth its own feature (deferred):** a **native SDF / implicit-surface
   primitive** (sphere-traced, GPU-portable) would give metaballs/isosurfaces *exactly*
   without lossy tessellation — useful independent of any importer, and the right way to
-  ever support POV-Ray-style implicit geometry. Not started.
+  ever support POV-Ray-style implicit geometry. **DONE** — `isosurface` (`src/implicit.h`,
+  FTSL §10), on CPU and GPU, with POV's marching controls adopted name-for-name
+  (`contained_by`, `max_gradient`, `accuracy`, `method sample`, `refine`), all **78** of
+  POV's `functions.inc` internal functions as bit-exact ports of `fnintern.cpp`
+  (`src/pov_functions.h`), and an exact port of POV's Perlin `Noise()` (`src/pov_noise.h`).
+- **Does that reopen the importer? NO — re-evaluated 2026-07-30, still declined.** The SDF
+  primitive answers only part of objection (2), and objections (1) and (3) are untouched.
+  The decisive point: POV's CSG is **ray-interval arithmetic over closed solids** (every
+  primitive must report *all* hits along a ray plus an `inside()` predicate), whereas ours
+  is **min/max on distance fields**. Those are not interchangeable. Ours cannot take a
+  `mesh` (there is no mesh→SDF path in the tree, and adding one is lossy), nor POV's
+  `prism` / `lathe` / `sor` / `text` / `bicubic_patch`; POV's `quadric` / `quartic` /
+  `poly` are expressible as `function { expr }` but are then *marched* rather than
+  root-found. Conversely ours does smooth/filleted booleans, which POV's cannot. So a
+  general POV scene using CSG still lands back on tessellation + mesh booleans for
+  anything non-SDF — objection (2) verbatim, for that class of scene.
+  **Note the reason is value and prerequisites, not effort:** the blockers are that a
+  faithful importer needs a Turing-complete interpreter plus POV's `.inc` standard library
+  (most real-world scenes `#include` at minimum `colors.inc`), and that POV's RGB /
+  non-physical lights and cameras must be re-authored into spectral absolute radiance
+  regardless — so the only thing an importer actually delivers is *geometry*, for which
+  Mitsuba XML (and hence Blender) already works. What was worth taking from POV-Ray has
+  been taken: its function corpus, its isosurface machinery, and its deterministic Whitted
+  model (mode `W`, with `-gi` standing in for radiosity).
+- **The separable question, if mesh booleans are ever wanted:** general interval CSG over
+  the *native* primitives. Scope is real but bounded — `allHits()` alongside `closestHit()`,
+  a BVH traversal that collects instead of pruning by `tMax`, fixed-size interval stacks on
+  the device, and interaction with the dielectric medium stack. Only `sphere` / `mesh` /
+  `isosurface` would qualify (`quad` and `triangle` are infinitely thin, so they are not
+  solids and CSG over them is meaningless — POV carries the same caveat). Mesh `inside()`
+  by parity counting *is* reliable here because the triangle test is watertight. Still not
+  recommended: the payoff is essentially "drill a hole in an imported mesh", which Blender
+  does better upstream of the existing import path. The cheap ~80 % alternative would be
+  POV-style **`clipped_by`** (clip a primitive by a half-space/convex region and cap the
+  opening) — no interval lists needed, and the isosurface container-cap code already has
+  most of that machinery.
 
 ## DONE (2026-07-22): Mode-M shared photon-map deposit/build hangs on the full gallery scene (4M photons) — was the CPU meter pre-pass; meter now runs on the requested device
 
