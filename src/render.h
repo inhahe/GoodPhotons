@@ -2194,9 +2194,19 @@ struct Renderer {
     // exterior-is-air behaviour bit-for-bit. Nested-dielectric callers pass the enclosing
     // medium's index (from the per-path priority stack) so glass-in-water refracts across
     // 1.33<->1.52 instead of 1.0<->1.52.
+    //
+    // `whittedWeight` switches the interface from stochastic to DETERMINISTIC for the mode-W
+    // preview: instead of tossing a coin against the Fresnel reflectance it takes the
+    // DOMINANT branch (reflect iff R >= 0.5) and reports that branch's Fresnel weight, which
+    // the caller folds into the path throughput -- the same "dominant branch + weight" trade
+    // mode W already makes at HalfMirror/Layered/Mix. Without it, a dielectric was the last
+    // material in that mode still consuming a random number, and at -spp 1 the coin flip IS
+    // visible: a glass sphere came out as an opaque salt-and-pepper blob. The frosting
+    // perturbation is skipped in this mode for the same reason (mode W takes the mirror
+    // direction for glossy lobes rather than sampling them).
     Ray refractOrReflect(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
                          double lambda, Pcg32& rng, bool* transmitted = nullptr,
-                         double extIor = 1.0) const {
+                         double extIor = 1.0, double* whittedWeight = nullptr) const {
         double ng = m.ior(lambda);
         bool entering = dot(d, h.ng) < 0.0;
         Vec3 nl = entering ? h.ng : -h.ng;      // normal on the incidence side
@@ -2210,17 +2220,20 @@ struct Renderer {
         bool refracted = false;
         if (sin2t > 1.0) {
             outDir = reflect(d, nl);            // total internal reflection
+            if (whittedWeight) *whittedWeight = 1.0;   // TIR is lossless, one branch only
         } else {
             double cosT = std::sqrt(1.0 - sin2t);
             double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
             double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
             double R = 0.5 * (rs * rs + rp * rp);
-            if (rng.uniform() < R) outDir = reflect(d, nl);
+            const bool doReflect = whittedWeight ? (R >= 0.5) : (rng.uniform() < R);
+            if (whittedWeight) *whittedWeight = doReflect ? R : 1.0 - R;
+            if (doReflect) outDir = reflect(d, nl);
             else { outDir = eta * d + nl * (eta * cosI - cosT); refracted = true; } // Snell
         }
         outDir = normalize(outDir);
         // Frosted glass: jitter the chosen lobe, keeping it on the intended side.
-        double rough = materialRoughness(scene, m, h);
+        double rough = whittedWeight ? 0.0 : materialRoughness(scene, m, h);
         if (rough > 1e-3) {
             Vec3 pert = sampleGlossy(outDir, rough, rng);
             bool ok = refracted ? (dot(pert, nl) < 0.0) : (dot(pert, nl) > 0.0);

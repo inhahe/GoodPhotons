@@ -2962,21 +2962,40 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
 // render passes its running spp count so successive chunks render successive
 // per-(pixel,sample) streams — the realization is identical for ANY chunk split,
 // thread count, or resume boundary (see renderRows / rng.h seedUnit).
+// `forceWhitted` renders this one film in deterministic mode W even when the run's mode is
+// something else. That is for the interactive viewer's live preview, which wants mode W's
+// noise-free-at-1-spp frame regardless of what the batch render is set to; a global flip
+// would leak into every other call, so the override is per-call.
+//
+// `rowBegin`/`rowEnd` (rowEnd < 0 = to the end) render only a BAND of the film, with the
+// thread pool splitting that band rather than the whole frame. The interactive preview uses
+// it to render a pose a slice at a time so a mode-W frame that costs seconds (a gyroid
+// labyrinth is ~26s at 960x600, vs 0.4s for a Cornell box) can still be shown as it fills
+// and abandoned the moment the camera moves. Rows outside the band are left untouched, so
+// the caller owns the film across calls.
 static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int resY,
                            long long spp, int nThreads, bool diffraction = true,
-                           unsigned long long sampleBase = 0) {
-    Film out; out.resX = resX; out.resY = resY; out.alloc();
+                           unsigned long long sampleBase = 0, bool forceWhitted = false,
+                           Film* into = nullptr, int rowBegin = 0, int rowEnd = -1) {
+    Film out;
+    if (!into) { out.resX = resX; out.resY = resY; out.alloc(); }
+    Film& film = into ? *into : out;
+    const int bandLo = std::clamp(rowBegin, 0, resY);
+    const int bandHi = std::clamp(rowEnd < 0 ? resY : rowEnd, bandLo, resY);
+    const int bandN  = bandHi - bandLo;
+    if (bandN <= 0) return out;
+    if (bandN < nThreads) nThreads = bandN;   // don't hand a thread an empty row range
     auto worker = [&](int tid) {
         BackwardRenderer br; br.diffraction = diffraction; br.heroC = g_heroC;
         if (g_maxBounceOverride >= 1) br.maxBounce = g_maxBounceOverride;
-        br.directOnly = g_directOnly;
-        br.whitted = g_whitted; br.lightGrid = g_whittedGrid;
+        br.directOnly = g_directOnly || forceWhitted;   // mode W is direct-only by construction
+        br.whitted = g_whitted || forceWhitted; br.lightGrid = g_whittedGrid;
         // -ambient is dimensionless (fraction of a light's own radiance); convert to
         // this scene's absolute radiance scale here. See Scene::ambientRef().
         br.ambient = g_ambient * scene.ambientRef();
         br.giDirs = g_gi; br.giGrid = g_giGrid; br.giBounce = g_giBounce;
-        int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
-        br.renderRows(scene, cam, out, y0, y1, spp, sampleBase);
+        int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
+        br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -5344,7 +5363,8 @@ static void printHelp(const char* prog) {
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
 "  -raster-iso <n>       marching-cubes resolution for isosurfaces (0 = skip)\n"
-"  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T for a live path-traced preview\n"
+"  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T to cycle\n"
+"                        the lit preview: raster -> mode W (deterministic, CPU, any scene) -> path-traced (GPU)\n"
 "  -noclip|-nocollide    start the fly viewer with wall collision off\n"
 "  -anim <file.json>     edit a loom CurveDrive sidecar in the fly viewer (implies -explore);\n"
 "                        control points seed from it and Save writes the reshaped curve back\n"
@@ -6096,11 +6116,19 @@ static int run(int argc, char** argv) {
     if (ftslScene.whitted && !modeFromCli) g_whitted = true;
     g_directOnly = directOnly || g_whitted;   // -mode W implies it
     if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);
-    if (g_whitted) {
+    // The interactive viewer renders its live preview in mode W whatever the run's mode is
+    // (press T), so mode W's settings have to be honoured in an -explore run too -- else
+    // `-explore -gi 32` would silently drop the gather and the preview would come out with
+    // a 1-wavelength bundle. There is no batch render in an explore run, so widening the
+    // bundle here can't slow anything else down.
+    const bool wPreview = exploreMode;
+    if (g_whitted || wPreview) {
         // Widen the spectral bundle by default (see g_heroCSet): at 1 spp the C hero
         // wavelengths ARE the whole spectral quadrature, and they share one BVH walk,
         // so this is the cheapest accuracy in the mode.
         if (!g_heroCSet) g_heroC = hero::kHeroMax;
+    }
+    if (g_whitted) {
         std::printf("[mode W] deterministic Whitted preview: %dx%d shadow rays/light, "
                     "%d wavelengths/sample, ambient %.3g\n",
                     g_whittedGrid, g_whittedGrid, g_heroC, g_ambient);
@@ -6114,7 +6142,8 @@ static int run(int argc, char** argv) {
     // also direct-only, and folding it in would swallow that notice when both are given.
     // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for
     // it, so silently accepting -gi anywhere else would just be misleading.
-    if (!g_whitted && g_gi > 0) {
+    // (wPreview spares it: the viewer's T preview IS mode W, so -gi is live there.)
+    if (!g_whitted && !wPreview && g_gi > 0) {
         std::printf("[ignore] -gi %d needs -mode W (other modes either have real GI or no "
                     "diffuse transport at all)\n", g_gi);
         g_gi = 0;
@@ -7926,33 +7955,84 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
             gpuWarmKeep = (gpuRaster != nullptr);   // only meaningful on the discrete GPU path
 #endif
-            // ---- Interactive PATH-TRACED preview (fast RGB backward), toggled with 'T' ----
+            // ---- Interactive LIT preview, cycled with 'T' -------------------------------
             // The explorer normally shows the flat-shaded raster (instant, for navigation).
-            // Press 'T' to instead progressively PATH-TRACE the current view with the fast RGB
-            // backward tracer (Stage 2) into a resident GPU session: while the camera holds
-            // still the image converges in place; the instant it moves we drop back to the
-            // responsive raster and re-aim the session. The scene-ignore flags (-no-media/-env/
-            // -fluoro, -max-bounce, -direct-only) already apply — they mutated the Scene before
-            // this session bakes it, and the depth/Whitted knobs are passed into begin(). GPU
-            // only, and only when the scene+camera are inside the fast-RGB scope.
-            bool  traceMode  = false;             // 'T' toggle: path-traced preview vs. flat raster
-            bool  traceAvail = false;             // scene+camera in fast-RGB scope on this GPU
-            bool  traceDirty = true;              // camera moved -> re-aim + restart accumulation
+            // 'T' cycles that for a real lit render of the pose you are standing at:
+            //
+            //   RASTER  ->  W  ->  PT  ->  RASTER ...
+            //
+            //   W  = mode W, the deterministic Whitted preview, on the CPU. ONE render per
+            //        pose, noise-free at 1 spp, and it works on ANY scene (full spectral
+            //        walk, all materials, media, env, and the -gi one-bounce gather if asked
+            //        for). This is the preview that is always available.
+            //   PT = progressively PATH-TRACE the pose with the fast RGB backward tracer
+            //        (Stage 2) into a resident GPU session: it keeps converging while you
+            //        hold still, so it ends up more correct than W (real multi-bounce GI),
+            //        but it needs a CUDA GPU and a scene inside the fast-RGB scope, and it
+            //        starts noisy. Skipped in the cycle when unavailable.
+            //
+            // Either way the instant the camera moves we drop back to the responsive raster,
+            // then re-render/re-aim once you settle. The scene-ignore flags (-no-media/-env/
+            // -fluoro, -max-bounce, -direct-only) already apply — they mutated the Scene
+            // before this point, so both previews inherit them.
+            // `-explore -mode W` opens straight into the mode-W preview: asking for the
+            // deterministic preview mode AND the interactive viewer in the same command can
+            // only mean you want to fly around the lit image, not the flat raster. Plain
+            // -explore still opens on the raster, which is what you want for navigating.
+            enum PreviewMode { PV_RASTER = 0, PV_WHITTED, PV_PT };
+            PreviewMode pvMode = g_whitted ? PV_WHITTED : PV_RASTER;   // 'T' cycles this
+            bool  traceAvail = false;             // scene+camera in fast-RGB scope on this GPU (PV_PT)
+            bool  traceDirty = true;              // camera moved -> re-render / re-aim + restart accumulation
             double traceAnchor = 0.0;             // locked auto-exposure anchor for the current pose (0 = recompute)
             const long long kTraceBatchSpp = 4;   // spp accumulated per idle iteration (responsive batches)
             const long long kTraceCapSpp   = 4096;// stop refining once this converged (idle after)
+            // PV_WHITTED progressive state. A mode-W frame is one deterministic pass, but it
+            // can cost seconds, so it is rendered as a stack of row BANDS with one band per
+            // viewer iteration: input keeps being drained between bands, and moving the camera
+            // simply abandons the unfinished rows. Band height is retuned from the measured
+            // cost of the previous band to hold ~kWBandSec, which is what lets the same code
+            // stay responsive on both a 0.4s Cornell box and a 26s gyroid labyrinth.
+            Film wFilm;                           // full-res mode-W film for the current pose (accumulates)
+            std::vector<uint8_t> wImg;            // tone-mapped RGB8 shown so far (coarse pass, then bands)
+            int    wRow      = 0;                 // film rows still to render are [0, wRow); bands come off the top
+            int    wBandRows = 16;                // adaptive band height (rows)
+            int    wPass     = 0;                 // absolute sample index of the pass being rendered
+            int    wResX = 0, wResY = 0;          // wFilm size (rebuilt on a resize)
+            const double kWBandSec = 0.10;        // target wall-time per band: responsiveness vs. overhead
+            const int    kWCoarse  = 16;          // first pass is 1/16 linear (1/256 the pixels)
+            // Mode W is exact at 1 spp only while the whole path stays in the hero BUNDLE, which
+            // carries heroC wavelengths at once. A dielectric (or any other wavelength-switching
+            // material) DE-HEROES the path onto a single wavelength, and mode W's wavelength
+            // lattice is a function of the sample index alone -- shared by every pixel -- so at
+            // 1 spp the entire object is rendered at ONE wavelength and comes out strongly
+            // mistinted (a Cornell SF10 ball renders flat green; it only goes neutral, with
+            // correct dispersion fringes, by ~16 spp). So: keep adding passes, but only when the
+            // scene actually contains such a material, since anywhere else the extra passes are
+            // bit-for-bit identical work. The scalar path (no bundle at all) needs them too.
+            // (No hasLens() term: the viewer builds its camera fresh from the pose each frame,
+            // so the preview camera is always a plain one even if the scene authored a lens.)
+            const int kWSppCap = 16;
+            bool wNeedSpp = (g_heroC <= 1) || scene.backwardMedium().enabled ||
+                            grin::sceneHasGrin(scene);
+            for (const Material& mm : scene.mats)
+                if (mm.type == MatType::Dielectric || mm.type == MatType::ThinFilm ||
+                    mm.type == MatType::Multilayer || mm.type == MatType::Grating ||
+                    mm.type == MatType::HalfMirror || mm.type == MatType::Fluorescent)
+                    wNeedSpp = true;
 #ifdef HAVE_CUDA
             BackwardRGBSession* traceSess = nullptr;   // resident RGB-backward preview (lazy)
             int   traceResX = 0, traceResY = 0;        // session film size (recreated on a resize)
             Film  traceFilm;                           // scratch download film (lazily sized)
             if (gpuRaster != nullptr)
                 traceAvail = cudaBackwardRGBSupported(scene, rc0.cam);   // same scope the batch -rgb uses
-            if (traceAvail)
-                std::printf("[viewer] press 'T' for a live path-traced preview (fast RGB backward)\n");
-            else
-                std::printf("[viewer] path-trace preview ('T') unavailable (scene/camera outside fast-RGB GPU scope)\n");
-            std::fflush(stdout);
 #endif
+            std::printf("[viewer] press 'T' to cycle the lit preview: raster -> mode W "
+                        "(deterministic, CPU, any scene) -> %s%s\n",
+                        traceAvail ? "path-traced (fast RGB, GPU)"
+                                   : "(path-traced GPU preview unavailable: no CUDA raster, or "
+                                     "scene/camera outside fast-RGB scope)",
+                        pvMode == PV_WHITTED ? "  [starting in mode W]" : "");
+            std::fflush(stdout);
             // ---- loom LIVE channel (-anim + -loom, E2 "channel b") --------------------
             // With a loom build file the editor stops being a sidecar editor and becomes a
             // live one: each scrub position is pushed to a resident `python -m loom.anim`,
@@ -8146,8 +8226,10 @@ static int run(int argc, char** argv) {
                 // The RGB-backward session bakes the scene at begin() — setCamera only
                 // re-aims — so a scene swap needs a full End/Begin, not a re-aim.
                 if (traceSess) { backwardRGBSessionEnd(traceSess); traceSess = nullptr; }
-                traceDirty = true;
 #endif
+                // Outside the ifdef: the mode-W preview traces the live `scene` band by band,
+                // so a scene swap must discard its half-finished frame too, CUDA or not.
+                traceDirty = true;
                 return true;
             };
             while (!g_liveWin->closed() && !g_stopRequested) {
@@ -8240,17 +8322,20 @@ static int run(int argc, char** argv) {
                     collide = (CollideMode)((collide + 1) % 3);
                     std::printf("[viewer] collision: %s\n", collideName(collide)); std::fflush(stdout);
                 }
-                // T toggles the live path-traced (fast RGB backward) preview vs. flat raster.
+                // T cycles the lit preview: raster -> mode W -> path-traced -> raster.
+                // The GPU path-trace stage is SKIPPED (not just refused) when unavailable, so
+                // on a CPU-only box or an out-of-scope scene T is a plain raster<->W toggle
+                // rather than a key that prints an error and does nothing.
                 if (nav.toggleTrace) {
-                    if (!traceAvail) {
-                        std::printf("[viewer] path-trace preview unavailable (scene/camera outside fast-RGB GPU scope)\n");
-                    } else {
-                        traceMode = !traceMode;
-                        traceDirty = true;   // restart accumulation at the current pose
-                        changed = true;      // repaint immediately (raster if off; re-aim if on)
-                        std::printf("[viewer] path-trace preview %s\n",
-                                    traceMode ? "ON (fast RGB backward)" : "OFF (raster)");
-                    }
+                    if (pvMode == PV_RASTER)       pvMode = PV_WHITTED;
+                    else if (pvMode == PV_WHITTED) pvMode = traceAvail ? PV_PT : PV_RASTER;
+                    else                           pvMode = PV_RASTER;
+                    traceDirty = true;   // re-render / restart accumulation at the current pose
+                    changed = true;      // repaint immediately (raster if off; re-aim if on)
+                    std::printf("[viewer] preview: %s\n",
+                                pvMode == PV_RASTER  ? "raster (flat, instant)"
+                              : pvMode == PV_WHITTED ? "mode W (deterministic, CPU)"
+                                                     : "path-traced (fast RGB backward, GPU)");
                     std::fflush(stdout);
                 }
                 // Reset is the reliable "put me back to a normal, steerable state" escape:
@@ -8473,8 +8558,115 @@ static int run(int argc, char** argv) {
                 // this idle pose; it suppresses the raster warm-frame and the idle sleep so the
                 // image keeps converging (the accumulate() launch already holds the GPU warm).
                 bool tracingNow = false;
+                if (pvMode == PV_WHITTED) {
+                    Camera c; c.projection = proj;
+                    c.lookAt(eye, tgt, rUp, rFov, VW, VH);
+                    if (wResX != VW || wResY != VH) {          // first use / window resize
+                        wFilm.resX = VW; wFilm.resY = VH; wFilm.alloc();
+                        wResX = VW; wResY = VH;
+                        traceDirty = true;
+                    }
+                    if (changed) {
+                        // Camera moved: show the responsive raster and drop the stale rows.
+                        if (!rasterPresent(c, VW, VH, ev, autoExp)) {
+                            std::vector<uint8_t> img = rasterOne(c, VW, VH, ev, autoExp, nullptr);
+                            drawOverlay(c, VW, VH, img);
+                            g_liveWin->update(VW, VH, img);
+                        }
+                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                                            ")  dir(" + fmt3(fwd) + ")  [mode W: stop to render]");
+                        traceDirty = true;
+                        changed = false;
+                    } else if (traceDirty) {
+                        // First still frame at a new pose: a COARSE full-frame mode-W pass.
+                        // It lands almost immediately (1/256 the pixels) so there is a real lit
+                        // image to look at at once, and — the reason it is full-frame rather
+                        // than just the first band — its p99 gives a globally representative
+                        // auto-exposure anchor. Anchoring on band 0 instead would expose the
+                        // whole frame off one strip of it and blow out everything that follows.
+                        const int cw = std::max(1, VW / kWCoarse), ch = std::max(1, VH / kWCoarse);
+                        Camera cc; cc.projection = proj;
+                        cc.lookAt(eye, tgt, rUp, rFov, cw, ch);
+                        Film cf = renderBackward(scene, cc, cw, ch, 1, nThreads, /*diffraction*/false,
+                                                 0, /*forceWhitted*/true);
+                        traceAnchor = 0.0;                     // recompute the anchor for this pose
+                        std::vector<uint8_t> small =
+                            filmToRgb8(cf, 1.0, ev, scene.absolute, &traceAnchor);
+                        wImg.assign((size_t)VW * VH * 3, 0);   // nearest-neighbour up to full size
+                        for (int y = 0; y < VH; ++y) {
+                            const int sy = std::min(ch - 1, y * ch / VH);
+                            for (int x = 0; x < VW; ++x) {
+                                const int sx = std::min(cw - 1, x * cw / VW);
+                                std::memcpy(&wImg[((size_t)y * VW + x) * 3],
+                                            &small[((size_t)sy * cw + sx) * 3], 3);
+                            }
+                        }
+                        std::vector<uint8_t> show = wImg;
+                        drawOverlay(c, VW, VH, show);
+                        g_liveWin->update(VW, VH, show);
+                        // wFilm ACCUMULATES across passes, so it has to be cleared for the new pose.
+                        std::fill(wFilm.xyz.begin(), wFilm.xyz.end(), Vec3(0.0, 0.0, 0.0));
+                        wRow = VH;                             // now refine full-res, top band first
+                        wBandRows = 16;
+                        wPass = 0;
+                        traceDirty = false;
+                        tracingNow = true;
+                    } else if (wRow > 0) {
+                        // Refine one band. Film row 0 is the image BOTTOM (filmToRgb8 flips), so
+                        // taking bands off the high end of the film fills the picture downwards.
+                        const int y1 = wRow, y0 = std::max(0, wRow - wBandRows);
+                        auto t0 = clock::now();
+                        renderBackward(scene, c, VW, VH, 1, nThreads, /*diffraction*/false,
+                                       /*sampleBase*/(unsigned long long)wPass,
+                                       /*forceWhitted*/true, &wFilm, y0, y1);
+                        double secs = std::chrono::duration<double>(clock::now() - t0).count();
+                        // Tone-map JUST this band, with the pose's locked anchor, and splice it
+                        // into the shown image over the coarse pixels it replaces. N is the pass
+                        // count these rows have received, not the frame's -- rows further down are
+                        // still one pass behind until the sweep reaches them.
+                        Film bf; bf.resX = VW; bf.resY = y1 - y0; bf.alloc();
+                        std::memcpy(bf.xyz.data(), &wFilm.xyz[(size_t)y0 * VW],
+                                    sizeof(Vec3) * (size_t)VW * (y1 - y0));
+                        std::vector<uint8_t> bimg =
+                            filmToRgb8(bf, (double)(wPass + 1), ev, scene.absolute, &traceAnchor);
+                        for (int r = 0; r < y1 - y0; ++r) {
+                            // bimg row r is film row (y1-1-r); the shown image has film row f at
+                            // image row VH-1-f.
+                            const int dst = VH - 1 - (y1 - 1 - r);
+                            std::memcpy(&wImg[(size_t)dst * VW * 3], &bimg[(size_t)r * VW * 3],
+                                        (size_t)VW * 3);
+                        }
+                        wRow = y0;
+                        // Retune for the next band. Clamped below at 1 row (a heavy scene must
+                        // still make progress) and above at 1/4 of the frame (so an easy scene
+                        // does not swallow the whole image in one unresponsive gulp).
+                        if (secs > 1e-4) {
+                            double scale = kWBandSec / secs;
+                            wBandRows = (int)std::clamp((double)wBandRows * scale, 1.0,
+                                                        std::max(1.0, VH / 4.0));
+                        }
+                        // Pass complete. A bundle-only scene is EXACT here, so stop; otherwise
+                        // start the next pass to fill in the spectrum (see wNeedSpp).
+                        if (wRow == 0 && wNeedSpp && wPass + 1 < kWSppCap) {
+                            ++wPass;
+                            wRow = VH;
+                        }
+                        std::vector<uint8_t> show = wImg;
+                        drawOverlay(c, VW, VH, show);
+                        g_liveWin->update(VW, VH, show);
+                        tracingNow = (wRow > 0);   // keep spinning until the frame is complete
+                        const std::string sppTag = wNeedSpp ? " " + std::to_string(wPass + 1) + " spp" : "";
+                        if (tracingNow)
+                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  mode W" + sppTag + " " +
+                                                std::to_string(100 * (VH - wRow) / std::max(1, VH)) +
+                                                "%  eye(" + fmt3(eye) + ")");
+                        else
+                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  mode W" + sppTag +
+                                                "  eye(" + fmt3(eye) + ")  dir(" + fmt3(fwd) + ")");
+                    }
+                }
 #ifdef HAVE_CUDA
-                if (traceMode && traceAvail) {
+                if (pvMode == PV_PT && traceAvail) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     // (Re)create the resident session on first use or after a resize.
@@ -8518,7 +8710,7 @@ static int run(int argc, char** argv) {
                     }
                 }
 #endif
-                if (!traceMode && (changed || warmOnly)) {
+                if (pvMode == PV_RASTER && (changed || warmOnly)) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     // A warm-only frame renders solely to hold the boost clock and must NOT

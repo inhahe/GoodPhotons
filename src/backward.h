@@ -719,7 +719,14 @@ struct BackwardRenderer {
                     const double extIor = (ranked && outMat >= 0)
                         ? scene.mats[outMat].ior(lambda) : 1.0;
                     bool transmitted = false;
-                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                    // Mode W: dominant Fresnel branch weighted into the throughput instead of
+                    // a coin flip (see refractOrReflect's whittedWeight). Attenuating AFTER
+                    // the call is safe because the ray has not been traced yet -- returning
+                    // false here just ends the path at this vertex, as elsewhere in mode W.
+                    double wW = 1.0;
+                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted,
+                                                extIor, whitted ? &wW : nullptr);
+                    if (whitted && !whittedAttenuate(thr, wW)) return false;
                     if (transmitted) stk.push(mi, pr);
                     return true;
                 } else {
@@ -737,7 +744,10 @@ struct BackwardRenderer {
                     const double extIor = (ranked && newMat >= 0)
                         ? scene.mats[newMat].ior(lambda) : 1.0;
                     bool transmitted = false;
-                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                    double wW = 1.0;                      // mode W: see the entering branch
+                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted,
+                                                extIor, whitted ? &wW : nullptr);
+                    if (whitted && !whittedAttenuate(thr, wW)) return false;
                     if (transmitted) stk.popMat(mi);      // TIR stays inside mi
                     return true;
                 }

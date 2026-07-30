@@ -187,8 +187,17 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   Grating / specular-bundle survival becomes `whittedAttenuate` (multiply the
   throughput by the weight, stop under `kWhittedCutoff` = 1/512 — POV-Ray's
   `adc_bailout`); HalfMirror / Layered take the dominant branch weighted, and a Mix
-  hard-thresholds via `mixResolveDominant` (`scene.h`); the wavelength and the
-  subpixel offset come off radical-inverse sequences instead of the rng. It implies
+  hard-thresholds via `mixResolveDominant` (`scene.h`); **Dielectric** likewise takes the
+  dominant Fresnel branch (reflect iff R ≥ 0.5) with that branch's weight folded into the
+  throughput, via `refractOrReflect`'s `whittedWeight` out-param (`render.h`) — which also
+  skips the frosting perturbation, the other rng draw at that interface (0.107.0; before
+  that a dielectric was the one estimator left tossing a coin, and at `-spp 1` a coin flip
+  per pixel is not noise but salt-and-pepper — glass rendered as a speckled blob); the
+  wavelength and the subpixel offset come off radical-inverse sequences instead of the rng.
+  Note the one thing still NOT free at 1 spp: a dielectric **de-heroes** the path onto a
+  single wavelength, and since the λ lattice is shared by every pixel, at 1 spp the whole
+  frame de-heroes onto the *same* wavelength and every dispersive object is strongly
+  mistinted (needs ~16 spp; see known-issues). It implies
   `directOnly`, with `ambient` (a flat term at each diffuse vertex) as the GI
   stand-in — pre-scaled by `Scene::ambientRef()` so the CLI value is dimensionless.
 
@@ -883,8 +892,39 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   photon mean free path of `1/(1-R)` bounces — ~33 for silver — so truncating at 8 does not
   dim such a scene, it deletes it (`scenes/mirror_sphere_interior.ftsl` goes from 97% pure
   black at depth 8 to 29% at depth 64).
-  Since 0.29.0 the interactive `-explore` fly-viewer can toggle (key **`T`**) a live
-  **path-traced preview** using the fast RGB backward tracer instead of the flat raster:
+  Since 0.107.0 the **`T`** key in the `-explore` fly-viewer **cycles** the still view
+  `raster → mode W → path-traced → raster`, with the path-traced stage *skipped* (not
+  refused) when unavailable, so on a CPU-only box `T` is a plain raster↔W toggle rather than
+  a key that prints an error. `-explore -mode W` opens straight into the W stage.
+  The **mode-W stage** (`pvMode == PV_WHITTED`) is the always-available one: CPU, any scene,
+  full spectral walk, and noise-free, so the pose renders ONCE rather than converging. Two
+  design points, both forced by the cost spread (a mode-W frame is ~0.4 s on a Cornell box
+  but ~26 s on a gyroid labyrinth at 960×600, so neither a blocking render nor a fixed
+  chunk size works):
+   * **Progressive row bands.** `renderBackward` grew `into`/`rowBegin`/`rowEnd` so the
+     thread pool can split a BAND of a caller-owned film. The viewer renders one band per
+     loop iteration and retunes `wBandRows` from the previous band's measured wall time
+     toward `kWBandSec` (0.10 s), clamped to `[1, VH/4]`. Input is drained between bands, so
+     moving the camera just abandons the unfinished rows. Bands come off the HIGH end of the
+     film because film row 0 is the image bottom (`filmToRgb8` flips), so the picture fills
+     downward.
+   * **A coarse full-frame pass first** (`kWCoarse` = 1/16 linear, 1/256 the pixels). It is
+     nearest-neighbour upscaled into `wImg` so there is a lit image immediately, but the real
+     reason it is full-frame rather than just the first band is that its p99 gives a
+     globally representative **auto-exposure anchor**, locked into `traceAnchor` for the
+     whole pose. Anchoring on band 0 instead would expose the frame off one strip of it and
+     blow out everything after.
+  Each band is tone-mapped alone, with `N = wPass + 1` (the pass count *those rows* have
+  received, not the frame's) and the locked anchor, then spliced into `wImg`. `wFilm`
+  accumulates, so it is cleared per pose. When a pass completes the viewer stops — a
+  bundle-only scene is exact at 1 spp — *unless* `wNeedSpp`, which is set when the scene
+  contains a de-heroing material (Dielectric/ThinFilm/Multilayer/Grating/HalfMirror/
+  Fluorescent) or the scalar path is in use at all (`heroC <= 1`, media, GRIN, lens); then it
+  keeps adding passes to `kWSppCap` (16) to resolve the wavelength collapse those materials
+  cause (see known-issues). Because the viewer's preview IS mode W, an `-explore` run also
+  honours mode-W-only settings that would otherwise be rejected: `wPreview` in `main.cpp`
+  widens the hero bundle and spares `-gi` from the "needs `-mode W`" rejection.
+  The older **path-traced preview** stage uses the fast RGB backward tracer:
   a resident `BackwardRGBSession` (render_cuda.cu) bakes/uploads the scene ONCE
   (`buildUploadScene`) and keeps a persistent SUM film; while the camera holds still the
   main loop calls `backwardRGBSessionAccumulate(batch)` each idle tick (advancing the RNG

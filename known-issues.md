@@ -5,57 +5,84 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### DEBT (2026-07-29, v0.105.0): mode `W` still samples dielectrics stochastically
+### DEBT (2026-07-29, v0.107.0): mode `W` picks a dielectric's dominant branch, it does not fork
+
+*(Supersedes the v0.105.0 "still samples dielectrics stochastically" entry and the v0.106.0
+"opaque bright blob" BUG — both **FIXED**, see below.)*
+
+`refractOrReflect` (`src/render.h`) now takes a `whittedWeight` out-param: mode `W` takes
+the **dominant** Fresnel branch (reflect iff R ≥ 0.5) and folds that branch's weight into
+the path throughput via `whittedAttenuate`, the same trade `MatType::HalfMirror` /
+`Layered` / `Mix` already make. That removed the coin flip, which was the real bug.
+
+What remains is the inherent limit of "dominant only": a dielectric is the one place where
+forking *both* branches genuinely matters (a window shows a reflection **and** what is
+behind it at once), so near the Brewster/grazing crossover one of them is visibly dropped.
+The honest version forks up to a small depth budget, POV-Ray-style, pruned by
+`kWhittedCutoff` — which prunes hard, since a normal-incidence reflection weighs ~0.04 and
+its second bounce ~0.0016 is already under the 1/512 cutoff, so the fork tree stays shallow
+in practice. That needs `radiance`/`radianceHero` to grow a recursive branch, which they
+currently avoid (both are iterative single-path loops).
+
+#### FIXED (2026-07-29, v0.107.0): the stochastic coin flip
 
 `-mode W` replaced every other Monte-Carlo estimator on the backward walk with a fixed
-quadrature (light grid, mirror direction, throughput attenuation instead of Russian
-roulette, dominant branch at half-mirrors/layers/mixes, fixed λ lattice, fixed subpixel
-pattern), but **`refractOrReflect` was deliberately left alone**: it still draws
-`rng.uniform()` to choose reflect vs refract at a dielectric interface. So a scene with
-glass in it is noise-free everywhere *except* the glass, which is exactly where the eye
-goes.
+quadrature, but `refractOrReflect` was left alone and still drew `rng.uniform()` to choose
+reflect vs refract. So glass was the one thing in a "noise-free" mode that was noisy — and
+at `-spp 1`, where the mode is meant to be used, a single coin flip per pixel is not noise
+but **salt-and-pepper**: `ftrace -in scenes/cornell.ftsl -mode W -spp 1` rendered the SF10
+ball as a speckled blob. Fixed by the dominant-branch selection above. (The roughness
+perturbation, also stochastic, is skipped in mode `W` for the same reason — consistent with
+mode `W` taking the mirror direction for glossy lobes.)
 
-*Proper fix:* the same treatment `MatType::HalfMirror` got — take the branch with the
-larger Fresnel weight and multiply the throughput by that weight, stopping under
-`kWhittedCutoff`. The complication is that a dielectric is the one place where forking
-*both* branches genuinely matters (a window shows a reflection and what's behind it at
-once), so "dominant only" will visibly drop one of them near the Brewster/grazing region;
-the honest version forks up to a small depth budget, POV-Ray-style. That needs
-`radiance`/`radianceHero` to grow a recursive branch, which they currently avoid (both
-are iterative single-path loops). Until then the README documents mode `W` on glass as
-"still a little noisy".
+#### FIXED (2026-07-29, v0.107.0): "opaque bright blob" — the original diagnosis was wrong
 
-### BUG (2026-07-29, v0.106.0): mode `W` renders a dielectric sphere as an opaque bright blob
+The v0.106.0 BUG entry claimed the sphere had "no lens structure whatsoever" and did **not**
+improve with `-spp`, "converging to the wrong answer". Both claims were artifacts of the
+metric it used. It scored sphere-centre *saturation max−min* (9.8 at `-spp 1`, 4.7 at 16,
+4.4 at 128) and read the *fall* as bias converging; that fall was simply the **coin-flip
+noise averaging out**. Measured properly against a 2504-spp mode-`R` reference at 640×400
+(`scraps/wprev_ref.png`), mode `W` at `-spp 16` is now:
 
-Worse than, and probably related to, the stochastic-dielectric DEBT entry above — that one
-predicts *noise* on glass, but the actual symptom is a **systematic** loss of the whole
-refracted image. Reproducer:
+| metric | ref (mode R) | W `-spp 1` | W `-spp 16` |
+|---|---|---|---|
+| sphere / lit-wall luminance ratio | 2.19 | 3.50 | **2.04** |
+| structure inside the ball (std) | 14.2 | 12.2 | **11.5** |
+| hue, sphere R−G | +8.7 | **−163.6** | +33.3 |
 
-    ftrace -scene cornell -mode W -r 240 240 -spp 128 -o scraps/csph_s128.png
-    ftrace -in scraps/cor_gi.ftsl -mode R -noise 1.0 -o ref.png   # (glass variant)
+Structure 11.5 vs the reference's 14.2 is *not* an opaque blob — the refracted lens image is
+there — and the brightness ratio is within 7% of the reference, so the "~2× too bright"
+reading was the direct-only wall being dark, not the glass being bright.
 
-The converged mode-`R` reference shows the SF10 sphere as clear glass with an inverted
-lens image of the room and the ceiling light visible through it. Mode `W` shows a smooth
-opaque ball with no lens structure whatsoever, and it does **not** improve with `-spp`
-(measured sphere-centre saturation max−min: 9.8 at `-spp 1`, 4.7 at 16, 4.4 at 128 — it
-converges to the *wrong* answer, so this is not the RNG in `refractOrReflect`).
+The one real residue is **hue**, and it is the wavelength issue below, not the interface.
 
-It is also far too bright: sphere centre reads 192 vs 107 on the directly lit left wall at
-`-ambient 0`, i.e. the glass is the brightest object in a frame whose only emitter is the
-ceiling panel, and it reads 178 against the reference's 94 (~2× too bright). The sphere
-also brightens with `-ambient` (192 → 233 from `-ambient 0` → `0.3`), which a purely
-specular dielectric should barely do — suggesting the vertex is picking up the diffuse
-`ambient` fill and/or terminating early rather than refracting.
+### DEBT (2026-07-29, v0.107.0): mode `W` renders dispersive materials at ONE wavelength per sample
 
-*Where to look:* the `MatType::Dielectric` case in `interactMaterial` (`src/backward.h`)
-under `whitted`, and how `directOnly` (which mode `W` implies) interacts with a specular
-chain — a dielectric vertex has no NEE contribution, so if `directOnly` cuts the path
-there the sphere can only return whatever fill is applied at that vertex, which would
-explain both the missing lens image and the ambient sensitivity.
+The `R−G = −163.6` above: at `-spp 1` a glass ball comes out violently green. A dielectric
+(or thin film / multilayer / grating / half-mirror / fluorescence) **de-heroes** the path —
+`radianceHero` terminates the secondary wavelengths and continues the hero channel alone,
+because the interface refracts each wavelength in a different direction. Mode `W`'s
+wavelength lattice `whittedLambdaU(sIdx)` is a function of the **sample index alone**, which
+is precisely what makes the mode noise-free (every pixel agrees), so at `-spp 1` the *entire
+frame* de-heroes onto *one* wavelength and every dispersive object is tinted by it. It is
+under-sampling, not bias: `R−G` falls −163.6 → +33.3 by `-spp 16` (reference +8.7).
+
+Mitigated, not fixed: the README documents `-spp 8`–`16` for glass, and the interactive
+viewer's mode-`W` preview auto-detects a dispersive material in the scene and keeps adding
+passes to 16 spp (`wNeedSpp` in `src/main.cpp`), stopping at 1 spp otherwise since a
+bundle-only scene is already exact.
+
+*Proper fix:* split the bundle at a de-hero vertex instead of collapsing it — run the scalar
+continuation once per hero wavelength and accumulate into `L[i]`, so one sample still covers
+`heroC` wavelengths through glass. Costs up to `heroC`× at dielectric vertices only.
+`hero::gSplit` (`-herosplit`) already does something structurally similar on the CPU forward
+tracer and is the place to look for prior art. Note the comment above the scalar λ draw in
+`renderRows` still says the hero path "gets C=heroC of them per sample for free" — true only
+until the path de-heroes, which is exactly this case.
 
 *Why it matters beyond glass:* it silently invalidated a GI measurement. The first attempt
 to evaluate `-gi` on `scenes/cornell` compared mode-`W` frames against a mode-`R`
-reference where this blob was the single largest error in the frame, swamping the
+reference where the mistinted sphere was the single largest error in the frame, swamping the
 interreflection signal the sweep was trying to measure. `scraps/cor_gi.ftsl` (all-diffuse,
 no dielectric, no glossy) exists specifically to dodge this and the glossy entry below.
 
