@@ -5,6 +5,64 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — FIXED (2026-07-30, v0.116.0): the GPU's *watertight* triangle test CRACKS, because nvcc contracts its edge functions into FMAs
+
+Found while validating N3c: `scraps/cor_gi.ftsl` at 240×240 in mode `W` failed the CPU↔GPU
+block-mean bar badly (max |dLuma| **7.668** codes, |dChroma| **3.062**, bar is 1.5) with **134
+pixels** more than 8 codes off. `scraps/n3c_diffmap.py` (written for this) localised them, and
+the shape was the giveaway: every bad pixel lay on `x == y` or `x + y == 239`, i.e. exactly the
+frame diagonals, and every one of them was pure `(0,0,0)` on the GPU against a lit
+`~(247,234,236)` wall on the CPU. Nothing to do with `-gi` at all — it reproduced at `-gi 0`.
+
+The camera is exactly centred on a square Cornell box, so the back-wall quad's own
+triangulation diagonal, plus all four ceiling/floor-to-side-wall corner seams, project **dead
+through hundreds of consecutive pixel centres**. The GPU was losing the hit at every one of
+them: the background leaking through a closed surface, from the intersection routine whose
+entire selling point is that this cannot happen.
+
+**Where:** `src/render_cuda.cu`, `intersectTri` — the three scaled barycentric edge functions of
+the Woop watertight test (Woop/Benthin/Wald/Áfra, JCGT 2013), plus the exact-zero double
+fallback right after them.
+
+**Mechanism.** The watertight guarantee is that two triangles sharing an edge evaluate that edge
+from **bitwise identical operands in opposite order**, so their edge functions come out exact
+negatives; the accept test rejects only *mixed* signs, so a zero is accepted and a ray dead-on
+the edge is claimed by exactly one sharer. nvcc defaults to `-fmad=true` and contracts
+`a*b - c*d` into `fma(a, b, -(c*d))`, which keeps **one** product exact and rounds only the
+other. On an exact tie the two sharers therefore compute `exact(pq) - rounded(qp)` and
+`exact(qp) - rounded(pq)` — which are *equal*, not negatives. If that shared sign is the
+minority one, **both triangles reject and the surface cracks.** The exact-zero fallback had the
+same problem, and it is precisely the tie case, so it is the code that most needs to stay
+antisymmetric.
+
+This is the same failure and the same fix as the CPU/GPU rasterizer's `edgeRow`/`edgeAt`
+(v0.98.2, item 6 below) — the ray-tracing analogue, missed at the time because the rasterizer
+fix didn't prompt an audit of the *tracer's* edge functions.
+
+**Fix.** A `dCrossRn(a,b,c,d)` helper built on `__fmul_rn`/`__fsub_rn` (with `double`
+overloads, `__dmul_rn`/`__dsub_rn`, so the `Real = double` device build is covered too), used
+for all three edge functions and for the double fallback. The host (`src/geometry.h`) needs
+nothing — MSVC's default `/fp:precise` does not contract and the build sets no `/fp:` or
+`/arch:` flag — but a comment now records that dependency and points at the CUDA twin, so a
+future `/fp:fast` doesn't reintroduce the bug silently.
+
+**Result.** `cor_gi -gi 0 -ambient 0.1`: dLuma **7.668 → 0.619**, dChroma **3.062 → 0.853**
+(FAIL → PASS); the 134 black pixels became **25**, none of them black — they are a
+red-wall-vs-white-ceiling tie-break one pixel wide, i.e. the two sharers now disagree about
+*which* of them owns the edge rather than both dropping it, which is legitimate and is what the
+watertight rule promises. `-gi 32` went dLuma 4.376 → **0.328**. The N3a/N3b/N3d beds and all 14
+self-tests pass.
+
+**Cost: none measurable.** A/B on `scraps/n3_gpu.ftsl` 1200×800 `-spp 256 -device gpu`
+(a tracer-dominated ~5 s, vs ~1.2 s of fixed startup overhead): contracted 5.213 / 5.009 /
+5.007 s, non-contracted 5.075 / 5.122 / 4.954 s — identical within run-to-run noise, even
+though the change adds ~3 float ops per triangle test inside the BVH leaf loop. The leaf loop is
+memory-bound, not ALU-bound.
+
+**Follow-up worth doing:** audit the *rest* of the device tracer for other places where a
+`a*b - c*d` determinant sign has to be consistent between two independent evaluations. The two
+found so far (rasterizer edges, tracer edges) were both found by symptom rather than by audit.
+
 ### BUG — FIXED (2026-07-30, v0.115.0 → v0.115.1): every `layered` surface renders MONOCHROMATIC in mode `W` at 1 spp
 
 Found while re-rendering `scenes/layered.ftsl` after the `shortpass`/`gaussian` parser fix below.
@@ -5699,8 +5757,8 @@ correctly on **both** backends.
   backend by scene material variety + path depth rather than always defaulting to the
   megakernel.
 
-### MOSTLY DONE (2026-07-29, v0.111.0): mode W is the only render mode with NO GPU path
-**Closed for the common case by TODO.md §N/N3a+N3b.** Mode W now rides the same `kBackward`
+### DONE (2026-07-30, v0.116.0): mode W is the only render mode with NO GPU path
+**Fully closed by TODO.md §N/N3a+N3b+N3c.** Mode W now rides the same `kBackward`
 megakernel as mode R with the estimators swapped: seven `DScene` knobs (`bkWhitted`, `bkGrid`,
 `bkGiDirs`, `bkGiGrid`, `bkGiBounce`, `bkHeroSplit`, `bkAmbient`) uploaded from a `WhittedOpts`
 (`src/render_cuda.h`), device twins of every lattice helper (`dRadicalInverse2` /
@@ -5731,13 +5789,39 @@ That commit also fixed a **latent divergence**: `buildUpload` now defaults
 Before, GPU mode R *silently ignored* `-herosplit` and always de-hero'd, so CPU and GPU mode R
 disagreed by ~4.4 codes of block luma on a glass scene whenever the flag was passed.
 
-**Still open (falls back to the CPU mode-W tracer rather than degrade, since a missing
-deterministic term is a visible error, not extra noise):**
-- **`-gi <n>`** (the deterministic one-bounce gather), a depth-1 recursion. The last mode-W
-  fallback.
-  *Proper fix (TODO.md §N/N3c):* `template<int GiDepth>` + a device `dGiDir` Fibonacci-spiral
-  lattice, then drop the `giDirs > 0` gate. `DGiCtx` and all four depth-1 behaviours plus the
-  escaped-gather `bkAmbient` tail already landed in N3a.
+**`-gi <n>` followed in N3c (v0.116.0) — the last mode-W fallback is gone.** The gather is a
+recursion (a diffuse vertex shoots `giDirs` rays back into `radiance()`), which on the device
+would need `-rdc` plus a hand-sized stack, so the depth became a **second, independent
+compile-time parameter**: `bkRadianceHeroLoop<bool AllowSplit, int GiDepth>`,
+`bkRadiance<int GiDepth>`, `bkRadianceHero<int GiDepth>`, `bkInteract<bool AllowGather>`. Only
+`GiDepth == 0` contains a gather call; the rays it spawns are `GiDepth == 1`, whose body
+contains none, and a split sub-path *inherits* its parent's `GiDepth`, so the deepest chain is
+`<true,0>` → gather → `<true,1>` → split → `<false,1>` — three statically-sized frames, no
+`-rdc`. (`bkInteract` takes a `bool` because the hero tracer handles Diffuse/DiffuseTransmit
+inline and routes only dispersive materials there, so it always passes `false` — 2
+instantiations, not 3.) `dGiDir` / `dGiPhases` are the world-space Fibonacci-spiral lattice,
+Cranley-Patterson-rotated by scrambled radical inverses in bases 7/11. `cudaBackwardWhittedSupported()`
+now narrows **nothing** beyond `cudaBackwardSupported()`.
+
+Measured on `scraps/cor_gi.ftsl` (Cornell box, 240×240, `-spp 1`, `scraps/n3b_check.py`,
+1.5-code bar): `-gi 32` CPU↔GPU **98.681 %** bit-identical, 99.914 % within one code, max
+|dLuma| **0.328** / |dChroma| **0.295** codes per 20 px block → PASS; strict `n3_check.py`
+gives 40 hot pixels and **0 blob interior**. The scalar `bkRadiance`/`bkGiGather` path
+(`-heroc 1 -gi 32`) passes independently at dLuma 0.573 / dChroma 0.733. The normalisation
+invariant holds bit-for-bit on the device: `scraps/gi_collapse.ftsl` renders **pixel-identically**
+at `-gi 0` and `-gi 32`, i.e. the gather collapses to exactly `rho * ambient` in an empty scene,
+so switching `-gi` on never steps the exposure. The N3a / N3b / N3d beds all re-verified
+(99.447 / 99.533 / 99.611 % bit-identical, dLuma ≤ 0.153) and all 14 physics self-tests pass.
+
+N3c also fixed three smaller latent divergences found while validating:
+- The **device scalar `bkRadiance`'s gather bounce cap was missing the `min`** — it used
+  `bkGiBounce` outright where the host uses `std::min(maxBounce, giBounce)`, so a `-gi-bounce`
+  larger than `-max-bounce` would have let a gather ray trace *deeper* than the camera path.
+- **`Fluorescent`'s NEE omitted the gi context on *both* sides** (`backward.h`
+  `MatType::Fluorescent`, `render_cuda.cu` `D_FLUORESCENT`), so a fluorescent surface paid
+  `lightGrid²` shadow rays inside a `-gi` gather while every Diffuse vertex paid `giGrid²` — the
+  two materials disagreed on the shadow lattice for no reason. Now both pass `gi` / `gi.depth`.
+- **`--help` still said mode `W` was "(CPU only)"**; it now says "(CPU or GPU)".
 
 Also worth recording: **`-rgb` is now refused in mode W** (message in `main.cpp`) rather than
 silently taken — the fast RGB kernel is a separate reduced tracer with no deterministic

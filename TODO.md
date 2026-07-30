@@ -3661,8 +3661,9 @@ Mode W (`-mode W`, the POV-Ray-style deterministic Whitted preview, v0.105.0; `-
 v0.106.0; promoted to the `-explore` viewer's lit preview v0.107.0) *was* the **only render mode with
 no GPU backend** — `main.cpp:4292`'s `(mode == 'R' && !g_whitted)` routed it to the CPU
 unconditionally. Continues §L (the backward tracer) and §M (GPU fallback closure, M1–M12 all done).
-As of v0.111.0 (N3a+N3b) it runs on the device for everything except `-gi` (N3c), which is the last
-remaining CPU fallback for mode W.
+As of v0.116.0 (N3a+N3b+N3c) **the whole mode runs on the device** —
+`cudaBackwardWhittedSupported()` narrows nothing at all beyond `cudaBackwardSupported()`, and mode W
+has no mode-W-specific CPU fallback left.
 
 **Order matters:** N1/N2 change mode W's *estimator*, so they come before the port — porting an
 estimator that is about to change means writing the hand-maintained device twin twice.
@@ -3745,8 +3746,8 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       only higher spp improves). Preserves both mode-W invariants: shared offsets per pixel, and
       indexing by the **absolute** sample index so the image stays chunk-split-independent.
       </details>
-- [ ] **N3. Port spectral mode W to the device.** *(N3a DONE 2026-07-29, v0.110.0; N3b DONE
-      2026-07-29, v0.111.0; N3c open.)*
+- [x] **N3. Port spectral mode W to the device.** *(DONE — N3a 2026-07-29, v0.110.0; N3b
+      2026-07-29, v0.111.0; N3c 2026-07-30, v0.116.0.)*
   - [x] **N3a — knobs, lattice helpers, quadrature, non-dispersive materials, flat `bkAmbient`.**
         `WhittedOpts` (`src/render_cuda.h`, the twin of `BackwardRenderer`'s mode-W fields with
         `ambient` pre-scaled by `Scene::ambientRef()`) is passed as a trailing
@@ -3812,12 +3813,52 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
         chroma is scored separately since a de-hero is specifically a hue error.
         **Found a pre-existing bug on the way** (`thinfilm`/`multilayer` are still stochastic in
         mode W on *both* devices) — see N3d.
-  - [ ] **N3c — the `-gi` one-bounce gather.** `template<int GiDepth>` + a device `dGiDir`
-        (Fibonacci spiral, Cranley-Patterson-rotated by base-7/11 radical inverses of `sIdx`),
-        then drop the `giDirs > 0` gate. `DGiCtx` and all four of its depth-1 behaviours
-        (no second gather, `bkGiGrid`, `bkGiBounce`, `specularArrival = false`) plus the escaped
-        gather's `bkAmbient` far-field tail already landed in N3a — only `giGatherHero`/`giGather`
-        themselves are missing.
+  - [x] **N3c — the `-gi` one-bounce gather.** **DONE (2026-07-30, v0.116.0)** — the last
+        mode-W-specific CPU fallback is gone; `cudaBackwardWhittedSupported()` now forwards
+        straight to `cudaBackwardSupported()`.
+        The gather is a *recursion*, and CUDA recursion would need `-rdc` plus a hand-sized device
+        stack, so the depth became a **second, independent compile-time parameter** alongside
+        `AllowSplit`: `bkRadianceHeroLoop<bool AllowSplit, int GiDepth>`, `bkRadiance<int GiDepth>`,
+        `bkRadianceHero<int GiDepth>`, `bkInteract<bool AllowGather>`. Only `GiDepth == 0` contains
+        a gather call; its rays are `GiDepth == 1`, whose body contains none; a split sub-path
+        **inherits** its parent's `GiDepth`. Deepest chain: `<true,0>` → gather → `<true,1>` →
+        split → `<false,1>` — three statically-sized frames. (`bkInteract` takes a `bool` because
+        the hero tracer handles Diffuse/DiffuseTransmit inline and routes only dispersive materials
+        there, so it always passes `false` — 2 instantiations, not 3.) `dGiDir` / `dGiPhases` are
+        the **world-space** Fibonacci-spiral lattice (no tangent frame → no basis seam; directions
+        enter/leave the hemisphere at `cos == 0`, zero weight, so shading slides rather than pops),
+        Cranley-Patterson-rotated by scrambled radical inverses in bases 7/11 of the absolute
+        sample index. `DGiCtx` and all four depth-1 behaviours (no second gather, `bkGiGrid`,
+        `bkGiBounce`, `specularArrival = false`) plus the escaped gather's `bkAmbient` far-field
+        tail had already landed in N3a.
+
+        | test | result |
+        |---|---|
+        | `cor_gi -gi 32` CPU↔GPU, 240×240 `-spp 1` (`n3b_check.py`, 1.5-code bar) | 98.681 % bit-identical, 99.914 % within 1 code, max \|dLuma\| **0.328** / \|dChroma\| **0.295** → **PASS** |
+        | same, strict `n3_check.py` | 40 hot pixels, **0 blob interior** → PASS (edge-thin only) |
+        | `cor_gi -gi 0 -ambient 0.1` CPU↔GPU | \|dLuma\| **0.619** / \|dChroma\| **0.853** → PASS |
+        | `-heroc 1 -gi 32` (scalar `bkRadiance`/`bkGiGather` path) | \|dLuma\| 0.573 / \|dChroma\| 0.733 → PASS |
+        | `gi_collapse.ftsl` GPU `-gi 0` vs `-gi 32` | **pixel-identical** — the normalisation invariant (gather collapses to exactly `rho*ambient` in an empty scene) holds bit-for-bit on the device, so switching `-gi` on never steps the exposure |
+        | N3a / N3b / N3d beds re-verified | 99.447 / 99.533 / 99.611 % bit-identical, \|dLuma\| ≤ 0.153 → all PASS |
+        | 14 physics self-tests | all PASS |
+
+        **Blocked on a real pre-existing GPU bug, found and fixed here:** the device's *watertight*
+        Woop triangle test was **cracking** along any shared edge that projects onto exact pixel
+        centres, because nvcc's default `-fmad=true` contracted the edge functions' `a*b - c*d` and
+        destroyed the shared-edge antisymmetry the guarantee rests on. On `cor_gi` at 240×240 the
+        back wall's triangulation diagonal and all four box corner seams land dead on `x == y` /
+        `x + y == 239`, and **134 pixels** came back pure black through a closed surface (dLuma
+        7.668 → FAIL). Fixed with `dCrossRn` (`__fmul_rn`/`__fsub_rn` + `double` overloads) on the
+        three edge functions and the exact-zero fallback: dLuma **7.668 → 0.619**, and the 134 black
+        pixels became 25 legitimate one-pixel tie-breaks. Same failure and same fix as the
+        rasterizer's `edgeRow`/`edgeAt` (v0.98.2). Cost: **none measurable** (A/B on `n3_gpu.ftsl`
+        1200×800 `-spp 256`: 5.007 s contracted vs 5.075 s not — the BVH leaf loop is memory-bound).
+        Full write-up in `known-issues.md`.
+
+        Three smaller latent divergences fixed on the way: the device scalar `bkRadiance`'s gather
+        bounce cap was missing the host's `min(giBounce, maxBounce)`; `Fluorescent`'s NEE omitted the
+        gi context on **both** host and device (so it paid `lightGrid²` shadow rays inside a gather
+        where Diffuse paid `giGrid²`); and `--help` still called mode W "(CPU only)".
   - [x] **N3d — mode W was still STOCHASTIC at some material vertices, on both CPU and GPU.**
         **DONE (N3d-1 v0.112.0 + N3d-2 v0.113.0, 2026-07-30)** — all four offending materials
         (thinfilm, multilayer, grating, fluorescent) are deterministic on both devices now, so mode
@@ -4100,10 +4141,10 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       shared child selection (a documented bias, not a collapse). `Mix` could take the same
       re-enter-this-vertex treatment if it ever matters.
 - [ ] **N4. Deterministic CPU-vs-GPU A/B as N3's acceptance test.** *(Part (b) is in place and
-      passing for the N3a **and** N3b scopes — `scraps/n3_check.py` plus the block-mean
-      `scraps/n3b_check.py`; see those items' numbers. Part (a), the direct host-vs-device
-      lattice-helper sweep, is still to write, and (b) must be re-run after N3c widens the
-      gate.)* Unlike every prior port in §M, the
+      passing for the **full** N3 scope — N3a, N3b, N3c (`-gi`) and N3d — via `scraps/n3_check.py`
+      plus the block-mean `scraps/n3b_check.py`; see those items' numbers. It was re-run against the
+      widened 0.116.0 gate and every bed passes. Part (a), the direct host-vs-device lattice-helper
+      sweep, is still to write — that is all that remains of N4, tracked as N4a.)* Unlike every prior port in §M, the
       usual escape hatch does **not** apply: `render_cuda.h` explicitly permits the stochastic modes
       to be "an independent noise realization that agrees to within Monte-Carlo noise", but mode W has
       no noise to hide a mismatch behind. Any disagreement in the quadrature, the radical-inverse

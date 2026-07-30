@@ -972,7 +972,11 @@ struct BackwardRenderer {
                 // fluorescent channel excites at a separately-sampled lambdaIn (Stokes
                 // shift). Both channels NEE; one stochastic continuation carries indirect.
                 double rhoEl = clamp01(m.reflect(lambda));   // elastic base at lambda(out)
-                L += thr * neeLight(scene, h, rhoEl, invPdfLambda, lambda, rng, spdCache);
+                // `gi` matters (it selects giGrid over lightGrid at a gather vertex) —
+                // omitting it here used to make a fluorescent surface pay lightGrid^2 shadow
+                // rays inside a -gi gather while every Diffuse vertex paid giGrid^2, so the
+                // two materials disagreed on the shadow lattice for no reason.
+                L += thr * neeLight(scene, h, rhoEl, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, h, rhoEl, invPdfLambda, lambda, rng);
                 double Mint = m.fluoEmitSampler.integral;
@@ -1010,7 +1014,8 @@ struct BackwardRenderer {
                         if (rhoFluo > 0.0) {                          // fluoro DIRECT NEE
                             // (lambdaIn ≠ the cached wavelengths → matches() fails and
                             // this evaluates spdFn live, exactly as before.)
-                            L += thr * gOut * neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn, rng, spdCache);
+                            L += thr * gOut * neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn,
+                                                       rng, spdCache, gi);
                             if (scene.envIndex >= 0)
                                 L += thr * gOut * neeEnv(scene, h, rhoFluo, invPdfIn, lambdaIn, rng);
                         }

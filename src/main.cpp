@@ -5386,7 +5386,7 @@ static void printHelp(const char* prog) {
 "  -mode <letter>        transport mode (default B; A/B/C forward, R/V/D backward — see README)\n"
 "  -mode W               deterministic POV-Ray-style preview: mode R with every estimator\n"
 "                        replaced by a fixed quadrature, so it is noise-free at -spp 1\n"
-"                        (CPU only). See -whitted-grid / -ambient below\n"
+"                        (CPU or GPU). See -whitted-grid / -ambient below\n"
 "  -n <count>            photon/sample count (accepts 2e8, 1.5e9)\n"
 "  -r <W> [H]            resolution (square if H omitted)\n"
 "  -time <sec>           wall-clock budget (progressive)\n"

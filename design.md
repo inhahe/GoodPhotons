@@ -138,7 +138,21 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `emitterSamplePoint` shape-5 branch, uploaded per emitter.
 - **`geometry.h` / `bvh.h`** — primitives + SAH BVH (split plane by SAH, always
   recurse to LEAF_SIZE, median fallback; front-to-back traversal, ray-slab test
-  unrolled; `tEnter` pruning).
+  unrolled; `tEnter` pruning). Triangles use the **Woop watertight** test (JCGT 2013):
+  per-ray axis permutation + shear, then three scaled barycentric edge functions
+  `U`/`V`/`W`. The watertight guarantee is that two triangles sharing an edge evaluate it
+  from *bitwise identical operands in opposite order*, so their edge functions are exact
+  negatives and a ray dead-on the edge is claimed by exactly one (the accept test rejects
+  only **mixed** signs, so a zero is accepted). **This means the three `a*b - c*d` products
+  must not be FMA-contracted** — an FMA keeps one product exact and rounds only the other, so
+  on an exact tie the two sharers compute `exact(pq) - rounded(qp)` and
+  `exact(qp) - rounded(pq)`, which are *equal* rather than negatives; if that sign is the
+  minority one **both reject and the surface cracks**. MSVC's default `/fp:precise` does not
+  contract (the build sets no `/fp:` or `/arch:` flag), so the host needs nothing; the CUDA
+  twin defaults to `-fmad=true` and must go through `dCrossRn`
+  (`__fmul_rn`/`__fsub_rn`, plus `double` overloads for the `Real = double` build) — see
+  `render_cuda.cu`. Exactly the same failure and the same fix as the rasterizer's
+  `edgeRow`/`edgeAt` below. Fixed 0.116.0; measurement in `known-issues.md`.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
 - **`implicit.h` / `isomesh.h`** — implicit/isosurface evaluation and marching-cubes
@@ -419,14 +433,16 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   emitter's stream and change an unrelated stochastic image.
 
   `cudaBackwardWhittedSupported()` gates the device path on top of
-  `cudaBackwardSupported()`, and is deliberately **narrower**: a missing deterministic term
-  is a visible error, not extra noise, so unsupported constructs fall back to the CPU
-  mode-`W` tracer (cheap — the mode is ~1 spp) rather than degrading. What remains rejected
-  is **`giDirs > 0`**, because the gather is a depth-1 recursion (N3c). `Layered` needs no
-  device twin at all: it already forces a CPU fallback device-wide via
-  `cudaForwardSupported`. Env NEE stays **stochastic** in mode `W` on both CPU and GPU (an
-  existing deliberate choice), so it needed no device change — an important *non*-change,
-  since "fixing" it on one side only would have manufactured a CPU/GPU divergence.
+  `cudaBackwardSupported()`. It used to be deliberately **narrower** — a missing
+  deterministic term is a visible error, not extra noise, so unsupported constructs fell
+  back to the CPU mode-`W` tracer (cheap — the mode is ~1 spp) rather than degrading. As of
+  **0.116.0 nothing mode-`W`-specific narrows it any more**: it forwards straight to
+  `cudaBackwardSupported()`. Dispersive materials stopped gating at 0.111.0 and `giDirs > 0`
+  at 0.116.0 (N3c, below). `Layered` needs no device twin at all: it already forces a CPU
+  fallback device-wide via `cudaForwardSupported`. Env NEE stays **stochastic** in mode `W`
+  on both CPU and GPU (an existing deliberate choice), so it needed no device change — an
+  important *non*-change, since "fixing" it on one side only would have manufactured a
+  CPU/GPU divergence.
 
   **Split-at-dispersion on the device (0.111.0).** Dispersion-dependent materials
   (Dielectric / ThinFilm / Multilayer / Grating / HalfMirror / Fluorescent) used to gate the
@@ -457,6 +473,49 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `Renderer::heroSplit`). Before 0.111.0 GPU mode `R` silently ignored `-herosplit` and
   de-hero'd where the CPU split — a real CPU/GPU divergence, fixed by the same code. The GPU
   *forward* megakernel still de-heros, which the `[hero]` startup line now says explicitly.
+
+  **The `-gi` one-bounce gather on the device (0.116.0, N3c).** This was the last mode-`W`
+  CPU fallback. The host gather is a *recursion* — a diffuse vertex shoots `giDirs` gather
+  rays back into the same `radiance()` — and CUDA recursion would need `-rdc` plus a
+  hand-sized device stack. So the depth became a **second, independent compile-time
+  parameter** alongside `AllowSplit`: `bkRadianceHeroLoop<bool AllowSplit, int GiDepth>`,
+  `bkRadiance<int GiDepth>`, `bkRadianceHero<int GiDepth>`, and `bkInteract<bool
+  AllowGather>`. `GiDepth == 0` is a camera path and is the *only* instantiation that
+  contains a gather call at all; the rays it spawns are `GiDepth == 1`, whose body contains
+  none, so the whole thing is provably finite with statically-sized frames. A split sub-path
+  **inherits** its parent's `GiDepth`, so the deepest chain is `<true,0>` → gather →
+  `<true,1>` → split → `<false,1>`: three nested tracer frames, no more. `bkInteract` takes
+  a `bool` rather than an `int` because the hero tracer handles `Diffuse`/`DiffuseTransmit`
+  inline with the whole bundle and routes only *dispersive* materials to `bkInteract`, which
+  can therefore always pass `false` — two instantiations instead of three.
+
+  Depth 1 changes four things, all mirrored from the host: the coarser `bkGiGrid` shadow
+  lattice instead of `bkGrid` (its soft-shadow detail is about to be averaged over `giDirs`
+  rays anyway, so `bkGrid²` there would be wasted work), the `bkGiBounce` depth cap, a
+  non-specular arrival, and the escaped-ray far-field tail. The bounce cap is
+  `min(bkGiBounce, bkMaxBounce)` — the `min` is load-bearing, since without it a `-gi-bounce`
+  larger than `-max-bounce` would let a *gather* ray trace deeper than the camera path it
+  hangs off.
+
+  The lattice itself (`dGiDir` / `dGiPhases`) is a fixed Fibonacci spiral over the **whole**
+  sphere, built in **world space**, Cranley-Patterson-rotated by scrambled radical inverses
+  of the absolute sample index in bases 7 and 11 (which collide with neither the subpixel
+  lattice's 2/3, the wavelength's 5, nor the glossy/discrete lattices' ≥13). World space
+  rather than a tangent frame is deliberate: no orthonormal basis means no basis
+  discontinuity to show up as a seam, and a direction entering or leaving the hemisphere does
+  so at `cos == 0`, i.e. with **zero weight**, so the estimate is continuous in the normal and
+  a rotating object's shading slides instead of popping. It is cacheless and non-adaptive, so
+  the residual error is low-frequency banding rather than noise — and because every pixel
+  shares the phases, raising `-spp` rotates the whole frame's lattice coherently and the
+  banding averages out.
+
+  The **normalisation invariant** is what makes the feature safe to switch on: normalising by
+  the *realised* sum of retained cosines makes the estimator exact for constant incident
+  radiance, so in an empty scene every gather ray escapes, each returns `ambient` via the
+  escaped-ray tail, and the whole gather collapses to exactly `rho * ambient`. `-gi 0` and
+  `-gi 32` are therefore **pixel-identical** on an empty scene and turning `-gi` on never
+  steps the exposure. `scraps/gi_collapse.ftsl` is that test, and it holds bit-for-bit on the
+  device.
 
   **Whole-image bit-exactness is not achievable and is not the acceptance bar.** The device
   runs `using Real = float` (`FTRACE_GPU_FP32`) with `RAY_EPS` 1e-4 against the CPU's

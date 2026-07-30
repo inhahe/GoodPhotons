@@ -239,9 +239,10 @@ struct WhittedOpts {
 };
 
 // True if this scene + camera can be rendered by the GPU mode-W megakernel with the given
-// options. Strictly narrower than cudaBackwardSupported: the deterministic path still needs
-// the -gi gather (N3c) on the device, so for now a non-zero giDirs falls back to the CPU
-// tracer. (Dispersive materials no longer do — the device carries the split as of v0.111.0.)
+// options. As of v0.116.0 NOTHING mode-W-specific narrows this any more: it just forwards to
+// cudaBackwardSupported. Dispersive materials stopped gating in v0.111.0 (the device carries
+// the split-at-dispersion walk) and `-gi N` stopped gating in v0.116.0 (the one-bounce gather
+// is a compile-time-bounded recursion, bkRadianceHeroLoop<AllowSplit, GiDepth>).
 bool cudaBackwardWhittedSupported(const Scene& scene, const Camera& cam,
                                   const WhittedOpts& w);
 

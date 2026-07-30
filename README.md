@@ -351,15 +351,19 @@ disagreeing region), which is what the device's fp32 `Real` and its coarser `RAY
 It is not bit-exact and cannot be — but it is not a different *image*. The same render is
 **12.1 s → 0.3 s** (≈40×) on a 4090 versus 12 CPU threads.
 
-One construct of the CPU tracer is not on the device yet, and because a missing
-deterministic term is a *visible* error rather than extra noise it **falls back to the CPU
-mode-`W` tracer** instead of silently degrading (a `[device] … using CPU` line says so):
-**`-gi`** (the one-bounce gather). Everything else — diffuse, diffuse-transmit, mirror,
-glossy, filter, material mixes, the full **split-at-dispersion** walk over glass /
-thin-film / multilayer / grating / half-mirror / fluorescent (described below), `-ambient`,
-area/sphere/cylinder/spot/sun/env lights, the physical lens — runs on the GPU. `-rgb` is ignored in mode `W`: the fast RGB
-kernel is a separate reduced tracer with no deterministic estimator, so it would hand back
-exactly the noise mode `W` exists to remove.
+Since v0.116.0 **the whole mode is on the device** — nothing mode-`W`-specific falls back to
+the CPU any more. `-gi` (the deterministic one-bounce gather) was the last holdout and landed
+in 0.116.0; the device runs the gather as a compile-time-bounded recursion, and it reproduces
+the CPU image to the same fp32 tolerance as the rest of the mode (on a Cornell box at
+`-gi 32`, 98.7 % of samples bit-identical, every 20 px block agreeing in luma *and* chroma to
+under 0.4 of an 8-bit code). Diffuse, diffuse-transmit, mirror, glossy, filter, material
+mixes, the full **split-at-dispersion** walk over glass / thin-film / multilayer / grating /
+half-mirror / fluorescent (described below), `-gi`, `-ambient`,
+area/sphere/cylinder/spot/sun/env lights and the physical lens all run on the GPU. (Mode `W`
+can still fall back for reasons that are not mode-`W`-specific — a `layered` material, say,
+gates the whole backward megakernel — and a `[device] … using CPU` line says so when it
+happens.) `-rgb` is ignored in mode `W`: the fast RGB kernel is a separate reduced tracer with
+no deterministic estimator, so it would hand back exactly the noise mode `W` exists to remove.
 
 **Honest limits.** Mode `W` is a *preview*, not a reference: it is biased. **Rough glossy metal is the one
 thing that wants `-spp` > 1**: at 1 spp the lobe is its single mirror direction, so a satin
@@ -738,7 +742,7 @@ that converges to the same physical image.
 | `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
 | `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
 | `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
-| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe; on the GPU except for `-gi` |
+| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe; fully on the GPU |
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
 | `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / spot / env lights |
@@ -1724,7 +1728,10 @@ watertight test (JCGT 2013) rather than Möller–Trumbore. A ray through a shar
 claimed by *exactly one* of the two triangles that meet there, so closed meshes render with
 **no grazing-edge cracks** (background pixels leaking through a silhouette) and no dropped
 hits. This holds on both the CPU double path and — where it matters most, since floating-point
-edge signs are what used to crack — the GPU float path.
+edge signs are what used to crack — the GPU float path. (v0.116.0 fixed a real crack on the
+GPU: the guarantee needs the edge functions' two products to stay *unfused*, and nvcc's
+default fused multiply-add was silently breaking the antisymmetry, so a mesh edge that landed
+dead on a column of pixel centres let the background through. See `known-issues.md`.)
 
 ### Implicit surfaces (`isosurface`)
 

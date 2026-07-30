@@ -82,12 +82,16 @@ bar. `scraps/n3d_montage.py` draws the before/after difference picture. `grating
 dominant-branch choices) and are tracked as N3d-2; they are a *CPU-and-GPU* estimator gap, not a
 device fallback, so nothing in the table below changes for them.
 
+**N3c (0.116.0):** `-gi` landed on the device, which was the last mode-`W`-specific fallback.
+`cudaBackwardWhittedSupported()` now narrows nothing at all beyond `cudaBackwardSupported()` —
+it is a straight forward. Nothing in the table below is a live mode-`W` gate any more.
+
 Because mode `W` has no noise to hide a mismatch behind, these still fall back rather than
 degrade:
 | Feature | Why CPU today | Class |
 |---|---|---|
 | ~~Any dispersion-dependent material (Dielectric / ThinFilm / Multilayer / Grating / HalfMirror / Fluorescent)~~ | **DONE (N3b, 0.111.0)** — `bkRadianceHeroLoop<true>` does split-at-dispersion on the device; the `sceneHasDispersiveMat` gate is gone. | ✅ |
-| `-gi <n>` (deterministic one-bounce gather) | the gather is a depth-1 recursion into `radiance`/`radianceHero` | **portable** — N3c: `template<int GiDepth>` + a device `dGiDir` Fibonacci-spiral lattice |
+| ~~`-gi <n>` (deterministic one-bounce gather)~~ | **DONE (N3c, 0.116.0)** — the depth became a second compile-time parameter (`bkRadianceHeroLoop<AllowSplit, GiDepth>` / `bkRadiance<GiDepth>` / `bkInteract<AllowGather>`), so the gather is a provably-one-level recursion needing no `-rdc` and no device stack sizing; `dGiDir`/`dGiPhases` are the world-space Fibonacci-spiral lattice. The `giDirs > 0` gate is gone. | ✅ |
 | `-rgb` in mode `W` | the RGB kernel is a separate reduced tracer with no deterministic estimator; it would return exactly the noise mode `W` removes | **inherently** refused (message in main.cpp), not a fallback |
 | `Layered` material | already a device-wide CPU fallback via `cudaForwardSupported` | no mode-`W` work needed |
 | Env NEE stays stochastic | deliberate existing CPU behaviour, mirrored on the device | ✅ intentional non-change |
