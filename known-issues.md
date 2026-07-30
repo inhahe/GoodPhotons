@@ -25,6 +25,40 @@ the honest version forks up to a small depth budget, POV-Ray-style. That needs
 are iterative single-path loops). Until then the README documents mode `W` on glass as
 "still a little noisy".
 
+### BUG (2026-07-29, v0.106.0): mode `W` renders a dielectric sphere as an opaque bright blob
+
+Worse than, and probably related to, the stochastic-dielectric DEBT entry above — that one
+predicts *noise* on glass, but the actual symptom is a **systematic** loss of the whole
+refracted image. Reproducer:
+
+    ftrace -scene cornell -mode W -r 240 240 -spp 128 -o scraps/csph_s128.png
+    ftrace -in scraps/cor_gi.ftsl -mode R -noise 1.0 -o ref.png   # (glass variant)
+
+The converged mode-`R` reference shows the SF10 sphere as clear glass with an inverted
+lens image of the room and the ceiling light visible through it. Mode `W` shows a smooth
+opaque ball with no lens structure whatsoever, and it does **not** improve with `-spp`
+(measured sphere-centre saturation max−min: 9.8 at `-spp 1`, 4.7 at 16, 4.4 at 128 — it
+converges to the *wrong* answer, so this is not the RNG in `refractOrReflect`).
+
+It is also far too bright: sphere centre reads 192 vs 107 on the directly lit left wall at
+`-ambient 0`, i.e. the glass is the brightest object in a frame whose only emitter is the
+ceiling panel, and it reads 178 against the reference's 94 (~2× too bright). The sphere
+also brightens with `-ambient` (192 → 233 from `-ambient 0` → `0.3`), which a purely
+specular dielectric should barely do — suggesting the vertex is picking up the diffuse
+`ambient` fill and/or terminating early rather than refracting.
+
+*Where to look:* the `MatType::Dielectric` case in `interactMaterial` (`src/backward.h`)
+under `whitted`, and how `directOnly` (which mode `W` implies) interacts with a specular
+chain — a dielectric vertex has no NEE contribution, so if `directOnly` cuts the path
+there the sphere can only return whatever fill is applied at that vertex, which would
+explain both the missing lens image and the ambient sensitivity.
+
+*Why it matters beyond glass:* it silently invalidated a GI measurement. The first attempt
+to evaluate `-gi` on `scenes/cornell` compared mode-`W` frames against a mode-`R`
+reference where this blob was the single largest error in the frame, swamping the
+interreflection signal the sweep was trying to measure. `scraps/cor_gi.ftsl` (all-diffuse,
+no dielectric, no glossy) exists specifically to dodge this and the glossy entry below.
+
 ### DEBT (2026-07-29, v0.105.0): mode `W` over-sharpens rough glossy metal
 
 `interactMaterial` sends a mode-`W` glossy vertex along the exact mirror direction,
@@ -36,7 +70,30 @@ metal (roughness ≳ 0.2) previews crisper than it renders.
 *Proper fix:* a small fixed lattice of lobe directions — the same trick `-whitted-grid`
 plays for area lights. N deterministic offsets around the mirror direction, weighted by
 the lobe, with N scaled off the roughness so smooth metals stay at one ray. Cost is
-linear in N, and only on specular chains.
+linear in N, and only on specular chains. Do **not** fork the path (that grows as
+N^depth inside a labyrinth like a gyroid); drive the single lobe direction from the
+low-discrepancy sequence indexed by (absolute sample index, bounce), *without* the
+`rot05` half-offset on the polar coordinate, so sample 0 is exactly today's mirror
+direction and higher `-spp` progressively widens the lobe.
+
+*Upgraded 2026-07-29, v0.106.0 — this is now measured to be the LARGER error of the two,
+at least on rough gold.* The claim above that roughness 0.045 gold "reads essentially
+identically to full GI" is too generous. Evaluating the new `-gi` gather on
+`gold_gyroids` (420², vs a converged mode-`R` reference) showed the gather buying only a
+6 % whole-frame improvement for 4.5× the cost:
+
+| mode W variant | crevices (darkest 10 %) | whole-frame mean \|err\| |
+|---|---|---|
+| no ambient | 25.4 (signed −21.3) | 24.7 |
+| `-ambient 0.05` | 13.8 (signed −8.2) | 13.3 |
+| `-ambient 0.05 -gi 32` | 13.6 (signed −7.6) | 12.5 |
+| `-ambient 0.05 -gi 64` | 13.2 (signed −7.3) | 12.1 |
+
+The difference image (`scraps/gi_diff.png`) shows the gather *is* depositing genuine
+bounce light on the floor and walls, but the dominant residual sits **on the gold lattice
+itself** — i.e. on the one material whose lobe mode `W` collapses to a mirror. A single
+mirror direction cannot spread light into a labyrinth of crevices, so no amount of
+diffuse GI fixes that scene. Fixing this entry is therefore the higher-value work.
 
 ### BUG — DONE (2026-07-29, v0.102.1): `-exposure`/`-ev` was silently ignored by `-topng`
 

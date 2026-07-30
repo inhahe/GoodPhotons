@@ -201,6 +201,75 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   and make `-spp` a no-op on the image — this was a real bug, fixed in 0.105.0.
   Mode `W` also raises the default hero bundle to `kHeroMax`, since at 1 spp the C
   wavelengths *are* the whole spectral quadrature and they share one BVH walk.
+
+  **The deterministic one-bounce gather (`giDirs`, `-gi`)** is mode `W`'s real GI, the
+  thing `ambient` only stands in for. `giGatherHero` / `giGather` trace `giDirs` rays
+  from a diffuse vertex along a fixed lattice (`giDir`: an `n`-point Fibonacci spiral on
+  the whole sphere, Cranley-Patterson-rotated by two radical inverses of the absolute
+  sample index), keep the ~half with `cos > 0`, weight by `cos`, and normalise by the
+  realised cosine sum. Each gather ray re-enters `radianceHero`/`radiance` recursively
+  with `GiCtx::depth == 1`, which is the single switch behind four behaviours: no second
+  gather (single bounce), `giGrid` instead of `lightGrid` for shadow rays, `giBounce`
+  instead of `maxBounce` as the loop cap, and `specularArrival` starting **false** so a
+  gather ray landing straight on an emitter adds nothing (the vertex's own NEE already
+  counted that) while one arriving *via* a specular bounce still does. An escaped gather
+  ray picks up `ambient` as the far-field term, which is what makes the two flags
+  compose: in an empty scene every direction escapes and the normalised gather collapses
+  exactly back to `rho * ambient`, so switching `-gi` on never steps the exposure.
+  `scraps/gi_collapse.ftsl` is the regression test for that normalisation — a lone diffuse
+  quad lit only by `ambient`, where `-gi 32` and `-gi 0` must be **pixel-identical**
+  (verified: 0 of 25600 pixels differ). Note the two hemisphere rejections (`cos <= 0` on
+  the shading normal, and on the oriented geometric normal so a smoothed normal cannot
+  gather through the true back face) drop directions *without* adding them to `wSum`, which
+  is what keeps that collapse exact on a smooth-shaded surface rather than darkening it.
+
+  Three design constraints drove this rather than a POV-Ray-style irradiance cache.
+  (1) **Temporal stability.** A cache's sample set depends on render order and on local
+  geometry, so on animated geometry its blotches pop between frames; the lattice is a
+  pure function of (index, sample index) and never of the scene, so a seamless loop
+  cannot flicker. (2) **No tangent frame.** The lattice lives in world space, so there
+  is no orthonormal-basis discontinuity to show as a seam, and a direction crossing the
+  horizon does so at `cos == 0` — the estimate is continuous in the normal, which is
+  what makes a rotating object's shading slide instead of pop. (3) **Every pixel shares
+  the rotation**, preserving the mode's core noise-free invariant; raising `-spp`
+  rotates the whole frame's lattice coherently, so the residual banding refines
+  progressively instead of being re-rendered identically.
+
+  **Measured outcome** (all-diffuse Cornell, `scraps/cor_gi.ftsl`, vs mode `R` at 0.8 %
+  noise; see `scraps/cor_eval.py`). Whole-frame mean |luminance error| 7.01 for the best
+  flat fill vs **5.40** for `-ambient 0.01 -gi 32` (23 % better), but colour bleeding 18 %
+  → **80 %** of the reference (4.5× better) — the gather's value is overwhelmingly in the
+  effects a constant *cannot* produce, not in the mean level, which a well-tuned constant
+  already gets close to. The gather saturates near `-gi 32` (12.91/12.80/12.77/12.77 for
+  32/64/128/256 with no tail), because past that the limit is the single bounce, not the
+  direction count: in a closed 0.75-albedo box the interreflection series is ~4× the first
+  bounce. Hence the two flags are complements rather than alternatives — `ambient` stands
+  in for the *tail of the series*, and `-gi 32` plus a small tail beats `-gi 256` alone.
+  Temporal stability is verified in `scraps/gi_temporal.py` (normalised second difference
+  1.907 for `-gi 32` vs a 1.851 direct-only control).
+
+  Two evaluation traps worth remembering, both of which produced confidently wrong numbers
+  before being caught. (1) **Auto-exposure hides `-ambient` entirely**: the anchor is the
+  frame's own 99th percentile, so raising the fill raises the mean and the anchor divides it
+  straight back out (measured 5× anchor swing over `-ambient 0 → 0.30`). A sweep run that
+  way concluded that a flat fill made the image *worse* than none at all. Any `-ambient` or
+  `-gi` comparison must put the scene in absolute mode (`lumens`/`power` on a light).
+  (2) **Pick a scene whose dominant error is the one being measured**: on `gold_gyroids`
+  the glossy-lobe collapse dwarfs the missing diffuse GI, and on `scenes/cornell` the
+  dielectric bug does — in both cases the gather looked nearly worthless.
+
+  `DiffuseTransmit` gathers **both** lobes (the hit normal and a flipped copy), since a
+  translucent surface receives from the full sphere. This also fixed a gap: in the
+  non-gather path it now adds `(rhoR + rhoT) * ambient`, where previously a
+  `DiffuseTransmit` vertex in mode `W` received **no** `ambient` fill at all. So a
+  translucent material renders brighter under `-ambient` than it did in v0.105.0 — an
+  intentional behaviour change, and the reason a scene using `translucent` will not match
+  a v0.105.0 mode-`W` render pixel-for-pixel.
+
+  `-gi` is rejected with a message outside mode `W` (`main.cpp`), since every other mode
+  either has real multi-bounce GI or no diffuse transport at all. Mode `R` is untouched:
+  every gather branch is gated on `whitted` and every new parameter defaults to the old
+  behaviour (`GiCtx{}` → depth 0 → `lightGrid`, `maxBounce`, `specularArrival = true`).
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,
@@ -793,7 +862,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `-mode W` → `'R'` normalization, which must happen in **both** `cliModePrescan` and
   the main parse loop), `g_whittedGrid` (`-whitted-grid`) and `g_ambient`
   (`-ambient`, multiplied by `Scene::ambientRef()` at the call site so the CLI value
-  is scene-scale-independent). `g_whitted` also forces `g_directOnly` and excludes
+  is scene-scale-independent), plus three for the one-bounce gather — `g_gi` (`-gi` /
+  `-radiosity`), `g_giGrid` (`-gi-grid`) and `g_giBounce` (`-gi-bounce`) → `giDirs` /
+  `giGrid` / `giBounce`. `g_gi` is zeroed with a message outside mode `W`.
+  `g_whitted` also forces `g_directOnly` and excludes
   the GPU backward megakernel (`gpuBackwardMode = mode == 'R' && !g_whitted`), since
   the device path keeps the stochastic estimators.
   Since 0.102.0 the **bidirectional** modes honour `maxBounce` too (they previously

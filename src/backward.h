@@ -71,6 +71,77 @@ struct BackwardRenderer {
     // cheap stand-in for the GI this mode drops. ABSOLUTE spectral radiance -- the CLI's
     // dimensionless -ambient is multiplied by Scene::ambientRef() before it lands here.
     double ambient = 0.0;
+
+    // ---- deterministic one-bounce gather ("radiosity" for mode W) -------------------
+    // `ambient` alone cannot reproduce two things real bounce light does, and both are
+    // measurable on the gold-gyroid scene:
+    //   * CONTACT DARKENING. A constant lights a deep crevice exactly as much as an
+    //     exposed face. Measured against a converged mode-R reference, the darkest 10%
+    //     of the frame (i.e. the occluded interior of the lattice) carries 13.8 units of
+    //     luminance error at the best flat ambient, and the error is SIGNED (-8.2) --
+    //     still too dark -- so no single constant fixes it: raising it to close the
+    //     crevices blows out the open faces by the same amount.
+    //   * COLOUR BLEEDING. Real GI more than doubles the red on the side wall
+    //     (48.7 -> 102.5) while barely moving the blue (4.4 -> 9.7), because the light
+    //     reaching that wall has bounced off gold. A grey constant lifts all three
+    //     channels together, so it buys exposure but not colour.
+    // `giDirs > 0` replaces the flat term with a real single-bounce hemisphere gather: a
+    // FIXED lattice of world-space directions (giDir) is traced from every diffuse
+    // vertex, each carrying whatever deterministic Whitted radiance it finds -- which is
+    // occlusion-aware and spectral, so both effects come back for real.
+    //
+    // Why a fixed lattice rather than POV-Ray's radiosity: POV-Ray caches irradiance at
+    // an ADAPTIVELY chosen sparse point set and interpolates. Which points get sampled
+    // depends on render order and on the local geometry, so on animated geometry the
+    // cache's low-frequency blotches pop in and out between frames. POV-Ray's answer is
+    // to pre-bake one cache and reuse it, which only works if nothing moves. This
+    // gather has NO cache and no adaptivity: the direction set is a pure function of
+    // (lattice index, sample index), never of the scene, so two frames of a rotating
+    // object are lit by the identical estimator and a seamless loop cannot flicker.
+    // The price is that the residual error appears as low-frequency BANDING instead of
+    // noise -- but banding is a smooth function of the surface normal, so it slides
+    // smoothly as geometry turns, where cache splotches jump. Raise `giDirs` (or -spp,
+    // which rotates the lattice, see giDir) to push it down.
+    int giDirs = 0;     // gather rays per diffuse vertex (0 = off, flat `ambient` only)
+    int giGrid = 1;     // NxN shadow-ray grid at a GATHER vertex (cheaper than lightGrid)
+    int giBounce = 4;   // max bounces along a gather ray. Bounds the cost of a specular
+                        // chain: gold is ~0.9 reflective, so kWhittedCutoff alone would
+                        // let a gather ray ricochet ~60 times inside a gold lattice.
+
+    // Where a path sits relative to the gather. `depth == 0` is a camera path (it does
+    // the gather); `depth == 1` is a gather ray (it does NOT recurse, uses `giGrid`, and
+    // terminates its own diffuse vertices on the flat `ambient` tail). `sIdx` is the
+    // absolute sample index, which rotates the lattice so that -spp progressively
+    // refines the gather instead of re-rendering the same banding.
+    struct GiCtx {
+        int depth = 0;
+        unsigned long long sIdx = 0;
+    };
+
+    // One direction of the fixed gather lattice: point `j` of an `n`-point Fibonacci
+    // spiral on the WHOLE sphere, Cranley-Patterson-rotated by (p1, p2).
+    //
+    // The lattice is built in WORLD space and the caller keeps the ~half of it with
+    // cos > 0, weighting by cos and normalising by the realised sum. Two reasons that
+    // beats a cosine-weighted lattice built in a local frame around the normal:
+    //   * No tangent frame is needed, so there is no orthonormal-basis discontinuity to
+    //     show up as a seam where the frame construction flips.
+    //   * A direction entering or leaving the hemisphere does so at cos == 0, i.e. with
+    //     zero weight, so the estimate is continuous in the normal -- which is what
+    //     makes a rotating object's shading slide instead of pop.
+    // Normalising by the realised sum of cosines makes the estimator EXACT for constant
+    // incident radiance, so with nothing in the scene the gather reduces bit-sensibly to
+    // the flat `ambient` term it replaces (no exposure step when -gi is switched on).
+    static Vec3 giDir(int j, int n, double p1, double p2) {
+        double t = ((double)j + 0.5) / (double)n + p2;
+        t -= std::floor(t);                          // CP rotation of the z-strata
+        const double z = 1.0 - 2.0 * t;
+        const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
+        const double kGolden = 2.399963229728653;    // pi * (3 - sqrt 5)
+        const double a = kGolden * (double)j + 2.0 * PI * p1;
+        return Vec3(r * std::cos(a), r * std::sin(a), z);
+    }
+
     bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating
     int  heroC = hero::kHeroC;  // wavelengths bundled per camera path when hero is on
                                 // (runtime -heroc N, clamped to [1, kHeroMax]; 1 = single-λ)
@@ -281,7 +352,8 @@ struct BackwardRenderer {
     }
 
     double neeLight(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
-                    double lambda, Pcg32& rng, const SpdCache* spdCache = nullptr) const {
+                    double lambda, Pcg32& rng, const SpdCache* spdCache = nullptr,
+                    GiCtx gi = GiCtx{}) const {
         double total = 0.0;
         // Geometric normal on the shading-normal side: every light connection must lie
         // in this hemisphere too, else a smoothed shading normal would leak light in
@@ -300,7 +372,10 @@ struct BackwardRenderer {
             const bool uv = emitterNeedsUV(em);
             // Whitted: G x G deterministic shadow rays per area light, averaged. A
             // deterministic emitter (spot/beam) has nothing to stratify, so it stays at 1.
-            const int G = (whitted && uv) ? lightGrid : 1;
+            // A GATHER vertex uses the coarser giGrid: its soft-shadow detail is about to
+            // be averaged over giDirs directions anyway, so paying lightGrid^2 there
+            // multiplies the gather's cost for no visible return.
+            const int G = (whitted && uv) ? (gi.depth ? giGrid : lightGrid) : 1;
             const int nS = G * G;
             double acc = 0.0, spdV = 0.0;
             bool haveSpd = false;
@@ -331,14 +406,15 @@ struct BackwardRenderer {
     // hero fast path, so there is no medium transmittance term.
     void neeLightHero(const Scene& scene, const Hit& h, const double* rho, double* L,
                       const double* thr, const double* lam, const double* invPdf,
-                      int nUp, Pcg32& rng, const SpdCache* spdCache) const {
+                      int nUp, Pcg32& rng, const SpdCache* spdCache,
+                      GiCtx gi = GiCtx{}) const {
         const Vec3 ngo = orientedGeoN(h);
         const bool cached = spdCache && spdCache->matches(lam, nUp);
         const int nEm = (int)scene.emitters.size();
         for (int e = 0; e < nEm; ++e) {
             const Emitter& em = scene.emitters[e];
             const bool uv = emitterNeedsUV(em);
-            const int G = (whitted && uv) ? lightGrid : 1;
+            const int G = (whitted && uv) ? (gi.depth ? giGrid : lightGrid) : 1;
             const int nS = G * G;
             const double invS = 1.0 / (double)nS;
             for (int s = 0; s < nS; ++s) {
@@ -359,6 +435,84 @@ struct BackwardRenderer {
             }
         }
     }
+
+    // ---- deterministic one-bounce gather ---------------------------------------------
+    // Estimate the cosine-weighted mean INCIDENT radiance over the hemisphere above a
+    // diffuse vertex by tracing the fixed lattice (see giDirs / giDir), then add the
+    // Lambertian response rho * that. This is the term flat `ambient` was standing in
+    // for, computed instead of assumed.
+    //
+    // Each gather ray runs the same deterministic Whitted radiance the camera ray does,
+    // just with GiCtx::depth == 1, which (a) stops it gathering again -- single bounce --
+    // (b) drops it to `giGrid` shadow rays, (c) makes it terminate its own diffuse
+    // vertices on the flat `ambient` tail, and (d) starts it NON-specular so that a ray
+    // landing straight on a light adds nothing (the vertex's own NEE already counted
+    // that; adding it here would double the direct light). A ray that reaches a light
+    // *via* a mirror still counts, because a specular bounce re-arms specularArrival --
+    // so gold-bounced light, the whole point of this, is carried at full weight.
+    //
+    void giGatherHero(const Scene& scene, const Hit& h, const double* rho, double* L,
+                      const double* thr, const double* lam, const double* invPdf,
+                      int nUp, Pcg32& rng, const SpdCache* spdCache, GiCtx gi) const {
+        const Vec3 ngo = orientedGeoN(h);
+        const int n = giDirs * 2;      // full-sphere lattice; ~half of it faces outward
+        // Cranley-Patterson phases from the ABSOLUTE sample index, on two decorrelated
+        // radical inverses (bases 7 and 11, so they collide with neither the subpixel
+        // lattice (2,3) nor the wavelength lattice (5)). Every pixel shares them -- the
+        // invariant that makes this mode noise-free -- so raising -spp rotates the whole
+        // frame's lattice coherently and the banding averages out progressively.
+        const double p1 = rot05(radicalInverseB(7, gi.sIdx));
+        const double p2 = rot05(radicalInverseB(11, gi.sIdx));
+        double acc[hero::kHeroMax];
+        for (int i = 0; i < nUp; ++i) acc[i] = 0.0;
+        double wSum = 0.0;
+        const GiCtx sub{gi.depth + 1, gi.sIdx};
+        for (int j = 0; j < n; ++j) {
+            const Vec3 d = giDir(j, n, p1, p2);
+            const double c = dot(h.n, d);
+            if (c <= 0.0) continue;
+            // Also require the GEOMETRIC hemisphere, or a smoothed shading normal would
+            // gather through the true back face (the shading-normal problem again).
+            if (dot(ngo, d) <= 0.0) continue;
+            wSum += c;
+            double Lg[hero::kHeroMax];
+            radianceHero(scene, Ray{h.p + ngo * 1e-6, d}, lam, invPdf, nUp, Lg, rng,
+                         spdCache, sub);
+            for (int i = 0; i < nUp; ++i) acc[i] += c * Lg[i];
+        }
+        if (wSum <= 0.0) return;
+        const double inv = 1.0 / wSum;
+        for (int i = 0; i < nUp; ++i) L[i] += thr[i] * rho[i] * (acc[i] * inv);
+    }
+
+    // Scalar twin of giGatherHero, for the paths that cannot use the hero bundle (fog,
+    // GRIN, a physical lens) and for a de-hero'd vertex inside interactMaterial.
+    double giGather(const Scene& scene, const Hit& h, double rho, double lambda,
+                    double invPdfLambda, Pcg32& rng, const SpdCache* spdCache,
+                    GiCtx gi) const {
+        const Vec3 ngo = orientedGeoN(h);
+        const int n = giDirs * 2;
+        const double p1 = rot05(radicalInverseB(7, gi.sIdx));
+        const double p2 = rot05(radicalInverseB(11, gi.sIdx));
+        double acc = 0.0, wSum = 0.0;
+        const GiCtx sub{gi.depth + 1, gi.sIdx};
+        for (int j = 0; j < n; ++j) {
+            const Vec3 d = giDir(j, n, p1, p2);
+            const double c = dot(h.n, d);
+            if (c <= 0.0) continue;
+            if (dot(ngo, d) <= 0.0) continue;
+            wSum += c;
+            acc += c * radiance(scene, Ray{h.p + ngo * 1e-6, d}, lambda, invPdfLambda,
+                                rng, spdCache, sub);
+        }
+        return (wSum > 0.0) ? rho * (acc / wSum) : 0.0;
+    }
+
+    // The Whitted indirect-diffuse term at a vertex, in one place so the scalar and hero
+    // diffuse cases cannot drift apart: the real gather on a camera path when -gi is on,
+    // otherwise the flat `ambient` constant. A gather ray (depth > 0) always takes the
+    // flat branch -- that constant is what terminates the single bounce.
+    bool giUseGather(GiCtx gi) const { return giDirs > 0 && gi.depth == 0; }
 
     // Volume next-event estimation: connect a fog scattering vertex `p` (photon
     // arriving along `wIn`) to a uniformly-sampled light point. The surface BRDF
@@ -535,7 +689,8 @@ struct BackwardRenderer {
     bool interactMaterial(const Scene& scene, const Material& m, const Hit& h, Renderer& mats,
                           Ray& ray, double& lambda, double& invPdfLambda, double& thr, double& L,
                           bool& specularArrival, double& contBsdfPdf, MediumStack& stk,
-                          Pcg32& rng, const SpdCache* spdCache = nullptr) const {
+                          Pcg32& rng, const SpdCache* spdCache = nullptr,
+                          GiCtx gi = GiCtx{}) const {
         switch (m.type) {
             case MatType::Dielectric: {
                 // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002). The
@@ -716,13 +871,21 @@ struct BackwardRenderer {
                 double rhoT = clamp01(transmitSlot(scene, m, h, lambda));
                 double sum = rhoR + rhoT;
                 if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }   // energy guard
-                L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng, spdCache);
+                L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, h, rhoR, invPdfLambda, lambda, rng);
                 Hit hb = h; hb.n = -h.n;                 // back hemisphere for the transmit lobe
-                L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng, spdCache);
+                L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, hb, rhoT, invPdfLambda, lambda, rng);
+                if (whitted) {   // both lobes gather, each into its own hemisphere
+                    if (giUseGather(gi)) {
+                        L += thr * giGather(scene, h,  rhoR, lambda, invPdfLambda, rng, spdCache, gi);
+                        L += thr * giGather(scene, hb, rhoT, lambda, invPdfLambda, rng, spdCache, gi);
+                    } else if (ambient > 0.0) {
+                        L += thr * (rhoR + rhoT) * ambient;
+                    }
+                }
                 if (directOnly) return false;            // Whitted: no diffuse indirect
                 double u = rng.uniform();
                 if (u < rhoR) {                          // reflect continuation (front)
@@ -741,10 +904,15 @@ struct BackwardRenderer {
             case MatType::Diffuse:
             default: {
                 double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
-                L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng, spdCache);
+                L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)   // env-NEE toward the sky (MIS'd on miss)
                     L += thr * neeEnv(scene, h, rho, invPdfLambda, lambda, rng);
-                if (whitted && ambient > 0.0) L += thr * rho * ambient;   // flat GI stand-in
+                if (whitted) {             // indirect diffuse: real gather, or the flat stand-in
+                    if (giUseGather(gi))
+                        L += thr * giGather(scene, h, rho, lambda, invPdfLambda, rng, spdCache, gi);
+                    else if (ambient > 0.0)
+                        L += thr * rho * ambient;
+                }
                 if (directOnly) return false;   // Whitted: no diffuse indirect
                 // Russian roulette on the albedo (throughput unchanged on survival).
                 if (rng.uniform() >= rho) return false;
@@ -761,9 +929,12 @@ struct BackwardRenderer {
     // `invPdfLambda` = emitG/g(lambda), the reciprocal of the sampled-wavelength
     // pdf; an emitter's Le/pdf weight is its SPD(lambda) * invPdfLambda.
     double radiance(const Scene& scene, Ray ray, double lambda, double invPdfLambda,
-                    Pcg32& rng, const SpdCache* spdCache = nullptr) const {
+                    Pcg32& rng, const SpdCache* spdCache = nullptr,
+                    GiCtx gi = GiCtx{}) const {
         double L = 0.0, thr = 1.0;
-        bool specularArrival = true;   // camera ray may see the light directly
+        // Camera ray may see the light directly; a gather ray may not (see radianceHero).
+        bool specularArrival = (gi.depth == 0);
+        const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
         double contBsdfPdf = 0.0;      // solid-angle pdf of the current continuation
                                        // ray (for env-miss MIS after a diffuse/volume
                                        // bounce; unused while specularArrival)
@@ -786,7 +957,7 @@ struct BackwardRenderer {
         // and is shared verbatim by the forward and bidirectional tracers.
         bool grinAny = grin::sceneHasGrin(scene);
 
-        for (int b = 0; b < maxBounce; ++b) {
+        for (int b = 0; b < maxB; ++b) {
             // GRIN curved marching pre-pass: advance the ray through any gradient-index
             // region it enters, integrating the Eikonal equation d/ds(n·dr/ds)=∇n in
             // small steps so the path bends. Pure marching does NOT consume a bounce;
@@ -859,6 +1030,8 @@ struct BackwardRenderer {
                 // this is a clean single-strategy split, not a missing MIS weight.
                 if (scene.sunCount > 0 && specularArrival)
                     L += thr * scene.sunRadiance(ray.d, lambda) * invPdfLambda;
+                // Escaped gather ray → the far-field `ambient` fill (see radianceHero).
+                if (gi.depth && ambient > 0.0) L += thr * ambient;
                 return L;
             }
             const Material* mp = &scene.mats[h.matId];
@@ -918,7 +1091,7 @@ struct BackwardRenderer {
                 L += thr * emitSlot(scene, m, h, lambda) * invPdfLambda;
 
             if (!interactMaterial(scene, m, h, mats, ray, lambda, invPdfLambda, thr, L,
-                                  specularArrival, contBsdfPdf, stk, rng, spdCache))
+                                  specularArrival, contBsdfPdf, stk, rng, spdCache, gi))
                 return L;                                 // path terminated in the interaction
         }
         return L;
@@ -935,12 +1108,18 @@ struct BackwardRenderer {
     // lens, so those branches are absent here. Fills Lout[0..C).
     void radianceHero(const Scene& scene, Ray ray, const double* lamIn,
                       const double* invPdfIn, int C, double* Lout, Pcg32& rng,
-                      const SpdCache* spdCache = nullptr) const {
+                      const SpdCache* spdCache = nullptr, GiCtx gi = GiCtx{}) const {
         double lam[hero::kHeroMax], invPdf[hero::kHeroMax], thr[hero::kHeroMax], L[hero::kHeroMax];
         for (int i = 0; i < C; ++i) { lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = 1.0; L[i] = 0.0; }
         bool secAlive = (C > 1);
-        bool specularArrival = true;
+        // A camera ray may see a light directly; a GATHER ray may not -- the vertex it
+        // left already NEE'd the direct light, so counting the emitter again here would
+        // double it. A specular bounce re-arms this, so gold-bounced light still lands.
+        bool specularArrival = (gi.depth == 0);
         double contBsdfPdf = 0.0;
+        // Gather rays are bounce-capped (see giBounce) so a highly reflective lattice
+        // cannot turn one gather direction into a 60-deep ricochet.
+        const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
         Renderer mats; mats.diffraction = diffraction;
         MediumStack stk;                 // dielectric priority (Beer-Lambert uses hero λ)
 
@@ -951,7 +1130,7 @@ struct BackwardRenderer {
             secAlive = false;
         };
 
-        for (int b = 0; b < maxBounce; ++b) {
+        for (int b = 0; b < maxB; ++b) {
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
             Hit h = scene.closestHit(ray);
             double dSurf = h.valid ? h.t : 1e30;
@@ -985,6 +1164,14 @@ struct BackwardRenderer {
                 if (scene.sunCount > 0 && specularArrival)   // directly-viewed solar disc
                     for (int i = 0; i < nUp; ++i)
                         L[i] += thr[i] * scene.sunRadiance(ray.d, lam[i]) * invPdf[i];
+                // A GATHER ray that escaped the scene picks up `ambient` as the far-field
+                // fill. This is what makes -ambient and -gi compose instead of compete:
+                // the gather supplies the near field (occlusion + bleeding) and the
+                // constant supplies whatever lies beyond the geometry -- and in an empty
+                // scene every direction escapes, so the gather collapses exactly back to
+                // the flat `rho * ambient` term it replaced (no exposure step).
+                if (gi.depth && ambient > 0.0)
+                    for (int i = 0; i < nUp; ++i) L[i] += thr[i] * ambient;
                 finish(); return;
             }
 
@@ -1046,13 +1233,22 @@ struct BackwardRenderer {
                         if (s > 1.0) { rr /= s; rt /= s; }       // per-λ energy guard
                         rhoR[i] = rr; rhoT[i] = rt;
                     }
-                    neeLightHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng, spdCache);
+                    neeLightHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng);
                     Hit hb = h; hb.n = -h.n;                     // back hemisphere (transmit lobe)
-                    neeLightHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache);
+                    neeLightHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                    if (whitted) {   // both lobes gather, each into its own hemisphere
+                        if (giUseGather(gi)) {
+                            giGatherHero(scene, h,  rhoR, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
+                            giGatherHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
+                        } else if (ambient > 0.0) {
+                            for (int i = 0; i < nUp; ++i)
+                                L[i] += thr[i] * (rhoR[i] + rhoT[i]) * ambient;
+                        }
+                    }
                     if (directOnly) { finish(); return; }        // Whitted: no diffuse indirect
                     // Lobe pick + RR over the whole bundle (see the Diffuse case): the
                     // reflect/transmit probabilities are the per-lobe MAX over live λ, so no
@@ -1136,7 +1332,7 @@ struct BackwardRenderer {
                     // the shared scalar interaction on the (boosted) hero channel.
                     deHero();
                     if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0], L[0],
-                                          specularArrival, contBsdfPdf, stk, rng, spdCache)) { finish(); return; }
+                                          specularArrival, contBsdfPdf, stk, rng, spdCache, gi)) { finish(); return; }
                     break;
                 }
                 case MatType::Diffuse:
@@ -1144,15 +1340,20 @@ struct BackwardRenderer {
                     double rho[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)
                         rho[i] = clamp01(diffuseReflectance(scene, m, h, lam[i]));
-                    neeLightHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, spdCache);
+                    neeLightHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng);
-                    // Whitted ambient: the flat stand-in for the diffuse GI this mode
-                    // drops. POV-Ray's `ambient` -- physically a lie, but without it a
-                    // CLOSED room previews with black shadows, since every non-key-lit
-                    // surface there is lit purely by bounce.
-                    if (whitted && ambient > 0.0)
-                        for (int i = 0; i < nUp; ++i) L[i] += thr[i] * rho[i] * ambient;
+                    // The Whitted indirect-diffuse term. With -gi this is a real
+                    // single-bounce hemisphere gather (occlusion-aware and spectral); with
+                    // -gi 0 it falls back to POV-Ray's flat `ambient` -- physically a lie,
+                    // but without it a CLOSED room previews with black shadows, since
+                    // every non-key-lit surface there is lit purely by bounce.
+                    if (whitted) {
+                        if (giUseGather(gi))
+                            giGatherHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
+                        else if (ambient > 0.0)
+                            for (int i = 0; i < nUp; ++i) L[i] += thr[i] * rho[i] * ambient;
+                    }
                     if (directOnly) { finish(); return; }         // Whitted: no diffuse indirect
                     // Continuation RR over the WHOLE bundle: the survival probability is
                     // max_i rho_i, not the hero's own albedo, and every live λ reweights by
@@ -1241,7 +1442,12 @@ struct BackwardRenderer {
                         else { jx = rng.uniform(); jy = rng.uniform(); }
                         Ray ray = cam.genRay(px, py, jx, jy);
                         double Lh[hero::kHeroMax];
-                        radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache);
+                        // GiCtx carries the ABSOLUTE sample index down to the gather, which
+                        // rotates its direction lattice by it -- so, exactly like the
+                        // subpixel and wavelength lattices, the gather is progressive and
+                        // independent of how the budget was chunked.
+                        radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache,
+                                     GiCtx{0, sIdx});
                         for (int i = 0; i < C; ++i)
                             film.add(px, py, Vec3(cieX(lamA[i]), cieY(lamA[i]), cieZ(lamA[i]))
                                              * (Lh[i] / C));
@@ -1277,7 +1483,8 @@ struct BackwardRenderer {
                         Ray ray; double wLens = 0.0;
                         if (!cam.genLensRay(px, py, jx, jy, u1, u2, lambda, ray, wLens))
                             continue;                       // clipped by an element / the stop
-                        double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache);
+                        double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache,
+                                            GiCtx{0, sIdx});
                         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens));
                         continue;
                     }
@@ -1285,7 +1492,8 @@ struct BackwardRenderer {
                     if (whitted) whittedSample(sIdx, sjx, sjy);
                     else { sjx = rng.uniform(); sjy = rng.uniform(); }
                     Ray ray = cam.genRay(px, py, sjx, sjy);
-                    double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache);
+                    double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache,
+                                        GiCtx{0, sIdx});
                     film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * L);
                 }
             }

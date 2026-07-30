@@ -2683,6 +2683,19 @@ static bool g_whitted = false;
 static int  g_whittedGrid = 4;
 static double g_ambient = 0.0;
 
+// -gi: mode W's deterministic ONE-BOUNCE GATHER, the real thing g_ambient only stands in
+// for. A flat constant cannot reproduce contact darkening (it lights a crevice exactly as
+// much as an exposed face) or colour bleeding (it is grey, where light that has bounced
+// off gold is not), and no single value fixes both -- raising it to fill the crevices
+// blows out the open faces. g_gi > 0 instead traces that many rays from every diffuse
+// vertex along a FIXED lattice and takes whatever deterministic Whitted radiance they
+// find. Unlike POV-Ray's radiosity there is no irradiance cache, so nothing depends on
+// render order or on which sample points the geometry happened to trigger -- which is
+// what makes it safe for an animated loop. See BackwardRenderer::giDirs.
+static int g_gi = 0;
+static int g_giGrid = 1;
+static int g_giBounce = 4;
+
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
 // segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
@@ -2961,6 +2974,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         // -ambient is dimensionless (fraction of a light's own radiance); convert to
         // this scene's absolute radiance scale here. See Scene::ambientRef().
         br.ambient = g_ambient * scene.ambientRef();
+        br.giDirs = g_gi; br.giGrid = g_giGrid; br.giBounce = g_giBounce;
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
         br.renderRows(scene, cam, out, y0, y1, spp, sampleBase);
     };
@@ -5299,6 +5313,20 @@ static void printHelp(const char* prog) {
 "                        (default 0; try 0.02..0.2). The stand-in for the diffuse GI\n"
 "                        mode W drops — without it a CLOSED room previews with black\n"
 "                        shadows, since everything there is lit by bounce\n"
+"  -gi|-radiosity <n>    replace the flat ambient with a REAL deterministic one-bounce\n"
+"                        gather: n rays per diffuse vertex along a fixed lattice\n"
+"                        (default 0 = off; try 16..64). Brings back what a constant\n"
+"                        cannot — contact darkening in crevices, and colour bleeding\n"
+"                        (a gold object actually tints the room). Costs roughly n/6×\n"
+"                        the frame time. Has NO irradiance cache, so unlike POV-Ray's\n"
+"                        radiosity it is safe on animation: nothing depends on render\n"
+"                        order, so a seamless loop cannot flicker. -ambient still\n"
+"                        applies, now as the far-field fill a gather ray sees when it\n"
+"                        escapes the geometry\n"
+"  -gi-grid <n>          n×n shadow rays at a GATHER vertex (default 1). Cheap detail\n"
+"                        knob; the gather averages over n directions anyway\n"
+"  -gi-bounce <n>        max bounces along one gather ray (default 4). Bounds the cost\n"
+"                        of a specular chain inside a highly reflective lattice\n"
 "\n"
 "Output, preview & checkpointing:\n"
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
@@ -5697,6 +5725,15 @@ static int run(int argc, char** argv) {
         else if ((!std::strcmp(argv[i], "-ambient") || !std::strcmp(argv[i], "-amb")) && i + 1 < argc) {
             g_ambient = std::max(0.0, std::atof(argv[++i]));
         }
+        else if ((!std::strcmp(argv[i], "-gi") || !std::strcmp(argv[i], "-radiosity")) && i + 1 < argc) {
+            g_gi = std::max(0, std::atoi(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-gi-grid") && i + 1 < argc) {
+            g_giGrid = std::max(1, std::atoi(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-gi-bounce") && i + 1 < argc) {
+            g_giBounce = std::max(1, std::atoi(argv[++i]));
+        }
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         // An explicit absolute radius pins the radius: don't then adapt it out from under
         // the user (this was the documented workaround for mode M's scaling problem).
@@ -6067,8 +6104,21 @@ static int run(int argc, char** argv) {
         std::printf("[mode W] deterministic Whitted preview: %dx%d shadow rays/light, "
                     "%d wavelengths/sample, ambient %.3g\n",
                     g_whittedGrid, g_whittedGrid, g_heroC, g_ambient);
+        if (g_gi > 0)
+            std::printf("[mode W] one-bounce gather: %d rays/diffuse vertex, %dx%d shadow "
+                        "rays at gather vertices, <=%d bounces/gather ray (cacheless, so "
+                        "temporally stable)\n", g_gi, g_giGrid, g_giGrid, g_giBounce);
     }
     else if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
+    // Kept out of the chain above: rejecting -gi is independent of whether the run is
+    // also direct-only, and folding it in would swallow that notice when both are given.
+    // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for
+    // it, so silently accepting -gi anywhere else would just be misleading.
+    if (!g_whitted && g_gi > 0) {
+        std::printf("[ignore] -gi %d needs -mode W (other modes either have real GI or no "
+                    "diffuse transport at all)\n", g_gi);
+        g_gi = 0;
+    }
     // -herosplit only reaches the CPU forward tracer; say so rather than silently
     // ignoring it, and point out that it is a no-op without a bundle to split.
     if (hero::gSplit) {

@@ -201,7 +201,7 @@ paths they can capture at all**.
 | `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera; independent photons | CPU + **GPU** |
 | `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU + GPU |
 | `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU + **GPU** |
-| `W` | Deterministic preview | Mode `R` with **every estimator replaced by a fixed quadrature** — a POV-Ray-style Whitted render that is noise-free at `-spp 1` and ~2 orders of magnitude faster than converging `R`. Trades diffuse GI (see `-ambient`) and unbiasedness for speed | CPU |
+| `W` | Deterministic preview | Mode `R` with **every estimator replaced by a fixed quadrature** — a POV-Ray-style Whitted render that is noise-free at `-spp 1` and ~2 orders of magnitude faster than converging `R`. Trades multi-bounce GI (see `-ambient` for a flat fill, `-gi` for a real deterministic one-bounce gather) and unbiasedness for speed | CPU |
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
@@ -241,21 +241,120 @@ never less grainy, and the progress line reads `deterministic` instead of a nois
 **`-ambient <v>` — the GI stand-in.** With the diffuse indirect bounce gone, a *closed*
 room previews with black shadows, because everything not directly facing the light is lit
 purely by bounce. `-ambient` adds POV-Ray's flat fill at every diffuse vertex; it is
-dimensionless — a fraction of a light's own radiance — so the same value works in any
-scene regardless of its absolute radiometric scale. `0.02..0.2` is the useful band
-(on the closed gold-gyroid room, `0.05` roughly halves the error against the full-GI
-reference). It is physically a lie, and it is what makes the mode usable indoors.
+dimensionless — a fraction of a light's own radiance — so a given value means the same
+thing whatever the scene's absolute radiometric scale. That makes it *scale*-independent,
+which is not the same as scene-independent: how much fill a room actually wants still
+depends on how closed and how reflective it is. `0.02..0.2` is the useful band for a fairly
+open room (on the gold-gyroid room, `0.05` roughly halves the error against the full-GI
+reference), but a small closed bright box wants far less — nearer `0.01` (see `-gi` below).
+Sweep it rather than trusting one number. It is physically a lie, and it is what makes the
+mode usable indoors.
+
+**`-gi <n>` — real one-bounce GI, and why it's safe on animation.**
+`-gi <n>` replaces the flat term with an actual **deterministic single-bounce hemisphere
+gather**: at every diffuse vertex it traces `n` rays along a fixed lattice and takes
+whatever mode-`W` radiance each one finds. `16..64` is the useful band; cost scales
+with `n`.
+
+Measured on an all-diffuse Cornell box (`scraps/cor_gi.ftsl`, 240², **absolute exposure**,
+against mode `R` converged to 0.8 % noise / 15636 spp), whole-frame mean |luminance error|
+over the box interior, and a **colour-bleed** score — how much redder the floor is beside
+the red wall than beside the green one, which cancels the light's own tint and the exposure
+and so is the one thing a grey fill provably cannot buy:
+
+| mode `W` variant | mean \|err\| | colour bleed |
+|---|---|---|
+| direct only | 33.32 | 13 % |
+| best flat fill, `-ambient 0.01` | 7.01 | 18 % |
+| gather only, `-gi 32` | 12.91 | 55 % |
+| **`-ambient 0.01 -gi 32`** | **5.40** | **80 %** |
+
+So the honest headline is **23 %** less luminance error than the best flat fill — not a
+landslide — but **4.5× more of the colour bleeding** (80 % vs 18 %), and that gap is the
+real point: the flat fill's bleed score never exceeds 43 % no matter how bright it is
+driven, because a grey constant cannot carry a wall's colour. Contact darkening behaves the
+same way: the gather's signed error in the darkest decile is +0.2 at `-ambient 0.005`,
+i.e. essentially exact, where the flat fill has to trade the crevices against the open
+faces with one knob.
+
+Two limits worth knowing, both measured:
+
+* **The gather saturates at about `-gi 32`.** 12.91 → 12.80 → 12.77 → 12.77 for
+  `-gi 32/64/128/256`. Past that the residual is not the direction count, it is the
+  *single bounce*: in a closed box of 0.75-albedo walls the interreflection series totals
+  ~1/(1−0.75) = 4× the first bounce, so one bounce structurally cannot get there. This is
+  why the combination wins — `-ambient 0.01 -gi 32` (5.40) beats `-gi 256` alone (12.77)
+  at a fraction of the cost, because the flat tail is standing in for the *rest of the
+  series* rather than for all of GI.
+* **`-spp` is what removes the banding.** Residual blotchiness falls 6.57 → 2.41 → 1.65
+  for `-spp 1/4/16` (and mean error 5.40 → 5.09 → 4.88). `-spp 4` buys most of it.
+
+> **The useful `-ambient` value is scene-dependent — sweep it.** The `0.02..0.2` band
+> above suits a fairly open room; on this *closed* box the optimum was **0.01**, and
+> `0.05` already overshot the darkest decile by +28 luminance units. Because it is a
+> fraction of a light's own radiance, a small closed bright box needs far less of it than
+> the number alone suggests.
+
+The design difference from POV-Ray matters if you are rendering a sequence. POV-Ray's
+radiosity caches irradiance at an **adaptively chosen** sparse point set and interpolates.
+Which points get sampled depends on render order and on the local geometry, so on animated
+geometry the cache's low-frequency blotches pop in and out between frames — which is why
+POV-Ray animations conventionally pre-bake one cache and reuse it, and why that only works
+when nothing moves. This gather has **no cache and no adaptivity**: its direction set is a
+pure function of (lattice index, sample index) and never of the scene, so two frames of a
+rotating object are lit by the identical estimator and **a seamless loop cannot flicker**.
+The price is that residual error appears as low-frequency *banding* rather than noise — but
+banding is a smooth function of the surface normal, so it slides smoothly as geometry
+turns, where cache splotches jump. Raise `-gi`, or raise `-spp` (which rotates the lattice
+progressively), to push it down.
+
+That is measured too, not just argued (`scraps/gi_temporal.py`): a box on a turntable
+through a 12° arc, scored on the per-pixel discrete *second* difference in luminance — the
+quantity that spikes when a value pops between frames even if the frame-to-frame difference
+looks reasonable. Normalised against the first difference, `-gi 32` scores **1.907** against
+a direct-only control of **1.851** — within 3 % of the smoothest thing this renderer can
+produce — and at `-spp 4` it comes in *below* the control, at 1.369. (The test resolves
+gross flicker, the multi-unit blotches a cache pops; 8-bit output puts a rounding floor
+under the subtle end.)
+
+`-ambient` still applies alongside `-gi`, now in its honest role: the **far-field** fill a
+gather ray picks up when it escapes the geometry. In an empty scene every direction
+escapes, so the gather collapses back to the flat term — switching `-gi` on never steps the
+exposure. This is verified rather than asserted: on `scraps/gi_collapse.ftsl` (a lone
+diffuse quad lit only by `ambient`) `-gi 32` and `-gi 0` render **pixel-identical** frames,
+which is the check that the gather's cosine normalisation is right. The one legitimate
+exception is a directly visible light: a gather ray that lands on an emitter contributes
+nothing, because the vertex's own next-event estimation already counted that light, so the
+solid angle the emitter subtends loses its share of the far-field fill. In effect the
+luminaire occludes the ambient sky, which is what you want, but it does mean `-gi` and
+`-ambient` are not bit-identical in an open scene with a visible lamp.
+
+> **Watch the auto-exposure when judging `-ambient`.** By default the tone map anchors on
+> the image's own 99th percentile, so raising `-ambient` raises the mean radiance and the
+> anchor immediately divides it back out — the frame does not get brighter so much as
+> **flatter**. Sweeping `-ambient 0 → 0.30` on a closed box moved the anchor by **5×**
+> (3.57e-13 → 7.05e-14). If you are comparing fills, or matching a preview against a
+> converged render, put the scene in **absolute mode** first (author `lumens`/`power` on a
+> light — see *Absolute power*) so the gain is fixed and a brightness change is a real
+> brightness change.
 
 **Honest limits.** Mode `W` is a *preview*, not a reference: it is biased. It is CPU-only
 (the GPU backward megakernel keeps the stochastic path). Rough glossy metal renders
 sharper than it really is, because one mirror ray can't spread a lobe. A half-mirror or
 layered coat picks its dominant branch instead of forking, and a pattern-driven material
-mix hard-thresholds instead of dithering. Dielectrics still choose reflect-vs-refract
-stochastically, so glass keeps a little noise (see `known-issues.md`). And no ambient
-constant is colour bleeding. When you want the truth, that's what `R`/`D`/`U` are for.
+mix hard-thresholds instead of dithering. **Glass is currently broken in mode `W`, not just
+noisy:** a dielectric sphere previews as an opaque bright blob with no refracted image at
+all, and it does not improve with `-spp` (it converges to the wrong answer), so do not use
+mode `W` to preview a scene whose subject is glass — use mode `R` or `B`. `-gi` is one
+bounce only, terminated on the `-ambient` tail — it is not a substitute for a converged
+render. All of these are tracked in `known-issues.md`.
+When you want the truth, that's what `R`/`D`/`U` are for.
 
 ```sh
+# fast look preview
 ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -window -keepwindow -o png/preview.png
+# ... with real bounce light (occlusion + colour bleeding), still deterministic
+ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keepwindow -o png/preview_gi.png
 ```
 
 > **Quick preview — `-raster` (not a transport mode).** To eyeball *composition*
@@ -580,7 +679,7 @@ that converges to the same physical image.
 | `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
 | `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
 | `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
-| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1` | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: no diffuse GI (use `-ambient`), rough glossy over-sharpened, CPU only |
+| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1` | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy over-sharpened, CPU only |
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
 | `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / spot / env lights |
@@ -2653,7 +2752,10 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-max-bounce <N>` | Set path depth to `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, the photon modes, and the bidirectional `D`/`U`). Default is the tracer's own cap: **32** for the unidirectional tracers, **8** for `D`/`U`, whose connection cost grows ~depth². For `D`/`U` the flag therefore *raises* the depth as often as it caps it — a specular-only cavity (a mirror-lined sphere, a kaleidoscope, deeply nested dielectrics) truncates its recursive images to black at 8 edges and wants `-max-bounce 24`–`48` before the hall of mirrors fills in. Specular vertices are cheap there: a delta BSDF has no connection to make. |
 | `-direct-only` / `-directonly` | **Whitted mode:** after a non-specular vertex (diffuse / diffuse-transmit / elastic-fluorescent / fog single-scatter) does its direct-lighting NEE, stop — no diffuse indirect (no colour bleeding, black shadows). Specular chains (mirror / glass / glossy / filter) still recurse. Scoped to the **camera** path tracers (`R` spectral + `-rgb`, and `P`'s backward layer); forward `B` and the photon/BDPT modes honour `-max-bounce` but ignore this. |
 | `-whitted-grid <n>` | **Mode `W` only.** Fire an `n`×`n` fixed lattice of shadow rays at every area light instead of one random point (default `4` → 16 rays). This is the single knob that decides how smooth a soft shadow is; a point/spot/collimated light is a deterministic connection already and ignores it. |
-| `-ambient <v>` / `-amb <v>` | **Mode `W` only.** Flat ambient fill added at every diffuse vertex (POV-Ray's `ambient`) — the cheap stand-in for the diffuse GI mode `W` drops, without which a **closed** room previews with black shadows. **Dimensionless:** `v` is a fraction of a light's own radiance (internally scaled by `Scene::ambientRef()`), so the same value behaves the same in any scene whatever its absolute radiometric scale. Default `0`; `0.02..0.2` is the useful band. |
+| `-ambient <v>` / `-amb <v>` | **Mode `W` only.** Flat ambient fill added at every diffuse vertex (POV-Ray's `ambient`) — the cheap stand-in for the diffuse GI mode `W` drops, without which a **closed** room previews with black shadows. **Dimensionless:** `v` is a fraction of a light's own radiance (internally scaled by `Scene::ambientRef()`), so the same value behaves the same in any scene whatever its absolute radiometric scale. Default `0`; `0.02..0.2` is the useful band. With `-gi` it keeps applying, as the **far-field** term a gather ray picks up when it escapes the geometry. |
+| `-gi <n>` / `-radiosity <n>` | **Mode `W` only.** Replace the flat `-ambient` term with a real **deterministic one-bounce hemisphere gather**: `n` rays per diffuse vertex along a fixed world-space lattice, each carrying whatever mode-`W` radiance it finds. Brings back the two things a constant cannot — **contact darkening** in crevices and **colour bleeding** (a gold object actually tints the room). Default `0` (off); `16..64` is the useful band. Unlike POV-Ray's radiosity there is **no irradiance cache**, so nothing depends on render order or on which sample points the geometry happened to trigger — which is what makes it safe for a **seamless animated loop**. Residual error shows as low-frequency banding rather than noise; `-spp` rotates the lattice, so it refines progressively. |
+| `-gi-grid <n>` | **Mode `W` only.** `n`×`n` shadow rays at a *gather* vertex (default `1`). Separate from `-whitted-grid` because a gather vertex's soft-shadow detail is averaged over `-gi` directions anyway, so paying the full grid there multiplies the gather's cost for almost no visible return. |
+| `-gi-bounce <n>` | **Mode `W` only.** Max bounces along one gather ray (default `4`). Bounds the cost of a specular chain: gold is ~0.9 reflective, so the `adc_bailout` cutoff alone would let a single gather direction ricochet ~60 times inside a gold lattice. |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,
