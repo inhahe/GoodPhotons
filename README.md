@@ -713,7 +713,7 @@ that converges to the same physical image.
 | `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
 | `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
 | `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
-| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe; on the GPU except for dispersive materials and `-gi` |
+| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe; on the GPU except for `-gi` |
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
 | `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / spot / env lights |
@@ -889,8 +889,8 @@ falls, so they share the same live progress and budget flags (`-time` / `-noise`
 `-forever` / `-preview` / `-interval`, and periodic crash-safe writes) on **both** the CPU
 and the GPU. They're all GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via
 the forward megakernel, **`D`** via its own GPU BDPT megakernel, **`R` (including the
-physical-lens camera) and `W` (the deterministic preview, with the quadratures ported —
-minus dispersive materials and `-gi`, which fall back)** via the GPU backward megakernel
+physical-lens camera) and `W` (the deterministic preview, with the quadratures *and* the
+split-at-dispersion walk ported — only `-gi` still falls back)** via the GPU backward megakernel
 — which the **`P` composite
 reuses for its camera-side layer**, so both of `P`'s layers run on the GPU when the scene
 is within the backward-GPU scope — and the **`M` photon map** (direct density query
@@ -1469,9 +1469,10 @@ second:**
   the split is linear, not exponential (once monochromatic a sub-path never re-splits) and
   is paid only by the photons that actually reach the glass, so it costs just **1.11×** per
   photon there. It stays opt-in because that ratio is scene-dependent: a scene that is
-  mostly glass pays much more of it. CPU forward modes `A`/`B`/`C`, the `M`/`S` photon
-  deposit, and the CPU backward tracer (`R`) honour the flag today; the GPU can adopt it
-  later. **Mode `W` always splits, flag or no flag** — its λ lattice is shared by every
+  mostly glass pays much more of it. The backward tracer (`R` and `W`) honours the flag on
+  **both the CPU and the GPU**; CPU forward modes `A`/`B`/`C` and the `M`/`S` photon deposit
+  honour it too, while the GPU *forward* megakernel still de-heros and can adopt it later.
+  **Mode `W` always splits, flag or no flag** — its λ lattice is shared by every
   pixel, so terminating the secondaries would mistint the *whole frame* rather than add
   noise. Splitting is what makes glass come out right at `-spp 1` there.
 - **Dispersion — colours actually splitting** through a prism / lens / water. Only

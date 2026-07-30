@@ -4292,11 +4292,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
     // GPU backward reference megakernel (own check). -mode W runs here too: the device
     // megakernel carries a full twin of the deterministic estimators (the bkWhitted /
-    // bkGrid / bkGi* / bkAmbient DScene knobs + the dWhitted* lattice helpers in
-    // render_cuda.cu), so it reproduces the CPU's noise-free image rather than the noisy
-    // one the mode exists to avoid. The device twin is not yet complete, though --
-    // cudaBackwardWhittedSupported() rejects dispersive materials and -gi, and those
-    // scenes fall back to the CPU mode-W tracer (which they can afford, being ~1 spp).
+    // bkGrid / bkGi* / bkHeroSplit / bkAmbient DScene knobs + the dWhitted* lattice helpers
+    // in render_cuda.cu, and the split-at-dispersion walk bkRadianceHeroLoop<true>), so it
+    // reproduces the CPU's noise-free image rather than the noisy one the mode exists to
+    // avoid. The device twin is not yet complete, though -- cudaBackwardWhittedSupported()
+    // rejects -gi, and those scenes fall back to the CPU mode-W tracer (which they can
+    // afford, being ~1 spp).
     const bool gpuBackwardMode = (mode == 'R');
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
@@ -4368,17 +4369,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // marching (M11), fluorescence, and BOTH a constant and an image-based env
             // light (M1). Collimated beams still fall back to the CPU backward tracer.
             // -mode W adds its own narrower check on top: the deterministic device twin
-            // does not yet cover the split-at-dispersion walk or the -gi gather, so those
-            // scenes stay on the CPU mode-W tracer (cheap there — mode W is ~1 spp).
+            // does not yet cover the -gi gather, so those scenes stay on the CPU mode-W
+            // tracer (cheap there — mode W is ~1 spp).
             const bool bwOk = g_whitted
                             ? cudaBackwardWhittedSupported(scene, cam, whittedOpts)
                             : cudaBackwardSupported(scene, cam);
             if (!bwOk) {
                 const char* why = g_whitted
-                    ? "mode W scene is outside the deterministic GPU scope (a "
-                      "dispersion-dependent material -- glass/thin-film/multilayer/grating/"
-                      "half-mirror/fluorescent -- or -gi, or a backward-GPU-unsupported "
-                      "feature)"
+                    ? "mode W scene is outside the deterministic GPU scope (-gi, or a "
+                      "backward-GPU-unsupported feature)"
                     : "scene has a backward-GPU-unsupported feature "
                       "(collimated light, an `emit pattern:` emission "
                       "profile, or a lens deeper than the device cap)";
@@ -6190,16 +6189,17 @@ static int run(int argc, char** argv) {
                     "diffuse transport at all)\n", g_gi);
         g_gi = 0;
     }
-    // -herosplit reaches the CPU forward tracer and the CPU backward tracer (modes R/W);
-    // say so rather than silently ignoring it, and point out that it is a no-op without a
-    // bundle to split. Mode W enables it itself (see BackwardRenderer::heroSplit), so it is
-    // reported there instead of here.
+    // -herosplit reaches the CPU forward tracer, the photon maps, and the backward tracer
+    // (modes R/W) on BOTH the CPU and the GPU (the device split is bkRadianceHeroLoop<true>,
+    // v0.111.0). The GPU FORWARD megakernel still de-heros, so name the layers rather than
+    // silently ignoring it, and point out that it is a no-op without a bundle to split. Mode W
+    // enables it itself (see BackwardRenderer::heroSplit), so it is reported there instead.
     if (hero::gSplit && !g_whitted) {
         if (g_heroC <= 1)
             std::printf("[hero] -herosplit has no effect with -heroc 1 (no secondaries to split)\n");
         else
-            std::printf("[hero] split-at-dispersion ON (C=%d fan-out; CPU forward modes A/B/C, "
-                        "photon-map M/S, backward R)\n", g_heroC);
+            std::printf("[hero] split-at-dispersion ON (C=%d fan-out; backward R/W on CPU+GPU, "
+                        "forward modes A/B/C and photon-map M/S on the CPU)\n", g_heroC);
     }
 
     if (checkBvhOnly) {

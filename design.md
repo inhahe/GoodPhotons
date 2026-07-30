@@ -341,18 +341,42 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `cudaBackwardWhittedSupported()` gates the device path on top of
   `cudaBackwardSupported()`, and is deliberately **narrower**: a missing deterministic term
   is a visible error, not extra noise, so unsupported constructs fall back to the CPU
-  mode-`W` tracer (cheap — the mode is ~1 spp) rather than degrading. Currently rejected:
-  any **dispersion-dependent material** (Dielectric / ThinFilm / Multilayer / Grating /
-  HalfMirror / Fluorescent — `sceneHasDispersiveMat`, which also scans `Mix` children),
-  because `bkRadianceHero` still *de-heros* at those vertices and mode `W` requires the
-  split; and **`giDirs > 0`**, because the gather is a depth-1 recursion. Both are depth-1
-  recursions on the CPU and will be re-expressed on the device as compile-time templates
-  (`template<bool AllowSplit>`, `template<int GiDepth>`) so nvcc instantiates two bodies
-  from one source — no runtime recursion, no device stack sizing. `Layered` needs no device
-  twin at all: it already forces a CPU fallback device-wide via `cudaForwardSupported`.
-  Env NEE stays **stochastic** in mode `W` on both CPU and GPU (an existing deliberate
-  choice), so it needed no device change — an important *non*-change, since "fixing" it on
-  one side only would have manufactured a CPU/GPU divergence.
+  mode-`W` tracer (cheap — the mode is ~1 spp) rather than degrading. What remains rejected
+  is **`giDirs > 0`**, because the gather is a depth-1 recursion (N3c). `Layered` needs no
+  device twin at all: it already forces a CPU fallback device-wide via
+  `cudaForwardSupported`. Env NEE stays **stochastic** in mode `W` on both CPU and GPU (an
+  existing deliberate choice), so it needed no device change — an important *non*-change,
+  since "fixing" it on one side only would have manufactured a CPU/GPU divergence.
+
+  **Split-at-dispersion on the device (0.111.0).** Dispersion-dependent materials
+  (Dielectric / ThinFilm / Multilayer / Grating / HalfMirror / Fluorescent) used to gate the
+  whole scene back to the CPU, because `bkRadianceHero` *de-hero'd* at those vertices and
+  mode `W` cannot use a de-hero: its λ lattice is per-**sample**, shared by every pixel, so
+  collapsing onto the hero collapses the entire *frame* onto one wavelength and mistints every
+  glass surface (36.7 pp of chroma error, measured — see N1). The fix mirrors the CPU
+  refactor: `bkRadianceHero`'s body became `template<bool AllowSplit>
+  bkRadianceHeroLoop(...)`, taking the whole bundle state (`ro`/`rd`/`stk`/`lam[]`/`invPdf[]`/
+  `thr[]`/`C`/`secAlive`/`specularArrival`/`contBsdfPdf`/`bounce0`) so it can be **re-entered**
+  mid-path, with `bkRadianceHero` left as the thin "fresh bundle at bounce 0" wrapper that
+  picks the instantiation off `sc.bkHeroSplit`. `AllowSplit == true` fans each live secondary
+  into its own monochromatic sub-path from bounce `b+1` — its own direction, its own
+  `DMediumStack`, its own `L[i]` slot, **no ×C boost** — via `bkRadianceHeroLoop<false>`;
+  `AllowSplit == false` keeps the de-hero.
+
+  The `if constexpr (AllowSplit)` is the load-bearing part. A runtime `if (heroSplit)` would
+  leave a self-recursive call in the `false` body, which on the device means unbounded stack;
+  as a compile-time switch nvcc emits two bodies and the `false` one contains **no recursive
+  call at all**, so the re-entry is provably one level deep, the frame is statically sized,
+  and no `cudaLimitStackSize` / `-rdc` is needed. (The CPU gets the same bound from
+  `secAlive`, but can afford real recursion.) `sub[]` and the copied `DMediumStack` add ~100
+  bytes to the `true` instantiation's frame.
+
+  `bkHeroSplit` is therefore the one mode-`W` `DScene` knob that is **not** mode-`W`-only:
+  `-herosplit` applies to plain mode `R` as well, so `buildUpload` defaults it from
+  `hero::gSplit` rather than to 0 (the same pattern as `BackwardRenderer::heroSplit` /
+  `Renderer::heroSplit`). Before 0.111.0 GPU mode `R` silently ignored `-herosplit` and
+  de-hero'd where the CPU split — a real CPU/GPU divergence, fixed by the same code. The GPU
+  *forward* megakernel still de-heros, which the `[hero]` startup line now says explicitly.
 
   **Whole-image bit-exactness is not achievable and is not the acceptance bar.** The device
   runs `using Real = float` (`FTRACE_GPU_FP32`) with `RAY_EPS` 1e-4 against the CPU's

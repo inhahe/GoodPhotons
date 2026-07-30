@@ -5,6 +5,41 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG (2026-07-29, v0.111.0): mode `W` is still STOCHASTIC at thinfilm / multilayer / grating / fluorescent vertices
+
+Mode `W`'s entire contract is "no rng draws — the same image at `-spp 1` every time, on any
+device". Four material vertices still break it, on **both** the CPU and the GPU:
+
+- **`src/render.h::thinFilmInterface` (~2277) and `multilayerInterface` (~2340)** flip a bare
+  reflect-or-transmit coin with **no `whitted` branch at all** — the opaque metal-backed path does
+  `if (rng.uniform() >= R) return false;`, the lossless path
+  `if (rng.uniform() < R) outDir = reflect(d, nl); else outDir = eta*d + nl*(eta*cosI - cosT);`
+  (three sites each). Contrast `refractOrReflect` in the same file, which *does* have the
+  `double* whittedWeight` dominant-branch contract (see the DEBT entry below).
+- **`gratingDiffract`** picks a diffraction order from the rng.
+- **`D_FLUORESCENT`** draws `dSampleSceneLambda` for the Stokes shift plus a continuation coin.
+
+**How it was found:** building N3b's deterministic CPU/GPU A/B bed (`scraps/n3b_gpu.ftsl`).
+`scraps/n3b_check.py` failed at max |dLuma| **4.078** / |dChroma| **6.995** codes on exactly the
+20 px blocks covering a `thinfilm` bubble, while every other block in the frame passed under 0.2
+codes. That is not a porting bug — the CPU render is equally noisy there; CPU and GPU simply draw
+from independent rng streams, so the two are different realizations of a stochastic estimator that
+should not have been stochastic. The bubble was swapped for a diamond ball so N3b could land on a
+genuinely deterministic scene; the underlying bug is untouched. It also means the viewer's mode-`W`
+preview is grainy on any iridescent surface, and `-spp 1` mode W on such a scene is not
+reproducible run to run.
+
+**Proper fix (TODO.md §N/N3d).** ThinFilm/Multilayer are mechanical: mirror
+`refractOrReflect`'s existing `double* whittedWeight` out-param contract — take the dominant
+branch (`R >= 0.5` → reflect, weight `R`; else transmit, weight `1-R`), draw nothing, and let
+`whittedAttenuate` fold the weight into the throughput. Four places must move together:
+`src/render.h` (both functions), `src/render_cuda.cu` (their device twins), and
+`src/backward.h:807` / `bkInteract`'s `D_THINFILM` + `D_MULTILAYER` call sites. Grating (*which*
+order is dominant — the one with the largest efficiency at this λ?) and Fluorescent (*which* λ_in
+does a deterministic Stokes shift pick?) need a design decision before they can be written. This
+changes mode-`W` output on any scene using those materials, so it deserves its own commit and
+VERSION bump rather than riding along with unrelated work.
+
 ### DEBT (2026-07-29, v0.107.0): mode `W` picks a dielectric's dominant branch, it does not fork
 
 *(Supersedes the v0.105.0 "still samples dielectrics stochastically" entry and the v0.106.0
@@ -5166,8 +5201,8 @@ correctly on **both** backends.
   backend by scene material variety + path depth rather than always defaulting to the
   megakernel.
 
-### MOSTLY DONE (2026-07-29, v0.110.0): mode W is the only render mode with NO GPU path
-**Closed for the common case by TODO.md §N/N3a.** Mode W now rides the same `kBackward`
+### MOSTLY DONE (2026-07-29, v0.111.0): mode W is the only render mode with NO GPU path
+**Closed for the common case by TODO.md §N/N3a+N3b.** Mode W now rides the same `kBackward`
 megakernel as mode R with the estimators swapped: seven `DScene` knobs (`bkWhitted`, `bkGrid`,
 `bkGiDirs`, `bkGiGrid`, `bkGiBounce`, `bkHeroSplit`, `bkAmbient`) uploaded from a `WhittedOpts`
 (`src/render_cuda.h`), device twins of every lattice helper (`dRadicalInverse2` /
@@ -5180,15 +5215,28 @@ channel samples bit-identical CPU↔GPU, 99.96 % within one 8-bit code, **zero**
 the device's fp32 `Real` + coarser `RAY_EPS`); **12.1 s → 0.3 s**, i.e. ≈40×, well above the ~8.5×
 mode-R ratio predicted below.
 
-**Still open (both fall back to the CPU mode-W tracer rather than degrade, since a missing
+**Dispersive materials followed in N3b (v0.111.0).** `bkRadianceHero`'s body became
+`template<bool AllowSplit> bkRadianceHeroLoop(...)`, the device twin of N1's `radianceHeroLoop`:
+the `<true>` instantiation fans each live secondary λ into its own monochromatic sub-path from
+bounce `b+1` (own Snell direction, own copied `DMediumStack`, own `L[i]` slot, no ×C boost) and
+continues the hero unboosted, while `<false>` keeps the old de-hero. `if constexpr` (not a runtime
+`if`) is what makes this safe on the device: the `<false>` body contains no recursive call, so
+re-entry is provably one level deep with a statically-sized frame — no `cudaLimitStackSize`, no
+`-rdc`. `sceneHasDispersiveMat` is gone. Measured on `scraps/n3b_gpu.ftsl` (the N3a box plus
+SF10/BK7/diamond balls and a half-mirror pane, 400×260 `-spp 1`, absolute): 99.561 % bit-identical,
+max |dLuma| 0.144 / |dChroma| 0.105 codes per 20 px block (`scraps/n3b_check.py`, limit 1.5), and
+0 blob interior even under the strict `n3_check.py` bar. The N3a scene re-rendered byte-for-byte
+identically, proving the refactor is inert off the split path.
+
+That commit also fixed a **latent divergence**: `buildUpload` now defaults
+`sc.bkHeroSplit = hero::gSplit`, matching `BackwardRenderer::heroSplit` / `Renderer::heroSplit`.
+Before, GPU mode R *silently ignored* `-herosplit` and always de-hero'd, so CPU and GPU mode R
+disagreed by ~4.4 codes of block luma on a glass scene whenever the flag was passed.
+
+**Still open (falls back to the CPU mode-W tracer rather than degrade, since a missing
 deterministic term is a visible error, not extra noise):**
-- **Dispersive materials** (Dielectric / ThinFilm / Multilayer / Grating / HalfMirror /
-  Fluorescent). `bkRadianceHero` still *de-heros* at those vertices, and mode W requires the
-  split-at-dispersion walk instead (its λ lattice is shared by every pixel — see the FIXED
-  v0.108.0 entry above). Gated by `sceneHasDispersiveMat` in `cudaBackwardWhittedSupported`.
-  *Proper fix (TODO.md §N/N3b):* re-express `bkRadianceHero` as a re-enterable loop with
-  `template<bool AllowSplit>`, mirroring N1's `radianceHeroLoop`, then drop the gate.
-- **`-gi <n>`** (the deterministic one-bounce gather), a depth-1 recursion.
+- **`-gi <n>`** (the deterministic one-bounce gather), a depth-1 recursion. The last mode-W
+  fallback.
   *Proper fix (TODO.md §N/N3c):* `template<int GiDepth>` + a device `dGiDir` Fibonacci-spiral
   lattice, then drop the `giDirs > 0` gate. `DGiCtx` and all four depth-1 behaviours plus the
   escaped-gather `bkAmbient` tail already landed in N3a.

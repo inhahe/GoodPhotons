@@ -3661,8 +3661,8 @@ Mode W (`-mode W`, the POV-Ray-style deterministic Whitted preview, v0.105.0; `-
 v0.106.0; promoted to the `-explore` viewer's lit preview v0.107.0) *was* the **only render mode with
 no GPU backend** — `main.cpp:4292`'s `(mode == 'R' && !g_whitted)` routed it to the CPU
 unconditionally. Continues §L (the backward tracer) and §M (GPU fallback closure, M1–M12 all done).
-As of v0.110.0 (N3a) it runs on the device for everything except dispersive materials (N3b) and
-`-gi` (N3c), which still fall back to the CPU tracer.
+As of v0.111.0 (N3a+N3b) it runs on the device for everything except `-gi` (N3c), which is the last
+remaining CPU fallback for mode W.
 
 **Order matters:** N1/N2 change mode W's *estimator*, so they come before the port — porting an
 estimator that is about to change means writing the hand-maintained device twin twice.
@@ -3745,7 +3745,8 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       only higher spp improves). Preserves both mode-W invariants: shared offsets per pixel, and
       indexing by the **absolute** sample index so the image stays chunk-split-independent.
       </details>
-- [ ] **N3. Port spectral mode W to the device.** *(N3a DONE 2026-07-29, v0.110.0; N3b/N3c open.)*
+- [ ] **N3. Port spectral mode W to the device.** *(N3a DONE 2026-07-29, v0.110.0; N3b DONE
+      2026-07-29, v0.111.0; N3c open.)*
   - [x] **N3a — knobs, lattice helpers, quadrature, non-dispersive materials, flat `bkAmbient`.**
         `WhittedOpts` (`src/render_cuda.h`, the twin of `BackwardRenderer`'s mode-W fields with
         `ambient` pre-scaled by `Scene::ambientRef()`) is passed as a trailing
@@ -3775,19 +3776,66 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
         8.5× mode-R ratio as predicted. Stochastic paths verified intact: mode R CPU↔GPU means
         agree to 0.04 %, modes B/D to ~0.1 %. Fallbacks confirmed to actually fire (glass scene
         and `-gi 8` both print `[device] … using CPU`).
-  - [ ] **N3b — dispersive materials + `heroSplit` on the device.** `bkRadianceHero` still
-        de-heros at a Dielectric/ThinFilm/Multilayer/Grating/HalfMirror/Fluorescent vertex, which
-        mode W cannot use. Re-express `bkRadianceHero` as a re-enterable loop with
-        `template<bool AllowSplit>`, mirroring N1's `radianceHeroLoop`; then drop
-        `sceneHasDispersiveMat` from the gate. (`whittedWeight` on `refractOrReflect` /
-        `dDielectricStep` and the whitted `D_DIELECTRIC`/`D_GRATING`/`D_HALFMIRROR` branches of
-        `bkInteract` already landed in N3a, so the remaining work is *only* the split.)
+  - [x] **N3b — dispersive materials + `heroSplit` on the device.** **DONE (2026-07-29,
+        v0.111.0.)** `bkRadianceHero`'s body became
+        `template<bool AllowSplit> bkRadianceHeroLoop(...)` (`src/render_cuda.cu`), a re-enterable
+        loop taking `(ro, rd, DMediumStack, lam[], invPdf[], thr[], C, secAlive, specularArrival,
+        contBsdfPdf, bounce0, Lout, rng, gi)` — the device twin of N1's `radianceHeroLoop`. At a
+        Dielectric/ThinFilm/Multilayer/Grating/HalfMirror/Fluorescent vertex the `<true>` body fans
+        each live secondary λ into its own monochromatic sub-path from bounce `b+1` (own Snell
+        direction, own copied `DMediumStack`, own `L[i]` slot, no ×C boost), then continues the hero
+        **unboosted**; the `<false>` body keeps the old de-hero. `bkRadianceHero` survives as a thin
+        wrapper that picks the instantiation from `sc.bkHeroSplit`, so `kBackward`'s call site is
+        untouched and the branch is warp-uniform. `sceneHasDispersiveMat` deleted;
+        `cudaBackwardWhittedSupported` now rejects only `giDirs > 0`.
+        **`if constexpr` is load-bearing:** a runtime `if (heroSplit)` would leave a self-recursive
+        call in the `<false>` body → unbounded device stack. As a compile-time switch nvcc emits two
+        bodies and the `false` one has *no* recursive call, so re-entry is provably one level deep
+        with a statically-sized frame (~100 bytes for `sub[]` + the copied stack) — no
+        `cudaLimitStackSize`, no `-rdc`.
+        **Free bug fix:** `buildUpload` now defaults `sc.bkHeroSplit = hero::gSplit`, matching
+        `BackwardRenderer::heroSplit` / `Renderer::heroSplit`. Previously GPU mode R *silently
+        ignored* `-herosplit`.
+        **Measured** (`scraps/n3b_gpu.ftsl` — the N3a box plus SF10/BK7/diamond dielectric balls
+        and a half-mirror pane; 400×260 `-spp 1`, absolute exposure, explicit `-device`):
+        | test | result |
+        |---|---|
+        | `scraps/n3_gpu.ftsl` (N3a regression) | 99.264 % bit-identical, 0 blob — **byte-for-byte N3a's numbers**, so the refactor changed nothing off the split path |
+        | `scraps/n3b_gpu.ftsl` mode W, `n3b_check.py` | 99.561 % bit-identical, 99.944 % within 1 code, max \|dLuma\| **0.144** / \|dChroma\| **0.105** codes per 20 px block (limit 1.5) — **PASS** |
+        | same, strict `n3_check.py` | 35 hot pixels, **0 blob interior** — passes even the N3a sliver bar |
+        | mode R, `-herosplit` off→on | dLuma **4.4** codes on *both* devices, same worst block — the flag is honoured on the GPU now |
+        | mode R, CPU↔GPU at fixed `-herosplit` | max \|dLuma\| 0.47 / \|dChroma\| 0.92 codes (split on) — agree within MC noise |
+        GPU 0.4 s → 0.6 s with the split on (CPU 4.7 s → 9.5 s), i.e. the fan-out really is doing
+        work. `n3b_check.py` compares **block means** rather than pixels, because with two Snell
+        refractions in fp32 a caustic streak legitimately lands a pixel over — that redistribution
+        cancels in a block mean, whereas a wrong estimator changes a whole region's energy or hue;
+        chroma is scored separately since a de-hero is specifically a hue error.
+        **Found a pre-existing bug on the way** (`thinfilm`/`multilayer` are still stochastic in
+        mode W on *both* devices) — see N3d.
   - [ ] **N3c — the `-gi` one-bounce gather.** `template<int GiDepth>` + a device `dGiDir`
         (Fibonacci spiral, Cranley-Patterson-rotated by base-7/11 radical inverses of `sIdx`),
         then drop the `giDirs > 0` gate. `DGiCtx` and all four of its depth-1 behaviours
         (no second gather, `bkGiGrid`, `bkGiBounce`, `specularArrival = false`) plus the escaped
         gather's `bkAmbient` far-field tail already landed in N3a — only `giGatherHero`/`giGather`
         themselves are missing.
+  - [ ] **N3d — mode W is still STOCHASTIC at four material vertices, on both CPU and GPU.**
+        *(Found 2026-07-29 while building N3b's A/B bed: `n3b_check.py` failed at dLuma 4.1 /
+        dChroma 7.0 on exactly the 20 px blocks covering a thin-film bubble, while every other block
+        passed at <0.2 codes. Not a porting bug — the CPU is noisy there too, and CPU/GPU just draw
+        from independent rng streams. The bubble was replaced by a diamond ball so N3b could land;
+        this is the real fix.)* Mode W's whole contract is "no rng draws", and these four break it:
+        - `render.h::thinFilmInterface` and `multilayerInterface` flip a bare
+          `rng.uniform()` reflect-or-transmit coin with **no `whitted` branch** — opaque path
+          `if (rng.uniform() >= R) return false;`, lossless path
+          `if (rng.uniform() < R) outDir = reflect(...) else refract(...)`.
+        - `gratingDiffract` picks a diffraction order from the rng.
+        - `D_FLUORESCENT` draws `dSampleSceneLambda` for the Stokes shift plus a continuation coin.
+        ThinFilm/Multilayer are **mechanical**: mirror the `double* whittedWeight` out-param
+        contract `refractOrReflect` already has (dominant branch — `R >= 0.5` → reflect weighted
+        `R`, else transmit weighted `1-R`, no rng draw), in `src/render.h`, `src/render_cuda.cu`,
+        and `backward.h:807` / `bkInteract`'s `D_THINFILM` / `D_MULTILAYER`. Grating (*which* order
+        dominates?) and Fluorescent (*which* λ_in?) need a design decision first. This changes
+        mode-W output on scenes using those materials, so it wants its own commit + VERSION bump.
 
       <details><summary>original plan</summary>
 
@@ -3821,9 +3869,10 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       Fresnel coin flip.
       </details>
 - [ ] **N4. Deterministic CPU-vs-GPU A/B as N3's acceptance test.** *(Part (b) is in place and
-      passing for the N3a scope — `scraps/n3_check.py`, see N3a's numbers. Part (a), the direct
-      host-vs-device lattice-helper sweep, is still to write, and (b) must be re-run after N3b and
-      N3c widen the gate.)* Unlike every prior port in §M, the
+      passing for the N3a **and** N3b scopes — `scraps/n3_check.py` plus the block-mean
+      `scraps/n3b_check.py`; see those items' numbers. Part (a), the direct host-vs-device
+      lattice-helper sweep, is still to write, and (b) must be re-run after N3c widens the
+      gate.)* Unlike every prior port in §M, the
       usual escape hatch does **not** apply: `render_cuda.h` explicitly permits the stochastic modes
       to be "an independent noise realization that agrees to within Monte-Carlo noise", but mode W has
       no noise to hide a mismatch behind. Any disagreement in the quadrature, the radical-inverse

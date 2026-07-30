@@ -232,15 +232,16 @@ struct WhittedOpts {
     int    giGrid    = 1;    // light grid used INSIDE the gather (cheaper than `grid`)
     int    giBounce  = 4;    // bounce cap inside the gather
     bool   heroSplit = true; // mode W forces the split-at-dispersion walk (de-hero would
-                             // collapse the whole frame onto one lambda: the lattice is shared)
+                             // collapse the whole frame onto one lambda: the lattice is shared).
+                             // Ported to the device in v0.111.0 as bkRadianceHeroLoop<true>;
+                             // plain mode R takes the same policy from `-herosplit`.
     double ambient   = 0.0;  // -ambient, ALREADY pre-scaled by Scene::ambientRef()
 };
 
 // True if this scene + camera can be rendered by the GPU mode-W megakernel with the given
 // options. Strictly narrower than cudaBackwardSupported: the deterministic path still needs
-// the split-at-dispersion walk (N3b) and the -gi gather (N3c) on the device, so for now a
-// scene containing any dispersion-dependent material (dielectric / thin-film / multilayer /
-// grating / half-mirror / fluorescent), or a non-zero giDirs, falls back to the CPU tracer.
+// the -gi gather (N3c) on the device, so for now a non-zero giDirs falls back to the CPU
+// tracer. (Dispersive materials no longer do — the device carries the split as of v0.111.0.)
 bool cudaBackwardWhittedSupported(const Scene& scene, const Camera& cam,
                                   const WhittedOpts& w);
 

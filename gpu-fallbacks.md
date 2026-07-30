@@ -45,11 +45,35 @@ branches, the deterministic glossy lobe, the subpixel + wavelength lattices, and
 `-ambient` fill (incl. the DiffuseTransmit both-lobe case). Validated CPU↔GPU on
 `scraps/n3_gpu.ftsl` (`scraps/n3_check.py`): 99.39 % of channel samples bit-identical,
 99.96 % within one 8-bit code, **zero** pixels inside a ≥3 px-wide disagreeing region;
-12.1 s → 0.3 s. Because mode `W` has no noise to hide a mismatch behind, these fall back
-rather than degrade:
+12.1 s → 0.3 s.
+
+**N3b (2026-07-29, 0.111.0):** dispersive materials no longer fall back. `bkRadianceHero`'s
+body became `template<bool AllowSplit> bkRadianceHeroLoop(...)`, a **re-enterable** bundle walk
+(it takes `ro`/`rd`/`stk`/`lam[]`/`invPdf[]`/`thr[]`/`C`/`secAlive`/`specularArrival`/
+`contBsdfPdf`/`bounce0`), so `AllowSplit == true` can fan each live secondary into its own
+monochromatic sub-path — own direction, own `DMediumStack`, own `L[i]` slot, no ×C boost — by
+re-entering `bkRadianceHeroLoop<false>`. `if constexpr` is what makes this safe on the device:
+the `false` body contains **no** recursive call, so the re-entry is provably one level deep with
+a statically-sized frame (no `cudaLimitStackSize`, no `-rdc`). Side effect / real bug fixed:
+`bkHeroSplit` now defaults from `hero::gSplit` in `buildUpload`, so **plain mode `R` on the GPU
+honours `-herosplit`** — before this it silently de-hero'd where the CPU split. Validated on
+`scraps/n3b_gpu.ftsl` (SF10 + BK7 + diamond balls and a half-mirror pane) with
+`scraps/n3b_check.py`, which compares 20 px **block means** in luma and chroma separately —
+the right bar with refraction in frame, since fp32 Snell divergence only *redistributes* energy
+within a neighbourhood while a wrong estimator shifts a whole region's colour. Result: 99.561 %
+bit-identical, max |dLuma| 0.144 / |dChroma| 0.105 codes per block (limit 1.5), and 0 blob
+interior even under N3a's stricter sliver test; the N3a scene re-rendered byte-for-byte
+identically, so the refactor is inert off the split path. Building that bed also exposed a
+*pre-existing* bug — `thinfilm` / `multilayer` (and `grating` / `fluorescent`) are still
+**stochastic** in mode `W` on both CPU and GPU, so they cannot appear in a deterministic A/B at
+all; logged as N3d in `known-issues.md`, and the reason the scene carries a diamond ball where a
+thin-film bubble originally sat.
+
+Because mode `W` has no noise to hide a mismatch behind, these still fall back rather than
+degrade:
 | Feature | Why CPU today | Class |
 |---|---|---|
-| Any dispersion-dependent material (Dielectric / ThinFilm / Multilayer / Grating / HalfMirror / Fluorescent) — `sceneHasDispersiveMat`, incl. `Mix` children | mode `W` requires **split-at-dispersion** (its λ lattice is shared by every pixel, so de-hero'ing collapses the whole frame onto one λ: 36.7 pp chroma error). `bkRadianceHero` still de-heros at those vertices. | **portable** — N3b: re-enterable `bkRadianceHeroLoop` as `template<bool AllowSplit>` (compile-time, so no runtime recursion / device stack) |
+| ~~Any dispersion-dependent material (Dielectric / ThinFilm / Multilayer / Grating / HalfMirror / Fluorescent)~~ | **DONE (N3b, 0.111.0)** — `bkRadianceHeroLoop<true>` does split-at-dispersion on the device; the `sceneHasDispersiveMat` gate is gone. | ✅ |
 | `-gi <n>` (deterministic one-bounce gather) | the gather is a depth-1 recursion into `radiance`/`radianceHero` | **portable** — N3c: `template<int GiDepth>` + a device `dGiDir` Fibonacci-spiral lattice |
 | `-rgb` in mode `W` | the RGB kernel is a separate reduced tracer with no deterministic estimator; it would return exactly the noise mode `W` removes | **inherently** refused (message in main.cpp), not a fallback |
 | `Layered` material | already a device-wide CPU fallback via `cudaForwardSupported` | no mode-`W` work needed |
