@@ -2990,6 +2990,12 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         if (g_maxBounceOverride >= 1) br.maxBounce = g_maxBounceOverride;
         br.directOnly = g_directOnly || forceWhitted;   // mode W is direct-only by construction
         br.whitted = g_whitted || forceWhitted; br.lightGrid = g_whittedGrid;
+        // Mode W turns split-at-dispersion ON by default. Its λ lattice is shared by every
+        // pixel, so a de-hero would collapse the WHOLE FRAME onto one wavelength and mistint
+        // every dielectric -- a deterministic error, not noise, so no amount of spp fixes it.
+        // Mode R is stochastic and averages the collapse away, so there it stays opt-in
+        // (`-herosplit`, which reaches the backward tracer via BackwardRenderer::heroSplit).
+        br.heroSplit = hero::gSplit || br.whitted;
         // -ambient is dimensionless (fraction of a light's own radiance); convert to
         // this scene's absolute radiance scale here. See Scene::ambientRef().
         br.ambient = g_ambient * scene.ambientRef();
@@ -5313,7 +5319,8 @@ static void printHelp(const char* prog) {
 "  -heroc <N>            hero-wavelength bundle size, 1..8 (default 4); 1 = single-λ, hero off\n"
 "  -herosplit            at a dispersive interface fan the bundle into N monochromatic\n"
 "                        sub-paths (crisp prism/rainbow caustics) instead of de-hero'ing;\n"
-"                        costs ~N× traversal past the split (CPU forward modes A/B/C, M/S)\n"
+"                        costs ~N× traversal past the split (CPU forward A/B/C, M/S, backward\n"
+"                        R; mode W always splits — it is what makes glass right at 1 spp)\n"
 "  -t <n>                CPU thread count\n"
 "\n"
 "Scene-ignore (faster preview — strip expensive features, like the rasterizer):\n"
@@ -6130,8 +6137,9 @@ static int run(int argc, char** argv) {
     }
     if (g_whitted) {
         std::printf("[mode W] deterministic Whitted preview: %dx%d shadow rays/light, "
-                    "%d wavelengths/sample, ambient %.3g\n",
-                    g_whittedGrid, g_whittedGrid, g_heroC, g_ambient);
+                    "%d wavelengths/sample%s, ambient %.3g\n",
+                    g_whittedGrid, g_whittedGrid, g_heroC,
+                    g_heroC > 1 ? " (split at dispersion)" : "", g_ambient);
         if (g_gi > 0)
             std::printf("[mode W] one-bounce gather: %d rays/diffuse vertex, %dx%d shadow "
                         "rays at gather vertices, <=%d bounces/gather ray (cacheless, so "
@@ -6148,14 +6156,16 @@ static int run(int argc, char** argv) {
                     "diffuse transport at all)\n", g_gi);
         g_gi = 0;
     }
-    // -herosplit only reaches the CPU forward tracer; say so rather than silently
-    // ignoring it, and point out that it is a no-op without a bundle to split.
-    if (hero::gSplit) {
+    // -herosplit reaches the CPU forward tracer and the CPU backward tracer (modes R/W);
+    // say so rather than silently ignoring it, and point out that it is a no-op without a
+    // bundle to split. Mode W enables it itself (see BackwardRenderer::heroSplit), so it is
+    // reported there instead of here.
+    if (hero::gSplit && !g_whitted) {
         if (g_heroC <= 1)
             std::printf("[hero] -herosplit has no effect with -heroc 1 (no secondaries to split)\n");
         else
-            std::printf("[hero] split-at-dispersion ON (C=%d fan-out; CPU forward modes A/B/C + "
-                        "photon-map M/S only)\n", g_heroC);
+            std::printf("[hero] split-at-dispersion ON (C=%d fan-out; CPU forward modes A/B/C, "
+                        "photon-map M/S, backward R)\n", g_heroC);
     }
 
     if (checkBvhOnly) {
@@ -8001,24 +8011,28 @@ static int run(int argc, char** argv) {
             const double kWBandSec = 0.10;        // target wall-time per band: responsiveness vs. overhead
             const int    kWCoarse  = 16;          // first pass is 1/16 linear (1/256 the pixels)
             // Mode W is exact at 1 spp only while the whole path stays in the hero BUNDLE, which
-            // carries heroC wavelengths at once. A dielectric (or any other wavelength-switching
-            // material) DE-HEROES the path onto a single wavelength, and mode W's wavelength
-            // lattice is a function of the sample index alone -- shared by every pixel -- so at
-            // 1 spp the entire object is rendered at ONE wavelength and comes out strongly
-            // mistinted (a Cornell SF10 ball renders flat green; it only goes neutral, with
-            // correct dispersion fringes, by ~16 spp). So: keep adding passes, but only when the
-            // scene actually contains such a material, since anywhere else the extra passes are
-            // bit-for-bit identical work. The scalar path (no bundle at all) needs them too.
+            // carries heroC wavelengths at once. Anything that DE-HEROES the path onto a single
+            // wavelength breaks that, because mode W's wavelength lattice is a function of the
+            // sample index alone -- shared by every pixel -- so at 1 spp the entire object is
+            // rendered at ONE wavelength and comes out strongly mistinted. Extra passes are the
+            // fallback; they are only worth taking when the scene actually contains such a
+            // material, since anywhere else they are bit-for-bit identical work.
+            //
+            // The DISPERSIVE materials (dielectric / thin-film / multilayer / grating /
+            // half-mirror / fluorescent) used to be the main offender -- a Cornell SF10 ball
+            // rendered flat green until ~16 spp. They no longer are: mode W now SPLITS the bundle
+            // at a dispersive vertex into C monochromatic sub-paths, each on its own Snell
+            // direction (BackwardRenderer::heroSplit), so glass is colour-correct at 1 spp.
+            // `Layered` still de-heroes -- its coat Fresnel is a λ-dependent *decision*, not a
+            // λ-dependent direction, so the split does not apply -- and so does the scalar
+            // (bundle-free) path taken for media / GRIN / heroC 1.
             // (No hasLens() term: the viewer builds its camera fresh from the pose each frame,
             // so the preview camera is always a plain one even if the scene authored a lens.)
             const int kWSppCap = 16;
             bool wNeedSpp = (g_heroC <= 1) || scene.backwardMedium().enabled ||
                             grin::sceneHasGrin(scene);
             for (const Material& mm : scene.mats)
-                if (mm.type == MatType::Dielectric || mm.type == MatType::ThinFilm ||
-                    mm.type == MatType::Multilayer || mm.type == MatType::Grating ||
-                    mm.type == MatType::HalfMirror || mm.type == MatType::Fluorescent)
-                    wNeedSpp = true;
+                if (mm.type == MatType::Layered) wNeedSpp = true;
 #ifdef HAVE_CUDA
             BackwardRGBSession* traceSess = nullptr;   // resident RGB-backward preview (lazy)
             int   traceResX = 0, traceResY = 0;        // session film size (recreated on a resize)

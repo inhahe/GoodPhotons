@@ -3675,7 +3675,28 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
 | `cornell.ftsl` | R, 1024 spp, GPU | `-rgb` 0.7 s | spectral 1.2 s | spectral penalty only **1.7×** |
 | `_room_of_gyroids_f12.ftsl` | R, 64 spp, GPU | `-rgb` 9.5 s | spectral 12.1 s | spectral penalty only **1.27×** |
 
-- [ ] **N1. Split the hero bundle at a de-hero vertex instead of collapsing it.** *(CPU; the
+- [x] **N1. Split the hero bundle at a de-hero vertex instead of collapsing it.** **DONE
+      (2026-07-29, v0.108.0.)** `radianceHero` factored into a re-enterable
+      `radianceHeroLoop` (`src/backward.h`), with a split branch that fans each secondary λ
+      into its own monochromatic sub-path from bounce `b+1` — its own Snell/grating
+      direction, its own `MediumStack`, its own `L[i]` slot, no ×C boost, zero-copy
+      re-pointing of the emitter-SPD cache (stride stays C, base offsets by `i`). Mode W
+      forces it on (`br.heroSplit = hero::gSplit || br.whitted`); mode R keeps it opt-in.
+      `wNeedSpp` now trips only on `Layered` + the scalar path. Measured on the Cornell SF10
+      ball (chroma error vs a converged mode-R reference; **absolute mode** — a tone-mapped
+      comparison is invalid, the p99 anchor moves):
+      | estimator | chroma error | render (960×600) |
+      |---|---|---|
+      | de-hero, 1 spp (old) | **36.67 pp** — the flat-green collapse | 0.5 s |
+      | de-hero, 16 spp (the old `wNeedSpp` workaround) | 4.20 pp | 7.1 s |
+      | **split, 1 spp (new)** | **0.80 pp** | **0.9 s** |
+      Unbiased (agrees with de-hero to 0.28–0.52 % at 2048 spp), free on non-dispersive
+      scenes (gyroid mode W bit-identical to v0.107.0). Validation scripts:
+      `scraps/n1_check.py`, `scraps/n1_unbiased.py`.
+
+      <details><summary>original plan</summary>
+
+      *(CPU; the
       highest-value item, and a prerequisite for judging N5.)* Today a Dielectric/ThinFilm/
       Multilayer/Grating/HalfMirror/Fluorescent vertex terminates the secondary wavelengths and
       continues the hero channel alone (each λ refracts differently). Combined with mode W's
@@ -3686,6 +3707,7 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       scene. **Fix:** split the bundle at the de-hero vertex and continue each wavelength on its own
       branch — `hero::gSplit` / `-herosplit` (`src/hero.h`) is the existing prior art for exactly
       this. Then drop the dielectric terms from `wNeedSpp`. Logged as DEBT in `known-issues.md`.
+      </details>
 - [ ] **N2. Deterministic glossy-lobe lattice.** *(CPU.)* Measurement showed that on rough gold the
       residual error is dominated by the **glossy lobe**, not by missing diffuse GI — mode W currently
       collapses a rough specular to the single mirror direction. **Do not fork** the lobe (N^depth

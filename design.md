@@ -179,6 +179,22 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `keepBundle` do **not** de-hero (their outgoing direction ignores λ). At
   `nUp == 1` every one of these is the scalar code verbatim.
 
+  **Split-at-dispersion (`heroSplit`)** mirrors the forward tracer's policy: the bounce
+  loop is factored out as **`radianceHeroLoop`** (`radianceHero` is now a thin wrapper
+  that seeds `thr[i] = 1`), so at a Dielectric / ThinFilm / Multilayer / Grating /
+  HalfMirror / Fluorescent vertex each secondary λ can **re-enter the loop** with `C == 1`
+  from bounce `b+1`, carrying its own Snell/grating direction, its own `MediumStack` copy
+  and its own throughput. Two things make it exact rather than approximate: (1) each
+  sub-path's radiance lands in the parent's **own `L[i]` slot** — `Lout` is *assigned*, so
+  the parent accumulates per-λ rather than into the hero — and (2) there is **no ×C boost
+  anywhere**, since the caller already divides by C. `secAlive = false` on the sub-paths
+  bounds recursion to one level and cost to linear in C. The emitter-SPD cache is
+  re-pointed **zero-copy**: the table is emitter-major with stride C (`spd[e*C + i]`), so
+  offsetting the base pointer by `i` while *keeping* the stride makes `spd[e*C + 0]` read
+  emitter `e` at λ_i. `Renderer::heroSplit` default-initialises from `hero::gSplit`
+  (`-herosplit`), and `main.cpp`'s backward worker ORs in `br.whitted` — mode `W` has no
+  choice (see below), mode `R` averages the collapse away so it stays opt-in.
+
   **Mode `W` (the `whitted` flag)** shares this whole walk and swaps only the
   *estimators*, which is why it is a flag and not a second tracer. Every stochastic
   decision on the path gets a deterministic replacement: the area-light NEE point
@@ -194,10 +210,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   that a dielectric was the one estimator left tossing a coin, and at `-spp 1` a coin flip
   per pixel is not noise but salt-and-pepper — glass rendered as a speckled blob); the
   wavelength and the subpixel offset come off radical-inverse sequences instead of the rng.
-  Note the one thing still NOT free at 1 spp: a dielectric **de-heroes** the path onto a
-  single wavelength, and since the λ lattice is shared by every pixel, at 1 spp the whole
-  frame de-heroes onto the *same* wavelength and every dispersive object is strongly
-  mistinted (needs ~16 spp; see known-issues). It implies
+  Glass is deterministic too, because mode `W` forces **`heroSplit`** on (see below): a
+  dispersive vertex fans the bundle into C monochromatic sub-paths rather than de-hero'ing
+  onto one λ. That is not an optimisation here but a correctness requirement — the λ
+  lattice is shared by every pixel, so de-hero'ing would collapse the *whole frame* onto
+  the *same* wavelength and mistint every dispersive object (measured 36.7 pp of chroma
+  error on a Cornell SF10 ball; splitting gives 0.80 pp at 1 spp, beating 16 stochastic
+  passes' 4.20 pp at 7.9× the speed). It implies
   `directOnly`, with `ambient` (a flat term at each diffuse vertex) as the GI
   stand-in — pre-scaled by `Scene::ambientRef()` so the CLI value is dimensionless.
 
@@ -918,10 +937,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   received, not the frame's) and the locked anchor, then spliced into `wImg`. `wFilm`
   accumulates, so it is cleared per pose. When a pass completes the viewer stops — a
   bundle-only scene is exact at 1 spp — *unless* `wNeedSpp`, which is set when the scene
-  contains a de-heroing material (Dielectric/ThinFilm/Multilayer/Grating/HalfMirror/
-  Fluorescent) or the scalar path is in use at all (`heroC <= 1`, media, GRIN, lens); then it
-  keeps adding passes to `kWSppCap` (16) to resolve the wavelength collapse those materials
-  cause (see known-issues). Because the viewer's preview IS mode W, an `-explore` run also
+  contains a `Layered` material or the scalar path is in use at all (`heroC <= 1`, media,
+  GRIN, lens); then it keeps adding passes to `kWSppCap` (16) to resolve the wavelength
+  collapse those cases still cause. The *dispersive* materials
+  (Dielectric/ThinFilm/Multilayer/Grating/HalfMirror/Fluorescent) used to be on that list
+  and no longer are, because `heroSplit` resolves them geometrically at 1 spp; `Layered`
+  stays because its λ-dependence is in the branch *decision*, not the direction, so there
+  is nothing to split on. Because the viewer's preview IS mode W, an `-explore` run also
   honours mode-W-only settings that would otherwise be rejected: `wPreview` in `main.cpp`
   widens the hero bundle and spares `-gi` from the "needs `-mode W`" rejection.
   The older **path-traced preview** stage uses the fast RGB backward tracer:

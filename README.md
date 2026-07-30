@@ -342,15 +342,18 @@ luminaire occludes the ambient sky, which is what you want, but it does mean `-g
 (the GPU backward megakernel keeps the stochastic path). Rough glossy metal renders
 sharper than it really is, because one mirror ray can't spread a lobe. A half-mirror or
 layered coat picks its dominant branch instead of forking, and a pattern-driven material
-mix hard-thresholds instead of dithering. **Glass needs `-spp` in this mode — it is the one
-thing that isn't free at 1 spp.** A dielectric is *dispersive*, so the path can no longer
-carry the whole hero bundle at once: it collapses onto a single wavelength. Mode `W`'s
-wavelength lattice is a function of the sample index alone (that is what makes it
-noise-free), so at `-spp 1` every pixel picks the *same* wavelength and the whole glass
-object comes out strongly mistinted — a Cornell SF10 ball renders flat green. It is not
-wrong, just under-sampled spectrally: by `-spp 16` the ball is neutral with correct
-dispersion fringes at the rim. So preview glass at `-spp 8`–`16` (the interactive `T`
-preview does this automatically — see `-explore`). `-gi` is one bounce only, terminated on
+mix hard-thresholds instead of dithering. **Glass is free at 1 spp** — mode `W` always
+**splits the hero bundle at a dispersive vertex** (see `-herosplit`), fanning it into one
+monochromatic sub-path per wavelength so each λ refracts along its own direction and lands
+in its own slot. It has to: the alternative policy (terminate the secondaries, boost the
+hero) is fine for a stochastic mode, but mode `W`'s wavelength lattice is a function of the
+sample index alone — that is what makes it noise-free — so at `-spp 1` *every pixel* would
+collapse onto the *same* wavelength and the whole glass object would come out strongly
+mistinted (a Cornell SF10 ball used to render flat green: **36.7 pp** of chroma error).
+Splitting brings that to **0.80 pp** at 1 spp, better than 16 stochastic passes managed
+(4.20 pp) and **7.9× faster**, and costs nothing on scenes without dispersive glass. A
+`layered` coat still picks its branch per-bundle rather than per-λ, so a *strongly*
+λ-dependent coat thickness can still tint at 1 spp. `-gi` is one bounce only, terminated on
 the `-ambient` tail — it is not a substitute for a converged render. All of these are
 tracked in `known-issues.md`.
 When you want the truth, that's what `R`/`D`/`U` are for.
@@ -684,7 +687,7 @@ that converges to the same physical image.
 | `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
 | `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
 | `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
-| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy over-sharpened, glass needs `-spp 8`–`16` for its colour, CPU only |
+| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy over-sharpened, CPU only |
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
 | `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / spot / env lights |
@@ -1438,8 +1441,11 @@ second:**
   the split is linear, not exponential (once monochromatic a sub-path never re-splits) and
   is paid only by the photons that actually reach the glass, so it costs just **1.11×** per
   photon there. It stays opt-in because that ratio is scene-dependent: a scene that is
-  mostly glass pays much more of it. CPU forward modes `A`/`B`/`C` and the `M`/`S` photon
-  deposit today; the backward tracer and the GPU can adopt the same flag later.
+  mostly glass pays much more of it. CPU forward modes `A`/`B`/`C`, the `M`/`S` photon
+  deposit, and the CPU backward tracer (`R`) honour the flag today; the GPU can adopt it
+  later. **Mode `W` always splits, flag or no flag** — its λ lattice is shared by every
+  pixel, so terminating the secondaries would mistint the *whole frame* rather than add
+  noise. Splitting is what makes glass come out right at `-spp 1` there.
 - **Dispersion — colours actually splitting** through a prism / lens / water. Only
   the single-λ (ours) and hero-wavelength (PBRT-v4, Mitsuba 3) schemes get this right;
   co-sampled spectral (PBRT-v3, Mitsuba 0.x) and every RGB pipeline cannot.

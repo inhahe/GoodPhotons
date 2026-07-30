@@ -56,7 +56,42 @@ reading was the direct-only wall being dark, not the glass being bright.
 
 The one real residue is **hue**, and it is the wavelength issue below, not the interface.
 
-### DEBT (2026-07-29, v0.107.0): mode `W` renders dispersive materials at ONE wavelength per sample
+### FIXED (2026-07-29, v0.108.0): mode `W` renders dispersive materials at ONE wavelength per sample
+
+**Fixed by split-at-dispersion in the backward tracer** (`BackwardRenderer::heroSplit`,
+`radianceHeroLoop` in `src/backward.h`; mode `W` enables it unconditionally, mode `R` keeps it
+opt-in via `-herosplit`). At a dispersive vertex the bundle now fans into C monochromatic
+sub-paths, each refracting along its own Snell direction and accumulating into **its own**
+`L[i]` slot, instead of terminating the secondaries and boosting the hero ×C.
+
+Measured on `scenes/cornell` (glass sphere region, chroma = each channel's fraction of the
+total, so brightness is normalised out and only the *tint* is compared, against a 4096-spp
+`-direct-only` mode-R reference):
+
+| estimator | chroma error | render (960×600) |
+|---|---|---|
+| de-hero, 1 spp (old) | **36.67 pp** — the flat-green collapse | 0.5 s |
+| de-hero, 16 spp (the old `wNeedSpp` workaround) | 4.20 pp | 7.1 s |
+| **split, 1 spp (new)** | **0.80 pp** | **0.9 s** |
+
+So the fix is **5× more accurate than the 16-pass workaround at 7.9× less cost**, and the
+workaround is gone (`wNeedSpp` no longer lists the dispersive materials). The split costs ~1.8×
+a single de-hero pass on this scene (C× traversal *past* the glass only) and is free on a scene
+with no dispersive material — `_room_of_gyroids_f12` mode W is bit-identical to v0.107.0.
+
+Verified **unbiased**, not just prettier: de-hero and split are two estimators of one integral,
+and on `scenes/absolute.ftsl` (fixed gain 6, so no per-image auto-exposure) at 2048 spp they
+agree to **+0.33 / +0.28 / +0.52 %** per channel against a ~2.2 % noise floor. *Do this
+comparison in absolute mode:* the same run tone-mapped with per-image auto-exposure reads a
+spurious "+5.4 % bias", because the split resolves the dispersive caustic geometrically and
+moves the p99 anchor by ~1.8× — the identical trap the mode-U validation notes in `TODO.md`.
+
+Still de-heroes (so still needs multiple passes in mode `W`): **`Layered`**, whose coat Fresnel
+is a λ-dependent *decision* rather than a λ-dependent direction, so the split does not apply;
+and the scalar, bundle-free path taken for participating media / GRIN / `-heroc 1`. `wNeedSpp`
+now tests for exactly those.
+
+<details><summary>Original entry (kept for the diagnosis, which the fix is built on)</summary>
 
 The `R−G = −163.6` above: at `-spp 1` a glass ball comes out violently green. A dielectric
 (or thin film / multilayer / grating / half-mirror / fluorescence) **de-heroes** the path —
@@ -85,6 +120,8 @@ to evaluate `-gi` on `scenes/cornell` compared mode-`W` frames against a mode-`R
 reference where the mistinted sphere was the single largest error in the frame, swamping the
 interreflection signal the sweep was trying to measure. `scraps/cor_gi.ftsl` (all-diffuse,
 no dielectric, no glossy) exists specifically to dodge this and the glossy entry below.
+
+</details>
 
 ### DEBT (2026-07-29, v0.105.0): mode `W` over-sharpens rough glossy metal
 

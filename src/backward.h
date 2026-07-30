@@ -145,6 +145,22 @@ struct BackwardRenderer {
     bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating
     int  heroC = hero::kHeroC;  // wavelengths bundled per camera path when hero is on
                                 // (runtime -heroc N, clamped to [1, kHeroMax]; 1 = single-λ)
+    // SPLIT-AT-DISPERSION (-herosplit; hero.h's alternative to de-hero'ing). At a
+    // dispersive vertex, fan the bundle into C monochromatic sub-paths -- each refracting
+    // along its OWN Snell direction -- instead of terminating the secondaries and boosting
+    // the hero ×C. Both estimators are unbiased; this one resolves the chromatic spread
+    // GEOMETRICALLY, at C× the traversal work past the split (linear, not exponential: a
+    // sub-path is already monochromatic and so can never split again).
+    //
+    // It matters far more here than in the forward tracer, and specifically for mode W.
+    // Mode W's λ lattice is SHARED by every pixel (that shared-offset property is exactly
+    // what makes it noise-free), so when de-hero collapses the bundle to the hero the
+    // ENTIRE FRAME collapses onto ONE wavelength and every dispersive object comes out
+    // strongly mistinted -- an error no amount of spatial sampling fixes, because it is not
+    // noise. Splitting keeps all C wavelengths live through the glass, so mode W is
+    // colour-correct on a dielectric at -spp 1. Hence `whitted` turns this on by default
+    // (main.cpp); mode R is stochastic and averages the collapse away, so it stays opt-in.
+    bool heroSplit = hero::gSplit;
 
     // Per-sample cache of emitter-SPD evaluations at the path's wavelengths. The
     // wavelengths are fixed for the whole camera path, but every NEE connection
@@ -1119,19 +1135,48 @@ struct BackwardRenderer {
     void radianceHero(const Scene& scene, Ray ray, const double* lamIn,
                       const double* invPdfIn, int C, double* Lout, Pcg32& rng,
                       const SpdCache* spdCache = nullptr, GiCtx gi = GiCtx{}) const {
-        double lam[hero::kHeroMax], invPdf[hero::kHeroMax], thr[hero::kHeroMax], L[hero::kHeroMax];
-        for (int i = 0; i < C; ++i) { lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = 1.0; L[i] = 0.0; }
-        bool secAlive = (C > 1);
+        // A fresh camera/gather bundle: unit throughput, empty medium stack, at bounce 0.
         // A camera ray may see a light directly; a GATHER ray may not -- the vertex it
         // left already NEE'd the direct light, so counting the emitter again here would
         // double it. A specular bounce re-arms this, so gold-bounced light still lands.
-        bool specularArrival = (gi.depth == 0);
-        double contBsdfPdf = 0.0;
+        double thr[hero::kHeroMax];
+        for (int i = 0; i < C; ++i) thr[i] = 1.0;
+        radianceHeroLoop(scene, ray, MediumStack{}, lamIn, invPdfIn, thr, C,
+                         /*secAlive=*/(C > 1), /*specularArrival=*/(gi.depth == 0),
+                         /*contBsdfPdf=*/0.0, /*bounce0=*/0, Lout, rng, spdCache, gi);
+    }
+
+    // Bounce loop for a hero bundle already sitting at (`ray`, `stk`) with
+    // `secAlive ? C : 1` live wavelengths carrying `lamIn[]`/`invPdfIn[]`/`thrIn[]`,
+    // resuming at bounce index `bounce0`. Split out of radianceHero so the `heroSplit`
+    // policy can RE-ENTER it once per monochromatic sub-path that a dispersive interface
+    // fans out (see the dispersive case below) -- the direct twin of the forward tracer's
+    // tracePhotonHeroLoop. Every sub-path is spawned with `secAlive == false` and the split
+    // branch is guarded on `secAlive`, so a sub-path can never split again: recursion is at
+    // most one level deep and the per-frame footprint (a MediumStack plus four kHeroMax
+    // double arrays) is bounded.
+    //
+    // `Lout` is ASSIGNED, not accumulated, exactly as before -- a split parent therefore
+    // adds each sub-path's returned radiance into its OWN L[i] slot (see below), which is
+    // what keeps wavelength i's radiance attributed to wavelength i.
+    void radianceHeroLoop(const Scene& scene, Ray ray, MediumStack stk, const double* lamIn,
+                          const double* invPdfIn, const double* thrIn, int C, bool secAlive,
+                          bool specularArrival, double contBsdfPdf, int bounce0,
+                          double* Lout, Pcg32& rng, const SpdCache* spdCache,
+                          GiCtx gi) const {
+        double lam[hero::kHeroMax], invPdf[hero::kHeroMax], thr[hero::kHeroMax], L[hero::kHeroMax];
+        // Copy only the LIVE entries: a monochromatic sub-path spawned by the split fills
+        // only slot 0 of its lamIn/invPdfIn/thrIn, so reading all C would read
+        // indeterminate values (harmless while nUp==1 ignores them, but still UB).
+        const int nLive = secAlive ? C : 1;
+        for (int i = 0; i < nLive; ++i) {
+            lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = thrIn[i]; L[i] = 0.0;
+        }
+        for (int i = nLive; i < C; ++i) { lam[i] = 0.0; invPdf[i] = 0.0; thr[i] = 0.0; L[i] = 0.0; }
         // Gather rays are bounce-capped (see giBounce) so a highly reflective lattice
         // cannot turn one gather direction into a 60-deep ricochet.
         const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
         Renderer mats; mats.diffraction = diffraction;
-        MediumStack stk;                 // dielectric priority (Beer-Lambert uses hero λ)
 
         auto finish = [&]() { for (int i = 0; i < C; ++i) Lout[i] = L[i]; };
         auto deHero = [&]() {            // terminate secondaries, boost hero ×C
@@ -1140,7 +1185,7 @@ struct BackwardRenderer {
             secAlive = false;
         };
 
-        for (int b = 0; b < maxB; ++b) {
+        for (int b = bounce0; b < maxB; ++b) {
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
             Hit h = scene.closestHit(ray);
             double dSurf = h.valid ? h.t : 1e30;
@@ -1338,8 +1383,64 @@ struct BackwardRenderer {
                 case MatType::Grating:
                 case MatType::HalfMirror:
                 case MatType::Fluorescent: {
-                    // Dispersive / wavelength-switching: terminate secondaries, then run
-                    // the shared scalar interaction on the (boosted) hero channel.
+                    // Dispersive / wavelength-switching: the outgoing direction (and, for a
+                    // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
+                    // cannot keep riding one shared direction past this interface.
+                    if (heroSplit && secAlive && nUp > 1) {
+                        // SPLIT-AT-DISPERSION: fan out instead of de-hero'ing. Each secondary
+                        // runs the SAME interaction with its OWN λ -- refracting along its own
+                        // Snell direction / diffracting into its own grating order -- and then
+                        // continues as an independent monochromatic sub-path from this vertex.
+                        // Its radiance lands in L[i], the slot for ITS wavelength, so the
+                        // caller's per-λ cieXYZ splat stays correctly attributed.
+                        //
+                        // No ×C boost anywhere: each of the C wavelengths now carries its own
+                        // unboosted estimate and the caller averages them (Lh[i]/C), whereas
+                        // de-hero boosts the lone survivor to stand in for all C. Both are
+                        // unbiased; this one is simply not collapsed.
+                        for (int i = 1; i < nUp; ++i) {
+                            if (invPdf[i] == 0.0) continue;   // dead secondary (zero-mass λ bin)
+                            // Sub-path state: mutable per-λ copies (interactMaterial takes
+                            // lambda/invPdf by reference -- a fluorescent Stokes shift rewrites
+                            // them) and a private medium stack, since sub-paths diverge here.
+                            double sLam = lam[i], sInv = invPdf[i], sThr = thr[i], sL = 0.0;
+                            bool sSpec = specularArrival;
+                            double sPdf = contBsdfPdf;
+                            MediumStack sStk = stk;
+                            Ray sRay = ray;
+                            // Re-point the emitter-SPD cache at wavelength i's COLUMN. The
+                            // table is emitter-major with stride C (spd[e*C + i]), so offsetting
+                            // the base by i and KEEPING the stride makes the sub-path's
+                            // spd[e*C + 0] read exactly emitter e at λ_i -- zero-copy, and
+                            // matches(&sLam, 1) still validates against lam[i]. Without this the
+                            // cache would silently hand the sub-path the HERO's SPD values.
+                            SpdCache sCache;
+                            const SpdCache* sCp = nullptr;
+                            if (spdCache && spdCache->lam && spdCache->spd && i < spdCache->C) {
+                                sCache.lam = spdCache->lam + i;
+                                sCache.spd = spdCache->spd + i;
+                                sCache.C   = spdCache->C;
+                                sCp = &sCache;
+                            }
+                            if (interactMaterial(scene, m, h, mats, sRay, sLam, sInv, sThr, sL,
+                                                 sSpec, sPdf, sStk, rng, sCp, gi)) {
+                                double sub[hero::kHeroMax];
+                                radianceHeroLoop(scene, sRay, sStk, &sLam, &sInv, &sThr,
+                                                 /*C=*/1, /*secAlive=*/false, sSpec, sPdf,
+                                                 b + 1, sub, rng, sCp, gi);
+                                sL += sub[0];
+                            }
+                            L[i] += sL;      // this wavelength's own estimate, own slot
+                            thr[i] = 0.0;    // it is now that sub-path's business, not ours
+                        }
+                        secAlive = false;    // hero carries on alone, UNBOOSTED
+                        if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0],
+                                              L[0], specularArrival, contBsdfPdf, stk, rng,
+                                              spdCache, gi)) { finish(); return; }
+                        break;
+                    }
+                    // Default policy: terminate secondaries, then run the shared scalar
+                    // interaction on the (boosted) hero channel.
                     deHero();
                     if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0], L[0],
                                           specularArrival, contBsdfPdf, stk, rng, spdCache, gi)) { finish(); return; }
