@@ -660,6 +660,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   renders it; the port is tracked in `known-issues.md`. The preview rasteriser ignores
   `emitPat`, consistent with its existing treatment of `reflectPat`/`transmitPat`.
 
+  **The `emit` slot name is overloaded, and `fluorescent` owns it.** On every other material
+  type `emit` means *self-emission* (`Material::emit` + `isLight = true`, i.e. the surface is a
+  light). On a `fluorescent` it means the **reradiation profile** — the Stokes-shifted emission
+  *shape*, consumed into `fluoEmit`/`fluoEmitSampler` and normalised by its own integral `Mint`
+  at every use site — so a fluorescent surface is never a light. `src/ftsl.h` therefore skips
+  the generic "any material may carry an `emit` spectrum" block for `MatType::Fluorescent`;
+  before v0.113.1 that block ran unconditionally, so a fluorescent's reradiation band was
+  *also* installed as absolute-radiance self-emission and the surface glowed ~4 orders of
+  magnitude too bright on the CPU (and not at all on the GPU, which uploads no per-material
+  emit spectrum) — see `known-issues.md`. `emit_map` is hard-refused on a fluorescent rather
+  than silently ignored, since a reradiation profile is not a surface pattern. A surface that
+  both fluoresces *and* self-emits is expressible as a `mix` of the two materials.
+
   **N-D authored-data tables.** A pattern formula can sample arrays of authored numbers in
   1–4 dimensions, via two sibling datatypes ported from loom's `data.py`/`interp.py`:
   `grid:<name>(c0, …)` reads a **regular lattice** (`PatGrid`, samples in C order with axis 0

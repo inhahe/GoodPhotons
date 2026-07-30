@@ -3729,7 +3729,20 @@ private:
         // emission-on-hit and the Le at an emitter-sampled point — so it is only legal
         // where the two provably agree on (u,v); checkEmitPatSupported (run after the
         // scene is built, when the emitter shapes are known) enforces that.
-        if (find(b, "emit") || find(b, "emit_map")) {
+        // EXCEPT on a `fluorescent` material, where `emit` was already consumed above as the
+        // RERADIATION profile (`fluoEmit` — the Stokes-shifted emission SHAPE, normalised by
+        // its own integral at every use site), not as self-emission. Letting the generic block
+        // also run made every fluorescent surface a self-luminous absolute-radiance light of
+        // its own emission band, which on the CPU tracers put a `gaussian center=560` dye pane
+        // ~8200× above a 0.5-albedo floor's radiance under the same lamp — impossible at
+        // `yield <= 1` — while the GPU (which never uploaded that `emit` slot) rendered only
+        // the elastic base. That is the whole of the CPU/GPU fluorescence divergence.
+        // `emit_map` has no meaning on a fluorescent either, so say so rather than drop it.
+        if (m.type == MatType::Fluorescent) {
+            if (find(b, "emit_map"))
+                fail("a fluorescent material's 'emit' is its reradiation spectrum, not surface "
+                     "emission, so 'emit_map' is not supported here");
+        } else if (find(b, "emit") || find(b, "emit_map")) {
             m.emit = patternedSpectrumParam(b, "emit", "emit_map", m.emitPat,
                                             constantSpectrum(0.0));
             m.isLight = true;

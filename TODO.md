@@ -3915,15 +3915,28 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
           post-fix they are smooth and that panel goes black over them. The fluorophore's per-device
           speckle is gone as well (`png/fluo_W2_ab.png` — the dye pane is a perfectly flat region at
           `-spp 1` on *both* devices).
-          **Found a separate, pre-existing bug on the way:** a `fluorescent` surface's POWER
-          diverges wildly between CPU and GPU (~5 orders of magnitude on a scene whose every other
-          pixel is bit-identical; CPU ≈ 8 200× a 0.5-albedo floor's radiance, which is impossible at
-          `yield 0.9`, while the GPU contributes essentially *no* fluorescence at all). Not a mode-W
-          problem — it reproduces in mode `R` at 512 spp — so the A/B above deliberately runs on the
-          dye-free `n3d2_grate.ftsl`. Logged as its own open BUG in `known-issues.md` with the
-          minimal repro (`scraps/fluo_min_area.ftsl`) and the suspect list
-          (`bakeSpec`'d `fluoEmitSpec` vs the host's continuous `m.fluoEmit(λ)`; the host's
-          `spdCache` possibly matching at the wrong λ inside `neeLight`).
+          **Found a separate, pre-existing bug on the way — since FIXED in v0.113.1:** a
+          `fluorescent` surface's POWER diverged wildly between CPU and GPU (~5 orders of magnitude
+          on a scene whose every other pixel is bit-identical; CPU ≈ 8 200× a 0.5-albedo floor's
+          radiance, which is impossible at `yield 0.9`, while the GPU contributed essentially *no*
+          fluorescence at all). Not a mode-W problem — it reproduced in mode `R` at 512 spp — which
+          is why the A/B above deliberately ran on the dye-free `n3d2_grate.ftsl`. The cause was in
+          neither device's reradiation code but in **`src/ftsl.h`**: the generic "any material may
+          carry an `emit` spectrum" block ran unconditionally *after* the per-type parse, so a
+          `fluorescent`'s `emit` — already consumed as its Stokes-shifted **reradiation** profile —
+          was installed a second time as absolute-radiance **self-emission** with `isLight = true`.
+          The CPU honours that slot (hence a self-luminous 560 nm pane); the GPU uploads no
+          per-material emit spectrum at all (hence elastic-only) — exactly the observed
+          opposite-direction split. Fix: skip the generic block for `MatType::Fluorescent`, and
+          hard-refuse `emit_map` there rather than drop it silently. After the fix the minimal bed
+          is **100.000 % bit-identical** across devices and the *full* `n3d2_gpu.ftsl` bed A/Bs at
+          **99.627 % / max |dLuma| 0.144** — so the dye bed no longer needed splitting at all.
+          Two follow-ups are logged as new open items in `known-issues.md`: the fluorescent
+          reradiation channel now contributes ~**zero** (`yield 0.0` ≡ `yield 0.9`, bit-identical),
+          and the GPU still cannot do material emission-on-hit for any non-mesh primitive.
+          *(For the record, the two suspects originally written down —`bakeSpec`'d `fluoEmitSpec`
+          vs the host's continuous `m.fluoEmit(λ)`, and the host's `spdCache` matching at the wrong
+          λ inside `neeLight` — were **both wrong**.)*
 
       <details><summary>original plan</summary>
 

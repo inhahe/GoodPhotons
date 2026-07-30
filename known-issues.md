@@ -5,14 +5,15 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### BUG — OPEN (2026-07-30, v0.113.0): a `fluorescent` surface has WILDLY different power on the CPU and the GPU — and both look wrong
+### BUG — FIXED (2026-07-30, v0.113.0 → v0.113.1): a `fluorescent` surface had WILDLY different power on the CPU and the GPU
 
 Found while building N3d-2's A/B bed. On a scene whose *every other pixel is bit-identical*
-between the devices, a fluorescent pane's radiance differs by ~5 orders of magnitude. This is
-**not** a mode-`W` determinism problem (N3d-2 fixed that; see below) — it reproduces in mode `R`
-at 512 spp, so it is a plain porting/scale bug in the bispectral reradiation term.
+between the devices, a fluorescent pane's radiance differed by ~5 orders of magnitude. This was
+**not** a mode-`W` determinism problem (N3d-2 fixed that; see below) — it reproduced in mode `R`
+at 512 spp. The cause turned out to be neither device's reradiation code but the **scene parser**;
+see the FIXED write-up at the end of this entry.
 
-**Repro** (`scraps/fluo_min_area.ftsl` — deliberately minimal: floor + back wall + ONE dye pane
+**Repro as originally observed** (`scraps/fluo_min_area.ftsl` — deliberately minimal: floor + back wall + ONE dye pane
 + ONE area light, absolute exposure so neither image is auto-anchored):
 
 ```
@@ -36,24 +37,138 @@ Backing the tone map out (sRGB transfer ÷ the reported absolute gain, and re-re
   `reflect 0.05` base lobe alone would give on a vertical pane under an overhead light: the
   fluorescent channel contributes essentially **nothing** on the device.
 
-So the two devices are wrong in opposite directions and neither is trustworthy. Ratio ≥ 30× on the
-tone-mapped codes with either light type (`fluo_min_area.ftsl` / `_spot`), and the same
-236.589-code block-luma gap appears at the *same* block at 1 spp and at 256 spp, which is what
-proves it systematic rather than noise.
+Ratio ≥ 30× on the tone-mapped codes with either light type (`fluo_min_area.ftsl` / `_spot`), and
+the same 236.589-code block-luma gap appeared at the *same* block at 1 spp and at 256 spp, which is
+what proved it systematic rather than noise.
 
-**Ruled out:** the `Mint` normalisation and `fluoroWeights` (identical on both sides).
-**Remaining suspects**, in order:
-1. `bakeSpec(m.fluoEmit, d.fluoEmitSpec)` + `specLookup` vs the host's continuous
-   `m.fluoEmit(lambda)` — does the baked table reproduce a `gaussian center=560 sigma=25`, or is
-   it (say) normalised differently / zero outside a narrower range? A GPU reading ~0 smells like
-   a table that is empty or mis-indexed.
-2. The host's `spdCache` in `neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn, rng, spdCache)` —
-   if the cache matches on the *outgoing* λ while the NEE is being done at λ_in, the CPU would
-   re-use a light SPD value from the wrong wavelength and could inflate the term arbitrarily.
+**Two suspects were written here originally and BOTH were wrong** — recorded so the dead ends
+aren't re-walked: (1) `bakeSpec(m.fluoEmit, d.fluoEmitSpec)` + `specLookup` diverging from the
+host's continuous `m.fluoEmit(lambda)`; (2) the host's `spdCache` in
+`neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn, rng, spdCache)` matching at the wrong λ. Both
+sides of the reradiation math are in fact identical; the bug was upstream of both.
 
-*First step of the fix:* a direct host-vs-device dump of `fluoEmitSpec` at 5 nm steps against
-`m.fluoEmit(λ)`, and of `invPdfIn`/`rhoIn`/`gOut` at one known λ_in — i.e. find which of the two
-sides moves before changing anything.
+#### FIXED (2026-07-30, v0.113.1) — the parser was making every fluorescent surface a LIGHT
+
+Bisecting the material spec (`scraps/fluo_v_bare.ftsl` / `_absorb` / `_emit` / `_diffuse`) showed
+the trigger was **the presence of an explicit `emit` statement on a `fluorescent` material**, and
+not the fluoro channel at all: `yield 0.0` and `yield 0.9` behaved the same, while deleting the
+`emit` line collapsed the CPU/GPU gap to zero.
+
+Cause, in `src/ftsl.h`: the per-type parse for `fluorescent` (~3649) already consumes `emit` as the
+**reradiation profile** —
+
+```cpp
+m.fluoEmit = spectrumParam(b, "emit", gaussianBand(560.0, 25.0, 1.0));
+```
+
+— but the *generic* "any material may carry an emit spectrum" block further down (~3732) then ran
+for **every** type, unconditionally:
+
+```cpp
+if (find(b, "emit") || find(b, "emit_map")) {
+    m.emit = patternedSpectrumParam(b, "emit", "emit_map", m.emitPat, constantSpectrum(0.0));
+    m.isLight = true;
+}
+```
+
+So the same `emit` statement was installed a *second* time as **self-emission**, and the dye pane
+became a self-luminous absolute-radiance light of its own emission band. That explains the split
+exactly: the CPU tracers honour `m.emit` on hit, so a `gaussian center=560` pane radiated ~8 200 ×
+a 0.5-albedo floor (impossible at `yield <= 1`) and in exactly the observed yellow-green hue; the
+GPU never uploads a per-material emit spectrum at all (see the separate entry below), so it
+rendered only the elastic `reflect 0.05` base — hence "wrong in opposite directions".
+
+The fix makes the generic block skip `Fluorescent`, and *rejects* `emit_map` there rather than
+silently dropping it (a reradiation profile is not a surface pattern):
+
+```cpp
+if (m.type == MatType::Fluorescent) {
+    if (find(b, "emit_map"))
+        fail("a fluorescent material's 'emit' is its reradiation spectrum, not surface "
+             "emission, so 'emit_map' is not supported here");
+} else if (find(b, "emit") || find(b, "emit_map")) { ... }
+```
+
+**Verified** on the minimal bed after the fix — the divergence is gone completely:
+
+| 12 px patch | before CPU | before GPU | after CPU | after GPU |
+|---|---|---|---|---|
+| dye pane | (255.00, 255.00, 0.00) clipped | (9.01, 7.96, 8.06) | (9.01, 7.96, 8.06) | (9.01, 7.96, 8.06) |
+| floor | (84.84, 79.94, 80.59) | (84.84, 79.94, 80.59) | (84.84, 79.94, 80.59) | (84.84, 79.94, 80.59) |
+
+`scraps/n3d2_probe.py` now reports **100.000 % bit-identical, |dLuma| = |dChroma| = 0.000** on
+that scene. Note this fix does *not* silently change any correct scene: only a `fluorescent`
+material with an explicit `emit` was ever affected, and it was unconditionally wrong there.
+(In-tree scenes that do change, correctly: `scenes/_fluo_cornell.ftsl` and
+`scenes/layered.ftsl`'s fluorescent body — their dyes no longer self-glow.)
+
+The full N3d-2 bed — the one whose dye divergence forced the grating-only bed
+`scraps/n3d2_grate.ftsl` to be split out in the first place — now A/Bs clean end-to-end:
+`scraps/n3d2_gpu.ftsl` at `-mode W -spp 1` scores **99.627 % bit-identical, max |dLuma| 0.144 /
+|dChroma| 0.100**, i.e. the same sliver-only agreement as every other bed. The three standing
+regression beds are untouched by the fix (they carry no fluorescent material): n3 99.264 %,
+n3b 99.561 %, n3d 99.697 %, and the grating bed still 99.606 % — all re-measured on the 0.113.1
+binary.
+
+### BUG — OPEN (2026-07-30, v0.113.1): a `fluorescent` material's reradiation channel contributes ~nothing
+
+Surfaced immediately after the parser fix above removed the spurious self-emission that had been
+masking it. On `scraps/fluo_min_area.ftsl` (`absorb shortpass edge=480 slope=0.2 amp=1`,
+`emit gaussian center=560 sigma=25`, `reflect 0.05`), varying `yield` does nothing whatsoever:
+
+```
+yield 0.0 cpu  dye (  9.007,  7.958,  8.062)      yield 0.0 gpu  dye (  9.007,  7.958,  8.062)
+yield 0.9 cpu  dye (  9.007,  7.958,  8.062)      yield 0.9 gpu  dye (  9.007,  7.958,  8.062)
+```
+
+— bit-identical, on **both** devices, and equal to what a plain `type diffuse reflect 0.05` pane
+reads. So the whole bispectral term is worth ≈0.00–0.02 codes out of 9.
+
+That is very unlikely to be right. A bb6500 illuminant puts roughly 30 % of its 360–830 nm power
+below the 480 nm absorption edge, so at `yield 0.9` the *effective reradiation albedo* should be on
+the order of 0.27 — about **5×** the elastic 0.05 lobe, i.e. the dye should dominate its own
+appearance, not vanish into it.
+
+**Ruled out:** the λ_in NEE weight. `scene.invPdfLambda(λ) = emitG / g(λ)` with
+`emitG = emitSampler.integral` (`src/scene.h` ~1351), which is exactly `1/pin × emitG` for the
+`pin` that `emitSampler.sample`/`sampleAt` returns — so `invPdfIn = scene.invPdfLambda(lambdaIn)`
+is consistent and cannot be the cancelling factor.
+
+**Next probes**, in order:
+1. Does `fluoroWeights(m, lambdaIn, rhoIn, aEffIn)` (`src/render.h`) return a non-trivial
+   `aEffIn` for that `shortPass` at a λ_in actually drawn from a bb6500 `emitSampler`? If `aEffIn`
+   comes back ~0 the absorption edge / slope convention is the bug.
+2. Is `gOut = (m.fluoEmit(lambda) / Mint) * invPdfLambda` (`backward.h` ~938) ever evaluated at a
+   λ_out *inside* the 560 ± 25 nm band? With only 8 hero wavelengths per sample a `sigma=25` band
+   can simply be missed by the λ lattice — which would make this a mode-`W`/hero-sampling gap
+   rather than a weight bug, and would show up as "works at high `-spp`, zero at 1 spp".
+3. Whether the term is being added at all: `L += thr * gOut * neeLight(...)` sits inside the
+   `MatType::Fluorescent` case, which mode `W` reaches only if the dye pane is actually classified
+   as fluorescent by then (confirm `m.type` survives, e.g. that no earlier branch claims it).
+
+### DEBT — OPEN (2026-07-30, v0.113.1): the GPU cannot do material emission-on-hit at all
+
+`src/render_cuda.cu` ~608 notes plainly that *"DMaterial carries no emit spectrum"*. Only meshes
+get registered as emitters (via `addMesh`), so any **non-mesh primitive** (a `quad`, `sphere`,
+`box`, …) bound to a material with an `emit` spectrum is a visible light on the CPU and a black /
+elastic-only surface on the GPU. This is a general CPU-vs-GPU divergence, not specific to
+fluorescence — it is simply how the fluorescence bug above became visible as a *device* split.
+
+Proper fix: bake a per-material emit spectrum into `DMaterial` (same `bakeSpec` treatment the other
+spectra get) and honour it on hit in `bkInteract`, plus register emissive non-mesh primitives with
+the device light list so NEE can see them too. Until then, emissive non-mesh geometry should
+either be documented as CPU-only or rejected at upload time with a clear message rather than
+silently rendering differently.
+
+### DEBT — OPEN (2026-07-30, v0.113.1): `Fluorescent`'s `neeLight` calls omit the `gi` argument
+
+`src/backward.h` ~927 and ~953 call `neeLight(scene, h, rho…, invPdf…, lambda…, rng, spdCache)`
+without the trailing `gi` that the `Diffuse` (~1019) and `DiffuseTransmit` (~986/990) cases pass.
+`neeLight` uses `gi` to pick the shadow-ray stratification grid, so at a `-gi` gather vertex a
+fluorescent surface pays `lightGrid²` shadow rays instead of `giGrid²` — wasted work and a
+different (needlessly fine) stratification than its neighbours. Fix is a one-word addition to
+both call sites, but it changes the sample pattern, so it needs an A/B re-baseline of the
+fluorescence beds and should ride along with the reradiation investigation above.
 
 ### BUG — FIXED (2026-07-29 → 2026-07-30, v0.111.0 → v0.113.0): mode `W` was still STOCHASTIC at grating / fluorescent vertices
 
