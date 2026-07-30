@@ -310,10 +310,42 @@ struct BackwardRenderer {
         return (double)i * (1.0 / 18446744073709551616.0);
     }
 
-    static double radicalInverseB(unsigned base, uint64_t i) {
+    // DIGIT-SCRAMBLED radical inverse (Faure's fix for high-dimensional Halton), needed by
+    // every lattice below that uses a LARGE base. A plain radical inverse in base b returns
+    // exactly i/b for i < b, so its first N points cover only the prefix [0, N/b) of the unit
+    // interval — well distributed *within* that prefix and blind to the rest. With b = 61 that
+    // means a 16-spp preview never leaves the first quarter of the sequence's range. That is
+    // not academic: it made a `fluorescent` dye whose absorption edge sits at 480 nm contribute
+    // EXACTLY NOTHING until `-spp 64` (its λ_in coordinate was pinned to [0.5, 0.75], i.e. to
+    // wavelengths well past the edge), and it skewed every `glossy` lobe towards its mirror
+    // direction until `-spp 13`.
+    //
+    // The fix is to permute the DIGITS: r = Σ π(dₖ) b^-(k+1). Any bijection π of {0..b-1}
+    // leaves the sequence a permutation of the same b-point grid, so it is exactly as
+    // low-discrepancy asymptotically, but the *order* the grid is visited in is scattered
+    // instead of monotone — N points now spread over the whole interval for any N.
+    //
+    // π here is multiplicative, π(d) = (d·m) mod b with m ≈ b/φ (golden ratio). That needs no
+    // permutation tables (so the device twin is trivially bit-identical), is a bijection for
+    // every prime b (gcd(m, b) = 1 since 0 < m < b), spreads consecutive digits about as
+    // evenly as a 1-D sequence can, and — the load-bearing property — satisfies **π(0) = 0**,
+    // so `radicalInverseScr(b, 0) == 0` exactly, in every base. Every "sample 0 is the
+    // canonical outcome" contract below (mirror direction, specular grating order, median λ)
+    // therefore survives untouched, and only spp > 1 changes.
+    static unsigned goldenDigitMul(unsigned base) {
+        // round(base / φ); φ⁻¹ = 0.6180339887498949. Clamped to a valid multiplier for the
+        // degenerate small bases (b = 2 gives 1, i.e. the identity — base 2 needs no scramble).
+        unsigned m = (unsigned)((double)base * 0.6180339887498949 + 0.5);
+        return (m == 0u || m >= base) ? 1u : m;
+    }
+    static double radicalInverseScr(unsigned base, uint64_t i) {
+        const unsigned mul = goldenDigitMul(base);
         const double invB = 1.0 / (double)base;
         double f = invB, r = 0.0;
-        while (i) { r += (double)(i % base) * f; i /= base; f *= invB; }
+        while (i) {
+            r += (double)((unsigned)(i % base) * mul % base) * f;
+            i /= base; f *= invB;
+        }
         return r;
     }
     // Cranley-Patterson rotation by 1/2, so that sample 0 of every sequence lands dead
@@ -335,11 +367,11 @@ struct BackwardRenderer {
     // gets sharper, never less grainy, because it was never grainy.
     static void whittedSample(uint64_t idx, double& u, double& v) {
         u = rot05(radicalInverse2(idx));
-        v = rot05(radicalInverseB(3, idx));
+        v = rot05(radicalInverseScr(3, idx));
     }
     // The bundle's / scalar path's base wavelength coordinate; a third, decorrelated
     // radical inverse so λ placement does not lock to the subpixel position.
-    static double whittedLambdaU(uint64_t idx) { return rot05(radicalInverseB(5, idx)); }
+    static double whittedLambdaU(uint64_t idx) { return rot05(radicalInverseScr(5, idx)); }
 
     // Deterministic ROUGH-SPECULAR direction for the Whitted preview: point `sIdx` of a
     // fixed 2-D lattice on the power-cosine lobe around `mdir`, instead of the lobe's single
@@ -362,12 +394,15 @@ struct BackwardRenderer {
     // Each bounce depth takes its own prime pair so two glossy vertices on one path are not
     // driven by the same 1-D sequence -- which would correlate their offsets and fold a
     // double-bounce lobe into a line. Bases 2/3 are the subpixel lattice, 5 the wavelength,
-    // 7/11 the gather, so these start at 13.
+    // 7/11 the gather, so these start at 13. Those bases are all LARGER than a typical preview's
+    // `-spp`, which is exactly why they go through the digit-SCRAMBLED radical inverse: unscrambled,
+    // base 13 pinned u1 to [1 - spp/13, 1] and kept the lobe hugging its mirror direction until
+    // `-spp 13`.
     static Vec3 whittedGlossyDir(const Vec3& mdir, double roughness, uint64_t sIdx, int bounce) {
         static const unsigned kBases[4][2] = {{13, 17}, {19, 23}, {29, 31}, {37, 41}};
         const unsigned* pb = kBases[bounce & 3];
-        const double u1 = 1.0 - radicalInverseB(pb[0], sIdx);   // 1 at sIdx 0 => mirror
-        const double u2 = radicalInverseB(pb[1], sIdx);
+        const double u1 = 1.0 - radicalInverseScr(pb[0], sIdx);   // 1 at sIdx 0 => mirror
+        const double u2 = radicalInverseScr(pb[1], sIdx);
         return glossyDirUV(mdir, roughness, u1, u2);
     }
 
@@ -384,18 +419,31 @@ struct BackwardRenderer {
     // base -- selects the specular order m = 0. That is the exact analogue of
     // whittedGlossyDir's "sample 0 is the mirror direction": a 1-spp preview shows the
     // undiffracted image, and extra spp fan the spectrum out into the higher orders.
+    // The scramble is what makes that fan-out *gradual*: unscrambled, base 43 confined u to
+    // [0, spp/43), so the higher orders arrived in a lump only once `-spp` passed the base.
     static double whittedOrderU(uint64_t sIdx, int bounce) {
         static const unsigned kBases[4] = {43, 47, 53, 59};
-        return radicalInverseB(kBases[bounce & 3], sIdx);
+        return radicalInverseScr(kBases[bounce & 3], sIdx);
     }
     // Deterministic Stokes-shift EXCITATION wavelength coordinate for the Whitted preview.
     // Unlike a grating order there is no "specular" outcome worth preferring here, so this one
     // IS rot05'd like the other wavelength lattices: sample 0 lands at the MEDIAN of the
     // excitation CDF -- the most representative single λ_in -- instead of at its short-λ
     // extreme, which is what an unrotated u == 0 would pick.
+    //
+    // This dimension is where the unscrambled radical inverse hurt most, and it is why
+    // radicalInverseScr exists: with base 61 and rot05, u was confined to [0.5, 0.5 + spp/61)
+    // for any preview budget below 61 spp, i.e. to the LONG half of the illuminant's CDF. A dye
+    // absorbing only below 480 nm was therefore never excited at all and rendered as its bare
+    // elastic lobe until `-spp 64`, at which point the sequence finally wrapped and the dye
+    // switched on in one step. Scrambled, the same 4 samples straddle the whole CDF.
+    // (Note `-spp 1` still lands on the illuminant median by construction, so a *narrow-band*
+    // dye still needs spp > 1 to appear -- tracked separately as a λ_in importance-sampling
+    // item in known-issues.md, since the real fix there is to draw λ_in from the dye's own
+    // absorption band rather than from the scene illuminant.)
     static double whittedFluoroU(uint64_t sIdx, int bounce) {
         static const unsigned kBases[4] = {61, 67, 71, 73};
-        return rot05(radicalInverseB(kBases[bounce & 3], sIdx));
+        return rot05(radicalInverseScr(kBases[bounce & 3], sIdx));
     }
 
     // Whitted: replace a Russian-roulette survival test with a throughput WEIGHT.
@@ -538,8 +586,8 @@ struct BackwardRenderer {
         // lattice (2,3) nor the wavelength lattice (5)). Every pixel shares them -- the
         // invariant that makes this mode noise-free -- so raising -spp rotates the whole
         // frame's lattice coherently and the banding averages out progressively.
-        const double p1 = rot05(radicalInverseB(7, gi.sIdx));
-        const double p2 = rot05(radicalInverseB(11, gi.sIdx));
+        const double p1 = rot05(radicalInverseScr(7, gi.sIdx));
+        const double p2 = rot05(radicalInverseScr(11, gi.sIdx));
         double acc[hero::kHeroMax];
         for (int i = 0; i < nUp; ++i) acc[i] = 0.0;
         double wSum = 0.0;
@@ -569,8 +617,8 @@ struct BackwardRenderer {
                     GiCtx gi) const {
         const Vec3 ngo = orientedGeoN(h);
         const int n = giDirs * 2;
-        const double p1 = rot05(radicalInverseB(7, gi.sIdx));
-        const double p2 = rot05(radicalInverseB(11, gi.sIdx));
+        const double p1 = rot05(radicalInverseScr(7, gi.sIdx));
+        const double p2 = rot05(radicalInverseScr(11, gi.sIdx));
         double acc = 0.0, wSum = 0.0;
         const GiCtx sub{gi.depth + 1, gi.sIdx};
         for (int j = 0; j < n; ++j) {

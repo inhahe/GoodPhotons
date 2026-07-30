@@ -241,6 +241,26 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   mirror direction" convention as the glossy lobe. `whittedFluoroU` *is* rotated, since no
   excitation λ is privileged that way and the median of the CDF is the better single sample.
   Env NEE is stochastic by deliberate choice on both devices.
+
+  **All of those lattices go through a DIGIT-SCRAMBLED radical inverse** (`radicalInverseScr` /
+  `goldenDigitMul` in `backward.h`, `dRadicalInverseScr` on the device), which is load-bearing
+  rather than cosmetic. A plain radical inverse in base *b* returns exactly `i/b` for `i < b`, so
+  its first *N* points cover only the prefix `[0, N/b)` — and every base above is *larger* than a
+  typical preview's `-spp`. Unscrambled, base 13 kept a glossy lobe hugging its mirror direction
+  until `-spp 13`, base 43 made a grating's higher orders arrive in a lump at `-spp 43`, and base
+  61 pinned the fluorescent λ_in to the long half of the illuminant CDF so a dye absorbing only
+  below 480 nm contributed **exactly nothing** until `-spp 64`, then switched on in one step. The
+  fix is Faure's standard one for high-dimensional Halton: permute the digits,
+  `r = Σ π(dₖ)·b^-(k+1)`. π is multiplicative, `π(d) = (d·m) mod b` with `m = round(b/φ)`, which
+  needs no permutation tables (so the CUDA twin is trivially bit-identical), is a bijection for
+  every prime base, and — the load-bearing property — has **π(0) = 0**, so sample 0 still maps to
+  exactly 0 in every base and every "sample 0 is the canonical outcome" contract above (mirror
+  direction, specular order, median λ, pixel centre) is untouched: all `-spp 1` images are
+  bit-identical across the change, and only `spp > 1` moves. Measured star discrepancy of the
+  first 16 points drops from 0.754 to 0.077 at base 61 and 0.651 to 0.102 at base 43
+  (`scraps/n3e_lattice.py`). What this does *not* fix is that λ_in is drawn from the scene
+  illuminant rather than from the dye's own absorption band, so a narrow-band dye still needs
+  `spp > 1`; that is tracked as its own item in `known-issues.md`.
   The wavelength and the subpixel offset come off radical-inverse sequences instead of the rng.
   Glass is deterministic too, because mode `W` forces **`heroSplit`** on (see below): a
   dispersive vertex fans the bundle into C monochromatic sub-paths rather than de-hero'ing

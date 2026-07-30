@@ -1175,23 +1175,39 @@ __device__ static double dRadicalInverse2(unsigned long long i) {
     i = ((i & 0x5555555555555555ULL) <<  1) | ((i & 0xaaaaaaaaaaaaaaaaULL) >>  1);
     return (double)i * (1.0 / 18446744073709551616.0);
 }
-__device__ static double dRadicalInverseB(unsigned base, unsigned long long i) {
+// DIGIT-SCRAMBLED radical inverse (Faure's fix for high-dimensional Halton). A plain radical
+// inverse in base b returns exactly i/b for i < b, so its first N points cover only the prefix
+// [0, N/b) -- and every base below is larger than a typical preview's `-spp`. Permuting the
+// digits, r = Σ π(dₖ) b^-(k+1), keeps the same b-point grid (so the same discrepancy) but visits
+// it scattered instead of monotone. π(d) = (d·m) mod b with m ≈ b/φ needs no tables, is a
+// bijection for prime b, and has π(0) = 0 -- so sIdx 0 still maps to exactly 0 in every base and
+// every "sample 0 is the canonical outcome" contract below is untouched.
+// (Host twin: BackwardRenderer::radicalInverseScr / goldenDigitMul. Must stay bit-identical.)
+__device__ static unsigned dGoldenDigitMul(unsigned base) {
+    unsigned m = (unsigned)((double)base * 0.6180339887498949 + 0.5);
+    return (m == 0u || m >= base) ? 1u : m;
+}
+__device__ static double dRadicalInverseScr(unsigned base, unsigned long long i) {
+    const unsigned mul = dGoldenDigitMul(base);
     const double invB = 1.0 / (double)base;
     double f = invB, r = 0.0;
-    while (i) { r += (double)(i % base) * f; i /= base; f *= invB; }
+    while (i) {
+        r += (double)((unsigned)(i % base) * mul % base) * f;
+        i /= base; f *= invB;
+    }
     return r;
 }
 __device__ static double dRot05(double x) { x += 0.5; return (x >= 1.0) ? x - 1.0 : x; }
 __device__ static void dWhittedSample(unsigned long long idx, double& u, double& v) {
     u = dRot05(dRadicalInverse2(idx));
-    v = dRot05(dRadicalInverseB(3, idx));
+    v = dRot05(dRadicalInverseScr(3, idx));
 }
 __device__ static double dWhittedLambdaU(unsigned long long idx) {
-    return dRot05(dRadicalInverseB(5, idx));
+    return dRot05(dRadicalInverseScr(5, idx));
 }
 // Deterministic rough-specular direction: point `sIdx` of a fixed 2-D lattice on the
 // power-cosine lobe. The polar coordinate is COMPLEMENTED (not rot05'd) so sample 0 is
-// exactly the mirror direction, since dRadicalInverseB(b, 0) == 0 in every base. Each
+// exactly the mirror direction, since dRadicalInverseScr(b, 0) == 0 in every base. Each
 // bounce depth takes its own prime pair so two glossy vertices on one path are not driven
 // by the same 1-D sequence. Bases 2/3 are the subpixel lattice, 5 the wavelength, 7/11 the
 // gather, so these start at 13.
@@ -1199,8 +1215,8 @@ __device__ static DVec3 dWhittedGlossyDir(const DVec3& mdir, Real roughness,
                                           unsigned long long sIdx, int bounce) {
     const unsigned kBases[4][2] = {{13, 17}, {19, 23}, {29, 31}, {37, 41}};
     const unsigned b0 = kBases[bounce & 3][0], b1 = kBases[bounce & 3][1];
-    const double u1 = 1.0 - dRadicalInverseB(b0, sIdx);   // 1 at sIdx 0 => mirror
-    const double u2 = dRadicalInverseB(b1, sIdx);
+    const double u1 = 1.0 - dRadicalInverseScr(b0, sIdx);   // 1 at sIdx 0 => mirror
+    const double u2 = dRadicalInverseScr(b1, sIdx);
     return glossyDirUV(mdir, roughness, (Real)u1, (Real)u2);
 }
 // Deterministic DISCRETE-CHOICE coordinate: one scalar off the (sIdx, bounce) lattice for a
@@ -1210,7 +1226,7 @@ __device__ static DVec3 dWhittedGlossyDir(const DVec3& mdir, Real roughness,
 // (Host twin: BackwardRenderer::whittedOrderU. Must stay bit-identical.)
 __device__ static double dWhittedOrderU(unsigned long long sIdx, int bounce) {
     const unsigned kBases[4] = {43, 47, 53, 59};
-    return dRadicalInverseB(kBases[bounce & 3], sIdx);
+    return dRadicalInverseScr(kBases[bounce & 3], sIdx);
 }
 // Deterministic Stokes-shift excitation-wavelength coordinate. Rot05'd like the other
 // wavelength lattices -- there is no "specular" outcome to prefer, so sample 0 should land on
@@ -1218,7 +1234,7 @@ __device__ static double dWhittedOrderU(unsigned long long sIdx, int bounce) {
 // (Host twin: BackwardRenderer::whittedFluoroU.)
 __device__ static double dWhittedFluoroU(unsigned long long sIdx, int bounce) {
     const unsigned kBases[4] = {61, 67, 71, 73};
-    return dRot05(dRadicalInverseB(kBases[bounce & 3], sIdx));
+    return dRot05(dRadicalInverseScr(kBases[bounce & 3], sIdx));
 }
 // Replace a Russian-roulette survival test with a throughput WEIGHT: same expected value,
 // zero variance. False once the path is too dim to matter — POV-Ray's `adc_bailout`.

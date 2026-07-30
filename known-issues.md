@@ -110,7 +110,7 @@ regression beds are untouched by the fix (they carry no fluorescent material): n
 n3b 99.561 %, n3d 99.697 %, and the grating bed still 99.606 % — all re-measured on the 0.113.1
 binary.
 
-### BUG — OPEN (2026-07-30, v0.113.1): a `fluorescent` material's reradiation channel contributes ~nothing
+### BUG — FIXED (2026-07-30, v0.113.1 → v0.114.0): a `fluorescent` material's reradiation channel contributed ~nothing in mode `W`
 
 Surfaced immediately after the parser fix above removed the spurious self-emission that had been
 masking it. On `scraps/fluo_min_area.ftsl` (`absorb shortpass edge=480 slope=0.2 amp=1`,
@@ -132,19 +132,75 @@ appearance, not vanish into it.
 **Ruled out:** the λ_in NEE weight. `scene.invPdfLambda(λ) = emitG / g(λ)` with
 `emitG = emitSampler.integral` (`src/scene.h` ~1351), which is exactly `1/pin × emitG` for the
 `pin` that `emitSampler.sample`/`sampleAt` returns — so `invPdfIn = scene.invPdfLambda(lambdaIn)`
-is consistent and cannot be the cancelling factor.
+is consistent and was never the cancelling factor. `-checkfluoro` also passes, so the reradiation
+primitives (`fluoEmitSampler`, `fluoroWeights`, `fluoroInteract`) are all sound.
 
-**Next probes**, in order:
-1. Does `fluoroWeights(m, lambdaIn, rhoIn, aEffIn)` (`src/render.h`) return a non-trivial
-   `aEffIn` for that `shortPass` at a λ_in actually drawn from a bb6500 `emitSampler`? If `aEffIn`
-   comes back ~0 the absorption edge / slope convention is the bug.
-2. Is `gOut = (m.fluoEmit(lambda) / Mint) * invPdfLambda` (`backward.h` ~938) ever evaluated at a
-   λ_out *inside* the 560 ± 25 nm band? With only 8 hero wavelengths per sample a `sigma=25` band
-   can simply be missed by the λ lattice — which would make this a mode-`W`/hero-sampling gap
-   rather than a weight bug, and would show up as "works at high `-spp`, zero at 1 spp".
-3. Whether the term is being added at all: `L += thr * gOut * neeLight(...)` sits inside the
-   `MatType::Fluorescent` case, which mode `W` reaches only if the dye pane is actually classified
-   as fluorescent by then (confirm `m.type` survives, e.g. that no earlier branch claims it).
+#### FIXED (2026-07-30, v0.114.0) — the (sIdx, bounce) lattice used bases far larger than `-spp`
+
+Bisecting the *material* rather than the code found it: a 2×2×2 sweep of
+{`absorb shortpass edge=480` | `absorb 1.0`} × {`emit gaussian 560/25` | wide} × {`yield 0.9` | `0.0`}
+showed fluorescence working perfectly with a **flat** absorption (dye = (78.9, 134.0, 0.0), a
+vivid green ≈33× the elastic lobe, exactly as the physics predicts) and contributing **exactly
+zero** with the shortpass edge. So the excitation λ_in was simply never landing below 480 nm.
+
+Cause: `whittedFluoroU` (`src/backward.h`) drew its coordinate from a **base-61** radical inverse.
+A plain radical inverse in base *b* returns exactly `i/b` for `i < b`, so its first *N* points
+cover only the prefix `[0, N/b)` — well distributed *within* that prefix and blind to the rest.
+With `rot05` on top, u was pinned to `[0.5, 0.5 + spp/61)`: the **long** half of the illuminant
+CDF, for every preview budget under 61 spp. Measured, the dye switched on in one step:
+
+| `-spp` | 1 | 4 | 16 | **64** | 256 |
+|---|---|---|---|---|---|
+| dye, unscrambled | 10.6, 9.5, 9.6 | 10.4, 9.6, 10.1 | 10.3, 9.8, 10.2 | **53.4, 73.7, 0.0** | 53.9, 73.5, 0.0 |
+| dye, scrambled | 10.6, 9.5, 9.6 | 43.4, 67.7, 0.0 | 48.6, 67.5, 0.0 | 54.0, 75.7, 0.0 | 54.9, 75.4, 0.0 |
+
+This was **not** specific to fluorescence — it hit every lattice with a base above the sample
+count: `whittedGlossyDir`'s bases 13–41 kept a rough lobe hugging its mirror direction until
+`-spp 13`, `whittedOrderU`'s 43–59 made a grating's higher orders arrive in a lump at `-spp 43`,
+and even the `-gi` gather's bases 7/11 confined its two coordinates to one corner.
+
+Fix: **digit-scramble** the radical inverse (Faure's standard fix for high-dimensional Halton) —
+`r = Σ π(dₖ)·b^-(k+1)` with `π(d) = (d·m) mod b`, `m = round(b/φ)`. Any bijection π leaves the
+sequence a permutation of the same *b*-point grid (so the discrepancy is asymptotically
+unchanged) but visits it scattered instead of monotone. The multiplicative form needs no
+permutation tables, so the CUDA twin is trivially bit-identical, and crucially **π(0) = 0**, so
+`radicalInverseScr(b, 0) == 0` in every base and every "sample 0 is the canonical outcome"
+contract (mirror direction / specular order `m = 0` / median λ) survives. Measured star
+discrepancy of the first *N* points (`scraps/n3e_lattice.py`):
+
+| base (role) | N=4 plain → scr | N=16 plain → scr |
+|---|---|---|
+| 13 (glossy u1) | 0.769 → 0.269 | 0.215 → 0.130 |
+| 43 (grating order) | 0.930 → 0.250 | 0.651 → 0.102 |
+| 61 (fluoro λ_in) | 0.951 → 0.254 | 0.754 → 0.077 |
+
+**Verified:** every `-spp 1` image is **bit-identical** to v0.113.1 (the π(0) = 0 anchor — checked
+with `cmp` on all four A/B beds plus the fluorescence bed), and CPU↔GPU still agree at both 1 and
+8 spp on all four beds (max |dLuma| ≤ 0.253 at 1 spp, ≤ 0.139 at 8 spp — every bed *tighter* at 8
+spp than at 1). `png/n3e_montage.png` is the visual proof: the dye pane is black at 1/4/16 spp and
+green only at 64 in the unscrambled column, green from 4 spp on in the scrambled one, with the two
+columns converging (near-black diff) by 64.
+
+### DEBT — OPEN (2026-07-30, v0.114.0): λ_in for fluorescence is drawn from the ILLUMINANT, not from the dye's absorption band
+
+The residue of the bug above, and the reason a narrow-band dye still previews as a bare elastic
+lobe at exactly `-spp 1`. `MatType::Fluorescent` samples its Stokes-shift excitation wavelength
+from `scene.emitSampler` — the scene-wide illuminant CDF — and mode `W`'s 1-spp coordinate is that
+CDF's **median** (~575 nm under bb6500). A dye absorbing only below 480 nm can therefore never be
+excited by the single canonical sample, however good the lattice is.
+
+It is also a plain variance problem in the stochastic modes: with `absorb shortpass edge=480`
+under a broadband lamp, roughly 3 of every 4 λ_in draws land where `fluoAbsorb ≈ 0` and
+contribute nothing, so the dye is ~4× noisier than it needs to be (worse for a narrower dye).
+
+Proper fix: give `Material` a `fluoAbsorbSampler` (the same `EmissionSampler.build` treatment
+`fluoEmitSampler` already gets) and draw λ_in from **absorption × illuminant**, or from the
+absorption band alone with MIS against the illuminant sampler. The weight machinery already
+supports it — `invPdfIn` is just `1/pdf(λ_in)`, so any sampler with a computable pdf drops in
+unbiased. Doing it also makes mode `W`'s 1-spp λ_in the median of the *absorption* band, which is
+the physically meaningful single excitation wavelength and would make the dye correct at 1 spp.
+Needs the CUDA twin (`d.fluoCdf*` already exists for the emission sampler, so an absorption CDF
+is the same upload pattern) and an A/B re-baseline of every fluorescence bed.
 
 ### DEBT — OPEN (2026-07-30, v0.113.1): the GPU cannot do material emission-on-hit at all
 

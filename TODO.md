@@ -3931,12 +3931,53 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
           hard-refuse `emit_map` there rather than drop it silently. After the fix the minimal bed
           is **100.000 % bit-identical** across devices and the *full* `n3d2_gpu.ftsl` bed A/Bs at
           **99.627 % / max |dLuma| 0.144** — so the dye bed no longer needed splitting at all.
-          Two follow-ups are logged as new open items in `known-issues.md`: the fluorescent
-          reradiation channel now contributes ~**zero** (`yield 0.0` ≡ `yield 0.9`, bit-identical),
-          and the GPU still cannot do material emission-on-hit for any non-mesh primitive.
+          Two follow-ups fell out of it: the fluorescent reradiation channel then contributed
+          ~**zero** (`yield 0.0` ≡ `yield 0.9`, bit-identical) — chased down and fixed as **N3e**
+          below — and the GPU still cannot do material emission-on-hit for any non-mesh primitive
+          (logged as open debt in `known-issues.md`).
           *(For the record, the two suspects originally written down —`bakeSpec`'d `fluoEmitSpec`
           vs the host's continuous `m.fluoEmit(λ)`, and the host's `spdCache` matching at the wrong
           λ inside `neeLight` — were **both wrong**.)*
+
+    - [x] **N3e — the mode-`W` lattices used prime bases LARGER than `-spp`, so a low-spp preview
+      explored only a `spp / base` sliver of each sequence.** **DONE (2026-07-30, v0.114.0.)**
+      Found while asking why a `fluorescent` dye contributed exactly nothing after N3d-2's parser
+      fix. A 2×2×2 material sweep (`absorb shortpass edge=480` vs flat × narrow vs wide `emit` ×
+      `yield 0.9` vs `0.0`) showed fluorescence working perfectly with a **flat** absorption —
+      dye = (78.9, 134.0, 0.0), a vivid green ≈33× the elastic lobe, exactly what the physics
+      predicts — and exactly zero with the shortpass edge. So λ_in was simply never landing below
+      480 nm: `whittedFluoroU`'s **base-61** radical inverse returns `i/61` for `i < 61`, and with
+      `rot05` on top that pins u to `[0.5, 0.5 + spp/61)` — the **long** half of the illuminant CDF
+      — for any budget under 61 spp. Measured, the dye switched on in one step at `-spp 64`.
+      Not a fluorescence bug: the same defect skewed `whittedGlossyDir` (bases 13–41 kept a rough
+      lobe hugging its mirror direction until `-spp 13`), `whittedOrderU` (43–59: a grating's
+      higher orders arrived in a lump at `-spp 43`) and the `-gi` gather (7/11).
+      Fix: **digit-scramble** the radical inverse — Faure's standard fix for high-dimensional
+      Halton — `r = Σ π(dₖ)·b^-(k+1)` with `π(d) = (d·m) mod b`, `m = round(b/φ)`. Any bijection π
+      leaves the sequence a permutation of the *same* b-point grid (asymptotic discrepancy
+      unchanged) but visits it scattered instead of monotone. The multiplicative form needs no
+      permutation tables — so `dRadicalInverseScr` is trivially bit-identical to the host — and
+      **π(0) = 0**, which is load-bearing: every "sample 0 is the canonical outcome" contract
+      (mirror direction / specular order m = 0 / median λ / pixel centre) survives untouched.
+      | check | result |
+      |---|---|
+      | dye vs `-spp`, unscrambled | 1: 10.6 · 4: 10.4 · 16: 10.3 · **64: 53.4, 73.7, 0** — off, then on in one step |
+      | dye vs `-spp`, scrambled | 1: 10.6 · **4: 43.4, 67.7, 0** · 16: 48.6 · 64: 54.0 · 256: 54.9 — converging from spp 2 |
+      | star discrepancy, first 16 pts | base 13: 0.215 → **0.130**; base 43: 0.651 → **0.102**; base 61: 0.754 → **0.077** |
+      | every `-spp 1` image | **bit-identical** to v0.113.1 (`cmp`, all four A/B beds + the fluo bed) — the π(0)=0 anchor |
+      | CPU↔GPU, 4 beds @ 1 spp | max \|dLuma\| ≤ 0.253 — unchanged |
+      | CPU↔GPU, 4 beds @ 8 spp | max \|dLuma\| ≤ 0.139 — every bed *tighter* at 8 spp than at 1 |
+      | `-checkfluoro` | PASS (reradiation primitives were never the problem) |
+      `png/n3e_montage.png` is the proof: the dye pane is black at 1/4/16 spp and green only at 64
+      in the unscrambled column, green from 4 spp on in the scrambled one, the two converging by 64.
+      `scraps/n3e_lattice.py` reproduces `radicalInverseScr`/`goldenDigitMul` in Python and prints
+      the discrepancy table (it also asserts the π(0)=0 anchor holds in every base used).
+      **Residue, logged as open debt:** λ_in is drawn from the scene **illuminant**, so mode `W`'s
+      1-spp coordinate is the illuminant median (~575 nm under bb6500) and a dye absorbing only
+      below 480 nm still can't be excited by that single sample. The proper fix is a
+      `fluoAbsorbSampler` on `Material` so λ_in is importance-sampled from absorption × illuminant
+      — which is also a ~4× variance win in the *stochastic* modes, where 3 of 4 λ_in draws
+      currently land where `fluoAbsorb ≈ 0`.
 
       <details><summary>original plan</summary>
 

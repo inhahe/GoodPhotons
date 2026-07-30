@@ -369,8 +369,12 @@ roughness 0.35, mean error falls **19×** from 1 spp to 256 spp; before v0.109.0
 because every sample re-traced the *identical* direction and no budget could fix it). A
 **`grating` wants `-spp` > 1 for the same reason**: at 1 spp it takes the specular order
 `m = 0`, so it previews as a plain mirror with no rainbow, and extra passes fan the spectrum
-out into the higher orders. A
-half-mirror or layered coat picks its dominant branch instead of forking, and a
+out into the higher orders. So does a **`fluorescent` dye with a narrow absorption band**: at 1 spp
+its single excitation wavelength is the *median* of the illuminant's spectrum, which for a dye
+that only absorbs blue is past the absorption edge — the dye previews as its plain elastic
+`reflect` lobe and the glow appears from `-spp 2` on. (Before v0.114.0 it took `-spp 64`, because
+the lattice's base was larger than the sample count; that was a bug, and it is fixed — see below.)
+A half-mirror or layered coat picks its dominant branch instead of forking, and a
 pattern-driven material mix hard-thresholds instead of dithering. **Glass is free at 1 spp** — mode `W` always
 **splits the hero bundle at a dispersive vertex** (see `-herosplit`), fanning it into one
 monochromatic sub-path per wavelength so each λ refracts along its own direction and lands
@@ -385,6 +389,15 @@ Splitting brings that to **0.80 pp** at 1 spp, better than 16 stochastic passes 
 λ-dependent coat thickness can still tint at 1 spp. `-gi` is one bounce only, terminated on
 the `-ambient` tail — it is not a substitute for a converged render. All of these are
 tracked in `known-issues.md`.
+
+Where extra `-spp` *does* buy convergence (the glossy lobe, the grating's orders, the dye's
+excitation λ), it now does so **from the second sample onward**. Each of those lattices uses its
+own prime base so that two vertices on one path aren't driven by the same sequence, and those
+bases (13…73) are larger than any sane preview budget — which used to mean the sequence only
+explored a `spp / base` sliver of its range and the effect arrived in a lump once `-spp` passed
+the base. Since v0.114.0 the sequences are **digit-scrambled** (Faure's fix for high-dimensional
+Halton), so *N* samples spread over the whole range for any *N*, while sample 0 still lands on
+exactly the same canonical value as before — so every `-spp 1` image is unchanged.
 When you want the truth, that's what `R`/`D`/`U` are for.
 
 ```sh
