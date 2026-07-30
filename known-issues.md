@@ -5,6 +5,70 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — OPEN (2026-07-30, v0.115.0): every `layered` surface renders MONOCHROMATIC in mode `W` at 1 spp
+
+Found while re-rendering `scenes/layered.ftsl` after the `shortpass`/`gaussian` parser fix below.
+At `-spp 1` the clearcoated back wall and the iridescent sphere both come out saturated **green**;
+at `-spp 64` the wall is its correct mauve (0.55·rgb(0.80,0.25,0.20) + 0.45·rgb(0.20,0.55,0.80))
+and the sphere is white. Nothing to do with fluorescence — `-no-fluoro` gives a bit-identical
+image, and the wall carries no fluorophore at all.
+
+Cause, `src/backward.h` ~1393, in the hero-bundle loop:
+
+```cpp
+if (mp->type == MatType::Layered) {
+    // Wavelength-dependent Fresnel coat: de-hero and run the scalar layered
+    // handling on the hero channel.
+    deHero(); nUp = 1;
+```
+
+The de-hero is **unconditional**. This is precisely the failure N1 exists to prevent: mode `W`'s
+wavelength lattice is a function of the *sample index alone*, shared by every pixel, so collapsing
+a bundle onto its hero λ at 1 spp collapses the whole frame onto the *same* λ — and the median of
+a bb6500 CDF is ~550 nm, i.e. green. Glass got the fix (split the bundle at the dispersive vertex);
+`layered` never did. The `-spp 64` image is right because 64 samples are 64 different wavelengths.
+
+`README.md` currently understates this as "a *strongly* λ-dependent coat thickness can still tint
+at 1 spp". It is not a tint and it is not conditional on the coat: a plain achromatic
+`reflectance fresnel  ior 1.5` clearcoat mistints just as hard.
+
+**Proper fix:** don't de-hero at all. The layered handling changes neither direction nor wavelength
+when it enters the body — it only computes a scalar coat reflectance `R` and swaps `mp` to a child
+material, then falls through to the ordinary per-λ switch. So evaluate `R` per-λ
+(`layeredCoatReflectance` already takes λ) and apply it as a per-λ throughput weight, keeping all
+`nUp` channels alive. The one genuinely chromatic case is a coat where some λ have `R ≥ 0.5` and
+others don't (mode `W`'s dominant-branch rule) or where the stochastic coin would go different ways
+per λ; that wants the same **split-at-dispersion** treatment `D_THINFILM`/`D_GRATING` get, not a
+de-hero. Note the scalar path (~1226) is already fine — this is purely the hero loop.
+
+### BUG — FIXED (2026-07-30, v0.115.0): `gaussian`/`shortpass` SILENTLY IGNORED positional arguments
+
+`src/ftsl.h` ~1840 parsed these two spectrum heads with
+
+```cpp
+for (size_t k = 1; k < w.size(); ++k) {
+    std::string key, val;
+    if (!splitEq(w[k], key, val)) continue;      // <-- positional args dropped
+```
+
+so only the `key=value` form worked. Both forms are documented and both appear in the checked-in
+scenes, so `scenes/layered.ftsl`'s
+
+```
+absorb shortpass 470 0.2 1.0
+emit   gaussian 600 30 1.0
+```
+
+parsed as `shortPass(0, 0, 1.0)` — a flat 0.5 absorption at every wavelength — and
+`gaussianBand(0, 0, 1.0)`, which is identically **zero** (`sigma = 0` makes `t = ±inf`, so
+`exp(-t²/2) = 0`). That gave the material `fluoEmitSampler.integral == 0`, i.e. `haveFluoro ==
+false`: the fluorescent body of that scene's iridescent sphere had been inert since it was written,
+with no diagnostic.
+
+Fixed by accepting positional args (mixable with keyed ones, which override the slot they name),
+**failing** on an unknown key instead of ignoring it, and rejecting `sigma`/`slope` ≤ 0 — which is
+never a usable band and is far likelier to be a typo than an intent.
+
 ### BUG — FIXED (2026-07-30, v0.113.0 → v0.113.1): a `fluorescent` surface had WILDLY different power on the CPU and the GPU
 
 Found while building N3d-2's A/B bed. On a scene whose *every other pixel is bit-identical*
@@ -181,26 +245,64 @@ spp than at 1). `png/n3e_montage.png` is the visual proof: the dye pane is black
 green only at 64 in the unscrambled column, green from 4 spp on in the scrambled one, with the two
 columns converging (near-black diff) by 64.
 
-### DEBT — OPEN (2026-07-30, v0.114.0): λ_in for fluorescence is drawn from the ILLUMINANT, not from the dye's absorption band
+### DEBT — FIXED (2026-07-30, v0.114.0 → v0.115.0): λ_in for fluorescence is drawn from the ILLUMINANT, not from the dye's absorption band
 
-The residue of the bug above, and the reason a narrow-band dye still previews as a bare elastic
-lobe at exactly `-spp 1`. `MatType::Fluorescent` samples its Stokes-shift excitation wavelength
+The residue of the bug above, and the reason a narrow-band dye still previewed as a bare elastic
+lobe at exactly `-spp 1`. `MatType::Fluorescent` sampled its Stokes-shift excitation wavelength
 from `scene.emitSampler` — the scene-wide illuminant CDF — and mode `W`'s 1-spp coordinate is that
-CDF's **median** (~575 nm under bb6500). A dye absorbing only below 480 nm can therefore never be
-excited by the single canonical sample, however good the lattice is.
+CDF's **median** (~575 nm under bb6500). A dye absorbing only below 480 nm could therefore never be
+excited by the single canonical sample, however good the lattice was.
 
-It is also a plain variance problem in the stochastic modes: with `absorb shortpass edge=480`
-under a broadband lamp, roughly 3 of every 4 λ_in draws land where `fluoAbsorb ≈ 0` and
-contribute nothing, so the dye is ~4× noisier than it needs to be (worse for a narrower dye).
+It was also a plain variance problem in the stochastic modes: with `absorb shortpass edge=480`
+under a broadband lamp most λ_in draws land where `fluoAbsorb ≈ 0` and contribute nothing, while
+the few that land in the band carry a correspondingly large weight.
 
-Proper fix: give `Material` a `fluoAbsorbSampler` (the same `EmissionSampler.build` treatment
-`fluoEmitSampler` already gets) and draw λ_in from **absorption × illuminant**, or from the
-absorption band alone with MIS against the illuminant sampler. The weight machinery already
-supports it — `invPdfIn` is just `1/pdf(λ_in)`, so any sampler with a computable pdf drops in
-unbiased. Doing it also makes mode `W`'s 1-spp λ_in the median of the *absorption* band, which is
-the physically meaningful single excitation wavelength and would make the dye correct at 1 spp.
-Needs the CUDA twin (`d.fluoCdf*` already exists for the emission sampler, so an absorption CDF
-is the same upload pattern) and an A/B re-baseline of every fluorescence bed.
+#### FIXED (2026-07-30, v0.115.0) — a per-material excitation CDF (absorb × illuminant)
+
+`Material` grew an `EmissionSampler fluoInSampler` (`src/scene.h` ~205), built inside
+`Scene::finalizeEmitters()` right after `emitSampler` from the product
+`clamp01(fluoAbsorb(λ)) · g(λ)`, where `g(λ) = Σ_k geomWeight_k · spd_k(λ)` is the same combined
+illuminant `emitSampler` uses. Built there (not at parse time) because it needs the finished
+emitter list, and rebuilt on every `finalizeEmitters()` so `-ignoreenv` — which drops an emitter
+and re-finalises — stays consistent.
+
+`src/backward.h`'s `MatType::Fluorescent` now draws from it and sets `invPdfIn = 1.0 / pin`. That
+second half matters on its own: the old code paired a *bin-discretised* CDF draw with the
+*analytic* `scene.invPdfLambda(λ)` = `emitG / g(λ)`, which is only approximately the reciprocal of
+the pdf the draw actually had. A material whose product integral is 0 (a dye this illuminant
+cannot excite at all) falls back to `scene.emitSampler`, so the branch still terminates.
+
+Device twin: `DMaterial` gained `fluoInCdfOffset` / `fluoInCdfN` / `fluoInCdfStep`, a second slice
+appended to the existing flat `DScene::fluoCdfAll` buffer, plus `dSampleFluoInU()` next to
+`dSampleSceneLambdaU()`. Only one call site needed changing — the second `D_FLUORESCENT` label in
+`render_cuda.cu` is the split-at-dispersion dispatch, which re-enters `bkInteract`.
+
+Unbiasedness is not a matter of taste here and is now asserted: `-checkfluoro` grew a fourth check
+that estimates the reradiation NEE weight `Q·∫aEff(λ)·spd(λ)dλ` **both ways** — from the illuminant
+CDF (the old sampler) and from absorb × illuminant (the new one) — and requires both within 2 % of
+a fine analytic quadrature. Measured: analytic `4.7061e15`, illuminant-sampled `4.7030e15`,
+product-sampled `4.7062e15`. It also reports the variance ratio and the mode-`W` median draw
+(421.7 nm, `aEff` = 0.825 there, i.e. squarely inside the band). The reported variance ratio is a
+best case — this synthetic integrand *is* the new sampler's target, so its estimator is constant
+and only CDF discretisation is left; a real render carries the NEE geometry factor too.
+
+The dye pane of `scraps/fluo_x_sp_narrow_09.ftsl` (`absorb shortpass edge=480`, `yield 0.9`),
+12 × 20 px patch, mode `W` on the CPU:
+
+| `-spp` | v0.113.x | v0.114.0 | v0.115.0 |
+|---|---|---|---|
+| 1 | 10.6 (bare elastic) | 10.6 (bare elastic) | **(47.6, 81.2, 0)** |
+| 2 | 10.6 | (59.9, 93.5, 0) | (48.8, 79.6, 0) |
+| 4 | 10.6 | 43.4 | (57.1, 77.7, 0) |
+| 16 | 10.6 | 48.6 | (58.0, 78.7, 0) |
+| 64 | (53.4, 73.7, 0) | 54.0 | (57.4, 78.4, 0) |
+| 256 | — | 54.9 | (57.5, 78.5, 0) |
+| 4096 | — | — | (57.5, 78.4, 0) |
+
+`yield 0.0` vs `yield 0.9` now differ at `-spp 1` (they were bit-identical up to `-spp 64` in
+v0.113.x — the original symptom). CPU↔GPU at 1 spp still PASSes the block-mean bar on every bed:
+n3 max \|dLuma\| 0.253, n3b 0.144, n3d 0.144, n3d2 0.144, grate 0.144, and the four dye beds
+0.044 / 0.003 / 0.065 / 0.002. All nine physics self-tests PASS.
 
 ### DEBT — OPEN (2026-07-30, v0.113.1): the GPU cannot do material emission-on-hit at all
 

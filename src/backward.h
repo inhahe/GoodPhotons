@@ -987,11 +987,23 @@ struct BackwardRenderer {
                     // the per-pixel luck goes away. This was mode W's last rng draw here; the
                     // elastic/fluoro continuation coin below is unreachable because mode W
                     // implies directOnly, which returns first.
+                    //
+                    // The CDF is the material's own excitation sampler (absorb x illuminant),
+                    // so every draw lands inside the dye's absorption band -- see
+                    // Material::fluoInSampler. Scenes whose dye cannot be excited at all by
+                    // this illuminant have an empty sampler; fall back to the illuminant so
+                    // the branch still terminates (rhoFluo will be 0 anyway).
+                    const EmissionSampler& inS = (m.fluoInSampler.integral > 0.0)
+                                                     ? m.fluoInSampler : scene.emitSampler;
                     lambdaIn = whitted
-                        ? scene.emitSampler.sampleAt(whittedFluoroU(gi.sIdx, gi.bounce), pin)
-                        : scene.emitSampler.sample(rng, pin);
+                        ? inS.sampleAt(whittedFluoroU(gi.sIdx, gi.bounce), pin)
+                        : inS.sample(rng, pin);
                     if (pin > 0.0) {
-                        invPdfIn = scene.invPdfLambda(lambdaIn);
+                        // 1/pdf of the sampler we actually drew from. (Pre-0.115.0 this
+                        // read scene.invPdfLambda(lambdaIn) -- correct only while the
+                        // sampler WAS the illuminant, and even then it mixed an analytic
+                        // emitG/g against a bin-discretised CDF draw.)
+                        invPdfIn = 1.0 / pin;
                         double rhoIn, aEffIn;
                         fluoroWeights(m, lambdaIn, rhoIn, aEffIn);   // shared with forward
                         rhoFluo = aEffIn * m.fluoYield;              // reradiation albedo @lambdaIn

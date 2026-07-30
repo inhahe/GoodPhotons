@@ -300,6 +300,14 @@ struct DMaterial {
     // instead, where M/pdf cancels and these aren't needed).
     double fluoEmitSpec[SPEC_N];
     double fluoMint;
+    // EXCITATION-wavelength CDF slice (device twin of Material::fluoInSampler), also
+    // living inside DScene::fluoCdfAll. Built from absorb(lambda)*g(lambda), so the
+    // backward adjoint's lambda_in always lands inside the dye's absorption band
+    // instead of being thrown at the whole illuminant (a variance reduction in the
+    // stochastic modes, and 1-spp correctness in mode W). fluoInCdfN == 0 => the
+    // product had no mass; fall back to the scene illuminant sampler.
+    int    fluoInCdfOffset, fluoInCdfN;
+    double fluoInCdfStep;
     // Multilayer stack (D_MULTILAYER): per-layer index/extinction/thickness; the
     // substrate is ior + substrateK (spectral). layer 0 is outermost.
     int    layerCount;
@@ -5764,6 +5772,22 @@ __device__ static Real dSampleSceneLambdaU(const DScene& sc, double u, double& p
 __device__ static Real dSampleSceneLambda(const DScene& sc, DRng& rng, double& pdf) {
     return dSampleSceneLambdaU(sc, (double)rng.uniform(), pdf);
 }
+// Sample a fluorophore's EXCITATION wavelength from its own absorb*illuminant CDF
+// (device twin of Material::fluoInSampler.sampleAt, same inverse-CDF core as above).
+// Returns lambda_in and sets pdf per nm; the caller's weight is exactly 1/pdf. Falls
+// back to the scene illuminant when the material has no excitation table, so a dye
+// that this illuminant cannot excite still terminates the branch (rhoFluo == 0).
+__device__ static Real dSampleFluoInU(const DScene& sc, const DMaterial& m,
+                                      double u, double& pdf) {
+    if (m.fluoInCdfN <= 1) return dSampleSceneLambdaU(sc, u, pdf);
+    const double* cdf = sc.fluoCdfAll + m.fluoInCdfOffset;
+    int lo = 0, hi = m.fluoInCdfN - 1;
+    while (lo + 1 < hi) { int mid = (lo + hi) / 2; if (cdf[mid] <= u) lo = mid; else hi = mid; }
+    double c0 = cdf[lo], c1 = cdf[lo + 1];
+    double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
+    pdf = (c1 - c0) / m.fluoInCdfStep;
+    return (Real)(DLMIN + (lo + frac) * m.fluoInCdfStep);
+}
 // invPdfLambda(lambda) = emitG / g(lambda), g(lambda) = sum_k geomWeight_k*SPD_k.
 // In BDPT scope every emitter is an area/sphere light, so geomWeight = area*PI.
 __device__ static double dInvPdfLambda(const DScene& sc, Real lambda) {
@@ -6447,11 +6471,18 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 // so the estimator is untouched and only the per-pixel luck goes away. This is
                 // mode W's last rng draw here; the continuation coin below is unreachable
                 // because mode W implies directOnly, which returns first.
+                //
+                // The CDF is the material's own excitation table (absorb x illuminant), so
+                // every draw lands inside the dye's absorption band -- see
+                // DMaterial::fluoInCdfOffset / Material::fluoInSampler.
                 lambdaIn = whitted
-                    ? dSampleSceneLambdaU(sc, dWhittedFluoroU(gi.sIdx, gi.bounce), pin)
-                    : dSampleSceneLambda(sc, rng, pin);
+                    ? dSampleFluoInU(sc, *mp, dWhittedFluoroU(gi.sIdx, gi.bounce), pin)
+                    : dSampleFluoInU(sc, *mp, (double)rng.uniform(), pin);
                 if (pin > 0.0) {
-                    invPdfIn = dInvPdfLambda(sc, lambdaIn);
+                    // 1/pdf of the sampler we actually drew from (pre-0.115.0: the
+                    // analytic dInvPdfLambda, correct only while that sampler was the
+                    // illuminant).
+                    invPdfIn = 1.0 / pin;
                     double rhoIn = clamp01((double)specLookup(mp->reflect, lambdaIn));
                     double eps   = clamp01((double)specLookup(mp->fluoAbsorb, lambdaIn));
                     double aEffIn = fmin(eps, fmax(0.0, 1.0 - rhoIn));
@@ -10370,6 +10401,19 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.fluoCdfOffset = 0; d.fluoCdfN = 0; d.fluoCdfStep = 1.0;
             for (int s = 0; s < SPEC_N; ++s) d.fluoEmitSpec[s] = 0.0;
             d.fluoMint = 0.0;
+        }
+        // Excitation CDF (absorb x illuminant), appended to the SAME flat buffer with
+        // its own slice. N == 0 makes the device sampler fall back to the illuminant,
+        // matching the host's `fluoInSampler.integral > 0 ? ... : scene.emitSampler`.
+        if (m.type == MatType::Fluorescent && !m.fluoInSampler.cdf.empty() &&
+            m.fluoInSampler.integral > 0.0) {
+            d.fluoInCdfOffset = (int)fluoCdfAll.size();
+            d.fluoInCdfN = (int)m.fluoInSampler.cdf.size();
+            d.fluoInCdfStep = m.fluoInSampler.step;
+            fluoCdfAll.insert(fluoCdfAll.end(), m.fluoInSampler.cdf.begin(),
+                              m.fluoInSampler.cdf.end());
+        } else {
+            d.fluoInCdfOffset = 0; d.fluoInCdfN = 0; d.fluoInCdfStep = 1.0;
         }
         d.roughness = m.roughness;
         d.filmIor = m.filmIor; d.filmThickness = m.filmThickness;

@@ -233,7 +233,7 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   per sample (candidate `i` with probability `w_i/Σw`, throughput unchanged — so it stays unbiased)
   but index it by `(sIdx, bounce)`. `whittedOrderU` (bases 43/47/53/59) and `whittedFluoroU`
   (61/67/71/73) in `backward.h` supply the coordinate, passed to `gratingDiffract` as an optional
-  `const double* whittedU` and to `emitSampler.sampleAt`; every stochastic caller passes `nullptr`
+  `const double* whittedU` and to `fluoInSampler.sampleAt`; every stochastic caller passes `nullptr`
   and is bit-identical. `whittedOrderU` is deliberately *not* `rot05`-rotated, because on the
   whitted path `gratingDiffract` walks its candidates in **descending efficiency**
   (`0, −1, +1, −2, +2, …`) instead of `mm = −M..+M`, so `u == 0` at sample 0 selects the specular
@@ -258,9 +258,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   direction, specular order, median λ, pixel centre) is untouched: all `-spp 1` images are
   bit-identical across the change, and only `spp > 1` moves. Measured star discrepancy of the
   first 16 points drops from 0.754 to 0.077 at base 61 and 0.651 to 0.102 at base 43
-  (`scraps/n3e_lattice.py`). What this does *not* fix is that λ_in is drawn from the scene
-  illuminant rather than from the dye's own absorption band, so a narrow-band dye still needs
-  `spp > 1`; that is tracked as its own item in `known-issues.md`.
+  (`scraps/n3e_lattice.py`).
+
+  **A fluorophore's excitation λ comes from the material's OWN distribution, not the scene's.**
+  `Material::fluoInSampler` (`scene.h`) is an `EmissionSampler` over the product
+  `clamp01(fluoAbsorb(λ)) · g(λ)`, where `g` is the same combined illuminant `Scene::emitSampler`
+  covers. It is built in `finalizeEmitters()` — after the emitter list is final, and rebuilt
+  whenever that list changes (`-ignoreenv`) — and consumed by `backward.h`'s `Fluorescent` case,
+  which then uses `invPdfIn = 1/pdf` from the sampler that actually made the draw rather than the
+  analytic `Scene::invPdfLambda`. Two things follow. In the stochastic modes it is plain
+  importance sampling: draws no longer land above a dye's absorption edge and return zero.
+  In mode `W` it is a *correctness* property, because the single 1-spp coordinate is a CDF
+  median: the median of the illuminant is ~575 nm (past a blue-absorbing dye's edge, so the dye
+  previewed as its bare elastic lobe), whereas the median of absorption × illuminant is 422 nm
+  for a `shortpass edge=480` dye under 6500 K, where `aEff` = 0.83. That is why the dye is right
+  at `-spp 1` since v0.115.0. Device twin: a second CDF slice in the existing flat
+  `DScene::fluoCdfAll` (`fluoInCdfOffset/N/Step`) plus `dSampleFluoInU`. Unbiasedness is asserted
+  numerically, not argued: `-checkfluoro` estimates the reradiation NEE weight from both the old
+  and the new sampler and requires both within 2 % of an analytic quadrature.
+
   The wavelength and the subpixel offset come off radical-inverse sequences instead of the rng.
   Glass is deterministic too, because mode `W` forces **`heroSplit`** on (see below): a
   dispersive vertex fans the bundle into C monochromatic sub-paths rather than de-hero'ing

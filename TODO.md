@@ -3972,12 +3972,46 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       in the unscrambled column, green from 4 spp on in the scrambled one, the two converging by 64.
       `scraps/n3e_lattice.py` reproduces `radicalInverseScr`/`goldenDigitMul` in Python and prints
       the discrepancy table (it also asserts the π(0)=0 anchor holds in every base used).
-      **Residue, logged as open debt:** λ_in is drawn from the scene **illuminant**, so mode `W`'s
-      1-spp coordinate is the illuminant median (~575 nm under bb6500) and a dye absorbing only
-      below 480 nm still can't be excited by that single sample. The proper fix is a
-      `fluoAbsorbSampler` on `Material` so λ_in is importance-sampled from absorption × illuminant
-      — which is also a ~4× variance win in the *stochastic* modes, where 3 of 4 λ_in draws
-      currently land where `fluoAbsorb ≈ 0`.
+      **Residue:** λ_in was drawn from the scene **illuminant**, so mode `W`'s 1-spp coordinate was
+      the illuminant median (~575 nm under bb6500) and a dye absorbing only below 480 nm still
+      couldn't be excited by that single sample. Fixed as N3f below.
+
+    - [x] **N3f — importance-sample a fluorophore's excitation λ from its OWN band
+      (absorption × illuminant), not from the scene illuminant.** **DONE (2026-07-30, v0.115.0.)**
+      N3e's residue, and the last reason a narrow-band dye needed `-spp` > 1.
+      `Material` gained an `EmissionSampler fluoInSampler` built inside `Scene::finalizeEmitters()`
+      from `clamp01(fluoAbsorb(λ)) · g(λ)` — the same combined illuminant `emitSampler` uses.
+      Built there because it needs the finished emitter list, and rebuilt on every
+      `finalizeEmitters()` so `-ignoreenv` (which drops an emitter and re-finalises) stays
+      consistent. `backward.h`'s `Fluorescent` case draws from it and now takes
+      `invPdfIn = 1/pin` from that sampler instead of the analytic `scene.invPdfLambda(λ_in)`,
+      which was a second, smaller error on its own: it paired a **bin-discretised** CDF draw with
+      an **analytic** `emitG/g(λ)` reciprocal. A dye this illuminant cannot excite at all has an
+      empty sampler and falls back to `scene.emitSampler` so the branch still terminates.
+      Device twin: `DMaterial::fluoInCdfOffset/N/Step` — a second slice appended to the existing
+      flat `DScene::fluoCdfAll` — plus `dSampleFluoInU()` beside `dSampleSceneLambdaU()`. Only one
+      call site: the *second* `D_FLUORESCENT` label in `render_cuda.cu` is the split-at-dispersion
+      dispatch, which re-enters `bkInteract`.
+      Unbiasedness is asserted, not argued — `-checkfluoro` grew a fourth check that estimates the
+      reradiation NEE weight `Q·∫aEff(λ)·spd(λ)dλ` from **both** samplers and requires both within
+      2 % of a fine analytic quadrature.
+      | check | result |
+      |---|---|
+      | dye patch vs `-spp` (mode W, CPU) | **1: (47.6, 81.2, 0)** · 2: 48.8 · 4: 57.1 · 16: 58.0 · 64: 57.4 · 256: 57.5 · 4096: 57.5 — lit from the *first* sample |
+      | same, v0.114.0 | 1: 10.6 (bare elastic) · 2: 59.9 · 4: 43.4 · 16: 48.6 · 64: 54.0 · 256: 54.9 |
+      | `-checkfluoro` unbiasedness | analytic 4.7061e15 · illuminant-sampled 4.7030e15 · product-sampled 4.7062e15 (both within 0.1 %) |
+      | mode-W 1-spp λ_in | 421.7 nm, `aEff` = 0.825 there (was the illuminant median ~575 nm, `aEff` = 0) |
+      | `yield 0.0` vs `0.9` @ 1 spp | **differ** (bit-identical up to `-spp 64` in v0.113.x — the original symptom) |
+      | CPU↔GPU, 5 beds @ 1 spp | max \|dLuma\| ≤ 0.253 — unchanged; all PASS the block-mean bar |
+      | CPU↔GPU, 4 dye beds @ 1 spp | max \|dLuma\| 0.044 / 0.003 / 0.065 / 0.002 — all PASS |
+      | all 9 physics self-tests | PASS |
+      The variance ratio `-checkfluoro` prints is a *best* case and is labelled as such: that
+      synthetic integrand **is** the new sampler's target, so its estimator is constant and only
+      CDF discretisation is left. A real render carries the NEE geometry/visibility factor too.
+      Note mode `R` at 512 spp reads 12 % brighter than converged mode `W` on the same bed — that
+      is the indirect term mode `W` deliberately omits (`directOnly`), not a discrepancy.
+      Unlike N3e this is **not** a bit-identical change: every fluorescent scene's λ_in draw moves
+      (including the flat-`absorb` case, via the `1/pin` correction), which is the point.
 
       <details><summary>original plan</summary>
 

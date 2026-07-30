@@ -605,10 +605,53 @@ static int checkFluoro() {
     double frac = (double)reemit / Nt;
     double moOut = reemit ? meanOut / reemit : 0.0;
 
+    // (d) The EXCITATION sampler (Material::fluoInSampler, built from
+    //     absorb(lambda)*illuminant(lambda)). The backward tracer's reradiation NEE
+    //     weight is E[aEff(lambda_in)*Q * spd(lambda_in) / pdf(lambda_in)], which must
+    //     equal Q*integral(aEff*spd) NO MATTER which pdf is used -- so estimating it
+    //     both ways (illuminant-only, the pre-0.115.0 sampler, vs absorb*illuminant)
+    //     is a direct unbiasedness test. The variance ratio is reported too, though
+    //     note it is a BEST case: this integrand is exactly the new sampler's target,
+    //     so its estimator is constant and only CDF discretisation is left. In a real
+    //     render the NEE geometry/visibility factor rides along and keeps variance.
+    //     Also checks the mode-W 1-spp draw (u = rot05(0) = 0.5, i.e. the CDF median)
+    //     lands inside the absorption band -- what makes a narrow dye right at 1 spp.
+    Spectrum illum = blackbody(6500.0);
+    Spectrum prodS = [&m, illum](double w) { return clamp01(m.fluoAbsorb(w)) * illum(w); };
+    EmissionSampler illumS, inS;
+    illumS.build(illum, 1.0);
+    inS.build(prodS, 1.0);
+    double refI = 0.0;   // analytic integral(aEff(lambda)*illum(lambda)) by fine quadrature
+    for (double w = LAMBDA_MIN + 0.25; w < LAMBDA_MAX; w += 0.5) {
+        double r2, a2; fluoroWeights(m, w, r2, a2);
+        refI += a2 * illum(w) * 0.5;
+    }
+    const long long Nx = 400'000;
+    double sumOld = 0, sumOld2 = 0, sumNew = 0, sumNew2 = 0;
+    for (long long i = 0; i < Nx; ++i) {
+        double p, r2, a2;
+        double w = illumS.sample(rng, p);
+        double f = 0.0;
+        if (p > 0.0) { fluoroWeights(m, w, r2, a2); f = a2 * illum(w) / p; }
+        sumOld += f; sumOld2 += f * f;
+        w = inS.sample(rng, p);
+        f = 0.0;
+        if (p > 0.0) { fluoroWeights(m, w, r2, a2); f = a2 * illum(w) / p; }
+        sumNew += f; sumNew2 += f * f;
+    }
+    double eOld = sumOld / Nx, eNew = sumNew / Nx;
+    double vOld = sumOld2 / Nx - eOld * eOld, vNew = sumNew2 / Nx - eNew * eNew;
+    double pMed; double lamMed = inS.sampleAt(0.5, pMed);   // mode W's 1-spp lambda_in
+    double rMed, aMed; fluoroWeights(m, lamMed, rMed, aMed);
+
     bool passA = std::fabs(sMean - meanAnalytic) < 1.0;
     bool passB = std::fabs(frac - expectFrac) < 0.005;
     bool passC = (moOut > lin) && std::fabs(moOut - meanAnalytic) < 1.5;
-    bool pass = passA && passB && passC;
+    // Both estimators unbiased to 2%, the new one strictly lower-variance, and the
+    // mode-W median draw actually excites the dye (aEff > half its peak-ish 0.1).
+    bool passD = refI > 0.0 && std::fabs(eOld - refI) < 0.02 * refI &&
+                 std::fabs(eNew - refI) < 0.02 * refI && vNew < vOld && aMed > 0.1;
+    bool pass = passA && passB && passC && passD;
 
     std::printf("[checkfluoro] emission mean: sampler=%.2f analytic=%.2f nm  (%s)\n",
                 sMean, meanAnalytic, passA ? "ok" : "BAD");
@@ -616,6 +659,12 @@ static int checkFluoro() {
                 lin, frac, expectFrac, passB ? "ok" : "BAD");
     std::printf("[checkfluoro] Stokes shift: in=%.0f -> out_mean=%.2f nm (elastic=%.3f absorb=%.3f)  (%s)\n",
                 lin, moOut, (double)elastic / Nt, (double)absorb / Nt, passC ? "ok" : "BAD");
+    std::printf("[checkfluoro] excitation NEE weight: analytic=%.5g  illuminant-sampled=%.5g"
+                "  absorb*illuminant-sampled=%.5g  var %.3g -> %.3g (%.1fx)  (%s)\n",
+                refI, eOld, eNew, vOld, vNew, (vNew > 0.0 ? vOld / vNew : 0.0),
+                passD ? "ok" : "BAD");
+    std::printf("[checkfluoro] mode-W 1-spp lambda_in (CDF median) = %.1f nm, aEff there = %.3f\n",
+                lamMed, aMed);
     std::printf("[checkfluoro] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

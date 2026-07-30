@@ -202,6 +202,23 @@ struct Material {
     Spectrum fluoEmit   = constantSpectrum(0.0);  // emission SPD M(lambda') (shape)
     EmissionSampler fluoEmitSampler;              // built from fluoEmit
     double fluoYield = 1.0;                        // quantum yield Q in [0,1]
+    // Excitation-wavelength sampler for the BACKWARD tracer, built by
+    // finalizeEmitters() from the product absorb(lambda) * g(lambda) where g is the
+    // combined illuminant (see Scene::emitSampler). Backward transport has to pick
+    // lambda_in *before* it knows anything about it, and drawing it from the
+    // illuminant alone (what pre-0.115.0 did) wastes most samples on a narrow-band
+    // dye: with `absorb shortpass 480` under a 6500 K illuminant across 360..830 nm
+    // most draws land above the absorption edge, return aEff = 0 and contribute
+    // literally nothing, while the few that do land in the band carry a large weight.
+    // Sampling the product puts every draw inside the band -- an unbiased variance
+    // reduction (`-checkfluoro` measures both estimators and their variances), and in
+    // mode W it makes the ONE deterministic lambda_in the median of the *excitation*
+    // band, the physically meaningful single excitation wavelength, so a narrow-band
+    // dye is correct at -spp 1 instead of needing -spp 2 (v0.114.0) or -spp 64
+    // (v0.113.x, before the radical inverses were digit-scrambled).
+    // Empty (integral == 0) whenever the product vanishes or the material is not
+    // fluorescent; callers then fall back to Scene::emitSampler.
+    EmissionSampler fluoInSampler;
 
     // --- Stochastic mix (MatType::Mix) --------------------------------------
     // A probabilistic blend of other materials: a photon (or camera path) picks
@@ -1314,6 +1331,20 @@ struct Scene {
         };
         emitSampler.build(g, stepNm);
         emitG = emitSampler.integral;
+        // Per-material excitation samplers: absorb(lambda) * g(lambda). Built here
+        // rather than at parse time because it needs the finished illuminant, and
+        // rebuilt on every finalizeEmitters() so -ignoreenv (which drops an emitter
+        // and re-finalizes) keeps host and sampler consistent. See
+        // Material::fluoInSampler for why the product and not g alone.
+        for (auto& mm : mats) {
+            if (mm.type != MatType::Fluorescent) continue;
+            Spectrum prod = [&mm, g](double w) {
+                double e = mm.fluoAbsorb(w);            // clamp01 lives in render.h
+                e = (e < 0.0) ? 0.0 : (e > 1.0 ? 1.0 : e);
+                return e * g(w);
+            };
+            mm.fluoInSampler.build(prod, stepNm);
+        }
     }
 
     // Select an emitter index for the power-weighted CDF. For a single emitter

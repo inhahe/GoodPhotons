@@ -1837,17 +1837,53 @@ private:
         if (h == "whitewall")  return whiteWall(w.size() > 1 ? num(w[1]) : 0.75);
         if (h == "redwall")    return redWall();
         if (h == "greenwall")  return greenWall();
+        // `gaussian center=560 sigma=25 amp=1` / `shortpass edge=480 slope=0.2 amp=1`,
+        // or POSITIONALLY: `gaussian 560 25 1` / `shortpass 480 0.2 1`. Both forms are
+        // documented, and the positional one used to be silently DROPPED (the loop
+        // `continue`d on anything without an `=`), so `shortpass 470 0.2 1.0` became
+        // shortPass(0, 0, 1.0) — a flat 0.5 absorption — and `gaussian 600 30 1.0`
+        // became gaussianBand(0, 0, 1.0), which is identically ZERO (sigma = 0 makes
+        // exp(-inf)), silently killing the dye in scenes/layered.ftsl. Positional and
+        // keyed args may be mixed (a key overrides the slot it names); an unrecognised
+        // key is now a hard error rather than a no-op, so this cannot recur.
         if (h == "gaussian" || h == "shortpass") {
+            const bool isG = (h == "gaussian");
             double a = 0, b = 0, c = 1.0;   // gaussian: center,sigma,amp ; shortpass: edge,slope,amp
+            int pos = 0;
             for (size_t k = 1; k < w.size(); ++k) {
                 std::string key, val;
-                if (!splitEq(w[k], key, val)) continue;
-                double x = num(val);
-                if      (key == "center" || key == "edge")  a = x;
-                else if (key == "sigma"  || key == "slope") b = x;
-                else if (key == "amp")                      c = x;
+                if (splitEq(w[k], key, val)) {
+                    double x = num(val);
+                    if      (key == "center" || key == "edge")  a = x;
+                    else if (key == "sigma"  || key == "slope") b = x;
+                    else if (key == "amp")                      c = x;
+                    else {
+                        fail(h + ": unknown parameter '" + key + "' (expected " +
+                             (isG ? "center/sigma/amp" : "edge/slope/amp") + ")");
+                        return constantSpectrum(0);
+                    }
+                } else {                                  // positional
+                    double x = num(w[k]);
+                    if      (pos == 0) a = x;
+                    else if (pos == 1) b = x;
+                    else if (pos == 2) c = x;
+                    else {
+                        fail(h + ": too many arguments ('" + w[k] + "'); expected at most " +
+                             (isG ? "center sigma amp" : "edge slope amp"));
+                        return constantSpectrum(0);
+                    }
+                    ++pos;
+                }
             }
-            return (h == "gaussian") ? gaussianBand(a, b, c) : shortPass(a, b, c);
+            // sigma/slope 0 is not a usable band (gaussian collapses to identically
+            // zero, shortpass to a flat amp/2), and is far likelier to be a typo than
+            // an intent. Catch it here rather than letting it render as black.
+            if (!(b > 0.0)) {
+                fail(h + ": " + (isG ? "sigma" : "slope") + " must be > 0 (got " +
+                     std::to_string(b) + ")");
+                return constantSpectrum(0);
+            }
+            return isG ? gaussianBand(a, b, c) : shortPass(a, b, c);
         }
         // `rgb r g b` / `hsv h s v` / `hsl h s l` — a colour, upsampled to a smooth
         // reflectance via the Jakob-Hanika fit. hue in [0,1] (turns, wraps); s/v/l in
