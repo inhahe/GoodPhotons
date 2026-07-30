@@ -226,7 +226,8 @@ the same on top of ftrace's mode-R walk:
 | one random point per area light | an **N×N lattice** over the light (`-whitted-grid`, default 4 → 16 shadow rays) |
 | random direction in the glossy lobe | the **mirror direction**, weighted by the lobe's reflectance |
 | Russian roulette at specular vertices | **attenuate the throughput** instead, and stop below an `adc_bailout`-style 1/512 cutoff |
-| random branch at half-mirrors / layers / mixes | the **dominant** branch, weighted (mixes hard-threshold at ½) |
+| random branch at half-mirrors / layers / mixes / thin films / multilayers | the **dominant** branch, weighted (mixes hard-threshold at ½) |
+| random diffraction order at a `grating`; random Stokes-shift excitation λ at a `fluorescent` | the same weighted pick, but driven by a **low-discrepancy lattice** indexed by (sample, bounce) instead of the rng — one *fixed* choice per sample, not a coin. Sample 0 gives the grating's **specular order m = 0** and the **median** excitation λ; extra `-spp` fan the diffracted spectrum out into the higher orders |
 | random wavelength per sample | a fixed lattice of **8 hero wavelengths** riding one BVH walk |
 | random subpixel jitter | a progressive low-discrepancy pattern, **identical in every pixel** (sample 0 is the pixel centre) |
 | stochastic diffuse indirect | dropped — implies `-direct-only`; see `-ambient` |
@@ -366,6 +367,9 @@ metal previews crisper than it renders. It is not stuck there — the lobe direc
 a deterministic lattice indexed by the sample index, so extra passes resolve it (on gold at
 roughness 0.35, mean error falls **19×** from 1 spp to 256 spp; before v0.109.0 it fell 6 %,
 because every sample re-traced the *identical* direction and no budget could fix it). A
+**`grating` wants `-spp` > 1 for the same reason**: at 1 spp it takes the specular order
+`m = 0`, so it previews as a plain mirror with no rainbow, and extra passes fan the spectrum
+out into the higher orders. A
 half-mirror or layered coat picks its dominant branch instead of forking, and a
 pattern-driven material mix hard-thresholds instead of dithering. **Glass is free at 1 spp** — mode `W` always
 **splits the hero bundle at a dispersive vertex** (see `-herosplit`), fanning it into one

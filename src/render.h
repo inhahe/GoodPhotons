@@ -2410,8 +2410,21 @@ struct Renderer {
     // reflected fraction is lossless (analog MC, beta unchanged). m=0 is specular.
     // The equation is reciprocal (m <-> -m), so the backward tracer reuses it.
     // Sets `absorbed` if no order propagates (degenerate grazing case).
+    //
+    // `whittedU` (non-null only in mode W) replaces the rng draw with one coordinate off the
+    // deterministic (sIdx, bounce) lattice -- see BackwardRenderer::whittedOrderU. This is NOT
+    // the dominant-branch trade the Fresnel materials make: the pick is already ANALOG (order i
+    // with probability wgt[i]/wsum, throughput untouched), so a stratified u keeps the estimator
+    // unbiased and only removes the per-pixel luck. It does change WHICH order a given u maps
+    // to, though: the candidate list is built mm = -M..+M, so a raw u = 0 would select the most
+    // NEGATIVE order. On the whitted path the walk therefore visits candidates in DESCENDING
+    // efficiency (0, -1, +1, -2, +2, ...) so u = 0 gives the specular m = 0 and a 1-spp preview
+    // is the undiffracted image. Total mass is the same wsum either way, so the two orders of
+    // traversal agree in distribution; the stochastic path keeps its original ascending walk and
+    // stays bit-identical.
     Ray gratingDiffract(const Material& m, const Hit& h, const Vec3& din,
-                        double lambda, Pcg32& rng, bool& absorbed) const {
+                        double lambda, Pcg32& rng, bool& absorbed,
+                        const double* whittedU = nullptr) const {
         absorbed = false;
         Vec3 nl = dot(din, h.ng) < 0.0 ? h.ng : -h.ng;      // incidence-side normal
         // Groove direction projected into the surface; dispersion axis perpendicular.
@@ -2425,15 +2438,35 @@ struct Renderer {
         int M = diffraction ? std::max(0, std::min(m.gratingMaxOrder, 32)) : 0;
         double lod = lambda / m.grooveSpacing;              // lambda / d (dimensionless)
         int   ord[65]; double wgt[65]; int cnt = 0; double wsum = 0.0;
+        int   slot[65];                                     // mm+M -> index in ord[], -1 evanescent
+        if (whittedU) for (int i = 0; i <= 2 * M; ++i) slot[i] = -1;
         for (int mm = -M; mm <= M; ++mm) {
             Vec3 a = ut + t * ((double)mm * lod);
             if (dot(a, a) >= 1.0) continue;                 // evanescent -> excluded
             double w = 1.0 / (1.0 + std::abs(mm));          // idealised efficiency
+            slot[mm + M] = cnt;                             // (only read on the whitted path)
             ord[cnt] = mm; wgt[cnt] = w; wsum += w; ++cnt;
         }
         if (cnt == 0 || wsum <= 0.0) { absorbed = true; return Ray{}; }
-        double xi = rng.uniform() * wsum, acc = 0.0; int pick = ord[cnt - 1];
-        for (int i = 0; i < cnt; ++i) { acc += wgt[i]; if (xi < acc) { pick = ord[i]; break; } }
+        int pick;
+        if (whittedU) {
+            // Deterministic: same inversion, but over the descending-efficiency traversal
+            // 0, -1, +1, -2, +2, ... so u = 0 lands on the specular order.
+            double xi = *whittedU * wsum, acc = 0.0;
+            pick = ord[cnt - 1];                            // guard against fp round-off at u->1
+            bool done = false;
+            for (int k = 0; k <= M && !done; ++k) {
+                for (int s = 0; s < (k == 0 ? 1 : 2); ++s) {
+                    int idx = slot[(s == 0 ? -k : k) + M];
+                    if (idx < 0) continue;                  // that order is evanescent
+                    acc += wgt[idx]; pick = ord[idx];
+                    if (xi < acc) { done = true; break; }
+                }
+            }
+        } else {
+            double xi = rng.uniform() * wsum, acc = 0.0; pick = ord[cnt - 1];
+            for (int i = 0; i < cnt; ++i) { acc += wgt[i]; if (xi < acc) { pick = ord[i]; break; } }
+        }
         Vec3 a = ut + t * ((double)pick * lod);
         Vec3 v = a + nl * std::sqrt(std::max(0.0, 1.0 - dot(a, a)));
         v = normalize(v);

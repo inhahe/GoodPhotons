@@ -371,6 +371,33 @@ struct BackwardRenderer {
         return glossyDirUV(mdir, roughness, u1, u2);
     }
 
+    // Deterministic DISCRETE-CHOICE coordinate for the Whitted preview. Same job as
+    // whittedGlossyDir, but for a pick out of a finite weighted SET rather than a direction on
+    // a lobe: one scalar in [0,1) off the (sIdx, bounce) lattice, which the caller inverts
+    // against its own CDF. Keeping ONE choice per sample (rather than summing the set) is what
+    // preserves the estimator -- the existing pick is analog (order i with probability
+    // wgt[i]/wsum, throughput unchanged), so feeding it a stratified u instead of an rng draw
+    // is still unbiased and merely removes the per-pixel luck.
+    //
+    // NOT rot05'd, deliberately: `gratingDiffract` walks its candidates in DESCENDING
+    // efficiency on this path, so u == 0 -- which radicalInverseB returns at sIdx 0 in every
+    // base -- selects the specular order m = 0. That is the exact analogue of
+    // whittedGlossyDir's "sample 0 is the mirror direction": a 1-spp preview shows the
+    // undiffracted image, and extra spp fan the spectrum out into the higher orders.
+    static double whittedOrderU(uint64_t sIdx, int bounce) {
+        static const unsigned kBases[4] = {43, 47, 53, 59};
+        return radicalInverseB(kBases[bounce & 3], sIdx);
+    }
+    // Deterministic Stokes-shift EXCITATION wavelength coordinate for the Whitted preview.
+    // Unlike a grating order there is no "specular" outcome worth preferring here, so this one
+    // IS rot05'd like the other wavelength lattices: sample 0 lands at the MEDIAN of the
+    // excitation CDF -- the most representative single λ_in -- instead of at its short-λ
+    // extreme, which is what an unrotated u == 0 would pick.
+    static double whittedFluoroU(uint64_t sIdx, int bounce) {
+        static const unsigned kBases[4] = {61, 67, 71, 73};
+        return rot05(radicalInverseB(kBases[bounce & 3], sIdx));
+    }
+
     // Whitted: replace a Russian-roulette survival test with a throughput WEIGHT.
     // Same expected value, zero variance. Returns false once the path is too dim to
     // matter -- POV-Ray's `adc_bailout` (default 1/255), which is what stops a
@@ -837,7 +864,12 @@ struct BackwardRenderer {
                 if (whitted) { if (!whittedAttenuate(thr, r)) return false; }
                 else if (rng.uniform() >= r) return false;      // RR absorb
                 bool absorbedG;
-                Ray nr = mats.gratingDiffract(m, h, ray.d, lambda, rng, absorbedG);
+                // Mode W: the diffraction ORDER comes off the (sIdx, bounce) lattice instead of
+                // the rng, so every pixel picks the same order and the preview is noise-free
+                // (see whittedOrderU / gratingDiffract).
+                const double uOrd = whitted ? whittedOrderU(gi.sIdx, gi.bounce) : 0.0;
+                Ray nr = mats.gratingDiffract(m, h, ray.d, lambda, rng, absorbedG,
+                                              whitted ? &uOrd : nullptr);
                 if (absorbedG) return false;
                 ray = nr; specularArrival = true; return true;
             }
@@ -901,7 +933,15 @@ struct BackwardRenderer {
                 if (haveFluoro) {
                     gOut = (m.fluoEmit(lambda) / Mint) * invPdfLambda;
                     double pin = 0.0;
-                    lambdaIn = scene.emitSampler.sample(rng, pin);
+                    // Mode W: the Stokes-shift EXCITATION wavelength comes off the
+                    // (sIdx, bounce) lattice rather than the rng -- the same CDF inversion
+                    // (sampleAt), just a stratified u, so the estimator is untouched and only
+                    // the per-pixel luck goes away. This was mode W's last rng draw here; the
+                    // elastic/fluoro continuation coin below is unreachable because mode W
+                    // implies directOnly, which returns first.
+                    lambdaIn = whitted
+                        ? scene.emitSampler.sampleAt(whittedFluoroU(gi.sIdx, gi.bounce), pin)
+                        : scene.emitSampler.sample(rng, pin);
                     if (pin > 0.0) {
                         invPdfIn = scene.invPdfLambda(lambdaIn);
                         double rhoIn, aEffIn;

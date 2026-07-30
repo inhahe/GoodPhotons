@@ -227,11 +227,20 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   throughput weight rather than a survival probability, exactly as Mirror/Filter do. Those two
   were missed in 0.107.0 (no `whitted` branch at all) and stayed noisy in the noise-free mode
   until an N3b CPU/GPU A/B measured them at 6.7 codes of block-luma disagreement.
-  **Still stochastic in mode `W`** (tracked as N3d-2): `gratingDiffract`'s diffraction-order
-  pick and `Fluorescent`'s Stokes-shift λ_in. Neither is a dominant-branch problem — they are
-  discrete draws from a distribution, so the fix is N2's: index the choice by
-  `(sIdx, bounce)` rather than take the modal outcome. Env NEE is stochastic by deliberate
-  choice on both devices.
+  **`gratingDiffract`'s diffraction-order pick** and **`Fluorescent`'s Stokes-shift λ_in** were
+  the last two, fixed in 0.113.0. Neither is a dominant-branch problem — they are discrete draws
+  from a *distribution*, so the fix is N2's rather than `whittedWeight`'s: keep one analog choice
+  per sample (candidate `i` with probability `w_i/Σw`, throughput unchanged — so it stays unbiased)
+  but index it by `(sIdx, bounce)`. `whittedOrderU` (bases 43/47/53/59) and `whittedFluoroU`
+  (61/67/71/73) in `backward.h` supply the coordinate, passed to `gratingDiffract` as an optional
+  `const double* whittedU` and to `emitSampler.sampleAt`; every stochastic caller passes `nullptr`
+  and is bit-identical. `whittedOrderU` is deliberately *not* `rot05`-rotated, because on the
+  whitted path `gratingDiffract` walks its candidates in **descending efficiency**
+  (`0, −1, +1, −2, +2, …`) instead of `mm = −M..+M`, so `u == 0` at sample 0 selects the specular
+  order m = 0 and extra spp fan the spectrum into the higher orders — the same "sample 0 is the
+  mirror direction" convention as the glossy lobe. `whittedFluoroU` *is* rotated, since no
+  excitation λ is privileged that way and the median of the CDF is the better single sample.
+  Env NEE is stochastic by deliberate choice on both devices.
   The wavelength and the subpixel offset come off radical-inverse sequences instead of the rng.
   Glass is deterministic too, because mode `W` forces **`heroSplit`** on (see below): a
   dispersive vertex fans the bundle into C monochromatic sub-paths rather than de-hero'ing

@@ -5,41 +5,76 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### BUG (2026-07-29, v0.111.0): mode `W` is still STOCHASTIC at grating / fluorescent vertices
+### BUG — OPEN (2026-07-30, v0.113.0): a `fluorescent` surface has WILDLY different power on the CPU and the GPU — and both look wrong
 
-*(Thin-film and multilayer — the two that were actually **measured** failing — are **FIXED** in
-v0.112.0; see below. What remains open is the other two, which need a different fix.)*
+Found while building N3d-2's A/B bed. On a scene whose *every other pixel is bit-identical*
+between the devices, a fluorescent pane's radiance differs by ~5 orders of magnitude. This is
+**not** a mode-`W` determinism problem (N3d-2 fixed that; see below) — it reproduces in mode `R`
+at 512 spp, so it is a plain porting/scale bug in the bispectral reradiation term.
+
+**Repro** (`scraps/fluo_min_area.ftsl` — deliberately minimal: floor + back wall + ONE dye pane
++ ONE area light, absolute exposure so neither image is auto-anchored):
+
+```
+ftrace scraps/fluo_min_area.ftsl -mode W -spp 1 -device cpu -o ppm/fluo_W2_cpu.ppm -window
+ftrace scraps/fluo_min_area.ftsl -mode W -spp 1 -device gpu -o ppm/fluo_W2_gpu.ppm -window
+python scraps/n3d2_probe.py ppm/fluo_W2_cpu.ppm ppm/fluo_W2_gpu.ppm 20 3
+```
+
+| 12 px patch | CPU | GPU |
+|---|---|---|
+| floor (96,116) | (84.84, 79.94, 80.59) | (84.84, 79.94, 80.59) — **bit-identical** |
+| dye pane (100,68) | (255.00, 255.00, 0.00) — **clipped** | (9.01, 7.96, 8.06) — neutral grey |
+
+Backing the tone map out (sRGB transfer ÷ the reported absolute gain, and re-rendering the CPU at
+`-exposure 0.02` to un-clip it, where the pane reads (45, 81, 0)):
+
+- **CPU** dye radiance ≈ **8 200 ×** the 0.5-albedo floor's, under the same light. A surface with
+  `reflect 0.05` and `yield 0.9` cannot out-radiate a diffuse floor at all, let alone by ~4
+  orders of magnitude — the CPU is **the wrong side**, and grossly so.
+- **GPU** dye radiance ≈ **0.03 ×** the floor's, and *neutral* in hue. That is exactly what the
+  `reflect 0.05` base lobe alone would give on a vertical pane under an overhead light: the
+  fluorescent channel contributes essentially **nothing** on the device.
+
+So the two devices are wrong in opposite directions and neither is trustworthy. Ratio ≥ 30× on the
+tone-mapped codes with either light type (`fluo_min_area.ftsl` / `_spot`), and the same
+236.589-code block-luma gap appears at the *same* block at 1 spp and at 256 spp, which is what
+proves it systematic rather than noise.
+
+**Ruled out:** the `Mint` normalisation and `fluoroWeights` (identical on both sides).
+**Remaining suspects**, in order:
+1. `bakeSpec(m.fluoEmit, d.fluoEmitSpec)` + `specLookup` vs the host's continuous
+   `m.fluoEmit(lambda)` — does the baked table reproduce a `gaussian center=560 sigma=25`, or is
+   it (say) normalised differently / zero outside a narrower range? A GPU reading ~0 smells like
+   a table that is empty or mis-indexed.
+2. The host's `spdCache` in `neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn, rng, spdCache)` —
+   if the cache matches on the *outgoing* λ while the NEE is being done at λ_in, the CPU would
+   re-use a light SPD value from the wrong wavelength and could inflate the term arbitrarily.
+
+*First step of the fix:* a direct host-vs-device dump of `fluoEmitSpec` at 5 nm steps against
+`m.fluoEmit(λ)`, and of `invPdfIn`/`rhoIn`/`gOut` at one known λ_in — i.e. find which of the two
+sides moves before changing anything.
+
+### BUG — FIXED (2026-07-29 → 2026-07-30, v0.111.0 → v0.113.0): mode `W` was still STOCHASTIC at grating / fluorescent vertices
+
+*(All four materials are now fixed: thin-film and multilayer in **v0.112.0** (N3d-1) and grating
+and fluorescent in **v0.113.0** (N3d-2). Both fix write-ups are below.)*
 
 Mode `W`'s entire contract is "no rng draws — the same image at `-spp 1` every time, on any
-device". Two material vertices still break it, on **both** the CPU and the GPU:
+device". Two material vertices still broke it, on **both** the CPU and the GPU:
 
-- **`gratingDiffract`** (`src/render.h` ~2393) picks a diffraction order from the rng:
+- **`gratingDiffract`** (`src/render.h` ~2393) picked a diffraction order from the rng:
   `double xi = rng.uniform() * wsum;` over the propagating orders weighted `1/(1+|m|)`.
-- **`MatType::Fluorescent`** (`backward.h` ~896) draws `scene.emitSampler.sample(rng, pin)` for
-  the Stokes-shift excitation wavelength λ_in. *(Its continuation coin at ~914 is **not** a
+- **`MatType::Fluorescent`** (`backward.h` ~896) drew `scene.emitSampler.sample(rng, pin)` for
+  the Stokes-shift excitation wavelength λ_in. *(Its continuation coin at ~914 was **not** a
   problem: mode `W` implies `directOnly`, which returns before reaching it.)*
 
-**These are not dominant-branch problems, so the `whittedWeight` trick does not apply.** Both are
+**Neither is a dominant-branch problem, so the `whittedWeight` trick did not apply.** Both are
 *discrete choices from a distribution*, which is exactly what N2 already solved for the glossy
 lobe: keep ONE choice per sample but drive it from a low-discrepancy sequence indexed by
-`(absolute sample index, bounce)` instead of the rng. `GiCtx` already carries `sIdx` and `bounce`
-and is already threaded into `interactMaterial` / `bkInteract` on both devices, so the plumbing
-exists.
-
-*Proper fix (TODO.md §N/N3d-2), for each:*
-- **Grating** — replace `rng.uniform()` with a lattice `u` (a new prime pair alongside
-  `whittedGlossyDir`'s 13/17…37/41), passed in as an optional `const double* whittedU` so the
-  stochastic path is untouched. One wrinkle: the candidate list is built in `mm = -M..+M` order,
-  so `u = 0` would select the most *negative* order — a strongly-dispersed order as the `-spp 1`
-  look, which is wrong. The whitted path should walk candidates in **descending efficiency**
-  (`0, -1, +1, -2, +2, …`) so `u = 0` gives `m = 0`, the specular order — the exact analogue of
-  "mode W collapses a glossy lobe to the mirror direction at 1 spp, and more spp resolves it".
-  Building that permutation only on the whitted path keeps every stochastic mode bit-identical.
-  No weight change is needed at all: the existing estimator is analog (pick order `i` with
-  probability `wgt[i]/wsum`, β unchanged), so substituting a stratified `u` for a random one
-  leaves it unbiased.
-- **Fluorescent** — needs an `emitSampler.sample(u, pin)` overload (or an existing inverse-CDF
-  entry point) so λ_in can come from the same lattice.
+`(absolute sample index, bounce)` instead of the rng. `GiCtx` already carried `sIdx` and `bounce`
+and was already threaded into `interactMaterial` / `bkInteract` on both devices, so the plumbing
+existed.
 
 **How the whole family was found:** building N3b's deterministic CPU/GPU A/B bed
 (`scraps/n3b_gpu.ftsl`). `scraps/n3b_check.py` failed at max |dLuma| **4.078** / |dChroma|
@@ -81,10 +116,76 @@ That is inside the same 1.5-code-per-20 px-block bar the non-iridescent N3b bed 
 `scraps/n3d_montage.py` draws the before/after proof picture (`png/n3d_montage.png`): the
 amplified CPU−GPU difference lights up on exactly the four iridescent spheres before the fix and
 is black after it. The N3b and N3a A/B beds were re-run and are unchanged (99.561 % / 0.144 /
-0.105 and 99.394 % / 0.131 / 0.190), and the stochastic path was checked to be unbiased as well
+0.105 and 99.264 % / 0.253 / 0.547 — *corrected 2026-07-30: this line originally read
+"99.394 % / 0.131 / 0.190" for the N3a bed, which does not reproduce and disagrees with the
+99.264 % TODO §N3a records; `scraps/n3_gpu.ftsl` contains only diffuse/mirror/filter/glossy, so
+neither N3d-1 nor N3d-2 can move it and 99.264 % has been its value since N3a*), and the
+stochastic path was checked to be unbiased as well
 as untouched: forward `-mode C` on this scene conserves energy (sum/emitted 1.000001) and a
 mode-`R` CPU↔GPU pair converges as √spp from 32 to 1024 spp (mean \|diff\| 24.95 → 5.25,
 \|dLuma\| 5.83 → 1.47, \|dChroma\| 12.49 → 2.17, all ≈ √32; frame means within 0.06 %).
+
+#### FIXED (2026-07-30, v0.113.0): the grating diffraction-order pick and the fluorescent λ_in
+
+Both were solved the way the entry above predicted — N2's trick, not N3d-1's. Neither pick is a
+dominant *branch*; each is a **discrete draw from a distribution**, and each is already **analog**
+(candidate `i` with probability `w_i/Σw`, throughput unchanged), so replacing the random `u` with a
+stratified one off the `(sIdx, bounce)` lattice is a pure **variance** fix — unbiased, same
+estimator, only the per-pixel luck removed.
+
+Two new lattice helpers, `BackwardRenderer::whittedOrderU` / `whittedFluoroU` (`src/backward.h`)
+with bit-identical device twins `dWhittedOrderU` / `dWhittedFluoroU` (`src/render_cuda.cu`),
+carrying fresh prime bases (43/47/53/59 and 61/67/71/73) so they don't correlate with
+`whittedGlossyDir`'s 13/17…37/41. They differ deliberately in one respect:
+
+- **`whittedOrderU` is NOT rot05'd**, because `gratingDiffract`'s whitted path walks its
+  candidates in **descending efficiency** (`0, −1, +1, −2, +2, …`) rather than the stochastic
+  path's `mm = −M..+M`. `radicalInverseB` returns 0 at `sIdx` 0 in every base, so sample 0 lands
+  on the **specular order m = 0** — the exact analogue of "1 spp collapses a glossy lobe to the
+  mirror direction", with extra spp fanning the spectrum out into the higher orders. (Without the
+  re-ordering, `u = 0` would have picked the most *negative* — most strongly dispersed — order as
+  the `-spp 1` look.) Total mass is the same `Σw` either way, so the two traversals agree in
+  distribution; the stochastic path keeps its ascending walk and stays bit-identical.
+- **`whittedFluoroU` IS rot05'd**, because no excitation wavelength is privileged the way `m = 0`
+  is: rotating by ½ puts sample 0 at the **median** of the excitation CDF (the most representative
+  single λ_in) instead of at its short-λ extreme.
+
+Plumbed as `gratingDiffract(..., const double* whittedU = nullptr)` (host `src/render.h`, device
+`src/render_cuda.cu`) and `scene.emitSampler.sampleAt(u, pin)` / `dSampleSceneLambdaU(sc, u, pin)`
+at the `Fluorescent` / `D_FLUORESCENT` case. Every non-whitted caller passes `nullptr` (host
+render.h ~1330; device 4591 / 7650 / 9044) and is bit-identical.
+
+**One port subtlety worth remembering:** the device whitted branch computes the CDF walk in
+**`double`**, and recomputes each `1/(1+|m|)` from the order instead of reading the `Real wgt[]`
+the stochastic path builds. The weights are small exact rationals, so accumulating them in double
+in the same sequence the host uses makes the *selection* bit-identical. That matters far more here
+than elsewhere in the port: an fp32 tie-break near a cumulative boundary would send the ray into a
+**neighbouring diffraction order** — a structural CPU/GPU difference, not the usual silhouette
+sliver.
+
+Measured on `scraps/n3d2_grate.ftsl` — four gratings (three groove spacings + one rotated 90° to
+check the dispersion axis comes off `groove_dir` consistently), a flat grating pane (a flat surface
+holds one incidence angle across a wide area, so an order flip is far more visible than on a
+sphere), high-contrast bars behind everything so a wrong order shows as a *displaced bar* rather
+than a flat tint, plus the N3d-1/N3b carry-overs. 400×260 `-spp 1`, absolute exposure:
+
+| test | result |
+|---|---|
+| `n3b_check.py` CPU vs GPU, `-spp 1` | 99.606 % bit-identical, 99.932 % within 1 code, max \|dLuma\| **0.144** / \|dChroma\| **0.103** — **PASS** |
+| strict `n3_check.py`, same pair | 36 hot pixels, **0 blob interior** — passes even the N3a sliver bar |
+| same pair at `-spp 64` | 99.311 % bit-identical, \|dLuma\| **0.050** / \|dChroma\| **0.093** — **PASS** (*tighter* than 1 spp, as averaging over orders should be) |
+| `-spp 1` vs `-spp 64` on one device | \|dLuma\| **68.279** codes — the higher orders really do fan out; 1 spp is the undiffracted preview, not the converged image (`png/n3d2_spp_fanout.png`) |
+| forward `-mode C`, 20 M photons | sum/emitted **0.999998** (CPU) / **0.999970** (GPU) — stochastic path untouched and still conserving |
+| N3d / N3b / N3a regression beds | 99.697 % / 99.561 % / 99.264 % — **unchanged to the digit** |
+
+`scraps/n3d2_montage.py` draws the before/after proof (`png/n3d2_montage.png`, from the *full*
+`scraps/n3d2_gpu.ftsl` bed which keeps the dye): pre-fix, the four grating spheres and the flat
+pane are rainbow salt-and-pepper and the amplified CPU−GPU panel lights up on exactly them;
+post-fix they are smooth and that panel goes black over them. The fluorophore's own per-device
+speckle is gone too (`png/fluo_W2_ab.png`: the dye pane is a perfectly flat region at `-spp 1` on
+both devices) — but its cross-device *power* still diverges wildly, which is the **separate** open
+BUG at the top of this file, and is why the cross-device A/B is run on the dye-free
+`n3d2_grate.ftsl`.
 
 ### DEBT (2026-07-29, v0.107.0): mode `W` picks a dielectric's dominant branch, it does not fork
 

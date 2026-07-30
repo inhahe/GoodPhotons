@@ -1203,6 +1203,23 @@ __device__ static DVec3 dWhittedGlossyDir(const DVec3& mdir, Real roughness,
     const double u2 = dRadicalInverseB(b1, sIdx);
     return glossyDirUV(mdir, roughness, (Real)u1, (Real)u2);
 }
+// Deterministic DISCRETE-CHOICE coordinate: one scalar off the (sIdx, bounce) lattice for a
+// pick out of a finite weighted set, as opposed to a direction on a lobe. Not rot05'd, so
+// u == 0 at sIdx 0 selects the FIRST candidate of the caller's traversal -- which
+// gratingDiffract orders by descending efficiency, making sample 0 the specular order.
+// (Host twin: BackwardRenderer::whittedOrderU. Must stay bit-identical.)
+__device__ static double dWhittedOrderU(unsigned long long sIdx, int bounce) {
+    const unsigned kBases[4] = {43, 47, 53, 59};
+    return dRadicalInverseB(kBases[bounce & 3], sIdx);
+}
+// Deterministic Stokes-shift excitation-wavelength coordinate. Rot05'd like the other
+// wavelength lattices -- there is no "specular" outcome to prefer, so sample 0 should land on
+// the MEDIAN of the excitation CDF rather than its short-λ extreme.
+// (Host twin: BackwardRenderer::whittedFluoroU.)
+__device__ static double dWhittedFluoroU(unsigned long long sIdx, int bounce) {
+    const unsigned kBases[4] = {61, 67, 71, 73};
+    return dRot05(dRadicalInverseB(kBases[bounce & 3], sIdx));
+}
 // Replace a Russian-roulette survival test with a throughput WEIGHT: same expected value,
 // zero variance. False once the path is too dim to matter — POV-Ray's `adc_bailout`.
 static constexpr double kWhittedCutoff = 1.0 / 512.0;   // POV-Ray's default adc_bailout is
@@ -2763,9 +2780,15 @@ __device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, co
     outDir = normalize(outDir); ro = h.p + outDir * RAY_EPS; rd = outDir; return true;
 }
 // Grating diffraction (port of render.h gratingDiffract). Returns false if absorbed.
+// `whittedU` (non-null only in mode W) replaces the rng draw with a coordinate off the
+// deterministic (sIdx, bounce) lattice, and switches the candidate walk to DESCENDING
+// efficiency (0, -1, +1, -2, +2, ...) so u = 0 selects the specular order m = 0 -- see the host
+// gratingDiffract for the full rationale. The pick is analog either way, so this is a variance
+// change only, not an estimator change.
 __device__ static bool gratingDiffract(const DMaterial& m, const DHit& h, const DVec3& din,
                                         Real lambda, int diffraction, DRng& rng,
-                                        DVec3& ro, DVec3& rd) {
+                                        DVec3& ro, DVec3& rd,
+                                        const double* whittedU = nullptr) {
     DVec3 nl = dot(din, h.ng) < 0 ? h.ng : -h.ng;
     DVec3 g = m.grooveDir - nl * dot(m.grooveDir, nl);
     if (dot(g, g) < (Real)1e-12)
@@ -2776,15 +2799,42 @@ __device__ static bool gratingDiffract(const DMaterial& m, const DHit& h, const 
     int M = diffraction ? (m.gratingMaxOrder < 0 ? 0 : (m.gratingMaxOrder > 32 ? 32 : m.gratingMaxOrder)) : 0;
     Real lod = lambda / (Real)m.grooveSpacing;
     int ord[65]; Real wgt[65]; int cnt = 0; Real wsum = 0;
+    int slot[65];                                   // mm+M -> index in ord[], -1 evanescent
+    if (whittedU) for (int i = 0; i <= 2 * M; ++i) slot[i] = -1;
     for (int mm = -M; mm <= M; ++mm) {
         DVec3 a = ut + t * ((Real)mm * lod);
         if (dot(a, a) >= 1) continue;
         Real w = (Real)1 / ((Real)1 + (mm < 0 ? -mm : mm));
+        if (whittedU) slot[mm + M] = cnt;
         ord[cnt] = mm; wgt[cnt] = w; wsum += w; ++cnt;
     }
     if (cnt == 0 || wsum <= 0) return false;
-    Real xi = rng.uniform() * wsum, acc = 0; int pick = ord[cnt - 1];
-    for (int i = 0; i < cnt; ++i) { acc += wgt[i]; if (xi < acc) { pick = ord[i]; break; } }
+    int pick;
+    if (whittedU) {
+        // Deterministic order pick. Done in DOUBLE, unlike the stochastic path's Real, and
+        // recomputing each 1/(1+|m|) from the order rather than reading the Real wgt[] above:
+        // the weights are small exact rationals, so accumulating them in double in the same
+        // sequence the host uses makes the selection BIT-IDENTICAL to the CPU. That matters far
+        // more here than anywhere else in the port -- picking a neighbouring order sends the ray
+        // in a visibly different direction, so an fp32 tie-break near a cumulative boundary
+        // would be a structural CPU/GPU difference rather than the usual silhouette sliver.
+        double wsumD = 0.0;                         // host's ascending-mm accumulation order
+        for (int i = 0; i < cnt; ++i) wsumD += 1.0 / (1.0 + (double)(ord[i] < 0 ? -ord[i] : ord[i]));
+        double xi = *whittedU * wsumD, acc = 0.0;
+        pick = ord[cnt - 1];                        // guard against fp round-off at u->1
+        bool done = false;
+        for (int k = 0; k <= M && !done; ++k) {      // descending efficiency: 0, -1, +1, -2, ...
+            for (int s = 0; s < (k == 0 ? 1 : 2); ++s) {
+                int idx = slot[(s == 0 ? -k : k) + M];
+                if (idx < 0) continue;              // that order is evanescent
+                acc += 1.0 / (1.0 + (double)k); pick = ord[idx];
+                if (xi < acc) { done = true; break; }
+            }
+        }
+    } else {
+        Real xi = rng.uniform() * wsum, acc = 0; pick = ord[cnt - 1];
+        for (int i = 0; i < cnt; ++i) { acc += wgt[i]; if (xi < acc) { pick = ord[i]; break; } }
+    }
     DVec3 a = ut + t * ((Real)pick * lod);
     DVec3 v = a + nl * sqrt(fmax((Real)0, (Real)1 - dot(a, a)));
     v = normalize(v);
@@ -6284,7 +6334,11 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             if (whitted) { if (!dWhittedAttenuate(thr, (double)r)) return false; }
             else if (rng.uniform() >= r) return false;
             DVec3 nro, nrd;
-            if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) return false;
+            // Mode W: the diffraction ORDER comes off the (sIdx, bounce) lattice instead of the
+            // rng, so every pixel picks the same order and the preview is noise-free.
+            const double uOrd = whitted ? dWhittedOrderU(gi.sIdx, gi.bounce) : 0.0;
+            if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd,
+                                 whitted ? &uOrd : nullptr)) return false;
             ro = nro; rd = nrd; specularArrival = true; return true;
         }
         case D_HALFMIRROR: {
@@ -6372,7 +6426,14 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             if (haveFluoro) {
                 gOut = ((double)specLookup(mp->fluoEmitSpec, lambda) / Mint) * invPdfLambda;
                 double pin = 0.0;
-                lambdaIn = dSampleSceneLambda(sc, rng, pin);
+                // Mode W: the Stokes-shift EXCITATION wavelength comes off the (sIdx, bounce)
+                // lattice rather than the rng -- the same CDF inversion, just a stratified u,
+                // so the estimator is untouched and only the per-pixel luck goes away. This is
+                // mode W's last rng draw here; the continuation coin below is unreachable
+                // because mode W implies directOnly, which returns first.
+                lambdaIn = whitted
+                    ? dSampleSceneLambdaU(sc, dWhittedFluoroU(gi.sIdx, gi.bounce), pin)
+                    : dSampleSceneLambda(sc, rng, pin);
                 if (pin > 0.0) {
                     invPdfIn = dInvPdfLambda(sc, lambdaIn);
                     double rhoIn = clamp01((double)specLookup(mp->reflect, lambdaIn));
