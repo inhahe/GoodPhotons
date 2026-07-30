@@ -5,6 +5,44 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-07-30): loom's `Isosurface` cannot emit a CSG field tree, so every scene that wants one hand-rolls its own `Element`
+
+Found while writing `tools/loom/examples/jumping_jack.py` (a jack of six sphere+cylinder arms
+carved out of a **world-static** gyroid). FTSL has had analytic CSG inside `isosurface` since
+v0.115.0 — `union` / `intersect` / `difference` / the `k`-blended smooth trio over
+`sphere` / `ellipsoid` / `box` / `torus` / `cylinder` / `cone` / `plane` / `function` leaves — but
+loom cannot reach any of it:
+
+- `loom/iso.py` (~342) hard-codes exactly one `function { expr … }` plus one `contained_by`, so
+  the field tree is unreachable from the authoring API.
+- `Room` (~410) *does* transform a field, but by folding the affine into the **field** frame
+  (`M_eff = M·Pᵀ`, `p_eff = P·p_local + T`). That is structurally the wrong mapping for the
+  common case of a **moving solid sampling a stationary field**: it drags the lattice along with
+  the object instead of letting the object sweep through it. The world-static idiom needs the
+  animated transform on the *shape* leaves and **no** transform on the `function` leaf.
+
+The workaround in `jumping_jack.py` therefore re-derives three non-obvious things by hand, each
+of which belongs in the library:
+
+1. **Aiming a cylinder.** An FTSL `cylinder` leaf's axis is local +y, so pointing an arm along a
+   direction `d` needs the Euler triple for ftrace's own composition `R = Rz(rz)·Ry(ry)·Rx(rx)`
+   (`src/mesh.h` ~119, `affineFromTRS`): `rx = asin(d.z)`, `rz = atan2(−d.x, d.y)`, `ry = 0`.
+   Verified numerically in `scraps/jack_check.py` (max residual 6.5e-16), but no caller should
+   have to know it.
+2. **A pose-independent `contained_by`.** Required on any `function` field; must bound the solid
+   over the *whole* animation, not the current frame.
+3. **Gradient renormalisation.** A raw gyroid at frequency `f` has `|∇h| ≤ 2√3·f`, which would
+   drag the sphere-tracer to `d/(2f)` steps. Dividing the expression by `2f` gives `|∇h| ≤ √3`,
+   so one honest `max_gradient 2` covers the tree and the march runs ~`f`× faster.
+
+**Proper fix.** `Field` leaf classes (`FSphere`, `FCylinder`, `FBox`, `FTorus`, `FExpr`), each
+carrying an animatable `Transform`, plus `FUnion` / `FIntersect` / `FDifference` and the
+`k`-blended smooth trio; `Isosurface` accepting a tree as its `field`; a library `aim_y(direction)
+-> rotate` that matches `affineFromTRS`; a `contained_by` declarable as pose-independent; and
+automatic gradient renormalisation of an `FExpr` leaf reusing the per-family bounds `nd_grad_bound`
+already knows (`√2` / 1 / `2^((n−1)/2)` / 7). Documented as a deliberate gap in
+`tools/loom/DESIGN.md` §7c until then.
+
 ### BUG — FIXED (2026-07-30, v0.117.0): `scraps/gi_collapse.ftsl`, the `-gi` normalisation regression test, was VACUOUS — auto-exposure divided out the very error it tests for
 
 Found while validating `-gi-clamp`. The scene tests the gather's cosine-normalisation invariant:

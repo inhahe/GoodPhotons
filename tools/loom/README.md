@@ -181,6 +181,7 @@ rest come back as a generic ordered `Block` that re-emits its source layout exac
 | `ribbon_loop.py` | a seamless looping swept **ribbon** (plus a twin tube) |
 | `scribble_loop.py` | a seamless looping 3-D "scribble" curve |
 | `gyroid_loop.py` | a seamless looping **gyroid** isosurface |
+| `jumping_jack.py` | a **jack tumbling through a world-static gyroid**: six arms (3 gold, 3 SF10 glass) built as `intersect { union{sphere,cylinder} function{gyroid} }`, where only the arm leaves carry the pose so the lattice flows *through* the moving solid instead of riding along. Shows the CSG field tree from a custom `Element`, plus mode W + `-gi` for a flicker-free loop |
 | `pov_loop.py` | a seamless looping **POV-Ray function** isosurface |
 | `gyroid_nd.py` | **higher-dimensional gyroid slices** — a randomized N-D gyroid whose hidden dimensions drift / rotate / *bloom*; gold or clear-glass; per-run output dirs (a full sub-tool, see its `--help`) |
 | `gold_gyroids.py` | two gold gyroids in a closed room **rotating in 4-D and 5-D** (`SliceField`), assembled into a seamlessly looping GIF |
