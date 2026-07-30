@@ -8033,6 +8033,13 @@ static int run(int argc, char** argv) {
                             grin::sceneHasGrin(scene);
             for (const Material& mm : scene.mats)
                 if (mm.type == MatType::Layered) wNeedSpp = true;
+            // Rough GLOSSY is deliberately NOT on that list, even though its lobe is likewise
+            // resolved across samples (whittedGlossyDir) rather than within one. The difference
+            // is what a single pass looks like: a de-hero'd dielectric is flatly WRONG (a green
+            // ball), whereas a one-direction lobe is merely SHARP -- it reads as a shinier
+            // metal, not as an error. Making every satin surface cost 16 passes to settle would
+            // trade the viewer's whole reason for existing against a subtle look difference, so
+            // resolving the lobe is left to an explicit `-spp` on a batch render.
 #ifdef HAVE_CUDA
             BackwardRGBSession* traceSess = nullptr;   // resident RGB-backward preview (lazy)
             int   traceResX = 0, traceResY = 0;        // session film size (recreated on a resize)

@@ -31,17 +31,35 @@ struct EnergyReport {
 
 inline double clamp01(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 
-// Power-cosine lobe around a mirror direction (rough specular). roughness in
-// [0,1]: 0 -> sharp mirror, 1 -> broad. Returns a sampled reflection direction.
-inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
+// Power-cosine lobe around a mirror direction (rough specular), from two CANONICAL
+// uniforms rather than an rng. roughness in [0,1]: 0 -> sharp mirror, 1 -> broad.
+//
+// Split out of sampleGlossy so a DETERMINISTIC caller (mode W, which has no rng to draw
+// from without reintroducing noise) can drive exactly the same lobe off a low-discrepancy
+// lattice. The polar coordinate is `cosT = u1^(1/(e+1))`, so **u1 == 1 is exactly the
+// mirror direction** — that is what lets mode W's sample 0 reproduce the old
+// mirror-direction-only behaviour bit-for-bit, and it is why a deterministic caller should
+// *complement* its sequence (1 - radicalInverse) instead of Cranley-Patterson rotating it.
+// The u1 == 1 case returns `mdir` verbatim, skipping the normalize() below, whose last-bit
+// rescale would otherwise spoil that bit-identity.
+inline Vec3 glossyDirUV(const Vec3& mdir, double roughness, double u1, double u2) {
+    if (u1 >= 1.0) return mdir;              // exact mirror (rng.uniform() is [0,1), so
+                                             // only a deterministic caller reaches this)
     double rr = roughness < 1e-3 ? 1e-3 : roughness;
     double e = 2.0 / (rr * rr) - 2.0; if (e < 0) e = 0;
-    double u1 = rng.uniform(), u2 = rng.uniform();
     double cosT = std::pow(u1, 1.0 / (e + 1.0));
     double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
     double phi = 2.0 * PI * u2;
     Vec3 t, b; onb(mdir, t, b);
     return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + mdir * cosT);
+}
+
+// Stochastic form: two draws off the caller's stream, in that order.
+inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
+    // Sequenced into locals deliberately: passing rng.uniform() twice as arguments would
+    // leave the draw order unspecified and desynchronise the stream.
+    double u1 = rng.uniform(), u2 = rng.uniform();
+    return glossyDirUV(mdir, roughness, u1, u2);
 }
 
 // --- Fluorescence interaction (shared by the forward tracer and -checkfluoro) --

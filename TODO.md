@@ -3708,7 +3708,33 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       branch — `hero::gSplit` / `-herosplit` (`src/hero.h`) is the existing prior art for exactly
       this. Then drop the dielectric terms from `wNeedSpp`. Logged as DEBT in `known-issues.md`.
       </details>
-- [ ] **N2. Deterministic glossy-lobe lattice.** *(CPU.)* Measurement showed that on rough gold the
+- [x] **N2. Deterministic glossy-lobe lattice.** **DONE (2026-07-30, v0.109.0.)**
+      `whittedGlossyDir` (`src/backward.h`) takes point `sIdx` of a 2-D radical-inverse lattice
+      on the power-cosine lobe, via a new `glossyDirUV` factored out of `sampleGlossy`
+      (`src/render.h`); wired into all four sites that collapsed a lobe to a mirror (`Glossy` in
+      `interactMaterial`, `Glossy` in the hero loop, both `Layered` coat branches). `GiCtx`
+      gained a `bounce` field so each depth draws from its own prime pair (13/17, 19/23, 29/31,
+      37/41). No forking, so no N^depth blowup; cost at equal spp unchanged.
+
+      The defect was **consistency**, not looks: every sample took the identical direction, so
+      mode W never converged on the true lobe at any budget. Mean |err| inside each ball on
+      `scraps/n2_rough.ftsl` (gold at roughness 0.045 / 0.15 / 0.35, vs a converged direct-only
+      mode-R reference, absolute exposure) — old → new:
+      | spp | 0.045 | 0.15 | 0.35 |
+      |---|---|---|---|
+      | 1 | 5.71 → 5.71 | 15.66 → 15.66 | 33.40 → 33.40 |
+      | 16 | 3.61 → **2.56** | 13.65 → **6.81** | 31.60 → **11.80** |
+      | 256 | 3.49 → **0.53** | 13.61 → **1.04** | 31.49 → **1.67** |
+      The old column is flat: 33.40 → 31.49 over 256× the budget is pure antialiasing. Verified
+      `-spp 1` bit-identical to v0.108.0 *on a glossy scene* (the polar coordinate is
+      complemented, not `rot05`'d, and `u1 == 1` returns `mdir` verbatim), and every stochastic
+      path bit-identical (`-device cpu`, modes R/B/C/M/S/D/U — compare with `-device cpu` on
+      both binaries or a CUDA build silently uses the GPU and fakes a regression). Check:
+      `scraps/n2_check.py`; visuals `png/n2_{old,new}_256.png` vs `png/n2_ref.png`.
+
+      <details><summary>original plan</summary>
+
+      *(CPU.)* Measurement showed that on rough gold the
       residual error is dominated by the **glossy lobe**, not by missing diffuse GI — mode W currently
       collapses a rough specular to the single mirror direction. **Do not fork** the lobe (N^depth
       blowup in a labyrinth scene): keep ONE direction but drive it from the low-discrepancy sequence
@@ -3716,6 +3742,7 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       sample 0 is exactly today's mirror direction (i.e. `-spp 1` stays bit-identical to v0.107.0 and
       only higher spp improves). Preserves both mode-W invariants: shared offsets per pixel, and
       indexing by the **absolute** sample index so the image stays chunk-split-independent.
+      </details>
 - [ ] **N3. Port spectral mode W to the device.** Add `bkWhitted` / `bkGrid` / `bkGiGrid` /
       `bkAmbient` to `DScene` (matching the existing `bkDirectOnly` convention), port the ~30
       `whitted` branches of `src/backward.h` into `bkInteract` + the `kBackward` light loop, drop the

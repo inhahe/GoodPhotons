@@ -123,7 +123,57 @@ no dielectric, no glossy) exists specifically to dodge this and the glossy entry
 
 </details>
 
-### DEBT (2026-07-29, v0.105.0): mode `W` over-sharpens rough glossy metal
+### FIXED (2026-07-30, v0.109.0): mode `W` over-sharpens rough glossy metal
+
+**Fixed by driving the lobe off a deterministic lattice** (`whittedGlossyDir` in
+`src/backward.h`, feeding the new `glossyDirUV` in `src/render.h`). A mode-`W` rough-specular
+vertex now takes point `sIdx` of a 2-D radical-inverse lattice on the power-cosine lobe
+instead of the lobe's single mirror direction, at all four sites that used to collapse it
+(`Glossy` in `interactMaterial`, `Glossy` in the hero loop's achromatic-delta case, and both
+`Layered` coat branches).
+
+The real defect was not aesthetic, it was **consistency**: every sample took the *identical*
+direction, so mode `W` did not converge on the true lobe at *any* budget. Measured on
+`scraps/n2_rough.ftsl` (three gold balls at roughness 0.045 / 0.15 / 0.35 reflecting
+high-contrast bars; mean |err| inside each ball vs a converged direct-only mode-`R`
+reference, absolute exposure so no per-image anchor can move):
+
+| spp | rough 0.045 | rough 0.15 | rough 0.35 |
+|---|---|---|---|
+| 1 | 5.71 → **5.71** | 15.66 → **15.66** | 33.40 → **33.40** |
+| 16 | 3.61 → **2.56** | 13.65 → **6.81** | 31.60 → **11.80** |
+| 64 | 3.51 → **0.97** | 13.62 → **2.45** | 31.49 → **4.16** |
+| 256 | 3.49 → **0.53** | 13.61 → **1.04** | 31.49 → **1.67** |
+
+Read the *old* column down: 33.40 → 31.49 over 256× the budget, a 6 % improvement that is
+purely edge antialiasing. The lobe error never moved. The new column converges (**19×** lower
+at 256 spp on the roughest ball), and `png/n2_old_256.png` vs `png/n2_new_256.png` shows it:
+three indistinguishable mirror balls become a proper satin gradient matching `png/n2_ref.png`.
+
+Two properties are load-bearing and were verified, not assumed:
+
+* **`-spp 1` is bit-identical to v0.108.0**, including on a scene that actually contains
+  glossy material. `glossyDirUV` maps `u1 == 1` to the mirror direction and
+  `radicalInverse(0) == 0` in every base, so the polar sequence is *complemented*
+  (`1 - radicalInverse`) rather than `rot05`-rotated, and sample 0 lands exactly where the old
+  code put it. The `u1 >= 1.0` early-out returns `mdir` verbatim so `normalize()`'s last-bit
+  rescale cannot spoil that.
+* **Every stochastic path is bit-identical** (`-device cpu`, modes R/B/C/M/S/D/U), since
+  `sampleGlossy` was only re-expressed in terms of `glossyDirUV` with its two draws sequenced
+  into locals. *Compare with `-device cpu` on both binaries* — a CUDA build silently
+  auto-selects the GPU, which reads as a spurious whole-frame "regression".
+
+Each bounce depth takes its own prime pair (13/17, 19/23, 29/31, 37/41) so two glossy
+vertices on one path are not driven by the same 1-D sequence. The path is **not** forked, so
+there is no N^depth blowup in a gyroid labyrinth, and cost at equal spp is unchanged.
+
+Still outstanding: because the lobe is resolved *across* samples rather than within one,
+rough metal is the one thing in mode `W` that genuinely wants `-spp` > 1 — it is no longer
+*wrong* at 1 spp, just as sharp as it always was. `wNeedSpp` does not test for it (a glossy
+scene previews fine; it is only a rough one that benefits), so the interactive viewer stops
+at one pass on rough metal.
+
+<details><summary>Original entry (kept for the diagnosis, which the fix is built on)</summary>
 
 `interactMaterial` sends a mode-`W` glossy vertex along the exact mirror direction,
 weighted by the lobe's reflectance. That is near-exact for the tight lobes this engine's
@@ -158,6 +208,8 @@ bounce light on the floor and walls, but the dominant residual sits **on the gol
 itself** — i.e. on the one material whose lobe mode `W` collapses to a mirror. A single
 mirror direction cannot spread light into a labyrinth of crevices, so no amount of
 diffuse GI fixes that scene. Fixing this entry is therefore the higher-value work.
+
+</details>
 
 ### BUG — DONE (2026-07-29, v0.102.1): `-exposure`/`-ev` was silently ignored by `-topng`
 

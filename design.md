@@ -198,8 +198,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   **Mode `W` (the `whitted` flag)** shares this whole walk and swaps only the
   *estimators*, which is why it is a flag and not a second tracer. Every stochastic
   decision on the path gets a deterministic replacement: the area-light NEE point
-  becomes an N×N lattice (`lightGrid`, `-whitted-grid`); the glossy lobe becomes the
-  mirror direction weighted by its reflectance; Russian roulette on Mirror / Filter /
+  becomes an N×N lattice (`lightGrid`, `-whitted-grid`); the glossy lobe keeps ONE
+  direction, weighted by its reflectance, but takes it from a 2-D radical-inverse lattice on
+  the power-cosine lobe (`whittedGlossyDir` → `glossyDirUV` in `render.h`) rather than the
+  rng — the path is deliberately **not** forked, which would cost N^depth inside a gyroid
+  labyrinth. That lattice is what makes the mode *consistent* on rough specular: collapsing
+  every sample onto the mirror direction (pre-0.109.0) meant extra spp bought edge
+  antialiasing and nothing else, so a satin metal never converged at any budget (measured:
+  6 % better over 256× the samples, versus 19× better now). The polar coordinate is
+  *complemented* rather than `rot05`-rotated because `glossyDirUV` maps `u1 == 1` to the
+  mirror direction and `radicalInverse(0) == 0` in every base — so sample 0 reproduces the
+  old behaviour bit-for-bit and only `spp > 1` changes. Each bounce depth draws from its own
+  prime pair so two glossy vertices on a path are not driven by one sequence.
+  Russian roulette on Mirror / Filter /
   Grating / specular-bundle survival becomes `whittedAttenuate` (multiply the
   throughput by the weight, stop under `kWhittedCutoff` = 1/512 — POV-Ray's
   `adc_bailout`); HalfMirror / Layered take the dominant branch weighted, and a Mix

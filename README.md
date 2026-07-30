@@ -339,10 +339,14 @@ luminaire occludes the ambient sky, which is what you want, but it does mean `-g
 > brightness change.
 
 **Honest limits.** Mode `W` is a *preview*, not a reference: it is biased. It is CPU-only
-(the GPU backward megakernel keeps the stochastic path). Rough glossy metal renders
-sharper than it really is, because one mirror ray can't spread a lobe. A half-mirror or
-layered coat picks its dominant branch instead of forking, and a pattern-driven material
-mix hard-thresholds instead of dithering. **Glass is free at 1 spp** — mode `W` always
+(the GPU backward megakernel keeps the stochastic path). **Rough glossy metal is the one
+thing that wants `-spp` > 1**: at 1 spp the lobe is its single mirror direction, so a satin
+metal previews crisper than it renders. It is not stuck there — the lobe direction comes off
+a deterministic lattice indexed by the sample index, so extra passes resolve it (on gold at
+roughness 0.35, mean error falls **19×** from 1 spp to 256 spp; before v0.109.0 it fell 6 %,
+because every sample re-traced the *identical* direction and no budget could fix it). A
+half-mirror or layered coat picks its dominant branch instead of forking, and a
+pattern-driven material mix hard-thresholds instead of dithering. **Glass is free at 1 spp** — mode `W` always
 **splits the hero bundle at a dispersive vertex** (see `-herosplit`), fanning it into one
 monochromatic sub-path per wavelength so each λ refracts along its own direction and lands
 in its own slot. It has to: the alternative policy (terminate the secondaries, boost the
@@ -687,7 +691,7 @@ that converges to the same physical image.
 | `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
 | `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
 | `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
-| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy over-sharpened, CPU only |
+| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe, CPU only |
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
 | `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / spot / env lights |

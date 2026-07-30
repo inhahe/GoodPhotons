@@ -112,10 +112,14 @@ struct BackwardRenderer {
     // the gather); `depth == 1` is a gather ray (it does NOT recurse, uses `giGrid`, and
     // terminates its own diffuse vertices on the flat `ambient` tail). `sIdx` is the
     // absolute sample index, which rotates the lattice so that -spp progressively
-    // refines the gather instead of re-rendering the same banding.
+    // refines the gather instead of re-rendering the same banding. `bounce` is the current
+    // bounce index along the path, so a deterministic per-vertex decision (the mode-W glossy
+    // lobe -- see whittedGlossyDir) can pick a different sequence at each vertex instead of
+    // driving every glossy bounce off the same 1-D lattice.
     struct GiCtx {
         int depth = 0;
         unsigned long long sIdx = 0;
+        int bounce = 0;
     };
 
     // One direction of the fixed gather lattice: point `j` of an `n`-point Fibonacci
@@ -336,6 +340,36 @@ struct BackwardRenderer {
     // The bundle's / scalar path's base wavelength coordinate; a third, decorrelated
     // radical inverse so λ placement does not lock to the subpixel position.
     static double whittedLambdaU(uint64_t idx) { return rot05(radicalInverseB(5, idx)); }
+
+    // Deterministic ROUGH-SPECULAR direction for the Whitted preview: point `sIdx` of a
+    // fixed 2-D lattice on the power-cosine lobe around `mdir`, instead of the lobe's single
+    // mirror direction.
+    //
+    // Why this is not just a polish item: collapsing every sample onto the mirror direction
+    // makes mode W INCONSISTENT on rough specular -- raising -spp changed nothing at all,
+    // because each extra sample re-traced the identical direction, so satin metal previewed
+    // crisper than it renders and stayed that way at any budget. Driving the lobe from the
+    // sample index makes -spp converge on the true lobe while keeping BOTH mode-W
+    // invariants: every pixel uses the same offsets (so it is noise-free, not grainy -- at a
+    // given spp the whole frame shares one lobe direction per vertex), and the sequence is
+    // indexed by the ABSOLUTE sample index (so the image is chunk-split-independent).
+    //
+    // The polar coordinate is COMPLEMENTED rather than rot05'd, because glossyDirUV maps
+    // u1 == 1 to the mirror direction and radicalInverse(0) == 0 in every base: sample 0 is
+    // therefore *exactly* the old mirror direction, so a 1-spp preview is bit-identical to
+    // 0.107.0 and only spp > 1 changes. (sinT == 0 there makes the azimuth moot too.)
+    //
+    // Each bounce depth takes its own prime pair so two glossy vertices on one path are not
+    // driven by the same 1-D sequence -- which would correlate their offsets and fold a
+    // double-bounce lobe into a line. Bases 2/3 are the subpixel lattice, 5 the wavelength,
+    // 7/11 the gather, so these start at 13.
+    static Vec3 whittedGlossyDir(const Vec3& mdir, double roughness, uint64_t sIdx, int bounce) {
+        static const unsigned kBases[4][2] = {{13, 17}, {19, 23}, {29, 31}, {37, 41}};
+        const unsigned* pb = kBases[bounce & 3];
+        const double u1 = 1.0 - radicalInverseB(pb[0], sIdx);   // 1 at sIdx 0 => mirror
+        const double u2 = radicalInverseB(pb[1], sIdx);
+        return glossyDirUV(mdir, roughness, u1, u2);
+    }
 
     // Whitted: replace a Russian-roulette survival test with a throughput WEIGHT.
     // Same expected value, zero variance. Returns false once the path is too dim to
@@ -825,13 +859,17 @@ struct BackwardRenderer {
             }
             case MatType::Glossy: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                // Whitted: the mirror direction, not a sampled lobe. This is exact for a
-                // near-mirror (gold at roughness 0.045 is visually indistinguishable) and
-                // progressively over-sharpens as roughness grows -- a satin metal previews
-                // crisper than it renders, which is the documented trade for 1-spp.
+                // Whitted: the lobe off a deterministic lattice rather than the rng, so the
+                // direction is the same for every pixel (noise-free) but varies with the
+                // sample index (so -spp actually resolves the lobe). At -spp 1 this IS the
+                // mirror direction, which is exact for a near-mirror and over-sharpens as
+                // roughness grows; the fix for that is more spp, which now works.
                 if (whitted) {
                     if (!whittedAttenuate(thr, r)) return false;
-                    ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                    Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
+                                              materialRoughness(scene, m, h), gi.sIdx, gi.bounce);
+                    if (dot(o, h.n) <= 0) return false;
+                    ray = Ray{h.p + h.n * 1e-6, o};
                     specularArrival = true; return true;
                 }
                 if (rng.uniform() >= r) return false;
@@ -984,6 +1022,9 @@ struct BackwardRenderer {
         bool grinAny = grin::sceneHasGrin(scene);
 
         for (int b = 0; b < maxB; ++b) {
+            // Publish the bounce index so a deterministic per-vertex choice (mode W's glossy
+            // lobe) can pick a decorrelated sequence at each depth. Costs nothing otherwise.
+            gi.bounce = b;
             // GRIN curved marching pre-pass: advance the ray through any gradient-index
             // region it enters, integrating the Eikonal equation d/ds(n·dr/ds)=∇n in
             // small steps so the path bends. Pure marching does NOT consume a bounce;
@@ -1084,7 +1125,10 @@ struct BackwardRenderer {
                 if (whitted) {
                     if (R >= 0.5) {
                         if (!whittedAttenuate(thr, R)) return L;
-                        ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                        Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
+                                                  materialRoughness(scene, cm, h), gi.sIdx, b);
+                        if (dot(o, h.n) <= 0) return L;
+                        ray = Ray{h.p + h.n * 1e-6, o};
                         specularArrival = true;
                         continue;
                     }
@@ -1187,6 +1231,7 @@ struct BackwardRenderer {
 
         for (int b = bounce0; b < maxB; ++b) {
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
+            gi.bounce = b;                // see the scalar twin: mode W's per-vertex lattice
             Hit h = scene.closestHit(ray);
             double dSurf = h.valid ? h.t : 1e30;
 
@@ -1246,7 +1291,10 @@ struct BackwardRenderer {
                 if (whitted) {   // dominant layer + weight; see the scalar twin above
                     if (R >= 0.5) {
                         if (!whittedAttenuate(thr[0], R)) { finish(); return; }
-                        ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                        Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
+                                                  materialRoughness(scene, cm, h), gi.sIdx, b);
+                        if (dot(o, h.n) <= 0) { finish(); return; }
+                        ray = Ray{h.p + h.n * 1e-6, o};
                         specularArrival = true;
                         continue;
                     }
@@ -1368,7 +1416,11 @@ struct BackwardRenderer {
                     } else if (m.type == MatType::Filter) {
                         ray = Ray{h.p + ray.d * 1e-6, ray.d};       // direction unchanged
                     } else if (whitted) {
-                        ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};   // mirror, not a lobe
+                        // Glossy: the lobe off the deterministic lattice (mirror at sample 0).
+                        Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
+                                                  materialRoughness(scene, m, h), gi.sIdx, b);
+                        if (dot(o, h.n) <= 0) { finish(); return; }
+                        ray = Ray{h.p + h.n * 1e-6, o};
                     } else {
                         Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                         if (dot(o, h.n) <= 0) { finish(); return; }
