@@ -865,6 +865,22 @@ struct DScene {
     // Whitted-style near-1-spp preview; 0 = full path tracing.
     int    bkMaxBounce;
     int    bkDirectOnly;
+    // Mode W (deterministic Whitted/POV-Ray preview) knobs — the device twin of
+    // BackwardRenderer's fields in src/backward.h. bkWhitted=1 replaces every stochastic
+    // estimator on the path with fixed quadrature; the rest are only read when it is set.
+    // bkGrid / bkGiGrid: the N of the N*N area-light NEE lattice at a primary / gather
+    // vertex. bkGiDirs: deterministic one-bounce gather ray count (0 = off, use bkAmbient
+    // only). bkGiBounce: path-depth cap on a gather ray. bkHeroSplit: fan the hero bundle
+    // into monochromatic sub-paths at a dispersive vertex (mode W forces this on — see
+    // design.md). bkAmbient: flat fill added at each diffuse vertex, already pre-scaled by
+    // Scene::ambientRef() on the host.
+    int    bkWhitted;
+    int    bkGrid;
+    int    bkGiDirs;
+    int    bkGiGrid;
+    int    bkGiBounce;
+    int    bkHeroSplit;
+    double bkAmbient;
 };
 
 // Everything the pattern VM (dPatternEval) needs beyond the scalar variables: the
@@ -1117,15 +1133,90 @@ __device__ static DVec3 cosineHemisphere(const DVec3& n, DRng& rng) {
     DVec3 t, b; onb(n, t, b);
     return normalize(t * lx + b * ly + n * lz);
 }
-__device__ static DVec3 sampleGlossy(const DVec3& mdir, Real roughness, DRng& rng) {
+// Power-cosine lobe around a mirror direction, from two CANONICAL uniforms rather than an
+// rng — the device twin of glossyDirUV (src/render.h), split out of sampleGlossy for the
+// same reason: mode W has no rng to draw from without reintroducing noise, so it drives the
+// identical lobe off a low-discrepancy lattice. `cosT = u1^(1/(e+1))` makes **u1 == 1
+// exactly the mirror direction**, which is why the deterministic caller complements its
+// sequence instead of rotating it, and why u1 >= 1 returns mdir verbatim (skipping the
+// normalize(), whose last-bit rescale would spoil that identity).
+__device__ static DVec3 glossyDirUV(const DVec3& mdir, Real roughness, Real u1, Real u2) {
+    if (u1 >= (Real)1) return mdir;          // exact mirror (only a deterministic caller
+                                             // reaches this; rng.uniform() is [0,1))
     Real rr = roughness < (Real)1e-3 ? (Real)1e-3 : roughness;
     Real e = (Real)2 / (rr * rr) - (Real)2; if (e < 0) e = 0;
-    Real u1 = rng.uniform(), u2 = rng.uniform();
     Real cosT = pow(u1, (Real)1 / (e + (Real)1));
     Real sinT = sqrt(fmax((Real)0, (Real)1 - cosT * cosT));
     Real phi = (Real)2 * (Real)DPI * u2;
     DVec3 t, b; onb(mdir, t, b);
     return normalize(t * (sinT * cos(phi)) + b * (sinT * sin(phi)) + mdir * cosT);
+}
+__device__ static DVec3 sampleGlossy(const DVec3& mdir, Real roughness, DRng& rng) {
+    // Sequenced into locals deliberately: passing rng.uniform() twice as arguments would
+    // leave the draw order unspecified and desynchronise the stream.
+    Real u1 = rng.uniform(), u2 = rng.uniform();
+    return glossyDirUV(mdir, roughness, u1, u2);
+}
+
+// ---------------- mode W: deterministic sample placement (device twin) ----------------
+// Exact ports of BackwardRenderer's statics in src/backward.h. All of these run in
+// `double` regardless of FTRACE_GPU_FP32, and on pure integer / double arithmetic, so they
+// are bit-identical to the host versions — which is what N4's part (a) tests directly.
+// See backward.h for the full rationale; the load-bearing invariants are (1) every pixel
+// uses the SAME offsets (that is what makes the mode noise-free) and (2) the sequences are
+// indexed by the ABSOLUTE sample index, so the image is chunk-split-independent.
+__device__ static double dRadicalInverse2(unsigned long long i) {
+    i = (i << 32) | (i >> 32);
+    i = ((i & 0x0000ffff0000ffffULL) << 16) | ((i & 0xffff0000ffff0000ULL) >> 16);
+    i = ((i & 0x00ff00ff00ff00ffULL) <<  8) | ((i & 0xff00ff00ff00ff00ULL) >>  8);
+    i = ((i & 0x0f0f0f0f0f0f0f0fULL) <<  4) | ((i & 0xf0f0f0f0f0f0f0f0ULL) >>  4);
+    i = ((i & 0x3333333333333333ULL) <<  2) | ((i & 0xccccccccccccccccULL) >>  2);
+    i = ((i & 0x5555555555555555ULL) <<  1) | ((i & 0xaaaaaaaaaaaaaaaaULL) >>  1);
+    return (double)i * (1.0 / 18446744073709551616.0);
+}
+__device__ static double dRadicalInverseB(unsigned base, unsigned long long i) {
+    const double invB = 1.0 / (double)base;
+    double f = invB, r = 0.0;
+    while (i) { r += (double)(i % base) * f; i /= base; f *= invB; }
+    return r;
+}
+__device__ static double dRot05(double x) { x += 0.5; return (x >= 1.0) ? x - 1.0 : x; }
+__device__ static void dWhittedSample(unsigned long long idx, double& u, double& v) {
+    u = dRot05(dRadicalInverse2(idx));
+    v = dRot05(dRadicalInverseB(3, idx));
+}
+__device__ static double dWhittedLambdaU(unsigned long long idx) {
+    return dRot05(dRadicalInverseB(5, idx));
+}
+// Deterministic rough-specular direction: point `sIdx` of a fixed 2-D lattice on the
+// power-cosine lobe. The polar coordinate is COMPLEMENTED (not rot05'd) so sample 0 is
+// exactly the mirror direction, since dRadicalInverseB(b, 0) == 0 in every base. Each
+// bounce depth takes its own prime pair so two glossy vertices on one path are not driven
+// by the same 1-D sequence. Bases 2/3 are the subpixel lattice, 5 the wavelength, 7/11 the
+// gather, so these start at 13.
+__device__ static DVec3 dWhittedGlossyDir(const DVec3& mdir, Real roughness,
+                                          unsigned long long sIdx, int bounce) {
+    const unsigned kBases[4][2] = {{13, 17}, {19, 23}, {29, 31}, {37, 41}};
+    const unsigned b0 = kBases[bounce & 3][0], b1 = kBases[bounce & 3][1];
+    const double u1 = 1.0 - dRadicalInverseB(b0, sIdx);   // 1 at sIdx 0 => mirror
+    const double u2 = dRadicalInverseB(b1, sIdx);
+    return glossyDirUV(mdir, roughness, (Real)u1, (Real)u2);
+}
+// Replace a Russian-roulette survival test with a throughput WEIGHT: same expected value,
+// zero variance. False once the path is too dim to matter — POV-Ray's `adc_bailout`.
+static constexpr double kWhittedCutoff = 1.0 / 512.0;   // POV-Ray's default adc_bailout is
+                                                        // 1/255; backward.h uses 1/512
+__device__ static bool dWhittedAttenuate(double& thr, double w) {
+    if (w <= 0.0) return false;
+    thr *= w;
+    return thr > kWhittedCutoff;
+}
+// Centre of cell (g%G, g/G) of a G x G lattice over an emitter's [0,1)^2 sample domain —
+// POV-Ray's `area_light`: a fixed set of shadow rays whose average is a soft shadow with
+// NO variance, rather than one random point whose average only smooths out over many spp.
+__device__ static void dGridUV(int g, int G, Real& u1, Real& u2) {
+    u1 = (Real)(((double)(g % G) + 0.5) / (double)G);
+    u2 = (Real)(((double)(g / G) + 0.5) / (double)G);
 }
 __device__ static Real hgPhase(Real cosTheta, Real g) {
     Real d = (Real)1 + g * g - (Real)2 * g * cosTheta;
@@ -2492,10 +2583,16 @@ __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const
 // cross to the wrong side so no light leaks through. `transmitted` (optional) reports
 // whether the ray refracted vs. reflected/TIR — the caller uses it to track which
 // medium it is now inside (interior absorption). Mirrors host refractOrReflect.
+//
+// `whittedWeight` (non-null only in mode W) switches the Fresnel coin flip for the DOMINANT
+// branch (reflect iff R >= 0.5) and reports that branch's weight for the caller to fold into
+// the throughput — same expected value, zero variance. It also suppresses the frosting
+// perturbation, the other rng draw at this interface: at 1 spp a coin flip per pixel is not
+// noise but salt-and-pepper, and glass rendered as a speckled blob. TIR reports weight 1.
 __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, const DHit& h,
                                          const DVec3& d, Real lambda, DRng& rng,
                                          DVec3& ro, DVec3& rd, bool* transmitted = nullptr,
-                                         Real extIor = (Real)1) {
+                                         Real extIor = (Real)1, double* whittedWeight = nullptr) {
     Real ng = specLookup(m.ior, lambda);
     bool entering = dot(d, h.ng) < 0;
     DVec3 nl = entering ? h.ng : -h.ng;
@@ -2505,18 +2602,21 @@ __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, co
     Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
     DVec3 outDir;
     bool refracted = false;
-    if (sin2t > 1) outDir = reflectv(d, nl);
+    if (sin2t > 1) { outDir = reflectv(d, nl); if (whittedWeight) *whittedWeight = 1.0; }
     else {
         Real cosT = sqrt((Real)1 - sin2t);
         Real rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
         Real rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
         Real R = (Real)0.5 * (rs * rs + rp * rp);
-        if (rng.uniform() < R) outDir = reflectv(d, nl);
+        const bool doReflect = whittedWeight ? (R >= (Real)0.5) : (rng.uniform() < R);
+        if (whittedWeight) *whittedWeight = doReflect ? (double)R : 1.0 - (double)R;
+        if (doReflect) outDir = reflectv(d, nl);
         else { outDir = d * eta + nl * (eta * cosI - cosT); refracted = true; }
     }
     outDir = normalize(outDir);
-    // Frosted glass: jitter the chosen lobe, keeping it on the intended side.
-    Real rough = dMatRoughness(sc, m, h);
+    // Frosted glass: jitter the chosen lobe, keeping it on the intended side. Skipped in
+    // mode W (see whittedWeight) — that draw is the other source of 1-spp salt-and-pepper.
+    Real rough = whittedWeight ? (Real)0 : dMatRoughness(sc, m, h);
     if (rough > (Real)1e-3) {
         DVec3 pert = sampleGlossy(outDir, rough, rng);
         bool ok = refracted ? (dot(pert, nl) < 0) : (dot(pert, nl) > 0);
@@ -2535,7 +2635,11 @@ __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, co
 // air<->glass model, so priority-free scenes render bit-identically. Mirrors the host.
 __device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, const DHit& h,
                                         const DVec3& d, Real lambda, DRng& rng,
-                                        int mi, DMediumStack& stk, DVec3& outO, DVec3& outD) {
+                                        int mi, DMediumStack& stk, DVec3& outO, DVec3& outD,
+                                        double* whittedWeight = nullptr) {
+    // Mode W: the suppressed-boundary pass-throughs below take no Fresnel branch, so their
+    // weight is 1; the two real interfaces overwrite this from refractOrReflect.
+    if (whittedWeight) *whittedWeight = 1.0;
     bool entering = dot(d, h.ng) < 0;
     int pr = m.priority;
     if (entering) {
@@ -2549,7 +2653,7 @@ __device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, con
         }
         Real extIor = (ranked && outMat >= 0) ? specLookup(sc.mats[outMat].ior, lambda) : (Real)1;
         bool transmitted = false; DVec3 nro, nrd;
-        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor);
+        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor, whittedWeight);
         if (transmitted) stk.push(mi, pr);
         outO = nro; outD = nrd;
     } else {
@@ -2564,7 +2668,7 @@ __device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, con
         }
         Real extIor = (ranked && newMat >= 0) ? specLookup(sc.mats[newMat].ior, lambda) : (Real)1;
         bool transmitted = false; DVec3 nro, nrd;
-        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor);
+        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor, whittedWeight);
         if (transmitted) stk.popMat(mi);                // TIR stays inside mi
         outO = nro; outD = nrd;
     }
@@ -4034,6 +4138,30 @@ __device__ static int dMixResolveChild(const DScene& sc, const DMaterial& m, con
     Real acc = 0;
     for (int k = 0; k < m.mixCount; ++k) { acc += (Real)m.mixWeight[k]; if (u < acc) return m.mixChild[k]; }
     return -1;
+}
+
+// Deterministic dMixResolveChild for mode W (device twin of scene.h mixResolveDominant +
+// mixDominantChild). A pattern/texture-driven two-way mix picks whichever child dominates AT
+// THIS POINT, so the blend becomes a hard threshold at t == 0.5 rather than a stochastic
+// dither: the preview shows a crisp boundary where the render shows a smooth gradient. That
+// is the honest cost of one deterministic sample per pixel, and it stays put frame to frame.
+// A constant-weight mix picks the heaviest lobe, unless the leftover absorption slice
+// outweighs every single lobe (then -1, i.e. absorbed).
+__device__ static int dMixResolveDominant(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if ((m.mixWeightPat >= 0 || m.mixWeightTex >= 0) && m.mixCount == 2) {
+        Real t = (m.mixWeightPat >= 0)
+               ? (Real)dPatternScalarAt(sc, m.mixWeightPat, h)
+               : (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        return (t >= (Real)0.5) ? m.mixChild[0] : m.mixChild[1];
+    }
+    int best = -1; double bestW = 0.0, sum = 0.0;
+    for (int k = 0; k < m.mixCount; ++k) {
+        if (m.mixWeight[k] > bestW) { bestW = m.mixWeight[k]; best = m.mixChild[k]; }
+        sum += m.mixWeight[k];
+    }
+    if (1.0 - sum > bestW) return -1;   // leftover absorbs more than any single lobe
+    return best;
 }
 
 // Per-hit reflectance of a baked driven record channel at driver `d` and wavelength
@@ -5726,8 +5854,18 @@ struct BkNeeGeom {
     bool  sun;       // distant-sun emitter (cone NEE in solid-angle measure)
     Real  wSun;      // sun only: the complete λ-independent weight cosSurf*Omega*stG
 };
+// Does this emitter consume its two sample coordinates? A collimated beam and a point-spot
+// are deterministic connections and draw nothing; every area shape (and the sun's cone)
+// draws two. Device twin of backward.h's emitterNeedsUV, and the reason (u1,u2) are
+// PARAMETERS rather than drawn inside bkEmitterGeom: mode W has to feed them from the G x G
+// lattice, while the stochastic callers must keep drawing at exactly the same point in the
+// stream (a scene that merely *added* a spot light would otherwise reshuffle every other
+// emitter's rng and change an unrelated image).
+__device__ static bool dEmitterNeedsUV(const DEmitter& em) {
+    return !em.collimated && em.shape != 2;
+}
 __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec3& ngo,
-                                     const DEmitter& em, DRng& rng, BkNeeGeom& g) {
+                                     const DEmitter& em, Real su1, Real su2, BkNeeGeom& g) {
     if (em.shape == 2) {
         // Point spot (device twin of emitterGeom's spot branch): deterministic connect
         // to the light point, cone falloff toward the surface, no rng draw. Peak
@@ -5750,10 +5888,9 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         // Distant sun (device twin of emitterGeom's Sun branch): sample wi uniformly in
         // the solar cone about -beamDir (pdf 1/Omega) and shadow-ray it to the scene exit.
         // No finite light distance, so no 1/dist^2 and no cosLight: in solid-angle measure
-        // the whole λ-independent weight is cosSurf/pdfW = cosSurf*Omega. Two rng draws,
-        // matching the area path, so adding a sun reshuffles no other emitter's stream.
-        double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
-        g.wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
+        // the whole λ-independent weight is cosSurf/pdfW = cosSurf*Omega. Two sample
+        // coordinates, matching the area path (see dEmitterNeedsUV).
+        g.wi = dSunSampleCone(em, em.beamDir * (Real)(-1), (double)su1, (double)su2);
         g.cosSurf = dot(h.n, g.wi);
         if (g.cosSurf <= (Real)0) return false;
         g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
@@ -5765,7 +5902,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.G = (Real)0; g.fall = (Real)1; g.spot = false; g.sun = true;
         return true;
     }
-    Real u1 = rng.uniform(), u2 = rng.uniform();
+    Real u1 = su1, u2 = su2;
     DVec3 y, nL;
     // Also returns this point's `emit pattern:` multiplier (1.0, and a bit-identical
     // draw, when there is none). Folding it into the λ-independent geometry weight G
@@ -5794,29 +5931,49 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     return true;
 }
 
+// `giDepth` selects mode W's shadow-ray grid: 0 = a primary vertex (bkGrid), 1 = a gather
+// vertex (the coarser bkGiGrid — its soft-shadow detail is about to be averaged over giDirs
+// directions anyway, so paying bkGrid^2 there multiplies the gather's cost for no return).
+// Ignored unless sc.bkWhitted.
 __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
-                                    double invPdfLambda, Real lambda, DRng& rng) {
+                                    double invPdfLambda, Real lambda, DRng& rng,
+                                    int giDepth = 0) {
     double total = 0.0;
     Real f = rho / (Real)DPI;                         // Lambertian BRDF
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    const bool whitted = (sc.bkWhitted != 0);
     for (int k = 0; k < sc.nEmitters; ++k) {
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnv)
-        BkNeeGeom g;
-        if (!bkEmitterGeom(sc, h, ngo0, em, rng, g)) continue;
-        double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        double contrib = g.sun
-            ? (double)(f * g.wSun) * emitW
-            : g.spot
-            ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
-            : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
-        // Shadow-ray transmittance through any participating media (superposition;
-        // homogeneous = exact exp with no rng draw, heterogeneous = ratio tracking).
-        // Matches the forward connectVolume / device volume-NEE transmittance so surface
-        // direct light agrees between the forward and backward estimators.
-        if (sc.mediaN > 0)
-            contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lambda, rng);
-        total += contrib;
+        const bool uv = dEmitterNeedsUV(em);
+        // Whitted: G x G deterministic shadow rays per area light, averaged. A
+        // deterministic emitter (spot/beam) has nothing to stratify, so it stays at 1.
+        const int G = (whitted && uv) ? (giDepth ? sc.bkGiGrid : sc.bkGrid) : 1;
+        const int nS = G * G;
+        // Loop-invariant across the lattice (a pure table lookup), so hoisted rather than
+        // repeated per shadow ray — value-identical either way.
+        const double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+        double acc = 0.0;
+        for (int s = 0; s < nS; ++s) {
+            Real u1 = (Real)0, u2 = (Real)0;
+            if (whitted) { if (uv) dGridUV(s, G, u1, u2); }
+            else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
+            BkNeeGeom g;
+            if (!bkEmitterGeom(sc, h, ngo0, em, u1, u2, g)) continue;
+            double contrib = g.sun
+                ? (double)(f * g.wSun) * emitW
+                : g.spot
+                ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
+                : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+            // Shadow-ray transmittance through any participating media (superposition;
+            // homogeneous = exact exp with no rng draw, heterogeneous = ratio tracking).
+            // Matches the forward connectVolume / device volume-NEE transmittance so
+            // surface direct light agrees between the forward and backward estimators.
+            if (sc.mediaN > 0)
+                contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lambda, rng);
+            acc += contrib;
+        }
+        total += (nS > 1) ? acc / (double)nS : acc;
     }
     return total;
 }
@@ -5828,22 +5985,33 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
 // transmittance term (bkRadianceHero is gated on mediaN == 0).
 __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Real* rho,
                                       double* L, const double* thr, const Real* lam,
-                                      const double* invPdf, int nUp, DRng& rng) {
+                                      const double* invPdf, int nUp, DRng& rng,
+                                      int giDepth = 0) {
     DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    const bool whitted = (sc.bkWhitted != 0);
     for (int k = 0; k < sc.nEmitters; ++k) {
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;
-        BkNeeGeom g;
-        if (!bkEmitterGeom(sc, h, ngo0, em, rng, g)) continue;
-        for (int i = 0; i < nUp; ++i) {
-            Real f = rho[i] / (Real)DPI;
-            double emitW = (double)specLookup(em.emitSpd, lam[i]) * invPdf[i];
-            double contrib = g.sun
-                ? (double)(f * g.wSun) * emitW
-                : g.spot
-                ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
-                : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
-            L[i] += thr[i] * contrib;
+        const bool uv = dEmitterNeedsUV(em);
+        const int G = (whitted && uv) ? (giDepth ? sc.bkGiGrid : sc.bkGrid) : 1;
+        const int nS = G * G;
+        const double invS = 1.0 / (double)nS;
+        for (int s = 0; s < nS; ++s) {
+            Real su1 = (Real)0, su2 = (Real)0;
+            if (whitted) { if (uv) dGridUV(s, G, su1, su2); }
+            else if (uv) { su1 = rng.uniform(); su2 = rng.uniform(); }
+            BkNeeGeom g;
+            if (!bkEmitterGeom(sc, h, ngo0, em, su1, su2, g)) continue;
+            for (int i = 0; i < nUp; ++i) {
+                Real f = rho[i] / (Real)DPI;
+                double emitW = (double)specLookup(em.emitSpd, lam[i]) * invPdf[i];
+                double contrib = g.sun
+                    ? (double)(f * g.wSun) * emitW
+                    : g.spot
+                    ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
+                    : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
+                L[i] += (nS > 1) ? thr[i] * contrib * invS : thr[i] * contrib;
+            }
         }
     }
 }
@@ -6030,6 +6198,19 @@ __device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const 
     return contrib;
 }
 
+// Mode W path context (device twin of BackwardRenderer::GiCtx). `depth == 0` is the primary
+// camera path, `depth == 1` a gather ray (does not recurse, uses bkGiGrid, caps at
+// bkGiBounce). `sIdx` is the ABSOLUTE sample index, which rotates every deterministic lattice
+// so -spp progressively refines instead of re-rendering the identical image. `bounce` is the
+// bounce index along the path, so a per-vertex deterministic decision (the glossy lobe — see
+// dWhittedGlossyDir) picks a different sequence at each vertex rather than driving every
+// glossy bounce off the same 1-D lattice.
+struct DGiCtx {
+    int depth = 0;
+    unsigned long long sIdx = 0;
+    int bounce = 0;
+};
+
 // Handle ONE surface material interaction on a single wavelength — the whole material
 // switch, factored out of bkRadiance (device twin of backward.h interactMaterial) so the
 // scalar tracer and the hero tracer (which de-heros before calling this) share one copy.
@@ -6042,10 +6223,20 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                                   int matId, int diffraction, bool directOnly,
                                   DVec3& ro, DVec3& rd, Real& lambda, double& invPdfLambda,
                                   double& thr, double& L, bool& specularArrival,
-                                  double& contBsdfPdf, DMediumStack& stk, DRng& rng) {
+                                  double& contBsdfPdf, DMediumStack& stk, DRng& rng,
+                                  DGiCtx gi = DGiCtx{}) {
+    const bool whitted = (sc.bkWhitted != 0);
     switch (mp->type) {
         case D_DIELECTRIC: {
-            DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd);
+            // Mode W: dominant Fresnel branch weighted into the throughput instead of a coin
+            // flip (see refractOrReflect's whittedWeight). Attenuating AFTER the call is safe
+            // because the ray has not been traced yet — returning false here just ends the
+            // path at this vertex, as elsewhere in mode W.
+            double wW = 1.0;
+            DVec3 nro, nrd;
+            dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd,
+                            whitted ? &wW : nullptr);
+            if (whitted && !dWhittedAttenuate(thr, wW)) return false;
             ro = nro; rd = nrd; specularArrival = true; return true;
         }
         case D_THINFILM: {
@@ -6060,31 +6251,58 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
         }
         case D_MIRROR: {
             Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-            if (rng.uniform() >= r) return false;   // RR absorb
+            // Mode W: carry the reflectance as WEIGHT instead of rolling for survival. Same
+            // expected value, zero variance — the whole reason a deterministic preview
+            // converges at 1 spp where Russian roulette needs tens.
+            if (whitted) { if (!dWhittedAttenuate(thr, (double)r)) return false; }
+            else if (rng.uniform() >= r) return false;   // RR absorb
             ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); specularArrival = true; return true;
         }
         case D_GRATING: {
             Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-            if (rng.uniform() >= r) return false;
+            if (whitted) { if (!dWhittedAttenuate(thr, (double)r)) return false; }
+            else if (rng.uniform() >= r) return false;
             DVec3 nro, nrd;
             if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) return false;
             ro = nro; rd = nrd; specularArrival = true; return true;
         }
         case D_HALFMIRROR: {
             Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-            if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
-            else                   { ro = h.p + rd * RAY_EPS; }
+            // Mode W: a true beam splitter needs the path to FORK, which this iterative loop
+            // cannot do. Take the dominant branch and weight it, so a preview is stable rather
+            // than a 50/50 coin flipped per pixel. (The minority branch is dropped, not just
+            // dimmed — a half mirror previews as whichever lobe is stronger.)
+            if (whitted) {
+                const bool refl = (r >= (Real)0.5);
+                if (!dWhittedAttenuate(thr, refl ? (double)r : 1.0 - (double)r)) return false;
+                if (refl) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
+                else      { ro = h.p + rd * RAY_EPS; }
+            } else if (rng.uniform() < r) { ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n); }
+            else                          { ro = h.p + rd * RAY_EPS; }
             specularArrival = true; return true;
         }
         case D_FILTER: {
             // Colored gel filter: pass straight through, survive with prob T(lambda).
             Real t = clamp01(dTransmitSlot(sc, *mp, h, lambda));
-            if (rng.uniform() >= t) return false;   // absorbed
+            if (whitted) { if (!dWhittedAttenuate(thr, (double)t)) return false; }
+            else if (rng.uniform() >= t) return false;   // absorbed
             ro = h.p + rd * RAY_EPS;                // direction unchanged
             specularArrival = true; return true;
         }
         case D_GLOSSY: {
             Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
+            // Mode W: the lobe off a deterministic lattice rather than the rng, so the
+            // direction is the same for every pixel (noise-free) but varies with the sample
+            // index (so -spp actually resolves the lobe). At -spp 1 this IS the mirror
+            // direction, which is exact for a near-mirror and over-sharpens as roughness
+            // grows; the fix for that is more spp, which now works.
+            if (whitted) {
+                if (!dWhittedAttenuate(thr, (double)r)) return false;
+                DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
+                                            gi.sIdx, gi.bounce);
+                if (dot(o, h.n) <= 0) return false;
+                ro = h.p + h.n * RAY_EPS; rd = o; specularArrival = true; return true;
+            }
             if (rng.uniform() >= r) return false;
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
             if (dot(o, h.n) <= 0) return false;
@@ -6100,13 +6318,17 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             Real sum = rhoR + rhoT;
             if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
             DVec3 nb = h.n * (Real)(-1);
-            L += thr * bkNeeLight(sc, h, rhoR, invPdfLambda, lambda, rng);   // front lobe
+            L += thr * bkNeeLight(sc, h, rhoR, invPdfLambda, lambda, rng, gi.depth);  // front
             if (sc.envIndex >= 0)
                 L += thr * bkNeeEnv(sc, h, rhoR, invPdfLambda, lambda, rng);
             DHit hb = h; hb.n = nb;
-            L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng);  // back lobe
+            L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng, gi.depth); // back
             if (sc.envIndex >= 0)
                 L += thr * bkNeeEnv(sc, hb, rhoT, invPdfLambda, lambda, rng);
+            // Mode W indirect diffuse. A translucent surface receives from the FULL sphere, so
+            // both lobes take the fill — before v0.106.0 a DiffuseTransmit vertex got none.
+            if (whitted && sc.bkAmbient > 0.0)
+                L += thr * (double)(rhoR + rhoT) * sc.bkAmbient;
             if (directOnly) return false;            // Whitted: no diffuse indirect
             Real u = rng.uniform();
             if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; ro = h.p + h.n * RAY_EPS; rd = wOut; specularArrival = false; return true; }
@@ -6166,9 +6388,11 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
         case D_DIFFUSE:
         default: {
             Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
-            L += thr * bkNeeLight(sc, h, rho, invPdfLambda, lambda, rng);
+            L += thr * bkNeeLight(sc, h, rho, invPdfLambda, lambda, rng, gi.depth);
             if (sc.envIndex >= 0)                   // env-NEE toward the sky (MIS'd on miss)
                 L += thr * bkNeeEnv(sc, h, rho, invPdfLambda, lambda, rng);
+            if (whitted && sc.bkAmbient > 0.0)      // indirect diffuse: the flat stand-in
+                L += thr * (double)rho * sc.bkAmbient;
             if (directOnly) return false;           // Whitted: no diffuse indirect
             if (rng.uniform() >= rho) return false; // RR on albedo
             DVec3 wOut = cosineHemisphere(h.n, rng);
@@ -6182,14 +6406,21 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
 // backward.h radiance, v1 scope: participating media + constant environment light).
 // Emission added only on specular/camera arrival; diffuse arrivals are covered by NEE.
 __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
-                                    Real lambda, double invPdfLambda, DRng& rng) {
+                                    Real lambda, double invPdfLambda, DRng& rng,
+                                    DGiCtx gi = DGiCtx{}) {
     double L = 0.0, thr = 1.0;
-    bool specularArrival = true;                       // camera ray may see a light directly
+    bool specularArrival = (gi.depth == 0);            // camera ray may see a light directly; a
+                                                       // gather ray must NOT (the vertex's own
+                                                       // NEE already counted that emitter)
     double contBsdfPdf = 0.0;                           // solid-angle pdf of the current continuation (env MIS)
     DMediumStack stk; stk.clear();                     // nested-dielectric medium stack (empty = vacuum)
-    const int maxBounce = sc.bkMaxBounce;
+    const bool whitted = (sc.bkWhitted != 0);
+    const int maxBounce = (whitted && gi.depth) ? sc.bkGiBounce : sc.bkMaxBounce;
     const bool directOnly = (sc.bkDirectOnly != 0);
     for (int b = 0; b < maxBounce; ++b) {
+        // Publish the bounce index so a deterministic per-vertex choice (mode W's glossy
+        // lobe) can pick a decorrelated sequence at each depth. Costs nothing otherwise.
+        gi.bounce = b;
         // GRIN curved-marching pre-pass (M11): bend the ray through any gradient-index
         // region it enters (symplectic Eikonal integration) BEFORE the surface query —
         // the exact device twin of the forward megakernel's pre-closestHit march and of
@@ -6251,6 +6482,11 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             // a clean single-strategy split, not a missing MIS weight (host twin: backward.h).
             if (sc.sunCount > 0 && specularArrival)
                 L += thr * dSunRadiance(sc, rd, lambda) * invPdfLambda;
+            // Escaped gather ray -> the far-field `ambient` fill. This is what makes -gi and
+            // -ambient compose: in an empty scene every direction escapes and the normalised
+            // gather collapses exactly back to rho * ambient, so switching -gi on never
+            // steps the exposure.
+            if (whitted && gi.depth && sc.bkAmbient > 0.0) L += thr * sc.bkAmbient;
             return L;
         }
         // Beer-Lambert attenuation over the in-glass segment up to this surface
@@ -6262,8 +6498,9 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         }
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
-        if (mp->type == D_MIX) {                       // resolve stochastic mix
-            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+        if (mp->type == D_MIX) {                       // resolve the mix to a child material
+            int child = whitted ? dMixResolveDominant(sc, *mp, h)
+                                : dMixResolveChild(sc, *mp, h, rng.uniform());
             if (child < 0) return L;                    // absorbed
             mp = &sc.mats[child]; matId = child;
         }
@@ -6276,7 +6513,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                      * dEmitPatMul(sc, mp->emitPat, h);
 
         if (!bkInteract(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
-                        invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk, rng))
+                        invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk, rng, gi))
             return L;                                   // path terminated in the interaction
     }
     return L;
@@ -6293,20 +6530,28 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
 // branches are absent here. Fills Lout[0..C).
 __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
                                       const Real* lamIn, const double* invPdfIn, int C,
-                                      double* Lout, DRng& rng) {
+                                      double* Lout, DRng& rng, DGiCtx gi = DGiCtx{}) {
     Real   lam[hero::kHeroMax];
     double invPdf[hero::kHeroMax], thr[hero::kHeroMax];
     for (int i = 0; i < C; ++i) { lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = 1.0; Lout[i] = 0.0; }
     double* L = Lout;                                  // accumulate straight into the output
     bool secAlive = (C > 1);
-    bool specularArrival = true;                       // camera ray may see a light directly
+    bool specularArrival = (gi.depth == 0);            // camera ray may see a light directly; a
+                                                       // gather ray must NOT (its origin vertex's
+                                                       // own NEE already counted that emitter)
     double contBsdfPdf = 0.0;                          // solid-angle pdf of the continuation (env MIS)
     DMediumStack stk; stk.clear();                     // dielectric priority (Beer-Lambert on the hero λ)
-    const int maxBounce = sc.bkMaxBounce;
+    const bool whitted = (sc.bkWhitted != 0);
+    // Gather rays are bounce-capped (see bkGiBounce) so a highly reflective lattice cannot
+    // turn one gather direction into a 60-deep ricochet.
+    const int maxBounce = (whitted && gi.depth)
+                        ? (sc.bkGiBounce < sc.bkMaxBounce ? sc.bkGiBounce : sc.bkMaxBounce)
+                        : sc.bkMaxBounce;
     const bool directOnly = (sc.bkDirectOnly != 0);
 
     for (int b = 0; b < maxBounce; ++b) {
         int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
+        gi.bounce = b;                                 // see the scalar twin: mode W's per-vertex lattice
         DHit h = closestHit(sc, ro, rd);
 
         // Beer-Lambert over the in-glass segment. A non-empty stack implies we already
@@ -6339,13 +6584,18 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
             if (sc.sunCount > 0 && specularArrival)     // directly-viewed solar disc
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * dSunRadiance(sc, rd, lam[i]) * invPdf[i];
+            // Escaped GATHER ray -> the far-field `ambient` fill, which is what makes -gi and
+            // -ambient compose instead of compete (see the scalar twin bkRadiance).
+            if (whitted && gi.depth && sc.bkAmbient > 0.0)
+                for (int i = 0; i < nUp; ++i) L[i] += thr[i] * sc.bkAmbient;
             return;
         }
 
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
-        if (mp->type == D_MIX) {                       // resolve stochastic mix
-            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+        if (mp->type == D_MIX) {                       // resolve the mix to a child material
+            int child = whitted ? dMixResolveDominant(sc, *mp, h)
+                                : dMixResolveChild(sc, *mp, h, rng.uniform());
             if (child < 0) return;                      // absorbed
             mp = &sc.mats[child]; matId = child;
         }
@@ -6369,11 +6619,16 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
                     rhoR[i] = rr; rhoT[i] = rt;
                 }
                 DVec3 nb = h.n * (Real)(-1);
-                bkNeeLightHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng);      // front lobe
+                bkNeeLightHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng, gi.depth);   // front
                 if (sc.envIndex >= 0) bkNeeEnvHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng);
                 DHit hb = h; hb.n = nb;                            // back hemisphere (transmit lobe)
-                bkNeeLightHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                bkNeeLightHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng, gi.depth);
                 if (sc.envIndex >= 0) bkNeeEnvHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                // Mode W indirect diffuse: a translucent surface receives from the FULL
+                // sphere, so both lobes take the fill.
+                if (whitted && sc.bkAmbient > 0.0)
+                    for (int i = 0; i < nUp; ++i)
+                        L[i] += thr[i] * (double)(rhoR[i] + rhoT[i]) * sc.bkAmbient;
                 if (directOnly) return;                            // Whitted: no diffuse indirect
                 // Lobe pick + RR over the whole bundle (see D_DIFFUSE): the reflect/transmit
                 // probabilities are the per-lobe MAX over live λ, so no secondary is ever
@@ -6419,12 +6674,30 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
                                                   : clamp01(dReflectSlot(sc, *mp, h, lam[i]));
                     if ((double)c[i] > q) q = (double)c[i];
                 }
-                if (rng.uniform() >= q) return;                    // RR absorb (q == 0 -> always)
-                for (int i = 0; i < nUp; ++i) thr[i] *= (double)c[i] / q;
+                if (whitted) {
+                    // Deterministic: carry every live λ's coefficient as weight (no coin, no
+                    // c_i/q reweight) and stop only once the WHOLE bundle has fallen under the
+                    // bailout — a per-λ cutoff would silently de-hero at a gel.
+                    double thrMax = 0.0;
+                    for (int i = 0; i < nUp; ++i) {
+                        thr[i] *= (double)c[i];
+                        if (thr[i] > thrMax) thrMax = thr[i];
+                    }
+                    if (thrMax <= kWhittedCutoff) return;
+                } else {
+                    if (rng.uniform() >= q) return;                // RR absorb (q == 0 -> always)
+                    for (int i = 0; i < nUp; ++i) thr[i] *= (double)c[i] / q;
+                }
                 if (mp->type == D_MIRROR) {
                     ro = h.p + h.n * RAY_EPS; rd = reflectv(rd, h.n);
                 } else if (mp->type == D_FILTER) {
                     ro = h.p + rd * RAY_EPS;                       // direction unchanged
+                } else if (whitted) {
+                    // Glossy: the lobe off the deterministic lattice (mirror at sample 0).
+                    DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
+                                                gi.sIdx, b);
+                    if (dot(o, h.n) <= 0) return;
+                    ro = h.p + h.n * RAY_EPS; rd = o;
                 } else {
                     DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                     if (dot(o, h.n) <= 0) return;
@@ -6443,7 +6716,8 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
                 // the only live wavelength.
                 if (secAlive) { thr[0] *= (double)C; secAlive = false; }
                 if (!bkInteract(sc, mp, h, matId, diffraction, directOnly, ro, rd, lam[0],
-                                invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk, rng))
+                                invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk,
+                                rng, gi))
                     return;
                 break;
             }
@@ -6451,8 +6725,12 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
             default: {
                 Real rho[hero::kHeroMax];
                 for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, *mp, h, lam[i]));
-                bkNeeLightHero(sc, h, rho, L, thr, lam, invPdf, nUp, rng);
+                bkNeeLightHero(sc, h, rho, L, thr, lam, invPdf, nUp, rng, gi.depth);
                 if (sc.envIndex >= 0) bkNeeEnvHero(sc, h, rho, L, thr, lam, invPdf, nUp, rng);
+                // The mode-W indirect-diffuse term. Without it a CLOSED room previews with
+                // black shadows, since every non-key-lit surface there is lit purely by bounce.
+                if (whitted && sc.bkAmbient > 0.0)
+                    for (int i = 0; i < nUp; ++i) L[i] += thr[i] * (double)rho[i] * sc.bkAmbient;
                 if (directOnly) return;                            // Whitted: no diffuse indirect
                 // Continuation RR over the WHOLE bundle: survival probability is max_i rho_i,
                 // not the hero's own albedo, and every live λ reweights by rho_i/q <= 1.
@@ -6497,6 +6775,14 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
         size_t o = ((size_t)py * resX + px) * 3;
+        // Mode W's ABSOLUTE sample index — the same quantity the host calls sIdx, i.e. WITHOUT
+        // the pixel term that `gidx` carries. Every pixel must share it, since sharing the
+        // sample offsets is exactly what makes the mode noise-free; and it must be absolute,
+        // so the image is independent of how the budget was chunked (a per-chunk index would
+        // collapse to "sample 0 forever" under -window, which chunks into 1-spp batches).
+        const unsigned long long sIdx =
+            (unsigned long long)(sampleBase + (idx - pix * chunkSpp));
+        const bool whitted = (sc.bkWhitted != 0);
 
         if (heroC > 1) {
             // One stratified base draw -> hero + C-1 secondary wavelengths, all from the
@@ -6505,7 +6791,12 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
             // splats nothing. Hero is gated off for a physical lens, so no lens weight.
             Real   lam[hero::kHeroMax];
             double invPdf[hero::kHeroMax];
-            double u = (double)rng.uniform(), pdf0 = 0.0;
+            // Mode W: the bundle's base coordinate comes off the progressive deterministic
+            // sequence instead of the rng, so the C wavelengths land on a FIXED lattice of the
+            // emission CDF. Without this the mode would still be noise-free in geometry and
+            // shading and yet visibly speckled in COLOUR, because λ was the last random draw.
+            double u = whitted ? dWhittedLambdaU(sIdx) : (double)rng.uniform();
+            double pdf0 = 0.0;
             lam[0] = dSampleSceneLambdaU(sc, u, pdf0);
             if (pdf0 <= 0.0) continue;
             invPdf[0] = dInvPdfLambda(sc, lam[0]);
@@ -6517,10 +6808,16 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
                 invPdf[i] = (pdfi > 0.0) ? dInvPdfLambda(sc, lam[i]) : 0.0;
             }
             DVec3 hro, hrd;
-            Real jx = rng.uniform(), jy = rng.uniform();
+            Real jx, jy;
+            if (whitted) { double u1, u2; dWhittedSample(sIdx, u1, u2); jx = (Real)u1; jy = (Real)u2; }
+            else         { jx = rng.uniform(); jy = rng.uniform(); }
             dGenRay(cam, px, py, jx, jy, hro, hrd);
             double Lh[hero::kHeroMax];
-            bkRadianceHero(sc, diffraction, hro, hrd, lam, invPdf, heroC, Lh, rng);
+            // DGiCtx carries the ABSOLUTE sample index down the path, which rotates every
+            // deterministic lattice (glossy lobe, gather directions) by it — so, exactly like
+            // the subpixel and wavelength lattices, they are progressive and chunk-independent.
+            bkRadianceHero(sc, diffraction, hro, hrd, lam, invPdf, heroC, Lh, rng,
+                           DGiCtx{0, sIdx, 0});
             for (int i = 0; i < heroC; ++i) {
                 double w = Lh[i] / (double)heroC;
                 atomicAdd(&film[o + 0], (double)cieX(lam[i]) * w);
@@ -6532,23 +6829,32 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         }
 
         double pdf = 0.0;
-        Real lambda = dSampleSceneLambda(sc, rng, pdf);
+        // Mode W: stratified λ, as in the hero path above. Note this scalar path carries ONE
+        // wavelength per sample, so a deterministic spectral preview here needs spp raised to
+        // cover the spectrum (the hero path, which is the usual one, gets heroC per sample).
+        Real lambda = whitted ? dSampleSceneLambdaU(sc, dWhittedLambdaU(sIdx), pdf)
+                              : dSampleSceneLambda(sc, rng, pdf);
         if (pdf <= 0.0) continue;
         double invPdfLambda = dInvPdfLambda(sc, lambda);
 
         DVec3 ro, rd;
         double wLens = 1.0;
         if (cam.hasLens) {
+            // The physical-lens path stays stochastic even in mode W (host twin: renderRows
+            // takes jx/jy/u1/u2 off the rng here), so a lens render is not noise-free.
             Real jx = rng.uniform(), jy = rng.uniform();
             Real u1 = rng.uniform(), u2 = rng.uniform();
             Real wl = 0;
             if (!dGenLensRay(cam, px, py, jx, jy, u1, u2, lambda, ro, rd, wl)) continue;  // vignetted
             wLens = (double)wl;
         } else {
-            Real jx = rng.uniform(), jy = rng.uniform();
+            Real jx, jy;
+            if (whitted) { double s1, s2; dWhittedSample(sIdx, s1, s2); jx = (Real)s1; jy = (Real)s2; }
+            else         { jx = rng.uniform(); jy = rng.uniform(); }
             dGenRay(cam, px, py, jx, jy, ro, rd);
         }
-        double Lval = bkRadiance(sc, diffraction, ro, rd, lambda, invPdfLambda, rng);
+        double Lval = bkRadiance(sc, diffraction, ro, rd, lambda, invPdfLambda, rng,
+                                 DGiCtx{0, sIdx, 0});
         double w = Lval * wLens;
         atomicAdd(&film[o + 0], (double)cieX(lambda) * w);
         atomicAdd(&film[o + 1], (double)cieY(lambda) * w);
@@ -10360,6 +10666,14 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     // wrappers (renderBackward[RGB]Cuda) override from the CLI flags before launch.
     sc.bkMaxBounce  = 32;
     sc.bkDirectOnly = 0;
+    // Mode W knobs. Defaults = mode W off, so every stochastic mode is untouched.
+    sc.bkWhitted   = 0;
+    sc.bkGrid      = 4;
+    sc.bkGiDirs    = 0;
+    sc.bkGiGrid    = 1;
+    sc.bkGiBounce  = 4;
+    sc.bkHeroSplit = 0;
+    sc.bkAmbient   = 0.0;
 
     // One-time fill of the specular-sphere scan-angle cos/sin tables (device-computed
     // so table entries are bit-identical to the per-step evaluation they replace).
@@ -10899,17 +11213,71 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     return true;
 }
 
+// Does any geometry in the scene use a material whose outgoing direction (or wavelength)
+// depends on λ, so that a hero bundle cannot keep riding one shared direction past it?
+// These are exactly backward.h's de-hero cases. Mode W REQUIRES them to be split into
+// monochromatic sub-paths rather than de-hero'd, because its λ lattice is shared by every
+// pixel: de-hero'ing would collapse the WHOLE FRAME onto one wavelength and mistint every
+// dispersive object (36.7 pp of chroma error, measured). The device split lands in N3b; until
+// then such a scene falls back to the CPU mode-W tracer.
+static bool sceneHasDispersiveMat(const Scene& scene) {
+    auto isDisp = [&](int matId) {
+        if (matId < 0 || matId >= (int)scene.mats.size()) return false;
+        const Material& m = scene.mats[matId];
+        switch (m.type) {
+            case MatType::Dielectric: case MatType::ThinFilm: case MatType::Multilayer:
+            case MatType::Grating:    case MatType::HalfMirror: case MatType::Fluorescent:
+                return true;
+            default: return false;
+        }
+    };
+    auto bad = [&](int matId) {
+        if (isDisp(matId)) return true;
+        if (matId >= 0 && matId < (int)scene.mats.size() &&
+            scene.mats[matId].type == MatType::Mix)
+            for (int c : scene.mats[matId].mixChildren) if (isDisp(c)) return true;
+        return false;
+    };
+    for (const auto& t : scene.tris)       if (bad(t.matId)) return true;
+    for (const auto& s : scene.spheres)    if (bad(s.matId)) return true;
+    for (const auto& im : scene.implicits) if (bad(im.matId)) return true;
+    return false;
+}
+
+bool cudaBackwardWhittedSupported(const Scene& scene, const Camera& cam,
+                                  const WhittedOpts& w) {
+    // Mode W rides the SAME device megakernel as mode R (kBackward), swapping only the
+    // estimators, so it inherits mode R's whole scope first.
+    if (!cudaBackwardSupported(scene, cam)) return false;
+    // N3a scope. Two constructs of the CPU tracer are still missing on the device, and both
+    // would be a VISIBLE deterministic difference rather than noise, so they gate instead of
+    // degrade. Widening these is N3b (split-at-dispersion) and N3c (the -gi gather).
+    if (sceneHasDispersiveMat(scene)) return false;   // needs heroSplit on the device (N3b)
+    if (w.giDirs > 0) return false;                   // needs giGatherHero on the device (N3c)
+    return true;
+}
+
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction, const SppProgress* prog,
-                        int maxBounce, bool directOnly, int heroC) {
+                        int maxBounce, bool directOnly, int heroC, const WhittedOpts* whitted) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBackwardSupported(scene, cam)) return out;
+    if (whitted && !cudaBackwardWhittedSupported(scene, cam, *whitted)) return out;
 
     DUpload up;
     buildUpload(scene, cam, resX, resY, up);
     if (maxBounce >= 1) up.sc.bkMaxBounce = maxBounce;   // Stage 3: -max-bounce cap
     up.sc.bkDirectOnly = directOnly ? 1 : 0;             // Stage 3: -direct-only (Whitted)
+    if (whitted) {                                       // -mode W deterministic preview
+        up.sc.bkWhitted   = 1;
+        up.sc.bkGrid      = whitted->grid;
+        up.sc.bkGiDirs    = whitted->giDirs;
+        up.sc.bkGiGrid    = whitted->giGrid;
+        up.sc.bkGiBounce  = whitted->giBounce;
+        up.sc.bkHeroSplit = whitted->heroSplit ? 1 : 0;
+        up.sc.bkAmbient   = whitted->ambient;
+    }
     // Hero-wavelength bundle (`-heroc N`). bkRadianceHero covers the plain surface walk
     // only, so fall back to the single-λ estimator when the scene needs a branch it does
     // not carry: participating media, gradient-index bending, or a physical lens (whose

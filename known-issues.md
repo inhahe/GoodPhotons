@@ -5166,7 +5166,39 @@ correctly on **both** backends.
   backend by scene material variety + path depth rather than always defaulting to the
   megakernel.
 
-### OPEN (opportunity, v0.107.0): mode W is the only render mode with NO GPU path
+### MOSTLY DONE (2026-07-29, v0.110.0): mode W is the only render mode with NO GPU path
+**Closed for the common case by TODO.md §N/N3a.** Mode W now rides the same `kBackward`
+megakernel as mode R with the estimators swapped: seven `DScene` knobs (`bkWhitted`, `bkGrid`,
+`bkGiDirs`, `bkGiGrid`, `bkGiBounce`, `bkHeroSplit`, `bkAmbient`) uploaded from a `WhittedOpts`
+(`src/render_cuda.h`), device twins of every lattice helper (`dRadicalInverse2` /
+`dRadicalInverseB` / `dRot05` / `dWhittedSample` / `dWhittedLambdaU` / `dWhittedGlossyDir` /
+`dWhittedAttenuate` / `dGridUV`), the G×G light quadrature in `bkNeeLight`/`bkNeeLightHero`, and
+the whitted branches of `bkInteract` / `bkRadiance` / `bkRadianceHero`. Measured on
+`scraps/n3_gpu.ftsl` (800×520 `-spp 16`, absolute exposure, `scraps/n3_check.py`): **99.39 %** of
+channel samples bit-identical CPU↔GPU, 99.96 % within one 8-bit code, **zero** pixels inside a
+≥3 px-wide disagreeing region (all residual is single-pixel silhouette/shadow-edge slivers from
+the device's fp32 `Real` + coarser `RAY_EPS`); **12.1 s → 0.3 s**, i.e. ≈40×, well above the ~8.5×
+mode-R ratio predicted below.
+
+**Still open (both fall back to the CPU mode-W tracer rather than degrade, since a missing
+deterministic term is a visible error, not extra noise):**
+- **Dispersive materials** (Dielectric / ThinFilm / Multilayer / Grating / HalfMirror /
+  Fluorescent). `bkRadianceHero` still *de-heros* at those vertices, and mode W requires the
+  split-at-dispersion walk instead (its λ lattice is shared by every pixel — see the FIXED
+  v0.108.0 entry above). Gated by `sceneHasDispersiveMat` in `cudaBackwardWhittedSupported`.
+  *Proper fix (TODO.md §N/N3b):* re-express `bkRadianceHero` as a re-enterable loop with
+  `template<bool AllowSplit>`, mirroring N1's `radianceHeroLoop`, then drop the gate.
+- **`-gi <n>`** (the deterministic one-bounce gather), a depth-1 recursion.
+  *Proper fix (TODO.md §N/N3c):* `template<int GiDepth>` + a device `dGiDir` Fibonacci-spiral
+  lattice, then drop the `giDirs > 0` gate. `DGiCtx` and all four depth-1 behaviours plus the
+  escaped-gather `bkAmbient` tail already landed in N3a.
+
+Also worth recording: **`-rgb` is now refused in mode W** (message in `main.cpp`) rather than
+silently taken — the fast RGB kernel is a separate reduced tracer with no deterministic
+estimator, so it would return exactly the noise mode W exists to remove.
+
+<details><summary>original entry (v0.107.0)</summary>
+
 - **Where:** `main.cpp:4292` — `const bool gpuBackwardMode = (mode == 'R' && !g_whitted);`
   is the entire gate. Mode W is mode R with `g_whitted`, so that one clause routes it to the
   CPU unconditionally. `render_cuda.cu` has zero whitted plumbing: the device `DScene` carries
@@ -5234,6 +5266,7 @@ correctly on **both** backends.
   `-ambient`/`-amb` (`g_ambient`) in v0.106.0. `bkWhitted`/`bkGrid`/`bkGiGrid`/`bkAmbient` are
   just the proposed device-`DScene` field names (matching the existing `bkDirectOnly`) that would
   carry those existing CPU features across. This is a pure port, not a feature.
+</details>
 
 ## Performance
 

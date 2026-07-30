@@ -4290,12 +4290,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     const bool gpuForwardMode =
         (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
     const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
-    // GPU backward reference megakernel (own check). -mode W is excluded: the device
-    // megakernel has its own twin of the NEE / RR / lobe sampling (render_cuda.cu), none
-    // of which knows about the deterministic estimators, so running it would silently
-    // give back the noisy image the mode exists to avoid. Whitted stays on the CPU --
-    // which it can afford, being ~1 spp.
-    const bool gpuBackwardMode = (mode == 'R' && !g_whitted);
+    // GPU backward reference megakernel (own check). -mode W runs here too: the device
+    // megakernel carries a full twin of the deterministic estimators (the bkWhitted /
+    // bkGrid / bkGi* / bkAmbient DScene knobs + the dWhitted* lattice helpers in
+    // render_cuda.cu), so it reproduces the CPU's noise-free image rather than the noisy
+    // one the mode exists to avoid. The device twin is not yet complete, though --
+    // cudaBackwardWhittedSupported() rejects dispersive materials and -gi, and those
+    // scenes fall back to the CPU mode-W tracer (which they can afford, being ~1 spp).
+    const bool gpuBackwardMode = (mode == 'R');
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
     const bool fisheyeCam = (cam.projection != CAM_RECTILINEAR);
@@ -4318,6 +4320,19 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      mode);
         return 1;
     }
+#ifdef HAVE_CUDA
+    // Mode W's device knobs — the exact twin of the BackwardRenderer setup in the mode-R CPU
+    // worker above (renderBackward's lambda), so the two estimators are configured
+    // identically. Built here because BOTH the -device gate below and the mode-R dispatch
+    // need it. Only read when g_whitted.
+    WhittedOpts whittedOpts;
+    whittedOpts.grid      = g_whittedGrid;
+    whittedOpts.giDirs    = g_gi;
+    whittedOpts.giGrid    = g_giGrid;
+    whittedOpts.giBounce  = g_giBounce;
+    whittedOpts.heroSplit = hero::gSplit || g_whitted;
+    whittedOpts.ambient   = g_ambient * scene.ambientRef();
+#endif
     bool useGpu = false;
     if (!wantGpu && !wantAuto && std::strcmp(device, "cpu"))
         std::fprintf(stderr, "[device] unknown -device '%s'; using CPU "
@@ -4352,10 +4367,21 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // participating media (homog+heterog, incl. rainbow phase — M10), GRIN
             // marching (M11), fluorescence, and BOTH a constant and an image-based env
             // light (M1). Collimated beams still fall back to the CPU backward tracer.
-            if (!cudaBackwardSupported(scene, cam)) {
-                const char* why = "scene has a backward-GPU-unsupported feature "
-                                  "(collimated light, an `emit pattern:` emission "
-                                  "profile, or a lens deeper than the device cap)";
+            // -mode W adds its own narrower check on top: the deterministic device twin
+            // does not yet cover the split-at-dispersion walk or the -gi gather, so those
+            // scenes stay on the CPU mode-W tracer (cheap there — mode W is ~1 spp).
+            const bool bwOk = g_whitted
+                            ? cudaBackwardWhittedSupported(scene, cam, whittedOpts)
+                            : cudaBackwardSupported(scene, cam);
+            if (!bwOk) {
+                const char* why = g_whitted
+                    ? "mode W scene is outside the deterministic GPU scope (a "
+                      "dispersion-dependent material -- glass/thin-film/multilayer/grating/"
+                      "half-mirror/fluorescent -- or -gi, or a backward-GPU-unsupported "
+                      "feature)"
+                    : "scene has a backward-GPU-unsupported feature "
+                      "(collimated light, an `emit pattern:` emission "
+                      "profile, or a lens deeper than the device cap)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -4419,7 +4445,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         bool rgbFast = false;
 #ifdef HAVE_CUDA
         if (rgbBackward) {
-            if (gpuBackward && cudaBackwardRGBSupported(scene, cam)) rgbFast = true;
+            // The RGB kernel is a separate reduced tracer with no deterministic twin, so
+            // -mode W keeps the spectral estimator (the whole point of W is a noise-free
+            // image; the RGB kernel would hand back a noisy one).
+            if (g_whitted)
+                std::fprintf(stderr, "[render] -rgb ignored in -mode W: the fast RGB backward "
+                                     "has no deterministic estimator; using the spectral "
+                                     "mode-W tracer\n");
+            else if (gpuBackward && cudaBackwardRGBSupported(scene, cam)) rgbFast = true;
             else std::fprintf(stderr, "[render] -rgb (fast RGB backward) not applicable to this "
                                       "render (%s); using the spectral backward tracer\n",
                               gpuBackward ? "scene outside the RGB fast-path scope"
@@ -4439,7 +4472,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (rgbFast)      return renderBackwardRGBCuda(scene, cam, res, resY, sppTarget, diffraction, p,
                                                            g_maxBounceOverride, g_directOnly);
             if (gpuBackward)  return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p,
-                                                        g_maxBounceOverride, g_directOnly, g_heroC);
+                                                        g_maxBounceOverride, g_directOnly, g_heroC,
+                                                        g_whitted ? &whittedOpts : nullptr);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {

@@ -201,7 +201,7 @@ paths they can capture at all**.
 | `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera; independent photons | CPU + **GPU** |
 | `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU + GPU |
 | `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU + **GPU** |
-| `W` | Deterministic preview | Mode `R` with **every estimator replaced by a fixed quadrature** — a POV-Ray-style Whitted render that is noise-free at `-spp 1` and ~2 orders of magnitude faster than converging `R`. Trades multi-bounce GI (see `-ambient` for a flat fill, `-gi` for a real deterministic one-bounce gather) and unbiasedness for speed. Also drives the interactive viewer's live lit preview (`-explore`, `T`) | CPU |
+| `W` | Deterministic preview | Mode `R` with **every estimator replaced by a fixed quadrature** — a POV-Ray-style Whitted render that is noise-free at `-spp 1` and ~2 orders of magnitude faster than converging `R`. Trades multi-bounce GI (see `-ambient` for a flat fill, `-gi` for a real deterministic one-bounce gather) and unbiasedness for speed. Also drives the interactive viewer's live lit preview (`-explore`, `T`) | CPU + **GPU** (see below) |
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
@@ -338,8 +338,30 @@ luminaire occludes the ambient sky, which is what you want, but it does mean `-g
 > light — see *Absolute power*) so the gain is fixed and a brightness change is a real
 > brightness change.
 
-**Honest limits.** Mode `W` is a *preview*, not a reference: it is biased. It is CPU-only
-(the GPU backward megakernel keeps the stochastic path). **Rough glossy metal is the one
+**On the GPU.** Since v0.110.0 mode `W` also runs on the **backward megakernel** (`-device
+gpu`/`auto`), with the deterministic estimators ported rather than approximated — the light
+grid, the throughput cutoff, the dominant branches and all three radical-inverse lattices
+(subpixel / wavelength / glossy lobe) are the same quadratures the CPU uses, indexed by the
+same absolute sample index. On the A/B test bed (`scraps/n3_gpu.ftsl`, 800×520, `-spp 16`,
+absolute exposure) **99.4 % of channel samples are bit-identical** between `-device cpu` and
+`-device gpu` and 99.96 % are within one 8-bit code; the residual is confined to
+**single-pixel slivers on silhouettes and shadow edges** (zero pixels sit inside a ≥3 px-wide
+disagreeing region), which is what the device's fp32 `Real` and its coarser `RAY_EPS` cost.
+It is not bit-exact and cannot be — but it is not a different *image*. The same render is
+**12.1 s → 0.3 s** (≈40×) on a 4090 versus 12 CPU threads.
+
+Two constructs of the CPU tracer are not on the device yet, and because a missing
+deterministic term is a *visible* error rather than extra noise they **fall back to the CPU
+mode-`W` tracer** instead of silently degrading (a `[device] … using CPU` line says so):
+a scene containing any **dispersion-dependent material** (glass / thin-film / multilayer /
+grating / half-mirror / fluorescent — these need the split-at-dispersion walk described
+below), and **`-gi`** (the one-bounce gather). Everything else — diffuse, diffuse-transmit,
+mirror, glossy, filter, material mixes, `-ambient`, area/sphere/cylinder/spot/sun/env
+lights, the physical lens — runs on the GPU. `-rgb` is ignored in mode `W`: the fast RGB
+kernel is a separate reduced tracer with no deterministic estimator, so it would hand back
+exactly the noise mode `W` exists to remove.
+
+**Honest limits.** Mode `W` is a *preview*, not a reference: it is biased. **Rough glossy metal is the one
 thing that wants `-spp` > 1**: at 1 spp the lobe is its single mirror direction, so a satin
 metal previews crisper than it renders. It is not stuck there — the lobe direction comes off
 a deterministic lattice indexed by the sample index, so extra passes resolve it (on gold at
@@ -691,7 +713,7 @@ that converges to the same physical image.
 | `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black |
 | `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
 | `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
-| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe, CPU only |
+| `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe; on the GPU except for dispersive materials and `-gi` |
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
 | `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / spot / env lights |
@@ -867,7 +889,9 @@ falls, so they share the same live progress and budget flags (`-time` / `-noise`
 `-forever` / `-preview` / `-interval`, and periodic crash-safe writes) on **both** the CPU
 and the GPU. They're all GPU-eligible too: **`A`/`B`/`C` and the forward pass of `V`** via
 the forward megakernel, **`D`** via its own GPU BDPT megakernel, **`R` (including the
-physical-lens camera)** via its own GPU backward megakernel — which the **`P` composite
+physical-lens camera) and `W` (the deterministic preview, with the quadratures ported —
+minus dispersive materials and `-gi`, which fall back)** via the GPU backward megakernel
+— which the **`P` composite
 reuses for its camera-side layer**, so both of `P`'s layers run on the GPU when the scene
 is within the backward-GPU scope — and the **`M` photon map** (direct density query
 *and* `-pmfg` final gather), which builds one shared map on the device and gathers every camera from it. Outside that scope `P`'s camera-side layer, and `V`'s

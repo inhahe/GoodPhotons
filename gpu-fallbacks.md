@@ -35,6 +35,26 @@ Everything forward rejects, **plus**:
 | Collimated beams / stray Env-shape emitter | not NEE-samplable even on CPU | **inherently-CPU** (low value) |
 | Lens deeper than `D_MAXLENS` | fixed device cap | low value |
 
+### Mode W (deterministic preview) — `cudaBackwardWhittedSupported` (render_cuda.cu)
+**N3a (2026-07-29, 0.110.0):** mode `W` was fully CPU-only until now. It rides the SAME
+`kBackward` megakernel as mode `R` with the estimators swapped, driven by seven new `DScene`
+knobs (`bkWhitted`/`bkGrid`/`bkGiDirs`/`bkGiGrid`/`bkGiBounce`/`bkHeroSplit`/`bkAmbient`)
+uploaded from a `WhittedOpts` (render_cuda.h). Now on-device: the G×G area-light quadrature,
+`whittedAttenuate`'s 1/512 bailout, the dominant Mirror/Filter/Grating/HalfMirror/Mix
+branches, the deterministic glossy lobe, the subpixel + wavelength lattices, and the flat
+`-ambient` fill (incl. the DiffuseTransmit both-lobe case). Validated CPU↔GPU on
+`scraps/n3_gpu.ftsl` (`scraps/n3_check.py`): 99.39 % of channel samples bit-identical,
+99.96 % within one 8-bit code, **zero** pixels inside a ≥3 px-wide disagreeing region;
+12.1 s → 0.3 s. Because mode `W` has no noise to hide a mismatch behind, these fall back
+rather than degrade:
+| Feature | Why CPU today | Class |
+|---|---|---|
+| Any dispersion-dependent material (Dielectric / ThinFilm / Multilayer / Grating / HalfMirror / Fluorescent) — `sceneHasDispersiveMat`, incl. `Mix` children | mode `W` requires **split-at-dispersion** (its λ lattice is shared by every pixel, so de-hero'ing collapses the whole frame onto one λ: 36.7 pp chroma error). `bkRadianceHero` still de-heros at those vertices. | **portable** — N3b: re-enterable `bkRadianceHeroLoop` as `template<bool AllowSplit>` (compile-time, so no runtime recursion / device stack) |
+| `-gi <n>` (deterministic one-bounce gather) | the gather is a depth-1 recursion into `radiance`/`radianceHero` | **portable** — N3c: `template<int GiDepth>` + a device `dGiDir` Fibonacci-spiral lattice |
+| `-rgb` in mode `W` | the RGB kernel is a separate reduced tracer with no deterministic estimator; it would return exactly the noise mode `W` removes | **inherently** refused (message in main.cpp), not a fallback |
+| `Layered` material | already a device-wide CPU fallback via `cudaForwardSupported` | no mode-`W` work needed |
+| Env NEE stays stochastic | deliberate existing CPU behaviour, mirrored on the device | ✅ intentional non-change |
+
 ### Backward R `-rgb` (fast, Option B) — `cudaBackwardRGBSupported` (render_cuda.cu:7545)
 Rejects everything spectral-backward rejects **plus**:
 | Feature | Why CPU/spectral today | Class |

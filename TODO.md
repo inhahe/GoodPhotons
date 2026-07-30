@@ -3658,9 +3658,11 @@ materials in the RGB fast path (inherently spectral), and fixed-cap overflows (o
 ## N. Mode W (deterministic preview) — estimator fixes, then the GPU port  *(ftrace renderer; greenlit by user 2026-07-29)*
 
 Mode W (`-mode W`, the POV-Ray-style deterministic Whitted preview, v0.105.0; `-gi`/`-ambient`
-v0.106.0; promoted to the `-explore` viewer's lit preview v0.107.0) is the **only render mode with
-no GPU backend** — `main.cpp:4292`'s `(mode == 'R' && !g_whitted)` routes it to the CPU
+v0.106.0; promoted to the `-explore` viewer's lit preview v0.107.0) *was* the **only render mode with
+no GPU backend** — `main.cpp:4292`'s `(mode == 'R' && !g_whitted)` routed it to the CPU
 unconditionally. Continues §L (the backward tracer) and §M (GPU fallback closure, M1–M12 all done).
+As of v0.110.0 (N3a) it runs on the device for everything except dispersive materials (N3b) and
+`-gi` (N3c), which still fall back to the CPU tracer.
 
 **Order matters:** N1/N2 change mode W's *estimator*, so they come before the port — porting an
 estimator that is about to change means writing the hand-maintained device twin twice.
@@ -3743,10 +3745,69 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       only higher spp improves). Preserves both mode-W invariants: shared offsets per pixel, and
       indexing by the **absolute** sample index so the image stays chunk-split-independent.
       </details>
-- [ ] **N3. Port spectral mode W to the device.** Add `bkWhitted` / `bkGrid` / `bkGiGrid` /
-      `bkAmbient` to `DScene` (matching the existing `bkDirectOnly` convention), port the ~30
-      `whitted` branches of `src/backward.h` into `bkInteract` + the `kBackward` light loop, drop the
-      `&& !g_whitted` at `main.cpp:4292`, and gate on a new `cudaBackwardWhittedSupported()`. Build it
+- [ ] **N3. Port spectral mode W to the device.** *(N3a DONE 2026-07-29, v0.110.0; N3b/N3c open.)*
+  - [x] **N3a — knobs, lattice helpers, quadrature, non-dispersive materials, flat `bkAmbient`.**
+        `WhittedOpts` (`src/render_cuda.h`, the twin of `BackwardRenderer`'s mode-W fields with
+        `ambient` pre-scaled by `Scene::ambientRef()`) is passed as a trailing
+        `const WhittedOpts*` to `renderBackwardCuda` (`nullptr` = mode R, so every existing call
+        site is source-compatible) and lands in the seven `DScene` knobs, whose `buildUpload`
+        defaults are "mode W off". Device helpers `dRadicalInverse2` / `dRadicalInverseB` /
+        `dRot05` / `dWhittedSample` / `dWhittedLambdaU` / `dWhittedGlossyDir` /
+        `dWhittedAttenuate` / `dGridUV` compute in `double` off integer inputs, so the quadrature
+        *points* are bit-exact against the CPU. `glossyDirUV`/`sampleGlossy` mirrored from
+        `render.h`; `whittedWeight` threaded through the device `refractOrReflect` /
+        `dDielectricStep`; `dMixResolveDominant` and `dEmitterNeedsUV` added; `bkEmitterGeom`'s
+        two emitter-sample coordinates became **parameters** so the G×G lattice can feed them
+        (drawn by the caller at exactly the same point in the rng stream, so stochastic modes are
+        unchanged); `bkNeeLight`/`bkNeeLightHero` gained the G×G loop; `bkInteract` /
+        `bkRadiance` / `bkRadianceHero` gained a `DGiCtx` + every whitted branch; `kBackward`
+        computes the pixel-**free** `sIdx = sampleBase + local` (NOT `gidx`, which includes the
+        pixel — using `gidx` would break the shared-offset invariant and make the noise-free mode
+        noisy) and drives the λ + subpixel lattices from it. `main.cpp`: gate is now
+        `(mode == 'R')`, with `cudaBackwardWhittedSupported()` deciding, and `-rgb` refused in
+        mode W with a message.
+        **Measured** (`scraps/n3_gpu.ftsl` — diffuse + mirror + glossy×3 + filter + area & spot
+        lights; 800×520 `-spp 16`, absolute exposure; `scraps/n3_check.py`): 99.39 % of channel
+        samples bit-identical CPU↔GPU, 99.96 % within one 8-bit code, and of 113 pixels over a
+        3-code threshold **zero** sit inside a ≥3 px-wide region — i.e. pure single-pixel
+        silhouette/shadow-edge slivers, the signature of the device's fp32 `Real` + coarser
+        `RAY_EPS` rather than of a port bug. **12.1 s → 0.3 s (≈40×)**, comfortably beating the
+        8.5× mode-R ratio as predicted. Stochastic paths verified intact: mode R CPU↔GPU means
+        agree to 0.04 %, modes B/D to ~0.1 %. Fallbacks confirmed to actually fire (glass scene
+        and `-gi 8` both print `[device] … using CPU`).
+  - [ ] **N3b — dispersive materials + `heroSplit` on the device.** `bkRadianceHero` still
+        de-heros at a Dielectric/ThinFilm/Multilayer/Grating/HalfMirror/Fluorescent vertex, which
+        mode W cannot use. Re-express `bkRadianceHero` as a re-enterable loop with
+        `template<bool AllowSplit>`, mirroring N1's `radianceHeroLoop`; then drop
+        `sceneHasDispersiveMat` from the gate. (`whittedWeight` on `refractOrReflect` /
+        `dDielectricStep` and the whitted `D_DIELECTRIC`/`D_GRATING`/`D_HALFMIRROR` branches of
+        `bkInteract` already landed in N3a, so the remaining work is *only* the split.)
+  - [ ] **N3c — the `-gi` one-bounce gather.** `template<int GiDepth>` + a device `dGiDir`
+        (Fibonacci spiral, Cranley-Patterson-rotated by base-7/11 radical inverses of `sIdx`),
+        then drop the `giDirs > 0` gate. `DGiCtx` and all four of its depth-1 behaviours
+        (no second gather, `bkGiGrid`, `bkGiBounce`, `specularArrival = false`) plus the escaped
+        gather's `bkAmbient` far-field tail already landed in N3a — only `giGatherHero`/`giGather`
+        themselves are missing.
+
+      <details><summary>original plan</summary>
+
+      Add the mode-W knobs to `DScene` (matching the
+      existing `bkDirectOnly` convention) — scoping the CPU side found **seven**, not four:
+      `bkWhitted`, `bkGrid`, `bkGiDirs`, `bkGiGrid`, `bkGiBounce`, `bkHeroSplit`, `bkAmbient` — port
+      the ~30 `whitted` branches of `src/backward.h` into `bkInteract` + the `kBackward` light loop,
+      drop the `&& !g_whitted` at `main.cpp:4298`, and gate on a new `cudaBackwardWhittedSupported()`.
+      Two CPU constructs are **depth-1 recursions** and need care on the device: N1's `heroSplit`
+      re-entry into `radianceHeroLoop`, and `-gi`'s gather re-entering `radianceHero`/`radiance` with
+      `GiCtx::depth == 1`. Use **compile-time templates** (`template<bool AllowSplit>`,
+      `template<int GiDepth>`) so nvcc instantiates two bodies from one source — no runtime recursion,
+      no stack sizing, one maintained source body. `Layered` needs **no** device twin (`D_LAYERED`
+      already forces a CPU fallback device-wide). Stage the rollout so every intermediate commit is
+      correct, with `cudaBackwardWhittedSupported()` starting narrow and widening:
+      **N3a** knobs + device lattice helpers + G×G NEE quadrature + the non-dispersive whitted
+      material branches + flat `bkAmbient` (gate: no dispersive material, `giDirs == 0`);
+      **N3b** dispersive materials + `whittedWeight` on the device `refractOrReflect`/`dDielectricStep`
+      + `heroSplit` (drops the dispersive gate); **N3c** the `-gi` gather (drops the `giDirs` gate).
+      Build it
       on the **spectral** `kBackward`, *not* `kBackwardRGB`: the spectral device scope (media,
       fluorescence, textured albedo, constant env, lens) is far wider than the RGB one, so this also
       gives the viewer a much broader-scope GPU preview than `-rgb` reaches today. Nothing to do on
@@ -3758,13 +3819,29 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       `whittedAttenuate`'s deterministic cutoff instead of Russian roulette (warps now terminate
       together), mirror/lattice direction instead of a sampled lobe, dominant branch instead of a
       Fresnel coin flip.
-- [ ] **N4. Bit-exact CPU-vs-GPU A/B as N3's acceptance test.** Unlike every prior port in §M, the
+      </details>
+- [ ] **N4. Deterministic CPU-vs-GPU A/B as N3's acceptance test.** *(Part (b) is in place and
+      passing for the N3a scope — `scraps/n3_check.py`, see N3a's numbers. Part (a), the direct
+      host-vs-device lattice-helper sweep, is still to write, and (b) must be re-run after N3b and
+      N3c widen the gate.)* Unlike every prior port in §M, the
       usual escape hatch does **not** apply: `render_cuda.h` explicitly permits the stochastic modes
       to be "an independent noise realization that agrees to within Monte-Carlo noise", but mode W has
       no noise to hide a mismatch behind. Any disagreement in the quadrature, the radical-inverse
       lattices (`whittedSample` / `whittedLambdaU`, including the `rot05` offsets), or the de-hero
-      point is a *visible deterministic* CPU/GPU difference. So N3 must be validated **bit-exact**
-      (0 differing pixels), not statistically — a stricter bar than M1–M12 despite the simpler logic.
+      point is a *visible deterministic* CPU/GPU difference — a stricter bar than M1–M12 despite the
+      simpler logic. Two-part acceptance, because **whole-image bit-exactness is not achievable** and
+      demanding it would only mean the test never passes: the device's `Real` is `float` by default
+      (`FTRACE_GPU_FP32`), `RAY_EPS` is `1e-4f` on the GPU vs `1e-6` on the CPU, and CUDA libdevice's
+      transcendentals differ from the MSVC CRT's in the last places. So instead:
+      **(a) bit-exact on the lattice helpers** — `radicalInverse2` / `radicalInverseB` / `rot05` /
+      `gridUV` / `whittedGlossyDir`'s `(u1,u2)` are pure integer-and-`double` math and genuinely *can*
+      be bit-identical; test them directly, host vs device, over a large index sweep.
+      **(b) image agreement to fp32 tolerance with no structural difference** — every failure mode this
+      test exists to catch (a wrong quadrature weight, an off-by-one in a lattice, a de-hero collapse,
+      a missed dominant branch) produces a large *structured* error, not a 1-LSB rounding difference,
+      so a tolerance band plus a "no connected region of disagreement" check has the same detection
+      power. Run both sides with `-device cpu` / `-device gpu` explicitly — a CUDA build silently
+      auto-selects the GPU and fakes a whole-frame regression.
 - [ ] **N5. Re-measure spectral vs `-rgb`, then judge whether an RGB mode W is worth a second
       kernel.** *(Prediction: it is not — resolve this by measurement, not by building it.)* At mode
       W's 1 spp there is no noise, so `-rgb`'s usual convergence advantage evaporates and only the

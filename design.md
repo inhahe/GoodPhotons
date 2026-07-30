@@ -309,6 +309,67 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   either has real multi-bounce GI or no diffuse transport at all. Mode `R` is untouched:
   every gather branch is gated on `whitted` and every new parameter defaults to the old
   behaviour (`GiCtx{}` → depth 0 → `lightGrid`, `maxBounce`, `specularArrival = true`).
+
+  **Mode `W` on the device (0.110.0).** Mode `W` is not a separate GPU kernel: it rides the
+  same `kBackward` megakernel as mode `R`, exactly as on the CPU, and swaps only the
+  estimators. The plumbing is a `WhittedOpts` struct (`render_cuda.h`) — the twin of
+  `BackwardRenderer`'s mode-`W` fields, with `ambient` already pre-scaled by
+  `Scene::ambientRef()` — passed as a trailing `const WhittedOpts*` to `renderBackwardCuda`
+  (`nullptr` = mode `R`, so every existing call site is unchanged). It lands in seven
+  `DScene` knobs (`bkWhitted`, `bkGrid`, `bkGiDirs`, `bkGiGrid`, `bkGiBounce`,
+  `bkHeroSplit`, `bkAmbient`) whose `buildUpload` defaults are "mode `W` off", which is what
+  keeps every stochastic mode bit-identical. The lattice helpers are ported one-for-one
+  (`dRadicalInverse2` / `dRadicalInverseB` / `dRot05` / `dWhittedSample` /
+  `dWhittedLambdaU` / `dWhittedGlossyDir` / `dWhittedAttenuate` / `dGridUV`) and compute in
+  `double` off integer inputs, so the *quadrature points themselves* are bit-exact against
+  the CPU even though the trace around them is not. `render.h`'s `glossyDirUV` /
+  `sampleGlossy` factoring is mirrored on the device so the deterministic and stochastic
+  lobe samplers share one body, and `refractOrReflect` / `dDielectricStep` gained the same
+  `whittedWeight` out-param contract.
+
+  Two details of the port are load-bearing. (1) **`sIdx` is not `gidx`.** The device seeds
+  its rng on `gidx = pix*sppTotal + sampleBase + local`, which deliberately *includes* the
+  pixel; mode `W`'s lattices must use the pixel-**free** `sIdx = sampleBase + local`, or
+  invariant (1) above — every pixel shares the offsets — is broken and the "noise-free"
+  mode comes out noisy. (2) **The u1/u2 emitter-sample coordinates are now caller-supplied.**
+  `bkEmitterGeom` used to draw them internally; the G×G quadrature has to feed them from the
+  lattice, so they became parameters and `dEmitterNeedsUV` (twin of `emitterNeedsUV`) tells
+  the caller when to draw. The draws had to move to exactly the same point in the rng
+  stream — a scene that merely *added* a spot light would otherwise reshuffle every other
+  emitter's stream and change an unrelated stochastic image.
+
+  `cudaBackwardWhittedSupported()` gates the device path on top of
+  `cudaBackwardSupported()`, and is deliberately **narrower**: a missing deterministic term
+  is a visible error, not extra noise, so unsupported constructs fall back to the CPU
+  mode-`W` tracer (cheap — the mode is ~1 spp) rather than degrading. Currently rejected:
+  any **dispersion-dependent material** (Dielectric / ThinFilm / Multilayer / Grating /
+  HalfMirror / Fluorescent — `sceneHasDispersiveMat`, which also scans `Mix` children),
+  because `bkRadianceHero` still *de-heros* at those vertices and mode `W` requires the
+  split; and **`giDirs > 0`**, because the gather is a depth-1 recursion. Both are depth-1
+  recursions on the CPU and will be re-expressed on the device as compile-time templates
+  (`template<bool AllowSplit>`, `template<int GiDepth>`) so nvcc instantiates two bodies
+  from one source — no runtime recursion, no device stack sizing. `Layered` needs no device
+  twin at all: it already forces a CPU fallback device-wide via `cudaForwardSupported`.
+  Env NEE stays **stochastic** in mode `W` on both CPU and GPU (an existing deliberate
+  choice), so it needed no device change — an important *non*-change, since "fixing" it on
+  one side only would have manufactured a CPU/GPU divergence.
+
+  **Whole-image bit-exactness is not achievable and is not the acceptance bar.** The device
+  runs `using Real = float` (`FTRACE_GPU_FP32`) with `RAY_EPS` 1e-4 against the CPU's
+  `double`/1e-6, and CUDA libdevice's transcendentals differ from the MSVC CRT's in the last
+  bits. The bar instead is: bit-exactness on the lattice helpers, plus image agreement to
+  fp32 tolerance with **no structural difference**. Measured (`scraps/n3_gpu.ftsl`, 800×520,
+  `-spp 16`, absolute exposure, `scraps/n3_check.py`): 99.39 % of channel samples identical,
+  99.96 % within one 8-bit code, and of the 113 pixels over a 3-code threshold **zero** sit
+  inside a ≥3 px-wide region — i.e. the residual is entirely single-pixel slivers on
+  silhouettes and shadow edges, which is the signature of epsilon rather than of a porting
+  bug. `n3_check.py`'s blob-vs-sliver split is exactly that test. Same scene: 12.1 s (12 CPU
+  threads) → 0.3 s (4090). Cross-checks that the shared stochastic path is intact: mode `R`
+  CPU↔GPU means agree to 0.04 %, modes `B`/`D` to ~0.1 %.
+
+  `-rgb` is refused in mode `W` (`main.cpp`, with a message): the fast RGB backward is a
+  separate reduced tracer with no deterministic estimator, so it would return precisely the
+  noise the mode exists to remove.
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,
