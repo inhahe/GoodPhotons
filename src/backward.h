@@ -437,10 +437,10 @@ struct BackwardRenderer {
     // absorbing only below 480 nm was therefore never excited at all and rendered as its bare
     // elastic lobe until `-spp 64`, at which point the sequence finally wrapped and the dye
     // switched on in one step. Scrambled, the same 4 samples straddle the whole CDF.
-    // (Note `-spp 1` still lands on the illuminant median by construction, so a *narrow-band*
-    // dye still needs spp > 1 to appear -- tracked separately as a λ_in importance-sampling
-    // item in known-issues.md, since the real fix there is to draw λ_in from the dye's own
-    // absorption band rather than from the scene illuminant.)
+    // Since v0.115.0 the CDF this indexes is the DYE'S OWN excitation distribution
+    // (Material::fluoInSampler = absorb(λ) × illuminant), not the scene-wide illuminant, so
+    // sample 0's median draw now lands inside the absorption band by construction and even a
+    // narrow-band dye fluoresces correctly at `-spp 1`.
     static double whittedFluoroU(uint64_t sIdx, int bounce) {
         static const unsigned kBases[4] = {61, 67, 71, 73};
         return rot05(radicalInverseScr(kBases[bounce & 3], sIdx));
@@ -1391,37 +1391,91 @@ struct BackwardRenderer {
                 mp = &scene.mats[child];
             }
             if (mp->type == MatType::Layered) {
-                // Wavelength-dependent Fresnel coat: de-hero and run the scalar layered
-                // handling on the hero channel.
-                deHero(); nUp = 1;
+                // Physical layered stack (specular coat over a weighted body). The coat
+                // interface is NOT dispersive in DIRECTION -- the sheen is a glossy lobe
+                // about the mirror direction and the body-lobe pick is a material index --
+                // so the ONLY λ dependence here is the scalar coat reflectance R(λ). That
+                // means the bundle can normally ride straight through carrying a per-λ
+                // weight, with no de-hero at all.
+                //
+                // Through v0.115.0 this de-hero'd UNCONDITIONALLY, which at -spp 1 collapsed
+                // every layered surface onto the bundle's single shared λ and rendered it
+                // saturated-monochromatic -- exactly the failure N1 fixed for glass, and the
+                // reason the viewer used to force 16 passes on any layered scene.
                 const Material& cm = *mp;
-                double R = layeredCoatReflectance(scene, cm, h, ray.d, lam[0]);
-                if (whitted) {   // dominant layer + weight; see the scalar twin above
-                    if (R >= 0.5) {
-                        if (!whittedAttenuate(thr[0], R)) { finish(); return; }
-                        Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
-                                                  materialRoughness(scene, cm, h), gi.sIdx, b);
-                        if (dot(o, h.n) <= 0) { finish(); return; }
-                        ray = Ray{h.p + h.n * 1e-6, o};
-                        specularArrival = true;
-                        continue;
+                double Rl[hero::kHeroMax];
+                for (int i = 0; i < nUp; ++i)
+                    Rl[i] = layeredCoatReflectance(scene, cm, h, ray.d, lam[i]);
+                // Stochastic: ONE shared coat coin, compared per-λ. u is uniform, so
+                // P(u < R_i) == R_i exactly for every live λ -- common-random-number analog
+                // splitting, unbiased per λ with NO reweight needed (the probability IS the
+                // weight, as in the scalar twin). At nUp == 1 that is the scalar code
+                // verbatim: same single draw, same order, throughput untouched.
+                // Whitted: no coin at all, just the dominant branch weighted per λ.
+                const double uCoat = whitted ? 0.0 : rng.uniform();
+                const bool refl0 = whitted ? (Rl[0] >= 0.5) : (uCoat < Rl[0]);
+                bool agree = true;
+                for (int i = 1; i < nUp; ++i)
+                    if ((whitted ? (Rl[i] >= 0.5) : (uCoat < Rl[i])) != refl0) { agree = false; break; }
+                if (!agree) {
+                    // A genuinely CHROMATIC coat: a thin-film Airy stack, or a Fresnel coat
+                    // sitting right on mode W's R >= 0.5 dominant-branch threshold. Some λ
+                    // take the sheen while the rest enter the body, so one shared continuation
+                    // cannot serve them all. Fan out exactly like the split-at-dispersion case
+                    // below: each secondary re-enters THIS vertex as its own monochromatic
+                    // sub-path, makes its own coat decision, and lands in its own L[i] slot.
+                    //
+                    // Re-entering at bounce `b` (not b + 1) is safe because nUp > 1 implies an
+                    // EMPTY medium stack -- every dielectric entry de-heros or splits, so a
+                    // bundle wider than 1 is never inside glass -- which makes the
+                    // Beer-Lambert step at the top of the loop a no-op that cannot be
+                    // double-applied. closestHit is deterministic, so the sub-path lands on
+                    // this same vertex; the cost is one redundant trace on a rare path.
+                    for (int i = 1; i < nUp; ++i) {
+                        if (invPdf[i] == 0.0) continue;      // dead secondary (zero-mass λ bin)
+                        double sLam = lam[i], sInv = invPdf[i], sThr = thr[i];
+                        SpdCache sCache;                     // re-point at λ_i's COLUMN
+                        const SpdCache* sCp = nullptr;
+                        if (spdCache && spdCache->lam && spdCache->spd && i < spdCache->C) {
+                            sCache.lam = spdCache->lam + i;
+                            sCache.spd = spdCache->spd + i;
+                            sCache.C   = spdCache->C;
+                            sCp = &sCache;
+                        }
+                        double sub[hero::kHeroMax];
+                        radianceHeroLoop(scene, ray, stk, &sLam, &sInv, &sThr,
+                                         /*C=*/1, /*secAlive=*/false, specularArrival,
+                                         contBsdfPdf, b, sub, rng, sCp, gi);
+                        L[i] += sub[0];      // this wavelength's own estimate, own slot
+                        thr[i] = 0.0;        // now that sub-path's business, not ours
                     }
-                    if (!whittedAttenuate(thr[0], 1.0 - R)) { finish(); return; }
-                    int child = mixDominantChild(cm);
-                    if (child < 0) { finish(); return; }
-                    mp = &scene.mats[child];
-                } else {
-                if (rng.uniform() < R) {
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
+                    secAlive = false; nUp = 1;   // hero carries on alone, UNBOOSTED
+                }
+                if (refl0) {                     // coat sheen: every live λ reflects
+                    // Whitted only: the deterministic branch carries R as a WEIGHT (the
+                    // stochastic coin above already paid for itself). Stop only once the
+                    // WHOLE bundle is under the bailout, as in the Glossy case below.
+                    if (whitted) {
+                        for (int i = 0; i < nUp; ++i) thr[i] *= Rl[i];
+                        if (hero::maxOf(thr, nUp) <= kWhittedCutoff) { finish(); return; }
+                    }
+                    Vec3 o = whitted
+                                 ? whittedGlossyDir(reflect(ray.d, h.n),
+                                                    materialRoughness(scene, cm, h), gi.sIdx, b)
+                                 : sampleGlossy(reflect(ray.d, h.n),
+                                                materialRoughness(scene, cm, h), rng);
                     if (dot(o, h.n) <= 0) { finish(); return; }
                     ray = Ray{h.p + h.n * 1e-6, o};
                     specularArrival = true;
                     continue;
                 }
-                int child = mixPickChild(cm, rng.uniform());
-                if (child < 0) { finish(); return; }
-                mp = &scene.mats[child];
+                if (whitted) {                   // body: every live λ enters the stack
+                    for (int i = 0; i < nUp; ++i) thr[i] *= 1.0 - Rl[i];
+                    if (hero::maxOf(thr, nUp) <= kWhittedCutoff) { finish(); return; }
                 }
+                int child = whitted ? mixDominantChild(cm) : mixPickChild(cm, rng.uniform());
+                if (child < 0) { finish(); return; }     // leftover slice absorbs
+                mp = &scene.mats[child];
             }
             const Material& m = *mp;
 

@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### BUG — OPEN (2026-07-30, v0.115.0): every `layered` surface renders MONOCHROMATIC in mode `W` at 1 spp
+### BUG — FIXED (2026-07-30, v0.115.0 → v0.115.1): every `layered` surface renders MONOCHROMATIC in mode `W` at 1 spp
 
 Found while re-rendering `scenes/layered.ftsl` after the `shortpass`/`gaussian` parser fix below.
 At `-spp 1` the clearcoated back wall and the iridescent sphere both come out saturated **green**;
@@ -40,6 +40,74 @@ material, then falls through to the ordinary per-λ switch. So evaluate `R` per-
 others don't (mode `W`'s dominant-branch rule) or where the stochastic coin would go different ways
 per λ; that wants the same **split-at-dispersion** treatment `D_THINFILM`/`D_GRATING` get, not a
 de-hero. Note the scalar path (~1226) is already fine — this is purely the hero loop.
+
+#### FIXED in v0.115.1 — a per-λ coat weight, with a fan-out only when the coat is truly chromatic
+
+Done exactly as scoped. `BackwardRenderer::radianceHeroLoop`'s `MatType::Layered` branch now:
+
+1. evaluates `Rl[i] = layeredCoatReflectance(scene, cm, h, ray.d, lam[i])` for every live λ;
+2. decides reflect-vs-body **per λ** — `Rl[i] >= 0.5` in mode `W`, `uCoat < Rl[i]` against ONE
+   shared coin otherwise;
+3. if all live λ agree (the overwhelmingly common case), takes that branch with the whole bundle
+   intact. Mode `W` multiplies each channel by its own `Rl[i]` / `1 - Rl[i]` and stops only once
+   `maxOf(thr, nUp)` falls under `kWhittedCutoff`, exactly like the `Mirror`/`Filter`/`Glossy`
+   case. The stochastic path needs **no reweight at all**: `uCoat` is uniform, so
+   `P(uCoat < Rl[i]) == Rl[i]` exactly for each λ — common-random-number analog splitting, where
+   the probability *is* the weight, just as in the scalar twin;
+4. if they disagree, fans out: each secondary re-enters `radianceHeroLoop` at **this same bounce**
+   as its own monochromatic sub-path (`C=1`, `secAlive=false`) and makes its own coat decision,
+   landing in its own `L[i]`. Re-entry at `b` rather than `b + 1` is safe because `nUp > 1` implies
+   an empty medium stack (every dielectric entry de-heros or splits), so the Beer-Lambert step at
+   the loop head was a no-op and cannot be double-applied.
+
+`Renderer::tracePhotonHeroLoop` (`src/render.h` ~2000) got the same shared-coin treatment, since it
+carried the identical unconditional `deHero()`. There the disagreement case falls back to
+`deHero()` instead of fanning out — a forward sub-path *cannot* re-enter its vertex, because the
+loop head has already run the model-C aperture catch and re-entering would deposit the photon into
+the film twice. De-hero is still unbiased, and it is what every dispersive material there does
+without `-herosplit`, so the fallback costs only variance in the rare chromatic case.
+
+The viewer's `wNeedSpp` list (`src/main.cpp` ~8120) no longer forces 16 passes on any scene
+containing a `Layered` material, so a clearcoated scene previews at 1 spp like everything else.
+
+Measured on `scenes/layered.ftsl` at 320×240, against a converged `-spp 1024` reference
+(block-mean bar: every 20 px block within 1.5 codes, luma and chroma separately):
+
+| image | max \|dLuma\| | max \|dChroma\| |
+|---|---|---|
+| **old** mode `W` `-spp 1` | 72.2 | **190.5** |
+| **new** mode `W` `-spp 1` | 12.8 | **11.0** |
+| old mode `W` `-spp 64` | 1.33 | 2.26 |
+| **new** mode `W` `-spp 64` | **0.354** | **0.225** |
+
+So the 1-spp chroma error drops **17×** (and the frame goes from saturated green to the correct
+red/green Cornell walls with a mauve back wall), while at 64 spp the new estimator is ~7× *closer*
+to the reference than the old one — keeping all 8 channels alive instead of boosting one ×8 is a
+straight variance win on top of the correctness fix.
+
+Unbiasedness of the fan-out was checked against the **untouched scalar path** on a deliberately
+pathological coat, `scenes/_lay_chroma.ftsl` (a thin-film Airy coat, `film_ior 3.5` over
+`ior 1.5`, `film_thickness 200`, whose R oscillates between ~0.06 and ~0.61 across the visible band
+and therefore straddles the `R >= 0.5` threshold several times). Bundle `-heroc 8 -spp 1024` vs
+scalar `-heroc 1 -spp 2048`: max \|dLuma\| **0.111**, max \|dChroma\| **1.57** codes. The
+disagreement branch was confirmed live with a temporary counter — 8192+ hits on that scene, and
+32+ even on `scenes/layered.ftsl` (grazing silhouette pixels where Fresnel R crosses 0.5).
+
+Mode `R` (stochastic) on `scenes/layered.ftsl` at `-spp 4096`, old vs new: max \|dLuma\| 0.964,
+max \|dChroma\| 1.333 — both inside the bar, so the common-random-number split is unbiased too.
+Forward mode `B` on the same scene, 2e9 photons old vs new: max \|dLuma\| **0.070**, max \|dChroma\|
+**0.075** codes (PASS), and the energy ledger is identical to six decimals —
+`absorbed=0.7105 escaped=0.2895 sum/emitted=0.999996` both ways. That ledger is the real check on
+the forward edit, since it replaced the post-de-hero `e.absorbed += beta[0]` bookings with
+`activeSum()`. Cost: **1.09×** (1117.3 s vs 1022.9 s back-to-back) — the per-λ
+`layeredCoatReflectance` fan (up to 8 Airy evaluations instead of 1) is the whole of it.
+
+Seven non-layered scenes (`cornell`, `multilayer`, `_fluo_cornell`, `_env_cornell`, `_rainbow_test`,
+`_spot_cornell`, `_fog_cornell`) are **bit-identical** old vs new at `-mode W -spp 2`; so is
+`scenes/layered.ftsl` itself at `-heroc 1` in modes `W`, `R` and forward `B` — the scalar,
+bundle-free paths, which this change does not touch (the shared coin is drawn in the same order as
+the old single draw, so at `nUp == 1` the new code is the old code verbatim). All 14 physics
+self-tests PASS.
 
 ### BUG — FIXED (2026-07-30, v0.115.0): `gaussian`/`shortpass` SILENTLY IGNORED positional arguments
 
@@ -541,10 +609,12 @@ comparison in absolute mode:* the same run tone-mapped with per-image auto-expos
 spurious "+5.4 % bias", because the split resolves the dispersive caustic geometrically and
 moves the p99 anchor by ~1.8× — the identical trap the mode-U validation notes in `TODO.md`.
 
-Still de-heroes (so still needs multiple passes in mode `W`): **`Layered`**, whose coat Fresnel
-is a λ-dependent *decision* rather than a λ-dependent direction, so the split does not apply;
-and the scalar, bundle-free path taken for participating media / GRIN / `-heroc 1`. `wNeedSpp`
-now tests for exactly those.
+Still de-heroes (so still needs multiple passes in mode `W`): the scalar, bundle-free path taken
+for participating media / GRIN / `-heroc 1`. `wNeedSpp` now tests for exactly those.
+(**`Layered`** used to be on this list — its coat Fresnel is a λ-dependent *decision* rather than a
+λ-dependent direction, so the dispersion split did not apply. v0.115.1 solved it differently, by
+applying the coat reflectance as a per-λ *weight* with the bundle intact and fanning out only when
+the decision itself differs across λ; see the layered de-hero entry above.)
 
 <details><summary>Original entry (kept for the diagnosis, which the fix is built on)</summary>
 
@@ -2157,7 +2227,9 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
     the same `-time` budget and compare photon counts.
   * **Not covered:** the GPU forward tracer (execution divergence as the fan-out wavelengths take different
     branches, plus the emission back-pressure / fixed work-pool needed to keep the device photon buffers
-    bounded), and modes `R` / `D` / `U`. Also **not** applied at `Layered` / `Mix` — see the next bullet.
+    bounded), and modes `R` / `D` / `U`. Also **not** applied at `Mix` — see the next bullet. (`Layered`
+    was in the same boat until v0.115.1, which keeps the bundle alive across a coat via a per-λ weight
+    and a shared coin instead; see the layered de-hero entry near the top of this file.)
 - **Three known approximations in the CPU hero path** (all minor, documented for when they're revisited):
   - **A zero hero throughput kills the whole bundle — FIXED everywhere (2026-07-26).** `bdpt.h`'s
     `randomWalk` (absolute `secF[]` + max-over-live-λ early-out), `backward.h`'s `radianceHero` /
@@ -2171,13 +2243,19 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   - **Mix material stays multi-λ with a shared child selection.** Exact for constant mix weights; for *spectrally
     varying* mix weights with diffuse children it introduces a small bias (the child is picked by the hero λ's
     weight, secondaries ride along). Acceptable vs. de-heroing every Mix; revisit if a spectral-mix scene shows it.
-    `Layered` has the same shape (its coat Fresnel probability is λ-dependent, so it de-heros outright).
-    **`-herosplit` does not cover either.** These are λ-dependent *decisions*, not λ-dependent *directions*, and
-    their natural split point sits *before* any interaction has happened — which does not fit
+    **`-herosplit` does not cover it.** This is a λ-dependent *decision*, not a λ-dependent *direction*, and its
+    natural split point sits *before* any interaction has happened — which does not fit
     `tracePhotonHeroLoop`'s "resume from a ray" entry shape the way the dispersive case does (there each
     secondary can just re-run `interactPhotonSpecular` at the same hit with its own λ and hand back a fresh ray).
-    Extending split to them needs a "resume at this hit with this material" entry point; worth doing if a
-    spectral-mix or coated-dielectric scene ever shows the bias, but nothing observed yet.
+    Extending split to it needs a "resume at this hit with this material" entry point; worth doing if a
+    spectral-mix scene ever shows the bias, but nothing observed yet.
+    `Layered`'s coat used to be listed here for the same reason, and it was worse than a bias — it de-hero'd
+    outright and mistinted the whole frame at 1 spp. v0.115.1 fixed it without needing a resume-at-this-hit
+    entry point: the coat decision is made **per λ against one shared coin**, the bundle rides through with a
+    per-λ weight whenever the live λ agree, and the backward loop fans out into monochromatic sub-paths
+    re-entering the *same* vertex when they don't. That re-entry trick works for a coat precisely because it
+    happens before any interaction — nothing has been deposited or absorbed yet, and a wide bundle is never
+    inside a medium. The same approach would work for `Mix`, and is the obvious next step if it ever matters.
   - **Equal-*time* benefit is geometry-dependent.** Hero shares one BVH walk across C wavelengths, so its win grows
     with scene complexity. On trivial geometry (Cornell: a few quads + 2 spheres) traversal is nearly free and the
     4× per-λ shading makes hero ~1.6× slower per spp, so at *equal time* single-λ can edge it there. On heavy

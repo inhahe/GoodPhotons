@@ -8106,9 +8106,12 @@ static int run(int argc, char** argv) {
             // rendered flat green until ~16 spp. They no longer are: mode W now SPLITS the bundle
             // at a dispersive vertex into C monochromatic sub-paths, each on its own Snell
             // direction (BackwardRenderer::heroSplit), so glass is colour-correct at 1 spp.
-            // `Layered` still de-heroes -- its coat Fresnel is a λ-dependent *decision*, not a
-            // λ-dependent direction, so the split does not apply -- and so does the scalar
-            // (bundle-free) path taken for media / GRIN / heroC 1.
+            // `Layered` used to be the remaining offender for the same reason (it de-hero'd
+            // unconditionally, so a clearcoat previewed monochromatic); as of v0.115.1 its coat
+            // reflectance is applied as a PER-λ weight with the bundle intact, and only a
+            // genuinely chromatic coat -- one where the R >= 0.5 dominant branch differs across
+            // λ -- fans out, so layered scenes are 1-spp-clean too. What still de-heroes is the
+            // scalar (bundle-free) path taken for media / GRIN / heroC 1.
             // (Thin-film and multilayer needed a SECOND fix beyond the split, in v0.112.0: the
             // split gives each λ its own direction, but the reflect-or-transmit choice at the
             // interface was still a coin flip with no `whitted` branch, so those two stayed
@@ -8119,8 +8122,6 @@ static int run(int argc, char** argv) {
             const int kWSppCap = 16;
             bool wNeedSpp = (g_heroC <= 1) || scene.backwardMedium().enabled ||
                             grin::sceneHasGrin(scene);
-            for (const Material& mm : scene.mats)
-                if (mm.type == MatType::Layered) wNeedSpp = true;
             // Rough GLOSSY is deliberately NOT on that list, even though its lobe is likewise
             // resolved across samples (whittedGlossyDir) rather than within one. The difference
             // is what a single pass looks like: a de-hero'd dielectric is flatly WRONG (a green

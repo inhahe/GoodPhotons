@@ -4044,6 +4044,61 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       together), mirror/lattice direction instead of a sampled lobe, dominant branch instead of a
       Fresnel coin flip.
       </details>
+
+    - [x] **N3g — stop de-hero'ing at `MatType::Layered`: a coat is a λ-dependent DECISION, so it
+      wants a per-λ weight and a shared coin, not a collapse.** **DONE (2026-07-30, v0.115.1.)**
+      Found while re-rendering `scenes/layered.ftsl` after N3f's parser fix woke its inert
+      fluorophore up: at `-spp 1` the clearcoated back wall *and* the iridescent sphere both came
+      out saturated **green**, while `-spp 64` was correct. Nothing to do with fluorescence —
+      `-no-fluoro` gave a bit-identical image and the wall carries no dye. `radianceHeroLoop`'s
+      `Layered` branch simply did `deHero(); nUp = 1;` unconditionally, which is exactly the failure
+      **N1** exists to prevent: mode `W`'s λ lattice is a function of the *sample index alone*, so
+      collapsing onto the hero at 1 spp collapses the **whole frame** onto one λ — and a bb6500
+      median is ~550 nm.
+      The fix is not the dispersion split. A coat changes neither the outgoing direction (a glossy
+      lobe about the mirror direction) nor the wavelength; the only λ-dependent thing is the scalar
+      `layeredCoatReflectance(…, λ)`. So evaluate it per live λ and, when all live λ land on the
+      same side of the reflect-or-enter decision, ride through with the bundle intact — mode `W`
+      weighting each channel by its own `R_i` / `1 - R_i` and stopping on
+      `maxOf(thr, nUp) <= kWhittedCutoff` like Mirror/Filter/Glossy, the stochastic path needing
+      **no reweight at all** because one shared uniform coin gives `P(u < R_i) == R_i` exactly per λ
+      (common random numbers: the probability *is* the weight, as in the scalar twin). Only when the
+      live λ genuinely disagree does the backward loop fan out, and then each sub-path re-enters at
+      **this same bounce** rather than `b + 1` — legal because `nUp > 1` implies an empty medium
+      stack (every dielectric entry de-heros or splits), so the loop head's Beer-Lambert was a no-op.
+      `render.h`'s `tracePhotonHeroLoop` got the same shared coin but falls back to `deHero()` on
+      disagreement: a forward sub-path *cannot* re-enter its vertex, because the loop head has
+      already run the model-C aperture catch and re-entry would deposit the photon into the film
+      twice. `main.cpp`'s `wNeedSpp` no longer forces 16 viewer passes on a `Layered` scene.
+      Measured on `scenes/layered.ftsl` at 320×240 against a converged `-spp 1024` reference
+      (block-mean bar: every 20 px block within 1.5 codes, luma and chroma separately):
+      | image | max \|dLuma\| | max \|dChroma\| |
+      |---|---|---|
+      | **old** mode `W` `-spp 1` | 72.2 | **190.5** |
+      | **new** mode `W` `-spp 1` | 12.8 | **11.0** |
+      | old mode `W` `-spp 64` | 1.33 | 2.26 |
+      | **new** mode `W` `-spp 64` | **0.354** | **0.225** |
+      So a **17×** chroma-error drop at 1 spp (green frame → correct red/green Cornell walls with a
+      mauve back wall), *and* ~7× closer to the reference at 64 spp — keeping all 8 channels alive
+      instead of boosting one ×8 is a straight variance win on top of the correctness fix. The
+      residual 12.8 codes of luma at 1 spp is the area-light and glossy-lobe quadrature, which mode
+      `W` deliberately resolves across samples.
+      The **fan-out** was validated against the untouched scalar path on a deliberately pathological
+      coat, `scenes/_lay_chroma.ftsl` (thin-film Airy, `film_ior 3.5` over `ior 1.5`,
+      `film_thickness 200`, so R oscillates ~0.06…0.61 and straddles the `R ≥ 0.5` threshold several
+      times across the visible band): bundle `-heroc 8 -spp 1024` vs scalar `-heroc 1 -spp 2048`
+      agrees to max \|dLuma\| **0.111**, max \|dChroma\| **1.57** codes. A temporary counter confirmed
+      the branch is live — 8192+ hits on that scene, and 32+ even on `scenes/layered.ftsl`, at the
+      grazing silhouette pixels where Fresnel R crosses 0.5.
+      | check | result |
+      |---|---|
+      | mode `R` `-spp 4096` on `layered.ftsl`, old vs new | max \|dLuma\| 0.964, \|dChroma\| 1.333 — PASS, so the shared coin is unbiased |
+      | forward mode `B`, 2e9 photons, old vs new | see the entry in `known-issues.md` |
+      | 7 non-layered scenes @ `-mode W -spp 2`, old vs new | **bit-identical** (`cornell`, `multilayer`, `_fluo_cornell`, `_env_cornell`, `_rainbow_test`, `_spot_cornell`, `_fog_cornell`) |
+      | all 14 physics self-tests | PASS |
+      Remaining de-hero: only the scalar bundle-free path (media / GRIN / `-heroc 1`), plus `Mix`'s
+      shared child selection (a documented bias, not a collapse). `Mix` could take the same
+      re-enter-this-vertex treatment if it ever matters.
 - [ ] **N4. Deterministic CPU-vs-GPU A/B as N3's acceptance test.** *(Part (b) is in place and
       passing for the N3a **and** N3b scopes — `scraps/n3_check.py` plus the block-mean
       `scraps/n3b_check.py`; see those items' numbers. Part (a), the direct host-vs-device

@@ -195,6 +195,28 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (`-herosplit`), and `main.cpp`'s backward worker ORs in `br.whitted` — mode `W` has no
   choice (see below), mode `R` averages the collapse away so it stays opt-in.
 
+  **A `layered` coat is a λ-dependent DECISION, not a λ-dependent direction — so it takes a
+  per-λ weight and a shared coin, not a de-hero.** The coat interface changes neither the
+  outgoing direction (a glossy lobe about the mirror direction) nor the wavelength; the only
+  thing λ touches is the scalar reflectance `layeredCoatReflectance(…, λ)`. So
+  `radianceHeroLoop` evaluates that per live λ and, when all live λ land on the same side of
+  the reflect-or-enter decision, carries the whole bundle through: mode `W` multiplies each
+  channel by its own `R_i` (or `1 - R_i`) and terminates only once `maxOf(thr, nUp)` falls
+  under `kWhittedCutoff`, exactly like Mirror/Filter/Glossy. The stochastic path draws **one
+  shared coin** and compares it per λ, which needs no reweight at all: `u` is uniform, so
+  `P(u < R_i) == R_i` exactly for each λ — common random numbers, where the probability *is*
+  the weight, as in the scalar twin. When the live λ *disagree* (a high-contrast iridescent
+  film, or a Fresnel coat sitting right on mode `W`'s `R ≥ 0.5` threshold) the backward loop
+  fans out like the dispersive case, except each sub-path re-enters at **this same bounce**
+  rather than `b + 1` — legal because a bundle wider than 1 is never inside a medium (every
+  dielectric entry de-heros or splits), so the loop head's Beer-Lambert step was a no-op and
+  cannot be double-applied. `tracePhotonHeroLoop` gets the same shared coin but falls back to
+  `deHero()` on disagreement, because a *forward* sub-path cannot re-enter its vertex: the loop
+  head has already run the model-C aperture catch, and re-entering would deposit the photon
+  into the film twice. Before v0.115.1 both loops de-hero'd at every coat unconditionally,
+  which in mode `W` — whose λ lattice is per-*sample*, shared by every pixel — collapsed the
+  whole frame onto one wavelength and rendered every coated surface saturated green.
+
   **Mode `W` (the `whitted` flag)** shares this whole walk and swaps only the
   *estimators*, which is why it is a flag and not a second tracer. Every stochastic
   decision on the path gets a deterministic replacement: the area-light NEE point
@@ -213,7 +235,8 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   Russian roulette on Mirror / Filter /
   Grating / specular-bundle survival becomes `whittedAttenuate` (multiply the
   throughput by the weight, stop under `kWhittedCutoff` = 1/512 — POV-Ray's
-  `adc_bailout`); HalfMirror / Layered take the dominant branch weighted, and a Mix
+  `adc_bailout`); HalfMirror / Layered take the dominant branch weighted (Layered per-λ, see
+  above, so the bundle survives a clearcoat), and a Mix
   hard-thresholds via `mixResolveDominant` (`scene.h`); **Dielectric** likewise takes the
   dominant Fresnel branch (reflect iff R ≥ 0.5) with that branch's weight folded into the
   throughput, via `refractOrReflect`'s `whittedWeight` out-param (`render.h`) — which also
@@ -1102,14 +1125,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   Each band is tone-mapped alone, with `N = wPass + 1` (the pass count *those rows* have
   received, not the frame's) and the locked anchor, then spliced into `wImg`. `wFilm`
   accumulates, so it is cleared per pose. When a pass completes the viewer stops — a
-  bundle-only scene is exact at 1 spp — *unless* `wNeedSpp`, which is set when the scene
-  contains a `Layered` material or the scalar path is in use at all (`heroC <= 1`, media,
-  GRIN, lens); then it keeps adding passes to `kWSppCap` (16) to resolve the wavelength
-  collapse those cases still cause. The *dispersive* materials
-  (Dielectric/ThinFilm/Multilayer/Grating/HalfMirror/Fluorescent) used to be on that list
-  and no longer are, because `heroSplit` resolves them geometrically at 1 spp; `Layered`
-  stays because its λ-dependence is in the branch *decision*, not the direction, so there
-  is nothing to split on. Because the viewer's preview IS mode W, an `-explore` run also
+  bundle-only scene is exact at 1 spp — *unless* `wNeedSpp`, which is set when the scalar path
+  is in use at all (`heroC <= 1`, media, GRIN, lens); then it keeps adding passes to
+  `kWSppCap` (16) to resolve the wavelength collapse that case still causes. The *dispersive*
+  materials (Dielectric/ThinFilm/Multilayer/Grating/HalfMirror/Fluorescent) used to be on that
+  list and no longer are, because `heroSplit` resolves them geometrically at 1 spp; `Layered`
+  came off it in v0.115.1, once its coat reflectance became a per-λ weight instead of an
+  unconditional de-hero. Because the viewer's preview IS mode W, an `-explore` run also
   honours mode-W-only settings that would otherwise be rejected: `wPreview` in `main.cpp`
   widens the hero bundle and spares `-gi` from the "needs `-mode W`" rejection.
   The older **path-traced preview** stage uses the fast RGB backward tracer:

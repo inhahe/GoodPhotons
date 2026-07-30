@@ -387,9 +387,15 @@ sample index alone — that is what makes it noise-free — so at `-spp 1` *ever
 collapse onto the *same* wavelength and the whole glass object would come out strongly
 mistinted (a Cornell SF10 ball used to render flat green: **36.7 pp** of chroma error).
 Splitting brings that to **0.80 pp** at 1 spp, better than 16 stochastic passes managed
-(4.20 pp) and **7.9× faster**, and costs nothing on scenes without dispersive glass. A
-`layered` coat still picks its branch per-bundle rather than per-λ, so a *strongly*
-λ-dependent coat thickness can still tint at 1 spp. `-gi` is one bounce only, terminated on
+(4.20 pp) and **7.9× faster**, and costs nothing on scenes without dispersive glass.
+**A `layered` clearcoat is free at 1 spp too** since v0.115.1: the coat's reflectance is applied as
+a per-λ *weight* with the bundle intact (it changes neither the direction nor the wavelength, so
+there is nothing to collapse), and the bundle fans out into monochromatic sub-paths only where the
+reflect-or-enter decision genuinely differs across λ — a high-contrast iridescent film, or a Fresnel
+coat right at the dominant-branch threshold. Before that fix every coated surface de-hero'd
+unconditionally and rendered *saturated green* at 1 spp; `scenes/layered.ftsl`'s chroma error against
+a converged reference fell **17×** (190 → 11 codes), and keeping all eight channels alive instead of
+boosting one ×8 also made the 64-spp image ~7× closer to that reference. `-gi` is one bounce only, terminated on
 the `-ambient` tail — it is not a substitute for a converged render. All of these are
 tracked in `known-issues.md`.
 

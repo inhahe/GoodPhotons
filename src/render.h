@@ -1998,19 +1998,36 @@ struct Renderer {
             }
 
             const Material* matp = &scene.mats[h.matId];
-            // Layered coat: wavelength-dependent Fresnel -> de-hero, run scalar coat on hero.
+            // Layered coat. The coat interface is NOT dispersive in DIRECTION -- the sheen is
+            // a glossy lobe about the mirror direction and the body-lobe pick is a material
+            // index -- so the only λ dependence is the scalar coat reflectance R(λ), and ONE
+            // shared coin can serve the whole bundle: u is uniform, so P(u < R_i) == R_i
+            // exactly per λ (common random numbers), with weights untouched just as in the
+            // scalar twin. That keeps the bundle alive across a clearcoat instead of
+            // collapsing it, which is what the backward hero loop does as of v0.115.1.
+            //
+            // Only a genuinely CHROMATIC coat -- a thin-film Airy stack where the coin lands
+            // on different sides for different λ -- still de-heroes. A fan-out like
+            // -herosplit's is NOT available here, because a forward sub-path cannot re-enter
+            // this same vertex: the loop head has already run the model-C aperture catch, so
+            // re-entering would deposit the photon into the film twice.
             if (matp->type == MatType::Layered) {
-                deHero(); nUp = 1;
                 const Material& cm = *matp;
-                double R = layeredCoatReflectance(scene, cm, h, ray.d, lam[0]);
-                if (rng.uniform() < R) {
+                double Rl[hero::kHeroMax];
+                for (int i = 0; i < nUp; ++i)
+                    Rl[i] = layeredCoatReflectance(scene, cm, h, ray.d, lam[i]);
+                const double uCoat = rng.uniform();
+                const bool refl0 = uCoat < Rl[0];
+                for (int i = 1; i < nUp; ++i)
+                    if ((uCoat < Rl[i]) != refl0) { deHero(); nUp = 1; break; }
+                if (refl0) {
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
-                    if (dot(o, h.n) <= 0) { e.absorbed += beta[0]; return; }
+                    if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
                     ray = Ray{h.p + h.n * 1e-6, o};
                     continue;
                 }
                 int child = mixPickChild(cm, rng.uniform());
-                if (child < 0) { e.absorbed += beta[0]; return; }
+                if (child < 0) { e.absorbed += activeSum(); return; }
                 matp = &scene.mats[child];
             }
             // Stochastic mix: resolve the child by the hero rng; secondaries ride along
