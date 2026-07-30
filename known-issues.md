@@ -5115,9 +5115,36 @@ correctly on **both** backends.
   `kBackward`, not `kBackwardRGB` — the spectral device scope (media, fluorescence, textured
   albedo, constant env, lens) is far wider than the RGB one, so this would also give the viewer
   a much broader-scope GPU preview than `-rgb` reaches today.
-- **Order it after** the deterministic glossy-lobe lattice and the de-hero bundle split: those
-  change mode W's estimator, and porting an estimator that is about to change means writing the
-  device twin twice.
+- **Spectral vs `-rgb`: do NOT assume spectral is much slower.** Measured on GPU, same scene/spp:
+
+  | scene | spp | `-rgb` | spectral `-heroc 8` | spectral penalty |
+  |---|---|---|---|---|
+  | `cornell.ftsl` | 1024 | 0.7 s | 1.2 s | 1.7x |
+  | `_room_of_gyroids_f12.ftsl` | 64 | 9.5 s | 12.1 s | **1.27x** |
+
+  Not 8x — hero sampling carries all 8 wavelengths down ONE shared BVH walk, and traversal is
+  the expensive part, so only the (cheap) shading arithmetic multiplies. The heavier the
+  geometry the smaller the penalty.
+- **Where `-rgb` would genuinely win is de-hero, not speed.** For the stochastic modes `-rgb`'s
+  advantage is convergence (no chroma noise); at mode W's 1 spp there is no noise, so that
+  evaporates and only the 1.27-1.7x per-sample cost is left. But spectral mode W on a glass
+  scene collapses the frame onto one wavelength (the de-hero DEBT below) and needs up to 16
+  passes — call it ~20x the RGB cost — whereas the RGB walk has no wavelength dimension at all
+  and so is honestly 1-spp-clean on plain glass (`MatType::Dielectric` IS in the RGB scope,
+  `render_cuda.cu:10976`).
+- **Therefore fix the de-hero bundle split FIRST, and re-measure before writing an RGB mode W.**
+  Once spectral mode W is 1-spp-clean on glass, `-rgb`'s entire remaining advantage is 1.27-1.7x
+  — not worth a second hand-written megakernel that has to stay bit-exact with the CPU. The
+  likely outcome is that the bundle-split fix makes an RGB mode W unnecessary.
+- **Order:** (1) de-hero bundle split [CPU], (2) deterministic glossy-lobe lattice [CPU],
+  (3) port spectral mode W to the device, (4) re-measure and only then judge `-rgb`. Steps 1-2
+  come first because they change mode W's estimator, and porting an estimator that is about to
+  change means writing the device twin twice.
+- **Nothing to do on the CPU side:** all four knobs already ship there — `-mode W` (`g_whitted`)
+  and `-whitted-grid N` (`g_whittedGrid`) in v0.105.0, `-gi`/`-radiosity` (`g_gi`) and
+  `-ambient`/`-amb` (`g_ambient`) in v0.106.0. `bkWhitted`/`bkGrid`/`bkGiGrid`/`bkAmbient` are
+  just the proposed device-`DScene` field names (matching the existing `bkDirectOnly`) that would
+  carry those existing CPU features across. This is a pure port, not a feature.
 
 ## Performance
 
