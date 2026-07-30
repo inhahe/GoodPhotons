@@ -64,10 +64,23 @@ within a neighbourhood while a wrong estimator shifts a whole region's colour. R
 bit-identical, max |dLuma| 0.144 / |dChroma| 0.105 codes per block (limit 1.5), and 0 blob
 interior even under N3a's stricter sliver test; the N3a scene re-rendered byte-for-byte
 identically, so the refactor is inert off the split path. Building that bed also exposed a
-*pre-existing* bug — `thinfilm` / `multilayer` (and `grating` / `fluorescent`) are still
-**stochastic** in mode `W` on both CPU and GPU, so they cannot appear in a deterministic A/B at
+*pre-existing* bug — `thinfilm` / `multilayer` (and `grating` / `fluorescent`) were still
+**stochastic** in mode `W` on both CPU and GPU, so they could not appear in a deterministic A/B at
 all; logged as N3d in `known-issues.md`, and the reason the scene carries a diamond ball where a
 thin-film bubble originally sat.
+
+**N3d-1 (2026-07-30, 0.112.0):** that bug is fixed for `thinfilm` and `multilayer`.
+`thinFilmInterface` / `multilayerInterface` (and their device twins) now honour the same
+`double* whittedWeight` dominant-branch contract `refractOrReflect` already had, so mode `W`
+makes no rng draw at an interference vertex on either device — a lossless substrate reflects iff
+R ≥ 0.5 with weight R or 1−R, an absorbing one always reflects with weight R. Verified on the new
+`scraps/n3d_gpu.ftsl`, which puts all four code paths in one frame (lossless film, absorbing film,
+lossless multilayer, absorbing multilayer): **91.780 % → 99.697 %** bit-identical, max |dLuma|
+**6.678 → 0.144**, |dChroma| **5.820 → 0.078** — a FAIL turned into a pass at the same 1.5-code
+bar. `scraps/n3d_montage.py` draws the before/after difference picture. `grating` and
+`fluorescent` remain stochastic in mode `W` (they are discrete draws from a distribution, not
+dominant-branch choices) and are tracked as N3d-2; they are a *CPU-and-GPU* estimator gap, not a
+device fallback, so nothing in the table below changes for them.
 
 Because mode `W` has no noise to hide a mismatch behind, these still fall back rather than
 degrade:

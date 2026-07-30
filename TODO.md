@@ -3818,24 +3818,62 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
         (no second gather, `bkGiGrid`, `bkGiBounce`, `specularArrival = false`) plus the escaped
         gather's `bkAmbient` far-field tail already landed in N3a — only `giGatherHero`/`giGather`
         themselves are missing.
-  - [ ] **N3d — mode W is still STOCHASTIC at four material vertices, on both CPU and GPU.**
+  - [ ] **N3d — mode W is still STOCHASTIC at some material vertices, on both CPU and GPU.**
         *(Found 2026-07-29 while building N3b's A/B bed: `n3b_check.py` failed at dLuma 4.1 /
         dChroma 7.0 on exactly the 20 px blocks covering a thin-film bubble, while every other block
         passed at <0.2 codes. Not a porting bug — the CPU is noisy there too, and CPU/GPU just draw
         from independent rng streams. The bubble was replaced by a diamond ball so N3b could land;
-        this is the real fix.)* Mode W's whole contract is "no rng draws", and these four break it:
-        - `render.h::thinFilmInterface` and `multilayerInterface` flip a bare
-          `rng.uniform()` reflect-or-transmit coin with **no `whitted` branch** — opaque path
-          `if (rng.uniform() >= R) return false;`, lossless path
-          `if (rng.uniform() < R) outDir = reflect(...) else refract(...)`.
-        - `gratingDiffract` picks a diffraction order from the rng.
-        - `D_FLUORESCENT` draws `dSampleSceneLambda` for the Stokes shift plus a continuation coin.
-        ThinFilm/Multilayer are **mechanical**: mirror the `double* whittedWeight` out-param
-        contract `refractOrReflect` already has (dominant branch — `R >= 0.5` → reflect weighted
-        `R`, else transmit weighted `1-R`, no rng draw), in `src/render.h`, `src/render_cuda.cu`,
-        and `backward.h:807` / `bkInteract`'s `D_THINFILM` / `D_MULTILAYER`. Grating (*which* order
-        dominates?) and Fluorescent (*which* λ_in?) need a design decision first. This changes
-        mode-W output on scenes using those materials, so it wants its own commit + VERSION bump.
+        N3d is the real fix.)* Mode W's whole contract is "no rng draws".
+    - [x] **N3d-1 — thin film + multilayer.** **DONE (2026-07-30, v0.112.0.)**
+          `render.h::thinFilmInterface` / `multilayerInterface` flipped a bare `rng.uniform()`
+          reflect-or-transmit coin with **no `whitted` branch** at all. Both now take
+          `refractOrReflect`'s existing `double* whittedWeight` out-param contract: lossless
+          substrate → dominant branch (`R >= 0.5` → reflect weighted `R`, else transmit weighted
+          `1-R`; TIR weight 1.0); opaque/absorbing substrate → always reflect weighted `R`, since
+          transmission is absorbed and there is only one *surviving* branch (reflectance as a
+          weight instead of a survival roll, as `Mirror`/`Filter` already do). Five sites moved
+          together: both functions in `src/render.h`, both device twins in `src/render_cuda.cu`,
+          and the `MatType::ThinFilm`/`Multilayer` + `D_THINFILM`/`D_MULTILAYER` call sites in
+          `src/backward.h` / `bkInteract`, which fold the weight in via `whittedAttenuate`.
+          Every non-mode-W caller passes `nullptr`, so forward `A`/`B`/`C`, `M`/`S`, BDPT, VCM and
+          the wavefront kernel are bit-identical.
+          **Measured** on the new `scraps/n3d_gpu.ftsl` (the N3b box carrying all four code paths
+          at once — lossless film `bubble`, absorbing film `beetle`, lossless multilayer
+          `dichroic`, absorbing multilayer `morphoish` — 400×260 `-spp 1`, absolute exposure,
+          CPU↔GPU via `scraps/n3b_check.py`): **91.780 % → 99.697 % bit-identical**, max
+          \|dLuma\| **6.678 → 0.144**, max \|dChroma\| **5.820 → 0.078** codes per 20 px block —
+          from a clear FAIL to comfortably inside the same 1.5-code bar the non-iridescent N3b bed
+          passes at. `scraps/n3d_montage.py` renders the proof picture (`png/n3d_montage.png`): the
+          amplified CPU−GPU difference lights up on exactly the four iridescent spheres before the
+          fix and is black after it.
+          Regressions re-run and unchanged: the N3b bed is still 99.561 % / 0.144 / 0.105 (it has no
+          thinfilm, so byte-for-byte its recorded numbers) and the N3a bed 99.394 % / 0.131 / 0.190.
+          Stochastic paths verified unbiased as well as untouched — forward `-mode C` on the same
+          scene conserves energy (sum/emitted 1.000001), and a mode-`R` CPU↔GPU pair converges as
+          √spp (32 → 1024 spp shrinks mean \|diff\| 24.95 → 5.25, \|dLuma\| 5.83 → 1.47,
+          \|dChroma\| 12.49 → 2.17 — all ≈ √32 = 5.66 — with frame means within 0.06 %), which is
+          two noise realisations approaching the *same* answer rather than a bias.
+    - [ ] **N3d-2 — grating order + fluorescent λ_in.** Not dominant-branch problems, so
+          `whittedWeight` does not apply: both are *discrete choices from a distribution*, which is
+          what N2 already solved for the glossy lobe — keep ONE choice per sample but index it by
+          the **(absolute sample index, bounce)** lattice instead of the rng. `GiCtx` already
+          carries `sIdx`/`bounce` and is already threaded into `interactMaterial`/`bkInteract` on
+          both devices, so the plumbing exists.
+          - `gratingDiffract` (`render.h` ~2393) does `xi = rng.uniform() * wsum` over the
+            propagating orders weighted `1/(1+|m|)`. Pass an optional `const double* whittedU`
+            (new prime pair alongside `whittedGlossyDir`'s 13/17…37/41) so the stochastic path is
+            untouched. Wrinkle: the candidate list is built `mm = -M..+M`, so `u = 0` would pick
+            the most *negative* order. The whitted path must walk candidates in **descending
+            efficiency** (`0, -1, +1, -2, +2, …`) so `u = 0` gives `m = 0`, the specular order —
+            the exact analogue of "1 spp collapses a glossy lobe to the mirror direction, more spp
+            resolves it". Building that permutation only on the whitted path keeps every
+            stochastic mode bit-identical. **No weight change needed:** the estimator is already
+            analog (order `i` w.p. `wgt[i]/wsum`, β unchanged), so a stratified `u` is still
+            unbiased.
+          - `MatType::Fluorescent` (`backward.h` ~896) draws `scene.emitSampler.sample(rng, pin)`
+            for λ_in; needs an `emitSampler.sample(u, pin)` overload fed from the same lattice.
+            *(Its continuation coin at ~914 is fine — mode W implies `directOnly`, which returns
+            first.)*
 
       <details><summary>original plan</summary>
 

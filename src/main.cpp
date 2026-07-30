@@ -8060,6 +8060,11 @@ static int run(int argc, char** argv) {
             // `Layered` still de-heroes -- its coat Fresnel is a λ-dependent *decision*, not a
             // λ-dependent direction, so the split does not apply -- and so does the scalar
             // (bundle-free) path taken for media / GRIN / heroC 1.
+            // (Thin-film and multilayer needed a SECOND fix beyond the split, in v0.112.0: the
+            // split gives each λ its own direction, but the reflect-or-transmit choice at the
+            // interface was still a coin flip with no `whitted` branch, so those two stayed
+            // grainy here even at C > 1. They now take the dominant branch weighted, like
+            // Dielectric -- see thinFilmInterface's whittedWeight.)
             // (No hasLens() term: the viewer builds its camera fresh from the pose each frame,
             // so the preview camera is always a plain one even if the scene authored a lens.)
             const int kWSppCap = 16;

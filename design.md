@@ -219,8 +219,20 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   throughput, via `refractOrReflect`'s `whittedWeight` out-param (`render.h`) — which also
   skips the frosting perturbation, the other rng draw at that interface (0.107.0; before
   that a dielectric was the one estimator left tossing a coin, and at `-spp 1` a coin flip
-  per pixel is not noise but salt-and-pepper — glass rendered as a speckled blob); the
-  wavelength and the subpixel offset come off radical-inverse sequences instead of the rng.
+  per pixel is not noise but salt-and-pepper — glass rendered as a speckled blob).
+  **ThinFilm / Multilayer** take the *same* `whittedWeight` contract as of 0.112.0
+  (`thinFilmInterface` / `multilayerInterface`): a lossless substrate reflects iff R ≥ 0.5 with
+  weight R or 1−R, while an *opaque* substrate — where transmission is absorbed, so there is
+  only one surviving branch — always reflects with weight R, the reflectance becoming a
+  throughput weight rather than a survival probability, exactly as Mirror/Filter do. Those two
+  were missed in 0.107.0 (no `whitted` branch at all) and stayed noisy in the noise-free mode
+  until an N3b CPU/GPU A/B measured them at 6.7 codes of block-luma disagreement.
+  **Still stochastic in mode `W`** (tracked as N3d-2): `gratingDiffract`'s diffraction-order
+  pick and `Fluorescent`'s Stokes-shift λ_in. Neither is a dominant-branch problem — they are
+  discrete draws from a distribution, so the fix is N2's: index the choice by
+  `(sIdx, bounce)` rather than take the modal outcome. Env NEE is stochastic by deliberate
+  choice on both devices.
+  The wavelength and the subpixel offset come off radical-inverse sequences instead of the rng.
   Glass is deterministic too, because mode `W` forces **`heroSplit`** on (see below): a
   dispersive vertex fans the bundle into C monochromatic sub-paths rather than de-hero'ing
   onto one λ. That is not an optimisation here but a correctness requirement — the λ

@@ -2274,8 +2274,18 @@ struct Renderer {
     //     from inside an opaque body is simply absorbed.
     // Returns false when the photon is absorbed (caller terminates the path); on
     // true, `out` is the continuation ray.
+    //
+    // `whittedWeight` is the same DETERMINISTIC contract refractOrReflect has (see above):
+    // non-null in mode W, it replaces the interference coin flip with the dominant branch
+    // and reports that branch's weight for the caller to fold into the throughput. Opaque
+    // substrate: there is only one *surviving* branch (transmission is absorbed), so it
+    // always reflects and reports R -- the reflectance becomes a weight instead of a
+    // survival probability, exactly as Mirror/Filter already do in mode W. Lossless
+    // substrate: reflect iff R >= 0.5, weight R or 1-R. Without this, thin film was a
+    // material that stayed NOISY in the noise-free preview.
     bool thinFilmInterface(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
-                           double lambda, Pcg32& rng, Ray& out) const {
+                           double lambda, Pcg32& rng, Ray& out,
+                           double* whittedWeight = nullptr) const {
         double ns = m.ior(lambda);              // substrate index (spectral -> dispersion)
         double nf = m.filmIor;                  // coating film index
         double ks = m.substrateK(lambda);       // substrate extinction (0 = transparent)
@@ -2287,7 +2297,8 @@ struct Renderer {
         if (ks > 0.0) {                         // opaque metal-backed film
             if (!entering) return false;        // inside the absorbing substrate: absorbed
             double R = thinFilmReflectance(1.0, nf, ns, ks, thickness, cosI, lambda);
-            if (rng.uniform() >= R) return false;               // transmitted -> absorbed
+            if (whittedWeight) *whittedWeight = R;              // weight, not a survival roll
+            else if (rng.uniform() >= R) return false;          // transmitted -> absorbed
             Vec3 o = normalize(reflect(d, nl));
             out = Ray{h.p + o * 1e-6, o};
             return true;
@@ -2300,13 +2311,16 @@ struct Renderer {
         Vec3 outDir;
         if (sin2t > 1.0) {
             outDir = reflect(d, nl);            // total internal reflection
+            if (whittedWeight) *whittedWeight = 1.0;    // lossless, one branch only
         } else {
             double cosT = std::sqrt(1.0 - sin2t);
             // Interference reflectance for the actual stack traversed this hit:
             // incidence medium nA, coating nf, transmission medium nB. Reciprocal,
             // so entering and exiting rays see the same R (energy consistent).
             double R = thinFilmReflectance(nA, nf, nB, 0.0, thickness, cosI, lambda);
-            if (rng.uniform() < R) outDir = reflect(d, nl);
+            const bool doReflect = whittedWeight ? (R >= 0.5) : (rng.uniform() < R);
+            if (whittedWeight) *whittedWeight = doReflect ? R : 1.0 - R;
+            if (doReflect) outDir = reflect(d, nl);
             else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
         }
         outDir = normalize(outDir);
@@ -2323,8 +2337,10 @@ struct Renderer {
     //     prob R, else the transmitted light is absorbed -> the photon terminates
     //     (opaque structural colour: beetle/Morpho on an absorbing base).
     // Returns false when the photon is absorbed (caller terminates the path).
+    // `whittedWeight`: same deterministic dominant-branch contract as thinFilmInterface.
     bool multilayerInterface(const Material& m, const Hit& h, const Vec3& d,
-                             double lambda, Pcg32& rng, Ray& out) const {
+                             double lambda, Pcg32& rng, Ray& out,
+                             double* whittedWeight = nullptr) const {
         double ns = m.ior(lambda);              // substrate index
         double ks = m.substrateK(lambda);       // substrate extinction
         int nL = (int)m.layerN.size();
@@ -2343,7 +2359,8 @@ struct Renderer {
             double R = multilayerReflectance(1.0, cosI, lambda,
                                              m.layerN.data(), m.layerK.data(),
                                              m.layerThick.data(), nL, ns, ks);
-            if (rng.uniform() >= R) return false;               // transmitted -> absorbed
+            if (whittedWeight) *whittedWeight = R;              // weight, not a survival roll
+            else if (rng.uniform() >= R) return false;          // transmitted -> absorbed
             Vec3 o = normalize(reflect(d, nl));
             out = Ray{h.p + o * 1e-6, o};
             return true;
@@ -2357,6 +2374,7 @@ struct Renderer {
         Vec3 outDir;
         if (sin2t > 1.0) {
             outDir = reflect(d, nl);            // total internal reflection
+            if (whittedWeight) *whittedWeight = 1.0;    // lossless, one branch only
         } else {
             double cosT = std::sqrt(1.0 - sin2t);
             // Evaluate the stack from the incidence side. When exiting (ray inside
@@ -2372,7 +2390,9 @@ struct Renderer {
                 for (int j = 0; j < nL; ++j) { rn[j] = m.layerN[nL-1-j]; rk[j] = m.layerK[nL-1-j]; rd[j] = m.layerThick[nL-1-j]; }
                 R = multilayerReflectance(ns, cosI, lambda, rn.data(), rk.data(), rd.data(), nL, 1.0, 0.0);
             }
-            if (rng.uniform() < R) outDir = reflect(d, nl);
+            const bool doReflect = whittedWeight ? (R >= 0.5) : (rng.uniform() < R);
+            if (whittedWeight) *whittedWeight = doReflect ? R : 1.0 - R;
+            if (doReflect) outDir = reflect(d, nl);
             else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
         }
         outDir = normalize(outDir);

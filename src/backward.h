@@ -803,13 +803,21 @@ struct BackwardRenderer {
                 }
             }
             case MatType::ThinFilm: {
-                Ray nr;
-                if (!mats.thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr)) return false;
+                // Mode W: dominant interference branch weighted into the throughput instead
+                // of a coin flip, exactly as Dielectric does above (see thinFilmInterface's
+                // whittedWeight). Attenuating AFTER the call is safe -- the ray has not been
+                // traced yet, so returning false just ends the path at this vertex.
+                Ray nr; double wW = 1.0;
+                if (!mats.thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr,
+                                            whitted ? &wW : nullptr)) return false;
+                if (whitted && !whittedAttenuate(thr, wW)) return false;
                 ray = nr; specularArrival = true; return true;
             }
             case MatType::Multilayer: {
-                Ray nr;
-                if (!mats.multilayerInterface(m, h, ray.d, lambda, rng, nr)) return false;
+                Ray nr; double wW = 1.0;                  // mode W: see ThinFilm above
+                if (!mats.multilayerInterface(m, h, ray.d, lambda, rng, nr,
+                                              whitted ? &wW : nullptr)) return false;
+                if (whitted && !whittedAttenuate(thr, wW)) return false;
                 ray = nr; specularArrival = true; return true;
             }
             case MatType::Mirror: {

@@ -2679,9 +2679,15 @@ __device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, con
 // texture samplers, below dTexScalarAt) is used here before its point of definition.
 __device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, const DHit& h);
 
+// `whittedWeight` (non-null only in mode W) is the same deterministic contract
+// refractOrReflect has: take the DOMINANT interference branch and report its weight for the
+// caller to fold into the throughput, instead of tossing a coin against R. Opaque substrate
+// has only one surviving branch, so it always reflects and reports R (reflectance as a weight
+// rather than a survival probability, as Mirror/Filter already do in mode W).
 __device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, const DHit& h,
                                           const DVec3& d,
-                                          Real lambda, DRng& rng, DVec3& ro, DVec3& rd) {
+                                          Real lambda, DRng& rng, DVec3& ro, DVec3& rd,
+                                          double* whittedWeight = nullptr) {
     Real ns = specLookup(m.ior, lambda), nf = (Real)m.filmIor;
     Real ks = specLookup(m.substrateK, lambda);
     Real thickness = dMatFilmThickness(sc, m, h);   // per-hit (map or constant)
@@ -2691,7 +2697,8 @@ __device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, c
     if (ks > 0) {                                // opaque metal-backed film
         if (!entering) return false;             // inside absorbing substrate: absorbed
         Real R = thinFilmReflectance((Real)1, nf, ns, ks, thickness, cosI, lambda);
-        if (rng.uniform() >= R) return false;    // transmitted -> absorbed
+        if (whittedWeight) *whittedWeight = (double)R;   // weight, not a survival roll
+        else if (rng.uniform() >= R) return false;       // transmitted -> absorbed
         DVec3 o = normalize(reflectv(d, nl));
         ro = h.p + o * RAY_EPS; rd = o;
         return true;
@@ -2700,11 +2707,13 @@ __device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, c
     Real eta = nA / nB;
     Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
     DVec3 outDir;
-    if (sin2t > 1) outDir = reflectv(d, nl);
+    if (sin2t > 1) { outDir = reflectv(d, nl); if (whittedWeight) *whittedWeight = 1.0; }
     else {
         Real cosT = sqrt((Real)1 - sin2t);
         Real R = thinFilmReflectance(nA, nf, nB, (Real)0, thickness, cosI, lambda);
-        if (rng.uniform() < R) outDir = reflectv(d, nl);
+        const bool doReflect = whittedWeight ? (R >= (Real)0.5) : (rng.uniform() < R);
+        if (whittedWeight) *whittedWeight = doReflect ? (double)R : 1.0 - (double)R;
+        if (doReflect) outDir = reflectv(d, nl);
         else outDir = d * eta + nl * (eta * cosI - cosT);
     }
     outDir = normalize(outDir);
@@ -2713,8 +2722,10 @@ __device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, c
 }
 // Multilayer stack interface (port of render.h multilayerInterface). Returns false
 // if the photon is absorbed by an absorbing stack/substrate.
+// `whittedWeight`: same deterministic dominant-branch contract as thinFilmInterface.
 __device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, const DVec3& d,
-                                            Real lambda, DRng& rng, DVec3& ro, DVec3& rd) {
+                                            Real lambda, DRng& rng, DVec3& ro, DVec3& rd,
+                                            double* whittedWeight = nullptr) {
     Real ns = specLookup(m.ior, lambda);
     Real ks = specLookup(m.substrateK, lambda);
     int nL = m.layerCount;
@@ -2726,14 +2737,15 @@ __device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, co
     if (anyAbs) {                                // opaque: reflect-or-absorb
         if (!entering) return false;
         Real R = multilayerReflectance((Real)1, cosI, lambda, m.layerN, m.layerK, m.layerThick, nL, ns, ks);
-        if (rng.uniform() >= R) return false;
+        if (whittedWeight) *whittedWeight = (double)R;   // weight, not a survival roll
+        else if (rng.uniform() >= R) return false;
         DVec3 o = normalize(reflectv(d, nl)); ro = h.p + o * RAY_EPS; rd = o; return true;
     }
     Real nA = entering ? (Real)1 : ns, nB = entering ? ns : (Real)1;
     Real eta = nA / nB;
     Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
     DVec3 outDir;
-    if (sin2t > 1) outDir = reflectv(d, nl);
+    if (sin2t > 1) { outDir = reflectv(d, nl); if (whittedWeight) *whittedWeight = 1.0; }
     else {
         Real cosT = sqrt((Real)1 - sin2t);
         Real R;
@@ -2743,7 +2755,9 @@ __device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, co
             for (int j = 0; j < nL; ++j) { rn[j] = m.layerN[nL-1-j]; rk[j] = m.layerK[nL-1-j]; rt[j] = m.layerThick[nL-1-j]; }
             R = multilayerReflectance(ns, cosI, lambda, rn, rk, rt, nL, (Real)1, (Real)0);
         }
-        if (rng.uniform() < R) outDir = reflectv(d, nl);
+        const bool doReflect = whittedWeight ? (R >= (Real)0.5) : (rng.uniform() < R);
+        if (whittedWeight) *whittedWeight = doReflect ? (double)R : 1.0 - (double)R;
+        if (doReflect) outDir = reflectv(d, nl);
         else outDir = d * eta + nl * (eta * cosI - cosT);
     }
     outDir = normalize(outDir); ro = h.p + outDir * RAY_EPS; rd = outDir; return true;
@@ -6241,13 +6255,19 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             ro = nro; rd = nrd; specularArrival = true; return true;
         }
         case D_THINFILM: {
-            DVec3 nro, nrd;
-            if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd)) return false;
+            // Mode W: dominant interference branch weighted in, exactly as D_DIELECTRIC above
+            // (see thinFilmInterface's whittedWeight).
+            DVec3 nro, nrd; double wW = 1.0;
+            if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd,
+                                   whitted ? &wW : nullptr)) return false;
+            if (whitted && !dWhittedAttenuate(thr, wW)) return false;
             ro = nro; rd = nrd; specularArrival = true; return true;
         }
         case D_MULTILAYER: {
-            DVec3 nro, nrd;
-            if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd)) return false;
+            DVec3 nro, nrd; double wW = 1.0;          // mode W: see D_THINFILM above
+            if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd,
+                                     whitted ? &wW : nullptr)) return false;
+            if (whitted && !dWhittedAttenuate(thr, wW)) return false;
             ro = nro; rd = nrd; specularArrival = true; return true;
         }
         case D_MIRROR: {
