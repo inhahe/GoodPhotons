@@ -1176,10 +1176,15 @@ The root is **exactly one** leaf or CSG combinator (wrap multiple shapes in a
 down the tree.
 
 ### 10.1 Leaves
+
+`center <x y z>` is accepted on **every** leaf (it is folded into the leaf transform), as
+are `translate` / `rotate` / `scale`. Note `center` is applied *inside* the rotation and
+`translate` *outside* it, so to rotate a leaf in place, position it with `translate`.
+
 | leaf | params |
 |---|---|
-| `sphere` | `center` `radius`(1) |
-| `ellipsoid` | `center` `radius <rx ry rz>` |
+| `sphere` | `radius`(1) |
+| `ellipsoid` | `radius <rx ry rz>` |
 | `box` | `size <x y z>`(1,1,1) `round`(0 corner radius) |
 | `torus` | `major`(1) `minor`(0.25) |
 | `cylinder` | `radius`(0.5) `height`(1) — axis = local y |
