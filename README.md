@@ -381,6 +381,16 @@ one canonical sample instead of being sampled past its own absorption edge. (Und
 excitation CDF is a variance reduction in the stochastic modes, where draws used to be thrown at
 the whole illuminant and mostly wasted; `-checkfluoro` estimates the reradiation weight both ways
 and asserts they agree, so it is a pure importance-sampling change, not a re-tuning.
+**A `-gi` gather over a *caustic* wants `-spp` > 1** — put a glass ball in a box and the floor
+around it picks up thin, bright, dashed contour curves at 1–4 spp. They are real light: a
+gather ray that refracts through the ball and lands on the lamp, which is a caustic path next-event
+estimation structurally cannot sample (the lamp is behind a refracting surface), so the only
+estimator for it is the emitter hit itself. They read as *curves* rather than as grain because
+sharing one direction lattice across every pixel is the whole point of the mode: "does gather
+direction #k reach the lamp through the ball?" flips at one coherent contour in the image instead
+of dissolving into per-pixel noise. They integrate away — invisible by `-spp 64` — and
+`-gi-bounce 1` removes them outright at 1 spp by denying a gather ray the second bounce a
+caustic needs, keeping the colour bleed and losing only the caustic.
 A half-mirror or layered coat picks its dominant branch instead of forking, and a
 pattern-driven material mix hard-thresholds instead of dithering. **Glass is free at 1 spp** — mode `W` always
 **splits the hero bundle at a dispersive vertex** (see `-herosplit`), fanning it into one

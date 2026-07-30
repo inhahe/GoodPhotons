@@ -5,6 +5,48 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### NOT A BUG, but a sharp edge worth a knob (2026-07-30, v0.116.0): mode W's `-gi` gather ALIASES a caustic into thin bright contour curves
+
+Noticed on the v0.116.0 showcase render (`scenes/cornell.ftsl`, `-mode W -gi 64 -spp 4`, 900×900):
+the floor around the SF10 glass ball, and the side walls, carry a family of thin, blown-out,
+**dashed white curves** concentric with the ball. Diagnosed by bisection rather than by reading
+code, then confirmed against the code:
+
+| probe | result |
+|---|---|
+| `-gi 0` (flat ambient) | curves **gone** → it is the gather |
+| `-gi-bounce 1` | curves **gone**, smooth soft rings remain; the caustic spot under the ball also goes |
+| `-gi-bounce 2` | curves **back**, caustic spot still absent |
+| `-spp 64` | curves **gone**, integrated into a smooth glow |
+| CPU vs GPU, 450², identical flags | max \|dLuma\| **0.123** / \|dChroma\| 0.192 → identical estimator, *not* a porting artifact |
+
+**Mechanism.** The path is *diffuse floor → gather ray → glass ball → lamp*. `bkRadiance` starts a
+gather ray at `specularArrival = false` (correct — the vertex's own NEE already counted that
+emitter), but the dielectric sets it back to `true`, so the subsequent emitter hit adds the lamp's
+**full radiance** (`render_cuda.cu` ~6672 and ~6776; host twin in `backward.h`). That is the right
+thing to do: NEE cannot sample a lamp that sits behind a refracting surface, so emission-on-hit is
+the *only* estimator that path has. The contribution is real and the estimator is unbiased in the
+lattice rotation — hence the clean convergence at `-spp 64`.
+
+It renders as a **curve instead of noise** because mode W deliberately shares one world-space
+direction lattice across every pixel (that invariant is what makes the mode noise-free). So
+"does direction *k* reach the lamp through the ball?" is a step function of surface position whose
+boundary is a single coherent contour in image space, where a stochastic renderer would smear the
+same discontinuity into grain. The dashes are plain aliasing — the contour is sub-pixel-thin in
+places and only registers where it passes near a pixel centre.
+
+**Status: documented, not changed.** Behaviour is correct and converges; README's "Honest limits"
+now names it alongside the rough-glossy and `grating` cases, with `-spp` and `-gi-bounce 1` as the
+two levers.
+
+**Possible improvement if it ever annoys anyone (needs a user decision, so not done unilaterally):**
+an opt-in **`-gi-clamp <x>`** ceiling on a single gather ray's returned radiance. That is the
+standard firefly clamp, bounded and explicit bias, and it would kill the spikes at 1 spp while
+keeping essentially all of the energy. Rejected alternatives: (a) suppressing emission-on-hit for
+gather rays entirely — kills the artifact but silently discards a real caustic and would make
+`-gi` darker than correct; (b) forcing `giBounce = 1` by default — same energy loss, and it would
+change existing images.
+
 ### BUG — FIXED (2026-07-30, v0.116.0): the GPU's *watertight* triangle test CRACKS, because nvcc contracts its edge functions into FMAs
 
 Found while validating N3c: `scraps/cor_gi.ftsl` at 240×240 in mode `W` failed the CPU↔GPU
