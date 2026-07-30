@@ -5077,6 +5077,48 @@ correctly on **both** backends.
   backend by scene material variety + path depth rather than always defaulting to the
   megakernel.
 
+### OPEN (opportunity, v0.107.0): mode W is the only render mode with NO GPU path
+- **Where:** `main.cpp:4292` — `const bool gpuBackwardMode = (mode == 'R' && !g_whitted);`
+  is the entire gate. Mode W is mode R with `g_whitted`, so that one clause routes it to the
+  CPU unconditionally. `render_cuda.cu` has zero whitted plumbing: the device `DScene` carries
+  `bkDirectOnly` (mode R's `-direct-only`) but no `bkWhitted` / `bkGrid` / `bkGi` / `bkAmbient`.
+  Every other mode (A/B/C forward, D BDPT, M photon map, R backward spectral + `-rgb`, S SPPM,
+  U VCM, G2 iso preview) has a device backend.
+- **Measured payoff (RTX 4090 vs 12 CPU threads, 480x300, `-heroc 8`, this machine):**
+
+  | scene | mode | CPU | GPU | ratio |
+  |---|---|---|---|---|
+  | `cornell.ftsl` | R, 32 spp | 1.8 s | 0.2 s | ~9x |
+  | `_room_of_gyroids_f12.ftsl` | R, 8 spp | 14.5 s | 1.7 s | ~8.5x |
+  | `_room_of_gyroids_f12.ftsl` | **W, 1 spp** | **5.0 s** | (none) | — |
+
+  So a device mode W projects to ~0.6 s on the gyroid room at 480x300 (~3 s at 960x600, down
+  from 25.7 s) — enough to turn the viewer's banded progressive preview into a per-pose redraw.
+- **Why it should beat 8.5x:** that ratio is strikingly low for a 4090 over 12 threads, which
+  says the spectral backward megakernel is divergence/register-bound rather than throughput-
+  bound. Mode W is *more* coherent than mode R by construction — fixed `lightGrid^2` quadrature
+  instead of one random shadow ray, `whittedAttenuate`'s deterministic cutoff instead of
+  Russian roulette (threads in a warp now terminate together), mirror direction instead of a
+  sampled glossy lobe, dominant branch instead of a Fresnel coin flip. All four remove warp
+  divergence, so mode W is closer to the GPU's happy path than anything already ported.
+- **Why it is still not trivial:** `kBackward` is a hand-written *mirror* of `backward.h`, not
+  shared code, so all ~30 `whitted` sites in `backward.h` need device twins. And the usual
+  escape hatch does not apply — `render_cuda.h` explicitly allows the stochastic modes to be
+  "an independent noise realization that agrees to within Monte-Carlo noise", but mode W has no
+  noise to hide a mismatch behind. Any disagreement in the quadrature, the radical-inverse
+  lattices (`whittedSample` / `whittedLambdaU`, incl. the `rot05` offsets), or the de-hero point
+  is a *visible deterministic* CPU/GPU difference. The port therefore needs a bit-exact A/B
+  against the CPU as its acceptance test, not a statistical one.
+- **Proper fix:** add `bkWhitted` / `bkGrid` / `bkGiGrid` / `bkAmbient` to `DScene`, port the
+  whitted branches into `bkInteract` + the `kBackward` light loop, drop the `&& !g_whitted` from
+  the gate, and gate on a new `cudaBackwardWhittedSupported()`. Do it on the **spectral**
+  `kBackward`, not `kBackwardRGB` — the spectral device scope (media, fluorescence, textured
+  albedo, constant env, lens) is far wider than the RGB one, so this would also give the viewer
+  a much broader-scope GPU preview than `-rgb` reaches today.
+- **Order it after** the deterministic glossy-lobe lattice and the de-hero bundle split: those
+  change mode W's estimator, and porting an estimator that is about to change means writing the
+  device twin twice.
+
 ## Performance
 
 ### RESOLVED: Diffuse-mesh renders were ~60× slower per photon (degenerate BVH)
