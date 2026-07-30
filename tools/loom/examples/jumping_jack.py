@@ -19,9 +19,21 @@ appear at the leading face and dissolve at the trailing one.  Put the ``rotate``
 on the ``isosurface`` (or on the ``function`` leaf) instead and the effect dies —
 the pattern would just ride along rigidly.
 
-Motion is a physical free-body tumble: spin about a body axis, whose direction
-precesses about world +y on a cone.  A jack whose three rods are half glass and
-half gold is *not* an inertially isotropic body, so a real one does precess.
+Motion is a real jack's tumble.  The **±y arm pair is the spin axis**: the jack
+turns about it, that axis leans ``tilt`` degrees off vertical, and the lean walks
+around a cone.  So the top ball rides a circle and the bottom ball rides the same
+circle 180° out of phase — automatic, since the two are antipodal about a centre
+that never moves — while the four equatorial arms whirl about the leaning axis.
+A jack whose three rods are half glass and half gold is *not* an inertially
+isotropic body, so a real one does precess like this.
+
+An earlier version pre-rotated the body to keep the spin axis deliberately *off*
+any arm, reasoning that spinning exactly about a rod leaves two of the six arms
+"stationary".  That was wrong twice over: those two arms are not stationary (they
+trace the precession circles, which is the motion one actually wants to see), and
+without an arm on the axis there is no visible top or bottom at all, so the tumble
+reads as arbitrary wobble rather than precession.
+
 Both rates are whole turns per loop, and the field is static, so the loop closes
 the instant the **pose** repeats — no phase drift needed anywhere.
 
@@ -45,14 +57,18 @@ Run:
   python examples/jumping_jack.py            # print frame-0 .ftsl to stdout
   python examples/jumping_jack.py --still    # one held still (pose check)
   python examples/jumping_jack.py --render   # render the looping GIF
+
+Knobs: ``--res N``, ``--freq F``, ``--solid F``, ``--ball R``, ``--rod R``, ``--fill F``,
+``--t PHASE`` and ``--name NAME`` (both for ``--still``), ``--plain-glass``.
 """
 
 from __future__ import annotations
 
+import bisect
 import math
 import os
 import sys
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -96,6 +112,58 @@ def _mv(M: Mat3, v: Sequence[float]) -> Tuple[float, float, float]:
     return tuple(sum(M[i][k] * v[k] for k in range(3)) for i in range(3))
 
 
+# ---------------------------------------------------------------------------
+# The gyroid's own value distribution, for picking level sets by volume
+# ---------------------------------------------------------------------------
+# `solid` / `fill` are volume fractions, so turning one into a level `g <= c` means
+# inverting the CDF of the raw gyroid.  Two shortcuts fail here and both were tried:
+#
+#   * `volfrac(|g| <= g0) ~ 0.647*g0` is the fraction in a BAND around zero.  The
+#     one-sided fraction is `(1 - 0.647*g0)/2`, i.e. HALF that slope — using the band
+#     slope for a one-sided level silently delivered 0.378 when 0.26 was asked for, which
+#     is why an entire sweep of "sparse" settings all came back looking half-filled.
+#   * Any linear fit is only good near g = 0 anyway.  Sparse lattices need levels far out
+#     in the tail (`solid = 0.15` is `c = -1.06` against a range of +/-1.5), where a
+#     linear extrapolation is off by a factor of two.
+#
+# So invert the real thing.  `g` is sampled on a fixed grid over one full period, which is
+# deterministic (no RNG, so the scene is reproducible) and independent of `freq` — the
+# distribution of `sin u cos v + ...` does not care how fast u, v, w sweep.  110k samples
+# is plenty for a volume fraction and takes a fraction of a second, once, cached.
+
+_G_SORTED: Optional[List[float]] = None
+
+
+def _gyroid_samples(n: int = 48) -> List[float]:
+    """Sorted samples of the raw gyroid over one period. Cached; ``freq``-independent."""
+    global _G_SORTED
+    if _G_SORTED is None:
+        tau = 2.0 * math.pi
+        vals: List[float] = []
+        trig = [(math.sin(tau * (i + 0.5) / n), math.cos(tau * (i + 0.5) / n))
+                for i in range(n)]
+        for sx, cx in trig:
+            for sy, cy in trig:
+                for sz, cz in trig:
+                    vals.append(sx * cy + sy * cz + sz * cx)
+        vals.sort()
+        _G_SORTED = vals
+    return _G_SORTED
+
+
+def gyroid_quantile(frac: float) -> float:
+    """Level ``c`` such that ``g <= c`` occupies volume fraction ``frac`` of space."""
+    v = _gyroid_samples()
+    p = min(max(float(frac), 0.0), 1.0)
+    return v[min(len(v) - 1, max(0, int(round(p * (len(v) - 1)))))]
+
+
+def gyroid_cdf(level: float) -> float:
+    """Volume fraction of ``g <= level`` — the inverse of :func:`gyroid_quantile`."""
+    v = _gyroid_samples()
+    return bisect.bisect_left(v, float(level)) / len(v)
+
+
 def aim_y_euler(d: Sequence[float]) -> Tuple[float, float, float]:
     """Euler angles (deg, ftrace's XYZ order) that rotate local **+y** onto unit ``d``.
 
@@ -107,6 +175,73 @@ def aim_y_euler(d: Sequence[float]) -> Tuple[float, float, float]:
     rx = math.degrees(math.asin(dz))
     rz = math.degrees(math.atan2(-float(d[0]), float(d[1])))
     return (rx, 0.0, rz)
+
+
+# ---------------------------------------------------------------------------
+# Geometry / gyroid tuning
+# ---------------------------------------------------------------------------
+# These live here, above the class, so `Jack`'s defaults and the CLI defaults are the
+# SAME constants — two copies of a tuned number is how a scene ends up rendering with
+# settings nobody chose.
+#
+# `solid` is the setting that decides whether a part looks openwork or merely *dimpled*.
+# It is the **volume fraction** of the gyroid solid used to carve the arms, and getting
+# here took ruling out three plausible-sounding answers — all measured, all wrong:
+#
+# 1. `freq` is not the lever.  Rendered at 12 / 20 / 26 / 34 with a half-filled lattice:
+#    all four give a golf ball whose dimples merely get finer.  A CSG intersection keeps
+#    every piece of the ball's OWN outer surface where the field is negative — half of it
+#    — and those broad smooth patches are what the eye reads as solid metal, at any
+#    frequency.
+# 2. Nor is a shell `|g| <= w` specified as a *thickness in metres*, which is a
+#    well-disguised trap.  The gyroid surface is so convoluted (area ~3.09 per unit
+#    volume per unit period) that a slab just 13.7% of a cell thick already occupies 43%
+#    of space, so the first "thin shell" rendered indistinguishably from the half-space.
+#    Thickness carries no intuition here; volume does.
+# 3. Even a correctly-thin shell only half-works.  At 24% by volume the envelope survives
+#    as narrow ribbons instead of broad caps — a real improvement, visible in
+#    `png/jack_tune/` — but with under 3 cells across a ball there is still no clear line
+#    of sight through the part, so it reads as knobbly rather than see-through.
+#
+# What the reference images (`png/gold_gyroids`, `png/gyroid_nd`) actually do is not CSG
+# at all: a lone `function` field with `contained_by { sphere }`, where `contained_by`
+# CLIPS rather than intersects, so the bare gyroid sheet is simply cut off at the sphere
+# and there is no envelope surface anywhere.  That cannot be reproduced through CSG,
+# whose whole job is to bound a solid — and it cannot be had per-arm either, since
+# `contained_by` takes one axis-aligned box or sphere, not a rotating ball-and-rod.
+#
+# So the lever that remains is to make the carving solid *sparse*: at `solid = 0.5` the
+# gyroid's two labyrinths are equal and the carve is chunky, while well below that the
+# solid thins to an open network with gaps you can see the room through — and the
+# envelope patches shrink with it, since they only survive where the field is negative.
+# `solid` is converted to a level set by the measured mapping in `Jack.level`.
+#
+# That works, and `solid` turned out to be the only lever that does.  Swept at 720x720:
+# 0.16 gives broad windows you can see the room through, 0.24 is already thickening back
+# towards knobbly, 0.30+ is the golf ball again.  0.16 it is.
+#
+# `freq` then controls scale alone: cell period `2*pi/freq`, so a ball spans
+# `ball*freq/pi` cells.  The intuition that *more* cells would look more like the lacy
+# reference stills is exactly backwards, and was measured to be: at freq 22 (3.6 cells
+# across a ball) and freq 30 (5.0) the dimpled golf ball comes straight back.  The
+# reference gets away with six small cells only because it is a clipped sheet with no
+# envelope at all; here the envelope survives every carve, so an opening only reads as an
+# opening while it is large compared with the part.  ~2.5 cells across a ball is the
+# balance — few enough for big windows, many enough to still read as a lattice.
+#
+# The glass is insensitive to all of this: swept over 0.16/0.20/0.24 the three renders are
+# near-indistinguishable, because refraction through a faceted shell dominates whatever
+# the shell's exact thickness is.  So `solid` is chosen on the gold alone.
+#
+# Sanity-checked for structural integrity rather than trusted: sampling every rod's cross
+# section over 60 frames x 6 arms x 24 slices, the retained fraction never reaches zero at
+# 0.16 (worst 2%), so no ball is ever carved free of the hub.
+FREQ = 15.0
+SOLID = 0.16
+FILL = 0.0
+ARM = 1.0
+BALL = 0.52
+ROD = 0.32
 
 
 # ---------------------------------------------------------------------------
@@ -130,29 +265,28 @@ class Jack(Element):
     into a single ``union`` means one sphere-trace instead of six.
 
     ``spin`` / ``precess`` are whole turns per loop (integers keep the loop seamless);
-    ``tilt`` is the half-angle of the precession cone in degrees; ``body`` is a fixed
-    body reorientation whose only job is to keep the spin axis off an arm (spinning
-    exactly about a rod would leave two of the six arms stationary).
+    ``tilt`` is the half-angle of the precession cone in degrees.  There is no body
+    pre-rotation: the spin axis is exactly the ±y arm pair, which is what makes the
+    precession legible (see the module docstring).
 
     ``gyroid_glass=False`` renders the glass arms as plain solid ball-and-rod — the
     fallback if intersecting a *dielectric* with a marched field proves too slow.
     """
 
-    def __init__(self, *, arm: float = 1.05, ball: float = 0.34, rod: float = 0.20,
-                 spin: float = 1.0, precess: float = 1.0, tilt: float = 27.0,
-                 body: Sequence[float] = (34.0, 21.0, 0.0),
-                 freq: float = 12.0, threshold: float = 0.0,
+    def __init__(self, *, arm: float = ARM, ball: float = BALL, rod: float = ROD,
+                 spin: float = 1.0, precess: float = 1.0, tilt: float = 35.0,
+                 freq: float = FREQ, solid: float = SOLID, fill: float = FILL,
                  gold: str = "gold", glass: str = "glass",
                  gyroid_glass: bool = True, name: str = "jack") -> None:
         self.arm = float(arm)
         self.ball = float(ball)
         self.rod = float(rod)
+        self.fill = float(fill)
         self.spin = float(spin)
         self.precess = float(precess)
         self.tilt = float(tilt)
-        self.body = tuple(float(c) for c in body)
         self.freq = float(freq)
-        self.threshold = float(threshold)
+        self.solid = float(solid)
         self.gold = gold
         self.glass = glass
         self.gyroid_glass = bool(gyroid_glass)
@@ -171,29 +305,92 @@ class Jack(Element):
     def pose(self, t: float) -> Mat3:
         """Body->world rotation at loop phase ``t`` in [0, 1).
 
-        ``Ry(precession) · Rz(tilt) · Ry(spin) · B``: the last factor reorients the
-        body, the spin turns it about its own axis, the tilt lays that axis over on a
-        cone, and the precession walks the cone around world +y.  Every factor is the
-        identity at ``t = 0`` and again at ``t = 1`` for integer turn counts.
-        """
-        bx, by, bz = self.body
-        B = _mm(_rz(math.radians(bz)), _mm(_ry(math.radians(by)), _rx(math.radians(bx))))
-        spin = _ry(2.0 * math.pi * self.spin * t)
-        tilt = _rz(math.radians(self.tilt))
-        prec = _ry(2.0 * math.pi * self.precess * t)
-        return _mm(prec, _mm(tilt, _mm(spin, B)))
+        ``Ry(precession) · Rz(tilt) · Ry(spin)``, read right to left: the jack spins
+        about its own ±y arm pair, that axis is laid over by ``tilt``, and the
+        precession walks the lean around world +y.
 
-    def gyroid_expr(self) -> str:
-        """The world-space gyroid, renormalised to ~unit Lipschitz (see module docstring)."""
+        Because ``Ry(spin)`` fixes ŷ, the axis direction reduces to
+        ``Ry(2π·precess·t) · Rz(tilt) · ŷ`` = ``(−sin tilt·cos θ, cos tilt, sin tilt·sin θ)``
+        — independent of the spin, i.e. an exact cone of half-angle ``tilt`` about
+        world +y.  That is what puts the two axis balls on antiphase circles of radius
+        ``arm·sin(tilt)`` at heights ``±arm·cos(tilt)``.
+        """
+        return _mm(_ry(2.0 * math.pi * self.precess * t),
+                   _mm(_rz(math.radians(self.tilt)),
+                       _ry(2.0 * math.pi * self.spin * t)))
+
+    def gyroid_fields(self) -> List[str]:
+        """The world-static gyroid as the ``function`` field(s) to carve the arms with.
+
+        Renormalised to ~unit Lipschitz (see the module docstring), and returned as a
+        list because the interesting case needs **two** leaves.
+
+        With ``fill = 0`` this is the single field ``g``, whose solid is the half-space
+        ``g <= 0``.  That is *not* the lacy look: intersecting a ball with it keeps about
+        half of the ball's own smooth outer surface, so the part reads as a solid golf
+        ball with dimples no matter how high ``freq`` goes.
+
+        With ``fill > 0`` it is the **shell** ``|g| <= w``, i.e. the pair
+        ``[g - w, -g - w]`` whose intersection is a slab hugging the zero level set.
+        Now the ball's outer surface survives only as a narrow rim where the slab
+        crosses it, and what's left is see-through gyroid filigree — the same surface the
+        plain gyroid examples show, just clipped to the arm.
+
+        ``fill`` is the **fraction of space the slab occupies**, which is the only
+        scale-free way to ask for this.  Thickness-in-metres is a trap: the gyroid
+        surface is so convoluted (area ~3.09/period per unit volume) that a slab merely
+        13.7% of a cell thick already fills 43% of space — visually indistinguishable
+        from the 50% half-space, which is exactly how a first attempt at this shell
+        failed.  Measured (400k samples, and frequency-independent because the
+        distribution of ``g`` does not depend on ``freq``):
+
+            volfrac(|g_raw| <= g0) ~ 0.647 * g0   for g0 up to ~0.3
+            |grad g_raw| ~ 1.529 * freq           near the zero set
+
+        so ``g0 = fill / 0.647`` and the field-unit half-width is ``w = g0 / (2*freq)``.
+        The implied world thickness ``2*g0 / (1.529*freq)`` is reported by
+        :meth:`shell_report` — it matters only because it must stay a few pixels wide.
+        """
         f = self.freq
         s = 1.0 / (2.0 * f)
-        thr = self.threshold
-        body = (f"sin({fmt(f)}*x)*cos({fmt(f)}*y)"
-                f"+sin({fmt(f)}*y)*cos({fmt(f)}*z)"
-                f"+sin({fmt(f)}*z)*cos({fmt(f)}*x)")
-        if thr != 0.0:
-            body = f"{body}-({fmt(thr)})"
-        return f"({body})*{fmt(s)}"
+        raw = (f"sin({fmt(f)}*x)*cos({fmt(f)}*y)"
+               f"+sin({fmt(f)}*y)*cos({fmt(f)}*z)"
+               f"+sin({fmt(f)}*z)*cos({fmt(f)}*x)")
+        c = self.level()
+        inner = raw if c == 0.0 else f"{raw}-({fmt(c)})"
+        core = f"({inner})*{fmt(s)}"
+        if self.fill <= 0.0:
+            return [core]
+        # A shell of volume fraction `fill` straddling level c, again by quantile rather
+        # than by any linear width formula.
+        p = gyroid_cdf(c)
+        lo = gyroid_quantile(p - 0.5 * self.fill)
+        hi = gyroid_quantile(p + 0.5 * self.fill)
+        return [f"({raw}-({fmt(hi)}))*{fmt(s)}", f"({fmt(lo)}-({raw}))*{fmt(s)}"]
+
+    # |grad g_raw| ~ 1.529*freq near the zero set (measured); used only to report a wall
+    # thickness in metres, never to pick a level.
+    GRAD_PER_FREQ = 1.529
+
+    def level(self) -> float:
+        """The raw-gyroid level ``c`` whose solid ``g <= c`` has volume fraction ``solid``."""
+        return gyroid_quantile(self.solid)
+
+    def shell_report(self) -> str:
+        """One line of human-checkable geometry, for tuning by eye against numbers."""
+        period = 2.0 * math.pi / self.freq
+        out = (f"freq={self.freq:g} period={period:.4f} solid={self.solid:g} "
+               f"level={self.level():+.3f}  "
+               f"cells across ball={self.ball * self.freq / math.pi:.2f} "
+               f"rod={self.rod * self.freq / math.pi:.2f}")
+        if self.fill > 0.0:
+            p = gyroid_cdf(self.level())
+            g0 = 0.5 * (gyroid_quantile(p + 0.5 * self.fill)
+                        - gyroid_quantile(p - 0.5 * self.fill))
+            thick = 2.0 * g0 / (self.GRAD_PER_FREQ * self.freq)
+            out += (f"  SHELL fill={self.fill:g} wall={thick:.4f}"
+                    f" ({thick / period * 100:.1f}% of a cell)")
+        return out
 
     def _arm_leaves(self, M: Mat3, kind: str) -> List[str]:
         out: List[str] = []
@@ -220,7 +417,10 @@ class Jack(Element):
             lines.append('        union {')
             lines.extend('    ' + s for s in leaves)
             lines.append('        }')
-            lines.append(f'        function {{ expr "{self.gyroid_expr()}" }}')
+            # N children fold pairwise as max(max(arms, g-w), -g-w), so the two shell
+            # halves need no extra nesting.
+            for expr in self.gyroid_fields():
+                lines.append(f'        function {{ expr "{expr}" }}')
             lines.append('    }')
             # A `function` field always needs a container; an origin-centred sphere is
             # pose-independent, so it never has to be recomputed as the jack turns.
@@ -246,14 +446,6 @@ class Jack(Element):
 # The scene
 # ---------------------------------------------------------------------------
 
-# Gyroid tuning.  `threshold` shifts the level set: the solid is `g <= threshold`, so a
-# POSITIVE value grows it past the 50/50 split of `threshold = 0`.  At 0 the lattice eats
-# the 0.2 m rods into loose chips; ~0.3 leaves the jack readable while the walls still
-# bore right through it.  `freq = 12` puts ~5 cells across the jack — enough that the
-# sweep through the static field is obvious frame to frame.
-FREQ = 12.0
-THRESHOLD = 0.3
-
 # Mode-W render settings shared by the still and the sequence.  `-ev` is a
 # *compensation multiplier* on the absolute sensor gain (not a stop count), and it is
 # fixed here rather than auto-anchored so every frame develops identically.
@@ -270,12 +462,14 @@ THRESHOLD = 0.3
 WHITTED = ["-spp", "8", "-gi", "24", "-ambient", "0.05", "-gi-clamp", "0.15",
            "-whitted-grid", "3", "-ev", "11"]
 
-# 90 frames at 25 fps = a 3.6 s loop carrying ONE turn of spin and one of precession:
-# ~100 deg/s and 4 deg between frames, slow enough to actually follow a lattice wall
-# entering one face of an arm and leaving the other.  (Two turns of spin — 10 deg/frame —
-# was measurably too fast to read.)  25 fps divides 100, so the GIF's integer
-# centisecond frame delay is exact and playback is not silently retimed.
-FRAMES = 90
+# 180 frames at 25 fps = a 7.2 s loop carrying ONE turn of spin and one of precession:
+# 2 deg per frame, ~50 deg/s.  The frame count is set by *angular resolution*, not by
+# duration — the gyroid-carved glass throws a different refraction pattern at every
+# orientation, so too few frames per degree turns continuous caustic motion into a
+# flickering slideshow.  90 frames (4 deg/frame) still read that way; this is deliberately
+# twice as fine.  25 fps divides 100, so the GIF's integer centisecond frame delay is
+# exact and playback is not silently retimed.
+FRAMES = 180
 FPS = 25
 
 # Closed room, camera inside it (so glass has a whole interior to refract).  It is
@@ -301,7 +495,8 @@ def _room() -> List[Raw]:
 
 
 def build_scene(res=(480, 480), *, gyroid_glass: bool = True, spin: float = 1.0,
-                freq: float = FREQ, threshold: float = THRESHOLD) -> Scene:
+                freq: float = FREQ, solid: float = SOLID,
+                ball: float = BALL, rod: float = ROD, fill: float = FILL) -> Scene:
     scene = Scene(Camera(eye=(0.5, 0.7, 5.5), look_at=(0.0, 0.05, 0.0),
                          up=(0, 1, 0), fov_y=38, mode="W", res=res))
     scene.add(
@@ -317,7 +512,8 @@ def build_scene(res=(480, 480), *, gyroid_glass: bool = True, spin: float = 1.0,
         # modelling it.
         Material("left", "diffuse", reflect="rgb 0.52 0.30 0.26"),
         Material("right", "diffuse", reflect="rgb 0.28 0.40 0.52"),
-        Jack(gyroid_glass=gyroid_glass, spin=spin, freq=freq, threshold=threshold),
+        Jack(gyroid_glass=gyroid_glass, spin=spin, freq=freq, solid=solid,
+             ball=ball, rod=rod, fill=fill),
         *_room(),
         # `lumens` pins the exposure (absolute mode) so the loop cannot pump — see
         # the module docstring.
@@ -331,18 +527,24 @@ def _opt(flag: str, default: float) -> float:
     return float(sys.argv[sys.argv.index(flag) + 1]) if flag in sys.argv else default
 
 
+def _sopt(flag: str, default: str) -> str:
+    return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
+
+
 def main() -> int:
     still = "--still" in sys.argv
     render = "--render" in sys.argv
     plain = "--plain-glass" in sys.argv
     r = int(_opt("--res", 480))
     scene = build_scene(res=(r, r), gyroid_glass=not plain,
-                        freq=_opt("--freq", FREQ), threshold=_opt("--thr", THRESHOLD))
+                        freq=_opt("--freq", FREQ), solid=_opt("--solid", SOLID),
+                        ball=_opt("--ball", BALL), rod=_opt("--rod", ROD),
+                        fill=_opt("--fill", FILL))
 
     if still:
         from loom.drive import render_still
-        render_still(scene, t=0.0, name="jumping_jack", n=1,
-                     interval=8.0, extra_args=WHITTED)
+        render_still(scene, t=_opt("--t", 0.0), name=_sopt("--name", "jumping_jack"),
+                     n=1, interval=8.0, extra_args=WHITTED)
         return 0
     if not render:
         from loom import Clock, Cache

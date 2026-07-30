@@ -43,6 +43,26 @@ automatic gradient renormalisation of an `FExpr` leaf reusing the per-family bou
 already knows (`√2` / 1 / `2^((n−1)/2)` / 7). Documented as a deliberate gap in
 `tools/loom/DESIGN.md` §7c until then.
 
+**A fourth thing the workaround re-derives, added after the fact: picking a carving level by
+volume fraction.** How holey an `intersect { solid, function }` looks is set by the volume
+fraction of the field's sub-level set, and there is no safe closed form for it. Measured on the
+3-D gyroid: the *band* fraction is `volfrac(|g| ≤ g₀) ≈ 0.647·g₀` but the *one-sided* fraction is
+`volfrac(g ≤ −g₀) = (1 − 0.647·g₀)/2` — **half** the slope, which is an invisible factor-of-two
+bug (asking for `solid = 0.26` silently delivered 0.378, making every "sparse" sweep look
+half-filled), and any linear fit is additionally off by ~2× in the tail (0.15 → 0.325).
+`jumping_jack.py` now inverts the distribution exactly (`_gyroid_samples` sorts a 48³ sample of
+one period, cached and frequency-independent; `gyroid_quantile` / `gyroid_cdf` read it), verified
+round-trip to 3 decimals. This inversion belongs next to `nd_grad_bound` in the library, per
+field family.
+
+**Also worth recording as a hard limit, not debt:** the lacy look of the reference stills
+(`png/gold_gyroids`, `png/gyroid_nd`) comes from `contained_by` **clipping** a bare `function`
+sheet, so there is no envelope surface at all. That is *not expressible through CSG* (whose job
+is to bound a solid), and it cannot be done per-arm even by hand, because `contained_by` takes a
+single axis-aligned box or sphere — not a rotating ball-and-rod, and not one per CSG leaf. A
+sparse carve is the CSG analogue; if a genuinely clipped multi-part sheet is ever wanted, FTSL
+itself would need per-leaf clip regions.
+
 ### BUG — FIXED (2026-07-30, v0.117.0): `scraps/gi_collapse.ftsl`, the `-gi` normalisation regression test, was VACUOUS — auto-exposure divided out the very error it tests for
 
 Found while validating `-gi-clamp`. The scene tests the gather's cosine-normalisation invariant:

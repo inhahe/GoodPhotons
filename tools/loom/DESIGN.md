@@ -374,6 +374,38 @@ divided by its own gradient bound (`2·freq` for the 3-D gyroid) so one honest
 unit-Lipschitz SDF partner is dragged down to the same crawl. This is the same
 `nd_grad_bound` reasoning as above, applied to keep a *hand-written* field cheap.
 
+**Choosing a carving level: by volume fraction, never by a threshold or a thickness.**
+An `intersect { solid, function }` keeps the part of the solid where the field is negative,
+so how *holey* the result looks is set entirely by how much of space that field's sub-level
+set occupies — and every intuitive shortcut for picking it is wrong. Three were tried on
+`jumping_jack.py` and all three failed: raising `freq` only shrinks the cells (the carve
+still keeps the solid's own envelope, so it stays a dimpled ball at any frequency);
+specifying a *shell* by wall thickness in metres is unitless-in-disguise (the gyroid's
+surface-area density is ≈3.09 per period, so a wall just 13.7% of a cell thick already fills
+**42.8%** of space — indistinguishable from the plain half-space carve); and even a
+correctly thin shell still leaves the solid's smooth envelope intact, which is the thing
+that reads as "solid". What works is making the carving solid *sparse* — around 0.16–0.20
+volume fraction, where the gyroid's minority labyrinth is an open network you can see the
+room through.
+
+So the knob should be the volume fraction itself, and the level must be obtained by
+**inverting the field's own sampled distribution numerically** — a linear fit is off by
+~2× in the tail (asking 0.15 delivers 0.325), and the band-vs-one-sided slopes differ by
+exactly 2× (`volfrac(|g| ≤ g₀) ≈ 0.647·g₀` but `volfrac(g ≤ −g₀) = (1 − 0.647·g₀)/2`),
+which is an easy and invisible factor-of-two bug. `jumping_jack.py`'s
+`_gyroid_samples` / `gyroid_quantile` / `gyroid_cdf` do it exactly: sort a 48³ sample of one
+period once, then read quantiles off it. Being frequency-independent, the table is built
+once per process and cached. This belongs in the library alongside `nd_grad_bound` when the
+Field-tree classes land.
+
+Finally, note what the reference gyroid stills (`png/gold_gyroids`, `png/gyroid_nd`) do,
+because it is *not* reachable from CSG: a lone `function` leaf plus `contained_by { sphere }`,
+where `contained_by` **clips** rather than intersects, so the bare gyroid sheet is simply cut
+off at the sphere and there is no envelope surface anywhere. CSG cannot reproduce that — its
+whole job is to bound a solid — and it cannot be had per-arm either, since `contained_by`
+takes a single axis-aligned box or sphere, not a rotating ball-and-rod. A sparse carve is the
+CSG-expressible analogue, not a literal equivalent.
+
 ### 7c. Function-driven materials
 Reuse Good Photons' existing material-props-by-function (reflectance/color/IOR/etc.
 over `x,y,z`/UV). Loom emits those expressions; adding `t` makes any property animate.
