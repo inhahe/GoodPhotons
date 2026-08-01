@@ -367,8 +367,10 @@ worked case. The idiom that matters there: put the animated `translate`/`rotate`
 field stays in world space and the solid sweeps through it. One `isosurface` per material
 folds that material's shapes into a single `union` inside the `intersect`, so the whole
 group costs one sphere-trace. Two practical rules travel with it: `contained_by` should be
-authored on a **pose-independent** hull (an origin-centred sphere for a body rotating about
-the origin) so it never has to be recomputed per frame, and a raw TPMS expression should be
+authored on a **pose-independent** hull (a sphere on the body's own centre of rotation,
+which stays valid under any pose and under translating the body as a whole — note the hull
+moves with the body while the `function` leaf still must not) so it never has to be
+recomputed per frame, and a raw TPMS expression should be
 divided by its own gradient bound (`2·freq` for the 3-D gyroid) so one honest
 `max_gradient ≈ √3` covers it — otherwise the marcher steps `d/(2·freq)` and the CSG's
 unit-Lipschitz SDF partner is dragged down to the same crawl. This is the same

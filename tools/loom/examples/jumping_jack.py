@@ -37,9 +37,14 @@ reads as arbitrary wobble rather than precession.
 Both rates are whole turns per loop, and the field is static, so the loop closes
 the instant the **pose** repeats — no phase drift needed anywhere.
 
-Three arms are gold (glossy ``metal:gold``) and three are SF10 glass, chosen on
-opposite half-axes (``+x −y +z`` gold, ``−x +y −z`` glass) so the two halves
-interlock instead of splitting the jack down the middle.
+The jack **stands on the floor** rather than floating: because the ±y pair is the spin
+axis, the bottom ball's centre sits at a constant height ``−arm·cos(tilt)`` for the whole
+loop, so the jack's depth below its own centre is the closed form ``arm·cos(tilt) + ball``
+with no dependence on ``t``.  See :func:`rest_height`.
+
+Three arms are gold (glossy ``metal:gold``) and three are SF10 glass.  The ±x axis is
+all gold, the ±z axis is all glass, and the **spin axis carries one of each**, which
+labels the jack's top and bottom and so keeps the precession readable.
 
 Why the intersection is cheap: a raw gyroid has ``|grad| <= 2*sqrt(3)*freq``, which
 would force the sphere-tracer into steps of ``d/(2*freq)``.  Dividing the
@@ -217,8 +222,9 @@ def aim_y_euler(d: Sequence[float]) -> Tuple[float, float, float]:
 # `solid` is converted to a level set by the measured mapping in `Jack.level`.
 #
 # That works, and `solid` turned out to be the only lever that does.  Swept at 720x720:
-# 0.16 gives broad windows you can see the room through, 0.24 is already thickening back
-# towards knobbly, 0.30+ is the golf ball again.  0.16 it is.
+# 0.16 gives broad windows you can see the room through, 0.24 keeps the windows but on
+# visibly heavier walls, 0.30+ is the golf ball again.  0.24 is the "less holey but still
+# see-through" setting and is the current default; 0.16 is the openwork end of the range.
 #
 # `freq` then controls scale alone: cell period `2*pi/freq`, so a ball spans
 # `ball*freq/pi` cells.  The intuition that *more* cells would look more like the lacy
@@ -237,23 +243,32 @@ def aim_y_euler(d: Sequence[float]) -> Tuple[float, float, float]:
 # section over 60 frames x 6 arms x 24 slices, the retained fraction never reaches zero at
 # 0.16 (worst 2%), so no ball is ever carved free of the hub.
 FREQ = 15.0
-SOLID = 0.16
+SOLID = 0.24
 FILL = 0.0
 ARM = 1.0
 BALL = 0.52
 ROD = 0.32
+TILT = 35.0     # precession half-angle; a module constant because `rest_height` needs it
 
 
 # ---------------------------------------------------------------------------
 # The element
 # ---------------------------------------------------------------------------
 
-# Body-frame half-axes: (direction, "gold" | "glass").  Opposite signs alternate
-# so neither material owns a whole hemisphere.
+# Body-frame half-axes: (direction, "gold" | "glass").  One whole axis is gold, one whole
+# axis is glass, and the third carries one of each — three arms per material either way.
+#
+# Which axis gets the mixed pair is not arbitrary: it is **±y, the spin axis**.  Those two
+# arms are the jack's top and bottom, the pair that rides the antiphase precession circles,
+# and they are the only two whose motion you can actually track by eye.  Making them
+# *different materials* labels the two ends of the axis, so the lean and its walk around
+# the cone stay readable; a matched pair there would be visually interchangeable and the
+# precession would again read as generic wobble.  The two same-material axes are the
+# equatorial ones, which whirl too fast to identify individually anyway.
 _ARMS: Tuple[Tuple[Tuple[int, int, int], str], ...] = (
-    ((1, 0, 0), "gold"), ((-1, 0, 0), "glass"),
-    ((0, 1, 0), "glass"), ((0, -1, 0), "gold"),
-    ((0, 0, 1), "gold"), ((0, 0, -1), "glass"),
+    ((1, 0, 0), "gold"), ((-1, 0, 0), "gold"),        # equatorial axis, both gold
+    ((0, 0, 1), "glass"), ((0, 0, -1), "glass"),      # equatorial axis, both glass
+    ((0, 1, 0), "gold"), ((0, -1, 0), "glass"),       # spin axis, one of each
 )
 
 
@@ -274,10 +289,12 @@ class Jack(Element):
     """
 
     def __init__(self, *, arm: float = ARM, ball: float = BALL, rod: float = ROD,
-                 spin: float = 1.0, precess: float = 1.0, tilt: float = 35.0,
+                 spin: float = 1.0, precess: float = 1.0, tilt: float = TILT,
                  freq: float = FREQ, solid: float = SOLID, fill: float = FILL,
+                 centre: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                  gold: str = "gold", glass: str = "glass",
                  gyroid_glass: bool = True, name: str = "jack") -> None:
+        self.centre = (float(centre[0]), float(centre[1]), float(centre[2]))
         self.arm = float(arm)
         self.ball = float(ball)
         self.rod = float(rod)
@@ -398,8 +415,9 @@ class Jack(Element):
             if k != kind:
                 continue
             d = _mv(M, d_body)
-            tip = tuple(self.arm * c for c in d)
-            mid = tuple(0.5 * self.arm * c for c in d)
+            o = self.centre
+            tip = tuple(self.arm * c + o[i] for i, c in enumerate(d))
+            mid = tuple(0.5 * self.arm * c + o[i] for i, c in enumerate(d))
             rx, ry, rz = aim_y_euler(d)
             out.append(f'            sphere {{ center {fmt3(tip)}  '
                        f'radius {fmt(self.ball)} }}')
@@ -422,9 +440,12 @@ class Jack(Element):
             for expr in self.gyroid_fields():
                 lines.append(f'        function {{ expr "{expr}" }}')
             lines.append('    }')
-            # A `function` field always needs a container; an origin-centred sphere is
-            # pose-independent, so it never has to be recomputed as the jack turns.
-            lines.append(f'    contained_by {{ sphere {{ center 0 0 0  '
+            # A `function` field always needs a container; a sphere on the jack's own
+            # centre is pose-independent (the jack only ever rotates about it), so it
+            # never has to be recomputed as the jack turns.  Note the container moves
+            # with the jack but the `function` leaf does NOT — the field stays in world
+            # space, which is the whole point.
+            lines.append(f'    contained_by {{ sphere {{ center {fmt3(self.centre)}  '
                          f'radius {fmt(self.reach)} }} }}')
             # |grad| of the renormalised gyroid is <= sqrt(3); the SDF partner is
             # unit-Lipschitz, and max(.,.) cannot exceed either bound.
@@ -440,6 +461,43 @@ class Jack(Element):
         M = self.pose(ctx.clock.t)
         return "\n".join([self._block(M, "gold", self.gold, True),
                           self._block(M, "glass", self.glass, self.gyroid_glass)])
+
+
+def rest_height(floor_y: float, *, arm: float = ARM, ball: float = BALL,
+                tilt: float = TILT) -> float:
+    """Centre height that stands the jack exactly on ``floor_y`` — a closed form.
+
+    The jack's lowest point is not something to search for numerically; it falls out of
+    the pose.  Of the six arms, the ±y pair *is* the spin axis, so those two ball centres
+    sit at constant heights ``±arm·cos(tilt)`` (they ride circles, which is the whole
+    precession story), while the four equatorial arms are perpendicular to that axis and
+    so their ball centres only ever reach ``±arm·sin(tilt)``.  For any ``tilt < 45°``,
+    ``cos(tilt) > sin(tilt)``, so the **bottom axis ball is always the lowest part of the
+    jack** — and, being at a constant height, it is lowest by the same amount at every
+    instant of the loop.  Hence
+
+        depth below centre = arm·cos(tilt) + ball
+
+    with no dependence on ``t`` at all.  (The rods never compete: an arm of direction
+    ``d`` bottoms out at ``min(0, arm·d_y) − rod·√(1−d_y²)``, which for these proportions
+    is 1.00 for the axis rod and 0.84 for an equatorial one, against the ball's 1.34.)
+
+    Two things worth stating because they are easy to get wrong:
+
+    * **The carve does not raise this.** One might expect the gyroid to shave the very
+      bottom off the ball and leave the jack visually hovering, and worse, the field is
+      world-static so the answer would depend on the height being solved for — a fixed
+      point rather than a formula.  It does not, because the ball's lowest point traces a
+      circle of radius ``arm·sin(tilt)`` through the field, ≈8.6 gyroid cells around per
+      loop, so it samples the field's whole range many times over.  Measured at the height
+      returned here: that point is solid material in 103 of 432 frames at ``solid=0.24``
+      (58 at 0.16, 143 at 0.30).  The jack really does touch down, repeatedly.
+    * **Touching at every instant is impossible** for a rigid tumbling jack — only a
+      sphere could manage that.  "On the floor" therefore means tangent at its lowest
+      moments and never penetrating, which is exactly what this height gives, and here the
+      lowest moment happens to recur throughout the loop rather than once.
+    """
+    return floor_y + arm * math.cos(math.radians(tilt)) + ball
 
 
 # ---------------------------------------------------------------------------
@@ -462,15 +520,25 @@ class Jack(Element):
 WHITTED = ["-spp", "8", "-gi", "24", "-ambient", "0.05", "-gi-clamp", "0.15",
            "-whitted-grid", "3", "-ev", "11"]
 
-# 180 frames at 25 fps = a 7.2 s loop carrying ONE turn of spin and one of precession:
-# 2 deg per frame, ~50 deg/s.  The frame count is set by *angular resolution*, not by
+# 432 frames at 60 fps = a 7.2 s loop carrying ONE turn of spin and one of precession:
+# 0.8333 deg per frame, ~50 deg/s.  The frame count is set by *angular resolution*, not by
 # duration — the gyroid-carved glass throws a different refraction pattern at every
 # orientation, so too few frames per degree turns continuous caustic motion into a
-# flickering slideshow.  90 frames (4 deg/frame) still read that way; this is deliberately
-# twice as fine.  25 fps divides 100, so the GIF's integer centisecond frame delay is
-# exact and playback is not silently retimed.
-FRAMES = 180
-FPS = 25
+# flickering slideshow.  90 frames (4 deg/frame) read that way badly and 180 (2 deg) still
+# a little; at 60 fps the motion is finally continuous.  The loop duration is held at 7.2 s
+# throughout so the jack's actual rotation *speed* never changes — only how finely it is
+# sampled.
+#
+# The GIF cannot be 60 fps: a GIF frame delay is an integer number of centiseconds, so the
+# only exact rates are divisors of 100 and 60 is not one (100/60 = 1.667 cs, which players
+# silently round to 2 cs = 50 fps, retiming the loop by 20%).  So the GIF is built from
+# every GIF_STRIDE-th frame at GIF_FPS, chosen to land on the identical 7.2 s: 432/3 = 144
+# frames at 20 fps, and 20 divides 100 exactly.  Same motion, same duration, same seam —
+# just the coarser sampling the format can actually represent.  The MP4 is the 60 fps one.
+FRAMES = 432
+FPS = 60
+GIF_STRIDE = 3
+GIF_FPS = 20
 
 # Closed room, camera inside it (so glass has a whole interior to refract).  It is
 # deep in +z because the camera stands *inside* and still has to clear the jack's
@@ -497,7 +565,13 @@ def _room() -> List[Raw]:
 def build_scene(res=(480, 480), *, gyroid_glass: bool = True, spin: float = 1.0,
                 freq: float = FREQ, solid: float = SOLID,
                 ball: float = BALL, rod: float = ROD, fill: float = FILL) -> Scene:
-    scene = Scene(Camera(eye=(0.5, 0.7, 5.5), look_at=(0.0, 0.05, 0.0),
+    # Stand the jack on the floor rather than floating it at the origin.
+    cy = rest_height(Y0, arm=ARM, ball=BALL, tilt=TILT)
+    # The camera framing was tuned around a jack at the origin, so drop the eye and the
+    # aim point by the same amount the jack dropped.  That preserves the composition
+    # exactly (same relative geometry, same slight downward tilt) instead of re-tuning it,
+    # and the eye stays 2.04 m above the floor, well inside the room.
+    scene = Scene(Camera(eye=(0.5, 0.7 + cy, 5.5), look_at=(0.0, 0.05 + cy, 0.0),
                          up=(0, 1, 0), fov_y=38, mode="W", res=res))
     scene.add(
         # `preset gold` / `preset glass:SF10` expand to exactly these (src/materials.h).
@@ -513,7 +587,7 @@ def build_scene(res=(480, 480), *, gyroid_glass: bool = True, spin: float = 1.0,
         Material("left", "diffuse", reflect="rgb 0.52 0.30 0.26"),
         Material("right", "diffuse", reflect="rgb 0.28 0.40 0.52"),
         Jack(gyroid_glass=gyroid_glass, spin=spin, freq=freq, solid=solid,
-             ball=ball, rod=rod, fill=fill),
+             ball=ball, rod=rod, fill=fill, centre=(0.0, cy, 0.0)),
         *_room(),
         # `lumens` pins the exposure (absolute mode) so the loop cannot pump — see
         # the module docstring.
@@ -552,11 +626,15 @@ def main() -> int:
         return 0
 
     from loom import render_range
-    from loom.drive import assemble_gif_ffmpeg, default_outdir
+    from loom.drive import assemble_gif_ffmpeg, assemble_mp4, default_outdir
     pngs = render_range(scene, FRAMES, name="jumping_jack", fps=FPS, n=1,
                         interval=8.0, skip_existing=True, extra_args=WHITTED)
     out = default_outdir("jumping_jack")
-    assemble_gif_ffmpeg(pngs, out / "jumping_jack.gif", fps=FPS)
+    # The MP4 is the deliverable: full 60 fps, every frame, and about 5x smaller than the
+    # GIF because it is not restricted to a 256-entry palette.
+    assemble_mp4(pngs, out / "jumping_jack.mp4", fps=FPS)
+    # The GIF is the compatibility copy — see the GIF_FPS comment for why it cannot be 60.
+    assemble_gif_ffmpeg(pngs[::GIF_STRIDE], out / "jumping_jack.gif", fps=GIF_FPS)
     return 0
 
 
