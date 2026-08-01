@@ -202,6 +202,17 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     double Bx = B[kx] - sh.Sx * B[kz], By = B[ky] - sh.Sy * B[kz];
     double Cx = C[kx] - sh.Sx * C[kz], Cy = C[ky] - sh.Sy * C[kz];
     // Scaled barycentric edge functions (U,V,W weight v0,v1,v2 respectively).
+    //
+    // THESE THREE LINES MUST NOT BE FMA-CONTRACTED. The watertight guarantee is that the two
+    // triangles sharing an edge evaluate it from bitwise identical operands in opposite order,
+    // so their edge functions are exact negatives and a ray dead-on the edge is claimed by
+    // exactly one of them. Contracting `a*b - c*d` into `fma(a, b, -(c*d))` keeps one product
+    // exact and rounds the other, so on an exact tie both sharers get the SAME small residual
+    // and, if its sign is the minority one, both reject -> the surface cracks along the edge.
+    // Safe as built: MSVC's default /fp:precise does not contract and the build sets no /fp:
+    // or /arch: flag. If that ever changes, switch to explicitly-rounded products the way the
+    // CUDA twin does (render_cuda.cu dCrossRn) -- it had to, because nvcc defaults to
+    // -fmad=true and this exact bug cracked the cornell box's quad diagonals on the GPU.
     double U = Cx * By - Cy * Bx;
     double V = Ax * Cy - Ay * Cx;
     double W = Bx * Ay - By * Ax;

@@ -605,10 +605,53 @@ static int checkFluoro() {
     double frac = (double)reemit / Nt;
     double moOut = reemit ? meanOut / reemit : 0.0;
 
+    // (d) The EXCITATION sampler (Material::fluoInSampler, built from
+    //     absorb(lambda)*illuminant(lambda)). The backward tracer's reradiation NEE
+    //     weight is E[aEff(lambda_in)*Q * spd(lambda_in) / pdf(lambda_in)], which must
+    //     equal Q*integral(aEff*spd) NO MATTER which pdf is used -- so estimating it
+    //     both ways (illuminant-only, the pre-0.115.0 sampler, vs absorb*illuminant)
+    //     is a direct unbiasedness test. The variance ratio is reported too, though
+    //     note it is a BEST case: this integrand is exactly the new sampler's target,
+    //     so its estimator is constant and only CDF discretisation is left. In a real
+    //     render the NEE geometry/visibility factor rides along and keeps variance.
+    //     Also checks the mode-W 1-spp draw (u = rot05(0) = 0.5, i.e. the CDF median)
+    //     lands inside the absorption band -- what makes a narrow dye right at 1 spp.
+    Spectrum illum = blackbody(6500.0);
+    Spectrum prodS = [&m, illum](double w) { return clamp01(m.fluoAbsorb(w)) * illum(w); };
+    EmissionSampler illumS, inS;
+    illumS.build(illum, 1.0);
+    inS.build(prodS, 1.0);
+    double refI = 0.0;   // analytic integral(aEff(lambda)*illum(lambda)) by fine quadrature
+    for (double w = LAMBDA_MIN + 0.25; w < LAMBDA_MAX; w += 0.5) {
+        double r2, a2; fluoroWeights(m, w, r2, a2);
+        refI += a2 * illum(w) * 0.5;
+    }
+    const long long Nx = 400'000;
+    double sumOld = 0, sumOld2 = 0, sumNew = 0, sumNew2 = 0;
+    for (long long i = 0; i < Nx; ++i) {
+        double p, r2, a2;
+        double w = illumS.sample(rng, p);
+        double f = 0.0;
+        if (p > 0.0) { fluoroWeights(m, w, r2, a2); f = a2 * illum(w) / p; }
+        sumOld += f; sumOld2 += f * f;
+        w = inS.sample(rng, p);
+        f = 0.0;
+        if (p > 0.0) { fluoroWeights(m, w, r2, a2); f = a2 * illum(w) / p; }
+        sumNew += f; sumNew2 += f * f;
+    }
+    double eOld = sumOld / Nx, eNew = sumNew / Nx;
+    double vOld = sumOld2 / Nx - eOld * eOld, vNew = sumNew2 / Nx - eNew * eNew;
+    double pMed; double lamMed = inS.sampleAt(0.5, pMed);   // mode W's 1-spp lambda_in
+    double rMed, aMed; fluoroWeights(m, lamMed, rMed, aMed);
+
     bool passA = std::fabs(sMean - meanAnalytic) < 1.0;
     bool passB = std::fabs(frac - expectFrac) < 0.005;
     bool passC = (moOut > lin) && std::fabs(moOut - meanAnalytic) < 1.5;
-    bool pass = passA && passB && passC;
+    // Both estimators unbiased to 2%, the new one strictly lower-variance, and the
+    // mode-W median draw actually excites the dye (aEff > half its peak-ish 0.1).
+    bool passD = refI > 0.0 && std::fabs(eOld - refI) < 0.02 * refI &&
+                 std::fabs(eNew - refI) < 0.02 * refI && vNew < vOld && aMed > 0.1;
+    bool pass = passA && passB && passC && passD;
 
     std::printf("[checkfluoro] emission mean: sampler=%.2f analytic=%.2f nm  (%s)\n",
                 sMean, meanAnalytic, passA ? "ok" : "BAD");
@@ -616,6 +659,12 @@ static int checkFluoro() {
                 lin, frac, expectFrac, passB ? "ok" : "BAD");
     std::printf("[checkfluoro] Stokes shift: in=%.0f -> out_mean=%.2f nm (elastic=%.3f absorb=%.3f)  (%s)\n",
                 lin, moOut, (double)elastic / Nt, (double)absorb / Nt, passC ? "ok" : "BAD");
+    std::printf("[checkfluoro] excitation NEE weight: analytic=%.5g  illuminant-sampled=%.5g"
+                "  absorb*illuminant-sampled=%.5g  var %.3g -> %.3g (%.1fx)  (%s)\n",
+                refI, eOld, eNew, vOld, vNew, (vNew > 0.0 ? vOld / vNew : 0.0),
+                passD ? "ok" : "BAD");
+    std::printf("[checkfluoro] mode-W 1-spp lambda_in (CDF median) = %.1f nm, aEff there = %.3f\n",
+                lamMed, aMed);
     std::printf("[checkfluoro] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
@@ -2650,6 +2699,11 @@ static double g_vcmAlpha = 0.75;
 // Set once at arg-parse; clamped to [1, hero::kHeroMax]. N==1 turns hero off (bit-identical
 // single-λ). Defaults to hero::kHeroC (4). GPU / BDPT / VCM paths ignore it (still single-λ).
 static int g_heroC = hero::kHeroC;
+// Was -heroc given explicitly? Mode W raises the default to the full kHeroMax bundle
+// (the C wavelengths ride ONE shared BVH walk, so a wider bundle is very nearly free,
+// while it is the only thing that buys spectral accuracy at 1 spp) — but never over an
+// explicit user choice.
+static bool g_heroCSet = false;
 
 // Scene-ignore render params (Stage 3), set once at arg-parse and read by the tracer
 // wrappers (like g_heroC). g_maxBounceOverride < 0 leaves each tracer's own default
@@ -2664,6 +2718,37 @@ static int g_heroC = hero::kHeroC;
 // bidirectional modes (M/S/D) honour maxBounce but ignore directOnly.
 static int  g_maxBounceOverride = -1;
 static bool g_directOnly = false;
+
+// -mode W: the DETERMINISTIC Whitted preview. g_directOnly alone still leaves every
+// estimator stochastic (one random light point, one random glossy direction, a Russian-
+// roulette coin per specular bounce), so it needs tens of spp to look clean and buys
+// only ~3x over full GI. g_whitted additionally swaps all three for their deterministic
+// equivalents, which is what lets it converge at ONE sample per pixel -- the actual
+// order-of-magnitude win, and what POV-Ray does. g_whittedGrid is the NxN shadow-ray
+// lattice per area light; g_ambient is the flat GI stand-in (POV-Ray's `ambient`),
+// without which a CLOSED room previews with black shadows, since everything there that
+// isn't facing the key light is lit purely by the bounce this mode drops.
+static bool g_whitted = false;
+static int  g_whittedGrid = 4;
+static double g_ambient = 0.0;
+
+// -gi: mode W's deterministic ONE-BOUNCE GATHER, the real thing g_ambient only stands in
+// for. A flat constant cannot reproduce contact darkening (it lights a crevice exactly as
+// much as an exposed face) or colour bleeding (it is grey, where light that has bounced
+// off gold is not), and no single value fixes both -- raising it to fill the crevices
+// blows out the open faces. g_gi > 0 instead traces that many rays from every diffuse
+// vertex along a FIXED lattice and takes whatever deterministic Whitted radiance they
+// find. Unlike POV-Ray's radiosity there is no irradiance cache, so nothing depends on
+// render order or on which sample points the geometry happened to trigger -- which is
+// what makes it safe for an animated loop. See BackwardRenderer::giDirs.
+static int g_gi = 0;
+static int g_giGrid = 1;
+static int g_giBounce = 4;
+// -gi-clamp, dimensionless like -ambient (a multiple of one light's own radiance, scaled by
+// Scene::ambientRef() at the two hand-off sites below). 0 = off. Caps one gather ray's
+// returned radiance, which is what tames the caustic-through-the-gather contour aliasing.
+// See BackwardRenderer::giClamp for the full rationale.
+static double g_giClamp = 0.0;
 
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
@@ -2931,16 +3016,47 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
 // render passes its running spp count so successive chunks render successive
 // per-(pixel,sample) streams — the realization is identical for ANY chunk split,
 // thread count, or resume boundary (see renderRows / rng.h seedUnit).
+// `forceWhitted` renders this one film in deterministic mode W even when the run's mode is
+// something else. That is for the interactive viewer's live preview, which wants mode W's
+// noise-free-at-1-spp frame regardless of what the batch render is set to; a global flip
+// would leak into every other call, so the override is per-call.
+//
+// `rowBegin`/`rowEnd` (rowEnd < 0 = to the end) render only a BAND of the film, with the
+// thread pool splitting that band rather than the whole frame. The interactive preview uses
+// it to render a pose a slice at a time so a mode-W frame that costs seconds (a gyroid
+// labyrinth is ~26s at 960x600, vs 0.4s for a Cornell box) can still be shown as it fills
+// and abandoned the moment the camera moves. Rows outside the band are left untouched, so
+// the caller owns the film across calls.
 static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int resY,
                            long long spp, int nThreads, bool diffraction = true,
-                           unsigned long long sampleBase = 0) {
-    Film out; out.resX = resX; out.resY = resY; out.alloc();
+                           unsigned long long sampleBase = 0, bool forceWhitted = false,
+                           Film* into = nullptr, int rowBegin = 0, int rowEnd = -1) {
+    Film out;
+    if (!into) { out.resX = resX; out.resY = resY; out.alloc(); }
+    Film& film = into ? *into : out;
+    const int bandLo = std::clamp(rowBegin, 0, resY);
+    const int bandHi = std::clamp(rowEnd < 0 ? resY : rowEnd, bandLo, resY);
+    const int bandN  = bandHi - bandLo;
+    if (bandN <= 0) return out;
+    if (bandN < nThreads) nThreads = bandN;   // don't hand a thread an empty row range
     auto worker = [&](int tid) {
         BackwardRenderer br; br.diffraction = diffraction; br.heroC = g_heroC;
         if (g_maxBounceOverride >= 1) br.maxBounce = g_maxBounceOverride;
-        br.directOnly = g_directOnly;
-        int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
-        br.renderRows(scene, cam, out, y0, y1, spp, sampleBase);
+        br.directOnly = g_directOnly || forceWhitted;   // mode W is direct-only by construction
+        br.whitted = g_whitted || forceWhitted; br.lightGrid = g_whittedGrid;
+        // Mode W turns split-at-dispersion ON by default. Its λ lattice is shared by every
+        // pixel, so a de-hero would collapse the WHOLE FRAME onto one wavelength and mistint
+        // every dielectric -- a deterministic error, not noise, so no amount of spp fixes it.
+        // Mode R is stochastic and averages the collapse away, so there it stays opt-in
+        // (`-herosplit`, which reaches the backward tracer via BackwardRenderer::heroSplit).
+        br.heroSplit = hero::gSplit || br.whitted;
+        // -ambient is dimensionless (fraction of a light's own radiance); convert to
+        // this scene's absolute radiance scale here. See Scene::ambientRef().
+        br.ambient = g_ambient * scene.ambientRef();
+        br.giDirs = g_gi; br.giGrid = g_giGrid; br.giBounce = g_giBounce;
+        br.giClamp = g_giClamp * scene.ambientRef();   // same scaling as -ambient above
+        int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
+        br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -3919,9 +4035,15 @@ static int runSppProgressive(
         // Every pixel receives exactly totalSpp samples, so the Monte-Carlo relative error
         // ~ 1/sqrt(samples) gives an honest graininess ballpark straight from the count.
         double noisePct = totalSpp > 0 ? 100.0 / std::sqrt((double)totalSpp) : 0.0;
+        // Mode W has no Monte-Carlo noise to report (every estimator is a fixed
+        // quadrature), so quoting 1/sqrt(spp) there would be pure fiction; spp only
+        // buys antialiasing and spectral resolution. Say so instead.
+        char nz[32];
+        if (g_whitted) std::snprintf(nz, sizeof nz, "deterministic");
+        else           std::snprintf(nz, sizeof nz, "~%.2f%% noise", noisePct);
         bool stopped  = g_stopRequested != 0;
         bool timeUp   = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
-        bool noiseMet = (noiseTarget > 0.0 && totalSpp > 0 && noisePct <= noiseTarget);
+        bool noiseMet = (!g_whitted && noiseTarget > 0.0 && totalSpp > 0 && noisePct <= noiseTarget);
         if (noiseMet) metNoise = true;
         bool stop = stopped || timeUp || noiseMet;
         bool done = stop || final;
@@ -3944,17 +4066,17 @@ static int runSppProgressive(
             const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
             char st[220];
             if (runForever)
-                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld spp, ~%.2f%% noise%s",
-                              elapsed, totalSpp, noisePct, why);
+                std::snprintf(st, sizeof st, "[forever] %.1fs, %lld spp, %s%s",
+                              elapsed, totalSpp, nz, why);
             else if (timeBudgetSec > 0.0)
-                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld spp, ~%.2f%% noise%s",
-                              elapsed, timeBudgetSec, totalSpp, noisePct, why);
+                std::snprintf(st, sizeof st, "[time] %.1fs / %.3gs, %lld spp, %s%s",
+                              elapsed, timeBudgetSec, totalSpp, nz, why);
             else if (noiseTarget > 0.0)
-                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld spp, ~%.2f%% noise%s",
-                              noiseTarget, elapsed, totalSpp, noisePct, why);
+                std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld spp, %s%s",
+                              noiseTarget, elapsed, totalSpp, nz, why);
             else
-                std::snprintf(st, sizeof st, "[spp] %lld / %lld, %.1fs, ~%.2f%% noise",
-                              totalSpp, baseSpp + sppReq, elapsed, noisePct);
+                std::snprintf(st, sizeof st, "[spp] %lld / %lld, %.1fs, %s",
+                              totalSpp, baseSpp + sppReq, elapsed, nz);
             if (preview) ansiPreview(*shown, (double)totalSpp, manualExposure, st);
             else { std::printf("%s\n", st); std::fflush(stdout); }
             liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute, st);
@@ -4223,7 +4345,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     const bool gpuForwardMode =
         (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'V' || mode == 'P');
     const bool gpuBdptMode = (mode == 'D');   // GPU BDPT megakernel (own support check)
-    const bool gpuBackwardMode = (mode == 'R');   // GPU backward reference megakernel (own check)
+    // GPU backward reference megakernel (own check). -mode W runs here too: the device
+    // megakernel carries a full twin of the deterministic estimators (the bkWhitted /
+    // bkGrid / bkGi* / bkHeroSplit / bkAmbient DScene knobs + the dWhitted* lattice helpers
+    // in render_cuda.cu, and the split-at-dispersion walk bkRadianceHeroLoop<true>), so it
+    // reproduces the CPU's noise-free image rather than the noisy one the mode exists to
+    // avoid. The device twin is not yet complete, though -- cudaBackwardWhittedSupported()
+    // rejects -gi, and those scenes fall back to the CPU mode-W tracer (which they can
+    // afford, being ~1 spp).
+    const bool gpuBackwardMode = (mode == 'R');
     const bool wantGpu  = !std::strcmp(device, "gpu");
     const bool wantAuto = !std::strcmp(device, "auto");
     const bool fisheyeCam = (cam.projection != CAM_RECTILINEAR);
@@ -4246,6 +4376,20 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      mode);
         return 1;
     }
+#ifdef HAVE_CUDA
+    // Mode W's device knobs — the exact twin of the BackwardRenderer setup in the mode-R CPU
+    // worker above (renderBackward's lambda), so the two estimators are configured
+    // identically. Built here because BOTH the -device gate below and the mode-R dispatch
+    // need it. Only read when g_whitted.
+    WhittedOpts whittedOpts;
+    whittedOpts.grid      = g_whittedGrid;
+    whittedOpts.giDirs    = g_gi;
+    whittedOpts.giGrid    = g_giGrid;
+    whittedOpts.giBounce  = g_giBounce;
+    whittedOpts.heroSplit = hero::gSplit || g_whitted;
+    whittedOpts.ambient   = g_ambient * scene.ambientRef();
+    whittedOpts.giClamp   = g_giClamp * scene.ambientRef();   // same scaling as ambient
+#endif
     bool useGpu = false;
     if (!wantGpu && !wantAuto && std::strcmp(device, "cpu"))
         std::fprintf(stderr, "[device] unknown -device '%s'; using CPU "
@@ -4280,10 +4424,19 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // participating media (homog+heterog, incl. rainbow phase — M10), GRIN
             // marching (M11), fluorescence, and BOTH a constant and an image-based env
             // light (M1). Collimated beams still fall back to the CPU backward tracer.
-            if (!cudaBackwardSupported(scene, cam)) {
-                const char* why = "scene has a backward-GPU-unsupported feature "
-                                  "(collimated light, an `emit pattern:` emission "
-                                  "profile, or a lens deeper than the device cap)";
+            // -mode W adds its own narrower check on top: the deterministic device twin
+            // does not yet cover the -gi gather, so those scenes stay on the CPU mode-W
+            // tracer (cheap there — mode W is ~1 spp).
+            const bool bwOk = g_whitted
+                            ? cudaBackwardWhittedSupported(scene, cam, whittedOpts)
+                            : cudaBackwardSupported(scene, cam);
+            if (!bwOk) {
+                const char* why = g_whitted
+                    ? "mode W scene is outside the deterministic GPU scope (-gi, or a "
+                      "backward-GPU-unsupported feature)"
+                    : "scene has a backward-GPU-unsupported feature "
+                      "(collimated light, an `emit pattern:` emission "
+                      "profile, or a lens deeper than the device cap)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -4347,7 +4500,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         bool rgbFast = false;
 #ifdef HAVE_CUDA
         if (rgbBackward) {
-            if (gpuBackward && cudaBackwardRGBSupported(scene, cam)) rgbFast = true;
+            // The RGB kernel is a separate reduced tracer with no deterministic twin, so
+            // -mode W keeps the spectral estimator (the whole point of W is a noise-free
+            // image; the RGB kernel would hand back a noisy one).
+            if (g_whitted)
+                std::fprintf(stderr, "[render] -rgb ignored in -mode W: the fast RGB backward "
+                                     "has no deterministic estimator; using the spectral "
+                                     "mode-W tracer\n");
+            else if (gpuBackward && cudaBackwardRGBSupported(scene, cam)) rgbFast = true;
             else std::fprintf(stderr, "[render] -rgb (fast RGB backward) not applicable to this "
                                       "render (%s); using the spectral backward tracer\n",
                               gpuBackward ? "scene outside the RGB fast-path scope"
@@ -4367,7 +4527,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (rgbFast)      return renderBackwardRGBCuda(scene, cam, res, resY, sppTarget, diffraction, p,
                                                            g_maxBounceOverride, g_directOnly);
             if (gpuBackward)  return renderBackwardCuda(scene, cam, res, resY, sppTarget, diffraction, p,
-                                                        g_maxBounceOverride, g_directOnly, g_heroC);
+                                                        g_maxBounceOverride, g_directOnly, g_heroC,
+                                                        g_whitted ? &whittedOpts : nullptr);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -5230,6 +5391,9 @@ static void printHelp(const char* prog) {
 "\n"
 "Render mode & budget:\n"
 "  -mode <letter>        transport mode (default B; A/B/C forward, R/V/D backward — see README)\n"
+"  -mode W               deterministic POV-Ray-style preview: mode R with every estimator\n"
+"                        replaced by a fixed quadrature, so it is noise-free at -spp 1\n"
+"                        (CPU or GPU). See -whitted-grid / -ambient below\n"
 "  -n <count>            photon/sample count (accepts 2e8, 1.5e9)\n"
 "  -r <W> [H]            resolution (square if H omitted)\n"
 "  -time <sec>           wall-clock budget (progressive)\n"
@@ -5244,7 +5408,8 @@ static void printHelp(const char* prog) {
 "  -heroc <N>            hero-wavelength bundle size, 1..8 (default 4); 1 = single-λ, hero off\n"
 "  -herosplit            at a dispersive interface fan the bundle into N monochromatic\n"
 "                        sub-paths (crisp prism/rainbow caustics) instead of de-hero'ing;\n"
-"                        costs ~N× traversal past the split (CPU forward modes A/B/C, M/S)\n"
+"                        costs ~N× traversal past the split (CPU forward A/B/C, M/S, backward\n"
+"                        R; mode W always splits — it is what makes glass right at 1 spp)\n"
 "  -t <n>                CPU thread count\n"
 "\n"
 "Scene-ignore (faster preview — strip expensive features, like the rasterizer):\n"
@@ -5255,6 +5420,38 @@ static void printHelp(const char* prog) {
 "                        where raising it is what a mirror-lined cavity needs)\n"
 "  -direct-only          Whitted: direct + specular recursion only, no diffuse indirect\n"
 "                        (near-1-spp preview; camera modes R/RGB and P's backward side)\n"
+"\n"
+"Mode W (deterministic preview) tuning:\n"
+"  -whitted-grid <n>     n×n fixed shadow rays per area light (default 4 = 16 rays);\n"
+"                        this is what makes a soft shadow smooth instead of noisy\n"
+"  -ambient|-amb <v>     flat ambient fill, as a fraction of a light's own radiance\n"
+"                        (default 0; try 0.02..0.2). The stand-in for the diffuse GI\n"
+"                        mode W drops — without it a CLOSED room previews with black\n"
+"                        shadows, since everything there is lit by bounce\n"
+"  -gi|-radiosity <n>    replace the flat ambient with a REAL deterministic one-bounce\n"
+"                        gather: n rays per diffuse vertex along a fixed lattice\n"
+"                        (default 0 = off; try 16..64). Brings back what a constant\n"
+"                        cannot — contact darkening in crevices, and colour bleeding\n"
+"                        (a gold object actually tints the room). Costs roughly n/6×\n"
+"                        the frame time. Has NO irradiance cache, so unlike POV-Ray's\n"
+"                        radiosity it is safe on animation: nothing depends on render\n"
+"                        order, so a seamless loop cannot flicker. -ambient still\n"
+"                        applies, now as the far-field fill a gather ray sees when it\n"
+"                        escapes the geometry\n"
+"  -gi-grid <n>          n×n shadow rays at a GATHER vertex (default 1). Cheap detail\n"
+"                        knob; the gather averages over n directions anyway\n"
+"  -gi-bounce <n>        max bounces along one gather ray (default 4). Bounds the cost\n"
+"                        of a specular chain inside a highly reflective lattice\n"
+"  -gi-clamp <x>         firefly ceiling on ONE gather ray, as a multiple of one light's\n"
+"                        own radiance (same units as -ambient; 0 = off, the default).\n"
+"                        Fixes the thin bright dashed curves a glass ball or mirror puts\n"
+"                        on nearby diffuse surfaces at low -spp: those are gather rays\n"
+"                        that reach the lamp THROUGH the specular surface, carrying its\n"
+"                        full radiance, and the shared direction lattice turns the\n"
+"                        on/off boundary into a contour instead of noise. Try 0.05-0.2.\n"
+"                        Keep it ABOVE -ambient: the clamp also caps the far-field tail an\n"
+"                        escaping gather ray returns, so the gather's fill is effectively\n"
+"                        min(-ambient, x) and a smaller x just darkens the whole scene\n"
 "\n"
 "Output, preview & checkpointing:\n"
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
@@ -5272,7 +5469,8 @@ static void printHelp(const char* prog) {
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
 "  -raster-iso <n>       marching-cubes resolution for isosurfaces (0 = skip)\n"
-"  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T for a live path-traced preview\n"
+"  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T to cycle\n"
+"                        the lit preview: raster -> mode W (deterministic, CPU, any scene) -> path-traced (GPU)\n"
 "  -noclip|-nocollide    start the fly viewer with wall collision off\n"
 "  -anim <file.json>     edit a loom CurveDrive sidecar in the fly viewer (implies -explore);\n"
 "                        control points seed from it and Save writes the reshaped curve back\n"
@@ -5519,7 +5717,15 @@ static int run(int argc, char** argv) {
     // than silently ignored.
     char cliModePrescan = 0;
     for (int i = 1; i + 1 < argc; ++i) {
-        if (!std::strcmp(argv[i], "-mode")) cliModePrescan = argv[i + 1][0];
+        if (!std::strcmp(argv[i], "-mode")) {
+            cliModePrescan = argv[i + 1][0];
+            // -mode W is the deterministic Whitted preview. It is not a separate
+            // transport: it reuses the backward tracer's traversal wholesale and only
+            // swaps the stochastic estimators for deterministic ones, so it normalises
+            // to 'R' HERE -- before any of the dozen `mode == 'R'` capability checks
+            // downstream -- and carries its difference in g_whitted instead.
+            if (cliModePrescan == 'W' || cliModePrescan == 'w') cliModePrescan = 'R';
+        }
         else if (!std::strcmp(argv[i], "-on-unsupported")) {
             std::string v = argv[i + 1];
             if      (v == "fallback" || v == "fall") g_onUnsupported = OnUnsupported::Fallback;
@@ -5635,7 +5841,28 @@ static int run(int argc, char** argv) {
                 resYCli = std::atoi(argv[++i]);
         }
         else if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
-        else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) { mode = argv[++i][0]; modeFromCli = true; }
+        else if (!std::strcmp(argv[i], "-mode") && i + 1 < argc) {
+            mode = argv[++i][0]; modeFromCli = true;
+            if (mode == 'W' || mode == 'w') { mode = 'R'; g_whitted = true; }   // see the prescan
+        }
+        else if (!std::strcmp(argv[i], "-whitted-grid") && i + 1 < argc) {
+            g_whittedGrid = std::max(1, std::atoi(argv[++i]));
+        }
+        else if ((!std::strcmp(argv[i], "-ambient") || !std::strcmp(argv[i], "-amb")) && i + 1 < argc) {
+            g_ambient = std::max(0.0, std::atof(argv[++i]));
+        }
+        else if ((!std::strcmp(argv[i], "-gi") || !std::strcmp(argv[i], "-radiosity")) && i + 1 < argc) {
+            g_gi = std::max(0, std::atoi(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-gi-grid") && i + 1 < argc) {
+            g_giGrid = std::max(1, std::atoi(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-gi-bounce") && i + 1 < argc) {
+            g_giBounce = std::max(1, std::atoi(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-gi-clamp") && i + 1 < argc) {
+            g_giClamp = std::max(0.0, std::atof(argv[++i]));
+        }
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         // An explicit absolute radius pins the radius: don't then adapt it out from under
         // the user (this was the documented workaround for mode M's scaling problem).
@@ -5654,6 +5881,7 @@ static int run(int argc, char** argv) {
             g_heroC = std::atoi(argv[++i]);
             if (g_heroC < 1) g_heroC = 1;
             if (g_heroC > hero::kHeroMax) g_heroC = hero::kHeroMax;
+            g_heroCSet = true;
         }
         // Split-at-dispersion instead of de-hero. A single global policy flag read by
         // every CPU forward tracer via Renderer::heroSplit's default initialiser, so it
@@ -5990,17 +6218,67 @@ static int run(int argc, char** argv) {
     // Publish the depth cap / direct-only mode to the tracer wrappers (globals, like
     // g_heroC), so every render (incl. the meter pre-pass) honours them.
     g_maxBounceOverride = maxBounceOverride;
-    g_directOnly = directOnly;
+    // An authored `mode W` is normalised to 'R' by the loader (ftsl::normMode); this is
+    // the half that turns the deterministic estimators on. A CLI `-mode <x>` forces every
+    // camera, so it also overrides the scene's choice of W — otherwise `-mode R` on a W
+    // scene would silently still render the biased preview.
+    if (ftslScene.whitted && !modeFromCli) g_whitted = true;
+    g_directOnly = directOnly || g_whitted;   // -mode W implies it
     if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);
-    if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
-    // -herosplit only reaches the CPU forward tracer; say so rather than silently
-    // ignoring it, and point out that it is a no-op without a bundle to split.
-    if (hero::gSplit) {
+    // The interactive viewer renders its live preview in mode W whatever the run's mode is
+    // (press T), so mode W's settings have to be honoured in an -explore run too -- else
+    // `-explore -gi 32` would silently drop the gather and the preview would come out with
+    // a 1-wavelength bundle. There is no batch render in an explore run, so widening the
+    // bundle here can't slow anything else down.
+    const bool wPreview = exploreMode;
+    if (g_whitted || wPreview) {
+        // Widen the spectral bundle by default (see g_heroCSet): at 1 spp the C hero
+        // wavelengths ARE the whole spectral quadrature, and they share one BVH walk,
+        // so this is the cheapest accuracy in the mode.
+        if (!g_heroCSet) g_heroC = hero::kHeroMax;
+    }
+    if (g_whitted) {
+        std::printf("[mode W] deterministic Whitted preview: %dx%d shadow rays/light, "
+                    "%d wavelengths/sample%s, ambient %.3g\n",
+                    g_whittedGrid, g_whittedGrid, g_heroC,
+                    g_heroC > 1 ? " (split at dispersion)" : "", g_ambient);
+        if (g_gi > 0) {
+            std::printf("[mode W] one-bounce gather: %d rays/diffuse vertex, %dx%d shadow "
+                        "rays at gather vertices, <=%d bounces/gather ray (cacheless, so "
+                        "temporally stable)\n", g_gi, g_giGrid, g_giGrid, g_giBounce);
+            if (g_giClamp > 0.0)
+                std::printf("[mode W] gather firefly clamp: one gather ray capped at %.3g "
+                            "of a light's own radiance\n", g_giClamp);
+        }
+    }
+    else if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
+    // Kept out of the chain above: rejecting -gi is independent of whether the run is
+    // also direct-only, and folding it in would swallow that notice when both are given.
+    // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for
+    // it, so silently accepting -gi anywhere else would just be misleading.
+    // (wPreview spares it: the viewer's T preview IS mode W, so -gi is live there.)
+    if (!g_whitted && !wPreview && g_gi > 0) {
+        std::printf("[ignore] -gi %d needs -mode W (other modes either have real GI or no "
+                    "diffuse transport at all)\n", g_gi);
+        g_gi = 0;
+    }
+    // -gi-clamp only ever reads inside the gather, so it is dead without -gi. Say so rather
+    // than letting someone tune a value that cannot do anything (and note that g_gi may have
+    // just been zeroed above, which is exactly one of the ways to get here).
+    if (g_giClamp > 0.0 && g_gi == 0)
+        std::printf("[ignore] -gi-clamp %.3g does nothing without -gi (it caps a GATHER "
+                    "ray; the flat -ambient fill is not clamped)\n", g_giClamp);
+    // -herosplit reaches the CPU forward tracer, the photon maps, and the backward tracer
+    // (modes R/W) on BOTH the CPU and the GPU (the device split is bkRadianceHeroLoop<true>,
+    // v0.111.0). The GPU FORWARD megakernel still de-heros, so name the layers rather than
+    // silently ignoring it, and point out that it is a no-op without a bundle to split. Mode W
+    // enables it itself (see BackwardRenderer::heroSplit), so it is reported there instead.
+    if (hero::gSplit && !g_whitted) {
         if (g_heroC <= 1)
             std::printf("[hero] -herosplit has no effect with -heroc 1 (no secondaries to split)\n");
         else
-            std::printf("[hero] split-at-dispersion ON (C=%d fan-out; CPU forward modes A/B/C + "
-                        "photon-map M/S only)\n", g_heroC);
+            std::printf("[hero] split-at-dispersion ON (C=%d fan-out; backward R/W on CPU+GPU, "
+                        "forward modes A/B/C and photon-map M/S on the CPU)\n", g_heroC);
     }
 
     if (checkBvhOnly) {
@@ -7800,33 +8078,101 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
             gpuWarmKeep = (gpuRaster != nullptr);   // only meaningful on the discrete GPU path
 #endif
-            // ---- Interactive PATH-TRACED preview (fast RGB backward), toggled with 'T' ----
+            // ---- Interactive LIT preview, cycled with 'T' -------------------------------
             // The explorer normally shows the flat-shaded raster (instant, for navigation).
-            // Press 'T' to instead progressively PATH-TRACE the current view with the fast RGB
-            // backward tracer (Stage 2) into a resident GPU session: while the camera holds
-            // still the image converges in place; the instant it moves we drop back to the
-            // responsive raster and re-aim the session. The scene-ignore flags (-no-media/-env/
-            // -fluoro, -max-bounce, -direct-only) already apply — they mutated the Scene before
-            // this session bakes it, and the depth/Whitted knobs are passed into begin(). GPU
-            // only, and only when the scene+camera are inside the fast-RGB scope.
-            bool  traceMode  = false;             // 'T' toggle: path-traced preview vs. flat raster
-            bool  traceAvail = false;             // scene+camera in fast-RGB scope on this GPU
-            bool  traceDirty = true;              // camera moved -> re-aim + restart accumulation
+            // 'T' cycles that for a real lit render of the pose you are standing at:
+            //
+            //   RASTER  ->  W  ->  PT  ->  RASTER ...
+            //
+            //   W  = mode W, the deterministic Whitted preview, on the CPU. ONE render per
+            //        pose, noise-free at 1 spp, and it works on ANY scene (full spectral
+            //        walk, all materials, media, env, and the -gi one-bounce gather if asked
+            //        for). This is the preview that is always available.
+            //   PT = progressively PATH-TRACE the pose with the fast RGB backward tracer
+            //        (Stage 2) into a resident GPU session: it keeps converging while you
+            //        hold still, so it ends up more correct than W (real multi-bounce GI),
+            //        but it needs a CUDA GPU and a scene inside the fast-RGB scope, and it
+            //        starts noisy. Skipped in the cycle when unavailable.
+            //
+            // Either way the instant the camera moves we drop back to the responsive raster,
+            // then re-render/re-aim once you settle. The scene-ignore flags (-no-media/-env/
+            // -fluoro, -max-bounce, -direct-only) already apply — they mutated the Scene
+            // before this point, so both previews inherit them.
+            // `-explore -mode W` opens straight into the mode-W preview: asking for the
+            // deterministic preview mode AND the interactive viewer in the same command can
+            // only mean you want to fly around the lit image, not the flat raster. Plain
+            // -explore still opens on the raster, which is what you want for navigating.
+            enum PreviewMode { PV_RASTER = 0, PV_WHITTED, PV_PT };
+            PreviewMode pvMode = g_whitted ? PV_WHITTED : PV_RASTER;   // 'T' cycles this
+            bool  traceAvail = false;             // scene+camera in fast-RGB scope on this GPU (PV_PT)
+            bool  traceDirty = true;              // camera moved -> re-render / re-aim + restart accumulation
             double traceAnchor = 0.0;             // locked auto-exposure anchor for the current pose (0 = recompute)
             const long long kTraceBatchSpp = 4;   // spp accumulated per idle iteration (responsive batches)
             const long long kTraceCapSpp   = 4096;// stop refining once this converged (idle after)
+            // PV_WHITTED progressive state. A mode-W frame is one deterministic pass, but it
+            // can cost seconds, so it is rendered as a stack of row BANDS with one band per
+            // viewer iteration: input keeps being drained between bands, and moving the camera
+            // simply abandons the unfinished rows. Band height is retuned from the measured
+            // cost of the previous band to hold ~kWBandSec, which is what lets the same code
+            // stay responsive on both a 0.4s Cornell box and a 26s gyroid labyrinth.
+            Film wFilm;                           // full-res mode-W film for the current pose (accumulates)
+            std::vector<uint8_t> wImg;            // tone-mapped RGB8 shown so far (coarse pass, then bands)
+            int    wRow      = 0;                 // film rows still to render are [0, wRow); bands come off the top
+            int    wBandRows = 16;                // adaptive band height (rows)
+            int    wPass     = 0;                 // absolute sample index of the pass being rendered
+            int    wResX = 0, wResY = 0;          // wFilm size (rebuilt on a resize)
+            const double kWBandSec = 0.10;        // target wall-time per band: responsiveness vs. overhead
+            const int    kWCoarse  = 16;          // first pass is 1/16 linear (1/256 the pixels)
+            // Mode W is exact at 1 spp only while the whole path stays in the hero BUNDLE, which
+            // carries heroC wavelengths at once. Anything that DE-HEROES the path onto a single
+            // wavelength breaks that, because mode W's wavelength lattice is a function of the
+            // sample index alone -- shared by every pixel -- so at 1 spp the entire object is
+            // rendered at ONE wavelength and comes out strongly mistinted. Extra passes are the
+            // fallback; they are only worth taking when the scene actually contains such a
+            // material, since anywhere else they are bit-for-bit identical work.
+            //
+            // The DISPERSIVE materials (dielectric / thin-film / multilayer / grating /
+            // half-mirror / fluorescent) used to be the main offender -- a Cornell SF10 ball
+            // rendered flat green until ~16 spp. They no longer are: mode W now SPLITS the bundle
+            // at a dispersive vertex into C monochromatic sub-paths, each on its own Snell
+            // direction (BackwardRenderer::heroSplit), so glass is colour-correct at 1 spp.
+            // `Layered` used to be the remaining offender for the same reason (it de-hero'd
+            // unconditionally, so a clearcoat previewed monochromatic); as of v0.115.1 its coat
+            // reflectance is applied as a PER-λ weight with the bundle intact, and only a
+            // genuinely chromatic coat -- one where the R >= 0.5 dominant branch differs across
+            // λ -- fans out, so layered scenes are 1-spp-clean too. What still de-heroes is the
+            // scalar (bundle-free) path taken for media / GRIN / heroC 1.
+            // (Thin-film and multilayer needed a SECOND fix beyond the split, in v0.112.0: the
+            // split gives each λ its own direction, but the reflect-or-transmit choice at the
+            // interface was still a coin flip with no `whitted` branch, so those two stayed
+            // grainy here even at C > 1. They now take the dominant branch weighted, like
+            // Dielectric -- see thinFilmInterface's whittedWeight.)
+            // (No hasLens() term: the viewer builds its camera fresh from the pose each frame,
+            // so the preview camera is always a plain one even if the scene authored a lens.)
+            const int kWSppCap = 16;
+            bool wNeedSpp = (g_heroC <= 1) || scene.backwardMedium().enabled ||
+                            grin::sceneHasGrin(scene);
+            // Rough GLOSSY is deliberately NOT on that list, even though its lobe is likewise
+            // resolved across samples (whittedGlossyDir) rather than within one. The difference
+            // is what a single pass looks like: a de-hero'd dielectric is flatly WRONG (a green
+            // ball), whereas a one-direction lobe is merely SHARP -- it reads as a shinier
+            // metal, not as an error. Making every satin surface cost 16 passes to settle would
+            // trade the viewer's whole reason for existing against a subtle look difference, so
+            // resolving the lobe is left to an explicit `-spp` on a batch render.
 #ifdef HAVE_CUDA
             BackwardRGBSession* traceSess = nullptr;   // resident RGB-backward preview (lazy)
             int   traceResX = 0, traceResY = 0;        // session film size (recreated on a resize)
             Film  traceFilm;                           // scratch download film (lazily sized)
             if (gpuRaster != nullptr)
                 traceAvail = cudaBackwardRGBSupported(scene, rc0.cam);   // same scope the batch -rgb uses
-            if (traceAvail)
-                std::printf("[viewer] press 'T' for a live path-traced preview (fast RGB backward)\n");
-            else
-                std::printf("[viewer] path-trace preview ('T') unavailable (scene/camera outside fast-RGB GPU scope)\n");
-            std::fflush(stdout);
 #endif
+            std::printf("[viewer] press 'T' to cycle the lit preview: raster -> mode W "
+                        "(deterministic, CPU, any scene) -> %s%s\n",
+                        traceAvail ? "path-traced (fast RGB, GPU)"
+                                   : "(path-traced GPU preview unavailable: no CUDA raster, or "
+                                     "scene/camera outside fast-RGB scope)",
+                        pvMode == PV_WHITTED ? "  [starting in mode W]" : "");
+            std::fflush(stdout);
             // ---- loom LIVE channel (-anim + -loom, E2 "channel b") --------------------
             // With a loom build file the editor stops being a sidecar editor and becomes a
             // live one: each scrub position is pushed to a resident `python -m loom.anim`,
@@ -8020,8 +8366,10 @@ static int run(int argc, char** argv) {
                 // The RGB-backward session bakes the scene at begin() — setCamera only
                 // re-aims — so a scene swap needs a full End/Begin, not a re-aim.
                 if (traceSess) { backwardRGBSessionEnd(traceSess); traceSess = nullptr; }
-                traceDirty = true;
 #endif
+                // Outside the ifdef: the mode-W preview traces the live `scene` band by band,
+                // so a scene swap must discard its half-finished frame too, CUDA or not.
+                traceDirty = true;
                 return true;
             };
             while (!g_liveWin->closed() && !g_stopRequested) {
@@ -8114,17 +8462,20 @@ static int run(int argc, char** argv) {
                     collide = (CollideMode)((collide + 1) % 3);
                     std::printf("[viewer] collision: %s\n", collideName(collide)); std::fflush(stdout);
                 }
-                // T toggles the live path-traced (fast RGB backward) preview vs. flat raster.
+                // T cycles the lit preview: raster -> mode W -> path-traced -> raster.
+                // The GPU path-trace stage is SKIPPED (not just refused) when unavailable, so
+                // on a CPU-only box or an out-of-scope scene T is a plain raster<->W toggle
+                // rather than a key that prints an error and does nothing.
                 if (nav.toggleTrace) {
-                    if (!traceAvail) {
-                        std::printf("[viewer] path-trace preview unavailable (scene/camera outside fast-RGB GPU scope)\n");
-                    } else {
-                        traceMode = !traceMode;
-                        traceDirty = true;   // restart accumulation at the current pose
-                        changed = true;      // repaint immediately (raster if off; re-aim if on)
-                        std::printf("[viewer] path-trace preview %s\n",
-                                    traceMode ? "ON (fast RGB backward)" : "OFF (raster)");
-                    }
+                    if (pvMode == PV_RASTER)       pvMode = PV_WHITTED;
+                    else if (pvMode == PV_WHITTED) pvMode = traceAvail ? PV_PT : PV_RASTER;
+                    else                           pvMode = PV_RASTER;
+                    traceDirty = true;   // re-render / restart accumulation at the current pose
+                    changed = true;      // repaint immediately (raster if off; re-aim if on)
+                    std::printf("[viewer] preview: %s\n",
+                                pvMode == PV_RASTER  ? "raster (flat, instant)"
+                              : pvMode == PV_WHITTED ? "mode W (deterministic, CPU)"
+                                                     : "path-traced (fast RGB backward, GPU)");
                     std::fflush(stdout);
                 }
                 // Reset is the reliable "put me back to a normal, steerable state" escape:
@@ -8347,8 +8698,115 @@ static int run(int argc, char** argv) {
                 // this idle pose; it suppresses the raster warm-frame and the idle sleep so the
                 // image keeps converging (the accumulate() launch already holds the GPU warm).
                 bool tracingNow = false;
+                if (pvMode == PV_WHITTED) {
+                    Camera c; c.projection = proj;
+                    c.lookAt(eye, tgt, rUp, rFov, VW, VH);
+                    if (wResX != VW || wResY != VH) {          // first use / window resize
+                        wFilm.resX = VW; wFilm.resY = VH; wFilm.alloc();
+                        wResX = VW; wResY = VH;
+                        traceDirty = true;
+                    }
+                    if (changed) {
+                        // Camera moved: show the responsive raster and drop the stale rows.
+                        if (!rasterPresent(c, VW, VH, ev, autoExp)) {
+                            std::vector<uint8_t> img = rasterOne(c, VW, VH, ev, autoExp, nullptr);
+                            drawOverlay(c, VW, VH, img);
+                            g_liveWin->update(VW, VH, img);
+                        }
+                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                                            ")  dir(" + fmt3(fwd) + ")  [mode W: stop to render]");
+                        traceDirty = true;
+                        changed = false;
+                    } else if (traceDirty) {
+                        // First still frame at a new pose: a COARSE full-frame mode-W pass.
+                        // It lands almost immediately (1/256 the pixels) so there is a real lit
+                        // image to look at at once, and — the reason it is full-frame rather
+                        // than just the first band — its p99 gives a globally representative
+                        // auto-exposure anchor. Anchoring on band 0 instead would expose the
+                        // whole frame off one strip of it and blow out everything that follows.
+                        const int cw = std::max(1, VW / kWCoarse), ch = std::max(1, VH / kWCoarse);
+                        Camera cc; cc.projection = proj;
+                        cc.lookAt(eye, tgt, rUp, rFov, cw, ch);
+                        Film cf = renderBackward(scene, cc, cw, ch, 1, nThreads, /*diffraction*/false,
+                                                 0, /*forceWhitted*/true);
+                        traceAnchor = 0.0;                     // recompute the anchor for this pose
+                        std::vector<uint8_t> small =
+                            filmToRgb8(cf, 1.0, ev, scene.absolute, &traceAnchor);
+                        wImg.assign((size_t)VW * VH * 3, 0);   // nearest-neighbour up to full size
+                        for (int y = 0; y < VH; ++y) {
+                            const int sy = std::min(ch - 1, y * ch / VH);
+                            for (int x = 0; x < VW; ++x) {
+                                const int sx = std::min(cw - 1, x * cw / VW);
+                                std::memcpy(&wImg[((size_t)y * VW + x) * 3],
+                                            &small[((size_t)sy * cw + sx) * 3], 3);
+                            }
+                        }
+                        std::vector<uint8_t> show = wImg;
+                        drawOverlay(c, VW, VH, show);
+                        g_liveWin->update(VW, VH, show);
+                        // wFilm ACCUMULATES across passes, so it has to be cleared for the new pose.
+                        std::fill(wFilm.xyz.begin(), wFilm.xyz.end(), Vec3(0.0, 0.0, 0.0));
+                        wRow = VH;                             // now refine full-res, top band first
+                        wBandRows = 16;
+                        wPass = 0;
+                        traceDirty = false;
+                        tracingNow = true;
+                    } else if (wRow > 0) {
+                        // Refine one band. Film row 0 is the image BOTTOM (filmToRgb8 flips), so
+                        // taking bands off the high end of the film fills the picture downwards.
+                        const int y1 = wRow, y0 = std::max(0, wRow - wBandRows);
+                        auto t0 = clock::now();
+                        renderBackward(scene, c, VW, VH, 1, nThreads, /*diffraction*/false,
+                                       /*sampleBase*/(unsigned long long)wPass,
+                                       /*forceWhitted*/true, &wFilm, y0, y1);
+                        double secs = std::chrono::duration<double>(clock::now() - t0).count();
+                        // Tone-map JUST this band, with the pose's locked anchor, and splice it
+                        // into the shown image over the coarse pixels it replaces. N is the pass
+                        // count these rows have received, not the frame's -- rows further down are
+                        // still one pass behind until the sweep reaches them.
+                        Film bf; bf.resX = VW; bf.resY = y1 - y0; bf.alloc();
+                        std::memcpy(bf.xyz.data(), &wFilm.xyz[(size_t)y0 * VW],
+                                    sizeof(Vec3) * (size_t)VW * (y1 - y0));
+                        std::vector<uint8_t> bimg =
+                            filmToRgb8(bf, (double)(wPass + 1), ev, scene.absolute, &traceAnchor);
+                        for (int r = 0; r < y1 - y0; ++r) {
+                            // bimg row r is film row (y1-1-r); the shown image has film row f at
+                            // image row VH-1-f.
+                            const int dst = VH - 1 - (y1 - 1 - r);
+                            std::memcpy(&wImg[(size_t)dst * VW * 3], &bimg[(size_t)r * VW * 3],
+                                        (size_t)VW * 3);
+                        }
+                        wRow = y0;
+                        // Retune for the next band. Clamped below at 1 row (a heavy scene must
+                        // still make progress) and above at 1/4 of the frame (so an easy scene
+                        // does not swallow the whole image in one unresponsive gulp).
+                        if (secs > 1e-4) {
+                            double scale = kWBandSec / secs;
+                            wBandRows = (int)std::clamp((double)wBandRows * scale, 1.0,
+                                                        std::max(1.0, VH / 4.0));
+                        }
+                        // Pass complete. A bundle-only scene is EXACT here, so stop; otherwise
+                        // start the next pass to fill in the spectrum (see wNeedSpp).
+                        if (wRow == 0 && wNeedSpp && wPass + 1 < kWSppCap) {
+                            ++wPass;
+                            wRow = VH;
+                        }
+                        std::vector<uint8_t> show = wImg;
+                        drawOverlay(c, VW, VH, show);
+                        g_liveWin->update(VW, VH, show);
+                        tracingNow = (wRow > 0);   // keep spinning until the frame is complete
+                        const std::string sppTag = wNeedSpp ? " " + std::to_string(wPass + 1) + " spp" : "";
+                        if (tracingNow)
+                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  mode W" + sppTag + " " +
+                                                std::to_string(100 * (VH - wRow) / std::max(1, VH)) +
+                                                "%  eye(" + fmt3(eye) + ")");
+                        else
+                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  mode W" + sppTag +
+                                                "  eye(" + fmt3(eye) + ")  dir(" + fmt3(fwd) + ")");
+                    }
+                }
 #ifdef HAVE_CUDA
-                if (traceMode && traceAvail) {
+                if (pvMode == PV_PT && traceAvail) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     // (Re)create the resident session on first use or after a resize.
@@ -8392,7 +8850,7 @@ static int run(int argc, char** argv) {
                     }
                 }
 #endif
-                if (!traceMode && (changed || warmOnly)) {
+                if (pvMode == PV_RASTER && (changed || warmOnly)) {
                     Camera c; c.projection = proj;
                     c.lookAt(eye, tgt, rUp, rFov, VW, VH);
                     // A warm-only frame renders solely to hold the boost clock and must NOT

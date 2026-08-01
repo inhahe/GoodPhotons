@@ -267,6 +267,30 @@ inline const Stmt* find(const Block& b, const char* key) {
 inline void markUsed(const Block& b, const char* key) {
     for (const auto& s : b.stmts) if (s.key == key) s.used = true;
 }
+// Gather every substring listed under a REPEATED, comma-splittable key (currently
+// `skip_material`). FTSL's statement splitter starts a NEW statement at the second
+// bareword, so `skip_material a b` would silently keep only `a` (and warn about a
+// stray key `b`). Both spellings that survive the splitter are therefore accepted and
+// unioned: repeat the statement (`skip_material a` / `skip_material b`) or comma-join
+// one token (`skip_material a,b`). Marks every match read, like markUsed.
+inline std::vector<std::string> wordListOf(const Block& b, const char* key) {
+    std::vector<std::string> out;
+    for (const auto& s : b.stmts) {
+        if (s.key != key) continue;
+        s.used = true;
+        for (const std::string& w : s.val.words) {
+            size_t start = 0;
+            for (;;) {
+                size_t c = w.find(',', start);
+                std::string piece = w.substr(start, (c == std::string::npos) ? c : c - start);
+                if (!piece.empty()) out.push_back(piece);
+                if (c == std::string::npos) break;
+                start = c + 1;
+            }
+        }
+    }
+    return out;
+}
 // Mark a whole block read, for bodies whose content is consumed as the flat
 // `words` dump rather than key/value statements (`data { … }`, `palette { … }`,
 // a table's rows). Their "keys" are just the first token of each line, so
@@ -586,6 +610,14 @@ struct Loaded {
                                  //   don't author their own `mode` (0 = not specified). Unlike
                                  //   `mode` above (which trails the last camera/render block),
                                  //   this is a stable, camera-immune default.
+    // `mode W` is not a transport mode of its own: it is mode R plus the deterministic
+    // Whitted estimators (backward.h `whitted`). Normalise it to 'R' AT PARSE TIME and
+    // raise this flag, so nothing downstream ever has to know about a 'W' — the letter
+    // reaching the render dispatch used to fall through to the forward default and
+    // silently produce a black image. main.cpp ORs this into g_whitted. It is a
+    // whole-run switch (like -heroc), so one camera authoring `mode W` turns it on for
+    // the run; mixing W and R cameras in one file is not meaningful.
+    bool whitted = false;
     double defaultFps = 0.0;     // scene { fps N }: default flyby playback fps (0 = not specified)
     long long photons = -1;      // -1 = not specified (CLI default wins)
     int res = -1;                // -1 = not specified
@@ -597,6 +629,15 @@ struct Loaded {
     // the author's problem.
     std::vector<std::string> unknownKeys;
 };
+
+// Normalise an authored mode letter: `W` is mode R plus the deterministic Whitted
+// estimators, not a transport mode of its own, so it never survives the parse.
+// See Loaded::whitted.
+inline char normMode(const std::string& md, Loaded& L) {
+    char m = md[0];
+    if (m == 'W' || m == 'w') { L.whitted = true; return 'R'; }
+    return m;
+}
 
 class Builder {
 public:
@@ -635,7 +676,7 @@ public:
             // path/orbit doesn't set its own `fps`. Both are pure defaults — a per-camera
             // `mode`/`fps` and the CLI still override them.
             std::string dm = strOf(b, "default_mode");
-            if (!dm.empty()) L.defaultMode = dm[0];
+            if (!dm.empty()) L.defaultMode = normMode(dm, L);
             double dfps = dblOf(b, "fps", 0.0);
             if (dfps > 0.0) L.defaultFps = dfps;
         }
@@ -1796,17 +1837,53 @@ private:
         if (h == "whitewall")  return whiteWall(w.size() > 1 ? num(w[1]) : 0.75);
         if (h == "redwall")    return redWall();
         if (h == "greenwall")  return greenWall();
+        // `gaussian center=560 sigma=25 amp=1` / `shortpass edge=480 slope=0.2 amp=1`,
+        // or POSITIONALLY: `gaussian 560 25 1` / `shortpass 480 0.2 1`. Both forms are
+        // documented, and the positional one used to be silently DROPPED (the loop
+        // `continue`d on anything without an `=`), so `shortpass 470 0.2 1.0` became
+        // shortPass(0, 0, 1.0) — a flat 0.5 absorption — and `gaussian 600 30 1.0`
+        // became gaussianBand(0, 0, 1.0), which is identically ZERO (sigma = 0 makes
+        // exp(-inf)), silently killing the dye in scenes/layered.ftsl. Positional and
+        // keyed args may be mixed (a key overrides the slot it names); an unrecognised
+        // key is now a hard error rather than a no-op, so this cannot recur.
         if (h == "gaussian" || h == "shortpass") {
+            const bool isG = (h == "gaussian");
             double a = 0, b = 0, c = 1.0;   // gaussian: center,sigma,amp ; shortpass: edge,slope,amp
+            int pos = 0;
             for (size_t k = 1; k < w.size(); ++k) {
                 std::string key, val;
-                if (!splitEq(w[k], key, val)) continue;
-                double x = num(val);
-                if      (key == "center" || key == "edge")  a = x;
-                else if (key == "sigma"  || key == "slope") b = x;
-                else if (key == "amp")                      c = x;
+                if (splitEq(w[k], key, val)) {
+                    double x = num(val);
+                    if      (key == "center" || key == "edge")  a = x;
+                    else if (key == "sigma"  || key == "slope") b = x;
+                    else if (key == "amp")                      c = x;
+                    else {
+                        fail(h + ": unknown parameter '" + key + "' (expected " +
+                             (isG ? "center/sigma/amp" : "edge/slope/amp") + ")");
+                        return constantSpectrum(0);
+                    }
+                } else {                                  // positional
+                    double x = num(w[k]);
+                    if      (pos == 0) a = x;
+                    else if (pos == 1) b = x;
+                    else if (pos == 2) c = x;
+                    else {
+                        fail(h + ": too many arguments ('" + w[k] + "'); expected at most " +
+                             (isG ? "center sigma amp" : "edge slope amp"));
+                        return constantSpectrum(0);
+                    }
+                    ++pos;
+                }
             }
-            return (h == "gaussian") ? gaussianBand(a, b, c) : shortPass(a, b, c);
+            // sigma/slope 0 is not a usable band (gaussian collapses to identically
+            // zero, shortpass to a flat amp/2), and is far likelier to be a typo than
+            // an intent. Catch it here rather than letting it render as black.
+            if (!(b > 0.0)) {
+                fail(h + ": " + (isG ? "sigma" : "slope") + " must be > 0 (got " +
+                     std::to_string(b) + ")");
+                return constantSpectrum(0);
+            }
+            return isG ? gaussianBand(a, b, c) : shortPass(a, b, c);
         }
         // `rgb r g b` / `hsv h s v` / `hsl h s l` — a colour, upsampled to a smooth
         // reflectance via the Jakob-Hanika fit. hue in [0,1] (turns, wraps); s/v/l in
@@ -3688,7 +3765,20 @@ private:
         // emission-on-hit and the Le at an emitter-sampled point — so it is only legal
         // where the two provably agree on (u,v); checkEmitPatSupported (run after the
         // scene is built, when the emitter shapes are known) enforces that.
-        if (find(b, "emit") || find(b, "emit_map")) {
+        // EXCEPT on a `fluorescent` material, where `emit` was already consumed above as the
+        // RERADIATION profile (`fluoEmit` — the Stokes-shifted emission SHAPE, normalised by
+        // its own integral at every use site), not as self-emission. Letting the generic block
+        // also run made every fluorescent surface a self-luminous absolute-radiance light of
+        // its own emission band, which on the CPU tracers put a `gaussian center=560` dye pane
+        // ~8200× above a 0.5-albedo floor's radiance under the same lamp — impossible at
+        // `yield <= 1` — while the GPU (which never uploaded that `emit` slot) rendered only
+        // the elastic base. That is the whole of the CPU/GPU fluorescence divergence.
+        // `emit_map` has no meaning on a fluorescent either, so say so rather than drop it.
+        if (m.type == MatType::Fluorescent) {
+            if (find(b, "emit_map"))
+                fail("a fluorescent material's 'emit' is its reradiation spectrum, not surface "
+                     "emission, so 'emit_map' is not supported here");
+        } else if (find(b, "emit") || find(b, "emit_map")) {
             m.emit = patternedSpectrumParam(b, "emit", "emit_map", m.emitPat,
                                             constantSpectrum(0.0));
             m.isLight = true;
@@ -3949,8 +4039,17 @@ private:
         }
         if (ext == ".gltf" || ext == ".glb") {
             bool importMats = (strOf(b, "import_materials") != "no");
+            // `skip_material <substr>[,<substr>…]` (glTF/GLB only), repeatable: drop
+            // every primitive whose glTF material name contains one of these, matched
+            // case-insensitively. Asset-store models routinely bundle a ground plane
+            // or studio backdrop into the same file as the subject, and there is no
+            // way to subtract geometry after loading. NOTE: list several by repeating
+            // the statement or comma-joining them — a space-separated `a b` would be
+            // split into a separate statement by the parser (see wordListOf).
+            std::vector<std::string> skipMats = wordListOf(b, "skip_material");
             std::string gerr;
-            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
+            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats) == 0
+                && !gerr.empty()) {
                 fail("mesh: " + gerr); return false;
             }
         } else if (ext == ".fbx") {
@@ -4073,7 +4172,7 @@ private:
 
     // ---- mesh_asset (shared instanced geometry) ----
     // `mesh_asset "name" { file "asset.obj|gltf|glb"  material <m>  [import_materials no]
-    //  [uv use_mesh]  [usemtl use_names] }` loads a mesh ONCE into its own local
+    //  [skip_material <substr>[,…]]  [uv use_mesh]  [usemtl use_names] }` loads a mesh ONCE into its own local
     //  (authored) space as a BLAS (Scene::blasList). It bakes NO world transform and
     //  emits NO triangles into Scene::tris — placement is done by `mesh_instance`,
     //  which references the asset by name. Multiple instances share this one BLAS,
@@ -4104,7 +4203,9 @@ private:
         if (ext == ".gltf" || ext == ".glb") {
             bool importMats = (strOf(b, "import_materials") != "no");
             std::string gerr;
-            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr) == 0 && !gerr.empty()) {
+            std::vector<std::string> skipMats = wordListOf(b, "skip_material");  // see the mesh block
+            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats) == 0
+                && !gerr.empty()) {
                 fail("mesh_asset: " + gerr); return false;
             }
         } else if (ext == ".fbx") {
@@ -5483,7 +5584,7 @@ private:
         if (!readProjection(b, cs)) return false;     // projection/fisheye
         if (!readLens(b, cs)) return false;           // optional physical `lens { ... }` block
         std::string md = strOf(b, "mode");
-        if (!md.empty()) cs.mode = md[0];
+        if (!md.empty()) cs.mode = normMode(md, L);
         L.cameras.push_back(cs);
 
         // Mirror the first camera into the flat fields + global mode/res (defaults
@@ -5563,7 +5664,7 @@ private:
         shared.fov = dblOf(b, "fov_y", 40.0);
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
-        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = normMode(md, L);
         shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
@@ -5674,7 +5775,7 @@ private:
         shared.fov = dblOf(b, "fov_y", 40.0);
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
-        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = normMode(md, L);
         shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
@@ -5786,7 +5887,7 @@ private:
         shared.fov = dblOf(b, "fov_y", 40.0);
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
         shared.focus = Len(dblOf(b, "focus", 0.0));
-        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = md[0];
+        std::string md = strOf(b, "mode"); if (!md.empty()) shared.mode = normMode(md, L);
         shared.fps = dblOf(b, "fps", 0.0);   // playback hint for the flyby (0 = inherit scene default)
         if (!readFilmExposure(b, shared)) return false;   // film{res,size/format,...}, lens, fstop, zoom
         if (!readProjection(b, shared)) return false;     // projection/fisheye
@@ -6402,7 +6503,7 @@ private:
         std::string dev = strOf(b, "device");
         if (!dev.empty()) L.device = dev;
         std::string md = strOf(b, "mode");
-        if (!md.empty()) L.mode = md[0];
+        if (!md.empty()) L.mode = normMode(md, L);
         std::string o = strOf(b, "out");
         if (!o.empty()) L.out = o;
         const Stmt* r = find(b, "res");

@@ -19,8 +19,10 @@ Design notes:
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -91,12 +93,18 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                  window: bool = True, interval: float = 5.0,
                  noise: Optional[float] = None, time_s: Optional[float] = None,
                  n: Optional[int] = None, loop: bool = True,
+                 skip_existing: bool = False,
                  extra_args: Sequence[str] = ()) -> List[Path]:
     """Emit and render a frame range; return the rendered PNG paths.
 
     ``loop=True`` (default) renders a **seamless closed loop**; ``loop=False``
     renders an **open** one-shot timeline with distinct endpoints (§11.6).
     ``noise``/``time_s``/``n`` pick the per-frame stop budget (default: 3% noise).
+
+    ``skip_existing=True`` leaves already-rendered PNGs alone, so a long sequence
+    interrupted by a crash (or a Ctrl-C) resumes instead of starting over.  It is
+    opt-in precisely because it cannot tell a stale frame from a fresh one — clear
+    the directory when the scene changes.
     """
     outdir = Path(outdir) if outdir is not None else default_outdir(name)
     ftrace = find_ftrace()
@@ -105,6 +113,11 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     pngs: List[Path] = []
     for i, fp in enumerate(ftsl_paths):
         png = fp.with_suffix(".png")
+        if skip_existing and png.is_file() and png.stat().st_size > 0:
+            print(f"[loom] frame {i + 1}/{len(ftsl_paths)}: {png.name} exists, skipping",
+                  flush=True)
+            pngs.append(png)
+            continue
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png),
                "-interval", f"{interval:g}", "-checkpoint", *budget]
         if window:
@@ -145,9 +158,125 @@ def render_still(scene: Scene, *, t: float = 0.0, name: str = "loom_still",
     return png
 
 
+def _find_ffmpeg() -> str:
+    ff = shutil.which("ffmpeg")
+    if ff is None:
+        raise RuntimeError("ffmpeg not found on PATH (needed for video assembly)")
+    return ff
+
+
+_FRAME_PATTERN = "f%06d.png"
+
+
+def _stage_frames(pngs: Sequence[os.PathLike], stage: Path) -> str:
+    """Link an arbitrary frame list into ``stage`` as ``f000000.png`` … and return the
+    ``-i`` pattern for it.
+
+    ffmpeg's ``image2`` demuxer only reads a contiguously numbered ``%0Nd`` *pattern*,
+    which would force every caller to have already named its frames that way in one
+    directory; staging decouples the two.  It is **not** done with the ``concat``
+    demuxer, which looks like the general answer and is a trap here: concat needs the
+    last entry repeated for its ``duration`` to apply, and that repeat is a real extra
+    frame — on a *closed loop* it duplicates the frame before the seam and shows up as
+    a visible hitch every cycle (caught by ``tests/test_drive.py``).
+
+    Staging costs no copy in the normal case: frames are hard-linked, falling back to a
+    copy only when the link fails (a different volume, or a filesystem without them).
+    """
+    stage.mkdir(parents=True, exist_ok=True)
+    for i, p in enumerate(pngs):
+        src, dst = Path(p).resolve(), stage / (_FRAME_PATTERN % i)
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copyfile(src, dst)
+    return str(stage / _FRAME_PATTERN)
+
+
+def assemble_gif_ffmpeg(pngs: Sequence[os.PathLike], out_gif: os.PathLike,
+                        *, fps: float = 30.0, loop: int = 0,
+                        max_colors: int = 256,
+                        dither: str = "sierra2_4a") -> Path:
+    """Assemble a looping GIF through ffmpeg's ``palettegen``/``paletteuse``.
+
+    Prefer this over :func:`assemble_gif` for anything with real shading: Pillow
+    quantizes each frame independently against a fixed web-ish palette, which bands
+    gradients and makes the banding *crawl* between frames.  ``palettegen`` with
+    ``stats_mode=diff`` instead derives one 256-colour palette weighted toward the
+    pixels that actually *change* across the sequence, so a loop's moving parts get the
+    colour budget and the static background doesn't shimmer.
+
+    ``loop=0`` repeats forever (the GIF convention), ``loop=-1`` plays once.
+
+    Note the frame *delay* a GIF stores is an integer number of centiseconds, so an
+    ``fps`` that doesn't divide 100 gets rounded and plays back at the wrong rate —
+    prefer 25 / 20 / 10 (and 50 if the viewer honours 2 cs).
+    """
+    ff = _find_ffmpeg()
+    out_gif = Path(out_gif)
+    pngs = [Path(p) for p in pngs]
+    if not pngs:
+        raise ValueError("no frames to assemble")
+    vf = (f"split[a][b];"
+          f"[a]palettegen=max_colors={int(max_colors)}:stats_mode=diff[p];"
+          f"[b][p]paletteuse=dither={dither}:diff_mode=rectangle")
+    with tempfile.TemporaryDirectory(prefix="loom_gif_") as tmp:
+        pat = _stage_frames(pngs, Path(tmp) / "frames")
+        cmd = [ff, "-y", "-framerate", f"{fps:g}", "-i", pat,
+               "-filter_complex", vf, "-loop", str(int(loop)), str(out_gif)]
+        print(f"[loom] {' '.join(cmd)}", flush=True)
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        raise RuntimeError("ffmpeg failed:\n" + r.stderr.decode("utf-8", "replace")[-2000:])
+    print(f"[loom] wrote {out_gif} ({len(pngs)} frames @ {fps} fps)", flush=True)
+    return out_gif
+
+
+def assemble_mp4(pngs: Sequence[os.PathLike], out_mp4: os.PathLike,
+                 *, fps: float = 30.0, crf: int = 17, preset: str = "slow",
+                 codec: str = "libx264") -> Path:
+    """Assemble an MP4 from rendered frames (needs ffmpeg).
+
+    The companion to :func:`assemble_gif_ffmpeg` for anything a GIF handles badly:
+    full colour instead of 256 entries, and roughly an order of magnitude smaller for
+    a long or highly detailed sequence.  A *loop* is a player-side property here (an
+    MP4 has no loop flag), so the file is simply the closed cycle's frames — play it
+    with ``loop`` set and the seam is still exactly the one loom built.
+
+    ``crf`` is x264's quality knob (lower = better; 17 is near-visually-lossless and
+    the right default for render output, which has none of the camera noise that
+    normally hides compression).  The frames are padded to even dimensions because
+    ``yuv420p`` — the profile every player accepts — cannot represent an odd width or
+    height, and the pad is *after* the render rather than a resolution constraint on it.
+    """
+    ff = _find_ffmpeg()
+    out_mp4 = Path(out_mp4)
+    pngs = [Path(p) for p in pngs]
+    if not pngs:
+        raise ValueError("no frames to assemble")
+    with tempfile.TemporaryDirectory(prefix="loom_mp4_") as tmp:
+        pat = _stage_frames(pngs, Path(tmp) / "frames")
+        cmd = [ff, "-y", "-framerate", f"{fps:g}", "-i", pat,
+               "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+               "-c:v", codec, "-crf", str(int(crf)), "-preset", preset,
+               "-pix_fmt", "yuv420p", "-r", f"{fps:g}",
+               "-movflags", "+faststart", str(out_mp4)]
+        print(f"[loom] {' '.join(cmd)}", flush=True)
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        raise RuntimeError("ffmpeg failed:\n" + r.stderr.decode("utf-8", "replace")[-2000:])
+    print(f"[loom] wrote {out_mp4} ({len(pngs)} frames @ {fps} fps)", flush=True)
+    return out_mp4
+
+
 def assemble_gif(pngs: Sequence[os.PathLike], out_gif: os.PathLike,
                  *, fps: float = 30.0, loop: int = 0) -> Path:
-    """Assemble a seamless looping GIF from rendered frames (needs Pillow)."""
+    """Assemble a seamless looping GIF from rendered frames (needs Pillow).
+
+    Dependency-light but quality-limited — see :func:`assemble_gif_ffmpeg`, which
+    derives a change-weighted shared palette and is the better default when ffmpeg
+    is available.
+    """
     try:
         from PIL import Image
     except ImportError as e:  # pragma: no cover

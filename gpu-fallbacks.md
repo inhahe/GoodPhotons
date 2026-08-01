@@ -35,6 +35,67 @@ Everything forward rejects, **plus**:
 | Collimated beams / stray Env-shape emitter | not NEE-samplable even on CPU | **inherently-CPU** (low value) |
 | Lens deeper than `D_MAXLENS` | fixed device cap | low value |
 
+### Mode W (deterministic preview) — `cudaBackwardWhittedSupported` (render_cuda.cu)
+**N3a (2026-07-29, 0.110.0):** mode `W` was fully CPU-only until now. It rides the SAME
+`kBackward` megakernel as mode `R` with the estimators swapped, driven by seven new `DScene`
+knobs (`bkWhitted`/`bkGrid`/`bkGiDirs`/`bkGiGrid`/`bkGiBounce`/`bkHeroSplit`/`bkAmbient`)
+uploaded from a `WhittedOpts` (render_cuda.h). Now on-device: the G×G area-light quadrature,
+`whittedAttenuate`'s 1/512 bailout, the dominant Mirror/Filter/Grating/HalfMirror/Mix
+branches, the deterministic glossy lobe, the subpixel + wavelength lattices, and the flat
+`-ambient` fill (incl. the DiffuseTransmit both-lobe case). Validated CPU↔GPU on
+`scraps/n3_gpu.ftsl` (`scraps/n3_check.py`): 99.39 % of channel samples bit-identical,
+99.96 % within one 8-bit code, **zero** pixels inside a ≥3 px-wide disagreeing region;
+12.1 s → 0.3 s.
+
+**N3b (2026-07-29, 0.111.0):** dispersive materials no longer fall back. `bkRadianceHero`'s
+body became `template<bool AllowSplit> bkRadianceHeroLoop(...)`, a **re-enterable** bundle walk
+(it takes `ro`/`rd`/`stk`/`lam[]`/`invPdf[]`/`thr[]`/`C`/`secAlive`/`specularArrival`/
+`contBsdfPdf`/`bounce0`), so `AllowSplit == true` can fan each live secondary into its own
+monochromatic sub-path — own direction, own `DMediumStack`, own `L[i]` slot, no ×C boost — by
+re-entering `bkRadianceHeroLoop<false>`. `if constexpr` is what makes this safe on the device:
+the `false` body contains **no** recursive call, so the re-entry is provably one level deep with
+a statically-sized frame (no `cudaLimitStackSize`, no `-rdc`). Side effect / real bug fixed:
+`bkHeroSplit` now defaults from `hero::gSplit` in `buildUpload`, so **plain mode `R` on the GPU
+honours `-herosplit`** — before this it silently de-hero'd where the CPU split. Validated on
+`scraps/n3b_gpu.ftsl` (SF10 + BK7 + diamond balls and a half-mirror pane) with
+`scraps/n3b_check.py`, which compares 20 px **block means** in luma and chroma separately —
+the right bar with refraction in frame, since fp32 Snell divergence only *redistributes* energy
+within a neighbourhood while a wrong estimator shifts a whole region's colour. Result: 99.561 %
+bit-identical, max |dLuma| 0.144 / |dChroma| 0.105 codes per block (limit 1.5), and 0 blob
+interior even under N3a's stricter sliver test; the N3a scene re-rendered byte-for-byte
+identically, so the refactor is inert off the split path. Building that bed also exposed a
+*pre-existing* bug — `thinfilm` / `multilayer` (and `grating` / `fluorescent`) were still
+**stochastic** in mode `W` on both CPU and GPU, so they could not appear in a deterministic A/B at
+all; logged as N3d in `known-issues.md`, and the reason the scene carries a diamond ball where a
+thin-film bubble originally sat.
+
+**N3d-1 (2026-07-30, 0.112.0):** that bug is fixed for `thinfilm` and `multilayer`.
+`thinFilmInterface` / `multilayerInterface` (and their device twins) now honour the same
+`double* whittedWeight` dominant-branch contract `refractOrReflect` already had, so mode `W`
+makes no rng draw at an interference vertex on either device — a lossless substrate reflects iff
+R ≥ 0.5 with weight R or 1−R, an absorbing one always reflects with weight R. Verified on the new
+`scraps/n3d_gpu.ftsl`, which puts all four code paths in one frame (lossless film, absorbing film,
+lossless multilayer, absorbing multilayer): **91.780 % → 99.697 %** bit-identical, max |dLuma|
+**6.678 → 0.144**, |dChroma| **5.820 → 0.078** — a FAIL turned into a pass at the same 1.5-code
+bar. `scraps/n3d_montage.py` draws the before/after difference picture. `grating` and
+`fluorescent` remain stochastic in mode `W` (they are discrete draws from a distribution, not
+dominant-branch choices) and are tracked as N3d-2; they are a *CPU-and-GPU* estimator gap, not a
+device fallback, so nothing in the table below changes for them.
+
+**N3c (0.116.0):** `-gi` landed on the device, which was the last mode-`W`-specific fallback.
+`cudaBackwardWhittedSupported()` now narrows nothing at all beyond `cudaBackwardSupported()` —
+it is a straight forward. Nothing in the table below is a live mode-`W` gate any more.
+
+Because mode `W` has no noise to hide a mismatch behind, these still fall back rather than
+degrade:
+| Feature | Why CPU today | Class |
+|---|---|---|
+| ~~Any dispersion-dependent material (Dielectric / ThinFilm / Multilayer / Grating / HalfMirror / Fluorescent)~~ | **DONE (N3b, 0.111.0)** — `bkRadianceHeroLoop<true>` does split-at-dispersion on the device; the `sceneHasDispersiveMat` gate is gone. | ✅ |
+| ~~`-gi <n>` (deterministic one-bounce gather)~~ | **DONE (N3c, 0.116.0)** — the depth became a second compile-time parameter (`bkRadianceHeroLoop<AllowSplit, GiDepth>` / `bkRadiance<GiDepth>` / `bkInteract<AllowGather>`), so the gather is a provably-one-level recursion needing no `-rdc` and no device stack sizing; `dGiDir`/`dGiPhases` are the world-space Fibonacci-spiral lattice. The `giDirs > 0` gate is gone. | ✅ |
+| `-rgb` in mode `W` | the RGB kernel is a separate reduced tracer with no deterministic estimator; it would return exactly the noise mode `W` removes | **inherently** refused (message in main.cpp), not a fallback |
+| `Layered` material | already a device-wide CPU fallback via `cudaForwardSupported` | no mode-`W` work needed |
+| Env NEE stays stochastic | deliberate existing CPU behaviour, mirrored on the device | ✅ intentional non-change |
+
 ### Backward R `-rgb` (fast, Option B) — `cudaBackwardRGBSupported` (render_cuda.cu:7545)
 Rejects everything spectral-backward rejects **plus**:
 | Feature | Why CPU/spectral today | Class |

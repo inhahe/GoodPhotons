@@ -70,7 +70,7 @@ tools/loom/
 │   ├── data.py      datasets: PointPath | TrackedPath | Grid | Scatter (N-D, DAG nodes)
 │   ├── color.py     colour model: RGB + HSV + HSL (animatable, seamless hue loops)
 │   ├── interp.py    interpolators (loop curve | tracked multi-curve | grid field | scatter field)
-│   ├── iso.py       isosurfaces: gyroid / Schwarz-P / Schwarz-D / Neovius + N-D slicing
+│   ├── iso.py       isosurfaces: gyroid / Schwarz-P / Schwarz-D / Neovius, in 3-D and true N-D (`SliceField`)
 │   ├── pov.py       POV-Ray function library, with which are N-D-generalizable
 │   ├── spatial.py   spatial expression DSL (X, Y, Z, U, V, T + math + Image/VolumeField/SigAt terms) → ftsl `expr`
 │   ├── sweep.py     sweep engine (rotation-minimizing frames, ribbon/tube/skin_rings, OBJ out)
@@ -124,6 +124,30 @@ Most examples take `--help`. Rendering shells out to the `ftrace` binary (found
 automatically via `loom.drive.find_ftrace`); build it first (see the top-level
 [README](../../README.md#building)).
 
+### Rendering and assembling a loop
+
+```python
+from loom import render_range, assemble_gif_ffmpeg, assemble_mp4
+
+pngs = render_range(scene, frames=150, outdir="png/myloop", name="myloop", loop=True)
+assemble_gif_ffmpeg(pngs, "png/myloop/myloop.gif", fps=25.0)   # needs ffmpeg
+assemble_mp4(pngs, "png/myloop/myloop.mp4", fps=25.0)          # needs ffmpeg
+```
+
+`assemble_gif` is the dependency-free fallback (Pillow only); `assemble_gif_ffmpeg`
+builds a per-loop optimised palette and looks considerably better on detailed
+imagery. Both default to `loop=0` — GIF for "repeat forever"; pass `loop=-1` for
+play-once.
+
+Two things to know if the loop must be **seamless**:
+
+- **Use a frame rate that divides 100.** A GIF stores its inter-frame delay in whole
+  centiseconds, so 25 fps (4 cs) is exact while 60 fps rounds 1.67 → 2 and plays back
+  at 50 fps. MP4 doesn't care.
+- **Render with `loop=True`.** That maps frame `k` to `t = k/frames`, so frame
+  `frames` *is* frame 0 and is correctly left out — the encoders emit exactly one
+  frame per input, never duplicating one at the seam.
+
 ### Reading `.ftsl` back
 
 `loom.grammar.reader` goes the other way — text to elements — for editing an existing
@@ -157,8 +181,10 @@ rest come back as a generic ordered `Block` that re-emits its source layout exac
 | `ribbon_loop.py` | a seamless looping swept **ribbon** (plus a twin tube) |
 | `scribble_loop.py` | a seamless looping 3-D "scribble" curve |
 | `gyroid_loop.py` | a seamless looping **gyroid** isosurface |
+| `jumping_jack.py` | a **jack tumbling through a world-static gyroid**: six arms (3 gold, 3 SF10 glass) built as `intersect { union{sphere,cylinder} function{gyroid} }`, where only the arm leaves carry the pose so the lattice flows *through* the moving solid instead of riding along. The carving gyroid's level is picked by **volume fraction** (`--solid`, inverted numerically off the gyroid's own sampled distribution) rather than by a raw threshold — that is what makes the parts read as open lattice rather than dimpled balls. `--solid` alone cannot separate *lacy* from *see-through*, though, since for a one-level carve the surviving envelope **is** the volume fraction; so a sparse **counter-network** (`--counter`) taken from the gyroid's *other* labyrinth, `g >= t`, is unioned in. It threads down the middle of the first one's voids — exactly where the sight-lines run — so it halves how much of the room shows through the part for ~2 points of envelope, where buying the same reduction out of `--solid` costs ~12. Both fold into a **single** `function` leaf via `min(a,b) = ((a+b) − |a−b|)/2`, whose `a+b` is constant here, so the gyroid is still evaluated once per march step. The motion is a real jack's tumble: the ±y arm pair *is* the spin axis, it leans `--tilt` off vertical and precesses, so the two axis balls ride antiphase circles — and because that holds the bottom ball at a *constant* height, standing the jack exactly on the floor is the closed form `arm·cos(tilt) + ball` rather than a search (`rest_height`). One axis is all gold, one all glass, and the spin axis carries one of each so the jack's top and bottom stay distinguishable. Delivered as a 60 fps MP4 (432 frames, 7.2 s) plus a 20 fps GIF built from every 3rd frame, since a GIF's integer-centisecond frame delay cannot express 60. Shows the CSG field tree from a custom `Element`, plus mode W + `-gi` for a flicker-free loop |
 | `pov_loop.py` | a seamless looping **POV-Ray function** isosurface |
 | `gyroid_nd.py` | **higher-dimensional gyroid slices** — a randomized N-D gyroid whose hidden dimensions drift / rotate / *bloom*; gold or clear-glass; per-run output dirs (a full sub-tool, see its `--help`) |
+| `gold_gyroids.py` | two gold gyroids in a closed room **rotating in 4-D and 5-D** (`SliceField`), assembled into a seamlessly looping GIF |
 | `material_loop.py` | a seamless looping **function-driven material** |
 | `mesh_bake.py` | **bake a scalar field to a mesh** with marching cubes |
 | `open_timeline.py` | a **one-shot, non-looping** animation (distinct endpoints) |

@@ -31,17 +31,35 @@ struct EnergyReport {
 
 inline double clamp01(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 
-// Power-cosine lobe around a mirror direction (rough specular). roughness in
-// [0,1]: 0 -> sharp mirror, 1 -> broad. Returns a sampled reflection direction.
-inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
+// Power-cosine lobe around a mirror direction (rough specular), from two CANONICAL
+// uniforms rather than an rng. roughness in [0,1]: 0 -> sharp mirror, 1 -> broad.
+//
+// Split out of sampleGlossy so a DETERMINISTIC caller (mode W, which has no rng to draw
+// from without reintroducing noise) can drive exactly the same lobe off a low-discrepancy
+// lattice. The polar coordinate is `cosT = u1^(1/(e+1))`, so **u1 == 1 is exactly the
+// mirror direction** — that is what lets mode W's sample 0 reproduce the old
+// mirror-direction-only behaviour bit-for-bit, and it is why a deterministic caller should
+// *complement* its sequence (1 - radicalInverse) instead of Cranley-Patterson rotating it.
+// The u1 == 1 case returns `mdir` verbatim, skipping the normalize() below, whose last-bit
+// rescale would otherwise spoil that bit-identity.
+inline Vec3 glossyDirUV(const Vec3& mdir, double roughness, double u1, double u2) {
+    if (u1 >= 1.0) return mdir;              // exact mirror (rng.uniform() is [0,1), so
+                                             // only a deterministic caller reaches this)
     double rr = roughness < 1e-3 ? 1e-3 : roughness;
     double e = 2.0 / (rr * rr) - 2.0; if (e < 0) e = 0;
-    double u1 = rng.uniform(), u2 = rng.uniform();
     double cosT = std::pow(u1, 1.0 / (e + 1.0));
     double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
     double phi = 2.0 * PI * u2;
     Vec3 t, b; onb(mdir, t, b);
     return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + mdir * cosT);
+}
+
+// Stochastic form: two draws off the caller's stream, in that order.
+inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
+    // Sequenced into locals deliberately: passing rng.uniform() twice as arguments would
+    // leave the draw order unspecified and desynchronise the stream.
+    double u1 = rng.uniform(), u2 = rng.uniform();
+    return glossyDirUV(mdir, roughness, u1, u2);
 }
 
 // --- Fluorescence interaction (shared by the forward tracer and -checkfluoro) --
@@ -1980,19 +1998,36 @@ struct Renderer {
             }
 
             const Material* matp = &scene.mats[h.matId];
-            // Layered coat: wavelength-dependent Fresnel -> de-hero, run scalar coat on hero.
+            // Layered coat. The coat interface is NOT dispersive in DIRECTION -- the sheen is
+            // a glossy lobe about the mirror direction and the body-lobe pick is a material
+            // index -- so the only λ dependence is the scalar coat reflectance R(λ), and ONE
+            // shared coin can serve the whole bundle: u is uniform, so P(u < R_i) == R_i
+            // exactly per λ (common random numbers), with weights untouched just as in the
+            // scalar twin. That keeps the bundle alive across a clearcoat instead of
+            // collapsing it, which is what the backward hero loop does as of v0.115.1.
+            //
+            // Only a genuinely CHROMATIC coat -- a thin-film Airy stack where the coin lands
+            // on different sides for different λ -- still de-heroes. A fan-out like
+            // -herosplit's is NOT available here, because a forward sub-path cannot re-enter
+            // this same vertex: the loop head has already run the model-C aperture catch, so
+            // re-entering would deposit the photon into the film twice.
             if (matp->type == MatType::Layered) {
-                deHero(); nUp = 1;
                 const Material& cm = *matp;
-                double R = layeredCoatReflectance(scene, cm, h, ray.d, lam[0]);
-                if (rng.uniform() < R) {
+                double Rl[hero::kHeroMax];
+                for (int i = 0; i < nUp; ++i)
+                    Rl[i] = layeredCoatReflectance(scene, cm, h, ray.d, lam[i]);
+                const double uCoat = rng.uniform();
+                const bool refl0 = uCoat < Rl[0];
+                for (int i = 1; i < nUp; ++i)
+                    if ((uCoat < Rl[i]) != refl0) { deHero(); nUp = 1; break; }
+                if (refl0) {
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
-                    if (dot(o, h.n) <= 0) { e.absorbed += beta[0]; return; }
+                    if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
                     ray = Ray{h.p + h.n * 1e-6, o};
                     continue;
                 }
                 int child = mixPickChild(cm, rng.uniform());
-                if (child < 0) { e.absorbed += beta[0]; return; }
+                if (child < 0) { e.absorbed += activeSum(); return; }
                 matp = &scene.mats[child];
             }
             // Stochastic mix: resolve the child by the hero rng; secondaries ride along
@@ -2194,9 +2229,19 @@ struct Renderer {
     // exterior-is-air behaviour bit-for-bit. Nested-dielectric callers pass the enclosing
     // medium's index (from the per-path priority stack) so glass-in-water refracts across
     // 1.33<->1.52 instead of 1.0<->1.52.
+    //
+    // `whittedWeight` switches the interface from stochastic to DETERMINISTIC for the mode-W
+    // preview: instead of tossing a coin against the Fresnel reflectance it takes the
+    // DOMINANT branch (reflect iff R >= 0.5) and reports that branch's Fresnel weight, which
+    // the caller folds into the path throughput -- the same "dominant branch + weight" trade
+    // mode W already makes at HalfMirror/Layered/Mix. Without it, a dielectric was the last
+    // material in that mode still consuming a random number, and at -spp 1 the coin flip IS
+    // visible: a glass sphere came out as an opaque salt-and-pepper blob. The frosting
+    // perturbation is skipped in this mode for the same reason (mode W takes the mirror
+    // direction for glossy lobes rather than sampling them).
     Ray refractOrReflect(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
                          double lambda, Pcg32& rng, bool* transmitted = nullptr,
-                         double extIor = 1.0) const {
+                         double extIor = 1.0, double* whittedWeight = nullptr) const {
         double ng = m.ior(lambda);
         bool entering = dot(d, h.ng) < 0.0;
         Vec3 nl = entering ? h.ng : -h.ng;      // normal on the incidence side
@@ -2210,17 +2255,20 @@ struct Renderer {
         bool refracted = false;
         if (sin2t > 1.0) {
             outDir = reflect(d, nl);            // total internal reflection
+            if (whittedWeight) *whittedWeight = 1.0;   // TIR is lossless, one branch only
         } else {
             double cosT = std::sqrt(1.0 - sin2t);
             double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
             double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
             double R = 0.5 * (rs * rs + rp * rp);
-            if (rng.uniform() < R) outDir = reflect(d, nl);
+            const bool doReflect = whittedWeight ? (R >= 0.5) : (rng.uniform() < R);
+            if (whittedWeight) *whittedWeight = doReflect ? R : 1.0 - R;
+            if (doReflect) outDir = reflect(d, nl);
             else { outDir = eta * d + nl * (eta * cosI - cosT); refracted = true; } // Snell
         }
         outDir = normalize(outDir);
         // Frosted glass: jitter the chosen lobe, keeping it on the intended side.
-        double rough = materialRoughness(scene, m, h);
+        double rough = whittedWeight ? 0.0 : materialRoughness(scene, m, h);
         if (rough > 1e-3) {
             Vec3 pert = sampleGlossy(outDir, rough, rng);
             bool ok = refracted ? (dot(pert, nl) < 0.0) : (dot(pert, nl) > 0.0);
@@ -2243,8 +2291,18 @@ struct Renderer {
     //     from inside an opaque body is simply absorbed.
     // Returns false when the photon is absorbed (caller terminates the path); on
     // true, `out` is the continuation ray.
+    //
+    // `whittedWeight` is the same DETERMINISTIC contract refractOrReflect has (see above):
+    // non-null in mode W, it replaces the interference coin flip with the dominant branch
+    // and reports that branch's weight for the caller to fold into the throughput. Opaque
+    // substrate: there is only one *surviving* branch (transmission is absorbed), so it
+    // always reflects and reports R -- the reflectance becomes a weight instead of a
+    // survival probability, exactly as Mirror/Filter already do in mode W. Lossless
+    // substrate: reflect iff R >= 0.5, weight R or 1-R. Without this, thin film was a
+    // material that stayed NOISY in the noise-free preview.
     bool thinFilmInterface(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
-                           double lambda, Pcg32& rng, Ray& out) const {
+                           double lambda, Pcg32& rng, Ray& out,
+                           double* whittedWeight = nullptr) const {
         double ns = m.ior(lambda);              // substrate index (spectral -> dispersion)
         double nf = m.filmIor;                  // coating film index
         double ks = m.substrateK(lambda);       // substrate extinction (0 = transparent)
@@ -2256,7 +2314,8 @@ struct Renderer {
         if (ks > 0.0) {                         // opaque metal-backed film
             if (!entering) return false;        // inside the absorbing substrate: absorbed
             double R = thinFilmReflectance(1.0, nf, ns, ks, thickness, cosI, lambda);
-            if (rng.uniform() >= R) return false;               // transmitted -> absorbed
+            if (whittedWeight) *whittedWeight = R;              // weight, not a survival roll
+            else if (rng.uniform() >= R) return false;          // transmitted -> absorbed
             Vec3 o = normalize(reflect(d, nl));
             out = Ray{h.p + o * 1e-6, o};
             return true;
@@ -2269,13 +2328,16 @@ struct Renderer {
         Vec3 outDir;
         if (sin2t > 1.0) {
             outDir = reflect(d, nl);            // total internal reflection
+            if (whittedWeight) *whittedWeight = 1.0;    // lossless, one branch only
         } else {
             double cosT = std::sqrt(1.0 - sin2t);
             // Interference reflectance for the actual stack traversed this hit:
             // incidence medium nA, coating nf, transmission medium nB. Reciprocal,
             // so entering and exiting rays see the same R (energy consistent).
             double R = thinFilmReflectance(nA, nf, nB, 0.0, thickness, cosI, lambda);
-            if (rng.uniform() < R) outDir = reflect(d, nl);
+            const bool doReflect = whittedWeight ? (R >= 0.5) : (rng.uniform() < R);
+            if (whittedWeight) *whittedWeight = doReflect ? R : 1.0 - R;
+            if (doReflect) outDir = reflect(d, nl);
             else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
         }
         outDir = normalize(outDir);
@@ -2292,8 +2354,10 @@ struct Renderer {
     //     prob R, else the transmitted light is absorbed -> the photon terminates
     //     (opaque structural colour: beetle/Morpho on an absorbing base).
     // Returns false when the photon is absorbed (caller terminates the path).
+    // `whittedWeight`: same deterministic dominant-branch contract as thinFilmInterface.
     bool multilayerInterface(const Material& m, const Hit& h, const Vec3& d,
-                             double lambda, Pcg32& rng, Ray& out) const {
+                             double lambda, Pcg32& rng, Ray& out,
+                             double* whittedWeight = nullptr) const {
         double ns = m.ior(lambda);              // substrate index
         double ks = m.substrateK(lambda);       // substrate extinction
         int nL = (int)m.layerN.size();
@@ -2312,7 +2376,8 @@ struct Renderer {
             double R = multilayerReflectance(1.0, cosI, lambda,
                                              m.layerN.data(), m.layerK.data(),
                                              m.layerThick.data(), nL, ns, ks);
-            if (rng.uniform() >= R) return false;               // transmitted -> absorbed
+            if (whittedWeight) *whittedWeight = R;              // weight, not a survival roll
+            else if (rng.uniform() >= R) return false;          // transmitted -> absorbed
             Vec3 o = normalize(reflect(d, nl));
             out = Ray{h.p + o * 1e-6, o};
             return true;
@@ -2326,6 +2391,7 @@ struct Renderer {
         Vec3 outDir;
         if (sin2t > 1.0) {
             outDir = reflect(d, nl);            // total internal reflection
+            if (whittedWeight) *whittedWeight = 1.0;    // lossless, one branch only
         } else {
             double cosT = std::sqrt(1.0 - sin2t);
             // Evaluate the stack from the incidence side. When exiting (ray inside
@@ -2341,7 +2407,9 @@ struct Renderer {
                 for (int j = 0; j < nL; ++j) { rn[j] = m.layerN[nL-1-j]; rk[j] = m.layerK[nL-1-j]; rd[j] = m.layerThick[nL-1-j]; }
                 R = multilayerReflectance(ns, cosI, lambda, rn.data(), rk.data(), rd.data(), nL, 1.0, 0.0);
             }
-            if (rng.uniform() < R) outDir = reflect(d, nl);
+            const bool doReflect = whittedWeight ? (R >= 0.5) : (rng.uniform() < R);
+            if (whittedWeight) *whittedWeight = doReflect ? R : 1.0 - R;
+            if (doReflect) outDir = reflect(d, nl);
             else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
         }
         outDir = normalize(outDir);
@@ -2359,8 +2427,21 @@ struct Renderer {
     // reflected fraction is lossless (analog MC, beta unchanged). m=0 is specular.
     // The equation is reciprocal (m <-> -m), so the backward tracer reuses it.
     // Sets `absorbed` if no order propagates (degenerate grazing case).
+    //
+    // `whittedU` (non-null only in mode W) replaces the rng draw with one coordinate off the
+    // deterministic (sIdx, bounce) lattice -- see BackwardRenderer::whittedOrderU. This is NOT
+    // the dominant-branch trade the Fresnel materials make: the pick is already ANALOG (order i
+    // with probability wgt[i]/wsum, throughput untouched), so a stratified u keeps the estimator
+    // unbiased and only removes the per-pixel luck. It does change WHICH order a given u maps
+    // to, though: the candidate list is built mm = -M..+M, so a raw u = 0 would select the most
+    // NEGATIVE order. On the whitted path the walk therefore visits candidates in DESCENDING
+    // efficiency (0, -1, +1, -2, +2, ...) so u = 0 gives the specular m = 0 and a 1-spp preview
+    // is the undiffracted image. Total mass is the same wsum either way, so the two orders of
+    // traversal agree in distribution; the stochastic path keeps its original ascending walk and
+    // stays bit-identical.
     Ray gratingDiffract(const Material& m, const Hit& h, const Vec3& din,
-                        double lambda, Pcg32& rng, bool& absorbed) const {
+                        double lambda, Pcg32& rng, bool& absorbed,
+                        const double* whittedU = nullptr) const {
         absorbed = false;
         Vec3 nl = dot(din, h.ng) < 0.0 ? h.ng : -h.ng;      // incidence-side normal
         // Groove direction projected into the surface; dispersion axis perpendicular.
@@ -2374,15 +2455,35 @@ struct Renderer {
         int M = diffraction ? std::max(0, std::min(m.gratingMaxOrder, 32)) : 0;
         double lod = lambda / m.grooveSpacing;              // lambda / d (dimensionless)
         int   ord[65]; double wgt[65]; int cnt = 0; double wsum = 0.0;
+        int   slot[65];                                     // mm+M -> index in ord[], -1 evanescent
+        if (whittedU) for (int i = 0; i <= 2 * M; ++i) slot[i] = -1;
         for (int mm = -M; mm <= M; ++mm) {
             Vec3 a = ut + t * ((double)mm * lod);
             if (dot(a, a) >= 1.0) continue;                 // evanescent -> excluded
             double w = 1.0 / (1.0 + std::abs(mm));          // idealised efficiency
+            slot[mm + M] = cnt;                             // (only read on the whitted path)
             ord[cnt] = mm; wgt[cnt] = w; wsum += w; ++cnt;
         }
         if (cnt == 0 || wsum <= 0.0) { absorbed = true; return Ray{}; }
-        double xi = rng.uniform() * wsum, acc = 0.0; int pick = ord[cnt - 1];
-        for (int i = 0; i < cnt; ++i) { acc += wgt[i]; if (xi < acc) { pick = ord[i]; break; } }
+        int pick;
+        if (whittedU) {
+            // Deterministic: same inversion, but over the descending-efficiency traversal
+            // 0, -1, +1, -2, +2, ... so u = 0 lands on the specular order.
+            double xi = *whittedU * wsum, acc = 0.0;
+            pick = ord[cnt - 1];                            // guard against fp round-off at u->1
+            bool done = false;
+            for (int k = 0; k <= M && !done; ++k) {
+                for (int s = 0; s < (k == 0 ? 1 : 2); ++s) {
+                    int idx = slot[(s == 0 ? -k : k) + M];
+                    if (idx < 0) continue;                  // that order is evanescent
+                    acc += wgt[idx]; pick = ord[idx];
+                    if (xi < acc) { done = true; break; }
+                }
+            }
+        } else {
+            double xi = rng.uniform() * wsum, acc = 0.0; pick = ord[cnt - 1];
+            for (int i = 0; i < cnt; ++i) { acc += wgt[i]; if (xi < acc) { pick = ord[i]; break; } }
+        }
         Vec3 a = ut + t * ((double)pick * lod);
         Vec3 v = a + nl * std::sqrt(std::max(0.0, 1.0 - dot(a, a)));
         v = normalize(v);

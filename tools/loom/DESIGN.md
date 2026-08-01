@@ -80,6 +80,13 @@ dataclasses, beat/tempo, wavetable-osc phase machinery if unused).
 **Keep as-is (reused):**
 - `Signal` base (a DAG node = pure function of a clock), `children()`, per-block
   cache, operator overloading (`+ - * neg`), `Const`, `TimeFn`.
+  - `TimeFn(fn, periodic=True)` folds `t` into `[0,1)` **only when `clock.loop`** —
+    the same "wrap iff the clock is closed" rule `retimed_clock` uses (§11.6 below).
+    It used to fold unconditionally, which was invisible on a closed clock (`t`
+    never leaves `[0,1)` anyway) but on an **open** timeline silently mapped the
+    last frame — exactly `t == 1` — back onto frame 0, deleting the final frame of
+    every non-value-periodic ramp (`phase_drift`) on the one timeline documented as
+    having *distinct* endpoints. Caught by `tests/test_drive.py`.
 - `Add/Sub/Mul/Neg/Clamp/Rectify/Power/MapRange/Mix/Smooth`.
 - `RefSignal` (shared/named sub-graph).
 - **`detect_signal_cycle(root)`** — the loop detector (3-color DFS →
@@ -314,6 +321,129 @@ from translating on *closed* curves and rotating by integer turns. Factory patte
 `make_gyroid(**params) -> Isosurface` + a `Room` driver (see
 `examples/room_of_gyroids.py`).
 
+**True N-D fields (`SliceField`).** The ≥4-input case is *implemented*, not deferred to
+meshing. `iso.py` carries N-D generalizations of all four TPMS templates — `gyroid_n`
+(cyclic `Σ sin cᵢ·cos cᵢ₊₁`), `schwarz_p_n`, `schwarz_d_n` (all odd-sine-count products,
+`2ⁿ⁻¹` terms), `neovius_n` — each reducing **exactly** to its 3-D form at `n == 3`, so
+raising the dimension is a strict extension. `SliceField(field, dim=, rotation=, offset=)`
+plugs in as an `Isosurface`'s `field` (the duck-typed `build`/`param_signals` protocol,
+same as `PovFn`): it embeds the host's `(cx, cy, cz)` in `dim` dimensions at `offset`,
+applies an animatable `dim×dim` `Mat`, and evaluates the N-D field there. Every N-D
+coordinate is an **affine form in x/y/z** with coefficients baked per frame, so the
+result is still a plain `expr` isosurface that ftrace sphere-traces natively — a real
+4-D/5-D rotation needs no new renderer path. Rotating in a plane that touches an axis
+*outside* the slice sweeps the hyperplane through the field, so the surface genuinely
+reconnects and changes topology (a 3-input field under an N-D rotation can only ever be
+an affine remap — §11.7). Zero/unit coefficients and a zero offset are pruned from
+the emitted string (decided on the *formatted* value, so text and pruning can't
+disagree), which roughly halves the expression the marcher re-evaluates per step.
+`nd_grad_bound(field, dim, freq, sigma)` gives the rigorous `max_gradient` the
+sphere-marcher needs (`σ_max(A)·|∇_c F|`), since a mixed N-D slice can defeat ftrace's
+sampled Lipschitz estimate. The per-coordinate factors are *proved*, not term counts:
+`gyroid` is **√2** (`∂f/∂cᵢ = a·cos cᵢ + b·sin cᵢ` with `|a|,|b| ≤ 1`, so the two terms
+can never saturate together), `schwarz_p` 1, `schwarz_d` **2^((n−1)/2)** (splitting on
+slot `i` gives `cos cᵢ·E − sin cᵢ·O` with `E±O = Π(cos ± sin)`, so
+`E²+O² = ((E+O)²+(E−O)²)/2 ≤ 2ⁿ⁻¹` — exponentially below the naive `2ⁿ⁻¹`), `neovius` 7.
+That matters for throughput as well as correctness: a loose bound shrinks every march
+step, and tightening `gyroid` 2 → √2 measured ~1.14× more samples/second on the
+`gold_gyroids` scene. Seamlessness: an integer number of turns per rotation plane
+returns the matrix to the identity at the wrap, which is also what lets the host's `2π`
+`drift` survive the N-D mix. Demo: `examples/gold_gyroids.py` (4-D + 5-D gyroids,
+150 frames at the GIF-exact 25 fps, `-noise 4` per frame).
+
+**What `Isosurface` deliberately does NOT cover: CSG, and a world-static field.** Its
+`emit` writes exactly one `function { expr }` leaf plus one `contained_by`, so the whole
+FTSL field *tree* (§10.2 of `FTSL.md` — `union`/`intersect`/`difference` and the smooth
+variants over analytic `sphere`/`box`/`cylinder`/… leaves) is out of reach from this class.
+It is also structurally the wrong shape for a **moving solid sampling a stationary
+field**: `Isosurface`/`Room` animate the *frame the field is read in* (`M_eff = M·Pᵀ`,
+`p_eff = P·p_local + T`), which is the opposite mapping — the pattern rides along with the
+object rigidly, and nothing new is ever revealed.
+
+Both are covered by subclassing `Element` directly (`roots()` + `emit(ctx)`), which is the
+intended extension point rather than a workaround — `examples/jumping_jack.py` is the
+worked case. The idiom that matters there: put the animated `translate`/`rotate` on the
+**shape** leaves of the CSG tree and leave the `function` leaf with *no* transform, so the
+field stays in world space and the solid sweeps through it. One `isosurface` per material
+folds that material's shapes into a single `union` inside the `intersect`, so the whole
+group costs one sphere-trace. Two practical rules travel with it: `contained_by` should be
+authored on a **pose-independent** hull (a sphere on the body's own centre of rotation,
+which stays valid under any pose and under translating the body as a whole — note the hull
+moves with the body while the `function` leaf still must not) so it never has to be
+recomputed per frame, and a raw TPMS expression should be
+divided by its own gradient bound (`2·freq` for the 3-D gyroid) so one honest
+`max_gradient ≈ √3` covers it — otherwise the marcher steps `d/(2·freq)` and the CSG's
+unit-Lipschitz SDF partner is dragged down to the same crawl. This is the same
+`nd_grad_bound` reasoning as above, applied to keep a *hand-written* field cheap.
+
+**Choosing a carving level: by volume fraction, never by a threshold or a thickness.**
+An `intersect { solid, function }` keeps the part of the solid where the field is negative,
+so how *holey* the result looks is set entirely by how much of space that field's sub-level
+set occupies — and every intuitive shortcut for picking it is wrong. Three were tried on
+`jumping_jack.py` and all three failed: raising `freq` only shrinks the cells (the carve
+still keeps the solid's own envelope, so it stays a dimpled ball at any frequency);
+specifying a *shell* by wall thickness in metres is unitless-in-disguise (the gyroid's
+surface-area density is ≈3.09 per period, so a wall just 13.7% of a cell thick already fills
+**42.8%** of space — indistinguishable from the plain half-space carve); and even a
+correctly thin shell still leaves the solid's smooth envelope intact, which is the thing
+that reads as "solid". What works is making the carving solid *sparse* — around 0.16–0.20
+volume fraction, where the gyroid's minority labyrinth is an open network you can see the
+room through.
+
+So the knob should be the volume fraction itself, and the level must be obtained by
+**inverting the field's own sampled distribution numerically** — a linear fit is off by
+~2× in the tail (asking 0.15 delivers 0.325), and the band-vs-one-sided slopes differ by
+exactly 2× (`volfrac(|g| ≤ g₀) ≈ 0.647·g₀` but `volfrac(g ≤ −g₀) = (1 − 0.647·g₀)/2`),
+which is an easy and invisible factor-of-two bug. `jumping_jack.py`'s
+`_gyroid_samples` / `gyroid_quantile` / `gyroid_cdf` do it exactly: sort a 48³ sample of one
+period once, then read quantiles off it. Being frequency-independent, the table is built
+once per process and cached. This belongs in the library alongside `nd_grad_bound` when the
+Field-tree classes land.
+
+**Lacy and see-through are two quantities, and one level cannot set both.** For a plain
+one-level carve, the fraction of the solid's own envelope that survives is *exactly* the
+volume fraction, so `solid` moves "how much smooth skin is left" and "how much of the room
+you can see through the part" in lockstep. Measured over 32 random placements × 4000 rays
+(`scraps/see_through.py`, paired so every candidate sees identical rays): `solid` 0.24 →
+14.9% see-through at 23.4% envelope, and halving the see-through costs ~12 points of
+envelope, i.e. the dimpled ball returns. Six mechanisms were measured against that, and the
+winner is not the intuitive one:
+
+* A **4-D gyroid sliced at a generic angle** — quasiperiodic, no exact straight channels — is
+  *worse* (18.4% at 24.3%). Quasiperiodicity removes the periodic channels but replaces them
+  with wider irregular voids, and a finite ray cares about void width, not straightness.
+* Unioning a copy shifted half a period in all three axes is an **identity**: `sin(x+π)cos(y+π)
+  = sin(x)cos(y)`. (An unpaired first sweep made this no-op look like a 1.7-point win — hence
+  paired sampling.)
+* A **denser core** inside each ball works (8.7% at an unchanged 23.4%) but leaves a hard
+  spherical seam visible mid-hole.
+* A **finer lattice** unioned on top blocks best of all (1.6%) but crusts the skin over at
+  35.9% envelope — the golf ball by another route.
+* The **double gyroid** `|g| ≥ t` measures well (7.6% at 24.1%) but its two networks are
+  provably disjoint (largest component 49.2% of the solid, one per labyrinth), so the part
+  would be two interlocked but unconnected lattices.
+* What wins is a sparse **counter-network**: keep `g ≤ c` and union on `g ≥ t`, the *other*
+  labyrinth's core, which runs down the middle of the first one's voids — precisely where the
+  sight-lines are. Spending volume there instead of on the surface gives 7.5% see-through at
+  25.7% envelope, and *triples* the number of disconnected islands the envelope breaks into
+  (18 → 48), so it reads lacier while seeing through half as much. The combined solid stays
+  connected and spanning.
+
+Emit the pair as **one leaf**, not a `union` of two: ftrace evaluates every leaf at every
+sphere-trace step, so two leaves double the trigonometry on the hottest loop. With
+`a = (g−c)·s` and `b = (t−g)·s`, `min(a,b) = ((a+b) − |a−b|)/2` and `a+b = (t−c)·s` is
+*constant* — the `g` terms cancel — leaving `((t−c) − |2g−c−t|)·s/2`, one leaf and one
+gyroid evaluation. Exact, and the Lipschitz bound is unchanged (`d/dg` is still `∓s`), so the
+same honest `max_gradient` covers it.
+
+Finally, note what the reference gyroid stills (`png/gold_gyroids`, `png/gyroid_nd`) do,
+because it is *not* reachable from CSG: a lone `function` leaf plus `contained_by { sphere }`,
+where `contained_by` **clips** rather than intersects, so the bare gyroid sheet is simply cut
+off at the sphere and there is no envelope surface anywhere. CSG cannot reproduce that — its
+whole job is to bound a solid — and it cannot be had per-arm either, since `contained_by`
+takes a single axis-aligned box or sphere, not a rotating ball-and-rod. A sparse carve is the
+CSG-expressible analogue, not a literal equivalent.
+
 ### 7c. Function-driven materials
 Reuse Good Photons' existing material-props-by-function (reflectance/color/IOR/etc.
 over `x,y,z`/UV). Loom emits those expressions; adding `t` makes any property animate.
@@ -474,8 +604,23 @@ whole-file `scene { … }` → live `Scene` builder is likewise still FUTURE (§
   crash-safe flags per project rules), collect PNG.
 - **Live viewer** (cheap GUI value): emit → raster preview so you can watch loops
   while tuning. Passive; no editing.
-- **Assembly**: reuse existing `tools/obj_sequence_to_video.py`-style helpers to build
-  a seamless GIF/MP4.
+- **Assembly**: `assemble_gif` (Pillow, no external dep), `assemble_gif_ffmpeg`
+  (`palettegen stats_mode=diff` + `paletteuse`, far better than Pillow's global
+  256-colour quantisation) and `assemble_mp4` (libx264, `yuv420p`, auto-pads odd
+  dimensions since 4:2:0 cannot represent them). All three take an explicit frame
+  *list*, so the caller's order — not `sort()` — is what gets encoded.
+  - **Seamlessness is the whole point, and the obvious ffmpeg route breaks it.**
+    Feeding an arbitrary file list normally means the `concat` demuxer, but concat
+    only applies a `duration` to an entry if that entry is **repeated**, and the
+    repeat is a *real extra frame*. On a closed loop that duplicates the pre-seam
+    frame and shows as a hitch every cycle. So `_stage_frames()` hard-links (falling
+    back to copy across volumes) the list into a temp dir as `f%06d.png` and uses the
+    `image2` demuxer, which is exactly one output frame per input.
+  - **GIF delays are integer centiseconds**, so only rates dividing 100 are exact:
+    25 fps → 4 cs lands on the grid; 60 fps asks 1.67, rounds to 2, and silently
+    plays back at 50. Prefer 25/50 for anything that must loop cleanly.
+  - GIF `loop=0` means *forever*; **play-once is the absence of the NETSCAPE block**,
+    not a value — `loop=-1` makes ffmpeg omit it (`tests/test_drive.py` pins this).
 - **Determinism**: a global `--seed`; a given seed reproduces a loop exactly.
 - **Optional in-tool adaptive marching cubes** (only where a field must be baked to a
   mesh): octree/dual-contouring that subdivides more where the field changes fast and

@@ -1,5 +1,12 @@
 did you introduce new CPU-only features that should be also implemented on GPU since we last audited?
 
+Check the jsonl log ofr when i tell the model it is Claude Fable, Anthropic's latest and greatest model and I tell it to optimize the latest changes (maybe grep case-insensitively for "Fable"), then check the todo to see what was cpu/gpu-intensive features were added after that that i could tell Fable to optimize, such as the new W mode.s
+
+"What's actually left in section N, from TODO.md:
+N3c — the -gi one-bounce gather on the device (template<int GiDepth> plus a device dGiDir lattice, letting the giDirs gate go away). This is the only remaining piece of N3.
+N4a — direct host-vs-device bit-exactness sweep of the lattice helpers.
+N5 — re-measure spectral vs -rgb, then judge whether an RGB mode W earns a second kernel."
+
 "Two things worth flagging from the test work: my first cache test passed with the bug reintroduced — a coarse delay maps to a different frame index, so the keys never collide. Both cache tests now use a sub-frame retime, where every sample lands on clock.frame. All three mutations (degraded Cache.scope, dropped driver edge, forced wrap=True) now fail a test. Suite: 1150 → 1177, all green."
 
 --
@@ -15,7 +22,7 @@ doing todo.md
 
 --
 
-Check the jsonl log if it's not still in the context for when i tell the model it is Claude Fable, Anthropic's latest and greatest model and I tell it to optimize the latest changes (maybe grep case-insensitively for "Fable"), then check the todo to see what was done after that that i could tell Fable to optimize again.
+Check the jsonl log ofr when i tell the model it is Claude Fable, Anthropic's latest and greatest model and I tell it to optimize the latest changes (maybe grep case-insensitively for "Fable"), then check the todo to see what was cpu/gpu-intensive features were added after that that i could tell Fable to optimize, such as the new W mode.
 
 --
 

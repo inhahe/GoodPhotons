@@ -217,6 +217,39 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 // cap (D_MAXLENS). Image-based env, collimated beams and GRIN media fall back to the CPU tracer.
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 
+// ---- Mode W (deterministic Whitted / POV-Ray-style preview) ----------------------------
+// Device twin of BackwardRenderer's mode-W fields (src/backward.h). Passing a non-null
+// WhittedOpts to renderBackwardCuda replaces every stochastic estimator on the backward
+// path with fixed quadrature, exactly as `-mode W` does on the CPU: an N*N light grid
+// instead of one random emitter point, a fixed throughput cutoff (POV-Ray's adc_bailout)
+// instead of Russian roulette, the dominant branch at every stochastic material fork, and
+// radical-inverse lattices (shared by every pixel, indexed by the ABSOLUTE sample index so
+// the image is chunk-split-independent) for the subpixel offset, the wavelength and each
+// glossy lobe.
+struct WhittedOpts {
+    int    grid      = 4;    // -whitted-grid N: N*N quadrature points per area light
+    int    giDirs    = 0;    // -gi N: deterministic one-bounce gather directions (0 = ambient only)
+    int    giGrid    = 1;    // light grid used INSIDE the gather (cheaper than `grid`)
+    int    giBounce  = 4;    // bounce cap inside the gather
+    bool   heroSplit = true; // mode W forces the split-at-dispersion walk (de-hero would
+                             // collapse the whole frame onto one lambda: the lattice is shared).
+                             // Ported to the device in v0.111.0 as bkRadianceHeroLoop<true>;
+                             // plain mode R takes the same policy from `-herosplit`.
+    double ambient   = 0.0;  // -ambient, ALREADY pre-scaled by Scene::ambientRef()
+    double giClamp   = 0.0;  // -gi-clamp: per-lambda firefly ceiling on ONE gather ray's
+                             // returned radiance, 0 = off. Also pre-scaled by ambientRef().
+                             // Caps the caustic-through-the-gather contour aliasing; the
+                             // rationale is on BackwardRenderer::giClamp (src/backward.h).
+};
+
+// True if this scene + camera can be rendered by the GPU mode-W megakernel with the given
+// options. As of v0.116.0 NOTHING mode-W-specific narrows this any more: it just forwards to
+// cudaBackwardSupported. Dispersive materials stopped gating in v0.111.0 (the device carries
+// the split-at-dispersion walk) and `-gi N` stopped gating in v0.116.0 (the one-bounce gather
+// is a compile-time-bounded recursion, bkRadianceHeroLoop<AllowSplit, GiDepth>).
+bool cudaBackwardWhittedSupported(const Scene& scene, const Camera& cam,
+                                  const WhittedOpts& w);
+
 // GPU backward reference trace (mode R). Renders `spp` samples per pixel at the given
 // resolution and returns the film accumulated over spp (same convention as the CPU
 // renderBackward: writeFilm(film, spp) for display). Handles the physical lens exactly
@@ -235,10 +268,16 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 // each camera path (one shared BVH walk, sharply lower chroma noise); it is clamped to
 // hero::kHeroMax and silently dropped to 1 for scenes the hero walk does not cover
 // (participating media, GRIN, a physical lens) — the same gate the CPU tracer applies.
+// `whitted` non-null selects the deterministic mode-W estimator (see WhittedOpts above) and
+// additionally requires cudaBackwardWhittedSupported(); otherwise an empty film is returned.
+// Note the "independent noise realization" caveat above does NOT apply in mode W: it has no
+// noise, so the CPU and GPU images agree up to device fp32 precision and the intersection
+// epsilon, with no structural difference.
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction,
                         const SppProgress* prog = nullptr,
-                        int maxBounce = 32, bool directOnly = false, int heroC = 1);
+                        int maxBounce = 32, bool directOnly = false, int heroC = 1,
+                        const WhittedOpts* whitted = nullptr);
 
 // True if this scene + camera can be rendered by the FAST RGB backward megakernel
 // (mode R `-rgb`, Option B in gpu-backward-fast.md): the reduced non-spectral tracer

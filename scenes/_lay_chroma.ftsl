@@ -1,0 +1,56 @@
+# Stress case for the CHROMATIC-coat fan-out in BackwardRenderer::radianceHeroLoop's
+# MatType::Layered branch (v0.115.1). A high-contrast thin-film coat (film_ior 3.5 over a
+# body of ior 1.5) has Airy R oscillating between ~0.06 and ~0.61 across the visible band,
+# so mode W's `R >= 0.5` dominant-branch test lands on DIFFERENT sides for different
+# wavelengths of the same hero bundle -- which is exactly the case that cannot ride one
+# shared continuation and must fan out into monochromatic sub-paths.
+#
+#   R maxima (cos delta = -1) at lambda = 2*nf*t/(k+0.5) = 1400/(k+0.5) nm -> 560, 400 nm
+#   R minima (cos delta = +1) at lambda = 1400/k                          -> 700, 466 nm
+#
+#   ftrace -in scenes/_lay_chroma.ftsl -mode W -spp 1    -r 320 240 -o png/laychroma_w1.png
+#   ftrace -in scenes/_lay_chroma.ftsl -mode W -spp 1024 -r 320 240 -o png/laychroma_ref.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "red"   { type diffuse reflect redwall }
+material "green" { type diffuse reflect greenwall }
+
+material "body_warm" { type diffuse reflect rgb 0.80 0.60 0.25 }
+material "body_cool" { type diffuse reflect rgb 0.25 0.45 0.85 }
+
+material "hicontrast_film" {
+    type layered
+    coat {
+        reflectance    thinfilm
+        film_ior       3.5
+        film_thickness 200
+        ior            1.5
+        roughness      0.0
+    }
+    layer "body_warm" 0.6
+    layer "body_cool" 0.4
+}
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material hicontrast_film }   # back wall
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }
+
+sphere { center 0.5 0.32 0.45   radius 0.28   material hicontrast_film }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

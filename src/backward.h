@@ -58,9 +58,144 @@ struct BackwardRenderer {
     // image keeps sharp reflections/refractions and direct+specular caustics but drops
     // diffuse GI — converging in ~1 spp. Left false = full unbiased path tracing.
     bool directOnly = false;
+    // Deterministic Whitted preview (CLI -mode W). `directOnly` alone still leaves every
+    // ESTIMATOR stochastic -- the area light is one random point per sample, a glossy
+    // lobe one random direction, and specular survival a Russian-roulette coin -- so it
+    // needs tens of spp to look clean and only buys ~3x. `whitted` additionally replaces
+    // all three with their deterministic equivalents (fixed light grid, mirror direction,
+    // reflectance-weighted continuation), which is what POV-Ray does and why it converges
+    // in ONE sample per pixel instead of tens. Implies directOnly.
+    bool whitted = false;
+    int  lightGrid = 4;        // Whitted: NxN deterministic shadow rays per area light
+    // Whitted: flat ambient radiance added at diffuse vertices (POV-Ray `ambient`), the
+    // cheap stand-in for the GI this mode drops. ABSOLUTE spectral radiance -- the CLI's
+    // dimensionless -ambient is multiplied by Scene::ambientRef() before it lands here.
+    double ambient = 0.0;
+
+    // ---- deterministic one-bounce gather ("radiosity" for mode W) -------------------
+    // `ambient` alone cannot reproduce two things real bounce light does, and both are
+    // measurable on the gold-gyroid scene:
+    //   * CONTACT DARKENING. A constant lights a deep crevice exactly as much as an
+    //     exposed face. Measured against a converged mode-R reference, the darkest 10%
+    //     of the frame (i.e. the occluded interior of the lattice) carries 13.8 units of
+    //     luminance error at the best flat ambient, and the error is SIGNED (-8.2) --
+    //     still too dark -- so no single constant fixes it: raising it to close the
+    //     crevices blows out the open faces by the same amount.
+    //   * COLOUR BLEEDING. Real GI more than doubles the red on the side wall
+    //     (48.7 -> 102.5) while barely moving the blue (4.4 -> 9.7), because the light
+    //     reaching that wall has bounced off gold. A grey constant lifts all three
+    //     channels together, so it buys exposure but not colour.
+    // `giDirs > 0` replaces the flat term with a real single-bounce hemisphere gather: a
+    // FIXED lattice of world-space directions (giDir) is traced from every diffuse
+    // vertex, each carrying whatever deterministic Whitted radiance it finds -- which is
+    // occlusion-aware and spectral, so both effects come back for real.
+    //
+    // Why a fixed lattice rather than POV-Ray's radiosity: POV-Ray caches irradiance at
+    // an ADAPTIVELY chosen sparse point set and interpolates. Which points get sampled
+    // depends on render order and on the local geometry, so on animated geometry the
+    // cache's low-frequency blotches pop in and out between frames. POV-Ray's answer is
+    // to pre-bake one cache and reuse it, which only works if nothing moves. This
+    // gather has NO cache and no adaptivity: the direction set is a pure function of
+    // (lattice index, sample index), never of the scene, so two frames of a rotating
+    // object are lit by the identical estimator and a seamless loop cannot flicker.
+    // The price is that the residual error appears as low-frequency BANDING instead of
+    // noise -- but banding is a smooth function of the surface normal, so it slides
+    // smoothly as geometry turns, where cache splotches jump. Raise `giDirs` (or -spp,
+    // which rotates the lattice, see giDir) to push it down.
+    int giDirs = 0;     // gather rays per diffuse vertex (0 = off, flat `ambient` only)
+    int giGrid = 1;     // NxN shadow-ray grid at a GATHER vertex (cheaper than lightGrid)
+    int giBounce = 4;   // max bounces along a gather ray. Bounds the cost of a specular
+                        // chain: gold is ~0.9 reflective, so kWhittedCutoff alone would
+                        // let a gather ray ricochet ~60 times inside a gold lattice.
+
+    // Firefly clamp on ONE gather ray's returned radiance, per wavelength; 0 = off.
+    // Absolute spectral radiance, pre-scaled by Scene::ambientRef() at the call site
+    // exactly as `ambient` is (main.cpp), so the user-facing `-gi-clamp x` means "x times
+    // one light's own radiance" in any scene.
+    //
+    // What it is for: a gather ray that reaches a lamp THROUGH a specular surface (glass
+    // ball, mirror) carries that lamp's full radiance, while a gather ray that merely
+    // bounced off a wall carries ~rho/pi times a small solid angle of it -- two orders of
+    // magnitude less. That caustic is real and NEE cannot sample it (the lamp is behind a
+    // refracting surface, so the emitter hit is its only estimator), but `giDirs` fixed
+    // directions cannot resolve where it lands. Because every pixel shares those directions
+    // (the invariant that makes this mode noise-free), the "does direction k reach the lamp
+    // through the ball" boundary is a coherent CONTOUR in the image rather than the grain a
+    // stochastic renderer would show -- i.e. thin, blown-out, dashed curves at 1 spp. This
+    // caps them. See known-issues.md.
+    //
+    // Per-wavelength, not per-bundle: the scalar twin giGather() has one lambda and nothing
+    // to take a max over, so a bundle-wide clamp would make the hero and scalar paths
+    // disagree on the same scene -- and this file works hard to keep those two from
+    // drifting apart. Costs a hue shift on a clamped ray, which is the point (it is being
+    // pulled toward its neighbourhood).
+    //
+    // Keep it WELL ABOVE `ambient`. A gather ray that escapes the scene returns the flat
+    // `ambient` far-field tail (see radianceHero), and the clamp is applied to that too, so
+    // the gather's own fill level is effectively min(ambient, giClamp): a clamp below
+    // `-ambient` darkens the whole scene uniformly instead of only capping fireflies. This
+    // is exact, not approximate -- scraps/gi_collapse.ftsl pins it down: in a scene where
+    // every gather ray escapes, `-gi 32 -gi-clamp c` is PIXEL-IDENTICAL to
+    // `-gi 0 -ambient min(ambient, c)` on both the CPU and the GPU.
+    double giClamp = 0.0;
+
+    // Where a path sits relative to the gather. `depth == 0` is a camera path (it does
+    // the gather); `depth == 1` is a gather ray (it does NOT recurse, uses `giGrid`, and
+    // terminates its own diffuse vertices on the flat `ambient` tail). `sIdx` is the
+    // absolute sample index, which rotates the lattice so that -spp progressively
+    // refines the gather instead of re-rendering the same banding. `bounce` is the current
+    // bounce index along the path, so a deterministic per-vertex decision (the mode-W glossy
+    // lobe -- see whittedGlossyDir) can pick a different sequence at each vertex instead of
+    // driving every glossy bounce off the same 1-D lattice.
+    struct GiCtx {
+        int depth = 0;
+        unsigned long long sIdx = 0;
+        int bounce = 0;
+    };
+
+    // One direction of the fixed gather lattice: point `j` of an `n`-point Fibonacci
+    // spiral on the WHOLE sphere, Cranley-Patterson-rotated by (p1, p2).
+    //
+    // The lattice is built in WORLD space and the caller keeps the ~half of it with
+    // cos > 0, weighting by cos and normalising by the realised sum. Two reasons that
+    // beats a cosine-weighted lattice built in a local frame around the normal:
+    //   * No tangent frame is needed, so there is no orthonormal-basis discontinuity to
+    //     show up as a seam where the frame construction flips.
+    //   * A direction entering or leaving the hemisphere does so at cos == 0, i.e. with
+    //     zero weight, so the estimate is continuous in the normal -- which is what
+    //     makes a rotating object's shading slide instead of pop.
+    // Normalising by the realised sum of cosines makes the estimator EXACT for constant
+    // incident radiance, so with nothing in the scene the gather reduces bit-sensibly to
+    // the flat `ambient` term it replaces (no exposure step when -gi is switched on).
+    static Vec3 giDir(int j, int n, double p1, double p2) {
+        double t = ((double)j + 0.5) / (double)n + p2;
+        t -= std::floor(t);                          // CP rotation of the z-strata
+        const double z = 1.0 - 2.0 * t;
+        const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
+        const double kGolden = 2.399963229728653;    // pi * (3 - sqrt 5)
+        const double a = kGolden * (double)j + 2.0 * PI * p1;
+        return Vec3(r * std::cos(a), r * std::sin(a), z);
+    }
+
     bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating
     int  heroC = hero::kHeroC;  // wavelengths bundled per camera path when hero is on
                                 // (runtime -heroc N, clamped to [1, kHeroMax]; 1 = single-λ)
+    // SPLIT-AT-DISPERSION (-herosplit; hero.h's alternative to de-hero'ing). At a
+    // dispersive vertex, fan the bundle into C monochromatic sub-paths -- each refracting
+    // along its OWN Snell direction -- instead of terminating the secondaries and boosting
+    // the hero ×C. Both estimators are unbiased; this one resolves the chromatic spread
+    // GEOMETRICALLY, at C× the traversal work past the split (linear, not exponential: a
+    // sub-path is already monochromatic and so can never split again).
+    //
+    // It matters far more here than in the forward tracer, and specifically for mode W.
+    // Mode W's λ lattice is SHARED by every pixel (that shared-offset property is exactly
+    // what makes it noise-free), so when de-hero collapses the bundle to the hero the
+    // ENTIRE FRAME collapses onto ONE wavelength and every dispersive object comes out
+    // strongly mistinted -- an error no amount of spatial sampling fixes, because it is not
+    // noise. Splitting keeps all C wavelengths live through the glass, so mode W is
+    // colour-correct on a dielectric at -spp 1. Hence `whitted` turns this on by default
+    // (main.cpp); mode R is stochastic and averages the collapse away, so it stays opt-in.
+    bool heroSplit = hero::gSplit;
 
     // Per-sample cache of emitter-SPD evaluations at the path's wavelengths. The
     // wavelengths are fixed for the whole camera path, but every NEE connection
@@ -92,15 +227,19 @@ struct BackwardRenderer {
     // SPD(lambda) it yields that emitter's Le/pdf weight (= its SPD integral for a
     // single light, matching the forward tracer's photon-weight convention).
     //
-    // Shared per-emitter geometry sample for a SURFACE next-event connection. Draws
-    // rng identically to the old inline neeLight body (0 draws for a collimated beam or
-    // point-spot, 2 for an area light), so the scalar and hero NEE can share one
-    // visibility sample. On success returns the λ-INDEPENDENT geometry weight `w` and
+    // Shared per-emitter geometry sample for a SURFACE next-event connection. Takes the
+    // emitter's two sample coordinates EXPLICITLY (`u1`,`u2`) rather than drawing them,
+    // so the scalar and hero NEE can share one visibility sample -- and so the
+    // deterministic Whitted preview (`whitted`) can drive the same body from a fixed
+    // stratified grid instead of the rng. Callers draw 2 uniforms per emitter to keep
+    // the Monte Carlo modes' rng stream (and therefore their images) bit-identical;
+    // a collimated beam or point-spot ignores both coordinates.
+    // On success returns the λ-INDEPENDENT geometry weight `w` and
     // the connection distance `dist`; the diffuse contribution at wavelength λ is then
     //   (rho(λ)/PI) * SPD(λ)*invPdfλ * w      (× medium transmittance, added by caller).
     // Returns false to skip this emitter (back-facing, shadowed, or behind geometry).
     bool emitterGeom(const Scene& scene, const Hit& h, const Vec3& ngo,
-                     const Emitter& em, Pcg32& rng, double& dist, double& w) const {
+                     const Emitter& em, double u1, double u2, double& dist, double& w) const {
         if (em.collimated) return false;                  // beams aren't area-samplable
         if (em.shape == EmitterShape::Spot) {
             // Point spot: deterministic connect to the light point, weighted by the
@@ -128,8 +267,7 @@ struct BackwardRenderer {
             // (rho/PI)*E_perp*cos(surf) for the irradiance the light was authored with.
             // Two rng draws, matching the area-light path below, so adding a sun does
             // not reshuffle any other emitter's stream.
-            double s1 = rng.uniform(), s2 = rng.uniform();
-            Vec3 wi = em.sampleCone(-em.beamDir, s1, s2);
+            Vec3 wi = em.sampleCone(-em.beamDir, u1, u2);
             double cosSurf = dot(h.n, wi);
             if (cosSurf <= 0) return false;
             double stG = shadowTerminatorG(wi, h.n, ngo);   // Chiang soft terminator (1 if flat)
@@ -139,7 +277,6 @@ struct BackwardRenderer {
             w = cosSurf * em.spotOmega * stG;
             return true;
         }
-        double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 y, nLight, wi;
         double pdfW = 0.0;
         // Sphere: cone/solid-angle importance sampling of only the visible cap toward
@@ -191,8 +328,188 @@ struct BackwardRenderer {
         return true;
     }
 
+    // Radical inverses (van der Corput), for the Whitted preview's deterministic sample
+    // placement. Base 2 gets the bit-reversal fast path; the odd bases use the generic
+    // digit loop (called once per pixel-sample, i.e. nothing beside a BVH walk).
+    static double radicalInverse2(uint64_t i) {
+        i = (i << 32) | (i >> 32);
+        i = ((i & 0x0000ffff0000ffffULL) << 16) | ((i & 0xffff0000ffff0000ULL) >> 16);
+        i = ((i & 0x00ff00ff00ff00ffULL) <<  8) | ((i & 0xff00ff00ff00ff00ULL) >>  8);
+        i = ((i & 0x0f0f0f0f0f0f0f0fULL) <<  4) | ((i & 0xf0f0f0f0f0f0f0f0ULL) >>  4);
+        i = ((i & 0x3333333333333333ULL) <<  2) | ((i & 0xccccccccccccccccULL) >>  2);
+        i = ((i & 0x5555555555555555ULL) <<  1) | ((i & 0xaaaaaaaaaaaaaaaaULL) >>  1);
+        return (double)i * (1.0 / 18446744073709551616.0);
+    }
+
+    // DIGIT-SCRAMBLED radical inverse (Faure's fix for high-dimensional Halton), needed by
+    // every lattice below that uses a LARGE base. A plain radical inverse in base b returns
+    // exactly i/b for i < b, so its first N points cover only the prefix [0, N/b) of the unit
+    // interval — well distributed *within* that prefix and blind to the rest. With b = 61 that
+    // means a 16-spp preview never leaves the first quarter of the sequence's range. That is
+    // not academic: it made a `fluorescent` dye whose absorption edge sits at 480 nm contribute
+    // EXACTLY NOTHING until `-spp 64` (its λ_in coordinate was pinned to [0.5, 0.75], i.e. to
+    // wavelengths well past the edge), and it skewed every `glossy` lobe towards its mirror
+    // direction until `-spp 13`.
+    //
+    // The fix is to permute the DIGITS: r = Σ π(dₖ) b^-(k+1). Any bijection π of {0..b-1}
+    // leaves the sequence a permutation of the same b-point grid, so it is exactly as
+    // low-discrepancy asymptotically, but the *order* the grid is visited in is scattered
+    // instead of monotone — N points now spread over the whole interval for any N.
+    //
+    // π here is multiplicative, π(d) = (d·m) mod b with m ≈ b/φ (golden ratio). That needs no
+    // permutation tables (so the device twin is trivially bit-identical), is a bijection for
+    // every prime b (gcd(m, b) = 1 since 0 < m < b), spreads consecutive digits about as
+    // evenly as a 1-D sequence can, and — the load-bearing property — satisfies **π(0) = 0**,
+    // so `radicalInverseScr(b, 0) == 0` exactly, in every base. Every "sample 0 is the
+    // canonical outcome" contract below (mirror direction, specular grating order, median λ)
+    // therefore survives untouched, and only spp > 1 changes.
+    static unsigned goldenDigitMul(unsigned base) {
+        // round(base / φ); φ⁻¹ = 0.6180339887498949. Clamped to a valid multiplier for the
+        // degenerate small bases (b = 2 gives 1, i.e. the identity — base 2 needs no scramble).
+        unsigned m = (unsigned)((double)base * 0.6180339887498949 + 0.5);
+        return (m == 0u || m >= base) ? 1u : m;
+    }
+    static double radicalInverseScr(unsigned base, uint64_t i) {
+        const unsigned mul = goldenDigitMul(base);
+        const double invB = 1.0 / (double)base;
+        double f = invB, r = 0.0;
+        while (i) {
+            r += (double)((unsigned)(i % base) * mul % base) * f;
+            i /= base; f *= invB;
+        }
+        return r;
+    }
+    // Cranley-Patterson rotation by 1/2, so that sample 0 of every sequence lands dead
+    // centre (0.5) rather than at 0 — a 1-spp preview is then the classic un-antialiased
+    // pixel-centre ray, and the wavelength lattice sits mid-stratum.
+    static double rot05(double x) { x += 0.5; return (x >= 1.0) ? x - 1.0 : x; }
+
+    // Deterministic sample placement for the Whitted preview. EVERY PIXEL USES THE SAME
+    // offsets -- that is precisely what makes the mode noise-free, since neighbouring
+    // pixels then differ only by their geometry and never by their luck. The sequence is
+    // indexed by the ABSOLUTE sample index and is *progressive* (any prefix of a radical
+    // inverse is well distributed), so — exactly like the rng stream — the pattern does
+    // not depend on how the budget was split into chunks. That matters in practice: a
+    // `-window` render chunks into 1-spp batches, and a per-chunk `(s + .5)/spp` lattice
+    // would collapse to "sample 0" forever and make `-spp` a no-op on the image.
+    //
+    // In this mode `spp` therefore stops meaning "more Monte Carlo samples" and starts
+    // meaning "finer edge antialiasing and a denser fixed wavelength set" -- the image
+    // gets sharper, never less grainy, because it was never grainy.
+    static void whittedSample(uint64_t idx, double& u, double& v) {
+        u = rot05(radicalInverse2(idx));
+        v = rot05(radicalInverseScr(3, idx));
+    }
+    // The bundle's / scalar path's base wavelength coordinate; a third, decorrelated
+    // radical inverse so λ placement does not lock to the subpixel position.
+    static double whittedLambdaU(uint64_t idx) { return rot05(radicalInverseScr(5, idx)); }
+
+    // Deterministic ROUGH-SPECULAR direction for the Whitted preview: point `sIdx` of a
+    // fixed 2-D lattice on the power-cosine lobe around `mdir`, instead of the lobe's single
+    // mirror direction.
+    //
+    // Why this is not just a polish item: collapsing every sample onto the mirror direction
+    // makes mode W INCONSISTENT on rough specular -- raising -spp changed nothing at all,
+    // because each extra sample re-traced the identical direction, so satin metal previewed
+    // crisper than it renders and stayed that way at any budget. Driving the lobe from the
+    // sample index makes -spp converge on the true lobe while keeping BOTH mode-W
+    // invariants: every pixel uses the same offsets (so it is noise-free, not grainy -- at a
+    // given spp the whole frame shares one lobe direction per vertex), and the sequence is
+    // indexed by the ABSOLUTE sample index (so the image is chunk-split-independent).
+    //
+    // The polar coordinate is COMPLEMENTED rather than rot05'd, because glossyDirUV maps
+    // u1 == 1 to the mirror direction and radicalInverse(0) == 0 in every base: sample 0 is
+    // therefore *exactly* the old mirror direction, so a 1-spp preview is bit-identical to
+    // 0.107.0 and only spp > 1 changes. (sinT == 0 there makes the azimuth moot too.)
+    //
+    // Each bounce depth takes its own prime pair so two glossy vertices on one path are not
+    // driven by the same 1-D sequence -- which would correlate their offsets and fold a
+    // double-bounce lobe into a line. Bases 2/3 are the subpixel lattice, 5 the wavelength,
+    // 7/11 the gather, so these start at 13. Those bases are all LARGER than a typical preview's
+    // `-spp`, which is exactly why they go through the digit-SCRAMBLED radical inverse: unscrambled,
+    // base 13 pinned u1 to [1 - spp/13, 1] and kept the lobe hugging its mirror direction until
+    // `-spp 13`.
+    static Vec3 whittedGlossyDir(const Vec3& mdir, double roughness, uint64_t sIdx, int bounce) {
+        static const unsigned kBases[4][2] = {{13, 17}, {19, 23}, {29, 31}, {37, 41}};
+        const unsigned* pb = kBases[bounce & 3];
+        const double u1 = 1.0 - radicalInverseScr(pb[0], sIdx);   // 1 at sIdx 0 => mirror
+        const double u2 = radicalInverseScr(pb[1], sIdx);
+        return glossyDirUV(mdir, roughness, u1, u2);
+    }
+
+    // Deterministic DISCRETE-CHOICE coordinate for the Whitted preview. Same job as
+    // whittedGlossyDir, but for a pick out of a finite weighted SET rather than a direction on
+    // a lobe: one scalar in [0,1) off the (sIdx, bounce) lattice, which the caller inverts
+    // against its own CDF. Keeping ONE choice per sample (rather than summing the set) is what
+    // preserves the estimator -- the existing pick is analog (order i with probability
+    // wgt[i]/wsum, throughput unchanged), so feeding it a stratified u instead of an rng draw
+    // is still unbiased and merely removes the per-pixel luck.
+    //
+    // NOT rot05'd, deliberately: `gratingDiffract` walks its candidates in DESCENDING
+    // efficiency on this path, so u == 0 -- which radicalInverseB returns at sIdx 0 in every
+    // base -- selects the specular order m = 0. That is the exact analogue of
+    // whittedGlossyDir's "sample 0 is the mirror direction": a 1-spp preview shows the
+    // undiffracted image, and extra spp fan the spectrum out into the higher orders.
+    // The scramble is what makes that fan-out *gradual*: unscrambled, base 43 confined u to
+    // [0, spp/43), so the higher orders arrived in a lump only once `-spp` passed the base.
+    static double whittedOrderU(uint64_t sIdx, int bounce) {
+        static const unsigned kBases[4] = {43, 47, 53, 59};
+        return radicalInverseScr(kBases[bounce & 3], sIdx);
+    }
+    // Deterministic Stokes-shift EXCITATION wavelength coordinate for the Whitted preview.
+    // Unlike a grating order there is no "specular" outcome worth preferring here, so this one
+    // IS rot05'd like the other wavelength lattices: sample 0 lands at the MEDIAN of the
+    // excitation CDF -- the most representative single λ_in -- instead of at its short-λ
+    // extreme, which is what an unrotated u == 0 would pick.
+    //
+    // This dimension is where the unscrambled radical inverse hurt most, and it is why
+    // radicalInverseScr exists: with base 61 and rot05, u was confined to [0.5, 0.5 + spp/61)
+    // for any preview budget below 61 spp, i.e. to the LONG half of the illuminant's CDF. A dye
+    // absorbing only below 480 nm was therefore never excited at all and rendered as its bare
+    // elastic lobe until `-spp 64`, at which point the sequence finally wrapped and the dye
+    // switched on in one step. Scrambled, the same 4 samples straddle the whole CDF.
+    // Since v0.115.0 the CDF this indexes is the DYE'S OWN excitation distribution
+    // (Material::fluoInSampler = absorb(λ) × illuminant), not the scene-wide illuminant, so
+    // sample 0's median draw now lands inside the absorption band by construction and even a
+    // narrow-band dye fluoresces correctly at `-spp 1`.
+    static double whittedFluoroU(uint64_t sIdx, int bounce) {
+        static const unsigned kBases[4] = {61, 67, 71, 73};
+        return rot05(radicalInverseScr(kBases[bounce & 3], sIdx));
+    }
+
+    // Whitted: replace a Russian-roulette survival test with a throughput WEIGHT.
+    // Same expected value, zero variance. Returns false once the path is too dim to
+    // matter -- POV-Ray's `adc_bailout` (default 1/255), which is what stops a
+    // mirror-lined box from recursing to maxBounce on literally every pixel.
+    static constexpr double kWhittedCutoff = 1.0 / 512.0;
+    static bool whittedAttenuate(double& thr, double w) {
+        if (w <= 0.0) return false;
+        thr *= w;
+        return thr > kWhittedCutoff;
+    }
+
+    // Does this emitter consume its two sample coordinates?  A collimated beam and a
+    // point-spot are deterministic connections and draw nothing; every area shape (and
+    // the sun's cone) draws two. The Monte Carlo callers must match this exactly, or a
+    // scene that merely *adds* a spot light would reshuffle every other emitter's rng
+    // stream and change an unrelated image.
+    static bool emitterNeedsUV(const Emitter& em) {
+        return !em.collimated && em.shape != EmitterShape::Spot;
+    }
+
+    // Deterministic stratified sample coordinates for the Whitted preview: the centre
+    // of cell (gx,gy) of a G x G grid over the emitter's [0,1)^2 sample domain. This is
+    // POV-Ray's `area_light` model -- a fixed lattice of shadow rays whose average is a
+    // soft shadow with NO variance, rather than one random point per camera sample whose
+    // average only becomes smooth after many spp.
+    static void gridUV(int g, int G, double& u1, double& u2) {
+        u1 = ((double)(g % G) + 0.5) / (double)G;
+        u2 = ((double)(g / G) + 0.5) / (double)G;
+    }
+
     double neeLight(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
-                    double lambda, Pcg32& rng, const SpdCache* spdCache = nullptr) const {
+                    double lambda, Pcg32& rng, const SpdCache* spdCache = nullptr,
+                    GiCtx gi = GiCtx{}) const {
         double total = 0.0;
         // Geometric normal on the shading-normal side: every light connection must lie
         // in this hemisphere too, else a smoothed shading normal would leak light in
@@ -208,14 +525,33 @@ struct BackwardRenderer {
         const int nEm = (int)scene.emitters.size();
         for (int e = 0; e < nEm; ++e) {
             const Emitter& em = scene.emitters[e];
-            double dist = 0.0, w = 0.0;
-            if (!emitterGeom(scene, h, ngo, em, rng, dist, w)) continue;
-            double spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
-                                 : em.spdFn(lambda);
-            double contrib = (rho / PI) * (spdV * invPdfLambda) * w;
-            if (med)                                              // Beer-Lambert on the shadow ray
-                contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
-            total += contrib;
+            const bool uv = emitterNeedsUV(em);
+            // Whitted: G x G deterministic shadow rays per area light, averaged. A
+            // deterministic emitter (spot/beam) has nothing to stratify, so it stays at 1.
+            // A GATHER vertex uses the coarser giGrid: its soft-shadow detail is about to
+            // be averaged over giDirs directions anyway, so paying lightGrid^2 there
+            // multiplies the gather's cost for no visible return.
+            const int G = (whitted && uv) ? (gi.depth ? giGrid : lightGrid) : 1;
+            const int nS = G * G;
+            double acc = 0.0, spdV = 0.0;
+            bool haveSpd = false;
+            for (int s = 0; s < nS; ++s) {
+                double u1 = 0.0, u2 = 0.0;
+                if (whitted) { if (uv) gridUV(s, G, u1, u2); }
+                else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
+                double dist = 0.0, w = 0.0;
+                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w)) continue;
+                if (!haveSpd) {   // evaluated at most once per emitter, as before
+                    spdV = cached ? spdCache->spd[(size_t)e * (size_t)spdCache->C]
+                                  : em.spdFn(lambda);
+                    haveSpd = true;
+                }
+                double contrib = (rho / PI) * (spdV * invPdfLambda) * w;
+                if (med)                                          // Beer-Lambert on the shadow ray
+                    contrib *= std::exp(-scene.backwardMedium().sigmaT(lambda) * dist);
+                acc += contrib;
+            }
+            total += (nS > 1) ? acc / (double)nS : acc;
         }
         return total;
     }
@@ -226,24 +562,120 @@ struct BackwardRenderer {
     // hero fast path, so there is no medium transmittance term.
     void neeLightHero(const Scene& scene, const Hit& h, const double* rho, double* L,
                       const double* thr, const double* lam, const double* invPdf,
-                      int nUp, Pcg32& rng, const SpdCache* spdCache) const {
+                      int nUp, Pcg32& rng, const SpdCache* spdCache,
+                      GiCtx gi = GiCtx{}) const {
         const Vec3 ngo = orientedGeoN(h);
         const bool cached = spdCache && spdCache->matches(lam, nUp);
         const int nEm = (int)scene.emitters.size();
         for (int e = 0; e < nEm; ++e) {
             const Emitter& em = scene.emitters[e];
-            double dist = 0.0, w = 0.0;
-            if (!emitterGeom(scene, h, ngo, em, rng, dist, w)) continue;
-            if (cached) {
-                const double* spdE = spdCache->spd + (size_t)e * (size_t)spdCache->C;
-                for (int i = 0; i < nUp; ++i)
-                    L[i] += thr[i] * (rho[i] / PI) * (spdE[i] * invPdf[i]) * w;
-            } else {
-                for (int i = 0; i < nUp; ++i)
-                    L[i] += thr[i] * (rho[i] / PI) * (em.spdFn(lam[i]) * invPdf[i]) * w;
+            const bool uv = emitterNeedsUV(em);
+            const int G = (whitted && uv) ? (gi.depth ? giGrid : lightGrid) : 1;
+            const int nS = G * G;
+            const double invS = 1.0 / (double)nS;
+            for (int s = 0; s < nS; ++s) {
+                double u1 = 0.0, u2 = 0.0;
+                if (whitted) { if (uv) gridUV(s, G, u1, u2); }
+                else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
+                double dist = 0.0, w = 0.0;
+                if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w)) continue;
+                const double ws = (nS > 1) ? w * invS : w;
+                if (cached) {
+                    const double* spdE = spdCache->spd + (size_t)e * (size_t)spdCache->C;
+                    for (int i = 0; i < nUp; ++i)
+                        L[i] += thr[i] * (rho[i] / PI) * (spdE[i] * invPdf[i]) * ws;
+                } else {
+                    for (int i = 0; i < nUp; ++i)
+                        L[i] += thr[i] * (rho[i] / PI) * (em.spdFn(lam[i]) * invPdf[i]) * ws;
+                }
             }
         }
     }
+
+    // ---- deterministic one-bounce gather ---------------------------------------------
+    // Estimate the cosine-weighted mean INCIDENT radiance over the hemisphere above a
+    // diffuse vertex by tracing the fixed lattice (see giDirs / giDir), then add the
+    // Lambertian response rho * that. This is the term flat `ambient` was standing in
+    // for, computed instead of assumed.
+    //
+    // Each gather ray runs the same deterministic Whitted radiance the camera ray does,
+    // just with GiCtx::depth == 1, which (a) stops it gathering again -- single bounce --
+    // (b) drops it to `giGrid` shadow rays, (c) makes it terminate its own diffuse
+    // vertices on the flat `ambient` tail, and (d) starts it NON-specular so that a ray
+    // landing straight on a light adds nothing (the vertex's own NEE already counted
+    // that; adding it here would double the direct light). A ray that reaches a light
+    // *via* a mirror still counts, because a specular bounce re-arms specularArrival --
+    // so gold-bounced light, the whole point of this, is carried at full weight.
+    //
+    void giGatherHero(const Scene& scene, const Hit& h, const double* rho, double* L,
+                      const double* thr, const double* lam, const double* invPdf,
+                      int nUp, Pcg32& rng, const SpdCache* spdCache, GiCtx gi) const {
+        const Vec3 ngo = orientedGeoN(h);
+        const int n = giDirs * 2;      // full-sphere lattice; ~half of it faces outward
+        // Cranley-Patterson phases from the ABSOLUTE sample index, on two decorrelated
+        // radical inverses (bases 7 and 11, so they collide with neither the subpixel
+        // lattice (2,3) nor the wavelength lattice (5)). Every pixel shares them -- the
+        // invariant that makes this mode noise-free -- so raising -spp rotates the whole
+        // frame's lattice coherently and the banding averages out progressively.
+        const double p1 = rot05(radicalInverseScr(7, gi.sIdx));
+        const double p2 = rot05(radicalInverseScr(11, gi.sIdx));
+        double acc[hero::kHeroMax];
+        for (int i = 0; i < nUp; ++i) acc[i] = 0.0;
+        double wSum = 0.0;
+        const GiCtx sub{gi.depth + 1, gi.sIdx};
+        for (int j = 0; j < n; ++j) {
+            const Vec3 d = giDir(j, n, p1, p2);
+            const double c = dot(h.n, d);
+            if (c <= 0.0) continue;
+            // Also require the GEOMETRIC hemisphere, or a smoothed shading normal would
+            // gather through the true back face (the shading-normal problem again).
+            if (dot(ngo, d) <= 0.0) continue;
+            wSum += c;
+            double Lg[hero::kHeroMax];
+            radianceHero(scene, Ray{h.p + ngo * 1e-6, d}, lam, invPdf, nUp, Lg, rng,
+                         spdCache, sub);
+            // Firefly clamp (see giClamp). NOT applied to wSum: the weight of a clamped
+            // direction stays c, so the estimator still normalises by the realised sum of
+            // cosines and an unclamped gather is untouched bit-for-bit.
+            if (giClamp > 0.0)
+                for (int i = 0; i < nUp; ++i) if (Lg[i] > giClamp) Lg[i] = giClamp;
+            for (int i = 0; i < nUp; ++i) acc[i] += c * Lg[i];
+        }
+        if (wSum <= 0.0) return;
+        const double inv = 1.0 / wSum;
+        for (int i = 0; i < nUp; ++i) L[i] += thr[i] * rho[i] * (acc[i] * inv);
+    }
+
+    // Scalar twin of giGatherHero, for the paths that cannot use the hero bundle (fog,
+    // GRIN, a physical lens) and for a de-hero'd vertex inside interactMaterial.
+    double giGather(const Scene& scene, const Hit& h, double rho, double lambda,
+                    double invPdfLambda, Pcg32& rng, const SpdCache* spdCache,
+                    GiCtx gi) const {
+        const Vec3 ngo = orientedGeoN(h);
+        const int n = giDirs * 2;
+        const double p1 = rot05(radicalInverseScr(7, gi.sIdx));
+        const double p2 = rot05(radicalInverseScr(11, gi.sIdx));
+        double acc = 0.0, wSum = 0.0;
+        const GiCtx sub{gi.depth + 1, gi.sIdx};
+        for (int j = 0; j < n; ++j) {
+            const Vec3 d = giDir(j, n, p1, p2);
+            const double c = dot(h.n, d);
+            if (c <= 0.0) continue;
+            if (dot(ngo, d) <= 0.0) continue;
+            wSum += c;
+            double Lg = radiance(scene, Ray{h.p + ngo * 1e-6, d}, lambda, invPdfLambda,
+                                 rng, spdCache, sub);
+            if (giClamp > 0.0 && Lg > giClamp) Lg = giClamp;   // see giClamp
+            acc += c * Lg;
+        }
+        return (wSum > 0.0) ? rho * (acc / wSum) : 0.0;
+    }
+
+    // The Whitted indirect-diffuse term at a vertex, in one place so the scalar and hero
+    // diffuse cases cannot drift apart: the real gather on a camera path when -gi is on,
+    // otherwise the flat `ambient` constant. A gather ray (depth > 0) always takes the
+    // flat branch -- that constant is what terminates the single bounce.
+    bool giUseGather(GiCtx gi) const { return giDirs > 0 && gi.depth == 0; }
 
     // Volume next-event estimation: connect a fog scattering vertex `p` (photon
     // arriving along `wIn`) to a uniformly-sampled light point. The surface BRDF
@@ -420,7 +852,8 @@ struct BackwardRenderer {
     bool interactMaterial(const Scene& scene, const Material& m, const Hit& h, Renderer& mats,
                           Ray& ray, double& lambda, double& invPdfLambda, double& thr, double& L,
                           bool& specularArrival, double& contBsdfPdf, MediumStack& stk,
-                          Pcg32& rng, const SpdCache* spdCache = nullptr) const {
+                          Pcg32& rng, const SpdCache* spdCache = nullptr,
+                          GiCtx gi = GiCtx{}) const {
         switch (m.type) {
             case MatType::Dielectric: {
                 // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002). The
@@ -449,7 +882,14 @@ struct BackwardRenderer {
                     const double extIor = (ranked && outMat >= 0)
                         ? scene.mats[outMat].ior(lambda) : 1.0;
                     bool transmitted = false;
-                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                    // Mode W: dominant Fresnel branch weighted into the throughput instead of
+                    // a coin flip (see refractOrReflect's whittedWeight). Attenuating AFTER
+                    // the call is safe because the ray has not been traced yet -- returning
+                    // false here just ends the path at this vertex, as elsewhere in mode W.
+                    double wW = 1.0;
+                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted,
+                                                extIor, whitted ? &wW : nullptr);
+                    if (whitted && !whittedAttenuate(thr, wW)) return false;
                     if (transmitted) stk.push(mi, pr);
                     return true;
                 } else {
@@ -467,24 +907,39 @@ struct BackwardRenderer {
                     const double extIor = (ranked && newMat >= 0)
                         ? scene.mats[newMat].ior(lambda) : 1.0;
                     bool transmitted = false;
-                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                    double wW = 1.0;                      // mode W: see the entering branch
+                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted,
+                                                extIor, whitted ? &wW : nullptr);
+                    if (whitted && !whittedAttenuate(thr, wW)) return false;
                     if (transmitted) stk.popMat(mi);      // TIR stays inside mi
                     return true;
                 }
             }
             case MatType::ThinFilm: {
-                Ray nr;
-                if (!mats.thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr)) return false;
+                // Mode W: dominant interference branch weighted into the throughput instead
+                // of a coin flip, exactly as Dielectric does above (see thinFilmInterface's
+                // whittedWeight). Attenuating AFTER the call is safe -- the ray has not been
+                // traced yet, so returning false just ends the path at this vertex.
+                Ray nr; double wW = 1.0;
+                if (!mats.thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr,
+                                            whitted ? &wW : nullptr)) return false;
+                if (whitted && !whittedAttenuate(thr, wW)) return false;
                 ray = nr; specularArrival = true; return true;
             }
             case MatType::Multilayer: {
-                Ray nr;
-                if (!mats.multilayerInterface(m, h, ray.d, lambda, rng, nr)) return false;
+                Ray nr; double wW = 1.0;                  // mode W: see ThinFilm above
+                if (!mats.multilayerInterface(m, h, ray.d, lambda, rng, nr,
+                                              whitted ? &wW : nullptr)) return false;
+                if (whitted && !whittedAttenuate(thr, wW)) return false;
                 ray = nr; specularArrival = true; return true;
             }
             case MatType::Mirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (rng.uniform() >= r) return false;      // RR absorb
+                // Whitted: carry the reflectance as WEIGHT instead of rolling for
+                // survival. Same expected value, zero variance -- the whole reason a
+                // deterministic preview converges at 1 spp where RR needs tens.
+                if (whitted) { if (!whittedAttenuate(thr, r)) return false; }
+                else if (rng.uniform() >= r) return false;      // RR absorb
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 specularArrival = true; return true;
             }
@@ -492,27 +947,57 @@ struct BackwardRenderer {
                 // The grating equation is reciprocal, so backward tracing reuses the
                 // same diffraction (m <-> -m symmetric). Specular per order.
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (rng.uniform() >= r) return false;      // RR absorb
+                if (whitted) { if (!whittedAttenuate(thr, r)) return false; }
+                else if (rng.uniform() >= r) return false;      // RR absorb
                 bool absorbedG;
-                Ray nr = mats.gratingDiffract(m, h, ray.d, lambda, rng, absorbedG);
+                // Mode W: the diffraction ORDER comes off the (sIdx, bounce) lattice instead of
+                // the rng, so every pixel picks the same order and the preview is noise-free
+                // (see whittedOrderU / gratingDiffract).
+                const double uOrd = whitted ? whittedOrderU(gi.sIdx, gi.bounce) : 0.0;
+                Ray nr = mats.gratingDiffract(m, h, ray.d, lambda, rng, absorbedG,
+                                              whitted ? &uOrd : nullptr);
                 if (absorbedG) return false;
                 ray = nr; specularArrival = true; return true;
             }
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (rng.uniform() < r) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
-                else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                // Whitted: a true beam splitter needs the path to FORK, which this
+                // iterative loop cannot do. Take the dominant branch and weight it, so a
+                // preview is stable rather than a 50/50 coin flipped per pixel. (The
+                // minority branch is dropped, not just dimmed -- a half mirror previews
+                // as whichever of reflection/transmission is stronger.)
+                if (whitted) {
+                    const bool refl = (r >= 0.5);
+                    if (!whittedAttenuate(thr, refl ? r : 1.0 - r)) return false;
+                    ray = refl ? Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)}
+                               : Ray{h.p + ray.d * 1e-6, ray.d};
+                } else if (rng.uniform() < r) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                else                          ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 specularArrival = true; return true;
             }
             case MatType::Filter: {
                 // Colored gel filter: pass straight through, survive with prob T(lambda).
                 double t = clamp01(transmitSlot(scene, m, h, lambda));
-                if (rng.uniform() >= t) return false;      // absorbed
+                if (whitted) { if (!whittedAttenuate(thr, t)) return false; }
+                else if (rng.uniform() >= t) return false;      // absorbed
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
                 specularArrival = true; return true;
             }
             case MatType::Glossy: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
+                // Whitted: the lobe off a deterministic lattice rather than the rng, so the
+                // direction is the same for every pixel (noise-free) but varies with the
+                // sample index (so -spp actually resolves the lobe). At -spp 1 this IS the
+                // mirror direction, which is exact for a near-mirror and over-sharpens as
+                // roughness grows; the fix for that is more spp, which now works.
+                if (whitted) {
+                    if (!whittedAttenuate(thr, r)) return false;
+                    Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
+                                              materialRoughness(scene, m, h), gi.sIdx, gi.bounce);
+                    if (dot(o, h.n) <= 0) return false;
+                    ray = Ray{h.p + h.n * 1e-6, o};
+                    specularArrival = true; return true;
+                }
                 if (rng.uniform() >= r) return false;
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0) return false;
@@ -525,7 +1010,11 @@ struct BackwardRenderer {
                 // fluorescent channel excites at a separately-sampled lambdaIn (Stokes
                 // shift). Both channels NEE; one stochastic continuation carries indirect.
                 double rhoEl = clamp01(m.reflect(lambda));   // elastic base at lambda(out)
-                L += thr * neeLight(scene, h, rhoEl, invPdfLambda, lambda, rng, spdCache);
+                // `gi` matters (it selects giGrid over lightGrid at a gather vertex) —
+                // omitting it here used to make a fluorescent surface pay lightGrid^2 shadow
+                // rays inside a -gi gather while every Diffuse vertex paid giGrid^2, so the
+                // two materials disagreed on the shadow lattice for no reason.
+                L += thr * neeLight(scene, h, rhoEl, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, h, rhoEl, invPdfLambda, lambda, rng);
                 double Mint = m.fluoEmitSampler.integral;
@@ -534,16 +1023,37 @@ struct BackwardRenderer {
                 if (haveFluoro) {
                     gOut = (m.fluoEmit(lambda) / Mint) * invPdfLambda;
                     double pin = 0.0;
-                    lambdaIn = scene.emitSampler.sample(rng, pin);
+                    // Mode W: the Stokes-shift EXCITATION wavelength comes off the
+                    // (sIdx, bounce) lattice rather than the rng -- the same CDF inversion
+                    // (sampleAt), just a stratified u, so the estimator is untouched and only
+                    // the per-pixel luck goes away. This was mode W's last rng draw here; the
+                    // elastic/fluoro continuation coin below is unreachable because mode W
+                    // implies directOnly, which returns first.
+                    //
+                    // The CDF is the material's own excitation sampler (absorb x illuminant),
+                    // so every draw lands inside the dye's absorption band -- see
+                    // Material::fluoInSampler. Scenes whose dye cannot be excited at all by
+                    // this illuminant have an empty sampler; fall back to the illuminant so
+                    // the branch still terminates (rhoFluo will be 0 anyway).
+                    const EmissionSampler& inS = (m.fluoInSampler.integral > 0.0)
+                                                     ? m.fluoInSampler : scene.emitSampler;
+                    lambdaIn = whitted
+                        ? inS.sampleAt(whittedFluoroU(gi.sIdx, gi.bounce), pin)
+                        : inS.sample(rng, pin);
                     if (pin > 0.0) {
-                        invPdfIn = scene.invPdfLambda(lambdaIn);
+                        // 1/pdf of the sampler we actually drew from. (Pre-0.115.0 this
+                        // read scene.invPdfLambda(lambdaIn) -- correct only while the
+                        // sampler WAS the illuminant, and even then it mixed an analytic
+                        // emitG/g against a bin-discretised CDF draw.)
+                        invPdfIn = 1.0 / pin;
                         double rhoIn, aEffIn;
                         fluoroWeights(m, lambdaIn, rhoIn, aEffIn);   // shared with forward
                         rhoFluo = aEffIn * m.fluoYield;              // reradiation albedo @lambdaIn
                         if (rhoFluo > 0.0) {                          // fluoro DIRECT NEE
                             // (lambdaIn ≠ the cached wavelengths → matches() fails and
                             // this evaluates spdFn live, exactly as before.)
-                            L += thr * gOut * neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn, rng, spdCache);
+                            L += thr * gOut * neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn,
+                                                       rng, spdCache, gi);
                             if (scene.envIndex >= 0)
                                 L += thr * gOut * neeEnv(scene, h, rhoFluo, invPdfIn, lambdaIn, rng);
                         }
@@ -576,13 +1086,21 @@ struct BackwardRenderer {
                 double rhoT = clamp01(transmitSlot(scene, m, h, lambda));
                 double sum = rhoR + rhoT;
                 if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }   // energy guard
-                L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng, spdCache);
+                L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, h, rhoR, invPdfLambda, lambda, rng);
                 Hit hb = h; hb.n = -h.n;                 // back hemisphere for the transmit lobe
-                L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng, spdCache);
+                L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, hb, rhoT, invPdfLambda, lambda, rng);
+                if (whitted) {   // both lobes gather, each into its own hemisphere
+                    if (giUseGather(gi)) {
+                        L += thr * giGather(scene, h,  rhoR, lambda, invPdfLambda, rng, spdCache, gi);
+                        L += thr * giGather(scene, hb, rhoT, lambda, invPdfLambda, rng, spdCache, gi);
+                    } else if (ambient > 0.0) {
+                        L += thr * (rhoR + rhoT) * ambient;
+                    }
+                }
                 if (directOnly) return false;            // Whitted: no diffuse indirect
                 double u = rng.uniform();
                 if (u < rhoR) {                          // reflect continuation (front)
@@ -601,9 +1119,15 @@ struct BackwardRenderer {
             case MatType::Diffuse:
             default: {
                 double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
-                L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng, spdCache);
+                L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)   // env-NEE toward the sky (MIS'd on miss)
                     L += thr * neeEnv(scene, h, rho, invPdfLambda, lambda, rng);
+                if (whitted) {             // indirect diffuse: real gather, or the flat stand-in
+                    if (giUseGather(gi))
+                        L += thr * giGather(scene, h, rho, lambda, invPdfLambda, rng, spdCache, gi);
+                    else if (ambient > 0.0)
+                        L += thr * rho * ambient;
+                }
                 if (directOnly) return false;   // Whitted: no diffuse indirect
                 // Russian roulette on the albedo (throughput unchanged on survival).
                 if (rng.uniform() >= rho) return false;
@@ -620,9 +1144,12 @@ struct BackwardRenderer {
     // `invPdfLambda` = emitG/g(lambda), the reciprocal of the sampled-wavelength
     // pdf; an emitter's Le/pdf weight is its SPD(lambda) * invPdfLambda.
     double radiance(const Scene& scene, Ray ray, double lambda, double invPdfLambda,
-                    Pcg32& rng, const SpdCache* spdCache = nullptr) const {
+                    Pcg32& rng, const SpdCache* spdCache = nullptr,
+                    GiCtx gi = GiCtx{}) const {
         double L = 0.0, thr = 1.0;
-        bool specularArrival = true;   // camera ray may see the light directly
+        // Camera ray may see the light directly; a gather ray may not (see radianceHero).
+        bool specularArrival = (gi.depth == 0);
+        const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
         double contBsdfPdf = 0.0;      // solid-angle pdf of the current continuation
                                        // ray (for env-miss MIS after a diffuse/volume
                                        // bounce; unused while specularArrival)
@@ -645,7 +1172,10 @@ struct BackwardRenderer {
         // and is shared verbatim by the forward and bidirectional tracers.
         bool grinAny = grin::sceneHasGrin(scene);
 
-        for (int b = 0; b < maxBounce; ++b) {
+        for (int b = 0; b < maxB; ++b) {
+            // Publish the bounce index so a deterministic per-vertex choice (mode W's glossy
+            // lobe) can pick a decorrelated sequence at each depth. Costs nothing otherwise.
+            gi.bounce = b;
             // GRIN curved marching pre-pass: advance the ray through any gradient-index
             // region it enters, integrating the Eikonal equation d/ds(n·dr/ds)=∇n in
             // small steps so the path bends. Pure marching does NOT consume a bounce;
@@ -718,6 +1248,8 @@ struct BackwardRenderer {
                 // this is a clean single-strategy split, not a missing MIS weight.
                 if (scene.sunCount > 0 && specularArrival)
                     L += thr * scene.sunRadiance(ray.d, lambda) * invPdfLambda;
+                // Escaped gather ray → the far-field `ambient` fill (see radianceHero).
+                if (gi.depth && ambient > 0.0) L += thr * ambient;
                 return L;
             }
             const Material* mp = &scene.mats[h.matId];
@@ -725,7 +1257,8 @@ struct BackwardRenderer {
             // leftover absorption slice) before the switch, mirroring the forward
             // tracer so the two agree on the blended surface by construction.
             if (mp->type == MatType::Mix) {
-                int child = mixResolveChild(scene, *mp, h, rng.uniform());
+                int child = whitted ? mixResolveDominant(scene, *mp, h)
+                                    : mixResolveChild(scene, *mp, h, rng.uniform());
                 if (child < 0) return L;   // absorbed
                 mp = &scene.mats[child];
             }
@@ -736,6 +1269,25 @@ struct BackwardRenderer {
             if (mp->type == MatType::Layered) {
                 const Material& cm = *mp;
                 double R = layeredCoatReflectance(scene, cm, h, ray.d, lambda);
+                // Whitted: no fork, so take the dominant layer and weight it. A real
+                // clearcoat has R ~ 0.04-0.1 at normal incidence, so this previews the
+                // BODY (the paint) and drops the coat sheen -- the right trade, since the
+                // sheen is the part you can least see at 1 spp anyway.
+                if (whitted) {
+                    if (R >= 0.5) {
+                        if (!whittedAttenuate(thr, R)) return L;
+                        Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
+                                                  materialRoughness(scene, cm, h), gi.sIdx, b);
+                        if (dot(o, h.n) <= 0) return L;
+                        ray = Ray{h.p + h.n * 1e-6, o};
+                        specularArrival = true;
+                        continue;
+                    }
+                    if (!whittedAttenuate(thr, 1.0 - R)) return L;
+                    int child = mixDominantChild(cm);
+                    if (child < 0) return L;
+                    mp = &scene.mats[child];
+                } else {
                 if (rng.uniform() < R) {
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
                     if (dot(o, h.n) <= 0) return L;
@@ -746,6 +1298,7 @@ struct BackwardRenderer {
                 int child = mixPickChild(cm, rng.uniform());   // body lobe
                 if (child < 0) return L;                        // leftover absorbs
                 mp = &scene.mats[child];
+                }
             }
             const Material& m = *mp;
 
@@ -759,7 +1312,7 @@ struct BackwardRenderer {
                 L += thr * emitSlot(scene, m, h, lambda) * invPdfLambda;
 
             if (!interactMaterial(scene, m, h, mats, ray, lambda, invPdfLambda, thr, L,
-                                  specularArrival, contBsdfPdf, stk, rng, spdCache))
+                                  specularArrival, contBsdfPdf, stk, rng, spdCache, gi))
                 return L;                                 // path terminated in the interaction
         }
         return L;
@@ -776,14 +1329,49 @@ struct BackwardRenderer {
     // lens, so those branches are absent here. Fills Lout[0..C).
     void radianceHero(const Scene& scene, Ray ray, const double* lamIn,
                       const double* invPdfIn, int C, double* Lout, Pcg32& rng,
-                      const SpdCache* spdCache = nullptr) const {
+                      const SpdCache* spdCache = nullptr, GiCtx gi = GiCtx{}) const {
+        // A fresh camera/gather bundle: unit throughput, empty medium stack, at bounce 0.
+        // A camera ray may see a light directly; a GATHER ray may not -- the vertex it
+        // left already NEE'd the direct light, so counting the emitter again here would
+        // double it. A specular bounce re-arms this, so gold-bounced light still lands.
+        double thr[hero::kHeroMax];
+        for (int i = 0; i < C; ++i) thr[i] = 1.0;
+        radianceHeroLoop(scene, ray, MediumStack{}, lamIn, invPdfIn, thr, C,
+                         /*secAlive=*/(C > 1), /*specularArrival=*/(gi.depth == 0),
+                         /*contBsdfPdf=*/0.0, /*bounce0=*/0, Lout, rng, spdCache, gi);
+    }
+
+    // Bounce loop for a hero bundle already sitting at (`ray`, `stk`) with
+    // `secAlive ? C : 1` live wavelengths carrying `lamIn[]`/`invPdfIn[]`/`thrIn[]`,
+    // resuming at bounce index `bounce0`. Split out of radianceHero so the `heroSplit`
+    // policy can RE-ENTER it once per monochromatic sub-path that a dispersive interface
+    // fans out (see the dispersive case below) -- the direct twin of the forward tracer's
+    // tracePhotonHeroLoop. Every sub-path is spawned with `secAlive == false` and the split
+    // branch is guarded on `secAlive`, so a sub-path can never split again: recursion is at
+    // most one level deep and the per-frame footprint (a MediumStack plus four kHeroMax
+    // double arrays) is bounded.
+    //
+    // `Lout` is ASSIGNED, not accumulated, exactly as before -- a split parent therefore
+    // adds each sub-path's returned radiance into its OWN L[i] slot (see below), which is
+    // what keeps wavelength i's radiance attributed to wavelength i.
+    void radianceHeroLoop(const Scene& scene, Ray ray, MediumStack stk, const double* lamIn,
+                          const double* invPdfIn, const double* thrIn, int C, bool secAlive,
+                          bool specularArrival, double contBsdfPdf, int bounce0,
+                          double* Lout, Pcg32& rng, const SpdCache* spdCache,
+                          GiCtx gi) const {
         double lam[hero::kHeroMax], invPdf[hero::kHeroMax], thr[hero::kHeroMax], L[hero::kHeroMax];
-        for (int i = 0; i < C; ++i) { lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = 1.0; L[i] = 0.0; }
-        bool secAlive = (C > 1);
-        bool specularArrival = true;
-        double contBsdfPdf = 0.0;
+        // Copy only the LIVE entries: a monochromatic sub-path spawned by the split fills
+        // only slot 0 of its lamIn/invPdfIn/thrIn, so reading all C would read
+        // indeterminate values (harmless while nUp==1 ignores them, but still UB).
+        const int nLive = secAlive ? C : 1;
+        for (int i = 0; i < nLive; ++i) {
+            lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = thrIn[i]; L[i] = 0.0;
+        }
+        for (int i = nLive; i < C; ++i) { lam[i] = 0.0; invPdf[i] = 0.0; thr[i] = 0.0; L[i] = 0.0; }
+        // Gather rays are bounce-capped (see giBounce) so a highly reflective lattice
+        // cannot turn one gather direction into a 60-deep ricochet.
+        const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
         Renderer mats; mats.diffraction = diffraction;
-        MediumStack stk;                 // dielectric priority (Beer-Lambert uses hero λ)
 
         auto finish = [&]() { for (int i = 0; i < C; ++i) Lout[i] = L[i]; };
         auto deHero = [&]() {            // terminate secondaries, boost hero ×C
@@ -792,8 +1380,9 @@ struct BackwardRenderer {
             secAlive = false;
         };
 
-        for (int b = 0; b < maxBounce; ++b) {
+        for (int b = bounce0; b < maxB; ++b) {
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
+            gi.bounce = b;                // see the scalar twin: mode W's per-vertex lattice
             Hit h = scene.closestHit(ray);
             double dSurf = h.valid ? h.t : 1e30;
 
@@ -826,30 +1415,109 @@ struct BackwardRenderer {
                 if (scene.sunCount > 0 && specularArrival)   // directly-viewed solar disc
                     for (int i = 0; i < nUp; ++i)
                         L[i] += thr[i] * scene.sunRadiance(ray.d, lam[i]) * invPdf[i];
+                // A GATHER ray that escaped the scene picks up `ambient` as the far-field
+                // fill. This is what makes -ambient and -gi compose instead of compete:
+                // the gather supplies the near field (occlusion + bleeding) and the
+                // constant supplies whatever lies beyond the geometry -- and in an empty
+                // scene every direction escapes, so the gather collapses exactly back to
+                // the flat `rho * ambient` term it replaced (no exposure step).
+                if (gi.depth && ambient > 0.0)
+                    for (int i = 0; i < nUp; ++i) L[i] += thr[i] * ambient;
                 finish(); return;
             }
 
             const Material* mp = &scene.mats[h.matId];
             if (mp->type == MatType::Mix) {
-                int child = mixResolveChild(scene, *mp, h, rng.uniform());
+                int child = whitted ? mixResolveDominant(scene, *mp, h)
+                                    : mixResolveChild(scene, *mp, h, rng.uniform());
                 if (child < 0) { finish(); return; }
                 mp = &scene.mats[child];
             }
             if (mp->type == MatType::Layered) {
-                // Wavelength-dependent Fresnel coat: de-hero and run the scalar layered
-                // handling on the hero channel.
-                deHero(); nUp = 1;
+                // Physical layered stack (specular coat over a weighted body). The coat
+                // interface is NOT dispersive in DIRECTION -- the sheen is a glossy lobe
+                // about the mirror direction and the body-lobe pick is a material index --
+                // so the ONLY λ dependence here is the scalar coat reflectance R(λ). That
+                // means the bundle can normally ride straight through carrying a per-λ
+                // weight, with no de-hero at all.
+                //
+                // Through v0.115.0 this de-hero'd UNCONDITIONALLY, which at -spp 1 collapsed
+                // every layered surface onto the bundle's single shared λ and rendered it
+                // saturated-monochromatic -- exactly the failure N1 fixed for glass, and the
+                // reason the viewer used to force 16 passes on any layered scene.
                 const Material& cm = *mp;
-                double R = layeredCoatReflectance(scene, cm, h, ray.d, lam[0]);
-                if (rng.uniform() < R) {
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
+                double Rl[hero::kHeroMax];
+                for (int i = 0; i < nUp; ++i)
+                    Rl[i] = layeredCoatReflectance(scene, cm, h, ray.d, lam[i]);
+                // Stochastic: ONE shared coat coin, compared per-λ. u is uniform, so
+                // P(u < R_i) == R_i exactly for every live λ -- common-random-number analog
+                // splitting, unbiased per λ with NO reweight needed (the probability IS the
+                // weight, as in the scalar twin). At nUp == 1 that is the scalar code
+                // verbatim: same single draw, same order, throughput untouched.
+                // Whitted: no coin at all, just the dominant branch weighted per λ.
+                const double uCoat = whitted ? 0.0 : rng.uniform();
+                const bool refl0 = whitted ? (Rl[0] >= 0.5) : (uCoat < Rl[0]);
+                bool agree = true;
+                for (int i = 1; i < nUp; ++i)
+                    if ((whitted ? (Rl[i] >= 0.5) : (uCoat < Rl[i])) != refl0) { agree = false; break; }
+                if (!agree) {
+                    // A genuinely CHROMATIC coat: a thin-film Airy stack, or a Fresnel coat
+                    // sitting right on mode W's R >= 0.5 dominant-branch threshold. Some λ
+                    // take the sheen while the rest enter the body, so one shared continuation
+                    // cannot serve them all. Fan out exactly like the split-at-dispersion case
+                    // below: each secondary re-enters THIS vertex as its own monochromatic
+                    // sub-path, makes its own coat decision, and lands in its own L[i] slot.
+                    //
+                    // Re-entering at bounce `b` (not b + 1) is safe because nUp > 1 implies an
+                    // EMPTY medium stack -- every dielectric entry de-heros or splits, so a
+                    // bundle wider than 1 is never inside glass -- which makes the
+                    // Beer-Lambert step at the top of the loop a no-op that cannot be
+                    // double-applied. closestHit is deterministic, so the sub-path lands on
+                    // this same vertex; the cost is one redundant trace on a rare path.
+                    for (int i = 1; i < nUp; ++i) {
+                        if (invPdf[i] == 0.0) continue;      // dead secondary (zero-mass λ bin)
+                        double sLam = lam[i], sInv = invPdf[i], sThr = thr[i];
+                        SpdCache sCache;                     // re-point at λ_i's COLUMN
+                        const SpdCache* sCp = nullptr;
+                        if (spdCache && spdCache->lam && spdCache->spd && i < spdCache->C) {
+                            sCache.lam = spdCache->lam + i;
+                            sCache.spd = spdCache->spd + i;
+                            sCache.C   = spdCache->C;
+                            sCp = &sCache;
+                        }
+                        double sub[hero::kHeroMax];
+                        radianceHeroLoop(scene, ray, stk, &sLam, &sInv, &sThr,
+                                         /*C=*/1, /*secAlive=*/false, specularArrival,
+                                         contBsdfPdf, b, sub, rng, sCp, gi);
+                        L[i] += sub[0];      // this wavelength's own estimate, own slot
+                        thr[i] = 0.0;        // now that sub-path's business, not ours
+                    }
+                    secAlive = false; nUp = 1;   // hero carries on alone, UNBOOSTED
+                }
+                if (refl0) {                     // coat sheen: every live λ reflects
+                    // Whitted only: the deterministic branch carries R as a WEIGHT (the
+                    // stochastic coin above already paid for itself). Stop only once the
+                    // WHOLE bundle is under the bailout, as in the Glossy case below.
+                    if (whitted) {
+                        for (int i = 0; i < nUp; ++i) thr[i] *= Rl[i];
+                        if (hero::maxOf(thr, nUp) <= kWhittedCutoff) { finish(); return; }
+                    }
+                    Vec3 o = whitted
+                                 ? whittedGlossyDir(reflect(ray.d, h.n),
+                                                    materialRoughness(scene, cm, h), gi.sIdx, b)
+                                 : sampleGlossy(reflect(ray.d, h.n),
+                                                materialRoughness(scene, cm, h), rng);
                     if (dot(o, h.n) <= 0) { finish(); return; }
                     ray = Ray{h.p + h.n * 1e-6, o};
                     specularArrival = true;
                     continue;
                 }
-                int child = mixPickChild(cm, rng.uniform());
-                if (child < 0) { finish(); return; }
+                if (whitted) {                   // body: every live λ enters the stack
+                    for (int i = 0; i < nUp; ++i) thr[i] *= 1.0 - Rl[i];
+                    if (hero::maxOf(thr, nUp) <= kWhittedCutoff) { finish(); return; }
+                }
+                int child = whitted ? mixDominantChild(cm) : mixPickChild(cm, rng.uniform());
+                if (child < 0) { finish(); return; }     // leftover slice absorbs
                 mp = &scene.mats[child];
             }
             const Material& m = *mp;
@@ -873,13 +1541,22 @@ struct BackwardRenderer {
                         if (s > 1.0) { rr /= s; rt /= s; }       // per-λ energy guard
                         rhoR[i] = rr; rhoT[i] = rt;
                     }
-                    neeLightHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng, spdCache);
+                    neeLightHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng);
                     Hit hb = h; hb.n = -h.n;                     // back hemisphere (transmit lobe)
-                    neeLightHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache);
+                    neeLightHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                    if (whitted) {   // both lobes gather, each into its own hemisphere
+                        if (giUseGather(gi)) {
+                            giGatherHero(scene, h,  rhoR, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
+                            giGatherHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
+                        } else if (ambient > 0.0) {
+                            for (int i = 0; i < nUp; ++i)
+                                L[i] += thr[i] * (rhoR[i] + rhoT[i]) * ambient;
+                        }
+                    }
                     if (directOnly) { finish(); return; }        // Whitted: no diffuse indirect
                     // Lobe pick + RR over the whole bundle (see the Diffuse case): the
                     // reflect/transmit probabilities are the per-lobe MAX over live λ, so no
@@ -929,12 +1606,26 @@ struct BackwardRenderer {
                         c[i] = (m.type == MatType::Filter) ? clamp01(transmitSlot(scene, m, h, lam[i]))
                                                            : clamp01(reflectSlot(scene, m, h, lam[i]));
                     const double q = hero::maxOf(c, nUp);
-                    if (rng.uniform() >= q) { finish(); return; }   // RR absorb (q == 0 always absorbs)
-                    for (int i = 0; i < nUp; ++i) thr[i] *= c[i] / q;
+                    if (whitted) {
+                        // Deterministic: carry every live λ's coefficient as weight (no
+                        // coin, no c_i/q reweight) and stop only when the whole bundle
+                        // has fallen under the bailout.
+                        for (int i = 0; i < nUp; ++i) thr[i] *= c[i];
+                        if (hero::maxOf(thr, nUp) <= kWhittedCutoff) { finish(); return; }
+                    } else {
+                        if (rng.uniform() >= q) { finish(); return; }   // RR absorb (q == 0 always absorbs)
+                        for (int i = 0; i < nUp; ++i) thr[i] *= c[i] / q;
+                    }
                     if (m.type == MatType::Mirror) {
                         ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                     } else if (m.type == MatType::Filter) {
                         ray = Ray{h.p + ray.d * 1e-6, ray.d};       // direction unchanged
+                    } else if (whitted) {
+                        // Glossy: the lobe off the deterministic lattice (mirror at sample 0).
+                        Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
+                                                  materialRoughness(scene, m, h), gi.sIdx, b);
+                        if (dot(o, h.n) <= 0) { finish(); return; }
+                        ray = Ray{h.p + h.n * 1e-6, o};
                     } else {
                         Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                         if (dot(o, h.n) <= 0) { finish(); return; }
@@ -949,11 +1640,67 @@ struct BackwardRenderer {
                 case MatType::Grating:
                 case MatType::HalfMirror:
                 case MatType::Fluorescent: {
-                    // Dispersive / wavelength-switching: terminate secondaries, then run
-                    // the shared scalar interaction on the (boosted) hero channel.
+                    // Dispersive / wavelength-switching: the outgoing direction (and, for a
+                    // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
+                    // cannot keep riding one shared direction past this interface.
+                    if (heroSplit && secAlive && nUp > 1) {
+                        // SPLIT-AT-DISPERSION: fan out instead of de-hero'ing. Each secondary
+                        // runs the SAME interaction with its OWN λ -- refracting along its own
+                        // Snell direction / diffracting into its own grating order -- and then
+                        // continues as an independent monochromatic sub-path from this vertex.
+                        // Its radiance lands in L[i], the slot for ITS wavelength, so the
+                        // caller's per-λ cieXYZ splat stays correctly attributed.
+                        //
+                        // No ×C boost anywhere: each of the C wavelengths now carries its own
+                        // unboosted estimate and the caller averages them (Lh[i]/C), whereas
+                        // de-hero boosts the lone survivor to stand in for all C. Both are
+                        // unbiased; this one is simply not collapsed.
+                        for (int i = 1; i < nUp; ++i) {
+                            if (invPdf[i] == 0.0) continue;   // dead secondary (zero-mass λ bin)
+                            // Sub-path state: mutable per-λ copies (interactMaterial takes
+                            // lambda/invPdf by reference -- a fluorescent Stokes shift rewrites
+                            // them) and a private medium stack, since sub-paths diverge here.
+                            double sLam = lam[i], sInv = invPdf[i], sThr = thr[i], sL = 0.0;
+                            bool sSpec = specularArrival;
+                            double sPdf = contBsdfPdf;
+                            MediumStack sStk = stk;
+                            Ray sRay = ray;
+                            // Re-point the emitter-SPD cache at wavelength i's COLUMN. The
+                            // table is emitter-major with stride C (spd[e*C + i]), so offsetting
+                            // the base by i and KEEPING the stride makes the sub-path's
+                            // spd[e*C + 0] read exactly emitter e at λ_i -- zero-copy, and
+                            // matches(&sLam, 1) still validates against lam[i]. Without this the
+                            // cache would silently hand the sub-path the HERO's SPD values.
+                            SpdCache sCache;
+                            const SpdCache* sCp = nullptr;
+                            if (spdCache && spdCache->lam && spdCache->spd && i < spdCache->C) {
+                                sCache.lam = spdCache->lam + i;
+                                sCache.spd = spdCache->spd + i;
+                                sCache.C   = spdCache->C;
+                                sCp = &sCache;
+                            }
+                            if (interactMaterial(scene, m, h, mats, sRay, sLam, sInv, sThr, sL,
+                                                 sSpec, sPdf, sStk, rng, sCp, gi)) {
+                                double sub[hero::kHeroMax];
+                                radianceHeroLoop(scene, sRay, sStk, &sLam, &sInv, &sThr,
+                                                 /*C=*/1, /*secAlive=*/false, sSpec, sPdf,
+                                                 b + 1, sub, rng, sCp, gi);
+                                sL += sub[0];
+                            }
+                            L[i] += sL;      // this wavelength's own estimate, own slot
+                            thr[i] = 0.0;    // it is now that sub-path's business, not ours
+                        }
+                        secAlive = false;    // hero carries on alone, UNBOOSTED
+                        if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0],
+                                              L[0], specularArrival, contBsdfPdf, stk, rng,
+                                              spdCache, gi)) { finish(); return; }
+                        break;
+                    }
+                    // Default policy: terminate secondaries, then run the shared scalar
+                    // interaction on the (boosted) hero channel.
                     deHero();
                     if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0], L[0],
-                                          specularArrival, contBsdfPdf, stk, rng, spdCache)) { finish(); return; }
+                                          specularArrival, contBsdfPdf, stk, rng, spdCache, gi)) { finish(); return; }
                     break;
                 }
                 case MatType::Diffuse:
@@ -961,9 +1708,20 @@ struct BackwardRenderer {
                     double rho[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)
                         rho[i] = clamp01(diffuseReflectance(scene, m, h, lam[i]));
-                    neeLightHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, spdCache);
+                    neeLightHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng);
+                    // The Whitted indirect-diffuse term. With -gi this is a real
+                    // single-bounce hemisphere gather (occlusion-aware and spectral); with
+                    // -gi 0 it falls back to POV-Ray's flat `ambient` -- physically a lie,
+                    // but without it a CLOSED room previews with black shadows, since
+                    // every non-key-lit surface there is lit purely by bounce.
+                    if (whitted) {
+                        if (giUseGather(gi))
+                            giGatherHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
+                        else if (ambient > 0.0)
+                            for (int i = 0; i < nUp; ++i) L[i] += thr[i] * rho[i] * ambient;
+                    }
                     if (directOnly) { finish(); return; }         // Whitted: no diffuse indirect
                     // Continuation RR over the WHOLE bundle: the survival probability is
                     // max_i rho_i, not the hero's own albedo, and every live λ reweights by
@@ -1011,9 +1769,9 @@ struct BackwardRenderer {
             for (int px = 0; px < film.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
                 for (long long s = 0; s < spp; ++s) {
+                    const uint64_t sIdx = sampleBase + (uint64_t)s;   // absolute sample index
                     Pcg32 rng;
-                    seedUnit(rng, (sampleBase + (uint64_t)s) * nPix + pixIdx,
-                             0xD1B54A32D192ED03ULL);
+                    seedUnit(rng, sIdx * nPix + pixIdx, 0xD1B54A32D192ED03ULL);
                     if (useHero) {
                         // One stratified base draw → hero + C-1 secondary wavelengths,
                         // all from the emission CDF (hero.h policy 1). The hero (index 0)
@@ -1021,7 +1779,13 @@ struct BackwardRenderer {
                         // and splat 0.
                         double lamA[hero::kHeroMax], invA[hero::kHeroMax];
                         double pdfA[hero::kHeroMax];
-                        if (!hero::sampleBundle(scene.emitSampler, rng.uniform(), C,
+                        // Whitted: the bundle's base coordinate comes off the progressive
+                        // deterministic sequence instead of the rng, so the C wavelengths
+                        // land on a FIXED lattice of the emission CDF. Without this the
+                        // mode would still be noise-free in geometry and shading and yet
+                        // visibly speckled in COLOUR, because λ was the last random draw.
+                        double uLam = whitted ? whittedLambdaU(sIdx) : rng.uniform();
+                        if (!hero::sampleBundle(scene.emitSampler, uLam, C,
                                                 lamA, pdfA)) continue;
                         // Fill the per-sample SPD table, then derive invA from it by
                         // replicating Scene::invPdfLambda on the cached values (same
@@ -1041,9 +1805,17 @@ struct BackwardRenderer {
                             invA[i] = (g > 0.0) ? scene.emitG / g : 0.0;
                         }
                         SpdCache spdCache{lamA, spdBuf.data(), C};
-                        Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
+                        double jx, jy;
+                        if (whitted) whittedSample(sIdx, jx, jy);
+                        else { jx = rng.uniform(); jy = rng.uniform(); }
+                        Ray ray = cam.genRay(px, py, jx, jy);
                         double Lh[hero::kHeroMax];
-                        radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache);
+                        // GiCtx carries the ABSOLUTE sample index down to the gather, which
+                        // rotates its direction lattice by it -- so, exactly like the
+                        // subpixel and wavelength lattices, the gather is progressive and
+                        // independent of how the budget was chunked.
+                        radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache,
+                                     GiCtx{0, sIdx});
                         for (int i = 0; i < C; ++i)
                             film.add(px, py, Vec3(cieX(lamA[i]), cieY(lamA[i]), cieZ(lamA[i]))
                                              * (Lh[i] / C));
@@ -1051,7 +1823,13 @@ struct BackwardRenderer {
                     }
                     // Sample lambda from the combined emission distribution g(lambda).
                     double pdf = 0.0;
-                    double lambda = scene.emitSampler.sample(rng, pdf);
+                    // Whitted: stratified λ, as in the hero path above. Note this scalar
+                    // path carries ONE wavelength per sample, so a deterministic spectral
+                    // preview here needs spp raised to cover the spectrum (the hero path,
+                    // which is the usual one, gets C=heroC of them per sample for free).
+                    double lambda = whitted
+                        ? scene.emitSampler.sampleAt(whittedLambdaU(sIdx), pdf)
+                        : scene.emitSampler.sample(rng, pdf);
                     if (pdf <= 0) continue;
                     // Fill the per-sample SPD table (C=1) and derive invPdfLambda from
                     // it, replicating Scene::invPdfLambda on the cached values (same
@@ -1073,12 +1851,17 @@ struct BackwardRenderer {
                         Ray ray; double wLens = 0.0;
                         if (!cam.genLensRay(px, py, jx, jy, u1, u2, lambda, ray, wLens))
                             continue;                       // clipped by an element / the stop
-                        double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache);
+                        double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache,
+                                            GiCtx{0, sIdx});
                         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens));
                         continue;
                     }
-                    Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
-                    double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache);
+                    double sjx, sjy;
+                    if (whitted) whittedSample(sIdx, sjx, sjy);
+                    else { sjx = rng.uniform(); sjy = rng.uniform(); }
+                    Ray ray = cam.genRay(px, py, sjx, sjy);
+                    double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache,
+                                        GiCtx{0, sIdx});
                     film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * L);
                 }
             }

@@ -1,0 +1,171 @@
+# APS-C mirrorless + fast 35 mm f/1.4 normal prime
+#
+# THE CAMERA IN THIS SCENE IS THE CAMERA YOU ARE LOOKING THROUGH. The GLB's own
+# optical axis and front-element vertex were solved from its geometry (tools/
+# camera_rig.py), and the mesh is placed so that vertex sits exactly on the render
+# camera's entrance pupil, pointing down +Z. So the body, the barrel and the finder
+# are all BEHIND the eye and can never appear in frame -- but they are still solid,
+# so the camera occludes the key light and casts its own shadow into its own
+# photograph. That shadow across the near bench is the proof the rig is real and not
+# a free-floating viewpoint.
+#
+# A white-bodied APS-C mirrorless with a short, fat, deeply-coated prime -- the
+# purple bloom on the front element in the asset's own preview is a multicoating
+# reflection. Body 120 mm wide (typical rangefinder-style mirrorless), which puts
+# 1.689 mm on a unit; the barrel then measures 58.7 mm across the front and 42 mm
+# long, i.e. a 35 mm f/1.4 with an oversized front group.
+#
+# APS-C is quoted as 23.4 x 15.6 mm (exactly 3:2; the usual 23.6 figure is not).
+# 35 mm on APS-C is a 52 mm-equivalent normal -- and at f/1.4 it is the shallowest
+# lens in the set, so this is the rig where the simulated variant differs most
+# from the analytic one: a fast lens is where real glass stops behaving ideally.
+#
+# --- solved placement (do not hand-edit; regenerate with tools/camera_rig.py) ----
+#   model bbox    [71.0632 46.2585 36.7277]  (120.0 mm wide -> scale 0.00168864)
+#   optical axis  [ 6.00e-05 -6.22e-04  1.00e+00]   (residual after the rotation below: 0.0000 deg)
+#   front vertex  [12.24343 -4.44471 25.36444]  -> world origin
+#   front rim     58.7 mm across
+#   the body sits 36.7 mm below its own axis, so the bench top is at y = -0.0367
+#     and the camera is RESTING on it (eye height above the bench = its real one)
+#
+# --- what this variant is --------------------------------------------------------
+# ANALYTIC rig -- mode A, the finite-lens forward physical camera. The aperture is a
+# real disc of radius focal/2N (12.50 mm here) and photons are splatted through it,
+# so the field of view and the depth of field are exactly right. What it does NOT have
+# is glass: the lens is an ideal thin element, so there is no spherical or chromatic
+# aberration, no distortion, no field curvature, and the blur discs are perfectly
+# uniform right into the corners.
+#
+# So this is the CONTROL. On this render the star row should be a row of clean points
+# all the way to the frame edge, and the bokeh row should be a row of identical round
+# discs including the outermost one. Compare against camrig_portable_sim.ftsl, which is
+# the same camera -- same focal length, same f-number, same sensor, same subject --
+# with the ideal element replaced by traced glass; every difference between the two
+# images is exactly what the glass did.
+#
+#   ftrace -in scenes/camrig_portable.ftsl -camera taking -time 900 \
+#          -window -keepwindow -interval 20  -checkpoint -o png/camrigs/portable.png
+#
+# The scene carries a second camera, "witness", an outside 3/4 view of the whole rig
+# so you can see the camera model that this photograph is being taken THROUGH:
+#
+#   ftrace -in scenes/camrig_portable.ftsl -camera witness -mode R -time 120 \
+#          -window -keepwindow -o png/camrigs/portable_witness.png
+
+scene { units meters  spectral 360 830 1 }
+
+# --- the bench ------------------------------------------------------------------
+# A checkered top, 45 mm squares, running away from the camera and meeting the
+# backdrop at z = 2.60. It is the continuous depth reference: the square size is
+# fixed, so how fast the squares shrink IS the focal length, and where they stop
+# resolving IS the depth of field. The camera is RESTING on this bench -- its own
+# base sits 36.7 mm below its own optical axis, which is why the top is at
+# y = -0.0367 and not some round number.
+pattern  "chk"      { type checker  size 0.045 }
+material "chk_pale" { type diffuse reflect rgb 0.74 0.71 0.66 }
+material "chk_dark" { type diffuse reflect rgb 0.11 0.11 0.13 }
+material "bench"    { type mix  layer "chk_pale" 0.5  layer "chk_dark" 0.5  weight_map pattern:chk }
+material "backdrop" { type diffuse reflect rgb 0.44 0.45 0.48 }
+quad { origin -2.20 -0.0367 -1.00   u 4.40 0 0   v 0 0 3.60   material bench }
+quad { origin -2.60 -0.0367 2.60    u 5.20 0 0   v 0 2.40 0   material backdrop }
+
+# --- the resolution charts -------------------------------------------------------
+# Three upright 120 x 140 mm cards on a fine 10 mm checker, standing on the bench and
+# facing the lens. The pale one at z = 1.00 m is the focus target; the other two are
+# 0.45 m and 0.95 m behind it, so how fast their checker mushes IS the depth of field.
+# Their lateral positions are solved so the three angular spans are disjoint from each
+# other and from the star row, hence the odd x values -- with the eye at bench height,
+# an object LYING on the bench reads as a smear on the horizon, so the subject stands.
+pattern "chkfine" { type checker  size 0.010 }
+material "card_dark" { type diffuse reflect rgb 0.05 0.05 0.06 }
+material "card_pale0" { type diffuse reflect rgb 0.86 0.84 0.8 }
+material "card0" { type mix  layer "card_pale0" 0.5  layer "card_dark" 0.5  weight_map pattern:chkfine }
+material "card_pale1" { type diffuse reflect rgb 0.3 0.5 0.62 }
+material "card1" { type mix  layer "card_pale1" 0.5  layer "card_dark" 0.5  weight_map pattern:chkfine }
+material "card_pale2" { type diffuse reflect rgb 0.62 0.44 0.26 }
+material "card2" { type mix  layer "card_pale2" 0.5  layer "card_dark" 0.5  weight_map pattern:chkfine }
+quad { origin 0.0400 -0.0367 1.000   u 0 0.140 0   v 0.120 0 0   material card0 }
+quad { origin -0.1870 -0.0367 1.450   u 0 0.140 0   v 0.120 0 0   material card1 }
+quad { origin 0.4000 -0.0367 1.950   u 0 0.140 0   v 0.120 0 0   material card2 }
+
+# --- the star row (in focus): the point-spread-function readout ------------------
+# 3 mm pinpoints floating AT the focus distance and exactly ON the optical axis plane,
+# 37 mm over the bench, fanned sideways across the whole frame. An in-focus
+# point source images to the lens's PSF, so this row is a star test: the analytic rig's
+# ideal element collapses every one of them to a few pixels no matter how far off axis,
+# while traced glass flares the outer ones into coma and fringes them with lateral
+# colour. y = 0 makes the centre star the true ON-AXIS reference and displaces the
+# rest purely laterally, so the row is a clean sweep of field angle; it also puts them
+# above the bench/backdrop horizon, read against flat grey instead of bench glare.
+# Count the ones in frame and you have read the field of view directly.
+light sphere { center 0.000 0.000 1.000  radius 0.0015  spd blackbody 5500 }
+light sphere { center 0.190 0.000 1.000  radius 0.0015  spd blackbody 5500 }
+light sphere { center -0.190 0.000 1.000  radius 0.0015  spd blackbody 5500 }
+light sphere { center 0.380 0.000 1.000  radius 0.0015  spd blackbody 5500 }
+light sphere { center -0.380 0.000 1.000  radius 0.0015  spd blackbody 5500 }
+light sphere { center 0.570 0.000 1.000  radius 0.0015  spd blackbody 5500 }
+light sphere { center -0.570 0.000 1.000  radius 0.0015  spd blackbody 5500 }
+light sphere { center 0.780 0.000 1.000  radius 0.0015  spd blackbody 5500 }
+light sphere { center -0.780 0.000 1.000  radius 0.0015  spd blackbody 5500 }
+
+# --- the bokeh row (1.32 m behind focus): the aperture readout -------------------
+# The same pinpoints, warm and 6 mm across, far enough back to be thoroughly defocused.
+# Blur-disc diameter on the sensor is A*f*(u-uf)/(u*(uf-f)), pure entrance pupil:
+# ~5 px at 30 mm f/3.5, ~22 px at 35 mm f/2.0. Under the simulated rig the outer
+# ones additionally go cat's-eye, clipped at both ends of the barrel. They sit high
+# enough (y = 0.32) that no resolution card can eclipse one on any camera in the set.
+light sphere { center 0.000 0.320 2.320  radius 0.0030  spd blackbody 2700 }
+light sphere { center 0.190 0.320 2.320  radius 0.0030  spd blackbody 2700 }
+light sphere { center -0.190 0.320 2.320  radius 0.0030  spd blackbody 2700 }
+light sphere { center 0.400 0.320 2.320  radius 0.0030  spd blackbody 2700 }
+light sphere { center -0.400 0.320 2.320  radius 0.0030  spd blackbody 2700 }
+light sphere { center 0.620 0.320 2.320  radius 0.0030  spd blackbody 2700 }
+light sphere { center -0.620 0.320 2.320  radius 0.0030  spd blackbody 2700 }
+light sphere { center 0.860 0.320 2.320  radius 0.0030  spd blackbody 2700 }
+light sphere { center -0.860 0.320 2.320  radius 0.0030  spd blackbody 2700 }
+
+# --- lighting -------------------------------------------------------------------
+# BOTH lights sit BEHIND the eye (z < 0), which is forced by two independent things:
+#
+#   * the resolution cards face -Z, i.e. they face the lens. A light in front of them
+#     lights their BACKS, and all three would render as flat silhouettes lit only by
+#     bounce. Anything meant to light the subject has to be behind the camera.
+#   * the camera's OWN SHADOW is the whole point of the rig -- the body is behind the
+#     eye and can never be in frame, but it is still solid. A key in FRONT throws that
+#     shadow backwards, behind the camera, where no one can see it. Only a key behind
+#     and above throws it FORWARD, across the near bench and into the frame.
+#
+# The key is placed by solving that shadow: the ray from the key over the body's top
+# edge meets the bench about 0.5 m in front of the lens and ~13 deg off axis, inside
+# even the narrowest frame here. Being behind the eye, neither light can be stared at
+# directly by the taking camera, and both are outside the witness camera's frame too.
+light sphere { center -0.25 0.35 -1.10  radius 0.130  spd blackbody 5200 }
+light sphere { center  0.85 0.55 -0.20  radius 0.100  spd blackbody 4200 }
+
+# --- the camera itself -----------------------------------------------------------
+# The GLB carries its own pbrMetallicRoughness materials, so the FTSL `material` line
+# is only a FALLBACK for primitives that have none (it would take over entirely under
+# `import_materials no`).
+material "camfallback" { type diffuse  reflect rgb 0.38 0.38 0.42 }
+mesh "body" {
+    file "cameras/portable_camera.glb"
+    material camfallback
+    scale 0.0016886369
+    rotate -0.03562 -0.00344 0.00000
+    translate -0.020672 0.007479 -0.042837
+}
+
+camera "taking" {
+    eye 0 0 0   look_at 0 0 1   up 0 1 0
+    mode A
+    lens 35   fstop 1.4   focus 1.000
+    film { res 1200 800  size 23.4 15.6 }
+}
+
+# An outside view of the rig: the camera model on the bench, with the still life it
+# is photographing behind it. Pinhole, so nothing here is a claim about the optics.
+camera "witness" {
+    eye -0.80 0.40 -0.62   look_at 0.02 0.0033 0.58   up 0 1 0
+    fov_y 42   mode R
+    film { res 1200 800 }
+}

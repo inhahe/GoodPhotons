@@ -15,6 +15,9 @@ from loom import (  # noqa: E402
     Clock, Cache, Const, Sine, rotations, vec,
     Scene, Material, Camera, Isosurface, Room, gyroid_surface, phase_drift,
     affine, Affine,
+    SliceField, ND_FIELDS, nd_grad_bound,
+    gyroid, schwarz_p, schwarz_d, neovius,
+    gyroid_n, schwarz_p_n, schwarz_d_n, neovius_n,
 )
 from loom.ftsl_emit import EmitCtx  # noqa: E402
 
@@ -240,6 +243,156 @@ def test_scene_check_cycles_ok():
     s.check_cycles()  # must not raise
     txt = s.emit(Clock.at_frame(3, 24), Cache())
     assert 'gyroid = isosurface' in txt
+
+
+# ---------------------------------------------------------------------------
+# N-D slice fields (a genuinely >=4-input field seen through an N-D rotation)
+# ---------------------------------------------------------------------------
+
+def _ndeval(expr: str, x: float, y: float, z: float) -> float:
+    """Evaluate an emitted ftsl field expression numerically (the subset we emit —
+    sin/cos, + - * and parens — is also valid Python)."""
+    return eval(expr, {"__builtins__": {}},  # noqa: S307
+                {"sin": math.sin, "cos": math.cos, "x": x, "y": y, "z": z})
+
+
+def test_nd_templates_reduce_to_the_3d_forms():
+    c = ("x", "y", "z")
+    assert gyroid_n(c) == gyroid(*c)
+    assert schwarz_p_n(c) == schwarz_p(*c)
+    assert neovius_n(c) == neovius(*c)
+    # D's terms are the same set, emitted in a different order
+    assert sorted(schwarz_d_n(c).split("+")) == sorted(schwarz_d(*c).split("+"))
+
+
+def test_nd_templates_scale_with_dimension():
+    c4 = ("a", "b", "c", "d")
+    assert gyroid_n(c4).count("sin(") == 4        # cyclic: one term per axis
+    assert schwarz_p_n(c4).count("cos(") == 4
+    assert schwarz_d_n(c4).count("*") == 8 * 3    # 2^(n-1) terms of n factors
+    assert set(ND_FIELDS) == {"gyroid", "schwarz_p", "schwarz_d", "neovius"}
+
+
+def test_slicefield_matches_direct_nd_evaluation():
+    ang, w = 0.7, 1.3
+    sf = SliceField("gyroid", dim=4, rotation=rotations(4, [(2, 3, ang)]),
+                    offset=[0.0, 0.0, 0.0, w])
+    expr = sf.build("x", "y", "z", EmitCtx(clock=Clock(t=0.0), cache=Cache()))
+    px, py, pz = 0.31, -0.72, 1.11
+    # reference: embed the slice point in 4-D, rotate it, evaluate the 4-D gyroid
+    c, s = math.cos(ang), math.sin(ang)
+    C = [px, py, c * pz - s * w, s * pz + c * w]
+    ref = sum(math.sin(C[i]) * math.cos(C[(i + 1) % 4]) for i in range(4))
+    # emitted coefficients carry ftsl_emit.fmt's 6 significant digits
+    assert abs(_ndeval(expr, px, py, pz) - ref) < 1e-6
+
+
+def test_slicefield_at_dim3_is_the_plain_field():
+    sf = SliceField("gyroid", dim=3)
+    expr = sf.build("x", "y", "z", EmitCtx(clock=Clock(t=0.0), cache=Cache()))
+    for p in ((0.2, 0.4, 0.9), (-1.3, 2.2, 0.05)):
+        assert abs(_ndeval(expr, *p) - _ndeval(gyroid("x", "y", "z"), *p)) < 1e-12
+
+
+def test_slicefield_extra_axis_is_a_real_input():
+    # The point of N-D: rotating in a plane that touches an axis OUTSIDE the slice
+    # must change the surface, not merely tilt it.  A rotation confined to the slice
+    # (0,1) at the same angle is an affine remap and preserves the value at a point
+    # that the rotation fixes; the (2,3) one does not.
+    ctx = EmitCtx(clock=Clock(t=0.0), cache=Cache())
+    off = [0.0, 0.0, 0.0, 1.1]
+    inside = SliceField("gyroid", dim=4, rotation=rotations(4, [(0, 1, 0.6)]),
+                        offset=off).build("x", "y", "z", ctx)
+    outside = SliceField("gyroid", dim=4, rotation=rotations(4, [(2, 3, 0.6)]),
+                         offset=off).build("x", "y", "z", ctx)
+    flat = SliceField("gyroid", dim=4, offset=off).build("x", "y", "z", ctx)
+    p = (0.0, 0.0, 0.83)          # on the (0,1) rotation's fixed axis
+    assert abs(_ndeval(inside, *p) - _ndeval(flat, *p)) < 1e-12
+    assert abs(_ndeval(outside, *p) - _ndeval(flat, *p)) > 1e-3
+
+
+def test_nd_grad_bound_is_conservative():
+    # max_gradient must bound the real slope or the sphere-marcher tunnels.  The
+    # per-component bounds are deliberately tight (gyroid's sqrt(2) is attained to
+    # within 0.1%), so sample the *sliced* gradient densely in several dims.
+    freq = 2.0
+    for name in sorted(ND_FIELDS):
+        for dim in (3, 4, 5):
+            planes = [(1, dim - 1, 0.9), (0, 2, 0.4)]
+            sf = SliceField(name, dim=dim, rotation=rotations(dim, planes),
+                            offset=[0.0, 0.0, 0.0, 0.7, 1.3][:dim])
+            expr = sf.build(*(f"({freq}*{v})" for v in "xyz"),
+                            ctx=EmitCtx(clock=Clock(t=0.0), cache=Cache()))
+            bound = sf.grad_bound(freq)
+            assert abs(bound - nd_grad_bound(name, dim, freq)) < 1e-12
+            h, worst = 1e-5, 0.0
+            for k in range(200):
+                p = [math.sin(k * 1.7) * 2.0, math.cos(k * 2.3) * 2.0,
+                     math.sin(k * 0.9) * 2.0]
+                g = []
+                for ax in range(3):
+                    q = list(p); q[ax] += h; hi = _ndeval(expr, *q)
+                    q = list(p); q[ax] -= h; lo = _ndeval(expr, *q)
+                    g.append((hi - lo) / (2 * h))
+                worst = max(worst, math.sqrt(sum(c * c for c in g)))
+            assert worst <= bound * (1 + 1e-6), (name, dim, worst, bound)
+
+
+def test_nd_grad_bound_tracks_the_tightened_component_bounds():
+    # Regression pins: these are the *proved* per-coordinate bounds (see the template
+    # docstrings), not the naive term counts they replaced (2, and 2**(n-1)).
+    assert abs(nd_grad_bound("gyroid", 4) - math.sqrt(2.0) * 2.0) < 1e-12
+    assert abs(nd_grad_bound("schwarz_p", 4) - 2.0) < 1e-12
+    assert abs(nd_grad_bound("schwarz_d", 5) - 4.0 * math.sqrt(5.0)) < 1e-12
+    assert abs(nd_grad_bound("neovius", 3) - 7.0 * math.sqrt(3.0)) < 1e-12
+    # freq and the pre-transform's largest singular value both scale it linearly
+    assert abs(nd_grad_bound("gyroid", 4, freq=3.0, sigma=0.5)
+               - 1.5 * math.sqrt(2.0) * 2.0) < 1e-12
+
+
+def test_slicefield_animates_and_wraps_seamlessly():
+    turn = rotations(4, [(0, 2, Sine(cycles=1, amp=math.pi)),
+                         (1, 3, Sine(cycles=1, amp=math.pi))])
+    iso = Isosurface(SliceField("gyroid", dim=4, rotation=turn,
+                                offset=[0.0, 0.0, 0.0, 1.1]),
+                     freq=1.0, drift=vec(phase_drift(1.0), 0.0, 0.0), material="m")
+    a0 = _emit(iso, Clock.at_frame(0, 30))
+    amid = _emit(iso, Clock.at_frame(11, 30))
+    awrap = _emit(iso, Clock.at_frame(30, 30))
+    assert a0 != amid, "an N-D rotation should morph the surface over the loop"
+    assert a0 == awrap, "loop wrap must reproduce frame 0 exactly (seamless)"
+    assert "+-" not in awrap and "*-" not in awrap
+
+
+def test_slicefield_params_join_the_dag():
+    turn = rotations(5, [(2, 4, Sine(cycles=1, amp=math.pi))])
+    sf = SliceField("schwarz_p", dim=5, rotation=turn,
+                    offset=[0.0, 0.0, 0.0, Const(0.5), 1.0])
+    iso = Isosurface(sf, freq=1.0, material="m", name="nd")
+    roots = iso.roots()
+    assert any(r is sf.offset for r in roots), "slice offset must be a DAG root"
+    assert len(roots) >= 25, "the 5x5 rotation entries must be DAG roots too"
+    s = Scene(Camera(eye=(0, 0, 5), look_at=(0, 0, 0), res=(16, 16)))
+    s.add(Material("m", "diffuse", reflect=0.7), iso)
+    s.check_cycles()
+    assert "nd = isosurface" in s.emit(Clock.at_frame(3, 24), Cache())
+
+
+def test_slicefield_rejects_bad_shapes():
+    for kw in (dict(dim=2), dict(dim=4, rotation=rotations(3, [(0, 1, 0.2)])),
+               dict(dim=4, offset=[0.0, 0.0, 0.0])):
+        try:
+            SliceField("gyroid", **kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"SliceField({kw}) should have been rejected")
+    try:
+        SliceField("nope", dim=4)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown N-D field name should raise")
 
 
 def _run_all():

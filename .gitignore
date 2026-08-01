@@ -7,6 +7,10 @@
 /build_asan/
 /build_plain/
 /build_prof/
+# CPU-only tree (scraps/build_cpu.bat, configured with an empty CMAKE_CUDA_COMPILER).
+# Exists so mode-W work can be built and tested while a long loom render holds
+# build_cuda2/bin/ftrace.exe open and blocks relinking it.
+/build_cpu/
 /out/
 # ftrace.exe copied into the repo root by build.bat (build artifact). A RelWithDebInfo
 # binary copied there for debugging drags its .pdb along, so ignore that too.

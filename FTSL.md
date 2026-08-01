@@ -121,7 +121,7 @@ scene { units meters  spectral 360 830 1 }
 |---|---|---|---|
 | `units` | `meters`/`m`, `centimeters`/`cm`, `millimeters`/`mm`, `inches`/`in`, `feet`/`ft` | `meters` | all authored **lengths/positions** are scaled to internal metres at load time |
 | `spectral` | `<lo> <hi> <binWidth>` | `360 830 1` | only the **bin width** is applied; the engine range is fixed at 360–830 nm (a warning prints if `lo/hi` differ) |
-| `default_mode` | a mode letter (`A`/`B`/`C`/`D`/`U`/`M`/`R`/`P`/…) | *(none)* | the render mode used when nothing else picks one. Resolution order: `-mode` (CLI) → a camera's own `mode` → `default_mode` → built-in `B` |
+| `default_mode` | a mode letter (`A`/`B`/`C`/`D`/`U`/`M`/`R`/`W`/`P`/…) | *(none)* | the render mode used when nothing else picks one. Resolution order: `-mode` (CLI) → a camera's own `mode` → `default_mode` → built-in `B`. `W` is not a transport mode of its own — the loader rewrites it to `R` and switches on the deterministic Whitted estimators for the whole run (a CLI `-mode` still overrides it) |
 | `fps` | `<n>` | *(none)* | default playback rate for flyby animations, read by assembly tooling (e.g. `showcase_flyby.py` when `--fps` is omitted). Overridable per-flyby with `fps <n>` on the `camera_curve`/`camera_path`/`camera_orbit` block. Playback hint only — does not affect rendering |
 
 Directions (`up`, `normal`, `dir`, `axis`) are **not** unit-scaled — only points and
@@ -1083,7 +1083,32 @@ upsampled to a reflectance spectrum, `metallicFactor ≥ 0.5` → a glossy (meta
 BSDF tinted by the base color, else diffuse, with `roughnessFactor` as the lobe
 width. Add `import_materials no` to ignore glTF's materials and paint every
 primitive with the block's FTSL `material` instead. The block `material` is always
-the fallback for primitives that carry no material. *Not supported* (see
+the fallback for primitives that carry no material.
+
+`skip_material <substr>[,<substr>…]` **drops** every primitive whose glTF material
+*name* contains one of the given substrings (case-insensitive). Asset-store models
+routinely bundle a backdrop into the same file as the subject — a ground plane, a
+studio sweep, a display pedestal — and there is no way to subtract geometry after
+it is loaded, so the filter has to run at load time. The loader prints
+`(skip_material dropped N prims)` so you can confirm it matched something.
+
+To list several substrings, **comma-join them or repeat the statement** — the two
+forms are unioned. A *space*-separated list does not work: the parser starts a new
+statement at the second bareword, so `skip_material ground backdrop` would filter on
+`ground` only and warn about an unknown key `backdrop`.
+
+```
+mesh "cam" {
+    file "cameras/cinema_camera.glb"
+    material fallback
+    skip_material ground,backdrop   # this asset ships its own floor plane
+    # equivalently:
+    #   skip_material ground
+    #   skip_material backdrop
+}
+```
+
+Works in `mesh_asset` too. *Not supported* (see
 known-issues): textures, KHR extensions (transmission/clearcoat/…), skinning,
 morph targets, sparse accessors, animation, and non-triangle primitives (skipped).
 
@@ -1101,6 +1126,7 @@ mesh_asset "ball" {           # load ONCE into local space (no world transform)
     uv use_mesh               # optional: read OBJ vt
     usemtl use_names          # optional: per-usemtl-group material by name
     import_materials no       # optional (glTF): ignore glTF materials
+    skip_material ground      # optional (glTF): drop prims by material name
 }
 
 mesh_instance {               # cheap placement of a named asset
@@ -1150,10 +1176,15 @@ The root is **exactly one** leaf or CSG combinator (wrap multiple shapes in a
 down the tree.
 
 ### 10.1 Leaves
+
+`center <x y z>` is accepted on **every** leaf (it is folded into the leaf transform), as
+are `translate` / `rotate` / `scale`. Note `center` is applied *inside* the rotation and
+`translate` *outside* it, so to rotate a leaf in place, position it with `translate`.
+
 | leaf | params |
 |---|---|
-| `sphere` | `center` `radius`(1) |
-| `ellipsoid` | `center` `radius <rx ry rz>` |
+| `sphere` | `radius`(1) |
+| `ellipsoid` | `radius <rx ry rz>` |
 | `box` | `size <x y z>`(1,1,1) `round`(0 corner radius) |
 | `torus` | `major`(1) `minor`(0.25) |
 | `cylinder` | `radius`(0.5) `height`(1) — axis = local y |
@@ -1531,7 +1562,7 @@ camera "cam" {
 | `fov_y` | 40 | vertical FOV in degrees |
 | `aperture` | 0.02 | thin-lens radius (metres) |
 | `focus` | 0 (∞) | focus distance |
-| `mode` | inherit CLI | `A` finite-lens forward splat, `B` pinhole splat, `C` finite-aperture catch, `R` backward reference, `D` BDPT |
+| `mode` | inherit CLI | `A` finite-lens forward splat, `B` pinhole splat, `C` finite-aperture catch, `R` backward reference, `W` deterministic (POV-Ray-style) preview — mode `R` with fixed quadratures instead of random draws, noise-free at 1 spp, `D` BDPT |
 | `lens <mm>` | — | focal length; sets fov_y = 2·atan(filmH/2f); overrides `fov_y` |
 | `fstop <N>` | — | aperture radius = focal/2N; seats film at image distance for A/C DoF |
 | `zoom <x>` | 1 | multiplies focal length (x>1 tele/narrower) |

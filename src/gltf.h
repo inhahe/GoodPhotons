@@ -223,10 +223,13 @@ inline Affine nodeLocalAffine(const minijson::Value& node) {
 
 // Load a glTF (.gltf) or GLB (.glb) into `s` as world-space triangles placed by `xf`.
 // `fallbackMat` is used for primitives lacking a material (or all primitives when
-// `importMaterials` is false). Returns the number of triangles added (0 on failure,
+// `importMaterials` is false). `skipMaterials` drops every primitive whose glTF
+// material NAME contains one of the given substrings (case-insensitive) -- see the
+// filter block below for why. Returns the number of triangles added (0 on failure,
 // with a message in `err`). Call before Scene::build().
 inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& xf,
-                    bool importMaterials, std::string& err) {
+                    bool importMaterials, std::string& err,
+                    const std::vector<std::string>& skipMaterials = {}) {
     using namespace gltfimpl;
     std::string spath(path);
     std::vector<uint8_t> file;
@@ -317,6 +320,32 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
         }
     }
 
+    // --- material-name skip filter --------------------------------------------------
+    // Asset-store GLBs routinely bundle a backdrop with the subject -- a ground plane,
+    // a studio sweep, a display pedestal -- as just another primitive of the same file.
+    // There is no way to subtract geometry after the fact, so a scene that wants only
+    // the subject has to drop those primitives at LOAD time. Matched case-insensitively
+    // as a SUBSTRING of the glTF material's `name`, and done independently of
+    // `importMaterials` because the names are in the document either way.
+    std::vector<char> matSkip;
+    int skippedByMat = 0;
+    if (!skipMaterials.empty()) {
+        if (const minijson::Value* mats = doc.root.find("materials"); mats && mats->isArray()) {
+            matSkip.assign(mats->arr.size(), 0);
+            for (size_t i = 0; i < mats->arr.size(); ++i) {
+                const minijson::Value* nm = mats->arr[i].find("name");
+                if (!nm || !nm->isString()) continue;
+                std::string lower = nm->str;
+                for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+                for (const std::string& pat : skipMaterials) {
+                    std::string p = pat;
+                    for (char& c : p) c = (char)std::tolower((unsigned char)c);
+                    if (!p.empty() && lower.find(p) != std::string::npos) { matSkip[i] = 1; break; }
+                }
+            }
+        }
+    }
+
     // --- materials: map each glTF material index -> a scene material id ------------
     std::vector<int> matMap;   // gltf material index -> scene mat id
     if (importMaterials) {
@@ -387,7 +416,11 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             bool hasN = (nrmAcc >= 0) && readAccessorFloat(doc, nrmAcc, nrm, nc) && nc >= 3;
             bool hasUV = (uvAcc >= 0) && readAccessorFloat(doc, uvAcc, uv, uc) && uc >= 2;
             size_t vcount = pos.size() / pc;
-            int matId = resolveMat(prim.intAt("material", -1));
+            int gltfMat = prim.intAt("material", -1);
+            if (gltfMat >= 0 && gltfMat < (int)matSkip.size() && matSkip[gltfMat]) {
+                ++skippedByMat; continue;   // `skip_material` -- bundled backdrop, not the subject
+            }
+            int matId = resolveMat(gltfMat);
 
             auto vertPos = [&](uint32_t vi) {
                 return world.apply(Vec3{pos[vi*pc+0], pos[vi*pc+1], pos[vi*pc+2]});
@@ -462,9 +495,12 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
         for (size_t i = 0; i < meshes->arr.size(); ++i) emitMesh((int)i, xf);
     }
 
-    std::printf("loadGltf: %s -> %d tris%s%s\n", path, added,
+    char skipNote[64] = {0};
+    if (skippedByMat)
+        std::snprintf(skipNote, sizeof skipNote, " (skip_material dropped %d prims)", skippedByMat);
+    std::printf("loadGltf: %s -> %d tris%s%s%s\n", path, added,
                 (importMaterials && !matMap.empty()) ? " [glTF materials]" : "",
-                skippedNonTri ? " (skipped non-triangle primitives)" : "");
+                skippedNonTri ? " (skipped non-triangle primitives)" : "", skipNote);
     if (added == 0 && err.empty()) err = "no triangles loaded (unsupported primitive layout?)";
     return added;
 }

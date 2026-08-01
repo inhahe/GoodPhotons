@@ -14,8 +14,15 @@ flows.  A *phase drift* that advances by an integer multiple of ``2*pi`` across 
 loop returns the field bit-for-bit to its start (``sin`` is ``2*pi``-periodic), so
 the animation is seamless — the same discipline as every other loom loop.
 
-A genuinely morphing (topology-changing) surface needs a >=4-input field, which
-ftrace cannot evaluate directly; that is the marching-cubes path (M7, deferred).
+A genuinely morphing (topology-changing) surface needs a >=4-input field.  It does
+**not** need meshing: :class:`SliceField` supplies the N-D TPMS templates
+(:func:`gyroid_n` and friends, each reducing *exactly* to its 3-D form at ``n == 3``)
+and reads them through an animatable N-D rotation, then slices back to 3-D.  Because
+every N-D coordinate is a *linear form in x/y/z* (the slice hyperplane's Jacobian
+baked per frame), the whole thing stays a plain ``expr`` isosurface that ftrace
+sphere-traces natively — so a real 4-D/5-D rotation renders on the existing path.
+The extra slice axes feed genuine extra field inputs, so the surface reconnects and
+changes topology instead of merely tilting.
 """
 
 from __future__ import annotations
@@ -68,6 +75,101 @@ FIELDS = {
     "schwarz_d": schwarz_d,
     "neovius": neovius,
 }
+
+
+# ---------------------------------------------------------------------------
+# True N-D generalizations of the same four surfaces
+#
+# Each takes a list of ``n`` coordinate expression strings and returns the field
+# formula.  At ``n == 3`` every one reduces to exactly the 3-D form above (same
+# terms), so raising the dimension is a strict extension, not a different surface.
+# ---------------------------------------------------------------------------
+
+# An N-D field template: coords -> field expression string.
+NDFieldFn = Callable[[Sequence[str]], str]
+
+
+def _nd_check(coords: Sequence[str]) -> int:
+    n = len(coords)
+    if n < 2:
+        raise ValueError("an N-D field needs at least 2 coordinates")
+    return n
+
+
+def gyroid_n(coords: Sequence[str]) -> str:
+    """N-D Schoen gyroid: the cyclic sum ``sum_i sin(c_i) * cos(c_{i+1})``.
+
+    At ``n == 3`` this is ``sin x cos y + sin y cos z + sin z cos x`` — the classic
+    gyroid.  ``c_i`` occurs in exactly two terms, so
+    ``df/dc_i = cos(c_i)*cos(c_{i+1}) - sin(c_i)*sin(c_{i-1}) = a*cos(c_i) + b*sin(c_i)``
+    with ``|a|,|b| <= 1``; that is a single sinusoid of amplitude ``sqrt(a^2+b^2)``, so the
+    per-coordinate gradient bound is **sqrt(2)**, not 2 — the two terms can never
+    saturate together."""
+    n = _nd_check(coords)
+    return "+".join(f"sin({coords[i]})*cos({coords[(i + 1) % n]})" for i in range(n))
+
+
+def schwarz_p_n(coords: Sequence[str]) -> str:
+    """N-D Schwarz P: ``sum_i cos(c_i)``.  Per-coordinate gradient bound 1."""
+    _nd_check(coords)
+    return "+".join(f"cos({c})" for c in coords)
+
+
+def schwarz_d_n(coords: Sequence[str]) -> str:
+    """N-D Schwarz D: the sum of all ``sin``/``cos`` products with an **odd** number
+    of sines.  At ``n == 3`` that is ``sss + scc + csc + ccs`` — the classic D
+    surface.  Costs ``2^(n-1)`` terms, so keep ``n`` small.
+
+    Gradient: splitting on slot ``i`` gives ``df/dc_i = cos(c_i)*E - sin(c_i)*O`` where
+    ``E``/``O`` sum the even/odd-sine products of the *other* ``n-1`` coordinates.  Since
+    ``E+O = prod(cos+sin)`` and ``E-O = prod(cos-sin)`` are each bounded by
+    ``2^((n-1)/2)``, ``E^2+O^2 = ((E+O)^2+(E-O)^2)/2 <= 2^(n-1)``, and Cauchy-Schwarz
+    gives the per-coordinate bound ``sqrt(E^2+O^2) <= 2^((n-1)/2)`` — exponentially
+    tighter than the naive term count ``2^(n-1)``."""
+    n = _nd_check(coords)
+    terms = []
+    for mask in range(1 << n):
+        if bin(mask).count("1") % 2 == 1:
+            terms.append("*".join(
+                f"{'sin' if (mask >> i) & 1 else 'cos'}({coords[i]})" for i in range(n)))
+    return "+".join(terms)
+
+
+def neovius_n(coords: Sequence[str]) -> str:
+    """N-D Neovius: ``3*sum_i cos(c_i) + 4*prod_i cos(c_i)``.  Per-coordinate
+    gradient bound 7."""
+    _nd_check(coords)
+    csum = "+".join(f"cos({c})" for c in coords)
+    cprod = "*".join(f"cos({c})" for c in coords)
+    return f"3*({csum})+4*{cprod}"
+
+
+ND_FIELDS: dict = {
+    "gyroid": gyroid_n,
+    "schwarz_p": schwarz_p_n,
+    "schwarz_d": schwarz_d_n,
+    "neovius": neovius_n,
+}
+
+# |df/dc_i| bounds, one per named N-D template (see each docstring).
+_ND_COMP_GRAD = {
+    "gyroid": lambda n: math.sqrt(2.0),
+    "schwarz_p": lambda n: 1.0,
+    "schwarz_d": lambda n: 2.0 ** ((n - 1) / 2.0),
+    "neovius": lambda n: 7.0,
+}
+
+
+def nd_grad_bound(field: str, dim: int, freq: float = 1.0, sigma: float = 1.0) -> float:
+    """A rigorous Lipschitz bound for a sliced N-D field, for ``max_gradient``.
+
+    The emitted field is ``F(A·p + k)`` with ``A`` the ``dim x 3`` slice Jacobian, so
+    ``|grad_p| <= sigma_max(A) * |grad_c F| <= sigma * freq * bound_i * sqrt(dim)``.
+    ``sigma`` is the largest singular value of the (unit-frequency) 3-D pre-transform
+    — 1 for a pure rotation, and still 1 for a skew that only *shrinks* an axis."""
+    if field not in _ND_COMP_GRAD:
+        raise ValueError(f"unknown N-D field {field!r} (have {sorted(ND_FIELDS)})")
+    return float(sigma) * float(freq) * _ND_COMP_GRAD[field](int(dim)) * math.sqrt(int(dim))
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +475,109 @@ class Room(Element):
                 if saved_name is not None:
                     c.name = saved_name
         return "\n\n".join(blocks)
+
+
+class SliceField:
+    """A genuinely N-input field read through an animatable N-D rotation, sliced
+    back to 3-D — the field template for a *higher-dimensional* isosurface.
+
+    Drop it in as an :class:`Isosurface`'s ``field``.  The host supplies the three
+    scene coordinates ``cx, cy, cz`` (already carrying its ``freq``, ``placement``,
+    3-D ``rotation`` and ``drift``); this class embeds them in ``dim`` dimensions at
+    ``offset`` — so the rendered world is the 3-D hyperplane
+    ``{offset + a*e0 + b*e1 + c*e2}`` — applies the ``dim x dim`` ``rotation`` to that
+    plane, and evaluates the N-D ``field`` there::
+
+        c_i = sum_j R[i][j] * (slice axis j) + sum_j R[i][j] * offset[j]
+
+    Each ``c_i`` is therefore an affine form in ``x/y/z`` whose coefficients are baked
+    once per frame, so the result is an ordinary ftsl ``expr`` isosurface that ftrace
+    sphere-traces natively — no meshing, no new renderer path.
+
+    Unlike a 3-input field seen through an N-D rotation (which can only ever be an
+    affine remap of ``x/y/z``), the extra axes here feed **real extra field inputs**:
+    rotating in a plane that touches an axis outside the slice sweeps the hyperplane
+    through the N-D field, so the surface genuinely reconnects and changes topology.
+
+    Seamlessness: the loop closes when the rotation returns to its ``t = 0`` value at
+    the wrap (an integer number of turns per plane) — the same discipline as the rest
+    of loom.  If the host's ``drift`` also advances, the rotation must be the identity
+    at the wrap for the ``2*pi`` shifts to survive the mix (they do for a
+    :func:`loom.rotations` built from :class:`~loom.signals.core.Sine` angles, which
+    start at 0).
+    """
+
+    def __init__(self, field: Union[str, NDFieldFn], *,
+                 dim: int = 4,
+                 rotation: Optional[Mat] = None,
+                 offset: Union[VecSignal, Sequence, None] = None) -> None:
+        self.dim = int(dim)
+        if self.dim < 3:
+            raise ValueError("SliceField dim must be >= 3 (the slice itself is 3-D)")
+        if isinstance(field, str):
+            if field not in ND_FIELDS:
+                raise ValueError(f"unknown N-D field {field!r} "
+                                 f"(have {sorted(ND_FIELDS)})")
+            self.field_name: Optional[str] = field
+            self.field: NDFieldFn = ND_FIELDS[field]
+        else:
+            self.field_name = None
+            self.field = field
+        if rotation is not None and (rotation.nrows != self.dim
+                                     or rotation.ncols != self.dim):
+            raise ValueError(f"SliceField rotation must be {self.dim}x{self.dim} "
+                             f"(got {rotation.nrows}x{rotation.ncols})")
+        self.rotation = rotation
+        off = [0.0] * self.dim if offset is None else offset
+        self.offset = off if isinstance(off, VecSignal) else VecSignal.of(off)
+        if self.offset.dim != self.dim:
+            raise ValueError(f"SliceField offset dim {self.offset.dim} != {self.dim}")
+
+    # --- duck-typed template protocol used by Isosurface / FuncPattern ---------
+    def param_signals(self) -> list:
+        out: list = [self.offset]
+        if self.rotation is not None:
+            for r in self.rotation.rows:
+                out.extend(r)
+        return out
+
+    def grad_bound(self, freq: float = 1.0, sigma: float = 1.0) -> float:
+        """This field's :func:`nd_grad_bound` (named templates only)."""
+        if self.field_name is None:
+            raise ValueError("grad_bound needs a named N-D field template")
+        return nd_grad_bound(self.field_name, self.dim, freq, sigma)
+
+    def build(self, cx: str, cy: str, cz: str, ctx) -> str:
+        clock, cache = ctx.clock, ctx.cache
+        n = self.dim
+        if self.rotation is None:
+            R = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+        else:
+            R = [[float(self.rotation.rows[i][j].at(clock, cache)) for j in range(n)]
+                 for i in range(n)]
+        o = [float(c) for c in self.offset.at(clock, cache)]
+        base = (cx, cy, cz)
+        coords = []
+        for i in range(n):
+            # Prune the terms that the emitted coefficients make vacuous. A sliced
+            # N-D rotation is mostly zeros (a plane rotation touches two axes), and
+            # this expression is re-evaluated at every march step of every ray, so
+            # dropping `(0)*(...)` and the `(1)*` of an untouched axis is a real win
+            # in the marcher's inner loop. Exact: only 0/1 coefficients and a 0
+            # offset are folded, decided on the *formatted* value so the emitted
+            # text and this pruning can never disagree.
+            terms: list = []
+            for j in range(3):
+                cs = fmt(R[i][j])
+                cv = float(cs)
+                if cv == 0.0:
+                    continue
+                terms.append(base[j] if cv == 1.0 else f"({cs})*{base[j]}")
+            ks = fmt(sum(R[i][j] * o[j] for j in range(n)))   # baked slice offset
+            if float(ks) != 0.0:
+                terms.append(f"({ks})")
+            coords.append("(" + "+".join(terms) + ")" if terms else "(0)")
+        return self.field(coords)
 
 
 def gyroid_surface(**kw) -> Isosurface:

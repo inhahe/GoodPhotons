@@ -5,6 +5,973 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-07-30): loom's `Isosurface` cannot emit a CSG field tree, so every scene that wants one hand-rolls its own `Element`
+
+Found while writing `tools/loom/examples/jumping_jack.py` (a jack of six sphere+cylinder arms
+carved out of a **world-static** gyroid). FTSL has had analytic CSG inside `isosurface` since
+v0.115.0 — `union` / `intersect` / `difference` / the `k`-blended smooth trio over
+`sphere` / `ellipsoid` / `box` / `torus` / `cylinder` / `cone` / `plane` / `function` leaves — but
+loom cannot reach any of it:
+
+- `loom/iso.py` (~342) hard-codes exactly one `function { expr … }` plus one `contained_by`, so
+  the field tree is unreachable from the authoring API.
+- `Room` (~410) *does* transform a field, but by folding the affine into the **field** frame
+  (`M_eff = M·Pᵀ`, `p_eff = P·p_local + T`). That is structurally the wrong mapping for the
+  common case of a **moving solid sampling a stationary field**: it drags the lattice along with
+  the object instead of letting the object sweep through it. The world-static idiom needs the
+  animated transform on the *shape* leaves and **no** transform on the `function` leaf.
+
+The workaround in `jumping_jack.py` therefore re-derives three non-obvious things by hand, each
+of which belongs in the library:
+
+1. **Aiming a cylinder.** An FTSL `cylinder` leaf's axis is local +y, so pointing an arm along a
+   direction `d` needs the Euler triple for ftrace's own composition `R = Rz(rz)·Ry(ry)·Rx(rx)`
+   (`src/mesh.h` ~119, `affineFromTRS`): `rx = asin(d.z)`, `rz = atan2(−d.x, d.y)`, `ry = 0`.
+   Verified numerically in `scraps/jack_check.py` (max residual 6.5e-16), but no caller should
+   have to know it.
+2. **A pose-independent `contained_by`.** Required on any `function` field; must bound the solid
+   over the *whole* animation, not the current frame.
+3. **Gradient renormalisation.** A raw gyroid at frequency `f` has `|∇h| ≤ 2√3·f`, which would
+   drag the sphere-tracer to `d/(2f)` steps. Dividing the expression by `2f` gives `|∇h| ≤ √3`,
+   so one honest `max_gradient 2` covers the tree and the march runs ~`f`× faster.
+
+**Proper fix.** `Field` leaf classes (`FSphere`, `FCylinder`, `FBox`, `FTorus`, `FExpr`), each
+carrying an animatable `Transform`, plus `FUnion` / `FIntersect` / `FDifference` and the
+`k`-blended smooth trio; `Isosurface` accepting a tree as its `field`; a library `aim_y(direction)
+-> rotate` that matches `affineFromTRS`; a `contained_by` declarable as pose-independent; and
+automatic gradient renormalisation of an `FExpr` leaf reusing the per-family bounds `nd_grad_bound`
+already knows (`√2` / 1 / `2^((n−1)/2)` / 7). Documented as a deliberate gap in
+`tools/loom/DESIGN.md` §7c until then.
+
+**A fourth thing the workaround re-derives, added after the fact: picking a carving level by
+volume fraction.** How holey an `intersect { solid, function }` looks is set by the volume
+fraction of the field's sub-level set, and there is no safe closed form for it. Measured on the
+3-D gyroid: the *band* fraction is `volfrac(|g| ≤ g₀) ≈ 0.647·g₀` but the *one-sided* fraction is
+`volfrac(g ≤ −g₀) = (1 − 0.647·g₀)/2` — **half** the slope, which is an invisible factor-of-two
+bug (asking for `solid = 0.26` silently delivered 0.378, making every "sparse" sweep look
+half-filled), and any linear fit is additionally off by ~2× in the tail (0.15 → 0.325).
+`jumping_jack.py` now inverts the distribution exactly (`_gyroid_samples` sorts a 48³ sample of
+one period, cached and frequency-independent; `gyroid_quantile` / `gyroid_cdf` read it), verified
+round-trip to 3 decimals. This inversion belongs next to `nd_grad_bound` in the library, per
+field family.
+
+**A fifth: separating "lacy" from "see-through", and fusing the result into one leaf.** The
+volume fraction alone cannot do it — for a one-level carve the surviving envelope *is* the
+volume fraction, so the two move together. Measured over 32 placements × 4000 rays
+(`scraps/see_through.py`, paired), the fix is a sparse **counter-network**: union `g ≥ t`, the
+gyroid's *other* labyrinth, onto `g ≤ c`. It occupies the middle of the first one's voids —
+where the sight-lines are — so see-through halves (14.9% → 7.5%) for ~2 points of envelope,
+where buying that out of `solid` costs ~12. Four rival mechanisms measured worse or uglier, and
+notably the intuitive "rotate it in a higher dimension" (a quasiperiodic 4-D slice) is *worse*
+than the plain carve, 18.4% vs 14.9%. Two traps recorded so they are not re-hit: a copy shifted
+half a period in all three axes is the **identity** on a gyroid (`sin(x+π)cos(y+π) = sin(x)cos(y)`)
+and an *unpaired* Monte-Carlo sweep hid that behind ~1.7 points of noise — always re-seed per
+candidate. The pair must also be emitted as **one** `function` leaf: ftrace evaluates every leaf
+at every march step, so a two-leaf `union` doubles the trigonometry in the hottest loop; here
+`min(a,b) = ((a+b) − |a−b|)/2` with `a+b` constant collapses it to `((t−c) − |2g−c−t|)·s/2`,
+exact and with the same Lipschitz bound. A library `Field` API should do this fusion (and the
+volume-fraction inversion above) automatically rather than leaving it to each scene.
+
+**Also worth recording as a hard limit, not debt:** the lacy look of the reference stills
+(`png/gold_gyroids`, `png/gyroid_nd`) comes from `contained_by` **clipping** a bare `function`
+sheet, so there is no envelope surface at all. That is *not expressible through CSG* (whose job
+is to bound a solid), and it cannot be done per-arm even by hand, because `contained_by` takes a
+single axis-aligned box or sphere — not a rotating ball-and-rod, and not one per CSG leaf. A
+sparse carve is the CSG analogue; if a genuinely clipped multi-part sheet is ever wanted, FTSL
+itself would need per-leaf clip regions.
+
+### BUG — FIXED (2026-07-30, v0.117.0): `scraps/gi_collapse.ftsl`, the `-gi` normalisation regression test, was VACUOUS — auto-exposure divided out the very error it tests for
+
+Found while validating `-gi-clamp`. The scene tests the gather's cosine-normalisation invariant:
+in a scene where every gather ray escapes, `-gi 32` must be pixel-identical to `-gi 0`, or
+"turning `-gi` on would step the exposure of every scene". Its documented invocation passed
+`-exposure 1`, which is not an absolute exposure — it is a **compensation multiplier on top of a
+p99 auto-exposure** (`main.cpp` ~2518). The scene renders one flat uniform diffuse quad, so the
+p99 anchor normalises away **any** overall scale factor. The test therefore passed regardless of
+how badly the estimator mis-scaled: exactly the failure mode it exists to catch. Confirmed
+directly — `-ambient 0.05` and `-ambient 0.1` produced **byte-identical** PPMs.
+
+This also invalidated a validation result recorded during N3c ("collapse invariant holds") and
+briefly sent me chasing a phantom: `-gi-clamp 0.05` under `-ambient 0.1` came back identical to
+`-gi 0`, contradicting a caveat I had just written into three files. The caveat was right; the
+test was blind.
+
+**Fix.** The light now carries `lumens 8000`, which puts the scene in **absolute** mode
+(`ftsl.h` ~4679 — a fixed sensor gain instead of an auto-exposure anchor), and the header says
+so in capitals, drops `-exposure` from the documented invocation, and carries a
+**discrimination check**: `-ambient 0.05` must render exactly half as bright as `-ambient 0.1`
+(centre pixel `0x2a` vs `0x3c`), so the test cannot silently go vacuous again. Re-verified with
+the fix in place: the invariant genuinely holds, pixel-identical, on both the CPU and the GPU.
+
+**Lesson worth generalising:** any regression test that compares *tone-mapped* frames is only
+measuring what the tone mapper did not remove. `scraps/cor_gi.ftsl` already had this right and
+says so in its header — a flat-fill sweep there made a constant ambient look like it made the
+image *worse* because the anchor swung 5× across the sweep. Prefer `lumens`/`power` (absolute
+mode) in any scene used for a numeric comparison, and never `-exposure` as a stand-in for it.
+`scraps/gi_firefly.ftsl`, added for `-gi-clamp`, follows the same rule.
+
+### NOT A BUG, but a sharp edge worth a knob — KNOB SHIPPED (2026-07-30, v0.117.0): mode W's `-gi` gather ALIASES a caustic into thin bright contour curves
+
+Noticed on the v0.116.0 showcase render (`scenes/cornell.ftsl`, `-mode W -gi 64 -spp 4`, 900×900):
+the floor around the SF10 glass ball, and the side walls, carry a family of thin, blown-out,
+**dashed white curves** concentric with the ball. Diagnosed by bisection rather than by reading
+code, then confirmed against the code:
+
+| probe | result |
+|---|---|
+| `-gi 0` (flat ambient) | curves **gone** → it is the gather |
+| `-gi-bounce 1` | curves **gone**, smooth soft rings remain; the caustic spot under the ball also goes |
+| `-gi-bounce 2` | curves **back**, caustic spot still absent |
+| `-spp 64` | curves **gone**, integrated into a smooth glow |
+| CPU vs GPU, 450², identical flags | max \|dLuma\| **0.123** / \|dChroma\| 0.192 → identical estimator, *not* a porting artifact |
+
+**Mechanism.** The path is *diffuse floor → gather ray → glass ball → lamp*. `bkRadiance` starts a
+gather ray at `specularArrival = false` (correct — the vertex's own NEE already counted that
+emitter), but the dielectric sets it back to `true`, so the subsequent emitter hit adds the lamp's
+**full radiance** (`render_cuda.cu` ~6672 and ~6776; host twin in `backward.h`). That is the right
+thing to do: NEE cannot sample a lamp that sits behind a refracting surface, so emission-on-hit is
+the *only* estimator that path has. The contribution is real and the estimator is unbiased in the
+lattice rotation — hence the clean convergence at `-spp 64`.
+
+It renders as a **curve instead of noise** because mode W deliberately shares one world-space
+direction lattice across every pixel (that invariant is what makes the mode noise-free). So
+"does direction *k* reach the lamp through the ball?" is a step function of surface position whose
+boundary is a single coherent contour in image space, where a stochastic renderer would smear the
+same discontinuity into grain. The dashes are plain aliasing — the contour is sub-pixel-thin in
+places and only registers where it passes near a pixel centre.
+
+**Status: RESOLVED in v0.117.0 by an opt-in `-gi-clamp <x>`** (user asked for it). The behaviour
+was never wrong — it is correct and it converges — so the clamp is **off by default and bit-for-bit
+inert when off** (verified: `cmp` against the v0.116.0 baseline PNG is byte-identical). README's
+"Honest limits" now names three levers, cheapest last: `-spp 64`, `-gi-bounce 1`, and
+`-gi-clamp 0.1`.
+
+`-gi-clamp x` caps the radiance **one** gather ray may return at `x` times
+`Scene::ambientRef()` — the same dimensionless "multiple of one light's own radiance" units as
+`-ambient`, so one number works at any scene scale. Implementation notes (full rationale on
+`BackwardRenderer::giClamp`, `src/backward.h`; device twin `DScene::bkGiClamp`):
+
+* **Per wavelength, not per bundle.** The scalar twin `giGather()` carries a single λ and has
+  nothing to take a max over, so a bundle-wide rule would make the hero and single-λ paths
+  disagree on the same scene. Costs a hue shift on a clamped ray, which is the point.
+* **`wSum` is not clamped.** A clamped direction keeps its weight `c`, so the estimator still
+  normalises by the realised sum of cosines and the collapse invariant survives.
+* **It also caps the far-field `ambient` tail** an escaping gather ray returns. Not a bug, but it
+  couples the two knobs: the gather's fill is exactly `min(ambient, giClamp)`. Pinned in
+  `scraps/gi_collapse.ftsl` — `-gi 32 -gi-clamp c` is pixel-identical to
+  `-gi 0 -ambient min(ambient, c)`. Hence "keep it above `-ambient`", or you darken the whole
+  scene instead of capping fireflies. `-gi-clamp` without `-gi` prints an `[ignore]` notice.
+
+**Measured** on `scraps/gi_firefly.ftsl` (added for this — the absolute-mode Cornell box *with*
+the glass ball, the deliberate counterpart to all-diffuse `cor_gi.ftsl`), `-gi 32 -spp 1
+-ambient 0.05`, 240², GPU:
+
+| `-gi-clamp` | frame Δluma | pixels > 250 codes |
+|---|---|---|
+| `0` (off) | — | 1689 |
+| `0.05` | −0.86 % | 1350 |
+| `0.1` | **−0.31 %** | 1350 |
+| `0.2` | −0.20 % | 1356 |
+| `0.5` | −0.04 % | 1600 |
+
+So the curves cost ~0.3 % of the frame's light to remove, and the caustic survives as a soft
+highlight rather than a blown-out spike. (The `0.05` row is dearer only because it is *at*
+`-ambient` and has started eating the fill.) CPU↔GPU with the clamp on: 98.7 % bit-identical,
+max 20-px-block |dLuma| 0.328 code against a 1.5-code bar. All 15 self-tests pass.
+
+**Rejected alternatives:** (a) suppressing emission-on-hit for gather rays entirely — kills the
+artifact but silently discards a real caustic and makes `-gi` darker than correct; (b) forcing
+`giBounce = 1` by default — same energy loss, and it would change existing images.
+
+### BUG — FIXED (2026-07-30, v0.116.0): the GPU's *watertight* triangle test CRACKS, because nvcc contracts its edge functions into FMAs
+
+Found while validating N3c: `scraps/cor_gi.ftsl` at 240×240 in mode `W` failed the CPU↔GPU
+block-mean bar badly (max |dLuma| **7.668** codes, |dChroma| **3.062**, bar is 1.5) with **134
+pixels** more than 8 codes off. `scraps/n3c_diffmap.py` (written for this) localised them, and
+the shape was the giveaway: every bad pixel lay on `x == y` or `x + y == 239`, i.e. exactly the
+frame diagonals, and every one of them was pure `(0,0,0)` on the GPU against a lit
+`~(247,234,236)` wall on the CPU. Nothing to do with `-gi` at all — it reproduced at `-gi 0`.
+
+The camera is exactly centred on a square Cornell box, so the back-wall quad's own
+triangulation diagonal, plus all four ceiling/floor-to-side-wall corner seams, project **dead
+through hundreds of consecutive pixel centres**. The GPU was losing the hit at every one of
+them: the background leaking through a closed surface, from the intersection routine whose
+entire selling point is that this cannot happen.
+
+**Where:** `src/render_cuda.cu`, `intersectTri` — the three scaled barycentric edge functions of
+the Woop watertight test (Woop/Benthin/Wald/Áfra, JCGT 2013), plus the exact-zero double
+fallback right after them.
+
+**Mechanism.** The watertight guarantee is that two triangles sharing an edge evaluate that edge
+from **bitwise identical operands in opposite order**, so their edge functions come out exact
+negatives; the accept test rejects only *mixed* signs, so a zero is accepted and a ray dead-on
+the edge is claimed by exactly one sharer. nvcc defaults to `-fmad=true` and contracts
+`a*b - c*d` into `fma(a, b, -(c*d))`, which keeps **one** product exact and rounds only the
+other. On an exact tie the two sharers therefore compute `exact(pq) - rounded(qp)` and
+`exact(qp) - rounded(pq)` — which are *equal*, not negatives. If that shared sign is the
+minority one, **both triangles reject and the surface cracks.** The exact-zero fallback had the
+same problem, and it is precisely the tie case, so it is the code that most needs to stay
+antisymmetric.
+
+This is the same failure and the same fix as the CPU/GPU rasterizer's `edgeRow`/`edgeAt`
+(v0.98.2, item 6 below) — the ray-tracing analogue, missed at the time because the rasterizer
+fix didn't prompt an audit of the *tracer's* edge functions.
+
+**Fix.** A `dCrossRn(a,b,c,d)` helper built on `__fmul_rn`/`__fsub_rn` (with `double`
+overloads, `__dmul_rn`/`__dsub_rn`, so the `Real = double` device build is covered too), used
+for all three edge functions and for the double fallback. The host (`src/geometry.h`) needs
+nothing — MSVC's default `/fp:precise` does not contract and the build sets no `/fp:` or
+`/arch:` flag — but a comment now records that dependency and points at the CUDA twin, so a
+future `/fp:fast` doesn't reintroduce the bug silently.
+
+**Result.** `cor_gi -gi 0 -ambient 0.1`: dLuma **7.668 → 0.619**, dChroma **3.062 → 0.853**
+(FAIL → PASS); the 134 black pixels became **25**, none of them black — they are a
+red-wall-vs-white-ceiling tie-break one pixel wide, i.e. the two sharers now disagree about
+*which* of them owns the edge rather than both dropping it, which is legitimate and is what the
+watertight rule promises. `-gi 32` went dLuma 4.376 → **0.328**. The N3a/N3b/N3d beds and all 14
+self-tests pass.
+
+**Cost: none measurable.** A/B on `scraps/n3_gpu.ftsl` 1200×800 `-spp 256 -device gpu`
+(a tracer-dominated ~5 s, vs ~1.2 s of fixed startup overhead): contracted 5.213 / 5.009 /
+5.007 s, non-contracted 5.075 / 5.122 / 4.954 s — identical within run-to-run noise, even
+though the change adds ~3 float ops per triangle test inside the BVH leaf loop. The leaf loop is
+memory-bound, not ALU-bound.
+
+**Follow-up worth doing:** audit the *rest* of the device tracer for other places where a
+`a*b - c*d` determinant sign has to be consistent between two independent evaluations. The two
+found so far (rasterizer edges, tracer edges) were both found by symptom rather than by audit.
+
+### BUG — FIXED (2026-07-30, v0.115.0 → v0.115.1): every `layered` surface renders MONOCHROMATIC in mode `W` at 1 spp
+
+Found while re-rendering `scenes/layered.ftsl` after the `shortpass`/`gaussian` parser fix below.
+At `-spp 1` the clearcoated back wall and the iridescent sphere both come out saturated **green**;
+at `-spp 64` the wall is its correct mauve (0.55·rgb(0.80,0.25,0.20) + 0.45·rgb(0.20,0.55,0.80))
+and the sphere is white. Nothing to do with fluorescence — `-no-fluoro` gives a bit-identical
+image, and the wall carries no fluorophore at all.
+
+Cause, `src/backward.h` ~1393, in the hero-bundle loop:
+
+```cpp
+if (mp->type == MatType::Layered) {
+    // Wavelength-dependent Fresnel coat: de-hero and run the scalar layered
+    // handling on the hero channel.
+    deHero(); nUp = 1;
+```
+
+The de-hero is **unconditional**. This is precisely the failure N1 exists to prevent: mode `W`'s
+wavelength lattice is a function of the *sample index alone*, shared by every pixel, so collapsing
+a bundle onto its hero λ at 1 spp collapses the whole frame onto the *same* λ — and the median of
+a bb6500 CDF is ~550 nm, i.e. green. Glass got the fix (split the bundle at the dispersive vertex);
+`layered` never did. The `-spp 64` image is right because 64 samples are 64 different wavelengths.
+
+`README.md` currently understates this as "a *strongly* λ-dependent coat thickness can still tint
+at 1 spp". It is not a tint and it is not conditional on the coat: a plain achromatic
+`reflectance fresnel  ior 1.5` clearcoat mistints just as hard.
+
+**Proper fix:** don't de-hero at all. The layered handling changes neither direction nor wavelength
+when it enters the body — it only computes a scalar coat reflectance `R` and swaps `mp` to a child
+material, then falls through to the ordinary per-λ switch. So evaluate `R` per-λ
+(`layeredCoatReflectance` already takes λ) and apply it as a per-λ throughput weight, keeping all
+`nUp` channels alive. The one genuinely chromatic case is a coat where some λ have `R ≥ 0.5` and
+others don't (mode `W`'s dominant-branch rule) or where the stochastic coin would go different ways
+per λ; that wants the same **split-at-dispersion** treatment `D_THINFILM`/`D_GRATING` get, not a
+de-hero. Note the scalar path (~1226) is already fine — this is purely the hero loop.
+
+#### FIXED in v0.115.1 — a per-λ coat weight, with a fan-out only when the coat is truly chromatic
+
+Done exactly as scoped. `BackwardRenderer::radianceHeroLoop`'s `MatType::Layered` branch now:
+
+1. evaluates `Rl[i] = layeredCoatReflectance(scene, cm, h, ray.d, lam[i])` for every live λ;
+2. decides reflect-vs-body **per λ** — `Rl[i] >= 0.5` in mode `W`, `uCoat < Rl[i]` against ONE
+   shared coin otherwise;
+3. if all live λ agree (the overwhelmingly common case), takes that branch with the whole bundle
+   intact. Mode `W` multiplies each channel by its own `Rl[i]` / `1 - Rl[i]` and stops only once
+   `maxOf(thr, nUp)` falls under `kWhittedCutoff`, exactly like the `Mirror`/`Filter`/`Glossy`
+   case. The stochastic path needs **no reweight at all**: `uCoat` is uniform, so
+   `P(uCoat < Rl[i]) == Rl[i]` exactly for each λ — common-random-number analog splitting, where
+   the probability *is* the weight, just as in the scalar twin;
+4. if they disagree, fans out: each secondary re-enters `radianceHeroLoop` at **this same bounce**
+   as its own monochromatic sub-path (`C=1`, `secAlive=false`) and makes its own coat decision,
+   landing in its own `L[i]`. Re-entry at `b` rather than `b + 1` is safe because `nUp > 1` implies
+   an empty medium stack (every dielectric entry de-heros or splits), so the Beer-Lambert step at
+   the loop head was a no-op and cannot be double-applied.
+
+`Renderer::tracePhotonHeroLoop` (`src/render.h` ~2000) got the same shared-coin treatment, since it
+carried the identical unconditional `deHero()`. There the disagreement case falls back to
+`deHero()` instead of fanning out — a forward sub-path *cannot* re-enter its vertex, because the
+loop head has already run the model-C aperture catch and re-entering would deposit the photon into
+the film twice. De-hero is still unbiased, and it is what every dispersive material there does
+without `-herosplit`, so the fallback costs only variance in the rare chromatic case.
+
+The viewer's `wNeedSpp` list (`src/main.cpp` ~8120) no longer forces 16 passes on any scene
+containing a `Layered` material, so a clearcoated scene previews at 1 spp like everything else.
+
+Measured on `scenes/layered.ftsl` at 320×240, against a converged `-spp 1024` reference
+(block-mean bar: every 20 px block within 1.5 codes, luma and chroma separately):
+
+| image | max \|dLuma\| | max \|dChroma\| |
+|---|---|---|
+| **old** mode `W` `-spp 1` | 72.2 | **190.5** |
+| **new** mode `W` `-spp 1` | 12.8 | **11.0** |
+| old mode `W` `-spp 64` | 1.33 | 2.26 |
+| **new** mode `W` `-spp 64` | **0.354** | **0.225** |
+
+So the 1-spp chroma error drops **17×** (and the frame goes from saturated green to the correct
+red/green Cornell walls with a mauve back wall), while at 64 spp the new estimator is ~7× *closer*
+to the reference than the old one — keeping all 8 channels alive instead of boosting one ×8 is a
+straight variance win on top of the correctness fix.
+
+Unbiasedness of the fan-out was checked against the **untouched scalar path** on a deliberately
+pathological coat, `scenes/_lay_chroma.ftsl` (a thin-film Airy coat, `film_ior 3.5` over
+`ior 1.5`, `film_thickness 200`, whose R oscillates between ~0.06 and ~0.61 across the visible band
+and therefore straddles the `R >= 0.5` threshold several times). Bundle `-heroc 8 -spp 1024` vs
+scalar `-heroc 1 -spp 2048`: max \|dLuma\| **0.111**, max \|dChroma\| **1.57** codes. The
+disagreement branch was confirmed live with a temporary counter — 8192+ hits on that scene, and
+32+ even on `scenes/layered.ftsl` (grazing silhouette pixels where Fresnel R crosses 0.5).
+
+Mode `R` (stochastic) on `scenes/layered.ftsl` at `-spp 4096`, old vs new: max \|dLuma\| 0.964,
+max \|dChroma\| 1.333 — both inside the bar, so the common-random-number split is unbiased too.
+Forward mode `B` on the same scene, 2e9 photons old vs new: max \|dLuma\| **0.070**, max \|dChroma\|
+**0.075** codes (PASS), and the energy ledger is identical to six decimals —
+`absorbed=0.7105 escaped=0.2895 sum/emitted=0.999996` both ways. That ledger is the real check on
+the forward edit, since it replaced the post-de-hero `e.absorbed += beta[0]` bookings with
+`activeSum()`. Cost: **1.09×** (1117.3 s vs 1022.9 s back-to-back) — the per-λ
+`layeredCoatReflectance` fan (up to 8 Airy evaluations instead of 1) is the whole of it.
+
+Seven non-layered scenes (`cornell`, `multilayer`, `_fluo_cornell`, `_env_cornell`, `_rainbow_test`,
+`_spot_cornell`, `_fog_cornell`) are **bit-identical** old vs new at `-mode W -spp 2`; so is
+`scenes/layered.ftsl` itself at `-heroc 1` in modes `W`, `R` and forward `B` — the scalar,
+bundle-free paths, which this change does not touch (the shared coin is drawn in the same order as
+the old single draw, so at `nUp == 1` the new code is the old code verbatim). All 14 physics
+self-tests PASS.
+
+### BUG — FIXED (2026-07-30, v0.115.0): `gaussian`/`shortpass` SILENTLY IGNORED positional arguments
+
+`src/ftsl.h` ~1840 parsed these two spectrum heads with
+
+```cpp
+for (size_t k = 1; k < w.size(); ++k) {
+    std::string key, val;
+    if (!splitEq(w[k], key, val)) continue;      // <-- positional args dropped
+```
+
+so only the `key=value` form worked. Both forms are documented and both appear in the checked-in
+scenes, so `scenes/layered.ftsl`'s
+
+```
+absorb shortpass 470 0.2 1.0
+emit   gaussian 600 30 1.0
+```
+
+parsed as `shortPass(0, 0, 1.0)` — a flat 0.5 absorption at every wavelength — and
+`gaussianBand(0, 0, 1.0)`, which is identically **zero** (`sigma = 0` makes `t = ±inf`, so
+`exp(-t²/2) = 0`). That gave the material `fluoEmitSampler.integral == 0`, i.e. `haveFluoro ==
+false`: the fluorescent body of that scene's iridescent sphere had been inert since it was written,
+with no diagnostic.
+
+Fixed by accepting positional args (mixable with keyed ones, which override the slot they name),
+**failing** on an unknown key instead of ignoring it, and rejecting `sigma`/`slope` ≤ 0 — which is
+never a usable band and is far likelier to be a typo than an intent.
+
+### BUG — FIXED (2026-07-30, v0.113.0 → v0.113.1): a `fluorescent` surface had WILDLY different power on the CPU and the GPU
+
+Found while building N3d-2's A/B bed. On a scene whose *every other pixel is bit-identical*
+between the devices, a fluorescent pane's radiance differed by ~5 orders of magnitude. This was
+**not** a mode-`W` determinism problem (N3d-2 fixed that; see below) — it reproduced in mode `R`
+at 512 spp. The cause turned out to be neither device's reradiation code but the **scene parser**;
+see the FIXED write-up at the end of this entry.
+
+**Repro as originally observed** (`scraps/fluo_min_area.ftsl` — deliberately minimal: floor + back wall + ONE dye pane
++ ONE area light, absolute exposure so neither image is auto-anchored):
+
+```
+ftrace scraps/fluo_min_area.ftsl -mode W -spp 1 -device cpu -o ppm/fluo_W2_cpu.ppm -window
+ftrace scraps/fluo_min_area.ftsl -mode W -spp 1 -device gpu -o ppm/fluo_W2_gpu.ppm -window
+python scraps/n3d2_probe.py ppm/fluo_W2_cpu.ppm ppm/fluo_W2_gpu.ppm 20 3
+```
+
+| 12 px patch | CPU | GPU |
+|---|---|---|
+| floor (96,116) | (84.84, 79.94, 80.59) | (84.84, 79.94, 80.59) — **bit-identical** |
+| dye pane (100,68) | (255.00, 255.00, 0.00) — **clipped** | (9.01, 7.96, 8.06) — neutral grey |
+
+Backing the tone map out (sRGB transfer ÷ the reported absolute gain, and re-rendering the CPU at
+`-exposure 0.02` to un-clip it, where the pane reads (45, 81, 0)):
+
+- **CPU** dye radiance ≈ **8 200 ×** the 0.5-albedo floor's, under the same light. A surface with
+  `reflect 0.05` and `yield 0.9` cannot out-radiate a diffuse floor at all, let alone by ~4
+  orders of magnitude — the CPU is **the wrong side**, and grossly so.
+- **GPU** dye radiance ≈ **0.03 ×** the floor's, and *neutral* in hue. That is exactly what the
+  `reflect 0.05` base lobe alone would give on a vertical pane under an overhead light: the
+  fluorescent channel contributes essentially **nothing** on the device.
+
+Ratio ≥ 30× on the tone-mapped codes with either light type (`fluo_min_area.ftsl` / `_spot`), and
+the same 236.589-code block-luma gap appeared at the *same* block at 1 spp and at 256 spp, which is
+what proved it systematic rather than noise.
+
+**Two suspects were written here originally and BOTH were wrong** — recorded so the dead ends
+aren't re-walked: (1) `bakeSpec(m.fluoEmit, d.fluoEmitSpec)` + `specLookup` diverging from the
+host's continuous `m.fluoEmit(lambda)`; (2) the host's `spdCache` in
+`neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn, rng, spdCache)` matching at the wrong λ. Both
+sides of the reradiation math are in fact identical; the bug was upstream of both.
+
+#### FIXED (2026-07-30, v0.113.1) — the parser was making every fluorescent surface a LIGHT
+
+Bisecting the material spec (`scraps/fluo_v_bare.ftsl` / `_absorb` / `_emit` / `_diffuse`) showed
+the trigger was **the presence of an explicit `emit` statement on a `fluorescent` material**, and
+not the fluoro channel at all: `yield 0.0` and `yield 0.9` behaved the same, while deleting the
+`emit` line collapsed the CPU/GPU gap to zero.
+
+Cause, in `src/ftsl.h`: the per-type parse for `fluorescent` (~3649) already consumes `emit` as the
+**reradiation profile** —
+
+```cpp
+m.fluoEmit = spectrumParam(b, "emit", gaussianBand(560.0, 25.0, 1.0));
+```
+
+— but the *generic* "any material may carry an emit spectrum" block further down (~3732) then ran
+for **every** type, unconditionally:
+
+```cpp
+if (find(b, "emit") || find(b, "emit_map")) {
+    m.emit = patternedSpectrumParam(b, "emit", "emit_map", m.emitPat, constantSpectrum(0.0));
+    m.isLight = true;
+}
+```
+
+So the same `emit` statement was installed a *second* time as **self-emission**, and the dye pane
+became a self-luminous absolute-radiance light of its own emission band. That explains the split
+exactly: the CPU tracers honour `m.emit` on hit, so a `gaussian center=560` pane radiated ~8 200 ×
+a 0.5-albedo floor (impossible at `yield <= 1`) and in exactly the observed yellow-green hue; the
+GPU never uploads a per-material emit spectrum at all (see the separate entry below), so it
+rendered only the elastic `reflect 0.05` base — hence "wrong in opposite directions".
+
+The fix makes the generic block skip `Fluorescent`, and *rejects* `emit_map` there rather than
+silently dropping it (a reradiation profile is not a surface pattern):
+
+```cpp
+if (m.type == MatType::Fluorescent) {
+    if (find(b, "emit_map"))
+        fail("a fluorescent material's 'emit' is its reradiation spectrum, not surface "
+             "emission, so 'emit_map' is not supported here");
+} else if (find(b, "emit") || find(b, "emit_map")) { ... }
+```
+
+**Verified** on the minimal bed after the fix — the divergence is gone completely:
+
+| 12 px patch | before CPU | before GPU | after CPU | after GPU |
+|---|---|---|---|---|
+| dye pane | (255.00, 255.00, 0.00) clipped | (9.01, 7.96, 8.06) | (9.01, 7.96, 8.06) | (9.01, 7.96, 8.06) |
+| floor | (84.84, 79.94, 80.59) | (84.84, 79.94, 80.59) | (84.84, 79.94, 80.59) | (84.84, 79.94, 80.59) |
+
+`scraps/n3d2_probe.py` now reports **100.000 % bit-identical, |dLuma| = |dChroma| = 0.000** on
+that scene. Note this fix does *not* silently change any correct scene: only a `fluorescent`
+material with an explicit `emit` was ever affected, and it was unconditionally wrong there.
+(In-tree scenes that do change, correctly: `scenes/_fluo_cornell.ftsl` and
+`scenes/layered.ftsl`'s fluorescent body — their dyes no longer self-glow.)
+
+The full N3d-2 bed — the one whose dye divergence forced the grating-only bed
+`scraps/n3d2_grate.ftsl` to be split out in the first place — now A/Bs clean end-to-end:
+`scraps/n3d2_gpu.ftsl` at `-mode W -spp 1` scores **99.627 % bit-identical, max |dLuma| 0.144 /
+|dChroma| 0.100**, i.e. the same sliver-only agreement as every other bed. The three standing
+regression beds are untouched by the fix (they carry no fluorescent material): n3 99.264 %,
+n3b 99.561 %, n3d 99.697 %, and the grating bed still 99.606 % — all re-measured on the 0.113.1
+binary.
+
+### BUG — FIXED (2026-07-30, v0.113.1 → v0.114.0): a `fluorescent` material's reradiation channel contributed ~nothing in mode `W`
+
+Surfaced immediately after the parser fix above removed the spurious self-emission that had been
+masking it. On `scraps/fluo_min_area.ftsl` (`absorb shortpass edge=480 slope=0.2 amp=1`,
+`emit gaussian center=560 sigma=25`, `reflect 0.05`), varying `yield` does nothing whatsoever:
+
+```
+yield 0.0 cpu  dye (  9.007,  7.958,  8.062)      yield 0.0 gpu  dye (  9.007,  7.958,  8.062)
+yield 0.9 cpu  dye (  9.007,  7.958,  8.062)      yield 0.9 gpu  dye (  9.007,  7.958,  8.062)
+```
+
+— bit-identical, on **both** devices, and equal to what a plain `type diffuse reflect 0.05` pane
+reads. So the whole bispectral term is worth ≈0.00–0.02 codes out of 9.
+
+That is very unlikely to be right. A bb6500 illuminant puts roughly 30 % of its 360–830 nm power
+below the 480 nm absorption edge, so at `yield 0.9` the *effective reradiation albedo* should be on
+the order of 0.27 — about **5×** the elastic 0.05 lobe, i.e. the dye should dominate its own
+appearance, not vanish into it.
+
+**Ruled out:** the λ_in NEE weight. `scene.invPdfLambda(λ) = emitG / g(λ)` with
+`emitG = emitSampler.integral` (`src/scene.h` ~1351), which is exactly `1/pin × emitG` for the
+`pin` that `emitSampler.sample`/`sampleAt` returns — so `invPdfIn = scene.invPdfLambda(lambdaIn)`
+is consistent and was never the cancelling factor. `-checkfluoro` also passes, so the reradiation
+primitives (`fluoEmitSampler`, `fluoroWeights`, `fluoroInteract`) are all sound.
+
+#### FIXED (2026-07-30, v0.114.0) — the (sIdx, bounce) lattice used bases far larger than `-spp`
+
+Bisecting the *material* rather than the code found it: a 2×2×2 sweep of
+{`absorb shortpass edge=480` | `absorb 1.0`} × {`emit gaussian 560/25` | wide} × {`yield 0.9` | `0.0`}
+showed fluorescence working perfectly with a **flat** absorption (dye = (78.9, 134.0, 0.0), a
+vivid green ≈33× the elastic lobe, exactly as the physics predicts) and contributing **exactly
+zero** with the shortpass edge. So the excitation λ_in was simply never landing below 480 nm.
+
+Cause: `whittedFluoroU` (`src/backward.h`) drew its coordinate from a **base-61** radical inverse.
+A plain radical inverse in base *b* returns exactly `i/b` for `i < b`, so its first *N* points
+cover only the prefix `[0, N/b)` — well distributed *within* that prefix and blind to the rest.
+With `rot05` on top, u was pinned to `[0.5, 0.5 + spp/61)`: the **long** half of the illuminant
+CDF, for every preview budget under 61 spp. Measured, the dye switched on in one step:
+
+| `-spp` | 1 | 4 | 16 | **64** | 256 |
+|---|---|---|---|---|---|
+| dye, unscrambled | 10.6, 9.5, 9.6 | 10.4, 9.6, 10.1 | 10.3, 9.8, 10.2 | **53.4, 73.7, 0.0** | 53.9, 73.5, 0.0 |
+| dye, scrambled | 10.6, 9.5, 9.6 | 43.4, 67.7, 0.0 | 48.6, 67.5, 0.0 | 54.0, 75.7, 0.0 | 54.9, 75.4, 0.0 |
+
+This was **not** specific to fluorescence — it hit every lattice with a base above the sample
+count: `whittedGlossyDir`'s bases 13–41 kept a rough lobe hugging its mirror direction until
+`-spp 13`, `whittedOrderU`'s 43–59 made a grating's higher orders arrive in a lump at `-spp 43`,
+and even the `-gi` gather's bases 7/11 confined its two coordinates to one corner.
+
+Fix: **digit-scramble** the radical inverse (Faure's standard fix for high-dimensional Halton) —
+`r = Σ π(dₖ)·b^-(k+1)` with `π(d) = (d·m) mod b`, `m = round(b/φ)`. Any bijection π leaves the
+sequence a permutation of the same *b*-point grid (so the discrepancy is asymptotically
+unchanged) but visits it scattered instead of monotone. The multiplicative form needs no
+permutation tables, so the CUDA twin is trivially bit-identical, and crucially **π(0) = 0**, so
+`radicalInverseScr(b, 0) == 0` in every base and every "sample 0 is the canonical outcome"
+contract (mirror direction / specular order `m = 0` / median λ) survives. Measured star
+discrepancy of the first *N* points (`scraps/n3e_lattice.py`):
+
+| base (role) | N=4 plain → scr | N=16 plain → scr |
+|---|---|---|
+| 13 (glossy u1) | 0.769 → 0.269 | 0.215 → 0.130 |
+| 43 (grating order) | 0.930 → 0.250 | 0.651 → 0.102 |
+| 61 (fluoro λ_in) | 0.951 → 0.254 | 0.754 → 0.077 |
+
+**Verified:** every `-spp 1` image is **bit-identical** to v0.113.1 (the π(0) = 0 anchor — checked
+with `cmp` on all four A/B beds plus the fluorescence bed), and CPU↔GPU still agree at both 1 and
+8 spp on all four beds (max |dLuma| ≤ 0.253 at 1 spp, ≤ 0.139 at 8 spp — every bed *tighter* at 8
+spp than at 1). `png/n3e_montage.png` is the visual proof: the dye pane is black at 1/4/16 spp and
+green only at 64 in the unscrambled column, green from 4 spp on in the scrambled one, with the two
+columns converging (near-black diff) by 64.
+
+### DEBT — FIXED (2026-07-30, v0.114.0 → v0.115.0): λ_in for fluorescence is drawn from the ILLUMINANT, not from the dye's absorption band
+
+The residue of the bug above, and the reason a narrow-band dye still previewed as a bare elastic
+lobe at exactly `-spp 1`. `MatType::Fluorescent` sampled its Stokes-shift excitation wavelength
+from `scene.emitSampler` — the scene-wide illuminant CDF — and mode `W`'s 1-spp coordinate is that
+CDF's **median** (~575 nm under bb6500). A dye absorbing only below 480 nm could therefore never be
+excited by the single canonical sample, however good the lattice was.
+
+It was also a plain variance problem in the stochastic modes: with `absorb shortpass edge=480`
+under a broadband lamp most λ_in draws land where `fluoAbsorb ≈ 0` and contribute nothing, while
+the few that land in the band carry a correspondingly large weight.
+
+#### FIXED (2026-07-30, v0.115.0) — a per-material excitation CDF (absorb × illuminant)
+
+`Material` grew an `EmissionSampler fluoInSampler` (`src/scene.h` ~205), built inside
+`Scene::finalizeEmitters()` right after `emitSampler` from the product
+`clamp01(fluoAbsorb(λ)) · g(λ)`, where `g(λ) = Σ_k geomWeight_k · spd_k(λ)` is the same combined
+illuminant `emitSampler` uses. Built there (not at parse time) because it needs the finished
+emitter list, and rebuilt on every `finalizeEmitters()` so `-ignoreenv` — which drops an emitter
+and re-finalises — stays consistent.
+
+`src/backward.h`'s `MatType::Fluorescent` now draws from it and sets `invPdfIn = 1.0 / pin`. That
+second half matters on its own: the old code paired a *bin-discretised* CDF draw with the
+*analytic* `scene.invPdfLambda(λ)` = `emitG / g(λ)`, which is only approximately the reciprocal of
+the pdf the draw actually had. A material whose product integral is 0 (a dye this illuminant
+cannot excite at all) falls back to `scene.emitSampler`, so the branch still terminates.
+
+Device twin: `DMaterial` gained `fluoInCdfOffset` / `fluoInCdfN` / `fluoInCdfStep`, a second slice
+appended to the existing flat `DScene::fluoCdfAll` buffer, plus `dSampleFluoInU()` next to
+`dSampleSceneLambdaU()`. Only one call site needed changing — the second `D_FLUORESCENT` label in
+`render_cuda.cu` is the split-at-dispersion dispatch, which re-enters `bkInteract`.
+
+Unbiasedness is not a matter of taste here and is now asserted: `-checkfluoro` grew a fourth check
+that estimates the reradiation NEE weight `Q·∫aEff(λ)·spd(λ)dλ` **both ways** — from the illuminant
+CDF (the old sampler) and from absorb × illuminant (the new one) — and requires both within 2 % of
+a fine analytic quadrature. Measured: analytic `4.7061e15`, illuminant-sampled `4.7030e15`,
+product-sampled `4.7062e15`. It also reports the variance ratio and the mode-`W` median draw
+(421.7 nm, `aEff` = 0.825 there, i.e. squarely inside the band). The reported variance ratio is a
+best case — this synthetic integrand *is* the new sampler's target, so its estimator is constant
+and only CDF discretisation is left; a real render carries the NEE geometry factor too.
+
+The dye pane of `scraps/fluo_x_sp_narrow_09.ftsl` (`absorb shortpass edge=480`, `yield 0.9`),
+12 × 20 px patch, mode `W` on the CPU:
+
+| `-spp` | v0.113.x | v0.114.0 | v0.115.0 |
+|---|---|---|---|
+| 1 | 10.6 (bare elastic) | 10.6 (bare elastic) | **(47.6, 81.2, 0)** |
+| 2 | 10.6 | (59.9, 93.5, 0) | (48.8, 79.6, 0) |
+| 4 | 10.6 | 43.4 | (57.1, 77.7, 0) |
+| 16 | 10.6 | 48.6 | (58.0, 78.7, 0) |
+| 64 | (53.4, 73.7, 0) | 54.0 | (57.4, 78.4, 0) |
+| 256 | — | 54.9 | (57.5, 78.5, 0) |
+| 4096 | — | — | (57.5, 78.4, 0) |
+
+`yield 0.0` vs `yield 0.9` now differ at `-spp 1` (they were bit-identical up to `-spp 64` in
+v0.113.x — the original symptom). CPU↔GPU at 1 spp still PASSes the block-mean bar on every bed:
+n3 max \|dLuma\| 0.253, n3b 0.144, n3d 0.144, n3d2 0.144, grate 0.144, and the four dye beds
+0.044 / 0.003 / 0.065 / 0.002. All nine physics self-tests PASS.
+
+### DEBT — OPEN (2026-07-30, v0.113.1): the GPU cannot do material emission-on-hit at all
+
+`src/render_cuda.cu` ~608 notes plainly that *"DMaterial carries no emit spectrum"*. Only meshes
+get registered as emitters (via `addMesh`), so any **non-mesh primitive** (a `quad`, `sphere`,
+`box`, …) bound to a material with an `emit` spectrum is a visible light on the CPU and a black /
+elastic-only surface on the GPU. This is a general CPU-vs-GPU divergence, not specific to
+fluorescence — it is simply how the fluorescence bug above became visible as a *device* split.
+
+Proper fix: bake a per-material emit spectrum into `DMaterial` (same `bakeSpec` treatment the other
+spectra get) and honour it on hit in `bkInteract`, plus register emissive non-mesh primitives with
+the device light list so NEE can see them too. Until then, emissive non-mesh geometry should
+either be documented as CPU-only or rejected at upload time with a clear message rather than
+silently rendering differently.
+
+### DEBT — OPEN (2026-07-30, v0.113.1): `Fluorescent`'s `neeLight` calls omit the `gi` argument
+
+`src/backward.h` ~927 and ~953 call `neeLight(scene, h, rho…, invPdf…, lambda…, rng, spdCache)`
+without the trailing `gi` that the `Diffuse` (~1019) and `DiffuseTransmit` (~986/990) cases pass.
+`neeLight` uses `gi` to pick the shadow-ray stratification grid, so at a `-gi` gather vertex a
+fluorescent surface pays `lightGrid²` shadow rays instead of `giGrid²` — wasted work and a
+different (needlessly fine) stratification than its neighbours. Fix is a one-word addition to
+both call sites, but it changes the sample pattern, so it needs an A/B re-baseline of the
+fluorescence beds and should ride along with the reradiation investigation above.
+
+### BUG — FIXED (2026-07-29 → 2026-07-30, v0.111.0 → v0.113.0): mode `W` was still STOCHASTIC at grating / fluorescent vertices
+
+*(All four materials are now fixed: thin-film and multilayer in **v0.112.0** (N3d-1) and grating
+and fluorescent in **v0.113.0** (N3d-2). Both fix write-ups are below.)*
+
+Mode `W`'s entire contract is "no rng draws — the same image at `-spp 1` every time, on any
+device". Two material vertices still broke it, on **both** the CPU and the GPU:
+
+- **`gratingDiffract`** (`src/render.h` ~2393) picked a diffraction order from the rng:
+  `double xi = rng.uniform() * wsum;` over the propagating orders weighted `1/(1+|m|)`.
+- **`MatType::Fluorescent`** (`backward.h` ~896) drew `scene.emitSampler.sample(rng, pin)` for
+  the Stokes-shift excitation wavelength λ_in. *(Its continuation coin at ~914 was **not** a
+  problem: mode `W` implies `directOnly`, which returns before reaching it.)*
+
+**Neither is a dominant-branch problem, so the `whittedWeight` trick did not apply.** Both are
+*discrete choices from a distribution*, which is exactly what N2 already solved for the glossy
+lobe: keep ONE choice per sample but drive it from a low-discrepancy sequence indexed by
+`(absolute sample index, bounce)` instead of the rng. `GiCtx` already carried `sIdx` and `bounce`
+and was already threaded into `interactMaterial` / `bkInteract` on both devices, so the plumbing
+existed.
+
+**How the whole family was found:** building N3b's deterministic CPU/GPU A/B bed
+(`scraps/n3b_gpu.ftsl`). `scraps/n3b_check.py` failed at max |dLuma| **4.078** / |dChroma|
+**6.995** codes on exactly the 20 px blocks covering a `thinfilm` bubble, while every other block
+in the frame passed under 0.2 codes. That was not a porting bug — the CPU render was equally noisy
+there; CPU and GPU simply draw from independent rng streams, so the two were different
+realizations of an estimator that should not have been stochastic at all.
+
+#### FIXED (2026-07-30, v0.112.0): the thin-film / multilayer reflect-or-transmit coin
+
+`src/render.h::thinFilmInterface` and `multilayerInterface` flipped a bare coin with **no
+`whitted` branch at all** — the opaque metal-backed path did `if (rng.uniform() >= R) return
+false;` and the lossless path `if (rng.uniform() < R) outDir = reflect(...) else refract(...)`.
+Both now take the same `double* whittedWeight` out-param contract `refractOrReflect` already had:
+
+- **Lossless substrate** (two real branches): reflect iff `R >= 0.5`, report `R` or `1-R`. TIR
+  reports 1.0 (one branch only).
+- **Opaque / absorbing substrate** (transmission is absorbed, so there is only one *surviving*
+  branch): always reflect and report `R` — the reflectance becomes a throughput weight instead of
+  a survival probability, exactly as `Mirror` and `Filter` already do in mode `W`.
+
+Five places moved together: both functions in `src/render.h`, both device twins in
+`src/render_cuda.cu`, and the `MatType::ThinFilm`/`Multilayer` + `D_THINFILM`/`D_MULTILAYER` call
+sites in `src/backward.h` and `bkInteract`, which fold the weight in via
+`whittedAttenuate`/`dWhittedAttenuate`. Every non-mode-W caller (forward `A`/`B`/`C`, `M`/`S`,
+BDPT, VCM, the wavefront kernel) passes `nullptr` and is bit-identical.
+
+Measured on `scraps/n3d_gpu.ftsl` — the N3b box with a lossless thin film (`bubble`), an
+absorbing thin film (`beetle`), a lossless multilayer (`dichroic`) and an absorbing multilayer
+(`morphoish`), so all four code paths are in one frame — at 400×260 `-spp 1`, absolute exposure,
+CPU vs GPU via `scraps/n3b_check.py`:
+
+| | bit-identical | max \|dLuma\| | max \|dChroma\| | |
+|---|---|---|---|---|
+| before (v0.111.0) | 91.780 % | 6.678 | 5.820 | **FAIL** |
+| after (v0.112.0) | **99.697 %** | **0.144** | **0.078** | **PASS** |
+
+That is inside the same 1.5-code-per-20 px-block bar the non-iridescent N3b bed passes at.
+`scraps/n3d_montage.py` draws the before/after proof picture (`png/n3d_montage.png`): the
+amplified CPU−GPU difference lights up on exactly the four iridescent spheres before the fix and
+is black after it. The N3b and N3a A/B beds were re-run and are unchanged (99.561 % / 0.144 /
+0.105 and 99.264 % / 0.253 / 0.547 — *corrected 2026-07-30: this line originally read
+"99.394 % / 0.131 / 0.190" for the N3a bed, which does not reproduce and disagrees with the
+99.264 % TODO §N3a records; `scraps/n3_gpu.ftsl` contains only diffuse/mirror/filter/glossy, so
+neither N3d-1 nor N3d-2 can move it and 99.264 % has been its value since N3a*), and the
+stochastic path was checked to be unbiased as well
+as untouched: forward `-mode C` on this scene conserves energy (sum/emitted 1.000001) and a
+mode-`R` CPU↔GPU pair converges as √spp from 32 to 1024 spp (mean \|diff\| 24.95 → 5.25,
+\|dLuma\| 5.83 → 1.47, \|dChroma\| 12.49 → 2.17, all ≈ √32; frame means within 0.06 %).
+
+#### FIXED (2026-07-30, v0.113.0): the grating diffraction-order pick and the fluorescent λ_in
+
+Both were solved the way the entry above predicted — N2's trick, not N3d-1's. Neither pick is a
+dominant *branch*; each is a **discrete draw from a distribution**, and each is already **analog**
+(candidate `i` with probability `w_i/Σw`, throughput unchanged), so replacing the random `u` with a
+stratified one off the `(sIdx, bounce)` lattice is a pure **variance** fix — unbiased, same
+estimator, only the per-pixel luck removed.
+
+Two new lattice helpers, `BackwardRenderer::whittedOrderU` / `whittedFluoroU` (`src/backward.h`)
+with bit-identical device twins `dWhittedOrderU` / `dWhittedFluoroU` (`src/render_cuda.cu`),
+carrying fresh prime bases (43/47/53/59 and 61/67/71/73) so they don't correlate with
+`whittedGlossyDir`'s 13/17…37/41. They differ deliberately in one respect:
+
+- **`whittedOrderU` is NOT rot05'd**, because `gratingDiffract`'s whitted path walks its
+  candidates in **descending efficiency** (`0, −1, +1, −2, +2, …`) rather than the stochastic
+  path's `mm = −M..+M`. `radicalInverseB` returns 0 at `sIdx` 0 in every base, so sample 0 lands
+  on the **specular order m = 0** — the exact analogue of "1 spp collapses a glossy lobe to the
+  mirror direction", with extra spp fanning the spectrum out into the higher orders. (Without the
+  re-ordering, `u = 0` would have picked the most *negative* — most strongly dispersed — order as
+  the `-spp 1` look.) Total mass is the same `Σw` either way, so the two traversals agree in
+  distribution; the stochastic path keeps its ascending walk and stays bit-identical.
+- **`whittedFluoroU` IS rot05'd**, because no excitation wavelength is privileged the way `m = 0`
+  is: rotating by ½ puts sample 0 at the **median** of the excitation CDF (the most representative
+  single λ_in) instead of at its short-λ extreme.
+
+Plumbed as `gratingDiffract(..., const double* whittedU = nullptr)` (host `src/render.h`, device
+`src/render_cuda.cu`) and `scene.emitSampler.sampleAt(u, pin)` / `dSampleSceneLambdaU(sc, u, pin)`
+at the `Fluorescent` / `D_FLUORESCENT` case. Every non-whitted caller passes `nullptr` (host
+render.h ~1330; device 4591 / 7650 / 9044) and is bit-identical.
+
+**One port subtlety worth remembering:** the device whitted branch computes the CDF walk in
+**`double`**, and recomputes each `1/(1+|m|)` from the order instead of reading the `Real wgt[]`
+the stochastic path builds. The weights are small exact rationals, so accumulating them in double
+in the same sequence the host uses makes the *selection* bit-identical. That matters far more here
+than elsewhere in the port: an fp32 tie-break near a cumulative boundary would send the ray into a
+**neighbouring diffraction order** — a structural CPU/GPU difference, not the usual silhouette
+sliver.
+
+Measured on `scraps/n3d2_grate.ftsl` — four gratings (three groove spacings + one rotated 90° to
+check the dispersion axis comes off `groove_dir` consistently), a flat grating pane (a flat surface
+holds one incidence angle across a wide area, so an order flip is far more visible than on a
+sphere), high-contrast bars behind everything so a wrong order shows as a *displaced bar* rather
+than a flat tint, plus the N3d-1/N3b carry-overs. 400×260 `-spp 1`, absolute exposure:
+
+| test | result |
+|---|---|
+| `n3b_check.py` CPU vs GPU, `-spp 1` | 99.606 % bit-identical, 99.932 % within 1 code, max \|dLuma\| **0.144** / \|dChroma\| **0.103** — **PASS** |
+| strict `n3_check.py`, same pair | 36 hot pixels, **0 blob interior** — passes even the N3a sliver bar |
+| same pair at `-spp 64` | 99.311 % bit-identical, \|dLuma\| **0.050** / \|dChroma\| **0.093** — **PASS** (*tighter* than 1 spp, as averaging over orders should be) |
+| `-spp 1` vs `-spp 64` on one device | \|dLuma\| **68.279** codes — the higher orders really do fan out; 1 spp is the undiffracted preview, not the converged image (`png/n3d2_spp_fanout.png`) |
+| forward `-mode C`, 20 M photons | sum/emitted **0.999998** (CPU) / **0.999970** (GPU) — stochastic path untouched and still conserving |
+| N3d / N3b / N3a regression beds | 99.697 % / 99.561 % / 99.264 % — **unchanged to the digit** |
+
+`scraps/n3d2_montage.py` draws the before/after proof (`png/n3d2_montage.png`, from the *full*
+`scraps/n3d2_gpu.ftsl` bed which keeps the dye): pre-fix, the four grating spheres and the flat
+pane are rainbow salt-and-pepper and the amplified CPU−GPU panel lights up on exactly them;
+post-fix they are smooth and that panel goes black over them. The fluorophore's own per-device
+speckle is gone too (`png/fluo_W2_ab.png`: the dye pane is a perfectly flat region at `-spp 1` on
+both devices) — but its cross-device *power* still diverges wildly, which is the **separate** open
+BUG at the top of this file, and is why the cross-device A/B is run on the dye-free
+`n3d2_grate.ftsl`.
+
+### DEBT (2026-07-29, v0.107.0): mode `W` picks a dielectric's dominant branch, it does not fork
+
+*(Supersedes the v0.105.0 "still samples dielectrics stochastically" entry and the v0.106.0
+"opaque bright blob" BUG — both **FIXED**, see below.)*
+
+`refractOrReflect` (`src/render.h`) now takes a `whittedWeight` out-param: mode `W` takes
+the **dominant** Fresnel branch (reflect iff R ≥ 0.5) and folds that branch's weight into
+the path throughput via `whittedAttenuate`, the same trade `MatType::HalfMirror` /
+`Layered` / `Mix` already make. That removed the coin flip, which was the real bug.
+
+What remains is the inherent limit of "dominant only": a dielectric is the one place where
+forking *both* branches genuinely matters (a window shows a reflection **and** what is
+behind it at once), so near the Brewster/grazing crossover one of them is visibly dropped.
+The honest version forks up to a small depth budget, POV-Ray-style, pruned by
+`kWhittedCutoff` — which prunes hard, since a normal-incidence reflection weighs ~0.04 and
+its second bounce ~0.0016 is already under the 1/512 cutoff, so the fork tree stays shallow
+in practice. That needs `radiance`/`radianceHero` to grow a recursive branch, which they
+currently avoid (both are iterative single-path loops).
+
+#### FIXED (2026-07-29, v0.107.0): the stochastic coin flip
+
+`-mode W` replaced every other Monte-Carlo estimator on the backward walk with a fixed
+quadrature, but `refractOrReflect` was left alone and still drew `rng.uniform()` to choose
+reflect vs refract. So glass was the one thing in a "noise-free" mode that was noisy — and
+at `-spp 1`, where the mode is meant to be used, a single coin flip per pixel is not noise
+but **salt-and-pepper**: `ftrace -in scenes/cornell.ftsl -mode W -spp 1` rendered the SF10
+ball as a speckled blob. Fixed by the dominant-branch selection above. (The roughness
+perturbation, also stochastic, is skipped in mode `W` for the same reason — consistent with
+mode `W` taking the mirror direction for glossy lobes.)
+
+#### FIXED (2026-07-29, v0.107.0): "opaque bright blob" — the original diagnosis was wrong
+
+The v0.106.0 BUG entry claimed the sphere had "no lens structure whatsoever" and did **not**
+improve with `-spp`, "converging to the wrong answer". Both claims were artifacts of the
+metric it used. It scored sphere-centre *saturation max−min* (9.8 at `-spp 1`, 4.7 at 16,
+4.4 at 128) and read the *fall* as bias converging; that fall was simply the **coin-flip
+noise averaging out**. Measured properly against a 2504-spp mode-`R` reference at 640×400
+(`scraps/wprev_ref.png`), mode `W` at `-spp 16` is now:
+
+| metric | ref (mode R) | W `-spp 1` | W `-spp 16` |
+|---|---|---|---|
+| sphere / lit-wall luminance ratio | 2.19 | 3.50 | **2.04** |
+| structure inside the ball (std) | 14.2 | 12.2 | **11.5** |
+| hue, sphere R−G | +8.7 | **−163.6** | +33.3 |
+
+Structure 11.5 vs the reference's 14.2 is *not* an opaque blob — the refracted lens image is
+there — and the brightness ratio is within 7% of the reference, so the "~2× too bright"
+reading was the direct-only wall being dark, not the glass being bright.
+
+The one real residue is **hue**, and it is the wavelength issue below, not the interface.
+
+### FIXED (2026-07-29, v0.108.0): mode `W` renders dispersive materials at ONE wavelength per sample
+
+**Fixed by split-at-dispersion in the backward tracer** (`BackwardRenderer::heroSplit`,
+`radianceHeroLoop` in `src/backward.h`; mode `W` enables it unconditionally, mode `R` keeps it
+opt-in via `-herosplit`). At a dispersive vertex the bundle now fans into C monochromatic
+sub-paths, each refracting along its own Snell direction and accumulating into **its own**
+`L[i]` slot, instead of terminating the secondaries and boosting the hero ×C.
+
+Measured on `scenes/cornell` (glass sphere region, chroma = each channel's fraction of the
+total, so brightness is normalised out and only the *tint* is compared, against a 4096-spp
+`-direct-only` mode-R reference):
+
+| estimator | chroma error | render (960×600) |
+|---|---|---|
+| de-hero, 1 spp (old) | **36.67 pp** — the flat-green collapse | 0.5 s |
+| de-hero, 16 spp (the old `wNeedSpp` workaround) | 4.20 pp | 7.1 s |
+| **split, 1 spp (new)** | **0.80 pp** | **0.9 s** |
+
+So the fix is **5× more accurate than the 16-pass workaround at 7.9× less cost**, and the
+workaround is gone (`wNeedSpp` no longer lists the dispersive materials). The split costs ~1.8×
+a single de-hero pass on this scene (C× traversal *past* the glass only) and is free on a scene
+with no dispersive material — `_room_of_gyroids_f12` mode W is bit-identical to v0.107.0.
+
+Verified **unbiased**, not just prettier: de-hero and split are two estimators of one integral,
+and on `scenes/absolute.ftsl` (fixed gain 6, so no per-image auto-exposure) at 2048 spp they
+agree to **+0.33 / +0.28 / +0.52 %** per channel against a ~2.2 % noise floor. *Do this
+comparison in absolute mode:* the same run tone-mapped with per-image auto-exposure reads a
+spurious "+5.4 % bias", because the split resolves the dispersive caustic geometrically and
+moves the p99 anchor by ~1.8× — the identical trap the mode-U validation notes in `TODO.md`.
+
+Still de-heroes (so still needs multiple passes in mode `W`): the scalar, bundle-free path taken
+for participating media / GRIN / `-heroc 1`. `wNeedSpp` now tests for exactly those.
+(**`Layered`** used to be on this list — its coat Fresnel is a λ-dependent *decision* rather than a
+λ-dependent direction, so the dispersion split did not apply. v0.115.1 solved it differently, by
+applying the coat reflectance as a per-λ *weight* with the bundle intact and fanning out only when
+the decision itself differs across λ; see the layered de-hero entry above.)
+
+<details><summary>Original entry (kept for the diagnosis, which the fix is built on)</summary>
+
+The `R−G = −163.6` above: at `-spp 1` a glass ball comes out violently green. A dielectric
+(or thin film / multilayer / grating / half-mirror / fluorescence) **de-heroes** the path —
+`radianceHero` terminates the secondary wavelengths and continues the hero channel alone,
+because the interface refracts each wavelength in a different direction. Mode `W`'s
+wavelength lattice `whittedLambdaU(sIdx)` is a function of the **sample index alone**, which
+is precisely what makes the mode noise-free (every pixel agrees), so at `-spp 1` the *entire
+frame* de-heroes onto *one* wavelength and every dispersive object is tinted by it. It is
+under-sampling, not bias: `R−G` falls −163.6 → +33.3 by `-spp 16` (reference +8.7).
+
+Mitigated, not fixed: the README documents `-spp 8`–`16` for glass, and the interactive
+viewer's mode-`W` preview auto-detects a dispersive material in the scene and keeps adding
+passes to 16 spp (`wNeedSpp` in `src/main.cpp`), stopping at 1 spp otherwise since a
+bundle-only scene is already exact.
+
+*Proper fix:* split the bundle at a de-hero vertex instead of collapsing it — run the scalar
+continuation once per hero wavelength and accumulate into `L[i]`, so one sample still covers
+`heroC` wavelengths through glass. Costs up to `heroC`× at dielectric vertices only.
+`hero::gSplit` (`-herosplit`) already does something structurally similar on the CPU forward
+tracer and is the place to look for prior art. Note the comment above the scalar λ draw in
+`renderRows` still says the hero path "gets C=heroC of them per sample for free" — true only
+until the path de-heroes, which is exactly this case.
+
+*Why it matters beyond glass:* it silently invalidated a GI measurement. The first attempt
+to evaluate `-gi` on `scenes/cornell` compared mode-`W` frames against a mode-`R`
+reference where the mistinted sphere was the single largest error in the frame, swamping the
+interreflection signal the sweep was trying to measure. `scraps/cor_gi.ftsl` (all-diffuse,
+no dielectric, no glossy) exists specifically to dodge this and the glossy entry below.
+
+</details>
+
+### FIXED (2026-07-30, v0.109.0): mode `W` over-sharpens rough glossy metal
+
+**Fixed by driving the lobe off a deterministic lattice** (`whittedGlossyDir` in
+`src/backward.h`, feeding the new `glossyDirUV` in `src/render.h`). A mode-`W` rough-specular
+vertex now takes point `sIdx` of a 2-D radical-inverse lattice on the power-cosine lobe
+instead of the lobe's single mirror direction, at all four sites that used to collapse it
+(`Glossy` in `interactMaterial`, `Glossy` in the hero loop's achromatic-delta case, and both
+`Layered` coat branches).
+
+The real defect was not aesthetic, it was **consistency**: every sample took the *identical*
+direction, so mode `W` did not converge on the true lobe at *any* budget. Measured on
+`scraps/n2_rough.ftsl` (three gold balls at roughness 0.045 / 0.15 / 0.35 reflecting
+high-contrast bars; mean |err| inside each ball vs a converged direct-only mode-`R`
+reference, absolute exposure so no per-image anchor can move):
+
+| spp | rough 0.045 | rough 0.15 | rough 0.35 |
+|---|---|---|---|
+| 1 | 5.71 → **5.71** | 15.66 → **15.66** | 33.40 → **33.40** |
+| 16 | 3.61 → **2.56** | 13.65 → **6.81** | 31.60 → **11.80** |
+| 64 | 3.51 → **0.97** | 13.62 → **2.45** | 31.49 → **4.16** |
+| 256 | 3.49 → **0.53** | 13.61 → **1.04** | 31.49 → **1.67** |
+
+Read the *old* column down: 33.40 → 31.49 over 256× the budget, a 6 % improvement that is
+purely edge antialiasing. The lobe error never moved. The new column converges (**19×** lower
+at 256 spp on the roughest ball), and `png/n2_old_256.png` vs `png/n2_new_256.png` shows it:
+three indistinguishable mirror balls become a proper satin gradient matching `png/n2_ref.png`.
+
+Two properties are load-bearing and were verified, not assumed:
+
+* **`-spp 1` is bit-identical to v0.108.0**, including on a scene that actually contains
+  glossy material. `glossyDirUV` maps `u1 == 1` to the mirror direction and
+  `radicalInverse(0) == 0` in every base, so the polar sequence is *complemented*
+  (`1 - radicalInverse`) rather than `rot05`-rotated, and sample 0 lands exactly where the old
+  code put it. The `u1 >= 1.0` early-out returns `mdir` verbatim so `normalize()`'s last-bit
+  rescale cannot spoil that.
+* **Every stochastic path is bit-identical** (`-device cpu`, modes R/B/C/M/S/D/U), since
+  `sampleGlossy` was only re-expressed in terms of `glossyDirUV` with its two draws sequenced
+  into locals. *Compare with `-device cpu` on both binaries* — a CUDA build silently
+  auto-selects the GPU, which reads as a spurious whole-frame "regression".
+
+Each bounce depth takes its own prime pair (13/17, 19/23, 29/31, 37/41) so two glossy
+vertices on one path are not driven by the same 1-D sequence. The path is **not** forked, so
+there is no N^depth blowup in a gyroid labyrinth, and cost at equal spp is unchanged.
+
+Still outstanding: because the lobe is resolved *across* samples rather than within one,
+rough metal is the one thing in mode `W` that genuinely wants `-spp` > 1 — it is no longer
+*wrong* at 1 spp, just as sharp as it always was. `wNeedSpp` does not test for it (a glossy
+scene previews fine; it is only a rough one that benefits), so the interactive viewer stops
+at one pass on rough metal.
+
+<details><summary>Original entry (kept for the diagnosis, which the fix is built on)</summary>
+
+`interactMaterial` sends a mode-`W` glossy vertex along the exact mirror direction,
+weighted by the lobe's reflectance. That is near-exact for the tight lobes this engine's
+metals usually use (the gold in `gold_gyroids` is roughness 0.045 and reads essentially
+identically to full GI) and it is why the mode converges at 1 spp — but a genuinely rough
+metal (roughness ≳ 0.2) previews crisper than it renders.
+
+*Proper fix:* a small fixed lattice of lobe directions — the same trick `-whitted-grid`
+plays for area lights. N deterministic offsets around the mirror direction, weighted by
+the lobe, with N scaled off the roughness so smooth metals stay at one ray. Cost is
+linear in N, and only on specular chains. Do **not** fork the path (that grows as
+N^depth inside a labyrinth like a gyroid); drive the single lobe direction from the
+low-discrepancy sequence indexed by (absolute sample index, bounce), *without* the
+`rot05` half-offset on the polar coordinate, so sample 0 is exactly today's mirror
+direction and higher `-spp` progressively widens the lobe.
+
+*Upgraded 2026-07-29, v0.106.0 — this is now measured to be the LARGER error of the two,
+at least on rough gold.* The claim above that roughness 0.045 gold "reads essentially
+identically to full GI" is too generous. Evaluating the new `-gi` gather on
+`gold_gyroids` (420², vs a converged mode-`R` reference) showed the gather buying only a
+6 % whole-frame improvement for 4.5× the cost:
+
+| mode W variant | crevices (darkest 10 %) | whole-frame mean \|err\| |
+|---|---|---|
+| no ambient | 25.4 (signed −21.3) | 24.7 |
+| `-ambient 0.05` | 13.8 (signed −8.2) | 13.3 |
+| `-ambient 0.05 -gi 32` | 13.6 (signed −7.6) | 12.5 |
+| `-ambient 0.05 -gi 64` | 13.2 (signed −7.3) | 12.1 |
+
+The difference image (`scraps/gi_diff.png`) shows the gather *is* depositing genuine
+bounce light on the floor and walls, but the dominant residual sits **on the gold lattice
+itself** — i.e. on the one material whose lobe mode `W` collapses to a mirror. A single
+mirror direction cannot spread light into a labyrinth of crevices, so no amount of
+diffuse GI fixes that scene. Fixing this entry is therefore the higher-value work.
+
+</details>
+
 ### BUG — DONE (2026-07-29, v0.102.1): `-exposure`/`-ev` was silently ignored by `-topng`
 
 `ftrace -topng in.ftbuf out.png -ev 3` produced a file byte-identical to the one
@@ -1496,7 +2463,9 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
     the same `-time` budget and compare photon counts.
   * **Not covered:** the GPU forward tracer (execution divergence as the fan-out wavelengths take different
     branches, plus the emission back-pressure / fixed work-pool needed to keep the device photon buffers
-    bounded), and modes `R` / `D` / `U`. Also **not** applied at `Layered` / `Mix` — see the next bullet.
+    bounded), and modes `R` / `D` / `U`. Also **not** applied at `Mix` — see the next bullet. (`Layered`
+    was in the same boat until v0.115.1, which keeps the bundle alive across a coat via a per-λ weight
+    and a shared coin instead; see the layered de-hero entry near the top of this file.)
 - **Three known approximations in the CPU hero path** (all minor, documented for when they're revisited):
   - **A zero hero throughput kills the whole bundle — FIXED everywhere (2026-07-26).** `bdpt.h`'s
     `randomWalk` (absolute `secF[]` + max-over-live-λ early-out), `backward.h`'s `radianceHero` /
@@ -1510,13 +2479,19 @@ auto-exposure 1.06e-13, energy conserved exactly). The remaining §L-HERO sub-it
   - **Mix material stays multi-λ with a shared child selection.** Exact for constant mix weights; for *spectrally
     varying* mix weights with diffuse children it introduces a small bias (the child is picked by the hero λ's
     weight, secondaries ride along). Acceptable vs. de-heroing every Mix; revisit if a spectral-mix scene shows it.
-    `Layered` has the same shape (its coat Fresnel probability is λ-dependent, so it de-heros outright).
-    **`-herosplit` does not cover either.** These are λ-dependent *decisions*, not λ-dependent *directions*, and
-    their natural split point sits *before* any interaction has happened — which does not fit
+    **`-herosplit` does not cover it.** This is a λ-dependent *decision*, not a λ-dependent *direction*, and its
+    natural split point sits *before* any interaction has happened — which does not fit
     `tracePhotonHeroLoop`'s "resume from a ray" entry shape the way the dispersive case does (there each
     secondary can just re-run `interactPhotonSpecular` at the same hit with its own λ and hand back a fresh ray).
-    Extending split to them needs a "resume at this hit with this material" entry point; worth doing if a
-    spectral-mix or coated-dielectric scene ever shows the bias, but nothing observed yet.
+    Extending split to it needs a "resume at this hit with this material" entry point; worth doing if a
+    spectral-mix scene ever shows the bias, but nothing observed yet.
+    `Layered`'s coat used to be listed here for the same reason, and it was worse than a bias — it de-hero'd
+    outright and mistinted the whole frame at 1 spp. v0.115.1 fixed it without needing a resume-at-this-hit
+    entry point: the coat decision is made **per λ against one shared coin**, the bundle rides through with a
+    per-λ weight whenever the live λ agree, and the backward loop fans out into monochromatic sub-paths
+    re-entering the *same* vertex when they don't. That re-entry trick works for a coat precisely because it
+    happens before any interaction — nothing has been deposited or absorbed yet, and a wide bundle is never
+    inside a medium. The same approach would work for `Mix`, and is the obvious next step if it ever matters.
   - **Equal-*time* benefit is geometry-dependent.** Hero shares one BVH walk across C wavelengths, so its win grows
     with scene complexity. On trivial geometry (Cornell: a few quads + 2 spheres) traversal is nearly free and the
     4× per-λ shading makes hero ~1.6× slower per spp, so at *equal time* single-λ can edge it there. On heavy
@@ -4960,6 +5935,147 @@ correctly on **both** backends.
   backend by scene material variety + path depth rather than always defaulting to the
   megakernel.
 
+### DONE (2026-07-30, v0.116.0): mode W is the only render mode with NO GPU path
+**Fully closed by TODO.md §N/N3a+N3b+N3c.** Mode W now rides the same `kBackward`
+megakernel as mode R with the estimators swapped: seven `DScene` knobs (`bkWhitted`, `bkGrid`,
+`bkGiDirs`, `bkGiGrid`, `bkGiBounce`, `bkHeroSplit`, `bkAmbient`) uploaded from a `WhittedOpts`
+(`src/render_cuda.h`), device twins of every lattice helper (`dRadicalInverse2` /
+`dRadicalInverseB` / `dRot05` / `dWhittedSample` / `dWhittedLambdaU` / `dWhittedGlossyDir` /
+`dWhittedAttenuate` / `dGridUV`), the G×G light quadrature in `bkNeeLight`/`bkNeeLightHero`, and
+the whitted branches of `bkInteract` / `bkRadiance` / `bkRadianceHero`. Measured on
+`scraps/n3_gpu.ftsl` (800×520 `-spp 16`, absolute exposure, `scraps/n3_check.py`): **99.39 %** of
+channel samples bit-identical CPU↔GPU, 99.96 % within one 8-bit code, **zero** pixels inside a
+≥3 px-wide disagreeing region (all residual is single-pixel silhouette/shadow-edge slivers from
+the device's fp32 `Real` + coarser `RAY_EPS`); **12.1 s → 0.3 s**, i.e. ≈40×, well above the ~8.5×
+mode-R ratio predicted below.
+
+**Dispersive materials followed in N3b (v0.111.0).** `bkRadianceHero`'s body became
+`template<bool AllowSplit> bkRadianceHeroLoop(...)`, the device twin of N1's `radianceHeroLoop`:
+the `<true>` instantiation fans each live secondary λ into its own monochromatic sub-path from
+bounce `b+1` (own Snell direction, own copied `DMediumStack`, own `L[i]` slot, no ×C boost) and
+continues the hero unboosted, while `<false>` keeps the old de-hero. `if constexpr` (not a runtime
+`if`) is what makes this safe on the device: the `<false>` body contains no recursive call, so
+re-entry is provably one level deep with a statically-sized frame — no `cudaLimitStackSize`, no
+`-rdc`. `sceneHasDispersiveMat` is gone. Measured on `scraps/n3b_gpu.ftsl` (the N3a box plus
+SF10/BK7/diamond balls and a half-mirror pane, 400×260 `-spp 1`, absolute): 99.561 % bit-identical,
+max |dLuma| 0.144 / |dChroma| 0.105 codes per 20 px block (`scraps/n3b_check.py`, limit 1.5), and
+0 blob interior even under the strict `n3_check.py` bar. The N3a scene re-rendered byte-for-byte
+identically, proving the refactor is inert off the split path.
+
+That commit also fixed a **latent divergence**: `buildUpload` now defaults
+`sc.bkHeroSplit = hero::gSplit`, matching `BackwardRenderer::heroSplit` / `Renderer::heroSplit`.
+Before, GPU mode R *silently ignored* `-herosplit` and always de-hero'd, so CPU and GPU mode R
+disagreed by ~4.4 codes of block luma on a glass scene whenever the flag was passed.
+
+**`-gi <n>` followed in N3c (v0.116.0) — the last mode-W fallback is gone.** The gather is a
+recursion (a diffuse vertex shoots `giDirs` rays back into `radiance()`), which on the device
+would need `-rdc` plus a hand-sized stack, so the depth became a **second, independent
+compile-time parameter**: `bkRadianceHeroLoop<bool AllowSplit, int GiDepth>`,
+`bkRadiance<int GiDepth>`, `bkRadianceHero<int GiDepth>`, `bkInteract<bool AllowGather>`. Only
+`GiDepth == 0` contains a gather call; the rays it spawns are `GiDepth == 1`, whose body
+contains none, and a split sub-path *inherits* its parent's `GiDepth`, so the deepest chain is
+`<true,0>` → gather → `<true,1>` → split → `<false,1>` — three statically-sized frames, no
+`-rdc`. (`bkInteract` takes a `bool` because the hero tracer handles Diffuse/DiffuseTransmit
+inline and routes only dispersive materials there, so it always passes `false` — 2
+instantiations, not 3.) `dGiDir` / `dGiPhases` are the world-space Fibonacci-spiral lattice,
+Cranley-Patterson-rotated by scrambled radical inverses in bases 7/11. `cudaBackwardWhittedSupported()`
+now narrows **nothing** beyond `cudaBackwardSupported()`.
+
+Measured on `scraps/cor_gi.ftsl` (Cornell box, 240×240, `-spp 1`, `scraps/n3b_check.py`,
+1.5-code bar): `-gi 32` CPU↔GPU **98.681 %** bit-identical, 99.914 % within one code, max
+|dLuma| **0.328** / |dChroma| **0.295** codes per 20 px block → PASS; strict `n3_check.py`
+gives 40 hot pixels and **0 blob interior**. The scalar `bkRadiance`/`bkGiGather` path
+(`-heroc 1 -gi 32`) passes independently at dLuma 0.573 / dChroma 0.733. The normalisation
+invariant holds bit-for-bit on the device: `scraps/gi_collapse.ftsl` renders **pixel-identically**
+at `-gi 0` and `-gi 32`, i.e. the gather collapses to exactly `rho * ambient` in an empty scene,
+so switching `-gi` on never steps the exposure. The N3a / N3b / N3d beds all re-verified
+(99.447 / 99.533 / 99.611 % bit-identical, dLuma ≤ 0.153) and all 14 physics self-tests pass.
+
+N3c also fixed three smaller latent divergences found while validating:
+- The **device scalar `bkRadiance`'s gather bounce cap was missing the `min`** — it used
+  `bkGiBounce` outright where the host uses `std::min(maxBounce, giBounce)`, so a `-gi-bounce`
+  larger than `-max-bounce` would have let a gather ray trace *deeper* than the camera path.
+- **`Fluorescent`'s NEE omitted the gi context on *both* sides** (`backward.h`
+  `MatType::Fluorescent`, `render_cuda.cu` `D_FLUORESCENT`), so a fluorescent surface paid
+  `lightGrid²` shadow rays inside a `-gi` gather while every Diffuse vertex paid `giGrid²` — the
+  two materials disagreed on the shadow lattice for no reason. Now both pass `gi` / `gi.depth`.
+- **`--help` still said mode `W` was "(CPU only)"**; it now says "(CPU or GPU)".
+
+Also worth recording: **`-rgb` is now refused in mode W** (message in `main.cpp`) rather than
+silently taken — the fast RGB kernel is a separate reduced tracer with no deterministic
+estimator, so it would return exactly the noise mode W exists to remove.
+
+<details><summary>original entry (v0.107.0)</summary>
+
+- **Where:** `main.cpp:4292` — `const bool gpuBackwardMode = (mode == 'R' && !g_whitted);`
+  is the entire gate. Mode W is mode R with `g_whitted`, so that one clause routes it to the
+  CPU unconditionally. `render_cuda.cu` has zero whitted plumbing: the device `DScene` carries
+  `bkDirectOnly` (mode R's `-direct-only`) but no `bkWhitted` / `bkGrid` / `bkGi` / `bkAmbient`.
+  Every other mode (A/B/C forward, D BDPT, M photon map, R backward spectral + `-rgb`, S SPPM,
+  U VCM, G2 iso preview) has a device backend.
+- **Measured payoff (RTX 4090 vs 12 CPU threads, 480x300, `-heroc 8`, this machine):**
+
+  | scene | mode | CPU | GPU | ratio |
+  |---|---|---|---|---|
+  | `cornell.ftsl` | R, 32 spp | 1.8 s | 0.2 s | ~9x |
+  | `_room_of_gyroids_f12.ftsl` | R, 8 spp | 14.5 s | 1.7 s | ~8.5x |
+  | `_room_of_gyroids_f12.ftsl` | **W, 1 spp** | **5.0 s** | (none) | — |
+
+  So a device mode W projects to ~0.6 s on the gyroid room at 480x300 (~3 s at 960x600, down
+  from 25.7 s) — enough to turn the viewer's banded progressive preview into a per-pose redraw.
+- **Why it should beat 8.5x:** that ratio is strikingly low for a 4090 over 12 threads, which
+  says the spectral backward megakernel is divergence/register-bound rather than throughput-
+  bound. Mode W is *more* coherent than mode R by construction — fixed `lightGrid^2` quadrature
+  instead of one random shadow ray, `whittedAttenuate`'s deterministic cutoff instead of
+  Russian roulette (threads in a warp now terminate together), mirror direction instead of a
+  sampled glossy lobe, dominant branch instead of a Fresnel coin flip. All four remove warp
+  divergence, so mode W is closer to the GPU's happy path than anything already ported.
+- **Why it is still not trivial:** `kBackward` is a hand-written *mirror* of `backward.h`, not
+  shared code, so all ~30 `whitted` sites in `backward.h` need device twins. And the usual
+  escape hatch does not apply — `render_cuda.h` explicitly allows the stochastic modes to be
+  "an independent noise realization that agrees to within Monte-Carlo noise", but mode W has no
+  noise to hide a mismatch behind. Any disagreement in the quadrature, the radical-inverse
+  lattices (`whittedSample` / `whittedLambdaU`, incl. the `rot05` offsets), or the de-hero point
+  is a *visible deterministic* CPU/GPU difference. The port therefore needs a bit-exact A/B
+  against the CPU as its acceptance test, not a statistical one.
+- **Proper fix:** add `bkWhitted` / `bkGrid` / `bkGiGrid` / `bkAmbient` to `DScene`, port the
+  whitted branches into `bkInteract` + the `kBackward` light loop, drop the `&& !g_whitted` from
+  the gate, and gate on a new `cudaBackwardWhittedSupported()`. Do it on the **spectral**
+  `kBackward`, not `kBackwardRGB` — the spectral device scope (media, fluorescence, textured
+  albedo, constant env, lens) is far wider than the RGB one, so this would also give the viewer
+  a much broader-scope GPU preview than `-rgb` reaches today.
+- **Spectral vs `-rgb`: do NOT assume spectral is much slower.** Measured on GPU, same scene/spp:
+
+  | scene | spp | `-rgb` | spectral `-heroc 8` | spectral penalty |
+  |---|---|---|---|---|
+  | `cornell.ftsl` | 1024 | 0.7 s | 1.2 s | 1.7x |
+  | `_room_of_gyroids_f12.ftsl` | 64 | 9.5 s | 12.1 s | **1.27x** |
+
+  Not 8x — hero sampling carries all 8 wavelengths down ONE shared BVH walk, and traversal is
+  the expensive part, so only the (cheap) shading arithmetic multiplies. The heavier the
+  geometry the smaller the penalty.
+- **Where `-rgb` would genuinely win is de-hero, not speed.** For the stochastic modes `-rgb`'s
+  advantage is convergence (no chroma noise); at mode W's 1 spp there is no noise, so that
+  evaporates and only the 1.27-1.7x per-sample cost is left. But spectral mode W on a glass
+  scene collapses the frame onto one wavelength (the de-hero DEBT below) and needs up to 16
+  passes — call it ~20x the RGB cost — whereas the RGB walk has no wavelength dimension at all
+  and so is honestly 1-spp-clean on plain glass (`MatType::Dielectric` IS in the RGB scope,
+  `render_cuda.cu:10976`).
+- **Therefore fix the de-hero bundle split FIRST, and re-measure before writing an RGB mode W.**
+  Once spectral mode W is 1-spp-clean on glass, `-rgb`'s entire remaining advantage is 1.27-1.7x
+  — not worth a second hand-written megakernel that has to stay bit-exact with the CPU. The
+  likely outcome is that the bundle-split fix makes an RGB mode W unnecessary.
+- **Order:** (1) de-hero bundle split [CPU], (2) deterministic glossy-lobe lattice [CPU],
+  (3) port spectral mode W to the device, (4) re-measure and only then judge `-rgb`. Steps 1-2
+  come first because they change mode W's estimator, and porting an estimator that is about to
+  change means writing the device twin twice.
+- **Nothing to do on the CPU side:** all four knobs already ship there — `-mode W` (`g_whitted`)
+  and `-whitted-grid N` (`g_whittedGrid`) in v0.105.0, `-gi`/`-radiosity` (`g_gi`) and
+  `-ambient`/`-amb` (`g_ambient`) in v0.106.0. `bkWhitted`/`bkGrid`/`bkGiGrid`/`bkAmbient` are
+  just the proposed device-`DScene` field names (matching the existing `bkDirectOnly`) that would
+  carry those existing CPU features across. This is a pure port, not a feature.
+</details>
+
 ## Performance
 
 ### RESOLVED: Diffuse-mesh renders were ~60× slower per photon (degenerate BVH)
@@ -5029,7 +6145,42 @@ correctly on **both** backends.
 - **Alternative worth its own feature (deferred):** a **native SDF / implicit-surface
   primitive** (sphere-traced, GPU-portable) would give metaballs/isosurfaces *exactly*
   without lossy tessellation — useful independent of any importer, and the right way to
-  ever support POV-Ray-style implicit geometry. Not started.
+  ever support POV-Ray-style implicit geometry. **DONE** — `isosurface` (`src/implicit.h`,
+  FTSL §10), on CPU and GPU, with POV's marching controls adopted name-for-name
+  (`contained_by`, `max_gradient`, `accuracy`, `method sample`, `refine`), all **78** of
+  POV's `functions.inc` internal functions as bit-exact ports of `fnintern.cpp`
+  (`src/pov_functions.h`), and an exact port of POV's Perlin `Noise()` (`src/pov_noise.h`).
+- **Does that reopen the importer? NO — re-evaluated 2026-07-30, still declined.** The SDF
+  primitive answers only part of objection (2), and objections (1) and (3) are untouched.
+  The decisive point: POV's CSG is **ray-interval arithmetic over closed solids** (every
+  primitive must report *all* hits along a ray plus an `inside()` predicate), whereas ours
+  is **min/max on distance fields**. Those are not interchangeable. Ours cannot take a
+  `mesh` (there is no mesh→SDF path in the tree, and adding one is lossy), nor POV's
+  `prism` / `lathe` / `sor` / `text` / `bicubic_patch`; POV's `quadric` / `quartic` /
+  `poly` are expressible as `function { expr }` but are then *marched* rather than
+  root-found. Conversely ours does smooth/filleted booleans, which POV's cannot. So a
+  general POV scene using CSG still lands back on tessellation + mesh booleans for
+  anything non-SDF — objection (2) verbatim, for that class of scene.
+  **Note the reason is value and prerequisites, not effort:** the blockers are that a
+  faithful importer needs a Turing-complete interpreter plus POV's `.inc` standard library
+  (most real-world scenes `#include` at minimum `colors.inc`), and that POV's RGB /
+  non-physical lights and cameras must be re-authored into spectral absolute radiance
+  regardless — so the only thing an importer actually delivers is *geometry*, for which
+  Mitsuba XML (and hence Blender) already works. What was worth taking from POV-Ray has
+  been taken: its function corpus, its isosurface machinery, and its deterministic Whitted
+  model (mode `W`, with `-gi` standing in for radiosity).
+- **The separable question, if mesh booleans are ever wanted:** general interval CSG over
+  the *native* primitives. Scope is real but bounded — `allHits()` alongside `closestHit()`,
+  a BVH traversal that collects instead of pruning by `tMax`, fixed-size interval stacks on
+  the device, and interaction with the dielectric medium stack. Only `sphere` / `mesh` /
+  `isosurface` would qualify (`quad` and `triangle` are infinitely thin, so they are not
+  solids and CSG over them is meaningless — POV carries the same caveat). Mesh `inside()`
+  by parity counting *is* reliable here because the triangle test is watertight. Still not
+  recommended: the payoff is essentially "drill a hole in an imported mesh", which Blender
+  does better upstream of the existing import path. The cheap ~80 % alternative would be
+  POV-style **`clipped_by`** (clip a primitive by a half-space/convex region and cap the
+  opening) — no interval lists needed, and the isosurface container-cap code already has
+  most of that machinery.
 
 ## DONE (2026-07-22): Mode-M shared photon-map deposit/build hangs on the full gallery scene (4M photons) — was the CPU meter pre-pass; meter now runs on the requested device
 
