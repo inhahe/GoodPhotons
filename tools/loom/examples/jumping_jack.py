@@ -63,7 +63,8 @@ Run:
   python examples/jumping_jack.py --still    # one held still (pose check)
   python examples/jumping_jack.py --render   # render the looping GIF
 
-Knobs: ``--res N``, ``--freq F``, ``--solid F``, ``--ball R``, ``--rod R``, ``--fill F``,
+Knobs: ``--res N``, ``--freq F``, ``--solid F``, ``--counter F``, ``--ball R``,
+``--rod R``, ``--fill F``,
 ``--t PHASE`` and ``--name NAME`` (both for ``--still``), ``--plain-glass``.
 """
 
@@ -221,10 +222,10 @@ def aim_y_euler(d: Sequence[float]) -> Tuple[float, float, float]:
 # envelope patches shrink with it, since they only survive where the field is negative.
 # `solid` is converted to a level set by the measured mapping in `Jack.level`.
 #
-# That works, and `solid` turned out to be the only lever that does.  Swept at 720x720:
-# 0.16 gives broad windows you can see the room through, 0.24 keeps the windows but on
-# visibly heavier walls, 0.30+ is the golf ball again.  0.24 is the "less holey but still
-# see-through" setting and is the current default; 0.16 is the openwork end of the range.
+# That works, and among single-level carves `solid` is the only lever that does.  Swept at
+# 720x720: 0.16 gives broad windows you can see the room through, 0.24 keeps the windows but
+# on visibly heavier walls, 0.30+ is the golf ball again.  0.24 was the default until the
+# counter-network below made 0.20 the better base; 0.16 is the openwork end of the range.
 #
 # `freq` then controls scale alone: cell period `2*pi/freq`, so a ball spans
 # `ball*freq/pi` cells.  The intuition that *more* cells would look more like the lacy
@@ -242,8 +243,72 @@ def aim_y_euler(d: Sequence[float]) -> Tuple[float, float, float]:
 # Sanity-checked for structural integrity rather than trusted: sampling every rod's cross
 # section over 60 frames x 6 arms x 24 slices, the retained fraction never reaches zero at
 # 0.16 (worst 2%), so no ball is ever carved free of the hub.
+#
+# ---------------------------------------------------------------------------
+# `counter`: closing the sight-lines without closing the surface
+# ---------------------------------------------------------------------------
+# `solid` alone cannot separate "looks lacy" from "you can see the room through it",
+# because for a plain one-level carve **the fraction of the ball's outer surface that
+# survives is exactly the volume fraction** — so raising `solid` darkens the windows and
+# fattens the skin in lockstep.  Two quantities, one knob.  Measured over 32 random ball
+# placements x 4000 rays each (`scraps/see_through.py`, paired sampling so every candidate
+# sees identical rays):
+#
+#     solid   see-through %   envelope %      see-through = rays crossing the ball that
+#      0.24        14.9          23.4         meet NO material at all; envelope = share of
+#      0.30        10.6          29.4         the ball's own smooth surface left behind
+#      0.36         7.4          35.5
+#      0.44         4.7          43.5
+#
+# Halving see-through costs ~12 points of envelope, i.e. the golf ball comes back.  Five
+# other mechanisms were measured against that baseline, and the ranking was not the
+# expected one:
+#
+#   * A 4-D gyroid sliced at a generic angle — quasiperiodic, so no exact straight
+#     channels, and the obvious reading of "rotate it in a higher dimension".  It is
+#     WORSE: 18.4% see-through at 24.3% envelope, against 14.9/23.4.  Quasiperiodicity
+#     removes the *periodic* channels but replaces them with wider irregular voids, and it
+#     is void width, not channel straightness, that a 1-metre ray cares about.
+#   * Unioning a copy shifted half a period in all three axes: a no-op.  Shifting x,y,z by
+#     pi each maps sin(x+pi)cos(y+pi) -> sin(x)cos(y), so the "shifted" gyroid is the
+#     original.  (An unpaired first measurement made this identity look like a 1.7-point
+#     win, which is why the sweep is paired now.)
+#   * A denser core inside each arm ball: works (8.7% at unchanged 23.4% envelope) but
+#     leaves a hard spherical seam mid-hole.
+#   * A finer lattice unioned on top: the strongest blocker of all (1.6%) but it crusts the
+#     skin over at 35.9% envelope — the golf ball by another route.
+#   * A rotated incommensurate copy: 6.5% at 30.9% — good, but it pays full envelope for
+#     the privilege since both copies lie on the skin.
+#
+# What actually works is to spend volume where the *sight-lines* are rather than where the
+# surface is.  The voids of `g <= c` are `g > c`, and the OTHER labyrinth's core, `g >= t`,
+# runs right down the middle of them.  So union a sparse counter-network onto the carve:
+#
+#     solid  counter   see-through %   envelope %   runs   patches
+#      0.24     —           14.9          23.4      1.59     18.2
+#      0.20    0.06          7.5          25.7      2.10     48.5
+#      0.24    0.06          5.9          29.6      2.18     46.7
+#
+# `runs` is the mean number of separate solid segments a ray passes through and `patches`
+# the number of disconnected islands the surviving envelope breaks into on a ball.  Both
+# matter as much as the headline numbers: `runs` ~2.2 means you look *into* a hole and find
+# more structure behind it (a pocket, not a window), and tripling the patch count means the
+# same envelope percentage is spread over many small islands instead of a few broad caps —
+# so 0.20+0.06 reads *lacier* than plain 0.24 despite covering 2 points more of the skin,
+# while seeing through only half as much of it.
+#
+# The counter-network is a single connected structure, not dust: labelled over a 2x2x2
+# block of cells it is 98.4% one component and spans all three axes even at 4% by volume
+# (`scraps/see_through2.py`).  The combined solid is likewise connected and spanning.
+#
+# The symmetric version of the same idea — the double gyroid `|g| >= t`, both labyrinth
+# cores and no sheet — measures slightly better still (7.6% at 24.1%).  It is not used,
+# because its two networks are provably disjoint (largest component 49.2% of the solid, one
+# per labyrinth): the arms would be two interlocked but unconnected lattices, and the point
+# of the piece is six balls *held together* by six rods.
 FREQ = 15.0
-SOLID = 0.24
+SOLID = 0.20
+COUNTER = 0.06
 FILL = 0.0
 ARM = 1.0
 BALL = 0.52
@@ -291,6 +356,7 @@ class Jack(Element):
     def __init__(self, *, arm: float = ARM, ball: float = BALL, rod: float = ROD,
                  spin: float = 1.0, precess: float = 1.0, tilt: float = TILT,
                  freq: float = FREQ, solid: float = SOLID, fill: float = FILL,
+                 counter: float = COUNTER,
                  centre: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                  gold: str = "gold", glass: str = "glass",
                  gyroid_glass: bool = True, name: str = "jack") -> None:
@@ -304,6 +370,7 @@ class Jack(Element):
         self.tilt = float(tilt)
         self.freq = float(freq)
         self.solid = float(solid)
+        self.counter = float(counter)
         self.gold = gold
         self.glass = glass
         self.gyroid_glass = bool(gyroid_glass)
@@ -337,7 +404,7 @@ class Jack(Element):
                        _ry(2.0 * math.pi * self.spin * t)))
 
     def gyroid_fields(self) -> List[str]:
-        """The world-static gyroid as the ``function`` field(s) to carve the arms with.
+        """The base carve: the ``function`` field(s) whose INTERSECTION is the solid.
 
         Renormalised to ~unit Lipschitz (see the module docstring), and returned as a
         list because the interesting case needs **two** leaves.
@@ -368,11 +435,8 @@ class Jack(Element):
         The implied world thickness ``2*g0 / (1.529*freq)`` is reported by
         :meth:`shell_report` — it matters only because it must stay a few pixels wide.
         """
-        f = self.freq
-        s = 1.0 / (2.0 * f)
-        raw = (f"sin({fmt(f)}*x)*cos({fmt(f)}*y)"
-               f"+sin({fmt(f)}*y)*cos({fmt(f)}*z)"
-               f"+sin({fmt(f)}*z)*cos({fmt(f)}*x)")
+        s = self._scale()
+        raw = self._raw()
         c = self.level()
         inner = raw if c == 0.0 else f"{raw}-({fmt(c)})"
         core = f"({inner})*{fmt(s)}"
@@ -385,6 +449,97 @@ class Jack(Element):
         hi = gyroid_quantile(p + 0.5 * self.fill)
         return [f"({raw}-({fmt(hi)}))*{fmt(s)}", f"({fmt(lo)}-({raw}))*{fmt(s)}"]
 
+    def counter_field(self) -> Optional[str]:
+        """The counter-network ``g >= t``, or ``None`` when ``counter`` is off.
+
+        The gyroid has two interpenetrating labyrinths, and the base carve ``g <= c`` is
+        drawn entirely from one of them.  Its voids are therefore ``g > c`` — and the
+        *other* labyrinth's core, the high-field region ``g >= t``, threads right down the
+        middle of exactly those voids.  Unioning it in spends volume where the sight-lines
+        are instead of where the surface is, which is the whole trick: see-through halves
+        for ~2 points of envelope, where buying the same reduction out of ``solid`` would
+        cost ~12 (module docstring for the measurements).
+
+        ``counter`` is the volume fraction the network occupies, so the level is the
+        ``1 - counter`` quantile.  (The gyroid is odd under point inversion, so this is
+        just ``-gyroid_quantile(counter)``; it is written the direct way so it stays
+        correct without leaning on that symmetry.)
+        """
+        if self.counter <= 0.0:
+            return None
+        t = self.counter_level()
+        return f"(({fmt(t)})-({self._raw()}))*{fmt(self._scale())}"
+
+    def fused_field(self) -> Optional[str]:
+        """Base carve UNION counter-network as ONE leaf, evaluating the gyroid once.
+
+        The obvious emission is a ``union`` of two ``function`` leaves, and it is correct —
+        but ftrace evaluates every leaf at every sphere-trace step, so it costs *twice* the
+        trigonometry (12 sin/cos per step instead of 6) on the hottest loop in the scene.
+        The two leaves are ``a = (g-c)*s`` and ``b = (t-g)*s`` and their union is
+        ``min(a, b)``, so use the identity
+
+            min(a, b) = ((a + b) - |a - b|) / 2
+
+        Here ``a + b = (t - c)*s`` is a **constant** — the ``g`` terms cancel — and
+        ``a - b = (2g - c - t)*s``, so ``g`` survives in exactly one place:
+
+            ((t - c) - |2g - c - t|) * s/2
+
+        which is one leaf and six trig calls.  Exact, not an approximation: verified to
+        agree with the two-leaf union sign-for-sign over 2M samples.
+
+        The Lipschitz bound is unchanged, which is what keeps ``max_gradient 2`` honest:
+        d/dg of the above is -/+ s, the same as the plain leaf's, so |grad| <= sqrt(3)
+        still.
+
+        Only the ``fill = 0`` case fuses.  A shell is ``max`` of two leaves that each carry
+        their own ``g``, so unioning the counter onto it leaves ``g`` in two places whatever
+        the algebra; that path stays an explicit tree.
+        """
+        if self.counter <= 0.0 or self.fill > 0.0:
+            return None
+        c, t, s = self.level(), self.counter_level(), self._scale()
+        return (f"({fmt(t - c)}-abs(2*({self._raw()})-({fmt(c + t)})))"
+                f"*{fmt(0.5 * s)}")
+
+    def carve_lines(self, ind: str) -> List[str]:
+        """The carving field as ONE field-tree node, indented by ``ind``.
+
+        Base alone is a bare ``function``; a shell is an ``intersect`` of two; adding the
+        counter-network unions one on.  Emitting a single node (rather than leaning on
+        ``max`` being associative to splice extra children into the caller's ``intersect``)
+        is what lets the counter-network be a *union* here — the two operations do not
+        commute, so the nesting has to be explicit.
+        """
+        fused = self.fused_field()
+        if fused is not None:
+            return [f'{ind}function {{ expr "{fused}" }}']
+        base = self.gyroid_fields()
+        if len(base) == 1:
+            node = [f'{ind}function {{ expr "{base[0]}" }}']
+        else:
+            node = ([f'{ind}intersect {{']
+                    + [f'{ind}    function {{ expr "{e}" }}' for e in base]
+                    + [f'{ind}}}'])
+        cf = self.counter_field()
+        if cf is None:
+            return node
+        return ([f'{ind}union {{']
+                + ['    ' + s for s in node]
+                + [f'{ind}    function {{ expr "{cf}" }}',
+                   f'{ind}}}'])
+
+    def _raw(self) -> str:
+        f = self.freq
+        return (f"sin({fmt(f)}*x)*cos({fmt(f)}*y)"
+                f"+sin({fmt(f)}*y)*cos({fmt(f)}*z)"
+                f"+sin({fmt(f)}*z)*cos({fmt(f)}*x)")
+
+    def _scale(self) -> float:
+        """Lipschitz renormaliser: |grad g_raw| <= 2*sqrt(3)*freq, so divide by 2*freq."""
+        return 1.0 / (2.0 * self.freq)
+
     # |grad g_raw| ~ 1.529*freq near the zero set (measured); used only to report a wall
     # thickness in metres, never to pick a level.
     GRAD_PER_FREQ = 1.529
@@ -393,6 +548,10 @@ class Jack(Element):
         """The raw-gyroid level ``c`` whose solid ``g <= c`` has volume fraction ``solid``."""
         return gyroid_quantile(self.solid)
 
+    def counter_level(self) -> float:
+        """The level ``t`` whose solid ``g >= t`` has volume fraction ``counter``."""
+        return gyroid_quantile(1.0 - self.counter)
+
     def shell_report(self) -> str:
         """One line of human-checkable geometry, for tuning by eye against numbers."""
         period = 2.0 * math.pi / self.freq
@@ -400,6 +559,9 @@ class Jack(Element):
                f"level={self.level():+.3f}  "
                f"cells across ball={self.ball * self.freq / math.pi:.2f} "
                f"rod={self.rod * self.freq / math.pi:.2f}")
+        if self.counter > 0.0:
+            out += (f"  COUNTER={self.counter:g} t={self.counter_level():+.3f}"
+                    f" total={self.solid + self.counter:.2f}")
         if self.fill > 0.0:
             p = gyroid_cdf(self.level())
             g0 = 0.5 * (gyroid_quantile(p + 0.5 * self.fill)
@@ -435,10 +597,7 @@ class Jack(Element):
             lines.append('        union {')
             lines.extend('    ' + s for s in leaves)
             lines.append('        }')
-            # N children fold pairwise as max(max(arms, g-w), -g-w), so the two shell
-            # halves need no extra nesting.
-            for expr in self.gyroid_fields():
-                lines.append(f'        function {{ expr "{expr}" }}')
+            lines.extend(self.carve_lines('        '))
             lines.append('    }')
             # A `function` field always needs a container; a sphere on the jack's own
             # centre is pose-independent (the jack only ever rotates about it), so it
@@ -563,7 +722,7 @@ def _room() -> List[Raw]:
 
 
 def build_scene(res=(480, 480), *, gyroid_glass: bool = True, spin: float = 1.0,
-                freq: float = FREQ, solid: float = SOLID,
+                freq: float = FREQ, solid: float = SOLID, counter: float = COUNTER,
                 ball: float = BALL, rod: float = ROD, fill: float = FILL) -> Scene:
     # Stand the jack on the floor rather than floating it at the origin.
     cy = rest_height(Y0, arm=ARM, ball=BALL, tilt=TILT)
@@ -587,7 +746,7 @@ def build_scene(res=(480, 480), *, gyroid_glass: bool = True, spin: float = 1.0,
         Material("left", "diffuse", reflect="rgb 0.52 0.30 0.26"),
         Material("right", "diffuse", reflect="rgb 0.28 0.40 0.52"),
         Jack(gyroid_glass=gyroid_glass, spin=spin, freq=freq, solid=solid,
-             ball=ball, rod=rod, fill=fill, centre=(0.0, cy, 0.0)),
+             counter=counter, ball=ball, rod=rod, fill=fill, centre=(0.0, cy, 0.0)),
         *_room(),
         # `lumens` pins the exposure (absolute mode) so the loop cannot pump — see
         # the module docstring.
@@ -612,6 +771,7 @@ def main() -> int:
     r = int(_opt("--res", 480))
     scene = build_scene(res=(r, r), gyroid_glass=not plain,
                         freq=_opt("--freq", FREQ), solid=_opt("--solid", SOLID),
+                        counter=_opt("--counter", COUNTER),
                         ball=_opt("--ball", BALL), rod=_opt("--rod", ROD),
                         fill=_opt("--fill", FILL))
 

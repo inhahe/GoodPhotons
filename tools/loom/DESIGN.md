@@ -400,6 +400,42 @@ period once, then read quantiles off it. Being frequency-independent, the table 
 once per process and cached. This belongs in the library alongside `nd_grad_bound` when the
 Field-tree classes land.
 
+**Lacy and see-through are two quantities, and one level cannot set both.** For a plain
+one-level carve, the fraction of the solid's own envelope that survives is *exactly* the
+volume fraction, so `solid` moves "how much smooth skin is left" and "how much of the room
+you can see through the part" in lockstep. Measured over 32 random placements × 4000 rays
+(`scraps/see_through.py`, paired so every candidate sees identical rays): `solid` 0.24 →
+14.9% see-through at 23.4% envelope, and halving the see-through costs ~12 points of
+envelope, i.e. the dimpled ball returns. Six mechanisms were measured against that, and the
+winner is not the intuitive one:
+
+* A **4-D gyroid sliced at a generic angle** — quasiperiodic, no exact straight channels — is
+  *worse* (18.4% at 24.3%). Quasiperiodicity removes the periodic channels but replaces them
+  with wider irregular voids, and a finite ray cares about void width, not straightness.
+* Unioning a copy shifted half a period in all three axes is an **identity**: `sin(x+π)cos(y+π)
+  = sin(x)cos(y)`. (An unpaired first sweep made this no-op look like a 1.7-point win — hence
+  paired sampling.)
+* A **denser core** inside each ball works (8.7% at an unchanged 23.4%) but leaves a hard
+  spherical seam visible mid-hole.
+* A **finer lattice** unioned on top blocks best of all (1.6%) but crusts the skin over at
+  35.9% envelope — the golf ball by another route.
+* The **double gyroid** `|g| ≥ t` measures well (7.6% at 24.1%) but its two networks are
+  provably disjoint (largest component 49.2% of the solid, one per labyrinth), so the part
+  would be two interlocked but unconnected lattices.
+* What wins is a sparse **counter-network**: keep `g ≤ c` and union on `g ≥ t`, the *other*
+  labyrinth's core, which runs down the middle of the first one's voids — precisely where the
+  sight-lines are. Spending volume there instead of on the surface gives 7.5% see-through at
+  25.7% envelope, and *triples* the number of disconnected islands the envelope breaks into
+  (18 → 48), so it reads lacier while seeing through half as much. The combined solid stays
+  connected and spanning.
+
+Emit the pair as **one leaf**, not a `union` of two: ftrace evaluates every leaf at every
+sphere-trace step, so two leaves double the trigonometry on the hottest loop. With
+`a = (g−c)·s` and `b = (t−g)·s`, `min(a,b) = ((a+b) − |a−b|)/2` and `a+b = (t−c)·s` is
+*constant* — the `g` terms cancel — leaving `((t−c) − |2g−c−t|)·s/2`, one leaf and one
+gyroid evaluation. Exact, and the Lipschitz bound is unchanged (`d/dg` is still `∓s`), so the
+same honest `max_gradient` covers it.
+
 Finally, note what the reference gyroid stills (`png/gold_gyroids`, `png/gyroid_nd`) do,
 because it is *not* reachable from CSG: a lone `function` leaf plus `contained_by { sphere }`,
 where `contained_by` **clips** rather than intersects, so the bare gyroid sheet is simply cut

@@ -55,6 +55,23 @@ one period, cached and frequency-independent; `gyroid_quantile` / `gyroid_cdf` r
 round-trip to 3 decimals. This inversion belongs next to `nd_grad_bound` in the library, per
 field family.
 
+**A fifth: separating "lacy" from "see-through", and fusing the result into one leaf.** The
+volume fraction alone cannot do it — for a one-level carve the surviving envelope *is* the
+volume fraction, so the two move together. Measured over 32 placements × 4000 rays
+(`scraps/see_through.py`, paired), the fix is a sparse **counter-network**: union `g ≥ t`, the
+gyroid's *other* labyrinth, onto `g ≤ c`. It occupies the middle of the first one's voids —
+where the sight-lines are — so see-through halves (14.9% → 7.5%) for ~2 points of envelope,
+where buying that out of `solid` costs ~12. Four rival mechanisms measured worse or uglier, and
+notably the intuitive "rotate it in a higher dimension" (a quasiperiodic 4-D slice) is *worse*
+than the plain carve, 18.4% vs 14.9%. Two traps recorded so they are not re-hit: a copy shifted
+half a period in all three axes is the **identity** on a gyroid (`sin(x+π)cos(y+π) = sin(x)cos(y)`)
+and an *unpaired* Monte-Carlo sweep hid that behind ~1.7 points of noise — always re-seed per
+candidate. The pair must also be emitted as **one** `function` leaf: ftrace evaluates every leaf
+at every march step, so a two-leaf `union` doubles the trigonometry in the hottest loop; here
+`min(a,b) = ((a+b) − |a−b|)/2` with `a+b` constant collapses it to `((t−c) − |2g−c−t|)·s/2`,
+exact and with the same Lipschitz bound. A library `Field` API should do this fusion (and the
+volume-fraction inversion above) automatically rather than leaving it to each scene.
+
 **Also worth recording as a hard limit, not debt:** the lacy look of the reference stills
 (`png/gold_gyroids`, `png/gyroid_nd`) comes from `contained_by` **clipping** a bare `function`
 sheet, so there is no envelope surface at all. That is *not expressible through CSG* (whose job
