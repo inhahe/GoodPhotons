@@ -5,6 +5,17 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-08-02): `fieldLeafSDF` computes `c.r = sqrt(x²+y²+z²)` unconditionally per Expr eval
+
+`src/implicit.h` (~95–105, the `FieldNode::Expr` case): every field-formula evaluation pays a
+`std::sqrt` to populate the `r` pattern variable whether or not the program reads `VarR` (the
+device twins in `render_cuda.cu` do the same). Profiling mode W on the gyroid scene (which never
+uses `r`) puts this at roughly 2–4% of `patternEval`-path time. **Proper fix:** a `usesR` flag
+computed once per program (scan for `PatOp::VarR`), carried on `FieldNode` / `DFieldNode` /
+`DFieldNodeF` through the upload conversion, and checked at the 4 eval sites before the sqrt.
+Pure elision of a dead store, so bit-identical by construction. Deferred from the 0.118.0
+mode-W optimization pass as below its noise floor.
+
 ### TECH DEBT (2026-07-30): loom's `Isosurface` cannot emit a CSG field tree, so every scene that wants one hand-rolls its own `Element`
 
 Found while writing `tools/loom/examples/jumping_jack.py` (a jack of six sphere+cylinder arms

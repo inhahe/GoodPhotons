@@ -20,6 +20,9 @@
 #include <string>
 #include <cmath>
 #include <cstdint>
+#include <cstring>         // memcpy: bit-pattern keys in the CSE optimizer
+#include <unordered_map>   // hash-consing map in the CSE optimizer
+#include <algorithm>       // sort: CSE register-priority ordering
 #include "linalg.h"
 #include "pov_functions.h"   // exact POV-Ray internal isosurface functions (f_torus, ...)
 
@@ -122,7 +125,23 @@ enum class PatOp : int {
     // only things uploaded. That is a structural guarantee, not a convention — the same
     // one that keeps `albedo_default` loader-side.
     Spec,
+    // Common-subexpression registers, emitted ONLY by patternOptimizeCSE (never by the
+    // compiler or authors). StReg copies the top of stack into reg[a] WITHOUT popping
+    // (the value is both the subtree's result and a saved copy); LdReg pushes reg[a].
+    // The optimizer guarantees every LdReg is preceded (in program order) by the StReg
+    // of the same register, so the evaluators' reg arrays need no zero-init. Both are
+    // pure data movement — a load reproduces bit-for-bit what re-executing the stored
+    // subtree would have produced, in the evaluator's own precision (double on the CPU
+    // VMs, float in dPatternEvalF) — so a CSE'd program is exactly equivalent on every
+    // backend. Appended at the END of the enum, like Tex/Grid/Scatter/VarA/Spec before
+    // them, so patternHasFreeVars' VarX..VarV range and varName() are unperturbed.
+    StReg,
+    LdReg,
 };
+
+// Register-file size available to a CSE-optimized program (per evaluator invocation).
+// Bounds the evaluators' stack-local `reg[]` arrays; the optimizer never assigns more.
+constexpr int PAT_CSE_REGS = 32;
 
 // Which variable vocabulary an expression is compiled against. The default surface
 // vocabulary (x/y/z/f/n*/r/u/v, plus the scoped `t` and `a`) describes a point being
@@ -469,6 +488,7 @@ inline double patValueNoise(double x, double y, double z) {
 // ---- postfix evaluator ------------------------------------------------------
 inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
     double st[64];
+    double reg[PAT_CSE_REGS];   // CSE registers; StReg always precedes LdReg, so no init
     int sp = 0;
     for (int i = 0; i < n; ++i) {
         const PatNode& nd = nodes[i];
@@ -564,6 +584,8 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 st[sp++] = patScatterSample(sc, c.dataPool, c.dataPoolN, co);
                 break;
             }
+            case PatOp::StReg:    reg[(int)nd.a] = st[sp-1]; break;   // save, keep on stack
+            case PatOp::LdReg:    st[sp++] = reg[(int)nd.a]; break;   // reuse saved value
         }
     }
     return sp > 0 ? st[0] : 0.0;
@@ -1065,6 +1087,178 @@ inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
             nd.op == PatOp::Tex || nd.op == PatOp::Grid ||
             nd.op == PatOp::Scatter) return true;
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Common-subexpression elimination over a compiled postfix program.
+//
+// Machine-generated field formulas (rotated/composed gyroids, exported CSG) repeat
+// whole subtrees many times — the same rotated coordinate feeds three sin/cos pairs,
+// the same argument arithmetic is spelled out per call. Since the pattern VM is the
+// inner loop of the implicit-surface sphere-trace (every march step and every shadow
+// ray bottoms out in patternEval / dPatternEval[F]), collapsing those repeats is a
+// direct hot-path win on BOTH backends: the optimized program is what gets uploaded.
+//
+// Method: simulate the postfix stack, hash-consing every (op, payload, children)
+// node into a DAG. Any interior node the DAG reaches >= 2 times becomes a register
+// candidate; the top PAT_CSE_REGS by saved-work get a register. The program is then
+// re-emitted by memoized post-order DFS: the first occurrence of a registered
+// subtree is followed by StReg r (save, keep on stack); every later occurrence
+// becomes a single LdReg r.
+//
+// WHY THIS IS EXACTLY SAFE (bit-identical, both precisions): every PatOp is a pure
+// function of its operands, its payload and the fixed PatCtx, so re-executing an
+// identical subtree within one evaluation yields identical bits — a register load
+// returns precisely what the recomputation would have. No arithmetic is folded,
+// reordered or changed; the emission order of the surviving nodes is the original
+// post-order. The optimizer additionally refuses anything it cannot prove out:
+// unknown arities (Grid/Scatter — table-dimension arity), already-optimized
+// programs, malformed stacks, and as a final belt-and-braces check it bit-compares
+// original vs optimized at a set of probe points before committing.
+// ---------------------------------------------------------------------------
+
+// Stack effect of one node: how many operands it pops and pushes. False when the
+// arity cannot be read from the node alone (Grid/Scatter: the arity is the named
+// table's own dimensionality, which lives outside the program).
+inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes) {
+    pushes = 1;
+    if (op >= PatOp::Const && op <= PatOp::VarT)  { pops = 0; return true; }
+    if (op == PatOp::VarA)                        { pops = 0; return true; }
+    if (op >= PatOp::Neg && op <= PatOp::Saturate){ pops = 1; return true; }
+    if (op >= PatOp::Add && op <= PatOp::Step)    { pops = 2; return true; }
+    if (op >= PatOp::Clamp && op <= PatOp::Noise) { pops = 3; return true; }
+    if (op == PatOp::PovFn)                       { pops = povFnArity((int)a); return true; }
+    if (op == PatOp::Tex)                         { pops = 2; return true; }
+    if (op == PatOp::Spec)                        { pops = 1; return true; }
+    if (op == PatOp::StReg)                       { pops = 0; pushes = 0; return true; }  // peeks
+    if (op == PatOp::LdReg)                       { pops = 0; pushes = 1; return true; }
+    return false;   // Grid / Scatter / anything future: bail out of optimizing
+}
+
+inline void patternOptimizeCSE(std::vector<PatNode>& prog) {
+    const int n = (int)prog.size();
+    if (n < 4) return;   // nothing worth sharing
+    // ---- 1. postfix -> hash-consed DAG --------------------------------------
+    struct DagNode { PatOp op; double a; std::vector<int> kids; int size; };
+    std::vector<DagNode> dag; dag.reserve(n);
+    std::unordered_map<std::string, int> cons;
+    std::vector<int> stk;
+    for (int i = 0; i < n; ++i) {
+        const PatNode& nd = prog[i];
+        if (nd.op == PatOp::StReg || nd.op == PatOp::LdReg) return;  // already optimized
+        int pops, pushes;
+        if (!patOpStackEffect(nd.op, nd.a, pops, pushes)) return;    // unknown arity
+        if (pops > (int)stk.size()) return;                          // malformed program
+        DagNode dn; dn.op = nd.op; dn.a = nd.a;
+        dn.kids.assign(stk.end() - pops, stk.end());
+        stk.resize(stk.size() - pops);
+        dn.size = 1;
+        for (int c : dn.kids) dn.size += dag[c].size;
+        std::string key; key.reserve(12 + dn.kids.size() * 4);
+        int opi = (int)dn.op;           key.append((const char*)&opi, 4);
+        std::uint64_t ab; std::memcpy(&ab, &dn.a, 8); key.append((const char*)&ab, 8);
+        for (int c : dn.kids)           key.append((const char*)&c, 4);
+        auto it = cons.find(key);
+        int id;
+        if (it != cons.end()) id = it->second;
+        else { id = (int)dag.size(); dag.push_back(std::move(dn)); cons.emplace(std::move(key), id); }
+        stk.push_back(id);
+    }
+    if (stk.size() != 1) return;   // not a single-rooted expression: leave untouched
+    const int root = stk[0];
+    // ---- 2. edge-multiplicity (uses) over the DAG reachable from the root ----
+    std::vector<int>  uses(dag.size(), 0);
+    std::vector<char> reach(dag.size(), 0);
+    {
+        std::vector<int> w{root};
+        while (!w.empty()) {
+            int u2 = w.back(); w.pop_back();
+            if (reach[u2]) continue;
+            reach[u2] = 1;
+            for (int c : dag[u2].kids) w.push_back(c);
+        }
+        for (int i = 0; i < (int)dag.size(); ++i)
+            if (reach[i]) for (int c : dag[i].kids) uses[c]++;
+    }
+    // ---- 3. register allocation: interior nodes reached >= 2 times -----------
+    struct Cand { int id; long long benefit; };
+    std::vector<Cand> cands;
+    for (int i = 0; i < (int)dag.size(); ++i)
+        if (reach[i] && uses[i] >= 2 && !dag[i].kids.empty())
+            cands.push_back({i, (long long)(uses[i] - 1) * dag[i].size});
+    if (cands.empty()) return;     // no shared interior subtrees: nothing to do
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+        if (a.benefit != b.benefit) return a.benefit > b.benefit;
+        return a.id < b.id;        // deterministic tie-break
+    });
+    std::vector<int> regOf(dag.size(), -1);
+    int nextReg = 0;
+    for (const Cand& c : cands) {
+        if (nextReg >= PAT_CSE_REGS) break;
+        regOf[c.id] = nextReg++;
+    }
+    // ---- 4. re-emit: memoized post-order DFS ---------------------------------
+    std::vector<PatNode> out; out.reserve(n);
+    std::vector<char> emitted(dag.size(), 0);
+    struct Frame { int id; int next; };
+    std::vector<Frame> work; work.push_back({root, 0});
+    while (!work.empty()) {
+        Frame& fr = work.back();          // valid until the next push_back below
+        const int id = fr.id;
+        if (fr.next == 0 && emitted[id] && regOf[id] >= 0) {
+            PatNode ld; ld.op = PatOp::LdReg; ld.a = (double)regOf[id];
+            out.push_back(ld);
+            work.pop_back();
+            continue;
+        }
+        if (fr.next < (int)dag[id].kids.size()) {
+            int c = dag[id].kids[fr.next];
+            ++fr.next;                    // mutate BEFORE push_back may reallocate
+            work.push_back({c, 0});
+            continue;                     // fr is dead past this point
+        }
+        PatNode nd2; nd2.op = dag[id].op; nd2.a = dag[id].a;
+        out.push_back(nd2);
+        if (regOf[id] >= 0) {
+            PatNode st2; st2.op = PatOp::StReg; st2.a = (double)regOf[id];
+            out.push_back(st2);
+            emitted[id] = 1;
+        }
+        work.pop_back();
+    }
+    if ((int)out.size() >= n) return;   // no shrink (all candidates beyond the reg cap)
+    // ---- 5. safety: re-simulate the emitted program (depth + balance) --------
+    {
+        int sp = 0, maxSp = 0;
+        for (const PatNode& nd : out) {
+            int pops, pushes;
+            if (!patOpStackEffect(nd.op, nd.a, pops, pushes)) return;
+            if (pops > sp) return;
+            sp += pushes - pops;
+            if (sp > maxSp) maxSp = sp;
+        }
+        if (sp != 1 || maxSp > 64) return;   // evaluator stack is 64 deep
+    }
+    // ---- 6. belt-and-braces: bit-compare original vs optimized ---------------
+    static const double probe[6][11] = {
+        // x      y      z      f    nx     ny     nz     r      u      v      t
+        { 0.31, -1.27,  2.63, 0.05, 0.27,  0.53, -0.80, 2.93,  0.37,  0.71, 0.13},
+        {-2.11,  0.04, -0.57, -0.2, -0.7,  0.10,  0.70, 2.19,  0.93,  0.08, 0.77},
+        { 5.02,  3.33, -4.19, 1.30, 0.57, -0.57,  0.59, 7.25,  0.11,  0.99, 0.42},
+        {-0.02, -0.03,  0.01, 0.00, 0.00,  1.00,  0.00, 0.04,  0.50,  0.50, 0.00},
+        { 12.7, -8.31,  0.66, -3.1, 0.80,  0.00, -0.60, 15.2,  0.66,  0.25, 1.00},
+        {-0.99,  0.98, -0.97, 0.42, -0.5,  0.50, -0.70, 1.70,  0.01,  0.02, 0.55},
+    };
+    for (int p = 0; p < 6; ++p) {
+        PatCtx c;
+        c.x = probe[p][0]; c.y = probe[p][1]; c.z  = probe[p][2]; c.f = probe[p][3];
+        c.nx = probe[p][4]; c.ny = probe[p][5]; c.nz = probe[p][6]; c.r = probe[p][7];
+        c.u = probe[p][8]; c.v = probe[p][9]; c.t  = probe[p][10];
+        double v0 = patternEval(prog.data(), n, c);
+        double v1 = patternEval(out.data(), (int)out.size(), c);
+        if (std::memcmp(&v0, &v1, 8) != 0) return;   // should be unreachable
+    }
+    prog = std::move(out);
 }
 
 // ---------------------------------------------------------------------------

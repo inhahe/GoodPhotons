@@ -4443,6 +4443,10 @@ private:
         if (!compilePatternExpr(expr, prog, perr, /*allowT=*/false, nullptr, &tableScope_)) {
             fail("function expr: " + perr); return false;
         }
+        // CSE the compiled program: field formulas are the sphere-trace's inner loop
+        // (every march step + shadow ray runs this program), and machine-generated
+        // exprs repeat whole subtrees. Bit-identical by construction (see pattern.h).
+        patternOptimizeCSE(prog);
         Affine L2W;
         for (int k = 0; k < 9; ++k) L2W.m[k] = L_ * authoredXf.m[k];
         L2W.t = authoredXf.t * L_;

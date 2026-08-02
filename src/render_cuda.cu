@@ -2090,8 +2090,11 @@ __device__ static void dProjectUV(double px, double py, double pz,
 }
 
 // Sphere-trace one implicit; writes into `hit` (respecting hit.t). Mirrors intersectImplicit.
+// `anyHit=true` (occlusion): boolean-only — skip root refine + gradient + writeHit when the
+// answer is already determined (bit-identical return value; see the host twin in implicit.h).
 __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
-                                          const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit) {
+                                          const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit,
+                                          bool anyHit = false) {
     double ox = roR.x, oy = roR.y, oz = roR.z, dx = rdR.x, dy = rdR.y, dz = rdR.z;
 
     const DFieldNode* nd = sc.fieldNodes + im.nodeOff;   // double pool: gradient/normal only
@@ -2119,13 +2122,15 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         double sq = sqrt(disc);
         tEnter = (-B - sq) / A;
         tExit  = (-B + sq) / A;
-        double pex = ox + dx*tEnter, pey = oy + dy*tEnter, pez = oz + dz*tEnter;
-        double pxx = ox + dx*tExit,  pxy = oy + dy*tExit,  pxz = oz + dz*tExit;
-        double gex = pex - im.sphereCenter[0], gey = pey - im.sphereCenter[1], gez = pez - im.sphereCenter[2];
-        double gxx = pxx - im.sphereCenter[0], gxy = pxy - im.sphereCenter[1], gxz = pxz - im.sphereCenter[2];
-        double le = sqrt(gex*gex + gey*gey + gez*gez), lx = sqrt(gxx*gxx + gxy*gxy + gxz*gxz);
-        if (le > 0.0) { neX = gex/le; neY = gey/le; neZ = gez/le; } else neZ = 1.0;
-        if (lx > 0.0) { nxX = gxx/lx; nxY = gxy/lx; nxZ = gxz/lx; } else nxZ = 1.0;
+        if (!anyHit) {   // cap normals are only needed when a hit gets written
+            double pex = ox + dx*tEnter, pey = oy + dy*tEnter, pez = oz + dz*tEnter;
+            double pxx = ox + dx*tExit,  pxy = oy + dy*tExit,  pxz = oz + dz*tExit;
+            double gex = pex - im.sphereCenter[0], gey = pey - im.sphereCenter[1], gez = pez - im.sphereCenter[2];
+            double gxx = pxx - im.sphereCenter[0], gxy = pxy - im.sphereCenter[1], gxz = pxz - im.sphereCenter[2];
+            double le = sqrt(gex*gex + gey*gey + gez*gez), lx = sqrt(gxx*gxx + gxy*gxy + gxz*gxz);
+            if (le > 0.0) { neX = gex/le; neY = gey/le; neZ = gez/le; } else neZ = 1.0;
+            if (lx > 0.0) { nxX = gxx/lx; nxY = gxy/lx; nxZ = gxz/lx; } else nxZ = 1.0;
+        }
     } else {
         double idx = 1.0/dx, idy = 1.0/dy, idz = 1.0/dz;
         tEnter = -1e300; tExit = 1e300;
@@ -2191,7 +2196,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     // NEAR CAP: ray enters the container already inside the solid (f<0); the container
     // face is the nearest surface. `open` skips this to reveal the cut edge.
     if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0f)
-        return writeHit(tEnter, ox + dx*tEnter, oy + dy*tEnter, oz + dz*tEnter, neX, neY, neZ);
+        return anyHit ? true : writeHit(tEnter, ox + dx*tEnter, oy + dy*tEnter, oz + dz*tEnter, neX, neY, neZ);
     for (int i = 0; i < MAX_STEP; ++i) {
         float step = sampleMode ? fixedStepF : fmaxf(fabsf(f) * invLipF, minStepF) / dlenF;
         float tn = t + step;
@@ -2200,6 +2205,14 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         float fn = dFieldEvalF(ndF, N, oxF + dxF*tn, oyF + dyF*tn, ozF + dzF*tn, exprPoolF, env);
         bool crossed = (f > 0.0f && fn <= 0.0f) || (f < 0.0f && fn >= 0.0f) || (f == 0.0f && fn != 0.0f);
         if (crossed) {
+            // Any-hit fast path: refinement keeps [ta,tb] inside [t,tn] (tm is guarded
+            // strictly interior), and th = 0.5*((double)ta+(double)tb) lies in
+            // [(double)ta,(double)tb]. So when (double)t >= tmin and (double)tn <
+            // (double)hit.t, the acceptance test below is guaranteed to pass — return
+            // the boolean without refining. (The guard is conservative: t = (float)t0
+            // can round below tmin, and tn == t1F can sit at/above hit.t after the
+            // float clamp; those rare corners take the full path and match baseline.)
+            if (anyHit && (double)t >= (double)tmin && (double)tn < (double)hit.t) return true;
             float ta = t, tb = tn, fa = f, fb = fn;
             int rfSide = 0;
             for (int b = 0; b < 48; ++b) {
@@ -2224,6 +2237,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             }
             double th = 0.5*((double)ta + (double)tb);
             if (th < tmin || th >= (double)hit.t) return false;
+            if (anyHit) return true;   // boolean only: skip gradient + writeHit
             double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
             double eps = fmax(1e-6, 1e-4*th);
             double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env);
@@ -2233,7 +2247,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             // FAR CAP: reached the container exit still inside the solid (fn<0), and the
             // far clip is the container itself — seal the sawn-off solid.
             if (capped && exitIsContainer && fn < 0.0f && tExit >= tmin && tExit < (double)hit.t)
-                return writeHit(tExit, ox + dx*tExit, oy + dy*tExit, oz + dz*tExit, nxX, nxY, nxZ);
+                return anyHit ? true : writeHit(tExit, ox + dx*tExit, oy + dy*tExit, oz + dz*tExit, nxX, nxY, nxZ);
             return false;
         }
         t = tn; f = fn;
@@ -2659,7 +2673,7 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 bool blocked;
                 if (prim < sc.nTris)                              blocked = intersectTri(sh, o, dir, sc.tris[prim], tmin, h);
                 else if (prim < sc.nTris + sc.nSph)               blocked = intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h);
-                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h);
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h, /*anyHit=*/true);
                 else {
                     // Instance leaf: any-hit inside the shared BLAS in local space.
                     const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits];
@@ -3936,6 +3950,7 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double u, double v,
                                       const DPatEnv& env) {
     double st[64]; int sp = 0;
+    double reg[PAT_CSE_REGS];   // CSE registers; StReg always precedes LdReg, so no init
     for (int i = 0; i < n; ++i) {
         const PatNode& nd = nodes[i];
         switch (nd.op) {
@@ -4032,6 +4047,8 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                 st[sp++] = patScatterSample(s, env.dataPool, env.dataPoolN, co);
                 break;
             }
+            case PatOp::StReg:    reg[(int)nd.a] = st[sp-1]; break;   // save, keep on stack
+            case PatOp::LdReg:    st[sp++] = reg[(int)nd.a]; break;   // reuse saved value
         }
     }
     return sp > 0 ? st[0] : 0.0;
@@ -4073,6 +4090,8 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float nx, float ny, float nz, float r,
                                       float u, float v, const DPatEnv& env) {
     float st[64]; int sp = 0;
+    float reg[PAT_CSE_REGS];    // CSE registers (float: bit-identical to re-running the
+                                // stored subtree in this evaluator's own precision)
     for (int i = 0; i < n; ++i) {
         const PatNodeF& nd = nodes[i];
         switch ((PatOp)nd.op) {
@@ -4162,6 +4181,8 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                 st[sp++] = (float)patScatterSample(sc, env.dataPool, env.dataPoolN, co);
                 break;
             }
+            case PatOp::StReg:    reg[(int)nd.a] = st[sp-1]; break;   // save, keep on stack
+            case PatOp::LdReg:    st[sp++] = reg[(int)nd.a]; break;   // reuse saved value
         }
     }
     return sp > 0 ? st[0] : 0.0f;
