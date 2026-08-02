@@ -87,10 +87,13 @@
 //                  checkpoint and keep adding samples (with -n/-spp/-time/-forever).
 //   -checkpoint    (modes A/B/C, R/D, P) on a plain -n/-spp render, also write the checkpoint
 //                  so a later -resume can continue it (-time/-forever/-resume imply it). Each
-//                  batch/resume draws an independent RNG stream (seed offset = cumulative
-//                  photons for A/B/C, cumulative spp for R/D/P), so the result matches a single
-//                  render of the combined count; a fresh render (offset 0) is bit-identical to
-//                  the historical path. R/D store a SUM-over-spp film + spp count; P stores a
+//                  batch/resume continues the ABSOLUTE sample/photon sequence (offset =
+//                  cumulative photons for A/B/C, cumulative spp for R/D/P), so the result
+//                  matches a single render of the combined count; a fresh render (offset 0)
+//                  is bit-identical to the historical path. In the deterministic mode W a
+//                  resume is bit-identical outright -- `-spp 3` then `-resume -spp 5` gives
+//                  exactly the pixels of a plain `-spp 8`, since the lattice is indexed by
+//                  absolute sample. R/D store a SUM-over-spp film + spp count; P stores a
 //                  dual forward+backward film (magic FTPCM02). M/S/U keep persistent per-pass
 //                  state that a film alone can't restore, so they are not disk-resumable.
 //   -savemap <f>   (mode M, GPU) after the forward deposit pass, write the view-independent
@@ -4195,7 +4198,10 @@ static int runCompositeProgressive(
             Film r;
 #ifdef HAVE_CUDA
             if (gpuBackward) {
-                SppProgress bp; bp.sampleBase = acc.spp;   // mixes into the device seed
+                // Absolute sample index of this batch's first sample, so the device
+                // continues the sequence (and, in mode W, the deterministic lattice)
+                // rather than replaying [0, dSpp) on top of what acc already holds.
+                SppProgress bp; bp.sampleBase = acc.spp;
                 bp.report = [](const Film&, long long, bool) { return false; };
                 r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp,
                                        g_maxBounceOverride, g_directOnly, g_heroC);

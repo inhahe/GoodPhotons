@@ -11594,6 +11594,15 @@ bool cudaBdptSupported(const Scene& scene) {
 // chunk. Stops when `prog.report` returns true or the requested `spp` is reached. Chunk
 // size adapts toward ~0.15 s of GPU work per launch so a wall-clock budget or Ctrl-C is
 // honoured promptly without paying per-launch overhead on fast scenes.
+//
+// The base handed to `launch` is the ABSOLUTE sample index, i.e. biased past whatever a
+// `-resume` checkpoint already holds (`prog.sampleBase`) — exactly what cpuSppChunks does
+// and what kBackward's `sIdx` is documented to receive. Without the bias a resumed run
+// re-rendered sample indices [0, c) on top of a film that already contained them, which
+// for the DETERMINISTIC mode W is not "an independent realization" but a straightforwardly
+// wrong image: its lattice is indexed by absolute sample, so `3 spp + resume 5` produced
+// samples {0,1,2} ∪ {0..4} instead of {0..7} — measurably different from a plain 8 spp
+// (max channel difference 163/255 on the loom jumping_jack frame that found this).
 template <class LaunchFn, class DownloadFn>
 static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                          LaunchFn&& launch, DownloadFn&& download) {
@@ -11602,7 +11611,7 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     while (done < spp) {
         long long c = chunk; if (c > spp - done) c = spp - done;
         auto t0 = clk::now();
-        launch(c, done);
+        launch(c, prog.sampleBase + done);
         done += c;
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
         if (dt > 1e-4) {                                   // retarget ~0.15 s per chunk
@@ -11646,8 +11655,14 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     double* d_splat = nullptr; CUDA_CHECK(cudaMalloc(&d_splat, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_cam,   0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_splat, 0, npix * 3 * sizeof(double)));
-    // Resume (mode D disk resume): mix the loaded sample count into the seed base so the
-    // continued samples are decorrelated from the ones already in the checkpoint film.
+    // Resume (mode D disk resume): fresh samples carry ABSOLUTE indices
+    // [sppBase, sppBase + spp), so the kernel's stride is the FINAL total (see
+    // renderBackwardCuda for why). The loaded sample count is also mixed into the seed
+    // base so the continued samples stay decorrelated from the ones already in the
+    // checkpoint film — mode D is Monte-Carlo throughout, so there is no deterministic
+    // lattice to continue exactly, only variance to keep independent.
+    const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
+    const long long sppTotal = sppBase + spp;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
         ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
 
@@ -11663,21 +11678,21 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
         if (useHero && deep)
-            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                              resX, maxDepth, diffraction ? 1 : 0, seed, C);
         else if (useHero)
-            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C);
         else if (deep)
-            kBdptT<0, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+            kBdptT<0, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                      resX, maxDepth, diffraction ? 1 : 0, seed, 1);
         else
-            kBdptT<0, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+            kBdptT<0, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1);
         cudaCheckKernel("bdpt");
     };
 
-    if (!prog || !prog->report) { launch(spp, 0); download(out); }   // single-shot
+    if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot
     else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);
@@ -11780,10 +11795,20 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
-    // Resume (mode R disk resume): mix the loaded sample count into the seed base so the
-    // continued samples are decorrelated from the ones already in the checkpoint film.
+    // Resume (mode R / W disk resume). Fresh samples carry ABSOLUTE indices
+    // [sppBase, sppBase + spp), so the kernel's stride must be the FINAL total, not just
+    // this invocation's request — otherwise `pix * sppTotal + sampleBase` walks off the
+    // end of its pixel's slot and aliases into the next pixel's seed range.
+    const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
+    const long long sppTotal = sppBase + spp;
+    // Mode W is a deterministic quadrature: its lattice is a function of the absolute
+    // sample index alone, so a resumed frame must be BIT-IDENTICAL to an uninterrupted one
+    // and the seed base has to stay put. The Monte-Carlo modes instead mix the loaded
+    // sample count in, because there `pix * sppTotal + sampleBase` can (rarely) collide
+    // with a stream the checkpointed samples already drew, and two correlated samples are
+    // worse than a decorrelated stream.
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
+        ^ ((prog && !whitted) ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
 
     std::vector<double> film(npix * 3);
     auto download = [&](Film& o) {
@@ -11794,12 +11819,12 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     };
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
-        kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, spp, base, resX,
+        kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, sppTotal, base, resX,
                                  diffraction ? 1 : 0, seed, effHeroC);
         cudaCheckKernel("backward");
     };
 
-    if (!prog || !prog->report) { launch(spp, 0); download(out); }   // single-shot
+    if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot
     else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);
@@ -11865,6 +11890,10 @@ Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int 
     double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
+    // Same absolute-sample-index resume contract as renderBackwardCuda; the RGB preview
+    // has no deterministic mode-W path, so it keeps the decorrelating seed mix.
+    const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
+    const long long sppTotal = sppBase + spp;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
         ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
 
@@ -11877,12 +11906,12 @@ Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int 
     };
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
-        kBackwardRGB<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, spp, base, resX,
+        kBackwardRGB<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, sppTotal, base, resX,
                                     diffraction ? 1 : 0, seed);
         cudaCheckKernel("backwardRGB");
     };
 
-    if (!prog || !prog->report) { launch(spp, 0); download(out); }
+    if (!prog || !prog->report) { launch(spp, sppBase); download(out); }
     else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);

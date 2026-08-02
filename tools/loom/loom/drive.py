@@ -208,12 +208,12 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
             # Note `-spp` is ADDITIONAL samples under `-resume`, not a total: resuming a
             # 3-spp frame with `-spp 8` renders it to 11.  So ask for exactly the
             # shortfall, which lands every frame on the same spp.  Because the sample
-            # lattice is indexed by ABSOLUTE sample index, `3 + 5` *should* be
-            # bit-identical to a fresh `8`, making a resumed frame not merely close to an
-            # un-interrupted one but the same image.  scraps/resume_check.py exercises
-            # exactly that claim, but has NOT yet been run to completion (its reference
-            # render died with `bad allocation` under commit exhaustion), so the
-            # bit-identity is reasoned-but-unverified.  See known-issues.md.
+            # lattice is indexed by ABSOLUTE sample index, `3 + 5` is bit-identical to a
+            # fresh `8`, so a resumed frame is not merely close to an un-interrupted one --
+            # it is the same image.  That is measured, not assumed: scraps/resume_check.py
+            # checks it by filecmp on both CPU and GPU, and its first run FAILED, which is
+            # how the GPU `-resume` bug (gpuSppChunks never applied prog.sampleBase) was
+            # found.  Requires ftrace >= 0.117.1; see known-issues.md.
             have_now = checkpoint_spp(png) or 0
             run = list(cmd)
             if have_now > 0 and want is not None and have_now < want:

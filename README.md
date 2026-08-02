@@ -945,7 +945,10 @@ composite `P` classifies its pixels once, then alternates forward and backward b
 into two accumulating films, re-fitting the forward→backward scale and re-blending each
 interval. **Disk `-resume`/`-checkpoint` now cover `A`/`B`/`C` (photon-count checkpoint),
 `R`/`D` (spp-count checkpoint), and `P` (dual forward+backward film)** — a resumed render
-draws a decorrelated sample stream so its added samples genuinely reduce variance. Only the
+continues the *absolute* sample sequence past whatever the checkpoint holds, so its added
+samples genuinely reduce variance; in the deterministic mode `W` the continuation is exact,
+and `-spp 3` followed by `-resume -spp 5` gives bit-for-bit the pixels of a plain `-spp 8`
+(note that `-spp` under `-resume` means *additional* samples, not a total). Only the
 persistent-state photon modes `M`/`S`/`U` (whose per-pass state a film alone can't restore)
 stay non-resumable.
 
