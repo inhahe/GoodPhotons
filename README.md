@@ -1674,6 +1674,19 @@ exactly as authored. Emissive meshes count as lights, so a scene lit *only* by o
 needs no separate `light` block. (Meshes that import their own materials — glTF/GLB —
 are not auto-lit; bind an FTSL `emit` material instead.)
 
+**Emissive non-mesh geometry (glowing solids).** `emit` is a property of the
+*material*, not of the `mesh` block, so binding an emissive material to anything else —
+a `sphere`, a `quad`, a CSG solid, a marched `isosurface` — makes that surface glow
+too, identically on CPU and GPU. The difference is that only a mesh has triangles to
+register an emitter against, so these surfaces are seen by **emission-on-hit only**: a
+camera ray (or a specular bounce) that lands on one picks up `emit(λ)`, but NEE and
+light subpaths cannot sample points on them, which means *they do not illuminate the
+rest of the scene* and contribute nothing in the forward modes `A/B/C`. Treat them as
+self-luminous **appearance**, not as luminaires, and keep a real light in the scene to
+do the actual lighting — see `tools/loom/examples/glowing_jack.py`, where a
+gyroid-carved isosurface glows from inside its own filigree while a ceiling panel
+shades it.
+
 ---
 
 ## Geometry

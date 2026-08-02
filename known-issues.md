@@ -5,6 +5,25 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### LIMITATION (2026-08-02): emissive geometry with no registered emitter is invisible to NEE, so it lights nothing
+
+A material's `emit` makes *any* surface glow — including a marched isosurface or a CSG / quadric
+solid, which have no triangles to register an `Emitter` against (only the single-material mesh
+path calls `Scene::addMeshLight`). Those surfaces are picked up by **emission-on-hit only**: a
+camera or specular ray that lands on one sees its radiance, but NEE and light subpaths can never
+sample a point on them. Consequences: an emissive isosurface casts **no** light on the room — or
+on itself, since a mode-W gather ray arrives with `specularArrival = false` and so takes emission
+only through NEE — and it contributes nothing at all in the forward modes A/B/C, where transport
+starts *at* an emitter. `tools/loom/examples/glowing_jack.py` documents the practical fallout:
+turning up the jack's emission brightens the jack and nothing else, so the room still needs its
+own panel to shade the subject.
+
+**Proper fix:** tessellate emissive implicit/CSG surfaces at load (the machinery exists in
+`src/isomesh.h`) into a sampling-only proxy mesh and register it via `addMeshLight`, keeping the
+marched surface for intersection. The proxy's area and per-point radiance must agree with the
+marched surface closely enough that MIS stays unbiased, which is the hard part and the reason
+this is deferred rather than bodged.
+
 ### TECH DEBT (2026-08-02): `fieldLeafSDF` computes `c.r = sqrt(x²+y²+z²)` unconditionally per Expr eval
 
 `src/implicit.h` (~95–105, the `FieldNode::Expr` case): every field-formula evaluation pays a

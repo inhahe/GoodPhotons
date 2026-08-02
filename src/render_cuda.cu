@@ -338,6 +338,17 @@ struct DMaterial {
     // drew — goes through DEmitter::emitPat; the two are constructed to agree pointwise
     // because MIS combines them.
     int    emitPat;
+    // Self-emission carried by the MATERIAL itself (device twin of Material::isLight /
+    // Material::emit). A `light` block registers a DEmitter and emission-on-hit is read
+    // from that (see dEmitterForMat below), but a material can also carry a bare `emit`
+    // spectrum on geometry that has no registered emitter at all — an isosurface, a CSG
+    // sphere, a quadric. Those are marched/analytic rather than tessellated, so there is
+    // nothing to area-sample and no emitter to register; they still have to LOOK lit when
+    // the camera sees them. matEmit is that fallback, consulted only when
+    // dEmitterForMat() < 0 so a mesh/quad light never double-counts.
+    int    matIsLight;
+    double matEmit[SPEC_N];
+    DVec3  rgbMatEmit;          // matEmit baked to linear sRGB, for the fast RGB backward
     // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
     // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
     // twin of Material::priority.
@@ -6798,9 +6809,18 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // this hit's `emit pattern:` factor — the same value the NEE side gets from the
         // sampler at this point (device twin of host emitSlot).
         int li = dEmitterForMat(sc, matId);
-        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
-            L += thr * (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda
-                     * dEmitPatMul(sc, mp->emitPat, h);
+        if (specularArrival && dot(rd, h.ng) < 0) {
+            // Prefer the registered emitter's baked SPD (it may carry a `power`/`lumens`
+            // flux normalisation the raw material spectrum does not); fall back to the
+            // material's own `emit` when this geometry has no emitter — an isosurface or
+            // CSG solid is marched, never tessellated, so nothing registers for it.
+            const double* eSpd = (li >= 0)          ? sc.emitters[li].emitSpd
+                               : (mp->matIsLight)   ? mp->matEmit
+                                                    : nullptr;
+            if (eSpd)
+                L += thr * (double)specLookup(eSpd, lambda) * invPdfLambda
+                         * dEmitPatMul(sc, mp->emitPat, h);
+        }
 
         if (!bkInteract<GiDepth == 0>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
                                       invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk,
@@ -6933,10 +6953,16 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         // Surface emission on a specular/camera arrival (NEE covers diffuse arrivals).
         // The `emit pattern:` factor is achromatic, so one eval serves the whole bundle.
         int li = dEmitterForMat(sc, matId);
-        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0) {
-            double ep = dEmitPatMul(sc, mp->emitPat, h);
-            for (int i = 0; i < nUp; ++i)
-                L[i] += thr[i] * (double)specLookup(sc.emitters[li].emitSpd, lam[i]) * invPdf[i] * ep;
+        if (specularArrival && dot(rd, h.ng) < 0) {
+            // Same emitter-then-material fallback as the single-wavelength path above.
+            const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
+                               : (mp->matIsLight) ? mp->matEmit
+                                                  : nullptr;
+            if (eSpd) {
+                double ep = dEmitPatMul(sc, mp->emitPat, h);
+                for (int i = 0; i < nUp; ++i)
+                    L[i] += thr[i] * (double)specLookup(eSpd, lam[i]) * invPdf[i] * ep;
+            }
         }
 
         switch (mp->type) {
@@ -7526,10 +7552,13 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             mp = &sc.mats[child]; matId = child;
         }
         int li = dEmitterForMat(sc, matId);
-        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0) {
+        if (specularArrival && dot(rd, h.ng) < 0 && (li >= 0 || mp->matIsLight)) {
             // The emission pattern is achromatic, so it scales the baked RGB radiance.
+            // Emitter-less emissive geometry (isosurface / CSG solid) falls back to the
+            // material's own baked emission, exactly as the spectral paths do.
             double ep = dEmitPatMul(sc, mp->emitPat, h);
-            L = L + hadamard(beta * (Real)ep, sc.emitters[li].rgbEmit);
+            L = L + hadamard(beta * (Real)ep,
+                             (li >= 0) ? sc.emitters[li].rgbEmit : mp->rgbMatEmit);
         }
 
         switch (mp->type) {
@@ -10722,6 +10751,13 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.reflectPat = m.reflectPat;
         d.transmitPat = m.transmitPat;
         d.emitPat = m.emitPat;
+        // Self-emission carried by the material (the emitter-less case: isosurfaces,
+        // CSG/quadric solids). bakeSpec of a null Spectrum yields all zeros, so a
+        // non-emissive material costs nothing but the storage.
+        d.matIsLight = m.isLight ? 1 : 0;
+        bakeSpec(m.emit, d.matEmit);
+        { Vec3 le = m.emit ? rgbbake::emitToRgb(m.emit) : Vec3{0, 0, 0};
+          d.rgbMatEmit = {le.x, le.y, le.z}; }
         // --- parametric-record REFLECT binding (§records stage 6a) ---
         // Device twin of recordReflectBound. A constant selStop binding bakes the stop's
         // colour straight into reflect[] (so the plain specLookup path is exact, no device
