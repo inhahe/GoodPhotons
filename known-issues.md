@@ -6357,6 +6357,41 @@ and the documented invocation to it. `-m loom.viewer` should keep working (depre
 so the ftrace side must not hard-depend on the new name until the docs are updated
 together.
 
+## FIXED (2026-08-01): loom's `skip_existing` adopted half-converged frames; `-resume` overshot spp
+Two bugs in the same code path, `render_range` in `tools/loom/loom/drive.py`, both found
+while re-rendering the 432-frame `jumping_jack` sequence after a crash.
+
+**1. Existence is not completeness.** `skip_existing` tested only `png.is_file() and
+png.stat().st_size > 0`. But ftrace writes the PNG at *every* `-interval` tick — that is
+the whole point of the crash-safety feature — so an interrupted frame leaves a perfectly
+valid PNG at whatever spp it reached. A resumed run then skipped it forever. Observed:
+frame 244 of the jack sequence was silently accepted at **3 of 8 spp**, i.e. a visible
+noise pop in the middle of a loop that nothing would have flagged.
+
+**Fix:** read the `.ftbuf` checkpoint sidecar and compare its accumulated sample count
+against the requested `-spp`. New helpers `checkpoint_spp()` (parses the packed
+little-endian `FTBUF01\n` header — `i32 resX, i32 resY, i32 mode, i64 N` — from
+`src/main.cpp:3574`) and `_target_spp()` (pulls `-spp` out of `extra_args`). A frame is
+done only when `have >= want`; a partial one is *continued*, not restarted, and the
+shortfall is announced rather than hidden. When the budget is not spp-based (`-noise`,
+`-time`) there is no completeness test available at all, so the fallback to existence is
+now logged once at the top of the run instead of silently assumed.
+
+**2. `-spp` is ADDITIVE under `-resume`.** Resuming a 3-spp frame with the original
+`-spp 8` renders it to **11**, not 8 — so the naive retry produced frames with more
+samples than their neighbours, which is the same flicker in the other direction. Fix:
+substitute `str(want - have_now)` into the resumed command line so every frame lands on
+exactly `want`.
+
+**Still unverified (tech debt):** the fix assumes `3 spp + resume 5 spp` is *bit-identical*
+to a plain `8 spp`. That should hold — mode W's sample lattice is indexed by absolute
+sample index, not by position within the current run — but `scraps/resume_check.py`,
+written to prove it by `filecmp`, has not been run to completion: its reference render
+died with `error: bad allocation` because this machine's Windows **commit** charge is
+exhausted (limit 256 GB, ~1.3 GB free, ftrace commits 2.51 GB) by unrelated long-lived
+processes. Re-run `scraps/resume_check.py` once commit is available; if it fails, the
+`-resume` continuation must be restricted to frames that will be re-rendered whole.
+
 ## DONE (2026-07-28, 0.92.0): the DAG panel crashed in `PrimReserve` — imgui #7543 vs. imnodes node rects
 
 The viewer's Graph pane died intermittently with an access violation writing to `0x20`,
