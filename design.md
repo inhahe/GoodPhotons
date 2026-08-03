@@ -136,6 +136,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   keeps an inward-wound import (e.g. `torus.obj`) from radiating into its own hollow.
   The GPU mirrors the sampler: `DEmitter` gains a device `DEmitTri*` CDF +
   `emitterSamplePoint` shape-5 branch, uploaded per emitter.
+  **Emitter-less emissive surfaces** (since 0.118.1): `emit` lives on the *material*, so
+  a sphere / CSG solid / marched `isosurface` can carry it too, but none of those have
+  triangles to register an emitter against. The CPU already handled them, because
+  `backward.h` reads `Material::isLight` + `emitSlot(...)` directly; the GPU did not,
+  because all three of its backward emission-on-hit sites keyed off `dEmitterForMat()`
+  and so rendered such surfaces black. `DMaterial` now carries `matIsLight` + a baked
+  `matEmit[SPEC_N]` (plus `rgbMatEmit` for the fast RGB path), and those sites fall back
+  to it when `dEmitterForMat() < 0`. The *emitter* is still preferred where one exists —
+  its SPD may carry a `power`/`lumens` flux normalisation the raw material spectrum does
+  not, and that ordering is also what stops a mesh light double-counting. Such surfaces
+  remain emission-on-hit only (no NEE, no forward emission): they glow but illuminate
+  nothing, including themselves — logged as a known limitation.
 - **`geometry.h` / `bvh.h`** — primitives + SAH BVH (split plane by SAH, always
   recurse to LEAF_SIZE, median fallback; front-to-back traversal, ray-slab test
   unrolled; `tEnter` pruning). Triangles use the **Woop watertight** test (JCGT 2013):
