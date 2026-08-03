@@ -174,6 +174,15 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   serial — bit-identical to the old serial code by construction. Per-implicit
   marching also runs in parallel across objects.
 
+  **Cap-fraction guard on `-export-mesh` (0.121.0).** A capped isosurface marches
+  `max(f, contSDF(p))`, so if the field's sign is inverted (`f < 0` *outside* the
+  intended shape) the container wins everywhere and the export is the `contained_by`
+  shape with the object hollowed out invisibly inside it — indistinguishable from a
+  plain ball until you strip the shell. `isomesh::capFraction()` classifies each
+  output triangle by which term won the `max()` at its centroid, and `main.cpp`'s
+  export loop warns when the cap exceeds half the output. Diagnostic only; it never
+  changes the mesh. (Cost is one field eval per triangle, once, at export time.)
+
   **Occlusion any-hit fast path (0.118.0).** `intersectImplicit` takes an
   `anyHit` flag (default false), set only by `Scene::occluded`'s traverseAny
   callback (device twin: the `occluded` loop in `render_cuda.cu`). Occlusion
@@ -1761,6 +1770,106 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
 - Rule: any hot-path optimization must be **bit-identical** (CPU sha1) or
   visually/fuzzy identical (GPU) vs. the pre-change exe before committing, one
   commit per optimization so any regression can be reverted alone.
+
+## Scene-authoring tools (`tools/`)
+
+- **`settle.py`** — rests a *single* object on a surface by lowering it vertically.
+- **`settle_scene.py`** — runs ONE pybullet sim containing many of a scene's objects
+  and rewrites the `.ftsl`, wrapping each settled block in
+  `group { translate … rotate … <original block> }`. Non-selected named objects
+  become static concave colliders, so pieces can rest on each other. Isosurfaces are
+  polygonised by shelling out to `ftrace -export-mesh` (whose OBJ groups are named
+  after the FTSL block, which is how each group is matched back to its object), so
+  the tool depends on a current `ftrace.exe` — it resolves the **repo-root** binary
+  first, then build dirs newest-first.
+
+  The delta baked into the group is `(pos − R·c, R)`: bodies spawn *at* their authored
+  COM `c`, so the sim works in `v − c` and `pos + R·(v − c) = (pos − R·c) + R·v`.
+  This matches FTSL's `group { translate t; rotate R }` = `p' = R·p + t` — verified
+  numerically against the render, not assumed.
+
+  Three mechanisms exist because a faithful free settle drops pieces onto *narrow*
+  pedestals and they roll off:
+
+  - `--tether k` — horizontal restoring spring applied **at the COM** (hence no
+    torque: free to tip onto its cap, not free to walk off it), with a deadband so a
+    piece inside tolerance settles naturally. It is a **fictitious body force that
+    does not vanish at rest**, so it is ramped to zero and the pose re-settled before
+    being read; otherwise the bake records a pose gravity alone cannot hold.
+  - `--jitter deg` / `--seed` — random spawn tilt so a symmetric body can't rest in
+    an unstable equilibrium (a ring balanced on its rim). A single draw is not enough
+    for a solid of revolution — a tilt about its own symmetry axis perturbs nothing —
+    so a perched piece is automatically re-thrown up to `SETTLE_ATTEMPTS` times,
+    re-using the built collision world rather than redoing VHACD.
+  - `--seat` — post-hoc geometric fallback: keep the settled orientation, restore the
+    authored XZ, lower straight down.
+
+  **Acceptance test — two stages, because equilibrium is not stability:**
+
+  1. *Support polygon.* The COM must project inside the convex hull of the
+     **load-bearing** contact points (`convex_hull_2d` / `support_margin`), within a
+     tolerance: smooth bodies genuinely touch at a point or along a line, so this is a
+     tolerance rather than a required inset. It catches gross failures (a piece resting
+     on the corner of its cap with the COM out over air).
+  2. *Poke.* A wheel balanced on its rim has its COM exactly over its contact and
+     passes stage 1 perfectly. So each piece is given a small random shove + spin and
+     re-settled; a stable rest absorbs it, an unstable one topples. The pose that
+     **survives the poke** is the one baked.
+
+  Contacts are read from the manifolds the last `stepSimulation()` left behind:
+  `performCollisionDetection()` rebuilds them, and `normalForce` is the solver's applied
+  impulse, so every fresh point reads zero force. The load-bearing threshold is a
+  *fraction of the body's total* normal impulse, not an absolute force — a VHACD proxy
+  spreads the weight over dozens of manifolds, so an absolute cut rejects every genuine
+  contact on a finely decomposed body. Dynamic bodies also disable sleeping, or a settled
+  body drops out of the solver and reports no contacts.
+
+  **Friction units matter.** Bullet's `rollingFriction` is a resistance *arm in metres*:
+  it caps the resistive torque at `mu_r · N`, so a body of radius R cannot tip past
+  `asin(mu_r / R)`. A plausible-looking 0.02 is 2 cm, which pins any gallery-scale piece
+  upright — it held `brass_dumbbell` balanced on its rim below 9.8°. Values are now
+  physical (`ROLLING_FRICTION = 5e-4`).
+
+  **Some shapes have no stable rest pose at all**, and no amount of simulation invents
+  one — the tool says `TOPPLES` on every retry and the *geometry* is what has to change.
+  `brass_dumbbell` was one: its ring's outer radius exceeded the balls' radius, so the
+  ring was the lowest feature, the balls could never reach the stand, and tipping ran away
+  to axle-vertical. Shrinking the ring under the ball radius lets it rest on its two
+  spheres, which is what a dumbbell at rest should look like.
+
+  Independent verification uses `-export-mesh` + per-group AABBs, which is exact and
+  involves no physics at all: every settled piece's bbox must sit on its stand's cap.
+
+  **Collision-geometry reduction is what makes the tool usable.** Sim cost is set almost
+  entirely by the number of *static* triangles in the contact patch under a resting piece
+  — not by the total scene triangle count (with the dynamic bodies moved away, a 3.6 M-tri
+  static set steps in 0.01 ms), and not by solver iterations. An un-reduced marching-cubes
+  pedestal cap is thousands of slivers where two triangles would do, which cost the gallery
+  bake 60 ms/step, i.e. ~40 min per run. Static colliders are therefore reduced two ways,
+  in order of fidelity:
+
+  1. **Quadric decimation** to `STATIC_TRI_CAP`, used whenever it actually reaches the cap
+     (it does for clean closed shapes: the gyroids, lamps, `chrome_ring`). This keeps the
+     concave shape, so it is always preferred.
+  2. **`slab_hulls()`** for the meshes where decimation stalls — the box-union pedestals
+     bottom out at 25–47% of their input no matter how many passes or how much aggression,
+     having already lost 29% of their volume. The mesh is cut into `STATIC_SLABS` (32)
+     horizontal slabs and each is replaced by the convex hull of its own vertices, with
+     slabs overlapping by one polygonisation cell so no seam gap opens. This reproduces cap
+     height and XZ extent *exactly* at ~4000 tris per stand. Hulling each slab separately
+     rather than the whole mesh is the point: a single hull is faster still and also exact
+     at the cap, but it fills the taper between a wide base and a narrow column, inventing
+     a shoulder a piece could rest on — which would be baked in as a piece floating beside
+     its stand. (VHACD on the stands was also rejected: it shifts the cap top 5 mm.)
+
+  Slab hulls are loaded as **convex** shapes rather than forced concave trimeshes, since
+  that is what they are.
+
+  **Caching** (`scraps/.settle_cache/`, `--no-cache` to bypass) memoises the two pure,
+  expensive setup steps: the `-export-mesh` polygonisation, keyed on (scene text,
+  `--mesh-res`, ftrace mtime), and the VHACD dynamic proxies, keyed on the proxy mesh's
+  content hash. Iterating on `--tether`/`--jitter`/`--seed` then skips both. Per-phase
+  timings are printed so a slow or non-converging bake is visible rather than silent.
 
 ## Build & release
 
