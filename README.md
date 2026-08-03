@@ -945,7 +945,10 @@ composite `P` classifies its pixels once, then alternates forward and backward b
 into two accumulating films, re-fitting the forward→backward scale and re-blending each
 interval. **Disk `-resume`/`-checkpoint` now cover `A`/`B`/`C` (photon-count checkpoint),
 `R`/`D` (spp-count checkpoint), and `P` (dual forward+backward film)** — a resumed render
-draws a decorrelated sample stream so its added samples genuinely reduce variance. Only the
+continues the *absolute* sample sequence past whatever the checkpoint holds, so its added
+samples genuinely reduce variance; in the deterministic mode `W` the continuation is exact,
+and `-spp 3` followed by `-resume -spp 5` gives bit-for-bit the pixels of a plain `-spp 8`
+(note that `-spp` under `-resume` means *additional* samples, not a total). Only the
 persistent-state photon modes `M`/`S`/`U` (whose per-pass state a film alone can't restore)
 stay non-resumable.
 
@@ -1670,6 +1673,19 @@ volume with inward orientation, leaving flat/open sheets (which enclose no volum
 exactly as authored. Emissive meshes count as lights, so a scene lit *only* by one
 needs no separate `light` block. (Meshes that import their own materials — glTF/GLB —
 are not auto-lit; bind an FTSL `emit` material instead.)
+
+**Emissive non-mesh geometry (glowing solids).** `emit` is a property of the
+*material*, not of the `mesh` block, so binding an emissive material to anything else —
+a `sphere`, a `quad`, a CSG solid, a marched `isosurface` — makes that surface glow
+too, identically on CPU and GPU. The difference is that only a mesh has triangles to
+register an emitter against, so these surfaces are seen by **emission-on-hit only**: a
+camera ray (or a specular bounce) that lands on one picks up `emit(λ)`, but NEE and
+light subpaths cannot sample points on them, which means *they do not illuminate the
+rest of the scene* and contribute nothing in the forward modes `A/B/C`. Treat them as
+self-luminous **appearance**, not as luminaires, and keep a real light in the scene to
+do the actual lighting — see `tools/loom/examples/glowing_jack.py`, where a
+gyroid-carved isosurface glows from inside its own filigree while a ceiling panel
+shades it.
 
 ---
 

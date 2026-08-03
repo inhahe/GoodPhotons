@@ -136,6 +136,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   keeps an inward-wound import (e.g. `torus.obj`) from radiating into its own hollow.
   The GPU mirrors the sampler: `DEmitter` gains a device `DEmitTri*` CDF +
   `emitterSamplePoint` shape-5 branch, uploaded per emitter.
+  **Emitter-less emissive surfaces** (since 0.118.1): `emit` lives on the *material*, so
+  a sphere / CSG solid / marched `isosurface` can carry it too, but none of those have
+  triangles to register an emitter against. The CPU already handled them, because
+  `backward.h` reads `Material::isLight` + `emitSlot(...)` directly; the GPU did not,
+  because all three of its backward emission-on-hit sites keyed off `dEmitterForMat()`
+  and so rendered such surfaces black. `DMaterial` now carries `matIsLight` + a baked
+  `matEmit[SPEC_N]` (plus `rgbMatEmit` for the fast RGB path), and those sites fall back
+  to it when `dEmitterForMat() < 0`. The *emitter* is still preferred where one exists —
+  its SPD may carry a `power`/`lumens` flux normalisation the raw material spectrum does
+  not, and that ordering is also what stops a mesh light double-counting. Such surfaces
+  remain emission-on-hit only (no NEE, no forward emission): they glow but illuminate
+  nothing, including themselves — logged as a known limitation.
 - **`geometry.h` / `bvh.h`** — primitives + SAH BVH (split plane by SAH, always
   recurse to LEAF_SIZE, median fallback; front-to-back traversal, ray-slab test
   unrolled; `tEnter` pruning). Triangles use the **Woop watertight** test (JCGT 2013):
@@ -161,6 +173,24 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (pure per-slot), with the order-sensitive weld-map sweep and winding pass kept
   serial — bit-identical to the old serial code by construction. Per-implicit
   marching also runs in parallel across objects.
+
+  **Occlusion any-hit fast path (0.118.0).** `intersectImplicit` takes an
+  `anyHit` flag (default false), set only by `Scene::occluded`'s traverseAny
+  callback (device twin: the `occluded` loop in `render_cuda.cu`). Occlusion
+  callers discard the `Hit` — they need a boolean — so once the sphere-tracer
+  finds a sign crossing whose bracket already lies inside `[tmin, hit.t)` the
+  ~27-eval bisection refine, 4-eval gradient and `writeHit` are all skipped:
+  the bracket `[ta,tb] ⊆ [t,tn] ⊆ [t0,t1]` with `t0 = max(tmin, tEnter)` and
+  `th = ½(ta+tb) ∈ [ta,tb]` guarantees any refined `th` would be accepted, so
+  `tn < hit.t` alone proves occlusion. Cap hits return `true` directly and the
+  cap-normal setup is skipped. The host test is exact in double; the device
+  (`Real = float` build) uses a conservative widened compare
+  (`(double)t >= tmin && (double)tn < hit.t`) so float-rounding corner cases
+  fall through to the unchanged exact path rather than flipping a result —
+  bit-identical output by construction on both backends. Mode W's 16
+  shadow rays per area light per diffuse vertex made occlusion ~88% of its
+  implicit-scene time; this plus the pattern-VM CSE below took the gyroid
+  scene 3.68× faster on CPU, 1.45× on GPU (hash-verified).
 - **`render.h`** — CPU forward tracer (modes A/B/C + photon deposit for M/S/P):
   per-photon loop, Russian roulette, sphere-scan cos/sin tables, splatting. The hero
   variant `tracePhotonHero` follows the same **max over live λ** RR rule as
@@ -870,6 +900,34 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   would leave the stack unbalanced and quietly return a *coordinate* as the result. That was
   a live wrong render before 0.78.0, reachable via `medium { density pattern:<p> }`, which
   copies a table-scoped pattern's nodes into a medium evaluated without tables.
+
+  **Pattern-VM CSE (0.118.0).** Field formulas are the sphere-tracer's inner loop —
+  `patternEval` was ~73% of mode W's CPU time on the gyroid scene — and authored
+  expressions repeat subtrees heavily (each `6*rot(p)+φ` appears in both a `sin` and a
+  `cos`; the rotated coordinates share `(x-c)`/`(z-c)`). `patternOptimizeCSE`
+  (`pattern.h`) rewrites a compiled program so each repeated subtree executes **once**:
+  it rebuilds the postfix into a hash-consed DAG (key = op + raw `a` bits + child ids),
+  counts uses, ranks interior nodes reached ≥2× by `(uses−1)·subtreeSize`, assigns up to
+  `PAT_CSE_REGS = 32` registers, and re-emits via a memoized post-order walk using two
+  new ops appended at the enum's end — `StReg` (peek top-of-stack into `reg[a]`) and
+  `LdReg` (push `reg[a]`). Three invariants carry the bit-exactness argument: (1) the
+  ops are **pure data movement**, and a register load reproduces exactly what
+  re-executing the identical subtree yields *in the evaluator's own precision* — so the
+  optimization is bit-identical in the host double evaluator **and** the device float
+  evaluator (`dPatternEvalF`) even though those two disagree with each other. Constant
+  folding was rejected for exactly this reason: host-double folding would change the
+  float path's bits. (2) It is hooked **only at the final-consumption site**
+  (`ftsl.h addFunctionLeaf`, after `compilePatternExpr`) — never inside compilation —
+  because `patternSubstitute` splices programs together and two pre-optimized fragments'
+  register indices would collide. (3) It is belt-and-braces conservative: programs with
+  `Grid`/`Scatter` (arity lives in the table, not the node) bail, the re-emitted program
+  is re-simulated for stack balance, and 6 full-variable probe points are bit-compared
+  (`memcmp`) old-vs-new before the rewrite is accepted — any mismatch keeps the
+  original. Since the ops are appended at the enum end, the `VarX..VarV` range tests
+  (`patternHasFreeVars`, the free-variable scans) are unperturbed; all **three**
+  evaluator switches (host `patternEval`, device `dPatternEval` / `dPatternEvalF`) carry
+  the two cases, and the `PatNode → PatNodeF` upload conversion is memberwise so a
+  register index ≤ 32 survives the float trip exactly.
 
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as

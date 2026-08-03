@@ -5,6 +5,36 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### LIMITATION (2026-08-02): emissive geometry with no registered emitter is invisible to NEE, so it lights nothing
+
+A material's `emit` makes *any* surface glow — including a marched isosurface or a CSG / quadric
+solid, which have no triangles to register an `Emitter` against (only the single-material mesh
+path calls `Scene::addMeshLight`). Those surfaces are picked up by **emission-on-hit only**: a
+camera or specular ray that lands on one sees its radiance, but NEE and light subpaths can never
+sample a point on them. Consequences: an emissive isosurface casts **no** light on the room — or
+on itself, since a mode-W gather ray arrives with `specularArrival = false` and so takes emission
+only through NEE — and it contributes nothing at all in the forward modes A/B/C, where transport
+starts *at* an emitter. `tools/loom/examples/glowing_jack.py` documents the practical fallout:
+turning up the jack's emission brightens the jack and nothing else, so the room still needs its
+own panel to shade the subject.
+
+**Proper fix:** tessellate emissive implicit/CSG surfaces at load (the machinery exists in
+`src/isomesh.h`) into a sampling-only proxy mesh and register it via `addMeshLight`, keeping the
+marched surface for intersection. The proxy's area and per-point radiance must agree with the
+marched surface closely enough that MIS stays unbiased, which is the hard part and the reason
+this is deferred rather than bodged.
+
+### TECH DEBT (2026-08-02): `fieldLeafSDF` computes `c.r = sqrt(x²+y²+z²)` unconditionally per Expr eval
+
+`src/implicit.h` (~95–105, the `FieldNode::Expr` case): every field-formula evaluation pays a
+`std::sqrt` to populate the `r` pattern variable whether or not the program reads `VarR` (the
+device twins in `render_cuda.cu` do the same). Profiling mode W on the gyroid scene (which never
+uses `r`) puts this at roughly 2–4% of `patternEval`-path time. **Proper fix:** a `usesR` flag
+computed once per program (scan for `PatOp::VarR`), carried on `FieldNode` / `DFieldNode` /
+`DFieldNodeF` through the upload conversion, and checked at the 4 eval sites before the sqrt.
+Pure elision of a dead store, so bit-identical by construction. Deferred from the 0.118.0
+mode-W optimization pass as below its noise floor.
+
 ### TECH DEBT (2026-07-30): loom's `Isosurface` cannot emit a CSG field tree, so every scene that wants one hand-rolls its own `Element`
 
 Found while writing `tools/loom/examples/jumping_jack.py` (a jack of six sphere+cylinder arms
@@ -6356,6 +6386,96 @@ does `from .viewer import serve_viewer; serve_viewer(...)`, and switch `LoomLink
 and the documented invocation to it. `-m loom.viewer` should keep working (deprecated),
 so the ftrace side must not hard-depend on the new name until the docs are updated
 together.
+
+## FIXED (2026-08-01): loom's `skip_existing` adopted half-converged frames; `-resume` overshot spp
+Two bugs in the same code path, `render_range` in `tools/loom/loom/drive.py`, both found
+while re-rendering the 432-frame `jumping_jack` sequence after a crash.
+
+**1. Existence is not completeness.** `skip_existing` tested only `png.is_file() and
+png.stat().st_size > 0`. But ftrace writes the PNG at *every* `-interval` tick — that is
+the whole point of the crash-safety feature — so an interrupted frame leaves a perfectly
+valid PNG at whatever spp it reached. A resumed run then skipped it forever. Observed:
+frame 244 of the jack sequence was silently accepted at **3 of 8 spp**, i.e. a visible
+noise pop in the middle of a loop that nothing would have flagged.
+
+**Fix:** read the `.ftbuf` checkpoint sidecar and compare its accumulated sample count
+against the requested `-spp`. New helpers `checkpoint_spp()` (parses the packed
+little-endian `FTBUF01\n` header — `i32 resX, i32 resY, i32 mode, i64 N` — from
+`src/main.cpp:3574`) and `_target_spp()` (pulls `-spp` out of `extra_args`). A frame is
+done only when `have >= want`; a partial one is *continued*, not restarted, and the
+shortfall is announced rather than hidden. When the budget is not spp-based (`-noise`,
+`-time`) there is no completeness test available at all, so the fallback to existence is
+now logged once at the top of the run instead of silently assumed.
+
+**2. `-spp` is ADDITIVE under `-resume`.** Resuming a 3-spp frame with the original
+`-spp 8` renders it to **11**, not 8 — so the naive retry produced frames with more
+samples than their neighbours, which is the same flicker in the other direction. Fix:
+substitute `str(want - have_now)` into the resumed command line so every frame lands on
+exactly `want`.
+
+**And the assumption underneath it was false — see the next entry.** Continuing a partial
+frame is only legitimate if `3 spp + resume 5 spp` is *bit-identical* to a plain `8 spp`.
+`scraps/resume_check.py` was written to prove that by `filecmp`, and on its first
+successful run it said **False**, max channel difference 163/255. That turned out to be a
+genuine CUDA bug, not a loom one.
+
+## FIXED (2026-08-01, 0.117.1): GPU `-resume` restarted the sample sequence at 0, so a resumed mode-W frame was the wrong image
+Found by `scraps/resume_check.py` while validating the loom fix above: on the **GPU**,
+`3 spp` + `-resume -spp 5` was NOT the same image as a plain `8 spp` — max channel
+difference **163/255**. On the **CPU** the same ladder passed all three rungs, which
+localised it immediately.
+
+`cpuSppChunks` (`src/main.cpp` ~3941) biases each chunk's sample index past whatever the
+checkpoint holds:
+
+```cpp
+const unsigned long long seedBias = (unsigned long long)prog->sampleBase;
+...
+Film f = renderOne(c, seedBias + (unsigned long long)done);
+```
+
+Its GPU counterpart `gpuSppChunks` (`src/render_cuda.cu` ~11598) did not — it called
+`launch(c, done)` with `done` starting at 0 every invocation. So a resumed run re-rendered
+absolute sample indices `[0, c)` on top of a film that already contained them. For the
+Monte-Carlo modes that was merely disguised (the host deliberately XORs `prog->sampleBase`
+into the device seed, so the repeated indices at least drew *different* streams and the
+average still converged). For **mode W** it was plainly wrong: mode W is a deterministic
+quadrature whose lattice is a pure function of the absolute sample index — `kBackward`
+computes `sIdx = sampleBase + local` for exactly that purpose — so `3 + resume 5` averaged
+samples `{0,1,2} ∪ {0,1,2,3,4}` instead of `{0..7}`. Duplicated coverage in part of the
+lattice, gaps in the rest, and no amount of further resuming would fix it.
+
+A second, subtler defect rode along: the kernel seeds on `gidx = pix * sppTotal +
+sampleBase + local`, and `sppTotal` was **this invocation's** requested spp, not the final
+total. Once `sampleBase` is honoured, `sampleBase + local` can exceed `sppTotal` and walk
+out of its pixel's slot into the next pixel's seed range, correlating two samples that are
+supposed to be independent.
+
+**Fix** (`src/render_cuda.cu`): `gpuSppChunks` passes `prog.sampleBase + done`; all three
+host drivers (`renderBackwardCuda`, `renderBdptCuda`, `renderBackwardRGBCuda`) compute
+`sppBase = prog->sampleBase`, pass `sppTotal = sppBase + spp` as the kernel's stride, and
+use `launch(spp, sppBase)` on the single-shot path. In `renderBackwardCuda` the
+decorrelating seed XOR is now applied only when **not** in mode W: a deterministic
+quadrature must reproduce the monolithic render exactly, so its seed base has to stay put,
+while the Monte-Carlo modes keep the mix as insurance against a rare `gidx` collision with
+a stream the checkpointed samples already drew.
+
+Verified with `scraps/resume_check.py` (three-rung ladder: plain-vs-plain with adaptive
+chunks, plain-vs-plain with `FTRACE_CHUNK_SPP=1`, then `8` vs `3 + resume 5`) — all True on
+both CPU and GPU. Regression-checked with `scraps/resume_regress.py`: frames 000/100/200/243
+of the loom `jumping_jack` sequence, rendered by the *previous* binary, re-render
+**bit-identically** under the new one, confirming that a non-resuming render is untouched
+(`sampleBase == 0` ⇒ `sppTotal == spp` and the seed is unchanged).
+
+**Known remaining wart (by design, documented rather than fixed):** because `gidx` carries
+`sppTotal`, a render resumed *twice* to different totals seeds its Monte-Carlo streams
+differently than a monolithic render of the final total would. Mode W is unaffected (its
+lattice never consults `gidx`), and for the stochastic modes distinct-but-valid streams are
+all that is required, so this only means "a twice-resumed mode R/D image is a different
+realization", not a wrong one. Removing it entirely would mean switching the device to the
+CPU's sample-major index `(sampleBase + local) * npix + pix`, which is total-independent
+*and* would move mode R/D closer to host/device bit-exactness (todo N4a) — but it changes
+the noise realization of every existing GPU render, so it belongs with N4a, not here.
 
 ## DONE (2026-07-28, 0.92.0): the DAG panel crashed in `PrimReserve` — imgui #7543 vs. imnodes node rects
 

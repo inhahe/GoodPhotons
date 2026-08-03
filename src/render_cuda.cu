@@ -338,6 +338,17 @@ struct DMaterial {
     // drew — goes through DEmitter::emitPat; the two are constructed to agree pointwise
     // because MIS combines them.
     int    emitPat;
+    // Self-emission carried by the MATERIAL itself (device twin of Material::isLight /
+    // Material::emit). A `light` block registers a DEmitter and emission-on-hit is read
+    // from that (see dEmitterForMat below), but a material can also carry a bare `emit`
+    // spectrum on geometry that has no registered emitter at all — an isosurface, a CSG
+    // sphere, a quadric. Those are marched/analytic rather than tessellated, so there is
+    // nothing to area-sample and no emitter to register; they still have to LOOK lit when
+    // the camera sees them. matEmit is that fallback, consulted only when
+    // dEmitterForMat() < 0 so a mesh/quad light never double-counts.
+    int    matIsLight;
+    double matEmit[SPEC_N];
+    DVec3  rgbMatEmit;          // matEmit baked to linear sRGB, for the fast RGB backward
     // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
     // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
     // twin of Material::priority.
@@ -2090,8 +2101,11 @@ __device__ static void dProjectUV(double px, double py, double pz,
 }
 
 // Sphere-trace one implicit; writes into `hit` (respecting hit.t). Mirrors intersectImplicit.
+// `anyHit=true` (occlusion): boolean-only — skip root refine + gradient + writeHit when the
+// answer is already determined (bit-identical return value; see the host twin in implicit.h).
 __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
-                                          const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit) {
+                                          const DVec3& roR, const DVec3& rdR, Real tmin, DHit& hit,
+                                          bool anyHit = false) {
     double ox = roR.x, oy = roR.y, oz = roR.z, dx = rdR.x, dy = rdR.y, dz = rdR.z;
 
     const DFieldNode* nd = sc.fieldNodes + im.nodeOff;   // double pool: gradient/normal only
@@ -2119,13 +2133,15 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         double sq = sqrt(disc);
         tEnter = (-B - sq) / A;
         tExit  = (-B + sq) / A;
-        double pex = ox + dx*tEnter, pey = oy + dy*tEnter, pez = oz + dz*tEnter;
-        double pxx = ox + dx*tExit,  pxy = oy + dy*tExit,  pxz = oz + dz*tExit;
-        double gex = pex - im.sphereCenter[0], gey = pey - im.sphereCenter[1], gez = pez - im.sphereCenter[2];
-        double gxx = pxx - im.sphereCenter[0], gxy = pxy - im.sphereCenter[1], gxz = pxz - im.sphereCenter[2];
-        double le = sqrt(gex*gex + gey*gey + gez*gez), lx = sqrt(gxx*gxx + gxy*gxy + gxz*gxz);
-        if (le > 0.0) { neX = gex/le; neY = gey/le; neZ = gez/le; } else neZ = 1.0;
-        if (lx > 0.0) { nxX = gxx/lx; nxY = gxy/lx; nxZ = gxz/lx; } else nxZ = 1.0;
+        if (!anyHit) {   // cap normals are only needed when a hit gets written
+            double pex = ox + dx*tEnter, pey = oy + dy*tEnter, pez = oz + dz*tEnter;
+            double pxx = ox + dx*tExit,  pxy = oy + dy*tExit,  pxz = oz + dz*tExit;
+            double gex = pex - im.sphereCenter[0], gey = pey - im.sphereCenter[1], gez = pez - im.sphereCenter[2];
+            double gxx = pxx - im.sphereCenter[0], gxy = pxy - im.sphereCenter[1], gxz = pxz - im.sphereCenter[2];
+            double le = sqrt(gex*gex + gey*gey + gez*gez), lx = sqrt(gxx*gxx + gxy*gxy + gxz*gxz);
+            if (le > 0.0) { neX = gex/le; neY = gey/le; neZ = gez/le; } else neZ = 1.0;
+            if (lx > 0.0) { nxX = gxx/lx; nxY = gxy/lx; nxZ = gxz/lx; } else nxZ = 1.0;
+        }
     } else {
         double idx = 1.0/dx, idy = 1.0/dy, idz = 1.0/dz;
         tEnter = -1e300; tExit = 1e300;
@@ -2191,7 +2207,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     // NEAR CAP: ray enters the container already inside the solid (f<0); the container
     // face is the nearest surface. `open` skips this to reveal the cut edge.
     if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0f)
-        return writeHit(tEnter, ox + dx*tEnter, oy + dy*tEnter, oz + dz*tEnter, neX, neY, neZ);
+        return anyHit ? true : writeHit(tEnter, ox + dx*tEnter, oy + dy*tEnter, oz + dz*tEnter, neX, neY, neZ);
     for (int i = 0; i < MAX_STEP; ++i) {
         float step = sampleMode ? fixedStepF : fmaxf(fabsf(f) * invLipF, minStepF) / dlenF;
         float tn = t + step;
@@ -2200,6 +2216,14 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         float fn = dFieldEvalF(ndF, N, oxF + dxF*tn, oyF + dyF*tn, ozF + dzF*tn, exprPoolF, env);
         bool crossed = (f > 0.0f && fn <= 0.0f) || (f < 0.0f && fn >= 0.0f) || (f == 0.0f && fn != 0.0f);
         if (crossed) {
+            // Any-hit fast path: refinement keeps [ta,tb] inside [t,tn] (tm is guarded
+            // strictly interior), and th = 0.5*((double)ta+(double)tb) lies in
+            // [(double)ta,(double)tb]. So when (double)t >= tmin and (double)tn <
+            // (double)hit.t, the acceptance test below is guaranteed to pass — return
+            // the boolean without refining. (The guard is conservative: t = (float)t0
+            // can round below tmin, and tn == t1F can sit at/above hit.t after the
+            // float clamp; those rare corners take the full path and match baseline.)
+            if (anyHit && (double)t >= (double)tmin && (double)tn < (double)hit.t) return true;
             float ta = t, tb = tn, fa = f, fb = fn;
             int rfSide = 0;
             for (int b = 0; b < 48; ++b) {
@@ -2224,6 +2248,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             }
             double th = 0.5*((double)ta + (double)tb);
             if (th < tmin || th >= (double)hit.t) return false;
+            if (anyHit) return true;   // boolean only: skip gradient + writeHit
             double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
             double eps = fmax(1e-6, 1e-4*th);
             double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env);
@@ -2233,7 +2258,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             // FAR CAP: reached the container exit still inside the solid (fn<0), and the
             // far clip is the container itself — seal the sawn-off solid.
             if (capped && exitIsContainer && fn < 0.0f && tExit >= tmin && tExit < (double)hit.t)
-                return writeHit(tExit, ox + dx*tExit, oy + dy*tExit, oz + dz*tExit, nxX, nxY, nxZ);
+                return anyHit ? true : writeHit(tExit, ox + dx*tExit, oy + dy*tExit, oz + dz*tExit, nxX, nxY, nxZ);
             return false;
         }
         t = tn; f = fn;
@@ -2659,7 +2684,7 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 bool blocked;
                 if (prim < sc.nTris)                              blocked = intersectTri(sh, o, dir, sc.tris[prim], tmin, h);
                 else if (prim < sc.nTris + sc.nSph)               blocked = intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h);
-                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h);
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h, /*anyHit=*/true);
                 else {
                     // Instance leaf: any-hit inside the shared BLAS in local space.
                     const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits];
@@ -3936,6 +3961,7 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                                       double u, double v,
                                       const DPatEnv& env) {
     double st[64]; int sp = 0;
+    double reg[PAT_CSE_REGS];   // CSE registers; StReg always precedes LdReg, so no init
     for (int i = 0; i < n; ++i) {
         const PatNode& nd = nodes[i];
         switch (nd.op) {
@@ -4032,6 +4058,8 @@ __device__ static double dPatternEval(const PatNode* nodes, int n,
                 st[sp++] = patScatterSample(s, env.dataPool, env.dataPoolN, co);
                 break;
             }
+            case PatOp::StReg:    reg[(int)nd.a] = st[sp-1]; break;   // save, keep on stack
+            case PatOp::LdReg:    st[sp++] = reg[(int)nd.a]; break;   // reuse saved value
         }
     }
     return sp > 0 ? st[0] : 0.0;
@@ -4073,6 +4101,8 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                                       float nx, float ny, float nz, float r,
                                       float u, float v, const DPatEnv& env) {
     float st[64]; int sp = 0;
+    float reg[PAT_CSE_REGS];    // CSE registers (float: bit-identical to re-running the
+                                // stored subtree in this evaluator's own precision)
     for (int i = 0; i < n; ++i) {
         const PatNodeF& nd = nodes[i];
         switch ((PatOp)nd.op) {
@@ -4162,6 +4192,8 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                 st[sp++] = (float)patScatterSample(sc, env.dataPool, env.dataPoolN, co);
                 break;
             }
+            case PatOp::StReg:    reg[(int)nd.a] = st[sp-1]; break;   // save, keep on stack
+            case PatOp::LdReg:    st[sp++] = reg[(int)nd.a]; break;   // reuse saved value
         }
     }
     return sp > 0 ? st[0] : 0.0f;
@@ -6777,9 +6809,18 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // this hit's `emit pattern:` factor — the same value the NEE side gets from the
         // sampler at this point (device twin of host emitSlot).
         int li = dEmitterForMat(sc, matId);
-        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0)
-            L += thr * (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda
-                     * dEmitPatMul(sc, mp->emitPat, h);
+        if (specularArrival && dot(rd, h.ng) < 0) {
+            // Prefer the registered emitter's baked SPD (it may carry a `power`/`lumens`
+            // flux normalisation the raw material spectrum does not); fall back to the
+            // material's own `emit` when this geometry has no emitter — an isosurface or
+            // CSG solid is marched, never tessellated, so nothing registers for it.
+            const double* eSpd = (li >= 0)          ? sc.emitters[li].emitSpd
+                               : (mp->matIsLight)   ? mp->matEmit
+                                                    : nullptr;
+            if (eSpd)
+                L += thr * (double)specLookup(eSpd, lambda) * invPdfLambda
+                         * dEmitPatMul(sc, mp->emitPat, h);
+        }
 
         if (!bkInteract<GiDepth == 0>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
                                       invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk,
@@ -6912,10 +6953,16 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         // Surface emission on a specular/camera arrival (NEE covers diffuse arrivals).
         // The `emit pattern:` factor is achromatic, so one eval serves the whole bundle.
         int li = dEmitterForMat(sc, matId);
-        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0) {
-            double ep = dEmitPatMul(sc, mp->emitPat, h);
-            for (int i = 0; i < nUp; ++i)
-                L[i] += thr[i] * (double)specLookup(sc.emitters[li].emitSpd, lam[i]) * invPdf[i] * ep;
+        if (specularArrival && dot(rd, h.ng) < 0) {
+            // Same emitter-then-material fallback as the single-wavelength path above.
+            const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
+                               : (mp->matIsLight) ? mp->matEmit
+                                                  : nullptr;
+            if (eSpd) {
+                double ep = dEmitPatMul(sc, mp->emitPat, h);
+                for (int i = 0; i < nUp; ++i)
+                    L[i] += thr[i] * (double)specLookup(eSpd, lam[i]) * invPdf[i] * ep;
+            }
         }
 
         switch (mp->type) {
@@ -7505,10 +7552,13 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             mp = &sc.mats[child]; matId = child;
         }
         int li = dEmitterForMat(sc, matId);
-        if (li >= 0 && specularArrival && dot(rd, h.ng) < 0) {
+        if (specularArrival && dot(rd, h.ng) < 0 && (li >= 0 || mp->matIsLight)) {
             // The emission pattern is achromatic, so it scales the baked RGB radiance.
+            // Emitter-less emissive geometry (isosurface / CSG solid) falls back to the
+            // material's own baked emission, exactly as the spectral paths do.
             double ep = dEmitPatMul(sc, mp->emitPat, h);
-            L = L + hadamard(beta * (Real)ep, sc.emitters[li].rgbEmit);
+            L = L + hadamard(beta * (Real)ep,
+                             (li >= 0) ? sc.emitters[li].rgbEmit : mp->rgbMatEmit);
         }
 
         switch (mp->type) {
@@ -10701,6 +10751,13 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.reflectPat = m.reflectPat;
         d.transmitPat = m.transmitPat;
         d.emitPat = m.emitPat;
+        // Self-emission carried by the material (the emitter-less case: isosurfaces,
+        // CSG/quadric solids). bakeSpec of a null Spectrum yields all zeros, so a
+        // non-emissive material costs nothing but the storage.
+        d.matIsLight = m.isLight ? 1 : 0;
+        bakeSpec(m.emit, d.matEmit);
+        { Vec3 le = m.emit ? rgbbake::emitToRgb(m.emit) : Vec3{0, 0, 0};
+          d.rgbMatEmit = {le.x, le.y, le.z}; }
         // --- parametric-record REFLECT binding (§records stage 6a) ---
         // Device twin of recordReflectBound. A constant selStop binding bakes the stop's
         // colour straight into reflect[] (so the plain specLookup path is exact, no device
@@ -11594,6 +11651,15 @@ bool cudaBdptSupported(const Scene& scene) {
 // chunk. Stops when `prog.report` returns true or the requested `spp` is reached. Chunk
 // size adapts toward ~0.15 s of GPU work per launch so a wall-clock budget or Ctrl-C is
 // honoured promptly without paying per-launch overhead on fast scenes.
+//
+// The base handed to `launch` is the ABSOLUTE sample index, i.e. biased past whatever a
+// `-resume` checkpoint already holds (`prog.sampleBase`) — exactly what cpuSppChunks does
+// and what kBackward's `sIdx` is documented to receive. Without the bias a resumed run
+// re-rendered sample indices [0, c) on top of a film that already contained them, which
+// for the DETERMINISTIC mode W is not "an independent realization" but a straightforwardly
+// wrong image: its lattice is indexed by absolute sample, so `3 spp + resume 5` produced
+// samples {0,1,2} ∪ {0..4} instead of {0..7} — measurably different from a plain 8 spp
+// (max channel difference 163/255 on the loom jumping_jack frame that found this).
 template <class LaunchFn, class DownloadFn>
 static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                          LaunchFn&& launch, DownloadFn&& download) {
@@ -11602,7 +11668,7 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     while (done < spp) {
         long long c = chunk; if (c > spp - done) c = spp - done;
         auto t0 = clk::now();
-        launch(c, done);
+        launch(c, prog.sampleBase + done);
         done += c;
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
         if (dt > 1e-4) {                                   // retarget ~0.15 s per chunk
@@ -11646,8 +11712,14 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     double* d_splat = nullptr; CUDA_CHECK(cudaMalloc(&d_splat, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_cam,   0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_splat, 0, npix * 3 * sizeof(double)));
-    // Resume (mode D disk resume): mix the loaded sample count into the seed base so the
-    // continued samples are decorrelated from the ones already in the checkpoint film.
+    // Resume (mode D disk resume): fresh samples carry ABSOLUTE indices
+    // [sppBase, sppBase + spp), so the kernel's stride is the FINAL total (see
+    // renderBackwardCuda for why). The loaded sample count is also mixed into the seed
+    // base so the continued samples stay decorrelated from the ones already in the
+    // checkpoint film — mode D is Monte-Carlo throughout, so there is no deterministic
+    // lattice to continue exactly, only variance to keep independent.
+    const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
+    const long long sppTotal = sppBase + spp;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
         ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
 
@@ -11663,21 +11735,21 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
         if (useHero && deep)
-            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                              resX, maxDepth, diffraction ? 1 : 0, seed, C);
         else if (useHero)
-            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C);
         else if (deep)
-            kBdptT<0, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+            kBdptT<0, BDPT_DEEPDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                      resX, maxDepth, diffraction ? 1 : 0, seed, 1);
         else
-            kBdptT<0, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, spp, base,
+            kBdptT<0, BDPT_MAXDEPTH><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1);
         cudaCheckKernel("bdpt");
     };
 
-    if (!prog || !prog->report) { launch(spp, 0); download(out); }   // single-shot
+    if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot
     else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);
@@ -11780,10 +11852,20 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
-    // Resume (mode R disk resume): mix the loaded sample count into the seed base so the
-    // continued samples are decorrelated from the ones already in the checkpoint film.
+    // Resume (mode R / W disk resume). Fresh samples carry ABSOLUTE indices
+    // [sppBase, sppBase + spp), so the kernel's stride must be the FINAL total, not just
+    // this invocation's request — otherwise `pix * sppTotal + sampleBase` walks off the
+    // end of its pixel's slot and aliases into the next pixel's seed range.
+    const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
+    const long long sppTotal = sppBase + spp;
+    // Mode W is a deterministic quadrature: its lattice is a function of the absolute
+    // sample index alone, so a resumed frame must be BIT-IDENTICAL to an uninterrupted one
+    // and the seed base has to stay put. The Monte-Carlo modes instead mix the loaded
+    // sample count in, because there `pix * sppTotal + sampleBase` can (rarely) collide
+    // with a stream the checkpointed samples already drew, and two correlated samples are
+    // worse than a decorrelated stream.
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
+        ^ ((prog && !whitted) ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
 
     std::vector<double> film(npix * 3);
     auto download = [&](Film& o) {
@@ -11794,12 +11876,12 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     };
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
-        kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, spp, base, resX,
+        kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, sppTotal, base, resX,
                                  diffraction ? 1 : 0, seed, effHeroC);
         cudaCheckKernel("backward");
     };
 
-    if (!prog || !prog->report) { launch(spp, 0); download(out); }   // single-shot
+    if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot
     else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);
@@ -11865,6 +11947,10 @@ Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int 
     double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
+    // Same absolute-sample-index resume contract as renderBackwardCuda; the RGB preview
+    // has no deterministic mode-W path, so it keeps the decorrelating seed mix.
+    const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
+    const long long sppTotal = sppBase + spp;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
         ^ (prog ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL);
 
@@ -11877,12 +11963,12 @@ Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int 
     };
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
-        kBackwardRGB<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, spp, base, resX,
+        kBackwardRGB<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, sppTotal, base, resX,
                                     diffraction ? 1 : 0, seed);
         cudaCheckKernel("backwardRGB");
     };
 
-    if (!prog || !prog->report) { launch(spp, 0); download(out); }
+    if (!prog || !prog->report) { launch(spp, sppBase); download(out); }
     else gpuSppChunks(spp, *prog, out, launch, download);
 
     freeUpload(up);

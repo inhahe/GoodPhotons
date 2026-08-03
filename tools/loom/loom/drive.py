@@ -64,6 +64,60 @@ def _budget_args(noise: Optional[float], time_s: Optional[float],
     return ["-noise", "3"]  # sensible default: stop at 3% graininess
 
 
+# ---------------------------------------------------------------------------
+# Telling a finished frame from an interrupted one
+# ---------------------------------------------------------------------------
+# ftrace writes the output PNG at EVERY `-interval` tick, not just at the end — that is
+# the whole point of the crash-safety rule.  So "the PNG exists" says nothing about
+# whether the frame converged, and a `skip_existing` resume that trusts it will silently
+# adopt a frame that was interrupted at 1 of 8 spp.  In a loop that is a visible noise
+# pop, and it is invisible in the logs because the resume cheerfully prints "skipping".
+# (Observed for real: a render killed by memory pressure at frame 244 left a 3-spp frame
+# that the next run skipped.)
+#
+# The `-checkpoint` sidecar is the honest record.  Its header is packed little-endian:
+#
+#     magic "FTBUF01\n" (8)  resX (i32)  resY (i32)  mode (i32)  N (i64)  ...
+#
+# and for a deterministic `-spp` render `N` is the accumulated sample count
+# (`src/main.cpp` ~4099 prints it as "holds %lld spp").  So a frame is finished iff its
+# sidecar reports at least the requested spp.
+_FTBUF_MAGIC = b"FTBUF01\n"
+
+
+def checkpoint_spp(png: os.PathLike) -> Optional[int]:
+    """Samples-per-pixel recorded in ``png``'s ``.ftbuf`` sidecar, or ``None``.
+
+    ``None`` means "cannot tell" — no sidecar, or one that is truncated or not a
+    checkpoint at all — and callers must treat that as *not known to be finished*
+    rather than assuming either answer.
+    """
+    fb = Path(str(png) + ".ftbuf")
+    try:
+        with open(fb, "rb") as f:
+            head = f.read(28)
+    except OSError:
+        return None
+    if len(head) < 28 or head[:8] != _FTBUF_MAGIC:
+        return None
+    return int.from_bytes(head[20:28], "little", signed=True)
+
+
+def _target_spp(extra_args: Sequence[str]) -> Optional[int]:
+    """The spp a finished frame must reach, read off the caller's own ``-spp``.
+
+    ``None`` when the budget is not spp-based (``-noise`` / ``-time`` have no fixed
+    target), in which case completeness cannot be checked and we say so out loud.
+    """
+    a = list(extra_args)
+    if "-spp" not in a:
+        return None
+    try:
+        return int(a[a.index("-spp") + 1])
+    except (IndexError, ValueError):
+        return None
+
+
 def emit_frames(scene: Scene, frames: int, outdir: os.PathLike, name: str,
                 *, fps: float = 30.0, loop: bool = True) -> List[Path]:
     """Emit ``frames`` ``.ftsl`` files; return their paths.
@@ -93,7 +147,7 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                  window: bool = True, interval: float = 5.0,
                  noise: Optional[float] = None, time_s: Optional[float] = None,
                  n: Optional[int] = None, loop: bool = True,
-                 skip_existing: bool = False,
+                 skip_existing: bool = False, retries: int = 2,
                  extra_args: Sequence[str] = ()) -> List[Path]:
     """Emit and render a frame range; return the rendered PNG paths.
 
@@ -101,32 +155,82 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     renders an **open** one-shot timeline with distinct endpoints (§11.6).
     ``noise``/``time_s``/``n`` pick the per-frame stop budget (default: 3% noise).
 
-    ``skip_existing=True`` leaves already-rendered PNGs alone, so a long sequence
-    interrupted by a crash (or a Ctrl-C) resumes instead of starting over.  It is
-    opt-in precisely because it cannot tell a stale frame from a fresh one — clear
-    the directory when the scene changes.
+    ``skip_existing=True`` resumes a long sequence that was interrupted by a crash
+    or a Ctrl-C instead of starting over.  A frame counts as done only when its
+    ``-checkpoint`` sidecar reports the full requested spp — **not** merely because
+    a PNG is there, since ftrace writes the PNG at every interval tick and an
+    interrupted frame would otherwise be adopted at whatever spp it reached.  A
+    partial frame is *continued* with ``-resume``, so the samples it already has are
+    kept.  When the budget is not spp-based there is no completeness test available,
+    so existence is all we have and the fact is logged rather than hidden.
+
+    ``skip_existing`` still cannot tell a *stale* frame from a fresh one — clear the
+    directory when the scene changes.
+
+    ``retries`` re-attempts a frame that exits non-zero (default 2 extra tries).
+    A long unattended sequence is exactly where a transient failure — the machine
+    briefly running out of commit, say — should cost one frame's time rather than
+    the whole run; each attempt resumes from the checkpoint, so nothing is redone.
+    A frame that fails every attempt still raises.
     """
     outdir = Path(outdir) if outdir is not None else default_outdir(name)
     ftrace = find_ftrace()
     ftsl_paths = emit_frames(scene, frames, outdir, name, fps=fps, loop=loop)
     budget = _budget_args(noise, time_s, n)
+    want = _target_spp(extra_args)
+    if skip_existing and want is None:
+        print("[loom] note: budget is not -spp based, so a resume cannot verify that an "
+              "existing frame finished; falling back to existence alone", flush=True)
     pngs: List[Path] = []
     for i, fp in enumerate(ftsl_paths):
         png = fp.with_suffix(".png")
+        tag = f"[loom] frame {i + 1}/{len(ftsl_paths)}"
+        have = checkpoint_spp(png) if want is not None else None
         if skip_existing and png.is_file() and png.stat().st_size > 0:
-            print(f"[loom] frame {i + 1}/{len(ftsl_paths)}: {png.name} exists, skipping",
-                  flush=True)
-            pngs.append(png)
-            continue
+            if want is None or (have is not None and have >= want):
+                print(f"{tag}: {png.name} done, skipping", flush=True)
+                pngs.append(png)
+                continue
+            print(f"{tag}: {png.name} is INCOMPLETE "
+                  f"({'no checkpoint' if have is None else f'{have}/{want} spp'}), "
+                  f"re-rendering", flush=True)
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png),
                "-interval", f"{interval:g}", "-checkpoint", *budget]
         if window:
             cmd.append("-window")
         cmd.extend(extra_args)
-        print(f"[loom] frame {i + 1}/{len(ftsl_paths)}: {' '.join(cmd)}", flush=True)
-        r = subprocess.run(cmd, cwd=str(repo_root()))
-        if r.returncode != 0:
-            raise RuntimeError(f"ftrace failed on {fp} (exit {r.returncode})")
+        for attempt in range(retries + 1):
+            # Continue from whatever the sidecar holds rather than discarding it.  A
+            # mismatched (stale-scene) checkpoint is rejected by ftrace's own identity
+            # guard, which restarts the frame and says so, so this is safe to pass
+            # whenever a usable sidecar exists.
+            #
+            # Note `-spp` is ADDITIONAL samples under `-resume`, not a total: resuming a
+            # 3-spp frame with `-spp 8` renders it to 11.  So ask for exactly the
+            # shortfall, which lands every frame on the same spp.  Because the sample
+            # lattice is indexed by ABSOLUTE sample index, `3 + 5` is bit-identical to a
+            # fresh `8`, so a resumed frame is not merely close to an un-interrupted one --
+            # it is the same image.  That is measured, not assumed: scraps/resume_check.py
+            # checks it by filecmp on both CPU and GPU, and its first run FAILED, which is
+            # how the GPU `-resume` bug (gpuSppChunks never applied prog.sampleBase) was
+            # found.  Requires ftrace >= 0.117.1; see known-issues.md.
+            have_now = checkpoint_spp(png) or 0
+            run = list(cmd)
+            if have_now > 0 and want is not None and have_now < want:
+                run[run.index("-spp") + 1] = str(want - have_now)
+                run.append("-resume")
+            elif have_now > 0 and want is None:
+                run.append("-resume")
+            print(f"{tag}"
+                  f"{f' (attempt {attempt + 1}/{retries + 1})' if attempt else ''}: "
+                  f"{' '.join(run)}", flush=True)
+            r = subprocess.run(run, cwd=str(repo_root()))
+            if r.returncode == 0:
+                break
+            if attempt == retries:
+                raise RuntimeError(f"ftrace failed on {fp} (exit {r.returncode}) after "
+                                   f"{retries + 1} attempts")
+            print(f"{tag}: exit {r.returncode}, retrying", flush=True)
         pngs.append(png)
     return pngs
 

@@ -271,8 +271,11 @@ struct Implicit {
 // Sphere-trace a ray against one Implicit. `r.d` need not be unit length: the SDF
 // is in world distance, so the parametric step is (|f|/lipschitz)/|d|. Writes into
 // `hit` (respecting hit.t as the current closest) and returns true on a nearer hit.
+// `anyHit=true` (occlusion queries): the caller only needs the boolean, so skip the
+// ~27-eval root refinement + 4-eval gradient + writeHit whenever the answer is already
+// determined — bit-identical to the full path's return value by construction.
 inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit& hit,
-                              const PatTables* tabs = nullptr) {
+                              const PatTables* tabs = nullptr, bool anyHit = false) {
     // ---- Container clip: entry/exit params [tEnter, tExit] and the container's
     // OUTWARD normals at those crossings (needed to shade caps). The container is the
     // world AABB `bounds` (box) or a world sphere. `bounds` is always the BVH/broad box.
@@ -288,11 +291,13 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         double sq = std::sqrt(disc);
         tEnter = (-B - sq) / A;
         tExit  = (-B + sq) / A;
-        Vec3 pe = r.o + r.d * tEnter, px = r.o + r.d * tExit;
-        Vec3 ge = pe - im.sphereCenter, gx = px - im.sphereCenter;
-        double le = length(ge), lx = length(gx);
-        nEnter = (le > 0.0) ? ge / le : Vec3{0, 0, 1};
-        nExit  = (lx > 0.0) ? gx / lx : Vec3{0, 0, 1};
+        if (!anyHit) {   // cap normals are only needed when a hit gets written
+            Vec3 pe = r.o + r.d * tEnter, px = r.o + r.d * tExit;
+            Vec3 ge = pe - im.sphereCenter, gx = px - im.sphereCenter;
+            double le = length(ge), lx = length(gx);
+            nEnter = (le > 0.0) ? ge / le : Vec3{0, 0, 1};
+            nExit  = (lx > 0.0) ? gx / lx : Vec3{0, 0, 1};
+        }
     } else {
         Vec3 invD{1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z};
         tEnter = -1e300; tExit = 1e300;
@@ -370,7 +375,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
     // ray — the nearest possible hit — so cap it and return. `open` surfaces skip this
     // and let the march reveal the field (a see-through opening / cut edge).
     if (capped && tEnter >= tmin && tEnter < hit.t && f < 0.0)
-        return writeHit(tEnter, r.o + r.d * tEnter, nEnter);
+        return anyHit ? true : writeHit(tEnter, r.o + r.d * tEnter, nEnter);
     for (int i = 0; i < MAX_STEP; ++i) {
         double step = sampleMode ? fixedStep
                                  : std::fmax(std::fabs(f) * invLip, minStep) / dlen;
@@ -385,6 +390,13 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         bool crossed = (f > 0.0 && fn <= 0.0) || (f < 0.0 && fn >= 0.0) ||
                        (f == 0.0 && fn != 0.0);
         if (crossed) {
+            // Any-hit fast path: the refined root th always lands in [t, tn] (both
+            // bisection and the guarded regula-falsi only shrink the bracket), and
+            // t >= t0 >= tmin, so when tn < hit.t acceptance is guaranteed — the
+            // boolean answer is known without refining or computing the gradient.
+            // (tn == hit.t only on a `last` step clamped by hit.t; then refine below
+            // to decide th < hit.t exactly as the full path does.)
+            if (anyHit && tn < hit.t) return true;
             // Refine the bracket [t, tn] to a precise root (residual ~1e-12) so the
             // shared 1e-6 ray-spawn offset lands safely on the correct side. Bisection
             // is the robust default; regula-falsi (Illinois-safeguarded) interpolates.
@@ -412,6 +424,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             }
             double th = 0.5 * (ta + tb);
             if (th < tmin || th >= hit.t) return false;
+            if (anyHit) return true;     // boolean only: skip gradient + writeHit
             Vec3 p = r.o + r.d * th;
             double eps = std::fmax(1e-6, 1e-4 * th);
             Vec3 g = fieldGradient(nd, N, p, eps, pool, tabs);
@@ -423,7 +436,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             // container itself (not a nearer surface via hit.t). Handles rays that
             // originate inside the solid (bounce/transmission/shadow) and exit a cap.
             if (capped && exitIsContainer && fn < 0.0 && tExit >= tmin && tExit < hit.t)
-                return writeHit(tExit, r.o + r.d * tExit, nExit);
+                return anyHit ? true : writeHit(tExit, r.o + r.d * tExit, nExit);
             return false;
         }
         t = tn; f = fn;
