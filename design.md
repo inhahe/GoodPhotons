@@ -174,6 +174,31 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   serial — bit-identical to the old serial code by construction. Per-implicit
   marching also runs in parallel across objects.
 
+  **Oriented container box (0.121.1).** An `expr` isosurface is NOT a distance
+  field, so the marcher clips the ray to the authored `contained_by` box and steps
+  by `|f| / max_gradient` — a bound the author only guarantees *inside* that box.
+  `Implicit` therefore stores the container in its OWN frame (`boxOriented`,
+  `boxInv` = world→container-local, `boxLo`/`boxHi`) and `intersectImplicit` runs
+  the slab test there. An affine map preserves the ray parameter
+  (`p(t) = o + t·d` ↦ `boxInv(o) + t·boxInv_dir(d)`), so the resulting `t` values
+  are directly comparable with `tmin`/`hit.t`; only the two face normals return to
+  world, via `Affine::applyDirTranspose` (`boxInv`'s linear part transposed — NOT
+  `applyNormal`, which would invert a second time). `ftsl.h`'s `addIsosurface`
+  sets `boxOriented` only when the local→world map is not axis-preserving, so
+  every unrotated scene takes the original world-AABB path and renders
+  bit-identically.
+
+  Clipping to the world AABB instead is a real invisibility bug: under a rotation
+  that AABB is strictly larger than the box (for the gallery heart, **4.36× the
+  volume**), the field out there is far steeper (max `|f|` 1688 → 37738), and the
+  first sphere-trace step of `37738/60 ≈ 629 m` leaps clean over a 0.6 m object.
+  Diagnostic signature: **the rasterizer shows it and every ray-traced mode does
+  not** — marching cubes samples a lattice and never sphere-traces, so it cannot
+  overshoot. Guarded by `-checkcontainer`, which builds one sextic solid twice
+  (axis-aligned and rigidly rotated) under a shared `max_gradient` and fires
+  correspondingly rotated rays: a rigid motion cannot change a hit distance, so
+  any disagreement is the clip region leaking outside the container.
+
   **Cap-fraction guard on `-export-mesh` (0.121.0).** A capped isosurface marches
   `max(f, contSDF(p))`, so if the field's sign is inverted (`f < 0` *outside* the
   intended shape) the container wins everywhere and the export is the `contained_by`

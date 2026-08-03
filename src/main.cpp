@@ -486,6 +486,103 @@ static int checkImplicit(long long rays) {
     return mismatches;
 }
 
+// ORIENTED-CONTAINER self-test: rotating an expression isosurface must not change what
+// it looks like. An `expr` field is not a distance function, so the marcher clips the ray
+// to the authored `contained_by` box and sizes its steps by |f|/max_gradient — a bound
+// that only holds INSIDE that box. Clip to the box's world AABB instead and a rotated
+// piece gets marched through a much larger region: for a steep field |f| out there is
+// enormous, the first step is |f|/max_gradient long, and the sphere-trace leaps clean over
+// the object, which then renders INVISIBLE in every ray-traced mode while the rasterizer
+// (marching cubes, no stepping) still shows it. That is exactly what happened to the
+// gallery heart once tools/settle_scene.py baked a `group { rotate .. }` rest pose onto it.
+//
+// So: build the SAME solid twice — once axis-aligned, once rigidly rotated — with one
+// shared max_gradient, and fire correspondingly rotated rays. A rigid motion cannot change
+// a hit distance, so any disagreement is the clip region leaking outside the container.
+// The field is a sextic ((|p|^2 - r^2)^3, zero set = a sphere of radius r) because the
+// failure scales with how fast the field grows outside the box; a quadric barely notices.
+static int checkContainer(long long rays) {
+    const double r = 0.7, half = 0.8;         // sphere radius; container half-extent
+    std::vector<PatNode> prog; std::string perr;
+    if (!compilePatternExpr("(x^2 + y^2 + z^2 - 0.49)^3", prog, perr)) {
+        std::printf("[checkcontainer] expr compile failed: %s -> FAIL\n", perr.c_str());
+        return 1;
+    }
+    // max|grad f| over the container cube: f' = 3(|p|^2-r^2)^2 * 2|p|, worst at the corner.
+    const double corner = half * std::sqrt(3.0);
+    const double lip = 3.0 * std::pow(corner * corner - r * r, 2.0) * 2.0 * corner;
+
+    auto build = [&](const Affine& l2w) {
+        Implicit im;
+        FieldNode nd; nd.op = FieldOp::Expr; nd.scale = 1.0;
+        nd.inv = l2w.inverse(); nd.exprOff = 0; nd.exprN = (int)prog.size();
+        im.nodes.push_back(nd);
+        im.exprNodes = prog;
+        im.matId = 0;
+        im.container = Container::Box;
+        im.capped = true;
+        im.lipschitz = lip;
+        im.boxLo = Vec3{-half, -half, -half};
+        im.boxHi = Vec3{ half,  half,  half};
+        im.boxInv = nd.inv;
+        // Axis-preserving map -> the authored box IS its world AABB (the fast path);
+        // otherwise keep it oriented. Same rule as ftsl.h's addIsosurface.
+        bool axisAligned = true;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) {
+                double v = l2w.m[i * 3 + j];
+                if (i == j) { if (v <= 0.0) axisAligned = false; }
+                else if (v != 0.0) axisAligned = false;
+            }
+        im.boxOriented = !axisAligned;
+        im.bounds.lo = im.bounds.hi = l2w.apply(im.boxLo);
+        for (int c = 1; c < 8; ++c)
+            im.bounds.expand(l2w.apply(Vec3{(c & 1) ? half : -half,
+                                            (c & 2) ? half : -half,
+                                            (c & 4) ? half : -half}));
+        im.minStep = implicitMinStepForDiag(length(l2w.applyDir(im.boxHi - im.boxLo)));
+        return im;
+    };
+
+    const Affine R = affineFromTRS(Vec3{0, 0, 0}, Vec3{50.6839, 9.91871, -34.6649}, Vec3{1, 1, 1});
+    Implicit flat = build(Affine::identity());
+    Implicit turned = build(R);
+    if (!turned.boxOriented) {   // the rotated case must actually exercise the new path
+        std::printf("[checkcontainer] rotated container was not detected as oriented -> FAIL\n");
+        return 1;
+    }
+    Pcg32 rng; rng.seed(0xB0C0DEu, 0x77u);
+    int missing = 0, mismatches = 0; long long compared = 0, grazed = 0;
+    double maxdt = 0;
+    for (long long i = 0; i < rays; ++i) {
+        Vec3 o{rng.uniform() * 4 - 2, rng.uniform() * 4 - 2, rng.uniform() * 4 - 2};
+        double z = rng.uniform() * 2 - 1, phi = 2 * PI * rng.uniform();
+        double rr = std::sqrt(std::max(0.0, 1 - z * z));
+        Vec3 d = normalize(Vec3{rr * std::cos(phi), rr * std::sin(phi), z});
+        // Skip silhouette grazes and origins sitting on the surface or the container
+        // wall: those are sub-epsilon coin flips, not a test of the clip region.
+        Vec3 oc = Vec3{0, 0, 0} - o;
+        double proj = dot(oc, d);
+        double impact = std::sqrt(std::max(0.0, dot(oc, oc) - proj * proj));
+        if (std::fabs(impact - r) < 1e-3 || std::fabs(length(oc) - r) < 1e-3) { ++grazed; continue; }
+        Hit hf; hf.t = DBL_MAX; bool hitF = intersectImplicit(Ray{o, d}, flat, 1e-6, hf);
+        // The same ray in the rotated frame: rotate origin and direction together.
+        Hit ht; ht.t = DBL_MAX;
+        bool hitT = intersectImplicit(Ray{R.apply(o), R.applyDir(d)}, turned, 1e-6, ht);
+        if (hitF != hitT) { if (hitF && !hitT) ++missing; else ++mismatches; continue; }
+        if (!hitF) continue;
+        ++compared;
+        double dt = std::fabs(hf.t - ht.t);
+        maxdt = std::max(maxdt, dt);
+        if (dt > 1e-6) ++mismatches;
+    }
+    int bad = missing + mismatches;
+    std::printf("[checkcontainer] %lld rays (%lld hits compared, %lld grazing skipped), "
+                "%d vanished-when-rotated, %d mismatches, max|dt|=%.2e -> %s\n",
+                rays, compared, grazed, missing, mismatches, maxdt, bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : 1;
+}
+
 // Deterministic thin-lens (mode C) self-test. Forward catch is far too photon-
 // inefficient to validate the lens by rendering, so instead we fire rays from a
 // fixed scene point through many aperture positions and measure the circle of
@@ -5633,6 +5730,7 @@ static int run(int argc, char** argv) {
     double focusDist = 0.0;   // mode C thin-lens focus distance (0 = no lens)
     bool checkBvhOnly = false;
     bool checkImplicitOnly = false;
+    bool checkContainerOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
     bool checkFluoroOnly = false;
@@ -5978,6 +6076,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-focus") && i + 1 < argc) focusDist = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
         else if (!std::strcmp(argv[i], "-checkimplicit")) checkImplicitOnly = true;
+        else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
@@ -6168,6 +6267,7 @@ static int run(int argc, char** argv) {
         g_windowTitle = "ftrace  \xE2\x80\x94  " + scene + "  \xE2\x86\x92  " + out;
     }
     if (checkImplicitOnly) return checkImplicit(500'000) == 0 ? 0 : 1; // deterministic, no scene needed
+    if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed

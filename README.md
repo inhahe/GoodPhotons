@@ -2943,10 +2943,15 @@ alone can't restore, so they are not disk-resumable.
 | `-convergence <m>` | Convergence-plane distance for `-stereo`, in **scene units** — the depth that lands at the screen (zero parallax); nearer objects pop out, farther recede. Default: the camera's **look-at target** distance. |
 | `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
-**Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
-`-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
-`-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`,
-`-checksun`, `-checkbind`, `-checkprop`, `-checkarray`.
+**Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checkimplicit`,
+`-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`, `-checkthinfilm`,
+`-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
+`-checkgrid`, `-checkscatter`, `-checksun`, `-checkbind`, `-checkprop`,
+`-checkarray`. Each runs deterministically without a scene and prints
+`PASS`/`FAIL`. `-checkcontainer` guards the isosurface container clip: rotating an
+isosurface must not change what a ray sees, so it builds the same solid twice
+(axis-aligned and rigidly rotated) and checks that correspondingly rotated rays
+return identical hit distances.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are

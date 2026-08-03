@@ -5,6 +5,69 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — DONE (2026-08-03): an `expr` isosurface inside a rotated `group` was INVISIBLE to every ray-traced mode
+
+Presented as "the morpho heart renders black in `png/heart_check.png`". It was not a material
+problem at all — the heart was not being *hit*. (`-checkmultilayer` passes, and an Abeles
+computation put `morpho`'s luminous normal-incidence reflectance at **0.5473** vs `oil-slick`'s
+**0.3728**, i.e. it reflects *more* than a jack that renders vividly. Swapping in a plain diffuse
+material left it equally invisible, which killed the material hypothesis outright.)
+
+**Root cause.** A `function { expr ... }` field is not a distance function, so `intersectImplicit`
+clips the ray to the authored `contained_by` box and sizes each step as `|f| / max_gradient` — a
+bound the author only guarantees **inside that box**. `ftsl.h`'s `addIsosurface` stored only the
+world AABB of the 8 transformed corners, and clipped to that. Under a rotation the AABB is
+strictly larger than the box, and the field out there is far steeper. Measured for the gallery
+heart (`scraps/heart_lipschitz.py`):
+
+| region | max &#124;f&#124; | max &#124;grad f&#124; |
+|---|---|---|
+| authored `contained_by` box | 1688 | 18858 |
+| AABB of that box after the settle rotation | 37738 | 245658 |
+
+— **4.36× the volume**. The first step is then `37738 / 60 ≈ 629 m` across a 0.6 m object: the
+sphere-trace leaps clean over it and reports a miss. Triggered the moment
+`tools/settle_scene.py` baked a `group { rotate 50.6839 9.91871 -34.6649 }` rest pose onto the
+piece — which is why `gallery.ftsl` showed the heart and `gallery_settled.ftsl` did not, with a
+byte-identical heart block in both.
+
+**Diagnostic signature worth remembering: the rasterizer showed it and every ray-traced mode did
+not.** `isomesh.h` marching cubes samples a lattice and never sphere-traces, so it cannot
+overshoot — that asymmetry localises a fault to the marcher immediately. (`-raster -raster-iso 96`
+is a ~0.1 s geometry check; `-mode W -ambient 0.15` a ~10 s deterministic, noise-free ray-traced
+A/B.)
+
+**Fix (0.121.1).** `Implicit` now stores the container in its own frame (`boxOriented`, `boxInv` =
+world→container-local, `boxLo`/`boxHi`) and both the CPU (`implicit.h`) and CUDA
+(`render_cuda.cu`) intersectors run the slab test there; `Affine::applyDirTranspose` maps the two
+face normals back to world. `estimateFieldLipschitz` likewise surveys the oriented box rather than
+its inflated AABB, so a rotated piece doesn't get a needlessly large `L` that would slow every
+march. `boxOriented` is set only when the local→world map is not axis-preserving, so unrotated
+scenes take exactly the code they always did — verified by rendering `gallery.ftsl` (no oriented
+container anywhere) with the pre- and post-fix binaries: **0 differing pixels, max channel delta
+0**. No scene change was needed; `max_gradient 60` stays as authored, and bumping it would only
+have papered over a general engine bug affecting every rotated expression isosurface.
+
+**Regression test.** `-checkcontainer` (`checkContainer` in `main.cpp`) builds one sextic solid
+twice — axis-aligned and rigidly rotated — under a shared `max_gradient`, and fires
+correspondingly rotated rays. A rigid motion cannot change a hit distance, so any disagreement is
+the clip region leaking outside the container. Confirmed to actually guard the bug: with the
+oriented branch disabled it reports **76 vanished-when-rotated → FAIL**.
+
+### TECH DEBT: `isomesh.h` caps a *rotated* container against its world AABB, not its true faces
+
+`boxSDF` / `capBox` in `src/isomesh.h` still use `im.bounds` (the world AABB) for
+`Container::Box`, so a rotated `capped` isosurface is sealed along AABB planes rather than the
+authored box's real faces — the cap sits outside the intended surface on the rotated faces. Not
+the overshoot bug above (marching cubes never sphere-traces, so it can't miss the object), and
+currently invisible: it only matters for a surface that actually *reaches* its container, which
+the gallery heart does not, and it only affects `-export-mesh` and `-raster`.
+
+**Proper fix:** give the mesher the same treatment as `intersectImplicit` — when
+`im.boxOriented`, transform the sample point by `im.boxInv` and evaluate the box SDF against
+`im.boxLo`/`im.boxHi` (the local extents), scaling the result by the map's uniform scale so the
+`max(f, contSDF)` blend stays in the same units as the field.
+
 ### BUG — DONE (2026-08-03): `settle_scene.py` reported a piece lying on the FLOOR as `OK` — both its acceptance tests are local
 
 `heart` baked into `gallery_settled.ftsl` with `translate 1.19 -2.81 0.45 rotate -177.6 -45.3 56.1`
