@@ -6533,3 +6533,84 @@ was visibly wrong the moment the user scrolled the pane back into view.
 width exceeds `2 * NodePadding.x * zoom`. A node always draws at least its title, so a
 content width of zero means "not measured this frame", never "an empty node". The previous
 frame's sizes are kept until a frame that actually drew comes along.
+
+## FIXED (2026-08-03, 0.119.0): mode `W` renders a scene to pure black — with no diagnostic — when every light is enclosed in refractive geometry
+
+Reported from `ftrace -explore -whitted-grid 1 -mode W -in scenes\gallery_settled.ftsl`:
+the raster stage navigates fine, but the instant the camera settles and the mode-`W` lit
+preview takes over, the window goes black and stays black. Reproduces headlessly:
+
+```
+ftrace -in scenes/gallery_settled.ftsl -mode W -spp 1 -whitted-grid 1 -camera cam \
+       -r 320 200 -o png/gal_w.png            # -> all-zero image, "auto-exposure=1"
+```
+
+**Not a viewer bug.** `gallery_settled`'s entire illumination is one 8 mm arc,
+
+```
+light sphere { center 5.0 3.10 3.0   radius 0.008   spd blackbody 6000 }
+```
+
+sitting at the exact centre of two nested dielectric meshes (`lamp_bulb`, fused silica,
+scale 0.11; `lamp_xe`, xenon gas, scale 0.1034) plus the chrome electrodes. Mode `W` does
+*all* of its lighting by NEE — a shadow ray from each vertex to a point on the light — and
+an occlusion test treats a dielectric as an opaque blocker, so **every** direct connection
+in the scene is blocked. Mode `W` also drops stochastic diffuse indirect (it implies
+`-direct-only`), so no energy reaches anything by any route, and the result is exactly
+zero everywhere. `-gi` does not help: gather rays collect mode-`W` radiance, which is
+itself zero. This is the classic Whitted limitation (POV-Ray behaves identically) and is
+exactly why the scene's own `prefer{}` block selects mode **D** — BDPT starts paths at the
+arc and refracts them *out* through the quartz.
+
+Confirmed by deleting only the two dielectric shells (`scraps/gal_noglass.ftsl`):
+auto-exposure goes `1` → `1.32e-09` and the hall lights up.
+
+**Workaround:** `-ambient 0.2` gives a fully readable flat-lit preview
+(`-no-media` on top, since mode `W` ignores the bounded cloud anyway and treats the global
+haze as a single homogeneous term):
+
+```
+ftrace -explore -mode W -whitted-grid 1 -ambient 0.2 -no-media -in scenes\gallery_settled.ftsl
+```
+
+**Fixed** by detecting the *condition* rather than the symptom, so the diagnostic names the
+cause instead of reporting a black frame after the fact. `Scene::emitterSeal()`
+(`src/scene.h`) probes each emitter with a deterministic lattice of 512 outgoing directions
+— stratified over the emitter surface via the existing `Emitter::samplePoint`, uniform over
+the outgoing hemisphere (or inside the cone, for a spot) — and reports the fraction whose
+first hit is a material for which `isSpecularType()` holds. That predicate is exactly right
+rather than approximately right: `backward.h` calls `neeLight()` from the `Diffuse`,
+`DiffuseTransmit` and `Fluorescent` cases and *nowhere else*, so a first hit on any
+specular type (glossy included) is a direction whose power NEE can never collect. Hits on
+the emitter's own surface yield no evidence and are excluded, so a concave mesh light
+seeing itself is not mistaken for a sealed one. `warnSealedLights()` (`src/main.cpp`) runs
+it once at startup whenever `g_whitted || wPreview`, so `-explore` is covered too (the
+viewer's `T` preview *is* mode `W`).
+
+The threshold is **0.95**, not 1.0, and this is the part that needed measuring rather than
+guessing: the gallery's arc probes at **98.2 %**, not 100 %, because the lamp assembly has
+its own socket and cord *inside* the envelope — diffuse surfaces that are genuinely lit but
+illuminate nothing except themselves. A first pass thresholded at 0.995 and silently missed
+the very scene it was written for. Past ~95 % the scene is at least 20× underlit against
+what the author intended, so the preview is misleading whether or not it is literally zero.
+
+Verified against all 98 scenes in `scenes/`: every one reaches the mode-`W` path, and
+exactly three trip the warning — `gallery.ftsl`, `gallery_settled.ftsl` and
+`mirror_sphere_interior.ftsl`, all the same sealed-lamp assembly. No false positives. The
+third is an independent confirmation rather than a third instance of one mistake: its own
+header comment already states that you cannot "next-event-connect a shading point to a
+light through a refracting interface", and it renders at `auto-exposure=7.18e-14` — a
+near-black frame with a few specular specks, exactly what the warning predicts.
+
+Still open as a possible extension: mode `R`/`P` hit the same condition, where it shows up
+as pathological convergence rather than a black frame, and would benefit from the same
+warning. The probe is mode-agnostic; only the call site is gated.
+
+## OPEN (minor, 2026-08-03): rendering `gallery_settled` without `-camera` also renders the 600-frame flyby
+
+`ftrace -in scenes/gallery_settled.ftsl -mode W -o png/gal_w.png` renders the still camera
+*and* then all 600 frames of the scene's `camera_curve "fly"`, writing `png/gal_w_fly000
+…599.png` (~4 min). Selecting a camera with `-camera cam` avoids it. Arguably working as
+designed — "render every camera in the scene" — but it is a surprising default for a scene
+that carries a long flypath, and it silently spams the output directory next to the `-o`
+path. Worth at least a printed warning naming how many frames are about to be written.

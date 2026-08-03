@@ -15,7 +15,7 @@ this file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `B` | forward light tracing, splat through pinhole/lens to film (flagship) | `render.h` |
 | `C` | forward + contact sensor | `render.h` |
 | `R` | backward (unidirectional) path tracer — the reference | `backward.h` |
-| `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased, CPU only) | `backward.h` (`whitted`) |
+| `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased; CPU + GPU since 0.110.0, fully on-device since 0.116.0) | `backward.h` (`whitted`), `render_cuda.cu` (`WhittedOpts`) |
 | `P` | composite: forward B + backward R passes merged | `main.cpp` orchestration |
 | `D` | bidirectional path tracer (BDPT, MIS) | `bdpt.h` |
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather) | `photonmap.h`, `photonmap_render.h` |
@@ -326,6 +326,28 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   bit-identical across the change, and only `spp > 1` moves. Measured star discrepancy of the
   first 16 points drops from 0.754 to 0.077 at base 61 and 0.651 to 0.102 at base 43
   (`scraps/n3e_lattice.py`).
+
+  **Sealed-light detection (0.119.0).** Because mode `W` implies `-direct-only`, NEE is the
+  *only* way anything is lit — and `Scene::occluded` blocks a shadow ray on any geometry,
+  dielectrics included (the SDS limitation). A light sealed inside refractive or mirrored
+  geometry therefore reaches no vertex at all and the mode renders pure black, previously
+  with `auto-exposure=1` as the sole hint. `Scene::emitterSeal()` (`scene.h`) probes an
+  emitter with a deterministic 512-direction lattice — stratified over the surface through
+  the existing `Emitter::samplePoint`, uniform over the outgoing hemisphere, or inside the
+  cone for a `Spot` — and returns the fraction whose first hit is a material satisfying
+  `isSpecularType()`. That predicate is exact rather than heuristic: `backward.h` calls
+  `neeLight()` from the `Diffuse`, `DiffuseTransmit` and `Fluorescent` cases and nowhere
+  else, so the two sets are complements by construction, and a change to either must keep
+  them so. Self-hits (`h.matId == e.matId`) yield no evidence and are excluded, so a
+  concave mesh light is not mistaken for a sealed one; `Env`/`Sun` return 0 outright.
+  `main.cpp`'s `warnSealedLights()` runs it once when `g_whitted || wPreview` — the explorer
+  is included because its `T` preview *is* mode `W` — and warns past `kSealWarnFrac` = 0.95.
+  The threshold is short of 1.0 on purpose: a real lamp assembly has hardware inside the
+  envelope (the gallery's arc probes 98.2 %, the remainder being its own socket and cord),
+  and a first pass at 0.995 missed the exact scene the check exists for. Verified across all
+  98 scenes in `scenes/`: three trip it, all the same sealed-lamp assembly, no false
+  positives. The probe is mode-agnostic; only the call site is gated, so `R`/`P` could
+  adopt it.
 
   **A fluorophore's excitation λ comes from the material's OWN distribution, not the scene's.**
   `Material::fluoInSampler` (`scene.h`) is an `EmissionSampler` over the product

@@ -2753,6 +2753,65 @@ static int g_giBounce = 4;
 // See BackwardRenderer::giClamp for the full rationale.
 static double g_giClamp = 0.0;
 
+// Mode W lights a surface ONLY by next-event estimation, and a shadow ray is blocked by
+// any geometry at all -- dielectrics very much included (Scene::occluded: "can't connect
+// through specular", the SDS limitation). So a light sealed inside refractive or mirrored
+// geometry -- an arc lamp in its quartz envelope, a filament in a closed reflector -- can
+// reach no vertex in the scene, and mode W renders the whole picture pure BLACK.
+//
+// That failure used to be completely silent: the only trace of it anywhere in the output
+// was `auto-exposure=1`, the "no signal at all to scale" fallback, which reads like a
+// normal number. In the interactive explorer it was worse still -- the raster stage
+// navigates fine and the window simply goes black the instant the camera settles and the
+// mode-W stage takes over, with nothing printed at all.
+//
+// So probe every emitter once at startup and say so up front, naming the blocker. A few
+// hundred rays per light, i.e. free next to any render.
+//
+// The reported number is the fraction of the emitter's outgoing directions that are
+// blocked, which IS the physically meaningful quantity: it is the share of the light's
+// emitted power that no NEE connection can ever collect. The threshold is deliberately
+// short of 1.0 because a real lamp assembly has hardware inside the envelope -- the
+// gallery's arc probes at 0.988, the missing 1.2% being its own socket and cord, which
+// are diffuse but sit inside the glass and light nothing but themselves. Anything past
+// ~0.95 means the scene is at least 20x underlit against what the author intended, so
+// mode W's picture is misleading whether or not it is literally all zero.
+static constexpr double kSealWarnFrac = 0.95;
+
+static void warnSealedLights(const Scene& scene) {
+    int sealed = 0, open = 0;
+    for (size_t i = 0; i < scene.emitters.size(); ++i) {
+        const Emitter& e = scene.emitters[i];
+        const Scene::EmitterSeal s = scene.emitterSeal(e, 512);
+        if (s.probes == 0) continue;
+        if (s.sealed < kSealWarnFrac) { ++open; continue; }
+        ++sealed;
+        const char* mesh = (s.blockMat >= 0) ? scene.meshNameForMat(s.blockMat) : nullptr;
+        const char* type = (s.blockMat >= 0 && s.blockMat < (int)scene.mats.size())
+                         ? matTypeName(scene.mats[s.blockMat].type) : "specular";
+        std::printf("[mode W] WARNING: light %zu of %zu is SEALED inside %s geometry%s%s%s -- "
+                    "%.1f%% of the directions leaving it are blocked\n",
+                    i + 1, scene.emitters.size(), type,
+                    mesh ? " (mesh '" : "", mesh ? mesh : "", mesh ? "')" : "",
+                    100.0 * s.sealed);
+    }
+    if (sealed == 0) return;
+    std::printf("[mode W]   Mode W lights a surface ONLY by next-event estimation, and a "
+                "shadow ray cannot pass through specular geometry, so that power is "
+                "unreachable here -- it needs a transport that can refract back OUT of the "
+                "enclosure.\n");
+    if (open == 0)
+        std::printf("[mode W]   No light in this scene can reach anything, so the image will "
+                    "render black or near-black.\n"
+                    "[mode W]   Use -ambient 0.15 for a flat-lit preview you can navigate and "
+                    "frame with, or render in mode D/B/M, which transport light out through "
+                    "the enclosure.\n");
+    else
+        std::printf("[mode W]   The other %d light%s still reach%s the scene, so expect it lit "
+                    "only by %s.\n", open, open == 1 ? "" : "s", open == 1 ? "es" : "",
+                    open == 1 ? "that one" : "those");
+}
+
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
 // segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
@@ -6258,6 +6317,9 @@ static int run(int argc, char** argv) {
         }
     }
     else if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
+    // Both a real mode-W render and the explorer's T preview (which IS mode W) hit the
+    // sealed-light failure, so warn for either -- see warnSealedLights.
+    if (g_whitted || wPreview) warnSealedLights(scene);
     // Kept out of the chain above: rejecting -gi is independent of whether the run is
     // also direct-only, and folding it in would swallow that notice when both are given.
     // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for

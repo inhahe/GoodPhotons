@@ -419,6 +419,35 @@ boosting one ×8 also made the 64-spp image ~7× closer to that reference. `-gi`
 the `-ambient` tail — it is not a substitute for a converged render. All of these are
 tracked in `known-issues.md`.
 
+**A light sealed inside glass renders the scene black — and mode `W` now says so.** Mode
+`W` lights a surface *only* by next-event estimation, and a shadow ray is blocked by any
+geometry at all, dielectrics very much included (the SDS limitation: you cannot connect
+through a refracting interface). So a lamp modelled the way a real one is built — an arc
+sealed in a quartz envelope, a filament inside a closed reflector — can reach no vertex
+anywhere in the scene, and the whole image comes out **pure black**. Nothing is wrong with
+the scene; it needs a transport that can refract back *out* of the enclosure, which is why
+`scenes/gallery_settled.ftsl` and `scenes/mirror_sphere_interior.ftsl` select mode `D`.
+That used to fail silently — the only trace was `auto-exposure=1`, the "no signal at all to
+scale" fallback, which reads like a normal number, and under `-explore` the window simply
+went black the instant the camera settled and the mode-`W` stage took over. Since v0.119.0
+ftrace probes every emitter at startup (a few hundred rays, free next to any render) and
+reports the fraction of its outgoing directions that a specular surface blocks, naming the
+blocking mesh:
+
+```
+[mode W] WARNING: light 1 of 1 is SEALED inside dielectric geometry (mesh 'lamp_xe')
+                 -- 98.2% of the directions leaving it are blocked
+```
+
+The reported number is the share of the light's emitted power that no NEE connection can
+ever collect. It warns past **95 %** rather than at a literal 100 % because a real lamp
+assembly has hardware *inside* the envelope — the gallery's arc probes at 98.2 %, the
+missing 1.8 % being its own socket and cord, which are diffuse but light nothing except
+themselves. The check runs under `-explore` too, since the viewer's `T` preview *is* mode
+`W`. Across all 98 scenes in `scenes/` exactly the three lamp-enclosure scenes trip it. The
+workaround it suggests, `-ambient 0.15`, gives a flat-lit preview that is perfectly good
+for navigating and framing.
+
 Where extra `-spp` *does* buy convergence (the glossy lobe, the grating's orders, the dye's
 excitation band), it now does so **from the second sample onward**. Each of those lattices uses its
 own prime base so that two vertices on one path aren't driven by the same sequence, and those
