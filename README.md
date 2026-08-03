@@ -1990,6 +1990,21 @@ one vertex ⇒ **no cracks**), crossings are refined by bisection on the real fi
 normals come from the field gradient (box-face normals on caps), and each triangle is wound so
 its geometric normal points outward.
 
+**Watch the cap warning.** Capping is only correct when `f < 0` means *inside the shape you
+want*. If the expression's sign is inverted, "solid" becomes everything **outside** the shape,
+the container sits entirely within it, and the exporter faithfully returns the whole container
+as a closed shell with the intended surface hollowed out invisibly inside — an export that
+looks like a plain ball or box from every angle. Since v0.121.0 the exporter measures how many
+output triangles lie on the cap and says so:
+
+```
+[export-mesh]   WARNING: 66% of these triangles are CONTAINER CAP, not surface.
+```
+
+If you see that, either add `open` to the `isosurface` (skip capping, keep the raw cut rim) or
+negate the expression. This is not hypothetical — it is how `meshes/klein_a120_b060_c30_d127*.obj`
+silently became featureless balls; see `known-issues.md`.
+
 The **adaptive** pass collapses cheap edges first: the quadric error is near-zero on flat
 regions (a vertex can slide freely) and large where the surface curves, so triangles thin out
 on flat areas and stay dense on detailed ones — the requested curvature-driven tessellation. A

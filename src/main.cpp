@@ -6509,6 +6509,22 @@ static int run(int argc, char** argv) {
             isomesh::Mesh m = isomesh::marchImplicit(scene.implicits[k], mo, &tabs);
             std::printf("[export-mesh]   marched: %zu verts, %zu tris\n",
                         m.pos.size(), m.tri.size() / 3);
+            // A cap that DOMINATES the output is the signature of an inverted field: the
+            // container ends up entirely inside the "solid", so the export is the container
+            // shell with the intended shape hollowed out invisibly inside it. This was silent
+            // until now — it is how the Klein-bottle OBJs became featureless balls.
+            const double capFrac = isomesh::capFraction(scene.implicits[k], m, &tabs);
+            if (capFrac > 0.5) {
+                std::printf("[export-mesh]   WARNING: %.0f%% of these triangles are CONTAINER CAP, "
+                            "not surface.\n"
+                            "[export-mesh]     The exported solid is essentially the `contained_by` "
+                            "shape with the isosurface hollowed out INSIDE it, so from the outside "
+                            "it will look like a plain ball/box.\n"
+                            "[export-mesh]     That usually means the field's sign is inverted "
+                            "(f < 0 OUTSIDE the intended shape). Add `open` to the isosurface to "
+                            "skip capping, or negate the expression.\n",
+                            100.0 * capFrac);
+            }
             if (mo.adaptive && !m.tri.empty()) {
                 size_t before = m.tri.size() / 3;
                 isomesh::decimateAdaptive(m, mo.decimate, scene.implicits[k]);
