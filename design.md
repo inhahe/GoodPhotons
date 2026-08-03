@@ -101,6 +101,21 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   that an unread key otherwise silently does nothing, turning a typo or a drifted
   emitter into a wrong image instead of a message. This is what makes the loom
   emitter-drift audit (`scraps/emit_audit.py`, TODO J3c) mechanically possible at all.
+  **The `render { … }` block** carries the handful of settings that belong to the scene
+  rather than to the run — `photons`, `mode`, `res`, `device`, `out`, and (since 0.122.0)
+  `max_bounce`. `applyRender` parses them onto `Loaded` (`Loaded::maxBounce`, `-1` = not
+  specified) and `main.cpp` folds each into the corresponding CLI variable *only if the
+  operator left it unset, so an explicit flag always wins*. `max_bounce` exists because
+  path depth is sometimes a property of the geometry and not of the operator's taste:
+  mode D/U run 8 path edges by default, and a thin-walled glass shell with another tube
+  inside it presents about eight dielectric interfaces along one line of sight, so at the
+  default the innermost surface's paths are truncated and it renders as a solid **black
+  plug** — indistinguishable, by eye, from a material or winding bug. The gallery's Klein
+  bottle is exactly that shape and so declares `render { max_bounce 32 }` itself; the
+  scene, not the command line, is the thing that knows. Pickup is announced
+  (`[scene] max bounce = N (from the scene's render block)`) so the number never applies
+  invisibly. Cost is real — measured ~35% of the sample rate on the gallery — which is
+  why it stays a per-scene declaration rather than a raised global default.
   Lights are `Emitter`s with an `EmitterShape`
   (Quad/Sphere/Spot/Env/Cylinder/**Mesh**/**Sun**); each carries its own SPD and a `power`
   = emitIntegral·geomWeight selection weight. **Distant sun** (since 0.84.0):
@@ -1852,8 +1867,8 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
      of them *and* still above that support's top. Both halves are load-bearing: the
      wedged heart still *touched* `stand_heart` on the way down, so membership alone
      passes it. The mid-height rule (rather than "below the piece's underside") is what
-     lets a **mount** count — `collar_klein`'s top is above the Klein bottle's lowest
-     point, because the bottle hangs down inside its bore.
+     lets a **mount** count — a collar's top is above the piece's lowest point whenever the
+     piece hangs down inside its bore, as the retired `collar_klein` did.
 
      Note this is deliberately *not* a displacement check. How far the COM moved is the
      obvious metric and the wrong one: `heart` settling correctly under `--tether` moves
@@ -1882,11 +1897,25 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
   to axle-vertical. Shrinking the ring under the ball radius lets it rest on its two
   spheres, which is what a dumbbell at rest should look like.
 
-  The `klein` bottle is the harder case: it has **no** acceptable rest pose, and its mesh
-  is art that must not be altered. Enumerating them settles it — the convex hull's faces
-  whose supporting plane has the COM over them *are* the poses it can rest in, and of the
-  44 the most upright leans 73°. So the fix is a **mount that grips rather than supports**,
-  which is what `tools/make_klein_collar.py` generates (see below).
+  The **third possibility is that the model itself is wrong for the shelf**, and that is
+  what the `klein` bottle turned out to be. The original image-to-3D bottle
+  (`klein_hunyuan.obj`) had *no* acceptable rest pose: enumerate them — the convex hull's
+  faces whose supporting plane has the COM over them *are* the poses it can rest in — and
+  of the 44 the most upright leans 73°. A mesh that is art must not be altered, so the fix
+  was a **mount that grips rather than supports**, a collar whose bore was cut to the
+  piece's own cross-section (`tools/make_klein_collar.py`, retired 2026-08-03). The real
+  fix was a better model: `meshes/klein_bottle_full.obj` is a glassblower's bottle with the
+  neck genuinely continuing *inside* the bulb and a punted foot, so it stands — foot ring
+  radius 66 mm under a COM 225 mm up, a 6.5° static tipping angle, 0.00° settled lean and
+  0.2 mm poke drift on the bare slate cap. **No mount at all is the strongest mount**, and
+  when a piece cannot stand, ask whether the geometry is the thing to replace before
+  engineering around it.
+
+  A seat ring for the new bottle was designed and rejected on measurement: the body flares
+  continuously off the foot (66 mm at the base → 83 mm 4 mm up → 112 mm at 20 mm), so a bore
+  loose enough to lower the piece into is loose enough to let it slide the same distance,
+  and `slab_sections`' 8 mm vertical quantisation turns that slope into ±13 mm of bore slop
+  in the sim regardless. A ring would have been decoration.
 
   `heart` is the third variety: a shape that *has* stable rests, just not the tilted one it
   is authored in. It therefore tips as it lands, and **tipping translates**. Free, it tips
@@ -1927,9 +1956,9 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
      volume to a few percent, at ~2 500 tris per stand.
 
      Sections rather than hulls, because **convexifying a slab fills any hole in it**. That
-     is not academic: the Klein bottle's mount is an annulus, and slab hulls plug its bore,
-     so the settle would run against a solid plinth and bake a pose the real scene cannot
-     hold. (Hulls also badly overstate the concave stands — `stand_gyroid` comes out at 3.73
+     is not academic: a mount with a bore is an annulus, and slab hulls plug it, so the
+     settle would run against a solid plinth and bake a pose the real scene cannot hold.
+     (Hulls also badly overstate the concave stands — `stand_gyroid` comes out at 3.73
      against a true 1.76 volume.) `slab_hulls()` survives as the fallback for when the
      shapely/section machinery is unavailable, and says so loudly when it is used.
 
@@ -1937,9 +1966,14 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
      fixed: a slab is a stair-step, so any horizontal feature is only resolved if it is
      thicker than one slab. A fixed 32 slabs is 32 mm on a 1 m pedestal, which quantised an
      earlier in-pedestal collar bore into a 32 mm dimple with its floor 3 mm above the real
-     cap. That reduction path is exactly why `collar_klein` ships as a **hand-built ≤4000-tri
-     mesh**: under `STATIC_TRI_CAP` a static collider is used verbatim, so a bore cut to a
-     quarter of a millimetre survives into the sim instead of being decimated or re-sliced.
+     cap. Even at the current 8 mm target this is the binding constraint on any *small*
+     feature machined into a pedestal cap, and it is why the new Klein bottle gets no seat
+     ring: a bore is only faithfully simulated if it is several slabs tall, and on a body
+     that flares 1.2–5 mm of radius per mm of height, several slabs of height is centimetres
+     of bore slop. A mount that must survive this path has to be a **hand-built ≤4000-tri
+     mesh**, which is what `collar_klein` was — under `STATIC_TRI_CAP` a static collider is
+     used verbatim, so a bore cut to a quarter of a millimetre survives into the sim instead
+     of being decimated or re-sliced.
 
   Whole-mesh hulling and VHACD were both rejected for stands: one hull is exact at the cap
   but fills the taper between a wide base and a narrow column, inventing a shoulder a piece
@@ -1951,38 +1985,21 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
   content hash. Iterating on `--tether`/`--jitter`/`--seed` then skips both. Per-phase
   timings are printed so a slow or non-converging bake is visible rather than silent.
 
-- **`make_klein_collar.py`** — generates `meshes/collar_klein.obj`, the mount that holds the
-  gallery's Klein bottle upright, and is the worked example of *what to do when a piece has
-  no acceptable rest pose*. It is a **generator, not a scene edit**: the bore is cut to one
-  exact placement of `klein_hunyuan.obj`, so `scenes/gallery.ftsl`'s `klein` block and this
-  tool are one unit and moving the bottle means re-running it.
-
-  Because the piece has no near-upright equilibrium (44 rest poses, most upright 73°), the
-  mount has to **grip**. The flank widens upward, so the collar is a stack of 4 mm slabs,
-  each an `R_OUT` disc with the piece's *own outline at that slab's mid height* punched out
-  of it: the piece jams where its section equals a bore, carrying its weight on a full
-  perimeter of upward-facing ledge whose plan shape is the section itself, which keys it
-  against yaw and sway as well as lean. Slabs are unioned into one watertight solid with
-  **manifold3d**, since `settle_scene` takes one static mesh per named object.
-
-  Three invariants, each of which was learned by violating it:
-
-  - *The bore is the outline **polygon**, not a radius per azimuth.* Sampling `r[level,
-    azimuth]` can never cut into the piece, but it fills every radial concavity, and this
-    section is strongly non-star-shaped about the pedestal axis — the polar bore came out
-    1.49× the true offset at y = 1.090. Grip collapsed to 12/36 pokes; the polygon gives
-    36/36.
-  - *The bore never re-narrows going up* (each slab's bore is unioned with everything below
-    it), so the piece still lifts straight out. A display mount must not be captive.
-  - *The bore is cut to the **VHACD proxy**, not the true mesh*, because that is the body
-    the sim collides and it is the wider of the two. The cost is a visible gap in the
-    render — logged as tech debt.
-
-  Tuning is measured, not chosen: `scraps/collar_configs.py` sweeps clearance / simplify
-  tolerance / slab thickness against `STATIC_TRI_CAP`, scored on `settle_scene`'s own 10 mm
-  `POKE_TOL` rather than a looser threshold. Clearance dominates. `scraps/validate_collar.py`
-  then re-measures the file that actually ships (0.25 mm clearance, 3888 tris: rests at
-  0.77°, all 36 pokes inside 4.6 mm).
+- **`make_klein_collar.py`** — **RETIRED 2026-08-03** (deleted with `meshes/collar_klein.obj`
+  when the gallery's Klein bottle was replaced by one that stands; see the `klein` note under
+  `settle_scene` above and known-issues.md). It generated the gripping collar that held the
+  old `klein_hunyuan.obj` upright, and remains the worked example of *what to do when a piece
+  has no acceptable rest pose* — a stack of 4 mm slabs, each an outer disc with the piece's
+  *own outline at that slab's mid height* punched out of it, so the piece jams where its
+  section equals a bore and carries its weight on a full perimeter of ledge whose plan shape
+  keys it against yaw and sway as well as lean. Three invariants it taught, each learned by
+  violating it: the bore must be the outline **polygon** and not a radius per azimuth (a
+  non-star-shaped section fills its own radial concavities — 12/36 pokes held versus 36/36);
+  the bore must **never re-narrow going up**, or the mount is captive and a display mount
+  must not be; and the bore must be cut to the **VHACD proxy**, not the true mesh, because
+  that is the body the sim collides — at the cost of a visible gap in the render. The
+  general lesson outlived the tool: engineering a mount around a bad model is more expensive
+  than replacing the model.
 
 ## Build & release
 

@@ -5,6 +5,53 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### DONE (2026-08-03): the gallery Klein bottle is now a glassblower's bottle WITH THE INTERNALS, and it needs no mount
+
+`scenes/gallery.ftsl`'s `klein` was `meshes/klein_hunyuan.obj`, an image-to-3D reconstruction: the
+right silhouette, but a closed shell in which the neck's passage through the wall was only *implied*.
+In a dielectric scene that is the whole point of the object, so it has been replaced by
+`meshes/klein_bottle_full.obj` (from `d:\youtube\philosophy\3d objects\full_package_klein_bottle\`),
+where the neck genuinely pierces the bulb and continues **down inside it** — a horizontal cut low in
+the body shows four loops (the outer wall's two surfaces plus the descending inner tube), three at the
+pass-through, and the tube alone above the shoulder.
+
+The mesh checks out as a dielectric: 12262 v / 12264 quads, every directed edge used exactly once, so
+closed, consistently wound and orientable; Euler characteristic **−2** (genus 2), which is what an
+immersed Klein bottle in R³ must be; signed volume **+150.356** against **2520.73** of area, i.e. a
+wall `2V/A = 0.119` raw units thick — **2.4 mm** at the shipped scale, real blown glass rather than a
+slab. (`trimesh.load` reports it non-watertight with χ = 2 until `merge_vertices(merge_tex=True,
+merge_norm=True)`; that is v/vt/vn vertex splitting, not a defect, and ftrace is unaffected because
+`src/mesh.h` fan-triangulates off the raw `v` array.)
+
+**The mount is gone.** `meshes/collar_klein.obj` and `tools/make_klein_collar.py` existed for exactly
+one reason — the old bottle had *no* near-upright equilibrium (44 resting orientations, the most
+upright leaning 73°), so only a gripping collar could hold it. The new one is a bottle with a punted
+foot and simply stands: foot ring radius **66.2 mm**, COM **224.5 mm** above the foot, static tipping
+angle **6.46°**. On the bare slate cap at settle_scene's own 5e-4 rolling/spinning friction, with its
+own 0.03 m/s + 0.30 rad/s kick from 12 directions at 3 spawn tilts (`scraps/newklein_stand.py`): rest
+drift **2.0 mm**, lean **0.00°**, and **36/36** pokes inside settle_scene's 10 mm POKE_TOL. The bake
+itself reports `OK klein: margin +5.0 mm, contacts 4, on stand_klein, poke 0.2 mm`.
+
+**A seat ring was designed and rejected on measurement**, and the reasoning is worth keeping. Take
+true horizontal cross-sections of the placed piece (vertex binning is useless — the shell is hollow,
+so a height band holds rings from both walls and the "max radius" alternates): the body flares
+*continuously* off the foot, 66.2 mm at the base → 78.3 mm at 2.3 mm → 82.6 mm at 4 mm → 92.6 mm at
+8 mm → 112.4 mm at 20 mm. So a bore has to clear the running maximum up to the ring's top, which means
+the radial play it leaves at the base is exactly the flare over the ring's height — a bore loose enough
+to lower the piece into is loose enough to let it slide the same distance. On top of that
+`slab_sections()` quantises a static collider vertically at `STATIC_SLAB_MAX_T = 8 mm`, and 8 mm of
+height on a 1.2–5 mm/mm flank is 1–4 cm of bore slop in the sim regardless of what is authored — the
+same quantisation that once left an in-pedestal collar bore as a dimple with its floor 3 mm above the
+real cap. A ring would have been decoration that made the sim worse.
+
+Placement: raw mesh is Y-up with its **foot ring centred on the origin** and its base plane at
+y = 0.025, extents 22.700 × 30.000 × 15.000, so `scale 0.02` → 0.454 × 0.600 × 0.300 — the same 0.60 m
+height as the piece it replaces. The foot goes on the pedestal axis (5.9, 2.6) rather than the volume
+centroid (which sits 41 mm toward +x), because the foot is what the eye reads as centred on the column.
+`rotate 0 -12 0` turns the handle into profile for the hero camera, which sees this pedestal along
+(−0.207, 0, 0.978). The bake now also seats it: `--seat heart:stand_heart,klein:stand_klein`, so the
+base lands exactly `--seat-gap` (1 mm) over the cap instead of wherever the VHACD proxy's error left it.
+
 ### BUG — DONE (2026-08-03): an `expr` isosurface inside a rotated `group` was INVISIBLE to every ray-traced mode
 
 Presented as "the morpho heart renders black in `png/heart_check.png`". It was not a material
@@ -104,8 +151,8 @@ wedge (it touches `stand_heart`), (b) alone would be fooled by a piece that slid
 *neighbouring* cap at the same height.
 
 The mid-height rule (rather than "the support's top is below the piece's underside") is what
-lets a **mount** count: `collar_klein`'s top is *above* the Klein bottle's lowest point, because
-the bottle hangs down inside its bore — yet it is the thing holding the bottle up.
+lets a **mount** count: the retired `collar_klein`'s top was *above* the Klein bottle's lowest
+point, because the bottle hung down inside its bore — yet it was the thing holding it up.
 
 Two traps found while fixing it:
 
@@ -3135,7 +3182,14 @@ settle_scene's POKE_TOL of 10 mm.
    settle_scene's own 10 mm POKE_TOL, not a looser threshold, because that is the number that prints
    TOPPLES.
 
-### TECH DEBT (2026-08-03): the VHACD proxy for `klein_hunyuan.obj` is a poor fit, so the collar shows a visible gap
+### TECH DEBT — MOOT (2026-08-03): the VHACD proxy for `klein_hunyuan.obj` is a poor fit, so the collar shows a visible gap
+**Closed the same day it was opened, by deleting the collar.** `klein_hunyuan.obj` is no longer in the
+gallery (see "the Klein bottle is now a glassblower's bottle with the internals", above) and neither is
+`collar_klein`, so there is no bore for the proxy to be cut to. The underlying observation still stands
+as a general warning — *VHACD decomposes a thin curved shell badly, and anything cut to fit the proxy
+will not visually fit the mesh* — so if a future piece needs a shaped mount, read this first. The
+original text follows.
+
 `settle_scene` collides a VHACD convex decomposition of each dynamic piece, and for the Klein bottle
 that decomposition is bad: only **9 hulls** at 1.09× the true volume, whose bulges reach up to
 **427.5 mm below** the true underside (the true surface dips below the proxy by at most 25.8 mm).

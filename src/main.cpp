@@ -6380,6 +6380,15 @@ static int run(int argc, char** argv) {
         if (!removed.empty())
             std::printf("[ignore] stripped: %s\n", removed.c_str());
     }
+    // A scene may declare the path depth its GEOMETRY needs (`render { max_bounce N }`),
+    // because that is not a matter of the operator's taste: mode D runs 8 path edges by
+    // default, and a thin-walled glass shell with another tube inside it presents about
+    // that many dielectric interfaces on one line of sight, so the innermost surface
+    // renders as a black plug. An explicit CLI `-max-bounce` still wins.
+    if (maxBounceOverride < 1 && ftslScene.maxBounce >= 1) {
+        maxBounceOverride = ftslScene.maxBounce;
+        std::printf("[scene] max bounce = %d (from the scene's render block)\n", maxBounceOverride);
+    }
     // Publish the depth cap / direct-only mode to the tracer wrappers (globals, like
     // g_heroC), so every render (incl. the meter pre-pass) honours them.
     g_maxBounceOverride = maxBounceOverride;

@@ -43,7 +43,10 @@ OK / FELL / PERCHED / TOPPLES.
 A piece that reports TOPPLES on every retry has no stable rest pose at all and its GEOMETRY
 is what needs changing — no amount of simulation can invent a rest that doesn't exist. One
 that reports FELL on every retry needs either a different authored pose or a MOUNT that grips
-it (see tools/make_klein_collar.py, which builds one for the Klein bottle).
+it — a collar whose bore is cut to the piece's own cross-section. A mount is the LAST resort,
+not the first: the gallery's Klein bottle needed one only for as long as the mesh was a shape
+with no upright equilibrium, and swapping in a bottle with a real punted foot retired both the
+mount and its generator (see design.md).
 
 Keeping pieces over their pedestals — two strategies for the same failure:
   A faithful free settle drops each piece onto NARROW pedestals, so anything wider than
@@ -583,9 +586,9 @@ def intended_supports(worlds, selected, floor_y):
 
     A support is any other named object whose plan (XZ) footprint overlaps the piece's and
     whose top is below the piece's mid height. The mid-height test (rather than "below the
-    piece's underside") is what lets a MOUNT count: `collar_klein`'s top is above the Klein
-    bottle's lowest point, because the bottle hangs down inside its bore — but it is still
-    the thing holding the bottle up. A piece over nothing is meant to rest on the floor."""
+    piece's underside") is what lets a MOUNT count: a collar's top is above the piece's lowest
+    point whenever the piece hangs down inside the bore — but the collar is still the thing
+    holding it up. A piece over nothing is meant to rest on the floor."""
     out = {}
     for pc in selected:
         plo, phi = worlds[pc].bounds
@@ -1189,8 +1192,9 @@ def main():
               f'placed it over — it slid or toppled off its stand and came to rest somewhere '
               f'else (the floor, or wedged against a pedestal shaft). It IS at rest there, so '
               f'margin/poke look healthy; those are local tests and cannot see this. Try '
-              f'--tether, or give the piece a MOUNT that grips it (tools/make_klein_collar.py '
-              f'builds one for the Klein bottle).\n'
+              f'--tether, or a MOUNT that grips it — a collar whose bore is cut to the '
+              f'piece\'s own cross-section. Consider first whether the MESH is the problem: '
+              f'a shape with no upright equilibrium is better replaced than propped up.\n'
               f'[settle_scene]   PERCHED = the COM lies outside the hull of its load-bearing '
               f'contacts, so the piece overhangs whatever it is touching — check the authored '
               f'position is really over the stand.\n'

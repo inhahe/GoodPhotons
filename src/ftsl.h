@@ -621,6 +621,13 @@ struct Loaded {
     double defaultFps = 0.0;     // scene { fps N }: default flyby playback fps (0 = not specified)
     long long photons = -1;      // -1 = not specified (CLI default wins)
     int res = -1;                // -1 = not specified
+    // render { max_bounce N }: path depth the SCENE needs, -1 = not specified. This is a
+    // property of the geometry, not of the operator's taste, so a scene that needs it must
+    // be able to say so: mode D defaults to 8 path edges, and a thin-walled glass shell
+    // with another tube inside it (the gallery's Klein bottle) presents ~8 dielectric
+    // interfaces on one line of sight, so at the default the innermost tube renders as a
+    // solid BLACK plug — truncated paths, not a material bug. A CLI `-max-bounce` still wins.
+    int maxBounce = -1;
     std::string device;          // empty = not specified
     std::string out;             // empty = not specified
     // Keys no builder read (see collectUnusedKeys). Carried on Loaded rather than
@@ -6548,6 +6555,12 @@ private:
         if (!o.empty()) L.out = o;
         const Stmt* r = find(b, "res");
         if (r && !r->val.words.empty()) L.res = (int)num(r->val.words[0]);
+        const Stmt* mb = find(b, "max_bounce");
+        if (mb && !mb->val.words.empty()) {
+            int n = (int)num(mb->val.words[0]);
+            if (n < 1) { fail("render: max_bounce must be >= 1"); return false; }
+            L.maxBounce = n;
+        }
         return true;
     }
 };

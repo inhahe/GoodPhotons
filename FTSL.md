@@ -1744,7 +1744,7 @@ mode (no GPU restriction).
 ## 16. `render` — defaults (CLI overrides)
 
 ```
-render { photons 1000000  device gpu  mode R  out png/out.png  res 900 }
+render { photons 1000000  device gpu  mode R  out png/out.png  res 900  max_bounce 32 }
 ```
 
 | key | meaning |
@@ -1754,8 +1754,20 @@ render { photons 1000000  device gpu  mode R  out png/out.png  res 900 }
 | `mode` | global measurement mode (per-camera `mode` still wins for that camera) |
 | `out` | output path (`.png` → `png/`, `.ppm` → `ppm/` per repo convention) |
 | `res` | global resolution |
+| `max_bounce` | path-depth cap (≥ 1); same meaning as `-max-bounce` |
 
 Any of these are overridden by the matching CLI flag.
+
+`max_bounce` is here because path depth is sometimes a property of the **geometry**
+rather than of the operator's taste. Modes D/U walk 8 path edges by default, and a
+thin-walled glass shell with another tube inside it presents about that many
+dielectric interfaces along one line of sight — so at the default the innermost
+surface's paths are truncated and it renders as a solid **black plug**, which looks
+exactly like a material or winding bug. A scene shaped like that (e.g. the gallery's
+Klein bottle) should declare the depth it needs itself. Pickup is announced with
+`[scene] max bounce = N (from the scene's render block)` so the setting never applies
+invisibly; deeper paths are not free (≈35% of the sample rate on the gallery), which
+is why this stays per-scene rather than a raised global default.
 
 ---
 

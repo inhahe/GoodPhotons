@@ -2479,6 +2479,19 @@ two project-wide defaults alongside `units`/`spectral`:
   resolution order is `--fps` → the flyby's `fps` → the scene-level `fps` → `30`. `fps`
   is purely a playback hint — it doesn't change what ftrace renders.
 
+**Render-setting block (`render { … }`).** A top-level `render` block carries defaults for
+settings that otherwise come from the CLI — `photons <n>`, `mode <letter>`, `res <px>`,
+`device <name>`, `out <file>`, and **`max_bounce <n>`**. The matching CLI flag always wins;
+the block is for settings a scene *needs* rather than ones an operator prefers.
+
+`max_bounce` is the clearest case. Modes `D`/`U` run **8** path edges by default (see
+`-max-bounce`), which is not enough for deeply nested dielectrics: `scenes/gallery.ftsl`'s
+Klein bottle is a 2.4 mm-walled glass shell with another tube *inside* it, so one line of
+sight crosses about eight interfaces and the innermost tube renders as a solid **black
+plug** — truncated paths, not a material bug. That scene therefore declares
+`render { max_bounce 32 }` and looks right without the operator having to know. When a scene
+sets it, the run prints `[scene] max bounce = N (from the scene's render block)`.
+
 ### Conditional blocks (`prefer { … } else { … }`)
 
 Some features aren't renderable in every mode — most notably **gradient-index (GRIN)
@@ -2897,7 +2910,7 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-no-media` / `-nomedia` | Drop all participating-media volumes (fog / homogeneous / heterogeneous). Also un-gates the fast `-rgb` backward, which otherwise falls back to spectral on any medium. |
 | `-no-env` / `-noenv` | Remove the environment light (constant or image-based): the scene renders against black, and the emitter CDF is rebuilt without it. |
 | `-no-fluoro` / `-nofluoro` | Demote every fluorescent material to a plain diffuse (using its elastic reflectance albedo) — skips the wavelength-shifting re-emission. |
-| `-max-bounce <N>` | Set path depth to `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, the photon modes, and the bidirectional `D`/`U`). Default is the tracer's own cap: **32** for the unidirectional tracers, **8** for `D`/`U`, whose connection cost grows ~depth². For `D`/`U` the flag therefore *raises* the depth as often as it caps it — a specular-only cavity (a mirror-lined sphere, a kaleidoscope, deeply nested dielectrics) truncates its recursive images to black at 8 edges and wants `-max-bounce 24`–`48` before the hall of mirrors fills in. Specular vertices are cheap there: a delta BSDF has no connection to make. |
+| `-max-bounce <N>` | Set path depth to `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, the photon modes, and the bidirectional `D`/`U`). Default is the tracer's own cap: **32** for the unidirectional tracers, **8** for `D`/`U`, whose connection cost grows ~depth². For `D`/`U` the flag therefore *raises* the depth as often as it caps it — a specular-only cavity (a mirror-lined sphere, a kaleidoscope, deeply nested dielectrics) truncates its recursive images to black at 8 edges and wants `-max-bounce 24`–`48` before the hall of mirrors fills in. Specular vertices are cheap there: a delta BSDF has no connection to make. A scene that always needs the deeper walk can say so itself with `render { max_bounce <n> }` (see **Render-setting block**); this flag overrides that. |
 | `-direct-only` / `-directonly` | **Whitted mode:** after a non-specular vertex (diffuse / diffuse-transmit / elastic-fluorescent / fog single-scatter) does its direct-lighting NEE, stop — no diffuse indirect (no colour bleeding, black shadows). Specular chains (mirror / glass / glossy / filter) still recurse. Scoped to the **camera** path tracers (`R` spectral + `-rgb`, and `P`'s backward layer); forward `B` and the photon/BDPT modes honour `-max-bounce` but ignore this. |
 | `-whitted-grid <n>` | **Mode `W` only.** Fire an `n`×`n` fixed lattice of shadow rays at every area light instead of one random point (default `4` → 16 rays). This is the single knob that decides how smooth a soft shadow is; a point/spot/collimated light is a deterministic connection already and ignores it. |
 | `-ambient <v>` / `-amb <v>` | **Mode `W` only.** Flat ambient fill added at every diffuse vertex (POV-Ray's `ambient`) — the cheap stand-in for the diffuse GI mode `W` drops, without which a **closed** room previews with black shadows. **Dimensionless:** `v` is a fraction of a light's own radiance (internally scaled by `Scene::ambientRef()`), so the same value behaves the same in any scene whatever its absolute radiometric scale. Default `0`; `0.02..0.2` is the useful band. With `-gi` it keeps applying, as the **far-field** term a gather ray picks up when it escapes the geometry. |
