@@ -1804,17 +1804,37 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
   - `--seat` — post-hoc geometric fallback: keep the settled orientation, restore the
     authored XZ, lower straight down.
 
-  **Acceptance test — two stages, because equilibrium is not stability:**
+  **Acceptance test — three stages, because equilibrium is not stability, and stability
+  is not correctness:**
 
   1. *Support polygon.* The COM must project inside the convex hull of the
      **load-bearing** contact points (`convex_hull_2d` / `support_margin`), within a
      tolerance: smooth bodies genuinely touch at a point or along a line, so this is a
      tolerance rather than a required inset. It catches gross failures (a piece resting
-     on the corner of its cap with the COM out over air).
+     on the corner of its cap with the COM out over air). Failure prints `PERCHED`.
   2. *Poke.* A wheel balanced on its rim has its COM exactly over its contact and
      passes stage 1 perfectly. So each piece is given a small random shove + spin and
      re-settled; a stable rest absorbs it, an unstable one topples. The pose that
-     **survives the poke** is the one baked.
+     **survives the poke** is the one baked. Failure prints `TOPPLES`.
+  3. *Intended support* (`intended_supports()`). Stages 1 and 2 are both **local** — they
+     interrogate the pose the sim produced and never look at the scene the author wrote.
+     A piece that slid off its cap, fell a metre and wedged between two pedestal shafts
+     passes both with *healthy* numbers, because down there it really is immovably at
+     rest. `heart` shipped exactly that pose, reported `OK`. So the tool now reads the
+     author's intent off the scene **before anything moves**: a piece's intended supports
+     are the other named objects whose plan (XZ) footprint overlaps its own and whose top
+     is below the piece's **mid height**, and it `FELL` unless it ends up resting on one
+     of them *and* still above that support's top. Both halves are load-bearing: the
+     wedged heart still *touched* `stand_heart` on the way down, so membership alone
+     passes it. The mid-height rule (rather than "below the piece's underside") is what
+     lets a **mount** count — `collar_klein`'s top is above the Klein bottle's lowest
+     point, because the bottle hangs down inside its bore.
+
+     Note this is deliberately *not* a displacement check. How far the COM moved is the
+     obvious metric and the wrong one: `heart` settling correctly under `--tether` moves
+     222 mm (it honestly tips from its authored tilt onto a stable lobe), while a piece
+     can slide clean off a narrow cap having moved far less. `FELL` is reported *before*
+     `PERCHED`/`TOPPLES` precisely because a fallen piece's other numbers look fine.
 
   Contacts are read from the manifolds the last `stepSimulation()` left behind:
   `performCollisionDetection()` rebuilds them, and `normalForce` is the solver's applied
@@ -1837,8 +1857,25 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
   to axle-vertical. Shrinking the ring under the ball radius lets it rest on its two
   spheres, which is what a dumbbell at rest should look like.
 
+  The `klein` bottle is the harder case: it has **no** acceptable rest pose, and its mesh
+  is art that must not be altered. Enumerating them settles it — the convex hull's faces
+  whose supporting plane has the COM over them *are* the poses it can rest in, and of the
+  44 the most upright leans 73°. So the fix is a **mount that grips rather than supports**,
+  which is what `tools/make_klein_collar.py` generates (see below).
+
+  `heart` is the third variety: a shape that *has* stable rests, just not the tilted one it
+  is authored in. It therefore tips as it lands, and **tipping translates**. Free, it tips
+  right off the cap; tethered, it stays on the stand but the tip walks it 222 mm sideways,
+  leaving 148 mm hanging past the rim. The gallery bake uses `--tether` to keep it on the
+  pedestal *and* `--seat heart:stand_heart` to put it back over the cap centre — on a flat
+  level cap seating is a pure horizontal translation of the whole contact set, so it
+  preserves the support margin exactly rather than trading stability for looks.
+
   Independent verification uses `-export-mesh` + per-group AABBs, which is exact and
   involves no physics at all: every settled piece's bbox must sit on its stand's cap.
+  (This is `scraps/settled_aabb.py`, and it earned its keep: it read `heart bot 0.213`
+  against a 1.000 cap while the bake called the same pose `OK`. When two tools disagree,
+  the one that gates the output is the one to distrust.)
 
   **Collision-geometry reduction is what makes the tool usable.** Sim cost is set almost
   entirely by the number of *static* triangles in the contact patch under a resting piece
@@ -1851,25 +1888,76 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
   1. **Quadric decimation** to `STATIC_TRI_CAP`, used whenever it actually reaches the cap
      (it does for clean closed shapes: the gyroids, lamps, `chrome_ring`). This keeps the
      concave shape, so it is always preferred.
-  2. **`slab_hulls()`** for the meshes where decimation stalls — the box-union pedestals
+  2. **`slab_sections()`** for the meshes where decimation stalls — the box-union pedestals
      bottom out at 25–47% of their input no matter how many passes or how much aggression,
-     having already lost 29% of their volume. The mesh is cut into `STATIC_SLABS` (32)
-     horizontal slabs and each is replaced by the convex hull of its own vertices, with
-     slabs overlapping by one polygonisation cell so no seam gap opens. This reproduces cap
-     height and XZ extent *exactly* at ~4000 tris per stand. Hulling each slab separately
-     rather than the whole mesh is the point: a single hull is faster still and also exact
-     at the cap, but it fills the taper between a wide base and a narrow column, inventing
-     a shoulder a piece could rest on — which would be baked in as a piece floating beside
-     its stand. (VHACD on the stands was also rejected: it shifts the cap top 5 mm.)
+     having already lost 29% of their volume. The mesh is cut into `STATIC_SLABS` horizontal
+     slabs; each slab's true cross-section is taken at its mid-height (`section_multiplane`
+     → `Path2D.polygons_full`, which needs `shapely`/`rtree`), simplified to
+     `SECTION_SIMPLIFY` (0.5 mm — a raw marching-cubes outline carries thousands of
+     near-collinear vertices and extrudes to ~83 k tris instead of ~2.4 k), and extruded
+     back over the slab. Each prism is placed with the *section's own* `metadata['to_3D']`
+     frame — the 2D frame's axes are not (x, z), and hardcoding a rotation silently
+     transposes a stand's footprint — then dropped half a slab, because `to_3D` puts z = 0
+     at the section height, i.e. the slab's middle. Cap height and XZ extent come out exact,
+     volume to a few percent, at ~2 500 tris per stand.
 
-  Slab hulls are loaded as **convex** shapes rather than forced concave trimeshes, since
-  that is what they are.
+     Sections rather than hulls, because **convexifying a slab fills any hole in it**. That
+     is not academic: the Klein bottle's mount is an annulus, and slab hulls plug its bore,
+     so the settle would run against a solid plinth and bake a pose the real scene cannot
+     hold. (Hulls also badly overstate the concave stands — `stand_gyroid` comes out at 3.73
+     against a true 1.76 volume.) `slab_hulls()` survives as the fallback for when the
+     shapely/section machinery is unavailable, and says so loudly when it is used.
+
+     `STATIC_SLABS` is derived from `STATIC_SLAB_MAX_T` (a target slab *thickness*), not
+     fixed: a slab is a stair-step, so any horizontal feature is only resolved if it is
+     thicker than one slab. A fixed 32 slabs is 32 mm on a 1 m pedestal, which quantised an
+     earlier in-pedestal collar bore into a 32 mm dimple with its floor 3 mm above the real
+     cap. That reduction path is exactly why `collar_klein` ships as a **hand-built ≤4000-tri
+     mesh**: under `STATIC_TRI_CAP` a static collider is used verbatim, so a bore cut to a
+     quarter of a millimetre survives into the sim instead of being decimated or re-sliced.
+
+  Whole-mesh hulling and VHACD were both rejected for stands: one hull is exact at the cap
+  but fills the taper between a wide base and a narrow column, inventing a shoulder a piece
+  could rest on; VHACD shifts the cap top 5 mm.
 
   **Caching** (`scraps/.settle_cache/`, `--no-cache` to bypass) memoises the two pure,
   expensive setup steps: the `-export-mesh` polygonisation, keyed on (scene text,
   `--mesh-res`, ftrace mtime), and the VHACD dynamic proxies, keyed on the proxy mesh's
   content hash. Iterating on `--tether`/`--jitter`/`--seed` then skips both. Per-phase
   timings are printed so a slow or non-converging bake is visible rather than silent.
+
+- **`make_klein_collar.py`** — generates `meshes/collar_klein.obj`, the mount that holds the
+  gallery's Klein bottle upright, and is the worked example of *what to do when a piece has
+  no acceptable rest pose*. It is a **generator, not a scene edit**: the bore is cut to one
+  exact placement of `klein_hunyuan.obj`, so `scenes/gallery.ftsl`'s `klein` block and this
+  tool are one unit and moving the bottle means re-running it.
+
+  Because the piece has no near-upright equilibrium (44 rest poses, most upright 73°), the
+  mount has to **grip**. The flank widens upward, so the collar is a stack of 4 mm slabs,
+  each an `R_OUT` disc with the piece's *own outline at that slab's mid height* punched out
+  of it: the piece jams where its section equals a bore, carrying its weight on a full
+  perimeter of upward-facing ledge whose plan shape is the section itself, which keys it
+  against yaw and sway as well as lean. Slabs are unioned into one watertight solid with
+  **manifold3d**, since `settle_scene` takes one static mesh per named object.
+
+  Three invariants, each of which was learned by violating it:
+
+  - *The bore is the outline **polygon**, not a radius per azimuth.* Sampling `r[level,
+    azimuth]` can never cut into the piece, but it fills every radial concavity, and this
+    section is strongly non-star-shaped about the pedestal axis — the polar bore came out
+    1.49× the true offset at y = 1.090. Grip collapsed to 12/36 pokes; the polygon gives
+    36/36.
+  - *The bore never re-narrows going up* (each slab's bore is unioned with everything below
+    it), so the piece still lifts straight out. A display mount must not be captive.
+  - *The bore is cut to the **VHACD proxy**, not the true mesh*, because that is the body
+    the sim collides and it is the wider of the two. The cost is a visible gap in the
+    render — logged as tech debt.
+
+  Tuning is measured, not chosen: `scraps/collar_configs.py` sweeps clearance / simplify
+  tolerance / slab thickness against `STATIC_TRI_CAP`, scored on `settle_scene`'s own 10 mm
+  `POKE_TOL` rather than a looser threshold. Clearance dominates. `scraps/validate_collar.py`
+  then re-measures the file that actually ships (0.25 mm clearance, 3888 tris: rests at
+  0.77°, all 36 pokes inside 4.6 mm).
 
 ## Build & release
 

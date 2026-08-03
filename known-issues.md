@@ -5,6 +5,71 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — DONE (2026-08-03): `settle_scene.py` reported a piece lying on the FLOOR as `OK` — both its acceptance tests are local
+
+`heart` baked into `gallery_settled.ftsl` with `translate 1.19 -2.81 0.45 rotate -177.6 -45.3 56.1`
+— a delta that puts its COM at y ≈ 0.35 when it was authored at y = 1.255, i.e. it had slid off
+`stand_heart`'s cap, fallen ~0.9 m, and come to rest **wedged between the `stand_heart` and
+`stand_dumbbell` shafts**. The bake reported:
+
+```
+  OK      heart:  margin  +10.2 mm  contacts   2  on stand_dumbbell, stand_heart  (poke  6.0 mm)
+```
+
+which reads like a success. `scraps/settled_aabb.py` independently said `heart cap top 1.000,
+bot 0.213, gap -0.786` — the two tools flatly contradicted each other, and the wrong one is the
+one that gates the bake.
+
+**Root cause — not a physics bug, a *missing question*.** Both acceptance tests were LOCAL:
+
+| test | asks | why it passed a piece on the floor |
+|---|---|---|
+| support margin | is the COM inside the hull of its load-bearing contacts? | it is — the wedge is a perfectly good support polygon |
+| poke | does the rest survive a shove + spin? | it does — wedged between two granite shafts is *more* stable than the cap |
+
+Neither test can see the authored scene, and to pybullet "wedged on the floor" and "sitting on
+its pedestal" are both just *rest*. The verdict even *listed* `stand_heart` in `resting_on`,
+because the heart grazed that shaft on the way down — so a naive "is it touching its stand?"
+check would also have passed it.
+
+**Fix.** A third acceptance test, computed against the AUTHORED pose before anything moves
+(`intended_supports()` in `tools/settle_scene.py`): each settled piece's *intended* supports are
+the other named objects whose plan (XZ) footprint overlaps its own and whose top is below the
+piece's **mid height**. A piece then FELLs unless it is (a) resting on at least one of them
+**and** (b) still above that support's top. Both halves are needed — (a) alone passes the
+wedge (it touches `stand_heart`), (b) alone would be fooled by a piece that slid onto a
+*neighbouring* cap at the same height.
+
+The mid-height rule (rather than "the support's top is below the piece's underside") is what
+lets a **mount** count: `collar_klein`'s top is *above* the Klein bottle's lowest point, because
+the bottle hangs down inside its bore — yet it is the thing holding the bottle up.
+
+Two traps found while fixing it:
+
+1. **Displacement is the wrong metric, even though it looks like the obvious one.** The first
+   attempt gated on "did the COM move more than 60 mm from where it was authored". It is wrong
+   in both directions: `heart` settling *correctly* under `--tether` moves its COM **222 mm**
+   (it honestly tips from its authored tilt onto a stable lobe), while a piece can slide clean
+   off a narrow cap having moved far less. What matters is *what it ends up on*, not how far it
+   went.
+2. **The verdict order matters.** `FELL` must be reported before `PERCHED`/`TOPPLES`, because a
+   piece on the floor has *healthy* margin and poke numbers — that is the whole point of the bug.
+
+Also fixed in the same change: the canonical bake command in `scenes/gallery.ftsl`'s header now
+carries `--tether --seat heart:stand_heart` (it had neither), with a comment saying what breaks
+without each. The bake is now `OK` for all five pieces on the first attempt.
+
+### TECH DEBT (2026-08-03): `settle.drop()` falls back to the surface's TOP PLANE when the footprint "misses" the mesh
+
+Seating the heart prints `[settle] warning: object footprint misses the surface mesh; resting on
+the surface top plane instead.` even though the rotated heart's footprint is comfortably inside
+`stand_heart`'s 0.50 m cap — so the raycast test in `tools/settle.py`'s `drop()` is rejecting a
+footprint it should hit. The fallback happens to give the exactly right answer here (the cap top
+*is* a flat plane at y = 1.000, and the seated heart lands 1.3 mm above it, fully 24 mm inside
+every cap edge), which is why it has gone unnoticed. It would be silently wrong on a stand with
+a domed, stepped or sloped top. Proper fix: find out why the down-rays miss — likely the
+footprint sample points or the ray origin height — rather than leaning on the plane fallback.
+
 ### BUG — DONE (2026-08-03, v0.121.0): the exported Klein-bottle OBJs are a solid ball — the container sphere got welded on as a cap
 
 `meshes/klein_a120_b060_c30_d127.obj` and `..._lite.obj` (the mesh `gallery.ftsl` /
@@ -2960,23 +3025,71 @@ Also fixed alongside it:
 `--mesh-res` is *not* the lever it appeared to be — it only helped as a side-effect of the broken
 decimation, and can now stay at full resolution.
 
-### BUG (2026-08-03): the Klein bottle mesh has no stable upright rest — it cannot stand on its pedestal
-`meshes/klein_hunyuan.obj` as placed in `scenes/gallery.ftsl` (`translate 5.9 1.32 2.6 rotate 0 40 0
-scale 0.30`) is correctly positioned — bottom at y=1.021 over stand_klein's cap top at y=1.00, a 21 mm
-drop, footprint 0.34×0.33 m on a 0.52×0.52 m cap — but a settle drops it on the floor every time.
+### DONE (2026-08-03): the Klein bottle mesh has no stable upright rest — it cannot stand on its pedestal
+`meshes/klein_hunyuan.obj` as placed in `scenes/gallery.ftsl` is correctly positioned — bottom at
+y=1.018 over stand_klein's cap top at y=1.00, footprint 0.34×0.33 m on a 0.52×0.52 m cap — but a settle
+dropped it on the floor every time (the last bad bake moved it `translate 1.06 3.90 -0.005 rotate
+-86.4 -51.4 -68.2`).
 
-Not a placement or simulation bug; the shape genuinely has no upright equilibrium. Its contact patch is
-a small rounded blob: the bottom 2 mm of the mesh spans only 47×42 mm, and the COM projects **43 mm
-outside** that patch. The footprint does not contain the COM until 20 mm up (+7.5 mm margin), by which
-point the piece has already tipped. Dropping the mesh alone onto a plane from six random orientations
-converges every time to the *same single* stable pose — lying on its side, 0.317 m tall with a ~0.6 m
-footprint — which does not fit the 0.52 m cap.
+**Root cause, measured.** Not a placement or simulation bug. Take the convex hull of the placed mesh
+and keep the faces whose supporting plane has the COM over them: those are *exactly* the orientations
+in which the piece can rest on a plane. There are **44, and the most upright of them leans 73°**. The
+shape has no near-upright equilibrium at all, so **nothing it merely rests on can hold it up** — only a
+mount that *grips* can. (An earlier version of this entry blamed a "47×42 mm contact blob with the COM
+43 mm outside it". That described a symptom of one particular pose, not the cause, and it sent the fix
+down several dead ends.)
 
-**Fix candidates:** (a) give `stand_klein` a shallow circular seat/collar so the round base is cradled
-(how museums actually display round-bottomed vessels, and makes the upright pose genuinely stable);
-(b) widen the cap and accept the natural reclining pose; (c) swap in a Klein mesh with a ground-flat
-base (real glass Klein bottles have one). Note the user intends to supply their own mesh, so hold off
-on tuning this one.
+**Five mount families were built and falsified by measurement**, each for a distinct geometric reason:
+
+| mount | why it fails |
+|---|---|
+| circular seat / bore rim | the section radius about the pedestal axis swings 25→130 mm, so a *circle* touches exactly 2 lobes 180° apart — a knife edge with the COM on the line between them |
+| spherical dish | a sphere is the one surface on which rolling is free; it rolled off |
+| sleeve / cage above the cap | the flank **narrows downward**, so leaning always *opens* clearance; the lean ran away 2→6→11→19→35→65° |
+| conforming height-field cradle | the underside is a paraboloid ρ²/244 mm, and a sphere rolls freely inside its own negative, so tilt is not resisted; also numerically pathological — a mesh colliding a surface coincident with it produced 1400–1700 N of penetration recovery on a 9.81 N piece |
+| discrete museum posts | a support point needs a near-horizontal surface normal, and the underside is only shallow within ρ≈70 mm — barely past the COM's own 67 mm offset |
+
+**Fix (shipped): a shaped tapered collar**, `meshes/collar_klein.obj`, generated by
+`tools/make_klein_collar.py` and referenced from `scenes/gallery.ftsl` as the `collar_klein` mesh
+object. The flank widens upward, so a bore cut to the piece's *own cross-section* captures it: it
+cannot sink because the taper jams, and its weight is carried all round the perimeter instead of on two
+lobes. Wedging was never the bug — it is the mechanism; the bug was that a *circular* bore wedges
+against only two points. The bore never re-narrows going up, so the piece still lifts straight out (not
+captive, the museum rule). Result: rests at 0.77° lean, `on collar_klein`, poke drift **1.6 mm** against
+settle_scene's POKE_TOL of 10 mm.
+
+**Two traps worth remembering, both of which produced confident wrong answers:**
+
+1. *Harness friction must match the tool.* Every early sweep hard-coded `rollingFriction=0.002` /
+   `spinningFriction=0.02` against settle_scene's actual `5e-4`/`5e-4` — 4× and 40× too much. That
+   alone made several seats look stable in the harness and fail in the bake. All harnesses now
+   **import** `ROLLING_FRICTION` / `SPINNING_FRICTION` from `settle_scene`.
+2. *A bore sampled as radius-per-azimuth is not the outline.* The first shipped collar lofted
+   `r[level, azimuth]` samples. That is safe (it can never cut into the piece) but it fills in every
+   radial concavity, and this section is strongly non-star-shaped about the pedestal axis: the polar
+   bore came out **1.49× the true 0.5 mm offset at y=1.090**, 114 cm² of void. It rested at 20.1° lean
+   and held 12/36 pokes. Cutting the bore from the outline *polygon* instead gives 36/36. Scored on
+   settle_scene's own 10 mm POKE_TOL, not a looser threshold, because that is the number that prints
+   TOPPLES.
+
+### TECH DEBT (2026-08-03): the VHACD proxy for `klein_hunyuan.obj` is a poor fit, so the collar shows a visible gap
+`settle_scene` collides a VHACD convex decomposition of each dynamic piece, and for the Klein bottle
+that decomposition is bad: only **9 hulls** at 1.09× the true volume, whose bulges reach up to
+**427.5 mm below** the true underside (the true surface dips below the proxy by at most 25.8 mm).
+
+Because the sim collides the proxy while the render shows the true mesh, `tools/make_klein_collar.py`
+must cut the bore to the **proxy** — the wider, containing body — or the settle would spawn the
+collided body already buried in the collar. The cost is that the *rendered* bottle sits a few mm clear
+of the collar bore where the proxy bulges past the true surface, so the mount reads as slightly loose
+on screen even though the physics is tight.
+
+**Proper fix:** get a better collision proxy, then re-cut the bore to it. Options, cheapest first:
+raise VHACD's `resolution` / `maxConvexHulls` / lower `concavity` for this mesh (the current call in
+`proxy_mesh()` / `settle_scene` uses defaults); or switch to CoACD, which handles thin curved shells
+like this far better than VHACD; or, since the collar only needs the band y∈[1.030, 1.110], collide the
+*true* mesh there via a per-piece override rather than the whole-body proxy. Whichever is chosen, the
+check is already in the generator: it prints how deep each body penetrates the collar at the authored
+pose (currently 0.00 mm for the rendered mesh, 0.99 mm for the proxy).
 
 ### FEATURE REQUEST (2026-07-19): cache ftrace's per-scene preprocessing before rasterizing
 Add an option to **cache the scene-derived data ftrace computes at load** (tessellation / BVH /

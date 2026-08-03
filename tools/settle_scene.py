@@ -30,12 +30,20 @@ Object geometry:
 Requirements: numpy, trimesh, and pybullet (for the physics). VHACD (bundled with
 pybullet) convex-decomposes concave dynamic objects for a faithful collision shape.
 
-Every settled piece is checked two ways before the pose is written, because equilibrium is
-not stability: its COM must project inside the convex hull of its load-bearing contacts,
-AND it must survive a poke (a small random shove + spin) without moving. The tool prints a
-per-piece verdict of OK / PERCHED (overhanging its support) / TOPPLES (it was balancing).
+Every settled piece is checked THREE ways before the pose is written, because equilibrium is
+not stability and stability is not correctness:
+  * its COM must project inside the convex hull of its load-bearing contacts (else PERCHED),
+  * it must survive a poke — a small random shove + spin — without moving (else TOPPLES),
+  * and it must end up resting ON TOP OF something the author placed it over (else FELL).
+The third one is not redundant: the first two are LOCAL tests, and a piece that slid off its
+cap, dropped a metre and wedged between two pedestal shafts passes both of them with healthy
+numbers, because it really is immovably at rest down there. Only a test against the AUTHORED
+scene knows the author didn't put it on the floor. The tool prints a per-piece verdict of
+OK / FELL / PERCHED / TOPPLES.
 A piece that reports TOPPLES on every retry has no stable rest pose at all and its GEOMETRY
-is what needs changing — no amount of simulation can invent a rest that doesn't exist.
+is what needs changing — no amount of simulation can invent a rest that doesn't exist. One
+that reports FELL on every retry needs either a different authored pose or a MOUNT that grips
+it (see tools/make_klein_collar.py, which builds one for the Klein bottle).
 
 Keeping pieces over their pedestals — two strategies for the same failure:
   A faithful free settle drops each piece onto NARROW pedestals, so anything wider than
@@ -89,11 +97,28 @@ COLLISION_TRI_CAP = 40000
 # a few thousand tris capture the flat resting top exactly while keeping steps cheap.
 STATIC_TRI_CAP = 4000
 
-# Horizontal slabs used by slab_hulls() for a static collider that will NOT decimate to
-# STATIC_TRI_CAP (the box-union pedestals). More slabs = a finer stair-step approximation of
-# the vertical profile, at ~150 tris each. 32 reproduces the gallery stands' cap height and
-# XZ extent exactly while keeping the whole static set under ~50k tris.
-STATIC_SLABS = 32
+# Horizontal slabs used by slab_sections() / slab_hulls() for a static collider that will NOT
+# decimate to STATIC_TRI_CAP (the box-union pedestals). Each slab is a stair-step of constant
+# cross-section, so a horizontal FEATURE is only resolved if it is thicker than one slab —
+# which is why the slab count is derived from a target THICKNESS rather than fixed. A fixed 32
+# slabs is 32 mm on a 1 m pedestal, and that quantised stand_klein's cradle collar into a
+# 32 mm dimple whose floor sat 3 mm above the real cap, leaving the bottle nothing to seat
+# against. 8 mm resolves every feature the gallery stands have (the thinnest is a 30 mm cap
+# plate) at ~10k tris per stand; the cap keeps a tall stand from exploding.
+STATIC_SLAB_MAX_T = 0.008
+STATIC_SLABS_MAX = 192
+
+
+def slab_count(mesh, max_t=STATIC_SLAB_MAX_T, cap=STATIC_SLABS_MAX):
+    """Slabs to cut `mesh` into so no slab is thicker than `max_t` (bounded by `cap`)."""
+    h = float(mesh.bounds[1][1] - mesh.bounds[0][1])
+    return int(max(4, min(cap, math.ceil(h / max(1e-9, max_t)))))
+
+# Tolerance (metres) used to simplify each slab's cross-section outline in slab_sections().
+# An outline traced around marching-cubes output carries thousands of near-collinear
+# vertices; extruding them verbatim costs ~83k tris per stand, versus ~2400 at 0.5 mm. Well
+# below any feature that can matter to a resting contact.
+SECTION_SIMPLIFY = 0.0005
 
 # Radius (metres) of the --tether spring's dead zone around each piece's authored XZ
 # anchor. Inside it the spring is OFF so the piece settles naturally; outside it the spring
@@ -147,6 +172,21 @@ STABILITY_MARGIN = -0.010
 POKE_SPEED = 0.03      # m/s linear kick
 POKE_SPIN = 0.30       # rad/s angular kick
 POKE_TOL = 0.010       # a stable piece moves less than this (m) in response
+
+# NEITHER of the two tests above notices that a piece landed somewhere else entirely. They
+# are both LOCAL: "is the COM over the contacts it actually has" and "does that rest survive
+# a shove". A piece that slides off its cap, drops a metre and wedges between two pedestal
+# shafts passes both — it is genuinely, immovably at rest down there. `heart` did exactly
+# that and was reported `OK ... on stand_dumbbell, stand_heart`, which reads like a success
+# and is a total failure: the author put it 30 mm above stand_heart's cap and the bake buried
+# it on the floor, where it happened to touch two shafts on the way down.
+#
+# So the bake also asks the only question the sim cannot answer by itself — did the piece end
+# up on the thing the AUTHOR put it over? That intent lives in the authored scene (see
+# intended_supports()), not in the physics. Note the test is deliberately NOT "how far did
+# the COM move": a piece that honestly tips from its authored tilt onto a stable face of its
+# own cap moves its COM by 100+ mm and is completely correct (`heart` under --tether does
+# exactly this), while a piece can slide clean off a narrow cap having moved much less.
 
 # How many times a piece that came to rest PERCHED (COM outside its support polygon) is
 # re-thrown with a fresh random perturbation before we give up on it. A symmetric body can
@@ -432,28 +472,17 @@ def parse_obj_groups(path):
 
 
 # ---------------------------------------------------------------- physics
-def slab_hulls(mesh, slabs=STATIC_SLABS):
-    """Decompose a mesh into a stack of convex hulls, one per horizontal slab.
+def slab_hulls(mesh, slabs=None):
+    """Fallback for slab_sections(): a stack of convex hulls, one per horizontal slab.
 
-    A cheap collider for a *static* body only has to reproduce the surface a piece can
-    come to rest on. A single convex hull does that for the TOP of a museum pedestal
-    exactly (the hull's extreme point in +y is the mesh's, so the cap height is preserved
-    bit-for-bit) — but it also fills in the taper between a wide base and a narrow column,
-    inventing a sloped shoulder that a piece sliding off the cap could come to rest on.
-    That would be baked into the scene as a piece floating in mid-air beside its stand,
-    so a single hull is not safe.
+    Cheap and robust (nothing but a hull per slab), and exact in cap height and XZ extent,
+    but it CONVEXIFIES each slab — so any bore or notch is silently filled in. That is fine
+    for a plain pedestal and wrong for anything hollow, which is why slab_sections() is
+    tried first and this only runs if the sectioning fails.
 
-    Hulling each horizontal slab separately removes exactly that failure: every slab's
-    hull spans only its own cross-section, so the vertical profile is reproduced
-    step-wise instead of being convexified end-to-end, and a piece that leaves the cap
-    falls past the column to the floor as it should. Measured on the gallery stands this
-    is exact in cap height AND in XZ extent, at ~150 tris per slab instead of ~50-115k
-    per stand.
-
-    Slabs OVERLAP by `eps` (one mean edge length, i.e. one polygonisation cell) so
-    consecutive hulls interpenetrate: without the overlap a slab boundary that falls on a
-    vertical wall can leave a hairline seam a contact could slip through. Overlap costs
-    nothing for a static collider, since the union is all that matters."""
+    Slabs OVERLAP by `eps` (one polygonisation cell) so consecutive hulls interpenetrate;
+    without it a slab boundary landing on a vertical wall can leave a hairline seam."""
+    slabs = slab_count(mesh) if slabs is None else slabs
     v = np.asarray(mesh.vertices)
     lo, hi = float(v[:, 1].min()), float(v[:, 1].max())
     if hi - lo < 1e-9:
@@ -474,6 +503,105 @@ def slab_hulls(mesh, slabs=STATIC_SLABS):
         if h.volume > 1e-12:          # skip degenerate (coplanar) slabs
             out.append(h)
     return out or [mesh.convex_hull]
+
+
+def slab_sections(mesh, slabs=None, tol=SECTION_SIMPLIFY):
+    """Reduce a static collider to a stack of prisms extruded from its true cross-section.
+
+    A cheap collider for a *static* body only has to reproduce the surface a piece can come
+    to rest on, so the marching-cubes tessellation is enormously over-detailed for it (see
+    the STATIC_TRI_CAP comment). The reduction has to preserve three things exactly: the
+    height of every resting surface, the XZ outline, and — critically — any HOLE.
+
+    Convexifying cannot do that. A single whole-mesh convex hull fills the taper between a
+    wide base and a narrow column, inventing a shoulder a piece could rest on; hulling each
+    horizontal slab separately fixes that, but still fills any bore in a slab, which would
+    quietly turn a cradle collar into a flat disc and make the settle meaningless.
+
+    So instead each slab is rebuilt from the mesh's actual cross-section at its mid-height:
+    `section_multiplane` gives closed 2D outlines (with interior holes as holes), which are
+    extruded back to the slab's full thickness. Measured on the gallery stands this is exact
+    in cap height and XZ extent, holds volume to within a few percent (versus +46% to +111%
+    for slab hulls), and costs ~2400 tris per stand — no worse than hulling.
+
+    The outlines are simplified to `tol` first: an outline traced around marching-cubes
+    output has thousands of collinear vertices, and extruding those directly gives ~83k tris
+    per stand, which would defeat the whole exercise. Half a millimetre is far below any
+    feature that matters here.
+
+    Each slab is a stair-step of constant cross-section, so a horizontal feature only
+    survives if it is thicker than a slab: the count comes from slab_count()'s target
+    thickness, not a fixed number (see STATIC_SLAB_MAX_T).
+
+    The prisms are CONCAVE (that is the point), so callers must load them as concave
+    trimeshes rather than convex shapes."""
+    slabs = slab_count(mesh) if slabs is None else slabs
+    v = np.asarray(mesh.vertices)
+    lo, hi = float(v[:, 1].min()), float(v[:, 1].max())
+    if hi - lo < 1e-9:
+        return None
+    cuts = np.linspace(lo, hi, slabs + 1)
+    mids = (cuts[:-1] + cuts[1:]) / 2.0
+    try:
+        secs = mesh.section_multiplane(plane_origin=[0.0, lo, 0.0],
+                                       plane_normal=[0.0, 1.0, 0.0],
+                                       heights=(mids - lo))
+    except Exception:
+        return None
+    out = []
+    for i, sec in enumerate(secs):
+        if sec is None:
+            continue
+        thick = float(cuts[i + 1] - cuts[i])
+        to_3d = sec.metadata.get('to_3D')
+        if to_3d is None:
+            return None       # without the section's own frame we'd guess the axes wrong
+        for poly in sec.polygons_full:
+            q = poly.simplify(tol) if tol else poly
+            if q.is_empty or q.area <= 0.0:
+                q = poly
+            try:
+                pr = trimesh.creation.extrude_polygon(q, thick)
+            except Exception:
+                continue
+            # extrude_polygon builds in the section's own 2D frame extruding +z; to_3D maps
+            # that frame back to world (its +z becomes the plane normal, i.e. world +y) and
+            # puts z=0 at the section height — which is the slab's MIDDLE, so drop by half a
+            # slab to make the prism span exactly [cuts[i], cuts[i+1]].
+            pr.apply_transform(to_3d)
+            pr.apply_translation([0.0, -0.5 * thick, 0.0])
+            out.append(pr)
+    return out or None
+
+
+def intended_supports(worlds, selected, floor_y):
+    """{piece: {support name: its top y}} — what the AUTHOR placed each settled piece over.
+
+    This is the reference the FELL verdict is checked against, and it has to be read off the
+    authored scene because the simulation has no notion of intent: to pybullet, "wedged on
+    the floor between two pedestals" and "sitting on its cap" are both just rest.
+
+    A support is any other named object whose plan (XZ) footprint overlaps the piece's and
+    whose top is below the piece's mid height. The mid-height test (rather than "below the
+    piece's underside") is what lets a MOUNT count: `collar_klein`'s top is above the Klein
+    bottle's lowest point, because the bottle hangs down inside its bore — but it is still
+    the thing holding the bottle up. A piece over nothing is meant to rest on the floor."""
+    out = {}
+    for pc in selected:
+        plo, phi = worlds[pc].bounds
+        mid = 0.5 * (plo[1] + phi[1])
+        sup = {}
+        for st, m in worlds.items():
+            if st == pc:
+                continue
+            slo, shi = m.bounds
+            if shi[0] < plo[0] or slo[0] > phi[0] or shi[2] < plo[2] or slo[2] > phi[2]:
+                continue                      # no plan overlap: it is not underneath
+            if shi[1] > mid:
+                continue                      # towers past the piece: a neighbour, not a support
+            sup[st] = float(shi[1])
+        out[pc] = sup or {'floor': float(floor_y)}
+    return out
 
 
 def settle_bodies(worlds, selected, floor_y, max_steps, friction, tether=0.0,
@@ -510,6 +638,13 @@ def settle_bodies(worlds, selected, floor_y, max_steps, friction, tether=0.0,
         import pybullet as p
     except ImportError:
         sys.exit('settle_scene needs pybullet:  python -m pip install pybullet')
+
+    # Read the author's intent off the scene BEFORE anything moves — once the sim runs, the
+    # authored pose is gone and there is nothing left to check the result against.
+    supports = intended_supports(worlds, selected, floor_y)
+    for _pc, _sup in supports.items():
+        print(f'[settle_scene] "{_pc}" is authored over: '
+              + ', '.join(f'{s} (top {y:.3f})' for s, y in sorted(_sup.items())))
 
     tmpdir = tempfile.mkdtemp(prefix='settlescene_sim_')
     p.connect(p.DIRECT)
@@ -595,11 +730,11 @@ def settle_bodies(worlds, selected, floor_y, max_steps, friction, tether=0.0,
             # Two reduction paths, in order of fidelity:
             #  1. Quadric decimation, when it actually reaches the cap (gyroid, the lamps,
             #     chrome_ring). This keeps the concave shape, so it is used whenever it works.
-            #  2. Slab-hull decomposition, for the meshes where decimation stalls. The stands
-            #     do: they are unions of boxes whose marching-cubes tessellation resists
-            #     edge-collapse, bottoming out at 25-47% of the input no matter how many
-            #     passes or how much aggression (and losing 29% of the volume on the way, so
-            #     pushing harder is not an option either). See slab_hulls().
+            #  2. Slab-section decomposition, for the meshes where decimation stalls. The
+            #     stands do: they are unions of boxes whose marching-cubes tessellation
+            #     resists edge-collapse, bottoming out at 25-47% of the input no matter how
+            #     many passes or how much aggression (and losing 29% of the volume on the
+            #     way, so pushing harder is not an option either). See slab_sections().
             parts = None
             if len(mesh.faces) > STATIC_TRI_CAP:
                 try:
@@ -611,20 +746,21 @@ def settle_bodies(worlds, selected, floor_y, max_steps, friction, tether=0.0,
                 except Exception as e:
                     print(f'[settle_scene] static-collider decimation of "{name}" failed ({e})')
                 if parts is None:
-                    parts = slab_hulls(mesh)
+                    parts = slab_sections(mesh)
+                    how = 'slab sections'
+                    if parts is None:                     # shapely/section machinery missing
+                        parts = slab_hulls(mesh)
+                        how = 'slab HULLS (holes will be filled!)'
                     print(f'[settle_scene] static collider "{name}" would not decimate; '
-                          f'{len(parts)} slab hulls, '
+                          f'{len(parts)} {how}, '
                           f'{sum(len(h.faces) for h in parts)} tris (from {len(mesh.faces)})')
             else:
                 parts = [mesh]
             for j, hpart in enumerate(parts):
                 ppath = path if len(parts) == 1 else path[:-4] + f'_{j}.obj'
                 hpart.export(ppath)
-                # A slab hull IS convex, so load it as a convex shape (GJK) rather than
-                # forcing a concave trimesh — same geometry, less per-contact work.
-                col = (p.createCollisionShape(p.GEOM_MESH, fileName=ppath) if len(parts) > 1
-                       else p.createCollisionShape(p.GEOM_MESH, fileName=ppath,
-                                                   flags=p.GEOM_FORCE_CONCAVE_TRIMESH))
+                col = p.createCollisionShape(p.GEOM_MESH, fileName=ppath,
+                                             flags=p.GEOM_FORCE_CONCAVE_TRIMESH)
                 sb = p.createMultiBody(0, col)
                 p.changeDynamics(sb, -1, lateralFriction=friction)
                 statics[sb] = name        # every slab reports as the stand it came from
@@ -755,11 +891,24 @@ def settle_bodies(worlds, selected, floor_y, max_steps, friction, tether=0.0,
             on.add(statics.get(cp[2]) or next((n for n, (b, _, _) in dyn.items()
                                                if b == cp[2]), 'floor'))
         hull = convex_hull_2d(pts)
+        # Did it land on what the author put it over? Two ways to fail: it is not touching
+        # any intended support at all, or it is touching one but has sunk BELOW that
+        # support's top — i.e. it is against the side of the pedestal, not on the cap. The
+        # second half is what catches the wedged-on-the-floor case, which still grazes the
+        # shafts it fell between and so passes a bare "is it touching its stand" test.
+        sup = supports[name]
+        top = max(sup.values())
+        # The body was spawned exactly at its authored COM `c` and is centred on it, so
+        # `pos - c` is the piece's displacement — reported for diagnosis, not gated on.
         return delta, {
             'margin':  support_margin(hull, (float(pos[0]), float(pos[2]))),
             'contacts': len(pts),
             'resting_on': sorted(on),
             'relax_drift': float(np.linalg.norm(free[name] - held[name])),
+            'supports': sorted(sup),
+            'fell': not (on & set(sup)) or float(pos[1]) <= top,
+            'displaced': float(np.linalg.norm(np.asarray(pos, float) - c)),
+            'dropped':   float(c[1] - pos[1]),
         }
 
     # Throw the pieces, settle them, and re-throw any that ended up PERCHED (balanced in an
@@ -811,7 +960,7 @@ def settle_bodies(worlds, selected, floor_y, max_steps, friction, tether=0.0,
             result[name], report[name] = measure(name, held, free)
             report[name]['poke_drift'] = float(np.linalg.norm(poked[name] - free[name]))
         pending = [n for n in dyn if report[n]['margin'] < STABILITY_MARGIN
-                   or report[n]['poke_drift'] > POKE_TOL]
+                   or report[n]['poke_drift'] > POKE_TOL or report[n]['fell']]
         if not pending:
             break
 
@@ -1015,21 +1164,33 @@ def main():
     # Static-stability verdict. A piece whose COM does not project inside the convex hull
     # of its load-bearing contacts is not resting — it is perched, and will read as
     # "floating off its pedestal" in the render even though the sim reported it settled.
-    print('[settle_scene] stability (COM over support polygon, then poked to see if it holds):')
+    print('[settle_scene] stability (landed on its own stand, COM over support polygon, '
+          'then poked to see if it holds):')
     unstable = []
     for name in selected:
         r = report[name]
         perched = r['margin'] < STABILITY_MARGIN
         wobbly = r['poke_drift'] > POKE_TOL
-        if perched or wobbly:
+        if r['fell'] or perched or wobbly:
             unstable.append(name)
-        verdict = 'PERCHED' if perched else ('TOPPLES' if wobbly else 'OK     ')
+        # FELL first: a piece on the floor is stably at rest down there, so its margin and
+        # poke numbers look fine and would otherwise print as OK.
+        verdict = ('FELL   ' if r['fell'] else 'PERCHED' if perched else
+                   'TOPPLES' if wobbly else 'OK     ')
         print(f'  {verdict} {name}:  margin {r["margin"]*1000:+7.1f} mm  '
               f'contacts {r["contacts"]:3d}  on {", ".join(r["resting_on"]) or "nothing"}  '
-              f'(tether release {r["relax_drift"]*1000:6.1f} mm, poke {r["poke_drift"]*1000:6.1f} mm)')
+              f'(wanted {", ".join(r["supports"])}; tether release {r["relax_drift"]*1000:6.1f} mm, '
+              f'poke {r["poke_drift"]*1000:6.1f} mm, moved {r["displaced"]*1000:6.1f} mm, '
+              f'dropped {r["dropped"]*1000:+7.1f} mm)')
     if unstable:
-        print(f'[settle_scene] WARNING: {len(unstable)} piece(s) are NOT stably supported: '
-              f'{", ".join(unstable)}\n'
+        print(f'[settle_scene] WARNING: {len(unstable)} piece(s) did NOT settle where they '
+              f'were authored: {", ".join(unstable)}\n'
+              f'[settle_scene]   FELL = the piece is not resting on top of anything the author '
+              f'placed it over — it slid or toppled off its stand and came to rest somewhere '
+              f'else (the floor, or wedged against a pedestal shaft). It IS at rest there, so '
+              f'margin/poke look healthy; those are local tests and cannot see this. Try '
+              f'--tether, or give the piece a MOUNT that grips it (tools/make_klein_collar.py '
+              f'builds one for the Klein bottle).\n'
               f'[settle_scene]   PERCHED = the COM lies outside the hull of its load-bearing '
               f'contacts, so the piece overhangs whatever it is touching — check the authored '
               f'position is really over the stand.\n'
