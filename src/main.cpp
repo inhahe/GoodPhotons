@@ -2808,14 +2808,14 @@ static denoise::Params g_denoiseParams;
 // preview window so both see identical pixels. Auto-exposure mirrors writeFilm:
 // absolute EV uses a fixed sensor gain; otherwise a p99 anchor (locked via lockAnchor
 // if non-null, else recomputed per frame). Optionally reports the chosen gain/exposure.
-static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
-                                       bool absolute, double* lockAnchor,
-                                       double* outEAuto = nullptr,
-                                       double* outExposure = nullptr) {
+// The film reduced to scene-linear sRGB-primary radiance, denoised but NOT exposed,
+// gamma-encoded or clamped. This is the buffer the 8-bit tone map starts from and the
+// buffer `-hdr` writes out; sharing it is what keeps the PFM sidecar an exact record of
+// the PNG's input rather than a second, subtly different reduction of the same film.
+static std::vector<Vec3> filmToLinear(const Film& f, double N) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin((size_t)W * H);
     double norm = 1.0 / (N * cieYIntegral());
-    std::vector<double> lum; lum.reserve((size_t)W * H);
     for (size_t i = 0; i < lin.size(); ++i)
         lin[i] = xyzToLinearSrgb(f.xyz[i] * norm);
     // Denoise BEFORE the auto-exposure anchor is measured, not after: the p99 anchor is
@@ -2823,6 +2823,16 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
     // handful of lucky paths set the exposure for the whole image and darken everything
     // else to compensate. Filtering first makes the anchor describe the picture.
     if (g_denoise) denoise::apply(lin, W, H, g_denoiseParams);
+    return lin;
+}
+
+static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
+                                       bool absolute, double* lockAnchor,
+                                       double* outEAuto = nullptr,
+                                       double* outExposure = nullptr) {
+    const int W = f.resX, H = f.resY;
+    std::vector<Vec3> lin = filmToLinear(f, N);
+    std::vector<double> lum; lum.reserve((size_t)W * H);
     for (size_t i = 0; i < lin.size(); ++i)
         lum.push_back(std::max({lin[i].x, lin[i].y, lin[i].z, 0.0}));
     double eAuto;
@@ -2859,6 +2869,53 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
     return img;
 }
 
+// -hdr: also write a 32-bit float PFM sidecar beside -o. Off unless the flag is given.
+//
+// WHY THIS EXISTS. A PNG is 8-bit sRGB with a hard clamp, so every value at or above the
+// clip point prints as the same #FFFFFF and its COLOUR is gone with it — the three
+// channels are literally equal. That is fatal for measuring a caustic, which is by
+// definition the brightest thing in frame: metering caustic hue or a peak-to-screen ratio
+// off a PNG silently reports the tone map's opinion instead of the render's. (Measured:
+// in gallery_rain 596 of the 22639 pixels of one cap were pure white, more than half the
+// caustic's area, so its "colour" read as white no matter what the optics did.) The PFM
+// records the same linear buffer the tone map consumes, before exposure and before the
+// clamp, so ratios and chromaticity come out exact.
+static bool g_writeHdr = false;
+
+// Write scene-linear RGB as a binary PFM (Portable Float Map): a three-line ASCII header
+// then raw little-endian float32 triples. PFM's raster order is left-to-right,
+// BOTTOM-to-top, which is exactly the film's own row order — so unlike the 8-bit path
+// this needs no vertical flip. Values are radiance in the film's own scale (post-denoise,
+// pre-exposure): the useful measurements off it — peak-to-median ratios, chromaticity —
+// are all exposure-invariant, so leaving the gain out keeps two renders comparable even
+// when they were shot at different stops.
+static bool writePfm(const std::string& path, int W, int H, const std::vector<Vec3>& lin) {
+    std::ofstream fo(path, std::ios::binary);
+    if (!fo) return false;
+    fo << "PF\n" << W << ' ' << H << "\n-1.0\n";   // negative scale = little-endian
+    std::vector<float> row((size_t)W * 3);
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            const Vec3& c = lin[(size_t)y * W + x];
+            row[(size_t)x * 3 + 0] = (float)c.x;
+            row[(size_t)x * 3 + 1] = (float)c.y;
+            row[(size_t)x * 3 + 2] = (float)c.z;
+        }
+        fo.write((const char*)row.data(), (std::streamsize)(row.size() * sizeof(float)));
+    }
+    return (bool)fo;
+}
+
+// `<path>` with its extension replaced by `.pfm` (appended if it has none), so the sidecar
+// lands beside the image and inherits any per-frame numbering a camera_path gave it.
+static std::string pfmPathFor(const std::string& path) {
+    size_t dot = path.find_last_of('.');
+    size_t sep = path.find_last_of("/\\");
+    if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
+        return path + ".pfm";
+    return path.substr(0, dot) + ".pfm";
+}
+
 // Returns true on success, false if the image encoder failed. Callers that own the
 // process exit code should propagate a non-zero status on false. (GPU renders that
 // fail — driver TDR, device-memory/scheduling contention — are now caught at the
@@ -2875,6 +2932,17 @@ static bool writeFilm(const char* path, const Film& f, double N, double expComp 
     if (!writeImage(path, W, H, img)) {
         std::fprintf(stderr, "error: could not write %s\n", path);
         return false;
+    }
+    // The HDR sidecar is written from the same linear buffer the tone map just consumed,
+    // so it always matches the PNG that was written a line ago -- including on the
+    // periodic in-progress writes, which is what makes it usable for metering a render
+    // that is still converging.
+    if (g_writeHdr) {
+        std::string hp = pfmPathFor(path);
+        if (!writePfm(hp, W, H, filmToLinear(f, N)))
+            std::fprintf(stderr, "warning: could not write %s\n", hp.c_str());
+        else if (!quiet)
+            std::printf("wrote %s (%dx%d, 32-bit float, scene-linear)\n", hp.c_str(), W, H);
     }
     if (quiet) return true;
     if (absolute)
@@ -5760,6 +5828,9 @@ static void printHelp(const char* prog) {
 "  -view EX,EY,EZ/LX,LY,LZ[/FOV]   ad-hoc eye/look-at[/fovY] camera; renders just it\n"
 "  -exposure|-ev <c>     override every camera's exposure compensation\n"
 "  -exposure-lock        one shared auto-exposure anchor across all rendered cameras\n"
+"  -hdr                  also write a 32-bit float PFM beside -o (scene-linear, no\n"
+"                        exposure/gamma/clamp) so highlights stay measurable — a PNG\n"
+"                        clips every caustic core to the same white and loses its colour\n"
 "\n"
 "Render mode & budget:\n"
 "  -mode <letter>        transport mode (default B; A/B/C forward, R/V/D backward — see README)\n"
@@ -6270,6 +6341,7 @@ static int run(int argc, char** argv) {
                 if (end && *end == '\0' && a > 0.0) { ++i; g_denoiseParams.chroma *= a; }
             }
         }
+        else if (!std::strcmp(argv[i], "-hdr")) g_writeHdr = true;
         else if (!std::strcmp(argv[i], "-denoise-chroma") && i + 1 < argc) {
             g_denoise = true;
             g_denoiseParams.chroma = std::max(0.0, std::atof(argv[++i]));

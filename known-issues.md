@@ -7836,6 +7836,17 @@ Three further conclusions:
    monotonically above ~0.5 m of drop, and past 45 deg the exit face starts to TIR exactly as
    the brilliant's pavilion does.
 
+   **FACETING IT DOES NOT HELP, and that is worth knowing** because from the scene's low
+   camera (11 deg above the horizon) a 45 deg cone is twice as wide as it is tall and
+   foreshortens into a squat glass wedge — optically right, visually mute — so a faceted
+   version that reads as a cut jewel was the obvious cosmetic fix. Every facet is at the same
+   45 deg tilt, so the optics "should" survive; they do not. Cutting the same solid into
+   6/8/12/16 pavilion facets at drop 0.35 gives 0.12/0.11/0.12/0.14% coverage at 0.063/0.162/
+   0.099/0.132 spread, against the smooth cone's 0.29% and 0.212. Sampling the ring focus at n
+   discrete azimuths instead of continuously collapses the patch from 1.43 x 0.96 m to a
+   0.20 x 0.03 m sliver — brighter per unit area (facet 8 reaches sat 0.367) but far too small
+   to read in a wide shot. The scene keeps the smooth cone.
+
    **Siting gotcha worth remembering: in this scene the NEAR row is HIGH z, not low z.** The
    still camera stands at (5.0, 2.95, 9.35) and looks toward -z, so "front of the gallery"
    means z around 5-7. The axicon's first site was z=1.10 — which reads as "front" on the page,
@@ -7844,6 +7855,34 @@ Three further conclusions:
    catches this; only projecting the candidate point through the camera basis does (or
    rendering it, which is how it was found). At z=5.45 the piece is 4.2 m out at 178 px/m and
    clears the gyroid on screen by ~24 px.
+
+**THE MEASUREMENTS ABOVE WERE ALL TAKEN THROUGH A CLIPPING 8-BIT PIPE, and that is a tooling
+bug big enough to have its own fix (2026-08-04).** Metering the shipped frame instead of the
+isolation rig (`scraps/_capchroma.py`, which projects each cap out of the scene through the
+still camera and runs the same metric) showed the axicon's in-scene caustic at spread 0.057
+against the rig's 0.212 — apparently a wash-out by the scene's sky-panel fill, which the rig
+does not have. It was not. **596 of that cap's 22639 pixels are exactly (255, 255, 255).** A
+PNG is 8-bit sRGB with a hard clamp, a caustic is by definition the brightest thing in frame,
+and at the clip point all three channels become *equal* — so the tone map deletes precisely
+the two quantities this whole investigation was measuring, hue and peak-to-screen ratio.
+More than half the caustic's area was clipped, so its colour metered as white no matter what
+the optics did, and the ranking table above was partly a ranking of how hard each piece hit
+the clamp.
+
+Fixed properly rather than worked around: **ftrace grew `-hdr`** (v0.132.0), which writes a
+32-bit float PFM beside `-o` holding the scene-linear buffer — no exposure, no gamma, no
+clamp — from the same `filmToLinear()` the tone map consumes, on the periodic in-progress
+writes as well as the final one. `_capchroma.py` reads either format and **prints a warning
+banner when handed an 8-bit file**. Rules that follow from this:
+
+* **Never meter a caustic (or any highlight) off a PNG.** Render with `-hdr` and measure the
+  `.pfm`. Looking at the PNG is fine; measuring it is not.
+* A clipped core is not only a measurement problem, it is a *rendering* one: a caustic whose
+  core is blown to white looks white on screen too. A caustic screen wants its albedo set so
+  the caustic **peak** lands just under clip, not so the ambient does — `capwhite` was already
+  taken from 0.88 to 0.30 for this reason and it is still not far enough under the axicon.
+* Any earlier conclusion in this file that rests on a *bright* caustic's colour should be
+  re-checked against a `.pfm` before it is trusted.
 
 **Tooling bug found and fixed along the way: `rotate` is not a valid key inside an FTSL
 `function` block** (only `translate` is), and the loader emits a **warning, not an error**, then

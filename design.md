@@ -957,6 +957,21 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.
+- **`-hdr` (a 32-bit float PFM beside `-o`)** — the escape hatch from the tone map, added
+  because *measuring* off a PNG had quietly been wrong all along. An 8-bit sRGB image clamps
+  at white, and a caustic is by definition the brightest thing in frame, so its core prints
+  as `#FFFFFF` with all three channels **equal**: the clamp destroys exactly the two
+  quantities a caustic study cares about, its **hue** and its **peak-to-screen ratio**.
+  (Measured in `gallery_rain`: 596 of one cap's 22639 pixels were pure white — more than half
+  the caustic's area — so the piece's colour metered as white no matter what the optics did,
+  and a long chain of shape experiments had been ranked through that clamp.) `writeFilm` now
+  calls the new `filmToLinear()` — the same denoised, scene-linear buffer `filmToRgb8`
+  consumes — and dumps it as PFM, so the sidecar is an exact record of the PNG's *input*
+  rather than a second reduction of the film. It is written on the periodic in-progress
+  writes too, so a converging render can be metered while it runs. **Scene-linear, not
+  exposed**: peak/median ratios and chromaticity are exposure-invariant, so renders shot at
+  different stops stay comparable. PFM's raster order (left-to-right, **bottom-to-top**) is
+  the film's own row order, so unlike the 8-bit path it needs no vertical flip.
 - **`denoise.h`** — `-denoise`, an edge-aware à-trous (SVGF-style) filter for Monte-Carlo
   speckle. It runs inside `filmToRgb8` on the **linear** image and *before* the p99
   auto-exposure anchor is measured (so a firefly can't set the exposure); because
