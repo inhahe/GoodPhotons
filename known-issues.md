@@ -73,23 +73,57 @@ silently dropped:
 * `collimated` lights in mode D/U. A delta emission *direction* from a finite surface means a
   shading point can never next-event-estimate it (the `s == 1` strategy has zero measure);
   only forward transport reaches it.
-* `spot` / `sun` in **mode U (VCM)** — see the entry below.
 * `spot` / `sun` in the **GPU** BDPT — see the entry below.
 
-### DEBT — OPEN (2026-08-04): VCM (mode U) still refuses `spot` / `sun` lights that BDPT now renders
+### DEBT — DONE (2026-08-04): VCM (mode U) refused `spot` / `sun` lights that BDPT renders
 
-`main.cpp`'s `vcmUnsupportedFeature()` (and the mode-`U` branch of `modeFeatureUnsupported`)
-now carry their own emitter check rejecting `Spot`/`Sun`, because vertex *merging* carries its
-own MIS weights (the vc/vm partial sums in `src/vcm.h`) which would each need the same
-delta-light exclusions the BDPT balance heuristic just got. `vcm.h:489,796` still skip those
-emitters outright, so without the guard mode U really *would* drop them silently — the guard
-is what makes the refusal loud.
+**Resolved 2026-08-04 (0.125.0).** The delta-light treatment is now ported into `src/vcm.h`,
+so mode U renders spot and sun lights exactly like mode D and both guards in `main.cpp`
+(`vcmUnsupportedFeature()` and the mode-`U` branch of `modeFeatureUnsupported`) have dropped
+their emitter check. What the port needed, in SmallVCM's compact `dVCM`/`dVC`/`dVM`
+bookkeeping rather than pbrt's explicit pdfFwd/pdfRev loop:
 
-Proper fix: port the delta-light treatment into `vcm.h` — `traceLightSubpath` needs the
-`deltaLightSubpath` emission cases, the NEE path needs the spot/sun connection geometry, and
-the vc/vm weight recursions need to skip the strategies a delta light can't be sampled by
-(no `s == 0`, and merging at the light vertex itself is impossible). Worth doing next; the
-BDPT code in `bdpt.h` is the reference to mirror.
+* `traceLightSubpath` gained the two delta emission cases. Both sample uniformly in the cone
+  (`pdfDirW = 1/Omega`; note `spotOmega` is the *falloff-weighted* solid angle, so the
+  sampling cone `2*PI*(1-cosOuter)` is recomputed — they coincide only for a sun). A spot
+  emits from `em.origin` with `pdfPos = 1`; a sun from a disc of radius `sceneRadius` one
+  radius upstream of the scene centre, `pdfPos = 1/(pi R^2)`. `|cos|` at the light is exactly
+  1 for both (the emission normal *is* the direction), and the spot's smoothstep penumbra is
+  folded into the radiance, never into a pdf.
+* **`dVC` (and hence `dVM`) start at 0 for a delta light**, and NEE forces `wLight = 0`. That
+  is what *drops* the unsamplable strategies from the balance heuristic instead of
+  under-weighting the ones that work. `dVCM` comes out as `Omega` for a spot and `pi R^2` for
+  a sun — the same values SmallVCM's `PointLight` / `DirectionalLight` produce.
+* `misArrival` gained a `foldDist2` flag, false for exactly one edge in the renderer: the
+  first edge of an **infinite** light's subpath, whose density is the planar `1/(pi R^2)`
+  rather than a solid-angle density (pbrt's "correct subpath sampling densities for infinite
+  area lights" patch; SmallVCM's `if (pathLength > 1 || isFiniteLight)`).
+* The camera NEE branch grew per-shape connection geometry: spot → `directPdfW = dist^2`,
+  `emissionPdfW = 1/Omega`, `cosAtLight = 1`; sun → `directPdfW = 1/Omega`,
+  `emissionPdfW = 1/(pi R^2 Omega)`, shadow ray out of the scene with **no** endpoint epsilon.
+* `traceCameraSubpath` tracks `camAllDelta` and adds the **escaped-ray sun** at the
+  `!h.valid` branch with MIS weight exactly 1 — the same strategy `bdpt.h` needed, and for
+  the same reason (nothing else can reach a sun through a purely specular chain).
+
+Validated against the GPU backward reference (mode R), all three regression scenes:
+
+| scene | mode U | mean ratio | mean \|diff\| | note |
+|---|---|---|---|---|
+| `_sun_check.ftsl` | 400 passes, `-pmradius 0.02` | **1.0002** | 0.0038 | identical auto-exposure (4.74e-14); shadow-core box 0.0813 vs mode D's 0.0810 |
+| `_spot_cornell.ftsl` | 300 passes, `-pmradius 0.003` | 1.0061 | 0.0068 | within mode U's 5.8% noise |
+| `_deltalight_mix.ftsl` | 250 passes, `-pmradius 0.02` | 0.9949 | 0.0081 | **absolute** units, so this is a real energy comparison; the worst pixels are mode *R*'s fireflies |
+
+The sun's glint on the mirror sphere is present and correctly weighted in mode U: the 7x7
+window at (50,101) sums to exactly 1.0000 in R, U and D alike — one saturated pixel, not two.
+Area-light scenes are **bit-identical** to before (same RNG draw order, same densities).
+
+Note the residual gap at the *default* merge radius (`sceneRadius * 0.02`) is larger — mean
+ratio 0.9834 on the mix scene — and shrinks monotonically with the radius. That is ordinary
+photon-mapping radius bias, not a delta-light error: `-pmradius 0.02` (8.5x smaller) takes it
+to 0.9949, and the mode-D/mode-R pair shows the same shadow-core value the small-radius mode U
+converges to.
+
+### DEBT — OPEN (2026-08-04): the GPU BDPT kernels don't do delta lights, so a spot/sun scene falls back to the (slower) CPU BDPT
 
 ### DEBT — OPEN (2026-08-04): the GPU BDPT kernels don't do delta lights, so a spot/sun scene falls back to the (slower) CPU BDPT
 
@@ -106,6 +140,12 @@ transliteration of the host code (`dGenerateLightSubpath` ↔ `generateLightSubp
 `dConnectBDPT` ↔ `connectBDPT`, `dVertexPdfLight` ↔ `vertexPdfLight`), so the port is
 mechanical; the fiddly parts are the infinite-light `path[1].pdfFwd` patch and threading the
 escaped-ray sun radiance through the device path accumulator.
+
+This now also costs **mode U**: `cudaVcmSupported()` is `cudaBdptSupported() && media.empty()`,
+so since 0.125.0 (which gave the CPU VCM delta lights) a spot/sun scene in mode U silently
+falls through to the CPU VCM session too. That fallback is correct and loud enough — mode U
+still renders the scene — but it is the reason a `light sun` VCM render is minutes rather than
+seconds. Relaxing `cudaBdptSupported()` fixes mode D and mode U in one go.
 
 ### DONE (2026-08-03): the gallery Klein bottle is now a glassblower's bottle WITH THE INTERNALS, and it needs no mount
 

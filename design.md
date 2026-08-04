@@ -131,9 +131,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `specularArrival` is true — a single unbiased estimator with **no MIS weight**, since
   NEE runs at precisely the material types that then clear that flag. `Scene::sunCount`
   gates all of it, so sun-free scenes are untouched. Not area-*connectible*, but since
-  0.124.0 **CPU BDPT (`bdpt.h`) renders a Sun and a Spot anyway** — see "Delta lights in
-  BDPT" below. `vcm.h` and the GPU BDPT kernels still reject both, and Env/collimated stay
-  outside BDPT entirely. The Preetham sky's `sun_disk separate` option
+  0.124.0 **CPU BDPT (`bdpt.h`) renders a Sun and a Spot anyway**, and since 0.125.0 so does
+  **CPU VCM (`vcm.h`)** — see "Delta lights in BDPT" below. The GPU BDPT/VCM kernels still
+  reject both (such a scene falls back to the CPU session), and Env/collimated stay outside
+  BDPT/VCM entirely. The Preetham sky's `sun_disk separate` option
   (`sky::SunDisk`) unbakes the solar disc from the env map and registers an
   energy-matched Sun instead — the same picture, converging ~20× faster in forward modes.
   **Mesh area lights** (since 0.41.0): a
@@ -715,6 +716,29 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   Gated by `Scene::sunCount` so sun-free scenes pay nothing.
   `scenes/_deltalight_mix.ftsl` is the regression scene (area + spot + sun + a mirror
   sphere); mode `D` vs mode `R` agrees to 0.33 % of mean luminance.
+
+  **Delta lights in VCM** (since 0.125.0): the same treatment, restated in SmallVCM's
+  compact `dVCM`/`dVC`/`dVM` running-partial-MIS form (`vcm.h` does *not* keep pbrt's
+  explicit pdfFwd/pdfRev arrays). The three rules that carry the whole thing:
+  (1) **`dVC` — and hence `dVM` — start at 0** for a delta light, and the NEE weight forces
+  `wLight = 0`; that is the `dVC`/`dVM` analogue of `vertexPdfLightOrigin` returning 0.
+  (2) **`dVCM` starts at `1/pdfDirW` = Ω for a Spot and `1/pdfPos` = πR² for a Sun**, which
+  falls out of `directPdf/emissionPdfW` once `directPdf` is defined per family
+  (`pdfChoice·pdfPos` for an area light, `pdfChoice·1` for a delta position,
+  `pdfChoice·pdfDirW` for the infinitely distant sun) — the same two constants SmallVCM's
+  `PointLight`/`DirectionalLight` produce. (3) **`misArrival` skips the `dist²` factor on the
+  first edge of an infinite light's subpath** (new `foldDist2` parameter, false in exactly
+  that one place), which is this renderer's form of the `path[1].pdfFwd` patch. On top of
+  those, `traceLightSubpath` gained the two cone-sampling emission cases (the spot's
+  smoothstep penumbra scales *radiance*, never a pdf; note `spotOmega` is the falloff-weighted
+  solid angle, so the sampling cone `2π(1−cosOuter)` is recomputed), the camera NEE branch
+  grew per-shape connection geometry (sun: shadow ray to the scene exit with **no** endpoint
+  epsilon), and `traceCameraSubpath` tracks `camAllDelta` to add the escaped-ray sun at
+  weight 1. Vertex connection and vertex merging needed **no** change: they read `dVCM`/`dVC`/
+  `dVM` off the stored light vertices, and the zeros propagate correctly through `misScatter`.
+  Validated vs mode `R`: `_sun_check` 1.0002 mean ratio (identical auto-exposure),
+  `_spot_cornell` 1.0061, `_deltalight_mix` (absolute units) 0.9949 — the residual at the
+  *default* merge radius is ordinary photon-mapping radius bias and shrinks with `-pmradius`.
 - **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.

@@ -3997,13 +3997,10 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
 // (its camera importance assumes the rectilinear pinhole). Returns a reason string or null.
 static const char* vcmUnsupportedFeature(const Scene& scene, const Camera& cam) {
     if (const char* r = bdptUnsupportedFeature(scene)) return r;
-    // Delta lights (spot / sun) are supported by BDPT but NOT yet by VCM: vertex merging
-    // carries its own MIS weights (the vc/vm partial sums), which would each need the same
-    // delta-light exclusions BDPT's balance heuristic just got. Until that is done, mode U
-    // refuses them rather than silently dropping their light subpaths (known-issues.md).
-    for (const auto& em : scene.emitters)
-        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Sun)
-            return "spot / sun lights (mode D renders them; mode U does not yet)";
+    // Delta lights (spot / sun) ARE supported here: vcm.h carries the same exclusions
+    // through its vc/vm partial sums (dVC/dVM start at 0, wLight is 0 in NEE, the infinite
+    // light skips the first edge's dist^2) plus the escaped-ray sun strategy. See the
+    // DELTA LIGHTS note at the top of vcm.h.
     if (!scene.media.empty()) return "participating media (mode U is surfaces-only)";
     if (cam.hasLens()) return "a realistic multi-element lens";
     if (cam.projection != CAM_RECTILINEAR) return "a non-rectilinear (fisheye/panoramic) camera";
@@ -4027,10 +4024,7 @@ static const char* modeFeatureUnsupported(const Scene& scene, char mode, int pro
             return "a non-rectilinear (fisheye/panoramic) camera in mode D";
     } else if (mode == 'U') {
         if (const char* r = bdptUnsupportedFeature(scene)) return r;
-        // Mirrors vcmUnsupportedFeature: BDPT gained delta lights, VCM has not yet.
-        for (const auto& em : scene.emitters)
-            if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Sun)
-                return "spot / sun lights (mode D renders them; mode U does not yet)";
+        // Mirrors vcmUnsupportedFeature: spot / sun lights are supported in mode U too.
         if (!scene.media.empty()) return "participating media (mode U is surfaces-only)";
         if (projection != CAM_RECTILINEAR)
             return "a non-rectilinear (fisheye/panoramic) camera in mode U";

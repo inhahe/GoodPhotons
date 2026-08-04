@@ -955,7 +955,11 @@ that converges to the same physical image.
   **ignored** (light-path count follows the film resolution); `-spp` is the **number of
   passes** (or a `-time`/`-noise`/`-forever` budget); the radius-shrink rate is
   `-vcmalpha` (default `0.75`) and the initial radius reuses `-pmradius`/`-pmradiusfrac`.
-  CPU only. *Cost:* the heaviest per-pass (both a full light pass and a full camera pass,
+  Since 0.125.0 it renders **`spot` and `sun` lights** on the same terms mode `D` does
+  (delta emitters: the unsamplable strategies are dropped from the vc/vm MIS weights, and a
+  `sun` gets the escaped-ray strategy so a mirror throws its disc back at the lens) — on the
+  **CPU**; a spot/sun scene falls back from the GPU VCM session, which shares BDPT's device
+  scope. *Cost:* the heaviest per-pass (both a full light pass and a full camera pass,
   plus a grid build), but the most consistent quality per pass — at equal time it beats
   SPPM on caustics *and* stays as clean as BDPT on diffuse GI. (Single-wavelength note:
   connections pair a camera path with its **own** light path so they share one wavelength
@@ -1018,8 +1022,9 @@ stay non-resumable.
   (Fluorescence, layered stacks, and env/collimated lights aren't a GPU limitation — BDPT
   can't render them on *any* backend, so mode `D` refuses or drops to mode `B` for those
   scenes on both CPU and GPU; use mode B/P/R for them. **Spot and sun lights** are the one
-  real GPU gap: the CPU BDPT renders them (since 0.124.0), the device kernels don't, so such
-  a scene falls back to CPU BDPT with a printed notice. GRIN media likewise keep an in-scope
+  real GPU gap: the CPU BDPT renders them (since 0.124.0) and the CPU VCM since 0.125.0, the
+  device kernels don't, so such a scene falls back to the CPU BDPT/VCM session with a printed
+  notice. GRIN media likewise keep an in-scope
   mode-`D` scene on the CPU; spectral **rainbow-phase** media now render on-device in mode `D`.) **Parametric records** (a
   material's slots driven by a per-hit driver sampling a named LUT bank — see *Parametric
   records* below) run on the **GPU forward, backward, and BDPT (`D`) tracers for both the
@@ -1645,9 +1650,10 @@ Unlike every other light, the sun costs nothing in forward modes: photons are bo
 disc the size of the scene's own cross-section, aimed down the beam, so **every** photon
 enters the scene instead of most missing it. Backward modes next-event-estimate it
 inside its cone, and the disc itself is directly viewable (aim a camera at it). Runs on
-both CPU and GPU in modes A/B/C/R/P/M/S, and on the **CPU** in mode `D` (BDPT — since
-0.124.0, together with `spot`; mode `U` VCM and the GPU BDPT kernels still refuse both,
-and a mode-`D` sun scene therefore falls back to CPU BDPT with a printed notice).
+both CPU and GPU in modes A/B/C/R/P/M/S, and on the **CPU** in modes `D` (BDPT — since
+0.124.0, together with `spot`) and `U` (VCM — since 0.125.0). The GPU BDPT/VCM kernels
+still refuse both, so a mode-`D`/`U` sun scene falls back to the CPU session with a
+printed notice.
 See `scenes/_sun_check.ftsl` and `scenes/_deltalight_mix.ftsl`, and `ftrace -checksun` for the deterministic self-test
 (cone solid angle, exposure invariance, uniform-in-solid-angle cone sampling, and
 NEE/direct-view rim agreement).
