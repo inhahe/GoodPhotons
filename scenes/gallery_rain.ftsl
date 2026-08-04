@@ -14,11 +14,16 @@
 #     but each keeps a SOLID WHITE CAP. The cap is not decoration — it is the screen the
 #     dispersive caustics from the glass sphere and the diamond gyroid land on, and a
 #     wireframe would have thrown that away (a cage catches almost nothing).
-#   * a CLOUD in the back-right, shaped by the actual cloud1.glb MESH rather than by an
-#     algebraic blob — `medium { bounds { object … } }` solid-voxelizes the mesh into an
-#     occupancy lattice, and `mesh { shape_only yes }` throws the 1.85 M triangles away
-#     once the bake has read them so the cloud is fog and nothing else (see FTSL 8.4/12.1);
-#   * a RAIN curtain falling out of it, carrying `phase rainbow`.
+#   * the scene's ONE cloud, in the back-right, shaped by the actual cloud1.glb MESH rather
+#     than by an algebraic blob — `medium { bounds { object … } }` solid-voxelizes the mesh
+#     into an occupancy lattice, `feather 0.13` softens that lattice's silhouette into a
+#     falloff zone the way a real cloud edge is, and `mesh { shape_only yes }` throws the
+#     1.85 M triangles away once the bake has read them so the cloud is fog and nothing else
+#     (see FTSL 8.4/12.1);
+#   * a RAIN curtain falling out of it — starting INSIDE it, not below it — carrying
+#     `phase rainbow`;
+#   * two FILL PANELS just outside the frame that exist only to be reflected: with the room
+#     gone, a polished metal's rim points at an empty black sky and renders black.
 #
 # --- Why the sun is where it is -----------------------------------------------------
 # None of this is eyeballed; scraps/bowgeom.py + scraps/bowmap.py solved for it. A bow is a
@@ -94,9 +99,9 @@
 # --- Why the xenon lamp is GONE (it used to hang from the ceiling) --------------------
 # The roofed edition kept a 15 kW short-arc lamp because back-projecting each hero piece
 # along the sun direction showed the ceiling shaft reached only gyroid, glass, klein, brass
-# and oiljack: the diamond gyroid, the dumbbell, the chrome ring, the heart and BOTH clouds
+# and oiljack: the diamond gyroid, the dumbbell, the chrome ring, the heart and the cloud
 # fell outside the slot and went black without it. Removing the roof removes that job — the
-# sun now reaches every piece and both clouds directly — and leaves the lamp hanging from a
+# sun now reaches every piece and the cloud directly — and leaves the lamp hanging from a
 # cord attached to nothing. Two further reasons not to keep it floating:
 #
 #   * LIGHT SELECTION again. Opening the scene out to a ~33 m ground plane raises R_scene
@@ -132,8 +137,11 @@ render { max_bounce 32 }
 # Two patterns over the SAME world-space field, one per slot.
 #
 # `grid_ground` is the wireframe itself: distance to the nearest integer gridline in x or z,
-# thresholded into a 3.6 cm core with a soft 10 cm shoulder so the line antialiases instead
-# of crawling. It drives `emit_map`, i.e. it METERS a green emission spectrum — the lines
+# thresholded into a 1.8 cm core with a soft 5 cm shoulder so the line antialiases instead
+# of crawling. Those are exactly half the original widths, matching the stand cages' 22 -> 11
+# mm; the SHOULDER is halved along with the core on purpose, because a thin core inside a wide
+# shoulder is not a thin line, it is a thin line wearing a fat halo. It drives `emit_map`, i.e.
+# it METERS a green emission spectrum — the lines
 # GLOW rather than being lit, which is what makes them read at all against a black sky and
 # what keeps them readable in the parts of the plane the sun never reaches.
 #
@@ -142,12 +150,14 @@ render { max_bounce 32 }
 # what hides the quad's own edge: past ~22 m the ground stops returning any light at all and
 # simply becomes the black sky, so there is no lit rectangle ending in mid-air and no
 # rectangular shadow cast by the sky panel to give the trick away. It also kills the
-# sub-pixel shimmer a 3.6 cm line would otherwise produce at 30+ m.
+# sub-pixel shimmer a centimetre-wide line would otherwise produce at 30+ m — which is why
+# the fade radii were LEFT ALONE when the lines were halved: a thinner line needs that fade
+# more, not less.
 #
 # Both fades are measured from (5, ., 3.5), the centre of the exhibit spread.
 pattern "grid_ground" {
-    expr "max(1 - smoothstep(0.018, 0.05, abs(fract(x + 0.5) - 0.5)),
-              1 - smoothstep(0.018, 0.05, abs(fract(z + 0.5) - 0.5)))
+    expr "max(1 - smoothstep(0.009, 0.025, abs(fract(x + 0.5) - 0.5)),
+              1 - smoothstep(0.009, 0.025, abs(fract(z + 0.5) - 0.5)))
           * (1 - smoothstep(13, 23, sqrt((x - 5)*(x - 5) + (z - 3.5)*(z - 3.5))))"
 }
 pattern "ground_fade" {
@@ -671,9 +681,9 @@ light sun { dir -0.1470 0.7071 0.6916   angle 0.53   spd blackbody 5800   intens
 # y=6.0. With the ceiling gone the exposed volume is much taller, so the fix here is to RAISE
 # the panel instead of shrinking it: a sun ray leaving any point (y0) in the scene reaches the
 # panel's plane after dz = 0.692/0.707 * (Y - y0) = 0.979*(Y - y0). At Y=12 the lowest exit
-# point in the whole scene is the top of the back-left cloud (y0=3.38, z0=0.36), which exits
-# at z = 8.8 — so a panel ending at z=8 clears EVERYTHING by 0.8 m while still covering the
-# entire exhibit footprint from directly above. (The old y=6 panel, un-shrunk, would have
+# point in the whole scene is the raincloud's crown at its back edge (y0=3.34, z0=0.36), which
+# exits at z = 8.8 — so a panel ending at z=8 clears EVERYTHING by 0.8 m while still covering
+# the entire exhibit footprint from directly above. (The old y=6 panel, un-shrunk, would have
 # thrown that cloud into shadow the moment the roof came off.)
 #
 # 50 kW over 280 m2 is ~180 W/m2 exitance, and at ~10 m above the pieces the view factor is
@@ -698,8 +708,8 @@ light area {
 #     16:9, so half its horizontal field is atan(tan(26) * 16/9) = 41 deg; at the panel's
 #     nearest depth (z = 3.4) the left frame edge is already at x = 5 - 3.45*tan(41) = 2.0.
 #     Re-check this if the framing ever moves.
-#   * y stops at 2.60 and z starts at 3.4 so the panel passes UNDER and IN FRONT of the
-#     back-left cloud (x[0.6,3.5] y[2.25,3.38] z[0.7,3.2]) instead of flooding it.
+#   * y stops at 2.60, below every cloud in the scene, so a panel whose whole purpose is to
+#     be seen in a metal cannot instead show up as a bright wash on the underside of fog.
 #   * it cannot eclipse the sun the way an early sky panel did. The sun is nearly overhead
 #     and behind (dir +y +z), so a shadow ray leaving any visible point toward it crosses
 #     the x = 1.5 plane at y > 4.8 — always above the panel's top edge.
@@ -741,21 +751,18 @@ light area {
 #     open it becomes a 10 x 3.4 x 7 m brick of fog sitting in mid-air with hard edges;
 #   * an unbounded version instead is worse — it would veil the black sky, and a dark sky is
 #     the backdrop the bow is read against.
-# So the only media left are the two clouds and the rain, all three genuinely bounded objects.
+# So the only media left are the rain cloud and the rain falling out of it.
 #
-# (1) A puffy CLOUD in the BACK-LEFT (low x, low z, high y) — it used to hug the ceiling and
-# now simply floats:
-# a BOUNDED, HETEROGENEOUS medium whose density is a hand-built isosurface field — three
-# overlapping spherical lobes modulated by value noise for wispy edges. Forward (A/B/C),
-# BDPT (D) and the photon-map camera (M) all image a bounded medium on the camera side.
-medium {
-    sigma_t 2.6   albedo 0.9   g 0.45
-    bounds { min 0.6 2.25 0.7   max 3.5 3.38 3.2 }
-    density "clamp( (0.55 + 0.6*noise(1.7*x,1.7*y,1.7*z)) * max(max( 1 - sqrt((x-1.8)^2+(y-3.00)^2+(z-1.6)^2)/0.90, 1 - sqrt((x-2.6)^2+(y-3.05)^2+(z-2.3)^2)/0.70), 1 - sqrt((x-1.5)^2+(y-2.85)^2+(z-2.4)^2)/0.60) - 0.1, 0, 1)"
-    density_max 1.2
-}
-
-# (2) The RAIN CLOUD in the BACK-RIGHT, shaped by a real mesh instead of by an algebraic
+# THERE USED TO BE A SECOND CLOUD, in the back-left (a bounded box at x[0.6,3.5] y[2.25,3.38]
+# z[0.7,3.2] whose density was three overlapping spherical lobes times value noise). It was
+# there to demonstrate the ALGEBRAIC way of building a cloud alongside the mesh-voxelized one,
+# and side by side the comparison was not flattering: an algebraic blob has no silhouette at
+# all, it only fades out where its lobe function goes negative, so at this framing — clipped
+# by the left edge of frame and barely 4 m from the camera — it read as a formless grey smear
+# rather than as a cloud. Deleted. The technique is still exercised elsewhere in scenes/; this
+# scene's job is the bow, and one cloud that looks like a cloud beats two that do not.
+#
+# (1) The RAIN CLOUD in the BACK-RIGHT, shaped by a real mesh instead of by an algebraic
 # blob. `bounds { object "raincloud" }` solid-voxelizes cloud1.glb into an occupancy lattice
 # by signed winding (so its two separate lobes come out as a UNION, not as parity holes) and
 # the medium is carved to it; `shape_only yes` then drops all 1.85 M triangles before the BVH
@@ -763,8 +770,8 @@ medium {
 # the fog, no traversal cost. See FTSL.md 8.4 and 12.1.
 #
 # Native cloud1.glb is 1.897 x 1.172 x 1.777 about the origin. Scaled to 2.75 x 1.03 x 2.49
-# (flattened, as a raining cloud is) and yawed -20 deg so it does not read as a mirror of the
-# back-left blob, it lands in x[6.28,9.72] y[2.30,3.34] z[0.36,3.64]. In the roofed edition
+# (flattened, as a raining cloud is) and yawed -20 deg so its own two lobes do not sit square
+# to the camera, it lands in x[6.28,9.72] y[2.30,3.34] z[0.36,3.64]. In the roofed edition
 # it was tucked under the solid half of the roof so it would stay dark behind the bow and be
 # modelled by the xenon lamp; now it takes full sun from above, which lights its crown and
 # leaves its underside — the side facing the camera and the rain — dark, which is both the
@@ -794,7 +801,7 @@ medium {
     density_max 1.15
 }
 
-# (3) The RAIN falling out of it. This is the only medium in the scene with a wavelength-
+# (2) The RAIN falling out of it. This is the only medium in the scene with a wavelength-
 # dependent phase function: `phase rainbow` swaps the smooth HG lobe for the tabulated Airy
 # water-droplet phase, which is what actually produces the 42 deg primary, the 51 deg
 # secondary and Alexander's dark band between them. 300 um with `supernumerary off` is the
@@ -843,7 +850,7 @@ medium {
 #
 # The still camera is wrapped in prefer{}/else{} so the render MODE resolves itself.
 # Mode D matters MORE in this edition than in the base scene, and the margin is thinner:
-# D is the only mode that renders bounded heterogeneous media (the two clouds and the rain)
+# D is the only mode that renders bounded heterogeneous media (the cloud and the rain)
 # AND shades a directly-seen dielectric (most of this room), so the else-branch is a real
 # downgrade rather than a slower equivalent — in mode B every piece of glass and the chrome
 # ring go black. That is why the sun spent this scene's first few versions as a distant
