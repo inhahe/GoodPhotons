@@ -341,9 +341,25 @@ quad { origin -18 0 -19   u 0 0 45   v 46 0 0   material gridground }
 # found two base-slab intersections that predated the wireframe rework — see the notes on
 # stand_glass and stand_brass, both now moved.)
 #
-# Every cap's y-position, thickness and `round` are UNCHANGED from the stone version, so the
-# settled poses are still valid; the two stands that MOVED (glass, brass) took their hero
-# piece with them by the same offset, so nothing needs re-settling either.
+# CAP THICKNESS = THAT STAND'S OWN BASE SLAB (0.18–0.24 m), not the 0.03 m the stone version
+# used. At 3 cm a cap read as a sheet of paper laid over a wire frame while the slab under the
+# same stand was eight times thicker — the two ends of one object disagreeing about what it is
+# made of. Matching each cap to its own slab makes the stand read as one piece of furniture,
+# and it is per-stand rather than one global number precisely so each stand stays internally
+# consistent (the gyroid plinth is chunky at 0.24, the orb's light pedestal 0.18).
+#
+# THE EXTRA THICKNESS IS ADDED DOWNWARD, i.e. every cap's TOP FACE y is unchanged. That is
+# not cosmetic bookkeeping: the hero pieces were dropped onto these caps by
+# `scraps/settle_scene.py` and their rest poses are recorded as literal coordinates, so
+# moving a top face by even a centimetre would leave a piece floating or sunk. Only the
+# bottom face moved, and the bottom face touches nothing. (One consequence to know: on the
+# gyroid plinth, whose middle cage tier is only 0.28 m tall, a 0.24 m cap now covers all but
+# ~7 cm of it, so that stand reads as two slabs with a wire gap between them rather than
+# three tiers. Deliberate — it is the centrepiece and mostly hidden behind the gold ball.)
+#
+# Cap `round` and the two stands that MOVED (glass, brass) are unchanged from the stone
+# version; those took their hero piece with them by the same offset, so nothing needs
+# re-settling there either.
 #
 # ---------------------------------------------------------------------------------------
 # THE SPREAD.  Every exhibit — its cage, its cap, its hero piece and any mount — is wrapped
@@ -405,7 +421,7 @@ isosurface "stand_gyroid_cap" { material capwhite
     # straight through the glass and diamond stands' COLUMNS (which reach z=3.71 and 3.72,
     # and span y=0.18..0.87 and 0.19..0.81 — both straddling the cap's own y=0.52..0.55).
     # 2.1 pulls the near edge back to 3.75 and clears both, for 9% of the catching area.
-    box { center 5.0 0.535 4.8  size 2.3 0.03 2.1  round 0.01 } }
+    box { center 5.0 0.43 4.8  size 2.3 0.24 2.1  round 0.01 } }
 }
 
 group { translate 1.00 0 0.45          # --- exhibit: GLASS ORB ---
@@ -439,7 +455,7 @@ isosurface "stand_glass_cap" { material capwhite
     # (y=1.70) to this cap (y=0.90) the focal axis walks +0.17 m in x and -0.78 m in z,
     # putting the disc at (6.87, 2.72). A cap centred under the column would have missed it
     # by half a metre; even this one only just contains it (near edge z=2.20).
-    box { center 6.7 0.885 3.05  size 1.1 0.03 1.7  round 0.02 } }
+    box { center 6.7 0.81 3.05  size 1.1 0.18 1.7  round 0.02 } }
 }
 
 group { translate -0.90 0 0.55         # --- exhibit: CRYSTAL GYROID ---
@@ -468,7 +484,7 @@ isosurface "stand_diamond_cap" { material capwhite
     # inside, and the outer filigree the solid network throws has room to fall on white
     # rather than off the edge into the floor cage. In world coordinates (this exhibit is
     # displaced -0.90, +0.55 by the spread) that is x 1.90..3.60, z 2.60..4.40.
-    box { center 3.65 0.825 2.95  size 1.7 0.05 1.8  round 0.02 } }
+    box { center 3.65 0.75 2.95  size 1.7 0.20 1.8  round 0.02 } }
 }
 
 group { translate 0.55 0 -0.05         # --- exhibit: KLEIN BOTTLE ---
@@ -499,7 +515,7 @@ isosurface "stand_klein_cap" { material capwhite
     # the near edge. 1.2 x 1.30 at (5.95, 2.50) = x 5.35..6.55, z 1.85..3.15; in world terms
     # (spread +0.55, -0.05) x 5.90..7.10, z 1.80..3.10 -- which is why it stops there: the
     # brass cap ends at z=1.73 and the orb's cantilever starts at x=7.15.
-    box { center 5.95 0.985 2.50  size 1.2 0.03 1.30  round 0.02 } }
+    box { center 5.95 0.89 2.50  size 1.2 0.22 1.30  round 0.02 } }
 }
 
 group { translate -0.30 0 0.00         # --- exhibit: BRASS DUMBBELL ---
@@ -520,7 +536,7 @@ isosurface "stand_dumbbell" {   # cap top y=0.88
     }
 }
 isosurface "stand_dumbbell_cap" { material capwhite
-    box { center 4.5 0.865 2.7  size 0.88 0.03 0.88  round 0.02 } }
+    box { center 4.5 0.77 2.7  size 0.88 0.22 0.88  round 0.02 } }
 }
 
 group { translate -0.90 0 -0.45        # --- exhibit: CHROME RING ---
@@ -541,7 +557,7 @@ isosurface "stand_chrome" {   # cap top y=0.90
     }
 }
 isosurface "stand_chrome_cap" { material capwhite
-    box { center 3.5 0.885 2.0  size 0.88 0.03 0.88  round 0.02 } }
+    box { center 3.5 0.80 2.0  size 0.88 0.20 0.88  round 0.02 } }
 }
 
 group { translate -0.25 0 -0.50        # --- exhibit: MORPHO HEART ---
@@ -562,7 +578,7 @@ isosurface "stand_heart" {   # cap top y=1.00
     }
 }
 isosurface "stand_heart_cap" { material capwhite
-    box { center 4.6 0.985 1.9  size 0.86 0.03 0.86  round 0.02 } }
+    box { center 4.6 0.89 1.9  size 0.86 0.22 0.86  round 0.02 } }
 }
 
 group { translate 0.60 0 -0.54         # --- exhibit: BRASS CLUSTER ---
@@ -586,7 +602,7 @@ isosurface "stand_brass" {   # cap top y=0.95
     }
 }
 isosurface "stand_brass_cap" { material capwhite
-    box { center 6.0 0.935 1.84  size 0.86 0.03 0.86  round 0.02 } }
+    box { center 6.0 0.83 1.84  size 0.86 0.24 0.86  round 0.02 } }
 }
 
 group { translate 0.20 0 -0.75         # --- exhibit: OILSLICK JACK ---
@@ -607,7 +623,7 @@ isosurface "stand_oil" {   # cap top y=0.92
     }
 }
 isosurface "stand_oil_cap" { material capwhite
-    box { center 5.3 0.905 1.5  size 0.82 0.03 0.82  round 0.02 } }
+    box { center 5.3 0.82 1.5  size 0.82 0.20 0.82  round 0.02 } }
 }
 
 # --- exhibit: CRYSTAL AXICON (the tenth stand, and the only NEW one) -------------------
@@ -665,7 +681,7 @@ isosurface "stand_axicon_cap" { material capwhite
     # spans x 1.80..3.40 and z 4.78..5.88, which contains all of it with ~0.05 m to spare.
     # It is WIDE and SHALLOW for the same reason the caustic is: the two bright cusps sit
     # left and right of the piece, not fore and aft.
-    box { center 2.6 0.885 5.33  size 1.6 0.03 1.1  round 0.02 } }
+    box { center 2.6 0.80 5.33  size 1.6 0.20 1.1  round 0.02 } }
 
 # ==============================  HERO PIECES  =================================
 # Each piece is wrapped in the SAME `group { translate }` as its stand — see THE SPREAD

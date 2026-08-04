@@ -1567,9 +1567,22 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       *within* an exhibit (cap over column, pin against sphere, settled rest pose) stays
       literally true as authored. Only clearances quoted *between* exhibits go stale, and
       every one of those gaps grew, so they read conservative rather than wrong.
+    - **Each cap is as thick as its own stand's base slab (0.18–0.24 m), and the thickness was
+      added DOWNWARD.** The stone-era caps were 3 cm — a sheet of paper laid over a wire frame,
+      with a slab eight times thicker at the bottom of the same stand, so the two ends of one
+      object disagreed about what it was made of. Matching each cap to its own slab (rather
+      than picking one global number) keeps each stand internally consistent. It has to grow
+      *downward* because the hero pieces were dropped onto these caps by `settle_scene.py` and
+      their rest poses are literal coordinates: moving a top face by a centimetre leaves a
+      piece floating or sunk, whereas the bottom face touches nothing. Side effect worth
+      knowing: the gyroid plinth's middle cage tier is only 0.28 m tall, so a 0.24 m cap covers
+      all but ~7 cm of it and that stand now reads as two slabs with a wire gap rather than
+      three tiers.
     - **Cap-vs-cap clearance is not enough; caps must be checked against neighbouring
-      COLUMNS.** Two caps each occupy one thin y slab, so they may overlap in plan freely. A
-      column spans a whole y range, so plan overlap *is* intersection. `scraps/_standaudit.py`
+      COLUMNS.** A cap used to occupy one thin y slab, so caps could overlap in plan freely;
+      now that they are 0.18–0.24 m deep that is no longer automatic, which is another reason
+      the audit is not optional. A column spans a whole y range, so plan overlap *is*
+      intersection. `scraps/_standaudit.py`
       brace-parses every cage's outer box and every cap box and checks all 39 colliders across
       the 11 stands in 3-D; run it after any stand edit (`-v` also lists every cap's world
       footprint, which is what you need in front of you before siting a new exhibit — the
