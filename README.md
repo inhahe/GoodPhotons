@@ -2357,8 +2357,17 @@ simple *per-object* fog like **the whole inside of a glass sphere** (author the 
 center/radius as the sphere). Or shape the fog to a **named object** with
 `bounds { object "<name>" }`: a named `sphere` gives its exact analytic bound, a named
 `isosurface` fills the field's interior (the fog takes the metaball/SDF silhouette
-exactly, carved per-point during tracking), and a named `mesh` uses the mesh's world
-AABB (a box approximation; true mesh containment is deferred). An *open* fog sphere is directly viewable in every mode.
+exactly, carved per-point during tracking), and a named `mesh` gives **true containment**
+of the imported triangle mesh — the mesh is solid-voxelized at load into an occupancy
+lattice and the fog fills its actual interior, so `mesh { file "cloud1.glb" }` shapes the
+fog like a cloud rather than filling a box around it. `voxels <n>` (default 160) sets the
+bake resolution on the longest axis; the fill uses generalized winding rather than parity,
+so a model made of several closed bodies (or with self-intersecting shells) comes out as
+their union instead of hollowing where they overlap, and 1.85 M triangles bake in about a
+second. The lattice is the same dense volume format an imported `.nvdb` uses, so mesh
+bounds run on the **GPU** too. Pair it with `mesh { … shape_only yes }`, which loads a mesh
+purely as a shape and strips its triangles from the scene once the bound is baked, so the
+shell defining the fog isn't also drawn around it. An *open* fog sphere is directly viewable in every mode.
 Fog (and any diffuse surface) seen through a **glass sphere** *is* imaged directly by the
 pinhole splat `B`, via the **analytic specular connection**: for each glowing haze in-scatter
 (or Lambertian surface) vertex the renderer solves the refracted eye ray that reaches the

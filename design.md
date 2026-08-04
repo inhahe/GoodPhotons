@@ -1145,6 +1145,32 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   sampler (the trilinear stencil is clamped before lookup). The host keeps the dense lattice.
   A multi-grid `.vdb` selects a grid **by name** (`loadVdbGrid(..., wantName)`; the OpenVDB reader
   seeks each descriptor to the previous grid's `endPos`, since descriptors interleave with bodies).
+- **`meshvoxel.h` — mesh containment for fog bounds.** `medium { bounds { object "<mesh>" } }`
+  used to degrade to the mesh's AABB; `meshvox::voxelizeSolid` now **solid-voxelizes** the
+  named mesh into an occupancy `VdbGrid` (`MediumBound::Mesh`, `Medium::boundGrid`,
+  `Medium::insideMesh`). Deliberately routed through `VdbGrid` rather than a bespoke
+  structure: that is already the dense-volume vehicle, already sampled by identical CPU/GPU
+  code and already uploaded as a sparse brick lattice, so the GPU path, majorants and
+  delta/ratio tracking all worked with **no new plumbing**. Note the distinction from
+  `Medium::vdb`, which *replaces* the density field — `boundGrid` only decides membership,
+  so an authored `density` formula still multiplies on top and shapes fog *within* the mesh
+  silhouette (the same semantics an isosurface bound has). Fill is by **signed-crossing
+  (generalized winding)** x-scanlines, not parity, so multi-body / self-intersecting imports
+  come out as a union rather than hollowing in the overlap; triangles are scattered into the
+  rows they cover, giving O(tris + covered rows).
+  - Two load-order hazards this exposed, both fixed and worth knowing: **`Tri::gn` is empty
+    during the load** (`Tri::finalize()` runs in `Scene::build()`, after the loader's
+    deferred medium sweep), so anything running inside the loader must derive geometric
+    facing from the vertices — the voxelizer uses `det = cross(v1-v0, v2-v0).x`. And
+    majorant estimation must use `Medium::densityFieldAt` (the field with no membership
+    carve) rather than `densityAt`, or a coarse probe of a thin shape majorises to ~0 and
+    the medium silently vanishes.
+  - **`mesh { shape_only yes }`** is the companion: the triangles are loaded for the bake and
+    then removed from `Scene::tris` by `Builder::stripShapeOnlyMeshes` — run between the
+    deferred medium sweep and `Scene::build()`, so they never reach the BVH. Renumbering is
+    safe because `Scene::tris` is indexed only via `MeshGroup::triStart/triCount` (fixed up
+    there); mesh area lights *copy* their triangles into `Emitter::meshTris`, and the key is
+    refused on an emissive material anyway.
 - **Volumetric blackbody emission ("fire")** — a `Medium` may carry a second `temperature` grid
   (`Medium::temperature`/`tempPeak`/`emitKelvin`/`emissionScale`; `emissive()`/`temperatureAt()`/
   `emissionAt()` in `scene.h`), turning its hot voxels into a self-illuminating isotropic volume

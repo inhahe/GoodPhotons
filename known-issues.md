@@ -4844,7 +4844,8 @@ bound; a named `isosurface` → **field membership** (a new `MediumBound::Implic
 fills the field interior via `fieldEval < 0` — inside-sign auto-detected from the field's
 value at its AABB center — carved per-point inside delta/ratio tracking over the field's
 AABB, reusing the same field VM as isosurface rendering); a named `mesh` → the mesh's world
-**AABB** (box approximation; true mesh containment deferred). Media are resolved in a
+**AABB** (box approximation; true mesh containment deferred — **since closed**, see
+"True mesh containment for fog bounds" below). Media are resolved in a
 deferred second sweep so the object may be authored anywhere. Implemented in `scene.h`
 (`Medium::boundField`/`boundFieldExpr`/`boundInsideNeg` + `insideField`/`densityAt`/
 `heterogeneous`), `ftsl.h` (name registries populated by `addSphere`/`addIsosurface`/
@@ -4856,6 +4857,55 @@ GPU-vs-CPU energy identical (absorbed 0.9978) and indirect room lighting agreein
 (large) dim-caustic noise floor. *(Same fog-inside-glass direct-view limitation as above
 applies — an implicit-shaped fog is enclosed by its own isosurface, so its direct camera view
 is a refracted SDS path; it lights the room correctly.)*
+
+**True mesh containment for fog bounds — DONE 2026-08-03.** Closes the gap left above.
+`bounds { object "<mesh>" }` no longer degrades to the mesh's AABB: the mesh is
+**solid-voxelized** at load into an occupancy lattice (`src/meshvoxel.h`, new
+`MediumBound::Mesh` + `Medium::boundGrid`) and the fog fills its true interior. Method is
+**signed-crossing (generalized winding)** x-scanlines rather than parity, because the
+meshes people import are routinely several closed bodies or self-intersecting shells
+(`cloud1.glb` is two) and parity double-toggles those into hollows; winding renders their
+union. Triangles are visited once and scattered into the rows they cover, so cost is
+O(tris + covered rows): 1.85 M triangles bake in ~1 s. The lattice is a plain `VdbGrid`,
+so it rides the existing sparse-brick device upload and `dVdbSample` — **GPU support came
+free**, no new plumbing. `voxels <n>` (default 160) sets resolution on the longest axis.
+
+Two bugs found and fixed while validating, both worth remembering:
+- **`Tri::gn` is not populated during the load.** `Tri::finalize()` runs in
+  `Scene::build()`, *after* the loader's deferred medium sweep, so the voxelizer read
+  `gn == (0,0,0)` for every triangle and gave every crossing the same winding sign. The
+  winding then never returned to zero and each scanline filled solid from its first
+  crossing to its last — i.e. the mesh's **x-convex hull**. Single convex shapes hid it
+  perfectly (hull == shape); only a multi-body test exposed it. Fixed by deriving the
+  facing from `det` (= `cross(v1-v0, v2-v0).x`), the same quantity, computed from the
+  vertices in hand and correct at any load stage. *Anything else running inside the
+  loader must not read `Tri::gn` either.*
+- Majorant estimation sampled `Medium::densityAt`, which returns 0 outside a membership
+  bound, so a coarse 25³ probe of a thin or low-volume-fraction mesh/implicit shape could
+  majorise to ~0 and silently delete the medium. Split out `Medium::densityFieldAt` (the
+  field with no membership carve) and estimate from that — membership only multiplies by
+  0 or 1, so the uncarved peak is always a valid conservative majorant.
+
+Validated against exact lattice-point counts by the permanent regression check
+**`tools/check_meshvox.py`** (`python tools/check_meshvox.py [--res 200]`), which builds
+each mesh, reproduces meshvox's lattice in numpy and compares: sphere 50.0 % vs 50.1 %
+expected, two **overlapping** spheres 54.9 % vs 55.0 %, two **disjoint** spheres 38.3 %
+vs 38.3 % — all within the meshes' own inscribed-faceting error. The *disjoint* case is
+the one that catches the convex-hull regression above; a convex-only test suite cannot.
+The one deviation is a surface lying exactly on a
+lattice-centre plane (axis-aligned box face, 94.2 % vs 95.6 %), where membership is a
+floating-point coin flip; it errs consistently toward **erosion**, the safe direction for
+a fog bound, and is sub-voxel against a boundary the trilinear ramp softens anyway.
+Rendered end-to-end on GPU (mode D, `scraps/_meshbound_test.ftsl` → `png/meshbound_cloud.png`).
+
+**`mesh { shape_only yes }` — DONE 2026-08-03.** The other half of the above: a mesh whose
+job is to *define* a volume should not also be drawn. Its triangles are loaded, handed to
+the medium bake, then stripped from `Scene::tris` before the BVH is built, so they neither
+render nor cost anything. Safe to renumber because `Scene::tris` is indexed only through
+`MeshGroup::triStart/triCount` (fixed up in `stripShapeOnlyMeshes`) — mesh area lights
+*copy* their triangles into `Emitter::meshTris`, and `shape_only` is refused on an emissive
+material regardless. Refused without a `"name"`. `-check-watertight` reports such a mesh as
+skipped rather than as a vacuously airtight 0-triangle object.
 
 **Remaining gap (BDPT fully closed):**
 - **BDPT (mode D) — ALL media DONE 2026-07-12 (CPU + GPU), incl. heterogeneous.** `bdpt.h`

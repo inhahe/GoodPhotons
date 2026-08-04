@@ -4498,9 +4498,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // the forward layer of the mode-P composite) AND the backward tracer (mode R, and
     // the mode-P camera-side layer) when the scene is within the backward-GPU scope
     // (renderBackwardCuda / cudaBackwardSupported — Lambertian/textured/specular,
-    // point-spot lights, participating media, fluorescence, and a constant env light;
-    // image-based env, collimated beams and GRIN/rainbow media still fall back to the
-    // CPU backward tracer); otherwise the backward layer falls back to the CPU. Mode V keeps
+    // point-spot lights, participating media (incl. spectral-rainbow phase, M10),
+    // fluorescence, GRIN marching (M11), and BOTH a constant and an image-based env
+    // light (M1); only collimated beams and stray env-shape emitters still fall back to
+    // the CPU backward tracer); otherwise the backward layer falls back to the CPU. Mode V keeps
     // its backward reference on the CPU by design. Fisheye/panoramic lenses run on the
     // GPU too (the device camera's project()/pixelSolidAngle() port the analytic
     // projection remap) for the pinhole-splat modes (B/V/P).
@@ -6502,6 +6503,14 @@ static int run(int argc, char** argv) {
             if (glass)         std::printf("           ! this object is DIELECTRIC (glass) — refraction WILL be wrong\n");
         };
         for (const auto& g : scene.meshGroups) {
+            // A `shape_only` mesh's triangles were consumed as a shape (a medium's
+            // containment bake) and removed from the scene, so there is nothing left to
+            // check. Say so rather than reporting a vacuously airtight 0-triangle object.
+            if (g.shapeOnly) {
+                std::printf("  [skip] mesh        \"%s\"  shape_only — geometry consumed by a "
+                            "medium bound; drop `shape_only` to check it\n", g.name.c_str());
+                continue;
+            }
             watertight::Report r = (g.blasId >= 0 && g.blasId < (int)scene.blasList.size())
                 ? watertight::checkTris(scene.blasList[g.blasId].tris.data(), scene.blasList[g.blasId].tris.size())
                 : watertight::checkTris(scene.tris.data() + g.triStart, g.triCount);

@@ -575,7 +575,8 @@ struct DMedium {
     double           tempPeak;        // raw temperature-grid peak (for peak-normalisation)
     double           emissionScale;   // brightness multiplier on the Planck term
     int              bounded;         // 1 => clip to the bound region
-    int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field
+    int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field,
+                                      // 3 => MESH containment (boundGrid occupancy >= 0.5)
     DVec3            bmin, bmax;
     DVec3            bcenter;
     double           bradius;
@@ -586,6 +587,12 @@ struct DMedium {
     int               boundFieldN;    // node count
     const PatNode*    boundFieldExpr; // expr pool backing DF_EXPR leaves (or null)
     int               boundInsideNeg; // 1 => inside when field < 0, else inside when > 0
+    // --- Optional MESH containment lattice (boundShape==3). Occupancy baked from the
+    // named mesh's triangles on the host (meshvoxel.h) and uploaded as a sparse brick
+    // grid like any other volume; inside == trilinear sample >= 0.5. Separate from
+    // densGrid because it decides MEMBERSHIP only — a `density` field still multiplies
+    // on top, shaping the fog within the mesh silhouette. ---
+    DVdbGrid          boundGrid;
     // --- Optional gradient-index (GRIN) refractive field n(x,y,z) (mirrors host Medium) ---
     // When `iorN > 0` this region bends rays along the Eikonal ray equation; the forward
     // megakernel/wavefront march through it (dGrinMarch) before each bounce's closestHit.
@@ -1533,6 +1540,9 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p, const D
         bool inside = m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
         if (!inside) return 0.0;
     }
+    if (m.boundShape == 3 && m.boundGrid.brickData) {   // mesh-containment carve-out
+        if (dVdbSample(m.boundGrid, p) < 0.5) return 0.0;
+    }
     // Imported .nvdb/.vdb volume: trilinearly sample the uploaded sparse brick grid.
     // Takes precedence over the pattern-VM density.
     if (m.densGrid.brickData) return dVdbSample(m.densGrid, p);
@@ -1631,6 +1641,8 @@ __device__ static bool dMedInside(const DMedium& m, const DVec3& p, const DPatEn
         double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr, env);
         return m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
     }
+    if (m.boundShape == 3 && m.boundGrid.brickData)   // mesh containment
+        return dVdbSample(m.boundGrid, p) >= 0.5;
     return p.x >= m.bmin.x && p.x <= m.bmax.x && p.y >= m.bmin.y &&
            p.y <= m.bmax.y && p.z >= m.bmin.z && p.z <= m.bmax.z;
 }
@@ -11206,7 +11218,14 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.emissionScale = m.emissionScale;
             dm.bounded  = m.bounded ? 1 : 0;
             dm.boundShape = (m.boundShape == MediumBound::Sphere)   ? 1
-                          : (m.boundShape == MediumBound::Implicit) ? 2 : 0;
+                          : (m.boundShape == MediumBound::Implicit) ? 2
+                          : (m.boundShape == MediumBound::Mesh)     ? 3 : 0;
+            // Mesh containment: upload the baked occupancy lattice the same way as any
+            // other volume, so CPU and GPU membership are the same trilinear test.
+            if (m.boundShape == MediumBound::Mesh && m.boundGrid && !m.boundGrid->empty())
+                uploadVdbGrid(*m.boundGrid, dm.boundGrid, "mesh bound");
+            else
+                clearVdbGrid(dm.boundGrid);
             dm.bmin = {m.bmin.x, m.bmin.y, m.bmin.z};
             dm.bmax = {m.bmax.x, m.bmax.y, m.bmax.z};
             dm.bcenter = {m.bcenter.x, m.bcenter.y, m.bcenter.z};
