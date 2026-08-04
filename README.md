@@ -3069,6 +3069,41 @@ ftrace -topng out.png.ftbuf out_bright.png -ev 3
 warns and is ignored, since that file is already 8-bit sRGB. *(Before 0.102.1 `-ev` was
 silently dropped on this path — `-topng` runs before the main argument loop.)*
 
+### Denoising (`-denoise`)
+
+`-denoise` runs an edge-aware à-trous (SVGF-style) filter on the linear image just before
+tone-mapping. Because it sits in the one function that feeds both the file and the live
+window, the preview shows exactly what you'll get.
+
+**It filters chroma only, and leaves luma bit-identical.** That is the point rather than a
+timid default. A spectral path carries a *single* wavelength, so wherever the
+hero-wavelength bundle can't be used — participating media, or any dispersive refraction —
+every sample deposits a fully saturated colour, and the pixel only turns white once enough
+different wavelengths have averaged in. The variance is therefore concentrated in *chroma*,
+while luma is already converging at the usual 1/spp. Since the eye resolves chroma detail
+at roughly a third the acuity of luma (the reason every video codec subsamples it), chroma
+can be blurred hard at no visible cost. Turning it on cannot lose you an edge, a wire, a
+caustic rim or a speck of geometric detail, so there is no tradeoff to weigh.
+
+Measured on `gallery_rain` at 120 spp against an 8000 spp reference of the same frame:
+
+| | chroma RMSE | PSNR | cost |
+|---|---|---|---|
+| no denoise | 23.8 | 20.4 dB | — |
+| `-denoise` | **13.8** (58 %) | **22.2 dB** (+1.8) | ~1 % of render time |
+
+Use it on anything with dispersive caustics or fog. `ftrace -checkdenoise` runs the
+filter's self-test (exact energy conservation, constant-image fixed point, bit-identical
+luma).
+
+| flag | meaning |
+|---|---|
+| `-denoise [amount]` | enable; `amount` scales the chroma tolerance (default 1) |
+| `-denoise-chroma <x>` | chroma edge-stop tolerance in local sigma (default 2 — a flat knob, barely sensitive across a factor of 8) |
+| `-denoise-levels <n>` | à-trous levels, support 2ⁿ wide (default 3). Swept against the reference, the optimum is a plateau at 2–3, *not* SVGF's 5: with no luma term holding the edges a very wide chroma support bleeds gold into white and caustic into floor, and by 7 levels it is a net loss |
+| `-denoise-luma <x>` | **also** filter luma (default 0 = off). Measured, this makes the image *worse* — −2.4 dB at `0.45`, because the filter cannot tell a wire or a caustic rim from a noise spike. Available for stills you want *smoothed*, not *truer* |
+| `-fireflies <k>` | clamp isolated outliers to `k`× the 2nd-brightest neighbour, hue preserved. Deliberately not energy-preserving. Implies `-denoise`; try 2–4 |
+
 A `.ftsl` is a *scene*, not an image — render it with `-in scene.ftsl -o out.png`.
 Three drag-and-drop Windows helpers in the repo root wrap this: **`ppm_to_png.bat`**,
 **`ftbuf_to_png.bat`** (both call `-topng`), and **`ftsl_to_png.bat`** (renders the

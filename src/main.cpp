@@ -154,6 +154,7 @@
 #include "curvedrive.h"         // -anim: loom CurveDrive JSON sidecar (E2 channel a) read/write
 #include "animlive.h"           // -anim -loom: the live editor<->loom value channel (E2 channel b)
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
+#include "denoise.h"            // -denoise: luma/chroma a-trous filter for MC speckle
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
                                // header also pulls it in, but CPU-only builds need it too
@@ -805,6 +806,159 @@ static int checkFog() {
     std::printf("[checkfog] HG mean cosine @g=%.2f: measured=%.4f  (%s)\n", g, mc, passB ? "ok" : "BAD");
     std::printf("[checkfog] HG sphere integral: %.5f (want 1)  (%s)\n", integ, passC ? "ok" : "BAD");
     std::printf("[checkfog] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
+// Deterministic denoiser self-test (src/denoise.h). The filter is a post-pass on the
+// LINEAR image, so it is held to two properties that a renderer's numbers depend on and
+// that a purely visual check would never catch. Both were violated by earlier drafts:
+//
+//   (a) ENERGY. Total luminance out == total luminance in, exactly. The first draft used
+//       a plain bilateral gather, which is row-normalised but not column-normalised, and
+//       on the heavy-tailed distribution MC noise actually has that regressed every pixel
+//       toward the local MODE: it quietly ate 30% of a 120 spp gallery_rain frame.
+//   (b) FIXED POINT. A constant image must come back unchanged. The scatter that fixes
+//       (a) divides by the neighbour's weight sum, so any pixel whose taps were dropped
+//       at the image border hands out more than it holds and brightens the interior
+//       beside it — a flat grey test image came back with a bright frame around it.
+//
+// The two pull against each other (exact energy wants a column-stochastic operator, a
+// fixed point wants a row-stochastic one), and they are only satisfiable together
+// because the weights are symmetric, which makes the operator doubly stochastic. That
+// symmetry is fragile — whole-sample edge mirroring silently broke it and leaked 0.06% —
+// so it is worth a standing test rather than a one-off measurement.
+static int checkDenoise() {
+    bool pass = true;
+
+    // (a) The luma/chroma split must be exactly reversible. Chroma is stored as a ratio
+    // to luma, so this is checked across ~6 decades rather than at one exposure.
+    {
+        Pcg32 rng; rng.seed(0xDE0121Eu, 0x9E37u);
+        double worst = 0.0;
+        for (int t = 0; t < 200000; ++t) {
+            double s = std::pow(10.0, rng.uniform() * 6.0 - 3.0);
+            Vec3 c(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+            Vec3 r = denoise::fromYcc(denoise::toYcc(c));
+            worst = std::max({worst, std::fabs(r.x - c.x) / s, std::fabs(r.y - c.y) / s,
+                              std::fabs(r.z - c.z) / s});
+        }
+        bool ok = worst < 1e-12;
+        pass = pass && ok;
+        std::printf("[checkdenoise] YCC round trip: worst rel err %.2e  (%s)\n", worst,
+                    ok ? "ok" : "BAD");
+    }
+
+    // (b) Energy conservation and grain reduction on heavy-tailed saturated speckle over
+    // a structured background — the regime that broke the gather formulation.
+    {
+        const int W = 320, H = 180;
+        Pcg32 rng; rng.seed(0xDE0121Eu, 0x1234u);
+        std::vector<Vec3> img((size_t)W * H);
+        for (int j = 0; j < H; ++j) for (int i = 0; i < W; ++i) {
+            double base = (i > W / 2) ? 0.35 : 0.02;
+            double dx = (i - 90) / 18.0, dy = (j - 60) / 18.0;
+            base += 3.0 * std::exp(-(dx * dx + dy * dy));
+            double v = base * -std::log(std::max(rng.uniform(), 1e-12)); // Exp(1), mean 1
+            double h = rng.uniform();
+            Vec3 tint = h < 1.0 / 3 ? Vec3(3.0, 0.1, 0.1)
+                      : h < 2.0 / 3 ? Vec3(0.1, 3.0, 0.1) : Vec3(0.1, 0.1, 3.0);
+            img[(size_t)j * W + i] = tint * v;
+        }
+        auto totalLuma = [](const std::vector<Vec3>& v) {
+            double s = 0.0; for (const Vec3& c : v) s += denoise::lumaOf(c); return s;
+        };
+        auto localCV = [&](const std::vector<Vec3>& v) {
+            double acc = 0.0; int n = 0;
+            for (int j = 1; j < H - 1; ++j) for (int i = 1; i < W - 1; ++i) {
+                double m = 0, m2 = 0;
+                for (int dj = -1; dj <= 1; ++dj) for (int di = -1; di <= 1; ++di) {
+                    double y = denoise::lumaOf(v[(size_t)(j + dj) * W + (i + di)]);
+                    m += y; m2 += y * y;
+                }
+                m /= 9.0; m2 = m2 / 9.0 - m * m;
+                acc += std::sqrt(std::max(m2, 0.0)) / (m + 1e-9); ++n;
+            }
+            return n ? acc / n : 0.0;
+        };
+        const double before = totalLuma(img), cv0 = localCV(img);
+
+        // Default is chroma-only, so the luma cases have to opt in explicitly. Chroma
+        // carries no luminance, so the chroma-only rows test that the split leaks none.
+        denoise::Params pDef;
+        denoise::Params pStrong; pStrong.chroma *= 2.0;
+        denoise::Params pLuma;   pLuma.luma = 0.45; pLuma.chroma = 0.0;
+        denoise::Params pBoth;   pBoth.luma = 0.45;
+        denoise::Params pLevels; pLevels.levels = 3;
+        const struct { const char* name; const denoise::Params* p; } cases[] = {
+            {"chroma only", &pDef}, {"chroma x2", &pStrong}, {"luma only", &pLuma},
+            {"luma+chroma", &pBoth}, {"3 levels", &pLevels},
+        };
+        for (const auto& c : cases) {
+            std::vector<Vec3> out = img;
+            denoise::apply(out, W, H, *c.p);
+            double pct = totalLuma(out) / before * 100.0, cv = localCV(out);
+            bool ok = std::fabs(pct - 100.0) < 0.01;
+            pass = pass && ok;
+            std::printf("[checkdenoise] energy %-11s %10.6f%% of input, grain %.4f->%.4f"
+                        "  (%s)\n", c.name, pct, cv0, cv, ok ? "ok" : "BAD");
+        }
+        // The firefly clamp removes outlier energy deliberately, so it is bounded, not exact.
+        {
+            std::vector<Vec3> out = img;
+            denoise::Params pf; pf.fireflies = 3.0;
+            denoise::apply(out, W, H, pf);
+            double pct = totalLuma(out) / before * 100.0;
+            bool ok = pct > 55.0 && pct < 100.0;
+            pass = pass && ok;
+            std::printf("[checkdenoise] energy fireflies=3 %6.2f%% (lossy by design)  (%s)\n",
+                        pct, ok ? "ok" : "BAD");
+        }
+    }
+
+    // (c) Chroma-only filtering — the default — must leave luma BIT-IDENTICAL, per pixel,
+    // not merely conserved in total. This is what the luminance-preserving gamut
+    // projection in fromYcc buys: the obvious repair for an out-of-gamut filtered chroma
+    // is to clamp the negative channel at 0, but clamping adds light, so it would break
+    // this invariant on exactly the saturated speckle the filter exists to clean up.
+    {
+        const int W = 96, H = 72;
+        Pcg32 rng; rng.seed(0xDE0121Eu, 0xC0DEu);
+        std::vector<Vec3> img((size_t)W * H);
+        for (size_t i = 0; i < img.size(); ++i) {
+            double v = -std::log(std::max(rng.uniform(), 1e-12));
+            double h = rng.uniform();
+            // Includes fully saturated primaries, which are the out-of-gamut hazard.
+            img[i] = (h < 1.0 / 3 ? Vec3(1, 0, 0) : h < 2.0 / 3 ? Vec3(0, 1, 0) : Vec3(0, 0, 1)) * v;
+        }
+        std::vector<Vec3> out = img;
+        denoise::apply(out, W, H, denoise::Params{});   // default = chroma only
+        double worst = 0.0;
+        for (size_t i = 0; i < img.size(); ++i) {
+            double a = denoise::lumaOf(img[i]), b = denoise::lumaOf(out[i]);
+            worst = std::max(worst, std::fabs(a - b) / (a + 1e-12));
+        }
+        bool ok = worst < 1e-9;
+        pass = pass && ok;
+        std::printf("[checkdenoise] chroma-only leaves luma: worst rel change %.2e  (%s)\n",
+                    worst, ok ? "ok" : "BAD");
+    }
+
+    // (d) A constant image is a fixed point, including at the borders.
+    {
+        const int W = 64, H = 64;
+        std::vector<Vec3> img((size_t)W * H, Vec3(0.3, 0.5, 0.7));
+        denoise::apply(img, W, H, denoise::Params{});
+        double worst = 0.0;
+        for (const Vec3& c : img)
+            worst = std::max({worst, std::fabs(c.x - 0.3), std::fabs(c.y - 0.5),
+                              std::fabs(c.z - 0.7)});
+        bool ok = worst < 1e-9;
+        pass = pass && ok;
+        std::printf("[checkdenoise] constant image: worst deviation %.2e  (%s)\n", worst,
+                    ok ? "ok" : "BAD");
+    }
+
+    std::printf("[checkdenoise] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
 
@@ -2643,6 +2797,12 @@ static int checkSun() {
 // and iso/shutter/exposure give exact photographic stops on top.
 constexpr double ABS_EXPOSURE_GAIN = 6.0;
 
+// -denoise: post-render speckle filter (src/denoise.h). Off unless the flag is given.
+// It runs inside filmToRgb8, which is the ONE place both the written image and the live
+// preview window get their pixels, so what the window shows stays what the file gets.
+static bool           g_denoise = false;
+static denoise::Params g_denoiseParams;
+
 // Tone-map a film into an 8-bit RGB buffer (W*H*3, row 0 = image top; +y flipped to
 // image-top to match writeImage). Shared by writeFilm (PNG/PPM output) and the live
 // preview window so both see identical pixels. Auto-exposure mirrors writeFilm:
@@ -2656,10 +2816,15 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
     std::vector<Vec3> lin((size_t)W * H);
     double norm = 1.0 / (N * cieYIntegral());
     std::vector<double> lum; lum.reserve((size_t)W * H);
-    for (size_t i = 0; i < lin.size(); ++i) {
+    for (size_t i = 0; i < lin.size(); ++i)
         lin[i] = xyzToLinearSrgb(f.xyz[i] * norm);
+    // Denoise BEFORE the auto-exposure anchor is measured, not after: the p99 anchor is
+    // an order statistic over the luminances, so leaving the fireflies in would let a
+    // handful of lucky paths set the exposure for the whole image and darken everything
+    // else to compensate. Filtering first makes the anchor describe the picture.
+    if (g_denoise) denoise::apply(lin, W, H, g_denoiseParams);
+    for (size_t i = 0; i < lin.size(); ++i)
         lum.push_back(std::max({lin[i].x, lin[i].y, lin[i].z, 0.0}));
-    }
     double eAuto;
     double exposure;
     if (absolute) {
@@ -5660,6 +5825,25 @@ static void printHelp(const char* prog) {
 "                        escaping gather ray returns, so the gather's fill is effectively\n"
 "                        min(-ambient, x) and a smaller x just darkens the whole scene\n"
 "\n"
+"Denoising (post-pass on the linear image; affects the file AND the live window):\n"
+"  -denoise [amount]     edge-aware a-trous filter for SPECTRAL speckle. CHROMA ONLY by\n"
+"                        default: luma is left bit-identical, so no detail is lost. MC\n"
+"                        colour noise is mostly chroma and the eye barely resolves chroma\n"
+"                        detail, so this removes the rainbow confetti in dispersive\n"
+"                        caustics / media (where the hero-wavelength bundle is unavailable\n"
+"                        and every path is single-lambda) while keeping every edge. Costs\n"
+"                        ~1%% of render time. amount scales the chroma tolerance, default 1\n"
+"  -denoise-chroma <x>   chroma edge-stop tolerance in local sigma (default 2). Lower it\n"
+"                        to protect real rainbow fringing; raise it to kill more speckle\n"
+"  -denoise-luma <x>     ALSO filter luma, tolerance in local sigma (default 0 = off).\n"
+"                        Measured against a converged reference this makes the image\n"
+"                        WORSE (-2.4 dB at 0.45): it cannot tell a wire or caustic rim\n"
+"                        from a noise spike. Only for stills you want smoothed, not truer\n"
+"  -denoise-levels <n>   a-trous levels, support is 2^n wide (default 3, max 8). Measured\n"
+"                        optimum is 2-3; by 7 the chroma bleed costs more than it removes\n"
+"  -fireflies <k>        clamp isolated outliers to k x the 2nd-brightest neighbour\n"
+"                        (hue preserved). Implies -denoise. Try 2-4. 0 = off (default)\n"
+"\n"
 "Output, preview & checkpointing:\n"
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
 "  -window               live OS preview window, refreshed as it converges\n"
@@ -5794,6 +5978,7 @@ static int run(int argc, char** argv) {
     double fogG = 0.0;        // Henyey-Greenstein anisotropy
     bool fogRayleigh = false; // wavelength-dependent scattering ~1/lambda^4
     bool checkFogOnly = false;
+    bool checkDenoiseOnly = false;
     double filmThickness = 300.0; // thin-film coating thickness (nm) for -scene iridescent
     double filmIor = 1.30;        // thin-film coating refractive index
     bool checkThinFilmOnly = false;
@@ -6071,6 +6256,36 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-gi-clamp") && i + 1 < argc) {
             g_giClamp = std::max(0.0, std::atof(argv[++i]));
         }
+        // -denoise [amount]: the optional amount scales BOTH tolerances, so `-denoise 2`
+        // is twice as aggressive and `-denoise 0.5` half. The argument is optional, so
+        // only consume the next token if it actually parses as a number — otherwise
+        // `-denoise -o out.png` would silently eat the output path.
+        else if (!std::strcmp(argv[i], "-denoise")) {
+            g_denoise = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                char* end = nullptr;
+                double a = std::strtod(argv[i + 1], &end);
+                // The optional multiplier scales the tolerance that is actually ON by
+                // default, which is chroma; luma stays off unless -denoise-luma asks.
+                if (end && *end == '\0' && a > 0.0) { ++i; g_denoiseParams.chroma *= a; }
+            }
+        }
+        else if (!std::strcmp(argv[i], "-denoise-chroma") && i + 1 < argc) {
+            g_denoise = true;
+            g_denoiseParams.chroma = std::max(0.0, std::atof(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-denoise-luma") && i + 1 < argc) {
+            g_denoise = true;
+            g_denoiseParams.luma = std::max(0.0, std::atof(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-denoise-levels") && i + 1 < argc) {
+            g_denoise = true;
+            g_denoiseParams.levels = std::clamp(std::atoi(argv[++i]), 1, 8);
+        }
+        else if (!std::strcmp(argv[i], "-fireflies") && i + 1 < argc) {
+            g_denoise = true;
+            g_denoiseParams.fireflies = std::max(0.0, std::atof(argv[++i]));
+        }
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         // An explicit absolute radius pins the radius: don't then adapt it out from under
         // the user (this was the documented workaround for mode M's scaling problem).
@@ -6140,6 +6355,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-fogg") && i + 1 < argc) fogG = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-fograyleigh")) fogRayleigh = true;
         else if (!std::strcmp(argv[i], "-checkfog")) checkFogOnly = true;
+        else if (!std::strcmp(argv[i], "-checkdenoise")) checkDenoiseOnly = true;
         else if (!std::strcmp(argv[i], "-filmthickness") && i + 1 < argc) filmThickness = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-filmior") && i + 1 < argc) filmIor = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkthinfilm")) checkThinFilmOnly = true;
@@ -6316,6 +6532,7 @@ static int run(int argc, char** argv) {
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
+    if (checkDenoiseOnly)  return checkDenoise();  // deterministic, no scene needed
     if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed
     if (checkMultilayerOnly) return checkMultilayer(); // deterministic, no scene needed
     if (thinFilmSwatchOnly) { thinFilmSwatch(filmIor, 1.5); return 0; } // visual diagnostic

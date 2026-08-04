@@ -7794,7 +7794,7 @@ pairs). It now uses a real brace matcher.
 
 ---
 
-### OPEN (2026-08-04): a dispersive caustic in mode `D` is single-wavelength with no variance reduction — chromatic speckle is unavoidable
+### PARTLY FIXED (2026-08-04, v0.131.0): a dispersive caustic in mode `D` is single-wavelength with no variance reduction — chromatic speckle is unavoidable
 
 Mode `D` is the only mode that renders a scene containing both participating media and a
 dispersive caustic (M and S drop the media, see above; U refuses media outright). But every
@@ -7808,7 +7808,7 @@ wavelength-sharing optimisation the renderer has is off in exactly that combinat
   bundle at the first surface.
 - **`-herosplit` — the fix for exactly that — is ignored by mode `D`.** It is implemented for
   CPU forward `A`/`B`/`C` and the `M`/`S` deposit only.
-- **There is no denoiser.** No `-denoise` flag exists.
+- ~~**There is no denoiser.** No `-denoise` flag exists.~~ — **FIXED, see below.**
 
 Net effect: the caustic converges one wavelength per path, so it arrives as saturated red/green/
 blue speckle that only brute-force sample count removes (variance goes as 1/spp, so halving the
@@ -7817,5 +7817,36 @@ speckle costs 4x the time). 1400 spp / 17 min at 1280x720 is visibly noisy in th
 Proper fix, in increasing order of work: (a) extend `-herosplit` to mode `D`'s subpath
 construction, which is where the win is largest since D is the mode media scenes are forced
 into; (b) allow `-heroc` on media scenes by carrying per-lambda transmittance through
-delta/ratio tracking instead of bailing; (c) a denoiser. Until then, budget samples accordingly
-and say so — a dispersive caustic under a cloud is the most expensive thing this renderer draws.
+delta/ratio tracking instead of bailing; (c) a denoiser.
+
+**(c) DONE 2026-08-04 (v0.131.0): `-denoise` (`src/denoise.h`).** Chroma-only edge-aware
+à-trous filter in `filmToRgb8`, so it affects the file and the live window identically and runs
+before the p99 auto-exposure anchor is measured. On `gallery_rain` at 120 spp, against an
+8000 spp reference of the same frame: chroma RMSE 23.8 → 13.8 (58 %), PSNR +1.8 dB, for ~1 % of
+render time, with luma left **bit-identical**. Still a net win at 480 spp (+0.6 dB), so it is
+safe to leave on. It attacks the *symptom* rather than the cause, so **(a) and (b) remain open**
+— a denoiser cannot recover a colour gradient the sampler never resolved, and the fringing at a
+caustic rim is exactly the chroma detail the filter has to soften.
+
+Three bugs were found and fixed while building it, each of which passed a naive visual check
+and is now pinned by `ftrace -checkdenoise`:
+
+1. **A plain bilateral gather ate 30 % of the frame's luminance.** `out_i = Σ w_ik in_k / Σ w_ik`
+   is row-stochastic but not column-stochastic, so on heavy-tailed MC noise it regresses toward
+   the local *mode*. Fixed with a symmetric (geometric-mean) tolerance so `w_ik == w_ki`, plus a
+   *scatter* for luma, `out_i = Σ w_ik (in_k / D_k)`, whose total is exactly `Σ in_k`.
+2. **A constant image was not a fixed point** (bright frame around a flat grey field): border
+   taps were being dropped, so edge rows summed to < 1 and handed out more than they held.
+   Fixed with **half**-sample edge mirroring — whole-sample mirroring has fixed points at the
+   two end samples, which double-counts, breaks the symmetry property 1 depends on, and leaked
+   0.06 %.
+3. **Averaging chroma turned speckle into coherent purple/orange blobs, and was measurably
+   *further* from the truth** (PSNR −2.4 dB) even though it looked less noisy. Chroma is stored
+   as a ratio to luma, and the mean of a ratio whose denominator is the noisy quantity is not
+   the wanted quantity: near-black pixels have enormous ratios and dominated the average. Fixed
+   by averaging numerator and denominator separately, `Σw(R−G) / ΣwY` — the luma-weighted mean
+   hue.
+
+The lesson worth keeping: **energy conservation and a flat-field test both passed while the
+filter was making the image objectively worse.** The only metric that caught it was RMSE against
+a converged reference (`scraps/_dneval.py`), which is now how any change here should be judged.

@@ -957,6 +957,30 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.
+- **`denoise.h`** — `-denoise`, an edge-aware à-trous (SVGF-style) filter for Monte-Carlo
+  speckle. It runs inside `filmToRgb8` on the **linear** image and *before* the p99
+  auto-exposure anchor is measured (so a firefly can't set the exposure); because
+  `filmToRgb8` is the single choke point for both `writeFilm` and the live window, the
+  preview shows exactly what the file gets. **It filters CHROMA ONLY and leaves luma
+  bit-identical** — a deliberate design choice, not a weak default: spectral paths carry
+  one wavelength, so wherever the hero-wavelength bundle is unavailable (participating
+  media, dispersive refraction) the variance is overwhelmingly chromatic, while luma is
+  already converging at 1/spp. Measured against an 8000 spp reference of `gallery_rain`,
+  filtering luma made the image *worse* (−2.4 dB; it cannot distinguish a wire or caustic
+  rim from a noise spike), so `-denoise-luma` exists but defaults off. Three invariants are
+  pinned by `-checkdenoise` and were each violated by a working draft: total luminance is
+  conserved **exactly** (a plain bilateral gather is row- but not column-stochastic and ate
+  30 % of the frame — fixed by a symmetric geometric-mean tolerance plus a luma *scatter*);
+  a constant image is a fixed point (needs **half**-sample edge mirroring — whole-sample
+  has fixed points at the edges, which double-counts and leaks 0.06 %); and chroma-only
+  leaves per-pixel luma bit-identical (needs the luminance-preserving gamut projection in
+  `fromYcc`, since clamping a negative channel to 0 *adds* light). Chroma is *stored* as a
+  ratio to luma (scale-free across ~4 decades) but **averaged luma-weighted**, `Σw(R−G) /
+  ΣwY` — averaging the ratios instead lets near-black pixels with wild ratios dominate,
+  which turned per-pixel speckle into coherent purple/orange blobs. `levels` and `chroma`
+  were swept against the reference: the optimum is a plateau at **2–3 levels**, not SVGF's
+  5, because with no luma term holding the edges a wide chroma support bleeds colour across
+  material boundaries (by 7 levels it is a net loss).
 - **`materials.h` / `pattern.h` / `texture.h` / `layered`** — BSDFs (diffuse,
   mirror, glossy, dielectric w/ nested IOR, diffuse-transmission, filter gels,
   fluorescence, layered), procedural patterns (POV-derived `pov_noise.h` /
@@ -1364,12 +1388,14 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       the 0.5 m limb, so the disc reads as breaking out from behind the glass. The cap is 1.7
       deep and centred 0.45 m −z of its column because that is where the disc lands, (6.87,
       2.72), from the sun's +0.2079 x / −0.9781 z per metre of drop.
-    - **The dispersive caustic is chromatic speckle, and no flag fixes it.** In mode `D` the
-      media disable `-heroc`, the orb's own dispersive refraction would de-hero the bundle
-      anyway, `-herosplit` (the cure) is implemented for CPU forward `A`/`B`/`C` and the
-      `M`/`S` deposit only, and there is no denoiser — so the caustic converges one wavelength
-      per path and only brute-force spp removes the speckle. Budget accordingly; see
-      `known-issues.md`.
+    - **The dispersive caustic is chromatic speckle; `-denoise` is the cure, not more spp.**
+      In mode `D` the media disable `-heroc`, the orb's own dispersive refraction would
+      de-hero the bundle anyway, and `-herosplit` is implemented for CPU forward `A`/`B`/`C`
+      and the `M`/`S` deposit only — so the caustic converges one wavelength per path and the
+      variance lands almost entirely in *chroma*. `-denoise` targets exactly that: measured on
+      this frame at 120 spp it cuts chroma RMSE against an 8000 spp reference to 58 % and
+      gains 1.8 dB PSNR, for ~1 % of render time and zero loss of luma detail. Render this
+      scene with it on.
     - **Cap-vs-cap clearance is not enough; caps must be checked against neighbouring
       COLUMNS.** Two caps each occupy one thin y slab, so they may overlap in plan freely. A
       column spans a whole y range, so plan overlap *is* intersection. `scraps/_standaudit.py`
