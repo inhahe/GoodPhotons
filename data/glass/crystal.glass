@@ -1,0 +1,33 @@
+# LEAD CRYSTAL (lead-silicate flint). Schott F2 catalog Sellmeier.
+# aliases: lead-crystal F2 leadglass
+#
+# This is the glass of cut crystal glassware, and it is in the library for one reason:
+# COLOURED CAUSTICS. What throws colour is not the index, it is the DISPERSION, and the
+# usual measure is the Abbe number V_d = (n_d - 1) / (n_F - n_C) — lower means more
+# colour. Measured from these coefficients:
+#
+#     glass       n(486)   n(589)   n(656)   n_F-n_C    V_d    f/R of a solid sphere
+#     BK7          1.5224   1.5167   1.5143   0.00806   64.1        1.468
+#     crystal(F2)  1.6321   1.6199   1.6150   0.01706   36.3        1.307
+#     SF10         1.7464   1.7281   1.7209   0.02553   28.5        1.187
+#     diamond      2.4355   2.4173   2.4099   0.02564   55.3        0.853
+#
+# So crystal splays a caustic 2.1x as far across the spectrum as BK7 does, which is the
+# difference between a white blob with a faint coloured rim and a caustic with actual
+# colour in it. `SF10` splays 3.2x and is the right pick if you want more still — it is
+# simply denser than anything sold as tableware.
+#
+# The `f/R` column is why `diamond` is NOT the caustic material despite its dispersion
+# matching SF10's: a solid sphere focuses at f = n/(2(n-1)) times its radius FROM ITS
+# CENTRE, and at n=2.42 that is 0.853 R — INSIDE the glass. A diamond ball cannot form an
+# external focus at all; it total-internally-reflects and sparkles instead. Crystal's
+# 1.307 R puts the focus 0.31 R clear of the surface, near enough to concentrate hard and
+# far enough to land on a screen.
+#
+# Physically this is a lead-alkali silicate (~45% PbO by weight for F2). Real tableware
+# "24% lead crystal" is a little softer at n_d ~ 1.545 / V_d ~ 37; F2 has essentially the
+# same dispersion with a higher index, and is the entry with published, trustworthy
+# Sellmeier coefficients, so it is what the name resolves to.
+form sellmeier
+B 1.34533359 0.209073176 0.937357162
+C 0.00997743871 0.0470450767 111.886764

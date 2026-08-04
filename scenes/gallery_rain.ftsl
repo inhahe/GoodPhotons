@@ -226,8 +226,29 @@ material "ceil"     { type diffuse  reflect whitewall 0.82 }   # raincloud stand
 material "gold"     { preset gold  roughness 0.18 }
 material "chrome"   { preset chrome }
 material "brass"    { preset brass }
-material "glass"    { type dielectric ior glass:BK7 }
-material "diamond"  { preset diamond }      # n~2.42 + dispersion -> coloured caustics
+# CRYSTAL, not BK7, and the reason is COLOUR IN THE CAUSTICS. What splays a caustic across
+# the spectrum is not the index, it is the DISPERSION, measured by the Abbe number
+# V_d = (n_d-1)/(n_F-n_C) — LOWER means more colour. From the Sellmeier coefficients:
+#
+#     glass       n(486)   n(589)   n(656)   n_F-n_C    V_d    f/R of a solid sphere
+#     BK7          1.5224   1.5167   1.5143   0.00806   64.1        1.468
+#     crystal(F2)  1.6321   1.6199   1.6150   0.01706   36.3        1.307
+#     SF10         1.7464   1.7281   1.7209   0.02553   28.5        1.187
+#     diamond      2.4355   2.4173   2.4099   0.02564   55.3        0.853
+#
+# Crystal splays 2.1x as far across the spectrum as BK7 — the difference between a white
+# blob with a faint coloured rim and a caustic with colour actually in it. It is also the
+# honest material for this room: BK7 is an optical blank, cut lead crystal is what a
+# gallery would put on a plinth. `glass:SF10` splays 3.2x if more is wanted.
+material "glass"    { type dielectric ior glass:crystal }
+#
+# `diamond` is NOT the caustic material, despite dispersing as hard as SF10. A solid sphere
+# focuses at f = n/(2(n-1)) times its radius FROM ITS CENTRE, and at n=2.42 that is 0.853 R
+# — INSIDE the glass. A diamond ball cannot form an external focus at all: it total-
+# internally-reflects and SPARKLES instead. Crystal's 1.307 R puts the focus 0.31 R clear of
+# the surface, close enough to concentrate hard and far enough to land on a cap. Kept as a
+# named material because sparkle is a real look, but nothing in this scene uses it now.
+material "diamond"  { preset diamond }
 material "morpho"   { preset morpho }       # iridescent multilayer Bragg (blue morpho)
 material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) — 2nd iridescent, different model
 
@@ -503,13 +524,24 @@ isosurface "gyroid" {
     max_gradient 40
 }
 
-# --- DIAMOND GYROID (coloured-caustic gem; NOT settled) --------------------------------
-# A finer k=13 lattice clipped to a small sphere in `diamond` (n~2.42, dispersive): the
-# high IOR tightens its refractive focus and the dispersion splays the caustic into real
-# colour across its walnut stand. Substitute for the missing gyref_gyroid_adaptive mesh.
+# --- CRYSTAL GYROID (the coloured-caustic piece) ----------------------------------------
+# A finer k=13 lattice clipped to a small sphere. This is the piece that throws COLOUR, and
+# it does so for a reason a sphere cannot: a ball lens only shifts its focus LONGITUDINALLY
+# with wavelength, so red and blue focus at slightly different depths but on the same axis,
+# and at any one screen distance all of them overlap into a single white-ish disc with a
+# faint coloured rim. Colour needs large, DIFFERING DEVIATION ANGLES — a prism, not a lens.
+# A gyroid is a dense pack of small, strongly and variously curved lobes, so each lobe
+# deviates its bundle by a different large angle and the spectra are thrown APART on the
+# cap instead of stacked on top of each other. That is why this, not the orb, is where the
+# colour is.
+#
+# It was `diamond` (n~2.42). Changed to crystal: at that index a lobe's focus falls inside
+# the material and the piece total-internally-reflects — it sparkles beautifully and throws
+# almost nothing. Crystal has 2.1x BK7's dispersion AND a workable external focus, which is
+# the combination this piece needs. See the material block for the numbers.
 # Clip bottom y=0.85 = stand_diamond top.
 isosurface "gyroid_gem" {
-    material diamond
+    material glass
     intersect {
         function {
             translate 3.5 1.35 3.6
@@ -861,9 +893,27 @@ light area {
 # is built, so the mesh contributes a silhouette and nothing else — no shell wrapped around
 # the fog, no traversal cost. See FTSL.md 8.4 and 12.1.
 #
-# Native cloud1.glb is 1.897 x 1.172 x 1.777 about the origin. Scaled to 2.75 x 1.03 x 2.49
-# (flattened, as a raining cloud is) and yawed -20 deg so its own two lobes do not sit square
-# to the camera, it lands in x[6.28,9.72] y[2.30,3.34] z[0.36,3.64]. In the roofed edition
+# Native cloud1.glb is 1.897 x 1.172 x 1.777 about the origin, i.e. ALREADY 1.62:1 wider
+# than tall, and it already has two lobes. The scale here is therefore UNIFORM, and that is
+# a fix, not a preference.
+#
+# It used to be `scale 1.45 0.88 1.40`, which squashed y by a further 0.607 relative to x
+# and took the piece to 2.67:1 — a 1.65x horizontal stretch on top of a mesh that was wide
+# to begin with. The comment justified it as "flattened, as a raining cloud is", but the
+# mesh had already done that flattening, so the scene was doing it twice. Two visible
+# symptoms: the cloud read as stretched compared to plain `ftrace cloud1.glb`, and because
+# flattening pushes the two lobes' crowns apart while pulling them down, they separated
+# into what looked like two clouds rather than one lumpy one.
+#
+# 1.42 is picked so the HORIZONTAL FOOTPRINT IS UNCHANGED and nothing else in the scene has
+# to move: x[6.303,9.697] z[0.354,3.646] against the old x[6.28,9.72] z[0.36,3.64], within
+# 2 cm. Only the height changes, 1.03 m -> 1.66 m, so it lands in y[1.99,3.65]. Two things
+# that had to be checked and both hold: the rain shaft's 2.55-3.15 taper band is still
+# fully buried in cloud, and the glass orb — which IS under the cloud's world-space
+# footprint — sits at object-space z 1.306 against a z half-extent of 0.889, so the deeper
+# cloud still does not reach it.
+#
+# Yawed -20 deg so its own two lobes do not sit square to the camera. In the roofed edition
 # it was tucked under the solid half of the roof so it would stay dark behind the bow and be
 # modelled by the xenon lamp; now it takes full sun from above, which lights its crown and
 # leaves its underside — the side facing the camera and the rain — dark, which is both the
@@ -872,7 +922,7 @@ mesh "raincloud" {
     file "cloud1.glb"
     material ceil            # never used: shape_only strips the triangles before render
     import_materials no
-    translate 8.0 2.82 2.0   rotate 0 -20 0   scale 1.45 0.88 1.40
+    translate 8.0 2.82 2.0   rotate 0 -20 0   scale 1.42
     shape_only yes
 }
 #
