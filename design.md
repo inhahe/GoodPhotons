@@ -1516,6 +1516,49 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       facets read 0.11–0.14 % coverage on a ~0.20 × 0.03 m sliver (1/220th the smooth cone's
       patch) at a third of the peak, none with enough cells to `fan`-test, because sampling the
       ring focus at *n* discrete azimuths instead of continuously collapses it.
+    - **The axicon is cut from DENSE FLINT, not crystal, and it is the only piece that is.**
+      What splays a caustic across the spectrum is the Abbe number: `glass:SF10` (V_d 28.5)
+      splays 1.5× as far as `glass:crystal`/F2 (36.3). The orb and the gyroid keep crystal —
+      their caustics are white-with-a-rim whatever the glass — but the axicon exists only to
+      put colour on a screen, so it gets `material "flint"`. **A denser glass also deviates
+      harder, so it moves the ring focus and the drop has to be re-swept with the material**:
+      SF10 at crystal's optimum drop of 0.35 lands in a null (0.08 % coverage), and its own
+      optimum is 0.65. Head to head at matched rig settings (960 px, 1200 spp — the 480 px
+      sweep setting is not fine enough to adjudicate this, and the metrics are
+      resolution-dependent, so only compare rows taken at the same resolution):
+
+      | glass | drop | peak | coverage | sat | spread | fan | patch |
+      |---|---|---|---|---|---|---|---|
+      | crystal | 0.35 | 16.44× | **0.28 %** | 0.321 | 0.152 | 0.51 | 1.37 × 0.98 |
+      | SF10 | 0.50 | **24.71×** | 0.13 % | 0.509 | 0.162 | 0.57 | 1.27 × 1.05 |
+      | **SF10** | **0.65** | 21.99× | 0.15 % | **0.516** | **0.187** | **0.77** | 1.41 × 1.14 |
+
+      In the finished frame that is **sat 0.269 → 0.444, spread 0.204 → 0.299, fan 0.37 →
+      0.76, peak 6.3× → 8.1×** for 80 % of the caustic area — and it *clips less* (0.13 %
+      against 0.52 %), because the caustic got smaller as it got brighter. That is not a
+      tail-selection artifact of the smaller patch: sweeping the caustic threshold until the
+      two match on area makes crystal *worse* (at 3.37 % coverage it reads sat 0.210, spread
+      0.117), so at matched coverage flint wins by 2.1× on sat rather than 1.7×. **The
+      mechanism is where in the patch the colour sits.** Crystal's caustic gets whiter toward
+      its core (sat 0.269 → 0.179 from 2× to 3.5× the pedestal) — its colour is in the dim
+      fringe, which the tone map crushes — while SF10's sat is flat at 0.34–0.37 out to 4×,
+      so the colour survives into the bright pixels. That is the whole resolution of "meters
+      as coloured, looks white". Two other levers
+      were ruled out by measurement first: darkening the screen cannot work (chromaticity is
+      scale-invariant, so albedo moves caustic and pedestal together), and cutting the sky
+      fill would buy almost nothing, because the cap's pedestal profiles as 0.0089 in the
+      piece's shadow (fill alone) against 0.0893 sunlit — **the fill is 10 % of it** and the
+      other 90 % is the same sun the caustic comes from.
+    - **Metrics do not replace looking at it: `scraps/_capcrop.py`.** It crops a cap's screen
+      footprint out of the float buffer and prints it three ways — *as shipped* (exactly the
+      PNG), *under-exposed* (gain set so the cap's own 2×2 peak lands just under white), and
+      *chromaticity only* (renormalised to equal luminance, saturation stretched). The three
+      rows separate three failures that all look alike: row 1 white but row 2 coloured means
+      the **tone map** is eating real colour; both white with a smooth row 3 means the colour
+      is real but **weak**; a confetti row 3 means there is no colour at all, only speckle
+      (this is `fan` made visible). The crystal axicon printed the middle case — a pale arc
+      with a faint warm fringe over a smooth but low-amplitude hue gradient — which is what
+      sent the investigation to the glass rather than to the exposure.
     - **Drop is not a colour parameter — it buys patch AREA.** Swept on float, the axicon's
       `spread` is flat at 0.065–0.083 from drop 0.35 to 1.10 while the patch grows 1.37 × 0.96 m
       → 2.33 × 1.55 m; peak peaks near 0.65 (34.5×) and `sat`/`fan` near 0.80 (0.314 / 0.85).
@@ -1540,22 +1583,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       under it.** A lens throws its focus ~0.98 m downwind per metre of drop (the sun walks
       +0.2079 x / −0.9788 z), which is why the orb's and the gyroid's caps are cantilevered
       most of a metre. An axicon has no focal *point* to displace — it has a focal *line*
-      starting at the exit face — so at drop 0.35 the core sits only 0.31 m off its own axis
-      and the cap is pulled just 0.12 m. What it *does* need is **width**: the caustic reads as
-      two bright rainbow cusps flanking the piece left and right, and 90 % of its light falls
-      within x ±0.72 m but z −0.60…+0.36 m, so its cap is wide and shallow (1.6 × 1.1) where
-      every other cap is roughly square or deep. Both the extent and the core offset are
+      starting at the exit face — so at drop 0.65 in SF10 the core sits within 0.06 m of its
+      own axis and the cap is pulled only 0.06 m in x and 0.04 m in z. What it *does* need is
+      **width**: the caustic reads as two bright rainbow cusps flanking the piece left and
+      right, and 90 % of its light falls within x −0.77…+0.65 m but z −0.61…+0.53 m, so its cap
+      is wide and shallow (1.6 × 1.28) where every other cap is roughly square or deep. It grew
+      from 1.1 to 1.28 deep with the flint swap: the extra height separates the cusps, taking
+      the patch from 1.37 × 0.98 to 1.41 × 1.14. Both the extent and the core offset are
       reported by `_gemsweep.py` as excess-weighted 5–95 % quantiles, *not* a raw bounding box:
       a handful of stray sparkle cells at the frame edge trebled the raw box.
-    - **The scene's colour source is a tenth exhibit, the CRYSTAL AXICON**, added rather than
-      swapped in because nothing already present could be made to do the job (see above: the
-      lattice cannot, whatever its outer shape, and the Klein bottle is a window). A 45° cone,
-      1.12 m across, hung **apex down** on three short pins with its point 0.07 m over the
-      tabletop, at near-left (2.60, 5.45). It is the only exhibit authored directly in **world
+    - **The scene's colour source is a tenth exhibit, the CRYSTAL AXICON** (named for the
+      gallery label; it is cut from flint, see above), added rather than swapped in because
+      nothing already present could be made to do the job (the lattice cannot, whatever its
+      outer shape, and the Klein bottle is a window). A 45° cone, 1.12 m across, hung **apex
+      down** on three pins with its point 0.37 m over the tabletop, at near-left
+      (2.60, 5.45). It is the only exhibit authored directly in **world
       coordinates with no `group { translate }` wrapper**, because unlike the other nine it has
-      no earlier layout position to be displaced from. Its site is checked four ways: 0.38 m
-      clear of the nearest cap and 0.24 m clear of the crystal gyroid beside it
-      (`_standaudit.py -v`), 1.10 m clear of the flyby (`_flyplan.py`), 29.5° off the still
+      no earlier layout position to be displaced from. Its site is checked four ways: 0.37 m
+      clear of the nearest cap (`_standaudit.py -v`) and 0.24 m clear in z of the crystal
+      gyroid beside it, 0.94 m clear of the flyby (`_flyplan.py`), 29.5° off the still
       camera's axis against a 40.9° half-width, and it balances a frame whose left half was the
       original reason the scene lost its roof. **The near row is high z, not low z** — the
       camera stands at z=9.35 looking toward −z, so "front of the gallery" is z ≈ 5–7. Siting

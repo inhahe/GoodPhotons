@@ -5,6 +5,39 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-04): `-stop` cannot stop a MULTI-CAMERA render — it ends the current frame and the batch marches on to the next camera
+
+**Symptom.** `scenes/gallery_rain.ftsl` declares 601 cameras. A render launched without
+`-camera` finishes the still and then walks the whole 600-frame flyby set. Two `ftrace -stop
+<pid>` calls each reported
+
+```
+[stop] asked pid 90024 to finish and exit cleanly.
+[stop] still running after 120s: 90024
+```
+
+and `-stop all` did no better, while the process kept emitting frames at ~2-3/s. It had to be
+killed with `taskkill /F`.
+
+**Diagnosis.** `-stop` is a *finish the current work item and exit* request, and the work item
+is one FRAME, not one invocation. In a multi-camera batch the stop flag is consumed (or
+cleared) at the frame boundary and the loop advances to camera N+1, so the request can never
+retire the run. The 120 s timeout then reports "still running", which reads like a hung process
+and invites a force-kill — exactly the thing `-stop` exists to avoid, and dangerous mid-CUDA.
+
+**Proper fix.** Make the stop flag terminate the *batch*: check it in the camera loop as well
+as the per-frame loop, and have it break out of both. A stop request should never be cleared by
+finishing a frame. Worth also making `-stop` report *which* frame of how many it is on, so the
+"still running" line distinguishes "wedged" from "working through 600 cameras".
+
+**Second bug, same incident.** Those flyby frames were written **loose next to `-o`** as
+`png/rain_axicon_fly000.{png,pfm,png.ftbuf}` — 148 of them before the kill — violating the
+project rule that a multi-frame series lives in its own `png/<setname>/`. ftrace should put a
+multi-camera path series in a subdirectory derived from the output base by default, rather than
+spraying siblings of the still. **Workaround until both are fixed: always pass `-camera <name>`
+when you want one image from a scene that declares a camera path.** (The 148 stray frames were
+deleted.)
+
 ### OPEN (2026-08-04): mode `W` is NOT noise-free at `-spp 1` when the scene has a medium — the fog term is still a Monte-Carlo free flight
 
 **Symptom.** `ftrace scenes/gallery_rain.ftsl -mode W -spp 1 -r 480 270` returns a black frame
@@ -8045,6 +8078,127 @@ The rig also re-measures the orb at **fan 0.94 on spread 0.013**, which is the p
 intended: a ball lens's tinted rim is perfectly *organised* colour, there is just almost none
 of it, over a 0.09 x 0.15 m patch. So `fan` validates a reading and `spread` sizes it — the
 axicon wins on magnitude 6:1 and the ordering is unchanged.
+
+**THEN LOOK AT IT, WHICH THE METRICS DO NOT REPLACE (2026-08-04).** All of the above is
+statistics on a cap; none of it says what the picture looks like. `scraps/_capcrop.py` crops a
+cap's screen footprint out of the float buffer and prints it three ways, stacked and upscaled:
+**as shipped** (linear x GAIN, sRGB — exactly the PNG), **under-exposed** (gain set so the
+cap's own 2x2 peak lands just under white), and **chromaticity only** (every pixel renormalised
+to equal luminance with the saturation stretched). The three rows separate three different
+failures that all look like "it reads white":
+
+* row 1 white, row 2 coloured  -> the colour is real and the **tone map** is eating it;
+* row 1 and row 2 both white, row 3 a smooth gradient -> the colour is real but **weak**;
+* row 3 confetti -> there is no colour, only speckle (this is `fan` made visible).
+
+On the crystal axicon it printed the second case: the cusp is a pale white arc with a faint
+warm fringe, and row 3 shows a smooth but *low-amplitude* hue gradient. So `spread 0.185 /
+fan 0.46` and "it reads whitish" were both true, and the two together are the actual
+diagnosis — organised colour, not enough of it.
+
+**Two levers were ruled out by measurement before the third was tried.** (1) **Darken the
+screen further.** It cannot work: chromaticity is scale-invariant, so albedo moves the caustic
+and its pedestal together (see below). (2) **Cut the sky fill**, on the theory that the 11000 K
+panel washes the cusps out. Also no — profiling the cap's luminance percentiles says the
+pedestal is almost entirely *direct sun*, not fill:
+
+| percentile of the axicon cap | scene-linear luminance | what it is |
+|---|---|---|
+| p5 | 0.0089 | the piece's own shadow, i.e. **sky fill alone** |
+| p50 | 0.0893 | sunlit cap = sun + fill |
+| p100 | 0.6292 | the caustic core |
+
+The fill is **10% of the pedestal**; removing all of it would raise the caustic:screen ratio by
+a tenth. And the remaining 90% is sunlight, which cannot be reduced without dimming the caustic
+by the same factor, since both arrive from the same sun. The pedestal is therefore fixed, and
+the only thing left to change is **how much the piece disperses**.
+
+**THE FIX: cut the axicon from DENSE FLINT instead of crystal (2026-08-04).** What splays a
+caustic across the spectrum is the Abbe number, and the scene's own material comment had the
+answer written in it the whole time — `glass:SF10` (V_d 28.5) splays 1.5x as far as
+`glass:crystal`/F2 (36.3). The rig gained `GEMIOR` (and `GEMRES`/`GEMSPP`, because at 480 px a
+0.13%-coverage caustic is 19 cells and `fan` needs 20). **A denser glass also deviates harder,
+so it moves the ring focus and the drop has to be re-swept with the material** — SF10 at
+crystal's optimum drop of 0.35 lands in a null (0.08% coverage). Swept, at 45 deg, 480 px:
+
+| drop | coverage | sat | spread | fan |
+|---|---|---|---|---|
+| 0.30 | 0.04% | 0.520 | 0.045 | — |
+| 0.35 | 0.08% | 0.548 | 0.050 | — |
+| 0.40 | 0.08% | 0.545 | 0.047 | — |
+| 0.50 | 0.13% | 0.480 | 0.109 | — |
+| **0.65** | 0.15% | 0.469 | 0.139 | **0.95** |
+| 0.80 | 0.16% | 0.482 | 0.121 | 0.92 |
+
+Head to head at matched settings (960 px, 1200 spp — the sweep setting is not fine enough to
+adjudicate this), each glass at its own best drop:
+
+| glass | drop | peak | coverage | sat | spread | fan | patch |
+|---|---|---|---|---|---|---|---|
+| crystal | 0.35 | 16.44x | **0.28%** | 0.321 | 0.152 | 0.51 | 1.37 x 0.98 |
+| SF10 | 0.50 | **24.71x** | 0.13% | 0.509 | 0.162 | 0.57 | 1.27 x 1.05 |
+| **SF10** | **0.65** | 21.99x | 0.15% | **0.516** | **0.187** | **0.77** | 1.41 x 1.14 |
+
+**Note the metrics are resolution-dependent** — the same crystal configuration reads spread
+0.079 / fan 0.76 at 480 px and 0.152 / 0.51 at 960 px, because finer cells resolve more
+structure *and* carry more per-cell noise. Only compare rows taken at the same `GEMRES`.
+
+Shipped: `material "flint" { type dielectric ior glass:SF10 }` on `crystal_axicon` only (the
+orb and the gyroid keep crystal — their caustics are white-with-a-rim whatever the glass), the
+piece raised 0.30 m to drop 0.65 (`translate 2.6 1.55 5.45`, `contained_by` y 1.25..1.85, pins
+0.37 -> 0.67 m long), and the cap regrown to the new patch: 1.6 x **1.28** centred (2.54, 5.41).
+`_flyplan.py`'s and `_capchroma.py`'s collider tables were moved with it — both hardcode the
+axicon's apex and both would otherwise mask the wrong region. In the finished frame:
+
+| | crystal, drop 0.35 | **SF10, drop 0.65** |
+|---|---|---|
+| coverage | 4.48% | 3.64% |
+| sat | 0.269 | **0.444** |
+| spread | 0.204 | **0.299** |
+| xspread (pedestal removed) | 0.292 | **0.413** |
+| peak | 6.29x | **8.05x** |
+| clip at albedo 0.15 | 0.52% | **0.13%** |
+| noise floor | 0.066 | 0.045 |
+| **fan** | 0.37 | **0.76** |
+
+(Both columns are the fully converged 600 s stills, `png/rain_axicon.pfm` and
+`png/rain_axicon_cam.pfm`. Intermediate reads from ~380 spp on were already inside a few
+percent of these, so the comparison was never spp-limited.)
+
+1.7x the saturation, 1.5x the chromatic spread and 2.1x the organisation, for 80% of the area
+— and it *clips less*, because the caustic got smaller as it got brighter. That leaves the
+0.15 albedo with more headroom than it now needs (doubling it to 0.30 would clip 1.36%, against
+3.06% for the crystal piece), so a brighter, more museum-white tabletop is available if the
+scene ever wants one. Left alone here to avoid moving two variables at once.
+
+**The obvious objection to that table is TAIL SELECTION** — SF10 lights 80% as much of the cap,
+so maybe its `sat` is high only because the threshold kept a smaller, brighter, more selected
+slice. Tested by sweeping `GEMCUT` (the multiple of the cap's own median that counts as
+caustic) on both finished stills until they meet on area:
+
+| GEMCUT | crystal: coverage / sat / spread / fan | SF10: coverage / sat / spread / fan |
+|---|---|---|
+| 2.0 | 4.48% / 0.269 / 0.204 / 0.37 | 3.64% / **0.444** / **0.299** / **0.76** |
+| 2.5 | **3.37%** / 0.210 / 0.117 / 0.35 | 1.48% / 0.344 / 0.172 / 0.72 |
+| 3.0 | 2.58% / 0.192 / 0.065 / 0.22 | 0.74% / 0.347 / 0.100 / -- |
+| 3.5 | 2.06% / 0.179 / 0.057 / 0.17 | 0.47% / 0.369 / 0.101 / -- |
+| 4.0 | 1.32% / 0.186 / 0.051 / 0.49 | 0.32% / 0.368 / 0.093 / -- |
+
+**The objection is refuted, and backwards.** Squeezing crystal down to SF10's area (cut 2.5,
+3.37% vs 3.64%) makes it *worse* on every axis — sat 0.269 -> 0.210, spread 0.204 -> 0.117 —
+so at matched coverage SF10 wins by 2.1x on sat, 2.6x on spread and 2.2x on fan, a wider
+margin than the headline table shows. SF10 at cut 2.5 beats crystal at cut 2.0 on sat and fan
+while lighting a third of the area.
+
+The mechanism is in the column shapes, and it is the whole point of the swap. **Crystal's
+caustic gets WHITER toward its core** (sat 0.269 -> 0.179 from 2x to 3.5x the pedestal): its
+colour lives in the low-excess *fringe*, which is exactly the part a tone map crushes and the
+eye reads as dim. **SF10's does not** — sat is flat at 0.34-0.37 all the way out to 4x, i.e.
+the colour survives into the bright core, where it is actually visible. That is why the piece
+metered as coloured under crystal yet looked white on screen, and why it now looks amber:
+raising V_d^-1 did not just add dispersion, it moved the dispersion into the bright pixels.
+(`fan` reads `--` past cut 2.5 for SF10 because fewer than 20 cells survive, not because the
+structure decays — see the quadratic-basis note above.)
 
 **And `capwhite` 0.30 -> 0.15 is a TONE-MAP decision, not a measurement one — a distinction
 worth writing down because it is easy to get backwards.** On the float buffer, chromaticity

@@ -271,6 +271,27 @@ material "brass"    { preset brass }
 # gallery would put on a plinth. `glass:SF10` splays 3.2x if more is wanted.
 material "glass"    { type dielectric ior glass:crystal }
 #
+# AND MORE IS WANTED, BY EXACTLY ONE PIECE. Crystal is right for the orb and the gyroid,
+# whose caustics are white-with-a-rim whatever the glass, but the axicon exists ONLY to put
+# colour on a screen, so it is cut from dense flint instead. Head to head in the isolation
+# rig at matched settings (`_gemsweep.py` at GEMRES=960 GEMSPP=1200, each at its own best
+# drop — a denser glass deviates harder, so it moves the ring focus and the drop has to be
+# re-optimised with it, 0.35 -> 0.65):
+#
+#     glass    drop   peak   coverage   sat     spread   fan    patch
+#     crystal  0.35   16.4x   0.28%     0.321   0.152    0.51   1.37 x 0.98
+#     SF10     0.50   24.7x   0.13%     0.509   0.162    0.57   1.27 x 1.05
+#     SF10     0.65   22.0x   0.15%     0.516   0.187    0.77   1.41 x 1.14
+#
+# SF10 at 0.65 wins on every colour axis at the same patch size — 1.6x the saturation, 1.2x
+# the chromatic spread, 1.5x the `fan` (how much of the colour is a smooth FUNCTION OF
+# POSITION rather than sampler speckle) — and pays for it in coverage, 0.15% against 0.28%.
+# That is the right trade here: the axicon's cusps are already the largest caustic in the
+# scene by an order of magnitude (5.96% of its cap in the finished frame), so area is the
+# one thing it does not need more of, and half of a lot is still far more than any other
+# piece has. Colour was the whole reason the exhibit exists.
+material "flint"    { type dielectric ior glass:SF10 }
+#
 # `diamond` is NOT the caustic material, despite dispersing as hard as SF10. A solid sphere
 # focuses at f = n/(2(n-1)) times its radius FROM ITS CENTRE, and at n=2.42 that is 0.853 R
 # — INSIDE the glass. A diamond ball cannot form an external focus at all: it total-
@@ -647,8 +668,16 @@ isosurface "stand_oil_cap" { material capwhite
 #     z=9.35 and looks toward -z, so "front of the gallery" means z around 5-7, and the first
 #     siting of this piece (at z=1.10, which reads as "front" on the page) put it 8.4 m away
 #     and directly BEHIND the crystal gyroid, which occluded it completely. At z=5.45 it is
-#     4.2 m out and 178 px/m, so the cone renders larger than the gyroid ball beyond it, and
-#     the two clear each other on screen by ~24 px.
+#     4.2 m out and 178 px/m, so the cone renders larger than the gyroid ball beyond it.
+#     They USED to clear each other on screen by ~24 px. THEY NO LONGER DO: SF10's optimum
+#     drop is 0.65 rather than crystal's 0.35 (see the piece), which lifted it 0.30 m, and at
+#     1280x720 the cone (x 90..322, y 421..563) now crosses the gyroid ball (x 229..381,
+#     y 312..451) over a 93 x 30 px box at the cone's APEX. Checked on the finished frame and
+#     KEPT: what overlaps is the cone's two straight silhouette edges converging over the
+#     gyroid's lower filigree — a hard geometric line against a busy one, 1.3 m nearer — so
+#     it reads as a near piece in front of a far piece, not as clutter. Moving it is not free
+#     either: the cap already runs off the left edge (x -21), so the obvious leftward dodge
+#     pushes more of it out of frame.
 #   * it balances the frame. The right half carries the gold gyroid, the orb, the cloud and
 #     the rain; the near-left was empty grid, and the scene's whole reason for losing its roof
 #     was that its left half sat in permanent shadow.
@@ -671,17 +700,21 @@ isosurface "stand_axicon" {   # cap top y=0.90
 isosurface "stand_axicon_cap" { material capwhite
     # The THIRD cantilevered cap, and the shallowest cantilever of the three, because an
     # axicon's caustic barely walks at all. A lens throws its focus a full 0.98 m downwind
-    # per metre of drop; this piece's patch measures a core only 0.31 m off its own axis
-    # (scraps/_gemsweep.py `piece vcone1.0 0.35`), because an axicon has no focal POINT to
-    # be displaced — it has a focal LINE that starts at the exit face. So the cap is pulled
-    # only 0.12 m toward -z, not most of a metre.
+    # per metre of drop; this piece's patch measures a core within 0.06 m of its own axis
+    # (scraps/_gemsweep.py `piece vcone1.0 0.65` in SF10), because an axicon has no focal
+    # POINT to be displaced — it has a focal LINE that starts at the exit face. So the cap is
+    # barely pulled at all: 0.06 m in -x and 0.04 m in -z, not most of a metre.
     #
-    # 1.6 x 1.1 is measured, not chosen: 90% of the caustic's light falls within
-    # x -0.74..+0.69 and z -0.60..+0.36 of the piece's axis. Centred at (2.60, 5.33) that
-    # spans x 1.80..3.40 and z 4.78..5.88, which contains all of it with ~0.05 m to spare.
-    # It is WIDE and SHALLOW for the same reason the caustic is: the two bright cusps sit
-    # left and right of the piece, not fore and aft.
-    box { center 2.6 0.80 5.33  size 1.6 0.20 1.1  round 0.02 } }
+    # 1.6 x 1.28 is measured, not chosen: 90% of the caustic's light falls within
+    # x -0.77..+0.65 and z -0.61..+0.53 of the piece's axis, i.e. x 1.83..3.25 and
+    # z 4.84..5.98. Centred at (2.54, 5.41) the cap spans x 1.74..3.34 and z 4.77..6.05,
+    # which contains all of it with 0.07-0.09 m to spare on every side.
+    #
+    # It grew 1.1 -> 1.28 deep when the piece went from crystal at drop 0.35 to SF10 at 0.65:
+    # the extra height separates the cusps, so the patch went 1.37 x 0.98 -> 1.41 x 1.14. It
+    # is still WIDE and SHALLOW for the reason the caustic is — the two bright cusps sit left
+    # and right of the piece, not fore and aft.
+    box { center 2.54 0.80 5.41  size 1.6 0.20 1.28  round 0.02 } }
 
 # ==============================  HERO PIECES  =================================
 # Each piece is wrapped in the SAME `group { translate }` as its stand — see THE SPREAD
@@ -1068,42 +1101,55 @@ isosurface "chrome_ring" {
 # are the same thin curved internal sheets that make a gyroid a DIFFUSER. So the crystal
 # gyroid stays exactly as it is, and this is an additional exhibit rather than a replacement.
 #
-# DROP 0.35 IS MEASURED. Sweeping the height at 45 deg (spread / sat):
-#     drop 0.35   0.212 / 0.320   <- best on both, and the tightest patch (1.43 x 0.96 m)
-#     drop 0.45   0.206 / 0.282
-#     drop 0.60   0.197 / 0.297
-#     drop 0.90   0.183 / 0.319       patch has grown to 2.16 x 1.43 m
-#     drop 1.10   0.142 / 0.261
-# Colour falls off monotonically with height because the cusps keep separating while the
-# light in them does not grow — past ~0.5 m the patch dilutes faster than the spectra
-# separate. So this piece hangs LOW: apex at y=0.97, just 0.07 m over the tabletop.
+# DROP 0.65 IS MEASURED — AND IT IS A PROPERTY OF THE GLASS, NOT OF THE SHAPE. On floats
+# (`-hdr -fireflies 3`; the numbers this comment used to quote were taken through the 8-bit
+# clamp and are retracted) the drop turns out to buy AREA, not colour: in crystal, `spread`
+# is flat at 0.065-0.083 all the way from 0.35 to 1.10 while the patch grows 1.37 x 0.96 m
+# to 2.33 x 1.55 m. So the old "colour falls off monotonically above ~0.5 m" was the clamp
+# talking — a bigger drop threw a BRIGHTER caustic, which clipped harder, which the 8-bit
+# meter then scored as whiter.
 #
-# 45 DEG (k=1.0) IS MEASURED TOO. At drop 0.90, sweeping the half-angle: k=0.8 gave
-# 0.137 spread, k=1.0 gave 0.183, k=1.1 gave 0.094, k=1.2 gave 0.072. Steeper than 45 deg and
-# the exit face starts to total-internally-reflect, exactly as the brilliant's pavilion does.
+# What DOES pin the drop is the glass. SF10 deviates ~17% harder than crystal, so the ring
+# focus sits at a different height and the drop has to be re-swept with the material
+# (coverage / sat / spread / fan at 45 deg, 480 px):
+#     drop 0.30   0.04%  0.520  0.045   --      ring focus short of the cap
+#     drop 0.35   0.08%  0.548  0.050   --      <- crystal's optimum; in SF10 it is a null
+#     drop 0.40   0.08%  0.545  0.047   --
+#     drop 0.50   0.13%  0.480  0.109   --
+#     drop 0.65   0.15%  0.469  0.139  0.95     <- best organised colour
+#     drop 0.80   0.16%  0.482  0.121  0.92
+# So the piece hangs at apex y=1.27, 0.37 m over the tabletop.
+#
+# 45 DEG (k=1.0) IS MEASURED TOO, and the reason once given for it was wrong. Sweeping the
+# half-angle in crystal at drop 0.35 (k = tan of the half-angle) gives coverage
+# 0.09 / 0.03 / 0.30 / 0.25 / 0.10% at k = 0.70 / 0.85 / 1.00 / 1.20 / 1.40. The collapse is
+# at k=0.85 (40.4 deg), BELOW 45, with 50.2 and 54.5 deg both still working — so this is not
+# a one-sided TIR cliff past 45 deg as the file used to say. Across the null the caustic core
+# also SWITCHES SIDES, +0.63 z at k=0.70 to -0.61 z at k=1.20: the ring focus is passing
+# through infinity there. 40.4 deg landing on crystal's 40.2 deg critical angle is a
+# coincidence, and is named as one so the wrong mechanism is not re-derived from it.
 #
 # The field is max() of the cone against the two end slabs; every term is unit-Lipschitz
 # except the cone's, whose gradient is sqrt(2), so max_gradient 2 is exact and generous.
 isosurface "crystal_axicon" {
-    material glass
+    material flint
     function {
-        translate 2.6 1.25 5.45
+        translate 2.6 1.55 5.45
         expr "max(sqrt(x*x + z*z) - (0.28 + y), max(-y - 0.28, y - 0.28))"
     }
-    contained_by { min 2.00 0.95 4.85   max 3.20 1.55 6.05 }
+    contained_by { min 2.00 1.25 4.85   max 3.20 1.85 6.05 }
     max_gradient 2
 }
-# The same three-pin mount the orb and the crystal gyroid use, but SHORT: the cone's surface
-# radius is 0.28 + y, so a pin standing at horizontal radius 0.30 meets it at y = +0.02, i.e.
-# world y = 1.27, and the reach from the cap top at 0.90 is only 0.37 m. Azimuths 0/120/240
-# from +z put one pin on the +z side, away from the caustic (which sits at -z), and the other
-# two at x = 2.34 and 2.86 — between the core at x=2.67 and the cusps at x=1.88 and 3.32, so
-# their 12 mm shadows fall on neither.
+# The same three-pin mount the orb and the crystal gyroid use. The cone's surface radius is
+# 0.28 + y, so a pin standing at horizontal radius 0.30 meets it at local y = +0.02, i.e.
+# world y = 1.57, and the reach from the cap top at 0.90 is 0.67 m. Azimuths 0/120/240 from
+# +z put one pin on the +z side and the other two at x = 2.34 and 2.86 — inboard of the cusps
+# at x = 1.83 and 3.25, so their 12 mm shadows fall on neither.
 isosurface "stand_axicon_mount" {
     material wirecage  union {
-        box { center 2.6000 1.085 5.7500  size 0.012 0.37 0.012 }
-        box { center 2.8598 1.085 5.3000  size 0.012 0.37 0.012 }
-        box { center 2.3402 1.085 5.3000  size 0.012 0.37 0.012 }
+        box { center 2.6000 1.235 5.7500  size 0.012 0.67 0.012 }
+        box { center 2.8598 1.235 5.3000  size 0.012 0.67 0.012 }
+        box { center 2.3402 1.235 5.3000  size 0.012 0.67 0.012 }
     }
 }
 
