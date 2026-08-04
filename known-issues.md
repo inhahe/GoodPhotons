@@ -7639,3 +7639,66 @@ occupancy with `smoothstep(distance-to-the-outside / feather)`.
   isosurface bound**, which are carved analytically and have no lattice to soften.
 
 Repro of the old behaviour: drop `feather` from the raincloud in `scenes/gallery_rain.ftsl`.
+
+---
+
+### OPEN: `gallery_rain`'s mode-B fallback branch is effectively dead now that the room is gone
+
+`scenes/gallery_rain.ftsl` wraps its still camera in `prefer { mode D } else { mode B }`, so a
+machine without a working CUDA BDPT falls back to the forward pinhole splat. That fallback was
+authored for the ROOFED edition and has not been re-validated since the walls and ceiling came
+off. It should be.
+
+Measured (v0.130.0, `-mode B -time 300`, 1.30e9 photons):
+
+```
+[energy] absorbed=0.4344 sensor=0.0000 escaped=0.5656 residual=0.0001
+```
+
+**Zero** of the emitted energy reaches the sensor, to four decimals. The frame is nearly black —
+only the cloud, the bow and a faint wash on the caps register at all. The cause is structural,
+not a bug: a forward tracer fires photons from the light and hopes they find the camera, and
+this scene's only lights are a distant sun and two panels firing into an *open hemisphere*.
+57% of every photon escapes to infinity on the first bounce. The enclosing room was what used
+to recycle them, and removing it is exactly what the open-air rework did.
+
+The scene header still describes the else-branch as merely "a real downgrade... in mode B every
+piece of glass and the chrome ring go black", which understates it — it is not a downgrade, it
+is not an image.
+
+Options, none yet chosen:
+* point the else-branch at **mode M** (photon-map camera) or CPU mode D instead of B;
+* or drop the `prefer{}/else{}` entirely and let the scene simply require D, since 0.127.0 made
+  the GPU BDPT handle the delta sun and the else-branch's original reason (mode D refusing a
+  `light sun`) no longer exists.
+
+Repro: `ftrace scenes/gallery_rain.ftsl -mode B -time 300 -o png/_b.png`
+
+### OPEN: `gallery_rain`'s caustic screens cannot show a caustic — they are metered into the clip
+
+Three revisions of that scene have widened the stand caps specifically so the dispersive
+caustics from the glass sphere and the diamond gyroid have somewhere to land. They still do not
+read, and the cap width was never the binding constraint. Three separate causes, in order of
+size:
+
+1. **The screen is clipped.** `exposure 0.25` was chosen to put a sunlit 0.88-albedo cap just
+   under white — correct metering for the brightest diffuse thing in a sunlit frame, and
+   exactly wrong for a caustic screen, which has to be DARKER than the caustic. Measured on the
+   1180-spp mode-D frame: the diamond's cap averages 209/255 with **24.7% of its pixels at full
+   white**; the glass sphere's cap 189/255 with 10% clipped. A caustic adds light to that and
+   has nowhere to go.
+2. **The sphere is sitting on its own focal length.** The glass sphere is R=0.5 resting directly
+   on the cap. For n~1.5 a sphere focuses at nR/(2(n-1)) = 0.75 m from its centre, i.e. 0.25 m
+   *below* the cap surface, so what reaches the cap is the cone cut short — a defocused disc
+   ~0.34 m across at maybe 5x the direct sun, not a caustic. And with the sun 45 deg off
+   vertical the cone axis walks 0.49 m in -z over the 0.5 m drop, centring the disc at z~3.01
+   against a cap whose front edge is z=2.95, so roughly a third of it falls off the front.
+3. **BDPT is the slow way to get one.** It cannot aim a light subpath; it has to randomly hit
+   the sphere, randomly refract and randomly land usefully. Verified with cap albedo dropped to
+   0.30 (unclipped, 129/255): at 413 spp there is a faintly brighter region in about the right
+   place, buried in chromatic fireflies.
+
+Fix, when someone takes it: drop the cap albedo to ~0.25-0.35, raise the glass sphere ~0.2 m
+off its cap so the cap sits nearer the focal distance, shift that cap ~0.3 m toward -z, and
+render mode M (or a much longer D). Note that (1) alone is what takes it from impossible to
+merely faint — the geometry changes are what make it bright.
