@@ -123,29 +123,68 @@ photon-mapping radius bias, not a delta-light error: `-pmradius 0.02` (8.5x smal
 to 0.9949, and the mode-D/mode-R pair shows the same shadow-core value the small-radius mode U
 converges to.
 
-### DEBT — OPEN (2026-08-04): the GPU BDPT kernels don't do delta lights, so a spot/sun scene falls back to the (slower) CPU BDPT
+### DEBT — DONE (2026-08-04, v0.126.0): the GPU BDPT kernels now do delta lights, so mode D no longer falls back to the CPU on a spot/sun scene
 
-### DEBT — OPEN (2026-08-04): the GPU BDPT kernels don't do delta lights, so a spot/sun scene falls back to the (slower) CPU BDPT
+`cudaBdptSupported()` (`src/render_cuda.cu`) used to reject `Spot` and `Sun` alongside `Env`
+and `collimated`, routing such a scene to the CPU BDPT with a printed `[device] … ; using CPU`
+notice. That was *correct* — the alternative would have been `dGenLightSubpath` /
+`dConnectBDPT` returning 0 for the emitter they just spent a CDF draw selecting, which really
+would drop the light and steal its share of the sample budget — but it cost the GPU speedup on
+exactly the daylight scenes that want it most. The `bdpt.h` delta-light work (the entry at the
+top of this file) has now been mirrored into the device kernels, one-for-one:
 
-`cudaBdptSupported()` (`src/render_cuda.cu`) now rejects `Spot` and `Sun` alongside `Env` and
-`collimated`, which routes such a scene to the CPU BDPT with a printed
-`[device] … ; using CPU` notice. That is *correct* — the alternative would be
-`dGenerateLightSubpath` / `dConnectBDPT` returning 0 for the emitter they just spent a CDF
-draw selecting, which really would drop the light and steal its share of the sample budget
-(the failure mode this file previously mis-attributed to the CPU path) — but it costs the GPU
-speedup on exactly the daylight scenes that want it most.
+* `dIsDeltaEmitter` / `dIsInfiniteEmitter` / `dIsDeltaLightVertex` — device twins of
+  `isDeltaEmitter` / `isInfiniteEmitter` / `Vertex::isDeltaLight()`.
+* `dGenLightSubpath` grew the delta-emission branch (device twin of `deltaLightSubpath`):
+  spot fires from `em.origin` uniformly into the outer cone (`pdfPos = 1`, `pdfDirW =
+  1/(2π(1−cosOuter))`, smoothstep penumbra carried as throughput); sun fires from a disc
+  point of radius `sceneRadius` one radius upstream of `sceneCenter` (`pdfPos = 1/(πR²)`)
+  along a direction in the solar cone. `path[0].pdfFwd = 0`, `delta = 0`, `matId = -1`, and
+  the infinite-light `path[1].pdfFwd` planar patch is applied after the walk.
+* `dConnectBDPT`'s `s == 1` NEE now uses the same unified λ-independent `Wgeom` the CPU does
+  — spot `fall/(d²·pdfChoice)`, sun `spotOmega/pdfChoice` with `occlEps = 0` so the shadow
+  ray reaches the scene exit unshortened, area `cosL·A/(d²·pdfChoice)` — and sets
+  `sampled.matId = -1` / `beta = Le·Wgeom` / `pdfFwd = 0` for a delta light.
+* `dVertexPdfLightF` gained the spot-cone and *planar* infinite branches (and now takes the
+  `DScene` so it can reach the emitter); `dVertexPdfLightOriginF` returns 0 for a delta light.
+* `dMisWeight`'s `deltaPrev` at `i == 0` is the `IsDeltaLight()` test rather than a hard
+  `false`, dropping the `s == 0` strategy — reading the SUBSTITUTED endpoint when `s == 1`.
+* `struct DEscape` + an optional out-param on `dRandomWalk` / `dGenCameraSubpath` report where
+  an eye ray escaped, and `kBdptT` adds the sun's radiance with MIS weight exactly 1 when
+  every eye vertex was delta — the strategy that carries the solar disc and its mirror glints.
 
-Proper fix: mirror the `bdpt.h` changes into `render_cuda.cu`. The device code is a close
-transliteration of the host code (`dGenerateLightSubpath` ↔ `generateLightSubpath`,
-`dConnectBDPT` ↔ `connectBDPT`, `dVertexPdfLight` ↔ `vertexPdfLight`), so the port is
-mechanical; the fiddly parts are the infinite-light `path[1].pdfFwd` patch and threading the
-escaped-ray sun radiance through the device path accumulator.
+`cudaBdptSupported()` now rejects only `Env` / `collimated`.
 
-This now also costs **mode U**: `cudaVcmSupported()` is `cudaBdptSupported() && media.empty()`,
-so since 0.125.0 (which gave the CPU VCM delta lights) a spot/sun scene in mode U silently
-falls through to the CPU VCM session too. That fallback is correct and loud enough — mode U
-still renders the scene — but it is the reason a `light sun` VCM render is minutes rather than
-seconds. Relaxing `cudaBdptSupported()` fixes mode D and mode U in one go.
+**Validated** by rendering the same camera on both backends (`-device cpu` vs the default
+GPU) at matched spp and comparing with `python scraps/imgdiff.py`:
+
+| scene | mode D, spp | mean ratio | mean \|diff\| | note |
+|---|---|---|---|---|
+| `_spot_cornell.ftsl` | 400 | 0.9963 | 0.0036 | auto-exposure 6.42e-14 vs 6.45e-14 |
+| `_sun_check.ftsl` | 400 | 0.9992 | 0.0039 | identical auto-exposure 4.75e-14 |
+| `_deltalight_mix.ftsl` | 3000 | 0.9989 | 0.0034 | absolute units, fixed gain |
+| `cornell.ftsl` (area-light regression) | 600 | 1.0128 | 0.0043 | auto-exposure 9.97e-14 vs 9.71e-14 |
+| `cornell.ftsl` (same, 10× spp) | 6000 | **1.0031** | 0.0023 | both figures halve with √spp ⇒ MC noise + auto-exposure jitter, not bias; worst pixels sit on the glass ball's caustic |
+
+On the mix scene the escaped-ray solar-disc strategy is present and singly counted on the
+GPU exactly as on the CPU: the 7×7 window at (50,101) — the sun's disc reflected off the
+mirror sphere — sums to `0.02041 = 1/49` on both, i.e. one saturated pixel each. The GPU is
+also ~14× faster there (16.5 s vs 229 s at 3000 spp), which is the point of the exercise.
+
+Area-light scenes are unchanged apart from float association: the `s == 1` estimator now
+spells `|cosSurf| · cosLight·A/(d²·pdfChoice)` where it used to spell `|cosSurf|·cosLight/d²
+÷ (pdfChoice/A)` — algebraically identical, ~1 ulp apart — and every other edit is gated
+behind `dIsDeltaEmitter`, which is false for them. The RNG draw order is byte-for-byte
+unchanged on every path (the `u1,u2` pair is still drawn before the shape branch).
+
+**Still open, smaller:** the GPU **VCM** kernels (`kVcmLightT`) have *not* been ported, so
+`cudaVcmSupported()` now carries its own explicit spot/sun reject instead of inheriting one
+from `cudaBdptSupported()`. A mode-U spot/sun scene therefore still runs on the CPU VCM
+(which does render it, since 0.125.0) — correct, just slower. The port is the same shape as
+this one but against SmallVCM's `dVCM`/`dVC`/`dVM` running-partial bookkeeping rather than
+PBRT's explicit pdf arrays; `src/vcm.h`'s three rules (delta ⇒ `dVC = 0` and `wLight = 0`;
+`dVCM` starts at Ω for a spot and πR² for a sun; skip the `dist²` fold on an infinite light's
+first edge) are what has to be transliterated.
 
 ### DONE (2026-08-03): the gallery Klein bottle is now a glassblower's bottle WITH THE INTERNALS, and it needs no mount
 

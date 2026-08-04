@@ -131,10 +131,14 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `specularArrival` is true — a single unbiased estimator with **no MIS weight**, since
   NEE runs at precisely the material types that then clear that flag. `Scene::sunCount`
   gates all of it, so sun-free scenes are untouched. Not area-*connectible*, but since
-  0.124.0 **CPU BDPT (`bdpt.h`) renders a Sun and a Spot anyway**, and since 0.125.0 so does
-  **CPU VCM (`vcm.h`)** — see "Delta lights in BDPT" below. The GPU BDPT/VCM kernels still
-  reject both (such a scene falls back to the CPU session), and Env/collimated stay outside
-  BDPT/VCM entirely. The Preetham sky's `sun_disk separate` option
+  0.124.0 **BDPT (mode `D`) renders a Sun and a Spot anyway** — on the CPU (`bdpt.h`) and,
+  since 0.126.0, on the **GPU** too (`render_cuda.cu`: `dGenLightSubpath`'s delta branch,
+  `dConnectBDPT`'s unified `Wgeom`, the delta-aware `dVertexPdfLight*`/`dMisWeight`, and
+  `DEscape` + `kBdptT`'s escaped-ray solar disc) — and since 0.125.0 so does **CPU VCM
+  (`vcm.h`)**; see "Delta lights in BDPT" below. The **GPU VCM** kernels are the one holdout
+  (`cudaVcmSupported` carries its own spot/sun reject, so mode `U` on such a scene falls back
+  to the CPU session), and Env/collimated stay outside BDPT/VCM entirely.
+  The Preetham sky's `sun_disk separate` option
   (`sky::SunDisk`) unbakes the solar disc from the env map and registers an
   energy-matched Sun instead — the same picture, converging ~20× faster in forward modes.
   **Mesh area lights** (since 0.41.0): a
@@ -716,6 +720,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   Gated by `Scene::sunCount` so sun-free scenes pay nothing.
   `scenes/_deltalight_mix.ftsl` is the regression scene (area + spot + sun + a mirror
   sphere); mode `D` vs mode `R` agrees to 0.33 % of mean luminance.
+
+  Since **0.126.0 the same treatment runs on the GPU**, so a spot/sun scene no longer falls
+  back to the CPU in mode `D`. `render_cuda.cu` mirrors every piece one-for-one:
+  `dIsDeltaEmitter`/`dIsInfiniteEmitter`/`dIsDeltaLightVertex` classify a `DEmitter` (the
+  device vertex has no light pointer, so `dVertexPdfLightF` took a `const DScene&` to reach
+  `sc.emitters[lightIdx]`); `dVertexPdfLightOriginF` returns 0 for a delta; `dMisWeight`'s
+  light loop skips the delta-previous term — with the twist that the device does *not* mutate
+  the vertex arrays the way pbrt's ScopedAssignment does, so the `i == 0` test must read the
+  substituted endpoint out of `*QsP` when `s == 1` (`(si == 0) ? *QsP : light[0]`);
+  `dGenLightSubpath` grew the delta branch (point origin for a Spot, `sceneRadius` disc for a
+  Sun, plus the same `path[1].pdfFwd` planar-density patch); `dConnectBDPT`'s `s == 1` folds
+  the three families into the same `Wgeom`; and the escaped-ray sun rides home in a new
+  `DEscape` (filled by `dRandomWalk` on a miss, threaded through `dGenCameraSubpath`) which
+  `kBdptT` accumulates straight into `camFilm` under the all-delta gate. `cudaBdptSupported()`
+  consequently rejects only `Env` / `collimated`. Validated CPU-vs-GPU at equal spp:
+  `_spot_cornell` 0.9963 mean ratio, `_sun_check` 0.9992, `_deltalight_mix` 0.9989 (absolute
+  units) with the mirror's solar disc identical on both backends, and `cornell.ftsl` unchanged
+  apart from ~1 ulp of float association in the rewritten `s == 1` estimator. The device is
+  ~14× faster on the mix scene (16.5 s vs 229 s).
 
   **Delta lights in VCM** (since 0.125.0): the same treatment, restated in SmallVCM's
   compact `dVCM`/`dVC`/`dVM` running-partial-MIS form (`vcm.h` does *not* keep pbrt's
@@ -1321,8 +1344,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `g_pmFinalGather==0` caller gates in `main.cpp` were dropped. Validated GPU==CPU on a Cornell
   glass-sphere+diffuse-walls box (mean 0.43%, background 0.98%, per-pixel noise √-scaling with
   spp — unbiased). Since 0.39.0 (M12) there is a resident **GPU VCM/UPS** session (mode `U`,
-  `VcmSession`, `cudaVcmSupported == cudaBdptSupported && media.empty()` — surfaces-only, pinhole
-  only) mirroring `vcm.h`'s `vcmPass`: each pass (1) `kVcmLight` traces one light subpath per pixel,
+  `VcmSession`, `cudaVcmSupported == cudaBdptSupported && media.empty()` **plus its own spot/sun
+  reject** since 0.126.0 — surfaces-only, pinhole only; `kVcmLightT` has not been ported to delta
+  emitters, and without the explicit reject it would draw a spot/sun out of the power CDF and then
+  discard it, losing that path) mirroring `vcm.h`'s `vcmPass`: each pass (1) `kVcmLight` traces one light subpath per pixel,
   storing connectible vertices into a **per-path slab** (`lvSlab[i·vcmCap+k]`, no cross-thread
   atomics) and splatting the connect-to-camera (t=1) light-image contributions (atomic into a
   per-pass double buffer); (2) compacts the slab **on-device** (0.39.1: thrust scans over the
@@ -1364,9 +1389,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   BDPT still can't render — **fluorescence**, **layered stacks**, **env/collimated lights** —
   are *not* GPU gaps: `main.cpp`'s mode-D guard (`bdptUnsupportedFeature`) refuses those scenes (or
   demotes D→B with `-on-unsupported fallback`) on both backends before any BDPT dispatch, so they
-  never reach the device path. **Spot/sun lights are a genuine GPU gap** since 0.124.0: the CPU
-  BDPT renders them but the device kernels do not, so `cudaBdptSupported` rejects them and the
-  scene falls back to CPU BDPT with a printed notice (see known-issues). GRIN media (curved
+  never reach the device path. **Spot/sun lights** were a genuine GPU gap from 0.124.0 to
+  0.125.0; since 0.126.0 the device kernels do them too (see "Delta lights in BDPT" above), so
+  `cudaBdptSupported` no longer rejects such a scene — mode `U` is now the only mode that
+  demotes a spot/sun scene to the CPU. GRIN media (curved
   paths) likewise keep an in-scope mode-D scene
   on the CPU (spectral rainbow-phase media now render on-device in mode D since M10/0.37.0). Validated GPU==CPU on `textured.ftsl` (mean 0.06%,
   per-pixel diff halving 8.2%→4.3% at 4× spp — unbiased), `mixmat.ftsl` (mean 0.21%),
