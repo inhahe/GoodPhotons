@@ -7782,6 +7782,79 @@ Three conclusions, two of which reverse what the scene used to claim:
    centred on its column) so the soft 2x patch and the piece's own glints land on white — there
    is no focus to chase and the scene now says so.
 
+**FURTHER RETRACTION, and the actual fix for COLOUR (2026-08-04).** Conclusions 1 and 2 above
+are about *brightness*, and re-metering at the honest 2x bar showed the colour question had not
+actually been answered by any of it: at 2x, **both** gyroid forms, the Klein bottle and a prism
+all score 0.00% coverage, and the orb — the scene's brightest caustic — is a near-white disc.
+The reason `sat` never revealed this is that `sat` measures distance from white and cannot tell
+a uniformly amber patch from a red-to-violet fan. `_gemsweep.py` now also reports **spread**:
+per caustic cell take chromaticity (r, b) = (R, B)/(R+G+B), find the excess-weighted centroid,
+and report twice the weighted RMS radius about it. White collapses to a point plus sampler
+noise; a spectrum is a long streak.
+
+**Brightness and colour are separate properties.** A caustic is bright because a surface
+*converges* light and coloured because it disperses light *sideways*, and the two normally
+exclude each other: a ball lens is concentric, so its dispersion is purely longitudinal (every
+wavelength on the same axis a little deeper, stacking into one white disc), while a prism
+disperses hard sideways but is parallel-in/parallel-out, so it never converges and its coloured
+band never rises above the bare sunlight beside it. An **axicon** — a flat top over a cone —
+does both: light enters the top undeviated, every point of the conical exit face is a prism at
+the *same* tilt, so the deviation is constant (a line focus, hence bright) while the dispersion
+is a prism's (hence coloured). Measured at 2x, each piece at its own best drop:
+
+| piece | coverage | sat | **spread** |
+|---|---|---|---|
+| **axicon**, 45 deg, apex down, drop 0.35 | 0.29% | **0.320** | **0.212** |
+| axicon, same, drop 0.90 | 0.31% | 0.319 | 0.183 |
+| apex-**up** cone, 42 deg, drop 0.90 | 0.07% | 0.289 | 0.157 |
+| round **brilliant** cut, R=0.40, drop 0.90 | 0.18% | 0.257 | 0.092 |
+| oblate spheroid (astigmatic lens) | 0.19% | 0.196 | 0.051 |
+| crystal **orb**, drop 0.80 | 0.16% | 0.265 | 0.048 |
+| glass torus (ring lens) | 0.03% | 0.210 | 0.045 |
+| solid gyroid k=10 / shell gyroid k=13 / Klein / prism | **0.00%** | — | — |
+
+Three further conclusions:
+
+4. **A round brilliant LOSES**, which is a surprise given the trade cut it for "fire". Built as
+   an intersection of half-spaces (1 table + 16 girdle + 8 crown bezels at 34.5 deg + 8 pavilion
+   mains at 40.75 deg) it scores 0.092 spread, because a 40.75 deg pavilion sits just past
+   crystal's 40.2 deg critical angle and **total-internally-reflects** — it throws the fire back
+   up at the viewer, not down at the table. Sweeping the pavilion to 20/25/30/35 deg does not
+   recover it.
+5. **The lattice cannot be rescued by reshaping its outer boundary.** Clipping the solid gyroid
+   to this same axicon instead of to a ball measures 0.13% / 0.205 / 0.099 — less than half a
+   plain axicon on every axis. The clip only sets the *first* surface a ray meets, and behind it
+   are the same internal sheets that make a gyroid a diffuser. So the crystal gyroid stays as
+   it is and the colour source is an **additional** exhibit, not a replacement.
+6. **The scene now has a tenth exhibit, `crystal_axicon`** — a 45 deg cone 1.12 m across, hung
+   apex down on three short pins with its point 0.07 m over the tabletop, at near-left
+   (2.60, 5.45). Its cap is 1.6 x 1.1, *wide and shallow* where every other cap is square or
+   deep, because an axicon's caustic reads as two rainbow cusps flanking the piece rather than a
+   disc under it, and it is cantilevered only 0.12 m (a lens throws its focus ~0.98 m downwind
+   per metre of drop; an axicon has no focal *point* to displace, only a focal *line* starting
+   at the exit face). Drop 0.35 and 45 deg are both metered optima — colour falls off
+   monotonically above ~0.5 m of drop, and past 45 deg the exit face starts to TIR exactly as
+   the brilliant's pavilion does.
+
+   **Siting gotcha worth remembering: in this scene the NEAR row is HIGH z, not low z.** The
+   still camera stands at (5.0, 2.95, 9.35) and looks toward -z, so "front of the gallery"
+   means z around 5-7. The axicon's first site was z=1.10 — which reads as "front" on the page,
+   since the file lists the low-z exhibits last — and that put it 8.4 m out and directly BEHIND
+   the crystal gyroid, which occluded it completely. Nothing in the scene text or the audits
+   catches this; only projecting the candidate point through the camera basis does (or
+   rendering it, which is how it was found). At z=5.45 the piece is 4.2 m out at 178 px/m and
+   clears the gyroid on screen by ~24 px.
+
+**Tooling bug found and fixed along the way: `rotate` is not a valid key inside an FTSL
+`function` block** (only `translate` is), and the loader emits a **warning, not an error**, then
+carries on — so a rotated field silently renders unrotated. A prism roll sweep came back as six
+identical rows before this was noticed. Fixed two ways: rotate half-space normals *algebraically*
+in the generator (a half-space `n.p <= d` under `p = Rq` is `(R^T n).q <= d`, so pre-rotating the
+normals is exact and needs no transform support), and gate every generated scene through
+`-parseonly`, raising on any warning rather than measuring the wrong object. **Worth checking
+whether other FTSL blocks accept unknown keys with only a warning** — a silent mis-parse that
+still renders is the worst failure mode a scene language can have.
+
 **RETRACTION: "render mode M" was bad advice — mode M silently drops participating media.**
 `src/photonmap_render.h` contains no `scene.media` handling at all; its only `Medium` symbols
 are the nested-dielectric IOR stack. Verified by running gallery_rain in mode M: the cloud,

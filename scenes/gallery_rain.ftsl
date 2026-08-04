@@ -2,7 +2,10 @@
 #
 # The same nine hero pieces, in the same places, as scenes/gallery_settled.ftsl (which stays
 # the canonical still + flyby scene; this is a separate edition, not a replacement — it is a
-# copy of that file, so re-bake it from gallery.ftsl the same way if the pieces ever move).
+# copy of that file, so re-bake it from gallery.ftsl the same way if the pieces ever move),
+# plus a TENTH that exists only here: the CRYSTAL AXICON, front-left, which is the only piece
+# in either scene that throws a genuinely COLOURED caustic. See its own block down in HERO
+# PIECES for the measurements that chose its shape, angle and height.
 # What is different here is the weather, and the setting built to make the weather legible:
 #
 #   * NO ROOM. The walls, the ceiling and the polished stone floor are gone. In their place
@@ -253,8 +256,10 @@ material "morpho"   { preset morpho }       # iridescent multilayer Bragg (blue 
 material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) — 2nd iridescent, different model
 
 # --- THE GROUND. One quad, 46 x 45 m, x[-18,28] z[-19,26] — no walls, no ceiling.
-# The exhibits still occupy the old hall's footprint (x in [3.2, 6.8], z in [1.5, 4.8]) so
-# nothing has moved; there is simply nothing around them any more.
+# The exhibits used to occupy the old hall's footprint (x in [3.2, 6.8], z in [1.5, 4.8]); the
+# 1.6x SPREAD below opened that to caps spanning x [1.90, 8.25] and z [0.34, 7.10], and the
+# crystal axicon then extended it to x=1.80. `scraps/_standaudit.py -v` prints the current
+# footprints — read them off it rather than off this comment before siting anything new.
 #
 # The extent is a compromise, not a "make it huge". `light sun`'s power is
 # irradiance * pi * R_scene^2, and R_scene is set by the geometry, so every metre of ground
@@ -578,6 +583,63 @@ isosurface "stand_oil" {   # cap top y=0.92
 isosurface "stand_oil_cap" { material capwhite
     box { center 5.3 0.905 1.5  size 0.82 0.03 0.82  round 0.02 } }
 }
+
+# --- exhibit: CRYSTAL AXICON (the tenth stand, and the only NEW one) -------------------
+# Authored directly in WORLD coordinates, with no `group { translate }` wrapper — unlike the
+# other nine it has no earlier layout position to be displaced from, so there is nothing to
+# offset and a `translate 0 0 0` would be noise. `scraps/_standaudit.py` sums enclosing
+# group translates and simply gets (0,0,0) here, which is correct.
+#
+# WHY IT EXISTS: nothing in this scene threw a COLOURED caustic. See the piece itself, down
+# in HERO PIECES, for the measurements; the short version is that the orb and both gyroids
+# make a white or faintly-tinted patch and the axicon makes a spectrum.
+#
+# WHY HERE: near-left, at (2.60, 5.45). Four constraints picked it and all four are checked:
+#   * clear of every existing cap and of the crystal gyroid it stands beside. Its cap reaches
+#     z=4.78 and stand_diamond_cap ends at z=4.40 (0.38 m); the gyroid ball itself ends at
+#     z=4.65 and this piece starts at 4.89 (0.24 m). `scraps/_standaudit.py` checks the caps
+#     and cages; `-v` prints every footprint, which is what to read before siting anything.
+#   * clear of the FLYBY, by 1.53 m (`scraps/_flyplan.py` carries it as a collider).
+#   * IN FRAME and UNOCCLUDED for the still camera at (5.0, 2.95, 9.35), 29.5 deg off axis
+#     against a 40.9 deg half-width. THE NEAR ROW IS HIGH z, NOT LOW z — the camera stands at
+#     z=9.35 and looks toward -z, so "front of the gallery" means z around 5-7, and the first
+#     siting of this piece (at z=1.10, which reads as "front" on the page) put it 8.4 m away
+#     and directly BEHIND the crystal gyroid, which occluded it completely. At z=5.45 it is
+#     4.2 m out and 178 px/m, so the cone renders larger than the gyroid ball beyond it, and
+#     the two clear each other on screen by ~24 px.
+#   * it balances the frame. The right half carries the gold gyroid, the orb, the cloud and
+#     the rain; the near-left was empty grid, and the scene's whole reason for losing its roof
+#     was that its left half sat in permanent shadow.
+isosurface "stand_axicon" {   # cap top y=0.90
+    material wirecage  union {
+        difference {
+            box { center 2.6 0.1 5.45  size 0.74  0.2   0.74  }
+            box { center 2.6 0.1 5.45  size 0.76  0.178 0.718 }
+            box { center 2.6 0.1 5.45  size 0.718 0.22  0.718 }
+            box { center 2.6 0.1 5.45  size 0.718 0.178 0.76  }
+        }
+        difference {
+            box { center 2.6 0.55 5.45  size 0.3   0.7   0.3   }
+            box { center 2.6 0.55 5.45  size 0.32  0.678 0.278 }
+            box { center 2.6 0.55 5.45  size 0.278 0.72  0.278 }
+            box { center 2.6 0.55 5.45  size 0.278 0.678 0.32  }
+        }
+    }
+}
+isosurface "stand_axicon_cap" { material capwhite
+    # The THIRD cantilevered cap, and the shallowest cantilever of the three, because an
+    # axicon's caustic barely walks at all. A lens throws its focus a full 0.98 m downwind
+    # per metre of drop; this piece's patch measures a core only 0.31 m off its own axis
+    # (scraps/_gemsweep.py `piece vcone1.0 0.35`), because an axicon has no focal POINT to
+    # be displaced — it has a focal LINE that starts at the exit face. So the cap is pulled
+    # only 0.12 m toward -z, not most of a metre.
+    #
+    # 1.6 x 1.1 is measured, not chosen: 90% of the caustic's light falls within
+    # x -0.74..+0.69 and z -0.60..+0.36 of the piece's axis. Centred at (2.60, 5.33) that
+    # spans x 1.80..3.40 and z 4.78..5.88, which contains all of it with ~0.05 m to spare.
+    # It is WIDE and SHALLOW for the same reason the caustic is: the two bright cusps sit
+    # left and right of the piece, not fore and aft.
+    box { center 2.6 0.885 5.33  size 1.6 0.03 1.1  round 0.02 } }
 
 # ==============================  HERO PIECES  =================================
 # Each piece is wrapped in the SAME `group { translate }` as its stand — see THE SPREAD
@@ -912,6 +974,95 @@ isosurface "chrome_ring" {
     material chrome
     torus { translate 3.5 1.30 2.0   rotate 90 0 0   major 0.34   minor 0.10 }
 }
+}
+
+# --- CRYSTAL AXICON (front-left; NOT settled — levitated, analytic placement) ----------
+# THE SCENE'S COLOUR SOURCE, and the only piece in it chosen for that job by measurement
+# rather than by eye. `scraps/_gemsweep.py` renders a candidate over a bare cap under this
+# scene's own sun and meters four things: peak brightness, the fraction of the cap covered
+# above 2x the bare sunlight, `sat` (how far the caustic is from white), and `spread` — the
+# one that actually answers the question, because `sat` cannot tell a uniformly amber patch
+# from a red-to-violet fan. `spread` is twice the excess-weighted RMS radius of the caustic's
+# CHROMATICITY scatter, so white collapses to a point and a real spectrum is a long streak.
+#
+#     piece (crystal, best drop for each)        coverage   sat     spread   peak
+#     AXICON, 45 deg, apex down, drop 0.35         0.29%   0.320    0.212    5.9x   <- this
+#     axicon, same, drop 0.90                      0.31%   0.319    0.183    7.1x
+#     apex-UP cone, 42 deg, drop 0.90              0.07%   0.289    0.157    ~3x
+#     round BRILLIANT cut, R=0.40, drop 0.90       0.18%   0.257    0.092    3.6x
+#     oblate spheroid (astigmatic lens)            0.19%   0.196    0.051    ~4x
+#     ORB (what the scene already had), drop 0.80  0.16%   0.265    0.048    6.0x
+#     glass torus (ring lens)                      0.03%   0.210    0.045    ~3x
+#     SOLID gyroid k=10   (the crystal gyroid)     0.00%     -        -       -
+#     shell gyroid k=13, klein bottle, prism       0.00%     -        -       -
+#
+# WHY A CONE, when a sphere is the obvious lens. A caustic is BRIGHT because a surface
+# CONVERGES light and COLOURED because it disperses light SIDEWAYS, and the two normally
+# exclude each other. A ball lens is concentric, so its dispersion is purely LONGITUDINAL:
+# every wavelength lands on the same axis a little deeper, and they stack into one white disc
+# with a faint coloured rim (hence the orb's spread of 0.048 — the scene's brightest caustic
+# is also one of its whitest). A prism disperses hard sideways but has parallel entry and
+# exit geometry, so it never converges at all and its coloured band never rises above the
+# bare sunlight beside it — a flat 0.00% here, which is not a bug but the answer.
+#
+# A cone breaks the trade-off. Light enters the flat top undeviated, and every point of the
+# conical exit face is a prism at the SAME tilt — so the deviation is constant, which gives a
+# line focus (bright), while the dispersion is a prism's (coloured). That is 4.4x the orb's
+# chromatic spread at comparable brightness, and it is why the caustic reads as two rainbow
+# CUSPS flanking the piece rather than as a disc under it.
+#
+# WHY NOT THE OBVIOUS "GEM". A flat table over a conical bottom is exactly what a cut gem is,
+# and the trade evolved that cut for "fire", so a round brilliant was built and measured
+# (1 table + 16 girdle + 8 crown bezels at 34.5 deg + 8 pavilion mains at 40.75 deg, as an
+# intersection of half-spaces). It LOSES, at 0.092 spread, and the reason is the point of the
+# cut: a 40.75 deg pavilion sits just past crystal's 40.2 deg critical angle, so the pavilion
+# TOTAL-INTERNALLY-REFLECTS and throws the fire back up at the viewer instead of down at the
+# table. Sweeping the pavilion below the critical angle (20/25/30/35 deg) did not recover it.
+#
+# WHY THE LATTICE CANNOT DO THIS JOB, however it is shaped. The obvious way to keep the
+# crystal gyroid AND get colour was to clip the gyroid to this axicon instead of to a ball,
+# which was built and measured too: 0.13% / sat 0.205 / spread 0.099, less than half this
+# piece on every axis. The outer boundary only sets the FIRST surface a ray meets; behind it
+# are the same thin curved internal sheets that make a gyroid a DIFFUSER. So the crystal
+# gyroid stays exactly as it is, and this is an additional exhibit rather than a replacement.
+#
+# DROP 0.35 IS MEASURED. Sweeping the height at 45 deg (spread / sat):
+#     drop 0.35   0.212 / 0.320   <- best on both, and the tightest patch (1.43 x 0.96 m)
+#     drop 0.45   0.206 / 0.282
+#     drop 0.60   0.197 / 0.297
+#     drop 0.90   0.183 / 0.319       patch has grown to 2.16 x 1.43 m
+#     drop 1.10   0.142 / 0.261
+# Colour falls off monotonically with height because the cusps keep separating while the
+# light in them does not grow — past ~0.5 m the patch dilutes faster than the spectra
+# separate. So this piece hangs LOW: apex at y=0.97, just 0.07 m over the tabletop.
+#
+# 45 DEG (k=1.0) IS MEASURED TOO. At drop 0.90, sweeping the half-angle: k=0.8 gave
+# 0.137 spread, k=1.0 gave 0.183, k=1.1 gave 0.094, k=1.2 gave 0.072. Steeper than 45 deg and
+# the exit face starts to total-internally-reflect, exactly as the brilliant's pavilion does.
+#
+# The field is max() of the cone against the two end slabs; every term is unit-Lipschitz
+# except the cone's, whose gradient is sqrt(2), so max_gradient 2 is exact and generous.
+isosurface "crystal_axicon" {
+    material glass
+    function {
+        translate 2.6 1.25 5.45
+        expr "max(sqrt(x*x + z*z) - (0.28 + y), max(-y - 0.28, y - 0.28))"
+    }
+    contained_by { min 2.00 0.95 4.85   max 3.20 1.55 6.05 }
+    max_gradient 2
+}
+# The same three-pin mount the orb and the crystal gyroid use, but SHORT: the cone's surface
+# radius is 0.28 + y, so a pin standing at horizontal radius 0.30 meets it at y = +0.02, i.e.
+# world y = 1.27, and the reach from the cap top at 0.90 is only 0.37 m. Azimuths 0/120/240
+# from +z put one pin on the +z side, away from the caustic (which sits at -z), and the other
+# two at x = 2.34 and 2.86 — between the core at x=2.67 and the cusps at x=1.88 and 3.32, so
+# their 12 mm shadows fall on neither.
+isosurface "stand_axicon_mount" {
+    material wirecage  union {
+        box { center 2.6000 1.085 5.7500  size 0.012 0.37 0.012 }
+        box { center 2.8598 1.085 5.3000  size 0.012 0.37 0.012 }
+        box { center 2.3402 1.085 5.3000  size 0.012 0.37 0.012 }
+    }
 }
 
 # ==============================  LIGHTING  ====================================

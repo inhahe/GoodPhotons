@@ -1420,6 +1420,78 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       Above 1.5× everything except the orb and the solid gyroids goes to *zero*. The Klein
       bottle cannot be rescued at all: a 2.4 mm wall is optically a window, and making it
       solid would destroy the internal tube that is the piece's whole point.
+    - **Brightness and colour are separate properties, and the shape that gives both is a
+      cone.** A caustic is *bright* because a surface **converges** light and *coloured*
+      because it disperses light **sideways**, and the two normally exclude each other. A ball
+      lens is concentric, so its dispersion is purely *longitudinal*: every wavelength lands on
+      the same axis a little deeper and they stack into one white disc with a tinted rim. A
+      prism disperses hard sideways but is parallel-in/parallel-out, so it never converges and
+      its coloured band never rises above the bare sunlight beside it — it scores a flat 0 % on
+      any threshold worth using, which is the answer and not a bug. An **axicon** (flat top
+      over a cone) breaks the trade-off: light enters the top undeviated, and every point of
+      the conical exit face is a prism at the *same* tilt, so the deviation is constant (a line
+      focus — bright) while the dispersion is a prism's (coloured).
+    - **`sat` cannot tell a uniform tint from a rainbow; `spread` can.** `sat` is distance from
+      white, so a uniformly amber patch and a red-to-violet fan score alike. `_gemsweep.py`
+      therefore also reports **spread**: per caustic cell take the chromaticity
+      (r, b) = (R, B)/(R+G+B), find the excess-weighted centroid, and report twice the weighted
+      RMS radius about it. White or uniformly tinted collapses to a point plus sampler noise; a
+      real spectrum is a long streak. Measured at the honest 2× bar, each piece at its own best
+      drop:
+
+      | piece | coverage | sat | **spread** |
+      |---|---|---|---|
+      | **axicon**, 45°, apex down, drop 0.35 | 0.29 % | **0.320** | **0.212** |
+      | axicon, same, drop 0.90 | 0.31 % | 0.319 | 0.183 |
+      | apex-**up** cone, 42°, drop 0.90 | 0.07 % | 0.289 | 0.157 |
+      | round **brilliant** cut, R = 0.40 | 0.18 % | 0.257 | 0.092 |
+      | oblate spheroid (astigmatic lens) | 0.19 % | 0.196 | 0.051 |
+      | crystal **orb**, drop 0.80 | 0.16 % | 0.265 | 0.048 |
+      | glass torus (ring lens) | 0.03 % | 0.210 | 0.045 |
+      | **solid gyroid k=10, shell gyroid k=13, Klein bottle, prism** | **0.00 %** | — | — |
+
+      The orb is the scene's brightest caustic *and* one of its whitest. Two results are worth
+      keeping: a **round brilliant loses**, because a 40.75° pavilion sits just past crystal's
+      40.2° critical angle and total-internally-reflects the fire back up at the viewer instead
+      of down at the table (sweeping the pavilion to 20–35° does not recover it); and **the
+      lattice cannot be rescued by reshaping its outer boundary** — a solid gyroid clipped to
+      this same axicon measures 0.13 % / 0.205 / 0.099, less than half a plain axicon, because
+      the clip only sets the *first* surface a ray meets and behind it are the same internal
+      sheets that make a gyroid a diffuser.
+    - **An axicon's caustic barely walks with height, and lands beside the piece rather than
+      under it.** A lens throws its focus ~0.98 m downwind per metre of drop (the sun walks
+      +0.2079 x / −0.9788 z), which is why the orb's and the gyroid's caps are cantilevered
+      most of a metre. An axicon has no focal *point* to displace — it has a focal *line*
+      starting at the exit face — so at drop 0.35 the core sits only 0.31 m off its own axis
+      and the cap is pulled just 0.12 m. What it *does* need is **width**: the caustic reads as
+      two bright rainbow cusps flanking the piece left and right, and 90 % of its light falls
+      within x ±0.72 m but z −0.60…+0.36 m, so its cap is wide and shallow (1.6 × 1.1) where
+      every other cap is roughly square or deep. Both the extent and the core offset are
+      reported by `_gemsweep.py` as excess-weighted 5–95 % quantiles, *not* a raw bounding box:
+      a handful of stray sparkle cells at the frame edge trebled the raw box.
+    - **The scene's colour source is a tenth exhibit, the CRYSTAL AXICON**, added rather than
+      swapped in because nothing already present could be made to do the job (see above: the
+      lattice cannot, whatever its outer shape, and the Klein bottle is a window). A 45° cone,
+      1.12 m across, hung **apex down** on three short pins with its point 0.07 m over the
+      tabletop, at near-left (2.60, 5.45). It is the only exhibit authored directly in **world
+      coordinates with no `group { translate }` wrapper**, because unlike the other nine it has
+      no earlier layout position to be displaced from. Its site is checked four ways: 0.38 m
+      clear of the nearest cap and 0.24 m clear of the crystal gyroid beside it
+      (`_standaudit.py -v`), 1.10 m clear of the flyby (`_flyplan.py`), 29.5° off the still
+      camera's axis against a 40.9° half-width, and it balances a frame whose left half was the
+      original reason the scene lost its roof. **The near row is high z, not low z** — the
+      camera stands at z=9.35 looking toward −z, so "front of the gallery" is z ≈ 5–7. Siting
+      it at z=1.10, which reads as "front" on the page, put it 8.4 m out and directly *behind*
+      the crystal gyroid, which occluded it completely; the error was invisible in the scene
+      text and obvious the moment it was rendered. Project the candidate point through the
+      camera basis before committing to a position.
+    - **`rotate` is not a valid key inside an FTSL `function` block** (only `translate` is), and
+      the loader emits a **warning, not an error**, then carries on — so a rotated field
+      silently renders unrotated. A prism roll sweep came back as six identical rows before
+      this was found. Two fixes: rotate half-space normals *algebraically* in the generator (a
+      half-space `n·p ≤ d` under `p = Rq` is `(Rᵀn)·q ≤ d`, so pre-rotating the normals is
+      exact and needs no transform support), and gate every generated scene through
+      `-parseonly`, failing loudly on any warning rather than measuring the wrong object.
     - **Per-pixel chroma is unmeasurable in mode `D`, so the metric has to downsample first.**
       Mode `D` renders one hero wavelength per sample, so a dispersive caustic arrives as
       chromatic *speckle* and per-pixel saturation measures the sampler, not the optics. The
@@ -1442,8 +1514,11 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     - **Cap-vs-cap clearance is not enough; caps must be checked against neighbouring
       COLUMNS.** Two caps each occupy one thin y slab, so they may overlap in plan freely. A
       column spans a whole y range, so plan overlap *is* intersection. `scraps/_standaudit.py`
-      brace-parses every cage's outer box and every cap box and checks all 33 colliders across
-      the 10 stands in 3-D; run it after any stand edit. It is **spread-aware** — it
+      brace-parses every cage's outer box and every cap box and checks all 39 colliders across
+      the 11 stands in 3-D; run it after any stand edit (`-v` also lists every cap's world
+      footprint, which is what you need in front of you before siting a new exhibit — the
+      question is never "is there floor", since there are no walls, but "how wide a cap fits
+      between its neighbours"). It is **spread-aware** — it
       accumulates every enclosing `group`'s translate onto each collider, because the boxes
       are authored in the pre-spread frame and reading them off the page would audit a layout
       the scene no longer has.
