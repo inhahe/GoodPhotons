@@ -7703,7 +7703,119 @@ size:
    0.30 (unclipped, 129/255): at 413 spp there is a faintly brighter region in about the right
    place, buried in chromatic fireflies.
 
-Fix, when someone takes it: drop the cap albedo to ~0.25-0.35, raise the glass sphere ~0.2 m
-off its cap so the cap sits nearer the focal distance, shift that cap ~0.3 m toward -z, and
-render mode M (or a much longer D). Note that (1) alone is what takes it from impossible to
-merely faint — the geometry changes are what make it bright.
+**Addressed (2026-08-04)** in the scene, with one part of the recipe RETRACTED:
+
+- (1) `capwhite` albedo 0.88 -> **0.30**. This is the change that matters; the rest only make
+  the caustic bright once there is headroom for "bright" to mean anything.
+- (2) The orb is **levitated 0.30 m** on three `wirecage` pins (`stand_glass_mount`) to
+  `center 6.7 1.70 3.5`, an 0.80 m drop to the cap. The height was **measured, not computed**:
+  the textbook ball-lens `f = nR/(2(n-1))` = 0.734 m is *paraxial*, and a full-aperture sphere
+  has gross spherical aberration, so the marginal rays (which carry most of the flux, area
+  going as r^2) cross far nearer the glass and the paraxial focus is the wrong target.
+  `scraps/_focalsweep.py` renders the orb at a range of heights and meters peak linear
+  irradiance on the cap:
+
+  | drop | peak (linear) | |
+  |---|---|---|
+  | 0.50 | 0.371 | orb resting tangent on the cap — the original scene |
+  | 0.65 | 0.371 | |
+  | **0.80** | **0.642** | best; 73% brighter than either neighbour 0.15 m away |
+  | 0.95 | 0.424 | |
+  | 1.15 | 0.363 | |
+
+  So the original scene was at 0.58x of the achievable peak — badly metered *and* badly placed.
+  The trade-off at 0.80: the sight line to the disc centre passes 0.514 m from the orb centre,
+  i.e. it clears the 0.5 m limb only barely, so the disc reads as breaking out from behind the
+  glass rather than sitting cleanly beside it. Deliberate, for the 1.5x brightness.
+- (3) The glass cap is 1.7 deep and **cantilevered 0.45 m in -z** off its column, which is
+  where the disc actually lands: (6.87, 2.72), from +0.2079 x / -0.9781 z per metre of drop.
+  Its stand also moved x 6.2 -> 6.7 to make room (and to fix an unrelated intersection, below).
+
+Result at 1400 spp, mode D, profiled along the sun azimuth on the glass cap (sRGB): shadow
+floor 84-100, sunlit cap 145-151, **caustic peak 176.3** — i.e. in linear light the caustic
+adds ~1.6x the direct sun's own contribution. It is a real caustic, not a bright patch.
+
+**RETRACTION: "render mode M" was bad advice — mode M silently drops participating media.**
+`src/photonmap_render.h` contains no `scene.media` handling at all; its only `Medium` symbols
+are the nested-dielectric IOR stack. Verified by running gallery_rain in mode M: the cloud,
+the rain and the rainbow are simply absent and the sky is pure black. For this scene mode **D**
+is the correct choice and always was — `main.cpp` (~line 4491) explicitly exempts D from the
+`mediaNeedForward` warning because "it handles multiple superposed, box/sphere/object-bounded
+AND heterogeneous media correctly on both devices". See the next entry.
+
+---
+
+### OPEN: mode `M` (and `S`) silently ignore participating media instead of refusing the scene
+
+`src/photonmap_render.h` has no participating-media code — no free-flight sampling, no volume
+photon deposits, no in-scatter on the camera walk. (`photonmap.h`'s header comment claims the
+pass "deposits a record at each diffuse/**volume** vertex", which is aspirational.) A scene
+with a `medium` therefore renders in mode M as if the medium were not there.
+
+The problem is not the missing feature, it is that **nothing tells you**. ftrace already has
+the machinery to say so: `unsupportedFeature()` / `vcmUnsupportedFeature()` in `main.cpp`
+(~3960, ~4004) make mode `U` refuse a scene outright with "participating media (mode U is
+surfaces-only)", and `prefer{}/else{}` then falls through to a mode that works. Modes `M` and
+`S` have no such check, so `gallery_rain` — whose whole subject is a rain cloud and a rainbow —
+rendered a black sky for six minutes with no diagnostic.
+
+Reproduce: `ftrace scenes/gallery_rain.ftsl -mode M -n 4e8 -spp 24 -o png/x.png` and compare
+with `-mode D`. Cloud, rain and bow are missing.
+
+Proper fix: add `scene.media.empty()` to the mode `M`/`S` support predicate alongside mode U's,
+so a media scene either refuses (and `prefer{}` falls through) or at minimum warns. The real
+fix — a volume photon map with beam/point-query in-scatter — is a much larger job and should be
+tracked separately; refusing loudly is the correct behaviour until then.
+
+---
+
+### DONE (2026-08-04): `gallery_rain` stand caps intersecting neighbouring stands' columns
+
+Widening the caps for the caustic work put `stand_gyroid_cap` (2.3 x 2.3 at x=5.0, z=4.8,
+y=0.52..0.55) straight through the glass stand's COLUMN (x 5.99..6.41, y 0.18..0.87). The
+audit done at the time compared cap-vs-cap only and concluded the caps "stagger like shelves";
+that reasoning is valid for two caps (each occupies one thin y slab) and invalid for a cap
+against a column (which spans a whole y range, so plan overlap = intersection).
+
+Two further intersections turned up that PREDATED the wireframe rework, both base slab against
+base slab: `stand_gyroid` x `stand_glass` (0.30 x 0.18 x 0.20) and `stand_klein` x `stand_brass`
+(0.61 x 0.22 x 0.11).
+
+Fixed: gyroid cap 2.3 x 2.3 -> 2.3 x 2.1 (near edge 3.65 -> 3.75, clearing both the glass and
+diamond columns); `stand_glass` x 6.2 -> 6.7; `stand_brass` z 2.0 -> 1.84 with the settled
+`brass_cluster` shifted by the same -0.16. `scraps/_standaudit.py` now audits all 30 colliders
+across the 9 stands in 3-D and comes back clean — run it after any stand edit.
+
+The audit script itself had a bug worth remembering: it terminated each `isosurface` block on a
+regex `\n\}`, but cap blocks are written `isosurface "x_cap" { material capwhite\n    box {...} }`
+and close on the SAME line, so every cap silently swallowed the following stand and reported
+that stand's cage boxes under the cap's name (8 stands instead of 9, and 18 bogus duplicate
+pairs). It now uses a real brace matcher.
+
+---
+
+### OPEN (2026-08-04): a dispersive caustic in mode `D` is single-wavelength with no variance reduction — chromatic speckle is unavoidable
+
+Mode `D` is the only mode that renders a scene containing both participating media and a
+dispersive caustic (M and S drop the media, see above; U refuses media outright). But every
+wavelength-sharing optimisation the renderer has is off in exactly that combination:
+
+- **`-heroc` (hero-wavelength bundle) is disabled by the media.** It is documented as "ignored
+  (still single-lambda) by ... any scene with participating media", so `gallery_rain` gets no
+  bundle at all.
+- **A dispersive refraction would de-hero the bundle anyway.** The dispersive event terminates
+  the N-1 secondary wavelengths, so even without media the orb's own refraction kills the
+  bundle at the first surface.
+- **`-herosplit` — the fix for exactly that — is ignored by mode `D`.** It is implemented for
+  CPU forward `A`/`B`/`C` and the `M`/`S` deposit only.
+- **There is no denoiser.** No `-denoise` flag exists.
+
+Net effect: the caustic converges one wavelength per path, so it arrives as saturated red/green/
+blue speckle that only brute-force sample count removes (variance goes as 1/spp, so halving the
+speckle costs 4x the time). 1400 spp / 17 min at 1280x720 is visibly noisy in the disc.
+
+Proper fix, in increasing order of work: (a) extend `-herosplit` to mode `D`'s subpath
+construction, which is where the win is largest since D is the mode media scenes are forced
+into; (b) allow `-heroc` on media scenes by carrying per-lambda transmittance through
+delta/ratio tracking instead of bailing; (c) a denoiser. Until then, budget samples accordingly
+and say so — a dispersive caustic under a cloud is the most expensive thing this renderer draws.

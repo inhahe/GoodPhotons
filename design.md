@@ -1344,6 +1344,43 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       a scene containing a `light sun` outright; 0.124.0/0.127.0 lifted that and it is now a
       real `light sun`. The old global haze is deleted: its `bounds` box was invisible only
       because the walls hid its faces.
+    - **The caustic screens are mid-grey (0.30), not white — and that is the whole trick.** A
+      caustic is only visible as a *ratio* to its screen, and a display shows no ratio above
+      its clip point. At the original 0.88 albedo the sunlit caps sat at 189–209/255 with
+      10–25 % of their pixels already at pure white, so a 5× caustic, a 50× one and the plain
+      sunlight beside them all printed the same `#FFFFFF`: the caps were metered *into* the
+      clip, not too dim. 0.30 puts them near 64/255 and leaves 4× of headroom.
+    - **The glass orb is levitated 0.30 m on three pins, and its cap is cantilevered.** The
+      height was *measured*, not computed. The textbook ball-lens `f = nR/(2(n−1))` — 0.734 m
+      from centre for BK7 at R=0.5 — is **paraxial**, and a full-aperture sphere has gross
+      spherical aberration: the marginal rays carry most of the flux (area ∝ r²) and cross far
+      nearer the glass, so the paraxial focus is the wrong target and its disc-area estimate of
+      concentration is badly optimistic. `scraps/_focalsweep.py` renders a sweep of heights and
+      meters peak linear irradiance on the cap; the answer is a sharp optimum at **0.80 m of
+      drop** (0.642, vs 0.371 at 0.65 and 0.424 at 0.95 — 73 % brighter than either neighbour
+      0.15 m away), i.e. *short* of the paraxial focus, not past it. Resting tangent (0.50 m,
+      the original scene) was 0.58× of the achievable peak. The cost of 0.80 m is that the
+      sight line to the disc centre passes 0.514 m from the orb's centre, only just clearing
+      the 0.5 m limb, so the disc reads as breaking out from behind the glass. The cap is 1.7
+      deep and centred 0.45 m −z of its column because that is where the disc lands, (6.87,
+      2.72), from the sun's +0.2079 x / −0.9781 z per metre of drop.
+    - **The dispersive caustic is chromatic speckle, and no flag fixes it.** In mode `D` the
+      media disable `-heroc`, the orb's own dispersive refraction would de-hero the bundle
+      anyway, `-herosplit` (the cure) is implemented for CPU forward `A`/`B`/`C` and the
+      `M`/`S` deposit only, and there is no denoiser — so the caustic converges one wavelength
+      per path and only brute-force spp removes the speckle. Budget accordingly; see
+      `known-issues.md`.
+    - **Cap-vs-cap clearance is not enough; caps must be checked against neighbouring
+      COLUMNS.** Two caps each occupy one thin y slab, so they may overlap in plan freely. A
+      column spans a whole y range, so plan overlap *is* intersection. `scraps/_standaudit.py`
+      brace-parses every cage's outer box and every cap box and checks all 30 colliders across
+      the 9 stands in 3-D; run it after any stand edit.
+    - **Mode `M` is not an option for this scene** even though it is the caustic-friendly mode
+      on paper: `photonmap_render.h` has no participating-media code, so M renders the cloud,
+      the rain and the bow away entirely — and, unlike mode `U`, does not refuse the scene or
+      warn. Logged in `known-issues.md`. Mode `D` is what the scene's `prefer{}` asks for and
+      is the one mode documented as handling superposed bounded heterogeneous media on both
+      devices.
 - **Volumetric blackbody emission ("fire")** — a `Medium` may carry a second `temperature` grid
   (`Medium::temperature`/`tempPeak`/`emitKelvin`/`emissionScale`; `emissive()`/`temperatureAt()`/
   `emissionAt()` in `scene.h`), turning its hot voxels into a self-illuminating isotropic volume
