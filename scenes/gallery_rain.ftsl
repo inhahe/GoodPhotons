@@ -1,0 +1,900 @@
+# Hero Room, WEATHER EDITION — the exhibits on an open GRID PLANE, with rain and a real bow.
+#
+# The same nine hero pieces, in the same places, as scenes/gallery_settled.ftsl (which stays
+# the canonical still + flyby scene; this is a separate edition, not a replacement — it is a
+# copy of that file, so re-bake it from gallery.ftsl the same way if the pieces ever move).
+# What is different here is the weather, and the setting built to make the weather legible:
+#
+#   * NO ROOM. The walls, the ceiling and the polished stone floor are gone. In their place
+#     is one wide, near-black glossy GROUND PLANE ruled by a glowing green wireframe GRID,
+#     under a black sky — so the whole hemisphere above the exhibits is open and every piece
+#     is lit by the full sun instead of by a slot in a roof. That is the point of the change:
+#     the enclosed hall left the left half of the frame in permanent shadow.
+#   * The museum STANDS follow the ground: their base and column are green wireframe CAGES,
+#     but each keeps a SOLID WHITE CAP. The cap is not decoration — it is the screen the
+#     dispersive caustics from the glass sphere and the diamond gyroid land on, and a
+#     wireframe would have thrown that away (a cage catches almost nothing).
+#   * the scene's ONE cloud, in the back-right, shaped by the actual cloud1.glb MESH rather
+#     than by an algebraic blob — `medium { bounds { object … } }` solid-voxelizes the mesh
+#     into an occupancy lattice, `feather 0.13` softens that lattice's silhouette into a
+#     falloff zone the way a real cloud edge is, and `mesh { shape_only yes }` throws the
+#     1.85 M triangles away once the bake has read them so the cloud is fog and nothing else
+#     (see FTSL 8.4/12.1);
+#   * a RAIN curtain falling out of it — starting INSIDE it, not below it — carrying
+#     `phase rainbow`;
+#   * two FILL PANELS just outside the frame that exist only to be reflected: with the room
+#     gone, a polished metal's rim points at an empty black sky and renders black.
+#
+# --- Why the sun is where it is -----------------------------------------------------
+# None of this is eyeballed; scraps/bowgeom.py + scraps/bowmap.py solved for it. A bow is a
+# circle of angular radius 42 deg about the ANTISOLAR direction, which from the camera is
+# just the sun's direction of travel — so the sun alone decides where the bow lands in
+# frame, and the only free choices are how much of that circle has rain on it and whether
+# the backdrop behind it is dark.
+#
+# Scanning the whole sky against this camera picked sun ELEVATION 45, AZIMUTH -12, which
+# puts a 60-degree limb of the primary sweeping from top-centre down to the right edge,
+# with the secondary outside it and Alexander's dark band between. The old roofed edition
+# then had to cut a slot to keep the wall behind that limb in shadow, because a bow is a
+# faint single-scatter signal that vanishes against a sunlit backdrop. Opening the room up
+# solved that constraint outright rather than tightening it: THERE IS NO BACKDROP ANY MORE.
+# Behind the bow is black sky and a ground plane whose lit component is ~5% albedo, which is
+# a darker backdrop than any shaded wall was, so the whole limb now reads.
+#
+# --- Why the rain is 300 um with supernumeraries OFF --------------------------------
+# The first version asked for `droplet_um 500  ` with the default supernumerary train and the
+# bow came out as a WIDE WHITE ARC with only a thin coloured fringe on its rim. That is the
+# model being right about the wrong thing. scraps/bowplot.py reproduces rainbow.h's table in
+# Python and measures it: at 500 um the coloured Airy band is genuinely only ~1.2 deg wide
+# (primary at 138.76 deg for 450 nm vs 137.65 deg for 650 nm), while the MONODISPERSE
+# supernumerary train rings on for another ~11 deg inside it, and eleven degrees of ringing
+# read as white glare. Real rain is polydisperse, so those higher-order maxima land at
+# different angles per drop size and average away; only the principal Airy lobe survives.
+# `supernumerary off` is that average, and 300 um widens the surviving lobe by 1.4x
+# (K scales as a^(2/3)), which also puts ~8 table bins across it instead of ~5 — the phase
+# table is 2048 bins UNIFORM IN MU, so a big drop is genuinely under-resolved (logged in
+# known-issues.md). Result: one clean coloured band, no white core.
+#
+# --- Why the sun is a real `light sun` (it used to be a distant sphere) ---------------
+# Mode D is the only mode that renders BOTH this scene's bounded heterogeneous media and
+# its directly-seen glass and chrome. (Forward A/B/C do the media but leave a directly-seen
+# dielectric black, which is most of this room; R and the P composite shade the glass but
+# flatten every bounded medium into one global homogeneous haze; see README "Modes".) So
+# whatever the sun is, mode D has to accept it — and when this scene was written it did not
+# accept `light sun`: a delta light was not connectible in BDPT at all, and after v0.124.0
+# made it connectible on the CPU the GPU BDPT kernels still rejected it, which would have
+# knocked this (very GPU-hungry) scene onto the CPU. So the sun was written as what the real
+# sun also is: a Lambertian sphere of radius 1.85 m at 400 m, subtending the sun's own
+# 0.53 deg, with power 1000 W/m2 * 4*pi*400^2 = 2.011e9 W.
+#
+# v0.126.0/v0.127.0 ported the delta-light path to the GPU BDPT and VCM kernels, so that
+# constraint is gone, and the sphere turned out to be costing real image quality:
+#
+#   * LIGHT SELECTION — the big one. NEE and light-subpath starts both draw from a power
+#     CDF, and a sphere that has to push 1000 W/m2 across 400 m needs 2.011e9 W of it.
+#     Against the xenon lamp's 15 kW and the sky panel's 8 kW that is p(lamp) = 7.5e-6: the
+#     lamp was sampled once in ~134,000 draws, each carrying 134,000x weight. Unbiased and
+#     unusable — the lamp's light arrives as rare fireflies that clip instead of as an image.
+#     MEASURED (640x360, 150 s, mode D, both absolute-exposed): the whole frame renders
+#     2.1x DARKER with the sphere, and that gap collapses to 1.10x the moment the lamp is
+#     deleted from both variants, i.e. the missing factor of two IS the starved lamp.
+#     `light sun`'s power is irradiance * pi * R_scene^2, which is ~3.3e6 W at this
+#     edition's ~33 m scene radius and leaves the sky panel a workable ~1.5%.
+#   * SCENE RADIUS. A sphere 400 m out is geometry, so it dragged the scene bounding sphere
+#     from ~12 m to ~400 m, and every sceneRadius-scaled quantity (env/sun phase-space
+#     weights, forward-mode emission discs, BVH extent) with it.
+#   * PARALLAX. 400 m is far, not infinite: the sun direction swung 0.4 deg across the rain
+#     volume. That is inside the bow's ~2 deg width so it never showed, but a real `light
+#     sun` is exactly parallel, which is what the 42 deg construction actually assumes.
+#   * (And, until v0.128.0, a plain ENGINE BUG on top: the fp32 device build's ray/sphere
+#     discriminant cancelled catastrophically at 400 m and its connection rays were
+#     shortened by an absolute epsilon smaller than one float ulp of that distance, so mode
+#     D self-occluded most of this sphere's shadow rays and rendered it 2.7x too dim. That
+#     is fixed and is no longer an argument either way — but it is why this scene's older
+#     renders are darker than the numbers here predict.)
+#
+# Nothing about the geometry solve changed — same direction, same 0.53 deg disc, same one
+# solar constant. See "(2) the SUN" below for the irradiance arithmetic.
+#
+# --- Why the xenon lamp is GONE (it used to hang from the ceiling) --------------------
+# The roofed edition kept a 15 kW short-arc lamp because back-projecting each hero piece
+# along the sun direction showed the ceiling shaft reached only gyroid, glass, klein, brass
+# and oiljack: the diamond gyroid, the dumbbell, the chrome ring, the heart and the cloud
+# fell outside the slot and went black without it. Removing the roof removes that job — the
+# sun now reaches every piece and the cloud directly — and leaves the lamp hanging from a
+# cord attached to nothing. Two further reasons not to keep it floating:
+#
+#   * LIGHT SELECTION again. Opening the scene out to a ~33 m ground plane raises R_scene
+#     from ~12 m to ~33 m, and the sun's power goes as R^2, so it grows ~7x to ~3.3e6 W.
+#     A 15 kW lamp against that is p = 0.46% of the CDF while still supplying ~20% of what
+#     the camera sees — a 40x under-sample, i.e. exactly the firefly regime the distant-sphere
+#     sun used to put it in. The sky panel below is the one fill that survives that arithmetic,
+#     because it is big enough (50 kW) to stay a real share.
+#   * The lamp's arc emitter sits inside a nested quartz/xenon dielectric, so NEE cannot reach
+#     it at all (mode W flags this); its contribution only ever arrived through forward or
+#     specular-chain paths.
+#
+# Render (still) — don't pass -mode, the scene's prefer{}/else{} picks it:
+#   ftrace -in scenes/gallery_rain.ftsl -camera cam -noise 2 \
+#          -window -keepwindow -interval 15 -checkpoint -o png/gallery_rain.png
+# Budget honestly: this is BDPT through three stacked media, so it is slow. Measured on an
+# RTX 4090, 1280x720: 310 spp in 600 s and still at 5.7% noise, and noise falls as 1/sqrt,
+# so `-noise 2` is ~2500 spp, i.e. well over an hour. `-time 600` already reads clearly (the
+# bow, the cloud and the shaft are all legible); -checkpoint + -resume adds to it later.
+# The flyby lives in gallery_settled.ftsl; this edition is a still, so it carries no curve.
+
+scene { units meters  spectral 360 830 1 }
+
+# The Klein bottle is a 2.4 mm-walled glass shell with ANOTHER TUBE INSIDE IT, so one line
+# of sight through the bulb crosses about eight dielectric interfaces. Mode D runs 8 path
+# edges by default, which is exactly not enough: the paths that would carry the inner tube
+# run out and it renders as a solid black plug in an otherwise clear bottle. 32 is comfortably
+# past the deepest stack in the room (measured: at 32 the plug is gone and the tube reads as
+# glass). Cost is ~35% of the sample rate. A CLI -max-bounce still overrides this.
+render { max_bounce 32 }
+
+# --- The ground plane ----------------------------------------------------------
+# Two patterns over the SAME world-space field, one per slot.
+#
+# `grid_ground` is the wireframe itself: distance to the nearest integer gridline in x or z,
+# thresholded into a 1.8 cm core with a soft 5 cm shoulder so the line antialiases instead
+# of crawling. Those are exactly half the original widths, matching the stand cages' 22 -> 11
+# mm; the SHOULDER is halved along with the core on purpose, because a thin core inside a wide
+# shoulder is not a thin line, it is a thin line wearing a fat halo. It drives `emit_map`, i.e.
+# it METERS a green emission spectrum — the lines
+# GLOW rather than being lit, which is what makes them read at all against a black sky and
+# what keeps them readable in the parts of the plane the sun never reaches.
+#
+# `ground_fade` is the same radial falloff without the line mask, bound to `reflect_map`, so
+# the plane's *reflective* component dies out at the same distance the grid does. That is
+# what hides the quad's own edge: past ~22 m the ground stops returning any light at all and
+# simply becomes the black sky, so there is no lit rectangle ending in mid-air and no
+# rectangular shadow cast by the sky panel to give the trick away. It also kills the
+# sub-pixel shimmer a centimetre-wide line would otherwise produce at 30+ m — which is why
+# the fade radii were LEFT ALONE when the lines were halved: a thinner line needs that fade
+# more, not less.
+#
+# Both fades are measured from (5, ., 3.5), the centre of the exhibit spread.
+pattern "grid_ground" {
+    expr "max(1 - smoothstep(0.009, 0.025, abs(fract(x + 0.5) - 0.5)),
+              1 - smoothstep(0.009, 0.025, abs(fract(z + 0.5) - 0.5)))
+          * (1 - smoothstep(13, 23, sqrt((x - 5)*(x - 5) + (z - 3.5)*(z - 3.5))))"
+}
+pattern "ground_fade" {
+    expr "1 - smoothstep(10, 22, sqrt((x - 5)*(x - 5) + (z - 3.5)*(z - 3.5)))"
+}
+# ~5% albedo: dark enough that the sunlit plane sits well below the exhibits, bright enough
+# that it still reads as a surface and still catches caustics in the forward modes. The green
+# is a 528 nm Gaussian rather than an `rgb` triple because emission wants a real radiance
+# magnitude — amp is spectral radiance per nm, and 0.55 puts the line core just at the clip
+# point of the camera's -2 stop absolute exposure, so the lines have a blown core and a graded
+# edge, which is what a glowing wire looks like.
+#
+# `type diffuse`, NOT glossy, and that is deliberate. The backward tracer treats Glossy as a
+# purely specular lobe: `bkInteract`'s D_GLOSSY case reflects the ray and returns, with no NEE
+# against the lights at all (render_cuda.cu ~6733 / backward.h). A glossy surface therefore
+# shows only what its mirror direction happens to hit, and under a black sky with one small
+# panel that is nothing — a glossy ground renders BLACK in modes R/W. (Verified: see
+# scraps/_grid_test.ftsl, whose two glossy tiles are pure black next to two identical diffuse
+# ones.) The forward modes would shade it fine, but a ground that is invisible in every
+# preview is not worth a wet sheen, so the body is Lambertian and the "wet" read comes from
+# the glowing lines instead.
+material "gridground" {
+    type diffuse
+    reflect rgb 0.05 0.055 0.05
+    reflect_map pattern:ground_fade
+    emit gaussian 528 34 0.55
+    emit_map pattern:grid_ground
+}
+
+# --- Museum-stand materials ----------------------------------------------------
+# The cage bars are the ground's grid stood upright: the same green glow, on a nearly black
+# body so they never read as lit plastic. The caps are the one bright diffuse surface in the
+# scene — deliberately the brightest, because they are the caustic screen.
+material "wirecage" { type diffuse  reflect rgb 0.02 0.05 0.03
+                      emit gaussian 528 34 0.45 }
+material "capwhite" { type diffuse  reflect whitewall 0.88 }
+material "ceil"     { type diffuse  reflect whitewall 0.82 }   # raincloud stand-in only
+
+# --- Hero-object materials -----------------------------------------------------
+# `roughness` after `preset` overrides the preset's polished lobe. Gold needs a LOT here, and
+# for two opposite reasons that pull the same way:
+#   * TOO BRIGHT in the middle. A perfect mirror pointed at a 1000 W/m2 sun returns a
+#     highlight ~2.4x the clip point in EVERY channel (gold's normal-incidence reflectance is
+#     ~0.95/0.86/0.42), so the front of the gyroid rendered as flat white — "grey gold".
+#   * TOO DARK at the rim. A mirror has no colour of its own; it shows what it points AT, and
+#     with the walls and ceiling gone the gyroid's outer edge points at an empty black sky and
+#     so renders black. Roughness is the only fix that does not require putting the room back:
+#     a wide lobe lets a rim microfacet still collect the sun, the overhead sky panel and the
+#     white caps, and gold's spectral reflectance then tints all of it gold.
+# 0.18 is the value that spreads the central spike below the clip point AND leaves the rim
+# lit. It reads as satin/brushed gold rather than polished — which is what a wide lobe IS.
+material "gold"     { preset gold  roughness 0.18 }
+material "chrome"   { preset chrome }
+material "brass"    { preset brass }
+material "glass"    { type dielectric ior glass:BK7 }
+material "diamond"  { preset diamond }      # n~2.42 + dispersion -> coloured caustics
+material "morpho"   { preset morpho }       # iridescent multilayer Bragg (blue morpho)
+material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) — 2nd iridescent, different model
+
+# --- THE GROUND. One quad, 46 x 45 m, x[-18,28] z[-19,26] — no walls, no ceiling.
+# The exhibits still occupy the old hall's footprint (x in [3.2, 6.8], z in [1.5, 4.8]) so
+# nothing has moved; there is simply nothing around them any more.
+#
+# The extent is a compromise, not a "make it huge". `light sun`'s power is
+# irradiance * pi * R_scene^2, and R_scene is set by the geometry, so every metre of ground
+# quadratically inflates the sun's share of the power CDF that NEE and light-subpath starts
+# draw from — which is what starves every other light in the scene (see the header). 46 x 45
+# puts R_scene at ~33 m, a 7x growth that the remaining sky panel can absorb. The plane still
+# reads as unbounded because `ground_fade` extinguishes it ~11 m INSIDE its own edge, well
+# before the horizon: what the camera sees is a ground that dissolves into the black sky,
+# not a rectangle floating in space.
+#
+# WINDING MATTERS HERE. A quad's geometric normal is cross(u, v), and the backward tracer
+# only adds a surface's own emission on a camera/specular arrival that hits the FRONT face
+# (`specularArrival && dot(rd, ng) < 0`, render_cuda.cu ~7006). With `u 46 0 0  v 0 0 45`
+# cross(u,v) is -y, the plane faces the floor, and the grid is invisible from above even
+# though the diffuse body shades normally via NEE (which flips the normal itself). Swapping
+# u and v puts cross(u,v) at +y and the lines light up. The old stone floor never noticed
+# because it had no emission.
+quad { origin -18 0 -19   u 0 0 45   v 46 0 0   material gridground }
+
+# ==============================  MUSEUM STANDS  ================================
+# Every stand is now TWO objects at the same place:
+#
+#   `stand_<piece>`      the green wireframe CAGE — the old base slab and column, hollowed
+#                        out to their twelve edges;
+#   `stand_<piece>_cap`  the SOLID WHITE CAP the hero piece rests on.
+#
+# Splitting them is forced by materials (one isosurface carries one material) and is the
+# whole point of the design: a cage catches essentially no light, so if the cap were wireframe
+# too the dispersive caustics thrown by the glass sphere and the diamond gyroid would land on
+# nothing and simply vanish from the image. The cap is deliberately the brightest diffuse
+# surface in the scene for the same reason. Both halves are NAMED, because settle_scene.py
+# makes every named object a static collider and the pieces must land on the cap, not fall
+# through it.
+#
+# A CAGE IS A CSG DIFFERENCE, not twelve hand-placed bars: take the original solid box and
+# subtract three axis-aligned boxes, each shrunk by the bar thickness on two axes and grown
+# past the surface on the third. What survives is exactly the twelve edges. Bar thickness is
+# 0.011 m (2 * 0.011 = 0.022 comes off each shrunk axis) and the subtractors overhang by
+# 0.02 m so the cut faces are clean rather than coplanar. Four primitives instead of twelve,
+# and every one an exact box SDF, so the sphere tracer stays well-behaved even on 11 mm bars.
+#
+# The CAPS are deliberately much wider than the cage that carries them — a cap is the only
+# surface in the scene that can actually catch a caustic, so widening it is the cheapest way
+# to see more of the glass pieces' dispersion. Four cap pairs (glass/klein, klein/brass,
+# dumbbell/heart, heart/oil) now overlap in PLAN, but every one of those pairs sits at a
+# different cap height, so they stagger like shelves instead of intersecting.
+#
+# Every cap's y-position, thickness and `round` are UNCHANGED from the stone version (only
+# the two horizontal sizes grew), so the settled poses in this file are still valid and
+# nothing needs re-settling.
+
+isosurface "stand_gyroid" {   # centrepiece: broad low plinth, cap top y=0.55
+    material wirecage  union {
+        difference {
+            box { center 5.0 0.12 4.8  size 2.1   0.24  2.1   }
+            box { center 5.0 0.12 4.8  size 2.12  0.218 2.078 }
+            box { center 5.0 0.12 4.8  size 2.078 0.26  2.078 }
+            box { center 5.0 0.12 4.8  size 2.078 0.218 2.12  }
+        }
+        difference {
+            box { center 5.0 0.38 4.8  size 1.66  0.28  1.66  }
+            box { center 5.0 0.38 4.8  size 1.68  0.258 1.638 }
+            box { center 5.0 0.38 4.8  size 1.638 0.3   1.638 }
+            box { center 5.0 0.38 4.8  size 1.638 0.258 1.68  }
+        }
+    }
+}
+isosurface "stand_gyroid_cap" { material capwhite
+    box { center 5.0 0.535 4.8  size 2.3 0.03 2.3  round 0.01 } }
+
+isosurface "stand_glass" {   # right-front pedestal, cap top y=0.90
+    material wirecage  union {
+        difference {
+            box { center 6.2 0.09 3.5  size 0.9   0.18  0.9   }
+            box { center 6.2 0.09 3.5  size 0.92  0.158 0.878 }
+            box { center 6.2 0.09 3.5  size 0.878 0.2   0.878 }
+            box { center 6.2 0.09 3.5  size 0.878 0.158 0.92  }
+        }
+        difference {
+            box { center 6.2 0.525 3.5  size 0.42  0.69  0.42  }
+            box { center 6.2 0.525 3.5  size 0.44  0.668 0.398 }
+            box { center 6.2 0.525 3.5  size 0.398 0.71  0.398 }
+            box { center 6.2 0.525 3.5  size 0.398 0.668 0.44  }
+        }
+    }
+}
+isosurface "stand_glass_cap" { material capwhite
+    box { center 6.2 0.885 3.5  size 1.1 0.03 1.1  round 0.02 } }
+
+isosurface "stand_diamond" {   # tall thin jewel-column, cap top y=0.85
+    material wirecage  union {
+        difference {
+            box { center 3.5 0.1 3.6  size 0.6   0.2   0.6   }
+            box { center 3.5 0.1 3.6  size 0.62  0.178 0.578 }
+            box { center 3.5 0.1 3.6  size 0.578 0.22  0.578 }
+            box { center 3.5 0.1 3.6  size 0.578 0.178 0.62  }
+        }
+        difference {
+            box { center 3.5 0.5 3.6  size 0.24  0.62  0.24  }
+            box { center 3.5 0.5 3.6  size 0.26  0.598 0.218 }
+            box { center 3.5 0.5 3.6  size 0.218 0.64  0.218 }
+            box { center 3.5 0.5 3.6  size 0.218 0.598 0.26  }
+        }
+    }
+}
+isosurface "stand_diamond_cap" { material capwhite
+    box { center 3.5 0.825 3.6  size 1.0 0.05 1.0  round 0.02 } }
+
+isosurface "stand_klein" {   # cap top y=1.00; the Klein bottle stands on it
+    material wirecage  union {
+        difference {
+            box { center 5.9 0.11 2.6  size 0.72  0.22  0.72  }
+            box { center 5.9 0.11 2.6  size 0.74  0.198 0.698 }
+            box { center 5.9 0.11 2.6  size 0.698 0.24  0.698 }
+            box { center 5.9 0.11 2.6  size 0.698 0.198 0.74  }
+        }
+        difference {
+            box { center 5.9 0.6 2.6  size 0.34  0.76  0.34  }
+            box { center 5.9 0.6 2.6  size 0.36  0.738 0.318 }
+            box { center 5.9 0.6 2.6  size 0.318 0.78  0.318 }
+            box { center 5.9 0.6 2.6  size 0.318 0.738 0.36  }
+        }
+    }
+}
+isosurface "stand_klein_cap" { material capwhite
+    box { center 5.9 0.985 2.6  size 0.96 0.03 0.96  round 0.02 } }
+
+isosurface "stand_dumbbell" {   # cap top y=0.88
+    material wirecage  union {
+        difference {
+            box { center 4.5 0.11 2.7  size 0.66  0.22  0.66  }
+            box { center 4.5 0.11 2.7  size 0.68  0.198 0.638 }
+            box { center 4.5 0.11 2.7  size 0.638 0.24  0.638 }
+            box { center 4.5 0.11 2.7  size 0.638 0.198 0.68  }
+        }
+        difference {
+            box { center 4.5 0.54 2.7  size 0.34  0.66  0.34  }
+            box { center 4.5 0.54 2.7  size 0.36  0.638 0.318 }
+            box { center 4.5 0.54 2.7  size 0.318 0.68  0.318 }
+            box { center 4.5 0.54 2.7  size 0.318 0.638 0.36  }
+        }
+    }
+}
+isosurface "stand_dumbbell_cap" { material capwhite
+    box { center 4.5 0.865 2.7  size 0.88 0.03 0.88  round 0.02 } }
+
+isosurface "stand_chrome" {   # cap top y=0.90
+    material wirecage  union {
+        difference {
+            box { center 3.5 0.1 2.0  size 0.74  0.2   0.74  }
+            box { center 3.5 0.1 2.0  size 0.76  0.178 0.718 }
+            box { center 3.5 0.1 2.0  size 0.718 0.22  0.718 }
+            box { center 3.5 0.1 2.0  size 0.718 0.178 0.76  }
+        }
+        difference {
+            box { center 3.5 0.55 2.0  size 0.3   0.7   0.3   }
+            box { center 3.5 0.55 2.0  size 0.32  0.678 0.278 }
+            box { center 3.5 0.55 2.0  size 0.278 0.72  0.278 }
+            box { center 3.5 0.55 2.0  size 0.278 0.678 0.32  }
+        }
+    }
+}
+isosurface "stand_chrome_cap" { material capwhite
+    box { center 3.5 0.885 2.0  size 0.88 0.03 0.88  round 0.02 } }
+
+isosurface "stand_heart" {   # cap top y=1.00
+    material wirecage  union {
+        difference {
+            box { center 4.6 0.11 1.9  size 0.68  0.22  0.68  }
+            box { center 4.6 0.11 1.9  size 0.7   0.198 0.658 }
+            box { center 4.6 0.11 1.9  size 0.658 0.24  0.658 }
+            box { center 4.6 0.11 1.9  size 0.658 0.198 0.7   }
+        }
+        difference {
+            box { center 4.6 0.6 1.9  size 0.32  0.76  0.32  }
+            box { center 4.6 0.6 1.9  size 0.34  0.738 0.298 }
+            box { center 4.6 0.6 1.9  size 0.298 0.78  0.298 }
+            box { center 4.6 0.6 1.9  size 0.298 0.738 0.34  }
+        }
+    }
+}
+isosurface "stand_heart_cap" { material capwhite
+    box { center 4.6 0.985 1.9  size 0.86 0.03 0.86  round 0.02 } }
+
+isosurface "stand_brass" {   # cap top y=0.95
+    material wirecage  union {
+        difference {
+            box { center 6.0 0.12 2.0  size 0.7   0.24  0.7   }
+            box { center 6.0 0.12 2.0  size 0.72  0.218 0.678 }
+            box { center 6.0 0.12 2.0  size 0.678 0.26  0.678 }
+            box { center 6.0 0.12 2.0  size 0.678 0.218 0.72  }
+        }
+        difference {
+            box { center 6.0 0.58 2.0  size 0.36  0.68  0.36  }
+            box { center 6.0 0.58 2.0  size 0.38  0.658 0.338 }
+            box { center 6.0 0.58 2.0  size 0.338 0.7   0.338 }
+            box { center 6.0 0.58 2.0  size 0.338 0.658 0.38  }
+        }
+    }
+}
+isosurface "stand_brass_cap" { material capwhite
+    box { center 6.0 0.935 2.0  size 0.86 0.03 0.86  round 0.02 } }
+
+isosurface "stand_oil" {   # cap top y=0.92
+    material wirecage  union {
+        difference {
+            box { center 5.3 0.1 1.5  size 0.64  0.2   0.64  }
+            box { center 5.3 0.1 1.5  size 0.66  0.178 0.618 }
+            box { center 5.3 0.1 1.5  size 0.618 0.22  0.618 }
+            box { center 5.3 0.1 1.5  size 0.618 0.178 0.66  }
+        }
+        difference {
+            box { center 5.3 0.55 1.5  size 0.3   0.7   0.3   }
+            box { center 5.3 0.55 1.5  size 0.32  0.678 0.278 }
+            box { center 5.3 0.55 1.5  size 0.278 0.72  0.278 }
+            box { center 5.3 0.55 1.5  size 0.278 0.678 0.32  }
+        }
+    }
+}
+isosurface "stand_oil_cap" { material capwhite
+    box { center 5.3 0.905 1.5  size 0.82 0.03 0.82  round 0.02 } }
+
+# ==============================  HERO PIECES  =================================
+
+# --- GOLD GYROID (centrepiece, close-up, plain view; NOT settled — threaded) -----------
+# The long-standing k=10 / T=0.45 lattice ball, translated as a rigid unit to the new
+# front-centre. The flyby's channel control points are the same validated threaded points,
+# shifted by the SAME translation, so the empty-air tunnel still lines up exactly.
+# Clip bottom sits at y=0.55 = stand_gyroid top.
+isosurface "gyroid" {
+    material gold
+    intersect {
+        function {
+            translate 5.0 1.33 4.8
+            expr "abs(sin(10*x)*cos(10*y) + sin(10*y)*cos(10*z) + sin(10*z)*cos(10*x)) - 0.45"
+        }
+        sphere { center 5.0 1.33 4.8   radius 0.78 }
+    }
+    contained_by { min 4.20 0.53 4.00   max 5.80 2.13 5.60 }
+    max_gradient 40
+}
+
+# --- DIAMOND GYROID (coloured-caustic gem; NOT settled) --------------------------------
+# A finer k=13 lattice clipped to a small sphere in `diamond` (n~2.42, dispersive): the
+# high IOR tightens its refractive focus and the dispersion splays the caustic into real
+# colour across its walnut stand. Substitute for the missing gyref_gyroid_adaptive mesh.
+# Clip bottom y=0.85 = stand_diamond top.
+isosurface "gyroid_gem" {
+    material diamond
+    intersect {
+        function {
+            translate 3.5 1.35 3.6
+            expr "abs(sin(13*x)*cos(13*y) + sin(13*y)*cos(13*z) + sin(13*z)*cos(13*x)) - 0.55"
+        }
+        sphere { center 3.5 1.35 3.6   radius 0.50 }
+    }
+    contained_by { min 3.00 0.85 3.10   max 4.00 1.85 4.10 }
+    max_gradient 52
+}
+
+# --- GLASS SPHERE (fly-through orb; NOT settled — analytic rest) -----------------------
+# A plain BK7 orb resting tangent on its marble pedestal (centre y = 0.90 top + 0.5 r).
+# The flyby dives straight THROUGH it. Native sphere for exact analytic refraction.
+sphere { center 6.2 1.40 3.5   radius 0.5   material glass }
+
+# --- KLEIN BOTTLE in glass (clear, intricate transparent piece; SETTLED) ---------------
+# A glassblower's Klein bottle with the INTERNALS: the neck passes through the wall of the
+# bulb and keeps going DOWN INSIDE it, so a horizontal cut low in the body shows four loops
+# (the outer wall's two surfaces plus the descending inner tube), three at the wall
+# pass-through, and the tube alone above the shoulder. That interior is the whole point of
+# the piece in a dielectric scene — the earlier image-to-3D bottle (meshes/klein_hunyuan.obj)
+# was a solid-looking shell with the self-intersection only implied.
+#
+# 12262 v / 12264 quads; closed, consistently wound, orientable, and genus 2 (Euler -2) as a
+# Klein bottle immersed in R^3 must be. Signed volume 150.356 against 2520.73 of area, i.e.
+# a wall 2V/A = 0.119 raw units thick — 2.4 mm at this scale, real blown glass. Raw mesh is
+# Y-up with its FOOT RING centred on the origin and its base plane at y = 0.025; extents
+# 22.700 x 30.000 x 15.000, so scale 0.02 -> 0.454 x 0.600 x 0.300, the same 0.60 m height
+# as the piece it replaces.
+#
+# NO MOUNT. The old bottle had no near-upright equilibrium (44 resting orientations, the most
+# upright of them leaning 73 degrees), which is why a generated collar mesh once existed here: a collar
+# whose bore was cut to that piece's own cross-section, the only thing that could hold it. This
+# one is a bottle with a punted foot and simply stands: a foot ring of radius 66 mm carrying a
+# centre of mass 225 mm above it, a static tipping angle of 6.5 degrees. Measured on the bare
+# slate cap at settle_scene's own rolling/spinning friction of 5e-4, with its own 0.03 m/s +
+# 0.30 rad/s kick from 12 directions at 3 spawn tilts (scraps/newklein_stand.py): it rests
+# 2.0 mm from the authored pose at 0.00 deg lean, and all 36 pokes stay inside 8.2 mm, under
+# settle_scene's POKE_TOL of 10 mm. A seat ring was measured and rejected — the body flares
+# continuously (66 mm at the base, 83 mm 4 mm up, 112 mm at 20 mm), so any bore loose enough
+# to lower the piece into is loose enough to let it slide the same distance anyway.
+group {  # settled by tools/settle_scene.py
+    translate 0.00840549 -0.00390297 -0.0188914
+    rotate    0.000770936 -0.183439 -0.00150841
+    mesh "klein" {
+        file "meshes/klein_bottle_full.obj"
+        # Foot ring on the pedestal axis (5.9, 2.6), base 5 mm above the cap (top y = 1.00) so the
+        # settle drops it squarely onto the slate. The piece is lopsided about its own foot — the
+        # volume centroid sits 41 mm toward +x — but that is 41 mm on a 520 mm cap and the foot,
+        # not the centroid, is what the eye reads as centred on the column.
+        # Yaw -12 deg turns the handle into profile for the hero camera at (5.0, 2.55, 6.85),
+        # which sees this pedestal along (-0.207, 0, 0.978): the loop and the point where the neck
+        # enters the bulb both face the lens instead of foreshortening away.
+        translate 5.9 1.0045 2.6   rotate 0 -12 0   scale 0.02
+        material glass
+    }
+}
+
+# --- BRASS DUMBBELL-ring (gallery pick 09): two spheres joined by a fused bar + ring,
+# with a small bite bored out; SETTLED. ---
+group {  # settled by tools/settle_scene.py
+    translate 0.02201 -0.0649694 -0.0169359
+    rotate    0.164391 -0.206977 0.560095
+    isosurface "brass_dumbbell" {
+        material brass
+        # Centred on stand_dumbbell's cap (4.5, 2.7); 0.03 m above its top (y=0.88).
+        translate 4.11 0.637 2.31   scale 0.78
+        difference {
+        smooth_union { k 0.046
+            smooth_union { k 0.033
+            smooth_union { k 0.032
+            sphere { center 0.340 0.500 0.500  radius 0.150 }
+            sphere { center 0.660 0.500 0.500  radius 0.150 }
+        }
+            cylinder { translate 0.500 0.500 0.500  rotate 0 0 90  radius 0.065  height 0.340 }
+        }
+            # Ring outer radius (major+minor) MUST stay under the balls' 0.150, or the ring is
+            # the piece's lowest feature and the balls can never touch the stand: it then has no
+            # stable rest at all — it balances on the rim like a bicycle wheel (the COM sits
+            # exactly over the single rim contact, so it is in equilibrium but topples at a
+            # touch), which is what the user saw. Was major 0.150 / minor 0.045 = 0.195 outer.
+            torus { translate 0.500 0.500 0.500  rotate 0 0 90  major 0.105  minor 0.038 }
+        }
+        sphere { center 0.369 0.528 0.501  radius 0.067 }
+        }
+    }
+}
+
+# --- BRASS CSG cluster (gallery pick 05): nested smooth_union of spheres+tori with two
+# spheres bored out; SETTLED. SDF leaves stay unit-Lipschitz, no max_gradient. ---
+group {  # settled by tools/settle_scene.py
+    translate 0.959524 -2.89096 1.1156
+    rotate    -21.1608 5.59516 21.6963
+    isosurface "brass_cluster" {
+        material brass
+        # Centred on stand_brass's cap (6.0, 2.0); 0.03 m above its top (y=0.95).
+        translate 5.627 0.784 1.6475   scale 0.8
+        difference {
+        difference {
+        smooth_union { k 0.038
+            smooth_union { k 0.050
+            smooth_union { k 0.039
+            smooth_union { k 0.035
+            smooth_union { k 0.032
+            smooth_union { k 0.042
+            sphere { center 0.642 0.391 0.564  radius 0.137 }
+            sphere { center 0.602 0.392 0.536  radius 0.133 }
+        }
+            torus { translate 0.369 0.629 0.403  rotate 155 167 28  major 0.201  minor 0.041 }
+        }
+            sphere { center 0.671 0.427 0.395  radius 0.092 }
+        }
+            sphere { center 0.566 0.601 0.542  radius 0.097 }
+        }
+            sphere { center 0.365 0.665 0.501  radius 0.128 }
+        }
+            torus { translate 0.390 0.561 0.494  rotate 152 95 79  major 0.150  minor 0.060 }
+        }
+        sphere { center 0.435 0.587 0.480  radius 0.070 }
+        }
+        sphere { center 0.520 0.500 0.495  radius 0.071 }
+        }
+    }
+}
+
+# --- IRIDESCENT algebraic HEART (gallery pick 07) in morpho-blue, tilted; SETTLED. -----
+group {  # settled by tools/settle_scene.py
+    translate 0.813538 4.20412 0.285009
+    rotate    59.3168 5.35726 -27.4569
+    isosurface "heart" {
+        material morpho
+        # Unit-cube local space (see oiljack): authored it sat at (4.77, 2.20), 0.30 m off the
+        # corner of stand_heart's cap at (4.6, 1.9). Re-centred; y drops it 0.03 m (cap top 1.00).
+        # THIS PIECE NEEDS BOTH `--tether` AND `--seat heart:stand_heart` IN THE BAKE (see the
+        # header): the tilt below is not a rest pose, so the heart tips as it lands, and untethered
+        # it tips right off the cap onto the floor. Do not bake this scene without them.
+        translate 4.134 0.78 1.447   scale 0.85
+        function {
+            translate 0.5 0.5 0.5   scale 0.24   rotate 22 36 -12
+            expr "(x^2 + (9/4)*z^2 + y^2 - 1)^3 - x^2*y^3 - (9/80)*z^2*y^3"
+        }
+        contained_by { min 0.14 0.14 0.2   max 0.86 0.86 0.8 }
+        max_gradient 60
+    }
+}
+
+# --- OIL-SLICK iridescent JACK (2nd iridescent — thin-film rainbow, different structural
+# model + colour than the morpho heart): three fused orthogonal capsules; SETTLED. ------
+group {  # settled by tools/settle_scene.py
+    translate -0.0179703 -0.027644 0.0792558
+    rotate    -0.000678612 0.795623 -0.00058678
+    isosurface "oiljack" {
+        material oilslick
+        # These hero CSG bodies are authored in the UNIT CUBE, so the world centre is
+        # translate + 0.5*scale — NOT translate. Written as `5.3 … 1.5` (stand_oil's cap
+        # centre) the jack actually landed at (5.61, 1.81), hanging 0.31 m off the +x+z corner
+        # of its own pedestal, and a fair settle correctly dumped it on the floor. Correct is
+        # 5.3 - 0.5*0.62 = 4.99 / 1.5 - 0.31 = 1.19. y leaves a 0.03 m drop onto the cap (top 0.92).
+        translate 4.99 0.882 1.19   scale 0.62
+        smooth_union { k 0.05
+            smooth_union { k 0.05
+            cylinder { translate 0.5 0.5 0.5  rotate 0 0 90  radius 0.14  height 0.78 }
+            cylinder { translate 0.5 0.5 0.5                 radius 0.14  height 0.78 }
+        }
+            cylinder { translate 0.5 0.5 0.5  rotate 90 0 0  radius 0.14  height 0.78 }
+        }
+    }
+}
+
+# --- MIRRORED chrome ring (upright display mount, left-mid; NOT settled) ---------------
+isosurface "chrome_ring" {
+    material chrome
+    torus { translate 3.5 1.30 2.0   rotate 90 0 0   major 0.34   minor 0.10 }
+}
+
+# ==============================  LIGHTING  ====================================
+# TWO lights now that the roof is gone (the xenon short-arc lamp that used to hang here was
+# deleted with the ceiling it hung from — see the header): the SUN, which does essentially
+# all the work and makes the bow, and one big cool SKY PANEL for fill.
+#
+# --- (1) the SUN -------------------------------------------------------------------
+# Elevation 45, azimuth -12 (solved for in the header): direction TOWARD the sun is
+# (-0.1470, 0.7071, 0.6916), so it sits behind, above and slightly left of the camera and
+# the light travels down the hall roughly along the view axis — which is what puts the
+# antisolar point, and therefore the 42 deg bow centred on it, in frame at all.
+#
+# `dir` is spelled out rather than `elevation 45 azimuth -12` ON PURPOSE: ftsl's azimuth is
+# measured from +x (z = cos(el)*sin(az)) while scraps/bowmap.py measures it from +z, so the
+# two conventions disagree by 90 deg and the literal vector is the only unambiguous form.
+# `angle 0.53` is the sun's true angular diameter, and `intensity` is set so the in-band
+# (360-830 nm) perpendicular irradiance is one solar constant, 1000 W/m2:
+#   intensity = 1000 / sum_360^830 planck(5800 K, lambda) dlambda = 9.2649e-14
+# (`light sun` takes an IRRADIANCE, not a `power` — a distant light's flux depends on the
+# scene's cross-section, so absolute `power` is rejected by the parser.)
+light sun { dir -0.1470 0.7071 0.6916   angle 0.53   spd blackbody 5800   intensity 9.2649e-14 }
+
+# --- (2) SKY (the only fill left) --------------------------------------------------
+# Direct sun alone would leave every -y and -z face of every piece at literally zero, and
+# with the walls gone there is no longer any bounce to fill them. This panel is the skylight:
+# a big cool 11000 K source high overhead. `light env` would be the physical model, but this
+# stays an AREA light because an area light is connectible in mode D and carries an absolute
+# `power`, which is what keeps the whole scene in absolute-exposure mode. cross(u,v) = -y, so
+# it faces down.
+#
+# It MUST NOT ROOF OVER THE SUN. `light area` is not an abstract emitter: ftsl.h pushes two
+# real, black-reflectance triangles into the BVH for it, so a panel spanning the whole sky is
+# an opaque lid — an early version of this scene eclipsed the sun completely and rendered a
+# near-black frame. The old roofed edition solved that by stopping the panel short in z at
+# y=6.0. With the ceiling gone the exposed volume is much taller, so the fix here is to RAISE
+# the panel instead of shrinking it: a sun ray leaving any point (y0) in the scene reaches the
+# panel's plane after dz = 0.692/0.707 * (Y - y0) = 0.979*(Y - y0). At Y=12 the lowest exit
+# point in the whole scene is the raincloud's crown at its back edge (y0=3.34, z0=0.36), which
+# exits at z = 8.8 — so a panel ending at z=8 clears EVERYTHING by 0.8 m while still covering
+# the entire exhibit footprint from directly above. (The old y=6 panel, un-shrunk, would have
+# thrown that cloud into shadow the moment the roof came off.)
+#
+# 50 kW over 280 m2 is ~180 W/m2 exitance, and at ~10 m above the pieces the view factor is
+# ~0.55, so they see ~100 W/m2 of skylight against 1000 W/m2 of sun — the ~10% split a real
+# clear-sky day has, and about 1.5% of the power CDF, which is enough that NEE finds it.
+# The panel is 36 deg above the top of frame, so it is never seen; and it is black anyway.
+light area {
+    origin -4 12.0 -6   u 20 0 0   v 0 0 14
+    spd blackbody 11000   power 50000
+}
+
+# --- (3) LEFT FILL PANEL (out of frame; exists only to be REFLECTED) ----------------
+# A polished metal has no colour of its own — it shows whatever it points AT — so with the
+# walls gone the gold gyroid's outer rim, whose normals point sideways, pointed at an empty
+# black sky and rendered black. Roughening the gold to 0.18 fixed the FRONT of the ball but
+# cannot fix the rim: a wide lobe around a grazing reflection still samples mostly black sky.
+# The only real fix is to give the metal something to reflect, which is what this is: a
+# studio-style fill flat, a couple of metres to the camera's left, facing the exhibits.
+#
+# EVERY NUMBER HERE IS A CONSTRAINT, not a taste call:
+#   * x = 1.5 keeps it OUT OF FRAME. The still camera is at (5, 2.55, 6.85) with fov_y 52 at
+#     16:9, so half its horizontal field is atan(tan(26) * 16/9) = 41 deg; at the panel's
+#     nearest depth (z = 3.4) the left frame edge is already at x = 5 - 3.45*tan(41) = 2.0.
+#     Re-check this if the framing ever moves.
+#   * y stops at 2.60, below every cloud in the scene, so a panel whose whole purpose is to
+#     be seen in a metal cannot instead show up as a bright wash on the underside of fog.
+#   * it cannot eclipse the sun the way an early sky panel did. The sun is nearly overhead
+#     and behind (dir +y +z), so a shadow ray leaving any visible point toward it crosses
+#     the x = 1.5 plane at y > 4.8 — always above the panel's top edge.
+#   * 2.5 kW over 10.3 m2 is ~240 W/m2 exitance; the gyroid is 3.5 m away and sees a view
+#     factor of ~0.27, so ~65 W/m2 against the sun's 1000. It lifts the rim off black without
+#     touching the exposure, and being on the LEFT it stays 9 m from the rain, so it adds
+#     essentially nothing to the multiply-scattered veil the bow has to be read against.
+# cross(u,v) = +x, so it faces the room.
+light area {
+    origin 1.5 0.15 3.4   u 0 2.45 0   v 0 0 4.2
+    spd blackbody 5500   power 2500
+}
+
+# --- (4) RIGHT FILL PANEL (the shadow side) ----------------------------------------
+# The sun's `dir` has a -x component, so it lights every +z / -x / +y face and leaves the
+# gyroid's +x flank in its own shadow — which the left panel above, being on the SAME side as
+# the key, does nothing for. This is the classic fill opposite the key, and it is deliberately
+# weaker (2 kW over 6.75 m2) so the ball still reads as lit from one side.
+#
+# ITS z RANGE IS THE WHOLE TRICK. Put this panel level with the exhibits (z ~ 3.4, mirroring
+# the left one) and it sits 1.6 m from the rain shaft with a cos of 0.67 — it would pour fill
+# straight into the one medium in this scene that must stay dark, and the bow is a single-
+# scatter signal that only survives against a dark backdrop. Sliding it back to z[6.0,9.0],
+# level with and behind the camera, drops the rain's irradiance from it by ~7.5x (cos 0.34 at
+# 3.2 m instead of 0.67 at 1.6 m) while IMPROVING its angle on the gyroid (cos 0.95 at 3.8 m),
+# because the gyroid is nearly straight off its normal from there. Measure the bow region's
+# mean level before and after any change to this light; it should not move.
+# cross(u,v) = -x, so it faces the room.
+light area {
+    origin 8.6 0.15 9.0   u 0 2.25 0   v 0 0 -3.0
+    spd blackbody 5500   power 2000
+}
+
+# ==============================  ATMOSPHERE  ==================================
+# The roofed edition opened with a faint global haze (sigma_t 0.012) bounded to the room, for
+# soft volumetric shafts and aerial depth. It is DELETED here and the deletion is not tidying:
+#   * its whole visual job was the shaft through the ceiling slot, and there is no slot;
+#   * its `bounds` box was invisible only because the walls hid the box's own faces. In the
+#     open it becomes a 10 x 3.4 x 7 m brick of fog sitting in mid-air with hard edges;
+#   * an unbounded version instead is worse — it would veil the black sky, and a dark sky is
+#     the backdrop the bow is read against.
+# So the only media left are the rain cloud and the rain falling out of it.
+#
+# THERE USED TO BE A SECOND CLOUD, in the back-left (a bounded box at x[0.6,3.5] y[2.25,3.38]
+# z[0.7,3.2] whose density was three overlapping spherical lobes times value noise). It was
+# there to demonstrate the ALGEBRAIC way of building a cloud alongside the mesh-voxelized one,
+# and side by side the comparison was not flattering: an algebraic blob has no silhouette at
+# all, it only fades out where its lobe function goes negative, so at this framing — clipped
+# by the left edge of frame and barely 4 m from the camera — it read as a formless grey smear
+# rather than as a cloud. Deleted. The technique is still exercised elsewhere in scenes/; this
+# scene's job is the bow, and one cloud that looks like a cloud beats two that do not.
+#
+# (1) The RAIN CLOUD in the BACK-RIGHT, shaped by a real mesh instead of by an algebraic
+# blob. `bounds { object "raincloud" }` solid-voxelizes cloud1.glb into an occupancy lattice
+# by signed winding (so its two separate lobes come out as a UNION, not as parity holes) and
+# the medium is carved to it; `shape_only yes` then drops all 1.85 M triangles before the BVH
+# is built, so the mesh contributes a silhouette and nothing else — no shell wrapped around
+# the fog, no traversal cost. See FTSL.md 8.4 and 12.1.
+#
+# Native cloud1.glb is 1.897 x 1.172 x 1.777 about the origin. Scaled to 2.75 x 1.03 x 2.49
+# (flattened, as a raining cloud is) and yawed -20 deg so its own two lobes do not sit square
+# to the camera, it lands in x[6.28,9.72] y[2.30,3.34] z[0.36,3.64]. In the roofed edition
+# it was tucked under the solid half of the roof so it would stay dark behind the bow and be
+# modelled by the xenon lamp; now it takes full sun from above, which lights its crown and
+# leaves its underside — the side facing the camera and the rain — dark, which is both the
+# more honest lighting for a raincloud and the same dark backdrop the bow needs.
+mesh "raincloud" {
+    file "cloud1.glb"
+    material ceil            # never used: shape_only strips the triangles before render
+    import_materials no
+    translate 8.0 2.82 2.0   rotate 0 -20 0   scale 1.45 0.88 1.40
+    shape_only yes
+}
+#
+# `feather 0.13` is what stops the mesh bound from reading as a cut-out. The voxelizer bakes
+# a BINARY occupancy lattice and the sampler's trilinear filter ramps 0->1 across exactly one
+# voxel (here 3.44 m / 192 = 18 mm), which at this scale is a hard silhouette — a cloud with
+# the edge quality of a sticker. `feather` replaces the 0/1 fill with a smoothstep of the
+# exact Euclidean distance to the outside, so the occupancy climbs from 0 at the surface to 1
+# about 0.13 m (~7 voxels) in. A real cloud's edge is exactly this: not a boundary but a zone
+# where droplet concentration falls off over metres. See FTSL.md 12.1.
+medium {
+    sigma_t 3.0   albedo 0.92   g 0.5
+    bounds { object "raincloud"   voxels 192   feather 0.13 }
+    # The mesh already supplies the silhouette, so this only breaks up the INTERIOR — a
+    # uniform fill inside a mesh reads as jelly rather than as cloud. It never reaches 0, so
+    # it cannot punch holes through the shape the voxelizer just baked.
+    density "saturate(0.72 + 0.42*noise(2.1*x, 2.6*y, 2.1*z))"
+    density_max 1.15
+}
+
+# (2) The RAIN falling out of it. This is the only medium in the scene with a wavelength-
+# dependent phase function: `phase rainbow` swaps the smooth HG lobe for the tabulated Airy
+# water-droplet phase, which is what actually produces the 42 deg primary, the 51 deg
+# secondary and Alexander's dark band between them. 300 um with `supernumerary off` is the
+# polydisperse-rain setting — see the header for the measurement that chose it; the short
+# version is that a single drop SIZE rings for ~11 deg inside the primary and that ringing
+# reads as a white arc, while real rain averages every drop size together and only the
+# principal Airy lobe survives. Drop the radius to ~10 um instead and the same scene gives a
+# broad white fogbow, which is also correct — for fog. Large drops scatter achromatically
+# outside the bow angles, which is why rain itself reads GREY.
+#
+# sigma_t is deliberately low. A bow is carried by SINGLY scattered light; pile on optical
+# depth and the multiply-scattered veil buries it. ~0.35 over the ~3 m the camera looks
+# through is tau ~ 0.7, thin enough that the bow dominates but thick enough to read as rain.
+#
+# THE SHAFT MUST START INSIDE THE CLOUD, NOT UNDER IT. An earlier version stopped the box at
+# y=2.4 — 0.1 m below the cloud's underside — and ran the radial ellipse out to x[6.16,9.84]
+# z[0.32,3.68], which is WIDER than the cloud's own x[6.28,9.72] z[0.36,3.64]. Both mistakes
+# show as straight lines: a lid of rain hanging in clear air with a visible top edge, and two
+# vertical shoulders of rain sticking out past the silhouette that is supposed to be emitting
+# it. The fix is geometric, not cosmetic:
+#   * the box now reaches y=3.2, which is 0.9 m INSIDE the cloud (cloud y[2.30,3.34]), and the
+#     density is faded out by smoothstep(2.55, 3.15, y) — so the shaft's top surface is not
+#     merely hidden by the cloud, it does not exist as a surface at all, it dissolves. The
+#     whole taper band lies above the cloud's underside, so it is buried in fog regardless.
+#   * the radial denominators drop 1.75 -> 1.30 and 1.60 -> 1.20, putting the shaft's outer
+#     limit at x[6.64,9.36] z[0.74,3.26], comfortably inside the cloud's footprint even after
+#     the -20 deg yaw shrinks the true silhouette in from its AABB.
+medium {
+    sigma_t 0.35   albedo 0.99
+    bounds { min 6.5 0 0.6   max 9.5 3.2 3.4 }
+    phase rainbow { droplet_um 300   supernumerary off }
+    # A soft elliptical shaft, densest at the top where it leaves the cloud and thinning as it
+    # falls, streaked by noise that is stretched ~6x in y so the structure reads as FALLING
+    # rather than as isotropic lumps. The radial term keeps the box's side faces from showing;
+    # the trailing smoothstep does the same job for the top face.
+    density "saturate( (1 - smoothstep(0.45, 1.05, sqrt( ((x-8.0)/1.30)^2 + ((z-2.0)/1.20)^2 )))
+                     * (0.55 + 0.75*noise(1.2*x, 0.20*y, 1.2*z))
+                     * mix(0.55, 1.0, saturate(y/2.4))
+                     * (1 - smoothstep(2.55, 3.15, y)) )"
+    density_max 1.30
+}
+
+# ==============================  CAMERAS  =====================================
+# Still: front-centre, moderate 50 deg lens, looking down the shallow hall so the whole
+# central spread of pieces reads at once with the gold gyroid big in the foreground.
+#
+# The still camera is wrapped in prefer{}/else{} so the render MODE resolves itself.
+# Mode D matters MORE in this edition than in the base scene, and the margin is thinner:
+# D is the only mode that renders bounded heterogeneous media (the cloud and the rain)
+# AND shades a directly-seen dielectric (most of this room), so the else-branch is a real
+# downgrade rather than a slower equivalent — in mode B every piece of glass and the chrome
+# ring go black. That is why the sun spent this scene's first few versions as a distant
+# sphere: `light sun` used to knock the scene straight into that branch, and later merely off
+# the GPU. Since v0.126.0/v0.127.0 the GPU BDPT and VCM kernels do delta lights, so the sun
+# is a real `light sun` and mode D still wins the prefer{} (see the header).
+# The else-branch still exists for the day the scene gains a genuinely D-hostile feature (a
+# GRIN gas field, say; see known-issues.md "GRIN in BDPT"); both branches are identical apart
+# from `mode`.
+#
+# EXPOSURE -2 STOPS. The scene authors absolute `power`, so the film uses a fixed sensor gain
+# instead of a per-image auto anchor and `exposure` is a true photographic stop. The roofed
+# edition was metered for a hall where only a slot's worth of sun got in; taking the roof off
+# raises the irradiance on every visible surface to the full solar constant, which puts a
+# sunlit 0.88-albedo cap at ~3.7x the clip point. 0.25 (two stops down) lands that cap just
+# under white — the correct place for the brightest diffuse thing in a sunlit frame — and
+# stops the gold and the caustics from flat-topping. It is a metering change, not a physics
+# change: the light in the scene is unchanged and two absolute renders taken at the same
+# `exposure` remain directly comparable.
+#
+# THE FRAMING IS RETUNED for this edition: look_at rises from y 0.95 to y 1.80, pitching the
+# camera up from -23.1 deg to -11.3 deg. The base scene aimed at the exhibits on the floor,
+# but the weather sits at two heights that both fall outside that aim:
+#   the CLOUD hugs the ceiling, +2.7 to +8.5 deg above the horizon from this eye;
+#   the BOW's top is ~3 deg BELOW it (antisolar point 45 deg down, ring radius 42 deg).
+# They are only ~11 deg apart, so one frame holds both easily — but not a frame whose top
+# edge is +2.9 deg, which clipped the cloud to a sliver along the top (measured: 3% of the
+# frame) and cut the bow's crown. Tilting up puts the cloud at 9% and costs the bow almost
+# nothing (66 clean ring pixels against 70). Panning right toward the rain and opening the
+# lens both looked tempting and both measured WORSE: they drag the sunlit floor into frame,
+# and the bow is a faint single-scatter signal that only survives against a dark backdrop
+# (sunlit backdrop 16% -> 38% panning to x 6.5, and the clean ring collapses 70 -> 39).
+# Re-check any reframe with `python scraps/bowmap.py 45 -12 3.4 7.0 4.5 10.0 --look_at ...`
+# rather than by eye; the trade is not visible until it is counted.
+prefer {
+    camera "cam" {
+        eye 5.0 2.55 6.85   look_at 5.0 1.80 3.1   up 0 1 0   fov_y 52
+        mode D
+        film { res 1280 720   exposure 0.25 }
+    }
+} else {
+    camera "cam" {
+        eye 5.0 2.55 6.85   look_at 5.0 1.80 3.1   up 0 1 0   fov_y 52
+        mode B
+        film { res 1280 720   exposure 0.25 }
+    }
+}

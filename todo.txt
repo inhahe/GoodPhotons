@@ -1,3 +1,19 @@
+there seem to be two clouds in the picture, one on the left and one on the right, i have no idea why. the one on the left is blurrier.
+the cloud with the rain should have have a tapered effect between the inside and the outside of the fog so its edges aren't so harsh. i think you mentioned we'd have that feature at some point? is it supported? should it be?
+make the green wire frames thinner.
+make the stand tables much wider so we can see more caustics.
+the rain seems to be a square block of rain, make it start from within the cloud instead of below it so you can't see the top line of it, and also make the left and right of it within the left and right of the cloud rather than outside of it. 
+in the last render it showed, the outer edge of the gold gyroid was still black and grey.. 
+--
+
+make the ground wire frame thinner too, not just the stands
+
+one thing i don't undersstand is how the outer edge of the gold gyroid was ever black and grey at one point. i can understand it being  black due to having nothing to reflect, but then why would the innards be gold? i guess because light reflects in various directions inside it, but still, i don't understand how there could ever be grey..because if there's any level of reflected light at all, shouldn't it be gold since its color is gold? 
+
+remove the cloud  from the left side
+--
+
+
 did you introduce new CPU-only features that should be also implemented on GPU since we last audited?
 
 Check the jsonl log ofr when i tell the model it is Claude Fable, Anthropic's latest and greatest model and I tell it to optimize the latest changes (maybe grep case-insensitively for "Fable"), then check the todo to see what was cpu/gpu-intensive features were added after that that i could tell Fable to optimize, such as the new W mode.s

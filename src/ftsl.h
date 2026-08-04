@@ -67,6 +67,7 @@
 #include "materials.h"
 #include "mesh.h"
 #include "gltf.h"
+#include "meshvoxel.h"   // solid voxelization for `medium { bounds { object "<mesh>" } }`
 #include "fbx.h"
 #include "upsample.h"
 #include "color.h"
@@ -807,6 +808,9 @@ public:
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
         for (const Block* mb : mediaBlocks) { if (!addMedium(*mb, L)) return false; }
+        // Every consumer of a shape-only mesh's triangles has now run, so drop them
+        // before the BVH is built (see stripShapeOnlyMeshes).
+        stripShapeOnlyMeshes(L);
         // A scene is lit if it has an explicit `light` block OR any emitter was
         // registered implicitly — e.g. an emissive mesh (a material with `emit` bound
         // to a mesh registers a Mesh area light in addMesh) — OR it contains a
@@ -843,6 +847,53 @@ public:
         // emission pattern's emitter is known. Reject the shapes that cannot honour one.
         if (!checkEmitPatsSupported(L)) return false;
         return true;
+    }
+
+    // Remove every `mesh { shape_only yes }` group's triangles from Scene::tris.
+    //
+    // Runs after the deferred medium sweep (the only current consumer of a shape-only
+    // mesh's geometry) and before Scene::build(), so the stripped triangles never reach
+    // the BVH: they are neither intersected nor drawn, and cost nothing at render time.
+    //
+    // Safety of renumbering: Scene::tris is referenced by INDEX only through
+    // MeshGroup::triStart/triCount, which this function fixes up. Mesh area lights COPY
+    // their triangles into Emitter::meshTris (Scene::addMeshLight) rather than keeping a
+    // range, and `shape_only` is refused on an emissive material anyway; materials are
+    // referenced per-triangle by id, not by position. Everything else that indexes tris
+    // (the BVH, hit records) is built later.
+    void stripShapeOnlyMeshes(Loaded& L) {
+        if (shapeOnlyGroups_.empty()) return;
+        // Mark the doomed triangles by group so one linear compaction handles any number
+        // of ranges, in any authoring order, without repeated erases.
+        std::vector<char> drop(L.scene.tris.size(), 0);
+        size_t dropped = 0;
+        for (size_t gi : shapeOnlyGroups_) {
+            MeshGroup& g = L.scene.meshGroups[gi];
+            size_t end = std::min(g.triStart + g.triCount, L.scene.tris.size());
+            for (size_t t = g.triStart; t < end; ++t) { if (!drop[t]) { drop[t] = 1; ++dropped; } }
+        }
+        if (dropped == 0) return;
+        // Prefix count of removed triangles, so each surviving group's new triStart is
+        // just its old one minus however many were removed before it.
+        std::vector<size_t> removedBefore(L.scene.tris.size() + 1, 0);
+        for (size_t t = 0; t < L.scene.tris.size(); ++t)
+            removedBefore[t + 1] = removedBefore[t] + (drop[t] ? 1 : 0);
+        for (MeshGroup& g : L.scene.meshGroups) {
+            if (g.blasId >= 0) continue;                      // instanced: not in Scene::tris
+            if (g.shapeOnly) { g.triStart = 0; g.triCount = 0; continue; }
+            g.triStart -= removedBefore[std::min(g.triStart, L.scene.tris.size())];
+        }
+        std::vector<Tri> kept;
+        kept.reserve(L.scene.tris.size() - dropped);
+        for (size_t t = 0; t < L.scene.tris.size(); ++t)
+            if (!drop[t]) kept.push_back(L.scene.tris[t]);
+        L.scene.tris.swap(kept);
+        for (size_t gi : shapeOnlyGroups_)
+            std::fprintf(stderr, "[mesh] shape_only \"%s\": geometry consumed as a shape and "
+                         "removed from the scene (not rendered)\n",
+                         L.scene.meshGroups[gi].name.c_str());
+        std::fprintf(stderr, "[mesh] shape_only: %zu triangle(s) stripped, %zu remain\n",
+                     dropped, L.scene.tris.size());
     }
 
     // An emission pattern is read from BOTH sides of transport — emission-on-hit (a
@@ -1066,6 +1117,9 @@ private:
     std::unordered_map<std::string, int>         implicitByName_; // named isosurface -> Scene::implicits index
     std::unordered_map<std::string, Aabb>        meshAabbByName_; // named mesh -> world AABB
     std::unordered_map<std::string, int>         blasIndex_;      // mesh_asset name -> Scene::blasList index
+    // `mesh { shape_only yes }` groups (indices into Scene::meshGroups), removed from
+    // Scene::tris by stripShapeOnlyMeshes() once the deferred medium sweep has read them.
+    std::vector<size_t>                          shapeOnlyGroups_;
 
     double L_ = 1.0;              // authored length -> internal metres
     double binWidth_ = 1.0;      // spectral sampling bin width (nm)
@@ -4034,6 +4088,28 @@ private:
         MtlResolver resolver = [this, &L](const std::string& nm) -> int {
             return lookupMaterial(nm, L);   // resolves a free `a` to albedo_default
         };
+        // `shape_only yes` — load this mesh's triangles as a SHAPE REFERENCE only and
+        // keep them out of the rendered scene. The motivating case is fog cut to an
+        // imported silhouette: `medium { bounds { object "cloud" } }` bakes the mesh
+        // into an occupancy lattice, after which the 1.8M-triangle shell is not only
+        // useless but actively wrong — it would render as a solid surface wrapped
+        // around the fog it was supposed to define, and would cost a BVH it never
+        // needs. There is no material that means "not there" (a `filter` with
+        // transmit 1 still consumes a bounce at every crossing), so this is a load-time
+        // property of the mesh, applied once the shape has been consumed.
+        std::string soStr = strOf(b, "shape_only");
+        bool shapeOnly = !soStr.empty() &&
+                         !(soStr == "no" || soStr == "off" || soStr == "false" || soStr == "0");
+        if (shapeOnly && b.name.empty()) {
+            fail("mesh `shape_only` needs a \"name\" — the whole point is for something "
+                 "else (e.g. `medium { bounds { object \"…\" } }`) to reference the shape");
+            return false;
+        }
+        if (shapeOnly && id >= 0 && id < (int)L.scene.mats.size() && L.scene.mats[id].isLight) {
+            fail("mesh \"" + b.name + "\": `shape_only` cannot be combined with an emissive "
+                 "(`emit`) material — a light with no surface would be silently dropped");
+            return false;
+        }
         size_t triStart = L.scene.tris.size();
         // Dispatch by file extension: .gltf/.glb use the glTF loader (which imports
         // its own pbrMetallicRoughness materials by default; `import_materials no`
@@ -4089,7 +4165,13 @@ private:
             g.triCount = L.scene.tris.size() - triStart;
             g.blasId   = -1;
             g.matId    = id;
+            g.shapeOnly = shapeOnly;
             L.scene.meshGroups.push_back(std::move(g));
+            // A shape-only mesh exists purely to hand its silhouette to something else
+            // (today: a `medium { bounds { object "<name>" } }` containment bake). Its
+            // triangles have to survive until the deferred medium sweep has read them,
+            // so the actual removal happens later, in stripShapeOnlyMeshes().
+            if (shapeOnly) shapeOnlyGroups_.push_back(L.scene.meshGroups.size() - 1);
         }
         // Emissive mesh → register a Mesh area light (§ mesh area lights). When the
         // bound material carries an `emit` spectrum, the triangles just appended form
@@ -4162,8 +4244,10 @@ private:
                                      L.scene.mats[id].emit, binWidth_, id);
             }
         }
-        // Record the loaded mesh's world AABB for object-name fog bounds (a mesh bound
-        // is approximated by its box — true containment is deferred, see known-issues).
+        // Record the loaded mesh's world AABB for object-name fog bounds. This is no
+        // longer the *shape* of such a bound — `bounds { object "..." }` solid-voxelizes
+        // the mesh and carves the silhouette (see the Mesh branch of addMedium) — it is
+        // the TRACKING bound: delta/ratio tracking still clips to a box, and this is it.
         if (!b.name.empty() && L.scene.tris.size() > triStart) {
             Aabb box; bool first = true;
             for (size_t t = triStart; t < L.scene.tris.size(); ++t) {
@@ -5052,9 +5136,24 @@ private:
             //   • sphere     -> exact analytic sphere bound (center/radius)
             //   • isosurface -> field membership (fog fills the field's interior,
             //                   carved per-point by fieldEval inside the field AABB)
-            //   • mesh       -> the mesh's world AABB (box approximation; true mesh
-            //                   containment is deferred — see known-issues.md)
+            //   • mesh       -> TRUE containment: the mesh's triangles are solid-voxelized
+            //                   into an occupancy lattice (meshvoxel.h) and membership is a
+            //                   trilinear sample of it, so the fog takes the imported
+            //                   silhouette. `voxels <n>` sets the longest-axis resolution.
             if (const std::string onm = strOf(bb, "object"); !onm.empty()) {
+                // `feather` softens a baked occupancy LATTICE, which only the mesh branch
+                // produces — a sphere and an isosurface are carved analytically per point and
+                // have no lattice to erode. Say that, rather than letting the generic
+                // unknown-key warning imply the keyword does not exist.
+                const bool isMeshBound = (sphereByName_.find(onm) == sphereByName_.end())
+                                      && (implicitByName_.find(onm) == implicitByName_.end());
+                if (!isMeshBound && find(bb, "feather")) {
+                    fail("medium `bounds { object \"" + onm + "\" feather … }`: `feather` "
+                         "applies only to a MESH bound (it softens the voxelized occupancy "
+                         "lattice). A sphere or isosurface bound is carved analytically — "
+                         "shape its edge with the `density` field instead.");
+                    return false;
+                }
                 if (auto sit = sphereByName_.find(onm); sit != sphereByName_.end()) {
                     const NamedSphere& ns = sit->second;
                     med.bounded = true;
@@ -5077,11 +5176,83 @@ private:
                     const PatTables btabs = L.scene.patTables();   // field may sample grid:/scatter:
                     med.boundInsideNeg = (im.eval(ctr, &btabs) <= 0.0);
                 } else if (auto mit = meshAabbByName_.find(onm); mit != meshAabbByName_.end()) {
-                    const Aabb& box = mit->second;
+                    // TRUE mesh containment. Find the triangle range this named block
+                    // appended and bake it to an occupancy lattice; the AABB is kept only
+                    // as the tracking bound (delta/ratio tracking still clips to a box,
+                    // the lattice then carves the silhouette out of it).
+                    const MeshGroup* grp = nullptr;
+                    for (const MeshGroup& mg : L.scene.meshGroups)
+                        if (mg.name == onm) { grp = &mg; break; }
+                    if (!grp || grp->triCount == 0) {
+                        // An INSTANCED mesh (mesh_asset -> blasList) keeps its triangles in
+                        // object space behind a BLAS rather than in Scene::tris, so there is
+                        // no world-space range here to voxelize. Say which case this is.
+                        fail("medium `bounds { object \"" + onm + "\" }`: that mesh has no "
+                             "world triangles to voxelize" +
+                             std::string((grp && grp->blasId >= 0)
+                                 ? " (it is an INSTANCED mesh_asset; give the fog a "
+                                   "non-instanced `mesh` block to shape it to)"
+                                 : ""));
+                        return false;
+                    }
+                    int vres = (int)dblOf(bb, "voxels", 160.0);
+                    if (vres < 8 || vres > 1024) {
+                        fail("medium `bounds { object \"" + onm + "\" voxels N }`: N must be "
+                             "8..1024");
+                        return false;
+                    }
+                    VdbGrid occ = meshvox::voxelizeSolid(L.scene.tris.data(), grp->triStart,
+                                                         grp->triCount, vres);
+                    if (occ.empty()) {
+                        fail("medium `bounds { object \"" + onm + "\" }`: voxelization "
+                             "produced an empty lattice (degenerate mesh?)");
+                        return false;
+                    }
+                    const double frac = meshvox::solidFraction(occ);
+                    std::fprintf(stderr,
+                        "[medium] mesh bound \"%s\": %d x %d x %d lattice, %.1f%% solid "
+                        "(%zu tris)\n", onm.c_str(), occ.nx, occ.ny, occ.nz, frac * 100.0,
+                        grp->triCount);
+                    // `feather <metres>` softens the silhouette: density ramps from 0 at the
+                    // mesh surface to full only that far INSIDE it, instead of the one-voxel
+                    // trilinear step the raw occupancy gives. Authored in world units so it
+                    // is independent of `voxels`; converted to voxels here because that is
+                    // what the distance transform measures in.
+                    const double feath = dblOf(bb, "feather", 0.0);
+                    if (feath < 0.0) {
+                        fail("medium `bounds { object \"" + onm + "\" feather D }`: D is a "
+                             "distance in metres and cannot be negative");
+                        return false;
+                    }
+                    if (feath > 0.0) {
+                        // Voxel edge = extent along the longest axis / that axis' voxel count.
+                        const Vec3 ex = occ.wmax - occ.wmin;
+                        const int nmx = std::max(occ.nx, std::max(occ.ny, occ.nz));
+                        const double vh = std::max({ex.x, ex.y, ex.z}) / std::max(1, nmx - 1);
+                        const double fv = (vh > 0.0) ? feath / vh : 0.0;
+                        if (fv < 1.0)
+                            std::fprintf(stderr,
+                                "[medium] NOTE: mesh bound \"%s\" feather %.3g m is %.2f voxel(s) "
+                                "at `voxels %d` — below one voxel it cannot resolve a ramp; "
+                                "raise `voxels` or `feather`.\n", onm.c_str(), feath, fv, vres);
+                        meshvox::featherGrid(occ, fv);
+                        std::fprintf(stderr,
+                            "[medium] mesh bound \"%s\": feathered %.3g m (%.1f voxels) inward\n",
+                            onm.c_str(), feath, fv);
+                    }
+                    // A mesh that voxelizes to nothing would silently render as no fog at
+                    // all, which reads as "the medium block did nothing" rather than as a
+                    // geometry problem. Say so instead of leaving the author guessing.
+                    if (frac < 1e-4)
+                        std::fprintf(stderr,
+                            "[medium] WARNING: mesh bound \"%s\" is essentially empty — the "
+                            "mesh may be open (not a closed solid) or too thin for `voxels "
+                            "%d`; the fog will be invisible.\n", onm.c_str(), vres);
                     med.bounded = true;
-                    med.boundShape = MediumBound::Box;
-                    med.bmin = box.lo;
-                    med.bmax = box.hi;
+                    med.boundShape = MediumBound::Mesh;
+                    med.boundGrid = std::make_shared<VdbGrid>(std::move(occ));
+                    med.bmin = med.boundGrid->wmin;
+                    med.bmax = med.boundGrid->wmax;
                 } else {
                     fail("medium `bounds { object \"" + onm + "\" }` names no sphere, "
                          "isosurface, or mesh (objects must have a \"name\")");
@@ -5201,7 +5372,11 @@ private:
                         // the renderer samples, or a `grid:`-driven density would majorise
                         // to 0 and the medium would vanish. The data pass runs before this
                         // one, so L.scene.grids/scatters/dataPool are already populated.
-                        peak = std::max(peak, med.densityAt(p, &tabs));
+                        // densityFieldAt, not densityAt: the membership carve of an
+                        // implicit/mesh bound only multiplies by 0 or 1, so the uncarved
+                        // field peak is the conservative majorant, and probing the carved
+                        // one on a 25^3 grid can miss a thin shape and majorise to 0.
+                        peak = std::max(peak, med.densityFieldAt(p, &tabs));
                     }
                     dmax = 1.3 * peak;
                 }

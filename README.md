@@ -239,6 +239,24 @@ CPU needs ~625 spp (~80 min) to reach 4 % graininess; mode `W` produces a clean 
 and starts meaning *finer antialiasing and a denser spectrum*; the picture gets sharper,
 never less grainy, and the progress line reads `deterministic` instead of a noise figure.
 
+**One exception: participating media.** The quadrature above covers the *surface* half of
+mode `R`. The fog branch was never converted, so a scene with a `medium` still takes a
+**random free flight** (`−ln(1−u)/σt`) and a **random** volume shadow connection at each
+pixel. The result is bit-identical run to run (the rng is seeded from the pixel), but it is
+*speckled*, not noise-free — at `-spp 1` each pixel either misses the light entirely or
+connects and carries the whole `1/pdf` as a blown-out dot. Add `-no-media` for a genuinely
+clean 1-spp preview, or spend `-spp 32..64` to converge the haze.
+
+**And media are one of the few places the CPU and GPU backward tracers disagree.** The
+**GPU** megakernel superposes the scene's **whole** `media` list — every `bounds` region,
+every `density` field, every per-medium phase function, `phase rainbow` included — so
+`-mode W` on the GPU renders bounded clouds and a real rainbow. The **CPU** backward
+(`backward.h`) still collapses everything to the **first authored medium**, as a global
+homogeneous haze with `bounds`/`density` ignored, so the same scene on `-device cpu` loses
+the clouds and the bow entirely. ftrace warns (`[medium] …`) when a render's backward layer
+lands on the degraded CPU path. Both the noise and the divergence are logged in
+`known-issues.md`.
+
 **`-ambient <v>` — the GI stand-in.** With the diffuse indirect bounce gone, a *closed*
 room previews with black shadows, because everything not directly facing the light is lit
 purely by bounce. `-ambient` adds POV-Ray's flat fill at every diffuse vertex; it is
@@ -790,10 +808,10 @@ that converges to the same physical image.
 | `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe; fully on the GPU |
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
-| `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / spot / env lights |
+| `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / env / collimated lights |
 | `M` | Many cameras sharing one lighting solution (flythroughs); reusable/persistable map | Fast per frame *(after one shared pass)* | ✓ *(walks to diffuse)* | — | ✓ | ✓ *(direct query)* | Direct query blurs contact shadows (use `-pmfg`) |
-| `S` | **Caustics / SDS**; progressive, bounded memory | Slow *(many passes)* | ✓ | ✓ | ✓✓ | ✗ | Many passes to converge; CPU only |
-| `U` | Robust "have it all" (diffuse GI + caustics), no per-scene mode picking | Heaviest / pass | ✓ | ✓ | ✓ | ✗ | Heaviest per-pass cost; CPU only |
+| `S` | **Caustics / SDS**; progressive, bounded memory | Slow *(many passes)* | ✓ | ✓ | ✓✓ | ✓ *(resident session; pinhole only)* | Many passes to converge |
+| `U` | Robust "have it all" (diffuse GI + caustics), no per-scene mode picking | Heaviest / pass | ✓ | ✓ | ✓ | ✓ *(resident session; pinhole only, no media)* | Heaviest per-pass cost |
 
 - **`B` — pinhole splat (default, fastest).** Every photon that hits a
   camera-visible surface splats to the pinhole, so essentially no photons are
@@ -854,8 +872,9 @@ that converges to the same physical image.
   camera-side layer falls back to the CPU. *Cost:* more expensive than plain `B`;
   there can be a subtle seam between the two layers. With a **physical lens** the
   pinhole-splat forward pass can't form the lens image, so `P` automatically routes
-  to the lens-aware BDPT (`D`) — or, if the scene is outside BDPT scope (fog / env /
-  spot / fluorescence), falls back to the backward realistic camera (`R`).
+  to the lens-aware BDPT (`D`) — or, if the scene is outside BDPT scope (env /
+  collimated lights, fluorescence, layered materials, GRIN media), falls back to the
+  backward realistic camera (`R`).
 - **`D` — BDPT (most general, slowest per sample).** One unbiased estimator that
   traces a light *and* a camera subpath and MIS-combines every connection, so it
   captures **specular-first pixels and diffuse caustics in a single pass** on the
@@ -869,8 +888,13 @@ that converges to the same physical image.
   in-scatter vertices, HG-phase connections and transmittance-weighted edges (subpath
   medium vertices placed by delta tracking, connections weighted by ratio-tracking
   transmittance), so fog *inside a glass shell* images correctly here (a case the
-  next-event modes leave dark). *Cost:* highest cost per sample, and it **does not support
-  fluorescence or spot & env lights** (use `B`/`P` or `R` for those).
+  next-event modes leave dark). Since 0.124.0 it also renders **`spot` and `sun` lights** —
+  delta emitters, so the strategies that would have to sample the Dirac (an eye path
+  *landing* on the light) are dropped from the MIS weight, and a `sun` additionally gets an
+  escaped-ray strategy so a mirror can throw its disc back at the lens. *Cost:* highest cost
+  per sample; it **does not support fluorescence, layered materials, or env & collimated
+  lights** (use `B`/`P` or `R` for those). Since 0.126.0 spot/sun scenes run on the **GPU**
+  too — the device kernels do delta lights, so there is no CPU fallback for them any more.
 - **`M` — photon map (view-independent, reusable).** Traces a forward photon pass
   **once** and stores every diffuse deposit in a **view-independent photon map** (a
   uniform hash grid), then forms the camera image by a backward camera pass. By default
@@ -949,7 +973,11 @@ that converges to the same physical image.
   **ignored** (light-path count follows the film resolution); `-spp` is the **number of
   passes** (or a `-time`/`-noise`/`-forever` budget); the radius-shrink rate is
   `-vcmalpha` (default `0.75`) and the initial radius reuses `-pmradius`/`-pmradiusfrac`.
-  CPU only. *Cost:* the heaviest per-pass (both a full light pass and a full camera pass,
+  Since 0.125.0 it renders **`spot` and `sun` lights** on the same terms mode `D` does
+  (delta emitters: the unsamplable strategies are dropped from the vc/vm MIS weights, and a
+  `sun` gets the escaped-ray strategy so a mirror throws its disc back at the lens) — on the
+  CPU, and since 0.127.0 on the **GPU** too (the device VCM session got the same port mode `D`
+  got in 0.126.0, and is ~170× faster than the CPU on a spotlit Cornell box). *Cost:* the heaviest per-pass (both a full light pass and a full camera pass,
   plus a grid build), but the most consistent quality per pass — at equal time it beats
   SPPM on caustics *and* stays as clean as BDPT on diffuse GI. (Single-wavelength note:
   connections pair a camera path with its **own** light path so they share one wavelength
@@ -991,7 +1019,7 @@ stay non-resumable.
   on a pinhole scene); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (spot/collimated lights; GRIN media in mode `D` BDPT — mode `R` now runs fog, spectral
+  (spot/sun/collimated lights; GRIN media in mode `D` BDPT — mode `R` now runs fog, spectral
   **rainbow-phase** media, **GRIN gradient-index bending**, fluorescence, and constant *and*
   image-based env lights on the device), and for
   fluorescent/oversized-mix forward scenes (mode `M`'s `-pmfg` final gather now runs
@@ -1008,11 +1036,15 @@ stay non-resumable.
   interior absorption, **diffuse-transmit** (two-sided Lambertian — both lobes +
   back-hemisphere connections), and **frosted (rough) glass** (stochastic-delta lobe jitter
   by per-hit roughness) all render **on-device** with MIS-consistent densities — the GPU
-  BDPT scope now matches the CPU BDPT exactly (no per-material fallback). (Fluorescence,
-  layered stacks, and spot/env/collimated lights aren't a GPU limitation — BDPT can't render
-  them on *any* backend, so mode `D` refuses or drops to mode `B` for those scenes on both
-  CPU and GPU; use mode B/P/R for them. GRIN media keep an in-scope mode-`D` scene on
-  the CPU; spectral **rainbow-phase** media now render on-device in mode `D`.) **Parametric records** (a
+  BDPT scope now matches the CPU BDPT for every *material* (no per-material fallback).
+  (Fluorescence, layered stacks, and env/collimated lights aren't a GPU limitation — BDPT
+  can't render them on *any* backend, so mode `D` refuses or drops to mode `B` for those
+  scenes on both CPU and GPU; use mode B/P/R for them. **Spot and sun lights** render
+  on-device in mode `D` since 0.126.0 and in mode `U` since 0.127.0 — the delta-emitter light
+  subpath, the per-shape NEE connection geometry and the escaped-ray solar disc are all in the
+  kernels, so a spot/sun scene no longer falls back in either bidirectional mode. GRIN media
+  likewise keep an in-scope
+  mode-`D` scene on the CPU; spectral **rainbow-phase** media now render on-device in mode `D`.) **Parametric records** (a
   material's slots driven by a per-hit driver sampling a named LUT bank — see *Parametric
   records* below) run on the **GPU forward, backward, and BDPT (`D`) tracers for both the
   reflect/albedo and roughness slots** (constant stop selectors bake into the device
@@ -1133,7 +1165,7 @@ mode `P` (which routes to `D`/`R`). It maps the sensor across the film width, so
 film whose aspect matches the sensor (e.g. `res 360 240` for a 3:2 sensor) covers it
 without cropping, while a mismatched aspect crops. It does not model inter-element
 flare/ghosting or shaped-iris bokeh. On the GPU it inherits its mode's scope (no
-fog/env/spot/fluorescence, and at most 16 lens surfaces); outside that scope it falls
+env/collimated lights or fluorescence, and at most 16 lens surfaces); outside that scope it falls
 back to the CPU automatically.
 
 ---
@@ -1637,8 +1669,10 @@ Unlike every other light, the sun costs nothing in forward modes: photons are bo
 disc the size of the scene's own cross-section, aimed down the beam, so **every** photon
 enters the scene instead of most missing it. Backward modes next-event-estimate it
 inside its cone, and the disc itself is directly viewable (aim a camera at it). Runs on
-both CPU and GPU in modes A/B/C/R/P/M/S (mode `D`/`U` refuse it, like `spot` and `env`).
-See `scenes/_sun_check.ftsl`, and `ftrace -checksun` for the deterministic self-test
+both CPU and GPU in every mode: A/B/C/R/P/M/S all along, mode `D` (BDPT) since 0.124.0 on the
+CPU and 0.126.0 on the GPU (together with `spot`), and mode `U` (VCM) since 0.125.0 on the CPU
+and 0.127.0 on the GPU. No mode falls back to the CPU for a sun any more.
+See `scenes/_sun_check.ftsl` and `scenes/_deltalight_mix.ftsl`, and `ftrace -checksun` for the deterministic self-test
 (cone solid angle, exposure invariance, uniform-in-solid-angle cone sampling, and
 NEE/direct-view rim agreement).
 
@@ -1715,6 +1749,21 @@ self-luminous **appearance**, not as luminaires, and keep a real light in the sc
 do the actual lighting — see `tools/loom/examples/glowing_jack.py`, where a
 gyroid-carved isosurface glows from inside its own filigree while a ceiling panel
 shades it.
+
+**Emission is one-sided — mind a `quad`'s winding.** A surface shows its `emit` only to a
+ray arriving on the *front* face, and a `quad`'s front face is the side `cross(u, v)`
+points at. So
+
+```ftsl
+quad { origin -18 0 -19  u 46 0 0  v 0 0 45  material glowgrid }   # normal -y: dark from above
+quad { origin -18 0 -19  u 0 0 45  v 46 0 0  material glowgrid }   # normal +y: glows
+```
+
+differ only in the order of `u` and `v`, and only the second one lights up. Every
+*reflective* slot looks identical either way — direct lighting flips the normal toward the
+light itself — so a mis-wound emissive quad shades perfectly normally and silently loses
+just its glow. If a glowing panel or floor renders as a plain lit surface, swap `u` and `v`
+first.
 
 ---
 
@@ -2357,8 +2406,24 @@ simple *per-object* fog like **the whole inside of a glass sphere** (author the 
 center/radius as the sphere). Or shape the fog to a **named object** with
 `bounds { object "<name>" }`: a named `sphere` gives its exact analytic bound, a named
 `isosurface` fills the field's interior (the fog takes the metaball/SDF silhouette
-exactly, carved per-point during tracking), and a named `mesh` uses the mesh's world
-AABB (a box approximation; true mesh containment is deferred). An *open* fog sphere is directly viewable in every mode.
+exactly, carved per-point during tracking), and a named `mesh` gives **true containment**
+of the imported triangle mesh — the mesh is solid-voxelized at load into an occupancy
+lattice and the fog fills its actual interior, so `mesh { file "cloud1.glb" }` shapes the
+fog like a cloud rather than filling a box around it. `voxels <n>` (default 160) sets the
+bake resolution on the longest axis; the fill uses generalized winding rather than parity,
+so a model made of several closed bodies (or with self-intersecting shells) comes out as
+their union instead of hollowing where they overlap, and 1.85 M triangles bake in about a
+second. The lattice is the same dense volume format an imported `.nvdb` uses, so mesh
+bounds run on the **GPU** too. Because that bake is binary and the sampler's trilinear
+filter only ramps across one voxel, a mesh bound has a **hard edge** by default — right for
+a body or a bottle, wrong for a cloud. `feather <metres>` fixes that: it replaces the 0/1
+occupancy with a smoothstep of the **exact Euclidean distance** to the outside (Felzenszwalb
+& Huttenlocher's separable transform, three linear-time sweeps — isotropic, no axis-aligned
+banding), so density rises from zero at the surface to full that far in and the silhouette
+becomes a falloff *zone* the way real cloud edges are. Pair it with
+`mesh { … shape_only yes }`, which loads a mesh purely as a shape and strips its triangles
+from the scene once the bound is baked, so the shell defining the fog isn't also drawn
+around it. An *open* fog sphere is directly viewable in every mode.
 Fog (and any diffuse surface) seen through a **glass sphere** *is* imaged directly by the
 pinhole splat `B`, via the **analytic specular connection**: for each glowing haze in-scatter
 (or Lambertian surface) vertex the renderer solves the refracted eye ray that reaches the
@@ -2463,7 +2528,10 @@ fly-around: N frames on a circle around a `center`, for MP4 orbits), `camera_cur
 (`cornell.ftsl`, `fisheye.ftsl`, `spotlight.ftsl`, `envlight.ftsl`,
 `material_presets.ftsl`, `realcam.ftsl`, `implicit.ftsl`, `function.ftsl`,
 `procedural.ftsl`, `uv_native.ftsl`, `showcase_orbit.ftsl`, `translucency.ftsl`,
-`gallery.ftsl` (a large room packed with varied materials around a gold gyroid), …).
+`gallery.ftsl` (a large room packed with varied materials around a gold gyroid),
+`gallery_rain.ftsl` (the same hall with weather in it: a fog cloud whose *shape* is a
+mesh, a rain curtain under it using the `rainbow` phase function, and a ceiling slot plus
+a distant-sphere sun sited so a real 42° primary bow lands in frame), …).
 
 **Scene-header defaults (`default_mode`, `fps`).** The `scene { … }` header can set
 two project-wide defaults alongside `units`/`spectral`:

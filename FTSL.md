@@ -1112,6 +1112,34 @@ Works in `mesh_asset` too. *Not supported* (see
 known-issues): textures, KHR extensions (transmission/clearcoat/…), skinning,
 morph targets, sparse accessors, animation, and non-triangle primitives (skipped).
 
+**`shape_only yes` — load the mesh as a shape, not as geometry.** The triangles are
+read and handed to whatever references the mesh **by name** — today that means a
+`medium { bounds { object "<name>" } }` containment bake (§12.1) — and are then
+**removed from the scene before the BVH is built**. Nothing renders, nothing is
+intersected, and the triangles cost nothing at render time.
+
+```
+mesh "cloud" { file "cloud1.glb"  material fog_shape  shape_only yes }
+medium { sigma_t 3.0 albedo 0.9 bounds { object "cloud" } }   # fog IS the cloud
+```
+
+This is what you want whenever the mesh's job is to *define* a volume: without it the
+imported shell renders as a solid surface wrapped around the fog it was supposed to
+shape, and drags its full triangle count through the BVH forever. There is no material
+that means "not there" — a `filter` with `transmit 1` is invisible but still consumes a
+bounce at every crossing — so this is a property of the mesh, applied once its shape has
+been consumed. The loader says what it did:
+
+```
+[mesh] shape_only "cloud": geometry consumed as a shape and removed from the scene (not rendered)
+[mesh] shape_only: 1852454 triangle(s) stripped, 4 remain
+```
+
+`shape_only` requires a `"name"` (nothing could reference it otherwise) and is refused
+on an **emissive** material, where it would silently delete a light. `-check-watertight`
+reports such a mesh as skipped, since its geometry is gone by the time the audit runs —
+drop `shape_only` for one run to check it.
+
 ### 8.5 `mesh_asset` + `mesh_instance` — instancing (two-level BVH)
 
 A `mesh` bakes its triangles into the scene, so ten copies cost ten triangle
@@ -1363,10 +1391,11 @@ medium {
   of your head) and the bow appears as a ring at ~42° radius around it. Keep the fog
   **thin** (optical depth ≲ 0.3) so single scattering — which carries the bow — dominates
   over the multiply-scattered veil.
-- **Mode support:** the tabulated rainbow phase is evaluated by the **CPU** tracers
-  (forward A/B/C, backward R, BDPT D). The **GPU** volume path only knows the analytic HG
-  lobe, so a scene with a rainbow-phase medium automatically **falls back to the CPU**
-  tracer (rather than silently dropping the bow to a smooth haze).
+- **Mode support:** the tabulated rainbow phase runs on **both CPU and GPU** — forward
+  A/B/C, backward R and BDPT D — since **M10** (0.113.0). The `(λ × μ)` phase table and
+  its per-λ CDF are uploaded per medium and sampled by the identical code on the device,
+  so `-device gpu` keeps the bow instead of falling back or degrading it to a smooth
+  haze. (This paragraph previously claimed a CPU-only fallback; that was stale.)
 
 **Multiple media.** You may author several `medium` blocks; they coexist as
 independent, possibly overlapping regions (e.g. two differently-tinted fog orbs plus
@@ -1418,8 +1447,68 @@ medium {
     sign at its bounding-box center), so the fog takes the metaball/SDF silhouette
     exactly (carved per-point during delta/ratio tracking over the field's AABB). A
     `density` field still multiplies on top, shaping the fog *within* the iso-shape.
-  - a named **mesh** → the mesh's world **AABB** (a box approximation; true mesh
-    containment is deferred — see `known-issues.md`).
+  - a named **mesh** → **true containment** of the triangle mesh. The mesh is
+    solid-voxelized at load into an occupancy lattice and the fog fills the interior,
+    so an imported cloud/body/silhouette really shapes the fog rather than filling a
+    box around it. `voxels <n>` (default **160**, range 8…1024) sets the lattice
+    resolution along the mesh's **longest** axis; the voxels are cubic, so the other
+    two axes get however many that implies. Like an isosurface bound, a `density`
+    field still multiplies on top, shaping the fog *within* the mesh silhouette.
+
+    ```
+    mesh "cloud" { file "cloud1.glb" material fog_shape shape_only yes }
+    medium {
+        sigma_t 3.0  albedo 0.9  g 0.4
+        bounds { object "cloud"  voxels 200 }
+    }
+    ```
+
+    The bake uses **signed-crossing (generalized winding)** scanlines, not parity, so a
+    model built from several closed bodies — or with self-intersecting shells — comes
+    out as their **union** instead of hollowing where they overlap. That is what the
+    imported meshes people actually reach for look like (`cloud1.glb` is two bodies).
+    Cost is linear in triangles: a 1.85 M-triangle cloud bakes in about a second. The
+    loader reports the lattice and how much of it came out solid —
+
+    ```
+    [medium] mesh bound "cloud": 163 x 102 x 153 lattice, 31.2% solid (1852454 tris)
+    ```
+
+    — and warns when that is ~0%, which means the mesh is open, inside-out, or thinner
+    than one voxel (raise `voxels`). The result is carried as the same dense fp16
+    lattice an imported `.nvdb` uses, so it is sampled by identical CPU/GPU code and
+    uploaded to the device as a sparse brick grid: **mesh bounds work on the GPU**.
+
+    A mesh used only to *define* a shape usually should not also be drawn — see
+    `shape_only` (§8.4), which strips its triangles once the bound has been baked.
+
+    **`feather <metres>`** (mesh bounds only, default **0** = off) softens that
+    silhouette. The bake is **binary** — a voxel is in or out — and the sampler's
+    trilinear filter ramps 0→1 across exactly **one voxel**, so by default a mesh bound
+    has a hard edge: fine for a body or a bottle, wrong for a cloud, smoke or a dust
+    volume, whose real edge is a *zone* where concentration falls off over a metre or
+    more. `feather` replaces the 0/1 occupancy with `smoothstep(distance-to-the-
+    outside / feather)`, so density climbs from 0 at the surface to full that far in:
+
+    ```
+    bounds { object "cloud"  voxels 192  feather 0.13 }
+    ```
+
+    The distance is an **exact Euclidean distance transform** (Felzenszwalb &
+    Huttenlocher's separable lower-envelope algorithm — three linear-time sweeps, one
+    per axis), not a chamfer approximation, so the falloff is isotropic and shows no
+    axis-aligned banding. The value is in **world metres** and is converted to voxels
+    for you; the loader reports both, and warns if you ask for less than one voxel
+    (which the trilinear filter already gives you for free):
+
+    ```
+    [medium] mesh bound "cloud": feathered 0.13 m (9.1 voxels) inward
+    ```
+
+    Feathering only ever *removes* density, so it thins the object slightly overall —
+    raise `sigma_t` a little if you want the core to hold its previous opacity. It is
+    rejected on a sphere or isosurface bound, which are carved analytically and have no
+    lattice to soften; shape those edges with the `density` field instead.
 
   The object may be authored anywhere in the file (media are resolved after all
   geometry). The named object's own material/visibility is unaffected — only its

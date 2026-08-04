@@ -328,7 +328,10 @@ inline Material makeFluoroMaterial() {
 // Shape of a medium's optional spatial bound: an axis-aligned box or a sphere. A
 // sphere bound fills exactly an object-shaped region (e.g. "the whole inside of a
 // glass sphere") — author the same center/radius as the sphere geometry.
-enum class MediumBound { Box, Sphere, Implicit };
+// How a bounded medium decides which points it occupies. `Mesh` is true containment of
+// an imported triangle mesh, carried as a baked occupancy lattice (see meshvoxel.h) —
+// NOT the mesh's AABB, which is what a named mesh used to degrade to.
+enum class MediumBound { Box, Sphere, Implicit, Mesh };
 
 struct Medium {
     bool enabled = false;
@@ -395,6 +398,18 @@ struct Medium {
     // of the Medium stay cheap. The grid's world AABB seeds the medium bound and
     // its peak value seeds densityMax. Takes precedence over the `density` formula.
     std::shared_ptr<VdbGrid> vdb;
+
+    // --- Optional MESH containment lattice (boundShape == MediumBound::Mesh) ----
+    // Occupancy (1 inside / 0 outside) baked from a named mesh's triangles by
+    // meshvox::voxelizeSolid, sampled trilinearly so the 0.5 threshold lands on a
+    // smooth interpolated isosurface rather than on voxel faces. Distinct from `vdb`
+    // above on purpose: `vdb` REPLACES the density field, whereas this only decides
+    // membership, so a `density` formula still multiplies on top and shapes the fog
+    // WITHIN the mesh silhouette — the same semantics a named isosurface bound has.
+    std::shared_ptr<VdbGrid> boundGrid;
+    bool insideMesh(const Vec3& p) const {
+        return boundGrid && boundGrid->sample(p) >= 0.5;
+    }
 
     // --- Optional volumetric blackbody EMISSION (fire) ----------------------
     // When `temperature` is set (a second imported grid giving T in Kelvin per
@@ -482,7 +497,8 @@ struct Medium {
     // an implicit membership makes the effective density spatially varying (1 inside,
     // 0 outside) even when the base coefficients are constant.
     bool heterogeneous() const {
-        return !density.empty() || vdb || boundShape == MediumBound::Implicit;
+        return !density.empty() || vdb || boundShape == MediumBound::Implicit ||
+               boundShape == MediumBound::Mesh;
     }
 
     // Dimensionless density multiplier at a world point (>= 0). 1 for a homogeneous
@@ -494,6 +510,17 @@ struct Medium {
     // a parameter, not a member, because it points into Scene's vectors — see PatTables.
     double densityAt(const Vec3& p, const PatTables* tabs = nullptr) const {
         if (boundShape == MediumBound::Implicit && !insideField(p, tabs)) return 0.0;
+        if (boundShape == MediumBound::Mesh && !insideMesh(p)) return 0.0;
+        return densityFieldAt(p, tabs);
+    }
+
+    // The density FIELD alone, with no membership carve — i.e. what `densityAt` would
+    // return if every point were inside the bound. This exists for majorant estimation:
+    // an implicit/mesh membership multiplies the field by 0 or 1, so the field's own
+    // peak is always a valid (conservative) majorant, whereas sampling `densityAt` on a
+    // coarse grid can miss a thin or low-volume-fraction shape entirely and majorise to
+    // ~0, which would make delta/ratio tracking silently drop the medium.
+    double densityFieldAt(const Vec3& p, const PatTables* tabs = nullptr) const {
         if (vdb) return vdb->sample(p);   // imported .nvdb volume (trilinear)
         if (density.empty()) return 1.0;
         PatCtx c = makePatCtx(p, 0.0, Vec3(0, 0, 0));
@@ -531,6 +558,7 @@ struct Medium {
             return dot(d, d) <= bradius * bradius;
         }
         if (boundShape == MediumBound::Implicit) return insideField(p, tabs);
+        if (boundShape == MediumBound::Mesh) return insideMesh(p);
         return p.x >= bmin.x && p.x <= bmax.x && p.y >= bmin.y &&
                p.y <= bmax.y && p.z >= bmin.z && p.z <= bmax.z;
     }
@@ -934,6 +962,12 @@ struct MeshGroup {
     size_t triStart = 0, triCount = 0;   // range into Scene::tris  (blasId < 0)
     int    blasId   = -1;                // >=0: geometry lives in Scene::blasList[blasId]
     int    matId    = 0;                 // representative material (dielectric emphasis)
+    // `mesh { shape_only yes }`: the triangles were loaded only to DEFINE a shape (a
+    // `medium { bounds { object … } }` containment lattice) and were removed from
+    // Scene::tris before the BVH was built, so this group renders nothing and its
+    // triStart/triCount are both 0. The entry survives so the object still has a name
+    // and reports can say what happened to it rather than silently omitting it.
+    bool   shapeOnly = false;
 };
 
 struct Scene {
@@ -977,13 +1011,22 @@ struct Scene {
     // point), so transmittance is the product of per-medium transmittances and a
     // collision is the earliest of the media's independent free-flight samples (with
     // the scattering medium chosen by the Poisson superposition theorem). Empty =>
-    // vacuum. (The backward/BDPT modes are homogeneous-only and use backwardMedium().)
+    // vacuum. BDPT (mode D, both devices) and the GPU backward megakernel superpose the
+    // full vector too; only the CPU backward tracer still degrades to backwardMedium().
     std::vector<Medium> media;
 
-    // Backward/BDPT (modes R/V/D and the P composite) support only a single GLOBAL
-    // HOMOGENEOUS haze; they ignore density/bounds. This returns the medium they use
-    // as that haze — the first authored medium — or a disabled default if there is
-    // none. main.cpp warns when an authored medium carries density/bounds for these modes.
+    // The CPU backward tracer (src/backward.h — modes R/W/V and the P composite's
+    // camera-side layer) supports only a single GLOBAL HOMOGENEOUS haze and ignores
+    // density/bounds. This returns the medium it uses as that haze — the first authored
+    // medium — or a disabled default if there is none.
+    //
+    // NOTE this is now a CPU-only limitation, and a source of CPU/GPU divergence: the
+    // device backward megakernel (render_cuda.cu dMediaSampleCollision / bkNeeVolume)
+    // superposes the whole `media` vector, bounds + density fields + per-medium phase
+    // functions included, so a GPU mode-R/W render of a multi-medium scene looks different
+    // (and more correct) than the CPU one. main.cpp warns when a render's backward layer
+    // actually lands on this degraded path. Tracked in known-issues.md; the fix is to port
+    // the superposition into backward.h and delete this accessor.
     const Medium& backwardMedium() const {
         static const Medium none;   // disabled (enabled=false) sentinel
         return media.empty() ? none : media.front();

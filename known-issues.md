@@ -5,6 +5,363 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-04): mode `W` is NOT noise-free at `-spp 1` when the scene has a medium — the fog term is still a Monte-Carlo free flight
+
+**Symptom.** `ftrace scenes/gallery_rain.ftsl -mode W -spp 1 -r 480 270` returns a black frame
+covered in isolated, fully-saturated speckles instead of smooth haze. The same scene with
+`-no-media` is clean and perfectly deterministic, and `scenes/cornell.ftsl -mode W -spp 1` is
+clean too, so the surface half of mode W is fine — it's the volume half that is noisy.
+
+**Why.** Mode `W` is meant to be mode `R` with every *estimator* replaced by a fixed quadrature
+(4x4 shadow rays per light, 8 wavelengths per sample, a grid instead of a random lobe). The
+participating-medium branch was never converted. `Backward::radiance` (`src/backward.h` ~1193)
+still does the plain analog free flight
+
+```cpp
+double tMed = -std::log(1.0 - rng.uniform()) / st;
+if (tMed < dSurf) { ...neeVolume(...)...; }        // then analog scatter-or-absorb
+```
+
+and `neeVolume` (~685) draws `rng.uniform()` again for the light-point / sun-cone sample. So each
+pixel gets **one** random scattering depth and **one** random shadow connection: it either misses
+the light entirely (black) or connects and carries the whole `1/pdf` (a blown-out speckle). It is
+*deterministic* in the sense the docs promise — two runs are bit-identical (`scraps/imgdiff.py`
+gives max |diff| 0.00000) because the RNG is seeded from the pixel — but it is not *noise-free*,
+which is the property that makes mode W useful as a 1-spp preview. `-spp 64` converges it, at
+which point mode W costs the same as mode R and its reason to exist is gone.
+
+**Proper fix.** Quadrature-ise the volume branch the same way the surface branch already was:
+march the camera segment in `N` equal-transmittance (or equal-`t`) strata instead of sampling one
+free flight, accumulate `sigma_s * T * phase * NEE` at each stratum, and give `neeVolume` the same
+fixed `4x4` light-sample grid `neeLight` uses (`gridUV(s, G, u1, u2)` at ~540/578) rather than
+`rng.uniform()`. Both are `whitted`-gated, so mode R stays bit-identical.
+
+### OPEN (2026-08-04): the CPU and GPU backward tracers render DIFFERENT fog — the CPU one still collapses `scene.media` to a single global haze
+
+**Symptom.** `scenes/gallery_rain.ftsl -mode W` renders the ceiling cloud, the mesh-bound
+raincloud and a full spectral **rainbow** from the `phase rainbow { droplet_um 500 }` curtain on
+the **GPU**, and none of them on the **CPU** — same scene, same mode, same spp, two different
+pictures:
+
+```
+ftrace scenes/gallery_rain.ftsl -mode W -spp 32 -r 480 270 -o png/gpu.png   # clouds + rainbow
+ftrace scenes/gallery_rain.ftsl -mode W -spp 32 -r 480 270 -device cpu -o png/cpu.png   # neither
+```
+
+**Why.** The device backward megakernel grew full multi-medium support (`dMediaSampleCollision`
+/ `dMediaTransmittance` / `bkNeeVolume` in `src/render_cuda.cu` ~1787, ~6929) — extinction adds
+over `sc.media[0..mediaN)`, homogeneous media use an exact free flight and heterogeneous ones
+Woodcock tracking, and the phase function is looked up per medium — but the CPU twin never did.
+`src/backward.h` still calls `scene.backwardMedium()` (`src/scene.h` ~1021), which is literally
+`media.front()`, and treats it as a *global homogeneous* haze with `bounds` and `density` ignored.
+Its own comment claims it "mirrors backward.h radiance() so the two estimators agree", which is
+no longer true. Mode `V` (which compares a forward render against the **CPU** backward reference
+by design) is therefore also measuring the wrong fog on any multi-medium scene.
+
+**Partially addressed (v0.128.1):** the `[medium] …` warning used to fire for every R/W/V/P
+render on a multi/bounded/heterogeneous-media scene, including GPU ones where nothing is actually
+lost. It now runs *after* the `-device` resolution in `src/main.cpp` and fires only when the
+render's backward layer really lands on the CPU tracer, and it names `-device gpu` as the fix.
+
+**Proper fix.** Port the superposition to `backward.h`: replace the single
+`scene.backwardMedium()` with the same "earliest of the media's independent free-flight samples,
+scatterer chosen by Poisson superposition" loop the forward tracer and the device kernel already
+use, and give `neeVolume` the per-medium phase/albedo lookup. Then delete `backwardMedium()` and
+the warning entirely. Until then, prefer `-device gpu` for any backward render of a scene with
+more than one medium.
+
+### BUG — DONE (2026-08-04, v0.128.0): the fp32 GPU build lost most of a DISTANT light's energy (a sun modelled as a far-away sphere rendered 2.7x too dim)
+
+**Symptom.** `scenes/gallery_rain.ftsl` modelled the sun as a Lambertian sphere `radius 1.85`
+at 400 m (subtending the sun's own 0.53°) carrying `power 2.011e9` = one solar constant. Mode D
+on the **GPU** rendered it **2.7x darker than the CPU reference**; the same sphere moved to
+40 m was 1.5x too dark, and by ~4 m the error vanished. `light sun` in the identical scene
+matched the CPU to 0.15%, which is what made the loss look like a delta-light problem when it
+was nothing of the sort — it was a plain float32 precision bug hitting *any* distant emitter.
+
+**Reproduce** (`scraps/_sunmatch_{sun,sphere,sphere40}.ftsl`, a grey floor + one light, plus
+`scraps/lumdiff.py`, which undoes the sRGB curve so the printed ratio is a real energy ratio):
+
+```
+ftrace -in scraps/_sunmatch_sphere.ftsl -camera cam -r 200 200 -time 10 -ev 0.02 -o png/a.png
+ftrace -in scraps/_sunmatch_sphere.ftsl -camera cam -r 200 200 -time 25 -ev 0.02 -device cpu -o png/b.png
+python scraps/lumdiff.py png/a.png png/b.png      # was 0.377, now 1.023
+```
+
+**Two independent root causes, both fixed in `src/render_cuda.cu`:**
+
+1. **`intersectSphere` used the textbook `disc = b² − 4ac`.** Both terms are `O(dist²)` while
+   their difference is `O(radius²)`, so the subtraction catastrophically cancels: a sphere `k`
+   radii away carries roughly `k²` ulp of error in its hit distance. At 400 m with `r = 1.85`
+   that is **±1 cm**. Replaced with the stable Ray-Tracing-Gems form — build the discriminant
+   from the ray's *perpendicular* offset (`disc = a·(r² − |f⊥|²)`, every term `O(r²)`) and take
+   the near root by Vieta (`c/q`). This also helps any camera ray hitting a distant sphere.
+2. **Connection rays were shortened by a fixed absolute epsilon** (`dist - 2e-6`, inherited
+   verbatim from the all-double CPU reference in `bdpt.h`). One ulp of a float is `dist·2⁻²³`,
+   so past **~17 m** the `2e-6` rounds straight back to `dist` and the shortening vanishes —
+   the shadow ray then ends exactly *on* the sampled light point and re-hits the emitter's own
+   geometry, so the sample is discarded as occluded. Replaced by `connMaxT(dist, absEps)`,
+   which shortens by `max(absEps, dist·CONN_REL_EPS)` with `CONN_REL_EPS = 1e-5` (fp32) / `0`
+   (the fp64 build, which therefore stays bit-identical to the CPU). `absEps == 0` still means
+   "don't shorten at all", which is what the distant-sun connection needs — its far end is the
+   scene exit, not a sampled surface point. Applied at all nine connection sites (BDPT `s=1`
+   / `t=1` / `s,t≥2`, the VCM equivalents, and the caustic chains' connections to the eye).
+
+Either fix alone is insufficient: with only (2) the sphere was still 30% dark at 400 m.
+
+**Validation.** `scraps/_sunmatch_*` GPU-vs-CPU energy ratio, was → now: sphere @400 m
+**0.377 → 1.023**, sphere @40 m **0.662 → 1.023**, `light sun` **0.998 → 0.999** (unchanged, as
+expected — a delta sun never shadow-rays *to* a surface point). `scenes/cornell.ftsl` mode D at
+a matched 400 spp, GPU vs CPU: mean ratio **0.9978**, mean |diff| 0.0060, auto-exposure anchor
+1.16e-13 vs 1.17e-13 — no regression at ordinary scene scale. All 16 `-check*` self-tests PASS.
+
+**Note for anyone reading old output:** every GPU mode-D/U render of a scene with a light more
+than ~20 m from the shading points was too dark before 0.128.0, the more so the further away
+the light. Re-render rather than trusting the exposure of an archived frame.
+
+### DONE (2026-08-04, v0.128.0): `scenes/gallery_rain.ftsl` now uses a real `light sun`
+
+The scene used to model the sun as the distant sphere above, with two comments justifying it on
+the grounds that GPU BDPT rejected delta lights. That stopped being true at 0.126.0/0.127.0
+(the GPU BDPT and VCM kernels now do `spot`/`sun`), so the workaround and both comments were
+stale. It is now `light sun { dir -0.1470 0.7071 0.6916  angle 0.53  spd blackbody 5800
+intensity 9.2649e-14 }` — same direction, same 0.53° disc, same one solar constant, with
+`intensity = 1000 / Σ₃₆₀^830 planck(5800 K, λ) dλ` because `light sun` takes an irradiance and
+rejects absolute `power`. `dir` is spelled out because ftsl measures azimuth from **+x** while
+`scraps/bowmap.py` measures it from **+z**.
+
+The switch was not cosmetic. Independently of the fp32 bug above, the sphere needs **2.011e9 W**
+to deliver 1000 W/m² across 400 m, which crushes the emitter power CDF: against the xenon lamp's
+15 kW and the sky panel's 8 kW, `p(lamp) = 7.5e-6`, so the lamp — the light that keeps five
+exhibits and the whole cloud off black — was sampled once in ~134,000 draws and arrived as rare
+clipping fireflies rather than as illumination. Measured at 640×360 / 150 s / mode D, both
+absolute-exposed: the frame is **2.1x darker** with the sphere, and the gap collapses to **1.10x**
+once the lamp is deleted from both variants — i.e. the missing factor of two *is* the starved
+lamp. `light sun`'s power is `irradiance·π·R_scene²` ≈ 4.8e5 W, putting the three lights at
+~95/3/2 %. Dropping the sphere also shrinks the scene bounding radius from ~400 m to ~12 m.
+
+### BUG — DONE (2026-08-04, v0.124.0): mode D could not render `spot` / `sun` lights at all — now it can (and the entry that claimed it did so *silently* was WRONG)
+
+**Correction first.** The original version of this entry claimed a mode-D scene containing a
+`sun`/`env`/`spot`/`collimated` light rendered black *with no diagnostic*, and that the
+unsupported emitter *stole* its power-weighted share of the sample budget from the lights
+that work. That was wrong, and reading the code rather than trusting the writeup is what
+caught it. `main.cpp`'s `bdptUnsupportedFeature()` has always listed all four types and is
+consulted at the mode-D/U guard *before* any BDPT dispatch, so the engine refused loudly:
+
+```
+[mode D] camera 'cam' uses spot / environment / sun / collimated lights, which that mode
+can't render; use mode A/B/C/R, add a prefer{}/else{} fallback, or pass
+-on-unsupported fallback|strip.
+```
+
+`-on-unsupported strip` cannot bypass it either (`stripUnsupportedFeature` only strips GRIN;
+anything else falls back to mode R). So the `return 0` guards inside `bdpt.h` / `vcm.h` were
+unreachable belt-and-suspenders, not a live silent-corruption path. What was real was the
+plain **missing feature**: mode D simply refused those scenes.
+
+**What was implemented.** `spot` and `sun` lights are now first-class in BDPT (mode D), CPU
+backend, following PBRT's delta-light treatment:
+
+* `bdpt.h` `isDeltaEmitter` / `isInfiniteEmitter` / `Vertex::isDeltaLight()` classify them.
+* `deltaLightSubpath()` emits light subpaths: a spot fires from its point uniformly into the
+  outer cone (pdf `1/(2π(1-cosOuter))`, the smoothstep penumbra carried as *throughput* so
+  the mean walk weight is still the emitter's power); a sun fires from a point on a disc of
+  radius `sceneRadius` one radius upstream of the scene centre (pdf `1/(πR²)`) along a
+  direction drawn inside the solar cone (pdf `1/Ω`).
+* `connectBDPT`'s `s == 1` NEE handles both: the spot connects deterministically to its point
+  with the cone falloff, the sun samples a direction in its cone and shadow-rays to the scene
+  exit (no `1/dist²`, no `cosLight` — the source is at infinity). All three emission models
+  now share one λ-independent weight `Wgeom`.
+* `vertexPdfLight` gained the spot-cone and the *planar* infinite-light density branches, and
+  `vertexPdfLightOrigin` returns 0 for a delta light — matching PBRT, and matching the 0 the
+  light subpath stores in `path[0].pdfFwd`, so both sides of every MIS ratio agree.
+* `generateLightSubpath` applies PBRT's "correct subpath densities for infinite area lights"
+  patch (rewriting `path[1].pdfFwd` to the planar form) — without it the forward and reverse
+  densities disagree and the MIS weights are wrong.
+* `misWeight` drops the `s == 0` strategy for a delta light (`light[0].isDeltaLight()`), since
+  no eye ray can land on a mathematical point or on an infinitely distant disc.
+* Because `s == 0` is gone, the sun's own disc — and every mirror/water glint of it — would
+  otherwise vanish, and NEE cannot supply those (a specular vertex is not connectible). So
+  `randomWalk` now reports where an eye ray *escaped* (`struct Escape`) and `renderRows` adds
+  the sun's radiance with MIS weight exactly 1 when every eye vertex on the path was delta —
+  precisely the case where no other strategy competes.
+
+**Validated** by rendering the same camera in mode D and in mode R (the backward reference)
+and comparing mean luminance (`python scraps/imgdiff.py A.png B.png`):
+`scenes/_spot_cornell.ftsl` agrees to 0.2 %, `scenes/_sun_check.ftsl` to 0.01 %, and the new
+mixed regression scene `scenes/_deltalight_mix.ftsl` (area quad + spot + sun + a mirror
+sphere) to 0.33 % — R at 20000 spp vs D at 6000 spp, mean |diff| 0.0039. That last scene
+authors **absolute** light units on purpose: a non-absolute pair is auto-exposed per image,
+so comparing two auto-exposed frames by mean luminance could not have detected a global
+energy error at all. Both modes put a single saturated pixel at (53,104) — the sun's disc
+reflected off the mirror sphere, i.e. exactly the escaped-ray strategy — and mode D is
+visibly *cleaner* than mode R (which sprays fireflies over that mirror), as expected of a
+bidirectional estimator.
+
+**What is still unsupported, deliberately** — each refused loudly at the mode guard, never
+silently dropped:
+
+* `env` lights in mode D/U. An environment is an infinite *area* light: it needs escaped-ray
+  radiance from every direction plus importance-sampled lat-long emission, which the BDPT
+  random walk and its MIS densities don't do. This is the genuinely large remaining piece.
+* `collimated` lights in mode D/U. A delta emission *direction* from a finite surface means a
+  shading point can never next-event-estimate it (the `s == 1` strategy has zero measure);
+  only forward transport reaches it.
+* `spot` / `sun` in the **GPU** BDPT — see the entry below.
+
+### DEBT — DONE (2026-08-04): VCM (mode U) refused `spot` / `sun` lights that BDPT renders
+
+**Resolved 2026-08-04 (0.125.0).** The delta-light treatment is now ported into `src/vcm.h`,
+so mode U renders spot and sun lights exactly like mode D and both guards in `main.cpp`
+(`vcmUnsupportedFeature()` and the mode-`U` branch of `modeFeatureUnsupported`) have dropped
+their emitter check. What the port needed, in SmallVCM's compact `dVCM`/`dVC`/`dVM`
+bookkeeping rather than pbrt's explicit pdfFwd/pdfRev loop:
+
+* `traceLightSubpath` gained the two delta emission cases. Both sample uniformly in the cone
+  (`pdfDirW = 1/Omega`; note `spotOmega` is the *falloff-weighted* solid angle, so the
+  sampling cone `2*PI*(1-cosOuter)` is recomputed — they coincide only for a sun). A spot
+  emits from `em.origin` with `pdfPos = 1`; a sun from a disc of radius `sceneRadius` one
+  radius upstream of the scene centre, `pdfPos = 1/(pi R^2)`. `|cos|` at the light is exactly
+  1 for both (the emission normal *is* the direction), and the spot's smoothstep penumbra is
+  folded into the radiance, never into a pdf.
+* **`dVC` (and hence `dVM`) start at 0 for a delta light**, and NEE forces `wLight = 0`. That
+  is what *drops* the unsamplable strategies from the balance heuristic instead of
+  under-weighting the ones that work. `dVCM` comes out as `Omega` for a spot and `pi R^2` for
+  a sun — the same values SmallVCM's `PointLight` / `DirectionalLight` produce.
+* `misArrival` gained a `foldDist2` flag, false for exactly one edge in the renderer: the
+  first edge of an **infinite** light's subpath, whose density is the planar `1/(pi R^2)`
+  rather than a solid-angle density (pbrt's "correct subpath sampling densities for infinite
+  area lights" patch; SmallVCM's `if (pathLength > 1 || isFiniteLight)`).
+* The camera NEE branch grew per-shape connection geometry: spot → `directPdfW = dist^2`,
+  `emissionPdfW = 1/Omega`, `cosAtLight = 1`; sun → `directPdfW = 1/Omega`,
+  `emissionPdfW = 1/(pi R^2 Omega)`, shadow ray out of the scene with **no** endpoint epsilon.
+* `traceCameraSubpath` tracks `camAllDelta` and adds the **escaped-ray sun** at the
+  `!h.valid` branch with MIS weight exactly 1 — the same strategy `bdpt.h` needed, and for
+  the same reason (nothing else can reach a sun through a purely specular chain).
+
+Validated against the GPU backward reference (mode R), all three regression scenes:
+
+| scene | mode U | mean ratio | mean \|diff\| | note |
+|---|---|---|---|---|
+| `_sun_check.ftsl` | 400 passes, `-pmradius 0.02` | **1.0002** | 0.0038 | identical auto-exposure (4.74e-14); shadow-core box 0.0813 vs mode D's 0.0810 |
+| `_spot_cornell.ftsl` | 300 passes, `-pmradius 0.003` | 1.0061 | 0.0068 | within mode U's 5.8% noise |
+| `_deltalight_mix.ftsl` | 250 passes, `-pmradius 0.02` | 0.9949 | 0.0081 | **absolute** units, so this is a real energy comparison; the worst pixels are mode *R*'s fireflies |
+
+The sun's glint on the mirror sphere is present and correctly weighted in mode U: the 7x7
+window at (50,101) sums to exactly 1.0000 in R, U and D alike — one saturated pixel, not two.
+Area-light scenes are **bit-identical** to before (same RNG draw order, same densities).
+
+Note the residual gap at the *default* merge radius (`sceneRadius * 0.02`) is larger — mean
+ratio 0.9834 on the mix scene — and shrinks monotonically with the radius. That is ordinary
+photon-mapping radius bias, not a delta-light error: `-pmradius 0.02` (8.5x smaller) takes it
+to 0.9949, and the mode-D/mode-R pair shows the same shadow-core value the small-radius mode U
+converges to.
+
+### DEBT — DONE (2026-08-04, v0.126.0): the GPU BDPT kernels now do delta lights, so mode D no longer falls back to the CPU on a spot/sun scene
+
+`cudaBdptSupported()` (`src/render_cuda.cu`) used to reject `Spot` and `Sun` alongside `Env`
+and `collimated`, routing such a scene to the CPU BDPT with a printed `[device] … ; using CPU`
+notice. That was *correct* — the alternative would have been `dGenLightSubpath` /
+`dConnectBDPT` returning 0 for the emitter they just spent a CDF draw selecting, which really
+would drop the light and steal its share of the sample budget — but it cost the GPU speedup on
+exactly the daylight scenes that want it most. The `bdpt.h` delta-light work (the entry at the
+top of this file) has now been mirrored into the device kernels, one-for-one:
+
+* `dIsDeltaEmitter` / `dIsInfiniteEmitter` / `dIsDeltaLightVertex` — device twins of
+  `isDeltaEmitter` / `isInfiniteEmitter` / `Vertex::isDeltaLight()`.
+* `dGenLightSubpath` grew the delta-emission branch (device twin of `deltaLightSubpath`):
+  spot fires from `em.origin` uniformly into the outer cone (`pdfPos = 1`, `pdfDirW =
+  1/(2π(1−cosOuter))`, smoothstep penumbra carried as throughput); sun fires from a disc
+  point of radius `sceneRadius` one radius upstream of `sceneCenter` (`pdfPos = 1/(πR²)`)
+  along a direction in the solar cone. `path[0].pdfFwd = 0`, `delta = 0`, `matId = -1`, and
+  the infinite-light `path[1].pdfFwd` planar patch is applied after the walk.
+* `dConnectBDPT`'s `s == 1` NEE now uses the same unified λ-independent `Wgeom` the CPU does
+  — spot `fall/(d²·pdfChoice)`, sun `spotOmega/pdfChoice` with `occlEps = 0` so the shadow
+  ray reaches the scene exit unshortened, area `cosL·A/(d²·pdfChoice)` — and sets
+  `sampled.matId = -1` / `beta = Le·Wgeom` / `pdfFwd = 0` for a delta light.
+* `dVertexPdfLightF` gained the spot-cone and *planar* infinite branches (and now takes the
+  `DScene` so it can reach the emitter); `dVertexPdfLightOriginF` returns 0 for a delta light.
+* `dMisWeight`'s `deltaPrev` at `i == 0` is the `IsDeltaLight()` test rather than a hard
+  `false`, dropping the `s == 0` strategy — reading the SUBSTITUTED endpoint when `s == 1`.
+* `struct DEscape` + an optional out-param on `dRandomWalk` / `dGenCameraSubpath` report where
+  an eye ray escaped, and `kBdptT` adds the sun's radiance with MIS weight exactly 1 when
+  every eye vertex was delta — the strategy that carries the solar disc and its mirror glints.
+
+`cudaBdptSupported()` now rejects only `Env` / `collimated`.
+
+**Validated** by rendering the same camera on both backends (`-device cpu` vs the default
+GPU) at matched spp and comparing with `python scraps/imgdiff.py`:
+
+| scene | mode D, spp | mean ratio | mean \|diff\| | note |
+|---|---|---|---|---|
+| `_spot_cornell.ftsl` | 400 | 0.9963 | 0.0036 | auto-exposure 6.42e-14 vs 6.45e-14 |
+| `_sun_check.ftsl` | 400 | 0.9992 | 0.0039 | identical auto-exposure 4.75e-14 |
+| `_deltalight_mix.ftsl` | 3000 | 0.9989 | 0.0034 | absolute units, fixed gain |
+| `cornell.ftsl` (area-light regression) | 600 | 1.0128 | 0.0043 | auto-exposure 9.97e-14 vs 9.71e-14 |
+| `cornell.ftsl` (same, 10× spp) | 6000 | 1.0043 | **0.0015** | mean \|diff\| falls 0.0043 → 0.0015 (√10× ⇒ pure MC noise, not bias); the residual mean ratio is auto-exposure jitter (a p99 statistic); worst pixels sit on the glass ball's caustic |
+
+On the mix scene the escaped-ray solar-disc strategy is present and singly counted on the
+GPU exactly as on the CPU: the 7×7 window at (50,101) — the sun's disc reflected off the
+mirror sphere — sums to `0.02041 = 1/49` on both, i.e. one saturated pixel each. The GPU is
+also ~14× faster there (16.5 s vs 229 s at 3000 spp), which is the point of the exercise.
+
+Area-light scenes are unchanged apart from float association: the `s == 1` estimator now
+spells `|cosSurf| · cosLight·A/(d²·pdfChoice)` where it used to spell `|cosSurf|·cosLight/d²
+÷ (pdfChoice/A)` — algebraically identical, ~1 ulp apart — and every other edit is gated
+behind `dIsDeltaEmitter`, which is false for them. The RNG draw order is byte-for-byte
+unchanged on every path (the `u1,u2` pair is still drawn before the shape branch).
+
+**Follow-on, now also DONE (2026-08-04, v0.127.0): the GPU VCM kernels do delta lights too.**
+Relaxing `cudaBdptSupported()` above would have silently broken **GPU VCM**, because
+`cudaVcmSupported()` was `cudaBdptSupported() && media.empty()` while `kVcmLightT` carried its
+own `shape == 2 || 3 || 6 || collimated` reject — it would have drawn a spot/sun out of the
+power CDF and then *discarded* it, losing the light AND its share of the sample budget. That
+was patched over with an explicit spot/sun reject in `cudaVcmSupported()`; the reject is now
+gone, because the kernels were ported. Against SmallVCM's running-partial `dVCM`/`dVC`/`dVM`
+bookkeeping (not PBRT's explicit pdf arrays), the three rules from `src/vcm.h` transliterate as:
+
+- **`kVcmLightT`** grew the per-shape emission block — cone sampling via `dSunSampleCone`
+  (recomputing the sampling cone `2π(1−cosOuter)`, since `spotOmega` is the *falloff-weighted*
+  solid angle), a point origin for a spot vs. a `sceneRadius` disc for a sun, `emitScale` kept
+  out of every density, and `directPdfW = pdfChoice · (isInfinite ? pdfDirW : isDelta ? 1 : pdfPos)`.
+  **`dVC` (and hence `dVM`) start at 0** for a delta light — the `dVC` analogue of
+  `vertexPdfLightOrigin` returning 0. The resulting `dVCM` is Ω for a spot and πR² for a sun,
+  exactly SmallVCM's `PointLight` / `DirectionalLight` constants.
+- The **first-edge `dist²` fold is skipped** for a sun (`if (!(isInfinite && edges == 1)) dVCM *= dist*dist;`)
+  — the device form of `misArrival`'s `foldDist2` parameter, false in exactly that one place.
+- **`kVcmCameraT`**'s NEE branch grew the same three-way connection geometry as the CPU
+  (`neeDirectPdfW` / `neeEmissionPdfW` / `occlEps`, with the sun's shadow ray running to the
+  scene exit with **no** endpoint epsilon), and `wLight` is forced to **0** for a delta light.
+- **`kVcmCameraT`** tracks `camAllDelta` and adds the **escaped-ray sun** at MIS weight 1 on a
+  miss, gated on `sc.sunCount > 0`.
+- Vertex connection (c) and vertex merging (d) needed **no** change on either backend: they
+  read `dVCM`/`dVC`/`dVM` off the stored light vertices and the zeros propagate correctly.
+
+**Validated** CPU vs GPU at matched passes:
+
+| scene | mode U | mean ratio | mean \|diff\| | note |
+|---|---|---|---|---|
+| `_spot_cornell.ftsl` | 300, `-pmradius 0.003` | **0.9997** | 0.0030 | auto-exposure 7.51e-14 vs 7.48e-14; GPU 2.5 s vs CPU 427 s (**~170×**) |
+| `_sun_check.ftsl` | 400, `-pmradius 0.02` | 0.9959 | 0.0048 | auto-exposure 4.76e-14 vs 4.81e-14 — the ~1% exposure jitter *is* the ratio |
+| `_deltalight_mix.ftsl` | 250, `-pmradius 0.02` | **0.9996** | 0.0108 | **absolute** units / fixed gain, so this is a real energy comparison; GPU 1.0 s vs CPU 100 s |
+
+The escaped-ray solar disc is present and singly counted on the GPU: the 4×4 window at (25,50)
+on the mix scene reads `0.06250 = 1/16` on **both** backends (one saturated pixel each).
+
+**Cross-check of the two ports against each other** (the strongest single result, because it
+compares two *independently* transliterated device estimators rather than a port against its
+own source): `_deltalight_mix.ftsl` at 400×300 in **absolute units / fixed gain**, GPU mode `D`
+at 3000 spp (16.7 s) vs GPU mode `U` at 2000 passes (14.3 s) — mean ratio **0.9974**, mean
+|diff| 0.0037, and the 7×7 solar-disc window at (50,101) reads `0.02041 = 1/49` in **both**.
+The worst pixels cluster on the spot's caustic under the mirror sphere, i.e. VCM merge-radius
+bias plus MC noise, exactly where the two estimators are expected to differ.
+
+Area-light scenes are **byte-identical**: `cornell.ftsl` mode U on GPU at 150 passes hashes to
+the same SHA-256 before and after the port (`015acdee6e10d5ce…`). The non-delta branch keeps
+the original RNG draw order and the original expressions verbatim; every new density is behind
+`dIsDeltaEmitter`, which is false for an area light.
+
 ### DONE (2026-08-03): the gallery Klein bottle is now a glassblower's bottle WITH THE INTERNALS, and it needs no mount
 
 `scenes/gallery.ftsl`'s `klein` was `meshes/klein_hunyuan.obj`, an image-to-3D reconstruction: the
@@ -4844,7 +5201,8 @@ bound; a named `isosurface` → **field membership** (a new `MediumBound::Implic
 fills the field interior via `fieldEval < 0` — inside-sign auto-detected from the field's
 value at its AABB center — carved per-point inside delta/ratio tracking over the field's
 AABB, reusing the same field VM as isosurface rendering); a named `mesh` → the mesh's world
-**AABB** (box approximation; true mesh containment deferred). Media are resolved in a
+**AABB** (box approximation; true mesh containment deferred — **since closed**, see
+"True mesh containment for fog bounds" below). Media are resolved in a
 deferred second sweep so the object may be authored anywhere. Implemented in `scene.h`
 (`Medium::boundField`/`boundFieldExpr`/`boundInsideNeg` + `insideField`/`densityAt`/
 `heterogeneous`), `ftsl.h` (name registries populated by `addSphere`/`addIsosurface`/
@@ -4856,6 +5214,55 @@ GPU-vs-CPU energy identical (absorbed 0.9978) and indirect room lighting agreein
 (large) dim-caustic noise floor. *(Same fog-inside-glass direct-view limitation as above
 applies — an implicit-shaped fog is enclosed by its own isosurface, so its direct camera view
 is a refracted SDS path; it lights the room correctly.)*
+
+**True mesh containment for fog bounds — DONE 2026-08-03.** Closes the gap left above.
+`bounds { object "<mesh>" }` no longer degrades to the mesh's AABB: the mesh is
+**solid-voxelized** at load into an occupancy lattice (`src/meshvoxel.h`, new
+`MediumBound::Mesh` + `Medium::boundGrid`) and the fog fills its true interior. Method is
+**signed-crossing (generalized winding)** x-scanlines rather than parity, because the
+meshes people import are routinely several closed bodies or self-intersecting shells
+(`cloud1.glb` is two) and parity double-toggles those into hollows; winding renders their
+union. Triangles are visited once and scattered into the rows they cover, so cost is
+O(tris + covered rows): 1.85 M triangles bake in ~1 s. The lattice is a plain `VdbGrid`,
+so it rides the existing sparse-brick device upload and `dVdbSample` — **GPU support came
+free**, no new plumbing. `voxels <n>` (default 160) sets resolution on the longest axis.
+
+Two bugs found and fixed while validating, both worth remembering:
+- **`Tri::gn` is not populated during the load.** `Tri::finalize()` runs in
+  `Scene::build()`, *after* the loader's deferred medium sweep, so the voxelizer read
+  `gn == (0,0,0)` for every triangle and gave every crossing the same winding sign. The
+  winding then never returned to zero and each scanline filled solid from its first
+  crossing to its last — i.e. the mesh's **x-convex hull**. Single convex shapes hid it
+  perfectly (hull == shape); only a multi-body test exposed it. Fixed by deriving the
+  facing from `det` (= `cross(v1-v0, v2-v0).x`), the same quantity, computed from the
+  vertices in hand and correct at any load stage. *Anything else running inside the
+  loader must not read `Tri::gn` either.*
+- Majorant estimation sampled `Medium::densityAt`, which returns 0 outside a membership
+  bound, so a coarse 25³ probe of a thin or low-volume-fraction mesh/implicit shape could
+  majorise to ~0 and silently delete the medium. Split out `Medium::densityFieldAt` (the
+  field with no membership carve) and estimate from that — membership only multiplies by
+  0 or 1, so the uncarved peak is always a valid conservative majorant.
+
+Validated against exact lattice-point counts by the permanent regression check
+**`tools/check_meshvox.py`** (`python tools/check_meshvox.py [--res 200]`), which builds
+each mesh, reproduces meshvox's lattice in numpy and compares: sphere 50.0 % vs 50.1 %
+expected, two **overlapping** spheres 54.9 % vs 55.0 %, two **disjoint** spheres 38.3 %
+vs 38.3 % — all within the meshes' own inscribed-faceting error. The *disjoint* case is
+the one that catches the convex-hull regression above; a convex-only test suite cannot.
+The one deviation is a surface lying exactly on a
+lattice-centre plane (axis-aligned box face, 94.2 % vs 95.6 %), where membership is a
+floating-point coin flip; it errs consistently toward **erosion**, the safe direction for
+a fog bound, and is sub-voxel against a boundary the trilinear ramp softens anyway.
+Rendered end-to-end on GPU (mode D, `scraps/_meshbound_test.ftsl` → `png/meshbound_cloud.png`).
+
+**`mesh { shape_only yes }` — DONE 2026-08-03.** The other half of the above: a mesh whose
+job is to *define* a volume should not also be drawn. Its triangles are loaded, handed to
+the medium bake, then stripped from `Scene::tris` before the BVH is built, so they neither
+render nor cost anything. Safe to renumber because `Scene::tris` is indexed only through
+`MeshGroup::triStart/triCount` (fixed up in `stripShapeOnlyMeshes`) — mesh area lights
+*copy* their triangles into `Emitter::meshTris`, and `shape_only` is refused on an emissive
+material regardless. Refused without a `"name"`. `-check-watertight` reports such a mesh as
+skipped rather than as a vacuously airtight 0-triangle object.
 
 **Remaining gap (BDPT fully closed):**
 - **BDPT (mode D) — ALL media DONE 2026-07-12 (CPU + GPU), incl. heterogeneous.** `bdpt.h`
@@ -7054,3 +7461,181 @@ warning. The probe is mode-agnostic; only the call site is gated.
 designed — "render every camera in the scene" — but it is a surprising default for a scene
 that carries a long flypath, and it silently spams the output directory next to the `-o`
 path. Worth at least a printed warning naming how many frames are about to be written.
+
+## OPEN (2026-08-04): a quad's emission is invisible from the side its winding faces away from
+
+The backward tracer only adds a surface's own emission when the camera/specular ray strikes
+the FRONT face:
+
+```cpp
+// src/render_cuda.cu ~7006 (host twin: src/backward.h)
+if (specularArrival && dot(rd, h.ng) < 0) { ... L += thr * specLookup(eSpd, lambda) ... }
+```
+
+A `quad`'s geometric normal is `cross(u, v)`, so
+
+```ftsl
+quad { origin -18 0 -19   u 46 0 0   v 0 0 45   material glowing }   # ng = -y, dark from above
+quad { origin -18 0 -19   u 0 0 45   v 46 0 0   material glowing }   # ng = +y, glows
+```
+
+are visually identical for every *reflective* slot — `bkNeeLight`/`bkNeeEnv` flip the normal
+toward the incoming light themselves, so a diffuse body shades the same either way — but only
+the second one shows its `emit`. The result is a silent, total loss of the emissive component
+with no diagnostic; `scenes/gallery_rain.ftsl`'s wireframe ground rendered pure black for this
+reason (the stone floor it replaced had no `emit`, so the bad winding had gone unnoticed).
+
+Repro: `scraps/_grid_test.ftsl` (flip `u`/`v` on the four tiles).
+
+Proper fix: emission on a single-sided primitive should be authorable. Either (a) treat `quad`
+emission as two-sided by default — test `dot(rd, ng) != 0` and take `|dot|` — since a quad has
+no interior for the "back face is inside the solid" argument to protect, or (b) keep it
+one-sided but add a `double_sided` / `emit_backface` material flag, and (c) either way, warn at
+load time when a scene contains an emissive `quad` whose normal faces away from every camera.
+Option (a) matches what people actually author (a glowing panel), and the one-sided rule is
+only really load-bearing for closed `isosurface`/mesh solids, whose normals are already
+outward.
+
+## OPEN (2026-08-04): `type glossy` renders black in the backward modes (R / W) — no NEE
+
+`bkInteract`'s `D_GLOSSY` case (`src/render_cuda.cu` ~6733, host twin `src/backward.h`)
+reflects the ray into a lobe around the mirror direction and returns. It never calls
+`bkNeeLight` / `bkNeeEnv`. So a Glossy surface in modes R and W contributes *only* whatever its
+mirror ray happens to hit — there is no direct-lighting term at all. Every other reflective
+type either NEEs (Diffuse, DiffuseTransmit, Fluorescent) or is genuinely specular (Mirror,
+Dielectric, ThinFilm), so Glossy is the one type whose backward appearance does not match its
+forward appearance.
+
+Consequence: a rough surface under a small light and a dark surround previews as pure black,
+even at high `-spp`, while modes A/B/C/D/M shade it normally. Verified with
+`scraps/_grid_test.ftsl`: two tiles differing *only* in `type diffuse` vs `type glossy` render
+as dark grey vs `(0,0,0)`. This cost real debugging time on `gallery_rain`, whose ground had to
+be demoted to `type diffuse` to be visible in any preview.
+
+Proper fix: give `D_GLOSSY` a direct-lighting term like the other non-specular types — NEE the
+light with the Cook-Torrance/Phong lobe's BRDF value and MIS it (balance heuristic) against the
+existing lobe-sampled continuation, which already carries `contBsdfPdf`. That is the same
+structure `D_DIFFUSE` uses, just with a non-constant BRDF, and it fixes both the black preview
+and the (currently very high) variance of a glossy surface in mode R.
+
+## OPEN (2026-08-04): `phase rainbow` — the 2048-bin uniform-in-mu table under-resolves large droplets, and monodisperse supernumeraries read as a white arc
+
+Two related problems with `src/rainbow.h`, both visible in `scenes/gallery_rain.ftsl` and both
+reproduced independently in `scraps/bowplot.py` (a Python re-implementation of the same
+construction, using `scipy.special.airy` for an exact Ai).
+
+**1. Table resolution.** The phase function is tabulated as 95 wavelengths x 2048 bins
+*uniform in mu = cos(theta)*. Near the primary bow (theta ~ 138 deg, sin theta ~ 0.66) one bin
+spans `dmu / sin(theta)` ~ 0.085 deg. The principal Airy lobe's half-width is `2.338 / K` with
+`K = (2/h)^(1/3) * (2*pi*a/lambda)^(2/3)`, which shrinks as `a^(2/3)`:
+
+| droplet radius | lobe half-width | bins per lobe |
+|---|---|---|
+| 300 um | ~0.42 deg | ~8 |
+| 500 um | ~0.30 deg | ~5 |
+| 1000 um | ~0.19 deg | ~3 |
+
+At 3 bins per lobe the bow's peak amplitude is a sampling accident of where the bins land, and
+it varies per wavelength (each lambda has its own `theta_rb`), so the *colour* of the arc
+aliases too. Proper fix: tabulate uniform in theta rather than in mu (the bow is a
+theta-domain feature and mu wastes almost all its resolution near the poles), or keep mu but
+add a locally-refined region around each bow's `theta_rb`.
+
+**2. Monodisperse supernumeraries.** With `supernumerary on` the Airy train `Ai(z)^2` rings for
+~11 deg inside the primary, while the *coloured* part of the bow — the spread of `theta_rb`
+between 450 nm (138.76 deg) and 650 nm (137.65 deg) — is only ~1.2 deg wide. So the eye sees a
+broad achromatic ringing band with a thin coloured fringe on each side: "a white curve with
+thin bands of colour on top and bottom", which is exactly what the scene was reporting. Real
+rain is polydisperse and the supernumeraries average away; only the first lobe survives.
+`supernumerary off` already does the right thing, but it is opt-*out*, so the default look is
+the wrong one. Proper fix: make the phase function take a size *distribution* (a
+gamma/Marshall-Palmer with a width parameter) and integrate over it when building the table,
+so `supernumerary on` means "narrow distribution, supernumeraries survive" rather than
+"physically-impossible single droplet size".
+
+## FIXED (2026-08-04, 0.129.0): GPU mode D dropped a *material's own* emission — every non-mesh glowing surface rendered black, while the CPU rendered it
+
+BDPT's s=0 strategy ("the eye path lands on an emitter") asks two questions of the last eye
+vertex: is it a light, and what does it emit. The device answered both by looking up a
+registered `Emitter`:
+
+```cpp
+// src/render_cuda.cu — before
+__device__ static inline bool dIsLightVertex(const DVertex& v) {
+    return v.type == BV_LIGHT || (v.type == BV_SURFACE && v.lightIdx >= 0);
+}
+__device__ static double dVertexLe(...) {
+    if (v.lightIdx < 0) return 0.0;
+    return specLookup(sc.emitters[v.lightIdx].emitSpd, lambda) * invPdfLambda * v.emitPatW;
+}
+```
+
+But **only tessellated geometry registers an Emitter.** A `quad`, an `isosurface` or a CSG
+solid is marched, never tessellated, so it has an emissive *material* (`Material::isLight`,
+`matIsLight` on the device) and `lightIdx == -1`. Both tests therefore failed and the surface
+contributed exactly zero emission on the GPU.
+
+The CPU has always been right: `bdpt.h`'s `Vertex::Le` tests `mat->isLight` and reads
+`mat->emit(lambda)` directly, and `Vertex::isLightVertex` does the same. So mode D produced
+*two different images* depending on `-device`, with no warning — the exact class of divergence
+that is hardest to notice, because the GPU image is not obviously broken, just missing a
+material's glow. (The backward tracer never had the bug: `bkRadiance` already fell back to
+`mp->matEmit` when `dEmitterForMat` returned -1, which is why modes R/W showed the emission
+that mode D did not.)
+
+Found via `scenes/gallery_rain.ftsl`, whose green wireframe ground and stand cages are emissive
+`quad`/`isosurface` geometry: mode W and CPU mode D rendered the grid, GPU mode D rendered a
+featureless grey plane.
+
+Fix: `dIsLightVertex` now also takes the `DScene` and accepts `sc.mats[v.matId].matIsLight`;
+`dVertexLe` falls back to `sc.mats[v.matId].matEmit` when there is no registered emitter,
+keeping the emitter's baked SPD first (it may carry a `power`/`lumens` normalisation the raw
+material spectrum does not) — the same precedence `bkRadiance` uses. Bit-identical for every
+scene whose emissive surfaces are meshes, since those still take the `lightIdx >= 0` branch.
+
+The MIS densities needed no change: `dVertexPdfLightF` already routes a `BV_SURFACE` vertex
+down the cosine-Lambertian branch, and `dVertexPdfLightOriginF` returns 0 for `lightIdx < 0`,
+which `dMisWeight`'s remap-0 turns into 1 — the same 0 the CPU's `vertexPdfLightOrigin`
+returns for a `Vertex` with a null `light`, so the two agree.
+
+Repro (pre-fix): `ftrace -in scraps/_grid_test.ftsl -camera cam -mode D -time 20` — grid absent
+on GPU, present with `-device cpu`.
+
+---
+
+### TECH DEBT — DONE (2026-08-04, v0.130.0): a mesh fog bound had a hard silhouette, so imported clouds read as cut-outs
+
+`medium { bounds { object "<mesh>" } }` bakes a **binary** occupancy lattice, and the
+`VdbGrid` sampler's trilinear filter ramps 0 -> 1 across exactly **one voxel**. On
+`scenes/gallery_rain.ftsl`'s raincloud that voxel is 14 mm across a 3.4 m cloud, so the bound
+was a hard edge in every practical sense: the fog stopped dead on the mesh surface and the
+cloud rendered with the edge quality of a sticker. That is right for a body or a bottle and
+wrong for every volumetric thing anyone actually imports a mesh bound for — cloud, smoke,
+dust — whose real edge is a *zone* where concentration falls off over metres.
+
+There was no way to soften it. `density` multiplies on top of membership, but it is evaluated
+from world position and knows nothing about where the surface is, so it cannot taper toward an
+arbitrary imported silhouette; the only lever was to hand-fit an algebraic falloff to the mesh,
+which defeats the point of using a mesh.
+
+Fixed by `feather <metres>` on a mesh bound (`meshvox::featherGrid`), which replaces the 0/1
+occupancy with `smoothstep(distance-to-the-outside / feather)`.
+
+* The distance is an **exact** Euclidean distance transform — Felzenszwalb & Huttenlocher
+  2012's separable lower-envelope-of-parabolas algorithm, one O(n) sweep per axis
+  (`meshvox::edt1d`). A chamfer/Manhattan approximation was rejected on purpose: its error is
+  anisotropic, so it would print the lattice's own axes onto the falloff, which is precisely
+  the artefact being removed.
+* Two numerical traps, both handled. The "unreached" seed must be a **large finite** value
+  (`nx^2 + ny^2 + nz^2 + 1`), not `1e300`: F&H intersects two parabolas by *subtracting* their
+  seeds, and `1e300 - 1e300` is pure cancellation noise. And the ramp is a smoothstep, not
+  linear — a linear ramp creases visibly where it reaches 1, and that crease reads as a second,
+  softer silhouette just inside the first.
+* Majorant-safe for free: feathering only ever *lowers* density, so `maxVal` stays 1 and delta
+  tracking is unaffected. It does thin the object overall; raise `sigma_t` if the core should
+  hold its previous opacity.
+* `ftsl.h` takes the value in world metres, divides by the voxel edge, warns below one voxel
+  (the trilinear filter already gives you that), and **rejects the key on a sphere or
+  isosurface bound**, which are carved analytically and have no lattice to soften.
+
+Repro of the old behaviour: drop `feather` from the raincloud in `scenes/gallery_rain.ftsl`.

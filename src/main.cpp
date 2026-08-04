@@ -3977,10 +3977,18 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
     for (size_t i = 0; i < scene.mats.size(); ++i)
         if (matUsed[i] && scene.mats[i].type == MatType::Layered)
             return "layered materials";
+    // SPOT and SUN lights ARE rendered by BDPT (bdpt.h: deltaLightSubpath emits from them,
+    // connectBDPT next-event-estimates them, and misWeight drops the strategies a delta
+    // light can't be sampled by). Two emitters remain out of scope:
+    //   env         - an infinite AREA light: it needs escaped-ray radiance from every
+    //                 direction plus importance-sampled lat-long emission, which the BDPT
+    //                 random walk (no environment handling) and its MIS densities don't do.
+    //   collimated  - a delta emission DIRECTION from a finite surface, so a shading point
+    //                 can never next-event-estimate it (the s=1 strategy has zero measure);
+    //                 only forward transport reaches it.
     for (const auto& em : scene.emitters)
-        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
-            em.shape == EmitterShape::Sun || em.collimated)
-            return "spot / environment / sun / collimated lights";
+        if (em.shape == EmitterShape::Env || em.collimated)
+            return "environment / collimated lights";
     return nullptr;
 }
 
@@ -3989,6 +3997,10 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
 // (its camera importance assumes the rectilinear pinhole). Returns a reason string or null.
 static const char* vcmUnsupportedFeature(const Scene& scene, const Camera& cam) {
     if (const char* r = bdptUnsupportedFeature(scene)) return r;
+    // Delta lights (spot / sun) ARE supported here: vcm.h carries the same exclusions
+    // through its vc/vm partial sums (dVC/dVM start at 0, wLight is 0 in NEE, the infinite
+    // light skips the first edge's dist^2) plus the escaped-ray sun strategy. See the
+    // DELTA LIGHTS note at the top of vcm.h.
     if (!scene.media.empty()) return "participating media (mode U is surfaces-only)";
     if (cam.hasLens()) return "a realistic multi-element lens";
     if (cam.projection != CAM_RECTILINEAR) return "a non-rectilinear (fisheye/panoramic) camera";
@@ -4012,6 +4024,7 @@ static const char* modeFeatureUnsupported(const Scene& scene, char mode, int pro
             return "a non-rectilinear (fisheye/panoramic) camera in mode D";
     } else if (mode == 'U') {
         if (const char* r = bdptUnsupportedFeature(scene)) return r;
+        // Mirrors vcmUnsupportedFeature: spot / sun lights are supported in mode U too.
         if (!scene.media.empty()) return "participating media (mode U is surfaces-only)";
         if (projection != CAM_RECTILINEAR)
             return "a non-rectilinear (fisheye/panoramic) camera in mode U";
@@ -4471,36 +4484,34 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 
     // Heterogeneous / bounded participating media (a `density` field or a `bounds`
     // box on `medium`) are honored only by the FORWARD light tracer (modes A/B/C, and
-    // the forward layers of V/P). The backward reference (R/V) and the camera-side layer
-    // of the P composite still treat the medium as a single global HOMOGENEOUS haze —
-    // they ignore the density field and the bounds box. Warn loudly rather than silently
-    // render a different fog than authored. (Tracked in known-issues.md: heterogeneous
-    // media in backward modes.) Mode D (volumetric BDPT) is EXCLUDED here: it handles
-    // multiple superposed, box/sphere/object-bounded AND heterogeneous (density-field)
-    // media correctly (over the full scene.media vector) — subpath medium vertices are
-    // placed by delta tracking and connections weighted by ratio-tracking transmittance —
-    // so it never needs this "single global haze" warning.
-    bool mediaNeedForward = scene.media.size() > 1;   // >1 medium is forward-only (R/V/P)
+    // the forward layers of V/P) and by the DEVICE tracers. The *CPU* backward tracer
+    // (backward.h, used by modes R/W/V and the camera-side layer of P) still collapses
+    // the whole `scene.media` vector to `scene.backwardMedium()` — the FIRST authored
+    // medium, treated as a global homogeneous haze with its `density` and `bounds`
+    // ignored. `mediaNeedForward` records whether this scene would actually notice.
+    // Mode D (volumetric BDPT) is excluded: it handles multiple superposed,
+    // box/sphere/object-bounded AND heterogeneous media correctly on both devices —
+    // subpath medium vertices are placed by delta tracking and connections weighted by
+    // ratio-tracking transmittance. The GPU backward megakernel (render_cuda.cu
+    // dMediaSampleCollision / bkNeeVolume) likewise superposes the full media vector,
+    // per-medium phase function included, so a GPU R/W render is NOT degraded and must
+    // not be warned about — which is why the warning itself now lives AFTER the -device
+    // resolution below rather than here. (Tracked in known-issues.md: the CPU backward's
+    // single-haze limitation, and the CPU/GPU divergence it causes.)
+    bool mediaNeedForward = scene.media.size() > 1;   // >1 medium: only the CPU backward suffers
     for (const Medium& m : scene.media)
         if (m.heterogeneous() || m.bounded) mediaNeedForward = true;
-    if (scene.anyMedium() && mediaNeedForward &&
-        (mode == 'R' || mode == 'V' || mode == 'P')) {
-        std::fprintf(stderr,
-            "[medium] mode %c uses the backward tracer, which treats participating "
-            "media as a SINGLE global HOMOGENEOUS haze (the first authored medium); any "
-            "additional media, `density` fields and `bounds` regions (box/sphere/object) are "
-            "IGNORED here. Render multi/heterogeneous/bounded fog with a forward mode "
-            "(A/B/C) or volumetric BDPT (mode D) for correct results.\n", mode);
-    }
+    mediaNeedForward = mediaNeedForward && scene.anyMedium();
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
     // the forward layer of the mode-P composite) AND the backward tracer (mode R, and
     // the mode-P camera-side layer) when the scene is within the backward-GPU scope
     // (renderBackwardCuda / cudaBackwardSupported — Lambertian/textured/specular,
-    // point-spot lights, participating media, fluorescence, and a constant env light;
-    // image-based env, collimated beams and GRIN/rainbow media still fall back to the
-    // CPU backward tracer); otherwise the backward layer falls back to the CPU. Mode V keeps
+    // point-spot lights, participating media (incl. spectral-rainbow phase, M10),
+    // fluorescence, GRIN marching (M11), and BOTH a constant and an image-based env
+    // light (M1); only collimated beams and stray env-shape emitters still fall back to
+    // the CPU backward tracer); otherwise the backward layer falls back to the CPU. Mode V keeps
     // its backward reference on the CPU by design. Fisheye/panoramic lenses run on the
     // GPU too (the device camera's project()/pixelSolidAngle() port the analytic
     // projection remap) for the pinhole-splat modes (B/V/P).
@@ -4569,7 +4580,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (!cudaBdptSupported(scene)) {
                 const char* why = "scene has a BDPT-GPU-unsupported feature "
                                   "(fluorescent/oversized-mix material, fog, "
-                                  "spot/env/collimated light, an `emit pattern:` emission "
+                                  "spot/sun/env/collimated light, an `emit pattern:` emission "
                                   "profile, or a per-hit BSDF the GPU BDPT can't MIS: a "
                                   "procedural pattern or frosted/colored glass)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
@@ -4637,6 +4648,40 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             std::fprintf(stderr, "[device] built without CUDA; using CPU "
                                  "(reconfigure with a CUDA toolkit for -device gpu)\n");
 #endif
+    }
+
+    // Now that the device is resolved, warn if this render's BACKWARD layer will actually
+    // run on the CPU tracer, which collapses `scene.media` to `backwardMedium()` (see the
+    // `mediaNeedForward` computation above). The GPU backward megakernel superposes the
+    // full media vector — bounds, density fields and per-medium phase functions included —
+    // so the same scene on the GPU renders the authored fog and gets no warning. Modes:
+    //   R/W — the whole image is the backward tracer; degraded iff !useGpu.
+    //   V   — its backward reference is CPU-by-design, so always degraded.
+    //   P   — only the camera-side (specular) layer is backward; it is on the GPU only when
+    //         the forward layer is too AND the scene is in backward-GPU scope.
+    if (mediaNeedForward) {
+        bool cpuBackward = false;
+        if      (mode == 'R') cpuBackward = !useGpu;
+        else if (mode == 'V') cpuBackward = true;
+#ifdef HAVE_CUDA
+        else if (mode == 'P') cpuBackward = !(useGpu && cudaBackwardSupported(scene, cam));
+#else
+        else if (mode == 'P') cpuBackward = true;
+#endif
+        if (cpuBackward) {
+            const char* layer = (mode == 'R')
+                ? "this render"
+                : (mode == 'V' ? "mode V's backward reference"
+                               : "mode P's camera-side layer");
+            std::fprintf(stderr,
+                "[medium] %s runs on the CPU backward tracer, which treats participating "
+                "media as a SINGLE global HOMOGENEOUS haze (the first authored medium); any "
+                "additional media, `density` fields and `bounds` regions (box/sphere/object) are "
+                "IGNORED here. The GPU backward megakernel does support them, so `-device gpu` "
+                "(mode %c) renders the authored fog; otherwise use a forward mode (A/B/C) or "
+                "volumetric BDPT (mode D).\n",
+                layer, g_whitted ? 'W' : mode);
+        }
     }
 
     // The wavefront (streaming) backend only applies to a forward render on the GPU.
@@ -6502,6 +6547,14 @@ static int run(int argc, char** argv) {
             if (glass)         std::printf("           ! this object is DIELECTRIC (glass) — refraction WILL be wrong\n");
         };
         for (const auto& g : scene.meshGroups) {
+            // A `shape_only` mesh's triangles were consumed as a shape (a medium's
+            // containment bake) and removed from the scene, so there is nothing left to
+            // check. Say so rather than reporting a vacuously airtight 0-triangle object.
+            if (g.shapeOnly) {
+                std::printf("  [skip] mesh        \"%s\"  shape_only — geometry consumed by a "
+                            "medium bound; drop `shape_only` to check it\n", g.name.c_str());
+                continue;
+            }
             watertight::Report r = (g.blasId >= 0 && g.blasId < (int)scene.blasList.size())
                 ? watertight::checkTris(scene.blasList[g.blasId].tris.data(), scene.blasList[g.blasId].tris.size())
                 : watertight::checkTris(scene.tris.data() + g.triStart, g.triCount);
