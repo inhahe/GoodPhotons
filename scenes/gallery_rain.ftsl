@@ -313,7 +313,46 @@ quad { origin -18 0 -19   u 0 0 45   v 46 0 0   material gridground }
 # Every cap's y-position, thickness and `round` are UNCHANGED from the stone version, so the
 # settled poses are still valid; the two stands that MOVED (glass, brass) took their hero
 # piece with them by the same offset, so nothing needs re-settling either.
+#
+# ---------------------------------------------------------------------------------------
+# THE SPREAD.  Every exhibit — its cage, its cap, its hero piece and any mount — is wrapped
+# in a `group { translate dx 0 dz }` that pushes it radially OUTWARD from the layout centre
+# (5.00, ., 2.72), the centroid of the nine original pedestal axes.  The displacement is
+# 0.6 * (p - centre), i.e. a 1.6x RADIAL SPREAD, rounded to 5 cm:
+#
+#     exhibit    was (x,z)      offset          now (x,z)
+#     gyroid     5.00 4.80    ( 0.00, +1.25)   5.00 6.05
+#     gem        3.50 3.60    (-0.90, +0.55)   2.60 4.15
+#     glass      6.70 3.50    (+1.00, +0.45)   7.70 3.95
+#     klein      5.90 2.60    (+0.55, -0.05)   6.45 2.55
+#     dumbbell   4.50 2.70    (-0.30,  0.00)   4.20 2.70
+#     chrome     3.50 2.00    (-0.90, -0.45)   2.60 1.55
+#     heart      4.60 1.90    (-0.25, -0.50)   4.35 1.40
+#     brass      6.00 1.84    (+0.60, -0.54)   6.60 1.30
+#     oil        5.30 1.50    (+0.20, -0.75)   5.50 0.75
+#
+# The x span goes 3.20 -> 5.10 m and the z span 3.30 -> 5.30 m while every piece keeps its
+# own size, which is what "farther apart" means: the pieces did not grow, the gaps did.
+# There are no walls to run into any more, so the only cost is that the still camera has to
+# back off by the same 1.6x (see the CAMERAS section) and each piece therefore reads 1.6x
+# smaller in the frame.  That is paid for twice over by what the room buys:
+#   * every cap is now clear of its neighbours' columns, so a cap can finally be made WIDE
+#     enough to catch a whole caustic (the gem and klein caps below are, and could not have
+#     been at the old spacing);
+#   * the flyby has room to bank between pieces instead of threading a corridor.
+#
+# WHY A GROUP AND NOT REWRITTEN COORDINATES.  Every number inside a stand block, and every
+# comment that quotes one, is authored in the ORIGINAL layout frame and stays exactly true
+# there; the group is the single place the new position lives.  Relationships WITHIN one
+# exhibit (cap over column, pin against sphere, settled rest pose) are untouched by a rigid
+# translation, so nothing needs re-deriving and nothing needs re-settling.  The one class of
+# comment the spread does stale is a clearance quoted BETWEEN two different exhibits (they
+# move by different offsets) — every one of those gaps only ever GREW, so they read as
+# conservative rather than wrong, and `scraps/_standaudit.py` is what actually proves the
+# scene collision-free after any change here.
+# ---------------------------------------------------------------------------------------
 
+group { translate 0.00 0 1.25          # --- exhibit: GOLD GYROID ---
 isosurface "stand_gyroid" {   # centrepiece: broad low plinth, cap top y=0.55
     material wirecage  union {
         difference {
@@ -336,7 +375,9 @@ isosurface "stand_gyroid_cap" { material capwhite
     # and span y=0.18..0.87 and 0.19..0.81 — both straddling the cap's own y=0.52..0.55).
     # 2.1 pulls the near edge back to 3.75 and clears both, for 9% of the catching area.
     box { center 5.0 0.535 4.8  size 2.3 0.03 2.1  round 0.01 } }
+}
 
+group { translate 1.00 0 0.45          # --- exhibit: GLASS ORB ---
 isosurface "stand_glass" {   # right-front pedestal, cap top y=0.90
     # Moved from x=6.2 to x=6.7. At 6.2 its base slab (x 5.75..6.65) drove 0.30 m into the
     # gyroid plinth's base slab (x 3.95..6.05) — a pre-existing intersection from the Tron
@@ -367,7 +408,9 @@ isosurface "stand_glass_cap" { material capwhite
     # putting the disc at (6.87, 2.72). A cap centred under the column would have missed it
     # by half a metre; even this one only just contains it (near edge z=2.20).
     box { center 6.7 0.885 3.05  size 1.1 0.03 1.7  round 0.02 } }
+}
 
+group { translate -0.90 0 0.55         # --- exhibit: CRYSTAL GYROID ---
 isosurface "stand_diamond" {   # tall thin jewel-column, cap top y=0.85
     material wirecage  union {
         difference {
@@ -386,7 +429,9 @@ isosurface "stand_diamond" {   # tall thin jewel-column, cap top y=0.85
 }
 isosurface "stand_diamond_cap" { material capwhite
     box { center 3.5 0.825 3.6  size 1.0 0.05 1.0  round 0.02 } }
+}
 
+group { translate 0.55 0 -0.05         # --- exhibit: KLEIN BOTTLE ---
 isosurface "stand_klein" {   # cap top y=1.00; the Klein bottle stands on it
     material wirecage  union {
         difference {
@@ -405,7 +450,9 @@ isosurface "stand_klein" {   # cap top y=1.00; the Klein bottle stands on it
 }
 isosurface "stand_klein_cap" { material capwhite
     box { center 5.9 0.985 2.6  size 0.96 0.03 0.96  round 0.02 } }
+}
 
+group { translate -0.30 0 0.00         # --- exhibit: BRASS DUMBBELL ---
 isosurface "stand_dumbbell" {   # cap top y=0.88
     material wirecage  union {
         difference {
@@ -424,7 +471,9 @@ isosurface "stand_dumbbell" {   # cap top y=0.88
 }
 isosurface "stand_dumbbell_cap" { material capwhite
     box { center 4.5 0.865 2.7  size 0.88 0.03 0.88  round 0.02 } }
+}
 
+group { translate -0.90 0 -0.45        # --- exhibit: CHROME RING ---
 isosurface "stand_chrome" {   # cap top y=0.90
     material wirecage  union {
         difference {
@@ -443,7 +492,9 @@ isosurface "stand_chrome" {   # cap top y=0.90
 }
 isosurface "stand_chrome_cap" { material capwhite
     box { center 3.5 0.885 2.0  size 0.88 0.03 0.88  round 0.02 } }
+}
 
+group { translate -0.25 0 -0.50        # --- exhibit: MORPHO HEART ---
 isosurface "stand_heart" {   # cap top y=1.00
     material wirecage  union {
         difference {
@@ -462,7 +513,9 @@ isosurface "stand_heart" {   # cap top y=1.00
 }
 isosurface "stand_heart_cap" { material capwhite
     box { center 4.6 0.985 1.9  size 0.86 0.03 0.86  round 0.02 } }
+}
 
+group { translate 0.60 0 -0.54         # --- exhibit: BRASS CLUSTER ---
 isosurface "stand_brass" {   # cap top y=0.95
     # Moved from z=2.0 to z=1.84: at 2.0 its base slab (z 1.65..2.35) overlapped the klein
     # stand's base slab (z 2.24..2.96) by 0.11 m, another pre-existing wireframe-through-
@@ -484,7 +537,9 @@ isosurface "stand_brass" {   # cap top y=0.95
 }
 isosurface "stand_brass_cap" { material capwhite
     box { center 6.0 0.935 1.84  size 0.86 0.03 0.86  round 0.02 } }
+}
 
+group { translate 0.20 0 -0.75         # --- exhibit: OILSLICK JACK ---
 isosurface "stand_oil" {   # cap top y=0.92
     material wirecage  union {
         difference {
@@ -503,14 +558,19 @@ isosurface "stand_oil" {   # cap top y=0.92
 }
 isosurface "stand_oil_cap" { material capwhite
     box { center 5.3 0.905 1.5  size 0.82 0.03 0.82  round 0.02 } }
+}
 
 # ==============================  HERO PIECES  =================================
+# Each piece is wrapped in the SAME `group { translate }` as its stand — see THE SPREAD
+# above for the offset table. The offsets must stay in lockstep between the two sections or
+# a piece will hang in mid-air next to its pedestal, so they are quoted in both places.
 
 # --- GOLD GYROID (centrepiece, close-up, plain view; NOT settled — threaded) -----------
 # The long-standing k=10 / T=0.45 lattice ball, translated as a rigid unit to the new
 # front-centre. The flyby's channel control points are the same validated threaded points,
 # shifted by the SAME translation, so the empty-air tunnel still lines up exactly.
 # Clip bottom sits at y=0.55 = stand_gyroid top.
+group { translate 0.00 0 1.25          # --- exhibit: GOLD GYROID ---
 isosurface "gyroid" {
     material gold
     intersect {
@@ -522,6 +582,7 @@ isosurface "gyroid" {
     }
     contained_by { min 4.20 0.53 4.00   max 5.80 2.13 5.60 }
     max_gradient 40
+}
 }
 
 # --- CRYSTAL GYROID (the coloured-caustic piece) ----------------------------------------
@@ -540,6 +601,7 @@ isosurface "gyroid" {
 # almost nothing. Crystal has 2.1x BK7's dispersion AND a workable external focus, which is
 # the combination this piece needs. See the material block for the numbers.
 # Clip bottom y=0.85 = stand_diamond top.
+group { translate -0.90 0 0.55         # --- exhibit: CRYSTAL GYROID ---
 isosurface "gyroid_gem" {
     material glass
     intersect {
@@ -551,6 +613,7 @@ isosurface "gyroid_gem" {
     }
     contained_by { min 3.00 0.85 3.10   max 4.00 1.85 4.10 }
     max_gradient 52
+}
 }
 
 # --- GLASS SPHERE (fly-through orb; NOT settled — analytic placement) ------------------
@@ -584,6 +647,7 @@ isosurface "gyroid_gem" {
 # height the sight line to the disc centre passes 0.514 m from the orb's centre, i.e. it
 # clears the 0.5 m limb — barely, so the disc reads as breaking out from behind the glass
 # rather than sitting cleanly beside it. That is a deliberate trade for the 1.5x brightness.
+group { translate 1.00 0 0.45          # --- exhibit: GLASS ORB ---
 sphere { center 6.7 1.70 3.5   radius 0.5   material glass }
 
 # The three pins the orb stands on. Deliberately in `wirecage`, 12 mm — the same visual
@@ -607,6 +671,7 @@ isosurface "stand_glass_mount" {
         box { center 6.9264 1.10 3.3032  size 0.012 0.40 0.012 }
         box { center 6.4164 1.10 3.4023  size 0.012 0.40 0.012 }
     }
+}
 }
 
 # --- KLEIN BOTTLE in glass (clear, intricate transparent piece; SETTLED) ---------------
@@ -635,6 +700,7 @@ isosurface "stand_glass_mount" {
 # settle_scene's POKE_TOL of 10 mm. A seat ring was measured and rejected — the body flares
 # continuously (66 mm at the base, 83 mm 4 mm up, 112 mm at 20 mm), so any bore loose enough
 # to lower the piece into is loose enough to let it slide the same distance anyway.
+group { translate 0.55 0 -0.05         # --- exhibit: KLEIN BOTTLE ---
 group {  # settled by tools/settle_scene.py
     translate 0.00840549 -0.00390297 -0.0188914
     rotate    0.000770936 -0.183439 -0.00150841
@@ -651,9 +717,11 @@ group {  # settled by tools/settle_scene.py
         material glass
     }
 }
+}
 
 # --- BRASS DUMBBELL-ring (gallery pick 09): two spheres joined by a fused bar + ring,
 # with a small bite bored out; SETTLED. ---
+group { translate -0.30 0 0.00         # --- exhibit: BRASS DUMBBELL ---
 group {  # settled by tools/settle_scene.py
     translate 0.02201 -0.0649694 -0.0169359
     rotate    0.164391 -0.206977 0.560095
@@ -681,9 +749,11 @@ group {  # settled by tools/settle_scene.py
         }
     }
 }
+}
 
 # --- BRASS CSG cluster (gallery pick 05): nested smooth_union of spheres+tori with two
 # spheres bored out; SETTLED. SDF leaves stay unit-Lipschitz, no max_gradient. ---
+group { translate 0.60 0 -0.54         # --- exhibit: BRASS CLUSTER ---
 group {  # settled by tools/settle_scene.py
     translate 0.959524 -2.89096 0.9556   # z: settled 1.1156, then -0.16 with stand_brass
     rotate    -21.1608 5.59516 21.6963
@@ -718,8 +788,10 @@ group {  # settled by tools/settle_scene.py
         }
     }
 }
+}
 
 # --- IRIDESCENT algebraic HEART (gallery pick 07) in morpho-blue, tilted; SETTLED. -----
+group { translate -0.25 0 -0.50        # --- exhibit: MORPHO HEART ---
 group {  # settled by tools/settle_scene.py
     translate 0.813538 4.20412 0.285009
     rotate    59.3168 5.35726 -27.4569
@@ -739,9 +811,11 @@ group {  # settled by tools/settle_scene.py
         max_gradient 60
     }
 }
+}
 
 # --- OIL-SLICK iridescent JACK (2nd iridescent — thin-film rainbow, different structural
 # model + colour than the morpho heart): three fused orthogonal capsules; SETTLED. ------
+group { translate 0.20 0 -0.75         # --- exhibit: OILSLICK JACK ---
 group {  # settled by tools/settle_scene.py
     translate -0.0179703 -0.027644 0.0792558
     rotate    -0.000678612 0.795623 -0.00058678
@@ -762,11 +836,14 @@ group {  # settled by tools/settle_scene.py
         }
     }
 }
+}
 
 # --- MIRRORED chrome ring (upright display mount, left-mid; NOT settled) ---------------
+group { translate -0.90 0 -0.45        # --- exhibit: CHROME RING ---
 isosurface "chrome_ring" {
     material chrome
     torus { translate 3.5 1.30 2.0   rotate 90 0 0   major 0.34   minor 0.10 }
+}
 }
 
 # ==============================  LIGHTING  ====================================
@@ -828,10 +905,20 @@ light area {
 # studio-style fill flat, a couple of metres to the camera's left, facing the exhibits.
 #
 # EVERY NUMBER HERE IS A CONSTRAINT, not a taste call:
-#   * x = 1.5 keeps it OUT OF FRAME. The still camera is at (5, 2.55, 6.85) with fov_y 52 at
-#     16:9, so half its horizontal field is atan(tan(26) * 16/9) = 41 deg; at the panel's
-#     nearest depth (z = 3.4) the left frame edge is already at x = 5 - 3.45*tan(41) = 2.0.
-#     Re-check this if the framing ever moves.
+#   * x = 1.5 keeps it OUT OF FRAME, but ONLY TOGETHER WITH ITS z RANGE, and the 1.6x spread
+#     is exactly the "if the framing ever moves" this used to warn about. Half the horizontal
+#     field is atan(tan(26) * 16/9) = 41 deg, so the left frame edge at depth z is
+#     x = 5 - (9.35 - z)*tan(41) = 5 - 0.869*(9.35 - z). It was authored for an eye at
+#     z = 6.85 and a panel at z[3.4, 7.6], where the edge at the panel's far end was x = 2.0
+#     and the panel at 1.5 cleared it by half a metre. Backing the eye off to 9.35 pushed that
+#     same edge out to x = -0.17, and the panel duly appeared in frame as a grey slab down the
+#     left side (visibly, in png/spread.png).
+#     The fix is the z range, NOT x: sliding the panel back to z[6.0, 10.2] puts its far end
+#     where the frame edge is x = 2.09, clear by 0.59 m, and it costs the light nothing. The
+#     panel exists to be seen in the gold gyroid's rim, the gyroid moved with the spread to
+#     z = 6.05, and the panel is still the same 3.5 m off its -x flank — it is now ALONGSIDE
+#     the ball instead of ahead of it, which is the same geometry the right fill panel already
+#     uses deliberately (see below). Re-derive both ends from the formula if the eye moves.
 #   * y stops at 2.60, below every cloud in the scene, so a panel whose whole purpose is to
 #     be seen in a metal cannot instead show up as a bright wash on the underside of fog.
 #   * it cannot eclipse the sun the way an early sky panel did. The sun is nearly overhead
@@ -843,7 +930,7 @@ light area {
 #     essentially nothing to the multiply-scattered veil the bow has to be read against.
 # cross(u,v) = +x, so it faces the room.
 light area {
-    origin 1.5 0.15 3.4   u 0 2.45 0   v 0 0 4.2
+    origin 1.5 0.15 6.0   u 0 2.45 0   v 0 0 4.2
     spd blackbody 5500   power 2500
 }
 
@@ -1032,15 +1119,37 @@ medium {
 # (sunlit backdrop 16% -> 38% panning to x 6.5, and the clean ring collapses 70 -> 39).
 # Re-check any reframe with `python scraps/bowmap.py 45 -12 3.4 7.0 4.5 10.0 --look_at ...`
 # rather than by eye; the trade is not visible until it is counted.
+#
+# THE 1.6x SPREAD MOVED THIS CAMERA and the move is forced, not stylistic. Backing off is
+# the whole cost of spreading the exhibits: they kept their size, so seeing 1.6x more ground
+# through the same lens means standing 1.6x further away and every piece reading 1.6x
+# smaller. Eye z goes 6.85 -> 9.35, which is 2.72 + 1.6*(6.85 - 2.72) about the layout
+# centre, and look_at z goes 3.10 -> 3.30 by the same map.
+#
+# THE PITCH IS HELD AT -11.3 deg, and that is the constraint that fixes the two y values.
+# The cloud and the bow are both ANGULAR — the bow sits 42 deg off the antisolar direction
+# regardless of where the camera stands — so the sky half of this frame depends on the view
+# DIRECTION and the lens alone. Hold the pitch and the whole tuning recorded above (cloud at
+# 9% of frame, 66 clean ring pixels, dark backdrop) survives the move untouched; change it
+# and all of it has to be re-measured with scraps/bowmap.py. Over the new 6.05 m of run that
+# pitch costs 0.1998 * 6.05 = 1.21 m of drop, so look_at y = eye y - 1.21.
+#
+# EYE y RISES 2.55 -> 2.95, which is the one free choice here and it buys sight lines. The
+# pieces are now spread over 5.3 m of DEPTH instead of 3.3, so at the old eye height the
+# near row screens the far row; 2.95 steepens every sight line just enough to see over the
+# front pieces without tipping the frame into a plan view. It is NOT the 1.6x scaling of
+# 2.55 (= 4.08) — the exhibits did not get taller, only farther apart, so scaling the
+# camera's height with the layout would have been a real change of viewpoint rather than a
+# change of distance.
 prefer {
     camera "cam" {
-        eye 5.0 2.55 6.85   look_at 5.0 1.80 3.1   up 0 1 0   fov_y 52
+        eye 5.0 2.95 9.35   look_at 5.0 1.74 3.3   up 0 1 0   fov_y 52
         mode D
         film { res 1280 720   exposure 0.25 }
     }
 } else {
     camera "cam" {
-        eye 5.0 2.55 6.85   look_at 5.0 1.80 3.1   up 0 1 0   fov_y 52
+        eye 5.0 2.95 9.35   look_at 5.0 1.74 3.3   up 0 1 0   fov_y 52
         mode B
         film { res 1280 720   exposure 0.25 }
     }
