@@ -7838,9 +7838,9 @@ Three further conclusions:
    deep, because an axicon's caustic reads as two rainbow cusps flanking the piece rather than a
    disc under it, and it is cantilevered only 0.12 m (a lens throws its focus ~0.98 m downwind
    per metre of drop; an axicon has no focal *point* to displace, only a focal *line* starting
-   at the exit face). Drop 0.35 and 45 deg are both metered optima — colour falls off
-   monotonically above ~0.5 m of drop, and past 45 deg the exit face starts to TIR exactly as
-   the brilliant's pavilion does.
+   at the exit face). Drop 0.35 and 45 deg are both metered optima. **Both stated REASONS are
+   retracted below** (see the two RETRACTION blocks): colour does *not* fall off with drop, and
+   the failure past 45 deg is not TIR. The choices themselves stand.
 
    **FACETING IT DOES NOT HELP, and that is worth knowing** because from the scene's low
    camera (11 deg above the horizon) a 45 deg cone is twice as wide as it is tall and
@@ -7851,7 +7851,8 @@ Three further conclusions:
    0.099/0.132 spread, against the smooth cone's 0.29% and 0.212. Sampling the ring focus at n
    discrete azimuths instead of continuously collapses the patch from 1.43 x 0.96 m to a
    0.20 x 0.03 m sliver — brighter per unit area (facet 8 reaches sat 0.367) but far too small
-   to read in a wide shot. The scene keeps the smooth cone.
+   to read in a wide shot. The scene keeps the smooth cone. **(Re-measured on float below: the
+   spreads all moved, the verdict did not.)**
 
    **Siting gotcha worth remembering: in this scene the NEAR row is HIGH z, not low z.** The
    still camera stands at (5.0, 2.95, 9.35) and looks toward -z, so "front of the gallery"
@@ -7906,24 +7907,99 @@ It is safe for real caustics precisely because a caustic is never isolated — i
 bright too. Evidence: the shipped axicon measures peak **14.68x with and without** the flag,
 bit-identical, while the gyroid's 1214x vanishes.
 
-**The corrected ranking (float + `-fireflies 3`, 600 spp, 4x box, 2x cut)** — this supersedes
-the `coverage / sat / spread` tables above, all of which were computed through the clamp:
+**The corrected ranking (float + `-fireflies 3`, 600 spp, 480x480, 4x box, 2x cut)** — this
+supersedes every `coverage / sat / spread` table above, all of which were computed through the
+clamp. Each piece at its own best drop; `patch` is the excess-weighted 5-95% extent:
 
-| piece | peak | coverage | sat | **spread** |
-|---|---|---|---|---|
-| **axicon 45 deg, drop 0.35 (shipped)** | **14.68x** | 0.30% | 0.275 | **0.079** |
-| axicon 45 deg, drop 0.80 | 24.58x | 0.29% | 0.314 | 0.083 |
-| round brilliant R=0.40, drop 0.80 | 3.68x | 0.06% | 0.234 | 0.096 |
-| crystal orb, drop 0.80 | 3.00x | 0.16% | 0.253 | 0.013 |
-| solid gyroid k=10, drop 0.80 | 2.60x | **0.00%** | — | — |
+| piece | peak | coverage | sat | **spread** | noise | **fan** | patch x by z |
+|---|---|---|---|---|---|---|---|
+| **axicon 45 deg, drop 0.35 (shipped)** | **14.68x** | **0.30%** | 0.275 | **0.079** | 0.008 | **0.76** | **1.37 x 0.96** |
+| axicon 45 deg, drop 0.80 | 24.58x | 0.29% | **0.314** | 0.083 | 0.011 | **0.85** | 1.98 x 1.34 |
+| apex-**up** cone k=0.9, drop 0.90 | 7.14x | 0.07% | 0.201 | 0.018 | 0.005 | — | 1.49 x 0.35 |
+| round **brilliant** R=0.40, drop 0.80 | 3.68x | 0.06% | 0.219 | 0.047 | 0.011 | — | 0.35 x 0.06 |
+| oblate spheroid b=0.22, drop 0.90 | 9.09x | 0.19% | 0.272 | 0.024 | 0.004 | 0.97 | 0.09 x 0.18 |
+| glass **torus**, drop 0.90 | 7.85x | 0.03% | 0.210 | 0.006 | 0.003 | — | 0.03 x 0.06 |
+| crystal **orb**, drop 0.80 | 3.00x | 0.16% | 0.253 | 0.013 | 0.008 | 0.94 | 0.09 x 0.15 |
+| solid gyroid k=10, drop 0.80 | 2.60x | **0.00%** | — | — | — | — | — |
 
-The *ordering* survives — the axicon still wins decisively (0.079 spread against the orb's
-0.013, and 5-8x the orb's peak) — so every conclusion drawn from the old tables about *which
-piece to ship* stands. But no absolute number in them does: they were suppressed by the clamp
-at the top end and inflated by fireflies at the tail, in opposite directions, so they cannot be
-rescued by rescaling. The brilliant's 0.096 spread now nominally edges the axicon's 0.079, on
-0.06% coverage against 0.30% and a fifth the peak — a spread measured over a handful of cells
-is not a comparable statistic, which is itself a reason to report coverage alongside it.
+The *ordering* survives — the axicon still wins decisively, on area (1.3 m of cusp against the
+orb's 9 cm patch), on spread 6:1, and on peak 5-8x — so every conclusion drawn from the old
+tables about *which piece to ship* stands. But no absolute number in them does: they were
+suppressed by the clamp at the top end and inflated by fireflies at the tail, in **opposite
+directions**, so they cannot be rescued by rescaling. Two specific reversals:
+
+* **The brilliant's "spread win" was a clamp artifact.** It read 0.092 through the clamp,
+  nominally beating the axicon's clipped 0.079; on float it is 0.047 with too few cells to
+  `fan`-test at all. Conclusion 4 above (a 40.75 deg pavilion TIRs the fire back at the viewer)
+  is unaffected — the brilliant still loses, just by more.
+* **`spread` measured over a handful of cells is not a comparable statistic**, which is why the
+  table now carries `coverage`, `patch` and `fan` beside it. The oblate spheroid's fan 0.97 and
+  the orb's 0.94 are *perfectly organised* colour over a 9 cm patch: real, and negligible.
+
+**RETRACTION: drop is not a colour parameter — it buys patch AREA (2026-08-04).** Conclusion 6
+above says "colour falls off monotonically above ~0.5 m of drop". That was the clamp talking:
+a bigger drop throws a brighter caustic, which clipped harder, which the PNG scored as *less*
+colourful. Swept on float:
+
+| drop | peak | coverage | sat | spread | fan | patch x by z |
+|---|---|---|---|---|---|---|
+| 0.35 (shipped) | 14.68x | 0.30% | 0.275 | 0.079 | 0.76 | 1.37 x 0.96 |
+| 0.50 | 18.43x | 0.27% | 0.257 | 0.076 | 0.82 | 1.55 x 1.11 |
+| 0.65 | 34.54x | 0.24% | 0.281 | 0.076 | 0.82 | 1.78 x 1.23 |
+| 0.80 | 24.58x | 0.29% | **0.314** | **0.083** | **0.85** | 1.98 x 1.34 |
+| 0.95 | 6.27x | 0.36% | 0.277 | 0.083 | 0.82 | 2.22 x 1.49 |
+| 1.10 | 5.02x | 0.56% | 0.256 | 0.065 | 0.67 | 2.33 x 1.55 |
+
+`spread` is flat at 0.065-0.083 across the whole range — drop is very nearly a **free
+parameter for colour** between 0.35 and 0.95. What it actually controls is how far the cusps
+walk apart: the patch grows 1.37 x 0.96 m -> 2.33 x 1.55 m, i.e. **a bigger drop needs a bigger
+cap**. That is a *staging* trade, not an optical one, and it is why the shipped 0.35 stays:
+0.80 is nominally best on `sat` (0.314) and `fan` (0.85), but taking it would need the axicon
+cap grown from 1.6 x 1.1 to ~2.1 x 1.45, whose near edge lands at z ~ 4.41 against the diamond
+cap's z = 4.40 *and* overlapping it in y (0.70-0.90 vs 0.65-0.85, since the caps were
+thickened). The gain is inside the run-to-run scatter; the layout surgery is not.
+
+**RETRACTION: the "past 45 deg the exit face TIRs" mechanism is wrong (2026-08-04).** Same
+conclusion 6. Swept on float at drop 0.35 (`k` = tan of the cone's half-angle; `k=1.0` is
+45 deg), with the caustic core's z offset from the piece's axis:
+
+| k | half-angle | peak | coverage | sat | spread | fan | core z |
+|---|---|---|---|---|---|---|---|
+| 0.70 | 35.0 deg | 6.49x | 0.09% | 0.234 | **0.129** | — | **+0.63** |
+| 0.85 | 40.4 deg | 13.16x | **0.03%** | 0.480 | 0.009 | — | -0.53 |
+| **1.00** | **45.0 deg** | **14.68x** | **0.30%** | 0.275 | 0.079 | **0.76** | -0.16 |
+| 1.20 | 50.2 deg | 12.94x | 0.25% | 0.219 | 0.052 | 0.93 | -0.61 |
+| 1.40 | 54.5 deg | 11.16x | 0.10% | 0.193 | 0.031 | — | -0.62 |
+
+45 deg is confirmed optimal, but not for the stated reason. The collapse is at **k=0.85
+(40.4 deg), BELOW 45 deg**, and both k=1.20 and k=1.40 keep working — so this is not a
+one-sided TIR cliff past 45 deg. The core also **switches sides**, +0.63 z at k=0.70 to -0.61 z
+at k=1.20, crossing near the null: the ring focus is passing through infinity there (the
+constant prism deviation sweeping past the drop distance), which is what empties the 2x bar,
+not the critical angle. 40.4 deg landing on crystal's 40.2 deg critical angle is a coincidence
+worth naming precisely so nobody re-derives the wrong mechanism from it. Shallower cones are
+also **short-range only**: `vcone0.70` at drop 0.80 and 1.10, and `vcone0.60` at 0.80, all read
+0.00% coverage.
+
+**FACETING STILL LOSES — the clamped conclusion survives honest measurement (2026-08-04).**
+The one previously-rejected option that would have improved the scene *visually*, re-tested on
+float at drop 0.35:
+
+| piece | peak | coverage | sat | spread | noise | fan | patch x by z |
+|---|---|---|---|---|---|---|---|
+| facet6 | 3.19x | 0.12% | 0.252 | 0.023 | 0.011 | — | 0.20 x 0.03 |
+| facet8 | 4.52x | 0.11% | 0.394 | 0.110 | 0.010 | — | 0.20 x 0.03 |
+| facet12 | 5.58x | 0.12% | 0.244 | 0.045 | 0.010 | — | 0.17 x 0.03 |
+| facet16 | 5.21x | 0.14% | 0.306 | 0.049 | 0.012 | 0.17 | 0.20 x 0.03 |
+| **smooth cone** | **14.68x** | **0.30%** | 0.275 | 0.079 | 0.008 | **0.76** | **1.37 x 0.96** |
+
+The absolute numbers all moved (facet8's spread went 0.162 -> 0.110, facet6's 0.063 -> 0.023)
+but the verdict does not: every facet count sits at 0.11-0.14% coverage on a ~0.20 x 0.03 m
+**sliver** — 1/220th the area of the smooth cone's patch — at a third to a fifth of the peak,
+and **not one has enough cells for a trustworthy `fan`** (facet16's 0.17 is the only number and
+it is weak, i.e. what colour is there is barely organised). Sampling the ring focus at n
+discrete azimuths instead of continuously is what collapses it, exactly as the clamped
+measurement said. The scene keeps the smooth cone.
 
 **CLOSED for the axicon: the in-scene frame now measures as a coloured caustic (2026-08-04).**
 `_capchroma.py` on a 1036-spp `-hdr -fireflies 3` render of the shipped scene, per cap, at the

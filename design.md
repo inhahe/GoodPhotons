@@ -1486,34 +1486,56 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       symmetry. The shipped axicon scores **fan 0.76** in the rig (control 0.00, floor 0.008)
       and **0.46** in the finished frame. The orb scores fan 0.94 on spread 0.013, which is the
       pair working as designed: a ball lens's tinted rim is perfectly organised colour, there is
-      just almost none of it. Measured at the honest 2× bar, each piece at its own best drop:
+      just almost none of it. Measured at the honest 2× bar on the **float** buffer with
+      `-fireflies 3` (600 spp, 480², 4× box), each piece at its own best drop — this supersedes
+      an earlier table taken through the 8-bit clamp, which was clip-suppressed at the top end
+      and firefly-inflated at the tail, *in opposite directions*, and so cannot be rescaled:
 
-      | piece | coverage | sat | **spread** |
-      |---|---|---|---|
-      | **axicon**, 45°, apex down, drop 0.35 | 0.29 % | **0.320** | **0.212** |
-      | axicon, same, drop 0.90 | 0.31 % | 0.319 | 0.183 |
-      | apex-**up** cone, 42°, drop 0.90 | 0.07 % | 0.289 | 0.157 |
-      | round **brilliant** cut, R = 0.40 | 0.18 % | 0.257 | 0.092 |
-      | oblate spheroid (astigmatic lens) | 0.19 % | 0.196 | 0.051 |
-      | crystal **orb**, drop 0.80 | 0.16 % | 0.265 | 0.048 |
-      | glass torus (ring lens) | 0.03 % | 0.210 | 0.045 |
-      | **solid gyroid k=10, shell gyroid k=13, Klein bottle, prism** | **0.00 %** | — | — |
+      | piece | peak | coverage | sat | **spread** | noise | **fan** | patch x × z |
+      |---|---|---|---|---|---|---|---|
+      | **axicon**, 45°, apex down, drop 0.35 | **14.68×** | **0.30 %** | 0.275 | **0.079** | 0.008 | **0.76** | **1.37 × 0.96** |
+      | axicon, same, drop 0.80 | 24.58× | 0.29 % | **0.314** | 0.083 | 0.011 | **0.85** | 1.98 × 1.34 |
+      | apex-**up** cone, drop 0.90 | 7.14× | 0.07 % | 0.201 | 0.018 | 0.005 | — | 1.49 × 0.35 |
+      | round **brilliant** cut, R = 0.40 | 3.68× | 0.06 % | 0.219 | 0.047 | 0.011 | — | 0.35 × 0.06 |
+      | oblate spheroid (astigmatic lens) | 9.09× | 0.19 % | 0.272 | 0.024 | 0.004 | 0.97 | 0.09 × 0.18 |
+      | crystal **orb**, drop 0.80 | 3.00× | 0.16 % | 0.253 | 0.013 | 0.008 | 0.94 | 0.09 × 0.15 |
+      | glass torus (ring lens) | 7.85× | 0.03 % | 0.210 | 0.006 | 0.003 | — | 0.03 × 0.06 |
+      | **solid gyroid k=10, shell gyroid k=13, Klein bottle, prism** | 2.60× | **0.00 %** | — | — | — | — | — |
 
-      **Those numbers were taken through the 8-bit clamp and are wrong in absolute terms** —
-      see the `-hdr` bullet below; the re-measurement on floats with `-fireflies 3` reads
-      axicon 0.079 spread at 14.68× peak against the orb's 0.013 at 3.00×, and the gyroid still
-      0.00 %. The *ordering* survives, so every "which piece to ship" conclusion here stands,
-      but the absolute figures cannot be rescued by rescaling (clip-suppressed at the top end,
-      firefly-inflated at the tail, in opposite directions).
-
-      The orb is the scene's brightest caustic *and* one of its whitest. Two results are worth
-      keeping: a **round brilliant loses**, because a 40.75° pavilion sits just past crystal's
-      40.2° critical angle and total-internally-reflects the fire back up at the viewer instead
-      of down at the table (sweeping the pavilion to 20–35° does not recover it); and **the
-      lattice cannot be rescued by reshaping its outer boundary** — a solid gyroid clipped to
-      this same axicon measures 0.13 % / 0.205 / 0.099, less than half a plain axicon, because
-      the clip only sets the *first* surface a ray meets and behind it are the same internal
-      sheets that make a gyroid a diffuser.
+      The orb is the scene's brightest ball-lens caustic *and* one of its whitest — fan 0.94 on
+      a 9 cm patch is real, organised and negligible, which is the whole reason the axicon was
+      added. Three results are worth keeping. A **round brilliant loses**, because a 40.75°
+      pavilion sits just past crystal's 40.2° critical angle and total-internally-reflects the
+      fire back up at the viewer instead of down at the table (sweeping the pavilion to 20–35°
+      does not recover it) — and its one-time "spread win" of 0.092 was purely a clamp artifact:
+      on float it is 0.047 with too few cells to `fan`-test. **The lattice cannot be rescued by
+      reshaping its outer boundary** — a solid gyroid clipped to this same axicon measures
+      0.13 % / 0.205 / 0.099, less than half a plain axicon, because the clip only sets the
+      *first* surface a ray meets and behind it are the same internal sheets that make a gyroid
+      a diffuser. And **faceting the axicon still loses on honest numbers**: 6/8/12/16 pavilion
+      facets read 0.11–0.14 % coverage on a ~0.20 × 0.03 m sliver (1/220th the smooth cone's
+      patch) at a third of the peak, none with enough cells to `fan`-test, because sampling the
+      ring focus at *n* discrete azimuths instead of continuously collapses it.
+    - **Drop is not a colour parameter — it buys patch AREA.** Swept on float, the axicon's
+      `spread` is flat at 0.065–0.083 from drop 0.35 to 1.10 while the patch grows 1.37 × 0.96 m
+      → 2.33 × 1.55 m; peak peaks near 0.65 (34.5×) and `sat`/`fan` near 0.80 (0.314 / 0.85).
+      An earlier claim that "colour falls off monotonically above ~0.5 m of drop" was the clamp
+      talking: a bigger drop threw a *brighter* caustic, which clipped harder, which the PNG
+      scored as less colourful. So drop is a **staging** trade — a bigger drop needs a bigger
+      cap — and the shipped 0.35 stays because growing the cap to ~2.1 × 1.45 would collide it
+      with the diamond cap in both z (4.41 vs 4.40) and y (0.70–0.90 vs 0.65–0.85), for a gain
+      inside the run-to-run scatter.
+    - **45° is the right cone angle, but NOT because of TIR.** Sweeping the half-angle at drop
+      0.35 (k = tan of the half-angle) gives coverage 0.09 / **0.03** / **0.30** / 0.25 / 0.10 %
+      at k = 0.70 / 0.85 / 1.00 / 1.20 / 1.40 (35 / 40.4 / 45 / 50.2 / 54.5°). The collapse is
+      at 40.4°, **below** 45°, and both 50.2° and 54.5° keep working — so this is not a
+      one-sided cliff past 45° as was once written. Across the null the caustic core also
+      **switches sides**, +0.63 z at k = 0.70 to −0.61 z at k = 1.20: the ring focus is passing
+      through infinity there (the constant prism deviation sweeping past the drop distance),
+      which is what empties the 2× bar. 40.4° landing on crystal's 40.2° critical angle is a
+      coincidence, and worth naming as one so the wrong mechanism is not re-derived from it.
+      Shallow cones are also short-range only — `vcone0.70` at drop 0.80 and 1.10 and
+      `vcone0.60` at 0.80 all read 0.00 % coverage.
     - **An axicon's caustic barely walks with height, and lands beside the piece rather than
       under it.** A lens throws its focus ~0.98 m downwind per metre of drop (the sun walks
       +0.2079 x / −0.9788 z), which is why the orb's and the gyroid's caps are cantilevered
