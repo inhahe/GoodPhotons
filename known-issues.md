@@ -7642,29 +7642,34 @@ Repro of the old behaviour: drop `feather` from the raincloud in `scenes/gallery
 
 ---
 
-### OPEN: `gallery_rain`'s mode-B fallback branch is effectively dead now that the room is gone
+### OPEN: `gallery_rain`'s mode-B fallback branch is a much worse image than its comment admits
 
 `scenes/gallery_rain.ftsl` wraps its still camera in `prefer { mode D } else { mode B }`, so a
 machine without a working CUDA BDPT falls back to the forward pinhole splat. That fallback was
 authored for the ROOFED edition and has not been re-validated since the walls and ceiling came
 off. It should be.
 
-Measured (v0.130.0, `-mode B -time 300`, 1.30e9 photons):
+Measured (v0.130.0, `-mode B -time 150` vs the 1180-spp mode-D still): the frame mean drops
+47.3 -> 25.2 and the diamond stand's cap 209 -> 152, with the gold gyroid, the glass sphere and
+the chrome ring rendering solid black and heavy photon noise everywhere else. The scene header
+calls this "a real downgrade... in mode B every piece of glass and the chrome ring go black",
+which is true as far as it goes but understates how far from usable the result now is.
 
-```
-[energy] absorbed=0.4344 sensor=0.0000 escaped=0.5656 residual=0.0001
-```
+Two compounding causes, both created by removing the room:
+* **57% of every photon escapes to infinity** (`escaped=0.5662`) instead of bouncing off a wall
+  and getting another chance at a camera-visible surface.
+* **The emission disc grew with the scene.** A `light sun` is an infinite directional source, so
+  a forward tracer has to emit it over a disc covering the scene's cross-section. Opening out to
+  a ~33 m ground plane took R_scene from ~12 m to ~33 m, so only ~(5/33)^2 ~ 2% of photons now
+  land anywhere near the exhibits. The scene header already works this out for *light selection*
+  (it is why the xenon lamp was removed) without noticing it applies to the forward modes too.
 
-**Zero** of the emitted energy reaches the sensor, to four decimals. The frame is nearly black —
-only the cloud, the bow and a faint wash on the caps register at all. The cause is structural,
-not a bug: a forward tracer fires photons from the light and hopes they find the camera, and
-this scene's only lights are a distant sun and two panels firing into an *open hemisphere*.
-57% of every photon escapes to infinity on the first bounce. The enclosing room was what used
-to recycle them, and removing it is exactly what the open-air rework did.
-
-The scene header still describes the else-branch as merely "a real downgrade... in mode B every
-piece of glass and the chrome ring go black", which understates it — it is not a downgrade, it
-is not an image.
+**NOT evidence, despite looking like it:** the `[energy]` line reports `sensor=0.0000` for this
+scene, but that is normal and says nothing — `scenes/_fog_cornell.ftsl`, a sealed box that mode
+B renders perfectly, reports `sensor=0.0000` too. A pinhole subtends ~zero solid angle, so the
+splat is an importance-weighted estimator and literal sensor energy is always ~0. (This entry
+originally cited that figure as proof the branch was dead; it was not, and the corrected
+measurements above are the frame mean and cap level.)
 
 Options, none yet chosen:
 * point the else-branch at **mode M** (photon-map camera) or CPU mode D instead of B;
@@ -7672,7 +7677,7 @@ Options, none yet chosen:
   the GPU BDPT handle the delta sun and the else-branch's original reason (mode D refusing a
   `light sun`) no longer exists.
 
-Repro: `ftrace scenes/gallery_rain.ftsl -mode B -time 300 -o png/_b.png`
+Repro: `ftrace scenes/gallery_rain.ftsl -mode B -time 150 -o png/_b.png`
 
 ### OPEN: `gallery_rain`'s caustic screens cannot show a caustic — they are metered into the clip
 
