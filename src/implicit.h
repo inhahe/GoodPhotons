@@ -209,10 +209,20 @@ enum class MarchMethod : int { Adaptive = 0, Sample = 1 };
 enum class RootRefine : int { Bisect = 0, RegulaFalsi = 1 };
 
 // Container shape an expression isosurface is clipped to (POV `contained_by`).
-//   Box    — the world AABB `bounds` (default; flat clip planes).
+//   Box    — the authored box, clipped in the isosurface's OWN frame. When that frame
+//            is axis-aligned in world this is just the world AABB `bounds`; when a
+//            transform rotates it (`boxOriented`), it is an oriented box and the ray is
+//            transformed by `boxInv` and slab-tested against `boxLo`/`boxHi` there.
+//            Clipping to the world AABB instead would be a correctness bug, not just
+//            slop: an expression field is only Lipschitz-bounded by its authored
+//            `max_gradient` INSIDE the authored box, and the AABB of a rotated box
+//            reaches well outside it. For the gallery heart (a sextic) that region
+//            holds |f| ~ 22x larger, so the very first |f|/max_gradient sphere-trace
+//            step steps clean over the whole object and it renders invisible.
 //   Sphere — a world sphere (center/radius); clips along a smooth curved boundary,
 //            so an unbounded surface's unavoidable cut reads as a rounded edge
 //            instead of hard facets. `bounds` is still the sphere's AABB for BVH.
+//            Rotation-invariant, so it never needed the `boxOriented` treatment.
 enum class Container : int { Box = 0, Sphere = 1 };
 
 // ---------------------------------------------------------------------------
@@ -229,6 +239,15 @@ struct Implicit {
     Container container = Container::Box;
     Vec3      sphereCenter{0, 0, 0};   // world center  (Container::Sphere)
     double    sphereRadius = 0.0;      // world radius  (Container::Sphere)
+    // Oriented container box (Container::Box only). Set when the isosurface's
+    // local->world map rotates the authored box, so its world AABB is strictly larger
+    // than the box itself — e.g. any piece a `group { rotate .. }` rest pose wraps.
+    // `boxInv` maps world -> the frame `boxLo`/`boxHi` are expressed in. When false the
+    // authored box IS `bounds` and the cheaper world-space slab test is used, keeping
+    // every unrotated scene bit-identical.
+    bool      boxOriented = false;
+    Affine    boxInv;                  // world -> container-local (boxOriented only)
+    Vec3      boxLo{0, 0, 0}, boxHi{0, 0, 0};   // authored box in that local frame
     // Where the solid interior (f<0) is sliced by the container wall, `capped` draws
     // that slice as a face of the isosurface material (a cleanly "sawn off" solid);
     // `open` (capped=false) omits it, leaving the surface's cut edge / a see-through
@@ -297,6 +316,39 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             double le = length(ge), lx = length(gx);
             nEnter = (le > 0.0) ? ge / le : Vec3{0, 0, 1};
             nExit  = (lx > 0.0) ? gx / lx : Vec3{0, 0, 1};
+        }
+    } else if (im.boxOriented) {
+        // Slab test in the box's OWN frame. An affine map preserves the ray parameter
+        // (p(t) = o + t*d maps to boxInv(o) + t*boxInv_dir(d)), so the t values this
+        // yields are directly comparable with tmin/hit.t — only the face normals have to
+        // come back to world, by boxInv's linear part TRANSPOSED (applyDirTranspose).
+        // Kept as its own branch rather than folded into the AABB test below: the
+        // unrotated case (every isosurface that has no rest pose baked onto it) then
+        // runs exactly the code it always did, and skips the ray transform entirely.
+        // Verified: a scene with no oriented container renders bit-identically.
+        const Vec3 ro = im.boxInv.apply(r.o);
+        const Vec3 rd = im.boxInv.applyDir(r.d);
+        Vec3 invD{1.0 / rd.x, 1.0 / rd.y, 1.0 / rd.z};
+        tEnter = -1e300; tExit = 1e300;
+        int eAx = 0; double eSgn = -1.0;   // entry face axis + outward-normal sign
+        int xAx = 0; double xSgn = 1.0;    // exit  face axis + outward-normal sign
+        for (int a = 0; a < 3; ++a) {
+            double o = vget(ro, a), id = vget(invD, a);
+            double tLo = (vget(im.boxLo, a) - o) * id;
+            double tHi = (vget(im.boxHi, a) - o) * id;
+            double tnear, tfar, nearSgn, farSgn;
+            if (id >= 0.0) { tnear = tLo; tfar = tHi; nearSgn = -1.0; farSgn = +1.0; }
+            else           { tnear = tHi; tfar = tLo; nearSgn = +1.0; farSgn = -1.0; }
+            if (tnear > tEnter) { tEnter = tnear; eAx = a; eSgn = nearSgn; }
+            if (tfar  < tExit)  { tExit  = tfar;  xAx = a; xSgn = farSgn; }
+            if (tExit < tEnter) return false;
+        }
+        if (!anyHit) {   // local face normals -> world (cap shading only)
+            Vec3 ne{0, 0, 0}, nx{0, 0, 0};
+            (eAx == 0 ? ne.x : eAx == 1 ? ne.y : ne.z) = eSgn;
+            (xAx == 0 ? nx.x : xAx == 1 ? nx.y : nx.z) = xSgn;
+            nEnter = normalize(im.boxInv.applyDirTranspose(ne));
+            nExit  = normalize(im.boxInv.applyDirTranspose(nx));
         }
     } else {
         Vec3 invD{1.0 / r.d.x, 1.0 / r.d.y, 1.0 / r.d.z};
@@ -533,12 +585,14 @@ inline Aabb implicitBounds(const std::vector<FieldNode>& nodes);   // fwd decl
 // March-step floor for a primitive of the given world bounds: a small fraction of
 // the bounds diagonal, clamped so it neither creeps (too small) nor skips features
 // (too large). Bounded planes/huge boxes clamp to the ceiling.
-inline double implicitMinStep(const Aabb& b) {
-    double diag = length(b.hi - b.lo);
+inline double implicitMinStepForDiag(double diag) {
     double s = 1e-3 * diag;
     if (s < 1e-5) s = 1e-5;
     if (s > 1e-3) s = 1e-3;
     return s;
+}
+inline double implicitMinStep(const Aabb& b) {
+    return implicitMinStepForDiag(length(b.hi - b.lo));
 }
 
 // True if the field expression contains an arbitrary-expression (Expr) leaf, which is
@@ -554,15 +608,24 @@ inline bool fieldHasExpr(const std::vector<FieldNode>& nodes) {
 // provably never overshoots the first zero crossing (|f(p)| <= L*dist => the nearest
 // surface is at least |f|/L away). The caller pads the result for safety. Returns at
 // least 1 (a true SDF has L = 1) so plain SDF leaves in the same field aren't slowed.
+//
+// `l2w` (optional) makes `box` a box in THAT frame rather than in world: the lattice is
+// laid out in local coordinates and each sample mapped out to world. This is how an
+// ORIENTED container is measured — sampling its world AABB instead would survey a
+// region the marcher never visits and, for a steep field just outside the container,
+// return a hugely inflated L that only slows every march down. The differences stay
+// along world axes either way, since |grad f| is what is wanted and a rigid map
+// preserves it.
 inline double estimateFieldLipschitz(const std::vector<FieldNode>& nodes,
                                      const std::vector<PatNode>& exprNodes,
                                      const Aabb& box, int grid = 24,
-                                     const PatTables* tabs = nullptr) {
+                                     const PatTables* tabs = nullptr,
+                                     const Affine* l2w = nullptr) {
     const FieldNode* nd = nodes.data();
     const int N = (int)nodes.size();
     const PatNode* pool = exprNodes.data();
     Vec3 ext = box.hi - box.lo;
-    double diag = length(ext);
+    double diag = l2w ? length(l2w->applyDir(ext)) : length(ext);
     if (diag <= 0) return 1.0;
     double eps = 1e-4 * diag;
     double maxg = 1.0;
@@ -572,6 +635,7 @@ inline double estimateFieldLipschitz(const std::vector<FieldNode>& nodes,
         Vec3 p{box.lo.x + ext.x * (ix / (double)grid),
                box.lo.y + ext.y * (iy / (double)grid),
                box.lo.z + ext.z * (iz / (double)grid)};
+        if (l2w) p = l2w->apply(p);
         double gx = fieldEval(nd, N, p + Vec3{eps,0,0}, pool, tabs) - fieldEval(nd, N, p - Vec3{eps,0,0}, pool, tabs);
         double gy = fieldEval(nd, N, p + Vec3{0,eps,0}, pool, tabs) - fieldEval(nd, N, p - Vec3{0,eps,0}, pool, tabs);
         double gz = fieldEval(nd, N, p + Vec3{0,0,eps}, pool, tabs) - fieldEval(nd, N, p - Vec3{0,0,eps}, pool, tabs);

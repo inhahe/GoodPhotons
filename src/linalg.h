@@ -91,6 +91,17 @@ struct Affine {
         return r;
     }
 
+    // M^T * v — the linear part transposed. Result is NOT normalized.
+    // Its use: when `*this` is a world->local map, this is exactly the local->world
+    // NORMAL transform, since (M^-1)^T with M the forward (local->world) linear part
+    // is (this->M)^T. Lets a caller holding only the inverse map push a normal back
+    // out to world without inverting it again (applyNormal would, every call).
+    Vec3 applyDirTranspose(const Vec3& v) const {
+        return Vec3{m[0] * v.x + m[3] * v.y + m[6] * v.z,
+                    m[1] * v.x + m[4] * v.y + m[7] * v.z,
+                    m[2] * v.x + m[5] * v.y + m[8] * v.z};
+    }
+
     // Transform a surface normal: normals map by the INVERSE-TRANSPOSE of the
     // linear part (not the affine itself), so they stay perpendicular to the
     // surface under non-uniform scale. Result is NOT normalized (the caller

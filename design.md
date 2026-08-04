@@ -15,7 +15,7 @@ this file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 | `B` | forward light tracing, splat through pinhole/lens to film (flagship) | `render.h` |
 | `C` | forward + contact sensor | `render.h` |
 | `R` | backward (unidirectional) path tracer — the reference | `backward.h` |
-| `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased, CPU only) | `backward.h` (`whitted`) |
+| `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased; CPU + GPU since 0.110.0, fully on-device since 0.116.0) | `backward.h` (`whitted`), `render_cuda.cu` (`WhittedOpts`) |
 | `P` | composite: forward B + backward R passes merged | `main.cpp` orchestration |
 | `D` | bidirectional path tracer (BDPT, MIS) | `bdpt.h` |
 | `M` | photon map (deposit pass + per-pixel density gather; optional `-pmfg` final gather) | `photonmap.h`, `photonmap_render.h` |
@@ -101,6 +101,21 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   that an unread key otherwise silently does nothing, turning a typo or a drifted
   emitter into a wrong image instead of a message. This is what makes the loom
   emitter-drift audit (`scraps/emit_audit.py`, TODO J3c) mechanically possible at all.
+  **The `render { … }` block** carries the handful of settings that belong to the scene
+  rather than to the run — `photons`, `mode`, `res`, `device`, `out`, and (since 0.122.0)
+  `max_bounce`. `applyRender` parses them onto `Loaded` (`Loaded::maxBounce`, `-1` = not
+  specified) and `main.cpp` folds each into the corresponding CLI variable *only if the
+  operator left it unset, so an explicit flag always wins*. `max_bounce` exists because
+  path depth is sometimes a property of the geometry and not of the operator's taste:
+  mode D/U run 8 path edges by default, and a thin-walled glass shell with another tube
+  inside it presents about eight dielectric interfaces along one line of sight, so at the
+  default the innermost surface's paths are truncated and it renders as a solid **black
+  plug** — indistinguishable, by eye, from a material or winding bug. The gallery's Klein
+  bottle is exactly that shape and so declares `render { max_bounce 32 }` itself; the
+  scene, not the command line, is the thing that knows. Pickup is announced
+  (`[scene] max bounce = N (from the scene's render block)`) so the number never applies
+  invisibly. Cost is real — measured ~35% of the sample rate on the gallery — which is
+  why it stays a per-scene declaration rather than a raised global default.
   Lights are `Emitter`s with an `EmitterShape`
   (Quad/Sphere/Spot/Env/Cylinder/**Mesh**/**Sun**); each carries its own SPD and a `power`
   = emitIntegral·geomWeight selection weight. **Distant sun** (since 0.84.0):
@@ -173,6 +188,40 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (pure per-slot), with the order-sensitive weld-map sweep and winding pass kept
   serial — bit-identical to the old serial code by construction. Per-implicit
   marching also runs in parallel across objects.
+
+  **Oriented container box (0.121.1).** An `expr` isosurface is NOT a distance
+  field, so the marcher clips the ray to the authored `contained_by` box and steps
+  by `|f| / max_gradient` — a bound the author only guarantees *inside* that box.
+  `Implicit` therefore stores the container in its OWN frame (`boxOriented`,
+  `boxInv` = world→container-local, `boxLo`/`boxHi`) and `intersectImplicit` runs
+  the slab test there. An affine map preserves the ray parameter
+  (`p(t) = o + t·d` ↦ `boxInv(o) + t·boxInv_dir(d)`), so the resulting `t` values
+  are directly comparable with `tmin`/`hit.t`; only the two face normals return to
+  world, via `Affine::applyDirTranspose` (`boxInv`'s linear part transposed — NOT
+  `applyNormal`, which would invert a second time). `ftsl.h`'s `addIsosurface`
+  sets `boxOriented` only when the local→world map is not axis-preserving, so
+  every unrotated scene takes the original world-AABB path and renders
+  bit-identically.
+
+  Clipping to the world AABB instead is a real invisibility bug: under a rotation
+  that AABB is strictly larger than the box (for the gallery heart, **4.36× the
+  volume**), the field out there is far steeper (max `|f|` 1688 → 37738), and the
+  first sphere-trace step of `37738/60 ≈ 629 m` leaps clean over a 0.6 m object.
+  Diagnostic signature: **the rasterizer shows it and every ray-traced mode does
+  not** — marching cubes samples a lattice and never sphere-traces, so it cannot
+  overshoot. Guarded by `-checkcontainer`, which builds one sextic solid twice
+  (axis-aligned and rigidly rotated) under a shared `max_gradient` and fires
+  correspondingly rotated rays: a rigid motion cannot change a hit distance, so
+  any disagreement is the clip region leaking outside the container.
+
+  **Cap-fraction guard on `-export-mesh` (0.121.0).** A capped isosurface marches
+  `max(f, contSDF(p))`, so if the field's sign is inverted (`f < 0` *outside* the
+  intended shape) the container wins everywhere and the export is the `contained_by`
+  shape with the object hollowed out invisibly inside it — indistinguishable from a
+  plain ball until you strip the shell. `isomesh::capFraction()` classifies each
+  output triangle by which term won the `max()` at its centroid, and `main.cpp`'s
+  export loop warns when the cap exceeds half the output. Diagnostic only; it never
+  changes the mesh. (Cost is one field eval per triangle, once, at export time.)
 
   **Occlusion any-hit fast path (0.118.0).** `intersectImplicit` takes an
   `anyHit` flag (default false), set only by `Scene::occluded`'s traverseAny
@@ -326,6 +375,28 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   bit-identical across the change, and only `spp > 1` moves. Measured star discrepancy of the
   first 16 points drops from 0.754 to 0.077 at base 61 and 0.651 to 0.102 at base 43
   (`scraps/n3e_lattice.py`).
+
+  **Sealed-light detection (0.119.0).** Because mode `W` implies `-direct-only`, NEE is the
+  *only* way anything is lit — and `Scene::occluded` blocks a shadow ray on any geometry,
+  dielectrics included (the SDS limitation). A light sealed inside refractive or mirrored
+  geometry therefore reaches no vertex at all and the mode renders pure black, previously
+  with `auto-exposure=1` as the sole hint. `Scene::emitterSeal()` (`scene.h`) probes an
+  emitter with a deterministic 512-direction lattice — stratified over the surface through
+  the existing `Emitter::samplePoint`, uniform over the outgoing hemisphere, or inside the
+  cone for a `Spot` — and returns the fraction whose first hit is a material satisfying
+  `isSpecularType()`. That predicate is exact rather than heuristic: `backward.h` calls
+  `neeLight()` from the `Diffuse`, `DiffuseTransmit` and `Fluorescent` cases and nowhere
+  else, so the two sets are complements by construction, and a change to either must keep
+  them so. Self-hits (`h.matId == e.matId`) yield no evidence and are excluded, so a
+  concave mesh light is not mistaken for a sealed one; `Env`/`Sun` return 0 outright.
+  `main.cpp`'s `warnSealedLights()` runs it once when `g_whitted || wPreview` — the explorer
+  is included because its `T` preview *is* mode `W` — and warns past `kSealWarnFrac` = 0.95.
+  The threshold is short of 1.0 on purpose: a real lamp assembly has hardware inside the
+  envelope (the gallery's arc probes 98.2 %, the remainder being its own socket and cord),
+  and a first pass at 0.995 missed the exact scene the check exists for. Verified across all
+  98 scenes in `scenes/`: three trip it, all the same sealed-lamp assembly, no false
+  positives. The probe is mode-agnostic; only the call site is gated, so `R`/`P` could
+  adopt it.
 
   **A fluorophore's excitation λ comes from the material's OWN distribution, not the scene's.**
   `Material::fluoInSampler` (`scene.h`) is an `EmissionSampler` over the product
@@ -1739,6 +1810,196 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
 - Rule: any hot-path optimization must be **bit-identical** (CPU sha1) or
   visually/fuzzy identical (GPU) vs. the pre-change exe before committing, one
   commit per optimization so any regression can be reverted alone.
+
+## Scene-authoring tools (`tools/`)
+
+- **`settle.py`** — rests a *single* object on a surface by lowering it vertically.
+- **`settle_scene.py`** — runs ONE pybullet sim containing many of a scene's objects
+  and rewrites the `.ftsl`, wrapping each settled block in
+  `group { translate … rotate … <original block> }`. Non-selected named objects
+  become static concave colliders, so pieces can rest on each other. Isosurfaces are
+  polygonised by shelling out to `ftrace -export-mesh` (whose OBJ groups are named
+  after the FTSL block, which is how each group is matched back to its object), so
+  the tool depends on a current `ftrace.exe` — it resolves the **repo-root** binary
+  first, then build dirs newest-first.
+
+  The delta baked into the group is `(pos − R·c, R)`: bodies spawn *at* their authored
+  COM `c`, so the sim works in `v − c` and `pos + R·(v − c) = (pos − R·c) + R·v`.
+  This matches FTSL's `group { translate t; rotate R }` = `p' = R·p + t` — verified
+  numerically against the render, not assumed.
+
+  Three mechanisms exist because a faithful free settle drops pieces onto *narrow*
+  pedestals and they roll off:
+
+  - `--tether k` — horizontal restoring spring applied **at the COM** (hence no
+    torque: free to tip onto its cap, not free to walk off it), with a deadband so a
+    piece inside tolerance settles naturally. It is a **fictitious body force that
+    does not vanish at rest**, so it is ramped to zero and the pose re-settled before
+    being read; otherwise the bake records a pose gravity alone cannot hold.
+  - `--jitter deg` / `--seed` — random spawn tilt so a symmetric body can't rest in
+    an unstable equilibrium (a ring balanced on its rim). A single draw is not enough
+    for a solid of revolution — a tilt about its own symmetry axis perturbs nothing —
+    so a perched piece is automatically re-thrown up to `SETTLE_ATTEMPTS` times,
+    re-using the built collision world rather than redoing VHACD.
+  - `--seat` — post-hoc geometric fallback: keep the settled orientation, restore the
+    authored XZ, lower straight down.
+
+  **Acceptance test — three stages, because equilibrium is not stability, and stability
+  is not correctness:**
+
+  1. *Support polygon.* The COM must project inside the convex hull of the
+     **load-bearing** contact points (`convex_hull_2d` / `support_margin`), within a
+     tolerance: smooth bodies genuinely touch at a point or along a line, so this is a
+     tolerance rather than a required inset. It catches gross failures (a piece resting
+     on the corner of its cap with the COM out over air). Failure prints `PERCHED`.
+  2. *Poke.* A wheel balanced on its rim has its COM exactly over its contact and
+     passes stage 1 perfectly. So each piece is given a small random shove + spin and
+     re-settled; a stable rest absorbs it, an unstable one topples. The pose that
+     **survives the poke** is the one baked. Failure prints `TOPPLES`.
+  3. *Intended support* (`intended_supports()`). Stages 1 and 2 are both **local** — they
+     interrogate the pose the sim produced and never look at the scene the author wrote.
+     A piece that slid off its cap, fell a metre and wedged between two pedestal shafts
+     passes both with *healthy* numbers, because down there it really is immovably at
+     rest. `heart` shipped exactly that pose, reported `OK`. So the tool now reads the
+     author's intent off the scene **before anything moves**: a piece's intended supports
+     are the other named objects whose plan (XZ) footprint overlaps its own and whose top
+     is below the piece's **mid height**, and it `FELL` unless it ends up resting on one
+     of them *and* still above that support's top. Both halves are load-bearing: the
+     wedged heart still *touched* `stand_heart` on the way down, so membership alone
+     passes it. The mid-height rule (rather than "below the piece's underside") is what
+     lets a **mount** count — a collar's top is above the piece's lowest point whenever the
+     piece hangs down inside its bore, as the retired `collar_klein` did.
+
+     Note this is deliberately *not* a displacement check. How far the COM moved is the
+     obvious metric and the wrong one: `heart` settling correctly under `--tether` moves
+     222 mm (it honestly tips from its authored tilt onto a stable lobe), while a piece
+     can slide clean off a narrow cap having moved far less. `FELL` is reported *before*
+     `PERCHED`/`TOPPLES` precisely because a fallen piece's other numbers look fine.
+
+  Contacts are read from the manifolds the last `stepSimulation()` left behind:
+  `performCollisionDetection()` rebuilds them, and `normalForce` is the solver's applied
+  impulse, so every fresh point reads zero force. The load-bearing threshold is a
+  *fraction of the body's total* normal impulse, not an absolute force — a VHACD proxy
+  spreads the weight over dozens of manifolds, so an absolute cut rejects every genuine
+  contact on a finely decomposed body. Dynamic bodies also disable sleeping, or a settled
+  body drops out of the solver and reports no contacts.
+
+  **Friction units matter.** Bullet's `rollingFriction` is a resistance *arm in metres*:
+  it caps the resistive torque at `mu_r · N`, so a body of radius R cannot tip past
+  `asin(mu_r / R)`. A plausible-looking 0.02 is 2 cm, which pins any gallery-scale piece
+  upright — it held `brass_dumbbell` balanced on its rim below 9.8°. Values are now
+  physical (`ROLLING_FRICTION = 5e-4`).
+
+  **Some shapes have no stable rest pose at all**, and no amount of simulation invents
+  one — the tool says `TOPPLES` on every retry and the *geometry* is what has to change.
+  `brass_dumbbell` was one: its ring's outer radius exceeded the balls' radius, so the
+  ring was the lowest feature, the balls could never reach the stand, and tipping ran away
+  to axle-vertical. Shrinking the ring under the ball radius lets it rest on its two
+  spheres, which is what a dumbbell at rest should look like.
+
+  The **third possibility is that the model itself is wrong for the shelf**, and that is
+  what the `klein` bottle turned out to be. The original image-to-3D bottle
+  (`klein_hunyuan.obj`) had *no* acceptable rest pose: enumerate them — the convex hull's
+  faces whose supporting plane has the COM over them *are* the poses it can rest in — and
+  of the 44 the most upright leans 73°. A mesh that is art must not be altered, so the fix
+  was a **mount that grips rather than supports**, a collar whose bore was cut to the
+  piece's own cross-section (`tools/make_klein_collar.py`, retired 2026-08-03). The real
+  fix was a better model: `meshes/klein_bottle_full.obj` is a glassblower's bottle with the
+  neck genuinely continuing *inside* the bulb and a punted foot, so it stands — foot ring
+  radius 66 mm under a COM 225 mm up, a 6.5° static tipping angle, 0.00° settled lean and
+  0.2 mm poke drift on the bare slate cap. **No mount at all is the strongest mount**, and
+  when a piece cannot stand, ask whether the geometry is the thing to replace before
+  engineering around it.
+
+  A seat ring for the new bottle was designed and rejected on measurement: the body flares
+  continuously off the foot (66 mm at the base → 83 mm 4 mm up → 112 mm at 20 mm), so a bore
+  loose enough to lower the piece into is loose enough to let it slide the same distance,
+  and `slab_sections`' 8 mm vertical quantisation turns that slope into ±13 mm of bore slop
+  in the sim regardless. A ring would have been decoration.
+
+  `heart` is the third variety: a shape that *has* stable rests, just not the tilted one it
+  is authored in. It therefore tips as it lands, and **tipping translates**. Free, it tips
+  right off the cap; tethered, it stays on the stand but the tip walks it 222 mm sideways,
+  leaving 148 mm hanging past the rim. The gallery bake uses `--tether` to keep it on the
+  pedestal *and* `--seat heart:stand_heart` to put it back over the cap centre — on a flat
+  level cap seating is a pure horizontal translation of the whole contact set, so it
+  preserves the support margin exactly rather than trading stability for looks.
+
+  Independent verification uses `-export-mesh` + per-group AABBs, which is exact and
+  involves no physics at all: every settled piece's bbox must sit on its stand's cap.
+  (This is `scraps/settled_aabb.py`, and it earned its keep: it read `heart bot 0.213`
+  against a 1.000 cap while the bake called the same pose `OK`. When two tools disagree,
+  the one that gates the output is the one to distrust.)
+
+  **Collision-geometry reduction is what makes the tool usable.** Sim cost is set almost
+  entirely by the number of *static* triangles in the contact patch under a resting piece
+  — not by the total scene triangle count (with the dynamic bodies moved away, a 3.6 M-tri
+  static set steps in 0.01 ms), and not by solver iterations. An un-reduced marching-cubes
+  pedestal cap is thousands of slivers where two triangles would do, which cost the gallery
+  bake 60 ms/step, i.e. ~40 min per run. Static colliders are therefore reduced two ways,
+  in order of fidelity:
+
+  1. **Quadric decimation** to `STATIC_TRI_CAP`, used whenever it actually reaches the cap
+     (it does for clean closed shapes: the gyroids, lamps, `chrome_ring`). This keeps the
+     concave shape, so it is always preferred.
+  2. **`slab_sections()`** for the meshes where decimation stalls — the box-union pedestals
+     bottom out at 25–47% of their input no matter how many passes or how much aggression,
+     having already lost 29% of their volume. The mesh is cut into `STATIC_SLABS` horizontal
+     slabs; each slab's true cross-section is taken at its mid-height (`section_multiplane`
+     → `Path2D.polygons_full`, which needs `shapely`/`rtree`), simplified to
+     `SECTION_SIMPLIFY` (0.5 mm — a raw marching-cubes outline carries thousands of
+     near-collinear vertices and extrudes to ~83 k tris instead of ~2.4 k), and extruded
+     back over the slab. Each prism is placed with the *section's own* `metadata['to_3D']`
+     frame — the 2D frame's axes are not (x, z), and hardcoding a rotation silently
+     transposes a stand's footprint — then dropped half a slab, because `to_3D` puts z = 0
+     at the section height, i.e. the slab's middle. Cap height and XZ extent come out exact,
+     volume to a few percent, at ~2 500 tris per stand.
+
+     Sections rather than hulls, because **convexifying a slab fills any hole in it**. That
+     is not academic: a mount with a bore is an annulus, and slab hulls plug it, so the
+     settle would run against a solid plinth and bake a pose the real scene cannot hold.
+     (Hulls also badly overstate the concave stands — `stand_gyroid` comes out at 3.73
+     against a true 1.76 volume.) `slab_hulls()` survives as the fallback for when the
+     shapely/section machinery is unavailable, and says so loudly when it is used.
+
+     `STATIC_SLABS` is derived from `STATIC_SLAB_MAX_T` (a target slab *thickness*), not
+     fixed: a slab is a stair-step, so any horizontal feature is only resolved if it is
+     thicker than one slab. A fixed 32 slabs is 32 mm on a 1 m pedestal, which quantised an
+     earlier in-pedestal collar bore into a 32 mm dimple with its floor 3 mm above the real
+     cap. Even at the current 8 mm target this is the binding constraint on any *small*
+     feature machined into a pedestal cap, and it is why the new Klein bottle gets no seat
+     ring: a bore is only faithfully simulated if it is several slabs tall, and on a body
+     that flares 1.2–5 mm of radius per mm of height, several slabs of height is centimetres
+     of bore slop. A mount that must survive this path has to be a **hand-built ≤4000-tri
+     mesh**, which is what `collar_klein` was — under `STATIC_TRI_CAP` a static collider is
+     used verbatim, so a bore cut to a quarter of a millimetre survives into the sim instead
+     of being decimated or re-sliced.
+
+  Whole-mesh hulling and VHACD were both rejected for stands: one hull is exact at the cap
+  but fills the taper between a wide base and a narrow column, inventing a shoulder a piece
+  could rest on; VHACD shifts the cap top 5 mm.
+
+  **Caching** (`scraps/.settle_cache/`, `--no-cache` to bypass) memoises the two pure,
+  expensive setup steps: the `-export-mesh` polygonisation, keyed on (scene text,
+  `--mesh-res`, ftrace mtime), and the VHACD dynamic proxies, keyed on the proxy mesh's
+  content hash. Iterating on `--tether`/`--jitter`/`--seed` then skips both. Per-phase
+  timings are printed so a slow or non-converging bake is visible rather than silent.
+
+- **`make_klein_collar.py`** — **RETIRED 2026-08-03** (deleted with `meshes/collar_klein.obj`
+  when the gallery's Klein bottle was replaced by one that stands; see the `klein` note under
+  `settle_scene` above and known-issues.md). It generated the gripping collar that held the
+  old `klein_hunyuan.obj` upright, and remains the worked example of *what to do when a piece
+  has no acceptable rest pose* — a stack of 4 mm slabs, each an outer disc with the piece's
+  *own outline at that slab's mid height* punched out of it, so the piece jams where its
+  section equals a bore and carries its weight on a full perimeter of ledge whose plan shape
+  keys it against yaw and sway as well as lean. Three invariants it taught, each learned by
+  violating it: the bore must be the outline **polygon** and not a radius per azimuth (a
+  non-star-shaped section fills its own radial concavities — 12/36 pokes held versus 36/36);
+  the bore must **never re-narrow going up**, or the mount is captive and a display mount
+  must not be; and the bore must be cut to the **VHACD proxy**, not the true mesh, because
+  that is the body the sim collides — at the cost of a visible gap in the render. The
+  general lesson outlived the tool: engineering a mount around a bad model is more expensive
+  than replacing the model.
 
 ## Build & release
 

@@ -30,6 +30,27 @@ inline bool isSpecularType(MatType t) {
            t == MatType::Multilayer || t == MatType::Filter;
 }
 
+// The authored `type` keyword for a material, for diagnostics. Mix/Layered resolve to
+// one of the others before they ever reach a BSDF switch, but can still be the type
+// recorded on a hit, so they are named too.
+inline const char* matTypeName(MatType t) {
+    switch (t) {
+        case MatType::Dielectric:      return "dielectric";
+        case MatType::Mirror:          return "mirror";
+        case MatType::HalfMirror:      return "half_mirror";
+        case MatType::Glossy:          return "glossy";
+        case MatType::Fluorescent:     return "fluorescent";
+        case MatType::ThinFilm:        return "thin_film";
+        case MatType::Grating:         return "grating";
+        case MatType::Mix:             return "mix";
+        case MatType::Multilayer:      return "multilayer";
+        case MatType::Layered:         return "layered";
+        case MatType::DiffuseTransmit: return "translucent";
+        case MatType::Filter:          return "filter";
+        case MatType::Diffuse:         default: return "diffuse";
+    }
+}
+
 struct Material {
     MatType type = MatType::Diffuse;
     // reflect means: diffuse albedo / mirror tint / glossy tint / half-mirror
@@ -1592,6 +1613,92 @@ struct Scene {
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             return blasList[inst.blasId].occludedLocal(lr, tmin, seg);  // world seg == local seg
         });
+    }
+
+    // --- deterministic sampling helpers for emitterSeal ---------------------------
+    // Van der Corput radical inverse in base `b`: a low-discrepancy 1D sequence.
+    static double vdc(int i, int b) {
+        double f = 1.0 / b, r = 0.0;
+        for (int n = i; n > 0; n /= b) { r += f * (n % b); f /= b; }
+        return r;
+    }
+    // Uniform direction in the cone of half-angle acos(cosMin) about `axis`, given a
+    // cosine already drawn in [cosMin, 1] and an azimuth uniform `u`.
+    static Vec3 coneDir(const Vec3& axis, double cz, double u) {
+        const double sz = std::sqrt(std::max(0.0, 1.0 - cz * cz)), phi = 2.0 * PI * u;
+        Vec3 t, b; onb(axis, t, b);
+        return t * (sz * std::cos(phi)) + b * (sz * std::sin(phi)) + axis * cz;
+    }
+    // Uniform over the hemisphere about `n` (cz uniform in [0,1] is the solid-angle
+    // -uniform draw; we want directions, not a cosine-weighted estimator).
+    static Vec3 hemiDir(const Vec3& n, double u1, double u2) { return coneDir(n, u1, u2); }
+
+    // What a light-seal probe found (see emitterSeal below).
+    struct EmitterSeal {
+        double sealed = 0.0;   // fraction of probed directions blocked by a specular surface
+        int    probes = 0;     // directions that produced evidence (self-hits excluded)
+        int    blockMat = -1;  // the material that blocked the most of them, or -1
+    };
+
+    // Diagnostic: is this emitter SEALED inside specular geometry?
+    //
+    // Next-event estimation is the only way a surface is lit in the Whitted preview
+    // (mode W), and NEE is performed at exactly the material types for which
+    // isSpecularType() is false — backward.h calls neeLight() from the Diffuse,
+    // DiffuseTransmit and Fluorescent cases and nowhere else. A shadow ray is
+    // furthermore blocked by ANY geometry, dielectrics very much included (see
+    // occluded() above — "can't connect through specular", the SDS limitation).
+    //
+    // So when every direction leaving a light lands immediately on a specular surface
+    // — an arc lamp sealed in its quartz envelope, a filament inside a mirrored
+    // reflector — there is no vertex anywhere in the scene that this light can reach by
+    // NEE, and mode W renders the whole thing pure black. Nothing is physically wrong
+    // with the scene: it simply needs a transport that can refract *out* of the
+    // enclosure (modes D/B/M), which is why such scenes select those modes.
+    //
+    // Deterministic (a stratified/van-der-Corput lattice, no rng), so the answer is
+    // reproducible run to run. Hits on the emitter's own surface yield no evidence and
+    // are excluded — a concave mesh light seeing itself still lights a room perfectly
+    // well. Env/Sun emitters have no enclosure to speak of and report 0.
+    EmitterSeal emitterSeal(const Emitter& e, int nSamples = 256) const {
+        EmitterSeal out;
+        if (e.shape == EmitterShape::Env || e.shape == EmitterShape::Sun) return out;
+        std::vector<int> blockCount(mats.size(), 0);
+        int blocked = 0;
+        for (int i = 0; i < nSamples; ++i) {
+            const double s1 = (i + 0.5) / nSamples;      // stratified along the surface
+            const double s2 = vdc(i, 2), s3 = vdc(i, 3), s4 = vdc(i, 5);
+            Vec3 y, nOut;
+            if (e.shape == EmitterShape::Spot) { y = e.origin; nOut = e.beamDir; }
+            else                                 e.samplePoint(s1, s2, y, nOut);
+            Vec3 d;
+            if (e.collimated) d = e.beamDir;
+            else if (e.shape == EmitterShape::Spot) {
+                // Uniform inside the spot's outer cone — outside it the light emits
+                // nothing, so a blocker there is no evidence of a seal.
+                const double cz = 1.0 - s3 * (1.0 - e.spotCosOuter);
+                d = coneDir(nOut, cz, s4);
+            } else d = hemiDir(nOut, s3, s4);            // uniform over the outgoing hemisphere
+            const Hit h = closestHit(Ray{y + nOut * 1e-5, d});
+            if (!h.valid) { ++out.probes; continue; }    // escapes into open space
+            if (e.matId >= 0 && h.matId == e.matId) continue;   // the light's own surface
+            ++out.probes;
+            if (h.matId >= 0 && h.matId < (int)mats.size() &&
+                isSpecularType(mats[h.matId].type)) { ++blocked; ++blockCount[h.matId]; }
+        }
+        if (out.probes > 0) out.sealed = (double)blocked / out.probes;
+        int best = 0;
+        for (size_t m = 0; m < blockCount.size(); ++m)
+            if (blockCount[m] > best) { best = blockCount[m]; out.blockMat = (int)m; }
+        return out;
+    }
+
+    // The authored name of the mesh object carrying material `matId`, or nullptr. Only
+    // meshes record a name (MeshGroup), which is enough for the seal diagnostic: an
+    // enclosure is a shell, and shells are modelled as meshes.
+    const char* meshNameForMat(int matId) const {
+        for (const auto& g : meshGroups) if (g.matId == matId) return g.name.c_str();
+        return nullptr;
     }
 
     // Linear-scan reference (pre-BVH), kept for the -checkbvh self-test.

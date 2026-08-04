@@ -506,6 +506,13 @@ struct DImplicit {
     double sphereCenter[3];  // world center for Container::Sphere
     double sphereRadius;     // world radius for Container::Sphere
     int    capped;           // 1 = draw container caps (closed); 0 = `open`
+    // Oriented container box — device twin of Implicit::boxOriented/boxInv/boxLo/boxHi.
+    // When set, the ray is mapped by boxInv and slab-tested against boxLo/boxHi there
+    // instead of against the world AABB, which for a rotated box is strictly larger
+    // than the authored container and outside the reach of its `max_gradient` bound.
+    int    boxOriented;      // 1 = clip in the box's own frame
+    double boxInvM[9], boxInvT[3];   // world -> container-local
+    double boxLo[3], boxHi[3];       // authored box in that frame
 };
 
 // Procedural pattern (math-driven scalar field, §4) — device twin of pattern.h.
@@ -2141,6 +2148,47 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             double le = sqrt(gex*gex + gey*gey + gez*gez), lx = sqrt(gxx*gxx + gxy*gxy + gxz*gxz);
             if (le > 0.0) { neX = gex/le; neY = gey/le; neZ = gez/le; } else neZ = 1.0;
             if (lx > 0.0) { nxX = gxx/lx; nxY = gxy/lx; nxZ = gxz/lx; } else nxZ = 1.0;
+        }
+    } else if (im.boxOriented != 0) {
+        // Slab test in the container's own frame (host twin: the boxOriented branch of
+        // intersectImplicit). An affine map preserves the ray parameter, so these t
+        // values stay comparable with tmin/hit.t; only the face normals must be pushed
+        // back to world, by boxInv's linear part TRANSPOSED (the local->world normal
+        // map). Split from the AABB test below for the same reason as on the host: the
+        // unrotated path then runs exactly the code it always did, with no ray transform.
+        const double* M = im.boxInvM; const double* T = im.boxInvT;
+        double bx = M[0]*ox + M[1]*oy + M[2]*oz + T[0];
+        double by = M[3]*ox + M[4]*oy + M[5]*oz + T[1];
+        double bz = M[6]*ox + M[7]*oy + M[8]*oz + T[2];
+        double bdx = M[0]*dx + M[1]*dy + M[2]*dz;
+        double bdy = M[3]*dx + M[4]*dy + M[5]*dz;
+        double bdz = M[6]*dx + M[7]*dy + M[8]*dz;
+        tEnter = -1e300; tExit = 1e300;
+        int eAx = 0; double eSgn = -1.0;
+        int xAx = 0; double xSgn = 1.0;
+        double o3[3] = {bx, by, bz}, id3[3] = {1.0/bdx, 1.0/bdy, 1.0/bdz};
+        for (int a = 0; a < 3; ++a) {
+            double tLo = (im.boxLo[a] - o3[a]) * id3[a];
+            double tHi = (im.boxHi[a] - o3[a]) * id3[a];
+            double tnear, tfar, nearSgn, farSgn;
+            if (id3[a] >= 0.0) { tnear = tLo; tfar = tHi; nearSgn = -1.0; farSgn = +1.0; }
+            else               { tnear = tHi; tfar = tLo; nearSgn = +1.0; farSgn = -1.0; }
+            if (tnear > tEnter) { tEnter = tnear; eAx = a; eSgn = nearSgn; }
+            if (tfar  < tExit)  { tExit  = tfar;  xAx = a; xSgn = farSgn; }
+            if (tExit < tEnter) return false;
+        }
+        if (!anyHit) {
+            double ne[3] = {0, 0, 0}, nx[3] = {0, 0, 0};
+            ne[eAx] = eSgn; nx[xAx] = xSgn;
+            double ex = M[0]*ne[0] + M[3]*ne[1] + M[6]*ne[2];
+            double ey = M[1]*ne[0] + M[4]*ne[1] + M[7]*ne[2];
+            double ez = M[2]*ne[0] + M[5]*ne[1] + M[8]*ne[2];
+            double xx = M[0]*nx[0] + M[3]*nx[1] + M[6]*nx[2];
+            double xy = M[1]*nx[0] + M[4]*nx[1] + M[7]*nx[2];
+            double xz = M[2]*nx[0] + M[5]*nx[1] + M[8]*nx[2];
+            double le = sqrt(ex*ex + ey*ey + ez*ez), lx = sqrt(xx*xx + xy*xy + xz*xz);
+            if (le > 0.0) { neX = ex/le; neY = ey/le; neZ = ez/le; }
+            if (lx > 0.0) { nxX = xx/lx; nxY = xy/lx; nxZ = xz/lx; }
         }
     } else {
         double idx = 1.0/dx, idy = 1.0/dy, idz = 1.0/dz;
@@ -10636,6 +10684,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.sphereCenter[2] = im.sphereCenter.z;
         d.sphereRadius = im.sphereRadius;
         d.capped = im.capped ? 1 : 0;
+        d.boxOriented = im.boxOriented ? 1 : 0;
+        for (int k = 0; k < 9; ++k) d.boxInvM[k] = im.boxInv.m[k];
+        d.boxInvT[0] = im.boxInv.t.x; d.boxInvT[1] = im.boxInv.t.y; d.boxInvT[2] = im.boxInv.t.z;
+        d.boxLo[0] = im.boxLo.x; d.boxLo[1] = im.boxLo.y; d.boxLo[2] = im.boxLo.z;
+        d.boxHi[0] = im.boxHi.x; d.boxHi[1] = im.boxHi.y; d.boxHi[2] = im.boxHi.z;
         // Rebase this implicit's field program (and its private expr pool) into the
         // shared device pools; sets d.nodeOff/d.nodeN.
         appendFieldProgram(im.nodes, im.exprNodes, d.nodeOff, d.nodeN);

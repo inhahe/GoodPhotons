@@ -5,6 +5,333 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### DONE (2026-08-03): the gallery Klein bottle is now a glassblower's bottle WITH THE INTERNALS, and it needs no mount
+
+`scenes/gallery.ftsl`'s `klein` was `meshes/klein_hunyuan.obj`, an image-to-3D reconstruction: the
+right silhouette, but a closed shell in which the neck's passage through the wall was only *implied*.
+In a dielectric scene that is the whole point of the object, so it has been replaced by
+`meshes/klein_bottle_full.obj` (from `d:\youtube\philosophy\3d objects\full_package_klein_bottle\`),
+where the neck genuinely pierces the bulb and continues **down inside it** — a horizontal cut low in
+the body shows four loops (the outer wall's two surfaces plus the descending inner tube), three at the
+pass-through, and the tube alone above the shoulder.
+
+The mesh checks out as a dielectric: 12262 v / 12264 quads, every directed edge used exactly once, so
+closed, consistently wound and orientable; Euler characteristic **−2** (genus 2), which is what an
+immersed Klein bottle in R³ must be; signed volume **+150.356** against **2520.73** of area, i.e. a
+wall `2V/A = 0.119` raw units thick — **2.4 mm** at the shipped scale, real blown glass rather than a
+slab. (`trimesh.load` reports it non-watertight with χ = 2 until `merge_vertices(merge_tex=True,
+merge_norm=True)`; that is v/vt/vn vertex splitting, not a defect, and ftrace is unaffected because
+`src/mesh.h` fan-triangulates off the raw `v` array.)
+
+**The mount is gone.** `meshes/collar_klein.obj` and `tools/make_klein_collar.py` existed for exactly
+one reason — the old bottle had *no* near-upright equilibrium (44 resting orientations, the most
+upright leaning 73°), so only a gripping collar could hold it. The new one is a bottle with a punted
+foot and simply stands: foot ring radius **66.2 mm**, COM **224.5 mm** above the foot, static tipping
+angle **6.46°**. On the bare slate cap at settle_scene's own 5e-4 rolling/spinning friction, with its
+own 0.03 m/s + 0.30 rad/s kick from 12 directions at 3 spawn tilts (`scraps/newklein_stand.py`): rest
+drift **2.0 mm**, lean **0.00°**, and **36/36** pokes inside settle_scene's 10 mm POKE_TOL. The bake
+itself reports `OK klein: margin +5.0 mm, contacts 4, on stand_klein, poke 0.2 mm`.
+
+**A seat ring was designed and rejected on measurement**, and the reasoning is worth keeping. Take
+true horizontal cross-sections of the placed piece (vertex binning is useless — the shell is hollow,
+so a height band holds rings from both walls and the "max radius" alternates): the body flares
+*continuously* off the foot, 66.2 mm at the base → 78.3 mm at 2.3 mm → 82.6 mm at 4 mm → 92.6 mm at
+8 mm → 112.4 mm at 20 mm. So a bore has to clear the running maximum up to the ring's top, which means
+the radial play it leaves at the base is exactly the flare over the ring's height — a bore loose enough
+to lower the piece into is loose enough to let it slide the same distance. On top of that
+`slab_sections()` quantises a static collider vertically at `STATIC_SLAB_MAX_T = 8 mm`, and 8 mm of
+height on a 1.2–5 mm/mm flank is 1–4 cm of bore slop in the sim regardless of what is authored — the
+same quantisation that once left an in-pedestal collar bore as a dimple with its floor 3 mm above the
+real cap. A ring would have been decoration that made the sim worse.
+
+Placement: raw mesh is Y-up with its **foot ring centred on the origin** and its base plane at
+y = 0.025, extents 22.700 × 30.000 × 15.000, so `scale 0.02` → 0.454 × 0.600 × 0.300 — the same 0.60 m
+height as the piece it replaces. The foot goes on the pedestal axis (5.9, 2.6) rather than the volume
+centroid (which sits 41 mm toward +x), because the foot is what the eye reads as centred on the column.
+`rotate 0 -12 0` turns the handle into profile for the hero camera, which sees this pedestal along
+(−0.207, 0, 0.978). The bake now also seats it: `--seat heart:stand_heart,klein:stand_klein`, so the
+base lands exactly `--seat-gap` (1 mm) over the cap instead of wherever the VHACD proxy's error left it.
+
+### BUG — DONE (2026-08-03): an `expr` isosurface inside a rotated `group` was INVISIBLE to every ray-traced mode
+
+Presented as "the morpho heart renders black in `png/heart_check.png`". It was not a material
+problem at all — the heart was not being *hit*. (`-checkmultilayer` passes, and an Abeles
+computation put `morpho`'s luminous normal-incidence reflectance at **0.5473** vs `oil-slick`'s
+**0.3728**, i.e. it reflects *more* than a jack that renders vividly. Swapping in a plain diffuse
+material left it equally invisible, which killed the material hypothesis outright.)
+
+**Root cause.** A `function { expr ... }` field is not a distance function, so `intersectImplicit`
+clips the ray to the authored `contained_by` box and sizes each step as `|f| / max_gradient` — a
+bound the author only guarantees **inside that box**. `ftsl.h`'s `addIsosurface` stored only the
+world AABB of the 8 transformed corners, and clipped to that. Under a rotation the AABB is
+strictly larger than the box, and the field out there is far steeper. Measured for the gallery
+heart (`scraps/heart_lipschitz.py`):
+
+| region | max &#124;f&#124; | max &#124;grad f&#124; |
+|---|---|---|
+| authored `contained_by` box | 1688 | 18858 |
+| AABB of that box after the settle rotation | 37738 | 245658 |
+
+— **4.36× the volume**. The first step is then `37738 / 60 ≈ 629 m` across a 0.6 m object: the
+sphere-trace leaps clean over it and reports a miss. Triggered the moment
+`tools/settle_scene.py` baked a `group { rotate 50.6839 9.91871 -34.6649 }` rest pose onto the
+piece — which is why `gallery.ftsl` showed the heart and `gallery_settled.ftsl` did not, with a
+byte-identical heart block in both.
+
+**Diagnostic signature worth remembering: the rasterizer showed it and every ray-traced mode did
+not.** `isomesh.h` marching cubes samples a lattice and never sphere-traces, so it cannot
+overshoot — that asymmetry localises a fault to the marcher immediately. (`-raster -raster-iso 96`
+is a ~0.1 s geometry check; `-mode W -ambient 0.15` a ~10 s deterministic, noise-free ray-traced
+A/B.)
+
+**Fix (0.121.1).** `Implicit` now stores the container in its own frame (`boxOriented`, `boxInv` =
+world→container-local, `boxLo`/`boxHi`) and both the CPU (`implicit.h`) and CUDA
+(`render_cuda.cu`) intersectors run the slab test there; `Affine::applyDirTranspose` maps the two
+face normals back to world. `estimateFieldLipschitz` likewise surveys the oriented box rather than
+its inflated AABB, so a rotated piece doesn't get a needlessly large `L` that would slow every
+march. `boxOriented` is set only when the local→world map is not axis-preserving, so unrotated
+scenes take exactly the code they always did — verified by rendering `gallery.ftsl` (no oriented
+container anywhere) with the pre- and post-fix binaries: **0 differing pixels, max channel delta
+0**. No scene change was needed; `max_gradient 60` stays as authored, and bumping it would only
+have papered over a general engine bug affecting every rotated expression isosurface.
+
+**Regression test.** `-checkcontainer` (`checkContainer` in `main.cpp`) builds one sextic solid
+twice — axis-aligned and rigidly rotated — under a shared `max_gradient`, and fires
+correspondingly rotated rays. A rigid motion cannot change a hit distance, so any disagreement is
+the clip region leaking outside the container. Confirmed to actually guard the bug: with the
+oriented branch disabled it reports **76 vanished-when-rotated → FAIL**.
+
+### TECH DEBT: `isomesh.h` caps a *rotated* container against its world AABB, not its true faces
+
+`boxSDF` / `capBox` in `src/isomesh.h` still use `im.bounds` (the world AABB) for
+`Container::Box`, so a rotated `capped` isosurface is sealed along AABB planes rather than the
+authored box's real faces — the cap sits outside the intended surface on the rotated faces. Not
+the overshoot bug above (marching cubes never sphere-traces, so it can't miss the object), and
+currently invisible: it only matters for a surface that actually *reaches* its container, which
+the gallery heart does not, and it only affects `-export-mesh` and `-raster`.
+
+**Proper fix:** give the mesher the same treatment as `intersectImplicit` — when
+`im.boxOriented`, transform the sample point by `im.boxInv` and evaluate the box SDF against
+`im.boxLo`/`im.boxHi` (the local extents), scaling the result by the map's uniform scale so the
+`max(f, contSDF)` blend stays in the same units as the field.
+
+### BUG — DONE (2026-08-03): `settle_scene.py` reported a piece lying on the FLOOR as `OK` — both its acceptance tests are local
+
+`heart` baked into `gallery_settled.ftsl` with `translate 1.19 -2.81 0.45 rotate -177.6 -45.3 56.1`
+— a delta that puts its COM at y ≈ 0.35 when it was authored at y = 1.255, i.e. it had slid off
+`stand_heart`'s cap, fallen ~0.9 m, and come to rest **wedged between the `stand_heart` and
+`stand_dumbbell` shafts**. The bake reported:
+
+```
+  OK      heart:  margin  +10.2 mm  contacts   2  on stand_dumbbell, stand_heart  (poke  6.0 mm)
+```
+
+which reads like a success. `scraps/settled_aabb.py` independently said `heart cap top 1.000,
+bot 0.213, gap -0.786` — the two tools flatly contradicted each other, and the wrong one is the
+one that gates the bake.
+
+**Root cause — not a physics bug, a *missing question*.** Both acceptance tests were LOCAL:
+
+| test | asks | why it passed a piece on the floor |
+|---|---|---|
+| support margin | is the COM inside the hull of its load-bearing contacts? | it is — the wedge is a perfectly good support polygon |
+| poke | does the rest survive a shove + spin? | it does — wedged between two granite shafts is *more* stable than the cap |
+
+Neither test can see the authored scene, and to pybullet "wedged on the floor" and "sitting on
+its pedestal" are both just *rest*. The verdict even *listed* `stand_heart` in `resting_on`,
+because the heart grazed that shaft on the way down — so a naive "is it touching its stand?"
+check would also have passed it.
+
+**Fix.** A third acceptance test, computed against the AUTHORED pose before anything moves
+(`intended_supports()` in `tools/settle_scene.py`): each settled piece's *intended* supports are
+the other named objects whose plan (XZ) footprint overlaps its own and whose top is below the
+piece's **mid height**. A piece then FELLs unless it is (a) resting on at least one of them
+**and** (b) still above that support's top. Both halves are needed — (a) alone passes the
+wedge (it touches `stand_heart`), (b) alone would be fooled by a piece that slid onto a
+*neighbouring* cap at the same height.
+
+The mid-height rule (rather than "the support's top is below the piece's underside") is what
+lets a **mount** count: the retired `collar_klein`'s top was *above* the Klein bottle's lowest
+point, because the bottle hung down inside its bore — yet it was the thing holding it up.
+
+Two traps found while fixing it:
+
+1. **Displacement is the wrong metric, even though it looks like the obvious one.** The first
+   attempt gated on "did the COM move more than 60 mm from where it was authored". It is wrong
+   in both directions: `heart` settling *correctly* under `--tether` moves its COM **222 mm**
+   (it honestly tips from its authored tilt onto a stable lobe), while a piece can slide clean
+   off a narrow cap having moved far less. What matters is *what it ends up on*, not how far it
+   went.
+2. **The verdict order matters.** `FELL` must be reported before `PERCHED`/`TOPPLES`, because a
+   piece on the floor has *healthy* margin and poke numbers — that is the whole point of the bug.
+
+Also fixed in the same change: the canonical bake command in `scenes/gallery.ftsl`'s header now
+carries `--tether --seat heart:stand_heart` (it had neither), with a comment saying what breaks
+without each. The bake is now `OK` for all five pieces on the first attempt.
+
+### TECH DEBT (2026-08-03): `settle.drop()` falls back to the surface's TOP PLANE when the footprint "misses" the mesh
+
+Seating the heart prints `[settle] warning: object footprint misses the surface mesh; resting on
+the surface top plane instead.` even though the rotated heart's footprint is comfortably inside
+`stand_heart`'s 0.50 m cap — so the raycast test in `tools/settle.py`'s `drop()` is rejecting a
+footprint it should hit. The fallback happens to give the exactly right answer here (the cap top
+*is* a flat plane at y = 1.000, and the seated heart lands 1.3 mm above it, fully 24 mm inside
+every cap edge), which is why it has gone unnoticed. It would be silently wrong on a stand with
+a domed, stepped or sloped top. Proper fix: find out why the down-rays miss — likely the
+footprint sample points or the ray origin height — rather than leaning on the plane fallback.
+
+### BUG — DONE (2026-08-03, v0.121.0): the exported Klein-bottle OBJs are a solid ball — the container sphere got welded on as a cap
+
+`meshes/klein_a120_b060_c30_d127.obj` and `..._lite.obj` (the mesh `gallery.ftsl` /
+`gallery_settled.ftsl` load as the object named `klein`) render as a **featureless sphere**.
+Measured: both files are a closed shell at `r = 10` — 64.9 % of the full file's 1 096 216 verts and
+65 % of the lite file's faces lie at `r > 9.3`, and the bbox is exactly ±10 on every axis. Strip
+those faces (`scraps/klein_core.obj`) and a real Klein bottle is inside; see `png/klein_look.png`
+(shipped mesh left = sphere, core-only right = the bottle).
+
+**Root cause.** The export scene `scraps/klein/mesh_export.ftsl` is missing the `open` keyword —
+it is the *only* scene in `scraps/klein/` that lacks it (compare `mesh_hi.ftsl` / `mesh_open.ftsl`,
+which are otherwise identical in the isosurface block). The Klein field is authored **negated**
+(`clamp(-(...), -10, 10)`, matching POV's sign), so `f < 0` — "solid" — is the region *outside* the
+bottle. With `capped = true` (`isomesh.h`, `const bool doCap = im.capped;`) the marcher therefore
+seals the entire `contained_by` sphere as a cap, and the exported solid is *the ball with a
+Klein-bottle-shaped void hollowed out of it*. Reproduced at res 96: capped → 402 140 tris, bbox
+±1.786 (= the container); `open` → 142 952 tris, bbox x ±1.298, y 0.263..2.300, z ±1.465 (= the
+bottle), and it renders as a Klein bottle (`png/klein_open_view.png`).
+
+**Fixed (v0.121.0).** Three parts:
+
+1. `scraps/klein/mesh_export.ftsl` gained the missing `open`, with a comment saying why it is
+   load-bearing.
+2. **A permanent guard in `-export-mesh`.** `isomesh::capFraction()` (`src/isomesh.h`) classifies
+   each output triangle by whether the container SDF or the field won the `max()` at its centroid,
+   and `main.cpp` warns when the cap is more than half the output. Verified both ways: the capped
+   Klein export reports `WARNING: 66% of these triangles are CONTAINER CAP` (matching the measured
+   65 % shell), while the `open` export and all 17 gallery isosurfaces — several of which are
+   legitimately capped — stay silent.
+3. **The scene no longer uses the procedural export at all.** The user wanted their own
+   AI-photogrammetry bottle, which was still on disk at `scraps/klein_hunyuan_clean.glb`
+   (Hunyuan3D). Converted to `meshes/klein_hunyuan.obj` (317 140 v / 634 280 f, watertight,
+   consistent winding, volume 0.870) so it can legitimately be a dielectric, and wired into
+   `gallery.ftsl` at `scale 0.30` → 0.375 × 0.598 × 0.314, which fits `stand_klein`'s 0.52 cap.
+   The stale `meshes/klein_a120_*.obj` files are no longer referenced by any scene.
+
+The mislabelled "GYROID SPHERE in glass … triply-periodic minimal surface trimmed to a ball"
+comment above the block (written when the ball silhouette was mistaken for an intentional trimmed
+gyroid) is also gone.
+
+### BUG — DONE (2026-08-03, v0.121.0): `settle_scene.py --tether` bakes poses that overhang the pedestal — the acceptance check only tests COM height
+
+Two of the settled pieces in `scenes/gallery_settled.ftsl` are visibly off their stands. Measured
+by exporting every isosurface to world-space OBJ groups (`ftrace -in scenes/gallery_settled.ftsl
+-export-mesh scraps/gal_dump.obj -mesh-res 48`) and taking per-group AABBs:
+
+| piece | settled COM (x,z) | its cap (x,z) extent | lateral drift | verdict |
+|---|---|---|---|---|
+| `oiljack` | 5.58, 1.87 | 5.07..5.53, 1.27..1.73 | **0.46 m** (cap half-width 0.23) | hangs off the cap's corner, bbox y 0.67..1.14 vs cap top 0.92 |
+| `heart` | 4.83, 2.29 | 4.35..4.85, 1.65..2.15 | **0.45 m** (cap half-width 0.25) | overhangs toward `stand_dumbbell`, bbox y 0.98..1.31 |
+| `brass_cluster` | 5.90, 2.01 | 5.73..6.27, 1.73..2.27 | 0.10 m | fine |
+| `brass_dumbbell` | 4.55, 2.78 | 4.25..4.75, 2.45..2.95 | 0.05 m | on the cap, but see the next issue |
+
+**Not** a transform-order bug: `R·c + t` reproduces every measured position to < 0.07 m (bbox-centre
+vs COM residual), while `R·(c + t)` is off by 1–4 m — so FTSL's `group { translate; rotate }` and the
+bake agree, and the renderer puts each piece exactly where the bake said.
+
+**Root cause.** `--tether` (added in 45fad2d) applies a horizontal restoring spring at the COM every
+step. Being a fictitious body force it does not vanish at rest, so the solver can converge on a pose
+that gravity alone would not support — a piece resting on the *corner* of its cap with its COM out
+over empty air. The 2026-07-19 acceptance check (`scraps/check_settle_heights.py`) then passed it,
+because it only asks whether the settled COM *height* is within 0.45 m of the stand top; a piece that
+drifted 0.46 m sideways but stayed at the right altitude reads as "on stand". That is why the fix
+was logged as successful while the render shows two pieces hanging in the air.
+
+**…but the tether was only hiding a deeper AUTHORING bug.** Releasing the spring made every piece
+fall off, which is the correct physics: the hero CSG bodies are authored in the **unit cube**, so
+their world centre is `translate + 0.5·scale`, *not* `translate`. `brass_cluster` does that
+arithmetic (`5.6 + 0.4 = 6.0` = its cap centre); `oiljack` and `heart` do not — written as
+`translate 5.3 … 1.5` (stand_oil's cap centre) the jack actually sat at (5.61, 1.81), hanging
+0.31 m off the +x+z corner of its own pedestal. Measured authored-vs-stand centres before the fix:
+
+| piece | authored world centre | its stand's cap centre | error |
+|---|---|---|---|
+| `oiljack` | 5.610, 1.810 | 5.3, 1.5 | **+0.31, +0.31** |
+| `heart` | 4.766, 2.203 | 4.6, 1.9 | **+0.17, +0.30** |
+| `brass_dumbbell` | 4.550, 2.750 | 4.5, 2.7 | +0.05, +0.05 |
+| `brass_cluster` | 5.973, 1.953 | 6.0, 2.0 | −0.03, −0.05 (correct) |
+
+**Fixed (v0.121.0).** In `scenes/gallery.ftsl`, all four pieces were re-centred on their caps and
+dropped to 0.03 m above the cap top (verified by AABB dump: every centre now matches its stand's to
+≤ 1 mm). In `tools/settle_scene.py`: the tether is ramped to zero and the pose re-settled before it
+is read (`RELAX_RAMP_STEPS`), the acceptance test is now the real one — the COM must project inside
+the convex hull of the **load-bearing** contact points (`convex_hull_2d` / `support_margin`) — and
+the tool prints a per-piece stability table plus how far each piece moved when the spring was let go.
+
+**Two further bugs found while validating that check**, both of which made it lie:
+
+* `run()` exited early on its "everything has been still for 0.5 s" test — which is true the
+  instant the release phase *begins*, since the pieces have just settled. So the ramp stopped at
+  ~75 % stiffness and the "gravity-only" pose was still tethered. Fixed with a `min_steps` floor.
+* Reading contacts after `p.performCollisionDetection()` returns **zero normal force on every
+  point**: that call rebuilds the manifolds, and a freshly created contact point has no applied
+  impulse yet (`normalForce` is the solver's impulse, not a geometric quantity). Pieces genuinely
+  resting on their stands reported `contacts 0 … resting on nothing`. Fixed by reading the
+  manifolds the last `stepSimulation()` left behind, and by disabling sleep on the dynamic bodies
+  (`ACTIVATION_STATE_DISABLE_SLEEPING`) so a settled body stays in the solver.
+* The load-bearing cut was an **absolute** force (`1e-3 N`). A unit-mass body at 240 Hz carries only
+  `m·g·Δt = 0.041 N·s` of normal impulse in total, and a VHACD proxy resting on a concave trimesh
+  splits that across one manifold per convex-child/triangle pair — so each point's share falls below
+  the cut as the proxy gets *finer*, and `oiljack` again reported "contacts 0" while sitting
+  squarely on its stand. The cut is now a fraction of the body's own total impulse
+  (`CONTACT_FORCE_FRAC = 0.01`), which is scale-free.
+
+**And a third, unrelated to physics:** `find_ftrace()` probed `build_cuda/bin/ftrace.exe` first, but
+`build.bat` builds into `build_cuda2/` and installs to the repo root — so every settle bake had been
+polygonising the scene with a **17-July binary**. It now prefers the repo-root exe and falls back to
+build dirs newest-first.
+
+### BUG — DONE (2026-08-03, v0.121.0): `brass_dumbbell` settles balanced on its ring — an unperturbed knife-edge equilibrium
+
+`brass_dumbbell` is a wheel: `torus { rotate 0 0 90 major 0.15 minor 0.045 }` (axis along X, so the
+ring lies in the YZ plane) with a sphere on each end of an X-axis bar. Scaled by 0.78 the ring's outer
+radius is 0.152 and the spheres' is 0.117, so **only the ring rim can touch the cap** — the balls
+never reach it. Its baked pose is `rotate 11.0397 0.346691 -0.760179`, i.e. essentially untilted, and
+its world bbox is y 0.88..1.18 with the cap top at exactly 0.88: it is standing on the rim like a
+bicycle wheel, which is what the user reported ("balancing evenly on the ring"). A rigid-body solver
+started from a perfectly symmetric pose with no lateral perturbation has nothing to break the
+symmetry, so it never topples.
+
+**Fixed (v0.121.0)** — and it took four separate fixes, because each one exposed the next.
+
+1. **Spawn jitter.** `--jitter` (default 2°) tilts each piece about a random horizontal axis at
+   spawn, lifted by the sagitta that tilt sweeps (`rmax·(1 − cos θ)`) so it doesn't drive a corner
+   into the stand.
+2. **Automatic retry.** Jitter alone is not enough and the first re-bake proved it: this body is (to
+   within the small bored-out bite) a *solid of revolution about X*, so a draw near the X axis maps
+   the body onto itself and perturbs nothing. The measured delta came back `rotate 8.59 −0.81 0.42`
+   — a rotation about X, i.e. the piece spun about its own symmetry axis and stayed on the rim. Any
+   piece still unstable is now re-thrown with a fresh draw up to `SETTLE_ATTEMPTS` (4) times,
+   re-using the built collision world so VHACD isn't repeated.
+3. **`rollingFriction` was holding it up.** Bullet's `rollingFriction` is a resistance **arm in
+   metres** — it caps the resistive torque at `mu_r · N`, so a body of radius R cannot tip past
+   `asin(mu_r / R)`. The bodies were created with `rollingFriction = 0.02`, i.e. **2 cm**, on a wheel
+   of world radius 0.117: tipping was capped at 9.8°, and the second re-bake's baked tilt was 5.05°
+   — sitting right under the cap. So the "ring balance" was being maintained by a fictitious torque.
+   Real metal-on-stone rolling resistance is a fraction of a millimetre; now `5e-4`.
+4. **The support-polygon test can't see this failure**, because a wheel on its rim has its COM
+   *exactly* over its contact point — it is in perfect equilibrium, just an unstable one. Added a
+   **poke phase**: after the free settle each piece gets a small random shove + spin and is
+   re-settled; a stable rest absorbs it, an unstable one topples. The pose that survives the poke is
+   the one baked, and the report distinguishes `PERCHED` (overhanging) from `TOPPLES` (balancing).
+
+**And the shape itself had to change.** With the sim finally honest, the piece has *no stable rest
+pose at all*: ring outer radius `0.195·0.78 = 0.152` vs ball radius `0.150·0.78 = 0.117`, so the ring
+hangs 35 mm below the balls and they can never reach the stand. Tipping about Z brings a ball down at
+14.1°, but at that tilt **both** contacts (rim at +0.037, ball at +0.121) are on the same side of the
+COM, so it keeps going — all the way to axle-vertical, balanced on one ball. No simulation can invent
+a rest pose that doesn't exist. `gallery.ftsl`'s torus is now `major 0.105 minor 0.038` (outer 0.143 <
+0.150), so the balls are the lowest feature and the piece rests on its two spheres like a dumbbell
+should.
+
 ### LIMITATION (2026-08-02): emissive geometry with no registered emitter is invisible to NEE, so it lights nothing
 
 A material's `emit` makes *any* surface glow — including a marched isosurface or a CSG / quadric
@@ -2758,15 +3085,128 @@ fix:** reconcile the two — back-port the camera/frames/default_mode authoring 
 settled file is fully regeneratable from source, then regenerate with `--tether`. Blocked on confirming
 authoring intent (is `frames 600` or `144` canonical? is the prefer/else wrapper wanted in source?).
 
-### TECH DEBT (2026-07-19): settle sim slow — non-manifold stand colliders won't decimate below ~150–390k tris
+### TECH DEBT — DONE (2026-08-03, v0.121.0): settle sim slow — stand colliders won't decimate below ~50–115k tris
 `tools/settle_scene.py` decimates static concave colliders to `STATIC_TRI_CAP` (4000) via
-`trimesh.simplify_quadric_decimation`, but the marching-cubes museum-stand meshes are multi-shell /
-non-manifold (unions of boxes), so quadric edge-collapse gives up early and only reduces them ~65%
-(e.g. stand meshes 500k–1M → 150k–390k tris), keeping per-step collision cost high. Clean closed meshes
-(gyroid, lamp) hit 4000 fine. Worked around by validating at `--mesh-res 64`. **Proper fix candidates:**
-(a) VHACD-decompose the static stands into convex compounds too (fast convex-vs-convex collision), or
-(b) vertex-clustering / voxel-remesh decimation that ignores topology, or (c) approximate each stand
-with authored box/cylinder primitive colliders instead of the polygonised isosurface.
+`trimesh.simplify_quadric_decimation`, but the marching-cubes museum-stand meshes bottom out far above
+the cap, keeping per-step collision cost high. Clean closed meshes (gyroid, lamp, chrome_ring) hit 4000
+fine. Worked around by validating at `--mesh-res 64`.
+
+**Measured (2026-08-03).** A full gallery bake took **40+ minutes**; the sim ran at **60 ms/step** for
+five dynamic bodies.
+
+Three of the original hypotheses were wrong and are recorded so they aren't re-tried:
+
+* *"The stands are non-manifold / multi-shell, so decimation gives up."* **No** — every stand mesh is
+  watertight, has no duplicate or degenerate faces, and `merge_vertices` changes nothing. Cleaning the
+  mesh first makes exactly zero difference.
+* *"Decimation just needs more passes or more aggression."* **No** — iterating
+  `simplify_quadric_decimation` to convergence takes stand_oil 207100 → 51354 (6 passes) and stand_glass
+  372940 → 97046 (12 passes), while `aggression=12` is no better than the default 7. It is a genuine
+  wall, and the iterated result has already lost **29% of the mesh volume**, so pushing harder would
+  trade a bad collider for a wrong one.
+* *"Cost is dominated by total static triangle count / the BVH is missing."* **No** — with the dynamic
+  bodies teleported 60 m away the same 3.6 M-triangle static set steps in **0.01 ms**. The broadphase and
+  BVH are working fine; the cost is entirely **contact-manifold generation against the thousands of
+  marching-cubes slivers directly underneath a resting piece**. Reducing triangles helps only because it
+  reduces triangles *in the contact patch*.
+
+**Fixed** by `slab_hulls()` (`tools/settle_scene.py`): a static collider that will not decimate is
+decomposed into 32 horizontal slabs, each replaced by the convex hull of its own vertices (slabs overlap
+by one polygonisation cell so no seam gap opens). Verified on all ten gallery stands: cap-top height and
+XZ extent are reproduced **exactly**, at ~4000 tris per stand instead of 50–115k. Decimation is still
+preferred when it works, since it keeps the concave shape.
+
+A single whole-mesh convex hull was rejected even though it is faster still (0.30 vs 1.5 ms/step) and
+also preserves the cap top exactly: it fills in the taper between a wide base and a narrow column,
+inventing a sloped shoulder a piece could come to rest on — which would be baked into the scene as a
+piece floating in mid-air beside its stand. VHACD on the stands was rejected too: it moves the cap top
+by 5 mm and *under*-estimates stand volume by 19%.
+
+Also fixed alongside it:
+* **Caching** (`scraps/.settle_cache/`, `--no-cache` to bypass). The `-export-mesh` polygonisation is
+  keyed on (scene text, `--mesh-res`, ftrace mtime) and the VHACD proxies on the proxy mesh's content
+  hash. Re-running a bake with a different `--tether`/`--jitter`/`--seed` — the normal iteration loop —
+  now skips both entirely.
+* **Per-phase timing** is printed (`attempt N phase M: k/8000 steps in Ts (X ms/step)`), including an
+  explicit `<-- hit the cap, did not settle` marker, so a slow or non-converging bake is visible rather
+  than silent.
+
+**Result: 40+ min → 70 s**, sim at 0.5–0.67 ms/step (~100×), with all five hero pieces reporting `OK`.
+`--mesh-res` is *not* the lever it appeared to be — it only helped as a side-effect of the broken
+decimation, and can now stay at full resolution.
+
+### DONE (2026-08-03): the Klein bottle mesh has no stable upright rest — it cannot stand on its pedestal
+`meshes/klein_hunyuan.obj` as placed in `scenes/gallery.ftsl` is correctly positioned — bottom at
+y=1.018 over stand_klein's cap top at y=1.00, footprint 0.34×0.33 m on a 0.52×0.52 m cap — but a settle
+dropped it on the floor every time (the last bad bake moved it `translate 1.06 3.90 -0.005 rotate
+-86.4 -51.4 -68.2`).
+
+**Root cause, measured.** Not a placement or simulation bug. Take the convex hull of the placed mesh
+and keep the faces whose supporting plane has the COM over them: those are *exactly* the orientations
+in which the piece can rest on a plane. There are **44, and the most upright of them leans 73°**. The
+shape has no near-upright equilibrium at all, so **nothing it merely rests on can hold it up** — only a
+mount that *grips* can. (An earlier version of this entry blamed a "47×42 mm contact blob with the COM
+43 mm outside it". That described a symptom of one particular pose, not the cause, and it sent the fix
+down several dead ends.)
+
+**Five mount families were built and falsified by measurement**, each for a distinct geometric reason:
+
+| mount | why it fails |
+|---|---|
+| circular seat / bore rim | the section radius about the pedestal axis swings 25→130 mm, so a *circle* touches exactly 2 lobes 180° apart — a knife edge with the COM on the line between them |
+| spherical dish | a sphere is the one surface on which rolling is free; it rolled off |
+| sleeve / cage above the cap | the flank **narrows downward**, so leaning always *opens* clearance; the lean ran away 2→6→11→19→35→65° |
+| conforming height-field cradle | the underside is a paraboloid ρ²/244 mm, and a sphere rolls freely inside its own negative, so tilt is not resisted; also numerically pathological — a mesh colliding a surface coincident with it produced 1400–1700 N of penetration recovery on a 9.81 N piece |
+| discrete museum posts | a support point needs a near-horizontal surface normal, and the underside is only shallow within ρ≈70 mm — barely past the COM's own 67 mm offset |
+
+**Fix (shipped): a shaped tapered collar**, `meshes/collar_klein.obj`, generated by
+`tools/make_klein_collar.py` and referenced from `scenes/gallery.ftsl` as the `collar_klein` mesh
+object. The flank widens upward, so a bore cut to the piece's *own cross-section* captures it: it
+cannot sink because the taper jams, and its weight is carried all round the perimeter instead of on two
+lobes. Wedging was never the bug — it is the mechanism; the bug was that a *circular* bore wedges
+against only two points. The bore never re-narrows going up, so the piece still lifts straight out (not
+captive, the museum rule). Result: rests at 0.77° lean, `on collar_klein`, poke drift **1.6 mm** against
+settle_scene's POKE_TOL of 10 mm.
+
+**Two traps worth remembering, both of which produced confident wrong answers:**
+
+1. *Harness friction must match the tool.* Every early sweep hard-coded `rollingFriction=0.002` /
+   `spinningFriction=0.02` against settle_scene's actual `5e-4`/`5e-4` — 4× and 40× too much. That
+   alone made several seats look stable in the harness and fail in the bake. All harnesses now
+   **import** `ROLLING_FRICTION` / `SPINNING_FRICTION` from `settle_scene`.
+2. *A bore sampled as radius-per-azimuth is not the outline.* The first shipped collar lofted
+   `r[level, azimuth]` samples. That is safe (it can never cut into the piece) but it fills in every
+   radial concavity, and this section is strongly non-star-shaped about the pedestal axis: the polar
+   bore came out **1.49× the true 0.5 mm offset at y=1.090**, 114 cm² of void. It rested at 20.1° lean
+   and held 12/36 pokes. Cutting the bore from the outline *polygon* instead gives 36/36. Scored on
+   settle_scene's own 10 mm POKE_TOL, not a looser threshold, because that is the number that prints
+   TOPPLES.
+
+### TECH DEBT — MOOT (2026-08-03): the VHACD proxy for `klein_hunyuan.obj` is a poor fit, so the collar shows a visible gap
+**Closed the same day it was opened, by deleting the collar.** `klein_hunyuan.obj` is no longer in the
+gallery (see "the Klein bottle is now a glassblower's bottle with the internals", above) and neither is
+`collar_klein`, so there is no bore for the proxy to be cut to. The underlying observation still stands
+as a general warning — *VHACD decomposes a thin curved shell badly, and anything cut to fit the proxy
+will not visually fit the mesh* — so if a future piece needs a shaped mount, read this first. The
+original text follows.
+
+`settle_scene` collides a VHACD convex decomposition of each dynamic piece, and for the Klein bottle
+that decomposition is bad: only **9 hulls** at 1.09× the true volume, whose bulges reach up to
+**427.5 mm below** the true underside (the true surface dips below the proxy by at most 25.8 mm).
+
+Because the sim collides the proxy while the render shows the true mesh, `tools/make_klein_collar.py`
+must cut the bore to the **proxy** — the wider, containing body — or the settle would spawn the
+collided body already buried in the collar. The cost is that the *rendered* bottle sits a few mm clear
+of the collar bore where the proxy bulges past the true surface, so the mount reads as slightly loose
+on screen even though the physics is tight.
+
+**Proper fix:** get a better collision proxy, then re-cut the bore to it. Options, cheapest first:
+raise VHACD's `resolution` / `maxConvexHulls` / lower `concavity` for this mesh (the current call in
+`proxy_mesh()` / `settle_scene` uses defaults); or switch to CoACD, which handles thin curved shells
+like this far better than VHACD; or, since the collar only needs the band y∈[1.030, 1.110], collide the
+*true* mesh there via a per-piece override rather than the whole-body proxy. Whichever is chosen, the
+check is already in the generator: it prints how deep each body penetrates the collar at the authored
+pose (currently 0.00 mm for the rendered mesh, 0.99 mm for the proxy).
 
 ### FEATURE REQUEST (2026-07-19): cache ftrace's per-scene preprocessing before rasterizing
 Add an option to **cache the scene-derived data ftrace computes at load** (tessellation / BVH /
@@ -6533,3 +6973,84 @@ was visibly wrong the moment the user scrolled the pane back into view.
 width exceeds `2 * NodePadding.x * zoom`. A node always draws at least its title, so a
 content width of zero means "not measured this frame", never "an empty node". The previous
 frame's sizes are kept until a frame that actually drew comes along.
+
+## FIXED (2026-08-03, 0.119.0): mode `W` renders a scene to pure black — with no diagnostic — when every light is enclosed in refractive geometry
+
+Reported from `ftrace -explore -whitted-grid 1 -mode W -in scenes\gallery_settled.ftsl`:
+the raster stage navigates fine, but the instant the camera settles and the mode-`W` lit
+preview takes over, the window goes black and stays black. Reproduces headlessly:
+
+```
+ftrace -in scenes/gallery_settled.ftsl -mode W -spp 1 -whitted-grid 1 -camera cam \
+       -r 320 200 -o png/gal_w.png            # -> all-zero image, "auto-exposure=1"
+```
+
+**Not a viewer bug.** `gallery_settled`'s entire illumination is one 8 mm arc,
+
+```
+light sphere { center 5.0 3.10 3.0   radius 0.008   spd blackbody 6000 }
+```
+
+sitting at the exact centre of two nested dielectric meshes (`lamp_bulb`, fused silica,
+scale 0.11; `lamp_xe`, xenon gas, scale 0.1034) plus the chrome electrodes. Mode `W` does
+*all* of its lighting by NEE — a shadow ray from each vertex to a point on the light — and
+an occlusion test treats a dielectric as an opaque blocker, so **every** direct connection
+in the scene is blocked. Mode `W` also drops stochastic diffuse indirect (it implies
+`-direct-only`), so no energy reaches anything by any route, and the result is exactly
+zero everywhere. `-gi` does not help: gather rays collect mode-`W` radiance, which is
+itself zero. This is the classic Whitted limitation (POV-Ray behaves identically) and is
+exactly why the scene's own `prefer{}` block selects mode **D** — BDPT starts paths at the
+arc and refracts them *out* through the quartz.
+
+Confirmed by deleting only the two dielectric shells (`scraps/gal_noglass.ftsl`):
+auto-exposure goes `1` → `1.32e-09` and the hall lights up.
+
+**Workaround:** `-ambient 0.2` gives a fully readable flat-lit preview
+(`-no-media` on top, since mode `W` ignores the bounded cloud anyway and treats the global
+haze as a single homogeneous term):
+
+```
+ftrace -explore -mode W -whitted-grid 1 -ambient 0.2 -no-media -in scenes\gallery_settled.ftsl
+```
+
+**Fixed** by detecting the *condition* rather than the symptom, so the diagnostic names the
+cause instead of reporting a black frame after the fact. `Scene::emitterSeal()`
+(`src/scene.h`) probes each emitter with a deterministic lattice of 512 outgoing directions
+— stratified over the emitter surface via the existing `Emitter::samplePoint`, uniform over
+the outgoing hemisphere (or inside the cone, for a spot) — and reports the fraction whose
+first hit is a material for which `isSpecularType()` holds. That predicate is exactly right
+rather than approximately right: `backward.h` calls `neeLight()` from the `Diffuse`,
+`DiffuseTransmit` and `Fluorescent` cases and *nowhere else*, so a first hit on any
+specular type (glossy included) is a direction whose power NEE can never collect. Hits on
+the emitter's own surface yield no evidence and are excluded, so a concave mesh light
+seeing itself is not mistaken for a sealed one. `warnSealedLights()` (`src/main.cpp`) runs
+it once at startup whenever `g_whitted || wPreview`, so `-explore` is covered too (the
+viewer's `T` preview *is* mode `W`).
+
+The threshold is **0.95**, not 1.0, and this is the part that needed measuring rather than
+guessing: the gallery's arc probes at **98.2 %**, not 100 %, because the lamp assembly has
+its own socket and cord *inside* the envelope — diffuse surfaces that are genuinely lit but
+illuminate nothing except themselves. A first pass thresholded at 0.995 and silently missed
+the very scene it was written for. Past ~95 % the scene is at least 20× underlit against
+what the author intended, so the preview is misleading whether or not it is literally zero.
+
+Verified against all 98 scenes in `scenes/`: every one reaches the mode-`W` path, and
+exactly three trip the warning — `gallery.ftsl`, `gallery_settled.ftsl` and
+`mirror_sphere_interior.ftsl`, all the same sealed-lamp assembly. No false positives. The
+third is an independent confirmation rather than a third instance of one mistake: its own
+header comment already states that you cannot "next-event-connect a shading point to a
+light through a refracting interface", and it renders at `auto-exposure=7.18e-14` — a
+near-black frame with a few specular specks, exactly what the warning predicts.
+
+Still open as a possible extension: mode `R`/`P` hit the same condition, where it shows up
+as pathological convergence rather than a black frame, and would benefit from the same
+warning. The probe is mode-agnostic; only the call site is gated.
+
+## OPEN (minor, 2026-08-03): rendering `gallery_settled` without `-camera` also renders the 600-frame flyby
+
+`ftrace -in scenes/gallery_settled.ftsl -mode W -o png/gal_w.png` renders the still camera
+*and* then all 600 frames of the scene's `camera_curve "fly"`, writing `png/gal_w_fly000
+…599.png` (~4 min). Selecting a camera with `-camera cam` avoids it. Arguably working as
+designed — "render every camera in the scene" — but it is a surprising default for a scene
+that carries a long flypath, and it silently spams the output directory next to the `-o`
+path. Worth at least a printed warning naming how many frames are about to be written.

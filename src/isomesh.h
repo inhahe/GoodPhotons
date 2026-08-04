@@ -281,6 +281,36 @@ inline Mesh marchImplicit(const Implicit& im, const Options& opt,
     return m;
 }
 
+// ---- How much of a marched mesh is container cap, not the surface itself ----
+// A capped export seals the solid flush with `contained_by` wherever the solid reaches
+// the wall (see the `open` keyword). That is correct and usually a small patch — but if
+// the field's SIGN is inverted, "solid" is everything OUTSIDE the intended shape, the
+// container is entirely inside the solid, and the marcher dutifully returns the whole
+// container as a closed shell with the real shape hollowed out INVISIBLY inside it.
+// That is not a hypothetical: it is how meshes/klein_a120_b060_c30_d127*.obj became a
+// featureless ball (65 % cap), and nothing in the export said so. This measures the
+// fraction of output triangles that lie on the cap — i.e. where the CONTAINER, not the
+// field, is the binding constraint in the augmented field max(f, contSDF).
+inline double capFraction(const Implicit& im, const Mesh& m, const PatTables* tabs = nullptr) {
+    if (!im.capped || m.tri.empty()) return 0.0;
+    const bool sphereCap = (im.container == Container::Sphere) && (im.sphereRadius > 0.0);
+    const Aabb& bb = im.bounds;
+    auto contSDF = [&](const Vec3& p)->double {
+        if (sphereCap) return length(p - im.sphereCenter) - im.sphereRadius;
+        double dx = std::max(bb.lo.x - p.x, p.x - bb.hi.x);
+        double dy = std::max(bb.lo.y - p.y, p.y - bb.hi.y);
+        double dz = std::max(bb.lo.z - p.z, p.z - bb.hi.z);
+        double ox = std::max(dx,0.0), oy = std::max(dy,0.0), oz = std::max(dz,0.0);
+        return std::sqrt(ox*ox + oy*oy + oz*oz) + std::min(std::max(dx, std::max(dy,dz)), 0.0);
+    };
+    size_t nTri = m.tri.size() / 3, onCap = 0;
+    for (size_t t = 0; t < nTri; ++t) {
+        const Vec3 c = (m.pos[m.tri[3*t]] + m.pos[m.tri[3*t+1]] + m.pos[m.tri[3*t+2]]) * (1.0/3.0);
+        if (contSDF(c) > im.eval(c, tabs)) ++onCap;   // container wins the max() -> cap
+    }
+    return (double)onCap / (double)nTri;
+}
+
 // ---- Curvature-adaptive decimation (quadric error metric edge collapse) -----
 // Collapses cheap edges first. The QEM cost is tiny on flat regions (all incident
 // planes coincide -> zero error to slide a vertex along them) and large where the

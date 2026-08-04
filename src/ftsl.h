@@ -621,6 +621,13 @@ struct Loaded {
     double defaultFps = 0.0;     // scene { fps N }: default flyby playback fps (0 = not specified)
     long long photons = -1;      // -1 = not specified (CLI default wins)
     int res = -1;                // -1 = not specified
+    // render { max_bounce N }: path depth the SCENE needs, -1 = not specified. This is a
+    // property of the geometry, not of the operator's taste, so a scene that needs it must
+    // be able to say so: mode D defaults to 8 path edges, and a thin-walled glass shell
+    // with another tube inside it (the gallery's Klein bottle) presents ~8 dielectric
+    // interfaces on one line of sight, so at the default the innermost tube renders as a
+    // solid BLACK plug — truncated paths, not a material bug. A CLI `-max-bounce` still wins.
+    int maxBounce = -1;
     std::string device;          // empty = not specified
     std::string out;             // empty = not specified
     // Keys no builder read (see collectUnusedKeys). Carried on Loaded rather than
@@ -4575,6 +4582,28 @@ private:
                     if (first) { box.lo = w; box.hi = w; first = false; } else box.expand(w);
                 }
                 im.container = Container::Box;
+                // That AABB is right for the BVH but WRONG to clip the ray to whenever
+                // rootXf rotates the box: the AABB of a tilted box pokes outside the
+                // authored container, and `max_gradient` only bounds the field INSIDE
+                // it. Marching the excess makes the first |f|/max_gradient step
+                // arbitrarily long and the sphere-trace steps straight over the object
+                // (see the Container comment in implicit.h). So when the map is not a
+                // positive-diagonal (axis-preserving) one, keep the box oriented and
+                // clip in its own frame; the marched region is then a rigid motion of
+                // the authored one, where the authored bound provably still holds.
+                Affine boxL2W;
+                for (int k = 0; k < 9; ++k) boxL2W.m[k] = L_ * rootXf.m[k];
+                boxL2W.t = rootXf.t * L_;
+                bool axisAligned = true;
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j) {
+                        double v = boxL2W.m[i * 3 + j];
+                        if (i == j) { if (v <= 0.0) axisAligned = false; }
+                        else if (v != 0.0) axisAligned = false;
+                    }
+                im.boxOriented = !axisAligned;
+                im.boxInv      = boxL2W.inverse();
+                im.boxLo = mn; im.boxHi = mx;
             }
             im.bounds = box;
             // Cap policy: a container-clipped solid is sealed with a face of the
@@ -4592,11 +4621,25 @@ private:
             // whose estimated slope is 0 — an unusably tiny bound. The data pass runs
             // before geometry, so the tables are already loaded here.
             const PatTables tabs = L.scene.patTables();
+            // Probe the region the marcher will actually walk. For an oriented box that
+            // is the box itself, not its (larger, steeper) world AABB — see the note on
+            // estimateFieldLipschitz. Sphere containers already bound their own region.
+            Affine boxL2W;
+            for (int k = 0; k < 9; ++k) boxL2W.m[k] = L_ * rootXf.m[k];
+            boxL2W.t = rootXf.t * L_;
+            Aabb  probe = box;
+            const Affine* probeXf = nullptr;
+            if (im.boxOriented) { probe.lo = im.boxLo; probe.hi = im.boxHi; probeXf = &boxL2W; }
             im.lipschitz = (mg > 0.0) ? mg
-                                      : 1.3 * estimateFieldLipschitz(im.nodes, im.exprNodes, box,
-                                                                     /*grid=*/24, &tabs);
+                                      : 1.3 * estimateFieldLipschitz(im.nodes, im.exprNodes, probe,
+                                                                     /*grid=*/24, &tabs, probeXf);
             double acc = dblOf(b, "accuracy", 0.0);
-            im.minStep = (acc > 0.0) ? acc * L_ : implicitMinStep(box);
+            // Step floor also sizes off the true container — the OBB's own world
+            // diagonal, not its AABB's — so a rotated piece keeps exactly the march
+            // resolution it had before a rest pose was baked onto it.
+            double stepDiag = im.boxOriented ? length(boxL2W.applyDir(im.boxHi - im.boxLo))
+                                             : length(box.hi - box.lo);
+            im.minStep = (acc > 0.0) ? acc * L_ : implicitMinStepForDiag(stepDiag);
         } else {
             im.lipschitz = 1.0;                       // SDF leaves + smin/CSG stay unit-Lipschitz
             im.bounds = implicitBounds(im.nodes);
@@ -6512,6 +6555,12 @@ private:
         if (!o.empty()) L.out = o;
         const Stmt* r = find(b, "res");
         if (r && !r->val.words.empty()) L.res = (int)num(r->val.words[0]);
+        const Stmt* mb = find(b, "max_bounce");
+        if (mb && !mb->val.words.empty()) {
+            int n = (int)num(mb->val.words[0]);
+            if (n < 1) { fail("render: max_bounce must be >= 1"); return false; }
+            L.maxBounce = n;
+        }
         return true;
     }
 };

@@ -486,6 +486,103 @@ static int checkImplicit(long long rays) {
     return mismatches;
 }
 
+// ORIENTED-CONTAINER self-test: rotating an expression isosurface must not change what
+// it looks like. An `expr` field is not a distance function, so the marcher clips the ray
+// to the authored `contained_by` box and sizes its steps by |f|/max_gradient — a bound
+// that only holds INSIDE that box. Clip to the box's world AABB instead and a rotated
+// piece gets marched through a much larger region: for a steep field |f| out there is
+// enormous, the first step is |f|/max_gradient long, and the sphere-trace leaps clean over
+// the object, which then renders INVISIBLE in every ray-traced mode while the rasterizer
+// (marching cubes, no stepping) still shows it. That is exactly what happened to the
+// gallery heart once tools/settle_scene.py baked a `group { rotate .. }` rest pose onto it.
+//
+// So: build the SAME solid twice — once axis-aligned, once rigidly rotated — with one
+// shared max_gradient, and fire correspondingly rotated rays. A rigid motion cannot change
+// a hit distance, so any disagreement is the clip region leaking outside the container.
+// The field is a sextic ((|p|^2 - r^2)^3, zero set = a sphere of radius r) because the
+// failure scales with how fast the field grows outside the box; a quadric barely notices.
+static int checkContainer(long long rays) {
+    const double r = 0.7, half = 0.8;         // sphere radius; container half-extent
+    std::vector<PatNode> prog; std::string perr;
+    if (!compilePatternExpr("(x^2 + y^2 + z^2 - 0.49)^3", prog, perr)) {
+        std::printf("[checkcontainer] expr compile failed: %s -> FAIL\n", perr.c_str());
+        return 1;
+    }
+    // max|grad f| over the container cube: f' = 3(|p|^2-r^2)^2 * 2|p|, worst at the corner.
+    const double corner = half * std::sqrt(3.0);
+    const double lip = 3.0 * std::pow(corner * corner - r * r, 2.0) * 2.0 * corner;
+
+    auto build = [&](const Affine& l2w) {
+        Implicit im;
+        FieldNode nd; nd.op = FieldOp::Expr; nd.scale = 1.0;
+        nd.inv = l2w.inverse(); nd.exprOff = 0; nd.exprN = (int)prog.size();
+        im.nodes.push_back(nd);
+        im.exprNodes = prog;
+        im.matId = 0;
+        im.container = Container::Box;
+        im.capped = true;
+        im.lipschitz = lip;
+        im.boxLo = Vec3{-half, -half, -half};
+        im.boxHi = Vec3{ half,  half,  half};
+        im.boxInv = nd.inv;
+        // Axis-preserving map -> the authored box IS its world AABB (the fast path);
+        // otherwise keep it oriented. Same rule as ftsl.h's addIsosurface.
+        bool axisAligned = true;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) {
+                double v = l2w.m[i * 3 + j];
+                if (i == j) { if (v <= 0.0) axisAligned = false; }
+                else if (v != 0.0) axisAligned = false;
+            }
+        im.boxOriented = !axisAligned;
+        im.bounds.lo = im.bounds.hi = l2w.apply(im.boxLo);
+        for (int c = 1; c < 8; ++c)
+            im.bounds.expand(l2w.apply(Vec3{(c & 1) ? half : -half,
+                                            (c & 2) ? half : -half,
+                                            (c & 4) ? half : -half}));
+        im.minStep = implicitMinStepForDiag(length(l2w.applyDir(im.boxHi - im.boxLo)));
+        return im;
+    };
+
+    const Affine R = affineFromTRS(Vec3{0, 0, 0}, Vec3{50.6839, 9.91871, -34.6649}, Vec3{1, 1, 1});
+    Implicit flat = build(Affine::identity());
+    Implicit turned = build(R);
+    if (!turned.boxOriented) {   // the rotated case must actually exercise the new path
+        std::printf("[checkcontainer] rotated container was not detected as oriented -> FAIL\n");
+        return 1;
+    }
+    Pcg32 rng; rng.seed(0xB0C0DEu, 0x77u);
+    int missing = 0, mismatches = 0; long long compared = 0, grazed = 0;
+    double maxdt = 0;
+    for (long long i = 0; i < rays; ++i) {
+        Vec3 o{rng.uniform() * 4 - 2, rng.uniform() * 4 - 2, rng.uniform() * 4 - 2};
+        double z = rng.uniform() * 2 - 1, phi = 2 * PI * rng.uniform();
+        double rr = std::sqrt(std::max(0.0, 1 - z * z));
+        Vec3 d = normalize(Vec3{rr * std::cos(phi), rr * std::sin(phi), z});
+        // Skip silhouette grazes and origins sitting on the surface or the container
+        // wall: those are sub-epsilon coin flips, not a test of the clip region.
+        Vec3 oc = Vec3{0, 0, 0} - o;
+        double proj = dot(oc, d);
+        double impact = std::sqrt(std::max(0.0, dot(oc, oc) - proj * proj));
+        if (std::fabs(impact - r) < 1e-3 || std::fabs(length(oc) - r) < 1e-3) { ++grazed; continue; }
+        Hit hf; hf.t = DBL_MAX; bool hitF = intersectImplicit(Ray{o, d}, flat, 1e-6, hf);
+        // The same ray in the rotated frame: rotate origin and direction together.
+        Hit ht; ht.t = DBL_MAX;
+        bool hitT = intersectImplicit(Ray{R.apply(o), R.applyDir(d)}, turned, 1e-6, ht);
+        if (hitF != hitT) { if (hitF && !hitT) ++missing; else ++mismatches; continue; }
+        if (!hitF) continue;
+        ++compared;
+        double dt = std::fabs(hf.t - ht.t);
+        maxdt = std::max(maxdt, dt);
+        if (dt > 1e-6) ++mismatches;
+    }
+    int bad = missing + mismatches;
+    std::printf("[checkcontainer] %lld rays (%lld hits compared, %lld grazing skipped), "
+                "%d vanished-when-rotated, %d mismatches, max|dt|=%.2e -> %s\n",
+                rays, compared, grazed, missing, mismatches, maxdt, bad == 0 ? "PASS" : "FAIL");
+    return bad == 0 ? 0 : 1;
+}
+
 // Deterministic thin-lens (mode C) self-test. Forward catch is far too photon-
 // inefficient to validate the lens by rendering, so instead we fire rays from a
 // fixed scene point through many aperture positions and measure the circle of
@@ -2752,6 +2849,65 @@ static int g_giBounce = 4;
 // returned radiance, which is what tames the caustic-through-the-gather contour aliasing.
 // See BackwardRenderer::giClamp for the full rationale.
 static double g_giClamp = 0.0;
+
+// Mode W lights a surface ONLY by next-event estimation, and a shadow ray is blocked by
+// any geometry at all -- dielectrics very much included (Scene::occluded: "can't connect
+// through specular", the SDS limitation). So a light sealed inside refractive or mirrored
+// geometry -- an arc lamp in its quartz envelope, a filament in a closed reflector -- can
+// reach no vertex in the scene, and mode W renders the whole picture pure BLACK.
+//
+// That failure used to be completely silent: the only trace of it anywhere in the output
+// was `auto-exposure=1`, the "no signal at all to scale" fallback, which reads like a
+// normal number. In the interactive explorer it was worse still -- the raster stage
+// navigates fine and the window simply goes black the instant the camera settles and the
+// mode-W stage takes over, with nothing printed at all.
+//
+// So probe every emitter once at startup and say so up front, naming the blocker. A few
+// hundred rays per light, i.e. free next to any render.
+//
+// The reported number is the fraction of the emitter's outgoing directions that are
+// blocked, which IS the physically meaningful quantity: it is the share of the light's
+// emitted power that no NEE connection can ever collect. The threshold is deliberately
+// short of 1.0 because a real lamp assembly has hardware inside the envelope -- the
+// gallery's arc probes at 0.988, the missing 1.2% being its own socket and cord, which
+// are diffuse but sit inside the glass and light nothing but themselves. Anything past
+// ~0.95 means the scene is at least 20x underlit against what the author intended, so
+// mode W's picture is misleading whether or not it is literally all zero.
+static constexpr double kSealWarnFrac = 0.95;
+
+static void warnSealedLights(const Scene& scene) {
+    int sealed = 0, open = 0;
+    for (size_t i = 0; i < scene.emitters.size(); ++i) {
+        const Emitter& e = scene.emitters[i];
+        const Scene::EmitterSeal s = scene.emitterSeal(e, 512);
+        if (s.probes == 0) continue;
+        if (s.sealed < kSealWarnFrac) { ++open; continue; }
+        ++sealed;
+        const char* mesh = (s.blockMat >= 0) ? scene.meshNameForMat(s.blockMat) : nullptr;
+        const char* type = (s.blockMat >= 0 && s.blockMat < (int)scene.mats.size())
+                         ? matTypeName(scene.mats[s.blockMat].type) : "specular";
+        std::printf("[mode W] WARNING: light %zu of %zu is SEALED inside %s geometry%s%s%s -- "
+                    "%.1f%% of the directions leaving it are blocked\n",
+                    i + 1, scene.emitters.size(), type,
+                    mesh ? " (mesh '" : "", mesh ? mesh : "", mesh ? "')" : "",
+                    100.0 * s.sealed);
+    }
+    if (sealed == 0) return;
+    std::printf("[mode W]   Mode W lights a surface ONLY by next-event estimation, and a "
+                "shadow ray cannot pass through specular geometry, so that power is "
+                "unreachable here -- it needs a transport that can refract back OUT of the "
+                "enclosure.\n");
+    if (open == 0)
+        std::printf("[mode W]   No light in this scene can reach anything, so the image will "
+                    "render black or near-black.\n"
+                    "[mode W]   Use -ambient 0.15 for a flat-lit preview you can navigate and "
+                    "frame with, or render in mode D/B/M, which transport light out through "
+                    "the enclosure.\n");
+    else
+        std::printf("[mode W]   The other %d light%s still reach%s the scene, so expect it lit "
+                    "only by %s.\n", open, open == 1 ? "" : "s", open == 1 ? "es" : "",
+                    open == 1 ? "that one" : "those");
+}
 
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
@@ -5574,6 +5730,7 @@ static int run(int argc, char** argv) {
     double focusDist = 0.0;   // mode C thin-lens focus distance (0 = no lens)
     bool checkBvhOnly = false;
     bool checkImplicitOnly = false;
+    bool checkContainerOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
     bool checkFluoroOnly = false;
@@ -5919,6 +6076,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-focus") && i + 1 < argc) focusDist = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
         else if (!std::strcmp(argv[i], "-checkimplicit")) checkImplicitOnly = true;
+        else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
@@ -6109,6 +6267,7 @@ static int run(int argc, char** argv) {
         g_windowTitle = "ftrace  \xE2\x80\x94  " + scene + "  \xE2\x86\x92  " + out;
     }
     if (checkImplicitOnly) return checkImplicit(500'000) == 0 ? 0 : 1; // deterministic, no scene needed
+    if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
@@ -6221,6 +6380,15 @@ static int run(int argc, char** argv) {
         if (!removed.empty())
             std::printf("[ignore] stripped: %s\n", removed.c_str());
     }
+    // A scene may declare the path depth its GEOMETRY needs (`render { max_bounce N }`),
+    // because that is not a matter of the operator's taste: mode D runs 8 path edges by
+    // default, and a thin-walled glass shell with another tube inside it presents about
+    // that many dielectric interfaces on one line of sight, so the innermost surface
+    // renders as a black plug. An explicit CLI `-max-bounce` still wins.
+    if (maxBounceOverride < 1 && ftslScene.maxBounce >= 1) {
+        maxBounceOverride = ftslScene.maxBounce;
+        std::printf("[scene] max bounce = %d (from the scene's render block)\n", maxBounceOverride);
+    }
     // Publish the depth cap / direct-only mode to the tracer wrappers (globals, like
     // g_heroC), so every render (incl. the meter pre-pass) honours them.
     g_maxBounceOverride = maxBounceOverride;
@@ -6258,6 +6426,9 @@ static int run(int argc, char** argv) {
         }
     }
     else if (directOnly) std::printf("[ignore] direct-only (no diffuse indirect)\n");
+    // Both a real mode-W render and the explorer's T preview (which IS mode W) hit the
+    // sealed-light failure, so warn for either -- see warnSealedLights.
+    if (g_whitted || wPreview) warnSealedLights(scene);
     // Kept out of the chain above: rejecting -gi is independent of whether the run is
     // also direct-only, and folding it in would swallow that notice when both are given.
     // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for
@@ -6447,6 +6618,22 @@ static int run(int argc, char** argv) {
             isomesh::Mesh m = isomesh::marchImplicit(scene.implicits[k], mo, &tabs);
             std::printf("[export-mesh]   marched: %zu verts, %zu tris\n",
                         m.pos.size(), m.tri.size() / 3);
+            // A cap that DOMINATES the output is the signature of an inverted field: the
+            // container ends up entirely inside the "solid", so the export is the container
+            // shell with the intended shape hollowed out invisibly inside it. This was silent
+            // until now — it is how the Klein-bottle OBJs became featureless balls.
+            const double capFrac = isomesh::capFraction(scene.implicits[k], m, &tabs);
+            if (capFrac > 0.5) {
+                std::printf("[export-mesh]   WARNING: %.0f%% of these triangles are CONTAINER CAP, "
+                            "not surface.\n"
+                            "[export-mesh]     The exported solid is essentially the `contained_by` "
+                            "shape with the isosurface hollowed out INSIDE it, so from the outside "
+                            "it will look like a plain ball/box.\n"
+                            "[export-mesh]     That usually means the field's sign is inverted "
+                            "(f < 0 OUTSIDE the intended shape). Add `open` to the isosurface to "
+                            "skip capping, or negate the expression.\n",
+                            100.0 * capFrac);
+            }
             if (mo.adaptive && !m.tri.empty()) {
                 size_t before = m.tri.size() / 3;
                 isomesh::decimateAdaptive(m, mo.decimate, scene.implicits[k]);

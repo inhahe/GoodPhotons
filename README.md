@@ -419,6 +419,35 @@ boosting one ×8 also made the 64-spp image ~7× closer to that reference. `-gi`
 the `-ambient` tail — it is not a substitute for a converged render. All of these are
 tracked in `known-issues.md`.
 
+**A light sealed inside glass renders the scene black — and mode `W` now says so.** Mode
+`W` lights a surface *only* by next-event estimation, and a shadow ray is blocked by any
+geometry at all, dielectrics very much included (the SDS limitation: you cannot connect
+through a refracting interface). So a lamp modelled the way a real one is built — an arc
+sealed in a quartz envelope, a filament inside a closed reflector — can reach no vertex
+anywhere in the scene, and the whole image comes out **pure black**. Nothing is wrong with
+the scene; it needs a transport that can refract back *out* of the enclosure, which is why
+`scenes/gallery_settled.ftsl` and `scenes/mirror_sphere_interior.ftsl` select mode `D`.
+That used to fail silently — the only trace was `auto-exposure=1`, the "no signal at all to
+scale" fallback, which reads like a normal number, and under `-explore` the window simply
+went black the instant the camera settled and the mode-`W` stage took over. Since v0.119.0
+ftrace probes every emitter at startup (a few hundred rays, free next to any render) and
+reports the fraction of its outgoing directions that a specular surface blocks, naming the
+blocking mesh:
+
+```
+[mode W] WARNING: light 1 of 1 is SEALED inside dielectric geometry (mesh 'lamp_xe')
+                 -- 98.2% of the directions leaving it are blocked
+```
+
+The reported number is the share of the light's emitted power that no NEE connection can
+ever collect. It warns past **95 %** rather than at a literal 100 % because a real lamp
+assembly has hardware *inside* the envelope — the gallery's arc probes at 98.2 %, the
+missing 1.8 % being its own socket and cord, which are diffuse but light nothing except
+themselves. The check runs under `-explore` too, since the viewer's `T` preview *is* mode
+`W`. Across all 98 scenes in `scenes/` exactly the three lamp-enclosure scenes trip it. The
+workaround it suggests, `-ambient 0.15`, gives a flat-lit preview that is perfectly good
+for navigating and framing.
+
 Where extra `-spp` *does* buy convergence (the glossy lobe, the grating's orders, the dye's
 excitation band), it now does so **from the second sample onward**. Each of those lattices uses its
 own prime base so that two vertices on one path aren't driven by the same sequence, and those
@@ -1961,6 +1990,21 @@ one vertex ⇒ **no cracks**), crossings are refined by bisection on the real fi
 normals come from the field gradient (box-face normals on caps), and each triangle is wound so
 its geometric normal points outward.
 
+**Watch the cap warning.** Capping is only correct when `f < 0` means *inside the shape you
+want*. If the expression's sign is inverted, "solid" becomes everything **outside** the shape,
+the container sits entirely within it, and the exporter faithfully returns the whole container
+as a closed shell with the intended surface hollowed out invisibly inside — an export that
+looks like a plain ball or box from every angle. Since v0.121.0 the exporter measures how many
+output triangles lie on the cap and says so:
+
+```
+[export-mesh]   WARNING: 66% of these triangles are CONTAINER CAP, not surface.
+```
+
+If you see that, either add `open` to the `isosurface` (skip capping, keep the raw cut rim) or
+negate the expression. This is not hypothetical — it is how `meshes/klein_a120_b060_c30_d127*.obj`
+silently became featureless balls; see `known-issues.md`.
+
 The **adaptive** pass collapses cheap edges first: the quadric error is near-zero on flat
 regions (a vertex can slide freely) and large where the surface curves, so triangles thin out
 on flat areas and stay dense on detailed ones — the requested curvature-driven tessellation. A
@@ -2435,6 +2479,19 @@ two project-wide defaults alongside `units`/`spectral`:
   resolution order is `--fps` → the flyby's `fps` → the scene-level `fps` → `30`. `fps`
   is purely a playback hint — it doesn't change what ftrace renders.
 
+**Render-setting block (`render { … }`).** A top-level `render` block carries defaults for
+settings that otherwise come from the CLI — `photons <n>`, `mode <letter>`, `res <px>`,
+`device <name>`, `out <file>`, and **`max_bounce <n>`**. The matching CLI flag always wins;
+the block is for settings a scene *needs* rather than ones an operator prefers.
+
+`max_bounce` is the clearest case. Modes `D`/`U` run **8** path edges by default (see
+`-max-bounce`), which is not enough for deeply nested dielectrics: `scenes/gallery.ftsl`'s
+Klein bottle is a 2.4 mm-walled glass shell with another tube *inside* it, so one line of
+sight crosses about eight interfaces and the innermost tube renders as a solid **black
+plug** — truncated paths, not a material bug. That scene therefore declares
+`render { max_bounce 32 }` and looks right without the operator having to know. When a scene
+sets it, the run prints `[scene] max bounce = N (from the scene's render block)`.
+
 ### Conditional blocks (`prefer { … } else { … }`)
 
 Some features aren't renderable in every mode — most notably **gradient-index (GRIN)
@@ -2853,7 +2910,7 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-no-media` / `-nomedia` | Drop all participating-media volumes (fog / homogeneous / heterogeneous). Also un-gates the fast `-rgb` backward, which otherwise falls back to spectral on any medium. |
 | `-no-env` / `-noenv` | Remove the environment light (constant or image-based): the scene renders against black, and the emitter CDF is rebuilt without it. |
 | `-no-fluoro` / `-nofluoro` | Demote every fluorescent material to a plain diffuse (using its elastic reflectance albedo) — skips the wavelength-shifting re-emission. |
-| `-max-bounce <N>` | Set path depth to `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, the photon modes, and the bidirectional `D`/`U`). Default is the tracer's own cap: **32** for the unidirectional tracers, **8** for `D`/`U`, whose connection cost grows ~depth². For `D`/`U` the flag therefore *raises* the depth as often as it caps it — a specular-only cavity (a mirror-lined sphere, a kaleidoscope, deeply nested dielectrics) truncates its recursive images to black at 8 edges and wants `-max-bounce 24`–`48` before the hall of mirrors fills in. Specular vertices are cheap there: a delta BSDF has no connection to make. |
+| `-max-bounce <N>` | Set path depth to `N` bounces (applies to forward `A`/`B`/`C`, backward `R`, the composite `P`, the photon modes, and the bidirectional `D`/`U`). Default is the tracer's own cap: **32** for the unidirectional tracers, **8** for `D`/`U`, whose connection cost grows ~depth². For `D`/`U` the flag therefore *raises* the depth as often as it caps it — a specular-only cavity (a mirror-lined sphere, a kaleidoscope, deeply nested dielectrics) truncates its recursive images to black at 8 edges and wants `-max-bounce 24`–`48` before the hall of mirrors fills in. Specular vertices are cheap there: a delta BSDF has no connection to make. A scene that always needs the deeper walk can say so itself with `render { max_bounce <n> }` (see **Render-setting block**); this flag overrides that. |
 | `-direct-only` / `-directonly` | **Whitted mode:** after a non-specular vertex (diffuse / diffuse-transmit / elastic-fluorescent / fog single-scatter) does its direct-lighting NEE, stop — no diffuse indirect (no colour bleeding, black shadows). Specular chains (mirror / glass / glossy / filter) still recurse. Scoped to the **camera** path tracers (`R` spectral + `-rgb`, and `P`'s backward layer); forward `B` and the photon/BDPT modes honour `-max-bounce` but ignore this. |
 | `-whitted-grid <n>` | **Mode `W` only.** Fire an `n`×`n` fixed lattice of shadow rays at every area light instead of one random point (default `4` → 16 rays). This is the single knob that decides how smooth a soft shadow is; a point/spot/collimated light is a deterministic connection already and ignores it. |
 | `-ambient <v>` / `-amb <v>` | **Mode `W` only.** Flat ambient fill added at every diffuse vertex (POV-Ray's `ambient`) — the cheap stand-in for the diffuse GI mode `W` drops, without which a **closed** room previews with black shadows. **Dimensionless:** `v` is a fraction of a light's own radiance (internally scaled by `Scene::ambientRef()`), so the same value behaves the same in any scene whatever its absolute radiometric scale. Default `0`; `0.02..0.2` is the useful band. With `-gi` it keeps applying, as the **far-field** term a gather ray picks up when it escapes the geometry. |
@@ -2899,10 +2956,15 @@ alone can't restore, so they are not disk-resumable.
 | `-convergence <m>` | Convergence-plane distance for `-stereo`, in **scene units** — the depth that lands at the screen (zero parallax); nearer objects pop out, farther recede. Default: the camera's **look-at target** distance. |
 | `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
-**Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checklens`,
-`-checkfluoro`, `-checkfog`, `-checkthinfilm`, `-checkmultilayer`,
-`-thinfilmswatch`, `-checkgrating`, `-checkupsample`, `-checkgrid`, `-checkscatter`,
-`-checksun`, `-checkbind`, `-checkprop`, `-checkarray`.
+**Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checkimplicit`,
+`-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`, `-checkthinfilm`,
+`-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
+`-checkgrid`, `-checkscatter`, `-checksun`, `-checkbind`, `-checkprop`,
+`-checkarray`. Each runs deterministically without a scene and prints
+`PASS`/`FAIL`. `-checkcontainer` guards the isosurface container clip: rotating an
+isosurface must not change what a ray sees, so it builds the same solid twice
+(axis-aligned and rigidly rotated) and checks that correspondingly rotated rays
+return identical hit distances.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are

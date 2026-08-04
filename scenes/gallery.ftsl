@@ -22,17 +22,41 @@
 # Pipeline: this is the AUTHORED source (settled pieces hover just above their stands).
 # Run tools/settle_scene.py to drop them onto the stands, producing gallery_settled.ftsl:
 #   python tools/settle_scene.py --scene scenes/gallery.ftsl \
-#       --settle klein,heart,brass_cluster,brass_dumbbell,oiljack --out scenes/gallery_settled.ftsl
+#       --settle klein,heart,brass_cluster,brass_dumbbell,oiljack \
+#       --tether --seat heart:stand_heart --out scenes/gallery_settled.ftsl
+# BOTH extra flags are load-bearing; dropping either bakes a visibly broken scene:
+#   --tether  without it `heart` rolls off its cap, falls a metre and comes to rest WEDGED
+#             between the stand_heart and stand_dumbbell shafts. That pose is stable, so
+#             the old two-test acceptance check reported it `OK ... on stand_dumbbell,
+#             stand_heart` and the bad bake shipped; settle_scene now calls it FELL.
+#   --seat heart:stand_heart
+#             the heart is authored at a tilt (rotate 22 36 -12) that has no stable rest,
+#             so it tips onto a lobe as it lands — and tipping walks it 222 mm sideways,
+#             leaving 148 mm of it hanging past the cap rim. Seating keeps the orientation
+#             physics chose but returns it to the authored XZ and lowers it straight down,
+#             which on a flat level cap is a pure translation and so preserves the support
+#             margin exactly. Result: 24 mm clear of every cap edge.
 # The gyroids, the chrome ring and the glass sphere are placed at ANALYTIC rest and left
 # OUT of the settle (the threaded gyroid must keep its exact channel/path alignment; a
 # pybullet pose on a non-watertight lattice would rotate the channel off the flight path).
 #
-# Render (still, mode D resolves the bounded cloud + dispersive caustics through glass):
-#   ftrace -in scenes/gallery_settled.ftsl -camera cam -mode D -noise 2 -window -o png/room.png
+# Render (still): the scene's prefer{}/else{} picks the mode itself — mode D today
+# (resolves the bounded cloud + dispersive caustics through glass in one pass), and
+# auto-falls back to mode B if a mode-D-hostile feature (e.g. a GRIN lamp-gas field)
+# is ever added. Don't pass -mode, so the chosen branch's own mode drives:
+#   ftrace -in scenes/gallery_settled.ftsl -camera cam -noise 2 -window -keepwindow -o png/room.png
 # Render (flyby, mode M = photon-map: build one stored map, reuse it for every frame):
 #   ftrace -in scenes/gallery_settled.ftsl -mode M -spp 8 -r 960 540 -window -o png/roomfly.png
 
 scene { units meters  spectral 360 830 1 }
+
+# The Klein bottle is a 2.4 mm-walled glass shell with ANOTHER TUBE INSIDE IT, so one line
+# of sight through the bulb crosses about eight dielectric interfaces. Mode D runs 8 path
+# edges by default, which is exactly not enough: the paths that would carry the inner tube
+# run out and it renders as a solid black plug in an otherwise clear bottle. 32 is comfortably
+# past the deepest stack in the room (measured: at 32 the plug is gone and the tube reads as
+# glass). Cost is ~35% of the sample rate. A CLI -max-bounce still overrides this.
+render { max_bounce 32 }
 
 # --- Room surfaces -------------------------------------------------------------
 material "floor"  { type glossy     reflect rgb 0.40 0.36 0.32   roughness 0.28 }  # polished stone
@@ -104,8 +128,8 @@ isosurface "stand_diamond" {  # tall thin walnut jewel-column, top y=0.85
         box { center 3.5 0.825 3.6 size 0.44 0.05 0.44  round 0.02 }
     }
 }
-isosurface "stand_klein" {    # slate column, top y=1.00
-    material slate  union {
+isosurface "stand_klein" {    # slate column, top y=1.00; the Klein bottle stands directly on
+    material slate  union {   # this cap — no mount, see the `klein` block below
         box { center 5.9 0.11 2.6  size 0.72 0.22 0.72  round 0.03 }
         box { center 5.9 0.60 2.6  size 0.34 0.76 0.34  round 0.02 }
         box { center 5.9 0.985 2.6 size 0.52 0.03 0.52  round 0.02 }
@@ -190,16 +214,42 @@ isosurface "gyroid_gem" {
 # The flyby dives straight THROUGH it. Native sphere for exact analytic refraction.
 sphere { center 6.2 1.40 3.5   radius 0.5   material glass }
 
-# --- GYROID SPHERE in glass (perforated triply-periodic minimal surface trimmed to a
-# ball; clear intricate transparent piece; object still named "klein" for the stand/settle
-# wiring) ------------------------------------------------------------------------------
+# --- KLEIN BOTTLE in glass (clear, intricate transparent piece; SETTLED) ---------------
+# A glassblower's Klein bottle with the INTERNALS: the neck passes through the wall of the
+# bulb and keeps going DOWN INSIDE it, so a horizontal cut low in the body shows four loops
+# (the outer wall's two surfaces plus the descending inner tube), three at the wall
+# pass-through, and the tube alone above the shoulder. That interior is the whole point of
+# the piece in a dielectric scene — the earlier image-to-3D bottle (meshes/klein_hunyuan.obj)
+# was a solid-looking shell with the self-intersection only implied.
+#
+# 12262 v / 12264 quads; closed, consistently wound, orientable, and genus 2 (Euler -2) as a
+# Klein bottle immersed in R^3 must be. Signed volume 150.356 against 2520.73 of area, i.e.
+# a wall 2V/A = 0.119 raw units thick — 2.4 mm at this scale, real blown glass. Raw mesh is
+# Y-up with its FOOT RING centred on the origin and its base plane at y = 0.025; extents
+# 22.700 x 30.000 x 15.000, so scale 0.02 -> 0.454 x 0.600 x 0.300, the same 0.60 m height
+# as the piece it replaces.
+#
+# NO MOUNT. The old bottle had no near-upright equilibrium (44 resting orientations, the most
+# upright of them leaning 73 degrees), which is why a generated collar mesh once existed here: a collar
+# whose bore was cut to that piece's own cross-section, the only thing that could hold it. This
+# one is a bottle with a punted foot and simply stands: a foot ring of radius 66 mm carrying a
+# centre of mass 225 mm above it, a static tipping angle of 6.5 degrees. Measured on the bare
+# slate cap at settle_scene's own rolling/spinning friction of 5e-4, with its own 0.03 m/s +
+# 0.30 rad/s kick from 12 directions at 3 spawn tilts (scraps/newklein_stand.py): it rests
+# 2.0 mm from the authored pose at 0.00 deg lean, and all 36 pokes stay inside 8.2 mm, under
+# settle_scene's POKE_TOL of 10 mm. A seat ring was measured and rejected — the body flares
+# continuously (66 mm at the base, 83 mm 4 mm up, 112 mm at 20 mm), so any bore loose enough
+# to lower the piece into is loose enough to let it slide the same distance anyway.
 mesh "klein" {
-    file "meshes/klein_a120_b060_c30_d127_lite.obj"
-    # raw mesh is centered at origin spanning +/-10 in each axis (size ~20);
-    # scale 0.025 -> ~0.5 across so it fits the stand_klein cap (~0.52), and
-    # translate y = 1.00 (cap top) + 0.25 (half-height) = 1.25 so it rests on top.
-    # lite decimation (~53 MB vs 168 MB) for faster load; same bounds.
-    translate 5.9 1.25 2.6   rotate 0 40 0   scale 0.025
+    file "meshes/klein_bottle_full.obj"
+    # Foot ring on the pedestal axis (5.9, 2.6), base 5 mm above the cap (top y = 1.00) so the
+    # settle drops it squarely onto the slate. The piece is lopsided about its own foot — the
+    # volume centroid sits 41 mm toward +x — but that is 41 mm on a 520 mm cap and the foot,
+    # not the centroid, is what the eye reads as centred on the column.
+    # Yaw -12 deg turns the handle into profile for the hero camera at (5.0, 2.55, 6.85),
+    # which sees this pedestal along (-0.207, 0, 0.978): the loop and the point where the neck
+    # enters the bulb both face the lens instead of foreshortening away.
+    translate 5.9 1.0045 2.6   rotate 0 -12 0   scale 0.02
     material glass
 }
 
@@ -207,7 +257,8 @@ mesh "klein" {
 # with a small bite bored out; SETTLED. ---
 isosurface "brass_dumbbell" {
     material brass
-    translate 4.16 1.00 2.36   scale 0.78
+    # Centred on stand_dumbbell's cap (4.5, 2.7); 0.03 m above its top (y=0.88).
+    translate 4.11 0.637 2.31   scale 0.78
     difference {
     smooth_union { k 0.046
         smooth_union { k 0.033
@@ -217,7 +268,12 @@ isosurface "brass_dumbbell" {
     }
         cylinder { translate 0.500 0.500 0.500  rotate 0 0 90  radius 0.065  height 0.340 }
     }
-        torus { translate 0.500 0.500 0.500  rotate 0 0 90  major 0.150  minor 0.045 }
+        # Ring outer radius (major+minor) MUST stay under the balls' 0.150, or the ring is
+        # the piece's lowest feature and the balls can never touch the stand: it then has no
+        # stable rest at all — it balances on the rim like a bicycle wheel (the COM sits
+        # exactly over the single rim contact, so it is in equilibrium but topples at a
+        # touch), which is what the user saw. Was major 0.150 / minor 0.045 = 0.195 outer.
+        torus { translate 0.500 0.500 0.500  rotate 0 0 90  major 0.105  minor 0.038 }
     }
     sphere { center 0.369 0.528 0.501  radius 0.067 }
     }
@@ -227,7 +283,8 @@ isosurface "brass_dumbbell" {
 # spheres bored out; SETTLED. SDF leaves stay unit-Lipschitz, no max_gradient. ---
 isosurface "brass_cluster" {
     material brass
-    translate 5.6 1.10 1.6   scale 0.8
+    # Centred on stand_brass's cap (6.0, 2.0); 0.03 m above its top (y=0.95).
+    translate 5.627 0.784 1.6475   scale 0.8
     difference {
     difference {
     smooth_union { k 0.038
@@ -258,7 +315,12 @@ isosurface "brass_cluster" {
 # --- IRIDESCENT algebraic HEART (gallery pick 07) in morpho-blue, tilted; SETTLED. -----
 isosurface "heart" {
     material morpho
-    translate 4.30 1.20 1.75   scale 0.85
+    # Unit-cube local space (see oiljack): authored it sat at (4.77, 2.20), 0.30 m off the
+    # corner of stand_heart's cap at (4.6, 1.9). Re-centred; y drops it 0.03 m (cap top 1.00).
+    # THIS PIECE NEEDS BOTH `--tether` AND `--seat heart:stand_heart` IN THE BAKE (see the
+    # header): the tilt below is not a rest pose, so the heart tips as it lands, and untethered
+    # it tips right off the cap onto the floor. Do not bake this scene without them.
+    translate 4.134 0.78 1.447   scale 0.85
     function {
         translate 0.5 0.5 0.5   scale 0.24   rotate 22 36 -12
         expr "(x^2 + (9/4)*z^2 + y^2 - 1)^3 - x^2*y^3 - (9/80)*z^2*y^3"
@@ -271,7 +333,12 @@ isosurface "heart" {
 # model + colour than the morpho heart): three fused orthogonal capsules; SETTLED. ------
 isosurface "oiljack" {
     material oilslick
-    translate 5.3 1.10 1.5   scale 0.62
+    # These hero CSG bodies are authored in the UNIT CUBE, so the world centre is
+    # translate + 0.5*scale — NOT translate. Written as `5.3 … 1.5` (stand_oil's cap
+    # centre) the jack actually landed at (5.61, 1.81), hanging 0.31 m off the +x+z corner
+    # of its own pedestal, and a fair settle correctly dumped it on the floor. Correct is
+    # 5.3 - 0.5*0.62 = 4.99 / 1.5 - 0.31 = 1.19. y leaves a 0.03 m drop onto the cap (top 0.92).
+    translate 4.99 0.882 1.19   scale 0.62
     smooth_union { k 0.05
         smooth_union { k 0.05
         cylinder { translate 0.5 0.5 0.5  rotate 0 0 90  radius 0.14  height 0.78 }
@@ -323,10 +390,27 @@ medium {
 # ==============================  CAMERAS  =====================================
 # Still: front-centre, moderate 50 deg lens, looking down the shallow hall so the whole
 # central spread of pieces reads at once with the gold gyroid big in the foreground.
-camera "cam" {
-    eye 5.0 2.55 6.85   look_at 5.0 0.95 3.1   up 0 1 0   fov_y 52
-    mode D
-    film { res 1280 720 }
+#
+# The still camera is wrapped in prefer{}/else{} so the render MODE resolves itself.
+# Today the scene carries no mode-D-hostile feature, so the PREFERRED branch (mode D —
+# fast, robust MIS in one pass) is selected. The day the scene gains something mode D
+# can't render — most importantly a gradient-index (GRIN) xenon lamp-gas field for the
+# shimmering arc mirage/schlieren (see known-issues.md "GRIN in BDPT" + "Showcase
+# render-mode") — the loader's trial build rejects the mode-D branch and falls back to
+# the mode-B branch (photon tracing: slower, but renders GRIN + everything else). Both
+# branches are identical apart from `mode`.
+prefer {
+    camera "cam" {
+        eye 5.0 2.55 6.85   look_at 5.0 0.95 3.1   up 0 1 0   fov_y 52
+        mode D
+        film { res 1280 720 }
+    }
+} else {
+    camera "cam" {
+        eye 5.0 2.55 6.85   look_at 5.0 0.95 3.1   up 0 1 0   fov_y 52
+        mode B
+        film { res 1280 720 }
+    }
 }
 
 # --- Flyby: a SEAMLESS closed loop that (1) starts front-high, (2) descends the centre
@@ -366,7 +450,8 @@ camera_curve "fly" {
     point 5.55 1.95 3.95     # climb and turn forward
     point 5.25 2.08 5.05     # forward toward the start
     point 5.08 2.10 5.75     # curl back toward the start, LEVEL
-    up 0 1 0   fov_y 70   mode M   frames 144
+    up 0 1 0   fov_y 70   mode M   frames 600
+    fps 30                         # playback rate the showcase assembles at (600 frames -> ~20 s)
     look tangent
     spline centripetal
     density_at 0.00 7   density_at 0.16 18   density_at 0.30 20   density_at 0.42 8
