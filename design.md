@@ -1314,7 +1314,8 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   gains a `tempGrid` + emission params, `DScene` gains a `DEmissiveVolume[]` (+ per-volume Planck-λ CDF)
   and `totalEmissionPower`, and `genPhoton` has the same power-split volume-birth branch +
   `connectEmissionVolume`/`camSplatEmissionAll` device splat (validated GPU-vs-CPU on `scraps/vdb_fire.ftsl`).
-  The backward reference (mode R/V) never samples the grid — it treats media as one homogeneous haze.
+  The **CPU** backward reference (modes R/W/V) never samples the grid — it treats media as one
+  homogeneous haze (`scene.backwardMedium()`); the GPU backward megakernel does sample it.
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.
@@ -1323,7 +1324,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   GPU backward (`bkRadiance`) supports **participating media** natively since
   0.23.0 (free-flight `dMediaSampleCollision` competing with the surface hit,
   volume NEE `bkNeeVolume`, Beer–Lambert `dMediaTransmittance` on NEE + throughput,
-  HG scatter + albedo Russian roulette) — homogeneous *and* heterogeneous.
+  HG scatter + albedo Russian roulette) — homogeneous *and* heterogeneous, and over the
+  **whole** `scene.media` vector by Poisson superposition (bounds regions and density
+  fields honoured). **This is strictly ahead of the CPU twin**, which still collapses
+  everything to `scene.backwardMedium()` = `media.front()` as a single global homogeneous
+  haze with `bounds`/`density` ignored, so a multi-medium scene rendered in mode `R`/`W`
+  looks materially different on the two devices (`gallery_rain` shows its clouds and its
+  spectral rainbow only on the GPU). `main.cpp` warns, after the `-device` resolution, when
+  a render's backward layer actually lands on the degraded CPU path; the real fix is to port
+  the superposition into `backward.h` and delete `backwardMedium()` (known-issues.md).
+  A second CPU/GPU-shared gap: mode `W`'s quadrature covers only the *surface* estimators —
+  the fog branch is still an analog free flight plus a one-sample volume NEE on both devices,
+  so a medium makes mode `W` speckled (deterministic, but not noise-free) at `-spp 1`.
   Spectral **rainbow-phase** media run on the device too since 0.37.0 (M10):
   a per-medium λ×µ Airy phase table + per-λ CDF is uploaded, and the unified
   `dMedPhase`/`dMedPhaseSample` dispatch (bilinear table eval / CDF importance-sample

@@ -4484,27 +4484,24 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 
     // Heterogeneous / bounded participating media (a `density` field or a `bounds`
     // box on `medium`) are honored only by the FORWARD light tracer (modes A/B/C, and
-    // the forward layers of V/P). The backward reference (R/V) and the camera-side layer
-    // of the P composite still treat the medium as a single global HOMOGENEOUS haze —
-    // they ignore the density field and the bounds box. Warn loudly rather than silently
-    // render a different fog than authored. (Tracked in known-issues.md: heterogeneous
-    // media in backward modes.) Mode D (volumetric BDPT) is EXCLUDED here: it handles
-    // multiple superposed, box/sphere/object-bounded AND heterogeneous (density-field)
-    // media correctly (over the full scene.media vector) — subpath medium vertices are
-    // placed by delta tracking and connections weighted by ratio-tracking transmittance —
-    // so it never needs this "single global haze" warning.
-    bool mediaNeedForward = scene.media.size() > 1;   // >1 medium is forward-only (R/V/P)
+    // the forward layers of V/P) and by the DEVICE tracers. The *CPU* backward tracer
+    // (backward.h, used by modes R/W/V and the camera-side layer of P) still collapses
+    // the whole `scene.media` vector to `scene.backwardMedium()` — the FIRST authored
+    // medium, treated as a global homogeneous haze with its `density` and `bounds`
+    // ignored. `mediaNeedForward` records whether this scene would actually notice.
+    // Mode D (volumetric BDPT) is excluded: it handles multiple superposed,
+    // box/sphere/object-bounded AND heterogeneous media correctly on both devices —
+    // subpath medium vertices are placed by delta tracking and connections weighted by
+    // ratio-tracking transmittance. The GPU backward megakernel (render_cuda.cu
+    // dMediaSampleCollision / bkNeeVolume) likewise superposes the full media vector,
+    // per-medium phase function included, so a GPU R/W render is NOT degraded and must
+    // not be warned about — which is why the warning itself now lives AFTER the -device
+    // resolution below rather than here. (Tracked in known-issues.md: the CPU backward's
+    // single-haze limitation, and the CPU/GPU divergence it causes.)
+    bool mediaNeedForward = scene.media.size() > 1;   // >1 medium: only the CPU backward suffers
     for (const Medium& m : scene.media)
         if (m.heterogeneous() || m.bounded) mediaNeedForward = true;
-    if (scene.anyMedium() && mediaNeedForward &&
-        (mode == 'R' || mode == 'V' || mode == 'P')) {
-        std::fprintf(stderr,
-            "[medium] mode %c uses the backward tracer, which treats participating "
-            "media as a SINGLE global HOMOGENEOUS haze (the first authored medium); any "
-            "additional media, `density` fields and `bounds` regions (box/sphere/object) are "
-            "IGNORED here. Render multi/heterogeneous/bounded fog with a forward mode "
-            "(A/B/C) or volumetric BDPT (mode D) for correct results.\n", mode);
-    }
+    mediaNeedForward = mediaNeedForward && scene.anyMedium();
 
     // Resolve the -device request (auto|cpu|gpu) to a concrete GPU flag. The GPU
     // covers the forward light trace (models A/B/C, the forward pass of mode V, and
@@ -4651,6 +4648,40 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             std::fprintf(stderr, "[device] built without CUDA; using CPU "
                                  "(reconfigure with a CUDA toolkit for -device gpu)\n");
 #endif
+    }
+
+    // Now that the device is resolved, warn if this render's BACKWARD layer will actually
+    // run on the CPU tracer, which collapses `scene.media` to `backwardMedium()` (see the
+    // `mediaNeedForward` computation above). The GPU backward megakernel superposes the
+    // full media vector — bounds, density fields and per-medium phase functions included —
+    // so the same scene on the GPU renders the authored fog and gets no warning. Modes:
+    //   R/W — the whole image is the backward tracer; degraded iff !useGpu.
+    //   V   — its backward reference is CPU-by-design, so always degraded.
+    //   P   — only the camera-side (specular) layer is backward; it is on the GPU only when
+    //         the forward layer is too AND the scene is in backward-GPU scope.
+    if (mediaNeedForward) {
+        bool cpuBackward = false;
+        if      (mode == 'R') cpuBackward = !useGpu;
+        else if (mode == 'V') cpuBackward = true;
+#ifdef HAVE_CUDA
+        else if (mode == 'P') cpuBackward = !(useGpu && cudaBackwardSupported(scene, cam));
+#else
+        else if (mode == 'P') cpuBackward = true;
+#endif
+        if (cpuBackward) {
+            const char* layer = (mode == 'R')
+                ? "this render"
+                : (mode == 'V' ? "mode V's backward reference"
+                               : "mode P's camera-side layer");
+            std::fprintf(stderr,
+                "[medium] %s runs on the CPU backward tracer, which treats participating "
+                "media as a SINGLE global HOMOGENEOUS haze (the first authored medium); any "
+                "additional media, `density` fields and `bounds` regions (box/sphere/object) are "
+                "IGNORED here. The GPU backward megakernel does support them, so `-device gpu` "
+                "(mode %c) renders the authored fog; otherwise use a forward mode (A/B/C) or "
+                "volumetric BDPT (mode D).\n",
+                layer, g_whitted ? 'W' : mode);
+        }
     }
 
     // The wavefront (streaming) backend only applies to a forward render on the GPU.

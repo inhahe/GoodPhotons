@@ -5,6 +5,71 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-04): mode `W` is NOT noise-free at `-spp 1` when the scene has a medium — the fog term is still a Monte-Carlo free flight
+
+**Symptom.** `ftrace scenes/gallery_rain.ftsl -mode W -spp 1 -r 480 270` returns a black frame
+covered in isolated, fully-saturated speckles instead of smooth haze. The same scene with
+`-no-media` is clean and perfectly deterministic, and `scenes/cornell.ftsl -mode W -spp 1` is
+clean too, so the surface half of mode W is fine — it's the volume half that is noisy.
+
+**Why.** Mode `W` is meant to be mode `R` with every *estimator* replaced by a fixed quadrature
+(4x4 shadow rays per light, 8 wavelengths per sample, a grid instead of a random lobe). The
+participating-medium branch was never converted. `Backward::radiance` (`src/backward.h` ~1193)
+still does the plain analog free flight
+
+```cpp
+double tMed = -std::log(1.0 - rng.uniform()) / st;
+if (tMed < dSurf) { ...neeVolume(...)...; }        // then analog scatter-or-absorb
+```
+
+and `neeVolume` (~685) draws `rng.uniform()` again for the light-point / sun-cone sample. So each
+pixel gets **one** random scattering depth and **one** random shadow connection: it either misses
+the light entirely (black) or connects and carries the whole `1/pdf` (a blown-out speckle). It is
+*deterministic* in the sense the docs promise — two runs are bit-identical (`scraps/imgdiff.py`
+gives max |diff| 0.00000) because the RNG is seeded from the pixel — but it is not *noise-free*,
+which is the property that makes mode W useful as a 1-spp preview. `-spp 64` converges it, at
+which point mode W costs the same as mode R and its reason to exist is gone.
+
+**Proper fix.** Quadrature-ise the volume branch the same way the surface branch already was:
+march the camera segment in `N` equal-transmittance (or equal-`t`) strata instead of sampling one
+free flight, accumulate `sigma_s * T * phase * NEE` at each stratum, and give `neeVolume` the same
+fixed `4x4` light-sample grid `neeLight` uses (`gridUV(s, G, u1, u2)` at ~540/578) rather than
+`rng.uniform()`. Both are `whitted`-gated, so mode R stays bit-identical.
+
+### OPEN (2026-08-04): the CPU and GPU backward tracers render DIFFERENT fog — the CPU one still collapses `scene.media` to a single global haze
+
+**Symptom.** `scenes/gallery_rain.ftsl -mode W` renders the ceiling cloud, the mesh-bound
+raincloud and a full spectral **rainbow** from the `phase rainbow { droplet_um 500 }` curtain on
+the **GPU**, and none of them on the **CPU** — same scene, same mode, same spp, two different
+pictures:
+
+```
+ftrace scenes/gallery_rain.ftsl -mode W -spp 32 -r 480 270 -o png/gpu.png   # clouds + rainbow
+ftrace scenes/gallery_rain.ftsl -mode W -spp 32 -r 480 270 -device cpu -o png/cpu.png   # neither
+```
+
+**Why.** The device backward megakernel grew full multi-medium support (`dMediaSampleCollision`
+/ `dMediaTransmittance` / `bkNeeVolume` in `src/render_cuda.cu` ~1787, ~6929) — extinction adds
+over `sc.media[0..mediaN)`, homogeneous media use an exact free flight and heterogeneous ones
+Woodcock tracking, and the phase function is looked up per medium — but the CPU twin never did.
+`src/backward.h` still calls `scene.backwardMedium()` (`src/scene.h` ~1021), which is literally
+`media.front()`, and treats it as a *global homogeneous* haze with `bounds` and `density` ignored.
+Its own comment claims it "mirrors backward.h radiance() so the two estimators agree", which is
+no longer true. Mode `V` (which compares a forward render against the **CPU** backward reference
+by design) is therefore also measuring the wrong fog on any multi-medium scene.
+
+**Partially addressed (v0.128.1):** the `[medium] …` warning used to fire for every R/W/V/P
+render on a multi/bounded/heterogeneous-media scene, including GPU ones where nothing is actually
+lost. It now runs *after* the `-device` resolution in `src/main.cpp` and fires only when the
+render's backward layer really lands on the CPU tracer, and it names `-device gpu` as the fix.
+
+**Proper fix.** Port the superposition to `backward.h`: replace the single
+`scene.backwardMedium()` with the same "earliest of the media's independent free-flight samples,
+scatterer chosen by Poisson superposition" loop the forward tracer and the device kernel already
+use, and give `neeVolume` the per-medium phase/albedo lookup. Then delete `backwardMedium()` and
+the warning entirely. Until then, prefer `-device gpu` for any backward render of a scene with
+more than one medium.
+
 ### BUG — DONE (2026-08-04, v0.128.0): the fp32 GPU build lost most of a DISTANT light's energy (a sun modelled as a far-away sphere rendered 2.7x too dim)
 
 **Symptom.** `scenes/gallery_rain.ftsl` modelled the sun as a Lambertian sphere `radius 1.85`

@@ -239,6 +239,24 @@ CPU needs ~625 spp (~80 min) to reach 4 % graininess; mode `W` produces a clean 
 and starts meaning *finer antialiasing and a denser spectrum*; the picture gets sharper,
 never less grainy, and the progress line reads `deterministic` instead of a noise figure.
 
+**One exception: participating media.** The quadrature above covers the *surface* half of
+mode `R`. The fog branch was never converted, so a scene with a `medium` still takes a
+**random free flight** (`−ln(1−u)/σt`) and a **random** volume shadow connection at each
+pixel. The result is bit-identical run to run (the rng is seeded from the pixel), but it is
+*speckled*, not noise-free — at `-spp 1` each pixel either misses the light entirely or
+connects and carries the whole `1/pdf` as a blown-out dot. Add `-no-media` for a genuinely
+clean 1-spp preview, or spend `-spp 32..64` to converge the haze.
+
+**And media are one of the few places the CPU and GPU backward tracers disagree.** The
+**GPU** megakernel superposes the scene's **whole** `media` list — every `bounds` region,
+every `density` field, every per-medium phase function, `phase rainbow` included — so
+`-mode W` on the GPU renders bounded clouds and a real rainbow. The **CPU** backward
+(`backward.h`) still collapses everything to the **first authored medium**, as a global
+homogeneous haze with `bounds`/`density` ignored, so the same scene on `-device cpu` loses
+the clouds and the bow entirely. ftrace warns (`[medium] …`) when a render's backward layer
+lands on the degraded CPU path. Both the noise and the divergence are logged in
+`known-issues.md`.
+
 **`-ambient <v>` — the GI stand-in.** With the diffuse indirect bounce gone, a *closed*
 room previews with black shadows, because everything not directly facing the light is lit
 purely by bounce. `-ambient` adds POV-Ray's flat fill at every diffuse vertex; it is

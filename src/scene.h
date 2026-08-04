@@ -1011,13 +1011,22 @@ struct Scene {
     // point), so transmittance is the product of per-medium transmittances and a
     // collision is the earliest of the media's independent free-flight samples (with
     // the scattering medium chosen by the Poisson superposition theorem). Empty =>
-    // vacuum. (The backward/BDPT modes are homogeneous-only and use backwardMedium().)
+    // vacuum. BDPT (mode D, both devices) and the GPU backward megakernel superpose the
+    // full vector too; only the CPU backward tracer still degrades to backwardMedium().
     std::vector<Medium> media;
 
-    // Backward/BDPT (modes R/V/D and the P composite) support only a single GLOBAL
-    // HOMOGENEOUS haze; they ignore density/bounds. This returns the medium they use
-    // as that haze — the first authored medium — or a disabled default if there is
-    // none. main.cpp warns when an authored medium carries density/bounds for these modes.
+    // The CPU backward tracer (src/backward.h — modes R/W/V and the P composite's
+    // camera-side layer) supports only a single GLOBAL HOMOGENEOUS haze and ignores
+    // density/bounds. This returns the medium it uses as that haze — the first authored
+    // medium — or a disabled default if there is none.
+    //
+    // NOTE this is now a CPU-only limitation, and a source of CPU/GPU divergence: the
+    // device backward megakernel (render_cuda.cu dMediaSampleCollision / bkNeeVolume)
+    // superposes the whole `media` vector, bounds + density fields + per-medium phase
+    // functions included, so a GPU mode-R/W render of a multi-medium scene looks different
+    // (and more correct) than the CPU one. main.cpp warns when a render's backward layer
+    // actually lands on this degraded path. Tracked in known-issues.md; the fix is to port
+    // the superposition into backward.h and delete this accessor.
     const Medium& backwardMedium() const {
         static const Medium none;   // disabled (enabled=false) sentinel
         return media.empty() ? none : media.front();
