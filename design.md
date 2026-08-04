@@ -170,6 +170,23 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   not, and that ordering is also what stops a mesh light double-counting. Such surfaces
   remain emission-on-hit only (no NEE, no forward emission): they glow but illuminate
   nothing, including themselves — logged as a known limitation.
+  0.118.1 fixed only the *backward* (mode R/W) sites; **0.129.0 extends the same fallback
+  to BDPT (mode `D`) on the GPU**, whose s=0 strategy asked the same question through
+  `dIsLightVertex` (`v.lightIdx >= 0`) and `dVertexLe` (`sc.emitters[v.lightIdx]`) and so
+  still rendered these surfaces black, while `bdpt.h`'s `Vertex::Le` / `isLightVertex` —
+  which read `mat->isLight` / `mat->emit(lambda)` — rendered them correctly. Mode D was
+  therefore producing two different images depending on `-device`. Both device predicates
+  now consult `sc.mats[v.matId].matIsLight` / `matEmit`. The MIS densities needed no
+  change: `dVertexPdfLightF` already routes a `BV_SURFACE` vertex down the cosine-
+  Lambertian branch, and `dVertexPdfLightOriginF` returns the same 0 the CPU's
+  `vertexPdfLightOrigin` returns for a `Vertex` with a null `light` (both remapped to 1 by
+  the balance heuristic). Mesh emitters still take the `lightIdx >= 0` branch, so every
+  pre-existing scene is bit-identical.
+  One authoring trap survives on the *quad* side of this: emission is one-sided
+  (`dot(rd, ng) < 0`), and a `quad`'s `ng` is `cross(u, v)`, so swapping `u` and `v` is
+  the difference between a glowing panel and a black one — while every *reflective* slot
+  looks identical either way, because NEE flips the normal toward the light itself. Open
+  in `known-issues.md`.
 - **`geometry.h` / `bvh.h`** — primitives + SAH BVH (split plane by SAH, always
   recurse to LEAF_SIZE, median fallback; front-to-back traversal, ray-slab test
   unrolled; `tEnter` pruning). Triangles use the **Woop watertight** test (JCGT 2013):

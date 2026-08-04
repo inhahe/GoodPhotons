@@ -7461,3 +7461,142 @@ warning. The probe is mode-agnostic; only the call site is gated.
 designed — "render every camera in the scene" — but it is a surprising default for a scene
 that carries a long flypath, and it silently spams the output directory next to the `-o`
 path. Worth at least a printed warning naming how many frames are about to be written.
+
+## OPEN (2026-08-04): a quad's emission is invisible from the side its winding faces away from
+
+The backward tracer only adds a surface's own emission when the camera/specular ray strikes
+the FRONT face:
+
+```cpp
+// src/render_cuda.cu ~7006 (host twin: src/backward.h)
+if (specularArrival && dot(rd, h.ng) < 0) { ... L += thr * specLookup(eSpd, lambda) ... }
+```
+
+A `quad`'s geometric normal is `cross(u, v)`, so
+
+```ftsl
+quad { origin -18 0 -19   u 46 0 0   v 0 0 45   material glowing }   # ng = -y, dark from above
+quad { origin -18 0 -19   u 0 0 45   v 46 0 0   material glowing }   # ng = +y, glows
+```
+
+are visually identical for every *reflective* slot — `bkNeeLight`/`bkNeeEnv` flip the normal
+toward the incoming light themselves, so a diffuse body shades the same either way — but only
+the second one shows its `emit`. The result is a silent, total loss of the emissive component
+with no diagnostic; `scenes/gallery_rain.ftsl`'s wireframe ground rendered pure black for this
+reason (the stone floor it replaced had no `emit`, so the bad winding had gone unnoticed).
+
+Repro: `scraps/_grid_test.ftsl` (flip `u`/`v` on the four tiles).
+
+Proper fix: emission on a single-sided primitive should be authorable. Either (a) treat `quad`
+emission as two-sided by default — test `dot(rd, ng) != 0` and take `|dot|` — since a quad has
+no interior for the "back face is inside the solid" argument to protect, or (b) keep it
+one-sided but add a `double_sided` / `emit_backface` material flag, and (c) either way, warn at
+load time when a scene contains an emissive `quad` whose normal faces away from every camera.
+Option (a) matches what people actually author (a glowing panel), and the one-sided rule is
+only really load-bearing for closed `isosurface`/mesh solids, whose normals are already
+outward.
+
+## OPEN (2026-08-04): `type glossy` renders black in the backward modes (R / W) — no NEE
+
+`bkInteract`'s `D_GLOSSY` case (`src/render_cuda.cu` ~6733, host twin `src/backward.h`)
+reflects the ray into a lobe around the mirror direction and returns. It never calls
+`bkNeeLight` / `bkNeeEnv`. So a Glossy surface in modes R and W contributes *only* whatever its
+mirror ray happens to hit — there is no direct-lighting term at all. Every other reflective
+type either NEEs (Diffuse, DiffuseTransmit, Fluorescent) or is genuinely specular (Mirror,
+Dielectric, ThinFilm), so Glossy is the one type whose backward appearance does not match its
+forward appearance.
+
+Consequence: a rough surface under a small light and a dark surround previews as pure black,
+even at high `-spp`, while modes A/B/C/D/M shade it normally. Verified with
+`scraps/_grid_test.ftsl`: two tiles differing *only* in `type diffuse` vs `type glossy` render
+as dark grey vs `(0,0,0)`. This cost real debugging time on `gallery_rain`, whose ground had to
+be demoted to `type diffuse` to be visible in any preview.
+
+Proper fix: give `D_GLOSSY` a direct-lighting term like the other non-specular types — NEE the
+light with the Cook-Torrance/Phong lobe's BRDF value and MIS it (balance heuristic) against the
+existing lobe-sampled continuation, which already carries `contBsdfPdf`. That is the same
+structure `D_DIFFUSE` uses, just with a non-constant BRDF, and it fixes both the black preview
+and the (currently very high) variance of a glossy surface in mode R.
+
+## OPEN (2026-08-04): `phase rainbow` — the 2048-bin uniform-in-mu table under-resolves large droplets, and monodisperse supernumeraries read as a white arc
+
+Two related problems with `src/rainbow.h`, both visible in `scenes/gallery_rain.ftsl` and both
+reproduced independently in `scraps/bowplot.py` (a Python re-implementation of the same
+construction, using `scipy.special.airy` for an exact Ai).
+
+**1. Table resolution.** The phase function is tabulated as 95 wavelengths x 2048 bins
+*uniform in mu = cos(theta)*. Near the primary bow (theta ~ 138 deg, sin theta ~ 0.66) one bin
+spans `dmu / sin(theta)` ~ 0.085 deg. The principal Airy lobe's half-width is `2.338 / K` with
+`K = (2/h)^(1/3) * (2*pi*a/lambda)^(2/3)`, which shrinks as `a^(2/3)`:
+
+| droplet radius | lobe half-width | bins per lobe |
+|---|---|---|
+| 300 um | ~0.42 deg | ~8 |
+| 500 um | ~0.30 deg | ~5 |
+| 1000 um | ~0.19 deg | ~3 |
+
+At 3 bins per lobe the bow's peak amplitude is a sampling accident of where the bins land, and
+it varies per wavelength (each lambda has its own `theta_rb`), so the *colour* of the arc
+aliases too. Proper fix: tabulate uniform in theta rather than in mu (the bow is a
+theta-domain feature and mu wastes almost all its resolution near the poles), or keep mu but
+add a locally-refined region around each bow's `theta_rb`.
+
+**2. Monodisperse supernumeraries.** With `supernumerary on` the Airy train `Ai(z)^2` rings for
+~11 deg inside the primary, while the *coloured* part of the bow — the spread of `theta_rb`
+between 450 nm (138.76 deg) and 650 nm (137.65 deg) — is only ~1.2 deg wide. So the eye sees a
+broad achromatic ringing band with a thin coloured fringe on each side: "a white curve with
+thin bands of colour on top and bottom", which is exactly what the scene was reporting. Real
+rain is polydisperse and the supernumeraries average away; only the first lobe survives.
+`supernumerary off` already does the right thing, but it is opt-*out*, so the default look is
+the wrong one. Proper fix: make the phase function take a size *distribution* (a
+gamma/Marshall-Palmer with a width parameter) and integrate over it when building the table,
+so `supernumerary on` means "narrow distribution, supernumeraries survive" rather than
+"physically-impossible single droplet size".
+
+## FIXED (2026-08-04, 0.129.0): GPU mode D dropped a *material's own* emission — every non-mesh glowing surface rendered black, while the CPU rendered it
+
+BDPT's s=0 strategy ("the eye path lands on an emitter") asks two questions of the last eye
+vertex: is it a light, and what does it emit. The device answered both by looking up a
+registered `Emitter`:
+
+```cpp
+// src/render_cuda.cu — before
+__device__ static inline bool dIsLightVertex(const DVertex& v) {
+    return v.type == BV_LIGHT || (v.type == BV_SURFACE && v.lightIdx >= 0);
+}
+__device__ static double dVertexLe(...) {
+    if (v.lightIdx < 0) return 0.0;
+    return specLookup(sc.emitters[v.lightIdx].emitSpd, lambda) * invPdfLambda * v.emitPatW;
+}
+```
+
+But **only tessellated geometry registers an Emitter.** A `quad`, an `isosurface` or a CSG
+solid is marched, never tessellated, so it has an emissive *material* (`Material::isLight`,
+`matIsLight` on the device) and `lightIdx == -1`. Both tests therefore failed and the surface
+contributed exactly zero emission on the GPU.
+
+The CPU has always been right: `bdpt.h`'s `Vertex::Le` tests `mat->isLight` and reads
+`mat->emit(lambda)` directly, and `Vertex::isLightVertex` does the same. So mode D produced
+*two different images* depending on `-device`, with no warning — the exact class of divergence
+that is hardest to notice, because the GPU image is not obviously broken, just missing a
+material's glow. (The backward tracer never had the bug: `bkRadiance` already fell back to
+`mp->matEmit` when `dEmitterForMat` returned -1, which is why modes R/W showed the emission
+that mode D did not.)
+
+Found via `scenes/gallery_rain.ftsl`, whose green wireframe ground and stand cages are emissive
+`quad`/`isosurface` geometry: mode W and CPU mode D rendered the grid, GPU mode D rendered a
+featureless grey plane.
+
+Fix: `dIsLightVertex` now also takes the `DScene` and accepts `sc.mats[v.matId].matIsLight`;
+`dVertexLe` falls back to `sc.mats[v.matId].matEmit` when there is no registered emitter,
+keeping the emitter's baked SPD first (it may carry a `power`/`lumens` normalisation the raw
+material spectrum does not) — the same precedence `bkRadiance` uses. Bit-identical for every
+scene whose emissive surfaces are meshes, since those still take the `lightIdx >= 0` branch.
+
+The MIS densities needed no change: `dVertexPdfLightF` already routes a `BV_SURFACE` vertex
+down the cosine-Lambertian branch, and `dVertexPdfLightOriginF` returns 0 for `lightIdx < 0`,
+which `dMisWeight`'s remap-0 turns into 1 — the same 0 the CPU's `vertexPdfLightOrigin`
+returns for a `Vertex` with a null `light`, so the two agree.
+
+Repro (pre-fix): `ftrace -in scraps/_grid_test.ftsl -camera cam -mode D -time 20` — grid absent
+on GPU, present with `-device cpu`.

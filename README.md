@@ -1750,6 +1750,21 @@ do the actual lighting — see `tools/loom/examples/glowing_jack.py`, where a
 gyroid-carved isosurface glows from inside its own filigree while a ceiling panel
 shades it.
 
+**Emission is one-sided — mind a `quad`'s winding.** A surface shows its `emit` only to a
+ray arriving on the *front* face, and a `quad`'s front face is the side `cross(u, v)`
+points at. So
+
+```ftsl
+quad { origin -18 0 -19  u 46 0 0  v 0 0 45  material glowgrid }   # normal -y: dark from above
+quad { origin -18 0 -19  u 0 0 45  v 46 0 0  material glowgrid }   # normal +y: glows
+```
+
+differ only in the order of `u` and `v`, and only the second one lights up. Every
+*reflective* slot looks identical either way — direct lighting flips the normal toward the
+light itself — so a mis-wound emissive quad shades perfectly normally and silently loses
+just its glow. If a glowing panel or floor renders as a plain lit surface, swap `u` and `v`
+first.
+
 ---
 
 ## Geometry

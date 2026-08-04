@@ -5816,8 +5816,16 @@ __device__ static inline double dMediumScatterF(const DScene& sc, const DVertex&
                                                 const DVec3& wo, const DVec3& wi, Real lambda) {
     return (double)medAlbedo(sc.media[v.mediumId], lambda) * dPhaseF(sc, v, wo, wi, lambda);
 }
-__device__ static inline bool dIsLightVertex(const DVertex& v) {
-    return v.type == BV_LIGHT || (v.type == BV_SURFACE && v.lightIdx >= 0);
+// Device twin of bdpt.h Vertex::isLightVertex. The `matIsLight` half is NOT redundant with
+// `lightIdx >= 0`: only tessellated geometry registers an Emitter, so an emissive `quad`,
+// `isosurface` or CSG solid has an emissive MATERIAL but no emitter at all, and testing
+// lightIdx alone silently dropped its self-emission from the s=0 strategy — a GPU-only
+// blackout of every non-mesh glowing surface, where the CPU (which has always tested
+// mat->isLight) rendered it. See dVertexLe for the radiance half of the same fix.
+__device__ static inline bool dIsLightVertex(const DScene& sc, const DVertex& v) {
+    if (v.type == BV_LIGHT) return true;
+    if (v.type != BV_SURFACE) return false;
+    return v.lightIdx >= 0 || (v.matId >= 0 && sc.mats[v.matId].matIsLight);
 }
 // PBRT's Vertex::IsDeltaLight (device twin of bdpt.h Vertex::isDeltaLight): this vertex IS
 // a light whose emission carries a Dirac delta, so the "eye path lands on the light" (s=0)
@@ -5961,7 +5969,8 @@ __device__ static float dVertexPdfLightF(const DScene& sc, const DVertex& cur, c
     float invD2 = 1.0f / d2;
     DVec3 wn = w * (Real)sqrtf(invD2);
     // Only a BV_LIGHT endpoint can be a delta emitter: spot/sun carry no geometry, so an
-    // emissive SURFACE vertex (which also has lightIdx >= 0) always takes the cosine branch.
+    // emissive SURFACE vertex — whether or not it registered an emitter — always takes the
+    // cosine branch, which is exactly what an unregistered glowing quad/isosurface wants.
     const DEmitter* em = (cur.type == BV_LIGHT && cur.lightIdx >= 0) ? &sc.emitters[cur.lightIdx]
                                                                      : nullptr;
     float pdf;
@@ -6031,12 +6040,22 @@ __device__ static float dVertexPdfLightOriginF(const DScene& sc, const DVertex& 
     return (float)((em.power / sc.totalPower) / em.area);
 }
 // Emitted radiance (single wavelength) leaving a light vertex toward w.
+//
+// Prefer the registered emitter's BAKED spd — it may carry a `power`/`lumens` flux
+// normalisation the raw material spectrum does not — and fall back to the material's own
+// `emit` when this geometry registered no emitter. Only tessellated geometry registers one,
+// so that fallback is what makes an emissive `quad` / `isosurface` / CSG solid visible in
+// mode D at all; without it the GPU returned 0 here and the surface rendered black while the
+// CPU (bdpt.h Vertex::Le, which reads mat->emit unconditionally) rendered it correctly. Same
+// emitter-then-material precedence the backward tracer uses in bkRadiance.
 __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVec3& w,
                                    Real lambda, double invPdfLambda) {
-    if (v.lightIdx < 0) return 0.0;
+    const double* eSpd = nullptr;
+    if (v.lightIdx >= 0)                                  eSpd = sc.emitters[v.lightIdx].emitSpd;
+    else if (v.matId >= 0 && sc.mats[v.matId].matIsLight) eSpd = sc.mats[v.matId].matEmit;
+    if (!eSpd) return 0.0;
     if (ddot(v.ng, w) <= 0.0) return 0.0;
-    return (double)specLookup(sc.emitters[v.lightIdx].emitSpd, lambda) * invPdfLambda
-           * (double)v.emitPatW;
+    return (double)specLookup(eSpd, lambda) * invPdfLambda * (double)v.emitPatW;
 }
 // Emitter that owns an emissive surface material (mirrors Scene::emitterForMat).
 __device__ static int dEmitterForMat(const DScene& sc, int matId) {
@@ -8573,7 +8592,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     const double invPdfLambda = hb.invPdf[0];
     isSplat = 0;
     nUpConn = 0;                    // set to the real width only once a contribution exists
-    if (t > 1 && s != 0 && dIsLightVertex(eye[t - 1])) return 0.0;
+    if (t > 1 && s != 0 && dIsLightVertex(sc, eye[t - 1])) return 0.0;
 
     double L = 0.0;
     int nUp = 1;                    // live wavelengths for THIS connection (set per branch)
@@ -8586,7 +8605,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     if (s == 0) {
         if (t < 2) return 0.0;
         const DVertex& pt = eye[t - 1];
-        if (!dIsLightVertex(pt)) return 0.0;
+        if (!dIsLightVertex(sc, pt)) return 0.0;
         DVec3 wo = normalize(eye[t - 2].p - pt.p);
         nUp = pt.nUp;
         double Le = dVertexLe(sc, pt, wo, lambda, invPdfLambda);
