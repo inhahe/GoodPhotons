@@ -5,6 +5,57 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — OPEN (2026-08-03): in mode D/U a `sun`/`env`/`spot`/`collimated` light contributes NOTHING, silently — and it STEALS the sample budget from the lights that work
+
+`src/bdpt.h:857` (light subpath) and `src/bdpt.h:1104` (the `s == 1` NEE connection) both do
+
+```cpp
+int ei = scene.selectEmitter(rng);
+const Emitter& em = scene.emitters[ei];
+if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
+    em.shape == EmitterShape::Sun || em.collimated)
+    return 0;                                    // unsupported in BDPT scope
+```
+
+`src/vcm.h:489,796` do the same. Nothing anywhere warns the user. So a scene that says
+`light sun { … }` and renders in mode D produces an image with no sun in it and no
+diagnostic — the light is simply not there, and the only clue is that the picture is dark.
+
+The second half is worse than the first and is easy to miss. `Scene::selectEmitter`
+(`src/scene.h:1408`) samples a **power-weighted** CDF, and the guard above `return 0`s
+*without resampling* — it does not pick a different emitter and it does not reweight. An
+unsupported emitter therefore consumes a share of every light-sampling attempt equal to its
+share of scene power, and throws all of it away. That share is normally overwhelming,
+because these are exactly the light types used for the sun: a solar emitter carrying ~10⁹ W
+next to a 15 kW room lamp takes >99.999 % of the samples and returns zero for every one of
+them, so the *supported* lights are starved too and the whole frame goes essentially black.
+The failure does not look like "the sun is missing", it looks like "mode D is broken".
+
+Hit while building `scenes/gallery_rain.ftsl`, which needs mode D (only D renders both this
+scene's bounded heterogeneous media *and* its directly-seen dielectrics) and also needs a
+sun. The scene works around it by modelling the sun as what it physically is — a sphere of
+finite angular diameter far away (400 m radius 1.85 m, subtending the sun's own 0.53°),
+which is a `Sphere` emitter and therefore connectible. That is honest physics rather than a
+hack, but it should be a choice, not a forced move.
+
+Proper fix, in order of value:
+
+1. **Diagnose it.** At load, if the selected mode is D or U and any emitter is
+   `Spot`/`Env`/`Sun`/`collimated`, print a warning naming the light and the mode, and say
+   it will contribute nothing. Cheap, and it turns a silent black frame into a message.
+2. **Stop the budget theft** even where the light type stays unsupported: build the
+   power-weighted CDF over *connectible* emitters only when the renderer is BDPT/VCM, so an
+   unsupported light costs nothing instead of costing everything. Without this, fix 1 tells
+   the user why the image is black but the image is still black.
+3. **Support them properly.** `Sun` and `collimated` are directional deltas: they have no
+   sampleable area, so a light subpath must start on a disc at the scene bound and the
+   connection pdf is a delta in direction — the standard treatment is to allow them only in
+   `s == 1` NEE (where the direction is fixed by the shading point) and forbid `s > 1`,
+   which is exactly how a pinhole camera's `t == 1` is handled on the eye side. `Env` needs
+   the infinite-light branch that `src/bdpt.h:400,516` explicitly leaves out.
+
+Fix 1 and 2 together are small and remove the trap; fix 3 is the real feature.
+
 ### DONE (2026-08-03): the gallery Klein bottle is now a glassblower's bottle WITH THE INTERNALS, and it needs no mount
 
 `scenes/gallery.ftsl`'s `klein` was `meshes/klein_hunyuan.obj`, an image-to-3D reconstruction: the

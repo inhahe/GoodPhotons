@@ -4244,8 +4244,10 @@ private:
                                      L.scene.mats[id].emit, binWidth_, id);
             }
         }
-        // Record the loaded mesh's world AABB for object-name fog bounds (a mesh bound
-        // is approximated by its box — true containment is deferred, see known-issues).
+        // Record the loaded mesh's world AABB for object-name fog bounds. This is no
+        // longer the *shape* of such a bound — `bounds { object "..." }` solid-voxelizes
+        // the mesh and carves the silhouette (see the Mesh branch of addMedium) — it is
+        // the TRACKING bound: delta/ratio tracking still clips to a box, and this is it.
         if (!b.name.empty() && L.scene.tris.size() > triStart) {
             Aabb box; bool first = true;
             for (size_t t = triStart; t < L.scene.tris.size(); ++t) {

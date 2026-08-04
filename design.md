@@ -1171,6 +1171,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     safe because `Scene::tris` is indexed only via `MeshGroup::triStart/triCount` (fixed up
     there); mesh area lights *copy* their triangles into `Emitter::meshTris`, and the key is
     refused on an emissive material anyway.
+  - **`scenes/gallery_rain.ftsl`** is the shipped worked example, and it exercises the whole
+    path in anger: `cloud1.glb` (1.85 M tris, two disjoint lobes — the case parity fill gets
+    wrong) bakes to a 195×76×187 lattice at 29.3 % solid, uploads as 2406/6000 sparse bricks
+    (5.3 MB → 2.4 MB VRAM), and all 1.85 M triangles are then stripped by `shape_only`. Under
+    it hangs a rain curtain using the `rainbow` phase function, lit through a ceiling slot by
+    a sun. Three things about that scene are load-bearing and non-obvious, so they are
+    written up in its header rather than only here: the sun is a **distant sphere**, not
+    `light sun`, because the latter contributes nothing in mode D (see known-issues, "a
+    `sun`/`env`/`spot`/`collimated` light contributes NOTHING in mode D/U"); the global haze
+    is **bounded to the room**, because an unbounded one extinguishes a 400 m light by
+    e^-4.8; and the sky panel **stops short of the solar shaft**, because `light area` is real
+    opaque geometry in the BVH and a full-sky panel eclipses the sun outright.
 - **Volumetric blackbody emission ("fire")** — a `Medium` may carry a second `temperature` grid
   (`Medium::temperature`/`tempPeak`/`emitKelvin`/`emissionScale`; `emissive()`/`temperatureAt()`/
   `emissionAt()` in `scene.h`), turning its hot voxels into a self-illuminating isotropic volume

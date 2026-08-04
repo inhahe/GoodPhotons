@@ -2472,7 +2472,10 @@ fly-around: N frames on a circle around a `center`, for MP4 orbits), `camera_cur
 (`cornell.ftsl`, `fisheye.ftsl`, `spotlight.ftsl`, `envlight.ftsl`,
 `material_presets.ftsl`, `realcam.ftsl`, `implicit.ftsl`, `function.ftsl`,
 `procedural.ftsl`, `uv_native.ftsl`, `showcase_orbit.ftsl`, `translucency.ftsl`,
-`gallery.ftsl` (a large room packed with varied materials around a gold gyroid), …).
+`gallery.ftsl` (a large room packed with varied materials around a gold gyroid),
+`gallery_rain.ftsl` (the same hall with weather in it: a fog cloud whose *shape* is a
+mesh, a rain curtain under it using the `rainbow` phase function, and a ceiling slot plus
+a distant-sphere sun sited so a real 42° primary bow lands in frame), …).
 
 **Scene-header defaults (`default_mode`, `fps`).** The `scene { … }` header can set
 two project-wide defaults alongside `units`/`spectral`:
