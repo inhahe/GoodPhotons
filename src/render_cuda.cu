@@ -11693,17 +11693,21 @@ bool cudaBdptSupported(const Scene& scene) {
     // samples the two lobes, dBsdfF/dBsdfPdf evaluate them, and dConnectBDPT allows
     // back-hemisphere connections (|cos| G, shadow-terminator skip).
     //
-    // No per-MATERIAL reject remains here. The features BDPT can't render at all —
-    // fluorescence, layered stacks, and spot/env/collimated lights — are NOT GPU-vs-CPU
-    // gaps: main.cpp's bdptUnsupportedFeature() flags them at the mode-D guard, which
-    // REFUSES the render (or demotes D->B with -on-unsupported fallback) on both backends
-    // BEFORE any BDPT dispatch, so a fluorescent/spot/env scene never reaches the BDPT path
-    // (CPU or GPU) to begin with. cudaBdptSupported is therefore only ever consulted for
-    // scenes already within BDPT scope. The spot/env/collimated emitter check below is kept
-    // purely as belt-and-suspenders (mirrors bdptUnsupportedFeature); if it were ever
-    // reached it just keeps the CPU and GPU BDPT scope identical.
+    // No per-MATERIAL reject remains here. Env and collimated lights are outside BDPT's
+    // transport scope on BOTH backends: main.cpp's bdptUnsupportedFeature() flags them at
+    // the mode-D guard, which REFUSES the render (or demotes D->B with -on-unsupported
+    // fallback) before any BDPT dispatch, so such a scene never reaches the BDPT path (CPU
+    // or GPU) at all. They are re-checked below purely as belt-and-suspenders.
+    //
+    // SPOT and SUN lights are a genuine GPU-vs-CPU gap: the CPU BDPT renders them (delta
+    // emission + NEE + the delta-aware MIS exclusions, see bdpt.h), the device kernels do
+    // not yet. Rejecting them here routes those scenes to the CPU BDPT — which is correct
+    // but slower — instead of letting dGenerateLightSubpath/dConnectBDPT silently return 0
+    // for the emitter they just spent a CDF draw selecting, which would both drop the
+    // light entirely AND steal its share of the sample budget from the lights that work.
     for (const auto& em : scene.emitters)
-        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env || em.collimated)
+        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
+            em.shape == EmitterShape::Sun || em.collimated)
             return false;
     // Gradient-index (GRIN) media bend rays along curved paths; BDPT's connection geometry,
     // area-measure pdf conversion and MIS weights all assume STRAIGHT connecting segments, so

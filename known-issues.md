@@ -5,56 +5,107 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### BUG — OPEN (2026-08-03): in mode D/U a `sun`/`env`/`spot`/`collimated` light contributes NOTHING, silently — and it STEALS the sample budget from the lights that work
+### BUG — DONE (2026-08-04, v0.124.0): mode D could not render `spot` / `sun` lights at all — now it can (and the entry that claimed it did so *silently* was WRONG)
 
-`src/bdpt.h:857` (light subpath) and `src/bdpt.h:1104` (the `s == 1` NEE connection) both do
+**Correction first.** The original version of this entry claimed a mode-D scene containing a
+`sun`/`env`/`spot`/`collimated` light rendered black *with no diagnostic*, and that the
+unsupported emitter *stole* its power-weighted share of the sample budget from the lights
+that work. That was wrong, and reading the code rather than trusting the writeup is what
+caught it. `main.cpp`'s `bdptUnsupportedFeature()` has always listed all four types and is
+consulted at the mode-D/U guard *before* any BDPT dispatch, so the engine refused loudly:
 
-```cpp
-int ei = scene.selectEmitter(rng);
-const Emitter& em = scene.emitters[ei];
-if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
-    em.shape == EmitterShape::Sun || em.collimated)
-    return 0;                                    // unsupported in BDPT scope
+```
+[mode D] camera 'cam' uses spot / environment / sun / collimated lights, which that mode
+can't render; use mode A/B/C/R, add a prefer{}/else{} fallback, or pass
+-on-unsupported fallback|strip.
 ```
 
-`src/vcm.h:489,796` do the same. Nothing anywhere warns the user. So a scene that says
-`light sun { … }` and renders in mode D produces an image with no sun in it and no
-diagnostic — the light is simply not there, and the only clue is that the picture is dark.
+`-on-unsupported strip` cannot bypass it either (`stripUnsupportedFeature` only strips GRIN;
+anything else falls back to mode R). So the `return 0` guards inside `bdpt.h` / `vcm.h` were
+unreachable belt-and-suspenders, not a live silent-corruption path. What was real was the
+plain **missing feature**: mode D simply refused those scenes.
 
-The second half is worse than the first and is easy to miss. `Scene::selectEmitter`
-(`src/scene.h:1408`) samples a **power-weighted** CDF, and the guard above `return 0`s
-*without resampling* — it does not pick a different emitter and it does not reweight. An
-unsupported emitter therefore consumes a share of every light-sampling attempt equal to its
-share of scene power, and throws all of it away. That share is normally overwhelming,
-because these are exactly the light types used for the sun: a solar emitter carrying ~10⁹ W
-next to a 15 kW room lamp takes >99.999 % of the samples and returns zero for every one of
-them, so the *supported* lights are starved too and the whole frame goes essentially black.
-The failure does not look like "the sun is missing", it looks like "mode D is broken".
+**What was implemented.** `spot` and `sun` lights are now first-class in BDPT (mode D), CPU
+backend, following PBRT's delta-light treatment:
 
-Hit while building `scenes/gallery_rain.ftsl`, which needs mode D (only D renders both this
-scene's bounded heterogeneous media *and* its directly-seen dielectrics) and also needs a
-sun. The scene works around it by modelling the sun as what it physically is — a sphere of
-finite angular diameter far away (400 m radius 1.85 m, subtending the sun's own 0.53°),
-which is a `Sphere` emitter and therefore connectible. That is honest physics rather than a
-hack, but it should be a choice, not a forced move.
+* `bdpt.h` `isDeltaEmitter` / `isInfiniteEmitter` / `Vertex::isDeltaLight()` classify them.
+* `deltaLightSubpath()` emits light subpaths: a spot fires from its point uniformly into the
+  outer cone (pdf `1/(2π(1-cosOuter))`, the smoothstep penumbra carried as *throughput* so
+  the mean walk weight is still the emitter's power); a sun fires from a point on a disc of
+  radius `sceneRadius` one radius upstream of the scene centre (pdf `1/(πR²)`) along a
+  direction drawn inside the solar cone (pdf `1/Ω`).
+* `connectBDPT`'s `s == 1` NEE handles both: the spot connects deterministically to its point
+  with the cone falloff, the sun samples a direction in its cone and shadow-rays to the scene
+  exit (no `1/dist²`, no `cosLight` — the source is at infinity). All three emission models
+  now share one λ-independent weight `Wgeom`.
+* `vertexPdfLight` gained the spot-cone and the *planar* infinite-light density branches, and
+  `vertexPdfLightOrigin` returns 0 for a delta light — matching PBRT, and matching the 0 the
+  light subpath stores in `path[0].pdfFwd`, so both sides of every MIS ratio agree.
+* `generateLightSubpath` applies PBRT's "correct subpath densities for infinite area lights"
+  patch (rewriting `path[1].pdfFwd` to the planar form) — without it the forward and reverse
+  densities disagree and the MIS weights are wrong.
+* `misWeight` drops the `s == 0` strategy for a delta light (`light[0].isDeltaLight()`), since
+  no eye ray can land on a mathematical point or on an infinitely distant disc.
+* Because `s == 0` is gone, the sun's own disc — and every mirror/water glint of it — would
+  otherwise vanish, and NEE cannot supply those (a specular vertex is not connectible). So
+  `randomWalk` now reports where an eye ray *escaped* (`struct Escape`) and `renderRows` adds
+  the sun's radiance with MIS weight exactly 1 when every eye vertex on the path was delta —
+  precisely the case where no other strategy competes.
 
-Proper fix, in order of value:
+**Validated** by rendering the same camera in mode D and in mode R (the backward reference)
+and comparing mean luminance (`python scraps/imgdiff.py A.png B.png`):
+`scenes/_spot_cornell.ftsl` agrees to 0.2 %, `scenes/_sun_check.ftsl` to 0.01 %, and the new
+mixed regression scene `scenes/_deltalight_mix.ftsl` (area quad + spot + sun + a mirror
+sphere) to 0.33 % — R at 20000 spp vs D at 6000 spp, mean |diff| 0.0039. That last scene
+authors **absolute** light units on purpose: a non-absolute pair is auto-exposed per image,
+so comparing two auto-exposed frames by mean luminance could not have detected a global
+energy error at all. Both modes put a single saturated pixel at (53,104) — the sun's disc
+reflected off the mirror sphere, i.e. exactly the escaped-ray strategy — and mode D is
+visibly *cleaner* than mode R (which sprays fireflies over that mirror), as expected of a
+bidirectional estimator.
 
-1. **Diagnose it.** At load, if the selected mode is D or U and any emitter is
-   `Spot`/`Env`/`Sun`/`collimated`, print a warning naming the light and the mode, and say
-   it will contribute nothing. Cheap, and it turns a silent black frame into a message.
-2. **Stop the budget theft** even where the light type stays unsupported: build the
-   power-weighted CDF over *connectible* emitters only when the renderer is BDPT/VCM, so an
-   unsupported light costs nothing instead of costing everything. Without this, fix 1 tells
-   the user why the image is black but the image is still black.
-3. **Support them properly.** `Sun` and `collimated` are directional deltas: they have no
-   sampleable area, so a light subpath must start on a disc at the scene bound and the
-   connection pdf is a delta in direction — the standard treatment is to allow them only in
-   `s == 1` NEE (where the direction is fixed by the shading point) and forbid `s > 1`,
-   which is exactly how a pinhole camera's `t == 1` is handled on the eye side. `Env` needs
-   the infinite-light branch that `src/bdpt.h:400,516` explicitly leaves out.
+**What is still unsupported, deliberately** — each refused loudly at the mode guard, never
+silently dropped:
 
-Fix 1 and 2 together are small and remove the trap; fix 3 is the real feature.
+* `env` lights in mode D/U. An environment is an infinite *area* light: it needs escaped-ray
+  radiance from every direction plus importance-sampled lat-long emission, which the BDPT
+  random walk and its MIS densities don't do. This is the genuinely large remaining piece.
+* `collimated` lights in mode D/U. A delta emission *direction* from a finite surface means a
+  shading point can never next-event-estimate it (the `s == 1` strategy has zero measure);
+  only forward transport reaches it.
+* `spot` / `sun` in **mode U (VCM)** — see the entry below.
+* `spot` / `sun` in the **GPU** BDPT — see the entry below.
+
+### DEBT — OPEN (2026-08-04): VCM (mode U) still refuses `spot` / `sun` lights that BDPT now renders
+
+`main.cpp`'s `vcmUnsupportedFeature()` (and the mode-`U` branch of `modeFeatureUnsupported`)
+now carry their own emitter check rejecting `Spot`/`Sun`, because vertex *merging* carries its
+own MIS weights (the vc/vm partial sums in `src/vcm.h`) which would each need the same
+delta-light exclusions the BDPT balance heuristic just got. `vcm.h:489,796` still skip those
+emitters outright, so without the guard mode U really *would* drop them silently — the guard
+is what makes the refusal loud.
+
+Proper fix: port the delta-light treatment into `vcm.h` — `traceLightSubpath` needs the
+`deltaLightSubpath` emission cases, the NEE path needs the spot/sun connection geometry, and
+the vc/vm weight recursions need to skip the strategies a delta light can't be sampled by
+(no `s == 0`, and merging at the light vertex itself is impossible). Worth doing next; the
+BDPT code in `bdpt.h` is the reference to mirror.
+
+### DEBT — OPEN (2026-08-04): the GPU BDPT kernels don't do delta lights, so a spot/sun scene falls back to the (slower) CPU BDPT
+
+`cudaBdptSupported()` (`src/render_cuda.cu`) now rejects `Spot` and `Sun` alongside `Env` and
+`collimated`, which routes such a scene to the CPU BDPT with a printed
+`[device] … ; using CPU` notice. That is *correct* — the alternative would be
+`dGenerateLightSubpath` / `dConnectBDPT` returning 0 for the emitter they just spent a CDF
+draw selecting, which really would drop the light and steal its share of the sample budget
+(the failure mode this file previously mis-attributed to the CPU path) — but it costs the GPU
+speedup on exactly the daylight scenes that want it most.
+
+Proper fix: mirror the `bdpt.h` changes into `render_cuda.cu`. The device code is a close
+transliteration of the host code (`dGenerateLightSubpath` ↔ `generateLightSubpath`,
+`dConnectBDPT` ↔ `connectBDPT`, `dVertexPdfLight` ↔ `vertexPdfLight`), so the port is
+mechanical; the fiddly parts are the infinite-light `path[1].pdfFwd` patch and threading the
+escaped-ray sun radiance through the device path accumulator.
 
 ### DONE (2026-08-03): the gallery Klein bottle is now a glassblower's bottle WITH THE INTERNALS, and it needs no mount
 

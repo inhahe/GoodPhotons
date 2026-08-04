@@ -790,7 +790,7 @@ that converges to the same physical image.
 | `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe; fully on the GPU |
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
-| `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / spot / env lights |
+| `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / env / collimated lights (spot & sun are CPU-only) |
 | `M` | Many cameras sharing one lighting solution (flythroughs); reusable/persistable map | Fast per frame *(after one shared pass)* | ✓ *(walks to diffuse)* | — | ✓ | ✓ *(direct query)* | Direct query blurs contact shadows (use `-pmfg`) |
 | `S` | **Caustics / SDS**; progressive, bounded memory | Slow *(many passes)* | ✓ | ✓ | ✓✓ | ✗ | Many passes to converge; CPU only |
 | `U` | Robust "have it all" (diffuse GI + caustics), no per-scene mode picking | Heaviest / pass | ✓ | ✓ | ✓ | ✗ | Heaviest per-pass cost; CPU only |
@@ -854,8 +854,9 @@ that converges to the same physical image.
   camera-side layer falls back to the CPU. *Cost:* more expensive than plain `B`;
   there can be a subtle seam between the two layers. With a **physical lens** the
   pinhole-splat forward pass can't form the lens image, so `P` automatically routes
-  to the lens-aware BDPT (`D`) — or, if the scene is outside BDPT scope (fog / env /
-  spot / fluorescence), falls back to the backward realistic camera (`R`).
+  to the lens-aware BDPT (`D`) — or, if the scene is outside BDPT scope (env /
+  collimated lights, fluorescence, layered materials, GRIN media), falls back to the
+  backward realistic camera (`R`).
 - **`D` — BDPT (most general, slowest per sample).** One unbiased estimator that
   traces a light *and* a camera subpath and MIS-combines every connection, so it
   captures **specular-first pixels and diffuse caustics in a single pass** on the
@@ -869,8 +870,13 @@ that converges to the same physical image.
   in-scatter vertices, HG-phase connections and transmittance-weighted edges (subpath
   medium vertices placed by delta tracking, connections weighted by ratio-tracking
   transmittance), so fog *inside a glass shell* images correctly here (a case the
-  next-event modes leave dark). *Cost:* highest cost per sample, and it **does not support
-  fluorescence or spot & env lights** (use `B`/`P` or `R` for those).
+  next-event modes leave dark). Since 0.124.0 it also renders **`spot` and `sun` lights** —
+  delta emitters, so the strategies that would have to sample the Dirac (an eye path
+  *landing* on the light) are dropped from the MIS weight, and a `sun` additionally gets an
+  escaped-ray strategy so a mirror can throw its disc back at the lens. *Cost:* highest cost
+  per sample; it **does not support fluorescence, layered materials, or env & collimated
+  lights** (use `B`/`P` or `R` for those), and a spot/sun scene runs on the **CPU** (the GPU
+  BDPT kernels don't do delta lights yet).
 - **`M` — photon map (view-independent, reusable).** Traces a forward photon pass
   **once** and stores every diffuse deposit in a **view-independent photon map** (a
   uniform hash grid), then forms the camera image by a backward camera pass. By default
@@ -991,7 +997,7 @@ stay non-resumable.
   on a pinhole scene); otherwise the CPU. Prints its choice.
 - **`-device gpu` / `cpu`.** Force the backend. The GPU **falls back to the CPU**
   for the mode-`P` camera-side layer and for `R`/`D` scenes outside their GPU scope
-  (spot/collimated lights; GRIN media in mode `D` BDPT — mode `R` now runs fog, spectral
+  (spot/sun/collimated lights; GRIN media in mode `D` BDPT — mode `R` now runs fog, spectral
   **rainbow-phase** media, **GRIN gradient-index bending**, fluorescence, and constant *and*
   image-based env lights on the device), and for
   fluorescent/oversized-mix forward scenes (mode `M`'s `-pmfg` final gather now runs
@@ -1008,11 +1014,13 @@ stay non-resumable.
   interior absorption, **diffuse-transmit** (two-sided Lambertian — both lobes +
   back-hemisphere connections), and **frosted (rough) glass** (stochastic-delta lobe jitter
   by per-hit roughness) all render **on-device** with MIS-consistent densities — the GPU
-  BDPT scope now matches the CPU BDPT exactly (no per-material fallback). (Fluorescence,
-  layered stacks, and spot/env/collimated lights aren't a GPU limitation — BDPT can't render
-  them on *any* backend, so mode `D` refuses or drops to mode `B` for those scenes on both
-  CPU and GPU; use mode B/P/R for them. GRIN media keep an in-scope mode-`D` scene on
-  the CPU; spectral **rainbow-phase** media now render on-device in mode `D`.) **Parametric records** (a
+  BDPT scope now matches the CPU BDPT for every *material* (no per-material fallback).
+  (Fluorescence, layered stacks, and env/collimated lights aren't a GPU limitation — BDPT
+  can't render them on *any* backend, so mode `D` refuses or drops to mode `B` for those
+  scenes on both CPU and GPU; use mode B/P/R for them. **Spot and sun lights** are the one
+  real GPU gap: the CPU BDPT renders them (since 0.124.0), the device kernels don't, so such
+  a scene falls back to CPU BDPT with a printed notice. GRIN media likewise keep an in-scope
+  mode-`D` scene on the CPU; spectral **rainbow-phase** media now render on-device in mode `D`.) **Parametric records** (a
   material's slots driven by a per-hit driver sampling a named LUT bank — see *Parametric
   records* below) run on the **GPU forward, backward, and BDPT (`D`) tracers for both the
   reflect/albedo and roughness slots** (constant stop selectors bake into the device
@@ -1133,7 +1141,7 @@ mode `P` (which routes to `D`/`R`). It maps the sensor across the film width, so
 film whose aspect matches the sensor (e.g. `res 360 240` for a 3:2 sensor) covers it
 without cropping, while a mismatched aspect crops. It does not model inter-element
 flare/ghosting or shaped-iris bokeh. On the GPU it inherits its mode's scope (no
-fog/env/spot/fluorescence, and at most 16 lens surfaces); outside that scope it falls
+env/spot/sun/collimated lights or fluorescence, and at most 16 lens surfaces); outside that scope it falls
 back to the CPU automatically.
 
 ---
@@ -1637,8 +1645,10 @@ Unlike every other light, the sun costs nothing in forward modes: photons are bo
 disc the size of the scene's own cross-section, aimed down the beam, so **every** photon
 enters the scene instead of most missing it. Backward modes next-event-estimate it
 inside its cone, and the disc itself is directly viewable (aim a camera at it). Runs on
-both CPU and GPU in modes A/B/C/R/P/M/S (mode `D`/`U` refuse it, like `spot` and `env`).
-See `scenes/_sun_check.ftsl`, and `ftrace -checksun` for the deterministic self-test
+both CPU and GPU in modes A/B/C/R/P/M/S, and on the **CPU** in mode `D` (BDPT — since
+0.124.0, together with `spot`; mode `U` VCM and the GPU BDPT kernels still refuse both,
+and a mode-`D` sun scene therefore falls back to CPU BDPT with a printed notice).
+See `scenes/_sun_check.ftsl` and `scenes/_deltalight_mix.ftsl`, and `ftrace -checksun` for the deterministic self-test
 (cone solid angle, exposure invariance, uniform-in-solid-angle cone sampling, and
 NEE/direct-view rim agreement).
 

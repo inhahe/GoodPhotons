@@ -130,8 +130,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   Backward does cone NEE and adds the direct disc view on a ray miss only when
   `specularArrival` is true — a single unbiased estimator with **no MIS weight**, since
   NEE runs at precisely the material types that then clear that flag. `Scene::sunCount`
-  gates all of it, so sun-free scenes are untouched. Not area-connectible, so `bdpt.h` /
-  `vcm.h` reject it like Spot/Env. The Preetham sky's `sun_disk separate` option
+  gates all of it, so sun-free scenes are untouched. Not area-*connectible*, but since
+  0.124.0 **CPU BDPT (`bdpt.h`) renders a Sun and a Spot anyway** — see "Delta lights in
+  BDPT" below. `vcm.h` and the GPU BDPT kernels still reject both, and Env/collimated stay
+  outside BDPT entirely. The Preetham sky's `sun_disk separate` option
   (`sky::SunDisk`) unbakes the solar disc from the env map and registers an
   energy-matched Sun instead — the same picture, converging ~20× faster in forward modes.
   **Mesh area lights** (since 0.41.0): a
@@ -683,6 +685,36 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   whose hero value is 0 (a gel filter, a saturated albedo) can't drop live
   secondaries. Delta vertices de-hero *except* Mirror and Filter, which pick their
   continuation without consulting λ and so set `keepBundle`.
+
+  **Delta lights in BDPT** (since 0.124.0): mode `D` renders `light spot` and `light sun`.
+  Both are Dirac emitters, so the strategies that would have to *sample* the delta are
+  unavailable and must be dropped from the balance heuristic — otherwise the surviving
+  strategies are under-weighted and the image loses energy. The pieces, all in `bdpt.h`:
+  `isDeltaEmitter`/`isInfiniteEmitter` classify an `Emitter`; `Vertex::isDeltaLight()`
+  reports it at a vertex; `vertexPdfLightOrigin` returns **0** for a delta emitter (there is
+  no positional density to hit), which makes `s == 0` — "the eye path lands on emissive
+  geometry" — vanish on both sides of every MIS ratio (`remap0` then turns both into 1, so
+  the ratios stay finite); `misWeight`'s light loop skips a term whose *previous* light
+  vertex is delta, mirroring pbrt's `deltaLightvertex` hook; and `vertexPdfLight` grows two
+  branches — uniform-in-cone `1/Ω · 1/d²` for a Spot, and the planar `1/(πR²)` (no `1/d²`)
+  for an infinite light, whose subpath origin is a fictitious disc point.
+  `deltaLightSubpath` starts the light subpath: a Spot emits from its point, a Sun from a
+  disc of radius `sceneRadius` shifted `-R` along the beam, and after the walk the Sun
+  rewrites `path[1].pdfFwd` to the planar density (pbrt's "correct subpath sampling
+  densities for infinite area lights" patch) so forward and reverse agree.
+  `connectBDPT`'s `s == 1` NEE branch folds all three emitter families into one
+  λ-independent `Wgeom` (`fall/(d²·pdfChoice)` for a Spot — whose SPD is an *intensity*,
+  W/sr — `Ω/pdfChoice` for a Sun, `cosL·A/(d²·pdfChoice)` for an area light), so the
+  radiometric conventions of `scene.h` are honoured in one place.
+  Finally a Sun needs an **escaped-ray** strategy, because a specular chain can only see it
+  by leaving the scene inside the solar cone and NEE cannot connect through a delta vertex:
+  `randomWalk` optionally fills an `Escape` (direction + hero/secondary throughput) and
+  `BdptRenderer::renderRows` adds `beta·Le` for every Sun whose cone contains that direction
+  — with **MIS weight exactly 1**, valid only because the block is gated on *every* eye
+  vertex being delta, which is precisely when no other strategy can reach the sun.
+  Gated by `Scene::sunCount` so sun-free scenes pay nothing.
+  `scenes/_deltalight_mix.ftsl` is the regression scene (area + spot + sun + a mirror
+  sphere); mode `D` vs mode `R` agrees to 0.33 % of mean luminance.
 - **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.
@@ -1178,8 +1210,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     it hangs a rain curtain using the `rainbow` phase function, lit through a ceiling slot by
     a sun. Three things about that scene are load-bearing and non-obvious, so they are
     written up in its header rather than only here: the sun is a **distant sphere**, not
-    `light sun`, because the latter contributes nothing in mode D (see known-issues, "a
-    `sun`/`env`/`spot`/`collimated` light contributes NOTHING in mode D/U"); the global haze
+    `light sun`, because when the scene was authored mode `D` refused a scene containing a
+    `light sun` outright (0.124.0 lifted that — a sphere still works and is equally physical,
+    so the scene was left alone); the global haze
     is **bounded to the room**, because an unbounded one extinguishes a 400 m light by
     e^-4.8; and the sky panel **stops short of the solar shaft**, because `light area` is real
     opaque geometry in the BVH and a full-sky panel eclipses the sun outright.
@@ -1304,10 +1337,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   rough dielectric is the same non-connectable **stochastic-delta** vertex on GPU as in `bdpt.h`
   (only the gate needed relaxing). With that, **all genuine per-hit-BSDF GPU-vs-CPU parity gaps in
   mode D are closed** (M9 complete): `cudaBdptSupported` carries no per-material reject. The things
-  BDPT still can't render — **fluorescence**, **layered stacks**, **spot/env/collimated lights** —
+  BDPT still can't render — **fluorescence**, **layered stacks**, **env/collimated lights** —
   are *not* GPU gaps: `main.cpp`'s mode-D guard (`bdptUnsupportedFeature`) refuses those scenes (or
   demotes D→B with `-on-unsupported fallback`) on both backends before any BDPT dispatch, so they
-  never reach the device path; only GRIN media (curved paths) keep an in-scope mode-D scene
+  never reach the device path. **Spot/sun lights are a genuine GPU gap** since 0.124.0: the CPU
+  BDPT renders them but the device kernels do not, so `cudaBdptSupported` rejects them and the
+  scene falls back to CPU BDPT with a printed notice (see known-issues). GRIN media (curved
+  paths) likewise keep an in-scope mode-D scene
   on the CPU (spectral rainbow-phase media now render on-device in mode D since M10/0.37.0). Validated GPU==CPU on `textured.ftsl` (mean 0.06%,
   per-pixel diff halving 8.2%→4.3% at 4× spp — unbiased), `mixmat.ftsl` (mean 0.21%),
   `scraps/dtrans.ftsl` (mean B/A=1.0009 at 512 spp, per-pixel diff halving 8.42%→4.39% at 4× spp),

@@ -208,6 +208,35 @@ inline double cameraPdfDir(const Camera& cam, double cosCam) {
 // area density at a medium interaction is cosine-free) — see the MIS notes below.
 enum class VType { Camera, Light, Surface, Medium };
 
+// --- Delta / infinite light classification (PBRT's LightFlags, specialised) --------
+// A DELTA light's emission involves a Dirac delta in position and/or direction, so some
+// BDPT strategies are impossible and must be dropped from the MIS balance heuristic (a
+// strategy that cannot be sampled must not appear in the denominator, or the retained
+// ones are under-weighted and the image loses energy):
+//   Spot       - delta POSITION (a mathematical point). No eye ray can ever hit it, so
+//                the s=0 strategy (eye path lands on emissive geometry) is impossible.
+//                NEE (s=1) works: the connection point is deterministic.
+//   Sun        - delta DIRECTION and infinitely distant. It has no geometry in the scene
+//                either, so again s=0 is impossible; NEE samples a direction inside the
+//                0.53-degree solar cone with pdf 1/Omega.
+//   collimated - delta DIRECTION from a FINITE surface. Both s=0 and NEE are impossible
+//                (a shading point sees the beam only if it happens to lie exactly on it),
+//                so these stay out of BDPT scope entirely (mode-D guard refuses them).
+inline bool isDeltaEmitter(const Emitter& em) {
+    return em.shape == EmitterShape::Spot || em.shape == EmitterShape::Sun || em.collimated;
+}
+// INFINITE lights have no finite emission point: their light-subpath origin is a fictitious
+// point on a disc outside the scene bounds, so the density of the first scene vertex is the
+// PLANAR density 1/(pi R^2) over that disc rather than a solid-angle density over 1/dist^2
+// (PBRT's Vertex::PdfLight infinite branch). Sun is one; Env would be the other, but Env is
+// still outside BDPT scope (it also needs escaped-ray radiance, which the walk doesn't do).
+inline bool isInfiniteEmitter(const Emitter& em) {
+    return em.shape == EmitterShape::Sun || em.shape == EmitterShape::Env;
+}
+// Can a shading point next-event-estimate this emitter (the s=1 strategy)? Everything
+// except a collimated beam, whose emitted direction is a Dirac delta about beamDir.
+inline bool isNeeEmitter(const Emitter& em) { return !em.collimated; }
+
 struct Vertex {
     VType type = VType::Surface;
     Vec3 p{0, 0, 0};      // world position
@@ -272,6 +301,17 @@ struct Vertex {
     }
     bool isLightVertex() const {
         return type == VType::Light || (type == VType::Surface && mat && mat->isLight);
+    }
+    // PBRT's Vertex::IsDeltaLight: this vertex IS a light whose emission carries a Dirac
+    // delta, so the "eye path hits the light" (s=0) strategy cannot produce it. Used by
+    // misWeight to drop that strategy from the balance heuristic.
+    bool isDeltaLight() const {
+        return type == VType::Light && light && isDeltaEmitter(*light);
+    }
+    // PBRT's Vertex::IsInfiniteLight: an infinitely-distant light whose subpath origin is
+    // a fictitious point outside the scene (planar emission density; see isInfiniteEmitter).
+    bool isInfiniteLight() const {
+        return type == VType::Light && light && isInfiniteEmitter(*light);
     }
 };
 
@@ -352,19 +392,39 @@ inline double camCos(const Camera& cam, const Vec3& p) {
 inline double vertexPdf(const Scene& scene, const Camera& cam,
                         const Vertex* prev, const Vertex& cur, const Vertex& next,
                         double lambda);
-inline double vertexPdfLight(const Camera& cam, const Vertex& cur, const Vertex& next);
+inline double vertexPdfLight(const Scene& scene, const Vertex& cur, const Vertex& next);
 
-// Emission directional density at a light vertex `cur` toward `next`, area measure.
-inline double vertexPdfLight(const Camera& /*cam*/, const Vertex& cur, const Vertex& next) {
+// Emission directional density at a light vertex `cur` toward `next`, area measure
+// (PBRT's Vertex::PdfLight). Three emission models:
+//   area/sphere/tube/mesh - cosine-weighted about the surface normal, cos/PI, converted
+//                           to area measure by the usual 1/dist^2 * cos(next).
+//   Spot                  - uniform inside the OUTER cone (the falloff is throughput, not
+//                           density), pdfW = 1/(2 PI (1 - cosOuter)), same conversion.
+//   Sun (infinite)        - no finite emission point: the subpath origin is a point on a
+//                           disc of radius sceneRadius outside the scene, so the density
+//                           of `next` is the PLANAR density 1/(pi R^2) with NO 1/dist^2
+//                           (the disc-point -> hit-point map is a shear along the beam,
+//                           whose Jacobian is exactly the cos(next) below).
+inline double vertexPdfLight(const Scene& scene, const Vertex& cur, const Vertex& next) {
     Vec3 w = next.p - cur.p;
     double d2 = dot(w, w);
     if (d2 == 0.0) return 0.0;
     double invD2 = 1.0 / d2;
     w = w * std::sqrt(invD2);
-    double cosLight = dot(cur.ng, w);               // one-sided Lambertian emitter
-    if (cosLight <= 0.0) return 0.0;
-    double pdfW = cosLight / PI;                     // cosine-weighted emission
-    double pdf = pdfW * invD2;
+    double pdf;
+    if (cur.light && isInfiniteEmitter(*cur.light)) {
+        double R = scene.sceneRadius;
+        if (R <= 0.0) return 0.0;
+        pdf = 1.0 / (PI * R * R);                    // planar density over the sun disc
+    } else if (cur.light && cur.light->shape == EmitterShape::Spot) {
+        double solid = 2.0 * PI * (1.0 - cur.light->spotCosOuter);
+        if (solid <= 0.0) return 0.0;
+        pdf = (1.0 / solid) * invD2;                 // uniform in the outer cone
+    } else {
+        double cosLight = dot(cur.ng, w);            // one-sided Lambertian emitter
+        if (cosLight <= 0.0) return 0.0;
+        pdf = (cosLight / PI) * invD2;               // cosine-weighted emission
+    }
     if (next.onSurface()) pdf *= std::abs(dot(next.ns, w));
     return pdf;
 }
@@ -372,7 +432,7 @@ inline double vertexPdfLight(const Camera& /*cam*/, const Vertex& cur, const Ver
 inline double vertexPdf(const Scene& scene, const Camera& cam,
                         const Vertex* prev, const Vertex& cur, const Vertex& next,
                         double lambda) {
-    if (cur.type == VType::Light) return vertexPdfLight(cam, cur, next);
+    if (cur.type == VType::Light) return vertexPdfLight(scene, cur, next);
     Vec3 wn = next.p - cur.p;
     if (dot(wn, wn) == 0.0) return 0.0;
     wn = normalize(wn);
@@ -396,15 +456,38 @@ inline double vertexPdf(const Scene& scene, const Camera& cam,
 }
 
 // Positional density (area measure) of sampling this light vertex's ORIGIN via
-// light sampling = P(choose this emitter) * (1/area). PBRT's PdfLightOrigin, minus
-// the infinite-light branch (unsupported in BDPT scope).
+// light sampling = P(choose this emitter) * (1/area). PBRT's PdfLightOrigin.
+// A DELTA light (spot: a point; sun: infinitely distant) has no area density at all —
+// PBRT returns 0 for exactly these (SpotLight/DistantLight::Pdf_Le set pdfPos = 0, and
+// InfiniteLightDensity is 0 for a delta-direction light). The 0 is consistent on BOTH
+// sides of every MIS ratio (the light subpath stores the same 0 in path[0].pdfFwd), and
+// misWeight's remap0 turns both into 1, so the ratios stay finite and unbiased.
 inline double vertexPdfLightOrigin(const Scene& scene, const Vertex& cur) {
-    if (!cur.light || scene.totalPower <= 0.0 || cur.light->area <= 0.0) return 0.0;
+    if (!cur.light || scene.totalPower <= 0.0) return 0.0;
+    if (isDeltaEmitter(*cur.light)) return 0.0;      // delta position / direction
+    if (cur.light->area <= 0.0) return 0.0;
     double pdfChoice = cur.light->power / scene.totalPower;
     return pdfChoice / cur.light->area;
 }
 
 // --- Random walk -----------------------------------------------------------------
+// Where, and with what weight, a subpath's LAST ray left the scene. BDPT has no
+// environment, but a `light sun` is an infinitely distant delta-DIRECTION emitter that an
+// eye ray can still look straight into. Because a delta light is excluded from the s=0
+// strategy (see misWeight), nothing else in BDPT can deliver the sun's own disc — nor any
+// mirror/water glint of it, which NEE cannot produce either (a specular vertex is not
+// connectible). Capturing the escaping ray lets the renderer add that one strategy back
+// with MIS weight exactly 1, since no other strategy can generate the same path (every
+// vertex on such a path is delta, so neither NEE nor a light-subpath connection reaches
+// it). See BdptRenderer::renderRows.
+struct Escape {
+    bool escaped = false;
+    Vec3 dir{0, 0, 0};                        // unit direction the ray left along
+    double beta = 0.0;                        // hero throughput carried out of the scene
+    double betaSec[hero::kHeroMax - 1] = {0};
+    int nUp = 1;
+};
+
 // Continue a subpath whose endpoint is already path[0] (Camera or Light). `ray` is
 // the first ray leaving that endpoint; `beta` the throughput carried along it;
 // `pdfDir` the solid-angle density of that first direction; `mode` the transport
@@ -423,7 +506,7 @@ inline double vertexPdfLightOrigin(const Scene& scene, const Vertex& cur) {
 inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& mats,
                        Ray ray, double beta, double pdfDir, const HeroBundle& hb,
                        int maxDepth, Mode mode, Pcg32& rng, std::vector<Vertex>& path,
-                       const double* betaSecIn, int nUpIn) {
+                       const double* betaSecIn, int nUpIn, Escape* esc = nullptr) {
     (void)cam;   // cam reserved for future NEE-to-camera use; mode now drives adjoint corr
     const double lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
@@ -513,7 +596,13 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             continue;
         }
 
-        if (!h.valid) return;                        // escaped (no env in BDPT scope)
+        if (!h.valid) {                              // escaped (no env in BDPT scope)
+            if (esc) {
+                esc->escaped = true; esc->dir = ray.d; esc->beta = beta; esc->nUp = nUp;
+                for (int i = 0; i + 1 < nUp; ++i) esc->betaSec[i] = betaSec[i];
+            }
+            return;
+        }
 
         // Resolve material (Mix -> child, or absorbed on the leftover slice).
         const Material* mp = &scene.mats[h.matId];
@@ -796,7 +885,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
 // an unused placeholder.
 inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
                                  int px, int py, const HeroBundle& hb, int maxDepth,
-                                 Pcg32& rng, std::vector<Vertex>& path) {
+                                 Pcg32& rng, std::vector<Vertex>& path,
+                                 Escape* esc = nullptr) {
     const double lambda = hb.lam[0];
     path.clear();
     // The camera vertex is wavelength-neutral: every λ in the bundle leaves it with
@@ -828,7 +918,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
         path.push_back(c);
         double pdfDir = cameraPdfDir(cam, dot(ray.d, cam.w));   // MIS-irrelevant placeholder
         randomWalk(scene, cam, mats, ray, wLens, pdfDir, hb, maxDepth - 1,
-                   Mode::Radiance, rng, path, betaSec0, 1);
+                   Mode::Radiance, rng, path, betaSec0, 1, esc);
         return (int)path.size();
     }
     c.p = cam.eye;
@@ -837,7 +927,95 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
     double cosCam = dot(ray.d, cam.w);
     double pdfDir = cameraPdfDir(cam, cosCam);
     randomWalk(scene, cam, mats, ray, /*beta*/1.0, pdfDir, hb, maxDepth - 1,
-               Mode::Radiance, rng, path, betaSec0, hb.C);
+               Mode::Radiance, rng, path, betaSec0, hb.C, esc);
+    return (int)path.size();
+}
+
+// Emit a light subpath from a DELTA light (spot or sun) — the two emitters with no
+// finite emissive surface. Shares the tail (random walk + throughput bookkeeping) with
+// the area-light path below, but the endpoint sampling is entirely different:
+//
+//   Spot  a point at `origin` radiating uniformly into the OUTER cone (pdfW =
+//         1/(2 PI (1-cosOuter))); the smoothstep falloff is carried as THROUGHPUT, not
+//         density, so the mean walk weight is I*spotOmega = the emitter's power. `spdFn`
+//         is the peak intensity per unit SPD (geomWeight == spotOmega), so the emitted
+//         quantity is an intensity (W/sr), not a radiance.
+//   Sun   an infinitely distant disc: the origin is a point on a disc of radius
+//         sceneRadius, centred one radius UPSTREAM of the scene centre and perpendicular
+//         to `beamDir`, so every emitted ray enters the scene's cross-section (pdfPos =
+//         1/(pi R^2)); the direction is drawn inside the solar cone (pdfW = 1/Omega).
+//         `spdFn` is the sun's radiance (addSunLight already divided by Omega).
+//
+// Both are delta lights: path[0].pdfFwd is 0 (PBRT's convention — see
+// vertexPdfLightOrigin) and misWeight drops the s=0 strategy for them. For the INFINITE
+// sun the first scene vertex's forward density must also be rewritten to the planar
+// 1/(pi R^2) form that vertexPdfLight reports in reverse (PBRT's "correct subpath
+// sampling densities for infinite area lights" patch), or the two sides disagree and the
+// MIS weights are wrong. Returns the subpath length.
+inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
+                             const Emitter& em, double pdfChoice, const HeroBundle& hb,
+                             int maxDepth, Pcg32& rng, std::vector<Vertex>& path) {
+    const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
+    const bool isSun = (em.shape == EmitterShape::Sun);
+    double u1 = rng.uniform(), u2 = rng.uniform();
+    Vec3 dir = em.sampleCone(em.beamDir, u1, u2);    // uniform in the (outer / solar) cone
+    double coneSolid = 2.0 * PI * (1.0 - em.spotCosOuter);
+    if (coneSolid <= 0.0) return 0;
+    double pdfDir = 1.0 / coneSolid;
+
+    Vec3 org;
+    double pdfPos = 1.0;                             // delta (spot) unless the sun's disc
+    if (isSun) {
+        double R = scene.sceneRadius;
+        if (R <= 0.0) return 0;
+        Vec3 t, b; onb(em.beamDir, t, b);
+        double rr = R * std::sqrt(rng.uniform()), phi = 2.0 * PI * rng.uniform();
+        org = scene.sceneCenter + t * (rr * std::cos(phi)) + b * (rr * std::sin(phi))
+            - em.beamDir * R;
+        pdfPos = 1.0 / (PI * R * R);
+    } else {
+        org = em.origin;
+    }
+    // Spot: the smoothstep penumbra scales the emitted intensity. Sun: no falloff.
+    double fall = isSun ? 1.0
+                        : spotFalloff(dot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
+    if (fall <= 0.0) return 0;
+    double Le = em.spdFn(lambda) * invPdfLambda * fall;
+    double LeSec[hero::kHeroMax - 1] = {0};
+    double mxLe = Le;
+    for (int i = 0; i + 1 < hb.C; ++i) {
+        LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * fall;
+        if (LeSec[i] > mxLe) mxLe = LeSec[i];
+    }
+    if (mxLe <= 0.0) return 0;
+
+    Vertex L0;
+    L0.type = VType::Light; L0.p = org; L0.ns = dir; L0.ng = dir;
+    L0.light = &em; L0.matId = -1; L0.mat = nullptr;
+    L0.beta = Le;
+    L0.pdfFwd = 0.0;                                 // delta origin (see vertexPdfLightOrigin)
+    L0.delta = false;                                // NEE (s=1) to a spot/sun IS possible
+    L0.nUp = hb.C;
+    for (int i = 0; i + 1 < hb.C; ++i) L0.betaSec[i] = LeSec[i];
+    path.push_back(L0);
+
+    // Walk throughput = Le / (pdfChoice * pdfPos * pdfDir); no cosine, because the
+    // emission normal IS the emission direction for both of these (|cos| == 1).
+    const double invP = 1.0 / (pdfChoice * pdfPos * pdfDir);
+    double betaWalk = Le * invP;
+    double betaWalkSec[hero::kHeroMax - 1];
+    for (int i = 0; i + 1 < hb.C; ++i) betaWalkSec[i] = LeSec[i] * invP;
+    Ray ray{org, dir};
+    randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
+               Mode::Importance, rng, path, betaWalkSec, hb.C);
+    // Infinite-light density patch (PBRT): the first scene vertex was given a solid-angle
+    // density converted with 1/dist^2 from the fictitious disc point, but the reverse
+    // direction (vertexPdfLight) reports the planar 1/(pi R^2). Rewrite it to match.
+    if (isSun && path.size() > 1) {
+        double pdf = pdfPos;
+        if (path[1].onSurface()) pdf *= std::abs(dot(path[1].ns, dir));
+        path[1].pdfFwd = pdf;
+    }
     return (int)path.size();
 }
 
@@ -845,7 +1023,8 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
 // cosine-distributed emission direction, at the shared wavelength `lambda`
 // (invPdfLambda folds the wavelength importance so Le is radiance, as in backward.h).
 // path[0] is the light endpoint (beta = Le, its pdfFwd the positional area density).
-// Only area/sphere (Lambertian) lights participate; spot/env/collimated are skipped.
+// Spot and sun lights route to deltaLightSubpath above; env/collimated are out of scope
+// (the mode-D guard refuses those scenes before any of this runs).
 inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
                                 const HeroBundle& hb, int maxDepth,
                                 Pcg32& rng, std::vector<Vertex>& path) {
@@ -854,8 +1033,11 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     if (scene.emitters.empty() || scene.totalPower <= 0.0) return 0;
     int ei = scene.selectEmitter(rng);
     const Emitter& em = scene.emitters[ei];
-    if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
-        em.shape == EmitterShape::Sun || em.collimated)
+    double pdfChoiceSel = em.power / scene.totalPower;
+    if (pdfChoiceSel <= 0.0) return 0;
+    if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Sun)
+        return deltaLightSubpath(scene, cam, mats, em, pdfChoiceSel, hb, maxDepth, rng, path);
+    if (em.shape == EmitterShape::Env || em.collimated)
         return 0;                                    // unsupported in BDPT scope
 
     double u1 = rng.uniform(), u2 = rng.uniform();
@@ -942,7 +1124,7 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     ScopedAssign<double> a5;
     if (ptM) {
         double val = (s > 0) ? vertexPdf(scene, cam, qs, *pt, *ptM, lambda)
-                             : vertexPdfLight(cam, *pt, *ptM);
+                             : vertexPdfLight(scene, *pt, *ptM);
         a5 = ScopedAssign<double>(&ptM->pdfRev, val);
     }
     // Reverse density of the light connection vertex qs and its predecessor.
@@ -959,7 +1141,11 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     ri = 1.0;
     for (int i = s - 1; i >= 0; --i) {               // hypothetical light strategies
         ri *= remap0(light[i].pdfRev) / remap0(light[i].pdfFwd);
-        bool deltaPrev = (i > 0) ? light[i - 1].delta : false; // area lights aren't delta
+        // The hypothetical strategy at index i connects light[i-1] to the eye side, so it
+        // is impossible if either end of that new edge is delta. At i == 0 the "edge" is
+        // instead the eye path LANDING on the emitter, which a delta light (spot: a point;
+        // sun: infinitely far, no geometry) can never be hit by — PBRT's IsDeltaLight().
+        bool deltaPrev = (i > 0) ? light[i - 1].delta : light[0].isDeltaLight();
         if (!light[i].delta && !deltaPrev) sumRi += ri;
     }
     return 1.0 / (1.0 + sumRi);
@@ -1101,19 +1287,55 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (!pt.isConnectible()) return 0.0;
         int ei = scene.selectEmitter(rng);
         const Emitter& em = scene.emitters[ei];
-        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Env ||
-            em.shape == EmitterShape::Sun || em.collimated)
-            return 0.0;
+        if (em.shape == EmitterShape::Env || em.collimated)
+            return 0.0;                                // out of BDPT scope (mode-D guard)
+        double pdfChoice = em.power / scene.totalPower;
+        if (pdfChoice <= 0.0) return 0.0;
         double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 y, nOut;
-        // Pattern factor at the sampled point (1.0 without a pattern). It scales Le
-        // below, never pdfA — see generateLightSubpath for why that stays unbiased.
-        double emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
-        Vec3 toL = y - pt.p; double dist2 = dot(toL, toL);
-        if (dist2 <= 0.0) return 0.0;
-        double dist = std::sqrt(dist2); Vec3 wi = toL / dist;
-        double cosLight = dot(nOut, wi * -1.0);
-        if (cosLight <= 0.0) return 0.0;               // emitter stays one-sided
+        // Per-shape connection geometry. `Wgeom` is the whole lambda-independent weight
+        // that multiplies |cosSurf| in the estimator, i.e.
+        //     L = beta * f * Le * |cosSurf| * Wgeom * Tr * stG
+        // which for an area light is the familiar cosLight/(dist^2 * pdfA). Collecting it
+        // into one scalar is what lets the three emission models (Lambertian area, spot
+        // cone, distant sun) share the BSDF / occlusion / transmittance code below.
+        Vec3 y, nOut, wi;
+        double dist, Wgeom, emitPatW = 1.0;
+        const bool deltaLight = isDeltaEmitter(em);
+        // A distant sun has no finite light point: the shadow ray runs all the way to the
+        // scene exit, so it must NOT be shortened by the usual endpoint epsilon.
+        double occlEps = 2e-6;
+        if (em.shape == EmitterShape::Spot) {
+            // Point spot: the connection point is deterministic (delta position); the
+            // smoothstep penumbra weights the intensity toward this receiver.
+            Vec3 toL = em.origin - pt.p; double dist2 = dot(toL, toL);
+            if (dist2 <= 0.0) return 0.0;
+            dist = std::sqrt(dist2); wi = toL / dist;
+            double fall = spotFalloff(dot(wi * -1.0, em.beamDir),
+                                      em.spotCosInner, em.spotCosOuter);
+            if (fall <= 0.0) return 0.0;               // outside the cone
+            y = em.origin; nOut = wi * -1.0;
+            Wgeom = fall / (dist2 * pdfChoice);        // spdFn is an INTENSITY (W/sr)
+        } else if (em.shape == EmitterShape::Sun) {
+            // Distant sun: sample a direction inside the solar cone (pdfW = 1/Omega) and
+            // shadow-ray it out of the scene. No 1/dist^2 and no cosLight — the source is
+            // at infinity — so Wgeom is just Omega/pdfChoice and spdFn is a radiance.
+            wi = em.sampleCone(em.beamDir * -1.0, u1, u2);
+            dist = length(scene.sceneCenter - pt.p) + scene.sceneRadius;
+            occlEps = 0.0;
+            y = pt.p + wi * dist; nOut = wi * -1.0;
+            Wgeom = em.spotOmega / pdfChoice;
+        } else {
+            // Pattern factor at the sampled point (1.0 without a pattern). It scales Le
+            // below, never pdfA — see generateLightSubpath for why that stays unbiased.
+            emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
+            Vec3 toL = y - pt.p; double dist2 = dot(toL, toL);
+            if (dist2 <= 0.0) return 0.0;
+            dist = std::sqrt(dist2); wi = toL / dist;
+            double cosLight = dot(nOut, wi * -1.0);
+            if (cosLight <= 0.0) return 0.0;           // emitter stays one-sided
+            if (em.area <= 0.0) return 0.0;
+            Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
+        }
         Vec3 wo = normalize(eye[t - 2].p - pt.p);
         // Scattering value f and endpoint cosine (phase / cos=1 at a medium vertex).
         double cosSurf, f, stG = 1.0, fSec[hero::kHeroMax - 1] = {0};
@@ -1155,21 +1377,22 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             }
             if (mxLe <= 0.0) return 0.0;
         }
-        if (scene.occluded(connOrigin(pt, wi), wi, dist - 2e-6)) return 0.0;
-        double pdfChoice = em.power / scene.totalPower;
-        double pdfA = pdfChoice / em.area;             // area-measure light pdf
-        if (pdfA <= 0.0) return 0.0;
+        if (scene.occluded(connOrigin(pt, wi), wi, dist - occlEps)) return 0.0;
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
         double Tr = mats.mediaTransmittance(scene, pt.p, wi, dist, lambda, rng);
-        double G = std::fabs(cosSurf) * cosLight / dist2;
-        L = pt.beta * f * Le * G / pdfA * Tr * stG;
+        double G = std::fabs(cosSurf) * Wgeom;
+        L = pt.beta * f * Le * G * Tr * stG;
         for (int i = 0; i + 1 < nUp; ++i)
-            Lsec[i] = pt.betaSec[i] * fSec[i] * LeSec[i] * G / pdfA * Tr * stG;
+            Lsec[i] = pt.betaSec[i] * fSec[i] * LeSec[i] * G * Tr * stG;
         sampled.type = VType::Light; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
-        sampled.light = &em; sampled.matId = em.matId;
-        sampled.mat = (em.matId >= 0) ? &scene.mats[em.matId] : nullptr;
+        sampled.light = &em; sampled.matId = deltaLight ? -1 : em.matId;
+        sampled.mat = (sampled.matId >= 0) ? &scene.mats[sampled.matId] : nullptr;
         sampled.emitPatW = emitPatW;
-        sampled.beta = Le / pdfA; sampled.delta = false; sampled.pdfFwd = pdfA;
+        // A delta light has no area density: pdfFwd is 0 on BOTH sides of every MIS ratio
+        // (the light subpath stores the same 0), matching PBRT — see vertexPdfLightOrigin.
+        sampled.beta = deltaLight ? Le * Wgeom : Le * em.area / pdfChoice;   // == Le/pdfA
+        sampled.delta = false;
+        sampled.pdfFwd = deltaLight ? 0.0 : (pdfChoice / em.area);
     } else {
         // Interior connection light[s-1] <-> eye[t-1].
         const Vertex& qs = light[s - 1];
@@ -1282,6 +1505,8 @@ struct BdptRenderer {
         const int C = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
         const bool useHero = (C > 1) && !scene.backwardMedium().enabled &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
+        // Only pay for escape tracking when the scene actually has a distant sun.
+        const bool hasSun = scene.sunCount > 0;
         for (int py = y0; py < y1; ++py)
             for (int px = 0; px < camFilm.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)camFilm.resX + (uint64_t)px;
@@ -1308,13 +1533,43 @@ struct BdptRenderer {
                         hb.invPdf[0] = scene.invPdfLambda(hb.lam[0]);
                         hb.C = 1;
                     }
+                    Escape esc;
                     int nE = generateCameraSubpath(scene, cam, mats, px, py, hb,
-                                                   maxDepth + 1, rng, eye);
+                                                   maxDepth + 1, rng, eye,
+                                                   hasSun ? &esc : nullptr);
                     int nL = generateLightSubpath(scene, cam, mats, hb,
                                                   maxDepth + 1, rng, light);
                     Vec3 cie[hero::kHeroMax];
                     for (int i = 0; i < hb.C; ++i)
                         cie[i] = Vec3(cieX(hb.lam[i]), cieY(hb.lam[i]), cieZ(hb.lam[i]));
+                    // Direct view of a distant `light sun`. A sun is a delta-DIRECTION
+                    // emitter with no geometry, so misWeight drops the s=0 strategy for it
+                    // and no connection strategy can reach it either — without this the
+                    // solar disc itself, and every mirror/water glint of it, would simply
+                    // be missing from mode D. It is added only when the escaping ray came
+                    // through camera + delta (specular) vertices ONLY, which is exactly
+                    // the case where no other strategy competes: NEE needs a connectible
+                    // (non-delta) vertex, and so does every s>=2 connection or t==1 splat.
+                    // The MIS weight is therefore exactly 1.
+                    if (esc.escaped) {
+                        bool allDelta = true;
+                        for (int i = 1; i < nE; ++i)
+                            if (!eye[i].delta) { allDelta = false; break; }
+                        if (allDelta) {
+                            for (const Emitter& em : scene.emitters) {
+                                if (em.shape != EmitterShape::Sun) continue;
+                                if (!em.inCone(esc.dir)) continue;
+                                Vec3 contrib = cie[0] * (esc.beta * em.spdFn(hb.lam[0]) *
+                                                         hb.invPdf[0]);
+                                for (int i = 0; i + 1 < esc.nUp; ++i)
+                                    contrib = contrib + cie[i + 1] *
+                                              (esc.betaSec[i] * em.spdFn(hb.lam[i + 1]) *
+                                               hb.invPdf[i + 1]);
+                                if (esc.nUp > 1) contrib = contrib * (1.0 / esc.nUp);
+                                camFilm.add(px, py, contrib);
+                            }
+                        }
+                    }
                     for (int t = 1; t <= nE; ++t)
                         for (int s = 0; s <= nL; ++s) {
                             int depth = t + s - 2;

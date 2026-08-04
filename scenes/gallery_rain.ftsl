@@ -34,7 +34,10 @@
 # z[1.81,6.46]. x[4.5,10] z[3.4,7] is that footprint, squared off to the room's edge.
 #
 # --- Why the sun is a distant SPHERE and not `light sun` -----------------------------
-# `light sun` is not connectible in BDPT, so mode D refuses a scene containing one — and
+# When this scene was written, `light sun` was not connectible in BDPT and mode D refused a
+# scene containing one. (v0.124.0 lifted that: mode D now renders `spot` and `sun` on the CPU
+# — but only on the CPU, since the GPU BDPT kernels still reject delta lights, and this scene
+# very much wants the GPU. A distant sphere is no less physical, so it stays.) And
 # mode D is the only mode that renders BOTH this scene's bounded heterogeneous media and
 # its directly-seen glass and chrome. (Forward A/B/C do the media but leave a directly-seen
 # dielectric black, which is most of this room; R and the P composite shade the glass but
@@ -546,7 +549,8 @@ medium {
 # AND shades a directly-seen dielectric (most of this room), so the else-branch is a real
 # downgrade rather than a slower equivalent — in mode B every piece of glass and the chrome
 # ring go black. That is the whole reason the sun here is a distant sphere and not
-# `light sun`, which would knock this scene straight into that branch (see the header).
+# `light sun`, which used to knock this scene straight into that branch and today would
+# merely force it off the GPU (see the header).
 # The else-branch still exists for the day the scene gains a genuinely D-hostile feature
 # (a GRIN xenon lamp-gas field; see known-issues.md "GRIN in BDPT"); both branches are
 # identical apart from `mode`.

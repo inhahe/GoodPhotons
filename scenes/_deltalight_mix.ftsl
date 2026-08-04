@@ -1,0 +1,80 @@
+# _deltalight_mix.ftsl - regression scene for BDPT delta-light support (mode D).
+#
+# Three emitter kinds at once, so the power-weighted emitter CDF has to mix them and the
+# MIS balance heuristic has to combine strategies with DIFFERENT sampling measures:
+#   * a small area quad  - finite surface, cosine emission (s=0 AND s=1 both possible)
+#   * a `light spot`     - delta POSITION: NEE works, "eye path hits the light" does not
+#   * a `light sun`      - delta DIRECTION, infinitely distant: same, plus its subpath
+#                          origin is a fictitious disc point (planar emission density)
+# The MIRROR sphere is the point of the scene: a specular chain can only see the sun by
+# escaping into the solar cone, which NEE can never deliver (a delta vertex is not
+# connectible). If BDPT's escape handling is missing or mis-weighted, the sun's glint on
+# that sphere is the first thing to vanish or double.
+#
+# Validate by rendering the SAME camera in mode D and in mode R (the backward reference)
+# and comparing: they must agree to Monte Carlo noise. The scene is ABSOLUTE (see the
+# light blocks), so both frames land on the same fixed sensor gain and a mean-luminance
+# comparison is a real energy comparison rather than two independently auto-exposed
+# images.
+#   ftrace scenes/_deltalight_mix.ftsl -mode R -spp 20000 -o png/deltalight/mix_R.png -window -keepwindow
+#   ftrace scenes/_deltalight_mix.ftsl -mode D -spp  6000 -o png/deltalight/mix_D.png -window -keepwindow
+#   python scraps/imgdiff.py png/deltalight/mix_R.png png/deltalight/mix_D.png
+# Measured at those counts: mean ratio 0.9967, mean |diff| 0.0039. Mode D is visibly the
+# cleaner of the two (mode R sprays fireflies over the mirror), and BOTH put a single
+# saturated pixel at (53,104) — the sun's disc reflected off the mirror sphere, which is
+# the escaped-ray strategy under test. Note mode B/A/C cannot stand in for mode R here:
+# a forward tracer leaves a directly-seen mirror black.
+
+scene { units meters }
+
+material "grey"   { type diffuse reflect 0.55 }
+material "warm"   { type diffuse reflect rgb 0.75 0.5 0.3 }
+material "mirror" { type mirror }
+
+quad { origin -6 0 -6   u 0 0 12   v 12 0 0   material grey }    # floor, normal +y
+
+sphere { center -1.1 0.7 0.2   radius 0.7   material mirror }
+sphere { center  1.0 0.5 -0.4  radius 0.5   material warm }
+sphere { center  0.2 0.35 1.4  radius 0.35  material grey }
+
+# All three lights author ABSOLUTE flux, so the scene renders on the fixed-gain
+# photometric scale (no per-image auto-exposure). That is deliberate: two renders of
+# the same scene can then be compared by mean luminance, which a p99 auto-exposure
+# anchor would silently renormalise away.
+
+# Finite area light: a small downward-facing quad off to the left.
+light area {
+    origin -2.6 2.2 -0.8   u 0.8 0 0   v 0 0 0.8
+    spd preset:bb6500   power 300
+}
+
+# Point spotlight aimed at the right-hand sphere.
+light spot {
+    origin 1.6 2.6 1.6   dir -0.35 -1 -0.7   inner_angle 14   outer_angle 26
+    spd preset:bb6500   power 200
+}
+
+# Distant sun, low and behind-left of the camera, so the mirror sphere throws its disc
+# back toward the lens. A sun cannot take `power` (a distant light's flux depends on the
+# scene's cross-section), so its band irradiance has to be dialled in through `intensity`
+# — and the scale factor is NOT intuitive: `preset:bb5800` is raw Planck spectral
+# radiance in W/m^3/sr (per METRE of wavelength), while the loader integrates an SPD by
+# summing spd(lambda)*binWidth with binWidth in NANOMETRES. So the band integral of the
+# unscaled curve is INT bb5800 = 1.08e16 in the same units `power` is expressed in, and
+#     intensity = <wanted W/m^2> / 1.08e16.
+# 4.6e-15 is therefore ~50 W/m^2 perpendicular — the level that balances against the
+# 300 W lamp and 200 W spot below.
+light sun {
+    elevation 32   azimuth 200
+    angle     0.53
+    spd       preset:bb5800
+    intensity 4.6e-15
+}
+
+camera "cam" {
+    eye 0 1.6 4.4   look_at 0 0.55 0   up 0 1 0   fov_y 42
+    mode D
+    # `exposure 2` is one photographic stop of compensation on the fixed absolute gain
+    # (the lights above are authored in round watts; this just prints them brighter).
+    film { res 400 300   exposure 2 }
+}
