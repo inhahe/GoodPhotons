@@ -1482,6 +1482,34 @@ medium {
     A mesh used only to *define* a shape usually should not also be drawn — see
     `shape_only` (§8.4), which strips its triangles once the bound has been baked.
 
+    **`feather <metres>`** (mesh bounds only, default **0** = off) softens that
+    silhouette. The bake is **binary** — a voxel is in or out — and the sampler's
+    trilinear filter ramps 0→1 across exactly **one voxel**, so by default a mesh bound
+    has a hard edge: fine for a body or a bottle, wrong for a cloud, smoke or a dust
+    volume, whose real edge is a *zone* where concentration falls off over a metre or
+    more. `feather` replaces the 0/1 occupancy with `smoothstep(distance-to-the-
+    outside / feather)`, so density climbs from 0 at the surface to full that far in:
+
+    ```
+    bounds { object "cloud"  voxels 192  feather 0.13 }
+    ```
+
+    The distance is an **exact Euclidean distance transform** (Felzenszwalb &
+    Huttenlocher's separable lower-envelope algorithm — three linear-time sweeps, one
+    per axis), not a chamfer approximation, so the falloff is isotropic and shows no
+    axis-aligned banding. The value is in **world metres** and is converted to voxels
+    for you; the loader reports both, and warns if you ask for less than one voxel
+    (which the trilinear filter already gives you for free):
+
+    ```
+    [medium] mesh bound "cloud": feathered 0.13 m (9.1 voxels) inward
+    ```
+
+    Feathering only ever *removes* density, so it thins the object slightly overall —
+    raise `sigma_t` a little if you want the core to hold its previous opacity. It is
+    rejected on a sphere or isosurface bound, which are carved analytically and have no
+    lattice to soften; shape those edges with the `density` field instead.
+
   The object may be authored anywhere in the file (media are resolved after all
   geometry). The named object's own material/visibility is unaffected — only its
   *shape* is borrowed for the fog bound.

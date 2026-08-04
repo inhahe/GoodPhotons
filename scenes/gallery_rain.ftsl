@@ -187,12 +187,19 @@ material "capwhite" { type diffuse  reflect whitewall 0.88 }
 material "ceil"     { type diffuse  reflect whitewall 0.82 }   # raincloud stand-in only
 
 # --- Hero-object materials -----------------------------------------------------
-# `roughness` after `preset` overrides the preset's polished lobe. Gold gets a little
-# because a perfect mirror pointed at a 1000 W/m2 sun returns a highlight ~2.4x the clip
-# point in EVERY channel (gold's normal-incidence reflectance is ~0.95/0.86/0.42), so the
-# front of the gyroid was rendering as flat white — "grey gold". 0.06 spreads that one
-# specular spike over a lobe and the metal reads as gold again.
-material "gold"     { preset gold  roughness 0.06 }
+# `roughness` after `preset` overrides the preset's polished lobe. Gold needs a LOT here, and
+# for two opposite reasons that pull the same way:
+#   * TOO BRIGHT in the middle. A perfect mirror pointed at a 1000 W/m2 sun returns a
+#     highlight ~2.4x the clip point in EVERY channel (gold's normal-incidence reflectance is
+#     ~0.95/0.86/0.42), so the front of the gyroid rendered as flat white — "grey gold".
+#   * TOO DARK at the rim. A mirror has no colour of its own; it shows what it points AT, and
+#     with the walls and ceiling gone the gyroid's outer edge points at an empty black sky and
+#     so renders black. Roughness is the only fix that does not require putting the room back:
+#     a wide lobe lets a rim microfacet still collect the sun, the overhead sky panel and the
+#     white caps, and gold's spectral reflectance then tints all of it gold.
+# 0.18 is the value that spreads the central spike below the clip point AND leaves the rim
+# lit. It reads as satin/brushed gold rather than polished — which is what a wide lobe IS.
+material "gold"     { preset gold  roughness 0.18 }
 material "chrome"   { preset chrome }
 material "brass"    { preset brass }
 material "glass"    { type dielectric ior glass:BK7 }
@@ -240,183 +247,190 @@ quad { origin -18 0 -19   u 0 0 45   v 46 0 0   material gridground }
 # A CAGE IS A CSG DIFFERENCE, not twelve hand-placed bars: take the original solid box and
 # subtract three axis-aligned boxes, each shrunk by the bar thickness on two axes and grown
 # past the surface on the third. What survives is exactly the twelve edges. Bar thickness is
-# 0.022 m (2 * 0.022 = 0.044 comes off each shrunk axis) and the subtractors overhang by
+# 0.011 m (2 * 0.011 = 0.022 comes off each shrunk axis) and the subtractors overhang by
 # 0.02 m so the cut faces are clean rather than coplanar. Four primitives instead of twelve,
-# and every one an exact box SDF, so the sphere tracer stays well-behaved on 22 mm bars.
+# and every one an exact box SDF, so the sphere tracer stays well-behaved even on 11 mm bars.
 #
-# The cap geometry and every top y are UNCHANGED from the stone version, so the settled poses
-# in this file are still valid and nothing needs re-settling.
+# The CAPS are deliberately much wider than the cage that carries them — a cap is the only
+# surface in the scene that can actually catch a caustic, so widening it is the cheapest way
+# to see more of the glass pieces' dispersion. Four cap pairs (glass/klein, klein/brass,
+# dumbbell/heart, heart/oil) now overlap in PLAN, but every one of those pairs sits at a
+# different cap height, so they stagger like shelves instead of intersecting.
+#
+# Every cap's y-position, thickness and `round` are UNCHANGED from the stone version (only
+# the two horizontal sizes grew), so the settled poses in this file are still valid and
+# nothing needs re-settling.
 
 isosurface "stand_gyroid" {   # centrepiece: broad low plinth, cap top y=0.55
     material wirecage  union {
-        difference {                                            # base slab, y 0..0.24
-            box { center 5.0 0.12 4.8  size 2.10  0.24  2.10 }
-            box { center 5.0 0.12 4.8  size 2.12  0.196 2.056 }
-            box { center 5.0 0.12 4.8  size 2.056 0.26  2.056 }
-            box { center 5.0 0.12 4.8  size 2.056 0.196 2.12  }
+        difference {
+            box { center 5.0 0.12 4.8  size 2.1   0.24  2.1   }
+            box { center 5.0 0.12 4.8  size 2.12  0.218 2.078 }
+            box { center 5.0 0.12 4.8  size 2.078 0.26  2.078 }
+            box { center 5.0 0.12 4.8  size 2.078 0.218 2.12  }
         }
-        difference {                                            # upper stage, y 0.24..0.52
-            box { center 5.0 0.38 4.8  size 1.66  0.28  1.66 }
-            box { center 5.0 0.38 4.8  size 1.68  0.236 1.616 }
-            box { center 5.0 0.38 4.8  size 1.616 0.30  1.616 }
-            box { center 5.0 0.38 4.8  size 1.616 0.236 1.68  }
+        difference {
+            box { center 5.0 0.38 4.8  size 1.66  0.28  1.66  }
+            box { center 5.0 0.38 4.8  size 1.68  0.258 1.638 }
+            box { center 5.0 0.38 4.8  size 1.638 0.3   1.638 }
+            box { center 5.0 0.38 4.8  size 1.638 0.258 1.68  }
         }
     }
 }
 isosurface "stand_gyroid_cap" { material capwhite
-    box { center 5.0 0.535 4.8  size 1.66 0.03 1.66  round 0.01 } }
+    box { center 5.0 0.535 4.8  size 2.3 0.03 2.3  round 0.01 } }
 
-isosurface "stand_glass" {    # right-front pedestal, cap top y=0.90
+isosurface "stand_glass" {   # right-front pedestal, cap top y=0.90
     material wirecage  union {
         difference {
-            box { center 6.2 0.09 3.5  size 0.90  0.18  0.90 }
-            box { center 6.2 0.09 3.5  size 0.92  0.136 0.856 }
-            box { center 6.2 0.09 3.5  size 0.856 0.20  0.856 }
-            box { center 6.2 0.09 3.5  size 0.856 0.136 0.92  }
+            box { center 6.2 0.09 3.5  size 0.9   0.18  0.9   }
+            box { center 6.2 0.09 3.5  size 0.92  0.158 0.878 }
+            box { center 6.2 0.09 3.5  size 0.878 0.2   0.878 }
+            box { center 6.2 0.09 3.5  size 0.878 0.158 0.92  }
         }
         difference {
-            box { center 6.2 0.525 3.5  size 0.42  0.69  0.42 }
-            box { center 6.2 0.525 3.5  size 0.44  0.646 0.376 }
-            box { center 6.2 0.525 3.5  size 0.376 0.71  0.376 }
-            box { center 6.2 0.525 3.5  size 0.376 0.646 0.44  }
+            box { center 6.2 0.525 3.5  size 0.42  0.69  0.42  }
+            box { center 6.2 0.525 3.5  size 0.44  0.668 0.398 }
+            box { center 6.2 0.525 3.5  size 0.398 0.71  0.398 }
+            box { center 6.2 0.525 3.5  size 0.398 0.668 0.44  }
         }
     }
 }
 isosurface "stand_glass_cap" { material capwhite
-    box { center 6.2 0.885 3.5  size 0.62 0.03 0.62  round 0.02 } }
+    box { center 6.2 0.885 3.5  size 1.1 0.03 1.1  round 0.02 } }
 
-isosurface "stand_diamond" {  # tall thin jewel-column, cap top y=0.85
+isosurface "stand_diamond" {   # tall thin jewel-column, cap top y=0.85
     material wirecage  union {
         difference {
-            box { center 3.5 0.10 3.6  size 0.60  0.20  0.60 }
-            box { center 3.5 0.10 3.6  size 0.62  0.156 0.556 }
-            box { center 3.5 0.10 3.6  size 0.556 0.22  0.556 }
-            box { center 3.5 0.10 3.6  size 0.556 0.156 0.62  }
+            box { center 3.5 0.1 3.6  size 0.6   0.2   0.6   }
+            box { center 3.5 0.1 3.6  size 0.62  0.178 0.578 }
+            box { center 3.5 0.1 3.6  size 0.578 0.22  0.578 }
+            box { center 3.5 0.1 3.6  size 0.578 0.178 0.62  }
         }
         difference {
-            box { center 3.5 0.50 3.6  size 0.24  0.62  0.24 }
-            box { center 3.5 0.50 3.6  size 0.26  0.576 0.196 }
-            box { center 3.5 0.50 3.6  size 0.196 0.64  0.196 }
-            box { center 3.5 0.50 3.6  size 0.196 0.576 0.26  }
+            box { center 3.5 0.5 3.6  size 0.24  0.62  0.24  }
+            box { center 3.5 0.5 3.6  size 0.26  0.598 0.218 }
+            box { center 3.5 0.5 3.6  size 0.218 0.64  0.218 }
+            box { center 3.5 0.5 3.6  size 0.218 0.598 0.26  }
         }
     }
 }
 isosurface "stand_diamond_cap" { material capwhite
-    box { center 3.5 0.825 3.6  size 0.44 0.05 0.44  round 0.02 } }
+    box { center 3.5 0.825 3.6  size 1.0 0.05 1.0  round 0.02 } }
 
-isosurface "stand_klein" {    # cap top y=1.00; the Klein bottle stands directly on this cap
-    material wirecage  union { # — no mount, see the `klein` block below
+isosurface "stand_klein" {   # cap top y=1.00; the Klein bottle stands on it
+    material wirecage  union {
         difference {
-            box { center 5.9 0.11 2.6  size 0.72  0.22  0.72 }
-            box { center 5.9 0.11 2.6  size 0.74  0.176 0.676 }
-            box { center 5.9 0.11 2.6  size 0.676 0.24  0.676 }
-            box { center 5.9 0.11 2.6  size 0.676 0.176 0.74  }
+            box { center 5.9 0.11 2.6  size 0.72  0.22  0.72  }
+            box { center 5.9 0.11 2.6  size 0.74  0.198 0.698 }
+            box { center 5.9 0.11 2.6  size 0.698 0.24  0.698 }
+            box { center 5.9 0.11 2.6  size 0.698 0.198 0.74  }
         }
         difference {
-            box { center 5.9 0.60 2.6  size 0.34  0.76  0.34 }
-            box { center 5.9 0.60 2.6  size 0.36  0.716 0.296 }
-            box { center 5.9 0.60 2.6  size 0.296 0.78  0.296 }
-            box { center 5.9 0.60 2.6  size 0.296 0.716 0.36  }
+            box { center 5.9 0.6 2.6  size 0.34  0.76  0.34  }
+            box { center 5.9 0.6 2.6  size 0.36  0.738 0.318 }
+            box { center 5.9 0.6 2.6  size 0.318 0.78  0.318 }
+            box { center 5.9 0.6 2.6  size 0.318 0.738 0.36  }
         }
     }
 }
 isosurface "stand_klein_cap" { material capwhite
-    box { center 5.9 0.985 2.6  size 0.52 0.03 0.52  round 0.02 } }
+    box { center 5.9 0.985 2.6  size 0.96 0.03 0.96  round 0.02 } }
 
-isosurface "stand_dumbbell" { # cap top y=0.88
+isosurface "stand_dumbbell" {   # cap top y=0.88
     material wirecage  union {
         difference {
-            box { center 4.5 0.11 2.7  size 0.66  0.22  0.66 }
-            box { center 4.5 0.11 2.7  size 0.68  0.176 0.616 }
-            box { center 4.5 0.11 2.7  size 0.616 0.24  0.616 }
-            box { center 4.5 0.11 2.7  size 0.616 0.176 0.68  }
+            box { center 4.5 0.11 2.7  size 0.66  0.22  0.66  }
+            box { center 4.5 0.11 2.7  size 0.68  0.198 0.638 }
+            box { center 4.5 0.11 2.7  size 0.638 0.24  0.638 }
+            box { center 4.5 0.11 2.7  size 0.638 0.198 0.68  }
         }
         difference {
-            box { center 4.5 0.54 2.7  size 0.34  0.66  0.34 }
-            box { center 4.5 0.54 2.7  size 0.36  0.616 0.296 }
-            box { center 4.5 0.54 2.7  size 0.296 0.68  0.296 }
-            box { center 4.5 0.54 2.7  size 0.296 0.616 0.36  }
+            box { center 4.5 0.54 2.7  size 0.34  0.66  0.34  }
+            box { center 4.5 0.54 2.7  size 0.36  0.638 0.318 }
+            box { center 4.5 0.54 2.7  size 0.318 0.68  0.318 }
+            box { center 4.5 0.54 2.7  size 0.318 0.638 0.36  }
         }
     }
 }
 isosurface "stand_dumbbell_cap" { material capwhite
-    box { center 4.5 0.865 2.7  size 0.50 0.03 0.50  round 0.02 } }
+    box { center 4.5 0.865 2.7  size 0.88 0.03 0.88  round 0.02 } }
 
 isosurface "stand_chrome" {   # cap top y=0.90
     material wirecage  union {
         difference {
-            box { center 3.5 0.10 2.0  size 0.74  0.20  0.74 }
-            box { center 3.5 0.10 2.0  size 0.76  0.156 0.696 }
-            box { center 3.5 0.10 2.0  size 0.696 0.22  0.696 }
-            box { center 3.5 0.10 2.0  size 0.696 0.156 0.76  }
+            box { center 3.5 0.1 2.0  size 0.74  0.2   0.74  }
+            box { center 3.5 0.1 2.0  size 0.76  0.178 0.718 }
+            box { center 3.5 0.1 2.0  size 0.718 0.22  0.718 }
+            box { center 3.5 0.1 2.0  size 0.718 0.178 0.76  }
         }
         difference {
-            box { center 3.5 0.55 2.0  size 0.30  0.70  0.30 }
-            box { center 3.5 0.55 2.0  size 0.32  0.656 0.256 }
-            box { center 3.5 0.55 2.0  size 0.256 0.72  0.256 }
-            box { center 3.5 0.55 2.0  size 0.256 0.656 0.32  }
+            box { center 3.5 0.55 2.0  size 0.3   0.7   0.3   }
+            box { center 3.5 0.55 2.0  size 0.32  0.678 0.278 }
+            box { center 3.5 0.55 2.0  size 0.278 0.72  0.278 }
+            box { center 3.5 0.55 2.0  size 0.278 0.678 0.32  }
         }
     }
 }
 isosurface "stand_chrome_cap" { material capwhite
-    box { center 3.5 0.885 2.0  size 0.50 0.03 0.50  round 0.02 } }
+    box { center 3.5 0.885 2.0  size 0.88 0.03 0.88  round 0.02 } }
 
-isosurface "stand_heart" {    # cap top y=1.00
+isosurface "stand_heart" {   # cap top y=1.00
     material wirecage  union {
         difference {
-            box { center 4.6 0.11 1.9  size 0.68  0.22  0.68 }
-            box { center 4.6 0.11 1.9  size 0.70  0.176 0.636 }
-            box { center 4.6 0.11 1.9  size 0.636 0.24  0.636 }
-            box { center 4.6 0.11 1.9  size 0.636 0.176 0.70  }
+            box { center 4.6 0.11 1.9  size 0.68  0.22  0.68  }
+            box { center 4.6 0.11 1.9  size 0.7   0.198 0.658 }
+            box { center 4.6 0.11 1.9  size 0.658 0.24  0.658 }
+            box { center 4.6 0.11 1.9  size 0.658 0.198 0.7   }
         }
         difference {
-            box { center 4.6 0.60 1.9  size 0.32  0.76  0.32 }
-            box { center 4.6 0.60 1.9  size 0.34  0.716 0.276 }
-            box { center 4.6 0.60 1.9  size 0.276 0.78  0.276 }
-            box { center 4.6 0.60 1.9  size 0.276 0.716 0.34  }
+            box { center 4.6 0.6 1.9  size 0.32  0.76  0.32  }
+            box { center 4.6 0.6 1.9  size 0.34  0.738 0.298 }
+            box { center 4.6 0.6 1.9  size 0.298 0.78  0.298 }
+            box { center 4.6 0.6 1.9  size 0.298 0.738 0.34  }
         }
     }
 }
 isosurface "stand_heart_cap" { material capwhite
-    box { center 4.6 0.985 1.9  size 0.50 0.03 0.50  round 0.02 } }
+    box { center 4.6 0.985 1.9  size 0.86 0.03 0.86  round 0.02 } }
 
-isosurface "stand_brass" {    # cap top y=0.95
+isosurface "stand_brass" {   # cap top y=0.95
     material wirecage  union {
         difference {
-            box { center 6.0 0.12 2.0  size 0.70  0.24  0.70 }
-            box { center 6.0 0.12 2.0  size 0.72  0.196 0.656 }
-            box { center 6.0 0.12 2.0  size 0.656 0.26  0.656 }
-            box { center 6.0 0.12 2.0  size 0.656 0.196 0.72  }
+            box { center 6.0 0.12 2.0  size 0.7   0.24  0.7   }
+            box { center 6.0 0.12 2.0  size 0.72  0.218 0.678 }
+            box { center 6.0 0.12 2.0  size 0.678 0.26  0.678 }
+            box { center 6.0 0.12 2.0  size 0.678 0.218 0.72  }
         }
         difference {
-            box { center 6.0 0.58 2.0  size 0.36  0.68  0.36 }
-            box { center 6.0 0.58 2.0  size 0.38  0.636 0.316 }
-            box { center 6.0 0.58 2.0  size 0.316 0.70  0.316 }
-            box { center 6.0 0.58 2.0  size 0.316 0.636 0.38  }
+            box { center 6.0 0.58 2.0  size 0.36  0.68  0.36  }
+            box { center 6.0 0.58 2.0  size 0.38  0.658 0.338 }
+            box { center 6.0 0.58 2.0  size 0.338 0.7   0.338 }
+            box { center 6.0 0.58 2.0  size 0.338 0.658 0.38  }
         }
     }
 }
 isosurface "stand_brass_cap" { material capwhite
-    box { center 6.0 0.935 2.0  size 0.54 0.03 0.54  round 0.02 } }
+    box { center 6.0 0.935 2.0  size 0.86 0.03 0.86  round 0.02 } }
 
-isosurface "stand_oil" {      # cap top y=0.92
+isosurface "stand_oil" {   # cap top y=0.92
     material wirecage  union {
         difference {
-            box { center 5.3 0.10 1.5  size 0.64  0.20  0.64 }
-            box { center 5.3 0.10 1.5  size 0.66  0.156 0.596 }
-            box { center 5.3 0.10 1.5  size 0.596 0.22  0.596 }
-            box { center 5.3 0.10 1.5  size 0.596 0.156 0.66  }
+            box { center 5.3 0.1 1.5  size 0.64  0.2   0.64  }
+            box { center 5.3 0.1 1.5  size 0.66  0.178 0.618 }
+            box { center 5.3 0.1 1.5  size 0.618 0.22  0.618 }
+            box { center 5.3 0.1 1.5  size 0.618 0.178 0.66  }
         }
         difference {
-            box { center 5.3 0.55 1.5  size 0.30  0.70  0.30 }
-            box { center 5.3 0.55 1.5  size 0.32  0.656 0.256 }
-            box { center 5.3 0.55 1.5  size 0.256 0.72  0.256 }
-            box { center 5.3 0.55 1.5  size 0.256 0.656 0.32  }
+            box { center 5.3 0.55 1.5  size 0.3   0.7   0.3   }
+            box { center 5.3 0.55 1.5  size 0.32  0.678 0.278 }
+            box { center 5.3 0.55 1.5  size 0.278 0.72  0.278 }
+            box { center 5.3 0.55 1.5  size 0.278 0.678 0.32  }
         }
     }
 }
 isosurface "stand_oil_cap" { material capwhite
-    box { center 5.3 0.905 1.5  size 0.46 0.03 0.46  round 0.02 } }
+    box { center 5.3 0.905 1.5  size 0.82 0.03 0.82  round 0.02 } }
 
 # ==============================  HERO PIECES  =================================
 
@@ -671,6 +685,54 @@ light area {
     spd blackbody 11000   power 50000
 }
 
+# --- (3) LEFT FILL PANEL (out of frame; exists only to be REFLECTED) ----------------
+# A polished metal has no colour of its own — it shows whatever it points AT — so with the
+# walls gone the gold gyroid's outer rim, whose normals point sideways, pointed at an empty
+# black sky and rendered black. Roughening the gold to 0.18 fixed the FRONT of the ball but
+# cannot fix the rim: a wide lobe around a grazing reflection still samples mostly black sky.
+# The only real fix is to give the metal something to reflect, which is what this is: a
+# studio-style fill flat, a couple of metres to the camera's left, facing the exhibits.
+#
+# EVERY NUMBER HERE IS A CONSTRAINT, not a taste call:
+#   * x = 1.5 keeps it OUT OF FRAME. The still camera is at (5, 2.55, 6.85) with fov_y 52 at
+#     16:9, so half its horizontal field is atan(tan(26) * 16/9) = 41 deg; at the panel's
+#     nearest depth (z = 3.4) the left frame edge is already at x = 5 - 3.45*tan(41) = 2.0.
+#     Re-check this if the framing ever moves.
+#   * y stops at 2.60 and z starts at 3.4 so the panel passes UNDER and IN FRONT of the
+#     back-left cloud (x[0.6,3.5] y[2.25,3.38] z[0.7,3.2]) instead of flooding it.
+#   * it cannot eclipse the sun the way an early sky panel did. The sun is nearly overhead
+#     and behind (dir +y +z), so a shadow ray leaving any visible point toward it crosses
+#     the x = 1.5 plane at y > 4.8 — always above the panel's top edge.
+#   * 2.5 kW over 10.3 m2 is ~240 W/m2 exitance; the gyroid is 3.5 m away and sees a view
+#     factor of ~0.27, so ~65 W/m2 against the sun's 1000. It lifts the rim off black without
+#     touching the exposure, and being on the LEFT it stays 9 m from the rain, so it adds
+#     essentially nothing to the multiply-scattered veil the bow has to be read against.
+# cross(u,v) = +x, so it faces the room.
+light area {
+    origin 1.5 0.15 3.4   u 0 2.45 0   v 0 0 4.2
+    spd blackbody 5500   power 2500
+}
+
+# --- (4) RIGHT FILL PANEL (the shadow side) ----------------------------------------
+# The sun's `dir` has a -x component, so it lights every +z / -x / +y face and leaves the
+# gyroid's +x flank in its own shadow — which the left panel above, being on the SAME side as
+# the key, does nothing for. This is the classic fill opposite the key, and it is deliberately
+# weaker (2 kW over 6.75 m2) so the ball still reads as lit from one side.
+#
+# ITS z RANGE IS THE WHOLE TRICK. Put this panel level with the exhibits (z ~ 3.4, mirroring
+# the left one) and it sits 1.6 m from the rain shaft with a cos of 0.67 — it would pour fill
+# straight into the one medium in this scene that must stay dark, and the bow is a single-
+# scatter signal that only survives against a dark backdrop. Sliding it back to z[6.0,9.0],
+# level with and behind the camera, drops the rain's irradiance from it by ~7.5x (cos 0.34 at
+# 3.2 m instead of 0.67 at 1.6 m) while IMPROVING its angle on the gyroid (cos 0.95 at 3.8 m),
+# because the gyroid is nearly straight off its normal from there. Measure the bow region's
+# mean level before and after any change to this light; it should not move.
+# cross(u,v) = -x, so it faces the room.
+light area {
+    origin 8.6 0.15 9.0   u 0 2.25 0   v 0 0 -3.0
+    spd blackbody 5500   power 2000
+}
+
 # ==============================  ATMOSPHERE  ==================================
 # The roofed edition opened with a faint global haze (sigma_t 0.012) bounded to the room, for
 # soft volumetric shafts and aerial depth. It is DELETED here and the deletion is not tidying:
@@ -714,9 +776,17 @@ mesh "raincloud" {
     translate 8.0 2.82 2.0   rotate 0 -20 0   scale 1.45 0.88 1.40
     shape_only yes
 }
+#
+# `feather 0.13` is what stops the mesh bound from reading as a cut-out. The voxelizer bakes
+# a BINARY occupancy lattice and the sampler's trilinear filter ramps 0->1 across exactly one
+# voxel (here 3.44 m / 192 = 18 mm), which at this scale is a hard silhouette — a cloud with
+# the edge quality of a sticker. `feather` replaces the 0/1 fill with a smoothstep of the
+# exact Euclidean distance to the outside, so the occupancy climbs from 0 at the surface to 1
+# about 0.13 m (~7 voxels) in. A real cloud's edge is exactly this: not a boundary but a zone
+# where droplet concentration falls off over metres. See FTSL.md 12.1.
 medium {
     sigma_t 3.0   albedo 0.92   g 0.5
-    bounds { object "raincloud"   voxels 192 }
+    bounds { object "raincloud"   voxels 192   feather 0.13 }
     # The mesh already supplies the silhouette, so this only breaks up the INTERIOR — a
     # uniform fill inside a mesh reads as jelly rather than as cloud. It never reaches 0, so
     # it cannot punch holes through the shape the voxelizer just baked.
@@ -738,16 +808,32 @@ medium {
 # sigma_t is deliberately low. A bow is carried by SINGLY scattered light; pile on optical
 # depth and the multiply-scattered veil buries it. ~0.35 over the ~3 m the camera looks
 # through is tau ~ 0.7, thin enough that the bow dominates but thick enough to read as rain.
+#
+# THE SHAFT MUST START INSIDE THE CLOUD, NOT UNDER IT. An earlier version stopped the box at
+# y=2.4 — 0.1 m below the cloud's underside — and ran the radial ellipse out to x[6.16,9.84]
+# z[0.32,3.68], which is WIDER than the cloud's own x[6.28,9.72] z[0.36,3.64]. Both mistakes
+# show as straight lines: a lid of rain hanging in clear air with a visible top edge, and two
+# vertical shoulders of rain sticking out past the silhouette that is supposed to be emitting
+# it. The fix is geometric, not cosmetic:
+#   * the box now reaches y=3.2, which is 0.9 m INSIDE the cloud (cloud y[2.30,3.34]), and the
+#     density is faded out by smoothstep(2.55, 3.15, y) — so the shaft's top surface is not
+#     merely hidden by the cloud, it does not exist as a surface at all, it dissolves. The
+#     whole taper band lies above the cloud's underside, so it is buried in fog regardless.
+#   * the radial denominators drop 1.75 -> 1.30 and 1.60 -> 1.20, putting the shaft's outer
+#     limit at x[6.64,9.36] z[0.74,3.26], comfortably inside the cloud's footprint even after
+#     the -20 deg yaw shrinks the true silhouette in from its AABB.
 medium {
     sigma_t 0.35   albedo 0.99
-    bounds { min 6.2 0 0.5   max 9.6 2.4 3.4 }
+    bounds { min 6.5 0 0.6   max 9.5 3.2 3.4 }
     phase rainbow { droplet_um 300   supernumerary off }
-    # A soft elliptical shaft under the cloud, widening and thinning as it falls, streaked by
-    # noise that is stretched ~6x in y so the structure reads as FALLING rather than as
-    # isotropic lumps. The radial term is what keeps the box's own faces from showing.
-    density "saturate( (1 - smoothstep(0.45, 1.05, sqrt( ((x-8.0)/1.75)^2 + ((z-2.0)/1.60)^2 )))
+    # A soft elliptical shaft, densest at the top where it leaves the cloud and thinning as it
+    # falls, streaked by noise that is stretched ~6x in y so the structure reads as FALLING
+    # rather than as isotropic lumps. The radial term keeps the box's side faces from showing;
+    # the trailing smoothstep does the same job for the top face.
+    density "saturate( (1 - smoothstep(0.45, 1.05, sqrt( ((x-8.0)/1.30)^2 + ((z-2.0)/1.20)^2 )))
                      * (0.55 + 0.75*noise(1.2*x, 0.20*y, 1.2*z))
-                     * mix(0.55, 1.0, saturate(y/2.4)) )"
+                     * mix(0.55, 1.0, saturate(y/2.4))
+                     * (1 - smoothstep(2.55, 3.15, y)) )"
     density_max 1.30
 }
 

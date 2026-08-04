@@ -36,6 +36,17 @@
 // side of EROSION, losing the outermost plane -- the safe direction for a fog bound, which
 // should never leak outside the mesh, and sub-voxel against a boundary the trilinear ramp
 // deliberately softens anyway.
+//
+// FEATHERING (`feather <metres>`): the trilinear ramp above spans exactly ONE voxel, so the
+// bake is effectively a hard silhouette -- a cloud bounded this way has a crisp cut-out edge
+// where real cloud has a diffuse one. `featherGrid` replaces the 0/1 occupancy with
+// `saturate(distance-to-the-outside / feather)`, i.e. the fog reaches full density only
+// `feather` metres INSIDE the surface and ramps smoothly to zero at it. It is a pure
+// post-pass on the lattice, so nothing downstream changes: the same fp16 grid, the same
+// trilinear sample, the same majorant (the maximum is still 1). Distance comes from an exact
+// Euclidean distance transform (Felzenszwalb & Huttenlocher 2012's separable lower-envelope
+// algorithm, three O(n) passes over the axes), not a chamfer approximation -- an approximate
+// metric shows up as faceted banding in the very gradient the feature exists to produce.
 #pragma once
 #include "geometry.h"
 #include "vdbgrid.h"
@@ -168,6 +179,93 @@ inline VdbGrid voxelizeSolid(const Tri* tris, size_t triStart, size_t triCount, 
     g.wmax = w0 + Vec3((nx - 1) * h, (ny - 1) * h, (nz - 1) * h);
     g.maxVal = 1.0f;
     return g;
+}
+
+// --- Feathering ---------------------------------------------------------------------
+// One pass of the exact separable EDT (Felzenszwalb & Huttenlocher): given per-column
+// squared distances `f[0..n)`, write back the lower envelope of the parabolas
+// (x - q)^2 + f[q]. O(n) via the standard stack of intersection points. `f`, `d`, `v` and
+// `z` are caller-owned scratch so the 3-axis sweep allocates once, not per column.
+inline void edt1d(const std::vector<double>& f, std::vector<double>& d, int n,
+                  std::vector<int>& v, std::vector<double>& z) {
+    const double BIG = 1e30;                     // envelope bound, NOT the seed (see below)
+    // Intersection abscissa of the parabolas rooted at p and q.
+    auto sect = [&](int q, int p) {
+        return ((f[q] + (double)q * q) - (f[p] + (double)p * p)) / (2.0 * (double)(q - p));
+    };
+    int k = 0;
+    v[0] = 0; z[0] = -BIG; z[1] = BIG;
+    for (int q = 1; q < n; ++q) {
+        double s = sect(q, v[k]);
+        while (k > 0 && s <= z[k]) { --k; s = sect(q, v[k]); }
+        ++k; v[k] = q; z[k] = s; z[k + 1] = BIG;
+    }
+    k = 0;
+    for (int q = 0; q < n; ++q) {
+        while (z[k + 1] < (double)q) ++k;
+        const double dq = (double)q - (double)v[k];
+        d[q] = dq * dq + f[v[k]];
+    }
+}
+
+// Turn a 0/1 occupancy lattice into a feathered one: each solid voxel's value becomes
+// `saturate(distance-to-the-nearest-empty-voxel / featherVox)`, so density ramps from 0 at
+// the silhouette to 1 once `featherVox` voxels inside. `featherVox` is in VOXELS (the caller
+// converts the author's metres by dividing by the voxel edge). A value <= 0 is a no-op.
+//
+// Distances are measured to the nearest EMPTY voxel, and the bake already surrounds the
+// lattice with a one-voxel zero shell, so a solid region touching the lattice edge still
+// feathers rather than being cut flat.
+inline void featherGrid(VdbGrid& g, double featherVox) {
+    if (g.data.empty() || !(featherVox > 0.0)) return;
+    const int nx = g.nx, ny = g.ny, nz = g.nz;
+    const size_t n = (size_t)nx * ny * nz;
+    auto idx = [nx, ny](int i, int j, int k) { return ((size_t)k * ny + (size_t)j) * nx + i; };
+
+    // Seed: 0 at every EMPTY voxel, "unreachable" at every solid one — the EDT then gives
+    // each solid voxel its squared distance to the outside. The seed is a large FINITE
+    // value, not 1e300: F&H's parabola intersection subtracts two seeds, and with 1e300 on
+    // both sides that difference is pure cancellation noise. One more than the longest
+    // squared diagonal the lattice can hold is unreachable in practice and keeps every
+    // intermediate well-conditioned.
+    const double UNREACH = (double)nx * nx + (double)ny * ny + (double)nz * nz + 1.0;
+    std::vector<double> dist(n);
+    for (size_t t = 0; t < n; ++t) dist[t] = g.data[t] ? UNREACH : 0.0;
+
+    const int nmax = std::max(nx, std::max(ny, nz));
+    std::vector<double> f((size_t)nmax), d((size_t)nmax), z((size_t)nmax + 1);
+    std::vector<int> v((size_t)nmax);
+
+    for (int k = 0; k < nz; ++k)                                   // along x
+        for (int j = 0; j < ny; ++j) {
+            for (int i = 0; i < nx; ++i) f[i] = dist[idx(i, j, k)];
+            edt1d(f, d, nx, v, z);
+            for (int i = 0; i < nx; ++i) dist[idx(i, j, k)] = d[i];
+        }
+    for (int k = 0; k < nz; ++k)                                   // along y
+        for (int i = 0; i < nx; ++i) {
+            for (int j = 0; j < ny; ++j) f[j] = dist[idx(i, j, k)];
+            edt1d(f, d, ny, v, z);
+            for (int j = 0; j < ny; ++j) dist[idx(i, j, k)] = d[j];
+        }
+    for (int j = 0; j < ny; ++j)                                   // along z
+        for (int i = 0; i < nx; ++i) {
+            for (int k = 0; k < nz; ++k) f[k] = dist[idx(i, j, k)];
+            edt1d(f, d, nz, v, z);
+            for (int k = 0; k < nz; ++k) dist[idx(i, j, k)] = d[k];
+        }
+
+    // Smoothstep rather than a linear ramp: a linear ramp leaves a visible crease where it
+    // reaches 1, which on a cloud edge reads as a second, softer silhouette.
+    const double inv = 1.0 / featherVox;
+    for (size_t t = 0; t < n; ++t) {
+        if (!g.data[t]) continue;
+        double u = std::sqrt(dist[t]) * inv;
+        if (u >= 1.0) continue;                       // already full density; leave the 1
+        if (u < 0.0) u = 0.0;
+        g.data[t] = floatToHalfBits((float)(u * u * (3.0 - 2.0 * u)));
+    }
+    g.maxVal = 1.0f;
 }
 
 // Fraction of the lattice that came out solid — a cheap sanity signal for the loader's

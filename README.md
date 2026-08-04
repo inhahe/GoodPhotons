@@ -2414,9 +2414,16 @@ bake resolution on the longest axis; the fill uses generalized winding rather th
 so a model made of several closed bodies (or with self-intersecting shells) comes out as
 their union instead of hollowing where they overlap, and 1.85 M triangles bake in about a
 second. The lattice is the same dense volume format an imported `.nvdb` uses, so mesh
-bounds run on the **GPU** too. Pair it with `mesh { … shape_only yes }`, which loads a mesh
-purely as a shape and strips its triangles from the scene once the bound is baked, so the
-shell defining the fog isn't also drawn around it. An *open* fog sphere is directly viewable in every mode.
+bounds run on the **GPU** too. Because that bake is binary and the sampler's trilinear
+filter only ramps across one voxel, a mesh bound has a **hard edge** by default — right for
+a body or a bottle, wrong for a cloud. `feather <metres>` fixes that: it replaces the 0/1
+occupancy with a smoothstep of the **exact Euclidean distance** to the outside (Felzenszwalb
+& Huttenlocher's separable transform, three linear-time sweeps — isotropic, no axis-aligned
+banding), so density rises from zero at the surface to full that far in and the silhouette
+becomes a falloff *zone* the way real cloud edges are. Pair it with
+`mesh { … shape_only yes }`, which loads a mesh purely as a shape and strips its triangles
+from the scene once the bound is baked, so the shell defining the fog isn't also drawn
+around it. An *open* fog sphere is directly viewable in every mode.
 Fog (and any diffuse surface) seen through a **glass sphere** *is* imaged directly by the
 pinhole splat `B`, via the **analytic specular connection**: for each glowing haze in-scatter
 (or Lambertian surface) vertex the renderer solves the refracted eye ray that reaches the

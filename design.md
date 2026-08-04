@@ -1292,6 +1292,23 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     majorant estimation must use `Medium::densityFieldAt` (the field with no membership
     carve) rather than `densityAt`, or a coarse probe of a thin shape majorises to ~0 and
     the medium silently vanishes.
+  - **`feather <metres>` (0.130.0)** is the answer to the one thing that bake gets visually
+    wrong. Occupancy is **binary** and the `VdbGrid` sampler's trilinear filter ramps 0→1 over
+    exactly **one voxel**, so a mesh bound is effectively a hard silhouette — correct for a
+    body, badly wrong for a cloud, whose real edge is a zone metres deep. `meshvox::featherGrid`
+    replaces the 0/1 fill with `smoothstep(dist_to_outside / feather)`. The distance is an
+    **exact** Euclidean distance transform (Felzenszwalb & Huttenlocher 2012: a 1-D
+    lower-envelope-of-parabolas pass run once per axis, O(n) each, `meshvox::edt1d`), *not* a
+    chamfer/Manhattan approximation — a chamfer's error is anisotropic and would print the
+    lattice's own axes onto the falloff, which is exactly the artefact being removed. Two
+    numerical traps, both already paid for: the "unreached" seed must be a **large finite**
+    value (`nx²+ny²+nz²+1`), because F&H intersects parabolas by *subtracting* two seeds and
+    `1e300 - 1e300` is pure cancellation noise; and the ramp is a smoothstep rather than a
+    linear one, because a linear ramp creases visibly where it reaches 1 and that crease reads
+    as a second, softer silhouette. Because it only ever *lowers* density it is majorant-safe
+    for free (`maxVal` stays 1). `ftsl.h` takes the value in **world metres**, divides by the
+    voxel edge, warns below one voxel, and **rejects the key on sphere/isosurface bounds**,
+    which are carved analytically and have no lattice to soften.
   - **`mesh { shape_only yes }`** is the companion: the triangles are loaded for the bake and
     then removed from `Scene::tris` by `Builder::stripShapeOnlyMeshes` — run between the
     deferred medium sweep and `Scene::build()`, so they never reach the BVH. Renumbering is
@@ -1301,16 +1318,32 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   - **`scenes/gallery_rain.ftsl`** is the shipped worked example, and it exercises the whole
     path in anger: `cloud1.glb` (1.85 M tris, two disjoint lobes — the case parity fill gets
     wrong) bakes to a 195×76×187 lattice at 29.3 % solid, uploads as 2406/6000 sparse bricks
-    (5.3 MB → 2.4 MB VRAM), and all 1.85 M triangles are then stripped by `shape_only`. Under
-    it hangs a rain curtain using the `rainbow` phase function, lit through a ceiling slot by
-    a sun. Three things about that scene are load-bearing and non-obvious, so they are
-    written up in its header rather than only here: the sun is a **distant sphere**, not
-    `light sun`, because when the scene was authored mode `D` refused a scene containing a
-    `light sun` outright (0.124.0 lifted that — a sphere still works and is equally physical,
-    so the scene was left alone); the global haze
-    is **bounded to the room**, because an unbounded one extinguishes a 400 m light by
-    e^-4.8; and the sky panel **stops short of the solar shaft**, because `light area` is real
-    opaque geometry in the BVH and a full-sky panel eclipses the sun outright.
+    (5.3 MB → 2.4 MB VRAM), and all 1.85 M triangles are then stripped by `shape_only`. It is
+    also the shipped example of `feather` (0.13 m ≈ 9 voxels), without which the cloud reads
+    as a sticker. Under it hangs a rain curtain using the `rainbow` phase function. Several
+    things about that scene are load-bearing and non-obvious, so they are written up in its
+    header rather than only here:
+    - **The rain shaft starts *inside* the cloud, not below it.** Both the top of its bounds
+      and the horizontal extent of its density ellipse must sit within the cloud's own
+      silhouette, and the density must fade to zero *before* the box's top face — otherwise
+      the "shaft" shows a straight lid and two vertical shoulders in clear air.
+    - **`light area` is real opaque geometry in the BVH**, so any panel can eclipse something.
+      The sky panel is therefore *raised* to y=12 (a sun ray leaving the scene's lowest exit
+      point clears its far edge) rather than shrunk, and the two later fill panels are placed
+      by checking where a shadow ray toward the sun crosses their plane.
+    - **The two fill panels exist to be reflected, not seen.** With the walls gone, a polished
+      metal's rim points at an empty black sky and renders black; roughness alone cannot fix
+      it, because a wide lobe around a grazing reflection still samples mostly black sky. Both
+      panels are placed just outside the still camera's 41° half-field so the background stays
+      pure black. The right-hand one is deliberately pushed *back* level with the camera:
+      mirroring the left one's z would have put it 1.6 m from the rain and poured fill into
+      the one medium that must stay dark, since a rainbow is single-scatter and only survives
+      against a dark backdrop. Verified by measuring the bow region's mean level before and
+      after — it moved 0.3 %.
+    - The sun spent the scene's early versions as a **distant sphere** because mode `D` refused
+      a scene containing a `light sun` outright; 0.124.0/0.127.0 lifted that and it is now a
+      real `light sun`. The old global haze is deleted: its `bounds` box was invisible only
+      because the walls hid its faces.
 - **Volumetric blackbody emission ("fire")** — a `Medium` may carry a second `temperature` grid
   (`Medium::temperature`/`tempPeak`/`emitKelvin`/`emissionScale`; `emissive()`/`temperatureAt()`/
   `emissionAt()` in `scene.h`), turning its hot voxels into a self-illuminating isotropic volume

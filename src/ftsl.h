@@ -5141,6 +5141,19 @@ private:
             //                   trilinear sample of it, so the fog takes the imported
             //                   silhouette. `voxels <n>` sets the longest-axis resolution.
             if (const std::string onm = strOf(bb, "object"); !onm.empty()) {
+                // `feather` softens a baked occupancy LATTICE, which only the mesh branch
+                // produces — a sphere and an isosurface are carved analytically per point and
+                // have no lattice to erode. Say that, rather than letting the generic
+                // unknown-key warning imply the keyword does not exist.
+                const bool isMeshBound = (sphereByName_.find(onm) == sphereByName_.end())
+                                      && (implicitByName_.find(onm) == implicitByName_.end());
+                if (!isMeshBound && find(bb, "feather")) {
+                    fail("medium `bounds { object \"" + onm + "\" feather … }`: `feather` "
+                         "applies only to a MESH bound (it softens the voxelized occupancy "
+                         "lattice). A sphere or isosurface bound is carved analytically — "
+                         "shape its edge with the `density` field instead.");
+                    return false;
+                }
                 if (auto sit = sphereByName_.find(onm); sit != sphereByName_.end()) {
                     const NamedSphere& ns = sit->second;
                     med.bounded = true;
@@ -5200,6 +5213,33 @@ private:
                         "[medium] mesh bound \"%s\": %d x %d x %d lattice, %.1f%% solid "
                         "(%zu tris)\n", onm.c_str(), occ.nx, occ.ny, occ.nz, frac * 100.0,
                         grp->triCount);
+                    // `feather <metres>` softens the silhouette: density ramps from 0 at the
+                    // mesh surface to full only that far INSIDE it, instead of the one-voxel
+                    // trilinear step the raw occupancy gives. Authored in world units so it
+                    // is independent of `voxels`; converted to voxels here because that is
+                    // what the distance transform measures in.
+                    const double feath = dblOf(bb, "feather", 0.0);
+                    if (feath < 0.0) {
+                        fail("medium `bounds { object \"" + onm + "\" feather D }`: D is a "
+                             "distance in metres and cannot be negative");
+                        return false;
+                    }
+                    if (feath > 0.0) {
+                        // Voxel edge = extent along the longest axis / that axis' voxel count.
+                        const Vec3 ex = occ.wmax - occ.wmin;
+                        const int nmx = std::max(occ.nx, std::max(occ.ny, occ.nz));
+                        const double vh = std::max({ex.x, ex.y, ex.z}) / std::max(1, nmx - 1);
+                        const double fv = (vh > 0.0) ? feath / vh : 0.0;
+                        if (fv < 1.0)
+                            std::fprintf(stderr,
+                                "[medium] NOTE: mesh bound \"%s\" feather %.3g m is %.2f voxel(s) "
+                                "at `voxels %d` — below one voxel it cannot resolve a ramp; "
+                                "raise `voxels` or `feather`.\n", onm.c_str(), feath, fv, vres);
+                        meshvox::featherGrid(occ, fv);
+                        std::fprintf(stderr,
+                            "[medium] mesh bound \"%s\": feathered %.3g m (%.1f voxels) inward\n",
+                            onm.c_str(), feath, fv);
+                    }
                     // A mesh that voxelizes to nothing would silently render as no fog at
                     // all, which reads as "the medium block did nothing" rather than as a
                     // geometry problem. Say so instead of leaving the author guessing.

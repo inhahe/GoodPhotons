@@ -7600,3 +7600,42 @@ returns for a `Vertex` with a null `light`, so the two agree.
 
 Repro (pre-fix): `ftrace -in scraps/_grid_test.ftsl -camera cam -mode D -time 20` — grid absent
 on GPU, present with `-device cpu`.
+
+---
+
+### TECH DEBT — DONE (2026-08-04, v0.130.0): a mesh fog bound had a hard silhouette, so imported clouds read as cut-outs
+
+`medium { bounds { object "<mesh>" } }` bakes a **binary** occupancy lattice, and the
+`VdbGrid` sampler's trilinear filter ramps 0 -> 1 across exactly **one voxel**. On
+`scenes/gallery_rain.ftsl`'s raincloud that voxel is 14 mm across a 3.4 m cloud, so the bound
+was a hard edge in every practical sense: the fog stopped dead on the mesh surface and the
+cloud rendered with the edge quality of a sticker. That is right for a body or a bottle and
+wrong for every volumetric thing anyone actually imports a mesh bound for — cloud, smoke,
+dust — whose real edge is a *zone* where concentration falls off over metres.
+
+There was no way to soften it. `density` multiplies on top of membership, but it is evaluated
+from world position and knows nothing about where the surface is, so it cannot taper toward an
+arbitrary imported silhouette; the only lever was to hand-fit an algebraic falloff to the mesh,
+which defeats the point of using a mesh.
+
+Fixed by `feather <metres>` on a mesh bound (`meshvox::featherGrid`), which replaces the 0/1
+occupancy with `smoothstep(distance-to-the-outside / feather)`.
+
+* The distance is an **exact** Euclidean distance transform — Felzenszwalb & Huttenlocher
+  2012's separable lower-envelope-of-parabolas algorithm, one O(n) sweep per axis
+  (`meshvox::edt1d`). A chamfer/Manhattan approximation was rejected on purpose: its error is
+  anisotropic, so it would print the lattice's own axes onto the falloff, which is precisely
+  the artefact being removed.
+* Two numerical traps, both handled. The "unreached" seed must be a **large finite** value
+  (`nx^2 + ny^2 + nz^2 + 1`), not `1e300`: F&H intersects two parabolas by *subtracting* their
+  seeds, and `1e300 - 1e300` is pure cancellation noise. And the ramp is a smoothstep, not
+  linear — a linear ramp creases visibly where it reaches 1, and that crease reads as a second,
+  softer silhouette just inside the first.
+* Majorant-safe for free: feathering only ever *lowers* density, so `maxVal` stays 1 and delta
+  tracking is unaffected. It does thin the object overall; raise `sigma_t` if the core should
+  hold its previous opacity.
+* `ftsl.h` takes the value in world metres, divides by the voxel edge, warns below one voxel
+  (the trilinear filter already gives you that), and **rejects the key on a sphere or
+  isosurface bound**, which are carved analytically and have no lattice to soften.
+
+Repro of the old behaviour: drop `feather` from the raincloud in `scenes/gallery_rain.ftsl`.
