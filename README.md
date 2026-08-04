@@ -792,8 +792,8 @@ that converges to the same physical image.
 | `P` | Mixed diffuse + mirrors/coatings | Medium | ✓ | ✓ *(routes to `D` w/ lens)* | ✓ | ✓ | Costs more than `B`; possible seam between layers |
 | `D` | Specular-first + diffuse caustics + **participating media** in one pass | Slow / sample | ✓ | ✓ *(physical lens)* | ✓ | ✓ | Highest per-sample cost; no fluorescence / env / collimated lights |
 | `M` | Many cameras sharing one lighting solution (flythroughs); reusable/persistable map | Fast per frame *(after one shared pass)* | ✓ *(walks to diffuse)* | — | ✓ | ✓ *(direct query)* | Direct query blurs contact shadows (use `-pmfg`) |
-| `S` | **Caustics / SDS**; progressive, bounded memory | Slow *(many passes)* | ✓ | ✓ | ✓✓ | ✗ | Many passes to converge; CPU only |
-| `U` | Robust "have it all" (diffuse GI + caustics), no per-scene mode picking | Heaviest / pass | ✓ | ✓ | ✓ | ✗ | Heaviest per-pass cost; CPU only |
+| `S` | **Caustics / SDS**; progressive, bounded memory | Slow *(many passes)* | ✓ | ✓ | ✓✓ | ✓ *(resident session; pinhole only)* | Many passes to converge |
+| `U` | Robust "have it all" (diffuse GI + caustics), no per-scene mode picking | Heaviest / pass | ✓ | ✓ | ✓ | ✓ *(resident session; pinhole only, no media)* | Heaviest per-pass cost |
 
 - **`B` — pinhole splat (default, fastest).** Every photon that hits a
   camera-visible surface splats to the pinhole, so essentially no photons are
@@ -958,8 +958,8 @@ that converges to the same physical image.
   Since 0.125.0 it renders **`spot` and `sun` lights** on the same terms mode `D` does
   (delta emitters: the unsamplable strategies are dropped from the vc/vm MIS weights, and a
   `sun` gets the escaped-ray strategy so a mirror throws its disc back at the lens) — on the
-  **CPU** only: unlike mode `D` (which got the device port in 0.126.0), the GPU VCM kernels
-  still don't do delta lights, so such a scene falls back to the CPU VCM session. *Cost:* the heaviest per-pass (both a full light pass and a full camera pass,
+  CPU, and since 0.127.0 on the **GPU** too (the device VCM session got the same port mode `D`
+  got in 0.126.0, and is ~170× faster than the CPU on a spotlit Cornell box). *Cost:* the heaviest per-pass (both a full light pass and a full camera pass,
   plus a grid build), but the most consistent quality per pass — at equal time it beats
   SPPM on caustics *and* stays as clean as BDPT on diffuse GI. (Single-wavelength note:
   connections pair a camera path with its **own** light path so they share one wavelength
@@ -1022,10 +1022,10 @@ stay non-resumable.
   (Fluorescence, layered stacks, and env/collimated lights aren't a GPU limitation — BDPT
   can't render them on *any* backend, so mode `D` refuses or drops to mode `B` for those
   scenes on both CPU and GPU; use mode B/P/R for them. **Spot and sun lights** render
-  on-device in mode `D` since 0.126.0 — the delta-emitter light subpath, the unified NEE
-  connection geometry and the escaped-ray solar disc are all in the kernels, so a spot/sun
-  scene no longer falls back; only mode `U` (GPU VCM) still demotes such a scene to the CPU
-  session with a printed notice. GRIN media likewise keep an in-scope
+  on-device in mode `D` since 0.126.0 and in mode `U` since 0.127.0 — the delta-emitter light
+  subpath, the per-shape NEE connection geometry and the escaped-ray solar disc are all in the
+  kernels, so a spot/sun scene no longer falls back in either bidirectional mode. GRIN media
+  likewise keep an in-scope
   mode-`D` scene on the CPU; spectral **rainbow-phase** media now render on-device in mode `D`.) **Parametric records** (a
   material's slots driven by a per-hit driver sampling a named LUT bank — see *Parametric
   records* below) run on the **GPU forward, backward, and BDPT (`D`) tracers for both the
@@ -1651,10 +1651,9 @@ Unlike every other light, the sun costs nothing in forward modes: photons are bo
 disc the size of the scene's own cross-section, aimed down the beam, so **every** photon
 enters the scene instead of most missing it. Backward modes next-event-estimate it
 inside its cone, and the disc itself is directly viewable (aim a camera at it). Runs on
-both CPU and GPU in modes A/B/C/R/P/M/S, and in mode `D` (BDPT — since 0.124.0 on the CPU,
-together with `spot`; **since 0.126.0 on the GPU too**). Mode `U` (VCM — since 0.125.0)
-renders it on the **CPU only**: the GPU VCM kernels still refuse a spot/sun, so a mode-`U`
-sun scene falls back to the CPU session with a printed notice.
+both CPU and GPU in every mode: A/B/C/R/P/M/S all along, mode `D` (BDPT) since 0.124.0 on the
+CPU and 0.126.0 on the GPU (together with `spot`), and mode `U` (VCM) since 0.125.0 on the CPU
+and 0.127.0 on the GPU. No mode falls back to the CPU for a sun any more.
 See `scenes/_sun_check.ftsl` and `scenes/_deltalight_mix.ftsl`, and `ftrace -checksun` for the deterministic self-test
 (cone solid angle, exposure invariance, uniform-in-solid-angle cone sampling, and
 NEE/direct-view rim agreement).

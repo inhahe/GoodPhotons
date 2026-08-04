@@ -9562,8 +9562,10 @@ __global__ void kSppmResolve(DSppmState st, double* film, int resX, int resY,
 // the PAIRED light subpath, and merging from the grid; it accumulates the pass image into
 // the persistent `accum` sum. The resolve divides by the pass count. Mirrors SmallVCM's
 // dVCM/dVC/dVM bookkeeping (misArrival / misScatter inlined; Mis(x)=x, so the wrappers are
-// dropped). Scope (gated in cudaVcmSupported): surfaces only, area/sphere Lambertian lights,
-// rectilinear pinhole camera, NO participating media (media.empty()).
+// dropped). Scope (gated in cudaVcmSupported): surfaces only, area/sphere/tube/mesh Lambertian
+// lights PLUS the two delta emitters (`spot`, `sun` — since 0.127.0, with dVC starting at 0,
+// the sun's planar first-edge density and its escaped-ray disc), rectilinear pinhole camera,
+// NO participating media (media.empty()).
 
 // One stored light-subpath vertex (device twin of vcm.h LightVertex). Stores INDICES + the
 // per-hit texcoords (u,v) so textured/patterned/record BSDFs evaluate per-hit like M9's BDPT.
@@ -9838,46 +9840,91 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 
         int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
         const DEmitter& em = sc.emitters[ei];
-        if (em.shape == 2 || em.shape == 3 || em.shape == 6 || em.collimated) continue;
+        if (em.shape == 3 || em.collimated) continue;      // env / collimated: out of VCM scope
+        const bool isDelta    = dIsDeltaEmitter(em);       // spot / sun: no s=0 strategy
+        const bool isInfinite = dIsInfiniteEmitter(em);    // sun: planar first-edge density
         Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 y, nOut;
-        // The sampled point's `emit pattern:` factor (1.0, and a bit-identical draw, when
-        // unpatterned) scales the radiance the light subpath starts with — the MIS pdfs
-        // are untouched, exactly as in dGenLightSubpath.
-        double emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
-        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
+        DVec3 y, nOut, dir;
+        // Per-shape emission sampling, the device twin of `vcm.h`'s traceLightSubpath.
+        // `emitScale` is the achromatic factor that multiplies the emitted SPECTRUM only and
+        // never a density (the `emit pattern:` weight for an area light, the smoothstep
+        // penumbra for a spot, 1 for a sun); `emitCos` is |cos| at the light, which is
+        // exactly 1 for both delta lights because their emission "normal" IS the direction.
+        // Keeping emitScale out of every pdf is what lets directPdf / emissionPdfW stay
+        // exactly what the camera kernel's s=0 / s=1 terms assume.
+        double emitScale = 1.0, emitCos = 1.0, pdfPos = 1.0, pdfDirW = 0.0;
+        if (isDelta) {
+            // Both delta lights emit uniformly inside a cone about beamDir (pdfW = 1/Omega).
+            // NOTE spotOmega is the FALLOFF-weighted solid angle for a spot, so the sampling
+            // cone has to be recomputed here (the two coincide only for a sun).
+            double coneSolid = 2.0 * DPI * (1.0 - em.spotCosOuter);
+            if (coneSolid <= 0.0) continue;
+            pdfDirW = 1.0 / coneSolid;
+            dir = dSunSampleCone(em, em.beamDir, (double)u1, (double)u2);
+            if (isInfinite) {
+                // Origin on a disc of radius sceneRadius, one radius upstream of the scene
+                // centre and perpendicular to beamDir: a PLANAR density 1/(pi R^2).
+                double R = sc.sceneRadius;
+                if (R <= 0.0) continue;
+                DVec3 tt, bb; onb(em.beamDir, tt, bb);
+                double rr = R * sqrt((double)rng.uniform()), phi = 2.0 * DPI * (double)rng.uniform();
+                y = sc.sceneCenter + tt * (Real)(rr * cos(phi)) + bb * (Real)(rr * sin(phi))
+                  - em.beamDir * (Real)R;
+                pdfPos = 1.0 / (DPI * R * R);
+            } else {
+                y = em.origin;                             // delta position: pdfPos == 1
+                emitScale = spotFalloff(ddot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
+                if (emitScale <= 0.0) continue;
+            }
+            nOut = dir;
+        } else {
+            // The sampled point's `emit pattern:` factor (1.0, and a bit-identical draw, when
+            // unpatterned) scales the radiance the light subpath starts with — the MIS pdfs
+            // are untouched, exactly as in dGenLightSubpath.
+            emitScale = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
+            if (em.area <= 0.0) continue;
+            pdfPos = 1.0 / em.area;
+            dir = cosineHemisphere(nOut, rng);
+            emitCos = ddot(nOut, dir);
+            if (emitCos <= 0.0) continue;
+            pdfDirW = emitCos / DPI;
+        }
+        double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitScale;
         // Max-over-live-λ: the hero can legitimately sit in a gap of the emission spectrum
         // while a secondary is on it. nUp == 1 -> empty loop -> mxLe == Le, the old test.
         double LeSec[SECN], mxLe = Le;
         for (int k = 0; k + 1 < nUp; ++k) {
-            LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1] * emitPatW;
+            LeSec[k] = (double)specLookup(em.emitSpd, lamAll[k + 1]) * invAll[k + 1] * emitScale;
             if (LeSec[k] > mxLe) mxLe = LeSec[k];
         }
         if (mxLe <= 0.0) continue;
         double pdfChoice = em.power / sc.totalPower;
-        double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
-        if (pdfPos <= 0.0 || pdfChoice <= 0.0) continue;
+        if (pdfPos <= 0.0 || pdfDirW <= 0.0 || pdfChoice <= 0.0) continue;
 
-        DVec3 dir = cosineHemisphere(nOut, rng);
-        double cosLight = ddot(nOut, dir);
-        if (cosLight <= 0.0) continue;
-        double pdfDirW = cosLight / DPI;
         double emissionPdfW = pdfPos * pdfDirW * pdfChoice;
         if (emissionPdfW <= 0.0) continue;
-        double directPdfW = pdfChoice * pdfPos;
+        // The density NEE (s=1) would have used for THIS sample, in the measure that strategy
+        // works in: an area density for a finite surface light, the solid-angle 1/Omega for
+        // the infinitely distant sun, and 1 for a delta position (SmallVCM's PointLight::Emit
+        // reports oDirectPdfA = 1). dVCM then comes out as Omega for a spot and pi R^2 for a
+        // sun — exactly SmallVCM's PointLight / DirectionalLight constants.
+        double directPdfW = pdfChoice * (isInfinite ? pdfDirW : (isDelta ? 1.0 : pdfPos));
 
-        double beta = Le * cosLight / emissionPdfW;
+        double beta = Le * emitCos / emissionPdfW;
         // MIS bookkeeping is the HERO's for the whole bundle: every sampling density in this
         // renderer (cosine / glossy-lobe / emitter pdfs) is wavelength-INDEPENDENT, so one
         // dVCM/dVC/dVM triple serves every λ — only the throughput VALUES differ.
+        // A delta light cannot be hit by BSDF sampling, so dVC (and the dVM built from it)
+        // start at ZERO: that is what DROPS the unsamplable strategies from the balance
+        // heuristic instead of under-weighting the ones that do work.
         double dVCM = directPdfW / emissionPdfW;
-        double dVC  = cosLight / emissionPdfW;
+        double dVC  = isDelta ? 0.0 : (emitCos / emissionPdfW);
         double dVM  = dVC * ctx.misVcWeight;
 
         double betaSec[SECN];
         double cieSx[SECN], cieSy[SECN], cieSz[SECN];
         for (int k = 0; k + 1 < nUp; ++k) {
-            betaSec[k] = LeSec[k] * cosLight / emissionPdfW;
+            betaSec[k] = LeSec[k] * emitCos / emissionPdfW;
             cieSx[k] = (double)cieX(lamAll[k + 1]);
             cieSy[k] = (double)cieY(lamAll[k + 1]);
             cieSz[k] = (double)cieZ(lamAll[k + 1]);
@@ -9917,8 +9964,14 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             }
             if (dEmitterForMat(sc, matId) >= 0) break;    // light subpath doesn't scatter off emitters
 
-            // misArrival(dist, cosThetaIn)
-            dVCM *= dist * dist; dVCM /= cosThetaIn; dVC /= cosThetaIn; dVM /= cosThetaIn;
+            // misArrival(dist, cosThetaIn, foldDist2 = !(isInfinite && edges == 1)). The one
+            // edge in the whole renderer that skips the dist^2 area conversion is the FIRST
+            // edge of a sun's subpath: that vertex's forward density is the planar 1/(pi R^2)
+            // over the fictitious disc, not a solid-angle density (SmallVCM's
+            // `if (pathLength > 1 || isFiniteLight) dVCM *= dist^2`; pbrt's "correct subpath
+            // sampling densities for infinite area lights" patch).
+            if (!(isInfinite && edges == 1)) dVCM *= dist * dist;
+            dVCM /= cosThetaIn; dVC /= cosThetaIn; dVM /= cosThetaIn;
 
             DVec3 wo = normalize(prevP - h.p);
             DVec3 ngo = (ddot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * (Real)-1;
@@ -10105,10 +10158,41 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         double dVC = 0.0, dVM = 0.0;
         DMediumStack stk; stk.clear();
         DVec3 prevP = cam.eye;
+        // Has this eye chain passed through ONLY delta (specular) vertices so far? That is
+        // the precondition for the escaped-sun strategy below; tracked explicitly rather than
+        // inferred from dVCM == 0, which a delta vertex sets but which says nothing about the
+        // vertices before it.
+        bool camAllDelta = true;
+        const bool hasSun = sc.sunCount > 0;
 
         for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
             DHit h = closestHit(sc, ro, rd);
-            if (!h.valid) break;                          // no env in scope
+            if (!h.valid) {
+                // The ray left the scene. No env map in VCM scope, but a `light sun` is a
+                // delta-DIRECTION emitter with no geometry: the s=0 term never fires for it
+                // and no connection or merge can reach it either, so without this the solar
+                // disc — and every mirror glint of it — would simply be missing. Add it only
+                // when the escaping ray came through camera + delta vertices ONLY, which is
+                // exactly the case where nothing else competes (NEE, every s>=2 connection,
+                // the t==1 splat and merging all need a connectible vertex). The MIS weight
+                // is therefore exactly 1.
+                if (hasSun && camAllDelta) {
+                    for (int k = 0; k < sc.nEmitters; ++k) {
+                        const DEmitter& em = sc.emitters[k];
+                        if (em.shape != 6 || !dInSunCone(em, rd)) continue;
+                        double e0 = beta * (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
+                        double ax = cieCx * e0, ay = cieCy * e0, az = cieCz * e0;
+                        for (int j = 0; j + 1 < nUp; ++j) {
+                            double ej = betaSec[j] *
+                                        (double)specLookup(em.emitSpd, lamAll[j + 1]) * invAll[j + 1];
+                            ax += cieSx[j] * ej; ay += cieSy[j] * ej; az += cieSz[j] * ej;
+                        }
+                        if (nUp > 1) { double inv = 1.0 / nUp; ax *= inv; ay *= inv; az *= inv; }
+                        rx += ax; ry += ay; rz += az;
+                    }
+                }
+                break;
+            }
             {
                 int cm = stk.topMat();
                 double a = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
@@ -10182,19 +10266,79 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 if (edges + 1 <= ctx.maxDepth && sc.nEmitters > 0 && sc.totalPower > 0.0) {
                     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
                     const DEmitter& em = sc.emitters[ei];
-                    if (!(em.shape == 2 || em.shape == 3 || em.shape == 6 || em.collimated)) {
+                    if (!(em.shape == 3 || em.collimated)) {
+                        const bool neeDelta = dIsDeltaEmitter(em);
                         Real u1 = rng.uniform(), u2 = rng.uniform();
-                        DVec3 yL, nL;
-                        // Sampled point's emission-pattern factor (1.0 when unpatterned).
-                        double epat = dEmitterSamplePointPat(sc, em, u1, u2, yL, nL);
-                        DVec3 toL = yL - h.p; double dist2 = ddot(toL, toL);
-                        if (dist2 > 1e-12) {
-                            double distL = sqrt(dist2); DVec3 wiL = toL * (Real)(1.0 / distL);
-                            double cosAtLight = ddot(nL, wiL * (Real)-1);
+                        // Per-shape connection geometry (device twin of vcm.h's NEE branch).
+                        // All three emission models produce the same five quantities, after
+                        // which the BSDF / occlusion / MIS code below is shared:
+                        //   wiL          connection direction (this vertex -> the light)
+                        //   distL        shadow-ray length (out of the scene for a sun)
+                        //   cosAtLight   |cos| at the light (1 for both delta lights)
+                        //   directPdfW   the NEE density in SOLID ANGLE at this vertex
+                        //   emissionPdfW pdfPos*pdfDirW of the same sample (no pickProb: it
+                        //                cancels in the wCamera ratio and is applied
+                        //                explicitly in wLight / the contribution below)
+                        // `epat` scales the emitted spectrum only, never a pdf.
+                        DVec3 wiL; double distL = 0.0, dist2 = 0.0, cosAtLight = 1.0;
+                        double neeDirectPdfW = 0.0, neeEmissionPdfW = 0.0, epat = 1.0;
+                        double occlEps = 2e-6;
+                        bool geomOk = false;
+                        if (em.shape == 2) {
+                            // Delta POSITION: the connection point is deterministic, so the
+                            // positional pdf is 1 and the solid-angle density is just dist^2.
+                            // The penumbra weights the INTENSITY toward this receiver (it is a
+                            // radiance factor, never a density — folding it into a pdf would
+                            // break the light subpath's matching dVCM).
+                            DVec3 toL = em.origin - h.p; dist2 = ddot(toL, toL);
+                            if (dist2 > 1e-12) {
+                                distL = sqrt(dist2); wiL = toL * (Real)(1.0 / distL);
+                                epat = spotFalloff(ddot(wiL * (Real)-1, em.beamDir),
+                                                   em.spotCosInner, em.spotCosOuter);
+                                double coneSolid = 2.0 * DPI * (1.0 - em.spotCosOuter);
+                                if (epat > 0.0 && coneSolid > 0.0) {
+                                    neeDirectPdfW = dist2;        // pdfA(=1)*dist^2/cosAtLight(=1)
+                                    neeEmissionPdfW = 1.0 / coneSolid;
+                                    geomOk = true;                // emitSpd is an INTENSITY (W/sr)
+                                }
+                            }
+                        } else if (em.shape == 6) {
+                            // Delta DIRECTION at infinity: sample inside the solar cone
+                            // (pdfW = 1/Omega) and shadow-ray all the way out of the scene, so
+                            // the ray must NOT be shortened by the endpoint epsilon. No 1/dist^2
+                            // and no cosLight; emitSpd is already a radiance.
+                            double coneSolid = 2.0 * DPI * (1.0 - em.spotCosOuter);
+                            double R = sc.sceneRadius;
+                            if (coneSolid > 0.0 && R > 0.0) {
+                                wiL = dSunSampleCone(em, em.beamDir * (Real)-1, (double)u1, (double)u2);
+                                distL = (double)length(sc.sceneCenter - h.p) + R;
+                                dist2 = distL * distL;
+                                occlEps = 0.0;
+                                neeDirectPdfW = 1.0 / coneSolid;
+                                neeEmissionPdfW = 1.0 / (DPI * R * R * coneSolid);
+                                geomOk = true;
+                            }
+                        } else {
+                            DVec3 yL, nL;
+                            // Sampled point's emission-pattern factor (1.0 when unpatterned).
+                            epat = dEmitterSamplePointPat(sc, em, u1, u2, yL, nL);
+                            DVec3 toL = yL - h.p; dist2 = ddot(toL, toL);
+                            if (dist2 > 1e-12 && em.area > 0.0) {
+                                distL = sqrt(dist2); wiL = toL * (Real)(1.0 / distL);
+                                cosAtLight = ddot(nL, wiL * (Real)-1);
+                                if (cosAtLight > 0.0) {           // emitter stays one-sided
+                                    double invArea = 1.0 / em.area;
+                                    neeDirectPdfW = invArea * dist2 / cosAtLight;
+                                    neeEmissionPdfW = invArea * cosAtLight / DPI;
+                                    geomOk = true;
+                                }
+                            }
+                        }
+                        if (geomOk) {
                             double cosToLight = ddot(h.n, wiL);
                             double stG = twoSidedCam ? 1.0 : (double)dShadowTerminatorG(wiL, h.n, ngoCam);
                             bool sideOk = twoSidedCam ? (cosToLight != 0.0) : (cosToLight > 0.0 && stG > 0.0);
-                            if (cosAtLight > 0.0 && sideOk) {
+                            if (sideOk) {
                                 // Cheap gates + shadow ray first, BSDF eval after (bit-
                                 // identical: no RNG in either; skips the eval when shadowed).
                                 double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * epat;
@@ -10207,8 +10351,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                 DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
                                 double f = 0.0, fSec[SECN];
                                 for (int k = 0; k + 1 < nUp; ++k) fSec[k] = 0.0;
-                                if (mxLe > 0.0 && em.area > 0.0 &&
-                                    !occluded(sc, oo, wiL, (Real)(distL - 2e-6))) {
+                                if (mxLe > 0.0 &&
+                                    !occluded(sc, oo, wiL, (Real)(distL - occlEps))) {
                                     f = dBsdfF(sc, vt, wo, wiL, lambda) * stG;
                                     for (int k = 0; k + 1 < nUp; ++k)
                                         fSec[k] = dBsdfF(sc, vt, wo, wiL, lamAll[k + 1]) * stG;
@@ -10223,12 +10367,15 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                 }
                                 if (mxfLe > 0.0) {
                                     double pdfChoice = em.power / sc.totalPower;
-                                    double invArea = 1.0 / em.area;
-                                    double directPdfW = invArea * dist2 / cosAtLight;
-                                    double emissionPdfW = invArea * cosAtLight / DPI;
+                                    double directPdfW = neeDirectPdfW;
+                                    double emissionPdfW = neeEmissionPdfW;
                                     double bsdfDirPdfW = dBsdfPdf(sc, vt, wo, wiL, lambda);
                                     double bsdfRevPdfW = dBsdfPdf(sc, vt, wiL, wo, lambda);
-                                    double wLight = bsdfDirPdfW / (pdfChoice * directPdfW);
+                                    // A delta light can never be found by BSDF sampling, so
+                                    // that strategy is DROPPED from the balance heuristic
+                                    // (weight 0) rather than given a density it does not have.
+                                    double wLight = neeDelta ? 0.0
+                                                             : (bsdfDirPdfW / (pdfChoice * directPdfW));
                                     double wCamera = (emissionPdfW * fabs(cosToLight) /
                                                       (directPdfW * cosAtLight)) *
                                                      (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW);
@@ -10409,6 +10556,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             }
             beta *= betaFactor;                           // camera side: no adjoint on continuation
             for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= secChromatic ? secF[k] : betaFactor;
+            if (!delta) camAllDelta = false;               // disqualifies the escaped-sun strategy
             if (delta && !keepBundle) nUp = 1;             // λ-dependent direction change
             prevP = h.p;
             double sgn2 = ddot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
@@ -13212,21 +13360,16 @@ struct VcmSession {
 };
 
 bool cudaVcmSupported(const Scene& scene) {
-    // VCM reuses the BDPT device scope (per-hit BSDFs, area/sphere Lambertian lights, no
+    // VCM reuses the BDPT device scope (per-hit BSDFs, area/sphere/spot/sun lights, no
     // fluorescence/layered/env/collimated, no GRIN) PLUS a NO-media restriction: the CPU
     // vcm.h path handles surfaces only (participating media are out of mode-U scope entirely,
     // guarded by vcmUnsupportedFeature), and the device kernels place no medium vertices, so a
     // scene with any medium must stay on the CPU. Pinhole cameras only (dGenRay / cam.project);
     // the caller gates the camera.
-    if (!cudaBdptSupported(scene) || !scene.media.empty()) return false;
-    // SPOT / SUN: the device BDPT kernels handle delta lights (0.126.0) but the device VCM
-    // ones do not yet — kVcmLightT would drop the emitter it just spent a CDF draw
-    // selecting, losing the light AND its share of the sample budget. Reject here so those
-    // scenes route to the CPU VCM (vcm.h, which HAS rendered them since 0.125.0): correct,
-    // just slower. See known-issues.md.
-    for (const auto& em : scene.emitters)
-        if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Sun) return false;
-    return true;
+    // Delta lights (spot / sun) render on-device since 0.127.0 — kVcmLightT emits into the
+    // cone with dVC == 0, kVcmCameraT carries the per-shape NEE geometry and the escaped-ray
+    // solar disc — so mode U needs no reject of its own beyond BDPT's env/collimated one.
+    return cudaBdptSupported(scene) && scene.media.empty();
 }
 
 VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,

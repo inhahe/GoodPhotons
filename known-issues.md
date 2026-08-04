@@ -164,7 +164,7 @@ GPU) at matched spp and comparing with `python scraps/imgdiff.py`:
 | `_sun_check.ftsl` | 400 | 0.9992 | 0.0039 | identical auto-exposure 4.75e-14 |
 | `_deltalight_mix.ftsl` | 3000 | 0.9989 | 0.0034 | absolute units, fixed gain |
 | `cornell.ftsl` (area-light regression) | 600 | 1.0128 | 0.0043 | auto-exposure 9.97e-14 vs 9.71e-14 |
-| `cornell.ftsl` (same, 10× spp) | 6000 | **1.0031** | 0.0023 | both figures halve with √spp ⇒ MC noise + auto-exposure jitter, not bias; worst pixels sit on the glass ball's caustic |
+| `cornell.ftsl` (same, 10× spp) | 6000 | 1.0043 | **0.0015** | mean \|diff\| falls 0.0043 → 0.0015 (√10× ⇒ pure MC noise, not bias); the residual mean ratio is auto-exposure jitter (a p99 statistic); worst pixels sit on the glass ball's caustic |
 
 On the mix scene the escaped-ray solar-disc strategy is present and singly counted on the
 GPU exactly as on the CPU: the 7×7 window at (50,101) — the sun's disc reflected off the
@@ -177,14 +177,47 @@ spells `|cosSurf| · cosLight·A/(d²·pdfChoice)` where it used to spell `|cosS
 behind `dIsDeltaEmitter`, which is false for them. The RNG draw order is byte-for-byte
 unchanged on every path (the `u1,u2` pair is still drawn before the shape branch).
 
-**Still open, smaller:** the GPU **VCM** kernels (`kVcmLightT`) have *not* been ported, so
-`cudaVcmSupported()` now carries its own explicit spot/sun reject instead of inheriting one
-from `cudaBdptSupported()`. A mode-U spot/sun scene therefore still runs on the CPU VCM
-(which does render it, since 0.125.0) — correct, just slower. The port is the same shape as
-this one but against SmallVCM's `dVCM`/`dVC`/`dVM` running-partial bookkeeping rather than
-PBRT's explicit pdf arrays; `src/vcm.h`'s three rules (delta ⇒ `dVC = 0` and `wLight = 0`;
-`dVCM` starts at Ω for a spot and πR² for a sun; skip the `dist²` fold on an infinite light's
-first edge) are what has to be transliterated.
+**Follow-on, now also DONE (2026-08-04, v0.127.0): the GPU VCM kernels do delta lights too.**
+Relaxing `cudaBdptSupported()` above would have silently broken **GPU VCM**, because
+`cudaVcmSupported()` was `cudaBdptSupported() && media.empty()` while `kVcmLightT` carried its
+own `shape == 2 || 3 || 6 || collimated` reject — it would have drawn a spot/sun out of the
+power CDF and then *discarded* it, losing the light AND its share of the sample budget. That
+was patched over with an explicit spot/sun reject in `cudaVcmSupported()`; the reject is now
+gone, because the kernels were ported. Against SmallVCM's running-partial `dVCM`/`dVC`/`dVM`
+bookkeeping (not PBRT's explicit pdf arrays), the three rules from `src/vcm.h` transliterate as:
+
+- **`kVcmLightT`** grew the per-shape emission block — cone sampling via `dSunSampleCone`
+  (recomputing the sampling cone `2π(1−cosOuter)`, since `spotOmega` is the *falloff-weighted*
+  solid angle), a point origin for a spot vs. a `sceneRadius` disc for a sun, `emitScale` kept
+  out of every density, and `directPdfW = pdfChoice · (isInfinite ? pdfDirW : isDelta ? 1 : pdfPos)`.
+  **`dVC` (and hence `dVM`) start at 0** for a delta light — the `dVC` analogue of
+  `vertexPdfLightOrigin` returning 0. The resulting `dVCM` is Ω for a spot and πR² for a sun,
+  exactly SmallVCM's `PointLight` / `DirectionalLight` constants.
+- The **first-edge `dist²` fold is skipped** for a sun (`if (!(isInfinite && edges == 1)) dVCM *= dist*dist;`)
+  — the device form of `misArrival`'s `foldDist2` parameter, false in exactly that one place.
+- **`kVcmCameraT`**'s NEE branch grew the same three-way connection geometry as the CPU
+  (`neeDirectPdfW` / `neeEmissionPdfW` / `occlEps`, with the sun's shadow ray running to the
+  scene exit with **no** endpoint epsilon), and `wLight` is forced to **0** for a delta light.
+- **`kVcmCameraT`** tracks `camAllDelta` and adds the **escaped-ray sun** at MIS weight 1 on a
+  miss, gated on `sc.sunCount > 0`.
+- Vertex connection (c) and vertex merging (d) needed **no** change on either backend: they
+  read `dVCM`/`dVC`/`dVM` off the stored light vertices and the zeros propagate correctly.
+
+**Validated** CPU vs GPU at matched passes:
+
+| scene | mode U | mean ratio | mean \|diff\| | note |
+|---|---|---|---|---|
+| `_spot_cornell.ftsl` | 300, `-pmradius 0.003` | **0.9997** | 0.0030 | auto-exposure 7.51e-14 vs 7.48e-14; GPU 2.5 s vs CPU 427 s (**~170×**) |
+| `_sun_check.ftsl` | 400, `-pmradius 0.02` | 0.9959 | 0.0048 | auto-exposure 4.76e-14 vs 4.81e-14 — the ~1% exposure jitter *is* the ratio |
+| `_deltalight_mix.ftsl` | 250, `-pmradius 0.02` | **0.9996** | 0.0108 | **absolute** units / fixed gain, so this is a real energy comparison; GPU 1.0 s vs CPU 100 s |
+
+The escaped-ray solar disc is present and singly counted on the GPU: the 4×4 window at (25,50)
+on the mix scene reads `0.06250 = 1/16` on **both** backends (one saturated pixel each).
+
+Area-light scenes are **byte-identical**: `cornell.ftsl` mode U on GPU at 150 passes hashes to
+the same SHA-256 before and after the port (`015acdee6e10d5ce…`). The non-delta branch keeps
+the original RNG draw order and the original expressions verbatim; every new density is behind
+`dIsDeltaEmitter`, which is false for an area light.
 
 ### DONE (2026-08-03): the gallery Klein bottle is now a glassblower's bottle WITH THE INTERNALS, and it needs no mount
 

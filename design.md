@@ -134,10 +134,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   0.124.0 **BDPT (mode `D`) renders a Sun and a Spot anyway** — on the CPU (`bdpt.h`) and,
   since 0.126.0, on the **GPU** too (`render_cuda.cu`: `dGenLightSubpath`'s delta branch,
   `dConnectBDPT`'s unified `Wgeom`, the delta-aware `dVertexPdfLight*`/`dMisWeight`, and
-  `DEscape` + `kBdptT`'s escaped-ray solar disc) — and since 0.125.0 so does **CPU VCM
-  (`vcm.h`)**; see "Delta lights in BDPT" below. The **GPU VCM** kernels are the one holdout
-  (`cudaVcmSupported` carries its own spot/sun reject, so mode `U` on such a scene falls back
-  to the CPU session), and Env/collimated stay outside BDPT/VCM entirely.
+  `DEscape` + `kBdptT`'s escaped-ray solar disc). **VCM (mode `U`)** followed: CPU in 0.125.0
+  (`vcm.h`), GPU in 0.127.0 (`kVcmLightT`/`kVcmCameraT`); see "Delta lights in BDPT"/"in VCM"
+  below. So both bidirectional modes now render a Spot and a Sun on **both** backends, with no
+  CPU fallback left; Env/collimated stay outside BDPT/VCM entirely.
   The Preetham sky's `sun_disk separate` option
   (`sky::SunDisk`) unbakes the solar disc from the env map and registers an
   energy-matched Sun instead — the same picture, converging ~20× faster in forward modes.
@@ -762,6 +762,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   Validated vs mode `R`: `_sun_check` 1.0002 mean ratio (identical auto-exposure),
   `_spot_cornell` 1.0061, `_deltalight_mix` (absolute units) 0.9949 — the residual at the
   *default* merge radius is ordinary photon-mapping radius bias and shrinks with `-pmradius`.
+
+  Since **0.127.0 the GPU VCM session does delta lights too**, so mode `U` no longer falls back
+  either. `render_cuda.cu`'s `kVcmLightT` gained the per-shape emission block (cone sampling,
+  point vs. disc origin, `directPdfW = pdfChoice·(isInfinite ? pdfDirW : isDelta ? 1 : pdfPos)`,
+  and `dVC = 0` for a delta), the first-edge `dist²` skip for a sun
+  (`if (!(isInfinite && edges == 1)) dVCM *= dist*dist;` — the device form of `foldDist2`), while
+  `kVcmCameraT` gained the three-way NEE connection geometry with `wLight = 0` for a delta plus
+  `camAllDelta` and the escaped-ray solar disc at weight 1. Connection and merging needed no
+  change on either backend. CPU-vs-GPU: `_spot_cornell` 0.9997 (GPU 2.5 s vs CPU 427 s, ~170×),
+  `_sun_check` 0.9959 (that residual *is* the ~1% auto-exposure jitter), `_deltalight_mix`
+  0.9996 in absolute units, solar disc `1/16` on both — and `cornell.ftsl` mode U is
+  **byte-identical** before and after the port, since every new density sits behind
+  `dIsDeltaEmitter` and the area path keeps its RNG draw order.
 - **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`** — U/S/M.
   PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.
@@ -1344,10 +1357,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `g_pmFinalGather==0` caller gates in `main.cpp` were dropped. Validated GPU==CPU on a Cornell
   glass-sphere+diffuse-walls box (mean 0.43%, background 0.98%, per-pixel noise √-scaling with
   spp — unbiased). Since 0.39.0 (M12) there is a resident **GPU VCM/UPS** session (mode `U`,
-  `VcmSession`, `cudaVcmSupported == cudaBdptSupported && media.empty()` **plus its own spot/sun
-  reject** since 0.126.0 — surfaces-only, pinhole only; `kVcmLightT` has not been ported to delta
-  emitters, and without the explicit reject it would draw a spot/sun out of the power CDF and then
-  discard it, losing that path) mirroring `vcm.h`'s `vcmPass`: each pass (1) `kVcmLight` traces one light subpath per pixel,
+  `VcmSession`, `cudaVcmSupported == cudaBdptSupported && media.empty()` — surfaces-only, pinhole
+  only; it briefly carried its own spot/sun reject in 0.126.0, dropped again in 0.127.0 once the
+  kernels learned delta lights) mirroring `vcm.h`'s `vcmPass`: each pass (1) `kVcmLight` traces one light subpath per pixel,
   storing connectible vertices into a **per-path slab** (`lvSlab[i·vcmCap+k]`, no cross-thread
   atomics) and splatting the connect-to-camera (t=1) light-image contributions (atomic into a
   per-pass double buffer); (2) compacts the slab **on-device** (0.39.1: thrust scans over the
@@ -1390,9 +1402,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   are *not* GPU gaps: `main.cpp`'s mode-D guard (`bdptUnsupportedFeature`) refuses those scenes (or
   demotes D→B with `-on-unsupported fallback`) on both backends before any BDPT dispatch, so they
   never reach the device path. **Spot/sun lights** were a genuine GPU gap from 0.124.0 to
-  0.125.0; since 0.126.0 the device kernels do them too (see "Delta lights in BDPT" above), so
-  `cudaBdptSupported` no longer rejects such a scene — mode `U` is now the only mode that
-  demotes a spot/sun scene to the CPU. GRIN media (curved
+  0.125.0; since 0.126.0 (mode `D`) and 0.127.0 (mode `U`) the device kernels do them too (see
+  "Delta lights in BDPT"/"in VCM" above), so neither `cudaBdptSupported` nor `cudaVcmSupported`
+  rejects such a scene any more. GRIN media (curved
   paths) likewise keep an in-scope mode-D scene
   on the CPU (spectral rainbow-phase media now render on-device in mode D since M10/0.37.0). Validated GPU==CPU on `textured.ftsl` (mean 0.06%,
   per-pixel diff halving 8.2%→4.3% at 4× spp — unbiased), `mixmat.ftsl` (mean 0.21%),
