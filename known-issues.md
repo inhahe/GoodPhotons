@@ -7686,7 +7686,13 @@ Options, none yet chosen:
 
 Repro: `ftrace scenes/gallery_rain.ftsl -mode B -time 150 -o png/_b.png`
 
-### OPEN: `gallery_rain`'s caustic screens cannot show a caustic — they are metered into the clip
+### DONE: `gallery_rain`'s caustic screens cannot show a caustic — they are metered into the clip
+
+*(Resolved 2026-08-04 over several revisions, each of which retracted part of the one before —
+kept in full because the retractions are the useful part. Short version: the screens were
+metered into the clip AND the measurements were taken through that same clip; the fix is
+`capwhite` 0.15, a tenth exhibit that actually disperses, `-hdr` for the metering and
+`-fireflies 3` to replace the outlier rejection the clamp had been doing by accident.)*
 
 Three revisions of that scene have widened the stand caps specifically so the dispersive
 caustics from the glass sphere and the diamond gyroid have somewhere to land. They still do not
@@ -7883,6 +7889,97 @@ banner when handed an 8-bit file**. Rules that follow from this:
   taken from 0.88 to 0.30 for this reason and it is still not far enough under the axicon.
 * Any earlier conclusion in this file that rests on a *bright* caustic's colour should be
   re-checked against a `.pfm` before it is trusted.
+
+**AND THE CLAMP WAS, BY ACCIDENT, THE RIG'S ONLY OUTLIER REJECTION (2026-08-04).** The first
+float measurements came back *worse* than the clipped ones, not better: the glass orb metered
+peak **1389x** / sat 0.838, and the solid gyroid k=10 — a piece that throws no caustic at all,
+0.00% coverage in every table above — metered peak **1214x** / spread **0.594** and would have
+"won" the whole ranking on three pixels. Mode D carries one hero wavelength per sample, so a
+rare specular-caustic path deposits an enormous **monochromatic** spike; the 8-bit clamp used
+to flatten those to white, which is why nobody ever saw them. The 4x box average does not help
+— a box is linear and zero-mean-symmetric, so it removes chroma *speckle* but a heavy-tailed
+1000x outlier survives it scaled by 1/16 and still dominates.
+
+So `-fireflies 3` (clamp a pixel brighter than 3x its 2nd-brightest neighbour, hue preserved)
+is **mandatory for any float metering of this scene**, and is now in both rigs' render command.
+It is safe for real caustics precisely because a caustic is never isolated — its neighbours are
+bright too. Evidence: the shipped axicon measures peak **14.68x with and without** the flag,
+bit-identical, while the gyroid's 1214x vanishes.
+
+**The corrected ranking (float + `-fireflies 3`, 600 spp, 4x box, 2x cut)** — this supersedes
+the `coverage / sat / spread` tables above, all of which were computed through the clamp:
+
+| piece | peak | coverage | sat | **spread** |
+|---|---|---|---|---|
+| **axicon 45 deg, drop 0.35 (shipped)** | **14.68x** | 0.30% | 0.275 | **0.079** |
+| axicon 45 deg, drop 0.80 | 24.58x | 0.29% | 0.314 | 0.083 |
+| round brilliant R=0.40, drop 0.80 | 3.68x | 0.06% | 0.234 | 0.096 |
+| crystal orb, drop 0.80 | 3.00x | 0.16% | 0.253 | 0.013 |
+| solid gyroid k=10, drop 0.80 | 2.60x | **0.00%** | — | — |
+
+The *ordering* survives — the axicon still wins decisively (0.079 spread against the orb's
+0.013, and 5-8x the orb's peak) — so every conclusion drawn from the old tables about *which
+piece to ship* stands. But no absolute number in them does: they were suppressed by the clamp
+at the top end and inflated by fireflies at the tail, in opposite directions, so they cannot be
+rescued by rescaling. The brilliant's 0.096 spread now nominally edges the axicon's 0.079, on
+0.06% coverage against 0.30% and a fifth the peak — a spread measured over a handful of cells
+is not a comparable statistic, which is itself a reason to report coverage alongside it.
+
+**CLOSED for the axicon: the in-scene frame now measures as a coloured caustic (2026-08-04).**
+`_capchroma.py` on a 1036-spp `-hdr -fireflies 3` render of the shipped scene, per cap, at the
+2x-own-median bar:
+
+| cap | coverage | sat | spread | xspread | peak | clipped | noise floor | **fan** |
+|---|---|---|---|---|---|---|---|---|
+| **axicon** | **6.11%** | 0.247 | **0.185** | **0.273** | **6.8x** | 0.66% | 0.056 | **0.46** |
+| glass orb | 0.56% | 0.595 | 0.237 | 0.445 | 2.05x | 0.00% | 0.100 | — |
+| brass cluster | 4.76% | 0.596 | 0.022 | 0.055 | 2.31x | 0.15% | 0.169 | — |
+| crystal gyroid ("diamond") | 0.65% | 0.837 | 0.053 | 0.074 | 2.47x | 0.00% | 0.053 | — |
+| chrome / dumbbell / heart / Klein / solid gyroid | 0.00% | — | — | — | 1.0-1.9x | 0.00% | 0.005-0.024 | — |
+
+The axicon throws **11x the caustic area of anything else in the scene at 3x the peak**, and
+it is the only cap in the scene with enough caustic on it to ask the colour question at all
+(the `—` in the fan column is "fewer than 20 cells, unmeasurable", not "not coloured").
+The scene's colour problem is solved.
+
+**Two new controls, and `spread` on its own should never have been trusted without them.**
+Looking at the frame after all this, the axicon's cusps still read whitish by eye, which does
+not square with spread 0.185 — so the metric got two companions, both in `_pfm.py` so the two
+rigs share one implementation:
+
+* **`noise`** — `spread` measured over a *control band* of cells at 1.0–1.2x the cap's median,
+  i.e. bare sunlit cap with no caustic on it. Whatever chromatic scatter those show is the
+  render's speckle floor. **This is the thing that made `spread` untrustworthy**: mode `D`
+  carries one hero wavelength per sample, so an unconverged pixel is *randomly coloured*, and
+  an RMS radius in chromaticity scores a loud random cloud exactly like a rainbow. A 4x box
+  only divides speckle by 4. In-scene at 2114 spp the axicon's floor is 0.056 against its
+  0.185, so it clears by 3.3x; but the glass orb reads spread 0.237 on a 0.100 floor from
+  three cells and swung between 0.001 and 0.237 across successive writes of the same render —
+  that number was always noise, and the rig (which says the orb is white, 0.013) was right.
+* **`fan`** — the fraction of chromatic variance explained by a weighted least-squares
+  *quadratic in position* on the cap (adjusted R^2). Real dispersion means chromaticity is a
+  **function of position**; speckle is uncorrelated with position and scores ~0 however loud.
+  This is the one that actually settles it. The basis has to be quadratic: a first draft fitted
+  a **plane** and scored the axicon 0.09, because an axicon disperses *radially* about its own
+  axis — red outside, violet inside, on both flanking cusps at once — and a plane is blind to
+  that by symmetry. On the quadratic basis the axicon scores **0.46 in-scene** (control band
+  0.15) and **0.76 in the sun-only rig** (control 0.00, noise floor 0.008).
+
+The rig also re-measures the orb at **fan 0.94 on spread 0.013**, which is the pair working as
+intended: a ball lens's tinted rim is perfectly *organised* colour, there is just almost none
+of it, over a 0.09 x 0.15 m patch. So `fan` validates a reading and `spread` sizes it — the
+axicon wins on magnitude 6:1 and the ordering is unchanged.
+
+**And `capwhite` 0.30 -> 0.15 is a TONE-MAP decision, not a measurement one — a distinction
+worth writing down because it is easy to get backwards.** On the float buffer, chromaticity
+and peak:median are both scale-invariant, so a diffuse screen's albedo changes `spread`, `sat`
+and `coverage` by *literally nothing* (verified: identical to three decimals at both albedos,
+by rescaling the same `.pfm`). What it changes is how much of the caustic the tone map deletes:
+on that same buffer the axicon cap clips **3.06% of its pixels at 0.30 and 0.70% at 0.15** —
+half the caustic's own area versus a tenth of it. So `_capchroma.py` now reports a `clip`
+column beside the float metrics (scene-linear x `GAIN` 1.5 >= 1.0, where 1.5 = ftrace's
+`ABS_EXPOSURE_GAIN` 6.0 x the film's `exposure 0.25`), because the float metrics alone cannot
+tell you the picture is still throwing the caustic away.
 
 **Tooling bug found and fixed along the way: `rotate` is not a valid key inside an FTSL
 `function` block** (only `translate` is), and the loader emits a **warning, not an error**, then

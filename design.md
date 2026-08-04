@@ -972,6 +972,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   exposed**: peak/median ratios and chromaticity are exposure-invariant, so renders shot at
   different stops stay comparable. PFM's raster order (left-to-right, **bottom-to-top**) is
   the film's own row order, so unlike the 8-bit path it needs no vertical flip.
+  **Corollary nobody expected: the 8-bit clamp had been the only outlier rejection those
+  measurements had.** With it gone, a spectral rig metered a piece that throws *no* caustic at
+  peak 1214× on three cells — mode `D` carries one hero wavelength per sample, so a rare
+  specular path deposits a huge *monochromatic* spike that a box average (linear, zero-mean-
+  symmetric) cannot touch. So float metering must be paired with `-fireflies 3`, which is safe
+  for genuine caustics precisely because a caustic is never isolated: the shipped axicon reads
+  peak 14.68× bit-identically with and without it.
 - **`denoise.h`** — `-denoise`, an edge-aware à-trous (SVGF-style) filter for Monte-Carlo
   speckle. It runs inside `filmToRgb8` on the **linear** image and *before* the p99
   auto-exposure anchor is measured (so a firefly can't set the exposure); because
@@ -1383,12 +1390,26 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       a scene containing a `light sun` outright; 0.124.0/0.127.0 lifted that and it is now a
       real `light sun`. The old global haze is deleted: its `bounds` box was invisible only
       because the walls hid its faces.
-    - **The caustic screens are mid-grey (0.30), not white — and that is the whole trick.** A
+    - **The caustic screens are dark grey (0.15), not white — and that is the whole trick.** A
       caustic is only visible as a *ratio* to its screen, and a display shows no ratio above
       its clip point. At the original 0.88 albedo the sunlit caps sat at 189–209/255 with
       10–25 % of their pixels already at pure white, so a 5× caustic, a 50× one and the plain
       sunlight beside them all printed the same `#FFFFFF`: the caps were metered *into* the
-      clip, not too dim. 0.30 puts them near 64/255 and leaves 4× of headroom.
+      clip, not too dim. 0.30 was the first fix and was **still not enough** — with the axicon
+      in the scene, 596 of that cap's 22639 pixels were pure white, more than half the
+      caustic's own area (found only once `-hdr` existed to measure it; see below). The screen
+      has to be set so the caustic **peak** lands under clip, not so the ambient does. Because
+      a diffuse cap's albedo scales its radiance exactly, the choice was made arithmetically on
+      the linear buffer at zero render cost, and **the metric it moves is the displayed one,
+      not the metered one**: on the float sidecar, chromaticity and peak:median are both
+      scale-invariant, so albedo changes `spread` / `sat` / `coverage` by literally nothing
+      (measured: identical to 3 decimals at 0.15 and 0.30). What it changes is how much of the
+      caustic the tone map deletes — on the same 1036 spp buffer the axicon cap clips **3.06 %
+      of its pixels at 0.30 and 0.70 % at 0.15**, i.e. half the caustic's own area versus a
+      tenth of it. Measured through the clamp (which is what a viewer sees) that is spread
+      0.111 → 0.147, +32 %. 0.15 puts the caps 2¾ stops below clip with room for the axicon's
+      ~7× cusps on top; below it the returns fall off sharply (0.09 buys a further +0.017 for
+      a dingy sRGB-80 tabletop).
     - **The glass orb is levitated 0.30 m on three pins, and its cap is cantilevered.** The
       height was *measured*, not computed. The textbook ball-lens `f = nR/(2(n−1))` — 0.734 m
       from centre for BK7 at R=0.5 — is **paraxial**, and a full-aperture sphere has gross
@@ -1450,9 +1471,22 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       white, so a uniformly amber patch and a red-to-violet fan score alike. `_gemsweep.py`
       therefore also reports **spread**: per caustic cell take the chromaticity
       (r, b) = (R, B)/(R+G+B), find the excess-weighted centroid, and report twice the weighted
-      RMS radius about it. White or uniformly tinted collapses to a point plus sampler noise; a
-      real spectrum is a long streak. Measured at the honest 2× bar, each piece at its own best
-      drop:
+      RMS radius about it. White or uniformly tinted collapses to a point; a real spectrum is a
+      long streak. **`spread` in turn needs two controls, and is worthless without them** —
+      mode `D` carries one hero wavelength per sample, so an unconverged pixel is *randomly
+      coloured* and an RMS radius scores a loud random cloud exactly like a rainbow (a 4× box
+      only divides speckle by 4). So `_pfm.py` — shared by both rigs — also gives **`noise`**,
+      the same statistic over a control band of cells at 1.0–1.2× the median (bare lit screen,
+      no caustic, hence the render's speckle floor), and **`fan`**, the fraction of chromatic
+      variance explained by a weighted least-squares *quadratic in position* (adjusted R²).
+      Dispersion means chromaticity is a **function of position**; speckle is uncorrelated with
+      position and scores ~0 however loud. The basis must be quadratic: a first draft fitted a
+      plane and scored the axicon 0.09, because an axicon disperses *radially* about its axis —
+      red outside, violet inside, on both flanking cusps at once — which a plane cannot see by
+      symmetry. The shipped axicon scores **fan 0.76** in the rig (control 0.00, floor 0.008)
+      and **0.46** in the finished frame. The orb scores fan 0.94 on spread 0.013, which is the
+      pair working as designed: a ball lens's tinted rim is perfectly organised colour, there is
+      just almost none of it. Measured at the honest 2× bar, each piece at its own best drop:
 
       | piece | coverage | sat | **spread** |
       |---|---|---|---|
@@ -1464,6 +1498,13 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       | crystal **orb**, drop 0.80 | 0.16 % | 0.265 | 0.048 |
       | glass torus (ring lens) | 0.03 % | 0.210 | 0.045 |
       | **solid gyroid k=10, shell gyroid k=13, Klein bottle, prism** | **0.00 %** | — | — |
+
+      **Those numbers were taken through the 8-bit clamp and are wrong in absolute terms** —
+      see the `-hdr` bullet below; the re-measurement on floats with `-fireflies 3` reads
+      axicon 0.079 spread at 14.68× peak against the orb's 0.013 at 3.00×, and the gyroid still
+      0.00 %. The *ordering* survives, so every "which piece to ship" conclusion here stands,
+      but the absolute figures cannot be rescued by rescaling (clip-suppressed at the top end,
+      firefly-inflated at the tail, in opposite directions).
 
       The orb is the scene's brightest caustic *and* one of its whitest. Two results are worth
       keeping: a **round brilliant loses**, because a 40.75° pavilion sits just past crystal's

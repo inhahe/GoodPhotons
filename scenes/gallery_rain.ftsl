@@ -194,7 +194,7 @@ material "gridground" {
 # The cage bars are the ground's grid stood upright: the same green glow, on a nearly black
 # body so they never read as lit plastic.
 #
-# The caps are the caustic SCREEN, and 0.30 — not 0.88 — is what makes them one. This is the
+# The caps are the caustic SCREEN, and 0.15 — not 0.88 — is what makes them one. This is the
 # single most important number in the scene and it is counter-intuitive, so: a caustic is only
 # ever visible as a RATIO to the surface it lands on, and a display can only show ratios below
 # its clip point. At 0.88 albedo, direct sun put these caps at 189/255 with a tenth of their
@@ -203,14 +203,40 @@ material "gridground" {
 # The caps were not too dim to show a caustic, they were metered INTO THE CLIP, which erases
 # contrast in exactly the way a blown highlight erases cloud detail in a photograph.
 #
-# 0.30 drops the lit cap to roughly 64/255, a mid grey, which leaves 4x of headroom below
-# white — so the orb's ~7x disc and the diamond's dispersion punch through as genuinely
-# brighter, coloured, structured light instead of more of the same white. The cost is real
-# and was accepted deliberately: the tabletops are no longer brilliant white. A gallery
-# plinth in raking sun is a mid grey anyway; brilliant white was the render clipping.
+# 0.30 WAS THE FIRST FIX AND IT WAS NOT ENOUGH — it was set before the scene had an exhibit
+# whose caustic is genuinely strong. It leaves the lit cap at 0.30 linear (sRGB 142) and so
+# 3.3x of headroom, and the crystal axicon's cusps peak 6.6x its cap: 3.06% of that cap's
+# pixels came back pure #FFFFFF, which is HALF the caustic's own area. The scene was still
+# throwing away the colour of its one colour-bearing piece.
+#
+# 0.15 is one full stop lower: the lit cap sits at sRGB ~103, still an unambiguous mid grey,
+# and 6.7x of headroom cuts the clipped area to 0.70% — a tenth of the caustic instead of half
+# (both measured on the same 1036-spp buffer, so this is the albedo and nothing else). Darker
+# still keeps helping but with sharp diminishing returns (0.09 albedo buys only +0.017 more
+# spread for a visibly dingy sRGB-80 tabletop), so one stop is where this stops.
+#
+# WHAT ALBEDO DOES AND DOESN'T MOVE, because it is easy to measure this wrong: on the linear
+# render it changes NOTHING — chromaticity and peak:median are both scale-invariant, so spread,
+# sat and coverage come back identical to three decimals at 0.15 and at 0.30. The albedo is
+# purely a TONE-MAP decision: what it buys is caustic that survives the clamp. Metered through
+# that clamp, i.e. as a viewer sees it, the caustic goes from spread 0.111 to 0.147 (+32%) and
+# sat 0.167 to 0.228.
+#
+# HOW TO RE-DERIVE THIS after any change to the sun, the exposure or the pieces: render with
+# `-hdr -fireflies 3` and run `python scraps/_capchroma.py <out>.pfm`, which meters each cap in
+# the finished frame and reports its clipped fraction. Never meter the PNG — it is 8-bit sRGB,
+# a caustic is by definition the brightest thing in frame, and at the clip point all three
+# channels are equal, so the tone map deletes exactly the hue and peak ratio being measured
+# (the PNG reported this caustic at spread 0.057 / peak 3.7x against the linear buffer's
+# 0.19 / 6.6x). `-fireflies 3` is not optional either: the clamp used to flatten mode D's
+# rare monochromatic spikes to white and was, by accident, the only outlier rejection this
+# scene's measurements had.
+#
+# The cost is real and was accepted deliberately: the tabletops are not brilliant white. A
+# gallery plinth in raking sun is a mid grey anyway; brilliant white was the render clipping.
 material "wirecage" { type diffuse  reflect rgb 0.02 0.05 0.03
                       emit gaussian 528 34 0.45 }
-material "capwhite" { type diffuse  reflect whitewall 0.30 }
+material "capwhite" { type diffuse  reflect whitewall 0.15 }
 material "ceil"     { type diffuse  reflect whitewall 0.82 }   # raincloud stand-in only
 
 # --- Hero-object materials -----------------------------------------------------
@@ -289,7 +315,7 @@ quad { origin -18 0 -19   u 0 0 45   v 46 0 0   material gridground }
 # Splitting them is forced by materials (one isosurface carries one material) and is the
 # whole point of the design: a cage catches essentially no light, so if the cap were wireframe
 # too the dispersive caustics thrown by the glass sphere and the diamond gyroid would land on
-# nothing and simply vanish from the image. The cap is a mid-grey 0.30 rather than a bright
+# nothing and simply vanish from the image. The cap is a mid-grey 0.15 rather than a bright
 # white, which is the OPPOSITE of the obvious choice and is explained at `capwhite`: a bright
 # cap in this sun clips, and a clipped screen cannot show a caustic at any intensity. Both
 # halves are NAMED, because settle_scene.py
@@ -1319,10 +1345,10 @@ medium {
 # `exposure` remain directly comparable.
 #
 # The caps are no longer 0.88 — see `capwhite`, which explains at length why "just under white"
-# was the wrong place to meter a CAUSTIC SCREEN and why they are 0.30 now. The exposure itself
+# was the wrong place to meter a CAUSTIC SCREEN and why they are 0.15 now. The exposure itself
 # is unchanged: the caps moved, the metering did not, so this stop is still the right one for
-# the gold, the sun-facing wire and the sky panel, and the caps now sit two and a half stops
-# below clip with room for a caustic on top.
+# the gold, the sun-facing wire and the sky panel, and the caps now sit two and three-quarter
+# stops below clip with room for the axicon's ~6.6x cusps on top (0.70% of that cap clips).
 #
 # THE FRAMING IS RETUNED for this edition: look_at rises from y 0.95 to y 1.80, pitching the
 # camera up from -23.1 deg to -11.3 deg. The base scene aimed at the exhibits on the floor,
