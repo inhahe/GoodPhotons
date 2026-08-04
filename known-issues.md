@@ -5,6 +5,34 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### STALE DOC / OPEN DECISION (2026-08-04, v0.126.0): `scenes/gallery_rain.ftsl` works around a GPU limitation that no longer exists
+
+The scene models the sun as a **distant sphere** (400 m away, `radius 1.85` = the sun's own
+0.53°, `power 2.011e9` = one solar constant) rather than a `light sun`, and says so twice:
+
+- header, "Why the sun is a distant SPHERE and not `light sun`": *"v0.124.0 lifted that: mode D
+  now renders `spot` and `sun` on the CPU — **but only on the CPU, since the GPU BDPT kernels
+  still reject delta lights, and this scene very much wants the GPU.** A distant sphere is no
+  less physical, so it stays."*
+- the `prefer{}/else{}` block (~line 552): *"…`light sun`, which used to knock this scene
+  straight into that branch and today would merely **force it off the GPU**."*
+
+**Both claims are false as of 0.126.0** — `cudaBdptSupported()` rejects only `Env`/collimated,
+so a `light sun` stays on the device. The blocker that motivated the workaround is gone.
+
+Checked, so it isn't a hidden obstacle: `dConnectBDPT`'s `s == 1` branch resolves
+`pt.type == BV_MEDIUM` (cos = 1, `dMediumScatterF`) **independently of** the per-shape `Wgeom`
+block, so a *volume* vertex connects to a delta light on the GPU exactly as a surface one does.
+The volumetric shaft and the rainbow would survive the switch — this scene is media-heavy, so
+that was the one thing that could have killed it.
+
+**Open decision (needs the user):** convert to a real `light sun` (re-deriving the irradiance,
+since `light sun` takes `intensity`, not `power`), or keep the sphere as physically honest and
+just correct the two comments. A real sun would also dissolve a second workaround: the global
+haze is bounded to the room *specifically* because an unbounded haze sits between the 400 m
+sphere and the roof slot and extinguishes it by `e^-(0.012·400)` ≈ 1/120 — a delta sun has no
+400 m of travel. Not edited yet because the right comment text depends on which way this goes.
+
 ### BUG — DONE (2026-08-04, v0.124.0): mode D could not render `spot` / `sun` lights at all — now it can (and the entry that claimed it did so *silently* was WRONG)
 
 **Correction first.** The original version of this entry claimed a mode-D scene containing a
