@@ -554,16 +554,26 @@ isosurface "gyroid_gem" {
 # rather than sitting cleanly beside it. That is a deliberate trade for the 1.5x brightness.
 sphere { center 6.7 1.70 3.5   radius 0.5   material glass }
 
-# The three pins the orb stands on. Deliberately in `wirecage` — same visual language as the
-# stands' 11 mm bars, and near-invisible against the caustic. They are at horizontal radius
-# 0.30, so they touch the sphere at y = 1.70 - sqrt(0.25 - 0.09) = 1.30, which is OUTSIDE the
-# converging cone there (radius 0.228) — they cast nothing into the disc. They are also all
-# below the equator, so they never shadow the sunlit upper hemisphere that forms the caustic.
+# The three pins the orb stands on. Deliberately in `wirecage`, 12 mm — the same visual
+# language as the stands' 11 mm bars. (They were 24 mm at first, i.e. twice everything else
+# in the scene, and against a mid-grey cap that read as three loud green bars over the hero
+# element. Halving them also halves their screen footprint over the caustic.)
+#
+# They are at horizontal radius 0.30, so they touch the sphere at y = 1.70 - sqrt(0.25-0.09)
+# = 1.30, OUTSIDE the converging cone there (radius 0.228) — they cast nothing into the disc.
+# All three are below the equator, so they never shadow the sunlit upper hemisphere that
+# forms the caustic.
+#
+# The triad's azimuths (11/131/251 deg from +z) are not arbitrary. The camera's sight line to
+# the disc centre crosses pin height (y=1.10) at (6.644, 3.220), and the disc's screen
+# footprint at that height spans +-0.14 m. At the obvious 0/120/240 the nearest pin sat 0.242 m
+# from that point and clipped the disc's edge; rotating 11 deg pushes the two near pins to
+# 0.292 m, so with a 6 mm half-width nothing overlaps the disc at all.
 isosurface "stand_glass_mount" {
     material wirecage  union {
-        box { center 6.7    1.10 3.80  size 0.024 0.40 0.024 }
-        box { center 6.4402 1.10 3.35  size 0.024 0.40 0.024 }
-        box { center 6.9598 1.10 3.35  size 0.024 0.40 0.024 }
+        box { center 6.7572 1.10 3.7945  size 0.012 0.40 0.012 }
+        box { center 6.9264 1.10 3.3032  size 0.012 0.40 0.012 }
+        box { center 6.4164 1.10 3.4023  size 0.012 0.40 0.012 }
     }
 }
 
