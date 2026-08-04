@@ -180,6 +180,40 @@ static constexpr Real DET_EPS = 1e-9;
 static constexpr Real BIG     = 1e30;
 #endif
 
+// Max-t for a CONNECTION ray — a shadow ray whose far end lands ON a sampled point of
+// another surface (BDPT/VCM's s=1 light connection, its t=1 camera connection, an s,t>=2
+// vertex-to-vertex connection, a caustic chain's connection to the eye). Such a ray must
+// stop just SHORT of that point or it re-hits the very surface the point was sampled from
+// and the sample is thrown away as occluded.
+//
+// The CPU reference shortens by a fixed 2e-6 and gets away with it because it is double
+// throughout. The fp32 device build cannot: `dist` is rebuilt from fp32 coordinates, so the
+// endpoint jitters by ~|coord|*2^-23 around the true surface (half of that jitter lands
+// INSIDE the emitter), and worse, 2e-6 is below one ulp of `dist` past ~17 m, so the cast
+// rounds it straight back to `dist` and the shortening vanishes entirely. The visible
+// symptom is a DISTANT light losing most of its energy: measured on a 1.85 m sphere 400 m
+// from the shading point, mode D on the GPU came out 2.7x darker than the CPU reference
+// (1.5x at 40 m, clean by ~4 m). Any scene modelling the sun as a far-away sphere hit this.
+//
+// So shorten by a RELATIVE amount, which tracks the fp32 jitter at every scene scale, and
+// keep the caller's absolute epsilon as a floor for near geometry. 1e-5 is ~84 ulp of a
+// float — two orders above the jitter — and in absolute terms 10 um at 1 m or 4 mm at
+// 400 m, far below any occluder these rays could legitimately need to see. The fp64 build
+// sets the relative term to zero so it stays bit-identical to the CPU reference.
+#if FTRACE_GPU_FP32
+static constexpr double CONN_REL_EPS = 1e-5;
+#else
+static constexpr double CONN_REL_EPS = 0.0;
+#endif
+// `absEps == 0` means "do not shorten at all": the distant-sun connection's far end is the
+// scene EXIT, not a sampled surface point, so it must keep the whole segment (see the
+// shape==6 branch of the s=1 connection, which sets occlEps = 0 for exactly that reason).
+__device__ __host__ inline Real connMaxT(double dist, double absEps = 2e-6) {
+    if (absEps <= 0.0) return (Real)dist;
+    double e = dist * CONN_REL_EPS;
+    return (Real)(dist - (e > absEps ? e : absEps));
+}
+
 // DVec3 stores Real and does Real arithmetic (the hot path), but its 3-arg
 // constructor keeps DOUBLE parameters so the host baking code's brace-init from
 // double Scene coordinates ({v.x, v.y, v.z}) is a widening conversion (legal),
@@ -2454,13 +2488,28 @@ __device__ static inline bool intersectTri(const DVec3& ro, const DVec3& rd, con
 }
 __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const DSphere& s,
                                         Real tmin, DHit& hit) {
+    // NUMERICALLY STABLE ray/sphere (Ray Tracing Gems ch. 7). The textbook
+    // disc = b^2 - 4ac catastrophically cancels once the sphere is far away relative to its
+    // radius: both terms are O(dist^2) and the difference is O(radius^2), so in fp32 the
+    // hit distance of a sphere `k` radii away carries ~k^2 ulp of error. A 1.85 m sphere at
+    // 400 m (a scene modelling the sun that way) landed +-1 cm off, which is enough for a
+    // BDPT/VCM connection ray aimed AT that sphere to re-hit it inside its own endpoint
+    // epsilon and be thrown away as occluded — the light then rendered ~2.7x too dim.
+    // Forming the discriminant from the ray's PERPENDICULAR offset instead keeps every
+    // term O(radius^2), and computing the near root by Vieta (c/q) keeps it stable too.
     DVec3 oc = ro - s.c;
-    Real a = dot(rd, rd), b = (Real)2 * dot(oc, rd), c = dot(oc, oc) - (Real)(s.r * s.r);
-    Real disc = b * b - (Real)4 * a * c;
+    Real a = dot(rd, rd);
+    Real bP = -dot(oc, rd);                       // = -b/2
+    DVec3 fd = oc + rd * (bP / a);                // ray's closest approach, relative to c
+    Real disc = a * ((Real)(s.r * s.r) - dot(fd, fd));   // == bP*bP - a*c, without the cancellation
     if (disc < 0) return false;
+    Real c = dot(oc, oc) - (Real)(s.r * s.r);
     Real sq = sqrt(disc);
-    Real t = (-b - sq) / ((Real)2 * a);
-    if (t < tmin) t = (-b + sq) / ((Real)2 * a);
+    Real q = bP + (bP >= (Real)0 ? sq : -sq);
+    if (q == (Real)0) return false;               // exactly tangential; no usable root
+    Real t = c / q, tFar = q / a;                 // near, far (Vieta) — order by value below
+    if (t > tFar) { Real tmp = t; t = tFar; tFar = tmp; }
+    if (t < tmin) t = tFar;
     if (t < tmin || t >= hit.t) return false;
     hit.t = t; hit.p = ro + rd * t; hit.valid = true;
     DVec3 ng = normalize(hit.p - s.c);
@@ -3640,7 +3689,7 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
         if (aGlass > 0.0) contrib *= exp(-aGlass * ch.innerLen);
 
         DVec3 wPR = wP.toR();
-        if (occluded(sc, (p + wP * 1e-6).toR(), wPR, (Real)(dP - 2e-6))) continue;
+        if (occluded(sc, (p + wP * 1e-6).toR(), wPR, connMaxT(dP))) continue;
         if (sc.mediaN > 0)
             contrib *= (double)dMediaTransmittance(sc, p.toR(), wPR, (Real)dP, lambda, rng);
 
@@ -3780,10 +3829,10 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         if (aGlass > 0.0) contrib *= exp(-aGlass * ch.innerLen);
 
         DVec3 wPR = wP.toR();
-        if (occluded(sc, (p + wP * 1e-6).toR(), wPR, (Real)(dP2 - 2e-6))) continue;
+        if (occluded(sc, (p + wP * 1e-6).toR(), wPR, connMaxT(dP2))) continue;
         D3 wE = eye - ch.P1; double dE = d3len(wE); wE = wE * (1.0 / dE);
         DVec3 wER = wE.toR();
-        if (occluded(sc, (ch.P1 + wE * 1e-6).toR(), wER, (Real)(dE - 2e-6))) continue;
+        if (occluded(sc, (ch.P1 + wE * 1e-6).toR(), wER, connMaxT(dE))) continue;
 
         if (sc.mediaN > 0) {
             contrib *= (double)dMediaTransmittance(sc, p.toR(),   wPR, (Real)dP2, lambda, rng);
@@ -8604,7 +8653,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
             if (mxF <= 0.0) return 0.0;
         }
-        if (occluded(sc, o, wcam, (Real)(dist - 2e-6))) return 0.0;
+        if (occluded(sc, o, wcam, connMaxT(dist))) return 0.0;
         double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
         // Hero-only transmittance: the hero gate excludes any medium, so Tr is exactly 1
         // whenever nUp > 1.
@@ -8710,7 +8759,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             double sgn = ddot(pt.ng, wi) >= 0.0 ? 1.0 : -1.0;
             o = pt.p + pt.ng * (Real)(sgn * 1e-6);
         }
-        if (occluded(sc, o, wi, (Real)(dist - occlEps))) return 0.0;
+        if (occluded(sc, o, wi, connMaxT(dist, occlEps))) return 0.0;
         double f = (pt.type == BV_MEDIUM) ? dMediumScatterF(sc, pt, wo, wi, lambda)
                                           : dBsdfF(sc, pt, wo, wi, lambda) * stG;
         double fSec[BDPT_NSEC];
@@ -8793,7 +8842,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosL = 1.0;
         }
-        if (occluded(sc, o, w, (Real)(dist - 2e-6))) return 0.0;
+        if (occluded(sc, o, w, connMaxT(dist))) return 0.0;
         double fE, fL;
         double fESec[BDPT_NSEC], fLSec[BDPT_NSEC];
         if (pt.type == BV_MEDIUM) {
@@ -10011,7 +10060,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                 // in either; skips the eval for occluded splats).
                                 double sgn = ddot(h.ng, wcam) >= 0.0 ? 1.0 : -1.0;
                                 DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
-                                if (!occluded(sc, oo, wcam, (Real)(distc - 2e-6))) {
+                                if (!occluded(sc, oo, wcam, connMaxT(distc))) {
                                     DVertex vt = dVertFromHit(h, matId);
                                     // The adjoint correction and shadow-terminator G are purely
                                     // geometric, so they scale every λ the same way.
@@ -10352,7 +10401,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                 double f = 0.0, fSec[SECN];
                                 for (int k = 0; k + 1 < nUp; ++k) fSec[k] = 0.0;
                                 if (mxLe > 0.0 &&
-                                    !occluded(sc, oo, wiL, (Real)(distL - occlEps))) {
+                                    !occluded(sc, oo, wiL, connMaxT(distL, occlEps))) {
                                     f = dBsdfF(sc, vt, wo, wiL, lambda) * stG;
                                     for (int k = 0; k + 1 < nUp; ++k)
                                         fSec[k] = dBsdfF(sc, vt, wo, wiL, lamAll[k + 1]) * stG;
@@ -10428,7 +10477,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     // that contributed nothing anyway.
                     double sgn = ddot(h.ng, w) >= 0.0 ? 1.0 : -1.0;
                     DVec3 oo = h.p + h.ng * (Real)(sgn * 1e-6);
-                    if (occluded(sc, oo, w, (Real)(distc - 2e-6))) continue;
+                    if (occluded(sc, oo, w, connMaxT(distc))) continue;
                     DVertex lvt = dVertFromLV(lv);
                     double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
                     double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;

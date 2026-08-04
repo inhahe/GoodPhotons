@@ -5,33 +5,75 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### STALE DOC / OPEN DECISION (2026-08-04, v0.126.0): `scenes/gallery_rain.ftsl` works around a GPU limitation that no longer exists
+### BUG — DONE (2026-08-04, v0.128.0): the fp32 GPU build lost most of a DISTANT light's energy (a sun modelled as a far-away sphere rendered 2.7x too dim)
 
-The scene models the sun as a **distant sphere** (400 m away, `radius 1.85` = the sun's own
-0.53°, `power 2.011e9` = one solar constant) rather than a `light sun`, and says so twice:
+**Symptom.** `scenes/gallery_rain.ftsl` modelled the sun as a Lambertian sphere `radius 1.85`
+at 400 m (subtending the sun's own 0.53°) carrying `power 2.011e9` = one solar constant. Mode D
+on the **GPU** rendered it **2.7x darker than the CPU reference**; the same sphere moved to
+40 m was 1.5x too dark, and by ~4 m the error vanished. `light sun` in the identical scene
+matched the CPU to 0.15%, which is what made the loss look like a delta-light problem when it
+was nothing of the sort — it was a plain float32 precision bug hitting *any* distant emitter.
 
-- header, "Why the sun is a distant SPHERE and not `light sun`": *"v0.124.0 lifted that: mode D
-  now renders `spot` and `sun` on the CPU — **but only on the CPU, since the GPU BDPT kernels
-  still reject delta lights, and this scene very much wants the GPU.** A distant sphere is no
-  less physical, so it stays."*
-- the `prefer{}/else{}` block (~line 552): *"…`light sun`, which used to knock this scene
-  straight into that branch and today would merely **force it off the GPU**."*
+**Reproduce** (`scraps/_sunmatch_{sun,sphere,sphere40}.ftsl`, a grey floor + one light, plus
+`scraps/lumdiff.py`, which undoes the sRGB curve so the printed ratio is a real energy ratio):
 
-**Both claims are false as of 0.126.0** — `cudaBdptSupported()` rejects only `Env`/collimated,
-so a `light sun` stays on the device. The blocker that motivated the workaround is gone.
+```
+ftrace -in scraps/_sunmatch_sphere.ftsl -camera cam -r 200 200 -time 10 -ev 0.02 -o png/a.png
+ftrace -in scraps/_sunmatch_sphere.ftsl -camera cam -r 200 200 -time 25 -ev 0.02 -device cpu -o png/b.png
+python scraps/lumdiff.py png/a.png png/b.png      # was 0.377, now 1.023
+```
 
-Checked, so it isn't a hidden obstacle: `dConnectBDPT`'s `s == 1` branch resolves
-`pt.type == BV_MEDIUM` (cos = 1, `dMediumScatterF`) **independently of** the per-shape `Wgeom`
-block, so a *volume* vertex connects to a delta light on the GPU exactly as a surface one does.
-The volumetric shaft and the rainbow would survive the switch — this scene is media-heavy, so
-that was the one thing that could have killed it.
+**Two independent root causes, both fixed in `src/render_cuda.cu`:**
 
-**Open decision (needs the user):** convert to a real `light sun` (re-deriving the irradiance,
-since `light sun` takes `intensity`, not `power`), or keep the sphere as physically honest and
-just correct the two comments. A real sun would also dissolve a second workaround: the global
-haze is bounded to the room *specifically* because an unbounded haze sits between the 400 m
-sphere and the roof slot and extinguishes it by `e^-(0.012·400)` ≈ 1/120 — a delta sun has no
-400 m of travel. Not edited yet because the right comment text depends on which way this goes.
+1. **`intersectSphere` used the textbook `disc = b² − 4ac`.** Both terms are `O(dist²)` while
+   their difference is `O(radius²)`, so the subtraction catastrophically cancels: a sphere `k`
+   radii away carries roughly `k²` ulp of error in its hit distance. At 400 m with `r = 1.85`
+   that is **±1 cm**. Replaced with the stable Ray-Tracing-Gems form — build the discriminant
+   from the ray's *perpendicular* offset (`disc = a·(r² − |f⊥|²)`, every term `O(r²)`) and take
+   the near root by Vieta (`c/q`). This also helps any camera ray hitting a distant sphere.
+2. **Connection rays were shortened by a fixed absolute epsilon** (`dist - 2e-6`, inherited
+   verbatim from the all-double CPU reference in `bdpt.h`). One ulp of a float is `dist·2⁻²³`,
+   so past **~17 m** the `2e-6` rounds straight back to `dist` and the shortening vanishes —
+   the shadow ray then ends exactly *on* the sampled light point and re-hits the emitter's own
+   geometry, so the sample is discarded as occluded. Replaced by `connMaxT(dist, absEps)`,
+   which shortens by `max(absEps, dist·CONN_REL_EPS)` with `CONN_REL_EPS = 1e-5` (fp32) / `0`
+   (the fp64 build, which therefore stays bit-identical to the CPU). `absEps == 0` still means
+   "don't shorten at all", which is what the distant-sun connection needs — its far end is the
+   scene exit, not a sampled surface point. Applied at all nine connection sites (BDPT `s=1`
+   / `t=1` / `s,t≥2`, the VCM equivalents, and the caustic chains' connections to the eye).
+
+Either fix alone is insufficient: with only (2) the sphere was still 30% dark at 400 m.
+
+**Validation.** `scraps/_sunmatch_*` GPU-vs-CPU energy ratio, was → now: sphere @400 m
+**0.377 → 1.023**, sphere @40 m **0.662 → 1.023**, `light sun` **0.998 → 0.999** (unchanged, as
+expected — a delta sun never shadow-rays *to* a surface point). `scenes/cornell.ftsl` mode D at
+a matched 400 spp, GPU vs CPU: mean ratio **0.9978**, mean |diff| 0.0060, auto-exposure anchor
+1.16e-13 vs 1.17e-13 — no regression at ordinary scene scale. All 16 `-check*` self-tests PASS.
+
+**Note for anyone reading old output:** every GPU mode-D/U render of a scene with a light more
+than ~20 m from the shading points was too dark before 0.128.0, the more so the further away
+the light. Re-render rather than trusting the exposure of an archived frame.
+
+### DONE (2026-08-04, v0.128.0): `scenes/gallery_rain.ftsl` now uses a real `light sun`
+
+The scene used to model the sun as the distant sphere above, with two comments justifying it on
+the grounds that GPU BDPT rejected delta lights. That stopped being true at 0.126.0/0.127.0
+(the GPU BDPT and VCM kernels now do `spot`/`sun`), so the workaround and both comments were
+stale. It is now `light sun { dir -0.1470 0.7071 0.6916  angle 0.53  spd blackbody 5800
+intensity 9.2649e-14 }` — same direction, same 0.53° disc, same one solar constant, with
+`intensity = 1000 / Σ₃₆₀^830 planck(5800 K, λ) dλ` because `light sun` takes an irradiance and
+rejects absolute `power`. `dir` is spelled out because ftsl measures azimuth from **+x** while
+`scraps/bowmap.py` measures it from **+z**.
+
+The switch was not cosmetic. Independently of the fp32 bug above, the sphere needs **2.011e9 W**
+to deliver 1000 W/m² across 400 m, which crushes the emitter power CDF: against the xenon lamp's
+15 kW and the sky panel's 8 kW, `p(lamp) = 7.5e-6`, so the lamp — the light that keeps five
+exhibits and the whole cloud off black — was sampled once in ~134,000 draws and arrived as rare
+clipping fireflies rather than as illumination. Measured at 640×360 / 150 s / mode D, both
+absolute-exposed: the frame is **2.1x darker** with the sphere, and the gap collapses to **1.10x**
+once the lamp is deleted from both variants — i.e. the missing factor of two *is* the starved
+lamp. `light sun`'s power is `irradiance·π·R_scene²` ≈ 4.8e5 W, putting the three lights at
+~95/3/2 %. Dropping the sphere also shrinks the scene bounding radius from ~400 m to ~12 m.
 
 ### BUG — DONE (2026-08-04, v0.124.0): mode D could not render `spot` / `sun` lights at all — now it can (and the entry that claimed it did so *silently* was WRONG)
 

@@ -33,20 +33,47 @@
 # -d onto the room's faces, and 100% of it exits through the ceiling over x[6.20,9.57]
 # z[1.81,6.46]. x[4.5,10] z[3.4,7] is that footprint, squared off to the room's edge.
 #
-# --- Why the sun is a distant SPHERE and not `light sun` -----------------------------
-# When this scene was written, `light sun` was not connectible in BDPT and mode D refused a
-# scene containing one. (v0.124.0 lifted that: mode D now renders `spot` and `sun` on the CPU
-# — but only on the CPU, since the GPU BDPT kernels still reject delta lights, and this scene
-# very much wants the GPU. A distant sphere is no less physical, so it stays.) And
-# mode D is the only mode that renders BOTH this scene's bounded heterogeneous media and
+# --- Why the sun is a real `light sun` (it used to be a distant sphere) ---------------
+# Mode D is the only mode that renders BOTH this scene's bounded heterogeneous media and
 # its directly-seen glass and chrome. (Forward A/B/C do the media but leave a directly-seen
 # dielectric black, which is most of this room; R and the P composite shade the glass but
-# flatten every bounded medium into one global homogeneous haze; see README "Modes".)
-# So the sun here is what the real sun is: a sphere of finite angular diameter a long way
-# off. At 400 m a radius of 1.85 m subtends the sun's own 0.53 deg, the direction varies by
-# only 0.4 deg across the rain volume (well under the bow's ~2 deg width), and the light is
-# connectible, so mode D renders it. The global haze is bounded to the room for this to
-# work at all — an unbounded haze would extinguish a 400 m light by e^-4.8.
+# flatten every bounded medium into one global homogeneous haze; see README "Modes".) So
+# whatever the sun is, mode D has to accept it — and when this scene was written it did not
+# accept `light sun`: a delta light was not connectible in BDPT at all, and after v0.124.0
+# made it connectible on the CPU the GPU BDPT kernels still rejected it, which would have
+# knocked this (very GPU-hungry) scene onto the CPU. So the sun was written as what the real
+# sun also is: a Lambertian sphere of radius 1.85 m at 400 m, subtending the sun's own
+# 0.53 deg, with power 1000 W/m2 * 4*pi*400^2 = 2.011e9 W.
+#
+# v0.126.0/v0.127.0 ported the delta-light path to the GPU BDPT and VCM kernels, so that
+# constraint is gone, and the sphere turned out to be costing real image quality:
+#
+#   * LIGHT SELECTION — the big one. NEE and light-subpath starts both draw from a power
+#     CDF, and a sphere that has to push 1000 W/m2 across 400 m needs 2.011e9 W of it.
+#     Against the xenon lamp's 15 kW and the sky panel's 8 kW that is p(lamp) = 7.5e-6: the
+#     lamp was sampled once in ~134,000 draws, each carrying 134,000x weight. Unbiased and
+#     unusable — the lamp's light arrives as rare fireflies that clip instead of as an image.
+#     MEASURED (640x360, 150 s, mode D, both absolute-exposed): the whole frame renders
+#     2.1x DARKER with the sphere, and that gap collapses to 1.10x the moment the lamp is
+#     deleted from both variants, i.e. the missing factor of two IS the starved lamp.
+#     `light sun`'s power is irradiance * pi * R_scene^2 (~4.8e5 W here), which puts the
+#     three lights at roughly 95 / 3 / 2 percent — the balance the lamp's 300-vs-1000 W/m2
+#     sizing always intended.
+#   * SCENE RADIUS. A sphere 400 m out is geometry, so it dragged the scene bounding sphere
+#     from ~12 m to ~400 m, and every sceneRadius-scaled quantity (env/sun phase-space
+#     weights, forward-mode emission discs, BVH extent) with it.
+#   * PARALLAX. 400 m is far, not infinite: the sun direction swung 0.4 deg across the rain
+#     volume. That is inside the bow's ~2 deg width so it never showed, but a real `light
+#     sun` is exactly parallel, which is what the 42 deg construction actually assumes.
+#   * (And, until v0.128.0, a plain ENGINE BUG on top: the fp32 device build's ray/sphere
+#     discriminant cancelled catastrophically at 400 m and its connection rays were
+#     shortened by an absolute epsilon smaller than one float ulp of that distance, so mode
+#     D self-occluded most of this sphere's shadow rays and rendered it 2.7x too dim. That
+#     is fixed and is no longer an argument either way — but it is why this scene's older
+#     renders are darker than the numbers here predict.)
+#
+# Nothing about the geometry solve changed — same direction, same 0.53 deg disc, same one
+# solar constant. See "(2) the SUN" below for the irradiance arithmetic.
 #
 # --- Why the xenon lamp STAYS ---------------------------------------------------------
 # It looks redundant next to a sun and it is not. Back-projecting each hero piece along the
@@ -428,17 +455,21 @@ mesh "lamp_cord" { file "assets/lamp/cord.obj"  translate 5.0 3.10 3.0  scale 0.
 # instead of going to black, while the sun still owns the image.
 light sphere { center 5.0 3.10 3.0   radius 0.008   spd blackbody 6000   power 15000 }
 
-# --- (2) the SUN, as a sphere 400 m away -----------------------------------------
+# --- (2) the SUN -------------------------------------------------------------------
 # Elevation 45, azimuth -12 (solved for in the header): direction TOWARD the sun is
 # (-0.1470, 0.7071, 0.6916), so it sits behind, above and slightly left of the camera and
 # the light travels down the hall roughly along the view axis — which is what puts the
 # antisolar point, and therefore the 42 deg bow centred on it, in frame at all.
-#   position = rain centre (8, 1.2, 2) + 400 m along that direction
-#   radius   = 400*tan(0.53/2 deg) = 1.85 m, i.e. the sun's own angular diameter
-#   power    = 1000 W/m2 * 4*pi*400^2, i.e. one solar constant of perpendicular irradiance
-# Written as a sphere rather than `light sun` so the scene stays connectible and mode D can
-# render it; see the header. Nothing is faked by this — the real sun is also a sphere.
-light sphere { center -50.80 284.04 278.64   radius 1.85   spd blackbody 5800   power 2.011e9 }
+#
+# `dir` is spelled out rather than `elevation 45 azimuth -12` ON PURPOSE: ftsl's azimuth is
+# measured from +x (z = cos(el)*sin(az)) while scraps/bowmap.py measures it from +z, so the
+# two conventions disagree by 90 deg and the literal vector is the only unambiguous form.
+# `angle 0.53` is the sun's true angular diameter, and `intensity` is set so the in-band
+# (360-830 nm) perpendicular irradiance is one solar constant, 1000 W/m2:
+#   intensity = 1000 / sum_360^830 planck(5800 K, lambda) dlambda = 9.2649e-14
+# (`light sun` takes an IRRADIANCE, not a `power` — a distant light's flux depends on the
+# scene's cross-section, so absolute `power` is rejected by the parser.)
+light sun { dir -0.1470 0.7071 0.6916   angle 0.53   spd blackbody 5800   intensity 9.2649e-14 }
 
 # --- (3) SKY seen through the roof slot -------------------------------------------
 # An open roof looks at the sky, and the sky is a light: without it the slot would be a hole
@@ -465,10 +496,13 @@ light area {
 
 # ==============================  ATMOSPHERE  ==================================
 # (1) A very faint haze so the lights cast soft volumetric shafts + aerial depth. BOUNDED to
-# the room, where in the base scene it was global. That is load-bearing now, not tidiness:
-# an unbounded haze fills all space, so it would sit between the 400 m sun and the roof slot
-# and extinguish it by e^-(0.012*400) ~ 1/120. Bounding it to the hall is also just more
-# correct — the haze is this room's dusty air, not the sky's.
+# the room, where in the base scene it was global. Back when the sun was a sphere 400 m away
+# this was load-bearing rather than tidiness — an unbounded haze fills all space, so it sat
+# between the sun and the roof slot and extinguished it by e^-(0.012*400) ~ 1/120. A `light
+# sun` is infinitely distant and its shadow ray only crosses the scene, so that trap is gone;
+# the bound stays because it is simply more correct — the haze is this room's dusty air, not
+# the sky's — and because an unbounded haze would still veil the dark +z sky the bow needs
+# as a backdrop.
 medium {
     sigma_t 0.012   albedo 0.85   g 0.6
     bounds { min 0 0 0   max 10 3.4 7 }
@@ -548,9 +582,10 @@ medium {
 # D is the only mode that renders bounded heterogeneous media (the two clouds and the rain)
 # AND shades a directly-seen dielectric (most of this room), so the else-branch is a real
 # downgrade rather than a slower equivalent — in mode B every piece of glass and the chrome
-# ring go black. That is the whole reason the sun here is a distant sphere and not
-# `light sun`, which used to knock this scene straight into that branch and today would
-# merely force it off the GPU (see the header).
+# ring go black. That is why the sun spent this scene's first few versions as a distant
+# sphere: `light sun` used to knock the scene straight into that branch, and later merely off
+# the GPU. Since v0.126.0/v0.127.0 the GPU BDPT and VCM kernels do delta lights, so the sun
+# is a real `light sun` and mode D still wins the prefer{} (see the header).
 # The else-branch still exists for the day the scene gains a genuinely D-hostile feature
 # (a GRIN xenon lamp-gas field; see known-issues.md "GRIN in BDPT"); both branches are
 # identical apart from `mode`.

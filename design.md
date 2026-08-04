@@ -677,6 +677,24 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   threads) → 0.3 s (4090). Cross-checks that the shared stochastic path is intact: mode `R`
   CPU↔GPU means agree to 0.04 %, modes `B`/`D` to ~0.1 %.
 
+  **An fp32 device cannot simply inherit the CPU reference's absolute epsilons or its
+  algebra** — 0.128.0 fixed two places where it had, and both showed up as the *same*
+  symptom: a **distant** light losing most of its energy in mode `D`/`U` (a 1.85 m sphere
+  400 m away — a scene modelling the sun that way — rendered 2.7× too dim; 1.5× at 40 m;
+  clean by ~4 m). (a) `intersectSphere` used the textbook `disc = b² − 4ac`, whose terms are
+  `O(dist²)` while their difference is `O(radius²)`, so a sphere `k` radii away carries ~`k²`
+  ulp of error in its hit distance (±1 cm at 400 m). It now uses the stable Ray-Tracing-Gems
+  form: discriminant from the ray's *perpendicular* offset, near root by Vieta. (b) Every
+  connection ray was shortened by an absolute `dist - 2e-6` copied from the all-double
+  `bdpt.h`; one float ulp is `dist·2⁻²³`, so past ~17 m that rounds back to `dist`, the ray
+  ends exactly *on* the sampled light point, re-hits the emitter and is thrown away as
+  occluded. `connMaxT(dist, absEps)` now shortens by `max(absEps, dist·CONN_REL_EPS)`, with
+  `CONN_REL_EPS = 1e-5` in fp32 and `0` in the fp64 build so the latter stays bit-identical
+  to the CPU; `absEps == 0` still means "don't shorten", which is what the distant-sun
+  connection (far end = the scene exit, not a surface point) requires. **The general rule:
+  any epsilon compared against a distance must be relative on the device, and any quadratic
+  solved there must be written in a cancellation-free form.**
+
   `-rgb` is refused in mode `W` (`main.cpp`, with a message): the fast RGB backward is a
   separate reduced tracer with no deterministic estimator, so it would return precisely the
   noise the mode exists to remove.
