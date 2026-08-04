@@ -684,7 +684,8 @@ isosurface "stand_gem_mount" {
 }
 
 # --- GLASS SPHERE (fly-through orb; NOT settled — analytic placement) ------------------
-# A plain BK7 orb, now LEVITATED 0.45 m above its cap on three thin pins. The flyby dives
+# A plain crystal orb, now LEVITATED 0.30 m above its cap on three thin pins (centre y=1.70,
+# radius 0.50, cap top y=0.90 -- so 0.80 m of DROP, which is the number that matters). The flyby dives
 # straight THROUGH it. Native sphere for exact analytic refraction.
 #
 # The height is not a styling choice, it is the caustic, and it was MEASURED rather than

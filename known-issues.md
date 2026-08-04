@@ -7453,7 +7453,7 @@ Still open as a possible extension: mode `R`/`P` hit the same condition, where i
 as pathological convergence rather than a black frame, and would benefit from the same
 warning. The probe is mode-agnostic; only the call site is gated.
 
-## OPEN (minor, 2026-08-03): rendering `gallery_settled` without `-camera` also renders the 600-frame flyby
+## OPEN (minor, 2026-08-03): rendering a scene without `-camera` also renders its 600-frame flyby
 
 `ftrace -in scenes/gallery_settled.ftsl -mode W -o png/gal_w.png` renders the still camera
 *and* then all 600 frames of the scene's `camera_curve "fly"`, writing `png/gal_w_fly000
@@ -7461,6 +7461,13 @@ warning. The probe is mode-agnostic; only the call site is gated.
 designed — "render every camera in the scene" — but it is a surprising default for a scene
 that carries a long flypath, and it silently spams the output directory next to the `-o`
 path. Worth at least a printed warning naming how many frames are about to be written.
+
+**Now affects `gallery_rain` too** (2026-08-04): it gained its own `camera_curve "fly"`, so
+`-parseonly` on it reports **601 cameras** and a bare render of the scene writes 600 frames
+into whatever directory `-o` points at. Use `-camera cam` for the still; `-camera near=X,Y,Z`
+is the convenient way to pull the single flyby frame closest to a point (it prints which
+`flyNNN` it picked and how far off it was), which is how the four fly-through passes were
+each validated without rendering the loop.
 
 ## OPEN (2026-08-04): a quad's emission is invisible from the side its winding faces away from
 
@@ -7734,6 +7741,46 @@ size:
 Result at 1400 spp, mode D, profiled along the sun azimuth on the glass cap (sRGB): shadow
 floor 84-100, sunlit cap 145-151, **caustic peak 176.3** — i.e. in linear light the caustic
 adds ~1.6x the direct sun's own contribution. It is a real caustic, not a bright patch.
+
+**The GYROID half of this entry stayed broken for a further revision, for a different reason,
+and the fix is a topology change (2026-08-04).** The orb above is now a solved problem; the
+"diamond gyroid" named in the title was not, and widening its cap again would not have helped
+either. It was a gyroid **shell**, `|G| < 0.55` — which is not a pack of prisms (the theory the
+scene asserted) but a labyrinth of thin *curved sheets*. A ray crosses a dozen of them and is
+deviated a dozen small random ways, so the piece is a **diffuser**: what lands on the cap is a
+shadow with a filigree of sub-centimetre threads, too thin to survive even a 4x box downsample.
+`scraps/_gemsweep.py` floats one piece at a time over a bare cap in the scene's own sun, box-
+averages 4x in linear light (mode D is one hero wavelength per sample, so raw per-pixel colour
+is speckle — see the entry below), and scores coverage above 1.2x the bare level, excess-
+weighted saturation, and peak:
+
+| piece | coverage | sat | peak |
+|---|---|---|---|
+| crystal **orb**, drop 0.80 | **0.72%** | **0.246** | 5.99x |
+| **solid** gyroid k=6, drop 0.90 | 0.39% | 0.214 | 6.12x |
+| **solid** gyroid k=10, drop 0.90 | 0.37% | 0.208 | 5.64x |
+| **solid** gyroid k=8, drop 0.90 | 0.31% | 0.188 | 5.60x |
+| shell gyroid k=6, drop 0.90 | 0.56% | 0.172 | 5.74x |
+| shell gyroid k=13, drop 0.90 | 0.24% | 0.173 | 5.76x (what was in the scene) |
+| **Klein bottle**, standing | 0.12% | 0.173 | 2.01x |
+
+Above 1.5x the bare cap, everything except the orb and the solid gyroids goes to **zero**.
+Three conclusions, two of which reverse what the scene used to claim:
+
+1. **The fix is topology, not frequency.** Dropping the `abs` takes the field to `G < 0`, one of
+   the two interpenetrating **solid networks** — chunky glass with one entry and one exit, i.e.
+   an actual optical body. Worth 1.5x the area and 1.2x the saturation at the same pitch. The
+   scene now uses solid k=10 at 0.90 m of drop (metered: 0.50 -> 0.26%, 0.70 -> 0.28%,
+   **0.90 -> 0.37%**, 1.40 -> 0.11%), on the orb's three pins, over a cap widened to 1.7 x 1.8
+   and cantilevered to (3.687, 2.719) where the core lands.
+2. **The plain sphere still wins, by 2x** — the exact opposite of the "the gyroid is where the
+   colour is" claim the scene carried. A ball lens has one refracting surface pair and all its
+   flux lands in one place.
+3. **The Klein bottle cannot be fixed at all.** A 2.4 mm wall is optically a *window*, not a
+   lens. Making it solid glass would give it a caustic and destroy the internal descending tube
+   that is the entire point of the piece. Its cap is therefore only widened (1.2 x 1.30, still
+   centred on its column) so the soft 2x patch and the piece's own glints land on white — there
+   is no focus to chase and the scene now says so.
 
 **RETRACTION: "render mode M" was bad advice — mode M silently drops participating media.**
 `src/photonmap_render.h` contains no `scene.media` handling at all; its only `Medium` symbols

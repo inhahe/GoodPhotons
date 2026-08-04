@@ -1341,7 +1341,7 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     refused on an emissive material anyway.
   - **`scenes/gallery_rain.ftsl`** is the shipped worked example, and it exercises the whole
     path in anger: `cloud1.glb` (1.85 M tris, two disjoint lobes — the case parity fill gets
-    wrong) bakes to a 195×76×187 lattice at 29.3 % solid, uploads as 2406/6000 sparse bricks
+    wrong) bakes to a 195×122×191 lattice at 30.1 % solid, uploads as 2406/6000 sparse bricks
     (5.3 MB → 2.4 MB VRAM), and all 1.85 M triangles are then stripped by `shape_only`. It is
     also the shipped example of `feather` (0.13 m ≈ 9 voxels), without which the cloud reads
     as a sticker. Under it hangs a rain curtain using the `rainbow` phase function. Several
@@ -1396,11 +1396,73 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       this frame at 120 spp it cuts chroma RMSE against an 8000 spp reference to 58 % and
       gains 1.8 dB PSNR, for ~1 % of render time and zero loss of luma detail. Render this
       scene with it on.
+    - **A gyroid SHELL is a diffuser, not a bank of prisms — and the plain sphere beats it.**
+      The scene long asserted the opposite: its crystal gyroid was a shell (`|G| < 0.55`) on
+      the theory that a gyroid is a pack of small prisms and prisms split light.
+      `scraps/_gemsweep.py` disproves it. A shell is a labyrinth of thin *curved sheets*, so a
+      ray crosses a dozen of them and is deviated a dozen small random ways; what reaches the
+      cap is a shadow with a filigree of sub-centimetre threads. The fix is not the lattice
+      frequency but the *topology*: dropping the `abs` takes the field to `G < 0`, one of the
+      two interpenetrating **solid networks** (50 % by volume), chunky glass with one entry
+      and one exit — an actual optical body. That is worth 1.5× the caustic area and 1.2× the
+      saturation at the same pitch. Measured over a bare cap in the scene's own sun, as
+      coverage above 1.2× the bare level / excess-weighted saturation / peak:
+
+      | piece | coverage | sat | peak |
+      |---|---|---|---|
+      | crystal **orb**, drop 0.80 | **0.72 %** | **0.246** | 5.99× |
+      | **solid** gyroid k=6, drop 0.90 | 0.39 % | 0.214 | 6.12× |
+      | **solid** gyroid k=10, drop 0.90 | 0.37 % | 0.208 | 5.64× |
+      | shell gyroid k=6, drop 0.90 | 0.56 % | 0.172 | 5.74× |
+      | shell gyroid k=13, drop 0.90 | 0.24 % | 0.173 | 5.76× |
+      | **Klein bottle**, standing | 0.12 % | 0.173 | 2.01× |
+
+      Above 1.5× everything except the orb and the solid gyroids goes to *zero*. The Klein
+      bottle cannot be rescued at all: a 2.4 mm wall is optically a window, and making it
+      solid would destroy the internal tube that is the piece's whole point.
+    - **Per-pixel chroma is unmeasurable in mode `D`, so the metric has to downsample first.**
+      Mode `D` renders one hero wavelength per sample, so a dispersive caustic arrives as
+      chromatic *speckle* and per-pixel saturation measures the sampler, not the optics. The
+      speckle is zero-mean in chroma over a neighbourhood — the same fact `-denoise` is built
+      on — so `_gemsweep.py` box-averages 4× in **linear** light before asking how saturated
+      the result is. A centroid-split metric (‖centroid_R − centroid_B‖) was tried first and
+      is hopelessly noise-dominated. **Coverage, not peak, is the number that separates a
+      filigree from a pool:** a thin web of threads and a broad disc can have identical peak
+      brightness and read nothing alike.
+    - **The 1.6× spread is authored as `group { translate }` wrappers, not as rewritten
+      coordinates.** Nine exhibits displaced radially about (5.00, 2.72) is ~90 numbers if
+      done by hand, and every comment quoting one of them would go stale. A `group` composes
+      onto `isosurface` children including all 8 `contained_by` corners, and a pure
+      translation is a positive-diagonal map so `im.boxOriented` stays false and no
+      oriented-box clipping penalty is paid. Each exhibit therefore gets *two* wrappers — one
+      round its stand, one round its piece — carrying the same offset, and every relationship
+      *within* an exhibit (cap over column, pin against sphere, settled rest pose) stays
+      literally true as authored. Only clearances quoted *between* exhibits go stale, and
+      every one of those gaps grew, so they read conservative rather than wrong.
     - **Cap-vs-cap clearance is not enough; caps must be checked against neighbouring
       COLUMNS.** Two caps each occupy one thin y slab, so they may overlap in plan freely. A
       column spans a whole y range, so plan overlap *is* intersection. `scraps/_standaudit.py`
-      brace-parses every cage's outer box and every cap box and checks all 30 colliders across
-      the 9 stands in 3-D; run it after any stand edit.
+      brace-parses every cage's outer box and every cap box and checks all 33 colliders across
+      the 10 stands in 3-D; run it after any stand edit. It is **spread-aware** — it
+      accumulates every enclosing `group`'s translate onto each collider, because the boxes
+      are authored in the pre-spread frame and reading them off the page would audit a layout
+      the scene no longer has.
+    - **The flyby threads four pieces, and the ring is threaded *toward* the hall.**
+      `camera_curve "fly"` is a closed 44-point loop through the gold gyroid's empty-air
+      channel (gallery_settled's validated points shifted the same +1.25 z the ball was), the
+      glass orb, the Klein bottle's bulb, and the chrome ring's bore. Three things are
+      non-obvious. (a) The Klein pass height is **measured**, not guessed: the quoted bounding
+      box includes the handle and the *foot ring*, not the body, sits on the mesh origin, so
+      `scraps/_kleinslice.py` walks the real vertices through the mesh/settle/spread chain and
+      finds the body is a clean circle of radius 0.151 at y=1.12 — the widest chord, and the
+      height at which a horizontal cut shows four loops. (b) The ring's `rotate 90 0 0` puts
+      its axis along z, so the pass must be nearly parallel to z, and it runs **+z** because
+      rendering it −z showed the camera emerging at the back-left corner into an empty frame;
+      reversed, the bore is a reveal onto the whole hall. (c) `density_at` stops are
+      arc-length fractions, and this loop is wildly unevenly spaced (0.27 m between channel
+      points, 1.3 m across the cruise), so naming the dwells by point index would put every
+      one of them in the wrong place — `scraps/_flyplan.py` converts the beats and also tests
+      the polyline at 2 cm against every cage, cap and hero piece.
     - **Mode `M` is not an option for this scene** even though it is the caustic-friendly mode
       on paper: `photonmap_render.h` has no participating-media code, so M renders the cloud,
       the rain and the bow away entirely — and, unlike mode `U`, does not refuse the scene or
