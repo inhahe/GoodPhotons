@@ -400,7 +400,8 @@ isosurface "stand_glass" {   # right-front pedestal, cap top y=0.90
     }
 }
 isosurface "stand_glass_cap" { material capwhite
-    # The one CANTILEVERED cap in the scene: 1.7 deep and centred at z=3.05, i.e. 0.45 m
+    # One of the two CANTILEVERED caps (the crystal gyroid's is the other, and for exactly
+    # the same reason). 1.7 deep and centred at z=3.05, i.e. 0.45 m
     # toward the camera-far side of its column at z=3.5. That is not decoration — it is
     # where the orb's caustic actually lands. Sunlight travels (0.147, -0.707, -0.692), i.e.
     # +0.2079 x and -0.9781 z per metre of drop, so over the 0.80 m from the orb's centre
@@ -428,7 +429,15 @@ isosurface "stand_diamond" {   # tall thin jewel-column, cap top y=0.85
     }
 }
 isosurface "stand_diamond_cap" { material capwhite
-    box { center 3.5 0.825 3.6  size 1.0 0.05 1.0  round 0.02 } }
+    # The second CANTILEVERED cap, and the bigger one. Raising the gyroid to y=1.75 (see the
+    # piece below) puts 0.90 m of drop between it and this cap top at y=0.85, and the sun
+    # walks the focal axis +0.2079 x / -0.9788 z per metre of that drop -- so the caustic
+    # core lands at (3.5+0.187, 3.6-0.881) = (3.687, 2.719), most of a metre off the column.
+    # 1.7 x 1.8 centred at (3.65, 2.95) spans x 2.80..4.50, z 2.05..3.85: the core sits well
+    # inside, and the outer filigree the solid network throws has room to fall on white
+    # rather than off the edge into the floor cage. In world coordinates (this exhibit is
+    # displaced -0.90, +0.55 by the spread) that is x 1.90..3.60, z 2.60..4.40.
+    box { center 3.65 0.825 2.95  size 1.7 0.05 1.8  round 0.02 } }
 }
 
 group { translate 0.55 0 -0.05         # --- exhibit: KLEIN BOTTLE ---
@@ -449,7 +458,17 @@ isosurface "stand_klein" {   # cap top y=1.00; the Klein bottle stands on it
     }
 }
 isosurface "stand_klein_cap" { material capwhite
-    box { center 5.9 0.985 2.6  size 0.96 0.03 0.96  round 0.02 } }
+    # Widened, but NOT cantilevered, and deliberately so. The bottle is a 2.4 mm-walled
+    # shell -- optically a window, not a lens -- and measured over a bare cap it peaks at
+    # only 2.0x the surrounding white with nothing at all above 1.5x (scraps/_gemsweep.py,
+    # `piece klein`). There is no focus to chase, just a soft brightening, and with barely
+    # 0.30 m from the body down to the cap the sun walks it only +0.06 x / -0.29 z, landing
+    # at (5.96, 2.31). So this stays centred on its column and simply gets bigger, so that
+    # patch and the bottle's own shadow-and-glint both fall on white instead of running off
+    # the near edge. 1.2 x 1.30 at (5.95, 2.50) = x 5.35..6.55, z 1.85..3.15; in world terms
+    # (spread +0.55, -0.05) x 5.90..7.10, z 1.80..3.10 -- which is why it stops there: the
+    # brass cap ends at z=1.73 and the orb's cantilever starts at x=7.15.
+    box { center 5.95 0.985 2.50  size 1.2 0.03 1.30  round 0.02 } }
 }
 
 group { translate -0.30 0 0.00         # --- exhibit: BRASS DUMBBELL ---
@@ -585,34 +604,82 @@ isosurface "gyroid" {
 }
 }
 
-# --- CRYSTAL GYROID (the coloured-caustic piece) ----------------------------------------
-# A finer k=13 lattice clipped to a small sphere. This is the piece that throws COLOUR, and
-# it does so for a reason a sphere cannot: a ball lens only shifts its focus LONGITUDINALLY
-# with wavelength, so red and blue focus at slightly different depths but on the same axis,
-# and at any one screen distance all of them overlap into a single white-ish disc with a
-# faint coloured rim. Colour needs large, DIFFERING DEVIATION ANGLES — a prism, not a lens.
-# A gyroid is a dense pack of small, strongly and variously curved lobes, so each lobe
-# deviates its bundle by a different large angle and the spectra are thrown APART on the
-# cap instead of stacked on top of each other. That is why this, not the orb, is where the
-# colour is.
+# --- CRYSTAL GYROID (the second caustic piece) ------------------------------------------
+# This block used to claim it was "the piece that throws COLOUR", on the theory that a
+# gyroid is a pack of small prisms and prisms are what split light. That theory is WRONG and
+# scraps/_gemsweep.py is what disproved it: a stripped top-down rig, one piece at a time
+# floated over a bare cap in this scene's sun, box-averaged 4x in linear light (mode D
+# renders one hero wavelength per sample, so raw per-pixel colour is speckle, not optics),
+# scoring the fraction of the cap lit above 1.2x the bare level and the excess-weighted
+# saturation of that light:
 #
-# It was `diamond` (n~2.42). Changed to crystal: at that index a lobe's focus falls inside
-# the material and the piece total-internally-reflects — it sparkles beautifully and throws
-# almost nothing. Crystal has 2.1x BK7's dispersion AND a workable external focus, which is
-# the combination this piece needs. See the material block for the numbers.
-# Clip bottom y=0.85 = stand_diamond top.
+#     piece                          coverage   sat     peak
+#     ORB (crystal, drop 0.80)         0.72%   0.246   5.99x    <- best, by 2x
+#     SOLID gyroid k=6,  drop 0.90     0.39%   0.214   6.12x
+#     SOLID gyroid k=10, drop 0.90     0.37%   0.208   5.64x    <- this piece
+#     shell gyroid k=6,  drop 0.90     0.56%   0.172   5.74x
+#     shell gyroid k=13, drop 0.90     0.24%   0.173   5.76x    <- what was here
+#     KLEIN BOTTLE, standing           0.12%   0.173   2.01x
+#
+# Raise the bar to 1.5x the cap and every row except the orb and the solid gyroids goes to
+# ZERO. The plain sphere beats the gyroid at throwing colour, which is the opposite of what
+# this comment used to assert, and the reason is optical depth: a gyroid SHELL (|G| < T) is
+# a labyrinth of thin curved glass sheets, and a ray crossing a dozen of them is deviated a
+# dozen small random ways. The result is not a dozen prisms, it is a diffuser — the light
+# comes out spread over most of a hemisphere, so what lands is a SHADOW with a filigree of
+# sub-centimetre threads round it, too thin to survive a 4x box (hence 0.24% and 0.00%).
+#
+# THE FIX IS THE SOLID NETWORK, NOT THE FREQUENCY. Dropping `abs` takes the field from
+# |G| < 0.55 (a sheet either side of G=0) to G < 0 (one of the two interpenetrating solid
+# networks, 50% by volume). That is chunky glass with ONE entry and ONE exit for most rays,
+# i.e. an actual optical body rather than a stack of windows, and it is worth 1.5x the
+# caustic area and 1.2x the saturation over the shell at the same pitch — and unlike either
+# shell it still has something left at 1.5x and 2.0x the cap level (0.04% at sat 0.295 and
+# 0.01% at sat 0.446, the most saturated light measured anywhere in the scene).
+#
+# k GOES 13 -> 10 to match the gold gyroid exactly, which makes the pair a statement rather
+# than two similar objects: the SAME lattice at the SAME pitch, taken the two complementary
+# ways — gold takes the sheet, crystal takes the solid. k=6 measured a hair better still
+# (0.39% / 0.214) but at 2*pi/6 = 1.05 m the cell is bigger than the 1 m ball and the piece
+# stops reading as a lattice at all; the gap to k=10 is inside this rig's noise.
+#
+# DROP 0.90 IS MEASURED, not chosen. Sweeping the height at k=10 (coverage above 1.2x cap):
+#     drop 0.50   0.26%      <- resting on the cap, where it used to be
+#     drop 0.70   0.28%
+#     drop 0.90   0.37%      <- best, 1.4x the seated value
+#     drop 1.40   0.11%
+# Past ~1 m the patch dilutes faster than the spectra separate. So this piece is levitated
+# too, on the same three pins as the orb, and for the same reason.
+#
+# The MATERIAL was `diamond` (n~2.42) before crystal. At that index a lobe's focus falls
+# inside the material and the piece total-internally-reflects: it sparkles beautifully and
+# throws almost nothing. Crystal has 2.1x BK7's dispersion AND a workable external focus.
 group { translate -0.90 0 0.55         # --- exhibit: CRYSTAL GYROID ---
 isosurface "gyroid_gem" {
     material glass
     intersect {
         function {
-            translate 3.5 1.35 3.6
-            expr "abs(sin(13*x)*cos(13*y) + sin(13*y)*cos(13*z) + sin(13*z)*cos(13*x)) - 0.55"
+            translate 3.5 1.75 3.6
+            expr "sin(10*x)*cos(10*y) + sin(10*y)*cos(10*z) + sin(10*z)*cos(10*x)"
         }
-        sphere { center 3.5 1.35 3.6   radius 0.50 }
+        sphere { center 3.5 1.75 3.6   radius 0.50 }
     }
-    contained_by { min 3.00 0.85 3.10   max 4.00 1.85 4.10 }
-    max_gradient 52
+    contained_by { min 3.00 1.25 3.10   max 4.00 2.25 4.10 }
+    max_gradient 40
+}
+# The three pins, exactly the orb's mount at a shorter reach: 12 mm `wirecage` bars at
+# horizontal radius 0.30, so they meet the clip sphere at y = 1.75 - sqrt(0.25-0.09) = 1.35
+# and stand 0.50 m off the cap. `contained_by` seals the clipped solid with a face of its
+# own material, so the ball has a closed spherical underside for them to touch even where
+# the network itself is empty there. Azimuths 0/120/240 from +z: the caustic walks toward
+# -z, and the two rear pins throw 12 mm shadows that cross the cap 0.3 m to either side of
+# the patch's core, so unlike the orb's this triad needed no rotating.
+isosurface "stand_gem_mount" {
+    material wirecage  union {
+        box { center 3.5000 1.10 3.9000  size 0.012 0.50 0.012 }
+        box { center 3.7598 1.10 3.4500  size 0.012 0.50 0.012 }
+        box { center 3.2402 1.10 3.4500  size 0.012 0.50 0.012 }
+    }
 }
 }
 
@@ -1153,4 +1220,136 @@ prefer {
         mode B
         film { res 1280 720   exposure 0.25 }
     }
+}
+
+# ==============================  FLYBY  =======================================
+# A SEAMLESS closed loop that goes THROUGH four pieces: the gold gyroid's empty-air
+# channel, the glass orb, the Klein bottle's bulb, and the chrome ring's bore. The hall has
+# no walls any more and the exhibits sit 1.6x further apart than they used to (see THE
+# SPREAD), so the loop is both wider and lower than the one gallery_settled flies -- there
+# is nothing left to clip a wing on, and the pieces are far enough apart that the camera
+# has to actually travel between them instead of pivoting.
+#
+# THE FOUR PASSES, and why each waypoint is the number it is:
+#
+# 1. GOLD GYROID (t 0.04..0.10). Points 4..10 are gallery_settled's OWN validated threaded
+#    channel points, shifted +1.25 in z and nothing else -- which is exactly the rigid
+#    translation this scene's gold gyroid got, so the empty-air tunnel through the
+#    k=10 / T=0.45 lattice still lines up to the millimetre. Do not "tidy" them: they were
+#    solved against the lattice, and 2 cm of drift puts the lens inside a strut.
+#
+# 2. GLASS ORB (t 0.245). World centre (7.70, 1.70, 3.95), r 0.50 -- the orb is levitated
+#    0.45 m off its cap now, so the old curve's z=3.50 / y=1.40 pass would miss it by more
+#    than a radius in both axes. That is the reason this curve had to be rewritten at all.
+#    Approach swings in from +z at a shallow angle so the camera crosses the sunlit upper
+#    hemisphere on the way in and comes out looking down its own caustic.
+#
+# 3. KLEIN BOTTLE (t 0.325). The tightest and best beat. scraps/_kleinslice.py walks the
+#    real mesh vertices through the mesh/settle/spread transform chain and reports the body
+#    in horizontal slabs: it is a circle of radius 0.151 about (6.4584, 2.5311) at y=1.12,
+#    and only above y~1.22 does the handle break out toward +x. So y=1.12 is the widest
+#    clean chord, and it is also the height at which a horizontal cut shows FOUR loops --
+#    the outer wall's two surfaces plus the descending inner tube. The pass runs along the
+#    piece's own long axis, world direction (+0.9775, 0, +0.2110) (i.e. its authored yaw of
+#    -12 deg plus the settle's -0.18), entering at +0.30 and leaving at -0.30 along it. The
+#    three pass points are held dead LEVEL so the centripetal spline can't bow the chord
+#    down into the cap: there is only 0.120 m between this line and the cap top at y=1.00,
+#    and that is the tightest clearance anywhere on the loop (scraps/_flyplan.py).
+#
+# 4. CHROME RING. World centre (2.60, 1.30, 1.55), major 0.34 / minor 0.10, and
+#    `rotate 90 0 0` puts its axis along z -- so the bore is a 0.24 m-radius hole facing
+#    +-z and the pass MUST be nearly parallel to z. The approach points are on the axis
+#    within 0.032 m and travelling within 4 deg of it, so across the tube's 0.20 m of
+#    thickness the path wanders under 12 mm.
+#
+#    It is threaded +z, i.e. from BEHIND the ring toward the hall, and that direction was
+#    chosen by rendering it the other way first. The ring stands at the back-left corner of
+#    the layout, so a -z pass has the camera emerge looking at bare floor and black sky --
+#    `ftrace -camera near=2.60,1.30,1.55` on that version is 90% empty frame. Reversed, the
+#    bore becomes a reveal: the whole hall is dead ahead as the camera comes through, with
+#    the crystal gyroid 2.6 m away on the axis and the gold one beyond it. That costs the
+#    loop a detour -- it now runs left and BACK from the Klein bottle, rounds behind the
+#    ring, and turns in -- which is why the leg climbs to y=1.95 over the morpho heart
+#    instead of staying low.
+#
+# CLEARANCE. scraps/_flyplan.py samples the polyline at 2 cm and tests it against every
+# stand cage and cap AABB in the file (spread offsets included): no penetrations, and the
+# margins over the caps it flies above are klein +0.120, chrome +0.400, glass +0.431,
+# gyroid +0.705, dumbbell +0.721, oil +1.535. It also reports the arc-length fraction of
+# each beat, which is where the `density_at` stops below come from -- the loop is 26.35 m
+# of very unevenly spaced chord (0.27 m between channel points, 1.3 m across the back
+# cruise), so naming the dwells by point index would have put every one of them in the
+# wrong place.
+#
+# The RAIN CLOUD is a bounded medium spanning x 6.64..9.36, y 1.97..3.67, z 0.67..3.33
+# (195 x 122 x 191 voxels of 13.98 mm at translate 8.0 2.82 2.0, scale 1.42). The orb leg is
+# the only part of the loop that goes anywhere near it and it passes UNDERNEATH, y <= 1.98
+# against the cloud's floor at 1.97 -- close enough to fly through the rain, not the cloud.
+#
+# CLOSURE. gallery_settled's loop closes on a fold -- it runs forward past the start and
+# doubles back, which `look tangent` renders as a 180 deg swing at the front of the hall.
+# This one closes on an ARC instead: the return leg comes forward to z=8.15, swings across
+# the front and turns back in on the centre line already heading -z, so frame 600 hands off
+# to frame 0 with the HEADING continuous as well as the position. The whole loop is a lazy
+# figure eight -- down the centre, right to the orb and the bottle, left and back behind the
+# ring, then forward again up the left-centre -- so it never retraces its own path either.
+camera_curve "fly" {
+    point 5.00   2.10  7.35     # START (front-high, centre line) — closure arc, LEVEL
+    point 4.98   1.85  7.10     # descend the centre line
+    point 4.95   1.60  6.87     # approach the gold gyroid's +z face (clip sphere ends 6.83)
+    point 4.882  1.437 6.855    # final approach — held just OUTSIDE the clip sphere
+    point 4.850  1.255 6.6649   # channel entry (+z face) — settled's threaded points, +1.25 z
+    point 4.866  1.451 6.3949
+    point 4.760  1.316 6.1499
+    point 4.911  1.384 5.8849
+    point 4.761  1.432 5.6259
+    point 4.835  1.255 5.4349   # channel exit (-z face)
+    point 4.78   1.35  5.20     # emerge behind the ball
+    point 5.10   1.55  4.95     # bank RIGHT and climb, away from the centre line
+    point 5.70   1.80  4.80
+    point 6.45   1.98  4.75     # sweep right toward the orb, under the cloud's floor
+    point 7.20   1.95  4.55
+    point 7.62   1.82  4.28     # final approach, dropping onto the orb's centre
+    point 7.70   1.70  3.95     # THROUGH THE GLASS ORB
+    point 7.62   1.58  3.58     # out the far side, looking down its own caustic
+    point 7.38   1.44  3.18
+    point 7.05   1.28  2.82     # descend-left toward the bottle
+    point 6.751  1.12  2.594    # klein entry (+0.30 along the body's long axis) — LEVEL
+    point 6.4584 1.12  2.5311   # THROUGH THE KLEIN BOTTLE's bulb, where the cut shows 4 loops
+    point 6.165  1.12  2.468    # klein exit (-0.30 along the axis) — LEVEL
+    point 5.88   1.25  2.42     # climb clear of the cap (top y=1.00, ends x=5.90)
+    point 5.40   1.55  2.28
+    point 4.85   1.80  2.00     # run left and BACK, climbing over the low pieces
+    point 4.30   1.95  1.55     # over the morpho heart
+    point 3.70   1.95  1.05
+    point 3.10   1.80  0.60     # round BEHIND the chrome ring
+    point 2.65   1.58  0.32
+    point 2.53   1.38  0.62     # turn onto the ring's z axis — now heading +z, INTO the hall
+    point 2.57   1.31  1.02     # final approach — on axis to 0.032 m
+    point 2.60   1.30  1.55     # THROUGH THE CHROME RING's bore
+    point 2.62   1.31  2.08     # out the front of the ring, whole hall opening up ahead
+    point 2.70   1.45  2.62
+    point 2.90   1.75  3.25     # climb toward the crystal gyroid
+    point 3.35   2.10  3.98     # swing right past it (0.345 m outside its 0.50 clip sphere)
+    point 3.85   2.35  4.85
+    point 4.35   2.52  5.70     # rise onto the cruise
+    point 4.95   2.62  6.55     # over the gold gyroid (its clip tops out at y=2.11)
+    point 5.35   2.55  7.45
+    point 5.55   2.42  8.15     # out past the front of the hall
+    point 5.32   2.28  8.55     # swing across the front — the closure ARC, not a fold
+    point 5.05   2.16  8.15     # turn back onto the centre line, already heading -z
+    up 0 1 0   fov_y 70   mode D   frames 600
+    fps 30                         # 600 frames -> 20 s
+    look tangent
+    spline centripetal
+    # Stops are ARC-LENGTH fractions from scraps/_flyplan.py, not point indices. The beats
+    # it reports for these 44 points / 23.93 m are: channel 0.048..0.111, orb 0.270,
+    # klein 0.358, ring 0.610, crystal gyroid 0.725, gold gyroid overflight 0.853.
+    density_at 0.00  8   density_at 0.055 20  density_at 0.105 20  density_at 0.16 8
+    density_at 0.270 22  density_at 0.31 14   density_at 0.358 24  density_at 0.40 10
+    density_at 0.50  6   density_at 0.610 20  density_at 0.68 10   density_at 0.725 14
+    density_at 0.80  8   density_at 0.90 6    density_at 1.00 8
+    closed
+    exposure_lock
+    film { res 960 540   exposure 0.25 }
 }
