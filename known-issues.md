@@ -214,6 +214,14 @@ bookkeeping (not PBRT's explicit pdf arrays), the three rules from `src/vcm.h` t
 The escaped-ray solar disc is present and singly counted on the GPU: the 4×4 window at (25,50)
 on the mix scene reads `0.06250 = 1/16` on **both** backends (one saturated pixel each).
 
+**Cross-check of the two ports against each other** (the strongest single result, because it
+compares two *independently* transliterated device estimators rather than a port against its
+own source): `_deltalight_mix.ftsl` at 400×300 in **absolute units / fixed gain**, GPU mode `D`
+at 3000 spp (16.7 s) vs GPU mode `U` at 2000 passes (14.3 s) — mean ratio **0.9974**, mean
+|diff| 0.0037, and the 7×7 solar-disc window at (50,101) reads `0.02041 = 1/49` in **both**.
+The worst pixels cluster on the spot's caustic under the mirror sphere, i.e. VCM merge-radius
+bias plus MC noise, exactly where the two estimators are expected to differ.
+
 Area-light scenes are **byte-identical**: `cornell.ftsl` mode U on GPU at 150 passes hashes to
 the same SHA-256 before and after the port (`015acdee6e10d5ce…`). The non-delta branch keeps
 the original RNG draw order and the original expressions verbatim; every new density is behind
