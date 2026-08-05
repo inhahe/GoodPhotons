@@ -135,6 +135,7 @@
 #include <atomic>              // -stop: cross-thread flags for the external stop channel
 #include <filesystem>          // -review: scan a directory of rendered frames
 #include "scene.h"
+#include "parallel.h"           // ft::setStopProbe — lets load-time loops see the stop flag
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
 #include "watertight.h"         // -check-watertight: report non-airtight meshes/isosurfaces
 #include "airtight.h"           // -check-airtight: ray-parity audit of the marched isosurface field
@@ -1499,15 +1500,15 @@ static int checkUpsample() {
             img.push_back(Vec3{i / 7999.0, (i * 3 % 7999) / 7999.0, (i * 11 % 7999) / 7999.0});
 
         std::vector<std::array<double, 3>> bulk(img.size());
-        upsample::fitMany(img.data(), img.size(), bulk.data());
+        bool done = upsample::fitMany(img.data(), img.size(), bulk.data());
         size_t bad = 0;
         for (size_t i = 0; i < img.size(); ++i) {
             std::array<double, 3> ref = upsample::fit(img[i].x, img[i].y, img[i].z);
             if (bulk[i][0] != ref[0] || bulk[i][1] != ref[1] || bulk[i][2] != ref[2]) ++bad;
         }
-        passI = (bad == 0);
-        std::printf("[checkupsample] bulk fitMany vs per-texel fit: %zu texels, %zu differing\n",
-                    img.size(), bad);
+        passI = (bad == 0) && done;
+        std::printf("[checkupsample] bulk fitMany vs per-texel fit: %zu texels, %zu differing%s\n",
+                    img.size(), bad, done ? "" : " (STOPPED early)");
     }
 
     bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH && passI;
@@ -6719,7 +6720,14 @@ static int run(int argc, char** argv) {
     } else if (inFile) {
         std::string ferr;
         if (!ftsl::load(inFile, ftslScene, ferr, supportFn)) {
-            std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
+            // A clean stop that landed mid-load is not a scene error. Say so plainly
+            // rather than printing a diagnostic that points the finger at the .ftsl —
+            // but still exit non-zero: no scene was built, so nothing can be rendered.
+            if (g_stopRequested)
+                std::fprintf(stderr, "[stop] scene load stopped before rendering — "
+                                     "nothing was rendered or written.\n");
+            else
+                std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
             return 1;
         }
         fromFtsl = true;
@@ -10762,6 +10770,12 @@ int main(int argc, char** argv) {
         const char* who = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : nullptr;
         return runStopCommand(who);
     }
+    // Let the LOAD-TIME parallel-for (src/parallel.h) see the same stop flag the render
+    // loops poll. g_stopRequested is a file-static volatile sig_atomic_t -- a signal
+    // handler writes it, and parallel.h can't name it -- so it is handed over as a probe
+    // instead. Installed here, before any scene work, because the whole point is that a
+    // `-stop` arriving during a long scene load takes effect during that load.
+    ft::setStopProbe([] { return g_stopRequested != 0; });
     // Tear the CUDA context down synchronously, in-process, on EVERY exit path (normal
     // return or exception). Leaving it for the driver to reclaim implicitly after main()
     // returns triggers an asynchronous nvlddmkm DPC teardown that, on buggy driver

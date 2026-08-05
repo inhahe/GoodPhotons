@@ -158,7 +158,11 @@ struct EnvMap {
         // multiply-add per texel, i.e. free) so its summation order — and therefore the
         // mean radiance, the emitter power and the wavelength CDF built from it — stays
         // bit-identical to the single-threaded build regardless of core count.
-        ft::parallelFor(nT, 4096, [&](size_t i) {
+        //
+        // It is also the one place an environment build can be interrupted: a clean stop
+        // abandons the remaining texels and fails the load, rather than leaving a probe
+        // whose coefficients are fitted for the top half of the sky and zero below it.
+        if (!ft::parallelFor(nT, 4096, [&](size_t i) {
             Vec3 c = rgbIn[i] * intensity;
             c.x = std::max(0.0, c.x); c.y = std::max(0.0, c.y); c.z = std::max(0.0, c.z);
             double m = std::max(c.x, std::max(c.y, c.z));
@@ -174,7 +178,11 @@ struct EnvMap {
                 xyz.x += L * g.wx; xyz.y += L * g.wy; xyz.z += L * g.wz;
             }
             xyzT[i] = xyz;
-        });
+        })) {
+            coeff.clear(); scaleT.clear(); xyzT.clear();
+            err = "environment build stopped by request";
+            return false;
+        }
 
         Vec3 avgRgb{0, 0, 0};
         double avgW = 0.0;

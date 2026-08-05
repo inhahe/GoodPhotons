@@ -74,11 +74,19 @@ struct Texture {
     // time during scene load with nothing on screen. fitMany dedups bit-equal texels
     // (an 8-bit image has far fewer distinct colours than texels) and threads what is
     // left; the coefficients it writes are bit-identical to the serial loop's.
-    void buildReflCoeff() {
-        if (hasPalette()) { buildPaletteRgb(); return; }
-        if (!valid() || coeff.size() == (size_t)w * h) return;
+    //
+    // Returns false only if a clean stop was requested mid-fit (`ftrace -stop`, Ctrl-C).
+    // The coefficient table is then partial, so it is cleared and the caller must fail
+    // the scene load — sampling a half-fitted texture would shade garbage.
+    [[nodiscard]] bool buildReflCoeff() {
+        if (hasPalette()) { buildPaletteRgb(); return true; }
+        if (!valid() || coeff.size() == (size_t)w * h) return true;
         coeff.resize((size_t)w * h);
-        upsample::fitMany(rgb.data(), rgb.size(), coeff.data());
+        if (!upsample::fitMany(rgb.data(), rgb.size(), coeff.data())) {
+            coeff.clear(); coeff.shrink_to_fit();
+            return false;
+        }
+        return true;
     }
 
     // Integrate each palette spectrum against the CIE curves under an equal-energy

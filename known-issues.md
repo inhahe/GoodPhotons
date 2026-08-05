@@ -5,28 +5,50 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-08-05, minor): `-stop` is accepted but ignored while a process is still in SCENE LOAD
+### DONE (2026-08-05, v0.138.2): `-stop` was accepted but ignored while a process was still in SCENE LOAD
 
 `stopChannelStart()` publishes the `<pid>.run` entry before `run()` is entered, so a
 process is listed by a bare `ftrace -stop` and can be signalled from the moment it starts.
-But the signal only sets `g_stopRequested`, and that flag is polled at render **chunk /
+But the signal only set `g_stopRequested`, and that flag was polled at render **chunk /
 frame** boundaries — the loader (mesh import, tessellation, solid voxelization, spectral
-upsampling) never polls it. So `ftrace -stop <pid>` against a process that has not reached
-its render loop reports success, then waits out its 120 s timeout while the load runs to
+upsampling) never polled it. So `ftrace -stop <pid>` against a process that had not reached
+its render loop reported success, then waited out its 120 s timeout while the load ran to
 completion.
 
-Mostly latent now that the worst loader stall is gone (the 47 s texture upsample above is
-2.9 s), and the consequence is a wait rather than a wrong result — which is why it is not
-being fixed immediately. **It is not a reason to `taskkill /F`**: force-killing mid-CUDA
-can wedge the display driver, and a process that hasn't started rendering has nothing
-worth interrupting anyway.
+**Fixed** by making the load cooperatively cancellable, at two granularities:
 
-Proper fix if it becomes annoying: poll `g_stopRequested` in the loader's own long loops —
-the natural seam is `ft::parallelFor` (`src/parallel.h`), whose chunk cursor is already the
-one place every load-time pass funnels through, so a cursor check that drains the range on
-stop would cover all of them at once. It would need each caller to tolerate a partially
-filled output, so the exit has to be "abandon the load and return non-zero", not "carry on
-with half a texture".
+* **Inside a long pass** — `ft::parallelFor` (`src/parallel.h`) now polls the stop flag at
+  its chunk cursor, *before* claiming work, so a stop drains the cursor and every worker
+  finishes at most the chunk it already holds. It returns `bool` (and is `[[nodiscard]]`,
+  so no caller can quietly ignore it): `false` means the range was abandoned and the output
+  is **partial**. The serial-cutoff path is chunked too, for the same poll.
+* **Between assets** — the loader's own serial stretches poll `ft::stopRequested()` via
+  `Builder::stopped()`, checked between top-level blocks in the texture, pattern,
+  `mesh_asset`, geometry and deferred-`medium` passes. That covers the loaders that are
+  still single-threaded (glTF/OBJ import, `meshvox::voxelizeSolid`, isomesh tessellation)
+  at asset granularity without having to thread them.
+
+`g_stopRequested` stays where it was — it is a file-static `volatile sig_atomic_t` because
+a signal handler writes it, so `parallel.h` cannot name it. `main()` instead installs it as
+a probe (`ft::setStopProbe`) before any scene work, which is also why the probe is one
+indirect call per *chunk* rather than per item.
+
+Propagation is "abandon the load and return non-zero", never "carry on with half a
+texture": `upsample::fitMany` → `Texture::buildReflCoeff` (which clears the partial
+coefficient table) → `addTexture` → load failure; `EnvMap::buildFromRgb` → its existing
+`err` out-param. `main.cpp` recognises the case and prints
+`[stop] scene load stopped before rendering — nothing was rendered or written.` rather than
+a scene-error diagnostic, exiting 1.
+
+One non-obvious trap found while testing: `prefer { } else { }` resolution treated the
+interrupted branch as *rejected* and went on to build the next branch — so the stop was
+observed, announced, and then ignored for another full scene load. `loadSource` now aborts
+the whole resolution when a stop is seen after a trial build.
+
+Verified: `-stop all` issued ~1 s into a `gallery_rain` load exits in under a second with
+exit code 1 and nothing written; a `-stop` during the render still writes image +
+checkpoint and exits 0; all 21 `-check*` self-tests pass (including the bit-identity check
+on `fitMany`); `prefer` still resolves to branch 1 on an uninterrupted load.
 
 ### PERF — DONE (2026-08-05, v0.138.1): `-explore scenes/gallery_rain.ftsl` sat for ~47 s with NOTHING on screen — per-texel spectral upsampling was serial
 

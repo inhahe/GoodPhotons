@@ -2682,6 +2682,9 @@ inline path below `2*grain` so a small array spawns nothing. It is for **pure,
 independent, one-shot** passes only; anything needing a reduction either keeps that
 reduction serial (envmap's mean radiance) or must justify the changed summation order.
 
+That same cursor is the program's **load-time cancellation seam** (0.138.2) — see
+"Stopping a render" below.
+
 ## Stopping a render (`g_stopRequested`, `-stop`)
 
 One flag drives every clean stop: `g_stopRequested` (`main.cpp`). It is raised by the
@@ -2712,6 +2715,34 @@ invisible under a sandboxed shell) and `Local\` objects are per-session.
 
 `-stop all` targets every live render, a bare `-stop` lists them, and both wait (≤120 s)
 for the targets to actually exit so a rebuild can be scripted immediately after.
+
+### Stopping during SCENE LOAD (0.138.2)
+
+The pid is published *before* `run()`, so a process can be signalled from the moment it
+starts — but until 0.138.2 the loader polled nothing, and a stop aimed at a process that
+hadn't reached its render loop was accepted and then waited out the full load. The load is
+now cooperatively cancellable at two granularities:
+
+- **Inside a long pass:** `ft::parallelFor` polls the flag at its chunk cursor, before
+  claiming work, so a stop drains the cursor and each worker finishes at most one chunk.
+- **Between assets:** `Builder::stopped()` polls it between top-level blocks in the
+  texture / pattern / `mesh_asset` / geometry / deferred-`medium` passes, which covers the
+  still-serial loaders (glTF/OBJ import, `meshvox::voxelizeSolid`, isomesh tessellation)
+  without threading them.
+
+`parallel.h` cannot name `g_stopRequested` — it is a file-static `volatile sig_atomic_t`,
+because a signal handler writes it — so `main()` hands it over as a **probe**
+(`ft::setStopProbe`) before any scene work. Reading it through a function pointer is free
+here precisely because it is read once per *chunk*, never per item.
+
+A cancelled `parallelFor` returns `false` and its output is **partial**, so the return is
+`[[nodiscard]]` and the contract is *abandon the load*, never "carry on with half a
+texture": `upsample::fitMany` → `Texture::buildReflCoeff` (which clears the partial
+coefficient table) → `addTexture` → load failure, and `EnvMap::buildFromRgb` → its `err`
+out-param. `main.cpp` reports it as `[stop] scene load stopped before rendering` and exits
+1 rather than printing a scene-error diagnostic. `prefer { } else { }` resolution aborts
+outright on a stop — treating an interrupted branch as *rejected* would otherwise make it
+build the next branch and ignore the stop for another whole load.
 
 ## GPU support gates fail safe, never coerce
 

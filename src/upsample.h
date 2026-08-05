@@ -158,8 +158,12 @@ inline std::array<double, 3> fit(double r, double g, double b) {
 // `basis()` is touched before any thread starts so its function-local static is already
 // constructed — magic statics are thread-safe, but paying a guarded init on every worker
 // probe is pointless when the caller can do it once.
-inline void fitMany(const Vec3* in, size_t n, std::array<double, 3>* out) {
-    if (!in || !out || n == 0) return;
+//
+// Returns false if a clean stop (`ftrace -stop`, Ctrl-C) was requested while it ran, in
+// which case `out` is only partially written and the caller must abandon the load rather
+// than render with a half-filled coefficient table.
+[[nodiscard]] inline bool fitMany(const Vec3* in, size_t n, std::array<double, 3>* out) {
+    if (!in || !out || n == 0) return true;
     (void)basis();
 
     // Key = the three doubles' raw bits. memcpy (not a reinterpret_cast) so this stays
@@ -183,6 +187,10 @@ inline void fitMany(const Vec3* in, size_t n, std::array<double, 3>* out) {
     std::vector<Vec3> uniq;
     uniq.reserve(std::min<size_t>(n, 1u << 16));
     for (size_t i = 0; i < n; ++i) {
+        // One hash probe per texel is fast, but "fast per texel" is exactly how the
+        // serial fit got here — poll the stop flag once per 64 k so even a huge image
+        // can't sit through the dedup pass ignoring a stop.
+        if ((i & 0xFFFF) == 0 && ft::stopRequested()) return false;
         Key k;
         std::memcpy(&k.a, &in[i].x, sizeof(double));
         std::memcpy(&k.b, &in[i].y, sizeof(double));
@@ -199,10 +207,11 @@ inline void fitMany(const Vec3* in, size_t n, std::array<double, 3>* out) {
     }
 
     std::vector<std::array<double, 3>> uc(uniq.size());
-    ft::parallelFor(uniq.size(), 64, [&](size_t i) {
-        uc[i] = fit(uniq[i].x, uniq[i].y, uniq[i].z);
-    });
-    ft::parallelFor(n, 65536, [&](size_t i) { out[i] = uc[which[i]]; });
+    if (!ft::parallelFor(uniq.size(), 64, [&](size_t i) {
+            uc[i] = fit(uniq[i].x, uniq[i].y, uniq[i].z);
+        }))
+        return false;
+    return ft::parallelFor(n, 65536, [&](size_t i) { out[i] = uc[which[i]]; });
 }
 
 // --- RGB -> illuminant (emission) spectrum upsampling ------------------------

@@ -70,6 +70,7 @@
 #include "meshvoxel.h"   // solid voxelization for `medium { bounds { object "<mesh>" } }`
 #include "fbx.h"
 #include "upsample.h"
+#include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long load
 #include "color.h"
 #include "sky.h"
 #include "record_ladder.h"   // generalized record-stop delimiter ladder (J3b item 2)
@@ -736,12 +737,14 @@ public:
         // Pass 1b: image textures (must exist before materials that bind them).
         for (const auto& b : blocks) {
             if (b.type != "texture") continue;
+            if (stopped()) return false;
             if (!addTexture(b, L)) return false;
         }
 
         // Pass 1c: procedural patterns (must exist before materials that bind them).
         for (const auto& b : blocks) {
             if (b.type != "pattern") continue;
+            if (stopped()) return false;
             if (!addPattern(b, L)) return false;
         }
 
@@ -779,7 +782,9 @@ public:
         // geometry pass so a `mesh_instance { of "name" }` (top-level or inside a
         // group) can reference any asset regardless of authoring order.
         for (const auto& b : blocks) {
-            if (b.type == "mesh_asset") { if (!addMeshAsset(b, L)) return false; }
+            if (b.type != "mesh_asset") continue;
+            if (stopped()) return false;
+            if (!addMeshAsset(b, L)) return false;
         }
 
         // Pass 3: geometry, lights, medium, camera, render.
@@ -789,6 +794,7 @@ public:
         bool haveLight = false;
         std::vector<const Block*> mediaBlocks;
         for (const auto& b : blocks) {
+            if (stopped()) return false;
             if      (b.type == "sphere")   { if (!addSphere(b, L)) return false; }
             else if (b.type == "quad")     { if (!addQuad(b, L)) return false; }
             else if (b.type == "triangle") { if (!addTriangle(b, L)) return false; }
@@ -811,7 +817,10 @@ public:
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
-        for (const Block* mb : mediaBlocks) { if (!addMedium(*mb, L)) return false; }
+        for (const Block* mb : mediaBlocks) {
+            if (stopped()) return false;
+            if (!addMedium(*mb, L)) return false;
+        }
         // Every consumer of a shape-only mesh's triangles has now run, so drop them
         // before the BVH is built (see stripShapeOnlyMeshes).
         stripShapeOnlyMeshes(L);
@@ -1133,6 +1142,18 @@ private:
     double Len(double d) const { return d * L_; }
 
     void fail(const std::string& m) { if (err.empty()) err = m; }
+
+    // Cooperative `ftrace -stop` / Ctrl-C during scene load. The long per-asset passes
+    // (per-texel spectral upsampling, environment integration) abandon at ft::parallelFor's
+    // chunk cursor; this covers the loader's own SERIAL stretches by polling between
+    // top-level blocks, so a stop lands between assets instead of waiting for whichever
+    // mesh/voxelization is in flight to finish the entire scene. Reported as a load
+    // failure, which is what it is: the caller must not render a partly-built scene.
+    bool stopped() {
+        if (!ft::stopRequested()) return false;
+        fail("scene load stopped by request");
+        return true;
+    }
 
     int matId(const std::string& name) {
         auto it = matIndex_.find(name);
@@ -2256,7 +2277,11 @@ private:
                 for (auto& e : entries) tex.palette[(size_t)e.first] = e.second;
             }
         }
-        tex.buildReflCoeff();   // precompute Jakob-Hanika reflectance coefficients (skipped for palette maps)
+        // Precompute Jakob-Hanika reflectance coefficients (skipped for palette maps).
+        // This is the single most expensive step of a texture-heavy load, so it is also
+        // the one most likely to be running when a `-stop` arrives; false means it was
+        // abandoned mid-fit and the half-built texture must not enter the scene.
+        if (!tex.buildReflCoeff()) { fail("scene load stopped by request"); return false; }
         int id = (int)L.scene.textures.size();
         L.scene.textures.push_back(std::move(tex));
         textureIndex_[b.name] = id;
@@ -6853,6 +6878,10 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
             choice[j] = c;
             Loaded trial;
             Trial t = tryBuild(choice, trial);
+            // A clean stop is NOT a branch failure. Without this, an interrupted branch
+            // looks "rejected", `prefer` moves on to the next one, and the stop gets
+            // ignored while the loader builds an entire alternative scene.
+            if (ft::stopRequested()) { err = "scene load stopped by request"; return false; }
             const bool renderable = (t.built && t.reason == nullptr);
             // For a single node, whichever branch we end on (first renderable, or the
             // last as fallback) is `chosen`, and `trial` currently holds its build.
