@@ -5,6 +5,42 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-05): `scraps/_gemsweep.py` — `-fireflies 3` does not hold at the rig's own prescribed finalist setting
+
+`_gemsweep.py` is the caustic-metering rig used to adjudicate the gallery's glass exhibits
+(it renders one piece over a bare white cap in the gallery's sun, meters the float `.pfm`
+4x-downsampled, and reports coverage / sat / peak / spread / noise / fan). Its docstring
+prescribes `GEMRES=960 GEMSPP=1200` for judging finalists — but at exactly that setting the
+firefly rejection stops being sufficient, and the intensity-derived metrics become garbage.
+
+Observed this session, same geometry (`solid10`, drop 0.90), same `GEMCUT=1.2`:
+
+```
+GEMRES=480  GEMSPP=600     peak    3.00x   sat 0.182   spread 0.014   coverage 0.35%
+GEMRES=960  GEMSPP=1200    peak 1179.42x   sat 0.844   spread 0.672   coverage 0.37%
+```
+
+The core snapped to `-0.01 +0.09` — the exact signature the script's own comments already
+document ("peak 1214x / spread 0.594 for the solid gyroid — the gyroid, which throws no
+caustic at all, 'winning' on three firefly cells"). Mode D carries one hero wavelength per
+sample, so a rare specular-caustic path deposits an enormous monochromatic spike; `-fireflies 3`
+clips the common case but not this one, and higher res makes it *worse* (fewer samples per
+cell, so a spike is diluted less by the 4x box).
+
+**Coverage is unaffected and remains trustworthy** (0.35% -> 0.37%, published 0.37%), because
+it is a *count* of cells above a threshold, not a magnitude. So the rig is still usable for
+the comparisons it is actually used for — but `peak`, `sat` and `spread` from a 960/1200 run
+must be discarded, which is precisely backwards from what the docstring says.
+
+**Proper fix:** either (a) meter percentiles instead of extrema — replace `peak` with e.g. the
+99.5th percentile of the cap and derive `sat`/`spread` from excess-weighted statistics with
+the top 0.1% of cells trimmed, so no single cell can move a metric; or (b) tighten rejection
+as resolution rises (scale the `-fireflies` threshold with samples-per-cell rather than
+leaving it at a constant 3). (a) is the better one: it fixes the metric rather than chasing
+the sampler. Until then the docstring should stop prescribing 960/1200 for anything but
+coverage. Note `scraps/` is gitignored, so this rig is not versioned — the fix has to be made
+in place.
+
 ### OPEN (2026-08-05, probably transient — logged only so a recurrence is recognisable): `build.bat` failed once, then succeeded twice unchanged
 
 Building the 0.138.2 changes, the **first** `build.bat` run reported
