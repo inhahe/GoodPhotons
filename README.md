@@ -2604,6 +2604,15 @@ extension), which ffmpeg concatenates into a video. Any flyby block may carry an
 `fps <n>` playback hint (read by the assembly tooling; overrides the scene-level
 `fps` default — see *Scene-header defaults* above).
 
+**Where the frames land.** A path/orbit/curve of more than one frame is written into
+its **own subdirectory**, named from the output stem and the block, rather than loose
+beside `-o`: `-o png/rain.png` with a `camera_path "fly"` writes
+`png/rain_fly/rain_fly000.png`, `…_fly001.png`, and so on (the directory is created if
+needed). Standalone `camera` blocks in the same scene still write beside `-o` as
+`png/rain_<name>.png`. This keeps a 600-frame flyby from burying the stills — and any
+unrelated images — in its output directory. To render just one image from a scene that
+also declares a path, pass `-camera <name>`.
+
 - **`camera_path "name" { … key <t> <ex ey ez> [<lx ly lz>] [<fov>] … frames N }`** —
   keyframed fly-through: the eye (and optionally look_at / fov) is linearly
   interpolated across `key` frames. Optional `dolly_zoom` holds the subject's
@@ -3016,6 +3025,7 @@ alone can't restore, so they are not disk-resumable.
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-stop [<pid>\|all]` | **Stop a running render cleanly, from another shell.** `ftrace -stop <pid>` asks that render to do exactly what Ctrl-C does — finish the current chunk, write the final image **and** `.ftbuf` checkpoint, release the CUDA context through the graceful-shutdown path — then waits (up to 120 s) for it to actually exit, so it's safe to script a rebuild right after. `-stop all` targets every running render; a bare `-stop` just **lists** them (pid + scene → output). This exists because a render launched detached has no console to Ctrl-C into, and **force-killing ftrace mid-CUDA is a known way to wedge the NVIDIA driver into a TDR/bugcheck** — so never `taskkill /F` a render, use this. It also releases a window being held open by `-keepwindow`. Implemented as a sentinel file under `<temp>/ftrace/` (a `<pid>.run` entry per live render, a `<pid>.stop` to signal it), which — unlike a named kernel event — crosses the session / window-station boundary between a detached render and the shell signalling it. |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |
+| `-hdr` | Also write a **32-bit float PFM** beside `-o` (`<out>.pfm`) holding the **scene-linear** image — the exact buffer the tone map consumes, with no exposure, no gamma and **no clamp**. Written on every periodic in-progress write too, so a still-converging render can be metered. Use it whenever you intend to *measure* rather than look: an 8-bit PNG clamps at white, and a caustic is by definition the brightest thing in frame, so its core prints as `#FFFFFF` with all three channels **equal** — the tone map destroys the caustic's colour and its peak-to-screen ratio before any analysis can see them. (Values are radiance in the film's own scale; peak/median ratios and chromaticity are exposure-invariant, so two renders shot at different stops stay comparable.) PFM is a 3-line ASCII header + raw little-endian `float32` RGB triples, raster order left-to-right **bottom-to-top**. |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
 | `-stereo <mode>` | **3-D stereoscopic output** (stills *and* movies). Renders each camera **twice** — a Left/Right eye pair — and composites them into the `-o` image. `mode` picks the fusion: `sbs` (side-by-side **wall-eyed**, L\|R), `cross` (side-by-side **cross-eyed**, R\|L), `anaglyph` (**red-cyan** Dubois glasses, the default kind), or `anaglyph-gm` (**green-magenta** Dubois). Uses the correct **off-axis** rig — two *parallel* cameras offset along the camera right axis with **asymmetric (sheared) frusta** sharing a convergence plane, so there's **no vertical parallax** (toe-in's eye-strain cause). Both eyes share one auto-exposure anchor, so L/R — and every frame of an exposure-locked `camera_path` — tone-map identically. Rectilinear cameras only (a fisheye camera renders mono, with a warning). See **Stereoscopic 3-D** below. |
 | `-eye-sep <m>` | Interocular (eye-to-eye) distance for `-stereo`, in metres. Default `0.063` (63 mm, average human). |
@@ -3068,6 +3078,41 @@ ftrace -topng out.png.ftbuf out_bright.png -ev 3
 `-ev` applies only to a `.ftbuf` (which still holds linear film); on a `.ppm` input it
 warns and is ignored, since that file is already 8-bit sRGB. *(Before 0.102.1 `-ev` was
 silently dropped on this path — `-topng` runs before the main argument loop.)*
+
+### Denoising (`-denoise`)
+
+`-denoise` runs an edge-aware à-trous (SVGF-style) filter on the linear image just before
+tone-mapping. Because it sits in the one function that feeds both the file and the live
+window, the preview shows exactly what you'll get.
+
+**It filters chroma only, and leaves luma bit-identical.** That is the point rather than a
+timid default. A spectral path carries a *single* wavelength, so wherever the
+hero-wavelength bundle can't be used — participating media, or any dispersive refraction —
+every sample deposits a fully saturated colour, and the pixel only turns white once enough
+different wavelengths have averaged in. The variance is therefore concentrated in *chroma*,
+while luma is already converging at the usual 1/spp. Since the eye resolves chroma detail
+at roughly a third the acuity of luma (the reason every video codec subsamples it), chroma
+can be blurred hard at no visible cost. Turning it on cannot lose you an edge, a wire, a
+caustic rim or a speck of geometric detail, so there is no tradeoff to weigh.
+
+Measured on `gallery_rain` at 120 spp against an 8000 spp reference of the same frame:
+
+| | chroma RMSE | PSNR | cost |
+|---|---|---|---|
+| no denoise | 23.8 | 20.4 dB | — |
+| `-denoise` | **13.8** (58 %) | **22.2 dB** (+1.8) | ~1 % of render time |
+
+Use it on anything with dispersive caustics or fog. `ftrace -checkdenoise` runs the
+filter's self-test (exact energy conservation, constant-image fixed point, bit-identical
+luma).
+
+| flag | meaning |
+|---|---|
+| `-denoise [amount]` | enable; `amount` scales the chroma tolerance (default 1) |
+| `-denoise-chroma <x>` | chroma edge-stop tolerance in local sigma (default 2 — a flat knob, barely sensitive across a factor of 8) |
+| `-denoise-levels <n>` | à-trous levels, support 2ⁿ wide (default 3). Swept against the reference, the optimum is a plateau at 2–3, *not* SVGF's 5: with no luma term holding the edges a very wide chroma support bleeds gold into white and caustic into floor, and by 7 levels it is a net loss |
+| `-denoise-luma <x>` | **also** filter luma (default 0 = off). Measured, this makes the image *worse* — −2.4 dB at `0.45`, because the filter cannot tell a wire or a caustic rim from a noise spike. Available for stills you want *smoothed*, not *truer* |
+| `-fireflies <k>` | clamp isolated outliers to `k`× the 2nd-brightest neighbour, hue preserved. Deliberately not energy-preserving. Implies `-denoise`; try 2–4 |
 
 A `.ftsl` is a *scene*, not an image — render it with `-in scene.ftsl -o out.png`.
 Three drag-and-drop Windows helpers in the repo root wrap this: **`ppm_to_png.bat`**,

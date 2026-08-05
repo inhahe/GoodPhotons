@@ -5,6 +5,132 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-04): `textures/marble_dumbbell.png` is derived from a WATERMARKED stock preview — replace before any public release
+
+**What.** `marble texture 3.5.avif`, one of the ten source sheets, is a VectorStock **comp**: a
+black footer bar carrying the agency name and stock id runs across the bottom ~9 %. That bar is
+why this one file measured `p5 = 0.000` while every other sheet floors around 0.45.
+`tools/make_marble_caps.py` crops it off (`crop=(0, 0, 1, 0.905)`), so the shipped texture is
+clean *looking* — but it is still a derivative of an unlicensed preview image, and it is now
+committed as `textures/marble_dumbbell.png` and referenced by `scenes/gallery_rain.ftsl`.
+
+**Why it was not silently shipped.** The repo publishes GitHub releases (`release.bat` →
+`inhahe/goodphotons`), so a stock comp in the asset set is a licensing problem, not a cosmetic
+one. Cropping the watermark out arguably makes it worse rather than better.
+
+**Fix.** Replace that one source with a properly-licensed or public-domain marble photograph and
+re-run `python tools/make_marble_caps.py`; nothing else changes, since the tool renormalises
+whatever it is given to the cap albedo. The other nine sources are of unverified but
+unwatermarked provenance and should be spot-checked at the same time. The raw drops themselves
+are deliberately left untracked (see `.gitignore`); only the prepared PNGs are committed.
+
+### OPEN (2026-08-04): `scraps/_capchroma.py` scores marble VEINS as a caustic — the metric assumes a uniform cap albedo
+
+**Symptom.** With the tabletops textured, the gyroid cap meters **coverage 4.55 %, sat 0.434,
+spread 0.201, fan 0.84** in the converged frame. The untextured control of the same frame meters
+**0.00 %**, and the gold gyroid standing on that cap is *opaque* — there is no caustic there to
+find. The brass cap shows the same thing more mildly.
+
+**Why.** The metric is "excess over 2× the cap's own median", which attributes every bit of
+variation across the cap to *light*. That is only valid when the cap's albedo is constant, which
+it was until v0.134.0. A full-contrast marble slab swings 6.7–8.2× p2→p98, so its own veins clear
+the 2× bar; and because veining varies *smoothly with position*, it also scores high on `fan`,
+the statistic specifically built to separate dispersed colour from position-uncorrelated speckle.
+`fan 0.84` here is being scored on rock. The tell is the `noise` control band, which is computed
+the same way and jumps with it: 0.028 → 0.297 on the gyroid cap, 0.028 → 0.164 on brass.
+
+**Impact today: none, by construction.** The seven caps that got full-contrast stone are exactly
+the ones with no measurable caustic (opaque metal / opaque iridescent / the Klein bottle's
+optical window), and the three caps that *are* metered were deliberately given calm stone
+(swing 1.29–1.37×, `k` 0.45–0.55, `s` 0.30–0.40). Their noise floors are unchanged by the
+texturing — axicon 0.050 → 0.050, diamond 0.060 → 0.062, orb 0.097 → 0.099 — so the caustic
+numbers remain valid. But the trap is now armed for anyone who meters a decorative cap, or who
+later raises `k` on a cap that matters.
+
+**Proper fix.** Divide the texture back out before thresholding: `_capchroma.py` should sample
+the cap's albedo map through the same planar UV projection the renderer uses and meter
+`irradiance = pixel / albedo(x)` rather than `pixel`. Failing that, it should at least *detect*
+a textured cap (the material carries a `texture:` reference) and refuse to report, rather than
+returning a confident wrong number.
+
+### OPEN (2026-08-04): a GPU render can be starved to a standstill by ANOTHER process on the card, and there is no way to make it yield
+
+**Symptom.** With an unrelated CUDA process (a `python` model server, pid 20264) holding ~20 GB
+of a 24 GB RTX 4090 and driving it at 100 %, `ftrace` mode D became unusable: a **160x90, 1-spp**
+chunk — a few milliseconds of work on an idle card — did not return in **11 minutes**. A
+1280x720 render of `gallery_rain` reached 25 spp in 30.8 s and then produced nothing for 17
+minutes. `cdb -p <pid> -c "~0k"` showed the main thread parked in `nvcuda64!cuCtxSynchronize` the
+whole time, and the process could not be stopped with `ftrace -stop` (see why below).
+
+**Diagnosis.** Contention, not an ftrace bug — and *not* a VRAM-capacity bug either: note that
+`cudaMemGetInfo` reported plenty free throughout, because under WDDM the driver overcommits and
+pages rather than failing an allocation, which makes the capacity query worthless as a detector.
+What ftrace *was* guilty of is being completely silent about it: from outside the process this is
+indistinguishable from a deadlock, and `nvidia-smi` reports 100 % busy either way. Confirmed
+environmental by rendering the *untextured* `git show HEAD:scenes/gallery_rain.ftsl` with
+identical settings — it stalled identically, clearing the scene's new marble textures.
+
+**What was done (v0.134.0).** Not a fix — the renderer cannot preempt another process's kernels
+— but the failure is no longer mute:
+
+- `gpuSppChunks` (`render_cuda.cu`) now runs a **stall watchdog** thread. If one chunk stays in
+  flight past 30 s (target: 0.15 s) it prints `[gpu-stall]` with the chunk size and elapsed time,
+  states that the render is not hung but cannot write `-interval`, honour `-time` or answer
+  `-stop` until the chunk returns, and points at `nvidia-smi` / `-device cpu`. Repeats each minute.
+- A `[vram]` line reports free/total device memory and the megakernel's per-thread local
+  reservation (`cudaMegakernelLocalBytes`, via `cudaFuncGetAttributes`) at the device gate, and
+  falls back to the CPU when the card is over budget or >88 % full. **Weak detector** — it did not
+  trip in the measured case, for the WDDM reason above. Kept because a trip is conclusive; a
+  non-trip means nothing.
+- `gpuSppChunks` gained the `FTRACE_CHUNK_SPP` / `FTRACE_CHUNK_DEBUG` levers `cpuSppChunks`
+  already had. Their absence is why this needed a debugger to characterise.
+
+**Still open / proper fix.** `-interval`, `-time` and `-stop` are all polled *between* chunks, so
+one long chunk disables the whole control surface. The robust fix is to stop assuming a chunk is
+short: size the first launch from a **cheap timed probe** (the kernels already take `totalSamples`
+explicitly, so a fraction of one spp is launchable) instead of starting at 1 spp and hoping, and
+consider a CUDA-stream + `cudaEventQuery` poll loop so the host thread stays responsive while a
+chunk is in flight instead of blocking in `cudaDeviceSynchronize`. Until then the workaround is
+`-device cpu` whenever the card is busy.
+
+### FIXED (2026-08-04, v0.133.0): `-stop` cannot stop a MULTI-CAMERA render — it ends the current frame and the batch marches on to the next camera
+
+**Symptom.** `scenes/gallery_rain.ftsl` declares 601 cameras. A render launched without
+`-camera` finishes the still and then walks the whole 600-frame flyby set. Two `ftrace -stop
+<pid>` calls each reported
+
+```
+[stop] asked pid 90024 to finish and exit cleanly.
+[stop] still running after 120s: 90024
+```
+
+and `-stop all` did no better, while the process kept emitting frames at ~2-3/s. It had to be
+killed with `taskkill /F`.
+
+**Diagnosis.** `-stop` is a *finish the current work item and exit* request, and the work item
+is one FRAME, not one invocation. In a multi-camera batch the stop flag is consumed (or
+cleared) at the frame boundary and the loop advances to camera N+1, so the request can never
+retire the run. The 120 s timeout then reports "still running", which reads like a hung process
+and invites a force-kill — exactly the thing `-stop` exists to avoid, and dangerous mid-CUDA.
+
+**Fix (v0.133.0).** The per-camera loop in `main.cpp` (the `restIdx` loop) now polls
+`g_stopRequested` between frames, exactly as the mode-M loop above it already did, and breaks —
+announcing `[stop] stopping the batch: N of M cameras not rendered.` so the truncation is visible
+rather than silent. Root cause was that the flag was only checked *inside* a frame: once set,
+every subsequent `runRender()` returned immediately at ~0 spp, so the batch sprayed near-black
+frames at several per second and `-stop` could never retire it. **Verified:** `-stop` now returns
+`[stop] done — stopped cleanly` in ~1 s (was: 120 s timeout then force-kill), with the log reading
+`[stop] stopping the batch: 596 of 601 cameras not rendered`.
+
+**Second bug, same incident — also FIXED (v0.133.0).** Those flyby frames were written **loose
+next to `-o`** as `png/rain_axicon_fly000.{png,pfm,png.ftbuf}` — 148 of them before the kill —
+violating the project rule that a multi-frame series lives in its own `png/<setname>/`.
+`CamSpec` now carries a `pathBase` (the path's name without the frame number, empty for a
+standalone `camera`), set at all three path-generation sites in `ftsl.h` (`camera_path`, `orbit`,
+`camera_curve`); `outFor` in `main.cpp` uses it to write any series of >1 frame into
+`<stem>_<pathBase>/`. **Verified:** flyby frames land in `png/_stoptest_fly/` while a standalone
+camera's still stays beside `-o`. (The 148 stray frames were deleted.)
+
 ### OPEN (2026-08-04): mode `W` is NOT noise-free at `-spp 1` when the scene has a medium — the fog term is still a Monte-Carlo free flight
 
 **Symptom.** `ftrace scenes/gallery_rain.ftsl -mode W -spp 1 -r 480 270` returns a black frame
@@ -7453,7 +7579,7 @@ Still open as a possible extension: mode `R`/`P` hit the same condition, where i
 as pathological convergence rather than a black frame, and would benefit from the same
 warning. The probe is mode-agnostic; only the call site is gated.
 
-## OPEN (minor, 2026-08-03): rendering `gallery_settled` without `-camera` also renders the 600-frame flyby
+## OPEN (minor, 2026-08-03): rendering a scene without `-camera` also renders its 600-frame flyby
 
 `ftrace -in scenes/gallery_settled.ftsl -mode W -o png/gal_w.png` renders the still camera
 *and* then all 600 frames of the scene's `camera_curve "fly"`, writing `png/gal_w_fly000
@@ -7461,6 +7587,41 @@ warning. The probe is mode-agnostic; only the call site is gated.
 designed — "render every camera in the scene" — but it is a surprising default for a scene
 that carries a long flypath, and it silently spams the output directory next to the `-o`
 path. Worth at least a printed warning naming how many frames are about to be written.
+
+**Now affects `gallery_rain` too** (2026-08-04): it gained its own `camera_curve "fly"`, so
+`-parseonly` on it reports **601 cameras** and a bare render of the scene writes 600 frames
+into whatever directory `-o` points at. Use `-camera cam` for the still; `-camera near=X,Y,Z`
+is the convenient way to pull the single flyby frame closest to a point (it prints which
+`flyNNN` it picked and how far off it was), which is how the four fly-through passes were
+each validated without rendering the loop.
+
+## OPEN (metrology, 2026-08-04): `-fireflies 3` does not always clear the gem rig's peak, so `peak` alone can be nonsense
+
+While sweeping crown angles for the axicon's girdle (`scraps/_gemsweep.py piece gcone0.08/20/0.60
+0.65`, SF10, 480 px / 600 spp, `-hdr -fireflies 3`) the rig printed:
+
+```
+gcone0.08/20/0.60 drop 0.65   peak 19945.07x   coverage  0.02%   sat 0.254   spread 0.041
+```
+
+`peak` is four orders of magnitude above every neighbouring row while `coverage` says there is
+essentially no caustic at all — i.e. a single monochromatic hero-wavelength spike survived the
+firefly filter. That filter clamps an isolated outlier to 3× its second-brightest *neighbour*,
+so it is defeated whenever a spike lands next to another bright pixel (two adjacent caustic-path
+hits, or a spike on the edge of a specular highlight). It is a **rig/metric** problem, not a
+renderer bug — the shipped scene never meters `peak` in isolation.
+
+Impact today: none of the decisions in `design.md` rest on `peak` alone (`coverage`, `sat`,
+`spread` and `fan` all agreed that every crown geometry kills the caustic), and the row above is
+published with its `peak` struck out. But `peak` is reported as a headline number in
+`_gemsweep.measure()` and will mislead the next reader.
+
+Proper fix: report a robust peak instead of the max — e.g. the 99.9th percentile of cell
+luminance, or the brightest *4× box cell* rather than the brightest pixel, both of which are
+immune to a single spike by construction. `measure()` already builds the downsampled cell list,
+so this is a two-line change; the reason it is logged rather than done is that changing the
+statistic silently invalidates every `peak` in `design.md`, so the fix has to re-run the tables
+in the same change.
 
 ## OPEN (2026-08-04): a quad's emission is invisible from the side its winding faces away from
 
@@ -7639,3 +7800,660 @@ occupancy with `smoothstep(distance-to-the-outside / feather)`.
   isosurface bound**, which are carved analytically and have no lattice to soften.
 
 Repro of the old behaviour: drop `feather` from the raincloud in `scenes/gallery_rain.ftsl`.
+
+---
+
+### OPEN: `gallery_rain`'s mode-B fallback branch is a much worse image than its comment admits
+
+`scenes/gallery_rain.ftsl` wraps its still camera in `prefer { mode D } else { mode B }`, so a
+machine without a working CUDA BDPT falls back to the forward pinhole splat. That fallback was
+authored for the ROOFED edition and has not been re-validated since the walls and ceiling came
+off. It should be.
+
+Measured (v0.130.0, `-mode B -time 150` vs the 1180-spp mode-D still): the frame mean drops
+47.3 -> 25.2 and the diamond stand's cap 209 -> 152, with the gold gyroid, the glass sphere and
+the chrome ring rendering solid black and heavy photon noise everywhere else. The scene header
+calls this "a real downgrade... in mode B every piece of glass and the chrome ring go black",
+which is true as far as it goes but understates how far from usable the result now is.
+
+Two compounding causes, both created by removing the room:
+* **57% of every photon escapes to infinity** (`escaped=0.5662`) instead of bouncing off a wall
+  and getting another chance at a camera-visible surface.
+* **The emission disc grew with the scene.** A `light sun` is an infinite directional source, so
+  a forward tracer has to emit it over a disc covering the scene's cross-section. Opening out to
+  a ~33 m ground plane took R_scene from ~12 m to ~33 m, so only ~(5/33)^2 ~ 2% of photons now
+  land anywhere near the exhibits. The scene header already works this out for *light selection*
+  (it is why the xenon lamp was removed) without noticing it applies to the forward modes too.
+
+**NOT evidence, despite looking like it:** the `[energy]` line reports `sensor=0.0000` for this
+scene, but that is normal and says nothing — `scenes/_fog_cornell.ftsl`, a sealed box that mode
+B renders perfectly, reports `sensor=0.0000` too. A pinhole subtends ~zero solid angle, so the
+splat is an importance-weighted estimator and literal sensor energy is always ~0. (This entry
+originally cited that figure as proof the branch was dead; it was not, and the corrected
+measurements above are the frame mean and cap level.)
+
+Options, none yet chosen:
+* point the else-branch at **mode M** (photon-map camera) or CPU mode D instead of B;
+* or drop the `prefer{}/else{}` entirely and let the scene simply require D, since 0.127.0 made
+  the GPU BDPT handle the delta sun and the else-branch's original reason (mode D refusing a
+  `light sun`) no longer exists.
+
+Repro: `ftrace scenes/gallery_rain.ftsl -mode B -time 150 -o png/_b.png`
+
+### DONE: `gallery_rain`'s caustic screens cannot show a caustic — they are metered into the clip
+
+*(Resolved 2026-08-04 over several revisions, each of which retracted part of the one before —
+kept in full because the retractions are the useful part. Short version: the screens were
+metered into the clip AND the measurements were taken through that same clip; the fix is
+`capwhite` 0.15, a tenth exhibit that actually disperses, `-hdr` for the metering and
+`-fireflies 3` to replace the outlier rejection the clamp had been doing by accident.)*
+
+Three revisions of that scene have widened the stand caps specifically so the dispersive
+caustics from the glass sphere and the diamond gyroid have somewhere to land. They still do not
+read, and the cap width was never the binding constraint. Three separate causes, in order of
+size:
+
+1. **The screen is clipped.** `exposure 0.25` was chosen to put a sunlit 0.88-albedo cap just
+   under white — correct metering for the brightest diffuse thing in a sunlit frame, and
+   exactly wrong for a caustic screen, which has to be DARKER than the caustic. Measured on the
+   1180-spp mode-D frame: the diamond's cap averages 209/255 with **24.7% of its pixels at full
+   white**; the glass sphere's cap 189/255 with 10% clipped. A caustic adds light to that and
+   has nowhere to go.
+2. **The sphere is sitting on its own focal length.** The glass sphere is R=0.5 resting directly
+   on the cap. For n~1.5 a sphere focuses at nR/(2(n-1)) = 0.75 m from its centre, i.e. 0.25 m
+   *below* the cap surface, so what reaches the cap is the cone cut short — a defocused disc
+   ~0.34 m across at maybe 5x the direct sun, not a caustic. And with the sun 45 deg off
+   vertical the cone axis walks 0.49 m in -z over the 0.5 m drop, centring the disc at z~3.01
+   against a cap whose front edge is z=2.95, so roughly a third of it falls off the front.
+3. **BDPT is the slow way to get one.** It cannot aim a light subpath; it has to randomly hit
+   the sphere, randomly refract and randomly land usefully. Verified with cap albedo dropped to
+   0.30 (unclipped, 129/255): at 413 spp there is a faintly brighter region in about the right
+   place, buried in chromatic fireflies.
+
+**Addressed (2026-08-04)** in the scene, with one part of the recipe RETRACTED:
+
+- (1) `capwhite` albedo 0.88 -> **0.30**. This is the change that matters; the rest only make
+  the caustic bright once there is headroom for "bright" to mean anything.
+- (2) The orb is **levitated 0.30 m** on three `wirecage` pins (`stand_glass_mount`) to
+  `center 6.7 1.70 3.5`, an 0.80 m drop to the cap. The height was **measured, not computed**:
+  the textbook ball-lens `f = nR/(2(n-1))` = 0.734 m is *paraxial*, and a full-aperture sphere
+  has gross spherical aberration, so the marginal rays (which carry most of the flux, area
+  going as r^2) cross far nearer the glass and the paraxial focus is the wrong target.
+  `scraps/_focalsweep.py` renders the orb at a range of heights and meters peak linear
+  irradiance on the cap:
+
+  | drop | peak (linear) | |
+  |---|---|---|
+  | 0.50 | 0.371 | orb resting tangent on the cap — the original scene |
+  | 0.65 | 0.371 | |
+  | **0.80** | **0.642** | best; 73% brighter than either neighbour 0.15 m away |
+  | 0.95 | 0.424 | |
+  | 1.15 | 0.363 | |
+
+  So the original scene was at 0.58x of the achievable peak — badly metered *and* badly placed.
+  The trade-off at 0.80: the sight line to the disc centre passes 0.514 m from the orb centre,
+  i.e. it clears the 0.5 m limb only barely, so the disc reads as breaking out from behind the
+  glass rather than sitting cleanly beside it. Deliberate, for the 1.5x brightness.
+- (3) The glass cap is 1.7 deep and **cantilevered 0.45 m in -z** off its column, which is
+  where the disc actually lands: (6.87, 2.72), from +0.2079 x / -0.9781 z per metre of drop.
+  Its stand also moved x 6.2 -> 6.7 to make room (and to fix an unrelated intersection, below).
+
+Result at 1400 spp, mode D, profiled along the sun azimuth on the glass cap (sRGB): shadow
+floor 84-100, sunlit cap 145-151, **caustic peak 176.3** — i.e. in linear light the caustic
+adds ~1.6x the direct sun's own contribution. It is a real caustic, not a bright patch.
+
+**The GYROID half of this entry stayed broken for a further revision, for a different reason,
+and the fix is a topology change (2026-08-04).** The orb above is now a solved problem; the
+"diamond gyroid" named in the title was not, and widening its cap again would not have helped
+either. It was a gyroid **shell**, `|G| < 0.55` — which is not a pack of prisms (the theory the
+scene asserted) but a labyrinth of thin *curved sheets*. A ray crosses a dozen of them and is
+deviated a dozen small random ways, so the piece is a **diffuser**: what lands on the cap is a
+shadow with a filigree of sub-centimetre threads, too thin to survive even a 4x box downsample.
+`scraps/_gemsweep.py` floats one piece at a time over a bare cap in the scene's own sun, box-
+averages 4x in linear light (mode D is one hero wavelength per sample, so raw per-pixel colour
+is speckle — see the entry below), and scores coverage above 1.2x the bare level, excess-
+weighted saturation, and peak:
+
+| piece | coverage | sat | peak |
+|---|---|---|---|
+| crystal **orb**, drop 0.80 | **0.72%** | **0.246** | 5.99x |
+| **solid** gyroid k=6, drop 0.90 | 0.39% | 0.214 | 6.12x |
+| **solid** gyroid k=10, drop 0.90 | 0.37% | 0.208 | 5.64x |
+| **solid** gyroid k=8, drop 0.90 | 0.31% | 0.188 | 5.60x |
+| shell gyroid k=6, drop 0.90 | 0.56% | 0.172 | 5.74x |
+| shell gyroid k=13, drop 0.90 | 0.24% | 0.173 | 5.76x (what was in the scene) |
+| **Klein bottle**, standing | 0.12% | 0.173 | 2.01x |
+
+Above 1.5x the bare cap, everything except the orb and the solid gyroids goes to **zero**.
+Three conclusions, two of which reverse what the scene used to claim:
+
+1. **The fix is topology, not frequency.** Dropping the `abs` takes the field to `G < 0`, one of
+   the two interpenetrating **solid networks** — chunky glass with one entry and one exit, i.e.
+   an actual optical body. Worth 1.5x the area and 1.2x the saturation at the same pitch. The
+   scene now uses solid k=10 at 0.90 m of drop (metered: 0.50 -> 0.26%, 0.70 -> 0.28%,
+   **0.90 -> 0.37%**, 1.40 -> 0.11%), on the orb's three pins, over a cap widened to 1.7 x 1.8
+   and cantilevered to (3.687, 2.719) where the core lands.
+2. **The plain sphere still wins, by 2x** — the exact opposite of the "the gyroid is where the
+   colour is" claim the scene carried. A ball lens has one refracting surface pair and all its
+   flux lands in one place.
+3. **The Klein bottle cannot be fixed at all.** A 2.4 mm wall is optically a *window*, not a
+   lens. Making it solid glass would give it a caustic and destroy the internal descending tube
+   that is the entire point of the piece. Its cap is therefore only widened (1.2 x 1.30, still
+   centred on its column) so the soft 2x patch and the piece's own glints land on white — there
+   is no focus to chase and the scene now says so.
+
+**FURTHER RETRACTION, and the actual fix for COLOUR (2026-08-04).** Conclusions 1 and 2 above
+are about *brightness*, and re-metering at the honest 2x bar showed the colour question had not
+actually been answered by any of it: at 2x, **both** gyroid forms, the Klein bottle and a prism
+all score 0.00% coverage, and the orb — the scene's brightest caustic — is a near-white disc.
+The reason `sat` never revealed this is that `sat` measures distance from white and cannot tell
+a uniformly amber patch from a red-to-violet fan. `_gemsweep.py` now also reports **spread**:
+per caustic cell take chromaticity (r, b) = (R, B)/(R+G+B), find the excess-weighted centroid,
+and report twice the weighted RMS radius about it. White collapses to a point plus sampler
+noise; a spectrum is a long streak.
+
+**Brightness and colour are separate properties.** A caustic is bright because a surface
+*converges* light and coloured because it disperses light *sideways*, and the two normally
+exclude each other: a ball lens is concentric, so its dispersion is purely longitudinal (every
+wavelength on the same axis a little deeper, stacking into one white disc), while a prism
+disperses hard sideways but is parallel-in/parallel-out, so it never converges and its coloured
+band never rises above the bare sunlight beside it. An **axicon** — a flat top over a cone —
+does both: light enters the top undeviated, every point of the conical exit face is a prism at
+the *same* tilt, so the deviation is constant (a line focus, hence bright) while the dispersion
+is a prism's (hence coloured). Measured at 2x, each piece at its own best drop:
+
+| piece | coverage | sat | **spread** |
+|---|---|---|---|
+| **axicon**, 45 deg, apex down, drop 0.35 | 0.29% | **0.320** | **0.212** |
+| axicon, same, drop 0.90 | 0.31% | 0.319 | 0.183 |
+| apex-**up** cone, 42 deg, drop 0.90 | 0.07% | 0.289 | 0.157 |
+| round **brilliant** cut, R=0.40, drop 0.90 | 0.18% | 0.257 | 0.092 |
+| oblate spheroid (astigmatic lens) | 0.19% | 0.196 | 0.051 |
+| crystal **orb**, drop 0.80 | 0.16% | 0.265 | 0.048 |
+| glass torus (ring lens) | 0.03% | 0.210 | 0.045 |
+| solid gyroid k=10 / shell gyroid k=13 / Klein / prism | **0.00%** | — | — |
+
+Three further conclusions:
+
+4. **A round brilliant LOSES**, which is a surprise given the trade cut it for "fire". Built as
+   an intersection of half-spaces (1 table + 16 girdle + 8 crown bezels at 34.5 deg + 8 pavilion
+   mains at 40.75 deg) it scores 0.092 spread, because a 40.75 deg pavilion sits just past
+   crystal's 40.2 deg critical angle and **total-internally-reflects** — it throws the fire back
+   up at the viewer, not down at the table. Sweeping the pavilion to 20/25/30/35 deg does not
+   recover it.
+5. **The lattice cannot be rescued by reshaping its outer boundary.** Clipping the solid gyroid
+   to this same axicon instead of to a ball measures 0.13% / 0.205 / 0.099 — less than half a
+   plain axicon on every axis. The clip only sets the *first* surface a ray meets, and behind it
+   are the same internal sheets that make a gyroid a diffuser. So the crystal gyroid stays as
+   it is and the colour source is an **additional** exhibit, not a replacement.
+6. **The scene now has a tenth exhibit, `crystal_axicon`** — a 45 deg cone 1.12 m across, hung
+   apex down on three short pins with its point 0.07 m over the tabletop, at near-left
+   (2.60, 5.45). Its cap is 1.6 x 1.1, *wide and shallow* where every other cap is square or
+   deep, because an axicon's caustic reads as two rainbow cusps flanking the piece rather than a
+   disc under it, and it is cantilevered only 0.12 m (a lens throws its focus ~0.98 m downwind
+   per metre of drop; an axicon has no focal *point* to displace, only a focal *line* starting
+   at the exit face). Drop 0.35 and 45 deg are both metered optima. **Both stated REASONS are
+   retracted below** (see the two RETRACTION blocks): colour does *not* fall off with drop, and
+   the failure past 45 deg is not TIR. The choices themselves stand.
+
+   **FACETING IT DOES NOT HELP, and that is worth knowing** because from the scene's low
+   camera (11 deg above the horizon) a 45 deg cone is twice as wide as it is tall and
+   foreshortens into a squat glass wedge — optically right, visually mute — so a faceted
+   version that reads as a cut jewel was the obvious cosmetic fix. Every facet is at the same
+   45 deg tilt, so the optics "should" survive; they do not. Cutting the same solid into
+   6/8/12/16 pavilion facets at drop 0.35 gives 0.12/0.11/0.12/0.14% coverage at 0.063/0.162/
+   0.099/0.132 spread, against the smooth cone's 0.29% and 0.212. Sampling the ring focus at n
+   discrete azimuths instead of continuously collapses the patch from 1.43 x 0.96 m to a
+   0.20 x 0.03 m sliver — brighter per unit area (facet 8 reaches sat 0.367) but far too small
+   to read in a wide shot. The scene keeps the smooth cone. **(Re-measured on float below: the
+   spreads all moved, the verdict did not.)**
+
+   **Siting gotcha worth remembering: in this scene the NEAR row is HIGH z, not low z.** The
+   still camera stands at (5.0, 2.95, 9.35) and looks toward -z, so "front of the gallery"
+   means z around 5-7. The axicon's first site was z=1.10 — which reads as "front" on the page,
+   since the file lists the low-z exhibits last — and that put it 8.4 m out and directly BEHIND
+   the crystal gyroid, which occluded it completely. Nothing in the scene text or the audits
+   catches this; only projecting the candidate point through the camera basis does (or
+   rendering it, which is how it was found). At z=5.45 the piece is 4.2 m out at 178 px/m and
+   clears the gyroid on screen by ~24 px.
+
+**THE MEASUREMENTS ABOVE WERE ALL TAKEN THROUGH A CLIPPING 8-BIT PIPE, and that is a tooling
+bug big enough to have its own fix (2026-08-04).** Metering the shipped frame instead of the
+isolation rig (`scraps/_capchroma.py`, which projects each cap out of the scene through the
+still camera and runs the same metric) showed the axicon's in-scene caustic at spread 0.057
+against the rig's 0.212 — apparently a wash-out by the scene's sky-panel fill, which the rig
+does not have. It was not. **596 of that cap's 22639 pixels are exactly (255, 255, 255).** A
+PNG is 8-bit sRGB with a hard clamp, a caustic is by definition the brightest thing in frame,
+and at the clip point all three channels become *equal* — so the tone map deletes precisely
+the two quantities this whole investigation was measuring, hue and peak-to-screen ratio.
+More than half the caustic's area was clipped, so its colour metered as white no matter what
+the optics did, and the ranking table above was partly a ranking of how hard each piece hit
+the clamp.
+
+Fixed properly rather than worked around: **ftrace grew `-hdr`** (v0.132.0), which writes a
+32-bit float PFM beside `-o` holding the scene-linear buffer — no exposure, no gamma, no
+clamp — from the same `filmToLinear()` the tone map consumes, on the periodic in-progress
+writes as well as the final one. `_capchroma.py` reads either format and **prints a warning
+banner when handed an 8-bit file**. Rules that follow from this:
+
+* **Never meter a caustic (or any highlight) off a PNG.** Render with `-hdr` and measure the
+  `.pfm`. Looking at the PNG is fine; measuring it is not.
+* A clipped core is not only a measurement problem, it is a *rendering* one: a caustic whose
+  core is blown to white looks white on screen too. A caustic screen wants its albedo set so
+  the caustic **peak** lands just under clip, not so the ambient does — `capwhite` was already
+  taken from 0.88 to 0.30 for this reason and it is still not far enough under the axicon.
+* Any earlier conclusion in this file that rests on a *bright* caustic's colour should be
+  re-checked against a `.pfm` before it is trusted.
+
+**AND THE CLAMP WAS, BY ACCIDENT, THE RIG'S ONLY OUTLIER REJECTION (2026-08-04).** The first
+float measurements came back *worse* than the clipped ones, not better: the glass orb metered
+peak **1389x** / sat 0.838, and the solid gyroid k=10 — a piece that throws no caustic at all,
+0.00% coverage in every table above — metered peak **1214x** / spread **0.594** and would have
+"won" the whole ranking on three pixels. Mode D carries one hero wavelength per sample, so a
+rare specular-caustic path deposits an enormous **monochromatic** spike; the 8-bit clamp used
+to flatten those to white, which is why nobody ever saw them. The 4x box average does not help
+— a box is linear and zero-mean-symmetric, so it removes chroma *speckle* but a heavy-tailed
+1000x outlier survives it scaled by 1/16 and still dominates.
+
+So `-fireflies 3` (clamp a pixel brighter than 3x its 2nd-brightest neighbour, hue preserved)
+is **mandatory for any float metering of this scene**, and is now in both rigs' render command.
+It is safe for real caustics precisely because a caustic is never isolated — its neighbours are
+bright too. Evidence: the shipped axicon measures peak **14.68x with and without** the flag,
+bit-identical, while the gyroid's 1214x vanishes.
+
+**The corrected ranking (float + `-fireflies 3`, 600 spp, 480x480, 4x box, 2x cut)** — this
+supersedes every `coverage / sat / spread` table above, all of which were computed through the
+clamp. Each piece at its own best drop; `patch` is the excess-weighted 5-95% extent:
+
+| piece | peak | coverage | sat | **spread** | noise | **fan** | patch x by z |
+|---|---|---|---|---|---|---|---|
+| **axicon 45 deg, drop 0.35 (shipped)** | **14.68x** | **0.30%** | 0.275 | **0.079** | 0.008 | **0.76** | **1.37 x 0.96** |
+| axicon 45 deg, drop 0.80 | 24.58x | 0.29% | **0.314** | 0.083 | 0.011 | **0.85** | 1.98 x 1.34 |
+| apex-**up** cone k=0.9, drop 0.90 | 7.14x | 0.07% | 0.201 | 0.018 | 0.005 | — | 1.49 x 0.35 |
+| round **brilliant** R=0.40, drop 0.80 | 3.68x | 0.06% | 0.219 | 0.047 | 0.011 | — | 0.35 x 0.06 |
+| oblate spheroid b=0.22, drop 0.90 | 9.09x | 0.19% | 0.272 | 0.024 | 0.004 | 0.97 | 0.09 x 0.18 |
+| glass **torus**, drop 0.90 | 7.85x | 0.03% | 0.210 | 0.006 | 0.003 | — | 0.03 x 0.06 |
+| crystal **orb**, drop 0.80 | 3.00x | 0.16% | 0.253 | 0.013 | 0.008 | 0.94 | 0.09 x 0.15 |
+| solid gyroid k=10, drop 0.80 | 2.60x | **0.00%** | — | — | — | — | — |
+
+The *ordering* survives — the axicon still wins decisively, on area (1.3 m of cusp against the
+orb's 9 cm patch), on spread 6:1, and on peak 5-8x — so every conclusion drawn from the old
+tables about *which piece to ship* stands. But no absolute number in them does: they were
+suppressed by the clamp at the top end and inflated by fireflies at the tail, in **opposite
+directions**, so they cannot be rescued by rescaling. Two specific reversals:
+
+* **The brilliant's "spread win" was a clamp artifact.** It read 0.092 through the clamp,
+  nominally beating the axicon's clipped 0.079; on float it is 0.047 with too few cells to
+  `fan`-test at all. Conclusion 4 above (a 40.75 deg pavilion TIRs the fire back at the viewer)
+  is unaffected — the brilliant still loses, just by more.
+* **`spread` measured over a handful of cells is not a comparable statistic**, which is why the
+  table now carries `coverage`, `patch` and `fan` beside it. The oblate spheroid's fan 0.97 and
+  the orb's 0.94 are *perfectly organised* colour over a 9 cm patch: real, and negligible.
+
+**RETRACTION: drop is not a colour parameter — it buys patch AREA (2026-08-04).** Conclusion 6
+above says "colour falls off monotonically above ~0.5 m of drop". That was the clamp talking:
+a bigger drop throws a brighter caustic, which clipped harder, which the PNG scored as *less*
+colourful. Swept on float:
+
+| drop | peak | coverage | sat | spread | fan | patch x by z |
+|---|---|---|---|---|---|---|
+| 0.35 (shipped) | 14.68x | 0.30% | 0.275 | 0.079 | 0.76 | 1.37 x 0.96 |
+| 0.50 | 18.43x | 0.27% | 0.257 | 0.076 | 0.82 | 1.55 x 1.11 |
+| 0.65 | 34.54x | 0.24% | 0.281 | 0.076 | 0.82 | 1.78 x 1.23 |
+| 0.80 | 24.58x | 0.29% | **0.314** | **0.083** | **0.85** | 1.98 x 1.34 |
+| 0.95 | 6.27x | 0.36% | 0.277 | 0.083 | 0.82 | 2.22 x 1.49 |
+| 1.10 | 5.02x | 0.56% | 0.256 | 0.065 | 0.67 | 2.33 x 1.55 |
+
+`spread` is flat at 0.065-0.083 across the whole range — drop is very nearly a **free
+parameter for colour** between 0.35 and 0.95. What it actually controls is how far the cusps
+walk apart: the patch grows 1.37 x 0.96 m -> 2.33 x 1.55 m, i.e. **a bigger drop needs a bigger
+cap**. That is a *staging* trade, not an optical one, and it is why the shipped 0.35 stays:
+0.80 is nominally best on `sat` (0.314) and `fan` (0.85), but taking it would need the axicon
+cap grown from 1.6 x 1.1 to ~2.1 x 1.45, whose near edge lands at z ~ 4.41 against the diamond
+cap's z = 4.40 *and* overlapping it in y (0.70-0.90 vs 0.65-0.85, since the caps were
+thickened). The gain is inside the run-to-run scatter; the layout surgery is not.
+
+**RETRACTION: the "past 45 deg the exit face TIRs" mechanism is wrong (2026-08-04).** Same
+conclusion 6. Swept on float at drop 0.35 (`k` = tan of the cone's half-angle; `k=1.0` is
+45 deg), with the caustic core's z offset from the piece's axis:
+
+| k | half-angle | peak | coverage | sat | spread | fan | core z |
+|---|---|---|---|---|---|---|---|
+| 0.70 | 35.0 deg | 6.49x | 0.09% | 0.234 | **0.129** | — | **+0.63** |
+| 0.85 | 40.4 deg | 13.16x | **0.03%** | 0.480 | 0.009 | — | -0.53 |
+| **1.00** | **45.0 deg** | **14.68x** | **0.30%** | 0.275 | 0.079 | **0.76** | -0.16 |
+| 1.20 | 50.2 deg | 12.94x | 0.25% | 0.219 | 0.052 | 0.93 | -0.61 |
+| 1.40 | 54.5 deg | 11.16x | 0.10% | 0.193 | 0.031 | — | -0.62 |
+
+45 deg is confirmed optimal, but not for the stated reason. The collapse is at **k=0.85
+(40.4 deg), BELOW 45 deg**, and both k=1.20 and k=1.40 keep working — so this is not a
+one-sided TIR cliff past 45 deg. The core also **switches sides**, +0.63 z at k=0.70 to -0.61 z
+at k=1.20, crossing near the null: the ring focus is passing through infinity there (the
+constant prism deviation sweeping past the drop distance), which is what empties the 2x bar,
+not the critical angle. 40.4 deg landing on crystal's 40.2 deg critical angle is a coincidence
+worth naming precisely so nobody re-derives the wrong mechanism from it. Shallower cones are
+also **short-range only**: `vcone0.70` at drop 0.80 and 1.10, and `vcone0.60` at 0.80, all read
+0.00% coverage.
+
+**FACETING STILL LOSES — the clamped conclusion survives honest measurement (2026-08-04).**
+The one previously-rejected option that would have improved the scene *visually*, re-tested on
+float at drop 0.35:
+
+| piece | peak | coverage | sat | spread | noise | fan | patch x by z |
+|---|---|---|---|---|---|---|---|
+| facet6 | 3.19x | 0.12% | 0.252 | 0.023 | 0.011 | — | 0.20 x 0.03 |
+| facet8 | 4.52x | 0.11% | 0.394 | 0.110 | 0.010 | — | 0.20 x 0.03 |
+| facet12 | 5.58x | 0.12% | 0.244 | 0.045 | 0.010 | — | 0.17 x 0.03 |
+| facet16 | 5.21x | 0.14% | 0.306 | 0.049 | 0.012 | 0.17 | 0.20 x 0.03 |
+| **smooth cone** | **14.68x** | **0.30%** | 0.275 | 0.079 | 0.008 | **0.76** | **1.37 x 0.96** |
+
+The absolute numbers all moved (facet8's spread went 0.162 -> 0.110, facet6's 0.063 -> 0.023)
+but the verdict does not: every facet count sits at 0.11-0.14% coverage on a ~0.20 x 0.03 m
+**sliver** — 1/220th the area of the smooth cone's patch — at a third to a fifth of the peak,
+and **not one has enough cells for a trustworthy `fan`** (facet16's 0.17 is the only number and
+it is weak, i.e. what colour is there is barely organised). Sampling the ring focus at n
+discrete azimuths instead of continuously is what collapses it, exactly as the clamped
+measurement said. The scene keeps the smooth cone.
+
+**CLOSED for the axicon: the in-scene frame now measures as a coloured caustic (2026-08-04).**
+`_capchroma.py` on a 1036-spp `-hdr -fireflies 3` render of the shipped scene, per cap, at the
+2x-own-median bar:
+
+| cap | coverage | sat | spread | xspread | peak | clipped | noise floor | **fan** |
+|---|---|---|---|---|---|---|---|---|
+| **axicon** | **6.11%** | 0.247 | **0.185** | **0.273** | **6.8x** | 0.66% | 0.056 | **0.46** |
+| glass orb | 0.56% | 0.595 | 0.237 | 0.445 | 2.05x | 0.00% | 0.100 | — |
+| brass cluster | 4.76% | 0.596 | 0.022 | 0.055 | 2.31x | 0.15% | 0.169 | — |
+| crystal gyroid ("diamond") | 0.65% | 0.837 | 0.053 | 0.074 | 2.47x | 0.00% | 0.053 | — |
+| chrome / dumbbell / heart / Klein / solid gyroid | 0.00% | — | — | — | 1.0-1.9x | 0.00% | 0.005-0.024 | — |
+
+The axicon throws **11x the caustic area of anything else in the scene at 3x the peak**, and
+it is the only cap in the scene with enough caustic on it to ask the colour question at all
+(the `—` in the fan column is "fewer than 20 cells, unmeasurable", not "not coloured").
+The scene's colour problem is solved.
+
+**Two new controls, and `spread` on its own should never have been trusted without them.**
+Looking at the frame after all this, the axicon's cusps still read whitish by eye, which does
+not square with spread 0.185 — so the metric got two companions, both in `_pfm.py` so the two
+rigs share one implementation:
+
+* **`noise`** — `spread` measured over a *control band* of cells at 1.0–1.2x the cap's median,
+  i.e. bare sunlit cap with no caustic on it. Whatever chromatic scatter those show is the
+  render's speckle floor. **This is the thing that made `spread` untrustworthy**: mode `D`
+  carries one hero wavelength per sample, so an unconverged pixel is *randomly coloured*, and
+  an RMS radius in chromaticity scores a loud random cloud exactly like a rainbow. A 4x box
+  only divides speckle by 4. In-scene at 2114 spp the axicon's floor is 0.056 against its
+  0.185, so it clears by 3.3x; but the glass orb reads spread 0.237 on a 0.100 floor from
+  three cells and swung between 0.001 and 0.237 across successive writes of the same render —
+  that number was always noise, and the rig (which says the orb is white, 0.013) was right.
+* **`fan`** — the fraction of chromatic variance explained by a weighted least-squares
+  *quadratic in position* on the cap (adjusted R^2). Real dispersion means chromaticity is a
+  **function of position**; speckle is uncorrelated with position and scores ~0 however loud.
+  This is the one that actually settles it. The basis has to be quadratic: a first draft fitted
+  a **plane** and scored the axicon 0.09, because an axicon disperses *radially* about its own
+  axis — red outside, violet inside, on both flanking cusps at once — and a plane is blind to
+  that by symmetry. On the quadratic basis the axicon scores **0.46 in-scene** (control band
+  0.15) and **0.76 in the sun-only rig** (control 0.00, noise floor 0.008).
+
+The rig also re-measures the orb at **fan 0.94 on spread 0.013**, which is the pair working as
+intended: a ball lens's tinted rim is perfectly *organised* colour, there is just almost none
+of it, over a 0.09 x 0.15 m patch. So `fan` validates a reading and `spread` sizes it — the
+axicon wins on magnitude 6:1 and the ordering is unchanged.
+
+**THEN LOOK AT IT, WHICH THE METRICS DO NOT REPLACE (2026-08-04).** All of the above is
+statistics on a cap; none of it says what the picture looks like. `scraps/_capcrop.py` crops a
+cap's screen footprint out of the float buffer and prints it three ways, stacked and upscaled:
+**as shipped** (linear x GAIN, sRGB — exactly the PNG), **under-exposed** (gain set so the
+cap's own 2x2 peak lands just under white), and **chromaticity only** (every pixel renormalised
+to equal luminance with the saturation stretched). The three rows separate three different
+failures that all look like "it reads white":
+
+* row 1 white, row 2 coloured  -> the colour is real and the **tone map** is eating it;
+* row 1 and row 2 both white, row 3 a smooth gradient -> the colour is real but **weak**;
+* row 3 confetti -> there is no colour, only speckle (this is `fan` made visible).
+
+On the crystal axicon it printed the second case: the cusp is a pale white arc with a faint
+warm fringe, and row 3 shows a smooth but *low-amplitude* hue gradient. So `spread 0.185 /
+fan 0.46` and "it reads whitish" were both true, and the two together are the actual
+diagnosis — organised colour, not enough of it.
+
+**Two levers were ruled out by measurement before the third was tried.** (1) **Darken the
+screen further.** It cannot work: chromaticity is scale-invariant, so albedo moves the caustic
+and its pedestal together (see below). (2) **Cut the sky fill**, on the theory that the 11000 K
+panel washes the cusps out. Also no — profiling the cap's luminance percentiles says the
+pedestal is almost entirely *direct sun*, not fill:
+
+| percentile of the axicon cap | scene-linear luminance | what it is |
+|---|---|---|
+| p5 | 0.0089 | the piece's own shadow, i.e. **sky fill alone** |
+| p50 | 0.0893 | sunlit cap = sun + fill |
+| p100 | 0.6292 | the caustic core |
+
+The fill is **10% of the pedestal**; removing all of it would raise the caustic:screen ratio by
+a tenth. And the remaining 90% is sunlight, which cannot be reduced without dimming the caustic
+by the same factor, since both arrive from the same sun. The pedestal is therefore fixed, and
+the only thing left to change is **how much the piece disperses**.
+
+**THE FIX: cut the axicon from DENSE FLINT instead of crystal (2026-08-04).** What splays a
+caustic across the spectrum is the Abbe number, and the scene's own material comment had the
+answer written in it the whole time — `glass:SF10` (V_d 28.5) splays 1.5x as far as
+`glass:crystal`/F2 (36.3). The rig gained `GEMIOR` (and `GEMRES`/`GEMSPP`, because at 480 px a
+0.13%-coverage caustic is 19 cells and `fan` needs 20). **A denser glass also deviates harder,
+so it moves the ring focus and the drop has to be re-swept with the material** — SF10 at
+crystal's optimum drop of 0.35 lands in a null (0.08% coverage). Swept, at 45 deg, 480 px:
+
+| drop | coverage | sat | spread | fan |
+|---|---|---|---|---|
+| 0.30 | 0.04% | 0.520 | 0.045 | — |
+| 0.35 | 0.08% | 0.548 | 0.050 | — |
+| 0.40 | 0.08% | 0.545 | 0.047 | — |
+| 0.50 | 0.13% | 0.480 | 0.109 | — |
+| **0.65** | 0.15% | 0.469 | 0.139 | **0.95** |
+| 0.80 | 0.16% | 0.482 | 0.121 | 0.92 |
+
+Head to head at matched settings (960 px, 1200 spp — the sweep setting is not fine enough to
+adjudicate this), each glass at its own best drop:
+
+| glass | drop | peak | coverage | sat | spread | fan | patch |
+|---|---|---|---|---|---|---|---|
+| crystal | 0.35 | 16.44x | **0.28%** | 0.321 | 0.152 | 0.51 | 1.37 x 0.98 |
+| SF10 | 0.50 | **24.71x** | 0.13% | 0.509 | 0.162 | 0.57 | 1.27 x 1.05 |
+| **SF10** | **0.65** | 21.99x | 0.15% | **0.516** | **0.187** | **0.77** | 1.41 x 1.14 |
+
+**Note the metrics are resolution-dependent** — the same crystal configuration reads spread
+0.079 / fan 0.76 at 480 px and 0.152 / 0.51 at 960 px, because finer cells resolve more
+structure *and* carry more per-cell noise. Only compare rows taken at the same `GEMRES`.
+
+Shipped: `material "flint" { type dielectric ior glass:SF10 }` on `crystal_axicon` only (the
+orb and the gyroid keep crystal — their caustics are white-with-a-rim whatever the glass), the
+piece raised 0.30 m to drop 0.65 (`translate 2.6 1.55 5.45`, `contained_by` y 1.25..1.85, pins
+0.37 -> 0.67 m long), and the cap regrown to the new patch: 1.6 x **1.28** centred (2.54, 5.41).
+`_flyplan.py`'s and `_capchroma.py`'s collider tables were moved with it — both hardcode the
+axicon's apex and both would otherwise mask the wrong region. In the finished frame:
+
+| | crystal, drop 0.35 | **SF10, drop 0.65** |
+|---|---|---|
+| coverage | 4.48% | 3.64% |
+| sat | 0.269 | **0.444** |
+| spread | 0.204 | **0.299** |
+| xspread (pedestal removed) | 0.292 | **0.413** |
+| peak | 6.29x | **8.05x** |
+| clip at albedo 0.15 | 0.52% | **0.13%** |
+| noise floor | 0.066 | 0.045 |
+| **fan** | 0.37 | **0.76** |
+
+(Both columns are the fully converged 600 s stills, `png/rain_axicon.pfm` and
+`png/rain_axicon_cam.pfm`. Intermediate reads from ~380 spp on were already inside a few
+percent of these, so the comparison was never spp-limited.)
+
+1.7x the saturation, 1.5x the chromatic spread and 2.1x the organisation, for 80% of the area
+— and it *clips less*, because the caustic got smaller as it got brighter. That leaves the
+0.15 albedo with more headroom than it now needs (doubling it to 0.30 would clip 1.36%, against
+3.06% for the crystal piece), so a brighter, more museum-white tabletop is available if the
+scene ever wants one. Left alone here to avoid moving two variables at once.
+
+**The obvious objection to that table is TAIL SELECTION** — SF10 lights 80% as much of the cap,
+so maybe its `sat` is high only because the threshold kept a smaller, brighter, more selected
+slice. Tested by sweeping `GEMCUT` (the multiple of the cap's own median that counts as
+caustic) on both finished stills until they meet on area:
+
+| GEMCUT | crystal: coverage / sat / spread / fan | SF10: coverage / sat / spread / fan |
+|---|---|---|
+| 2.0 | 4.48% / 0.269 / 0.204 / 0.37 | 3.64% / **0.444** / **0.299** / **0.76** |
+| 2.5 | **3.37%** / 0.210 / 0.117 / 0.35 | 1.48% / 0.344 / 0.172 / 0.72 |
+| 3.0 | 2.58% / 0.192 / 0.065 / 0.22 | 0.74% / 0.347 / 0.100 / -- |
+| 3.5 | 2.06% / 0.179 / 0.057 / 0.17 | 0.47% / 0.369 / 0.101 / -- |
+| 4.0 | 1.32% / 0.186 / 0.051 / 0.49 | 0.32% / 0.368 / 0.093 / -- |
+
+**The objection is refuted, and backwards.** Squeezing crystal down to SF10's area (cut 2.5,
+3.37% vs 3.64%) makes it *worse* on every axis — sat 0.269 -> 0.210, spread 0.204 -> 0.117 —
+so at matched coverage SF10 wins by 2.1x on sat, 2.6x on spread and 2.2x on fan, a wider
+margin than the headline table shows. SF10 at cut 2.5 beats crystal at cut 2.0 on sat and fan
+while lighting a third of the area.
+
+The mechanism is in the column shapes, and it is the whole point of the swap. **Crystal's
+caustic gets WHITER toward its core** (sat 0.269 -> 0.179 from 2x to 3.5x the pedestal): its
+colour lives in the low-excess *fringe*, which is exactly the part a tone map crushes and the
+eye reads as dim. **SF10's does not** — sat is flat at 0.34-0.37 all the way out to 4x, i.e.
+the colour survives into the bright core, where it is actually visible. That is why the piece
+metered as coloured under crystal yet looked white on screen, and why it now looks amber:
+raising V_d^-1 did not just add dispersion, it moved the dispersion into the bright pixels.
+(`fan` reads `--` past cut 2.5 for SF10 because fewer than 20 cells survive, not because the
+structure decays — see the quadratic-basis note above.)
+
+**And `capwhite` 0.30 -> 0.15 is a TONE-MAP decision, not a measurement one — a distinction
+worth writing down because it is easy to get backwards.** On the float buffer, chromaticity
+and peak:median are both scale-invariant, so a diffuse screen's albedo changes `spread`, `sat`
+and `coverage` by *literally nothing* (verified: identical to three decimals at both albedos,
+by rescaling the same `.pfm`). What it changes is how much of the caustic the tone map deletes:
+on that same buffer the axicon cap clips **3.06% of its pixels at 0.30 and 0.70% at 0.15** —
+half the caustic's own area versus a tenth of it. So `_capchroma.py` now reports a `clip`
+column beside the float metrics (scene-linear x `GAIN` 1.5 >= 1.0, where 1.5 = ftrace's
+`ABS_EXPOSURE_GAIN` 6.0 x the film's `exposure 0.25`), because the float metrics alone cannot
+tell you the picture is still throwing the caustic away.
+
+**Tooling bug found and fixed along the way: `rotate` is not a valid key inside an FTSL
+`function` block** (only `translate` is), and the loader emits a **warning, not an error**, then
+carries on — so a rotated field silently renders unrotated. A prism roll sweep came back as six
+identical rows before this was noticed. Fixed two ways: rotate half-space normals *algebraically*
+in the generator (a half-space `n.p <= d` under `p = Rq` is `(R^T n).q <= d`, so pre-rotating the
+normals is exact and needs no transform support), and gate every generated scene through
+`-parseonly`, raising on any warning rather than measuring the wrong object. **Worth checking
+whether other FTSL blocks accept unknown keys with only a warning** — a silent mis-parse that
+still renders is the worst failure mode a scene language can have.
+
+**RETRACTION: "render mode M" was bad advice — mode M silently drops participating media.**
+`src/photonmap_render.h` contains no `scene.media` handling at all; its only `Medium` symbols
+are the nested-dielectric IOR stack. Verified by running gallery_rain in mode M: the cloud,
+the rain and the rainbow are simply absent and the sky is pure black. For this scene mode **D**
+is the correct choice and always was — `main.cpp` (~line 4491) explicitly exempts D from the
+`mediaNeedForward` warning because "it handles multiple superposed, box/sphere/object-bounded
+AND heterogeneous media correctly on both devices". See the next entry.
+
+---
+
+### OPEN: mode `M` (and `S`) silently ignore participating media instead of refusing the scene
+
+`src/photonmap_render.h` has no participating-media code — no free-flight sampling, no volume
+photon deposits, no in-scatter on the camera walk. (`photonmap.h`'s header comment claims the
+pass "deposits a record at each diffuse/**volume** vertex", which is aspirational.) A scene
+with a `medium` therefore renders in mode M as if the medium were not there.
+
+The problem is not the missing feature, it is that **nothing tells you**. ftrace already has
+the machinery to say so: `unsupportedFeature()` / `vcmUnsupportedFeature()` in `main.cpp`
+(~3960, ~4004) make mode `U` refuse a scene outright with "participating media (mode U is
+surfaces-only)", and `prefer{}/else{}` then falls through to a mode that works. Modes `M` and
+`S` have no such check, so `gallery_rain` — whose whole subject is a rain cloud and a rainbow —
+rendered a black sky for six minutes with no diagnostic.
+
+Reproduce: `ftrace scenes/gallery_rain.ftsl -mode M -n 4e8 -spp 24 -o png/x.png` and compare
+with `-mode D`. Cloud, rain and bow are missing.
+
+Proper fix: add `scene.media.empty()` to the mode `M`/`S` support predicate alongside mode U's,
+so a media scene either refuses (and `prefer{}` falls through) or at minimum warns. The real
+fix — a volume photon map with beam/point-query in-scatter — is a much larger job and should be
+tracked separately; refusing loudly is the correct behaviour until then.
+
+---
+
+### DONE (2026-08-04): `gallery_rain` stand caps intersecting neighbouring stands' columns
+
+Widening the caps for the caustic work put `stand_gyroid_cap` (2.3 x 2.3 at x=5.0, z=4.8,
+y=0.52..0.55) straight through the glass stand's COLUMN (x 5.99..6.41, y 0.18..0.87). The
+audit done at the time compared cap-vs-cap only and concluded the caps "stagger like shelves";
+that reasoning is valid for two caps (each occupies one thin y slab) and invalid for a cap
+against a column (which spans a whole y range, so plan overlap = intersection).
+
+Two further intersections turned up that PREDATED the wireframe rework, both base slab against
+base slab: `stand_gyroid` x `stand_glass` (0.30 x 0.18 x 0.20) and `stand_klein` x `stand_brass`
+(0.61 x 0.22 x 0.11).
+
+Fixed: gyroid cap 2.3 x 2.3 -> 2.3 x 2.1 (near edge 3.65 -> 3.75, clearing both the glass and
+diamond columns); `stand_glass` x 6.2 -> 6.7; `stand_brass` z 2.0 -> 1.84 with the settled
+`brass_cluster` shifted by the same -0.16. `scraps/_standaudit.py` now audits all 30 colliders
+across the 9 stands in 3-D and comes back clean — run it after any stand edit.
+
+The audit script itself had a bug worth remembering: it terminated each `isosurface` block on a
+regex `\n\}`, but cap blocks are written `isosurface "x_cap" { material capwhite\n    box {...} }`
+and close on the SAME line, so every cap silently swallowed the following stand and reported
+that stand's cage boxes under the cap's name (8 stands instead of 9, and 18 bogus duplicate
+pairs). It now uses a real brace matcher.
+
+---
+
+### PARTLY FIXED (2026-08-04, v0.131.0): a dispersive caustic in mode `D` is single-wavelength with no variance reduction — chromatic speckle is unavoidable
+
+Mode `D` is the only mode that renders a scene containing both participating media and a
+dispersive caustic (M and S drop the media, see above; U refuses media outright). But every
+wavelength-sharing optimisation the renderer has is off in exactly that combination:
+
+- **`-heroc` (hero-wavelength bundle) is disabled by the media.** It is documented as "ignored
+  (still single-lambda) by ... any scene with participating media", so `gallery_rain` gets no
+  bundle at all.
+- **A dispersive refraction would de-hero the bundle anyway.** The dispersive event terminates
+  the N-1 secondary wavelengths, so even without media the orb's own refraction kills the
+  bundle at the first surface.
+- **`-herosplit` — the fix for exactly that — is ignored by mode `D`.** It is implemented for
+  CPU forward `A`/`B`/`C` and the `M`/`S` deposit only.
+- ~~**There is no denoiser.** No `-denoise` flag exists.~~ — **FIXED, see below.**
+
+Net effect: the caustic converges one wavelength per path, so it arrives as saturated red/green/
+blue speckle that only brute-force sample count removes (variance goes as 1/spp, so halving the
+speckle costs 4x the time). 1400 spp / 17 min at 1280x720 is visibly noisy in the disc.
+
+Proper fix, in increasing order of work: (a) extend `-herosplit` to mode `D`'s subpath
+construction, which is where the win is largest since D is the mode media scenes are forced
+into; (b) allow `-heroc` on media scenes by carrying per-lambda transmittance through
+delta/ratio tracking instead of bailing; (c) a denoiser.
+
+**(c) DONE 2026-08-04 (v0.131.0): `-denoise` (`src/denoise.h`).** Chroma-only edge-aware
+à-trous filter in `filmToRgb8`, so it affects the file and the live window identically and runs
+before the p99 auto-exposure anchor is measured. On `gallery_rain` at 120 spp, against an
+8000 spp reference of the same frame: chroma RMSE 23.8 → 13.8 (58 %), PSNR +1.8 dB, for ~1 % of
+render time, with luma left **bit-identical**. Still a net win at 480 spp (+0.6 dB), so it is
+safe to leave on. It attacks the *symptom* rather than the cause, so **(a) and (b) remain open**
+— a denoiser cannot recover a colour gradient the sampler never resolved, and the fringing at a
+caustic rim is exactly the chroma detail the filter has to soften.
+
+Three bugs were found and fixed while building it, each of which passed a naive visual check
+and is now pinned by `ftrace -checkdenoise`:
+
+1. **A plain bilateral gather ate 30 % of the frame's luminance.** `out_i = Σ w_ik in_k / Σ w_ik`
+   is row-stochastic but not column-stochastic, so on heavy-tailed MC noise it regresses toward
+   the local *mode*. Fixed with a symmetric (geometric-mean) tolerance so `w_ik == w_ki`, plus a
+   *scatter* for luma, `out_i = Σ w_ik (in_k / D_k)`, whose total is exactly `Σ in_k`.
+2. **A constant image was not a fixed point** (bright frame around a flat grey field): border
+   taps were being dropped, so edge rows summed to < 1 and handed out more than they held.
+   Fixed with **half**-sample edge mirroring — whole-sample mirroring has fixed points at the
+   two end samples, which double-counts, breaks the symmetry property 1 depends on, and leaked
+   0.06 %.
+3. **Averaging chroma turned speckle into coherent purple/orange blobs, and was measurably
+   *further* from the truth** (PSNR −2.4 dB) even though it looked less noisy. Chroma is stored
+   as a ratio to luma, and the mean of a ratio whose denominator is the noisy quantity is not
+   the wanted quantity: near-black pixels have enormous ratios and dominated the average. Fixed
+   by averaging numerator and denominator separately, `Σw(R−G) / ΣwY` — the luma-weighted mean
+   hue.
+
+The lesson worth keeping: **energy conservation and a flat-field test both passed while the
+filter was making the image objectively worse.** The only metric that caught it was RMSE against
+a converged reference (`scraps/_dneval.py`), which is now how any change here should be judged.

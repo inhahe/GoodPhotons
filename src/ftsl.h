@@ -565,6 +565,10 @@ struct CamSpec {
     //   EXPLOCK_CAMERA  `exposure_lock <name>`     -> a separately-defined camera "<name>"
     enum { EXPLOCK_FIRST = 0, EXPLOCK_INDEX, EXPLOCK_NEAR, EXPLOCK_CAMERA, EXPLOCK_AVERAGE };
     int  pathGroup   = -1;
+    // The path's base name WITHOUT the frame number ("fly" for frames "fly000".."fly599");
+    // empty for a standalone `camera`. Rendering several frames of one path writes them into
+    // a subdirectory built from this, so a 600-frame flyby cannot spray siblings of a still.
+    std::string pathBase;
     bool exposureLock = false;
     int  expLockSel   = EXPLOCK_FIRST;   // which frame the group meters from (enum above)
     int  expLockIndex = 0;               // EXPLOCK_INDEX: frame index (may be negative)
@@ -5960,6 +5964,7 @@ private:
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;
             cs.pathGroup = pathGroup;
+            cs.pathBase  = base;
             cs.exposureLock = pathLock;
             L.cameras.push_back(cs);
             if (!L.hasCamera) {
@@ -6041,6 +6046,7 @@ private:
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;
             cs.pathGroup = pathGroup;
+            cs.pathBase  = base;
             cs.exposureLock = pathLock;
             L.cameras.push_back(cs);
             if (!L.hasCamera) {
@@ -6705,6 +6711,7 @@ private:
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;
             cs.pathGroup = pathGroup;
+            cs.pathBase  = base;
             cs.exposureLock = pathLock;
             L.cameras.push_back(cs);
             if (!L.hasCamera) {

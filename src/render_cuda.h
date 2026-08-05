@@ -26,6 +26,19 @@ bool cudaAvailable();
 // Human-readable name of the primary CUDA device (or "none").
 const char* cudaDeviceName();
 
+// Free / total device memory, in bytes. False (leaving the outputs untouched) if there is
+// no device or the query fails. Note `free` is the WHOLE card's free pool, i.e. it moves
+// with every other process on the machine, not just this one.
+bool cudaMemInfo(size_t* freeB, size_t* totalB);
+
+// Bytes of device memory the megakernel for render `mode` reserves for per-thread LOCAL
+// storage alone, at the instantiation this render will launch (`maxDepth` / `heroC` select
+// the same BDPT variant renderBdptCuda does). This is real VRAM and it is often gigabytes.
+// If the card cannot hold it, the driver silently spills it to host RAM over PCIe and the
+// kernel runs 2-3 orders of magnitude slower at 100% reported utilisation — see the comment
+// on the definition. Returns 0 for "unknown" (no device, or a mode with no megakernel).
+size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC);
+
 // Orderly CUDA teardown: synchronize any outstanding device work, then destroy the
 // primary context (cudaDeviceReset) while the process is still in a clean, quiescent
 // state. Call this once, at the very end of a successful (or failed) run, BEFORE the

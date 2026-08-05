@@ -154,6 +154,7 @@
 #include "curvedrive.h"         // -anim: loom CurveDrive JSON sidecar (E2 channel a) read/write
 #include "animlive.h"           // -anim -loom: the live editor<->loom value channel (E2 channel b)
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
+#include "denoise.h"            // -denoise: luma/chroma a-trous filter for MC speckle
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
                                // header also pulls it in, but CPU-only builds need it too
@@ -805,6 +806,159 @@ static int checkFog() {
     std::printf("[checkfog] HG mean cosine @g=%.2f: measured=%.4f  (%s)\n", g, mc, passB ? "ok" : "BAD");
     std::printf("[checkfog] HG sphere integral: %.5f (want 1)  (%s)\n", integ, passC ? "ok" : "BAD");
     std::printf("[checkfog] %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
+// Deterministic denoiser self-test (src/denoise.h). The filter is a post-pass on the
+// LINEAR image, so it is held to two properties that a renderer's numbers depend on and
+// that a purely visual check would never catch. Both were violated by earlier drafts:
+//
+//   (a) ENERGY. Total luminance out == total luminance in, exactly. The first draft used
+//       a plain bilateral gather, which is row-normalised but not column-normalised, and
+//       on the heavy-tailed distribution MC noise actually has that regressed every pixel
+//       toward the local MODE: it quietly ate 30% of a 120 spp gallery_rain frame.
+//   (b) FIXED POINT. A constant image must come back unchanged. The scatter that fixes
+//       (a) divides by the neighbour's weight sum, so any pixel whose taps were dropped
+//       at the image border hands out more than it holds and brightens the interior
+//       beside it — a flat grey test image came back with a bright frame around it.
+//
+// The two pull against each other (exact energy wants a column-stochastic operator, a
+// fixed point wants a row-stochastic one), and they are only satisfiable together
+// because the weights are symmetric, which makes the operator doubly stochastic. That
+// symmetry is fragile — whole-sample edge mirroring silently broke it and leaked 0.06% —
+// so it is worth a standing test rather than a one-off measurement.
+static int checkDenoise() {
+    bool pass = true;
+
+    // (a) The luma/chroma split must be exactly reversible. Chroma is stored as a ratio
+    // to luma, so this is checked across ~6 decades rather than at one exposure.
+    {
+        Pcg32 rng; rng.seed(0xDE0121Eu, 0x9E37u);
+        double worst = 0.0;
+        for (int t = 0; t < 200000; ++t) {
+            double s = std::pow(10.0, rng.uniform() * 6.0 - 3.0);
+            Vec3 c(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+            Vec3 r = denoise::fromYcc(denoise::toYcc(c));
+            worst = std::max({worst, std::fabs(r.x - c.x) / s, std::fabs(r.y - c.y) / s,
+                              std::fabs(r.z - c.z) / s});
+        }
+        bool ok = worst < 1e-12;
+        pass = pass && ok;
+        std::printf("[checkdenoise] YCC round trip: worst rel err %.2e  (%s)\n", worst,
+                    ok ? "ok" : "BAD");
+    }
+
+    // (b) Energy conservation and grain reduction on heavy-tailed saturated speckle over
+    // a structured background — the regime that broke the gather formulation.
+    {
+        const int W = 320, H = 180;
+        Pcg32 rng; rng.seed(0xDE0121Eu, 0x1234u);
+        std::vector<Vec3> img((size_t)W * H);
+        for (int j = 0; j < H; ++j) for (int i = 0; i < W; ++i) {
+            double base = (i > W / 2) ? 0.35 : 0.02;
+            double dx = (i - 90) / 18.0, dy = (j - 60) / 18.0;
+            base += 3.0 * std::exp(-(dx * dx + dy * dy));
+            double v = base * -std::log(std::max(rng.uniform(), 1e-12)); // Exp(1), mean 1
+            double h = rng.uniform();
+            Vec3 tint = h < 1.0 / 3 ? Vec3(3.0, 0.1, 0.1)
+                      : h < 2.0 / 3 ? Vec3(0.1, 3.0, 0.1) : Vec3(0.1, 0.1, 3.0);
+            img[(size_t)j * W + i] = tint * v;
+        }
+        auto totalLuma = [](const std::vector<Vec3>& v) {
+            double s = 0.0; for (const Vec3& c : v) s += denoise::lumaOf(c); return s;
+        };
+        auto localCV = [&](const std::vector<Vec3>& v) {
+            double acc = 0.0; int n = 0;
+            for (int j = 1; j < H - 1; ++j) for (int i = 1; i < W - 1; ++i) {
+                double m = 0, m2 = 0;
+                for (int dj = -1; dj <= 1; ++dj) for (int di = -1; di <= 1; ++di) {
+                    double y = denoise::lumaOf(v[(size_t)(j + dj) * W + (i + di)]);
+                    m += y; m2 += y * y;
+                }
+                m /= 9.0; m2 = m2 / 9.0 - m * m;
+                acc += std::sqrt(std::max(m2, 0.0)) / (m + 1e-9); ++n;
+            }
+            return n ? acc / n : 0.0;
+        };
+        const double before = totalLuma(img), cv0 = localCV(img);
+
+        // Default is chroma-only, so the luma cases have to opt in explicitly. Chroma
+        // carries no luminance, so the chroma-only rows test that the split leaks none.
+        denoise::Params pDef;
+        denoise::Params pStrong; pStrong.chroma *= 2.0;
+        denoise::Params pLuma;   pLuma.luma = 0.45; pLuma.chroma = 0.0;
+        denoise::Params pBoth;   pBoth.luma = 0.45;
+        denoise::Params pLevels; pLevels.levels = 3;
+        const struct { const char* name; const denoise::Params* p; } cases[] = {
+            {"chroma only", &pDef}, {"chroma x2", &pStrong}, {"luma only", &pLuma},
+            {"luma+chroma", &pBoth}, {"3 levels", &pLevels},
+        };
+        for (const auto& c : cases) {
+            std::vector<Vec3> out = img;
+            denoise::apply(out, W, H, *c.p);
+            double pct = totalLuma(out) / before * 100.0, cv = localCV(out);
+            bool ok = std::fabs(pct - 100.0) < 0.01;
+            pass = pass && ok;
+            std::printf("[checkdenoise] energy %-11s %10.6f%% of input, grain %.4f->%.4f"
+                        "  (%s)\n", c.name, pct, cv0, cv, ok ? "ok" : "BAD");
+        }
+        // The firefly clamp removes outlier energy deliberately, so it is bounded, not exact.
+        {
+            std::vector<Vec3> out = img;
+            denoise::Params pf; pf.fireflies = 3.0;
+            denoise::apply(out, W, H, pf);
+            double pct = totalLuma(out) / before * 100.0;
+            bool ok = pct > 55.0 && pct < 100.0;
+            pass = pass && ok;
+            std::printf("[checkdenoise] energy fireflies=3 %6.2f%% (lossy by design)  (%s)\n",
+                        pct, ok ? "ok" : "BAD");
+        }
+    }
+
+    // (c) Chroma-only filtering — the default — must leave luma BIT-IDENTICAL, per pixel,
+    // not merely conserved in total. This is what the luminance-preserving gamut
+    // projection in fromYcc buys: the obvious repair for an out-of-gamut filtered chroma
+    // is to clamp the negative channel at 0, but clamping adds light, so it would break
+    // this invariant on exactly the saturated speckle the filter exists to clean up.
+    {
+        const int W = 96, H = 72;
+        Pcg32 rng; rng.seed(0xDE0121Eu, 0xC0DEu);
+        std::vector<Vec3> img((size_t)W * H);
+        for (size_t i = 0; i < img.size(); ++i) {
+            double v = -std::log(std::max(rng.uniform(), 1e-12));
+            double h = rng.uniform();
+            // Includes fully saturated primaries, which are the out-of-gamut hazard.
+            img[i] = (h < 1.0 / 3 ? Vec3(1, 0, 0) : h < 2.0 / 3 ? Vec3(0, 1, 0) : Vec3(0, 0, 1)) * v;
+        }
+        std::vector<Vec3> out = img;
+        denoise::apply(out, W, H, denoise::Params{});   // default = chroma only
+        double worst = 0.0;
+        for (size_t i = 0; i < img.size(); ++i) {
+            double a = denoise::lumaOf(img[i]), b = denoise::lumaOf(out[i]);
+            worst = std::max(worst, std::fabs(a - b) / (a + 1e-12));
+        }
+        bool ok = worst < 1e-9;
+        pass = pass && ok;
+        std::printf("[checkdenoise] chroma-only leaves luma: worst rel change %.2e  (%s)\n",
+                    worst, ok ? "ok" : "BAD");
+    }
+
+    // (d) A constant image is a fixed point, including at the borders.
+    {
+        const int W = 64, H = 64;
+        std::vector<Vec3> img((size_t)W * H, Vec3(0.3, 0.5, 0.7));
+        denoise::apply(img, W, H, denoise::Params{});
+        double worst = 0.0;
+        for (const Vec3& c : img)
+            worst = std::max({worst, std::fabs(c.x - 0.3), std::fabs(c.y - 0.5),
+                              std::fabs(c.z - 0.7)});
+        bool ok = worst < 1e-9;
+        pass = pass && ok;
+        std::printf("[checkdenoise] constant image: worst deviation %.2e  (%s)\n", worst,
+                    ok ? "ok" : "BAD");
+    }
+
+    std::printf("[checkdenoise] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
 
@@ -2643,23 +2797,44 @@ static int checkSun() {
 // and iso/shutter/exposure give exact photographic stops on top.
 constexpr double ABS_EXPOSURE_GAIN = 6.0;
 
+// -denoise: post-render speckle filter (src/denoise.h). Off unless the flag is given.
+// It runs inside filmToRgb8, which is the ONE place both the written image and the live
+// preview window get their pixels, so what the window shows stays what the file gets.
+static bool           g_denoise = false;
+static denoise::Params g_denoiseParams;
+
 // Tone-map a film into an 8-bit RGB buffer (W*H*3, row 0 = image top; +y flipped to
 // image-top to match writeImage). Shared by writeFilm (PNG/PPM output) and the live
 // preview window so both see identical pixels. Auto-exposure mirrors writeFilm:
 // absolute EV uses a fixed sensor gain; otherwise a p99 anchor (locked via lockAnchor
 // if non-null, else recomputed per frame). Optionally reports the chosen gain/exposure.
+// The film reduced to scene-linear sRGB-primary radiance, denoised but NOT exposed,
+// gamma-encoded or clamped. This is the buffer the 8-bit tone map starts from and the
+// buffer `-hdr` writes out; sharing it is what keeps the PFM sidecar an exact record of
+// the PNG's input rather than a second, subtly different reduction of the same film.
+static std::vector<Vec3> filmToLinear(const Film& f, double N) {
+    const int W = f.resX, H = f.resY;
+    std::vector<Vec3> lin((size_t)W * H);
+    double norm = 1.0 / (N * cieYIntegral());
+    for (size_t i = 0; i < lin.size(); ++i)
+        lin[i] = xyzToLinearSrgb(f.xyz[i] * norm);
+    // Denoise BEFORE the auto-exposure anchor is measured, not after: the p99 anchor is
+    // an order statistic over the luminances, so leaving the fireflies in would let a
+    // handful of lucky paths set the exposure for the whole image and darken everything
+    // else to compensate. Filtering first makes the anchor describe the picture.
+    if (g_denoise) denoise::apply(lin, W, H, g_denoiseParams);
+    return lin;
+}
+
 static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
                                        bool absolute, double* lockAnchor,
                                        double* outEAuto = nullptr,
                                        double* outExposure = nullptr) {
     const int W = f.resX, H = f.resY;
-    std::vector<Vec3> lin((size_t)W * H);
-    double norm = 1.0 / (N * cieYIntegral());
+    std::vector<Vec3> lin = filmToLinear(f, N);
     std::vector<double> lum; lum.reserve((size_t)W * H);
-    for (size_t i = 0; i < lin.size(); ++i) {
-        lin[i] = xyzToLinearSrgb(f.xyz[i] * norm);
+    for (size_t i = 0; i < lin.size(); ++i)
         lum.push_back(std::max({lin[i].x, lin[i].y, lin[i].z, 0.0}));
-    }
     double eAuto;
     double exposure;
     if (absolute) {
@@ -2694,6 +2869,53 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
     return img;
 }
 
+// -hdr: also write a 32-bit float PFM sidecar beside -o. Off unless the flag is given.
+//
+// WHY THIS EXISTS. A PNG is 8-bit sRGB with a hard clamp, so every value at or above the
+// clip point prints as the same #FFFFFF and its COLOUR is gone with it — the three
+// channels are literally equal. That is fatal for measuring a caustic, which is by
+// definition the brightest thing in frame: metering caustic hue or a peak-to-screen ratio
+// off a PNG silently reports the tone map's opinion instead of the render's. (Measured:
+// in gallery_rain 596 of the 22639 pixels of one cap were pure white, more than half the
+// caustic's area, so its "colour" read as white no matter what the optics did.) The PFM
+// records the same linear buffer the tone map consumes, before exposure and before the
+// clamp, so ratios and chromaticity come out exact.
+static bool g_writeHdr = false;
+
+// Write scene-linear RGB as a binary PFM (Portable Float Map): a three-line ASCII header
+// then raw little-endian float32 triples. PFM's raster order is left-to-right,
+// BOTTOM-to-top, which is exactly the film's own row order — so unlike the 8-bit path
+// this needs no vertical flip. Values are radiance in the film's own scale (post-denoise,
+// pre-exposure): the useful measurements off it — peak-to-median ratios, chromaticity —
+// are all exposure-invariant, so leaving the gain out keeps two renders comparable even
+// when they were shot at different stops.
+static bool writePfm(const std::string& path, int W, int H, const std::vector<Vec3>& lin) {
+    std::ofstream fo(path, std::ios::binary);
+    if (!fo) return false;
+    fo << "PF\n" << W << ' ' << H << "\n-1.0\n";   // negative scale = little-endian
+    std::vector<float> row((size_t)W * 3);
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            const Vec3& c = lin[(size_t)y * W + x];
+            row[(size_t)x * 3 + 0] = (float)c.x;
+            row[(size_t)x * 3 + 1] = (float)c.y;
+            row[(size_t)x * 3 + 2] = (float)c.z;
+        }
+        fo.write((const char*)row.data(), (std::streamsize)(row.size() * sizeof(float)));
+    }
+    return (bool)fo;
+}
+
+// `<path>` with its extension replaced by `.pfm` (appended if it has none), so the sidecar
+// lands beside the image and inherits any per-frame numbering a camera_path gave it.
+static std::string pfmPathFor(const std::string& path) {
+    size_t dot = path.find_last_of('.');
+    size_t sep = path.find_last_of("/\\");
+    if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
+        return path + ".pfm";
+    return path.substr(0, dot) + ".pfm";
+}
+
 // Returns true on success, false if the image encoder failed. Callers that own the
 // process exit code should propagate a non-zero status on false. (GPU renders that
 // fail — driver TDR, device-memory/scheduling contention — are now caught at the
@@ -2710,6 +2932,17 @@ static bool writeFilm(const char* path, const Film& f, double N, double expComp 
     if (!writeImage(path, W, H, img)) {
         std::fprintf(stderr, "error: could not write %s\n", path);
         return false;
+    }
+    // The HDR sidecar is written from the same linear buffer the tone map just consumed,
+    // so it always matches the PNG that was written a line ago -- including on the
+    // periodic in-progress writes, which is what makes it usable for metering a render
+    // that is still converging.
+    if (g_writeHdr) {
+        std::string hp = pfmPathFor(path);
+        if (!writePfm(hp, W, H, filmToLinear(f, N)))
+            std::fprintf(stderr, "warning: could not write %s\n", hp.c_str());
+        else if (!quiet)
+            std::printf("wrote %s (%dx%d, 32-bit float, scene-linear)\n", hp.c_str(), W, H);
     }
     if (quiet) return true;
     if (absolute)
@@ -4650,6 +4883,72 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #endif
     }
 
+#ifdef HAVE_CUDA
+    // ---- device-memory preflight (see cudaMegakernelLocalBytes) ----------------------
+    // Having decided WHICH device can run this scene, check whether the card can still
+    // afford to. Every megakernel here launches a fixed 2048x128 grid, and its per-thread
+    // local storage is real VRAM measured in gigabytes; if the card is already full because
+    // some UNRELATED process on the machine took it, the driver does not fail the launch,
+    // it backs the spill with host memory over PCIe. The render then crawls by 2-3 orders
+    // of magnitude at 100% reported GPU utilisation, and because every poll of `-interval`,
+    // `-time` and `-stop` happens between chunks, none of them ever gets a turn: the render
+    // looks hung, writes nothing, and cannot be stopped except by killing it.
+    //
+    // That is a miserable thing to debug from the outside (it cost a full session once), and
+    // the CPU path — merely slow — is strictly better than a GPU path that is 1000x slow.
+    // So: measure, and say exactly what is wrong and who to blame.
+    if (useGpu) {
+        const int hero = (mode == 'D') ? g_heroC : 1;
+        const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
+        size_t needLocal = cudaMegakernelLocalBytes(mode, mdep, hero);
+        size_t freeB = 0, totalB = 0;
+        if (cudaMemInfo(&freeB, &totalB)) {
+            // Headroom on top of the local-memory reservation for the scene upload, the
+            // film buffers and the driver's own context. The film pair is known exactly
+            // (two double3 images); 256 MB covers the rest with room to spare.
+            const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2;
+            const size_t needAll = needLocal + film + (size_t)256 * 1024 * 1024;
+            const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
+            // Always say what the card looks like. This one line is what turns "the render
+            // is mysteriously hung" into "something else is holding 20 of my 24 GB", which
+            // is otherwise only visible from outside the process (nvidia-smi reports it as
+            // 100% busy either way, and per-process VRAM is N/A under WDDM).
+            std::printf("[vram] %.2f GB free of %.2f GB on %s; mode-%c kernel wants "
+                        "%.2f GB local + %.2f GB film/scene/context\n",
+                        freeB * toGB, totalB * toGB, cudaDeviceName(), mode,
+                        needLocal * toGB, (needAll - needLocal) * toGB);
+            // Fall back on either signal: the explicit budget, or a card so nearly full
+            // that whatever we failed to account for will certainly not fit.
+            //
+            // CAVEAT, measured: this test is WEAK on Windows. Under WDDM the driver
+            // overcommits and pages rather than failing, so cudaMemGetInfo happily reports
+            // gigabytes "free" on a card nvidia-smi shows at 96% used — in the case that
+            // motivated all of this it did not trip at all. Treat a trip as conclusive, but
+            // NOT tripping as meaningless. The reliable detector is the runtime one:
+            // gpuSppChunks' stall watchdog, which measures the chunk that is actually in
+            // flight and can therefore see contention this query is blind to.
+            const bool tooTight = freeB < needAll;
+            const bool nearFull = totalB && (double)freeB < 0.12 * (double)totalB;
+            if (tooTight || nearFull) {
+                std::fprintf(stderr,
+                    "[device] NOT ENOUGH FREE VRAM for the GPU path (%s): the mode-%c "
+                    "megakernel reserves %.2f GB of per-thread local memory (+%.2f GB "
+                    "film/scene/context) but only %.2f GB of %.2f GB is free on %s.\n"
+                    "[device] Some other process on this machine is holding the card. Running "
+                    "on the GPU anyway would spill that local memory to host RAM over PCIe and "
+                    "render 100-1000x slower at 100%% reported GPU load, with -interval, -time "
+                    "and -stop all inert. Using the CPU instead (-device gpu forces the GPU).\n",
+                    tooTight ? "over budget" : "card is >88% full",
+                    mode, needLocal * toGB, (needAll - needLocal) * toGB,
+                    freeB * toGB, totalB * toGB, cudaDeviceName());
+                if (!wantGpu) useGpu = false;      // `auto`: fall back, which is the whole point
+                else std::fprintf(stderr, "[device] -device gpu given explicitly; proceeding "
+                                          "anyway. Expect the render to appear hung.\n");
+            }
+        }
+    }
+#endif
+
     // Now that the device is resolved, warn if this render's BACKWARD layer will actually
     // run on the CPU tracer, which collapses `scene.media` to `backwardMedium()` (see the
     // `mediaNeedForward` computation above). The GPU backward megakernel superposes the
@@ -5595,6 +5894,9 @@ static void printHelp(const char* prog) {
 "  -view EX,EY,EZ/LX,LY,LZ[/FOV]   ad-hoc eye/look-at[/fovY] camera; renders just it\n"
 "  -exposure|-ev <c>     override every camera's exposure compensation\n"
 "  -exposure-lock        one shared auto-exposure anchor across all rendered cameras\n"
+"  -hdr                  also write a 32-bit float PFM beside -o (scene-linear, no\n"
+"                        exposure/gamma/clamp) so highlights stay measurable — a PNG\n"
+"                        clips every caustic core to the same white and loses its colour\n"
 "\n"
 "Render mode & budget:\n"
 "  -mode <letter>        transport mode (default B; A/B/C forward, R/V/D backward — see README)\n"
@@ -5659,6 +5961,25 @@ static void printHelp(const char* prog) {
 "                        Keep it ABOVE -ambient: the clamp also caps the far-field tail an\n"
 "                        escaping gather ray returns, so the gather's fill is effectively\n"
 "                        min(-ambient, x) and a smaller x just darkens the whole scene\n"
+"\n"
+"Denoising (post-pass on the linear image; affects the file AND the live window):\n"
+"  -denoise [amount]     edge-aware a-trous filter for SPECTRAL speckle. CHROMA ONLY by\n"
+"                        default: luma is left bit-identical, so no detail is lost. MC\n"
+"                        colour noise is mostly chroma and the eye barely resolves chroma\n"
+"                        detail, so this removes the rainbow confetti in dispersive\n"
+"                        caustics / media (where the hero-wavelength bundle is unavailable\n"
+"                        and every path is single-lambda) while keeping every edge. Costs\n"
+"                        ~1%% of render time. amount scales the chroma tolerance, default 1\n"
+"  -denoise-chroma <x>   chroma edge-stop tolerance in local sigma (default 2). Lower it\n"
+"                        to protect real rainbow fringing; raise it to kill more speckle\n"
+"  -denoise-luma <x>     ALSO filter luma, tolerance in local sigma (default 0 = off).\n"
+"                        Measured against a converged reference this makes the image\n"
+"                        WORSE (-2.4 dB at 0.45): it cannot tell a wire or caustic rim\n"
+"                        from a noise spike. Only for stills you want smoothed, not truer\n"
+"  -denoise-levels <n>   a-trous levels, support is 2^n wide (default 3, max 8). Measured\n"
+"                        optimum is 2-3; by 7 the chroma bleed costs more than it removes\n"
+"  -fireflies <k>        clamp isolated outliers to k x the 2nd-brightest neighbour\n"
+"                        (hue preserved). Implies -denoise. Try 2-4. 0 = off (default)\n"
 "\n"
 "Output, preview & checkpointing:\n"
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
@@ -5794,6 +6115,7 @@ static int run(int argc, char** argv) {
     double fogG = 0.0;        // Henyey-Greenstein anisotropy
     bool fogRayleigh = false; // wavelength-dependent scattering ~1/lambda^4
     bool checkFogOnly = false;
+    bool checkDenoiseOnly = false;
     double filmThickness = 300.0; // thin-film coating thickness (nm) for -scene iridescent
     double filmIor = 1.30;        // thin-film coating refractive index
     bool checkThinFilmOnly = false;
@@ -6071,6 +6393,37 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-gi-clamp") && i + 1 < argc) {
             g_giClamp = std::max(0.0, std::atof(argv[++i]));
         }
+        // -denoise [amount]: the optional amount scales BOTH tolerances, so `-denoise 2`
+        // is twice as aggressive and `-denoise 0.5` half. The argument is optional, so
+        // only consume the next token if it actually parses as a number — otherwise
+        // `-denoise -o out.png` would silently eat the output path.
+        else if (!std::strcmp(argv[i], "-denoise")) {
+            g_denoise = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                char* end = nullptr;
+                double a = std::strtod(argv[i + 1], &end);
+                // The optional multiplier scales the tolerance that is actually ON by
+                // default, which is chroma; luma stays off unless -denoise-luma asks.
+                if (end && *end == '\0' && a > 0.0) { ++i; g_denoiseParams.chroma *= a; }
+            }
+        }
+        else if (!std::strcmp(argv[i], "-hdr")) g_writeHdr = true;
+        else if (!std::strcmp(argv[i], "-denoise-chroma") && i + 1 < argc) {
+            g_denoise = true;
+            g_denoiseParams.chroma = std::max(0.0, std::atof(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-denoise-luma") && i + 1 < argc) {
+            g_denoise = true;
+            g_denoiseParams.luma = std::max(0.0, std::atof(argv[++i]));
+        }
+        else if (!std::strcmp(argv[i], "-denoise-levels") && i + 1 < argc) {
+            g_denoise = true;
+            g_denoiseParams.levels = std::clamp(std::atoi(argv[++i]), 1, 8);
+        }
+        else if (!std::strcmp(argv[i], "-fireflies") && i + 1 < argc) {
+            g_denoise = true;
+            g_denoiseParams.fireflies = std::max(0.0, std::atof(argv[++i]));
+        }
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         // An explicit absolute radius pins the radius: don't then adapt it out from under
         // the user (this was the documented workaround for mode M's scaling problem).
@@ -6140,6 +6493,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-fogg") && i + 1 < argc) fogG = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-fograyleigh")) fogRayleigh = true;
         else if (!std::strcmp(argv[i], "-checkfog")) checkFogOnly = true;
+        else if (!std::strcmp(argv[i], "-checkdenoise")) checkDenoiseOnly = true;
         else if (!std::strcmp(argv[i], "-filmthickness") && i + 1 < argc) filmThickness = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-filmior") && i + 1 < argc) filmIor = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkthinfilm")) checkThinFilmOnly = true;
@@ -6316,6 +6670,7 @@ static int run(int argc, char** argv) {
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
+    if (checkDenoiseOnly)  return checkDenoise();  // deterministic, no scene needed
     if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed
     if (checkMultilayerOnly) return checkMultilayer(); // deterministic, no scene needed
     if (thinFilmSwatchOnly) { thinFilmSwatch(filmIor, 1.5); return 0; } // visual diagnostic
@@ -6723,7 +7078,8 @@ static int run(int argc, char** argv) {
         return camMode ? camMode : mode;      // else per-camera, else the global default
     };
     struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup;
-                       Vec3 lookAt{0,0,0}; Vec3 up{0,1,0}; double fovY = 40.0; };  // lookAt/up/fovY: for the interactive raster viewer
+                       Vec3 lookAt{0,0,0}; Vec3 up{0,1,0}; double fovY = 40.0;   // lookAt/up/fovY: for the interactive raster viewer
+                       std::string pathBase; };  // owning camera_path/orbit/curve base name ("" = standalone camera)
     std::vector<RenderCam> toRender;
 
     // Raster previews are cheap to compute, so unless the user pinned a size with -r,
@@ -6932,7 +7288,8 @@ static int run(int argc, char** argv) {
                 cmode = applyUnsupportedPolicy(scene, cmode, cs->projection, cs->name.c_str(), proceed);
                 if (!proceed) return 1;
             }
-            toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov});
+            toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov,
+                                cs->pathBase});
         }
     } else {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
@@ -6990,12 +7347,39 @@ static int run(int argc, char** argv) {
 
     // Output naming: a single camera writes to `out`; several cameras write one file
     // each, inserting `_<name>` before the extension (so out=r.ppm -> r_hero.ppm).
+    //
+    // A CAMERA PATH GETS ITS OWN SUBDIRECTORY. When two or more frames of the same
+    // `camera_path`/`orbit`/`camera_curve` are being rendered, they go to
+    // `<stem>_<pathbase>/<leaf>_<frame>.<ext>` instead of becoming siblings of `-o`:
+    //     -o png/rain.png, path "fly"  ->  png/rain_fly/rain_fly000.png, ...
+    // Previously a 600-frame flyby dumped 1800 loose files (png/rain_fly000.png +
+    // .pfm + .ftbuf) into the same directory as the still, burying it. A single frame
+    // of a path (`-camera fly042`) is a one-off and stays beside `-o`, as does any
+    // standalone `camera`, so only an actual series creates a directory.
     auto outFor = [&](const std::string& name) -> std::string {
         if (toRender.size() <= 1 || name.empty()) return out;
         std::string base = out;
         auto dot = base.find_last_of('.');
         std::string stem = (dot == std::string::npos) ? base : base.substr(0, dot);
         std::string ext  = (dot == std::string::npos) ? std::string(".ppm") : base.substr(dot);
+
+        // The owning path of this camera, and how many frames of it we are rendering.
+        // (Stereo eye copies inherit pathBase, so a stereo flyby subdirs correctly too.)
+        std::string pb;
+        for (const RenderCam& rc : toRender)
+            if (rc.name == name) { pb = rc.pathBase; break; }
+        if (!pb.empty()) {
+            size_t nInPath = 0;
+            for (const RenderCam& rc : toRender) if (rc.pathBase == pb) ++nInPath;
+            if (nInPath > 1) {
+                std::string dir = stem + "_" + pb;
+                auto slash = stem.find_last_of("/\\");
+                std::string leaf = (slash == std::string::npos) ? stem : stem.substr(slash + 1);
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);   // harmless if it exists
+                return dir + "/" + leaf + "_" + name + ext;
+            }
+        }
         return stem + "_" + name + ext;
     };
 
@@ -9835,11 +10219,27 @@ static int run(int argc, char** argv) {
     };
     runSharedPhotonMap(groupM);
 
-    for (int i : restIdx) {
+    for (size_t ri = 0; ri < restIdx.size(); ++ri) {
+        const int i = restIdx[ri];
+        // Poll the interrupt BETWEEN frames, exactly as the mode-M loop above does. A stop
+        // request (Ctrl-C, window close, or `ftrace -stop <pid>`) means "stop the RUN", not
+        // "stop this frame": without this break a multi-camera batch kept marching, and since
+        // every subsequent runRender() sees the flag already set it returned immediately at
+        // ~0 spp, so the batch sprayed out near-black frames at several per second and
+        // `-stop` could never retire it (the caller then force-kills, which is exactly what
+        // -stop exists to avoid). Announce the abandoned frames so the truncation is visible.
+        if (g_stopRequested) {
+            const size_t left = restIdx.size() - ri;
+            if (toRender.size() > 1)
+                std::printf("[stop] stopping the batch: %zu of %zu camera%s not rendered.\n",
+                            left, restIdx.size(), restIdx.size() == 1 ? "" : "s");
+            break;
+        }
         const RenderCam& rc = toRender[i];
         if (toRender.size() > 1)
-            std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s\n",
-                        rc.name.c_str(), rc.mode, rc.res, rc.resY, outFor(rc.name).c_str());
+            std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s  [%zu/%zu]\n",
+                        rc.name.c_str(), rc.mode, rc.res, rc.resY, outFor(rc.name).c_str(),
+                        ri + 1, restIdx.size());
         double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, rc.resY, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
