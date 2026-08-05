@@ -8020,7 +8020,7 @@ in the same commit. They have real interdependencies (`_gemsweep` and `_capchrom
 Logged rather than done because renaming the paths that every measured table cites is a change
 that wants to be its own commit, not a rider on a scene tweak.
 
-## OPEN (metrology, 2026-08-04): `-fireflies 3` does not always clear the gem rig's peak, so `peak` alone can be nonsense
+## FIXED (2026-08-05): `-fireflies 3` does not always clear the gem rig's peak, so `peak` alone can be nonsense
 
 While sweeping crown angles for the axicon's girdle (`scraps/_gemsweep.py piece gcone0.08/20/0.60
 0.65`, SF10, 480 px / 600 spp, `-hdr -fireflies 3`) the rig printed:
@@ -8047,6 +8047,55 @@ immune to a single spike by construction. `measure()` already builds the downsam
 so this is a two-line change; the reason it is logged rather than done is that changing the
 statistic silently invalidates every `peak` in `design.md`, so the fix has to re-run the tables
 in the same change.
+
+**FIXED (2026-08-05)** — and the delay above turned out to be the expensive part, because the
+half-fix that landed in between was in one specific way worse than doing nothing.
+
+What was added first was a cell-level spike test: compare each 4×-box cell with its
+*second-brightest* neighbour and drop it if it stands more than `GEMSPIKE` (8) times above that,
+on the principle written down in the rig itself — **a caustic is never isolated**, because it is
+the image of a continuous wavefront, whereas a firefly is one cell with ordinary cap all round
+it. That test works. But it was applied **only to the box-averaged cell luminance**, while
+`peak` kept being read from `c[3]`, the brightest **raw** pixel in the block. A 4× box dilutes a
+single-pixel spike 16-fold, so a firefly big enough to dominate `peak` can sit comfortably under
+the 8× cell threshold, pass, and still set the headline number. The rig now looked defended,
+which is why the next false reading was believed rather than double-checked.
+
+That is not hypothetical — it produced a wrong answer that was nearly acted on. Sweeping the
+`fin` clip (the vertical-plate gyroid) the rig printed:
+
+```
+fin10/0.125 drop 0.90  peak 84.34x  coverage 0.67%  sat 0.298  spread 0.437  fan 0.46
+```
+
+which reads as by far the best rainbow in the whole gem programme — `spread` 0.437 against a
+0.006 noise floor. Histogramming the raw `.pfm` showed exactly **two** pixels in 480×480 above
+5× the median (at 85× and 1115×), everything else topping out near 2×. Two samples.
+
+The fix runs the identical second-brightest-neighbour test a second time keyed on the raw `hot`
+value, and takes the **union** of the two spike sets — union rather than a peak-only filter,
+because a 1000× pixel is still +60× on the 16-pixel mean it lands in, which is plenty to move
+`sat` and `spread` as well. That row now re-meters to `peak 2.22x / sat 0.180 / spread 0.009`
+with 2 spike cells dropped.
+
+The condition attached above — "the fix has to re-run the tables in the same change" — was met
+without re-rendering anything, because `_remeter.py` re-scores the `.pfm` sidecars already on
+disk. **Every published number survived unchanged**, which is the useful part of the result:
+
+- the sphere control `solid10_090` still meters `peak 3.25× / sat 0.196 / spread 0.060`, now
+  annotated `[4 spike cells dropped]` — the cell test had already been catching its fireflies,
+  so the box-vs-sphere adjudication in `design.md` and commit `2dc798e` stands;
+- the shipped box `slab10_0_3125_050` still meters `peak 8.43× / cov 0.19% / sat 0.216 /
+  spread 0.018`, with **zero** spikes dropped — that peak is a real caustic cusp, and its raw
+  top ten (4.7 4.9 5.0 5.5 5.8 6.2 6.4 6.6 7.8 8.4) is the smooth gradient a caustic makes,
+  as against the sphere's raw top ten (86 96 118 149 288 440 659 669 758 1181), which is not;
+- of the eleven `fin` rows, only the one above moved at all.
+
+Standing lesson, worth more than the fix: **an outlier filter has to be applied to the same
+array as the statistic it is protecting.** The cell test and the `peak` statistic were computed
+from different data — averaged cells versus raw pixels — so the filter was correct, and the
+number it was meant to guard was still completely unguarded. When adding a robustness test,
+check every reported statistic for which array it actually reads.
 
 ## OPEN (2026-08-04): a quad's emission is invisible from the side its winding faces away from
 

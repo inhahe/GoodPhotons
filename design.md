@@ -1656,6 +1656,38 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       otherwise formulaic radial spread plus a 0.25 m re-centring of the exhibit's cap — the
       only direction with any room, since −z runs the flyby into the piece (clearance
       0.252 → 0.037 m) and moving the axicon instead throws it off the left edge of the frame.
+    - **…but thickness was the wrong variable. What actually sets a gyroid's caustic is the
+      piece's VERTICAL EXTENT, and the winning body is a small UPRIGHT PLATE.** The table above
+      swept one degree of freedom (how thick a 1 m-square pancake is) and read the answer as
+      "thicker focuses better". Re-cutting the same solid as a plate standing on edge —
+      horizontal : depth : vertical = 1 : *f* : 1 — shows what that sweep was really measuring.
+      At 480 px / 600 spp, cut 1.2× cap, spike rejection on (raw-pixel *and* cell), each at the
+      best drop of its own sweep:
+
+      | body (h × d × v) | drop | coverage | sat | spread | peak |
+      |---|---|---|---|---|---|
+      | sphere r = 0.50 | 0.90 | 0.35 % | 0.196 | 0.014 | 3.25× |
+      | pancake 1 × 1 × 0.625 *(was shipped)* | 0.50 | 0.15 % | 0.205 | 0.009 | 6.07× |
+      | upright 1 : 5⁄16 : 1, **1.000 m** | 0.70 | 0.04 % | 0.200 | 0.021 | 4.60× |
+      | upright 1 : 5⁄16 : 1, **0.875 m** | 0.58 | **1.12 %** | 0.197 | 0.014 | 4.15× |
+      | upright 1 : 5⁄16 : 1, **0.750 m** | 0.51 | 0.88 % | 0.209 | 0.020 | 7.46× |
+      | **upright 1 : 5⁄16 : 1, 0.625 m** *(shipped)* | 0.45 | 0.65 % | **0.212** | 0.019 | **13.81×** |
+
+      Two things fall out. First, **the proportion is not what matters — the size is.** Hold the
+      1 : 5⁄16 : 1 shape fixed and shrink it and `peak` climbs monotonically to 13.81×, while the
+      *full-size* version of the very same shape is the worst row in the table (coverage 0.04 %,
+      a twentieth of its own 0.625 m sibling). Under a near-overhead sun it is the **vertical**
+      dimension that sets how much network a ray traverses, and ~0.625 m is where that path
+      focuses; 1.0 m over-diffuses. Second, **at equal path length the upright plate still beats
+      the pancake** — 2.3× the peak and 4.3× the coverage, on a plan aperture a *twentieth* the
+      size — because a pancake presents parallel faces square to the beam, so only the network
+      does any work, whereas a plate turns that network's output out through its perpendicular
+      side faces. The optimum is a plateau, not a spike (*f* = 0.25…0.375 and drop 0.35…0.45 all
+      give peak 10–14×), so it is robust; *f* = 0.1875 and *f* ≥ 0.5 both fall off to ~3.5–5×.
+      The cost is **size**: at k = 10 the cell is 0.63 m, so the shipped plate is exactly one unit
+      cell square and under a third of a cell thick — it reads as a single cell seen edge-on
+      rather than as a block of lattice. The 0.750 m row is the documented fallback if that ever
+      reads too small, since it still beats the pancake on peak *and* coverage.
     - **Beware ranking pieces across resolutions.** `coverage` is a cell count and is
       resolution-stable (the solid gyroid: 0.35 % at 480 px, 0.37 % at 960 px), but `spread` is
       **not** — same piece, 0.014 at 480 px against 0.060 at 960 px — because it is computed
