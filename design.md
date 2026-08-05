@@ -1621,6 +1621,41 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       Above 1.5× everything except the orb and the solid gyroids goes to *zero*. The Klein
       bottle cannot be rescued at all: a 2.4 mm wall is optically a window, and making it
       solid would destroy the internal tube that is the piece's whole point.
+    - **The clip shape is an optical component, and for the solid gyroid a THICK BOX beats the
+      sphere on brightness while losing on rainbow.** `contained_by` seals a clip with the
+      piece's own material, so the clip is not a mask — it is the piece's outer refracting
+      envelope. A sphere clip therefore leaves a curved lens surface; a box clip caps the solid
+      with flat *parallel* faces, and a plane-parallel plate displaces a beam but cannot
+      converge one. That predicts the box should simply lose, and at one quarter thickness it
+      does. It is wrong for thick boxes, because the focusing is not done by the cap at all but
+      by the **depth of network behind it**. Swept over thickness at 960 px / 1200 spp, cut
+      1.2× cap, spike rejection on, each at the best drop of its own sweep:
+
+      | clip (half-extents 0.50 × hy × 0.50) | coverage | sat | spread | peak | fan |
+      |---|---|---|---|---|---|
+      | sphere r = 0.50, drop 0.90 | 0.37 % | 0.196 | **0.060** | 3.25× | 0.18 |
+      | box 1 : ¼ : 1, drop 0.50 | **0.55 %** | 0.177 | 0.008 | 2.92× | 0.04 |
+      | **box 1 : ⅝ : 1, drop 0.50** *(shipped)* | 0.19 % | **0.216** | 0.018 | **8.43×** | 0.13 |
+      | box 1 : ¾ : 1, drop 0.50 | 0.14 % | 0.190 | 0.012 | 6.86× | 0.20 |
+
+      Thickness trades **area for concentration, monotonically**. The thin slab covers more cap
+      than the ball but all of it is wash — `spread` 0.008 is barely off the 0.003 speckle floor
+      and `fan` 0.04 is nothing — and at k = 10 the cell is 0.63 m, so a ¼ box is 0.4 of *one*
+      cell thick and renders as a perforated plate with big round through-holes that stops
+      reading as a lattice. Both problems close by hy ≈ 0.25. At ⅝ the box has 2.6× the ball's
+      peak and beats it on saturation in half the area, but **no box on the curve reaches the
+      ball's chromatic spread**. `gallery_rain` ships the ⅝ box: the wide-rainbow role there is
+      filled far better by the axicon (spread 0.211, fan 0.51) than any gyroid could, the room
+      already has a *spherical* gyroid in gold, and a slab buys silhouette variety on top.
+      Moving the clip also moves the `function`'s `translate` — the lattice phase is anchored at
+      the piece centre, and 0.40 m is 0.64 of a period.
+    - **Beware ranking pieces across resolutions.** `coverage` is a cell count and is
+      resolution-stable (the solid gyroid: 0.35 % at 480 px, 0.37 % at 960 px), but `spread` is
+      **not** — same piece, 0.014 at 480 px against 0.060 at 960 px — because it is computed
+      over whichever cells clear the threshold, and how many that is depends on resolution. The
+      box/sphere ranking on `spread` *inverts* between 480 px and 960 px. Rank at one
+      resolution or not at all; the proper fix (meter at a fixed world-space cell size) is
+      logged in `known-issues.md`.
     - **Brightness and colour are separate properties, and the shape that gives both is a
       cone.** A caustic is *bright* because a surface **converges** light and *coloured*
       because it disperses light **sideways**, and the two normally exclude each other. A ball
@@ -1681,6 +1716,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       facets read 0.11–0.14 % coverage on a ~0.20 × 0.03 m sliver (1/220th the smooth cone's
       patch) at a third of the peak, none with enough cells to `fan`-test, because sampling the
       ring focus at *n* discrete azimuths instead of continuously collapses it.
+    - **An axicon's SIZE is a rainbow knob, and unusually it costs nothing in saturation.** A
+      bigger aperture normally buys a brighter, *whiter* patch. An axicon's does not, because
+      it has no focal point: the cusps land at a distance that scales with the piece, so
+      growing it simply pushes the wavelengths apart that were previously landing on top of
+      each other. Sweeping the half-height *h* (top radius 2*h*) in SF10 at drop 0.65, 480 px,
+      cut 1.2× cap — one resolution, so these rank only against each other:
+
+      | *h* | top radius | coverage | sat | **spread** | **fan** | patch x × z |
+      |---|---|---|---|---|---|---|
+      | 0.28 *(shipped)* | 0.56 | **0.56 %** | 0.327 | 0.107 | 0.65 | 1.43 × 0.44 |
+      | 0.40 | 0.80 | 0.29 % | **0.527** | 0.128 | **0.76** | 1.93 × 0.47 |
+      | 0.52 | 1.04 | 0.60 % | 0.445 | **0.172** | 0.44 | 2.48 × 1.90 |
+
+      `spread` rises monotonically with size and `sat` rises with it too; *h* = 0.40 is the most
+      **organised** colour measured anywhere in `gallery_rain` (fan 0.76), and *h* = 0.52 the
+      widest rainbow, with `fan` falling to 0.44 only because the two cusps grow into each
+      other. **The shipped size is the layout optimum, not the optical one** — *h* = 0.52 is a
+      2.08 m piece, larger than anything else in the room, throwing a patch bigger than its own
+      1.8 × 1.7 m cap. Growing an axicon means re-siting and re-capping it.
     - **The axicon is cut from DENSE FLINT, not crystal, and it is the only piece that is.**
       What splays a caustic across the spectrum is the Abbe number: `glass:SF10` (V_d 28.5)
       splays 1.5× as far as `glass:crystal`/F2 (36.3). The orb and the gyroid keep crystal —

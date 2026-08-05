@@ -559,14 +559,18 @@ isosurface "stand_diamond" {   # tall thin jewel-column, cap top y=0.85
 }
 isosurface "stand_diamond_cap" { material capmarble_gyroidx
     uv planar axis=y
-    # The second CANTILEVERED cap, and the bigger one. Raising the gyroid to y=1.75 (see the
-    # piece below) puts 0.90 m of drop between it and this cap top at y=0.85, and the sun
-    # walks the focal axis +0.2079 x / -0.9788 z per metre of that drop -- so the caustic
-    # core lands at (3.5+0.187, 3.6-0.881) = (3.687, 2.719), most of a metre off the column.
-    # 1.7 x 1.8 centred at (3.65, 2.95) spans x 2.80..4.50, z 2.05..3.85: the core sits well
-    # inside, and the outer filigree the solid network throws has room to fall on white
-    # rather than off the edge into the floor cage. In world coordinates (this exhibit is
-    # displaced -0.90, +0.55 by the spread) that is x 1.90..3.60, z 2.60..4.40.
+    # The second CANTILEVERED cap, and the bigger one. Its span was sized for the gyroid's
+    # old 0.90 m drop, where the sun (which walks the focal axis +0.2079 x / -0.9788 z per
+    # metre of drop) put the core at (3.687, 2.719), most of a metre off the column. The box
+    # clip sits at drop 0.50 instead, so the analytic core comes back to (3.604, 3.111) and
+    # the metered patch -- core +0.10 / -0.20 from the piece axis, 90% of its light inside
+    # 0.71 x 0.45 m -- spans x 3.19..3.90, z 3.07..3.52. The cap is 1.7 x 1.8 centred at
+    # (3.65, 2.95), i.e. x 2.80..4.50, z 2.05..3.85, so the whole patch now lands comfortably
+    # inside with the outer filigree still on white rather than off the edge into the floor
+    # cage. It is DELIBERATELY not resized down to suit: the cap reads as a plinth for a
+    # 1 m piece, and cropping it to the caustic would make the exhibit look undersized.
+    # In world coordinates (this exhibit is displaced -0.90, +0.55 by the spread) the cap is
+    # x 1.90..3.60, z 2.60..4.40.
     box { center 3.65 0.75 2.95  size 1.7 0.20 1.8  round 0.02 } }
 }
 
@@ -736,16 +740,31 @@ isosurface "stand_oil_cap" { material capmarble_oil
 #     z=9.35 and looks toward -z, so "front of the gallery" means z around 5-7, and the first
 #     siting of this piece (at z=1.10, which reads as "front" on the page) put it 8.4 m away
 #     and directly BEHIND the crystal gyroid, which occluded it completely. At z=5.45 it is
-#     4.2 m out and 178 px/m, so the cone renders larger than the gyroid ball beyond it.
-#     They USED to clear each other on screen by ~24 px. THEY NO LONGER DO: SF10's optimum
-#     drop is 0.65 rather than crystal's 0.35 (see the piece), which lifted it 0.30 m, and at
-#     1280x720 the cone (x 90..322, y 421..563) now crosses the gyroid ball (x 229..381,
-#     y 312..451) over a 93 x 30 px box at the cone's APEX. Checked on the finished frame and
-#     KEPT: what overlaps is the cone's two straight silhouette edges converging over the
-#     gyroid's lower filigree — a hard geometric line against a busy one, 1.3 m nearer — so
-#     it reads as a near piece in front of a far piece, not as clutter. Moving it is not free
-#     either: the cap already runs off the left edge (x -21), so the obvious leftward dodge
-#     pushes more of it out of frame.
+#     4.2 m out and 178 px/m, so the cone renders larger than the gyroid beyond it.
+#     They USED to clear each other on screen by ~24 px. THEY NO LONGER DO, and the overlap
+#     has now grown TWICE, for two unrelated reasons:
+#       1. SF10's optimum drop is 0.65 rather than crystal's 0.35 (see the piece), which
+#          lifted the cone 0.30 m. That put the cone (x 90..322, y 421..563) across the
+#          gyroid BALL (x 229..381, y 312..451) over a 93 x 30 px box. Checked on the
+#          finished frame and KEPT: what overlapped was the cone's two straight silhouette
+#          edges converging over the gyroid's lower filigree — a hard geometric line against
+#          a busy one, 1.3 m nearer — so it read as a near piece in front of a far piece.
+#       2. The gyroid's clip became a 1 : 5/8 : 1 BOX, which is both wider on screen and
+#          0.40 m LOWER (the box's best drop is 0.50, not the ball's 0.90 — measured, and
+#          not close: at drop 0.90 the box falls to 0.05% coverage and peak 3.2x). The slab
+#          projects to x 200..405, y 378..501, so the overlap is now 122 x 80 px.
+#     `scraps/_proj.py` computes these boxes and is validated against the recorded ball box
+#     to the pixel. THE SECOND ONE IS ALSO CHECKED ON A FINISHED FRAME (1125 spp, mode D)
+#     AND KEPT, but by a narrower margin and for a DIFFERENT reason than the first. There is
+#     no gap left at all -- the slab's left corner runs onto the cone's top face -- so what
+#     separates them is no longer silhouette but TONE: the cone is hard-edged, banded black
+#     and white specular, the slab is busy, green-tinted and full of violet internal caustic
+#     blobs, and the two do not blend. If a later reframe ever loses that contrast this is
+#     the first thing that breaks. The cheap fix is +x on the crystal gyroid's exhibit group
+#     (`translate -0.90 0 0.55`); +0.30 m there is about +43 px of separation at this depth
+#     and costs nothing optically, since the cap has 0.9 m of margin round the patch. Moving
+#     the CONE is not free: its cap already runs off the left edge (x -21), so the obvious
+#     leftward dodge pushes more of it out of frame.
 #   * it balances the frame. The right half carries the gold gyroid, the orb, the cloud and
 #     the rain; the near-left was empty grid, and the scene's whole reason for losing its roof
 #     was that its left half sat in permanent shadow.
@@ -827,7 +846,7 @@ isosurface "gyroid" {
 #     piece                          coverage   sat     peak
 #     ORB (crystal, drop 0.80)         0.72%   0.246   5.99x    <- best, by 2x
 #     SOLID gyroid k=6,  drop 0.90     0.39%   0.214   6.12x
-#     SOLID gyroid k=10, drop 0.90     0.37%   0.208   5.64x    <- this piece
+#     SOLID gyroid k=10, drop 0.90     0.37%   0.208   5.64x    <- this piece, sphere-clipped
 #     shell gyroid k=6,  drop 0.90     0.56%   0.172   5.74x
 #     shell gyroid k=13, drop 0.90     0.24%   0.173   5.76x    <- what was here
 #     KLEIN BOTTLE, standing           0.12%   0.173   2.01x
@@ -854,53 +873,59 @@ isosurface "gyroid" {
 # (0.39% / 0.214) but at 2*pi/6 = 1.05 m the cell is bigger than the 1 m ball and the piece
 # stops reading as a lattice at all; the gap to k=10 is inside this rig's noise.
 #
-# DROP 0.90 IS MEASURED, not chosen. Sweeping the height at k=10 (coverage above 1.2x cap):
-#     drop 0.50   0.26%      <- resting on the cap, where it used to be
-#     drop 0.70   0.28%
-#     drop 0.90   0.37%      <- best, 1.4x the seated value
-#     drop 1.40   0.11%
-# Past ~1 m the patch dilutes faster than the spectra separate. So this piece is levitated
-# too, on the same three pins as the orb, and for the same reason.
+# DROP IS MEASURED, not chosen. Sweeping the height at k=10 with the OLD spherical clip
+# (coverage above 1.2x cap) gave 0.26% / 0.28% / 0.37% / 0.11% at drop 0.50 / 0.70 / 0.90 /
+# 1.40; past ~1 m the patch dilutes faster than the spectra separate. The BOX peaks lower --
+# its own sweep bottoms out at drop 0.50 -- so the piece now sits at 0.50, still levitated on
+# the same three pins as the orb, and for the same reason.
 #
 # The MATERIAL was `diamond` (n~2.42) before crystal. At that index a lobe's focus falls
 # inside the material and the piece total-internally-reflects: it sparkles beautifully and
 # throws almost nothing. Crystal has 2.1x BK7's dispersion AND a workable external focus.
 #
-# THE CLIP STAYS A SPHERE, AND THE BOX THAT WAS MEASURED AGAINST IT IS WORTH RECORDING,
-# because it is a genuine TRADE and not the walkover the first measurement of it claimed.
-# Replacing the `sphere` with a box (the solid network clipped to a slab of half-extents
-# 0.50 x hy x 0.50) was swept over hy and over drop, at the rig's finalist setting -- 960px,
-# 1200 spp, cut 1.2x cap, each at the best drop of its own sweep:
+# THE CLIP IS A BOX, 1 : 5/8 : 1 (half-extents 0.50 x 0.3125 x 0.50), AND THAT IS A CHOSEN
+# TRADE, not a walkover. Swept over thickness and over drop at the rig's finalist setting --
+# 960px, 1200 spp, cut 1.2x cap, each at the best drop of its own sweep:
 #     sphere r=0.50, drop 0.90   cover 0.37%   sat 0.196   spread 0.060   peak 3.25x   fan 0.18
 #     box 1:1/4:1,   drop 0.50   cover 0.55%   sat 0.177   spread 0.008   peak 2.92x   fan 0.04
-#     box 1:5/8:1,   drop 0.50   cover 0.19%   sat 0.216   spread 0.018   peak 8.43x   fan 0.13
+#     box 1:5/8:1,   drop 0.50   cover 0.19%   sat 0.216   spread 0.018   peak 8.43x   fan 0.13  <- this piece
 #     box 1:3/4:1,   drop 0.50   cover 0.14%   sat 0.190   spread 0.012   peak 6.86x   fan 0.20
 #
 # THICKNESS TRADES AREA FOR CONCENTRATION, MONOTONICALLY. A thin slab spreads the light over
 # more cap than the ball does (0.55% against 0.37%) but every bit of that extra area is wash:
 # `spread` 0.008 is barely off the 0.003 speckle floor and `fan` -- how much of the
 # chromaticity a quadratic in position explains, i.e. is the colour ARRANGED or merely loud --
-# is 0.04, which is nothing. Thickening it turns that around and does real optical work:
-# 1:5/8:1 more than doubles the ball's peak and beats it on saturation. But it pays two
-# thirds of the area to get there, and no box on the curve reaches the ball's chromatic
-# spread. THE BALL'S POINT ON THAT TRADE IS SIMPLY BETTER THAN ANY BOX'S: near the thin
-# slab's area AND 3-7x the spread of any of them. That is the whole reason the sphere stays.
+# is 0.04, which is nothing. Thickening turns that around and does real optical work: 1:5/8:1
+# has 2.6x the ball's peak and beats it on saturation, in a patch half the size. What it does
+# NOT do is match the ball's chromatic `spread` (0.018 against 0.060) -- no box on the curve
+# does. So the honest reading is: THE BOX BUYS BRIGHT/TIGHT/SATURATED AND SELLS AREA AND
+# RAINBOW. Both halves of that were wanted here. A brighter, tighter, more saturated caustic
+# is worth as much to this room as a wider chromatic one, the wide-rainbow role is already
+# filled (and filled better than any gyroid could) by the SF10 AXICON at spread 0.211 /
+# fan 0.51, and the room already has a SPHERICAL gyroid in gold -- so making the crystal one
+# a slab buys silhouette variety on top, turning the pair from two balls into the same
+# lattice taken two ways in two shapes.
 #
 # The mechanism is that `contained_by` seals a clip with the piece's own material, so a box
 # clip caps the solid with flat PARALLEL faces -- a plane-parallel plate displaces a beam but
-# cannot converge one -- where the sphere clip leaves a curved lens envelope. Thickening
-# helps because it is not the CAP that focuses, it is the depth of network behind it.
+# cannot converge one -- where a sphere clip leaves a curved lens envelope. Thickening helps
+# because it is not the CAP that focuses, it is the depth of network behind it; that is also
+# why the box's peak is so much higher than the ball's despite the flat faces.
 #
-# Independent of optics, at k=10 the cell is 2*pi/10 = 0.63 m, so a 1:1/4:1 box is 0.4 of ONE
-# cell thick: it renders as a perforated plate with big round through-holes and stops reading
-# as a lattice at all, which throws away the gold/crystal statement above. That closes by
-# hy = 0.25 and is not an objection to the thicker boxes. The two that survive for any box
-# are the axicon's siting (validated against this ball's on-screen box) and the three pins,
-# which are authored to meet a sphere at y = 1.35; both would need re-authoring.
+# WHY NOT THINNER: at k=10 the cell is 2*pi/10 = 0.63 m, so a 1:1/4:1 box is 0.4 of ONE cell
+# thick and renders as a perforated plate with big round through-holes -- it stops reading as
+# a lattice at all, throwing away the gold/crystal statement above. That closes by hy = 0.25,
+# and 5/8 is a full cell thick, so the piece reads as lattice from every angle.
+#
+# TWO THINGS MOVED WITH THE CLIP. The `function`'s translate must track the piece centre
+# (the lattice phase is anchored there, and 0.40 m is 0.64 of a period -- a materially
+# different slice), and the three pins are re-authored flat and short below. The axicon's
+# siting note further up was validated against this piece's OLD spherical on-screen box and
+# needs re-checking against the new silhouette.
 #
 # HEALTH WARNING ON THE NUMBERS ABOVE: they are all at 960px. `coverage` is a cell count and
-# is resolution-stable (this ball: 0.35% at 480px, 0.37% at 960px), but `spread` is NOT --
-# same ball, 0.014 at 480px and 0.060 at 960px -- because it is computed over whichever cells
+# is resolution-stable (the sphere clip: 0.35% at 480px, 0.37% at 960px), but `spread` is NOT
+# -- same clip, 0.014 at 480px and 0.060 at 960px -- because it is computed over whichever cells
 # clear the bar and how many that is depends on resolution. At 480px the box/sphere ranking
 # on `spread` INVERTS. Rank pieces at one resolution or not at all.
 group { translate -0.90 0 0.55         # --- exhibit: CRYSTAL GYROID ---
@@ -908,26 +933,27 @@ isosurface "gyroid_gem" {
     material glass
     intersect {
         function {
-            translate 3.5 1.75 3.6
+            translate 3.5 1.35 3.6
             expr "sin(10*x)*cos(10*y) + sin(10*y)*cos(10*z) + sin(10*z)*cos(10*x)"
         }
-        sphere { center 3.5 1.75 3.6   radius 0.50 }
+        box { center 3.5 1.35 3.6   size 1.00 0.625 1.00 }
     }
-    contained_by { min 3.00 1.25 3.10   max 4.00 2.25 4.10 }
+    contained_by { min 3.00 1.03 3.10   max 4.00 1.67 4.10 }
     max_gradient 40
 }
-# The three pins, exactly the orb's mount at a shorter reach: 12 mm `wirecage` bars at
-# horizontal radius 0.30, so they meet the clip sphere at y = 1.75 - sqrt(0.25-0.09) = 1.35
-# and stand 0.50 m off the cap. `contained_by` seals the clipped solid with a face of its
-# own material, so the ball has a closed spherical underside for them to touch even where
-# the network itself is empty there. Azimuths 0/120/240 from +z: the caustic walks toward
-# -z, and the two rear pins throw 12 mm shadows that cross the cap 0.3 m to either side of
-# the patch's core, so unlike the orb's this triad needed no rotating.
+# The three pins, the orb's mount at a much shorter reach: 12 mm `wirecage` bars at
+# horizontal radius 0.30. The slab's underside is FLAT at y = 1.35 - 0.3125 = 1.0375, so
+# unlike the ball's triad all three are the same length -- 0.1875 m from the cap top at
+# y = 0.85, centred y = 0.94375. `contained_by` seals the clipped solid with a face of its
+# own material, so the slab has a closed flat underside for them to touch even where the
+# network itself is empty there. Azimuths 0/120/240 from +z: the caustic walks toward -z,
+# and the two rear pins throw 12 mm shadows that cross the cap to either side of the
+# patch's core, so unlike the orb's this triad needed no rotating.
 isosurface "stand_gem_mount" {
     material wirecage  union {
-        box { center 3.5000 1.10 3.9000  size 0.012 0.50 0.012 }
-        box { center 3.7598 1.10 3.4500  size 0.012 0.50 0.012 }
-        box { center 3.2402 1.10 3.4500  size 0.012 0.50 0.012 }
+        box { center 3.5000 0.94375 3.9000  size 0.012 0.1875 0.012 }
+        box { center 3.7598 0.94375 3.4500  size 0.012 0.1875 0.012 }
+        box { center 3.2402 0.94375 3.4500  size 0.012 0.1875 0.012 }
     }
 }
 }
@@ -1240,6 +1266,25 @@ isosurface "chrome_ring" {
 # also SWITCHES SIDES, +0.63 z at k=0.70 to -0.61 z at k=1.20: the ring focus is passing
 # through infinity there. 40.4 deg landing on crystal's 40.2 deg critical angle is a
 # coincidence, and is named as one so the wrong mechanism is not re-derived from it.
+#
+# SIZE IS THE RAINBOW KNOB, and it is the one axis where "wider" costs nothing in colour.
+# An axicon's cusps land at a distance that scales with the piece, so the top radius decides
+# how wide a cap the exhibit needs -- but it was not obvious that it also decides how much
+# SPECTRUM there is, because a bigger aperture usually just means a brighter, whiter patch.
+# It does not here (`vcone1.0/<h>`, half-height h, top radius 2h, SF10, drop 0.65, 480 px,
+# GEMBOX 0.9, cut 1.2x cap -- all one resolution, so these rank against each other only):
+#     h 0.28  r 0.56  <- SHIPPED   cov 0.56%  sat 0.327  spread 0.107  fan 0.65  1.43 x 0.44 m
+#     h 0.40  r 0.80                cov 0.29%  sat 0.527  spread 0.128  fan 0.76  1.93 x 0.47 m
+#     h 0.52  r 1.04                cov 0.60%  sat 0.445  spread 0.172  fan 0.44  2.48 x 1.90 m
+# `spread` rises MONOTONICALLY with size and `sat` rises with it too -- the ring simply gets
+# bigger, so the wavelengths that were landing on top of each other separate. h=0.40 is the
+# most ORGANISED colour measured anywhere in this scene (fan 0.76 against this piece's 0.65),
+# and h=0.52 is the widest rainbow (spread 0.172, a 2.48 m fan) at the cost of fan falling to
+# 0.44 as the two cusps grow into each other. THE SHIPPED SIZE IS NOT THE OPTICAL OPTIMUM; it
+# is the LAYOUT optimum. h=0.52 is a 2.08 m-wide piece, larger than anything else in the room
+# and larger than the gold gyroid it would have to share a frame with, and its patch (2.48 x
+# 1.90 m) is bigger than its own 1.8 x 1.7 cap, so the rainbow would fall off onto the floor
+# cage. Growing this piece means re-siting and re-capping it, not just editing one number.
 #
 # IT HAS A GIRDLE, AND THAT IS THE ONLY GEM CUT IT CAN AFFORD. Asked to shape this "more
 # like a diamond", the honest reply is that a diamond cut is an ANTI-CAUSTIC shape and this
