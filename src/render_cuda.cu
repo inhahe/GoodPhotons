@@ -1276,8 +1276,18 @@ __device__ static double dRadicalInverse2(unsigned long long i) {
 // bijection for prime b, and has π(0) = 0 -- so sIdx 0 still maps to exactly 0 in every base and
 // every "sample 0 is the canonical outcome" contract below is untouched.
 // (Host twin: BackwardRenderer::radicalInverseScr / goldenDigitMul. Must stay bit-identical.)
+//
+// BOTH multiply-adds below are spelled with __dmul_rn / __dadd_rn rather than `a * b + c`,
+// and that is load-bearing, not style. nvcc contracts a multiply feeding an add into a
+// single FMA by default (-fmad=true); MSVC does not. FMA is the *more* accurate of the two
+// — it drops the intermediate rounding — but "more accurate" is not the contract here:
+// mode W has no Monte-Carlo noise to absorb a difference, so the host is the reference and
+// the device must reproduce its rounding exactly. Contracted, the digit loop disagreed with
+// the CPU by 1 ULP on ~1.6% of indices (caught by `-checklattice`, N4a); the rn intrinsics
+// are individually-rounded operations the compiler is not permitted to fuse, which pins the
+// evaluation order to the host's without touching any other kernel's codegen.
 __device__ static unsigned dGoldenDigitMul(unsigned base) {
-    unsigned m = (unsigned)((double)base * 0.6180339887498949 + 0.5);
+    unsigned m = (unsigned)__dadd_rn(__dmul_rn((double)base, 0.6180339887498949), 0.5);
     return (m == 0u || m >= base) ? 1u : m;
 }
 __device__ static double dRadicalInverseScr(unsigned base, unsigned long long i) {
@@ -1285,7 +1295,7 @@ __device__ static double dRadicalInverseScr(unsigned base, unsigned long long i)
     const double invB = 1.0 / (double)base;
     double f = invB, r = 0.0;
     while (i) {
-        r += (double)((unsigned)(i % base) * mul % base) * f;
+        r = __dadd_rn(r, __dmul_rn((double)((unsigned)(i % base) * mul % base), f));
         i /= base; f *= invB;
     }
     return r;
@@ -1333,12 +1343,21 @@ __device__ static void dGiPhases(unsigned long long sIdx, double& p1, double& p2
 // bounce depth takes its own prime pair so two glossy vertices on one path are not driven
 // by the same 1-D sequence. Bases 2/3 are the subpixel lattice, 5 the wavelength, 7/11 the
 // gather, so these start at 13.
-__device__ static DVec3 dWhittedGlossyDir(const DVec3& mdir, Real roughness,
-                                          unsigned long long sIdx, int bounce) {
+// The two lattice COORDINATES are factored out of the direction (host twin:
+// BackwardRenderer::whittedGlossyUV) so `-checklattice` can probe exactly the numbers the
+// kernel uses. They are pure integer-and-`double` arithmetic and so bit-comparable with the
+// host; the direction itself goes through glossyDirUV's trig in `Real` and is not.
+__device__ static void dWhittedGlossyUV(unsigned long long sIdx, int bounce,
+                                        double& u1, double& u2) {
     const unsigned kBases[4][2] = {{13, 17}, {19, 23}, {29, 31}, {37, 41}};
     const unsigned b0 = kBases[bounce & 3][0], b1 = kBases[bounce & 3][1];
-    const double u1 = 1.0 - dRadicalInverseScr(b0, sIdx);   // 1 at sIdx 0 => mirror
-    const double u2 = dRadicalInverseScr(b1, sIdx);
+    u1 = 1.0 - dRadicalInverseScr(b0, sIdx);   // 1 at sIdx 0 => mirror
+    u2 = dRadicalInverseScr(b1, sIdx);
+}
+__device__ static DVec3 dWhittedGlossyDir(const DVec3& mdir, Real roughness,
+                                          unsigned long long sIdx, int bounce) {
+    double u1, u2;
+    dWhittedGlossyUV(sIdx, bounce, u1, u2);
     return glossyDirUV(mdir, roughness, (Real)u1, (Real)u2);
 }
 // Deterministic DISCRETE-CHOICE coordinate: one scalar off the (sIdx, bounce) lattice for a
@@ -1374,6 +1393,44 @@ __device__ static void dGridUV(int g, int G, Real& u1, Real& u2) {
     u1 = (Real)(((double)(g % G) + 0.5) / (double)G);
     u2 = (Real)(((double)(g / G) + 0.5) / (double)G);
 }
+// ---- N4a: the device half of the lattice bit-exactness probe ---------------
+// Evaluates every helper above at one index per thread and writes a fixed-width row of raw
+// doubles. See render_cuda.h for the column layout; the host compares the bits directly.
+// Deliberately calls the SAME functions the megakernel does — a re-implementation here
+// would test the copy, not the kernel.
+// `bases` is kLatticeProbeBases uploaded as a plain device buffer rather than a
+// `__constant__` symbol, so the probe needs no API beyond the handful the HIP shim at the
+// top of this file already covers — and the base list stays single-sourced in the header.
+__global__ void kLatticeProbe(const unsigned long long* idx, int n,
+                              const unsigned* bases, double* out) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    const unsigned long long i = idx[t];
+    const int b = (int)(i & 3ull);
+    double* r = out + (size_t)t * kLatticeProbeCols;
+    const double ri2 = dRadicalInverse2(i);
+    r[0] = ri2;
+    r[1] = dRot05(ri2);
+    dWhittedSample(i, r[2], r[3]);
+    r[4] = dWhittedLambdaU(i);
+    r[5] = dWhittedOrderU(i, b);
+    r[6] = dWhittedFluoroU(i, b);
+    dWhittedGlossyUV(i, b, r[7], r[8]);
+    dGiPhases(i, r[9], r[10]);
+    // gridUV takes an `int` cell index and writes `Real`; widen back so the host can compare
+    // against its own (Real)-narrowed value. G varies with the index so the probe covers
+    // several lattice sizes rather than one.
+    const int G = 4 + (int)(i % 5ull);
+    Real gu1, gu2;
+    dGridUV((int)(i % (unsigned long long)(G * G)), G, gu1, gu2);
+    r[11] = (double)gu1;
+    r[12] = (double)gu2;
+    for (int k = 0; k < kLatticeProbeNBases; ++k)
+        r[13 + k] = dRadicalInverseScr(bases[k], i);
+}
+// `sizeof(Real)` for the host half of the probe, which has no view of this file's typedef.
+// (The public `cudaRealBytes` wrapper is with the rest of the host API, past the namespace.)
+inline int realBytes() { return (int)sizeof(Real); }
 __device__ static Real hgPhase(Real cosTheta, Real g) {
     Real d = (Real)1 + g * g - (Real)2 * g * cosTheta;
     if (d < (Real)1e-9) d = (Real)1e-9;
@@ -10651,6 +10708,36 @@ bool cudaAvailable() {
     return true;
 }
 const char* cudaDeviceName() { cudaAvailable(); return g_devName; }
+
+// ---- N4a: host half of the mode-W lattice bit-exactness probe (-checklattice) ----
+// See lattice_probe.h for the column layout and render_cuda.h for the contract. The base
+// list travels as a plain device buffer rather than a `__constant__` symbol, so this needs
+// no API beyond the handful the HIP shim at the top of this file already covers.
+int cudaRealBytes() { return gpu::realBytes(); }
+bool cudaLatticeProbe(const unsigned long long* idx, int n, double* out) {
+    if (!cudaAvailable() || n <= 0) return false;
+    unsigned long long* dIdx = nullptr;
+    unsigned* dBases = nullptr;
+    double* dOut = nullptr;
+    const size_t nOut = (size_t)n * kLatticeProbeCols;
+    bool ok = cudaMalloc(&dIdx, (size_t)n * sizeof(unsigned long long)) == cudaSuccess &&
+              cudaMalloc(&dBases, sizeof(kLatticeProbeBases)) == cudaSuccess &&
+              cudaMalloc(&dOut, nOut * sizeof(double)) == cudaSuccess;
+    if (ok) ok = cudaMemcpy(dIdx, idx, (size_t)n * sizeof(unsigned long long),
+                            cudaMemcpyHostToDevice) == cudaSuccess &&
+                 cudaMemcpy(dBases, kLatticeProbeBases, sizeof(kLatticeProbeBases),
+                            cudaMemcpyHostToDevice) == cudaSuccess;
+    if (ok) {
+        gpu::kLatticeProbe<<<(n + 255) / 256, 256>>>(dIdx, n, dBases, dOut);
+        ok = cudaDeviceSynchronize() == cudaSuccess && cudaGetLastError() == cudaSuccess;
+    }
+    if (ok) ok = cudaMemcpy(out, dOut, nOut * sizeof(double),
+                            cudaMemcpyDeviceToHost) == cudaSuccess;
+    if (dIdx)   cudaFree(dIdx);
+    if (dBases) cudaFree(dBases);
+    if (dOut)   cudaFree(dOut);
+    return ok;
+}
 
 // Append one flushed line to the teardown-trace file named by $FTRACE_TEARDOWN_LOG
 // (no-op when the env var is unset). Each call opens/appends/flushes/closes so that if

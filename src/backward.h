@@ -404,6 +404,17 @@ struct BackwardRenderer {
     // radical inverse so λ placement does not lock to the subpixel position.
     static double whittedLambdaU(uint64_t idx) { return rot05(radicalInverseScr(5, idx)); }
 
+    // The two Cranley-Patterson phases of the one-bounce-gather lattice (see giGatherHero),
+    // from the ABSOLUTE sample index. Bases 7 and 11 collide with neither the subpixel
+    // lattice (2, 3), the wavelength lattice (5), nor the glossy/discrete lattices (>= 13).
+    // Every pixel shares them -- the invariant that makes this mode noise-free -- so raising
+    // -spp rotates the whole frame's lattice coherently and the banding averages out.
+    // (Device twin: dGiPhases. Must stay bit-identical; probed by `-checklattice`.)
+    static void giPhases(uint64_t sIdx, double& p1, double& p2) {
+        p1 = rot05(radicalInverseScr(7, sIdx));
+        p2 = rot05(radicalInverseScr(11, sIdx));
+    }
+
     // Deterministic ROUGH-SPECULAR direction for the Whitted preview: point `sIdx` of a
     // fixed 2-D lattice on the power-cosine lobe around `mdir`, instead of the lobe's single
     // mirror direction.
@@ -429,11 +440,20 @@ struct BackwardRenderer {
     // `-spp`, which is exactly why they go through the digit-SCRAMBLED radical inverse: unscrambled,
     // base 13 pinned u1 to [1 - spp/13, 1] and kept the lobe hugging its mirror direction until
     // `-spp 13`.
-    static Vec3 whittedGlossyDir(const Vec3& mdir, double roughness, uint64_t sIdx, int bounce) {
+    //
+    // The two lattice COORDINATES are factored out of the direction so `-checklattice`
+    // (N4a) can probe exactly the numbers the renderer uses. They are pure integer-and-
+    // `double` arithmetic and so are bit-comparable host-vs-device; the direction itself
+    // goes through `glossyDirUV`'s trig in `Real` and is not.
+    static void whittedGlossyUV(uint64_t sIdx, int bounce, double& u1, double& u2) {
         static const unsigned kBases[4][2] = {{13, 17}, {19, 23}, {29, 31}, {37, 41}};
         const unsigned* pb = kBases[bounce & 3];
-        const double u1 = 1.0 - radicalInverseScr(pb[0], sIdx);   // 1 at sIdx 0 => mirror
-        const double u2 = radicalInverseScr(pb[1], sIdx);
+        u1 = 1.0 - radicalInverseScr(pb[0], sIdx);   // 1 at sIdx 0 => mirror
+        u2 = radicalInverseScr(pb[1], sIdx);
+    }
+    static Vec3 whittedGlossyDir(const Vec3& mdir, double roughness, uint64_t sIdx, int bounce) {
+        double u1, u2;
+        whittedGlossyUV(sIdx, bounce, u1, u2);
         return glossyDirUV(mdir, roughness, u1, u2);
     }
 
@@ -617,8 +637,8 @@ struct BackwardRenderer {
         // lattice (2,3) nor the wavelength lattice (5)). Every pixel shares them -- the
         // invariant that makes this mode noise-free -- so raising -spp rotates the whole
         // frame's lattice coherently and the banding averages out progressively.
-        const double p1 = rot05(radicalInverseScr(7, gi.sIdx));
-        const double p2 = rot05(radicalInverseScr(11, gi.sIdx));
+        double p1, p2;
+        giPhases(gi.sIdx, p1, p2);
         double acc[hero::kHeroMax];
         for (int i = 0; i < nUp; ++i) acc[i] = 0.0;
         double wSum = 0.0;
@@ -653,8 +673,8 @@ struct BackwardRenderer {
                     GiCtx gi) const {
         const Vec3 ngo = orientedGeoN(h);
         const int n = giDirs * 2;
-        const double p1 = rot05(radicalInverseScr(7, gi.sIdx));
-        const double p2 = rot05(radicalInverseScr(11, gi.sIdx));
+        double p1, p2;
+        giPhases(gi.sIdx, p1, p2);
         double acc = 0.0, wSum = 0.0;
         const GiCtx sub{gi.depth + 1, gi.sIdx};
         for (int j = 0; j < n; ++j) {

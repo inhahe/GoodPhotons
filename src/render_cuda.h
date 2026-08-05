@@ -416,3 +416,23 @@ bool cudaIsoPreviewSupported(const Scene& scene, const Camera& cam);
 std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
                                           int W, int H, int nThreads, double exposure = 1.0,
                                           bool autoExpose = true, double* lockAnchor = nullptr);
+
+// ---------------------------------------------------------------------------
+// N4a — mode-W deterministic-lattice bit-exactness probe (`-checklattice`).
+//
+// Evaluates the DEVICE twins of backward.h's sample lattices over a caller-supplied index
+// sweep and hands back the raw bits for the host to compare against `BackwardRenderer`'s own
+// statics. `out` receives `n * kLatticeProbeCols` doubles, row-major — see lattice_probe.h
+// for the column layout and for why this is the one CPU/GPU comparison held to bit exactness.
+//
+// Returns false (leaving `out` untouched) if there is no usable CUDA device or the launch
+// fails; the caller then reports the device half as SKIPPED rather than failed.
+#include "lattice_probe.h"
+bool cudaLatticeProbe(const unsigned long long* idx, int n, double* out);
+
+// `sizeof(Real)` — the device's working float width (4 with the default FTRACE_GPU_FP32,
+// 8 in an exact-FP64 build). The lattice helpers are `double` either way, but `gridUV`
+// hands its result back as `Real`, so `-checklattice` must narrow the host's double to the
+// same width before comparing bits. Also worth printing in any CPU/GPU parity report, since
+// it is the single biggest reason whole-image bit-exactness is not on the table.
+int cudaRealBytes();

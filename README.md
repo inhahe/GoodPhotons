@@ -3064,11 +3064,20 @@ alone can't restore, so they are not disk-resumable.
 `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`, `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checksun`, `-checkbind`, `-checkprop`,
-`-checkarray`. Each runs deterministically without a scene and prints
+`-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
 `PASS`/`FAIL`. `-checkcontainer` guards the isosurface container clip: rotating an
 isosurface must not change what a ray sees, so it builds the same solid twice
 (axis-aligned and rigidly rotated) and checks that correspondingly rotated rays
-return identical hit distances.
+return identical hit distances. `-checklattice` guards **mode W**'s deterministic
+sample lattices: first the structural contracts (the digit scramble is a bijection,
+`radicalInverseScr(b, 0) == 0` exactly so sample 0 stays the mirror direction /
+specular order / median λ, the first *b* points are a permutation of the *b*-point
+grid, and 16 samples span at least half the unit interval in every base), then a
+**bit-exact** CPU-vs-GPU sweep over every lattice helper. Mode W has no Monte-Carlo
+noise for a device mismatch to hide behind, and these helpers are pure
+integer-and-`double` arithmetic on both sides, so unlike a rendered image they must
+agree to the last bit — a CUDA build compares them directly, a CPU-only build reports
+that half as `SKIPPED`.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are

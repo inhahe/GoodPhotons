@@ -4174,11 +4174,12 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       frames of a flat uniform patch under a p99 auto-exposure that divides out any overall scale,
       i.e. exactly the error it tests for. Logged in `known-issues.md`; it now forces absolute mode
       via `lumens` and carries a discrimination check so it cannot go blind again.
-- [ ] **N4. Deterministic CPU-vs-GPU A/B as N3's acceptance test.** *(Part (b) is in place and
+- [x] **N4. Deterministic CPU-vs-GPU A/B as N3's acceptance test.** ✅ **DONE 2026-08-05 (0.137.0)** —
+      both parts. *(Part (b) was already in place and
       passing for the **full** N3 scope — N3a, N3b, N3c (`-gi`) and N3d — via `scraps/n3_check.py`
       plus the block-mean `scraps/n3b_check.py`; see those items' numbers. It was re-run against the
       widened 0.116.0 gate and every bed passes. Part (a), the direct host-vs-device lattice-helper
-      sweep, is still to write — that is all that remains of N4, tracked as N4a.)* Unlike every prior port in §M, the
+      sweep, is the N4a entry below and shipped 2026-08-05.)* Unlike every prior port in §M, the
       usual escape hatch does **not** apply: `render_cuda.h` explicitly permits the stochastic modes
       to be "an independent noise realization that agrees to within Monte-Carlo noise", but mode W has
       no noise to hide a mismatch behind. Any disagreement in the quadrature, the radical-inverse
@@ -4197,6 +4198,49 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       so a tolerance band plus a "no connected region of disagreement" check has the same detection
       power. Run both sides with `-device cpu` / `-device gpu` explicitly — a CUDA build silently
       auto-selects the GPU and fakes a whole-frame regression.
+    * **STATUS (2026-08-05): N4a — part (a) — DONE, shipped as 0.137.0, and it caught a real
+      CPU/GPU divergence on its first run.** Landed as `ftrace -checklattice`, a deterministic,
+      scene-free self-test in the same family as `-checksun` / `-checkgrating`.
+      - **Shared layout header `src/lattice_probe.h`** — dependency-free, so main.cpp (host, always)
+        and render_cuda.cu (device, CUDA builds only) share ONE definition of the probe's 33-column
+        row and its 20-base list. A re-declaration on either side could drift, which is exactly the
+        bug class the probe exists to catch.
+      - **Two pure refactors so the probe tests the renderer, not a copy of it.** `whittedGlossyUV`
+        was factored out of `whittedGlossyDir` and `giPhases` out of the two `giGather*` bodies (host
+        `backward.h`; device `dWhittedGlossyUV` out of `dWhittedGlossyDir`). The direction itself goes
+        through `glossyDirUV`'s trig in `Real` and is not bit-comparable; the two lattice coordinates
+        are pure `double` and are.
+      - **Section 1 — structural contracts, runs with or without a GPU:** the digit multiplier is a
+        bijection (`0 < m < b`, `gcd(m,b) == 1`) in all 20 bases; `π(0)=0` so `radicalInverseScr(b,0)`
+        is EXACTLY 0 (the contract behind "sample 0 is the mirror direction / specular order / median
+        λ"); the first *b* points are a permutation of the *b*-point grid; every value is in [0,1);
+        16 samples span ≥ 0.5 of the interval in every base (the regression test for the un-scrambled
+        bug that hid a 480 nm dye until `-spp 64`); `rot05` stays in range, round-trips to ≤ 2 ULP and
+        is exact at 0; `gridUV` tiles [0,1)² with G·G distinct cell centres for G = 1..8; and sample 0
+        is the canonical outcome at every lattice.
+      - **Section 2 — the bit-exact sweep:** 65 732 indices (all of 0..65535, plus 2^e−1/2^e/2^e+1 for
+        every e < 64 and a few 64-bit oddballs) × 33 columns = **2 169 156 values**, compared by raw
+        bit pattern (not `==`, so a ±0.0 or a NaN payload difference would also register). `gridUV` is
+        the one column the device returns through `Real`, so the host narrows to `cudaRealBytes()`
+        first; every other column is `double` on both sides and compares unadjusted. Reports SKIPPED,
+        not failed, with no device or in a CPU-only build.
+      - **THE BUG IT FOUND: nvcc was contracting the digit loop's multiply-add into an FMA.**
+        `r += digit * f` in `dRadicalInverseScr` (and `base * φ⁻¹ + 0.5` in `dGoldenDigitMul`) fuse
+        under nvcc's default `-fmad=true`; MSVC does not fuse. FMA is the *more* accurate of the two —
+        it drops the intermediate rounding — but accuracy is not the contract: mode W has no
+        Monte-Carlo noise to absorb a difference, so the host is the reference. Measured divergence
+        before the fix: **34 191 of 2 169 156 values (1.6%), all 1 ULP, confined to the
+        `radicalInverseScr` columns** — the per-column histogram the check prints is what made that
+        diagnosis immediate. Fixed by spelling both multiply-adds with `__dmul_rn` / `__dadd_rn`,
+        individually-rounded operations the compiler may not fuse, which pins the evaluation order to
+        the host's *without* touching any other kernel's codegen. Post-fix: all 2 169 156 values
+        bit-identical.
+      - **Validation:** all 18 scene-free self-tests PASS. Part (b) re-run on top of the device fix —
+        `scraps/n3_gpu.ftsl` at `-spp 16` is **99.31 %** bit-identical CPU-vs-GPU (mean |diff| 0.008
+        codes, 0 blob-interior pixels, 30 edge slivers), and `scraps/cor_gi.ftsl` at `-spp 1 -gi 32`
+        is **98.68 %** (mean 0.032 codes, 0 blob interior, 40 slivers) — matching the 98.7 % recorded
+        at the 0.116.0 gate, i.e. no regression, and the `-gi` bed is what independently pins the
+        host-side `giPhases` refactor as a true no-op.
 - [ ] **N5. Re-measure spectral vs `-rgb`, then judge whether an RGB mode W is worth a second
       kernel.** *(Prediction: it is not — resolve this by measurement, not by building it.)* At mode
       W's 1 spp there is no noise, so `-rgb`'s usual convergence advantage evaporates and only the

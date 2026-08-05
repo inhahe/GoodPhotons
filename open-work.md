@@ -5,7 +5,7 @@ long prose blocks whose opening paragraph reads like a plan but whose later
 `**STATUS (date) … DONE**` sub-paragraph says it landed. That makes "what's actually left?"
 expensive to answer.
 
-**This file is the actionable extract, as of 2026-07-28 (ftrace v0.101.0).** It carries only
+**This file is the actionable extract, as of 2026-08-05 (ftrace v0.137.0).** It carries only
 work that is genuinely undone *and* not explicitly ruled out. `TODO.md` remains the
 authoritative design text — every item below names its section/item ID there, and the full
 rationale, prior art and scoping live in that entry, not here.
@@ -76,7 +76,25 @@ the `(u)` to add. A composed array literal works inside a table call too
 (`grid:ramp([0.2 0.8](u))`), which needed `WORD`'s balanced-group alternative widened to match
 `PARENWORD`'s body. Pinned by `-checkarray` section (i).
 
-**Section 1 is now empty of actionable ftrace items.**
+### ~~N4a — bit-exact host-vs-device sweep of the mode-W sample lattices~~  **DONE 2026-08-05 (v0.137.0)**
+*TODO.md §N item N4 — now closed, both parts.*
+
+Shipped as `ftrace -checklattice`: structural contracts for the digit-scrambled radical inverse
+(bijectivity, `π(0)=0`, grid-permutation, low-spp coverage, `rot05`, `gridUV` tiling, "sample 0 is
+the canonical outcome"), then a bit-pattern comparison of **2 169 156** values — 65 732 sample
+indices × 33 lattice columns — host against device. It found a real divergence on its first run:
+nvcc contracts `r += digit * f` into an FMA and MSVC doesn't, so 1.6 % of values differed by 1 ULP.
+Fixed with `__dmul_rn` / `__dadd_rn`; logged in `known-issues.md`.
+
+### N5 — re-measure spectral vs `-rgb` at mode W's 1 spp, then judge an RGB mode W  *(ftrace; small — a measurement)*
+*TODO.md §N item N5.*
+
+The only genuinely open, unblocked ftrace item. It is a **measurement, not a build**: at 1 spp
+there is no noise, so `-rgb`'s convergence advantage evaporates and only the measured 1.27–1.7×
+per-sample cost remains. The prediction recorded in TODO.md is that a second hand-written RGB
+megakernel is **not** worth it — one that would have to stay bit-exact with the CPU forever (N4) —
+and that `-rgb`'s one real edge (dodging the de-hero collapse on glass) is an argument for N1
+instead. Resolve it by measuring, then write the verdict up; don't build first.
 
 ---
 

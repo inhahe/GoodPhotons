@@ -400,6 +400,33 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   first 16 points drops from 0.754 to 0.077 at base 61 and 0.651 to 0.102 at base 43
   (`scraps/n3e_lattice.py`).
 
+  **Host/device bit-exactness is a TEST, not a comment (`-checklattice`, 0.137.0).** Every
+  claim above ("trivially bit-identical", "must stay bit-identical") is now asserted by a
+  scene-free self-test. `src/lattice_probe.h` is a dependency-free header giving `main.cpp`
+  and `render_cuda.cu` **one** definition of a 33-column probe row (radicalInverse2, rot05,
+  whittedSample, whittedLambdaU, whittedOrderU, whittedFluoroU, whittedGlossyUV, giPhases,
+  gridUV, and `radicalInverseScr` in all 20 bases the mode uses); `cudaLatticeProbe` runs the
+  device twins over an index sweep and the host compares raw bit patterns. Two helpers were
+  factored out (`whittedGlossyUV` from `whittedGlossyDir`, `giPhases` from the two
+  `giGather*` bodies, with `dWhittedGlossyUV` mirroring the first) precisely so the probe
+  reads the renderer's own code rather than a copy of it — a copy could drift, which is the
+  bug class the probe exists to catch. This is N4 part (a); part (b), image agreement to fp32
+  tolerance with no *structural* difference, stays with `scraps/n3_check.py`, because whole-
+  image bit-exactness is not achievable (device `Real` is fp32, `RAY_EPS` is 1e-4f vs 1e-6,
+  and libdevice's transcendentals differ from the CRT's).
+
+  The test earned its keep immediately: nvcc contracts a multiply feeding an add into an FMA
+  by default and MSVC does not, so `dRadicalInverseScr`'s `r += digit * f` disagreed with the
+  CPU by 1 ULP on 1.6 % of indices. FMA is the *more* accurate form, but accuracy is not the
+  contract — mode `W` has no Monte-Carlo noise to absorb a difference, so the host is the
+  reference and the device must reproduce its rounding. Fixed by spelling both multiply-adds
+  with `__dmul_rn` / `__dadd_rn`, which the compiler may not fuse, rather than a global
+  `-fmad=false` that would have perturbed every other kernel. **General rule this establishes:
+  a `double` expression duplicated host-and-device is not bit-identical by construction — a
+  bare `a*b + c` will diverge — so either write it with the `_rn` intrinsics or don't claim
+  bit-exactness for it.** (`dGiDir` still contracts, but its output goes through `cos`/`sin`
+  and was never bit-comparable; it is covered by part (b).)
+
   **Sealed-light detection (0.119.0).** Because mode `W` implies `-direct-only`, NEE is the
   *only* way anything is lit — and `Scene::occluded` blocks a shadow ray on any geometry,
   dielectrics included (the SDS limitation). A light sealed inside refractive or mirrored

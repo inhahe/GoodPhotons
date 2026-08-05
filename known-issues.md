@@ -5,6 +5,45 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — DONE (2026-08-05, v0.137.0): nvcc's FMA contraction made the GPU's mode-W sample lattices disagree with the CPU's by 1 ULP
+
+**What.** `dRadicalInverseScr` — the digit-scrambled radical inverse that places every
+deterministic mode-W sample (subpixel, wavelength, glossy lobe, grating order, fluorescence
+excitation, GI gather phase) — computed its digit accumulation as `r += digit * f`.
+`dGoldenDigitMul` likewise computed `(unsigned)(base * 0.6180339887498949 + 0.5)`. Both are
+multiply-adds, and **nvcc contracts a multiply feeding an add into a single FMA by default**
+(`-fmad=true`) while MSVC does not. The two sides therefore rounded differently: **34 191 of
+2 169 156 probed values (1.6%) differed, all by exactly 1 ULP, all confined to the
+`radicalInverseScr` columns.**
+
+**Why it mattered.** FMA is the *more* accurate form — it drops the intermediate rounding —
+so this is not an accuracy bug. It is a **contract** bug. `render_cuda.h` permits the
+stochastic modes to be "an independent noise realization that agrees to within Monte-Carlo
+noise", but **mode W has no noise for a mismatch to hide behind**: every pixel shares the same
+sample offsets, which is precisely what makes the mode noise-free, so a lattice difference is
+a *visible deterministic* CPU/GPU difference rather than a re-rolled die. `backward.h` and
+`render_cuda.cu` both carry "Host twin: … Must stay bit-identical" comments on these
+functions; they simply weren't tested, so the claim had quietly become false.
+
+**How it was found.** `ftrace -checklattice` (TODO §N item N4a), on its first run. The
+per-column mismatch histogram it prints is what made the diagnosis immediate: a 1-ULP spread
+confined to exactly the columns containing a multiply-add is a compiler-contraction
+signature, whereas a logic error would show a large or column-wide gap.
+
+**Fix.** Spell both multiply-adds with `__dmul_rn` / `__dadd_rn` — individually-rounded
+operations the compiler is not permitted to fuse. This pins the device's evaluation order to
+the host's without touching any other kernel's codegen (a global `-fmad=false` would have
+changed every kernel in the build). Post-fix all 2 169 156 values are bit-identical, and the
+part-(b) image A/Bs are unregressed: `scraps/n3_gpu.ftsl` 99.31 % bit-identical, and
+`scraps/cor_gi.ftsl -gi 32` 98.68 %, matching the 98.7 % recorded at the 0.116.0 gate.
+
+**Lesson worth keeping.** Any host/device pair asserted to be bit-identical must have that
+asserted *by a test*, not by a comment — and the first thing to suspect in a 1-ULP host/device
+gap is FMA contraction, not the algorithm. Other device code carries the same hazard where a
+comment claims bit-identity: `dGiDir`'s `kGolden * j + 2*PI*p1` contracts too, but its result
+goes through `cos`/`sin`, which libdevice already computes differently from the CRT, so that
+one is not bit-comparable in the first place and is covered by part (b), not part (a).
+
 ### DONE (0.135.0): preview rasterizer showed six classes of material as flat colour
 
 **What.** `ftrace scenes\gallery_rain.ftsl -explore` previewed the ten marble caps
