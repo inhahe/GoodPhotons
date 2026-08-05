@@ -1634,7 +1634,8 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       | girdle 0.02 | 36.41× | 0.15 % | 0.480 | 0.273 | 1.46 × 1.20 |
       | **girdle 0.04 — SHIPPED** | **37.07×** | **0.17 %** | 0.463 | 0.254 | **1.49 × 1.22** |
       | girdle 0.08 | 27.35× | 0.19 % | 0.392 | 0.226 | 1.60 × **0.38** |
-      | girdle 0.04, 16 vertical facets | 29.71× | 0.18 % | 0.470 | 0.243 | 1.55 × **0.38** |
+      | girdle 0.04, 16 vertical facets | 32.41× | 0.17 % | 0.428 | 0.242 | 1.49 × **0.38** |
+      | girdle 0.04, 8 vertical facets | 13.83× | 0.15 % | 0.377 | **0.099** | 1.49 × **0.35** |
       | + crown 34.5° / 75 % table | 3.75× | **0.01 %** | 0.272 | 0.036 | — |
       | + crown 34.5° / 53 % table (a real brilliant) | 3.48× | **0.01 %** | 0.229 | 0.004 | — |
       | + crown 20° / 60 % table | — | **0.02 %** | 0.254 | 0.041 | — |
@@ -1645,7 +1646,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       wider-covering than the bare cone, for ~9 % of `sat`. Past that the band eats the rim:
       at 0.08 the patch collapses from two cusps (1.17 m of z) to one band (0.38 m). Sixteen
       **vertical** facets — which by construction cannot deviate the descending aperture at
-      all — collapse it the same way, so the glinting waist is not worth its cost. **A crown
+      all — collapse it the same way, and eight facets are far worse again (spread 0.099, peak
+      13.83×), so faceting costs monotonically with coarseness and the glinting waist is not
+      worth its cost at any count. **A crown
       is fatal**, which is the round-brilliant row of the table above arrived at from the other
       direction: a crown facet at angle *c* bends a descending ray inward by
       *c* − asin(sin *c* / n) — 15.6° at *c* = 34.5° in SF10 — so the whole annulus outside the

@@ -1211,7 +1211,8 @@ isosurface "chrome_ring" {
 #     girdle 0.02               peak 36.41x  cov 0.15%  sat 0.480  spread 0.273  1.46 x 1.20 m
 #     girdle 0.04  <- SHIPPED   peak 37.07x  cov 0.17%  sat 0.463  spread 0.254  1.49 x 1.22 m
 #     girdle 0.08               peak 27.35x  cov 0.19%  sat 0.392  spread 0.226  1.60 x 0.38 m
-#     girdle 0.04, 16 facets    peak 29.71x  cov 0.18%  sat 0.470  spread 0.243  1.55 x 0.38 m
+#     girdle 0.04, 16 facets    peak 32.41x  cov 0.17%  sat 0.428  spread 0.242  1.49 x 0.38 m
+#     girdle 0.04,  8 facets    peak 13.83x  cov 0.15%  sat 0.377  spread 0.099  1.49 x 0.35 m
 #     + crown 34.5 deg / 75% table            cov 0.01%  sat 0.272  spread 0.036
 #     + crown 34.5 deg / 53% table            cov 0.01%  sat 0.229  spread 0.004  <- a real
 #     + crown 20.0 deg / 60% table            cov 0.02%  sat 0.254  spread 0.041     brilliant
@@ -1222,7 +1223,8 @@ isosurface "chrome_ring" {
 # than the bare cone. Past that the band starts eating the rim: at 0.08 the patch collapses
 # from two cusps (1.17 m of z) to a single band (0.38 m), and 16 vertical facets -- which
 # cannot deviate the descending aperture at all, being vertical -- collapse it the same way
-# for the same reason, so the glinting waist is not worth its cost.
+# for the same reason. 8 facets are far worse again, so the cost is monotonic in coarseness
+# and the glinting waist is not worth it at any count.
 #
 # A CROWN IS FATAL, and that is the same finding as the round-brilliant row in the sweep
 # above (0.06% against this piece's 0.30% in crystal), from the other direction: a crown facet
