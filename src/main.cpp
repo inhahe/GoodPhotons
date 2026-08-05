@@ -7739,7 +7739,7 @@ static int run(int argc, char** argv) {
             const bool wantGpu  = !std::strcmp(device, "gpu");
             const bool wantAuto = !std::strcmp(device, "auto");
             if (!useGpuIso && (wantGpu || wantAuto) && raster_cuda::available()) {
-                gpuRaster = raster_cuda::upload(prims, plight, &scene.textures);
+                gpuRaster = raster_cuda::upload(prims, plight, &scene);
                 if (gpuRaster)
                     std::printf("[raster] GPU rasterizer: frames on the GPU "
                                 "(all projections; skins + see-through supported)\n");
@@ -7773,7 +7773,7 @@ static int run(int argc, char** argv) {
 #endif
             ensurePrims();   // lazy fallback (also the sole path when the GPU is unavailable)
             return raster::renderFrame(prims, cam, W, H, plight, nThreads, ev, autoExp, lock,
-                                       rasterSeeThrough, rasterClarity, &scene.textures);
+                                       rasterSeeThrough, rasterClarity, &scene);
         };
 
         // Exposure-lock meter pre-pass: for each locked group, raster its selected metering
@@ -8989,7 +8989,7 @@ static int run(int argc, char** argv) {
                     raster_cuda::destroy(gpuRaster);
                     gpuRaster = nullptr;
                     ensurePrims();
-                    gpuRaster = raster_cuda::upload(prims, plight, &scene.textures);
+                    gpuRaster = raster_cuda::upload(prims, plight, &scene);
                     if (!gpuRaster)
                         std::fprintf(stderr, "[anim] GPU re-upload failed; using the CPU rasterizer\n");
                 }

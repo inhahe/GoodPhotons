@@ -5,6 +5,74 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### DONE (0.135.0): preview rasterizer showed six classes of material as flat colour
+
+**What.** `ftrace scenes\gallery_rain.ftsl -explore` previewed the ten marble caps
+completely untextured, and rendered 28% of the frame as one flat `rgb(0,255,89)` slab.
+Both had the same shape of cause: `raster::tessellate` / the shade pass knew about a
+*subset* of the material features that determine a surface's appearance, and silently
+dropped the rest.
+
+Six gaps, all now closed on **both** the CPU (`raster.h`) and GPU (`raster_cuda.cu`) paths:
+
+1. **Per-primitive `uv` projections were ignored for marched implicits** — the reported
+   bug. `Implicit::uvProj/uvAxis/uvBounds` is what gives an isosurface a UV parameterisation
+   (marching cubes emits none), and `tessellate` honoured only the *material's*
+   `triplanarScale`, so it set `tex = -1` on every marched implicit. Fixed by projecting each
+   marched vertex with the tracer's own `projectUV`.
+   *Seam hazard closed with it*: azimuthal (spherical/cylindrical) `u` wraps 1.0→0.0. The
+   ray-hit path projects AT the hit and never sees the wrap; the rasterizer *interpolates*,
+   so a straddling triangle would run `u` backwards across the whole texture. Triangles whose
+   `u` spread exceeds 0.5 now have their low corners lifted by +1.
+2. **`emit pattern:` / `emit_map pattern:` ignored** — the flat green slab. `gridground`
+   is a 528 nm emitter masked by `emit_map pattern:grid_ground`; with the mask dropped the
+   whole plane glowed. The fix required moving the emissive early-out to AFTER pattern
+   evaluation.
+3. **`reflect pattern:` / `reflect_map pattern:` ignored** — same VM, albedo slot.
+4. **Palette (indexed-spectral) maps sampled their raw index map.** `Texture::sampleRgb`
+   returned the *index* out of the red channel, so entry 3 of 12 shaded as near-black. Fixed
+   inside `Texture` (`buildPaletteRgb` / `paletteRgbAt`) so every colour consumer benefits,
+   not just the rasterizer.
+5. **Normal maps unused.** Now applied through a UV-derived TBN frame.
+6. **`mix` / layered materials collapsed to the parent's `reflect`.** Now resolved via
+   `mixDominantChild` — the same child deterministic mode W picks, so the two agree.
+
+**How the class of bug was closed, not just the instances.** A single `applyMat()` now
+assigns every per-material field, called from all four geometry paths (world tris, spheres,
+implicits, instances); the original bug was a feature wired into three of the four. The CPU
+G-buffer also stopped copying material fields per pixel and stores the *source triangle
+index* instead (matching what the GPU backend already did), so a future per-material feature
+needs no new per-pixel channel to be dropped from.
+
+**Not** fixed, deliberately: roughness / film-thickness maps stay ignored (a preview has no
+glossy lobe for them to drive), and there is no "textured emitter" — the language has no
+such slot, so previewing one would invent detail the render does not have.
+
+**Verified.** `gallery_rain` on both backends: 6247 of 1.17 M pixels (0.54%) differ by
+more than 2/255, all of them on grid-line boundaries where a hard `step` meets the CPU's
+double vs the GPU's float world position. Mean absolute difference 0.12/255.
+
+**Also verified: the shared pattern VM did not regress the path tracer.** The VM body that
+`raster_cuda.cu` now calls was *lifted out of* `render_cuda.cu` into `pattern_device.cuh`, so
+the tracer had to be re-checked. `scenes/_preview_pattern_tex.ftsl` (added for this) binds
+three `tex:` expressions (plain,
+warped-lookup, and an `emit_map` mask) to slots the preview actually evaluates — `weight_map`
+is no good for this, since the preview resolves a `mix` to its dominant child and never runs
+that pattern. CPU vs GPU, matched settings:
+
+| path | difference |
+|---|---|
+| `-raster` (`DPatEnvT<DTex>`) | 133 of 160 k px (0.08%) differ by >2; mean 0.09/255; 1322 vs 1323 unique colours |
+| `-mode W` (`DPatEnvT<DTexture>`) | 24 of 25.6 k px (0.09%) differ by >2; mean 0.02/255; identical auto-exposure anchor `6.11e-13` |
+
+Same residual as above — hard checker edges under `filter nearest`, float vs double.
+
+**Note on how slow that mode-W check was:** 74.4 s on the GPU for 4 spp at 160x160 versus
+**0.1 s** on the CPU, with the `[gpu-stall]` watchdog reporting 30 s per 1-spp chunk against a
+0.15 s target. That is the GPU-contention entry below (pid 20264 again), not a cost of this
+change — the raster path, whose kernels are tiny, rendered the same scene in 0.42 s throughout.
+
+
 ### OPEN (2026-08-04): `textures/marble_dumbbell.png` is derived from a WATERMARKED stock preview — replace before any public release
 
 **What.** `marble texture 3.5.avif`, one of the ten source sheets, is a VectorStock **comp**: a

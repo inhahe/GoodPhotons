@@ -492,12 +492,31 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
 > ghost and a mirror as a flat tint. (Opt in to **see-through clear objects** with
 > `-see-through` — see below — which drops the ghost for a dim + milky-haze pass
-> that still refracts nothing.) **Image skins** *are* shown: a material whose
-> albedo is a bound texture (`reflect texture:<name>`) is previewed by
-> interpolating the surface's per-vertex UVs — or, for an un-UV'd mesh/isosurface,
-> the material's world **triplanar** projection — and sampling the texture's linear
-> RGB per pixel, so a skinned globe/wallpaper/torus reads with its actual image
-> rather than a flat colour. Shading sums a diffuse term from **every**
+> that still refracts nothing.) But everything that gives a surface its look **at a
+> single point** *is* shown, on both the CPU and GPU preview alike:
+>
+> * **Image skins** — a material whose albedo is a bound texture
+>   (`reflect texture:<name>`) is sampled per pixel, so a skinned
+>   globe/wallpaper/torus reads with its actual image rather than a flat colour. The
+>   UVs come from the surface's per-vertex coords; from the material's world
+>   **triplanar** projection for an un-UV'd mesh; or, for a marched
+>   isosurface/CSG, from the primitive's own `uv planar|spherical|cylindrical`
+>   projection (marching cubes produces no per-vertex UVs, so without this a skinned
+>   implicit would preview bare).
+> * **Palette (indexed-spectral) maps** — previewed as the colours their palette
+>   spectra actually reflect, not as the raw index stored in the image.
+> * **Procedural `pattern` drives** — `reflect pattern:` / `reflect_map pattern:`
+>   modulate the albedo, and `emit pattern:` / `emit_map pattern:` modulate the
+>   **emission**, both evaluated per pixel by the same expression VM the real
+>   renderer uses. So a masked emitter (a glowing grid on a dark floor) previews as
+>   the grid, not as one flat glowing slab.
+> * **Normal maps** — `normal_map` perturbs the shading normal through the
+>   triangle's UV-derived tangent frame, so surface relief shows.
+> * **`mix` / layered materials** — previewed as their dominant child (the same
+>   choice the deterministic `-mode W` viewer makes) rather than the parent's colour.
+>
+> Roughness and film-thickness maps are deliberately *not* previewed: the preview
+> has no glossy lobe for them to drive. Shading sums a diffuse term from **every**
 > scene light using its real position/direction (spot cones included), so multi-
 > light rooms read with their true key directions. It reuses the **same camera
 > projection** as the real renderer, so the pinhole's off-axis stretch (spheres
@@ -543,11 +562,13 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > CPU (~5×), with the one-time tessellation unchanged; tiny scenes are launch-bound
 > and roughly tie. **Scope:** the GPU path covers **all camera projections**
 > (rectilinear **and** fisheye/panoramic — the device applies the same angular lens
-> map the real camera uses), **opaque and textured (skinned)** geometry (image skins
-> — per-vertex UV **and** world-triplanar `reflect texture:<name>` albedo — are sampled
-> on-device), **and** `-see-through` clear-glass compositing (a device clear-accumulation
-> pass mirrors the CPU one). Only a device allocation failure falls back to the CPU
-> rasterizer per camera (mixed camera lists just work), so `-device gpu` never fails a
+> map the real camera uses), **opaque** geometry, **and** `-see-through` clear-glass
+> compositing (a device clear-accumulation pass mirrors the CPU one). Its shading has
+> **full parity with the CPU preview** — image skins, palette maps, normal maps and
+> procedural `pattern` drives on albedo and emission all run on-device, the last through
+> the very same expression VM the GPU path tracer uses. Only a device allocation failure
+> falls back to the CPU rasterizer per camera (mixed camera lists just work), so
+> `-device gpu` never fails a
 > preview it can't accelerate. Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -device gpu -window -o png/preview.png`.
 >

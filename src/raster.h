@@ -3,14 +3,28 @@
 // This is the "quick taste" viewer: it turns the whole scene into triangles once
 // (analytic spheres tessellated, isosurfaces marched to a mesh, instanced meshes
 // baked to world space) and rasterizes each authored camera with a plain z-buffer
-// and simple diffuse+headlight shading. Image skins (a `reflect texture:<name>`
-// albedo) ARE previewed: the per-vertex UVs (or a world triplanar projection) are
-// interpolated in the deferred G-buffer and the texture's linear RGB is sampled per
-// pixel in the shade pass, so a skinned surface shows its image. There is NO
-// transparency, refraction,
-// reflection, shadows, caustics or global illumination — a dielectric shows as a
-// solid ghost, a mirror as a flat tint. The point is to see the *composition* and
-// (for a camera_curve) the *flyby motion* in a fraction of a second per frame,
+// and simple diffuse+headlight shading.
+//
+// Everything that gives a surface its LOOK at a single point is previewed:
+//   * Image skins (`reflect texture:<name>`) — UVs are interpolated in the deferred
+//     G-buffer and the texture's linear RGB sampled per pixel in the shade pass. The
+//     UVs come from per-vertex coords, a world triplanar projection, or (for marched
+//     implicits, which have no per-vertex UVs) the primitive's own `uv planar/
+//     spherical/cylindrical` projection, re-evaluated per marched vertex.
+//   * Palette (indexed-spectral) maps — resolved to one linear-sRGB colour per palette
+//     entry, so an index map previews as its actual spectra, not as raw indices.
+//   * Procedural `pattern` drives on the albedo (`reflect pattern:`/`reflect_map
+//     pattern:`) and on the EMISSION (`emit pattern:`/`emit_map pattern:`), evaluated
+//     per pixel by the same VM the tracer uses. The emission mask matters most: without
+//     it a masked emitter previews as one flat glowing slab instead of its pattern.
+//   * Normal maps (`normal_map`) — perturbed through the triangle's UV-derived TBN.
+//   * Mix / layered materials — resolved to their dominant child (the same choice
+//     deterministic mode W makes), instead of collapsing to the parent's flat colour.
+// There is NO transparency, refraction, reflection, shadows, caustics or global
+// illumination — a dielectric shows as a solid ghost, a mirror as a flat tint. Glossy
+// lobes do not exist here either, so roughness/film-thickness maps are ignored by
+// design (they drive nothing a preview can show). The point is to see the *composition*
+// and (for a camera_curve) the *flyby motion* in a fraction of a second per frame,
 // exactly the way the isosurface mesher lets you eyeball an implicit.
 //
 // It reuses the real Camera projection (Camera::project semantics reimplemented for
@@ -44,9 +58,41 @@ struct PTri {
     Vec3 uv0{0, 0, 0}, uv1{0, 0, 0}, uv2{0, 0, 0};
     int  tex = -1;           // index into the scene texture table, or -1 (flat `color`)
     double triplanarScale = 0.0;  // >0: sample the texture by world triplanar, not UV
+    // Scalar pattern drives (index into Scene::patterns, or -1). Evaluated per pixel in
+    // the shade pass and multiplied into the slot they name, exactly as the tracer's
+    // slotPatMul does — that is what turns `emit_map pattern:grid_ground` from "the whole
+    // floor glows" into the thin grid lines it actually is.
+    int  reflectPat = -1;    // scales the albedo (`reflect pattern:` / `reflect_map pattern:`)
+    int  emitPat    = -1;    // scales the emission (`emit pattern:` / `emit_map pattern:`)
+    int  normalTex  = -1;    // tangent-space normal map, or -1
+    double normalStrength = 1.0;
     bool emissive = false;
     bool clear    = false;   // dielectric/thin-film/filter surface (see-through mode dims/hazes it)
 };
+
+// Per-triangle tangent for normal mapping, derived from the UV gradient (the standard
+// dP/dU construction) and then Gram-Schmidt'd against the shading normal. Returns a
+// zero vector only if no usable frame exists, which the caller treats as "skip the map".
+// Constant over the triangle, so it is computed in the shade pass for the one winning
+// fragment rather than stored per vertex.
+inline Vec3 triTangent(const PTri& t, const Vec3& N) {
+    Vec3 e1 = t.p1 - t.p0, e2 = t.p2 - t.p0;
+    Vec3 d1 = t.uv1 - t.uv0, d2 = t.uv2 - t.uv0;
+    double det = d1.x * d2.y - d2.x * d1.y;
+    Vec3 T;
+    if (std::fabs(det) > 1e-18) {
+        T = (e1 * d2.y - e2 * d1.y) * (1.0 / det);
+    } else {
+        // Degenerate/absent UV parameterisation (e.g. a triplanar or projected skin):
+        // fall back to any stable tangent so the map still perturbs, just in an
+        // unauthored frame. Picking the axis least parallel to N avoids a null cross.
+        Vec3 ax = (std::fabs(N.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+        T = cross(ax, N);
+    }
+    T = T - N * dot(N, T);                       // re-orthogonalize against the shading normal
+    double l = std::sqrt(dot(T, T));
+    return (l > 1e-12) ? T * (1.0 / l) : Vec3{0, 0, 0};
+}
 
 // A "clear" preview surface for the optional see-through rasterizer: a transmissive
 // dielectric-family material. In see-through mode these aren't drawn as solid ghosts;
@@ -191,19 +237,60 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
     std::vector<char>  matClear(sc.mats.size(), 0);
     std::vector<int>   matTex(sc.mats.size(), -1);   // bound reflectTex (image skin) or -1
     std::vector<double> matTri(sc.mats.size(), 0.0); // triplanar scale (0 = per-vertex UV)
+    std::vector<int>   matRPat(sc.mats.size(), -1);  // reflect-slot scalar pattern, or -1
+    std::vector<int>   matEPat(sc.mats.size(), -1);  // emit-slot scalar pattern, or -1
+    std::vector<int>   matNrm(sc.mats.size(), -1);   // tangent-space normal map, or -1
+    std::vector<double> matNrmS(sc.mats.size(), 1.0);
+    // A Mix material has no shading of its own — it selects among child materials, so its
+    // own `reflect` slot is normally unset and previewing it shows a flat default grey.
+    // Resolve to the HEAVIEST child via mixDominantChild, which is exactly what the
+    // deterministic Whitted preview (-mode W) does, so raster and mode W agree on what a
+    // mix looks like. Layered/Multilayer use the same child list, so they resolve too.
+    // Iterated (a child may itself be a mix) with a depth cap against a malformed cycle;
+    // a leftover-absorption result (-1) keeps the parent, which previews as its own colour.
+    auto resolveMix = [&](size_t i) -> int {
+        int cur = (int)i;
+        for (int guard = 0; guard < 8; ++guard) {
+            if (cur < 0 || cur >= (int)sc.mats.size()) break;
+            const Material& m = sc.mats[cur];
+            if (m.mixChildren.empty()) break;
+            int pick = mixDominantChild(m);
+            if (pick < 0 || pick == cur || pick >= (int)sc.mats.size()) break;
+            cur = pick;
+        }
+        return cur;
+    };
     for (size_t i = 0; i < sc.mats.size(); ++i) {
+        // Preview a mix through its dominant child, so its skin/pattern show too.
+        const Material& m = sc.mats[resolveMix(i)];
         bool em = false;
-        matCol[i] = materialColor(sc.mats[i], em);
+        matCol[i] = materialColor(m, em);
         matEmit[i] = em ? 1 : 0;
-        matClear[i] = (!sc.mats[i].isLight && isClearPreviewType(sc.mats[i].type)) ? 1 : 0;
+        matClear[i] = (!m.isLight && isClearPreviewType(m.type)) ? 1 : 0;
         // An image skin: a diffuse-albedo texture bound via `reflect texture:<name>`.
         // The preview shades from the texture's linear RGB (Texture::sampleRgb), so no
         // Jakob-Hanika coefficient precompute is needed (that's only for spectral hits).
-        int rt = sc.mats[i].reflectTex;
-        if (!sc.mats[i].isLight && rt >= 0 && rt < (int)sc.textures.size() &&
-            sc.textures[rt].valid() && !sc.textures[rt].hasPalette()) {
+        // Palette (indexed) maps are included: sampleRgb resolves the index through
+        // Texture::paletteRgb rather than shading with the raw index byte.
+        // Emitters are still excluded, and deliberately: emission is an SPD plus an
+        // optional `emit_map pattern:` — there is NO textured-emission slot in the
+        // material model, so a `reflect texture:` on a light means nothing to the tracer
+        // and previewing it would invent detail the real render does not have. Spatially
+        // varying emission is previewed through emitPat below, which IS the real mechanism.
+        int rt = m.reflectTex;
+        if (!m.isLight && rt >= 0 && rt < (int)sc.textures.size() && sc.textures[rt].valid()) {
             matTex[i] = rt;
-            matTri[i] = sc.mats[i].triplanarScale;
+            matTri[i] = m.triplanarScale;
+        }
+        // Scalar pattern drives. `reflect pattern:` / `reflect_map pattern:` both land in
+        // reflectPat and multiply the albedo; `emit pattern:` / `emit_map pattern:` land
+        // in emitPat and multiply the emission. Same slots, same clamp, as the tracer.
+        matRPat[i] = m.reflectPat;
+        matEPat[i] = m.emitPat;
+        if (m.normalTex >= 0 && m.normalTex < (int)sc.textures.size() &&
+            sc.textures[m.normalTex].valid()) {
+            matNrm[i]  = m.normalTex;
+            matNrmS[i] = m.normalStrength;
         }
     }
     auto colOf = [&](int matId) -> Vec3 {
@@ -221,6 +308,23 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
     auto triOf = [&](int matId) -> double {
         return (matId >= 0 && matId < (int)matTri.size()) ? matTri[matId] : 0.0;
     };
+    // Stamp EVERY material-derived field onto a triangle in one place. Each geometry kind
+    // below (world tris, spheres, implicits, instances) calls exactly this, so adding a
+    // per-material preview feature can no longer be wired into three of the four paths and
+    // silently dropped on the fourth — which is how marched implicits ended up unable to
+    // show a skin at all. Only the UV SOURCE differs per kind, and that stays local.
+    auto applyMat = [&](PTri& p, int matId) {
+        p.color    = colOf(matId);
+        p.emissive = emOf(matId);
+        p.clear    = clearOf(matId);
+        p.tex      = texOf(matId);
+        p.triplanarScale = triOf(matId);
+        const bool ok = matId >= 0 && matId < (int)matRPat.size();
+        p.reflectPat = ok ? matRPat[matId] : -1;
+        p.emitPat    = ok ? matEPat[matId] : -1;
+        p.normalTex  = ok ? matNrm[matId]  : -1;
+        p.normalStrength = ok ? matNrmS[matId] : 1.0;
+    };
 
     // (1) World triangles.
     out.reserve(sc.tris.size() + 4096);
@@ -228,9 +332,8 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
         PTri p;
         p.p0 = t.v0; p.p1 = t.v1; p.p2 = t.v2;
         p.n0 = t.n0; p.n1 = t.n1; p.n2 = t.n2;
-        p.color = colOf(t.matId); p.emissive = emOf(t.matId); p.clear = clearOf(t.matId);
+        applyMat(p, t.matId);
         p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;
-        p.tex = texOf(t.matId); p.triplanarScale = triOf(t.matId);
         out.push_back(p);
     }
 
@@ -244,8 +347,6 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
                         std::cos(theta),
                         std::sin(theta) * std::sin(phi)};
         };
-        Vec3 col = colOf(s.matId); bool em = emOf(s.matId); bool cl = clearOf(s.matId);
-        int  tex = texOf(s.matId); double tri = triOf(s.matId);
         // Equirectangular (lat/long) UV per vertex, matching the analytic sphere hit in
         // geometry.h (u = 0.5 + atan2(z,x)/2pi, v = 0.5 - asin(y)/pi) so a skin lines up
         // with the real render. Computed from the unit direction d (== the vertex normal).
@@ -264,10 +365,10 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
                 Vec3 uv00 = uvOf(d00), uv01 = uvOf(d01), uv10 = uvOf(d10), uv11 = uvOf(d11);
                 if (iu == SU - 1) { uv10.x += 1.0; uv11.x += 1.0; }
                 PTri a; a.p0 = v00; a.p1 = v01; a.p2 = v11; a.n0 = d00; a.n1 = d01; a.n2 = d11;
-                a.color = col; a.emissive = em; a.clear = cl; a.tex = tex; a.triplanarScale = tri;
+                applyMat(a, s.matId);
                 a.uv0 = uv00; a.uv1 = uv01; a.uv2 = uv11;
                 PTri b; b.p0 = v00; b.p1 = v11; b.p2 = v10; b.n0 = d00; b.n1 = d11; b.n2 = d10;
-                b.color = col; b.emissive = em; b.clear = cl; b.tex = tex; b.triplanarScale = tri;
+                applyMat(b, s.matId);
                 b.uv0 = uv00; b.uv1 = uv11; b.uv2 = uv10;
                 out.push_back(a); out.push_back(b);
             }
@@ -332,18 +433,65 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
         for (int ii = 0; ii < nImp; ++ii) {
             const auto& im = sc.implicits[ii];
             const isomesh::Mesh& m = meshes[ii];
-            Vec3 col = colOf(im.matId); bool em = emOf(im.matId); bool cl = clearOf(im.matId);
-            // Marched implicits carry no per-vertex UVs, so a skin only shows via world
-            // triplanar projection (triplanarScale > 0); a plain UV-bound texture stays flat.
-            double tri = triOf(im.matId);
-            int    tex = (tri > 0.0) ? texOf(im.matId) : -1;
+            // Marching cubes emits no per-vertex UVs, so a skin needs a PROJECTION to land
+            // on an implicit. Two independent ones, in priority order (matching the shade
+            // pass, which tests tpScale first):
+            //   * material `uv triplanar` (triplanarScale > 0) -> sampled from world pos;
+            //   * primitive `uv planar|spherical|cylindrical` (im.uvProj) -> the SAME
+            //     projectUV() the ray-hit path runs in implicit.h's writeHit, evaluated
+            //     per marched vertex here and then barycentrically interpolated. This is
+            //     what gallery_rain's marble caps use (`uv planar axis=y`); without it
+            //     every cap previewed as its flat pre-texture albedo.
+            // Neither present -> no UV source exists, so leave the skin off rather than
+            // smear texel (0,0) over the whole surface.
+            PTri proto;
+            applyMat(proto, im.matId);
+            const bool projUV = (im.uvProj != UvProjection::None);
+            // A UV-sampled skin needs a projection; a triplanar one does not.
+            if (proto.tex >= 0 && proto.triplanarScale <= 0.0 && !projUV) proto.tex = -1;
+            // Same reference box and centre the tracer uses, hoisted out of the vertex loop.
+            const Aabb& ub = im.uvBoundsSet ? im.uvBounds : im.bounds;
+            const Vec3  uctr = (ub.lo + ub.hi) * 0.5;
+            // Project once per VERTEX (not per triangle corner): a marched mesh shares
+            // vertices between faces, so this is ~6x less work than projecting inline.
+            // Patterns and normal maps read (u,v) too — `uv planar` exists on an implicit
+            // precisely so pattern/expression materials get coordinates — so any of them
+            // being bound is reason enough to project.
+            const bool wantUV = projUV &&
+                                ((proto.tex >= 0 && proto.triplanarScale <= 0.0) ||
+                                 proto.normalTex >= 0 || proto.reflectPat >= 0 ||
+                                 proto.emitPat >= 0);
+            std::vector<Vec3> pUV;
+            if (wantUV) {
+                pUV.resize(m.pos.size());
+                for (size_t vi = 0; vi < m.pos.size(); ++vi)
+                    pUV[vi] = projectUV(m.pos[vi], ub.lo, ub.hi, uctr, im.uvProj, im.uvAxis);
+            }
             for (size_t f = 0; f + 2 < m.tri.size(); f += 3) {
                 int i0 = m.tri[f], i1 = m.tri[f + 1], i2 = m.tri[f + 2];
-                PTri p;
+                PTri p = proto;
                 p.p0 = m.pos[i0]; p.p1 = m.pos[i1]; p.p2 = m.pos[i2];
                 p.n0 = m.nrm[i0]; p.n1 = m.nrm[i1]; p.n2 = m.nrm[i2];
-                p.color = col; p.emissive = em; p.clear = cl;
-                p.tex = tex; p.triplanarScale = tri;
+                if (!pUV.empty()) {
+                    p.uv0 = pUV[i0]; p.uv1 = pUV[i1]; p.uv2 = pUV[i2];
+                    // SEAM REPAIR (azimuthal projections only). Spherical/cylindrical u is
+                    // an angle normalised to [0,1), so a triangle straddling the -x meridian
+                    // gets corners like (0.99, 0.01, 0.02). The ray-hit path never sees this
+                    // — it projects AT the hit — but we interpolate, so that triangle would
+                    // run u backwards across the entire texture: one garish vertical stripe
+                    // of the whole image at the seam. Lift the low corners by one turn so
+                    // the triangle stays monotonic (with `wrap repeat` this samples exactly
+                    // right; with `clamp` the sliver clamps to the edge texel, still local).
+                    if (im.uvProj == UvProjection::Spherical ||
+                        im.uvProj == UvProjection::Cylindrical) {
+                        double umax = std::max({p.uv0.x, p.uv1.x, p.uv2.x});
+                        if (umax - std::min({p.uv0.x, p.uv1.x, p.uv2.x}) > 0.5) {
+                            if (umax - p.uv0.x > 0.5) p.uv0.x += 1.0;
+                            if (umax - p.uv1.x > 0.5) p.uv1.x += 1.0;
+                            if (umax - p.uv2.x > 0.5) p.uv2.x += 1.0;
+                        }
+                    }
+                }
                 out.push_back(p);
             }
         }
@@ -362,9 +510,8 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
             p.n0 = normalize(inst.toWorld.applyNormal(t.n0));
             p.n1 = normalize(inst.toWorld.applyNormal(t.n1));
             p.n2 = normalize(inst.toWorld.applyNormal(t.n2));
-            p.color = colOf(matId); p.emissive = emOf(matId); p.clear = clearOf(matId);
+            applyMat(p, matId);
             p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;   // UVs are instance-invariant
-            p.tex = texOf(matId); p.triplanarScale = triOf(matId);
             out.push_back(p);
         }
     }
@@ -393,9 +540,15 @@ struct VtxScreen {
 // near-plane clipping happen a single time per triangle instead of once per thread.
 struct STri {
     VtxScreen v0, v1, v2;
-    Vec3   color;
-    int    tex;        // bound skin texture index, or -1 (use flat `color`)
-    double triplanarScale;  // >0: sample the skin by world triplanar instead of UV
+    // Index of the SOURCE PTri rather than a copy of its shading attributes. The shade
+    // pass is deferred, so it can fetch colour / texture / pattern / normal-map bindings
+    // straight from tris[src] for the one winning fragment. That keeps the rasterizer's
+    // innermost loop writing a single int where it used to write a Vec3 + int + float,
+    // and means a new per-material preview feature costs no extra G-buffer channel.
+    // (This is also how the GPU twin has always worked — see raster_cuda.cu's kShade,
+    // which reads its attributes bit-verbatim from the source DPTri.)
+    int    src;
+    bool   needUV;     // interpolate UVs for this triangle (a skin, pattern or normal map reads them)
     bool   emissive;
     bool   clear;      // see-through transmissive surface (handled by the clear-accumulation pass)
     int    iy0, iy1;   // inclusive pixel-row span the triangle can touch
@@ -407,11 +560,9 @@ struct GBuffer {
     std::vector<float>   zbuf;    // 1/depth key (bigger = closer); 0 = background
     std::vector<Vec3>    wpos;    // world position of the winning surface
     std::vector<Vec3>    wn;      // world normal of the winning surface
-    std::vector<Vec3>    color;   // base albedo of the winning triangle
+    std::vector<int>     tri;     // index of the winning source PTri, or -1 (background)
     std::vector<uint8_t> emis;    // 1 where the winning triangle is an emitter
     std::vector<Vec3>    uv;      // interpolated texture coords of the winning surface
-    std::vector<int>     tex;     // winning triangle's skin texture index, or -1
-    std::vector<float>   tpScale; // winning triangle's triplanar scale (0 = UV)
 };
 
 // --- Watertight coverage: canonical edge functions -------------------------------------
@@ -526,10 +677,8 @@ inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& 
             double d = 1.0 / std::max(invd, 1e-12);
             g.wpos[row]  = (A.wpos * (w0 * A.invd) + B.wpos * (w1 * B.invd) + C.wpos * (w2 * C.invd)) * d;
             g.wn[row]    = (A.wn   * (w0 * A.invd) + B.wn   * (w1 * B.invd) + C.wn   * (w2 * C.invd)) * d;
-            g.color[row] = t.color;
-            g.tex[row]   = t.tex;
-            g.tpScale[row] = (float)t.triplanarScale;
-            if (t.tex >= 0)
+            g.tri[row]   = t.src;
+            if (t.needUV)
                 g.uv[row] = (A.uv * (w0 * A.invd) + B.uv * (w1 * B.invd) + C.uv * (w2 * C.invd)) * d;
         }
     }
@@ -822,7 +971,12 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                                         int nThreads, double exposure = 1.0,
                                         bool autoExpose = true, double* lockAnchor = nullptr,
                                         bool seeThrough = false, double glassClarity = 0.85,
-                                        const std::vector<Texture>* textures = nullptr) {
+                                        const Scene* scenePtr = nullptr) {
+    // The shade pass needs more of the Scene than just its textures: scalar patterns are
+    // evaluated per pixel and the pattern VM reads the scene's `grid:`/`scatter:` tables
+    // through bindPatScene. Passing the Scene (rather than a texture vector) is what lets
+    // `emit_map pattern:` mask an emitter instead of the whole surface glowing.
+    const std::vector<Texture>* textures = scenePtr ? &scenePtr->textures : nullptr;
     const double expComp = (exposure > 0.0) ? exposure : 1.0;
     const double EMIS_BOOST = 4.0;    // emitters read as bright light sources (clip to white)
     const Vec3 bg{0.06, 0.07, 0.09};                    // background tint (unlit, unexposed)
@@ -859,13 +1013,13 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
             c.wpos = P; c.wn = Nn; c.uv = UV; return c;
         };
         auto push = [&](const VtxScreen& s0, const VtxScreen& s1, const VtxScreen& s2,
-                        const Vec3& col, int tex, double tps, bool emis, bool clr) {
+                        int src, bool needUV, bool emis, bool clr) {
             double lo = std::min({s0.sy, s1.sy, s2.sy});
             double hi = std::max({s0.sy, s1.sy, s2.sy});
             int iy0 = std::max(0, (int)std::floor(lo));
             int iy1 = std::min(H - 1, (int)std::ceil(hi));
             if (iy0 > iy1) return;
-            out.push_back(STri{s0, s1, s2, col, tex, tps, emis, clr, iy0, iy1});
+            out.push_back(STri{s0, s1, s2, src, needUV, emis, clr, iy0, iy1});
         };
         for (size_t ti = a; ti < b; ++ti) {
             const PTri& t = tris[ti];
@@ -882,6 +1036,12 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
             const bool back = dot(t.n0, cam.eye - t.p0) < 0.0 &&
                               dot(t.n1, cam.eye - t.p1) < 0.0 &&
                               dot(t.n2, cam.eye - t.p2) < 0.0;
+            // Interpolate UVs when ANY per-pixel binding reads them: an image skin, a
+            // normal map, or a scalar pattern (patterns get u/v in their context, and a
+            // `[0 1](u)` ramp is exactly a UV read). Triplanar skins sample from world
+            // position instead, but a pattern on the same material may still want UVs.
+            const bool needUV = (t.tex >= 0 && t.triplanarScale <= 0.0) ||
+                                t.normalTex >= 0 || t.reflectPat >= 0 || t.emitPat >= 0;
             VtxCS cs[3] = { toCS(t.p0, back ? -t.n0 : t.n0, t.uv0),
                             toCS(t.p1, back ? -t.n1 : t.n1, t.uv1),
                             toCS(t.p2, back ? -t.n2 : t.n2, t.uv2) };
@@ -904,7 +1064,7 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 for (int i = 1; i + 1 < np; ++i) {
                     VtxScreen sc1 = projectVtx(cam, poly[i], W, H);
                     VtxScreen sc2 = projectVtx(cam, poly[i+1], W, H);
-                    push(sc0, sc1, sc2, t.color, t.tex, t.triplanarScale, t.emissive, t.clear);
+                    push(sc0, sc1, sc2, (int)ti, needUV, t.emissive, t.clear);
                 }
             } else {
                 bool bad = false;
@@ -916,7 +1076,7 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
                 VtxScreen sc0 = projectVtx(cam, cs[0], W, H);
                 VtxScreen sc1 = projectVtx(cam, cs[1], W, H);
                 VtxScreen sc2 = projectVtx(cam, cs[2], W, H);
-                push(sc0, sc1, sc2, t.color, t.tex, t.triplanarScale, t.emissive, t.clear);
+                push(sc0, sc1, sc2, (int)ti, needUV, t.emissive, t.clear);
             }
         }
     };
@@ -971,11 +1131,9 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
     g.zbuf.assign(N, 0.0f);
     g.wpos.assign(N, Vec3{0,0,0});
     g.wn.assign(N, Vec3{0,0,0});
-    g.color.assign(N, bg);
+    g.tri.assign(N, -1);
     g.emis.assign(N, 0);
     g.uv.assign(N, Vec3{0,0,0});
-    g.tex.assign(N, -1);
-    g.tpScale.assign(N, 0.0f);
     dispatchBands([&](int y0, int y1) {
         for (const STri& s : stris) {
             if (s.iy1 < y0 || s.iy0 >= y1) continue;   // triangle can't touch this band
@@ -1007,21 +1165,56 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
     parallelFor(N, [&](size_t a, size_t b) {
         for (size_t i = a; i < b; ++i) {
             if (g.zbuf[i] <= 0.0f) continue;         // background stays bg tint
-            Vec3 col = g.color[i];
-            if (g.emis[i]) { accum[i] = col * EMIS_BOOST; continue; }  // raw emitter radiance
+            const int si = g.tri[i];
+            if (si < 0 || si >= (int)tris.size()) continue;
+            const PTri& pt = tris[si];
+            Vec3 col = pt.color;
             // Image skin: replace the flat albedo with the texture's linear RGB, sampled
             // either at the interpolated per-vertex UV or by world triplanar projection.
-            if (textures && g.tex[i] >= 0 && g.tex[i] < (int)textures->size()) {
-                const Texture& tx = (*textures)[g.tex[i]];
-                col = (g.tpScale[i] > 0.0f)
-                    ? tx.sampleRgbTriplanar(g.wpos[i], g.wn[i], (double)g.tpScale[i])
+            if (textures && pt.tex >= 0 && pt.tex < (int)textures->size()) {
+                const Texture& tx = (*textures)[pt.tex];
+                col = (pt.triplanarScale > 0.0)
+                    ? tx.sampleRgbTriplanar(g.wpos[i], g.wn[i], pt.triplanarScale)
                     : tx.sampleRgb(g.uv[i].x, g.uv[i].y);
             }
+            // Scalar pattern drives, evaluated with the SAME PatCtx the tracer builds at a
+            // hit (world point, oriented normal, u, v — and fieldVal 0, which is exact here
+            // because an isosurface's marched vertices lie on the level set). A bound
+            // pattern multiplies its slot and is clamped to [0,1], mirroring slotPatMul.
+            if (scenePtr && (pt.reflectPat >= 0 || pt.emitPat >= 0)) {
+                PatCtx pc = makePatCtx(g.wpos[i], 0.0, normalize(g.wn[i]),
+                                       g.uv[i].x, g.uv[i].y);
+                bindPatScene(pc, *scenePtr);
+                const int slot = g.emis[i] ? pt.emitPat : pt.reflectPat;
+                if (slot >= 0 && slot < (int)scenePtr->patterns.size()) {
+                    double p = scenePtr->patterns[slot].eval(pc);
+                    col = col * (p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p));
+                }
+            }
+            if (g.emis[i]) { accum[i] = col * EMIS_BOOST; continue; }  // raw emitter radiance
             // No two-sided flip here: it is decided ONCE PER TRIANGLE at projection time
             // (see projectRange). Testing the smoothly-interpolated normal per pixel used
             // to invert it in a 1-px band at every silhouette, where dot(N,V) legitimately
             // grazes through zero — that produced dark speckles on the sphere's rim.
             Vec3 N3 = normalize(g.wn[i]);
+            // Tangent-space normal map. The rasterizer has no per-vertex tangents, so the
+            // frame is derived from the UV gradient the same way the mesh loader would:
+            // an arbitrary but stable basis about N when UVs are degenerate. Perturbing
+            // here (not in the G-buffer) keeps the pass-2 inner loop untouched.
+            if (textures && pt.normalTex >= 0 && pt.normalTex < (int)textures->size()) {
+                const Texture& nx = (*textures)[pt.normalTex];
+                if (nx.valid()) {
+                    Vec3 T = triTangent(pt, N3);
+                    if (dot(T, T) > 1e-18) {
+                        Vec3 B3 = cross(N3, T);
+                        Vec3 tn = nx.sampleNormalTS(g.uv[i].x, g.uv[i].y);
+                        double s3 = pt.normalStrength;
+                        Vec3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + N3 * tn.z;
+                        double pl = std::sqrt(dot(pert, pert));
+                        if (pl > 1e-12) N3 = pert * (1.0 / pl);
+                    }
+                }
+            }
             Vec3 V = normalize(cam.eye - g.wpos[i]);     // toward camera
             double lit = 0.0;
             for (const auto& lp : light.lights) {

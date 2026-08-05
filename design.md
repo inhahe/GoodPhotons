@@ -1088,8 +1088,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   within 0.005%; U/VCM within 0.02%). **CPU-only in 0.80.0**: the device has ~20 emission
   read sites, and a partial port would be *biased* rather than visibly incomplete, so
   `cudaForwardSupported` (and `cudaBackwardRGBSupported`) reject the whole scene and the CPU
-  renders it; the port is tracked in `known-issues.md`. The preview rasteriser ignores
-  `emitPat`, consistent with its existing treatment of `reflectPat`/`transmitPat`.
+  renders it; the port is tracked in `known-issues.md`. The preview rasteriser DOES honour
+  `emitPat` (and `reflectPat`) since 0.135.0 — see *Preview shading model* below; ignoring
+  it made a masked emitter preview as one flat glowing slab.
 
   **The `emit` slot name is overloaded, and `fluorescent` owns it.** On every other material
   type `emit` means *self-emission* (`Material::emit` + `isLight = true`, i.e. the surface is a
@@ -2325,6 +2326,65 @@ Five call sites share the rule: `fillTriangleG` and `fillTriangleClear` (raster.
 in the clear pass, which *multiplies* into `clearT`/`milkT` — a doubly-covered edge would
 darken a seam twice, an uncovered one leaves a hairline of un-tinted glass. Costs ~4% on the
 CPU rasterizer; GPU unchanged. History and measurements in `known-issues.md`.
+
+## Preview shading model (`raster.h` + `raster_cuda.cu`, 0.135.0)
+
+The preview has no light transport, so nothing that needs a *second* bounce — reflection,
+refraction, shadows, GI, glossy lobes — can exist in it. But everything that determines a
+surface's appearance **at a single point** can, and now does. Both backends implement the
+identical set, because they share the bake (`raster::tessellate`) and mirror the shade.
+
+| Material feature | Preview behaviour |
+|---|---|
+| `reflect texture:` skin | Sampled per pixel: per-vertex UV, world triplanar, or the primitive's own `uv` projection |
+| Palette (indexed-spectral) map | Each palette entry pre-resolved to a linear-sRGB colour; nearest lookup |
+| `reflect pattern:` / `reflect_map pattern:` | Scalar clamped to [0,1], multiplies the albedo |
+| `emit pattern:` / `emit_map pattern:` | Scalar clamped to [0,1], multiplies the **emission** |
+| `normal_map` | Perturbs the shading normal through the triangle's UV-derived TBN |
+| `mix` / layered material | Resolved to its dominant child (`mixDominantChild`) |
+| `roughness_map`, `film_thickness` maps | Ignored **by design** — a preview has no glossy lobe for them to drive |
+| Textured light | No such slot exists in the language; a light's look is its SPD × `emit_map pattern:` |
+
+Design points worth keeping:
+
+- **The emission mask is evaluated BEFORE the emissive early-out.** This is the whole
+  reason the feature matters. `gallery_rain`'s ground is a 528 nm emitter masked by
+  `emit_map pattern:grid_ground`; skipping the pattern made 28% of the frame one flat
+  `rgb(0,255,89)` slab instead of a dark plane with thin glowing grid lines.
+- **Marched implicits get their UVs from the primitive, not the mesh.** Marching cubes
+  emits no per-vertex UVs, so a skinned isosurface has *no* UV source unless the
+  primitive carries a `uv planar/spherical/cylindrical` projection — which `tessellate`
+  now re-evaluates per marched vertex with the tracer's own `projectUV`. Missing this was
+  the original bug: `gallery_rain`'s ten marble caps previewed untextured while the
+  traced render showed marble.
+  Azimuthal projections need **per-triangle seam repair**: the ray-hit path projects *at*
+  the hit and never sees the 1.0→0.0 wrap, but the rasterizer *interpolates*, so a
+  triangle straddling the seam would run `u` backwards across the entire texture. Any
+  triangle whose `u` spread exceeds 0.5 has its low corners lifted by +1.
+- **One `applyMat()` assigns every per-material field**, called from all four geometry
+  paths (world tris, spheres, implicits, instances). The class of bug being closed is a
+  feature wired into three paths and silently dropped on the fourth.
+- **The G-buffer stores a source triangle INDEX**, not a copy of each material field. The
+  shade pass reads `tris[g.tri[i]]`, so every future per-material feature is free of a new
+  per-pixel channel — and it matches what the GPU backend already did (`slot >> 1`).
+- **Palette resolution lives in `Texture`, not in the rasterizer** (`buildPaletteRgb` /
+  `paletteRgbAt`), so every consumer that wants a *colour* rather than a spectrum gets it.
+  Previously `sampleRgb` on an index map returned the raw index out of the red channel —
+  entry 3 of 12 shading as near-black.
+- **The pattern VM is shared source, not a second implementation** (`pattern_device.cuh`).
+  It was extracted verbatim out of `render_cuda.cu` and templated on the texture-record
+  type, because the two backends store textures differently: the tracer uploads spectral
+  `DTexture`s (Jakob-Hanika coefficients), the preview flat linear-RGB `DTex`s. The VM
+  reaches a texture only through `TexT::patScalarAt(u,v)`, which each backend implements
+  against its own storage (both mirroring the host's `Texture::scalarAt`). Everything else
+  it touches — `PatGrid`, `PatScatter`, the flat float pool, the POV function library — was
+  already shared `__host__ __device__` code in `pattern.h`.
+
+CPU/GPU parity is verified on `gallery_rain`: of 1.17 M pixels, 6247 (0.54%) differ by
+more than 2/255, and every one of them lies on a grid-line boundary — the pattern is a
+hard step, the CPU evaluates it at a double-precision world position and the GPU at a
+float one, so a sub-texel shift flips a pixel across the step. Mean absolute difference
+over the frame is 0.12/255.
 
 ## GPU raster pipeline (`raster_cuda.cu`)
 
