@@ -123,6 +123,7 @@
 
 #include "raster_cuda.h"
 #include "camera.h"    // Camera, CAM_RECTILINEAR
+#include "pattern_device.cuh"   // DPattern / DPatEnvT / dPatternEval — shared with render_cuda.cu
 
 namespace raster_cuda {
 
@@ -138,6 +139,32 @@ struct DPTri {
     float  triplanarScale;  // >0: sample the skin by world triplanar instead of UV
     int    emissive;
     int    clear;           // see-through transmissive surface (handled by the clear pass)
+    int    normalTex;       // tangent-space normal map, or -1
+    float  normalStrength;  // XY scale applied to the sampled tangent-space normal
+    int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
+    int    emitPat;         // scalar `pattern` masking the emission, or -1
+    int    mix;             // index into the DMix table for a per-hit mix, else -1
+};
+
+// Device twin of raster.h's PMix: the LOSING half of a two-child `mix` whose blend is
+// driven per hit by `weight_map pattern:` / `weight_map texture:`. kShade evaluates the
+// mask at the shaded point and, below the 0.5 threshold, swaps these fields in over the
+// ones it unpacked from the triangle — the same hard threshold the CPU preview and
+// -mode W's mixResolveDominant() use, so all three agree on where the boundary falls.
+//
+// `emissive` and `clear` are deliberately absent: both are decided per TRIANGLE in
+// kProject (they steer visibility, the see-through pass and the auto-exposure anchor,
+// none of which is a per-pixel decision here), so a mix takes them from its child 0.
+struct DMix {
+    int    weightPat;       // device pattern index driving child 0's share, or -1
+    int    weightTex;       // ...or a scalar texture index, or -1
+    float3 color;
+    int    tex;
+    float  triplanarScale;
+    int    normalTex;
+    float  normalStrength;
+    int    reflectPat;
+    int    emitPat;
 };
 
 // A device image texture (linear RGB), mirroring raster.h's use of Texture::sampleRgb /
@@ -149,6 +176,14 @@ struct DTex {
     int wrap;     // 0 = repeat, 1 = clamp, 2 = mirror
     int offset;   // start index into the shared texel array
     int valid;    // w > 0 && h > 0 && texels present
+    // Base of the shared texel array. Redundant with the `texels` argument every sampler
+    // already takes, but the pattern VM (pattern_device.cuh) reaches a texture through the
+    // member hook below and has no second parameter to hand it — so the pointer is carried
+    // per record. It is patched in after the texel array is allocated (upload()).
+    const float3* texels;
+    // The pattern VM's `tex:` hook. Mirrors the host's Texture::scalarAt (the mean of the
+    // three linear channels at (u,v)); defined out of line below, next to dSampleRgb.
+    __device__ double patScalarAt(double u, double v) const;
 };
 
 struct DLight {
@@ -193,6 +228,10 @@ struct DAttr {
     int    tex;             // skin texture index, or -1
     float  triplanarScale;  // >0: sample by world triplanar instead of UV
     int    emissive;
+    int    normalTex;       // tangent-space normal map, or -1
+    float  normalStrength;
+    int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
+    int    emitPat;         // scalar `pattern` masking the emission, or -1
 };
 // Per-slot flags array values (kProject writes, classify/raster/shade/clear probe).
 constexpr int kSlotValid   = 1;   // bit0: slot holds a projected sub-triangle
@@ -209,6 +248,10 @@ constexpr int kSlotBack    = 8;
 // A camera-space vertex carrying the interpolated attributes (mirrors raster::VtxCS).
 struct DVtxCS { float x, y, z; float3 wpos, wn; float2 uv; };
 
+// The pattern environment for this backend: preview textures are flat linear-RGB DTex
+// records (not render_cuda's spectral DTextures), so the shared VM is instantiated on DTex.
+using DPatEnv = DPatEnvT<DTex>;
+
 // ---------------------------------------------------------------------------
 // Device vector helpers (self-contained; no host header is __device__-annotated).
 __host__ __device__ inline float3 mk(float x, float y, float z) { return make_float3(x, y, z); }
@@ -216,6 +259,9 @@ __device__ inline float3 operator+(float3 a, float3 b) { return mk(a.x+b.x, a.y+
 __device__ inline float3 operator-(float3 a, float3 b) { return mk(a.x-b.x, a.y-b.y, a.z-b.z); }
 __device__ inline float3 operator*(float3 a, float s)  { return mk(a.x*s, a.y*s, a.z*s); }
 __device__ inline float  dot3(float3 a, float3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+__device__ inline float3 cross3(float3 a, float3 b) {
+    return mk(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);
+}
 __device__ inline float3 normalize3(float3 a) {
     float L = sqrtf(dot3(a, a));
     return (L > 1e-12f) ? a * (1.0f / L) : a;
@@ -291,6 +337,28 @@ __device__ inline float3 dSampleRgb(const DTex* meta, const float3* texels, int 
     float3 a = c00 * (1.0f - fx) + c10 * fx;
     float3 b = c01 * (1.0f - fx) + c11 * fx;
     return a * (1.0f - fy) + b * fy;
+}
+
+// The pattern VM's `tex:` hook (declared with DTex). Mirrors Texture::scalarAt — the mean
+// of the three linear channels at (u,v) — using the same sampler the skin path uses, so a
+// `tex:` node inside a pattern reads exactly the texels a bound skin would.
+__device__ inline double DTex::patScalarAt(double u, double v) const {
+    if (!valid || !texels) return 0.5;
+    // dSampleRgb indexes meta[ti] and offsets texels itself; this record IS meta[ti] and
+    // `texels` is the shared base, so passing (this, texels, 0) samples exactly this map.
+    float3 c = dSampleRgb(this, texels, 0, (float)u, (float)v);
+    return ((double)c.x + (double)c.y + (double)c.z) * (1.0 / 3.0);
+}
+
+// Tangent-space normal at (u,v) — device twin of Texture::sampleNormalTS (C6). The map
+// stores an encoded normal: linear RGB in [0,1] remapped to [-1,1]^3 and normalized. The
+// caller rotates the result into world space with the triangle's TBN frame.
+__device__ inline float3 dSampleNormalTS(const DTex* meta, const float3* texels, int ti,
+                                         float u, float v) {
+    float3 c = dSampleRgb(meta, texels, ti, u, v);
+    float3 n = mk(2.0f * c.x - 1.0f, 2.0f * c.y - 1.0f, 2.0f * c.z - 1.0f);
+    float l = sqrtf(dot3(n, n));
+    return (l > 1e-12f) ? n * (1.0f / l) : mk(0.0f, 0.0f, 1.0f);
 }
 
 // Triplanar (box) projection of the LINEAR RGB albedo at a world hit — device twin of
@@ -411,6 +479,8 @@ __device__ inline void emitSlot(DGeo* geos, DAttr* attrs, int* flags, int idx,
         a.wp2 = C.wp; a.wn2 = C.wn; a.uv2 = C.uv;
         a.color = t.color; a.tex = t.tex; a.triplanarScale = t.triplanarScale;
         a.emissive = t.emissive;
+        a.normalTex = t.normalTex; a.normalStrength = t.normalStrength;
+        a.reflectPat = t.reflectPat; a.emitPat = t.emitPat;
         attrs[idx] = a;
     }
     flags[idx] = kSlotValid | (t.clear ? kSlotClear : 0) | (clipped ? kSlotClipped : 0)
@@ -717,6 +787,32 @@ __global__ void kRasterLarge(const DGeo* geos, const int* flags, const int* list
     }
 }
 
+// Per-triangle tangent from the UV parameterisation (device twin of the CPU pipeline's
+// raster::triTangentRaw + the shade pass's per-pixel Gram-Schmidt, fused — a GPU thread
+// recomputes the raw part too, since at 0.2 ms for the whole kShade pass a per-triangle
+// bake would buy nothing): the world direction in which u increases, orthogonalized
+// against the shading normal.
+// Degenerate UVs (a zero-area triangle in texture space) fall back to any perpendicular,
+// which is what a normal map with no usable frame deserves — a stable, if arbitrary, basis
+// rather than a NaN.
+__device__ inline float3 dTriTangent(float3 p0, float3 p1, float3 p2,
+                                     float2 t0, float2 t1, float2 t2, float3 N) {
+    float3 e1 = p1 - p0, e2 = p2 - p0;
+    float d1x = t1.x - t0.x, d1y = t1.y - t0.y;
+    float d2x = t2.x - t0.x, d2y = t2.y - t0.y;
+    float det = d1x * d2y - d2x * d1y;
+    float3 T;
+    if (fabsf(det) > 1e-18f) {
+        T = (e1 * d2y - e2 * d1y) * (1.0f / det);
+    } else {
+        float3 ax = (fabsf(N.x) < 0.9f) ? mk(1, 0, 0) : mk(0, 1, 0);
+        T = cross3(ax, N);
+    }
+    T = T - N * dot3(N, T);
+    float l = sqrtf(dot3(T, T));
+    return (l > 1e-12f) ? T * (1.0f / l) : mk(0.0f, 0.0f, 0.0f);
+}
+
 // ---------------------------------------------------------------------------
 // Pass C: resolve + shade each pixel once. Decode the winning slot, recompute barycentrics
 // at the pixel centre (same float math as kRaster, so the winner's 1/depth reproduces),
@@ -727,6 +823,8 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
                        float ambient, float keyScale, float fill,
                        DCam cam, int W, int H, float3 bg, float emisBoost,
                        const DTex* texMeta, const float3* texels, int nTex,
+                       const PatNode* patNodes, const DPattern* patterns, int nPatterns,
+                       DPatEnv patEnv, const DMix* mixes, int nMixes,
                        float3* accum, float* zbuf, unsigned char* emis) {
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (unsigned long long)W * H) return;
@@ -753,48 +851,106 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // vertices were lerped by the near clip (then the DAttr store holds them).
     float3 wp0, wp1, wp2, wn0, wn1, wn2, color;
     float2 uv0, uv1, uv2;
-    int tex, emissive; float tps;
+    int tex, emissive, nrmTex, rPat, ePat; float tps, nrmS;
     if (flags[slot] & kSlotClipped) {
         const DAttr& a = attrs[slot];
         wp0 = a.wp0; wn0 = a.wn0; uv0 = a.uv0;
         wp1 = a.wp1; wn1 = a.wn1; uv1 = a.uv1;
         wp2 = a.wp2; wn2 = a.wn2; uv2 = a.uv2;
         color = a.color; tex = a.tex; tps = a.triplanarScale; emissive = a.emissive;
+        nrmTex = a.normalTex; nrmS = a.normalStrength;
+        rPat = a.reflectPat; ePat = a.emitPat;
     } else {
         const DPTri& s = tris[slot >> 1];
         wp0 = s.p0; wn0 = s.n0; uv0 = s.uv0;
         wp1 = s.p1; wn1 = s.n1; uv1 = s.uv1;
         wp2 = s.p2; wn2 = s.n2; uv2 = s.uv2;
         color = s.color; tex = s.tex; tps = s.triplanarScale; emissive = s.emissive;
+        nrmTex = s.normalTex; nrmS = s.normalStrength;
+        rPat = s.reflectPat; ePat = s.emitPat;
     }
     if (flags[slot] & kSlotBack) {           // two-sided: the whole triangle faces away
         wn0 = wn0 * -1.0f; wn1 = wn1 * -1.0f; wn2 = wn2 * -1.0f;
     }
     emis[i] = emissive ? 1 : 0;
-    if (emissive) { accum[i] = color * emisBoost; return; }   // raw emitter radiance
 
     // Perspective-correct world pos / normal.
     float d = 1.0f / fmaxf(invd, 1e-12f);
     float3 wpos = (wp0 * (w0 * t.invd0) + wp1 * (w1 * t.invd1) + wp2 * (w2 * t.invd2)) * d;
     float3 wn   = (wn0 * (w0 * t.invd0) + wn1 * (w1 * t.invd1) + wn2 * (w2 * t.invd2)) * d;
+    // Perspective-correct UV, needed by the skin, the normal map and the pattern VM alike.
+    float uu = (uv0.x * (w0 * t.invd0) + uv1.x * (w1 * t.invd1) + uv2.x * (w2 * t.invd2)) * d;
+    float vv = (uv0.y * (w0 * t.invd0) + uv1.y * (w1 * t.invd1) + uv2.y * (w2 * t.invd2)) * d;
+
+    // Per-hit `mix`: a `weight_map` selects between two whole material payloads at every
+    // point, so it must be resolved before anything below reads one. The mix index is
+    // material-derived, hence identical for a clipped slot and its source triangle —
+    // so it is read from the source either way (slot >> 1), needing no room in DAttr.
+    // Evaluated here, after the perspective-correct wpos/normal/UV the mask samples at.
+    const int mixId = tris[slot >> 1].mix;
+    if (mixId >= 0 && mixId < nMixes && mixes) {
+        const DMix& mx = mixes[mixId];
+        double wt = 0.0;
+        if (mx.weightPat >= 0 && mx.weightPat < nPatterns && patNodes) {
+            const DPattern& wp = patterns[mx.weightPat];
+            float3 pn = normalize3(wn);
+            double qx = wpos.x, qy = wpos.y, qz = wpos.z;
+            double qr = sqrt(qx * qx + qy * qy + qz * qz);
+            wt = dPatternEval(patNodes + wp.off, wp.n, qx, qy, qz, 0.0,
+                              pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, patEnv);
+        } else if (mx.weightTex >= 0 && mx.weightTex < nTex) {
+            wt = texMeta[mx.weightTex].patScalarAt((double)uu, (double)vv);
+        }
+        wt = fmin(1.0, fmax(0.0, wt));
+        if (wt < 0.5) {                       // child 1 wins here — swap its payload in
+            color = mx.color; tex = mx.tex; tps = mx.triplanarScale;
+            nrmTex = mx.normalTex; nrmS = mx.normalStrength;
+            rPat = mx.reflectPat; ePat = mx.emitPat;
+        }
+    }
 
     // Image skin: replace the flat albedo with the texture's linear RGB, sampled either at
     // the interpolated per-vertex UV or by world triplanar projection (mirrors raster.h P3).
     float3 col = color;
-    if (tex >= 0 && tex < nTex) {
-        if (tps > 0.0f) {
-            col = dSampleRgbTri(texMeta, texels, tex, wpos, wn, tps);
-        } else {
-            float u = (uv0.x * (w0 * t.invd0) + uv1.x * (w1 * t.invd1) + uv2.x * (w2 * t.invd2)) * d;
-            float v2 = (uv0.y * (w0 * t.invd0) + uv1.y * (w1 * t.invd1) + uv2.y * (w2 * t.invd2)) * d;
-            col = dSampleRgb(texMeta, texels, tex, u, v2);
-        }
+    if (tex >= 0 && tex < nTex)
+        col = (tps > 0.0f) ? dSampleRgbTri(texMeta, texels, tex, wpos, wn, tps)
+                           : dSampleRgb(texMeta, texels, tex, uu, vv);
+
+    // Procedural drive: a bound `pattern` is a scalar clamped to [0,1] that SCALES its slot
+    // — the albedo for `reflect pattern:`/`reflect_map pattern:`, the emission for
+    // `emit pattern:`/`emit_map pattern:`. Evaluated before the emissive early-out, which is
+    // the whole point: an emit mask (e.g. a glowing grid on a dark plane) only exists here.
+    int pat = emissive ? ePat : rPat;
+    if (pat >= 0 && pat < nPatterns && patNodes) {
+        const DPattern& pp = patterns[pat];
+        float3 pn = normalize3(wn);
+        double px = wpos.x, py = wpos.y, pz = wpos.z;
+        double r  = sqrt(px * px + py * py + pz * pz);
+        // f = 0: the implicit field value is exactly 0 on the level set the marched mesh
+        // approximates, matching both the CPU preview and the tracer's own hit context.
+        double s = dPatternEval(patNodes + pp.off, pp.n, px, py, pz, 0.0,
+                                pn.x, pn.y, pn.z, r, (double)uu, (double)vv, patEnv);
+        col = col * (float)fmin(1.0, fmax(0.0, s));
     }
+    if (emissive) { accum[i] = col * emisBoost; return; }   // raw emitter radiance
 
     // No two-sided flip here: decided once per triangle in kProject, exactly as the CPU
     // rasterizer does (see raster.h projectRange). Flipping the interpolated normal per
     // pixel inverted a 1-px band at every silhouette, where dot(N,V) grazes through zero.
     float3 N3 = normalize3(wn);
+    // Normal map (C6): rotate the tangent-space normal into world with the triangle's TBN.
+    // The tangent comes from the SOURCE triangle's UV parameterisation, so a clipped slot
+    // (whose stored verts are lerped) still gets the same frame as its unclipped siblings.
+    if (nrmTex >= 0 && nrmTex < nTex) {
+        float3 T = dTriTangent(wp0, wp1, wp2, uv0, uv1, uv2, N3);
+        if (dot3(T, T) > 1e-18f) {
+            float3 B3 = cross3(N3, T);
+            float3 tn = dSampleNormalTS(texMeta, texels, nrmTex, uu, vv);
+            float3 pert = T * (tn.x * nrmS) + B3 * (tn.y * nrmS) + N3 * tn.z;
+            float pl = sqrtf(dot3(pert, pert));
+            if (pl > 1e-12f) N3 = pert * (1.0f / pl);
+        }
+    }
     float3 V  = normalize3(cam.eye - wpos);
     float lit = 0.0f;
     for (int li = 0; li < nLights; ++li) {
@@ -1043,6 +1199,21 @@ struct Scene {
     DTex*    dtexMeta = nullptr;
     float3*  dtexels  = nullptr;
     int      nTex     = 0;
+    // Procedural patterns (§4) bound to a triangle's albedo/emission: one flat PatNode pool
+    // sliced per pattern by DPattern, plus the grid/scatter sample tables and the flat float
+    // pool they read (all uploaded verbatim from the host Scene — same POD, same maths).
+    PatNode*     dpatNodes = nullptr;
+    DPattern*    dpatterns = nullptr;
+    int          nPatterns = 0;
+    PatGrid*     dgrids    = nullptr;
+    int          nGrids    = 0;
+    PatScatter*  dscatters = nullptr;
+    int          nScatters = 0;
+    float*       ddataPool = nullptr;
+    int          nDataPool = 0;
+    // Per-hit `mix` side table (one entry per weight-mapped mix MATERIAL, not per triangle).
+    DMix*        dmixes    = nullptr;
+    int          nMixes    = 0;
     // Per-pixel scratch (sized to the largest W*H seen).
     unsigned long long* vis    = nullptr;
     float3*             accum  = nullptr;
@@ -1079,6 +1250,17 @@ struct Scene {
 #endif
 };
 
+// The sample tables a `pattern` expression can reach into (`tex:`, `grid:`, `scatter:`),
+// bundled for the shared VM. Built per launch — it is just eight uploaded pointers/counts.
+static DPatEnv patEnvOf(const Scene& sc) {
+    DPatEnv e;
+    e.tex      = sc.dtexMeta;  e.nTex      = sc.nTex;
+    e.grids    = sc.dgrids;    e.nGrids    = sc.nGrids;
+    e.scatters = sc.dscatters; e.nScatters = sc.nScatters;
+    e.dataPool = sc.ddataPool; e.dataPoolN = sc.nDataPool;
+    return e;
+}
+
 static float3 toF3(const Vec3& v) { return make_float3((float)v.x, (float)v.y, (float)v.z); }
 
 // Non-aborting device alloc: returns false on failure (the rasterizer falls back to CPU
@@ -1110,6 +1292,12 @@ void destroy(Scene* sc) {
     if (sc->dlights)  cudaFree(sc->dlights);
     if (sc->dtexMeta) cudaFree(sc->dtexMeta);
     if (sc->dtexels)  cudaFree(sc->dtexels);
+    if (sc->dpatNodes) cudaFree(sc->dpatNodes);
+    if (sc->dpatterns) cudaFree(sc->dpatterns);
+    if (sc->dgrids)    cudaFree(sc->dgrids);
+    if (sc->dscatters) cudaFree(sc->dscatters);
+    if (sc->ddataPool) cudaFree(sc->ddataPool);
+    if (sc->dmixes)    cudaFree(sc->dmixes);
     if (sc->vis)      cudaFree(sc->vis);
     if (sc->accum)    cudaFree(sc->accum);
     if (sc->zbuf)     cudaFree(sc->zbuf);
@@ -1130,11 +1318,13 @@ void destroy(Scene* sc) {
     delete sc;
 }
 
-Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight& light,
-              const std::vector<Texture>* textures) {
+Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light,
+              const ::Scene* scene) {
+    const std::vector<raster::PTri>& tris = geom.tris;
     if (!available() || tris.empty()) return nullptr;
     Scene* sc = new Scene();
     sc->nTris = (int)tris.size();
+    const std::vector<Texture>* textures = scene ? &scene->textures : nullptr;
 
     // Bake triangles.
     std::vector<DPTri> h(tris.size());
@@ -1151,11 +1341,40 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
         d.triplanarScale = (float)t.triplanarScale;
         d.emissive = t.emissive ? 1 : 0;
         d.clear = t.clear ? 1 : 0;
+        d.normalTex = t.normalTex;
+        d.normalStrength = (float)t.normalStrength;
+        d.reflectPat = t.reflectPat;
+        d.emitPat    = t.emitPat;
+        d.mix        = t.mix;
     }
+    // Bake the per-hit `mix` side table (raster.h's PMix -> DMix). One entry per
+    // weight-mapped mix MATERIAL, so this stays tiny however many triangles index it.
+    std::vector<DMix> hmix(geom.mixes.size());
+    for (size_t i = 0; i < geom.mixes.size(); ++i) {
+        const raster::PMix& m = geom.mixes[i];
+        DMix& d = hmix[i];
+        d.weightPat = m.weightPat;
+        d.weightTex = m.weightTex;
+        d.color = toF3(m.b.color);
+        d.tex   = m.b.tex;
+        d.triplanarScale = (float)m.b.triplanarScale;
+        d.normalTex      = m.b.normalTex;
+        d.normalStrength = (float)m.b.normalStrength;
+        d.reflectPat     = m.b.reflectPat;
+        d.emitPat        = m.b.emitPat;
+    }
+    sc->nMixes = (int)hmix.size();
     // Bake image-skin textures: flatten every texture's LINEAR rgb into one shared texel
     // array, plus per-texture metadata (dims/filter/wrap/offset). Sampling on the device
-    // mirrors Texture::sampleRgb / sampleRgbTriplanar exactly. Palette (indexed) textures
-    // sample their raw index-map rgb here, identical to the CPU preview's sampleRgb path.
+    // mirrors Texture::sampleRgb / sampleRgbTriplanar exactly.
+    //
+    // Palette (indexed, §9.3) maps are RESOLVED here rather than uploaded raw: their `rgb`
+    // holds an INDEX in the red channel, not a colour, so uploading it verbatim would shade
+    // entry 3 of 12 as near-black. Texture::paletteRgb (built by buildReflCoeff) already
+    // holds each palette spectrum's linear-sRGB colour, so the flatten substitutes it per
+    // texel — the exact colours the host's sampleRgb returns. Indices are categorical, so
+    // such a map is forced to NEAREST: bilerping two resolved colours across a palette
+    // boundary would invent a colour that is in no spectrum.
     std::vector<DTex>   htexMeta;
     std::vector<float3> htexels;
     if (textures && !textures->empty()) {
@@ -1164,17 +1383,41 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
             const Texture& tx = (*textures)[i];
             DTex& m = htexMeta[i];
             m.w = tx.w; m.h = tx.h;
-            m.filter = (tx.filter == TexFilter::Nearest) ? 0 : 1;
+            m.filter = (tx.filter == TexFilter::Nearest || tx.hasPalette()) ? 0 : 1;
             m.wrap   = (tx.wrap == TexWrap::Clamp) ? 1 : (tx.wrap == TexWrap::Mirror ? 2 : 0);
             m.offset = (int)htexels.size();
             m.valid  = tx.valid() ? 1 : 0;
-            if (m.valid) {
+            m.texels = nullptr;   // patched to the device base once dtexels is allocated
+            if (m.valid && tx.hasPalette() && !tx.paletteRgb.empty()) {
+                const int np = (int)tx.paletteRgb.size();
+                for (const Vec3& c : tx.rgb) {
+                    int idx = (int)(c.x * 255.0 + 0.5);          // red channel IS the index
+                    idx = (idx < 0) ? 0 : (idx >= np ? np - 1 : idx);
+                    const Vec3& pc = tx.paletteRgb[idx];
+                    htexels.push_back(make_float3((float)pc.x, (float)pc.y, (float)pc.z));
+                }
+            } else if (m.valid) {
                 for (const Vec3& c : tx.rgb)
                     htexels.push_back(make_float3((float)c.x, (float)c.y, (float)c.z));
             }
         }
     }
     sc->nTex = (int)htexMeta.size();
+
+    // Bake procedural patterns (§4): one flat PatNode pool sliced per pattern, exactly as
+    // render_cuda.cu does, so both backends run the same programs through the same VM.
+    std::vector<PatNode>  hpatNodes;
+    std::vector<DPattern> hpat;
+    if (scene) {
+        hpat.resize(scene->patterns.size());
+        for (size_t i = 0; i < scene->patterns.size(); ++i) {
+            const Pattern& p = scene->patterns[i];
+            hpat[i].off = (int)hpatNodes.size();
+            hpat[i].n   = (int)p.nodes.size();
+            hpatNodes.insert(hpatNodes.end(), p.nodes.begin(), p.nodes.end());
+        }
+    }
+    sc->nPatterns = (int)hpat.size();
     // Bake lights.
     std::vector<DLight> hl(light.lights.size());
     for (size_t i = 0; i < light.lights.size(); ++i) {
@@ -1208,7 +1451,24 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
         ok = tryMalloc((void**)&sc->dtexMeta, sizeof(DTex) * htexMeta.size());
     if (ok && !htexels.empty())
         ok = tryMalloc((void**)&sc->dtexels, sizeof(float3) * htexels.size());
+    if (ok && !hpatNodes.empty())
+        ok = tryMalloc((void**)&sc->dpatNodes, sizeof(PatNode) * hpatNodes.size());
+    if (ok && !hpat.empty())
+        ok = tryMalloc((void**)&sc->dpatterns, sizeof(DPattern) * hpat.size());
+    if (ok && scene && !scene->grids.empty())
+        ok = tryMalloc((void**)&sc->dgrids, sizeof(PatGrid) * scene->grids.size());
+    if (ok && scene && !scene->scatters.empty())
+        ok = tryMalloc((void**)&sc->dscatters, sizeof(PatScatter) * scene->scatters.size());
+    if (ok && scene && !scene->dataPool.empty())
+        ok = tryMalloc((void**)&sc->ddataPool, sizeof(float) * scene->dataPool.size());
+    if (ok && !hmix.empty())
+        ok = tryMalloc((void**)&sc->dmixes, sizeof(DMix) * hmix.size());
     if (!ok) { destroy(sc); return nullptr; }
+
+    // The pattern VM reaches a texture through DTex::patScalarAt, which has no texel-array
+    // parameter — so each record carries the DEVICE base pointer. It only exists now that
+    // dtexels is allocated, hence the patch here (before the meta upload below).
+    for (DTex& m : htexMeta) m.texels = sc->dtexels;
 
     if (cudaMemcpy(sc->dtris, h.data(), sizeof(DPTri) * tris.size(),
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
@@ -1220,6 +1480,32 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
     if (!htexels.empty() &&
         cudaMemcpy(sc->dtexels, htexels.data(), sizeof(float3) * htexels.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    if (!hpatNodes.empty() &&
+        cudaMemcpy(sc->dpatNodes, hpatNodes.data(), sizeof(PatNode) * hpatNodes.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    if (!hpat.empty() &&
+        cudaMemcpy(sc->dpatterns, hpat.data(), sizeof(DPattern) * hpat.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    if (scene && !scene->grids.empty()) {
+        sc->nGrids = (int)scene->grids.size();
+        if (cudaMemcpy(sc->dgrids, scene->grids.data(), sizeof(PatGrid) * scene->grids.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    }
+    if (scene && !scene->scatters.empty()) {
+        sc->nScatters = (int)scene->scatters.size();
+        if (cudaMemcpy(sc->dscatters, scene->scatters.data(),
+                       sizeof(PatScatter) * scene->scatters.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    }
+    if (scene && !scene->dataPool.empty()) {
+        sc->nDataPool = (int)scene->dataPool.size();
+        if (cudaMemcpy(sc->ddataPool, scene->dataPool.data(),
+                       sizeof(float) * scene->dataPool.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    }
+    if (!hmix.empty() &&
+        cudaMemcpy(sc->dmixes, hmix.data(), sizeof(DMix) * hmix.size(),
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
     // The EXACT sRGB table bytes the host tonemap indexes — sharing it is part of the
     // byte-identity guarantee of the device tonemap (see kToneMap / encodeSrgb).
@@ -1353,6 +1639,8 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
                           sc->dlights, sc->nLights,
                           sc->ambient, sc->keyScale, sc->fill, dc, W, H, bg, EMIS_BOOST,
                           sc->dtexMeta, sc->dtexels, sc->nTex,
+                          sc->dpatNodes, sc->dpatterns, sc->nPatterns, patEnvOf(*sc),
+                          sc->dmixes, sc->nMixes,
                           sc->accum, sc->zbuf, sc->emis);
     rec(4);
 

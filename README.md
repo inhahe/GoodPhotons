@@ -492,12 +492,36 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
 > ghost and a mirror as a flat tint. (Opt in to **see-through clear objects** with
 > `-see-through` — see below — which drops the ghost for a dim + milky-haze pass
-> that still refracts nothing.) **Image skins** *are* shown: a material whose
-> albedo is a bound texture (`reflect texture:<name>`) is previewed by
-> interpolating the surface's per-vertex UVs — or, for an un-UV'd mesh/isosurface,
-> the material's world **triplanar** projection — and sampling the texture's linear
-> RGB per pixel, so a skinned globe/wallpaper/torus reads with its actual image
-> rather than a flat colour. Shading sums a diffuse term from **every**
+> that still refracts nothing.) But everything that gives a surface its look **at a
+> single point** *is* shown, on both the CPU and GPU preview alike:
+>
+> * **Image skins** — a material whose albedo is a bound texture
+>   (`reflect texture:<name>`) is sampled per pixel, so a skinned
+>   globe/wallpaper/torus reads with its actual image rather than a flat colour. The
+>   UVs come from the surface's per-vertex coords; from the material's world
+>   **triplanar** projection for an un-UV'd mesh; or, for a marched
+>   isosurface/CSG, from the primitive's own `uv planar|spherical|cylindrical`
+>   projection (marching cubes produces no per-vertex UVs, so without this a skinned
+>   implicit would preview bare).
+> * **Palette (indexed-spectral) maps** — previewed as the colours their palette
+>   spectra actually reflect, not as the raw index stored in the image.
+> * **Procedural `pattern` drives** — `reflect pattern:` / `reflect_map pattern:`
+>   modulate the albedo, and `emit pattern:` / `emit_map pattern:` modulate the
+>   **emission**, both evaluated per pixel by the same expression VM the real
+>   renderer uses. So a masked emitter (a glowing grid on a dark floor) previews as
+>   the grid, not as one flat glowing slab.
+> * **Normal maps** — `normal_map` perturbs the shading normal through the
+>   triangle's UV-derived tangent frame, so surface relief shows.
+> * **`mix` / layered materials** — previewed as their dominant child (the same
+>   choice the deterministic `-mode W` viewer makes) rather than the parent's colour.
+> * **`mix` blend masks** — a two-child `mix` carrying a `weight_map texture:` /
+>   `weight_map pattern:` is instead resolved **per pixel**, hard-thresholded at ½
+>   exactly as `-mode W` does, and the winning child's *whole* payload (albedo, skin,
+>   normal map, pattern drives) is swapped in. So a wear mask, decal or painted A/B
+>   blend previews as the spatial pattern it is, not as one flat winner.
+>
+> Roughness and film-thickness maps are deliberately *not* previewed: the preview
+> has no glossy lobe for them to drive. Shading sums a diffuse term from **every**
 > scene light using its real position/direction (spot cones included), so multi-
 > light rooms read with their true key directions. It reuses the **same camera
 > projection** as the real renderer, so the pinhole's off-axis stretch (spheres
@@ -543,11 +567,13 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > CPU (~5×), with the one-time tessellation unchanged; tiny scenes are launch-bound
 > and roughly tie. **Scope:** the GPU path covers **all camera projections**
 > (rectilinear **and** fisheye/panoramic — the device applies the same angular lens
-> map the real camera uses), **opaque and textured (skinned)** geometry (image skins
-> — per-vertex UV **and** world-triplanar `reflect texture:<name>` albedo — are sampled
-> on-device), **and** `-see-through` clear-glass compositing (a device clear-accumulation
-> pass mirrors the CPU one). Only a device allocation failure falls back to the CPU
-> rasterizer per camera (mixed camera lists just work), so `-device gpu` never fails a
+> map the real camera uses), **opaque** geometry, **and** `-see-through` clear-glass
+> compositing (a device clear-accumulation pass mirrors the CPU one). Its shading has
+> **full parity with the CPU preview** — image skins, palette maps, normal maps and
+> procedural `pattern` drives on albedo and emission all run on-device, the last through
+> the very same expression VM the GPU path tracer uses. Only a device allocation failure
+> falls back to the CPU rasterizer per camera (mixed camera lists just work), so
+> `-device gpu` never fails a
 > preview it can't accelerate. Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -device gpu -window -o png/preview.png`.
 >
@@ -1566,7 +1592,16 @@ second:**
   participating media, a GRIN volume, or a finite-lens camera also stay single-λ everywhere.
   The bundle size is runtime-configurable with **`-heroc N`** (default 4, range 1–8);
   `-heroc 1` turns hero off, reducing every hero tracer (CPU and the GPU megakernel)
-  bit-identically to the classic single-λ estimator.
+  bit-identically to the classic single-λ estimator. **Do not do that in mode `W`.** Mode
+  `W` defaults to the widest bundle (`8`) because at 1 spp the `N` hero wavelengths *are*
+  the whole spectral quadrature — there are no further samples to average a collapse away,
+  so `-heroc 1` there does not make a dispersive surface noisier, it makes it **wrong**
+  (a Cornell `glass:SF10` sphere renders a flat green ball: 46.85 pp of chroma error against
+  0.82 pp at the default). It also buys almost nothing: mode `W` is traversal-bound, so its
+  full 8-wavelength bundle measures at **2.7 %** of frame time over a single wavelength
+  (versus 61 % in mode `R`). Passing `-heroc 1` to a batch mode-`W` render on a scene with a
+  dispersive dielectric, thin film, grating, multilayer, layered coat or fluorescence now
+  prints a warning naming the material.
   **`-herosplit`** changes the dispersive-event policy from terminate-secondaries to
   **split**: all `N` wavelengths carry on, each refracting along its *own* per-λ
   direction, so one bundle fans out into `N` monochromatic sub-paths through the glass.
@@ -2948,7 +2983,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-savemap <f>` / `-loadmap <f>` | Mode `M` (GPU) view-independent photon-map cache. `-savemap` writes the built map to `<f>` after the forward deposit; `-loadmap` reloads it and **skips the deposit**, re-gathering any camera / radius for free. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene. Like `-o`, a missing parent directory for `-savemap` is created up front rather than discovered after the deposit |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
-| `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S`, BDPT `D` and VCM `U`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D`, and VCM `U`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. VCM (`U`) does the same on **both** backends: one bundle per path index feeds both its light and camera subpath, so its *connections* are exact per-λ while its *merges* key off each stored light vertex's own wavelengths — **0.51× noise RMS** at equal passes on a gel + mirror box (CPU), **0.72–0.82× chroma noise** for 1.5–1.7× the time on the GPU, matching the single-λ estimator to 0.02 % and each other to 0.03 %. In modes `R` and `A`/`B`/`C` (and the `M`/`S` deposit) the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors in `R` and ~1.1× luma / 1.3–1.8× chroma at equal time in the forward modes. Default `4`; clamped to `1..8`. `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator). Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`) and by any scene with participating media, a GRIN volume, or a finite-lens camera |
+| `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S`, BDPT `D` and VCM `U`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D`, and VCM `U`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. VCM (`U`) does the same on **both** backends: one bundle per path index feeds both its light and camera subpath, so its *connections* are exact per-λ while its *merges* key off each stored light vertex's own wavelengths — **0.51× noise RMS** at equal passes on a gel + mirror box (CPU), **0.72–0.82× chroma noise** for 1.5–1.7× the time on the GPU, matching the single-λ estimator to 0.02 % and each other to 0.03 %. In modes `R` and `A`/`B`/`C` (and the `M`/`S` deposit) the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors in `R` and ~1.1× luma / 1.3–1.8× chroma at equal time in the forward modes. Default `4`; clamped to `1..8`. **Mode `W` defaults to `8` instead** — at 1 spp the bundle *is* the spectral quadrature, and it is nearly free there (measured 2.7 % of frame time versus a single wavelength, because mode `W` is traversal-bound; the same step costs 61 % in mode `R`). `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator) — fine in the sampled modes, but in mode `W` it renders dispersive surfaces flatly **wrong** rather than merely noisy, and a batch mode-`W` render now warns and names the offending material. Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`) and by any scene with participating media, a GRIN volume, or a finite-lens camera |
 | `-herosplit` | **Split-at-dispersion** instead of the default de-hero policy. Normally a dispersive event (dielectric refraction, grating order, fluorescent Stokes shift) *terminates* the `N-1` secondary wavelengths and boosts the hero ×`N`, because they can no longer follow one shared direction. With `-herosplit` all `N` wavelengths **continue**, each running the same interaction with its own λ — refracting along its own Snell direction, diffracting into its own grating order — so the bundle fans out into `N` independent monochromatic sub-paths. Same mean (both estimators are unbiased; verified `sum/emitted = 1.000000` and converged luminance matching a 200 M-photon reference to 0.03 %), but the chromatic spread of a prism / rainbow / dispersive caustic is resolved **geometrically per photon** instead of stochastically across many. Measured on a dispersive `glass:SF10` flint-sphere Cornell box, **at equal wall clock**: **0.70× chroma / 0.89× luma noise RMS inside the caustic**, 0.80× / 0.92× over the whole frame. The extra traversal past the split is linear, not exponential (a monochromatic sub-path never re-splits) and is paid only by photons that actually reach the glass — **1.11×** per photon there — but that ratio is scene-dependent, which is why it stays opt-in. No-op with `-heroc 1`. **CPU forward modes `A`/`B`/`C` + the `M`/`S` photon deposit** only — ignored by the GPU backends, the backward tracer (`R`), BDPT (`D`) and VCM (`U`). |
 | `-beams` / `-photonbeams` | **Decorrelated single-scatter volumetrics** for the shared forward mode-`B` multi-camera / flyby pass. Normally that pass splats one photon realisation to every camera, so a view-dependent single-scatter effect (rainbow / fogbow / glory) has the *same* frozen speckle in every frame. `-beams` switches to a **single-scattering long-beam** estimator: the photon crosses the medium straight (deposited once), and **each camera independently samples its own in-scatter point** toward its own eye — so all cameras share the same mean bow but get **independent per-frame noise** (≈1× photon cost across the flyby, correct per-view angle, non-frozen grain). Deliberately omits the multiple-scatter haze wash (crisper bow). Runs on **CPU and GPU** (ported to the CUDA forward tracer; spectral-rainbow-phase media stay CPU-tabulated and fall back to CPU); needs ≥2 shared cameras + a scattering `medium`. No effect otherwise. |
 | `-camera <sel>` | Pick which camera(s) to render (and thus what `-window`/`-preview` shows). `<sel>` is `all`, an exact name (`hero`, `fly137`), a **path base name** (`fly` selects every frame of `camera_curve "fly"` — `fly000..fly143` — while excluding unrelated stills), an index `#N` into the declared cameras (0-based, `#-1` = last), or `near=X,Y,Z` (the camera whose eye is closest to that point). The path-base form renders one whole flyby from a scene that also declares one-off stills; the index / nearest forms aim the live view at one frame of a long `camera_curve` without hunting for its frame name. |
@@ -3038,11 +3073,20 @@ alone can't restore, so they are not disk-resumable.
 `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`, `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checksun`, `-checkbind`, `-checkprop`,
-`-checkarray`. Each runs deterministically without a scene and prints
+`-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
 `PASS`/`FAIL`. `-checkcontainer` guards the isosurface container clip: rotating an
 isosurface must not change what a ray sees, so it builds the same solid twice
 (axis-aligned and rigidly rotated) and checks that correspondingly rotated rays
-return identical hit distances.
+return identical hit distances. `-checklattice` guards **mode W**'s deterministic
+sample lattices: first the structural contracts (the digit scramble is a bijection,
+`radicalInverseScr(b, 0) == 0` exactly so sample 0 stays the mirror direction /
+specular order / median λ, the first *b* points are a permutation of the *b*-point
+grid, and 16 samples span at least half the unit interval in every base), then a
+**bit-exact** CPU-vs-GPU sweep over every lattice helper. Mode W has no Monte-Carlo
+noise for a device mismatch to hide behind, and these helpers are pure
+integer-and-`double` arithmetic on both sides, so unlike a rendered image they must
+agree to the last bit — a CUDA build compares them directly, a CPU-only build reports
+that half as `SKIPPED`.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are

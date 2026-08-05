@@ -124,34 +124,57 @@ class Transform:
         out-of-plane components are ignored.
         """
         q = VecSignal.of(query)
-        d = q.dim
+        return VecSignal(self._inverse_map(list(q.components), q.dim, lambda s: s))
+
+    def inverse_apply_spatial(self, coords) -> List:
+        """The :mod:`loom.spatial` twin of :meth:`inverse_apply`: map world-space
+        **SpatialExpr** coordinates back into this transform's local frame.
+
+        Identical formula, identical code path — only the algebra differs, because a
+        transform's own parameters are temporal :class:`Signal`\\s in both cases and
+        the spatial algebra coerces them (``spatial._Sig``).  This is what lets a
+        placed :class:`~loom.data.Grid` be sampled from a *field* expression
+        (``grid(X, Y)``) and still read the same values a world-space curve would
+        (:func:`loom.interp._local_query`) — the placement is folded into the emitted
+        coordinate arguments, since ftsl's ``grid`` block has no transform of its own.
+        """
+        from .spatial import sexpr
+        c = [sexpr(x) for x in coords]
+        return self._inverse_map(c, len(c), sexpr)
+
+    def _inverse_map(self, c: List, d: int, wrap) -> List:
+        """Shared body of :meth:`inverse_apply` / :meth:`inverse_apply_spatial`.
+
+        ``c`` holds the query components in *some* algebra (temporal Signals or
+        spatial expressions) and ``wrap`` lifts one of this transform's own scalar
+        parameters into that same algebra, so the two backends can never drift.
+        """
         if d not in (2, 3):
             raise ValueError(
                 "Transform.inverse_apply supports only 2-D or 3-D queries "
                 f"(got dim {d})")
-        c: List[Signal] = list(q.components)
         # Undo, outermost first: translate, then rotation, then scale, then shear.
         if self.translate is not None:
             t = self.translate.components
-            c = [c[i] - t[i] for i in range(d)]
+            c = [c[i] - wrap(t[i]) for i in range(d)]
         if self.rotate is not None:
-            c = self._inv_rotate(c, d)
+            c = self._inv_rotate(c, d, wrap)
         if self.scale is not None:
             s = self.scale.components
-            c = [c[i] / s[i] for i in range(d)]
+            c = [c[i] / wrap(s[i]) for i in range(d)]
         if self.skew is not None:
-            c = self._inv_shear(c, d)
-        return VecSignal(c)
+            c = self._inv_shear(c, d, wrap)
+        return c
 
-    def _inv_rotate(self, c: List[Signal], d: int) -> List[Signal]:
+    def _inv_rotate(self, c: List, d: int, wrap) -> List:
         r = self.rotate.components
         if d == 2:
-            cz, sz = Cos(_rad(r[2])), Sin(_rad(r[2]))
+            cz, sz = wrap(Cos(_rad(r[2]))), wrap(Sin(_rad(r[2])))
             x, y = c[0], c[1]
             return [cz * x + sz * y, cz * y - sz * x]
-        cx, sx = Cos(_rad(r[0])), Sin(_rad(r[0]))
-        cy, sy = Cos(_rad(r[1])), Sin(_rad(r[1]))
-        cz, sz = Cos(_rad(r[2])), Sin(_rad(r[2]))
+        cx, sx = wrap(Cos(_rad(r[0]))), wrap(Sin(_rad(r[0])))
+        cy, sy = wrap(Cos(_rad(r[1]))), wrap(Sin(_rad(r[1])))
+        cz, sz = wrap(Cos(_rad(r[2]))), wrap(Sin(_rad(r[2])))
         x, y, z = c
         # Rz^T
         x, y = cz * x + sz * y, cz * y - sz * x
@@ -161,13 +184,13 @@ class Transform:
         y, z = cx * y + sx * z, cx * z - sx * y
         return [x, y, z]
 
-    def _inv_shear(self, c: List[Signal], d: int) -> List[Signal]:
+    def _inv_shear(self, c: List, d: int, wrap) -> List:
         sk = self.skew.components
-        a = sk[0]
+        a = wrap(sk[0])
         if d == 2:
             # forward x' = x + a*y  ->  x = x' - a*y'
             return [c[0] - a * c[1], c[1]]
-        b, cc = sk[1], sk[2]
+        b, cc = wrap(sk[1]), wrap(sk[2])
         z = c[2]
         y = c[1] - cc * z
         x = c[0] - a * y - b * z

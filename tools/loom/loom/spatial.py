@@ -126,6 +126,26 @@ class SpatialExpr:
     def _image_texture(self):
         return None  # an Image leaf returns the loom Texture it needs declared
 
+    def _table_decl(self):
+        return None  # a GridSample / ScatterSample leaf returns its N-D table block
+
+    def table_decls(self) -> List:
+        """The ``grid { … }`` / ``scatter { … }`` declarations required by the
+        :class:`GridSample` and :class:`ScatterSample` leaves in this tree, deduped
+        by name and in encounter order.
+
+        The exact twin of :meth:`image_textures`, and for the same reason: a table
+        leaf emits ftrace's ``grid:<name>(c0, …)`` / ``scatter:<name>(c0, …)`` call,
+        which only resolves if a table of that name is declared, so
+        :meth:`loom.Scene.add` collects the companion block automatically."""
+        out, seen = [], set()
+        for n in self._walk():
+            t = n._table_decl()
+            if t is not None and t.name not in seen:
+                seen.add(t.name)
+                out.append(t)
+        return out
+
     def image_textures(self) -> List:
         """The :class:`loom.scene.Texture` declarations required by the
         :class:`Image` leaves in this tree, deduped by name and in encounter order.
@@ -638,6 +658,290 @@ class VolumeField(SpatialExpr):
     def __repr__(self) -> str:            # pragma: no cover - debugging aid
         g = f", grid={self.grid!r}" if self.grid else ""
         return f"VolumeField({self.path!r}{g})"
+
+
+class GridSample(SpatialExpr):
+    """A loom :class:`~loom.data.Grid` **sampled as a term inside a formula** — the
+    spatial, *renderable* twin of :class:`~loom.interp.GridField`.
+
+    ``grid(X, Y)`` builds one of these (``grid(u, v)`` with temporal arguments still
+    builds the ``GridField`` Signal), so measured data becomes an operand of an
+    ordinary field expression::
+
+        heat = Grid([[0, 1], [1, 0]], lo=-1, hi=1)
+        rough = 0.05 + 0.5 * heat(X, Z) * (0.5 + 0.5 * sin(20 * Y))
+
+    **Both backends, as everywhere else in this module.**  :meth:`emit` writes
+    ftrace's ``grid:<name>(c0, …)`` table call (``PatOp::Grid``) and the companion
+    ``grid { … }`` block is collected by :meth:`SpatialExpr.table_decls` —
+    :meth:`loom.Scene.add` picks it up, so the author never declares it.
+    :meth:`eval_np` is a vectorised port of ftrace's ``patGridSample`` /
+    ``patGridCellFrac``, which are themselves the documented twins of loom's own
+    :func:`loom.interp._grid_weights` / :func:`loom.interp._cell_base_frac` — so the
+    2-D raster preview, the temporal ``GridField`` and the render all agree.
+
+    **Placement is folded into the coordinates.**  ftsl's ``grid`` block has no
+    transform, so a :meth:`~loom.data._Transformable.transformed` Grid inverse-maps
+    the *query* through its placement at construction
+    (:meth:`loom.transform.Transform.inverse_apply_spatial`) — the same remap
+    :func:`loom.interp._local_query` applies on the temporal path, so moving the data
+    object changes what a fixed world point reads back, identically in both.
+
+    **What ftrace cannot express is refused, not approximated.**  A vector-valued
+    grid (``PatGrid`` stores scalar floats), ``interp="cubic"`` (``patGridSample`` is
+    N-linear only), ``on_outside="raise"`` (a renderer samples millions of times a
+    frame and cannot throw) and more than four axes (``PAT_ND_MAX_DIM``) all raise
+    here rather than emit something that means something else.
+    """
+
+    #: ftrace's ``PatGrid`` axis cap (``PAT_ND_MAX_DIM``, ``src/pattern.h``).
+    MAX_DIM = 4
+
+    def __init__(self, grid, coords, *, name: str = None,
+                 interp: str = "linear", on_outside: str = "clamp",
+                 _local: bool = False) -> None:
+        from .interp import _parse_grid_interp, _parse_on_outside  # lazy: cycle
+        self.grid = grid
+        if getattr(grid, "is_vector", False):
+            raise TypeError(
+                "a vector-valued Grid cannot be sampled as an ftsl term: ftrace's "
+                "PatGrid stores scalar floats. Sample one channel into its own "
+                "scalar Grid, or keep the vector field on the temporal path "
+                "(VecGridField).")
+        if grid.ndim > self.MAX_DIM:
+            raise ValueError(
+                f"a {grid.ndim}-D Grid exceeds ftrace's {self.MAX_DIM}-axis table "
+                f"limit (PAT_ND_MAX_DIM)")
+        if _parse_grid_interp(interp):
+            raise ValueError(
+                "interp='cubic' has no ftsl spelling: ftrace's patGridSample is "
+                "separable N-linear only. Use interp='linear' to render, or stay on "
+                "the temporal GridField for Catmull-Rom.")
+        self.interp = "linear"
+        out = _parse_on_outside(on_outside)
+        if out == "raise":
+            raise ValueError(
+                "on_outside='raise' has no ftsl spelling: a renderer samples "
+                "millions of times per frame and cannot throw. ftrace's authoring "
+                "guard is the load-time domain check; choose 'clamp', 'wrap' or "
+                "'extrapolate' for the render.")
+        self.on_outside = out
+        cs = tuple(_coerce(c) for c in coords)
+        if len(cs) != grid.ndim:
+            raise ValueError(
+                f"grid sample needs one coordinate per axis: {grid.ndim} expected, "
+                f"{len(cs)} given")
+        if not _local:
+            xf = getattr(grid, "xf", None)
+            if xf is not None and not xf.is_identity():
+                cs = tuple(xf.inverse_apply_spatial(cs))
+        self.coords = cs
+        self.name = name if name is not None else self._auto_name()
+
+    # ---- grid declaration -------------------------------------------------
+    def _auto_name(self) -> str:
+        """A deterministic ftsl identifier for this grid + out-of-domain policy.
+
+        Two leaves over the *same* :class:`~loom.data.Grid` with the same
+        ``on_outside`` share one declaration; a different policy gets a different
+        name because ``outside`` lives on ftsl's ``grid`` block, not on the sample
+        call, so the two cannot share one block."""
+        return f"grid_{self.grid.id}_{self.on_outside}"
+
+    def _table_decl(self):
+        from .scene import GridDecl   # lazy: scene.py is the higher layer
+        return GridDecl(self.name, self.grid, outside=self.on_outside)
+
+    # ---- tree ------------------------------------------------------------
+    def children(self):
+        return self.coords
+
+    def _rebuild(self, new_children):
+        # the coordinates are already in the grid's local frame (any placement was
+        # folded in at construction), so rebuild without re-applying it.
+        return GridSample(self.grid, tuple(new_children), name=self.name,
+                          interp=self.interp, on_outside=self.on_outside,
+                          _local=True)
+
+    # ---- emit ------------------------------------------------------------
+    def emit(self, coords, ctx) -> str:
+        args = ",".join(c.emit(coords, ctx) for c in self.coords)
+        return f"grid:{self.name}({args})"
+
+    # ---- numpy twin (port of patGridSample / patGridCellFrac) ------------
+    def _cell_base_frac_np(self, axis: int, coord):
+        """Vectorised :func:`loom.interp._cell_base_frac` — returns ``(i0, frac)``."""
+        g = self.grid
+        n = g.shape[axis]
+        lo, hi = g.lo[axis], g.hi[axis]
+        z = _np.zeros_like(coord, dtype=_np.float64)
+        if n <= 1 or hi == lo:
+            return z.astype(_np.int64), z
+        p = (coord - lo) / (hi - lo) * (n - 1)
+        if self.on_outside == "wrap":
+            span = float(n - 1)
+            p = p - _np.floor(p / span) * span         # fold into [0, n-1)
+            i = _np.floor(p).astype(_np.int64)
+            seam = i >= (n - 1)                        # numerical guard at the seam
+            f = _np.where(seam, 0.0, p - i)
+            return _np.where(seam, 0, i), f
+        i = _np.floor(p).astype(_np.int64)
+        f = p - i
+        low = p <= 0.0
+        high = p >= (n - 1)
+        if self.on_outside == "extrapolate":
+            f = _np.where(low, _np.where(p < 0.0, p, 0.0), f)
+            f = _np.where(high, _np.where(p > (n - 1), p - (n - 2), 1.0), f)
+        else:                                          # clamp / edge-extend
+            f = _np.where(low, 0.0, f)
+            f = _np.where(high, 1.0, f)
+        i = _np.where(low, 0, i)
+        i = _np.where(high, n - 2, i)
+        return i, f
+
+    def eval_np(self, coords, clock, cache):
+        if _np is None:              # pragma: no cover
+            raise ImportError("GridSample.eval_np needs numpy")
+        g = self.grid
+        cs = [_np.asarray(c.eval_np(coords, clock, cache), dtype=_np.float64)
+              for c in self.coords]
+        shape = _np.broadcast(*cs).shape if len(cs) > 1 else cs[0].shape
+        cs = [_np.broadcast_to(c, shape).astype(_np.float64) for c in cs]
+        base, frac = [], []
+        for a in range(g.ndim):
+            i, f = self._cell_base_frac_np(a, cs[a])
+            base.append(i)
+            frac.append(f)
+        vals = _np.array([v.at(clock, cache) for v in g.values], dtype=_np.float64)
+        wrap = (self.on_outside == "wrap")
+        acc = _np.zeros(shape, dtype=_np.float64)
+        for corner in range(1 << g.ndim):
+            w = _np.ones(shape, dtype=_np.float64)
+            flat = _np.zeros(shape, dtype=_np.int64)
+            for a in range(g.ndim):
+                n = g.shape[a]
+                up = (corner >> a) & 1
+                w = w * (frac[a] if up else (1.0 - frac[a]))
+                idx = base[a] + up
+                idx = _np.mod(idx, n - 1) if (wrap and n > 1) else _np.clip(idx, 0, n - 1)
+                flat = flat * n + idx          # C order: axis 0 outermost
+            acc = acc + w * vals[flat]
+        return acc
+
+    def __repr__(self) -> str:            # pragma: no cover - debugging aid
+        return f"GridSample({self.name!r}, ndim={self.grid.ndim})"
+
+
+class ScatterSample(SpatialExpr):
+    """A loom :class:`~loom.data.Scatter` **sampled as a term inside a formula** — the
+    ragged sibling of :class:`GridSample`, and the spatial twin of
+    :class:`~loom.interp.ScatterField`.
+
+    ``scatter(X, Y)`` builds one of these (a temporal query still builds the
+    ``ScatterField`` Signal).  :meth:`emit` writes ftrace's ``scatter:<name>(c0, …)``
+    table call (``PatOp::Scatter``) and the companion ``scatter { … }`` block is
+    collected by :meth:`SpatialExpr.table_decls`; :meth:`eval_np` is a vectorised
+    port of ``patScatterSample``, itself the documented twin of loom's
+    :func:`loom.interp._shepard_weights`.
+
+    Same refusals as :class:`GridSample` where ftrace cannot follow: vector-valued
+    samples (``PatScatter`` stores scalar floats) and more than four dimensions.
+    Unlike a grid there is no out-of-domain policy — Shepard weighting is defined
+    everywhere — so ``power``/``eps`` are the only sampler settings, and because they
+    live on the *block* they take part in the auto-name.
+    """
+
+    MAX_DIM = 4
+
+    def __init__(self, scatter, coords, *, name: str = None,
+                 power: float = 2.0, eps: float = 1e-9,
+                 _local: bool = False) -> None:
+        self.scatter = scatter
+        if getattr(scatter, "is_vector", False):
+            raise TypeError(
+                "a vector-valued Scatter cannot be sampled as an ftsl term: ftrace's "
+                "PatScatter stores scalar floats. Split the channels into scalar "
+                "Scatters, or stay on the temporal path (VecScatterField).")
+        if scatter.dim > self.MAX_DIM:
+            raise ValueError(
+                f"a {scatter.dim}-D Scatter exceeds ftrace's {self.MAX_DIM}-axis "
+                f"table limit (PAT_ND_MAX_DIM)")
+        self.power = float(power)
+        self.eps = float(eps)
+        if not (self.power > 0.0):
+            raise ValueError("scatter power must be > 0")
+        if self.eps < 0.0:
+            raise ValueError("scatter eps must be >= 0")
+        cs = tuple(_coerce(c) for c in coords)
+        if len(cs) != scatter.dim:
+            raise ValueError(
+                f"scatter sample needs one coordinate per dimension: {scatter.dim} "
+                f"expected, {len(cs)} given")
+        if not _local:
+            xf = getattr(scatter, "xf", None)
+            if xf is not None and not xf.is_identity():
+                cs = tuple(xf.inverse_apply_spatial(cs))
+        self.coords = cs
+        self.name = name if name is not None else self._auto_name()
+
+    def _auto_name(self) -> str:
+        """``scatter_<id>_<hash>`` — the hash covers ``power``/``eps``, which live on
+        the emitted block rather than on the sample call, so two leaves that weight
+        differently cannot share one declaration."""
+        import hashlib
+        key = f"{self.power!r}|{self.eps!r}"
+        return f"scatter_{self.scatter.id}_{hashlib.sha1(key.encode()).hexdigest()[:6]}"
+
+    def _table_decl(self):
+        from .scene import ScatterDecl   # lazy: scene.py is the higher layer
+        return ScatterDecl(self.name, self.scatter, power=self.power, eps=self.eps)
+
+    def children(self):
+        return self.coords
+
+    def _rebuild(self, new_children):
+        return ScatterSample(self.scatter, tuple(new_children), name=self.name,
+                             power=self.power, eps=self.eps, _local=True)
+
+    def emit(self, coords, ctx) -> str:
+        args = ",".join(c.emit(coords, ctx) for c in self.coords)
+        return f"scatter:{self.name}({args})"
+
+    def eval_np(self, coords, clock, cache):
+        if _np is None:              # pragma: no cover
+            raise ImportError("ScatterSample.eval_np needs numpy")
+        sc = self.scatter
+        cs = [_np.asarray(c.eval_np(coords, clock, cache), dtype=_np.float64)
+              for c in self.coords]
+        shape = _np.broadcast(*cs).shape if len(cs) > 1 else cs[0].shape
+        cs = [_np.broadcast_to(c, shape).astype(_np.float64) for c in cs]
+        half = 0.5 * self.power
+        num = _np.zeros(shape, dtype=_np.float64)
+        den = _np.zeros(shape, dtype=_np.float64)
+        hit = _np.zeros(shape, dtype=bool)
+        hitval = _np.zeros(shape, dtype=_np.float64)
+        for pos, val in zip(sc.positions, sc.values):
+            p = pos.at(clock, cache)
+            v = float(val.at(clock, cache))
+            d2 = _np.zeros(shape, dtype=_np.float64)
+            for a in range(sc.dim):
+                d = cs[a] - float(p[a])
+                d2 = d2 + d * d
+            # coincidence: the FIRST sample within eps wins, exactly as the scalar
+            # path (which returns immediately) and ftrace's patScatterSample do.
+            co = (d2 <= self.eps) & ~hit
+            hitval = _np.where(co, v, hitval)
+            hit = hit | co
+            safe = _np.where(d2 <= self.eps, 1.0, d2)
+            w = (1.0 / safe) if self.power == 2.0 else _np.power(safe, -half)
+            w = _np.where(d2 <= self.eps, 0.0, w)
+            num = num + w * v
+            den = den + w
+        blend = _np.where(den > 0.0, num / _np.where(den > 0.0, den, 1.0), 0.0)
+        return _np.where(hit, hitval, blend)
+
+    def __repr__(self) -> str:            # pragma: no cover - debugging aid
+        return f"ScatterSample({self.name!r}, dim={self.scatter.dim})"
 
 
 class _Time(SpatialExpr):

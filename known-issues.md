@@ -5,6 +5,200 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — DONE (2026-08-05, v0.138.0): `-mode W -heroc 1` silently rendered the de-hero collapse it was supposed to have fixed
+
+**What.** `-heroc 1` means "hero bundle off, single wavelength" (`ftrace -h`), which in mode W
+collapses the mode's *entire fixed spectral quadrature* to one λ and forces every material down
+the scalar, bundle-free path. On a scene with a spectrally-varying material that is not an
+approximation, it is flatly wrong. Measured on `scenes/cornell.ftsl` (SF10 sphere), chroma error
+against a converged 8192-spp direct-only mode-R reference, brightness normalised out:
+
+| render | chroma error |
+|---|---|
+| mode W, 1 spp, default C=8 | **0.82 pp** (correct — reproduces N1's 0.80 pp) |
+| mode W, 1 spp, `-heroc 1`  | **46.85 pp** — a flat GREEN ball |
+
+46.85 pp is the exact de-hero pathology N1 (v0.108.0) was written to kill, still reachable through
+a CLI flag, and **nothing was printed** to say so.
+
+**Why it mattered.** Mode W's whole promise is "noise-free and *correct* at 1 spp". Everywhere else
+the codebase defends that promise: the interactive viewer detects `g_heroC <= 1` and keeps
+accumulating passes (`wNeedSpp`, `main.cpp`), so its preview converges out of the collapse. A batch
+`-mode W -spp 1` render has nothing to average over, so it just emits the wrong image. And the
+trade the user thinks they are making isn't real: N5 measured C=1 vs the C=8 default at **2.7% of
+frame time** on a 15-second mode-W frame (mode W is traversal-bound — the bundle rides along on
+rays already being traced), so they gave up correctness for a rounding error.
+
+**How it was found.** Sweeping `-heroc` while measuring N5's cost slope; the `-heroc 1` frame was
+included as a timing point and its *image* turned out to be the interesting result.
+
+**Fix.** `warnWhittedHeroCollapse` (`main.cpp`), called only for a real batch mode-W render at
+`g_heroC <= 1` — not for the explorer's T preview, which converges anyway and would nag every run.
+It names the material class responsible, states that those surfaces are *flatly wrong* rather than
+merely noisy, and quotes the ~1% cost of not doing this. The scene predicate `whittedNeedsBundle`
+walks only materials actually attached to geometry (an unused library material is no reason to
+nag), returns immediately for ThinFilm / Grating / Multilayer / Layered / Fluorescent, and — since
+`Spectrum` is a `std::function` with no inspectable curve type — decides a Dielectric by **probing
+its `ior` at 400–700 nm**, so a constant-IOR dielectric (exact at C=1) stays silent. Print-only:
+the mode-W image is byte-identical to 0.137.0.
+
+**Lesson.** A knob that is legitimate in one mode can silently void another mode's headline
+guarantee. `-heroc 1` is perfectly reasonable in mode R, where more samples fix it; in mode W there
+are no more samples. When a mode's contract is "correct at 1 spp", every flag that can break that
+contract needs either a guard or a warning — the viewer had a guard, the batch path had neither.
+
+### BUG — DONE (2026-08-05, v0.137.0): nvcc's FMA contraction made the GPU's mode-W sample lattices disagree with the CPU's by 1 ULP
+
+**What.** `dRadicalInverseScr` — the digit-scrambled radical inverse that places every
+deterministic mode-W sample (subpixel, wavelength, glossy lobe, grating order, fluorescence
+excitation, GI gather phase) — computed its digit accumulation as `r += digit * f`.
+`dGoldenDigitMul` likewise computed `(unsigned)(base * 0.6180339887498949 + 0.5)`. Both are
+multiply-adds, and **nvcc contracts a multiply feeding an add into a single FMA by default**
+(`-fmad=true`) while MSVC does not. The two sides therefore rounded differently: **34 191 of
+2 169 156 probed values (1.6%) differed, all by exactly 1 ULP, all confined to the
+`radicalInverseScr` columns.**
+
+**Why it mattered.** FMA is the *more* accurate form — it drops the intermediate rounding —
+so this is not an accuracy bug. It is a **contract** bug. `render_cuda.h` permits the
+stochastic modes to be "an independent noise realization that agrees to within Monte-Carlo
+noise", but **mode W has no noise for a mismatch to hide behind**: every pixel shares the same
+sample offsets, which is precisely what makes the mode noise-free, so a lattice difference is
+a *visible deterministic* CPU/GPU difference rather than a re-rolled die. `backward.h` and
+`render_cuda.cu` both carry "Host twin: … Must stay bit-identical" comments on these
+functions; they simply weren't tested, so the claim had quietly become false.
+
+**How it was found.** `ftrace -checklattice` (TODO §N item N4a), on its first run. The
+per-column mismatch histogram it prints is what made the diagnosis immediate: a 1-ULP spread
+confined to exactly the columns containing a multiply-add is a compiler-contraction
+signature, whereas a logic error would show a large or column-wide gap.
+
+**Fix.** Spell both multiply-adds with `__dmul_rn` / `__dadd_rn` — individually-rounded
+operations the compiler is not permitted to fuse. This pins the device's evaluation order to
+the host's without touching any other kernel's codegen (a global `-fmad=false` would have
+changed every kernel in the build). Post-fix all 2 169 156 values are bit-identical, and the
+part-(b) image A/Bs are unregressed: `scraps/n3_gpu.ftsl` 99.31 % bit-identical, and
+`scraps/cor_gi.ftsl -gi 32` 98.68 %, matching the 98.7 % recorded at the 0.116.0 gate.
+
+**Lesson worth keeping.** Any host/device pair asserted to be bit-identical must have that
+asserted *by a test*, not by a comment — and the first thing to suspect in a 1-ULP host/device
+gap is FMA contraction, not the algorithm. Other device code carries the same hazard where a
+comment claims bit-identity: `dGiDir`'s `kGolden * j + 2*PI*p1` contracts too, but its result
+goes through `cos`/`sin`, which libdevice already computes differently from the CRT, so that
+one is not bit-comparable in the first place and is covered by part (b), not part (a).
+
+### DONE (0.135.0): preview rasterizer showed six classes of material as flat colour
+
+**What.** `ftrace scenes\gallery_rain.ftsl -explore` previewed the ten marble caps
+completely untextured, and rendered 28% of the frame as one flat `rgb(0,255,89)` slab.
+Both had the same shape of cause: `raster::tessellate` / the shade pass knew about a
+*subset* of the material features that determine a surface's appearance, and silently
+dropped the rest.
+
+Six gaps, all now closed on **both** the CPU (`raster.h`) and GPU (`raster_cuda.cu`) paths:
+
+1. **Per-primitive `uv` projections were ignored for marched implicits** — the reported
+   bug. `Implicit::uvProj/uvAxis/uvBounds` is what gives an isosurface a UV parameterisation
+   (marching cubes emits none), and `tessellate` honoured only the *material's*
+   `triplanarScale`, so it set `tex = -1` on every marched implicit. Fixed by projecting each
+   marched vertex with the tracer's own `projectUV`.
+   *Seam hazard closed with it*: azimuthal (spherical/cylindrical) `u` wraps 1.0→0.0. The
+   ray-hit path projects AT the hit and never sees the wrap; the rasterizer *interpolates*,
+   so a straddling triangle would run `u` backwards across the whole texture. Triangles whose
+   `u` spread exceeds 0.5 now have their low corners lifted by +1.
+2. **`emit pattern:` / `emit_map pattern:` ignored** — the flat green slab. `gridground`
+   is a 528 nm emitter masked by `emit_map pattern:grid_ground`; with the mask dropped the
+   whole plane glowed. The fix required moving the emissive early-out to AFTER pattern
+   evaluation.
+3. **`reflect pattern:` / `reflect_map pattern:` ignored** — same VM, albedo slot.
+4. **Palette (indexed-spectral) maps sampled their raw index map.** `Texture::sampleRgb`
+   returned the *index* out of the red channel, so entry 3 of 12 shaded as near-black. Fixed
+   inside `Texture` (`buildPaletteRgb` / `paletteRgbAt`) so every colour consumer benefits,
+   not just the rasterizer.
+5. **Normal maps unused.** Now applied through a UV-derived TBN frame.
+6. **`mix` / layered materials collapsed to the parent's `reflect`.** Now resolved via
+   `mixDominantChild` — the same child deterministic mode W picks, so the two agree.
+
+**How the class of bug was closed, not just the instances.** A single `applyMat()` now
+assigns every per-material field, called from all four geometry paths (world tris, spheres,
+implicits, instances); the original bug was a feature wired into three of the four. The CPU
+G-buffer also stopped copying material fields per pixel and stores the *source triangle
+index* instead (matching what the GPU backend already did), so a future per-material feature
+needs no new per-pixel channel to be dropped from.
+
+**Not** fixed, deliberately: roughness / film-thickness maps stay ignored (a preview has no
+glossy lobe for them to drive), and there is no "textured emitter" — the language has no
+such slot, so previewing one would invent detail the render does not have.
+
+**Verified.** `gallery_rain` on both backends: 6247 of 1.17 M pixels (0.54%) differ by
+more than 2/255, all of them on grid-line boundaries where a hard `step` meets the CPU's
+double vs the GPU's float world position. Mean absolute difference 0.12/255.
+
+**Also verified: the shared pattern VM did not regress the path tracer.** The VM body that
+`raster_cuda.cu` now calls was *lifted out of* `render_cuda.cu` into `pattern_device.cuh`, so
+the tracer had to be re-checked. `scenes/_preview_pattern_tex.ftsl` (added for this) binds
+three `tex:` expressions (plain,
+warped-lookup, and an `emit_map` mask) to slots the preview evaluated at the time —
+`weight_map` was no good for it, because the preview then resolved a `mix` to its dominant
+child and never ran that pattern. (That limitation is itself now fixed; see the 0.136.0
+entry below. The scene stays as-is: `reflect`/`emit_map` bindings are the tighter test of
+the VM, since they reach it without going through the mix threshold.) CPU vs GPU, matched
+settings:
+
+| path | difference |
+|---|---|
+| `-raster` (`DPatEnvT<DTex>`) | 133 of 160 k px (0.08%) differ by >2; mean 0.09/255; 1322 vs 1323 unique colours |
+| `-mode W` (`DPatEnvT<DTexture>`) | 24 of 25.6 k px (0.09%) differ by >2; mean 0.02/255; identical auto-exposure anchor `6.11e-13` |
+
+Same residual as above — hard checker edges under `filter nearest`, float vs double.
+
+**Note on how slow that mode-W check was:** 74.4 s on the GPU for 4 spp at 160x160 versus
+**0.1 s** on the CPU, with the `[gpu-stall]` watchdog reporting 30 s per 1-spp chunk against a
+0.15 s target. That is the GPU-contention entry below (pid 20264 again), not a cost of this
+change — the raster path, whose kernels are tiny, rendered the same scene in 0.42 s throughout.
+
+
+### DONE (0.136.0): seventh gap — a `mix` blend mask never previewed (the preview and mode W disagreed)
+
+**What.** A two-child `mix` carrying `weight_map texture:` / `weight_map pattern:` is a
+*spatial A/B mask* — wear masks, decals, painted patterns. The preview rasterizer resolved
+every mix with `mixDominantChild`, which only compares the **constant** weights. A blend
+mask is always declared 50/50, so the "dominant" child was always child 0 and the mask was
+never evaluated: the surface previewed as one flat winner. `-mode W` calls
+`mixResolveDominant` instead, which samples the mask at the hit and hard-thresholds at ½.
+So `raster.h`'s own header comment — "the same child deterministic mode W picks, so the two
+agree" — was false for exactly this case.
+
+Visible on `scenes/pattern_tex.ftsl`: mode W shows three checkered walls, the preview showed
+three flat ones. 19 shipped scenes use `weight_map`.
+
+**Fix (both backends).** `PTri`'s material payload is split out into a base `PShade`;
+`PreviewGeom` now carries a `PMix` side table (`weightPat`, `weightTex`, and the child-1
+`PShade`) that `PTri::mix` indexes. The shade pass evaluates the mask at the shaded point
+and, below ½, repoints `const PShade* sh` at the loser — so albedo, skin, normal map and
+pattern drives all switch together, per pixel. The table is keyed **per material**, so three
+weight-mapped mixes cost three entries no matter how many triangles carry them (inlining a
+second payload in `PTri` would have cost ~+120 MB on a 2 M-triangle scene). The GPU twin
+mirrors it with a `DMix` device array consumed in `kShade`.
+
+`emissive` and `clear` deliberately still come from child 0: `g.emis` is consumed by
+auto-exposure *before* shading, and `clear` steers the separate see-through pass, so neither
+can vary per pixel. A child that is itself a weight-mapped mix still flattens.
+
+**Bug found and fixed during verification.** The first cut still previewed flat, because
+`STri::needUV` — the flag that decides whether the raster pass interpolates UVs at all —
+listed only skins / normal maps / pattern slots. A mix mask reads (u,v) too, so the mask was
+being sampled at `u=v=0`. With `needUV |= (mix >= 0)`, `pattern_tex.ftsl` reproduces mode W
+exactly. (The GPU interpolates UVs unconditionally and never had the bug — a good reminder
+that CPU-only optimisations are their own parity hazard.)
+
+**Verified.** `pattern_tex.ftsl` (`weight_map pattern:`) CPU vs GPU raster: 0.076% of pixels
+over 2/255, mean 0.04/255. `maskblend.ftsl` (`weight_map texture:`): 0.068%, mean 0.05/255,
+and the CPU raster is visually identical to a 16-spp `-mode W` reference. Regression check on
+`_preview_pattern_tex.ftsl`: 0.083%, unchanged from before this work. `gallery_rain` still
+previews its marble and grid correctly. All residuals are the usual hard-threshold /
+hard-checker edges under float-vs-double.
+
+
 ### OPEN (2026-08-04): `textures/marble_dumbbell.png` is derived from a WATERMARKED stock preview — replace before any public release
 
 **What.** `marble texture 3.5.avif`, one of the ten source sheets, is a VectorStock **comp**: a
@@ -7595,6 +7789,25 @@ is the convenient way to pull the single flyby frame closest to a point (it prin
 `flyNNN` it picked and how far off it was), which is how the four fly-through passes were
 each validated without rendering the loop.
 
+## OPEN (tech debt, 2026-08-04): `design.md`'s measurement rigs live in git-ignored `scraps/`
+
+`design.md` cites `scraps/_gemsweep.py`, `scraps/_capchroma.py`, `scraps/_capcrop.py` and
+`scraps/_pfm.py` as the authority for decisions that are *shipped* in `scenes/gallery_rain.ftsl`
+— which glass the axicon is cut from, what drop it hangs at, how big its cap is, and (2026-08-04)
+that it gets a 0.04 m girdle and no crown. Those files are **untracked**: `.gitignore` has a
+blanket `/scraps/`, on the correct general principle that scraps is for throwaway scripts.
+
+The result is that every measured table in `design.md` is unreproducible from a clean clone.
+Losing the directory would not break a build, but it would strand the numbers: nobody could
+re-derive them, and nobody could tell whether a later scene edit had moved them.
+
+Proper fix: promote the four load-bearing ones to `tools/` (which is for permanent checked-in
+tooling) and update the ~40 `scraps/_*.py` path references in `design.md` and the scene comments
+in the same commit. They have real interdependencies (`_gemsweep` and `_capchroma` both import
+`_pfm`, `_capcrop` imports `_capchroma`), so it is a move of the whole cluster or none of it.
+Logged rather than done because renaming the paths that every measured table cites is a change
+that wants to be its own commit, not a rider on a scene tweak.
+
 ## OPEN (metrology, 2026-08-04): `-fireflies 3` does not always clear the gem rig's peak, so `peak` alone can be nonsense
 
 While sweeping crown angles for the axicon's girdle (`scraps/_gemsweep.py piece gcone0.08/20/0.60
@@ -8457,3 +8670,48 @@ and is now pinned by `ftrace -checkdenoise`:
 The lesson worth keeping: **energy conservation and a flat-field test both passed while the
 filter was making the image objectively worse.** The only metric that caught it was RMSE against
 a converged reference (`scraps/_dneval.py`), which is now how any change here should be judged.
+
+## FIXED (2026-08-05, loom-only): `write_obj`'s atomic replace flaked with WinError 5, and the same helper was copy-pasted four times
+`tools/loom/tests/test_mcubes.py::test_isomesh_static_field_baked_once` failed
+intermittently (once in three full-suite runs) with
+
+    PermissionError: [WinError 5] Access is denied:
+      '…\tmpwoxkkky5.obj.tmp' -> '…\s.obj'      (loom/sweep.py:235)
+
+`os.replace` is atomic on Windows but **not immune to sharing**: `MoveFileEx` fails with
+`ERROR_ACCESS_DENIED` (5) or `ERROR_SHARING_VIOLATION` (32) if anything holds a handle to
+the source or destination at that instant — which includes the antivirus scanner and the
+search indexer opportunistically opening a file loom just closed, not only a reader loom
+knows about. That makes it a live-channel hazard, not just a test flake: §F4 re-emits a
+scene on a worker thread while ftrace is loading the previous emission's assets out of the
+same directory, which is precisely when a handle collision is most likely.
+
+Aggravating factor: the same temp-file + `os.replace` + cleanup block existed **four
+times** — `sweep.py` `write_obj`, `anim.py` `CurveDrive.save`, and two byte-identical
+`_atomic_write_text` copies in `anim.py` and `viewer.py` — so a fix in one would not have
+reached the others.
+
+**Fix:** one shared `loom/atomicio.py` (`write_atomic` / `replace_atomic`) that all four
+call sites now use. It retries a `PermissionError` on a doubling backoff (2 ms → 64 ms,
+1 s total budget) and then re-raises, so a transient scanner handle costs milliseconds
+while a genuine permission problem still fails promptly and audibly. The temp file is
+still removed on any failure, so the old file survives intact. Pinned by
+`tools/loom/tests/test_atomicio.py` (6 tests): the retry succeeds after two simulated
+WinError 5s, a persistent one propagates with the old file unchanged, a non-sharing
+`OSError` is *not* retried, and no `.tmp` litter is left in any case.
+
+## FIXED (2026-08-05, loom-only): loom's own tests modelled a `point` light, which ftrace does not have
+Four loom test modules built scenes with `Light("point", position=(3, 3, 3), name="key")`
+or `Light("point", intensity=1.0)`. ftrace's `addLight` (`src/ftsl.h` ~4840) recognises
+`collimated` / `sphere` / `cylinder` / `spot` / `env` / `sun`, and **everything else falls
+through to the default rectangular area light** — so a `point` light renders as a large
+white quad, while `position` / `name` / `intensity` are unknown keys that only *warn*.
+
+Harmless inside those tests (none of them render), but it is exactly the kind of fixture
+that gets copied: writing a validation scene from that spelling produced a render dominated
+by a giant white quad before the cause was obvious. loom's `Light` is schema-free **on
+purpose** (its docstring: "loom does not invent light fields"), so the fix is not
+validation — it is that the fixtures now spell lights that exist:
+`Light("sphere", center=…, radius=…, power=…)` in `test_image_term.py`,
+`test_material_bundle.py` and `test_viewer.py`, and `Light("collimated", origin=…, dir=…)`
+in `test_grammar_scene.py` (which deliberately round-trips a *non-default* subtype).

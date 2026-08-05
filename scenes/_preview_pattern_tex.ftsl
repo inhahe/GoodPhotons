@@ -1,0 +1,61 @@
+# _preview_pattern_tex.ftsl — CPU/GPU parity regression for the shared device pattern
+# VM (src/pattern_device.cuh), specifically its `tex:` op (PatOp::Tex), which is the one
+# opcode whose implementation differs per backend: the path tracer reaches a spectral
+# `DTexture`, the preview rasterizer a flat-RGB `DTex`, both through the same
+# `patScalarAt` member hook.
+#
+# Why the bindings look like this: patterns are bound to `reflect pattern:` and
+# `emit_map pattern:` rather than to a mix's `weight_map`. A weight_map reaches the VM only
+# through the mix's hard ½ threshold, which throws away everything but the sign of
+# (value - ½) — so it can only ever detect gross VM breakage, and it hides any disagreement
+# in the value itself. These bindings multiply the slot by the raw scalar, so the whole
+# output range is under test. (Until 0.136.0 a weight_map tested literally nothing on the
+# raster path: the preview resolved a mix to its dominant child and never ran the pattern.
+# See scenes/pattern_tex.ftsl, which is now the regression scene for that fix.)
+#
+# Run both backends of both pipelines and diff; expect agreement to within the usual
+# float-vs-double disagreement on the hard checker edges (`filter nearest`), i.e. <0.1% of
+# pixels differing by more than 2/255, and an identical auto-exposure anchor:
+#
+#   ftrace -in scenes/_preview_pattern_tex.ftsl -raster -device gpu -r 400 400 -o png/a.png
+#   ftrace -in scenes/_preview_pattern_tex.ftsl -raster -device cpu -r 400 400 -o png/b.png
+#   ftrace -in scenes/_preview_pattern_tex.ftsl -mode W -device gpu -spp 4 -r 160 160 -o png/c.png
+#   ftrace -in scenes/_preview_pattern_tex.ftsl -mode W -device cpu -spp 4 -r 160 160 -o png/d.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+texture "gray" {
+    file     scenes/graychecker.ppm
+    encoding linear
+    filter   nearest
+    wrap     repeat
+}
+
+pattern "plain"  { expr "tex:gray(u, v)" }
+pattern "warped" { expr "tex:gray(u + 0.05*sin(16*v), v)" }
+pattern "mixed"  { expr "saturate(tex:gray(u, v) * (0.5 + 0.5*sin(26*v)) * 2)" }
+
+material "m_plain"  { type diffuse reflect pattern:plain  }
+material "m_warped" { type diffuse reflect pattern:warped }
+material "m_emit"   { type diffuse reflect 0.0  emit blackbody 5200  emit_map pattern:mixed }
+material "white"    { type diffuse reflect whitewall 0.75 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material m_plain }
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material m_warped }
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material m_emit }
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material white }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 400 400 }
+}

@@ -53,6 +53,12 @@ struct Texture {
     // Indices never interpolate (nearest only). GPU falls back to CPU for such maps.
     std::vector<Spectrum> palette;
     bool hasPalette() const { return !palette.empty(); }
+    // One linear-sRGB colour per palette entry, so a palette map can answer sampleRgb()
+    // without a spectral evaluation. Spectra are exact but useless to anything that wants
+    // a colour (the raster preview, thumbnails), and the old behaviour there was to read
+    // the raw INDEX out of the red channel and shade with it — index 3 of 12 previewing as
+    // near-black. Built once by buildReflCoeff(), which every bound texture already calls.
+    std::vector<Vec3> paletteRgb;
     TexEncoding encoding = TexEncoding::sRGB;
     TexFilter   filter   = TexFilter::Bilinear;
     TexWrap     wrap     = TexWrap::Repeat;
@@ -63,10 +69,44 @@ struct Texture {
     // when a texture is bound to a reflectance parameter so per-hit sampling is a
     // cheap coefficient bilerp + sigmoid evaluation rather than a Gauss-Newton fit.
     void buildReflCoeff() {
-        if (!valid() || hasPalette() || coeff.size() == (size_t)w * h) return;
+        if (hasPalette()) { buildPaletteRgb(); return; }
+        if (!valid() || coeff.size() == (size_t)w * h) return;
         coeff.resize((size_t)w * h);
         for (size_t i = 0; i < rgb.size(); ++i)
             coeff[i] = upsample::fit(rgb[i].x, rgb[i].y, rgb[i].z);
+    }
+
+    // Integrate each palette spectrum against the CIE curves under an equal-energy
+    // illuminant -> the colour that reflectance would appear as. At most 256 entries, so
+    // this is trivially cheap and done eagerly rather than lazily (sampleRgb is const and
+    // runs on many threads).
+    void buildPaletteRgb() {
+        if (palette.empty() || paletteRgb.size() == palette.size()) return;
+        paletteRgb.resize(palette.size());
+        for (size_t i = 0; i < palette.size(); ++i) {
+            Vec3 xyz{0, 0, 0};
+            double wsum = 0.0;
+            if (palette[i]) {
+                for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 5.0) {
+                    double v = palette[i](lam);
+                    xyz = xyz + Vec3(cieX(lam), cieY(lam), cieZ(lam)) * v;
+                    wsum += cieY(lam);
+                }
+            }
+            Vec3 c = (wsum > 0.0) ? xyzToLinearSrgb(xyz / wsum) : Vec3{0, 0, 0};
+            paletteRgb[i] = Vec3{std::max(0.0, c.x), std::max(0.0, c.y), std::max(0.0, c.z)};
+        }
+    }
+
+    // Nearest-index palette lookup returning the entry's preview COLOUR. Categorical, so
+    // it never bilerps — the same snap-and-clamp paletteReflectanceAt does.
+    Vec3 paletteRgbAt(double u, double v) const {
+        int x = wrapIndex((int)std::floor(u * w), w);
+        int y = wrapIndex((int)std::floor((1.0 - v) * h), h);
+        int idx = (int)std::lround(rgb[(size_t)y * w + x].x * 255.0);
+        if (idx < 0) idx = 0;
+        if (idx >= (int)paletteRgb.size()) idx = (int)paletteRgb.size() - 1;
+        return paletteRgb.empty() ? Vec3{0.5, 0.5, 0.5} : paletteRgb[idx];
     }
 
     // ---- sampling -----------------------------------------------------------
@@ -97,6 +137,9 @@ struct Texture {
 
     Vec3 sampleRgb(double u, double v) const {
         if (!valid()) return Vec3{0.5, 0.5, 0.5};
+        // An INDEX map's texels are palette indices, not colours: resolve through the
+        // palette rather than returning the index as if it were a shade of grey.
+        if (hasPalette()) return paletteRgbAt(u, v);
         if (filter == TexFilter::Nearest) {
             int x = wrapIndex((int)std::floor(u * w), w);
             int y = wrapIndex((int)std::floor((1.0 - v) * h), h);

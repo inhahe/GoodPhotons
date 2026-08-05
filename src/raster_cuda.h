@@ -11,11 +11,14 @@
 // sRGB encoding stay bit-identical regardless of backend.
 //
 // Scope: all camera projections (RECTILINEAR pinhole plus the fisheye/panoramic lens
-// maps — equidistant, equisolid, stereographic, orthographic), OPAQUE geometry, image
-// skins (per-vertex UV + world-triplanar textures, sampled on-device), and see-through
-// (clear-glass) compositing (a device clear-accumulation pass mirrors the CPU one). A
-// render() call on any config still returns an empty vector on device failure so the
-// caller can fall back to raster::renderFrame.
+// maps — equidistant, equisolid, stereographic, orthographic), OPAQUE geometry, and
+// see-through (clear-glass) compositing (a device clear-accumulation pass mirrors the
+// CPU one). The shade pass has FULL parity with raster.h's: image skins (per-vertex UV,
+// world triplanar, or a marched implicit's own `uv` projection), palette (indexed)
+// maps, normal maps, and procedural `pattern` drives on the albedo and the emission —
+// the last running the shared device pattern VM (pattern_device.cuh), the same one the
+// path tracer uses. A render() call on any config still returns an empty vector on
+// device failure so the caller can fall back to raster::renderFrame.
 //
 // This is a plain-C++ interface (no __device__ symbols leak out) so main.cpp (MSVC) can
 // call into the nvcc-compiled translation unit raster_cuda.cu. When the project is built
@@ -38,11 +41,16 @@ bool available();
 // free with destroy().
 struct Scene;
 
-// Bake `tris` (world-space preview triangles) + `light` + `textures` (image skins bound by
-// PTri::tex; may be null/empty) to the device. Returns nullptr if CUDA is unavailable or a
-// device allocation fails (caller must then use the CPU path).
-Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight& light,
-              const std::vector<Texture>* textures = nullptr);
+// Bake `geom` (the world-space preview triangles plus the side tables they index) +
+// `light` + the source scene to the device. `scene` supplies everything the shade pass
+// reaches beyond the triangle itself: the image skins bound by PTri::tex /
+// PTri::normalTex, and the procedural `pattern` programs (plus their grid/scatter sample
+// tables) bound by PTri::reflectPat / PTri::emitPat / PMix::weightPat. May be null, in
+// which case textured and pattern-driven surfaces fall back to their flat colour.
+// Returns nullptr if CUDA is unavailable or a device allocation fails (caller must then use
+// the CPU path).
+Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light,
+              const ::Scene* scene = nullptr);
 
 // Free a scene created by upload() (safe on nullptr).
 void destroy(Scene* sc);

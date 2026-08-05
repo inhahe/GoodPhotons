@@ -42,9 +42,9 @@ import inspect
 import json
 import os
 import sys
-import tempfile
 from typing import Any, Callable, Dict, List, Optional
 
+from .atomicio import write_atomic
 from .signals.core import Clock, walk
 from .data import PointPath, TrackedPath, Grid, Scatter
 from .interp import eval_curve
@@ -668,18 +668,7 @@ class ViewerModel:
 
 
 def _atomic_write_text(path: str, text: str) -> None:
-    d = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=d)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    write_atomic(path, text)
 
 
 # ===========================================================================

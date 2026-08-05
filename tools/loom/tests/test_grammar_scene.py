@@ -31,7 +31,7 @@ def _ctx() -> EmitCtx:
 _SAMPLES = [
     Sphere((0.0, 1.5, -2.0), 0.75, "gold"),
     Sphere((-1, 0, 0), 1, "glass"),
-    Light("point", position="0 5 0", spd="preset:bb6500", power="40"),
+    Light("collimated", origin="0 5 0", dir="0 -1 0", spd="preset:bb6500", power="40"),
     # `color=` is loom's one convenience: it emits `spd rgb …` (ftrace lights are
     # spectral, no `color` field). Geometry uses ftrace's real area-light `u`/`v`.
     Light("area", color="0.9 0.8 0.7", u="1 0 0", v="0 0 1"),
@@ -65,11 +65,18 @@ def test_sphere_fields_roundtrip():
 
 
 def test_light_fields_roundtrip():
-    lt = Light("point", position="0 5 0", spd="preset:bb6500", power="40")
+    # ftrace's real subtypes are collimated / sphere / cylinder / spot / env / sun,
+    # plus the default rectangular area light that everything else falls through to
+    # (`addLight`, src/ftsl.h) — loom's Light is schema-free on purpose, but the
+    # fixtures here still spell lights that actually exist, so nobody copies a
+    # `point` light out of a test and gets a silent white quad.
+    lt = Light("collimated", origin="0 5 0", dir="0 -1 0",
+               spd="preset:bb6500", power="40")
     back = parse_element(lt.emit(_ctx()))
     assert isinstance(back, Light)
-    assert back.kind == "point"
-    assert back.props["position"] == "0 5 0"
+    assert back.kind == "collimated"
+    assert back.props["origin"] == "0 5 0"
+    assert back.props["dir"] == "0 -1 0"
     assert back.props["spd"] == "preset:bb6500"
     assert back.props["power"] == "40"
 

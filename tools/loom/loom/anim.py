@@ -38,10 +38,10 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from .atomicio import write_atomic
 from .axes import AConst, Binding, Target, ADDITIVE, GAIN, BIPOLAR
 from .signals.core import Signal, Clock, Cache
 
@@ -171,21 +171,9 @@ class CurveDrive:
         )
 
     def save(self, path: str) -> None:
-        """Atomically write the sidecar JSON (temp file + ``os.replace``) so the
-        editor never reads a half-written config."""
-        text = json.dumps(self.to_dict(), indent=2)
-        d = os.path.dirname(os.path.abspath(path))
-        fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=d)
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(text)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        """Atomically write the sidecar JSON (temp file + ``os.replace``, see
+        :mod:`loom.atomicio`) so the editor never reads a half-written config."""
+        write_atomic(path, json.dumps(self.to_dict(), indent=2))
 
     @classmethod
     def load(cls, path: str) -> "CurveDrive":
@@ -512,18 +500,7 @@ def serve_live(session: LiveSession, in_stream, out_stream) -> None:
 
 
 def _atomic_write_text(path: str, text: str) -> None:
-    d = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=d)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    write_atomic(path, text)
 
 
 # ===========================================================================

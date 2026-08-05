@@ -400,6 +400,33 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   first 16 points drops from 0.754 to 0.077 at base 61 and 0.651 to 0.102 at base 43
   (`scraps/n3e_lattice.py`).
 
+  **Host/device bit-exactness is a TEST, not a comment (`-checklattice`, 0.137.0).** Every
+  claim above ("trivially bit-identical", "must stay bit-identical") is now asserted by a
+  scene-free self-test. `src/lattice_probe.h` is a dependency-free header giving `main.cpp`
+  and `render_cuda.cu` **one** definition of a 33-column probe row (radicalInverse2, rot05,
+  whittedSample, whittedLambdaU, whittedOrderU, whittedFluoroU, whittedGlossyUV, giPhases,
+  gridUV, and `radicalInverseScr` in all 20 bases the mode uses); `cudaLatticeProbe` runs the
+  device twins over an index sweep and the host compares raw bit patterns. Two helpers were
+  factored out (`whittedGlossyUV` from `whittedGlossyDir`, `giPhases` from the two
+  `giGather*` bodies, with `dWhittedGlossyUV` mirroring the first) precisely so the probe
+  reads the renderer's own code rather than a copy of it — a copy could drift, which is the
+  bug class the probe exists to catch. This is N4 part (a); part (b), image agreement to fp32
+  tolerance with no *structural* difference, stays with `scraps/n3_check.py`, because whole-
+  image bit-exactness is not achievable (device `Real` is fp32, `RAY_EPS` is 1e-4f vs 1e-6,
+  and libdevice's transcendentals differ from the CRT's).
+
+  The test earned its keep immediately: nvcc contracts a multiply feeding an add into an FMA
+  by default and MSVC does not, so `dRadicalInverseScr`'s `r += digit * f` disagreed with the
+  CPU by 1 ULP on 1.6 % of indices. FMA is the *more* accurate form, but accuracy is not the
+  contract — mode `W` has no Monte-Carlo noise to absorb a difference, so the host is the
+  reference and the device must reproduce its rounding. Fixed by spelling both multiply-adds
+  with `__dmul_rn` / `__dadd_rn`, which the compiler may not fuse, rather than a global
+  `-fmad=false` that would have perturbed every other kernel. **General rule this establishes:
+  a `double` expression duplicated host-and-device is not bit-identical by construction — a
+  bare `a*b + c` will diverge — so either write it with the `_rn` intrinsics or don't claim
+  bit-exactness for it.** (`dGiDir` still contracts, but its output goes through `cos`/`sin`
+  and was never bit-comparable; it is covered by part (b).)
+
   **Sealed-light detection (0.119.0).** Because mode `W` implies `-direct-only`, NEE is the
   *only* way anything is lit — and `Scene::occluded` blocks a shadow ray on any geometry,
   dielectrics included (the SDS limitation). A light sealed inside refractive or mirrored
@@ -458,7 +485,11 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   collapse to "sample 0 forever" under `-window` (which chunks into 1-spp batches)
   and make `-spp` a no-op on the image — this was a real bug, fixed in 0.105.0.
   Mode `W` also raises the default hero bundle to `kHeroMax`, since at 1 spp the C
-  wavelengths *are* the whole spectral quadrature and they share one BVH walk.
+  wavelengths *are* the whole spectral quadrature and they share one BVH walk — measured at
+  **2.7 %** of frame time for the full 8 versus 1 (N5, 0.138.0), because the mode is
+  traversal-bound. The converse is that `-heroc 1` here is not a speed/quality trade at all:
+  it is a correctness hazard, since there are no further samples to average the collapse
+  away. See the `-rgb`-in-mode-`W` note under `render_cuda.cu`.
 
   **The deterministic one-bounce gather (`giDirs`, `-gi`)** is mode `W`'s real GI, the
   thing `ambient` only stands in for. `giGatherHero` / `giGather` trace `giDirs` rays
@@ -715,6 +746,31 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `-rgb` is refused in mode `W` (`main.cpp`, with a message): the fast RGB backward is a
   separate reduced tracer with no deterministic estimator, so it would return precisely the
   noise the mode exists to remove.
+
+  **And there will not be a deterministic RGB twin of it, because mode `W` is
+  traversal-bound (measured, N5, 0.138.0).** The obvious follow-up — "write an RGB mode `W`
+  and get `-rgb`'s 1.6–2.3× in the deterministic mode too" — does not survive measurement.
+  That speedup is entirely *bundle width*, not the cost of being spectral: on the Cornell
+  box a **spectral** mode-`R` render at `-heroc 1` costs exactly what `-rgb` costs
+  (4.4 s / 4.4 s at 8192 spp), so the fixed overhead of SPD evaluation, upsampling and CIE
+  integration measures as **zero**. And mode `W` barely pays for width, because it fires
+  `4×4` shadow rays per light per hit (plus the `-gi` gather) and the extra wavelengths ride
+  along on rays that are already being traced: on a 15-second frame (gyroid room, 7680×4800,
+  `-gi 32`) the full 8-wide default costs **2.7 %** over a single wavelength, against **61 %**
+  for mode `R`'s 4-wide bundle on Cornell. So a second hand-written RGB megakernel could win
+  ~1–2 %, in exchange for a permanent — and now *tested*, via `-checklattice` — obligation to
+  stay bit-exact with a CPU twin, plus `cudaBackwardRGBSupported`'s scope gate blanking the
+  deterministic preview on exactly the materials it is most useful for (media, thin film,
+  gratings, multilayer, layered, fluorescence, textured albedo). **The general rule: before
+  porting a cost win from one mode to another, check which term it actually came from — mode
+  `R` is shading-bound and mode `W` is traversal-bound, so their cost models do not
+  transfer.**
+
+  The same measurement is why mode `W` *raises* the default bundle to `kHeroMax` rather than
+  economising on it, and why `-heroc 1` is a hazard there specifically: at 1 spp the bundle
+  is the entire spectral quadrature, so narrowing it does not add noise that more samples
+  would remove — it changes the answer. `warnWhittedHeroCollapse` guards the batch path
+  (the viewer already guarded itself via `wNeedSpp`); see `known-issues.md`.
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,
@@ -1088,8 +1144,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   within 0.005%; U/VCM within 0.02%). **CPU-only in 0.80.0**: the device has ~20 emission
   read sites, and a partial port would be *biased* rather than visibly incomplete, so
   `cudaForwardSupported` (and `cudaBackwardRGBSupported`) reject the whole scene and the CPU
-  renders it; the port is tracked in `known-issues.md`. The preview rasteriser ignores
-  `emitPat`, consistent with its existing treatment of `reflectPat`/`transmitPat`.
+  renders it; the port is tracked in `known-issues.md`. The preview rasteriser DOES honour
+  `emitPat` (and `reflectPat`) since 0.135.0 — see *Preview shading model* below; ignoring
+  it made a masked emitter preview as one flat glowing slab.
 
   **The `emit` slot name is overloaded, and `fluorescent` owns it.** On every other material
   type `emit` means *self-emission* (`Material::emit` + `isLight = true`, i.e. the surface is a
@@ -1144,6 +1201,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   would leave the stack unbalanced and quietly return a *coordinate* as the result. That was
   a live wrong render before 0.78.0, reachable via `medium { density pattern:<p> }`, which
   copies a table-scoped pattern's nodes into a medium evaluated without tables.
+
+  **loom emits both blocks (2026-08-05, loom-only).** The port ran one way for a while:
+  ftrace had the datatypes, but loom's own `Grid`/`Scatter` could still only be sampled in
+  Python (a `GridField` is a `Signal`, so it bakes to one number per frame). `grid(X, Y)` —
+  a query in ftsl's *spatial* coordinates — now builds a `GridSample`/`ScatterSample` term
+  (`loom/spatial.py`) that emits the table call, with the companion `grid`/`scatter` block
+  collected automatically by `Scene.add` and its values baked at the emit clock. Its
+  `eval_np` is a vectorised port of `patGridSample`/`patScatterSample`, so loom's raster
+  preview and the render agree; a dataset's placement `Transform` folds into the emitted
+  *coordinates*, since these blocks (unlike geometry) carry no transform of their own. What
+  ftrace cannot express — vector-valued samples, cubic interpolation, a throwing
+  out-of-domain policy, > 4 axes — raises in loom rather than emitting something that means
+  something else. See `tools/loom/DESIGN.md` §6.
 
   **Pattern-VM CSE (0.118.0).** Field formulas are the sphere-tracer's inner loop —
   `patternEval` was ~73% of mode W's CPU time on the gyroid scene — and authored
@@ -1634,7 +1704,8 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       | girdle 0.02 | 36.41× | 0.15 % | 0.480 | 0.273 | 1.46 × 1.20 |
       | **girdle 0.04 — SHIPPED** | **37.07×** | **0.17 %** | 0.463 | 0.254 | **1.49 × 1.22** |
       | girdle 0.08 | 27.35× | 0.19 % | 0.392 | 0.226 | 1.60 × **0.38** |
-      | girdle 0.04, 16 vertical facets | 29.71× | 0.18 % | 0.470 | 0.243 | 1.55 × **0.38** |
+      | girdle 0.04, 16 vertical facets | 32.41× | 0.17 % | 0.428 | 0.242 | 1.49 × **0.38** |
+      | girdle 0.04, 8 vertical facets | 13.83× | 0.15 % | 0.377 | **0.099** | 1.49 × **0.35** |
       | + crown 34.5° / 75 % table | 3.75× | **0.01 %** | 0.272 | 0.036 | — |
       | + crown 34.5° / 53 % table (a real brilliant) | 3.48× | **0.01 %** | 0.229 | 0.004 | — |
       | + crown 20° / 60 % table | — | **0.02 %** | 0.254 | 0.041 | — |
@@ -1645,7 +1716,9 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       wider-covering than the bare cone, for ~9 % of `sat`. Past that the band eats the rim:
       at 0.08 the patch collapses from two cusps (1.17 m of z) to one band (0.38 m). Sixteen
       **vertical** facets — which by construction cannot deviate the descending aperture at
-      all — collapse it the same way, so the glinting waist is not worth its cost. **A crown
+      all — collapse it the same way, and eight facets are far worse again (spread 0.099, peak
+      13.83×), so faceting costs monotonically with coarseness and the glinting waist is not
+      worth its cost at any count. **A crown
       is fatal**, which is the round-brilliant row of the table above arrived at from the other
       direction: a crown facet at angle *c* bends a descending ray inward by
       *c* − asin(sin *c* / n) — 15.6° at *c* = 34.5° in SF10 — so the whole annulus outside the
@@ -1653,6 +1726,22 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       coverage, i.e. *no caustic*. That is the cut working as designed: a brilliant throws its
       fire **up at the viewer**, and flint makes that worse than crystal (critical angle 35.4°
       against 40.2°), so the flint recut moves *away* from a gem cut, not toward one.
+
+      **Confirmed in the finished frame, not just in the rig**, at matched convergence
+      (`-device cpu`, 800×450, control 324 spp / 5.56 % noise against girdled 305 spp /
+      5.73 %), which matters because the rig floats one piece over a bare white cap while the
+      real exhibit sits on textured marble under a partly-shadowed sky:
+
+      | axicon cap | coverage | sat | spread | xspread | peak | clip | noise | fan |
+      |---|---|---|---|---|---|---|---|---|
+      | pre-girdle | 2.40 % | 0.324 | 0.130 | 0.201 | 4.94× | 0.13 % | 0.059 | — |
+      | **0.04 girdle** | **2.77 %** | 0.335 | 0.135 | 0.205 | **5.17×** | 0.15 % | 0.062 | **0.80** |
+
+      Every axis moves the right way and the caustic becomes *more* organised (`fan` goes from
+      unmeasurable to 0.80). The rig's +42 % coverage lands as +15 % in frame — the shipped
+      exhibit is shadowed and textured, so the rig overstates the gain, which is the expected
+      direction and the reason both are measured. Every other cap is unchanged to three
+      decimals (gyroid 2.84 %/0.444→0.445, glass 0.00 % both), i.e. no side effects.
     - **`contained_by` is a hard clip in the gem rig, and its default box was shaving the
       control.** `scraps/_gemsweep.py` boxed every piece at ±0.5 m while `vcone1.0`'s girdle
       radius is 0.56, so every axicon number the rig printed before the girdle sweep was
@@ -2306,6 +2395,143 @@ Five call sites share the rule: `fillTriangleG` and `fillTriangleClear` (raster.
 in the clear pass, which *multiplies* into `clearT`/`milkT` — a doubly-covered edge would
 darken a seam twice, an uncovered one leaves a hairline of un-tinted glass. Costs ~4% on the
 CPU rasterizer; GPU unchanged. History and measurements in `known-issues.md`.
+
+## Preview shading model (`raster.h` + `raster_cuda.cu`, 0.135.0; per-hit mix 0.136.0)
+
+The preview has no light transport, so nothing that needs a *second* bounce — reflection,
+refraction, shadows, GI, glossy lobes — can exist in it. But everything that determines a
+surface's appearance **at a single point** can, and now does. Both backends implement the
+identical set, because they share the bake (`raster::tessellate`) and mirror the shade.
+
+| Material feature | Preview behaviour |
+|---|---|
+| `reflect texture:` skin | Sampled per pixel: per-vertex UV, world triplanar, or the primitive's own `uv` projection |
+| Palette (indexed-spectral) map | Each palette entry pre-resolved to a linear-sRGB colour; nearest lookup |
+| `reflect pattern:` / `reflect_map pattern:` | Scalar clamped to [0,1], multiplies the albedo |
+| `emit pattern:` / `emit_map pattern:` | Scalar clamped to [0,1], multiplies the **emission** |
+| `normal_map` | Perturbs the shading normal through the triangle's UV-derived TBN |
+| `mix` / layered material | Resolved to its dominant child (`mixDominantChild`) |
+| 2-child `mix` + `weight_map texture:`/`pattern:` | Resolved **per pixel**: the mask is sampled at the shaded point and hard-thresholded at ½, exactly as `mixResolveDominant`, and the winning child's whole payload is swapped in |
+| `roughness_map`, `film_thickness` maps | Ignored **by design** — a preview has no glossy lobe for them to drive |
+| Textured light | No such slot exists in the language; a light's look is its SPD × `emit_map pattern:` |
+
+Design points worth keeping:
+
+- **The emission mask is evaluated BEFORE the emissive early-out.** This is the whole
+  reason the feature matters. `gallery_rain`'s ground is a 528 nm emitter masked by
+  `emit_map pattern:grid_ground`; skipping the pattern made 28% of the frame one flat
+  `rgb(0,255,89)` slab instead of a dark plane with thin glowing grid lines.
+- **Marched implicits get their UVs from the primitive, not the mesh.** Marching cubes
+  emits no per-vertex UVs, so a skinned isosurface has *no* UV source unless the
+  primitive carries a `uv planar/spherical/cylindrical` projection — which `tessellate`
+  now re-evaluates per marched vertex with the tracer's own `projectUV`. Missing this was
+  the original bug: `gallery_rain`'s ten marble caps previewed untextured while the
+  traced render showed marble.
+  Azimuthal projections need **per-triangle seam repair**: the ray-hit path projects *at*
+  the hit and never sees the 1.0→0.0 wrap, but the rasterizer *interpolates*, so a
+  triangle straddling the seam would run `u` backwards across the entire texture. Any
+  triangle whose `u` spread exceeds 0.5 has its low corners lifted by +1.
+- **A `weight_map` mix is a PER-PIXEL material swap, not a per-material choice** (0.136.0).
+  `mixDominantChild` only compares the *constant* weights, so a weight-mapped mix (always
+  50/50, hence always child 0) previewed as one flat winner while `-mode W` — which calls
+  `mixResolveDominant` and evaluates the mask at the hit — showed the blend. That broke
+  `raster.h`'s own stated invariant that "raster and mode W agree on what a mix looks
+  like". The fix splits `PTri`'s material payload into a base `PShade` and adds a `PMix`
+  side table (`PreviewGeom::mixes`, indexed by `PTri::mix`); the shade pass evaluates the
+  mask and, below ½, repoints `const PShade* sh` at the loser's payload — so albedo, skin,
+  normal map and pattern drives all switch together. Key consequences:
+  - **Per MATERIAL, not per triangle.** Inlining a second payload in `PTri` would add ~58 B
+    to a ~276 B struct (~+120 MB on a 2 M-triangle scene); the side table has one entry per
+    weight-mapped mix however many triangles carry it.
+  - **`PTri : PShade` by inheritance**, so every existing `pt.color` / `t.tex` reference in
+    both backends still compiles. Safe because `PTri` is only ever default-constructed.
+  - **Geometry and side table travel together** as `PreviewGeom` — a `PTri::mix` index is
+    only meaningful against the `mixes` built in the same `tessellate()` call.
+  - **`emissive` and `clear` deliberately come from child 0 only.** `g.emis` is written in
+    the raster pass and consumed by auto-exposure *before* shading, and `clear` steers the
+    separate see-through composite pass; neither can vary per pixel.
+  - **`needUV` must include `mix >= 0`.** The mask is sampled at (u,v) whether it is a
+    pattern or a scalar texture. Missing this was the whole visible bug on the first cut:
+    `pattern_tex.ftsl` previewed with `u=v=0`, so its two `tex:`-driven walls came out flat
+    and only the floor (which also reads world `x`) showed any structure. The GPU twin
+    interpolates UVs unconditionally and needed no equivalent change.
+  - A child that is *itself* a weight-mapped mix still flattens — no recursive per-pixel
+    walk, and no scene in the library nests them.
+- **One `applyMat()` assigns every per-material field**, called from all four geometry
+  paths (world tris, spheres, implicits, instances). The class of bug being closed is a
+  feature wired into three paths and silently dropped on the fourth.
+- **The G-buffer stores a source triangle INDEX**, not a copy of each material field. The
+  shade pass reads `tris[g.tri[i]]`, so every future per-material feature is free of a new
+  per-pixel channel — and it matches what the GPU backend already did (`slot >> 1`).
+- **Palette resolution lives in `Texture`, not in the rasterizer** (`buildPaletteRgb` /
+  `paletteRgbAt`), so every consumer that wants a *colour* rather than a spectrum gets it.
+  Previously `sampleRgb` on an index map returned the raw index out of the red channel —
+  entry 3 of 12 shading as near-black.
+- **The pattern VM is shared source, not a second implementation** (`pattern_device.cuh`).
+  It was extracted verbatim out of `render_cuda.cu` and templated on the texture-record
+  type, because the two backends store textures differently: the tracer uploads spectral
+  `DTexture`s (Jakob-Hanika coefficients), the preview flat linear-RGB `DTex`s. The VM
+  reaches a texture only through `TexT::patScalarAt(u,v)`, which each backend implements
+  against its own storage (both mirroring the host's `Texture::scalarAt`). Everything else
+  it touches — `PatGrid`, `PatScatter`, the flat float pool, the POV function library — was
+  already shared `__host__ __device__` code in `pattern.h`.
+
+CPU/GPU parity is verified on `gallery_rain`: of 1.17 M pixels, 6247 (0.54%) differ by
+more than 2/255, and every one of them lies on a grid-line boundary — the pattern is a
+hard step, the CPU evaluates it at a double-precision world position and the GPU at a
+float one, so a sub-texel shift flips a pixel across the step. Mean absolute difference
+over the frame is 0.12/255. The per-hit mix agrees to the same tolerance and for the same
+reason (the ½ threshold is another hard step): `pattern_tex.ftsl` 0.076% of pixels over
+2/255, `maskblend.ftsl` (a `weight_map texture:`) 0.068%, `_preview_pattern_tex.ftsl`
+0.083% — unchanged from before the mix work, i.e. no regression. Both raster backends now
+reproduce `-mode W`'s image of all three `pattern_tex` walls.
+
+## CPU raster frame loop (`raster.h`, perf architecture, 0.136.1)
+
+`renderFrame` is seven strictly-sequential parallel passes (project → zbuf clear →
+G-buffer raster → optional see-through → shade → auto-exposure anchor → tonemap/encode).
+The feature work above (textures / pattern VM / per-pixel mix / normal maps) added genuine
+per-pixel cost, but profiling showed the frame was dominated by *fixed* overhead, removed
+in 0.136.1 (2.4–3.5× at 1280×960; every optimization below is **byte-identical** on a
+9-image corpus — the invariants that make that provable are the point of this section):
+
+- **`RasterScratch`** (owned by the caller, one per explorer/bench session, passed down as
+  an optional pointer): the G-buffer, accum, see-through buffers, per-thread projection
+  parts and the `BandPool` all persist across frames. Before, every frame re-allocated and
+  `assign()`-zeroed ~129 MB — pure page-fault + memset cost. Channels are now `resize()`d
+  (no re-zero) and only **zbuf** is cleared, because every other channel is write-before-read:
+  each is only ever read where `zbuf > 0`, and the raster pass that sets zbuf writes them
+  all (auto-exposure's scan short-circuits on `zbuf[i] <= 0 || emis[i]`, and `emis` is
+  written by the same raster pass). Stale-data hazard to preserve: `S.parts` buffers past
+  the current thread count must be explicitly cleared or a shrink leaks old triangles into
+  the concatenation.
+- **`BandPool`**: a persistent worker pool (generation-counted condition-variable
+  broadcast, `run(body(workerIdx))`, not nestable) replacing ~84 `std::thread` spawns per
+  frame (7 passes × N threads). Bit-identity argument: the pool runs the **same partition
+  formulas** (`chunk = (n+nT-1)/nT`, row bands) as the spawn path, so band ownership —
+  and therefore every band-ordered write — is unchanged. `exposeAndEncodeT` takes the pool
+  as an optional parameter (other caller: `render_cuda.cu`'s G2 iso preview, which passes
+  none) and falls back to spawning if the pool's size mismatches `nThreads`.
+- **`selectKthNonNeg`** (auto-exposure anchor): the p99-luminance anchor ran a *serial*
+  `std::nth_element` over ~1.1 M doubles (~4 ms). Non-negative IEEE doubles order
+  monotonically as raw bit patterns, so a parallel 16-bit-radix histogram (top 16 bits)
+  locates the bucket holding rank k, a parallel scan collects just that bucket's members,
+  and a tiny `nth_element` selects within it. Exactness: selection is by **value** over a
+  multiset, so neither pack order nor tie order can change the result; small n / no pool
+  falls back to plain `nth_element`. Requires non-negative inputs (the anchor packs
+  `max(r,g,b,0.0)`).
+- **Feature-cost hoists** in the shade pass: `normalize(g.wn[i])` computed once and shared
+  by the pattern context and shading; the mix `weight_map` PatCtx is built lazily (texture
+  masks don't need it); the normal-map tangent's raw dP/dU half (`triTangentRaw`) is baked
+  per triangle at tessellation (`PTri::tanRaw`, zero when UVs degenerate ⇒ per-pixel
+  fallback basis) leaving only the per-pixel Gram-Schmidt. The GPU twin deliberately keeps
+  recomputing the raw tangent per pixel — its whole shade pass is 0.19 ms.
+- **What was measured, not guessed** (`scenes/_raster_bench.ftsl` + its `_plain` twin,
+  1280×960, 12 threads): features-heavy
+  86 → ~36 ms median, all-plain 69 → ~20 ms; remaining with-anchor cost over absolute-EV
+  is ~2–3 ms = the two collection scans, inherent to the percentile semantics. GPU was
+  profiled first and left untouched: 2.73 ms/frame with all new feature code costing
+  0.19 ms in `kShade`.
 
 ## GPU raster pipeline (`raster_cuda.cu`)
 

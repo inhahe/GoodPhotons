@@ -1,0 +1,29 @@
+# _raster_bench_plain.ftsl — all-plain twin of _raster_bench.ftsl: identical geometry,
+# camera and light, but every surface is flat whitewall diffuse. The delta between the
+# two benches isolates the per-pixel feature cost (textures / pattern VM / mix / normal
+# map) from the fixed pipeline cost (project, raster, clears, anchor, tonemap).
+#
+#   ftrace -in scenes/_raster_bench_plain.ftsl -raster -raster-bench 60 -device cpu -r 1280 960 -o png/rbench_plain_cpu.png
+
+scene { units meters  spectral 360 830 1 }
+
+material "plain"  { type diffuse reflect whitewall 0.75 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material plain }    # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material plain }    # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material plain }    # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material plain }    # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material plain }    # right
+
+sphere { center 0.5 0.45 0.5  radius 0.28  material plain }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.2   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 46
+    mode B
+    film { res 1280 960 }
+}

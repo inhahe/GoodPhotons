@@ -5,7 +5,7 @@ long prose blocks whose opening paragraph reads like a plan but whose later
 `**STATUS (date) … DONE**` sub-paragraph says it landed. That makes "what's actually left?"
 expensive to answer.
 
-**This file is the actionable extract, as of 2026-07-28 (ftrace v0.101.0).** It carries only
+**This file is the actionable extract, as of 2026-08-05 (ftrace v0.138.0).** It carries only
 work that is genuinely undone *and* not explicitly ruled out. `TODO.md` remains the
 authoritative design text — every item below names its section/item ID there, and the full
 rationale, prior art and scoping live in that entry, not here.
@@ -76,7 +76,49 @@ the `(u)` to add. A composed array literal works inside a table call too
 (`grid:ramp([0.2 0.8](u))`), which needed `WORD`'s balanced-group alternative widened to match
 `PARENWORD`'s body. Pinned by `-checkarray` section (i).
 
-**Section 1 is now empty of actionable ftrace items.**
+### ~~N4a — bit-exact host-vs-device sweep of the mode-W sample lattices~~  **DONE 2026-08-05 (v0.137.0)**
+*TODO.md §N item N4 — now closed, both parts.*
+
+Shipped as `ftrace -checklattice`: structural contracts for the digit-scrambled radical inverse
+(bijectivity, `π(0)=0`, grid-permutation, low-spp coverage, `rot05`, `gridUV` tiling, "sample 0 is
+the canonical outcome"), then a bit-pattern comparison of **2 169 156** values — 65 732 sample
+indices × 33 lattice columns — host against device. It found a real divergence on its first run:
+nvcc contracts `r += digit * f` into an FMA and MSVC doesn't, so 1.6 % of values differed by 1 ULP.
+Fixed with `__dmul_rn` / `__dadd_rn`; logged in `known-issues.md`.
+
+### ~~N5 — re-measure spectral vs `-rgb` at mode W's 1 spp, then judge an RGB mode W~~  **DONE 2026-08-05 (v0.138.0)**
+*TODO.md §N item N5 — measured and declined.*
+
+The verdict is **no**, by a much wider margin than the recorded 1.27–1.7× reasoning suggested —
+because that figure is a **mode-R** number and does not transfer to mode W. Re-measured on the
+RTX 4090: mode R's spectral penalty has actually *widened* (1.61× Cornell, 2.30× gyroids), but a
+`-heroc` sweep shows it is entirely **bundle width** — a spectral render at C=1 costs exactly what
+the RGB kernel costs on Cornell, so the fixed cost of being spectral measures as zero. Mode W,
+being traversal-bound (4×4 shadow rays per light per hit), is nearly flat in bundle width: on a
+15-second frame the full 8-wavelength default costs **2.7%** over one wavelength, versus 61%/46%
+in mode R. So a second hand-written RGB megakernel could win ~1–2%, in exchange for a permanent
+bit-exactness obligation (now *tested*, via `-checklattice`) and `cudaBackwardRGBSupported`'s scope
+gate blanking the deterministic preview on media / thin-film / gratings / multilayer / layered /
+fluorescence / textured albedo. Not built.
+
+Also confirmed `-rgb`'s one structural edge is closed: spectral mode W is 1-spp-clean on the
+Cornell SF10 sphere at **0.82 pp** chroma error (reproducing N1's 0.80 pp). And it turned up a real
+bug — see below.
+
+### ~~`-mode W -heroc 1` silently reproduced the de-hero collapse~~  **DONE 2026-08-05 (v0.138.0)**
+*Found while measuring N5.*
+
+`-heroc 1` turns the hero bundle off, so mode W's fixed spectral quadrature collapses to one
+wavelength — and on a dispersive scene that isn't approximate, it's flatly wrong: the Cornell SF10
+sphere renders **46.85 pp** off in chroma (a flat green ball), with nothing printed. The viewer
+absorbs this by accumulating passes (`wNeedSpp`); a batch `-spp 1` render has nothing to average.
+`warnWhittedHeroCollapse` now names the offending material class. `whittedNeedsBundle` scans only
+materials attached to geometry, and calls a dielectric dispersive only if its `ior` Spectrum
+actually varies over 400–700 nm, so a constant-IOR dielectric doesn't nag. Print-only; the mode-W
+image is byte-identical to 0.137.0.
+
+**Section 1 is again empty of actionable ftrace items** — everything left is either blocked on a
+user decision (§2) or deferred by measurement (§3).
 
 ---
 
@@ -158,28 +200,44 @@ round-trip byte-identically, 65 of 97 corpus files parse and 64 of those re-emit
 other 32 are full-ftrace-language forms `ftsl.epeg` deliberately doesn't model — see the
 scope-boundary note in TODO.md §J3c and loom's `design.md` §8b), 1243 loom tests green.
 
-### loom `Grid` has no `.ftsl` emitter — grids can only be sampled in Python  *(loom; medium)*
+### ~~loom `Grid` has no `.ftsl` emitter — grids can only be sampled in Python~~  **DONE 2026-08-05 (loom-only, no `VERSION` bump)**
 *Noticed 2026-07-28 while auditing the loom element emitters.*
 
-ftsl has a first-class **`grid { shape / lo / hi / data }`** dataset block plus `n(x, y)`
-sampling inside a spatial expression (`src/ftsl.h`, and array literals desugar into exactly
-that block — see `g.type = "grid"` ~2452). loom has a `Grid` dataset (`loom/data.py`) and a
-`GridField`/`VecGridField` interpolator (`loom/interp.py`) — but **no path from one to the
-other**. `GridField._eval` interpolates in *Python* and bakes to a number, and nothing in
-`loom/ftsl_emit.py` ever writes a `grid` block, so:
+ftsl has first-class **`grid { shape / lo / hi / outside / data }`** and
+**`scatter { dim / power / eps / data }`** dataset blocks (loaded in Pass 1a, `src/ftsl.h`
+`addGrid`/`addScatter`) sampled from any pattern expression as `grid:<name>(c0, …)` /
+`scatter:<name>(c0, …)` (`PatOp::Grid`/`PatOp::Scatter`, `src/pattern.h`). loom had the
+datasets and the interpolators but **no path from one to the other**: `grid(X, Y)` raised,
+and a grid-driven field could only reach `.ftsl` fully baked per frame.
 
-- `grid(X, Y)` (sampling a grid by ftsl's *spatial* coordinates) raises
-  `TypeError: float() argument must be … not 'Surface'` — the field can only be sampled at
-  numbers, never at a coordinate the renderer supplies;
-- a grid-driven field can therefore only reach `.ftsl` **fully baked per frame**, losing both
-  the render-time interpolation and the compact `data …` representation ftrace already has.
+Fixed as designed, and extended to `Scatter` — leaving one dataset renderable and its sibling
+not would have been exactly the asymmetry that becomes debt later:
 
-Proper fix: a `Grid.emit(ctx)` (or an emitting wrapper element) that writes the `grid` block —
-`shape`, `lo`, `hi`, `data` with the values baked at `ctx.clock` — plus a `GridField` spelling
-that lowers to `name(x, y)` in the emitted expression when its query is a `SpatialExpr`. The
-Python evaluator stays as the loom-side preview, exactly as `sample(t)` is for `CurveDrive`.
+- **`GridSample` / `ScatterSample`** (`loom/spatial.py`) — new `SpatialExpr` leaves.
+  `Grid.__call__`/`Scatter.__call__` are now dual-tier: a temporal query still builds the
+  `GridField`/`ScatterField` Signal, a query containing any `SpatialExpr` builds the
+  renderable leaf. `emit()` writes the table call; `eval_np()` is a vectorised port of
+  `patGridSample`/`patScatterSample`, so the raster preview, the temporal field and the
+  render all agree (checked to ~1e-15 against loom's own interpolators).
+- **`GridDecl` / `ScatterDecl`** (`loom/scene.py`) — the companion blocks, values (and a
+  scatter's positions) baked at `ctx.clock`. `Scene.add` collects them automatically via
+  `SpatialExpr.table_decls()`, deduped by name, explicit declaration wins — the same
+  mechanism `Image` → `Texture` already used.
+- **Placement folds into the query.** ftsl's `grid` block has no transform, so a
+  `.transformed()` dataset inverse-maps the *coordinates* instead. `Transform.inverse_apply`
+  and the new `inverse_apply_spatial` now share one body (`_inverse_map(c, d, wrap)`), so the
+  two tiers cannot drift.
+- **Honest refusals** where ftrace cannot follow: vector-valued datasets (`PatGrid` stores
+  scalar floats), `interp="cubic"` (`patGridSample` is N-linear only), `on_outside="raise"`
+  (a renderer cannot throw per-sample) and > 4 axes (`PAT_ND_MAX_DIM`).
 
-No current consumer is blocked on it — logged so it isn't rediscovered.
+Verified: 48 new tests in `tools/loom/tests/test_grid_term.py` (1328 loom tests green), and
+ftrace loads and renders the emitted `.ftsl` with no warnings — an A/B render against an
+all-constant grid moves the two table-driven channels while the deliberately-constant channel
+stays at ratio exactly 1.000.  The rendered image also carries the field itself: dividing each
+grid-driven channel by the constant one cancels the cosine shading that otherwise dominates the
+eye, leaving R/B spanning 1.00–1.77 and G/B spanning 1.10–1.57 across the sphere — the wider
+red spread is exactly what the narrower green albedo range (`0.15 + 0.6*g`) predicts.
 
 ### FUTURE — loom full `.ftsl` read support  *(loom; large)*
 *TODO.md, the `FUTURE` bullet under §J3c.*

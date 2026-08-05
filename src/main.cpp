@@ -158,6 +158,10 @@
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
                                // header also pulls it in, but CPU-only builds need it too
+#include "lattice_probe.h"     // -checklattice (N4a): the shared host/device probe layout.
+                               // Unconditional — section 1 of the check (the structural
+                               // invariants) runs in a CPU-only build too.
+#include <cstdarg>             // checkLattice's variadic failure reporter
 #ifdef HAVE_CUDA
 #include "render_cuda.h"
 #include "raster_cuda.h"   // GPU preview rasterizer (device twin of raster::renderFrame)
@@ -2767,6 +2771,297 @@ static int checkSun() {
     return ok ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// N4a — mode-W deterministic sample lattices: structural invariants, then a
+// BIT-EXACT host-vs-device sweep (`-checklattice`).
+//
+// Why this test exists and why it is stricter than everything in §M: the usual GPU escape
+// hatch in render_cuda.h — "an independent noise realization that agrees to within
+// Monte-Carlo noise" — does not apply to mode W, which has no noise for a mismatch to hide
+// behind. A wrong quadrature weight, an off-by-one in a lattice, or a base typo is a
+// *visible deterministic* CPU/GPU difference. Whole-image bit-exactness is nevertheless
+// unachievable (device `Real` is fp32, RAY_EPS differs, libdevice's transcendentals differ
+// from the CRT's), so N4 splits acceptance in two: part (b) is image agreement to fp32
+// tolerance with no structural error, already covered by scraps/n3_check.py; part (a) is
+// THIS — the lattice helpers are pure integer-and-`double` arithmetic and so genuinely can
+// be, and here must be, bit-identical.
+//
+// Section 1 runs with or without a GPU and pins the contracts backward.h's comments claim:
+// digit-scramble bijectivity, pi(0) == 0, whole-interval coverage at low spp (the actual
+// bug that made radicalInverseScr necessary), and "sample 0 is the canonical outcome" at
+// every lattice. Section 2 is the host-vs-device bit comparison; it reports SKIPPED, not
+// failed, in a CPU-only build or on a machine with no device.
+static int checkLattice() {
+    typedef BackwardRenderer BR;
+    bool ok = true;
+    auto bad = [&](const char* fmt, ...) {
+        va_list ap; va_start(ap, fmt);
+        std::printf("[checklattice] ");
+        std::vprintf(fmt, ap);
+        std::printf("  BAD\n");
+        va_end(ap);
+        ok = false;
+    };
+
+    // ---- 1. structural invariants of the digit-scrambled radical inverse ----
+    // The multiplier must be a bijection's: 0 < m < b with gcd(m, b) == 1. Every base used
+    // is prime, so the second condition is implied, but check it directly anyway — a future
+    // composite base would silently collapse the permutation onto a sub-grid.
+    bool passMul = true, passZero = true, passPerm = true, passCover = true, passRange = true;
+    for (unsigned b : kLatticeProbeBases) {
+        const unsigned m = BR::goldenDigitMul(b);
+        if (m == 0u || m >= b) { bad("goldenDigitMul(%u) = %u out of range", b, m); passMul = false; }
+        unsigned g = m, h = b;
+        while (h) { unsigned t = g % h; g = h; h = t; }
+        if (g != 1u) { bad("gcd(goldenDigitMul(%u)=%u, %u) = %u != 1", b, m, b, g); passMul = false; }
+
+        // pi(0) = 0, so radicalInverseScr(b, 0) is EXACTLY 0 in every base. This is what
+        // keeps "sample 0 is the mirror direction / the specular order / the median lambda".
+        if (BR::radicalInverseScr(b, 0) != 0.0) { bad("radicalInverseScr(%u, 0) != 0", b); passZero = false; }
+
+        // The first b points must be a PERMUTATION of the b-point grid {0, 1/b, ..., (b-1)/b}
+        // — that is the whole claim: same grid (so the same discrepancy), scattered order.
+        std::vector<char> seen(b, 0);
+        for (unsigned i = 0; i < b; ++i) {
+            const double v = BR::radicalInverseScr(b, i);
+            if (v < 0.0 || v >= 1.0) { bad("radicalInverseScr(%u, %u) = %.17g out of [0,1)", b, i, v); passRange = false; break; }
+            const unsigned cell = (unsigned)(v * (double)b + 0.5);
+            if (cell >= b || std::fabs(v - (double)cell / (double)b) > 1e-12 || seen[cell]) {
+                bad("radicalInverseScr(%u, ...) is not a permutation of the %u-point grid (i=%u)", b, b, i);
+                passPerm = false; break;
+            }
+            seen[cell] = 1;
+        }
+
+        // Coverage at a realistic preview budget. Unscrambled, base b confined the first N
+        // samples to [0, N/b) — with b = 61 and N = 16 that is the first quarter, which is
+        // exactly how a 480 nm dye rendered as if it did not fluoresce until -spp 64.
+        // Scrambled, 16 samples must straddle the interval.
+        double lo = 1.0, hi = 0.0;
+        for (unsigned i = 0; i < 16; ++i) {
+            const double v = BR::radicalInverseScr(b, i);
+            lo = std::min(lo, v); hi = std::max(hi, v);
+        }
+        if (hi - lo < 0.5) { bad("base %u: 16 samples span only %.3f of [0,1)", b, hi - lo); passCover = false; }
+    }
+    std::printf("[checklattice] digit multiplier is a bijection (0<m<b, gcd=1), all %d bases  (%s)\n",
+                kLatticeProbeNBases, passMul ? "ok" : "BAD");
+    std::printf("[checklattice] pi(0)=0 => radicalInverseScr(b,0) == 0 exactly, all bases  (%s)\n",
+                passZero ? "ok" : "BAD");
+    std::printf("[checklattice] first b points are a permutation of the b-point grid  (%s)\n",
+                passPerm ? "ok" : "BAD");
+    std::printf("[checklattice] every value in [0,1)  (%s)\n", passRange ? "ok" : "BAD");
+    std::printf("[checklattice] 16 samples span >= 0.5 of [0,1) in every base  (%s)\n",
+                passCover ? "ok" : "BAD");
+
+    // rot05 is a rotation by 1/2 on the circle, hence an involution on [0,1) — exactly in
+    // the reals, and to within one rounding in `double`: for x < 0.5 the intermediate x+0.5
+    // lands in [0.5, 1), whose ULP is 2^-53, so a small x is quantised to that coarser grid
+    // and cannot survive the round trip bit-for-bit. Demanding exactness here would be
+    // asserting something false about floating point, not something true about the lattice;
+    // what actually matters is that it stays in range and never drifts by more than that
+    // single rounding (2^-53, doubled for the round trip).
+    {
+        bool passRot = true;
+        const double tol = 2.0 * 1.1102230246251565e-16;   // 2 * 2^-53
+        for (int i = 0; i <= 4096 && passRot; ++i) {
+            const double x = (double)i / 4096.0 * 0.99999;
+            const double r = BR::rot05(x);
+            if (r < 0.0 || r >= 1.0) { bad("rot05(%.17g) = %.17g out of [0,1)", x, r); passRot = false; break; }
+            if (std::fabs(BR::rot05(r) - x) > tol) {
+                bad("rot05 round trip at %.17g drifts by %.3g (> 2 ULP)", x, std::fabs(BR::rot05(r) - x));
+                passRot = false;
+            }
+        }
+        // Exactness IS required where it is achievable and load-bearing: at x = 0, which is
+        // what puts sample 0 at 0.5 (the pixel centre / mid-stratum) in every rotated lattice.
+        if (BR::rot05(0.0) != 0.5) { bad("rot05(0) != 0.5 exactly"); passRot = false; }
+        std::printf("[checklattice] rot05 stays in [0,1), round-trips to <= 2 ULP, rot05(0) == 0.5 exactly  (%s)\n",
+                    passRot ? "ok" : "BAD");
+    }
+
+    // "Sample 0 is the canonical outcome" — the contract that makes a 1-spp preview the
+    // classic un-antialiased, mirror-reflecting, specular-order, median-lambda image, and
+    // that lets every spp>1 change be judged as a pure refinement.
+    {
+        bool passS0 = true;
+        auto exact = [&](const char* what, double got, double want) {
+            if (got != want) { bad("%s = %.17g, want exactly %.17g", what, got, want); passS0 = false; }
+        };
+        double u, v;
+        BR::whittedSample(0, u, v);
+        exact("whittedSample(0).u  (pixel centre)", u, 0.5);
+        exact("whittedSample(0).v  (pixel centre)", v, 0.5);
+        exact("whittedLambdaU(0)   (mid-stratum)", BR::whittedLambdaU(0), 0.5);
+        double p1, p2;
+        BR::giPhases(0, p1, p2);
+        exact("giPhases(0).p1", p1, 0.5);
+        exact("giPhases(0).p2", p2, 0.5);
+        for (int b = 0; b < 4; ++b) {
+            double g1, g2;
+            BR::whittedGlossyUV(0, b, g1, g2);
+            exact("whittedGlossyUV(0).u1 (mirror dir)", g1, 1.0);
+            exact("whittedGlossyUV(0).u2", g2, 0.0);
+            exact("whittedOrderU(0)     (specular order)", BR::whittedOrderU(0, b), 0.0);
+            exact("whittedFluoroU(0)    (median excitation)", BR::whittedFluoroU(0, b), 0.5);
+        }
+        std::printf("[checklattice] sample 0 is the canonical outcome at every lattice  (%s)\n",
+                    passS0 ? "ok" : "BAD");
+    }
+
+    // gridUV must tile [0,1)^2 exactly: G*G distinct cell centres, no duplicates, no gaps.
+    {
+        bool passGrid = true;
+        for (int G = 1; G <= 8 && passGrid; ++G) {
+            std::vector<char> seen((size_t)G * G, 0);
+            for (int g = 0; g < G * G; ++g) {
+                double u1, u2;
+                BR::gridUV(g, G, u1, u2);
+                const int cx = (int)(u1 * G), cy = (int)(u2 * G);
+                if (u1 <= 0.0 || u1 >= 1.0 || u2 <= 0.0 || u2 >= 1.0 ||
+                    cx < 0 || cx >= G || cy < 0 || cy >= G || seen[(size_t)cy * G + cx]) {
+                    bad("gridUV(%d, %d) = (%.17g, %.17g) is not a fresh in-range cell centre", g, G, u1, u2);
+                    passGrid = false; break;
+                }
+                seen[(size_t)cy * G + cx] = 1;
+                if (std::fabs(u1 - ((double)cx + 0.5) / G) > 1e-15 ||
+                    std::fabs(u2 - ((double)cy + 0.5) / G) > 1e-15) {
+                    bad("gridUV(%d, %d) is not the CENTRE of its cell", g, G);
+                    passGrid = false; break;
+                }
+            }
+        }
+        std::printf("[checklattice] gridUV tiles [0,1)^2 with G*G distinct cell centres  (%s)\n",
+                    passGrid ? "ok" : "BAD");
+    }
+
+    // ---- 2. host vs device, bit for bit ------------------------------------
+    // The sweep: every index a real preview actually visits (0..65535 covers -spp far past
+    // any practical budget, and every base), plus a sparse tail that exercises the 64-bit
+    // paths — the bit-reversal's high word, indices past 2^32, and the digit loop's depth.
+    std::vector<unsigned long long> idx;
+    idx.reserve(65536 + 320);
+    for (unsigned long long i = 0; i < 65536ull; ++i) idx.push_back(i);
+    for (int e = 0; e < 64; ++e) {
+        const unsigned long long p = 1ull << e;
+        idx.push_back(p);
+        if (p >= 1ull) idx.push_back(p - 1ull);
+        idx.push_back(p + 1ull);
+    }
+    idx.push_back(0xFFFFFFFFull);
+    idx.push_back(0x100000000ull);
+    idx.push_back(0xFFFFFFFFFFFFFFFFull);
+    idx.push_back(0xDEADBEEFCAFEBABEull);
+    const int n = (int)idx.size();
+
+    // Host rows, computed by calling the RENDERER'S OWN statics — not a copy of them, which
+    // is why whittedGlossyUV / giPhases were factored out of whittedGlossyDir / giGather.
+    std::vector<double> host((size_t)n * kLatticeProbeCols);
+    for (int t = 0; t < n; ++t) {
+        const unsigned long long i = idx[t];
+        const int b = (int)(i & 3ull);
+        double* r = &host[(size_t)t * kLatticeProbeCols];
+        const double ri2 = BR::radicalInverse2(i);
+        r[0] = ri2;
+        r[1] = BR::rot05(ri2);
+        BR::whittedSample(i, r[2], r[3]);
+        r[4] = BR::whittedLambdaU(i);
+        r[5] = BR::whittedOrderU(i, b);
+        r[6] = BR::whittedFluoroU(i, b);
+        BR::whittedGlossyUV(i, b, r[7], r[8]);
+        BR::giPhases(i, r[9], r[10]);
+        const int G = 4 + (int)(i % 5ull);
+        BR::gridUV((int)(i % (unsigned long long)(G * G)), G, r[11], r[12]);
+        for (int k = 0; k < kLatticeProbeNBases; ++k)
+            r[13 + k] = BR::radicalInverseScr(kLatticeProbeBases[k], i);
+    }
+
+#ifdef HAVE_CUDA
+    if (cudaAvailable()) {
+        // gridUV is the one column the device hands back through `Real`, so narrow the host
+        // value to the same width before comparing. Everything else is double on both sides
+        // and must match to the last bit with no adjustment at all.
+        const int rb = cudaRealBytes();
+        if (rb == 4)
+            for (int t = 0; t < n; ++t) {
+                double* r = &host[(size_t)t * kLatticeProbeCols];
+                r[11] = (double)(float)r[11];
+                r[12] = (double)(float)r[12];
+            }
+
+        std::vector<double> dev((size_t)n * kLatticeProbeCols, 0.0);
+        if (!cudaLatticeProbe(idx.data(), n, dev.data())) {
+            std::printf("[checklattice] device probe FAILED to launch — device half not run  BAD\n");
+            ok = false;
+        } else {
+            static const char* kCol[13] = {
+                "radicalInverse2", "rot05(radicalInverse2)", "whittedSample.u", "whittedSample.v",
+                "whittedLambdaU", "whittedOrderU", "whittedFluoroU", "whittedGlossyUV.u1",
+                "whittedGlossyUV.u2", "giPhases.p1", "giPhases.p2", "gridUV.u1", "gridUV.u2"
+            };
+            auto colName = [&](int c, char* nm, size_t cap) {
+                if (c < 13) std::snprintf(nm, cap, "%s", kCol[c]);
+                else std::snprintf(nm, cap, "radicalInverseScr(base %u)", kLatticeProbeBases[c - 13]);
+            };
+            long long mismatches = 0;
+            int shown = 0;
+            // Per-column counts and the worst ULP gap, because WHICH helper diverges and by
+            // HOW MUCH is the whole diagnosis: a 1-ULP spread confined to the columns that
+            // contain a multiply-add is a compiler contraction (nvcc fuses to FMA, MSVC does
+            // not), whereas a large or column-wide gap is a genuine logic difference.
+            std::vector<long long> colBad(kLatticeProbeCols, 0);
+            std::vector<long long> colWorstUlp(kLatticeProbeCols, 0);
+            for (int t = 0; t < n; ++t)
+                for (int c = 0; c < kLatticeProbeCols; ++c) {
+                    const double a = host[(size_t)t * kLatticeProbeCols + c];
+                    const double d = dev[(size_t)t * kLatticeProbeCols + c];
+                    // Bit comparison, not ==: this must also catch a -0.0 / +0.0 or a NaN
+                    // payload difference, either of which would be a real divergence.
+                    unsigned long long ba, bd;
+                    std::memcpy(&ba, &a, 8);
+                    std::memcpy(&bd, &d, 8);
+                    if (ba == bd) continue;
+                    ++mismatches;
+                    ++colBad[c];
+                    // Both values are finite and non-negative here, so the raw bit patterns
+                    // are monotone in value and their difference IS the ULP distance.
+                    const long long ulp = (long long)(ba > bd ? ba - bd : bd - ba);
+                    if (ulp > colWorstUlp[c]) colWorstUlp[c] = ulp;
+                    if (shown < 8) {
+                        char nm[64];
+                        colName(c, nm, sizeof nm);
+                        std::printf("[checklattice] idx %llu  %-28s host %.17g (%016llx) != dev %.17g (%016llx)  BAD\n",
+                                    (unsigned long long)idx[t], nm, a, ba, d, bd);
+                        ++shown;
+                    }
+                }
+            if (mismatches > shown)
+                std::printf("[checklattice] ... and %lld further mismatches\n", mismatches - shown);
+            for (int c = 0; c < kLatticeProbeCols; ++c) {
+                if (!colBad[c]) continue;
+                char nm[64];
+                colName(c, nm, sizeof nm);
+                std::printf("[checklattice]   column %-28s %lld / %d differ, worst %lld ULP\n",
+                            nm, colBad[c], n, colWorstUlp[c]);
+            }
+            std::printf("[checklattice] device Real = %s (%d bytes); %d indices x %d columns = %lld values\n",
+                        rb == 4 ? "float" : "double", rb, n, kLatticeProbeCols,
+                        (long long)n * kLatticeProbeCols);
+            std::printf("[checklattice] host vs device BIT-IDENTICAL on every lattice helper  (%s)\n",
+                        mismatches == 0 ? "ok" : "BAD");
+            if (mismatches) ok = false;
+        }
+    } else {
+        std::printf("[checklattice] host vs device: SKIPPED (no CUDA device on this machine)\n");
+    }
+#else
+    std::printf("[checklattice] host vs device: SKIPPED (built without CUDA)\n");
+#endif
+
+    std::printf("[checklattice] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // The film accumulates radiance in an arbitrary (non-absolute) radiometric scale
 // that depends on photon count, light power, etc., so the image is always anchored
 // by an auto-exposure that maps the 99th luminance percentile to ~0.9. `expComp`
@@ -3140,6 +3435,75 @@ static void warnSealedLights(const Scene& scene) {
         std::printf("[mode W]   The other %d light%s still reach%s the scene, so expect it lit "
                     "only by %s.\n", open, open == 1 ? "" : "s", open == 1 ? "es" : "",
                     open == 1 ? "that one" : "those");
+}
+
+// `-heroc 1` turns the hero bundle OFF, so mode W's fixed spectral quadrature collapses to
+// a single wavelength and every material takes the scalar (bundle-free) path. On a
+// spectrally-varying material that is not merely approximate, it is flatly WRONG: measured
+// 2026-08-05 (N5), the Cornell SF10 sphere renders 46.85 pp off in chroma at `-heroc 1` -- a
+// flat GREEN ball, the exact de-hero pathology N1 was written to kill -- against 0.82 pp at
+// the default C=4. The interactive viewer absorbs this by accumulating passes (see wNeedSpp),
+// but a batch `-mode W -spp 1` render has nothing to average over and emits the wrong image
+// silently. It is also a pointless trade: N5 measured C=1 vs C=4 at 1.3% of a 15 s mode-W
+// frame (mode W is traversal-bound, so the bundle rides along nearly free) -- the user is
+// giving up correctness for a rounding error. So name the offending material and say so.
+//
+// Returns the material type that makes the bundle load-bearing, or nullptr if the scene is
+// achromatic enough that a 1-wavelength preview is honest. Only materials actually attached
+// to geometry count; an unused library material is not a reason to nag.
+static const char* whittedNeedsBundle(const Scene& scene) {
+    std::vector<char> matUsed(scene.mats.size(), 0);
+    auto markUsed = [&](int id) {
+        if (id < 0 || id >= (int)scene.mats.size()) return;
+        matUsed[id] = 1;
+        if (scene.mats[id].type == MatType::Mix)
+            for (int c : scene.mats[id].mixChildren)
+                if (c >= 0 && c < (int)scene.mats.size()) matUsed[c] = 1;
+    };
+    for (const auto& tr : scene.tris) markUsed(tr.matId);
+    for (const auto& sp : scene.spheres) markUsed(sp.matId);
+    for (size_t i = 0; i < scene.mats.size(); ++i) {
+        if (!matUsed[i]) continue;
+        const Material& m = scene.mats[i];
+        switch (m.type) {
+            // Inherently wavelength-branching: the interface itself sends different lambda
+            // in different directions (or to different wavelengths, for fluorescence), so
+            // one lambda cannot stand in for the bundle at any roughness.
+            case MatType::ThinFilm:    return "thin-film";
+            case MatType::Grating:     return "diffraction grating";
+            case MatType::Multilayer:  return "multilayer";
+            case MatType::Layered:     return "layered (clearcoat)";
+            case MatType::Fluorescent: return "fluorescent";
+            case MatType::Dielectric:
+                // Only DISPERSIVE glass matters -- a constant-IOR dielectric refracts every
+                // wavelength identically, so C=1 is exact for it. Spectrum is a std::function,
+                // so probe it across the visible band rather than inspecting a curve type.
+                if (m.ior) {
+                    const double n0 = m.ior(400.0);
+                    for (double lam : {450.0, 500.0, 550.0, 600.0, 650.0, 700.0})
+                        if (std::abs(m.ior(lam) - n0) > 1e-6) return "dispersive dielectric";
+                }
+                break;
+            default: break;
+        }
+    }
+    return nullptr;
+}
+
+static void warnWhittedHeroCollapse(const Scene& scene) {
+    const char* what = whittedNeedsBundle(scene);
+    if (!what) return;
+    std::printf("[mode W] WARNING: -heroc 1 turns the hero bundle off, but this scene uses "
+                "%s material(s)\n"
+                "[mode W]   whose behaviour VARIES with wavelength. At 1 spp there is nothing "
+                "to average over, so\n"
+                "[mode W]   those surfaces will render a flat single-wavelength colour (the "
+                "classic green-glass\n"
+                "[mode W]   collapse), not merely a noisier version of the right answer.\n"
+                "[mode W]   Drop the -heroc 1 (mode W defaults to %d, which splits the bundle "
+                "at dispersion) --\n"
+                "[mode W]   it is measured at ~1%% of frame time here, since mode W is "
+                "traversal-bound, not spectral.\n", what, hero::kHeroMax);
 }
 
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
@@ -6130,6 +6494,7 @@ static int run(int argc, char** argv) {
     bool checkPropOnly = false;
     bool checkArrayOnly = false;
     bool checkSunOnly = false;
+    bool checkLatticeOnly = false;
     const char* device = "auto";  // -device auto|cpu|gpu (auto = GPU when it helps)
     bool wavefront = false;       // -wavefront: streaming GPU backend (else megakernel)
     bool rgbBackward = false;      // -rgb: fast RGB (non-spectral) backward preview (mode R, GPU)
@@ -6512,6 +6877,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
         else if (!std::strcmp(argv[i], "-checkarray")) checkArrayOnly = true;
         else if (!std::strcmp(argv[i], "-checksun")) checkSunOnly = true;
+        else if (!std::strcmp(argv[i], "-checklattice")) checkLatticeOnly = true;
         else if (!std::strcmp(argv[i], "-device") && i + 1 < argc) device = argv[++i];
         else if (!std::strcmp(argv[i], "-wavefront")) wavefront = true;
         else if (!std::strcmp(argv[i], "-rgb")) rgbBackward = true;
@@ -6682,6 +7048,7 @@ static int run(int argc, char** argv) {
     if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)
     if (checkArrayOnly)    return checkArray();    // ditto
     if (checkSunOnly)      return checkSun();      // deterministic, no scene needed
+    if (checkLatticeOnly)  return checkLattice();  // N4a: host-vs-device, no scene needed
 
     // --- every output directory must exist BEFORE a single photon is traced ----------
     // Otherwise a mistyped/not-yet-created output directory used to be discovered only
@@ -6829,6 +7196,10 @@ static int run(int argc, char** argv) {
     // Both a real mode-W render and the explorer's T preview (which IS mode W) hit the
     // sealed-light failure, so warn for either -- see warnSealedLights.
     if (g_whitted || wPreview) warnSealedLights(scene);
+    // Only for a real batch mode-W render: the viewer's T preview keeps accumulating passes
+    // (wNeedSpp), so its C=1 image converges rather than staying wrong, and nagging there
+    // would fire on every explore run.
+    if (g_whitted && !wPreview && g_heroC <= 1) warnWhittedHeroCollapse(scene);
     // Kept out of the chain above: rejecting -gi is independent of whether the run is
     // also direct-only, and folding it in would swallow that notice when both are given.
     // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for
@@ -7682,7 +8053,7 @@ static int run(int argc, char** argv) {
         }
 
         raster::PreviewLight plight = raster::deriveLight(scene);
-        std::vector<raster::PTri> prims;   // tessellated lazily (empty in pure GPU-iso mode)
+        raster::PreviewGeom prims;         // tessellated lazily (empty in pure GPU-iso mode)
         bool tessellated = false;
         // Tessellate on demand: the CPU / GPU-triangle path calls this immediately; the GPU
         // iso path skips it entirely and only tessellates if a frame must fall back (e.g. a
@@ -7739,7 +8110,7 @@ static int run(int argc, char** argv) {
             const bool wantGpu  = !std::strcmp(device, "gpu");
             const bool wantAuto = !std::strcmp(device, "auto");
             if (!useGpuIso && (wantGpu || wantAuto) && raster_cuda::available()) {
-                gpuRaster = raster_cuda::upload(prims, plight, &scene.textures);
+                gpuRaster = raster_cuda::upload(prims, plight, &scene);
                 if (gpuRaster)
                     std::printf("[raster] GPU rasterizer: frames on the GPU "
                                 "(all projections; skins + see-through supported)\n");
@@ -7753,6 +8124,11 @@ static int run(int argc, char** argv) {
 #endif
         // Render one preview frame: GPU when it's baked (any projection / skins / see-through),
         // else the CPU rasterizer. A GPU device failure returns empty -> CPU fallback too.
+        // The CPU path reuses one RasterScratch across every frame of the session (meter
+        // pre-pass, stills, flybys, interactive loop): its ~85 B/pixel of G-buffer would
+        // otherwise be re-allocated and re-zeroed per frame, which used to cost more than
+        // the rasterization itself.
+        raster::RasterScratch rasterScratch;
         auto rasterOne = [&](const Camera& cam, int W, int H, double ev, bool autoExp,
                              double* lock) -> std::vector<uint8_t> {
 #ifdef HAVE_CUDA
@@ -7773,7 +8149,7 @@ static int run(int argc, char** argv) {
 #endif
             ensurePrims();   // lazy fallback (also the sole path when the GPU is unavailable)
             return raster::renderFrame(prims, cam, W, H, plight, nThreads, ev, autoExp, lock,
-                                       rasterSeeThrough, rasterClarity, &scene.textures);
+                                       rasterSeeThrough, rasterClarity, &scene, &rasterScratch);
         };
 
         // Exposure-lock meter pre-pass: for each locked group, raster its selected metering
@@ -8989,7 +9365,7 @@ static int run(int argc, char** argv) {
                     raster_cuda::destroy(gpuRaster);
                     gpuRaster = nullptr;
                     ensurePrims();
-                    gpuRaster = raster_cuda::upload(prims, plight, &scene.textures);
+                    gpuRaster = raster_cuda::upload(prims, plight, &scene);
                     if (!gpuRaster)
                         std::fprintf(stderr, "[anim] GPU re-upload failed; using the CPU rasterizer\n");
                 }
