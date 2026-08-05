@@ -772,18 +772,23 @@ isosurface "stand_axicon_cap" { material capmarble_axicon
     # per metre of drop; this piece's patch measures a core within 0.06 m of its own axis
     # (scraps/_gemsweep.py `piece vcone1.0 0.65` in SF10), because an axicon has no focal
     # POINT to be displaced — it has a focal LINE that starts at the exit face. So the cap is
-    # barely pulled at all: 0.06 m in -x and 0.04 m in -z, not most of a metre.
+    # barely pulled at all: 0.06 m in -x and 0.01 m in -z, not most of a metre.
     #
-    # 1.6 x 1.28 is measured, not chosen: 90% of the caustic's light falls within
-    # x -0.77..+0.65 and z -0.61..+0.53 of the piece's axis, i.e. x 1.83..3.25 and
-    # z 4.84..5.98. Centred at (2.54, 5.41) the cap spans x 1.74..3.34 and z 4.77..6.05,
-    # which contains all of it with 0.07-0.09 m to spare on every side.
+    # 1.6 x 1.34 is measured, not chosen: 90% of the caustic's light falls within
+    # x -0.80..+0.69 and z -0.63..+0.60 of the piece's axis, i.e. x 1.80..3.29 and
+    # z 4.82..6.05. Centred at (2.54, 5.44) the cap spans x 1.74..3.34 and z 4.77..6.11,
+    # which contains all of it with 0.05-0.06 m to spare on every side.
     #
     # It grew 1.1 -> 1.28 deep when the piece went from crystal at drop 0.35 to SF10 at 0.65:
     # the extra height separates the cusps, so the patch went 1.37 x 0.98 -> 1.41 x 1.14. It
     # is still WIDE and SHALLOW for the reason the caustic is — the two bright cusps sit left
     # and right of the piece, not fore and aft.
-    box { center 2.54 0.80 5.41  size 1.6 0.20 1.28  round 0.02 } }
+    #
+    # 1.28 -> 1.34 (and 0.03 m further downwind) came with the piece's 0.04 m GIRDLE, which
+    # grows the patch to 1.49 x 1.22 and pushes its core from +0.16 to +0.25 z. The old cap
+    # ended at exactly +0.60 z, i.e. ZERO margin on the far edge, which is not a cap size —
+    # it is a coincidence waiting to become a clipped cusp.
+    box { center 2.54 0.80 5.44  size 1.6 0.20 1.34  round 0.02 } }
 
 # ==============================  HERO PIECES  =================================
 # Each piece is wrapped in the SAME `group { translate }` as its stand — see THE SPREAD
@@ -1198,15 +1203,50 @@ isosurface "chrome_ring" {
 # through infinity there. 40.4 deg landing on crystal's 40.2 deg critical angle is a
 # coincidence, and is named as one so the wrong mechanism is not re-derived from it.
 #
-# The field is max() of the cone against the two end slabs; every term is unit-Lipschitz
-# except the cone's, whose gradient is sqrt(2), so max_gradient 2 is exact and generous.
+# IT HAS A GIRDLE, AND THAT IS THE ONLY GEM CUT IT CAN AFFORD. Asked to shape this "more
+# like a diamond", the honest reply is that a diamond cut is an ANTI-CAUSTIC shape and this
+# was re-measured rather than argued (scraps/_gemsweep.py, `gcone`, SF10, drop 0.65, 480 px /
+# 600 spp, GEMBOX=0.7 so nothing is clipped). Everything above the girdle plane, in order:
+#     nothing (a bare cone)     peak 35.79x  cov 0.12%  sat 0.509  spread 0.282  1.40 x 1.17 m
+#     girdle 0.02               peak 36.41x  cov 0.15%  sat 0.480  spread 0.273  1.46 x 1.20 m
+#     girdle 0.04  <- SHIPPED   peak 37.07x  cov 0.17%  sat 0.463  spread 0.254  1.49 x 1.22 m
+#     girdle 0.08               peak 27.35x  cov 0.19%  sat 0.392  spread 0.226  1.60 x 0.38 m
+#     girdle 0.04, 16 facets    peak 29.71x  cov 0.18%  sat 0.470  spread 0.243  1.55 x 0.38 m
+#     + crown 34.5 deg / 75% table            cov 0.01%  sat 0.272  spread 0.036
+#     + crown 34.5 deg / 53% table            cov 0.01%  sat 0.229  spread 0.004  <- a real
+#     + crown 20.0 deg / 60% table            cov 0.02%  sat 0.254  spread 0.041     brilliant
+#
+# A STRAIGHT GIRDLE IS BETTER THAN FREE, because a ray that enters the flat table crosses no
+# interface until the cone and so arrives there on the same line it always did, just starting
+# 0.04 m higher; only the rim is touched. 0.04 m comes out brighter AND 42% wider-covering
+# than the bare cone. Past that the band starts eating the rim: at 0.08 the patch collapses
+# from two cusps (1.17 m of z) to a single band (0.38 m), and 16 vertical facets -- which
+# cannot deviate the descending aperture at all, being vertical -- collapse it the same way
+# for the same reason, so the glinting waist is not worth its cost.
+#
+# A CROWN IS FATAL, and that is the same finding as the round-brilliant row in the sweep
+# above (0.06% against this piece's 0.30% in crystal), from the other direction: a crown facet
+# at angle c bends a descending ray inward by c - asin(sin c / n) -- 15.6 deg at c=34.5 in
+# SF10 -- so the whole annulus outside the table meets the cone at the wrong incidence. Three
+# crown geometries all land at 0.01-0.02% coverage, i.e. no caustic at all. The mechanism is
+# the point of the cut: a brilliant is engineered to throw its fire UP AT THE VIEWER, and
+# flint makes that worse than crystal, not better (critical angle 35.4 deg against 40.2).
+#
+# So the piece is a table, a 0.04 m girdle and a 45 deg pavilion -- a gem's silhouette minus
+# exactly the one feature that would switch the caustic off.
+#
+# The field is max() of the (girdle-capped) cone against the two end slabs; every term is
+# unit-Lipschitz except the cone's, whose gradient is sqrt(2), so max_gradient 2 is still
+# exact and generous. NOTE the parens around `0.28 + y`: it is subtracted from the sqrt, and
+# unbracketed it would parse as `(sqrt(...) - 0.28) + y` and build a different solid. Here
+# the `min(...)` commas bracket it already, but the trap is one edit away.
 isosurface "crystal_axicon" {
     material flint
     function {
         translate 2.6 1.55 5.45
-        expr "max(sqrt(x*x + z*z) - (0.28 + y), max(-y - 0.28, y - 0.28))"
+        expr "max(sqrt(x*x + z*z) - min(0.28 + y, 0.56), max(-y - 0.28, y - 0.32))"
     }
-    contained_by { min 2.00 1.25 4.85   max 3.20 1.85 6.05 }
+    contained_by { min 2.00 1.25 4.85   max 3.20 1.90 6.05 }
     max_gradient 2
 }
 # The same three-pin mount the orb and the crystal gyroid use. The cone's surface radius is

@@ -18,6 +18,9 @@
 /ftrace.pdb
 *.ppm
 *.exr
+# `-hdr` writes a float sidecar next to every -o; it is a render output like the PNG it
+# accompanies, and at 3 floats/px it is the biggest of them.
+*.pfm
 *.png
 *.jpg
 *.jpeg

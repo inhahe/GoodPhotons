@@ -7595,6 +7595,53 @@ is the convenient way to pull the single flyby frame closest to a point (it prin
 `flyNNN` it picked and how far off it was), which is how the four fly-through passes were
 each validated without rendering the loop.
 
+## OPEN (tech debt, 2026-08-04): `design.md`'s measurement rigs live in git-ignored `scraps/`
+
+`design.md` cites `scraps/_gemsweep.py`, `scraps/_capchroma.py`, `scraps/_capcrop.py` and
+`scraps/_pfm.py` as the authority for decisions that are *shipped* in `scenes/gallery_rain.ftsl`
+— which glass the axicon is cut from, what drop it hangs at, how big its cap is, and (2026-08-04)
+that it gets a 0.04 m girdle and no crown. Those files are **untracked**: `.gitignore` has a
+blanket `/scraps/`, on the correct general principle that scraps is for throwaway scripts.
+
+The result is that every measured table in `design.md` is unreproducible from a clean clone.
+Losing the directory would not break a build, but it would strand the numbers: nobody could
+re-derive them, and nobody could tell whether a later scene edit had moved them.
+
+Proper fix: promote the four load-bearing ones to `tools/` (which is for permanent checked-in
+tooling) and update the ~40 `scraps/_*.py` path references in `design.md` and the scene comments
+in the same commit. They have real interdependencies (`_gemsweep` and `_capchroma` both import
+`_pfm`, `_capcrop` imports `_capchroma`), so it is a move of the whole cluster or none of it.
+Logged rather than done because renaming the paths that every measured table cites is a change
+that wants to be its own commit, not a rider on a scene tweak.
+
+## OPEN (metrology, 2026-08-04): `-fireflies 3` does not always clear the gem rig's peak, so `peak` alone can be nonsense
+
+While sweeping crown angles for the axicon's girdle (`scraps/_gemsweep.py piece gcone0.08/20/0.60
+0.65`, SF10, 480 px / 600 spp, `-hdr -fireflies 3`) the rig printed:
+
+```
+gcone0.08/20/0.60 drop 0.65   peak 19945.07x   coverage  0.02%   sat 0.254   spread 0.041
+```
+
+`peak` is four orders of magnitude above every neighbouring row while `coverage` says there is
+essentially no caustic at all — i.e. a single monochromatic hero-wavelength spike survived the
+firefly filter. That filter clamps an isolated outlier to 3× its second-brightest *neighbour*,
+so it is defeated whenever a spike lands next to another bright pixel (two adjacent caustic-path
+hits, or a spike on the edge of a specular highlight). It is a **rig/metric** problem, not a
+renderer bug — the shipped scene never meters `peak` in isolation.
+
+Impact today: none of the decisions in `design.md` rest on `peak` alone (`coverage`, `sat`,
+`spread` and `fan` all agreed that every crown geometry kills the caustic), and the row above is
+published with its `peak` struck out. But `peak` is reported as a headline number in
+`_gemsweep.measure()` and will mislead the next reader.
+
+Proper fix: report a robust peak instead of the max — e.g. the 99.9th percentile of cell
+luminance, or the brightest *4× box cell* rather than the brightest pixel, both of which are
+immune to a single spike by construction. `measure()` already builds the downsampled cell list,
+so this is a two-line change; the reason it is logged rather than done is that changing the
+statistic silently invalidates every `peak` in `design.md`, so the fix has to re-run the tables
+in the same change.
+
 ## OPEN (2026-08-04): a quad's emission is invisible from the side its winding faces away from
 
 The backward tracer only adds a surface's own emission when the camera/specular ray strikes

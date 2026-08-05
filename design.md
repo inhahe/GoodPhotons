@@ -1621,6 +1621,61 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       fill would buy almost nothing, because the cap's pedestal profiles as 0.0089 in the
       piece's shadow (fill alone) against 0.0893 sunlit — **the fill is 10 % of it** and the
       other 90 % is the same sun the caustic comes from.
+    - **The axicon has a 4 cm GIRDLE, and that is the only gem cut it can afford.** Asked to
+      shape it "more like a diamond", the answer is that a diamond cut is an *anti-caustic*
+      shape — but "how much gem silhouette can it carry" is a different question from "should
+      it be a brilliant", and it has its own sweep (`scraps/_gemsweep.py`, piece `gcone`; SF10,
+      drop 0.65, 480 px / 600 spp, and **`GEMBOX=0.7`** — see the box caveat below). Everything
+      added *above* the girdle plane, leaving the 45° conical exit face untouched:
+
+      | above the girdle plane | peak | coverage | sat | spread | patch x × z |
+      |---|---|---|---|---|---|
+      | nothing (a bare cone) | 35.79× | 0.12 % | **0.509** | **0.282** | 1.40 × 1.17 |
+      | girdle 0.02 | 36.41× | 0.15 % | 0.480 | 0.273 | 1.46 × 1.20 |
+      | **girdle 0.04 — SHIPPED** | **37.07×** | **0.17 %** | 0.463 | 0.254 | **1.49 × 1.22** |
+      | girdle 0.08 | 27.35× | 0.19 % | 0.392 | 0.226 | 1.60 × **0.38** |
+      | girdle 0.04, 16 vertical facets | 29.71× | 0.18 % | 0.470 | 0.243 | 1.55 × **0.38** |
+      | + crown 34.5° / 75 % table | 3.75× | **0.01 %** | 0.272 | 0.036 | — |
+      | + crown 34.5° / 53 % table (a real brilliant) | 3.48× | **0.01 %** | 0.229 | 0.004 | — |
+      | + crown 20° / 60 % table | — | **0.02 %** | 0.254 | 0.041 | — |
+
+      **A straight girdle is better than free.** A ray entering the flat table crosses no
+      interface until the cone, so it arrives there on the same line it always did, just
+      starting 0.04 m higher; only the rim is touched. 0.04 m comes out *brighter* and 42 %
+      wider-covering than the bare cone, for ~9 % of `sat`. Past that the band eats the rim:
+      at 0.08 the patch collapses from two cusps (1.17 m of z) to one band (0.38 m). Sixteen
+      **vertical** facets — which by construction cannot deviate the descending aperture at
+      all — collapse it the same way, so the glinting waist is not worth its cost. **A crown
+      is fatal**, which is the round-brilliant row of the table above arrived at from the other
+      direction: a crown facet at angle *c* bends a descending ray inward by
+      *c* − asin(sin *c* / n) — 15.6° at *c* = 34.5° in SF10 — so the whole annulus outside the
+      table meets the cone at the wrong incidence. Three crown geometries all read 0.01–0.02 %
+      coverage, i.e. *no caustic*. That is the cut working as designed: a brilliant throws its
+      fire **up at the viewer**, and flint makes that worse than crystal (critical angle 35.4°
+      against 40.2°), so the flint recut moves *away* from a gem cut, not toward one.
+
+      **Confirmed in the finished frame, not just in the rig**, at matched convergence
+      (`-device cpu`, 800×450, control 324 spp / 5.56 % noise against girdled 305 spp /
+      5.73 %), which matters because the rig floats one piece over a bare white cap while the
+      real exhibit sits on textured marble under a partly-shadowed sky:
+
+      | axicon cap | coverage | sat | spread | xspread | peak | clip | noise | fan |
+      |---|---|---|---|---|---|---|---|---|
+      | pre-girdle | 2.40 % | 0.324 | 0.130 | 0.201 | 4.94× | 0.13 % | 0.059 | — |
+      | **0.04 girdle** | **2.77 %** | 0.335 | 0.135 | 0.205 | **5.17×** | 0.15 % | 0.062 | **0.80** |
+
+      Every axis moves the right way and the caustic becomes *more* organised (`fan` goes from
+      unmeasurable to 0.80). The rig's +42 % coverage lands as +15 % in frame — the shipped
+      exhibit is shadowed and textured, so the rig overstates the gain, which is the expected
+      direction and the reason both are measured. Every other cap is unchanged to three
+      decimals (gyroid 2.84 %/0.444→0.445, glass 0.00 % both), i.e. no side effects.
+    - **`contained_by` is a hard clip in the gem rig, and its default box was shaving the
+      control.** `scraps/_gemsweep.py` boxed every piece at ±0.5 m while `vcone1.0`'s girdle
+      radius is 0.56, so every axicon number the rig printed before the girdle sweep was
+      measured on a cone with four flats cut into its rim. Harmless for *ranking* shapes that
+      all share the box, which is why the default is unchanged — but `GEMBOX=0.7` now exists,
+      and any absolute axicon number must say which box it came from. (The rows above are all
+      `GEMBOX=0.7`; the rows in the piece-ranking table further up are all ±0.5.)
     - **Metrics do not replace looking at it: `scraps/_capcrop.py`.** It crops a cap's screen
       footprint out of the float buffer and prints it three ways — *as shipped* (exactly the
       PNG), *under-exposed* (gain set so the cap's own 2×2 peak lands just under white), and
