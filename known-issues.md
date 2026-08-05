@@ -5,6 +5,43 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-05, probably transient — logged only so a recurrence is recognisable): `build.bat` failed once, then succeeded twice unchanged
+
+Building the 0.138.2 changes, the **first** `build.bat` run reported
+`[build] WARNING: build FAILED - ftrace.exe was NOT rebuilt.` Two subsequent runs, with
+**identical sources**, both succeeded cleanly. So this is very likely a transient — a
+parallel-compile OOM (MSVC `C1060`/`C3859`) or a transient file lock, not a defect in the
+tree. It is logged only so that if it happens again it is recognised as a *pattern* rather
+than diagnosed from scratch a second time.
+
+What was on screen (all that was captured — I tailed 40 lines and the actual diagnostic
+had already scrolled off):
+
+```
+isomesh.h(404): note: see the first reference to
+  'std::_Hash<std::_Umap_traits<uint64_t,char,...>>::emplace' in 'isomesh::decimateAdaptive'
+… followed by the usual xhash(618) / list(595) / xmemory(730) / xutility(463) note chain
+  for std::pair<const uint64_t,char>
+```
+
+Two reasons not to read too much into that: MSVC emits the same note chain for a *warning*
+as for an error, so those lines may not belong to the failure at all; and `isomesh.h` was
+not touched by this change (the edits were `parallel.h`, `upsample.h`, `texture.h`,
+`envmap.h`, `ftsl.h`, `main.cpp`).
+
+**If it recurs, capture the diagnostic itself, not the notes.** The mistake the first time
+was `| tail -40`, which keeps only the trailing note chain. Instead:
+
+```sh
+cmd //c ".\\build.bat" 2>&1 | tee scraps/build.log     # then grep the log
+grep -nE "error [A-Z]+[0-9]+|fatal error" scraps/build.log
+```
+
+An `error C1060: compiler is out of heap space` / `C3859` confirms the OOM theory (fix:
+build with `--parallel 1`, or raise `/Zm`). Anything else — especially a real
+`error C####` inside `isomesh.h` — means it is a genuine, order-dependent bug and this
+entry should be rewritten as one.
+
 ### DONE (2026-08-05, v0.138.2): `-stop` was accepted but ignored while a process was still in SCENE LOAD
 
 `stopChannelStart()` publishes the `<pid>.run` entry before `run()` is entered, so a
