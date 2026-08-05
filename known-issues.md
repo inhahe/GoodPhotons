@@ -5,7 +5,40 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-08-05): `scraps/_gemsweep.py` — `-fireflies 3` does not hold at the rig's own prescribed finalist setting
+### OPEN (2026-08-05): `scraps/_gemsweep.py` — `spread` is not resolution-stable and can invert a ranking
+
+Found while adjudicating a box vs sphere clip for `gallery_rain`'s crystal gyroid. `coverage`
+is a *count* of cells above the cut, so it is stable across render resolution (the same
+gyroid: 0.35% at 480px, 0.37% at 960px, published 0.37%). `spread` is not, and not by a
+little — the same two geometries, each metered at both resolutions:
+
+```
+                          spread @480px    spread @960px
+sphere-clipped gyroid         0.014            0.060
+box-clipped (1:3/4:1)         0.022            0.012
+```
+
+At 480px the box wins; at 960px the sphere wins by 5x. **The ranking inverts**, so any
+comparison that mixes resolutions is meaningless, and the rig currently offers no protection
+against doing exactly that (`GEMRES` is an env var and nothing records which value produced a
+given row).
+
+Cause: `spread` is the excess-weighted RMS chromaticity radius over *the set of cells that
+cleared the cut*, and the size and composition of that set depends on resolution — a finer
+grid resolves faint fringe structure into cells that clear the bar, and fringe cells have
+noisier chromaticity than core cells. So the statistic is conditioned on a
+resolution-dependent population. `sat` and `fan` share the same conditioning and are probably
+affected too, just less visibly.
+
+**Proper fix:** make the metered population resolution-independent rather than
+threshold-defined — e.g. meter at a fixed world-space cell size (adapt `DOWN` to `RES` so a
+cell is always the same number of centimetres of cap, which is what the 4x box was really
+for), and/or weight by excess over a fixed *world-area* normalisation instead of a cell count.
+Until then: **never rank two pieces measured at different `GEMRES`**, and stamp the
+resolution into every printed row (`_remeter.py` already prints `[NNNpx]`; `_gemsweep.py`'s
+own sweep header prints it once but the per-row lines do not carry it).
+
+### DONE (2026-08-05): `scraps/_gemsweep.py` — `-fireflies 3` did not hold at the rig's own prescribed finalist setting
 
 `_gemsweep.py` is the caustic-metering rig used to adjudicate the gallery's glass exhibits
 (it renders one piece over a bare white cap in the gallery's sun, meters the float `.pfm`
@@ -32,14 +65,37 @@ it is a *count* of cells above a threshold, not a magnitude. So the rig is still
 the comparisons it is actually used for — but `peak`, `sat` and `spread` from a 960/1200 run
 must be discarded, which is precisely backwards from what the docstring says.
 
-**Proper fix:** either (a) meter percentiles instead of extrema — replace `peak` with e.g. the
-99.5th percentile of the cap and derive `sat`/`spread` from excess-weighted statistics with
-the top 0.1% of cells trimmed, so no single cell can move a metric; or (b) tighten rejection
-as resolution rises (scale the `-fireflies` threshold with samples-per-cell rather than
-leaving it at a constant 3). (a) is the better one: it fixes the metric rather than chasing
-the sampler. Until then the docstring should stop prescribing 960/1200 for anything but
-coverage. Note `scraps/` is gitignored, so this rig is not versioned — the fix has to be made
-in place.
+**Fixed** in `measure()` by rejecting spikes at the CELL level, after the 4x box, rather than
+trimming a percentile. A percentile trim was the first plan and is worse: it needs a tuned
+fraction, and it silently removes real caustic cores on the pieces that actually concentrate
+light. The discriminator used instead is the one the sampler cannot fake, and it was already
+written down in the rig's own comments — **a caustic is never isolated**, because it is the
+image of a continuous wavefront, so its neighbours are bright too, whereas a firefly is one
+cell with ordinary cap all round it. Each cell is compared with the *median* of its 8
+neighbours (median so one spike cannot drag its own reference up) and dropped if it stands
+more than `GEMSPIKE` (default 8) times above them. Dropped cells are excluded from every
+statistic including coverage, and the count is printed — a silent trim is how a rig starts
+lying. 8x is deliberately loose: measured caustics climb well under 2x per cell even at their
+cusps, while the spikes overshoot by two to three orders of magnitude, so the threshold sits
+in a wide gap and needs no per-piece tuning.
+
+Verified on the failing case — `solid10` drop 0.90 re-metered from the same sidecars:
+
+```
+480px/600spp   peak    3.00x   sat 0.182   spread 0.014      (was already trustworthy)
+960px/1200spp  peak 1179.42x   sat 0.844   spread 0.672      before the fix
+960px/1200spp  peak    3.25x   sat 0.196   spread 0.060      after (11 spike cells dropped)
+```
+
+Cross-resolution agreement — the property that was actually broken — is restored, and the
+reported core moves off the firefly cell (`-0.01 +0.09`) onto the real one (`+0.64 -0.43`).
+
+**Consequence for already-published numbers:** any `peak`/`sat`/`spread`/`fan` measured at
+960/1200 before this fix is suspect and should be re-metered. Re-metering is cheap and needs
+no re-render — `scraps/_remeter.py` runs `measure()` over existing `.pfm` sidecars at any
+`GEMCUT`. In particular the crystal gyroid's `fan 0.86` was *itself* the fireflies; honestly
+metered it is 0.18. Note `scraps/` is gitignored, so neither the rig nor this fix is
+versioned — only this entry records it.
 
 ### OPEN (2026-08-05, probably transient — logged only so a recurrence is recognisable): `build.bat` failed once, then succeeded twice unchanged
 
