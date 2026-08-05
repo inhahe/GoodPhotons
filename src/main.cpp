@@ -4883,6 +4883,72 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #endif
     }
 
+#ifdef HAVE_CUDA
+    // ---- device-memory preflight (see cudaMegakernelLocalBytes) ----------------------
+    // Having decided WHICH device can run this scene, check whether the card can still
+    // afford to. Every megakernel here launches a fixed 2048x128 grid, and its per-thread
+    // local storage is real VRAM measured in gigabytes; if the card is already full because
+    // some UNRELATED process on the machine took it, the driver does not fail the launch,
+    // it backs the spill with host memory over PCIe. The render then crawls by 2-3 orders
+    // of magnitude at 100% reported GPU utilisation, and because every poll of `-interval`,
+    // `-time` and `-stop` happens between chunks, none of them ever gets a turn: the render
+    // looks hung, writes nothing, and cannot be stopped except by killing it.
+    //
+    // That is a miserable thing to debug from the outside (it cost a full session once), and
+    // the CPU path — merely slow — is strictly better than a GPU path that is 1000x slow.
+    // So: measure, and say exactly what is wrong and who to blame.
+    if (useGpu) {
+        const int hero = (mode == 'D') ? g_heroC : 1;
+        const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
+        size_t needLocal = cudaMegakernelLocalBytes(mode, mdep, hero);
+        size_t freeB = 0, totalB = 0;
+        if (cudaMemInfo(&freeB, &totalB)) {
+            // Headroom on top of the local-memory reservation for the scene upload, the
+            // film buffers and the driver's own context. The film pair is known exactly
+            // (two double3 images); 256 MB covers the rest with room to spare.
+            const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2;
+            const size_t needAll = needLocal + film + (size_t)256 * 1024 * 1024;
+            const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
+            // Always say what the card looks like. This one line is what turns "the render
+            // is mysteriously hung" into "something else is holding 20 of my 24 GB", which
+            // is otherwise only visible from outside the process (nvidia-smi reports it as
+            // 100% busy either way, and per-process VRAM is N/A under WDDM).
+            std::printf("[vram] %.2f GB free of %.2f GB on %s; mode-%c kernel wants "
+                        "%.2f GB local + %.2f GB film/scene/context\n",
+                        freeB * toGB, totalB * toGB, cudaDeviceName(), mode,
+                        needLocal * toGB, (needAll - needLocal) * toGB);
+            // Fall back on either signal: the explicit budget, or a card so nearly full
+            // that whatever we failed to account for will certainly not fit.
+            //
+            // CAVEAT, measured: this test is WEAK on Windows. Under WDDM the driver
+            // overcommits and pages rather than failing, so cudaMemGetInfo happily reports
+            // gigabytes "free" on a card nvidia-smi shows at 96% used — in the case that
+            // motivated all of this it did not trip at all. Treat a trip as conclusive, but
+            // NOT tripping as meaningless. The reliable detector is the runtime one:
+            // gpuSppChunks' stall watchdog, which measures the chunk that is actually in
+            // flight and can therefore see contention this query is blind to.
+            const bool tooTight = freeB < needAll;
+            const bool nearFull = totalB && (double)freeB < 0.12 * (double)totalB;
+            if (tooTight || nearFull) {
+                std::fprintf(stderr,
+                    "[device] NOT ENOUGH FREE VRAM for the GPU path (%s): the mode-%c "
+                    "megakernel reserves %.2f GB of per-thread local memory (+%.2f GB "
+                    "film/scene/context) but only %.2f GB of %.2f GB is free on %s.\n"
+                    "[device] Some other process on this machine is holding the card. Running "
+                    "on the GPU anyway would spill that local memory to host RAM over PCIe and "
+                    "render 100-1000x slower at 100%% reported GPU load, with -interval, -time "
+                    "and -stop all inert. Using the CPU instead (-device gpu forces the GPU).\n",
+                    tooTight ? "over budget" : "card is >88% full",
+                    mode, needLocal * toGB, (needAll - needLocal) * toGB,
+                    freeB * toGB, totalB * toGB, cudaDeviceName());
+                if (!wantGpu) useGpu = false;      // `auto`: fall back, which is the whole point
+                else std::fprintf(stderr, "[device] -device gpu given explicitly; proceeding "
+                                          "anyway. Expect the render to appear hung.\n");
+            }
+        }
+    }
+#endif
+
     // Now that the device is resolved, warn if this render's BACKWARD layer will actually
     // run on the CPU tracer, which collapses `scene.media` to `backwardMedium()` (see the
     // `mediaNeedForward` computation above). The GPU backward megakernel superposes the
@@ -7012,7 +7078,8 @@ static int run(int argc, char** argv) {
         return camMode ? camMode : mode;      // else per-camera, else the global default
     };
     struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup;
-                       Vec3 lookAt{0,0,0}; Vec3 up{0,1,0}; double fovY = 40.0; };  // lookAt/up/fovY: for the interactive raster viewer
+                       Vec3 lookAt{0,0,0}; Vec3 up{0,1,0}; double fovY = 40.0;   // lookAt/up/fovY: for the interactive raster viewer
+                       std::string pathBase; };  // owning camera_path/orbit/curve base name ("" = standalone camera)
     std::vector<RenderCam> toRender;
 
     // Raster previews are cheap to compute, so unless the user pinned a size with -r,
@@ -7221,7 +7288,8 @@ static int run(int argc, char** argv) {
                 cmode = applyUnsupportedPolicy(scene, cmode, cs->projection, cs->name.c_str(), proceed);
                 if (!proceed) return 1;
             }
-            toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov});
+            toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov,
+                                cs->pathBase});
         }
     } else {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
@@ -7279,12 +7347,39 @@ static int run(int argc, char** argv) {
 
     // Output naming: a single camera writes to `out`; several cameras write one file
     // each, inserting `_<name>` before the extension (so out=r.ppm -> r_hero.ppm).
+    //
+    // A CAMERA PATH GETS ITS OWN SUBDIRECTORY. When two or more frames of the same
+    // `camera_path`/`orbit`/`camera_curve` are being rendered, they go to
+    // `<stem>_<pathbase>/<leaf>_<frame>.<ext>` instead of becoming siblings of `-o`:
+    //     -o png/rain.png, path "fly"  ->  png/rain_fly/rain_fly000.png, ...
+    // Previously a 600-frame flyby dumped 1800 loose files (png/rain_fly000.png +
+    // .pfm + .ftbuf) into the same directory as the still, burying it. A single frame
+    // of a path (`-camera fly042`) is a one-off and stays beside `-o`, as does any
+    // standalone `camera`, so only an actual series creates a directory.
     auto outFor = [&](const std::string& name) -> std::string {
         if (toRender.size() <= 1 || name.empty()) return out;
         std::string base = out;
         auto dot = base.find_last_of('.');
         std::string stem = (dot == std::string::npos) ? base : base.substr(0, dot);
         std::string ext  = (dot == std::string::npos) ? std::string(".ppm") : base.substr(dot);
+
+        // The owning path of this camera, and how many frames of it we are rendering.
+        // (Stereo eye copies inherit pathBase, so a stereo flyby subdirs correctly too.)
+        std::string pb;
+        for (const RenderCam& rc : toRender)
+            if (rc.name == name) { pb = rc.pathBase; break; }
+        if (!pb.empty()) {
+            size_t nInPath = 0;
+            for (const RenderCam& rc : toRender) if (rc.pathBase == pb) ++nInPath;
+            if (nInPath > 1) {
+                std::string dir = stem + "_" + pb;
+                auto slash = stem.find_last_of("/\\");
+                std::string leaf = (slash == std::string::npos) ? stem : stem.substr(slash + 1);
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);   // harmless if it exists
+                return dir + "/" + leaf + "_" + name + ext;
+            }
+        }
         return stem + "_" + name + ext;
     };
 
@@ -10124,11 +10219,27 @@ static int run(int argc, char** argv) {
     };
     runSharedPhotonMap(groupM);
 
-    for (int i : restIdx) {
+    for (size_t ri = 0; ri < restIdx.size(); ++ri) {
+        const int i = restIdx[ri];
+        // Poll the interrupt BETWEEN frames, exactly as the mode-M loop above does. A stop
+        // request (Ctrl-C, window close, or `ftrace -stop <pid>`) means "stop the RUN", not
+        // "stop this frame": without this break a multi-camera batch kept marching, and since
+        // every subsequent runRender() sees the flag already set it returned immediately at
+        // ~0 spp, so the batch sprayed out near-black frames at several per second and
+        // `-stop` could never retire it (the caller then force-kills, which is exactly what
+        // -stop exists to avoid). Announce the abandoned frames so the truncation is visible.
+        if (g_stopRequested) {
+            const size_t left = restIdx.size() - ri;
+            if (toRender.size() > 1)
+                std::printf("[stop] stopping the batch: %zu of %zu camera%s not rendered.\n",
+                            left, restIdx.size(), restIdx.size() == 1 ? "" : "s");
+            break;
+        }
         const RenderCam& rc = toRender[i];
         if (toRender.size() > 1)
-            std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s\n",
-                        rc.name.c_str(), rc.mode, rc.res, rc.resY, outFor(rc.name).c_str());
+            std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s  [%zu/%zu]\n",
+                        rc.name.c_str(), rc.mode, rc.res, rc.resY, outFor(rc.name).c_str(),
+                        ri + 1, restIdx.size());
         double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, rc.resY, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,

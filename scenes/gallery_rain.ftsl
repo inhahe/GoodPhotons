@@ -236,8 +236,67 @@ material "gridground" {
 # gallery plinth in raking sun is a mid grey anyway; brilliant white was the render clipping.
 material "wirecage" { type diffuse  reflect rgb 0.02 0.05 0.03
                       emit gaussian 528 34 0.45 }
-material "capwhite" { type diffuse  reflect whitewall 0.15 }
+material "capwhite" { type diffuse  reflect whitewall 0.15 }   # the caps' pre-marble albedo
 material "ceil"     { type diffuse  reflect whitewall 0.82 }   # raincloud stand-in only
+
+# --- MARBLE TABLETOPS ------------------------------------------------------------------
+# Every cap is a different slab of marble. The images are prepared by
+# `python tools/make_marble_caps.py` (sources: the repo-root `marble texture *` drops) and
+# written to `textures/`; that script is where the reasoning and the per-cap knobs live.
+#
+# THE ONE THING THAT MATTERS HERE: a cap is the caustic SCREEN, and every raw marble photo
+# means 0.34-0.85 LINEAR against the 0.15 that `capwhite` above spends forty lines
+# justifying. Dropping one in unprepared raises a cap's albedo up to 5.7x — two and a half
+# stops back INTO the clip the 0.15 exists to escape — and every caustic in the scene goes
+# back to printing as flat #FFFFFF. So each image is rescaled at prep time to a MEAN LINEAR
+# REFLECTANCE of exactly 0.15. The stone's pattern survives; its brightness does not. The
+# caps are the same mid grey they were, now with veins.
+#
+# Two further preparations, because a caustic on a diffuse surface is MULTIPLICATIVE
+# (pixel = albedo(x) * irradiance(x)), so the stone modulates the caustic directly rather
+# than sitting behind it:
+#   * CONTRAST is compressed on the three caps that catch a measured caustic, so a dark vein
+#     cannot erase the caustic crossing it. Those three end up swinging only 1.29-1.37x
+#     peak-to-trough (p2..p98), i.e. +-15% on the caustic, against 6.0-8.2x left on the caps
+#     that catch nothing.
+#   * SATURATION is pulled toward neutral on those same three, because a coloured stone TINTS
+#     the caustic — which attacks the exact quantity (`sat`, `spread`) the axicon was recut in
+#     flint to produce. The axicon's own slab is the flattest and most neutral sheet in the
+#     set (source chroma 0.003) and is further desaturated to 0.30 of that.
+#
+# WHICH SLAB GOES WHERE IS BY MEASURED CAUSTIC STRENGTH, not by taste. Only three pieces put
+# anything on their cap (design.md's float ranking): the axicon (the only piece that makes
+# COLOUR), the crystal orb, and the solid crystal gyroid. The other seven are opaque, metal,
+# or — for the Klein bottle — optically a window, so their caps are free and get the dramatic
+# gold-veined stone. That is also why the GOLD gyroid and the BRASS cluster stand on the
+# gold-veined slabs: the vein colour rhymes with the metal at zero caustic cost.
+texture "tex_marble_gold"     { file textures/marble_gold.png     encoding srgb  filter bilinear  wrap clamp }
+texture "tex_marble_orb"      { file textures/marble_orb.png      encoding srgb  filter bilinear  wrap clamp }
+texture "tex_marble_gyroidx"  { file textures/marble_gyroidx.png  encoding srgb  filter bilinear  wrap clamp }
+texture "tex_marble_klein"    { file textures/marble_klein.png    encoding srgb  filter bilinear  wrap clamp }
+texture "tex_marble_dumbbell" { file textures/marble_dumbbell.png encoding srgb  filter bilinear  wrap clamp }
+texture "tex_marble_chrome"   { file textures/marble_chrome.png   encoding srgb  filter bilinear  wrap clamp }
+texture "tex_marble_heart"    { file textures/marble_heart.png    encoding srgb  filter bilinear  wrap clamp }
+texture "tex_marble_brass"    { file textures/marble_brass.png    encoding srgb  filter bilinear  wrap clamp }
+texture "tex_marble_oil"      { file textures/marble_oil.png      encoding srgb  filter bilinear  wrap clamp }
+texture "tex_marble_axicon"   { file textures/marble_axicon.png   encoding srgb  filter bilinear  wrap clamp }
+
+# `wrap clamp` (not `repeat`) with `uv planar axis=y` on each cap isosurface maps ONE slab
+# across each tabletop, referenced to that primitive's own world bounds — a quarried slab cut
+# to the table, not a tiled bathroom floor. The projection is down the y axis, so the top face
+# (the only one that catches anything, and nearly the only one visible from the still camera)
+# carries the image undistorted; the 0.20-0.24 m rims inherit the same projection, which is
+# what a real slab's edge does anyway.
+material "capmarble_gold"     { type diffuse  reflect texture:tex_marble_gold }
+material "capmarble_orb"      { type diffuse  reflect texture:tex_marble_orb }
+material "capmarble_gyroidx"  { type diffuse  reflect texture:tex_marble_gyroidx }
+material "capmarble_klein"    { type diffuse  reflect texture:tex_marble_klein }
+material "capmarble_dumbbell" { type diffuse  reflect texture:tex_marble_dumbbell }
+material "capmarble_chrome"   { type diffuse  reflect texture:tex_marble_chrome }
+material "capmarble_heart"    { type diffuse  reflect texture:tex_marble_heart }
+material "capmarble_brass"    { type diffuse  reflect texture:tex_marble_brass }
+material "capmarble_oil"      { type diffuse  reflect texture:tex_marble_oil }
+material "capmarble_axicon"   { type diffuse  reflect texture:tex_marble_axicon }
 
 # --- Hero-object materials -----------------------------------------------------
 # `roughness` after `preset` overrides the preset's polished lobe. Gold needs a LOT here, and
@@ -437,7 +496,8 @@ isosurface "stand_gyroid" {   # centrepiece: broad low plinth, cap top y=0.55
         }
     }
 }
-isosurface "stand_gyroid_cap" { material capwhite
+isosurface "stand_gyroid_cap" { material capmarble_gold
+    uv planar axis=y
     # 2.3 wide but only 2.1 DEEP. At 2.3 deep the cap's near edge sat at z=3.65 and sliced
     # straight through the glass and diamond stands' COLUMNS (which reach z=3.71 and 3.72,
     # and span y=0.18..0.87 and 0.19..0.81 — both straddling the cap's own y=0.52..0.55).
@@ -467,7 +527,8 @@ isosurface "stand_glass" {   # right-front pedestal, cap top y=0.90
         }
     }
 }
-isosurface "stand_glass_cap" { material capwhite
+isosurface "stand_glass_cap" { material capmarble_orb
+    uv planar axis=y
     # One of the two CANTILEVERED caps (the crystal gyroid's is the other, and for exactly
     # the same reason). 1.7 deep and centred at z=3.05, i.e. 0.45 m
     # toward the camera-far side of its column at z=3.5. That is not decoration — it is
@@ -496,7 +557,8 @@ isosurface "stand_diamond" {   # tall thin jewel-column, cap top y=0.85
         }
     }
 }
-isosurface "stand_diamond_cap" { material capwhite
+isosurface "stand_diamond_cap" { material capmarble_gyroidx
+    uv planar axis=y
     # The second CANTILEVERED cap, and the bigger one. Raising the gyroid to y=1.75 (see the
     # piece below) puts 0.90 m of drop between it and this cap top at y=0.85, and the sun
     # walks the focal axis +0.2079 x / -0.9788 z per metre of that drop -- so the caustic
@@ -525,7 +587,8 @@ isosurface "stand_klein" {   # cap top y=1.00; the Klein bottle stands on it
         }
     }
 }
-isosurface "stand_klein_cap" { material capwhite
+isosurface "stand_klein_cap" { material capmarble_klein
+    uv planar axis=y
     # Widened, but NOT cantilevered, and deliberately so. The bottle is a 2.4 mm-walled
     # shell -- optically a window, not a lens -- and measured over a bare cap it peaks at
     # only 2.0x the surrounding white with nothing at all above 1.5x (scraps/_gemsweep.py,
@@ -556,7 +619,8 @@ isosurface "stand_dumbbell" {   # cap top y=0.88
         }
     }
 }
-isosurface "stand_dumbbell_cap" { material capwhite
+isosurface "stand_dumbbell_cap" { material capmarble_dumbbell
+    uv planar axis=y
     box { center 4.5 0.77 2.7  size 0.88 0.22 0.88  round 0.02 } }
 }
 
@@ -577,7 +641,8 @@ isosurface "stand_chrome" {   # cap top y=0.90
         }
     }
 }
-isosurface "stand_chrome_cap" { material capwhite
+isosurface "stand_chrome_cap" { material capmarble_chrome
+    uv planar axis=y
     box { center 3.5 0.80 2.0  size 0.88 0.20 0.88  round 0.02 } }
 }
 
@@ -598,7 +663,8 @@ isosurface "stand_heart" {   # cap top y=1.00
         }
     }
 }
-isosurface "stand_heart_cap" { material capwhite
+isosurface "stand_heart_cap" { material capmarble_heart
+    uv planar axis=y
     box { center 4.6 0.89 1.9  size 0.86 0.22 0.86  round 0.02 } }
 }
 
@@ -622,7 +688,8 @@ isosurface "stand_brass" {   # cap top y=0.95
         }
     }
 }
-isosurface "stand_brass_cap" { material capwhite
+isosurface "stand_brass_cap" { material capmarble_brass
+    uv planar axis=y
     box { center 6.0 0.83 1.84  size 0.86 0.24 0.86  round 0.02 } }
 }
 
@@ -643,7 +710,8 @@ isosurface "stand_oil" {   # cap top y=0.92
         }
     }
 }
-isosurface "stand_oil_cap" { material capwhite
+isosurface "stand_oil_cap" { material capmarble_oil
+    uv planar axis=y
     box { center 5.3 0.82 1.5  size 0.82 0.20 0.82  round 0.02 } }
 }
 
@@ -697,7 +765,8 @@ isosurface "stand_axicon" {   # cap top y=0.90
         }
     }
 }
-isosurface "stand_axicon_cap" { material capwhite
+isosurface "stand_axicon_cap" { material capmarble_axicon
+    uv planar axis=y
     # The THIRD cantilevered cap, and the shallowest cantilever of the three, because an
     # axicon's caustic barely walks at all. A lens throws its focus a full 0.98 m downwind
     # per metre of drop; this piece's patch measures a core within 0.06 m of its own axis

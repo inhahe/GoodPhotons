@@ -2604,6 +2604,15 @@ extension), which ffmpeg concatenates into a video. Any flyby block may carry an
 `fps <n>` playback hint (read by the assembly tooling; overrides the scene-level
 `fps` default — see *Scene-header defaults* above).
 
+**Where the frames land.** A path/orbit/curve of more than one frame is written into
+its **own subdirectory**, named from the output stem and the block, rather than loose
+beside `-o`: `-o png/rain.png` with a `camera_path "fly"` writes
+`png/rain_fly/rain_fly000.png`, `…_fly001.png`, and so on (the directory is created if
+needed). Standalone `camera` blocks in the same scene still write beside `-o` as
+`png/rain_<name>.png`. This keeps a 600-frame flyby from burying the stills — and any
+unrelated images — in its output directory. To render just one image from a scene that
+also declares a path, pass `-camera <name>`.
+
 - **`camera_path "name" { … key <t> <ex ey ez> [<lx ly lz>] [<fov>] … frames N }`** —
   keyframed fly-through: the eye (and optionally look_at / fov) is linearly
   interpolated across `key` frames. Optional `dolly_zoom` holds the subject's

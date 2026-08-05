@@ -1410,6 +1410,78 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       0.111 → 0.147, +32 %. 0.15 puts the caps 2¾ stops below clip with room for the axicon's
       ~7× cusps on top; below it the returns fall off sharply (0.09 buys a further +0.017 for
       a dingy sRGB-80 tabletop).
+    - **The ten tabletops are MARBLE, and each one is renormalised to that same 0.15 before it
+      is allowed near a cap.** The caps are not decoration, they are the caustic screens, so a
+      texture on one is not a free cosmetic change: a caustic on a diffuse surface is
+      **multiplicative** (`pixel = albedo(x) · irradiance(x)`), which makes the stone a
+      multiplier on the very quantity the scene exists to measure. The raw marble photographs
+      mean 0.34–0.85 *linear* (sRGB 0.62–0.93), so dropping one in as-is would raise a cap's
+      albedo by up to **5.7×** — two and a half stops back *into* the clip the 0.15 was chosen
+      to escape, and every caustic in the scene would print flat `#FFFFFF` again. So
+      `tools/make_marble_caps.py` prepares each sheet and its one non-negotiable operation is
+      to rescale the image so its **mean linear reflectance equals 0.15**. The pattern
+      survives; the brightness does not. Two further knobs follow from the same
+      multiplicativity and are applied *in linear light* so they compose with the rescale as
+      pure multiplies: **contrast `k`** (albedo swing about the mean — a vein at half the mean
+      halves the caustic that crosses it, i.e. a dark vein *erases* it) and **saturation `s`**
+      (a coloured stone *tints* the caustic, attacking exactly the `sat`/`spread` the axicon
+      exists to produce). Both default to 1 and are turned down only where they must be.
+      Assignment is by **measured caustic strength, not taste**: the three caps that catch a
+      real caustic (axicon 0.30 % / sat 0.275 — and the only piece that makes colour; crystal
+      orb 0.72 % / 0.246; solid gyroid k=10 0.37 % / 0.208) get the flattest, most neutral
+      sheets, further calmed to k 0.45–0.55 / s 0.30–0.40, which leaves them swinging only
+      **1.29–1.37×** p2→p98. The other seven measure at or near zero — gold/brass/chrome are
+      opaque, the heart and jack are opaque iridescent, and the Klein bottle's 2.4 mm wall is
+      optically a window (0.12 %, nothing at the 1.5× bar) — so they are *free*, and get the
+      dramatic gold-veined slabs at full contrast, deliberately putting gold marble under the
+      gold gyroid and the brass cluster. Sources are also matched to each cap's **on-screen
+      footprint** (gyroid 634×293 px down to oil 72×16 px), so the two ~200 px drops go to caps
+      under 160 px and the 4650² and 1600×1067 sheets to the two that matter; everything is
+      box-filtered to ≤1024 px because a 1.6 m cap never spans more than ~650 px. Two source
+      files needed handling rather than trust: `marble texture 2.jpg` (actually a palette PNG)
+      bottomed out at 0.006 linear (sRGB 19) at full contrast, reading as a *hole* in the
+      tabletop, so it takes k=0.75 to lift the floor without touching its veins; and
+      `marble texture 3.5.avif` is a **watermarked VectorStock preview** whose black footer bar
+      is why it alone measured p5 = 0.000 — the bar is cropped off (bottom 9.5 %), but it is
+      still a stock comp and is flagged here and in the scene rather than shipped silently.
+      Each cap gets `uv planar axis=y` so the slab is quarried once across the whole tabletop
+      rather than tiling.
+
+      **Verified, not asserted.** The same frame was rendered twice at matched settings and
+      matched convergence — marble 259 spp / 6.21 % noise against the untextured scene at
+      230 spp / 6.59 % — and metered with `_capchroma.py`. On the three caps that carry a
+      caustic, nothing moved:
+
+      | cap | coverage | sat | spread | peak | clip | noise | fan |
+      |---|---|---|---|---|---|---|---|
+      | **axicon** untextured | 3.64 % | 0.436 | 0.271 | 7.90× | 0.15 % | 0.050 | 0.75 |
+      | **axicon** marble | 3.53 % | 0.452 | 0.267 | 8.03× | 0.15 % | 0.050 | 0.74 |
+      | solid gyroid (diamond cap) untextured | 4.93 % | 0.886 | 0.087 | 3.17× | 0.00 % | 0.060 | 0.50 |
+      | solid gyroid (diamond cap) marble | 5.04 % | 0.904 | 0.081 | 3.28× | 0.00 % | 0.062 | 0.45 |
+      | crystal orb (glass cap) untextured | 0.37 % | 0.260 | 0.008 | 2.48× | 0.00 % | 0.097 | — |
+      | crystal orb (glass cap) marble | 0.37 % | 0.223 | 0.003 | 2.29× | 0.00 % | 0.099 | — |
+
+      Every number is within run-to-run scatter; the axicon's `clip` is *identical* at 0.15 %,
+      which is the specific thing the 0.15 normalisation existed to protect. (An early read at
+      70 spp showed clip 0.13 % → 0.38 % and looked like a real regression — it was pure
+      sample-count artifact and vanished on convergence. Do not meter this at low spp.) The
+      orb's `sat`/`spread` drop is on absolute values of 0.008 → 0.003, i.e. inside the noise
+      of a caustic already documented as "organised colour, and almost none of it".
+    - **CAVEAT — `_capchroma.py` assumes a UNIFORM cap albedo, and a high-contrast texture
+      breaks it.** The metric is "excess over 2× the cap's own median", which silently
+      attributes *all* variation to light. On the full-contrast decorative slabs the stone's
+      own veins clear that bar, so the meter reports a caustic that does not exist: the gyroid
+      cap reads **coverage 4.55 %, sat 0.434, spread 0.201, fan 0.84** where the untextured
+      control reads a flat **0.00 %** — and the gold gyroid is opaque, so there is no caustic
+      on that cap at all. `fan 0.84` is being scored on *rock*, because marble veining also
+      varies smoothly with position and that is precisely what `fan` detects. The `noise`
+      control band gives it away (0.028 → 0.297 on that cap; brass 0.028 → 0.164), which is
+      the tell to look for. This costs nothing today — the seven textured-for-drama caps are
+      exactly the ones with no caustic to measure — but **only the three calm caps remain
+      metrologically valid**, and their noise floors are untouched (axicon 0.050 → 0.050,
+      diamond 0.060 → 0.062, orb 0.097 → 0.099), which independently confirms the `k`/`s`
+      calming was sized correctly. To meter a decorative cap properly the tool would have to
+      divide the texture back out before thresholding.
     - **The glass orb is levitated 0.30 m on three pins, and its cap is cantilevered.** The
       height was *measured*, not computed. The textbook ball-lens `f = nR/(2(n−1))` — 0.734 m
       from centre for BK7 at R=0.5 — is **paraxial**, and a full-aperture sphere has gross

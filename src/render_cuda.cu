@@ -50,6 +50,10 @@
 #include <cstring>
 #include <vector>
 #include <chrono>
+#include <thread>                // gpuSppChunks' stall watchdog
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <math.h>
 #include <float.h>
 
@@ -12205,14 +12209,93 @@ template <class LaunchFn, class DownloadFn>
 static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                          LaunchFn&& launch, DownloadFn&& download) {
     using clk = std::chrono::steady_clock;
-    long long done = 0, chunk = 1;
+    // Same two diagnostic levers cpuSppChunks has, and for the same reason: when a render
+    // appears to hang, the first question is always "how big did the chunk get, and how long
+    // is one taking?" — and the adaptive answer is invisible from outside.
+    //   FTRACE_CHUNK_SPP=K   pin every chunk to K spp (0/unset = adapt)
+    //   FTRACE_CHUNK_DEBUG=1 log each chunk's size and wall time
+    // The GPU chunker went without these, which is exactly why a 320x180 4-spp frame that
+    // would not finish in 7 minutes could not be told apart from a deadlock without a debugger.
+    long long forcedChunk = 0;
+    if (const char* e = std::getenv("FTRACE_CHUNK_SPP")) forcedChunk = std::atoll(e);
+    const bool chunkDebug = [] { const char* e = std::getenv("FTRACE_CHUNK_DEBUG");
+                                 return e && *e && std::strcmp(e, "0"); }();
+    long long done = 0, chunk = (forcedChunk > 0) ? forcedChunk : 1;
+
+    // ---- stall watchdog ------------------------------------------------------------
+    // A kernel launch is synchronous from here (cudaCheckKernel synchronizes), so while one
+    // chunk is in flight this thread is parked in cuCtxSynchronize and CANNOT report, write
+    // the -interval image, honour -time, or answer -stop. Normally that is fine: chunks are
+    // retargeted to ~0.15 s. But if ANOTHER process on the machine is saturating the GPU,
+    // even the minimum 1-spp chunk can take minutes-to-hours, and the render becomes
+    // indistinguishable from a deadlock — silent, unwritable and unkillable except by
+    // taskkill. (Measured: a 160x90 2-spp frame did not complete a single chunk in minutes
+    // while an unrelated CUDA process held ~20 GB and 100% of an RTX 4090. Note that
+    // cudaMemGetInfo is NO help here — under WDDM it cheerfully reports the memory as
+    // available, because the driver will page rather than fail.)
+    //
+    // So watch the in-flight launch from a second thread and SAY SO. It cannot make the
+    // kernel come back sooner, but it converts an apparent hang into an accurate diagnosis,
+    // which is the whole difference between "ftrace is broken" and "something else is using
+    // your GPU".
+    std::mutex wmx;
+    std::condition_variable wcv;
+    bool watchQuit = false;
+    std::atomic<long long> launchStartMs{0};    // 0 = nothing in flight
+    std::atomic<long long> launchSpp{0};
+    auto nowMs = [] {
+        return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   clk::now().time_since_epoch()).count();
+    };
+    std::thread watchdog([&] {
+        bool warned = false;
+        double nextWarn = 30.0;                 // first complaint after 30 s in one chunk
+        for (;;) {
+            std::unique_lock<std::mutex> lk(wmx);
+            wcv.wait_for(lk, std::chrono::seconds(2), [&] { return watchQuit; });
+            if (watchQuit) return;
+            lk.unlock();
+            const long long t0 = launchStartMs.load(std::memory_order_relaxed);
+            if (!t0) { warned = false; nextWarn = 30.0; continue; }   // between chunks: reset
+            const double el = (nowMs() - t0) / 1000.0;
+            if (el < nextWarn) continue;
+            if (!warned) {
+                std::fprintf(stderr,
+                    "\n[gpu-stall] one %lld-spp chunk has been running on the GPU for %.0f s "
+                    "(target is 0.15 s).\n"
+                    "[gpu-stall] The render is NOT hung, but until this chunk returns it "
+                    "cannot write the -interval image, end on -time, or answer -stop.\n"
+                    "[gpu-stall] The usual cause is another process saturating the GPU: check "
+                    "`nvidia-smi` for a second CUDA program. Run with -device cpu to sidestep "
+                    "it, or free the card.\n",
+                    launchSpp.load(std::memory_order_relaxed), el);
+                warned = true;
+            } else {
+                std::fprintf(stderr, "[gpu-stall] still in the same chunk after %.0f s.\n", el);
+            }
+            std::fflush(stderr);
+            nextWarn = el + 60.0;               // then once a minute, so it stays visible
+        }
+    });
+    struct WatchdogJoin {                        // join on every exit path, including a throw
+        std::mutex& m; std::condition_variable& cv; bool& q; std::thread& t;
+        ~WatchdogJoin() { { std::lock_guard<std::mutex> lk(m); q = true; } cv.notify_all();
+                          if (t.joinable()) t.join(); }
+    } wjoin{wmx, wcv, watchQuit, watchdog};
+
     while (done < spp) {
         long long c = chunk; if (c > spp - done) c = spp - done;
         auto t0 = clk::now();
+        launchSpp.store(c, std::memory_order_relaxed);
+        launchStartMs.store(nowMs(), std::memory_order_relaxed);
         launch(c, prog.sampleBase + done);
+        launchStartMs.store(0, std::memory_order_relaxed);
         done += c;
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
-        if (dt > 1e-4) {                                   // retarget ~0.15 s per chunk
+        if (chunkDebug)
+            std::fprintf(stderr, "[chunk] gpu %lld spp in %.3f s (%.1f spp/s), %lld/%lld done\n",
+                         c, dt, dt > 0 ? c / dt : 0.0, done, spp);
+        if (forcedChunk <= 0 && dt > 1e-4) {               // retarget ~0.15 s per chunk
             long long next = (long long)((double)c * (0.15 / dt));
             if (next < 1)          next = 1;
             if (next > c * 8 + 1)  next = c * 8 + 1;        // ramp up, but not explosively
@@ -12296,6 +12379,69 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     freeUpload(up);
     cudaFree(d_cam); cudaFree(d_splat);
     return out;
+}
+
+// ------------------------- device-memory preflight ---------------------------
+//
+// WHY THIS EXISTS: a megakernel's per-thread LOCAL memory is real device memory. The BDPT
+// kernel carries its path vertices in thread-local arrays, so the fixed 2048 x 128 grid
+// every megakernel here launches with (MEGAKERNEL_THREADS below) reserves
+// `localSizeBytes * 262144` bytes of backing store before it traces a single sample — on
+// this project that is GIGABYTES, not megabytes.
+//
+// When another process has filled the card, that allocation does NOT fail. The WDDM driver
+// backs the spill with host memory across PCIe and the kernel simply CRAWLS — measured at
+// 2-3 orders of magnitude slower, while nvidia-smi still reports 100% GPU utilisation, so
+// from the outside it is indistinguishable from a hang. Worse, it disables the render's
+// whole control surface: `-interval` writes, the `-time` budget and `-stop` are all polled
+// BETWEEN chunks (gpuSppChunks), and a chunk that should take 0.15 s never returns.
+//
+// Measured case that motivated this: a 320x180 4-spp gallery_rain frame — normally ~2 s —
+// had not finished after 7 minutes, with an unrelated process holding 20 GB of the card's
+// 24 GB. Nothing in the renderer said a word.
+//
+// So: ask the driver what the kernel actually reserves, ask the card what is actually free,
+// and let the caller refuse the GPU with a real explanation instead of thrashing silently.
+#define MEGAKERNEL_THREADS ((size_t)2048 * 128)
+
+bool cudaMemInfo(size_t* freeB, size_t* totalB) {
+    if (!cudaAvailable()) return false;
+    size_t f = 0, t = 0;
+    if (cudaMemGetInfo(&f, &t) != cudaSuccess) return false;
+    if (freeB)  *freeB  = f;
+    if (totalB) *totalB = t;
+    return true;
+}
+
+// Bytes of device memory the megakernel for `mode` reserves purely for per-thread local
+// storage, at the instantiation this render will actually launch. `maxDepth`/`heroC` pick
+// the same four-way BDPT branch renderBdptCuda picks, so the number is the one that will
+// really be reserved rather than a worst case. Returns 0 when unknown (no device, or a
+// mode with no megakernel), which callers must treat as "no opinion", not as "free".
+size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
+    using namespace gpu;                      // the megakernels live there
+    if (!cudaAvailable()) return 0;
+    const void* fn = nullptr;
+    if (mode == 'D') {
+        // Mirrors renderBdptCuda's dispatch exactly (deep = maxDepth past the default
+        // instantiation; hero = the multi-wavelength bundle). The deep variant is the
+        // expensive one: BDPT_DEEPDEPTH is 64 vertices of local path state per thread.
+        const bool deep = (maxDepth > BDPT_MAXDEPTH);
+        const bool hero = (heroC > 1);
+        if      (hero && deep) fn = (const void*)kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH>;
+        else if (hero)         fn = (const void*)kBdptT<BDPT_NSEC, BDPT_MAXDEPTH>;
+        else if (deep)         fn = (const void*)kBdptT<0, BDPT_DEEPDEPTH>;
+        else                   fn = (const void*)kBdptT<0, BDPT_MAXDEPTH>;
+    } else if (mode == 'R' || mode == 'W') {
+        fn = (const void*)kBackward;
+    } else if (mode == 'P') {
+        fn = (const void*)kBackwardRGB;
+    }
+    if (!fn) return 0;
+    cudaFuncAttributes fa{};
+    if (cudaFuncGetAttributes(&fa, fn) != cudaSuccess) return 0;
+    cudaGetLastError();                       // don't leave a sticky error for the next launch
+    return (size_t)fa.localSizeBytes * MEGAKERNEL_THREADS;
 }
 
 // --------------------- backward reference (mode R) host ----------------------

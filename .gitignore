@@ -27,6 +27,12 @@
 # ...but the small image ASSETS the sample scenes reference are inputs, not render
 # outputs, and must be committed or scenes/*.ftsl won't load for anyone else.
 !/scenes/*.ppm
+# textures/ holds prepared cap textures (tools/make_marble_caps.py), which gallery_rain
+# loads by name — without them the scene fails to load. They are <=1024 px and ~3.5 MB
+# total. The RAW `marble texture *.{jpg,jpeg,avif}` drops they are built from stay
+# untracked: they are source material of unverified provenance (one is a watermarked
+# stock comp — see known-issues.md), and the prepared PNGs are the actual asset.
+!/textures/*.png
 
 # 3D model assets (large binaries kept on disk, never committed — cameras/, meshes/,
 # Meshy_* textures, etc. Scenes reference them locally; they don't belong in history.)

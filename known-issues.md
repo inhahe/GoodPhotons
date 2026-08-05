@@ -5,7 +5,95 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-08-04): `-stop` cannot stop a MULTI-CAMERA render — it ends the current frame and the batch marches on to the next camera
+### OPEN (2026-08-04): `textures/marble_dumbbell.png` is derived from a WATERMARKED stock preview — replace before any public release
+
+**What.** `marble texture 3.5.avif`, one of the ten source sheets, is a VectorStock **comp**: a
+black footer bar carrying the agency name and stock id runs across the bottom ~9 %. That bar is
+why this one file measured `p5 = 0.000` while every other sheet floors around 0.45.
+`tools/make_marble_caps.py` crops it off (`crop=(0, 0, 1, 0.905)`), so the shipped texture is
+clean *looking* — but it is still a derivative of an unlicensed preview image, and it is now
+committed as `textures/marble_dumbbell.png` and referenced by `scenes/gallery_rain.ftsl`.
+
+**Why it was not silently shipped.** The repo publishes GitHub releases (`release.bat` →
+`inhahe/goodphotons`), so a stock comp in the asset set is a licensing problem, not a cosmetic
+one. Cropping the watermark out arguably makes it worse rather than better.
+
+**Fix.** Replace that one source with a properly-licensed or public-domain marble photograph and
+re-run `python tools/make_marble_caps.py`; nothing else changes, since the tool renormalises
+whatever it is given to the cap albedo. The other nine sources are of unverified but
+unwatermarked provenance and should be spot-checked at the same time. The raw drops themselves
+are deliberately left untracked (see `.gitignore`); only the prepared PNGs are committed.
+
+### OPEN (2026-08-04): `scraps/_capchroma.py` scores marble VEINS as a caustic — the metric assumes a uniform cap albedo
+
+**Symptom.** With the tabletops textured, the gyroid cap meters **coverage 4.55 %, sat 0.434,
+spread 0.201, fan 0.84** in the converged frame. The untextured control of the same frame meters
+**0.00 %**, and the gold gyroid standing on that cap is *opaque* — there is no caustic there to
+find. The brass cap shows the same thing more mildly.
+
+**Why.** The metric is "excess over 2× the cap's own median", which attributes every bit of
+variation across the cap to *light*. That is only valid when the cap's albedo is constant, which
+it was until v0.134.0. A full-contrast marble slab swings 6.7–8.2× p2→p98, so its own veins clear
+the 2× bar; and because veining varies *smoothly with position*, it also scores high on `fan`,
+the statistic specifically built to separate dispersed colour from position-uncorrelated speckle.
+`fan 0.84` here is being scored on rock. The tell is the `noise` control band, which is computed
+the same way and jumps with it: 0.028 → 0.297 on the gyroid cap, 0.028 → 0.164 on brass.
+
+**Impact today: none, by construction.** The seven caps that got full-contrast stone are exactly
+the ones with no measurable caustic (opaque metal / opaque iridescent / the Klein bottle's
+optical window), and the three caps that *are* metered were deliberately given calm stone
+(swing 1.29–1.37×, `k` 0.45–0.55, `s` 0.30–0.40). Their noise floors are unchanged by the
+texturing — axicon 0.050 → 0.050, diamond 0.060 → 0.062, orb 0.097 → 0.099 — so the caustic
+numbers remain valid. But the trap is now armed for anyone who meters a decorative cap, or who
+later raises `k` on a cap that matters.
+
+**Proper fix.** Divide the texture back out before thresholding: `_capchroma.py` should sample
+the cap's albedo map through the same planar UV projection the renderer uses and meter
+`irradiance = pixel / albedo(x)` rather than `pixel`. Failing that, it should at least *detect*
+a textured cap (the material carries a `texture:` reference) and refuse to report, rather than
+returning a confident wrong number.
+
+### OPEN (2026-08-04): a GPU render can be starved to a standstill by ANOTHER process on the card, and there is no way to make it yield
+
+**Symptom.** With an unrelated CUDA process (a `python` model server, pid 20264) holding ~20 GB
+of a 24 GB RTX 4090 and driving it at 100 %, `ftrace` mode D became unusable: a **160x90, 1-spp**
+chunk — a few milliseconds of work on an idle card — did not return in **11 minutes**. A
+1280x720 render of `gallery_rain` reached 25 spp in 30.8 s and then produced nothing for 17
+minutes. `cdb -p <pid> -c "~0k"` showed the main thread parked in `nvcuda64!cuCtxSynchronize` the
+whole time, and the process could not be stopped with `ftrace -stop` (see why below).
+
+**Diagnosis.** Contention, not an ftrace bug — and *not* a VRAM-capacity bug either: note that
+`cudaMemGetInfo` reported plenty free throughout, because under WDDM the driver overcommits and
+pages rather than failing an allocation, which makes the capacity query worthless as a detector.
+What ftrace *was* guilty of is being completely silent about it: from outside the process this is
+indistinguishable from a deadlock, and `nvidia-smi` reports 100 % busy either way. Confirmed
+environmental by rendering the *untextured* `git show HEAD:scenes/gallery_rain.ftsl` with
+identical settings — it stalled identically, clearing the scene's new marble textures.
+
+**What was done (v0.134.0).** Not a fix — the renderer cannot preempt another process's kernels
+— but the failure is no longer mute:
+
+- `gpuSppChunks` (`render_cuda.cu`) now runs a **stall watchdog** thread. If one chunk stays in
+  flight past 30 s (target: 0.15 s) it prints `[gpu-stall]` with the chunk size and elapsed time,
+  states that the render is not hung but cannot write `-interval`, honour `-time` or answer
+  `-stop` until the chunk returns, and points at `nvidia-smi` / `-device cpu`. Repeats each minute.
+- A `[vram]` line reports free/total device memory and the megakernel's per-thread local
+  reservation (`cudaMegakernelLocalBytes`, via `cudaFuncGetAttributes`) at the device gate, and
+  falls back to the CPU when the card is over budget or >88 % full. **Weak detector** — it did not
+  trip in the measured case, for the WDDM reason above. Kept because a trip is conclusive; a
+  non-trip means nothing.
+- `gpuSppChunks` gained the `FTRACE_CHUNK_SPP` / `FTRACE_CHUNK_DEBUG` levers `cpuSppChunks`
+  already had. Their absence is why this needed a debugger to characterise.
+
+**Still open / proper fix.** `-interval`, `-time` and `-stop` are all polled *between* chunks, so
+one long chunk disables the whole control surface. The robust fix is to stop assuming a chunk is
+short: size the first launch from a **cheap timed probe** (the kernels already take `totalSamples`
+explicitly, so a fraction of one spp is launchable) instead of starting at 1 spp and hoping, and
+consider a CUDA-stream + `cudaEventQuery` poll loop so the host thread stays responsive while a
+chunk is in flight instead of blocking in `cudaDeviceSynchronize`. Until then the workaround is
+`-device cpu` whenever the card is busy.
+
+### FIXED (2026-08-04, v0.133.0): `-stop` cannot stop a MULTI-CAMERA render — it ends the current frame and the batch marches on to the next camera
 
 **Symptom.** `scenes/gallery_rain.ftsl` declares 601 cameras. A render launched without
 `-camera` finishes the still and then walks the whole 600-frame flyby set. Two `ftrace -stop
@@ -25,18 +113,23 @@ cleared) at the frame boundary and the loop advances to camera N+1, so the reque
 retire the run. The 120 s timeout then reports "still running", which reads like a hung process
 and invites a force-kill — exactly the thing `-stop` exists to avoid, and dangerous mid-CUDA.
 
-**Proper fix.** Make the stop flag terminate the *batch*: check it in the camera loop as well
-as the per-frame loop, and have it break out of both. A stop request should never be cleared by
-finishing a frame. Worth also making `-stop` report *which* frame of how many it is on, so the
-"still running" line distinguishes "wedged" from "working through 600 cameras".
+**Fix (v0.133.0).** The per-camera loop in `main.cpp` (the `restIdx` loop) now polls
+`g_stopRequested` between frames, exactly as the mode-M loop above it already did, and breaks —
+announcing `[stop] stopping the batch: N of M cameras not rendered.` so the truncation is visible
+rather than silent. Root cause was that the flag was only checked *inside* a frame: once set,
+every subsequent `runRender()` returned immediately at ~0 spp, so the batch sprayed near-black
+frames at several per second and `-stop` could never retire it. **Verified:** `-stop` now returns
+`[stop] done — stopped cleanly` in ~1 s (was: 120 s timeout then force-kill), with the log reading
+`[stop] stopping the batch: 596 of 601 cameras not rendered`.
 
-**Second bug, same incident.** Those flyby frames were written **loose next to `-o`** as
-`png/rain_axicon_fly000.{png,pfm,png.ftbuf}` — 148 of them before the kill — violating the
-project rule that a multi-frame series lives in its own `png/<setname>/`. ftrace should put a
-multi-camera path series in a subdirectory derived from the output base by default, rather than
-spraying siblings of the still. **Workaround until both are fixed: always pass `-camera <name>`
-when you want one image from a scene that declares a camera path.** (The 148 stray frames were
-deleted.)
+**Second bug, same incident — also FIXED (v0.133.0).** Those flyby frames were written **loose
+next to `-o`** as `png/rain_axicon_fly000.{png,pfm,png.ftbuf}` — 148 of them before the kill —
+violating the project rule that a multi-frame series lives in its own `png/<setname>/`.
+`CamSpec` now carries a `pathBase` (the path's name without the frame number, empty for a
+standalone `camera`), set at all three path-generation sites in `ftsl.h` (`camera_path`, `orbit`,
+`camera_curve`); `outFor` in `main.cpp` uses it to write any series of >1 frame into
+`<stem>_<pathBase>/`. **Verified:** flyby frames land in `png/_stoptest_fly/` while a standalone
+camera's still stays beside `-o`. (The 148 stray frames were deleted.)
 
 ### OPEN (2026-08-04): mode `W` is NOT noise-free at `-spp 1` when the scene has a medium — the fog term is still a Monte-Carlo free flight
 
