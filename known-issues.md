@@ -56,9 +56,12 @@ double vs the GPU's float world position. Mean absolute difference 0.12/255.
 `raster_cuda.cu` now calls was *lifted out of* `render_cuda.cu` into `pattern_device.cuh`, so
 the tracer had to be re-checked. `scenes/_preview_pattern_tex.ftsl` (added for this) binds
 three `tex:` expressions (plain,
-warped-lookup, and an `emit_map` mask) to slots the preview actually evaluates — `weight_map`
-is no good for this, since the preview resolves a `mix` to its dominant child and never runs
-that pattern. CPU vs GPU, matched settings:
+warped-lookup, and an `emit_map` mask) to slots the preview evaluated at the time —
+`weight_map` was no good for it, because the preview then resolved a `mix` to its dominant
+child and never ran that pattern. (That limitation is itself now fixed; see the 0.136.0
+entry below. The scene stays as-is: `reflect`/`emit_map` bindings are the tighter test of
+the VM, since they reach it without going through the mix threshold.) CPU vs GPU, matched
+settings:
 
 | path | difference |
 |---|---|
@@ -71,6 +74,48 @@ Same residual as above — hard checker edges under `filter nearest`, float vs d
 **0.1 s** on the CPU, with the `[gpu-stall]` watchdog reporting 30 s per 1-spp chunk against a
 0.15 s target. That is the GPU-contention entry below (pid 20264 again), not a cost of this
 change — the raster path, whose kernels are tiny, rendered the same scene in 0.42 s throughout.
+
+
+### DONE (0.136.0): seventh gap — a `mix` blend mask never previewed (the preview and mode W disagreed)
+
+**What.** A two-child `mix` carrying `weight_map texture:` / `weight_map pattern:` is a
+*spatial A/B mask* — wear masks, decals, painted patterns. The preview rasterizer resolved
+every mix with `mixDominantChild`, which only compares the **constant** weights. A blend
+mask is always declared 50/50, so the "dominant" child was always child 0 and the mask was
+never evaluated: the surface previewed as one flat winner. `-mode W` calls
+`mixResolveDominant` instead, which samples the mask at the hit and hard-thresholds at ½.
+So `raster.h`'s own header comment — "the same child deterministic mode W picks, so the two
+agree" — was false for exactly this case.
+
+Visible on `scenes/pattern_tex.ftsl`: mode W shows three checkered walls, the preview showed
+three flat ones. 19 shipped scenes use `weight_map`.
+
+**Fix (both backends).** `PTri`'s material payload is split out into a base `PShade`;
+`PreviewGeom` now carries a `PMix` side table (`weightPat`, `weightTex`, and the child-1
+`PShade`) that `PTri::mix` indexes. The shade pass evaluates the mask at the shaded point
+and, below ½, repoints `const PShade* sh` at the loser — so albedo, skin, normal map and
+pattern drives all switch together, per pixel. The table is keyed **per material**, so three
+weight-mapped mixes cost three entries no matter how many triangles carry them (inlining a
+second payload in `PTri` would have cost ~+120 MB on a 2 M-triangle scene). The GPU twin
+mirrors it with a `DMix` device array consumed in `kShade`.
+
+`emissive` and `clear` deliberately still come from child 0: `g.emis` is consumed by
+auto-exposure *before* shading, and `clear` steers the separate see-through pass, so neither
+can vary per pixel. A child that is itself a weight-mapped mix still flattens.
+
+**Bug found and fixed during verification.** The first cut still previewed flat, because
+`STri::needUV` — the flag that decides whether the raster pass interpolates UVs at all —
+listed only skins / normal maps / pattern slots. A mix mask reads (u,v) too, so the mask was
+being sampled at `u=v=0`. With `needUV |= (mix >= 0)`, `pattern_tex.ftsl` reproduces mode W
+exactly. (The GPU interpolates UVs unconditionally and never had the bug — a good reminder
+that CPU-only optimisations are their own parity hazard.)
+
+**Verified.** `pattern_tex.ftsl` (`weight_map pattern:`) CPU vs GPU raster: 0.076% of pixels
+over 2/255, mean 0.04/255. `maskblend.ftsl` (`weight_map texture:`): 0.068%, mean 0.05/255,
+and the CPU raster is visually identical to a 16-spp `-mode W` reference. Regression check on
+`_preview_pattern_tex.ftsl`: 0.083%, unchanged from before this work. `gallery_rain` still
+previews its marble and grid correctly. All residuals are the usual hard-threshold /
+hard-checker edges under float-vs-double.
 
 
 ### OPEN (2026-08-04): `textures/marble_dumbbell.png` is derived from a WATERMARKED stock preview — replace before any public release

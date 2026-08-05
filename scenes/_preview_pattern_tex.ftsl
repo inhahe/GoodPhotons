@@ -5,10 +5,13 @@
 # `patScalarAt` member hook.
 #
 # Why the bindings look like this: patterns are bound to `reflect pattern:` and
-# `emit_map pattern:` rather than to a mix's `weight_map`. The preview rasterizer resolves
-# a `mix` material to its dominant child, so a `weight_map` pattern is never evaluated
-# there — a weight_map-based scene (scenes/pattern_tex.ftsl) silently tests nothing on the
-# raster path.
+# `emit_map pattern:` rather than to a mix's `weight_map`. A weight_map reaches the VM only
+# through the mix's hard ½ threshold, which throws away everything but the sign of
+# (value - ½) — so it can only ever detect gross VM breakage, and it hides any disagreement
+# in the value itself. These bindings multiply the slot by the raw scalar, so the whole
+# output range is under test. (Until 0.136.0 a weight_map tested literally nothing on the
+# raster path: the preview resolved a mix to its dominant child and never ran the pattern.
+# See scenes/pattern_tex.ftsl, which is now the regression scene for that fix.)
 #
 # Run both backends of both pipelines and diff; expect agreement to within the usual
 # float-vs-double disagreement on the hard checker edges (`filter nearest`), i.e. <0.1% of

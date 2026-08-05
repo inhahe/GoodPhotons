@@ -41,14 +41,15 @@ bool available();
 // free with destroy().
 struct Scene;
 
-// Bake `tris` (world-space preview triangles) + `light` + the source scene to the device.
-// `scene` supplies everything the shade pass reaches beyond the triangle itself: the image
-// skins bound by PTri::tex / PTri::normalTex, and the procedural `pattern` programs (plus
-// their grid/scatter sample tables) bound by PTri::reflectPat / PTri::emitPat. May be null,
-// in which case textured and pattern-driven surfaces fall back to their flat colour.
+// Bake `geom` (the world-space preview triangles plus the side tables they index) +
+// `light` + the source scene to the device. `scene` supplies everything the shade pass
+// reaches beyond the triangle itself: the image skins bound by PTri::tex /
+// PTri::normalTex, and the procedural `pattern` programs (plus their grid/scatter sample
+// tables) bound by PTri::reflectPat / PTri::emitPat / PMix::weightPat. May be null, in
+// which case textured and pattern-driven surfaces fall back to their flat colour.
 // Returns nullptr if CUDA is unavailable or a device allocation fails (caller must then use
 // the CPU path).
-Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight& light,
+Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light,
               const ::Scene* scene = nullptr);
 
 // Free a scene created by upload() (safe on nullptr).

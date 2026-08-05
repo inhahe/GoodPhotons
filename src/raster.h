@@ -20,6 +20,10 @@
 //   * Normal maps (`normal_map`) — perturbed through the triangle's UV-derived TBN.
 //   * Mix / layered materials — resolved to their dominant child (the same choice
 //     deterministic mode W makes), instead of collapsing to the parent's flat colour.
+//     A two-child mix carrying a `weight_map` is resolved PER PIXEL instead: the mask is
+//     sampled at the shaded point and the whole losing payload (albedo, skin, normal map,
+//     pattern drives) is swapped in, so a wear mask / decal / painted blend previews as
+//     the spatial A/B pattern it is rather than as one flat winner.
 // There is NO transparency, refraction, reflection, shadows, caustics or global
 // illumination — a dielectric shows as a solid ghost, a mirror as a flat tint. Glossy
 // lobes do not exist here either, so roughness/film-thickness maps are ignored by
@@ -48,14 +52,12 @@
 
 namespace raster {
 
-// One preview triangle: world-space positions + per-vertex world normals + a solid
-// base colour (linear sRGB albedo) and an "emissive" flag (light geometry glows).
-struct PTri {
-    Vec3 p0, p1, p2;
-    Vec3 n0, n1, n2;
+// Everything the shade pass needs to know about a surface's MATERIAL, and nothing about
+// its geometry. Split out of PTri so that a per-hit `mix` (below) can swap the whole
+// payload per PIXEL: the two children of a weight-mapped mix differ in albedo, skin and
+// pattern drives all at once, so they have to travel together rather than as loose fields.
+struct PShade {
     Vec3 color;
-    // Per-vertex texture coordinates (u in .x, v in .y). Only meaningful when tex >= 0.
-    Vec3 uv0{0, 0, 0}, uv1{0, 0, 0}, uv2{0, 0, 0};
     int  tex = -1;           // index into the scene texture table, or -1 (flat `color`)
     double triplanarScale = 0.0;  // >0: sample the texture by world triplanar, not UV
     // Scalar pattern drives (index into Scene::patterns, or -1). Evaluated per pixel in
@@ -69,6 +71,56 @@ struct PTri {
     bool emissive = false;
     bool clear    = false;   // dielectric/thin-film/filter surface (see-through mode dims/hazes it)
 };
+
+// A two-child `mix` whose blend is driven per hit by `weight_map pattern:` /
+// `weight_map texture:` — a spatial A/B selection, not a constant weight, so it cannot be
+// resolved once at bake time. The preview stores the LOSING child's payload here and picks
+// between it and the triangle's own (the winning-at-t>=0.5 child) per pixel, which is
+// exactly what the deterministic Whitted preview does in mixResolveDominant(): a hard
+// threshold at t == 0.5 rather than a stochastic dither, so raster and -mode W agree.
+//
+// One entry per MATERIAL, not per triangle — the payload is material-derived, so a scene
+// with three weight-mapped mixes has three entries no matter how many triangles carry them.
+// That keeps PTri one int larger instead of doubling its shading half.
+struct PMix {
+    int    weightPat = -1;   // Scene::patterns index driving child-0's share, or -1
+    int    weightTex = -1;   // ...or a scalar texture (`weight_map texture:`), or -1
+    PShade b;                // the child-1 payload, shown where the weight evaluates < 0.5
+};
+
+// One preview triangle: world-space positions + per-vertex world normals + the material
+// payload it was baked with (inherited, so `t.color` / `t.tex` still read as before).
+struct PTri : PShade {
+    Vec3 p0, p1, p2;
+    Vec3 n0, n1, n2;
+    // Per-vertex texture coordinates (u in .x, v in .y). Only meaningful when tex >= 0.
+    Vec3 uv0{0, 0, 0}, uv1{0, 0, 0}, uv2{0, 0, 0};
+    int  mix = -1;           // index into PreviewGeom::mixes for a per-hit mix, else -1
+};
+
+// Tessellated preview geometry plus the side tables its triangles index. Bundled so the
+// two cannot be handed around separately and fall out of sync: a PTri's `mix` index is
+// only meaningful against the `mixes` built in the same tessellate() call.
+struct PreviewGeom {
+    std::vector<PTri> tris;
+    std::vector<PMix> mixes;
+    void clear() { tris.clear(); mixes.clear(); }
+    bool empty() const { return tris.empty(); }
+    size_t size() const { return tris.size(); }
+};
+
+// The per-hit mix weight at a shaded pixel: the pattern or texture bound to `weight_map`,
+// clamped to [0,1], giving child 0's share. Mirrors mixResolveDominant()'s evaluation so
+// the preview and -mode W threshold on the same number.
+inline double previewMixWeight(const PMix& mx, const Scene& sc, const PatCtx& pc,
+                               double u, double v) {
+    double t = 0.0;
+    if (mx.weightPat >= 0 && mx.weightPat < (int)sc.patterns.size())
+        t = sc.patterns[mx.weightPat].eval(pc);
+    else if (mx.weightTex >= 0 && mx.weightTex < (int)sc.textures.size())
+        t = sc.textures[mx.weightTex].scalarAt(u, v);
+    return (t < 0.0) ? 0.0 : (t > 1.0 ? 1.0 : t);
+}
 
 // Per-triangle tangent for normal mapping, derived from the UV gradient (the standard
 // dP/dU construction) and then Gram-Schmidt'd against the shading normal. Returns a
@@ -228,19 +280,52 @@ inline PreviewLight deriveLight(const Scene& sc) {
 // about to be marched: progress(done, total) where `total` is the implicit count and
 // `done` runs 0..total (0 before the first, total after the last). Marching implicits
 // is by far the slow part of tessellation, so this drives the "tessellating N/M" UI.
-inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
-                                    const std::function<void(int, int)>& progress = {}) {
-    std::vector<PTri> out;
-    // Precompute one solid colour per material.
-    std::vector<Vec3> matCol(sc.mats.size());
-    std::vector<char>  matEmit(sc.mats.size(), 0);
-    std::vector<char>  matClear(sc.mats.size(), 0);
-    std::vector<int>   matTex(sc.mats.size(), -1);   // bound reflectTex (image skin) or -1
-    std::vector<double> matTri(sc.mats.size(), 0.0); // triplanar scale (0 = per-vertex UV)
-    std::vector<int>   matRPat(sc.mats.size(), -1);  // reflect-slot scalar pattern, or -1
-    std::vector<int>   matEPat(sc.mats.size(), -1);  // emit-slot scalar pattern, or -1
-    std::vector<int>   matNrm(sc.mats.size(), -1);   // tangent-space normal map, or -1
-    std::vector<double> matNrmS(sc.mats.size(), 1.0);
+inline PreviewGeom tessellate(const Scene& sc, int isoRes,
+                              const std::function<void(int, int)>& progress = {}) {
+    PreviewGeom geom;
+    std::vector<PTri>& out = geom.tris;
+    // One baked shading payload per material (was a fistful of parallel arrays; a single
+    // PShade keeps them from drifting apart and lets the mix table below reuse them).
+    std::vector<PShade> matSh(sc.mats.size());
+    std::vector<int>    matMix(sc.mats.size(), -1);  // index into geom.mixes, or -1
+    PShade fallback;                                  // unknown/out-of-range material
+    fallback.color = Vec3{0.6, 0.6, 0.6};
+
+    // Bake ONE material's own preview payload. No mix resolution here — the callers below
+    // decide which material to bake, so this stays a pure Material -> PShade function.
+    auto bakeOwn = [&](const Material& m) -> PShade {
+        PShade s;
+        bool em = false;
+        s.color    = materialColor(m, em);
+        s.emissive = em;
+        s.clear    = (!m.isLight && isClearPreviewType(m.type));
+        // An image skin: a diffuse-albedo texture bound via `reflect texture:<name>`.
+        // The preview shades from the texture's linear RGB (Texture::sampleRgb), so no
+        // Jakob-Hanika coefficient precompute is needed (that's only for spectral hits).
+        // Palette (indexed) maps are included: sampleRgb resolves the index through
+        // Texture::paletteRgb rather than shading with the raw index byte.
+        // Emitters are still excluded, and deliberately: emission is an SPD plus an
+        // optional `emit_map pattern:` — there is NO textured-emission slot in the
+        // material model, so a `reflect texture:` on a light means nothing to the tracer
+        // and previewing it would invent detail the real render does not have. Spatially
+        // varying emission is previewed through emitPat below, which IS the real mechanism.
+        int rt = m.reflectTex;
+        if (!m.isLight && rt >= 0 && rt < (int)sc.textures.size() && sc.textures[rt].valid()) {
+            s.tex = rt;
+            s.triplanarScale = m.triplanarScale;
+        }
+        // Scalar pattern drives. `reflect pattern:` / `reflect_map pattern:` both land in
+        // reflectPat and multiply the albedo; `emit pattern:` / `emit_map pattern:` land
+        // in emitPat and multiply the emission. Same slots, same clamp, as the tracer.
+        s.reflectPat = m.reflectPat;
+        s.emitPat    = m.emitPat;
+        if (m.normalTex >= 0 && m.normalTex < (int)sc.textures.size() &&
+            sc.textures[m.normalTex].valid()) {
+            s.normalTex      = m.normalTex;
+            s.normalStrength = m.normalStrength;
+        }
+        return s;
+    };
     // A Mix material has no shading of its own — it selects among child materials, so its
     // own `reflect` slot is normally unset and previewing it shows a flat default grey.
     // Resolve to the HEAVIEST child via mixDominantChild, which is exactly what the
@@ -260,70 +345,42 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
         }
         return cur;
     };
+    // Pass 1 — every material, previewed through its CONSTANT-weight mix chain.
+    for (size_t i = 0; i < sc.mats.size(); ++i)
+        matSh[i] = bakeOwn(sc.mats[resolveMix(i)]);
+    // Pass 2 — upgrade the two-child mixes whose blend is driven per hit by `weight_map`.
+    // Pass 1 collapsed these to whichever child had the larger CONSTANT weight (usually a
+    // 50/50 tie, so always child 0), which is why a weight-mapped mix previewed as one flat
+    // colour while -mode W showed the mask. Now child 0 rides on the triangle and child 1
+    // goes in the side table, to be chosen per pixel at the t == 0.5 threshold.
+    //
+    // A child that is ITSELF a weight-mapped mix still flattens (matSh[child] is that
+    // child's own dominant collapse): nesting one spatial mask inside another would need a
+    // recursive per-pixel walk, and no scene in the library does it.
     for (size_t i = 0; i < sc.mats.size(); ++i) {
-        // Preview a mix through its dominant child, so its skin/pattern show too.
-        const Material& m = sc.mats[resolveMix(i)];
-        bool em = false;
-        matCol[i] = materialColor(m, em);
-        matEmit[i] = em ? 1 : 0;
-        matClear[i] = (!m.isLight && isClearPreviewType(m.type)) ? 1 : 0;
-        // An image skin: a diffuse-albedo texture bound via `reflect texture:<name>`.
-        // The preview shades from the texture's linear RGB (Texture::sampleRgb), so no
-        // Jakob-Hanika coefficient precompute is needed (that's only for spectral hits).
-        // Palette (indexed) maps are included: sampleRgb resolves the index through
-        // Texture::paletteRgb rather than shading with the raw index byte.
-        // Emitters are still excluded, and deliberately: emission is an SPD plus an
-        // optional `emit_map pattern:` — there is NO textured-emission slot in the
-        // material model, so a `reflect texture:` on a light means nothing to the tracer
-        // and previewing it would invent detail the real render does not have. Spatially
-        // varying emission is previewed through emitPat below, which IS the real mechanism.
-        int rt = m.reflectTex;
-        if (!m.isLight && rt >= 0 && rt < (int)sc.textures.size() && sc.textures[rt].valid()) {
-            matTex[i] = rt;
-            matTri[i] = m.triplanarScale;
-        }
-        // Scalar pattern drives. `reflect pattern:` / `reflect_map pattern:` both land in
-        // reflectPat and multiply the albedo; `emit pattern:` / `emit_map pattern:` land
-        // in emitPat and multiply the emission. Same slots, same clamp, as the tracer.
-        matRPat[i] = m.reflectPat;
-        matEPat[i] = m.emitPat;
-        if (m.normalTex >= 0 && m.normalTex < (int)sc.textures.size() &&
-            sc.textures[m.normalTex].valid()) {
-            matNrm[i]  = m.normalTex;
-            matNrmS[i] = m.normalStrength;
-        }
+        const Material& m = sc.mats[i];
+        if (m.mixChildren.size() != 2) continue;
+        if (m.mixWeightPat < 0 && m.mixWeightTex < 0) continue;
+        const int c0 = m.mixChildren[0], c1 = m.mixChildren[1];
+        const int n  = (int)sc.mats.size();
+        if (c0 < 0 || c0 >= n || c1 < 0 || c1 >= n) continue;
+        PMix mx;
+        mx.weightPat = m.mixWeightPat;
+        mx.weightTex = m.mixWeightTex;
+        mx.b         = matSh[c1];          // shown where the weight evaluates < 0.5
+        matMix[i]    = (int)geom.mixes.size();
+        geom.mixes.push_back(mx);
+        matSh[i]     = matSh[c0];          // ...and child 0 where it is >= 0.5
     }
-    auto colOf = [&](int matId) -> Vec3 {
-        return (matId >= 0 && matId < (int)matCol.size()) ? matCol[matId] : Vec3{0.6, 0.6, 0.6};
-    };
-    auto emOf = [&](int matId) -> bool {
-        return (matId >= 0 && matId < (int)matEmit.size()) && matEmit[matId];
-    };
-    auto clearOf = [&](int matId) -> bool {
-        return (matId >= 0 && matId < (int)matClear.size()) && matClear[matId];
-    };
-    auto texOf = [&](int matId) -> int {
-        return (matId >= 0 && matId < (int)matTex.size()) ? matTex[matId] : -1;
-    };
-    auto triOf = [&](int matId) -> double {
-        return (matId >= 0 && matId < (int)matTri.size()) ? matTri[matId] : 0.0;
-    };
     // Stamp EVERY material-derived field onto a triangle in one place. Each geometry kind
     // below (world tris, spheres, implicits, instances) calls exactly this, so adding a
     // per-material preview feature can no longer be wired into three of the four paths and
     // silently dropped on the fourth — which is how marched implicits ended up unable to
     // show a skin at all. Only the UV SOURCE differs per kind, and that stays local.
     auto applyMat = [&](PTri& p, int matId) {
-        p.color    = colOf(matId);
-        p.emissive = emOf(matId);
-        p.clear    = clearOf(matId);
-        p.tex      = texOf(matId);
-        p.triplanarScale = triOf(matId);
-        const bool ok = matId >= 0 && matId < (int)matRPat.size();
-        p.reflectPat = ok ? matRPat[matId] : -1;
-        p.emitPat    = ok ? matEPat[matId] : -1;
-        p.normalTex  = ok ? matNrm[matId]  : -1;
-        p.normalStrength = ok ? matNrmS[matId] : 1.0;
+        const bool ok = matId >= 0 && matId < (int)matSh.size();
+        static_cast<PShade&>(p) = ok ? matSh[matId] : fallback;
+        p.mix = ok ? matMix[matId] : -1;
     };
 
     // (1) World triangles.
@@ -515,7 +572,7 @@ inline std::vector<PTri> tessellate(const Scene& sc, int isoRes,
             out.push_back(p);
         }
     }
-    return out;
+    return geom;   // `out` aliases geom.tris; geom.mixes was filled during the material bake
 }
 
 // A vertex after transform to camera space, carrying the attributes we interpolate.
@@ -966,12 +1023,16 @@ inline std::vector<uint8_t> exposeAndEncode(
 //   * `lockAnchor` (optional) shares one auto-exposure anchor across a camera_path's
 //     frames: >0 reuses the stored anchor (no flicker on a dolly), ==0 writes the
 //     freshly-computed one back for later frames, null => per-frame auto-exposure.
-inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Camera& cam,
+inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& cam,
                                         int W, int H, const PreviewLight& light,
                                         int nThreads, double exposure = 1.0,
                                         bool autoExpose = true, double* lockAnchor = nullptr,
                                         bool seeThrough = false, double glassClarity = 0.85,
                                         const Scene* scenePtr = nullptr) {
+    // Geometry and its side tables arrive together (a PTri's `mix` index is only meaningful
+    // against the mixes built alongside it), then are aliased for the passes below.
+    const std::vector<PTri>& tris  = geom.tris;
+    const std::vector<PMix>& mixes = geom.mixes;
     // The shade pass needs more of the Scene than just its textures: scalar patterns are
     // evaluated per pixel and the pattern VM reads the scene's `grid:`/`scatter:` tables
     // through bindPatScene. Passing the Scene (rather than a texture vector) is what lets
@@ -1040,8 +1101,12 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
             // normal map, or a scalar pattern (patterns get u/v in their context, and a
             // `[0 1](u)` ramp is exactly a UV read). Triplanar skins sample from world
             // position instead, but a pattern on the same material may still want UVs.
+            // A per-hit `mix` ALWAYS needs them: the mask is sampled at (u,v) whether it
+            // is a pattern (u/v live in its context) or a scalar texture, and the child
+            // payload it may swap in can carry a skin/normal map/pattern of its own.
             const bool needUV = (t.tex >= 0 && t.triplanarScale <= 0.0) ||
-                                t.normalTex >= 0 || t.reflectPat >= 0 || t.emitPat >= 0;
+                                t.normalTex >= 0 || t.reflectPat >= 0 || t.emitPat >= 0 ||
+                                t.mix >= 0;
             VtxCS cs[3] = { toCS(t.p0, back ? -t.n0 : t.n0, t.uv0),
                             toCS(t.p1, back ? -t.n1 : t.n1, t.uv1),
                             toCS(t.p2, back ? -t.n2 : t.n2, t.uv2) };
@@ -1168,26 +1233,45 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
             const int si = g.tri[i];
             if (si < 0 || si >= (int)tris.size()) continue;
             const PTri& pt = tris[si];
-            Vec3 col = pt.color;
+            // The PatCtx the tracer builds at a hit (world point, oriented normal, u, v —
+            // and fieldVal 0, which is exact here because an isosurface's marched vertices
+            // lie on the level set). Built at most ONCE per pixel and only when something
+            // actually needs it, since most surfaces have neither a mix mask nor a pattern.
+            PatCtx pc;
+            bool   pcReady = false;
+            auto   ctx = [&]() -> const PatCtx& {
+                if (!pcReady) {
+                    pc = makePatCtx(g.wpos[i], 0.0, normalize(g.wn[i]),
+                                    g.uv[i].x, g.uv[i].y);
+                    bindPatScene(pc, *scenePtr);
+                    pcReady = true;
+                }
+                return pc;
+            };
+            // A `weight_map`-driven two-child mix selects a WHOLE material payload per
+            // pixel — albedo, skin and pattern drives together — so resolve it before
+            // reading any of them. Hard threshold at 0.5, exactly as mixResolveDominant().
+            const PShade* sh = &pt;
+            if (scenePtr && pt.mix >= 0 && pt.mix < (int)mixes.size()) {
+                const PMix& mx = mixes[pt.mix];
+                if (previewMixWeight(mx, *scenePtr, ctx(), g.uv[i].x, g.uv[i].y) < 0.5)
+                    sh = &mx.b;
+            }
+            Vec3 col = sh->color;
             // Image skin: replace the flat albedo with the texture's linear RGB, sampled
             // either at the interpolated per-vertex UV or by world triplanar projection.
-            if (textures && pt.tex >= 0 && pt.tex < (int)textures->size()) {
-                const Texture& tx = (*textures)[pt.tex];
-                col = (pt.triplanarScale > 0.0)
-                    ? tx.sampleRgbTriplanar(g.wpos[i], g.wn[i], pt.triplanarScale)
+            if (textures && sh->tex >= 0 && sh->tex < (int)textures->size()) {
+                const Texture& tx = (*textures)[sh->tex];
+                col = (sh->triplanarScale > 0.0)
+                    ? tx.sampleRgbTriplanar(g.wpos[i], g.wn[i], sh->triplanarScale)
                     : tx.sampleRgb(g.uv[i].x, g.uv[i].y);
             }
-            // Scalar pattern drives, evaluated with the SAME PatCtx the tracer builds at a
-            // hit (world point, oriented normal, u, v — and fieldVal 0, which is exact here
-            // because an isosurface's marched vertices lie on the level set). A bound
-            // pattern multiplies its slot and is clamped to [0,1], mirroring slotPatMul.
-            if (scenePtr && (pt.reflectPat >= 0 || pt.emitPat >= 0)) {
-                PatCtx pc = makePatCtx(g.wpos[i], 0.0, normalize(g.wn[i]),
-                                       g.uv[i].x, g.uv[i].y);
-                bindPatScene(pc, *scenePtr);
-                const int slot = g.emis[i] ? pt.emitPat : pt.reflectPat;
+            // Scalar pattern drives. A bound pattern multiplies its slot and is clamped to
+            // [0,1], mirroring slotPatMul.
+            if (scenePtr && (sh->reflectPat >= 0 || sh->emitPat >= 0)) {
+                const int slot = g.emis[i] ? sh->emitPat : sh->reflectPat;
                 if (slot >= 0 && slot < (int)scenePtr->patterns.size()) {
-                    double p = scenePtr->patterns[slot].eval(pc);
+                    double p = scenePtr->patterns[slot].eval(ctx());
                     col = col * (p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p));
                 }
             }
@@ -1201,14 +1285,14 @@ inline std::vector<uint8_t> renderFrame(const std::vector<PTri>& tris, const Cam
             // frame is derived from the UV gradient the same way the mesh loader would:
             // an arbitrary but stable basis about N when UVs are degenerate. Perturbing
             // here (not in the G-buffer) keeps the pass-2 inner loop untouched.
-            if (textures && pt.normalTex >= 0 && pt.normalTex < (int)textures->size()) {
-                const Texture& nx = (*textures)[pt.normalTex];
+            if (textures && sh->normalTex >= 0 && sh->normalTex < (int)textures->size()) {
+                const Texture& nx = (*textures)[sh->normalTex];
                 if (nx.valid()) {
                     Vec3 T = triTangent(pt, N3);
                     if (dot(T, T) > 1e-18) {
                         Vec3 B3 = cross(N3, T);
                         Vec3 tn = nx.sampleNormalTS(g.uv[i].x, g.uv[i].y);
-                        double s3 = pt.normalStrength;
+                        double s3 = sh->normalStrength;
                         Vec3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + N3 * tn.z;
                         double pl = std::sqrt(dot(pert, pert));
                         if (pl > 1e-12) N3 = pert * (1.0 / pl);

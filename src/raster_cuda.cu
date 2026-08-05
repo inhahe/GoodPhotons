@@ -143,6 +143,28 @@ struct DPTri {
     float  normalStrength;  // XY scale applied to the sampled tangent-space normal
     int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
     int    emitPat;         // scalar `pattern` masking the emission, or -1
+    int    mix;             // index into the DMix table for a per-hit mix, else -1
+};
+
+// Device twin of raster.h's PMix: the LOSING half of a two-child `mix` whose blend is
+// driven per hit by `weight_map pattern:` / `weight_map texture:`. kShade evaluates the
+// mask at the shaded point and, below the 0.5 threshold, swaps these fields in over the
+// ones it unpacked from the triangle — the same hard threshold the CPU preview and
+// -mode W's mixResolveDominant() use, so all three agree on where the boundary falls.
+//
+// `emissive` and `clear` are deliberately absent: both are decided per TRIANGLE in
+// kProject (they steer visibility, the see-through pass and the auto-exposure anchor,
+// none of which is a per-pixel decision here), so a mix takes them from its child 0.
+struct DMix {
+    int    weightPat;       // device pattern index driving child 0's share, or -1
+    int    weightTex;       // ...or a scalar texture index, or -1
+    float3 color;
+    int    tex;
+    float  triplanarScale;
+    int    normalTex;
+    float  normalStrength;
+    int    reflectPat;
+    int    emitPat;
 };
 
 // A device image texture (linear RGB), mirroring raster.h's use of Texture::sampleRgb /
@@ -799,7 +821,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
                        DCam cam, int W, int H, float3 bg, float emisBoost,
                        const DTex* texMeta, const float3* texels, int nTex,
                        const PatNode* patNodes, const DPattern* patterns, int nPatterns,
-                       DPatEnv patEnv,
+                       DPatEnv patEnv, const DMix* mixes, int nMixes,
                        float3* accum, float* zbuf, unsigned char* emis) {
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (unsigned long long)W * H) return;
@@ -856,6 +878,33 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // Perspective-correct UV, needed by the skin, the normal map and the pattern VM alike.
     float uu = (uv0.x * (w0 * t.invd0) + uv1.x * (w1 * t.invd1) + uv2.x * (w2 * t.invd2)) * d;
     float vv = (uv0.y * (w0 * t.invd0) + uv1.y * (w1 * t.invd1) + uv2.y * (w2 * t.invd2)) * d;
+
+    // Per-hit `mix`: a `weight_map` selects between two whole material payloads at every
+    // point, so it must be resolved before anything below reads one. The mix index is
+    // material-derived, hence identical for a clipped slot and its source triangle —
+    // so it is read from the source either way (slot >> 1), needing no room in DAttr.
+    // Evaluated here, after the perspective-correct wpos/normal/UV the mask samples at.
+    const int mixId = tris[slot >> 1].mix;
+    if (mixId >= 0 && mixId < nMixes && mixes) {
+        const DMix& mx = mixes[mixId];
+        double wt = 0.0;
+        if (mx.weightPat >= 0 && mx.weightPat < nPatterns && patNodes) {
+            const DPattern& wp = patterns[mx.weightPat];
+            float3 pn = normalize3(wn);
+            double qx = wpos.x, qy = wpos.y, qz = wpos.z;
+            double qr = sqrt(qx * qx + qy * qy + qz * qz);
+            wt = dPatternEval(patNodes + wp.off, wp.n, qx, qy, qz, 0.0,
+                              pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, patEnv);
+        } else if (mx.weightTex >= 0 && mx.weightTex < nTex) {
+            wt = texMeta[mx.weightTex].patScalarAt((double)uu, (double)vv);
+        }
+        wt = fmin(1.0, fmax(0.0, wt));
+        if (wt < 0.5) {                       // child 1 wins here — swap its payload in
+            color = mx.color; tex = mx.tex; tps = mx.triplanarScale;
+            nrmTex = mx.normalTex; nrmS = mx.normalStrength;
+            rPat = mx.reflectPat; ePat = mx.emitPat;
+        }
+    }
 
     // Image skin: replace the flat albedo with the texture's linear RGB, sampled either at
     // the interpolated per-vertex UV or by world triplanar projection (mirrors raster.h P3).
@@ -1159,6 +1208,9 @@ struct Scene {
     int          nScatters = 0;
     float*       ddataPool = nullptr;
     int          nDataPool = 0;
+    // Per-hit `mix` side table (one entry per weight-mapped mix MATERIAL, not per triangle).
+    DMix*        dmixes    = nullptr;
+    int          nMixes    = 0;
     // Per-pixel scratch (sized to the largest W*H seen).
     unsigned long long* vis    = nullptr;
     float3*             accum  = nullptr;
@@ -1242,6 +1294,7 @@ void destroy(Scene* sc) {
     if (sc->dgrids)    cudaFree(sc->dgrids);
     if (sc->dscatters) cudaFree(sc->dscatters);
     if (sc->ddataPool) cudaFree(sc->ddataPool);
+    if (sc->dmixes)    cudaFree(sc->dmixes);
     if (sc->vis)      cudaFree(sc->vis);
     if (sc->accum)    cudaFree(sc->accum);
     if (sc->zbuf)     cudaFree(sc->zbuf);
@@ -1262,8 +1315,9 @@ void destroy(Scene* sc) {
     delete sc;
 }
 
-Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight& light,
+Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light,
               const ::Scene* scene) {
+    const std::vector<raster::PTri>& tris = geom.tris;
     if (!available() || tris.empty()) return nullptr;
     Scene* sc = new Scene();
     sc->nTris = (int)tris.size();
@@ -1288,7 +1342,25 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
         d.normalStrength = (float)t.normalStrength;
         d.reflectPat = t.reflectPat;
         d.emitPat    = t.emitPat;
+        d.mix        = t.mix;
     }
+    // Bake the per-hit `mix` side table (raster.h's PMix -> DMix). One entry per
+    // weight-mapped mix MATERIAL, so this stays tiny however many triangles index it.
+    std::vector<DMix> hmix(geom.mixes.size());
+    for (size_t i = 0; i < geom.mixes.size(); ++i) {
+        const raster::PMix& m = geom.mixes[i];
+        DMix& d = hmix[i];
+        d.weightPat = m.weightPat;
+        d.weightTex = m.weightTex;
+        d.color = toF3(m.b.color);
+        d.tex   = m.b.tex;
+        d.triplanarScale = (float)m.b.triplanarScale;
+        d.normalTex      = m.b.normalTex;
+        d.normalStrength = (float)m.b.normalStrength;
+        d.reflectPat     = m.b.reflectPat;
+        d.emitPat        = m.b.emitPat;
+    }
+    sc->nMixes = (int)hmix.size();
     // Bake image-skin textures: flatten every texture's LINEAR rgb into one shared texel
     // array, plus per-texture metadata (dims/filter/wrap/offset). Sampling on the device
     // mirrors Texture::sampleRgb / sampleRgbTriplanar exactly.
@@ -1386,6 +1458,8 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
         ok = tryMalloc((void**)&sc->dscatters, sizeof(PatScatter) * scene->scatters.size());
     if (ok && scene && !scene->dataPool.empty())
         ok = tryMalloc((void**)&sc->ddataPool, sizeof(float) * scene->dataPool.size());
+    if (ok && !hmix.empty())
+        ok = tryMalloc((void**)&sc->dmixes, sizeof(DMix) * hmix.size());
     if (!ok) { destroy(sc); return nullptr; }
 
     // The pattern VM reaches a texture through DTex::patScalarAt, which has no texel-array
@@ -1427,6 +1501,9 @@ Scene* upload(const std::vector<raster::PTri>& tris, const raster::PreviewLight&
                        sizeof(float) * scene->dataPool.size(),
                        cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
     }
+    if (!hmix.empty() &&
+        cudaMemcpy(sc->dmixes, hmix.data(), sizeof(DMix) * hmix.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
     // The EXACT sRGB table bytes the host tonemap indexes — sharing it is part of the
     // byte-identity guarantee of the device tonemap (see kToneMap / encodeSrgb).
     if (cudaMemcpy(sc->dlut, raster::srgbLut8().data(), raster::srgbLut8().size(),
@@ -1560,6 +1637,7 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
                           sc->ambient, sc->keyScale, sc->fill, dc, W, H, bg, EMIS_BOOST,
                           sc->dtexMeta, sc->dtexels, sc->nTex,
                           sc->dpatNodes, sc->dpatterns, sc->nPatterns, patEnvOf(*sc),
+                          sc->dmixes, sc->nMixes,
                           sc->accum, sc->zbuf, sc->emis);
     rec(4);
 

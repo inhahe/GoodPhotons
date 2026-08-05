@@ -7682,7 +7682,7 @@ static int run(int argc, char** argv) {
         }
 
         raster::PreviewLight plight = raster::deriveLight(scene);
-        std::vector<raster::PTri> prims;   // tessellated lazily (empty in pure GPU-iso mode)
+        raster::PreviewGeom prims;         // tessellated lazily (empty in pure GPU-iso mode)
         bool tessellated = false;
         // Tessellate on demand: the CPU / GPU-triangle path calls this immediately; the GPU
         // iso path skips it entirely and only tessellates if a frame must fall back (e.g. a

@@ -514,6 +514,11 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 >   triangle's UV-derived tangent frame, so surface relief shows.
 > * **`mix` / layered materials** — previewed as their dominant child (the same
 >   choice the deterministic `-mode W` viewer makes) rather than the parent's colour.
+> * **`mix` blend masks** — a two-child `mix` carrying a `weight_map texture:` /
+>   `weight_map pattern:` is instead resolved **per pixel**, hard-thresholded at ½
+>   exactly as `-mode W` does, and the winning child's *whole* payload (albedo, skin,
+>   normal map, pattern drives) is swapped in. So a wear mask, decal or painted A/B
+>   blend previews as the spatial pattern it is, not as one flat winner.
 >
 > Roughness and film-thickness maps are deliberately *not* previewed: the preview
 > has no glossy lobe for them to drive. Shading sums a diffuse term from **every**

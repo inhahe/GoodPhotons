@@ -2327,7 +2327,7 @@ in the clear pass, which *multiplies* into `clearT`/`milkT` — a doubly-covered
 darken a seam twice, an uncovered one leaves a hairline of un-tinted glass. Costs ~4% on the
 CPU rasterizer; GPU unchanged. History and measurements in `known-issues.md`.
 
-## Preview shading model (`raster.h` + `raster_cuda.cu`, 0.135.0)
+## Preview shading model (`raster.h` + `raster_cuda.cu`, 0.135.0; per-hit mix 0.136.0)
 
 The preview has no light transport, so nothing that needs a *second* bounce — reflection,
 refraction, shadows, GI, glossy lobes — can exist in it. But everything that determines a
@@ -2342,6 +2342,7 @@ identical set, because they share the bake (`raster::tessellate`) and mirror the
 | `emit pattern:` / `emit_map pattern:` | Scalar clamped to [0,1], multiplies the **emission** |
 | `normal_map` | Perturbs the shading normal through the triangle's UV-derived TBN |
 | `mix` / layered material | Resolved to its dominant child (`mixDominantChild`) |
+| 2-child `mix` + `weight_map texture:`/`pattern:` | Resolved **per pixel**: the mask is sampled at the shaded point and hard-thresholded at ½, exactly as `mixResolveDominant`, and the winning child's whole payload is swapped in |
 | `roughness_map`, `film_thickness` maps | Ignored **by design** — a preview has no glossy lobe for them to drive |
 | Textured light | No such slot exists in the language; a light's look is its SPD × `emit_map pattern:` |
 
@@ -2361,6 +2362,32 @@ Design points worth keeping:
   the hit and never sees the 1.0→0.0 wrap, but the rasterizer *interpolates*, so a
   triangle straddling the seam would run `u` backwards across the entire texture. Any
   triangle whose `u` spread exceeds 0.5 has its low corners lifted by +1.
+- **A `weight_map` mix is a PER-PIXEL material swap, not a per-material choice** (0.136.0).
+  `mixDominantChild` only compares the *constant* weights, so a weight-mapped mix (always
+  50/50, hence always child 0) previewed as one flat winner while `-mode W` — which calls
+  `mixResolveDominant` and evaluates the mask at the hit — showed the blend. That broke
+  `raster.h`'s own stated invariant that "raster and mode W agree on what a mix looks
+  like". The fix splits `PTri`'s material payload into a base `PShade` and adds a `PMix`
+  side table (`PreviewGeom::mixes`, indexed by `PTri::mix`); the shade pass evaluates the
+  mask and, below ½, repoints `const PShade* sh` at the loser's payload — so albedo, skin,
+  normal map and pattern drives all switch together. Key consequences:
+  - **Per MATERIAL, not per triangle.** Inlining a second payload in `PTri` would add ~58 B
+    to a ~276 B struct (~+120 MB on a 2 M-triangle scene); the side table has one entry per
+    weight-mapped mix however many triangles carry it.
+  - **`PTri : PShade` by inheritance**, so every existing `pt.color` / `t.tex` reference in
+    both backends still compiles. Safe because `PTri` is only ever default-constructed.
+  - **Geometry and side table travel together** as `PreviewGeom` — a `PTri::mix` index is
+    only meaningful against the `mixes` built in the same `tessellate()` call.
+  - **`emissive` and `clear` deliberately come from child 0 only.** `g.emis` is written in
+    the raster pass and consumed by auto-exposure *before* shading, and `clear` steers the
+    separate see-through composite pass; neither can vary per pixel.
+  - **`needUV` must include `mix >= 0`.** The mask is sampled at (u,v) whether it is a
+    pattern or a scalar texture. Missing this was the whole visible bug on the first cut:
+    `pattern_tex.ftsl` previewed with `u=v=0`, so its two `tex:`-driven walls came out flat
+    and only the floor (which also reads world `x`) showed any structure. The GPU twin
+    interpolates UVs unconditionally and needed no equivalent change.
+  - A child that is *itself* a weight-mapped mix still flattens — no recursive per-pixel
+    walk, and no scene in the library nests them.
 - **One `applyMat()` assigns every per-material field**, called from all four geometry
   paths (world tris, spheres, implicits, instances). The class of bug being closed is a
   feature wired into three paths and silently dropped on the fourth.
@@ -2384,7 +2411,11 @@ CPU/GPU parity is verified on `gallery_rain`: of 1.17 M pixels, 6247 (0.54%) dif
 more than 2/255, and every one of them lies on a grid-line boundary — the pattern is a
 hard step, the CPU evaluates it at a double-precision world position and the GPU at a
 float one, so a sub-texel shift flips a pixel across the step. Mean absolute difference
-over the frame is 0.12/255.
+over the frame is 0.12/255. The per-hit mix agrees to the same tolerance and for the same
+reason (the ½ threshold is another hard step): `pattern_tex.ftsl` 0.076% of pixels over
+2/255, `maskblend.ftsl` (a `weight_map texture:`) 0.068%, `_preview_pattern_tex.ftsl`
+0.083% — unchanged from before the mix work, i.e. no regression. Both raster backends now
+reproduce `-mode W`'s image of all three `pattern_tex` walls.
 
 ## GPU raster pipeline (`raster_cuda.cu`)
 
