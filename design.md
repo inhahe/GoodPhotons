@@ -1648,7 +1648,14 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       filled far better by the axicon (spread 0.211, fan 0.51) than any gyroid could, the room
       already has a *spherical* gyroid in gold, and a slab buys silhouette variety on top.
       Moving the clip also moves the `function`'s `translate` — the lattice phase is anchored at
-      the piece centre, and 0.40 m is 0.64 of a period.
+      the piece centre, and 0.40 m is 0.64 of a period. **And changing a clip is a layout
+      change**: the slab is wider on screen and, because its optimum drop is 0.50 rather than
+      0.90, it sits 0.40 m lower, which more than doubled its silhouette overlap with the
+      axicon standing in front of it (85 × 62 px for the ball → 114 × 112 px for the slab,
+      `scraps/_proj.py`). Fixing that cost a documented +0.30 m override on `gallery_rain`'s
+      otherwise formulaic radial spread plus a 0.25 m re-centring of the exhibit's cap — the
+      only direction with any room, since −z runs the flyby into the piece (clearance
+      0.252 → 0.037 m) and moving the axicon instead throws it off the left edge of the frame.
     - **Beware ranking pieces across resolutions.** `coverage` is a cell count and is
       resolution-stable (the solid gyroid: 0.35 % at 480 px, 0.37 % at 960 px), but `spread` is
       **not** — same piece, 0.014 at 480 px against 0.060 at 960 px — because it is computed

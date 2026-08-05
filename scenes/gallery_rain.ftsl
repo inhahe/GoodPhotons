@@ -449,7 +449,7 @@ quad { origin -18 0 -19   u 0 0 45   v 46 0 0   material gridground }
 #
 #     exhibit    was (x,z)      offset          now (x,z)
 #     gyroid     5.00 4.80    ( 0.00, +1.25)   5.00 6.05
-#     gem        3.50 3.60    (-0.90, +0.55)   2.60 4.15
+#     gem        3.50 3.60    (-0.60, +0.55)   2.90 4.15   <- +0.30 x off the rule; see below
 #     glass      6.70 3.50    (+1.00, +0.45)   7.70 3.95
 #     klein      5.90 2.60    (+0.55, -0.05)   6.45 2.55
 #     dumbbell   4.50 2.70    (-0.30,  0.00)   4.20 2.70
@@ -457,6 +457,24 @@ quad { origin -18 0 -19   u 0 0 45   v 46 0 0   material gridground }
 #     heart      4.60 1.90    (-0.25, -0.50)   4.35 1.40
 #     brass      6.00 1.84    (+0.60, -0.54)   6.60 1.30
 #     oil        5.30 1.50    (+0.20, -0.75)   5.50 0.75
+#
+# THE GEM IS THE ONE EXCEPTION, and it is deliberate. The rule would give it (-0.90, +0.55);
+# it takes (-0.60, +0.55), i.e. 0.30 m LESS spread in x than the formula. When its clip became
+# a 1 : 5/8 : 1 box (see the piece) it got wider on screen and 0.40 m lower, and it started to
+# run into the crystal axicon's silhouette in the still frame -- 122 x 80 px of overlap
+# against the ball's 93 x 30. Of the three ways out, this is the only one that costs nothing:
+#   * -z (pushing it deeper) shrinks it on screen AND runs it into the flyby, whose loop
+#     passes just in front of this piece -- clearance falls 0.252 -> 0.101 m at -0.35 and to
+#     0.037 m at -0.50, which is a graze;
+#   * moving the AXICON +z toward the camera does separate them (it swings left fast) but
+#     costs 150-270 px off the left edge of the frame, and its cap already overhangs there;
+#   * +x costs the flyby nothing at all (clearance is 0.252 m at either position) and does
+#     not change the piece's size. Its only obstacle was stand_dumbbell_cap at x 3.76, which
+#     the diamond cap ran into by 0.14 m -- paid for by re-centring that cap 0.25 m -x, which
+#     the box's much smaller and much less downwind caustic independently justifies.
+# So the formula is still how every OTHER exhibit got where it is, and this row is a
+# documented override rather than a silent drift. `scraps/_standaudit.py` and
+# `scraps/_flyplan.py` both pass at the new position.
 #
 # The x span goes 3.20 -> 5.10 m and the z span 3.30 -> 5.30 m while every piece keeps its
 # own size, which is what "farther apart" means: the pieces did not grow, the gaps did.
@@ -540,7 +558,7 @@ isosurface "stand_glass_cap" { material capmarble_orb
     box { center 6.7 0.81 3.05  size 1.1 0.18 1.7  round 0.02 } }
 }
 
-group { translate -0.90 0 0.55         # --- exhibit: CRYSTAL GYROID ---
+group { translate -0.60 0 0.55         # --- exhibit: CRYSTAL GYROID ---
 isosurface "stand_diamond" {   # tall thin jewel-column, cap top y=0.85
     material wirecage  union {
         difference {
@@ -564,14 +582,23 @@ isosurface "stand_diamond_cap" { material capmarble_gyroidx
     # metre of drop) put the core at (3.687, 2.719), most of a metre off the column. The box
     # clip sits at drop 0.50 instead, so the analytic core comes back to (3.604, 3.111) and
     # the metered patch -- core +0.10 / -0.20 from the piece axis, 90% of its light inside
-    # 0.71 x 0.45 m -- spans x 3.19..3.90, z 3.07..3.52. The cap is 1.7 x 1.8 centred at
-    # (3.65, 2.95), i.e. x 2.80..4.50, z 2.05..3.85, so the whole patch now lands comfortably
-    # inside with the outer filigree still on white rather than off the edge into the floor
-    # cage. It is DELIBERATELY not resized down to suit: the cap reads as a plinth for a
-    # 1 m piece, and cropping it to the caustic would make the exhibit look undersized.
-    # In world coordinates (this exhibit is displaced -0.90, +0.55 by the spread) the cap is
-    # x 1.90..3.60, z 2.60..4.40.
-    box { center 3.65 0.75 2.95  size 1.7 0.20 1.8  round 0.02 } }
+    # 0.71 x 0.45 m -- spans x 3.19..3.90, z 3.07..3.52, a THIRD of the area the old ball
+    # threw and much closer in. So the cap RE-CENTRES from (3.65, 2.95) to (3.40, 3.10),
+    # keeping its 1.7 x 1.8 size: it no longer has to trail a metre downwind to catch the
+    # patch, and it should sit under the piece instead. It is DELIBERATELY not resized DOWN
+    # to suit -- the cap reads as a plinth for a 1 m piece, and cropping it to the caustic
+    # would make the exhibit look undersized -- but the 0.25 m it gives up on the +x side is
+    # what pays for the exhibit's +0.30 m x nudge (see THE SPREAD): local x now ends at 4.25
+    # instead of 4.50, so after the nudge the cap's world +x edge lands at 3.65 and clears
+    # stand_dumbbell_cap (which starts at 3.76) by 0.11 m. At the un-nudged offset it would
+    # have overlapped it by 0.14 m, which is what `scraps/_standaudit.py` caught.
+    # New local span x 2.55..4.25, z 2.20..4.00. Against that the piece footprint is
+    # x 3.00..4.00 / z 3.10..4.10 (so the flat slab overhangs the front lip by only 0.10 m,
+    # where at the old centring it hung 0.25 m out -- invisible under a ball, obvious under
+    # a slab) and the patch clears every edge by 0.35 m or more. In world coordinates (this
+    # exhibit is displaced -0.60, +0.55 by the spread) the cap is x 1.95..3.65, z 2.75..4.55,
+    # which also keeps 0.22 m to stand_axicon_cap at z 4.77.
+    box { center 3.40 0.75 3.10  size 1.7 0.20 1.8  round 0.02 } }
 }
 
 group { translate 0.55 0 -0.05         # --- exhibit: KLEIN BOTTLE ---
@@ -751,20 +778,26 @@ isosurface "stand_oil_cap" { material capmarble_oil
 #          a busy one, 1.3 m nearer — so it read as a near piece in front of a far piece.
 #       2. The gyroid's clip became a 1 : 5/8 : 1 BOX, which is both wider on screen and
 #          0.40 m LOWER (the box's best drop is 0.50, not the ball's 0.90 — measured, and
-#          not close: at drop 0.90 the box falls to 0.05% coverage and peak 3.2x). The slab
-#          projects to x 200..405, y 378..501, so the overlap is now 122 x 80 px.
-#     `scraps/_proj.py` computes these boxes and is validated against the recorded ball box
-#     to the pixel. THE SECOND ONE IS ALSO CHECKED ON A FINISHED FRAME (1125 spp, mode D)
-#     AND KEPT, but by a narrower margin and for a DIFFERENT reason than the first. There is
-#     no gap left at all -- the slab's left corner runs onto the cone's top face -- so what
-#     separates them is no longer silhouette but TONE: the cone is hard-edged, banded black
-#     and white specular, the slab is busy, green-tinted and full of violet internal caustic
-#     blobs, and the two do not blend. If a later reframe ever loses that contrast this is
-#     the first thing that breaks. The cheap fix is +x on the crystal gyroid's exhibit group
-#     (`translate -0.90 0 0.55`); +0.30 m there is about +43 px of separation at this depth
-#     and costs nothing optically, since the cap has 0.9 m of margin round the patch. Moving
-#     the CONE is not free: its cap already runs off the left edge (x -21), so the obvious
-#     leftward dodge pushes more of it out of frame.
+#          not close: at drop 0.90 the box falls to 0.05% coverage and peak 3.2x). At the
+#          gyroid's rule-derived position the slab projected to x 200..405, y 378..501 and
+#          the overlap grew to 122 x 80 px, with no gap left anywhere: the slab's left
+#          corner sat ON the cone's top face, and the only thing separating the two was
+#          TONE (hard banded specular against busy green lattice).
+#     THAT WAS FIXED BY MOVING THE GYROID, NOT THIS PIECE. Its exhibit takes a documented
+#     +0.30 m x override on the spread rule (see THE SPREAD). `scraps/_proj.py` projects
+#     every silhouette from the same camera, so these three rows ARE comparable with each
+#     other (it puts the cone at x 73..313, y 390..517 -- about 17 px left of the by-eye box
+#     quoted above, so never mix the two sets):
+#         old ball                x 229..381  y 312..451   overlap  85 x  62 =  5224 px2
+#         slab, rule position     x 200..405  y 378..501   overlap 114 x 112 = 12682 px2
+#         slab, +0.30 m x         x 245..442  y 378..501   overlap  68 x 112 =  7601 px2
+#     So the nudge takes 40% of the overlap back out, and the part it fixes is the part that
+#     mattered: horizontally the slab now clears the cone BETTER than the ball ever did
+#     (68 px against 85). What it cannot fix is the vertical, because the box's optimum drop
+#     puts the slab 0.40 m lower and straight across the cone's band -- that is why the total
+#     is still 1.45x the ball's. Moving THIS piece was the alternative and it is much worse:
+#     +z toward the camera separates them fast (the cone swings left ~170 px per 0.4 m) but
+#     throws 150-270 px off the left edge of the frame, and its cap already overhangs there.
 #   * it balances the frame. The right half carries the gold gyroid, the orb, the cloud and
 #     the rain; the near-left was empty grid, and the scene's whole reason for losing its roof
 #     was that its left half sat in permanent shadow.
@@ -928,7 +961,7 @@ isosurface "gyroid" {
 # -- same clip, 0.014 at 480px and 0.060 at 960px -- because it is computed over whichever cells
 # clear the bar and how many that is depends on resolution. At 480px the box/sphere ranking
 # on `spread` INVERTS. Rank pieces at one resolution or not at all.
-group { translate -0.90 0 0.55         # --- exhibit: CRYSTAL GYROID ---
+group { translate -0.60 0 0.55         # --- exhibit: CRYSTAL GYROID ---
 isosurface "gyroid_gem" {
     material glass
     intersect {
