@@ -5,6 +5,48 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### BUG — DONE (2026-08-05, v0.138.0): `-mode W -heroc 1` silently rendered the de-hero collapse it was supposed to have fixed
+
+**What.** `-heroc 1` means "hero bundle off, single wavelength" (`ftrace -h`), which in mode W
+collapses the mode's *entire fixed spectral quadrature* to one λ and forces every material down
+the scalar, bundle-free path. On a scene with a spectrally-varying material that is not an
+approximation, it is flatly wrong. Measured on `scenes/cornell.ftsl` (SF10 sphere), chroma error
+against a converged 8192-spp direct-only mode-R reference, brightness normalised out:
+
+| render | chroma error |
+|---|---|
+| mode W, 1 spp, default C=8 | **0.82 pp** (correct — reproduces N1's 0.80 pp) |
+| mode W, 1 spp, `-heroc 1`  | **46.85 pp** — a flat GREEN ball |
+
+46.85 pp is the exact de-hero pathology N1 (v0.108.0) was written to kill, still reachable through
+a CLI flag, and **nothing was printed** to say so.
+
+**Why it mattered.** Mode W's whole promise is "noise-free and *correct* at 1 spp". Everywhere else
+the codebase defends that promise: the interactive viewer detects `g_heroC <= 1` and keeps
+accumulating passes (`wNeedSpp`, `main.cpp`), so its preview converges out of the collapse. A batch
+`-mode W -spp 1` render has nothing to average over, so it just emits the wrong image. And the
+trade the user thinks they are making isn't real: N5 measured C=1 vs the C=8 default at **2.7% of
+frame time** on a 15-second mode-W frame (mode W is traversal-bound — the bundle rides along on
+rays already being traced), so they gave up correctness for a rounding error.
+
+**How it was found.** Sweeping `-heroc` while measuring N5's cost slope; the `-heroc 1` frame was
+included as a timing point and its *image* turned out to be the interesting result.
+
+**Fix.** `warnWhittedHeroCollapse` (`main.cpp`), called only for a real batch mode-W render at
+`g_heroC <= 1` — not for the explorer's T preview, which converges anyway and would nag every run.
+It names the material class responsible, states that those surfaces are *flatly wrong* rather than
+merely noisy, and quotes the ~1% cost of not doing this. The scene predicate `whittedNeedsBundle`
+walks only materials actually attached to geometry (an unused library material is no reason to
+nag), returns immediately for ThinFilm / Grating / Multilayer / Layered / Fluorescent, and — since
+`Spectrum` is a `std::function` with no inspectable curve type — decides a Dielectric by **probing
+its `ior` at 400–700 nm**, so a constant-IOR dielectric (exact at C=1) stays silent. Print-only:
+the mode-W image is byte-identical to 0.137.0.
+
+**Lesson.** A knob that is legitimate in one mode can silently void another mode's headline
+guarantee. `-heroc 1` is perfectly reasonable in mode R, where more samples fix it; in mode W there
+are no more samples. When a mode's contract is "correct at 1 spp", every flag that can break that
+contract needs either a guard or a warning — the viewer had a guard, the batch path had neither.
+
 ### BUG — DONE (2026-08-05, v0.137.0): nvcc's FMA contraction made the GPU's mode-W sample lattices disagree with the CPU's by 1 ULP
 
 **What.** `dRadicalInverseScr` — the digit-scrambled radical inverse that places every

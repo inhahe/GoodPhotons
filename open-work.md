@@ -5,7 +5,7 @@ long prose blocks whose opening paragraph reads like a plan but whose later
 `**STATUS (date) … DONE**` sub-paragraph says it landed. That makes "what's actually left?"
 expensive to answer.
 
-**This file is the actionable extract, as of 2026-08-05 (ftrace v0.137.0).** It carries only
+**This file is the actionable extract, as of 2026-08-05 (ftrace v0.138.0).** It carries only
 work that is genuinely undone *and* not explicitly ruled out. `TODO.md` remains the
 authoritative design text — every item below names its section/item ID there, and the full
 rationale, prior art and scoping live in that entry, not here.
@@ -86,15 +86,39 @@ indices × 33 lattice columns — host against device. It found a real divergenc
 nvcc contracts `r += digit * f` into an FMA and MSVC doesn't, so 1.6 % of values differed by 1 ULP.
 Fixed with `__dmul_rn` / `__dadd_rn`; logged in `known-issues.md`.
 
-### N5 — re-measure spectral vs `-rgb` at mode W's 1 spp, then judge an RGB mode W  *(ftrace; small — a measurement)*
-*TODO.md §N item N5.*
+### ~~N5 — re-measure spectral vs `-rgb` at mode W's 1 spp, then judge an RGB mode W~~  **DONE 2026-08-05 (v0.138.0)**
+*TODO.md §N item N5 — measured and declined.*
 
-The only genuinely open, unblocked ftrace item. It is a **measurement, not a build**: at 1 spp
-there is no noise, so `-rgb`'s convergence advantage evaporates and only the measured 1.27–1.7×
-per-sample cost remains. The prediction recorded in TODO.md is that a second hand-written RGB
-megakernel is **not** worth it — one that would have to stay bit-exact with the CPU forever (N4) —
-and that `-rgb`'s one real edge (dodging the de-hero collapse on glass) is an argument for N1
-instead. Resolve it by measuring, then write the verdict up; don't build first.
+The verdict is **no**, by a much wider margin than the recorded 1.27–1.7× reasoning suggested —
+because that figure is a **mode-R** number and does not transfer to mode W. Re-measured on the
+RTX 4090: mode R's spectral penalty has actually *widened* (1.61× Cornell, 2.30× gyroids), but a
+`-heroc` sweep shows it is entirely **bundle width** — a spectral render at C=1 costs exactly what
+the RGB kernel costs on Cornell, so the fixed cost of being spectral measures as zero. Mode W,
+being traversal-bound (4×4 shadow rays per light per hit), is nearly flat in bundle width: on a
+15-second frame the full 8-wavelength default costs **2.7%** over one wavelength, versus 61%/46%
+in mode R. So a second hand-written RGB megakernel could win ~1–2%, in exchange for a permanent
+bit-exactness obligation (now *tested*, via `-checklattice`) and `cudaBackwardRGBSupported`'s scope
+gate blanking the deterministic preview on media / thin-film / gratings / multilayer / layered /
+fluorescence / textured albedo. Not built.
+
+Also confirmed `-rgb`'s one structural edge is closed: spectral mode W is 1-spp-clean on the
+Cornell SF10 sphere at **0.82 pp** chroma error (reproducing N1's 0.80 pp). And it turned up a real
+bug — see below.
+
+### ~~`-mode W -heroc 1` silently reproduced the de-hero collapse~~  **DONE 2026-08-05 (v0.138.0)**
+*Found while measuring N5.*
+
+`-heroc 1` turns the hero bundle off, so mode W's fixed spectral quadrature collapses to one
+wavelength — and on a dispersive scene that isn't approximate, it's flatly wrong: the Cornell SF10
+sphere renders **46.85 pp** off in chroma (a flat green ball), with nothing printed. The viewer
+absorbs this by accumulating passes (`wNeedSpp`); a batch `-spp 1` render has nothing to average.
+`warnWhittedHeroCollapse` now names the offending material class. `whittedNeedsBundle` scans only
+materials attached to geometry, and calls a dielectric dispersive only if its `ior` Spectrum
+actually varies over 400–700 nm, so a constant-IOR dielectric doesn't nag. Print-only; the mode-W
+image is byte-identical to 0.137.0.
+
+**Section 1 is again empty of actionable ftrace items** — everything left is either blocked on a
+user decision (§2) or deferred by measurement (§3).
 
 ---
 

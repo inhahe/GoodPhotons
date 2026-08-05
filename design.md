@@ -485,7 +485,11 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   collapse to "sample 0 forever" under `-window` (which chunks into 1-spp batches)
   and make `-spp` a no-op on the image — this was a real bug, fixed in 0.105.0.
   Mode `W` also raises the default hero bundle to `kHeroMax`, since at 1 spp the C
-  wavelengths *are* the whole spectral quadrature and they share one BVH walk.
+  wavelengths *are* the whole spectral quadrature and they share one BVH walk — measured at
+  **2.7 %** of frame time for the full 8 versus 1 (N5, 0.138.0), because the mode is
+  traversal-bound. The converse is that `-heroc 1` here is not a speed/quality trade at all:
+  it is a correctness hazard, since there are no further samples to average the collapse
+  away. See the `-rgb`-in-mode-`W` note under `render_cuda.cu`.
 
   **The deterministic one-bounce gather (`giDirs`, `-gi`)** is mode `W`'s real GI, the
   thing `ambient` only stands in for. `giGatherHero` / `giGather` trace `giDirs` rays
@@ -742,6 +746,31 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `-rgb` is refused in mode `W` (`main.cpp`, with a message): the fast RGB backward is a
   separate reduced tracer with no deterministic estimator, so it would return precisely the
   noise the mode exists to remove.
+
+  **And there will not be a deterministic RGB twin of it, because mode `W` is
+  traversal-bound (measured, N5, 0.138.0).** The obvious follow-up — "write an RGB mode `W`
+  and get `-rgb`'s 1.6–2.3× in the deterministic mode too" — does not survive measurement.
+  That speedup is entirely *bundle width*, not the cost of being spectral: on the Cornell
+  box a **spectral** mode-`R` render at `-heroc 1` costs exactly what `-rgb` costs
+  (4.4 s / 4.4 s at 8192 spp), so the fixed overhead of SPD evaluation, upsampling and CIE
+  integration measures as **zero**. And mode `W` barely pays for width, because it fires
+  `4×4` shadow rays per light per hit (plus the `-gi` gather) and the extra wavelengths ride
+  along on rays that are already being traced: on a 15-second frame (gyroid room, 7680×4800,
+  `-gi 32`) the full 8-wide default costs **2.7 %** over a single wavelength, against **61 %**
+  for mode `R`'s 4-wide bundle on Cornell. So a second hand-written RGB megakernel could win
+  ~1–2 %, in exchange for a permanent — and now *tested*, via `-checklattice` — obligation to
+  stay bit-exact with a CPU twin, plus `cudaBackwardRGBSupported`'s scope gate blanking the
+  deterministic preview on exactly the materials it is most useful for (media, thin film,
+  gratings, multilayer, layered, fluorescence, textured albedo). **The general rule: before
+  porting a cost win from one mode to another, check which term it actually came from — mode
+  `R` is shading-bound and mode `W` is traversal-bound, so their cost models do not
+  transfer.**
+
+  The same measurement is why mode `W` *raises* the default bundle to `kHeroMax` rather than
+  economising on it, and why `-heroc 1` is a hazard there specifically: at 1 spp the bundle
+  is the entire spectral quadrature, so narrowing it does not add noise that more samples
+  would remove — it changes the answer. `warnWhittedHeroCollapse` guards the batch path
+  (the viewer already guarded itself via `wNeedSpp`); see `known-issues.md`.
 - **`bdpt.h`** — BDPT with MIS; vertices stored by **index** (never `Vertex&`
   across `push_back` — a use-after-free lived here once; see known-issues).
   Hero-wavelength capable (`HeroBundle` on both subpaths, `Vertex::betaSec/nUp`,

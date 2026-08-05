@@ -4241,8 +4241,10 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
         is **98.68 %** (mean 0.032 codes, 0 blob interior, 40 slivers) — matching the 98.7 % recorded
         at the 0.116.0 gate, i.e. no regression, and the `-gi` bed is what independently pins the
         host-side `giPhases` refactor as a true no-op.
-- [ ] **N5. Re-measure spectral vs `-rgb`, then judge whether an RGB mode W is worth a second
-      kernel.** *(Prediction: it is not — resolve this by measurement, not by building it.)* At mode
+- [x] **N5. Re-measure spectral vs `-rgb`, then judge whether an RGB mode W is worth a second
+      kernel.** ✅ **DONE 2026-08-05 (0.138.0) — measured, and the answer is NO, by a much wider
+      margin than the original reasoning claimed.** *(Prediction: it is not — resolve this by
+      measurement, not by building it.)* At mode
       W's 1 spp there is no noise, so `-rgb`'s usual convergence advantage evaporates and only the
       measured 1.27–1.7× per-sample cost remains. Its one real advantage is dodging the de-hero
       collapse — worth ~20× on a glass scene, since plain `MatType::Dielectric` *is* in the RGB scope
@@ -4252,6 +4254,64 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
       CPU forever (N4). Note also that N1–N3 serve the wide-scope cases `-rgb` structurally *cannot*:
       thin-film, gratings, multilayer, fluorescence, media and textured albedo are all outside the RGB
       gate and inside the spectral one.
+    * **STATUS (2026-08-05): MEASURED — verdict NO, and the recorded 1.27–1.7× reasoning was
+      measuring the wrong mode.** All numbers RTX 4090, `-device gpu`, today's binary (0.137.0),
+      two runs each and reproducible to the printed 0.1 s.
+      - **Mode R, spectral vs `-rgb` — re-measured, and the penalty has WIDENED, not narrowed:**
+        | scene | spp | `-rgb` | spectral (C=4, mode R default) | penalty | was (2026-07-29) |
+        |---|---|---|---|---|---|
+        | `cornell.ftsl` 480×300 | 8192 | 4.4 s | 7.1 s | **1.61×** | 1.7× |
+        | `_room_of_gyroids_f12.ftsl` 480×300 | 64 | 1.65 s | 3.8 s | **2.30×** | 1.27× |
+        Both paths got much faster since July (gyroid spectral 12.1 → 3.8 s, RGB 9.5 → 1.7 s), but
+        RGB gained more, so the gap grew. Taken at face value this looks like an argument *for* an
+        RGB mode W. It isn't — see the next table.
+      - **The penalty is bundle WIDTH, not "spectral machinery" — proved by sweeping `-heroc`:**
+        | scene | `-rgb` | C=1 | C=2 | C=4 |
+        |---|---|---|---|---|
+        | `cornell.ftsl`, R, 8192 spp | 4.4 s | **4.4 s** | 6.0 s | 7.1 s |
+        | gyroids, R, 64 spp | 1.65 s | 2.6 s | 3.5 s | 3.8 s |
+        On Cornell a *spectral* render at C=1 costs **exactly** what the RGB kernel costs — the
+        fixed cost of being spectral at all (SPD eval, upsampling, CIE integration) measures as
+        **zero**. Every bit of `-rgb`'s win is "carries 1 channel instead of 4".
+      - **…and mode W's cost is almost independent of bundle width, because mode W is
+        TRAVERSAL-bound.** Mode W fires `4×4` shadow rays per light per hit (plus the `-gi` gather)
+        and the bundle rides along on rays that are being traced anyway:
+        | scene / config | C=1 | C=2 | C=4 | C=8 *(mode W default)* |
+        |---|---|---|---|---|
+        | `cornell.ftsl` 3840×2400, 1 spp | 0.3 s | 0.3 s | 0.3 s | 0.3 s |
+        | gyroids 3840×2400, 1 spp | 0.8 s | 0.8 s | 0.8 s | 0.9 s |
+        | gyroids **7680×4800, `-gi 32`** (a 15 s frame — enough workload to resolve the slope) | **15.0 s** | 15.1 s | 15.2 s | **15.4 s** |
+        **Mode W's full 8-wavelength bundle costs 2.7% over a single wavelength. Mode R's 4-wide
+        bundle costs 61% (Cornell) / 46% (gyroids).** The 1.27–2.3× figure is a mode-R phenomenon
+        and does **not transfer to mode W at all** — which is precisely the number N5 was written
+        to check.
+      - **So the ceiling on an RGB mode W is ~2.7%, and probably less** (it would still carry three
+        channels, so realistically ~1–2%), against the cost of a second hand-written megakernel that
+        — as of `-checklattice` (N4a, 0.137.0) — now carries a standing, *tested* obligation to stay
+        bit-exact with a CPU twin forever. It would also inherit `cudaBackwardRGBSupported`'s scope
+        gate, i.e. no media, no thin-film / grating / multilayer / layered / fluorescence, no
+        textured or pattern-driven albedo, no image env, no collimated lights — so the deterministic
+        preview would go *dark* on exactly the material set mode W is most useful for previewing.
+        **Not built. Closing N5 as measured-and-declined.**
+      - **N5's one remaining pro-`-rgb` clause is confirmed CLOSED.** The de-hero collapse was
+        `-rgb`'s only structural advantage, and N1 (0.108.0) fixed it. Re-verified on today's binary
+        via `scraps/n5_chroma.py` (Cornell SF10 sphere chroma vs a converged 8192-spp direct-only
+        mode-R reference; brightness normalised out, since exposure was never the failure):
+        | image | chroma error |
+        |---|---|
+        | spectral mode W, 1 spp, default C=8 | **0.82 pp** — reproduces N1's 0.80 pp |
+        | mode R `-rgb`, 8192 spp | 0.12 pp (region *mean*, which averages the dispersion away) |
+        | spectral mode W, 1 spp, **`-heroc 1`** | **46.85 pp** — the flat-GREEN ball |
+      - **Bonus fix shipped as 0.138.0: `-heroc 1` was silently reproducing the de-hero collapse in
+        batch mode W.** That 46.85 pp row is not a hypothetical — it is what `-mode W -heroc 1 -spp 1`
+        renders today on any dispersive scene, with nothing printed. The viewer absorbs it (it keeps
+        accumulating passes; see `wNeedSpp`), but a batch render has nothing to average over.
+        `warnWhittedHeroCollapse` (`main.cpp`) now names the offending material class and says the
+        surfaces will be flatly wrong rather than merely noisy. `whittedNeedsBundle` scans only
+        materials actually attached to geometry, and treats a dielectric as dispersive only if its
+        `ior` Spectrum actually varies across 400–700 nm (a constant-IOR dielectric is exact at C=1,
+        so it must not nag). Verified: fires on `cornell.ftsl -heroc 1`, silent on the gyroid room
+        and on Cornell at the default C. Print-only — the mode-W image is byte-identical to 0.137.0.
 
 ---
 

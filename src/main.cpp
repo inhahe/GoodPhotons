@@ -3437,6 +3437,75 @@ static void warnSealedLights(const Scene& scene) {
                     open == 1 ? "that one" : "those");
 }
 
+// `-heroc 1` turns the hero bundle OFF, so mode W's fixed spectral quadrature collapses to
+// a single wavelength and every material takes the scalar (bundle-free) path. On a
+// spectrally-varying material that is not merely approximate, it is flatly WRONG: measured
+// 2026-08-05 (N5), the Cornell SF10 sphere renders 46.85 pp off in chroma at `-heroc 1` -- a
+// flat GREEN ball, the exact de-hero pathology N1 was written to kill -- against 0.82 pp at
+// the default C=4. The interactive viewer absorbs this by accumulating passes (see wNeedSpp),
+// but a batch `-mode W -spp 1` render has nothing to average over and emits the wrong image
+// silently. It is also a pointless trade: N5 measured C=1 vs C=4 at 1.3% of a 15 s mode-W
+// frame (mode W is traversal-bound, so the bundle rides along nearly free) -- the user is
+// giving up correctness for a rounding error. So name the offending material and say so.
+//
+// Returns the material type that makes the bundle load-bearing, or nullptr if the scene is
+// achromatic enough that a 1-wavelength preview is honest. Only materials actually attached
+// to geometry count; an unused library material is not a reason to nag.
+static const char* whittedNeedsBundle(const Scene& scene) {
+    std::vector<char> matUsed(scene.mats.size(), 0);
+    auto markUsed = [&](int id) {
+        if (id < 0 || id >= (int)scene.mats.size()) return;
+        matUsed[id] = 1;
+        if (scene.mats[id].type == MatType::Mix)
+            for (int c : scene.mats[id].mixChildren)
+                if (c >= 0 && c < (int)scene.mats.size()) matUsed[c] = 1;
+    };
+    for (const auto& tr : scene.tris) markUsed(tr.matId);
+    for (const auto& sp : scene.spheres) markUsed(sp.matId);
+    for (size_t i = 0; i < scene.mats.size(); ++i) {
+        if (!matUsed[i]) continue;
+        const Material& m = scene.mats[i];
+        switch (m.type) {
+            // Inherently wavelength-branching: the interface itself sends different lambda
+            // in different directions (or to different wavelengths, for fluorescence), so
+            // one lambda cannot stand in for the bundle at any roughness.
+            case MatType::ThinFilm:    return "thin-film";
+            case MatType::Grating:     return "diffraction grating";
+            case MatType::Multilayer:  return "multilayer";
+            case MatType::Layered:     return "layered (clearcoat)";
+            case MatType::Fluorescent: return "fluorescent";
+            case MatType::Dielectric:
+                // Only DISPERSIVE glass matters -- a constant-IOR dielectric refracts every
+                // wavelength identically, so C=1 is exact for it. Spectrum is a std::function,
+                // so probe it across the visible band rather than inspecting a curve type.
+                if (m.ior) {
+                    const double n0 = m.ior(400.0);
+                    for (double lam : {450.0, 500.0, 550.0, 600.0, 650.0, 700.0})
+                        if (std::abs(m.ior(lam) - n0) > 1e-6) return "dispersive dielectric";
+                }
+                break;
+            default: break;
+        }
+    }
+    return nullptr;
+}
+
+static void warnWhittedHeroCollapse(const Scene& scene) {
+    const char* what = whittedNeedsBundle(scene);
+    if (!what) return;
+    std::printf("[mode W] WARNING: -heroc 1 turns the hero bundle off, but this scene uses "
+                "%s material(s)\n"
+                "[mode W]   whose behaviour VARIES with wavelength. At 1 spp there is nothing "
+                "to average over, so\n"
+                "[mode W]   those surfaces will render a flat single-wavelength colour (the "
+                "classic green-glass\n"
+                "[mode W]   collapse), not merely a noisier version of the right answer.\n"
+                "[mode W]   Drop the -heroc 1 (mode W defaults to %d, which splits the bundle "
+                "at dispersion) --\n"
+                "[mode W]   it is measured at ~1%% of frame time here, since mode W is "
+                "traversal-bound, not spectral.\n", what, hero::kHeroMax);
+}
+
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
 // segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
@@ -7127,6 +7196,10 @@ static int run(int argc, char** argv) {
     // Both a real mode-W render and the explorer's T preview (which IS mode W) hit the
     // sealed-light failure, so warn for either -- see warnSealedLights.
     if (g_whitted || wPreview) warnSealedLights(scene);
+    // Only for a real batch mode-W render: the viewer's T preview keeps accumulating passes
+    // (wNeedSpp), so its C=1 image converges rather than staying wrong, and nagging there
+    // would fire on every explore run.
+    if (g_whitted && !wPreview && g_heroC <= 1) warnWhittedHeroCollapse(scene);
     // Kept out of the chain above: rejecting -gi is independent of whether the run is
     // also direct-only, and folding it in would swallow that notice when both are given.
     // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for
