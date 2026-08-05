@@ -980,6 +980,29 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   vertex by `bary_k / T_k` (`T_k = X+Y+Z` of its spectrum) rather than by `bary_k`
   alone, because a chromaticity is an `(X+Y+Z)`-weighted mean — that is what makes the
   interpolated chromaticity *exact* rather than merely close.
+- **`upsample::fitMany` — the bulk path every image texture goes through (0.138.1).**
+  A single Jakob–Hanika fit is ~40 Gauss–Newton iterations over the 95-sample basis:
+  a few microseconds, negligible for a material, *seconds per megapixel* for a texture.
+  Run serially per texel it was pure scene-load latency with nothing on screen —
+  `scenes/gallery_rain.ftsl` (ten marble maps, 4.6 Mtexel total) spent **~45 s of its
+  47 s startup** inside this one loop, which is what made `-explore` on it look hung.
+  `fitMany` fixes it with two exact accelerations, in this order:
+  (a) **deduplicate.** The fit is a pure function of the colour and an 8-bit source
+  decodes through a 256-entry per-channel table, so equal texels are *bit*-equal
+  `Vec3`s and a hash of their raw bit patterns collapses them with no tolerance and
+  no quantisation. Real images collapse hard — the project's own procedural marble
+  maps carry 96 to 80 k distinct colours over 0.05–1.05 M texels;
+  (b) **thread the survivors** through `ft::parallelFor`. Chunk-stealing rather than a
+  static split matters here because the per-colour cost is wildly uneven (a saturated
+  colour never trips the residual bail-out and burns all 40 iterations).
+  Net on that scene: **47 s → 2.9 s to parse, 4.5 s to a live `-explore` window.**
+  Both steps are *optimizations, not method changes*: the coefficients are bit-identical
+  to the serial loop, which `-checkupsample` check (i) asserts permanently over a
+  synthetic 40 k-texel image built to exercise both the dedup hit and miss paths.
+  `EnvMap::buildFromRgb` (`envmap.h`) has the same per-texel fit plus a 95-sample XYZ
+  integral and is parallelised the same way — but its sin θ-weighted *mean* is left
+  serial (one FMA per texel, i.e. free) so the summation order, and hence the emitter
+  power and wavelength CDF derived from it, cannot drift with core count.
 - **User-supplied upsamplers (`upsample "n" { expr … }`, head `rgb:<n>`).** The sixth
   member of the family, and the only open-ended one: the scene supplies the function.
   Deliberately *not* in `upsample.h` — the five above are numerical fits, this is a
@@ -2646,6 +2669,18 @@ work units pull atomically from a shared counter in chunks. Determinism comes fr
 per-unit RNG seeding (above) plus order-independent accumulation per band/tile;
 film merges are structured so paired runs differ only by summation-order ulps at
 worst (mode R) or are bit-identical (fixed splits).
+
+**Load-time loops use `src/parallel.h` (`ft::parallelFor`), not a hand-rolled pool.**
+Each renderer's pool is tuned to its traversal (raster.h keeps a persistent one,
+photonmap.h bands by photon block, isomesh.h splits the lattice) and none is reachable
+from the loader — so scene setup kept doing its embarrassingly parallel passes on one
+core, which is how per-texel spectral upsampling grew into a 45-second startup stall
+(see `upsample::fitMany`). `parallelFor(n, grain, fn)` is deliberately minimal: one
+atomic cursor handing out `grain`-sized chunks (chunk-stealing, because these loops
+have very uneven per-item cost), the caller acting as one of the workers, and a serial
+inline path below `2*grain` so a small array spawns nothing. It is for **pure,
+independent, one-shot** passes only; anything needing a reduction either keeps that
+reduction serial (envmap's mean radiance) or must justify the changed summation order.
 
 ## Stopping a render (`g_stopRequested`, `-stop`)
 

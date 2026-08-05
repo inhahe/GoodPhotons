@@ -5,6 +5,44 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PERF — DONE (2026-08-05, v0.138.1): `-explore scenes/gallery_rain.ftsl` sat for ~47 s with NOTHING on screen — per-texel spectral upsampling was serial
+
+**What.** `ftrace -explore scenes/gallery_rain.ftsl` produced no output and no window for
+about three quarters of a minute, then loaded normally. It read as a hang; it was not one.
+Measured with `-parseonly` (which stops right after the scene is built):
+
+| stage | before | after |
+|---|---|---|
+| `gallery_rain.ftsl` scene load (`-parseonly`) | **46.9 s** | **2.9 s** |
+| `-explore` → live window on screen | ~50 s | **4.5 s** |
+
+**Where it went.** Bisecting the scene ruled out the obvious suspects — deleting the
+mesh-bound `medium` (a 195×122×191 solid voxelization) changed nothing, and deleting the
+1.85 M-triangle `cloud1.glb` saved only ~4 s. It was the ten `texture` blocks. A one-texture
+scene took 6.1 s against a 0.33 s empty-scene baseline, and the cost tracked *texel count*,
+not file size: 0.05 MP → 0.2 s, 1.05 MP → 10.3 s. Summed over the scene's 4.6 Mtexels that
+is ~45 s, i.e. essentially the entire stall.
+
+**Why.** `Texture::buildReflCoeff` ran `upsample::fit` once per texel, serially, on one
+core. Each fit is up to 40 Gauss–Newton iterations over a 95-sample basis — microseconds
+each, which is nothing for a material and seconds per megapixel for an image. Nothing was
+wrong with the *method*; it was simply being invoked ~4.6 million times in a single-threaded
+loop during scene load, before any progress output exists to say so.
+
+**Fix.** `upsample::fitMany` (`upsample.h`) + `ft::parallelFor` (new `src/parallel.h`):
+deduplicate bit-equal texels through a hash of their raw bit patterns (these procedural
+marble maps hold 96–80 000 distinct colours across 0.05–1.05 M texels, so the collapse is
+13×–10 000×), then thread the surviving distinct fits. Both steps are exact — the emitted
+coefficients are bit-identical to the serial loop, asserted permanently by
+`-checkupsample` check (i) on a synthetic 40 k-texel image that exercises both the dedup
+hit and miss paths. `EnvMap::buildFromRgb` carried the identical serial-fit-per-texel
+pattern and was parallelised the same way (its sin θ-weighted mean deliberately left serial
+so the emitter power cannot drift with core count).
+
+**Lesson for next time.** Load-time work has no progress reporting and no thread pool, so
+an O(pixels) inner loop there is invisible until someone calls it a hang. Anything that
+scales with an *asset's* size — texels, voxels, triangles — belongs on `ft::parallelFor`.
+
 ### BUG — DONE (2026-08-05, v0.138.0): `-mode W -heroc 1` silently rendered the de-hero collapse it was supposed to have fixed
 
 **What.** `-heroc 1` means "hero bundle off, single wavelength" (`ftrace -h`), which in mode W

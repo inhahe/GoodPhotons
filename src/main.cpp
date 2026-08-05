@@ -1478,7 +1478,39 @@ static int checkUpsample() {
                 "out of scope");
     }
 
-    bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH;
+    // (i) BULK fit: upsample::fitMany (the deduplicating, threaded path every image
+    // texture's reflectance coefficients go through) must agree with a plain per-texel
+    // upsample::fit BIT-FOR-BIT. It is an optimization, not a method: the dedup key is
+    // the colour's raw bit pattern and the workers write disjoint entries, so anything
+    // other than exact equality means the hash collapsed two colours that differ, or a
+    // worker wrote outside its range. The synthetic image below is built the way a real
+    // 8-bit texture is — a small palette of colours repeated over many texels, plus a
+    // tail of all-distinct ones — so it exercises both the dedup hit and miss paths, and
+    // is sized past parallelFor's serial cutoff so the threaded path is what runs.
+    bool passI = true;
+    {
+        std::vector<Vec3> img;
+        img.reserve(40000);
+        for (int i = 0; i < 32000; ++i) {          // 40 distinct colours, 800x each
+            int k = i % 40;
+            img.push_back(Vec3{k / 39.0, 1.0 - k / 39.0, (k * 7 % 40) / 39.0});
+        }
+        for (int i = 0; i < 8000; ++i)             // 8000 all-distinct colours
+            img.push_back(Vec3{i / 7999.0, (i * 3 % 7999) / 7999.0, (i * 11 % 7999) / 7999.0});
+
+        std::vector<std::array<double, 3>> bulk(img.size());
+        upsample::fitMany(img.data(), img.size(), bulk.data());
+        size_t bad = 0;
+        for (size_t i = 0; i < img.size(); ++i) {
+            std::array<double, 3> ref = upsample::fit(img[i].x, img[i].y, img[i].z);
+            if (bulk[i][0] != ref[0] || bulk[i][1] != ref[1] || bulk[i][2] != ref[2]) ++bad;
+        }
+        passI = (bad == 0);
+        std::printf("[checkupsample] bulk fitMany vs per-texel fit: %zu texels, %zu differing\n",
+                    img.size(), bad);
+    }
+
+    bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH && passI;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
@@ -1489,6 +1521,7 @@ static int checkUpsample() {
     std::printf("[checkupsample] meng round-trip max error = %.5f (excl. white %.5f); smoother than JH: %s  (%s)\n",
                 mengErr, mengWhiteErr, mengSmoother ? "yes" : "NO", passG ? "ok" : "BAD");
     std::printf("[checkupsample] user-declared `upsample` blocks  (%s)\n", passH ? "ok" : "BAD");
+    std::printf("[checkupsample] bulk fit is bit-identical to the serial fit  (%s)\n", passI ? "ok" : "BAD");
     std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
