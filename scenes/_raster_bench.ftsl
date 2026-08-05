@@ -1,0 +1,51 @@
+# _raster_bench.ftsl — preview-rasterizer shading benchmark. Every wall of the box
+# exercises a different per-pixel raster feature (the 0.135/0.136 texture/material
+# preview work), so nearly every covered pixel runs the heaviest applicable path:
+#   floor   : image skin (checker texture, per-pixel UV sample)
+#   back    : procedural `reflect pattern:` with tex: op + warp (pattern VM per pixel)
+#   left    : `emit_map pattern:` (pattern VM per pixel on an emitter)
+#   right   : two-child mix with `weight_map pattern:` (VM per pixel + payload swap)
+#   ceiling : plain flat colour (control)
+#   sphere  : normal map through UV TBN + image skin (both per pixel)
+# `_raster_bench_plain.ftsl` is the all-plain twin for isolating fixed pipeline cost.
+#
+#   ftrace -in scenes/_raster_bench.ftsl -raster -raster-bench 60 -device cpu -r 1280 960 -o png/rbench_cpu.png
+#   ftrace -in scenes/_raster_bench.ftsl -raster -raster-bench 60 -device gpu -r 1280 960 -o png/rbench_gpu.png
+
+scene { units meters  spectral 360 830 1 }
+
+texture "chk"  { file scenes/checker.ppm      encoding srgb   filter bilinear  wrap repeat }
+texture "gray" { file scenes/graychecker.ppm  encoding linear filter nearest   wrap repeat }
+texture "bump" { file scenes/bumps_normal.ppm encoding linear filter bilinear  wrap repeat }
+
+pattern "warped" { expr "tex:gray(u + 0.05*sin(16*v), v)" }
+pattern "glowgrid" { expr "saturate((step(0.94, fract(u*12)) + step(0.94, fract(v*12))) * 2)" }
+pattern "blend" { expr "saturate(0.5 + 0.6*sin(u*21) * sin(v*17))" }
+
+material "skin"   { type diffuse reflect texture:chk }
+material "proc"   { type diffuse reflect pattern:warped }
+material "emitpat" { type diffuse reflect 0.05  emit blackbody 5200  emit_map pattern:glowgrid }
+material "mixa"   { type diffuse reflect texture:chk }
+material "mixb"   { type diffuse reflect rgb 0.8 0.2 0.1 }
+material "mixed"  { type mix  layer "mixa" 0.5  layer "mixb" 0.5  weight_map pattern:blend }
+material "plain"  { type diffuse reflect whitewall 0.75 }
+material "bumpy"  { type diffuse reflect texture:chk  normal_map texture:bump }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material skin }     # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material plain }    # ceiling
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material proc }     # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material emitpat }  # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material mixed }    # right
+
+sphere { center 0.5 0.45 0.5  radius 0.28  material bumpy }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.2   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 46
+    mode B
+    film { res 1280 960 }
+}

@@ -787,8 +787,11 @@ __global__ void kRasterLarge(const DGeo* geos, const int* flags, const int* list
     }
 }
 
-// Per-triangle tangent from the UV parameterisation (device twin of raster::triTangent):
-// the world direction in which u increases, Gram-Schmidt'd against the shading normal.
+// Per-triangle tangent from the UV parameterisation (device twin of the CPU pipeline's
+// raster::triTangentRaw + the shade pass's per-pixel Gram-Schmidt, fused — a GPU thread
+// recomputes the raw part too, since at 0.2 ms for the whole kShade pass a per-triangle
+// bake would buy nothing): the world direction in which u increases, orthogonalized
+// against the shading normal.
 // Degenerate UVs (a zero-area triangle in texture space) fall back to any perpendicular,
 // which is what a normal map with no usable frame deserves — a stable, if arbitrary, basis
 // rather than a NaN.

@@ -2417,6 +2417,53 @@ reason (the ½ threshold is another hard step): `pattern_tex.ftsl` 0.076% of pix
 0.083% — unchanged from before the mix work, i.e. no regression. Both raster backends now
 reproduce `-mode W`'s image of all three `pattern_tex` walls.
 
+## CPU raster frame loop (`raster.h`, perf architecture, 0.136.1)
+
+`renderFrame` is seven strictly-sequential parallel passes (project → zbuf clear →
+G-buffer raster → optional see-through → shade → auto-exposure anchor → tonemap/encode).
+The feature work above (textures / pattern VM / per-pixel mix / normal maps) added genuine
+per-pixel cost, but profiling showed the frame was dominated by *fixed* overhead, removed
+in 0.136.1 (2.4–3.5× at 1280×960; every optimization below is **byte-identical** on a
+9-image corpus — the invariants that make that provable are the point of this section):
+
+- **`RasterScratch`** (owned by the caller, one per explorer/bench session, passed down as
+  an optional pointer): the G-buffer, accum, see-through buffers, per-thread projection
+  parts and the `BandPool` all persist across frames. Before, every frame re-allocated and
+  `assign()`-zeroed ~129 MB — pure page-fault + memset cost. Channels are now `resize()`d
+  (no re-zero) and only **zbuf** is cleared, because every other channel is write-before-read:
+  each is only ever read where `zbuf > 0`, and the raster pass that sets zbuf writes them
+  all (auto-exposure's scan short-circuits on `zbuf[i] <= 0 || emis[i]`, and `emis` is
+  written by the same raster pass). Stale-data hazard to preserve: `S.parts` buffers past
+  the current thread count must be explicitly cleared or a shrink leaks old triangles into
+  the concatenation.
+- **`BandPool`**: a persistent worker pool (generation-counted condition-variable
+  broadcast, `run(body(workerIdx))`, not nestable) replacing ~84 `std::thread` spawns per
+  frame (7 passes × N threads). Bit-identity argument: the pool runs the **same partition
+  formulas** (`chunk = (n+nT-1)/nT`, row bands) as the spawn path, so band ownership —
+  and therefore every band-ordered write — is unchanged. `exposeAndEncodeT` takes the pool
+  as an optional parameter (other caller: `render_cuda.cu`'s G2 iso preview, which passes
+  none) and falls back to spawning if the pool's size mismatches `nThreads`.
+- **`selectKthNonNeg`** (auto-exposure anchor): the p99-luminance anchor ran a *serial*
+  `std::nth_element` over ~1.1 M doubles (~4 ms). Non-negative IEEE doubles order
+  monotonically as raw bit patterns, so a parallel 16-bit-radix histogram (top 16 bits)
+  locates the bucket holding rank k, a parallel scan collects just that bucket's members,
+  and a tiny `nth_element` selects within it. Exactness: selection is by **value** over a
+  multiset, so neither pack order nor tie order can change the result; small n / no pool
+  falls back to plain `nth_element`. Requires non-negative inputs (the anchor packs
+  `max(r,g,b,0.0)`).
+- **Feature-cost hoists** in the shade pass: `normalize(g.wn[i])` computed once and shared
+  by the pattern context and shading; the mix `weight_map` PatCtx is built lazily (texture
+  masks don't need it); the normal-map tangent's raw dP/dU half (`triTangentRaw`) is baked
+  per triangle at tessellation (`PTri::tanRaw`, zero when UVs degenerate ⇒ per-pixel
+  fallback basis) leaving only the per-pixel Gram-Schmidt. The GPU twin deliberately keeps
+  recomputing the raw tangent per pixel — its whole shade pass is 0.19 ms.
+- **What was measured, not guessed** (`scenes/_raster_bench.ftsl` + its `_plain` twin,
+  1280×960, 12 threads): features-heavy
+  86 → ~36 ms median, all-plain 69 → ~20 ms; remaining with-anchor cost over absolute-EV
+  is ~2–3 ms = the two collection scans, inherent to the percentile semantics. GPU was
+  profiled first and left untouched: 2.73 ms/frame with all new feature code costing
+  0.19 ms in `kShade`.
+
 ## GPU raster pipeline (`raster_cuda.cu`)
 
 Powers `-raster -device gpu` and the interactive explorer's per-frame redraws;

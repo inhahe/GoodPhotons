@@ -38,11 +38,14 @@
 #pragma once
 #include <vector>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <algorithm>
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <memory>
 #include <functional>
 #include <array>
 #include "scene.h"
@@ -96,6 +99,13 @@ struct PTri : PShade {
     // Per-vertex texture coordinates (u in .x, v in .y). Only meaningful when tex >= 0.
     Vec3 uv0{0, 0, 0}, uv1{0, 0, 0}, uv2{0, 0, 0};
     int  mix = -1;           // index into PreviewGeom::mixes for a per-hit mix, else -1
+    // Raw (unnormalized, un-orthogonalized) dP/dU tangent for normal mapping. Constant
+    // over the triangle, so tessellate() precomputes it once for every triangle that can
+    // shade a normal map (its own material's, or its mix child's) instead of the shade
+    // pass re-deriving it from the edge/UV deltas at every covered pixel. Zero when the
+    // UV parameterisation is degenerate/absent — the shade pass then falls back to a
+    // stable frame about the shading normal, exactly as the old per-pixel path did.
+    Vec3 tanRaw{0, 0, 0};
 };
 
 // Tessellated preview geometry plus the side tables its triangles index. Bundled so the
@@ -109,41 +119,16 @@ struct PreviewGeom {
     size_t size() const { return tris.size(); }
 };
 
-// The per-hit mix weight at a shaded pixel: the pattern or texture bound to `weight_map`,
-// clamped to [0,1], giving child 0's share. Mirrors mixResolveDominant()'s evaluation so
-// the preview and -mode W threshold on the same number.
-inline double previewMixWeight(const PMix& mx, const Scene& sc, const PatCtx& pc,
-                               double u, double v) {
-    double t = 0.0;
-    if (mx.weightPat >= 0 && mx.weightPat < (int)sc.patterns.size())
-        t = sc.patterns[mx.weightPat].eval(pc);
-    else if (mx.weightTex >= 0 && mx.weightTex < (int)sc.textures.size())
-        t = sc.textures[mx.weightTex].scalarAt(u, v);
-    return (t < 0.0) ? 0.0 : (t > 1.0 ? 1.0 : t);
-}
-
-// Per-triangle tangent for normal mapping, derived from the UV gradient (the standard
-// dP/dU construction) and then Gram-Schmidt'd against the shading normal. Returns a
-// zero vector only if no usable frame exists, which the caller treats as "skip the map".
-// Constant over the triangle, so it is computed in the shade pass for the one winning
-// fragment rather than stored per vertex.
-inline Vec3 triTangent(const PTri& t, const Vec3& N) {
+// The raw dP/dU tangent of one triangle (the standard UV-gradient construction), or zero
+// when the UV parameterisation is degenerate. Called once per triangle by tessellate()'s
+// tangent bake; the shade pass finishes the frame per pixel (Gram-Schmidt against the
+// interpolated shading normal + normalize), which is the only part that varies per pixel.
+inline Vec3 triTangentRaw(const PTri& t) {
     Vec3 e1 = t.p1 - t.p0, e2 = t.p2 - t.p0;
     Vec3 d1 = t.uv1 - t.uv0, d2 = t.uv2 - t.uv0;
     double det = d1.x * d2.y - d2.x * d1.y;
-    Vec3 T;
-    if (std::fabs(det) > 1e-18) {
-        T = (e1 * d2.y - e2 * d1.y) * (1.0 / det);
-    } else {
-        // Degenerate/absent UV parameterisation (e.g. a triplanar or projected skin):
-        // fall back to any stable tangent so the map still perturbs, just in an
-        // unauthored frame. Picking the axis least parallel to N avoids a null cross.
-        Vec3 ax = (std::fabs(N.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
-        T = cross(ax, N);
-    }
-    T = T - N * dot(N, T);                       // re-orthogonalize against the shading normal
-    double l = std::sqrt(dot(T, T));
-    return (l > 1e-12) ? T * (1.0 / l) : Vec3{0, 0, 0};
+    if (std::fabs(det) > 1e-18) return (e1 * d2.y - e2 * d1.y) * (1.0 / det);
+    return Vec3{0, 0, 0};
 }
 
 // A "clear" preview surface for the optional see-through rasterizer: a transmissive
@@ -572,6 +557,18 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             out.push_back(p);
         }
     }
+    // Tangent bake: precompute the raw dP/dU tangent for every triangle that can shade a
+    // normal map — its own material's, or the one its mix's losing child would swap in.
+    // Constant over a triangle, so deriving it here (once per SESSION) replaces the shade
+    // pass re-deriving it from the edge/UV deltas at every covered pixel of every frame.
+    // Runs at the very tail so it sees the FINAL per-vertex UVs (after the azimuthal seam
+    // repair above, which lifts individual corners by a full turn and thus changes dUV).
+    for (auto& p : out) {
+        const bool wantTan = p.normalTex >= 0 ||
+            (p.mix >= 0 && p.mix < (int)geom.mixes.size() &&
+             geom.mixes[p.mix].b.normalTex >= 0);
+        if (wantTan) p.tanRaw = triTangentRaw(p);
+    }
     return geom;   // `out` aliases geom.tris; geom.mixes was filled during the material bake
 }
 
@@ -620,6 +617,83 @@ struct GBuffer {
     std::vector<int>     tri;     // index of the winning source PTri, or -1 (background)
     std::vector<uint8_t> emis;    // 1 where the winning triangle is an emitter
     std::vector<Vec3>    uv;      // interpolated texture coords of the winning surface
+};
+
+// A persistent band pool: N workers that sleep on a condition variable and execute one
+// broadcast job at a time (each worker gets its own index and derives its slice). The
+// frame pipeline runs SEVEN parallel passes back to back (project, zbuf clear, raster,
+// shade, two exposure-anchor scans, tonemap); with plain std::thread that was ~7*N
+// thread creations PER FRAME — several milliseconds of pure spawn cost plus scheduler
+// jitter that showed up directly as the min-to-median spread in -raster-bench. Here a
+// pass costs one notify_all and N wakeups instead. Not nestable (run() must not be
+// called from inside a job), which the strictly sequential pass structure guarantees.
+class BandPool {
+public:
+    explicit BandPool(int n) : nW_(n < 1 ? 1 : n) {
+        workers_.reserve(nW_);
+        for (int i = 0; i < nW_; ++i)
+            workers_.emplace_back([this, i] {
+                uint64_t seen = 0;
+                std::unique_lock<std::mutex> lk(m_);
+                for (;;) {
+                    cvJob_.wait(lk, [&] { return quit_ || gen_ != seen; });
+                    if (quit_) return;
+                    seen = gen_;
+                    const std::function<void(int)>* j = job_;
+                    lk.unlock();
+                    (*j)(i);
+                    lk.lock();
+                    if (--pending_ == 0) cvDone_.notify_one();
+                }
+            });
+    }
+    ~BandPool() {
+        { std::lock_guard<std::mutex> lk(m_); quit_ = true; }
+        cvJob_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
+    BandPool(const BandPool&) = delete;
+    BandPool& operator=(const BandPool&) = delete;
+    int size() const { return nW_; }
+    // Run body(workerIndex) on every worker and wait for all of them.
+    void run(const std::function<void(int)>& body) {
+        std::unique_lock<std::mutex> lk(m_);
+        job_ = &body;
+        pending_ = nW_;
+        ++gen_;
+        cvJob_.notify_all();
+        cvDone_.wait(lk, [&] { return pending_ == 0; });
+        job_ = nullptr;
+    }
+
+private:
+    std::vector<std::thread>       workers_;
+    std::mutex                     m_;
+    std::condition_variable        cvJob_, cvDone_;
+    const std::function<void(int)>* job_ = nullptr;
+    uint64_t                       gen_ = 0;
+    int                            pending_ = 0;
+    int                            nW_ = 1;
+    bool                           quit_ = false;
+};
+
+// Frame-to-frame scratch for renderFrame. The G-buffer alone is ~85 bytes per pixel
+// (~100 MB at 1280x960 counting the HDR accumulator), so allocating and value-filling it
+// from scratch EVERY frame — as the old local vectors did — cost more than the entire
+// rasterization: freshly mapped pages must be zeroed by the OS and then faulted in,
+// twice over per frame. A caller that renders repeatedly (the interactive explorer, a
+// flyby, the meter pre-pass) passes one of these to reuse the allocations; only zbuf is
+// actually re-cleared per frame (in parallel), because every other channel is written
+// before it is read: the shade/encode passes read them solely where zbuf > 0, and any
+// pixel with zbuf > 0 had ALL its channels stored by fillTriangleG this same frame.
+// The worker pool lives here too, so its threads persist across frames with the buffers.
+struct RasterScratch {
+    GBuffer                        g;
+    std::vector<Vec3>              accum;    // HDR shade target (bg written by the shade pass)
+    std::vector<STri>              stris;    // projected triangles (capacity reused)
+    std::vector<std::vector<STri>> parts;    // per-thread projection buffers
+    std::vector<float>             clearT, milkT;   // see-through products
+    std::unique_ptr<BandPool>      pool;     // persistent workers (created on first frame)
 };
 
 // --- Watertight coverage: canonical edge functions -------------------------------------
@@ -832,6 +906,86 @@ inline VtxScreen projectVtx(const Camera& cam, const VtxCS& v, int W, int H) {
     return s;
 }
 
+// Exact k-th smallest of n NON-NEGATIVE doubles — the same value std::nth_element would
+// leave at [k] — found with two parallel O(n) scans instead of nth_element's serial
+// partition recursion (which was the auto-exposure anchor's dominant cost: ~4 ms alone
+// for a 1.2-Mpixel frame). Non-negative IEEE doubles order monotonically as their raw
+// bit patterns, so a histogram over the TOP 16 BITS partitions the values into 65536
+// order-preserving buckets: find the bucket holding rank k by prefix sum, collect just
+// that bucket's members (typically a few dozen), and select within them. Selection is by
+// VALUE over a multiset, so neither the pack order nor tie order can change the result.
+// May permute v[] (the small-n path selects in place), exactly as nth_element did.
+inline double selectKthNonNeg(double* v, size_t n, size_t k,
+                              BandPool* pool, int nThreads) {
+    if (n == 0) return 0.0;
+    if (k >= n) k = n - 1;
+    constexpr int B = 1 << 16;
+    if (!pool || nThreads <= 1 || n < ((size_t)1 << 15)) {   // small frames: not worth scans
+        std::nth_element(v, v + k, v + n);
+        return v[k];
+    }
+    const int nB = pool->size();
+    static thread_local std::vector<uint32_t> s_hist;        // per-worker histogram slabs
+    if (s_hist.size() < (size_t)nB * B) s_hist.resize((size_t)nB * B);
+    uint32_t* histBase = s_hist.data();
+    const size_t chunk = (n + nB - 1) / nB;
+    pool->run([&](int ti) {
+        uint32_t* h = histBase + (size_t)ti * B;
+        std::fill(h, h + B, 0u);                             // also zeroes idle workers' slabs
+        size_t a = (size_t)ti * chunk, b = std::min(n, a + chunk);
+        for (size_t i = a; i < b; ++i) {
+            uint64_t bits;
+            std::memcpy(&bits, &v[i], sizeof bits);
+            ++h[(int)(bits >> 48)];
+        }
+    });
+    // Merge the per-worker histograms (parallel over bucket ranges), then a serial prefix
+    // scan over the 65536 merged counts to locate the bucket holding rank k.
+    static thread_local std::vector<uint64_t> s_merged;
+    if (s_merged.size() < (size_t)B) s_merged.resize(B);
+    uint64_t* merged = s_merged.data();
+    {
+        const int bchunk = (B + nB - 1) / nB;
+        pool->run([&](int ti) {
+            int a = ti * bchunk, b = std::min(B, a + bchunk);
+            for (int bi = a; bi < b; ++bi) {
+                uint64_t c = 0;
+                for (int w = 0; w < nB; ++w) c += histBase[(size_t)w * B + bi];
+                merged[bi] = c;
+            }
+        });
+    }
+    size_t cum = 0; int bkt = 0; size_t inBkt = 0;
+    for (int bi = 0; bi < B; ++bi) {
+        if (cum + merged[bi] > k) { bkt = bi; inBkt = (size_t)merged[bi]; break; }
+        cum += merged[bi];
+    }
+    // Collect the target bucket's members: each worker owns a disjoint segment of the
+    // candidate buffer sized by its own histogram count, so no locking.
+    static thread_local std::vector<double> s_cand;
+    if (s_cand.size() < inBkt) s_cand.resize(inBkt);
+    double* cand = s_cand.data();
+    static thread_local std::vector<size_t> s_boff;
+    if (s_boff.size() < (size_t)nB) s_boff.resize(nB);
+    size_t* boff = s_boff.data();
+    {
+        size_t o = 0;
+        for (int ti = 0; ti < nB; ++ti) { boff[ti] = o; o += histBase[(size_t)ti * B + bkt]; }
+    }
+    pool->run([&](int ti) {
+        size_t a = (size_t)ti * chunk, b = std::min(n, a + chunk);
+        double* dst = cand + boff[ti];
+        for (size_t i = a; i < b; ++i) {
+            uint64_t bits;
+            std::memcpy(&bits, &v[i], sizeof bits);
+            if ((int)(bits >> 48) == bkt) *dst++ = v[i];
+        }
+    });
+    const size_t kk = k - cum;
+    std::nth_element(cand, cand + kk, cand + inBkt);
+    return cand[kk];
+}
+
 // sRGB gamma lookup table shared by the CPU tonemap below and the CUDA rasterizer's
 // on-device tonemap (raster_cuda.cu uploads these exact bytes once): the tone map clamps
 // each channel to [0,1] before encoding, and gamma is monotonic (anything >=1 saturates
@@ -865,20 +1019,28 @@ inline std::vector<uint8_t> exposeAndEncodeT(
         int W, int H, int nThreads,
         double expComp, bool autoExpose, double* lockAnchor,
         bool seeThrough, const float* clearT, const float* milkT,
-        const Vec3& milkColor) {
+        const Vec3& milkColor, BandPool* pool = nullptr) {
     const size_t N = (size_t)W * H;
     if (nThreads < 1) nThreads = 1;
+    if (pool && pool->size() != nThreads) pool = nullptr;   // stale pool: fall back to spawning
     auto parallelFor = [&](size_t n, const std::function<void(size_t, size_t)>& body) {
         if (n == 0) return;
         if (nThreads == 1) { body(0, n); return; }
-        std::vector<std::thread> pool;
         size_t chunk = (n + nThreads - 1) / nThreads;
+        if (pool) {
+            pool->run([&](int ti) {
+                size_t a = (size_t)ti * chunk, b = std::min(n, a + chunk);
+                if (a < b) body(a, b);
+            });
+            return;
+        }
+        std::vector<std::thread> tp;
         for (int ti = 0; ti < nThreads; ++ti) {
             size_t a = (size_t)ti * chunk, b = std::min(n, a + chunk);
             if (a >= b) break;
-            pool.emplace_back(body, a, b);
+            tp.emplace_back(body, a, b);
         }
-        for (auto& th : pool) th.join();
+        for (auto& th : tp) th.join();
     };
 
     // Auto-exposure anchor (mirror filmToRgb8): map the 99th-percentile luminance of the
@@ -890,8 +1052,8 @@ inline std::vector<uint8_t> exposeAndEncodeT(
     //
     // The collect runs banded across threads into a persistent scratch buffer: band ti
     // fills [off[ti], off[ti]+cnt[ti]) with its qualifying pixels in row-major order, so
-    // the packed buffer holds the exact sequence a serial scan would produce and
-    // nth_element selects the identical 99th-percentile value.
+    // the packed buffer holds the exact multiset a serial scan would produce and the
+    // k-th-smallest selection (selectKthNonNeg) yields the identical 99th-percentile value.
     double eAuto = 1.0;
     if (autoExpose) {
         if (lockAnchor && *lockAnchor > 0.0) {
@@ -912,49 +1074,56 @@ inline std::vector<uint8_t> exposeAndEncodeT(
                 const size_t bands = (size_t)nThreads;
                 const size_t chunk = (N + bands - 1) / bands;
                 std::vector<size_t> cnt(bands, 0), off(bands, 0);
-                {   // pass 1: count qualifying pixels per band (reads only zbuf/emis)
-                    std::vector<std::thread> pool;
-                    for (size_t ti = 0; ti < bands; ++ti) {
-                        size_t a = ti * chunk, b = std::min(N, a + chunk);
-                        if (a >= b) break;
-                        pool.emplace_back([&, ti, a, b] {
-                            size_t c = 0;
-                            for (size_t i = a; i < b; ++i)
-                                if (!(zbuf[i] <= 0.0f || emis[i])) ++c;
-                            cnt[ti] = c;
-                        });
-                    }
-                    for (auto& th : pool) th.join();
-                }
-                for (size_t ti = 0; ti < bands; ++ti) { off[ti] = total; total += cnt[ti]; }
-                if (s_lum.size() < total) s_lum.resize(total);
+                // Band bodies for the two scans; dispatched on the persistent pool when
+                // one was passed in, else on freshly spawned threads (identical split
+                // either way, so the packed order — and thus the anchor — is unchanged).
+                auto countBand = [&](size_t ti) {
+                    size_t a = ti * chunk, b = std::min(N, a + chunk);
+                    size_t c = 0;
+                    for (size_t i = a; i < b; ++i)
+                        if (!(zbuf[i] <= 0.0f || emis[i])) ++c;
+                    cnt[ti] = c;
+                };
                 // NB: s_lum is thread_local, and lambdas do NOT capture thread-locals —
                 // each worker would resolve the name to its own empty instance. Hand the
                 // workers a plain pointer to *this* thread's buffer instead.
-                double* lumBase = s_lum.data();
-                {   // pass 2: pack each band's luminances at its offset
-                    std::vector<std::thread> pool;
-                    for (size_t ti = 0; ti < bands; ++ti) {
-                        size_t a = ti * chunk, b = std::min(N, a + chunk);
-                        if (a >= b) break;
-                        pool.emplace_back([&, ti, a, b] {
-                            double* dst = lumBase + off[ti];
-                            for (size_t i = a; i < b; ++i) {
-                                if (zbuf[i] <= 0.0f || emis[i]) continue;
-                                const Vec3 c = pixel(i);
-                                *dst++ = std::max({c.x, c.y, c.z, 0.0});
-                            }
-                        });
+                auto packBand = [&](size_t ti, double* lumBase) {
+                    size_t a = ti * chunk, b = std::min(N, a + chunk);
+                    double* dst = lumBase + off[ti];
+                    for (size_t i = a; i < b; ++i) {
+                        if (zbuf[i] <= 0.0f || emis[i]) continue;
+                        const Vec3 c = pixel(i);
+                        *dst++ = std::max({c.x, c.y, c.z, 0.0});
                     }
-                    for (auto& th : pool) th.join();
-                }
+                };
+                auto runBands = [&](const std::function<void(size_t)>& body) {
+                    if (pool) {
+                        pool->run([&](int ti) {
+                            size_t a = (size_t)ti * chunk;
+                            if (a < N) body((size_t)ti);
+                        });
+                        return;
+                    }
+                    std::vector<std::thread> tp;
+                    for (size_t ti = 0; ti < bands; ++ti) {
+                        size_t a = ti * chunk;
+                        if (a >= N) break;
+                        tp.emplace_back(body, ti);
+                    }
+                    for (auto& th : tp) th.join();
+                };
+                runBands(countBand);                    // pass 1: count per band
+                for (size_t ti = 0; ti < bands; ++ti) { off[ti] = total; total += cnt[ti]; }
+                if (s_lum.size() < total) s_lum.resize(total);
+                double* lumBase = s_lum.data();
+                runBands([&](size_t ti) { packBand(ti, lumBase); });   // pass 2: pack
             }
             if (total > 0) {
-                // Only the 99th-percentile order statistic matters, so partition instead
-                // of a full sort (O(n) vs O(n log n)).
+                // Only the 99th-percentile order statistic matters, so select instead of
+                // sorting — and in parallel (radix-bucket scan) instead of nth_element's
+                // serial partition recursion.
                 size_t k = (size_t)(0.99 * (total - 1));
-                std::nth_element(s_lum.begin(), s_lum.begin() + k, s_lum.begin() + total);
-                double p99 = s_lum[k];
+                double p99 = selectKthNonNeg(s_lum.data(), total, k, pool, nThreads);
                 eAuto = (p99 > 0.0) ? 0.9 / p99 : 1.0;
             }
             if (lockAnchor) *lockAnchor = eAuto;    // first frame sets the anchor
@@ -995,14 +1164,14 @@ inline std::vector<uint8_t> exposeAndEncode(
         const std::vector<uint8_t>& emis, int W, int H, int nThreads,
         double expComp, bool autoExpose, double* lockAnchor,
         bool seeThrough, const std::vector<float>& clearT, const std::vector<float>& milkT,
-        const Vec3& milkColor) {
+        const Vec3& milkColor, BandPool* pool = nullptr) {
     const Vec3* A = accum.data();
     return exposeAndEncodeT([A](size_t i) { return A[i]; },
                             zbuf.data(), emis.data(), W, H, nThreads,
                             expComp, autoExpose, lockAnchor, seeThrough,
                             clearT.empty() ? nullptr : clearT.data(),
                             milkT.empty()  ? nullptr : milkT.data(),
-                            milkColor);
+                            milkColor, pool);
 }
 
 // Render one camera to an 8-bit RGB image (row 0 = image top), multithreaded by
@@ -1028,11 +1197,16 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                                         int nThreads, double exposure = 1.0,
                                         bool autoExpose = true, double* lockAnchor = nullptr,
                                         bool seeThrough = false, double glassClarity = 0.85,
-                                        const Scene* scenePtr = nullptr) {
+                                        const Scene* scenePtr = nullptr,
+                                        RasterScratch* scratch = nullptr) {
     // Geometry and its side tables arrive together (a PTri's `mix` index is only meaningful
     // against the mixes built alongside it), then are aliased for the passes below.
     const std::vector<PTri>& tris  = geom.tris;
     const std::vector<PMix>& mixes = geom.mixes;
+    // Frame-to-frame buffer reuse (see RasterScratch): a caller that renders repeatedly
+    // passes a scratch; a one-shot caller gets a frame-local one and behaves as before.
+    RasterScratch localScratch;
+    RasterScratch& S = scratch ? *scratch : localScratch;
     // The shade pass needs more of the Scene than just its textures: scalar patterns are
     // evaluated per pixel and the pattern VM reads the scene's `grid:`/`scatter:` tables
     // through bindPatScene. Passing the Scene (rather than a texture vector) is what lets
@@ -1048,19 +1222,25 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
 
     if (nThreads < 1) nThreads = 1;
 
-    // Tiny parallel-for over [0,n): splits into nThreads contiguous chunks. Used by the
-    // shading + tone-map passes (each pixel is independent, so no locking needed).
+    // Persistent workers for every parallel pass below (see BandPool). Created on the
+    // first frame and reused for the rest of the session; recreated only if the caller
+    // changes its thread count. Even a one-shot call (frame-local scratch) wins: one
+    // pool spawn serves all seven passes instead of each spawning its own threads.
+    if (nThreads > 1 && (!S.pool || S.pool->size() != nThreads))
+        S.pool = std::make_unique<BandPool>(nThreads);
+    BandPool* pool = (nThreads > 1) ? S.pool.get() : nullptr;
+
+    // Tiny parallel-for over [0,n): splits into nThreads contiguous chunks (the same
+    // partition the old spawn-per-pass version used, so band ownership is unchanged).
+    // Used by the shading + tone-map passes (each pixel is independent, no locking).
     auto parallelFor = [&](size_t n, const std::function<void(size_t, size_t)>& body) {
         if (n == 0) return;
-        if (nThreads == 1) { body(0, n); return; }
-        std::vector<std::thread> pool;
+        if (!pool) { body(0, n); return; }
         size_t chunk = (n + nThreads - 1) / nThreads;
-        for (int ti = 0; ti < nThreads; ++ti) {
+        pool->run([&](int ti) {
             size_t a = (size_t)ti * chunk, b = std::min(n, a + chunk);
-            if (a >= b) break;
-            pool.emplace_back(body, a, b);
-        }
-        for (auto& th : pool) th.join();
+            if (a < b) body(a, b);
+        });
     };
 
     // -- Pass 1: project every triangle ONCE (parallel over the triangle list). Each
@@ -1146,23 +1326,27 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
         }
     };
 
-    std::vector<STri> stris;
+    std::vector<STri>& stris = S.stris;
+    stris.clear();                               // keeps capacity across frames
     {
         int pT = std::min<int>(nThreads, std::max<size_t>(1, tris.size()));
-        if (pT <= 1) {
+        if (pT <= 1 || !pool) {
             stris.reserve(tris.size());
             projectRange(0, tris.size(), stris);
         } else {
-            std::vector<std::vector<STri>> parts(pT);
-            std::vector<std::thread> pool;
+            std::vector<std::vector<STri>>& parts = S.parts;
+            if ((int)parts.size() < pT) parts.resize(pT);
+            for (auto& p : parts) p.clear();     // ALL of them (keeps capacity): a stale
+                                                 // buffer past this frame's pT must not
+                                                 // leak into the concatenation below
             size_t chunk = (tris.size() + pT - 1) / pT;
-            for (int ti = 0; ti < pT; ++ti) {
+            pool->run([&](int ti) {
+                if (ti >= pT) return;
                 size_t a = (size_t)ti * chunk, b = std::min(tris.size(), a + chunk);
-                if (a >= b) break;
-                parts[ti].reserve((b - a));
-                pool.emplace_back([&, ti, a, b]{ projectRange(a, b, parts[ti]); });
-            }
-            for (auto& th : pool) th.join();
+                if (a >= b) return;
+                parts[ti].reserve(b - a);
+                projectRange(a, b, parts[ti]);
+            });
             size_t tot = 0; for (auto& p : parts) tot += p.size();
             stris.reserve(tot);
             for (auto& p : parts) stris.insert(stris.end(), p.begin(), p.end());
@@ -1176,29 +1360,37 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     const double kRimStrength    = 0.55;                     // extra silhouette milk (Fresnel-ish)
     const Vec3   kMilkColor{0.52, 0.55, 0.60};               // display-space haze tint
 
-    // Dispatch a per-row-band body across nThreads (each band owns disjoint rows -> no locking).
+    // Dispatch a per-row-band body across nThreads (each band owns disjoint rows -> no
+    // locking; the same row split the old spawn-per-pass version used).
     auto dispatchBands = [&](const std::function<void(int,int)>& body) {
-        if (nThreads == 1) { body(0, H); return; }
-        std::vector<std::thread> pool;
+        if (!pool) { body(0, H); return; }
         int rows = (H + nThreads - 1) / nThreads;
-        for (int ti = 0; ti < nThreads; ++ti) {
+        pool->run([&](int ti) {
             int y0 = ti * rows, y1 = std::min(H, y0 + rows);
-            if (y0 >= y1) break;
-            pool.emplace_back(body, y0, y1);
-        }
-        for (auto& th : pool) th.join();
+            if (y0 < y1) body(y0, y1);
+        });
     };
 
     // -- Pass 2: deferred G-buffer rasterization, parallel by horizontal row-bands. Each
     // band owns rows [y0,y1) so bands never touch the same pixel (no locking). Triangles
     // whose y-span misses the band are skipped in O(1) via the precomputed iy0/iy1.
-    GBuffer g;
-    g.zbuf.assign(N, 0.0f);
-    g.wpos.assign(N, Vec3{0,0,0});
-    g.wn.assign(N, Vec3{0,0,0});
-    g.tri.assign(N, -1);
-    g.emis.assign(N, 0);
-    g.uv.assign(N, Vec3{0,0,0});
+    //
+    // Only zbuf is cleared (in parallel — a serial fill of these buffers used to dominate
+    // the whole frame). Every other channel is write-before-read: the shade and encode
+    // passes read them exclusively where zbuf > 0, and a pixel with zbuf > 0 had all its
+    // channels stored by fillTriangleG this same frame (uv whenever its triangle's
+    // bindings read UVs, which is exactly when the shade pass samples them). resize()
+    // value-initializes only on growth, so steady-state frames touch nothing here.
+    GBuffer& g = S.g;
+    g.zbuf.resize(N);
+    g.wpos.resize(N);
+    g.wn.resize(N);
+    g.tri.resize(N);
+    g.emis.resize(N);
+    g.uv.resize(N);
+    parallelFor(N, [&](size_t a, size_t b) {
+        std::fill(g.zbuf.begin() + a, g.zbuf.begin() + b, 0.0f);
+    });
     dispatchBands([&](int y0, int y1) {
         for (const STri& s : stris) {
             if (s.iy1 < y0 || s.iy0 >= y1) continue;   // triangle can't touch this band
@@ -1210,10 +1402,18 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     // -- Pass 2b (see-through only): accumulate the clear surfaces' cumulative transmittance
     // (`clearT`, product of glassClarity per crossed surface) and milk product (`milkT`)
     // against the now-complete opaque depth. Order-independent, so no transparent sort.
-    std::vector<float> clearT, milkT;
+    // These ARE read at every pixel by the encode pass, so both get a real fill (parallel,
+    // reusing the scratch allocation).
+    std::vector<float>& clearT = S.clearT;
+    std::vector<float>& milkT  = S.milkT;
+    if (!seeThrough) { clearT.clear(); milkT.clear(); }
     if (seeThrough) {
-        clearT.assign(N, 1.0f);
-        milkT.assign(N, 1.0f);
+        clearT.resize(N);
+        milkT.resize(N);
+        parallelFor(N, [&](size_t a, size_t b) {
+            std::fill(clearT.begin() + a, clearT.begin() + b, 1.0f);
+            std::fill(milkT.begin() + a, milkT.begin() + b, 1.0f);
+        });
         dispatchBands([&](int y0, int y1) {
             for (const STri& s : stris) {
                 if (!s.clear) continue;
@@ -1226,13 +1426,20 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
 
     // -- Pass 3: shade each covered pixel exactly once (parallel over pixels). Overlapping
     // triangles no longer re-shade the same pixel — only the winning surface is shaded.
-    std::vector<Vec3> accum(N, bg);
+    // The background tint is written HERE (rather than pre-filling the whole buffer
+    // serially before the pass): every pixel gets exactly one store either way, so the
+    // pre-fill was pure extra traffic.
+    std::vector<Vec3>& accum = S.accum;
+    accum.resize(N);
     parallelFor(N, [&](size_t a, size_t b) {
         for (size_t i = a; i < b; ++i) {
-            if (g.zbuf[i] <= 0.0f) continue;         // background stays bg tint
+            if (g.zbuf[i] <= 0.0f) { accum[i] = bg; continue; }   // background tint
             const int si = g.tri[i];
-            if (si < 0 || si >= (int)tris.size()) continue;
+            if (si < 0 || si >= (int)tris.size()) { accum[i] = bg; continue; }
             const PTri& pt = tris[si];
+            // The unit shading normal, needed by (almost) every path below — normalized
+            // ONCE instead of separately by the pattern context and the lighting model.
+            const Vec3 N0 = normalize(g.wn[i]);
             // The PatCtx the tracer builds at a hit (world point, oriented normal, u, v —
             // and fieldVal 0, which is exact here because an isosurface's marched vertices
             // lie on the level set). Built at most ONCE per pixel and only when something
@@ -1241,8 +1448,7 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             bool   pcReady = false;
             auto   ctx = [&]() -> const PatCtx& {
                 if (!pcReady) {
-                    pc = makePatCtx(g.wpos[i], 0.0, normalize(g.wn[i]),
-                                    g.uv[i].x, g.uv[i].y);
+                    pc = makePatCtx(g.wpos[i], 0.0, N0, g.uv[i].x, g.uv[i].y);
                     bindPatScene(pc, *scenePtr);
                     pcReady = true;
                 }
@@ -1250,12 +1456,19 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             };
             // A `weight_map`-driven two-child mix selects a WHOLE material payload per
             // pixel — albedo, skin and pattern drives together — so resolve it before
-            // reading any of them. Hard threshold at 0.5, exactly as mixResolveDominant().
+            // reading any of them. Hard threshold at 0.5, exactly as mixResolveDominant()
+            // (same pattern/texture evaluation, same clamp). The PatCtx is only built for
+            // a PATTERN mask; a texture mask samples straight from the interpolated UV.
             const PShade* sh = &pt;
             if (scenePtr && pt.mix >= 0 && pt.mix < (int)mixes.size()) {
                 const PMix& mx = mixes[pt.mix];
-                if (previewMixWeight(mx, *scenePtr, ctx(), g.uv[i].x, g.uv[i].y) < 0.5)
-                    sh = &mx.b;
+                double wt = 0.0;
+                if (mx.weightPat >= 0 && mx.weightPat < (int)scenePtr->patterns.size())
+                    wt = scenePtr->patterns[mx.weightPat].eval(ctx());
+                else if (mx.weightTex >= 0 && mx.weightTex < (int)scenePtr->textures.size())
+                    wt = scenePtr->textures[mx.weightTex].scalarAt(g.uv[i].x, g.uv[i].y);
+                wt = (wt < 0.0) ? 0.0 : (wt > 1.0 ? 1.0 : wt);
+                if (wt < 0.5) sh = &mx.b;
             }
             Vec3 col = sh->color;
             // Image skin: replace the flat albedo with the texture's linear RGB, sampled
@@ -1280,16 +1493,26 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             // (see projectRange). Testing the smoothly-interpolated normal per pixel used
             // to invert it in a 1-px band at every silhouette, where dot(N,V) legitimately
             // grazes through zero — that produced dark speckles on the sphere's rim.
-            Vec3 N3 = normalize(g.wn[i]);
+            Vec3 N3 = N0;
             // Tangent-space normal map. The rasterizer has no per-vertex tangents, so the
-            // frame is derived from the UV gradient the same way the mesh loader would:
-            // an arbitrary but stable basis about N when UVs are degenerate. Perturbing
-            // here (not in the G-buffer) keeps the pass-2 inner loop untouched.
+            // frame comes from the triangle's UV gradient — precomputed by tessellate()'s
+            // tangent bake (PTri::tanRaw), since it is constant over the triangle; only
+            // the Gram-Schmidt against the interpolated normal is per-pixel work. A zero
+            // tanRaw means degenerate/absent UVs: fall back to a stable basis about N,
+            // exactly as before. Perturbing here (not in the G-buffer) keeps the pass-2
+            // inner loop untouched.
             if (textures && sh->normalTex >= 0 && sh->normalTex < (int)textures->size()) {
                 const Texture& nx = (*textures)[sh->normalTex];
                 if (nx.valid()) {
-                    Vec3 T = triTangent(pt, N3);
-                    if (dot(T, T) > 1e-18) {
+                    Vec3 T = pt.tanRaw;
+                    if (!(dot(T, T) > 0.0)) {
+                        Vec3 ax = (std::fabs(N3.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+                        T = cross(ax, N3);
+                    }
+                    T = T - N3 * dot(N3, T);     // re-orthogonalize against the shading normal
+                    double tl = std::sqrt(dot(T, T));
+                    if (tl > 1e-12) {
+                        T = T * (1.0 / tl);
                         Vec3 B3 = cross(N3, T);
                         Vec3 tn = nx.sampleNormalTS(g.uv[i].x, g.uv[i].y);
                         double s3 = sh->normalStrength;
@@ -1321,9 +1544,10 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
 
     // Auto-exposure + sRGB tone map: shared with the CUDA rasterizer (see exposeAndEncode),
     // so both backends anchor and encode identically. The see-through buffers are empty when
-    // !seeThrough and simply ignored by the helper in that case.
+    // !seeThrough and simply ignored by the helper in that case. Rides the same worker pool
+    // as the passes above (its three scans used to spawn their own threads each).
     return exposeAndEncode(accum, g.zbuf, g.emis, W, H, nThreads, expComp, autoExpose,
-                           lockAnchor, seeThrough, clearT, milkT, kMilkColor);
+                           lockAnchor, seeThrough, clearT, milkT, kMilkColor, pool);
 }
 
 // Draw a red look-at crosshair at world point `target` onto an already-rendered RGB

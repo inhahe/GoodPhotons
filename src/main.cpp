@@ -7753,6 +7753,11 @@ static int run(int argc, char** argv) {
 #endif
         // Render one preview frame: GPU when it's baked (any projection / skins / see-through),
         // else the CPU rasterizer. A GPU device failure returns empty -> CPU fallback too.
+        // The CPU path reuses one RasterScratch across every frame of the session (meter
+        // pre-pass, stills, flybys, interactive loop): its ~85 B/pixel of G-buffer would
+        // otherwise be re-allocated and re-zeroed per frame, which used to cost more than
+        // the rasterization itself.
+        raster::RasterScratch rasterScratch;
         auto rasterOne = [&](const Camera& cam, int W, int H, double ev, bool autoExp,
                              double* lock) -> std::vector<uint8_t> {
 #ifdef HAVE_CUDA
@@ -7773,7 +7778,7 @@ static int run(int argc, char** argv) {
 #endif
             ensurePrims();   // lazy fallback (also the sole path when the GPU is unavailable)
             return raster::renderFrame(prims, cam, W, H, plight, nThreads, ev, autoExp, lock,
-                                       rasterSeeThrough, rasterClarity, &scene);
+                                       rasterSeeThrough, rasterClarity, &scene, &rasterScratch);
         };
 
         // Exposure-lock meter pre-pass: for each locked group, raster its selected metering
