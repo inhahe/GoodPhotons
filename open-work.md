@@ -234,7 +234,10 @@ not would have been exactly the asymmetry that becomes debt later:
 Verified: 48 new tests in `tools/loom/tests/test_grid_term.py` (1328 loom tests green), and
 ftrace loads and renders the emitted `.ftsl` with no warnings — an A/B render against an
 all-constant grid moves the two table-driven channels while the deliberately-constant channel
-stays at ratio exactly 1.000.
+stays at ratio exactly 1.000.  The rendered image also carries the field itself: dividing each
+grid-driven channel by the constant one cancels the cosine shading that otherwise dominates the
+eye, leaving R/B spanning 1.00–1.77 and G/B spanning 1.10–1.57 across the sphere — the wider
+red spread is exactly what the narrower green albedo range (`0.15 + 0.6*g`) predicts.
 
 ### FUTURE — loom full `.ftsl` read support  *(loom; large)*
 *TODO.md, the `FUTURE` bullet under §J3c.*
