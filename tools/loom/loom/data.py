@@ -386,14 +386,29 @@ class Grid(_Transformable):
         return self._id
 
     def __call__(self, *query, interp: str = "linear", on_outside: str = "clamp"):
-        """Sample this grid as a field of position: ``grid(x, y)`` (scalars or Signals)
-        or ``grid(vec(...))`` → a :class:`~loom.interp.GridField` (scalar grid) or
-        :class:`~loom.interp.VecGridField` (vector grid), a Signal node in the DAG.  This
-        mirrors ftsl's ``n(x,y)`` expression form; call ``.at(clock)`` to evaluate it, or
-        use :meth:`sample` for an eager number."""
+        """Sample this grid as a field of position — in **either tier**, chosen by what
+        the query is made of.
+
+        * A *temporal* query (numbers, :class:`~loom.signals.core.Signal`\\s,
+          ``vec(...)``) → a :class:`~loom.interp.GridField` /
+          :class:`~loom.interp.VecGridField`: a Signal node in the modulation DAG.
+          Call ``.at(clock)`` to evaluate it, or :meth:`sample` for an eager number.
+        * A *spatial* query — any :class:`~loom.spatial.SpatialExpr` argument, e.g.
+          ``grid(X, Y)`` → a :class:`~loom.spatial.GridSample`: a term of the field
+          algebra that **renders**, emitting ftsl's ``grid:<name>(c0, …)`` table call
+          with its ``grid { … }`` block collected automatically by
+          :meth:`loom.Scene.add`.
+
+        Both tiers interpolate identically (loom's ``_grid_weights`` and ftrace's
+        ``patGridSample`` are documented twins), so the choice is only about *where*
+        the answer is consumed, not what it is."""
         from .interp import GridField, VecGridField   # lazy: avoid data<->interp cycle
+        from .spatial import SpatialExpr, GridSample
+        q = _query_of(query)
+        if isinstance(q, (list, tuple)) and any(isinstance(c, SpatialExpr) for c in q):
+            return GridSample(self, q, interp=interp, on_outside=on_outside)
         Field = VecGridField if self.is_vector else GridField
-        return Field(self, _query_of(query), interp=interp, on_outside=on_outside)
+        return Field(self, q, interp=interp, on_outside=on_outside)
 
     def sample(self, *query, clock=None, interp: str = "linear",
                on_outside: str = "clamp"):
@@ -459,14 +474,23 @@ class Scatter(_Transformable):
         return _resolve_channel(self.channels, self.value_dim, channel)
 
     def __call__(self, *query, power: float = 2.0, eps: float = 1e-9):
-        """Sample this scatter set as a field of position: ``scatter(x, y)`` (scalars or
-        Signals) or ``scatter(vec(...))`` → a :class:`~loom.interp.ScatterField` (scalar)
-        or :class:`~loom.interp.VecScatterField` (vector), a Signal node (Shepard
-        inverse-distance, exponent ``power``).  Mirrors ftsl's ``n(x,y)``; call
-        ``.at(clock)`` to evaluate, or use :meth:`sample` for an eager number."""
+        """Sample this scatter set as a field of position — in **either tier**, exactly
+        like :meth:`Grid.__call__`.
+
+        * A *temporal* query (numbers, Signals, ``vec(...)``) → a
+          :class:`~loom.interp.ScatterField` / :class:`~loom.interp.VecScatterField`:
+          a Signal node (Shepard inverse-distance, exponent ``power``).
+        * A *spatial* query (any :class:`~loom.spatial.SpatialExpr`, e.g.
+          ``scatter(X, Y)``) → a :class:`~loom.spatial.ScatterSample`, a renderable
+          term emitting ftsl's ``scatter:<name>(c0, …)`` with its ``scatter { … }``
+          block collected by :meth:`loom.Scene.add`."""
         from .interp import ScatterField, VecScatterField  # lazy: avoid data<->interp cycle
+        from .spatial import SpatialExpr, ScatterSample
+        q = _query_of(query)
+        if isinstance(q, (list, tuple)) and any(isinstance(c, SpatialExpr) for c in q):
+            return ScatterSample(self, q, power=power, eps=eps)
         Field = VecScatterField if self.is_vector else ScatterField
-        return Field(self, _query_of(query), power=power, eps=eps)
+        return Field(self, q, power=power, eps=eps)
 
     def sample(self, *query, clock=None, power: float = 2.0, eps: float = 1e-9):
         """Eagerly read the scatter field at an explicit query point: returns a ``float``

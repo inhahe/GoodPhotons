@@ -149,7 +149,7 @@ def test_scene_expands_bundle_into_companions_before_the_material():
                  roughness=0.5 + 0.5 * sin(6.0 * X), albedo_default=0.8)
     sc = Scene(_cam())
     sc.add(m, Sphere((0, 0, 0), 1, "gold"),
-           Light("point", position=(3, 3, 3), name="key"))
+           Light("sphere", center=(3, 3, 3), radius=0.4, power=4000))
     txt = sc.emit(Clock(t=0.0), Cache())
     # companions emitted, referenced by the material, no bundle syntax leaked
     assert "gold_reflect = texture" in txt

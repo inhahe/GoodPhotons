@@ -274,6 +274,52 @@ inverse exactly round-trips the ftrace forward map; every transform parameter is
 (so the remap animates and threads into the DAG). Applies to 2-D or 3-D datasets (2-D uses
 the in-plane parameters only: translate/scale XY, rotate about Z, skew X-along-Y).
 
+**Two tiers: a dataset is both a modulator and a renderable term.** Everything above is
+the *temporal* tier — an interpolator is a `Signal`, so it bakes to one number at a clock.
+That is right for driving a knob and wrong for a field that must vary *across a surface*
+during a render. ftrace already had the other half: `grid { shape / lo / hi / outside /
+data }` and `scatter { dim / power / eps / data }` blocks (loaded in Pass 1a, `src/ftsl.h`
+`addGrid`/`addScatter`), sampled from any pattern expression as `grid:<name>(c0, …)` /
+`scatter:<name>(c0, …)` (`PatOp::Grid`/`PatOp::Scatter`, `src/pattern.h`). So
+`Grid.__call__`/`Scatter.__call__` dispatch on **what the query is made of**:
+
+| query | builds | lives in |
+|---|---|---|
+| numbers / `Signal`s / `vec(...)` | `GridField` / `ScatterField` (+ `Vec*`, RBF) | the modulation DAG |
+| any `SpatialExpr` — `grid(X, Y)` | `GridSample` / `ScatterSample` (`spatial.py`) | the field algebra (emitted) |
+
+The spatial leaves are ordinary `SpatialExpr` nodes: their coordinates are sub-expressions
+(so the lattice is warpable, and `substitute` reaches them, so a material bundle's
+`u=`/`v=` binding flows in), and like every other spatial node they carry **both backends**
+— `emit()` writes the table call, `eval_np()` is a vectorised port of ftrace's
+`patGridSample`/`patScatterSample`, which are themselves the documented twins of loom's
+`_grid_weights`/`_shepard_weights`. So the 2-D raster preview, the temporal field and the
+render agree by construction, not by coincidence.
+
+The companion **`GridDecl`/`ScatterDecl`** blocks (`scene.py`) bake the values — and a
+scatter's *positions* — at the emit clock, so a modulated dataset re-emits new numbers every
+frame while a grid's lattice stays put (the Grid contract, unchanged). `Scene.add` collects
+them automatically from `SpatialExpr.table_decls()`, deduped by name, with an explicit
+declaration winning — the same mechanism `Image` → `Texture` uses, so an author who writes
+`grid(X, Y)` never declares a block. The out-of-domain policy lives on the *block*, not the
+call, so it takes part in the auto-name (`grid_<id>_<outside>`) and one dataset sampled under
+two policies emits two blocks rather than silently colliding; likewise a scatter's
+`power`/`eps`.
+
+**Placement folds into the query on the spatial tier**, because ftsl's block has no
+transform of its own — so a `.transformed()` dataset inverse-maps the *emitted coordinate
+arguments* instead of the data. `Transform.inverse_apply` (Signals) and
+`Transform.inverse_apply_spatial` (field expressions) share one body,
+`_inverse_map(c, d, wrap)`, where `wrap` lifts a transform parameter into the caller's
+algebra — one formula, two backends, so a placement can never mean two different things.
+
+**What ftrace cannot express is refused, not approximated** (the policy `VolumeField.emit`
+already used): a vector-valued dataset (`PatGrid`/`PatScatter` store scalar floats),
+`interp="cubic"` (`patGridSample` is separable N-linear only), `on_outside="raise"` (a
+renderer samples millions of times per frame and cannot throw) and more than four axes
+(`PAT_ND_MAX_DIM`) each raise with the reason and the alternative. All four remain available
+on the temporal tier, which is not a renderer.
+
 Because interpolators are `Signal`s, you can: feed a modulator into a control point;
 *or* feed an N-D value into an interpolator to read a value out and pass it onward;
 *or* chain modulators through interpolators arbitrarily. All one DAG, all cycle-checked.
@@ -658,8 +704,10 @@ tools/loom/
       bindings.py           slot-shape validators (colour / scalar / map binds)
       spectrum.py           spectrum-expression validator
       emit_cpp.py           grammar → ftrace C++ front-end
+    spatial.py              SpatialExpr field algebra (both backends: emit + eval_np), incl. Image / GridSample / ScatterSample terms
     scene.py                Scene, evaluate(), serialize/round-trip (new)
     ftsl_emit.py            snapshot → .ftsl text (new)
+    atomicio.py             the one atomic temp+replace writer (with the Windows sharing retry)
     drive.py                render_range, viewer, assembly, seed (new)
     mcubes.py               marching cubes: bake a field to a mesh (M7)
     vdbio.py                bake a field to a dense grid + write/read .vdb, read .nvdb (E4)

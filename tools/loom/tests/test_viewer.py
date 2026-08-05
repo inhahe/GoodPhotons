@@ -31,7 +31,7 @@ def build(clock=None, *, radius=0.12):
     mat = Material("skin", "diffuse", roughness=grid(0.5, 0.5))  # references Grid
     ball = Sphere((2, 0, 0), scat(0.5, 0.5), "skin")             # references Scatter
     sc = Scene(cam)
-    sc.add(mat, tb, ball, Light("point", intensity=1.0))
+    sc.add(mat, tb, ball, Light("sphere", center=(0, 3, 0), radius=0.2, power=1000))
     return sc
 
 
@@ -438,7 +438,7 @@ def test_introspect_datasets_sorted_and_unique():
 def test_introspect_camera_and_lights():
     d = introspect(build())
     assert d["camera"]["class"] == "Camera"
-    assert d["lights"] and d["lights"][0]["kind"] == "point"
+    assert d["lights"] and d["lights"][0]["kind"] == "sphere"
 
 
 # --------------------------------------------------------------------------
@@ -685,7 +685,7 @@ def _sphere_build(clock=None, *, radius=0.25):
     cam = Camera(eye=(0, 0, 5), look_at=(0, 0, 0))
     mat = Material("skin", "diffuse")
     sc = Scene(cam)
-    sc.add(mat, Sphere((0, 0, 0), radius, "skin"), Light("point", intensity=1.0))
+    sc.add(mat, Sphere((0, 0, 0), radius, "skin"), Light("sphere", center=(0, 3, 0), radius=0.2, power=1000))
     return sc
 
 

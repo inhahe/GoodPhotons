@@ -188,7 +188,7 @@ def test_scene_auto_declares_the_texture_a_material_field_samples():
                  roughness=0.05 + 0.9 * Image("grime.png", name="grime"))
     sc = Scene(_cam())
     sc.add(m, Sphere((0, 0, 0), 1, "wall"),
-           Light("point", position=(3, 3, 3), name="key"))
+           Light("sphere", center=(3, 3, 3), radius=0.4, power=4000))
     txt = sc.emit(Clock(t=0.0), Cache())
     assert "grime = texture" in txt
     assert "tex:grime(" in txt
@@ -203,7 +203,7 @@ def test_auto_declared_texture_precedes_every_use():
                  reflect=(Image("p.png", name="p"), V, 0.5))
     sc = Scene(_cam())
     sc.add(m, Sphere((0, 0, 0), 1, "skinny"),
-           Light("point", position=(3, 3, 3), name="key"))
+           Light("sphere", center=(3, 3, 3), radius=0.4, power=4000))
     txt = sc.emit(Clock(t=0.0), Cache())
     assert txt.index("p = texture") < txt.index("skinny_reflect = texture")
 
@@ -213,7 +213,7 @@ def test_scene_declares_a_shared_image_exactly_once():
     sc.add(Material("a", "glossy", roughness=Image("s.png", name="s")),
            Material("b", "glossy", roughness=1.0 - Image("s.png", name="s")),
            Sphere((0, 0, 0), 1, "a"),
-           Light("point", position=(3, 3, 3), name="key"))
+           Light("sphere", center=(3, 3, 3), radius=0.4, power=4000))
     txt = sc.emit(Clock(t=0.0), Cache())
     assert txt.count("s = texture") == 1
 
@@ -228,7 +228,7 @@ def test_an_explicit_texture_of_the_same_name_wins_in_either_order():
         sc = Scene(_cam())
         sc.add(*order)
         sc.add(Sphere((0, 0, 0), 1, "a"),
-               Light("point", position=(3, 3, 3), name="key"))
+               Light("sphere", center=(3, 3, 3), radius=0.4, power=4000))
         txt = sc.emit(Clock(t=0.0), Cache())
         assert txt.count("hand = texture") == 1
         assert "nearest" in txt          # the explicit declaration is the one kept

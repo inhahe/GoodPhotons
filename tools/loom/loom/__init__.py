@@ -28,7 +28,7 @@ from .interp import (
 )
 from .mathnd import Mat, rotation, rotations, slice3, Affine, affine
 from .scene import (
-    Scene, Material, Texture, skin, ProcTexture, func_skin, Sphere, Beads, Raw,
+    Scene, Material, Texture, GridDecl, ScatterDecl, skin, ProcTexture, func_skin, Sphere, Beads, Raw,
     Light, Camera, CameraCurve, Element, Group,
     Pattern, SweptMesh, IsoMesh, ribbon, tube, blob, fan, Volume,
     NamedSpectrum, Upsample,
@@ -79,7 +79,8 @@ from .viewer import (
     load_build, build_scene, introspect, ViewerModel,
 )
 from .spatial import (
-    SpatialExpr, Surface, Image, VolumeField, SigAt, sexpr, X, Y, Z, U, V, A, T,
+    SpatialExpr, Surface, Image, VolumeField, GridSample, ScatterSample, SigAt, sexpr,
+    X, Y, Z, U, V, A, T,
     SPATIAL_PATTERNS,
     sin, cos, tan, sqrt, exp, log, floor, fract, sign, saturate, sabs,
     smin, smax, spow, atan2, step, clamp, mix, smoothstep,
@@ -109,7 +110,7 @@ __all__ = [
     "VecGridField", "VecScatterField", "RbfScatterField", "VecRbfScatterField",
     "FieldCurve", "eval_curve",
     "Mat", "rotation", "rotations", "slice3", "Affine", "affine",
-    "Scene", "Material", "Texture", "skin", "ProcTexture", "func_skin",
+    "Scene", "Material", "Texture", "GridDecl", "ScatterDecl", "skin", "ProcTexture", "func_skin",
     "Sphere", "Beads", "Raw", "Light",
     "Camera", "CameraCurve", "Element", "Group", "Transform",
     "Pattern", "FuncPattern", "MixMaterial", "PATTERNS",
@@ -140,7 +141,8 @@ __all__ = [
     "assemble_gif_ffmpeg", "assemble_mp4", "find_ftrace",
     "PreviewServer", "preview_range",
     "load_build", "build_scene", "introspect", "ViewerModel",
-    "SpatialExpr", "Surface", "Image", "VolumeField", "SigAt", "sexpr",
+    "SpatialExpr", "Surface", "Image", "VolumeField", "GridSample",
+    "ScatterSample", "SigAt", "sexpr",
     "X", "Y", "Z", "U", "V", "A", "T",
     "SPATIAL_PATTERNS",
     "sin", "cos", "tan", "sqrt", "exp", "log", "floor", "fract", "sign",

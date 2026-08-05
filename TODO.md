@@ -2181,7 +2181,29 @@ question — *should grid/scatter points be multi-valued?* — with **YES**.
       DAG nodes that can drive scene variables; `.sample(u, clock)` polls at an explicit progression index
       returning `(coords, {channel: value})` (channel keys are dataset names if present, else indices).
       Explicit polling uses a private probe field over a mutable query so it doesn't disturb the bound
-      DAG. 8 new tests (`tests/test_fieldcurve.py`). **§H complete.**
+      DAG. 8 new tests (`tests/test_fieldcurve.py`).
+- [x] **H5 — the datasets became *renderable*, not just samplable.** ✅ 2026-08-05 (loom-only, no
+      `VERSION` bump). H1–H4 all live on the **temporal** tier: a field is a Signal, so a dataset could
+      drive a knob but baked to one number per frame and could never vary across a surface in a render.
+      ftrace has had the other half all along — the `grid { shape / lo / hi / outside / data }` and
+      `scatter { dim / power / eps / data }` blocks (Pass 1a, `src/ftsl.h` `addGrid`/`addScatter`)
+      sampled as `grid:<name>(c0, …)` / `scatter:<name>(c0, …)` (`PatOp::Grid`/`PatOp::Scatter`,
+      `src/pattern.h`) — so this is loom catching up to the renderer.
+      `Grid.__call__`/`Scatter.__call__` are now **dual-tier**: a temporal query builds the H1–H3 Signal
+      exactly as before, a query containing any `SpatialExpr` (`grid(X, Y)`) builds the new
+      `GridSample`/`ScatterSample` leaves (`loom/spatial.py`), which emit the table call and carry a
+      vectorised numpy port of `patGridSample`/`patScatterSample` so preview, temporal field and render
+      agree (~1e-15 against loom's own `_grid_weights`/`_shepard_weights`). The companion
+      `GridDecl`/`ScatterDecl` blocks (`loom/scene.py`) are collected automatically by `Scene.add` via
+      `SpatialExpr.table_decls()` — deduped by name, explicit declaration wins — the same mechanism
+      `Image` → `Texture` uses, so an author never declares one. **Placement folds into the query**
+      (ftsl's block has no transform of its own): `Transform.inverse_apply` and the new
+      `inverse_apply_spatial` now share one body, so the two tiers cannot drift. What ftrace cannot
+      express is **refused, not approximated** — vector-valued datasets (`PatGrid` stores scalar floats),
+      `interp="cubic"` (`patGridSample` is N-linear only), `on_outside="raise"` (a renderer cannot throw
+      per-sample) and > 4 axes (`PAT_ND_MAX_DIM`); all four remain available on the temporal tier.
+      48 new tests (`tests/test_grid_term.py`); 1328 loom tests green; ftrace renders the emitted
+      `.ftsl` with no warnings. **§H complete.**
 
 ---
 

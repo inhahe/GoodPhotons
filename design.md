@@ -1202,6 +1202,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   a live wrong render before 0.78.0, reachable via `medium { density pattern:<p> }`, which
   copies a table-scoped pattern's nodes into a medium evaluated without tables.
 
+  **loom emits both blocks (2026-08-05, loom-only).** The port ran one way for a while:
+  ftrace had the datatypes, but loom's own `Grid`/`Scatter` could still only be sampled in
+  Python (a `GridField` is a `Signal`, so it bakes to one number per frame). `grid(X, Y)` —
+  a query in ftsl's *spatial* coordinates — now builds a `GridSample`/`ScatterSample` term
+  (`loom/spatial.py`) that emits the table call, with the companion `grid`/`scatter` block
+  collected automatically by `Scene.add` and its values baked at the emit clock. Its
+  `eval_np` is a vectorised port of `patGridSample`/`patScatterSample`, so loom's raster
+  preview and the render agree; a dataset's placement `Transform` folds into the emitted
+  *coordinates*, since these blocks (unlike geometry) carry no transform of their own. What
+  ftrace cannot express — vector-valued samples, cubic interpolation, a throwing
+  out-of-domain policy, > 4 axes — raises in loom rather than emitting something that means
+  something else. See `tools/loom/DESIGN.md` §6.
+
   **Pattern-VM CSE (0.118.0).** Field formulas are the sphere-tracer's inner loop —
   `patternEval` was ~73% of mode W's CPU time on the gyroid scene — and authored
   expressions repeat subtrees heavily (each `6*rot(p)+φ` appears in both a `sin` and a

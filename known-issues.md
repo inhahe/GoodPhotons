@@ -8670,3 +8670,48 @@ and is now pinned by `ftrace -checkdenoise`:
 The lesson worth keeping: **energy conservation and a flat-field test both passed while the
 filter was making the image objectively worse.** The only metric that caught it was RMSE against
 a converged reference (`scraps/_dneval.py`), which is now how any change here should be judged.
+
+## FIXED (2026-08-05, loom-only): `write_obj`'s atomic replace flaked with WinError 5, and the same helper was copy-pasted four times
+`tools/loom/tests/test_mcubes.py::test_isomesh_static_field_baked_once` failed
+intermittently (once in three full-suite runs) with
+
+    PermissionError: [WinError 5] Access is denied:
+      '…\tmpwoxkkky5.obj.tmp' -> '…\s.obj'      (loom/sweep.py:235)
+
+`os.replace` is atomic on Windows but **not immune to sharing**: `MoveFileEx` fails with
+`ERROR_ACCESS_DENIED` (5) or `ERROR_SHARING_VIOLATION` (32) if anything holds a handle to
+the source or destination at that instant — which includes the antivirus scanner and the
+search indexer opportunistically opening a file loom just closed, not only a reader loom
+knows about. That makes it a live-channel hazard, not just a test flake: §F4 re-emits a
+scene on a worker thread while ftrace is loading the previous emission's assets out of the
+same directory, which is precisely when a handle collision is most likely.
+
+Aggravating factor: the same temp-file + `os.replace` + cleanup block existed **four
+times** — `sweep.py` `write_obj`, `anim.py` `CurveDrive.save`, and two byte-identical
+`_atomic_write_text` copies in `anim.py` and `viewer.py` — so a fix in one would not have
+reached the others.
+
+**Fix:** one shared `loom/atomicio.py` (`write_atomic` / `replace_atomic`) that all four
+call sites now use. It retries a `PermissionError` on a doubling backoff (2 ms → 64 ms,
+1 s total budget) and then re-raises, so a transient scanner handle costs milliseconds
+while a genuine permission problem still fails promptly and audibly. The temp file is
+still removed on any failure, so the old file survives intact. Pinned by
+`tools/loom/tests/test_atomicio.py` (6 tests): the retry succeeds after two simulated
+WinError 5s, a persistent one propagates with the old file unchanged, a non-sharing
+`OSError` is *not* retried, and no `.tmp` litter is left in any case.
+
+## FIXED (2026-08-05, loom-only): loom's own tests modelled a `point` light, which ftrace does not have
+Four loom test modules built scenes with `Light("point", position=(3, 3, 3), name="key")`
+or `Light("point", intensity=1.0)`. ftrace's `addLight` (`src/ftsl.h` ~4840) recognises
+`collimated` / `sphere` / `cylinder` / `spot` / `env` / `sun`, and **everything else falls
+through to the default rectangular area light** — so a `point` light renders as a large
+white quad, while `position` / `name` / `intensity` are unknown keys that only *warn*.
+
+Harmless inside those tests (none of them render), but it is exactly the kind of fixture
+that gets copied: writing a validation scene from that spelling produced a render dominated
+by a giant white quad before the cause was obvious. loom's `Light` is schema-free **on
+purpose** (its docstring: "loom does not invent light fields"), so the fix is not
+validation — it is that the fixtures now spell lights that exist:
+`Light("sphere", center=…, radius=…, power=…)` in `test_image_term.py`,
+`test_material_bundle.py` and `test_viewer.py`, and `Light("collimated", origin=…, dir=…)`
+in `test_grammar_scene.py` (which deliberately round-trips a *non-default* subtype).

@@ -214,6 +214,90 @@ class Texture(Element):
                 f'wrap {self.wrap} }}')
 
 
+class GridDecl(Element):
+    """A loom :class:`~loom.data.Grid` emitted as ftsl's ``grid "name" { … }`` block.
+
+    The companion declaration a :class:`~loom.spatial.GridSample` term needs: the
+    lattice (``shape``/``lo``/``hi``), its out-of-domain policy (``outside``) and the
+    samples, **baked at the emit clock** — a Grid's values are ordinary Signals, so a
+    modulated grid re-emits new numbers every frame while the lattice stays put
+    (which is exactly the Grid contract: positions fixed, values modulable).
+
+    Authors never write one: :meth:`Scene.add` collects it from the ``GridSample``
+    leaves in any field it is given, the same way it collects an :class:`Image`
+    term's :class:`Texture`.  ``outside`` belongs to the *block*, not to the sample
+    call, which is why one Grid sampled under two policies emits two blocks.
+    """
+
+    def __init__(self, name: str, grid, *, outside: str = "clamp") -> None:
+        self.name = name
+        self.grid = grid
+        if outside not in ("clamp", "wrap", "extrapolate"):
+            raise ValueError('grid outside must be "clamp", "wrap" or "extrapolate"')
+        self.outside = outside
+
+    def roots(self) -> List:
+        # the samples are the modulators; the lattice itself is fixed by design
+        return list(self.grid.values)
+
+    def emit(self, ctx: EmitCtx) -> str:
+        g = self.grid
+        clock, cache = ctx.clock, ctx.cache
+        L = [f'grid "{self.name}" {{']
+        L.append("    shape " + " ".join(str(int(s)) for s in g.shape))
+        L.append("    lo " + " ".join(fmt(v) for v in g.lo))
+        L.append("    hi " + " ".join(fmt(v) for v in g.hi))
+        L.append(f"    outside {self.outside}")
+        # C order, axis 0 outermost — the same order Grid._strides uses, and the
+        # order ftrace's `data` list is read in. One row per fastest axis run so a
+        # human can still read the block.
+        row = g.shape[-1]
+        L.append("    data {")
+        for start in range(0, len(g.values), row):
+            chunk = g.values[start:start + row]
+            L.append("        " + " ".join(fmt(v.at(clock, cache)) for v in chunk))
+        L.append("    }")
+        L.append("}")
+        return "\n".join(L)
+
+
+class ScatterDecl(Element):
+    """A loom :class:`~loom.data.Scatter` emitted as ftsl's ``scatter "name" { … }``
+    block — the ragged sibling of :class:`GridDecl`.
+
+    ``data`` interleaves each sample's coordinates with its value (ftrace reads it in
+    strides of ``dim + 1``), which is the point of a scatter: unlike a lattice, a
+    sample's position and value are not separable.  **Both** are Signals in loom, so
+    both are baked at the emit clock and a moving sample set re-emits every frame.
+    """
+
+    def __init__(self, name: str, scatter, *, power: float = 2.0,
+                 eps: float = 1e-9) -> None:
+        self.name = name
+        self.scatter = scatter
+        self.power = float(power)
+        self.eps = float(eps)
+
+    def roots(self) -> List:
+        return [*self.scatter.positions, *self.scatter.values]
+
+    def emit(self, ctx: EmitCtx) -> str:
+        s = self.scatter
+        clock, cache = ctx.clock, ctx.cache
+        L = [f'scatter "{self.name}" {{']
+        L.append(f"    dim {int(s.dim)}")
+        L.append(f"    power {fmt(self.power)}")
+        L.append(f"    eps {fmt(self.eps)}")
+        L.append("    data {")
+        for pos, val in zip(s.positions, s.values):
+            p = pos.at(clock, cache)
+            row = " ".join(fmt(c) for c in p[:s.dim])
+            L.append(f"        {row}   {fmt(val.at(clock, cache))}")
+        L.append("    }")
+        L.append("}")
+        return "\n".join(L)
+
+
 # colour-valued material slots — a field here lowers to a ``ProcTexture`` over the
 # surface u/v; every other slot is a scalar knob lowering to a world-space pattern.
 _COLOR_SLOTS = ("reflect", "transmit", "emit", "emission", "color", "tint")
@@ -1148,6 +1232,10 @@ class Scene:
         # resolves all three lazily so the order is not load-bearing — it just reads.
         self.spectra: List[Element] = []
         self.upsamplers: List[Element] = []
+        # `grid`/`scatter` blocks load in ftrace's Pass 1a, before textures/patterns/
+        # materials, so the order is not load-bearing — emitting them first just keeps
+        # the text reading top-down (data, then the fields that sample it).
+        self.tables: List[Element] = []
         self.textures: List[Element] = []
         self.patterns: List[Element] = []
         self.records: List[Element] = []
@@ -1178,10 +1266,33 @@ class Scene:
                     tex._auto_image = True
                     self.textures.append(tex)
 
+    def _add_table_decls(self, e: Element) -> None:
+        """Declare the ``grid`` / ``scatter`` blocks any
+        :class:`~loom.spatial.GridSample` or :class:`~loom.spatial.ScatterSample`
+        term inside ``e`` needs — the exact twin of :meth:`_add_image_textures`, and
+        for the same reason: the emitted ``grid:<name>(…)`` call is a dangling
+        reference until the block exists, so collecting it has to be automatic.
+
+        Deduped by name, so several fields sampling one dataset with the same
+        sampler settings share a single block."""
+        have = {getattr(g, "name", None) for g in self.tables}
+        for src in _spatial_fields(e):
+            for td in src.table_decls():
+                if td.name not in have:
+                    have.add(td.name)
+                    td._auto_table = True
+                    self.tables.append(td)
+
     def add(self, *elems: Element) -> "Scene":
         from .record import Record as _Record  # lazy: record.py imports scene.Element
         for e in elems:
             self._add_image_textures(e)
+            self._add_table_decls(e)
+            if isinstance(e, (GridDecl, ScatterDecl)):
+                # an explicit declaration supersedes one auto-collected from a term
+                self.tables = [g for g in self.tables
+                               if not (getattr(g, "_auto_table", False)
+                                       and getattr(g, "name", None) == e.name)]
             if isinstance(e, (Texture, ProcTexture)):
                 # An explicit declaration supersedes one auto-collected from an
                 # Image term, whichever order they were added in.
@@ -1194,6 +1305,8 @@ class Scene:
                 self.spectra.append(e)
             elif isinstance(e, Upsample):
                 self.upsamplers.append(e)
+            elif isinstance(e, (GridDecl, ScatterDecl)):
+                self.tables.append(e)
             elif isinstance(e, (Texture, ProcTexture)):
                 self.textures.append(e)
             elif isinstance(e, Pattern):
@@ -1217,7 +1330,7 @@ class Scene:
         return self
 
     def _all_elements(self) -> List[Element]:
-        return [*self.spectra, *self.upsamplers, *self.textures, *self.patterns,
+        return [*self.spectra, *self.upsamplers, *self.tables, *self.textures, *self.patterns,
                 *self.records, *self.materials, *self.elements, *self.lights,
                 self.camera]
 
@@ -1240,6 +1353,10 @@ class Scene:
         for up in self.upsamplers:
             blocks.append(up.emit(ctx))
         if self.upsamplers:
+            blocks.append("")
+        for td in self.tables:
+            blocks.append(td.emit(ctx))
+        if self.tables:
             blocks.append("")
         for tx in self.textures:
             blocks.append(tx.emit(ctx))

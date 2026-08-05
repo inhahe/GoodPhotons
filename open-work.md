@@ -200,28 +200,41 @@ round-trip byte-identically, 65 of 97 corpus files parse and 64 of those re-emit
 other 32 are full-ftrace-language forms `ftsl.epeg` deliberately doesn't model — see the
 scope-boundary note in TODO.md §J3c and loom's `design.md` §8b), 1243 loom tests green.
 
-### loom `Grid` has no `.ftsl` emitter — grids can only be sampled in Python  *(loom; medium)*
+### ~~loom `Grid` has no `.ftsl` emitter — grids can only be sampled in Python~~  **DONE 2026-08-05 (loom-only, no `VERSION` bump)**
 *Noticed 2026-07-28 while auditing the loom element emitters.*
 
-ftsl has a first-class **`grid { shape / lo / hi / data }`** dataset block plus `n(x, y)`
-sampling inside a spatial expression (`src/ftsl.h`, and array literals desugar into exactly
-that block — see `g.type = "grid"` ~2452). loom has a `Grid` dataset (`loom/data.py`) and a
-`GridField`/`VecGridField` interpolator (`loom/interp.py`) — but **no path from one to the
-other**. `GridField._eval` interpolates in *Python* and bakes to a number, and nothing in
-`loom/ftsl_emit.py` ever writes a `grid` block, so:
+ftsl has first-class **`grid { shape / lo / hi / outside / data }`** and
+**`scatter { dim / power / eps / data }`** dataset blocks (loaded in Pass 1a, `src/ftsl.h`
+`addGrid`/`addScatter`) sampled from any pattern expression as `grid:<name>(c0, …)` /
+`scatter:<name>(c0, …)` (`PatOp::Grid`/`PatOp::Scatter`, `src/pattern.h`). loom had the
+datasets and the interpolators but **no path from one to the other**: `grid(X, Y)` raised,
+and a grid-driven field could only reach `.ftsl` fully baked per frame.
 
-- `grid(X, Y)` (sampling a grid by ftsl's *spatial* coordinates) raises
-  `TypeError: float() argument must be … not 'Surface'` — the field can only be sampled at
-  numbers, never at a coordinate the renderer supplies;
-- a grid-driven field can therefore only reach `.ftsl` **fully baked per frame**, losing both
-  the render-time interpolation and the compact `data …` representation ftrace already has.
+Fixed as designed, and extended to `Scatter` — leaving one dataset renderable and its sibling
+not would have been exactly the asymmetry that becomes debt later:
 
-Proper fix: a `Grid.emit(ctx)` (or an emitting wrapper element) that writes the `grid` block —
-`shape`, `lo`, `hi`, `data` with the values baked at `ctx.clock` — plus a `GridField` spelling
-that lowers to `name(x, y)` in the emitted expression when its query is a `SpatialExpr`. The
-Python evaluator stays as the loom-side preview, exactly as `sample(t)` is for `CurveDrive`.
+- **`GridSample` / `ScatterSample`** (`loom/spatial.py`) — new `SpatialExpr` leaves.
+  `Grid.__call__`/`Scatter.__call__` are now dual-tier: a temporal query still builds the
+  `GridField`/`ScatterField` Signal, a query containing any `SpatialExpr` builds the
+  renderable leaf. `emit()` writes the table call; `eval_np()` is a vectorised port of
+  `patGridSample`/`patScatterSample`, so the raster preview, the temporal field and the
+  render all agree (checked to ~1e-15 against loom's own interpolators).
+- **`GridDecl` / `ScatterDecl`** (`loom/scene.py`) — the companion blocks, values (and a
+  scatter's positions) baked at `ctx.clock`. `Scene.add` collects them automatically via
+  `SpatialExpr.table_decls()`, deduped by name, explicit declaration wins — the same
+  mechanism `Image` → `Texture` already used.
+- **Placement folds into the query.** ftsl's `grid` block has no transform, so a
+  `.transformed()` dataset inverse-maps the *coordinates* instead. `Transform.inverse_apply`
+  and the new `inverse_apply_spatial` now share one body (`_inverse_map(c, d, wrap)`), so the
+  two tiers cannot drift.
+- **Honest refusals** where ftrace cannot follow: vector-valued datasets (`PatGrid` stores
+  scalar floats), `interp="cubic"` (`patGridSample` is N-linear only), `on_outside="raise"`
+  (a renderer cannot throw per-sample) and > 4 axes (`PAT_ND_MAX_DIM`).
 
-No current consumer is blocked on it — logged so it isn't rediscovered.
+Verified: 48 new tests in `tools/loom/tests/test_grid_term.py` (1328 loom tests green), and
+ftrace loads and renders the emitted `.ftsl` with no warnings — an A/B render against an
+all-constant grid moves the two table-driven channels while the deliberately-constant channel
+stays at ratio exactly 1.000.
 
 ### FUTURE — loom full `.ftsl` read support  *(loom; large)*
 *TODO.md, the `FUTURE` bullet under §J3c.*
