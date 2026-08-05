@@ -5,6 +5,29 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-05, minor): `-stop` is accepted but ignored while a process is still in SCENE LOAD
+
+`stopChannelStart()` publishes the `<pid>.run` entry before `run()` is entered, so a
+process is listed by a bare `ftrace -stop` and can be signalled from the moment it starts.
+But the signal only sets `g_stopRequested`, and that flag is polled at render **chunk /
+frame** boundaries — the loader (mesh import, tessellation, solid voxelization, spectral
+upsampling) never polls it. So `ftrace -stop <pid>` against a process that has not reached
+its render loop reports success, then waits out its 120 s timeout while the load runs to
+completion.
+
+Mostly latent now that the worst loader stall is gone (the 47 s texture upsample above is
+2.9 s), and the consequence is a wait rather than a wrong result — which is why it is not
+being fixed immediately. **It is not a reason to `taskkill /F`**: force-killing mid-CUDA
+can wedge the display driver, and a process that hasn't started rendering has nothing
+worth interrupting anyway.
+
+Proper fix if it becomes annoying: poll `g_stopRequested` in the loader's own long loops —
+the natural seam is `ft::parallelFor` (`src/parallel.h`), whose chunk cursor is already the
+one place every load-time pass funnels through, so a cursor check that drains the range on
+stop would cover all of them at once. It would need each caller to tolerate a partially
+filled output, so the exit has to be "abandon the load and return non-zero", not "carry on
+with half a texture".
+
 ### PERF — DONE (2026-08-05, v0.138.1): `-explore scenes/gallery_rain.ftsl` sat for ~47 s with NOTHING on screen — per-texel spectral upsampling was serial
 
 **What.** `ftrace -explore scenes/gallery_rain.ftsl` produced no output and no window for
