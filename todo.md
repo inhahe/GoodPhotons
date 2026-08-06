@@ -59,7 +59,7 @@ The creature layer is a *generator*; it never becomes part of a runtime.
       current morph vector actually produced, then closed-loop corrected against the
       settled pose. See design.md → "Passive tone: declare the goal, measure the gains".
 - [x] `creaturelab/validate.py` — the acceptance bar: motors off, 3 s of gravity.
-- [x] `tests/test_rig.py` — 27 regression tests, biased towards the silent failures (see
+- [x] `tests/test_rig.py` — 28 regression tests, biased towards the silent failures (see
       design.md → "Validation"). `python -m pytest tests/ -q`, ~7 s.
 - [x] **Validation:** MuJoCo loads it, it stands under gravity, and sweeping a morph
       param regenerates a *different but still valid* body with no hand-editing.
@@ -68,11 +68,16 @@ The creature layer is a *generator*; it never becomes part of a runtime.
         scale-correct gains are supposed to do), and across a 32× `body_mass` range at a
         flat 4.8–4.9%.
       - `morph_sweep.py` — full-body randomisation, 60 draws per width:
-        **100% stand at scales 0.25 / 0.5 / 0.75; 95% at scale 1.0.**
-        The residual 5% is not a tuner failure: scale 1.0 samples all 26 parameters
-        independently, so nothing stops it drawing a 314 kg animal on a 26 cm back. P4
+        **100% stand at scales 0.25 / 0.5; 98.3% at 0.75; 93.3% at scale 1.0.**
+        The residual is not a tuner failure: scale 1.0 samples all 26 parameters
+        independently, so nothing stops it drawing a 314 kg animal on a 26 cm back. The
+        collapses topple to ~50° while sagging only 2–4%, from support margins of +18 and
+        +60 mm — feet in the wrong place, which no amount of passive tone fixes. P4
         should either couple stance angles to limb lengths or reject on the measured
         support margin that `tune.support_polygon` already returns.
+        (Was 100%/95% before armature was measured rather than declared; the difference is
+        two draws in 120, and the old figures were partly bought with a 38× overweight paw
+        acting as a transient damper. See known-issues → armature, DONE.)
 - [ ] Decide: does FTSL itself need to change, or does the creature layer only ever
       *emit* it? (Current answer: emit only. Keep ftrace static and bit-reproducible.)
 
