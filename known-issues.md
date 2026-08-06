@@ -187,6 +187,10 @@ images are correct; the GPU run completed and exited 0. So `-device cpu` is not 
 "workaround when the card is busy" — under contention it is **three orders of magnitude** better,
 which is worth knowing before choosing a device.
 
+**Read that table only as a statement about contention, never about the GPU path** — see the
+resolved caveat at the end of this entry: the same GPU command on an *idle* card takes **0.1 s**,
+five times faster than the CPU.
+
 **The detector the old entry says does not exist — it does, just not in `nvidia-smi`.** That entry
 concludes contention is invisible from inside the process ("`nvidia-smi` reports 100 % busy either
 way, and per-process VRAM is N/A under WDDM"), and ftrace's own `[gpu-stall]` text still advises
@@ -210,18 +214,37 @@ the query (`Get-Counter` on `\GPU Engine(*)\Utilization Percentage`, whose insta
    into a one-line explanation, and it is the cheapest item here.
 2. **Consider auto-falling back to the CPU on sustained foreign GPU load.** The `[vram]` gate
    already falls back when the card is over budget; this is the same decision with a working input.
-   Given the 3000× measured here, defaulting to CPU when another process holds >80 % of the card
-   would frequently be the *faster* choice, not a degradation.
+   Given the 3000× measured here *under contention*, defaulting to CPU when another process holds
+   >80 % of the card would frequently be the *faster* choice, not a degradation. Note the gate must
+   key on **measured foreign load**, not on the device: with the card idle the GPU wins by 5×, so a
+   heuristic that merely distrusted the GPU would make things worse.
 3. The first-chunk timed probe and the `cudaEventQuery` poll loop already described in the
    2026-08-04 entry's "Still open / proper fix" remain the structural fix for `-stop` / `-interval`
    responsiveness; nothing here supersedes them.
 
-**Caveat on attribution.** The counters report the **`3d` engine**, not `Compute`, for both
-processes, so this measures engine occupancy rather than SM occupancy, and it does not by itself
-prove ftrace's kernel would be fast on an idle card. The clean experiment — the same A/B on a
-genuinely idle GPU — has **not** been run, because the competing process is one of the user's own
-long-running Python services and is not mine to stop. Until that is done, "ftrace's GPU mode-W path
-is fine and this was purely contention" is *strongly indicated but not proven*.
+**Caveat on attribution — now RESOLVED (2026-08-06, v0.142.0).** The counters report the **`3d`
+engine**, not `Compute`, for both processes, so they measure engine occupancy rather than SM
+occupancy, and did not by themselves prove ftrace's kernel would be fast on an idle card. That
+clean experiment has now been run: when the competing python process exited, the identical command
+was re-issued on a confirmed-idle card (2 % util, no foreign CUDA process):
+
+```
+ftrace -in out/seam_check.ftsl -mode W -spp 1 -device auto -o png/wperf_gpu_idle.png   # 520x520
+
+contended (python at ~93%)   1584.8 s
+idle                             0.1 s      <-- ~16,000x
+cpu, 12 threads                  0.5 s
+```
+
+`png/wperf_gpu_idle.png` is **byte-identical** to the contended `png/wperf_gpu.png` (md5
+`28d88fc6c2bb88e0fec39444ec81ed39`) — same scene, same work, same output, contention the only
+variable. So it is now *proven*, not merely indicated: **ftrace's GPU mode-W path is fine.** It is
+not 3000x slower than the CPU, it is **~5x faster** (0.1 s vs 0.5 s), and 99.99 % of the 26-minute
+run was foreign-process starvation.
+
+This also strengthens improvement 2 above rather than weakening it: the CPU-fallback-under-contention
+heuristic is worth having *because* the GPU path is healthy — the fallback should key on measured
+foreign load, never on a belief that the GPU code is slow.
 
 ### PERF (2026-08-06): `-mode W` inherits mode R's `-spp 256` default, but is deterministic at 1 spp
 
@@ -246,8 +269,10 @@ lesson, not the conclusion.**
 1. *"GPU starvation from contention."* — the right answer, but I had not established it, and I
    abandoned it under weak evidence.
 2. *"A non-terminating kernel."* — wrong. The render completed on its own after 1584.8 s.
-3. *"The GPU mode-W path is ~3000× slower than the CPU."* — wrong. The number is real, but it
-   measures **contention**, not the code path.
+3. *"The GPU mode-W path is ~3000× slower than the CPU."* — wrong, and now **disproven by
+   measurement**, not just doubted: the same command on an idle card runs in **0.1 s** and emits a
+   byte-identical image, so the GPU path is ~5× *faster* than the CPU. The number was real; it
+   measured **contention**, not the code path.
 
 **Error 2 came from reading an instrument with no control.** I saw `100 % util, 1 % mem, ~95 W,
 2760 MHz` and concluded "occupancy without work = a spin". With ftrace exited and the render over,
