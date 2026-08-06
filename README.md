@@ -3268,7 +3268,18 @@ whichever ones won the slot rather than the animation. Pacing to the bake plays 
 and the readout states the **measured** rate ("playing 1.7 fps") rather than pretending to a
 frame rate it isn't hitting. Play needs somewhere to advance to, so it is disabled when
 `frames` is 1 — which is what a sidecar saved without a clock advertises; save with
-`ViewerModel.save_sidecar(path, Clock.at_frame(0, N))`.
+`ViewerModel.save_sidecar(path, Clock.at_frame(0, N))`. Adding **`-play`** opens with the
+transport already running, so a loop can be watched — or its per-frame cost read off the
+`[play]` trace on stdout — without anyone having to click into the window first.
+
+The Live panel breaks the played frame down into its parts (`bake`, `sidecar`, `ftsl`,
+`raymarch`, and an explicit `other` residual so the numbers account for the whole period),
+because the answer is not the obvious one: the loom round-trip is *not* the bottleneck — the
+Render pane's raymarch is, and most of its cost is fixed per call rather than per pixel
+(the preview kernel re-uploads the scene each frame; see `known-issues.md`). The Render
+pane's **`play res`** slider therefore renders at a reduced draft resolution *only while the
+transport is playing*, snapping back to full resolution the moment you pause, which buys
+back the part of the cost that does scale with pixels.
 
 ---
 

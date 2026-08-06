@@ -3,7 +3,7 @@
 #ifndef _WIN32
 // -------- Non-Windows stub: the native viewer needs Win32 + D3D11 --------------
 #include <cstdio>
-int runViewerGui(const std::string&, const std::string&) {
+int runViewerGui(const std::string&, const std::string&, bool) {
     std::fprintf(stderr, "error: -viewer is only available on Windows builds.\n");
     return 1;
 }
@@ -680,6 +680,9 @@ struct LivePanel {
     // won the slot -- not playback. Pacing to the bake rate plays every frame, and
     // the fps readout states the rate honestly rather than pretending to be 30.
     bool playing = false;
+    // Force the "play just started" priming post even though `playing` was set
+    // before the first draw (the -play flag), where there is no rising edge to see.
+    bool primePlay = false;
     bool loopPlay = true;         // wrap at the end vs. stop there
     bool pingpong = false;        // bounce instead of wrapping
     int  dir = 1;                 // +1 / -1, flipped by ping-pong
@@ -690,6 +693,31 @@ struct LivePanel {
     // precisely the "pretend it's 30" this feature was supposed to avoid.
     double    playFps = 0.0;
     long long lastAdvanceQpc = 0;
+    // Per-stage adoption cost, so "why is play slow?" is answered by measurement
+    // rather than by guessing at the FTSL round trip. Milliseconds, last frame.
+    double msSidecar = 0.0;   // parse the introspection JSON + rebuild DAG/skins
+    double msFtsl    = 0.0;   // parse the .ftsl + load its mesh assets
+    double msRender  = 0.0;   // the Render pane's synchronous CUDA raymarch
+    // Set by the Render tab each UI frame it actually draws. Needed because the
+    // Live panel is drawn BEFORE the Render pane, so zeroing msRender when a bake
+    // lands would blank it every frame during play -- it would always read 0 and
+    // wrongly exonerate the raymarch. Instead the value persists and is cleared
+    // only once the tab has genuinely stopped drawing.
+    bool renderTabDrew = false;
+};
+
+// A scoped wall-clock stopwatch that adds into a double (milliseconds).
+struct MsTimer {
+    double*   sink;
+    long long t0;
+    explicit MsTimer(double* d) : sink(d) {
+        LARGE_INTEGER q; QueryPerformanceCounter(&q); t0 = q.QuadPart;
+    }
+    ~MsTimer() {
+        LARGE_INTEGER q, f;
+        QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+        if (sink && f.QuadPart) *sink = 1000.0 * double(q.QuadPart - t0) / double(f.QuadPart);
+    }
 };
 
 // Step the clock one frame in the current play direction, honouring loop/ping-pong.
@@ -2288,6 +2316,13 @@ struct RenderPane {
     int  texW = 0, texH = 0;
     bool dirty = true;
     int  resLong = 640;               // square raymarch resolution (long edge)
+    // Playback resolution. The raymarch is synchronous on the UI thread and scales
+    // with res^2, so at the full 640 it costs ~440 ms and is ~63% of a played frame
+    // -- it, not the .ftsl round trip, is what makes play slow. Dropping to 256
+    // while playing is ~6x less work, and matches what the -explore viewer already
+    // does: degrade while moving, refine once settled (here, once paused).
+    int  resPlay = 256;
+    bool lowRes  = false;             // the res the current texture was traced at
     std::string status;
 
     void initFrom(const Scene& s) {
@@ -2344,8 +2379,10 @@ struct RenderPane {
         return true;
     }
 
-    void render(const Scene& s, ID3D11Device* dev, ID3D11DeviceContext* ctx) {
-        int W = resLong, H = resLong;
+    void render(const Scene& s, ID3D11Device* dev, ID3D11DeviceContext* ctx,
+                bool draft = false) {
+        int W = draft ? std::min(resPlay, resLong) : resLong, H = W;
+        lowRes = (W != resLong);
         Camera cam = camera(W, H);
         unsigned hw = std::thread::hardware_concurrency();
         int nThreads = hw ? (int)hw : 4;
@@ -2378,6 +2415,18 @@ static bool drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
     ImGui::SetNextItemWidth(120);
     if (ImGui::SliderInt("res", &rp.resLong, 128, 1024)) rp.dirty = true;
     ImGui::SameLine();
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("play res", &rp.resPlay, 64, 1024);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Resolution to raymarch at while the clock is PLAYING.\n"
+                          "This trace is synchronous and scales with res^2, so it is\n"
+                          "normally the largest single cost of a played frame; lower\n"
+                          "this to play faster. Full `res` is restored when you pause.");
+    if (rp.lowRes) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(draft %d)", std::min(rp.resPlay, rp.resLong));
+    }
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(120);
     if (ImGui::SliderFloat("fov", &rp.fov, 10.0f, 110.0f, "%.0f deg")) rp.dirty = true;
     ImGui::SameLine();
@@ -2404,7 +2453,19 @@ static bool drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
         if (w != 0.0f) { rp.distMul *= (1.0f - w * 0.1f); if (rp.distMul < 0.2f) rp.distMul = 0.2f; rp.dirty = true; }
     }
 
-    if (rp.dirty) rp.render(scene, dev, ctx);
+    if (live) live->renderTabDrew = true;
+    // Trace at draft res while the clock is playing, full res once it settles. The
+    // moment play stops, the image on screen is a draft, so ask for one more trace
+    // -- otherwise pausing would leave you inspecting a deliberately coarse frame.
+    const bool draft = (live && live->playing);
+    if (!draft && rp.lowRes) rp.dirty = true;
+    if (rp.dirty) {
+        // Timed because a landed bake calls initFrom, which sets `dirty`, so the
+        // whole scene is re-raymarched synchronously on the UI thread at res^2 on
+        // every played frame -- a cost paid only while this tab is open.
+        if (live) { MsTimer _t(&live->msRender); rp.render(scene, dev, ctx, draft); }
+        else      { rp.render(scene, dev, ctx, draft); }
+    }
 
     // Fit the square texture into the pane, centered, preserving aspect.
     if (rp.srv && rp.texW > 0 && rp.texH > 0) {
@@ -2864,10 +2925,11 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
             lp.frame = (lp.frame + lp.frames - 1) % lp.frames; changed = true;
         }
     }
-    if (lp.playing && !wasPlaying) {
+    if (lp.playing && (!wasPlaying || lp.primePlay)) {
         forced = true;                 // prime the paced loop
         lp.playFps = 0.0;              // and don't average across the pause
         lp.lastAdvanceQpc = 0;
+        lp.primePlay = false;
     }
     if (lp.playing) {
         ImGui::SameLine();
@@ -2875,6 +2937,36 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
             ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1), "playing %.1f fps", lp.playFps);
         else
             ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1), "playing...");
+    }
+    // Where the frame time actually goes. Worth showing rather than leaving to be
+    // guessed at: the intuition is that the .ftsl round trip dominates, and on a
+    // modest mesh it does not -- the Render pane's synchronous raymarch does.
+    {
+        const double acc = lp.lastMs + lp.msSidecar + lp.msFtsl + lp.msRender;
+        // Show the MEASURED period beside the parts, and the residual explicitly.
+        // A breakdown that silently omits the gap between "what I timed" and "what
+        // it actually costs" is the same dishonesty as deriving fps from the bake.
+        if (lp.playing && lp.playFps > 0.0) {
+            const double period = 1000.0 / lp.playFps;
+            ImGui::TextDisabled(
+                "frame %.0f ms = bake %.0f + sidecar %.0f + ftsl %.0f + raymarch %.0f + other %.0f",
+                period, lp.lastMs, lp.msSidecar, lp.msFtsl, lp.msRender,
+                (period - acc > 0.0 ? period - acc : 0.0));
+        } else {
+            ImGui::TextDisabled("bake %.0f + sidecar %.0f + ftsl %.0f + raymarch %.0f = %.0f ms",
+                                lp.lastMs, lp.msSidecar, lp.msFtsl, lp.msRender, acc);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "bake     loom: build() + emit + introspect (its own process)\n"
+                "sidecar  parse the introspection JSON, rebuild the DAG and skin buffers\n"
+                "ftsl     parse the .ftsl and load its mesh assets\n"
+                "raymarch the Render tab re-tracing the scene on the UI thread.\n"
+                "         Only charged while that tab is open -- switch to Meshes\n"
+                "         to play without it.\n"
+                "other    the residual against the measured play period: IPC with the\n"
+                "         loom process, writing/reading the sidecar + OBJ through the\n"
+                "         filesystem, and the wait for vblank.");
     }
 
     // --- the build's declared params ---
@@ -2917,7 +3009,8 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
 // --------------------------------------------------------------------------
 // Entry point
 // --------------------------------------------------------------------------
-int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
+int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
+                 bool startPlaying) {
     Sidecar sc;
     if (!sc.load(sidecarPath)) {
         std::fprintf(stderr, "error: -viewer: %s\n", sc.err.c_str());
@@ -3082,6 +3175,16 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
         return true;
     };
 
+    // `-play`: open with the transport already running. Only meaningful once the
+    // clock has somewhere to go and there is a live channel to re-derive through --
+    // a frozen sidecar has no frames to bake, so silently "playing" it would be a lie.
+    if (startPlaying) {
+        if (live.up && live.frames > 1) { live.playing = true; live.primePlay = true; }
+        else std::fprintf(stderr, "[play] ignoring -play: %s\n",
+                          !live.up ? "no live loom channel (-loom, or a sidecar `build` key)"
+                                   : "the sidecar advertises frames = 1 (saved without a clock)");
+    }
+
     bool done = false;
     bool firstFrame = true;   // one-shot: default-select the primary geometry tab
     while (!done) {
@@ -3107,10 +3210,14 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
                 live.lastMs  = r.ms;
                 live.lastErr = r.ok ? std::string() : r.err;
                 if (r.ok) {
-                    if (!r.sidecarPath.empty()) adoptSidecar(r.sidecarPath);
+                    if (!r.sidecarPath.empty()) {
+                        MsTimer _t(&live.msSidecar);
+                        adoptSidecar(r.sidecarPath);
+                    }
                     if (!r.sourcePath.empty()) {
                         ftsl::Loaded nl;
                         std::string  nerr;
+                        MsTimer _t(&live.msFtsl);
                         if (ftsl::load(r.sourcePath, nl, nerr)) {
                             loaded  = std::move(nl);
                             sceneOk = true;
@@ -3309,6 +3416,30 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
         if (livePost && live.up && bridge.linkUp()) {
             bridge.post(liveJob(live, /*wantSidecar=*/true, liveWantSource));
             ++live.posted;
+        }
+
+        // The Render tab has stopped drawing (collapsed, or another tab selected),
+        // so its cost is no longer being paid -- stop reporting the stale figure.
+        if (!live.renderTabDrew) live.msRender = 0.0;
+        live.renderTabDrew = false;
+
+        // Echo the same breakdown to stdout about once a second while playing. The
+        // panel shows it live, but a printed trace is what you can actually diff
+        // between builds, capture from a script, or read back after the fact.
+        if (live.playing && live.playFps > 0.0) {
+            static double lastLog = 0.0;
+            const double now = ImGui::GetTime();
+            if (now - lastLog > 1.0) {
+                lastLog = now;
+                const double period = 1000.0 / live.playFps;
+                const double acc = live.lastMs + live.msSidecar + live.msFtsl + live.msRender;
+                std::printf("[play] %5.1f fps  %6.1f ms = bake %.0f + sidecar %.0f + "
+                            "ftsl %.0f + raymarch %.0f + other %.0f\n",
+                            live.playFps, period, live.lastMs, live.msSidecar,
+                            live.msFtsl, live.msRender,
+                            (period - acc > 0.0 ? period - acc : 0.0));
+                std::fflush(stdout);
+            }
         }
 
         ImGui::Render();

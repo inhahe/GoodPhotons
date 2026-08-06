@@ -2141,6 +2141,24 @@ replacement for the renderer or the primary editing tool.**
         **no clock** writes `frames = 1` — which would make play a button that silently does nothing.
         It is now disabled with a tooltip saying exactly that; scenes should save with
         `Clock.at_frame(0, N)`.
+      - **Profiled 2026-08-06 (0.140.0) — and the bottleneck is NOT the loom round-trip.** The Live
+        panel now prints the whole period split, with an explicit residual so nothing hides:
+        `[play] 1.7 fps 574.4 ms = bake 40 + sidecar 87 + ftsl 46 + raymarch 297 + other 104`.
+        The F7 Render pane's synchronous raymarch is **more than half**, and it is **not pixel-bound**:
+        640² → 256² (6.25× fewer pixels) moved it only 439 → ~300 ms, so fixed ≈ **274 ms**, pixel ≈
+        165 ms. That fixed part is `renderIsoPreviewCuda` re-running `buildUpload` — whole scene,
+        BVH, materials, *every texture's texels* — plus three fresh `cudaMalloc`s, **per call**.
+        This **changes the priority order for (b)**: caching sidecars/`.ftsl` per frame removes only
+        the 133 ms loom half. A prebaked play that still calls the preview kernel the same way is
+        capped at ~3 fps. So (b) should cache **the resident GPU scene**, not just the text — upload
+        each frame's geometry once during the bake pass, keep the `DUpload` alive, version it so an
+        unchanged mesh/material/texture set is never re-sent, and pool the accum/z/emissive buffers.
+        Logged as a PERF entry in `known-issues.md`.
+      - Shipped alongside: a **`play res`** draft resolution used only while playing (1.4 → 1.8 fps,
+        ~25%) and a **`-play`** CLI flag that opens with the transport already running — the latter
+        because driving an ImGui window with synthetic input to measure it is unreliable (ImGui
+        clears key state on focus loss, and `PrintWindow` returns white on a D3D11 swapchain). A
+        flag plus a stdout trace is the honest way to profile a GUI.
       What exists today (`src/viewer_gui.cpp` ~L2774, the F4 **Live (loom)** panel): a `SliderInt("frame")`
       + `DragInt("frames")`. Dragging `frame` marks the live panel `changed`, `LoomBridge::post()`s an
       `introspect`+`emit` at that clock, and the returned sidecar/`.ftsl` re-seed the geometry and the F7

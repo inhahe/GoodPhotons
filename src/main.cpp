@@ -10832,8 +10832,11 @@ int main(int argc, char** argv) {
         {
             const char* viewerSidecar = nullptr;
             const char* viewerLoom    = nullptr;
+            bool        viewerPlay    = false;
             for (int i = 1; i < argc; ++i) {
-                if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
+                if (!std::strcmp(argv[i], "-play") || !std::strcmp(argv[i], "--play")) {
+                    viewerPlay = true;
+                } else if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
                     if (i + 1 >= argc) {
                         std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
                         return 1;
@@ -10848,7 +10851,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (viewerSidecar)
-                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "");
+                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "", viewerPlay);
             if (viewerLoom) {
                 // -loom names a live channel, and there are two of them: the viewer's F4
                 // re-introspection (-viewer) and the fly editor's E2 value channel

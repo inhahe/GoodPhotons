@@ -32,4 +32,9 @@
 // `loomScene` is the loom `build()` file to open the live channel against. Empty
 // means "use the sidecar's own `build` key if it has one"; a sidecar with neither
 // still opens, just frozen — the Live panel says why.
-int runViewerGui(const std::string& sidecarPath, const std::string& loomScene = "");
+//
+// `startPlaying` opens with the transport already running (the `-play` flag), so a
+// loop can be watched — or its per-frame cost traced to stdout — without anyone
+// having to click into the window first.
+int runViewerGui(const std::string& sidecarPath, const std::string& loomScene = "",
+                 bool startPlaying = false);

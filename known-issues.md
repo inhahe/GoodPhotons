@@ -5,6 +5,89 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PERF (2026-08-06, v0.140.0): the viewer's Render pane re-uploads the WHOLE scene to the GPU every frame — ~274 ms of a ~570 ms played frame
+
+**Where.** `renderIsoPreviewCuda`, `src/render_cuda.cu` ~12696, called from `RenderPane::render`
+in `src/viewer_gui.cpp`. Nothing persists between calls: every invocation runs `buildUpload(scene,
+cam, W, H, up)` (geometry, BVH, materials), re-derives and re-uploads the preview lights, the
+per-material colour + emissive arrays, **every texture's full texel array**, and the
+material→texture bindings, then does three fresh `cudaMalloc`s for the accum / z / emissive
+buffers.
+
+**Measured.** With the F8a paced-play transport running `scatter_modulated_sweep` at 48 frames,
+the viewer's own `[play]` trace reads:
+
+```
+[play]  1.7 fps  574.4 ms = bake 40 + sidecar 87 + ftsl 46 + raymarch 297 + other 104
+```
+
+The raymarch dominates, and it is **not pixel-bound**. Dropping 640² → 256² (6.25× fewer pixels)
+moved it only 439 → ~300 ms. Solving the two points gives **fixed ≈ 274 ms, pixel ≈ 165 ms** at
+640². The fixed 274 ms is the per-call re-upload described above — it is paid identically at any
+resolution, so no amount of resolution tuning can touch it.
+
+**Note this partly refutes the obvious hypothesis.** The FTSL round-trip the frame appears to be
+"about" (sidecar 87 + ftsl 46 = 133 ms, ~23%) is real but *secondary*. The expensive thing is the
+preview kernel's non-resident GPU scene.
+
+**Proper fix.** Give the preview path a **resident GPU scene**: keep the `DUpload` (or an
+equivalent handle) alive across calls, hash/version the scene so an unchanged mesh, BVH, material
+table and texture set are not re-sent, and pool the accum/z/emissive allocations instead of
+`cudaMalloc`/`cudaFree` per frame. Only the camera and the frame's changed geometry should cross
+the bus. This also directly strengthens the case for TODO F8b (prebaked play), since a prebaked
+sequence would upload each frame's geometry exactly once.
+
+**Shipped partial mitigation (v0.140.0).** `RenderPane` gained a `play res` slider (64–1024,
+default 256) and renders in draft at that resolution *while the transport is playing*, snapping
+back to full res on pause. Worth 1.4 → 1.8 fps (~25%) — it can only attack the 165 ms pixel half.
+
+### BUG (2026-08-06): `ftrace -stop` cannot stop a render whose CUDA kernel never returns — the stop flag is only polled between chunks
+
+**Symptom.** A `-mode W` GPU render (pid 132596, `out/seam_check.ftsl -> png/seam_fixed.png`) sat
+on a single 1-spp chunk for **>271 s**, emitting `[gpu-stall]` lines. `ftrace -stop 132596` was
+issued twice, the second time long after the viewer had exited; both printed `[stop] asked pid …
+to finish and exit cleanly.` and then `[stop] still running after 120s`. The process was **still
+alive and still wedged hours later**, with ~567 s of accumulated CPU time.
+
+**Root cause, from a non-invasive `cdb -pv -p 132596` attach.** The render thread is parked inside
+the driver's synchronise, not in any ftrace loop:
+
+```
+ftrace+0x19b78
+nvcudart_hybrid64!_cudaGetProcAddress+0x29a58
+nvcuda64!cuCtxSynchronize_v2+0x25
+nvcuda64!cuCtxSynchronize+0xbf
+nvcuda64+0x4a24d …
+```
+
+So the thread that would poll the stop flag is blocked in `cuCtxSynchronize` on a kernel that has
+not completed. The high CPU number is the driver's spin-wait, not progress. Three other threads
+are the usual nvcuda worker/waiter threads.
+
+**Contributing condition — the GPU was genuinely exhausted, not merely busy.** `nvidia-smi` at the
+time: **100 % utilisation, 23701 MiB of 24564 MiB used** on the RTX 4090, with ~49 compute
+contexts resident (this machine runs a lot of other GPU work). This was resource starvation, and
+under starvation a launched kernel can simply not get scheduled to completion.
+
+**Why this is the defect worth logging.** `taskkill /F` is forbidden in this repo — force-killing
+with CUDA kernels in flight is a known way to wedge the NVIDIA driver into a TDR/bugcheck. So a
+kernel that never returns makes a render **unstoppable by any sanctioned means**. It also keeps a
+file lock on `ftrace.exe`, which blocks `build.bat` from copying a new binary into the repo root —
+exactly the situation where the reflex is to kill by name.
+
+**Workaround used.** `-device cpu` for the same scene completed in ~30 s and produced
+`png/seam_fixed.png` normally.
+
+**What the fix looks like.**
+- **Poll the stop flag from a thread that is never inside a CUDA call** (the existing `[gpu-stall]`
+  watchdog thread), so `-stop` is at least *acknowledged* while the render thread is blocked.
+- **Let the watchdog abandon a chunk**, not merely report it: after a bounded timeout, mark the
+  chunk lost, write the image + `.ftbuf` from what has already converged, and exit — accepting that
+  the leaked context is the OS's problem at process teardown.
+- **Fail fast on admission** rather than launching into an exhausted device: query free VRAM before
+  `buildUpload` and refuse (or fall back to `-device cpu`) when the requested working set does not
+  fit, instead of launching a kernel that cannot be scheduled.
+
 ### TECH DEBT (2026-08-06): a "render every scene at a uniform budget" sweep cannot distinguish correct from broken — three separate false signals
 
 **Not a renderer bug.** This is about the *regression sweep methodology*, and it is logged because
