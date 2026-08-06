@@ -176,6 +176,60 @@ def _full_mass_matrix(model, data):
     return dst
 
 
+def size_armature(creature: Creature) -> dict[str, float]:
+    """Give every joint an armature proportional to the inertia it actually carries.
+
+    Armature is reflected rotor inertia: `n^2 * I_rotor`. The body-independent quantity is
+    therefore the *ratio* to the load, because a drive matched to a heavier limb has a
+    bigger motor behind a similar gear ratio. An absolute kg*m^2 is the same units mistake
+    a stiffness literal makes, and it hides better -- nothing about the model looks wrong,
+    the joint is simply heavier than the bone attached to it.
+
+    How bad it was, on this rig, unmorphed, with no morph vector involved at all: the
+    single default `0.01 kg*m^2` was **0.7% of the spine's own inertia and 3790% of the
+    paw's**. The paw joints were 97.4% fictitious rotor -- 0.00821 against a true 0.00021
+    -- so their dynamics were essentially invented. It then propagated: `stiffness_ceiling`
+    is `I*(2*pi*f_max)^2`, so an inflated `I` licensed 38x more stiffness than the real
+    limb could follow, and damping is `2*zeta*sqrt(k*I)`, so those joints came out heavily
+    overdamped as well. Both errors are largest exactly where the contact happens.
+
+    Measured with armature at zero, which is what the model already has if nothing set it,
+    so the inertia read here is the limb's own. Runs before `measure`, since every torque,
+    ceiling and damping value downstream is computed through the mass matrix this changes.
+    An authored per-joint `armature`, or an absolute `defaults.joint_armature`, still wins.
+    """
+    import mujoco
+    import numpy as np
+
+    ratio = creature.defaults.joint_armature_ratio
+    override = creature.defaults.joint_armature
+    if override is None and not ratio:
+        return {}
+
+    model = mujoco.MjModel.from_xml_string(to_mjcf(creature))
+    data = mujoco.MjData(model)
+    place_on_ground(model, data, -SEAT)
+    data.qvel[:] = 0.0
+    mujoco.mj_forward(model, data)
+    Mdiag = np.diag(_full_mass_matrix(model, data))
+
+    inertia: dict[str, float] = {}
+    for jid in range(model.njnt):
+        if model.jnt_type[jid] in (mujoco.mjtJoint.mjJNT_FREE, mujoco.mjtJoint.mjJNT_BALL):
+            continue
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, jid)
+        inertia[name] = float(Mdiag[int(model.jnt_dofadr[jid])])
+
+    out: dict[str, float] = {}
+    for bone in creature.bones:
+        for j in bone.joints:
+            if j.armature is not None or j.name not in inertia:
+                continue                    # authored: not argued with
+            j.armature = override if override is not None else ratio * inertia[j.name]
+            out[j.name] = j.armature
+    return out
+
+
 def auto_exclude(creature: Creature, margin: float = 0.006) -> list[tuple[str, str]]:
     """Find the body pairs whose geometry overlaps in the reference pose, and exclude them.
 
@@ -673,6 +727,10 @@ def apply_posture(creature: Creature) -> list[JointLoad]:
     # Must come first: every torque below is measured through the load path, and a rig that
     # is propping itself up on a self-collision has the wrong load path entirely.
     auto_exclude(creature)
+    # Then armature, because it is *part of* the mass matrix that every measurement below
+    # reads -- the stiffness ceiling, the damping, and the buckling gradient all run through
+    # it. Sizing it afterwards would tune the body to a mass matrix it does not have.
+    size_armature(creature)
     loads = size_tone(measure(creature), creature)
     by_name = {L.name: L for L in loads}
     owned_k: set[str] = set()

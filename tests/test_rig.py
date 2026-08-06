@@ -185,6 +185,35 @@ def test_gains_respect_the_integrator_timestep(tuned):
         assert L.hz * model.opt.timestep < 1.0 / 12.0 + 1e-9, L.name
 
 
+def test_armature_scales_with_each_joint_s_own_inertia(tuned):
+    """An absolute armature literal is invisible: the joint is just heavier than its bone.
+
+    The rig's old `0.008 kg*m^2` was 0.7% of the spine's inertia and 3790% of the paw's --
+    unmorphed, no morph vector involved -- so the paw joints were 97.4% fictitious rotor.
+    Nothing raised, and the inflated inertia went on to license 38x more stiffness through
+    `stiffness_ceiling` and to overdamp the same joints, both worst at the ground contact.
+    So assert the property that a literal cannot have: a *constant fraction*.
+    """
+    creature, loads, _, _ = tuned
+    ratio = creature.defaults.joint_armature_ratio
+    armature = {j.name: j.armature
+                for bone in creature.bones for j in bone.joints if j.armature is not None}
+    assert len(armature) >= 20, "armature was not sized for most joints"
+
+    inertias = [L.inertia for L in loads]
+    assert max(inertias) / min(inertias) > 100, \
+        "this rig no longer spans enough inertia for the test to be meaningful"
+
+    for L in loads:
+        a = armature.get(L.name)
+        if a is None:
+            continue
+        # `L.inertia` already includes the armature, so the limb's own inertia is I - a.
+        limb = L.inertia - a
+        assert limb > 0, f"{L.name}: armature {a:.3g} exceeds total inertia {L.inertia:.3g}"
+        assert a == pytest.approx(ratio * limb, rel=1e-6), L.name
+
+
 def test_left_right_torques_match(tuned):
     """An asymmetric rig teaches an asymmetric gait, and is invisible in a 25-body tree."""
     _, loads, _, _ = tuned

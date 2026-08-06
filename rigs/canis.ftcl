@@ -125,8 +125,14 @@ creature "canis" {
     }
 
     defaults {
-        joint_damping  0.35
-        joint_armature 0.008
+        # No joint_damping or joint_armature here, deliberately. Both are absolute units --
+        # N*m*s/rad and kg*m^2 -- so a single number is right for one body and wrong for
+        # every morph of it. The 0.008 kg*m^2 that used to sit here was 0.7% of this dog's
+        # spine inertia and 3790% of its paw inertia, in the *unmorphed* rig: the paw joints
+        # were 97.4% rotor and 2.6% animal. Damping comes from posture.damping_ratio and
+        # armature from joint_armature_ratio below, both of which are dimensionless and
+        # therefore survive being morphed.
+        joint_armature_ratio 0.1
         geom_friction  0.9 0.005 0.0001
         motor_gear     28
         rgba 0.62 0.55 0.47 1

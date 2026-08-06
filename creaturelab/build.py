@@ -246,6 +246,8 @@ def build_from_nodes(nodes: list[Node], src: str | None = None,
         defaults = Defaults(
             joint_damping=_f(dnode, "joint_damping", env, defaults.joint_damping),
             joint_armature=_f(dnode, "joint_armature", env, defaults.joint_armature),
+            joint_armature_ratio=_f(dnode, "joint_armature_ratio", env,
+                                    defaults.joint_armature_ratio),
             geom_density=_f(dnode, "geom_density", env, defaults.geom_density),
             geom_friction=_vec(dnode, "geom_friction", env, defaults.geom_friction),
             motor_gear=_f(dnode, "motor_gear", env, defaults.motor_gear),

@@ -30,7 +30,8 @@ import numpy as np                                     # noqa: E402
 from ftcl.errors import FtclError                      # noqa: E402
 from creaturelab.emit_mjcf import (geom_z_extent, natural_mass,  # noqa: E402
                                    place_on_ground, to_mjcf)
-from creaturelab.tune import SEAT, build_tuned          # noqa: E402
+from creaturelab.tune import (SEAT, build_tuned,        # noqa: E402
+                              steps_per_cycle_floor)
 from creaturelab.validate import stand_test, withers_height   # noqa: E402
 
 
@@ -128,13 +129,18 @@ def main() -> int:
     # `implicitfast` integrate joint stiffness and damping implicitly, which is exactly
     # what they exist for, so they tolerate far stiffer springs than explicit Euler; using
     # one threshold for both would either cry wolf here or miss a real problem there.
+    # `need` comes from tune, never from a literal repeated here: `stiffness_ceiling` sizes
+    # springs to land exactly on this bound, so a copy that drifted -- or a `>` where the
+    # bound is inclusive -- makes the tuner's own output fail the tuner's own check. It did:
+    # with armature no longer inflating the distal joints, the clamped joints sit at exactly
+    # 12 steps/cycle and `>` reported the correctly-tuned rig as too stiff.
     fmax = max(L.hz for L in loads)
     steps = 1.0 / (fmax * model.opt.timestep) if fmax > 0 else float("inf")
-    implicit = creature.world.integrator in ("implicit", "implicitfast")
-    need = 12 if implicit else 30
+    need = steps_per_cycle_floor(creature)
+    ok = steps >= need * (1.0 - 1e-9)
     print(f"stiffest joint oscillates at {fmax:.1f} Hz = {steps:.0f} steps/cycle "
-          f"({creature.world.integrator}, wants > {need}) "
-          + ("fine" if steps > need else "*** TOO STIFF FOR THIS TIMESTEP ***"))
+          f"({creature.world.integrator}, wants >= {need}) "
+          + ("fine" if ok else "*** TOO STIFF FOR THIS TIMESTEP ***"))
 
     # --- symmetry -----------------------------------------------------------------------
     by_name = {L.name: L.tau_static for L in loads}

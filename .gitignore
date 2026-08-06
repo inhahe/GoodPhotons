@@ -13,3 +13,6 @@ runs/
 checkpoints/
 *.pt
 *.onnx
+
+# Throwaway calibration/analysis scripts (see CLAUDE.md conventions)
+scraps/

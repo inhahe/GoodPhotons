@@ -104,8 +104,17 @@ class Posture:
 
 @dataclass
 class Defaults:
-    joint_damping: float = 0.1
-    joint_armature: float = 0.01
+    # Both of these are *escape hatches*, not the normal path: an absolute number in
+    # kg*m^2 or N*m*s/rad is body-specific, so it is wrong for every morph but one. Leave
+    # them None and `tune` measures each joint instead. See `joint_armature_ratio`.
+    joint_damping: float | None = None
+    joint_armature: float | None = None
+    # Armature as a dimensionless fraction of the joint's own measured inertia -- which is
+    # what a gear ratio physically is, since reflected rotor inertia is n^2*I_rotor and a
+    # matched drive keeps that a roughly fixed share of the load it drives. Scale-free, so
+    # it survives morphing; an absolute number does not. The default 0.01 kg*m^2 spanned
+    # 0.7% to 3790% of true joint inertia across this rig's *own* joints, unmorphed.
+    joint_armature_ratio: float = 0.1
     geom_density: float = 1000.0
     geom_friction: Vec3 = (0.8, 0.005, 0.0001)
     motor_gear: float = 30.0

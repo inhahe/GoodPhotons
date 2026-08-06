@@ -175,6 +175,28 @@ Two things this pass must do that are easy to omit:
   joints are. Chasing that ran one 314 kg draw to 2.3×10⁶ N·m/rad over eight rounds of a
   loop that was never going to converge. Diverging quietly is worse than failing.
 
+**Armature is measured too, and for the same reason.** Reflected rotor inertia is
+`n²·I_rotor`, so the body-independent quantity is the *fraction* of the load it represents
+— a drive matched to a heavier limb puts a bigger motor behind a similar gear ratio.
+Declaring it as `kg·m²` is the same units mistake as a stiffness literal and hides better,
+because nothing in the model looks wrong: the joint is simply heavier than the bone
+attached to it. On this rig, unmorphed, one `0.008 kg·m²` default was **0.7% of the
+spine's own inertia and 3790% of the paw's** — the paw joints were 97.4% rotor and 2.6%
+animal. Because armature is part of the mass matrix, that propagated into everything read
+from it: `stiffness_ceiling = I(2πf)²` licensed 38× more stiffness than the real limb could
+follow, and `c = ζ·2√(kI)` overdamped the same joints — both worst exactly where the foot
+meets the ground. `tune.size_armature` therefore measures each joint's true inertia (with
+armature at zero, which is what the model already has if nothing set it) and applies a
+dimensionless `joint_armature_ratio`. It runs after `auto_exclude` and *before* `measure`,
+since sizing it afterwards would tune the body against a mass matrix it does not have.
+
+Ordering, then, is not incidental — each pass changes the model the next one measures:
+
+```
+auto_exclude   →  size_armature  →  measure  →  size_tone  →  relax
+(load path)       (mass matrix)     (torques)   (predict)     (correct)
+```
+
 Two rig bugs were found by measurement that were invisible to loading, simulating and
 eyeballing, and both had been silently corrupting every torque reported before they were
 fixed:

@@ -31,42 +31,67 @@ Ruled out, each by direct measurement:
 | friction cone | statics solve needs μ = 0.000 (reaction is purely vertical); ground provides 0.9 | no |
 | self-collision load path | 0 excluded pairs needed; contacts are the 4 paws | no |
 | general mass scaling bug | the default rig is flat at 4.8–4.9% sag across a **32×** `body_mass` sweep | no |
+| absolute `joint_armature` | replaced by a measured per-joint armature (issue 2, DONE): **bit-identical**, +793 mm and 170.3° before and after | no |
 
 Only mass moves it: the identical morph at `body_mass/4` (78 kg) stands at 4.0% sag. So
 it is a threshold effect specific to that geometry, not a systematic scaling error.
-Remaining suspects, untested: MuJoCo contact behaviour under a ~3 kN load on four point
-contacts (the hind paw's centre descends 37 mm during the slide, which looks like more
-than seating), and `Defaults.joint_armature = 0.01` being an absolute constant rather than
-a mass-scaled one.
+
+Remaining suspect, untested: MuJoCo contact behaviour under a ~3 kN load on four point
+contacts — the hind paw's centre descends 37 mm during the slide, which looks like more
+than seating.
 
 Low priority — P4 will need a viability filter on randomised draws regardless, and
 `tune.support_polygon` already returns the number to filter on. But the mechanism should
 be understood before it is filtered away, in case it also affects plausible bodies.
 
-### 2. `Defaults.joint_armature` and `joint_damping` are absolute literals
-
-`creaturelab/model.py`: `joint_armature = 0.01` (kg·m²) and `joint_damping = 0.1`
-(N·m·s/rad). These are exactly the body-specific unit literals that `tune.py` exists to
-eliminate, one layer down — armature 0.01 is negligible on a 314 kg hip and dominant on a
-paw joint. `tune.py` overrides damping for every joint it owns, so the damping default
-only reaches unowned joints, but armature is never overridden and feeds `stiffness_ceiling`
-and every damping calculation through the mass-matrix diagonal.
-
-Proper fix: derive both from the joint's own measured inertia (armature as a fraction of
-it, which is what a gear ratio physically is), the same way stiffness is derived. Possibly
-implicated in issue 1.
-
-### 3. Independent morph sampling can draw incoherent animals
+### 2. Independent morph sampling can draw incoherent animals
 
 `sample_morph` perturbs all 26 parameters independently, so `stance_femur` is uncorrelated
 with `femur_len`, and `body_scale` with `trunk_len`. At `--scale 1.0` this produces bodies
-no animal resembles. Yield is still 95%, but P4 wants a distribution of *plausible* bodies,
+no animal resembles. Yield is still 93%, but P4 wants a distribution of *plausible* bodies,
 not merely standable ones. Options: declare covariance in the `morph` block, or sample a
 few latent factors (size, gracility, crouch) that drive the parameters.
+
+Every scale-1.0 collapse other than seed 15 is now of this shape rather than a tuner
+failure: seeds 30 and 32 topple to ~50° while sagging only 2–4%, from support margins of
++60 and +18 mm. They are not sprung too softly — they are bodies whose feet are in the
+wrong place, and no amount of passive tone fixes a foot in the wrong place.
 
 ---
 
 ## Done
+
+### `Defaults.joint_armature` and `joint_damping` were absolute literals  **DONE**
+
+`joint_armature = 0.01 kg·m²` and `joint_damping = 0.1 N·m·s/rad` — exactly the
+body-specific unit literals `tune.py` exists to eliminate, one layer down, and better
+hidden, because nothing about the model looks wrong. The joint is simply heavier than the
+bone attached to it.
+
+Measured on the default rig, **unmorphed, with no morph vector involved at all**, the
+rig's own `0.008` spanned **0.7% of the spine's inertia and 3790% of the paw's**: the paw
+joints were 0.00821 against a true 0.00021, i.e. 97.4% fictitious rotor and 2.6% animal.
+It then propagated, because armature is part of the mass matrix every other measurement
+reads — `stiffness_ceiling` is `I(2πf)²`, so an inflated `I` licensed 38× more stiffness
+than the real limb could follow, and damping is `2ζ√(kI)`, so the same joints came out
+heavily overdamped. Both errors were largest exactly where the contact happens.
+
+Fixed by `tune.size_armature`: armature is a dimensionless fraction of each joint's own
+measured inertia, which is what a gear ratio physically is (reflected rotor inertia is
+`n²·I_rotor`, a roughly fixed share of the load a matched drive is built for). It runs
+after `auto_exclude` and before `measure`, since sizing it later would tune the body
+against a mass matrix it does not have. `joint_damping` now defaults to `None`, so an
+unowned joint gets no arbitrary damping instead of a wrong one.
+
+The ratio was chosen by measurement, not taste: stand yield is **flat across a 40× range**
+of it (0.02 → 0.8 all give 100% / 98.3% / ~92% at scales 0.5 / 0.75 / 1.0), which is the
+right property for a numerical stabiliser and confirms that what mattered was making the
+quantity scale-free, not the number. 0.1 is at or near the best in every column.
+
+Honest cost: scale-1.0 yield went 95% → 93.3% and scale-0.75 100% → 98.3%, two draws in
+120. The old figures were partly bought with the fictitious inertia — a 38× overweight
+paw is a very effective transient damper — and the draws that now topple are the
+incoherent morphs of issue 2, not tuner failures.
 
 ### MuJoCo 3.11 API drift — silent wrong answers, no errors  **DONE**
 

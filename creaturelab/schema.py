@@ -114,8 +114,10 @@ DEFAULTS = BlockSpec(
     label="name", label_required=False,
     doc="Values applied to every joint/geom that does not set them itself.",
     props={
-        "joint_damping": Prop(1),
-        "joint_armature": Prop(1),
+        "joint_damping": Prop(1, doc="absolute N*m*s/rad; body-specific, prefer posture"),
+        "joint_armature": Prop(1, doc="absolute kg*m^2; body-specific, prefer the ratio"),
+        "joint_armature_ratio": Prop(
+            1, doc="armature as a fraction of each joint's own measured inertia"),
         "geom_density": Prop(1),
         "geom_friction": Prop(3),
         "motor_gear": Prop(1, doc="default torque scale for joint motors"),
