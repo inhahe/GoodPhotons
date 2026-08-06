@@ -30,8 +30,16 @@ P4 morphology conditioning  (the thing that makes stylization free later)
 P5 VIDEO FITTING            ← the research risk, entered with a yardstick
 ────────────────────────────
 P6 stylization / morph transfer
-P7 soft tissue + fur + render through ftrace
+P7 soft tissue + skin + eyes + fur + render through ftrace
+P8 live creature viewer     (not strictly ordered — pull it forward the moment
+                             morph-space exploration starts costing you time)
+P9 human-performance drive  (needs P4's conditioned policy + P7's face to be
+                             the interesting version rather than pose retargeting)
 ```
+
+**P8 is deliberately unordered.** It is the one item here that pays back immediately at *any* stage:
+26 morph parameters are currently explored by randomising and counting collapses, and a slider plus
+a live sag/support readout replaces that with looking. Promote it as soon as it would save a session.
 
 P2 is the one people skip and regret. Fitting a controller to *clean* mocap first means
 that when the video version fails, you know it's the video, not the controller.
@@ -132,6 +140,13 @@ AMP now means P5 doesn't need a new controller.
 - [ ] Non-idealised joints where it matters: migrating knee centre-of-rotation, and the
       **floating scapula** (in felids the scapula isn't rigidly articulated to the axial
       skeleton — it rides in a muscular sling, and that is what makes a cat read as a cat)
+- [ ] **Cartilage** *(added 2026-08-06 — was missing from this list entirely; zero hits repo-wide)*.
+      Two distinct jobs, easy to conflate: (i) **articular cartilage** on joint surfaces, which is
+      what actually produces the migrating centre-of-rotation above — model it as compliant contact
+      / a shaped constraint surface rather than as a body; (ii) **structural cartilage** (costal,
+      nasal, ear, intervertebral discs, the xiphoid) which is load-bearing *geometry* with a
+      stiffness between bone and flesh, and matters mostly to P7's deformation, not to control.
+      Decide per site which tier it belongs to; do (i) only where it changes the motion.
 - [ ] Retrain P2's controller on muscle actuation
 
 ---
@@ -184,13 +199,126 @@ the controller nearly nothing.
 - [ ] **In-loop:** rigid skeletal sim only
 - [ ] **Offline:** skinning + secondary dynamics (mass-spring / quasistatic FEM / learned
       deformer) as a render-time pass
-- [ ] Pose → `.ftsl` bake, rendered by ftrace
+- [ ] Pose → `.ftsl` bake, rendered by ftrace. **Note there is no `creaturelab/emit_ftsl.py` yet** —
+      `model.py`'s docstring says "the emitters turn it into MJCF or FTSL", but only `emit_mjcf.py`
+      exists. FTSL is y-up and the sim side is z-up (`schema.py`), so the renderer emitter owns
+      that conversion.
+- [ ] **Skin as a surface, not just a word.** Today "skin" means nothing here: there is no mesh, no
+      bind pose, no weights. Needs (a) a skin mesh authored/fitted against the rig, (b) skinning
+      weights, (c) sliding over fascia rather than rigidly following bone — the sliding is most of
+      what separates a real animal from a CG one.
+- [ ] **Eyes** *(added 2026-08-06 — was missing entirely; zero hits repo-wide)*. Small in geometry,
+      enormous in read, and they belong in *both* tiers: **control** (gaze as a first-class output —
+      saccades, smooth pursuit, vestibulo-ocular reflex stabilising gaze against head bob during
+      locomotion; head/neck orientation is downstream of where the animal is looking, so this is not
+      cosmetic) and **look** (a layered refractive eye — cornea/aqueous/lens with distinct IORs,
+      wet-surface specular, a real caustic on the iris behind the cornea). ftrace's spectral
+      dielectric path already renders that tier; the missing part is the anatomy and the gaze
+      controller. Also: pupil dilation as a morph/state knob, and a nictitating membrane for species
+      that have one.
 - [ ] Fur: fiber BCSDF (Marschner / d'Eon / Yan) + dual scattering — a natural extension
-      of ftrace's existing spectral + volume machinery rather than a new dependency
+      of ftrace's existing spectral + volume machinery rather than a new dependency.
+      Prerequisite that does *not* exist yet: a **groom** — fiber generation, guide curves, clumping,
+      and direction driven by the anatomical layer (see below). ftrace has no hair/curve primitive
+      today, so this is a renderer feature as much as a creature feature.
 - [ ] Non-stationary texture: curvature/cavity masks, spatially-varying noise parameters,
       domain warping, reaction–diffusion for coat patterning — driven by the *anatomical*
       layer (strain, muscle proximity, contact history). This is the piece nobody has,
       and it's only possible because we own both layers.
+      **Renderer-side prerequisites are now written down**: `../forward raytracer/TODO.md` **§O**
+      (audit 2026-08-06). ftrace today has value noise + POV's exact Perlin + the fBm/ridged
+      multifractals, and a CPU/GPU-identical expression VM that can already *express* spatially
+      varying parameters — but it has **no cellular/Worley/Voronoi** (§O1), **no vector noise for
+      domain warping** (§O2), and **no reaction–diffusion** (§O6). Those three are exactly this
+      bullet's vocabulary, so build them there and this becomes a binding exercise.
+
+---
+
+## P8 — Live creature viewer: see and pose the knobs interactively  `[ ]`
+*(added 2026-08-06 — asked for explicitly, and absent from the plan until now.)*
+
+**What exists:** `tools/ftcl_build.py --view` opens **MuJoCo's** viewer on the generated model —
+useful for checking physics, useless for judging *look*, and it has no knobs. `rig_report.py` and
+`morph_sweep.py` are headless and numeric: they answer "does it stand?" in a table, and 26 morph
+parameters are currently explored by *randomising and counting collapses*, never by a human moving
+a slider and watching. That is a real gap — the whole justification for the `.ftcl` layer (see "Why
+not just write MJCF by hand?") is that morphology is **symbolic and named**, and nobody has ever
+seen those names as controls.
+
+- [ ] **Slider-per-morph-param panel**, live: move `femur_len`, rebuild, re-tune, re-settle, redraw.
+      The rebuild path is already fast and already correct (`build` → `tune` → `validate`); this is
+      a UI over machinery that exists.
+- [ ] **Show the tuner's verdict inline** — sag %, support margin, trunk tilt, per-joint buckling —
+      so a slider that walks the body out of the feasible set says so *while you drag it*, instead
+      of showing up as a collapse statistic 60 draws later. `tune.support_polygon` already returns
+      the number.
+- [ ] **Which renderer?** Two tiers, and they are not competing:
+      - **near-term:** MuJoCo's own viewer + a param panel. Cheap, immediate, good enough to explore
+        morph space and to catch known-issue #2 (incoherent draws — a 314 kg animal on a 26 cm back)
+        by eye rather than by statistics.
+      - **the one actually asked for:** drive **ftrace's `-raster-gpu`** so the creature is seen in
+        the real renderer with real materials. This needs P7's `emit_ftsl.py` first, and then it is
+        largely a *solved integration*: ftrace already has a resident `-serve` mode, an interactive
+        `-explore`/`-fly` loop, and — most relevantly — the loom viewer's **`LoomBridge`** pattern
+        (spawn a Python process, hold a newline-delimited-JSON channel, latest-wins on a one-slot
+        job so a continuous drag costs one rebuild, adopt results on whatever frame they land).
+        `creaturelab` sits in exactly loom's position in that architecture. Read
+        `../forward raytracer/src/viewer_gui.cpp` (the **Live (loom)** panel) before designing this;
+        do not invent a second bridge.
+- [ ] **Playback, not just posing** — scrub/play a trajectory (a settled fall, later a trained gait)
+      rather than only static poses. Note the loom viewer has the *same* gap and it is written up as
+      §F8 there; the pacing lesson (bake-rate-paced play vs. prebaked play) transfers directly.
+- [ ] **Bar:** a person can find a good-looking, physically-valid animal by dragging, in one sitting,
+      without reading a table.
+
+---
+
+## P9 — Human-performance drive: puppeteer the creature  `[ ]`
+*(added 2026-08-06 — asked for explicitly, and genuinely not in the plan. Zero hits repo-wide for
+`mocap`, `facial`, `expression`, `retarget`, `blendshape`, `FACS`.)*
+
+**This is a different axis from P5, and conflating them would be a mistake.** P5 is *animal video →
+learned controller*: offline, one-way, its output is a **policy**. P9 is *live human performance →
+creature state*: real-time, interactive, its output is a **pose/knob stream**. P5 makes the creature
+move like an animal; P9 lets a person act through it. They share a keypoint front-end and almost
+nothing else.
+
+- [ ] **Decide the target of the drive first — this is the whole design question.** Three options,
+      increasingly interesting and increasingly hard:
+      1. **Pose retargeting** — human joint angles → creature joint angles. Straightforward,
+        well-trodden, and *throws away everything this project is for*: it bypasses the muscles and
+        the learned controller, so the creature moves like a costumed human. Useful as a baseline
+        and as a debugging harness, not as the goal.
+      2. **Knob drive** — the performance sets *high-level* variables the policy already consumes
+        (heading, speed, gait, gaze target, posture/tension, effort). The controller still produces
+        the motion, so it stays biomechanically honest and stays *animal*. **This is the one that
+        fits the architecture**, and it is why P4 (morphology conditioning) and a well-chosen
+        observation space matter: the drive is only as expressive as the policy's inputs.
+      3. **Style/latent drive** — map performance into an AMP latent so the performer supplies
+        *manner* (skulking, wary, exhausted) rather than pose. Open research, but the natural
+        endpoint of choosing AMP in P2.
+- [ ] **Body capture.** Bias to **markerless multi-camera** (calibrated rig + triangulated 2D
+      keypoints) over marker suits: it shares its whole front-end with P5's animal pipeline, needs no
+      hardware the project doesn't already want, and P5 already budgets a ≥4-camera ≥120 fps rig
+      (`notes/capture.md`). Marker-based Vicon/OptiTrack is more accurate but is a second pipeline
+      for one purpose. **Reuse P5's rig and calibration — do not build a parallel one.**
+- [ ] **Facial capture and a face rig — note the face does not exist at all yet.** `canis.ftcl` is
+      25 bones of locomotor skeleton: there is no skull articulation beyond the jaw, no facial
+      musculature, no ear/brow/lip/nostril controls, and no eyes (see P7). So "control facial
+      expression" is currently blocked on *building a face*, not on capture. Order of work:
+      1. facial anatomy in the grammar (jaw, ears, brow, lips, nostrils, eyelids, tongue) as
+         muscle-driven controls, not blendshapes — blendshapes would fork the actuation model and
+         would not morph with P4;
+      2. **cross-species mapping is the hard part** — a human smile has no canine referent. Do not
+         retarget geometry; retarget *intent* (arousal, valence, attention, threat) onto the
+         creature's own species-appropriate display. This is authored mapping plus taste, not a
+         solved algorithm, and it is where the character will actually live;
+      3. only then capture (monocular face tracking is mature and cheap; a head-mounted camera is
+         the production answer).
+- [ ] **Latency budget.** "Live puppeteering" means the loop capture → solve → policy → sim → render
+      must close in tens of milliseconds. That is a hard constraint on the controller's inference
+      cost and it should be measured early, not discovered at the end.
+- [ ] **Bar:** a person moves, and a *dog* moves — recognisably driven, recognisably still a dog.
 
 ---
 
