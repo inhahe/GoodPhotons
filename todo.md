@@ -465,9 +465,57 @@ separate channels is how you get a 200-dimensional command space by accident.
       physics is most visible.
 - [ ] **Idle behaviours** — shake off water, scratch, stretch, yawn. What makes a creature look alive
       *between* actions.
-- [ ] **Fatigue as accumulating state**, not a knob that is set.
 - [ ] **Piloerection** — a state knob on the **fur groom**, connecting P7's look layer to the control
       layer.
+
+### Persistent state: three things, all of which fatigue needs
+
+*(This entry started as "fatigue is accumulating state, not a knob that is set", which was wrong —
+it is all three of the following, and the mistake generalises to every slow variable, so it is
+written up here rather than as one checklist line.)*
+
+Fatigue splits into three separate objects that are easy to conflate:
+
+1. **Susceptibility — a MORPH parameter (P4).** How fast this creature tires, and under what
+   conditions. Muscle fibre-type composition is the physical handle: a sprinter fatigues fast and
+   recovers fast, a sustained trotter barely fatigues at that intensity at all. Since P4 transforms
+   one creature into another, susceptibility has to ride in the **morph vector** and change with it —
+   greyhound→wolf must alter the endurance curve without anyone re-authoring it. Same P4 rule as
+   everywhere else: **conditioning input at training time, or the fix is a retrain.**
+2. **Level — accumulating state.** Integrates work done, decays with rest. This is the part that must
+   *not* be only a knob: an animal that has been galloping for five minutes should be tired with
+   nobody setting anything.
+3. **Level — a settable knob, with a write port.** **The argument that settles it: the simulation's
+   timeline is not the film's timeline.** The animal exits frame fresh and re-enters after an implied
+   three-hour chase that was never simulated. There is no run of physics connecting those shots, so
+   the state has to be *writable*, not merely reachable by simulating up to it. Accumulation and
+   direct setting are not opposed — accumulation is the default, the knob is the seek control.
+
+- [ ] **Give every slow variable a write port.** Fatigue is not special; it is the first instance of
+      a class. Hunger, thirst, injury, **wetness** (which is a P7 fur-look input as much as a state),
+      body temperature, breath recovery, alertness/arousal, and fatigue all integrate over time and
+      all get set out of continuity order by a director. Design the persistent-state block once, as a
+      named vector that can be saved, restored, interpolated between shots, and set directly —
+      instead of discovering the requirement separately seven times.
+- [ ] **Fatigue must be implemented at BOTH levels, or it fails in a recognisable way.**
+      - *Actuator level*: fatigue reduces available force from the Hill-type actuators. Physically
+        real, and consequences follow for free.
+      - *Conditioning level*: fatigue is in the policy's observation/conditioning vector, so it
+        knows it is tired and changes strategy — shorter stride, lower head carriage, more ground
+        contact time.
+      - Only the first ⇒ the policy is startled by its own weakness and simply falls over. Only the
+        second ⇒ theatrical tiredness with no physical consequence, which is what hand-animation
+        already does badly. Both ⇒ an animal that is *actually* weaker and *knows* it.
+- [ ] **Gait downgrade should then emerge, not be authored.** Fatigue lowers available force, the
+      energy penalty that already selects gait (Hoyt & Taylor, above) re-optimises against the new
+      cost landscape, and gallop→trot→walk should fall out of the same mechanism that produced the
+      upward transitions. If it does, that is strong evidence the emergence argument is real and not
+      a story told about a hand-tuned result. **Worth testing explicitly as a P10 milestone.**
+- [ ] **Fatigue is also the honest resolution of the muscle-redundancy problem** noted at the end of
+      this section: recovering activations from captured kinematics is underdetermined and needs an
+      effort/fatigue criterion to pick a solution. The same fatigue model therefore serves both the
+      control layer and the capture-inference layer — a reason to build it early rather than treat it
+      as set dressing.
 
 **Why this section exists.** The user's framing was "simulate the kinesthetic sense so the creature is
 easy to control abstractly". The sensing half of that is free in simulation and needs no net; the
