@@ -216,11 +216,62 @@ the controller nearly nothing.
       dielectric path already renders that tier; the missing part is the anatomy and the gaze
       controller. Also: pupil dilation as a morph/state knob, and a nictitating membrane for species
       that have one.
-- [ ] Fur: fiber BCSDF (Marschner / d'Eon / Yan) + dual scattering — a natural extension
-      of ftrace's existing spectral + volume machinery rather than a new dependency.
-      Prerequisite that does *not* exist yet: a **groom** — fiber generation, guide curves, clumping,
-      and direction driven by the anatomical layer (see below). ftrace has no hair/curve primitive
-      today, so this is a renderer feature as much as a creature feature.
+### Fur — scoped deliberately narrow  *(scoping decided 2026-08-06)*
+
+Fur is the **least novel thing in this project** — thousands of people have shipped it; nobody has
+shipped muscle-actuated animal control fit from video. So it stays last and stays small. What
+follows is the scope, and just as importantly what is deliberately *excluded*.
+
+- [ ] **Gate: a curve primitive in ftrace.** Verified 2026-08-06 — ftrace has **none**: zero hits for
+      `fiber`, `ribbon`, `bezier`, `b-spline`, and all four `hair` matches are the English idiom
+      ("a hair negative"). Without one, fur must be triangle ribbons at ~64 tris/hair, i.e. 10⁸–10⁹
+      triangles for a dog (~1–10M hairs × 8–32 segments). Not viable. Curve primitive + its own BVH
+      is the entry ticket and nothing else starts until it exists.
+- [ ] **Shading: Yan-style double-cylinder, not plain Marschner.** Marschner was derived for *human
+      hair*. Animal fur has a **medulla** — a hollow scattering core — which is why Yan et al.
+      (2015/2017) added the TT^s/TRT^s lobes. Plain Marschner on a dog reads as plastic doll hair.
+- [ ] **Inter-fiber multiple scattering (dual scattering, Zinke 2008) is not optional.** Light coats
+      are *dominated* by it; white/cream fur without it renders dark and dead. This is the single
+      most common "why does my fur look wrong", so budget for it up front rather than bolting it on.
+- [ ] **Antialiasing / LOD is the real technical risk.** A hair is sub-pixel (often 1/5–1/50 of a
+      pixel), so in a path tracer this appears as **variance**, not jaggies — a ray hits a fiber or
+      misses and the two answers differ wildly. You don't antialias fur, you average it, expensively.
+      Past some distance individual fibers must give way to an aggregate volumetric BSDF, and making
+      that transition not pop is where the effort actually goes.
+      **Backward mode only** (`-mode L`): a forward/photon tracer is the wrong vehicle, because
+      photons cast from a light almost never usefully hit sub-pixel fibers.
+- [ ] **Procedural groom, driven by the anatomical layer — LOCKED DESIGN DECISION, decided now
+      even though the work is late.** The groom (fiber generation, guide curves, clumping, density,
+      length, guard-hair vs underfur populations, direction field) must be *parameterised by the
+      anatomy*, never hand-painted. Two reasons, and the second is the load-bearing one:
+      1. it's the only genuinely novel part of the fur work — direction following muscle topology,
+         clumping from strain and contact history, which is the "we own both layers" payoff;
+      2. **a painted groom does not survive P4's morphing.** Change the body and painted maps are
+         stale, which would quietly destroy the thing that justifies this whole architecture.
+      Note "sufficiently random yet orderly" is precisely a *correlated*-randomness problem:
+      guide curves give order, per-hair jitter gives randomness, and **clumping gives the
+      correlation**. Omit clumping and fur reads as carpet. It is also inherently non-stationary —
+      whorls, cowlicks, parting lines, belly-vs-back density — and you cannot comb a sphere, so the
+      direction field *must* have singularities and where they go is a design decision, not a
+      computation. Same missing vocabulary as the texture bullet below (§O3 non-stationary,
+      §O4 flow-aligned).
+- [ ] **Dynamics: quasi-static deflection only. NO simulated fur.** ("Dynamics" = each hair simulated
+      as a stiff segment chain responding to inertia, gravity, wind and body collision — so the coat
+      lags, overshoots and settles when the animal moves.) Excluded because:
+      - **swing amplitude scales with length.** A 2 cm hair's tip cannot travel more than 2 cm even
+        in principle, and with real bending stiffness far less — sub-pixel at normal viewing
+        distance. Only long groups (tail plume, ear feathering, a mane) swing visibly.
+      - **the killer is statefulness, not CPU.** Simulated fur at frame 500 depends on frames
+        0–499, which destroys the embarrassingly-parallel property of frame rendering: no
+        distributing frames across machines, no rendering one frame in isolation to test a lighting
+        change. That's worse for this project than the compute cost.
+      **Do instead:** closed-form deflection as a function of local surface velocity + wind vector,
+      evaluated fresh each frame — stateless, parallel, and it buys the "fur leans back when the dog
+      runs / ripples in wind" read for almost nothing. Loses lag, overshoot and settle, which is
+      exactly the part only long fur shows.
+      *If long fur is ever genuinely needed*, the standard escape is: simulate **guide curves only**
+      (~10³) in a separate cached pass written to disk, then render statelessly from the cache — a
+      pipeline stage, not a flag. Don't do it until a specific shot demands it.
 - [ ] Non-stationary texture: curvature/cavity masks, spatially-varying noise parameters,
       domain warping, reaction–diffusion for coat patterning — driven by the *anatomical*
       layer (strain, muscle proximity, contact history). This is the piece nobody has,
