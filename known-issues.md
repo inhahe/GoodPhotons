@@ -41,78 +41,127 @@ sequence would upload each frame's geometry exactly once.
 default 256) and renders in draft at that resolution *while the transport is playing*, snapping
 back to full res on pause. Worth 1.4 → 1.8 fps (~25%) — it can only attack the 165 ms pixel half.
 
-### BUG (2026-08-06): a trivial `-mode W` GPU render hung in a kernel that never returns, and `ftrace -stop` cannot stop it
+**CONFOUNDER — re-measure before acting on the split (found 2026-08-06, after the fact).** These
+numbers were taken while another process (`python`, pid 103640) was holding **90–93 % of the GPU**;
+see the GPU-contention entry below, where the same confounder cost me two wrong diagnoses. The
+`raymarch 297` term is the only GPU-side term in the breakdown, so it is inflated by contention
+while `sidecar 87` / `ftsl 46` (pure CPU) are not. **The ranking may therefore invert on an idle
+card**, which would make the loom round-trip the real bottleneck after all — the very hypothesis
+this entry claims to refute.
 
-**Symptom.** A `-mode W` GPU render (pid 132596, `out/seam_check.ftsl -> png/seam_fixed.png`) sat
-on a single 1-spp chunk for **>271 s**, emitting `[gpu-stall]` lines. `ftrace -stop 132596` was
-issued twice, the second time long after the viewer had exited; both printed `[stop] asked pid …
-to finish and exit cleanly.` and then `[stop] still running after 120s`. The process was **still
-alive and still wedged hours later**, with ~567 s of accumulated CPU time.
+What survives the confounder and what does not:
+- **Survives:** the *structural* finding that `renderIsoPreviewCuda` re-uploads the whole scene per
+  call. That is read off the code, not the clock, and the fix is right regardless.
+- **Survives:** the fixed-vs-pixel *decomposition* (a resolution change that barely moves the time
+  implies a large resolution-independent term), since contention scales both points.
+- **Does NOT survive:** every absolute millisecond figure, the "raymarch dominates" claim, and the
+  "133 ms is only ~23 %" dismissal of the loom round-trip.
 
-**Root cause, from a non-invasive `cdb -pv -p 132596` attach.** The render thread is parked inside
-the driver's synchronise, not in any ftrace loop:
+**Re-run the `[play]` trace with the card idle** (check `tools/gpu_by_process.ps1` first) before
+using this entry to prioritise F8b.
 
-```
-ftrace+0x19b78
-nvcudart_hybrid64!_cudaGetProcAddress+0x29a58
-nvcuda64!cuCtxSynchronize_v2+0x25
-nvcuda64!cuCtxSynchronize+0xbf
-nvcuda64+0x4a24d …
-```
+### RECURRENCE (2026-08-06) of the 2026-08-04 GPU-contention issue below — plus the per-process detector it was missing
 
-So the thread that would poll the stop flag is blocked in `cuCtxSynchronize` on a kernel that has
-not completed. The high CPU number is the driver's spin-wait, not progress. Three other threads
-are the usual nvcuda worker/waiter threads.
+**This is the same issue as "OPEN (2026-08-04): a GPU render can be starved to a standstill by
+ANOTHER process on the card"** further down this file. Logged separately only because it produced
+a clean magnitude measurement and a *usable detector*, both of which that entry lacked.
 
-**It is a hung kernel, not GPU starvation — this was my first (wrong) reading, corrected by
-telemetry.** The initial guess was contention: the render had been launched while the viewer held
-a CUDA context, and `nvidia-smi` showed 100 % utilisation. But after the viewer exited, ftrace was
-the only remaining *compute* consumer (the other ~48 contexts are ordinary desktop apps — Chrome,
-Edge, WindowsTerminal, Signal, soffice) and the GPU still reads:
+**Measured magnitude.** Identical scene, resolution, mode and sample count; only `-device` differs:
 
 ```
-util.gpu  util.mem  power     clocks.sm  temp
-100 %     1 %       ~95 W     2760 MHz   48 C
+ftrace -in out/seam_check.ftsl -mode W -spp 1 -o ... -window     # 520x520
+
+-device cpu    [spp] 1 / 1,   0.5 s, deterministic     (12 CPU threads)
+-device auto   [spp] 1 / 256, 1584.8 s, deterministic  (RTX 4090)
 ```
 
-**100 % occupancy with 1 % memory traffic and ~95 W on a 4090** (which pulls 300–450 W under real
-dense work, and idles far cooler than its ceiling here) is the signature of a kernel *occupying*
-the device without doing work — a spin or a non-terminating loop, with almost no SMs active.
+**0.5 s on twelve CPU cores against 26 minutes on a 4090**, for 1 mesh (2160 verts / 4320 tris),
+93 spheres, 5 quads and one area light. The renderer's own adaptive chunk target is 0.15 s. Both
+images are correct; the GPU run completed and exited 0. So `-device cpu` is not merely a
+"workaround when the card is busy" — under contention it is **three orders of magnitude** better,
+which is worth knowing before choosing a device.
 
-**And the scene is trivial for mode W:** `out/seam_check.ftsl` is 1 mesh + 93 spheres + 5 quads +
-1 light, all `diffuse`, with **no `isosurface`/`function` block** at all. Mode W should finish this
-in well under a second per spp; it has now held the GPU for **>20 minutes on a single 1-spp
-chunk** and accumulated 1352 s of CPU in the driver's spin-wait. That is not a slow render.
+**The detector the old entry says does not exist — it does, just not in `nvidia-smi`.** That entry
+concludes contention is invisible from inside the process ("`nvidia-smi` reports 100 % busy either
+way, and per-process VRAM is N/A under WDDM"), and ftrace's own `[gpu-stall]` text still advises
+"check `nvidia-smi` for a second CUDA program" — advice that **cannot work on WDDM**. Windows'
+**GPU Engine** performance counters *do* attribute utilisation per process. During the stall:
 
-*Not yet confirmed:* which kernel, and whether the earlier contention is what put it into this
-state. Confirming wants a GPU-side debugger (`cuda-gdb` / Nsight) attached to a fresh repro, which
-has not been attempted — a repro recipe is the first thing this entry needs.
+```
+   PID Name    Engine  Pct
+103640 python  3d      93.1     <-- owns the card
+ 42512 ftrace  3d       8.8     <-- our render
+```
 
-**Why this is the defect worth logging.** `taskkill /F` is forbidden in this repo — force-killing
-with CUDA kernels in flight is a known way to wedge the NVIDIA driver into a TDR/bugcheck. So a
-kernel that never returns makes a render **unstoppable by any sanctioned means**. It also keeps a
-file lock on `ftrace.exe`, which blocks `build.bat` from copying a new binary into the repo root —
-exactly the situation where the reflex is to kill by name.
+Sampled repeatedly, python held 90–93 % while ftrace got ~8.7 %. `tools/gpu_by_process.ps1` wraps
+the query (`Get-Counter` on `\GPU Engine(*)\Utilization Percentage`, whose instance names encode
+`pid_<n>` and `engtype_<kind>`).
 
-**Workaround used.** `-device cpu` for the same scene completed in ~30 s and produced
-`png/seam_fixed.png` normally.
+**Actionable improvements this unlocks, in priority order:**
+1. **Make `[gpu-stall]` name the culprit.** Query those counters from the watchdog thread and print
+   `[gpu-stall] pid 103640 (python) is using 93% of the GPU` instead of pointing at a tool that
+   cannot answer the question. This converts the single most confusing failure mode in the renderer
+   into a one-line explanation, and it is the cheapest item here.
+2. **Consider auto-falling back to the CPU on sustained foreign GPU load.** The `[vram]` gate
+   already falls back when the card is over budget; this is the same decision with a working input.
+   Given the 3000× measured here, defaulting to CPU when another process holds >80 % of the card
+   would frequently be the *faster* choice, not a degradation.
+3. The first-chunk timed probe and the `cudaEventQuery` poll loop already described in the
+   2026-08-04 entry's "Still open / proper fix" remain the structural fix for `-stop` / `-interval`
+   responsiveness; nothing here supersedes them.
 
-**What the fix looks like — two independent bugs here, fix both.**
-1. **The hang itself.** Find the non-terminating loop in the mode-W GPU path. The prime suspects
-   are the unbounded `while` loops: BVH traversal with a corrupt/duplicated node index, and any
-   `for(;;)` refraction/TIR bounce loop lacking a hard iteration cap. Every device-side loop that
-   can be driven by scene data should carry an explicit iteration bound, so bad data degrades a
-   pixel rather than hanging the machine.
-2. **The unstoppability, which is the worse of the two.** Even a legitimately long kernel must not
-   defeat `-stop`:
-   - **Poll the stop flag from a thread that is never inside a CUDA call** (the existing
-     `[gpu-stall]` watchdog thread), so `-stop` is at least *acknowledged* while the render thread
-     is blocked in `cuCtxSynchronize`.
-   - **Let the watchdog abandon a chunk**, not merely report it: after a bounded timeout, mark the
-     chunk lost, write the image + `.ftbuf` from what has already converged, and exit — accepting
-     that the leaked context is the OS's problem at process teardown.
-   - Prefer **launching chunks on a stream and polling a `cudaEvent`** over a blocking
-     `cudaDeviceSynchronize`, which is what makes the render thread unresponsive in the first place.
+**Caveat on attribution.** The counters report the **`3d` engine**, not `Compute`, for both
+processes, so this measures engine occupancy rather than SM occupancy, and it does not by itself
+prove ftrace's kernel would be fast on an idle card. The clean experiment — the same A/B on a
+genuinely idle GPU — has **not** been run, because the competing process is one of the user's own
+long-running Python services and is not mine to stop. Until that is done, "ftrace's GPU mode-W path
+is fine and this was purely contention" is *strongly indicated but not proven*.
+
+### PERF (2026-08-06): `-mode W` inherits mode R's `-spp 256` default, but is deterministic at 1 spp
+
+Independent of the contention above, and cheap to fix. `spp = 256` is the backward-reference
+default (`main.cpp:6545`) and mode W inherits it, yet W exists precisely because its deterministic
+estimators "converge at ONE sample per pixel" (`main.cpp:3387-3388`) — and the progress line
+already concedes that spp there "only buys antialiasing and spectral resolution"
+(`main.cpp:4877`), which is why it prints `deterministic` instead of a noise percentage.
+
+So the advertised headline feature of the mode ("noise-free at `-spp 1`", README) is **not what you
+get by default**: a plain `ftrace scene.ftsl -mode W` does 256× more work than the mode needs, and
+in the run above that turned a 26-minute observation into a 112-hour projection.
+
+**Fix.** Default `spp` per mode rather than globally — 1 for W (or a small handful if antialiasing
+is judged worth it by default), 256 for R/V. An explicit `-spp` keeps overriding it.
+
+---
+
+**Methodology note — I diagnosed this THREE times before getting it right. The pattern is the
+lesson, not the conclusion.**
+
+1. *"GPU starvation from contention."* — the right answer, but I had not established it, and I
+   abandoned it under weak evidence.
+2. *"A non-terminating kernel."* — wrong. The render completed on its own after 1584.8 s.
+3. *"The GPU mode-W path is ~3000× slower than the CPU."* — wrong. The number is real, but it
+   measures **contention**, not the code path.
+
+**Error 2 came from reading an instrument with no control.** I saw `100 % util, 1 % mem, ~95 W,
+2760 MHz` and concluded "occupancy without work = a spin". With ftrace exited and the render over,
+the same machine still read `100 %, 0 %, ~95 W`: that was the *baseline*, not a symptom, so every
+inference drawn from it was void.
+
+**Error 3 came from a controlled experiment with an uncontrolled variable.** The A/B was rigorous
+about scene, mode, resolution and spp — and silent about the other process on the card. Holding the
+obvious variables fixed felt like rigour, and disguised the one that mattered.
+
+Rules this earns:
+- **An instrument reading with no baseline is not evidence.** The difference between running and
+  idle is the measurement; a single absolute number is not.
+- **Before concluding "X is slow", enumerate who else is using X.** For any shared resource — GPU,
+  disk, network, a lock — "is something else using it?" precedes every performance conclusion.
+- **When the program under test states a diagnosis, disprove it explicitly before overriding it.**
+  `[gpu-stall]` said "The render is NOT hung" and named contention as the usual cause. It was right
+  on both counts, in writing, the entire time.
+- **"Hung" is falsifiable by waiting**, and waiting was free — the process was already running and
+  harming nothing.
 
 ### TECH DEBT (2026-08-06): a "render every scene at a uniform budget" sweep cannot distinguish correct from broken — three separate false signals
 

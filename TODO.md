@@ -2141,19 +2141,21 @@ replacement for the renderer or the primary editing tool.**
         **no clock** writes `frames = 1` — which would make play a button that silently does nothing.
         It is now disabled with a tooltip saying exactly that; scenes should save with
         `Clock.at_frame(0, N)`.
-      - **Profiled 2026-08-06 (0.140.0) — and the bottleneck is NOT the loom round-trip.** The Live
-        panel now prints the whole period split, with an explicit residual so nothing hides:
+      - **Profiled 2026-08-06 (0.140.0).** The Live panel now prints the whole period split, with an
+        explicit residual so nothing hides:
         `[play] 1.7 fps 574.4 ms = bake 40 + sidecar 87 + ftsl 46 + raymarch 297 + other 104`.
-        The F7 Render pane's synchronous raymarch is **more than half**, and it is **not pixel-bound**:
-        640² → 256² (6.25× fewer pixels) moved it only 439 → ~300 ms, so fixed ≈ **274 ms**, pixel ≈
-        165 ms. That fixed part is `renderIsoPreviewCuda` re-running `buildUpload` — whole scene,
-        BVH, materials, *every texture's texels* — plus three fresh `cudaMalloc`s, **per call**.
-        This **changes the priority order for (b)**: caching sidecars/`.ftsl` per frame removes only
-        the 133 ms loom half. A prebaked play that still calls the preview kernel the same way is
-        capped at ~3 fps. So (b) should cache **the resident GPU scene**, not just the text — upload
-        each frame's geometry once during the bake pass, keep the `DUpload` alive, version it so an
-        unchanged mesh/material/texture set is never re-sent, and pool the accum/z/emissive buffers.
-        Logged as a PERF entry in `known-issues.md`.
+        **These absolute numbers are NOT trustworthy** — they were taken while another process held
+        90–93 % of the GPU, and `raymarch` is the only GPU-side term, so it alone is inflated. The
+        "raymarch dominates, the loom round-trip is secondary" reading may invert on an idle card.
+        **Re-run the trace with the GPU idle before using it to prioritise (b)**; check with
+        `tools/gpu_by_process.ps1` (`nvidia-smi` cannot attribute per process under WDDM).
+        What *does* survive the confounder, because it is read off the code rather than the clock:
+        `renderIsoPreviewCuda` re-runs `buildUpload` — whole scene, BVH, materials, *every texture's
+        texels* — plus three fresh `cudaMalloc`s, **per call**, so a large part of its cost is fixed
+        rather than per-pixel. That still argues (b) should cache **the resident GPU scene** and not
+        merely the sidecar/`.ftsl` text: upload each frame's geometry once during the bake pass,
+        keep the `DUpload` alive, version it so an unchanged mesh/material/texture set is never
+        re-sent, and pool the accum/z/emissive buffers. Logged in `known-issues.md`.
       - Shipped alongside: a **`play res`** draft resolution used only while playing (1.4 → 1.8 fps,
         ~25%) and a **`-play`** CLI flag that opens with the transport already running — the latter
         because driving an ImGui window with synthetic input to measure it is unreliable (ImGui

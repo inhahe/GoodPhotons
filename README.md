@@ -3274,12 +3274,14 @@ transport already running, so a loop can be watched — or its per-frame cost re
 
 The Live panel breaks the played frame down into its parts (`bake`, `sidecar`, `ftsl`,
 `raymarch`, and an explicit `other` residual so the numbers account for the whole period),
-because the answer is not the obvious one: the loom round-trip is *not* the bottleneck — the
-Render pane's raymarch is, and most of its cost is fixed per call rather than per pixel
-(the preview kernel re-uploads the scene each frame; see `known-issues.md`). The Render
-pane's **`play res`** slider therefore renders at a reduced draft resolution *only while the
-transport is playing*, snapping back to full resolution the moment you pause, which buys
-back the part of the cost that does scale with pixels.
+so you can see where a slow frame actually goes rather than guessing. Two things that
+breakdown has already shown: the preview kernel re-uploads the whole scene on every call,
+so a large part of `raymarch` is fixed per call rather than per pixel; and the figures are
+only meaningful when nothing else is using the GPU, since `raymarch` is the one GPU-side
+term and another process on the card inflates it alone (see `known-issues.md`). The Render
+pane's **`play res`** slider renders at a reduced draft resolution *only while the transport
+is playing*, snapping back to full resolution the moment you pause, which buys back the part
+of the cost that does scale with pixels.
 
 ---
 
