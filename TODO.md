@@ -2121,6 +2121,32 @@ replacement for the renderer or the primary editing tool.**
         -serve` re-renders instantly. This is **C++ interactive-viewer work** (spawn/drive the resident
         process, present its frames, wire scrub/param/edit) — best done with the user present; the MC mesh
         is the working stand-in until then. Textures via **G5** + the F4 material/texture sidecar (done).
+- [ ] **F8 — the viewer *plays*, not only *scrubs*.** *(gap found 2026-08-06 answering "does the loom
+      viewer support viewing loom objects animated?" — answer: it **scrubs**, it does not **play**.)*
+      What exists today (`src/viewer_gui.cpp` ~L2774, the F4 **Live (loom)** panel): a `SliderInt("frame")`
+      + `DragInt("frames")`. Dragging `frame` marks the live panel `changed`, `LoomBridge::post()`s an
+      `introspect`+`emit` at that clock, and the returned sidecar/`.ftsl` re-seed the geometry and the F7
+      Render pane. So a loom scene **is** time-varying in the viewer and any frame can be inspected — but
+      the clock only advances when a human drags it. There is **no play/pause, no fps/wall-clock advance,
+      no loop toggle and no frame-rate readout** anywhere in the file (grep for `play`/`pause`/`animat` in
+      `viewer_gui.cpp` returns nothing).
+      - **The hard part is the pacing, not the button.** `LoomBridge` is deliberately *latest-wins on a
+        one-slot pending job* — the rule that makes a continuous drag cost one bake of the final value. A
+        naive play loop that posts every frame inherits exactly that and silently drops most of the
+        animation: you get a stutter of whichever frames won the slot, not playback. So play needs one of:
+        - **(a) paced play** — advance the clock only when the previous bake *lands* (the `baked` counter
+          ticks), i.e. play at the bake rate and honestly report "playing at 6 fps" rather than pretend;
+        - **(b) prebaked play** — a "bake range" pass that walks `0..frames-1` once, caches each frame's
+          sidecar + `.ftsl` (or just the tessellated geometry), then plays from cache at a real fps. This
+          is the one that gives smooth playback; it wants a memory cap and a progress bar.
+        Do (a) first (cheap, no new storage, immediately useful); (b) is what makes it a viewer you can
+        actually judge *motion* in.
+      - Worth doing in the same pass: **loop / ping-pong toggle**, **spacebar play-pause**, **arrow keys
+        ±1 frame**, and an **fps field** so `frames` means something in seconds. `loom/anim.py` (601 lines)
+        already owns clock/timeline semantics on the loom side — the viewer should read its fps/duration
+        over the existing channel rather than inventing a second notion of time.
+      - **Not blocked by anything.** The channel (`ViewerSession`/`serve_viewer`), the bake and the clock
+        parameter all exist and already work per-frame; this is purely viewer-side UI + pacing policy.
 
 ---
 
@@ -4334,6 +4360,77 @@ Measured 2026-07-29 (RTX 4090 vs 12 CPU threads, 480×300), the numbers this pla
         `ior` Spectrum actually varies across 400–700 nm (a constant-IOR dielectric is exact at C=1,
         so it must not nag). Verified: fires on `cornell.ftsl -heroc 1`, silent on the gyroid room
         and on Cornell at the default C. Print-only — the mode-W image is byte-identical to 0.137.0.
+
+---
+
+## O. Procedural texture — non-uniform / non-stationary randomness  *(ftrace pattern VM; gap audit 2026-08-06)*
+**Why this section exists.** Asked "can we author new custom textures with non-uniform randomness?", an
+audit of `src/pattern.h` / `src/pov_noise.h` / `src/pov_functions.h` found the *substrate* is strong and
+the *randomness vocabulary* is thin. Nothing below is started.
+
+**What already ships (do not rebuild):**
+- The **pattern expression VM** (`PatOp`, `patternEval`, `dPatternEvalF`) — one postfix bytecode evaluated
+  bit-identically on CPU and GPU, with CSE (`StReg`/`LdReg`), 40+ opcodes, and — critically — free
+  variables `x y z / nx ny nz / r / u v / f` so any expression is a *field*, not a baked image.
+- `PatOp::Noise` — 3-D **value noise** (hash lattice + trilinear smoothstep fade), `pattern.h` ~L454.
+- **POV-Ray's exact Perlin engine**, ported host+device: `pov_noise.h` (gen 3 = `kNoiseGen_Perlin`,
+  the real `NoisePermutation[2*(2048+1)]` gradient lattice) reachable through `PovFn` as
+  **`f_noise3d` (76)**, **`f_noise_generator`**, and the multifractals **`f_ridge` (58)**,
+  **`f_ridged_mf` (59)**, **`f_hetero_mf` (29)** — i.e. fBm / ridged-multifractal / heterogeneous
+  terrain noise are already available today.
+- `PatOp::Tex` (`tex:<name>(u,v)`) — sample an image *inside* a formula, so "procedural × photo" works.
+- `PatOp::Grid` / `PatOp::Scatter` — N-D lattice and ragged Shepard lookups, so measured/irregular data
+  can drive a texture.
+- `emit pattern:` / `emit_map` (shipped v0.80.0) — patterns drive emission, not just albedo.
+
+**The gaps — all confirmed absent (0 hits repo-wide):**
+- [ ] **O1 — cellular / Worley / Voronoi noise.** The single biggest hole. `worley`, `voronoi`,
+      `cellular`, `crackle` all return **zero** matches. This is the family behind scales, cracked mud,
+      cobble, cell/pore structure, leather, reptile skin — none of which value noise or fBm can fake.
+      Note `pov_functions.h` explicitly documents **`f_pattern(77)` as EXCLUDED** ("needs POV's
+      Perlin-noise / pattern / pigment engine, not yet ported"), and POV's `crackle` lives behind exactly
+      that door — so this is a known, already-signposted omission. Want F1, F2, F2−F1, and the cell id
+      (for per-cell randomisation), as separate outputs; 3-D; and a distance-metric selector
+      (Euclidean / Manhattan / Chebyshev) since the metric is most of the look.
+- [ ] **O2 — vector-valued noise (`DNoise`) for domain warping.** `DNoise` appears **nowhere** — not in
+      `pov_noise.h`, not in `pattern.h`. Domain warping (`noise(p + k*noise(p))`) is *the* cheapest route
+      to non-uniform, flow-like, marbled structure, and today it must be spelled as three independent
+      scalar `noise()` calls at offset lattice points: 3× the cost and a subtly different (less coherent)
+      warp than a true gradient-vector noise. Exposing a 3-vector noise op is small and unlocks a lot.
+- [ ] **O3 — genuinely *non-stationary* randomness.** Everything above is statistically uniform over
+      space — the same texture everywhere. The interesting thing the question was actually about is
+      randomness whose *parameters vary spatially*: frequency/octaves/amplitude/anisotropy driven by
+      another field (curvature, cavity, a `grid:` mask, distance-to-feature, a strain map). The VM can
+      already *express* this (any argument is an expression), so this is mostly **idiom + primitives +
+      docs**, not new machinery: a worked `docs/` section plus the missing primitives (curvature/cavity
+      as free variables, a distance-to-mesh field) would make it authorable.
+- [ ] **O4 — anisotropic / flow-aligned noise.** Noise stretched and steered along a direction field —
+      wood grain following a trunk, hair/fur flow, brushed metal, muscle striation. Needs a per-hit
+      tangent frame (partly there via `nx ny nz` + UV derivatives) and a way to bind a flow field.
+- [ ] **O5 — blue noise / Gabor noise / sparse convolution.** Zero hits for `blue noise` or `gabor`.
+      Blue-noise point sets matter for *placement* (freckles, pores, spots) as much as shading; Gabor
+      noise is the principled band-limited/anisotropic alternative to lattice noise and antialiases
+      properly under minification, which lattice value noise does not.
+- [ ] **O6 — reaction–diffusion.** Zero hits. Gray–Scott on a texture domain is the classic route to
+      coat patterning (spots→stripes→labyrinths as one continuous knob) and is a *bake* step, not a
+      per-hit evaluation, so it fits the existing `tex:` path: bake offline → sample in a formula.
+- [ ] **O7 — by-example texture synthesis / stochastic tiling.** Zero hits for `texture synthesis`,
+      `wang tile`, `histogram-preserving`, `by-example`. Heitz–Neyret histogram-preserving blending is
+      the standard way to tile one photo infinitely without visible repetition, and it composes with
+      `PatOp::Tex` rather than replacing it.
+- [ ] **O8 — antialiasing the noise.** None of the above currently band-limits. Under minification a
+      lattice noise aliases badly; a filtered/analytically-band-limited variant (or an explicit
+      octave-cutoff driven by the screen-space footprint) is what makes procedural texture usable at
+      distance. This is a *quality* prerequisite for taking O1–O7 seriously in a beauty render.
+
+**Ordering note.** O2 then O1 buys the most look per line of code (domain warping + cellular covers a
+huge fraction of natural texture); O3 is mostly documentation of what the VM can already do; O8 is the
+one that decides whether any of it survives a real render at distance.
+
+**Cross-project link.** `D:\visual studio projects\creature` → `todo.md` **P7** wants exactly O1/O3/O6
+("non-stationary texture: curvature/cavity masks, spatially-varying noise parameters, domain warping,
+reaction–diffusion for coat patterning — driven by the *anatomical* layer"). Building them here makes
+that item mostly a binding exercise there.
 
 ---
 
