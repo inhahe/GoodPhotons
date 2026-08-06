@@ -3056,6 +3056,16 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
   `ftrace.exe` to the repo root. **Warning:** freshly-configured build dirs
   currently produce a GPU-silently-dead exe (see known-issues, 2026-07-22) — build
   in the long-lived `build_cuda2`.
+  **A running render no longer blocks the build (0.141.0).** Windows locks a live
+  exe against write/delete but still permits *rename*, so if the copy fails
+  build.bat moves the old binary aside to `build_cuda2/ftrace.locked.<n>.exe` and
+  installs the new one into the freed name; the running process keeps its mapped
+  image and is entirely unaffected (verified against two concurrent renders). Stale
+  parked copies are reaped at the start of the next build, once their holder has
+  exited. This exists to remove the one situation that used to tempt a
+  `taskkill /F` — which can wedge the NVIDIA driver into a TDR. Only if the rename
+  *also* fails does build.bat error out, and it then restores the old exe so the
+  root is never left without one.
 - `VERSION` (single `MAJOR.MINOR.PATCH` line) bumps with every observable rebuild;
   `release.bat` publishes repo-root `ftrace.exe` as GitHub release `v<VERSION>`
   (refuses on duplicate tag). CMake also `file(READ)`s it into the
