@@ -4434,6 +4434,36 @@ that item mostly a binding exercise there.
 
 ---
 
+## P. Curve / fiber primitive (hair, fur, grass, wire)  *(ftrace geometry; gap audit 2026-08-06)*
+- [ ] **P1 — a native curve primitive.** ftrace today has **none**: zero hits repo-wide for `fiber`,
+      `ribbon`, `bezier`, `b-spline`, and all four `hair` matches are the English idiom ("a hair
+      negative"). `MatType`, `MediumBound` and `EmitterShape` confirm the primitive set is
+      triangles + analytic shapes + implicits. So a fiber today must be triangle ribbons — ~64 tris
+      per hair, i.e. **10⁸–10⁹ triangles** for one furred animal (1–10M hairs × 8–32 segments).
+      That is the blocker, and it is a hard one: it needs a curve intersector (round cylinder or
+      camera-facing ribbon, swept along a cubic) plus a BVH build that doesn't degenerate on
+      near-collinear, wildly-anisotropic bounds. Wanted by `creature`'s P7 fur, and independently
+      useful for grass, wire, cables and thread.
+- [ ] **P2 — sub-pixel variance and the aggregate-BSDF LOD.** The reason fiber rendering is
+      expensive is not the intersector. A fiber is typically **1/5 to 1/50 of a pixel wide**, so in
+      a path tracer each ray either hits or misses and the two answers differ wildly — it shows up
+      as **variance**, not aliasing, and it is one of the classic SPP sinks. Past some distance
+      individual fibers must give way to an **aggregate volumetric BSDF**; making that near/far
+      transition not pop is the actual work. ftrace's existing participating-medium machinery
+      (`MediumBound`, per-λ free flight) is the natural substrate for the far tier.
+      **Note for mode selection:** fibers are a **backward-mode** (`-mode L`) feature. A
+      forward/photon tracer is structurally the wrong vehicle — photons cast from a light almost
+      never usefully hit sub-pixel geometry.
+- [ ] **P3 — fiber BCSDF.** Marschner R/TT/TRT is the baseline, but it was derived for *human hair*;
+      **animal fur has a medulla** (hollow scattering core), which is why Yan et al. 2015/2017 add
+      the TT^s/TRT^s lobes of the double-cylinder model. Plain Marschner on fur reads as plastic.
+      Then **dual scattering** (Zinke 2008) for inter-fiber multiple scattering — not optional, since
+      light-coloured coats are dominated by it and render dark and dead without it. All three are
+      published formulae testable against published plots, so this is the *least* risky piece
+      despite sounding like the hardest.
+
+---
+
 ## Progress log
 - 2026-07-27: **Measured G3/G4 instead of guessing — overturned both deferrals' stated reasons, and the
   measurement pointed at a third thing that was actually the bottleneck (v0.84.3).** Built a probe method
