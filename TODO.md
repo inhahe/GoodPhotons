@@ -2170,6 +2170,18 @@ replacement for the renderer or the primary editing tool.**
         `upload 3.0 + kernel 3.7 + readback 8.8`, `readback` is **2.4× the kernel** and the actual
         GPU trace is **1.7 % of the frame** — so tracing is not merely not-the-bottleneck, it is
         nearly free, and any future win must come from the round-trip or from readback.
+      - **FIRST REAL SPEEDUP (v0.144.0): `minijson` was ~12× too slow, and that was half the
+        round-trip.** Splitting `msSidecar` gave `sidecar 135 = json 129 + geom 1 + dag 1 +
+        skins 0` — the JSON parse was ~96 % of adoption. Cause: `Value` held a `std::map`, whose
+        move ctor is not `noexcept` on MSVC, so `std::vector` **deep-copied** the whole tree on
+        every array growth. Members are now a key-sorted vector; parse went **169.7 → 13.9 ms**
+        (~5 → ~65 MB/s), byte-identical output. In the viewer: sidecar **90.5 → 30.5 ms**, frame
+        **199.9 → 176.9 ms**, **4.61 → 5.39 fps** (n=71). Full write-up in `known-issues.md`.
+        **Remaining order is now `ftsl 66.0 ≈ bake 62.3 ≫ sidecar 30.5 > raymarch 18.1`** — so the
+        next target is the `.ftsl` + temp-`.obj` text round-trip (still one `loadObj` per frame),
+        then loom's own bake. Note a *near-miss* worth remembering: the intuitively obvious target
+        in `adoptSidecar` was the unconditional per-frame `skins.release()/build()` of every GPU
+        texture, which measured **0 ms**. Measure before cutting.
       - Shipped alongside: a **`play res`** draft resolution used only while playing (1.4 → 1.8 fps,
         ~25%) and a **`-play`** CLI flag that opens with the transport already running — the latter
         because driving an ImGui window with synthetic input to measure it is unreliable (ImGui

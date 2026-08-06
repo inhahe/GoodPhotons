@@ -5,6 +5,56 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PERF — FIXED (2026-08-06, v0.144.0): `minijson` parsed at ~5 MB/s because one member made `Value`'s move throwing, so `std::vector` DEEP-COPIED on every growth
+
+**Symptom.** Parsing the viewer's ~0.86 MB introspection sidecar took **~170 ms** — roughly half of
+a played frame, and ~96 % of all sidecar-adoption cost (`sidecar 135 = json 129 + geom 1 + dag 1 +
+skins 0`). ~5 MB/s is one to two orders of magnitude below a competent JSON parser, so this was the
+*parser*, not the format or the file size.
+
+**Root cause.** `std::vector` only **moves** its elements when reallocating if the element type is
+nothrow-move-constructible; otherwise it must **copy** them, to preserve `push_back`'s strong
+exception guarantee. A JSON `Value` copies **deeply**. `minijson::Value` held
+`std::map<std::string, Value> obj`, and on MSVC `std::map`'s move constructor is **not** `noexcept`
+(it may allocate a sentinel node). That single member poisoned `Value`'s implicit move, so every
+array growth recursively cloned the entire tree parsed so far — quadratic, and worst exactly where
+these sidecars are heaviest (long numeric arrays). Confirmed before fixing, not inferred:
+
+```
+sizeof(Value) = 88   nothrow_move_constructible = 0     <-- vector COPIES on growth
+```
+
+**Fix.** Members are now a key-**sorted** `std::vector<std::pair<std::string, Value>>`. `find()`
+binary-searches for the same O(log n); `parseObject` appends and sorts once on close (O(n log n),
+rather than the O(n)-per-insert a sorted insert would cost); `stable_sort` + `unique` keeps the
+first of duplicate keys, exactly as `std::map::emplace` did. `std::string` and `std::vector` both
+move `noexcept`, so `Value`'s move is now `noexcept` **honestly** — a property of its members rather
+than an assertion we could not keep. A `static_assert` pins it.
+
+**Measured** (`tools/jsonbench.cpp`, back-to-back on one machine state, 0.86 MB):
+
+```
+old (std::map)        mean 169.7 ms    ~5 MB/s
+new (sorted vector)   mean  13.9 ms   ~65 MB/s     ~12x
+```
+
+**Correctness.** Canonical dumps of the entire parsed tree from the old and new parsers are
+**byte-identical** (920,365 bytes, md5 `9b22c72a70c842b45793a128d5d76bb0`) — iteration order is
+unchanged because both are key-sorted. The glTF consumer of this shared header still loads a
+425,992-triangle GLB and renders.
+
+**Effect in the viewer.** Per-frame sidecar adoption **90.5 → 30.5 ms**; the played frame
+**199.9 → 176.9 ms**, **4.61 → 5.39 fps**. Far less than 12× because JSON was only ~45 % of the
+frame — `bake` and `ftsl` now dominate. This is the **first actual optimisation** in this line of
+work; everything before it was measurement and the correction of earlier wrong diagnoses.
+
+**Lesson worth keeping.** Nothing about a `std::map` member *looks* slow, which is why this
+survived so long in a file explicitly labelled "not a general high-performance parser" — the label
+made the slowness feel expected and thus unexamined. Also note the near-miss: the obvious target in
+`adoptSidecar` was the unconditional `skins.release()/build()` (tearing down every GPU texture per
+frame), which is self-evidently wasteful and measured **0 ms**. Instrumenting before cutting is what
+caught it.
+
 ### RESOLVED-AS-WRONG (2026-08-06, v0.142.0): the "Render pane re-upload dominates played frames" entry below is REFUTED. Measured on an idle card, the loom round-trip is **84 %** of the frame and the whole raymarch is **9 %**
 
 **Read this before the entry below it, which is retained only as a record of how the error was
