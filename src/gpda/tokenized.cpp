@@ -598,19 +598,32 @@ ParseError Parser::make_error(const std::vector<Cursor>& expanded,
 // ============================================================================
 
 ParseNodePtr Parser::parse(const std::vector<Token>& tokens) {
-    // Filter out EOF sentinels (match Python behavior)
-    std::vector<Token> real;
-    real.reserve(tokens.size());
-    for (const auto& t : tokens) {
-        if (t.type != "EOF") real.push_back(t);
-    }
-    tokens_ = &real;
-    ScratchGuard scratch_guard{this};
-
     graph.finalize();
     if (graph.start_rule_id >= graph.rule_starts.size()) {
         throw std::runtime_error("No start rule: " + graph.start_rule);
     }
+
+    // Filter out EOF sentinels (match Python behavior) and, with them, every skip
+    // token the graph provably cannot consume (Graph::inert_skip).  Dropping the
+    // inert ones here rather than no-op'ing them inside the loop is what makes it a
+    // saving: the loop below would otherwise run a full expand_all + dedup per
+    // whitespace token only to restore the cursor set unchanged, and WS alone is
+    // ~45% of a real .ftsl stream.
+    //
+    // The parse tree is unaffected: a token that no terminal matches never produced
+    // a ParseNode, so removing it removes nothing from the output.  Token positions
+    // renumber, but every consumer of a position (StackEntry::start_pos, the
+    // SubCheckNot span, find_completions) indexes into `real` itself, and error
+    // messages carry line/col on the Token — so all of them stay consistent.
+    std::vector<Token> real;
+    real.reserve(tokens.size());
+    for (const auto& t : tokens) {
+        if (t.type == "EOF") continue;
+        if (graph.inert_skip(t)) continue;
+        real.push_back(t);
+    }
+    tokens_ = &real;
+    ScratchGuard scratch_guard{this};
     std::uint32_t start_node = graph.rule_starts[graph.start_rule_id];
 
     std::vector<Cursor> cursors;

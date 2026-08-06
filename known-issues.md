@@ -5,6 +5,72 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PERF — FIXED (2026-08-06, v0.146.0): the GPDA graph walk spent ~45 % of its time on whitespace tokens it then threw away
+
+**Symptom.** The per-frame `.ftsl` reload split (added in 0.145.0) put the **text parse**, not the
+temp-`.obj` load, at the top: `ftsl 78 = parse 40 + assets 25 + accel 3`. A 7.8 KB scene taking
+~40 ms to parse is **~200 KB/s** — *worse* than the JSON parser was before the 0.144.0 fix, and
+about 100× off what a parser of this shape should do.
+
+**Root cause.** The tokenized GPDA engine treats a `skip_types` token (whitespace, comments) as
+*optionally consumable*, so the main loop handles one by running a full epsilon-closure
+(`expand_all`) plus a `dedup`, matching nothing, and then restoring the cursor set **exactly as it
+was**. Measured with a token histogram rather than assumed:
+
+```
+WS       1121  (45.4%)  [SKIPPED by grammar]     <-- pure no-op rounds
+WORD      461  (18.7%)
+NUMWORD   451  (18.3%)
+NEWLINE   116  ( 4.7%)   <-- NOT a skip type; grammar-significant
+_lit_8    109  ( 4.4%)
+_lit_9    109  ( 4.4%)
+STRING    100  ( 4.1%)
+```
+
+FTSL declares `skip_types = {"COMMENT", "WS"}` and **no node in the graph matches either**, so
+every one of those 1121 rounds was provably incapable of changing anything.
+
+**Fix.** `Graph::finalize()` now precomputes the graph's terminal alphabet — the token *types* some
+`MatchTok` accepts and the token *values* some `MatchStr` accepts, which are the only two ways
+`token_matches()` can return true. `Graph::inert_skip(tok)` is then a skip-type token that neither
+set can accept, and `Parser::parse` drops those from the stream alongside the `EOF` sentinel,
+before any work. It is derived from the graph, so a grammar that *does* reference its skip type as
+a significant separator keeps it automatically and no grammar needs annotating.
+
+**Measured** (`tools/ftslbench.cpp`, 7788 bytes / 2468 tokens, **minimum** per-rep — see the note
+below on why not the mean):
+
+```
+                 before    after
+tokenize          5.0 ms   4.8 ms
+graph walk       16.3 ms   8.8 ms    1.86x   (predicted 1.83x from the 45.4% share)
+total            21.6 ms  13.6 ms    1.59x
+```
+
+**Correctness.** Canonical parse-tree dumps (name/value/line/col, every node, in order) from the old
+and new engines over **every `.ftsl` in the tree — 3909 files, 3908 of which parse** — are
+**byte-identical**: 113,069,546 bytes, md5 `3f3cac21a3d39a3e435995bf9c28102c`. The one failing scene
+fails with the identical message in both. This is expected rather than lucky: a token no terminal
+matches never produced a `ParseNode`, so removing it removes nothing from the output, and every
+consumer of a token *position* indexes the filtered vector itself.
+
+**Methodology note — quote the minimum, not the mean.** This measurement was taken while a backup
+job (CrashPlan + LithicBackup + Defender scanning it, ~5 of 12 cores, all running as SYSTEM and so
+invisible to a `Get-Process`-based CPU sampler) had the machine at ~90 %. Background load can only
+ever make a sample *slower*, so for single-threaded work the mean measures the machine's mood while
+the **min measures the code** — and the min was reproducible to ~2 % across runs while the mean
+moved 50 %. `tools/ftslbench.cpp` now prints both, so a large min/mean gap is itself the signal that
+a run was contended.
+
+**Not yet measured end-to-end.** The in-viewer effect (the `[play] ftsl` term and the frame rate)
+still has to be taken on a quiet machine; the play loop could not even complete a frame under the
+load above. Expect roughly `parse 40 → 25 ms` on this scene, so `ftsl 78 → ~63 ms`.
+
+**Still open after this.** The lexer is ~2 µs/token (regex-based) and the graph walk is still
+~3.5 µs/token, both far above what this work needs; and the real prize is still the one the user
+named — a direct mesh handoff that deletes the per-frame text round-trip entirely, rather than
+making the round-trip faster.
+
 ### PERF — FIXED (2026-08-06, v0.144.0): `minijson` parsed at ~5 MB/s because one member made `Value`'s move throwing, so `std::vector` DEEP-COPIED on every growth
 
 **Symptom.** Parsing the viewer's ~0.86 MB introspection sidecar took **~170 ms** — roughly half of

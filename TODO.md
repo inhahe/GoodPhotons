@@ -2182,6 +2182,22 @@ replacement for the renderer or the primary editing tool.**
         then loom's own bake. Note a *near-miss* worth remembering: the intuitively obvious target
         in `adoptSidecar` was the unconditional per-frame `skins.release()/build()` of every GPU
         texture, which measured **0 ms**. Measure before cutting.
+      - **SECOND SPEEDUP (v0.146.0): the GPDA parser spent ~45 % of its time on whitespace.**
+        Splitting `msFtsl` (v0.145.0) gave `ftsl 78 = parse 40 + assets 25 + accel 3` — so the
+        `.ftsl` **text** parse was the bigger half, not the temp-`.obj` load, and the BVH is nearly
+        free. 7.8 KB in 40 ms is ~200 KB/s, *worse* than minijson before its fix. Cause: a
+        `skip_types` token is "optionally consumable", so each of the 1121 `WS` tokens (45.4 % of
+        the stream) cost a full `expand_all` + `dedup` that restored the cursor set unchanged.
+        `Graph::finalize()` now precomputes the terminal alphabet and `Parser::parse` drops skip
+        tokens no terminal can ever accept. Graph walk **16.3 → 8.8 ms (1.86×)**; parse trees
+        **byte-identical over all 3909 `.ftsl` in the tree** (md5
+        `3f3cac21a3d39a3e435995bf9c28102c`). Tool: `tools/ftslbench.cpp`, which reports **min** and
+        mean per rep — quote the min, because background load can only make a sample slower.
+        In-viewer number still owed: the machine was at ~90 % (a backup job) when this landed.
+      - Still ahead, in order: **loom's own `bake`** (~62 ms, the Python side), the **lexer**
+        (~2 µs/token, regex-based) and the remaining graph walk (~3.5 µs/token) — and above all the
+        thing originally asked for, a **direct mesh handoff** that deletes the per-frame text
+        round-trip rather than making it faster.
       - Shipped alongside: a **`play res`** draft resolution used only while playing (1.4 → 1.8 fps,
         ~25%) and a **`-play`** CLI flag that opens with the transport already running — the latter
         because driving an ImGui window with synthetic input to measure it is unreliable (ImGui

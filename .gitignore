@@ -110,3 +110,5 @@ Desktop.ini
 
 # built on demand by tools/jsonbench.bat (source is checked in, binary is not)
 tools/jsonbench.exe
+# built on demand by tools/ftslbench.bat (source is checked in, binary is not)
+tools/ftslbench.exe
