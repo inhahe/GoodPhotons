@@ -41,7 +41,7 @@ sequence would upload each frame's geometry exactly once.
 default 256) and renders in draft at that resolution *while the transport is playing*, snapping
 back to full res on pause. Worth 1.4 → 1.8 fps (~25%) — it can only attack the 165 ms pixel half.
 
-### BUG (2026-08-06): `ftrace -stop` cannot stop a render whose CUDA kernel never returns — the stop flag is only polled between chunks
+### BUG (2026-08-06): a trivial `-mode W` GPU render hung in a kernel that never returns, and `ftrace -stop` cannot stop it
 
 **Symptom.** A `-mode W` GPU render (pid 132596, `out/seam_check.ftsl -> png/seam_fixed.png`) sat
 on a single 1-spp chunk for **>271 s**, emitting `[gpu-stall]` lines. `ftrace -stop 132596` was
@@ -64,10 +64,29 @@ So the thread that would poll the stop flag is blocked in `cuCtxSynchronize` on 
 not completed. The high CPU number is the driver's spin-wait, not progress. Three other threads
 are the usual nvcuda worker/waiter threads.
 
-**Contributing condition — the GPU was genuinely exhausted, not merely busy.** `nvidia-smi` at the
-time: **100 % utilisation, 23701 MiB of 24564 MiB used** on the RTX 4090, with ~49 compute
-contexts resident (this machine runs a lot of other GPU work). This was resource starvation, and
-under starvation a launched kernel can simply not get scheduled to completion.
+**It is a hung kernel, not GPU starvation — this was my first (wrong) reading, corrected by
+telemetry.** The initial guess was contention: the render had been launched while the viewer held
+a CUDA context, and `nvidia-smi` showed 100 % utilisation. But after the viewer exited, ftrace was
+the only remaining *compute* consumer (the other ~48 contexts are ordinary desktop apps — Chrome,
+Edge, WindowsTerminal, Signal, soffice) and the GPU still reads:
+
+```
+util.gpu  util.mem  power     clocks.sm  temp
+100 %     1 %       ~95 W     2760 MHz   48 C
+```
+
+**100 % occupancy with 1 % memory traffic and ~95 W on a 4090** (which pulls 300–450 W under real
+dense work, and idles far cooler than its ceiling here) is the signature of a kernel *occupying*
+the device without doing work — a spin or a non-terminating loop, with almost no SMs active.
+
+**And the scene is trivial for mode W:** `out/seam_check.ftsl` is 1 mesh + 93 spheres + 5 quads +
+1 light, all `diffuse`, with **no `isosurface`/`function` block** at all. Mode W should finish this
+in well under a second per spp; it has now held the GPU for **>20 minutes on a single 1-spp
+chunk** and accumulated 1352 s of CPU in the driver's spin-wait. That is not a slow render.
+
+*Not yet confirmed:* which kernel, and whether the earlier contention is what put it into this
+state. Confirming wants a GPU-side debugger (`cuda-gdb` / Nsight) attached to a fresh repro, which
+has not been attempted — a repro recipe is the first thing this entry needs.
 
 **Why this is the defect worth logging.** `taskkill /F` is forbidden in this repo — force-killing
 with CUDA kernels in flight is a known way to wedge the NVIDIA driver into a TDR/bugcheck. So a
@@ -78,15 +97,22 @@ exactly the situation where the reflex is to kill by name.
 **Workaround used.** `-device cpu` for the same scene completed in ~30 s and produced
 `png/seam_fixed.png` normally.
 
-**What the fix looks like.**
-- **Poll the stop flag from a thread that is never inside a CUDA call** (the existing `[gpu-stall]`
-  watchdog thread), so `-stop` is at least *acknowledged* while the render thread is blocked.
-- **Let the watchdog abandon a chunk**, not merely report it: after a bounded timeout, mark the
-  chunk lost, write the image + `.ftbuf` from what has already converged, and exit — accepting that
-  the leaked context is the OS's problem at process teardown.
-- **Fail fast on admission** rather than launching into an exhausted device: query free VRAM before
-  `buildUpload` and refuse (or fall back to `-device cpu`) when the requested working set does not
-  fit, instead of launching a kernel that cannot be scheduled.
+**What the fix looks like — two independent bugs here, fix both.**
+1. **The hang itself.** Find the non-terminating loop in the mode-W GPU path. The prime suspects
+   are the unbounded `while` loops: BVH traversal with a corrupt/duplicated node index, and any
+   `for(;;)` refraction/TIR bounce loop lacking a hard iteration cap. Every device-side loop that
+   can be driven by scene data should carry an explicit iteration bound, so bad data degrades a
+   pixel rather than hanging the machine.
+2. **The unstoppability, which is the worse of the two.** Even a legitimately long kernel must not
+   defeat `-stop`:
+   - **Poll the stop flag from a thread that is never inside a CUDA call** (the existing
+     `[gpu-stall]` watchdog thread), so `-stop` is at least *acknowledged* while the render thread
+     is blocked in `cuCtxSynchronize`.
+   - **Let the watchdog abandon a chunk**, not merely report it: after a bounded timeout, mark the
+     chunk lost, write the image + `.ftbuf` from what has already converged, and exit — accepting
+     that the leaked context is the OS's problem at process teardown.
+   - Prefer **launching chunks on a stream and polling a `cudaEvent`** over a blocking
+     `cudaDeviceSynchronize`, which is what makes the render thread unresponsive in the first place.
 
 ### TECH DEBT (2026-08-06): a "render every scene at a uniform budget" sweep cannot distinguish correct from broken — three separate false signals
 
