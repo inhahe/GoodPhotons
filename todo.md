@@ -401,6 +401,74 @@ narrow delay-compensation use a forward model is usually introduced for.
       stumbles reads as alive; one that never does reads as machinery. Same family as P1's
       conduction-delay item — imperfection is character, and it is nearly free.
 
+### Channel inventory — and the discipline that keeps it small
+
+*(2026-08-06, from a brainstorm of "everything an animal might typically do".)*
+
+**That enumeration is a TEST SUITE, not an interface.** The distinction is load-bearing. A list of
+behaviours is how you *verify* the interface is sufficient; it is not the interface itself, and
+building one channel per listed behaviour produces a command space too large to train.
+
+**The hard constraint nobody states: the conditioning vector is not free.** Every channel must be
+randomised over *jointly*, so coverage cost grows with the dimensionality of the command space, not
+with the number of behaviours it can express. Hence the discipline:
+
+> **Anything that can emerge should emerge, not be commanded.**
+
+**One mechanism, not N channels.** The policy already actuates every joint. So part-specific control
+is **one** generic "goal for body-part-set S" channel (level 3 above) that covers "wag tail", "flick
+the left ear", "curve the spine 30° right" and everything unanticipated. Enumerating body parts as
+separate channels is how you get a 200-dimensional command space by accident.
+
+**The five categories, which differ in cost by ~3 orders of magnitude:**
+
+| category | examples | mechanism | cost |
+|---|---|---|---|
+| pose goals | any limb segment, spine curvature, ears, head, tail, jaw opening, claws | one goal-injection channel (L3) | low |
+| locomotion params | speed, heading, turn-in-place | ~4-number command vector (L1) | low |
+| targeted ballistic | "jump exactly there" | goal + planner (MuJoCo-MPC) | medium |
+| affect | happy / pain / sad / angry / sleepy | global modulation vector | low–medium |
+| **object interaction** | eat, drink, play-with-X, fight-and-win | **tasks needing a world — NOT control channels** | **enormous** |
+
+- [ ] **Gait must NOT be a command — let it emerge.** Animals select gait by energetics: Hoyt &
+      Taylor (1981) showed horses pick the gait minimising metabolic cost at each speed, with sharp
+      transition thresholds. Speed command + energy penalty ⇒ walk→trot→gallop emerges *correctly
+      placed*. Commanding it spends training coverage and lets you request physically absurd
+      speed/gait pairs. Keep an explicit override for stylization only.
+- [ ] **Affect is a modulation vector, not a set of poses — and for quadrupeds it is NOT facial.**
+      Animal affect lives in **posture and tension**: ear carriage, tail position *and motion
+      quality*, body height, weight distribution fore/aft, gaze, piloerection. Implement it as a
+      low-dimensional vector conditioning *everything* (posture, gait timing, muscle tension), which
+      is also the cheapest way to get design.md's "menace is a knob, not a layer". Dogs are a partial
+      exception, interestingly: they have a facial muscle wolves lack (levator anguli oculi medialis,
+      Kaminski et al. 2019) for the inner-brow raise, apparently selected for by human attention.
+- [ ] **"Be pregnant" is a MORPH, not a channel — and it is the best P4 validation target available.**
+      Belly volume + added mass + shifted CoM. If morphology conditioning genuinely works, the wider
+      stance, shortened stride and altered balance must emerge **with no new training**. That is a
+      falsifiable test of the project's central architectural bet, worth far more than a knob.
+- [ ] **Object interaction is out of the control layer entirely.** Eat / drink / play-with-X /
+      fight-and-win each need an environment, physical objects, grasp and contact, and in the fight
+      case a second agent and an unspecifiable reward. None reuses the others' machinery — that is
+      *content*, which this project explicitly scopes out ("we build the system that makes lions
+      buildable"). Same reasoning retires sex and birth: no reusable architecture in them.
+
+**Missing from the brainstorm — add to the coverage checklist:**
+- [ ] **Gaze.** The largest omission. Gaze *leads* movement; head/neck orientation is downstream of
+      where the animal looks. Probably the single most expressive channel. (See P7 eyes.)
+- [ ] **Breathing** — visible in the flank, rate/depth coupled to exertion and affect. Its absence is
+      a large part of why CG creatures read as dead. Near-free.
+- [ ] **Blinking** — same category, near-zero cost, deeply uncanny when missing.
+- [ ] **Postural transitions** — lie down, sit, get up, roll over. Genuinely hard (large body
+      reorientation, whole-body ground contact) and constantly needed. Absent from the brainstorm.
+- [ ] **Terrain.** The brainstorm assumes flat ground. Slopes, uneven footing, stairs, slip-and-recover.
+- [ ] **Landing** — the counterpart to jumping; impact absorption is its own skill and is where bad
+      physics is most visible.
+- [ ] **Idle behaviours** — shake off water, scratch, stretch, yawn. What makes a creature look alive
+      *between* actions.
+- [ ] **Fatigue as accumulating state**, not a knob that is set.
+- [ ] **Piloerection** — a state knob on the **fur groom**, connecting P7's look layer to the control
+      layer.
+
 **Why this section exists.** The user's framing was "simulate the kinesthetic sense so the creature is
 easy to control abstractly". The sensing half of that is free in simulation and needs no net; the
 *abstraction* half is real and is this section. Note also that capture data cannot supply the sensing
