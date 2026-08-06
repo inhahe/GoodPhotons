@@ -2141,21 +2141,28 @@ replacement for the renderer or the primary editing tool.**
         **no clock** writes `frames = 1` — which would make play a button that silently does nothing.
         It is now disabled with a tooltip saying exactly that; scenes should save with
         `Clock.at_frame(0, N)`.
-      - **Profiled 2026-08-06 (0.140.0).** The Live panel now prints the whole period split, with an
-        explicit residual so nothing hides:
-        `[play] 1.7 fps 574.4 ms = bake 40 + sidecar 87 + ftsl 46 + raymarch 297 + other 104`.
-        **These absolute numbers are NOT trustworthy** — they were taken while another process held
-        90–93 % of the GPU, and `raymarch` is the only GPU-side term, so it alone is inflated. The
-        "raymarch dominates, the loom round-trip is secondary" reading may invert on an idle card.
-        **Re-run the trace with the GPU idle before using it to prioritise (b)**; check with
-        `tools/gpu_by_process.ps1` (`nvidia-smi` cannot attribute per process under WDDM).
-        What *does* survive the confounder, because it is read off the code rather than the clock:
-        `renderIsoPreviewCuda` re-runs `buildUpload` — whole scene, BVH, materials, *every texture's
-        texels* — plus three fresh `cudaMalloc`s, **per call**, so a large part of its cost is fixed
-        rather than per-pixel. That still argues (b) should cache **the resident GPU scene** and not
-        merely the sidecar/`.ftsl` text: upload each frame's geometry once during the bake pass,
-        keep the `DUpload` alive, version it so an unchanged mesh/material/texture set is never
-        re-sent, and pool the accum/z/emissive buffers. Logged in `known-issues.md`.
+      - **Profiled 2026-08-06 — first reading was contaminated, RE-MEASURED on an idle card in
+        0.142.0. The conclusion inverted.** The original trace,
+        `[play] 1.7 fps 574.4 ms = bake 40 + sidecar 87 + ftsl 46 + raymarch 297 + other 104`,
+        was taken while another process held 90–93 % of the GPU. `raymarch` is the only SM-bound
+        term, so it alone was inflated — and it was then ranked against the CPU-side terms, which
+        is how "raymarch dominates, the loom round-trip is secondary" got written down.
+        With the card **confirmed idle** (`tools/gpu_by_process.ps1`; `nvidia-smi` cannot attribute
+        per process under WDDM) and `renderIsoPreviewCuda` now reporting an `IsoPreviewTiming`
+        phase split, 8 consecutive samples average:
+        `4.54 fps  220.1 ms = bake 41.0 + sidecar 96.5 + ftsl 47.4 + raymarch 20.1 + other 18.2`,
+        `raymarch 20.1 = upload 4.2 + kernel 6.4 + readback 9.2`.
+        **So: the loom round-trip is 184.9 ms = 84 % of the frame, and the entire raymarch is 9 %.**
+        The original hypothesis — that emitting `.ftsl` + a JSON sidecar and re-parsing them every
+        frame is the bottleneck — was right, and was dismissed on bad data.
+        **This retires the "cache the resident GPU scene" recommendation for (b).** `upload` is
+        **4.2 ms, 1.9 % of the frame** — the whole-scene re-marshal is real but *cheap* at these
+        scene sizes, so caching it would buy ~2 %. (It stays a genuine risk only for textured
+        scenes: texels re-upload at 12 B each, ~50 MB/frame for one 2048² skin — see
+        `known-issues.md`.) Prioritise (b) by the measured order instead: **sidecar 96.5 ≫ ftsl
+        47.4 ≈ bake 41.0**, i.e. a direct geometry channel from loom to the viewer that never
+        serialises to `.ftsl`/JSON — note the log also shows a temp `.obj` re-written and
+        re-loaded *per frame*. Full write-up in `known-issues.md`.
       - Shipped alongside: a **`play res`** draft resolution used only while playing (1.4 → 1.8 fps,
         ~25%) and a **`-play`** CLI flag that opens with the transport already running — the latter
         because driving an ImGui window with synthetic input to measure it is unreliable (ImGui

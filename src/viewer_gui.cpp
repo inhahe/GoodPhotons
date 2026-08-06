@@ -698,6 +698,14 @@ struct LivePanel {
     double msSidecar = 0.0;   // parse the introspection JSON + rebuild DAG/skins
     double msFtsl    = 0.0;   // parse the .ftsl + load its mesh assets
     double msRender  = 0.0;   // the Render pane's synchronous CUDA raymarch
+    // ...and where THAT went. Split out because the three phases scale with different
+    // things (scene size / pixels / pixels) and because only `kernel` is SM-bound: a
+    // foreign process saturating the card inflates that phase ALONE. An earlier profile
+    // of this pane blamed the raymarch while another program held 90% of the GPU; with
+    // the split, such a contaminated reading is self-evident instead of plausible.
+    double msRenderUpload = 0.0;  // marshal the WHOLE scene + H2D (scene size; CPU+DMA)
+    double msRenderKernel = 0.0;  // the raymarch itself           (pixels; SM-bound)
+    double msRenderRead   = 0.0;  // D2H + host tone map           (pixels; mostly CPU)
     // Set by the Render tab each UI frame it actually draws. Needed because the
     // Live panel is drawn BEFORE the Render pane, so zeroing msRender when a bake
     // lands would blank it every frame during play -- it would always read 0 and
@@ -2324,6 +2332,10 @@ struct RenderPane {
     int  resPlay = 256;
     bool lowRes  = false;             // the res the current texture was traced at
     std::string status;
+    // Phase split of the last raymarch (upload / kernel / readback). Fed to the Live
+    // panel so the play breakdown can say WHICH part of the raymarch costs, rather
+    // than leaving one opaque number to be over-interpreted.
+    IsoPreviewTiming lastTiming;
 
     void initFrom(const Scene& s) {
         center = s.sceneCenter;
@@ -2386,8 +2398,9 @@ struct RenderPane {
         Camera cam = camera(W, H);
         unsigned hw = std::thread::hardware_concurrency();
         int nThreads = hw ? (int)hw : 4;
+        lastTiming = IsoPreviewTiming{};
         std::vector<uint8_t> img =
-            renderIsoPreviewCuda(s, cam, W, H, nThreads, 1.0, true, nullptr);
+            renderIsoPreviewCuda(s, cam, W, H, nThreads, 1.0, true, nullptr, &lastTiming);
         if (img.empty()) { status = "raymarch unavailable (no CUDA device or unsupported scene)"; return; }
         if (upload(img, W, H, dev, ctx)) { status.clear(); dirty = false; }
         else status = "D3D11 texture upload failed";
@@ -2463,7 +2476,15 @@ static bool drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
         // Timed because a landed bake calls initFrom, which sets `dirty`, so the
         // whole scene is re-raymarched synchronously on the UI thread at res^2 on
         // every played frame -- a cost paid only while this tab is open.
-        if (live) { MsTimer _t(&live->msRender); rp.render(scene, dev, ctx, draft); }
+        if (live) {
+            { MsTimer _t(&live->msRender); rp.render(scene, dev, ctx, draft); }
+            // Carry the phase split up alongside the total. Copied after the timer
+            // closes so `msRender` stays the authoritative wall-clock figure and the
+            // three parts are only ever a breakdown OF it, never a substitute.
+            live->msRenderUpload = rp.lastTiming.msUpload;
+            live->msRenderKernel = rp.lastTiming.msKernel;
+            live->msRenderRead   = rp.lastTiming.msReadback;
+        }
         else      { rp.render(scene, dev, ctx, draft); }
     }
 
@@ -2967,6 +2988,28 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
                 "other    the residual against the measured play period: IPC with the\n"
                 "         loom process, writing/reading the sidecar + OBJ through the\n"
                 "         filesystem, and the wait for vblank.");
+        // Break the raymarch open. Without this the single `raymarch` number invites
+        // exactly one wrong conclusion -- that the .ftsl round trip is secondary --
+        // which cannot be checked, because the three phases inside it scale with
+        // different things and only one of them is affected by other GPU users.
+        if (lp.msRender > 0.0) {
+            ImGui::TextDisabled("   raymarch %.0f = upload %.0f + kernel %.0f + readback %.0f",
+                                lp.msRender, lp.msRenderUpload, lp.msRenderKernel,
+                                lp.msRenderRead);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "upload   re-marshal the WHOLE scene (tris, BVH, materials, every\n"
+                    "         texel) and push it across PCIe -- every frame, even when\n"
+                    "         only the camera moved. Scales with SCENE size, not pixels.\n"
+                    "kernel   the raymarch. Scales with PIXELS (see `play res`). This is\n"
+                    "         the ONLY phase another process on the GPU can inflate, so\n"
+                    "         if it dwarfs the rest, check the card is actually idle\n"
+                    "         before concluding the raymarch is the bottleneck.\n"
+                    "readback D2H of accum/z/emissive + the host tone map. Pixels; CPU.\n"
+                    "\n"
+                    "Compare `upload` against bake+sidecar+ftsl to see whether caching\n"
+                    "the scene on the device would actually buy anything for THIS scene.");
+        }
     }
 
     // --- the build's declared params ---
@@ -3420,7 +3463,10 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
 
         // The Render tab has stopped drawing (collapsed, or another tab selected),
         // so its cost is no longer being paid -- stop reporting the stale figure.
-        if (!live.renderTabDrew) live.msRender = 0.0;
+        if (!live.renderTabDrew) {
+            live.msRender = 0.0;
+            live.msRenderUpload = live.msRenderKernel = live.msRenderRead = 0.0;
+        }
         live.renderTabDrew = false;
 
         // Echo the same breakdown to stdout about once a second while playing. The
@@ -3438,6 +3484,16 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                             live.playFps, period, live.lastMs, live.msSidecar,
                             live.msFtsl, live.msRender,
                             (period - acc > 0.0 ? period - acc : 0.0));
+                // The raymarch broken open, on its own line. A printed trace is what
+                // gets diffed between builds and quoted afterwards, so it must carry
+                // the same detail as the panel -- a bare `raymarch N` in the log is
+                // what let an SM-contention artefact get read as a real ranking.
+                if (live.msRender > 0.0) {
+                    std::printf("[play]        raymarch %.0f = upload %.0f (scene) + "
+                                "kernel %.0f (pixels) + readback %.0f\n",
+                                live.msRender, live.msRenderUpload,
+                                live.msRenderKernel, live.msRenderRead);
+                }
                 std::fflush(stdout);
             }
         }

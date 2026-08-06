@@ -5,7 +5,50 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### PERF (2026-08-06, v0.140.0): the viewer's Render pane re-uploads the WHOLE scene to the GPU every frame — ~274 ms of a ~570 ms played frame
+### RESOLVED-AS-WRONG (2026-08-06, v0.142.0): the "Render pane re-upload dominates played frames" entry below is REFUTED. Measured on an idle card, the loom round-trip is **84 %** of the frame and the whole raymarch is **9 %**
+
+**Read this before the entry below it, which is retained only as a record of how the error was
+made.** With the GPU confirmed idle (`tools/gpu_by_process.ps1`: only the viewer itself at 2.7 %),
+the new `IsoPreviewTiming` split gives, averaged over 8 consecutive `[play]` samples of
+`scatter_modulated_sweep`:
+
+```
+4.54 fps   220.1 ms/frame
+  bake       41.0 ms   18.6 %     |
+  sidecar    96.5 ms   43.9 %     |  loom round-trip = 184.9 ms = 84.0 %
+  ftsl       47.4 ms   21.5 %     |
+  raymarch   20.1 ms    9.1 %   = upload 4.2 + kernel 6.4 + readback 9.2
+  other      18.2 ms    8.3 %
+```
+
+**Three conclusions, all inverting the earlier entry:**
+
+1. **The FTSL/sidecar round-trip IS the bottleneck** — 84 % of the frame. The earlier entry called
+   it "real but *secondary*" at ~23 %. That was the original hypothesis (emit `.ftsl` → parse →
+   load per frame) and it was **correct all along**; it was dismissed on contaminated data.
+2. **The re-upload is not worth fixing.** `upload` is **4.2 ms — 1.9 % of the frame**, not the
+   claimed 274 ms. A resident GPU scene would buy ~2 % at best on scenes of this size. The
+   *structural* observation (the whole scene really is re-marshalled per call) stands, but it is
+   redundant **cheap** work here. Do not build the cache on this evidence; see the texel entry
+   below for the one configuration where it would matter.
+3. **`raymarch 297 ms` was ~93 % contention artefact** — it fell to 20.1 ms (≈15×) with nothing
+   else on the card. Within it, `readback` (9.2 ms, D2H + host tone map) now costs *more than the
+   kernel* (6.4 ms), which the old single number could not have shown.
+
+**Where the remaining time actually is, in priority order:** `sidecar` 96.5 ms (parse the
+introspection JSON, rebuild the DAG and skin buffers) ≫ `ftsl` 47.4 ms ≈ `bake` 41.0 ms. Note also
+that the viewer re-writes and re-loads a temp `.obj` per frame (`loadObj: …/ftrace_viewer_<pid>/
+morphing_sweep.obj` appears repeatedly in the log). The right fix is the one originally proposed:
+a direct geometry channel from loom into the viewer that skips serialising to `.ftsl` + JSON and
+re-parsing them every frame. That is TODO F8b territory.
+
+**Methodology note — this is the third diagnosis this profile has produced.** "raymarch dominates"
+(wrong), "fixed 274 ms = the re-upload" (wrong), and now this one. What finally settled it was not
+more reasoning but (a) waiting for an idle card and (b) instrumenting the phases so they could not
+be inferred from a two-point fit. Both were available the whole time. Any future perf claim about
+this pane should quote a `[play]` line *and* a `tools/gpu_by_process.ps1` reading taken together.
+
+### SUPERSEDED (2026-08-06, v0.140.0) — retained as a record of a wrong diagnosis: "the viewer's Render pane re-uploads the WHOLE scene to the GPU every frame — ~274 ms of a ~570 ms played frame"
 
 **Where.** `renderIsoPreviewCuda`, `src/render_cuda.cu` ~12696, called from `RenderPane::render`
 in `src/viewer_gui.cpp`. Nothing persists between calls: every invocation runs `buildUpload(scene,
@@ -59,6 +102,47 @@ What survives the confounder and what does not:
 
 **Re-run the `[play]` trace with the card idle** (check `tools/gpu_by_process.ps1` first) before
 using this entry to prioritise F8b.
+
+**SECOND correction (2026-08-06, v0.141.0): the "fixed 274 ms = the re-upload" attribution is an
+INFERENCE, not a measurement, and it is almost certainly wrong.** `fixed ≈ 274 ms` was derived as
+"whatever does not scale with pixels" in a two-point resolution fit. It was then *labelled* the
+per-call re-upload without anything measuring the upload itself. That does not survive a sanity
+check on volume: the scene being played (`out/seam_check.ftsl`) is 117 lines, **one 4320-triangle
+mesh and zero textures**, marshalling to roughly **1.4 MB**. At PCIe speeds that is well under a
+millisecond — it cannot be 274 ms. Far more likely, the resolution-independent term is
+`cudaMalloc`/`cudaFree` and the `cudaDeviceSynchronize` in `cudaCheckKernel` *blocking behind the
+foreign process* — fixed cost that has nothing to do with upload volume and would largely vanish on
+an idle card. So the resolution fit is sound; only the attribution of its fixed half is not.
+
+**Instrumentation added (v0.141.0) to settle it directly.** `renderIsoPreviewCuda` now takes an
+optional `IsoPreviewTiming*` (`src/render_cuda.h`) and reports **upload / kernel / readback**
+separately; the viewer's Live panel and the printed `[play]` trace both show the split:
+`raymarch N = upload A (scene) + kernel B (pixels) + readback C`. This exists so the phases can
+never again be ranked by inference: `upload` scales with scene size and is CPU+DMA, `kernel` scales
+with pixels and is the *only* SM-bound phase (hence the only one a foreign GPU process inflates),
+`readback` is pixels and mostly CPU. Read `upload` against `bake + sidecar + ftsl` to decide whether
+a resident GPU scene is worth building **for the scene actually in front of you**.
+
+### PERF / LATENT (2026-08-06, v0.141.0): the preview re-marshals every texel of every texture, every frame — ~50 MB/frame for one 2048² skin
+
+**Where.** `renderIsoPreviewCuda`, `src/render_cuda.cu` ~12740: the `hTexels` loop flattens *all*
+textures into one `std::vector<DVec3>` and uploads it on **every call**, including a call triggered
+by nothing but a one-pixel camera nudge. `DVec3` is three `Real`s — `float` under the default
+`FTRACE_GPU_FP32=ON`, so **12 bytes per texel**.
+
+**Why it is not hurting yet.** The loom scenes currently driven through the viewer have **no
+textures at all**, so `hTexels` is empty and this costs nothing. That is the only reason it is
+invisible — it is a property of the test scenes, not of the code.
+
+**Scale when it does bite.** One 2048² image skin = 4.19 M texels × 12 B = **~50 MB re-marshalled
+and re-copied per frame**; two of them, or a 4096² skin, and the Render pane falls off a cliff. The
+host-side `push_back` loop that builds the array is pure CPU and is likely the worse half.
+
+**Proper fix.** Same resident-scene fix as the entry above — textures are the *most* obviously
+static part of a scene and should be uploaded once and versioned. If a narrower fix is wanted first,
+hoisting just the texel array out of the per-call path captures most of the risk. Also worth
+storing texels as 8-bit or `half` on the device rather than 3 × `float`, since a preview shading
+term does not need 32-bit-per-channel colour.
 
 ### RECURRENCE (2026-08-06) of the 2026-08-04 GPU-contention issue below — plus the per-process detector it was missing
 

@@ -413,9 +413,30 @@ bool cudaIsoPreviewSupported(const Scene& scene, const Camera& cam);
 // or unsupported config so the caller can fall back to the CPU rasterizer.
 #include <vector>
 #include <cstdint>
+
+// Optional per-call phase timing (milliseconds), so "why is the Render pane slow?" is
+// answered by measurement instead of intuition. The three phases are kept separate
+// because they scale with DIFFERENT things and react differently to another process
+// contending for the card:
+//   upload   host marshalling of the WHOLE scene (tris, BVH, materials, texels) + the
+//            H2D copies. Scales with SCENE size, not pixels. Mostly CPU + DMA, so it is
+//            the phase least distorted by a foreign process saturating the SMs.
+//   kernel   the raymarch (launch + sync). Scales with PIXELS. The only SM-bound phase,
+//            so it is the one inflated by GPU contention -- do not rank it against the
+//            others without first checking the card is idle.
+//   readback D2H of the accum/z/emissive buffers + the host tone map. Pixels; mostly CPU.
+// A struct rather than one number so no phase can hide inside another -- the same reason
+// the viewer's play breakdown shows its residual explicitly.
+struct IsoPreviewTiming {
+    double msUpload   = 0.0;
+    double msKernel   = 0.0;
+    double msReadback = 0.0;
+};
+
 std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
                                           int W, int H, int nThreads, double exposure = 1.0,
-                                          bool autoExpose = true, double* lockAnchor = nullptr);
+                                          bool autoExpose = true, double* lockAnchor = nullptr,
+                                          IsoPreviewTiming* timing = nullptr);
 
 // ---------------------------------------------------------------------------
 // N4a — mode-W deterministic-lattice bit-exactness probe (`-checklattice`).
