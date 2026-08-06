@@ -740,6 +740,20 @@ class SweptMesh(Element):
     ``turns`` adds a full ``turns * 2pi`` twist distributed along the spine.
     ``scale_profile`` is an optional ``f(u)->float`` multiplier (``u in [0,1)``)
     that swells/pinches the section along the spine (used by the ``blob`` preset).
+
+    **On a closed spine, ``turns`` must be a whole number.** The twist accumulates
+    around the loop and the seam joins the last ring to the first *vertex for
+    vertex*, so the total rotation has to be a whole number of profile revolutions
+    or the ridges arrive misregistered and the closing span is visibly wrung. This
+    is topology, not a tolerance -- a fractional value cannot close. (Nor does a
+    ``1/k`` turn on a ``k``-fold-symmetric profile: the silhouette maps onto itself
+    but the vertex *indices* still do not.) A non-integer ``turns`` on a closed
+    spine is warned about once per element rather than silently mis-skinned.
+
+    ``twist`` carries no such restriction: it rotates every ring by the *same*
+    angle, so nothing accumulates and it is seamless at any value. **Animate
+    ``twist``, keep ``turns`` a static int** -- that is how you get moving roll on
+    a closed sweep without tearing the seam.
     """
 
     def __init__(self, spine: Union[LoopCurve, PointPath], profile: Sequence[Tuple[float, float]],
@@ -761,6 +775,7 @@ class SweptMesh(Element):
         self.smooth = int(smooth)
         self.name = name
         self.scale_profile = scale_profile
+        self._warned_turns = False
 
     def roots(self) -> List:
         out: List = [self.spine]
@@ -769,12 +784,35 @@ class SweptMesh(Element):
                 out.append(v)
         return out
 
+    def _check_turns(self, turns: float) -> None:
+        """A closed spine can only close on a whole number of profile revolutions.
+
+        Warn rather than snap: snapping would silently change the geometry the
+        author asked for, and on an *animated* `turns` it would quantise a smooth
+        channel into pops. Warn once per element -- this runs every frame.
+        """
+        if self._warned_turns or not self.closed_spine:
+            return
+        if abs(turns - round(turns)) <= 1e-6:
+            return
+        self._warned_turns = True
+        import warnings
+        warnings.warn(
+            f"SweptMesh({self.name!r}): closed_spine=True with a non-integer "
+            f"turns={turns:.4g}. The twist accumulates around the loop and the seam "
+            f"joins last ring to first vertex-for-vertex, so the profile arrives "
+            f"misregistered and the closing span is visibly wrung. Use a whole "
+            f"number of turns; to *animate* roll on a closed sweep drive `twist` "
+            f"(uniform, seamless at any value) instead.",
+            stacklevel=3)
+
     def emit(self, ctx: EmitCtx) -> str:
         n = self.count
         pts = [self.spine.sample(k / n, ctx.clock, ctx.cache) for k in range(n)]
         base_sc = num(self.scale, ctx.clock, ctx.cache)
         base_tw = num(self.twist, ctx.clock, ctx.cache)
         turns = num(self.turns, ctx.clock, ctx.cache)
+        self._check_turns(turns)
         scales: List[float] = []
         twists: List[float] = []
         for k in range(n):

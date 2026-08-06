@@ -26,6 +26,23 @@ about the spine tangent — and twisting a *circle* about its own centre is the
 identity, so a circular tube's ``turns`` parameter is invisible.  A lobed profile
 makes the twist actually show.
 
+**Which twist channel gets modulated, and why it matters here.**  ``SweptMesh`` has
+two, and on a *closed* spine they are not interchangeable:
+
+  * ``turns`` **accumulates** around the loop, and the seam joins the last ring to
+    the first vertex-for-vertex — so the total rotation must be a whole number of
+    profile revolutions or the ridges arrive misregistered and the closing span is
+    visibly wrung.  Measured: an integer ``turns`` closes to the polyline
+    discretisation floor (~0.03), while ``turns = 0.5`` leaves a **2.68**-unit gap.
+    A fractional ``1/k`` turn does not rescue it on a ``k``-lobed profile either —
+    the silhouette maps onto itself but the vertex *indices* do not.
+  * ``twist`` is **uniform** — every ring rolls by the same angle, nothing
+    accumulates, and it closes at *any* value.
+
+So ``helix_turns`` is a static integer and the plot drives ``twist``.  Modulating
+``turns`` instead is exactly the mistake this scene originally made, and the
+symptom was precisely a seam whose ridges did not line up.
+
 Everything the modulator does is also drawn, so the mechanism is visible in the
 render rather than only in the code:
 
@@ -121,7 +138,8 @@ def build(clock=None,
           morph_amp: float = 0.62,
           tube_radius: float = 0.20,
           radius_swing: float = 0.55,
-          twist_turns: float = 3.0,
+          helix_turns: int = 3,
+          roll_swing: float = 1.0,
           profile_lobes: int = 3,
           profile_bulge: float = 0.34,
           sides: int = 18,
@@ -132,9 +150,13 @@ def build(clock=None,
     ``nodes`` is how many spine control points there are — and therefore how many
     phase-shifted taps into the plot drive the travelling wave. ``morph_amp`` is how
     far the plot pushes a spine node in and out; ``radius_swing`` how much it swells
-    the cross-section; ``twist_turns`` how much twist a full-scale reading adds.
-    Set ``morph_amp``/``radius_swing``/``twist_turns`` to 0 to freeze that channel
+    the cross-section; ``roll_swing`` how far the reading rolls the section.
+    Set ``morph_amp``/``radius_swing``/``roll_swing`` to 0 to freeze that channel
     and confirm the others in isolation.
+
+    ``helix_turns`` is **static and integral on purpose** — see the note on the two
+    twist channels in the module docstring. It is the one control here that is not
+    modulated, because it cannot be without tearing the seam.
     """
     nodes = max(3, int(nodes))
 
@@ -164,16 +186,21 @@ def build(clock=None,
     spine = PointPath(spine_points, closed=True)
 
     # 5. the primary modulator (the un-shifted head) also drives the cross-section's
-    #    size and the twist along the spine.
+    #    size and its roll.
     primary = taps[0]
     radius = MapRange(primary, 0.0, 1.0,
                       tube_radius * (1.0 - radius_swing),
                       tube_radius * (1.0 + radius_swing), clamp=True)
-    turns = MapRange(primary, 0.0, 1.0, -twist_turns, twist_turns)
+    # The ANIMATED twist channel is `twist` (uniform), never `turns` (accumulating):
+    # see the module docstring. Uniform roll closes at any value, so this can be
+    # driven continuously by the plot without tearing the seam.
+    roll = MapRange(primary, 0.0, 1.0,
+                    -roll_swing * math.pi, roll_swing * math.pi)
 
     swept = SweptMesh(spine,
                       _lobed_profile(int(sides), int(profile_lobes), profile_bulge),
-                      count=int(count), scale=radius, turns=turns,
+                      count=int(count), scale=radius,
+                      twist=roll, turns=int(round(helix_turns)),
                       closed_spine=True, closed_profile=True,
                       material="body", smooth=1, name="morphing_sweep")
 

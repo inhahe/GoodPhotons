@@ -143,6 +143,106 @@ def test_sweptmesh_check_cycles_ok():
         s.check_cycles()  # must not raise; LoopCurve spine is acyclic
 
 
+# --- closed-spine seam: `turns` must be a whole number, `twist` need not be -------
+#
+# Regression for the 2026-08-06 bug where a closed sweep's ridges did not line up at
+# the seam. The RMF closes correctly on its own (test_closed_frame_seam_closes above);
+# the tear came from `turns`, which ACCUMULATES along the spine. A closed spine joins
+# ring[n-1] back to ring[0] vertex-for-vertex, so a fractional number of profile
+# revolutions cannot close -- and profile symmetry does not rescue it (the silhouette
+# maps onto itself, the vertex *indices* do not). Uniform `twist` adds the same angle
+# to every ring, so it is seamless at any value; that is the channel an animation must
+# drive.
+
+def _lobed_profile(sides=18, lobes=3, bulge=0.34):
+    out = []
+    for j in range(sides):
+        a = 2.0 * math.pi * j / sides
+        r = 1.0 + bulge * math.cos(lobes * a)
+        out.append((r * math.cos(a), r * math.sin(a)))
+    return out
+
+
+def _seam_error(turns, base_tw=0.0, n=120, radius=1.05):
+    """Max vertex gap between ring[0] and the continuation of ring[n-1].
+
+    Sweeps the closed ring, then sweeps one step PAST the end (same spine point as
+    ring[0], carrying the twist it had accumulated) and compares. If the sweep closes,
+    those two rings coincide to within the spine's discretization.
+    """
+    pts = _circle_spine(n, r=radius)
+    prof = _lobed_profile()
+    scales = [1.0] * n
+    twists = [base_tw + turns * 2.0 * math.pi * (k / n) for k in range(n)]
+    rings = sweep_rings(pts, prof, scales, twists, True)
+
+    cont = sweep_rings(pts + [pts[0]], prof, scales + [1.0],
+                       twists + [base_tw + turns * 2.0 * math.pi], False)[-1]
+    return max(math.dist(a, b) for a, b in zip(cont, rings[0]))
+
+
+# The floor an integer `turns` reaches (~0.030) is spine discretization, not
+# misregistration; a fractional `turns` misses by whole lobes (~2.2-2.7).
+_SEAM_FLOOR = 0.05
+
+
+def test_closed_sweep_seams_on_integer_turns():
+    for t in (0.0, 1.0, 2.0, 3.0, -3.0):
+        err = _seam_error(t)
+        assert err < _SEAM_FLOOR, f"turns={t} should close, got seam error {err:.4f}"
+
+
+def test_closed_sweep_tears_on_fractional_turns():
+    for t in (1.0 / 3.0, 0.5, 1.5, 2.7):
+        err = _seam_error(t)
+        assert err > 10 * _SEAM_FLOOR, \
+            f"turns={t} cannot close; expected a large seam error, got {err:.4f}"
+
+
+def test_uniform_twist_is_seamless_at_any_value():
+    # `twist` is the channel an animation may drive continuously.
+    for bt in (0.0, 0.5, 1.0, 2.0943, 3.7, 5.0):
+        err = _seam_error(0.0, base_tw=bt)
+        assert err < _SEAM_FLOOR, f"uniform twist {bt} should be seamless, got {err:.4f}"
+    # ...and it composes with an integer `turns`, which is the supported combination.
+    for bt in (0.0, 1.3, 2.9, 4.4):
+        err = _seam_error(3.0, base_tw=bt)
+        assert err < _SEAM_FLOOR, f"turns=3 twist={bt} should be seamless, got {err:.4f}"
+
+
+def test_sweptmesh_warns_once_on_fractional_turns_closed_spine():
+    import tempfile
+    import warnings
+    import loom as L
+
+    spine = L.LoopCurve(L.PointPath(
+        [L.vec(math.cos(2 * math.pi * i / 6), 0.0, math.sin(2 * math.pi * i / 6))
+         for i in range(6)], closed=True), L.Const(0.0))
+
+    def emit_twice(mesh, tmp):
+        s = L.Scene(L.Camera(eye=(0, 1, 3), look_at=(0, 0, 0), res=(32, 32)))
+        s.add(L.Material("m", "diffuse", reflect=0.7))
+        s.add(mesh)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            s.emit(L.Clock.at_frame(0, 4), L.Cache(), assets_dir=tmp, tag="w0")
+            s.emit(L.Clock.at_frame(1, 4), L.Cache(), assets_dir=tmp, tag="w1")
+            return [x for x in w if "turns" in str(x.message)]
+
+    kw = dict(count=40, scale=0.2, closed_spine=True, closed_profile=True,
+              material="m")
+    with tempfile.TemporaryDirectory() as tmp:
+        bad = emit_twice(L.SweptMesh(spine, circle_profile(10), turns=0.5,
+                                     name="bad", **kw), tmp)
+        # exactly once: this runs every frame, so it must not spam an animation
+        assert len(bad) == 1, f"expected one warning, got {len(bad)}"
+        assert "closed_spine" in str(bad[0].message)
+
+        ok = emit_twice(L.SweptMesh(spine, circle_profile(10), turns=3,
+                                    twist=1.234, name="ok", **kw), tmp)
+        assert ok == [], f"integer turns + uniform twist must be silent, got {ok}"
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
