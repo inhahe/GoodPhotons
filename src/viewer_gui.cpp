@@ -672,7 +672,53 @@ struct LivePanel {
     long long posted = 0, baked = 0, appliedSeq = 0;
     double lastMs = 0.0;
     std::string lastErr;
+    // --- F8(a) paced play -------------------------------------------------
+    // The clock advances only when a bake LANDS, never on a wall-clock timer. The
+    // bridge is latest-wins on a one-slot pending job (the rule that makes a drag
+    // cost one bake), so a play loop that posted on a timer would have most of its
+    // frames superseded before they ran and would show a stutter of whichever ones
+    // won the slot -- not playback. Pacing to the bake rate plays every frame, and
+    // the fps readout states the rate honestly rather than pretending to be 30.
+    bool playing = false;
+    bool loopPlay = true;         // wrap at the end vs. stop there
+    bool pingpong = false;        // bounce instead of wrapping
+    int  dir = 1;                 // +1 / -1, flipped by ping-pong
+    // MEASURED playback rate (EMA), not 1000/lastMs. `lastMs` times loom's bake alone;
+    // the viewer then parses a multi-MB sidecar, rebuilds mesh buffers and re-inits the
+    // raymarch pane on the UI thread, and that adoption cost is routinely the larger
+    // half. Deriving fps from the bake overstated real playback by ~10x here, which is
+    // precisely the "pretend it's 30" this feature was supposed to avoid.
+    double    playFps = 0.0;
+    long long lastAdvanceQpc = 0;
 };
+
+// Step the clock one frame in the current play direction, honouring loop/ping-pong.
+static void liveAdvanceClock(LivePanel& lp) {
+    if (lp.frames <= 1) return;
+    int next = lp.frame + lp.dir;
+    if (lp.pingpong) {
+        if (next >= lp.frames)  { next = lp.frames - 2; lp.dir = -1; }
+        else if (next < 0)      { next = 1;             lp.dir = +1; }
+    } else if (next >= lp.frames) {
+        if (lp.loopPlay) next = 0;
+        else { next = lp.frames - 1; lp.playing = false; }
+    } else if (next < 0) {
+        next = lp.loopPlay ? lp.frames - 1 : 0;
+    }
+    lp.frame = std::min(std::max(next, 0), lp.frames - 1);
+
+    LARGE_INTEGER f, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    if (lp.lastAdvanceQpc && f.QuadPart) {
+        double dt = double(now.QuadPart - lp.lastAdvanceQpc) / double(f.QuadPart);
+        if (dt > 1e-9) {
+            double inst = 1.0 / dt;
+            lp.playFps = lp.playFps > 0.0 ? lp.playFps * 0.8 + inst * 0.2 : inst;
+        }
+    }
+    lp.lastAdvanceQpc = now.QuadPart;
+}
 
 // The canvas gesture: right-drag sweeps the chosen parameter axis. Call it directly
 // after the pane's InvisibleButton (it reads that item's active state). Returns true
@@ -2782,6 +2828,55 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
         changed = true;
     }
 
+    // --- transport (F8a): play is paced by the bake, not by a timer ---
+    // Starting play must post once to prime the loop: the clock only advances when a
+    // result lands, so with nothing in flight nothing would ever land and play would
+    // sit still. Hence `forced` on the leading edge.
+    const bool wasPlaying = lp.playing;
+    // A one-frame timeline has nowhere to advance to, so play would be a button that
+    // silently does nothing -- the worst kind. Say why instead. `frames` comes from the
+    // sidecar's clock, so the usual cause is a sidecar saved without one.
+    const bool playable = lp.frames > 1;
+    if (!playable) { lp.playing = false; ImGui::BeginDisabled(); }
+    if (ImGui::Button(lp.playing ? "pause" : "play")) lp.playing = !lp.playing;
+    if (!playable) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(playable
+            ? "space; the clock advances one frame per completed bake"
+            : "frames = 1: nothing to play. Raise `frames`, or save the sidecar with a\n"
+              "clock (ViewerModel.save_sidecar(path, Clock.at_frame(0, N))).");
+    ImGui::SameLine();
+    if (ImGui::Button("|<")) { lp.frame = 0; lp.dir = 1; changed = true; }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("rewind to frame 0");
+    ImGui::SameLine();
+    ImGui::Checkbox("loop", &lp.loopPlay);
+    ImGui::SameLine();
+    ImGui::Checkbox("ping-pong", &lp.pingpong);
+
+    // Keyboard: space toggles, arrows step. Guarded on WantTextInput so typing a
+    // value into a drag field doesn't scrub the clock out from under the edit.
+    if (!ImGui::GetIO().WantTextInput) {
+        if (playable && ImGui::IsKeyPressed(ImGuiKey_Space)) lp.playing = !lp.playing;
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && lp.frames > 1) {
+            lp.frame = (lp.frame + 1) % lp.frames; changed = true;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && lp.frames > 1) {
+            lp.frame = (lp.frame + lp.frames - 1) % lp.frames; changed = true;
+        }
+    }
+    if (lp.playing && !wasPlaying) {
+        forced = true;                 // prime the paced loop
+        lp.playFps = 0.0;              // and don't average across the pause
+        lp.lastAdvanceQpc = 0;
+    }
+    if (lp.playing) {
+        ImGui::SameLine();
+        if (lp.playFps > 0.0)
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1), "playing %.1f fps", lp.playFps);
+        else
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1), "playing...");
+    }
+
     // --- the build's declared params ---
     if (lp.params.empty()) {
         ImGui::TextDisabled("(the build declares no keyword params)");
@@ -2998,6 +3093,9 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
         }
         if (done) break;
 
+        // Set when paced play steps the clock below; OR'd into `livePost` so the next
+        // frame's bake is requested through the single post site like any other change.
+        bool livePlayPost = false;
         // Fold in whatever loom finished since the last frame. The UI never waits on a
         // bake — it keeps drawing the geometry it already has and adopts the new one on
         // whatever frame it lands.
@@ -3034,6 +3132,12 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
                 }
                 bridge.reap(r.sidecarPath);
                 bridge.reap(r.sourcePath);
+                // F8(a): a bake landed, so the clock may take its next step. Doing it
+                // HERE -- rather than on a timer -- is what makes play show every
+                // frame instead of only the ones that won the latest-wins slot. A
+                // failed bake still advances: stalling on a bad frame would look like
+                // a hang, and the error is already on screen.
+                if (live.playing) { liveAdvanceClock(live); livePlayPost = true; }
             }
         }
 
@@ -3051,13 +3155,16 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
         ImGui::Text("sidecar: %s", sidecarPath.c_str());
         ImGui::Separator();
 
-        bool livePost = false;    // something the geometry depends on moved this frame
+        // Something the geometry depends on moved this frame. Seeded from the paced-play
+        // step because `drawLivePanel` is inside a CollapsingHeader: seeding it there
+        // instead would make collapsing the panel silently stop playback.
+        bool livePost = livePlayPost;
 
         float leftW = ImGui::GetContentRegionAvail().x * 0.42f;
         ImGui::BeginChild("left", ImVec2(leftW, 0), true);
         if (ImGui::CollapsingHeader("Live (loom)",
                                     live.up ? ImGuiTreeNodeFlags_DefaultOpen : 0))
-            livePost = drawLivePanel(live, bridge);
+            livePost = drawLivePanel(live, bridge) || livePost;
         if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen))
             drawScenePanel(sc);
         if (ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen))

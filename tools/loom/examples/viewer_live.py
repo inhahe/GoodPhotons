@@ -28,15 +28,18 @@ Open it live:
   ftrace -viewer <sidecar.json> -loom examples/viewer_live.py
 
 or, since ``save_sidecar`` records this file's path under the sidecar's ``build``
-key, just::
+key, write the sidecar first and let it name its own build::
 
-  python -m loom.viewer examples/viewer_live.py --sidecar out/live.json
+  python examples/viewer_live.py --sidecar out/live.json
   ftrace -viewer out/live.json
+
+(``python -m loom.viewer <scene>`` is a *different* thing — the resident
+re-introspection server the GUI drives. It takes no ``--sidecar``.)
 
 Run standalone:
 
-  python examples/viewer_live.py            # print frame-0 .ftsl to stdout
-  python examples/viewer_live.py --sidecar  # write viewer_live.json beside it
+  python examples/viewer_live.py                  # print frame-0 .ftsl to stdout
+  python examples/viewer_live.py --sidecar [path] # write the sidecar
 """
 
 from __future__ import annotations
@@ -113,15 +116,24 @@ def build(clock=None,
     return scene
 
 
+FRAMES = 48          # the loop length this scene is authored for
+
+
 def main() -> int:
+    from loom import Cache, Clock
     if "--sidecar" in sys.argv:
         from loom.viewer import ViewerModel
-        out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer_live.json")
-        ViewerModel(build).save_sidecar(out)
+        i = sys.argv.index("--sidecar")
+        out = (sys.argv[i + 1] if len(sys.argv) > i + 1
+               else os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "viewer_live.json"))
+        # Save WITH a clock: the sidecar's `frame` block is where the viewer gets its
+        # `frames` from, and a sidecar saved without one advertises frames = 1 — which
+        # leaves the viewer's transport with nowhere to advance to.
+        ViewerModel(build).save_sidecar(out, Clock.at_frame(0, FRAMES))
         print(out)
         return 0
-    from loom import Cache, Clock
-    print(build().emit(Clock.at_frame(0, 48), Cache()))
+    print(build().emit(Clock.at_frame(0, FRAMES), Cache()))
     return 0
 
 

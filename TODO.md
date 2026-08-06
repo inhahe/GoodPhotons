@@ -2121,8 +2121,26 @@ replacement for the renderer or the primary editing tool.**
         -serve` re-renders instantly. This is **C++ interactive-viewer work** (spawn/drive the resident
         process, present its frames, wire scrub/param/edit) — best done with the user present; the MC mesh
         is the working stand-in until then. Textures via **G5** + the F4 material/texture sidecar (done).
-- [ ] **F8 — the viewer *plays*, not only *scrubs*.** *(gap found 2026-08-06 answering "does the loom
+- [~] **F8 — the viewer *plays*, not only *scrubs*.** *(gap found 2026-08-06 answering "does the loom
       viewer support viewing loom objects animated?" — answer: it **scrubs**, it does not **play**.)*
+      **(a) paced play DONE 2026-08-06** (0.139.0, `src/viewer_gui.cpp`): play/pause button + spacebar,
+      `|<` rewind, loop and ping-pong toggles, arrow keys ±1 frame, and a **measured** fps readout.
+      **(b) prebaked play is still open** — that is the one that makes motion judgeable. Notes from
+      doing (a), which (b) should not have to rediscover:
+      - The clock advances *only* where a result lands (the `bridge.take(r)` site), never on a timer.
+        That is the whole trick: pacing to the bake sidesteps latest-wins entirely, so every frame is
+        actually shown rather than most being superseded in the one-slot pending job.
+      - Starting play must post **once** (`forced = true` on the leading edge) to prime the loop —
+        with nothing in flight, nothing lands, and play would sit still.
+      - **Do not derive fps from `lastMs`.** `lastMs` times loom's bake alone; the viewer then parses a
+        ~900 KB sidecar, rebuilds mesh buffers and re-inits the raymarch pane on the UI thread, and that
+        adoption is routinely the larger half. Measured end-to-end on `scatter_modulated_sweep.py`:
+        bake ≈ 30 ms but real playback ≈ **1.7 fps**. `1000/lastMs` said ~19. The readout now measures
+        the actual advance interval (QPC, EMA). The 10x gap is also the size of the prize for (b).
+      - `frames` is seeded from the sidecar's `frame` block, and `ViewerModel.save_sidecar(path)` with
+        **no clock** writes `frames = 1` — which would make play a button that silently does nothing.
+        It is now disabled with a tooltip saying exactly that; scenes should save with
+        `Clock.at_frame(0, N)`.
       What exists today (`src/viewer_gui.cpp` ~L2774, the F4 **Live (loom)** panel): a `SliderInt("frame")`
       + `DragInt("frames")`. Dragging `frame` marks the live panel `changed`, `LoomBridge::post()`s an
       `introspect`+`emit` at that clock, and the returned sidecar/`.ftsl` re-seed the geometry and the F7

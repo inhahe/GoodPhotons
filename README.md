@@ -3259,6 +3259,17 @@ sequence number and wall time. `auto` off defers bakes to the **re-derive now** 
 scenes too slow to rebuild interactively; a scene that raises, or emits an `.ftsl` ftrace
 can't load, reports the error in the panel and leaves the last good geometry on screen.
 
+The clock **plays**, not only scrubs: a **play/pause** button (or the **spacebar**), a `|<`
+rewind, **loop** and **ping-pong** toggles, and **left/right arrows** to step one frame.
+Playback is *paced by the bake*, not by a wall-clock timer — the clock advances only when a
+re-derivation lands. That is deliberate: the queue is latest-wins, so a play loop posting on
+a timer would have most of its frames superseded before they ran and would show a stutter of
+whichever ones won the slot rather than the animation. Pacing to the bake plays every frame,
+and the readout states the **measured** rate ("playing 1.7 fps") rather than pretending to a
+frame rate it isn't hitting. Play needs somewhere to advance to, so it is disabled when
+`frames` is 1 — which is what a sidecar saved without a clock advertises; save with
+`ViewerModel.save_sidecar(path, Clock.at_frame(0, N))`.
+
 ---
 
 ## Known issues & roadmap
