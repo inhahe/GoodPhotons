@@ -178,7 +178,11 @@ distribution.
       *dog*, compare against the P2 mocap for the same gait, and report a hard error
       number. That says empirically whether the ambitious version is viable, or whether
       video should be demoted to style reference only.
-- [ ] Capture rig (see `notes/capture.md`) — 4 cameras minimum for a quadruped, ≥120fps
+- [ ] Capture rig — **`notes/capture.md` now exists** (it was a dangling reference until 2026-08-06).
+      4 cameras minimum for a quadruped (they self-occlude far worse than humans), ≥120 fps.
+      Note that page's central rule: the rig has **two modes that must never share a recording** —
+      motion (fast, whole-animal, whatever resolution survives the fps budget) and groom/appearance
+      (stills, full sensor, close, controlled light, still subject). Same hardware, opposite settings.
 
 ---
 
@@ -246,6 +250,9 @@ follows is the scope, and just as importantly what is deliberately *excluded*.
       anatomy*, never hand-painted. Two reasons, and the second is the load-bearing one:
       1. it's the only genuinely novel part of the fur work — direction following muscle topology,
          clumping from strain and contact history, which is the "we own both layers" payoff;
+         **and it makes the groom *fittable from photographs*** — a procedural groom is a ~10–30
+         number parameter vector, so capture becomes analysis-by-synthesis on summary statistics
+         rather than per-strand reconstruction. See `notes/capture.md`;
       2. **a painted groom does not survive P4's morphing.** Change the body and painted maps are
          stale, which would quietly destroy the thing that justifies this whole architecture.
       Note "sufficiently random yet orderly" is precisely a *correlated*-randomness problem:
