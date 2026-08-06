@@ -358,11 +358,48 @@ anything expensive**, even though it's built later.
       learned controller produces the base motion, then a physics-aware trajectory-optimisation pass
       enforces the shot constraint offline. Write this down now so nobody burns a week trying to make
       the policy hit an exact contact.
-- [ ] **A learned forward model** — state + motor command → predicted next sensory state. This is the
-      one place a small net genuinely belongs (see P1's proprioception items: the net is for
-      *predicting*, not for *sensing*, since sensing is exact in sim). It is what lets a controller
-      act through the delays added in P1, it is standard model-based-RL machinery, and its learned
-      representation is the substrate levels 0–2 operate on.
+### Forward model and planning — **use MuJoCo as the model; do not learn one**
+
+*(refined 2026-08-06.)* The motivating case: balance, and "jump exactly that far". Both need
+predicting what happens **if** a set of muscles is fired — a *counterfactual* query, evaluated
+without executing, many times, in order to **choose** the action. That is planning/search, not the
+narrow delay-compensation use a forward model is usually introduced for.
+
+- [ ] **First, do not build this to get abstraction.** "Say *walk* instead of specifying each leg
+      over time" comes free from a **model-free** policy with command inputs — the planning is
+      amortised into the weights during training, and runtime is one microsecond forward pass with
+      no search. That is exactly level 1 above. Abstraction is not a reason to build a model.
+- [ ] **The real payoff is zero-shot goals.** A model-free policy can only pursue goals it was
+      *trained* on. A model + planner can pursue one specified for the first time at runtime —
+      "clear that 2.3 m gap from this stride phase" — by searching for a takeoff impulse whose
+      predicted arc satisfies it. This *is* the "jump just the right length" case and it is a genuine
+      capability difference.
+- [ ] **Use the simulator as the model. `MuJoCo` already *is* `f(s,a) → s'`, exactly, contact
+      included.** Training a net to approximate a simulator we are already running is strictly worse
+      unless we need it *faster than real time*. Prior art to follow rather than reinvent:
+      **MuJoCo MPC** (DeepMind 2022) — sampling-based predictive control using MuJoCo as its own
+      model, in real time. Rolling out the true dynamics avoids all three classic failure modes:
+      - **compounding error** — 1% one-step error over a 50-step rollout is garbage; this is what
+        kept model-based RL marginal for years;
+      - **contact discontinuity** — a foot touches or it does not; smooth nets model that badly and
+        the errors land *exactly* at the instants that decide balance and landing;
+      - **adversarial exploitation** — a planner searching a learned model *finds its errors*, and
+        will cheerfully discover an action sequence the model believes yields a 10 m jump.
+- [ ] **Then distil.** Plan offline with MuJoCo-MPC for the hard targeted actions, train the fast
+      policy to reproduce them. Keeps the planner's generality and the policy's microsecond runtime —
+      which is also what keeps **P9's live-puppeteering latency budget** intact.
+- [ ] **Learn a model only if profiled speed demands it**, and treat it as an optimisation with a
+      known-good reference (the real sim) to score it against — not as the primary design.
+- [ ] **Balance is not planning — keep the two mechanisms separate.** Balance is fast reactive
+      feedback; biologically it is *spinal* (reflex arcs, central pattern generators), on a loop far
+      faster than deliberation. Targeted jumping is planning. Real motor control layers these —
+      spinal reflexes/CPGs for balance and gait rhythm, cerebellum for the forward model and fine
+      timing, cortex for planning — which maps onto this section's levels almost directly, and is
+      corroborating evidence the layering is right. Implement balance in the policy (fast, reactive,
+      trained), planning above it.
+- [ ] **Keep the model slightly wrong on purpose.** An animal that occasionally misjudges a gap and
+      stumbles reads as alive; one that never does reads as machinery. Same family as P1's
+      conduction-delay item — imperfection is character, and it is nearly free.
 
 **Why this section exists.** The user's framing was "simulate the kinesthetic sense so the creature is
 easy to control abstractly". The sensing half of that is free in simulation and needs no net; the
