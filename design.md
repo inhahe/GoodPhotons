@@ -293,6 +293,76 @@ graveyard is full of technically excellent systems that died on integration and 
 control, not on simulation quality. The bar is not "does the solver converge", it's "can a
 TD debug this at 2am three days before delivery".
 
+## Standing constraints
+
+*Decisions that are never "done", extracted here because they lived in `todo.md` and a checklist is
+the wrong place for a rule. Each one is cheap to honour now and expensive to retrofit; several were
+reached from different directions and only afterwards recognised as the same argument.*
+
+### The recurring argument: the cost model picks the algorithm, before quality is discussed
+
+This settled three unrelated decisions, which is why it is stated first rather than three times:
+
+| decision | the budget | what it eliminated |
+|---|---|---|
+| fur groom is **procedural**, not simulated or captured per-strand | per-frame render cost × millions of fibers | per-strand capture and reconstruction |
+| fur responds **quasi-statically** to wind, with no dynamics | dynamics makes rendering *stateful in time*, killing per-frame parallelism | any integrated hair sim |
+| aerodynamics is **blade-element**, not CFD | ~10⁸ RL steps ⇒ ~100 µs/step | CFD, by ~10⁶× — not a fidelity trade, an impossibility |
+
+**Consequence: compute the budget first.** In every case the budget had exactly one survivor, and
+arguing fidelity beforehand would have been wasted. When a new subsystem is proposed, the first
+question is its per-step or per-frame cost against the loop it sits in.
+
+### Control
+
+- **Anything that can emerge should emerge, not be commanded.** Conditioning inputs must be
+  randomised *jointly*, so training cost scales with the dimensionality of the command space, not
+  with the behaviours it can express. Enumerating behaviours as channels is how a command space
+  becomes untrainable by accident. Worked example: gait is not commanded — speed plus an energy
+  penalty reproduces the walk/trot/gallop transitions *and* puts them at the right speeds.
+- **Every control channel must be a conditioning input at training time.** Morph vector, gaze,
+  affect, style, part goals, fatigue. A channel added afterwards is ignored by the policy, and the
+  fix is a retrain. This is P4's lesson generalised to the whole interface, and it is why the control
+  interface must be *designed* long before it is built.
+- **Part-specific control is one generic mechanism, not N channels** — a goal for a body-part set,
+  injected as a goal rather than overriding actuators. Overriding actuators discards the balance
+  solution that makes the motion physical.
+- **Plan with the simulator; do not learn an approximation of it.** MuJoCo is already an accurate,
+  fast, differentiable-enough forward model. A learned dynamics model would be a lossy copy of
+  something we own outright.
+
+### Morphology
+
+- **The morph space is per-body-plan, not one global manifold.** You cannot interpolate a leg into a
+  wing: the midpoint body has neither working limb, and no policy exists across a discontinuous
+  reward landscape. Morph claims must always be qualified by body plan.
+- **Morphs can produce non-viable creatures, and viability is plan-specific.** Terrestrial morphs
+  essentially always walk; flight morphs can be aerodynamically uncontrollable (static margin, wing
+  loading) or over the mass ceiling for powered flight. Each body plan needs its own viability check
+  alongside `tune.py`'s cost measurement.
+- **Physical impossibility is a correct result, not a bug** — a scaled-up flyer *should* fail at
+  powered flight. The test is whether the fallback behaviour emerges rather than whether the failure
+  is suppressed.
+
+### State
+
+- **Every slow variable needs a write port.** Fatigue, hunger, injury, wetness, temperature,
+  alertness. The decisive reason: **the simulation's timeline is not the film's timeline** — an
+  animal re-enters frame after an implied three-hour chase that was never simulated, so state must be
+  *writable*, not merely reachable by running physics up to it. Accumulation is the default; the knob
+  is the seek control. Design this as one named, saveable, interpolatable vector rather than
+  discovering the requirement separately per variable.
+- **Anything with a rate is also a morph parameter.** How fast a given creature tires is a property
+  of that creature and must ride in the morph vector, or it goes stale the moment the body changes.
+
+### Scope
+
+- **Content is out; architecture is in.** Object interaction (eat, drink, play-with-X, fight) needs a
+  world, graspable objects, contact and — for fighting — a second agent and an unspecifiable reward.
+  None of it reuses the others' machinery, which is the test: *if it generalises it is architecture,
+  if each instance is bespoke it is content.* A wind field passes that test (a few numbers per point,
+  serving both aerodynamics and fur deflection); a lion does not.
+
 ## Repo layout
 
 ```

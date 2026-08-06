@@ -7,6 +7,11 @@ losing the learned motion character**.
 
 Status key: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
+**This file holds work items. The rules that constrain the work live in `design.md` §Standing
+constraints** — things like "anything that can emerge should emerge", "every control channel must be
+a training-time conditioning input", and "the morph space is per-body-plan". Those never get checked
+off, so they are not tasks; read them before adding anything here that they would rule out.
+
 ---
 
 ## The ordering question (read this first)
