@@ -2163,6 +2163,13 @@ replacement for the renderer or the primary editing tool.**
         47.4 ≈ bake 41.0**, i.e. a direct geometry channel from loom to the viewer that never
         serialises to `.ftsl`/JSON — note the log also shows a temp `.obj` re-written and
         re-loaded *per frame*. Full write-up in `known-issues.md`.
+        **Reproduced at n=50** (`png/loom_play_idle.log`, 247 frames): round-trip **184.0 ms** vs
+        184.9 above, so the headline holds to within 1 ms. That run also confirms the `.obj`
+        churn quantitatively — **247 `loadObj` lines for 247 frames**, each re-parsing and
+        re-crease-smoothing the same 2160-vert / 4320-tri mesh. And the split sharpens: at
+        `upload 3.0 + kernel 3.7 + readback 8.8`, `readback` is **2.4× the kernel** and the actual
+        GPU trace is **1.7 % of the frame** — so tracing is not merely not-the-bottleneck, it is
+        nearly free, and any future win must come from the round-trip or from readback.
       - Shipped alongside: a **`play res`** draft resolution used only while playing (1.4 → 1.8 fps,
         ~25%) and a **`-play`** CLI flag that opens with the transport already running — the latter
         because driving an ImGui window with synthetic input to measure it is unreliable (ImGui

@@ -35,6 +35,23 @@ the new `IsoPreviewTiming` split gives, averaged over 8 consecutive `[play]` sam
    else on the card. Within it, `readback` (9.2 ms, D2H + host tone map) now costs *more than the
    kernel* (6.4 ms), which the old single number could not have shown.
 
+**Independently reproduced at n=50 (2026-08-06, same build).** A full play session
+(`png/loom_play_idle.log`, 247 frames, 50 `[play]` samples) — 6× the sample count above, and the
+relevant check given that this diagnosis already reversed once on bad measurement:
+
+```
+4.61 fps mean (min 4.30, max 5.10)
+  bake       45.5 ms   |
+  sidecar    90.5 ms   |  loom round-trip = 184.0 ms   (n=8 run: 184.9 ms)
+  ftsl       48.0 ms   |
+  raymarch   15.9 ms  = upload 3.0 + kernel 3.7 + readback 8.8
+```
+
+The round-trip reproduces to within 1 ms, so the headline number is solid. Two things sharpen:
+`readback` is now **2.4× the kernel**, i.e. the phase named "raymarch" is mostly *moving pixels
+back*, and the actual GPU trace is **1.7 % of the frame** — so even making tracing infinitely fast
+would be invisible. `upload` at 3.0 ms sits even further below the retired 274 ms premise.
+
 **Where the remaining time actually is, in priority order:** `sidecar` 96.5 ms (parse the
 introspection JSON, rebuild the DAG and skin buffers) ≫ `ftsl` 47.4 ms ≈ `bake` 41.0 ms. Note also
 that the viewer re-writes and re-loads a temp `.obj` per frame (`loadObj: …/ftrace_viewer_<pid>/
