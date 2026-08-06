@@ -107,3 +107,6 @@ __pycache__/
 Thumbs.db
 Desktop.ini
 /build_nocuda/
+
+# built on demand by tools/jsonbench.bat (source is checked in, binary is not)
+tools/jsonbench.exe
