@@ -3549,14 +3549,49 @@ static void warnWhittedHeroCollapse(const Scene& scene) {
 // shared kernel doesn't implement the per-camera resample yet).
 static bool g_beamGather = false;
 
-// Enable ANSI/virtual-terminal escape processing so the preview renders in a plain
-// Windows console (conhost/cmd), not only in Windows Terminal. No-op elsewhere.
+#ifdef _WIN32
+// The console's ORIGINAL output code page, kept so it can be put back. The setting is
+// process-wide but the CONSOLE OUTLIVES THE PROCESS, so leaving it switched would quietly
+// change how every later command in that shell prints -- not a renderer's business to do.
+static UINT g_prevConsoleCP = 0;
+static void restoreConsoleOutputCP() {
+    if (g_prevConsoleCP) { SetConsoleOutputCP(g_prevConsoleCP); g_prevConsoleCP = 0; }
+}
+#endif
+
+// Make the console able to PRINT WHAT WE ACTUALLY EMIT. Windows needs two separate switches
+// here and missing either one corrupts the output in a different way:
+//   * ENABLE_VIRTUAL_TERMINAL_PROCESSING makes it INTERPRET ANSI escapes instead of echoing
+//     them, which is what colours the preview; and
+//   * SetConsoleOutputCP(CP_UTF8) makes it DECODE our bytes as UTF-8.
+// Only the first was ever set, and the resulting bug was invisible from any redirected run.
+// `-preview` draws with U+2580 UPPER HALF BLOCK, emitted as the raw bytes E2 96 80, and a
+// default console (code page 437) decodes each of those as its OWN character -- so the
+// thumbnail came out as a field of "Gamma u C" mojibake with the correct colours behind it,
+// which looks like a font problem and is not. Piped to a file the identical bytes are
+// correct, which is why this survived: every automated run redirects.
+//
+// It was never confined to the preview either. Three dozen ordinary status lines carry an
+// em dash (U+2014, bytes E2 80 94) -- including `[stop] running renders -- stop one with
+// ...`, i.e. the help text for the one command that must work when something has gone wrong
+// -- and those printed as three characters of soup on any console at its default code page.
+// So this is called once from main() rather than only when -preview is on.
 static void enableAnsiTerminal() {
 #ifdef _WIN32
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD m = 0;
     if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &m))
         SetConsoleMode(h, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    // GetConsoleOutputCP returns 0 when no console is attached (output redirected to a file
+    // or a pipe) and SetConsoleOutputCP then fails harmlessly -- in that case the raw UTF-8
+    // bytes go straight to the file, which is already what is wanted.
+    if (!g_prevConsoleCP) {
+        UINT cur = GetConsoleOutputCP();
+        if (cur && cur != CP_UTF8 && SetConsoleOutputCP(CP_UTF8)) {
+            g_prevConsoleCP = cur;
+            std::atexit(restoreConsoleOutputCP);
+        }
+    }
 #endif
 }
 static void ansiPreview(const Film& f, double N, double expComp, const char* status) {
@@ -10762,6 +10797,11 @@ static int runServe(int argc, char** argv, int inValPos) {
 // spectral-library resolver) into a clean message + non-zero exit, instead of a
 // silent fall-through to a default illuminant that would render the wrong thing.
 int main(int argc, char** argv) {
+    // Teach the console to decode our UTF-8 and interpret our ANSI escapes, BEFORE anything
+    // can print. This has to precede the -stop branch below, because that branch prints the
+    // running-render list -- which contains an em dash -- and then returns without ever
+    // reaching the render setup where this used to be called.
+    enableAnsiTerminal();
     // `-stop [<pid>|all]`: talk to ALREADY-RUNNING renders and exit. Handled before
     // anything else so it works from a bare command line -- it loads no scene, opens
     // no window and creates no CUDA context, so there is nothing here to tear down.

@@ -5,6 +5,51 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-08-05, v0.138.3): `-preview` printed mojibake in a real console — the output code page was never set
+
+**Symptom (user-reported).** `ftrace scenes\gallery_rain.ftsl -preview -glass` drew the ANSI
+thumbnail as a field of garbage characters with the *correct colours* behind them. At the
+console's small font the garbage read as something like `rä¢` repeated across every row.
+
+**Cause.** Two entirely separate Windows console switches were being confused for one:
+
+| switch | what it does | were we setting it? |
+|---|---|---|
+| `SetConsoleMode(… ENABLE_VIRTUAL_TERMINAL_PROCESSING)` | *interpret* ANSI escape sequences | yes |
+| `SetConsoleOutputCP(CP_UTF8)` | *decode our bytes* as UTF-8 | **no** |
+
+The preview emits each cell as `"\033[38;2;…m\033[48;2;…m" "\xE2\x96\x80"` — an SGR colour
+pair (pure ASCII, so it always worked, which is why the colours looked right) followed by
+U+2580 UPPER HALF BLOCK as three raw UTF-8 bytes. A default CP437 console decodes those three
+bytes as three *separate* CP437 glyphs (`Γ`, `û`, `Ç`), so every one-character cell became
+three junk characters. Nothing was wrong with the colours, the escapes, or the image — only
+the byte→glyph mapping.
+
+This was not preview-specific: **36 other status lines contain an em dash** (U+2014, bytes
+`E2 80 94`) and were mangled the same way, including the `[stop] running renders — …` listing
+that this project's own docs tell you to read a pid out of.
+
+**Why it survived so long.** Every automated run in this repo redirects stdout to a `.log` or
+pipes it. Redirected output is not a console, so the bytes land in the file unmodified and
+read back perfectly in any UTF-8 editor. The bug is invisible unless a human is looking at a
+live console — which is exactly how the user found it.
+
+**Fix** (`src/main.cpp`): `enableAnsiTerminal()` now also calls `SetConsoleOutputCP(CP_UTF8)`,
+remembering the previous code page and restoring it from an `std::atexit` handler — the output
+CP is process-wide but the *console outlives the process*, so leaving it at 65001 would change
+the user's shell behind their back. The call was additionally hoisted to the very top of
+`main()`, because the `-stop` branch prints (em-dash-bearing) output and returns without ever
+reaching the render setup where `enableAnsiTerminal()` used to be called.
+
+**Verified** by running the repro in its own console window and reading back what conhost
+actually painted (`RawUI.GetBufferContents()`): the thumbnail rows come back as runs of
+`U+2580`, the checkpoint line's dash comes back as `U+2014`, and `GetConsoleOutputCP()` is
+437 both before and after the process — i.e. the restore works. Redirected runs are byte-identical
+to before.
+
+**Standing lesson.** A rendering CLI's console output can be broken in a way that no
+redirected test will ever catch. When touching terminal output, check it in a real console.
+
 ### OPEN (2026-08-05): `scraps/_gemsweep.py` — `spread` is not resolution-stable and can invert a ranking
 
 Found while adjudicating a box vs sphere clip for `gallery_rain`'s crystal gyroid. `coverage`
