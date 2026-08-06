@@ -36,6 +36,9 @@ P8 live creature viewer     (not strictly ordered — pull it forward the moment
 P9 human-performance drive  (needs P4's conditioned policy + P7's face to be
                              the interesting version rather than pose retargeting)
 P10 layered control         (DESIGN before P2; BUILD alongside P4 — see below)
+P11 flight                  (out of the main line; a separate body plan and a
+                             separate physics problem — but it scopes P4's claim,
+                             so read it before P4 is built)
 ```
 
 **P10's design cannot wait for its slot.** Every control channel you want at the end — morph vector,
@@ -189,7 +192,10 @@ distribution.
 - [ ] Morph vector (bone lengths, masses, attachment points, muscle strengths) as a
       first-class policy input
 - [ ] Domain randomisation over morph space during training
-- [ ] **Bar:** a body never seen in training walks with the same character
+- [ ] **Bar:** a body never seen in training walks with the same character — **within its body
+      plan.** That qualifier is load-bearing and is not hedging: the morph space is *not* one global
+      manifold. You cannot interpolate a leg into a wing, because the midpoint body has neither
+      working limb and no policy exists across a discontinuous reward landscape. See P11.
 - [ ] Prior art: MetaMorph; Shared Modular Policies
 
 ---
@@ -611,6 +617,150 @@ nothing else.
       must close in tens of milliseconds. That is a hard constraint on the controller's inference
       cost and it should be measured early, not discovered at the end.
 - [ ] **Bar:** a person moves, and a *dog* moves — recognisably driven, recognisably still a dog.
+
+---
+
+## P11 — Flight  `[ ]`  ← breaks a different layer than everything above
+
+*(2026-08-06. Asked as "what if we wanted to simulate a flying animal?". Written down because the
+answer turned out to scope P4's central claim, which is worth knowing before P4 is built.)*
+
+**The headline: almost everything in this file transfers, and the one thing that doesn't is the
+physics engine.** For a walker, contact is the hard part and MuJoCo is excellent at contact. For a
+flyer, contact barely matters and *the fluid is everything* — and MuJoCo's fluid model is a
+quasi-steady per-geom ellipsoid approximation (blunt/slender/angular drag, Kutta lift, Magnus). It
+has no wake, no circulation history, no leading-edge vortex. Flapping flight lift is *dominated* by
+unsteady mechanisms, so the engine is not merely inaccurate here, it is missing the mechanism.
+
+### The training budget picks the aerodynamics model — this is not a free choice
+
+RL needs on the order of 10⁸–10⁹ simulation steps. That sets a hard per-step aero budget of roughly
+**O(100 µs)**, which eliminates the entire high-fidelity end of the menu before quality is even
+discussed:
+
+| approach | per-step cost | verdict |
+|---|---|---|
+| CFD (Navier–Stokes, moving boundary) | ~1 s–min | **10⁶× over budget.** A single training run would take years. Not a fidelity trade-off — an impossibility. |
+| **Blade-element / BEMT** | ~10 µs at 20 strips/wing | **The answer.** Strip the wing, compute local relative airflow, look up Cl/Cd(α), apply force + torque per strip via `xfrc_applied`. Pennycuick-style, standard in the biomechanics literature. |
+| learned CFD surrogate | ~100 µs | Plausible *later*, but you must run the CFD first to have training data, so it is not a way to avoid the CFD. |
+
+- [ ] **Write the blade-element model as an external force layer over MuJoCo**, not as a MuJoCo
+      feature. Per strip: relative wind (body velocity + flapping velocity + ambient field − induced
+      velocity), angle of attack, Cl/Cd polar, force at the strip's centre of pressure. This is small,
+      self-contained, and testable against published lift/power curves.
+- [ ] **Know what quasi-steady costs you.** It is decent (order tens of percent) for *bird* flight
+      and hopeless for insect flight — quasi-steady famously underpredicts insect lift, which is the
+      origin of the "bumblebees can't fly" folklore. Dickinson et al. (1999) patch it with rotational
+      circulation + wake-capture terms; Ellington et al. (1996) identified the leading-edge vortex as
+      the missing lift. **So: birds and bats are in scope, insects are a different project.**
+- [ ] **Reynolds number is a scope boundary, not a parameter.** Re ~10² (insect) to ~10⁵ (large bird)
+      is a qualitative change in the flow regime, not a coefficient to interpolate. One aero model
+      does not span it.
+
+### Glide before flap — and the reason is architectural, not incremental caution
+
+**Gliding is the correct first target**, because a glider is a *continuous deformation of the
+existing quadruped*: flying squirrel, colugo, sugar glider, Draco. A patagium is a membrane between
+existing limbs — it is a morph parameter on the body plan already in `canis.ftcl`. And gliding is
+aerodynamically the easy case: attached flow, quasi-steady, no unsteady mechanisms required, so
+blade-element is not an approximation there so much as the actual right model.
+
+That gliding evolved independently *many* times in mammals is itself the evidence for the claim:
+evolution reached it repeatedly by incremental change, which is what "lies on a continuous manifold"
+means. Powered flapping flight evolved ~4 times, ever.
+
+- [ ] **Glider milestone:** patagium as a morph parameter, blade-element aero, and a controlled
+      descent that trades height for distance. Exercises the entire aerodynamic pipeline without
+      touching flapping, on a body the project already has.
+
+### Flight is a SEPARATE morph manifold — this scopes P4's claim
+
+You cannot interpolate between a leg and a wing. The midpoint creature has neither working legs nor
+working wings, *and no policy exists for it* because the reward landscape across that path is
+discontinuous. So the morph vector is **not one global space; it is per-body-plan**, and P4's bar
+should read "a body never seen in training walks with the same character **within its body plan**".
+
+That is still the right claim and still a strong one — but the unqualified version is false, and it
+is much cheaper to learn that now than to discover it when a morph sweep produces an unflyable
+chimera and it reads as a bug.
+
+- [ ] **New failure mode: morph vectors can produce creatures that cannot fly at all**, in a way
+      terrestrial morphs cannot produce creatures that cannot walk. Static margin (CoM vs
+      aerodynamic centre), wing loading, and dihedral decide controllability outright. P4 morph
+      sweeps need a **flight-viability check**, analogous to what `tune.py` already does for cost.
+- [ ] **The mass ceiling is physics, not a bug.** Power required scales ≈ m^1.17 while power
+      available scales ≈ m^0.67, so powered flight has a ceiling near ~15–20 kg (the heaviest flying
+      birds sit right there; the far heavier extinct flyers were almost certainly soarers). **Scale
+      the morph up and powered flight *should* fail** — and if soaring takes over on its own, that is
+      the emergence argument validating itself again.
+
+### Control: no equilibrium, and a limit cycle instead of a pose
+
+- Terrestrial control has a stable reference — the ground — and a **zero-action equilibrium**: an
+  animal can stand still and think. A flyer has neither. Stop flying and you fall. Everything is
+  underactuated in all 6 DOF at once, continuously.
+- **Flapping is a limit cycle, not a pose sequence.** The control problem is *shaping an
+  oscillation*, which is exactly what P1's CPG/spinal layer is for — so that layer becomes **more**
+  load-bearing here, not less. This is the strongest argument in the file for building P1's reflex
+  tier properly rather than letting the policy do everything.
+- [ ] **Takeoff and landing are the hard parts, and they are where flight meets contact again.**
+      Takeoff is a power spike (the *legs* do much of it — birds leap first). Perching is a precision
+      landing on a small, possibly moving target with an unforgiving failure mode. Cruise is the easy
+      middle.
+- [ ] **flap → glide → soar is the aerial gait ladder — and it should fall out of the SAME mechanism
+      as gallop → trot → walk.** Flight is enormously expensive and the pectoralis fatigues; the
+      energy criterion that selects terrestrial gait, plus the fatigue model above, should select the
+      aerial one. If commanding it is ever needed, the emergence argument has failed somewhere.
+
+### A wind field is infrastructure, and it pays for itself twice
+
+- [ ] **Add a spatially-varying ambient velocity field** that the aero model samples. It is cheap,
+      and it is the prerequisite for thermals, ridge lift, gusts, ground effect and therefore for
+      soaring at all. **The same field drives P7's quasi-static fur/feather wind deflection** — so
+      one piece of infrastructure serves both the physics layer and the look layer. (Note this is
+      *not* the "object interaction is content" category from P10: a velocity field is a few numbers
+      per point, not a world of graspable objects.)
+
+### Feathers are a new tissue — closer to fur than to skin, but not the same problem
+
+- [ ] Feathers are **not** the curve primitive from the raytracer's §P. A feather is hierarchical:
+      rachis (a stiff curve) → barbs (curves) → barbules. At distance the vane is a *surface* with a
+      strongly anisotropic BSDF; barbs only need resolving up close. That is a real LOD story and a
+      different one from hair's.
+- [ ] Counts are far friendlier than fur — ~1.5–3 k feathers on a songbird, ~25 k on a swan, versus
+      millions of hairs. But each one is *individually visible and individually posed*, so the
+      statistical treatment that saves fur is unavailable. **Fur is a texture problem; feathers are a
+      posing problem.**
+- [ ] Wing area changes drastically between downstroke and upstroke (flexion, primary separation),
+      and feathers slide over one another. The wing is a **deforming surface**, not a rigid linkage —
+      and for bats it is worse still: an elastic membrane with muscles embedded *in* it.
+- [ ] **Iridescence is where ftrace's spectral machinery finally earns its keep.** Structural colour
+      in feathers is a multilayer/photonic-crystal effect (hummingbird gorget: stacked melanosome
+      platelets; peacock barbule: a 2-D photonic crystal) — and ftrace *already* has `ThinFilm`,
+      `Multilayer`, `Grating` and `Layered` material types and is spectral end-to-end. An RGB
+      renderer cannot do this correctly at all. Nearly free capability, high visual payoff.
+
+### What the capture rig cannot give us
+
+`notes/capture.md` is built for a ground animal at ~3 m in a fixed volume, and flight defeats it on
+three counts: the subject **leaves the volume**; wingbeat is 5–50 Hz (pigeon ~8 Hz, hummingbird
+50–80 Hz) so 120 fps yields ~15 samples per pigeon beat and nothing usable for a hummingbird; and
+joint-centre triangulation is **ill-posed on a wing**, where the bones are buried under a much larger
+deforming feather surface.
+
+- [ ] Accept that **flight reference motion must come from published biomechanics / wind-tunnel work,
+      not from our own rig** — or go reference-free. Reference-free is *more* plausible for flight
+      than for walking, interestingly, because the aerodynamic objective constrains the solution so
+      much harder than the walking objective does.
+
+### What transfers unchanged (most of it)
+
+P10's layered control is untouched — level 1 just becomes "fly there at speed v". The persistent-state
+block, fatigue, breathing (coupled to a much larger exertion range), gaze, and the affect vector all
+work as written. **Gaze is a standout: bird head stabilisation is famously precise and visually
+iconic, and it falls straight out of "hold gaze fixed" as a goal** with no new machinery. And the
+legs do not go away — perching, takeoff and walking still need them, so flight is *additive* to the
+quadruped work rather than a replacement for it.
 
 ---
 
