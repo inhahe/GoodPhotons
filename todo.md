@@ -35,7 +35,14 @@ P8 live creature viewer     (not strictly ordered — pull it forward the moment
                              morph-space exploration starts costing you time)
 P9 human-performance drive  (needs P4's conditioned policy + P7's face to be
                              the interesting version rather than pose retargeting)
+P10 layered control         (DESIGN before P2; BUILD alongside P4 — see below)
 ```
+
+**P10's design cannot wait for its slot.** Every control channel you want at the end — morph vector,
+gaze target, style knobs, part-specific goals — must be a conditioning input *during* training or the
+policy will ignore it. That is P4's own lesson applied to the whole control interface, and the cost of
+discovering it late is a retrain. So decide the interface before P2 spends real compute, even though
+most of the implementation lands with P4.
 
 **P8 is deliberately unordered.** It is the one item here that pays back immediately at *any* stage:
 26 morph parameters are currently explored by randomising and counting collapses, and a slider plus
@@ -104,6 +111,26 @@ definitions themselves should round-trip to MJCF, not compete with it.
 Smoke-test the entire loop end to end on a body whose dynamics we trust.
 
 - [ ] Gym-style env wrapping the generated model
+- [ ] **Proprioceptive observation space — decide this before the first PPO run, not after.**
+      *(added 2026-08-06.)* In sim, proprioception is **free and exact** — MuJoCo already gives joint
+      angles/velocities, muscle lengths and rates, tendon forces, contacts, body orientation, which
+      *is* what spindles, Golgi tendon organs and the vestibular system report. So there is nothing
+      to *infer*; the decision is **which signals, in what frame, normalised how**, and it is
+      load-bearing:
+      - **Global state (world positions, absolute orientation, exact velocities) is the wrong
+        choice** even though it trains fastest. It produces a brittle policy that cannot transfer.
+      - **Body-local, biologically-available, normalised signals** — muscle length as a fraction of
+        rest length, tendon force as a fraction of max, joint angle relative to *its own* limits,
+        gravity direction in head frame, foot contact — make the same numbers **mean the same thing
+        on a different body**. That is the property P4's morph generalisation actually rests on, so
+        this item is a P4 prerequisite disguised as a P1 detail. Getting it wrong is a retrain.
+- [ ] **Proprioceptive delay and noise, scaled by body size.** Real conduction latency is 10–40 ms,
+      longer for a hind limb than a fore, and >100 ms in a large animal. Training on perfect
+      instantaneous state yields superhuman reflexes and a twitchy, over-corrected gait — a genuine
+      CG tell, the motor-control analogue of the fixed-pivot knee. **Delay should be derived from
+      the morph vector** (limb length ÷ conduction velocity), not authored, so a scaled-up creature
+      moves *heavier* for free. Directly serves design.md's "old / exhausted / 40 kg heavier is one
+      knob" claim.
 - [ ] PPO baseline, flat ground, forward-velocity reward
 - [ ] Termination on fall, action-rate + energy penalties
 - [ ] **Bar:** a stable gait emerges. It will look bad. That is fine — this step is
@@ -289,6 +316,60 @@ follows is the scope, and just as importantly what is deliberately *excluded*.
       varying parameters — but it has **no cellular/Worley/Voronoi** (§O1), **no vector noise for
       domain warping** (§O2), and **no reaction–diffusion** (§O6). Those three are exactly this
       bullet's vocabulary, so build them there and this becomes a binding exercise.
+
+---
+
+## P10 — Layered control: from "flee" down to "that foot, there, now"  `[ ]`
+*(added 2026-08-06. Do the *design* early — it constrains P1–P4's training — and the
+implementation alongside P4, since most of it is conditioning inputs.)*
+
+**The governing principle, and it is P4's lesson generalised.** P4 already says: condition the policy
+on the morphology vector *from the start*, because train-then-morph-then-finetune destroys the motion
+character. The same is true of **every control channel**. A gaze target, a style knob, a
+part-specific goal — each must be present as a conditioning input *during training*, randomised, or
+the finished policy will ignore it or fight it. This is one principle, not four features, and getting
+it wrong costs a retrain every time. **So the control interface must be designed before P2 trains
+anything expensive**, even though it's built later.
+
+### The layers
+
+| level | what you say | mechanism |
+|---|---|---|
+| 0 | "go there", "flee", "follow that" | path / intent planner above the policy |
+| 1 | speed, gait, heading, **wary / exhausted / injured / aggressive** | conditioning knobs |
+| 2 | *manner*, blended continuously | learned latent skill space |
+| 3 | "look at that while you keep trotting", "favour the left fore" | part-specific goals |
+| 4 | "plant the left forefoot **here** at t=1.2 s" | shot-specific hard constraint |
+
+- [ ] **Level 1 — the knobs.** design.md already guessed at these ("menace is probably a knob, not a
+      layer"); this is where that gets cashed out. Randomise them during P2/P3 training.
+- [ ] **Level 2 — latent skill space.** This is **ASE** (Peng et al. 2022), the direct successor to
+      the AMP already chosen in P2 — so the plan is already pointed at it and this is a smaller step
+      than it looks. Gives continuous blending between manners and is the natural drive target for
+      P9's human performance.
+- [ ] **Level 3 — part-specific goals, WITHOUT overriding actuators.** The failure mode to avoid:
+      a monolithic policy emits a whole-body action vector, so overriding the head leaves the rest of
+      the body acting on stale assumptions, and the creature falls. **Inject the request as a goal in
+      the observation + reward and let the policy satisfy it**, adapting the rest of the body itself.
+      The policy stays in charge, so it stays stable. (Residual-on-output and per-limb sub-policy
+      decomposition are the alternatives; both are more fragile. Try goal-injection first.)
+- [ ] **Level 4 — accept that this may not be a policy at all.** "Foot exactly there at exactly that
+      frame" is a hard constraint and a policy is a soft thing. Realistic answer is **hybrid**:
+      learned controller produces the base motion, then a physics-aware trajectory-optimisation pass
+      enforces the shot constraint offline. Write this down now so nobody burns a week trying to make
+      the policy hit an exact contact.
+- [ ] **A learned forward model** — state + motor command → predicted next sensory state. This is the
+      one place a small net genuinely belongs (see P1's proprioception items: the net is for
+      *predicting*, not for *sensing*, since sensing is exact in sim). It is what lets a controller
+      act through the delays added in P1, it is standard model-based-RL machinery, and its learned
+      representation is the substrate levels 0–2 operate on.
+
+**Why this section exists.** The user's framing was "simulate the kinesthetic sense so the creature is
+easy to control abstractly". The sensing half of that is free in simulation and needs no net; the
+*abstraction* half is real and is this section. Note also that capture data cannot supply the sensing
+half regardless — proprioception is unobservable from outside, and capture yields **kinematics, not
+activations** (recovering muscle forces from joint angles is the underdetermined muscle-redundancy
+problem, and needs an effort/fatigue criterion to resolve — OpenSim static optimisation / CMC).
 
 ---
 
