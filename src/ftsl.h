@@ -60,6 +60,7 @@
 #include <fstream>
 #include <sstream>
 #include <functional>
+#include <chrono>
 #include "scene.h"
 #include "camera.h"
 #include "spectrum.h"
@@ -598,6 +599,44 @@ struct AuthoredCurve {
     bool   closed = false;
 };
 
+// Optional per-phase cost of a scene load, for callers that re-load repeatedly (the
+// loom viewer re-derives and re-loads a whole .ftsl EVERY played frame, where this is
+// one of the two dominant terms). Off by default: pass nullptr and nothing is timed.
+//
+// The phases scale with different things, which is the point of separating them --
+// `parse` with source TEXT size, `assets` with the mesh files on disk and their
+// triangle counts, `build` with scene complexity. Ranking them by intuition has been
+// wrong repeatedly in this project; measure instead.
+struct LoadTiming {
+    double msParse  = 0.0;  // source text -> Block tree (ftsl_gpda::parse)
+    double msBuild  = 0.0;  // Block tree -> Scene, INCLUDING msAssets and msAccel below
+    double msAssets = 0.0;  // of msBuild: mesh files read+parsed from disk (obj/gltf/fbx)
+    double msAccel  = 0.0;  // of msBuild: BVH construction (per-asset Blas + Scene::build)
+};
+
+namespace detail {
+// Accumulate per-phase cost for the build currently in progress. thread_local so a
+// parallel loader cannot cross-contaminate; both reset at the top of each loadSource.
+inline thread_local double g_assetMs = 0.0;
+inline thread_local double g_accelMs = 0.0;
+
+// Adds its lifetime to a chosen accumulator. Wraps the mesh-file loader calls and the
+// BVH builds, so each phase is measured where the work actually happens rather than
+// estimated by subtraction -- a two-point subtraction fit is exactly how this project
+// previously "measured" a 274 ms scene re-upload that turned out to be 4 ms.
+struct PhaseTimer {
+    double* sink;
+    std::chrono::steady_clock::time_point t0;
+    explicit PhaseTimer(double* d) : sink(d), t0(std::chrono::steady_clock::now()) {}
+    ~PhaseTimer() {
+        *sink += std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - t0).count();
+    }
+};
+struct AssetTimer : PhaseTimer { AssetTimer() : PhaseTimer(&g_assetMs) {} };
+struct AccelTimer : PhaseTimer { AccelTimer() : PhaseTimer(&g_accelMs) {} };
+}
+
 struct Loaded {
     Scene scene;
     // All authored cameras, in file order. Phase 3a: any number of `camera` blocks
@@ -854,7 +893,7 @@ public:
         // build() finalizes tris/BVH and the emitter set (per-emitter samplers were
         // built in addLight; finalizeEmitters computes powers, the selection CDF,
         // and the combined backward wavelength sampler).
-        L.scene.build();
+        { detail::AccelTimer _ct; L.scene.build(); }
         // build() -> finalizeEmitters() has now adopted each emitter's emitPat from the
         // material on its geometry, so this is the first moment the SHAPE of every
         // emission pattern's emitter is known. Reject the shapes that cannot honour one.
@@ -4160,16 +4199,22 @@ private:
             // split into a separate statement by the parser (see wordListOf).
             std::vector<std::string> skipMats = wordListOf(b, "skip_material");
             std::string gerr;
-            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats) == 0
-                && !gerr.empty()) {
-                fail("mesh: " + gerr); return false;
+            {
+                detail::AssetTimer _at;
+                if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats) == 0
+                    && !gerr.empty()) {
+                    fail("mesh: " + gerr); return false;
+                }
             }
         } else if (ext == ".fbx") {
             // Autodesk FBX via the vendored ufbx bridge. `uv use_mesh` pulls the file's
             // first UV set; procedural UV projections and crease smoothing are OBJ-only.
             std::string ferr;
-            if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
-                fail("mesh: " + ferr); return false;
+            {
+                detail::AssetTimer _at;
+                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
+                    fail("mesh: " + ferr); return false;
+                }
             }
         } else {
             // `smooth [<deg>]` (OBJ only): when the mesh has no `vn`, auto-generate
@@ -4181,8 +4226,11 @@ private:
                 if (!sm->val.words.empty() && isNumber(sm->val.words[0]))
                     creaseAngleDeg = num(sm->val.words[0]);
             }
-            loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
-                    uvProj, uvAxis, creaseAngleDeg);
+            {
+                detail::AssetTimer _at;
+                loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
+                        uvProj, uvAxis, creaseAngleDeg);
+            }
         }
         // Record the object as a named mesh group (for -check-watertight): the range of
         // world triangles this block just appended. Unnamed blocks get a synthesized
@@ -4324,14 +4372,20 @@ private:
             bool importMats = (strOf(b, "import_materials") != "no");
             std::string gerr;
             std::vector<std::string> skipMats = wordListOf(b, "skip_material");  // see the mesh block
-            if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats) == 0
-                && !gerr.empty()) {
-                fail("mesh_asset: " + gerr); return false;
+            {
+                detail::AssetTimer _at;
+                if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats) == 0
+                    && !gerr.empty()) {
+                    fail("mesh_asset: " + gerr); return false;
+                }
             }
         } else if (ext == ".fbx") {
             std::string ferr;
-            if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
-                fail("mesh_asset: " + ferr); return false;
+            {
+                detail::AssetTimer _at;
+                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
+                    fail("mesh_asset: " + ferr); return false;
+                }
             }
         } else {
             double creaseAngleDeg = -1.0;
@@ -4340,14 +4394,17 @@ private:
                 if (!sm->val.words.empty() && isNumber(sm->val.words[0]))
                     creaseAngleDeg = num(sm->val.words[0]);
             }
-            loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
-                    UvProjection::None, 1, creaseAngleDeg);
+            {
+                detail::AssetTimer _at;
+                loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
+                        UvProjection::None, 1, creaseAngleDeg);
+            }
         }
         Blas blas;
         blas.tris.assign(L.scene.tris.begin() + start, L.scene.tris.end());
         L.scene.tris.resize(start);
         if (blas.tris.empty()) { fail("mesh_asset '" + b.name + "' loaded no triangles"); return false; }
-        blas.build();
+        { detail::AccelTimer _ct; blas.build(); }
         int blasId = (int)L.scene.blasList.size();
         L.scene.blasList.push_back(std::move(blas));
         blasIndex_[b.name] = blasId;
@@ -6808,7 +6865,8 @@ inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
 // `ftrace foo.glb` builds an auto-lit scene string and loads it through here).
 inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
                        Loaded& L, std::string& err,
-                       const SupportFn& supported = {}) {
+                       const SupportFn& supported = {},
+                       LoadTiming* timing = nullptr) {
     // Report the keys nothing in the loader read. A warning rather than an error:
     // the check is new, and an old scene carrying a stale property should still
     // render — but it must SAY so, because the alternative (today's behaviour) is
@@ -6818,9 +6876,42 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
             std::fprintf(stderr, "[ftsl] warning: %s: %s\n", nameForMsgs.c_str(), w.c_str());
     };
 
+    // Phase timing (opt-in). The accumulators are reset here rather than in the
+    // AssetTimer/AccelTimer so a `prefer` scene, which try-builds several candidate
+    // branches, reports the TOTAL work the load actually did -- which is the number
+    // that matters to a caller re-loading every frame.
+    using PhaseClock = std::chrono::steady_clock;
+    detail::g_assetMs = 0.0;
+    detail::g_accelMs = 0.0;
+    auto phaseT0 = PhaseClock::now();
+    auto phaseLap = [&phaseT0]() {
+        auto now = PhaseClock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - phaseT0).count();
+        phaseT0 = now;
+        return ms;
+    };
+    // Publish whatever phases completed, on every return path including failures.
+    // msBuild is measured in the destructor as "everything after the parse lap", so it
+    // covers all of the build paths below (fast path, single-node `prefer`, multi-node
+    // rebuild) without threading a lap call through each of their returns.
+    struct TimingPublish {
+        LoadTiming*                    t;
+        PhaseClock::time_point*        from;
+        ~TimingPublish() {
+            if (!t) return;
+            t->msAssets = detail::g_assetMs;
+            t->msAccel  = detail::g_accelMs;
+            t->msBuild  = std::chrono::duration<double, std::milli>(
+                              PhaseClock::now() - *from).count();
+        }
+    } _publish{timing, &phaseT0};
+    if (timing) *timing = LoadTiming{};
+
     // The shared grammar (src/gpda/ftsl_frontend.hpp) is the only front end.
     std::vector<Block> blocks;
-    if (!ftsl_gpda::parse(src, blocks, err)) return false;
+    bool parsedOk = ftsl_gpda::parse(src, blocks, err);
+    if (timing) timing->msParse = phaseLap();
+    if (!parsedOk) return false;
 
     // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
     std::vector<size_t> preferIdx;
@@ -6915,12 +7006,12 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
 }
 
 inline bool load(const std::string& path, Loaded& L, std::string& err,
-                 const SupportFn& supported = {}) {
+                 const SupportFn& supported = {}, LoadTiming* timing = nullptr) {
     std::ifstream f(path);
     if (!f) { err = "cannot open scene file: " + path; return false; }
     std::stringstream ss; ss << f.rdbuf();
     std::string src = ss.str();
-    return loadSource(src, path, L, err, supported);
+    return loadSource(src, path, L, err, supported, timing);
 }
 
 } // namespace ftsl

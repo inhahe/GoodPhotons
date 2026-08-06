@@ -717,6 +717,15 @@ struct LivePanel {
     double msAdoptGeom  = 0.0;  // curves/strips/fields/meshes collection
     double msAdoptDag   = 0.0;  // collectDag + layout carry-over
     double msAdoptSkins = 0.0;  // skins.release() + skins.build() (decode + D3D11 upload)
+    // ...and the same for msFtsl, now the largest term. `assets` and `accel` are nested
+    // inside `build`, so the residual (build - assets - accel) is the Builder's own work.
+    // The interesting question this answers: of the per-frame .ftsl round-trip, how much
+    // is text parsing (which a direct mesh handoff would delete outright) versus BVH
+    // construction (which it would NOT -- that has to happen for any new geometry).
+    double msFtslParse  = 0.0;  // source text -> Block tree (ftsl_gpda::parse)
+    double msFtslBuild  = 0.0;  // Block tree -> Scene, INCLUDING assets + accel below
+    double msFtslAssets = 0.0;  // of build: mesh files read+parsed from disk (obj/gltf/fbx)
+    double msFtslAccel  = 0.0;  // of build: BVH construction (per-asset Blas + Scene::build)
     // Set by the Render tab each UI frame it actually draws. Needed because the
     // Live panel is drawn BEFORE the Render pane, so zeroing msRender when a bake
     // lands would blank it every frame during play -- it would always read 0 and
@@ -3287,8 +3296,13 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                     if (!r.sourcePath.empty()) {
                         ftsl::Loaded nl;
                         std::string  nerr;
+                        ftsl::LoadTiming lt;
                         MsTimer _t(&live.msFtsl);
-                        if (ftsl::load(r.sourcePath, nl, nerr)) {
+                        if (ftsl::load(r.sourcePath, nl, nerr, {}, &lt)) {
+                            live.msFtslParse  = lt.msParse;
+                            live.msFtslBuild  = lt.msBuild;
+                            live.msFtslAssets = lt.msAssets;
+                            live.msFtslAccel  = lt.msAccel;
                             loaded  = std::move(nl);
                             sceneOk = true;
                             sceneErr.clear();
@@ -3527,6 +3541,15 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                                 "dag %.0f + skins %.0f\n",
                                 live.msSidecar, live.msAdoptJson, live.msAdoptGeom,
                                 live.msAdoptDag, live.msAdoptSkins);
+                }
+                // ...and the .ftsl reload. `rest` is the Builder's own work with the two
+                // nested phases (asset file loading, BVH build) taken back out.
+                if (live.msFtsl > 0.0) {
+                    std::printf("[play]        ftsl %.0f = parse %.0f + assets %.0f + "
+                                "accel %.0f + rest %.0f\n",
+                                live.msFtsl, live.msFtslParse, live.msFtslAssets,
+                                live.msFtslAccel,
+                                live.msFtslBuild - live.msFtslAssets - live.msFtslAccel);
                 }
                 std::fflush(stdout);
             }
