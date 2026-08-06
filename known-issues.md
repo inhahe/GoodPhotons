@@ -123,6 +123,28 @@ with pixels and is the *only* SM-bound phase (hence the only one a foreign GPU p
 `readback` is pixels and mostly CPU. Read `upload` against `bake + sidecar + ftsl` to decide whether
 a resident GPU scene is worth building **for the scene actually in front of you**.
 
+### OPEN (2026-08-06, v0.142.0): `ftrace -stop` cannot see or stop the VIEWER — the one CUDA-using process with no clean CLI shutdown
+
+**Symptom.** `ftrace -stop` (bare) lists live renders and finds nothing while a `-viewer` process is
+running and driving CUDA through the Render pane. `ftrace -stop <viewer-pid>` likewise does nothing.
+The only ways to stop a viewer are closing its window by hand or `taskkill /F` — and CLAUDE.md
+forbids the latter precisely because force-killing a process with CUDA kernels in flight is a known
+route to an NVIDIA TDR/bugcheck. So the *one* long-lived process the project has no clean stop for is
+also one that holds a CUDA context.
+
+**Where.** `src/main.cpp:10874` — the `-viewer` branch does `return runViewerGui(...)` and
+short-circuits the renderer. `stopChannelStart()` is only called at `main.cpp:10909`, 35 lines
+further down the render path, so a viewer never publishes its `<temp>/ftrace/<pid>.run` file and
+never starts the watcher thread that polls for `<pid>.stop`. Nothing about the stop channel is
+render-specific — it is a pid-keyed sentinel file plus a 250 ms polling thread, entirely independent
+of what the process is doing.
+
+**Proper fix.** Call `stopChannelStart("viewer -> " + sidecar)` before `runViewerGui` and
+`stopChannelEnd()` after it, and give the viewer's frame loop a `g_stopRequested` poll that breaks
+out to the same orderly teardown the window-close path already takes. The one-shot semantics and
+the 120 s wait in `-stop` need no change. Worth doing together with the `.run` label, so
+`ftrace -stop` bare-lists the viewer as a viewer rather than as a render.
+
 ### PERF / LATENT (2026-08-06, v0.141.0): the preview re-marshals every texel of every texture, every frame — ~50 MB/frame for one 2048² skin
 
 **Where.** `renderIsoPreviewCuda`, `src/render_cuda.cu` ~12740: the `hTexels` loop flattens *all*
