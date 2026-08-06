@@ -212,6 +212,22 @@ left/right torque symmetry (an asymmetric rig teaches an asymmetric gait), wheth
 foot actually reaches the ground in the reference pose, and steps-per-oscillation against
 the creature's own declared integrator.
 
+`tests/test_rig.py` is the regression suite, and it is deliberately biased towards the
+failures that **do not raise**. Every serious bug found while building this layer returned
+a plausible number rather than an error: feet seated 3.6 cm above the floor reported every
+joint torque as `0.00` (free fall needs no internal force), a body flipped 170° reported
+`+10 deg pitch`, an underdetermined statics solve had a foot pulling downwards, and a
+disabled-contact self-check passed vacuously because the quantity it compared was exactly
+zero on both sides. A test suite that only asserts "it didn't throw" would have caught none
+of them, so the assertions are on measured physical quantities with known-correct values —
+foot levelness, ground-reaction balance and sign, sag as a fraction of withers held across
+a 32× mass range, tilt over the full [0°, 180°] range.
+
+`validate.trunk_tilt` is a named function rather than a line inside `stand_test` because P1
+needs the same measure: "has the creature fallen over" is the termination condition of every
+locomotion episode, and if it differs from the acceptance test's notion a policy can learn
+to satisfy one and not the other.
+
 ### Textures: non-stationarity, not randomness
 
 Procedural noise (Perlin/Worley/fBm) is **stationary** — statistically identical

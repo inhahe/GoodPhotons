@@ -59,6 +59,8 @@ The creature layer is a *generator*; it never becomes part of a runtime.
       current morph vector actually produced, then closed-loop corrected against the
       settled pose. See design.md → "Passive tone: declare the goal, measure the gains".
 - [x] `creaturelab/validate.py` — the acceptance bar: motors off, 3 s of gravity.
+- [x] `tests/test_rig.py` — 27 regression tests, biased towards the silent failures (see
+      design.md → "Validation"). `python -m pytest tests/ -q`, ~7 s.
 - [x] **Validation:** MuJoCo loads it, it stands under gravity, and sweeping a morph
       param regenerates a *different but still valid* body with no hand-editing.
       - `rig_report.py` — stands across `body_scale` 0.6 → 1.7 (sag 6.9% → 5.2% of
@@ -189,8 +191,9 @@ the controller nearly nothing.
 
 ## Cross-cutting
 
-- [ ] `design.md` kept current (it is the architecture record)
-- [ ] `known-issues.md` for bugs/tech debt
+- [x] `design.md` kept current (it is the architecture record) — ongoing, not a milestone
+- [x] `known-issues.md` for bugs/tech debt — 3 open, 6 resolved
+- [x] Version control: `git init`ed at the close of P0; `out/`, `runs/`, `*.pt` ignored
 - [ ] Determinism: seed everything; training runs must be re-runnable
 - [ ] Literature sweep before assuming any link is unclaimed — this field moves fast and
       video→animal-motion is actively worked on
