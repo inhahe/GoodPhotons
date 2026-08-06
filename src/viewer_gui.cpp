@@ -706,6 +706,17 @@ struct LivePanel {
     double msRenderUpload = 0.0;  // marshal the WHOLE scene + H2D (scene size; CPU+DMA)
     double msRenderKernel = 0.0;  // the raymarch itself           (pixels; SM-bound)
     double msRenderRead   = 0.0;  // D2H + host tone map           (pixels; mostly CPU)
+    // ...and the same treatment for msSidecar, which the n=50 profile showed is the
+    // single biggest term in a played frame (90.5 of 215 ms). Same rule as above: it
+    // is a sum of four unrelated costs -- a JSON parse that scales with sidecar bytes,
+    // geometry collection that scales with tessellation, a DAG rebuild that scales with
+    // node count, and a GPU skin rebuild that scales with TEXELS and is pure waste when
+    // the texture set has not changed. Ranking those by intuition is exactly the error
+    // that produced three wrong diagnoses here, so they are measured separately.
+    double msAdoptJson  = 0.0;  // Sidecar::load  -- minijson parse of the whole file
+    double msAdoptGeom  = 0.0;  // curves/strips/fields/meshes collection
+    double msAdoptDag   = 0.0;  // collectDag + layout carry-over
+    double msAdoptSkins = 0.0;  // skins.release() + skins.build() (decode + D3D11 upload)
     // Set by the Render tab each UI frame it actually draws. Needed because the
     // Live panel is drawn BEFORE the Render pane, so zeroing msRender when a bake
     // lands would blank it every frame during play -- it would always read 0 and
@@ -721,11 +732,16 @@ struct MsTimer {
     explicit MsTimer(double* d) : sink(d) {
         LARGE_INTEGER q; QueryPerformanceCounter(&q); t0 = q.QuadPart;
     }
-    ~MsTimer() {
+    // Close the interval early and detach, for a phase whose end does not line up with
+    // a scope (e.g. a block that declares locals the next phase must still see). Safe
+    // to call more than once; the destructor then does nothing.
+    void stop() {
         LARGE_INTEGER q, f;
         QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
         if (sink && f.QuadPart) *sink = 1000.0 * double(q.QuadPart - t0) / double(f.QuadPart);
+        sink = nullptr;
     }
+    ~MsTimer() { if (sink) stop(); }
 };
 
 // Step the clock one frame in the current play direction, honouring loop/ping-pong.
@@ -3178,19 +3194,26 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
     // default on every bake would be unusable.
     auto adoptSidecar = [&](const std::string& path) -> bool {
         Sidecar ns;
-        if (!ns.load(path)) { live.lastErr = "sidecar: " + ns.err; return false; }
+        {
+            MsTimer _t(&live.msAdoptJson);
+            if (!ns.load(path)) { live.lastErr = "sidecar: " + ns.err; return false; }
+        }
         std::vector<int> oldIds;
         for (const auto& n : dag.nodes) oldIds.push_back(n.id);
 
         sc = std::move(ns);
-        curves = collectCurves(sc);
-        strips = buildStrips(curves);
-        fields = collectFields(sc);
-        meshes = collectMeshes(sc);
-        ++mview.geomGen;   // a NEW tessellation -> the mesh pane must re-upload its buffers
-        for (const auto& c : curves) view.maxDim  = std::max(view.maxDim,  c.dim);
-        for (const auto& f : fields) fview.maxDim = std::max(fview.maxDim, f.dim);
+        {
+            MsTimer _t(&live.msAdoptGeom);
+            curves = collectCurves(sc);
+            strips = buildStrips(curves);
+            fields = collectFields(sc);
+            meshes = collectMeshes(sc);
+            ++mview.geomGen;   // a NEW tessellation -> the mesh pane must re-upload its buffers
+            for (const auto& c : curves) view.maxDim  = std::max(view.maxDim,  c.dim);
+            for (const auto& f : fields) fview.maxDim = std::max(fview.maxDim, f.dim);
+        }
 
+        MsTimer _tdag(&live.msAdoptDag);
         DagGraph nd = collectDag(sc);
         std::vector<int> newIds;
         for (const auto& n : nd.nodes) newIds.push_back(n.id);
@@ -3212,9 +3235,13 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
         }
         nd.maximized = dag.maximized;
         dag = std::move(nd);
+        _tdag.stop();
 
-        skins.release();
-        skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
+        {
+            MsTimer _t(&live.msAdoptSkins);
+            skins.release();
+            skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
+        }
         return true;
     };
 
@@ -3493,6 +3520,13 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                                 "kernel %.0f (pixels) + readback %.0f\n",
                                 live.msRender, live.msRenderUpload,
                                 live.msRenderKernel, live.msRenderRead);
+                }
+                // ...and sidecar adoption, the biggest term of all, on the same terms.
+                if (live.msSidecar > 0.0) {
+                    std::printf("[play]        sidecar %.0f = json %.0f + geom %.0f + "
+                                "dag %.0f + skins %.0f\n",
+                                live.msSidecar, live.msAdoptJson, live.msAdoptGeom,
+                                live.msAdoptDag, live.msAdoptSkins);
                 }
                 std::fflush(stdout);
             }
