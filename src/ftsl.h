@@ -4216,6 +4216,27 @@ private:
                     fail("mesh: " + ferr); return false;
                 }
             }
+        } else if (ext == ".ftmesh") {
+            // Binary indexed mesh (see the format note in mesh.h). Accepts the same
+            // `smooth` / `uv` statements as the OBJ path and runs the identical
+            // finishing passes, so a generator can switch a mesh from .obj to .ftmesh
+            // without changing how the scene shades — only how fast it loads. A
+            // .ftmesh that carries its own normals skips smoothing, exactly as an OBJ
+            // with `vn` does.
+            double creaseAngleDeg = -1.0;
+            if (const Stmt* sm = find(b, "smooth")) {
+                creaseAngleDeg = 40.0;
+                if (!sm->val.words.empty() && isNumber(sm->val.words[0]))
+                    creaseAngleDeg = num(sm->val.words[0]);
+            }
+            std::string merr;
+            {
+                detail::AssetTimer _at;
+                if (loadFtmesh(L.scene, file.c_str(), id, xf, loadUV, merr,
+                               uvProj, uvAxis, creaseAngleDeg) == 0 && !merr.empty()) {
+                    fail("mesh: " + merr); return false;
+                }
+            }
         } else {
             // `smooth [<deg>]` (OBJ only): when the mesh has no `vn`, auto-generate
             // smooth shading normals, merging faces across edges softer than <deg>
@@ -4385,6 +4406,21 @@ private:
                 detail::AssetTimer _at;
                 if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr) == 0 && !ferr.empty()) {
                     fail("mesh_asset: " + ferr); return false;
+                }
+            }
+        } else if (ext == ".ftmesh") {
+            double creaseAngleDeg = -1.0;                 // see the mesh block
+            if (const Stmt* sm = find(b, "smooth")) {
+                creaseAngleDeg = 40.0;
+                if (!sm->val.words.empty() && isNumber(sm->val.words[0]))
+                    creaseAngleDeg = num(sm->val.words[0]);
+            }
+            std::string merr;
+            {
+                detail::AssetTimer _at;
+                if (loadFtmesh(L.scene, file.c_str(), id, xf, loadUV, merr,
+                               UvProjection::None, 1, creaseAngleDeg) == 0 && !merr.empty()) {
+                    fail("mesh_asset: " + merr); return false;
                 }
             }
         } else {

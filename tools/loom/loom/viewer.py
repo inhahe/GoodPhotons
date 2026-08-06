@@ -756,7 +756,14 @@ class ViewerSession:
         clk = clock if clock is not None else Clock.at_frame(0, 1)
         out = msg.get("out")
         assets = os.path.dirname(os.path.abspath(out)) if out else None
-        text = scene.emit(clk, Cache(), assets_dir=assets)
+        # Binary meshes on the live channel. Nothing ever reads these files but the
+        # ftrace that asked for them, milliseconds later, on this machine — so the OBJ
+        # text round trip (format here, parse there, every frame, for geometry that is
+        # floats on both ends) buys nothing and costs several ms. `mesh_format`
+        # defaults to "obj" everywhere else, where a portable artifact IS the point;
+        # a caller can still ask for text here by sending `mesh_format: "obj"`.
+        fmt = msg.get("mesh_format") or "ftmesh"
+        text = scene.emit(clk, Cache(), assets_dir=assets, mesh_format=fmt)
         if out:
             _atomic_write_text(out, text)
             return {"ok": True, "out": out}

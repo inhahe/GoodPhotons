@@ -822,8 +822,7 @@ class SweptMesh(Element):
             twists.append(base_tw + turns * 2.0 * math.pi * u)
         rings = _sweep.sweep_rings(pts, self.profile, scales, twists, self.closed_spine)
         verts, faces = _sweep.skin_rings(rings, self.closed_spine, self.closed_profile)
-        path = ctx.asset_path(self.name, "obj")
-        _sweep.write_obj(path, verts, faces)
+        path = ctx.write_mesh(self.name, verts, faces)
         return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '
                 f'material "{self.material}" }}')
 
@@ -882,8 +881,7 @@ class IsoMesh(Element):
                 adaptive=self.adaptive, coarse=self.coarse)
             if self._static():
                 self._cache_static = (verts, faces)
-        path = ctx.asset_path(self.name, "obj")
-        _sweep.write_obj(path, verts, faces)
+        path = ctx.write_mesh(self.name, verts, faces)
         return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '
                 f'material "{self.material}" }}')
 
@@ -1379,8 +1377,16 @@ class Scene:
                 detect_signal_cycle(r)
 
     def emit(self, clock: Clock, cache: Optional[Cache] = None, *,
-             assets_dir: Optional["Path"] = None, tag: str = "") -> str:
-        ctx = EmitCtx(clock=clock, cache=cache, assets_dir=assets_dir, tag=tag)
+             assets_dir: Optional["Path"] = None, tag: str = "",
+             mesh_format: str = "obj") -> str:
+        """Serialise the scene to ftsl source at ``clock``.
+
+        ``mesh_format`` selects how file-backed meshes are written — ``"obj"`` for a
+        portable, readable artifact, ``"ftmesh"`` for the binary format the live
+        viewer channel uses.  See :class:`~loom.ftsl_emit.EmitCtx`.
+        """
+        ctx = EmitCtx(clock=clock, cache=cache, assets_dir=assets_dir, tag=tag,
+                      mesh_format=mesh_format)
         lo, hi, step = self.spectral
         header = f"scene {{ units {self.units}  spectral {fmt(lo)} {fmt(hi)} {fmt(step)} }}"
         blocks = [header, ""]

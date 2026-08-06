@@ -2194,10 +2194,42 @@ replacement for the renderer or the primary editing tool.**
         `3f3cac21a3d39a3e435995bf9c28102c`). Tool: `tools/ftslbench.cpp`, which reports **min** and
         mean per rep — quote the min, because background load can only make a sample slower.
         In-viewer number still owed: the machine was at ~90 % (a backup job) when this landed.
-      - Still ahead, in order: **loom's own `bake`** (~62 ms, the Python side), the **lexer**
-        (~2 µs/token, regex-based) and the remaining graph walk (~3.5 µs/token) — and above all the
-        thing originally asked for, a **direct mesh handoff** that deletes the per-frame text
-        round-trip rather than making it faster.
+      - **THIRD SPEEDUP (v0.147.0): the direct mesh handoff — and the wall behind it.** This is the
+        thing originally asked for. Built in two halves, because measuring first said the obvious
+        half was the smaller one.
+        - **Half 1, crease smoothing (the part a binary format cannot delete).** `meshbench` timed
+          `loadObj` with `creaseAngleDeg = -1` vs `40` and found *smoothing*, not text parsing, was
+          the larger half everywhere and got worse with size: 54 % / 58 % / **66 %** of the load at
+          1.5 k / 4.3 k / 32 k triangles. Cause: the inner loop *searched* for which corner a
+          welded id meant, so a vertex of degree *d* paid O(*d*²) `acos`. Corner ids in a CSR
+          incidence list + a precomputed `ang[]` table + a hashed weld map: **2.6–3.8×**, and
+          bit-identical over 188 of the 189 `.obj` in the tree — the 189th differs because the
+          rewrite fixes a real double-counting bug on sliver triangles.
+        - **Half 2, the `.ftmesh` format.** 24-byte header + f32 positions/normals/UVs + u32
+          indices, little-endian, every section sized by the header so truncation is detectable.
+          Written by `loom.ftmesh`, read by `loadFtmesh`, dispatched on the extension at both
+          `.ftsl` sites; both loaders end in the same `meshFinishTris`, so smoothing cannot diverge
+          by construction. f32 is a *fidelity gain* over the `%.6g` text it replaces (6 digits vs
+          ~7.2) — `meshbench --compare` measures worst displacement 1.7e-08 × the bbox diagonal.
+          Load **2.4× overall, 6.5× on read+decode**, at 0.52–0.56× the file size.
+        - **In the viewer, n=130 on an idle card: 138.9 → 129.6 ms, 7.20 → 7.72 fps**, with
+          `assets 14 → 9` and `loadObj` replaced by `loadFtmesh` in the trace. **That is far less
+          than the bench predicted, and the gap is the real finding**: splitting `open()` from
+          `read()` shows a **flat ~8 ms charged before the first byte** on any freshly written file
+          over ~32 KB — Windows Defender's on-access scan, verdict cached per content (2nd open of
+          the same file: 0.066 ms). So `assets 9` is ~8 ms of antivirus and ~1 ms of mesh, and the
+          903 KB sidecar pays the same toll again. **~17 ms/frame (13 %) is AV opening files this
+          process's own child just wrote** — more than the GPU kernel. `scraps/freshread.py`
+          reproduces it. Full write-up in `known-issues.md`.
+      - **Next, and it is now the top item: get geometry out of the filesystem entirely.** loom and
+        ftrace already hold a stdio pipe open (`LoomBridge` ↔ `python -m loom.viewer`); the
+        `.ftmesh` bytes and the sidecar should ride **in that channel** (length-prefixed binary
+        frames, or shared memory) instead of via `%TEMP%`. `.ftmesh` is already the right wire
+        format — it just needs a transport that no on-access scanner watches. Worth ~17 ms of scan
+        plus ~1.3 ms of temp-file + `os.replace` on the writing side.
+      - Then, in order: **loom's own `bake`** (~37 ms, the Python side), the remaining **minijson**
+        parse (~13 ms of the sidecar), the **lexer** (~2 µs/token, regex-based) and the remaining
+        graph walk (~3.5 µs/token).
       - Shipped alongside: a **`play res`** draft resolution used only while playing (1.4 → 1.8 fps,
         ~25%) and a **`-play`** CLI flag that opens with the transport already running — the latter
         because driving an ImGui window with synthetic input to measure it is unreliable (ImGui

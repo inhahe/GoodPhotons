@@ -38,14 +38,28 @@ class EmitCtx:
     """Context for one frame's emission.
 
     ``assets_dir`` is where file-backed elements (e.g. a swept mesh) write their
-    OBJ; ``tag`` disambiguates per-frame filenames.  When ``assets_dir`` is None
+    mesh; ``tag`` disambiguates per-frame filenames.  When ``assets_dir`` is None
     (a stdout preview), file-backed elements fall back to a temp dir.
+
+    ``mesh_format`` picks how those meshes are serialised:
+
+    ``"obj"`` (the default)
+        Wavefront OBJ text.  Portable and human-readable, so a ``.ftsl`` you keep,
+        share or open in another tool has meshes anyone can read.
+
+    ``"ftmesh"``
+        The binary :mod:`loom.ftmesh` format.  Skips a float->decimal format here
+        and a decimal->float parse in ftrace, which is why the **live viewer
+        channel** uses it: it re-emits every frame and nothing ever reads those
+        files but ftrace, microseconds later, on the same machine.  Slightly *more*
+        precise than the OBJ path, which formats at ``%.6g``.
     """
 
     clock: Clock
     cache: Optional[Cache] = None
     assets_dir: Optional[Path] = None
     tag: str = ""
+    mesh_format: str = "obj"
 
     def asset_path(self, name: str, ext: str) -> Path:
         import tempfile
@@ -53,6 +67,25 @@ class EmitCtx:
         d = Path(d)
         d.mkdir(parents=True, exist_ok=True)
         return d / f"{name}{self.tag}.{ext}"
+
+    def write_mesh(self, name: str, verts, faces) -> Path:
+        """Write one indexed mesh in this context's format; return its path.
+
+        Every file-backed mesh element goes through here, so the format choice is
+        made in exactly one place and the two element types cannot drift apart.
+        """
+        if self.mesh_format == "ftmesh":
+            from .ftmesh import write_ftmesh
+            path = self.asset_path(name, "ftmesh")
+            write_ftmesh(path, verts, faces)
+        elif self.mesh_format == "obj":
+            from .sweep import write_obj
+            path = self.asset_path(name, "obj")
+            write_obj(path, verts, faces)
+        else:
+            raise ValueError(
+                f"EmitCtx.mesh_format must be 'obj' or 'ftmesh', got {self.mesh_format!r}")
+        return path
 
 
 def num(x: Union[Signal, Number], clock: Clock, cache: Optional[Cache] = None) -> float:

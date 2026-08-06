@@ -1808,7 +1808,7 @@ first.
 ## Geometry
 
 `sphere`, `quad` (parallelogram), `triangle`, and `mesh` (**OBJ, glTF 2.0 / GLB,
-and Autodesk FBX** import — the loader dispatches on file extension). glTF brings
+Autodesk FBX, and `.ftmesh`** import — the loader dispatches on file extension). glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
 roughness → lobe width; `import_materials no` forces the FTSL `material` instead).
@@ -1843,6 +1843,17 @@ softened (Chiang et al. 2019) so low-poly smooth meshes show a smooth shadow gra
 instead of hard facet slivers — applied uniformly to every mode including `R`. Flat
 meshes are unaffected — both the correction and the softening are exactly a no-op when
 the shading and geometric normals coincide.)
+**`.ftmesh`** is ftrace's own compact binary mesh: a 24-byte header followed by
+little-endian `f32` positions (plus optional normals and UVs) and `u32` triangle
+indices. It exists for the **loom live viewer**, which re-derives and reloads a mesh
+on every frame — parsing that as text was the single largest asset cost, and a binary
+blob loads ~2.4× faster overall (~6.5× on read+decode alone) at about half the file
+size. It is also *more* precise than the OBJ text it replaces, which went through
+`%.6g` (6 significant digits, against `f32`'s ~7.2). Write one from Python with
+`loom.ftmesh.write_ftmesh(path, verts, faces)`, or have any loom scene emit them by
+passing `mesh_format="ftmesh"` to `Scene.emit` (the live viewer channel already
+defaults to it). `mesh { smooth … }`, `uv …`, transforms and materials all behave
+identically to the OBJ path — both formats share the same normal-synthesis code.
 Meshes without their own `vt` coordinates can be textured via a procedural
 projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
 at load time from the mesh's world-space bounding box (the optional token is the

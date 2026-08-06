@@ -206,6 +206,44 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `edgeRow`/`edgeAt` below. Fixed 0.116.0; measurement in `known-issues.md`.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
+  **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds
+  vertices by quantized position, then gives each corner an angle-weighted average
+  (Thürmer & Wüthrich) of the incident face normals, skipping any face across a
+  crease sharper than `creaseAngleDeg`. Three details are load-bearing for speed
+  (0.147.0 — it was ~2/3 of the whole cost of loading a mesh, and the live loom
+  viewer reloads a mesh every frame): the weld map is **hashed, not ordered** (welded
+  ids are opaque slots and both containers assign them in first-seen order, so the
+  result is unchanged); the vertex→incident-corner index is **CSR**, one flat array
+  plus offsets, rather than one `std::vector` per vertex; and each corner's interior
+  angle is **precomputed once** into `ang[tri*3+c]` instead of being recomputed from
+  the innermost loop, which made a vertex of degree *d* pay O(*d*²) `acos` calls per
+  fan. Storing the corner index (not just the triangle) in the CSR is also what makes
+  the angle a lookup — and fixed a latent bug in passing: a sliver triangle whose two
+  corners weld to the *same* vertex used to contribute its first corner's angle twice
+  rather than each corner's own. Measured 2.6–3.8× on the smoothing pass, bit-identical
+  on 188 of the 189 `.obj` files in the tree (the 189th is the sliver fix).
+  **`.ftmesh` — the binary mesh handoff** (0.147.0, `loadFtmesh`). Written by
+  `loom.ftmesh` (`tools/loom/loom/ftmesh.py`), read here, and dispatched on the file
+  extension at both `.ftsl` sites (`mesh` and `mesh_asset`), so a scene swaps formats
+  by changing one filename and nothing else. Layout — 24-byte header
+  (`"FTMESH\0\0"`, u32 version = 1, u32 flags, u32 nverts, u32 ntris), then f32
+  positions, then optional f32 normals, then optional f32 UVs, then u32 indices; all
+  little-endian, `HAS_NORMALS = 1`, `HAS_UVS = 2`. Every section's size is implied by
+  the header, so a **truncated file is detectable** rather than being read as geometry
+  made of whatever followed — which matters because the live viewer channel re-emits
+  while ftrace may still be opening the previous frame's file. Out-of-range indices
+  roll the partial load back (`s.tris.resize(triStart)`) and return 0 with `err` set.
+  Both loaders then call the same `meshFinishTris`, so **crease smoothing cannot
+  diverge between the two formats by construction**; only header/layout/index handling
+  is format-specific, which is exactly what `tools/loom/tests/test_ftmesh.py` and
+  `meshbench --compare` check. f32 storage is a *fidelity gain*, not a loss: the OBJ
+  text it replaces went through `%.6g`, i.e. 6 significant decimal digits against
+  f32's ~7.2 — measured worst vertex displacement 1.7e-08 × the mesh bbox diagonal and
+  worst shading-normal tilt 0.0002–0.011°. Load is 2.4× faster end-to-end and 6.5×
+  on read+decode alone, at 0.52–0.56× the file size. **What it did not fix** is the
+  cost of the file itself: on this machine opening any freshly-written file larger
+  than ~32 KB costs a flat ~8 ms before a byte is read (Defender), which is now ~90 %
+  of the viewer's per-frame `assets` term — see `known-issues.md`.
 - **`implicit.h` / `isomesh.h`** — implicit/isosurface evaluation and marching-cubes
   tessellation. `marchImplicit` is staged **fill → discover → resolve → wind**:
   parallel lattice `val[]` fill and parallel per-vertex bisection refine + gradient

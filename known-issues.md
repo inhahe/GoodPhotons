@@ -5,6 +5,123 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### PERF — OPEN (found 2026-08-06, v0.147.0): the live viewer pays ~17 ms/frame to Windows Defender for opening files it wrote itself
+
+**This is the finding that came out of building the binary mesh handoff, and it is bigger than
+the handoff was.** The `.ftmesh` format did exactly what it was designed to do — the *decode* of
+the per-frame mesh went from ~6 ms to ~1 ms — and the viewer's `assets` term still only fell
+`14 -> 9 ms`, because ~8 ms of it was never decoding at all.
+
+**Symptom.** `meshbench` loads a 4320-triangle `.ftmesh` (read + decode + crease-smooth) in
+**1.43 ms**. The live viewer's `[play] ftsl 31 = parse 16 + assets 9 + accel 2 + rest 1` reports
+**9 ms** for that one `loadFtmesh` call and nothing else. 6x apart, on the same bytes, on the same
+machine. The difference is that meshbench re-reads *the same file* 40 times while the viewer opens
+a **freshly written** one every frame.
+
+**Root cause — measured, not guessed** (`scraps/freshread.py`). Splitting `open()` from `read()`
+on a 76 KB file that another process just wrote:
+
+```
+open()   median 8.031 ms   min 6.153      <-- before a single byte is read
+read()   median 0.081 ms   min 0.067
+```
+
+Three probes identify it as Defender's real-time scan, not the filesystem:
+
+- **The verdict is cached per content.** 1st open after a write: 8.24 ms. 2nd open of the same
+  file: **0.066 ms**. 125x — that is a scanner memoizing a clean verdict, not a cold page cache.
+- **It is about new *content*, not `os.replace`.** Writing to a brand-new filename with no
+  replace at all costs the same 7.67 ms.
+- **It has a size threshold, not a throughput.** 1 KB -> 1.2 ms, 8 KB -> 1.1 ms, then 32 KB
+  through 1024 KB all sit flat at **8.5–9.9 ms**. A copy or a hash would scale with size; this
+  does not. `Get-MpComputerStatus` confirms `RealTimeProtectionEnabled : True`.
+
+(A fourth symptom had already been papered over without being understood: `atomicio.py` retries
+`os.replace` past `ERROR_SHARING_VIOLATION`. Re-running the probe without that retry raises
+`PermissionError: [WinError 5]` within ~40 iterations — the scanner still holding the destination.)
+
+**Scope — it is not just the mesh.** Every file loom hands ftrace per frame pays this once, if
+it clears ~32 KB:
+
+```
+              size      of which is the first-open gate
+  sidecar    903 KB     ~9 ms of `sidecar 22 = json 21`   (~13 ms is the actual minijson parse)
+  .ftmesh     76 KB     ~8 ms of `assets 9`               (~1 ms is the actual load)
+  .ftsl      7.8 KB     ~0 ms  (under the threshold)
+```
+
+So roughly **17 ms of the 129.6 ms frame — 13 % — is antivirus opening files this process's own
+child just created.** That is more than the entire GPU raymarch kernel (6 ms), and comparable to
+what either of the last two optimizations recovered.
+
+**Why this is a real bug and not a machine-config note.** The obvious "fix" — exclude
+`%TEMP%\ftrace_viewer_*` in Defender — needs admin, is per-machine, silently doesn't apply to
+anyone else, and weakens the user's AV to work around a design choice that was ours. **The design
+choice is the bug: the live channel round-trips geometry through the filesystem when the two
+processes already have a pipe open between them.**
+
+**Proper fix.** Stop writing per-frame files. loom and ftrace already speak newline-delimited
+JSON over stdio (`LoomBridge` <-> `python -m loom.viewer`); the mesh and the sidecar should travel
+**in that channel** — length-prefixed binary frames alongside the JSON, or a shared-memory
+mapping — so nothing per-frame ever hits a path an on-access scanner watches. `.ftmesh` is
+already the right wire format for that; it just needs a transport that is not a file. Expected to
+recover the full ~17 ms plus the ~1.3 ms/frame the writer spends on temp-file + `os.replace`.
+Tracked as the next step of TODO §F8(b).
+
+### PERF — FIXED (2026-08-06, v0.147.0): crease smoothing was quadratic in vertex degree, and was 2/3 of the cost of loading a mesh
+
+**Symptom.** Splitting the live viewer's `ftsl 35 = parse 16 + assets 14 + accel 2` further,
+`tools/meshbench.cpp` timed `loadObj` twice per rep — once with `creaseAngleDeg = -1` (read +
+text parse only) and once with `40` — and found the *smoothing*, not the text parsing, was the
+larger half everywhere, and got relatively worse with mesh size:
+
+```
+                          read+parse   + crease smooth   smoothing is
+orbit.obj        1.5k tri   0.97 ms        1.13 ms          54 %
+morphing_sweep   4.3k tri   2.30 ms        3.17 ms          58 %
+gyroid_ball     32.2k tri  16.44 ms       31.51 ms          66 %
+```
+
+This mattered because it is the half a binary mesh format **cannot** delete: however new
+geometry reaches the renderer, it still arrives without normals and still has to be smoothed.
+
+**Root cause.** The inner loop asked for a corner's interior angle by calling
+`cornerAngle(tri, weldedVid)`, which *searched* `weld[vi[0..2]] == weldedVid` to discover which
+corner it meant and then did two `sqrt`s and an `acos`. It was called once per **incident pair**,
+so a vertex of degree *d* paid O(*d*²) `acos` calls per fan rather than O(*d*) — ~78 k `acos` for a
+4.3 k-triangle mesh where 13 k would do. Two smaller costs rode along: a `std::map` weld (a
+red-black tree, pointer-chased, for what only needs exact-equality lookup) and a
+`std::vector<std::vector<int>>` incidence list (one heap allocation per welded vertex).
+
+**Fix** (`src/mesh.h`). Store the **corner id** `tri*3+c` in the incidence list instead of just
+`tri`, which makes the angle a direct lookup into an `ang[]` table computed once (3·nt entries);
+flatten the incidence list to **CSR** (counts → prefix sum → fill, which preserves the old
+ascending-triangle traversal order exactly); and swap the weld `std::map` for an
+`unordered_map` with an FNV hash of the quantized key (welded ids are opaque slots, and both
+containers assign them in first-seen order, so nothing downstream can tell).
+
+**Measured** (min of 30 reps, `tools/meshbench.exe`) — on the smoothing pass alone:
+
+```
+orbit.obj         1.13 -> 0.30 ms   3.8x
+morphing_sweep    3.17 -> 1.22 ms   2.6x
+gyroid_ball      31.51 -> 8.68 ms   3.6x
+```
+
+**Verification, and a bug it turned up.** Every `.obj` in the tree (189 files, up to 4.0 M
+triangles) was loaded with `smooth` under both builds and fingerprinted with FNV-1a over each
+triangle's positions, normals and UVs. **188 of 189 are bit-identical.** The one that differs,
+`meshes/klein_hunyuan.obj`, differs because the rewrite *fixed* a latent bug: 108 of its 634 280
+triangles are slivers with two corners closer together than the weld epsilon (2.6e-6), so those
+two corners weld to the same vertex. Such a triangle appears twice in that vertex's incidence
+list, and the old search-for-the-first-match returned **corner 0 both times** — double-counting
+one angle instead of summing the two angles at which the face actually touches the vertex. The
+new code carries the corner index, so each contributes its own. `scraps/degen_probe.py`
+reproduces the census. No other mesh in the tree has a collapsing corner.
+
+**Note the reporting is again the *minimum* of N reps**, for the reason recorded in the entry
+below: background load can only make a single-threaded sample slower.
+
 ### PERF — FIXED (2026-08-06, v0.146.0): the GPDA graph walk spent ~45 % of its time on whitespace tokens it then threw away
 
 **Symptom.** The per-frame `.ftsl` reload split (added in 0.145.0) put the **text parse**, not the

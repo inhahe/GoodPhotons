@@ -2623,7 +2623,8 @@ struct LoomBridge {
             temps_.clear();
             // Sweep the whole scratch directory, not just the files we named: emitting
             // an .ftsl also drops the mesh assets it references (loom's `asset_path`
-            // writes .obj next to `out`), and RemoveDirectory fails on a non-empty dir.
+            // writes them next to `out` -- .ftmesh on the live channel, .obj if the
+            // scene asked for text), and RemoveDirectory fails on a non-empty dir.
             WIN32_FIND_DATAA fd{};
             HANDLE h = FindFirstFileA((tempDir_ + "\\*").c_str(), &fd);
             if (h != INVALID_HANDLE_VALUE) {
@@ -2704,7 +2705,7 @@ private:
     // Delete `ftrace_viewer_<pid>` directories left behind by viewers that died without
     // running stop() — a crash, or the user killing the process. `stop()` handles the
     // orderly exit, but nothing can clean up after a kill except the *next* run, and a
-    // scene bake drops a multi-megabyte sidecar plus its .obj assets each time, so
+    // scene bake drops a multi-megabyte sidecar plus its mesh assets each time, so
     // without this %TEMP% accumulates them for as long as the machine stands. A PID is
     // reused eventually, hence the liveness probe rather than an age heuristic:
     // OpenProcess failing with ERROR_INVALID_PARAMETER is Windows saying "no such pid".

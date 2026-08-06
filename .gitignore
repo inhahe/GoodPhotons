@@ -61,6 +61,9 @@
 # ...except this one: a hand-written UV'd unit quad that a shipped scene
 # (scenes/emit_pattern.ftsl) depends on, not a generated mesh.
 !meshes/uvquad.obj
+# Binary meshes (loom.ftmesh). Always generated -- the live viewer channel writes one
+# per frame into its scratch dir; nothing checked in depends on one existing.
+*.ftmesh
 
 # Reference PDFs (e.g. Kodak Wratten handbook used to digitize filter data)
 *.pdf
@@ -112,3 +115,6 @@ Desktop.ini
 tools/jsonbench.exe
 # built on demand by tools/ftslbench.bat (source is checked in, binary is not)
 tools/ftslbench.exe
+
+# built on demand by tools/meshbench.bat (source is checked in, binary is not)
+tools/meshbench.exe

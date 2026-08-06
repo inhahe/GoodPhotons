@@ -60,12 +60,28 @@ def write_atomic(path, text: str, *, suffix: str = ".tmp",
     only atomic within a single filesystem.  On any failure the temp file is removed,
     so a crashed write leaves the old file intact and no litter behind.
     """
+    _write_atomic_raw(path, text, suffix=suffix, mode="w", encoding=encoding)
+
+
+def write_atomic_bytes(path, data: bytes, *, suffix: str = ".tmp") -> None:
+    """Binary sibling of :func:`write_atomic`, with the identical guarantee.
+
+    Same reasoning, and the same reader: the live viewer channel hands ftrace a
+    binary ``.ftmesh`` the same way it used to hand it an ``.obj``, and a half-written
+    one is worse than a half-written OBJ, not better — the header would describe a
+    vertex count the body does not contain.
+    """
+    _write_atomic_raw(path, data, suffix=suffix, mode="wb", encoding=None)
+
+
+def _write_atomic_raw(path, payload, *, suffix: str, mode: str,
+                      encoding: Optional[str]) -> None:
     path = str(path)
     d = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(suffix=suffix, dir=d)
     try:
-        with os.fdopen(fd, "w", encoding=encoding) as f:
-            f.write(text)
+        with os.fdopen(fd, mode, encoding=encoding) as f:
+            f.write(payload)
         replace_atomic(tmp, path)
     except BaseException:
         try:
