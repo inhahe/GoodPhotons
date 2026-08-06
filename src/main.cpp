@@ -134,6 +134,14 @@
 #include <memory>
 #include <atomic>              // -stop: cross-thread flags for the external stop channel
 #include <filesystem>          // -review: scan a directory of rendered frames
+
+// Baked in by CMake from the repo-root VERSION file (see CMakeLists.txt). The
+// fallback only fires for a hand-rolled compile outside the CMake build; a real
+// build.bat binary always carries the real number.
+#ifndef FTRACE_VERSION
+#define FTRACE_VERSION "unknown"
+#endif
+
 #include "scene.h"
 #include "parallel.h"           // ft::setStopProbe — lets load-time loops see the stop flag
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
@@ -6308,7 +6316,7 @@ static bool stereoComposite(int mode, const std::string& left, const std::string
 // README.md, which this points at rather than duplicating.
 static void printHelp(const char* prog) {
     std::printf(
-"ftrace — spectral forward + backward photon raytracer\n"
+"ftrace " FTRACE_VERSION " — spectral forward + backward photon raytracer\n"
 "\n"
 "Usage:\n"
 "  %s -in <scene.ftsl> [options]         render a scene file\n"
@@ -6452,6 +6460,7 @@ static void printHelp(const char* prog) {
 "  -viewer <s.json>      open the loom native viewer on a scene-introspection sidecar\n"
 "  -loom <scene.py>      with -viewer: re-derive geometry live from this loom build\n"
 "  -h | --help           show this help and exit\n"
+"  -version | -V         print the version and exit\n"
 "\n"
 "See README.md for the complete flag list (fog, thin-film, meshes, diagnostics, …).\n",
         prog, prog, prog, prog, prog, prog);
@@ -6477,6 +6486,17 @@ static int run(int argc, char** argv) {
         if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help") ||
             !std::strcmp(argv[i], "-help") || !std::strcmp(argv[i], "help")) {
             printHelp(argv[0]);
+            return 0;
+        }
+    }
+    // `-version` (also `--version` / `-V`) anywhere on the command line: print the
+    // baked-in version and exit. FTRACE_VERSION comes from the repo-root VERSION
+    // file via CMake, so a built ftrace.exe can identify itself instead of being
+    // anonymous — otherwise the only way to tell two builds apart is a byte compare.
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "-version") || !std::strcmp(argv[i], "--version") ||
+            !std::strcmp(argv[i], "-V")) {
+            std::printf("ftrace %s\n", FTRACE_VERSION);
             return 0;
         }
     }

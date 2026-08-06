@@ -1,6 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 project(forward_raytracer LANGUAGES CXX C)   # C for the vendored ufbx.c (FBX loader)
 
+# --- Version -----------------------------------------------------------------
+# The repo-root VERSION file is the single source of truth (release.bat tags
+# v<VERSION>). Bake it into the binary too, so a built ftrace.exe can say which
+# version it is (`ftrace -version`) instead of being anonymous. CONFIGURE_DEPENDS
+# semantics: touching VERSION re-runs CMake, so the define never goes stale.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" FTRACE_VERSION_RAW)
+string(STRIP "${FTRACE_VERSION_RAW}" FTRACE_VERSION)
+message(STATUS "ftrace version: ${FTRACE_VERSION}")
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -46,6 +57,7 @@ add_executable(ftrace
     src/third_party/imnodes/imnodes.cpp
 )
 target_include_directories(ftrace PRIVATE src src/gpda src/third_party/imgui src/third_party/implot src/third_party/imnodes)
+target_compile_definitions(ftrace PRIVATE FTRACE_VERSION="${FTRACE_VERSION}")
 
 # The vendored GPDA engine + generated grammar are third-party/generated code;
 # don't hold them to ftrace's /W4 /permissive- bar (keeps the build-warning

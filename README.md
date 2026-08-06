@@ -137,6 +137,9 @@ Useful CMake options:
 # List the common flags, grouped by task, and exit
 ftrace -h            # or --help
 
+# Which build is this? (the repo's VERSION, baked in at compile time)
+ftrace -version      # or --version / -V   ->  "ftrace 0.141.0"
+
 # Built-in Cornell box, forward pinhole splat (mode B), 512²
 ftrace -scene cornell -n 200000000 -r 512 -o cornell.png
 

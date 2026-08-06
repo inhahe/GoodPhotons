@@ -3058,7 +3058,12 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
   in the long-lived `build_cuda2`.
 - `VERSION` (single `MAJOR.MINOR.PATCH` line) bumps with every observable rebuild;
   `release.bat` publishes repo-root `ftrace.exe` as GitHub release `v<VERSION>`
-  (refuses on duplicate tag).
+  (refuses on duplicate tag). CMake also `file(READ)`s it into the
+  `FTRACE_VERSION` compile definition (with `CMAKE_CONFIGURE_DEPENDS` on the file,
+  so a bump re-configures), which `ftrace -version` / `-V` prints and the `-h`
+  banner carries. Before 0.141.0 the binary was anonymous — two builds could only
+  be told apart by hashing them — so anything that needs to know which build it is
+  looking at should call `-version` rather than trusting a file date.
 - Output conventions: renders → `ppm/`/`png/` (flyby series in `png/<set>/`),
   scratch scripts → `scraps/`. Renders always launched with `-keepwindow`
   (+ `-checkpoint`/`-interval`) and outside the Bash sandbox so the live window is
