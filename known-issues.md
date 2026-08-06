@@ -5,6 +5,51 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### TECH DEBT (2026-08-06): a "render every scene at a uniform budget" sweep cannot distinguish correct from broken — three separate false signals
+
+**Not a renderer bug.** This is about the *regression sweep methodology*, and it is logged because
+the sweep produced three different misleading results in a row and each one looked like a failure.
+
+**What was run.** All 104 `scenes/*.ftsl` at a flat `-n 200000` into `png/_reg_*.png`, exit 0.
+
+**The three false signals, all benign:**
+
+1. **19 scenes produced no output — they were *timeouts*, not failures.** Measured afterwards at a
+   trivial 96×72: `pattern_grid` needs **2461 s** (41 min) for its 256 spp, `usemtl` **1946 s**,
+   `procskin` **427 s**, `function` **446 s for 4 of 256 spp** (~110 s/spp). A uniform per-scene
+   time limit silently drops exactly the scenes that are most expensive, which are often the ones
+   most worth checking.
+2. **6 outputs came out black or near-black — and that is the physically correct answer.**
+   `expo.ftsl`'s `fstop` camera is **mode C**, a thin-lens *catch* at f/2.8 on a 36×24 sensor, so
+   photons must physically land on a finite aperture; `camrig_*.ftsl`'s `taking` camera photographs
+   *through* a modelled camera body and lens (a GLB with real optics). Both are legitimately
+   low-throughput forward paths. `camrig_cinema.ftsl`'s own header comment recommends `-time 900`
+   with `-checkpoint`; the sweep gave it 200 000 photons. Black is the correct render of an
+   under-exposed photograph, not a defect.
+3. **`sensor=0.0000` in the `[energy]` line is likewise not a leak.** `uvmesh` / `procskin` /
+   `usemtl` at 20 000 photons all report `absorbed + escaped = 1.000000` with `sensor` at zero —
+   energy is conserved exactly; the camera simply collected nothing, which is what a forward tracer
+   does at that photon count.
+
+**Why it matters.** All three failure modes are indistinguishable from real breakage if you only
+check exit codes and file existence — which is how the sweep was first (incorrectly) reported clean.
+Checking `mean(pixels)` afterwards then produced the *opposite* error, flagging six correct renders
+as suspect.
+
+**What a sound sweep needs:**
+- **Per-scene budgets, not one global budget.** Forward/catch-mode scenes (mode C, the camrig
+  family) need orders of magnitude more photons than a backward-mode scene; a flat `-n` is
+  meaningless across that range. Drive from `-noise <pct>` or a per-scene `-time`, not `-n`.
+- **A per-scene expected-outcome record** — at minimum "expected non-black: yes/no", so a correctly
+  dark render doesn't read as a failure. `expo`'s `fstop` and the five `camrig_*` `taking` cameras
+  are the known-dark set at low budget.
+- **Handle multi-camera and camera-path scenes explicitly.** Multi-camera scenes emit one file per
+  camera (`_reg_expo_fstop.png`), and the 9 camera-path scenes (`dolly`, `flythrough`,
+  `crystalloop`, `showcase_orbit`, `gallery`, `lanterns`, `_cam5b_*`, `_camA_travel`) emit frame
+  *sequences* — so naive `scene name → one png` matching reports both as missing.
+- **Compare against stored references**, not against "is the file there". Without a reference image
+  per scene the sweep can only catch hard crashes, which is the least interesting failure.
+
 ### FIXED (2026-08-05, v0.138.3): `-preview` printed mojibake in a real console — the output code page was never set
 
 **Symptom (user-reported).** `ftrace scenes\gallery_rain.ftsl -preview -glass` drew the ANSI
