@@ -2350,9 +2350,29 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   frame at all**: the drivers only touched the window inside their
   `done || sinceSave >= intervalSec` block, so a 5 s `-mode W` frame under `-interval 8`
   painted exactly once, on `done`, as the process was exiting — the image appeared for a
-  split second and vanished. (The window itself was up the whole time; it is created early
-  with a dark placeholder before tessellation, so "no window" was never the symptom.)
-  Repaint granularity is bounded below by the renderer's chunk size, not by this timer:
+  split second and vanished.
+- **The window is created UP FRONT, not on the first repaint** (`liveWindowPlaceholder()`
+  in `main.cpp`). It used to be constructed lazily inside `liveWindowUpdate`, which meant
+  that in the ray-traced modes it did not exist at all until the first repaint — so the
+  "painted once, at the end" bug above was really "*created* once, at the end", and what
+  the user actually saw was a window flashing up as the process exited. Only the
+  raster/`-explore` path popped up an early placeholder. Since 0.149.1 both paths call
+  `liveWindowPlaceholder(w, h, stage)`: the raster block before tessellating, and `run()`'s
+  render dispatch (plus the top of `runRender` as a per-frame re-title) before the CUDA
+  probe / scene bake / device upload / first chunk. It fills a near-black frame and names
+  the stage in the title bar (`preparing…`, `tessellating (3/8)`, `mode W — starting…`), so
+  a long silent setup phase is legible instead of looking hung. It deliberately does **not**
+  stamp `g_lastWindowPaint`, so the first real frame lands the instant it exists rather than
+  waiting out a window interval. Because the placeholder now creates the window, "have we
+  painted yet" is tracked by its own flag `g_windowPainted` rather than by
+  `g_liveWin != nullptr` — the cold-cost exclusion below keys off the first *image*, and
+  conflating the two would have re-introduced the 4 s adaptive floor. Measured on
+  `gallery_rain` at 480² `-mode W`: window on screen at 2.2 s (as soon as the scene has
+  loaded) and live from spp 1, versus not existing until the render was over. The one
+  remaining silent stretch is the scene load itself, which is before the frame size is
+  known — opening a guessed-size window there would leave it the wrong shape for the whole
+  render, so it isn't done.
+- Repaint granularity is bounded below by the renderer's chunk size, not by this timer:
   `gpuSppChunks` / `cpuSppChunks` retarget ~0.15 s per chunk with a 1 spp floor, so a 480²
   `-mode W -spp 8` frame gets one repaint per spp and the first complete image lands after
   ~0.6 s. The floor is adaptive — `max(-window-interval, 12 × last measured repaint cost)`

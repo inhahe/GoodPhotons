@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-08-07, v0.149.0): the live window cannot repaint mid-image — its finest granularity is one whole image at 1 spp, not "every N rows"
+### OPEN (2026-08-07, v0.149.0, amended v0.149.1): the live window cannot repaint mid-image — its finest granularity is one whole image at 1 spp, not "every N rows"
 
 **What was asked for vs what was delivered.** The request was for the live window to refresh
 *during* a deterministic mode-W render — "on every so many rows, or once a row or whatever" —
@@ -15,6 +15,34 @@ PNG + `.ftbuf` write (default 15 s), so a 5.6 s frame legitimately got exactly o
 end. v0.149.0 fixes that by giving the window its own timer (`-window-interval`, default 0.2 s)
 with an adaptive cost budget, in all four progressive drivers. A 480² mode-W frame now paints 8
 times instead of 1.
+
+**Correction (v0.149.1) — the first version of this entry, and the code comments written with
+it, both asserted that "the window was up the whole time, it just never received an image."
+That was wrong, and the user was right to push back on it: they had never seen a window during
+a mode-W render at all.** The early dark-placeholder window only ever existed on the
+raster/`-explore` path; in the ray-traced modes `LiveWindow` was constructed *lazily inside
+`liveWindowUpdate`*, i.e. on the first repaint. So "painted once, at the end" was also "created
+once, at the end" — the window genuinely did not exist until the render was over, which is
+exactly the flash-and-vanish that was reported. v0.149.1 adds `liveWindowPlaceholder()` and calls
+it from `run()`'s render dispatch (before the CUDA probe, scene bake, device upload and first
+chunk) as well as from the raster block, so every mode shows the window up front with the stage
+named in the title bar. Measured on `gallery_rain` at 480²: window on screen at 2.2 s, live from
+spp 1. **The lesson for the next entry: "the mechanism I changed explains the symptom" is not the
+same as "I observed the symptom go away," and a user saying they never saw something is data.**
+
+Two smaller things fell out of that fix and are worth knowing:
+- "have we painted yet" is now its own flag (`g_windowPainted`), not `g_liveWin != nullptr`. The
+  cold-first-paint exclusion in the repaint budget keys off the first *image*; once the
+  placeholder creates the window, conflating the two would charge the cold 340 ms paint to the
+  budget and re-impose a ~4 s repaint floor, which is the bug that limited v0.149.0 to two
+  repaints before it was caught.
+- **Scene load is still windowless** (2.2 s on `gallery_rain`, and it was ~47 s before v0.138.1
+  parallelised the spectral texel upsample). The placeholder can't be opened any earlier because
+  the frame size isn't known until the scene is parsed, and opening a guessed-size window would
+  leave it the wrong shape for the entire render — `LiveWindow::update` accepts a new image size
+  but the OS window keeps its construction-time dimensions and just letterboxes. If load time
+  ever regresses badly enough to matter, the fix is to let `LiveWindow` resize its own window on
+  the first differently-sized `update()`, then open a small placeholder before parsing.
 
 **But the row-level granularity that was literally asked for is not achievable in the current
 architecture, and this entry records why.** A repaint can only happen where the driver regains

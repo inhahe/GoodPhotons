@@ -4343,9 +4343,14 @@ static const char* modeLabel(char m) {
 // They used to share -interval, and the result was that any render finishing FASTER than
 // one interval never showed a single live frame: the drivers only touched the window
 // inside their `done || sinceSave >= intervalSec` block, so a 5 s mode-W frame under
-// `-interval 8` painted exactly once, at the end, and then the process exited. The window
-// was up the whole time (it is created early with a dark placeholder, see the tessellation
-// block in run()) — it just never received an image until there was nothing left to watch.
+// `-interval 8` painted exactly once, at the end, and then the process exited.
+//
+// And because the window is created LAZILY on the first update (see liveWindowUpdate),
+// "painted once, at the end" also meant "created once, at the end": in the ray-traced
+// modes no window existed at all until the render was already over, so what the user saw
+// was a window flashing up as the process exited rather than a slow live view. Only the
+// raster/-explore path popped up an early placeholder. liveWindowPlaceholder() below now
+// does that for every mode.
 static double g_windowIntervalSec = 0.2;      // -window-interval
 // Repainting is not free: filmToRgb8 tone-maps every pixel (spectral upsample + exposure
 // + gamma) and the blit copies the frame again, which is microseconds at 480x480 and tens
@@ -4381,6 +4386,45 @@ static void liveWindowNotePaintCost(double sec) {
     if (sec > g_lastWindowPaintSec) g_lastWindowPaintSec = sec;
 }
 
+// True once a real rendered frame has reached the window. Deliberately NOT the same test
+// as `g_liveWin != nullptr`: the placeholder below creates the window long before there is
+// an image, and the FIRST real paint is still the cold one (lazy spectral tables, untouched
+// framebuffer) whose cost must not be fed into the repaint budget.
+static bool g_windowPainted = false;
+
+// Put the window on screen NOW, before the work that will fill it.
+//
+// The window used to be born inside liveWindowUpdate, i.e. on the first repaint. Everything
+// before that first repaint therefore happened with no window at all: the BVH build, the
+// GPU scene bake and upload, the spectral texel upsample, and then the whole first render
+// chunk. For a deterministic mode-W frame — where the first chunk IS essentially the final
+// image — that meant the window appeared only as the render finished, which reads as the
+// image flashing up for a split second rather than converging. Showing a dark placeholder
+// up front costs one window creation (~340 ms, once) and makes the whole render watchable,
+// with the title bar naming the stage so a long silent setup phase is legible instead of
+// looking hung.
+//
+// Does NOT stamp g_lastWindowPaint: the placeholder is not an image, so the first real
+// frame should land the instant it exists rather than waiting out a window interval.
+static void liveWindowPlaceholder(int w, int h, const std::string& stage) {
+    if (!g_showWindow || w <= 0 || h <= 0) return;
+    if (!g_liveWin) {
+        // Near-black rather than pure black so an empty window is visibly a window that is
+        // waiting, not a dead rectangle or a hole punched in the desktop.
+        std::vector<uint8_t> placeholder((size_t)w * h * 3);
+        for (size_t i = 0; i < placeholder.size(); i += 3) {
+            placeholder[i] = 24; placeholder[i + 1] = 26; placeholder[i + 2] = 30;
+        }
+        g_liveWin = std::make_unique<LiveWindow>(w, h, g_windowTitle.c_str());
+        g_liveWin->update(w, h, placeholder);
+    }
+    // Re-title even when the window already exists: callers use this to advance the stage
+    // ("preparing" -> "tessellating (3/8)" -> the render's own progress line).
+    if (!g_liveWin->closed())
+        g_liveWin->setTitle(stage.empty() ? g_windowTitle
+                                          : g_windowTitle + "  \xE2\x80\x94  " + stage);
+}
+
 static void liveWindowUpdate(const Film& f, double N, double expComp, bool absolute,
                              const char* status = nullptr) {
     if (!g_showWindow || N <= 0.0) return;
@@ -4388,7 +4432,10 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     // and must not be timed: it measured 342 ms against a 45 ms steady-state repaint, and
     // feeding that into the cost budget set the floor to 4 s — which on a 5 s frame meant
     // the second repaint was also the last one. Time only the part that recurs.
-    const bool firstPaint = !g_liveWin;
+    // NB: this asks "has a real frame been shown yet", not "does the window exist" — the
+    // placeholder may already have created it, and the cold-cost exclusion below still has
+    // to apply to the first *image*.
+    const bool firstPaint = !g_windowPainted;
     if (!g_liveWin)
         g_liveWin = std::make_unique<LiveWindow>(f.resX, f.resY, g_windowTitle.c_str());
     const auto tPaint = std::chrono::steady_clock::now();
@@ -4408,6 +4455,7 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     // so it is not representative of the next one either. Let it through unbudgeted and
     // start predicting from the second, which is the first one that actually repeats.
     if (!firstPaint) g_lastWindowPaintSec = cost;
+    g_windowPainted = true;
     // FTRACE_WINDOW_DEBUG=1 logs every repaint (same convention as FTRACE_CHUNK_DEBUG in
     // render_cuda.cu). Whether the live view is actually updating is otherwise only
     // observable by watching the screen, which is exactly the kind of thing that silently
@@ -5231,6 +5279,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      double* exposureAnchor = nullptr, bool rgbBackward = false,
                      int maxBounceOverride = -1, bool directOnly = false) {
     g_windowMode = modeLabel(mode);   // title bar shows the transport mode of this frame
+    // Make sure the window is up (and naming this frame) before the first chunk rather than
+    // after it — see liveWindowPlaceholder. Normally a no-op re-title, since run() already
+    // created it; this also covers any path that reaches a render without going through
+    // that dispatch.
+    liveWindowPlaceholder(res, resY, g_windowMode + " \xE2\x80\x94 starting\xE2\x80\xA6");
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
     const bool forwardCatch = (mode == 'C');
@@ -8251,24 +8304,17 @@ static int run(int argc, char** argv) {
 
         // Pop the live window up IMMEDIATELY (before the potentially-slow tessellation)
         // so heavy scenes don't sit with a blank screen while the isosurfaces march.
-        // Size it to the first camera we'll render; fill a dark placeholder frame and
-        // show a "tessellating…" title, then update N/M progress as each implicit is
-        // marched (see the tessellate() callback below).
-        if (g_showWindow && !toRender.empty() && !g_liveWin) {
-            int pw = toRender.front().res, ph = toRender.front().resY;
-            std::vector<uint8_t> placeholder((size_t)pw * ph * 3);
-            for (size_t i = 0; i < placeholder.size(); i += 3) {
-                placeholder[i] = 24; placeholder[i + 1] = 26; placeholder[i + 2] = 30;
-            }
-            g_liveWin = std::make_unique<LiveWindow>(pw, ph, g_windowTitle.c_str());
-            g_liveWin->update(pw, ph, placeholder);
-            if (useGpuIso) {
-                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  GPU iso preview\xE2\x80\xA6");
-            } else {
-                const size_t nImp = scene.implicits.size();
-                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating" +
-                                    (nImp ? " (0/" + std::to_string(nImp) + ")" : "\xE2\x80\xA6"));
-            }
+        // Size it to the first camera we'll render and name the stage in the title, then
+        // update N/M progress as each implicit is marched (see the tessellate() callback
+        // below). The ray-traced modes do the same thing at the top of run()'s render
+        // dispatch; both go through liveWindowPlaceholder.
+        if (!toRender.empty()) {
+            const size_t nImp = scene.implicits.size();
+            liveWindowPlaceholder(toRender.front().res, toRender.front().resY,
+                                  useGpuIso ? "GPU iso preview\xE2\x80\xA6"
+                                            : "tessellating" +
+                                              (nImp ? " (0/" + std::to_string(nImp) + ")"
+                                                    : std::string("\xE2\x80\xA6")));
         }
 
         raster::PreviewLight plight = raster::deriveLight(scene);
@@ -10392,6 +10438,18 @@ static int run(int argc, char** argv) {
     // else on the CPU. Sharing applies only to per-frame-auto-exposed cameras (an
     // exposure-locked camera_path is an animation, better left un-shared so its frames
     // don't all carry the same fixed noise realisation).
+    // Show the window before ANY of the ray-traced setup, for the same reason the raster
+    // path shows it before tessellating: everything from here to the first rendered chunk
+    // — the CUDA probe and scene bake right below, the device upload, then a full sample
+    // pass — used to run with nothing on screen, because the window was created lazily by
+    // the first repaint. In a deterministic mode-W render the first repaint is also very
+    // nearly the last, so the window appeared just as the process was exiting and the
+    // finished image seemed to flash by. This is the earliest point where the frame size
+    // is known and the heavy work hasn't started.
+    if (!toRender.empty())
+        liveWindowPlaceholder(toRender.front().res, toRender.front().resY,
+                              "preparing\xE2\x80\xA6");
+
     bool useGpuForward = false;
 #ifdef HAVE_CUDA
     {
