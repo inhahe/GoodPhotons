@@ -162,13 +162,15 @@ def build_scene(res=(480, 480), *, purple=PURPLE, green=GREEN, lumens=LUMENS,
     # jack's 6.0, which is where perspective magnifies it most.  At the
     # original (z 5.5, fov 38) the ring's near top/bottom projects to 1.43× the half
     # frame — i.e. cut off for a third of every turn, which is worse than any framing
-    # compromise.  These numbers are the cheapest fix found by `scraps/ring_fit.py`
-    # (which projects the whole torus surface at every azimuth): back off 0.5 m, open
-    # up to fov 44, and lift eye + aim so the ring's near arc is centred rather than
-    # riding the bottom edge.  Worst-case projection is then 0.81 across and 0.94 down,
-    # so the ring clears the frame at every azimuth with a little margin to spare.
-    # Note the eye must stay inside the room (front wall at z = 6.6), which is why the
-    # extra room comes from the field of view and not from backing off further.
+    # compromise.  `scraps/ring_fit.py` projects the whole torus surface at every azimuth
+    # to find what does fit: back off 0.5 m, open up to fov 44, and lift eye + aim so the
+    # ring's near arc is centred rather than riding the bottom edge.  Worst-case
+    # projection is then 0.81 across and 0.94 down, so the ring clears the frame at every
+    # azimuth with margin to spare.  Two notes on why not tighter: the eye must stay
+    # inside the room (front wall at z = 6.6), so the extra room has to come from the
+    # field of view rather than from backing off further; and an exhaustive sweep of the
+    # same script does bottom out slightly tighter, at fov 41 with the eye at z 6.2, but
+    # that buys only 8 % of subject size for 0.2 m less wall clearance.
     scene = Scene(Camera(eye=(0.5, 1.0 + cy, 6.0), look_at=(0.0, 0.3 + cy, 0.0),
                          up=(0, 1, 0), fov_y=44, mode="W", res=res))
     light = dict(origin=f"-1.6 {fmt(jj.Y1 - 0.02)} -1.6", u="3.2 0 0", v="0 0 3.2",
