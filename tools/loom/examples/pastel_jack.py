@@ -163,9 +163,37 @@ class Ring(Element):
         ])
 
 
+def loop_frames(cycles: int = 1) -> int:
+    """Frames in a loop holding ``cycles`` of the jack's own 7.2 s tumble."""
+    return jj.FRAMES * int(cycles)
+
+
 def build_scene(res=(480, 480), *, purple=PURPLE, green=GREEN, lumens=LUMENS,
-                spin: float = 1.0) -> Scene:
-    """The jumping-jack scene surfaced as two matte pastel gyroid shells, ringed."""
+                spin: float = 1.0, cycles: int = 1,
+                ring_turns: float = RING_TURNS) -> Scene:
+    """The jumping-jack scene surfaced as two matte pastel gyroid shells, ringed.
+
+    ``ring_turns`` is the ring's rate in whole turns per *one jack cycle* (the base
+    7.2 s / 432 frames), signed — negative counter-rotates against the precession.
+    ``cycles`` lengthens the loop to that many jack cycles while the jack keeps its
+    real-world speed (its ``spin``/``precess`` scale with it), which is the only way
+    to run the ring at a **fractional** rate and still close the loop.
+
+    Both rotations have to come back to their start at the end of the loop or the
+    video pops when it repeats, so ``ring_turns * cycles`` must be a whole number.
+    A half-speed ring (``ring_turns=1.5``) therefore needs ``cycles=2``: 3 whole ring
+    turns against 2 jack cycles, a 14.4 s loop.  This is checked rather than trusted,
+    because the failure mode is a one-frame jump at the wrap that is easy to miss when
+    you watch the render go by frame at a time and obvious the moment it loops.
+    """
+    total_turns = ring_turns * cycles
+    if abs(total_turns - round(total_turns)) > 1e-9:
+        raise ValueError(
+            f"ring_turns={ring_turns} over cycles={cycles} gives {total_turns} turns, "
+            f"which does not close the loop (the ring would jump "
+            f"{360.0 * (total_turns - int(total_turns)):.4g}° at the wrap). "
+            f"Use a cycles that makes ring_turns*cycles a whole number — e.g. "
+            f"cycles=2 for a half-speed ring.")
     # Same standing height as the original — that is pure geometry and none of it
     # depends on the materials.
     cy = jj.rest_height(jj.Y0, arm=jj.ARM, ball=jj.BALL, tilt=jj.TILT)
@@ -204,9 +232,15 @@ def build_scene(res=(480, 480), *, purple=PURPLE, green=GREEN, lumens=LUMENS,
         Material("ring", "glossy", reflect="metal:gold", roughness=0.05),
         # `gold`/`glass` here are only the Jack element's two material SLOTS (the
         # names of its two arm triples); both are carved by the same gyroid.
-        jj.Jack(gyroid_glass=True, spin=spin, centre=(0.0, cy, 0.0),
-                gold="purple", glass="green"),
-        Ring((0.0, cy, 0.0), reach),
+        # `spin`/`precess` are counted per LOOP, not per second, so lengthening the loop
+        # to `cycles` jack tumbles means multiplying both by `cycles` — that is what keeps
+        # the jack moving at exactly the speed it moves at in the 432-frame cut instead of
+        # slowing down alongside the ring.
+        jj.Jack(gyroid_glass=True, spin=spin * cycles, precess=float(cycles),
+                centre=(0.0, cy, 0.0), gold="purple", glass="green"),
+        # Likewise the ring: `ring_turns` is per jack cycle, so over `cycles` of them it
+        # makes `ring_turns * cycles` whole turns — the quantity checked above.
+        Ring((0.0, cy, 0.0), reach, turns=ring_turns * cycles),
         *jj._room(),
         Light("area", **light),
     )
@@ -252,7 +286,14 @@ def main() -> int:
     # `--name` is how you give it one, and it keeps each set self-contained (frames,
     # `.ftsl`, checkpoints, MP4 and GIF all under `png/<name>/`).
     name = jj._sopt("--name", "pastel_jack")
-    scene = build_scene(res=(r, r))
+    # `--ring-turns` is signed whole-or-half turns of the ring per jack cycle, and
+    # `--cycles` is how many jack cycles the loop holds.  They are separate knobs because
+    # only their PRODUCT has to be a whole number: a ring rate that is not itself whole
+    # (the half-speed cut, 1.5) is legal as soon as the loop is long enough to close it.
+    cycles = max(1, int(jj._opt("--cycles", 1)))
+    ring_turns = float(jj._opt("--ring-turns", RING_TURNS))
+    frames = loop_frames(cycles)
+    scene = build_scene(res=(r, r), cycles=cycles, ring_turns=ring_turns)
 
     if still:
         from loom.drive import render_still
@@ -261,12 +302,12 @@ def main() -> int:
         return 0
     if not render:
         from loom import Clock, Cache
-        print(scene.emit(Clock.at_frame(0, jj.FRAMES), Cache()))
+        print(scene.emit(Clock.at_frame(0, frames), Cache()))
         return 0
 
     from loom import render_range
     from loom.drive import assemble_gif_ffmpeg, assemble_mp4, default_outdir
-    pngs = render_range(scene, jj.FRAMES, name=name, fps=jj.FPS, n=1,
+    pngs = render_range(scene, frames, name=name, fps=jj.FPS, n=1,
                         interval=8.0, skip_existing=True, extra_args=_args())
     out = default_outdir(name)
     assemble_mp4(pngs, out / f"{name}.mp4", fps=jj.FPS)
