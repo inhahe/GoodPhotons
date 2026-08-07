@@ -10,6 +10,42 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
 
 ---
 
+## Demo
+
+<video src="https://github.com/inhahe/GoodPhotons/raw/main/pastel_jack_ring.mp4"
+       controls muted loop playsinline width="480">
+  Your viewer can't play embedded video —
+  <a href="pastel_jack_ring.mp4">download the clip</a> instead.
+</video>
+
+*A gyroid-glass jumping jack tumbling inside a gold ring, 432 frames at 60 fps
+(7.2 s, 480²), seamlessly looping. The ring's tilted plane precesses in the
+**opposite** sense to the jack's own lean, because turning them the same way made
+the two read as geared to one another rather than as independent motions.
+Reproduce it with
+`python tools/loom/examples/pastel_jack.py --render --name pastel_jack_ring`
+([`tools/loom/examples/pastel_jack.py`](tools/loom/examples/pastel_jack.py); the
+counter-rotation is that script's default `--ring-turns -3`), which renders every
+frame at `-mode W -spp 8 -gi 24 -gi-clamp 0.15 -whitted-grid 3` and assembles the
+MP4 and GIF.*
+
+> **This clip was rendered by a _backward_ tracer, not the forward one.** Mode `W`
+> is the deterministic Whitted preview, which is mode `R`'s **backward** camera-ray
+> walk with every Monte-Carlo draw replaced by a fixed quadrature — rays start at the
+> camera and are traced toward the lights, the opposite of the forward photon core
+> the project is named for. It was the right tool here for a reason that is worth
+> stating plainly: an animation needs every frame to be *quiet*, and a forward mode
+> reaches that only by converging away its noise, frame after frame. A deterministic
+> mode has no noise to converge, so each frame is final in seconds and — crucially —
+> consecutive frames carry no independently-drawn grain to shimmer against each other.
+> The trade is that mode `W`'s global illumination is a one-bounce `-gi` gather rather
+> than the real multi-bounce transport modes `A`/`B`/`C`/`M`/`S`/`U` deliver. So take
+> this as a demonstration of the geometry, materials and animation tooling, **not** as
+> a showcase of the forward light-transport engine or of ftrace's spectral caustics —
+> for those see the mode table below and the gallery scenes.
+
+---
+
 ## Highlights
 
 - **Spectral transport** — continuous per-photon wavelengths over a configurable band
