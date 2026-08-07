@@ -242,8 +242,29 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   worst shading-normal tilt 0.0002–0.011°. Load is 2.4× faster end-to-end and 6.5×
   on read+decode alone, at 0.52–0.56× the file size. **What it did not fix** is the
   cost of the file itself: on this machine opening any freshly-written file larger
-  than ~32 KB costs a flat ~8 ms before a byte is read (Defender), which is now ~90 %
-  of the viewer's per-frame `assets` term — see `known-issues.md`.
+  than ~32 KB costs a flat ~8 ms before a byte is read (Defender), which was ~90 % of
+  the viewer's per-frame `assets` term. 0.148.0 removed that from the live channel
+  outright by never writing the file (see `loomlink.h`/`viewer_gui.*`) and reduced it
+  everywhere else by prefetching (see `assetbytes.h`) — `known-issues.md` records what
+  the gate actually is, because most of what looked obvious about it was wrong.
+- **`assetbytes.h`** (0.148.0) — the two things a scene's asset *bytes* may need that
+  aren't parsing: an **overlay** and a **warmer**. `Overlay` is a map from `normKey`
+  (lowercased, forward-slashed — so loom's `Path.as_posix()` names match ftrace's
+  lookups on Windows) to bytes; `ftsl::Builder` carries one and every mesh dispatch
+  site consults it before touching the disk, which is what lets the live viewer hand
+  meshes over the pipe under the very same filenames the `.ftsl` text names, so nothing
+  downstream has to know which transport produced them. `Warmer` is the complement for
+  assets that *are* on disk: `loadSource` scans the scene text for `file "…"` paths
+  (`scanAssetPaths`) and reads-and-discards them on one background thread, capped at
+  64 MB, purely to make the OS and the virus scanner do their work concurrently with
+  the GPDA parse instead of serially in front of each `open()`. It is deliberately
+  format-agnostic and constant-memory — it never decodes anything, so it cannot
+  disagree with the real loader. Skipped when a non-empty overlay is present (the
+  bytes are already here), which doubles as the A/B switch `scraps/warmbench.cpp` uses.
+  Measured on cold assets: **−21.5 %** on a 24-mesh scene, **−6.2 %** on gallery's 27 MB;
+  on settled assets, where it can only ever lose, it costs nothing (−0.7 to −1.9 %,
+  i.e. still marginally ahead). That last column is the one that justifies it being
+  unconditional.
 - **`implicit.h` / `isomesh.h`** — implicit/isosurface evaluation and marching-cubes
   tessellation. `marchImplicit` is staged **fill → discover → resolve → wind**:
   parallel lattice `val[]` fill and parallel per-vertex bisection refine + gradient
@@ -2406,13 +2427,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (§E2 slice 3b) — two live loom channels, one transport, so a protocol or lifetime fix
   lands in both. `post()` overwrites an
   unstarted job, so a drag that moves a parameter every frame costs one bake of the final
-  value — latest-wins, and the UI never blocks. Each bake writes a fresh sidecar + `.ftsl`
-  into a per-process `%TEMP%\ftrace_viewer_<pid>` scratch dir; the bridge tracks the
-  outstanding files and deletes each as it is consumed (a superseded result's files are
-  dropped unread), then sweeps and removes the whole directory in `stop()`. Startup also
-  reclaims `ftrace_viewer_<pid>` dirs whose pid is no longer alive (`OpenProcess` failing
-  with `ERROR_INVALID_PARAMETER`), since a crashed or killed viewer can't clean up after
-  itself and only the next run ever can. Results are
+  value — latest-wins, and the UI never blocks. **Each bake is carried entirely over the
+  pipe the two processes already share — nothing per-frame touches the filesystem.** The
+  sidecar rides back inside the ack as a JSON member (`stealMember` *moves* the subtree
+  out, so the parse the bridge already did on its worker thread is the only one), and the
+  meshes ride as raw bytes: the emit request carries `"assets":"inline"`, which makes
+  loom's `EmitCtx.mesh_sink` divert the encoded mesh into a dict instead of writing it,
+  and `serve_viewer` frames those payloads **after** the ack line, back-to-back with no
+  delimiters, every length declared up front in the ack's `blobs:[{name,bytes}]` manifest.
+  A reader must therefore drain them even if it wants none, or the stream desyncs — hence
+  `LoomLink::readExact`. They arrive as an `assetbytes::Overlay` that `ftsl::loadSource`
+  consults before ever calling `open()`. This removed the *whole* per-frame filesystem
+  round-trip, whose dominant cost was not the I/O but Windows Defender scanning files
+  ftrace's own child had written microseconds earlier: 130.3 → **102.6 ms/frame**
+  (7.70 → 9.75 fps, n=104), with the `sidecar` term collapsing 22 → 2 ms and `ftsl` 31 →
+  21. The scratch dir is now only a *naming scheme* for the assets keys, never created;
+  `stop()` still sweeps it, and startup still reclaims `ftrace_viewer_<pid>` dirs whose
+  pid is no longer alive (`OpenProcess` failing with `ERROR_INVALID_PARAMETER`), since a
+  crashed or killed viewer can't clean up after itself and only the next run ever can —
+  both retained because older builds did litter. Results are
   adopted on whatever frame they land, preserving the user's orbit, zoom, active tab and
   DAG layout. **Third-party note:** `src/third_party/imnodes/imnodes.cpp` carries
   `[ftrace patch]` edits for imgui #7543 — see `known-issues.md`; re-vendoring imnodes must

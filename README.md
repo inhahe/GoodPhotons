@@ -1852,7 +1852,11 @@ size. It is also *more* precise than the OBJ text it replaces, which went throug
 `%.6g` (6 significant digits, against `f32`'s ~7.2). Write one from Python with
 `loom.ftmesh.write_ftmesh(path, verts, faces)`, or have any loom scene emit them by
 passing `mesh_format="ftmesh"` to `Scene.emit` (the live viewer channel already
-defaults to it). `mesh { smooth … }`, `uv …`, transforms and materials all behave
+defaults to it — and now sends those bytes straight down its pipe rather than via a
+file, so the format doubles as the live wire format). `Scene.emit` also takes a
+`mesh_sink=` dict, which collects the encoded meshes in memory instead of writing
+them while leaving the emitted scene text byte-for-byte identical — that is the hook
+the live channel uses. `mesh { smooth … }`, `uv …`, transforms and materials all behave
 identically to the OBJ path — both formats share the same normal-synthesis code.
 Meshes without their own `vt` coordinates can be textured via a procedural
 projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
@@ -3297,11 +3301,21 @@ everything else. Check with `tools/gpu_by_process.ps1` before drawing conclusion
 (`nvidia-smi` cannot attribute utilisation per process under Windows' WDDM driver model).
 
 Measured on an idle card, a played frame is dominated by the loom round-trip — emitting the
-`.ftsl` + JSON sidecar and re-parsing them each frame — at ~84 % of the period, with the
-whole raymarch under 10 %. The Render pane's **`play res`** slider renders at a reduced
-draft resolution *only while the transport is playing*, snapping back to full resolution the
-moment you pause, which buys back the part of the cost that does scale with pixels. See
-`known-issues.md` for the full breakdown.
+scene and adopting it each frame — with the whole raymarch under 10 %. Successive rounds of
+profiling that round-trip have taken playback from **4.61 to 9.75 fps**; the largest single
+step was getting geometry **out of the filesystem altogether**. The mesh and the sidecar now
+travel over the stdio pipe the two processes already share, rather than through temp files —
+which not only skips the I/O but sidesteps the on-access virus scan those freshly-written
+files attracted, and that scan was costing more per frame than the entire GPU kernel. As of
+this version a played frame writes **nothing to disk at all**, and loom's own tessellation is
+what's left as the dominant term. Scenes that *do* load assets from disk get a related
+speedup: their files are prefetched on a background thread while the `.ftsl` is being parsed,
+which is worth up to ~20 % on a mesh-heavy scene's first load and costs nothing when the
+files are already warm. The Render pane's **`play res`** slider renders at a reduced draft
+resolution *only while the transport is playing*, snapping back to full resolution the moment
+you pause, which buys back the part of the cost that does scale with pixels. See
+`known-issues.md` for the full breakdown — including a worked example of a benchmark that
+confidently reported one of these optimizations as a regression.
 
 ---
 

@@ -53,6 +53,14 @@ class EmitCtx:
         channel** uses it: it re-emits every frame and nothing ever reads those
         files but ftrace, microseconds later, on the same machine.  Slightly *more*
         precise than the OBJ path, which formats at ``%.6g``.
+
+    ``mesh_sink``, when given, means **don't write the mesh to disk** — put its bytes
+    in this dict, keyed by the same path the ``.ftsl`` names, and let the caller
+    deliver them.  The live viewer channel does this: measured 2026-08-06, a file
+    another process wrote a millisecond ago costs ~8 ms to *open*, essentially all of
+    it Windows Defender's on-access scan, so the fastest mesh file is the one that
+    never exists.  The emitted ``.ftsl`` text is identical either way — the path is
+    still computed and still named — which is what lets the two modes share tests.
     """
 
     clock: Clock
@@ -60,28 +68,42 @@ class EmitCtx:
     assets_dir: Optional[Path] = None
     tag: str = ""
     mesh_format: str = "obj"
+    mesh_sink: Optional[dict] = None
 
     def asset_path(self, name: str, ext: str) -> Path:
         import tempfile
         d = self.assets_dir if self.assets_dir is not None else Path(tempfile.gettempdir())
         d = Path(d)
-        d.mkdir(parents=True, exist_ok=True)
+        # Only touch the filesystem if something is actually going to land there.
+        if self.mesh_sink is None:
+            d.mkdir(parents=True, exist_ok=True)
         return d / f"{name}{self.tag}.{ext}"
 
     def write_mesh(self, name: str, verts, faces) -> Path:
-        """Write one indexed mesh in this context's format; return its path.
+        """Serialise one indexed mesh in this context's format; return its path.
 
         Every file-backed mesh element goes through here, so the format choice is
         made in exactly one place and the two element types cannot drift apart.
+        With a ``mesh_sink`` the bytes go into the dict instead of to the path, but
+        the path is still what the caller gets and still what the scene text names.
         """
+        sink = self.mesh_sink
         if self.mesh_format == "ftmesh":
-            from .ftmesh import write_ftmesh
             path = self.asset_path(name, "ftmesh")
-            write_ftmesh(path, verts, faces)
+            if sink is None:
+                from .ftmesh import write_ftmesh
+                write_ftmesh(path, verts, faces)
+            else:
+                from .ftmesh import encode
+                sink[path.as_posix()] = encode(verts, faces)
         elif self.mesh_format == "obj":
-            from .sweep import write_obj
             path = self.asset_path(name, "obj")
-            write_obj(path, verts, faces)
+            if sink is None:
+                from .sweep import write_obj
+                write_obj(path, verts, faces)
+            else:
+                from .sweep import encode_obj
+                sink[path.as_posix()] = encode_obj(verts, faces).encode("utf-8")
         else:
             raise ValueError(
                 f"EmitCtx.mesh_format must be 'obj' or 'ftmesh', got {self.mesh_format!r}")

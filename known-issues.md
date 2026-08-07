@@ -5,7 +5,7 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### PERF — OPEN (found 2026-08-06, v0.147.0): the live viewer pays ~17 ms/frame to Windows Defender for opening files it wrote itself
+### PERF — FIXED (2026-08-06, v0.148.0): the live viewer pays ~17 ms/frame to Windows Defender for opening files it wrote itself
 
 **This is the finding that came out of building the binary mesh handoff, and it is bigger than
 the handoff was.** The `.ftmesh` format did exactly what it was designed to do — the *decode* of
@@ -28,9 +28,11 @@ read()   median 0.081 ms   min 0.067
 
 Three probes identify it as Defender's real-time scan, not the filesystem:
 
-- **The verdict is cached per content.** 1st open after a write: 8.24 ms. 2nd open of the same
+- **The verdict is cached.** 1st open after a write: 8.24 ms. 2nd open of the same
   file: **0.066 ms**. 125x — that is a scanner memoizing a clean verdict, not a cold page cache.
-- **It is about new *content*, not `os.replace`.** Writing to a brand-new filename with no
+  (Cached against the *path*, not the content — see the correction below; the original wording
+  here said "per content" and that was wrong.)
+- **It is about the file being new, not `os.replace`.** Writing to a brand-new filename with no
   replace at all costs the same 7.67 ms.
 - **It has a size threshold, not a throughput.** 1 KB -> 1.2 ms, 8 KB -> 1.1 ms, then 32 KB
   through 1024 KB all sit flat at **8.5–9.9 ms**. A copy or a hash would scale with size; this
@@ -60,13 +62,61 @@ anyone else, and weakens the user's AV to work around a design choice that was o
 choice is the bug: the live channel round-trips geometry through the filesystem when the two
 processes already have a pipe open between them.**
 
-**Proper fix.** Stop writing per-frame files. loom and ftrace already speak newline-delimited
-JSON over stdio (`LoomBridge` <-> `python -m loom.viewer`); the mesh and the sidecar should travel
-**in that channel** — length-prefixed binary frames alongside the JSON, or a shared-memory
-mapping — so nothing per-frame ever hits a path an on-access scanner watches. `.ftmesh` is
-already the right wire format for that; it just needs a transport that is not a file. Expected to
-recover the full ~17 ms plus the ~1.3 ms/frame the writer spends on temp-file + `os.replace`.
-Tracked as the next step of TODO §F8(b).
+**Fix (shipped 0.148.0).** Stop writing per-frame files. loom and ftrace already speak
+newline-delimited JSON over stdio (`LoomBridge` <-> `python -m loom.viewer`), so the mesh and the
+sidecar now travel **in that channel**: the sidecar as a JSON member of the ack, the meshes as raw
+payloads framed after it against a `blobs:[{name,bytes}]` manifest, landing in an
+`assetbytes::Overlay` that `ftsl::loadSource` consults instead of opening anything. Nothing
+per-frame touches a path an on-access scanner watches — verified by the absence of any
+`ftrace_viewer_*` directory in `%TEMP%` during a live run. Measured in-viewer, same scene, `-play`:
+
+```
+                n    median    fps    bake  sidecar  ftsl  raymarch  other
+  v0.146       97    138.9     7.20     40      23     35        19     21
+  v0.147.0    185    130.3     7.70     38      22     31        20     18
+  v0.148.0    104    102.6     9.75     42       2     21        20     19
+```
+
+**-27.7 ms/frame, 1.27x** over 0.147.0 and 1.35x over 0.146. `sidecar` collapsed 22 -> 2 (its
+`json` sub-term 21 -> 0, because the parse moved onto the bridge's worker thread as part of
+parsing the ack it was already parsing); `ftsl` 31 -> 21 (its `assets` sub-term 10 -> 1). loom's
+own `bake` (~42 ms) is now the dominant per-frame term — see TODO §F8.
+
+---
+
+**Correction, same day: almost everything "obvious" about this gate was wrong, and the wrong
+model nearly deleted a working optimization.** Chasing the general (non-viewer) case with
+`scraps/warmbench.cpp` produced three rounds of results that contradicted each other, because
+the *harness* was wrong in a way the model above couldn't see. What the follow-up probes
+(`scraps/gateprobe*.py`, `scraps/gateprobe.cpp`) actually establish:
+
+- **The verdict is cached per path, NOT per content.** Copying an already-scanned file to a new
+  name, byte-identical, still costs **9.19 ms**. The original "cached per content" reading came
+  from re-opening *the same path* and doesn't support the conclusion drawn from it. This one
+  mattered: believing it, I made warmbench append a comment to each copied asset "so every file
+  is genuinely novel to the scanner" — and that append is what invalidated the whole benchmark.
+- **Waiting does not help.** Write a file, sleep, read it: **8.5–10 ms at every gap from 0 ms to
+  1000 ms**, for both direct writes and write-temp-then-`os.replace`. So it is a genuine
+  synchronous toll paid by the reader, not a race against a scan that would finish on its own.
+- **But it IS overlappable with other work, and that is the whole opportunity.** Opening a file
+  for write and closing it starts its scan in the background; a batch of 24 copy-then-append
+  files costs **1.2 ms/file** to open afterwards, while 24 plain copies cost **7.6 ms/file**.
+  Same bytes, same directory, same process — the only difference is whether something touched
+  each file early enough for the scan to drain concurrently.
+- **The cost is per file and stubbornly linear**: 24 fresh files = 234 ms of pure gate.
+
+The trap: warmbench's own freshening loop (copy + append, 24 times) *was* that early touch, so
+its "cold" control was really a second warm column — and it duly reported that prefetching
+saved -2.2 %, i.e. was worthless. The tell was arithmetic, not intuition: the whole "cold" load
+measured 128.9 ms when the gate alone should have been 234 ms. Removing the append flipped it to
+**+21.5 %**. Recorded here because the failure mode is general and cheap to repeat: *a benchmark
+that prepares its own cold case can warm it in the process, and it will report a real
+optimization as a regression.* Cross-check totals against a separately-measured floor.
+
+**Consequence.** `assetbytes::Warmer` ships and is on unconditionally for every scene load
+(`ftsl::loadSource` prefetches the scene's `file "…"` assets on one background thread while the
+GPDA parse runs). Cold: **-21.5 %** on a 24-mesh scene, **-6.2 %** on gallery's 27 MB. Settled,
+where it can only ever lose: it doesn't (-0.7 to -1.9 %). See `design.md` -> `assetbytes.h`.
 
 ### PERF — FIXED (2026-08-06, v0.147.0): crease smoothing was quadratic in vertex degree, and was 2/3 of the cost of loading a mesh
 

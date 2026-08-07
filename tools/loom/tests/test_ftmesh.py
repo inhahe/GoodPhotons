@@ -177,6 +177,37 @@ def test_mesh_format_switches_the_file_but_not_the_scene():
                 assert ca == pytest.approx(cb, abs=1e-5)
 
 
+def test_mesh_sink_diverts_the_bytes_and_leaves_the_scene_text_alone():
+    """A mesh_sink must change *where* the bytes go and nothing else — the ftsl still
+    names the same path, so a consumer keyed by that path (ftrace's asset overlay)
+    doesn't have to know which mode produced it."""
+    import loom as L
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = L.Clock.at_frame(3, 24)
+        onfile = _swept_scene().emit(clock, L.Cache(), assets_dir=tmp, tag="x",
+                                     mesh_format="ftmesh")
+        sink = {}
+        piped = _swept_scene().emit(clock, L.Cache(), assets_dir=tmp, tag="x",
+                                    mesh_format="ftmesh", mesh_sink=sink)
+        assert onfile == piped
+        (name, data), = sink.items()
+        assert f'file "{name}"' in piped
+        with open(os.path.join(tmp, "tubex.ftmesh"), "rb") as fh:
+            assert data == fh.read()
+
+
+def test_mesh_sink_does_not_create_the_assets_dir():
+    """Skipping the write is not enough: creating the directory would put us back to
+    touching the filesystem once per frame, which is the cost this avoids."""
+    import loom as L
+    with tempfile.TemporaryDirectory() as tmp:
+        d = os.path.join(tmp, "nope")
+        sink = {}
+        _swept_scene().emit(L.Clock.at_frame(0, 24), L.Cache(), assets_dir=d,
+                            mesh_format="ftmesh", mesh_sink=sink)
+        assert sink and not os.path.exists(d)
+
+
 def test_unknown_mesh_format_is_an_error_not_a_silent_obj():
     import loom as L
     with tempfile.TemporaryDirectory() as tmp:

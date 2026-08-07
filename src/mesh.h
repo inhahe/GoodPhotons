@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
+#include "assetbytes.h"
 #include "geometry.h"
 #include "scene.h"
 
@@ -296,22 +297,14 @@ inline bool meshFinishTris(Scene& s, size_t triStart,
 // material for subsequent faces to `matResolver(name)` (falling back to `matId`
 // when the name is unknown) — this is the per-face `usemtl use_names` path.
 // Returns the number of triangles added (0 on failure). Call before Scene::build().
-inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
-                   bool loadUV = false, const MtlResolver* matResolver = nullptr,
-                   UvProjection uvProj = UvProjection::None, int uvAxis = 1,
-                   double creaseAngleDeg = -1.0) {
-    // Slurp the whole file (binary; CRLF is handled at the line split below, so
-    // the parsed lines are exactly what text-mode getline used to produce).
-    std::FILE* fp = std::fopen(path, "rb");
-    if (!fp) { std::fprintf(stderr, "loadObj: cannot open %s\n", path); return 0; }
-    std::string buf;
-    {
-        char tmp[1 << 16];
-        size_t got;
-        while ((got = std::fread(tmp, 1, sizeof tmp, fp)) > 0) buf.append(tmp, got);
-    }
-    std::fclose(fp);
-
+// `buf` is the file's bytes and `path` is only a label for diagnostics, so the same
+// parse serves a file on disk and bytes that arrived over the loom pipe (see
+// assetbytes.h). `loadObj` below is the file-reading wrapper.
+inline int loadObjBytes(Scene& s, const std::string& buf, const char* path, int matId,
+                        const Affine& xf,
+                        bool loadUV = false, const MtlResolver* matResolver = nullptr,
+                        UvProjection uvProj = UvProjection::None, int uvAxis = 1,
+                        double creaseAngleDeg = -1.0) {
     std::vector<Vec3> verts;
     std::vector<Vec3> texcoords;   // (u,v,0) per `vt`
     std::vector<Vec3> normals;     // per `vn`, already in WORLD space (inv-transpose)
@@ -417,6 +410,20 @@ inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
     return added;
 }
 
+// Read the file (binary; CRLF is handled at the line split inside, so the parsed
+// lines are exactly what text-mode getline used to produce) and parse it.
+inline int loadObj(Scene& s, const char* path, int matId, const Affine& xf,
+                   bool loadUV = false, const MtlResolver* matResolver = nullptr,
+                   UvProjection uvProj = UvProjection::None, int uvAxis = 1,
+                   double creaseAngleDeg = -1.0) {
+    std::string buf;
+    if (!assetbytes::readFile(path, buf)) {
+        std::fprintf(stderr, "loadObj: cannot open %s\n", path);
+        return 0;
+    }
+    return loadObjBytes(s, buf, path, matId, xf, loadUV, matResolver, uvProj, uvAxis,
+                        creaseAngleDeg);
+}
 
 // MeshXform overload: a single scale+Euler+translate transform (the common case).
 inline int loadObj(Scene& s, const char* path, int matId, const MeshXform& xf,
@@ -476,20 +483,17 @@ enum : unsigned { FTMESH_HAS_NORMALS = 1u, FTMESH_HAS_UVS = 2u };
 // authored-normals-win rule, same procedural UV and crease-smoothing passes (it
 // calls the same `meshFinishTris`) — so swapping a mesh's file format cannot change
 // how it shades. Returns triangles added (0 on failure, with `err` set).
-inline int loadFtmesh(Scene& s, const char* path, int matId, const Affine& xf,
-                      bool loadUV, std::string& err,
-                      UvProjection uvProj = UvProjection::None, int uvAxis = 1,
-                      double creaseAngleDeg = -1.0) {
-    std::FILE* fp = std::fopen(path, "rb");
-    if (!fp) { err = std::string("ftmesh: cannot open ") + path; return 0; }
-    std::string buf;
-    {
-        char tmp[1 << 16];
-        size_t got;
-        while ((got = std::fread(tmp, 1, sizeof tmp, fp)) > 0) buf.append(tmp, got);
-    }
-    std::fclose(fp);
-
+// As with `loadObjBytes`, `buf` is the content and `path` is only a label for the
+// diagnostics — so the identical decode serves a file and bytes handed over the loom
+// pipe. Everything the format guarantees (magic, version, the header-implied size,
+// index range) is checked here, where the bytes are, rather than at whatever supplied
+// them: the live channel is exactly the caller that must not be trusted to have
+// finished writing.
+inline int loadFtmeshBytes(Scene& s, const std::string& buf, const char* path,
+                           int matId, const Affine& xf,
+                           bool loadUV, std::string& err,
+                           UvProjection uvProj = UvProjection::None, int uvAxis = 1,
+                           double creaseAngleDeg = -1.0) {
     const size_t HDR = 24;
     if (buf.size() < HDR || std::memcmp(buf.data(), FTMESH_MAGIC, 8) != 0) {
         err = std::string("ftmesh: ") + path + " is not a .ftmesh (bad magic)";
@@ -580,6 +584,19 @@ inline int loadFtmesh(Scene& s, const char* path, int matId, const Affine& xf,
                 proceduralUV ? " [procedural UVs]" : "",
                 didSmooth ? " [crease-smoothed]" : "");
     return added;
+}
+
+inline int loadFtmesh(Scene& s, const char* path, int matId, const Affine& xf,
+                      bool loadUV, std::string& err,
+                      UvProjection uvProj = UvProjection::None, int uvAxis = 1,
+                      double creaseAngleDeg = -1.0) {
+    std::string buf;
+    if (!assetbytes::readFile(path, buf)) {
+        err = std::string("ftmesh: cannot open ") + path;
+        return 0;
+    }
+    return loadFtmeshBytes(s, buf, path, matId, xf, loadUV, err, uvProj, uvAxis,
+                           creaseAngleDeg);
 }
 
 inline int loadFtmesh(Scene& s, const char* path, int matId, const MeshXform& xf,

@@ -2221,15 +2221,39 @@ replacement for the renderer or the primary editing tool.**
           903 KB sidecar pays the same toll again. **~17 ms/frame (13 %) is AV opening files this
           process's own child just wrote** — more than the GPU kernel. `scraps/freshread.py`
           reproduces it. Full write-up in `known-issues.md`.
-      - **Next, and it is now the top item: get geometry out of the filesystem entirely.** loom and
-        ftrace already hold a stdio pipe open (`LoomBridge` ↔ `python -m loom.viewer`); the
-        `.ftmesh` bytes and the sidecar should ride **in that channel** (length-prefixed binary
-        frames, or shared memory) instead of via `%TEMP%`. `.ftmesh` is already the right wire
-        format — it just needs a transport that no on-access scanner watches. Worth ~17 ms of scan
-        plus ~1.3 ms of temp-file + `os.replace` on the writing side.
-      - Then, in order: **loom's own `bake`** (~37 ms, the Python side), the remaining **minijson**
-        parse (~13 ms of the sidecar), the **lexer** (~2 µs/token, regex-based) and the remaining
-        graph walk (~3.5 µs/token).
+      - **FOURTH SPEEDUP (v0.148.0): geometry left the filesystem entirely — the single biggest
+        win of the series.** loom and ftrace already hold a stdio pipe open, so the sidecar now
+        rides back as a JSON member of the ack and the meshes as raw payloads framed after it
+        against a `blobs:[{name,bytes}]` manifest, landing in an `assetbytes::Overlay` that
+        `ftsl::loadSource` consults instead of opening anything. Nothing per-frame touches the
+        disk — verified by the absence of any `ftrace_viewer_*` dir in `%TEMP%` during a run.
+        **n=104 on an idle card: 130.3 → 102.6 ms, 7.70 → 9.75 fps (1.27×; 1.35× over 0.146).**
+        `sidecar 22 → 2` (its `json` term 21 → 0 — the parse moved onto the bridge's worker
+        thread as part of parsing the ack it was already parsing) and `ftsl 31 → 21`
+        (`assets 10 → 1`). Two design notes worth keeping: the blob framing lives in
+        `serve_viewer`, not `handle`, so `handle` stays a pure dict→dict function the tests can
+        call directly; and loom's `EmitCtx.mesh_sink` diverts the bytes *without changing the
+        emitted `.ftsl` text*, so the scene still names the same paths and nothing downstream
+        knows which transport produced them.
+      - **FIFTH (v0.148.0): prefetch on-disk assets during the parse — and a benchmark that lied.**
+        `ftsl::loadSource` now starts an `assetbytes::Warmer` (one thread, read-and-discard,
+        64 MB cap) over the scene's `file "…"` paths, so the AV gate on *ordinary* file-backed
+        scenes overlaps the GPDA parse. Cold: **−21.5 %** (24-mesh scene), **−6.2 %** (gallery,
+        27 MB). Settled, where it can only lose: it doesn't. **The cautionary half:** the first
+        three rounds of `scraps/warmbench.cpp` said this was worthless (−2.2 %), because the
+        harness appended a byte to each copied asset "to make it novel to the scanner" — and
+        that write-and-close *starts the scan*, so its cold control was silently pre-warmed.
+        Caught by arithmetic, not intuition: the whole "cold" load measured 128.9 ms when the
+        gate alone should have been 234 ms. The premise it was built on ("the verdict is cached
+        per content") was also simply false. Full post-mortem in `known-issues.md`; the general
+        lesson is that **a benchmark which prepares its own cold case can warm it in the
+        process, and will then report a real optimization as a regression.**
+      - **Next, in the new measured order: loom's own `bake` is now the dominant term (~42 ms of
+        102.6).** That is the Python side — tessellation and modulator evaluation in
+        `loom.sweep`/`loom.scene`. Then `ftsl` ~21 (of which the GPDA parse is ~17), `raymarch`
+        ~20 (dominated by `readback` ~9, not the kernel), and `other` ~19 which is still
+        unattributed and should be split before being optimized. The **lexer** (~2 µs/token,
+        regex-based) and the remaining **graph walk** (~3.5 µs/token) sit inside that `ftsl` 21.
       - Shipped alongside: a **`play res`** draft resolution used only while playing (1.4 → 1.8 fps,
         ~25%) and a **`-play`** CLI flag that opens with the transport already running — the latter
         because driving an ImGui window with synthetic input to measure it is unreliable (ImGui

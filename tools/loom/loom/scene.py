@@ -1378,15 +1378,17 @@ class Scene:
 
     def emit(self, clock: Clock, cache: Optional[Cache] = None, *,
              assets_dir: Optional["Path"] = None, tag: str = "",
-             mesh_format: str = "obj") -> str:
+             mesh_format: str = "obj", mesh_sink: Optional[dict] = None) -> str:
         """Serialise the scene to ftsl source at ``clock``.
 
         ``mesh_format`` selects how file-backed meshes are written — ``"obj"`` for a
         portable, readable artifact, ``"ftmesh"`` for the binary format the live
-        viewer channel uses.  See :class:`~loom.ftsl_emit.EmitCtx`.
+        viewer channel uses.  ``mesh_sink``, when given, collects those meshes as
+        ``{path: bytes}`` *instead of* writing them, for a consumer that can take the
+        bytes directly.  See :class:`~loom.ftsl_emit.EmitCtx`.
         """
         ctx = EmitCtx(clock=clock, cache=cache, assets_dir=assets_dir, tag=tag,
-                      mesh_format=mesh_format)
+                      mesh_format=mesh_format, mesh_sink=mesh_sink)
         lo, hi, step = self.spectral
         header = f"scene {{ units {self.units}  spectral {fmt(lo)} {fmt(hi)} {fmt(step)} }}"
         blocks = [header, ""]

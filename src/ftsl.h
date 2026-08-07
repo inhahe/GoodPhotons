@@ -695,6 +695,19 @@ class Builder {
 public:
     std::string err;
 
+    // Asset contents supplied out-of-band, consulted before any mesh file is opened.
+    // Null for every ordinary load (a scene on disk names files, and files is what it
+    // gets); non-null only for the loom live channel, which sends the geometry it just
+    // derived down the pipe it already has open rather than through `%TEMP%` — see
+    // assetbytes.h for the ~8 ms/file this is dodging. Borrowed, not owned: the caller
+    // keeps it alive across `build`.
+    const assetbytes::Overlay* assets = nullptr;
+
+    // Bytes for `file` if the overlay has them, else null ("open it yourself").
+    const std::string* assetBytes(const std::string& file) const {
+        return assets ? assets->get(file) : nullptr;
+    }
+
     bool build(std::vector<Block>& blocks, Loaded& L) {
         records_ = &L.scene.records;   // stable handle for record refs at value sites (records added in Pass 1d)
         loadedRef_ = &L;               // ditto for §3.2 material-property refs (which may apply a material)
@@ -4232,10 +4245,12 @@ private:
             std::string merr;
             {
                 detail::AssetTimer _at;
-                if (loadFtmesh(L.scene, file.c_str(), id, xf, loadUV, merr,
-                               uvProj, uvAxis, creaseAngleDeg) == 0 && !merr.empty()) {
-                    fail("mesh: " + merr); return false;
-                }
+                const std::string* mb = assetBytes(file);
+                int n = mb ? loadFtmeshBytes(L.scene, *mb, file.c_str(), id, xf, loadUV,
+                                             merr, uvProj, uvAxis, creaseAngleDeg)
+                           : loadFtmesh(L.scene, file.c_str(), id, xf, loadUV, merr,
+                                        uvProj, uvAxis, creaseAngleDeg);
+                if (n == 0 && !merr.empty()) { fail("mesh: " + merr); return false; }
             }
         } else {
             // `smooth [<deg>]` (OBJ only): when the mesh has no `vn`, auto-generate
@@ -4249,8 +4264,13 @@ private:
             }
             {
                 detail::AssetTimer _at;
-                loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
-                        uvProj, uvAxis, creaseAngleDeg);
+                const MtlResolver* res = useNames ? &resolver : nullptr;
+                if (const std::string* mb = assetBytes(file))
+                    loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
+                                 uvProj, uvAxis, creaseAngleDeg);
+                else
+                    loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
+                            uvProj, uvAxis, creaseAngleDeg);
             }
         }
         // Record the object as a named mesh group (for -check-watertight): the range of
@@ -4418,10 +4438,12 @@ private:
             std::string merr;
             {
                 detail::AssetTimer _at;
-                if (loadFtmesh(L.scene, file.c_str(), id, xf, loadUV, merr,
-                               UvProjection::None, 1, creaseAngleDeg) == 0 && !merr.empty()) {
-                    fail("mesh_asset: " + merr); return false;
-                }
+                const std::string* mb = assetBytes(file);
+                int n = mb ? loadFtmeshBytes(L.scene, *mb, file.c_str(), id, xf, loadUV,
+                                             merr, UvProjection::None, 1, creaseAngleDeg)
+                           : loadFtmesh(L.scene, file.c_str(), id, xf, loadUV, merr,
+                                        UvProjection::None, 1, creaseAngleDeg);
+                if (n == 0 && !merr.empty()) { fail("mesh_asset: " + merr); return false; }
             }
         } else {
             double creaseAngleDeg = -1.0;
@@ -4432,8 +4454,13 @@ private:
             }
             {
                 detail::AssetTimer _at;
-                loadObj(L.scene, file.c_str(), id, xf, loadUV, useNames ? &resolver : nullptr,
-                        UvProjection::None, 1, creaseAngleDeg);
+                const MtlResolver* res = useNames ? &resolver : nullptr;
+                if (const std::string* mb = assetBytes(file))
+                    loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
+                                 UvProjection::None, 1, creaseAngleDeg);
+                else
+                    loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
+                            UvProjection::None, 1, creaseAngleDeg);
             }
         }
         Blas blas;
@@ -6902,7 +6929,8 @@ inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
 inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
                        Loaded& L, std::string& err,
                        const SupportFn& supported = {},
-                       LoadTiming* timing = nullptr) {
+                       LoadTiming* timing = nullptr,
+                       const assetbytes::Overlay* assets = nullptr) {
     // Report the keys nothing in the loader read. A warning rather than an error:
     // the check is new, and an old scene carrying a stale property should still
     // render — but it must SAY so, because the alternative (today's behaviour) is
@@ -6943,6 +6971,18 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     } _publish{timing, &phaseT0};
     if (timing) *timing = LoadTiming{};
 
+    // Start reading the scene's assets NOW, on another thread, so an on-access
+    // virus scanner does its ~8 ms-per-file work during the parse below instead of
+    // serially after it (assetbytes.h has the measurement). This is prefetch, not a
+    // load: the bytes are read and dropped, and every loader still opens the file it
+    // was going to open — it just finds the scan already done. Skipped entirely when
+    // an overlay already carries the bytes, since then nothing will be opened at all.
+    assetbytes::Warmer warmer;
+    if (!assets || assets->empty()) {
+        std::vector<std::string> paths = assetbytes::scanAssetPaths(src);
+        if (!paths.empty()) warmer.start(std::move(paths));
+    }
+
     // The shared grammar (src/gpda/ftsl_frontend.hpp) is the only front end.
     std::vector<Block> blocks;
     bool parsedOk = ftsl_gpda::parse(src, blocks, err);
@@ -6956,6 +6996,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
 
     if (preferIdx.empty()) {
         Builder bld;
+        bld.assets = assets;
         if (!bld.build(blocks, L)) { err = bld.err; return false; }
         reportUnknownKeys(L);
         return true;
@@ -6982,6 +7023,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     auto tryBuild = [&](const std::vector<int>& ch, Loaded& out) -> Trial {
         std::vector<Block> flat = flattenPrefer(blocks, preferIdx, ch);
         Builder bld;
+        bld.assets = assets;
         if (!bld.build(flat, out)) return {false, bld.err, nullptr};
         return {true, {}, supported ? supported(out) : nullptr};
     };
@@ -7032,6 +7074,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
         // Multi-node: rebuild once with the fully-resolved choices across all nodes.
         std::vector<Block> flat = flattenPrefer(blocks, preferIdx, choice);
         Builder bld;
+        bld.assets = assets;
         if (!bld.build(flat, L)) { err = bld.err; return false; }
     }
     for (size_t j = 0; j < preferIdx.size(); ++j)
@@ -7042,12 +7085,13 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
 }
 
 inline bool load(const std::string& path, Loaded& L, std::string& err,
-                 const SupportFn& supported = {}, LoadTiming* timing = nullptr) {
+                 const SupportFn& supported = {}, LoadTiming* timing = nullptr,
+                 const assetbytes::Overlay* assets = nullptr) {
     std::ifstream f(path);
     if (!f) { err = "cannot open scene file: " + path; return false; }
     std::stringstream ss; ss << f.rdbuf();
     std::string src = ss.str();
-    return loadSource(src, path, L, err, supported, timing);
+    return loadSource(src, path, L, err, supported, timing, assets);
 }
 
 } // namespace ftsl

@@ -39,6 +39,8 @@ int runViewerGui(const std::string&, const std::string&, bool) {
 #include <cstring>
 #include <cstdlib>                 // strtoul: parsing the pid out of a scratch dir name
 #include <cwctype>
+#include <memory>                  // shared_ptr: the live channel's in-memory payload
+#include "assetbytes.h"            // asset bytes handed to the loader instead of paths
 
 // Bridge to ftrace's own scene loader + GPU field raymarcher (F7 primary path).
 // The viewer IS the ftrace binary, so it can parse loom's emitted `.ftsl` with the
@@ -180,7 +182,16 @@ struct Sidecar {
     bool load(const std::string& path) {
         std::string text;
         if (!readFile(path, text)) { err = "cannot open " + path; return false; }
-        if (!minijson::parse(text, root, err)) return false;
+        minijson::Value v;
+        if (!minijson::parse(text, v, err)) return false;
+        return adopt(std::move(v));
+    }
+    // Take over an already-parsed tree. The live channel gets its sidecar as an
+    // object *inside* loom's ack, so by the time it reaches here the parse has
+    // already happened (on the bridge's worker thread); re-serialising it only to
+    // re-parse it would be pure waste. Moves — this tree is ~900 KB on a real scene.
+    bool adopt(minijson::Value v) {
+        root = std::move(v);
         if (!root.isObject()) { err = "sidecar root is not an object"; return false; }
         ok = true;
         return true;
@@ -2573,12 +2584,31 @@ struct LoomJob {
     bool wantSource  = true;    // re-emit .ftsl: the Render tab's raymarched field
 };
 
+// One finished re-derivation, entire in memory. NOTHING here names a file.
+//
+// It used to: loom wrote a `.json` and a `.ftsl` (plus the mesh assets the `.ftsl`
+// referenced) into a scratch directory and the viewer opened them back. Measured
+// 2026-08-06, that cost ~17 ms of a 130 ms frame — not I/O but Windows Defender's
+// on-access scan, which charges a flat ~8 ms to open a file another process wrote a
+// millisecond ago and cannot be avoided by writing faster. loom and ftrace already
+// hold a pipe open between them, so the bytes come down that instead.
+//
+// Handed to the UI thread by `shared_ptr` and never copied: the sidecar tree alone is
+// ~900 KB, and deep-copying it under the bridge's lock once a frame would give back
+// most of what this change is buying.
+struct LoomPayload {
+    minijson::Value     sidecar;              // parsed off the ack, on the worker
+    bool                hasSidecar = false;
+    std::string         source;               // .ftsl text
+    bool                hasSource  = false;
+    assetbytes::Overlay assets;               // mesh bytes the source names by path
+};
+
 struct LoomResult {
     long long   seq = 0;
     bool        ok  = false;
     std::string err;
-    std::string sidecarPath;    // temp file loom wrote (empty when not requested)
-    std::string sourcePath;
+    std::shared_ptr<LoomPayload> payload;
     double      ms = 0.0;
 };
 
@@ -2618,13 +2648,10 @@ struct LoomBridge {
         }
         link_.stop();
         if (!tempDir_.empty()) {
-            std::lock_guard<std::mutex> lk(m_);
-            for (const auto& f : temps_) DeleteFileA(f.c_str());
-            temps_.clear();
-            // Sweep the whole scratch directory, not just the files we named: emitting
-            // an .ftsl also drops the mesh assets it references (loom's `asset_path`
-            // writes them next to `out` -- .ftmesh on the live channel, .obj if the
-            // scene asked for text), and RemoveDirectory fails on a non-empty dir.
+            // Nothing is written there any more (the live channel is all in-memory),
+            // but a directory left by an OLDER ftrace under this same pid name would
+            // otherwise never be collected, and the sweep is one syscall on an empty
+            // dir. Files first: RemoveDirectory fails on a non-empty one.
             WIN32_FIND_DATAA fd{};
             HANDLE h = FindFirstFileA((tempDir_ + "\\*").c_str(), &fd);
             if (h != INVALID_HANDLE_VALUE) {
@@ -2648,10 +2675,13 @@ struct LoomBridge {
         cv_.notify_one();
     }
 
+    // Moves: the payload is ~1 MB and the bridge must not keep a second reference to
+    // it alive until the next bake happens to overwrite the slot.
     bool take(LoomResult& out) {
         std::lock_guard<std::mutex> lk(m_);
         if (!hasResult_) return false;
-        out = result_;
+        out = std::move(result_);
+        result_ = LoomResult{};
         hasResult_ = false;
         return true;
     }
@@ -2679,29 +2709,7 @@ struct LoomBridge {
     }
     const std::string& command() const { return link_.cmdline; }
 
-    // temp scratch files the UI has finished reading
-    void reap(const std::string& path) {
-        if (path.empty()) return;
-        DeleteFileA(path.c_str());
-        std::lock_guard<std::mutex> lk(m_);
-        forgetLocked(path);
-    }
-
 private:
-    // `temps_` is the outstanding-scratch-file set, not a log: a long sweep posts
-    // hundreds of jobs, so entries must leave it as the files are deleted or it (and
-    // the %TEMP% directory it mirrors) would grow without bound for the session.
-    void forgetLocked(const std::string& path) {
-        for (size_t i = 0; i < temps_.size(); ++i)
-            if (temps_[i] == path) { temps_[i] = temps_.back(); temps_.pop_back(); return; }
-    }
-
-    void dropLocked(const std::string& path) {
-        if (path.empty()) return;
-        DeleteFileA(path.c_str());
-        forgetLocked(path);
-    }
-
     // Delete `ftrace_viewer_<pid>` directories left behind by viewers that died without
     // running stop() — a crash, or the user killing the process. `stop()` handles the
     // orderly exit, but nothing can clean up after a kill except the *next* run, and a
@@ -2739,6 +2747,12 @@ private:
         FindClose(h);
     }
 
+    // The live channel writes nothing, so this directory is now only a NAMING scheme:
+    // loom builds its mesh paths under it and the same strings become the `file`
+    // arguments in the emitted `.ftsl`, which is what keys the byte overlay ftrace
+    // loads from. It is deliberately still per-pid and still swept, because older
+    // builds *did* write here and because a `mesh_format: "obj"` caller could ask for
+    // files again. Not created: nothing needs it to exist.
     bool makeTempDir(std::string& err) {
         char tmp[MAX_PATH + 1];
         DWORD n = GetTempPathA(MAX_PATH, tmp);
@@ -2746,24 +2760,13 @@ private:
         sweepOrphanTempDirs(tmp);
         char dir[MAX_PATH + 64];
         std::snprintf(dir, sizeof dir, "%sftrace_viewer_%lu", tmp, GetCurrentProcessId());
-        if (!CreateDirectoryA(dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
-            err = "cannot create the viewer scratch directory"; return false;
-        }
         tempDir_ = dir;
         return true;
     }
 
-    // Called on the worker thread, so the bookkeeping must take the lock (tempDir_ is
-    // written once, before the worker exists, and is only cleared after it is joined).
-    std::string scratch(long long seq, const char* ext) {
-        char b[MAX_PATH + 64];
-        std::snprintf(b, sizeof b, "%s\\live_%lld%s", tempDir_.c_str(), seq, ext);
-        std::string p = b;
-        { std::lock_guard<std::mutex> lk(m_); temps_.push_back(p); }
-        return p;
-    }
-
-    std::string requestLine(const char* cmd, const LoomJob& j, const std::string& out) {
+    // `extra` is spliced in before the closing brace, for the per-command fields.
+    std::string requestLine(const char* cmd, const LoomJob& j,
+                            const std::string& extra = std::string()) {
         std::string s = "{\"cmd\":\"";
         s += cmd;
         s += "\",\"clock\":{\"frame\":" + std::to_string(j.frame)
@@ -2772,8 +2775,18 @@ private:
             if (i) s += ",";
             s += "\"" + jsonEsc(j.params[i].first) + "\":" + j.params[i].second;
         }
-        s += "},\"out\":\"" + jsonEsc(out) + "\"}";
+        s += "}" + extra + "}";
         return s;
+    }
+
+    // Move a named object out of an ack rather than copying it. The sidecar is ~900 KB
+    // of parsed tree; `find()` hands back a const pointer, and taking a copy of that
+    // would undo the whole point of parsing it exactly once.
+    static bool stealMember(minijson::Value& ack, const char* key, minijson::Value& out) {
+        if (ack.type != minijson::Value::Object) return false;
+        for (auto& kv : ack.obj)
+            if (kv.first == key) { out = std::move(kv.second); return true; }
+        return false;
     }
 
     void workerMain() {
@@ -2789,25 +2802,40 @@ private:
             }
             LoomResult r;
             r.seq = job.seq;
+            r.payload = std::make_shared<LoomPayload>();
             LARGE_INTEGER f, t0, t1;
             QueryPerformanceFrequency(&f);
             QueryPerformanceCounter(&t0);
             std::string err;
             bool ok = true;
             minijson::Value ack;
-            // A failed request may still have left a partial file behind: drop it here
-            // rather than let it sit in temps_ until the viewer exits.
+            // Both requests come back INLINE — no `out`, so loom writes nothing and the
+            // reply carries the payload. The sidecar rides in the ack's JSON (already
+            // parsed by the time `call` returns, on this thread, off the UI's); the
+            // meshes ride as binary attachments after the ack line, because base64 in
+            // JSON would cost a 4/3 blowup plus an encode and a decode for bytes that
+            // are already exactly what the loader wants.
             if (ok && job.wantSidecar) {
-                std::string out = scratch(job.seq, ".json");
-                ok = link_.call(requestLine("introspect", job, out), ack, err);
-                if (ok) r.sidecarPath = out;
-                else { std::lock_guard<std::mutex> lk(m_); dropLocked(out); }
+                ok = link_.call(requestLine("introspect", job), ack, err);
+                if (ok) r.payload->hasSidecar =
+                            stealMember(ack, "sidecar", r.payload->sidecar);
             }
             if (ok && job.wantSource) {
-                std::string out = scratch(job.seq, ".ftsl");
-                ok = link_.call(requestLine("emit", job, out), ack, err);
-                if (ok) r.sourcePath = out;
-                else { std::lock_guard<std::mutex> lk(m_); dropLocked(out); }
+                std::vector<loomlink::Blob> blobs;
+                // `assets_dir` no longer points anywhere real; it is only how loom
+                // *names* the meshes, and those names are what the overlay is keyed by.
+                std::string extra = ",\"assets_dir\":\"" + jsonEsc(tempDir_)
+                                  + "\",\"assets\":\"inline\"";
+                ok = link_.call(requestLine("emit", job, extra), ack, err, &blobs);
+                if (ok) {
+                    minijson::Value src;
+                    if (stealMember(ack, "source", src) && src.isString()) {
+                        r.payload->source    = std::move(src.str);
+                        r.payload->hasSource = true;
+                    }
+                    for (loomlink::Blob& b : blobs)
+                        r.payload->assets.put(b.name, std::move(b.bytes));
+                }
             }
             QueryPerformanceCounter(&t1);
             r.ms = f.QuadPart ? 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart) : 0.0;
@@ -2817,20 +2845,12 @@ private:
                 std::lock_guard<std::mutex> lk(m_);
                 // A result must never overwrite a FRESHER one the UI has not read yet;
                 // with one job in flight at a time that can't happen, but the guard
-                // makes the invariant explicit rather than incidental.
+                // makes the invariant explicit rather than incidental. Superseding an
+                // unread result now just drops its shared_ptr — there is no scratch
+                // file left over for anyone to have to collect.
                 if (!hasResult_ || r.seq >= result_.seq) {
-                    // Superseding an unread result: the UI will never call reap() for
-                    // its files, so they have to go here or a fast sweep leaves one
-                    // scratch pair per skipped bake behind in %TEMP%.
-                    if (hasResult_) {
-                        dropLocked(result_.sidecarPath);
-                        dropLocked(result_.sourcePath);
-                    }
-                    result_ = r;
+                    result_ = std::move(r);
                     hasResult_ = true;
-                } else {
-                    dropLocked(r.sidecarPath);
-                    dropLocked(r.sourcePath);
                 }
                 running_ = false;
                 if (!ok && !link_.alive()) { dead_ = true; deadErr_ = err; }
@@ -2849,7 +2869,6 @@ private:
     std::string deadErr_;
     long long seq_ = 0;
     std::string tempDir_;
-    std::vector<std::string> temps_;
     std::vector<std::pair<std::string, minijson::Value>> paramDefaults_;
     std::map<std::string, std::string> paramTypes_;
 };
@@ -3188,8 +3207,8 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
     // F4 skins — needs the device, so it happens after CreateDeviceD3D. Relative
     // image paths in the sidecar fall back to the sidecar's own directory.
     // baseDir is hoisted out because a live re-derivation rebuilds the skins against
-    // the SAME directory — loom's scratch sidecar lives in %TEMP%, but the image paths
-    // in it are still relative to the original scene, not to the scratch file.
+    // the SAME directory — a re-derived sidecar has no file of its own at all (it comes
+    // down the pipe), and its image paths were always relative to the original scene.
     std::string baseDir;
     {
         size_t cut = sidecarPath.find_last_of("/\\");
@@ -3202,11 +3221,11 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
     // is the GEOMETRY; the VIEW is ours, so orbit / zoom / dim selection / tab choice are
     // deliberately preserved — a parameter sweep that snapped the camera back to its
     // default on every bake would be unusable.
-    auto adoptSidecar = [&](const std::string& path) -> bool {
+    auto adoptSidecar = [&](minijson::Value&& tree) -> bool {
         Sidecar ns;
         {
             MsTimer _t(&live.msAdoptJson);
-            if (!ns.load(path)) { live.lastErr = "sidecar: " + ns.err; return false; }
+            if (!ns.adopt(std::move(tree))) { live.lastErr = "sidecar: " + ns.err; return false; }
         }
         std::vector<int> oldIds;
         for (const auto& n : dag.nodes) oldIds.push_back(n.id);
@@ -3289,17 +3308,20 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                 ++live.baked;
                 live.lastMs  = r.ms;
                 live.lastErr = r.ok ? std::string() : r.err;
-                if (r.ok) {
-                    if (!r.sidecarPath.empty()) {
+                if (r.ok && r.payload) {
+                    if (r.payload->hasSidecar) {
                         MsTimer _t(&live.msSidecar);
-                        adoptSidecar(r.sidecarPath);
+                        adoptSidecar(std::move(r.payload->sidecar));
                     }
-                    if (!r.sourcePath.empty()) {
+                    if (r.payload->hasSource) {
                         ftsl::Loaded nl;
                         std::string  nerr;
                         ftsl::LoadTiming lt;
                         MsTimer _t(&live.msFtsl);
-                        if (ftsl::load(r.sourcePath, nl, nerr, {}, &lt)) {
+                        // The overlay is why nothing here opens a file: every `mesh`
+                        // the emitted source names came down the pipe with it.
+                        if (ftsl::loadSource(r.payload->source, "<loom live>", nl, nerr,
+                                             {}, &lt, &r.payload->assets)) {
                             live.msFtslParse  = lt.msParse;
                             live.msFtslBuild  = lt.msBuild;
                             live.msFtslAssets = lt.msAssets;
@@ -3322,8 +3344,7 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                         }
                     }
                 }
-                bridge.reap(r.sidecarPath);
-                bridge.reap(r.sourcePath);
+                r.payload.reset();   // last reference: the ~1 MB frame goes here
                 // F8(a): a bake landed, so the clock may take its next step. Doing it
                 // HERE -- rather than on a timer -- is what makes play show every
                 // frame instead of only the ones that won the latest-wins slot. A
