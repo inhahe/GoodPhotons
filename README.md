@@ -10,6 +10,42 @@ forward pinhole mode, and a small scene-description language (**FTSL**).
 
 ---
 
+## Demo
+
+<video src="https://github.com/inhahe/GoodPhotons/raw/main/pastel_jack_ring.mp4"
+       controls muted loop playsinline width="480">
+  Your viewer can't play embedded video —
+  <a href="pastel_jack_ring.mp4">download the clip</a> instead.
+</video>
+
+*A gyroid-glass jumping jack tumbling inside a gold ring, 432 frames at 60 fps
+(7.2 s, 480²), seamlessly looping. The ring's tilted plane precesses in the
+**opposite** sense to the jack's own lean, because turning them the same way made
+the two read as geared to one another rather than as independent motions.
+Reproduce it with
+`python tools/loom/examples/pastel_jack.py --render --name pastel_jack_ring`
+([`tools/loom/examples/pastel_jack.py`](tools/loom/examples/pastel_jack.py); the
+counter-rotation is that script's default `--ring-turns -3`), which renders every
+frame at `-mode W -spp 8 -gi 24 -gi-clamp 0.15 -whitted-grid 3` and assembles the
+MP4 and GIF.*
+
+> **This clip was rendered by a _backward_ tracer, not the forward one.** Mode `W`
+> is the deterministic Whitted preview, which is mode `R`'s **backward** camera-ray
+> walk with every Monte-Carlo draw replaced by a fixed quadrature — rays start at the
+> camera and are traced toward the lights, the opposite of the forward photon core
+> the project is named for. It was the right tool here for a reason that is worth
+> stating plainly: an animation needs every frame to be *quiet*, and a forward mode
+> reaches that only by converging away its noise, frame after frame. A deterministic
+> mode has no noise to converge, so each frame is final in seconds and — crucially —
+> consecutive frames carry no independently-drawn grain to shimmer against each other.
+> The trade is that mode `W`'s global illumination is a one-bounce `-gi` gather rather
+> than the real multi-bounce transport modes `A`/`B`/`C`/`M`/`S`/`U` deliver. So take
+> this as a demonstration of the geometry, materials and animation tooling, **not** as
+> a showcase of the forward light-transport engine or of ftrace's spectral caustics —
+> for those see the mode table below and the gallery scenes.
+
+---
+
 ## Highlights
 
 - **Spectral transport** — continuous per-photon wavelengths over a configurable band
@@ -136,6 +172,9 @@ Useful CMake options:
 ```sh
 # List the common flags, grouped by task, and exit
 ftrace -h            # or --help
+
+# Which build is this? (the repo's VERSION, baked in at compile time)
+ftrace -version      # or --version / -V   ->  "ftrace 0.141.0"
 
 # Built-in Cornell box, forward pinhole splat (mode B), 512²
 ftrace -scene cornell -n 200000000 -r 512 -o cornell.png
@@ -1805,7 +1844,7 @@ first.
 ## Geometry
 
 `sphere`, `quad` (parallelogram), `triangle`, and `mesh` (**OBJ, glTF 2.0 / GLB,
-and Autodesk FBX** import — the loader dispatches on file extension). glTF brings
+Autodesk FBX, and `.ftmesh`** import — the loader dispatches on file extension). glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
 roughness → lobe width; `import_materials no` forces the FTSL `material` instead).
@@ -1840,6 +1879,21 @@ softened (Chiang et al. 2019) so low-poly smooth meshes show a smooth shadow gra
 instead of hard facet slivers — applied uniformly to every mode including `R`. Flat
 meshes are unaffected — both the correction and the softening are exactly a no-op when
 the shading and geometric normals coincide.)
+**`.ftmesh`** is ftrace's own compact binary mesh: a 24-byte header followed by
+little-endian `f32` positions (plus optional normals and UVs) and `u32` triangle
+indices. It exists for the **loom live viewer**, which re-derives and reloads a mesh
+on every frame — parsing that as text was the single largest asset cost, and a binary
+blob loads ~2.4× faster overall (~6.5× on read+decode alone) at about half the file
+size. It is also *more* precise than the OBJ text it replaces, which went through
+`%.6g` (6 significant digits, against `f32`'s ~7.2). Write one from Python with
+`loom.ftmesh.write_ftmesh(path, verts, faces)`, or have any loom scene emit them by
+passing `mesh_format="ftmesh"` to `Scene.emit` (the live viewer channel already
+defaults to it — and now sends those bytes straight down its pipe rather than via a
+file, so the format doubles as the live wire format). `Scene.emit` also takes a
+`mesh_sink=` dict, which collects the encoded meshes in memory instead of writing
+them while leaving the emitted scene text byte-for-byte identical — that is the hook
+the live channel uses. `mesh { smooth … }`, `uv …`, transforms and materials all behave
+identically to the OBJ path — both formats share the same normal-synthesis code.
 Meshes without their own `vt` coordinates can be textured via a procedural
 projection — `mesh { uv planar|spherical|cylindrical [x|y|z] }` synthesizes UVs
 at load time from the mesh's world-space bounding box (the optional token is the
@@ -3044,9 +3098,10 @@ alone can't restore, so they are not disk-resumable.
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
-| `-window` | Open a real OS window (Win32; no-op off Windows) showing the actual tone-mapped pixels, refreshed each `-interval` tick. The image is **presented by Direct3D 11** (a flip-model swap chain; the control strip below it stays GDI), which is what keeps a fast renderer fast: the previous CPU present — a per-pixel RGB→BGRA repack plus a `HALFTONE` `StretchDIBits` — cost **9 ms/frame** at 1920², more than the render it was displaying, and charged it to the render thread; it is now **~1.3 ms**. In the GPU-rasterized interactive explorer (`-raster -explore -device gpu`) the frame skips host memory **entirely**: CUDA is handed the window's own D3D11 texture and the tone-map kernel writes the finished pixels straight into it, so there is no device→host download, no re-upload, and no host touch of the image at all (measured at 3840²: **26.1 ms → 9.7 ms** per displayed frame). ftrace prints one line saying which way it's presenting; the copy path is used automatically whenever the fast one can't be (notably when D3D picks a different adapter than the CUDA device, as on hybrid iGPU/dGPU laptops, or when a flypath overlay has to be drawn into the pixels). `FTRACE_LIVE_GDI=1` forces the old GDI path (and ftrace falls back to it automatically if D3D can't start). Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>`, then the transport mode driving that frame (`mode B (pinhole)`, `mode D (BDPT)`, `mode M (photon map)`, …; a per-camera flight shows the mode of the frame currently on screen), then the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing, how it's being rendered, and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
+| `-window` | Open a real OS window (Win32; no-op off Windows) showing the actual tone-mapped pixels, refreshed every `-window-interval` (default 0.2 s, independent of the `-interval` disk-write cadence — so the image builds up on screen while it renders rather than appearing only when it's finished). The image is **presented by Direct3D 11** (a flip-model swap chain; the control strip below it stays GDI), which is what keeps a fast renderer fast: the previous CPU present — a per-pixel RGB→BGRA repack plus a `HALFTONE` `StretchDIBits` — cost **9 ms/frame** at 1920², more than the render it was displaying, and charged it to the render thread; it is now **~1.3 ms**. In the GPU-rasterized interactive explorer (`-raster -explore -device gpu`) the frame skips host memory **entirely**: CUDA is handed the window's own D3D11 texture and the tone-map kernel writes the finished pixels straight into it, so there is no device→host download, no re-upload, and no host touch of the image at all (measured at 3840²: **26.1 ms → 9.7 ms** per displayed frame). ftrace prints one line saying which way it's presenting; the copy path is used automatically whenever the fast one can't be (notably when D3D picks a different adapter than the CUDA device, as on hybrid iGPU/dGPU laptops, or when a flypath overlay has to be drawn into the pixels). `FTRACE_LIVE_GDI=1` forces the old GDI path (and ftrace falls back to it automatically if D3D can't start). The window is put on screen **before the render starts** — as soon as the scene has loaded and the frame size is known — showing a near-black placeholder with the current stage in the title bar (`preparing…`, `mode W — starting…`), then the first rendered chunk replaces it. Previously it was created lazily by the first repaint, so in the ray-traced modes no window existed until the render was already over and the finished image appeared to flash up for a split second as the process exited. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>`, then the transport mode driving that frame (`mode B (pinhole)`, `mode D (BDPT)`, `mode M (photon map)`, …; a per-camera flight shows the mode of the frame currently on screen), then the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing, how it's being rendered, and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
 | `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still). Implies `-window`. |
-| `-interval <s>` | Periodic image write / preview / window refresh (default 15 s) |
+| `-interval <s>` | Periodic image write / status line / ANSI `-preview` refresh (default 15 s). This is the **crash-safety** cadence — how often the PNG and the `.ftbuf` checkpoint are rewritten — and is deliberately *not* what drives the live window (see `-window-interval`). |
+| `-window-interval <s>` | How often the `-window` live view repaints (default 0.2 s), independent of `-interval`. The two used to share one timer, which meant any render finishing inside one interval never showed a single live frame — a 5 s `-mode W` frame under `-interval 8` painted once, as the process was exiting, so the finished image just flashed and vanished. They are separate now because they want opposite cadences: rewriting a PNG and a multi-megabyte checkpoint five times a second is pointless disk churn, while repainting a window every 15 s defeats the point of having one. Repaint granularity is bounded below by the renderer's own chunk size (one chunk ≈ 0.15 s of GPU work, minimum 1 spp), so on a 480² `-mode W -spp 8` frame you get one repaint per spp — the first complete image lands after ~0.6 s instead of after 5 s. Measured cost of the extra repaints there: **+3.9 %** of render time (a repaint tone-maps and presents the whole frame, ~25 ms at 480²). The floor is adaptive — never less than the larger of this value and 12× what the last repaint actually cost — so a 4K film backs itself off instead of spending all its time painting. `0` means "every chunk, subject only to that budget". `FTRACE_WINDOW_DEBUG=1` logs each repaint and its cost. |
 | `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
 | `-raster-bench <n>` | Raster **frame-rate benchmark**: after the scene is built (and uploaded, on the GPU), re-render the first selected camera `n` times and report steady-state **ms/frame** (min/median/mean + fps) — the interactive explorer's per-move cost, measured independently of startup. With `-device gpu` also prints a per-pass breakdown (clearvis/project/raster/shade/clear/expose+encode/download, timed with CUDA events on the GPU timeline). Add `-window` and it also reports the **live-window present tail** — what handing each finished frame to the preview costs the render thread — because that tail used to be larger than the render itself and a backend speedup is only real if it stays small. With `-device gpu -window` it then runs a **second, zero-copy phase**: the same `n` frames rendered directly into the window's D3D11 texture, reported as one combined `render+present` figure (there is no separate tail to report — there is no handoff) plus its own per-pass breakdown, so the two presentation paths can be compared pass by pass on one run. Note that the zero-copy *median* pins at the display refresh (16.67 ms / 60.0 fps) because presenting blocks on vblank once both back buffers are queued — read **min** for the true pipeline cost. Writes the last frame to `-o` so backends/builds can be byte-compared. |
@@ -3058,7 +3113,7 @@ alone can't restore, so they are not disk-resumable.
 | `-anim <file.json>` | Edit a **loom `CurveDrive` sidecar** in the interactive fly editor (implies `-explore`). The editor's control points become the drive's N-dimensional points: channels 0–2 are the point you see and move in 3-D, channels 3+ are non-spatial values carried along per point. **Save** writes the reshaped curve back to the sidecar atomically, preserving the drive's name/mode/dims and every channel → scene-variable **binding**. A sidecar that doesn't exist yet is created on the first Save (from whatever control points the scene seeded), so this is also how you start a drive. See **Editing a loom animation drive** under **Interactive fly camera**. |
 | `-loom <scene.py>` | Keep a **live loom process** alongside the window so the scene can be *re-derived*, not merely re-viewed. With `-anim` it turns the fly editor into a real animation editor: scrubbing asks loom for the scene as of that point on the drive, so the **bound scene variables** move in the viewport (loom does the curve sampling, so the preview can't drift from the final render), and the panel grows a **loom bind row** for editing channel → variable bindings and the channel count live. With `-viewer` it drives the loom sidecar viewer's **Live (loom)** panel instead (one control per `build()` parameter, plus the sweep axis). See **Editing a loom animation drive** and **Live re-derivation**. |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
-| `-stop [<pid>\|all]` | **Stop a running render cleanly, from another shell.** `ftrace -stop <pid>` asks that render to do exactly what Ctrl-C does — finish the current chunk, write the final image **and** `.ftbuf` checkpoint, release the CUDA context through the graceful-shutdown path — then waits (up to 120 s) for it to actually exit, so it's safe to script a rebuild right after. `-stop all` targets every running render; a bare `-stop` just **lists** them (pid + scene → output). This exists because a render launched detached has no console to Ctrl-C into, and **force-killing ftrace mid-CUDA is a known way to wedge the NVIDIA driver into a TDR/bugcheck** — so never `taskkill /F` a render, use this. It also releases a window being held open by `-keepwindow`. Implemented as a sentinel file under `<temp>/ftrace/` (a `<pid>.run` entry per live render, a `<pid>.stop` to signal it), which — unlike a named kernel event — crosses the session / window-station boundary between a detached render and the shell signalling it. |
+| `-stop [<pid>\|all]` | **Stop a running render cleanly, from another shell.** `ftrace -stop <pid>` asks that render to do exactly what Ctrl-C does — finish the current chunk, write the final image **and** `.ftbuf` checkpoint, release the CUDA context through the graceful-shutdown path — then waits (up to 120 s) for it to actually exit, so it's safe to script a rebuild right after. `-stop all` targets every running render; a bare `-stop` just **lists** them (pid + scene → output). This exists because a render launched detached has no console to Ctrl-C into, and **force-killing ftrace mid-CUDA is a known way to wedge the NVIDIA driver into a TDR/bugcheck** — so never `taskkill /F` a render, use this. It also releases a window being held open by `-keepwindow`. Implemented as a sentinel file under `<temp>/ftrace/` (a `<pid>.run` entry per live render, a `<pid>.stop` to signal it), which — unlike a named kernel event — crosses the session / window-station boundary between a detached render and the shell signalling it. A stop that arrives while the process is still **loading the scene** aborts the load rather than being waited out: it prints `[stop] scene load stopped before rendering — nothing was rendered or written.` and exits **1** (no scene was built, so nothing could be rendered — the non-zero exit is the correct outcome, not an error in your `.ftsl`). |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |
 | `-hdr` | Also write a **32-bit float PFM** beside `-o` (`<out>.pfm`) holding the **scene-linear** image — the exact buffer the tone map consumes, with no exposure, no gamma and **no clamp**. Written on every periodic in-progress write too, so a still-converging render can be metered. Use it whenever you intend to *measure* rather than look: an 8-bit PNG clamps at white, and a caustic is by definition the brightest thing in frame, so its core prints as `#FFFFFF` with all three channels **equal** — the tone map destroys the caustic's colour and its peak-to-screen ratio before any analysis can see them. (Values are radiance in the film's own scale; peak/median ratios and chromaticity are exposure-invariant, so two renders shot at different stops stay comparable.) PFM is a 3-line ASCII header + raw little-endian `float32` RGB triples, raster order left-to-right **bottom-to-top**. |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
@@ -3258,6 +3313,46 @@ make that visible (`posted > baked` is the collapsing working), alongside the la
 sequence number and wall time. `auto` off defers bakes to the **re-derive now** button for
 scenes too slow to rebuild interactively; a scene that raises, or emits an `.ftsl` ftrace
 can't load, reports the error in the panel and leaves the last good geometry on screen.
+
+The clock **plays**, not only scrubs: a **play/pause** button (or the **spacebar**), a `|<`
+rewind, **loop** and **ping-pong** toggles, and **left/right arrows** to step one frame.
+Playback is *paced by the bake*, not by a wall-clock timer — the clock advances only when a
+re-derivation lands. That is deliberate: the queue is latest-wins, so a play loop posting on
+a timer would have most of its frames superseded before they ran and would show a stutter of
+whichever ones won the slot rather than the animation. Pacing to the bake plays every frame,
+and the readout states the **measured** rate ("playing 1.7 fps") rather than pretending to a
+frame rate it isn't hitting. Play needs somewhere to advance to, so it is disabled when
+`frames` is 1 — which is what a sidecar saved without a clock advertises; save with
+`ViewerModel.save_sidecar(path, Clock.at_frame(0, N))`. Adding **`-play`** opens with the
+transport already running, so a loop can be watched — or its per-frame cost read off the
+`[play]` trace on stdout — without anyone having to click into the window first.
+
+The Live panel breaks the played frame down into its parts (`bake`, `sidecar`, `ftsl`,
+`raymarch`, and an explicit `other` residual so the numbers account for the whole period),
+so you can see where a slow frame actually goes rather than guessing. `raymarch` is broken
+down further into `upload + kernel + readback`, because those scale with different things —
+scene size, pixels and pixels respectively — and only `kernel` runs on the GPU's shaders.
+That distinction matters: **another process using the GPU inflates `kernel` and nothing
+else**, so a breakdown taken on a busy card will overstate the raymarch and understate
+everything else. Check with `tools/gpu_by_process.ps1` before drawing conclusions
+(`nvidia-smi` cannot attribute utilisation per process under Windows' WDDM driver model).
+
+Measured on an idle card, a played frame is dominated by the loom round-trip — emitting the
+scene and adopting it each frame — with the whole raymarch under 10 %. Successive rounds of
+profiling that round-trip have taken playback from **4.61 to 9.75 fps**; the largest single
+step was getting geometry **out of the filesystem altogether**. The mesh and the sidecar now
+travel over the stdio pipe the two processes already share, rather than through temp files —
+which not only skips the I/O but sidesteps the on-access virus scan those freshly-written
+files attracted, and that scan was costing more per frame than the entire GPU kernel. As of
+this version a played frame writes **nothing to disk at all**, and loom's own tessellation is
+what's left as the dominant term. Scenes that *do* load assets from disk get a related
+speedup: their files are prefetched on a background thread while the `.ftsl` is being parsed,
+which is worth up to ~20 % on a mesh-heavy scene's first load and costs nothing when the
+files are already warm. The Render pane's **`play res`** slider renders at a reduced draft
+resolution *only while the transport is playing*, snapping back to full resolution the moment
+you pause, which buys back the part of the cost that does scale with pixels. See
+`known-issues.md` for the full breakdown — including a worked example of a benchmark that
+confidently reported one of these optimizations as a regression.
 
 ---
 

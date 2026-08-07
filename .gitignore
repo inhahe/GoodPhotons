@@ -36,6 +36,12 @@
 # untracked: they are source material of unverified provenance (one is a watermarked
 # stock comp — see known-issues.md), and the prepared PNGs are the actual asset.
 !/textures/*.png
+# The README's demo clip. It IS a rendered output like every other .mp4 here, but it is
+# also the only moving picture of what ftrace does that anyone landing on the repo page
+# will see, so it has to live in the repo rather than merely be regenerable from it
+# (`python tools/loom/examples/pastel_jack.py --ring-turns -3`). 480x480 / 7.2 s / 3.4 MB
+# — deliberately small enough not to bloat a clone.
+!/pastel_jack_ring.mp4
 
 # 3D model assets (large binaries kept on disk, never committed — cameras/, meshes/,
 # Meshy_* textures, etc. Scenes reference them locally; they don't belong in history.)
@@ -61,6 +67,9 @@
 # ...except this one: a hand-written UV'd unit quad that a shipped scene
 # (scenes/emit_pattern.ftsl) depends on, not a generated mesh.
 !meshes/uvquad.obj
+# Binary meshes (loom.ftmesh). Always generated -- the live viewer channel writes one
+# per frame into its scratch dir; nothing checked in depends on one existing.
+*.ftmesh
 
 # Reference PDFs (e.g. Kodak Wratten handbook used to digitize filter data)
 *.pdf
@@ -107,3 +116,11 @@ __pycache__/
 Thumbs.db
 Desktop.ini
 /build_nocuda/
+
+# built on demand by tools/jsonbench.bat (source is checked in, binary is not)
+tools/jsonbench.exe
+# built on demand by tools/ftslbench.bat (source is checked in, binary is not)
+tools/ftslbench.exe
+
+# built on demand by tools/meshbench.bat (source is checked in, binary is not)
+tools/meshbench.exe
