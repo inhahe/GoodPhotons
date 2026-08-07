@@ -385,9 +385,11 @@ static std::vector<FieldGeom> collectFields(const Sidecar& sc) {
 }
 
 // --------------------------------------------------------------------------
-// F4 — SweptMesh tessellated geometry. Each swept_mesh object carries a `mesh`
-// key (vertices / faces / uvs) baked by loom; the viewer draws it as a shaded,
-// depth-sorted triangle surface in a 3-D orbit pane.
+// F4 — tessellated geometry. A `swept_mesh` object carries a `mesh` key
+// (vertices / faces / uvs) baked by loom; a `strand` object carries a fiber
+// centreline + per-sample radius and is tubed here (see `strandToMesh`). Either
+// way the viewer draws a shaded, depth-buffered triangle surface in a 3-D orbit
+// pane.
 // --------------------------------------------------------------------------
 struct MeshGeom {
     std::string        id, name, material;
@@ -398,6 +400,125 @@ struct MeshGeom {
     std::vector<float> uvs;     // flat uv (2 per vertex), may be empty
 };
 
+// A loom `Strand` ships NO triangles: it emits ftrace's native `curve` primitive,
+// which the renderer flattens into a watertight chain of round cones itself. This
+// pane is a triangle rasteriser, so the fiber is tubed *here*, from the sidecar's
+// spine samples + per-sample radius: one ring of STRAND_SIDES vertices per sample,
+// swept along a rotation-minimising frame so the tube doesn't corkscrew round a
+// bend. Preview geometry only — ftrace still renders the analytic cones, never these.
+static const int STRAND_SIDES = 10;
+
+static bool strandToMesh(const minijson::Value& s, MeshGeom& g) {
+    std::vector<std::vector<float>> pv, rv;
+    readFlatVecs(s.find("points"), pv);
+    readFlatVecs(s.find("radii"), rv);
+    const int n = (int)pv.size();
+    if (n < 2) return false;
+    const minijson::Value* cl = s.find("closed");
+    const bool closed = cl && cl->asBool(false);
+
+    std::vector<Vec3>   P(n);
+    std::vector<double> R(n, 0.0);
+    for (int i = 0; i < n; ++i) {
+        const std::vector<float>& v = pv[i];
+        P[i] = Vec3(v.size() > 0 ? v[0] : 0.0f, v.size() > 1 ? v[1] : 0.0f,
+                    v.size() > 2 ? v[2] : 0.0f);
+        R[i] = (i < (int)rv.size() && !rv[i].empty()) ? rv[i][0] : 0.0;
+    }
+    // Per-sample tangent: a central difference, wrapped on a closed fiber and
+    // one-sided at an open fiber's two ends.
+    std::vector<Vec3> T(n);
+    for (int i = 0; i < n; ++i) {
+        Vec3 d;
+        if (closed)           d = P[(i + 1) % n] - P[(i + n - 1) % n];
+        else if (i == 0)      d = P[1] - P[0];
+        else if (i == n - 1)  d = P[n - 1] - P[n - 2];
+        else                  d = P[i + 1] - P[i - 1];
+        double L = length(d);
+        T[i] = (L > 1e-12) ? d / L : Vec3(0, 0, 1);
+    }
+    // Parallel transport: carry the reference vector forward by the same rotation
+    // that takes T[i-1] to T[i]. A fixed reference (say world up) would make the
+    // ring shear wherever the fiber turns; this keeps consecutive rings aligned.
+    auto transport = [](const Vec3& u, const Vec3& t0, const Vec3& t1) {
+        Vec3   ax = cross(t0, t1);
+        double sn = length(ax), cs = dot(t0, t1);
+        Vec3   r  = u;
+        if (sn > 1e-12) {                                   // Rodrigues about t0 x t1
+            ax = ax / sn;
+            double a = std::atan2(sn, cs), c = std::cos(a), si = std::sin(a);
+            r = u * c + cross(ax, u) * si + ax * (dot(ax, u) * (1.0 - c));
+        }
+        r = r - t1 * dot(r, t1);                            // undo accumulated drift
+        double L = length(r);
+        if (L < 1e-9) { Vec3 b; onb(t1, r, b); L = length(r); }
+        return r / L;
+    };
+    std::vector<Vec3> U(n);
+    { Vec3 b; onb(T[0], U[0], b); }
+    for (int i = 1; i < n; ++i) U[i] = transport(U[i - 1], T[i - 1], T[i]);
+    if (closed && n > 2) {
+        // Transporting once more across the seam does NOT land back on U[0] — that
+        // residual angle is the frame's holonomy, and left alone it becomes a single
+        // sheared band of triangles at one joint. Spread it evenly along the loop so
+        // the tube closes on itself exactly (c[n-1] - c[0] == the mismatch).
+        Vec3   w   = transport(U[n - 1], T[n - 1], T[0]);
+        double ang = std::atan2(dot(cross(w, U[0]), T[0]), dot(w, U[0]));
+        for (int i = 0; i < n; ++i) {
+            double a = ang * ((double)i / (double)(n - 1));
+            double c = std::cos(a), si = std::sin(a);
+            U[i] = U[i] * c + cross(T[i], U[i]) * si;
+        }
+    }
+
+    // A closed fiber emits one extra ring that repeats sample 0 — the positions are
+    // identical (so the tube is still closed) but it carries u=1, which keeps the
+    // texture from folding back over the last span.
+    const int rings = closed ? n + 1 : n;
+    const int K     = STRAND_SIDES;
+    g.verts.reserve((size_t)rings * K * 3);
+    g.uvs.reserve((size_t)rings * K * 2);
+    for (int i = 0; i < rings; ++i) {
+        int   j = i % n;
+        Vec3  V = cross(T[j], U[j]);
+        float u = (rings > 1) ? (float)i / (float)(rings - 1) : 0.0f;
+        for (int k = 0; k < K; ++k) {
+            double a = 2.0 * 3.14159265358979323846 * (double)k / (double)K;
+            Vec3   p = P[j] + (U[j] * std::cos(a) + V * std::sin(a)) * R[j];
+            g.verts.push_back((float)p.x);
+            g.verts.push_back((float)p.y);
+            g.verts.push_back((float)p.z);
+            g.uvs.push_back(u);
+            g.uvs.push_back((float)k / (float)K);
+        }
+    }
+    for (int i = 0; i + 1 < rings; ++i)
+        for (int k = 0; k < K; ++k) {
+            int k1 = (k + 1) % K;
+            int a = i * K + k, b = i * K + k1, c = (i + 1) * K + k1, d = (i + 1) * K + k;
+            g.faces.push_back(a); g.faces.push_back(b); g.faces.push_back(c);
+            g.faces.push_back(a); g.faces.push_back(c); g.faces.push_back(d);
+        }
+    if (!closed) {                       // flat caps, so an open fiber isn't a straw
+        for (int e = 0; e < 2; ++e) {
+            int  j    = e ? n - 1 : 0;
+            int  ring = e ? (rings - 1) * K : 0;
+            int  ctr  = (int)g.verts.size() / 3;
+            g.verts.push_back((float)P[j].x);
+            g.verts.push_back((float)P[j].y);
+            g.verts.push_back((float)P[j].z);
+            g.uvs.push_back(e ? 1.0f : 0.0f); g.uvs.push_back(0.5f);
+            for (int k = 0; k < K; ++k) {
+                int k1 = (k + 1) % K;
+                g.faces.push_back(ctr); g.faces.push_back(ring + k); g.faces.push_back(ring + k1);
+            }
+        }
+    }
+    g.nverts = (int)g.verts.size() / 3;
+    g.nfaces = (int)g.faces.size() / 3;
+    return g.nfaces > 0;
+}
+
 static std::vector<MeshGeom> collectMeshes(const Sidecar& sc) {
     std::vector<MeshGeom> meshes;
     const minijson::Value* objs = sc.arr("objects");
@@ -406,12 +527,18 @@ static std::vector<MeshGeom> collectMeshes(const Sidecar& sc) {
     std::function<void(const minijson::Value&)> visit = [&](const minijson::Value& o) {
         if (const minijson::Value* ch = o.find("children"); ch && ch->isArray())
             for (const auto& c : ch->arr) visit(c);
-        const minijson::Value* m = o.find("mesh");
-        if (!m || !m->isObject()) return;
         MeshGeom g;
         g.id       = scalarStr(o.find("id"), "");
         g.name     = scalarStr(o.find("name"), "");
         g.material = scalarStr(o.find("material"), "");
+        // A fiber has no baked mesh — tube its centreline so it shares this pane
+        // with the swept surfaces instead of being invisible here.
+        if (const minijson::Value* st = o.find("strand"); st && st->isObject()) {
+            if (strandToMesh(*st, g)) meshes.push_back(std::move(g));
+            return;
+        }
+        const minijson::Value* m = o.find("mesh");
+        if (!m || !m->isObject()) return;
         if (const minijson::Value* v = m->find("vertices"); v && v->isArray())
             for (const auto& p : v->arr) {
                 for (int k = 0; k < 3; ++k)
@@ -1622,11 +1749,12 @@ float4 main(VSOut i) : SV_Target {
 };
 
 // --------------------------------------------------------------------------
-// F4 — mesh pane: SweptMesh tessellated surfaces as a shaded, z-buffered
-// triangle mesh. Orbiting the 3 spatial dims is a view-only re-projection (no
-// re-tessellation, exactly as the F4 rule specifies for isometries of the shown
-// dims). Colour: flat lambert shading, per-object tint, a UV checker, or the
-// material's real skin sampled per-pixel at the interpolated mesh UVs.
+// F4 — mesh pane: SweptMesh tessellated surfaces, plus Strand fibers tubed from
+// their centreline, as a shaded, z-buffered triangle mesh. Orbiting the 3 spatial
+// dims is a view-only re-projection (no re-tessellation, exactly as the F4 rule
+// specifies for isometries of the shown dims). Colour: flat lambert shading,
+// per-object tint, a UV checker, or the material's real skin sampled per-pixel at
+// the interpolated mesh UVs.
 // --------------------------------------------------------------------------
 struct MeshView {
     float yaw = 0.6f, pitch = 0.4f, zoom = 1.0f;

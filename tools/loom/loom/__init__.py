@@ -31,6 +31,7 @@ from .scene import (
     Scene, Material, Texture, GridDecl, ScatterDecl, skin, ProcTexture, func_skin, Sphere, Beads, Raw,
     Light, Camera, CameraCurve, Element, Group,
     Pattern, SweptMesh, IsoMesh, ribbon, tube, blob, fan, Volume,
+    Strand, strand, hair,
     NamedSpectrum, Upsample,
 )
 from .transform import Transform
@@ -60,6 +61,7 @@ from .sweep import (
     rmf_frames, tangents, sweep_rings, skin_rings, circle_profile, line_profile,
     write_obj,
 )
+from .strands import closed_bspline_controls, strand_controls, sample_spine
 from .iso import (
     Isosurface, Room, gyroid_surface, phase_drift, FIELDS,
     gyroid, schwarz_p, schwarz_d, neovius,
@@ -119,6 +121,7 @@ __all__ = [
     "Record", "RecordChannel", "RecordStop",
     "parse_ladder", "emit_ladder", "ladder_shape",
     "SweptMesh", "IsoMesh", "ribbon", "tube", "blob", "fan", "Volume",
+    "Strand", "strand", "hair",
     "mesh_field",
     "write_vdb", "read_vdb", "read_vdb_grids", "bake_field", "write_volume",
     "VolumeGrid", "VdbTransform", "ReadGrid",
@@ -131,6 +134,7 @@ __all__ = [
     "Slot", "collect_slots", "SceneDriver", "LiveSession", "serve_live",
     "rmf_frames", "tangents", "sweep_rings", "skin_rings", "circle_profile",
     "line_profile", "write_obj",
+    "closed_bspline_controls", "strand_controls", "sample_spine",
     "Isosurface", "Room", "gyroid_surface", "phase_drift", "FIELDS",
     "gyroid", "schwarz_p", "schwarz_d", "neovius",
     "SliceField", "ND_FIELDS", "nd_grad_bound",

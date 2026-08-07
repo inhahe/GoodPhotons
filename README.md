@@ -292,10 +292,10 @@ building 3-D scenes and **seamless looping animations** that render on ftrace. L
 animates *continuous* things — modulator graphs, curves, fields, N-D-transformed
 isosurfaces — and discretizes **last, per frame**, emitting one `.ftsl` per frame
 which ftrace then renders (raster preview or full path trace) and assembles into a
-GIF/MP4. It ships with ready-to-run examples (swept ribbons/tubes, gyroid and other
-triply-periodic minimal-surface loops, higher-dimensional gyroid slices, function-driven
-materials, 2-D motion graphics, spacetime-transform videos) and stands alone (it can
-drive any renderer).
+GIF/MP4. It ships with ready-to-run examples (swept ribbons/tubes, native `curve` fiber
+tangles, gyroid and other triply-periodic minimal-surface loops, higher-dimensional
+gyroid slices, function-driven materials, 2-D motion graphics, spacetime-transform
+videos) and stands alone (it can drive any renderer).
 
 **The [demo at the top of this page](#demo) is a loom animation** —
 [`tools/loom/examples/pastel_jack.py`](tools/loom/examples/pastel_jack.py) — and it is
@@ -357,7 +357,11 @@ sidecar), and a procedural `r`/`g`/`b` formula skin is baked on the CPU through 
 pattern VM — including `tex:<name>(u,v)` sampling of an image declared above it — so the
 preview matches what the renderer would produce. A mesh with no skin, or a skin that fails to
 load or compile, falls back to grey and the reason is printed under the pane. `IsoMesh`
-isosurfaces are baked to a marching-cubes mesh and shown in the same Meshes tab. When the sidecar carries a
+isosurfaces are baked to a marching-cubes mesh and shown in the same Meshes tab, and a `Strand`
+fiber — which ships no triangles at all, since ftrace's native `curve` primitive flattens itself
+into round cones at load — is **tubed** for the preview from its centreline and per-sample
+radius, swept along a rotation-minimising frame so a closed loop's tube closes without a twisted
+band at the seam. When the sidecar carries a
 `source` key — the `.ftsl` `save_sidecar` emits beside it — a **Render tab** raymarches the
 *real* isosurface **field** in-process: it parses the `.ftsl` with ftrace's own `ftsl::load`
 and sphere-traces the field bytecode via `renderIsoPreviewCuda` (the `-raster-gpu` preview

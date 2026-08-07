@@ -60,9 +60,18 @@ def _mid(p: Tuple[float, ...], q: Tuple[float, ...]) -> Tuple[float, ...]:
 
 def eval_curve(pts: List[Tuple[float, ...]], u: float, closed: bool) -> Tuple[float, ...]:
     """Point on the midpoint-quadratic-Bezier curve through control points ``pts``
-    at parameter ``u`` (wrapped to [0,1)).  ``pts`` are already-evaluated tuples."""
+    at parameter ``u``.  ``pts`` are already-evaluated tuples.
+
+    A **closed** curve wraps ``u`` to ``[0, 1)`` — going round again is exactly what
+    a loop means.  An **open** curve **clamps** ``u`` to ``[0, 1]`` instead: it has
+    two ends, and wrapping would teleport ``u = 1`` back to the start, which is a
+    discontinuity no caller wants (it is why every internal sampler used to stop at
+    ``k/n``).  Clamping makes ``u = 1`` the actual end of the path, so a sampler can
+    include the endpoint and a strand can reach its tip.  Values inside ``[0, 1)``
+    are unaffected either way.
+    """
     n = len(pts)
-    u -= math.floor(u)
+    u = (u - math.floor(u)) if closed else min(max(u, 0.0), 1.0)
     if closed:
         x = u * n
         i = int(math.floor(x)) % n
@@ -106,8 +115,10 @@ class LoopCurve(VecSignal):
     to choose.  The construction is per-component, so it works in any dimension.
 
     ``u`` is a scalar curve parameter (a Signal or number).  Wrapped to
-    ``[0, 1)``; ``u`` and ``t`` are independent (drive ``u`` from ``t`` for a
-    point travelling around the loop, or hold it to pin a location).
+    ``[0, 1)`` on a closed path, **clamped** to ``[0, 1]`` on an open one (an open
+    path has ends; see :func:`eval_curve`); ``u`` and ``t`` are independent (drive
+    ``u`` from ``t`` for a point travelling around the loop, or hold it to pin a
+    location).
     """
 
     def __init__(self, path: PointPath, u: Union[Signal, Number],

@@ -136,6 +136,16 @@ def _dataset_kind(obj: Any) -> Optional[str]:
     return None
 
 
+def _poly_us(n: int, closed: bool) -> List[float]:
+    """The ``n`` curve parameters a display polyline is sampled at.  A **closed**
+    curve tiles ``[0, 1)`` at ``k/n`` (the caller repeats the first point to close
+    it); an **open** curve is endpoint-inclusive at ``k/(n-1)``, so the polyline
+    reaches the actual end of the path rather than stopping ``1/n`` short."""
+    if closed:
+        return [k / n for k in range(n)]
+    return [k / (n - 1) for k in range(n)] if n > 1 else [0.0]
+
+
 def _curve_geometry(path: Any, clock: Optional[Clock]) -> Dict[str, Any]:
     """Evaluate a :class:`PointPath`'s control points at ``clock`` and sample a
     display **polyline** along the interpolated (loop) curve — the actual N-D
@@ -146,9 +156,7 @@ def _curve_geometry(path: Any, clock: Optional[Clock]) -> Dict[str, Any]:
     cps = [list(p.at(clk)) for p in path.points]
     tup = [tuple(c) for c in cps]
     n = _POLYLINE_SAMPLES
-    # eval_curve wraps u to [0,1), so sample u = k/n (never hitting 1.0) for both
-    # cases; a closed curve then repeats the first point to visibly close the loop.
-    poly = [list(eval_curve(tup, k / n, path.closed)) for k in range(n)]
+    poly = [list(eval_curve(tup, u, path.closed)) for u in _poly_us(n, path.closed)]
     if path.closed:
         poly.append(list(poly[0]))
     return {"control_points": cps, "polyline": poly}
@@ -168,7 +176,7 @@ def _track_channels(tp: Any, clock: Optional[Clock]) -> List[Dict[str, Any]]:
         # evaluate each control point's track value at the clock, then ride the same
         # curve interpolation the main point uses (identical u samples).
         cps = [tuple(vs.at(clk)) for vs in pts]
-        samples = [list(eval_curve(cps, k / n, tp.closed)) for k in range(n)]
+        samples = [list(eval_curve(cps, u, tp.closed)) for u in _poly_us(n, tp.closed)]
         if tp.closed:
             samples.append(list(samples[0]))
         out.append({"name": name,
@@ -226,6 +234,41 @@ def _swept_mesh_geometry(sm: Any, clock: Optional[Clock]) -> Dict[str, Any]:
     return {"vertices": [list(v) for v in verts],
             "faces": [list(f) for f in faces],
             "uvs": uvs, "rings": n, "profile_count": k}
+
+
+def _strand_geometry(st: Any, clock: Optional[Clock]) -> Dict[str, Any]:
+    """The polyline a :class:`~loom.scene.Strand` becomes, at ``clock``.
+
+    A ``Strand`` emits ftrace's native ``curve`` primitive, so there are no triangles
+    to hand the 3-D pane — what the viewer draws is the fiber's *centreline* plus its
+    radius at each vertex.  Mirrors ``Strand.emit``: the same spine samples, the same
+    root→tip taper and ``radius_profile``.  ``points`` are the sampled spine points
+    (not the emitted B-spline control points — those are an implementation detail of
+    closing the loop, and the curve passes through these), ``radii`` the matching
+    fiber radius, ``closed`` whether the last point joins the first."""
+    from . import strands as _strands
+    from .signals.core import Cache
+    clk = clock if clock is not None else Clock(t=0.0, frame=0, frames=1, fps=1.0)
+    cache = Cache()
+
+    def _num(v):
+        return float(v.at(clk, cache)) if hasattr(v, "at") else float(v)
+
+    r_root = _num(st.radius)
+    r_tip = r_root if st.radius_tip is None else _num(st.radius_tip)
+    n = st.count
+    pts = _strands.sample_spine(st.spine, n, st.closed_spine, clk, cache)
+    us = [k / n for k in range(n)] if st.closed_spine else \
+         [k / (n - 1) for k in range(n)]
+    radii = []
+    for u in us:
+        r = r_root + (r_tip - r_root) * u
+        if st.radius_profile is not None:
+            r *= float(st.radius_profile(u))
+        radii.append(r)
+    return {"points": [list(p) for p in pts], "radii": radii,
+            "closed": bool(st.closed_spine),
+            "basis": "bspline" if st.closed_spine else "catmull_rom"}
 
 
 def _iso_mesh_geometry(im: Any, clock: Optional[Clock]) -> Dict[str, Any]:
@@ -299,10 +342,11 @@ def _datasets_in(el: Any, out: Dict[int, Any]) -> List[int]:
 def _describe_element(el: Any, oid: int, datasets: Dict[int, Any],
                       clock: Optional[Clock] = None) -> Dict[str, Any]:
     cls = type(el).__name__
-    from .scene import Group, SweptMesh, IsoMesh  # lazy
+    from .scene import Group, SweptMesh, IsoMesh, Strand  # lazy
     kind = {
         "Sphere": "sphere", "Beads": "beads", "SweptMesh": "swept_mesh",
         "IsoMesh": "iso_mesh", "Raw": "raw", "Group": "group", "Volume": "volume",
+        "Strand": "strand",
     }.get(cls, cls.lower())
     rec: Dict[str, Any] = {"id": oid, "kind": kind, "class": cls}
     name = getattr(el, "name", None)
@@ -312,7 +356,7 @@ def _describe_element(el: Any, oid: int, datasets: Dict[int, Any],
     if isinstance(mat, str):
         rec["material"] = mat
     for attr in ("count", "res", "iso", "bounds", "closed_spine",
-                 "closed_profile", "smooth"):
+                 "closed_profile", "smooth", "segments"):
         v = getattr(el, attr, None)
         if isinstance(v, (int, float, bool)):
             rec[attr] = v
@@ -335,6 +379,11 @@ def _describe_element(el: Any, oid: int, datasets: Dict[int, Any],
                 rec["mesh"] = _iso_mesh_geometry(el, clock)
             except Exception as exc:      # skimage missing / empty surface, etc.
                 rec["mesh_error"] = str(exc)
+        elif isinstance(el, Strand):
+            try:
+                rec["strand"] = _strand_geometry(el, clock)
+            except Exception as exc:      # never let one bad fiber sink the sidecar
+                rec["strand_error"] = str(exc)
     return rec
 
 

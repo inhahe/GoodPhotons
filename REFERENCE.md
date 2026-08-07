@@ -1841,6 +1841,16 @@ missing is the *aggregate LOD*: every fiber is intersected individually, so a gr
 is linear in strand count and sub-pixel fibers are a variance sink. See `known-issues.md`,
 which also covers the per-segment azimuthal `v` frame and `CurveSeg`'s memory footprint.
 
+**Authoring one procedurally.** The bundled Loom toolkit emits `curve` blocks from an
+animated spine: `Strand` / `strand()` / `hair()` (`tools/loom/loom/scene.py`). It samples
+the spine per frame and picks the basis for you — `catmull_rom` for an open spine (it
+interpolates, so the fiber passes through the samples), and for a *closed* spine a
+**periodic** `bspline` whose control points are solved so the loop is C2 through the seam
+*and* still on the spine. That is worth knowing even if you never use loom: it is the
+general recipe for closing a loop with this primitive, since `catmull_rom`'s
+clamp-duplicated ends cannot. See `tools/loom/DESIGN.md` §7a′ and
+`tools/loom/examples/strand_loop.py`.
+
 ### Grooms (`fur`)
 
 A `curve` is one strand, written out by hand. A coat is 10⁴–10⁶ strands, which nobody
