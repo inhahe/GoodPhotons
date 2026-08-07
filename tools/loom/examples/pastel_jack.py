@@ -18,6 +18,12 @@ Keeping the two triples different colours does the same job the gold/glass split
 in the original: the ±y spin axis carries **one of each**, which labels the jack's top
 and bottom so the precession stays readable instead of looking like generic wobble.
 
+One thing is *not* pastel: a thin **gold ring** (:class:`Ring`) orbits the jack, tipped
+45° off horizontal and spinning about the room's vertical like a coin caught halfway
+between falling flat and standing on edge.  It is the scene's only specular element, and
+it is deliberately the one that isn't matte — it draws the eye round the jack instead of
+competing with it, and it puts a moving highlight in a picture that otherwise has none.
+
 Run:
   python examples/pastel_jack.py            # print frame-0 .ftsl to stdout
   python examples/pastel_jack.py --still    # one held still (look check)
@@ -29,13 +35,14 @@ for ``--still``.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from loom import Scene, Material, Camera, Light  # noqa: E402
-from loom.ftsl_emit import fmt  # noqa: E402
+from loom import Scene, Material, Camera, Element, Light  # noqa: E402
+from loom.ftsl_emit import EmitCtx, fmt, fmt3  # noqa: E402
 
 import jumping_jack as jj  # noqa: E402
 
@@ -58,14 +65,110 @@ GREEN = "rgb 0.55 0.85 0.45"    # shell_c — the "glass" triple
 LUMENS = None
 
 
+# ---------------------------------------------------------------------------
+# The gold ring
+# ---------------------------------------------------------------------------
+
+RING_MINOR = 0.07     # tube radius — "thin-ish" against a ~1.8 ring radius
+RING_TILT = 45.0      # degrees off horizontal: a coin exactly halfway through falling
+RING_TURNS = 3.0      # whole turns of the contact point per loop (432 frames / 3 = 144)
+
+
+class Ring(Element):
+    """A thin torus tipped ``tilt`` degrees off horizontal, spun about world +y.
+
+    The motion is a spinning coin held at one instant of its collapse: the ring keeps a
+    **constant** tilt, and what goes round is the *azimuth* of that tilt, so the point
+    touching the floor walks a circle at floor level while the diametrically opposite
+    point walks the same circle at the top of the ring's travel.  In ftsl that is one
+    leaf::
+
+        torus { major R  minor r  rotate <tilt> <azimuth> 0  translate 0 <cy> 0 }
+
+    because a leaf transform is TRS regardless of statement order (``src/ftsl.h``
+    ``fieldXf`` → ``affineFromTRS``) and ``rotate rx ry rz`` composes as
+    ``Rz·Ry·Rx`` — so ``rotate tilt az 0`` is exactly "tip about x, then carry the tilt
+    around y", with the translate applied outside, i.e. the ring rotates about its own
+    centre and is then lifted into place.
+
+    **Sizing is forced, not chosen.**  ``reach`` is the half-height the ring must span:
+    the caller passes the jack's own ``arm·cos(tilt) + ball`` (see
+    :func:`jumping_jack.rest_height`), which is simultaneously the drop from the jack's
+    centre to the floor and the rise from its centre to its top.  Put the ring's centre
+    at the jack's centre and the two conditions the brief asks for — lowest point on the
+    floor, highest point level with the top of the jack — become the single equation
+
+        R·sin(tilt) + r = reach
+
+    solved here for ``R``.  The ``+ r`` is not a fudge: at the extreme point of the tilted
+    centreline the tangent is horizontal, so the tube's circular cross-section stands
+    vertically there and contributes its full radius to the height.  Because the tilt is
+    constant, both extremes are **constant in time** too — the ring touches down at every
+    instant of the loop, never hovering and never clipping through the floor.
+
+    The clearance is also fixed by that equation: with ``reach = 1.339`` and ``r = 0.07``
+    the ring radius is 1.795, so its inner surface sits 1.725 from the jack's centre
+    against the jack's 1.52 reach — a 0.20 margin the tumble can never close, since the
+    jack only ever rotates about that same centre.
+
+    A ``torus`` leaf is an exact, unit-Lipschitz SDF with analytic bounds
+    (``src/implicit.h``), so unlike the jack's carved ``function`` field it needs neither
+    ``contained_by`` nor ``max_gradient``.
+    """
+
+    def __init__(self, centre, reach, *, minor: float = RING_MINOR,
+                 tilt: float = RING_TILT, turns: float = RING_TURNS,
+                 material: str = "ring", name: str = "gold_ring") -> None:
+        self.centre = tuple(float(c) for c in centre)
+        self.reach = float(reach)
+        self.minor = float(minor)
+        self.tilt = float(tilt)
+        self.turns = float(turns)
+        self.material = material
+        self.name = name
+
+    @property
+    def major(self) -> float:
+        """Ring radius that puts the low point on the floor and the high point at the
+        top of the jack — see the class docstring."""
+        return (self.reach - self.minor) / math.sin(math.radians(self.tilt))
+
+    def roots(self):
+        return []       # every field is a plain float; nothing to cycle-check
+
+    def emit(self, ctx: EmitCtx) -> str:
+        az = 360.0 * self.turns * ctx.clock.t
+        return "\n".join([
+            f'{self.name} = isosurface {{',
+            f'    material "{self.material}"',
+            f'    torus {{ major {fmt(self.major)}  minor {fmt(self.minor)}  '
+            f'rotate {fmt(self.tilt)} {fmt(az)} 0  translate {fmt3(self.centre)} }}',
+            '}',
+        ])
+
+
 def build_scene(res=(480, 480), *, purple=PURPLE, green=GREEN, lumens=LUMENS,
                 spin: float = 1.0) -> Scene:
-    """The jumping-jack scene surfaced as two matte pastel gyroid shells."""
-    # Same standing height and same camera framing as the original — the composition
-    # was tuned there and none of it depends on the materials.
+    """The jumping-jack scene surfaced as two matte pastel gyroid shells, ringed."""
+    # Same standing height as the original — that is pure geometry and none of it
+    # depends on the materials.
     cy = jj.rest_height(jj.Y0, arm=jj.ARM, ball=jj.BALL, tilt=jj.TILT)
-    scene = Scene(Camera(eye=(0.5, 0.7 + cy, 5.5), look_at=(0.0, 0.05 + cy, 0.0),
-                         up=(0, 1, 0), fov_y=38, mode="W", res=res))
+    reach = cy - jj.Y0                       # == arm·cos(tilt) + ball, both ways
+    # The framing, though, HAS to change: `jumping_jack`'s eye/fov were tuned around a
+    # 1.5 m-reach jack, and the ring is a 1.79 m-radius object that swings its nearest
+    # arc 1.27 m out of the jack's plane and towards the eye — 4.7 m away instead of the
+    # jack's 6.0, which is where perspective magnifies it most.  At the
+    # original (z 5.5, fov 38) the ring's near top/bottom projects to 1.43× the half
+    # frame — i.e. cut off for a third of every turn, which is worse than any framing
+    # compromise.  These numbers are the cheapest fix found by `scraps/ring_fit.py`
+    # (which projects the whole torus surface at every azimuth): back off 0.5 m, open
+    # up to fov 44, and lift eye + aim so the ring's near arc is centred rather than
+    # riding the bottom edge.  Worst-case projection is then 0.81 across and 0.94 down,
+    # so the ring clears the frame at every azimuth with a little margin to spare.
+    # Note the eye must stay inside the room (front wall at z = 6.6), which is why the
+    # extra room comes from the field of view and not from backing off further.
+    scene = Scene(Camera(eye=(0.5, 1.0 + cy, 6.0), look_at=(0.0, 0.3 + cy, 0.0),
+                         up=(0, 1, 0), fov_y=44, mode="W", res=res))
     light = dict(origin=f"-1.6 {fmt(jj.Y1 - 0.02)} -1.6", u="3.2 0 0", v="0 0 3.2",
                  normal="0 -1 0", spd="preset:bb6500")
     if lumens:
@@ -78,10 +181,14 @@ def build_scene(res=(480, 480), *, purple=PURPLE, green=GREEN, lumens=LUMENS,
         Material("wall", "diffuse", reflect=0.58),
         Material("left", "diffuse", reflect="rgb 0.52 0.30 0.26"),
         Material("right", "diffuse", reflect="rgb 0.28 0.40 0.52"),
+        # The one specular surface in the scene — `jumping_jack`'s own gold, verbatim
+        # (which is what `preset gold` expands to in src/materials.h).
+        Material("ring", "glossy", reflect="metal:gold", roughness=0.05),
         # `gold`/`glass` here are only the Jack element's two material SLOTS (the
         # names of its two arm triples); both are carved by the same gyroid.
         jj.Jack(gyroid_glass=True, spin=spin, centre=(0.0, cy, 0.0),
                 gold="purple", glass="green"),
+        Ring((0.0, cy, 0.0), reach),
         *jj._room(),
         Light("area", **light),
     )
