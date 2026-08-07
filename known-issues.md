@@ -73,6 +73,36 @@ per-repaint cost is ~26 ms (down from ~40 ms after `filmToRgb8`'s auto-exposure 
 from a full `std::sort` to `std::nth_element` — bit-for-bit identical, verified). `FTRACE_WINDOW_DEBUG=1`
 prints each repaint with its measured tone-map+blit cost if this needs re-measuring.
 
+### NOTE (2026-08-07): GitHub will not play a repo-hosted video in README.md — the demo GIF is not a stylistic choice, don't "improve" it back into a `<video>`
+
+The README demo was first committed as an HTML5 `<video>` tag pointing at the committed
+`pastel_jack_ring.mp4`. It rendered as **nothing at all** on github.com. Two independent
+reasons, both measured rather than assumed, and either one alone is fatal:
+
+1. **GitHub's Markdown sanitiser deletes `<video>` outright.** Verified by posting the README
+   through GitHub's own renderer — `gh api -X POST markdown -f mode=gfm -f context=inhahe/goodphotons`
+   — which returns an empty `<p></p>` where the `<video>` was, while `<img>` and `![]()` survive
+   (the GIF even gains `data-animated-image=""`). Videos *do* work in issues/PR comments, but
+   only via GitHub's own upload endpoint, which rewrites them to a `user-images.githubusercontent.com`
+   asset URL. A path inside the repo can never become one of those.
+2. **`raw.githubusercontent.com` serves repo media with the wrong content type under `nosniff`.**
+   Measured with `curl -sI`: `.png` → `image/png` (fine), but `.mp4` → `application/octet-stream`,
+   and `.gif` / `.webp` → `text/plain`, all with `X-Content-Type-Options: nosniff`. So even a
+   sanitiser-surviving tag pointed at a raw URL would be refused by the browser. `<img>` escapes
+   this only because GitHub proxies image sources through `camo`, which re-serves them with a
+   correct image content type — that proxy is the entire reason the GIF works.
+
+**Consequence, which is why both files are committed and both are `.gitignore` exceptions:**
+the animated GIF (320², 20 fps, 3.3 MB) is the *only* thing that plays on the repo page, so it
+is the embed; the MP4 (480², 60 fps, 3.4 MB) is the full-quality download linked beside it.
+An animated WebP was built and tested first (2.78 MB, better quality per byte) and **discarded**
+— raw serves `.webp` as `text/plain`.
+
+**If the GIF ever needs re-encoding, use gifski, not ffmpeg's palettegen.** Same clip:
+ffmpeg palettegen bottomed out at 5.3 MB for acceptable quality; gifski 1.7.1 (installed via
+npm) hit 3.27 MB at 320²/20 fps/`--quality 65` with visibly less banding on the gyroid glass.
+Command shape: `gifski -o pastel_jack_ring.gif --fps 20 --width 320 --quality 65 frames/*.png`.
+
 ### PERF — FIXED (2026-08-06, v0.148.0): the live viewer pays ~17 ms/frame to Windows Defender for opening files it wrote itself
 
 **This is the finding that came out of building the binary mesh handoff, and it is bigger than

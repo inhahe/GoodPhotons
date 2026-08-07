@@ -4,8 +4,12 @@ Physically-based **spectral** renderer (C++17, single exe `ftrace.exe`), Windows
 MSVC / CMake, with a CUDA backend (RTX-class, tested sm_89). Photons are traced
 **forward from the lights** in the flagship modes (hence "forward raytracer"), but
 backward path tracing, BDPT, photon mapping, SPPM, VCM and a z-buffer preview
-rasterizer are all built in. `README.md` is the exhaustive user-facing manual;
-this file records the *internal* architecture. `known-issues.md` tracks bugs/debt.
+rasterizer are all built in. `README.md` is the user-facing landing page (what it is,
+how to build it, first renders) and `REFERENCE.md` the exhaustive user-facing manual
+(modes, cameras, materials, spectra, lights, geometry, media, CLI) — they were one
+3300-line file until the README was split; keep an observable change in whichever of
+the two describes it. `FTSL.md` is the authoritative scene-language grammar.
+This file records the *internal* architecture. `known-issues.md` tracks bugs/debt.
 
 ## Render modes (dispatch in `main.cpp`)
 
