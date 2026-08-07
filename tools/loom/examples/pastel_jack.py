@@ -73,7 +73,16 @@ LUMENS = None
 
 RING_MINOR = 0.07     # tube radius — "thin-ish" against a ~1.8 ring radius
 RING_TILT = 45.0      # degrees off horizontal: a coin exactly halfway through falling
-RING_TURNS = 3.0      # whole turns of the contact point per loop (432 frames / 3 = 144)
+# Whole turns of the contact point per loop, and the sign is the whole point.  The jack's
+# `precess` walks its lean around world +y once per loop — the SAME axis and the SAME
+# sense the ring's azimuth turns on — so a positive ring rate is an exact integer
+# multiple of the jack's own rotation, and +3 read as the two being geared together
+# rather than as two things happening at once.  Negative counter-rotates it: the eye gets
+# opposing motion, which no shared axis can disguise, and the relative rate goes from
+# 3 − 1 = 2 turns per loop to |−3 − 1| = 4.  It stays a whole number because a seamless
+# loop needs every rotation to close, and −3 keeps the ring's own speed exactly what it
+# was — only its direction changes.
+RING_TURNS = -3.0
 
 
 class Ring(Element):
@@ -82,8 +91,10 @@ class Ring(Element):
     The motion is a spinning coin held at one instant of its collapse: the ring keeps a
     **constant** tilt, and what goes round is the *azimuth* of that tilt, so the point
     touching the floor walks a circle at floor level while the diametrically opposite
-    point walks the same circle at the top of the ring's travel.  In ftsl that is one
-    leaf::
+    point walks the same circle at the top of the ring's travel.  ``turns`` is that
+    azimuth's whole turns per loop, and may be **negative** to counter-rotate against the
+    jack's precession, which shares this axis (see :data:`RING_TURNS`).  In ftsl that is
+    one leaf::
 
         torus { major R  minor r  rotate <tilt> <azimuth> 0  translate 0 <cy> 0 }
 
@@ -139,7 +150,10 @@ class Ring(Element):
         return []       # every field is a plain float; nothing to cycle-check
 
     def emit(self, ctx: EmitCtx) -> str:
-        az = 360.0 * self.turns * ctx.clock.t
+        # Wrapped into [0, 360) purely for tidy scene text — a rotation is periodic, so
+        # this changes nothing, but it keeps a counter-rotating ring from emitting a
+        # growing pile of negatives (and a literal `-0` at t=0).
+        az = (360.0 * self.turns * ctx.clock.t) % 360.0
         return "\n".join([
             f'{self.name} = isosurface {{',
             f'    material "{self.material}"',
