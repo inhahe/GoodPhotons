@@ -1241,6 +1241,102 @@ aggregate LOD for sub-pixel fibers).
 
 ---
 
+### 8.7 `fur` — scatter strands over a surface
+
+`curve` is **one** strand, written out by hand. A coat is 10⁴–10⁶ strands, which nobody
+authors as text — so `fur { }` generates them. It samples roots **area-uniformly** over a
+named surface and grows each one with a closed-form shape (lift, comb, gravity droop,
+curl, clump).
+
+What it emits is **not a new kind of geometry**: it is exactly the same strand records a
+hand-written `curve` produces, so the BVH, the CPU tracer, the CUDA megakernel and the
+raster preview all already know how to draw it, and everything in §8.6 (bases, taper,
+watertight joints, `u` along the strand) applies unchanged.
+
+```
+sphere "ball" { center 0.22 0.20 0.55  radius 0.13  material skin }
+
+fur "ball_coat" {
+    on "ball"                   # required — a named sphere, mesh, quad or triangle
+    material brown
+    count 60000
+    length 0.055   length_jitter 0.35
+    radius 0.0006               # radius_tip defaults to 0.25*radius — fur tapers
+    droop 0.55                  # sag under `gravity`
+    jitter 0.25
+    seed 1
+}
+```
+
+| key | meaning |
+|---|---|
+| `on "<object>"` | **required**. The named `sphere`, `mesh`, `quad` or `triangle` to grow on |
+| `material <m>` | required |
+| `count <n>` | exact strand count |
+| `density <n>` | strands per **authored** unit² — used when `count` is absent. Survives rescaling the model, which `count` does not |
+| `seed <n>` | which realisation of the groom. Default `0` |
+| `points <n>` | control points per strand. Default `5`, minimum 2 |
+| `segments <n>` | round cones per span. Default `2`, clamped `[1, 256]`; `linear` forces 1 |
+| `basis <b>` | as §8.6. Default `catmull_rom` |
+| `length <l>` | root→tip length. Default `0.05` |
+| `length_jitter <0..1>` | ± fraction of `length`, uniform. Default `0.2` |
+| `radius <r>` | root radius. Default `0.0008` |
+| `radius_tip <r>` | tip radius. Default **`0.25 * radius`** — unlike `curve`, which defaults to no taper, because an untapered fiber reads as wire rather than hair |
+| `lift <0..1>` | `1` grows straight along the normal, `0` lies flat along the surface. Default `1` |
+| `jitter <0..1>` | random tilt of the growth direction. Default `0.15` |
+| `root_offset <l>` | push the root along the normal, to bed the strand into the skin. Default `0` |
+| `direction <x y z>` | world combing direction (zero = no comb) |
+| `comb <0..1>` | tip displacement along `direction`, as a fraction of `length`. Default `0.35` |
+| `gravity <x y z>` | world "down". Default `0 -1 0` |
+| `droop <0..1>` | tip sag along `gravity`, as a fraction of `length`. Default `0.25` |
+| `curl <0..1>` | helix radius, as a fraction of `length`. Default `0` (off) |
+| `curl_freq <n>` | turns over the strand's length. Default `3` |
+| `clump <0..1>` | blend toward the nearest tuft guide. Default `0` (off) |
+| `clump_size <l>` | tuft **radius** — one guide per `π·clump_size²` of surface. Default `0.02` |
+
+**Roots are area-uniform, always.** Over a mesh the generator samples a triangle
+proportional to its area and then warps the barycentrics, so a low-poly belly and a dense
+face grow the same hairs per square centimetre — the model's tessellation never leaks into
+the look, and `density` means what it says. A `sphere` target is **not** tessellated: roots
+land on the analytic surface with the analytic normal, so a furred ball has no faceting in
+its coat.
+
+**Every bend is quadratic in `t`, growth is linear.** That is what makes a strand leave the
+skin cleanly along its growth direction while the tip carries the full droop/comb/curl
+displacement — a strand that bends at its root reads as broken. It also makes every strand
+independent of every other, hence deterministic and parallel: the groom is a pure function
+of `(surface, parameters, seed)`, so the same seed always rebuilds the same coat.
+
+**Clumping changes shape, never density.** Each strand blends toward its **nearest** clump
+guide with weight `clump · t`, so roots stay exactly where the area-uniform sampler put
+them while tips converge into tufts. Guides are found by a real spatial lookup rather than
+by hashing the root cell — hashing gives cube-shaped tufts on a grid, nearest-guide gives
+Voronoi tufts, which is what hair does.
+
+**Growth never points into the surface.** A direction below the tangent plane is lifted
+back to a shallow grazing angle rather than being rejected, because rejection would
+silently bias the root distribution.
+
+**Ordering doesn't matter.** A `fur` block is resolved in a **deferred pass**, so it may
+sit anywhere in the file and name a surface authored later. The pass runs *before*
+`shape_only` meshes are stripped, so a groom can grow on an invisible scalp that then
+vanishes. An instanced `mesh_instance` cannot be a target — its triangles live in a BLAS,
+not in world space — and that is a load error, not a silent empty coat.
+
+Each block reports what it made:
+
+```
+[fur] "lawn_grass" on "lawn": 1622 strands, 3244 segments (mesh 0.1352 m^2)
+```
+
+Worked examples: `scenes/fur_basics.ftsl` (a furred ball, a clumped one, a curled one,
+and a `density`-driven grass patch — the parameters one at a time) and
+`scenes/fur_creature.ftsl` (an animal built from overlapping spheres wearing ~300 000
+strands from a dozen `fur` blocks, all at one shared `density`). Guarded by
+`ftrace -checkfur`.
+
+---
+
 ## 9. UV wraps on native primitives and meshes
 
 Pattern/texture expressions can see surface texture coordinates `u`, `v`. Where they

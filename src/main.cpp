@@ -885,6 +885,396 @@ static int checkCurve(long long rays) {
     return fails;
 }
 
+// ---------------------------------------------------------------------------
+// FUR / GROOM self-test  (-checkfur; fur.h, TODO §P1 stage 2)
+// ---------------------------------------------------------------------------
+// The generator's failures are the quiet kind. It emits ordinary `Curve`/`CurveSeg`
+// records, so nothing downstream can reject a wrong groom — a coat that is subtly
+// non-uniform, or that grows into the skin, or that silently produces zero strands, all
+// look like "geometry" to the BVH and like a rendering problem to the person looking at
+// the image. (That last one is not hypothetical: fur on a mesh target generated exactly
+// zero strands during bring-up, with no error printed anywhere, because the loader runs
+// before `Tri::finalize()` fills in normals. §7 exists specifically to keep that fixed.)
+//
+// So each section checks an INVARIANT of the groom rather than an image: roots on the
+// surface, roots distributed by area, output identical for a seed, strands leaving the
+// skin, clumping changing shape but not density, and the segment chain well-formed.
+static int checkFur(long long strands) {
+    int fails = 0;
+
+    // A two-triangle target with a deliberate 3:1 area ratio: a 3x1 rectangle split by
+    // the diagonal is the wrong test (both halves are equal), so build two independent
+    // right triangles in the z=0 plane with legs chosen to give areas 1.5 and 0.5.
+    std::vector<Tri> flat(2);
+    flat[0].v0 = Vec3(0, 0, 0);   flat[0].v1 = Vec3(3, 0, 0);   flat[0].v2 = Vec3(0, 1, 0);   // area 1.5
+    flat[1].v0 = Vec3(4, 0, 0);   flat[1].v1 = Vec3(5, 0, 0);   flat[1].v2 = Vec3(4, 1, 0);   // area 0.5
+    // NOTE: deliberately NOT finalized. This is the state the loader actually hands the
+    // generator (gn and n0..n2 all zero), and testing the finalized state would test a
+    // configuration that never occurs at load time.
+    FurSurface mesh;  mesh.tris = flat.data();  mesh.nTris = flat.size();
+    FurSurface ball;  ball.isSphere = true;  ball.center = Vec3(0.5, -2, 0.25);  ball.radius = 0.4;
+
+    auto baseSpec = [&](long long n) {
+        FurSpec s;
+        s.matId = 3;  s.name = "test";  s.count = n;  s.seed = 12345;
+        s.points = 5;  s.subdiv = 2;  s.basis = CurveBasis::CatmullRom;
+        s.length = 0.08;  s.lengthJitter = 0.3;
+        s.radius = 0.001;  s.radiusTip = 0.0002;
+        s.lift = 1.0;  s.jitter = 0.2;
+        s.gravity = Vec3(0, 0, -1);  s.droop = 0.3;      // "down" is -z for the z=0 patch
+        return s;
+    };
+
+    // --- 1. every root lies ON the target surface ------------------------------------
+    // The root is the one point the generator does not get to invent: it must be on the
+    // authored skin, or the coat floats off the model / buries itself in it.
+    {
+        int badPlane = 0, badInside = 0, badSphere = 0;
+        double maxOff = 0.0, maxRadErr = 0.0;
+        std::vector<Curve> cs; std::vector<CurveSeg> sg;
+        FurSpec s = baseSpec(strands);
+        s.rootOffset = 0.0;
+        if (generateFur(s, mesh, cs, sg) <= 0) ++badPlane;
+        for (const Curve& c : cs) {
+            const Vec3 r = sg[(size_t)c.firstSeg].p0;
+            maxOff = std::max(maxOff, std::fabs(r.z));
+            if (std::fabs(r.z) > 1e-9) ++badPlane;
+            // Inside one of the two triangles (barycentric, in the z=0 plane).
+            bool in = false;
+            for (const Tri& t : flat) {
+                const Vec3 e1 = t.v1 - t.v0, e2 = t.v2 - t.v0, rp = r - t.v0;
+                const double d00 = dot(e1, e1), d01 = dot(e1, e2), d11 = dot(e2, e2);
+                const double d20 = dot(rp, e1), d21 = dot(rp, e2);
+                const double den = d00 * d11 - d01 * d01;
+                const double b1 = (d11 * d20 - d01 * d21) / den;
+                const double b2 = (d00 * d21 - d01 * d20) / den;
+                if (b1 >= -1e-9 && b2 >= -1e-9 && b1 + b2 <= 1 + 1e-9) { in = true; break; }
+            }
+            if (!in) ++badInside;
+        }
+        std::vector<Curve> cs2; std::vector<CurveSeg> sg2;
+        FurSpec sp = baseSpec(strands);  sp.gravity = Vec3(0, -1, 0);
+        generateFur(sp, ball, cs2, sg2);
+        for (const Curve& c : cs2) {
+            const double e = std::fabs(length(sg2[(size_t)c.firstSeg].p0 - ball.center) - ball.radius);
+            maxRadErr = std::max(maxRadErr, e);
+            if (e > 1e-9) ++badSphere;
+        }
+        const int bad = badPlane + badInside + badSphere;
+        fails += bad;
+        std::printf("[checkfur] 1. roots on the surface: %zu mesh + %zu sphere roots, "
+                    "max off-plane %.2e, max radial err %.2e, %d off-surface -> %s\n",
+                    cs.size(), cs2.size(), maxOff, maxRadErr, bad, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 2. roots are AREA-uniform, and `density` means what it says -----------------
+    // Sampling a triangle uniformly instead of by area is the classic mistake, and it is
+    // nearly invisible on a well-tessellated model — but it makes a coat thin out over
+    // big polygons. The 3:1 area split must show up as a 3:1 strand split.
+    {
+        const long long n = std::max(strands, 20000LL);
+        std::vector<Curve> cs; std::vector<CurveSeg> sg;
+        FurSpec s = baseSpec(n);
+        generateFur(s, mesh, cs, sg);
+        long long inBig = 0;
+        for (const Curve& c : cs) if (sg[(size_t)c.firstSeg].p0.x < 3.5) ++inBig;
+        const double frac = cs.empty() ? 0.0 : (double)inBig / (double)cs.size();
+        // 3-sigma on a binomial with p=0.75 over n samples, floored so a small -checkfur
+        // ray budget does not make this flaky.
+        const double sigma = std::sqrt(0.75 * 0.25 / (double)std::max<long long>(n, 1));
+        const bool okSplit = std::fabs(frac - 0.75) <= std::max(4.0 * sigma, 0.005);
+
+        // `density` * area == count, exactly (area here is 2.0).
+        std::vector<Curve> cd; std::vector<CurveSeg> sd;
+        FurSpec dspec = baseSpec(0);
+        dspec.density = 5000.0;                       // 5000/m^2 over 2 m^2 -> 10000
+        const long long made = generateFur(dspec, mesh, cd, sd);
+        const bool okDensity = (made == 10000);
+
+        // And uniform WITHIN a triangle: the sqrt barycentric warp, not raw (u,v). Split
+        // the big triangle by area with a line parallel to its hypotenuse: the region with
+        // b0 > 1 - sqrt(1/2) ... simpler and just as sharp — the mean of b0 over a triangle
+        // is 1/3, and the broken (unwarped) map gives 1/2.
+        double meanB0 = 0.0; long long nB0 = 0;
+        for (const Curve& c : cs) {
+            const Vec3 r = sg[(size_t)c.firstSeg].p0;
+            if (r.x >= 3.5) continue;
+            // b0 for triangle 0 = 1 - x/3 - y  (v0 at origin, legs 3 and 1)
+            meanB0 += 1.0 - r.x / 3.0 - r.y;  ++nB0;
+        }
+        if (nB0) meanB0 /= (double)nB0;
+        const bool okWarp = std::fabs(meanB0 - 1.0 / 3.0) < 0.01;
+
+        const int bad = (!okSplit) + (!okDensity) + (!okWarp);
+        fails += bad;
+        std::printf("[checkfur] 2. area-uniform roots: 3:1 split gave %.4f (want 0.7500), "
+                    "mean b0 %.4f (want 0.3333), density 5000*2m^2 -> %lld (want 10000) -> %s\n",
+                    frac, meanB0, made, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 3. determinism ---------------------------------------------------------------
+    // A groom is regenerated on every load, so it must be a pure function of its seed —
+    // otherwise a checkpoint/resume, a flyby, or a CPU-vs-GPU comparison all quietly
+    // render different geometry each time. Also: the parallel build must not let thread
+    // scheduling leak into the result.
+    //
+    // There are TWO independent consumers of `spec.seed` — the per-strand rng (root
+    // position + all the shaping jitter) and the guide rng that drives clumping — and they
+    // must BOTH depend on it. Testing "does seed 8 differ from seed 7" with clumping ON
+    // cannot tell them apart: either one alone moving is enough to make the buffers differ,
+    // so a build where the strands stopped honouring the seed still passes. (That is not
+    // hypothetical — mutation-testing this section caught exactly that hole: deleting
+    // `spec.seed` from the strand rng was MISSED by the original single clumped test.) So
+    // the seed sensitivity is checked twice, once with each path isolated.
+    {
+        auto gen = [&](uint64_t seed, double clump, std::vector<CurveSeg>& out) {
+            std::vector<Curve> cs;
+            FurSpec s = baseSpec(std::min(strands, 20000LL));
+            s.seed = seed;  s.clump = clump;  s.clumpSize = 0.15;
+            generateFur(s, mesh, cs, out);
+        };
+        auto differ = [](const std::vector<CurveSeg>& x, const std::vector<CurveSeg>& y) {
+            return x.size() != y.size() ||
+                   std::memcmp(x.data(), y.data(), x.size() * sizeof(CurveSeg)) != 0;
+        };
+        // (a) reproducible: same seed, same groom, twice — with the guide path engaged, so
+        //     the parallel guide build is covered too.
+        std::vector<CurveSeg> a, b;
+        gen(7, 0.6, a);  gen(7, 0.6, b);
+        const bool same = !differ(a, b);
+        // (b) the STRAND rng honours the seed: clumping off, so nothing else can move.
+        std::vector<CurveSeg> u7, u8;
+        gen(7, 0.0, u7);  gen(8, 0.0, u8);
+        const bool okStrandSeed = differ(u7, u8);
+        // (c) the GUIDE rng honours the seed, isolated from the strand rng. Trick: drive the
+        //     guide count to exactly ONE (clump_size 1.0 over this 2 m^2 target gives
+        //     G = round(2/pi) = 1) and clump at full strength, so w = clump*t is exactly 1
+        //     at the tip and EVERY strand's last control point is literally the single
+        //     guide's tip. That one point is then a pure function of the guide rng — the
+        //     strand rng cannot move it — so if the guide seeding stopped reading
+        //     spec.seed the point would be identical across seeds. Also assert the tips
+        //     really did collapse to one point, otherwise the isolation silently didn't
+        //     happen and the comparison below would be testing the strand path again.
+        auto oneGuideTip = [&](uint64_t seed, Vec3& tip, double& spread) {
+            std::vector<Curve> cs; std::vector<CurveSeg> sg;
+            FurSpec s = baseSpec(std::min(strands, 2000LL));
+            s.seed = seed;  s.clump = 1.0;  s.clumpSize = 1.0;
+            generateFur(s, mesh, cs, sg);
+            tip = Vec3(0, 0, 0);  spread = 0.0;
+            if (cs.empty()) return;
+            auto tipOf = [&](const Curve& c) {
+                return sg[(size_t)(c.firstSeg + c.segCount - 1)].p1;
+            };
+            tip = tipOf(cs[0]);
+            for (const Curve& c : cs) spread = std::max(spread, length(tipOf(c) - tip));
+        };
+        Vec3 g7, g8;  double spread7 = 0, spread8 = 0;
+        oneGuideTip(7, g7, spread7);  oneGuideTip(8, g8, spread8);
+        const bool collapsed = (spread7 < 1e-9 && spread8 < 1e-9);   // isolation actually held
+        const bool okGuideSeed = collapsed && length(g7 - g8) > 1e-6;
+        const int bad = (!same) + (!okStrandSeed) + (!okGuideSeed);
+        fails += bad;
+        std::printf("[checkfur] 3. determinism: seed 7 twice %s, strand seed matters %s, "
+                    "guide seed matters %s (1-guide tips %.4f apart, collapse %.1e/%.1e), "
+                    "%zu segments -> %s\n",
+                    same ? "identical" : "DIVERGED", okStrandSeed ? "yes" : "NO",
+                    okGuideSeed ? "yes" : "NO", length(g7 - g8), spread7, spread8,
+                    a.size(), bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 4. strands leave the skin, and honour the length bounds ----------------------
+    // A strand whose GROWTH DIRECTION points below the tangent plane spends its whole
+    // length buried and renders as a bald patch with a shadow. `lift 0` plus a large
+    // `jitter` is exactly the authoring that produces such a direction, so the generator
+    // clamps it back to a shallow grazing angle — this pins that clamp.
+    //
+    // Note the invariant is about the direction the strand LEAVES the root, not about
+    // where it ends up: a shallow strand under heavy gravity droop legitimately curves
+    // back down and touches the skin again (that is what long grass does). So the
+    // direction is measured with shaping off, and the shaping is bounded separately.
+    {
+        auto arcOf = [&](const std::vector<CurveSeg>& sg, const Curve& c) {
+            double a = 0.0;
+            for (int k = 0; k < c.segCount; ++k)
+                a += length(sg[(size_t)c.firstSeg + k].p1 - sg[(size_t)c.firstSeg + k].p0);
+            return a;
+        };
+        const Vec3 N(0, 0, 1);                              // the patch's true normal
+
+        // (a) + (b): adversarial direction authoring, shaping off. A straight strand is
+        // flattened exactly by every basis, so the arc must equal the jittered length to
+        // fp precision — which makes the length window tight rather than decorative.
+        int intoSkin = 0, outOfBounds = 0;
+        double minL = 1e300, maxL = 0.0;
+        std::vector<Curve> cs; std::vector<CurveSeg> sg;
+        FurSpec s = baseSpec(strands);
+        s.lift = 0.0;  s.jitter = 0.9;  s.droop = 0.0;
+        generateFur(s, mesh, cs, sg);
+        for (const Curve& c : cs) {
+            const CurveSeg& f = sg[(size_t)c.firstSeg];
+            const Vec3 d = f.p1 - f.p0;
+            if (dot(d, d) <= 0.0 || dot(normalize(d), N) <= 0.0) ++intoSkin;
+            const double arc = arcOf(sg, c);
+            minL = std::min(minL, arc);  maxL = std::max(maxL, arc);
+            if (arc < s.length * (1.0 - s.lengthJitter) * (1 - 1e-9) ||
+                arc > s.length * (1.0 + s.lengthJitter) * (1 + 1e-9)) ++outOfBounds;
+        }
+
+        // (c) shaping stays bounded. For q(t) = dir*L*t + g*droop*L*t^2 the speed is at
+        // most L*(1 + 2*droop*t), so the arc can never exceed L*(1 + droop) — a closed
+        // bound, so a droop/curl term that blows up is caught rather than merely looking
+        // odd. Curl adds its own helix circumference, hence the extra 2*pi*curl*curlFreq.
+        int unbounded = 0; double maxShaped = 0.0;
+        std::vector<Curve> cs2; std::vector<CurveSeg> sg2;
+        FurSpec s2 = baseSpec(strands);
+        s2.lift = 0.35;  s2.jitter = 0.8;  s2.droop = 0.9;  s2.curl = 0.15;  s2.curlFreq = 3.0;
+        generateFur(s2, mesh, cs2, sg2);
+        const double ceilArc = s2.length * (1.0 + s2.lengthJitter) *
+                               (1.0 + s2.droop + 2.0 * PI * s2.curl * s2.curlFreq);
+        for (const Curve& c : cs2) {
+            const double arc = arcOf(sg2, c);
+            maxShaped = std::max(maxShaped, arc);
+            if (!(arc > 0.0) || arc > ceilArc) ++unbounded;
+        }
+
+        const int bad = intoSkin + outOfBounds + unbounded;
+        fails += bad;
+        std::printf("[checkfur] 4. growth direction + length: %zu strands, %d grew into the skin, "
+                    "%d outside the jitter window (arc %.5f..%.5f m, authored %.3f +/-%.0f%%), "
+                    "%d over the shaping bound (max %.5f <= %.5f m) -> %s\n",
+                    cs.size(), intoSkin, outOfBounds, minL, maxL, s.length,
+                    s.lengthJitter * 100.0, unbounded, maxShaped, ceilArc,
+                    bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 5. clumping changes SHAPE, never density ------------------------------------
+    // The whole point of blending toward a guide with weight proportional to t is that
+    // roots stay exactly where the area-uniform sampler put them. If clumping moved roots
+    // it would gather the coat into tufts AND thin the skin between them, which is a
+    // different (and wrong) look. So: identical roots, collapsed tips.
+    {
+        const long long n = std::min(strands, 8000LL);
+        auto tipsAndRoots = [&](double clump, std::vector<Vec3>& roots, std::vector<Vec3>& tips) {
+            std::vector<Curve> cs; std::vector<CurveSeg> sg;
+            FurSpec s = baseSpec(n);
+            s.clump = clump;  s.clumpSize = 0.12;  s.jitter = 0.35;
+            generateFur(s, mesh, cs, sg);
+            roots.clear(); tips.clear();
+            for (const Curve& c : cs) {
+                roots.push_back(sg[(size_t)c.firstSeg].p0);
+                tips .push_back(sg[(size_t)(c.firstSeg + c.segCount - 1)].p1);
+            }
+        };
+        std::vector<Vec3> r0, t0, r1, t1;
+        tipsAndRoots(0.0, r0, t0);
+        tipsAndRoots(1.0, r1, t1);
+        int movedRoots = 0;
+        const size_t m = std::min(r0.size(), r1.size());
+        for (size_t i = 0; i < m; ++i) if (length(r0[i] - r1[i]) > 1e-12) ++movedRoots;
+        // Mean nearest-neighbour tip distance: O(n^2) on a few thousand tips is fine, and
+        // an exact measure beats a sampled one for a threshold this coarse.
+        auto meanNN = [](const std::vector<Vec3>& v) {
+            double acc = 0.0;
+            for (size_t i = 0; i < v.size(); ++i) {
+                double best = 1e300;
+                for (size_t j = 0; j < v.size(); ++j)
+                    if (j != i) best = std::min(best, dot(v[i] - v[j], v[i] - v[j]));
+                acc += std::sqrt(best);
+            }
+            return v.empty() ? 0.0 : acc / (double)v.size();
+        };
+        const double nn0 = meanNN(t0), nn1 = meanNN(t1);
+        const bool okRoots = (movedRoots == 0) && (r0.size() == r1.size()) && !r0.empty();
+        const bool okTips  = (nn1 < 0.5 * nn0);
+        const int bad = (!okRoots) + (!okTips);
+        fails += bad;
+        std::printf("[checkfur] 5. clumping: %zu roots, %d moved by clumping (want 0), "
+                    "mean tip spacing %.5f -> %.5f m (want <50%%) -> %s\n",
+                    r0.size(), movedRoots, nn0, nn1, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 6. the emitted chain is well-formed ------------------------------------------
+    // Everything a hand-authored `curve` guarantees must hold for a generated one, because
+    // downstream code cannot tell them apart: contiguous cones, positive monotone taper,
+    // `u` marching 0..1, and every segment's `curveId` pointing back at its own Curve.
+    {
+        std::vector<Curve> cs; std::vector<CurveSeg> sg;
+        FurSpec s = baseSpec(std::min(strands, 20000LL));
+        const long long made = generateFur(s, mesh, cs, sg);
+        const int spans = curveSpanCount(s.basis, s.points);
+        const size_t want = (size_t)made * (size_t)spans * (size_t)s.subdiv;
+        int cracks = 0, badRad = 0, badU = 0, badId = 0, badMat = 0, zeroLen = 0;
+        for (size_t ci = 0; ci < cs.size(); ++ci) {
+            const Curve& c = cs[ci];
+            for (int k = 0; k < c.segCount; ++k) {
+                const CurveSeg& q = sg[(size_t)c.firstSeg + k];
+                if (q.curveId != (int)ci) ++badId;
+                if (q.matId != s.matId) ++badMat;
+                if (!(q.r0 > 0.0) || !(q.r1 > 0.0) || q.r1 > q.r0 + 1e-15) ++badRad;
+                if (!(q.u1 >= q.u0)) ++badU;
+                if (length(q.p1 - q.p0) <= 0.0) ++zeroLen;
+                if (k && length(q.p0 - sg[(size_t)c.firstSeg + k - 1].p1) > 1e-12) ++cracks;
+            }
+            if (c.segCount > 0) {
+                if (std::fabs(sg[(size_t)c.firstSeg].u0) > 1e-9) ++badU;
+                if (std::fabs(sg[(size_t)(c.firstSeg + c.segCount - 1)].u1 - 1.0) > 1e-9) ++badU;
+            }
+        }
+        const bool okCount = (sg.size() == want) && (made > 0);
+        const int bad = (!okCount) + cracks + badRad + badU + badId + badMat + zeroLen;
+        fails += bad;
+        std::printf("[checkfur] 6. chain well-formed: %lld strands x %d spans x %d = %zu "
+                    "segments (got %zu), %d cracks, %d bad radii, %d bad u, %d bad ids -> %s\n",
+                    made, spans, s.subdiv, want, sg.size(), cracks, badRad, badU, badId,
+                    bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 7. REGRESSION: un-finalized triangles must still grow fur --------------------
+    // The loader's deferred fur sweep runs BEFORE Scene::build() calls Tri::finalize(), so
+    // the generator sees gn == n0 == n1 == n2 == (0,0,0) on every quad, triangle, and mesh
+    // without authored `vn`. Reading a shading normal there normalizes a zero vector; the
+    // NaN propagates through the strand and is then swallowed by tessellateCurve's
+    // `dot(dp,dp) > 0` coincidence guard, so the groom emits ZERO strands and prints no
+    // error at all. This section pins both halves: zeroed normals still produce strands
+    // pointing the geometric way, and authored shading normals are still honoured.
+    {
+        std::vector<Curve> cs; std::vector<CurveSeg> sg;
+        FurSpec s = baseSpec(2000);
+        s.jitter = 0.0;  s.droop = 0.0;  s.lift = 1.0;
+        const long long made = generateFur(s, mesh, cs, sg);
+        int nonFinite = 0, wrongSide = 0;
+        for (const Curve& c : cs) {
+            const CurveSeg& f = sg[(size_t)c.firstSeg];
+            if (!std::isfinite(f.p0.x) || !std::isfinite(f.p0.y) || !std::isfinite(f.p0.z) ||
+                !std::isfinite(f.p1.x) || !std::isfinite(f.p1.y) || !std::isfinite(f.p1.z))
+                ++nonFinite;
+            if ((f.p1 - f.p0).z <= 0.0) ++wrongSide;      // must grow along +z, the geometric normal
+        }
+        // With real shading normals the coat must follow THEM, not the facet: tilt every
+        // vertex normal 45 degrees toward +x and the strands must lean the same way.
+        std::vector<Tri> tilted = flat;
+        const Vec3 sn = normalize(Vec3(1, 0, 1));
+        for (Tri& t : tilted) { t.n0 = sn; t.n1 = sn; t.n2 = sn; }
+        FurSurface tiltedSurf;  tiltedSurf.tris = tilted.data();  tiltedSurf.nTris = tilted.size();
+        std::vector<Curve> cs2; std::vector<CurveSeg> sg2;
+        generateFur(s, tiltedSurf, cs2, sg2);
+        int notTilted = 0;
+        for (const Curve& c : cs2) {
+            const CurveSeg& f = sg2[(size_t)c.firstSeg];
+            if (dot(normalize(f.p1 - f.p0), sn) < 0.999) ++notTilted;
+        }
+        const bool okMade = (made == 2000) && (cs2.size() == 2000);
+        const int bad = (!okMade) + nonFinite + wrongSide + notTilted;
+        fails += bad;
+        std::printf("[checkfur] 7. un-finalized normals (load-order regression): %lld strands "
+                    "(want 2000), %d non-finite, %d grew inward, %d ignored shading normals -> %s\n",
+                    made, nonFinite, wrongSide, notTilted, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    std::printf("[checkfur] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    return fails;
+}
+
 // ORIENTED-CONTAINER self-test: rotating an expression isosurface must not change what
 // it looks like. An `expr` field is not a distance function, so the marcher clips the ray
 // to the authored `contained_by` box and sizes its steps by |f|/max_gradient — a bound
@@ -7105,6 +7495,7 @@ static int run(int argc, char** argv) {
     bool checkBvhOnly = false;
     bool checkImplicitOnly = false;
     bool checkCurveOnly = false;
+    bool checkFurOnly = false;
     bool checkContainerOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
@@ -7493,6 +7884,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
         else if (!std::strcmp(argv[i], "-checkimplicit")) checkImplicitOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurve")) checkCurveOnly = true;
+        else if (!std::strcmp(argv[i], "-checkfur")) checkFurOnly = true;
         else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
@@ -7693,6 +8085,7 @@ static int run(int argc, char** argv) {
     }
     if (checkImplicitOnly) return checkImplicit(500'000) == 0 ? 0 : 1; // deterministic, no scene needed
     if (checkCurveOnly)    return checkCurve(200'000) == 0 ? 0 : 1;    // deterministic, no scene needed
+    if (checkFurOnly)      return checkFur(50'000) == 0 ? 0 : 1;      // deterministic, no scene needed
     if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed

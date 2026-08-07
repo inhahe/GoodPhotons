@@ -71,6 +71,7 @@
 #include "meshvoxel.h"   // solid voxelization for `medium { bounds { object "<mesh>" } }`
 #include "fbx.h"
 #include "upsample.h"
+#include "fur.h"         // `fur { }` groom generator — scatters `curve` strands (TODO §P1)
 #include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long load
 #include "color.h"
 #include "sky.h"
@@ -843,8 +844,11 @@ public:
         // `medium` blocks are DEFERRED to a second sweep so `bounds { object "name" }`
         // can reference any named sphere / isosurface / mesh regardless of authoring
         // order (the object registries are populated by the geometry builders below).
+        // `fur` is deferred for the same reason: `on "body"` must resolve against the
+        // named-object registries no matter where the block sits relative to its target.
         bool haveLight = false;
         std::vector<const Block*> mediaBlocks;
+        std::vector<const Block*> furBlocks;
         for (const auto& b : blocks) {
             if (stopped()) return false;
             if      (b.type == "sphere")   { if (!addSphere(b, L)) return false; }
@@ -854,6 +858,7 @@ public:
             else if (b.type == "mesh_instance") { if (!addMeshInstance(b, L)) return false; }
             else if (b.type == "isosurface") { if (!addIsosurface(b, L)) return false; }
             else if (b.type == "curve")    { if (!addCurve(b, L)) return false; }
+            else if (b.type == "fur")      { furBlocks.push_back(&b); }
             else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
             else if (b.type == "group")    { if (!addGroup(b, L, Affine::identity(), haveLight)) return false; }
             else if (b.type == "medium")   { mediaBlocks.push_back(&b); }
@@ -868,6 +873,12 @@ public:
                      b.type == "upsample" ||
                      b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
+        }
+        // Deferred fur sweep. Before the medium sweep and before stripShapeOnlyMeshes, so
+        // a groom can be grown on a `shape_only` scalp that is then removed from the scene.
+        for (const Block* fb : furBlocks) {
+            if (stopped()) return false;
+            if (!addFur(*fb, L)) return false;
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
         for (const Block* mb : mediaBlocks) {
@@ -1182,6 +1193,12 @@ private:
     std::unordered_map<std::string, NamedSphere> sphereByName_;   // named sphere -> world center/radius
     std::unordered_map<std::string, int>         implicitByName_; // named isosurface -> Scene::implicits index
     std::unordered_map<std::string, Aabb>        meshAabbByName_; // named mesh -> world AABB
+    // Named world-triangle ranges, for `fur { on "name" }` to scatter roots over. Filled
+    // by quad/triangle/mesh (anything that appends to Scene::tris under a name) — a
+    // superset of meshGroups, which only mesh blocks create. Read by the deferred fur
+    // sweep, which runs BEFORE stripShapeOnlyMeshes, so a `mesh { shape_only yes }` scalp
+    // can grow a coat and then vanish from the render.
+    std::unordered_map<std::string, std::pair<size_t, size_t>> triRangeByName_;
     std::unordered_map<std::string, int>         blasIndex_;      // mesh_asset name -> Scene::blasList index
     // `mesh { shape_only yes }` groups (indices into Scene::meshGroups), removed from
     // Scene::tris by stripShapeOnlyMeshes() once the deferred medium sweep has read them.
@@ -4086,6 +4103,7 @@ private:
         t2.uv0 = {0, 0, 0}; t2.uv1 = {1, 1, 0}; t2.uv2 = {0, 1, 0};
         L.scene.tris.push_back(t1);
         L.scene.tris.push_back(t2);
+        if (!b.name.empty()) triRangeByName_[b.name] = {L.scene.tris.size() - 2, 2};
         return true;
     }
     bool addTriangle(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
@@ -4093,6 +4111,7 @@ private:
         vec3Of(b, "v0", v0); vec3Of(b, "v1", v1); vec3Of(b, "v2", v2);
         int id = matFieldId(b, L, "triangle"); if (id < 0) return false;
         L.scene.tris.push_back(Tri{P(xf.apply(v0)), P(xf.apply(v1)), P(xf.apply(v2)), id, -1, {}});
+        if (!b.name.empty()) triRangeByName_[b.name] = {L.scene.tris.size() - 1, 1};
         return true;
     }
     // ---- curve / fiber (hair, fur, grass, wire) -------------------------------
@@ -4199,6 +4218,121 @@ private:
                                      (int)L.scene.curves.size(), L.scene.curveSegs);
         if (c.segCount <= 0) { fail("curve: control points are all coincident"); return false; }
         L.scene.curves.push_back(std::move(c));
+        return true;
+    }
+
+    // ---- fur / groom generator ------------------------------------------------
+    // `fur { on "<object>"  material <m>  count|density ... }` scatters strands over a
+    // named surface. It is pure sugar over `curve`: the generator (src/fur.h) emits the
+    // same Curve/CurveSeg records a hand-authored strand does, so nothing downstream —
+    // BVH, CPU tracer, CUDA megakernel, raster preview — needs to know fur exists.
+    //
+    // DEFERRED to a second sweep (like `medium`) so `on "body"` resolves regardless of
+    // authoring order: a `fur` block above the mesh it grows on is the natural way to
+    // write it, and an order-dependent scene language is a trap.
+    //
+    //   on         "<name>"       required — a named sphere, mesh, quad or triangle
+    //   material   <m>            required
+    //   count      <n>            exact strand count           } one of the two
+    //   density    <n>            strands per authored unit^2  }
+    //   seed       <n>            groom realisation (default 0)
+    //   points     <n>            control points per strand (default 5)
+    //   segments   <n>            round cones per span (default 2)
+    //   basis      linear|catmull_rom|bezier|bspline  (default catmull_rom)
+    //   length <l>  length_jitter <0..1>
+    //   radius <r>  radius_tip <r>        (radius_tip defaults to 0.25*radius — fur tapers)
+    //   lift <0..1>  jitter <0..1>  root_offset <l>
+    //   direction <x y z>  comb <0..1>
+    //   gravity <x y z>    droop <0..1>
+    //   curl <0..1>        curl_freq <n>
+    //   clump <0..1>       clump_size <l>
+    bool addFur(const Block& b, Loaded& L) {
+        const std::string on = strOf(b, "on");
+        if (on.empty()) { fail("fur needs `on \"<object>\"` — the named surface to grow on"); return false; }
+        int id = matFieldId(b, L, "fur"); if (id < 0) return false;
+
+        // Resolve the target as an INDEX RANGE, never as a pointer held across the
+        // parameter reads below: Scene::tris is a vector, and a stored `Tri*` would be a
+        // dangling reference the moment anything appended to it. The pointer is taken at
+        // the call site, one statement before it is used.
+        FurSurface surf;
+        size_t triFirst = 0, triCount = 0;
+        auto sph = sphereByName_.find(on);
+        auto tri = triRangeByName_.find(on);
+        if (sph != sphereByName_.end()) {
+            surf.isSphere = true;
+            surf.center = sph->second.center;
+            surf.radius = sph->second.radius;
+        } else if (tri != triRangeByName_.end() && tri->second.second > 0) {
+            triFirst = tri->second.first;
+            triCount = tri->second.second;
+        } else {
+            fail("fur `on \"" + on + "\"` names no sphere, mesh, quad or triangle in the scene "
+                 "(an instanced `mesh_instance` cannot be a fur target — its triangles live in "
+                 "a BLAS, not in world space)");
+            return false;
+        }
+
+        FurSpec sp;
+        sp.matId = id;
+        sp.name  = b.name.empty() ? ("fur:" + on) : b.name;
+
+        const std::string bs = strOf(b, "basis", "catmull_rom");
+        if      (bs == "linear")                        sp.basis = CurveBasis::Linear;
+        else if (bs == "catmull_rom" || bs == "catmull-rom" ||
+                 bs == "catmullrom")                    sp.basis = CurveBasis::CatmullRom;
+        else if (bs == "bezier")                        sp.basis = CurveBasis::Bezier;
+        else if (bs == "bspline" || bs == "b-spline")   sp.basis = CurveBasis::BSpline;
+        else { fail("fur: unknown basis '" + bs + "' (linear, catmull_rom, bezier, bspline)"); return false; }
+
+        sp.count  = (long long)dblOf(b, "count", 0.0);
+        sp.seed   = (uint64_t)std::max(0.0, dblOf(b, "seed", 0.0));
+        sp.points = (int)dblOf(b, "points", 5.0);
+        sp.subdiv = (int)dblOf(b, "segments", 2.0);
+
+        // Authored -> internal units. A length scales by L_; an AREA density scales by
+        // 1/L_^2, which is the one conversion in this block that is easy to get backwards:
+        // `density 20000` must mean 20000 hairs per authored square unit whatever `scene {
+        // units }` says, so the count it implies has to be computed against the authored
+        // area, i.e. internalArea / L_^2.
+        sp.density   = dblOf(b, "density", 0.0) / (L_ * L_);
+        sp.length    = Len(dblOf(b, "length", 0.05));
+        sp.lengthJitter = dblOf(b, "length_jitter", 0.2);
+        sp.radius    = Len(dblOf(b, "radius", 0.0008));
+        // A negative tip radius is the sentinel for "unauthored", which fur.h turns into
+        // 0.25*radius. An untapered fiber reads as wire, not hair, so fur's default
+        // deliberately differs from `curve`'s (which defaults to no taper at all).
+        sp.radiusTip = find(b, "radius_tip") ? Len(dblOf(b, "radius_tip", 0.0)) : -1.0;
+        sp.lift      = dblOf(b, "lift", 1.0);
+        sp.jitter    = dblOf(b, "jitter", 0.15);
+        sp.rootOffset = Len(dblOf(b, "root_offset", 0.0));
+        vec3Of(b, "direction", sp.comb);
+        sp.combAmount = dblOf(b, "comb", 0.35);
+        vec3Of(b, "gravity", sp.gravity);
+        sp.droop     = dblOf(b, "droop", 0.25);
+        sp.curl      = dblOf(b, "curl", 0.0);
+        sp.curlFreq  = dblOf(b, "curl_freq", 3.0);
+        sp.clump     = dblOf(b, "clump", 0.0);
+        sp.clumpSize = Len(dblOf(b, "clump_size", 0.02));
+        if (sp.count <= 0 && sp.density <= 0.0) {
+            fail("fur '" + sp.name + "' needs a positive `count` or `density`");
+            return false;
+        }
+
+        std::string ferr;
+        if (!surf.isSphere) { surf.tris = L.scene.tris.data() + triFirst; surf.nTris = triCount; }
+        const size_t segsBefore = L.scene.curveSegs.size();
+        const long long made = generateFur(sp, surf, L.scene.curves, L.scene.curveSegs, &ferr);
+        if (made < 0) {
+            // A stop during generation is not a scene error — it is a cancelled load, and
+            // stopped() is what main.cpp reports. Only a real failure gets a message.
+            if (!ferr.empty()) fail(ferr);
+            return false;
+        }
+        std::fprintf(stderr, "[fur] \"%s\" on \"%s\": %lld strands, %zu segments (%s %.4g m^2)\n",
+                     sp.name.c_str(), on.c_str(), made,
+                     L.scene.curveSegs.size() - segsBefore,
+                     surf.isSphere ? "sphere" : "mesh", furTargetArea(surf));
         return true;
     }
 
@@ -4392,6 +4526,7 @@ private:
             g.blasId   = -1;
             g.matId    = id;
             g.shapeOnly = shapeOnly;
+            if (!b.name.empty()) triRangeByName_[b.name] = {triStart, L.scene.tris.size() - triStart};
             L.scene.meshGroups.push_back(std::move(g));
             // A shape-only mesh exists purely to hand its silhouette to something else
             // (today: a `medium { bounds { object "<name>" } }` containment bake). Its

@@ -302,6 +302,83 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     tangent lateral band → front cap; both tangent circles sit at polar angle `acos(a)`,
     `a = (r0−r1)/|ba|`, which is what makes one angular sweep cover all three
     continuously and the preview mesh closed). Coarse by design, ~80 tris/segment.
+- **`fur.h`** — the **groom generator** (`fur { on "<object>" … }`), added 0.152.0 for
+  TODO §P1 stage 2. `curve.h` gave ftrace a strand; this gives it a way to *author* a
+  coat, which is a different problem — nobody types 10⁴–10⁶ hairs, so without a
+  generator the primitive is limited to the handful of wires you are willing to write
+  out. A pure function of `(surface, parameters, seed, index) -> strands`.
+  - *It emits no new geometry type.* `generateFur` appends exactly the `Curve` /
+    `CurveSeg` records `ftsl.h`'s hand-authored `curve` path produces, so the BVH, the
+    CPU tracer, the CUDA megakernel and the raster preview all needed **zero** new code
+    and a groom inherited the 0.151.0 GPU port for free. That constraint is what kept
+    the feature to one header plus a loader arm.
+  - *Roots are area-uniform.* A prefix CDF over triangle area plus the sqrt barycentric
+    warp — sampling a triangle *uniformly* instead is the classic mistake and is nearly
+    invisible on an even mesh, yet it thins the coat over large polygons and makes
+    `density` meaningless. A `sphere` target is **not** tessellated at all: roots land on
+    the analytic surface with the analytic normal, so a furred ball has no faceting in
+    its root distribution.
+  - *Shaping is closed-form, and that is the design.* Growth is linear in the arc
+    parameter `t`; droop, comb, curl and clump are all quadratic in it, so the root
+    leaves the skin along its growth direction (a strand that bends at its root reads as
+    broken) while the tip carries the full displacement. Closed-form is what makes each
+    strand independent of every other, hence the build is a lock-free `ft::parallelFor`
+    into a preallocated slice whose result does not depend on scheduling. No simulation,
+    no solver, no collision — a deliberate first tier.
+  - *Variable output, handled honestly.* `tessellateCurve` may emit fewer cones than the
+    upper bound (it drops coincident samples), so each strand records its own count and a
+    serial compaction closes the gaps; the "nothing dropped" case (every ordinary groom)
+    degenerates to a single bulk append. If any strand *was* dropped, every `curveId` is
+    renumbered rather than left stale.
+  - *Clumping uses a real spatial structure.* Strands blend toward their **nearest** guide
+    with weight `clump·t`, so roots stay exactly where the sampler put them — clumping
+    must change a coat's **shape, never its density**. Guides live in a CSR uniform grid
+    with shell-only ring expansion and a "one ring past the first hit" stop rule (the
+    classic off-by-one: the nearest guide can sit beyond the first non-empty ring). The
+    cell count is capped at 2·10⁶ by coarsening, so a tiny `clump_size` on a large model
+    cannot allocate a billion cells. Hashing the root cell would have been simpler and is
+    visibly wrong — it gives cube-shaped tufts on a grid instead of Voronoi ones.
+  - *LOAD-ORDER TRAP (cost a debugging session; now pinned).* The deferred `fur` sweep
+    runs inside the **loader**, but `Tri::finalize()` — which computes `gn` and back-fills
+    absent shading normals — is called from **`Scene::build()`**, i.e. afterwards. So the
+    generator sees `gn == n0 == n1 == n2 == (0,0,0)` on every quad, triangle, and mesh
+    without authored `vn`. `normalize` of that zero made the whole strand NaN, and the NaN
+    was then swallowed by `tessellateCurve`'s `dot(dp,dp) > 0` coincidence guard — so a
+    groom emitted **zero strands and printed no error at all**. `furSampleRoot` now
+    derives the geometric normal from the vertices itself and uses shading normals only
+    when genuinely present. The general lesson: **anything reading `Tri` during loading
+    must assume it is not finalized.**
+  - *Loader wiring (`ftsl.h`).* `triRangeByName_` maps a name → `(first, count)` into
+    `Scene::tris`, filled by `addQuad`/`addTriangle`/`addMesh`. The target is resolved as
+    an **index range**, never a `Tri*` held across the parameter reads — `Scene::tris` is
+    a vector and a stored pointer would dangle the moment anything appended. Like
+    `medium`, `fur` is collected in Pass 3 and processed in a **deferred sweep** so
+    `on "name"` resolves regardless of authoring order; the sweep runs *before*
+    `stripShapeOnlyMeshes`, so a groom can grow on an invisible scalp. `density` is
+    divided by `L_²` because it is authored per *authored* unit², not per m².
+  - *Verification.* `-checkfur` (`main.cpp`) is seven sections — roots on the surface;
+    area-uniformity (a 3:1 area split must give a 3:1 strand split, mean barycentric ⅓ not
+    ½, `density × area` an exact count); determinism across seeds; growth never into the
+    skin plus length inside the jitter window and shaped arc inside its analytic bound;
+    clumping collapsing tip spacing while moving **no** root; a well-formed chain; and the
+    load-order regression, built on deliberately **un-finalized** triangles. Note §4
+    measures the direction the strand *leaves* at, not where it ends up: a shallow strand
+    under heavy droop legitimately curves back to the ground. **Mutation-tested** by
+    `tools/mutate_fur.py` — nine deliberate breaks in `fur.h`, each caught by the section
+    that owns it (`python tools/mutate_fur.py 6 9` re-runs individual ones; a full sweep is
+    one rebuild per mutation). `tools/fur_noise.py` is the companion measurement behind
+    TODO §P2's corrected forward-vs-backward note.
+  - *And the mutation run paid for itself immediately.* `spec.seed` has **two** independent
+    consumers — the per-strand rng and the clump-guide rng — and §3's original "seed 8
+    differs from seed 7" test ran with clumping **on**, where either one moving alone is
+    enough to make the buffers differ. Deleting `spec.seed` from the *strand* seeding was
+    therefore MISSED: the groom would silently have ignored the seed entirely in any scene
+    without `clump`. §3 now checks each path in isolation — the strand rng with clumping
+    off (nothing else can move), and the guide rng by driving the guide count to exactly
+    **one** (`clump_size` large enough that `G = round(area/πr²)` clamps to 1) at
+    `clump 1.0`, so `w = clump·t` is exactly 1 at the tip and every strand's last control
+    point *is* that single guide's tip — a point the strand rng cannot influence. §3 also
+    asserts the tips really did collapse, so the isolation can't silently fail open.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds

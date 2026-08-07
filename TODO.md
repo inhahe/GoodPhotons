@@ -4599,16 +4599,84 @@ that item mostly a binding exercise there.
       recentering** on host *and* device (exact re-parameterisation; also tightened the double path
       16×), and permanently guarded by `-checkcurve` §6, which instantiates the real intersector at
       `float` (mutation-verified: `shift = 0` fails §6 on all four rows, §§1–5 still pass).
+      **Groom generator ✅ 2026-08-07, v0.152.0** — `src/fur.h` + the FTSL `fur { on "<object>" … }`
+      block, the piece that turns "ftrace has fibers" into "ftrace has fur" (a coat is 10⁴–10⁶
+      strands; nobody types that). Roots are scattered **area-uniformly** over a named sphere,
+      mesh, quad or triangle — a triangle-area CDF plus the sqrt barycentric warp for meshes, the
+      analytic surface with the analytic normal for a `sphere`, so a furred ball has no faceting in
+      its coat. Each strand is shaped by closed-form terms (`lift`/`jitter`, `direction`+`comb`,
+      `gravity`+`droop`, `curl`+`curl_freq`, `clump`+`clump_size`), growth linear in `t` and every
+      bend quadratic, so roots leave the skin cleanly and strands stay independent — hence a
+      lock-free `parallelFor` and a groom that is a pure function of `(surface, params, seed)`.
+      Clumping uses **nearest-guide** assignment through a CSR uniform grid (hashing the root cell
+      would give cube tufts on a grid instead of Voronoi ones) with weight `clump·t`, so it changes
+      a coat's shape and never its density. **It emits no new geometry type** — exactly the
+      `Curve`/`CurveSeg` records a hand-authored `curve` produces, so BVH / CPU / CUDA / raster all
+      needed zero new code and a groom inherited the 0.151.0 GPU port for free. Guarded by
+      `-checkfur` (seven sections, nine-mutation-tested — and the mutation run **found a real
+      hole**: §3 originally tested seed sensitivity once with clumping on, which could not
+      distinguish the strand rng from the guide rng, so deleting `spec.seed` from the strand
+      seeding went undetected. §3 now isolates each path). Demos: `scenes/fur_basics.ftsl`,
+      `scenes/fur_creature.ftsl`.
 - [ ] **P2 — sub-pixel variance and the aggregate-BSDF LOD.** The reason fiber rendering is
       expensive is not the intersector. A fiber is typically **1/5 to 1/50 of a pixel wide**, so in
-      a path tracer each ray either hits or misses and the two answers differ wildly — it shows up
-      as **variance**, not aliasing, and it is one of the classic SPP sinks. Past some distance
-      individual fibers must give way to an **aggregate volumetric BSDF**; making that near/far
-      transition not pop is the actual work. ftrace's existing participating-medium machinery
-      (`MediumBound`, per-λ free flight) is the natural substrate for the far tier.
-      **Note for mode selection:** fibers are a **backward-mode** (`-mode L`) feature. A
-      forward/photon tracer is structurally the wrong vehicle — photons cast from a light almost
-      never usefully hit sub-pixel geometry.
+      a **backward** path tracer each camera ray either hits or misses and the two answers differ
+      wildly — it shows up as **variance**, not aliasing, and it is one of the classic SPP sinks.
+      Past some distance individual fibers must give way to an **aggregate volumetric BSDF**; making
+      that near/far transition not pop is the actual work. ftrace's existing participating-medium
+      machinery (`MediumBound`, per-λ free flight) is the natural substrate for the far tier.
+      **Note for mode selection — CORRECTED 2026-08-07.** An earlier draft of this entry claimed
+      fibers are a **backward-mode** feature and that "a forward/photon tracer is structurally the
+      wrong vehicle — photons cast from a light almost never usefully hit sub-pixel geometry."
+      **That is wrong**, and it is worth recording *why*, because the error is the kind that sounds
+      physical. "Sub-pixel" is a statement about the geometry's **camera-side** subtended angle. It
+      says nothing about its **light-side** one, and photons are cast toward the *light's* view of
+      the scene. A coat is a dense opaque mat of ~10⁵ strands covering a large solid angle from any
+      light in the room — from the light it is one of the **easiest** targets present, not one of
+      the hardest. The two sides were conflated.
+      The variance argument fails the same way. Sub-pixel fiber variance is a **point-sampling**
+      pathology: a backward tracer probes a pixel with a handful of camera rays, each a binary
+      hit/miss on an object 1/50 of a pixel wide, and the two outcomes differ wildly. ftrace's
+      forward modes (`A`/`B`/`C`) never point-sample a pixel — they *splat accumulated flux* into
+      the film, so a pixel's value is an area average over its whole footprint **by construction**.
+      Per-pixel relative error there is governed by photons-per-pixel, i.e. by **flux**, not by how
+      much geometry sits behind the pixel. A fur pixel and a wall pixel of equal brightness converge
+      at the same rate.
+      What genuinely survives is **cost, not detail**, and it is mode-agnostic: (a) traversal — a
+      dense coat is deep, high-bounce-count geometry whichever direction the rays run; (b) memory —
+      80 B per `CurveSeg`, ~1.3 GB for a real groom (logged in `known-issues.md`); (c) deep-coat
+      radiance converges slowly in *any* estimator, though it is dim, so the absolute error is
+      small. If anything the forward modes should be **better** on hair's specular R-lobe sheen,
+      which is caustic-like and is precisely what light tracing is good at. So the aggregate LOD
+      above is still worth building — but in a forward mode it buys **cost**, not variance.
+      **And it was measured, not argued** (`tools/fur_noise.py`, `scenes/fur_creature.ftsl`,
+      720×540, RTX 4090). Each mode got 30 s and was scored against a long run of the *other*
+      mode (2400 s of `B`, 900 s of `R`) — cross-paired deliberately, because ftrace seeds
+      deterministically and a long run of the **same** mode contains the short run's own samples
+      and would flatter it; the reference's own per-region error is then removed in quadrature.
+      Regions are segmented by chroma (the coat is brown, every surface in the room is neutral
+      grey), 84 869 fur pixels vs 153 869 bare-room pixels, relative RMS error on **linear**
+      luminance:
+
+      | mode | fur | bare room | **fur penalty** |
+      |---|---|---|---|
+      | `B` forward | 44.6 % | 14.9 % | **3.00×** |
+      | `R` backward | 12.2 % | 2.7 % | **4.56×** |
+
+      The forward tracer's fur penalty is the **smaller** of the two, which is the claim the
+      corrected note makes. The mechanism check is sharper still: in a forward tracer a pixel's
+      relative error is 1/√(photons in it) and photons are proportional to flux, so the fur/room
+      ratio is *predicted with no free parameters* by brightness alone — mean linear luminance
+      0.0582 vs 0.2966 gives √(0.2966/0.0582) = **2.26×**. Forward measures 3.00× (**+33 %** over
+      the flux-only prediction); backward measures 4.56× (**+102 %**). So the part of the fur
+      penalty that is *not* explained by "fur is a dark brown surface sitting in its own shadow"
+      is 1.33× forward against 2.02× backward — the sub-pixel term is real in both, and it is
+      **~1.5× weaker in the forward mode**, in the direction predicted.
+      Two honest caveats. (1) In **absolute** terms `R` beat `B` everywhere on this scene at
+      matched wall-clock (2.7 % vs 14.9 % even on the bare wall) — but that is a property of the
+      scene (a small diffuse room, two big area lights, no caustics), not of fur, and it is the
+      same ranking a fur-free version would give. (2) 30 s is short; the ratios are what the
+      experiment measures well, the absolutes less so.
 - [ ] **P3 — fiber BCSDF.** Marschner R/TT/TRT is the baseline, but it was derived for *human hair*;
       **animal fur has a medulla** (hollow scattering core), which is why Yan et al. 2015/2017 add
       the TT^s/TRT^s lobes of the double-cylinder model. Plain Marschner on fur reads as plastic.
@@ -4620,6 +4688,39 @@ that item mostly a binding exercise there.
 ---
 
 ## Progress log
+- 2026-08-07: **`fur { }` — the groom generator, and a wrong claim corrected by measurement
+  (v0.152.0).** `src/fur.h` + an FTSL `fur { on "<object>" … }` block scatter 10⁴–10⁶ strands
+  area-uniformly over a named sphere / mesh / quad / triangle and emit **ordinary `Curve`/
+  `CurveSeg` records** — no new geometry type, so BVH, CPU, CUDA and raster needed zero new code
+  and a groom inherited the 0.151.0 GPU port for free. `scenes/fur_creature.ftsl` grows 308 506
+  strands / 1 792 316 segments from fifteen `fur` blocks at one shared `density 450000` over an
+  animal built from overlapping analytic spheres; the coat is what makes that pile of balls read
+  as one creature. CPU↔GPU parity on it: mean |diff| **0.18 %**, the worst pixels all single
+  strand edges at grazing incidence — the documented `float` conditioning limit, not a new bug.
+  **The load-order trap is the part worth remembering.** The deferred `fur` sweep runs during
+  *loading*; `Tri::finalize()` doesn't run until `Scene::build()`. So on any mesh/quad target the
+  generator read a zeroed normal, `normalize()` made the strand NaN, and the flattener's
+  coincident-point guard then swallowed it — an entire groom emitting **zero strands with no
+  error printed anywhere**. `-checkfur` §7 builds on deliberately un-finalized triangles.
+  **And mutation-testing the guard paid for itself immediately.** Nine deliberate breaks in
+  `fur.h`; eight were caught by the section that owns them, and the ninth — deleting `spec.seed`
+  from the per-strand rng — was **MISSED**, because §3 tested seed sensitivity once with clumping
+  on, where the *guide* rng moving alone was enough to pass. A build that silently ignored the
+  seed in every scene without `clump` would have shipped. §3 now isolates each path: the strand
+  rng with clumping off, and the guide rng by forcing the guide count to exactly **one** at
+  `clump 1.0`, so every strand's tip *is* that guide's tip — a point the strand rng cannot touch.
+  **Separately, a claim in §P2 turned out to be wrong and is now measured rather than asserted.**
+  It said fibers are a backward-mode feature and "a forward/photon tracer is structurally the
+  wrong vehicle — photons almost never usefully hit sub-pixel geometry." That conflates the
+  geometry's **camera-side** subtended angle with its **light-side** one: a coat is a dense mat
+  and is one of the easiest targets in the room *from the light*. And sub-pixel fiber variance is
+  a **point-sampling** pathology — forward modes splat flux into the film and area-average by
+  construction. `tools/fur_noise.py` measures it (30 s each, cross-scored against long runs of
+  the *other* mode so no run shares an rng stream with its own reference, chroma-segmented
+  regions, relative RMS on linear luminance): fur-vs-bare-room error penalty **3.00× forward vs
+  4.56× backward**. Against the parameter-free flux-only prediction √(L_room/L_fur) = 2.26×, the
+  unexplained sub-pixel residual is **1.33× forward against 2.02× backward** — real in both, and
+  ~1.5× weaker in the forward mode, i.e. the opposite of the retracted claim.
 - 2026-08-07: **Curves run on the GPU — and the port turned up a bug no image test could have found
   (v0.151.0).** `render_cuda.cu` gains `DCurveSeg` and a device `intersectCurveSeg`; `curveSegs` becomes
   the **fifth** prim range in both `closestHit` and `occluded` (which shifts the instance index

@@ -5,6 +5,65 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-08-07, v0.152.0): a `fur` block on a MESH/QUAD target generated ZERO strands, silently
+
+Found during bring-up of the `fur { }` generator, and it is worth keeping as a record
+because every layer that could have complained stayed quiet:
+
+```
+[fur] "ball_coat"  on "ball": 60000 strands, 480000 segments (sphere 0.2124 m^2)
+[fur] "lawn_grass" on "lawn":     0 strands,      0 segments (mesh   0.1352 m^2)
+```
+
+Spheres worked; every triangle-backed target produced an empty coat with no error, no
+warning, and a *correct* surface area in the log (so the area CDF was demonstrably fine).
+
+**Root cause: loader-vs-`Scene::build()` ordering.** `Tri::finalize()` — which computes
+the geometric normal `gn` and back-fills absent shading normals `n0..n2` — is called from
+`Scene::build()` (`scene.h`), which runs **after** the loader. The deferred `fur` sweep
+runs **inside** the loader, so it saw `gn == n0 == n1 == n2 == (0,0,0)` for every quad,
+every `triangle`, and every mesh without authored `vn`. `normalize()` is
+`a / length(a)`, so the root normal became NaN; the NaN propagated through the whole
+strand; and `tessellateCurve`'s coincident-sample guard `if (dot(dp,dp) > 0.0)` is
+**false for NaN**, so every segment was dropped and the strand vanished. A guard written
+to skip degenerate input silently swallowed corrupt input.
+
+**Fix.** `furSampleRoot` derives the geometric normal from the vertices itself
+(`cross(v1−v0, v2−v0)`) and uses shading normals only when they are genuinely present,
+with a final fallback for a degenerate triangle. Pinned by **`-checkfur` §7**, which
+deliberately builds on **un-finalized** `Tri`s — testing the finalized state would have
+tested a configuration that never occurs at load time — and also checks that real
+authored shading normals are still honoured.
+
+**Generalisation worth carrying:** anything that reads a `Tri` *during loading* must
+assume it is not finalized. `fur` is the first loader-time consumer of triangle normals;
+the next one will hit the same trap.
+
+### OPEN (2026-08-07, v0.152.0): `fur` cannot grow on a `mesh_instance`, and a huge groom peaks at 2× its final memory
+
+Two bounded limits of the v1 groom generator (`src/fur.h`), logged rather than fixed:
+
+- **No instanced targets.** `fur { on "…" }` resolves a name to a range of *world-space*
+  triangles in `Scene::tris`. An instanced `mesh_instance` keeps its triangles in a BLAS
+  in object space with a per-instance transform, so there is nothing in world space to
+  scatter over. This is a clear load error rather than a silent empty coat, but it means
+  the natural way to author a herd — one `mesh_asset`, many instances — cannot be furred.
+  *Proper fix:* sample in the asset's object space and transform each root + normal by the
+  instance transform (normals by the inverse-transpose), generating one groom per instance;
+  or, better for memory, teach the BVH to instance a **groom** the way it instances a mesh.
+- **Peak memory is the upper bound, not the result.** `generateFur` preallocates
+  `count × spans × subdiv` segments because `tessellateCurve` emits a variable number and
+  the build is a lock-free `parallelFor` into a fixed slice. Compaction is in-place, so
+  the peak is the bound — fine (the bound is nearly always exact), except that the bound
+  itself is large: 1 M strands × 8 cones × 80 B ≈ **640 MB**, on top of the `CurveSeg`
+  footprint issue already logged below. *Proper fix* is the same one that entry names —
+  shrink `CurveSeg` — plus, if a groom ever needs to stream, a two-pass count-then-fill.
+
+Also minor, not worth its own entry: clump **guides** are built in a serial loop rather
+than a `parallelFor`, so a groom with a very small `clump_size` (hence many guides) has a
+serial phase. It is O(guides) with guides ≪ strands by construction, so it has not
+mattered.
+
 ### FIXED (2026-08-07, v0.151.0): the `curve` primitive had no CUDA path — the whole scene fell back to the CPU
 
 Shipped deliberately with the primitive in v0.150.0 (TODO §P1) and ported one version

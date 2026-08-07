@@ -1,0 +1,123 @@
+# The FUR / GROOM generator — scattering `curve` strands over a surface.
+#
+# `curve` (see scenes/curve_basics.ftsl) is ONE strand, written out by hand. A coat is
+# 10^4-10^6 strands, which nobody authors as text — so `fur { }` generates them: it
+# samples roots AREA-UNIFORMLY over a named surface and grows each one with a closed-form
+# shape (lift, comb, gravity droop, curl, clump). What it emits is not a new kind of
+# geometry; it is exactly the Curve/CurveSeg records a hand-written `curve` produces, so
+# the BVH, the CPU tracer, the CUDA megakernel and the raster preview all already know
+# how to draw it.
+#
+#   on       "<object>"   required — a named sphere, mesh, quad or triangle
+#   count <n> | density <n>          exact count, or strands per authored unit^2
+#   seed <n>                         which realisation of the groom
+#   points <n>  segments <n>  basis <b>       strand tessellation
+#   length <l>  length_jitter <0..1>
+#   radius <r>  radius_tip <r>       (radius_tip defaults to 0.25*radius — fur tapers)
+#   lift <0..1>  jitter <0..1>  root_offset <l>
+#   direction <x y z>  comb <0..1>   combing / wind
+#   gravity <x y z>    droop <0..1>  sag
+#   curl <0..1>        curl_freq <n>
+#   clump <0..1>       clump_size <l>
+#
+# A `fur` block may sit anywhere — it is resolved in a deferred pass, so it can name a
+# surface authored later in the file.
+#
+#   ftrace -in scenes/fur_basics.ftsl -mode W -spp 64 \
+#          -o png/fur_basics.png -window -keepwindow
+
+scene { units meters  spectral 360 830 1 }
+
+material "white" { type diffuse  reflect whitewall 0.75 }
+material "grey"  { type diffuse  reflect 0.30 }
+material "skin"  { type diffuse  reflect rgb 0.35 0.26 0.22 }
+
+material "brown" { type diffuse  reflect rgb 0.42 0.26 0.13 }
+material "ginger"{ type diffuse  reflect rgb 0.62 0.30 0.10 }
+material "grass" { type diffuse  reflect rgb 0.28 0.52 0.16 }
+material "silver"{ type glossy   reflect rgb 0.75 0.75 0.78  roughness 0.25 }
+
+# --- an open box ---
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material grey  }   # back wall
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material white }   # left wall
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material white }   # right wall
+
+# A fiber is thin, so a small source leaves most of a strand's circumference in shadow
+# and the coat reads black. Use a broad ceiling panel.
+light area {
+    origin 0.10 0.985 0.10   u 0.80 0 0   v 0 0 0.80   normal 0 -1 0
+    power 260   spd preset:d65
+}
+
+# --- 1. A furred ball. The target is an ANALYTIC sphere, so roots are sampled on the
+#        real surface with the real normal — no tessellation, and no faceting in the
+#        root distribution. Gravity droop makes it read as fur rather than a pincushion.
+sphere "ball" { center 0.22 0.20 0.55  radius 0.13  material skin }
+fur "ball_coat" {
+    on "ball"
+    material brown
+    count 60000
+    length 0.055   length_jitter 0.35
+    radius 0.0006
+    droop 0.55
+    jitter 0.25
+    seed 1
+}
+
+# --- 2. CLUMPING. The same ball, groomed into tufts: each strand blends toward its
+#        NEAREST clump guide with weight proportional to distance along the strand, so
+#        roots stay area-uniform (clumping must change a coat's shape, never its density)
+#        while tips converge. `clump_size` is the tuft radius.
+sphere "ball2" { center 0.55 0.20 0.55  radius 0.13  material skin }
+fur "ball2_coat" {
+    on "ball2"
+    material ginger
+    count 60000
+    length 0.070   length_jitter 0.30
+    radius 0.0006
+    droop 0.45
+    jitter 0.30
+    clump 0.85   clump_size 0.022
+    seed 2
+}
+
+# --- 3. CURL. A helix superimposed on the growth direction, `curl` being the helix
+#        radius as a fraction of strand length and `curl_freq` the number of turns.
+sphere "ball3" { center 0.85 0.20 0.55  radius 0.12  material skin }
+fur "ball3_coat" {
+    on "ball3"
+    material silver
+    count 45000
+    length 0.075   length_jitter 0.25
+    radius 0.0007
+    curl 0.10   curl_freq 4
+    droop 0.30
+    seed 3
+}
+
+# --- 4. GRASS on a quad, driven by DENSITY rather than count: 12000 blades per square
+#        metre over a 0.5 x 0.28 m patch. `lift 1` grows straight up, a gentle `direction`
+#        comb leans the whole patch, and `basis linear` keeps each blade a cheap 2-cone
+#        polyline (grass does not need a smooth spline).
+quad "lawn" { origin 0.24 0.0005 0.10   u 0.52 0 0   v 0 0 0.26   material grey }
+fur "lawn_grass" {
+    on "lawn"
+    material grass
+    density 12000
+    basis linear
+    points 3
+    length 0.085   length_jitter 0.45
+    radius 0.0009  radius_tip 0.0001
+    lift 1.0   jitter 0.22
+    direction 1 0 -0.3   comb 0.30
+    droop 0.20
+    seed 4
+}
+
+camera "cam" {
+    eye 0.53 0.42 1.85   look_at 0.53 0.22 0.55   up 0 1 0   fov_y 40
+    mode W
+    film { res 640 480 }
+}

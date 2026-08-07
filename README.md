@@ -94,6 +94,12 @@ renders — so the animation's source is the one Python file, not 432 baked scen
   watertight surface with no cracks at the joints — a handful of segments per hair
   instead of the ~64 triangles a ribbon would need. Ray-traced on **CPU and GPU**
   (74× measured on a 96 000-segment fur patch), and shown by the raster preview.
+- **Fur / groom generator** — `fur { on "<object>" … }` scatters 10⁴–10⁶ strands
+  **area-uniformly** over any named sphere, mesh, quad or triangle and shapes them with
+  lift, comb, gravity droop, curl and Voronoi clumping. It emits ordinary `curve`
+  records, so a groom needs no new code anywhere downstream and inherits the GPU path
+  for free; the build is a deterministic, lock-free pure function of
+  `(surface, parameters, seed)`.
 - **Participating media** — one or many coexisting (superposed) fog regions with
   Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous

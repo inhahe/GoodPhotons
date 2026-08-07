@@ -28,6 +28,7 @@ Three neighbouring documents cover what this one only summarises:
 - [Lights](#lights)
 - [Geometry](#geometry)
   - [Curves and fibers (`curve`)](#curves-and-fibers-curve)
+  - [Grooms (`fur`)](#grooms-fur)
   - [Implicit surfaces (`isosurface`)](#implicit-surfaces-isosurface)
 - [Textures](#textures)
 - [Procedural patterns (math-driven materials)](#procedural-patterns-math-driven-materials)
@@ -1840,6 +1841,91 @@ missing is the *aggregate LOD*: every fiber is intersected individually, so a gr
 is linear in strand count and sub-pixel fibers are a variance sink. See `known-issues.md`,
 which also covers the per-segment azimuthal `v` frame and `CurveSeg`'s memory footprint.
 
+### Grooms (`fur`)
+
+A `curve` is one strand, written out by hand. A coat is 10⁴–10⁶ strands, which nobody
+authors as text — so a **`fur { }`** block generates them (`src/fur.h`), scattering roots
+over a named surface and growing each one with a closed-form shape:
+
+```
+sphere "ball" { center 0.22 0.20 0.55  radius 0.13  material skin }
+
+fur "ball_coat" {
+    on "ball"                 # a named sphere, mesh, quad or triangle
+    material brown
+    count 60000               # or `density <n>` — strands per authored unit^2
+    length 0.055  length_jitter 0.35
+    radius 0.0006             # radius_tip defaults to 0.25*radius
+    droop 0.55  jitter 0.25  seed 1
+}
+```
+
+The full key list is in FTSL.md → **§8.7 `fur`**. The shaping controls are `lift` /
+`jitter` (growth direction), `direction` + `comb` (combing and wind), `gravity` + `droop`
+(sag), `curl` + `curl_freq` (a helix), and `clump` + `clump_size` (tufts).
+
+**It is not a new kind of geometry.** The generator emits exactly the `Curve`/`CurveSeg`
+records a hand-written `curve` produces, so the BVH, the CPU tracer, the CUDA megakernel
+and the raster preview need no new code — everything above about round cones, bases,
+taper, watertight joints and the `u`/`v`/`tangent` frame applies to generated strands
+unchanged, and a groom inherits the GPU speedup for free.
+
+**Area-uniform roots.** Over a mesh, a triangle is picked proportional to its area and the
+barycentrics are sqrt-warped, so a low-poly belly and a dense face grow the same hairs per
+square centimetre and `density` is meaningful. A `sphere` target is not tessellated at all
+— roots land on the analytic surface with the analytic normal, so a furred ball has no
+faceting in its coat and no tessellation bias in its density.
+
+**Deterministic and parallel.** A strand is a pure function of `(surface, parameters, seed,
+index)` — no simulation, no solver, no neighbour queries — so the build is a lock-free
+`parallelFor` whose result does not depend on how the work was scheduled, and the same seed
+always rebuilds the same coat (which is what a checkpoint/resume, a flyby, or a CPU-vs-GPU
+comparison all quietly depend on). Growth is linear in the arc parameter `t` and every bend
+is quadratic in it, so the root leaves the skin along its growth direction while the tip
+carries the full displacement.
+
+**Clumping changes shape, never density.** Strands blend toward their **nearest** tuft
+guide with weight `clump · t`: roots stay exactly where the area-uniform sampler put them
+while tips converge. Guides are located through a CSR uniform grid rather than by hashing
+the root cell — hashing produces cube-shaped tufts on a grid, nearest-guide produces
+Voronoi tufts, which is what hair does.
+
+**Correctness.** `ftrace -checkfur` runs seven sections: roots lying on the target surface
+(off-plane distance, in-triangle containment, sphere radial error); area-uniformity (a 3:1
+area split must produce a 3:1 strand split, the mean barycentric must be ⅓ rather than the
+½ an unwarped map gives, and `density × area` must be the exact count); determinism, with
+the **two** consumers of the seed checked separately — the per-strand rng with clumping off,
+and the guide rng by forcing the guide count to one at full clump strength, so every tip *is*
+that guide's tip; growth direction never pointing into the skin, with lengths inside the jitter window
+and the shaped arc inside its analytic bound; clumping collapsing tip spacing while moving
+no root; the emitted chain being well-formed (segment count, contiguity, monotone taper and
+`u`, correct back-pointers); and a regression section for the load-order trap below. Each
+section is mutation-tested — a deliberate break in `fur.h` must make the section that owns
+it fail — and that mutation run is why the determinism section now splits the two seed
+paths: with clumping on, either path alone moving is enough to pass, so a build that had
+stopped seeding the *strands* from `spec.seed` slipped through the original test.
+
+**Load-order trap (fixed, and pinned).** The deferred `fur` sweep runs during scene
+*loading*, but `Tri::finalize()` — which computes geometric normals and back-fills absent
+shading normals — does not run until `Scene::build()`. So the generator sees zeroed normals
+on every quad, triangle and mesh without authored `vn`. Normalizing that zero vector made
+every strand NaN, and the NaN was then swallowed by the flattener's coincident-point guard,
+so a groom emitted **zero strands with no error printed anywhere**. The generator now
+derives the geometric normal from the vertices itself and uses shading normals only when
+they are genuinely present; `-checkfur` §7 builds on deliberately un-finalized triangles to
+keep it that way.
+
+**Limits.** The generator's ceiling is deliberate: no collision, no styling curves, no
+interactive brushing. It also inherits the curve limits above — most importantly the
+missing aggregate LOD, which is what decides how large a groom stays affordable. A
+`mesh_instance` cannot be a target (its triangles live in a BLAS, not in world space);
+see `known-issues.md`.
+
+Worked examples: `scenes/fur_basics.ftsl` isolates each parameter; `scenes/fur_creature.ftsl`
+is the payoff — an animal built from overlapping analytic spheres wearing ~300 000 strands
+from a dozen `fur` blocks at one shared `density`, which is also a demonstration that fur
+hides the seams of the geometry underneath it.
+
 ### Implicit surfaces (`isosurface`)
 
 Besides the explicit primitives above, geometry can be defined *implicitly* as the
@@ -3034,7 +3120,7 @@ alone can't restore, so they are not disk-resumable.
 | `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checkimplicit`,
-`-checkcurve`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
+`-checkcurve`, `-checkfur`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checksun`, `-checkbind`, `-checkprop`,
@@ -3045,7 +3131,11 @@ one-sphere-swallows-the-other case against the analytic ray–sphere test, `anyH
 against the full path (with half the origins *inside* the fiber), watertightness at
 chain joints, the four bases' flattening, and the **fp32 conditioning** of the quadric at
 fiber scale (the same code instantiated at `float`, as the CUDA megakernel runs it) —
-see **Curves and fibers** above.
+see **Curves and fibers** above. `-checkfur` guards the `fur` generator on top of that,
+in seven sections: roots on the surface, area-uniform root distribution, determinism
+across seeds, growth never pointing into the skin, clumping that collapses tips without
+moving roots, a well-formed segment chain, and a regression on the loader-ordering trap
+that once made a whole groom generate zero strands silently — see **Grooms** above.
 `-checkcontainer` guards the isosurface container clip: rotating an
 isosurface must not change what a ray sees, so it builds the same solid twice
 (axis-aligned and rigidly rotated) and checks that correspondingly rotated rays
