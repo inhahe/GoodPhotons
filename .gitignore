@@ -36,12 +36,19 @@
 # untracked: they are source material of unverified provenance (one is a watermarked
 # stock comp — see known-issues.md), and the prepared PNGs are the actual asset.
 !/textures/*.png
-# The README's demo clip. It IS a rendered output like every other .mp4 here, but it is
-# also the only moving picture of what ftrace does that anyone landing on the repo page
+# The README's demo clip. It IS a rendered output like every other .mp4/.gif here, but it
+# is also the only moving picture of what ftrace does that anyone landing on the repo page
 # will see, so it has to live in the repo rather than merely be regenerable from it
-# (`python tools/loom/examples/pastel_jack.py --ring-turns -3`). 480x480 / 7.2 s / 3.4 MB
-# — deliberately small enough not to bloat a clone.
+# (`python tools/loom/examples/pastel_jack.py --render --name pastel_jack_ring`).
+#
+# BOTH forms are committed on purpose. GitHub's Markdown sanitiser deletes <video> tags
+# outright, and raw.githubusercontent serves a repo .mp4 as `application/octet-stream`
+# with `X-Content-Type-Options: nosniff`, so no browser will play it inline — an animated
+# GIF is the only thing that renders on the repo page. The GIF is therefore the embed
+# (320x320 / 20 fps / 3.3 MB, gifski q65) and the MP4 is the full-quality download
+# (480x480 / 60 fps / 3.4 MB). Together ~6.6 MB, small enough not to bloat a clone.
 !/pastel_jack_ring.mp4
+!/pastel_jack_ring.gif
 
 # 3D model assets (large binaries kept on disk, never committed — cameras/, meshes/,
 # Meshy_* textures, etc. Scenes reference them locally; they don't belong in history.)
