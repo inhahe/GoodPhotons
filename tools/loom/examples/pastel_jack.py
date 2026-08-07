@@ -29,8 +29,10 @@ Run:
   python examples/pastel_jack.py --still    # one held still (look check)
   python examples/pastel_jack.py --render   # render the looping MP4 + GIF
 
-Knobs: ``--res N``, ``--gi N`` (gather rays), plus ``--t PHASE`` / ``--name NAME``
-for ``--still``.
+Knobs: ``--res N``, ``--gi N`` (gather rays), ``--t PHASE`` (``--still`` only), and
+``--name NAME``, which names the output directory ``png/<NAME>/`` for *either* mode —
+give a changed scene its own name rather than resuming on top of an old sequence, since
+a resume can detect a half-finished frame but not a stale one.
 """
 
 from __future__ import annotations
@@ -226,12 +228,19 @@ def main() -> int:
     still = "--still" in sys.argv
     render = "--render" in sys.argv
     r = int(jj._opt("--res", 480))
+    # `--name` applies to a sequence as well as to a still.  A sequence resumes on
+    # `skip_existing`, which can spot a *partial* frame (its `-checkpoint` sidecar is
+    # short) but has no way to spot a **stale** one — a finished frame of a different
+    # scene looks identical to a finished frame of this one.  So when the scene changes,
+    # the run needs a directory of its own rather than a clean-up you have to remember;
+    # `--name` is how you give it one, and it keeps each set self-contained (frames,
+    # `.ftsl`, checkpoints, MP4 and GIF all under `png/<name>/`).
+    name = jj._sopt("--name", "pastel_jack")
     scene = build_scene(res=(r, r))
 
     if still:
         from loom.drive import render_still
-        render_still(scene, t=jj._opt("--t", 0.0),
-                     name=jj._sopt("--name", "pastel_jack"),
+        render_still(scene, t=jj._opt("--t", 0.0), name=name,
                      n=1, interval=8.0, extra_args=_args())
         return 0
     if not render:
@@ -241,11 +250,11 @@ def main() -> int:
 
     from loom import render_range
     from loom.drive import assemble_gif_ffmpeg, assemble_mp4, default_outdir
-    pngs = render_range(scene, jj.FRAMES, name="pastel_jack", fps=jj.FPS, n=1,
+    pngs = render_range(scene, jj.FRAMES, name=name, fps=jj.FPS, n=1,
                         interval=8.0, skip_existing=True, extra_args=_args())
-    out = default_outdir("pastel_jack")
-    assemble_mp4(pngs, out / "pastel_jack.mp4", fps=jj.FPS)
-    assemble_gif_ffmpeg(pngs[::jj.GIF_STRIDE], out / "pastel_jack.gif", fps=jj.GIF_FPS)
+    out = default_outdir(name)
+    assemble_mp4(pngs, out / f"{name}.mp4", fps=jj.FPS)
+    assemble_gif_ffmpeg(pngs[::jj.GIF_STRIDE], out / f"{name}.gif", fps=jj.GIF_FPS)
     return 0
 
 
