@@ -74,11 +74,12 @@ import bisect
 import math
 import os
 import sys
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from loom import Scene, Material, Camera, Light, Raw  # noqa: E402
+from loom import Clamp, Cos, Phase, Signal, Slot, as_signal  # noqa: E402
 from loom.scene import Element  # noqa: E402
 from loom.ftsl_emit import EmitCtx, fmt, fmt3  # noqa: E402
 
@@ -315,6 +316,18 @@ BALL = 0.52
 ROD = 0.32
 TILT = 35.0     # precession half-angle; a module constant because `rest_height` needs it
 
+# Bounds on a *driven* lean (see :func:`lean_signal`).  Both ends are real limits, not
+# taste.  Below ~5° the cone collapses and the precession stops being visible at all,
+# and `rest_height`'s proof that the bottom axis ball is always the lowest part of the
+# jack holds only for `tilt < 45°` (it turns on `cos(tilt) > sin(tilt)`) — past that the
+# equatorial arms swing lower, the solved standing height is wrong, and the jack cuts
+# through the floor.  So the upper clamp is exactly where that proof expires.
+LEAN_MIN = 5.0
+LEAN_MAX = 44.0
+
+_TAU = 2.0 * math.pi
+_RAD = math.pi / 180.0          # degrees -> radians, as a multiplier for a Signal
+
 
 # ---------------------------------------------------------------------------
 # The element
@@ -351,23 +364,46 @@ class Jack(Element):
 
     ``gyroid_glass=False`` renders the glass arms as plain solid ball-and-rod — the
     fallback if intersecting a *dielectric* with a marched field proves too slow.
+
+    **The pose is a Signal graph, and its three angles carry named**
+    :class:`~loom.anim.Slot`\\ **s**, so the tumble is drivable from the curve editor
+    without editing this file:
+
+    ``jack_spin`` / ``jack_precess``
+        Extra spin / precession **in degrees**, authored at 0 and *added* to the
+        constant ``spin``/``precess`` rate terms.  As pure offsets they re-time the
+        tumble against anything else in the scene without disturbing the whole-turn
+        rates that keep the loop seamless.
+    ``jack_lean``
+        The half-angle of the precession cone, ``tilt`` by default.  Unlike the two
+        phases this one changes the jack's *shape in space*, so the standing height has
+        to follow it — pass the same signal through :func:`rest_height` and the jack
+        stays exactly on the floor at every value (that is what ``tilt=lean_signal(…)``
+        plus ``centre=(0, rest_height(Y0, tilt=that_same_signal), 0)`` is for, and
+        :mod:`pastel_jack` does it).  Clamped to ``[LEAN_MIN, LEAN_MAX]``.
+
+    ``centre`` accepts plain floats (the ordinary static case) *or* Signals per
+    component; ``tilt`` likewise takes a float — wrapped into a fresh ``jack_lean``
+    slot — or an existing Signal, which is how two elements share one lean.  Because a
+    slot's value is pushed in from outside the clock, everything derived from one is
+    resolved **per frame** in :meth:`emit` rather than cached on the instance.
     """
 
     def __init__(self, *, arm: float = ARM, ball: float = BALL, rod: float = ROD,
-                 spin: float = 1.0, precess: float = 1.0, tilt: float = TILT,
+                 spin: float = 1.0, precess: float = 1.0,
+                 tilt: Union[float, Signal] = TILT,
                  freq: float = FREQ, solid: float = SOLID, fill: float = FILL,
                  counter: float = COUNTER,
-                 centre: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+                 centre: Tuple[Union[float, Signal], ...] = (0.0, 0.0, 0.0),
                  gold: str = "gold", glass: str = "glass",
                  gyroid_glass: bool = True, name: str = "jack") -> None:
-        self.centre = (float(centre[0]), float(centre[1]), float(centre[2]))
+        self.centre = tuple(as_signal(c) for c in centre)
         self.arm = float(arm)
         self.ball = float(ball)
         self.rod = float(rod)
         self.fill = float(fill)
         self.spin = float(spin)
         self.precess = float(precess)
-        self.tilt = float(tilt)
         self.freq = float(freq)
         self.solid = float(solid)
         self.counter = float(counter)
@@ -375,19 +411,31 @@ class Jack(Element):
         self.glass = glass
         self.gyroid_glass = bool(gyroid_glass)
         self.name = name
+        # ---- the pose graph -------------------------------------------------
+        # A float `tilt` gets its own slot; a Signal is taken as-is so a caller can hand
+        # the SAME lean to the jack and to whatever else must track it.
+        self.tilt = lean_signal(tilt) if not isinstance(tilt, Signal) else tilt
+        self.spin_phase = Slot("jack_spin", 0.0)
+        self.precess_phase = Slot("jack_precess", 0.0)
+        # The offsets are ADDED to the rate terms rather than folded inside them, which
+        # is deliberate: `(2*pi*rate)*t + (pi/180)*0.0` is bit-for-bit the closed form
+        # this replaced, so switching to Signals is provably a refactor and not a
+        # re-derivation. (Verified: all 432 frames of `pastel_jack` emit byte-identical.)
+        self.spin_angle = _TAU * self.spin * Phase() + _RAD * self.spin_phase
+        self.precess_angle = _TAU * self.precess * Phase() + _RAD * self.precess_phase
 
-    # The pose is a closed form in the clock, not a Signal graph, so there is
-    # nothing here for the cycle detector to walk.
     def roots(self) -> List:
-        return []
+        # Every animatable value-site, so `detect_signal_cycle` can walk the graph and
+        # `collect_slots` can find `jack_spin` / `jack_precess` / `jack_lean` by name.
+        return [self.spin_angle, self.precess_angle, self.tilt, *self.centre]
 
     @property
     def reach(self) -> float:
         """Radius of the smallest origin-centred sphere containing the jack."""
         return self.arm + self.ball
 
-    def pose(self, t: float) -> Mat3:
-        """Body->world rotation at loop phase ``t`` in [0, 1).
+    def pose(self, spin_rad: float, precess_rad: float, tilt_deg: float) -> Mat3:
+        """Body->world rotation from three resolved angles.
 
         ``Ry(precession) · Rz(tilt) · Ry(spin)``, read right to left: the jack spins
         about its own ±y arm pair, that axis is laid over by ``tilt``, and the
@@ -399,9 +447,9 @@ class Jack(Element):
         world +y.  That is what puts the two axis balls on antiphase circles of radius
         ``arm·sin(tilt)`` at heights ``±arm·cos(tilt)``.
         """
-        return _mm(_ry(2.0 * math.pi * self.precess * t),
-                   _mm(_rz(math.radians(self.tilt)),
-                       _ry(2.0 * math.pi * self.spin * t)))
+        return _mm(_ry(precess_rad),
+                   _mm(_rz(math.radians(tilt_deg)),
+                       _ry(spin_rad)))
 
     def gyroid_fields(self) -> List[str]:
         """The base carve: the ``function`` field(s) whose INTERSECTION is the solid.
@@ -571,13 +619,12 @@ class Jack(Element):
                     f" ({thick / period * 100:.1f}% of a cell)")
         return out
 
-    def _arm_leaves(self, M: Mat3, kind: str) -> List[str]:
+    def _arm_leaves(self, M: Mat3, o: Tuple[float, float, float], kind: str) -> List[str]:
         out: List[str] = []
         for d_body, k in _ARMS:
             if k != kind:
                 continue
             d = _mv(M, d_body)
-            o = self.centre
             tip = tuple(self.arm * c + o[i] for i, c in enumerate(d))
             mid = tuple(0.5 * self.arm * c + o[i] for i, c in enumerate(d))
             rx, ry, rz = aim_y_euler(d)
@@ -588,8 +635,9 @@ class Jack(Element):
                        f'radius {fmt(self.rod)}  height {fmt(self.arm)} }}')
         return out
 
-    def _block(self, M: Mat3, kind: str, material: str, carve: bool) -> str:
-        leaves = self._arm_leaves(M, kind)
+    def _block(self, M: Mat3, o: Tuple[float, float, float], kind: str,
+               material: str, carve: bool) -> str:
+        leaves = self._arm_leaves(M, o, kind)
         lines = [f'{self.name}_{kind} = isosurface {{',
                  f'    material "{material}"']
         if carve:
@@ -604,7 +652,7 @@ class Jack(Element):
             # never has to be recomputed as the jack turns.  Note the container moves
             # with the jack but the `function` leaf does NOT — the field stays in world
             # space, which is the whole point.
-            lines.append(f'    contained_by {{ sphere {{ center {fmt3(self.centre)}  '
+            lines.append(f'    contained_by {{ sphere {{ center {fmt3(o)}  '
                          f'radius {fmt(self.reach)} }} }}')
             # |grad| of the renormalised gyroid is <= sqrt(3); the SDF partner is
             # unit-Lipschitz, and max(.,.) cannot exceed either bound.
@@ -617,14 +665,35 @@ class Jack(Element):
         return "\n".join(lines)
 
     def emit(self, ctx: EmitCtx) -> str:
-        M = self.pose(ctx.clock.t)
-        return "\n".join([self._block(M, "gold", self.gold, True),
-                          self._block(M, "glass", self.glass, self.gyroid_glass)])
+        # Resolve every animatable value ONCE per frame, through the emit cache, then
+        # build the pose from plain floats — the matrix maths below has no business
+        # knowing about the graph.
+        M = self.pose(self.spin_angle.at(ctx.clock, ctx.cache),
+                      self.precess_angle.at(ctx.clock, ctx.cache),
+                      self.tilt.at(ctx.clock, ctx.cache))
+        o = tuple(c.at(ctx.clock, ctx.cache) for c in self.centre)
+        return "\n".join([self._block(M, o, "gold", self.gold, True),
+                          self._block(M, o, "glass", self.glass, self.gyroid_glass)])
+
+
+def lean_signal(default: float = TILT, name: str = "jack_lean") -> Signal:
+    """A clamped, named :class:`~loom.anim.Slot` for the precession half-angle.
+
+    Split out of :class:`Jack` so a caller can build the lean *before* the jack and hand
+    the same node to both the pose and :func:`rest_height` — one channel, two consumers,
+    which is what keeps a driven lean standing on the floor instead of hovering over it.
+    """
+    return Clamp(Slot(name, float(default)), LEAN_MIN, LEAN_MAX)
 
 
 def rest_height(floor_y: float, *, arm: float = ARM, ball: float = BALL,
-                tilt: float = TILT) -> float:
+                tilt: Union[float, Signal] = TILT) -> Union[float, Signal]:
     """Centre height that stands the jack exactly on ``floor_y`` — a closed form.
+
+    Pass a **Signal** ``tilt`` (from :func:`lean_signal`) and you get a Signal back, with
+    the same expression built out of graph nodes: the height then tracks a driven lean
+    frame by frame, so the jack keeps touching down no matter what the channel does.  A
+    float ``tilt`` returns a float, unchanged, which is the ordinary static case.
 
     The jack's lowest point is not something to search for numerically; it falls out of
     the pose.  Of the six arms, the ±y pair *is* the spin axis, so those two ball centres
@@ -656,6 +725,10 @@ def rest_height(floor_y: float, *, arm: float = ARM, ball: float = BALL,
       moments and never penetrating, which is exactly what this height gives, and here the
       lowest moment happens to recur throughout the loop rather than once.
     """
+    if isinstance(tilt, Signal):
+        # Same expression, same association order, so the default value of the slot
+        # reproduces the float branch bit for bit.
+        return floor_y + arm * Cos(_RAD * tilt) + ball
     return floor_y + arm * math.cos(math.radians(tilt)) + ball
 
 

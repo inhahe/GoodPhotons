@@ -40,7 +40,13 @@ from __future__ import annotations
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))      # the loom package
+# ...and this directory, so the sibling `jumping_jack` import below still resolves when
+# this file is imported BY PATH rather than run as a script (`loom.viewer.load_build`,
+# which the live viewer and `python -m loom.anim` both use, does not add it).
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from loom import Scene, Material, Camera, Light  # noqa: E402
 from loom.ftsl_emit import fmt  # noqa: E402

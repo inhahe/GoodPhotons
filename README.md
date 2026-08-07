@@ -30,6 +30,23 @@ counter-rotation is that script's default `--ring-turns -3`), which renders ever
 frame at `-mode W -spp 8 -gi 24 -gi-clamp 0.15 -whitted-grid 3` and assembles the
 MP4 and GIF.*
 
+*The animation is authored in **[Loom](#loom--procedural-animation-toolkit)**, the
+procedural toolkit bundled in `tools/loom/`, and there are no keyframes anywhere in it.
+Every moving quantity — the jack's spin and its precession, its lean off the vertical,
+the ring's spin and the tilt of the ring's plane — is a **modulator signal**: a pure
+function of the loop phase, which is what makes the loop seamless by construction rather
+than by matching the ends up. The geometry that has to stay *consistent* is then solved
+from those signals instead of being animated alongside them — the ring's major radius is
+derived from its tilt so that the bottom of the ring touches the floor and the top
+reaches the top of the jack at **any** tilt, and the jack's standing height is derived
+from its lean so its lowest ball stays on the floor as it leans over. Each of the five is
+also exposed as a named channel — `jack_spin`, `jack_precess`, `jack_lean`, `ring_spin`,
+`ring_tilt` — that loom's `CurveDrive` / `SceneDriver` layer can push at runtime, so the
+same scene can be driven live (`python -m loom.anim examples/pastel_jack.py`) with those
+invariants still holding. Loom discretizes **last**: only once a frame is asked for does
+it collapse the whole graph to numbers and emit that frame's `.ftsl`, which ftrace then
+renders — so the animation's source is the one Python file, not 432 baked scenes.*
+
 > **This clip was rendered by a _backward_ tracer, not the forward one.** Mode `W`
 > is the deterministic Whitted preview, which is mode `R`'s **backward** camera-ray
 > walk with every Monte-Carlo draw replaced by a fixed quadrature — rays start at the
@@ -266,6 +283,14 @@ GIF/MP4. It ships with ready-to-run examples (swept ribbons/tubes, gyroid and ot
 triply-periodic minimal-surface loops, higher-dimensional gyroid slices, function-driven
 materials, 2-D motion graphics, spacetime-transform videos) and stands alone (it can
 drive any renderer).
+
+**The [demo at the top of this page](#demo) is a loom animation** —
+[`tools/loom/examples/pastel_jack.py`](tools/loom/examples/pastel_jack.py) — and it is
+the worked end-to-end example of loom's driven-channel path: every moving quantity is a
+modulator signal of the loop phase, the dependent geometry is *solved* from those signals
+so contact and framing invariants hold at any value, and the five authored quantities are
+published as named `Slot` channels a `CurveDrive` can push live. Start there if you want
+to see the whole stack in one file.
 
 See **[`tools/loom/README.md`](tools/loom/README.md)** for the tour, and
 `tools/loom/DESIGN.md` for the architecture.

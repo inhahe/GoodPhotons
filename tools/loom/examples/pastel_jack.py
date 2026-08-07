@@ -33,6 +33,37 @@ Knobs: ``--res N``, ``--gi N`` (gather rays), ``--t PHASE`` (``--still`` only), 
 ``--name NAME``, which names the output directory ``png/<NAME>/`` for *either* mode —
 give a changed scene its own name rather than resuming on top of an old sequence, since
 a resume can detect a half-finished frame but not a stale one.
+
+Driving it live
+---------------
+Every moving part is a :mod:`loom.signals` graph, and the five values worth playing with
+are named :class:`~loom.anim.Slot`\\ s, so the whole thing is drivable from ftrace's
+curve editor with no edit to this file::
+
+    python -m loom.anim examples/pastel_jack.py --config drive.json --strict
+
++-----------------+---------+----------------------------------------------------------+
+| slot            | default | what it does                                             |
++=================+=========+==========================================================+
+| ``ring_spin``   |   0°    | extra ring azimuth on top of the constant ``turns`` rate |
+| ``ring_tilt``   |  45°    | the coin-collapse angle; the radius re-solves to match    |
+| ``jack_lean``   |  35°    | precession cone half-angle; the standing height follows   |
+| ``jack_spin``   |   0°    | extra spin phase                                          |
+| ``jack_precess``|   0°    | extra precession phase                                    |
++-----------------+---------+----------------------------------------------------------+
+
+``jack_lean`` is the one that shows why this is worth doing rather than just exposing
+numbers: it feeds the pose, the height that stands the jack on the floor, *and* the
+ring's sizing, all off one node, so the scene's "everything touches the floor, nothing
+clips through it" invariant holds at every value a curve can hand it — which is
+*checked*, in ``tests/test_example_pastel_jack.py``, rather than asserted: that test
+sweeps five leans against three ring tilts across the loop and reads both contact points
+back out of the emitted text.  :data:`DRIVE` is the starting configuration the scene
+proposes to the editor.
+
+The conversion from the previous closed-form-in-``ctx.clock.t`` version was a **pure
+refactor**: every frame of the loop emitted byte-identical ``.ftsl`` before and after,
+and the re-rendered PNGs were byte-identical to the shipped ones.
 """
 
 from __future__ import annotations
@@ -41,9 +72,20 @@ import math
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))      # the loom package
+# ...and this directory, for the sibling `jumping_jack` import below.  Running the file
+# as a script puts it on the path anyway, but `build()` is also imported BY PATH — by
+# `loom.viewer.load_build`, which `python -m loom.anim` and the live viewer both go
+# through — and that route never adds the scene's own directory.  Without this the
+# contract function is unreachable from anywhere but `examples/`.
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from loom import Scene, Material, Camera, Element, Light  # noqa: E402
+from loom import Clamp, Phase, Slot, as_signal  # noqa: E402
+from loom.anim import ChannelBinding, CurveDrive, MODE_ANIMATION  # noqa: E402
+from loom.axes import ADDITIVE  # noqa: E402
 from loom.ftsl_emit import EmitCtx, fmt, fmt3  # noqa: E402
 
 import jumping_jack as jj  # noqa: E402
@@ -83,6 +125,14 @@ RING_TILT = 45.0      # degrees off horizontal: a coin exactly halfway through f
 # loop needs every rotation to close, and −3 keeps the ring's own speed exactly what it
 # was — only its direction changes.
 RING_TURNS = -3.0
+
+# Bounds on the driveable tilt (see :class:`Ring`).  The lower bound is not taste: the
+# sizing equation divides by sin(tilt), so tilt -> 0 sends the ring radius to infinity.
+# 5 deg already gives a 14.1 m ring, far outside a 13.2 m room, which is as flat as the
+# shot can go before the geometry stops meaning anything.  90 deg is the other extreme,
+# a vertical hoop, and needs no guard — it is where the radius is *smallest*.
+RING_TILT_MIN = 5.0
+RING_TILT_MAX = 90.0
 
 
 class Ring(Element):
@@ -127,38 +177,81 @@ class Ring(Element):
     A ``torus`` leaf is an exact, unit-Lipschitz SDF with analytic bounds
     (``src/implicit.h``), so unlike the jack's carved ``function`` field it needs neither
     ``contained_by`` nor ``max_gradient``.
+
+    **Both of its degrees of freedom are Signals, and each carries a named**
+    :class:`~loom.anim.Slot`, so the whole ring is drivable from the curve editor without
+    touching this file (see the module docstring's "Driving it live"):
+
+    ``ring_spin``
+        Extra azimuth **in degrees**, added on top of the constant ``turns`` rate.  Zero
+        by default, so it is a pure offset: nudging it re-times the ring against the
+        jack, and sweeping it through 360 replaces the constant rate with whatever the
+        curve says.
+    ``ring_tilt``
+        The coin-collapse angle, ``RING_TILT`` by default.  This is the interesting one,
+        because :attr:`major` is *solved* from it rather than authored — drive the tilt
+        up towards 90 and the ring both stands up and shrinks, keeping its low point on
+        the floor and its high point level with the jack's crown at every value.  It is
+        clamped to ``[RING_TILT_MIN, RING_TILT_MAX]`` since the solve divides by
+        ``sin(tilt)``.
+
+        Being honest about the low end: the clamp keeps the *solve* well-conditioned, not
+        the *shot*.  ``R = (reach - r)/sin(tilt)`` grows without bound as the tilt falls,
+        so by ~25° the ring is around 2.9 m across and by ``RING_TILT_MIN`` it is far
+        outside a camera framed — as this one is — for the authored 45°.  The invariants
+        still hold there (the tests check exactly those tilts); the ring has simply
+        flattened out and walked off the edge of the frame.  A drive that sweeps the tilt
+        low should pull the camera back with it.
+
+    A slot's value is pushed in from outside the clock, so :meth:`major` and the azimuth
+    are evaluated **per frame** through the emit cache rather than cached on the instance
+    — which is also why a driven frame must be emitted with a fresh
+    :class:`~loom.Cache` (:class:`~loom.anim.SceneDriver` does this).
     """
 
     def __init__(self, centre, reach, *, minor: float = RING_MINOR,
                  tilt: float = RING_TILT, turns: float = RING_TURNS,
                  material: str = "ring", name: str = "gold_ring") -> None:
-        self.centre = tuple(float(c) for c in centre)
-        self.reach = float(reach)
+        # `centre` and `reach` are Signals so they can track the jack's own driven lean
+        # (both are solved from it — see `build_scene`); plain floats still work and
+        # `as_signal` wraps them in a Const that resolves to exactly the same number.
+        self.centre = tuple(as_signal(c) for c in centre)
+        self.reach = as_signal(reach)
         self.minor = float(minor)
-        self.tilt = float(tilt)
         self.turns = float(turns)
         self.material = material
         self.name = name
+        # The two animatable channels.  `spin` is authored at 0 and ADDED to the rate
+        # term, not multiplied into it, precisely so the default graph evaluates to the
+        # same number the old closed form did: `(360*turns)*t + 0.0` is exactly
+        # `(360*turns)*t`, and the conversion is provably a refactor.
+        self.spin = Slot("ring_spin", 0.0)
+        self.tilt = Clamp(Slot("ring_tilt", float(tilt)), RING_TILT_MIN, RING_TILT_MAX)
+        self.azimuth = 360.0 * self.turns * Phase() + self.spin
 
-    @property
-    def major(self) -> float:
+    def major(self, reach: float, tilt_deg: float) -> float:
         """Ring radius that puts the low point on the floor and the high point at the
-        top of the jack — see the class docstring."""
-        return (self.reach - self.minor) / math.sin(math.radians(self.tilt))
+        top of the jack, for a given reach and tilt — see the class docstring."""
+        return (reach - self.minor) / math.sin(math.radians(tilt_deg))
 
     def roots(self):
-        return []       # every field is a plain float; nothing to cycle-check
+        # The graph roots the cycle checker and `collect_slots` walk. Returning them is
+        # what makes `ring_spin` / `ring_tilt` discoverable by name.
+        return [self.azimuth, self.tilt, self.reach, *self.centre]
 
     def emit(self, ctx: EmitCtx) -> str:
+        tilt = self.tilt.at(ctx.clock, ctx.cache)
+        reach = self.reach.at(ctx.clock, ctx.cache)
+        centre = tuple(c.at(ctx.clock, ctx.cache) for c in self.centre)
         # Wrapped into [0, 360) purely for tidy scene text — a rotation is periodic, so
         # this changes nothing, but it keeps a counter-rotating ring from emitting a
         # growing pile of negatives (and a literal `-0` at t=0).
-        az = (360.0 * self.turns * ctx.clock.t) % 360.0
+        az = self.azimuth.at(ctx.clock, ctx.cache) % 360.0
         return "\n".join([
             f'{self.name} = isosurface {{',
             f'    material "{self.material}"',
-            f'    torus {{ major {fmt(self.major)}  minor {fmt(self.minor)}  '
-            f'rotate {fmt(self.tilt)} {fmt(az)} 0  translate {fmt3(self.centre)} }}',
+            f'    torus {{ major {fmt(self.major(reach, tilt))}  minor {fmt(self.minor)}  '
+            f'rotate {fmt(tilt)} {fmt(az)} 0  translate {fmt3(centre)} }}',
             '}',
         ])
 
@@ -195,9 +288,18 @@ def build_scene(res=(480, 480), *, purple=PURPLE, green=GREEN, lumens=LUMENS,
             f"Use a cycles that makes ring_turns*cycles a whole number — e.g. "
             f"cycles=2 for a half-speed ring.")
     # Same standing height as the original — that is pure geometry and none of it
-    # depends on the materials.
-    cy = jj.rest_height(jj.Y0, arm=jj.ARM, ball=jj.BALL, tilt=jj.TILT)
+    # depends on the materials.  What *is* new is that it is a Signal: one `jack_lean`
+    # slot feeds the jack's pose AND, through `rest_height`, the height that stands it on
+    # the floor AND the ring's sizing, so driving the lean keeps all three consistent
+    # rather than leaving the jack hovering or buried.  At the slot's default this
+    # evaluates to exactly the float the closed form gave.
+    lean = jj.lean_signal(jj.TILT)
+    cy = jj.rest_height(jj.Y0, arm=jj.ARM, ball=jj.BALL, tilt=lean)
     reach = cy - jj.Y0                       # == arm·cos(tilt) + ball, both ways
+    # The camera, by contrast, is framed for the AUTHORED lean and deliberately does not
+    # chase a driven one: a viewfinder that slides up and down while you scrub a channel
+    # makes the channel impossible to judge.  `cy_static` is that one fixed number.
+    cy_static = jj.rest_height(jj.Y0, arm=jj.ARM, ball=jj.BALL, tilt=jj.TILT)
     # The framing, though, HAS to change: `jumping_jack`'s eye/fov were tuned around a
     # 1.5 m-reach jack, and the ring is a 1.79 m-radius object that swings its nearest
     # arc 1.27 m out of the jack's plane and towards the eye — 4.7 m away instead of the
@@ -213,7 +315,8 @@ def build_scene(res=(480, 480), *, purple=PURPLE, green=GREEN, lumens=LUMENS,
     # field of view rather than from backing off further; and an exhaustive sweep of the
     # same script does bottom out slightly tighter, at fov 41 with the eye at z 6.2, but
     # that buys only 8 % of subject size for 0.2 m less wall clearance.
-    scene = Scene(Camera(eye=(0.5, 1.0 + cy, 6.0), look_at=(0.0, 0.3 + cy, 0.0),
+    scene = Scene(Camera(eye=(0.5, 1.0 + cy_static, 6.0),
+                         look_at=(0.0, 0.3 + cy_static, 0.0),
                          up=(0, 1, 0), fov_y=44, mode="W", res=res))
     light = dict(origin=f"-1.6 {fmt(jj.Y1 - 0.02)} -1.6", u="3.2 0 0", v="0 0 3.2",
                  normal="0 -1 0", spd="preset:bb6500")
@@ -237,7 +340,7 @@ def build_scene(res=(480, 480), *, purple=PURPLE, green=GREEN, lumens=LUMENS,
         # the jack moving at exactly the speed it moves at in the 432-frame cut instead of
         # slowing down alongside the ring.
         jj.Jack(gyroid_glass=True, spin=spin * cycles, precess=float(cycles),
-                centre=(0.0, cy, 0.0), gold="purple", glass="green"),
+                tilt=lean, centre=(0.0, cy, 0.0), gold="purple", glass="green"),
         # Likewise the ring: `ring_turns` is per jack cycle, so over `cycles` of them it
         # makes `ring_turns * cycles` whole turns — the quantity checked above.
         Ring((0.0, cy, 0.0), reach, turns=ring_turns * cycles),
@@ -245,6 +348,46 @@ def build_scene(res=(480, 480), *, purple=PURPLE, green=GREEN, lumens=LUMENS,
         Light("area", **light),
     )
     return scene
+
+
+def build(clock=None, res: int = 480, cycles: int = 1,
+          ring_turns: float = RING_TURNS) -> Scene:
+    """The loom ``build()`` contract: a fresh Scene, no side effects at import.
+
+    This is what makes the scene *viewable and drivable* — ``python -m loom.anim
+    examples/pastel_jack.py`` serves a live session against it, and ftrace's curve
+    editor drives the five slots below through that session.  ``build_scene`` remains
+    the full-fat constructor; this is the one-int-per-knob face of it the contract
+    wants.
+    """
+    return build_scene(res=(res, res), cycles=cycles, ring_turns=ring_turns)
+
+
+# The drive this scene *proposes* to an editor (`loom.anim._scene_drive` looks for
+# exactly this name).  It is a starting point, not a fixture: the editor seeds from it,
+# the user records over it, and the sidecar it writes back wins on the next launch.
+#
+# Every binding is `mod`, not `pin`.  A `pin` replaces the slot outright, which would
+# throw away the authored value the moment a channel is touched — for `ring_tilt` that
+# means the ring snapping from its 45° coin-tilt to whatever the curve happens to read
+# at t=0.  `mod` accumulates onto the slot's own default instead, so a flat curve is a
+# no-op and the numbers in this file stay the baseline the editor deviates *from*.
+#
+# The gains are the useful full-scale swing of a channel in [-1, 1]: 180° of ring
+# azimuth, ±20° of ring tilt (45 ± 20 stays clear of the RING_TILT_MIN divide), ±9° of
+# jack lean (35 ± 9 stays inside [LEAN_MIN, LEAN_MAX], so the clamp never has to save
+# it), and a half turn of each jack phase.
+DRIVE = CurveDrive(
+    5,
+    # Two control points at the origin: a flat, no-op curve, i.e. the scene renders
+    # exactly as authored until something is recorded over it.
+    [(0.0,) * 5, (0.0,) * 5],
+    [ChannelBinding(0, "ring_spin", mode="mod", gain=180.0, kind=ADDITIVE),
+     ChannelBinding(1, "ring_tilt", mode="mod", gain=20.0, kind=ADDITIVE),
+     ChannelBinding(2, "jack_lean", mode="mod", gain=9.0, kind=ADDITIVE),
+     ChannelBinding(3, "jack_spin", mode="mod", gain=180.0, kind=ADDITIVE),
+     ChannelBinding(4, "jack_precess", mode="mod", gain=180.0, kind=ADDITIVE)],
+    mode=MODE_ANIMATION, name="pastel_jack")
 
 
 # The showcase itself was rendered with a bare `-mode W -spp 8` — no gather, no ambient

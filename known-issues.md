@@ -103,6 +103,36 @@ ffmpeg palettegen bottomed out at 5.3 MB for acceptable quality; gifski 1.7.1 (i
 npm) hit 3.27 MB at 320²/20 fps/`--quality 65` with visibly less banding on the gyroid glass.
 Command shape: `gifski -o pastel_jack_ring.gif --fps 20 --width 320 --quality 65 frames/*.png`.
 
+### FIXED (2026-08-07, loom-only, no binary change): a loom example that imports a SIBLING example is unloadable by `loom.viewer.load_build` — so `python -m loom.anim` and the native viewer could not open it
+
+`examples/pastel_jack.py` and `examples/glowing_jack.py` both do `import jumping_jack as jj`
+after inserting only the **parent** directory (`tools/loom/`, so that `import loom` works) on
+`sys.path`. Run as a script that is fine, because Python puts the script's own directory on
+`sys.path` for free. But `loom.viewer.load_build` imports a scene **by path**
+(`importlib.util.spec_from_file_location`), which does *not*, and both `python -m loom.anim
+<scene.py>` and the native `-viewer` go through it. Result: `ModuleNotFoundError: No module
+named 'jumping_jack'` — the two most elaborate examples in the tree were reachable only by
+running them directly, i.e. exactly the two entry points the animation work needed were dead.
+
+Found while converting `pastel_jack` to named `Slot` channels (the first time anything actually
+tried to drive an example live). Fixed in both files by also inserting the example's **own**
+directory, with a comment saying why, since the failure only shows up on the by-path route:
+
+```python
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))      # the loom package
+if _HERE not in sys.path:                       # ...and the sibling examples
+    sys.path.insert(0, _HERE)
+```
+
+**The general rule, for the next example that grows a sibling import:** a scene file must not
+assume it was launched as a script. Anything it imports by bare name has to be made reachable
+from the file's own location. Nothing in the test suite covered this because the tests
+`sys.path.insert` the examples directory themselves before importing — same blind spot as the
+`-m` identity trap above: an in-process test cannot see a path problem it has already solved for
+the module under test. A subprocess `python -m loom.anim examples/pastel_jack.py` smoke check
+would have caught it.
+
 ### PERF — FIXED (2026-08-06, v0.148.0): the live viewer pays ~17 ms/frame to Windows Defender for opening files it wrote itself
 
 **This is the finding that came out of building the binary mesh handoff, and it is bigger than

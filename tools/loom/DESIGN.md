@@ -1057,6 +1057,27 @@ tools/loom/
   scene variable(s)` on a scene that clearly has one. In-process tests are structurally incapable of catching
   it (they only ever have one module identity), so `test_anim_live.py` and `test_viewer.py` each now spawn a
   **real subprocess** and assert on the emitted artifact, not just on the ack.
+  **The reference example (2026-08-07): `examples/pastel_jack.py`.** Until now the slot path had unit tests
+  but no example that used it end to end — every shipped animation computed its motion closed-form from
+  `ctx.clock.t` inside `emit`, which is drivable by nothing. `pastel_jack` (the project README's demo) was
+  converted: each `emit`-time expression became a `Signal` of `Phase()`, and the five authored quantities
+  became `Slot`s (`ring_spin`, `ring_tilt`, `jack_lean`, `jack_spin`, `jack_precess`) with a module-level
+  `DRIVE` proposal. Three things the conversion pinned down, all of them non-obvious until an example forced
+  them: (a) **offsets must be added to the rate term, never folded into it** — `(2π·rate)·t + (π/180)·0`
+  reproduces the old `(2π·rate)·t` bit-for-bit, which is how the refactor was proved pure (every frame of the
+  loop emitted byte-identical `.ftsl`, and the re-rendered PNGs were byte-identical to the shipped ones);
+  (b) a derived quantity must be **solved from the slot, not from the slot's default** — `rest_height` is
+  polymorphic (returns a `Signal` when handed one, a float otherwise) so the jack's standing height, the
+  ring's centre and the ring's radius all hang off the *same* `jack_lean` node, which is what makes the
+  floor-contact invariants hold under drive rather than only at the authored pose; (c) bindings are `mod`,
+  never `pin`, so a flat driving curve is a no-op and the scene's own animation survives being driven.
+  Guarded by `tests/test_example_pastel_jack.py` (23), which sweeps lean × ring-tilt across the loop and
+  reads both contact points back out of the emitted text.
+  **Bug found by doing it:** `pastel_jack`/`glowing_jack` import a sibling example by bare name but only put
+  the *parent* directory on `sys.path`. Running them as a script works (Python adds the script's directory);
+  `loom.viewer.load_build` imports **by path** and does not, so `python -m loom.anim examples/pastel_jack.py`
+  and the live viewer both died with `ModuleNotFoundError: jumping_jack`. Any example that imports a sibling
+  must insert its **own** directory on `sys.path`, not just the package's.
 - **F1 (native viewer — the loom↔viewer data contract).** ✅ done (`loom/viewer.py`). The §F native viewer is
   a C++ process; loom is Python, so (per the locked architecture) loom exposes a scene via a **`build()`
   load contract** and a **JSON introspection sidecar**, not in-process sharing. `build(clock=None, **params)
