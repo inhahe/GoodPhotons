@@ -807,6 +807,80 @@ static int checkCurve(long long rays) {
                     bad, bad == 0 ? "PASS" : "FAIL");
     }
 
+    // --- 6. fp32 conditioning at FIBER scale (guards the CUDA device twin) -----------
+    // The CUDA megakernel runs `using Real = float`, so the round-cone quadric must stay
+    // well-conditioned in single precision or a furred scene renders as speckled holes on
+    // the GPU while looking perfect on the CPU — a divergence no image-vs-image test would
+    // attribute to the intersector. This section instantiates the SAME `curveSegCrossings`
+    // the renderer uses at `float` and measures it against the double path.
+    //
+    // Scale matters more than ray count here: §1's cones have centimetre-to-decimetre
+    // radii, which are perfectly conditioned. The cancellation only bites at real fiber
+    // proportions — a sub-millimetre radius with the origin metres away — so this section
+    // sweeps exactly that regime. (Before the origin-recentering fix, the first row below
+    // read `15.0% lost, 11.8 radii`; it is what motivated the fix.)
+    {
+        struct Cfg { double seglen, radius, dist; };
+        const Cfg cfgs[] = {
+            {0.01,  0.0010, 2.0},    // 1 mm hair, 1 cm segments, arm's length
+            {0.01,  0.0010, 10.0},   // ... across a room
+            {0.02,  0.0005, 2.0},    // finer fur, longer segments
+            {0.005, 0.0002, 5.0},    // 0.2 mm down fiber
+        };
+        int bad = 0;
+        for (const Cfg& c : cfgs) {
+            long long tested = 0, lost = 0;
+            double maxErrRadii = 0.0;
+            for (long long i = 0; i < rays / 4; ++i) {
+                CurveSeg s;
+                s.p0 = Vec3{rng.uniform() * 0.2 - 0.1, rng.uniform() * 0.2 - 0.1, rng.uniform() * 0.2 - 0.1};
+                s.p1 = s.p0 + unitDir() * c.seglen;
+                s.r0 = c.radius;
+                s.r1 = c.radius * (0.3 + 0.7 * rng.uniform());
+                // Aim at a jittered point on the fiber (nothing random hits a 1 mm strand).
+                const Vec3 target = s.p0 + (s.p1 - s.p0) * rng.uniform()
+                                  + unitDir() * (c.radius * 1.6 * rng.uniform());
+                const Vec3 o = target + unitDir() * c.dist;
+                const Vec3 d = normalize(target - o);
+
+                const CurveRay cr = makeCurveRay(d);
+                Hit h; h.t = DBL_MAX;
+                if (!intersectCurveSeg(cr, Ray{o, d}, s, 1e-9, h)) continue;
+                ++tested;
+
+                // Same algebra, float instantiation, nearest forward root.
+                const float roF[3] = {(float)o.x, (float)o.y, (float)o.z};
+                const float rdF[3] = {(float)d.x, (float)d.y, (float)d.z};
+                const float p0F[3] = {(float)s.p0.x, (float)s.p0.y, (float)s.p0.z};
+                const float p1F[3] = {(float)s.p1.x, (float)s.p1.y, (float)s.p1.z};
+                float shiftF = 0.0f, bestF = FLT_MAX;
+                curveSegCrossings<float>(roF, rdF, p0F, p1F, (float)s.r0, (float)s.r1, shiftF,
+                    [&](float tn, int, float) {
+                        if (tn < bestF && tn + shiftF > 0.0f) bestF = tn;
+                    });
+                if (bestF == FLT_MAX) { ++lost; continue; }
+                // Error in FIBER RADII: one radius means the hit slid off the strand
+                // entirely, which is what is visible, whereas an absolute tolerance would
+                // be meaningless across four scales.
+                maxErrRadii = std::max(maxErrRadii,
+                                       std::fabs((double)(bestF + shiftF) - h.t) / c.radius);
+            }
+            const double lostPct = tested ? 100.0 * (double)lost / (double)tested : 0.0;
+            // Thresholds: grazing rays are a genuine coin flip in fp32, so a few tenths of
+            // a percent of losses is physics, not a bug; 0.25 radii of slip is invisible on
+            // a fiber a fraction of a pixel wide. The broken form missed both by >40x.
+            const bool ok = (lostPct <= 0.5) && (maxErrRadii <= 0.25);
+            if (!ok) ++bad;
+            std::printf("[checkcurve]    fp32 seg=%.3fm r=%.4fm dist=%.0fm: %lld hits,"
+                        " %.3f%% lost, max err %.3f radii%s\n",
+                        c.seglen, c.radius, c.dist, tested, lostPct, maxErrRadii,
+                        ok ? "" : "   <== FAIL");
+        }
+        fails += bad;
+        std::printf("[checkcurve] 6. fp32 conditioning at fiber scale (CUDA twin): %d failures -> %s\n",
+                    bad, bad == 0 ? "PASS" : "FAIL");
+    }
+
     std::printf("[checkcurve] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return fails;
 }

@@ -1811,20 +1811,34 @@ fiber (`scenes/curve_basics.ftsl` bands one strand with
 `expr "0.5+0.5*sin(2*pi*9*u)"`). `tangent` is the strand's axis, Gram-Schmidt'd against
 the shading normal — the frame an anisotropic or fiber BSDF wants.
 
-**Correctness.** `ftrace -checkcurve` runs five sections: the round-cone intersector
+**Correctness.** `ftrace -checkcurve` runs six sections: the round-cone intersector
 against Inigo Quilez's exact analytic SDF (position, first-hit `t`, normal vs. the
 numerical SDF gradient, `u`/`v` ranges, and AABB containment); the degenerate case where
 one end sphere swallows the other, which must equal the analytic ray–sphere test
 exactly; `anyHit` agreement with the full path including origins *inside* the fiber;
-watertightness at chain joints; and basis flattening (span counts, monotone `u`, chain
+watertightness at chain joints; basis flattening (span counts, monotone `u`, chain
 contiguity, and that interpolating bases hit their control points while `bspline` stays
-off them).
+off them); and the **fp32 conditioning** of the quadric at fiber scale, which the CUDA
+path depends on (see below).
 
-**Limits (v1).** Curves are **CPU-only** in the ray-traced modes: the CUDA megakernel has
-no device twin yet, so a scene containing curves falls back to the CPU rather than
-rendering bald. The `-raster` / `-raster-gpu` previews *do* show strands (each round cone
-is meshed at preview fidelity). See `known-issues.md`, which also covers the per-segment
-azimuthal `v` frame and `CurveSeg`'s memory footprint.
+**Numerics.** The round-cone quadric's constant term is a difference of two large,
+nearly equal products. At fiber scale — a 1 mm radius on a 1 cm segment viewed from 2 m
+— those products are ~4·10⁻⁴ while their difference is ~10⁻¹⁰: **six decades**, i.e. the
+entire fp32 mantissa. So before forming the quadric, both the host and the device slide
+the ray origin along itself to its closest approach to the segment's root point, and undo
+that shift on each accepted root. This is an exact re-parameterisation — it changes only
+the *conditioning* — and it is what makes the intersector usable in the fp32 CUDA
+megakernel. Without it, 12–36 % of fiber hits are lost outright and the rest land tens of
+radii off (strands render as speckled holes on the GPU while looking perfect on the CPU);
+with it the fp32 error stays under 0.06 radii. `-checkcurve` §6 instantiates the real
+intersector at `float` and guards exactly this.
+
+**Limits (v1).** Curves run on **both the CPU and the GPU** in the ray-traced modes as of
+0.151.0 (measured 74× on a 96 000-segment fur patch), and the `-raster` / `-raster-gpu`
+previews show strands too (each round cone is meshed at preview fidelity). What is still
+missing is the *aggregate LOD*: every fiber is intersected individually, so a groom's cost
+is linear in strand count and sub-pixel fibers are a variance sink. See `known-issues.md`,
+which also covers the per-segment azimuthal `v` frame and `CurveSeg`'s memory footprint.
 
 ### Implicit surfaces (`isosurface`)
 
@@ -3029,7 +3043,9 @@ alone can't restore, so they are not disk-resumable.
 round-cone intersector against the exact analytic SDF, the degenerate
 one-sphere-swallows-the-other case against the analytic ray–sphere test, `anyHit`
 against the full path (with half the origins *inside* the fiber), watertightness at
-chain joints, and the four bases' flattening — see **Curves and fibers** above.
+chain joints, the four bases' flattening, and the **fp32 conditioning** of the quadric at
+fiber scale (the same code instantiated at `float`, as the CUDA megakernel runs it) —
+see **Curves and fibers** above.
 `-checkcontainer` guards the isosurface container clip: rotating an
 isosurface must not change what a ray sees, so it builds the same solid twice
 (axis-aligned and rigidly rotated) and checks that correspondingly rotated rays

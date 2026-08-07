@@ -92,8 +92,8 @@ renders — so the animation's source is the one Python file, not 432 baked scen
   thread, in four bases (`linear`, `catmull_rom`, `bezier`, `bspline`), traced as
   chains of **round cones** that share their end spheres, so a strand is one
   watertight surface with no cracks at the joints — a handful of segments per hair
-  instead of the ~64 triangles a ribbon would need. (Ray-traced on the CPU for now;
-  the raster preview shows them.)
+  instead of the ~64 triangles a ribbon would need. Ray-traced on **CPU and GPU**
+  (74× measured on a 96 000-segment fur patch), and shown by the raster preview.
 - **Participating media** — one or many coexisting (superposed) fog regions with
   Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous

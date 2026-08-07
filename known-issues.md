@@ -5,23 +5,49 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### OPEN (2026-08-07, v0.150.0): the new `curve` primitive has no CUDA path — the whole scene falls back to the CPU
+### FIXED (2026-08-07, v0.151.0): the `curve` primitive had no CUDA path — the whole scene fell back to the CPU
 
-Shipped deliberately with the primitive (TODO §P1), logged so it isn't forgotten.
+Shipped deliberately with the primitive in v0.150.0 (TODO §P1) and ported one version
+later. `cudaForwardSupported` used to return false for any scene with `scene.curveSegs`
+non-empty (and `cudaBdptSupported`/`cudaBackwardSupported` chain to it), so modes A/B/C/D/R
+went to the CPU tracer. The fallback was correct and not the bug — the device hit routine
+knew four prim ranges (`tri | sphere | implicit | instance`) and a fifth one with no
+intersector would not fault, it would silently trace *past* every strand and render a
+furred subject **bald**. A plausible-looking wrong image is worse than a fallback.
 
-`cudaForwardSupported` returns false for any scene with `scene.curveSegs` non-empty (and
-`cudaBdptSupported`/`cudaBackwardSupported` chain to it), so modes A/B/C/D/R go to the CPU
-tracer. The fallback itself is correct and not the bug — the device hit routine knows four
-prim ranges (`tri | sphere | implicit | instance`) and a fifth one with no
-`dIntersectCurveSeg` would not fault, it would silently trace *past* every strand and
-render a furred subject **bald**. A plausible-looking wrong image is worse than a
-fallback.
+**Fix:** `DCurveSeg` + `intersectCurveSeg` in `render_cuda.cu`, a fifth range in both
+`closestHit` and `occluded` (and the instance index arithmetic shifted past it in both),
+and a straight narrowing copy in the scene bake — `CurveSeg` was already a POD laid out for
+exactly this. The material support screen still applies to curve materials like any other
+primitive's. Measured on a 4 000-strand / 96 000-segment fur patch at 400×300: **59.1 s →
+0.8 s (74×)** at 512 spp for the same 4.42% noise. Verified equal: mode W is deterministic
+on both devices, and CPU vs GPU gives mean |Δlum| 5e-4 on the fur patch and 3e-5 on
+`curve_basics`, with divergence confined to grazing silhouette pixels. Curve-free scenes
+are still bit-identical on the CPU (cornell / implicit / group md5s unchanged) and agree
+CPU↔GPU — `group` in particular exercises the instance range whose indices shifted.
 
-The fix is a real port. `CurveSeg` is already a POD (`Vec3 p0,p1; double r0,r1;
-int matId,curveId; float u0,u1`) laid out to upload directly, so the work is a device twin
-of `intersectCurveSeg` plus a fifth range in the traversal — mechanical. Worth doing
-**before** §P2: a fiber is 1/5–1/50 of a pixel wide, so fur is an SPP sink, which is
-exactly the regime where losing the GPU hurts most.
+**The port was not mechanical, and the reason is worth keeping.** The device runs
+`using Real = float`, and the round-cone quadric is *catastrophically ill-conditioned* in
+fp32 at fiber scale: `k0 = d2*m5 - m1*m1 + …` has both terms ~4e-4 while their difference
+is ~1e-10 for a 1 mm strand seen from 2 m — six decades of cancellation, i.e. the entire
+fp32 mantissa. A naive transliteration measured **12–36% of hits lost outright and errors
+of 11–42 fiber radii**: strands would have rendered as speckled holes on the GPU while
+looking perfect on the CPU, and no image-level test would have blamed the intersector.
+
+The fix is *origin recentering* — slide the ray origin to its closest approach to `p0`
+before forming any quadric, undo the shift on each accepted root. Exact in exact
+arithmetic, purely a conditioning change, and the round-cone analogue of the
+perpendicular-offset trick `intersectSphere` already uses from Ray Tracing Gems ch.7. It is
+applied on **both** host and device: double merely postpones the identical failure to
+scenes ~1e9× larger, and sharing the formulation means the self-test validates the algebra
+the GPU actually runs. It also improved the double path — `-checkcurve` §1's max SDF
+residual fell 8.60e-13 → 5.23e-14.
+
+Guarded permanently by **`-checkcurve` §6**, which instantiates the host's
+`curveSegCrossings` (templated on the scalar type precisely so this is possible) at `float`
+and asserts <0.5% lost hits and <0.25 radii of error across four fiber configurations.
+Mutation-tested: disabling the recentering fails §6 on all four rows while sections **1–5
+all still pass**, so §6 tests something no other section can see.
 
 ### FIXED (2026-08-07, v0.150.0): `-raster` / `-raster-gpu` drew a scene of `curve` strands as EMPTY, with no warning
 

@@ -471,6 +471,9 @@ struct DMediumStack {
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
                  DVec3 tangent; double bitangentSign; };  // C6 tangent frame for normal mapping
 struct DSphere { DVec3 c; double r; int matId; };
+// One round cone of a curve/fiber strand — the device twin of CurveSeg (curve.h). The host
+// record is already a POD in exactly this shape; only the scalar type narrows to Real.
+struct DCurveSeg { DVec3 p0, p1; Real r0, r1; int matId; float u0, u1; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 
 // Two-level BVH for instancing (device twin of scene.h Blas / MeshInstance). A DBlas
@@ -898,8 +901,14 @@ struct DScene {
     const DFieldNodeF* fieldNodesF;
     const PatNodeF*    fieldExprNodesF;
     const DImplicit*  implicits; int nImplicits;
-    // Instancing (two-level BVH). BVH prims with index >= nTris+nSph+nImplicits map to
-    // instances[prim - nTris - nSph - nImplicits]; each instance references a DBlas
+    // Curve / fiber round cones (curve.h). BVH prims with index >= nTris+nSph+nImplicits
+    // map to curveSegs[prim - nTris - nSph - nImplicits]. This range sits BEFORE instances
+    // in exactly the order Scene::buildBvh pushes them (tris | spheres | implicits |
+    // curveSegs | instances) — the host and device leaf dispatch must agree index for
+    // index, so any new primitive range has to be inserted in all three places at once.
+    const DCurveSeg*  curveSegs; int nCurveSegs;
+    // Instancing (two-level BVH). BVH prims with index >= nTris+nSph+nImplicits+nCurveSegs
+    // map to instances[prim - nTris - nSph - nImplicits - nCurveSegs]; each references a DBlas
     // (offsets into the shared blasNodes/blasTris/blasPrim pools). Null/0 when the scene
     // has no instances (the common path uploads Scene::bvh verbatim, bit-identical).
     const DInstance*  instances; int nInstances;
@@ -2572,6 +2581,153 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     hit.bitangentSign = (Real)1;
     return true;
 }
+// ---- curve / fiber segments (device twin of curve.h) ----------------------
+// A round cone: the convex hull of sphere(p0,r0) and sphere(p1,r1). See curve.h for the
+// three-piece decomposition (lateral tangent band + a spherical cap at each end) and the
+// axial band test that selects between them; this is a transliteration of
+// `curveSegCrossings` + the hit fill of `intersectCurveSeg`.
+//
+// THE ONE THING THAT IS NOT OPTIONAL HERE is the origin recentering. `Real` is float by
+// default, and the naive quadric cancels over six decades at fiber scale — measured, it
+// loses 12-36% of hits and misplaces the rest by 11-42 fiber radii, i.e. the GPU would
+// draw a strand as speckled holes while the CPU drew it perfectly. `ftrace -checkcurve`
+// §6 exists specifically to guard this invariant and instantiates the host's
+// `curveSegCrossings` at `float` to do it; if that section fails, THIS function is wrong
+// too. Do not "simplify" the shift away.
+struct DCurveRay { DVec3 dn; Real invLen; };   // unit direction + 1/|d|, hoisted per ray
+
+__device__ static inline DCurveRay makeCurveRay(const DVec3& d) {
+    DCurveRay c; c.dn = d; c.invLen = (Real)1;
+    Real l2 = dot(d, d);
+    if (l2 > (Real)0) { Real l = sqrt(l2); c.invLen = (Real)1 / l; c.dn = d * c.invLen; }
+    return c;
+}
+
+__device__ static bool intersectCurveSeg(const DCurveRay& cr, const DVec3& ro, const DVec3& rd,
+                                          const DCurveSeg& s, Real tmin, DHit& hit,
+                                          bool anyHit = false) {
+    const DVec3 dn = cr.dn;
+    const DVec3 ba = s.p1 - s.p0;
+    const Real  m0 = dot(ba, ba);
+    if (!(m0 > (Real)0)) return false;           // zero-length segment: nothing to sweep
+
+    // Slide the origin to its closest approach to p0 (dn is unit) — the conditioning fix.
+    const Real  shift = dot(s.p0 - ro, dn);
+    const DVec3 o  = ro + dn * shift;
+    const DVec3 oa = o - s.p0;
+    const DVec3 ob = o - s.p1;
+
+    const Real rr = s.r0 - s.r1;
+    const Real m1 = dot(ba, oa);
+    const Real m2 = dot(ba, dn);
+    const Real m3 = dot(dn, oa);
+    const Real m5 = dot(oa, oa);
+    const Real m6 = dot(ob, dn);
+    const Real m7 = dot(ob, ob);
+    const Real d2 = m0 - rr * rr;
+
+    Real bestTn = BIG;      // best root, in the RECENTERED unit-direction parameter
+    int  piece   = -1;      // 0 = lateral, 1 = cap at p0, 2 = cap at p1
+    Real bestY   = (Real)0;
+
+    // Roots are in the shifted parameterisation and the near one is typically NEGATIVE,
+    // so undo the shift before the tmin / running-closest tests (host comment applies).
+    #define CURVE_OFFER(TN, W, Y) do {                                        \
+        const Real _tn = (TN);                                                \
+        if (_tn < bestTn) {                                                   \
+            const Real _t = (_tn + shift) * cr.invLen;                        \
+            if (_t >= tmin && _t < hit.t) { bestTn = _tn; piece = (W); bestY = (Y); } \
+        }                                                                     \
+    } while (0)
+
+    if (d2 > (Real)0) {
+        const Real k2 = d2 - m2 * m2;
+        const Real k1 = d2 * m3 - m1 * m2 + m2 * rr * s.r0;
+        const Real k0 = d2 * m5 - m1 * m1 + m1 * rr * s.r0 * (Real)2 - m0 * s.r0 * s.r0;
+        const Real h  = k1 * k1 - k0 * k2;
+        if (h >= (Real)0 && k2 != (Real)0) {
+            const Real sq = sqrt(h);
+            Real ta = (-sq - k1) / k2, tb = (sq - k1) / k2;
+            if (ta > tb) { Real tmp = ta; ta = tb; tb = tmp; }
+            const Real base = m1 - s.r0 * rr;
+            const Real ya = base + ta * m2, yb = base + tb * m2;
+            if (ya > (Real)0 && ya < d2) CURVE_OFFER(ta, 0, ya);
+            if (yb > (Real)0 && yb < d2) CURVE_OFFER(tb, 0, yb);
+        }
+        const Real h1 = m3 * m3 - m5 + s.r0 * s.r0;
+        if (h1 > (Real)0) {
+            const Real q = sqrt(h1), base = m1 - s.r0 * rr;
+            const Real ta = -m3 - q, tb = -m3 + q;
+            if (base + ta * m2 <= (Real)0) CURVE_OFFER(ta, 1, (Real)0);
+            if (base + tb * m2 <= (Real)0) CURVE_OFFER(tb, 1, (Real)0);
+        }
+        const Real h2 = m6 * m6 - m7 + s.r1 * s.r1;
+        if (h2 > (Real)0) {
+            const Real q = sqrt(h2), base = m1 - s.r0 * rr;
+            const Real ta = -m6 - q, tb = -m6 + q;
+            if (base + ta * m2 >= d2) CURVE_OFFER(ta, 2, d2);
+            if (base + tb * m2 >= d2) CURVE_OFFER(tb, 2, d2);
+        }
+    } else {
+        // One ball swallows the other: the hull is just the bigger sphere.
+        const bool useP0 = (s.r0 >= s.r1);
+        const Real rc    = useP0 ? s.r0 : s.r1;
+        const Real mm    = useP0 ? m3 : m6;
+        const Real mq    = useP0 ? m5 : m7;
+        const Real hh    = mm * mm - mq + rc * rc;
+        if (hh > (Real)0) {
+            const Real q = sqrt(hh);
+            CURVE_OFFER(-mm - q, useP0 ? 1 : 2, useP0 ? (Real)0 : d2);
+            CURVE_OFFER(-mm + q, useP0 ? 1 : 2, useP0 ? (Real)0 : d2);
+        }
+    }
+    #undef CURVE_OFFER
+
+    if (piece < 0) return false;
+
+    const Real t = (bestTn + shift) * cr.invLen;
+    hit.t = t;
+    hit.valid = true;
+    if (anyHit) return true;
+
+    const DVec3 p = ro + rd * t;
+    hit.p = p;
+    hit.matId = s.matId;
+    hit.sensorId = -1;
+
+    DVec3 ng;
+    if (piece == 0)      ng = (oa + dn * bestTn) * d2 - ba * bestY;   // lateral (iq)
+    else if (piece == 1) ng = oa + dn * bestTn;                       // sphere at p0
+    else                 ng = ob + dn * bestTn;                       // sphere at p1
+    const Real nl = sqrt(dot(ng, ng));
+    ng = (nl > (Real)1e-18) ? ng * ((Real)1 / nl) : normalize(ba);
+    hit.ng = ng;
+    hit.n  = (dot(rd, ng) < (Real)0) ? ng : -ng;
+
+    // u along the strand (root -> tip), v around the circumference.
+    Real f = (d2 > (Real)0) ? (bestY / d2) : (Real)0;
+    f = f < (Real)0 ? (Real)0 : (f > (Real)1 ? (Real)1 : f);
+    hit.u = (Real)s.u0 + ((Real)s.u1 - (Real)s.u0) * f;
+
+    const DVec3 axis = ba * ((Real)1 / sqrt(m0));
+    const DVec3 dp   = p - s.p0;
+    const DVec3 radial = dp - axis * dot(dp, axis);
+    // Same onb() basis as the host, so u/v patterns land identically on both devices.
+    const Real sgn = (axis.z >= (Real)0) ? (Real)1 : (Real)-1;
+    const Real ia  = (Real)-1 / (sgn + axis.z);
+    const Real dd  = axis.x * axis.y * ia;
+    const DVec3 T{(Real)1 + sgn * axis.x * axis.x * ia, sgn * dd, -sgn * axis.x};
+    const DVec3 B{dd, sgn + axis.y * axis.y * ia, -axis.y};
+    hit.v = (Real)0.5 + atan2(dot(radial, B), dot(radial, T)) * (Real)(1.0 / (2.0 * DPI));
+
+    // Surface tangent = the fiber axis, Gram-Schmidt'd against the shading normal.
+    DVec3 tg = axis - hit.n * dot(hit.n, axis);
+    const Real tl = sqrt(dot(tg, tg));
+    hit.tangent = (tl > (Real)1e-12) ? tg * ((Real)1 / tl) : T;
+    hit.bitangentSign = (Real)1;
+    return true;
+}
+
 __device__ static bool boxHit(const DNode& nd, const DVec3& ro, const DVec3& invD,
                                Real tmin, Real tmax, Real& tEnter) {
     Real te = tmin, tx = tmax;
@@ -2714,6 +2870,10 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     if (sc.nNodes == 0) return h;
     DVec3 invD{(Real)1 / rd.x, (Real)1 / rd.y, (Real)1 / rd.z};
     const DTriShear sh = makeTriShear(rd);
+    // Hoisted per ray, not per segment (a fur render tests thousands of segments per ray).
+    // Guarded so a curve-free scene never pays the normalising sqrt — the host does the
+    // same in Scene::closestHit.
+    const DCurveRay cray = sc.nCurveSegs ? makeCurveRay(rd) : DCurveRay{DVec3{(Real)0,(Real)0,(Real)1}, (Real)1};
     Real tMax = tCap;
     // Push-time slab tests + pop-time scalar prune (see blasClosest).
     int stack[64]; Real tStack[64]; int sp = 0;
@@ -2730,10 +2890,11 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
                 if (prim < sc.nTris)              { if (intersectTri(sh, ro, rd, sc.tris[prim], tmin, h)) tMax = h.t; }
                 else if (prim < sc.nTris + sc.nSph){ if (intersectSphere(ro, rd, sc.sph[prim - sc.nTris], tmin, h)) tMax = h.t; }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) tMax = h.t; }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { if (intersectCurveSeg(cray, ro, rd, sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits], tmin, h)) tMax = h.t; }
                 else {
                     // Instance leaf: transform the ray into BLAS-local space, walk the
                     // shared sub-BVH, and map any closer hit back to world space.
-                    const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits];
+                    const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits - sc.nCurveSegs];
                     DVec3 lro = affPoint(inst.Lm, inst.Lt, ro);
                     DVec3 lrd = affDir(inst.Lm, rd);
                     DHit lh; lh.t = h.t; lh.valid = false;
@@ -2850,6 +3011,7 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
     if (sc.nNodes == 0) return false;
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
     const DTriShear sh = makeTriShear(dir);
+    const DCurveRay cray = sc.nCurveSegs ? makeCurveRay(dir) : DCurveRay{DVec3{(Real)0,(Real)0,(Real)1}, (Real)1};
     Real tMax = maxDist - tmin;
     // tMax is fixed for the whole walk: push-time tests suffice (see blasOccluded).
     Real tRoot;
@@ -2865,9 +3027,10 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 if (prim < sc.nTris)                              blocked = intersectTri(sh, o, dir, sc.tris[prim], tmin, h);
                 else if (prim < sc.nTris + sc.nSph)               blocked = intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h);
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h, /*anyHit=*/true);
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) blocked = intersectCurveSeg(cray, o, dir, sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits], tmin, h, /*anyHit=*/true);
                 else {
                     // Instance leaf: any-hit inside the shared BLAS in local space.
-                    const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits];
+                    const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits - sc.nCurveSegs];
                     DVec3 lo = affPoint(inst.Lm, inst.Lt, o);
                     DVec3 ld = affDir(inst.Lm, dir);
                     blocked = blasOccluded(sc, inst, lo, ld, tmin, tMax);
@@ -10881,16 +11044,13 @@ bool cudaForwardSupported(const Scene& scene) {
         }
         return false;
     };
-    // Curve / fiber primitives (curve.h, TODO §P1) have no device twin yet: the megakernel
-    // knows four prim ranges (tri | sphere | implicit | instance) and would silently trace
-    // straight past every strand, so a furred scene would render BALD on the GPU rather
-    // than merely differently. Falling back to the CPU is the only honest answer until the
-    // round-cone intersector is ported. (Checked here rather than in the backward/BDPT
-    // gates because both of those call this one first.)
-    if (!scene.curveSegs.empty()) return false;
     for (const auto& t : scene.tris)      if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres)   if (unsupported(s.matId)) return false;
     for (const auto& im : scene.implicits) if (unsupported(im.matId)) return false;
+    // Curve / fiber round cones (curve.h, TODO §P1) have a device twin as of 0.151.0, so
+    // strands no longer force a whole-scene CPU fallback — but their MATERIALS still go
+    // through the same support screen as every other primitive's.
+    for (const auto& cs : scene.curveSegs) if (unsupported(cs.matId)) return false;
     // `emit pattern:` / `emit_map` runs on the device (0.82.0). Unlike reflect/transmit it
     // is not a one-sided throughput slot: the same profile has to be applied on BOTH sides
     // of transport — emission-on-hit AND the Le at an emitter-sampled point — because MIS
@@ -11001,9 +11161,22 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         const Sphere& s = scene.spheres[i]; DSphere& d = sph[i];
         d.c = {s.c.x, s.c.y, s.c.z}; d.r = s.r; d.matId = s.matId;
     }
+    // Curve / fiber round cones. The host CurveSeg is already a flat POD in this exact
+    // shape (curve.h says so, and this is what it was for), so the bake is a straight
+    // narrowing copy — no flattening, no per-strand indirection. curveId is host-side
+    // diagnostics only and is not uploaded.
+    std::vector<DCurveSeg> curveSegs(scene.curveSegs.size());
+    for (size_t i = 0; i < scene.curveSegs.size(); ++i) {
+        const CurveSeg& s = scene.curveSegs[i]; DCurveSeg& d = curveSegs[i];
+        d.p0 = {(Real)s.p0.x, (Real)s.p0.y, (Real)s.p0.z};
+        d.p1 = {(Real)s.p1.x, (Real)s.p1.y, (Real)s.p1.z};
+        d.r0 = (Real)s.r0; d.r1 = (Real)s.r1;
+        d.matId = s.matId; d.u0 = s.u0; d.u1 = s.u1;
+    }
+
     // Top-level BVH: upload Scene::bvh VERBATIM in every case. Its prim-index layout is
-    // [tris | spheres | implicits | instances] — the device leaf dispatch in
-    // closestHit/occluded now understands all four ranges (an instance leaf transforms
+    // [tris | spheres | implicits | curveSegs | instances] — the device leaf dispatch in
+    // closestHit/occluded now understands all five ranges (an instance leaf transforms
     // the ray into BLAS-local space and walks the shared sub-BVH), so no flat rebuild /
     // instance expansion is needed. This is bit-identical to the old path for scenes
     // with no instances, and the memory win (shared BLAS) for scenes with them.
@@ -11339,6 +11512,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     DFieldNodeF* d_fnodesF = fieldNodesF.empty() ? nullptr : (DFieldNodeF*)keep(uploadVec(fieldNodesF));
     PatNodeF*    d_fexprF  = fieldExprNodesF.empty() ? nullptr : (PatNodeF*)keep(uploadVec(fieldExprNodesF));
     DImplicit*  d_impl   = dimpl.empty()      ? nullptr : (DImplicit*)keep(uploadVec(dimpl));
+    DCurveSeg*  d_curves = curveSegs.empty()  ? nullptr : (DCurveSeg*)keep(uploadVec(curveSegs));
     // Two-level BVH pools (shared BLAS + instance table). Empty for scenes with no instances.
     DInstance*  d_inst   = dinst.empty()     ? nullptr : (DInstance*)keep(uploadVec(dinst));
     DBlas*      d_blas   = dblas.empty()     ? nullptr : (DBlas*)keep(uploadVec(dblas));
@@ -11535,6 +11709,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.fieldNodes = d_fnodes; sc.fieldExprNodes = d_fexpr;
     sc.fieldNodesF = d_fnodesF; sc.fieldExprNodesF = d_fexprF;
     sc.implicits = d_impl; sc.nImplicits = (int)dimpl.size();
+    sc.curveSegs = d_curves; sc.nCurveSegs = (int)curveSegs.size();
     sc.instances = d_inst; sc.nInstances = (int)dinst.size();
     sc.blas = d_blas; sc.blasNodes = d_blasN; sc.blasPrim = d_blasP; sc.blasTris = d_blasT;
     sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();

@@ -218,7 +218,8 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     Flattening up front (rather than evaluating the basis per ray) buys **exact leaf
     bounds** ("bound what you test", vs. a strand box that is mostly empty), keeps basis
     evaluation out of the inner loop that §P2's sub-pixel variance will hammer, and
-    leaves a POD record a future GPU port can upload directly. It costs memory
+    leaves a POD record the GPU port uploads directly (0.151.0 does exactly that —
+    `DCurveSeg` is a narrowing memcpy of `CurveSeg`). It costs memory
     (80 B/seg) and discretised curvature. Round rather than camera-facing ribbons
     because adjacent cones **share their end sphere**, making the chain watertight and
     smooth at joints with **no mitre logic** — a strand is one closed surface however
@@ -237,6 +238,30 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     predictable branch and nothing else — **verified bit-identical** to the pre-curve
     binary (modes R and W × triangles / implicits / instances, md5-compared against a
     `git worktree` build of HEAD).
+  - *Conditioning: origin recentering (0.151.0).* The quadric's constant term
+    `k0 = d2·m5 − m1² + 2·m1·rr·r0 − m0·r0²` is a difference of two nearly equal large
+    products. At the scale a fiber is actually authored at — `r ≈ 1 mm`, segment ≈ 1 cm,
+    origin 2 m away — `d2·m5` and `m1²` are each ~4·10⁻⁴ while `k0` is ~10⁻¹⁰: **six
+    decades**, the entire fp32 mantissa. So `curveSegCrossings` first slides the ray
+    origin along itself to its closest approach to `p0` (`shift = dot(p0−ro, rd)`) and
+    every accepted root undoes the shift. This is an exact re-parameterisation — it
+    changes conditioning, nothing else — and it is the round-cone analogue of the
+    perpendicular-offset trick `intersectSphere` already uses (Ray Tracing Gems ch. 7).
+    Measured: without it the fp32 intersector **loses 12–36 % of fiber hits** and
+    misplaces the rest by **11–42 radii** (strands would render as speckled holes on the
+    GPU while looking perfect on the CPU, with no image-level test able to blame the
+    intersector); with it, ≤ 0.06 radii. It also tightened the double path 16× (§1 max SDF
+    residual 8.60e-13 → 5.23e-14). **Trap:** after recentering the near root is normally
+    *negative* (the origin now sits beside the fiber), so `tmin`/running-closest filtering
+    must happen **after** undoing the shift — filtering in shifted space discards exactly
+    the root you want. Both the host lambda and the device `CURVE_OFFER` macro do the
+    unshift first, and both say so in a comment.
+  - *Root enumeration is scalar-templated.* `curveSegCrossings<S>(ro, rd, p0, p1, r0, r1,
+    shift, offer)` takes geometry as `S[3]` arrays (not `Vec3`) precisely so a `float`
+    instantiation does its dot products in float — that being the thing under test. The
+    renderer instantiates it at `double`; `-checkcurve` §6 instantiates the *same code* at
+    `float`. Without the templating, the self-test could only have validated algebra the
+    GPU does not run.
   - *Bases.* `linear` (exact, `segments` forced to 1), uniform **Catmull-Rom** (default,
     interpolating — an authored guide hair passes through its points; ends
     clamp-duplicated), **Bezier** (cubic chain, `3k+1` points), uniform cubic
@@ -250,19 +275,29 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     own `onb(axis)`; `tangent` = the axis Gram-Schmidt'd against the shading normal.
     The v1 azimuthal frame is **per-segment, not parallel-transported**, so `v` can step
     at a sharp joint — logged in `known-issues.md`.
-  - *Verification.* `-checkcurve` (`main.cpp`) is five sections: the intersector vs. the
+  - *Verification.* `-checkcurve` (`main.cpp`) is six sections: the intersector vs. the
     exact analytic SDF (sphere-traced ground truth, with rays *aimed* at the fiber —
     uniformly random rays essentially never hit something 1 mm wide, which made the first
     draft of this section vacuous at 950 hits per 200 k rays); the degenerate containment
     case vs. `intersectSphere`; `anyHit` vs. the full path with half the origins inside;
-    watertightness at chain joints; and basis flattening. **Mutation-tested**: dropping
-    the p0-cap band restriction fails only §3, dropping the p1 cap fails §1 and §4 — so
-    the sections are complementary, not redundant.
-  - *Not on the GPU yet.* `cudaForwardSupported` returns false for any scene with
-    `curveSegs` (see **GPU support gates fail safe**): the megakernel knows four prim
-    ranges, so it would trace straight past every strand and render a furred scene
-    **bald** rather than merely differently. The **raster preview** is not gated but is
-    not missing either — `raster::tessellate` stage (2b) meshes each round cone by
+    watertightness at chain joints; basis flattening; and **fp32 conditioning** at four
+    fiber scales (error measured in *fiber radii*, since an absolute tolerance is
+    meaningless across scales). **Mutation-tested**: dropping the p0-cap band restriction
+    fails only §3, dropping the p1 cap fails §1 and §4, and forcing `shift = 0` fails only
+    §6 (on all four rows) — so the sections are complementary, not redundant.
+  - *On the GPU since 0.151.0.* `DCurveSeg` + `intersectCurveSeg` in `render_cuda.cu` are
+    the device twin, and `curveSegs` became the **fifth** prim range in the flat BVH
+    dispatch (`tris | spheres | implicits | curveSegs | instances`) — which shifts the
+    instance index arithmetic in *both* `closestHit` and `occluded`, the classic way to
+    break instancing while porting something else. `cudaForwardSupported` no longer
+    rejects curve scenes; it only screens their **materials**, like every other
+    primitive's. Measured 74× (512 spp, 400×300, 96 000 segments: 59.1 s → 0.8 s at
+    identical 4.42 % noise). The general lesson worth carrying to the next primitive: a
+    device port is **not mechanical** when the megakernel is fp32 — check the
+    conditioning of any quadric *at the scale the primitive is actually authored at*,
+    because a well-behaved `double` intersector can be numerically useless in `float`.
+    The **raster preview** was never gated —
+    `raster::tessellate` stage (2b) meshes each round cone by
     sweeping rings through the same three pieces the intersector knows (back cap →
     tangent lateral band → front cap; both tangent circles sit at polar angle `acos(a)`,
     `a = (r0−r1)/|ba|`, which is what makes one angular sweep cover all three
@@ -3055,11 +3090,16 @@ unrecognised value into some other device code hands a kernel malformed geometry
 malformed geometry inside a kernel does not fail cleanly — it can fault the display
 driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
 
-A **whole missing primitive** is the same rule at the coarsest grain: the megakernel's
-hit routine knows four prim ranges (`tri | sphere | implicit | instance`), so 0.150.0's
-`curveSegs` fifth range gates the entire scene to the CPU. Without that gate the device
-would not fail at all — it would happily miss every strand and render a furred subject
-**bald**, which is far worse than a fallback because it looks like a plausible image.
+A **whole missing primitive** is the same rule at the coarsest grain. When 0.150.0 added
+`curveSegs` as a fifth prim range, the megakernel's hit routine still knew only four
+(`tri | sphere | implicit | instance`), so the gate sent any curve scene to the CPU
+wholesale. Without that gate the device would not have failed at all — it would happily
+miss every strand and render a furred subject **bald**, which is far worse than a fallback
+because it looks like a plausible image. 0.151.0 removed the gate by writing the missing
+device twin (`DCurveSeg` + `intersectCurveSeg`, and the fifth range in both `closestHit`
+and `occluded`); what survives is the *screen*, which still checks curve **materials**
+exactly like every other primitive's. That is the intended lifecycle of one of these
+gates: ship it the moment the hole exists, delete it only by filling the hole.
 
 ## Benchmarks & perf discipline
 

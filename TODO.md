@@ -4578,17 +4578,27 @@ that item mostly a binding exercise there.
       so a `group{}` transforms the control points and the flattening stays exact. Adjacent cones
       **share their end sphere**, so a chain is watertight at joints with no mitre logic. `u` runs
       root→tip, `v` around the circumference, `tangent` is the axis. Verified by `-checkcurve`
-      (five sections, mutation-tested) and bit-identity of curve-free scenes against a `git
+      (six sections, mutation-tested) and bit-identity of curve-free scenes against a `git
       worktree` build of the previous HEAD. Demo: `scenes/curve_basics.ftsl`.
       *The scoping fear did not materialise:* `src/bvh.h` is primitive-agnostic
       (`build(const std::vector<Aabb>&)` + `LeafFn`), so "a BVH build that doesn't degenerate on
       near-collinear, wildly-anisotropic bounds" needed **no BVH change at all** — flattening to
       cones makes the leaf bounds tight by construction, which is the whole point of doing it at
       load time. Likewise the FTSL/GPDA grammar is generic over block types, so `curve` needed no
-      grammar edit. **Not on the GPU** yet (the megakernel gates a curve scene to the CPU rather
-      than render it bald); `-raster`/`-raster-gpu` DO preview strands — a round-cone mesh added
+      grammar edit. `-raster`/`-raster-gpu` DO preview strands — a round-cone mesh added
       in the same version after the preview was caught drawing them as nothing at all. See
       `known-issues.md`.
+      **CUDA port ✅ 2026-08-07, v0.151.0** (0.150.0 had shipped CPU-only behind a whole-scene
+      gate). `DCurveSeg` + a device `intersectCurveSeg` in `render_cuda.cu`; `curveSegs` is now the
+      fifth prim range in both `closestHit` and `occluded`, and `cudaForwardSupported` only screens
+      curve *materials*. **74× measured** (512 spp, 400×300, 4000 strands / 96 000 segments:
+      59.1 s → 0.8 s at identical 4.42 % noise). The port was **not** mechanical: the round-cone
+      quadric's constant term is a six-decade cancellation at fiber scale, so the naive fp32
+      version loses 12–36 % of hits and misplaces the rest by 11–42 radii — strands would have
+      rendered as speckled holes on the GPU while looking perfect on the CPU. Fixed by **origin
+      recentering** on host *and* device (exact re-parameterisation; also tightened the double path
+      16×), and permanently guarded by `-checkcurve` §6, which instantiates the real intersector at
+      `float` (mutation-verified: `shift = 0` fails §6 on all four rows, §§1–5 still pass).
 - [ ] **P2 — sub-pixel variance and the aggregate-BSDF LOD.** The reason fiber rendering is
       expensive is not the intersector. A fiber is typically **1/5 to 1/50 of a pixel wide**, so in
       a path tracer each ray either hits or misses and the two answers differ wildly — it shows up
@@ -4610,6 +4620,44 @@ that item mostly a binding exercise there.
 ---
 
 ## Progress log
+- 2026-08-07: **Curves run on the GPU — and the port turned up a bug no image test could have found
+  (v0.151.0).** `render_cuda.cu` gains `DCurveSeg` and a device `intersectCurveSeg`; `curveSegs` becomes
+  the **fifth** prim range in both `closestHit` and `occluded` (which shifts the instance index
+  arithmetic in both — the classic way to break instancing while porting something else, so curve-free
+  `group` scenes were re-verified explicitly), and `cudaForwardSupported` stops rejecting curve scenes
+  wholesale and only screens their *materials*, like every other primitive's. **74×** on the workload
+  that motivates the primitive: 4000 strands / 96 000 segments, 512 spp at 400×300, **59.1 s → 0.8 s**
+  at identical 4.42 % noise.
+  **The part worth recording is that this was not a mechanical port.** The device is `Real = float`,
+  and the round-cone quadric's constant term `k0 = d2·m5 − m1² + 2·m1·rr·r0 − m0·r0²` is a difference
+  of two nearly equal large products. At the scale a *fiber* is actually authored at — 1 mm radius,
+  1 cm segment, origin 2 m away — those products are ~4e-4 while `k0` is ~1e-10: **six decades**, the
+  entire fp32 mantissa. I suspected it and **measured instead of guessing** (a standalone
+  `scraps/curve_fp32_probe.cpp` running the same algebra at `float` and `double`): the naive fp32
+  intersector **loses 12–36 % of fiber hits** and misplaces the rest by **11–42 fiber radii**. That
+  would have shipped as strands rendering as *speckled holes* on the GPU while looking perfect on the
+  CPU — and no image-level test would have blamed the intersector, because the symptom looks like
+  sampling noise. The fix is **origin recentering**: slide the ray origin along itself to its closest
+  approach to the segment root before forming any quadric, and undo the shift on each accepted root.
+  Exact in exact arithmetic — it changes *conditioning*, nothing else — and it is the round-cone
+  analogue of the perpendicular-offset trick `intersectSphere` already used. fp32 error dropped to
+  ≤ 0.06 radii, and the *double* path got 16× tighter for free (§1 max SDF residual 8.60e-13 →
+  5.23e-14). One trap it cost me an hour: after recentering the near root is normally **negative**, so
+  the `tmin`/closest filtering must happen *after* undoing the shift; filtering in shifted space
+  discards exactly the root you want (my probe had this bug and briefly "proved" recentering was
+  worse).
+  To make the fix *guardable* rather than merely present, root enumeration was extracted into a
+  **scalar-templated** `curveSegCrossings<S>` taking geometry as `S[3]` arrays, so a `float`
+  instantiation really does its dot products in float. `-checkcurve` §6 runs the *real* intersector at
+  `float` across four fiber scales and measures error in **fiber radii** (an absolute tolerance is
+  meaningless across scales). **Mutation-verified**: forcing `shift = 0` fails §6 on all four rows and
+  leaves §§1–5 passing — a guard that cannot fail is not a guard.
+  Equality checks: `-checkcurve` 6/6; `curve_basics` in mode W (deterministic on *both* devices, which
+  makes CPU↔GPU comparison far sharper than noisy mode R) mean |Δlum| **0.00003** with a single
+  outlier pixel on a specular highlight edge; curve-free CPU md5s unchanged; curve-free CPU↔GPU mode W
+  within ~5e-5. **Next:** a `fur { … }` generator block (P1's follow-on) — now that a groom is 74×
+  cheaper, the missing piece is authoring one, since nobody writes a million strands as text.
+  `scraps/gen_fur_test.py` is the throwaway scaffold that stood in for it here.
 - 2026-08-07: **P1 done — ftrace has a curve/fiber primitive (v0.150.0).** `src/curve.h`: a strand is
   control points + a radius, **flattened at load** into a chain of **round cones** (the convex hull of a
   sphere at either end), one BVH leaf per cone. Three design calls worth recording. (1) *Flatten at load,
@@ -4639,7 +4687,8 @@ that item mostly a binding exercise there.
   redundant, which is the property a passing suite does *not* by itself demonstrate. Separately, curve-free
   scenes were confirmed **bit-identical** (md5, modes R and W × triangles/implicits/instances) against a
   `git worktree` build of the previous HEAD, so the fifth prim range costs existing scenes nothing.
-  Shipped CPU-only on the ray-traced side: CUDA gates the whole scene to the CPU, because a missing prim
+  Shipped CPU-only on the ray-traced side (*closed the same day in 0.151.0 — see the entry above*):
+  CUDA gates the whole scene to the CPU, because a missing prim
   range would not *fail*, it would render fur **bald** — a plausible-looking wrong image, which is worse.
   The raster preview had the same hole and **no gate to fall back to**: `curve_basics` previewed as
   `[raster] 12 triangles` — the box, and none of the five strands, silently. Fixed in the same version by

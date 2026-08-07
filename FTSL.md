@@ -1235,8 +1235,9 @@ become elliptical.
 
 Worked example: `scenes/curve_basics.ftsl` (all four bases, a taper, an `r=` bulge, a
 `u`-banded pattern, and a strand inside a transformed group). See REFERENCE.md →
-**Curves and fibers** for how it is traced and for the v1 limits (the ray-traced modes
-are CPU-only — a scene with curves falls back from CUDA; `-raster` previews them fine).
+**Curves and fibers** for how it is traced and for the v1 limits (both CPU and CUDA
+trace strands as of 0.151.0; `-raster` previews them too — what is missing is an
+aggregate LOD for sub-pixel fibers).
 
 ---
 

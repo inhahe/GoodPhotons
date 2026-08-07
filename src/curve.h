@@ -155,6 +155,125 @@ inline CurveRay makeCurveRay(const Vec3& d) {
 // Degenerate case: when one ball contains the other (d2 <= 0) the hull IS the larger
 // ball and the lateral surface does not exist, so only that sphere is tested.
 //
+// ---------------------------------------------------------------------------
+// ORIGIN RECENTERING — why the ray origin is slid before any quadric is formed.
+// ---------------------------------------------------------------------------
+// `curveSegCrossings` first slides the ray origin along itself to its closest approach
+// to p0, and reports roots in that shifted parameterisation (the caller undoes the
+// shift).  That is exact in exact arithmetic — it only re-parameterises the same ray —
+// and is purely a CONDITIONING fix: the round-cone analogue of the perpendicular-offset
+// trick Ray Tracing Gems ch.7 uses for spheres, which `intersectSphere` already uses for
+// exactly the same reason.
+//
+// Without it, `k0 = d2*m5 - m1*m1 + ...` catastrophically cancels at FIBER scales: with a
+// 1 mm radius, 1 cm segments and an origin 2 m away, `d2*m5` and `m1*m1` are both ~4e-4
+// while their difference is O(m0*r0^2) ~ 1e-10 — a six-decade cancellation.  Double has
+// the headroom to absorb that (which is why it was invisible at first), but the CUDA
+// megakernel is fp32 by default (`using Real = float`), where six decades is the entire
+// mantissa.  Measured on 109 k rays aimed at exactly that configuration, the naive form
+// loses **16 016 hits outright (15%)** and errs by up to **11.8 radii** — it renders a
+// strand as speckled holes and misplaced surface, not as a slightly noisy strand.
+// Recentered: 4 grazing misses (0.004%), max error 0.008 radii.  At 0.5 mm radius / 2 cm
+// segments the naive form is worse still (31 837 misses, 42 radii); recentered stays at
+// 0.036 radii.  After recentering every term is O(r^2) with no large common part to
+// cancel away.
+//
+// The host uses the same formulation as the device deliberately: it costs two dot
+// products, it buys the CPU the same robustness at large world coordinates (double merely
+// postpones the identical failure to scenes ~1e9x bigger), and it means `-checkcurve`
+// validates the exact algebra the GPU runs rather than a cousin of it.
+//
+// ---------------------------------------------------------------------------
+// Root enumeration, generic over the scalar type.
+// ---------------------------------------------------------------------------
+// Templated on `S` so the SAME algebra can be instantiated at double (the renderer) and
+// at float (`-checkcurve` §6, which measures the conditioning the fp32 device twin in
+// render_cuda.cu depends on).  One copy means the guard cannot drift away from the code
+// it guards — the failure above was found precisely because nothing tested the float
+// conditioning of the double-only original.
+//
+// Geometry comes in as plain scalar triples rather than Vec3 so a float instantiation
+// does its dot products in float too; that is the thing being measured.  `offer(tn, piece,
+// y)` is called for every boundary crossing, in the SHIFTED parameterisation; the caller
+// applies tmin / running-closest filtering because only it knows those units.  `shift`
+// receives the amount the origin moved.  Returns false for a degenerate (zero-length)
+// segment, which has nothing to sweep.
+template <class S, class OfferFn>
+inline bool curveSegCrossings(const S ro[3], const S rd[3],
+                              const S p0[3], const S p1[3], S r0, S r1,
+                              S& shift, OfferFn&& offer) {
+    const S ba[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+    auto d3 = [](const S a[3], const S b[3]) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; };
+
+    const S m0 = d3(ba, ba);
+    if (!(m0 > S(0))) return false;          // zero-length segment: nothing to sweep
+
+    // Slide the origin to its closest approach to p0 (rd is unit, so this is a dot).
+    const S toP0[3] = {p0[0] - ro[0], p0[1] - ro[1], p0[2] - ro[2]};
+    shift = d3(toP0, rd);
+    const S o[3] = {ro[0] + rd[0]*shift, ro[1] + rd[1]*shift, ro[2] + rd[2]*shift};
+    const S oa[3] = {o[0] - p0[0], o[1] - p0[1], o[2] - p0[2]};
+    const S ob[3] = {o[0] - p1[0], o[1] - p1[1], o[2] - p1[2]};
+
+    const S rr = r0 - r1;
+    const S m1 = d3(ba, oa);
+    const S m2 = d3(ba, rd);
+    const S m3 = d3(rd, oa);
+    const S m5 = d3(oa, oa);
+    const S m6 = d3(ob, rd);
+    const S m7 = d3(ob, ob);
+    const S d2 = m0 - rr * rr;
+
+    if (d2 > S(0)) {
+        // --- lateral (tangent) cone -----------------------------------------------
+        const S k2 = d2 - m2 * m2;
+        const S k1 = d2 * m3 - m1 * m2 + m2 * rr * r0;
+        const S k0 = d2 * m5 - m1 * m1 + m1 * rr * r0 * S(2) - m0 * r0 * r0;
+        const S h  = k1 * k1 - k0 * k2;
+        // k2 == 0 is the ray running exactly along the axis; the quadratic degenerates
+        // to a line and the crossing it would report is a cap crossing, which the two
+        // sphere tests below find anyway.
+        if (h >= S(0) && k2 != S(0)) {
+            const S sq = std::sqrt(h);
+            S ta = (-sq - k1) / k2, tb = (sq - k1) / k2;
+            if (ta > tb) { S tmp = ta; ta = tb; tb = tmp; }
+            const S base = m1 - r0 * rr;
+            const S ya = base + ta * m2, yb = base + tb * m2;
+            if (ya > S(0) && ya < d2) offer(ta, 0, ya);
+            if (yb > S(0) && yb < d2) offer(tb, 0, yb);
+        }
+        // --- cap at p0 (the hull boundary only where y <= 0) ------------------------
+        const S h1 = m3 * m3 - m5 + r0 * r0;
+        if (h1 > S(0)) {
+            const S q = std::sqrt(h1), base = m1 - r0 * rr;
+            const S ta = -m3 - q, tb = -m3 + q;
+            if (base + ta * m2 <= S(0)) offer(ta, 1, S(0));
+            if (base + tb * m2 <= S(0)) offer(tb, 1, S(0));
+        }
+        // --- cap at p1 (the hull boundary only where y >= d2) -----------------------
+        const S h2 = m6 * m6 - m7 + r1 * r1;
+        if (h2 > S(0)) {
+            const S q = std::sqrt(h2), base = m1 - r0 * rr;
+            const S ta = -m6 - q, tb = -m6 + q;
+            if (base + ta * m2 >= d2) offer(ta, 2, d2);
+            if (base + tb * m2 >= d2) offer(tb, 2, d2);
+        }
+    } else {
+        // One ball swallows the other: the hull is just the bigger sphere.
+        const bool useP0 = (r0 >= r1);
+        const S    rc    = useP0 ? r0 : r1;
+        const S    mm    = useP0 ? m3 : m6;
+        const S    mq    = useP0 ? m5 : m7;
+        const S    hh    = mm * mm - mq + rc * rc;
+        if (hh > S(0)) {
+            const S q = std::sqrt(hh);
+            offer(-mm - q, useP0 ? 1 : 2, useP0 ? S(0) : d2);
+            offer(-mm + q, useP0 ? 1 : 2, useP0 ? S(0) : d2);
+        }
+    }
+    return true;
+}
+
 // Writes into `hit` respecting hit.t as the running closest, and returns true on a
 // nearer hit — the same contract as intersectTri / intersectSphere / intersectImplicit.
 // `anyHit` (occlusion queries) skips the normal / UV / tangent work, which cannot change
@@ -163,86 +282,42 @@ inline bool intersectCurveSeg(const CurveRay& cr, const Ray& r, const CurveSeg& 
                               double tmin, Hit& hit, bool anyHit = false) {
     const Vec3&  rd = cr.dn;
     const Vec3   ba = s.p1 - s.p0;
-    const Vec3   oa = r.o - s.p0;
-    const Vec3   ob = r.o - s.p1;
-    const double rr = s.r0 - s.r1;
     const double m0 = dot(ba, ba);
-    if (m0 <= 0.0) return false;             // zero-length segment: nothing to sweep
-    const double m1 = dot(ba, oa);
-    const double m2 = dot(ba, rd);
-    const double m3 = dot(rd, oa);
-    const double m5 = dot(oa, oa);
-    const double m6 = dot(ob, rd);
-    const double m7 = dot(ob, ob);
-    const double d2 = m0 - rr * rr;
 
-    double bestTn = DBL_MAX;      // best root, in UNIT-direction parameter
+    double bestTn = DBL_MAX;      // best root, in RECENTERED unit-direction parameter
     int    piece  = -1;           // 0 = lateral, 1 = cap at p0, 2 = cap at p1
     double bestY  = 0.0;          // axial coordinate at the winner (lateral -> u)
+    double shift  = 0.0;
 
-    // Offer one root of one piece. Converts to the ray's own parameterisation before
-    // the tmin / running-closest tests so both stay in the caller's units.
-    auto offer = [&](double tn, int w, double y) {
-        if (tn >= bestTn) return;
-        double t = tn * cr.invLen;
-        if (t < tmin || t >= hit.t) return;
-        bestTn = tn; piece = w; bestY = y;
-    };
-
-    if (d2 > 0.0) {
-        // --- lateral (tangent) cone -----------------------------------------------
-        const double k2 = d2 - m2 * m2;
-        const double k1 = d2 * m3 - m1 * m2 + m2 * rr * s.r0;
-        const double k0 = d2 * m5 - m1 * m1 + m1 * rr * s.r0 * 2.0 - m0 * s.r0 * s.r0;
-        const double h  = k1 * k1 - k0 * k2;
-        // k2 == 0 is the ray running exactly along the axis; the quadratic degenerates
-        // to a line and the crossing it would report is a cap crossing, which the two
-        // sphere tests below find anyway.
-        if (h >= 0.0 && k2 != 0.0) {
-            const double sq = std::sqrt(h);
-            double ta = (-sq - k1) / k2, tb = (sq - k1) / k2;
-            if (ta > tb) std::swap(ta, tb);
-            const double base = m1 - s.r0 * rr;
-            double ya = base + ta * m2, yb = base + tb * m2;
-            if (ya > 0.0 && ya < d2) offer(ta, 0, ya);
-            if (yb > 0.0 && yb < d2) offer(tb, 0, yb);
-        }
-        // --- cap at p0 (the hull boundary only where y <= 0) ------------------------
-        const double h1 = m3 * m3 - m5 + s.r0 * s.r0;
-        if (h1 > 0.0) {
-            const double q = std::sqrt(h1), base = m1 - s.r0 * rr;
-            double ta = -m3 - q, tb = -m3 + q;
-            if (base + ta * m2 <= 0.0) offer(ta, 1, 0.0);
-            if (base + tb * m2 <= 0.0) offer(tb, 1, 0.0);
-        }
-        // --- cap at p1 (the hull boundary only where y >= d2) -----------------------
-        const double h2 = m6 * m6 - m7 + s.r1 * s.r1;
-        if (h2 > 0.0) {
-            const double q = std::sqrt(h2), base = m1 - s.r0 * rr;
-            double ta = -m6 - q, tb = -m6 + q;
-            if (base + ta * m2 >= d2) offer(ta, 2, d2);
-            if (base + tb * m2 >= d2) offer(tb, 2, d2);
-        }
-    } else {
-        // One ball swallows the other: the hull is just the bigger sphere.
-        const bool  useP0 = (s.r0 >= s.r1);
-        const double rc   = useP0 ? s.r0 : s.r1;
-        const double mm   = useP0 ? m3 : m6;
-        const double mq   = useP0 ? m5 : m7;
-        const double hh   = mm * mm - mq + rc * rc;
-        if (hh > 0.0) {
-            const double q = std::sqrt(hh);
-            offer(-mm - q, useP0 ? 1 : 2, useP0 ? 0.0 : d2);
-            offer(-mm + q, useP0 ? 1 : 2, useP0 ? 0.0 : d2);
-        }
-    }
-
+    // Roots arrive in the RECENTERED parameterisation, where the near root of a strand the
+    // ray actually hits is typically NEGATIVE (the origin now sits beside the fiber, not
+    // metres in front of it). So the shift must be undone BEFORE the tmin / running-closest
+    // tests — testing `tn` itself against tmin would discard exactly the root wanted.
+    const double roA[3] = {r.o.x, r.o.y, r.o.z}, rdA[3] = {rd.x, rd.y, rd.z};
+    const double p0A[3] = {s.p0.x, s.p0.y, s.p0.z}, p1A[3] = {s.p1.x, s.p1.y, s.p1.z};
+    if (!curveSegCrossings<double>(roA, rdA, p0A, p1A, s.r0, s.r1, shift,
+            [&](double tn, int w, double y) {
+                if (tn >= bestTn) return;
+                const double t = (tn + shift) * cr.invLen;
+                if (t < tmin || t >= hit.t) return;
+                bestTn = tn; piece = w; bestY = y;
+            }))
+        return false;
     if (piece < 0) return false;
 
-    const double t = bestTn * cr.invLen;
+    const double t = (bestTn + shift) * cr.invLen;
     hit.t = t;
     hit.valid = true;
     if (anyHit) return true;
+
+    // Rebuild the recentered offset vectors for the normal. Only reached on an accepted
+    // non-anyHit hit, so the occlusion path (the majority of a fur render's rays) never
+    // pays for them.
+    const double rr = s.r0 - s.r1;
+    const double d2 = m0 - rr * rr;
+    const Vec3 ro = r.o + rd * shift;
+    const Vec3 oa = ro - s.p0;
+    const Vec3 ob = ro - s.p1;
 
     const Vec3 p = r.o + r.d * t;
     hit.p = p;
