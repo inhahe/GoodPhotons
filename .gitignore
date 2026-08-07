@@ -52,10 +52,9 @@
 # The demo's SCENE, by contrast, is NOT committed in rendered form: the animation is
 # tools/loom/examples/pastel_jack.py, and the ~1700 per-frame `.ftsl` it emits into png/
 # are generated artifacts exactly like the PNGs beside them. `.ftsl` has no blanket rule
-# (scenes/*.ftsl are hand-written source), so ignore the emitted ones by location.
-# png/_objseq_test_frames/scenes/ predates this rule and is already tracked — a rule here
-# cannot untrack a tracked file, so those five stay; they are the fixture of an objseq
-# regression test rather than frames of an animation.
+# (scenes/*.ftsl are hand-written source), so ignore the emitted ones by location. This
+# also retires png/_objseq_test_frames/scenes/frame_0000*.ftsl, five emitted frames that
+# had been swept into a commit before any rule covered them; nothing references them.
 /png/**/*.ftsl
 
 # 3D model assets (large binaries kept on disk, never committed — cameras/, meshes/,
