@@ -725,6 +725,75 @@ def test_session_emit_reflects_params():
     assert a != b
 
 
+def test_session_emit_writes_mesh_files_by_default(tmp_path):
+    ack = _session().handle({"cmd": "emit", "assets_dir": str(tmp_path)})
+    assert "_blobs" not in ack
+    meshes = list(tmp_path.glob("*.ftmesh"))
+    assert meshes, "the tube should have written a mesh"
+    assert f'file "{meshes[0].as_posix()}"' in ack["source"]
+
+
+def test_session_emit_inline_assets_returns_bytes_and_writes_nothing(tmp_path):
+    d = tmp_path / "never"
+    ack = _session().handle({"cmd": "emit", "assets": "inline",
+                             "assets_dir": str(d)})
+    blobs = ack["_blobs"]
+    assert len(blobs) == 1
+    name, data = blobs[0]
+    # ...named exactly as the scene text names it, which is what keys ftrace's overlay
+    assert f'file "{name}"' in ack["source"]
+    assert data[:8] == b"FTMESH\0\0"
+    # ...and the directory it is *named* after was never even created
+    assert not d.exists()
+
+
+def test_session_emit_inline_assets_matches_the_file_it_replaces(tmp_path):
+    """The two modes must be the same bytes, or the pipe path is a second format."""
+    written = _session().handle({"cmd": "emit", "assets_dir": str(tmp_path)})
+    piped = _session().handle({"cmd": "emit", "assets": "inline",
+                               "assets_dir": str(tmp_path)})
+    assert written["source"] == piped["source"]
+    (name, data), = piped["_blobs"]
+    assert data == open(name, "rb").read()
+
+
+def test_session_emit_inline_assets_honours_mesh_format(tmp_path):
+    ack = _session().handle({"cmd": "emit", "assets": "inline",
+                             "assets_dir": str(tmp_path), "mesh_format": "obj"})
+    (name, data), = ack["_blobs"]
+    assert name.endswith(".obj")
+    assert data.startswith(b"v ")
+
+
+def test_serve_viewer_frames_blobs_after_the_ack_line(tmp_path):
+    """The wire framing: a `blobs` manifest in the ack, raw payloads after it."""
+    import io
+    reqs = json.dumps({"cmd": "emit", "assets": "inline",
+                       "assets_dir": str(tmp_path)}) + "\n"
+    out, binout = io.StringIO(), io.BytesIO()
+    serve_viewer(_session(), io.StringIO(reqs), out, binout)
+    ack = json.loads(out.getvalue())
+    assert "_blobs" not in ack                       # the private key never ships
+    assert len(ack["blobs"]) == 1
+    entry = ack["blobs"][0]
+    assert f'file "{entry["name"]}"' in ack["source"]
+    payload = binout.getvalue()
+    assert len(payload) == entry["bytes"]            # manifest length is authoritative
+    assert payload[:8] == b"FTMESH\0\0"
+
+
+def test_serve_viewer_reports_rather_than_dropping_blobs_it_cannot_send(tmp_path):
+    """A text-only stream cannot frame bytes, and silently omitting them would leave
+    the reader loading a mesh file that was never written."""
+    import io
+    reqs = json.dumps({"cmd": "emit", "assets": "inline",
+                       "assets_dir": str(tmp_path)}) + "\n"
+    out = io.StringIO()
+    serve_viewer(_session(), io.StringIO(reqs), out, bin_stream=None)
+    ack = json.loads(out.getvalue())
+    assert ack["ok"] is False and "text-only" in ack["error"]
+
+
 def test_session_unknown_cmd_and_errors_dont_crash():
     assert _session().handle({"cmd": "nope"})["ok"] is False
     # a bad param surfaces as an error ack, not an exception

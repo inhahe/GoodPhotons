@@ -212,6 +212,19 @@ def line_profile(half_width: float = 0.5) -> List[Vec2]:
     return [(-half_width, 0.0), (half_width, 0.0)]
 
 
+def encode_obj(verts: Sequence[Vec3], faces: Sequence[Tuple[int, int, int]]) -> str:
+    """Serialise an indexed mesh as OBJ text.
+
+    Split out from :func:`write_obj` so the same bytes can go somewhere other than a
+    file — the live viewer channel hands them to ftrace down the pipe the two
+    processes already share, never touching the filesystem.  Keeping one encoder
+    means the piped mesh and the written one cannot drift.
+    """
+    lines = [f"v {v[0]:.6g} {v[1]:.6g} {v[2]:.6g}" for v in verts]
+    lines += [f"f {a + 1} {b + 1} {c + 1}" for (a, b, c) in faces]
+    return "\n".join(lines) + "\n"
+
+
 def write_obj(path, verts: Sequence[Vec3], faces: Sequence[Tuple[int, int, int]]) -> None:
     """Write an OBJ **atomically** (temp file in the same directory + ``os.replace``).
 
@@ -223,6 +236,4 @@ def write_obj(path, verts: Sequence[Vec3], faces: Sequence[Tuple[int, int, int]]
     Replacing the whole file in one step makes a reader see either the old mesh or
     the new one, never a splice of the two.  See :mod:`loom.atomicio`.
     """
-    lines = [f"v {v[0]:.6g} {v[1]:.6g} {v[2]:.6g}" for v in verts]
-    lines += [f"f {a + 1} {b + 1} {c + 1}" for (a, b, c) in faces]
-    write_atomic(path, "\n".join(lines) + "\n", suffix=".obj.tmp")
+    write_atomic(path, encode_obj(verts, faces), suffix=".obj.tmp")

@@ -3,7 +3,7 @@
 #ifndef _WIN32
 // -------- Non-Windows stub: the native viewer needs Win32 + D3D11 --------------
 #include <cstdio>
-int runViewerGui(const std::string&, const std::string&) {
+int runViewerGui(const std::string&, const std::string&, bool) {
     std::fprintf(stderr, "error: -viewer is only available on Windows builds.\n");
     return 1;
 }
@@ -39,6 +39,8 @@ int runViewerGui(const std::string&, const std::string&) {
 #include <cstring>
 #include <cstdlib>                 // strtoul: parsing the pid out of a scratch dir name
 #include <cwctype>
+#include <memory>                  // shared_ptr: the live channel's in-memory payload
+#include "assetbytes.h"            // asset bytes handed to the loader instead of paths
 
 // Bridge to ftrace's own scene loader + GPU field raymarcher (F7 primary path).
 // The viewer IS the ftrace binary, so it can parse loom's emitted `.ftsl` with the
@@ -180,7 +182,16 @@ struct Sidecar {
     bool load(const std::string& path) {
         std::string text;
         if (!readFile(path, text)) { err = "cannot open " + path; return false; }
-        if (!minijson::parse(text, root, err)) return false;
+        minijson::Value v;
+        if (!minijson::parse(text, v, err)) return false;
+        return adopt(std::move(v));
+    }
+    // Take over an already-parsed tree. The live channel gets its sidecar as an
+    // object *inside* loom's ack, so by the time it reaches here the parse has
+    // already happened (on the bridge's worker thread); re-serialising it only to
+    // re-parse it would be pure waste. Moves — this tree is ~900 KB on a real scene.
+    bool adopt(minijson::Value v) {
+        root = std::move(v);
         if (!root.isObject()) { err = "sidecar root is not an object"; return false; }
         ok = true;
         return true;
@@ -672,7 +683,114 @@ struct LivePanel {
     long long posted = 0, baked = 0, appliedSeq = 0;
     double lastMs = 0.0;
     std::string lastErr;
+    // --- F8(a) paced play -------------------------------------------------
+    // The clock advances only when a bake LANDS, never on a wall-clock timer. The
+    // bridge is latest-wins on a one-slot pending job (the rule that makes a drag
+    // cost one bake), so a play loop that posted on a timer would have most of its
+    // frames superseded before they ran and would show a stutter of whichever ones
+    // won the slot -- not playback. Pacing to the bake rate plays every frame, and
+    // the fps readout states the rate honestly rather than pretending to be 30.
+    bool playing = false;
+    // Force the "play just started" priming post even though `playing` was set
+    // before the first draw (the -play flag), where there is no rising edge to see.
+    bool primePlay = false;
+    bool loopPlay = true;         // wrap at the end vs. stop there
+    bool pingpong = false;        // bounce instead of wrapping
+    int  dir = 1;                 // +1 / -1, flipped by ping-pong
+    // MEASURED playback rate (EMA), not 1000/lastMs. `lastMs` times loom's bake alone;
+    // the viewer then parses a multi-MB sidecar, rebuilds mesh buffers and re-inits the
+    // raymarch pane on the UI thread, and that adoption cost is routinely the larger
+    // half. Deriving fps from the bake overstated real playback by ~10x here, which is
+    // precisely the "pretend it's 30" this feature was supposed to avoid.
+    double    playFps = 0.0;
+    long long lastAdvanceQpc = 0;
+    // Per-stage adoption cost, so "why is play slow?" is answered by measurement
+    // rather than by guessing at the FTSL round trip. Milliseconds, last frame.
+    double msSidecar = 0.0;   // parse the introspection JSON + rebuild DAG/skins
+    double msFtsl    = 0.0;   // parse the .ftsl + load its mesh assets
+    double msRender  = 0.0;   // the Render pane's synchronous CUDA raymarch
+    // ...and where THAT went. Split out because the three phases scale with different
+    // things (scene size / pixels / pixels) and because only `kernel` is SM-bound: a
+    // foreign process saturating the card inflates that phase ALONE. An earlier profile
+    // of this pane blamed the raymarch while another program held 90% of the GPU; with
+    // the split, such a contaminated reading is self-evident instead of plausible.
+    double msRenderUpload = 0.0;  // marshal the WHOLE scene + H2D (scene size; CPU+DMA)
+    double msRenderKernel = 0.0;  // the raymarch itself           (pixels; SM-bound)
+    double msRenderRead   = 0.0;  // D2H + host tone map           (pixels; mostly CPU)
+    // ...and the same treatment for msSidecar, which the n=50 profile showed is the
+    // single biggest term in a played frame (90.5 of 215 ms). Same rule as above: it
+    // is a sum of four unrelated costs -- a JSON parse that scales with sidecar bytes,
+    // geometry collection that scales with tessellation, a DAG rebuild that scales with
+    // node count, and a GPU skin rebuild that scales with TEXELS and is pure waste when
+    // the texture set has not changed. Ranking those by intuition is exactly the error
+    // that produced three wrong diagnoses here, so they are measured separately.
+    double msAdoptJson  = 0.0;  // Sidecar::load  -- minijson parse of the whole file
+    double msAdoptGeom  = 0.0;  // curves/strips/fields/meshes collection
+    double msAdoptDag   = 0.0;  // collectDag + layout carry-over
+    double msAdoptSkins = 0.0;  // skins.release() + skins.build() (decode + D3D11 upload)
+    // ...and the same for msFtsl, now the largest term. `assets` and `accel` are nested
+    // inside `build`, so the residual (build - assets - accel) is the Builder's own work.
+    // The interesting question this answers: of the per-frame .ftsl round-trip, how much
+    // is text parsing (which a direct mesh handoff would delete outright) versus BVH
+    // construction (which it would NOT -- that has to happen for any new geometry).
+    double msFtslParse  = 0.0;  // source text -> Block tree (ftsl_gpda::parse)
+    double msFtslBuild  = 0.0;  // Block tree -> Scene, INCLUDING assets + accel below
+    double msFtslAssets = 0.0;  // of build: mesh files read+parsed from disk (obj/gltf/fbx)
+    double msFtslAccel  = 0.0;  // of build: BVH construction (per-asset Blas + Scene::build)
+    // Set by the Render tab each UI frame it actually draws. Needed because the
+    // Live panel is drawn BEFORE the Render pane, so zeroing msRender when a bake
+    // lands would blank it every frame during play -- it would always read 0 and
+    // wrongly exonerate the raymarch. Instead the value persists and is cleared
+    // only once the tab has genuinely stopped drawing.
+    bool renderTabDrew = false;
 };
+
+// A scoped wall-clock stopwatch that adds into a double (milliseconds).
+struct MsTimer {
+    double*   sink;
+    long long t0;
+    explicit MsTimer(double* d) : sink(d) {
+        LARGE_INTEGER q; QueryPerformanceCounter(&q); t0 = q.QuadPart;
+    }
+    // Close the interval early and detach, for a phase whose end does not line up with
+    // a scope (e.g. a block that declares locals the next phase must still see). Safe
+    // to call more than once; the destructor then does nothing.
+    void stop() {
+        LARGE_INTEGER q, f;
+        QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+        if (sink && f.QuadPart) *sink = 1000.0 * double(q.QuadPart - t0) / double(f.QuadPart);
+        sink = nullptr;
+    }
+    ~MsTimer() { if (sink) stop(); }
+};
+
+// Step the clock one frame in the current play direction, honouring loop/ping-pong.
+static void liveAdvanceClock(LivePanel& lp) {
+    if (lp.frames <= 1) return;
+    int next = lp.frame + lp.dir;
+    if (lp.pingpong) {
+        if (next >= lp.frames)  { next = lp.frames - 2; lp.dir = -1; }
+        else if (next < 0)      { next = 1;             lp.dir = +1; }
+    } else if (next >= lp.frames) {
+        if (lp.loopPlay) next = 0;
+        else { next = lp.frames - 1; lp.playing = false; }
+    } else if (next < 0) {
+        next = lp.loopPlay ? lp.frames - 1 : 0;
+    }
+    lp.frame = std::min(std::max(next, 0), lp.frames - 1);
+
+    LARGE_INTEGER f, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    if (lp.lastAdvanceQpc && f.QuadPart) {
+        double dt = double(now.QuadPart - lp.lastAdvanceQpc) / double(f.QuadPart);
+        if (dt > 1e-9) {
+            double inst = 1.0 / dt;
+            lp.playFps = lp.playFps > 0.0 ? lp.playFps * 0.8 + inst * 0.2 : inst;
+        }
+    }
+    lp.lastAdvanceQpc = now.QuadPart;
+}
 
 // The canvas gesture: right-drag sweeps the chosen parameter axis. Call it directly
 // after the pane's InvisibleButton (it reads that item's active state). Returns true
@@ -2242,7 +2360,18 @@ struct RenderPane {
     int  texW = 0, texH = 0;
     bool dirty = true;
     int  resLong = 640;               // square raymarch resolution (long edge)
+    // Playback resolution. The raymarch is synchronous on the UI thread and scales
+    // with res^2, so at the full 640 it costs ~440 ms and is ~63% of a played frame
+    // -- it, not the .ftsl round trip, is what makes play slow. Dropping to 256
+    // while playing is ~6x less work, and matches what the -explore viewer already
+    // does: degrade while moving, refine once settled (here, once paused).
+    int  resPlay = 256;
+    bool lowRes  = false;             // the res the current texture was traced at
     std::string status;
+    // Phase split of the last raymarch (upload / kernel / readback). Fed to the Live
+    // panel so the play breakdown can say WHICH part of the raymarch costs, rather
+    // than leaving one opaque number to be over-interpreted.
+    IsoPreviewTiming lastTiming;
 
     void initFrom(const Scene& s) {
         center = s.sceneCenter;
@@ -2298,13 +2427,16 @@ struct RenderPane {
         return true;
     }
 
-    void render(const Scene& s, ID3D11Device* dev, ID3D11DeviceContext* ctx) {
-        int W = resLong, H = resLong;
+    void render(const Scene& s, ID3D11Device* dev, ID3D11DeviceContext* ctx,
+                bool draft = false) {
+        int W = draft ? std::min(resPlay, resLong) : resLong, H = W;
+        lowRes = (W != resLong);
         Camera cam = camera(W, H);
         unsigned hw = std::thread::hardware_concurrency();
         int nThreads = hw ? (int)hw : 4;
+        lastTiming = IsoPreviewTiming{};
         std::vector<uint8_t> img =
-            renderIsoPreviewCuda(s, cam, W, H, nThreads, 1.0, true, nullptr);
+            renderIsoPreviewCuda(s, cam, W, H, nThreads, 1.0, true, nullptr, &lastTiming);
         if (img.empty()) { status = "raymarch unavailable (no CUDA device or unsupported scene)"; return; }
         if (upload(img, W, H, dev, ctx)) { status.clear(); dirty = false; }
         else status = "D3D11 texture upload failed";
@@ -2332,6 +2464,18 @@ static bool drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
     ImGui::SetNextItemWidth(120);
     if (ImGui::SliderInt("res", &rp.resLong, 128, 1024)) rp.dirty = true;
     ImGui::SameLine();
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("play res", &rp.resPlay, 64, 1024);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Resolution to raymarch at while the clock is PLAYING.\n"
+                          "This trace is synchronous and scales with res^2, so it is\n"
+                          "normally the largest single cost of a played frame; lower\n"
+                          "this to play faster. Full `res` is restored when you pause.");
+    if (rp.lowRes) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(draft %d)", std::min(rp.resPlay, rp.resLong));
+    }
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(120);
     if (ImGui::SliderFloat("fov", &rp.fov, 10.0f, 110.0f, "%.0f deg")) rp.dirty = true;
     ImGui::SameLine();
@@ -2358,7 +2502,27 @@ static bool drawRenderPane(RenderPane& rp, const Scene& scene, bool sceneOk,
         if (w != 0.0f) { rp.distMul *= (1.0f - w * 0.1f); if (rp.distMul < 0.2f) rp.distMul = 0.2f; rp.dirty = true; }
     }
 
-    if (rp.dirty) rp.render(scene, dev, ctx);
+    if (live) live->renderTabDrew = true;
+    // Trace at draft res while the clock is playing, full res once it settles. The
+    // moment play stops, the image on screen is a draft, so ask for one more trace
+    // -- otherwise pausing would leave you inspecting a deliberately coarse frame.
+    const bool draft = (live && live->playing);
+    if (!draft && rp.lowRes) rp.dirty = true;
+    if (rp.dirty) {
+        // Timed because a landed bake calls initFrom, which sets `dirty`, so the
+        // whole scene is re-raymarched synchronously on the UI thread at res^2 on
+        // every played frame -- a cost paid only while this tab is open.
+        if (live) {
+            { MsTimer _t(&live->msRender); rp.render(scene, dev, ctx, draft); }
+            // Carry the phase split up alongside the total. Copied after the timer
+            // closes so `msRender` stays the authoritative wall-clock figure and the
+            // three parts are only ever a breakdown OF it, never a substitute.
+            live->msRenderUpload = rp.lastTiming.msUpload;
+            live->msRenderKernel = rp.lastTiming.msKernel;
+            live->msRenderRead   = rp.lastTiming.msReadback;
+        }
+        else      { rp.render(scene, dev, ctx, draft); }
+    }
 
     // Fit the square texture into the pane, centered, preserving aspect.
     if (rp.srv && rp.texW > 0 && rp.texH > 0) {
@@ -2420,12 +2584,31 @@ struct LoomJob {
     bool wantSource  = true;    // re-emit .ftsl: the Render tab's raymarched field
 };
 
+// One finished re-derivation, entire in memory. NOTHING here names a file.
+//
+// It used to: loom wrote a `.json` and a `.ftsl` (plus the mesh assets the `.ftsl`
+// referenced) into a scratch directory and the viewer opened them back. Measured
+// 2026-08-06, that cost ~17 ms of a 130 ms frame — not I/O but Windows Defender's
+// on-access scan, which charges a flat ~8 ms to open a file another process wrote a
+// millisecond ago and cannot be avoided by writing faster. loom and ftrace already
+// hold a pipe open between them, so the bytes come down that instead.
+//
+// Handed to the UI thread by `shared_ptr` and never copied: the sidecar tree alone is
+// ~900 KB, and deep-copying it under the bridge's lock once a frame would give back
+// most of what this change is buying.
+struct LoomPayload {
+    minijson::Value     sidecar;              // parsed off the ack, on the worker
+    bool                hasSidecar = false;
+    std::string         source;               // .ftsl text
+    bool                hasSource  = false;
+    assetbytes::Overlay assets;               // mesh bytes the source names by path
+};
+
 struct LoomResult {
     long long   seq = 0;
     bool        ok  = false;
     std::string err;
-    std::string sidecarPath;    // temp file loom wrote (empty when not requested)
-    std::string sourcePath;
+    std::shared_ptr<LoomPayload> payload;
     double      ms = 0.0;
 };
 
@@ -2465,12 +2648,10 @@ struct LoomBridge {
         }
         link_.stop();
         if (!tempDir_.empty()) {
-            std::lock_guard<std::mutex> lk(m_);
-            for (const auto& f : temps_) DeleteFileA(f.c_str());
-            temps_.clear();
-            // Sweep the whole scratch directory, not just the files we named: emitting
-            // an .ftsl also drops the mesh assets it references (loom's `asset_path`
-            // writes .obj next to `out`), and RemoveDirectory fails on a non-empty dir.
+            // Nothing is written there any more (the live channel is all in-memory),
+            // but a directory left by an OLDER ftrace under this same pid name would
+            // otherwise never be collected, and the sweep is one syscall on an empty
+            // dir. Files first: RemoveDirectory fails on a non-empty one.
             WIN32_FIND_DATAA fd{};
             HANDLE h = FindFirstFileA((tempDir_ + "\\*").c_str(), &fd);
             if (h != INVALID_HANDLE_VALUE) {
@@ -2494,10 +2675,13 @@ struct LoomBridge {
         cv_.notify_one();
     }
 
+    // Moves: the payload is ~1 MB and the bridge must not keep a second reference to
+    // it alive until the next bake happens to overwrite the slot.
     bool take(LoomResult& out) {
         std::lock_guard<std::mutex> lk(m_);
         if (!hasResult_) return false;
-        out = result_;
+        out = std::move(result_);
+        result_ = LoomResult{};
         hasResult_ = false;
         return true;
     }
@@ -2525,33 +2709,11 @@ struct LoomBridge {
     }
     const std::string& command() const { return link_.cmdline; }
 
-    // temp scratch files the UI has finished reading
-    void reap(const std::string& path) {
-        if (path.empty()) return;
-        DeleteFileA(path.c_str());
-        std::lock_guard<std::mutex> lk(m_);
-        forgetLocked(path);
-    }
-
 private:
-    // `temps_` is the outstanding-scratch-file set, not a log: a long sweep posts
-    // hundreds of jobs, so entries must leave it as the files are deleted or it (and
-    // the %TEMP% directory it mirrors) would grow without bound for the session.
-    void forgetLocked(const std::string& path) {
-        for (size_t i = 0; i < temps_.size(); ++i)
-            if (temps_[i] == path) { temps_[i] = temps_.back(); temps_.pop_back(); return; }
-    }
-
-    void dropLocked(const std::string& path) {
-        if (path.empty()) return;
-        DeleteFileA(path.c_str());
-        forgetLocked(path);
-    }
-
     // Delete `ftrace_viewer_<pid>` directories left behind by viewers that died without
     // running stop() — a crash, or the user killing the process. `stop()` handles the
     // orderly exit, but nothing can clean up after a kill except the *next* run, and a
-    // scene bake drops a multi-megabyte sidecar plus its .obj assets each time, so
+    // scene bake drops a multi-megabyte sidecar plus its mesh assets each time, so
     // without this %TEMP% accumulates them for as long as the machine stands. A PID is
     // reused eventually, hence the liveness probe rather than an age heuristic:
     // OpenProcess failing with ERROR_INVALID_PARAMETER is Windows saying "no such pid".
@@ -2585,6 +2747,12 @@ private:
         FindClose(h);
     }
 
+    // The live channel writes nothing, so this directory is now only a NAMING scheme:
+    // loom builds its mesh paths under it and the same strings become the `file`
+    // arguments in the emitted `.ftsl`, which is what keys the byte overlay ftrace
+    // loads from. It is deliberately still per-pid and still swept, because older
+    // builds *did* write here and because a `mesh_format: "obj"` caller could ask for
+    // files again. Not created: nothing needs it to exist.
     bool makeTempDir(std::string& err) {
         char tmp[MAX_PATH + 1];
         DWORD n = GetTempPathA(MAX_PATH, tmp);
@@ -2592,24 +2760,13 @@ private:
         sweepOrphanTempDirs(tmp);
         char dir[MAX_PATH + 64];
         std::snprintf(dir, sizeof dir, "%sftrace_viewer_%lu", tmp, GetCurrentProcessId());
-        if (!CreateDirectoryA(dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
-            err = "cannot create the viewer scratch directory"; return false;
-        }
         tempDir_ = dir;
         return true;
     }
 
-    // Called on the worker thread, so the bookkeeping must take the lock (tempDir_ is
-    // written once, before the worker exists, and is only cleared after it is joined).
-    std::string scratch(long long seq, const char* ext) {
-        char b[MAX_PATH + 64];
-        std::snprintf(b, sizeof b, "%s\\live_%lld%s", tempDir_.c_str(), seq, ext);
-        std::string p = b;
-        { std::lock_guard<std::mutex> lk(m_); temps_.push_back(p); }
-        return p;
-    }
-
-    std::string requestLine(const char* cmd, const LoomJob& j, const std::string& out) {
+    // `extra` is spliced in before the closing brace, for the per-command fields.
+    std::string requestLine(const char* cmd, const LoomJob& j,
+                            const std::string& extra = std::string()) {
         std::string s = "{\"cmd\":\"";
         s += cmd;
         s += "\",\"clock\":{\"frame\":" + std::to_string(j.frame)
@@ -2618,8 +2775,18 @@ private:
             if (i) s += ",";
             s += "\"" + jsonEsc(j.params[i].first) + "\":" + j.params[i].second;
         }
-        s += "},\"out\":\"" + jsonEsc(out) + "\"}";
+        s += "}" + extra + "}";
         return s;
+    }
+
+    // Move a named object out of an ack rather than copying it. The sidecar is ~900 KB
+    // of parsed tree; `find()` hands back a const pointer, and taking a copy of that
+    // would undo the whole point of parsing it exactly once.
+    static bool stealMember(minijson::Value& ack, const char* key, minijson::Value& out) {
+        if (ack.type != minijson::Value::Object) return false;
+        for (auto& kv : ack.obj)
+            if (kv.first == key) { out = std::move(kv.second); return true; }
+        return false;
     }
 
     void workerMain() {
@@ -2635,25 +2802,40 @@ private:
             }
             LoomResult r;
             r.seq = job.seq;
+            r.payload = std::make_shared<LoomPayload>();
             LARGE_INTEGER f, t0, t1;
             QueryPerformanceFrequency(&f);
             QueryPerformanceCounter(&t0);
             std::string err;
             bool ok = true;
             minijson::Value ack;
-            // A failed request may still have left a partial file behind: drop it here
-            // rather than let it sit in temps_ until the viewer exits.
+            // Both requests come back INLINE — no `out`, so loom writes nothing and the
+            // reply carries the payload. The sidecar rides in the ack's JSON (already
+            // parsed by the time `call` returns, on this thread, off the UI's); the
+            // meshes ride as binary attachments after the ack line, because base64 in
+            // JSON would cost a 4/3 blowup plus an encode and a decode for bytes that
+            // are already exactly what the loader wants.
             if (ok && job.wantSidecar) {
-                std::string out = scratch(job.seq, ".json");
-                ok = link_.call(requestLine("introspect", job, out), ack, err);
-                if (ok) r.sidecarPath = out;
-                else { std::lock_guard<std::mutex> lk(m_); dropLocked(out); }
+                ok = link_.call(requestLine("introspect", job), ack, err);
+                if (ok) r.payload->hasSidecar =
+                            stealMember(ack, "sidecar", r.payload->sidecar);
             }
             if (ok && job.wantSource) {
-                std::string out = scratch(job.seq, ".ftsl");
-                ok = link_.call(requestLine("emit", job, out), ack, err);
-                if (ok) r.sourcePath = out;
-                else { std::lock_guard<std::mutex> lk(m_); dropLocked(out); }
+                std::vector<loomlink::Blob> blobs;
+                // `assets_dir` no longer points anywhere real; it is only how loom
+                // *names* the meshes, and those names are what the overlay is keyed by.
+                std::string extra = ",\"assets_dir\":\"" + jsonEsc(tempDir_)
+                                  + "\",\"assets\":\"inline\"";
+                ok = link_.call(requestLine("emit", job, extra), ack, err, &blobs);
+                if (ok) {
+                    minijson::Value src;
+                    if (stealMember(ack, "source", src) && src.isString()) {
+                        r.payload->source    = std::move(src.str);
+                        r.payload->hasSource = true;
+                    }
+                    for (loomlink::Blob& b : blobs)
+                        r.payload->assets.put(b.name, std::move(b.bytes));
+                }
             }
             QueryPerformanceCounter(&t1);
             r.ms = f.QuadPart ? 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart) : 0.0;
@@ -2663,20 +2845,12 @@ private:
                 std::lock_guard<std::mutex> lk(m_);
                 // A result must never overwrite a FRESHER one the UI has not read yet;
                 // with one job in flight at a time that can't happen, but the guard
-                // makes the invariant explicit rather than incidental.
+                // makes the invariant explicit rather than incidental. Superseding an
+                // unread result now just drops its shared_ptr — there is no scratch
+                // file left over for anyone to have to collect.
                 if (!hasResult_ || r.seq >= result_.seq) {
-                    // Superseding an unread result: the UI will never call reap() for
-                    // its files, so they have to go here or a fast sweep leaves one
-                    // scratch pair per skipped bake behind in %TEMP%.
-                    if (hasResult_) {
-                        dropLocked(result_.sidecarPath);
-                        dropLocked(result_.sourcePath);
-                    }
-                    result_ = r;
+                    result_ = std::move(r);
                     hasResult_ = true;
-                } else {
-                    dropLocked(r.sidecarPath);
-                    dropLocked(r.sourcePath);
                 }
                 running_ = false;
                 if (!ok && !link_.alive()) { dead_ = true; deadErr_ = err; }
@@ -2695,7 +2869,6 @@ private:
     std::string deadErr_;
     long long seq_ = 0;
     std::string tempDir_;
-    std::vector<std::string> temps_;
     std::vector<std::pair<std::string, minijson::Value>> paramDefaults_;
     std::map<std::string, std::string> paramTypes_;
 };
@@ -2782,6 +2955,108 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
         changed = true;
     }
 
+    // --- transport (F8a): play is paced by the bake, not by a timer ---
+    // Starting play must post once to prime the loop: the clock only advances when a
+    // result lands, so with nothing in flight nothing would ever land and play would
+    // sit still. Hence `forced` on the leading edge.
+    const bool wasPlaying = lp.playing;
+    // A one-frame timeline has nowhere to advance to, so play would be a button that
+    // silently does nothing -- the worst kind. Say why instead. `frames` comes from the
+    // sidecar's clock, so the usual cause is a sidecar saved without one.
+    const bool playable = lp.frames > 1;
+    if (!playable) { lp.playing = false; ImGui::BeginDisabled(); }
+    if (ImGui::Button(lp.playing ? "pause" : "play")) lp.playing = !lp.playing;
+    if (!playable) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(playable
+            ? "space; the clock advances one frame per completed bake"
+            : "frames = 1: nothing to play. Raise `frames`, or save the sidecar with a\n"
+              "clock (ViewerModel.save_sidecar(path, Clock.at_frame(0, N))).");
+    ImGui::SameLine();
+    if (ImGui::Button("|<")) { lp.frame = 0; lp.dir = 1; changed = true; }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("rewind to frame 0");
+    ImGui::SameLine();
+    ImGui::Checkbox("loop", &lp.loopPlay);
+    ImGui::SameLine();
+    ImGui::Checkbox("ping-pong", &lp.pingpong);
+
+    // Keyboard: space toggles, arrows step. Guarded on WantTextInput so typing a
+    // value into a drag field doesn't scrub the clock out from under the edit.
+    if (!ImGui::GetIO().WantTextInput) {
+        if (playable && ImGui::IsKeyPressed(ImGuiKey_Space)) lp.playing = !lp.playing;
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && lp.frames > 1) {
+            lp.frame = (lp.frame + 1) % lp.frames; changed = true;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && lp.frames > 1) {
+            lp.frame = (lp.frame + lp.frames - 1) % lp.frames; changed = true;
+        }
+    }
+    if (lp.playing && (!wasPlaying || lp.primePlay)) {
+        forced = true;                 // prime the paced loop
+        lp.playFps = 0.0;              // and don't average across the pause
+        lp.lastAdvanceQpc = 0;
+        lp.primePlay = false;
+    }
+    if (lp.playing) {
+        ImGui::SameLine();
+        if (lp.playFps > 0.0)
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1), "playing %.1f fps", lp.playFps);
+        else
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1), "playing...");
+    }
+    // Where the frame time actually goes. Worth showing rather than leaving to be
+    // guessed at: the intuition is that the .ftsl round trip dominates, and on a
+    // modest mesh it does not -- the Render pane's synchronous raymarch does.
+    {
+        const double acc = lp.lastMs + lp.msSidecar + lp.msFtsl + lp.msRender;
+        // Show the MEASURED period beside the parts, and the residual explicitly.
+        // A breakdown that silently omits the gap between "what I timed" and "what
+        // it actually costs" is the same dishonesty as deriving fps from the bake.
+        if (lp.playing && lp.playFps > 0.0) {
+            const double period = 1000.0 / lp.playFps;
+            ImGui::TextDisabled(
+                "frame %.0f ms = bake %.0f + sidecar %.0f + ftsl %.0f + raymarch %.0f + other %.0f",
+                period, lp.lastMs, lp.msSidecar, lp.msFtsl, lp.msRender,
+                (period - acc > 0.0 ? period - acc : 0.0));
+        } else {
+            ImGui::TextDisabled("bake %.0f + sidecar %.0f + ftsl %.0f + raymarch %.0f = %.0f ms",
+                                lp.lastMs, lp.msSidecar, lp.msFtsl, lp.msRender, acc);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "bake     loom: build() + emit + introspect (its own process)\n"
+                "sidecar  parse the introspection JSON, rebuild the DAG and skin buffers\n"
+                "ftsl     parse the .ftsl and load its mesh assets\n"
+                "raymarch the Render tab re-tracing the scene on the UI thread.\n"
+                "         Only charged while that tab is open -- switch to Meshes\n"
+                "         to play without it.\n"
+                "other    the residual against the measured play period: IPC with the\n"
+                "         loom process, writing/reading the sidecar + OBJ through the\n"
+                "         filesystem, and the wait for vblank.");
+        // Break the raymarch open. Without this the single `raymarch` number invites
+        // exactly one wrong conclusion -- that the .ftsl round trip is secondary --
+        // which cannot be checked, because the three phases inside it scale with
+        // different things and only one of them is affected by other GPU users.
+        if (lp.msRender > 0.0) {
+            ImGui::TextDisabled("   raymarch %.0f = upload %.0f + kernel %.0f + readback %.0f",
+                                lp.msRender, lp.msRenderUpload, lp.msRenderKernel,
+                                lp.msRenderRead);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "upload   re-marshal the WHOLE scene (tris, BVH, materials, every\n"
+                    "         texel) and push it across PCIe -- every frame, even when\n"
+                    "         only the camera moved. Scales with SCENE size, not pixels.\n"
+                    "kernel   the raymarch. Scales with PIXELS (see `play res`). This is\n"
+                    "         the ONLY phase another process on the GPU can inflate, so\n"
+                    "         if it dwarfs the rest, check the card is actually idle\n"
+                    "         before concluding the raymarch is the bottleneck.\n"
+                    "readback D2H of accum/z/emissive + the host tone map. Pixels; CPU.\n"
+                    "\n"
+                    "Compare `upload` against bake+sidecar+ftsl to see whether caching\n"
+                    "the scene on the device would actually buy anything for THIS scene.");
+        }
+    }
+
     // --- the build's declared params ---
     if (lp.params.empty()) {
         ImGui::TextDisabled("(the build declares no keyword params)");
@@ -2822,7 +3097,8 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
 // --------------------------------------------------------------------------
 // Entry point
 // --------------------------------------------------------------------------
-int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
+int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
+                 bool startPlaying) {
     Sidecar sc;
     if (!sc.load(sidecarPath)) {
         std::fprintf(stderr, "error: -viewer: %s\n", sc.err.c_str());
@@ -2931,8 +3207,8 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
     // F4 skins — needs the device, so it happens after CreateDeviceD3D. Relative
     // image paths in the sidecar fall back to the sidecar's own directory.
     // baseDir is hoisted out because a live re-derivation rebuilds the skins against
-    // the SAME directory — loom's scratch sidecar lives in %TEMP%, but the image paths
-    // in it are still relative to the original scene, not to the scratch file.
+    // the SAME directory — a re-derived sidecar has no file of its own at all (it comes
+    // down the pipe), and its image paths were always relative to the original scene.
     std::string baseDir;
     {
         size_t cut = sidecarPath.find_last_of("/\\");
@@ -2945,21 +3221,28 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
     // is the GEOMETRY; the VIEW is ours, so orbit / zoom / dim selection / tab choice are
     // deliberately preserved — a parameter sweep that snapped the camera back to its
     // default on every bake would be unusable.
-    auto adoptSidecar = [&](const std::string& path) -> bool {
+    auto adoptSidecar = [&](minijson::Value&& tree) -> bool {
         Sidecar ns;
-        if (!ns.load(path)) { live.lastErr = "sidecar: " + ns.err; return false; }
+        {
+            MsTimer _t(&live.msAdoptJson);
+            if (!ns.adopt(std::move(tree))) { live.lastErr = "sidecar: " + ns.err; return false; }
+        }
         std::vector<int> oldIds;
         for (const auto& n : dag.nodes) oldIds.push_back(n.id);
 
         sc = std::move(ns);
-        curves = collectCurves(sc);
-        strips = buildStrips(curves);
-        fields = collectFields(sc);
-        meshes = collectMeshes(sc);
-        ++mview.geomGen;   // a NEW tessellation -> the mesh pane must re-upload its buffers
-        for (const auto& c : curves) view.maxDim  = std::max(view.maxDim,  c.dim);
-        for (const auto& f : fields) fview.maxDim = std::max(fview.maxDim, f.dim);
+        {
+            MsTimer _t(&live.msAdoptGeom);
+            curves = collectCurves(sc);
+            strips = buildStrips(curves);
+            fields = collectFields(sc);
+            meshes = collectMeshes(sc);
+            ++mview.geomGen;   // a NEW tessellation -> the mesh pane must re-upload its buffers
+            for (const auto& c : curves) view.maxDim  = std::max(view.maxDim,  c.dim);
+            for (const auto& f : fields) fview.maxDim = std::max(fview.maxDim, f.dim);
+        }
 
+        MsTimer _tdag(&live.msAdoptDag);
         DagGraph nd = collectDag(sc);
         std::vector<int> newIds;
         for (const auto& n : nd.nodes) newIds.push_back(n.id);
@@ -2981,11 +3264,25 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
         }
         nd.maximized = dag.maximized;
         dag = std::move(nd);
+        _tdag.stop();
 
-        skins.release();
-        skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
+        {
+            MsTimer _t(&live.msAdoptSkins);
+            skins.release();
+            skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
+        }
         return true;
     };
+
+    // `-play`: open with the transport already running. Only meaningful once the
+    // clock has somewhere to go and there is a live channel to re-derive through --
+    // a frozen sidecar has no frames to bake, so silently "playing" it would be a lie.
+    if (startPlaying) {
+        if (live.up && live.frames > 1) { live.playing = true; live.primePlay = true; }
+        else std::fprintf(stderr, "[play] ignoring -play: %s\n",
+                          !live.up ? "no live loom channel (-loom, or a sidecar `build` key)"
+                                   : "the sidecar advertises frames = 1 (saved without a clock)");
+    }
 
     bool done = false;
     bool firstFrame = true;   // one-shot: default-select the primary geometry tab
@@ -2998,6 +3295,9 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
         }
         if (done) break;
 
+        // Set when paced play steps the clock below; OR'd into `livePost` so the next
+        // frame's bake is requested through the single post site like any other change.
+        bool livePlayPost = false;
         // Fold in whatever loom finished since the last frame. The UI never waits on a
         // bake — it keeps drawing the geometry it already has and adopts the new one on
         // whatever frame it lands.
@@ -3008,12 +3308,24 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
                 ++live.baked;
                 live.lastMs  = r.ms;
                 live.lastErr = r.ok ? std::string() : r.err;
-                if (r.ok) {
-                    if (!r.sidecarPath.empty()) adoptSidecar(r.sidecarPath);
-                    if (!r.sourcePath.empty()) {
+                if (r.ok && r.payload) {
+                    if (r.payload->hasSidecar) {
+                        MsTimer _t(&live.msSidecar);
+                        adoptSidecar(std::move(r.payload->sidecar));
+                    }
+                    if (r.payload->hasSource) {
                         ftsl::Loaded nl;
                         std::string  nerr;
-                        if (ftsl::load(r.sourcePath, nl, nerr)) {
+                        ftsl::LoadTiming lt;
+                        MsTimer _t(&live.msFtsl);
+                        // The overlay is why nothing here opens a file: every `mesh`
+                        // the emitted source names came down the pipe with it.
+                        if (ftsl::loadSource(r.payload->source, "<loom live>", nl, nerr,
+                                             {}, &lt, &r.payload->assets)) {
+                            live.msFtslParse  = lt.msParse;
+                            live.msFtslBuild  = lt.msBuild;
+                            live.msFtslAssets = lt.msAssets;
+                            live.msFtslAccel  = lt.msAccel;
                             loaded  = std::move(nl);
                             sceneOk = true;
                             sceneErr.clear();
@@ -3032,8 +3344,13 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
                         }
                     }
                 }
-                bridge.reap(r.sidecarPath);
-                bridge.reap(r.sourcePath);
+                r.payload.reset();   // last reference: the ~1 MB frame goes here
+                // F8(a): a bake landed, so the clock may take its next step. Doing it
+                // HERE -- rather than on a timer -- is what makes play show every
+                // frame instead of only the ones that won the latest-wins slot. A
+                // failed bake still advances: stalling on a bad frame would look like
+                // a hang, and the error is already on screen.
+                if (live.playing) { liveAdvanceClock(live); livePlayPost = true; }
             }
         }
 
@@ -3051,13 +3368,16 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
         ImGui::Text("sidecar: %s", sidecarPath.c_str());
         ImGui::Separator();
 
-        bool livePost = false;    // something the geometry depends on moved this frame
+        // Something the geometry depends on moved this frame. Seeded from the paced-play
+        // step because `drawLivePanel` is inside a CollapsingHeader: seeding it there
+        // instead would make collapsing the panel silently stop playback.
+        bool livePost = livePlayPost;
 
         float leftW = ImGui::GetContentRegionAvail().x * 0.42f;
         ImGui::BeginChild("left", ImVec2(leftW, 0), true);
         if (ImGui::CollapsingHeader("Live (loom)",
                                     live.up ? ImGuiTreeNodeFlags_DefaultOpen : 0))
-            livePost = drawLivePanel(live, bridge);
+            livePost = drawLivePanel(live, bridge) || livePost;
         if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen))
             drawScenePanel(sc);
         if (ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen))
@@ -3202,6 +3522,59 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene) {
         if (livePost && live.up && bridge.linkUp()) {
             bridge.post(liveJob(live, /*wantSidecar=*/true, liveWantSource));
             ++live.posted;
+        }
+
+        // The Render tab has stopped drawing (collapsed, or another tab selected),
+        // so its cost is no longer being paid -- stop reporting the stale figure.
+        if (!live.renderTabDrew) {
+            live.msRender = 0.0;
+            live.msRenderUpload = live.msRenderKernel = live.msRenderRead = 0.0;
+        }
+        live.renderTabDrew = false;
+
+        // Echo the same breakdown to stdout about once a second while playing. The
+        // panel shows it live, but a printed trace is what you can actually diff
+        // between builds, capture from a script, or read back after the fact.
+        if (live.playing && live.playFps > 0.0) {
+            static double lastLog = 0.0;
+            const double now = ImGui::GetTime();
+            if (now - lastLog > 1.0) {
+                lastLog = now;
+                const double period = 1000.0 / live.playFps;
+                const double acc = live.lastMs + live.msSidecar + live.msFtsl + live.msRender;
+                std::printf("[play] %5.1f fps  %6.1f ms = bake %.0f + sidecar %.0f + "
+                            "ftsl %.0f + raymarch %.0f + other %.0f\n",
+                            live.playFps, period, live.lastMs, live.msSidecar,
+                            live.msFtsl, live.msRender,
+                            (period - acc > 0.0 ? period - acc : 0.0));
+                // The raymarch broken open, on its own line. A printed trace is what
+                // gets diffed between builds and quoted afterwards, so it must carry
+                // the same detail as the panel -- a bare `raymarch N` in the log is
+                // what let an SM-contention artefact get read as a real ranking.
+                if (live.msRender > 0.0) {
+                    std::printf("[play]        raymarch %.0f = upload %.0f (scene) + "
+                                "kernel %.0f (pixels) + readback %.0f\n",
+                                live.msRender, live.msRenderUpload,
+                                live.msRenderKernel, live.msRenderRead);
+                }
+                // ...and sidecar adoption, the biggest term of all, on the same terms.
+                if (live.msSidecar > 0.0) {
+                    std::printf("[play]        sidecar %.0f = json %.0f + geom %.0f + "
+                                "dag %.0f + skins %.0f\n",
+                                live.msSidecar, live.msAdoptJson, live.msAdoptGeom,
+                                live.msAdoptDag, live.msAdoptSkins);
+                }
+                // ...and the .ftsl reload. `rest` is the Builder's own work with the two
+                // nested phases (asset file loading, BVH build) taken back out.
+                if (live.msFtsl > 0.0) {
+                    std::printf("[play]        ftsl %.0f = parse %.0f + assets %.0f + "
+                                "accel %.0f + rest %.0f\n",
+                                live.msFtsl, live.msFtslParse, live.msFtslAssets,
+                                live.msFtslAccel,
+                                live.msFtslBuild - live.msFtslAssets - live.msFtslAccel);
+                }
+                std::fflush(stdout);
+            }
         }
 
         ImGui::Render();

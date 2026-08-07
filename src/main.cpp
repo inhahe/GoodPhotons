@@ -134,7 +134,16 @@
 #include <memory>
 #include <atomic>              // -stop: cross-thread flags for the external stop channel
 #include <filesystem>          // -review: scan a directory of rendered frames
+
+// Baked in by CMake from the repo-root VERSION file (see CMakeLists.txt). The
+// fallback only fires for a hand-rolled compile outside the CMake build; a real
+// build.bat binary always carries the real number.
+#ifndef FTRACE_VERSION
+#define FTRACE_VERSION "unknown"
+#endif
+
 #include "scene.h"
+#include "parallel.h"           // ft::setStopProbe — lets load-time loops see the stop flag
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
 #include "watertight.h"         // -check-watertight: report non-airtight meshes/isosurfaces
 #include "airtight.h"           // -check-airtight: ray-parity audit of the marched isosurface field
@@ -1478,7 +1487,39 @@ static int checkUpsample() {
                 "out of scope");
     }
 
-    bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH;
+    // (i) BULK fit: upsample::fitMany (the deduplicating, threaded path every image
+    // texture's reflectance coefficients go through) must agree with a plain per-texel
+    // upsample::fit BIT-FOR-BIT. It is an optimization, not a method: the dedup key is
+    // the colour's raw bit pattern and the workers write disjoint entries, so anything
+    // other than exact equality means the hash collapsed two colours that differ, or a
+    // worker wrote outside its range. The synthetic image below is built the way a real
+    // 8-bit texture is — a small palette of colours repeated over many texels, plus a
+    // tail of all-distinct ones — so it exercises both the dedup hit and miss paths, and
+    // is sized past parallelFor's serial cutoff so the threaded path is what runs.
+    bool passI = true;
+    {
+        std::vector<Vec3> img;
+        img.reserve(40000);
+        for (int i = 0; i < 32000; ++i) {          // 40 distinct colours, 800x each
+            int k = i % 40;
+            img.push_back(Vec3{k / 39.0, 1.0 - k / 39.0, (k * 7 % 40) / 39.0});
+        }
+        for (int i = 0; i < 8000; ++i)             // 8000 all-distinct colours
+            img.push_back(Vec3{i / 7999.0, (i * 3 % 7999) / 7999.0, (i * 11 % 7999) / 7999.0});
+
+        std::vector<std::array<double, 3>> bulk(img.size());
+        bool done = upsample::fitMany(img.data(), img.size(), bulk.data());
+        size_t bad = 0;
+        for (size_t i = 0; i < img.size(); ++i) {
+            std::array<double, 3> ref = upsample::fit(img[i].x, img[i].y, img[i].z);
+            if (bulk[i][0] != ref[0] || bulk[i][1] != ref[1] || bulk[i][2] != ref[2]) ++bad;
+        }
+        passI = (bad == 0) && done;
+        std::printf("[checkupsample] bulk fitMany vs per-texel fit: %zu texels, %zu differing%s\n",
+                    img.size(), bad, done ? "" : " (STOPPED early)");
+    }
+
+    bool pass = passA && passB && passW && passC && passD && passE && passF && passG && passH && passI;
     std::printf("[checkupsample] round-trip max error (excl. white) = %.5f  (%s)\n", maxErr, passA ? "ok" : "BAD");
     std::printf("[checkupsample] reflectance in [0,1]  (%s)\n", passB ? "ok" : "BAD");
     std::printf("[checkupsample] pure-white residual = %.5f (<0.02 expected)  (%s)\n", whiteErr, passW ? "ok" : "BAD");
@@ -1489,6 +1530,7 @@ static int checkUpsample() {
     std::printf("[checkupsample] meng round-trip max error = %.5f (excl. white %.5f); smoother than JH: %s  (%s)\n",
                 mengErr, mengWhiteErr, mengSmoother ? "yes" : "NO", passG ? "ok" : "BAD");
     std::printf("[checkupsample] user-declared `upsample` blocks  (%s)\n", passH ? "ok" : "BAD");
+    std::printf("[checkupsample] bulk fit is bit-identical to the serial fit  (%s)\n", passI ? "ok" : "BAD");
     std::printf("[checkupsample] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
@@ -3127,9 +3169,6 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
                                        double* outExposure = nullptr) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin = filmToLinear(f, N);
-    std::vector<double> lum; lum.reserve((size_t)W * H);
-    for (size_t i = 0; i < lin.size(); ++i)
-        lum.push_back(std::max({lin[i].x, lin[i].y, lin[i].z, 0.0}));
     double eAuto;
     double exposure;
     if (absolute) {
@@ -3142,8 +3181,24 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
     if (lockAnchor && *lockAnchor > 0.0) {
         eAuto = *lockAnchor;                       // reuse the path's locked anchor
     } else {
-        std::vector<double> sorted = lum; std::sort(sorted.begin(), sorted.end());
-        double p99 = sorted[(size_t)(0.99 * (sorted.size() - 1))];
+        // The per-pixel luminances exist ONLY to locate this one order statistic, so they
+        // are built here rather than unconditionally: an absolute-EV render and a
+        // camera_path frame with a locked anchor both skip the pass and the allocation
+        // outright. And since a single order statistic is all that is wanted, a full sort
+        // is O(n log n) of wasted work — nth_element partitions in O(n) and guarantees the
+        // element at that index is exactly the one a full sort would have put there, so
+        // the anchor is bit-for-bit identical. It also partitions `lum` in place, so the
+        // extra whole-image copy the old code made to sort goes away too.
+        //
+        // Worth doing because this runs on every image write AND (now that the live window
+        // has its own repaint cadence) several times a second during a render: at 480x480
+        // the sort alone was the bulk of a ~40 ms repaint.
+        std::vector<double> lum((size_t)W * H);
+        for (size_t i = 0; i < lin.size(); ++i)
+            lum[i] = std::max({lin[i].x, lin[i].y, lin[i].z, 0.0});
+        const size_t k = (size_t)(0.99 * (lum.size() - 1));
+        std::nth_element(lum.begin(), lum.begin() + k, lum.end());
+        double p99 = lum[k];
         eAuto = (p99 > 0) ? 0.9 / p99 : 1.0;
         if (lockAnchor) *lockAnchor = eAuto;       // first frame sets the anchor
     }
@@ -3515,14 +3570,49 @@ static void warnWhittedHeroCollapse(const Scene& scene) {
 // shared kernel doesn't implement the per-camera resample yet).
 static bool g_beamGather = false;
 
-// Enable ANSI/virtual-terminal escape processing so the preview renders in a plain
-// Windows console (conhost/cmd), not only in Windows Terminal. No-op elsewhere.
+#ifdef _WIN32
+// The console's ORIGINAL output code page, kept so it can be put back. The setting is
+// process-wide but the CONSOLE OUTLIVES THE PROCESS, so leaving it switched would quietly
+// change how every later command in that shell prints -- not a renderer's business to do.
+static UINT g_prevConsoleCP = 0;
+static void restoreConsoleOutputCP() {
+    if (g_prevConsoleCP) { SetConsoleOutputCP(g_prevConsoleCP); g_prevConsoleCP = 0; }
+}
+#endif
+
+// Make the console able to PRINT WHAT WE ACTUALLY EMIT. Windows needs two separate switches
+// here and missing either one corrupts the output in a different way:
+//   * ENABLE_VIRTUAL_TERMINAL_PROCESSING makes it INTERPRET ANSI escapes instead of echoing
+//     them, which is what colours the preview; and
+//   * SetConsoleOutputCP(CP_UTF8) makes it DECODE our bytes as UTF-8.
+// Only the first was ever set, and the resulting bug was invisible from any redirected run.
+// `-preview` draws with U+2580 UPPER HALF BLOCK, emitted as the raw bytes E2 96 80, and a
+// default console (code page 437) decodes each of those as its OWN character -- so the
+// thumbnail came out as a field of "Gamma u C" mojibake with the correct colours behind it,
+// which looks like a font problem and is not. Piped to a file the identical bytes are
+// correct, which is why this survived: every automated run redirects.
+//
+// It was never confined to the preview either. Three dozen ordinary status lines carry an
+// em dash (U+2014, bytes E2 80 94) -- including `[stop] running renders -- stop one with
+// ...`, i.e. the help text for the one command that must work when something has gone wrong
+// -- and those printed as three characters of soup on any console at its default code page.
+// So this is called once from main() rather than only when -preview is on.
 static void enableAnsiTerminal() {
 #ifdef _WIN32
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD m = 0;
     if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &m))
         SetConsoleMode(h, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    // GetConsoleOutputCP returns 0 when no console is attached (output redirected to a file
+    // or a pipe) and SetConsoleOutputCP then fails harmlessly -- in that case the raw UTF-8
+    // bytes go straight to the file, which is already what is wanted.
+    if (!g_prevConsoleCP) {
+        UINT cur = GetConsoleOutputCP();
+        if (cur && cur != CP_UTF8 && SetConsoleOutputCP(CP_UTF8)) {
+            g_prevConsoleCP = cur;
+            std::atexit(restoreConsoleOutputCP);
+        }
+    }
 #endif
 }
 static void ansiPreview(const Film& f, double N, double expComp, const char* status) {
@@ -4244,11 +4334,111 @@ static const char* modeLabel(char m) {
         default:  return "";
     }
 }
+// How often the live window may repaint. This is deliberately SEPARATE from -interval,
+// which governs the crash-safe PNG + .ftbuf write, because the two want opposite
+// cadences: writing a PNG and a multi-megabyte checkpoint every fifth of a second would
+// thrash the disk for nothing, while repainting a window only every 15 s defeats the
+// point of having one.
+//
+// They used to share -interval, and the result was that any render finishing FASTER than
+// one interval never showed a single live frame: the drivers only touched the window
+// inside their `done || sinceSave >= intervalSec` block, so a 5 s mode-W frame under
+// `-interval 8` painted exactly once, at the end, and then the process exited.
+//
+// And because the window is created LAZILY on the first update (see liveWindowUpdate),
+// "painted once, at the end" also meant "created once, at the end": in the ray-traced
+// modes no window existed at all until the render was already over, so what the user saw
+// was a window flashing up as the process exited rather than a slow live view. Only the
+// raster/-explore path popped up an early placeholder. liveWindowPlaceholder() below now
+// does that for every mode.
+static double g_windowIntervalSec = 0.2;      // -window-interval
+// Repainting is not free: filmToRgb8 tone-maps every pixel (spectral upsample + exposure
+// + gamma) and the blit copies the frame again, which is microseconds at 480x480 and tens
+// of milliseconds at 4K. So the floor is the LARGER of the requested interval and a
+// multiple of what the last repaint actually cost, which keeps the live view from eating
+// a meaningful share of a big render's wall clock without needing the user to know that
+// resolution changes the right answer.
+static constexpr double kWindowRepaintBudget = 12.0;   // spend <= ~1/12 of wall time painting
+static std::chrono::steady_clock::time_point g_lastWindowPaint{};
+static double g_lastWindowPaintSec = 0.0;
+
+// True when the window is open and enough time has passed to repaint it. Callers test
+// this BEFORE assembling the display film, because for a resumed render that assembly is
+// a full film copy + merge — cheap at 480x480, but not something to do 5x a second at 4K
+// only to throw it away.
+static bool liveWindowDue() {
+    if (!g_showWindow) return false;
+    if (g_lastWindowPaint.time_since_epoch().count() == 0) return true;   // never painted
+    const double since = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - g_lastWindowPaint).count();
+    return since >= std::max(g_windowIntervalSec,
+                             kWindowRepaintBudget * g_lastWindowPaintSec);
+}
+
+// Some drivers have to do real work just to HAVE something to paint: composite an env
+// background, or (the shared multi-camera forward path) pull every camera's film back
+// from the device. liveWindowUpdate can only time its own tone-map + blit, so those
+// callers time the whole prepare-and-paint block and report the total here. The budget
+// then backs the repaint rate off on its own when preparing is the expensive part —
+// which is the difference between a live view that costs 8% of a flythrough and one that
+// re-downloads a gigabyte of films five times a second.
+static void liveWindowNotePaintCost(double sec) {
+    if (sec > g_lastWindowPaintSec) g_lastWindowPaintSec = sec;
+}
+
+// True once a real rendered frame has reached the window. Deliberately NOT the same test
+// as `g_liveWin != nullptr`: the placeholder below creates the window long before there is
+// an image, and the FIRST real paint is still the cold one (lazy spectral tables, untouched
+// framebuffer) whose cost must not be fed into the repaint budget.
+static bool g_windowPainted = false;
+
+// Put the window on screen NOW, before the work that will fill it.
+//
+// The window used to be born inside liveWindowUpdate, i.e. on the first repaint. Everything
+// before that first repaint therefore happened with no window at all: the BVH build, the
+// GPU scene bake and upload, the spectral texel upsample, and then the whole first render
+// chunk. For a deterministic mode-W frame — where the first chunk IS essentially the final
+// image — that meant the window appeared only as the render finished, which reads as the
+// image flashing up for a split second rather than converging. Showing a dark placeholder
+// up front costs one window creation (~340 ms, once) and makes the whole render watchable,
+// with the title bar naming the stage so a long silent setup phase is legible instead of
+// looking hung.
+//
+// Does NOT stamp g_lastWindowPaint: the placeholder is not an image, so the first real
+// frame should land the instant it exists rather than waiting out a window interval.
+static void liveWindowPlaceholder(int w, int h, const std::string& stage) {
+    if (!g_showWindow || w <= 0 || h <= 0) return;
+    if (!g_liveWin) {
+        // Near-black rather than pure black so an empty window is visibly a window that is
+        // waiting, not a dead rectangle or a hole punched in the desktop.
+        std::vector<uint8_t> placeholder((size_t)w * h * 3);
+        for (size_t i = 0; i < placeholder.size(); i += 3) {
+            placeholder[i] = 24; placeholder[i + 1] = 26; placeholder[i + 2] = 30;
+        }
+        g_liveWin = std::make_unique<LiveWindow>(w, h, g_windowTitle.c_str());
+        g_liveWin->update(w, h, placeholder);
+    }
+    // Re-title even when the window already exists: callers use this to advance the stage
+    // ("preparing" -> "tessellating (3/8)" -> the render's own progress line).
+    if (!g_liveWin->closed())
+        g_liveWin->setTitle(stage.empty() ? g_windowTitle
+                                          : g_windowTitle + "  \xE2\x80\x94  " + stage);
+}
+
 static void liveWindowUpdate(const Film& f, double N, double expComp, bool absolute,
                              const char* status = nullptr) {
     if (!g_showWindow || N <= 0.0) return;
+    // Creating the window is a ONE-TIME cost (register the class, size the DIB, show it)
+    // and must not be timed: it measured 342 ms against a 45 ms steady-state repaint, and
+    // feeding that into the cost budget set the floor to 4 s — which on a 5 s frame meant
+    // the second repaint was also the last one. Time only the part that recurs.
+    // NB: this asks "has a real frame been shown yet", not "does the window exist" — the
+    // placeholder may already have created it, and the cold-cost exclusion below still has
+    // to apply to the first *image*.
+    const bool firstPaint = !g_windowPainted;
     if (!g_liveWin)
         g_liveWin = std::make_unique<LiveWindow>(f.resX, f.resY, g_windowTitle.c_str());
+    const auto tPaint = std::chrono::steady_clock::now();
     // Per-frame auto-expose (nullptr anchor) so the live view tracks the converging
     // image the same way the ANSI preview does.
     std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr);
@@ -4259,6 +4449,25 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     if (status && *status)         t += "  \xE2\x80\x94  " + std::string(status);
     g_liveWin->setTitle(t);
     if (g_liveWin->closed()) g_stopRequested = 1;
+    g_lastWindowPaint = std::chrono::steady_clock::now();
+    const double cost = std::chrono::duration<double>(g_lastWindowPaint - tPaint).count();
+    // The first repaint still runs cold — lazy spectral tables, an untouched framebuffer —
+    // so it is not representative of the next one either. Let it through unbudgeted and
+    // start predicting from the second, which is the first one that actually repeats.
+    if (!firstPaint) g_lastWindowPaintSec = cost;
+    g_windowPainted = true;
+    // FTRACE_WINDOW_DEBUG=1 logs every repaint (same convention as FTRACE_CHUNK_DEBUG in
+    // render_cuda.cu). Whether the live view is actually updating is otherwise only
+    // observable by watching the screen, which is exactly the kind of thing that silently
+    // stops working — this is how the "paints once, at the end" bug is checked for.
+    static const bool dbg = [] { const char* e = std::getenv("FTRACE_WINDOW_DEBUG");
+                                 return e && *e && std::strcmp(e, "0"); }();
+    if (dbg) {
+        static int nPaint = 0;
+        std::fprintf(stderr, "[window] repaint #%d at N=%.0f (%.1f ms to tone-map+blit%s)\n",
+                     ++nPaint, N, cost * 1e3, firstPaint ? ", cold — not budgeted" : "");
+        std::fflush(stderr);
+    }
 }
 
 // --- Resumable-render checkpoint (.ftbuf sidecar) -----------------------------
@@ -4816,22 +5025,17 @@ static int runSppProgressive(
         if (noiseMet) metNoise = true;
         bool stop = stopped || timeUp || noiseMet;
         bool done = stop || final;
-        if (done || sinceSave >= intervalSec) {
+        // Two independent cadences (see g_windowIntervalSec): -interval drives the
+        // crash-safe write and the status line, while the window repaints far more often
+        // so the image is actually watchable. A frame that finishes inside one -interval
+        // used to paint only on `done`, i.e. once, as the process was exiting.
+        bool wantSave = done || sinceSave >= intervalSec;
+        bool wantWin  = done || liveWindowDue();
+        if (wantSave || wantWin) {
             // Combine the loaded base film (if resuming) with the fresh SUM before display.
             const Film* shown = &film;
             Film combined;
             if (haveBase) { combined = film; combined.merge(base.film); shown = &combined; }
-            // The converged/stopping frame owns the exposure anchor; intermediate frames
-            // auto-expose independently (they only refine, never lock the anchor).
-            writeOk = writeFilm(outPath.c_str(), *shown, (double)totalSpp, manualExposure,
-                                /*quiet*/preview, done ? exposureAnchor : nullptr, absolute);
-            if (wantCheckpoint) {
-                Checkpoint save; save.film = *shown; save.N = totalSpp;
-                if (!writeCheckpoint(outPath, save, guard, mode))
-                    std::fprintf(stderr, "[checkpoint] could not write %s\n",
-                                 checkpointPath(outPath).c_str());
-            }
-            lastSave = clk::now();
             const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
             char st[220];
             if (runForever)
@@ -4846,9 +5050,26 @@ static int runSppProgressive(
             else
                 std::snprintf(st, sizeof st, "[spp] %lld / %lld, %.1fs, %s",
                               totalSpp, baseSpp + sppReq, elapsed, nz);
-            if (preview) ansiPreview(*shown, (double)totalSpp, manualExposure, st);
-            else { std::printf("%s\n", st); std::fflush(stdout); }
-            liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute, st);
+            if (wantSave) {
+                // The converged/stopping frame owns the exposure anchor; intermediate frames
+                // auto-expose independently (they only refine, never lock the anchor).
+                writeOk = writeFilm(outPath.c_str(), *shown, (double)totalSpp, manualExposure,
+                                    /*quiet*/preview, done ? exposureAnchor : nullptr, absolute);
+                if (wantCheckpoint) {
+                    Checkpoint save; save.film = *shown; save.N = totalSpp;
+                    if (!writeCheckpoint(outPath, save, guard, mode))
+                        std::fprintf(stderr, "[checkpoint] could not write %s\n",
+                                     checkpointPath(outPath).c_str());
+                }
+                lastSave = clk::now();
+                // The ANSI thumbnail and the status line stay on the -interval cadence:
+                // both go to stdout, which is a LOG as often as it is a terminal, and a
+                // 5 Hz repaint that is nice on screen is thousands of junk lines in a
+                // piped build log.
+                if (preview) ansiPreview(*shown, (double)totalSpp, manualExposure, st);
+                else { std::printf("%s\n", st); std::fflush(stdout); }
+            }
+            if (wantWin) liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute, st);
         }
         return stop;
     };
@@ -4928,15 +5149,19 @@ static int runCompositeProgressive(
     bool metNoise = false;
     long long batchSpp = 1;   // adapts toward ~0.5 s of combined work per iteration
 
-    auto writeOut = [&](bool done) {
-        Film comp = compositeFromFilms(acc.fwd, std::max(acc.N, 1LL), acc.ref,
-                                       std::max(acc.spp, 1LL), cc, envScene, /*verbose*/done);
+    // Compositing is split from persisting so the live window can repaint on its own
+    // (much faster) cadence without also rewriting the PNG and the dual-film sidecar —
+    // see g_windowIntervalSec.
+    auto compose = [&](bool done) {
+        return compositeFromFilms(acc.fwd, std::max(acc.N, 1LL), acc.ref,
+                                  std::max(acc.spp, 1LL), cc, envScene, /*verbose*/done);
+    };
+    auto persist = [&](const Film& comp, bool done) {
         writeOk = writeFilm(outPath.c_str(), comp, 1.0, manualExposure, /*quiet*/preview,
                             done ? exposureAnchor : nullptr, absolute);
         if (wantCheckpoint && !writeCompositeCheckpoint(outPath, acc, guard))
             std::fprintf(stderr, "[checkpoint] could not write %s\n",
                          checkpointPath(outPath).c_str());
-        return comp;
     };
 
     for (;;) {
@@ -4947,7 +5172,7 @@ static int runCompositeProgressive(
             long long remN   = Nreq   - acc.N;   if (remN   < 0) remN   = 0;
             dSpp = std::min(dSpp, remSpp);
             dN   = std::min(dN,   remN);
-            if (dSpp == 0 && dN == 0) { writeOut(/*done*/true); break; }  // both budgets met
+            if (dSpp == 0 && dN == 0) { persist(compose(/*done*/true), true); break; }  // both budgets met
         }
         auto tb = clk::now();
         if (dN > 0) {   // forward model-B layer (seedBase = cumulative photons, like A/B/C)
@@ -4994,10 +5219,10 @@ static int runCompositeProgressive(
         bool noiseMet = (noiseTarget > 0.0 && acc.spp > 0 && noisePct <= noiseTarget);
         if (noiseMet) metNoise = true;
         bool done = stopped || timeUp || noiseMet;
-        bool wantStatus = sinceSave >= intervalSec;
-        if (done || wantStatus) {
-            Film comp = writeOut(done);
-            lastSave = clk::now();
+        bool wantSave = done || sinceSave >= intervalSec;
+        bool wantWin  = done || liveWindowDue();      // window repaints on its own cadence
+        if (wantSave || wantWin) {
+            Film comp = compose(done);
             const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)" : "";
             char st[220];
             if (runForever)
@@ -5012,9 +5237,13 @@ static int runCompositeProgressive(
             else
                 std::snprintf(st, sizeof st, "[spp] %lld / %lld spp (%lld / %lld photons), %.1fs, ~%.2f%% noise",
                               acc.spp, sppReq, acc.N, Nreq, elapsed, noisePct);
-            if (preview) ansiPreview(comp, 1.0, manualExposure, st);
-            else { std::printf("%s\n", st); std::fflush(stdout); }
-            liveWindowUpdate(comp, 1.0, manualExposure, absolute, st);
+            if (wantSave) {
+                persist(comp, done);
+                lastSave = clk::now();
+                if (preview) ansiPreview(comp, 1.0, manualExposure, st);
+                else { std::printf("%s\n", st); std::fflush(stdout); }
+            }
+            if (wantWin) liveWindowUpdate(comp, 1.0, manualExposure, absolute, st);
         }
         if (done) break;
     }
@@ -5050,6 +5279,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      double* exposureAnchor = nullptr, bool rgbBackward = false,
                      int maxBounceOverride = -1, bool directOnly = false) {
     g_windowMode = modeLabel(mode);   // title bar shows the transport mode of this frame
+    // Make sure the window is up (and naming this frame) before the first chunk rather than
+    // after it — see liveWindowPlaceholder. Normally a no-op re-title, since run() already
+    // created it; this also covers any path that reaches a render without going through
+    // that dispatch.
+    liveWindowPlaceholder(res, resY, g_windowMode + " \xE2\x80\x94 starting\xE2\x80\xA6");
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'D' || refMode);
     const bool forwardCatch = (mode == 'C');
@@ -5814,6 +6048,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             bool stopped = g_stopRequested != 0;
             bool timeUp  = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
             bool wantStatus = sinceSave >= intervalSec;
+            bool wantWin    = liveWindowDue();   // window repaints on its own cadence
             // Cheap graininess estimate: Monte-Carlo relative error at an illuminated
             // pixel falls as 1/sqrt(samples), and the per-pixel photon (hit) count is
             // that sample count, so 100/sqrt(mean hits over lit pixels) is an honest
@@ -5821,7 +6056,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // and the -noise stop. Computed every batch only when -noise is active
             // (needed to test the floor); otherwise just when we're about to report.
             double noisePct = 0.0, meanHits = 0.0;
-            if (noiseTarget > 0.0 || wantStatus || stopped || timeUp) {
+            if (noiseTarget > 0.0 || wantStatus || wantWin || stopped || timeUp) {
                 double sumHits = 0.0; long long lit = 0;
                 for (double h : acc.film.hits) if (h > 0.0) { sumHits += h; ++lit; }
                 meanHits = lit ? sumHits / (double)lit : 0.0;
@@ -5834,9 +6069,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (noiseMet) metNoise = true;
             bool totalDone = chunkFixed && N > 0 && acc.N >= N;   // fixed-N window render
             bool done = stopped || timeUp || noiseMet || totalDone;
-            if (done || wantStatus) {   // periodic crash-safe checkpoint + preview
-                writeOut(/*announceCheckpoint*/false, /*quiet*/preview, /*useAnchor*/done);
-                lastSave = clk::now();
+            bool wantSave = done || wantStatus;
+            if (done && g_showWindow) wantWin = true;   // finished frame always lands on screen
+            if (wantSave || wantWin) {   // periodic crash-safe checkpoint + preview
+                if (wantSave) {
+                    writeOut(/*announceCheckpoint*/false, /*quiet*/preview, /*useAnchor*/done);
+                    lastSave = clk::now();
+                }
                 const char* why = stopped ? " (stopping)"
                                 : noiseMet ? " (noise target met)"
                                 : totalDone ? " (done)" : "";
@@ -5853,13 +6092,20 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 else
                     std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %.1fs, %lld batches, %lld photons, ~%.1f%% noise%s",
                                   noiseTarget, elapsed, batches, acc.N, noisePct, why);
-                if (preview || g_showWindow) {
+                if (preview || wantWin) {
+                    auto tPrep = clk::now();
                     Film disp = acc.film;
                     if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
-                    if (preview) ansiPreview(disp, (double)acc.N, manualExposure, st);
-                    else { std::printf("%s\n", st); std::fflush(stdout); }
-                    liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute, st);
-                } else { std::printf("%s\n", st); std::fflush(stdout); }
+                    if (wantSave) {
+                        if (preview) ansiPreview(disp, (double)acc.N, manualExposure, st);
+                        else { std::printf("%s\n", st); std::fflush(stdout); }
+                    }
+                    if (wantWin) {
+                        liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute, st);
+                        liveWindowNotePaintCost(     // env composite is part of the repaint
+                            std::chrono::duration<double>(clk::now() - tPrep).count());
+                    }
+                } else if (wantSave) { std::printf("%s\n", st); std::fflush(stdout); }
             }
             if (done) break;
         }
@@ -6239,7 +6485,7 @@ static bool stereoComposite(int mode, const std::string& left, const std::string
 // README.md, which this points at rather than duplicating.
 static void printHelp(const char* prog) {
     std::printf(
-"ftrace — spectral forward + backward photon raytracer\n"
+"ftrace " FTRACE_VERSION " — spectral forward + backward photon raytracer\n"
 "\n"
 "Usage:\n"
 "  %s -in <scene.ftsl> [options]         render a scene file\n"
@@ -6350,7 +6596,8 @@ static void printHelp(const char* prog) {
 "  -window               live OS preview window, refreshed as it converges\n"
 "  -keepwindow|-hold     like -window but hold the final image until you close it\n"
 "  -preview              live ANSI thumbnail in the terminal\n"
-"  -interval <sec>       periodic image-write / preview cadence (default: 15)\n"
+"  -interval <sec>       periodic image-write / status / ANSI-preview cadence (default: 15)\n"
+"  -window-interval <s>  live-window repaint cadence, independent of -interval (default: 0.2)\n"
 "  -checkpoint           write a resumable .ftbuf sidecar next to -o (modes A/B/C)\n"
 "  -resume               continue an accumulated render from its .ftbuf checkpoint\n"
 "  -parseonly            load the scene, print a contents summary, exit (no render)\n"
@@ -6383,6 +6630,7 @@ static void printHelp(const char* prog) {
 "  -viewer <s.json>      open the loom native viewer on a scene-introspection sidecar\n"
 "  -loom <scene.py>      with -viewer: re-derive geometry live from this loom build\n"
 "  -h | --help           show this help and exit\n"
+"  -version | -V         print the version and exit\n"
 "\n"
 "See README.md for the complete flag list (fog, thin-film, meshes, diagnostics, …).\n",
         prog, prog, prog, prog, prog, prog);
@@ -6408,6 +6656,17 @@ static int run(int argc, char** argv) {
         if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help") ||
             !std::strcmp(argv[i], "-help") || !std::strcmp(argv[i], "help")) {
             printHelp(argv[0]);
+            return 0;
+        }
+    }
+    // `-version` (also `--version` / `-V`) anywhere on the command line: print the
+    // baked-in version and exit. FTRACE_VERSION comes from the repo-root VERSION
+    // file via CMake, so a built ftrace.exe can identify itself instead of being
+    // anonymous — otherwise the only way to tell two builds apart is a byte compare.
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "-version") || !std::strcmp(argv[i], "--version") ||
+            !std::strcmp(argv[i], "-V")) {
+            std::printf("ftrace %s\n", FTRACE_VERSION);
             return 0;
         }
     }
@@ -6686,7 +6945,14 @@ static int run(int argc, char** argv) {
     } else if (inFile) {
         std::string ferr;
         if (!ftsl::load(inFile, ftslScene, ferr, supportFn)) {
-            std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
+            // A clean stop that landed mid-load is not a scene error. Say so plainly
+            // rather than printing a diagnostic that points the finger at the .ftsl —
+            // but still exit non-zero: no scene was built, so nothing can be rendered.
+            if (g_stopRequested)
+                std::fprintf(stderr, "[stop] scene load stopped before rendering — "
+                                     "nothing was rendered or written.\n");
+            else
+                std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
             return 1;
         }
         fromFtsl = true;
@@ -6951,6 +7217,12 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-convergence") && i + 1 < argc) stereoConverge = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-stereo-keep-eyes")) stereoKeepEyes = true;
         else if (!std::strcmp(argv[i], "-interval") && i + 1 < argc) intervalSec = std::atof(argv[++i]);
+        // Separate from -interval on purpose: -interval is how often the render is made
+        // CRASH-SAFE (PNG + .ftbuf), which you want rare, and this is how often it is made
+        // WATCHABLE, which you want often. 0 means "every chunk", subject only to the
+        // adaptive cost budget in liveWindowDue().
+        else if (!std::strcmp(argv[i], "-window-interval") && i + 1 < argc)
+            g_windowIntervalSec = std::max(0.0, std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "-resume")) resume = true;
         else if (!std::strcmp(argv[i], "-checkpoint")) wantCheckpointFlag = true;
         else if (!std::strcmp(argv[i], "-in") && i + 1 < argc) ++i; // handled in pre-scan
@@ -8032,24 +8304,17 @@ static int run(int argc, char** argv) {
 
         // Pop the live window up IMMEDIATELY (before the potentially-slow tessellation)
         // so heavy scenes don't sit with a blank screen while the isosurfaces march.
-        // Size it to the first camera we'll render; fill a dark placeholder frame and
-        // show a "tessellating…" title, then update N/M progress as each implicit is
-        // marched (see the tessellate() callback below).
-        if (g_showWindow && !toRender.empty() && !g_liveWin) {
-            int pw = toRender.front().res, ph = toRender.front().resY;
-            std::vector<uint8_t> placeholder((size_t)pw * ph * 3);
-            for (size_t i = 0; i < placeholder.size(); i += 3) {
-                placeholder[i] = 24; placeholder[i + 1] = 26; placeholder[i + 2] = 30;
-            }
-            g_liveWin = std::make_unique<LiveWindow>(pw, ph, g_windowTitle.c_str());
-            g_liveWin->update(pw, ph, placeholder);
-            if (useGpuIso) {
-                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  GPU iso preview\xE2\x80\xA6");
-            } else {
-                const size_t nImp = scene.implicits.size();
-                g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating" +
-                                    (nImp ? " (0/" + std::to_string(nImp) + ")" : "\xE2\x80\xA6"));
-            }
+        // Size it to the first camera we'll render and name the stage in the title, then
+        // update N/M progress as each implicit is marched (see the tessellate() callback
+        // below). The ray-traced modes do the same thing at the top of run()'s render
+        // dispatch; both go through liveWindowPlaceholder.
+        if (!toRender.empty()) {
+            const size_t nImp = scene.implicits.size();
+            liveWindowPlaceholder(toRender.front().res, toRender.front().resY,
+                                  useGpuIso ? "GPU iso preview\xE2\x80\xA6"
+                                            : "tessellating" +
+                                              (nImp ? " (0/" + std::to_string(nImp) + ")"
+                                                    : std::string("\xE2\x80\xA6")));
         }
 
         raster::PreviewLight plight = raster::deriveLight(scene);
@@ -10173,6 +10438,18 @@ static int run(int argc, char** argv) {
     // else on the CPU. Sharing applies only to per-frame-auto-exposed cameras (an
     // exposure-locked camera_path is an animation, better left un-shared so its frames
     // don't all carry the same fixed noise realisation).
+    // Show the window before ANY of the ray-traced setup, for the same reason the raster
+    // path shows it before tessellating: everything from here to the first rendered chunk
+    // — the CUDA probe and scene bake right below, the device upload, then a full sample
+    // pass — used to run with nothing on screen, because the window was created lazily by
+    // the first repaint. In a deterministic mode-W render the first repaint is also very
+    // nearly the last, so the window appeared just as the process was exiting and the
+    // finished image seemed to flash by. This is the earliest point where the frame size
+    // is known and the heavy work hasn't started.
+    if (!toRender.empty())
+        liveWindowPlaceholder(toRender.front().res, toRender.front().resY,
+                              "preparing\xE2\x80\xA6");
+
     bool useGpuForward = false;
 #ifdef HAVE_CUDA
     {
@@ -10388,14 +10665,18 @@ static int run(int argc, char** argv) {
                 // Graininess estimate from camera 0's lit-pixel hit count (mirrors the
                 // single-camera path); drives the status line and the -noise stop.
                 double noisePct = 0.0, meanHits = 0.0;
-                if (noiseTarget > 0.0 || wantStatus || stopped || timeUp) {
+                // A window repaint needs the films too, so it joins the conditions that
+                // force a full sync — and pays for itself through liveWindowNotePaintCost
+                // below, which folds the download into the repaint budget.
+                const bool wantWinPre = liveWindowDue();
+                if (noiseTarget > 0.0 || wantStatus || wantWinPre || stopped || timeUp) {
 #ifdef HAVE_CUDA
                     if (gses && !accFresh) {
                         // Resident GPU path: the hit counts live on the device. A status /
                         // stop boundary wants the films anyway, so do the full download;
                         // a bare -noise poll between intervals fetches ONLY camera 0's
                         // hits (npix doubles) instead of every film.
-                        if (wantStatus || stopped || timeUp) syncAcc();
+                        if (wantStatus || wantWinPre || stopped || timeUp) syncAcc();
                         else sharedForwardGpuHits0(gses, acc[0].hits);
                     }
 #endif
@@ -10408,9 +10689,10 @@ static int run(int argc, char** argv) {
                 if (noiseMet) metNoise = true;
                 bool totalDone = chunkFixed && N > 0 && accN >= N;
                 bool done = stopped || timeUp || noiseMet || totalDone;
-                if (done || wantStatus) {
-                    writeOut(/*quiet*/preview);
-                    lastSave = clk::now();
+                bool wantSave = done || wantStatus;
+                bool wantWin  = g_showWindow && (done || wantWinPre);
+                if (wantSave || wantWin) {
+                    if (wantSave) { writeOut(/*quiet*/preview); lastSave = clk::now(); }
                     const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)"
                                     : totalDone ? " (done)" : "";
                     char st[240];
@@ -10426,13 +10708,22 @@ static int run(int argc, char** argv) {
                     else
                         std::snprintf(st, sizeof st, "[noise] ~%.2g%% target, %.1fs, %lld photons, %d cams, ~%.1f%% noise%s",
                                       noiseTarget, elapsed, accN, nc, noisePct, why);
-                    if (preview || g_showWindow) {
+                    if (preview || wantWin) {
+                        auto tPrep = clk::now();
                         Film disp = acc[0];
                         addEnvBackground(disp, scene, toRender[idx[0]].cam, accN);
-                        if (preview) ansiPreview(disp, (double)accN, toRender[idx[0]].exposure, st);
-                        else { std::printf("%s\n", st); std::fflush(stdout); }
-                        liveWindowUpdate(disp, (double)accN, toRender[idx[0]].exposure, scene.absolute, st);
-                    } else { std::printf("%s\n", st); std::fflush(stdout); }
+                        if (wantSave) {
+                            if (preview) ansiPreview(disp, (double)accN, toRender[idx[0]].exposure, st);
+                            else { std::printf("%s\n", st); std::fflush(stdout); }
+                        }
+                        if (wantWin) {
+                            liveWindowUpdate(disp, (double)accN, toRender[idx[0]].exposure,
+                                             scene.absolute, st);
+                            // Charge the sync + env composite to the repaint budget too.
+                            liveWindowNotePaintCost(
+                                std::chrono::duration<double>(clk::now() - tPrep).count());
+                        }
+                    } else if (wantSave) { std::printf("%s\n", st); std::fflush(stdout); }
                 }
                 if (done) break;
             }
@@ -10721,6 +11012,11 @@ static int runServe(int argc, char** argv, int inValPos) {
 // spectral-library resolver) into a clean message + non-zero exit, instead of a
 // silent fall-through to a default illuminant that would render the wrong thing.
 int main(int argc, char** argv) {
+    // Teach the console to decode our UTF-8 and interpret our ANSI escapes, BEFORE anything
+    // can print. This has to precede the -stop branch below, because that branch prints the
+    // running-render list -- which contains an em dash -- and then returns without ever
+    // reaching the render setup where this used to be called.
+    enableAnsiTerminal();
     // `-stop [<pid>|all]`: talk to ALREADY-RUNNING renders and exit. Handled before
     // anything else so it works from a bare command line -- it loads no scene, opens
     // no window and creates no CUDA context, so there is nothing here to tear down.
@@ -10729,6 +11025,12 @@ int main(int argc, char** argv) {
         const char* who = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : nullptr;
         return runStopCommand(who);
     }
+    // Let the LOAD-TIME parallel-for (src/parallel.h) see the same stop flag the render
+    // loops poll. g_stopRequested is a file-static volatile sig_atomic_t -- a signal
+    // handler writes it, and parallel.h can't name it -- so it is handed over as a probe
+    // instead. Installed here, before any scene work, because the whole point is that a
+    // `-stop` arriving during a long scene load takes effect during that load.
+    ft::setStopProbe([] { return g_stopRequested != 0; });
     // Tear the CUDA context down synchronously, in-process, on EVERY exit path (normal
     // return or exception). Leaving it for the driver to reclaim implicitly after main()
     // returns triggers an asynchronous nvlddmkm DPC teardown that, on buggy driver
@@ -10745,8 +11047,11 @@ int main(int argc, char** argv) {
         {
             const char* viewerSidecar = nullptr;
             const char* viewerLoom    = nullptr;
+            bool        viewerPlay    = false;
             for (int i = 1; i < argc; ++i) {
-                if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
+                if (!std::strcmp(argv[i], "-play") || !std::strcmp(argv[i], "--play")) {
+                    viewerPlay = true;
+                } else if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
                     if (i + 1 >= argc) {
                         std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
                         return 1;
@@ -10761,7 +11066,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (viewerSidecar)
-                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "");
+                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "", viewerPlay);
             if (viewerLoom) {
                 // -loom names a live channel, and there are two of them: the viewer's F4
                 // re-introspection (-viewer) and the fly editor's E2 value channel

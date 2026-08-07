@@ -150,6 +150,40 @@ struct EnvMap {
         for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX + 1e-9; lam += 5.0)
             grid.push_back({lam, cieX(lam) * 5.0, cieY(lam) * 5.0, cieZ(lam) * 5.0, illumAt(lam)});
 
+        // Per-texel: fit the chroma sigmoid, then integrate the resulting SPD against the
+        // observer. That is a ~40-iteration Gauss-Newton solve plus a 95-sample integral
+        // for every texel, so on a 2k x 1k HDR probe the serial version is seconds of
+        // dead scene-load time. The texels are independent, so it runs threaded; the
+        // sin(theta)-weighted MEAN below is deliberately left serial (it is one fused
+        // multiply-add per texel, i.e. free) so its summation order — and therefore the
+        // mean radiance, the emitter power and the wavelength CDF built from it — stays
+        // bit-identical to the single-threaded build regardless of core count.
+        //
+        // It is also the one place an environment build can be interrupted: a clean stop
+        // abandons the remaining texels and fails the load, rather than leaving a probe
+        // whose coefficients are fitted for the top half of the sky and zero below it.
+        if (!ft::parallelFor(nT, 4096, [&](size_t i) {
+            Vec3 c = rgbIn[i] * intensity;
+            c.x = std::max(0.0, c.x); c.y = std::max(0.0, c.y); c.z = std::max(0.0, c.z);
+            double m = std::max(c.x, std::max(c.y, c.z));
+            double s = 2.0 * m;                       // PBRT-style: chroma in [0,0.5]
+            std::array<double, 3> cf;
+            if (m > 0.0) cf = upsample::fit(c.x / s, c.y / s, c.z / s);
+            else         { cf = {0, 0, 0}; s = 0.0; }
+            coeff[i] = cf; scaleT[i] = s;
+            // Per-texel spectral XYZ = integral CIE(lambda)*L(lambda) dlambda.
+            Vec3 xyz{0, 0, 0};
+            for (const GridW& g : grid) {
+                double L = s * upsample::reflAt(cf, g.lam) * g.il;
+                xyz.x += L * g.wx; xyz.y += L * g.wy; xyz.z += L * g.wz;
+            }
+            xyzT[i] = xyz;
+        })) {
+            coeff.clear(); scaleT.clear(); xyzT.clear();
+            err = "environment build stopped by request";
+            return false;
+        }
+
         Vec3 avgRgb{0, 0, 0};
         double avgW = 0.0;
         for (int row = 0; row < h; ++row) {
@@ -159,19 +193,6 @@ struct EnvMap {
                 size_t i = (size_t)row * w + col;
                 Vec3 c = rgbIn[i] * intensity;
                 c.x = std::max(0.0, c.x); c.y = std::max(0.0, c.y); c.z = std::max(0.0, c.z);
-                double m = std::max(c.x, std::max(c.y, c.z));
-                double s = 2.0 * m;                       // PBRT-style: chroma in [0,0.5]
-                std::array<double, 3> cf;
-                if (m > 0.0) cf = upsample::fit(c.x / s, c.y / s, c.z / s);
-                else         { cf = {0, 0, 0}; s = 0.0; }
-                coeff[i] = cf; scaleT[i] = s;
-                // Per-texel spectral XYZ = integral CIE(lambda)*L(lambda) dlambda.
-                Vec3 xyz{0, 0, 0};
-                for (const GridW& g : grid) {
-                    double L = s * upsample::reflAt(cf, g.lam) * g.il;
-                    xyz.x += L * g.wx; xyz.y += L * g.wy; xyz.z += L * g.wz;
-                }
-                xyzT[i] = xyz;
                 double lum = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
                 img[i] = lum * sinT;
                 avgRgb += c * sinT; avgW += sinT;

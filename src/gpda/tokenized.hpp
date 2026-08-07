@@ -234,6 +234,31 @@ struct Graph {
     std::uint32_t              start_rule_id = UINT32_MAX;
     bool                       finalized = false;
 
+    // The graph's terminal alphabet, precomputed by finalize(): every token TYPE
+    // some MatchTok node accepts, and every token VALUE some MatchStr node accepts.
+    // Together these are the ONLY ways token_matches() can ever return true, so a
+    // token in neither set cannot be consumed by any cursor, in any cursor set, at
+    // any position.  See inert_skip() below.
+    std::unordered_set<std::string> matchtok_types;
+    std::unordered_set<std::string> matchstr_values;
+
+    // True when `tok` is a skip-type token that NO terminal in the graph could ever
+    // consume — which makes feeding it to the parser a provable no-op, so it can be
+    // dropped from the stream outright.
+    //
+    // Why this matters: skip tokens are "optionally consumable", so the parse loop
+    // handles them by running a full epsilon-closure (expand_all) and dedup, finding
+    // nothing that matches, and then putting the cursor set back exactly as it was.
+    // On real .ftsl input WS is ~45% of the token stream, so nearly half the graph
+    // walk was that no-op.  A grammar that *does* reference its skip type (WS as a
+    // significant separator) still has it in matchtok_types and is unaffected — the
+    // test is derived from the graph, so no grammar needs to opt in or annotate.
+    bool inert_skip(const Token& tok) const {
+        return skip_types.count(tok.type) != 0
+            && matchtok_types.count(tok.type) == 0
+            && matchstr_values.count(tok.value) == 0;
+    }
+
     std::uint32_t add_node(NodeType t) {
         nodes.push_back(Node{});
         nodes.back().type = t;
@@ -261,12 +286,18 @@ struct Graph {
             rule_names.push_back(kv.first);
             by_name[kv.first] = id;
         }
+        matchtok_types.clear();
+        matchstr_values.clear();
         for (auto& n : nodes) {
             if (n.type == NodeType::RuleRef) {
                 auto it = by_name.find(n.value);
                 n.rule_id = (it != by_name.end()) ? it->second : UINT32_MAX;
                 n.links_shared = std::make_shared<
                     const std::vector<std::uint32_t>>(n.links);
+            } else if (n.type == NodeType::MatchTok) {
+                matchtok_types.insert(n.value);
+            } else if (n.type == NodeType::MatchStr) {
+                matchstr_values.insert(n.value);
             }
         }
         rule_stripped.assign(rule_starts.size(), 0);

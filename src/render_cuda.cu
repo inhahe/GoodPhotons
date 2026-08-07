@@ -12695,10 +12695,25 @@ bool cudaIsoPreviewSupported(const Scene& scene, const Camera& cam) {
 
 std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
                                           int W, int H, int nThreads, double exposure,
-                                          bool autoExpose, double* lockAnchor) {
+                                          bool autoExpose, double* lockAnchor,
+                                          IsoPreviewTiming* timing) {
     using namespace gpu;
     if (!cudaIsoPreviewSupported(scene, cam)) return {};   // caller falls back to CPU raster
     if (W <= 0 || H <= 0) return {};
+
+    // Phase clock for the optional timing split (see IsoPreviewTiming in render_cuda.h).
+    // steady_clock rather than CUDA events, because host marshalling must be charged to
+    // `upload` and events only see device-side work. The kernel phase syncs explicitly
+    // before stopping its clock, so an async launch cannot leak its cost into `readback`.
+    using PhaseClock = std::chrono::steady_clock;
+    auto phaseMark = PhaseClock::now();
+    auto phaseLap = [&phaseMark]() {
+        auto now = PhaseClock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - phaseMark).count();
+        phaseMark = now;
+        return ms;
+    };
+    if (timing) *timing = IsoPreviewTiming{};
 
     DUpload up;
     buildUpload(scene, cam, W, H, up);
@@ -12776,10 +12791,15 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
     int grid  = (int)((npix + block - 1) / block);
     if (grid < 1) grid = 1;
     if (grid > 65535) grid = 65535;
+    // Everything above marshalled the whole scene and pushed it across PCIe; charge it
+    // all to `upload` before the first launch.
+    if (timing) timing->msUpload = phaseLap();
+
     kIsoPreview<<<grid, block>>>(up.sc, up.dc, dpl, dCol, dEmit, (int)scene.mats.size(),
                                  dTexMeta, dTexels, dMatTex, dMatTri,
                                  d_accum, d_z, d_emis, W, H, bg, EMIS_BOOST);
-    cudaCheckKernel("iso-preview");
+    cudaCheckKernel("iso-preview");                  // ends with cudaDeviceSynchronize
+    if (timing) timing->msKernel = phaseLap();
 
     std::vector<double>        accD(npix * 3);
     std::vector<float>         zf(npix);
@@ -12800,8 +12820,14 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
     }
     const double expComp = (exposure > 0.0) ? exposure : 1.0;
     const Vec3 kMilkColor{0.52, 0.55, 0.60};             // unused (seeThrough=false)
-    return raster::exposeAndEncode(accum, zf, emis, W, H, nThreads, expComp, autoExpose,
-                                   lockAnchor, /*seeThrough=*/false, {}, {}, kMilkColor);
+    std::vector<uint8_t> out =
+        raster::exposeAndEncode(accum, zf, emis, W, H, nThreads, expComp, autoExpose,
+                                lockAnchor, /*seeThrough=*/false, {}, {}, kMilkColor);
+    // D2H copies + the host tone map. Named into a local first so this lap covers
+    // exposeAndEncode -- returning its result directly would leave that cost untimed
+    // and silently inflate whatever the caller measures around this function.
+    if (timing) timing->msReadback = phaseLap();
+    return out;
 }
 
 // --------------------- photon map (mode M) host ------------------------------

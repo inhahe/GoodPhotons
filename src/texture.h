@@ -68,12 +68,25 @@ struct Texture {
     // Precompute the Jakob-Hanika reflectance coefficients per texel (once). Called
     // when a texture is bound to a reflectance parameter so per-hit sampling is a
     // cheap coefficient bilerp + sigmoid evaluation rather than a Gauss-Newton fit.
-    void buildReflCoeff() {
-        if (hasPalette()) { buildPaletteRgb(); return; }
-        if (!valid() || coeff.size() == (size_t)w * h) return;
+    //
+    // Deliberately upsample::fitMany rather than a per-texel loop over upsample::fit:
+    // the fit is a few microseconds, which at megapixel resolutions is SECONDS of dead
+    // time during scene load with nothing on screen. fitMany dedups bit-equal texels
+    // (an 8-bit image has far fewer distinct colours than texels) and threads what is
+    // left; the coefficients it writes are bit-identical to the serial loop's.
+    //
+    // Returns false only if a clean stop was requested mid-fit (`ftrace -stop`, Ctrl-C).
+    // The coefficient table is then partial, so it is cleared and the caller must fail
+    // the scene load — sampling a half-fitted texture would shade garbage.
+    [[nodiscard]] bool buildReflCoeff() {
+        if (hasPalette()) { buildPaletteRgb(); return true; }
+        if (!valid() || coeff.size() == (size_t)w * h) return true;
         coeff.resize((size_t)w * h);
-        for (size_t i = 0; i < rgb.size(); ++i)
-            coeff[i] = upsample::fit(rgb[i].x, rgb[i].y, rgb[i].z);
+        if (!upsample::fitMany(rgb.data(), rgb.size(), coeff.data())) {
+            coeff.clear(); coeff.shrink_to_fit();
+            return false;
+        }
+        return true;
     }
 
     // Integrate each palette spectrum against the CIE curves under an equal-energy

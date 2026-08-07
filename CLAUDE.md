@@ -75,7 +75,8 @@ progress survives a crash. Concretely, when you start a render:
   themselves. Use it on every render so the completed image stays watchable. (When
   you launch a render in the background to poll its progress, remember the process
   will now stay alive holding the window after the render completes — stop it
-  explicitly once you and the user are done inspecting.)
+  explicitly with `ftrace -stop <pid>` once you and the user are done inspecting;
+  see the section below, and never `taskkill /F` it.)
 - **Always add periodic crash-safe output.** Use `-interval <sec>` (default 15) for
   the write/refresh cadence, and `-checkpoint` (forward modes A/B/C) so a resumable
   `.ftbuf` sidecar is written next to `-o` and progress survives a crash/Ctrl-C
@@ -102,6 +103,42 @@ completion. So a bare `-n 4000000000` can run for hours producing nothing and
 losing it all on a crash. Adding `-window` (or any budget flag) is what enables the
 periodic-output loop.
 
+## Stopping a render — `ftrace -stop <pid>`, NEVER `taskkill /F`
+
+**Force-killing ftrace while CUDA kernels are in flight is a known way to wedge the
+NVIDIA driver into a TDR/bugcheck.** So no ftrace process in this repo may ever be
+stopped with `taskkill /F` (or `Stop-Process -Force`, or `kill -9`) — not the render
+you started, not a stale `-keepwindow` preview holding the exe open and blocking
+`build.bat` from copying, not one you didn't start. There is a purpose-built clean
+stop, and it is always the answer:
+
+- **`ftrace -stop <pid>`** — asks that render to do exactly what Ctrl-C does: finish
+  the current chunk, write the final image **and** the `.ftbuf` checkpoint, release
+  the CUDA context through the graceful-shutdown path, then exit. It waits (up to
+  120 s) for the process to actually be gone, so you can chain a rebuild straight
+  after it. It also releases a window being held open by `-keepwindow`.
+- **`ftrace -stop`** (bare) — *lists* every live render: pid + scene → output. Use
+  this to find the pid rather than grepping `tasklist`.
+- **`ftrace -stop all`** — stops every live render.
+
+ftrace prints the exact command you need when it starts holding a window
+(`[window] render done — close the preview window to exit (or run: ftrace -stop
+<pid>)`), so the pid is normally already on screen in the log you're tailing.
+
+`-stop` also works during **scene load** (since 0.138.2): the loader polls the same flag
+between top-level blocks and inside `ft::parallelFor`'s chunk cursor, so a stop aimed at
+a process that hasn't reached its render loop aborts the load in well under a second,
+prints `[stop] scene load stopped before rendering — nothing was rendered or written.`,
+and exits **1**. A non-zero exit there is the expected, correct outcome — no scene was
+built, so nothing could be rendered. (Latency is bounded by one chunk / one asset, so a
+single very large mesh import still has to finish before the stop lands. Still never a
+reason to `taskkill /F`.)
+
+Why this needs saying here and not just in `design.md`: the natural reflex when a
+build fails with "the destination is probably IN USE" is to kill the process by name,
+and by the time you're reading the build error you are nowhere near the docs that
+explain why that's dangerous. `-stop` costs the same one command and is safe.
+
 ## Performance
 
 - **Optimize the tight loops / CPU-heavy hot paths as much as possible, until the
@@ -119,10 +156,26 @@ periodic-output loop.
 
 ## Docs to keep current
 
-- **`README.md`** is user-facing — update it whenever an observable feature changes
-  (render modes, camera models, materials/lights/spectra presets, CLI flags, GPU
-  backend scope). Mode descriptions in particular must match the actual implementation
-  (e.g. mode A is the finite-lens physical camera, not the old contact-sensor wall).
+The user-facing docs are split into three files. Know which one a change belongs in:
+
+- **`README.md`** is the **landing page** — demo, highlights, building, quick start, a
+  pointer table to the other docs, loom, known issues. Keep it short enough to read end
+  to end (it was a 3365-line wall before the split; it is now ~400 lines). New reference
+  material does **not** go here — add a line to the pointer table and put the detail in
+  `REFERENCE.md`. Do update it when something in *its* scope changes (build steps, quick
+  start flags, headline features, the demo).
+- **`REFERENCE.md`** is the **manual** — render modes, cameras, materials, spectra,
+  lights, geometry, textures, procedural patterns, participating media, the FTSL scene
+  language overview, the full command-line reference, output formats. Update it whenever
+  an observable feature changes. Mode descriptions in particular must match the actual
+  implementation (e.g. mode A is the finite-lens physical camera, not the old
+  contact-sensor wall). Its `## Contents` list is **hand-maintained**: if you add or
+  rename a heading, update the TOC in the same edit. The anchors are GitHub slugs —
+  lowercase, punctuation stripped, and **each** space replaced by a hyphen, so a run of
+  spaces becomes a run of hyphens (`## Mode W — the …` → `#mode-w--the-…`). Use
+  `npx github-slugger` if you need to check one.
+- **`FTSL.md`** stays authoritative for the scene-language grammar itself;
+  `REFERENCE.md` only summarises it and links across.
 - **`known-issues.md`** tracks unsolved bugs and tech debt — log anything you can't fix
   immediately, and mark entries DONE when resolved.
 

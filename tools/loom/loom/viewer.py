@@ -696,12 +696,17 @@ class ViewerSession:
       re-derive the scene at that clock/params and introspect it.  With ``out`` the
       sidecar JSON is written there (atomically) and the ack is ``{ok, out}``; else
       the sidecar dict rides back inline as ``{ok, sidecar}``.
-    * ``emit`` — ``{clock?:{…}, params?:{…}, out?:"path"}``: re-derive the scene at
-      that clock/params and emit its ``.ftsl`` (the source ftrace parses to raymarch
-      the real field — the F7 primary path).  With ``out`` the ``.ftsl`` is written
-      there (atomically) and the ack is ``{ok, out}``; else the source text rides
-      back inline as ``{ok, source}``.  This is what the viewer calls on
+    * ``emit`` — ``{clock?:{…}, params?:{…}, out?:"path", assets_dir?:"path",
+      mesh_format?:"ftmesh"|"obj", assets?:"inline"}``: re-derive the scene at that
+      clock/params and emit its ``.ftsl`` (the source ftrace parses to raymarch the
+      real field — the F7 primary path).  With ``out`` the ``.ftsl`` is written there
+      (atomically) and the ack is ``{ok, out}``; else the source text rides back
+      inline as ``{ok, source}``.  This is what the viewer calls on
       rotate/scrub/param-edit to get freshly re-tessellated geometry (F4).
+      ``assets: "inline"`` additionally keeps file-backed meshes out of the
+      filesystem: they come back as private ``_blobs`` for :func:`serve_viewer` to
+      frame onto the wire, and ``assets_dir`` becomes purely the naming scheme the
+      scene text uses to refer to them.
     * ``params`` — ack ``{ok, params, types, build}``: the build's declared keyword
       controls (name→default) so the viewer can build its parameter UI, each one's
       type tag (``int``/``float``/``bool``/``str``/``other`` — JSON erases int-vs-float
@@ -755,22 +760,60 @@ class ViewerSession:
         scene = self.model.scene(clock, **params)
         clk = clock if clock is not None else Clock.at_frame(0, 1)
         out = msg.get("out")
-        assets = os.path.dirname(os.path.abspath(out)) if out else None
-        text = scene.emit(clk, Cache(), assets_dir=assets)
+        assets = msg.get("assets_dir") or (
+            os.path.dirname(os.path.abspath(out)) if out else None)
+        # Binary meshes on the live channel. Nothing ever reads these files but the
+        # ftrace that asked for them, milliseconds later, on this machine — so the OBJ
+        # text round trip (format here, parse there, every frame, for geometry that is
+        # floats on both ends) buys nothing and costs several ms. `mesh_format`
+        # defaults to "obj" everywhere else, where a portable artifact IS the point;
+        # a caller can still ask for text here by sending `mesh_format: "obj"`.
+        fmt = msg.get("mesh_format") or "ftmesh"
+        # `assets: "inline"` — don't write the meshes at all; hand their bytes back
+        # for the transport to deliver.  `assets_dir` still names them (the scene text
+        # is the same either way), it just never has to exist.  Opt-in, because an
+        # ack that carries megabytes only makes sense over a channel that can frame
+        # them — see `serve_viewer`.
+        sink = {} if msg.get("assets") == "inline" else None
+        text = scene.emit(clk, Cache(), assets_dir=assets, mesh_format=fmt,
+                          mesh_sink=sink)
         if out:
             _atomic_write_text(out, text)
-            return {"ok": True, "out": out}
-        return {"ok": True, "source": text}
+            ack = {"ok": True, "out": out}
+        else:
+            ack = {"ok": True, "source": text}
+        if sink:
+            ack["_blobs"] = list(sink.items())
+        return ack
 
 
-def serve_viewer(session: ViewerSession, in_stream=None, out_stream=None) -> None:
+def serve_viewer(session: ViewerSession, in_stream=None, out_stream=None,
+                 bin_stream=None) -> None:
     """Run the newline-delimited-JSON message loop over the given streams (default
     the process's ``stdin``/``stdout``): read one JSON object per line, dispatch to
     ``session.handle``, write one JSON ack per line, and stop after a ``quit`` (or
     EOF).  Mirrors :func:`loom.anim.serve_live` and :class:`loom.PreviewServer`'s
-    one-message-per-line stdio convention, in the viewer→loom direction."""
+    one-message-per-line stdio convention, in the viewer→loom direction.
+
+    BINARY ATTACHMENTS.  ``session.handle`` may return a private ``_blobs`` key —
+    ``[(name, bytes), …]`` — which this function turns into a public wire framing:
+    the ack line gains ``"blobs":[{"name","bytes"}, …]`` and the raw payloads follow
+    the newline back to back, in that order, with no delimiters (every length is in
+    the manifest).  A reader that doesn't want them must still read past them or the
+    stream desyncs.
+
+    Keeping the framing *here* rather than in ``handle`` is deliberate: ``handle``
+    stays a pure dict→dict function that unit tests can drive with no streams at all,
+    and the one place that knows about bytes-on-a-pipe is the one place that has a
+    pipe.  ``_blobs`` never reaches the wire under that name.
+
+    ``bin_stream`` defaults to ``out_stream.buffer`` — the same file descriptor, seen
+    unencoded.  The text stream is flushed before anything is written to it, so the
+    two views cannot interleave out of order."""
     in_stream = sys.stdin if in_stream is None else in_stream
     out_stream = sys.stdout if out_stream is None else out_stream
+    if bin_stream is None:
+        bin_stream = getattr(out_stream, "buffer", None)
     for line in in_stream:
         line = line.strip()
         if not line:
@@ -781,8 +824,20 @@ def serve_viewer(session: ViewerSession, in_stream=None, out_stream=None) -> Non
             ack = {"ok": False, "error": f"bad json: {e}"}
         else:
             ack = session.handle(msg)
+        blobs = ack.pop("_blobs", None)
+        if blobs:
+            if bin_stream is None:
+                ack = {"ok": False,
+                       "error": "blobs requested but this stream is text-only"}
+                blobs = None
+            else:
+                ack["blobs"] = [{"name": n, "bytes": len(b)} for n, b in blobs]
         out_stream.write(json.dumps(ack) + "\n")
         out_stream.flush()
+        if blobs:
+            for _name, data in blobs:
+                bin_stream.write(data)
+            bin_stream.flush()
         if ack.get("bye"):
             break
 

@@ -740,6 +740,20 @@ class SweptMesh(Element):
     ``turns`` adds a full ``turns * 2pi`` twist distributed along the spine.
     ``scale_profile`` is an optional ``f(u)->float`` multiplier (``u in [0,1)``)
     that swells/pinches the section along the spine (used by the ``blob`` preset).
+
+    **On a closed spine, ``turns`` must be a whole number.** The twist accumulates
+    around the loop and the seam joins the last ring to the first *vertex for
+    vertex*, so the total rotation has to be a whole number of profile revolutions
+    or the ridges arrive misregistered and the closing span is visibly wrung. This
+    is topology, not a tolerance -- a fractional value cannot close. (Nor does a
+    ``1/k`` turn on a ``k``-fold-symmetric profile: the silhouette maps onto itself
+    but the vertex *indices* still do not.) A non-integer ``turns`` on a closed
+    spine is warned about once per element rather than silently mis-skinned.
+
+    ``twist`` carries no such restriction: it rotates every ring by the *same*
+    angle, so nothing accumulates and it is seamless at any value. **Animate
+    ``twist``, keep ``turns`` a static int** -- that is how you get moving roll on
+    a closed sweep without tearing the seam.
     """
 
     def __init__(self, spine: Union[LoopCurve, PointPath], profile: Sequence[Tuple[float, float]],
@@ -761,6 +775,7 @@ class SweptMesh(Element):
         self.smooth = int(smooth)
         self.name = name
         self.scale_profile = scale_profile
+        self._warned_turns = False
 
     def roots(self) -> List:
         out: List = [self.spine]
@@ -769,12 +784,35 @@ class SweptMesh(Element):
                 out.append(v)
         return out
 
+    def _check_turns(self, turns: float) -> None:
+        """A closed spine can only close on a whole number of profile revolutions.
+
+        Warn rather than snap: snapping would silently change the geometry the
+        author asked for, and on an *animated* `turns` it would quantise a smooth
+        channel into pops. Warn once per element -- this runs every frame.
+        """
+        if self._warned_turns or not self.closed_spine:
+            return
+        if abs(turns - round(turns)) <= 1e-6:
+            return
+        self._warned_turns = True
+        import warnings
+        warnings.warn(
+            f"SweptMesh({self.name!r}): closed_spine=True with a non-integer "
+            f"turns={turns:.4g}. The twist accumulates around the loop and the seam "
+            f"joins last ring to first vertex-for-vertex, so the profile arrives "
+            f"misregistered and the closing span is visibly wrung. Use a whole "
+            f"number of turns; to *animate* roll on a closed sweep drive `twist` "
+            f"(uniform, seamless at any value) instead.",
+            stacklevel=3)
+
     def emit(self, ctx: EmitCtx) -> str:
         n = self.count
         pts = [self.spine.sample(k / n, ctx.clock, ctx.cache) for k in range(n)]
         base_sc = num(self.scale, ctx.clock, ctx.cache)
         base_tw = num(self.twist, ctx.clock, ctx.cache)
         turns = num(self.turns, ctx.clock, ctx.cache)
+        self._check_turns(turns)
         scales: List[float] = []
         twists: List[float] = []
         for k in range(n):
@@ -784,8 +822,7 @@ class SweptMesh(Element):
             twists.append(base_tw + turns * 2.0 * math.pi * u)
         rings = _sweep.sweep_rings(pts, self.profile, scales, twists, self.closed_spine)
         verts, faces = _sweep.skin_rings(rings, self.closed_spine, self.closed_profile)
-        path = ctx.asset_path(self.name, "obj")
-        _sweep.write_obj(path, verts, faces)
+        path = ctx.write_mesh(self.name, verts, faces)
         return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '
                 f'material "{self.material}" }}')
 
@@ -844,8 +881,7 @@ class IsoMesh(Element):
                 adaptive=self.adaptive, coarse=self.coarse)
             if self._static():
                 self._cache_static = (verts, faces)
-        path = ctx.asset_path(self.name, "obj")
-        _sweep.write_obj(path, verts, faces)
+        path = ctx.write_mesh(self.name, verts, faces)
         return (f'mesh {{ file "{path.as_posix()}"  smooth {self.smooth}  '
                 f'material "{self.material}" }}')
 
@@ -1341,8 +1377,18 @@ class Scene:
                 detect_signal_cycle(r)
 
     def emit(self, clock: Clock, cache: Optional[Cache] = None, *,
-             assets_dir: Optional["Path"] = None, tag: str = "") -> str:
-        ctx = EmitCtx(clock=clock, cache=cache, assets_dir=assets_dir, tag=tag)
+             assets_dir: Optional["Path"] = None, tag: str = "",
+             mesh_format: str = "obj", mesh_sink: Optional[dict] = None) -> str:
+        """Serialise the scene to ftsl source at ``clock``.
+
+        ``mesh_format`` selects how file-backed meshes are written — ``"obj"`` for a
+        portable, readable artifact, ``"ftmesh"`` for the binary format the live
+        viewer channel uses.  ``mesh_sink``, when given, collects those meshes as
+        ``{path: bytes}`` *instead of* writing them, for a consumer that can take the
+        bytes directly.  See :class:`~loom.ftsl_emit.EmitCtx`.
+        """
+        ctx = EmitCtx(clock=clock, cache=cache, assets_dir=assets_dir, tag=tag,
+                      mesh_format=mesh_format, mesh_sink=mesh_sink)
         lo, hi, step = self.spectral
         header = f"scene {{ units {self.units}  spectral {fmt(lo)} {fmt(hi)} {fmt(step)} }}"
         blocks = [header, ""]

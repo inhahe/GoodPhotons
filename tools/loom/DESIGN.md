@@ -346,6 +346,35 @@ distribute the residual twist so the ribbon closes seamlessly.
 
 Raw `sweep` stays exposed as the power-user escape hatch.
 
+**Two twist channels, and only one of them can close (audited 2026-08-06).** `SweptMesh`
+exposes `twist` and `turns`, and they are *not* interchangeable:
+- **`twist`** is a **uniform** roll — the same angle added to every ring. It is seamless at
+  **any** value, because rotating every ring equally cannot open a gap between the last and
+  the first.
+- **`turns`** **accumulates along the spine** (`base_tw + turns·2π·u`, `u = k/n`). On a
+  `closed_spine=True` sweep the seam joins ring `n−1` back to ring `0` **vertex-for-vertex**,
+  so the accumulated roll must be a whole number of profile revolutions or the vertices land
+  on the wrong neighbours.
+
+**This is topology, not a tolerance.** A `k`-fold-symmetric profile does *not* rescue a `1/k`
+turn: the silhouette maps onto itself but the vertex *indices* still do not. Measured on a
+120-sample ring with a 3-lobed profile: integer `turns` → max seam gap **0.0304** (pure
+discretization floor), `turns = 0.5` → **2.68** units — an unmistakable tear with visibly
+mismatched ridges. Pinned by `tests/test_sweep.py::test_closed_sweep_seams_on_integer_turns`
+/ `..._tears_on_fractional_turns` / `..._uniform_twist_is_seamless_at_any_value`, which assert
+both directions so the constraint can't silently regress into a tolerance.
+Note this is separate from, and downstream of, the RMF
+holonomy unwind above, which closes correctly on its own (`sweep.py:rmf_frames` transports
+`R[n−1]` one more reflection onto point 0's tangent and distributes the `deficit` linearly).
+
+**Consequence for animation: animate `twist`, keep `turns` a static int.** A continuously
+driven `turns` on a closed spine is broken at almost every value it passes through.
+`SweptMesh._check_turns` therefore **warns once per element** when a closed spine gets a
+non-integer `turns`. It deliberately *warns rather than snaps*: snapping would silently
+change the geometry the author asked for, and on an animated channel it would quantise smooth
+motion into pops. Once-per-element rather than once-per-emit because emit runs every frame
+(`tests/test_sweep.py::test_sweptmesh_warns_once_on_fractional_turns_closed_spine`).
+
 ### 7b. Isosurface + N-D slicer
 Emit an ftsl `isosurface`/`function` block whose input coordinates are pre-transformed
 by the Layer-2 slicer (rotate/scale/shear/drift, or true N-D slice if the function

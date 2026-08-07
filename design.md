@@ -4,8 +4,12 @@ Physically-based **spectral** renderer (C++17, single exe `ftrace.exe`), Windows
 MSVC / CMake, with a CUDA backend (RTX-class, tested sm_89). Photons are traced
 **forward from the lights** in the flagship modes (hence "forward raytracer"), but
 backward path tracing, BDPT, photon mapping, SPPM, VCM and a z-buffer preview
-rasterizer are all built in. `README.md` is the exhaustive user-facing manual;
-this file records the *internal* architecture. `known-issues.md` tracks bugs/debt.
+rasterizer are all built in. `README.md` is the user-facing landing page (what it is,
+how to build it, first renders) and `REFERENCE.md` the exhaustive user-facing manual
+(modes, cameras, materials, spectra, lights, geometry, media, CLI) — they were one
+3300-line file until the README was split; keep an observable change in whichever of
+the two describes it. `FTSL.md` is the authoritative scene-language grammar.
+This file records the *internal* architecture. `known-issues.md` tracks bugs/debt.
 
 ## Render modes (dispatch in `main.cpp`)
 
@@ -206,6 +210,65 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `edgeRow`/`edgeAt` below. Fixed 0.116.0; measurement in `known-issues.md`.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
+  **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds
+  vertices by quantized position, then gives each corner an angle-weighted average
+  (Thürmer & Wüthrich) of the incident face normals, skipping any face across a
+  crease sharper than `creaseAngleDeg`. Three details are load-bearing for speed
+  (0.147.0 — it was ~2/3 of the whole cost of loading a mesh, and the live loom
+  viewer reloads a mesh every frame): the weld map is **hashed, not ordered** (welded
+  ids are opaque slots and both containers assign them in first-seen order, so the
+  result is unchanged); the vertex→incident-corner index is **CSR**, one flat array
+  plus offsets, rather than one `std::vector` per vertex; and each corner's interior
+  angle is **precomputed once** into `ang[tri*3+c]` instead of being recomputed from
+  the innermost loop, which made a vertex of degree *d* pay O(*d*²) `acos` calls per
+  fan. Storing the corner index (not just the triangle) in the CSR is also what makes
+  the angle a lookup — and fixed a latent bug in passing: a sliver triangle whose two
+  corners weld to the *same* vertex used to contribute its first corner's angle twice
+  rather than each corner's own. Measured 2.6–3.8× on the smoothing pass, bit-identical
+  on 188 of the 189 `.obj` files in the tree (the 189th is the sliver fix).
+  **`.ftmesh` — the binary mesh handoff** (0.147.0, `loadFtmesh`). Written by
+  `loom.ftmesh` (`tools/loom/loom/ftmesh.py`), read here, and dispatched on the file
+  extension at both `.ftsl` sites (`mesh` and `mesh_asset`), so a scene swaps formats
+  by changing one filename and nothing else. Layout — 24-byte header
+  (`"FTMESH\0\0"`, u32 version = 1, u32 flags, u32 nverts, u32 ntris), then f32
+  positions, then optional f32 normals, then optional f32 UVs, then u32 indices; all
+  little-endian, `HAS_NORMALS = 1`, `HAS_UVS = 2`. Every section's size is implied by
+  the header, so a **truncated file is detectable** rather than being read as geometry
+  made of whatever followed — which matters because the live viewer channel re-emits
+  while ftrace may still be opening the previous frame's file. Out-of-range indices
+  roll the partial load back (`s.tris.resize(triStart)`) and return 0 with `err` set.
+  Both loaders then call the same `meshFinishTris`, so **crease smoothing cannot
+  diverge between the two formats by construction**; only header/layout/index handling
+  is format-specific, which is exactly what `tools/loom/tests/test_ftmesh.py` and
+  `meshbench --compare` check. f32 storage is a *fidelity gain*, not a loss: the OBJ
+  text it replaces went through `%.6g`, i.e. 6 significant decimal digits against
+  f32's ~7.2 — measured worst vertex displacement 1.7e-08 × the mesh bbox diagonal and
+  worst shading-normal tilt 0.0002–0.011°. Load is 2.4× faster end-to-end and 6.5×
+  on read+decode alone, at 0.52–0.56× the file size. **What it did not fix** is the
+  cost of the file itself: on this machine opening any freshly-written file larger
+  than ~32 KB costs a flat ~8 ms before a byte is read (Defender), which was ~90 % of
+  the viewer's per-frame `assets` term. 0.148.0 removed that from the live channel
+  outright by never writing the file (see `loomlink.h`/`viewer_gui.*`) and reduced it
+  everywhere else by prefetching (see `assetbytes.h`) — `known-issues.md` records what
+  the gate actually is, because most of what looked obvious about it was wrong.
+- **`assetbytes.h`** (0.148.0) — the two things a scene's asset *bytes* may need that
+  aren't parsing: an **overlay** and a **warmer**. `Overlay` is a map from `normKey`
+  (lowercased, forward-slashed — so loom's `Path.as_posix()` names match ftrace's
+  lookups on Windows) to bytes; `ftsl::Builder` carries one and every mesh dispatch
+  site consults it before touching the disk, which is what lets the live viewer hand
+  meshes over the pipe under the very same filenames the `.ftsl` text names, so nothing
+  downstream has to know which transport produced them. `Warmer` is the complement for
+  assets that *are* on disk: `loadSource` scans the scene text for `file "…"` paths
+  (`scanAssetPaths`) and reads-and-discards them on one background thread, capped at
+  64 MB, purely to make the OS and the virus scanner do their work concurrently with
+  the GPDA parse instead of serially in front of each `open()`. It is deliberately
+  format-agnostic and constant-memory — it never decodes anything, so it cannot
+  disagree with the real loader. Skipped when a non-empty overlay is present (the
+  bytes are already here), which doubles as the A/B switch `scraps/warmbench.cpp` uses.
+  Measured on cold assets: **−21.5 %** on a 24-mesh scene, **−6.2 %** on gallery's 27 MB;
+  on settled assets, where it can only ever lose, it costs nothing (−0.7 to −1.9 %,
+  i.e. still marginally ahead). That last column is the one that justifies it being
+  unconditional.
 - **`implicit.h` / `isomesh.h`** — implicit/isosurface evaluation and marching-cubes
   tessellation. `marchImplicit` is staged **fill → discover → resolve → wind**:
   parallel lattice `val[]` fill and parallel per-vertex bisection refine + gradient
@@ -980,6 +1043,29 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   vertex by `bary_k / T_k` (`T_k = X+Y+Z` of its spectrum) rather than by `bary_k`
   alone, because a chromaticity is an `(X+Y+Z)`-weighted mean — that is what makes the
   interpolated chromaticity *exact* rather than merely close.
+- **`upsample::fitMany` — the bulk path every image texture goes through (0.138.1).**
+  A single Jakob–Hanika fit is ~40 Gauss–Newton iterations over the 95-sample basis:
+  a few microseconds, negligible for a material, *seconds per megapixel* for a texture.
+  Run serially per texel it was pure scene-load latency with nothing on screen —
+  `scenes/gallery_rain.ftsl` (ten marble maps, 4.6 Mtexel total) spent **~45 s of its
+  47 s startup** inside this one loop, which is what made `-explore` on it look hung.
+  `fitMany` fixes it with two exact accelerations, in this order:
+  (a) **deduplicate.** The fit is a pure function of the colour and an 8-bit source
+  decodes through a 256-entry per-channel table, so equal texels are *bit*-equal
+  `Vec3`s and a hash of their raw bit patterns collapses them with no tolerance and
+  no quantisation. Real images collapse hard — the project's own procedural marble
+  maps carry 96 to 80 k distinct colours over 0.05–1.05 M texels;
+  (b) **thread the survivors** through `ft::parallelFor`. Chunk-stealing rather than a
+  static split matters here because the per-colour cost is wildly uneven (a saturated
+  colour never trips the residual bail-out and burns all 40 iterations).
+  Net on that scene: **47 s → 2.9 s to parse, 4.5 s to a live `-explore` window.**
+  Both steps are *optimizations, not method changes*: the coefficients are bit-identical
+  to the serial loop, which `-checkupsample` check (i) asserts permanently over a
+  synthetic 40 k-texel image built to exercise both the dedup hit and miss paths.
+  `EnvMap::buildFromRgb` (`envmap.h`) has the same per-texel fit plus a 95-sample XYZ
+  integral and is parallelised the same way — but its sin θ-weighted *mean* is left
+  serial (one FMA per texel, i.e. free) so the summation order, and hence the emitter
+  power and wavelength CDF derived from it, cannot drift with core count.
 - **User-supplied upsamplers (`upsample "n" { expr … }`, head `rgb:<n>`).** The sixth
   member of the family, and the only open-ended one: the scene supplies the function.
   Deliberately *not* in `upsample.h` — the five above are numerical fits, this is a
@@ -1013,6 +1099,17 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.
+- **`filmToRgb8` auto-exposure cost** — the p99 anchor wants exactly **one** order
+  statistic, so it uses `std::nth_element` (O(n), partitions in place) rather than a full
+  `std::sort` of every pixel's luminance, and it builds the luminance array **only when
+  that anchor is actually computed** — an absolute-EV render and a `camera_path` frame with
+  a locked anchor both skip the pass and the allocation outright. `nth_element` guarantees
+  the element at that index is the one a full sort would have placed there, so the anchor
+  and every output pixel are **bit-for-bit identical** (verified against a pre-change
+  render). This matters because `filmToRgb8` is the shared choke point for `writeFilm`
+  *and* the live window, and once the window got its own repaint cadence it began running
+  several times a second: at 480² the sort alone was the bulk of a ~40 ms repaint, now
+  ~25 ms.
 - **`-hdr` (a 32-bit float PFM beside `-o`)** — the escape hatch from the tone map, added
   because *measuring* off a PNG had quietly been wrong all along. An 8-bit sRGB image clamps
   at white, and a caustic is by definition the brightest thing in frame, so its core prints
@@ -1598,6 +1695,80 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       Above 1.5× everything except the orb and the solid gyroids goes to *zero*. The Klein
       bottle cannot be rescued at all: a 2.4 mm wall is optically a window, and making it
       solid would destroy the internal tube that is the piece's whole point.
+    - **The clip shape is an optical component, and for the solid gyroid a THICK BOX beats the
+      sphere on brightness while losing on rainbow.** `contained_by` seals a clip with the
+      piece's own material, so the clip is not a mask — it is the piece's outer refracting
+      envelope. A sphere clip therefore leaves a curved lens surface; a box clip caps the solid
+      with flat *parallel* faces, and a plane-parallel plate displaces a beam but cannot
+      converge one. That predicts the box should simply lose, and at one quarter thickness it
+      does. It is wrong for thick boxes, because the focusing is not done by the cap at all but
+      by the **depth of network behind it**. Swept over thickness at 960 px / 1200 spp, cut
+      1.2× cap, spike rejection on, each at the best drop of its own sweep:
+
+      | clip (half-extents 0.50 × hy × 0.50) | coverage | sat | spread | peak | fan |
+      |---|---|---|---|---|---|
+      | sphere r = 0.50, drop 0.90 | 0.37 % | 0.196 | **0.060** | 3.25× | 0.18 |
+      | box 1 : ¼ : 1, drop 0.50 | **0.55 %** | 0.177 | 0.008 | 2.92× | 0.04 |
+      | **box 1 : ⅝ : 1, drop 0.50** *(shipped)* | 0.19 % | **0.216** | 0.018 | **8.43×** | 0.13 |
+      | box 1 : ¾ : 1, drop 0.50 | 0.14 % | 0.190 | 0.012 | 6.86× | 0.20 |
+
+      Thickness trades **area for concentration, monotonically**. The thin slab covers more cap
+      than the ball but all of it is wash — `spread` 0.008 is barely off the 0.003 speckle floor
+      and `fan` 0.04 is nothing — and at k = 10 the cell is 0.63 m, so a ¼ box is 0.4 of *one*
+      cell thick and renders as a perforated plate with big round through-holes that stops
+      reading as a lattice. Both problems close by hy ≈ 0.25. At ⅝ the box has 2.6× the ball's
+      peak and beats it on saturation in half the area, but **no box on the curve reaches the
+      ball's chromatic spread**. `gallery_rain` ships the ⅝ box: the wide-rainbow role there is
+      filled far better by the axicon (spread 0.211, fan 0.51) than any gyroid could, the room
+      already has a *spherical* gyroid in gold, and a slab buys silhouette variety on top.
+      Moving the clip also moves the `function`'s `translate` — the lattice phase is anchored at
+      the piece centre, and 0.40 m is 0.64 of a period. **And changing a clip is a layout
+      change**: the slab is wider on screen and, because its optimum drop is 0.50 rather than
+      0.90, it sits 0.40 m lower, which more than doubled its silhouette overlap with the
+      axicon standing in front of it (85 × 62 px for the ball → 114 × 112 px for the slab,
+      `scraps/_proj.py`). Fixing that cost a documented +0.30 m override on `gallery_rain`'s
+      otherwise formulaic radial spread plus a 0.25 m re-centring of the exhibit's cap — the
+      only direction with any room, since −z runs the flyby into the piece (clearance
+      0.252 → 0.037 m) and moving the axicon instead throws it off the left edge of the frame.
+    - **…but thickness was the wrong variable. What actually sets a gyroid's caustic is the
+      piece's VERTICAL EXTENT, and the winning body is a small UPRIGHT PLATE.** The table above
+      swept one degree of freedom (how thick a 1 m-square pancake is) and read the answer as
+      "thicker focuses better". Re-cutting the same solid as a plate standing on edge —
+      horizontal : depth : vertical = 1 : *f* : 1 — shows what that sweep was really measuring.
+      At 480 px / 600 spp, cut 1.2× cap, spike rejection on (raw-pixel *and* cell), each at the
+      best drop of its own sweep:
+
+      | body (h × d × v) | drop | coverage | sat | spread | peak |
+      |---|---|---|---|---|---|
+      | sphere r = 0.50 | 0.90 | 0.35 % | 0.196 | 0.014 | 3.25× |
+      | pancake 1 × 1 × 0.625 *(was shipped)* | 0.50 | 0.15 % | 0.205 | 0.009 | 6.07× |
+      | upright 1 : 5⁄16 : 1, **1.000 m** | 0.70 | 0.04 % | 0.200 | 0.021 | 4.60× |
+      | upright 1 : 5⁄16 : 1, **0.875 m** | 0.58 | **1.12 %** | 0.197 | 0.014 | 4.15× |
+      | upright 1 : 5⁄16 : 1, **0.750 m** | 0.51 | 0.88 % | 0.209 | 0.020 | 7.46× |
+      | **upright 1 : 5⁄16 : 1, 0.625 m** *(shipped)* | 0.45 | 0.65 % | **0.212** | 0.019 | **13.81×** |
+
+      Two things fall out. First, **the proportion is not what matters — the size is.** Hold the
+      1 : 5⁄16 : 1 shape fixed and shrink it and `peak` climbs monotonically to 13.81×, while the
+      *full-size* version of the very same shape is the worst row in the table (coverage 0.04 %,
+      a twentieth of its own 0.625 m sibling). Under a near-overhead sun it is the **vertical**
+      dimension that sets how much network a ray traverses, and ~0.625 m is where that path
+      focuses; 1.0 m over-diffuses. Second, **at equal path length the upright plate still beats
+      the pancake** — 2.3× the peak and 4.3× the coverage, on a plan aperture a *twentieth* the
+      size — because a pancake presents parallel faces square to the beam, so only the network
+      does any work, whereas a plate turns that network's output out through its perpendicular
+      side faces. The optimum is a plateau, not a spike (*f* = 0.25…0.375 and drop 0.35…0.45 all
+      give peak 10–14×), so it is robust; *f* = 0.1875 and *f* ≥ 0.5 both fall off to ~3.5–5×.
+      The cost is **size**: at k = 10 the cell is 0.63 m, so the shipped plate is exactly one unit
+      cell square and under a third of a cell thick — it reads as a single cell seen edge-on
+      rather than as a block of lattice. The 0.750 m row is the documented fallback if that ever
+      reads too small, since it still beats the pancake on peak *and* coverage.
+    - **Beware ranking pieces across resolutions.** `coverage` is a cell count and is
+      resolution-stable (the solid gyroid: 0.35 % at 480 px, 0.37 % at 960 px), but `spread` is
+      **not** — same piece, 0.014 at 480 px against 0.060 at 960 px — because it is computed
+      over whichever cells clear the threshold, and how many that is depends on resolution. The
+      box/sphere ranking on `spread` *inverts* between 480 px and 960 px. Rank at one
+      resolution or not at all; the proper fix (meter at a fixed world-space cell size) is
+      logged in `known-issues.md`.
     - **Brightness and colour are separate properties, and the shape that gives both is a
       cone.** A caustic is *bright* because a surface **converges** light and *coloured*
       because it disperses light **sideways**, and the two normally exclude each other. A ball
@@ -1658,6 +1829,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       facets read 0.11–0.14 % coverage on a ~0.20 × 0.03 m sliver (1/220th the smooth cone's
       patch) at a third of the peak, none with enough cells to `fan`-test, because sampling the
       ring focus at *n* discrete azimuths instead of continuously collapses it.
+    - **An axicon's SIZE is a rainbow knob, and unusually it costs nothing in saturation.** A
+      bigger aperture normally buys a brighter, *whiter* patch. An axicon's does not, because
+      it has no focal point: the cusps land at a distance that scales with the piece, so
+      growing it simply pushes the wavelengths apart that were previously landing on top of
+      each other. Sweeping the half-height *h* (top radius 2*h*) in SF10 at drop 0.65, 480 px,
+      cut 1.2× cap — one resolution, so these rank only against each other:
+
+      | *h* | top radius | coverage | sat | **spread** | **fan** | patch x × z |
+      |---|---|---|---|---|---|---|
+      | 0.28 *(shipped)* | 0.56 | **0.56 %** | 0.327 | 0.107 | 0.65 | 1.43 × 0.44 |
+      | 0.40 | 0.80 | 0.29 % | **0.527** | 0.128 | **0.76** | 1.93 × 0.47 |
+      | 0.52 | 1.04 | 0.60 % | 0.445 | **0.172** | 0.44 | 2.48 × 1.90 |
+
+      `spread` rises monotonically with size and `sat` rises with it too; *h* = 0.40 is the most
+      **organised** colour measured anywhere in `gallery_rain` (fan 0.76), and *h* = 0.52 the
+      widest rainbow, with `fan` falling to 0.44 only because the two cusps grow into each
+      other. **The shipped size is the layout optimum, not the optical one** — *h* = 0.52 is a
+      2.08 m piece, larger than anything else in the room, throwing a patch bigger than its own
+      1.8 × 1.7 m cap. Growing an axicon means re-siting and re-capping it.
     - **The axicon is cut from DENSE FLINT, not crystal, and it is the only piece that is.**
       What splays a caustic across the spectrum is the Abbe number: `glass:SF10` (V_d 28.5)
       splays 1.5× as far as `glass:crystal`/F2 (36.3). The orb and the gyroid keep crystal —
@@ -2153,6 +2343,51 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   loop (measured: +80% photons/s on 16 cams @ 640×360, +22% on 2 cams @ 320×240);
   `renderForwardSharedCuda` survives as a one-shot wrapper over the session.
   `raster_cuda.cu` = GPU raster (own section below).
+- **Live-window refresh cadence** — the window repaints on its **own** timer
+  (`-window-interval`, default 0.2 s; `liveWindowDue()` / `liveWindowUpdate()` in
+  `main.cpp`), *not* on `-interval`. Every progressive driver (`runSppProgressive` for
+  R/W/D, `runCompositeProgressive` for P, the forward A/B/C loop, and the shared
+  multi-camera forward loop) computes two independent flags per report — `wantSave` on
+  `-interval` for the crash-safe PNG + `.ftbuf` + status line, and `wantWin` on the window
+  timer — and does only the work each one needs. They were one flag until 0.149.0, and the
+  consequence was that **any render finishing inside one `-interval` never displayed a live
+  frame at all**: the drivers only touched the window inside their
+  `done || sinceSave >= intervalSec` block, so a 5 s `-mode W` frame under `-interval 8`
+  painted exactly once, on `done`, as the process was exiting — the image appeared for a
+  split second and vanished.
+- **The window is created UP FRONT, not on the first repaint** (`liveWindowPlaceholder()`
+  in `main.cpp`). It used to be constructed lazily inside `liveWindowUpdate`, which meant
+  that in the ray-traced modes it did not exist at all until the first repaint — so the
+  "painted once, at the end" bug above was really "*created* once, at the end", and what
+  the user actually saw was a window flashing up as the process exited. Only the
+  raster/`-explore` path popped up an early placeholder. Since 0.149.1 both paths call
+  `liveWindowPlaceholder(w, h, stage)`: the raster block before tessellating, and `run()`'s
+  render dispatch (plus the top of `runRender` as a per-frame re-title) before the CUDA
+  probe / scene bake / device upload / first chunk. It fills a near-black frame and names
+  the stage in the title bar (`preparing…`, `tessellating (3/8)`, `mode W — starting…`), so
+  a long silent setup phase is legible instead of looking hung. It deliberately does **not**
+  stamp `g_lastWindowPaint`, so the first real frame lands the instant it exists rather than
+  waiting out a window interval. Because the placeholder now creates the window, "have we
+  painted yet" is tracked by its own flag `g_windowPainted` rather than by
+  `g_liveWin != nullptr` — the cold-cost exclusion below keys off the first *image*, and
+  conflating the two would have re-introduced the 4 s adaptive floor. Measured on
+  `gallery_rain` at 480² `-mode W`: window on screen at 2.2 s (as soon as the scene has
+  loaded) and live from spp 1, versus not existing until the render was over. The one
+  remaining silent stretch is the scene load itself, which is before the frame size is
+  known — opening a guessed-size window there would leave it the wrong shape for the whole
+  render, so it isn't done.
+- Repaint granularity is bounded below by the renderer's chunk size, not by this timer:
+  `gpuSppChunks` / `cpuSppChunks` retarget ~0.15 s per chunk with a 1 spp floor, so a 480²
+  `-mode W -spp 8` frame gets one repaint per spp and the first complete image lands after
+  ~0.6 s. The floor is adaptive — `max(-window-interval, 12 × last measured repaint cost)`
+  — so a 4K film, or the shared multi-camera path where a repaint also forces a full
+  device→host film download (`liveWindowNotePaintCost` charges that to the same budget),
+  backs itself off instead of spending the render on painting. The **first** paint is
+  excluded from the estimate: it runs cold and includes one-time window creation, and
+  feeding its 342 ms in set a 4 s floor that made the second repaint also the last.
+  Measured on a 480² `-mode W -spp 8` frame: `-window` at all costs +0.28 s (pre-existing
+  D3D11 / swap-chain init), the seven extra repaints +0.20 s = **+3.9 %**.
+  `FTRACE_WINDOW_DEBUG=1` logs each repaint and its cost.
 - **`livewindow.*`** — Win32 live preview (`-window`/`-keepwindow`), interactive
   fly viewer input, camera-path timeline panel.
   The **image area is presented by D3D11**, the control strip below it by GDI.
@@ -2252,13 +2487,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (§E2 slice 3b) — two live loom channels, one transport, so a protocol or lifetime fix
   lands in both. `post()` overwrites an
   unstarted job, so a drag that moves a parameter every frame costs one bake of the final
-  value — latest-wins, and the UI never blocks. Each bake writes a fresh sidecar + `.ftsl`
-  into a per-process `%TEMP%\ftrace_viewer_<pid>` scratch dir; the bridge tracks the
-  outstanding files and deletes each as it is consumed (a superseded result's files are
-  dropped unread), then sweeps and removes the whole directory in `stop()`. Startup also
-  reclaims `ftrace_viewer_<pid>` dirs whose pid is no longer alive (`OpenProcess` failing
-  with `ERROR_INVALID_PARAMETER`), since a crashed or killed viewer can't clean up after
-  itself and only the next run ever can. Results are
+  value — latest-wins, and the UI never blocks. **Each bake is carried entirely over the
+  pipe the two processes already share — nothing per-frame touches the filesystem.** The
+  sidecar rides back inside the ack as a JSON member (`stealMember` *moves* the subtree
+  out, so the parse the bridge already did on its worker thread is the only one), and the
+  meshes ride as raw bytes: the emit request carries `"assets":"inline"`, which makes
+  loom's `EmitCtx.mesh_sink` divert the encoded mesh into a dict instead of writing it,
+  and `serve_viewer` frames those payloads **after** the ack line, back-to-back with no
+  delimiters, every length declared up front in the ack's `blobs:[{name,bytes}]` manifest.
+  A reader must therefore drain them even if it wants none, or the stream desyncs — hence
+  `LoomLink::readExact`. They arrive as an `assetbytes::Overlay` that `ftsl::loadSource`
+  consults before ever calling `open()`. This removed the *whole* per-frame filesystem
+  round-trip, whose dominant cost was not the I/O but Windows Defender scanning files
+  ftrace's own child had written microseconds earlier: 130.3 → **102.6 ms/frame**
+  (7.70 → 9.75 fps, n=104), with the `sidecar` term collapsing 22 → 2 ms and `ftsl` 31 →
+  21. The scratch dir is now only a *naming scheme* for the assets keys, never created;
+  `stop()` still sweeps it, and startup still reclaims `ftrace_viewer_<pid>` dirs whose
+  pid is no longer alive (`OpenProcess` failing with `ERROR_INVALID_PARAMETER`), since a
+  crashed or killed viewer can't clean up after itself and only the next run ever can —
+  both retained because older builds did litter. Results are
   adopted on whatever frame they land, preserving the user's orbit, zoom, active tab and
   DAG layout. **Third-party note:** `src/third_party/imnodes/imnodes.cpp` carries
   `[ftrace patch]` edits for imgui #7543 — see `known-issues.md`; re-vendoring imnodes must
@@ -2647,6 +2894,21 @@ per-unit RNG seeding (above) plus order-independent accumulation per band/tile;
 film merges are structured so paired runs differ only by summation-order ulps at
 worst (mode R) or are bit-identical (fixed splits).
 
+**Load-time loops use `src/parallel.h` (`ft::parallelFor`), not a hand-rolled pool.**
+Each renderer's pool is tuned to its traversal (raster.h keeps a persistent one,
+photonmap.h bands by photon block, isomesh.h splits the lattice) and none is reachable
+from the loader — so scene setup kept doing its embarrassingly parallel passes on one
+core, which is how per-texel spectral upsampling grew into a 45-second startup stall
+(see `upsample::fitMany`). `parallelFor(n, grain, fn)` is deliberately minimal: one
+atomic cursor handing out `grain`-sized chunks (chunk-stealing, because these loops
+have very uneven per-item cost), the caller acting as one of the workers, and a serial
+inline path below `2*grain` so a small array spawns nothing. It is for **pure,
+independent, one-shot** passes only; anything needing a reduction either keeps that
+reduction serial (envmap's mean radiance) or must justify the changed summation order.
+
+That same cursor is the program's **load-time cancellation seam** (0.138.2) — see
+"Stopping a render" below.
+
 ## Stopping a render (`g_stopRequested`, `-stop`)
 
 One flag drives every clean stop: `g_stopRequested` (`main.cpp`). It is raised by the
@@ -2677,6 +2939,34 @@ invisible under a sandboxed shell) and `Local\` objects are per-session.
 
 `-stop all` targets every live render, a bare `-stop` lists them, and both wait (≤120 s)
 for the targets to actually exit so a rebuild can be scripted immediately after.
+
+### Stopping during SCENE LOAD (0.138.2)
+
+The pid is published *before* `run()`, so a process can be signalled from the moment it
+starts — but until 0.138.2 the loader polled nothing, and a stop aimed at a process that
+hadn't reached its render loop was accepted and then waited out the full load. The load is
+now cooperatively cancellable at two granularities:
+
+- **Inside a long pass:** `ft::parallelFor` polls the flag at its chunk cursor, before
+  claiming work, so a stop drains the cursor and each worker finishes at most one chunk.
+- **Between assets:** `Builder::stopped()` polls it between top-level blocks in the
+  texture / pattern / `mesh_asset` / geometry / deferred-`medium` passes, which covers the
+  still-serial loaders (glTF/OBJ import, `meshvox::voxelizeSolid`, isomesh tessellation)
+  without threading them.
+
+`parallel.h` cannot name `g_stopRequested` — it is a file-static `volatile sig_atomic_t`,
+because a signal handler writes it — so `main()` hands it over as a **probe**
+(`ft::setStopProbe`) before any scene work. Reading it through a function pointer is free
+here precisely because it is read once per *chunk*, never per item.
+
+A cancelled `parallelFor` returns `false` and its output is **partial**, so the return is
+`[[nodiscard]]` and the contract is *abandon the load*, never "carry on with half a
+texture": `upsample::fitMany` → `Texture::buildReflCoeff` (which clears the partial
+coefficient table) → `addTexture` → load failure, and `EnvMap::buildFromRgb` → its `err`
+out-param. `main.cpp` reports it as `[stop] scene load stopped before rendering` and exits
+1 rather than printing a scene-error diagnostic. `prefer { } else { }` resolution aborts
+outright on a stop — treating an interrupted branch as *rejected* would otherwise make it
+build the next branch and ignore the stop for another whole load.
 
 ## GPU support gates fail safe, never coerce
 
@@ -2897,9 +3187,24 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
   `ftrace.exe` to the repo root. **Warning:** freshly-configured build dirs
   currently produce a GPU-silently-dead exe (see known-issues, 2026-07-22) — build
   in the long-lived `build_cuda2`.
+  **A running render no longer blocks the build (0.141.0).** Windows locks a live
+  exe against write/delete but still permits *rename*, so if the copy fails
+  build.bat moves the old binary aside to `build_cuda2/ftrace.locked.<n>.exe` and
+  installs the new one into the freed name; the running process keeps its mapped
+  image and is entirely unaffected (verified against two concurrent renders). Stale
+  parked copies are reaped at the start of the next build, once their holder has
+  exited. This exists to remove the one situation that used to tempt a
+  `taskkill /F` — which can wedge the NVIDIA driver into a TDR. Only if the rename
+  *also* fails does build.bat error out, and it then restores the old exe so the
+  root is never left without one.
 - `VERSION` (single `MAJOR.MINOR.PATCH` line) bumps with every observable rebuild;
   `release.bat` publishes repo-root `ftrace.exe` as GitHub release `v<VERSION>`
-  (refuses on duplicate tag).
+  (refuses on duplicate tag). CMake also `file(READ)`s it into the
+  `FTRACE_VERSION` compile definition (with `CMAKE_CONFIGURE_DEPENDS` on the file,
+  so a bump re-configures), which `ftrace -version` / `-V` prints and the `-h`
+  banner carries. Before 0.141.0 the binary was anonymous — two builds could only
+  be told apart by hashing them — so anything that needs to know which build it is
+  looking at should call `-version` rather than trusting a file date.
 - Output conventions: renders → `ppm/`/`png/` (flyby series in `png/<set>/`),
   scratch scripts → `scraps/`. Renders always launched with `-keepwindow`
   (+ `-checkpoint`/`-interval`) and outside the Bash sandbox so the live window is

@@ -14,10 +14,15 @@
 #pragma once
 #include <cmath>
 #include <array>
+#include <cstdint>
+#include <cstring>
+#include <unordered_map>
+#include <vector>
 #include "color.h"
 #include "spectrum.h"
 #include "lights.h"
 #include "meng_table.h"
+#include "parallel.h"
 
 namespace upsample {
 
@@ -130,6 +135,83 @@ inline std::array<double, 3> fit(double r, double g, double b) {
     const Basis& B = basis();
     double tX, tY, tZ; linSrgbToXyz(r, g, b, tX, tY, tZ);
     return fitSigmoid(B.N, B.lam, B.wX, B.wY, B.wZ, tX, tY, tZ);
+}
+
+// --- Bulk fit: fit(...) for a whole image, DEDUPLICATED and THREADED ---------------
+// A single fit is ~40 Gauss-Newton iterations over a 95-sample basis, i.e. a few
+// microseconds; run once per texel, serially, that is seconds per megapixel and it lands
+// squarely in scene-load latency (a 10-texture gallery scene spent ~45 s of its ~47 s
+// startup right here, before anything appeared on screen).
+//
+// Two exact accelerations, in this order:
+//   * DEDUPLICATE. The fit is a pure function of the colour, and an 8-bit source image
+//     decodes through a 256-entry per-channel table, so equal texels are BIT-equal
+//     Vec3s — hashing the raw bit patterns collapses them safely (no tolerance, no
+//     quantisation, so the output is bit-identical to fitting every texel). Real images
+//     collapse hard: the project's own procedural marble maps run 96 to 80 k distinct
+//     colours over 0.05-1.05 M texels, a 13x-to-10000x reduction. A photograph or an
+//     HDR float image dedups little, and then this costs one hash probe per texel.
+//   * THREAD the remaining distinct fits. They are independent and their cost varies a
+//     lot per colour (saturated colours never hit the residual bail-out and burn all 40
+//     iterations), so parallelFor's atomic chunk cursor is what keeps the tail even.
+//
+// `basis()` is touched before any thread starts so its function-local static is already
+// constructed — magic statics are thread-safe, but paying a guarded init on every worker
+// probe is pointless when the caller can do it once.
+//
+// Returns false if a clean stop (`ftrace -stop`, Ctrl-C) was requested while it ran, in
+// which case `out` is only partially written and the caller must abandon the load rather
+// than render with a half-filled coefficient table.
+[[nodiscard]] inline bool fitMany(const Vec3* in, size_t n, std::array<double, 3>* out) {
+    if (!in || !out || n == 0) return true;
+    (void)basis();
+
+    // Key = the three doubles' raw bits. memcpy (not a reinterpret_cast) so this stays
+    // free of strict-aliasing UB; -0.0 simply fails to dedup against +0.0, which is
+    // harmless (it fits to the same coefficients anyway, just twice).
+    struct Key {
+        uint64_t a, b, c;
+        bool operator==(const Key& o) const { return a == o.a && b == o.b && c == o.c; }
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const {
+            uint64_t h = k.a * 0x9E3779B97F4A7C15ull;
+            h ^= k.b + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+            h ^= k.c + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+            return (size_t)h;
+        }
+    };
+    std::unordered_map<Key, uint32_t, KeyHash> seen;
+    seen.reserve(std::min<size_t>(n, 1u << 16));
+    std::vector<uint32_t> which(n);
+    std::vector<Vec3> uniq;
+    uniq.reserve(std::min<size_t>(n, 1u << 16));
+    for (size_t i = 0; i < n; ++i) {
+        // One hash probe per texel is fast, but "fast per texel" is exactly how the
+        // serial fit got here — poll the stop flag once per 64 k so even a huge image
+        // can't sit through the dedup pass ignoring a stop.
+        if ((i & 0xFFFF) == 0 && ft::stopRequested()) return false;
+        Key k;
+        std::memcpy(&k.a, &in[i].x, sizeof(double));
+        std::memcpy(&k.b, &in[i].y, sizeof(double));
+        std::memcpy(&k.c, &in[i].z, sizeof(double));
+        auto it = seen.find(k);
+        if (it == seen.end()) {
+            uint32_t id = (uint32_t)uniq.size();
+            seen.emplace(k, id);
+            uniq.push_back(in[i]);
+            which[i] = id;
+        } else {
+            which[i] = it->second;
+        }
+    }
+
+    std::vector<std::array<double, 3>> uc(uniq.size());
+    if (!ft::parallelFor(uniq.size(), 64, [&](size_t i) {
+            uc[i] = fit(uniq[i].x, uniq[i].y, uniq[i].z);
+        }))
+        return false;
+    return ft::parallelFor(n, 65536, [&](size_t i) { out[i] = uc[which[i]]; });
 }
 
 // --- RGB -> illuminant (emission) spectrum upsampling ------------------------

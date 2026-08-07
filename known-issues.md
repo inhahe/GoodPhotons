@@ -5,6 +5,995 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-07, v0.149.0, amended v0.149.1): the live window cannot repaint mid-image — its finest granularity is one whole image at 1 spp, not "every N rows"
+
+**What was asked for vs what was delivered.** The request was for the live window to refresh
+*during* a deterministic mode-W render — "on every so many rows, or once a row or whatever" —
+because a mode-W frame appeared to pop up only for a split second at the end. The cause turned
+out to be that the window repaint was gated behind the *same* `-interval` timer as the crash-safe
+PNG + `.ftbuf` write (default 15 s), so a 5.6 s frame legitimately got exactly one paint, at the
+end. v0.149.0 fixes that by giving the window its own timer (`-window-interval`, default 0.2 s)
+with an adaptive cost budget, in all four progressive drivers. A 480² mode-W frame now paints 8
+times instead of 1.
+
+**Correction (v0.149.1) — the first version of this entry, and the code comments written with
+it, both asserted that "the window was up the whole time, it just never received an image."
+That was wrong, and the user was right to push back on it: they had never seen a window during
+a mode-W render at all.** The early dark-placeholder window only ever existed on the
+raster/`-explore` path; in the ray-traced modes `LiveWindow` was constructed *lazily inside
+`liveWindowUpdate`*, i.e. on the first repaint. So "painted once, at the end" was also "created
+once, at the end" — the window genuinely did not exist until the render was over, which is
+exactly the flash-and-vanish that was reported. v0.149.1 adds `liveWindowPlaceholder()` and calls
+it from `run()`'s render dispatch (before the CUDA probe, scene bake, device upload and first
+chunk) as well as from the raster block, so every mode shows the window up front with the stage
+named in the title bar. Measured on `gallery_rain` at 480²: window on screen at 2.2 s, live from
+spp 1. **The lesson for the next entry: "the mechanism I changed explains the symptom" is not the
+same as "I observed the symptom go away," and a user saying they never saw something is data.**
+
+Two smaller things fell out of that fix and are worth knowing:
+- "have we painted yet" is now its own flag (`g_windowPainted`), not `g_liveWin != nullptr`. The
+  cold-first-paint exclusion in the repaint budget keys off the first *image*; once the
+  placeholder creates the window, conflating the two would charge the cold 340 ms paint to the
+  budget and re-impose a ~4 s repaint floor, which is the bug that limited v0.149.0 to two
+  repaints before it was caught.
+- **Scene load is still windowless** (2.2 s on `gallery_rain`, and it was ~47 s before v0.138.1
+  parallelised the spectral texel upsample). The placeholder can't be opened any earlier because
+  the frame size isn't known until the scene is parsed, and opening a guessed-size window would
+  leave it the wrong shape for the entire render — `LiveWindow::update` accepts a new image size
+  but the OS window keeps its construction-time dimensions and just letterboxes. If load time
+  ever regresses badly enough to matter, the fix is to let `LiveWindow` resize its own window on
+  the first differently-sized `update()`, then open a small placeholder before parsing.
+
+**But the row-level granularity that was literally asked for is not achievable in the current
+architecture, and this entry records why.** A repaint can only happen where the driver regains
+control, which is between *chunks*: `gpuSppChunks` (`src/render_cuda.cu` ~12126) sizes each chunk
+to about 0.15 s of GPU work but has a **hard floor of 1 spp**, and `cpuSppChunks` is the same. So
+the shortest interval at which anything can reach the window is however long one full-image
+sample pass takes — ~0.62 s at 480², and it scales with pixel count. Below that, the megakernel
+is in flight and the film is mid-write on the device; there is nothing coherent to show.
+
+**Why this is mostly fine, and exactly when it is not.** For mode W it is arguably *better* than
+rows: spp buys only antialiasing and spectral resolution, no noise reduction, so the very first
+chunk already delivers a complete, essentially-final image rather than a partial one with a hard
+edge across it. The failure case is a frame big enough that a single spp takes tens of seconds —
+a 4K mode-W render, or any scene heavy enough per-sample — where the window would still sit empty
+for that whole first pass and the original complaint would return unchanged.
+
+**The proper fix if that case ever matters:** slice the sample pass itself into row bands, i.e.
+have `gpuSppChunks` be able to emit a *partial-image* chunk (rows `[y0,y1)` at 1 spp) and have the
+progressive drivers tone-map and blit only the completed band. That is a real change to the launch
+geometry, and it trades GPU occupancy for latency — narrow bands mean more launches, worse
+scheduling, and a measurable slowdown on exactly the large frames that motivated it. It should not
+be done speculatively; do it only when a concrete render is observed sitting blank, and gate it so
+the banding only kicks in once a projected 1-spp pass exceeds the window interval by a wide margin.
+
+**Cost of what *was* shipped, measured on a 480² 8-spp mode-W frame:** no window 5.15 s, window
+with 1 repaint 5.43 s, window with 8 repaints 5.63 s. So the extra repaints are +3.9 %, and the
+per-repaint cost is ~26 ms (down from ~40 ms after `filmToRgb8`'s auto-exposure anchor was changed
+from a full `std::sort` to `std::nth_element` — bit-for-bit identical, verified). `FTRACE_WINDOW_DEBUG=1`
+prints each repaint with its measured tone-map+blit cost if this needs re-measuring.
+
+### NOTE (2026-08-07): GitHub will not play a repo-hosted video in README.md — the demo GIF is not a stylistic choice, don't "improve" it back into a `<video>`
+
+The README demo was first committed as an HTML5 `<video>` tag pointing at the committed
+`pastel_jack_ring.mp4`. It rendered as **nothing at all** on github.com. Two independent
+reasons, both measured rather than assumed, and either one alone is fatal:
+
+1. **GitHub's Markdown sanitiser deletes `<video>` outright.** Verified by posting the README
+   through GitHub's own renderer — `gh api -X POST markdown -f mode=gfm -f context=inhahe/goodphotons`
+   — which returns an empty `<p></p>` where the `<video>` was, while `<img>` and `![]()` survive
+   (the GIF even gains `data-animated-image=""`). Videos *do* work in issues/PR comments, but
+   only via GitHub's own upload endpoint, which rewrites them to a `user-images.githubusercontent.com`
+   asset URL. A path inside the repo can never become one of those.
+2. **`raw.githubusercontent.com` serves repo media with the wrong content type under `nosniff`.**
+   Measured with `curl -sI`: `.png` → `image/png` (fine), but `.mp4` → `application/octet-stream`,
+   and `.gif` / `.webp` → `text/plain`, all with `X-Content-Type-Options: nosniff`. So even a
+   sanitiser-surviving tag pointed at a raw URL would be refused by the browser. `<img>` escapes
+   this only because GitHub proxies image sources through `camo`, which re-serves them with a
+   correct image content type — that proxy is the entire reason the GIF works.
+
+**Consequence, which is why both files are committed and both are `.gitignore` exceptions:**
+the animated GIF (320², 20 fps, 3.3 MB) is the *only* thing that plays on the repo page, so it
+is the embed; the MP4 (480², 60 fps, 3.4 MB) is the full-quality download linked beside it.
+An animated WebP was built and tested first (2.78 MB, better quality per byte) and **discarded**
+— raw serves `.webp` as `text/plain`.
+
+**If the GIF ever needs re-encoding, use gifski, not ffmpeg's palettegen.** Same clip:
+ffmpeg palettegen bottomed out at 5.3 MB for acceptable quality; gifski 1.7.1 (installed via
+npm) hit 3.27 MB at 320²/20 fps/`--quality 65` with visibly less banding on the gyroid glass.
+Command shape: `gifski -o pastel_jack_ring.gif --fps 20 --width 320 --quality 65 frames/*.png`.
+
+### PERF — FIXED (2026-08-06, v0.148.0): the live viewer pays ~17 ms/frame to Windows Defender for opening files it wrote itself
+
+**This is the finding that came out of building the binary mesh handoff, and it is bigger than
+the handoff was.** The `.ftmesh` format did exactly what it was designed to do — the *decode* of
+the per-frame mesh went from ~6 ms to ~1 ms — and the viewer's `assets` term still only fell
+`14 -> 9 ms`, because ~8 ms of it was never decoding at all.
+
+**Symptom.** `meshbench` loads a 4320-triangle `.ftmesh` (read + decode + crease-smooth) in
+**1.43 ms**. The live viewer's `[play] ftsl 31 = parse 16 + assets 9 + accel 2 + rest 1` reports
+**9 ms** for that one `loadFtmesh` call and nothing else. 6x apart, on the same bytes, on the same
+machine. The difference is that meshbench re-reads *the same file* 40 times while the viewer opens
+a **freshly written** one every frame.
+
+**Root cause — measured, not guessed** (`scraps/freshread.py`). Splitting `open()` from `read()`
+on a 76 KB file that another process just wrote:
+
+```
+open()   median 8.031 ms   min 6.153      <-- before a single byte is read
+read()   median 0.081 ms   min 0.067
+```
+
+Three probes identify it as Defender's real-time scan, not the filesystem:
+
+- **The verdict is cached.** 1st open after a write: 8.24 ms. 2nd open of the same
+  file: **0.066 ms**. 125x — that is a scanner memoizing a clean verdict, not a cold page cache.
+  (Cached against the *path*, not the content — see the correction below; the original wording
+  here said "per content" and that was wrong.)
+- **It is about the file being new, not `os.replace`.** Writing to a brand-new filename with no
+  replace at all costs the same 7.67 ms.
+- **It has a size threshold, not a throughput.** 1 KB -> 1.2 ms, 8 KB -> 1.1 ms, then 32 KB
+  through 1024 KB all sit flat at **8.5–9.9 ms**. A copy or a hash would scale with size; this
+  does not. `Get-MpComputerStatus` confirms `RealTimeProtectionEnabled : True`.
+
+(A fourth symptom had already been papered over without being understood: `atomicio.py` retries
+`os.replace` past `ERROR_SHARING_VIOLATION`. Re-running the probe without that retry raises
+`PermissionError: [WinError 5]` within ~40 iterations — the scanner still holding the destination.)
+
+**Scope — it is not just the mesh.** Every file loom hands ftrace per frame pays this once, if
+it clears ~32 KB:
+
+```
+              size      of which is the first-open gate
+  sidecar    903 KB     ~9 ms of `sidecar 22 = json 21`   (~13 ms is the actual minijson parse)
+  .ftmesh     76 KB     ~8 ms of `assets 9`               (~1 ms is the actual load)
+  .ftsl      7.8 KB     ~0 ms  (under the threshold)
+```
+
+So roughly **17 ms of the 129.6 ms frame — 13 % — is antivirus opening files this process's own
+child just created.** That is more than the entire GPU raymarch kernel (6 ms), and comparable to
+what either of the last two optimizations recovered.
+
+**Why this is a real bug and not a machine-config note.** The obvious "fix" — exclude
+`%TEMP%\ftrace_viewer_*` in Defender — needs admin, is per-machine, silently doesn't apply to
+anyone else, and weakens the user's AV to work around a design choice that was ours. **The design
+choice is the bug: the live channel round-trips geometry through the filesystem when the two
+processes already have a pipe open between them.**
+
+**Fix (shipped 0.148.0).** Stop writing per-frame files. loom and ftrace already speak
+newline-delimited JSON over stdio (`LoomBridge` <-> `python -m loom.viewer`), so the mesh and the
+sidecar now travel **in that channel**: the sidecar as a JSON member of the ack, the meshes as raw
+payloads framed after it against a `blobs:[{name,bytes}]` manifest, landing in an
+`assetbytes::Overlay` that `ftsl::loadSource` consults instead of opening anything. Nothing
+per-frame touches a path an on-access scanner watches — verified by the absence of any
+`ftrace_viewer_*` directory in `%TEMP%` during a live run. Measured in-viewer, same scene, `-play`:
+
+```
+                n    median    fps    bake  sidecar  ftsl  raymarch  other
+  v0.146       97    138.9     7.20     40      23     35        19     21
+  v0.147.0    185    130.3     7.70     38      22     31        20     18
+  v0.148.0    104    102.6     9.75     42       2     21        20     19
+```
+
+**-27.7 ms/frame, 1.27x** over 0.147.0 and 1.35x over 0.146. `sidecar` collapsed 22 -> 2 (its
+`json` sub-term 21 -> 0, because the parse moved onto the bridge's worker thread as part of
+parsing the ack it was already parsing); `ftsl` 31 -> 21 (its `assets` sub-term 10 -> 1). loom's
+own `bake` (~42 ms) is now the dominant per-frame term — see TODO §F8.
+
+---
+
+**Correction, same day: almost everything "obvious" about this gate was wrong, and the wrong
+model nearly deleted a working optimization.** Chasing the general (non-viewer) case with
+`scraps/warmbench.cpp` produced three rounds of results that contradicted each other, because
+the *harness* was wrong in a way the model above couldn't see. What the follow-up probes
+(`scraps/gateprobe*.py`, `scraps/gateprobe.cpp`) actually establish:
+
+- **The verdict is cached per path, NOT per content.** Copying an already-scanned file to a new
+  name, byte-identical, still costs **9.19 ms**. The original "cached per content" reading came
+  from re-opening *the same path* and doesn't support the conclusion drawn from it. This one
+  mattered: believing it, I made warmbench append a comment to each copied asset "so every file
+  is genuinely novel to the scanner" — and that append is what invalidated the whole benchmark.
+- **Waiting does not help.** Write a file, sleep, read it: **8.5–10 ms at every gap from 0 ms to
+  1000 ms**, for both direct writes and write-temp-then-`os.replace`. So it is a genuine
+  synchronous toll paid by the reader, not a race against a scan that would finish on its own.
+- **But it IS overlappable with other work, and that is the whole opportunity.** Opening a file
+  for write and closing it starts its scan in the background; a batch of 24 copy-then-append
+  files costs **1.2 ms/file** to open afterwards, while 24 plain copies cost **7.6 ms/file**.
+  Same bytes, same directory, same process — the only difference is whether something touched
+  each file early enough for the scan to drain concurrently.
+- **The cost is per file and stubbornly linear**: 24 fresh files = 234 ms of pure gate.
+
+The trap: warmbench's own freshening loop (copy + append, 24 times) *was* that early touch, so
+its "cold" control was really a second warm column — and it duly reported that prefetching
+saved -2.2 %, i.e. was worthless. The tell was arithmetic, not intuition: the whole "cold" load
+measured 128.9 ms when the gate alone should have been 234 ms. Removing the append flipped it to
+**+21.5 %**. Recorded here because the failure mode is general and cheap to repeat: *a benchmark
+that prepares its own cold case can warm it in the process, and it will report a real
+optimization as a regression.* Cross-check totals against a separately-measured floor.
+
+**Consequence.** `assetbytes::Warmer` ships and is on unconditionally for every scene load
+(`ftsl::loadSource` prefetches the scene's `file "…"` assets on one background thread while the
+GPDA parse runs). Cold: **-21.5 %** on a 24-mesh scene, **-6.2 %** on gallery's 27 MB. Settled,
+where it can only ever lose: it doesn't (-0.7 to -1.9 %). See `design.md` -> `assetbytes.h`.
+
+### PERF — FIXED (2026-08-06, v0.147.0): crease smoothing was quadratic in vertex degree, and was 2/3 of the cost of loading a mesh
+
+**Symptom.** Splitting the live viewer's `ftsl 35 = parse 16 + assets 14 + accel 2` further,
+`tools/meshbench.cpp` timed `loadObj` twice per rep — once with `creaseAngleDeg = -1` (read +
+text parse only) and once with `40` — and found the *smoothing*, not the text parsing, was the
+larger half everywhere, and got relatively worse with mesh size:
+
+```
+                          read+parse   + crease smooth   smoothing is
+orbit.obj        1.5k tri   0.97 ms        1.13 ms          54 %
+morphing_sweep   4.3k tri   2.30 ms        3.17 ms          58 %
+gyroid_ball     32.2k tri  16.44 ms       31.51 ms          66 %
+```
+
+This mattered because it is the half a binary mesh format **cannot** delete: however new
+geometry reaches the renderer, it still arrives without normals and still has to be smoothed.
+
+**Root cause.** The inner loop asked for a corner's interior angle by calling
+`cornerAngle(tri, weldedVid)`, which *searched* `weld[vi[0..2]] == weldedVid` to discover which
+corner it meant and then did two `sqrt`s and an `acos`. It was called once per **incident pair**,
+so a vertex of degree *d* paid O(*d*²) `acos` calls per fan rather than O(*d*) — ~78 k `acos` for a
+4.3 k-triangle mesh where 13 k would do. Two smaller costs rode along: a `std::map` weld (a
+red-black tree, pointer-chased, for what only needs exact-equality lookup) and a
+`std::vector<std::vector<int>>` incidence list (one heap allocation per welded vertex).
+
+**Fix** (`src/mesh.h`). Store the **corner id** `tri*3+c` in the incidence list instead of just
+`tri`, which makes the angle a direct lookup into an `ang[]` table computed once (3·nt entries);
+flatten the incidence list to **CSR** (counts → prefix sum → fill, which preserves the old
+ascending-triangle traversal order exactly); and swap the weld `std::map` for an
+`unordered_map` with an FNV hash of the quantized key (welded ids are opaque slots, and both
+containers assign them in first-seen order, so nothing downstream can tell).
+
+**Measured** (min of 30 reps, `tools/meshbench.exe`) — on the smoothing pass alone:
+
+```
+orbit.obj         1.13 -> 0.30 ms   3.8x
+morphing_sweep    3.17 -> 1.22 ms   2.6x
+gyroid_ball      31.51 -> 8.68 ms   3.6x
+```
+
+**Verification, and a bug it turned up.** Every `.obj` in the tree (189 files, up to 4.0 M
+triangles) was loaded with `smooth` under both builds and fingerprinted with FNV-1a over each
+triangle's positions, normals and UVs. **188 of 189 are bit-identical.** The one that differs,
+`meshes/klein_hunyuan.obj`, differs because the rewrite *fixed* a latent bug: 108 of its 634 280
+triangles are slivers with two corners closer together than the weld epsilon (2.6e-6), so those
+two corners weld to the same vertex. Such a triangle appears twice in that vertex's incidence
+list, and the old search-for-the-first-match returned **corner 0 both times** — double-counting
+one angle instead of summing the two angles at which the face actually touches the vertex. The
+new code carries the corner index, so each contributes its own. `scraps/degen_probe.py`
+reproduces the census. No other mesh in the tree has a collapsing corner.
+
+**Note the reporting is again the *minimum* of N reps**, for the reason recorded in the entry
+below: background load can only make a single-threaded sample slower.
+
+### PERF — FIXED (2026-08-06, v0.146.0): the GPDA graph walk spent ~45 % of its time on whitespace tokens it then threw away
+
+**Symptom.** The per-frame `.ftsl` reload split (added in 0.145.0) put the **text parse**, not the
+temp-`.obj` load, at the top: `ftsl 78 = parse 40 + assets 25 + accel 3`. A 7.8 KB scene taking
+~40 ms to parse is **~200 KB/s** — *worse* than the JSON parser was before the 0.144.0 fix, and
+about 100× off what a parser of this shape should do.
+
+**Root cause.** The tokenized GPDA engine treats a `skip_types` token (whitespace, comments) as
+*optionally consumable*, so the main loop handles one by running a full epsilon-closure
+(`expand_all`) plus a `dedup`, matching nothing, and then restoring the cursor set **exactly as it
+was**. Measured with a token histogram rather than assumed:
+
+```
+WS       1121  (45.4%)  [SKIPPED by grammar]     <-- pure no-op rounds
+WORD      461  (18.7%)
+NUMWORD   451  (18.3%)
+NEWLINE   116  ( 4.7%)   <-- NOT a skip type; grammar-significant
+_lit_8    109  ( 4.4%)
+_lit_9    109  ( 4.4%)
+STRING    100  ( 4.1%)
+```
+
+FTSL declares `skip_types = {"COMMENT", "WS"}` and **no node in the graph matches either**, so
+every one of those 1121 rounds was provably incapable of changing anything.
+
+**Fix.** `Graph::finalize()` now precomputes the graph's terminal alphabet — the token *types* some
+`MatchTok` accepts and the token *values* some `MatchStr` accepts, which are the only two ways
+`token_matches()` can return true. `Graph::inert_skip(tok)` is then a skip-type token that neither
+set can accept, and `Parser::parse` drops those from the stream alongside the `EOF` sentinel,
+before any work. It is derived from the graph, so a grammar that *does* reference its skip type as
+a significant separator keeps it automatically and no grammar needs annotating.
+
+**Measured** (`tools/ftslbench.cpp`, 7788 bytes / 2468 tokens, **minimum** per-rep — see the note
+below on why not the mean):
+
+```
+                 before    after
+tokenize          5.0 ms   4.8 ms
+graph walk       16.3 ms   8.8 ms    1.86x   (predicted 1.83x from the 45.4% share)
+total            21.6 ms  13.6 ms    1.59x
+```
+
+**Correctness.** Canonical parse-tree dumps (name/value/line/col, every node, in order) from the old
+and new engines over **every `.ftsl` in the tree — 3909 files, 3908 of which parse** — are
+**byte-identical**: 113,069,546 bytes, md5 `3f3cac21a3d39a3e435995bf9c28102c`. The one failing scene
+fails with the identical message in both. This is expected rather than lucky: a token no terminal
+matches never produced a `ParseNode`, so removing it removes nothing from the output, and every
+consumer of a token *position* indexes the filtered vector itself.
+
+**Methodology note — quote the minimum, not the mean.** This measurement was taken while a backup
+job (CrashPlan + LithicBackup + Defender scanning it, ~5 of 12 cores, all running as SYSTEM and so
+invisible to a `Get-Process`-based CPU sampler) had the machine at ~90 %. Background load can only
+ever make a sample *slower*, so for single-threaded work the mean measures the machine's mood while
+the **min measures the code** — and the min was reproducible to ~2 % across runs while the mean
+moved 50 %. `tools/ftslbench.cpp` now prints both, so a large min/mean gap is itself the signal that
+a run was contended.
+
+**Not yet measured end-to-end.** The in-viewer effect (the `[play] ftsl` term and the frame rate)
+still has to be taken on a quiet machine; the play loop could not even complete a frame under the
+load above. Expect roughly `parse 40 → 25 ms` on this scene, so `ftsl 78 → ~63 ms`.
+
+**Still open after this.** The lexer is ~2 µs/token (regex-based) and the graph walk is still
+~3.5 µs/token, both far above what this work needs; and the real prize is still the one the user
+named — a direct mesh handoff that deletes the per-frame text round-trip entirely, rather than
+making the round-trip faster.
+
+### PERF — FIXED (2026-08-06, v0.144.0): `minijson` parsed at ~5 MB/s because one member made `Value`'s move throwing, so `std::vector` DEEP-COPIED on every growth
+
+**Symptom.** Parsing the viewer's ~0.86 MB introspection sidecar took **~170 ms** — roughly half of
+a played frame, and ~96 % of all sidecar-adoption cost (`sidecar 135 = json 129 + geom 1 + dag 1 +
+skins 0`). ~5 MB/s is one to two orders of magnitude below a competent JSON parser, so this was the
+*parser*, not the format or the file size.
+
+**Root cause.** `std::vector` only **moves** its elements when reallocating if the element type is
+nothrow-move-constructible; otherwise it must **copy** them, to preserve `push_back`'s strong
+exception guarantee. A JSON `Value` copies **deeply**. `minijson::Value` held
+`std::map<std::string, Value> obj`, and on MSVC `std::map`'s move constructor is **not** `noexcept`
+(it may allocate a sentinel node). That single member poisoned `Value`'s implicit move, so every
+array growth recursively cloned the entire tree parsed so far — quadratic, and worst exactly where
+these sidecars are heaviest (long numeric arrays). Confirmed before fixing, not inferred:
+
+```
+sizeof(Value) = 88   nothrow_move_constructible = 0     <-- vector COPIES on growth
+```
+
+**Fix.** Members are now a key-**sorted** `std::vector<std::pair<std::string, Value>>`. `find()`
+binary-searches for the same O(log n); `parseObject` appends and sorts once on close (O(n log n),
+rather than the O(n)-per-insert a sorted insert would cost); `stable_sort` + `unique` keeps the
+first of duplicate keys, exactly as `std::map::emplace` did. `std::string` and `std::vector` both
+move `noexcept`, so `Value`'s move is now `noexcept` **honestly** — a property of its members rather
+than an assertion we could not keep. A `static_assert` pins it.
+
+**Measured** (`tools/jsonbench.cpp`, back-to-back on one machine state, 0.86 MB):
+
+```
+old (std::map)        mean 169.7 ms    ~5 MB/s
+new (sorted vector)   mean  13.9 ms   ~65 MB/s     ~12x
+```
+
+**Correctness.** Canonical dumps of the entire parsed tree from the old and new parsers are
+**byte-identical** (920,365 bytes, md5 `9b22c72a70c842b45793a128d5d76bb0`) — iteration order is
+unchanged because both are key-sorted. The glTF consumer of this shared header still loads a
+425,992-triangle GLB and renders.
+
+**Effect in the viewer.** Per-frame sidecar adoption **90.5 → 30.5 ms**; the played frame
+**199.9 → 176.9 ms**, **4.61 → 5.39 fps**. Far less than 12× because JSON was only ~45 % of the
+frame — `bake` and `ftsl` now dominate. This is the **first actual optimisation** in this line of
+work; everything before it was measurement and the correction of earlier wrong diagnoses.
+
+**Lesson worth keeping.** Nothing about a `std::map` member *looks* slow, which is why this
+survived so long in a file explicitly labelled "not a general high-performance parser" — the label
+made the slowness feel expected and thus unexamined. Also note the near-miss: the obvious target in
+`adoptSidecar` was the unconditional `skins.release()/build()` (tearing down every GPU texture per
+frame), which is self-evidently wasteful and measured **0 ms**. Instrumenting before cutting is what
+caught it.
+
+### RESOLVED-AS-WRONG (2026-08-06, v0.142.0): the "Render pane re-upload dominates played frames" entry below is REFUTED. Measured on an idle card, the loom round-trip is **84 %** of the frame and the whole raymarch is **9 %**
+
+**Read this before the entry below it, which is retained only as a record of how the error was
+made.** With the GPU confirmed idle (`tools/gpu_by_process.ps1`: only the viewer itself at 2.7 %),
+the new `IsoPreviewTiming` split gives, averaged over 8 consecutive `[play]` samples of
+`scatter_modulated_sweep`:
+
+```
+4.54 fps   220.1 ms/frame
+  bake       41.0 ms   18.6 %     |
+  sidecar    96.5 ms   43.9 %     |  loom round-trip = 184.9 ms = 84.0 %
+  ftsl       47.4 ms   21.5 %     |
+  raymarch   20.1 ms    9.1 %   = upload 4.2 + kernel 6.4 + readback 9.2
+  other      18.2 ms    8.3 %
+```
+
+**Three conclusions, all inverting the earlier entry:**
+
+1. **The FTSL/sidecar round-trip IS the bottleneck** — 84 % of the frame. The earlier entry called
+   it "real but *secondary*" at ~23 %. That was the original hypothesis (emit `.ftsl` → parse →
+   load per frame) and it was **correct all along**; it was dismissed on contaminated data.
+2. **The re-upload is not worth fixing.** `upload` is **4.2 ms — 1.9 % of the frame**, not the
+   claimed 274 ms. A resident GPU scene would buy ~2 % at best on scenes of this size. The
+   *structural* observation (the whole scene really is re-marshalled per call) stands, but it is
+   redundant **cheap** work here. Do not build the cache on this evidence; see the texel entry
+   below for the one configuration where it would matter.
+3. **`raymarch 297 ms` was ~93 % contention artefact** — it fell to 20.1 ms (≈15×) with nothing
+   else on the card. Within it, `readback` (9.2 ms, D2H + host tone map) now costs *more than the
+   kernel* (6.4 ms), which the old single number could not have shown.
+
+**Independently reproduced at n=50 (2026-08-06, same build).** A full play session
+(`png/loom_play_idle.log`, 247 frames, 50 `[play]` samples) — 6× the sample count above, and the
+relevant check given that this diagnosis already reversed once on bad measurement:
+
+```
+4.61 fps mean (min 4.30, max 5.10)
+  bake       45.5 ms   |
+  sidecar    90.5 ms   |  loom round-trip = 184.0 ms   (n=8 run: 184.9 ms)
+  ftsl       48.0 ms   |
+  raymarch   15.9 ms  = upload 3.0 + kernel 3.7 + readback 8.8
+```
+
+The round-trip reproduces to within 1 ms, so the headline number is solid. Two things sharpen:
+`readback` is now **2.4× the kernel**, i.e. the phase named "raymarch" is mostly *moving pixels
+back*, and the actual GPU trace is **1.7 % of the frame** — so even making tracing infinitely fast
+would be invisible. `upload` at 3.0 ms sits even further below the retired 274 ms premise.
+
+**Where the remaining time actually is, in priority order:** `sidecar` 96.5 ms (parse the
+introspection JSON, rebuild the DAG and skin buffers) ≫ `ftsl` 47.4 ms ≈ `bake` 41.0 ms. Note also
+that the viewer re-writes and re-loads a temp `.obj` per frame (`loadObj: …/ftrace_viewer_<pid>/
+morphing_sweep.obj` appears repeatedly in the log). The right fix is the one originally proposed:
+a direct geometry channel from loom into the viewer that skips serialising to `.ftsl` + JSON and
+re-parsing them every frame. That is TODO F8b territory.
+
+**Methodology note — this is the third diagnosis this profile has produced.** "raymarch dominates"
+(wrong), "fixed 274 ms = the re-upload" (wrong), and now this one. What finally settled it was not
+more reasoning but (a) waiting for an idle card and (b) instrumenting the phases so they could not
+be inferred from a two-point fit. Both were available the whole time. Any future perf claim about
+this pane should quote a `[play]` line *and* a `tools/gpu_by_process.ps1` reading taken together.
+
+### SUPERSEDED (2026-08-06, v0.140.0) — retained as a record of a wrong diagnosis: "the viewer's Render pane re-uploads the WHOLE scene to the GPU every frame — ~274 ms of a ~570 ms played frame"
+
+**Where.** `renderIsoPreviewCuda`, `src/render_cuda.cu` ~12696, called from `RenderPane::render`
+in `src/viewer_gui.cpp`. Nothing persists between calls: every invocation runs `buildUpload(scene,
+cam, W, H, up)` (geometry, BVH, materials), re-derives and re-uploads the preview lights, the
+per-material colour + emissive arrays, **every texture's full texel array**, and the
+material→texture bindings, then does three fresh `cudaMalloc`s for the accum / z / emissive
+buffers.
+
+**Measured.** With the F8a paced-play transport running `scatter_modulated_sweep` at 48 frames,
+the viewer's own `[play]` trace reads:
+
+```
+[play]  1.7 fps  574.4 ms = bake 40 + sidecar 87 + ftsl 46 + raymarch 297 + other 104
+```
+
+The raymarch dominates, and it is **not pixel-bound**. Dropping 640² → 256² (6.25× fewer pixels)
+moved it only 439 → ~300 ms. Solving the two points gives **fixed ≈ 274 ms, pixel ≈ 165 ms** at
+640². The fixed 274 ms is the per-call re-upload described above — it is paid identically at any
+resolution, so no amount of resolution tuning can touch it.
+
+**Note this partly refutes the obvious hypothesis.** The FTSL round-trip the frame appears to be
+"about" (sidecar 87 + ftsl 46 = 133 ms, ~23%) is real but *secondary*. The expensive thing is the
+preview kernel's non-resident GPU scene.
+
+**Proper fix.** Give the preview path a **resident GPU scene**: keep the `DUpload` (or an
+equivalent handle) alive across calls, hash/version the scene so an unchanged mesh, BVH, material
+table and texture set are not re-sent, and pool the accum/z/emissive allocations instead of
+`cudaMalloc`/`cudaFree` per frame. Only the camera and the frame's changed geometry should cross
+the bus. This also directly strengthens the case for TODO F8b (prebaked play), since a prebaked
+sequence would upload each frame's geometry exactly once.
+
+**Shipped partial mitigation (v0.140.0).** `RenderPane` gained a `play res` slider (64–1024,
+default 256) and renders in draft at that resolution *while the transport is playing*, snapping
+back to full res on pause. Worth 1.4 → 1.8 fps (~25%) — it can only attack the 165 ms pixel half.
+
+**CONFOUNDER — re-measure before acting on the split (found 2026-08-06, after the fact).** These
+numbers were taken while another process (`python`, pid 103640) was holding **90–93 % of the GPU**;
+see the GPU-contention entry below, where the same confounder cost me two wrong diagnoses. The
+`raymarch 297` term is the only GPU-side term in the breakdown, so it is inflated by contention
+while `sidecar 87` / `ftsl 46` (pure CPU) are not. **The ranking may therefore invert on an idle
+card**, which would make the loom round-trip the real bottleneck after all — the very hypothesis
+this entry claims to refute.
+
+What survives the confounder and what does not:
+- **Survives:** the *structural* finding that `renderIsoPreviewCuda` re-uploads the whole scene per
+  call. That is read off the code, not the clock, and the fix is right regardless.
+- **Survives:** the fixed-vs-pixel *decomposition* (a resolution change that barely moves the time
+  implies a large resolution-independent term), since contention scales both points.
+- **Does NOT survive:** every absolute millisecond figure, the "raymarch dominates" claim, and the
+  "133 ms is only ~23 %" dismissal of the loom round-trip.
+
+**Re-run the `[play]` trace with the card idle** (check `tools/gpu_by_process.ps1` first) before
+using this entry to prioritise F8b.
+
+**SECOND correction (2026-08-06, v0.141.0): the "fixed 274 ms = the re-upload" attribution is an
+INFERENCE, not a measurement, and it is almost certainly wrong.** `fixed ≈ 274 ms` was derived as
+"whatever does not scale with pixels" in a two-point resolution fit. It was then *labelled* the
+per-call re-upload without anything measuring the upload itself. That does not survive a sanity
+check on volume: the scene being played (`out/seam_check.ftsl`) is 117 lines, **one 4320-triangle
+mesh and zero textures**, marshalling to roughly **1.4 MB**. At PCIe speeds that is well under a
+millisecond — it cannot be 274 ms. Far more likely, the resolution-independent term is
+`cudaMalloc`/`cudaFree` and the `cudaDeviceSynchronize` in `cudaCheckKernel` *blocking behind the
+foreign process* — fixed cost that has nothing to do with upload volume and would largely vanish on
+an idle card. So the resolution fit is sound; only the attribution of its fixed half is not.
+
+**Instrumentation added (v0.141.0) to settle it directly.** `renderIsoPreviewCuda` now takes an
+optional `IsoPreviewTiming*` (`src/render_cuda.h`) and reports **upload / kernel / readback**
+separately; the viewer's Live panel and the printed `[play]` trace both show the split:
+`raymarch N = upload A (scene) + kernel B (pixels) + readback C`. This exists so the phases can
+never again be ranked by inference: `upload` scales with scene size and is CPU+DMA, `kernel` scales
+with pixels and is the *only* SM-bound phase (hence the only one a foreign GPU process inflates),
+`readback` is pixels and mostly CPU. Read `upload` against `bake + sidecar + ftsl` to decide whether
+a resident GPU scene is worth building **for the scene actually in front of you**.
+
+### OPEN (2026-08-06, v0.142.0): `ftrace -stop` cannot see or stop the VIEWER — the one CUDA-using process with no clean CLI shutdown
+
+**Symptom.** `ftrace -stop` (bare) lists live renders and finds nothing while a `-viewer` process is
+running and driving CUDA through the Render pane. `ftrace -stop <viewer-pid>` likewise does nothing.
+The only ways to stop a viewer are closing its window by hand or `taskkill /F` — and CLAUDE.md
+forbids the latter precisely because force-killing a process with CUDA kernels in flight is a known
+route to an NVIDIA TDR/bugcheck. So the *one* long-lived process the project has no clean stop for is
+also one that holds a CUDA context.
+
+**Where.** `src/main.cpp:10874` — the `-viewer` branch does `return runViewerGui(...)` and
+short-circuits the renderer. `stopChannelStart()` is only called at `main.cpp:10909`, 35 lines
+further down the render path, so a viewer never publishes its `<temp>/ftrace/<pid>.run` file and
+never starts the watcher thread that polls for `<pid>.stop`. Nothing about the stop channel is
+render-specific — it is a pid-keyed sentinel file plus a 250 ms polling thread, entirely independent
+of what the process is doing.
+
+**Proper fix.** Call `stopChannelStart("viewer -> " + sidecar)` before `runViewerGui` and
+`stopChannelEnd()` after it, and give the viewer's frame loop a `g_stopRequested` poll that breaks
+out to the same orderly teardown the window-close path already takes. The one-shot semantics and
+the 120 s wait in `-stop` need no change. Worth doing together with the `.run` label, so
+`ftrace -stop` bare-lists the viewer as a viewer rather than as a render.
+
+### PERF / LATENT (2026-08-06, v0.141.0): the preview re-marshals every texel of every texture, every frame — ~50 MB/frame for one 2048² skin
+
+**Where.** `renderIsoPreviewCuda`, `src/render_cuda.cu` ~12740: the `hTexels` loop flattens *all*
+textures into one `std::vector<DVec3>` and uploads it on **every call**, including a call triggered
+by nothing but a one-pixel camera nudge. `DVec3` is three `Real`s — `float` under the default
+`FTRACE_GPU_FP32=ON`, so **12 bytes per texel**.
+
+**Why it is not hurting yet.** The loom scenes currently driven through the viewer have **no
+textures at all**, so `hTexels` is empty and this costs nothing. That is the only reason it is
+invisible — it is a property of the test scenes, not of the code.
+
+**Scale when it does bite.** One 2048² image skin = 4.19 M texels × 12 B = **~50 MB re-marshalled
+and re-copied per frame**; two of them, or a 4096² skin, and the Render pane falls off a cliff. The
+host-side `push_back` loop that builds the array is pure CPU and is likely the worse half.
+
+**Proper fix.** Same resident-scene fix as the entry above — textures are the *most* obviously
+static part of a scene and should be uploaded once and versioned. If a narrower fix is wanted first,
+hoisting just the texel array out of the per-call path captures most of the risk. Also worth
+storing texels as 8-bit or `half` on the device rather than 3 × `float`, since a preview shading
+term does not need 32-bit-per-channel colour.
+
+### RECURRENCE (2026-08-06) of the 2026-08-04 GPU-contention issue below — plus the per-process detector it was missing
+
+**This is the same issue as "OPEN (2026-08-04): a GPU render can be starved to a standstill by
+ANOTHER process on the card"** further down this file. Logged separately only because it produced
+a clean magnitude measurement and a *usable detector*, both of which that entry lacked.
+
+**Measured magnitude.** Identical scene, resolution, mode and sample count; only `-device` differs:
+
+```
+ftrace -in out/seam_check.ftsl -mode W -spp 1 -o ... -window     # 520x520
+
+-device cpu    [spp] 1 / 1,   0.5 s, deterministic     (12 CPU threads)
+-device auto   [spp] 1 / 256, 1584.8 s, deterministic  (RTX 4090)
+```
+
+**0.5 s on twelve CPU cores against 26 minutes on a 4090**, for 1 mesh (2160 verts / 4320 tris),
+93 spheres, 5 quads and one area light. The renderer's own adaptive chunk target is 0.15 s. Both
+images are correct; the GPU run completed and exited 0. So `-device cpu` is not merely a
+"workaround when the card is busy" — under contention it is **three orders of magnitude** better,
+which is worth knowing before choosing a device.
+
+**Read that table only as a statement about contention, never about the GPU path** — see the
+resolved caveat at the end of this entry: the same GPU command on an *idle* card takes **0.1 s**,
+five times faster than the CPU.
+
+**The detector the old entry says does not exist — it does, just not in `nvidia-smi`.** That entry
+concludes contention is invisible from inside the process ("`nvidia-smi` reports 100 % busy either
+way, and per-process VRAM is N/A under WDDM"), and ftrace's own `[gpu-stall]` text still advises
+"check `nvidia-smi` for a second CUDA program" — advice that **cannot work on WDDM**. Windows'
+**GPU Engine** performance counters *do* attribute utilisation per process. During the stall:
+
+```
+   PID Name    Engine  Pct
+103640 python  3d      93.1     <-- owns the card
+ 42512 ftrace  3d       8.8     <-- our render
+```
+
+Sampled repeatedly, python held 90–93 % while ftrace got ~8.7 %. `tools/gpu_by_process.ps1` wraps
+the query (`Get-Counter` on `\GPU Engine(*)\Utilization Percentage`, whose instance names encode
+`pid_<n>` and `engtype_<kind>`).
+
+**Actionable improvements this unlocks, in priority order:**
+1. **Make `[gpu-stall]` name the culprit.** Query those counters from the watchdog thread and print
+   `[gpu-stall] pid 103640 (python) is using 93% of the GPU` instead of pointing at a tool that
+   cannot answer the question. This converts the single most confusing failure mode in the renderer
+   into a one-line explanation, and it is the cheapest item here.
+2. **Consider auto-falling back to the CPU on sustained foreign GPU load.** The `[vram]` gate
+   already falls back when the card is over budget; this is the same decision with a working input.
+   Given the 3000× measured here *under contention*, defaulting to CPU when another process holds
+   >80 % of the card would frequently be the *faster* choice, not a degradation. Note the gate must
+   key on **measured foreign load**, not on the device: with the card idle the GPU wins by 5×, so a
+   heuristic that merely distrusted the GPU would make things worse.
+3. The first-chunk timed probe and the `cudaEventQuery` poll loop already described in the
+   2026-08-04 entry's "Still open / proper fix" remain the structural fix for `-stop` / `-interval`
+   responsiveness; nothing here supersedes them.
+
+**Caveat on attribution — now RESOLVED (2026-08-06, v0.142.0).** The counters report the **`3d`
+engine**, not `Compute`, for both processes, so they measure engine occupancy rather than SM
+occupancy, and did not by themselves prove ftrace's kernel would be fast on an idle card. That
+clean experiment has now been run: when the competing python process exited, the identical command
+was re-issued on a confirmed-idle card (2 % util, no foreign CUDA process):
+
+```
+ftrace -in out/seam_check.ftsl -mode W -spp 1 -device auto -o png/wperf_gpu_idle.png   # 520x520
+
+contended (python at ~93%)   1584.8 s
+idle                             0.1 s      <-- ~16,000x
+cpu, 12 threads                  0.5 s
+```
+
+`png/wperf_gpu_idle.png` is **byte-identical** to the contended `png/wperf_gpu.png` (md5
+`28d88fc6c2bb88e0fec39444ec81ed39`) — same scene, same work, same output, contention the only
+variable. So it is now *proven*, not merely indicated: **ftrace's GPU mode-W path is fine.** It is
+not 3000x slower than the CPU, it is **~5x faster** (0.1 s vs 0.5 s), and 99.99 % of the 26-minute
+run was foreign-process starvation.
+
+This also strengthens improvement 2 above rather than weakening it: the CPU-fallback-under-contention
+heuristic is worth having *because* the GPU path is healthy — the fallback should key on measured
+foreign load, never on a belief that the GPU code is slow.
+
+### PERF (2026-08-06): `-mode W` inherits mode R's `-spp 256` default, but is deterministic at 1 spp
+
+Independent of the contention above, and cheap to fix. `spp = 256` is the backward-reference
+default (`main.cpp:6545`) and mode W inherits it, yet W exists precisely because its deterministic
+estimators "converge at ONE sample per pixel" (`main.cpp:3387-3388`) — and the progress line
+already concedes that spp there "only buys antialiasing and spectral resolution"
+(`main.cpp:4877`), which is why it prints `deterministic` instead of a noise percentage.
+
+So the advertised headline feature of the mode ("noise-free at `-spp 1`", README) is **not what you
+get by default**: a plain `ftrace scene.ftsl -mode W` does 256× more work than the mode needs, and
+in the run above that turned a 26-minute observation into a 112-hour projection.
+
+**Fix.** Default `spp` per mode rather than globally — 1 for W (or a small handful if antialiasing
+is judged worth it by default), 256 for R/V. An explicit `-spp` keeps overriding it.
+
+---
+
+**Methodology note — I diagnosed this THREE times before getting it right. The pattern is the
+lesson, not the conclusion.**
+
+1. *"GPU starvation from contention."* — the right answer, but I had not established it, and I
+   abandoned it under weak evidence.
+2. *"A non-terminating kernel."* — wrong. The render completed on its own after 1584.8 s.
+3. *"The GPU mode-W path is ~3000× slower than the CPU."* — wrong, and now **disproven by
+   measurement**, not just doubted: the same command on an idle card runs in **0.1 s** and emits a
+   byte-identical image, so the GPU path is ~5× *faster* than the CPU. The number was real; it
+   measured **contention**, not the code path.
+
+**Error 2 came from reading an instrument with no control.** I saw `100 % util, 1 % mem, ~95 W,
+2760 MHz` and concluded "occupancy without work = a spin". With ftrace exited and the render over,
+the same machine still read `100 %, 0 %, ~95 W`: that was the *baseline*, not a symptom, so every
+inference drawn from it was void.
+
+**Error 3 came from a controlled experiment with an uncontrolled variable.** The A/B was rigorous
+about scene, mode, resolution and spp — and silent about the other process on the card. Holding the
+obvious variables fixed felt like rigour, and disguised the one that mattered.
+
+Rules this earns:
+- **An instrument reading with no baseline is not evidence.** The difference between running and
+  idle is the measurement; a single absolute number is not.
+- **Before concluding "X is slow", enumerate who else is using X.** For any shared resource — GPU,
+  disk, network, a lock — "is something else using it?" precedes every performance conclusion.
+- **When the program under test states a diagnosis, disprove it explicitly before overriding it.**
+  `[gpu-stall]` said "The render is NOT hung" and named contention as the usual cause. It was right
+  on both counts, in writing, the entire time.
+- **"Hung" is falsifiable by waiting**, and waiting was free — the process was already running and
+  harming nothing.
+
+### TECH DEBT (2026-08-06): a "render every scene at a uniform budget" sweep cannot distinguish correct from broken — three separate false signals
+
+**Not a renderer bug.** This is about the *regression sweep methodology*, and it is logged because
+the sweep produced three different misleading results in a row and each one looked like a failure.
+
+**What was run.** All 104 `scenes/*.ftsl` at a flat `-n 200000` into `png/_reg_*.png`, exit 0.
+
+**The three false signals, all benign:**
+
+1. **19 scenes produced no output — they were *timeouts*, not failures.** Measured afterwards at a
+   trivial 96×72: `pattern_grid` needs **2461 s** (41 min) for its 256 spp, `usemtl` **1946 s**,
+   `procskin` **427 s**, `function` **446 s for 4 of 256 spp** (~110 s/spp). A uniform per-scene
+   time limit silently drops exactly the scenes that are most expensive, which are often the ones
+   most worth checking.
+2. **6 outputs came out black or near-black — and that is the physically correct answer.**
+   `expo.ftsl`'s `fstop` camera is **mode C**, a thin-lens *catch* at f/2.8 on a 36×24 sensor, so
+   photons must physically land on a finite aperture; `camrig_*.ftsl`'s `taking` camera photographs
+   *through* a modelled camera body and lens (a GLB with real optics). Both are legitimately
+   low-throughput forward paths. `camrig_cinema.ftsl`'s own header comment recommends `-time 900`
+   with `-checkpoint`; the sweep gave it 200 000 photons. Black is the correct render of an
+   under-exposed photograph, not a defect.
+3. **`sensor=0.0000` in the `[energy]` line is likewise not a leak.** `uvmesh` / `procskin` /
+   `usemtl` at 20 000 photons all report `absorbed + escaped = 1.000000` with `sensor` at zero —
+   energy is conserved exactly; the camera simply collected nothing, which is what a forward tracer
+   does at that photon count.
+
+**Why it matters.** All three failure modes are indistinguishable from real breakage if you only
+check exit codes and file existence — which is how the sweep was first (incorrectly) reported clean.
+Checking `mean(pixels)` afterwards then produced the *opposite* error, flagging six correct renders
+as suspect.
+
+**What a sound sweep needs:**
+- **Per-scene budgets, not one global budget.** Forward/catch-mode scenes (mode C, the camrig
+  family) need orders of magnitude more photons than a backward-mode scene; a flat `-n` is
+  meaningless across that range. Drive from `-noise <pct>` or a per-scene `-time`, not `-n`.
+- **A per-scene expected-outcome record** — at minimum "expected non-black: yes/no", so a correctly
+  dark render doesn't read as a failure. `expo`'s `fstop` and the five `camrig_*` `taking` cameras
+  are the known-dark set at low budget.
+- **Handle multi-camera and camera-path scenes explicitly.** Multi-camera scenes emit one file per
+  camera (`_reg_expo_fstop.png`), and the 9 camera-path scenes (`dolly`, `flythrough`,
+  `crystalloop`, `showcase_orbit`, `gallery`, `lanterns`, `_cam5b_*`, `_camA_travel`) emit frame
+  *sequences* — so naive `scene name → one png` matching reports both as missing.
+- **Compare against stored references**, not against "is the file there". Without a reference image
+  per scene the sweep can only catch hard crashes, which is the least interesting failure.
+
+### FIXED (2026-08-05, v0.138.3): `-preview` printed mojibake in a real console — the output code page was never set
+
+**Symptom (user-reported).** `ftrace scenes\gallery_rain.ftsl -preview -glass` drew the ANSI
+thumbnail as a field of garbage characters with the *correct colours* behind them. At the
+console's small font the garbage read as something like `rä¢` repeated across every row.
+
+**Cause.** Two entirely separate Windows console switches were being confused for one:
+
+| switch | what it does | were we setting it? |
+|---|---|---|
+| `SetConsoleMode(… ENABLE_VIRTUAL_TERMINAL_PROCESSING)` | *interpret* ANSI escape sequences | yes |
+| `SetConsoleOutputCP(CP_UTF8)` | *decode our bytes* as UTF-8 | **no** |
+
+The preview emits each cell as `"\033[38;2;…m\033[48;2;…m" "\xE2\x96\x80"` — an SGR colour
+pair (pure ASCII, so it always worked, which is why the colours looked right) followed by
+U+2580 UPPER HALF BLOCK as three raw UTF-8 bytes. A default CP437 console decodes those three
+bytes as three *separate* CP437 glyphs (`Γ`, `û`, `Ç`), so every one-character cell became
+three junk characters. Nothing was wrong with the colours, the escapes, or the image — only
+the byte→glyph mapping.
+
+This was not preview-specific: **36 other status lines contain an em dash** (U+2014, bytes
+`E2 80 94`) and were mangled the same way, including the `[stop] running renders — …` listing
+that this project's own docs tell you to read a pid out of.
+
+**Why it survived so long.** Every automated run in this repo redirects stdout to a `.log` or
+pipes it. Redirected output is not a console, so the bytes land in the file unmodified and
+read back perfectly in any UTF-8 editor. The bug is invisible unless a human is looking at a
+live console — which is exactly how the user found it.
+
+**Fix** (`src/main.cpp`): `enableAnsiTerminal()` now also calls `SetConsoleOutputCP(CP_UTF8)`,
+remembering the previous code page and restoring it from an `std::atexit` handler — the output
+CP is process-wide but the *console outlives the process*, so leaving it at 65001 would change
+the user's shell behind their back. The call was additionally hoisted to the very top of
+`main()`, because the `-stop` branch prints (em-dash-bearing) output and returns without ever
+reaching the render setup where `enableAnsiTerminal()` used to be called.
+
+**Verified** by running the repro in its own console window and reading back what conhost
+actually painted (`RawUI.GetBufferContents()`): the thumbnail rows come back as runs of
+`U+2580`, the checkpoint line's dash comes back as `U+2014`, and `GetConsoleOutputCP()` is
+437 both before and after the process — i.e. the restore works. Redirected runs are byte-identical
+to before.
+
+**Standing lesson.** A rendering CLI's console output can be broken in a way that no
+redirected test will ever catch. When touching terminal output, check it in a real console.
+
+### OPEN (2026-08-05): `scraps/_gemsweep.py` — `spread` is not resolution-stable and can invert a ranking
+
+Found while adjudicating a box vs sphere clip for `gallery_rain`'s crystal gyroid. `coverage`
+is a *count* of cells above the cut, so it is stable across render resolution (the same
+gyroid: 0.35% at 480px, 0.37% at 960px, published 0.37%). `spread` is not, and not by a
+little — the same two geometries, each metered at both resolutions:
+
+```
+                          spread @480px    spread @960px
+sphere-clipped gyroid         0.014            0.060
+box-clipped (1:3/4:1)         0.022            0.012
+```
+
+At 480px the box wins; at 960px the sphere wins by 5x. **The ranking inverts**, so any
+comparison that mixes resolutions is meaningless, and the rig currently offers no protection
+against doing exactly that (`GEMRES` is an env var and nothing records which value produced a
+given row).
+
+Cause: `spread` is the excess-weighted RMS chromaticity radius over *the set of cells that
+cleared the cut*, and the size and composition of that set depends on resolution — a finer
+grid resolves faint fringe structure into cells that clear the bar, and fringe cells have
+noisier chromaticity than core cells. So the statistic is conditioned on a
+resolution-dependent population. `sat` and `fan` share the same conditioning and are probably
+affected too, just less visibly.
+
+**Proper fix:** make the metered population resolution-independent rather than
+threshold-defined — e.g. meter at a fixed world-space cell size (adapt `DOWN` to `RES` so a
+cell is always the same number of centimetres of cap, which is what the 4x box was really
+for), and/or weight by excess over a fixed *world-area* normalisation instead of a cell count.
+Until then: **never rank two pieces measured at different `GEMRES`**, and stamp the
+resolution into every printed row (`_remeter.py` already prints `[NNNpx]`; `_gemsweep.py`'s
+own sweep header prints it once but the per-row lines do not carry it).
+
+### DONE (2026-08-05): `scraps/_gemsweep.py` — `-fireflies 3` did not hold at the rig's own prescribed finalist setting
+
+`_gemsweep.py` is the caustic-metering rig used to adjudicate the gallery's glass exhibits
+(it renders one piece over a bare white cap in the gallery's sun, meters the float `.pfm`
+4x-downsampled, and reports coverage / sat / peak / spread / noise / fan). Its docstring
+prescribes `GEMRES=960 GEMSPP=1200` for judging finalists — but at exactly that setting the
+firefly rejection stops being sufficient, and the intensity-derived metrics become garbage.
+
+Observed this session, same geometry (`solid10`, drop 0.90), same `GEMCUT=1.2`:
+
+```
+GEMRES=480  GEMSPP=600     peak    3.00x   sat 0.182   spread 0.014   coverage 0.35%
+GEMRES=960  GEMSPP=1200    peak 1179.42x   sat 0.844   spread 0.672   coverage 0.37%
+```
+
+The core snapped to `-0.01 +0.09` — the exact signature the script's own comments already
+document ("peak 1214x / spread 0.594 for the solid gyroid — the gyroid, which throws no
+caustic at all, 'winning' on three firefly cells"). Mode D carries one hero wavelength per
+sample, so a rare specular-caustic path deposits an enormous monochromatic spike; `-fireflies 3`
+clips the common case but not this one, and higher res makes it *worse* (fewer samples per
+cell, so a spike is diluted less by the 4x box).
+
+**Coverage is unaffected and remains trustworthy** (0.35% -> 0.37%, published 0.37%), because
+it is a *count* of cells above a threshold, not a magnitude. So the rig is still usable for
+the comparisons it is actually used for — but `peak`, `sat` and `spread` from a 960/1200 run
+must be discarded, which is precisely backwards from what the docstring says.
+
+**Fixed** in `measure()` by rejecting spikes at the CELL level, after the 4x box, rather than
+trimming a percentile. A percentile trim was the first plan and is worse: it needs a tuned
+fraction, and it silently removes real caustic cores on the pieces that actually concentrate
+light. The discriminator used instead is the one the sampler cannot fake, and it was already
+written down in the rig's own comments — **a caustic is never isolated**, because it is the
+image of a continuous wavefront, so its neighbours are bright too, whereas a firefly is one
+cell with ordinary cap all round it. Each cell is compared with the *median* of its 8
+neighbours (median so one spike cannot drag its own reference up) and dropped if it stands
+more than `GEMSPIKE` (default 8) times above them. Dropped cells are excluded from every
+statistic including coverage, and the count is printed — a silent trim is how a rig starts
+lying. 8x is deliberately loose: measured caustics climb well under 2x per cell even at their
+cusps, while the spikes overshoot by two to three orders of magnitude, so the threshold sits
+in a wide gap and needs no per-piece tuning.
+
+Verified on the failing case — `solid10` drop 0.90 re-metered from the same sidecars:
+
+```
+480px/600spp   peak    3.00x   sat 0.182   spread 0.014      (was already trustworthy)
+960px/1200spp  peak 1179.42x   sat 0.844   spread 0.672      before the fix
+960px/1200spp  peak    3.25x   sat 0.196   spread 0.060      after (11 spike cells dropped)
+```
+
+Cross-resolution agreement — the property that was actually broken — is restored, and the
+reported core moves off the firefly cell (`-0.01 +0.09`) onto the real one (`+0.64 -0.43`).
+
+**Consequence for already-published numbers:** any `peak`/`sat`/`spread`/`fan` measured at
+960/1200 before this fix is suspect and should be re-metered. Re-metering is cheap and needs
+no re-render — `scraps/_remeter.py` runs `measure()` over existing `.pfm` sidecars at any
+`GEMCUT`. In particular the crystal gyroid's `fan 0.86` was *itself* the fireflies; honestly
+metered it is 0.18. Note `scraps/` is gitignored, so neither the rig nor this fix is
+versioned — only this entry records it.
+
+### OPEN (2026-08-05, probably transient — logged only so a recurrence is recognisable): `build.bat` failed once, then succeeded twice unchanged
+
+Building the 0.138.2 changes, the **first** `build.bat` run reported
+`[build] WARNING: build FAILED - ftrace.exe was NOT rebuilt.` Two subsequent runs, with
+**identical sources**, both succeeded cleanly. So this is very likely a transient — a
+parallel-compile OOM (MSVC `C1060`/`C3859`) or a transient file lock, not a defect in the
+tree. It is logged only so that if it happens again it is recognised as a *pattern* rather
+than diagnosed from scratch a second time.
+
+What was on screen (all that was captured — I tailed 40 lines and the actual diagnostic
+had already scrolled off):
+
+```
+isomesh.h(404): note: see the first reference to
+  'std::_Hash<std::_Umap_traits<uint64_t,char,...>>::emplace' in 'isomesh::decimateAdaptive'
+… followed by the usual xhash(618) / list(595) / xmemory(730) / xutility(463) note chain
+  for std::pair<const uint64_t,char>
+```
+
+Two reasons not to read too much into that: MSVC emits the same note chain for a *warning*
+as for an error, so those lines may not belong to the failure at all; and `isomesh.h` was
+not touched by this change (the edits were `parallel.h`, `upsample.h`, `texture.h`,
+`envmap.h`, `ftsl.h`, `main.cpp`).
+
+**If it recurs, capture the diagnostic itself, not the notes.** The mistake the first time
+was `| tail -40`, which keeps only the trailing note chain. Instead:
+
+```sh
+cmd //c ".\\build.bat" 2>&1 | tee scraps/build.log     # then grep the log
+grep -nE "error [A-Z]+[0-9]+|fatal error" scraps/build.log
+```
+
+An `error C1060: compiler is out of heap space` / `C3859` confirms the OOM theory (fix:
+build with `--parallel 1`, or raise `/Zm`). Anything else — especially a real
+`error C####` inside `isomesh.h` — means it is a genuine, order-dependent bug and this
+entry should be rewritten as one.
+
+### DONE (2026-08-05, v0.138.2): `-stop` was accepted but ignored while a process was still in SCENE LOAD
+
+`stopChannelStart()` publishes the `<pid>.run` entry before `run()` is entered, so a
+process is listed by a bare `ftrace -stop` and can be signalled from the moment it starts.
+But the signal only set `g_stopRequested`, and that flag was polled at render **chunk /
+frame** boundaries — the loader (mesh import, tessellation, solid voxelization, spectral
+upsampling) never polled it. So `ftrace -stop <pid>` against a process that had not reached
+its render loop reported success, then waited out its 120 s timeout while the load ran to
+completion.
+
+**Fixed** by making the load cooperatively cancellable, at two granularities:
+
+* **Inside a long pass** — `ft::parallelFor` (`src/parallel.h`) now polls the stop flag at
+  its chunk cursor, *before* claiming work, so a stop drains the cursor and every worker
+  finishes at most the chunk it already holds. It returns `bool` (and is `[[nodiscard]]`,
+  so no caller can quietly ignore it): `false` means the range was abandoned and the output
+  is **partial**. The serial-cutoff path is chunked too, for the same poll.
+* **Between assets** — the loader's own serial stretches poll `ft::stopRequested()` via
+  `Builder::stopped()`, checked between top-level blocks in the texture, pattern,
+  `mesh_asset`, geometry and deferred-`medium` passes. That covers the loaders that are
+  still single-threaded (glTF/OBJ import, `meshvox::voxelizeSolid`, isomesh tessellation)
+  at asset granularity without having to thread them.
+
+`g_stopRequested` stays where it was — it is a file-static `volatile sig_atomic_t` because
+a signal handler writes it, so `parallel.h` cannot name it. `main()` instead installs it as
+a probe (`ft::setStopProbe`) before any scene work, which is also why the probe is one
+indirect call per *chunk* rather than per item.
+
+Propagation is "abandon the load and return non-zero", never "carry on with half a
+texture": `upsample::fitMany` → `Texture::buildReflCoeff` (which clears the partial
+coefficient table) → `addTexture` → load failure; `EnvMap::buildFromRgb` → its existing
+`err` out-param. `main.cpp` recognises the case and prints
+`[stop] scene load stopped before rendering — nothing was rendered or written.` rather than
+a scene-error diagnostic, exiting 1.
+
+One non-obvious trap found while testing: `prefer { } else { }` resolution treated the
+interrupted branch as *rejected* and went on to build the next branch — so the stop was
+observed, announced, and then ignored for another full scene load. `loadSource` now aborts
+the whole resolution when a stop is seen after a trial build.
+
+Verified: `-stop all` issued ~1 s into a `gallery_rain` load exits in under a second with
+exit code 1 and nothing written; a `-stop` during the render still writes image +
+checkpoint and exits 0; all 21 `-check*` self-tests pass (including the bit-identity check
+on `fitMany`); `prefer` still resolves to branch 1 on an uninterrupted load.
+
+### PERF — DONE (2026-08-05, v0.138.1): `-explore scenes/gallery_rain.ftsl` sat for ~47 s with NOTHING on screen — per-texel spectral upsampling was serial
+
+**What.** `ftrace -explore scenes/gallery_rain.ftsl` produced no output and no window for
+about three quarters of a minute, then loaded normally. It read as a hang; it was not one.
+Measured with `-parseonly` (which stops right after the scene is built):
+
+| stage | before | after |
+|---|---|---|
+| `gallery_rain.ftsl` scene load (`-parseonly`) | **46.9 s** | **2.9 s** |
+| `-explore` → live window on screen | ~50 s | **4.5 s** |
+
+**Where it went.** Bisecting the scene ruled out the obvious suspects — deleting the
+mesh-bound `medium` (a 195×122×191 solid voxelization) changed nothing, and deleting the
+1.85 M-triangle `cloud1.glb` saved only ~4 s. It was the ten `texture` blocks. A one-texture
+scene took 6.1 s against a 0.33 s empty-scene baseline, and the cost tracked *texel count*,
+not file size: 0.05 MP → 0.2 s, 1.05 MP → 10.3 s. Summed over the scene's 4.6 Mtexels that
+is ~45 s, i.e. essentially the entire stall.
+
+**Why.** `Texture::buildReflCoeff` ran `upsample::fit` once per texel, serially, on one
+core. Each fit is up to 40 Gauss–Newton iterations over a 95-sample basis — microseconds
+each, which is nothing for a material and seconds per megapixel for an image. Nothing was
+wrong with the *method*; it was simply being invoked ~4.6 million times in a single-threaded
+loop during scene load, before any progress output exists to say so.
+
+**Fix.** `upsample::fitMany` (`upsample.h`) + `ft::parallelFor` (new `src/parallel.h`):
+deduplicate bit-equal texels through a hash of their raw bit patterns (these procedural
+marble maps hold 96–80 000 distinct colours across 0.05–1.05 M texels, so the collapse is
+13×–10 000×), then thread the surviving distinct fits. Both steps are exact — the emitted
+coefficients are bit-identical to the serial loop, asserted permanently by
+`-checkupsample` check (i) on a synthetic 40 k-texel image that exercises both the dedup
+hit and miss paths. `EnvMap::buildFromRgb` carried the identical serial-fit-per-texel
+pattern and was parallelised the same way (its sin θ-weighted mean deliberately left serial
+so the emitter power cannot drift with core count).
+
+**Lesson for next time.** Load-time work has no progress reporting and no thread pool, so
+an O(pixels) inner loop there is invisible until someone calls it a hang. Anything that
+scales with an *asset's* size — texels, voxels, triangles — belongs on `ft::parallelFor`.
+
 ### BUG — DONE (2026-08-05, v0.138.0): `-mode W -heroc 1` silently rendered the de-hero collapse it was supposed to have fixed
 
 **What.** `-heroc 1` means "hero bundle off, single wavelength" (`ftrace -h`), which in mode W
@@ -7808,7 +8797,7 @@ in the same commit. They have real interdependencies (`_gemsweep` and `_capchrom
 Logged rather than done because renaming the paths that every measured table cites is a change
 that wants to be its own commit, not a rider on a scene tweak.
 
-## OPEN (metrology, 2026-08-04): `-fireflies 3` does not always clear the gem rig's peak, so `peak` alone can be nonsense
+## FIXED (2026-08-05): `-fireflies 3` does not always clear the gem rig's peak, so `peak` alone can be nonsense
 
 While sweeping crown angles for the axicon's girdle (`scraps/_gemsweep.py piece gcone0.08/20/0.60
 0.65`, SF10, 480 px / 600 spp, `-hdr -fireflies 3`) the rig printed:
@@ -7835,6 +8824,55 @@ immune to a single spike by construction. `measure()` already builds the downsam
 so this is a two-line change; the reason it is logged rather than done is that changing the
 statistic silently invalidates every `peak` in `design.md`, so the fix has to re-run the tables
 in the same change.
+
+**FIXED (2026-08-05)** — and the delay above turned out to be the expensive part, because the
+half-fix that landed in between was in one specific way worse than doing nothing.
+
+What was added first was a cell-level spike test: compare each 4×-box cell with its
+*second-brightest* neighbour and drop it if it stands more than `GEMSPIKE` (8) times above that,
+on the principle written down in the rig itself — **a caustic is never isolated**, because it is
+the image of a continuous wavefront, whereas a firefly is one cell with ordinary cap all round
+it. That test works. But it was applied **only to the box-averaged cell luminance**, while
+`peak` kept being read from `c[3]`, the brightest **raw** pixel in the block. A 4× box dilutes a
+single-pixel spike 16-fold, so a firefly big enough to dominate `peak` can sit comfortably under
+the 8× cell threshold, pass, and still set the headline number. The rig now looked defended,
+which is why the next false reading was believed rather than double-checked.
+
+That is not hypothetical — it produced a wrong answer that was nearly acted on. Sweeping the
+`fin` clip (the vertical-plate gyroid) the rig printed:
+
+```
+fin10/0.125 drop 0.90  peak 84.34x  coverage 0.67%  sat 0.298  spread 0.437  fan 0.46
+```
+
+which reads as by far the best rainbow in the whole gem programme — `spread` 0.437 against a
+0.006 noise floor. Histogramming the raw `.pfm` showed exactly **two** pixels in 480×480 above
+5× the median (at 85× and 1115×), everything else topping out near 2×. Two samples.
+
+The fix runs the identical second-brightest-neighbour test a second time keyed on the raw `hot`
+value, and takes the **union** of the two spike sets — union rather than a peak-only filter,
+because a 1000× pixel is still +60× on the 16-pixel mean it lands in, which is plenty to move
+`sat` and `spread` as well. That row now re-meters to `peak 2.22x / sat 0.180 / spread 0.009`
+with 2 spike cells dropped.
+
+The condition attached above — "the fix has to re-run the tables in the same change" — was met
+without re-rendering anything, because `_remeter.py` re-scores the `.pfm` sidecars already on
+disk. **Every published number survived unchanged**, which is the useful part of the result:
+
+- the sphere control `solid10_090` still meters `peak 3.25× / sat 0.196 / spread 0.060`, now
+  annotated `[4 spike cells dropped]` — the cell test had already been catching its fireflies,
+  so the box-vs-sphere adjudication in `design.md` and commit `2dc798e` stands;
+- the shipped box `slab10_0_3125_050` still meters `peak 8.43× / cov 0.19% / sat 0.216 /
+  spread 0.018`, with **zero** spikes dropped — that peak is a real caustic cusp, and its raw
+  top ten (4.7 4.9 5.0 5.5 5.8 6.2 6.4 6.6 7.8 8.4) is the smooth gradient a caustic makes,
+  as against the sphere's raw top ten (86 96 118 149 288 440 659 669 758 1181), which is not;
+- of the eleven `fin` rows, only the one above moved at all.
+
+Standing lesson, worth more than the fix: **an outlier filter has to be applied to the same
+array as the statistic it is protecting.** The cell test and the `peak` statistic were computed
+from different data — averaged cells versus raw pixels — so the filter was correct, and the
+number it was meant to guard was still completely unguarded. When adding a robustness test,
+check every reported statistic for which array it actually reads.
 
 ## OPEN (2026-08-04): a quad's emission is invisible from the side its winding faces away from
 

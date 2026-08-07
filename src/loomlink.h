@@ -24,6 +24,7 @@
 // Windows-only, like every other child-process/GUI piece in the tree. On other
 // platforms `Link` compiles to a stub whose start() reports why.
 #pragma once
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -31,6 +32,26 @@
 #include "third_party/json.h"
 
 namespace loomlink {
+
+// A binary attachment to one ack.
+//
+// The transport is newline-delimited JSON, which is exactly wrong for a megabyte of
+// mesh: base64 in the ack would cost a 4/3 blowup plus an encode and a decode, and a
+// side file costs an open — which on this machine means ~8 ms of Windows Defender
+// scanning a file our own child wrote a millisecond ago (see `known-issues.md`). So
+// the ack line may carry a manifest, `"blobs":[{"name":…,"bytes":N}, …]`, and the raw
+// payloads follow the newline back to back in that order. Every length is known
+// before a byte is read, so there is nothing to delimit and nothing to escape.
+//
+// The manifest is part of the ack, not a separate message, which makes the invariant
+// checkable at one point: a reader that has parsed an ack knows exactly how many
+// bytes still belong to it. `Link::call` therefore ALWAYS consumes them, even when
+// the caller passes no `blobs` vector and even when the ack reports failure —
+// leaving them in the pipe would desynchronise every request after it.
+struct Blob {
+    std::string name;   // the path the scene text uses to name this asset
+    std::string bytes;
+};
 
 // minijson parses but does not serialise, and every request line is a small fixed
 // shape, so callers build them by hand over this escape.
@@ -66,7 +87,8 @@ struct Link {
         return false;
     }
     void stop() {}
-    bool call(const std::string&, minijson::Value&, std::string& err) {
+    bool call(const std::string&, minijson::Value&, std::string& err,
+              std::vector<Blob>* = nullptr) {
         err = "loom link is not running";
         return false;
     }
@@ -244,10 +266,41 @@ struct Link {
         }
     }
 
+    // Exactly `n` more bytes of the child's stdout, taken from what `readLine` has
+    // already buffered before the pipe is touched again.
+    bool readExact(size_t n, std::string& out, std::string& err) {
+        out.clear();
+        out.reserve(n);
+        while (out.size() < n) {
+            if (!rx.empty()) {
+                size_t take = (std::min)(n - out.size(), rx.size());
+                out.append(rx, 0, take);
+                rx.erase(0, take);
+                continue;
+            }
+            char buf[1 << 16];
+            DWORD want = (DWORD)(std::min)(sizeof buf, n - out.size());
+            DWORD got = 0;
+            if (!ReadFile(rd, buf, want, &got, nullptr) || got == 0) {
+                err = "loom link: the python process closed its output mid-attachment"
+                      " (see its traceback on stderr)";
+                return false;
+            }
+            out.append(buf, got);
+        }
+        return true;
+    }
+
     // One request/ack round trip. A transport failure tears the link down (there is
     // no resynchronising a half-written pipe); a protocol-level `ok:false` leaves it
     // up, since loom reports scene errors that way and stays serving.
-    bool call(const std::string& line, minijson::Value& ack, std::string& err) {
+    //
+    // `blobs`, when given, receives the ack's binary attachments (see `Blob`). They
+    // are read off the pipe either way — passing null discards them rather than
+    // leaving them to be mistaken for the next ack.
+    bool call(const std::string& line, minijson::Value& ack, std::string& err,
+              std::vector<Blob>* blobs = nullptr) {
+        if (blobs) blobs->clear();
         if (!alive()) { err = "loom link is not running"; return false; }
         std::string msg = line;
         msg.push_back('\n');
@@ -265,8 +318,34 @@ struct Link {
         if (!readLine(reply, err)) { stop(); return false; }
         std::string perr;
         if (!minijson::parse(reply, ack, perr)) {
+            // The manifest we would need in order to skip past any attachment is in
+            // the line we just failed to parse, so the pipe's framing is gone with it.
             err = "loom link: unparsable ack (" + perr + ")";
+            stop();
             return false;
+        }
+        // Drain attachments BEFORE the ok/error check: they belong to this ack no
+        // matter what it says, and the next request would read them as its reply.
+        if (const minijson::Value* bl = ack.find("blobs")) {
+            if (bl->isArray()) {
+                for (const minijson::Value& e : bl->arr) {
+                    long long n = (long long)e.numAt("bytes", -1.0);
+                    if (n < 0) {
+                        err = "loom link: blob manifest entry has no byte count";
+                        stop();
+                        return false;
+                    }
+                    std::string data;
+                    if (!readExact((size_t)n, data, err)) { stop(); return false; }
+                    if (blobs) {
+                        const minijson::Value* nm = e.find("name");
+                        Blob b;
+                        b.name = nm && nm->isString() ? nm->str : std::string();
+                        b.bytes = std::move(data);
+                        blobs->push_back(std::move(b));
+                    }
+                }
+            }
         }
         const minijson::Value* okv = ack.find("ok");
         if (!okv || !okv->asBool(false)) {
