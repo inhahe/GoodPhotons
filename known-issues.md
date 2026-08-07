@@ -5,6 +5,46 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-07, v0.149.0): the live window cannot repaint mid-image — its finest granularity is one whole image at 1 spp, not "every N rows"
+
+**What was asked for vs what was delivered.** The request was for the live window to refresh
+*during* a deterministic mode-W render — "on every so many rows, or once a row or whatever" —
+because a mode-W frame appeared to pop up only for a split second at the end. The cause turned
+out to be that the window repaint was gated behind the *same* `-interval` timer as the crash-safe
+PNG + `.ftbuf` write (default 15 s), so a 5.6 s frame legitimately got exactly one paint, at the
+end. v0.149.0 fixes that by giving the window its own timer (`-window-interval`, default 0.2 s)
+with an adaptive cost budget, in all four progressive drivers. A 480² mode-W frame now paints 8
+times instead of 1.
+
+**But the row-level granularity that was literally asked for is not achievable in the current
+architecture, and this entry records why.** A repaint can only happen where the driver regains
+control, which is between *chunks*: `gpuSppChunks` (`src/render_cuda.cu` ~12126) sizes each chunk
+to about 0.15 s of GPU work but has a **hard floor of 1 spp**, and `cpuSppChunks` is the same. So
+the shortest interval at which anything can reach the window is however long one full-image
+sample pass takes — ~0.62 s at 480², and it scales with pixel count. Below that, the megakernel
+is in flight and the film is mid-write on the device; there is nothing coherent to show.
+
+**Why this is mostly fine, and exactly when it is not.** For mode W it is arguably *better* than
+rows: spp buys only antialiasing and spectral resolution, no noise reduction, so the very first
+chunk already delivers a complete, essentially-final image rather than a partial one with a hard
+edge across it. The failure case is a frame big enough that a single spp takes tens of seconds —
+a 4K mode-W render, or any scene heavy enough per-sample — where the window would still sit empty
+for that whole first pass and the original complaint would return unchanged.
+
+**The proper fix if that case ever matters:** slice the sample pass itself into row bands, i.e.
+have `gpuSppChunks` be able to emit a *partial-image* chunk (rows `[y0,y1)` at 1 spp) and have the
+progressive drivers tone-map and blit only the completed band. That is a real change to the launch
+geometry, and it trades GPU occupancy for latency — narrow bands mean more launches, worse
+scheduling, and a measurable slowdown on exactly the large frames that motivated it. It should not
+be done speculatively; do it only when a concrete render is observed sitting blank, and gate it so
+the banding only kicks in once a projected 1-spp pass exceeds the window interval by a wide margin.
+
+**Cost of what *was* shipped, measured on a 480² 8-spp mode-W frame:** no window 5.15 s, window
+with 1 repaint 5.43 s, window with 8 repaints 5.63 s. So the extra repaints are +3.9 %, and the
+per-repaint cost is ~26 ms (down from ~40 ms after `filmToRgb8`'s auto-exposure anchor was changed
+from a full `std::sort` to `std::nth_element` — bit-for-bit identical, verified). `FTRACE_WINDOW_DEBUG=1`
+prints each repaint with its measured tone-map+blit cost if this needs re-measuring.
+
 ### PERF — FIXED (2026-08-06, v0.148.0): the live viewer pays ~17 ms/frame to Windows Defender for opening files it wrote itself
 
 **This is the finding that came out of building the binary mesh handoff, and it is bigger than

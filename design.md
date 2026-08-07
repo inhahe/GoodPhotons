@@ -1095,6 +1095,17 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.
+- **`filmToRgb8` auto-exposure cost** — the p99 anchor wants exactly **one** order
+  statistic, so it uses `std::nth_element` (O(n), partitions in place) rather than a full
+  `std::sort` of every pixel's luminance, and it builds the luminance array **only when
+  that anchor is actually computed** — an absolute-EV render and a `camera_path` frame with
+  a locked anchor both skip the pass and the allocation outright. `nth_element` guarantees
+  the element at that index is the one a full sort would have placed there, so the anchor
+  and every output pixel are **bit-for-bit identical** (verified against a pre-change
+  render). This matters because `filmToRgb8` is the shared choke point for `writeFilm`
+  *and* the live window, and once the window got its own repaint cadence it began running
+  several times a second: at 480² the sort alone was the bulk of a ~40 ms repaint, now
+  ~25 ms.
 - **`-hdr` (a 32-bit float PFM beside `-o`)** — the escape hatch from the tone map, added
   because *measuring* off a PNG had quietly been wrong all along. An 8-bit sRGB image clamps
   at white, and a caustic is by definition the brightest thing in frame, so its core prints
@@ -2328,6 +2339,31 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   loop (measured: +80% photons/s on 16 cams @ 640×360, +22% on 2 cams @ 320×240);
   `renderForwardSharedCuda` survives as a one-shot wrapper over the session.
   `raster_cuda.cu` = GPU raster (own section below).
+- **Live-window refresh cadence** — the window repaints on its **own** timer
+  (`-window-interval`, default 0.2 s; `liveWindowDue()` / `liveWindowUpdate()` in
+  `main.cpp`), *not* on `-interval`. Every progressive driver (`runSppProgressive` for
+  R/W/D, `runCompositeProgressive` for P, the forward A/B/C loop, and the shared
+  multi-camera forward loop) computes two independent flags per report — `wantSave` on
+  `-interval` for the crash-safe PNG + `.ftbuf` + status line, and `wantWin` on the window
+  timer — and does only the work each one needs. They were one flag until 0.149.0, and the
+  consequence was that **any render finishing inside one `-interval` never displayed a live
+  frame at all**: the drivers only touched the window inside their
+  `done || sinceSave >= intervalSec` block, so a 5 s `-mode W` frame under `-interval 8`
+  painted exactly once, on `done`, as the process was exiting — the image appeared for a
+  split second and vanished. (The window itself was up the whole time; it is created early
+  with a dark placeholder before tessellation, so "no window" was never the symptom.)
+  Repaint granularity is bounded below by the renderer's chunk size, not by this timer:
+  `gpuSppChunks` / `cpuSppChunks` retarget ~0.15 s per chunk with a 1 spp floor, so a 480²
+  `-mode W -spp 8` frame gets one repaint per spp and the first complete image lands after
+  ~0.6 s. The floor is adaptive — `max(-window-interval, 12 × last measured repaint cost)`
+  — so a 4K film, or the shared multi-camera path where a repaint also forces a full
+  device→host film download (`liveWindowNotePaintCost` charges that to the same budget),
+  backs itself off instead of spending the render on painting. The **first** paint is
+  excluded from the estimate: it runs cold and includes one-time window creation, and
+  feeding its 342 ms in set a 4 s floor that made the second repaint also the last.
+  Measured on a 480² `-mode W -spp 8` frame: `-window` at all costs +0.28 s (pre-existing
+  D3D11 / swap-chain init), the seven extra repaints +0.20 s = **+3.9 %**.
+  `FTRACE_WINDOW_DEBUG=1` logs each repaint and its cost.
 - **`livewindow.*`** — Win32 live preview (`-window`/`-keepwindow`), interactive
   fly viewer input, camera-path timeline panel.
   The **image area is presented by D3D11**, the control strip below it by GDI.
