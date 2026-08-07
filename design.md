@@ -208,6 +208,65 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (`__fmul_rn`/`__fsub_rn`, plus `double` overloads for the `Real = double` build) — see
   `render_cuda.cu`. Exactly the same failure and the same fix as the rasterizer's
   `edgeRow`/`edgeAt` below. Fixed 0.116.0; measurement in `known-issues.md`.
+- **`curve.h`** — the **curve / fiber** primitive (hair, fur, grass, wire, thread),
+  added 0.150.0 for TODO §P1. A `curve` is control points + a radius; the loader
+  **flattens it at load time** into a chain of `CurveSeg` **round cones** (the convex
+  hull of a sphere at either end — a capsule with a linearly varying radius), and the
+  BVH indexes one leaf per *cone*, not per strand.
+  - *Why flatten, and why round cones.* A triangle ribbon costs ~64 tris/hair, so one
+    furred animal is 10⁸–10⁹ triangles — that is the whole reason the primitive exists.
+    Flattening up front (rather than evaluating the basis per ray) buys **exact leaf
+    bounds** ("bound what you test", vs. a strand box that is mostly empty), keeps basis
+    evaluation out of the inner loop that §P2's sub-pixel variance will hammer, and
+    leaves a POD record a future GPU port can upload directly. It costs memory
+    (80 B/seg) and discretised curvature. Round rather than camera-facing ribbons
+    because adjacent cones **share their end sphere**, making the chain watertight and
+    smooth at joints with **no mitre logic** — a strand is one closed surface however
+    sharply it bends.
+  - *The intersector.* A round cone's boundary is three pieces — the tangent **lateral**
+    cone and a **spherical cap** at each end — discriminated by one axial coordinate
+    `y = dot(ba, p−p0) − r0·(r0−r1)` against the band `(0, d2)`, `d2 = |ba|² − (r0−r1)²`
+    (parameterisation from Inigo Quilez). Entry into a union is the **min over pieces of
+    entry into each piece**, so the code enumerates *all* roots of *all three* quadrics,
+    restricts each root by its own piece's `y` range, and takes the minimum. That is what
+    makes it correct for an origin **inside** the fiber (a shadow ray must still find its
+    exit) as well as outside. `d2 <= 0` means one ball swallows the other and the hull is
+    just the bigger sphere — a separate branch, checked against `intersectSphere`
+    bit-for-bit. `makeCurveRay` hoists the one `sqrt` per ray (cf. `TriShear`), and
+    `scene.h` builds it only when `curveSegs` is non-empty so a curve-free scene pays a
+    predictable branch and nothing else — **verified bit-identical** to the pre-curve
+    binary (modes R and W × triangles / implicits / instances, md5-compared against a
+    `git worktree` build of HEAD).
+  - *Bases.* `linear` (exact, `segments` forced to 1), uniform **Catmull-Rom** (default,
+    interpolating — an authored guide hair passes through its points; ends
+    clamp-duplicated), **Bezier** (cubic chain, `3k+1` points), uniform cubic
+    **B-spline** (approximating + C2, the shape a groom solver emits). All four are
+    affine-invariant, which is why `ftsl.h` transforms the *control points* and flattens
+    afterwards — a `group { rotate … }` carries a strand exactly, for free. Radius is
+    interpolated **linearly** between a span's endpoint control points, never through the
+    basis: a Catmull-Rom radius can overshoot, and a negative radius is not a taper.
+  - *Hit record.* `u` = strand parameter 0 (root) → 1 (tip), carried on the segment as
+    `u0`/`u1` so a pattern can band a fiber lengthwise; `v` = azimuth from the segment's
+    own `onb(axis)`; `tangent` = the axis Gram-Schmidt'd against the shading normal.
+    The v1 azimuthal frame is **per-segment, not parallel-transported**, so `v` can step
+    at a sharp joint — logged in `known-issues.md`.
+  - *Verification.* `-checkcurve` (`main.cpp`) is five sections: the intersector vs. the
+    exact analytic SDF (sphere-traced ground truth, with rays *aimed* at the fiber —
+    uniformly random rays essentially never hit something 1 mm wide, which made the first
+    draft of this section vacuous at 950 hits per 200 k rays); the degenerate containment
+    case vs. `intersectSphere`; `anyHit` vs. the full path with half the origins inside;
+    watertightness at chain joints; and basis flattening. **Mutation-tested**: dropping
+    the p0-cap band restriction fails only §3, dropping the p1 cap fails §1 and §4 — so
+    the sections are complementary, not redundant.
+  - *Not on the GPU yet.* `cudaForwardSupported` returns false for any scene with
+    `curveSegs` (see **GPU support gates fail safe**): the megakernel knows four prim
+    ranges, so it would trace straight past every strand and render a furred scene
+    **bald** rather than merely differently. The **raster preview** is not gated but is
+    not missing either — `raster::tessellate` stage (2b) meshes each round cone by
+    sweeping rings through the same three pieces the intersector knows (back cap →
+    tangent lateral band → front cap; both tangent circles sit at polar angle `acos(a)`,
+    `a = (r0−r1)/|ba|`, which is what makes one angular sweep cover all three
+    continuously and the preview mesh closed). Coarse by design, ~80 tris/segment.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds
@@ -2678,6 +2737,22 @@ Design points worth keeping:
   the hit and never sees the 1.0→0.0 wrap, but the rasterizer *interpolates*, so a
   triangle straddling the seam would run `u` backwards across the entire texture. Any
   triangle whose `u` spread exceeds 0.5 has its low corners lifted by +1.
+- **A new PRIMITIVE needs the same "did every consumer get it?" sweep a new material
+  feature does** (0.150.0). The `applyMat` comment above exists because a per-material
+  feature once got wired into three of four geometry paths; the `curve` primitive was the
+  geometry-level version of the same miss. It shipped with the tracer, the BVH and a CUDA
+  gate all correct, and `-raster` drawing `curve_basics` as `[raster] 12 triangles` — the
+  box, none of the five strands, **silently**. Worse than the CUDA case, because CUDA at
+  least has a gate to fall back through and the preview has none: nothing warns, the scene
+  just looks empty. Now stage `(2b)` of `tessellate` meshes each `CurveSeg` as a round
+  cone, sweeping rings through the same three pieces the intersector knows (back cap →
+  tangent lateral band → front cap). Both tangent circles sit at polar angle `acos(a)`,
+  `a = (r0−r1)/|ba|`, on their respective end spheres — that single fact is what lets one
+  angular sweep cover all three pieces continuously, so the preview mesh is closed exactly
+  like the surface it approximates, and the `|a| ≥ 1` degenerate (one ball swallows the
+  other) falls out for free as a collapsed cap. `v` uses the same `onb(axis)` the analytic
+  hit does, so a `u`/`v` pattern previews where it will land. ~80 tris/segment, which does
+  not scale to a real groom — see `known-issues.md`.
 - **A `weight_map` mix is a PER-PIXEL material swap, not a per-material choice** (0.136.0).
   `mixDominantChild` only compares the *constant* weights, so a weight-mapped mix (always
   50/50, hence always child 0) previewed as one flat winner while `-mode W` — which calls
@@ -2979,6 +3054,12 @@ enumerator trips MSVC C4062, plus a `-1` runtime fail-safe). Silently coercing a
 unrecognised value into some other device code hands a kernel malformed geometry, and
 malformed geometry inside a kernel does not fail cleanly — it can fault the display
 driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
+
+A **whole missing primitive** is the same rule at the coarsest grain: the megakernel's
+hit routine knows four prim ranges (`tri | sphere | implicit | instance`), so 0.150.0's
+`curveSegs` fifth range gates the entire scene to the CPU. Without that gate the device
+would not fail at all — it would happily miss every strand and render a furred subject
+**bald**, which is far worse than a fallback because it looks like a plausible image.
 
 ## Benchmarks & perf discipline
 

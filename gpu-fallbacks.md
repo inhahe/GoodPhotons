@@ -16,6 +16,7 @@ Status legend: **portable** (worth doing) · **portable-hard** (large but feasib
 ### Forward A/B/C — `cudaForwardSupported` (render_cuda.cu:6281)
 | Feature | Why CPU today | Class |
 |---|---|---|
+| **Any `curve` / fiber primitive** (`scene.curveSegs` non-empty) | **added 0.150.0 with the primitive itself.** The device hit routine knows four prim ranges (`tri \| sphere \| implicit \| instance`); `curveSegs` is a fifth, with no device twin of `intersectCurveSeg`. Without the gate the kernel would not fail — it would silently trace *past* every strand and render a furred subject **bald**, a plausible-looking wrong image, which is strictly worse than a fallback. Gated in `cudaForwardSupported`, so backward `R` and BDPT `D` inherit it. | **portable** (`CurveSeg` is a POD laid out for upload; needs a `dIntersectCurveSeg` + a fifth range in the traversal) |
 | Indexed-spectral palette maps | device only bakes the Jakob-Hanika coeff path; palette resolves per-texel to a named reflectance spectrum | **portable** (upload per-texel palette spectra) |
 | Layered material (coat over weighted body) | no device `shadeStep` Layered branch | **portable** (port the branch) |
 | ~~Spectral rainbow-phase media~~ | **DONE (M10, 0.37.0)** — λ×µ phase table + per-λ CDF uploaded per-medium; `dMedPhase`/`dMedPhaseSample` dispatch rainbow (bilinear `dRbEval` / CDF sample) vs HG on forward + backward + BDPT | ✔ on device |

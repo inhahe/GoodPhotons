@@ -4571,15 +4571,24 @@ that item mostly a binding exercise there.
 ---
 
 ## P. Curve / fiber primitive (hair, fur, grass, wire)  *(ftrace geometry; gap audit 2026-08-06)*
-- [ ] **P1 — a native curve primitive.** ftrace today has **none**: zero hits repo-wide for `fiber`,
-      `ribbon`, `bezier`, `b-spline`, and all four `hair` matches are the English idiom ("a hair
-      negative"). `MatType`, `MediumBound` and `EmitterShape` confirm the primitive set is
-      triangles + analytic shapes + implicits. So a fiber today must be triangle ribbons — ~64 tris
-      per hair, i.e. **10⁸–10⁹ triangles** for one furred animal (1–10M hairs × 8–32 segments).
-      That is the blocker, and it is a hard one: it needs a curve intersector (round cylinder or
-      camera-facing ribbon, swept along a cubic) plus a BVH build that doesn't degenerate on
-      near-collinear, wildly-anisotropic bounds. Wanted by `creature`'s P7 fur, and independently
-      useful for grass, wire, cables and thread.
+- [x] **P1 — a native curve primitive.** ✅ 2026-08-07, v0.150.0. `src/curve.h` + the FTSL `curve`
+      block. A strand is control points + a radius, **flattened at load** into a chain of **round
+      cones** (convex hull of a sphere at either end), one BVH leaf per cone. Four bases —
+      `linear`, `catmull_rom` (default, interpolating), `bezier`, `bspline` — all affine-invariant,
+      so a `group{}` transforms the control points and the flattening stays exact. Adjacent cones
+      **share their end sphere**, so a chain is watertight at joints with no mitre logic. `u` runs
+      root→tip, `v` around the circumference, `tangent` is the axis. Verified by `-checkcurve`
+      (five sections, mutation-tested) and bit-identity of curve-free scenes against a `git
+      worktree` build of the previous HEAD. Demo: `scenes/curve_basics.ftsl`.
+      *The scoping fear did not materialise:* `src/bvh.h` is primitive-agnostic
+      (`build(const std::vector<Aabb>&)` + `LeafFn`), so "a BVH build that doesn't degenerate on
+      near-collinear, wildly-anisotropic bounds" needed **no BVH change at all** — flattening to
+      cones makes the leaf bounds tight by construction, which is the whole point of doing it at
+      load time. Likewise the FTSL/GPDA grammar is generic over block types, so `curve` needed no
+      grammar edit. **Not on the GPU** yet (the megakernel gates a curve scene to the CPU rather
+      than render it bald); `-raster`/`-raster-gpu` DO preview strands — a round-cone mesh added
+      in the same version after the preview was caught drawing them as nothing at all. See
+      `known-issues.md`.
 - [ ] **P2 — sub-pixel variance and the aggregate-BSDF LOD.** The reason fiber rendering is
       expensive is not the intersector. A fiber is typically **1/5 to 1/50 of a pixel wide**, so in
       a path tracer each ray either hits or misses and the two answers differ wildly — it shows up
@@ -4601,6 +4610,45 @@ that item mostly a binding exercise there.
 ---
 
 ## Progress log
+- 2026-08-07: **P1 done — ftrace has a curve/fiber primitive (v0.150.0).** `src/curve.h`: a strand is
+  control points + a radius, **flattened at load** into a chain of **round cones** (the convex hull of a
+  sphere at either end), one BVH leaf per cone. Three design calls worth recording. (1) *Flatten at load,
+  not per ray* — it buys exact leaf bounds ("bound what you test"; a whole strand's box is mostly empty),
+  keeps basis evaluation out of an inner loop that P2's sub-pixel variance will run millions of times, and
+  leaves a POD record a GPU port can upload directly. It costs 80 B/segment and discretised curvature.
+  (2) *Round cones, not camera-facing ribbons* — adjacent cones **share their end sphere**, so a chain is
+  watertight and smooth at joints with **no mitre logic**; a strand is one closed surface however sharply
+  it bends (the `linear` zig-zag in the demo scene is the proof). (3) *The intersector enumerates all
+  roots of all three quadrics* (lateral cone + two spherical caps), each restricted by its own piece's
+  axial band, and takes the minimum — because entry into a union is the min of entry into its pieces.
+  That is what makes it right for an origin **inside** the fiber, which a shadow ray needs.
+  **Two premises in the P1 entry above turned out to be wrong, both in the cheap direction.** The feared
+  "BVH build that doesn't degenerate on near-collinear, wildly-anisotropic bounds" needed **no BVH change
+  at all**: `src/bvh.h` is already primitive-agnostic (`build(const std::vector<Aabb>&)` + `LeafFn`), and
+  flattening to cones makes the bounds tight by construction — the anisotropy problem is *caused* by
+  bounding whole strands, which is exactly what this doesn't do. And the FTSL/GPDA grammar is generic over
+  block types (zero hits for `isosurface`/`mesh_instance`/`camera_curve` in `ftsl_scene.epeg`), so `curve`
+  needed no grammar edit either. The actual work was the intersector and the four bases.
+  **Verification** was the larger half. `-checkcurve` is five sections: round cone vs. Inigo Quilez's
+  exact SDF (sphere-traced ground truth), degenerate containment vs. `intersectSphere`, `anyHit` vs. the
+  full path with half the origins inside the fiber, watertightness at chain joints, and basis flattening.
+  The first draft of §1 was nearly **vacuous** — uniformly random rays produced 950 hits per 200 k, because
+  nothing random hits something 1 mm wide; re-aiming the rays at jittered points on the fiber took it to
+  143 k hits with a healthy mix of grazes. Then **mutation-tested**: removing the p0-cap band restriction
+  fails only §3, removing the p1 cap fails §1 and §4 — so the sections are complementary rather than
+  redundant, which is the property a passing suite does *not* by itself demonstrate. Separately, curve-free
+  scenes were confirmed **bit-identical** (md5, modes R and W × triangles/implicits/instances) against a
+  `git worktree` build of the previous HEAD, so the fifth prim range costs existing scenes nothing.
+  Shipped CPU-only on the ray-traced side: CUDA gates the whole scene to the CPU, because a missing prim
+  range would not *fail*, it would render fur **bald** — a plausible-looking wrong image, which is worse.
+  The raster preview had the same hole and **no gate to fall back to**: `curve_basics` previewed as
+  `[raster] 12 triangles` — the box, and none of the five strands, silently. Fixed in the same version by
+  meshing each round cone (sweep rings through back cap → tangent band → front cap; both tangent circles
+  sit at polar angle `acos((r0−r1)/|ba|)`, which is what lets one angular sweep close the surface).
+  `raster.h`'s own comment already warned about exactly this class of miss — it was written after marched
+  implicits turned out unable to show a skin — which is a fair argument that a new *primitive* needs the
+  same "did every consumer get it?" sweep a new *material feature* does. Next: P2 (sub-pixel variance / aggregate LOD) is the deep one, but the immediately useful next
+  step is a `fur { … }` generator block — a groom is a million strands, and nobody authors that as text.
 - 2026-07-27: **Measured G3/G4 instead of guessing — overturned both deferrals' stated reasons, and the
   measurement pointed at a third thing that was actually the bottleneck (v0.84.3).** Built a probe method
   that changes *only* program size while keeping output bit-identical (rewrite the field `E` as `(E+E)/2`

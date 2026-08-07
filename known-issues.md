@@ -5,6 +5,111 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-07, v0.150.0): the new `curve` primitive has no CUDA path — the whole scene falls back to the CPU
+
+Shipped deliberately with the primitive (TODO §P1), logged so it isn't forgotten.
+
+`cudaForwardSupported` returns false for any scene with `scene.curveSegs` non-empty (and
+`cudaBdptSupported`/`cudaBackwardSupported` chain to it), so modes A/B/C/D/R go to the CPU
+tracer. The fallback itself is correct and not the bug — the device hit routine knows four
+prim ranges (`tri | sphere | implicit | instance`) and a fifth one with no
+`dIntersectCurveSeg` would not fault, it would silently trace *past* every strand and
+render a furred subject **bald**. A plausible-looking wrong image is worse than a
+fallback.
+
+The fix is a real port. `CurveSeg` is already a POD (`Vec3 p0,p1; double r0,r1;
+int matId,curveId; float u0,u1`) laid out to upload directly, so the work is a device twin
+of `intersectCurveSeg` plus a fifth range in the traversal — mechanical. Worth doing
+**before** §P2: a fiber is 1/5–1/50 of a pixel wide, so fur is an SPP sink, which is
+exactly the regime where losing the GPU hurts most.
+
+### FIXED (2026-08-07, v0.150.0): `-raster` / `-raster-gpu` drew a scene of `curve` strands as EMPTY, with no warning
+
+Found immediately after the primitive landed, by previewing `scenes/curve_basics.ftsl`:
+`[raster] 12 triangles` — the six box quads and **not one of the five strands** — and no
+message saying anything had been skipped.
+
+The preview rasterizer builds its draw list from triangles (world tris, tessellated
+spheres, marched isosurfaces, baked instances). It had no curve path and, unlike the CUDA
+gate above, **no gate either**, so a curve scene did not fall back and did not warn — it
+just previewed empty. That is the same failure class the CUDA gate exists to prevent, and
+worse here because there is nothing to notice: "geometry I can't draw is geometry that
+isn't there." `raster.h`'s own `applyMat` comment already warns about exactly this ("adding
+a per-material preview feature can no longer be wired into three of the four paths and
+silently dropped on the fourth — which is how marched implicits ended up unable to show a
+skin at all"); this was the geometry-level version of the same mistake.
+
+**Fix:** stage `(2b)` in `raster::tessellate` meshes each `CurveSeg` as a proper round
+cone. The surface is swept as a stack of rings about the segment axis, walking the same
+three pieces the analytic intersector knows: the back cap of `sphere(p0,r0)`, the tangent
+lateral band, and the front cap of `sphere(p1,r1)`. With `a = (r0−r1)/|p1−p0|` the tangent
+circles sit at polar angle `acos(a)` on **both** end spheres, which is what lets one
+angular sweep cover all three pieces continuously — so the preview mesh is closed, exactly
+like the surface it approximates. The `|a| ≥ 1` degenerate (one ball swallows the other)
+falls out for free: the swallowed sphere's cap collapses to zero rings and the survivor is
+drawn whole, matching the intersector's `d2 <= 0` branch. `v` uses the same `onb(axis)` the
+analytic hit does, so a `u`/`v` pattern previews where it will actually land. Coarse by
+design (`CU = 10` azimuthal, `CCAP = 2` rings/cap ≈ 80 tris/segment) — a fiber is a few
+pixels wide in a preview and the silhouette is the point. `curve_basics` now tessellates to
+13372 triangles and previews all five strands with their taper, `r=` bulge, `u`-banding and
+group transform.
+
+*Residual, not worth fixing yet:* 80 tris/segment does not scale to a real groom (1 M
+strands × 16 segments would be 1.3 G preview triangles). Nothing authors a groom that big
+yet — see the `CurveSeg` memory entry below, which hits first — but when the `fur { … }`
+generator lands, the raster path will want a segment-count-driven LOD (drop the caps, then
+drop to a single camera-facing quad per strand).
+
+### OPEN (2026-08-07, v0.150.0): a `curve`'s azimuthal `v` is a PER-SEGMENT frame, not parallel-transported — it can step at a sharp joint
+
+`intersectCurveSeg` builds the azimuthal frame from `onb(axis)` of the round cone that was
+hit, so `v = 0.5 + atan2(dot(radial,B), dot(radial,T)) / 2π` is measured against a basis
+that is a discontinuous function of the axis direction. Along a smooth strand successive
+segments' axes barely differ and `v` is effectively continuous; across a **sharp** bend
+(the `linear` zig-zag in `scenes/curve_basics.ftsl` is the extreme case) the reference
+direction can rotate abruptly and a `v`-driven pattern will show a seam at the joint.
+
+`u` is unaffected — it is carried explicitly as `u0`/`u1` per segment and is exactly
+continuous by construction — so lengthwise banding (the common case, and what fur
+colouring actually wants) is already correct. This only bites a texture that wraps *around*
+the fiber.
+
+Proper fix: **parallel-transport** a reference frame along the strand at tessellation time
+(rotation-minimising frame — Bishop frame, or the double-reflection method of Wang et al.
+2008, which is cheap and stable), store the per-segment reference vector on `CurveSeg`
+(one `Vec3`, or two floats if packed against the axis), and measure `v` against that
+instead of a locally-derived `onb`. It belongs in `tessellateCurve`, where the whole
+strand is in hand, not in the intersector. Deferred because no current material varies
+with a fiber's `v`, and because the frame a fiber BCSDF (§P3) needs is the *same* one —
+so it is better built once, with that consumer in view.
+
+### OPEN (2026-08-07, v0.150.0): `CurveSeg` is 80 bytes, so a real groom is ~1.3 GB before anything else is loaded
+
+`struct CurveSeg` is `Vec3 p0, p1` (6 × `double` = 48 B) + `double r0, r1` (16 B) +
+`int matId, curveId` (8 B) + `float u0, u1` (8 B) = **80 B**. At the scale the primitive
+exists for — 1 M strands × 16 segments — that is **1.28 GB** of segments alone, before the
+BVH (which adds a leaf *per segment*, not per strand). 10 M hairs is not representable at
+all.
+
+This is inherent to flattening at load and is the accepted trade (see `design.md` →
+`curve.h` for why flattening wins), but the constant is larger than it needs to be. The
+obvious reductions, roughly in order of value per unit of risk:
+- **`float` positions/radii** — halves it to ~40 B. A fiber is 10–100 µm wide; `float`'s
+  ~7 digits is ample for a strand's own geometry, though the *world* position of a hair on
+  a large model is where fp32 would start to hurt, so this wants a per-curve origin.
+- **Store `p0` + a packed axis + length** rather than two full endpoints, exploiting that
+  consecutive segments share an endpoint (the chain is contiguous by construction — §5 of
+  `-checkcurve` asserts `segs[k].p0 == segs[k-1].p1`). A chain of `n` segments has `n+1`
+  endpoints, not `2n`.
+- **Drop `curveId`/`matId` to a per-*curve* indirection** — every segment of a strand
+  shares both, and `Curve` already records `firstSeg`/`segCount`.
+- **`u0`/`u1` are derivable** from the segment index within its curve (`u = k/segCount`
+  for a uniform subdivision, which is what `tessellateCurve` emits), so they are pure
+  redundancy today; they exist so a future non-uniform subdivision stays expressible.
+Not urgent — nothing yet authors a groom big enough to hit it (the biggest scene in
+`scenes/` has five strands) — but it is the first wall §P2's fur work will run into, and
+the fixes are all local to `curve.h` + `tessellateCurve`.
+
 ### OPEN (2026-08-07, v0.149.0, amended v0.149.1): the live window cannot repaint mid-image — its finest granularity is one whole image at 1 spp, not "every N rows"
 
 **What was asked for vs what was delivered.** The request was for the live window to refresh

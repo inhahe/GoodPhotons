@@ -88,6 +88,12 @@ renders — so the animation's source is the one Python file, not 432 baked scen
   diffraction gratings, fluorescence, and stochastic mixes.
 - **Wave-optical effects** — thin-film Airy interference, Abelès multilayer
   stacks, and reflective diffraction gratings.
+- **Curve / fiber primitive** — `curve` strands for hair, fur, grass, wire and
+  thread, in four bases (`linear`, `catmull_rom`, `bezier`, `bspline`), traced as
+  chains of **round cones** that share their end spheres, so a strand is one
+  watertight surface with no cracks at the joints — a handful of segments per hair
+  instead of the ~64 triangles a ribbon would need. (Ray-traced on the CPU for now;
+  the raster preview shows them.)
 - **Participating media** — one or many coexisting (superposed) fog regions with
   Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous
@@ -259,6 +265,7 @@ stays something you can actually read end to end.
 | Building SPDs — blackbody, gaussian, measured tables, `rgb` upsampling, IOR curves, the named presets | [Spectra](REFERENCE.md#spectra-spds-reflectances-indices) |
 | Area / sphere / cylinder / spot / sun / environment emitters and how they're sampled | [Lights](REFERENCE.md#lights) |
 | Primitives, transforms, meshes (`.obj` / `.gltf` / `.glb` / `.fbx` / `.stl` / `.ply` / `.ftmesh`), CSG, isosurfaces | [Geometry](REFERENCE.md#geometry) |
+| Hair / fur / grass / wire strands — the `curve` primitive and its four bases | [Curves and fibers](REFERENCE.md#curves-and-fibers-curve) |
 | Image textures, UV handling, and the math-driven procedural patterns | [Textures](REFERENCE.md#textures) · [Patterns](REFERENCE.md#procedural-patterns-math-driven-materials) |
 | Fog and volumes: homogeneous, bounded, heterogeneous density fields, OpenVDB / NanoVDB import | [Participating media](REFERENCE.md#participating-media--fog) |
 | A tour of the scene language, and stereoscopic / animation workflows | [Scene language](REFERENCE.md#scene-language-ftsl) |

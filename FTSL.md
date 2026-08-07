@@ -1176,6 +1176,68 @@ mesh_instance {               # cheap placement of a named asset
   triangles at upload (flat device memory — the memory saving is CPU-only; images
   are identical). See known-issues.
 
+### 8.6 `curve` — hair, fur, grass, wire, thread
+
+A **strand**: control points plus a radius, flattened at load time into a chain of
+**round cones** (each the convex hull of a sphere at either end). Adjacent cones share
+their end sphere, so the chain is watertight and smooth at the joints with no mitre
+logic — a strand is one closed surface however sharply it bends.
+
+```
+curve "guide_hair" {
+    material gold
+    basis      catmull_rom      # linear | catmull_rom | bezier | bspline
+    radius     0.016            # ROOT radius, default 0.001 (1 mm)
+    radius_tip 0.002            # TIP radius, default = radius (untapered tube)
+    segments   12               # round cones per span, default 4, capped 256
+    point 0.30 0.02 0.55        # repeated, at least 2, in root -> tip order
+    point 0.36 0.24 0.48
+    point 0.27 0.46 0.60  r=0.028
+    point 0.35 0.68 0.50
+    point 0.29 0.88 0.56
+}
+```
+
+| key | meaning |
+|---|---|
+| `material <m>` | required, like every primitive |
+| `basis <b>` | `linear`, `catmull_rom` (default; `catmull-rom`/`catmullrom` also accepted), `bezier`, `bspline` (`b-spline` too) |
+| `radius <r>` | root radius. Default `0.001` |
+| `radius_tip <r>` | tip radius. Default = `radius` |
+| `segments <n>` | round cones per span. Default `4`, clamped to `[1, 256]`; `linear` forces `1` because the polyline is already exact |
+| `point x y z [r=<r>]` | **repeated**, at least 2. `r=` pins the radius at that control point, overriding the taper |
+
+> The per-point radius **must be `key=val`**: `point 0 0.1 0 r=0.002`. Written as a
+> bareword (`point 0 0.1 0 r 0.002`) the value continuation would stop at `r` and start
+> a new statement — the same rule as `uv planar axis=x` (§1.1).
+
+**Control-point counts per basis.** `linear` and `catmull_rom` take any `n ≥ 2` and give
+`n−1` spans; `bezier` is a cubic chain `P0 C C P1 C C P2 …` so it needs `3k+1` points
+(4, 7, 10, …) and gives `(n−1)/3` spans; `bspline` needs `n ≥ 4` and gives `n−3` spans.
+A count the basis can't accept is a load error naming the requirement.
+
+**Interpolating vs approximating.** `linear` and `catmull_rom` pass exactly through
+every point you author — use them for a hand-placed guide hair. `bspline` is
+approximating and C2: smoother than its control polygon, and it does *not* touch the
+points — the right basis for a groom solver's output. `bezier`'s spans meet at every
+third point.
+
+**Radius interpolation** is always **linear** between a span's two endpoint control
+points, never through the basis — a Catmull-Rom radius can overshoot, and a negative
+radius is not a taper, it is a bug.
+
+**Under a `group`.** A `curve` may appear at top level or inside a `group{}`. Every
+basis is affine-invariant, so the loader transforms the *control points* and flattens
+afterwards, which is exactly equal to the other order. The radius picks up the group's
+uniform scale; a **non-uniform** scale prints a `[ftsl] warning:` and uses the
+volume-preserving geometric mean of the three axis scales, because a round fiber cannot
+become elliptical.
+
+Worked example: `scenes/curve_basics.ftsl` (all four bases, a taper, an `r=` bulge, a
+`u`-banded pattern, and a strand inside a transformed group). See REFERENCE.md →
+**Curves and fibers** for how it is traced and for the v1 limits (the ray-traced modes
+are CPU-only — a scene with curves falls back from CUDA; `-raster` previews them fine).
+
 ---
 
 ## 9. UV wraps on native primitives and meshes
@@ -1189,6 +1251,9 @@ come from:
   `uv planar|spherical|cylindrical [axis=x|y|z]`, or `uv triplanar [scale=<s>]`.
 - **`isosurface`**: `uv planar|spherical|cylindrical [axis=x|y|z]` — the SAME
   projection meshes use, referenced to the primitive's world AABB. Default axis `y`.
+- **`curve`**: built-in and not configurable — `u` runs `0` (root) → `1` (tip) *along*
+  the strand and `v` runs `0`→`1` *around* its circumference, so a pattern can band a
+  fiber lengthwise or ring it. (`tangent` is the strand axis, for anisotropic lobes.)
 
 > The projection **axis must be `key=val`**: `uv planar axis=z`. A bareword
 > (`uv planar z`) would be parsed as a separate statement and the axis silently

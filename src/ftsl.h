@@ -853,6 +853,7 @@ public:
             else if (b.type == "mesh")     { if (!addMesh(b, L)) return false; }
             else if (b.type == "mesh_instance") { if (!addMeshInstance(b, L)) return false; }
             else if (b.type == "isosurface") { if (!addIsosurface(b, L)) return false; }
+            else if (b.type == "curve")    { if (!addCurve(b, L)) return false; }
             else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
             else if (b.type == "group")    { if (!addGroup(b, L, Affine::identity(), haveLight)) return false; }
             else if (b.type == "medium")   { mediaBlocks.push_back(&b); }
@@ -4094,6 +4095,113 @@ private:
         L.scene.tris.push_back(Tri{P(xf.apply(v0)), P(xf.apply(v1)), P(xf.apply(v2)), id, -1, {}});
         return true;
     }
+    // ---- curve / fiber (hair, fur, grass, wire) -------------------------------
+    // A `curve { material <m>  point ... point ... }` builds one strand: control points
+    // under a chosen basis, flattened at load time into the round-cone chain the tracer
+    // actually intersects (see curve.h).
+    //
+    //   basis      linear | catmull_rom | bezier | bspline      (default catmull_rom)
+    //   radius     <r>            root radius (authored units), default 1 mm
+    //   radius_tip <r>            tip radius; default = radius (an untapered tube)
+    //   segments   <n>            round cones per span, default 4 (linear forces 1)
+    //   point x y z [r=<r>]       repeated, >= 2 — a per-point `r=` overrides the taper
+    //
+    // Radii come from three places, in increasing priority: the `radius`/`radius_tip`
+    // taper (linear in control-point index, which is what a groom wants), then an
+    // explicit per-point `r=`. The taper is expressed in point index rather than arc
+    // length on purpose — it must be computable before the curve exists.
+    bool addCurve(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
+        int id = matFieldId(b, L, "curve"); if (id < 0) return false;
+
+        const std::string bs = strOf(b, "basis", "catmull_rom");
+        CurveBasis basis;
+        if      (bs == "linear")                        basis = CurveBasis::Linear;
+        else if (bs == "catmull_rom" || bs == "catmull-rom" ||
+                 bs == "catmullrom")                    basis = CurveBasis::CatmullRom;
+        else if (bs == "bezier")                        basis = CurveBasis::Bezier;
+        else if (bs == "bspline" || bs == "b-spline")   basis = CurveBasis::BSpline;
+        else { fail("curve: unknown basis '" + bs + "' (linear, catmull_rom, bezier, bspline)"); return false; }
+
+        const double rRoot = dblOf(b, "radius", 0.001);
+        const double rTip  = dblOf(b, "radius_tip", rRoot);
+        int subdiv = (int)dblOf(b, "segments", 4.0);
+        if (subdiv < 1) subdiv = 1;
+        if (subdiv > 256) subdiv = 256;   // a per-span cap; nothing sane needs more
+
+        // Gather the repeated `point` statements (in authoring order). A per-point radius
+        // rides as a `key=val` value continuation (`point 0 0.1 0 r=0.002`) because FTSL's
+        // statement splitter would start a NEW statement at a bareword — the same reason
+        // `uv planar axis=x` has to be written with `=`.
+        std::vector<Vec3>   pts;
+        std::vector<double> radii;
+        std::vector<int>    explicitR;   // 1 where the author gave an `r=`
+        for (const auto& s : b.stmts) {
+            if (s.key != "point") continue;
+            s.used = true;
+            if (s.val.words.size() < 3) { fail("curve: `point` needs x y z"); return false; }
+            pts.push_back(Vec3{num(s.val.words[0]), num(s.val.words[1]), num(s.val.words[2])});
+            double pr = 0.0; bool haveR = false;
+            for (size_t k = 3; k < s.val.words.size(); ++k) {
+                std::string key, val;
+                if (!splitEq(s.val.words[k], key, val)) continue;
+                if (key == "r" || key == "radius") { pr = num(val); haveR = true; }
+            }
+            radii.push_back(pr);
+            explicitR.push_back(haveR ? 1 : 0);
+        }
+        const int n = (int)pts.size();
+        if (n < 2) { fail("curve needs at least 2 `point` statements"); return false; }
+        const int spans = curveSpanCount(basis, n);
+        if (spans <= 0) {
+            fail("curve: " + std::to_string(n) + " control points is not a valid " + bs +
+                 (basis == CurveBasis::Bezier ? " chain (needs 3k+1: 4, 7, 10, ...)"
+                                              : " curve (needs at least 4)"));
+            return false;
+        }
+
+        // Fill the un-authored radii from the root->tip taper, then take everything to
+        // world space. An affine map commutes with every basis, so transforming the
+        // CONTROL points and flattening afterwards is identical to the other order —
+        // which is what lets a `group { rotate ... }` carry a strand for free.
+        bool nonUniform = false;
+        const double us = xf.uniformScale(nonUniform);
+        for (int i = 0; i < n; ++i) {
+            double rr = explicitR[i] ? radii[i]
+                                     : rRoot + (rTip - rRoot) * (n > 1 ? (double)i / (n - 1) : 0.0);
+            // A non-uniform group scale cannot be represented by a round cross-section
+            // (it would make an elliptical fiber), so the radius takes the geometric mean
+            // of the three axis scales — the scale that preserves the swept volume. The
+            // approximation is noted rather than fatal: at fiber widths it is invisible,
+            // and refusing to load would make a strand the one primitive a group cannot
+            // hold. (`uniformScale` returns the max axis scale; for the uniform case,
+            // which is every ordinary scene, that IS the exact scale and nothing changes.)
+            radii[i] = Len(rr) * us;
+            pts[i] = P(xf.apply(pts[i]));
+        }
+        if (nonUniform) {
+            const double sx = std::sqrt(xf.m[0]*xf.m[0] + xf.m[3]*xf.m[3] + xf.m[6]*xf.m[6]);
+            const double sy = std::sqrt(xf.m[1]*xf.m[1] + xf.m[4]*xf.m[4] + xf.m[7]*xf.m[7]);
+            const double sz = std::sqrt(xf.m[2]*xf.m[2] + xf.m[5]*xf.m[5] + xf.m[8]*xf.m[8]);
+            const double gm = std::cbrt(std::max(1e-300, sx * sy * sz));
+            for (int i = 0; i < n; ++i) radii[i] *= gm / (us > 0.0 ? us : 1.0);
+            std::fprintf(stderr, "[ftsl] warning: curve%s%s%s under a non-uniform group scale — "
+                                 "the fiber radius uses the volume-preserving geometric mean "
+                                 "(a round fiber cannot become elliptical)\n",
+                         b.name.empty() ? "" : " '", b.name.c_str(), b.name.empty() ? "" : "'");
+        }
+
+        Curve c;
+        c.matId = id;
+        c.basis = basis;
+        c.name  = b.name;
+        c.firstSeg = (int)L.scene.curveSegs.size();
+        c.segCount = tessellateCurve(pts, radii, basis, subdiv, id,
+                                     (int)L.scene.curves.size(), L.scene.curveSegs);
+        if (c.segCount <= 0) { fail("curve: control points are all coincident"); return false; }
+        L.scene.curves.push_back(std::move(c));
+        return true;
+    }
+
     bool addMesh(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
         std::string file = strOf(b, "file");
         if (file.empty()) { fail("mesh needs a file"); return false; }
@@ -4569,9 +4677,10 @@ private:
             else if (s.key == "mesh")     { if (!addMesh(*cb, L, world)) return false; }
             else if (s.key == "mesh_instance") { if (!addMeshInstance(*cb, L, world)) return false; }
             else if (s.key == "isosurface") { if (!addIsosurface(*cb, L, world)) return false; }
+            else if (s.key == "curve")    { if (!addCurve(*cb, L, world)) return false; }
             else if (s.key == "light")    { if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false; haveLight = true; }
             else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
-            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, light, group)"); return false; }
+            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, curve, light, group)"); return false; }
         }
         return true;
     }

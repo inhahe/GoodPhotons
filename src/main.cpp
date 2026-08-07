@@ -500,6 +500,317 @@ static int checkImplicit(long long rays) {
     return mismatches;
 }
 
+// ---------------------------------------------------------------------------
+// CURVE / FIBER self-test  (-checkcurve; curve.h, TODO §P1)
+// ---------------------------------------------------------------------------
+// The round-cone intersector is closed-form algebra with three surface pieces and a
+// band test that decides which piece a root belongs to — exactly the shape of code that
+// looks right, renders plausibly, and is quietly wrong on the pieces a hand-authored
+// test scene happens not to graze. So it is checked against a WHOLLY INDEPENDENT
+// formulation: Inigo Quilez's exact signed distance function for the same solid, which
+// shares no algebra with the intersector (it classifies by comparing squared distances,
+// not by solving a quadratic). Two independent derivations of the same surface agreeing
+// on a million random rays is real evidence; one derivation looking fine is not.
+//
+// Because it IS an exact SDF (Lipschitz 1), sphere-tracing it converges to the true
+// first crossing, which gives ground truth for the far more important question — not
+// "is the reported point on the surface?" but "is it the FIRST one?" A missed near root
+// is the bug that renders fur see-through in exactly the configurations a taper produces.
+static double sdRoundCone(const Vec3& p, const Vec3& a, const Vec3& b, double r1, double r2) {
+    const Vec3   ba = b - a;
+    const double l2 = dot(ba, ba);
+    const double rr = r1 - r2;
+    const double a2 = l2 - rr * rr;
+    if (a2 <= 0.0) {   // one ball swallows the other: the hull IS the larger ball
+        const bool useA = (r1 >= r2);
+        const Vec3 c = useA ? a : b;
+        return length(p - c) - (useA ? r1 : r2);
+    }
+    const double il2 = 1.0 / l2;
+    const Vec3   pa = p - a;
+    const double y = dot(pa, ba);
+    const double z = y - l2;
+    const Vec3   q = pa * l2 - ba * y;
+    const double x2 = dot(q, q);
+    const double y2 = y * y * l2;
+    const double z2 = z * z * l2;
+    const double sgn = (rr < 0.0) ? -1.0 : (rr > 0.0 ? 1.0 : 0.0);
+    const double k = sgn * rr * rr * x2;
+    const double sz = (z < 0.0) ? -1.0 : (z > 0.0 ? 1.0 : 0.0);
+    const double sy = (y < 0.0) ? -1.0 : (y > 0.0 ? 1.0 : 0.0);
+    if (sz * a2 * z2 > k) return std::sqrt(x2 + z2) * il2 - r2;
+    if (sy * a2 * y2 < k) return std::sqrt(x2 + y2) * il2 - r1;
+    return (std::sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
+}
+
+static int checkCurve(long long rays) {
+    Pcg32 rng; rng.seed(0xF1BE125u, 0x5EEDu);
+    auto unitDir = [&]() {
+        double z = rng.uniform() * 2 - 1, phi = 2 * PI * rng.uniform();
+        double rr = std::sqrt(std::max(0.0, 1 - z * z));
+        return Vec3{rr * std::cos(phi), rr * std::sin(phi), z};
+    };
+    int fails = 0;
+
+    // --- 1. surface residual, first-hit agreement, and the normal --------------------
+    // Random round cones spanning the interesting shape space: untapered tubes, strong
+    // tapers in both directions, and near-spherical stubs.
+    {
+        long long tested = 0, agreed = 0, skipped = 0;
+        int missMismatch = 0, badResidual = 0, badT = 0, badNormal = 0, badUV = 0, badBound = 0;
+        double maxRes = 0, maxDt = 0, maxDn = 0;
+        for (long long i = 0; i < rays; ++i) {
+            CurveSeg s;
+            s.p0 = Vec3{rng.uniform() * 2 - 1, rng.uniform() * 2 - 1, rng.uniform() * 2 - 1};
+            s.p1 = s.p0 + unitDir() * (0.05 + rng.uniform() * 1.2);
+            s.r0 = 0.005 + rng.uniform() * 0.35;
+            s.r1 = 0.005 + rng.uniform() * 0.35;
+            s.u0 = 0.25f; s.u1 = 0.75f;
+            // AIM the ray at a random point on/around the cone rather than firing into
+            // an empty box: a uniformly random ray misses a 1 cm fiber essentially always,
+            // and a test that hits 0.5% of the time is testing the miss path. Offsetting
+            // the aim point by up to ~2.5 radii keeps a healthy mix of hits, near-misses
+            // and grazes — including every cap-vs-lateral boundary, which is where the
+            // band classification could be wrong.
+            const Vec3 target = s.p0 + (s.p1 - s.p0) * rng.uniform()
+                              + unitDir() * ((s.r0 + s.r1) * 0.5 * rng.uniform() * 2.5);
+            const Vec3 d = unitDir();
+            const Vec3 o = target - d * (1.0 + rng.uniform() * 3.0);
+            const double sdo = sdRoundCone(o, s.p0, s.p1, s.r0, s.r1);
+            if (sdo < 0.02) { ++skipped; continue; }      // origin inside / on: §3 covers it
+
+            // Ground truth: sphere-trace the exact SDF (never overshoots, since it is a
+            // true distance), and take the first t where the surface is reached.
+            const double tMaxG = 12.0, hitEps = 1e-7;
+            double tg = 0.0; bool gHit = false;
+            for (int it = 0; it < 4000 && tg < tMaxG; ++it) {
+                double dsd = sdRoundCone(o + d * tg, s.p0, s.p1, s.r0, s.r1);
+                if (dsd < hitEps) { gHit = true; break; }
+                tg += dsd;
+            }
+            // A grazing ray is a genuine coin flip at the surface epsilon (the sphere
+            // trace stalls asymptotically alongside a tangent), so it tests floating
+            // point, not the intersector. Skip only those.
+            if (gHit) {
+                double graze = sdRoundCone(o + d * tg, s.p0, s.p1, s.r0, s.r1);
+                if (std::fabs(graze) > 1e-3) { ++skipped; continue; }
+            } else if (tg >= tMaxG) {
+                // may have stalled next to a tangent: check how close it got
+                double closest = DBL_MAX;   // (not `near`: that is a windows.h macro)
+                for (int k = 0; k <= 400; ++k)
+                    closest = std::min(closest, sdRoundCone(o + d * (k * (tMaxG / 400.0)),
+                                                            s.p0, s.p1, s.r0, s.r1));
+                if (closest < 1e-3) { ++skipped; continue; }
+            }
+
+            const CurveRay cr = makeCurveRay(d);
+            Hit h; h.t = DBL_MAX;
+            const bool got = intersectCurveSeg(cr, Ray{o, d}, s, 1e-6, h);
+            ++tested;
+            if (got != gHit) { ++missMismatch; ++fails; continue; }
+            if (!got) continue;
+            ++agreed;
+
+            // (a) the reported point is ON the surface
+            const Vec3 p = o + d * h.t;
+            const double res = std::fabs(sdRoundCone(p, s.p0, s.p1, s.r0, s.r1));
+            maxRes = std::max(maxRes, res);
+            if (res > 1e-6) { ++badResidual; ++fails; }
+            // (b) it is the FIRST one
+            const double dt = std::fabs(h.t - tg);
+            maxDt = std::max(maxDt, dt);
+            if (dt > 1e-4) { ++badT; ++fails; }
+            // (c) the analytic normal matches the SDF gradient
+            const double e = 1e-5;
+            Vec3 g{sdRoundCone(p + Vec3{e,0,0}, s.p0, s.p1, s.r0, s.r1) - sdRoundCone(p - Vec3{e,0,0}, s.p0, s.p1, s.r0, s.r1),
+                   sdRoundCone(p + Vec3{0,e,0}, s.p0, s.p1, s.r0, s.r1) - sdRoundCone(p - Vec3{0,e,0}, s.p0, s.p1, s.r0, s.r1),
+                   sdRoundCone(p + Vec3{0,0,e}, s.p0, s.p1, s.r0, s.r1) - sdRoundCone(p - Vec3{0,0,e}, s.p0, s.p1, s.r0, s.r1)};
+            g = normalize(g);
+            const double dn = length(g - h.ng);
+            maxDn = std::max(maxDn, dn);
+            if (dn > 5e-3) { ++badNormal; ++fails; }
+            // (d) parameterisation: u inside the segment's own span, v a full turn,
+            //     and the shading normal facing the ray.
+            if (h.u < (double)s.u0 - 1e-9 || h.u > (double)s.u1 + 1e-9 ||
+                h.v < 0.0 || h.v > 1.0 || dot(d, h.n) > 0.0) { ++badUV; ++fails; }
+            // (e) the BVH leaf box actually contains the hit — a bound that misses is a
+            //     silently disappearing strand, not a slow one.
+            const Aabb bx = curveSegBounds(s);
+            if (p.x < bx.lo.x - 1e-9 || p.x > bx.hi.x + 1e-9 ||
+                p.y < bx.lo.y - 1e-9 || p.y > bx.hi.y + 1e-9 ||
+                p.z < bx.lo.z - 1e-9 || p.z > bx.hi.z + 1e-9) { ++badBound; ++fails; }
+        }
+        std::printf("[checkcurve] 1. round cone vs exact SDF: %lld rays (%lld hit, %lld grazing skipped)"
+                    " miss=%d res=%d t=%d n=%d uv=%d box=%d"
+                    "  max|sd|=%.2e max|dt|=%.2e max|dn|=%.2e -> %s\n",
+                    tested, agreed, skipped, missMismatch, badResidual, badT, badNormal, badUV, badBound,
+                    maxRes, maxDt, maxDn,
+                    (missMismatch + badResidual + badT + badNormal + badUV + badBound) == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 2. degenerate containment: the hull is a plain sphere ------------------------
+    // r0 - r1 >= |p1 - p0| means one end ball swallows the other. The lateral surface
+    // does not exist, and the answer must be exactly what intersectSphere gives.
+    {
+        int bad = 0; long long n = 0;
+        double maxdt = 0;
+        for (long long i = 0; i < rays / 8; ++i) {
+            CurveSeg s;
+            s.p0 = Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5};
+            const double len = 0.01 + rng.uniform() * 0.2;
+            s.p1 = s.p0 + unitDir() * len;
+            s.r0 = len + 0.05 + rng.uniform() * 0.4;      // big end swallows the small one
+            s.r1 = 0.001 + rng.uniform() * 0.02;
+            const Vec3 o{rng.uniform() * 6 - 3, rng.uniform() * 6 - 3, rng.uniform() * 6 - 3};
+            const Vec3 d = unitDir();
+            Sphere sp{s.p0, s.r0, 0};
+            Hit ha; ha.t = DBL_MAX; const bool hitA = intersectSphere(Ray{o, d}, sp, 1e-6, ha);
+            Hit hb; hb.t = DBL_MAX; const bool hitB = intersectCurveSeg(makeCurveRay(d), Ray{o, d}, s, 1e-6, hb);
+            // Skip tangent grazes (hit/miss coin flip at the epsilon).
+            const Vec3 oc = s.p0 - o; const double proj = dot(oc, d);
+            const double impact = std::sqrt(std::max(0.0, dot(oc, oc) - proj * proj));
+            if (std::fabs(impact - s.r0) < 1e-3) continue;
+            ++n;
+            if (hitA != hitB) { ++bad; continue; }
+            if (!hitA) continue;
+            maxdt = std::max(maxdt, std::fabs(ha.t - hb.t));
+            if (std::fabs(ha.t - hb.t) > 1e-9) ++bad;
+        }
+        fails += bad;
+        std::printf("[checkcurve] 2. degenerate containment == analytic sphere: %lld rays, %d mismatches,"
+                    " max|dt|=%.2e -> %s\n", n, bad, maxdt, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 3. anyHit agrees with the full path ------------------------------------------
+    // Occlusion queries take a shortcut that skips normals/UVs; it must not be able to
+    // change the boolean, INCLUDING for a ray whose origin is inside the fiber (a shadow
+    // ray leaving a strand), which is exactly the case §1 skips.
+    {
+        int bad = 0; long long n = 0, inside = 0;
+        for (long long i = 0; i < rays / 4; ++i) {
+            CurveSeg s;
+            s.p0 = Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5};
+            s.p1 = s.p0 + unitDir() * (0.05 + rng.uniform() * 1.0);
+            s.r0 = 0.01 + rng.uniform() * 0.3;
+            s.r1 = 0.01 + rng.uniform() * 0.3;
+            // Half the origins deliberately INSIDE the fiber.
+            Vec3 o;
+            if (i & 1) { o = s.p0 + (s.p1 - s.p0) * rng.uniform() + unitDir() * (rng.uniform() * s.r0 * 0.5); ++inside; }
+            else       { o = Vec3{rng.uniform() * 4 - 2, rng.uniform() * 4 - 2, rng.uniform() * 4 - 2}; }
+            const Vec3 d = unitDir();
+            const CurveRay cr = makeCurveRay(d);
+            Hit hf; hf.t = DBL_MAX; const bool full = intersectCurveSeg(cr, Ray{o, d}, s, 1e-6, hf);
+            Hit hq; hq.t = DBL_MAX; const bool any  = intersectCurveSeg(cr, Ray{o, d}, s, 1e-6, hq, true);
+            ++n;
+            if (full != any || (full && hf.t != hq.t)) ++bad;
+            // A ray starting inside must find its exit, and that exit must be on the surface.
+            if (full && sdRoundCone(o, s.p0, s.p1, s.r0, s.r1) < -1e-3) {
+                if (std::fabs(sdRoundCone(o + d * hf.t, s.p0, s.p1, s.r0, s.r1)) > 1e-6) ++bad;
+            }
+        }
+        fails += bad;
+        std::printf("[checkcurve] 3. anyHit == full path (%lld inside-origin): %lld rays, %d mismatches -> %s\n",
+                    inside, n, bad, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 4. a CHAIN is watertight at its joints ---------------------------------------
+    // Adjacent round cones share an end sphere, so their union should have no crack —
+    // the whole reason the flattening emits a sphere-swept chain instead of mitred tubes.
+    // Rays are aimed straight at the joints, which is where a crack would be.
+    {
+        std::vector<CurveSeg> chain;
+        std::vector<Vec3>   pts = {{0, 0, 0}, {0.4, 0.5, 0.1}, {-0.2, 0.9, -0.3}, {0.3, 1.4, 0.2}};
+        std::vector<double> rad = {0.06, 0.05, 0.04, 0.02};
+        tessellateCurve(pts, rad, CurveBasis::Linear, 1, 0, 0, chain);
+        int bad = 0; long long n = 0, skipped = 0;
+        auto chainSd = [&](const Vec3& p) {
+            double m = DBL_MAX;
+            for (const auto& c : chain) m = std::min(m, sdRoundCone(p, c.p0, c.p1, c.r0, c.r1));
+            return m;
+        };
+        for (long long i = 0; i < rays / 4; ++i) {
+            // Aim at a random point near a joint, from a random direction.
+            const Vec3 j = pts[1 + (int)(rng.uniform() * 2.999)];
+            const Vec3 target = j + unitDir() * (rng.uniform() * 0.02);
+            const Vec3 d = unitDir();
+            const Vec3 o = target - d * 3.0;
+            const double truth = chainSd(o + d * 3.0);   // is `target` inside the chain?
+            if (std::fabs(truth) < 2e-3) { ++skipped; continue; }   // grazing
+            const CurveRay cr = makeCurveRay(d);
+            Hit h; h.t = DBL_MAX;
+            bool got = false;
+            for (const auto& c : chain) got |= intersectCurveSeg(cr, Ray{o, d}, c, 1e-6, h);
+            ++n;
+            // The target is inside the solid, so a ray through it MUST hit — a crack at
+            // the joint is precisely a ray that passes through and reports nothing.
+            if (truth < 0.0 && !got) ++bad;
+            if (got && std::fabs(chainSd(o + d * h.t)) > 1e-6) ++bad;
+        }
+        fails += bad;
+        std::printf("[checkcurve] 4. chain watertight at joints: %lld rays (%lld grazing skipped), %d cracks -> %s\n",
+                    n, skipped, bad, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 5. basis flattening ----------------------------------------------------------
+    // Catmull-Rom must INTERPOLATE its control points (that is the whole reason it is the
+    // default for an authored guide hair); Bezier must hit its endpoints; linear must be
+    // exact; and every basis must lay `u` down monotonically from 0 to 1.
+    {
+        int bad = 0;
+        const std::vector<Vec3>   pts = {{0, 0, 0}, {0.3, 0.4, 0.1}, {-0.1, 0.9, -0.2},
+                                          {0.4, 1.3, 0.05}, {0.1, 1.8, 0.3}, {0.5, 2.2, 0}, {0.2, 2.6, -0.1}};
+        const std::vector<double> rad = {0.05, 0.045, 0.04, 0.035, 0.03, 0.02, 0.01};
+        struct Case { CurveBasis b; const char* nm; int spans; };
+        const Case cases[] = {{CurveBasis::Linear, "linear", 6},
+                              {CurveBasis::CatmullRom, "catmull_rom", 6},
+                              {CurveBasis::Bezier, "bezier", 2},
+                              {CurveBasis::BSpline, "bspline", 4}};
+        for (const Case& c : cases) {
+            if (curveSpanCount(c.b, (int)pts.size()) != c.spans) { ++bad; continue; }
+            std::vector<CurveSeg> segs;
+            const int sub = (c.b == CurveBasis::Linear) ? 1 : 8;
+            const int n = tessellateCurve(pts, rad, c.b, sub, 7, 3, segs);
+            if (n != (int)segs.size() || n <= 0) { ++bad; continue; }
+            // u marches monotonically from 0 to 1 across the whole strand, and the chain
+            // is contiguous (each segment starts where the last ended).
+            if (std::fabs(segs.front().u0) > 1e-6 || std::fabs(segs.back().u1 - 1.0) > 1e-6) ++bad;
+            for (size_t k = 0; k < segs.size(); ++k) {
+                if (segs[k].u1 < segs[k].u0) ++bad;
+                if (segs[k].matId != 7 || segs[k].curveId != 3) ++bad;
+                if (segs[k].r0 <= 0.0 || segs[k].r1 <= 0.0) ++bad;   // a taper must never go negative
+                if (k && length(segs[k].p0 - segs[k - 1].p1) > 1e-12) ++bad;
+            }
+            // Interpolating bases pass exactly through the control points they claim to.
+            auto onCurve = [&](const Vec3& q) {
+                double m = DBL_MAX;
+                for (const auto& sg : segs) m = std::min(m, length(sg.p0 - q));
+                m = std::min(m, length(segs.back().p1 - q));
+                return m;
+            };
+            if (c.b == CurveBasis::Linear || c.b == CurveBasis::CatmullRom) {
+                for (const Vec3& q : pts) if (onCurve(q) > 1e-9) ++bad;
+            } else if (c.b == CurveBasis::Bezier) {
+                if (onCurve(pts[0]) > 1e-9 || onCurve(pts[3]) > 1e-9 || onCurve(pts[6]) > 1e-9) ++bad;
+            } else {   // a B-spline is APPROXIMATING: it must stay off its own control points
+                if (onCurve(pts[3]) < 1e-6) ++bad;
+            }
+        }
+        // A point count no basis admits must be refused, not silently truncated.
+        std::vector<CurveSeg> junk;
+        std::vector<Vec3> two = {{0, 0, 0}, {0, 1, 0}};
+        std::vector<double> tworad = {0.01, 0.01};
+        if (tessellateCurve(two, tworad, CurveBasis::Bezier, 4, 0, 0, junk) != 0) ++bad;
+        if (tessellateCurve(two, tworad, CurveBasis::BSpline, 4, 0, 0, junk) != 0) ++bad;
+        if (tessellateCurve(two, tworad, CurveBasis::Linear, 4, 0, 0, junk) != 1) ++bad;  // linear forces sub=1
+        fails += bad;
+        std::printf("[checkcurve] 5. basis flattening (linear/catmull_rom/bezier/bspline): %d failures -> %s\n",
+                    bad, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    std::printf("[checkcurve] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    return fails;
+}
+
 // ORIENTED-CONTAINER self-test: rotating an expression isosurface must not change what
 // it looks like. An `expr` field is not a distance function, so the marcher clips the ray
 // to the authored `contained_by` box and sizes its steps by |f|/max_gradient — a bound
@@ -6719,6 +7030,7 @@ static int run(int argc, char** argv) {
     double focusDist = 0.0;   // mode C thin-lens focus distance (0 = no lens)
     bool checkBvhOnly = false;
     bool checkImplicitOnly = false;
+    bool checkCurveOnly = false;
     bool checkContainerOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
@@ -6966,10 +7278,11 @@ static int run(int argc, char** argv) {
         if (parseOnly) {
             const Scene& sc = ftslScene.scene;
             std::printf("[parseonly] ok: %zu materials, %zu records, %zu emitters, "
-                        "%zu spheres, %zu tris, %zu implicits, %zu textures, "
-                        "%zu patterns, %zu cameras\n",
+                        "%zu spheres, %zu tris, %zu implicits, %zu curves (%zu segs), "
+                        "%zu textures, %zu patterns, %zu cameras\n",
                         sc.mats.size(), sc.records.size(), sc.emitters.size(),
                         sc.spheres.size(), sc.tris.size(), sc.implicits.size(),
+                        sc.curves.size(), sc.curveSegs.size(),
                         sc.textures.size(), sc.patterns.size(),
                         ftslScene.cameras.size());
             return 0;
@@ -7105,6 +7418,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-focus") && i + 1 < argc) focusDist = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
         else if (!std::strcmp(argv[i], "-checkimplicit")) checkImplicitOnly = true;
+        else if (!std::strcmp(argv[i], "-checkcurve")) checkCurveOnly = true;
         else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
@@ -7304,6 +7618,7 @@ static int run(int argc, char** argv) {
         g_windowTitle = "ftrace  \xE2\x80\x94  " + scene + "  \xE2\x86\x92  " + out;
     }
     if (checkImplicitOnly) return checkImplicit(500'000) == 0 ? 0 : 1; // deterministic, no scene needed
+    if (checkCurveOnly)    return checkCurve(200'000) == 0 ? 0 : 1;    // deterministic, no scene needed
     if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed

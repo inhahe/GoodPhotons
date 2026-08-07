@@ -416,6 +416,91 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             }
     }
 
+    // (2b) Curve / fiber segments -> a round-cone mesh (lateral tangent band + both
+    // spherical caps). The rasterizer draws triangles, so without this a scene of
+    // strands previews EMPTY — and unlike the CUDA path, which gates the whole scene
+    // to the CPU rather than render a furred subject bald, the preview has no gate to
+    // fall back to. "Geometry I can't draw is geometry that isn't there" is the exact
+    // failure the applyMat comment above warns about, so the fix is to draw it.
+    //
+    // The surface is swept as a stack of RINGS about the segment axis, walking the same
+    // three pieces the analytic intersector knows (curve.h): the back cap of sphere(p0,r0),
+    // the tangent lateral band, and the front cap of sphere(p1,r1). With
+    // `a = (r0-r1)/|p1-p0|` the tangent circles sit at polar angle `acos(a)` on BOTH end
+    // spheres, which is what makes one angular sweep cover all three pieces continuously
+    // — so the preview mesh is closed, exactly like the surface it approximates.
+    if (!sc.curveSegs.empty()) {
+        const int CU   = 10;   // azimuthal divisions
+        const int CCAP = 2;    // rings per spherical cap
+        // A fiber is a few pixels wide at preview resolution, so this stays deliberately
+        // coarse: 80 tris/segment is already ~5x what a strand costs the ray tracer, and
+        // the silhouette is what the preview is for.
+        for (const auto& s : sc.curveSegs) {
+            Vec3 ba = s.p1 - s.p0;
+            double l = length(ba);
+            if (l <= 1e-12) continue;                 // coincident ends: tessellateCurve drops these
+            Vec3 ax = ba * (1.0 / l);
+            double a = (s.r0 - s.r1) / l;
+            if (a > 1.0) a = 1.0; else if (a < -1.0) a = -1.0;   // one ball swallows the other
+            Vec3 T, B; onb(ax, T, B);
+            const double alpha0 = std::acos(a);       // polar angle of BOTH tangent circles
+
+            // Ring stations, back pole -> front pole. `onSphere0` picks which end sphere
+            // the ring rides; the two tangent rings are shared, so the strip is seamless.
+            struct Ring { Vec3 c; double rad, nAx; double u; };
+            std::vector<Ring> rings;
+            rings.reserve(2 * CCAP + 2);
+            auto push = [&](const Vec3& org, double r, double alpha, double u) {
+                const double ca = std::cos(alpha), sa = std::sin(alpha);
+                rings.push_back(Ring{org + ax * (r * ca), r * sa, ca, u});
+            };
+            for (int i = 0; i <= CCAP; ++i)           // cap at p0: alpha pi -> alpha0
+                push(s.p0, s.r0, PI + (alpha0 - PI) * (double)i / CCAP, (double)s.u0);
+            push(s.p1, s.r1, alpha0, (double)s.u1);   // the OTHER tangent circle (lateral band)
+            for (int i = 1; i <= CCAP; ++i)           // cap at p1: alpha0 -> 0
+                push(s.p1, s.r1, alpha0 * (1.0 - (double)i / CCAP), (double)s.u1);
+
+            auto vert = [&](const Ring& rg, int iu, Vec3& p, Vec3& n) {
+                const double phi = 2.0 * PI * (double)iu / CU;
+                const Vec3 rad = T * std::cos(phi) + B * std::sin(phi);
+                n = rad * std::sqrt(std::max(0.0, 1.0 - rg.nAx * rg.nAx)) + ax * rg.nAx;
+                p = rg.c + rad * rg.rad;
+            };
+            // v matches the analytic hit's azimuth (curve.h uses the same onb(axis)), so a
+            // pattern reading u/v previews where it will actually land.
+            auto uvAt = [&](const Ring& rg, int iu) {
+                return Vec3{rg.u, (double)iu / CU, 0.0};
+            };
+            for (size_t k = 0; k + 1 < rings.size(); ++k) {
+                const Ring& r0 = rings[k];
+                const Ring& r1 = rings[k + 1];
+                const bool degen0 = r0.rad <= 1e-12, degen1 = r1.rad <= 1e-12;
+                if (degen0 && degen1) continue;
+                for (int iu = 0; iu < CU; ++iu) {
+                    Vec3 p00, n00, p10, n10, p01, n01, p11, n11;
+                    vert(r0, iu, p00, n00); vert(r0, iu + 1, p10, n10);
+                    vert(r1, iu, p01, n01); vert(r1, iu + 1, p11, n11);
+                    Vec3 uv00 = uvAt(r0, iu), uv10 = uvAt(r0, iu + 1);
+                    Vec3 uv01 = uvAt(r1, iu), uv11 = uvAt(r1, iu + 1);
+                    if (!degen0) {   // pole rings collapse the quad to a single fan triangle
+                        PTri t; t.p0 = p00; t.p1 = p01; t.p2 = p11;
+                        t.n0 = n00; t.n1 = n01; t.n2 = n11;
+                        applyMat(t, s.matId);
+                        t.uv0 = uv00; t.uv1 = uv01; t.uv2 = uv11;
+                        out.push_back(t);
+                    }
+                    if (!degen1) {
+                        PTri t; t.p0 = p00; t.p1 = p11; t.p2 = p10;
+                        t.n0 = n00; t.n1 = n11; t.n2 = n10;
+                        applyMat(t, s.matId);
+                        t.uv0 = uv00; t.uv1 = uv11; t.uv2 = uv10;
+                        out.push_back(t);
+                    }
+                }
+            }
+        }
+    }
+
     // (3) Isosurfaces / metaballs / CSG -> marching-tetrahedra mesh.
     if (isoRes > 0) {
         isomesh::Options opt; opt.res = isoRes; opt.adaptive = false; opt.refineIters = 3;

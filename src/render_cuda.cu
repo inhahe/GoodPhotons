@@ -10881,6 +10881,13 @@ bool cudaForwardSupported(const Scene& scene) {
         }
         return false;
     };
+    // Curve / fiber primitives (curve.h, TODO §P1) have no device twin yet: the megakernel
+    // knows four prim ranges (tri | sphere | implicit | instance) and would silently trace
+    // straight past every strand, so a furred scene would render BALD on the GPU rather
+    // than merely differently. Falling back to the CPU is the only honest answer until the
+    // round-cone intersector is ported. (Checked here rather than in the backward/BDPT
+    // gates because both of those call this one first.)
+    if (!scene.curveSegs.empty()) return false;
     for (const auto& t : scene.tris)      if (unsupported(t.matId)) return false;
     for (const auto& s : scene.spheres)   if (unsupported(s.matId)) return false;
     for (const auto& im : scene.implicits) if (unsupported(im.matId)) return false;

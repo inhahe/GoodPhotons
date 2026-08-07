@@ -27,6 +27,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Spectral representation vs. other renderers](#spectral-representation-vs-other-renderers)
 - [Lights](#lights)
 - [Geometry](#geometry)
+  - [Curves and fibers (`curve`)](#curves-and-fibers-curve)
   - [Implicit surfaces (`isosurface`)](#implicit-surfaces-isosurface)
 - [Textures](#textures)
 - [Procedural patterns (math-driven materials)](#procedural-patterns-math-driven-materials)
@@ -344,7 +345,8 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > **Quick preview — `-raster` (not a transport mode).** To eyeball *composition*
 > and *camera motion* before committing to a full render, `-raster` skips light
 > transport entirely: it tessellates the whole scene once (analytic spheres →
-> UV spheres, isosurfaces/CSG → marching-tetrahedra mesh, instanced meshes baked
+> UV spheres, isosurfaces/CSG → marching-tetrahedra mesh, `curve` strands → a
+> round-cone mesh per segment, instanced meshes baked
 > to world space) and z-buffers each camera as solid, flat diffuse+headlight
 > triangles — roughly **1 fps at 1280×720**. There is **no** transparency,
 > reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
@@ -1662,7 +1664,8 @@ first.
 
 ## Geometry
 
-`sphere`, `quad` (parallelogram), `triangle`, and `mesh` (**OBJ, glTF 2.0 / GLB,
+`sphere`, `quad` (parallelogram), `triangle`, `curve` (a hair/fur/wire strand — see
+**Curves and fibers** below), and `mesh` (**OBJ, glTF 2.0 / GLB,
 Autodesk FBX, and `.ftmesh`** import — the loader dispatches on file extension). glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
@@ -1719,7 +1722,7 @@ at load time from the mesh's world-space bounding box (the optional token is the
 projection/up axis, default `y`).
 `group { translate … rotate … scale … shear … <children> }` composes transform
 hierarchies (baked to world space at load). Children may be `sphere`, `quad`,
-`triangle`, `mesh`, `mesh_instance`, `isosurface`, `light`, or nested `group`s —
+`triangle`, `mesh`, `mesh_instance`, `isosurface`, `curve`, `light`, or nested `group`s —
 so a physically-settled rest pose (e.g. from `tools/settle_scene.py`) can wrap an
 isosurface CSG/implicit just as easily as a mesh. `shear <a> <b> <c>` adds a
 unit-diagonal upper-triangular skew (`x' = x + a·y + b·z`, `y' = y + c·z`) to the
@@ -1750,6 +1753,78 @@ edge signs are what used to crack — the GPU float path. (v0.116.0 fixed a real
 GPU: the guarantee needs the edge functions' two products to stay *unfused*, and nvcc's
 default fused multiply-add was silently breaking the antisymmetry, so a mesh edge that landed
 dead on a column of pixel centres let the background through. See `known-issues.md`.)
+
+### Curves and fibers (`curve`)
+
+A `curve` is a **strand**: control points plus a radius, for hair, fur, grass, wire,
+thread and cables. It exists because the alternative is untenable — a triangle ribbon
+costs ~64 triangles per hair, so one furred animal (1–10 M hairs × 8–32 segments) is
+**10⁸–10⁹ triangles**. A strand instead costs a handful of segments.
+
+```
+curve "guide_hair" {
+    material gold
+    basis      catmull_rom       # linear | catmull_rom | bezier | bspline
+    radius     0.016             # root radius (default 0.001 = 1 mm)
+    radius_tip 0.002             # tip radius (default = radius, i.e. untapered)
+    segments   12                # round cones per span (default 4; linear forces 1)
+    point 0.30 0.02 0.55
+    point 0.36 0.24 0.48
+    point 0.27 0.46 0.60  r=0.028   # `r=` overrides the taper at one point
+    point 0.35 0.68 0.50
+    point 0.29 0.88 0.56
+}
+```
+
+**How it is traced.** ftrace **flattens the curve at load time** into a chain of
+**round cones** — each the convex hull of a sphere at either end, i.e. a capsule whose
+radius varies linearly (`src/curve.h`). The BVH indexes one leaf per *round cone*, not
+per strand, because a whole hair's bounding box is mostly empty space. Flattening up
+front rather than evaluating the basis per ray means exact leaf bounds ("bound what you
+test"), no basis evaluation in the inner loop, and a POD segment record that a future
+GPU port can upload directly.
+
+Because adjacent round cones **share their end sphere**, the chain is watertight and
+smooth at the joints with no mitre logic: a strand is a single closed surface however
+sharply it bends. That is why the `linear` zig-zag in `scenes/curve_basics.ftsl` has
+no cracks at its corners.
+
+**Bases.** All four are affine-invariant, so a `group { translate … rotate … scale … }`
+transforms the control points and the flattening is exact; the radius picks up the
+group's uniform scale (a non-uniform scale warns and uses the volume-preserving
+geometric mean, since a round fiber cannot become elliptical).
+
+| `basis` | points needed | spans | behaviour |
+|---|---|---|---|
+| `linear` | ≥ 2 | `n−1` | the control points **are** the polyline; `segments` is forced to 1 |
+| `catmull_rom` *(default)* | ≥ 2 | `n−1` | **interpolating** — the strand passes exactly through every point you author, so it is the right basis for a hand-placed guide hair. Ends are clamp-duplicated |
+| `bezier` | `3k+1` | `(n−1)/3` | cubic chain, `P0 C C P1 C C P2 …` |
+| `bspline` | ≥ 4 | `n−3` | **approximating** and C2 — smoother than its control polygon and does *not* pass through the points; the right basis for a groom solver's output |
+
+Radius is interpolated **linearly** between a span's two endpoint control points, never
+through the basis — a Catmull-Rom radius can overshoot, and a negative radius is not a
+taper, it is a bug.
+
+**Texture coordinates.** The hit's `u` runs `0` (root) → `1` (tip) along the strand and
+`v` runs around its circumference, so a `pattern` or texture can vary along or around a
+fiber (`scenes/curve_basics.ftsl` bands one strand with
+`expr "0.5+0.5*sin(2*pi*9*u)"`). `tangent` is the strand's axis, Gram-Schmidt'd against
+the shading normal — the frame an anisotropic or fiber BSDF wants.
+
+**Correctness.** `ftrace -checkcurve` runs five sections: the round-cone intersector
+against Inigo Quilez's exact analytic SDF (position, first-hit `t`, normal vs. the
+numerical SDF gradient, `u`/`v` ranges, and AABB containment); the degenerate case where
+one end sphere swallows the other, which must equal the analytic ray–sphere test
+exactly; `anyHit` agreement with the full path including origins *inside* the fiber;
+watertightness at chain joints; and basis flattening (span counts, monotone `u`, chain
+contiguity, and that interpolating bases hit their control points while `bspline` stays
+off them).
+
+**Limits (v1).** Curves are **CPU-only** in the ray-traced modes: the CUDA megakernel has
+no device twin yet, so a scene containing curves falls back to the CPU rather than
+rendering bald. The `-raster` / `-raster-gpu` previews *do* show strands (each round cone
+is meshed at preview fidelity). See `known-issues.md`, which also covers the per-segment
+azimuthal `v` frame and `CurveSeg`'s memory footprint.
 
 ### Implicit surfaces (`isosurface`)
 
@@ -2428,7 +2503,8 @@ sphere=((0.5, 0.45, 0.5), 0.32), density_max=1.2)`.
 
 An FTSL file is a list of blocks. Top-level block types: `scene` (the
 `units …` / `spectral …` header), `material`, `texture`, `pattern` (procedural scalar
-field), `spectrum`, `sphere`, `quad`, `triangle`, `mesh`, `isosurface` (implicit SDF
+field), `spectrum`, `sphere`, `quad`, `triangle`, `mesh`, `curve` (a hair/fur/wire
+strand), `isosurface` (implicit SDF
 surface / CSG / metaballs / arbitrary `function` formulas), `light`, `group`, `medium`,
 `camera`, `camera_path` (keyframed camera animation), `camera_orbit` (turntable /
 fly-around: N frames on a circle around a `center`, for MP4 orbits), `camera_curve`
@@ -2944,11 +3020,17 @@ alone can't restore, so they are not disk-resumable.
 | `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checkimplicit`,
-`-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`, `-checkthinfilm`,
+`-checkcurve`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
+`-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checksun`, `-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
-`PASS`/`FAIL`. `-checkcontainer` guards the isosurface container clip: rotating an
+`PASS`/`FAIL`. `-checkcurve` guards the `curve` primitive: it cross-checks the
+round-cone intersector against the exact analytic SDF, the degenerate
+one-sphere-swallows-the-other case against the analytic ray–sphere test, `anyHit`
+against the full path (with half the origins *inside* the fiber), watertightness at
+chain joints, and the four bases' flattening — see **Curves and fibers** above.
+`-checkcontainer` guards the isosurface container clip: rotating an
 isosurface must not change what a ray sees, so it builds the same solid twice
 (axis-aligned and rigidly rotated) and checks that correspondingly rotated rays
 return identical hit distances. `-checklattice` guards **mode W**'s deterministic

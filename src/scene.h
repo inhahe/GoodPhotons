@@ -7,6 +7,7 @@
 #include "geometry.h"
 #include "bvh.h"
 #include "implicit.h"
+#include "curve.h"       // curve / fiber primitive (hair, fur, grass, wire) — TODO §P1
 #include "pattern.h"
 #include "spectrum.h"
 #include "scene_film.h"
@@ -974,6 +975,12 @@ struct Scene {
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
     std::vector<Implicit> implicits;   // isosurfaces / metaballs / (smooth) CSG
+    // Curve / fiber primitives (hair, fur, grass, wire). `curves` is one entry per
+    // authored strand and exists for diagnostics and future per-strand data; the thing
+    // actually traced — and the thing the BVH indexes — is the flat `curveSegs` pool of
+    // round cones each strand was flattened into at load time (see curve.h).
+    std::vector<Curve>    curves;
+    std::vector<CurveSeg> curveSegs;
     std::vector<Blas> blasList;        // shared instanced mesh assets (local space)
     std::vector<MeshInstance> instances; // placements of blasList into the world
     std::vector<MeshGroup> meshGroups;   // named mesh objects (for -check-watertight)
@@ -1542,8 +1549,12 @@ struct Scene {
             Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
             boxes.push_back(b);
         }
-        boxes.reserve(boxes.size() + implicits.size() + instances.size());
+        boxes.reserve(boxes.size() + implicits.size() + curveSegs.size() + instances.size());
         for (const auto& im : implicits) boxes.push_back(im.bounds);
+        // One leaf per round cone, NOT per strand: a whole hair's box is mostly empty,
+        // and a BVH over long thin near-collinear boxes is exactly the degeneracy
+        // TODO §P1 warned about. Per-segment bounds are also exact for what is tested.
+        for (const auto& cs : curveSegs) boxes.push_back(curveSegBounds(cs));
         // One TLAS leaf per instance: the BLAS's local bounding box transformed into
         // world space (union of its 8 transformed corners — the tightest world AABB
         // of a rotated box short of re-bounding the actual triangles).
@@ -1611,7 +1622,13 @@ struct Scene {
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
+        const size_t nC = curveSegs.size();
         const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
+        // Unit ray direction + 1/|d| for the round-cone algebra: once per ray, not once
+        // per segment (a fur render tests thousands of segments per ray). See curve.h.
+        // Guarded on nC so a curve-free scene does not pay a sqrt on every single ray —
+        // verified bit-identical against the pre-curve binary on the sample scenes.
+        const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
         // Sampled tables, in case an implicit's field formula reads `grid:`/`scatter:`.
         // Built once per ray, not per implicit hit: three pointer copies either way, and
         // the lambda is called many times.
@@ -1620,8 +1637,9 @@ struct Scene {
             if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs)) tm = h.t; }
+            else if (prim < (int)(nT + nS + nI + nC)) { if (intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h)) tm = h.t; }
             else {
-                const MeshInstance& inst = instances[prim - nT - nS - nI];
+                const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
                 Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
                 Hit lh; lh.t = h.t;                    // running world tMax == local tMax
                 if (blasList[inst.blasId].intersectLocal(lr, tmin, lh)) {
@@ -1644,15 +1662,19 @@ struct Scene {
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
+        const size_t nC = curveSegs.size();
         const double seg = maxDist - tmin;
         const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
+        const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};   // see closestHit
         const PatTables tabs = patTables();      // see closestHit
         return bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
             if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
-            const MeshInstance& inst = instances[prim - nT - nS - nI];
+            if (prim < (int)(nT + nS + nI + nC))
+                return intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h, /*anyHit=*/true);
+            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             return blasList[inst.blasId].occludedLocal(lr, tmin, seg);  // world seg == local seg
         });
