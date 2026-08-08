@@ -150,6 +150,33 @@ POSTURE = BlockSpec(
     },
 )
 
+SENSING = BlockSpec(
+    label="name", label_required=False,
+    doc="The proprioceptive interface: where the nervous system reads the body from, how "
+        "late the signals arrive, and how noisy they are.",
+    props={
+        # `hub` is here rather than inferred because a *conduction* delay is a distance to
+        # somewhere, and only the rig knows where the nervous system's integration point
+        # is. Inferring it from bone names would be a guess that silently reverses the
+        # fore/hind delay ordering on any rig that spells its head differently.
+        "hub": Prop(1, kind="str",
+                    doc="bone the afferent/efferent path length is measured to, i.e. where "
+                        "the CNS sits; default = the root bone"),
+        "conduction": Prop(1, doc="signal conduction velocity along the body, m/s "
+                                  "(large myelinated fibre ~60); delay = distance / this"),
+        "central_delay": Prop(1, doc="fixed central processing latency, s, on top of "
+                                     "conduction -- the part that does not scale with size"),
+        # Noise is declared as a FRACTION of each channel's own scale, not in radians or
+        # newtons, for the same reason posture declares an angle: a receptor's error is
+        # proportional to what it measures, so a fraction stays true across the morph range
+        # while an absolute figure is right for exactly one body.
+        "angle_noise": Prop(1, doc="joint-angle noise, fraction of that joint's own range"),
+        "rate_noise": Prop(1, doc="joint-velocity noise, fraction of the body's rate scale"),
+        "force_noise": Prop(1, doc="contact-force noise, fraction of body weight"),
+        "vestibular_noise": Prop(1, doc="noise on the gravity direction and body rates"),
+    },
+)
+
 CREATURE = BlockSpec(
     label="name",
     props={
@@ -159,11 +186,12 @@ CREATURE = BlockSpec(
         "mass": Prop(1, doc="target total mass; geom densities are scaled to hit it"),
     },
     blocks={"morph": MORPH, "derive": DERIVE, "skeleton": SKELETON,
-            "world": WORLD, "defaults": DEFAULTS, "posture": POSTURE},
+            "world": WORLD, "defaults": DEFAULTS, "posture": POSTURE,
+            "sensing": SENSING},
     required_blocks=("skeleton",),
 )
 
 ROOT = BlockSpec(blocks={"creature": CREATURE})
 
 __all__ = ["ROOT", "CREATURE", "SKELETON", "BONE", "JOINT", "GEOM", "MORPH", "PARAM",
-           "DERIVE", "WORLD", "DEFAULTS", "POSTURE", "VARIADIC"]
+           "DERIVE", "WORLD", "DEFAULTS", "POSTURE", "SENSING", "VARIADIC"]

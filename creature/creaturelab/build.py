@@ -18,7 +18,7 @@ from ftcl.expr import Env, Expr
 from ftcl.parser import Node, parse_file, parse_string
 
 from .model import (Bone, Creature, Defaults, Geom, Joint, MorphParam, Posture,
-                    World)
+                    Sensing, World)
 from .schema import ROOT
 
 
@@ -280,10 +280,26 @@ def build_from_nodes(nodes: list[Node], src: str | None = None,
             raise FtclError("posture 'sag' must be a positive angle (it divides the "
                             "measured holding torque)", pnode.loc, src)
 
+    xnode = cnode.child("sensing")
+    sensing = Sensing()
+    if xnode is not None:
+        sensing = Sensing(
+            hub=_str(xnode, "hub", sensing.hub),
+            conduction=_f(xnode, "conduction", env, sensing.conduction),
+            central_delay=_f(xnode, "central_delay", env, sensing.central_delay),
+            angle_noise=_f(xnode, "angle_noise", env, sensing.angle_noise),
+            rate_noise=_f(xnode, "rate_noise", env, sensing.rate_noise),
+            force_noise=_f(xnode, "force_noise", env, sensing.force_noise),
+            vestibular_noise=_f(xnode, "vestibular_noise", env, sensing.vestibular_noise),
+        )
+        if sensing.conduction <= 0:
+            raise FtclError("sensing 'conduction' must be a positive velocity in m/s "
+                            "(it divides the afferent path length)", xnode.loc, src)
+
     snode = cnode.child("skeleton")
     creature = Creature(name=cnode.name, params=resolved, morph=morph_vec,
                         world=world, defaults=defaults, posture=posture,
-                        target_mass=_f(cnode, "mass", env),
+                        sensing=sensing, target_mass=_f(cnode, "mass", env),
                         doc=_str(cnode, "doc", "") or "")
     locs = {}
     for bnode in snode.all("bone"):
@@ -294,6 +310,11 @@ def build_from_nodes(nodes: list[Node], src: str | None = None,
 
     declared_root = _str(snode, "root")
     validate_tree(creature, src, locs)
+    if sensing.hub is not None:
+        names = {b.name for b in creature.bones}
+        if sensing.hub not in names:
+            raise FtclError(f"sensing hub '{sensing.hub}' is not a bone"
+                            + did_you_mean(sensing.hub, names), xnode.loc, src)
     if declared_root and declared_root != creature.root:
         raise FtclError(f"skeleton declares root '{declared_root}' but the bone tree's "
                         f"root is '{creature.root}'", snode.loc, src)

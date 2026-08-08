@@ -169,6 +169,27 @@ creature "canis" {
         # `world` already declares.
     }
 
+    # -------------------------------------------------------------- proprioception
+    # What the policy is allowed to know, and how stale and how noisy it is. Declared
+    # here for the same reason `posture` is: these are properties of the *animal*, not of
+    # a training run, so they have to travel with the rig or a retrained policy silently
+    # gets a different body to control.
+    #
+    # `hub "head"` is the load-bearing line. A conduction delay is a distance over a
+    # velocity, so it needs a destination, and putting the destination at the head makes
+    # hind-limb afferents travel further than fore-limb ones -- the real asymmetry, and it
+    # falls out of the morph vector instead of being authored. Leaving this at its default
+    # (the pelvis, which is the root) would reverse it.
+    sensing {
+        hub "head"
+        conduction    60          # m/s, large myelinated afferent
+        central_delay 0.010       # s of processing that does not shrink with the animal
+        angle_noise   0.004       # of each joint's own range
+        rate_noise    0.02        # of the body's own rate scale
+        force_noise   0.03        # of body weight
+        vestibular_noise 0.01
+    }
+
     # ------------------------------------------------------------------------- skeleton
     skeleton {
         root "pelvis"

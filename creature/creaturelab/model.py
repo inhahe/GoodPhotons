@@ -103,6 +103,39 @@ class Posture:
 
 
 @dataclass
+class Sensing:
+    """What the policy is allowed to know about the body, and how late and how wrong.
+
+    This exists because "observation space" is not a training detail -- it is the contract
+    that decides whether a policy transfers to a different body at all. Two rules follow
+    from that and are enforced by `creaturelab.sensing` rather than left to the trainer:
+
+    * **Every channel is body-local and normalised by the body's own scale**, so the same
+      number means the same thing on a Chihuahua and a Great Dane. A world position or an
+      absolute velocity in m/s does not have that property, trains faster, and produces a
+      policy that cannot be morphed -- which is P4's entire premise thrown away for a
+      short-term convergence win.
+    * **Signals arrive late.** Conduction is finite, so a real animal acts on a body state
+      that is 10-40 ms old, more in a large one. Training on instantaneous truth yields
+      reflexes no animal has, and the tell is a twitchy over-corrected gait -- the motor
+      analogue of a fixed-pivot knee. The delay is *derived* from the morph vector
+      (path length / conduction velocity), so scaling the creature up makes it move
+      heavier for free instead of needing a second hand-tuned number.
+
+    Noise is deliberately NOT scaled by body size: it is declared as a fraction of each
+    channel's own scale, and a receptor's fractional error is already size-independent.
+    Scaling it again would be scaling it twice.
+    """
+    hub: str | None = None          # bone the conduction distance is measured to
+    conduction: float = 60.0        # m/s
+    central_delay: float = 0.010    # s
+    angle_noise: float = 0.004      # fraction of joint range
+    rate_noise: float = 0.02        # fraction of the body's rate scale
+    force_noise: float = 0.03       # fraction of body weight
+    vestibular_noise: float = 0.01
+
+
+@dataclass
 class Defaults:
     # Both of these are *escape hatches*, not the normal path: an absolute number in
     # kg*m^2 or N*m*s/rad is body-specific, so it is wrong for every morph but one. Leave
@@ -131,6 +164,7 @@ class Creature:
     world: World = field(default_factory=World)
     defaults: Defaults = field(default_factory=Defaults)
     posture: Posture | None = None          # None = no passive tone; a bare skeleton
+    sensing: Sensing = field(default_factory=Sensing)
     target_mass: float | None = None
     # Body pairs that may never collide. Derived, not authored -- see tune.auto_exclude.
     contact_excludes: list[tuple[str, str]] = field(default_factory=list)

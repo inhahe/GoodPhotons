@@ -57,8 +57,8 @@ def withers_height(model, data) -> float:
     return max(geom_z_extent(model, data, g)[1] for g in range(model.ngeom))
 
 
-def trunk_tilt(model, data) -> float:
-    """Degrees between the trunk's own up-axis and world up, over the full [0, 180] range.
+def trunk_tilt_of(data) -> float:
+    """Degrees between the trunk's own up-axis and world up, from an ALREADY-forward `data`.
 
     Extracting a pitch from the quaternion as `asin(2*(qy*qw - qx*qz))` looks equivalent
     and is not: `asin` saturates, so it folds large rotations back into small ones. A draw
@@ -66,16 +66,26 @@ def trunk_tilt(model, data) -> float:
     because it had also sunk most of a metre. Taking the angle between two axis vectors has
     no such branch -- upside down is 180, and cannot be anything else.
 
-    Separate from `stand_test` because P1 needs it too: "has the creature fallen over" is
-    the termination condition of every locomotion episode, and it must be the same measure
-    the acceptance test uses, or a policy can learn to satisfy one and not the other.
+    Split out from `trunk_tilt` because P1's episode loop asks this question once per
+    control step, right after `mj_step` has already updated the kinematics -- and the
+    `mj_forward` inside `trunk_tilt` would then be a redundant full dynamics evaluation in
+    the hot loop. Splitting rather than reimplementing keeps the training termination
+    condition and the P0 acceptance bar *literally the same measure*, which matters: a
+    policy that can satisfy one and not the other is a policy that learned to game the
+    difference.
     """
-    import mujoco
     import numpy as np
 
-    mujoco.mj_forward(model, data)
     # Body 1 is the first body after the world, i.e. the floating root the rig hangs from.
     return float(np.degrees(np.arccos(np.clip(data.xmat[1].reshape(3, 3)[2, 2], -1.0, 1.0))))
+
+
+def trunk_tilt(model, data) -> float:
+    """`trunk_tilt_of`, forcing the kinematics up to date first."""
+    import mujoco
+
+    mujoco.mj_forward(model, data)
+    return trunk_tilt_of(data)
 
 
 def stand_test(model, data, seconds: float = SETTLE_SECONDS, sag_frac: float = 0.09,
