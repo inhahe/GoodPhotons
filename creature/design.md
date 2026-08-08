@@ -3,9 +3,9 @@
 ## What this is
 
 A system for building physically-simulated animals whose motion is **learned** rather than
-keyframed: articulated skeleton → muscle/tendon actuators → soft tissue → fur, driven by a
-neural controller fit to real animal movement, and morphable into stylized or fictional
-creatures while preserving the learned motion character.
+keyframed: articulated skeleton → muscle/tendon actuators → respiration → soft tissue → fur,
+driven by a neural controller fit to real animal movement, and morphable into stylized or
+fictional creatures while preserving the learned motion character.
 
 The goal is **not** to build a specific creature. A convincing lion is a content problem
 (artists, years). The system that makes lions buildable is an architecture problem, and
@@ -105,6 +105,7 @@ body/joint tree, which is what makes the MJCF emitter cheap.
 |---|---|---|
 | skeleton (bones, joints, ligaments) | yes | defines the configuration space |
 | muscles / tendons | yes | actuators *within* that space |
+| respiration (lungs, diaphragm, ribcage) | **partly** | the *oscillation* is offline; the **aerobic budget** is in the loop, because it is what makes sustained speed cost something. See below |
 | soft tissue (flesh, fat, skin slide) | **no** | offline render pass — FEM in-loop is prohibitive and buys the controller nothing |
 | fur / surface | **no** | offline |
 
@@ -337,6 +338,54 @@ a 32× mass range, tilt over the full [0°, 180°] range.
 needs the same measure: "has the creature fallen over" is the termination condition of every
 locomotion episode, and if it differs from the acceptance test's notion a policy can learn
 to satisfy one and not the other.
+
+### Breathing is mechanically coupled to gait, so it is not a render effect
+
+*(added 2026-08-08.)* The obvious place to put breathing is the offline look pass, next to fur
+— a periodic swell of the flank, applied after the physics is done. That is where it will end
+up *visually*, and it is still the wrong model, for three reasons that are each measurable.
+
+**1. At a gallop, breathing is driven by locomotion, not by the animal.** Bramble & Carrier
+(1983) found running quadrupeds lock to a **1:1 stride-to-breath ratio**, and the mechanism is
+mechanical rather than neural: the visceral mass slides fore-and-aft in the abdomen and drives
+the diaphragm like a piston, while forelimb impact loads the thorax. So the breath *phase* is
+not free to be authored — it is a consequence of the gait, and a decorative sine wave applied
+afterwards will drift out of phase with the footfalls in exactly the way a real animal's does
+not. (Humans are the odd ones out here, with flexible 4:1/3:1/2:1 ratios; that flexibility is
+part of the endurance-running story and is a *human* trait, not a mammalian one. Getting this
+backwards would put human breathing on a dog.)
+
+**2. The aerobic budget is what makes sustained speed cost something.** The energy penalty in
+P1's reward is instantaneous mechanical cost of transport, which has no notion of a debt. A
+real animal has a sustainable aerobic ceiling and can exceed it briefly by going anaerobic,
+after which it must repay — and that repayment is *the* reason a cheetah's sprint is measured
+in seconds. This belongs in the loop, as a slow state variable feeding the fatigue model
+(todo.md §"Persistent state"), and it is the honest source of the gait-downgrade behaviour that
+section wants to emerge rather than be authored. It also fits the existing rule that anything
+with a rate is a morph parameter: aerobic capacity and lung volume are properties of the body.
+
+**3. Its parameters are allometric, so they come free from the morph vector.** Lung volume
+scales roughly with mass while metabolic rate scales as M^0.75, so respiratory frequency goes
+as about M^−0.25 — Stahl (1967) gives f ≈ 53.5·M^−0.26 breaths/min and a tidal volume near
+7.7 mL/kg. A bigger animal breathes *slower and deeper*, and that is derived, not authored, in
+exactly the way `sensing`'s conduction delays and pendulum periods already are. This is the
+same "40 kg heavier is one knob" claim, applied to a system that would otherwise be a
+hand-tuned constant per creature.
+
+**One correction worth writing down before it is coded wrong: in dogs, panting is
+thermoregulation, not gas exchange.** It is shallow, moves mostly dead-space air so it does not
+blow off CO₂ into alkalosis, and it runs at the respiratory system's mechanical resonant
+frequency (~5–6 Hz) to minimise the work of breathing. The natural implementation — tie panting
+rate to oxygen demand — is therefore wrong: it is tied to *body temperature*, which is a
+different slow variable with a different time constant, and a dog that stops panting the instant
+it stops running reads as fake. Respiration and thermoregulation are two systems that share one
+airway.
+
+What this buys on the look side is disproportionate to its cost. A resting animal's *only*
+motion is breathing, and its absence is a large part of why a still CG creature reads as dead —
+the flank rise and fall, nostril flare, the ribcage moving under fur (which the fur groom
+already deforms with skin strain), and, in cold air, visible breath, which ftrace's
+participating media can already render.
 
 ### The training environment: only signals a nerve could carry
 

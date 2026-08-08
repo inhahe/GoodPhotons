@@ -1,7 +1,7 @@
 # Creature — TODO
 
 A physically-based animal: articulated skeleton, Hill-type muscle/tendon actuators,
-soft-tissue deformation, fur — driven by a **learned** controller rather than keyframes,
+respiration, soft-tissue deformation, fur — driven by a **learned** controller rather than keyframes,
 fit to real animal motion, and morphable into stylized/fictional creatures **without
 losing the learned motion character**.
 
@@ -265,6 +265,37 @@ AMP now means P5 doesn't need a new controller.
       nasal, ear, intervertebral discs, the xiphoid) which is load-bearing *geometry* with a
       stiffness between bone and flesh, and matters mostly to P7's deformation, not to control.
       Decide per site which tier it belongs to; do (i) only where it changes the motion.
+- [ ] **Lungs, diaphragm and the ribcage** *(added 2026-08-08 — was missing from this list
+      entirely; the only prior mention anywhere was a one-line "breathing is near-free" note in
+      the coverage checklist, which is the wrong model. See design.md §"Breathing is mechanically
+      coupled to gait, so it is not a render effect".)* Three separable pieces, and only the
+      middle one is cheap:
+      - **Ribcage + costal cartilage as geometry.** The ribs are already the thoracic part of the
+        skeleton and are load-bearing for the forelimb sling; costal cartilage is tier (ii) of the
+        cartilage item above. Needed before the diaphragm has anything to pull against.
+      - **Diaphragm and intercostals as muscles** in the same Hill-type framework as the rest —
+        they are ordinary skeletal muscle, which is what makes this cheap to add once the muscle
+        blocks exist. The thing to get right is that the **abdominal viscera are a moving mass**:
+        at a gallop the gut slides fore-and-aft and drives the diaphragm like a piston, which is
+        the mechanism behind the 1:1 stride-to-breath lock (Bramble & Carrier 1983). A sliding
+        visceral mass is one body and one slider joint, not a soft-body sim.
+      - **Aerobic budget as a slow state variable** — sustainable ceiling, anaerobic overdraft,
+        repayment. This is the in-loop half and it belongs with fatigue (see "Persistent state"
+        below), not here; listed here so the two are not built as separate models of the same
+        thing. It is also the honest reason a sprint is measured in seconds.
+- [ ] **Respiratory parameters are allometric — derive them, do not author them.** Lung volume
+      scales ~M while metabolic rate scales ~M^0.75, so frequency goes as ~M^−0.25 (Stahl 1967:
+      f ≈ 53.5·M^−0.26 breaths/min, tidal volume ≈ 7.7 mL/kg). A bigger creature must breathe
+      slower and deeper *for free* from the morph vector, exactly as `sensing` already derives
+      conduction delay and pendulum period. Authoring a per-creature breath rate is the same
+      mistake as `max_stiffness 4000` (known-issues, DONE).
+- [ ] **Panting is thermoregulation, not gas exchange — do not wire it to oxygen demand.**
+      In dogs it is shallow, moves mostly dead-space air (so it does not drive alkalosis), and
+      runs at the respiratory system's mechanical resonant frequency (~5–6 Hz) to minimise the
+      work of breathing. It is driven by **body temperature**, a different slow variable with a
+      much longer time constant — which is why a dog goes on panting well after it stops running,
+      and why an implementation that ties panting to exertion reads as fake. Respiration and
+      thermoregulation share an airway and nothing else.
 - [ ] Retrain P2's controller on muscle actuation
 
 ---
@@ -532,6 +563,16 @@ the controller nearly nothing.
       dielectric path already renders that tier; the missing part is the anatomy and the gaze
       controller. Also: pupil dilation as a morph/state knob, and a nictitating membrane for species
       that have one.
+- [ ] **Breathing, on the look side** *(added 2026-08-08; the anatomy is P3, the aerobic budget is
+      the fatigue section — this item is only the visible half)*. A resting animal's *only* motion
+      is breathing, so its absence is a large part of why a still CG creature reads as dead, and it
+      is the cheapest life sign there is. Flank rise and fall, ribcage moving under fur (the groom
+      already deforms with skin strain, so this comes almost free once the thorax actually moves),
+      nostril flare, and — in cold air — **visible breath**, which ftrace's participating media
+      renders today. The one thing not to do is drive it with an authored sine wave: the phase is a
+      consequence of the gait, not a free parameter (design.md §"Breathing is mechanically coupled
+      to gait"), and a decorative oscillator drifts out of step with the footfalls in exactly the
+      way a real animal's does not.
 ### Fur — scoped deliberately narrow  *(scoping decided 2026-08-06)*
 
 Fur is the **least novel thing in this project** — thousands of people have shipped it; nobody has
@@ -759,7 +800,14 @@ separate channels is how you get a 200-dimensional command space by accident.
 - [ ] **Gaze.** The largest omission. Gaze *leads* movement; head/neck orientation is downstream of
       where the animal looks. Probably the single most expressive channel. (See P7 eyes.)
 - [ ] **Breathing** — visible in the flank, rate/depth coupled to exertion and affect. Its absence is
-      a large part of why CG creatures read as dead. Near-free.
+      a large part of why CG creatures read as dead. ~~Near-free.~~ **Corrected 2026-08-08: "near-free"
+      was wrong, and it was wrong in the way that matters.** Breathing is a body system, not a
+      decoration: at a gallop it is *driven* by the gait through the visceral piston (1:1
+      stride-to-breath lock), its aerobic budget is what makes sustained speed cost anything, and
+      its parameters are allometric. Promoted to real entries — anatomy in **P3** (lungs, diaphragm,
+      ribcage, panting≠gas-exchange), the visible half in **P7**, the aerobic debt in "Persistent
+      state" below. See design.md §"Breathing is mechanically coupled to gait, so it is not a render
+      effect".
 - [ ] **Blinking** — same category, near-zero cost, deeply uncanny when missing.
 - [ ] **Postural transitions** — lie down, sit, get up, roll over. Genuinely hard (large body
       reorientation, whole-body ground contact) and constantly needed. Absent from the brainstorm.
@@ -814,6 +862,17 @@ Fatigue splits into three separate objects that are easy to conflate:
       cost landscape, and gallop→trot→walk should fall out of the same mechanism that produced the
       upward transitions. If it does, that is strong evidence the emergence argument is real and not
       a story told about a hand-tuned result. **Worth testing explicitly as a P10 milestone.**
+- [ ] **The aerobic budget is where fatigue's "level" actually comes from** *(added 2026-08-08 with
+      the lungs work in P3)*. Today's energy penalty is instantaneous cost of transport and has no
+      notion of a debt, so nothing in the model explains why a sprint is measured in seconds. Give
+      respiration a sustainable ceiling that can be exceeded briefly by going anaerobic, and repaid
+      afterwards — that overdraft *is* the accumulating level in (2) above, and its repayment is what
+      drives panting and the recovery period after a chase. Build it as one model with fatigue, not
+      two, or they will disagree. Capacity rides in the morph vector by the same rule as
+      susceptibility: a greyhound and a wolf differ here and nobody should re-author it. Note the
+      thermoregulation split flagged in P3 — panting is on body temperature's much longer time
+      constant, not on this one, and an animal that stops panting the instant it stops running is
+      the tell that they were conflated.
 - [ ] **Fatigue is also the honest resolution of the muscle-redundancy problem** noted at the end of
       this section: recovering activations from captured kinematics is underdetermined and needs an
       effort/fatigue criterion to pick a solution. The same fatigue model therefore serves both the
