@@ -143,3 +143,6 @@ tools/ftslbench.exe
 
 # built on demand by tools/meshbench.bat (source is checked in, binary is not)
 tools/meshbench.exe
+
+# MuJoCo writes this next to the cwd whenever a warning fires; pure noise.
+MUJOCO_LOG.TXT

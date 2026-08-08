@@ -120,12 +120,17 @@ definitions themselves should round-trip to MJCF, not compete with it.
 
 ---
 
-## P1 — Torque-actuated quadruped + PPO  `[ ]`
+## P1 — Torque-actuated quadruped + PPO  `[~]`
 
 Smoke-test the entire loop end to end on a body whose dynamics we trust.
 
-- [ ] Gym-style env wrapping the generated model
-- [ ] **Proprioceptive observation space — decide this before the first PPO run, not after.**
+- [x] Gym-style env wrapping the generated model — `creaturelab/env.py`. `VecCreatureEnv` is the
+      single implementation and `CreatureEnv` is an N=1 view over it, because the reward and
+      termination rules *are* the task and two copies would drift. Batched across envs: the
+      thread pool touches `MjData` and nothing else, everything else is one numpy call over all
+      N. See design.md §"The vec env is batched because the GIL, not the physics, was the
+      bottleneck" — 762 → ~3000 env-steps/s, which is a 2e7-step PPO run in ~2 h not ~7.
+- [x] **Proprioceptive observation space — decide this before the first PPO run, not after.**
       *(added 2026-08-06.)* In sim, proprioception is **free and exact** — MuJoCo already gives joint
       angles/velocities, muscle lengths and rates, tendon forces, contacts, body orientation, which
       *is* what spindles, Golgi tendon organs and the vestibular system report. So there is nothing
@@ -138,17 +143,39 @@ Smoke-test the entire loop end to end on a body whose dynamics we trust.
         gravity direction in head frame, foot contact — make the same numbers **mean the same thing
         on a different body**. That is the property P4's morph generalisation actually rests on, so
         this item is a P4 prerequisite disguised as a P1 detail. Getting it wrong is a retrain.
-- [ ] **Proprioceptive delay and noise, scaled by body size.** Real conduction latency is 10–40 ms,
+      - **Decided and built** in `creaturelab/sensing.py`: joint angle normalised against *its own*
+        limits, joint rate ÷ the body's own pendulum period, efference copy, vestibular (gravity
+        direction + angular rate + body-frame velocity in Froude units), per-foot normal force ÷
+        body weight, command, morph vector. No world position or absolute orientation anywhere, and
+        `test_env.py::test_no_world_frame_channel_leaks_in` bans the names so it stays that way.
+        Every rate-like channel saturates at `sensing.RATE_CLIP` — real afferents do, and without
+        it an undamped tail segment reached 49.6 against every other channel's ~1.
+- [x] **Proprioceptive delay and noise, scaled by body size.** Real conduction latency is 10–40 ms,
       longer for a hind limb than a fore, and >100 ms in a large animal. Training on perfect
       instantaneous state yields superhuman reflexes and a twitchy, over-corrected gait — a genuine
       CG tell, the motor-control analogue of the fixed-pivot knee. **Delay should be derived from
       the morph vector** (limb length ÷ conduction velocity), not authored, so a scaled-up creature
       moves *heavier* for free. Directly serves design.md's "old / exhausted / 40 kg heavier is one
       knob" claim.
+      - **Built.** Lag is `central_delay + tree_path_length / conduction_velocity`, measured through
+        the kinematic tree to the declared CNS hub, so canis's hind afferents (32 ms) really do
+        arrive after its fore (27 ms) and both scale with `body_scale` for free. Stored as
+        **fractional** control steps and linearly interpolated between ring-buffer samples —
+        rounding to whole steps at 50 Hz collapses 27 and 32 ms to the same number and deletes
+        the anatomy the module exists to express, silently.
 - [ ] PPO baseline, flat ground, forward-velocity reward
-- [ ] Termination on fall, action-rate + energy penalties
+      - Own implementation in torch (~350 lines) rather than SB3: SB3's vec-env and rollout
+        assumptions are exactly what P2's AMP discriminator and P10's ASE latents have to replace.
+- [x] Termination on fall, action-rate + energy penalties — tilt (the *same* measure as P0's
+      acceptance bar, deliberately), height ÷ withers, and an insanity check that reads MuJoCo's
+      warning counters rather than `isfinite`, because on a bad qvel MuJoCo resets the body itself
+      and hands back a finite default pose. Energy is trapezoid-integrated |τ·q̇| at a measured
+      accuracy/throughput trade (`sensing.actuator_work`), and every reward term is dimensionless.
 - [ ] **Bar:** a stable gait emerges. It will look bad. That is fine — this step is
       testing the plumbing, not the motion.
+      - **Blocked on known-issues #3** (passive roll instability): the body cannot hold the stance
+        it is reset into, so "stable gait" would be measuring the policy against a body that falls
+        over on its own. Decide that first.
 - [ ] Headless training + checkpointing so runs survive between sessions
 
 ---

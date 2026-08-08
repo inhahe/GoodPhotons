@@ -258,6 +258,99 @@ needs the same measure: "has the creature fallen over" is the termination condit
 locomotion episode, and if it differs from the acceptance test's notion a policy can learn
 to satisfy one and not the other.
 
+### The training environment: only signals a nerve could carry
+
+`creaturelab/sensing.py` owns the observation contract and `creaturelab/env.py` the task.
+The split is not cosmetic: the observation vector is a **cross-morph interface**, so it has
+to be derivable from the body rather than authored alongside the reward.
+
+**Everything is in the body's own units, via dynamic similarity.** Divide every length by
+withers height `L`, every time by the pendulum period `T = √(L/g)`, speed by `V = √(gL)`,
+force by body weight `W = mg`. Then `joint_rate = 0.8` and `contact = 0.5` mean the same
+physical situation on a 14 kg body and a 300 kg one, and so does a reward weight. That is
+the property P4's morph generalisation rests on, and it is cheaper to get right now than to
+retrain for later. `V·T == L` is asserted in the tests, because if the three scales ever
+stop being consistent every channel is quietly in a different unit system than its weight.
+
+**No channel may carry information a nerve could not.** World position, absolute
+orientation and exact world velocity all train *faster* and produce a policy that cannot
+transfer. So the vector is: joint angle normalised against *its own* limits, joint rate,
+efference copy of the last action, vestibular (gravity direction in the root frame, angular
+rate, body-frame linear velocity), per-foot normal force ÷ body weight, the command, and the
+morph vector. Root height exists in `RawState` because termination needs it, and is
+deliberately *not* a channel — `test_no_world_frame_channel_leaks_in` bans the names, since
+this is exactly the kind of thing that gets added during a debugging session and stays.
+
+**Rate channels saturate**, at `sensing.RATE_CLIP`. Real afferents do, and the alternative
+is not "unbounded in theory" but unbounded in fact: 200 steps of ±0.3 random actuation drove
+one tail joint's rate channel to 49.6 while every other channel sat near 1. No exception, no
+NaN — just one input at eight times the scale of the rest, which is the input the first
+layer organises itself around.
+
+**Conduction delay is measured through the tree, not authored.** Each channel's lag is
+`central_delay + path_length_to_the_CNS_hub / conduction_velocity`, so a hind-paw spindle
+(32 ms) really does arrive after a fore-paw one (27 ms), the vestibular signal is the
+fastest thing the animal has, and scaling the body scales its reflexes for free — which is
+what makes design.md's "40 kg heavier is one knob" claim true rather than aspirational. The
+lags are stored as **fractional** control steps and interpolated between ring-buffer
+samples. Rounding to whole steps at 50 Hz maps 27 ms and 32 ms to the same integer and
+deletes the entire fore/hind asymmetry the module exists to express, while still training.
+
+### The vec env is batched because the GIL, not the physics, was the bottleneck
+
+The first version stepped N envs on a thread pool with each env's normalisation, delay,
+reward and termination running inside its own worker. It managed 762 env-steps/s, which
+makes a 2×10⁷-step PPO smoke test an overnight job. Root-causing it by measurement rather
+than by intuition changed the design:
+
+- `mj_step` releases the GIL, so the physics genuinely parallelises — ~343 µs per env-step,
+  scaling 3.9× across 16 threads.
+- The ~500 µs of surrounding numpy per env holds the GIL and does not scale at all.
+- Worse, what costs is the **number of GIL hand-offs**, not the serial fraction.
+  Interleaving 58 µs of Python between physics steps — a 15% serial fraction — cut a
+  physics-only loop from 7900 to 1800 env-steps/s. Amdahl predicts nothing like that.
+- `ThreadPoolExecutor.map` is itself GIL-held Python: a Future, a condition variable and a
+  queue entry per task, ~10–18 µs each.
+
+Ruled out with data, so they don't get re-proposed: solver and integrator changes (`mj_step`
+is 36 µs; CG buys 1.31×, not the 2× an earlier measurement on a loaded machine suggested,
+and every configuration passes `stand_test` identically), `sys.setswitchinterval`,
+free-threaded Python (not installed), and multiprocess workers (~2900/s — the Windows pipe
+barrier eats the gain).
+
+So the rule is: **the thread pool touches `MjData` and nothing else.** Workers write raw
+state into rows of a shared `RawState`, one task per *worker* over a contiguous span of envs
+so dispatch is O(workers) not O(N), and every other operation — normalisation, the delay
+lines, the noise, all five reward terms, termination — is a single numpy call across all N.
+Result: **762 → ~3000 env-steps/s**, i.e. 318 µs per env-step against a 343 µs single-core
+physics floor. There is nothing left in this layer; the next lever is the physics itself.
+
+Two consequences worth stating because they constrain later work:
+
+- **`VecCreatureEnv` is the only implementation.** `CreatureEnv` is an N=1 view over it. The
+  reward and termination rules *are* the definition of the task, and two copies of them
+  drift the moment either is tuned.
+- **Anything `info` hands out must be a buffer the auto-reset cannot touch.** `info` returns
+  the env's own arrays to avoid a per-step allocation, and the auto-reset runs at the end of
+  the same `step`, so `command` and the sanity flag are snapshotted. Reading them live was a
+  real bug of the shape this project keeps producing: only the rows that *finished* were
+  wrong — precisely the rows a logger or an AMP buffer reads — and the wrong values were a
+  valid command and `sane=True`, so nothing raised.
+
+**Energy is a measured trade, not a default.** The energy penalty needs `∫|τ·q̇|` over the
+control step, and each sample costs a GIL hand-off inside the physics. Both sides were
+measured: 1 sample/step under-reports by 22% on an episode total (systematically, and worst
+exactly when the animal is flailing and the penalty matters most), 5 samples costs 1.2% and
+27% of throughput, 10 is exact. Five is the default and `energy_samples` is the knob. The
+naive rectangle estimator is no better than a 1-sample trapezoid, so the trapezoid is free.
+
+**"The integrator blew up" is not `isfinite`.** On a bad qpos/qvel/qacc MuJoCo warns and
+calls `mj_resetData` *itself*, so the step returns a perfectly finite state that happens to
+be the default pose at the origin at rest. That is worse than a NaN: a NaN crashes the
+optimiser and leaves a traceback, whereas a silent mid-episode teleport just teaches the
+value function that some state transitions to a fresh standing pose for free. The detector
+is therefore MuJoCo's own warning counter, against a per-env baseline that the reset clears.
+
 ### Textures: non-stationarity, not randomness
 
 Procedural noise (Perlin/Worley/fBm) is **stationary** — statistically identical

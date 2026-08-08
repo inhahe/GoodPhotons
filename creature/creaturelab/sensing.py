@@ -85,6 +85,28 @@ class ObsSpec:
     # --- feet ----------------------------------------------------------------------
     foot_bodies: np.ndarray        # body ids, stable order
     foot_names: list[str]
+    geom_foot: np.ndarray          # (ngeom,) -> foot index, or -1. See `gather_contact`.
+
+    # --- fast selectors -------------------------------------------------------------
+    # `jnt_qposadr` / `jnt_dofadr` as something numpy can slice cheaply. Reading
+    # `data.qvel[array_of_indices]` costs ~1.6 us; reading `data.qvel[a:b]` costs ~0.7 us,
+    # and these are read several times per physics chunk per env inside the thread pool,
+    # where every microsecond is GIL-held and therefore serialises the whole vec env. The
+    # addresses are contiguous whenever the actuated joints are a contiguous run of the
+    # dof array, which is the normal case for a rig with one free root; when they are not,
+    # these fall back to the index arrays and nothing else changes.
+    qpos_sel: object               # slice | np.ndarray
+    dof_sel: object                # slice | np.ndarray
+
+    # Precomputed joint-angle normalisation, so the per-step form is one fused
+    # multiply-add rather than a subtract, a divide and a subtract.
+    ang_scale: np.ndarray          # 2 / (hi - lo)
+    ang_bias: np.ndarray           # -2*lo/(hi - lo) - 1
+
+    # The morph vector this body was built from, in [-1, 1]. A constant per body, but it
+    # rides in the observation from day one: a conditioning channel added after training
+    # is a channel the policy has already learned to ignore, and the fix is a retrain.
+    morph_norm: np.ndarray
 
     # --- sensing lag / noise --------------------------------------------------------
     # Lags are kept as FRACTIONAL control steps and interpolated at read time. Rounding
@@ -102,6 +124,13 @@ class ObsSpec:
 
     def group(self, name: str) -> slice:
         return self.slices[name]
+
+
+def _selector(adr: np.ndarray):
+    """A contiguous run of addresses as a `slice`, otherwise the index array unchanged."""
+    if adr.size and bool(np.all(np.diff(adr) == 1)):
+        return slice(int(adr[0]), int(adr[-1]) + 1)
+    return adr
 
 
 def _path_lengths_to(model, hub_body: int) -> np.ndarray:
@@ -221,6 +250,13 @@ def build_spec(model, data, creature: Creature, *, control_dt: float,
     # channel still lands in [-1, 1] instead of silently dominating the input scale.
     lo[~limited], hi[~limited] = -np.pi, np.pi
 
+    # Which geoms belong to a foot, as an O(1) lookup keyed by geom id. The per-step
+    # alternative -- searching `foot_bodies` for each contact -- is a numpy call per
+    # contact inside the physics threads, i.e. exactly where it costs the most.
+    geom_foot = np.full(model.ngeom, -1, dtype=np.int32)
+    for k, b in enumerate(foot_bodies):
+        geom_foot[model.geom_bodyid == b] = k
+
     # ---- layout -----------------------------------------------------------------------
     nfoot = len(foot_bodies)
     nmorph = len(creature.params)
@@ -279,127 +315,282 @@ def build_spec(model, data, creature: Creature, *, control_dt: float,
         dim=dim, slices=slices, names=names,
         length=L, time=T, speed=V, weight=W,
         jnt_qposadr=qposadr, jnt_dofadr=dofadr, jnt_lo=lo, jnt_hi=hi, jnt_limited=limited,
-        foot_bodies=foot_bodies, foot_names=list(foot_names),
+        foot_bodies=foot_bodies, foot_names=list(foot_names), geom_foot=geom_foot,
+        qpos_sel=_selector(qposadr), dof_sel=_selector(dofadr),
+        ang_scale=2.0 / (hi - lo), ang_bias=-2.0 * lo / (hi - lo) - 1.0,
+        morph_norm=np.array(creature.morph_vector_normalized(), dtype=float),
         obs_delay=obs_delay, act_delay=act_delay, obs_delay_s=obs_lag_s, obs_noise=noise,
         max_delay=int(np.ceil(max(obs_delay.max(initial=0.0),
                                   act_delay.max(initial=0.0)))),
     )
 
 
-# ------------------------------------------------------------------ the per-step reading
-def raw_observation(model, data, spec: ObsSpec, prev_action: np.ndarray,
-                    command: np.ndarray, morph: np.ndarray,
-                    out: np.ndarray | None = None) -> np.ndarray:
-    """Sample every channel from the current state, already normalised. No delay, no noise.
+# ============================================================ the per-step reading, batched
+#
+# Everything below works on N bodies at once. That is a performance decision with a hard
+# measurement behind it, and it is worth stating because the per-env form was much easier
+# to read.
+#
+# MuJoCo's `mj_step` releases the GIL, so N creatures really do step in parallel on a
+# thread pool -- but only for as long as the threads stay inside C. Measured on this rig
+# (31 actuators, 135 channels, 12 cores): the physics is ~343 us per control step and scales
+# to 3.9x across 16 threads, while the surrounding numpy was ~500 us per env and did not
+# scale at all, because it holds the GIL. Interleaving even 58 us of it between the physics
+# steps dropped a physics-only loop from 7900 to 1800 env-steps/s -- a 4.4x loss to a 15 %
+# serial fraction, far worse than Amdahl predicts, because what costs is the GIL hand-off,
+# not the work. Lowering `sys.setswitchinterval` does not help, and worker processes reach
+# only ~2900 env-steps/s because the Windows pipe barrier eats what the GIL gave back.
+#
+# So the split is: the threads touch `MjData` and nothing else, copying raw state into
+# per-env rows of shared (N, ...) buffers; every normalisation, delay, noise, reward and
+# termination computation then happens once on the whole batch, outside the pool. The numpy
+# call count per control step becomes O(1) in N instead of O(N). Net effect on the vec env:
+# 762 -> 3139 env-steps/s, i.e. a 2e7-step PPO run goes from ~7 hours to ~1.8. What is left
+# is genuinely close to the floor -- 318 us per env-step against 343 us of single-core
+# physics -- so the next real lever is the physics itself, not this layer.
 
-    Called once per control step per env, so it avoids allocation and keeps everything in
-    numpy; the delay/noise pass is applied afterwards by `Proprioception`.
+@dataclass
+class RawState:
+    """Un-normalised physical state for N bodies, as gathered straight out of `MjData`.
+
+    The only thing the physics threads write, and the only thing the batched pass reads.
+    Keeping it a plain struct of (N, ...) arrays is what makes the boundary between "in the
+    thread, GIL-held, expensive" and "outside, batched, cheap" a boundary you can see.
+    """
+    qpos_j: np.ndarray             # (N, nu)   actuated joint angles, rad
+    qvel_j: np.ndarray             # (N, nu)   actuated joint rates, rad/s
+    xmat: np.ndarray               # (N, 3, 3) root body orientation
+    qvel_free: np.ndarray          # (N, 6)    free-joint velocity: 0:3 world lin, 3:6 body ang
+    root_z: np.ndarray             # (N,)      root height, m -- termination only, never sensed
+    contact: np.ndarray            # (N, nfoot) normal force on each foot, N
+    work_tau: np.ndarray           # (N, C+1, nu) actuator generalised force, per energy sample
+    work_vel: np.ndarray           # (N, C+1, nu) matching joint rate
+    sane: np.ndarray               # (N,) bool -- did the integrator survive. See `gather_state`
+    warn: np.ndarray               # (N,) int  -- cumulative MuJoCo bad-value warning count
+
+
+def make_raw(spec: ObsSpec, n: int, energy_samples: int) -> RawState:
+    nu = len(spec.jnt_lo)
+    c = energy_samples + 1
+    return RawState(
+        qpos_j=np.zeros((n, nu)), qvel_j=np.zeros((n, nu)),
+        xmat=np.zeros((n, 3, 3)), qvel_free=np.zeros((n, 6)), root_z=np.zeros(n),
+        contact=np.zeros((n, len(spec.foot_bodies))),
+        work_tau=np.zeros((n, c, nu)), work_vel=np.zeros((n, c, nu)),
+        sane=np.ones(n, dtype=bool), warn=np.zeros(n, dtype=np.int64))
+
+
+def gather_contact(model, data, spec: ObsSpec, out: np.ndarray) -> None:
+    """Sum the normal force on each foot into `out`. Called inside the physics thread.
+
+    Any contact involving a foot geom counts, whatever the foot is touching. The narrower
+    "only contacts against the world body" rule reads as more careful and is not: a paw
+    resting on another paw is a real load on a real mechanoreceptor, and P3's terrain may
+    not be a world geom at all, so the narrow rule would silently blank the channel on the
+    first rig it was not written for.
     """
     import mujoco
 
-    o = np.empty(spec.dim) if out is None else out
+    out[:] = 0.0
+    ncon = data.ncon
+    if not ncon:
+        return
+    g = data.contact.geom[:ncon]               # (ncon, 2), one attribute access
+    f0 = spec.geom_foot[g[:, 0]]
+    f1 = spec.geom_foot[g[:, 1]]
+    hits = np.nonzero((f0 >= 0) | (f1 >= 0))[0]
+    if not hits.size:
+        return
+    buf = np.empty(6)
+    for i in hits:
+        mujoco.mj_contactForce(model, data, int(i), buf)
+        fn = abs(buf[0])                       # normal component, contact frame
+        if f0[i] >= 0:
+            out[f0[i]] += fn
+        if f1[i] >= 0:
+            out[f1[i]] += fn
 
-    q = data.qpos[spec.jnt_qposadr]
-    o[spec.slices["joint_angle"]] = np.clip(
-        2.0 * (q - spec.jnt_lo) / (spec.jnt_hi - spec.jnt_lo) - 1.0, -2.0, 2.0)
-    o[spec.slices["joint_rate"]] = data.qvel[spec.jnt_dofadr] * spec.time
-    o[spec.slices["efference"]] = prev_action
 
-    R = data.xmat[1].reshape(3, 3)                      # root body orientation
-    v = spec.slices["vestibular"]
-    o[v.start + 0:v.start + 3] = R[2, :]                # world -z ... see note below
-    # `R[2, :]` is world +z expressed in the root's own frame; gravity is its negation, and
-    # the sign is a wash for the policy, but writing +up keeps it readable next to
+#: `mjWARN_BADQPOS`, `mjWARN_BADQVEL`, `mjWARN_BADQACC` -- contiguous in the enum, so this
+#: is a slice rather than a fancy index, which matters because it is read inside the threads.
+_BAD_WARN = slice(3, 6)
+
+
+def gather_state(model, data, spec: ObsSpec, raw: RawState, i: int) -> None:
+    """Copy env `i`'s physical state out of `MjData` into row `i` of the batch buffers.
+
+    Also decides whether the step is usable at all, and that check needs both halves.
+
+    Testing `isfinite` alone does not work, and finding out why is the reason this comment
+    exists: when MuJoCo detects a bad qpos/qvel/qacc it warns and then calls `mj_resetData`
+    itself, so by the time the step returns the state is finite again -- it is just no longer
+    the state of the animal that was walking. It is the default pose, at the origin, at rest.
+    A NaN reaching the rollout buffer at least crashes the optimiser and points a traceback
+    somewhere; a silent teleport mid-episode does not, and instead teaches the value function
+    that a particular state transitions to a fresh standing pose for free. So the actual
+    detector is MuJoCo's own warning counter, and the finiteness test only remains as the
+    belt-and-braces case where a NaN appears without tripping a warning at all.
+    """
+    raw.qpos_j[i] = data.qpos[spec.qpos_sel]
+    raw.qvel_j[i] = data.qvel[spec.dof_sel]
+    raw.xmat[i] = data.xmat[1].reshape(3, 3)   # body 1 = the floating root
+    raw.qvel_free[i] = data.qvel[0:6]
+    raw.root_z[i] = data.qpos[2]
+    gather_contact(model, data, spec, raw.contact[i])
+    warn = int(data.warning.number[_BAD_WARN].sum())
+    # Checked on the full state, not just the copied subset: an unactuated joint can be the
+    # one that blew up, and a NaN anywhere propagates to everything next step.
+    raw.sane[i] = (warn == raw.warn[i]
+                   and bool(np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all()))
+    raw.warn[i] = warn
+
+
+#: Saturation limit for every rate-like channel, in the body's own Froude units.
+#:
+#: Real afferents saturate, and this is not a safety net bolted on after the fact -- it is
+#: part of what the sensor *is*. A muscle spindle's Ia firing rate flattens out long before
+#: the joint does, and a semicircular canal stops reporting past roughly 6 rad/s. Peak joint
+#: rates in dog locomotion reach ~15-20 rad/s, which for canis (T = 0.26 s) is 4-5 in these
+#: units, so 8 clears the physiological range with headroom and still bounds the input.
+#:
+#: Without it the channel is unbounded in practice, not merely in theory: 200 control steps
+#: of +-0.3 random actuation drive `qd/tail2_pitch` to 49.6, because the last tail segment is
+#: light, long and barely damped. That is honest physics, not an exploded integrator -- which
+#: is exactly what makes it dangerous. One channel at eight times the scale of every other is
+#: the channel the first layer's weights get organised around, and the failure is silent: the
+#: policy trains fine, and quietly treats a whipping tail as its dominant input.
+RATE_CLIP = 8.0
+
+
+def assemble(spec: ObsSpec, raw: RawState, prev_action: np.ndarray,
+             command: np.ndarray, morph: np.ndarray, out: np.ndarray) -> np.ndarray:
+    """Normalise a whole batch of raw state into observations. No delay, no noise yet."""
+    s = spec.slices
+    out[:, s["joint_angle"]] = np.clip(raw.qpos_j * spec.ang_scale + spec.ang_bias,
+                                       -2.0, 2.0)
+    np.clip(raw.qvel_j * spec.time, -RATE_CLIP, RATE_CLIP, out=out[:, s["joint_rate"]])
+    out[:, s["efference"]] = prev_action
+
+    v = s["vestibular"].start
+    R = raw.xmat
+    # `R[:, 2, :]` is world +z expressed in each root's own frame; gravity is its negation
+    # and the sign is a wash for the policy, but writing +up keeps it readable next to
     # `trunk_tilt`, which reads the same row.
-    # MuJoCo free-joint velocity: qvel[0:3] linear in WORLD, qvel[3:6] angular in the
-    # BODY frame. So the angular part is already local; the linear part must be rotated.
-    o[v.start + 3:v.start + 6] = data.qvel[3:6] * spec.time
-    o[v.start + 6:v.start + 9] = (R.T @ data.qvel[0:3]) / spec.speed
+    out[:, v + 0:v + 3] = R[:, 2, :]
+    # MuJoCo free-joint velocity: qvel[0:3] is linear in the WORLD frame, qvel[3:6] angular
+    # in the BODY frame. So the angular part is already local; the linear part needs R.T.
+    np.clip(raw.qvel_free[:, 3:6] * spec.time, -RATE_CLIP, RATE_CLIP,
+            out=out[:, v + 3:v + 6])
+    np.einsum("nji,nj->ni", R, raw.qvel_free[:, 0:3], out=out[:, v + 6:v + 9])
+    out[:, v + 6:v + 9] /= spec.speed
+    np.clip(out[:, v + 6:v + 9], -RATE_CLIP, RATE_CLIP, out=out[:, v + 6:v + 9])
 
-    c = np.zeros(len(spec.foot_bodies))
-    if data.ncon:
-        buf = np.zeros(6)
-        for i in range(data.ncon):
-            con = data.contact[i]
-            b1 = int(model.geom_bodyid[con.geom1])
-            b2 = int(model.geom_bodyid[con.geom2])
-            if (b1 == 0) == (b2 == 0):
-                continue
-            b = b2 if b1 == 0 else b1
-            hit = np.nonzero(spec.foot_bodies == b)[0]
-            if hit.size:
-                mujoco.mj_contactForce(model, data, i, buf)
-                c[hit[0]] += abs(buf[0])           # normal component, contact frame
-    o[spec.slices["contact"]] = np.minimum(c / spec.weight, 2.0)
-
-    o[spec.slices["command"]] = command
-    o[spec.slices["morph"]] = morph
-    return o
+    np.minimum(raw.contact / spec.weight, 2.0, out=out[:, s["contact"]])
+    out[:, s["command"]] = command
+    out[:, s["morph"]] = morph
+    return out
 
 
-class Proprioception:
-    """Per-env delay lines for the sensed observation and the issued action.
+def actuator_work(spec: ObsSpec, raw: RawState, chunk_dt: float) -> np.ndarray:
+    """Mechanical work each body's actuators delivered over the last control step, J.
 
-    One ring buffer each. The observation buffer is written every control step and read
-    per-element at that element's own lag, so a hind-paw spindle and a vestibular canal are
-    genuinely different ages within the same input vector -- which is the point, and is not
-    expressible as a single "observation delay" hyperparameter.
+    Trapezoid-integrated over `C + 1` samples of |tau . qdot| taken inside the frame skip.
+    Sampling every *physics* step is exact, and is what this did first; each sample also
+    costs a GIL hand-off in the middle of the physics, so the count is a throughput knob.
+    Both sides of that trade were measured rather than assumed -- accuracy on 2400 control
+    steps of smoothed random actuation against the every-physics-step sum, throughput at 128
+    envs on 12 threads:
+
+        samples/step   mean |err|   p95 |err|   bias on episode total   env-steps/s
+                   1       27 %        50 %              -22 %              4315
+                   2       12 %        22 %               -9 %              3862
+                   5        3 %         8 %               -1.2 %            3139
+                  10        2 %         6 %                0 % (exact)      2433
+
+    One sample is not acceptable at any price: the error is a systematic *under*-report,
+    because |power| is spiky within a control step, so the energy penalty would be quietly
+    disabled exactly when the animal is flailing and the penalty is most needed. Five buys
+    an 18x accuracy improvement over one for 27 % of the throughput, and a 1.2 % bias on a
+    term weighted 0.02 is not a term anyone can distinguish from exact -- so five is the
+    default. Note also that the naive "sample once at the end and multiply by the step"
+    estimator is no better than the 1-sample trapezoid (28 % vs 27 %), so the trapezoid is
+    free accuracy and there is never a reason to use the rectangle.
+    """
+    p = np.abs(raw.work_tau * raw.work_vel).sum(axis=2)         # (N, C+1)
+    return 0.5 * (p[:, :-1] + p[:, 1:]).sum(axis=1) * chunk_dt
+
+
+class BatchProprioception:
+    """Delay lines for N bodies at once: one ring buffer, indexed per channel AND per env.
+
+    The observation buffer is written every control step and read per-element at that
+    element's own lag, so a hind-paw spindle and a vestibular canal are genuinely different
+    ages within the same input vector -- which is the point, and is not expressible as a
+    single "observation delay" hyperparameter.
+
+    All N envs share one `head`, because a vec env steps them in lockstep. That is what lets
+    the whole read be two fancy-index gathers on a (N, hist, dim) array instead of N
+    separate ones.
     """
 
-    def __init__(self, spec: ObsSpec, rng: np.random.Generator):
+    def __init__(self, spec: ObsSpec, n_env: int, rng: np.random.Generator):
         self.spec = spec
+        self.n_env = n_env
         self.rng = rng
-        n = spec.max_delay + 1
-        self.obs_buf = np.zeros((n, spec.dim))
-        self.act_buf = np.zeros((n, len(spec.act_delay)))
-        self.head = 0
-        self.n = n
-        self._obs_take = np.arange(spec.dim)
-        self._act_take = np.arange(len(spec.act_delay))
-        # Precomputed halves of the fractional-delay lerp; the per-step work is then two
-        # gathers and a fused multiply-add rather than any index arithmetic.
         self._obs_lo = np.floor(spec.obs_delay).astype(np.int32)
-        self._obs_w = (spec.obs_delay - self._obs_lo)
         self._act_lo = np.floor(spec.act_delay).astype(np.int32)
-        self._act_w = (spec.act_delay - self._act_lo)
+        self._obs_w = spec.obs_delay - self._obs_lo
+        self._act_w = spec.act_delay - self._act_lo
+        # The lerp reads `floor(lag)` and one step further back, so the history must hold
+        # max(floor(lag)) + 2 entries. Sizing it from ceil(lag) instead is off by one
+        # whenever a lag lands exactly on a step boundary; the stale sample it then reads is
+        # multiplied by a zero weight and does no harm, which is precisely why that bug
+        # would survive every test.
+        self.hist = int(max(self._obs_lo.max(initial=0),
+                            self._act_lo.max(initial=0))) + 2
+        self.obs_buf = np.zeros((n_env, self.hist, spec.dim))
+        self.act_buf = np.zeros((n_env, self.hist, len(spec.act_delay)))
+        self.head = 0
+        self._obs_chan = np.arange(spec.dim)
+        self._act_chan = np.arange(len(spec.act_delay))
         self._noise_idx = np.nonzero(spec.obs_noise > 0)[0]
         self._noise_sig = spec.obs_noise[self._noise_idx]
 
-    def reset(self, obs0: np.ndarray, action0: np.ndarray) -> None:
-        """Fill the whole history with the reset state.
+    def reset(self, idx, obs0: np.ndarray, action0: np.ndarray) -> None:
+        """Fill the whole history of envs `idx` with a freshly-reset state.
 
         Zero-filling instead would hand the policy a first observation claiming the animal
         was inverted and airborne a moment ago, and the resulting flail is easy to mistake
         for a physics problem.
         """
-        self.obs_buf[:] = obs0
-        self.act_buf[:] = action0
-        self.head = 0
+        self.obs_buf[idx] = obs0[:, None, :]
+        self.act_buf[idx] = action0[:, None, :]
 
-    def sense(self, raw: np.ndarray) -> np.ndarray:
-        """Record a fresh reading and return what the policy actually gets to see."""
-        self.obs_buf[self.head] = raw
-        lo = (self.head - self._obs_lo) % self.n
-        hi = (lo - 1) % self.n                       # one step further into the past
-        a = self.obs_buf[lo, self._obs_take]
-        b = self.obs_buf[hi, self._obs_take]
-        out = a + (b - a) * self._obs_w
+    def sense(self, raw_obs: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
+        """Record fresh readings and return what each policy actually gets to see."""
+        self.obs_buf[:, self.head] = raw_obs
+        lo = (self.head - self._obs_lo) % self.hist
+        hi = (lo - 1) % self.hist                     # one step further into the past
+        a = self.obs_buf[:, lo, self._obs_chan]
+        b = self.obs_buf[:, hi, self._obs_chan]
+        o = np.add(a, (b - a) * self._obs_w, out=out)
         if self._noise_idx.size:
-            out[self._noise_idx] += (
-                self.rng.standard_normal(self._noise_idx.size) * self._noise_sig)
-        return out
+            o[:, self._noise_idx] += (
+                self.rng.standard_normal((self.n_env, self._noise_idx.size))
+                * self._noise_sig)
+        return o
 
     def actuate(self, action: np.ndarray) -> np.ndarray:
-        """Record a fresh command and return what actually reaches the muscles now."""
-        self.act_buf[self.head] = action
-        lo = (self.head - self._act_lo) % self.n
-        hi = (lo - 1) % self.n
-        a = self.act_buf[lo, self._act_take]
-        b = self.act_buf[hi, self._act_take]
+        """Record fresh commands and return what actually reaches the muscles now."""
+        self.act_buf[:, self.head] = action
+        lo = (self.head - self._act_lo) % self.hist
+        hi = (lo - 1) % self.hist
+        a = self.act_buf[:, lo, self._act_chan]
+        b = self.act_buf[:, hi, self._act_chan]
         return a + (b - a) * self._act_w
 
     def advance(self) -> None:
-        self.head = (self.head + 1) % self.n
+        self.head = (self.head + 1) % self.hist
 
 
 def describe(spec: ObsSpec) -> str:

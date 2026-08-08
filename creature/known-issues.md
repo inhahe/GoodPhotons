@@ -57,6 +57,120 @@ failure: seeds 30 and 32 topple to ~50° while sagging only 2–4%, from support
 +60 and +18 mm. They are not sprung too softly — they are bodies whose feet are in the
 wrong place, and no amount of passive tone fixes a foot in the wrong place.
 
+### 3. The default rig is passively unstable in roll, and neither guard can see it
+
+*(found 2026-08-08, while writing P1's env.)* The **unmorphed canis rig** stands
+indefinitely from a perfectly symmetric start, and falls over in 3.5–6.5 s under zero
+torque from any asymmetry at all. Reproduce it in eight lines — perturb the settled stance
+and watch the trunk, motors off throughout:
+
+```python
+from creaturelab import env as envmod
+from creaturelab.emit_mjcf import place_on_ground
+import mujoco, numpy as np
+body = envmod.build_body(envmod.EnvConfig(rig="rigs/canis.ftcl")); m, s = body.model, body.spec
+d = mujoco.MjData(m); mujoco.mj_resetData(m, d); place_on_ground(m, d)
+d.qpos[s.jnt_qposadr] += np.random.default_rng(0).uniform(-.5, .5, m.nu) * (s.jnt_hi - s.jnt_lo) * .02
+mujoco.mj_forward(m, d); place_on_ground(m, d)
+for k in range(4000):                                  # 8 s, no ctrl ever written
+    mujoco.mj_step(m, d)
+    print(k * m.opt.timestep, np.degrees(np.arccos(d.xmat[1].reshape(3, 3)[2, 2])))
+```
+
+Drop the perturbation line and it stands for 20 s. (The fuller diagnostic probes used to
+produce the numbers below — mode shape, stiffness sweep, per-foot loads, the coupled `−∂τ/∂q`
+matrix — were written as throwaways in the gitignored `scraps/`; the measurements they
+produced are recorded here so they do not need to be rewritten.)
+
+**It is a clean exponential**, not excessive reset noise. Roll e-folds every **0.67 s**
+(≈2.6 pendulum periods) and the fall time depends on the perturbation only through its
+logarithm:
+
+| `init_joint_noise` | fall time (seeds 0 / 1) | predicted by `t₀ − τ·ln(amp)` |
+|---|---|---|
+| 0.002 | 5.53 s / 6.35 s | — |
+| 0.02  | 3.64 s / 4.56 s | 5.53 − 0.67·ln(10) = 3.99 s |
+| 0.05  | 3.55 s / 3.71 s | 3.64 − 0.67·ln(2.5) = 3.03 s |
+
+A 25× larger perturbation buys only 1.95 s, against `τ·ln(25)` = 2.17 s. Pitch stays at
+~0.8° the whole time; it is purely the frontal plane.
+
+**The mode is trunk roll on the four abduction springs.** At 0.28° of roll all four
+abduction joints have deflected the *same* sign by ~0.21°, i.e. they absorb 74% of it — the
+legs stay upright and the trunk rolls over them. Ranked deflection: `hip_l_abduct` 0.229°,
+`hip_r_abduct` 0.209°, `shoulder_l_abduct` 0.204°, `shoulder_r_abduct` 0.196°, then the
+sagittal joints an order of magnitude behind (all `*_pitch` rms 0.0025°).
+
+**It needs ~2.2× the abduction stiffness it has.** Scaling only the abduction springs
+(damping scaled by √ to hold ζ) puts the threshold sharply between 2× and 3×:
+
+| × stiffness | k (N·m/rad) | fell | peak tilt |
+|---|---|---|---|
+| 1 | 39.8 | 3.64 s | 45° |
+| 2 | 79.6 | 9.49 s | 45° |
+| 3 | 119.4 | **never (15 s)** | 2.2° |
+| 20 | 796 | never | 2.2° |
+
+The two growth rates independently agree with that threshold: `λ² ∝ K_destab − K_restore`
+with `λ₁ = 1.49/s` and `λ₂ ≈ 0.575/s` solves to `K_destab = 2.18 · K_restore(1×)`.
+
+**Why `validate.stand_test` cannot see it.** It starts exactly symmetric, so roll stays at
+`0.00°` for 19 s of a 20 s run — the mode is never excited, and an antisymmetric instability
+is invisible to a symmetric probe no matter how long you watch. `SETTLE_SECONDS` is also
+3.0 s, which is *shorter than the fall*. This is the same class of mistake `validate.py`'s
+own docstring warns about, one level up.
+
+**Why `tune.measure_buckling` cannot see it, which is the more interesting half.** It
+perturbs one joint at a time, so it measures the diagonal of the destabilising stiffness
+matrix — but the full matrix does not contain the mode either. Every abduction diagonal
+entry is **exactly 0.00 N·m/rad**, and the largest coupled eigenvalue of the symmetrised
+`−∂τ/∂q` is 34.65 N·m/rad in a *sagittal* mode (`spine_pitch`, `shoulder_*_flex`,
+`scap_*_swing`) with **zero** abduction content. The reason is structural: `_hold_torque`
+uses the ground reaction solved from statics and then held **frozen**, and the destabilising
+term here is precisely the reaction *redistributing*. Watching it live:
+
+```
+   t    roll    y_com | fpaw_l    fpaw_r    hpaw_l    hpaw_r      (Fn, N)
+ 1.0  -0.262    4.2mm |  50.5      43.1      57.8      54.6
+ 2.0  -1.049   14.1mm |  61.0      41.6      57.8      45.5
+ 3.0  -5.434   64.4mm |  86.9      17.8      73.6      26.3
+ 4.0 -102.8   570.1mm |   0.0       0.0       0.0       0.0   (airborne)
+```
+
+The feet barely slide (lateral position 74.8 → 73.0 mm). What moves is the CoM, out towards
+the left foot line at ±75–85 mm, unloading the right pair from 51 N nominal to 18 N, until it
+crosses the support edge and the body tips about the loaded pair. A frozen reaction cannot
+represent load transfer between feet by construction, so **no amount of eigenanalysis of the
+current measurement recovers this mode** — the measurement's own assumption excludes it.
+
+**Why the tuner had nothing to size these springs from.** For an abduction joint in a
+symmetric stance the static holding torque is zero by symmetry and the single-joint buckling
+gradient is zero as shown above, so two of `size_tone`'s four requirements are identically
+zero and the spring falls through to the **floor** term — tone proportional to the subtree
+weight the joint could carry. design.md already names the reason that term exists ("they
+still need tone or the body flops laterally the moment it is disturbed"), which makes this
+the one requirement in the table that is a *guess* rather than a measurement of the mode it
+exists to prevent. It guesses 2.2× low.
+
+**Consequences now.** `env.EnvConfig.init_joint_noise` defaults to 0.05, so every P1 episode
+starts in a state the passive body cannot hold, which contradicts the project's own rule that
+not-falling-over belongs in the ligaments and not in the policy. P1's bar ("a stable gait
+emerges") would be measured against a body that falls over on its own, so it is blocked on
+this. `test_env.py::test_passive_body_holds_its_stance` is deliberately written with zero
+reset noise and says so — it passes, and would fail at the default.
+
+Ruled out by direct check: the abduction joints are **not** unsprung (39.651 and 39.975
+N·m/rad, in the same range as the sagittal joints), so this is not the zero-stiffness bug it
+first looked like.
+
+**The proper fix** is a fifth requirement in `size_tone`, measured the way the module
+measures everything else: perturb the settled body in the frontal-plane mode with contacts
+**live**, read the resulting roll acceleration, and raise the abduction springs until it
+restores with a margin. `stand_test` needs a lateral nudge in the same change, or the fix has
+no regression test. Both must be validated against the randomised-morph yield (currently 93%
+at scale 1.0) rather than just against the default rig, since the change can only make springs
+stiffer and the stiffness ceiling is real.
+
 ---
 
 ## Done
