@@ -33,7 +33,12 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 
 ## Module map (src/)
 
-- **`main.cpp`** (~6200) — CLI parsing, mode dispatch, chunking/progressive loop
+- **`main.cpp`** (~6200) — CLI parsing (the option table is a chain of `else if`s split
+  into **segments** — each ends `else handled = false;` and the next is guarded by
+  `if (!handled)`, because one unbroken chain hit MSVC's `C1061: blocks nested too deeply`
+  at ~128 links and the build then fails on whatever flag was added last; append new flags
+  to a segment, and start another once one nears ~100 links), mode dispatch,
+  chunking/progressive loop
   (`cpuSppChunks`, `chunkFixed = !progressive && g_showWindow` — a bare fixed `-n`
   with no `-window`/budget flag runs monolithically with output only at the end),
   periodic write/`-interval`, checkpoint/resume (`.ftbuf`), multi-camera shared
@@ -302,6 +307,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     tangent lateral band → front cap; both tangent circles sit at polar angle `acos(a)`,
     `a = (r0−r1)/|ba|`, which is what makes one angular sweep cover all three
     continuously and the preview mesh closed). Coarse by design, ~80 tris/segment.
+    *Coarse was still ~46 GB* (0.160.0): a groom is 10⁶ segments and `sizeof(PTri)` is
+    320 B, so the fixed 80-tris/segment cone made `-explore` on `gallery_rain`
+    (1.79 M segments) allocate tens of gigabytes and page-thrash forever behind an
+    unchanging `tessellating (0/33)` placeholder. Stage (2b) now runs under a **triangle
+    budget** (`raster::kDefaultCurveBudget`, 12 M; `-raster-curve-budget`): it takes the
+    richest LOD on the ladder `{10,2} → {6,1} → {4,1} → {3,1} → {4,0} → {3,0} → {2,0}`
+    (`{azimuth divisions, rings per cap}`; `ccap == 0` drops the sub-pixel end caps,
+    `cu == 2` is a double-sided ribbon) that fits, and thins whole strands by
+    `CurveSeg::curveId` only if even the cheapest tube doesn't. The lesson generalises:
+    **a per-primitive preview cost that is fine for the primitive is not fine for the
+    generator that authors 10⁶ of them** — every "coarse by design" constant that a groom,
+    an instancer or a particle system can multiply needs a budget, not a constant.
   - *A new prim range lives in **three** places, not two* (learned 0.153.1). The BVH leaf
     and the device leaf are the obvious two, and both announce a mistake loudly — the
     scene renders wrong, or falls back. The third is `Scene::closestHitLinear`, the

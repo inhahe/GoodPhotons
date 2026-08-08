@@ -416,6 +416,24 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > longest axis; `0` skips implicit surfaces). Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.
 >
+> **Fur / curve strands are previewed under a triangle budget —
+> `-raster-curve-budget <n>` (default 12000000).** Every curve segment is swept into a
+> round-cone mesh so a furred subject doesn't preview bald, but a groomed pelt is
+> *millions* of segments: `scenes/fur_creature.ftsl` and the creature in
+> `scenes/gallery_rain.ftsl` carry ~1.79 M each, and at the full 80-triangles-per-segment
+> cone that would be tens of gigabytes of preview geometry. So the sweep picks the
+> coarsest tube that fits the budget — 10-sided capped → 6/4/3-sided → capless →
+> a flat double-sided ribbon — and only if even the cheapest one busts the budget does it
+> thin whole **strands** (kept strands stay continuous, never dashed). At the default
+> those two pelts land on a 3-sided capless tube, ~6 triangles/segment, which is
+> visually indistinguishable from the full cone at preview resolution. When the budget
+> bites, ftrace says so:
+> `[raster] 1786496 curve segments over the 12000000-triangle preview budget: 3-sided
+> uncapped tube, 6 tris/segment (10718976 tris)`. Raise `-raster-curve-budget` for
+> rounder strands if you have the RAM (each preview triangle is ~320 B), lower it on a
+> small machine. This only affects the **preview**; the ray-traced modes intersect the
+> analytic strands exactly and ignore the budget entirely.
+>
 > **GPU-accelerated preview — `-device gpu` (or `auto`).** When ftrace is built
 > with CUDA, the preview rasterizer runs on the GPU: the tessellated world
 > triangles are uploaded **once** and every camera is projected, depth-resolved
@@ -3198,6 +3216,7 @@ alone can't restore, so they are not disk-resumable.
 | `-window-interval <s>` | How often the `-window` live view repaints (default 0.2 s), independent of `-interval`. The two used to share one timer, which meant any render finishing inside one interval never showed a single live frame — a 5 s `-mode W` frame under `-interval 8` painted once, as the process was exiting, so the finished image just flashed and vanished. They are separate now because they want opposite cadences: rewriting a PNG and a multi-megabyte checkpoint five times a second is pointless disk churn, while repainting a window every 15 s defeats the point of having one. Repaint granularity is bounded below by the renderer's own chunk size (one chunk ≈ 0.15 s of GPU work, minimum 1 spp), so on a 480² `-mode W -spp 8` frame you get one repaint per spp — the first complete image lands after ~0.6 s instead of after 5 s. Measured cost of the extra repaints there: **+3.9 %** of render time (a repaint tone-maps and presents the whole frame, ~25 ms at 480²). The floor is adaptive — never less than the larger of this value and 12× what the last repaint actually cost — so a 4K film backs itself off instead of spending all its time painting. `0` means "every chunk, subject only to that budget". `FTRACE_WINDOW_DEBUG=1` logs each repaint and its cost. |
 | `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
+| `-raster-curve-budget <n>` | Cap on the preview triangles spent tessellating **curve / fur strands** (default `12000000`, ~3.8 GB of preview geometry). Past it the round-cone tubes coarsen (10-sided capped → 6/4/3-sided → capless → flat ribbon), and only if the cheapest tube still busts the budget are whole **strands** thinned out. A groomed pelt is millions of segments, so without this a `-raster`/`-explore` on one would allocate tens of GB and appear to hang. Preview-only — the ray-traced modes intersect the analytic strands and ignore it. |
 | `-raster-bench <n>` | Raster **frame-rate benchmark**: after the scene is built (and uploaded, on the GPU), re-render the first selected camera `n` times and report steady-state **ms/frame** (min/median/mean + fps) — the interactive explorer's per-move cost, measured independently of startup. With `-device gpu` also prints a per-pass breakdown (clearvis/project/raster/shade/clear/expose+encode/download, timed with CUDA events on the GPU timeline). Add `-window` and it also reports the **live-window present tail** — what handing each finished frame to the preview costs the render thread — because that tail used to be larger than the render itself and a backend speedup is only real if it stays small. With `-device gpu -window` it then runs a **second, zero-copy phase**: the same `n` frames rendered directly into the window's D3D11 texture, reported as one combined `render+present` figure (there is no separate tail to report — there is no handoff) plus its own per-pass breakdown, so the two presentation paths can be compared pass by pass on one run. Note that the zero-copy *median* pins at the display refresh (16.67 ms / 60.0 fps) because presenting blocks on vblank once both back buffers are queued — read **min** for the true pipeline cost. Writes the last frame to `-o` so backends/builds can be byte-compared. |
 | `-see-through` / `-seethrough` / `-glass` | In `-raster`, render **clear** materials (dielectric / thin-film / filter / diffuse-transmit) as actually see-through instead of solid ghosts: each clear surface between the camera and the opaque background **dims** and **milkily hazes** what's behind it, cumulative with the number of clear surfaces crossed (no refraction, no coloured absorption). Order-independent, so overlapping glass needs no sort. See the preview note under **Render modes**. |
 | `-glass-clarity <0..1>` | Per-surface transmittance for `-see-through` (default `0.85`; higher = clearer / less dimming). Passing it implies `-see-through`. |

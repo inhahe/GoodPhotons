@@ -5,6 +5,55 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-08-08, v0.160.0): `-explore` on a FURRED scene never started — the curve preview sweep allocated ~46 GB of triangles and thrashed the page file forever
+
+`ftrace scenes\gallery_rain.ftsl -explore` sat with the live window titled
+**`tessellating (0/33)`** indefinitely. The title was the giveaway and was misread twice:
+`raster::tessellate`'s own progress callback formats `tessellating (N/M, P%)` — *with* a
+percentage — so a title with no percentage is the **placeholder** stamped by
+`main.cpp:~9884` *before* tessellation. Nothing had entered the implicit marcher at all.
+Confirmed from a captured stdout: the last line was
+`[raster] solid-shaded preview: tessellating scene (iso res 96) ...` and
+`[raster] tessellating implicit 0/33 (0%)` (raster.h's `progress(0, nImp)`) never printed.
+
+The stall was section **(2b)** of `raster::tessellate`, which runs *before* (3) and has no
+progress reporting: it sweeps every `CurveSeg` into a closed round-cone mesh at a fixed
+`CU = 10`, `CCAP = 2` — **80 triangles per segment**. `gallery_rain` carries **1 786 496**
+fur segments (a 15-block groom on the creature), and `sizeof(PTri) == 320 B`, so that is
+**~46 GB** of preview geometry — **~92 GB** transiently while `std::vector` doubles.
+Measured on the wedged process: **71.9 GB private bytes**, 39.7 GB working set, ~57 % of one
+core (it was page-faulting, not computing). A second copy of the same run had been squeezed
+to a 0.01 GB working set by the first. Non-invasive `cdb -p <pid> -c "~*k; qd"` sampling
+matched: main thread parked in `SleepEx`, no tessellation workers, message pump idle.
+
+**Fix (raster.h §2b):** the curve sweep now runs under a **triangle budget**
+(`kDefaultCurveBudget = 12 M`, `-raster-curve-budget <n>`). It walks a LOD ladder
+`{10,2} → {6,1} → {4,1} → {3,1} → {4,0} → {3,0} → {2,0}` (`{azimuthal divisions, rings per
+spherical cap}`; `ccap == 0` drops the sub-pixel end caps, `cu == 2` degenerates to a
+double-sided flat ribbon) and takes the richest LOD that fits. Only if the cheapest one
+still busts the budget does it thin whole **strands** — keyed on `CurveSeg::curveId`, so a
+kept strand stays continuous instead of dashed. The per-segment `std::vector<Ring>` is now a
+fixed stack buffer (it was one heap allocation per segment, millions of them), and `out` is
+reserved for the exact post-budget count so the doubling spike is gone.
+
+Result on `gallery_rain`: 3-sided capless tube, 6 tris/segment, **10.7 M curve triangles**
+(14.5 M scene total) tessellated in **3.1 s**, ~13.6 GB peak private, and the interactive
+viewer runs at **10.7 fps**. A/B stills (`png/fur_lod_full.png` = ribbon,
+`png/fur_lod_mid.png` = 3-sided, `png/fur_lod_hi.png` = 4-sided) are why the default is 12 M
+and not 8 M: the ribbon samples only two azimuths and reads visibly darker and patchier,
+while the 3-sided tube is indistinguishable from the full cone at preview resolution.
+
+**Two things this exposed, both handled in the same change:**
+1. `main.cpp`'s option table was **at MSVC's block-nesting ceiling** — adding one more
+   `else if` failed the build with `C1061: compiler limit: blocks nested too deeply`.
+   The chain is now split into **segments**, each ending in `else handled = false;` with the
+   next guarded by `if (!handled)`, so new flags no longer approach the limit.
+2. Section (2b) still reports **no progress**. It is now ~1 s rather than forever, so the
+   frozen `tessellating (0/33)` placeholder is no longer misleading in practice — but a
+   scene an order of magnitude furrier would look stalled again for a few seconds. See the
+   related open entry on `CurveSeg` being 80 bytes; `PTri` at 320 B (all-double positions,
+   normals and UVs for a *preview*) is the bigger prize and is untouched.
+
 ### BY-DESIGN (2026-08-08, v0.157.0): auto-exposure's p99 anchor can't be stabilised by *any* per-image statistic — the shared anchor **is** the fix, not a mitigation
 
 > **This entry previously recorded the wrong root cause and two wrong fixes.** It blamed a

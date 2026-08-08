@@ -8095,6 +8095,8 @@ static void printHelp(const char* prog) {
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
 "  -raster-iso <n>       marching-cubes resolution for isosurfaces (0 = skip)\n"
+"  -raster-curve-budget <n>  max preview triangles spent on curve/fur strands (default 12000000;\n"
+"                        over it the tubes coarsen, then whole strands thin out)\n"
 "  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T to cycle\n"
 "                        the lit preview: raster -> mode W (deterministic, CPU, any scene) -> path-traced (GPU)\n"
 "  -noclip|-nocollide    start the fly viewer with wall collision off\n"
@@ -8299,6 +8301,10 @@ static int run(int argc, char** argv) {
     std::string animSidecar;      // -anim <file.json>: loom CurveDrive sidecar the curve editor seeds from / saves back to (E2 channel a)
     std::string animLoomScene;    // -loom <scene.py>: with -anim, the build file the LIVE channel re-derives from (E2 channel b)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
+    // -raster-curve-budget <n>: cap on preview triangles spent tessellating curve/fur strands.
+    // 0 = raster::kDefaultCurveBudget. A groomed pelt is millions of segments; at the full
+    // 80-tris/segment cone that is tens of GB of PTri, which is what used to wedge -explore.
+    size_t rasterCurveBudget = 0;
     bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
     int  rasterBench = 0;         // -raster-bench <n>: render the first camera n times, report steady-state ms/frame (explorer metric)
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
@@ -8502,6 +8508,15 @@ static int run(int argc, char** argv) {
     }
 
     for (int i = 1; i < argc; ++i) {
+        // NOTE — why this option table is split into SEGMENTS. MSVC caps how deeply blocks
+        // may nest (C1061, ~128 levels) and every link of an `else if` chain costs one
+        // level, so a single chain covering every flag hits the compiler limit and the
+        // build dies on whichever flag happened to be added last. Each segment is its own
+        // chain that ends in `else handled = false;`, and the next one only runs when the
+        // previous matched nothing; the LAST segment ends in the unknown-option error.
+        // Adding a flag = appending to the segment it belongs with; if a segment grows
+        // past ~100 links, start another one the same way.
+        bool handled = true;
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) {
             // Photon count. Accept both plain integers ("200000000") and scientific /
             // float shorthand ("2e8", "1.5e9") — atoll stops at the 'e', so parse the
@@ -8626,7 +8641,11 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
-        else if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
+        else handled = false;
+
+        // ---- segment 2 (see the nesting note at the top of the loop) ----------------
+        if (!handled) {
+        if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-export-mesh") && i + 1 < argc) exportMeshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-mesh-res") && i + 1 < argc) exportMeshRes = std::atoi(argv[++i]);
@@ -8706,6 +8725,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-no-meter") || !std::strcmp(argv[i], "-nometer")) noMeter = true;
         else if (!std::strcmp(argv[i], "-noclip") || !std::strcmp(argv[i], "-nocollide")) viewerNoclip = true;
         else if (!std::strcmp(argv[i], "-raster-iso") && i + 1 < argc) rasterIso = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-raster-curve-budget") && i + 1 < argc)
+            rasterCurveBudget = (size_t)std::max(0LL, std::atoll(argv[++i]));
         else if (!std::strcmp(argv[i], "-see-through") || !std::strcmp(argv[i], "-seethrough") || !std::strcmp(argv[i], "-glass")) rasterSeeThrough = true;
         else if (!std::strcmp(argv[i], "-glass-clarity") && i + 1 < argc) { rasterClarity = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
@@ -8763,6 +8784,7 @@ static int run(int argc, char** argv) {
             std::fprintf(stderr, "ftrace: unknown option '%s' (try -h / --help)\n", argv[i]);
             return 2;
         }
+        }   // end segment 2
     }
     if (nThreads < 1) nThreads = 1;
 
@@ -9912,7 +9934,7 @@ static int run(int argc, char** argv) {
                     lastTick = now;
                 }
             };
-            prims = raster::tessellate(scene, rasterIso, tessProgress);
+            prims = raster::tessellate(scene, rasterIso, tessProgress, rasterCurveBudget);
             auto rt1 = std::chrono::steady_clock::now();
             std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
                         prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),

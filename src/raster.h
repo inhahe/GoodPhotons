@@ -48,6 +48,8 @@
 #include <memory>
 #include <functional>
 #include <array>
+#include <string>
+#include <cstdio>
 #include "scene.h"
 #include "camera.h"
 #include "color.h"
@@ -260,13 +262,33 @@ inline PreviewLight deriveLight(const Scene& sc) {
     return L;
 }
 
+// Deepest `ccap` (rings per spherical cap) any curve LOD may ask for — sizes the
+// fixed ring buffer in the curve sweep below.
+constexpr int kMaxCurveCap = 2;
+
+// How many preview triangles the curve/fiber sweep may spend in total. Each PTri is
+// ~320 B, so this caps fur preview geometry at roughly 3.8 GB; past it the sweep drops
+// to a coarser tube and finally thins whole strands (see section 2b). Overridable per
+// call (`-raster-curve-budget`), because a machine with room to spare may prefer the
+// full 80-tris/segment cone on a groomed pelt.
+//
+// 12 M is chosen so the reference pelts (scenes/fur_creature.ftsl and the creature in
+// scenes/gallery_rain.ftsl, ~1.79 M segments each) land on the 3-sided uncapped tube
+// rather than the flat ribbon below it: the ribbon samples only two azimuths, so its
+// shading reads noticeably darker and patchier, while the 3-sided tube is visually
+// indistinguishable from the full cone at preview resolution for ~1/13 the triangles.
+constexpr size_t kDefaultCurveBudget = 12u * 1000u * 1000u;
+
 // ---- Scene -> world-space preview triangles (done once, reused for every frame) --
 // `progress`, if set, is called as each heavy implicit (isosurface/CSG/metaball) is
 // about to be marched: progress(done, total) where `total` is the implicit count and
 // `done` runs 0..total (0 before the first, total after the last). Marching implicits
 // is by far the slow part of tessellation, so this drives the "tessellating N/M" UI.
+// `curveBudget` (0 = kDefaultCurveBudget) caps the triangles spent on curve/fiber
+// strands; see section (2b).
 inline PreviewGeom tessellate(const Scene& sc, int isoRes,
-                              const std::function<void(int, int)>& progress = {}) {
+                              const std::function<void(int, int)>& progress = {},
+                              size_t curveBudget = 0) {
     PreviewGeom geom;
     std::vector<PTri>& out = geom.tris;
     // One baked shading payload per material (was a fistful of parallel arrays; a single
@@ -429,13 +451,55 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
     // `a = (r0-r1)/|p1-p0|` the tangent circles sit at polar angle `acos(a)` on BOTH end
     // spheres, which is what makes one angular sweep cover all three pieces continuously
     // — so the preview mesh is closed, exactly like the surface it approximates.
+    //
+    // TRIANGLE BUDGET. A fiber is a few pixels wide at preview resolution, so the full
+    // 80-tris/segment cone is only affordable on light strand counts. A groomed pelt is
+    // NOT light: `scenes/gallery_rain.ftsl` carries 1.79 M fur segments, which at 80 tris
+    // and sizeof(PTri) == 320 B is ~46 GB of preview geometry (~92 GB while the vector
+    // doubles) — `-explore` on it used to sit at "tessellating (0/33)" forever, thrashing
+    // the page file, because this loop ran before the implicits it was reporting progress
+    // for. So the sweep now picks the coarsest ring/azimuth LOD that fits `curveBudget`
+    // triangles, and only if even the cheapest one busts the budget does it thin whole
+    // STRANDS (by curveId, so a kept strand stays continuous rather than dashed).
     if (!sc.curveSegs.empty()) {
-        const int CU   = 10;   // azimuthal divisions
-        const int CCAP = 2;    // rings per spherical cap
-        // A fiber is a few pixels wide at preview resolution, so this stays deliberately
-        // coarse: 80 tris/segment is already ~5x what a strand costs the ray tracer, and
-        // the silhouette is what the preview is for.
+        // LOD ladder, richest first: {azimuthal divisions, rings per spherical cap}.
+        // ccap == 0 drops the end caps and sweeps the lateral band alone (an open cone) —
+        // the caps are sub-pixel on fur. cu == 2 degenerates that band into a double-sided
+        // flat ribbon, the cheapest thing that still shows every strand.
+        struct CurveLod { int cu, ccap; };
+        static const CurveLod kCurveLods[] = {{10,2},{6,1},{4,1},{3,1},{4,0},{3,0},{2,0}};
+        auto lodTris = [](const CurveLod& L) -> size_t {
+            const int rings = L.ccap > 0 ? 2 * L.ccap + 2 : 2;
+            size_t t = (size_t)2 * L.cu * (rings - 1);
+            if (L.ccap > 0) t -= (size_t)2 * L.cu;   // the two pole spans collapse to fans
+            return t;
+        };
+        const size_t nSeg = sc.curveSegs.size();
+        const size_t budget = curveBudget ? curveBudget : kDefaultCurveBudget;
+        size_t lod = 0;
+        while (lod + 1 < sizeof(kCurveLods) / sizeof(kCurveLods[0]) &&
+               nSeg * lodTris(kCurveLods[lod]) > budget) ++lod;
+        const int CU   = kCurveLods[lod].cu;
+        const int CCAP = kCurveLods[lod].ccap;
+        const size_t perSeg = lodTris(kCurveLods[lod]);
+        // Still over budget at the cheapest LOD: keep one strand in `stride`.
+        size_t stride = 1;
+        if (nSeg * perSeg > budget) stride = (nSeg * perSeg + budget - 1) / budget;
+        if (lod > 0 || stride > 1) {
+            const std::string thin = stride > 1
+                ? ", thinned to 1 strand in " + std::to_string(stride) : std::string();
+            std::printf("[raster] %zu curve segments over the %zu-triangle preview budget: "
+                        "%d-sided%s tube, %zu tris/segment%s (%zu tris)\n",
+                        nSeg, budget, CU, CCAP ? "" : " uncapped", perSeg, thin.c_str(),
+                        (nSeg / stride) * perSeg);
+            std::fflush(stdout);
+        }
+        out.reserve(out.size() + (nSeg / stride + 1) * perSeg);
+        size_t segIdx = 0;
         for (const auto& s : sc.curveSegs) {
+            const size_t key = (s.curveId >= 0) ? (size_t)s.curveId : segIdx;
+            ++segIdx;
+            if (stride > 1 && key % stride) continue;
             Vec3 ba = s.p1 - s.p0;
             double l = length(ba);
             if (l <= 1e-12) continue;                 // coincident ends: tessellateCurve drops these
@@ -445,20 +509,28 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             Vec3 T, B; onb(ax, T, B);
             const double alpha0 = std::acos(a);       // polar angle of BOTH tangent circles
 
-            // Ring stations, back pole -> front pole. `onSphere0` picks which end sphere
-            // the ring rides; the two tangent rings are shared, so the strip is seamless.
+            // Ring stations, back pole -> front pole. The two tangent rings are shared, so
+            // the strip is seamless. Held in a fixed stack buffer rather than a vector:
+            // this runs once per segment and a furred scene has millions of them, so a
+            // heap allocation here would dominate the sweep.
             struct Ring { Vec3 c; double rad, nAx; double u; };
-            std::vector<Ring> rings;
-            rings.reserve(2 * CCAP + 2);
+            Ring rings[2 * kMaxCurveCap + 2];
+            int nRings = 0;
             auto push = [&](const Vec3& org, double r, double alpha, double u) {
                 const double ca = std::cos(alpha), sa = std::sin(alpha);
-                rings.push_back(Ring{org + ax * (r * ca), r * sa, ca, u});
+                rings[nRings++] = Ring{org + ax * (r * ca), r * sa, ca, u};
             };
-            for (int i = 0; i <= CCAP; ++i)           // cap at p0: alpha pi -> alpha0
-                push(s.p0, s.r0, PI + (alpha0 - PI) * (double)i / CCAP, (double)s.u0);
-            push(s.p1, s.r1, alpha0, (double)s.u1);   // the OTHER tangent circle (lateral band)
-            for (int i = 1; i <= CCAP; ++i)           // cap at p1: alpha0 -> 0
-                push(s.p1, s.r1, alpha0 * (1.0 - (double)i / CCAP), (double)s.u1);
+            if (CCAP > 0) {
+                for (int i = 0; i <= CCAP; ++i)       // cap at p0: alpha pi -> alpha0
+                    push(s.p0, s.r0, PI + (alpha0 - PI) * (double)i / CCAP, (double)s.u0);
+                push(s.p1, s.r1, alpha0, (double)s.u1);   // the OTHER tangent circle
+                for (int i = 1; i <= CCAP; ++i)       // cap at p1: alpha0 -> 0
+                    push(s.p1, s.r1, alpha0 * (1.0 - (double)i / CCAP), (double)s.u1);
+            } else {
+                // Capless LOD: the lateral band alone, tangent circle to tangent circle.
+                push(s.p0, s.r0, alpha0, (double)s.u0);
+                push(s.p1, s.r1, alpha0, (double)s.u1);
+            }
 
             auto vert = [&](const Ring& rg, int iu, Vec3& p, Vec3& n) {
                 const double phi = 2.0 * PI * (double)iu / CU;
@@ -471,7 +543,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             auto uvAt = [&](const Ring& rg, int iu) {
                 return Vec3{rg.u, (double)iu / CU, 0.0};
             };
-            for (size_t k = 0; k + 1 < rings.size(); ++k) {
+            for (int k = 0; k + 1 < nRings; ++k) {
                 const Ring& r0 = rings[k];
                 const Ring& r1 = rings[k + 1];
                 const bool degen0 = r0.rad <= 1e-12, degen1 = r1.rad <= 1e-12;
