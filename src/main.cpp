@@ -431,10 +431,18 @@ static void selfTestColor() {
 // Fire random rays through the scene and assert the BVH agrees with the linear
 // scan (same hit distance, material, sensor). Guards against BVH build/traversal
 // bugs that would silently corrupt the image.
+//
+// Threaded, and it has to be: the reference side is O(rays * prims) with no
+// acceleration at all, so a groom (fur_basics is ~5e5 curve segments) puts the
+// serial version past half an hour — long enough that the test stops being run,
+// which is the same as not having it. Each ray gets its OWN Pcg32 stream keyed by
+// its index instead of drawing from one shared sequence, so the ray set is a pure
+// function of `i` and the run stays reproducible regardless of core count or how
+// the chunk cursor happens to hand work out.
 static int checkBvh(const Scene& scene, long long rays) {
-    Pcg32 rng; rng.seed(1234567u, 0xABCDEFu);
-    int mismatches = 0;
-    for (long long i = 0; i < rays; ++i) {
+    std::atomic<int> mismatches{0};
+    const bool full = ft::parallelFor((size_t)rays, 256, [&](size_t i) {
+        Pcg32 rng; rng.seed(mix64((uint64_t)i), 0xABCDEFu);
         // Random ray: origin in a box around the scene, random direction.
         Vec3 o{rng.uniform() * 3 - 1, rng.uniform() * 3 - 1, rng.uniform() * 3 - 1};
         double z = rng.uniform() * 2 - 1, phi = 2 * PI * rng.uniform();
@@ -446,11 +454,16 @@ static int checkBvh(const Scene& scene, long long rays) {
         bool ok = (a.valid == b.valid) &&
                   (!a.valid || (std::fabs(a.t - b.t) < 1e-7 &&
                                 a.matId == b.matId && a.sensorId == b.sensorId));
-        if (!ok) ++mismatches;
+        if (!ok) mismatches.fetch_add(1, std::memory_order_relaxed);
+    });
+    const int m = mismatches.load();
+    if (!full) {                       // `ftrace -stop` landed mid-check
+        std::printf("[checkbvh] stopped early after partial sweep, %d mismatches so far\n", m);
+        return m;
     }
     std::printf("[checkbvh] %lld rays, %d mismatches -> %s\n",
-                rays, mismatches, mismatches == 0 ? "PASS" : "FAIL");
-    return mismatches;
+                rays, m, m == 0 ? "PASS" : "FAIL");
+    return m;
 }
 
 // Implicit-surface (SDF sphere trace) self-test. A unit-Lipschitz SDF sphere must
@@ -8286,7 +8299,12 @@ static int run(int argc, char** argv) {
     if (checkBvhOnly) {
         // Bound the linear-reference work (~O(rays * prims)) so the self-test
         // stays fast even for big meshes: ~5e8 primitive tests, clamped.
-        long long prims = (long long)scene.tris.size() + (long long)scene.spheres.size();
+        // Count every prim the linear reference actually scans. A groom is nearly all
+        // curve segments, so leaving those out of the estimate made the "bounded"
+        // budget unbounded on exactly the scenes that need it most.
+        long long prims = (long long)scene.tris.size() + (long long)scene.spheres.size()
+                        + (long long)scene.implicits.size() + (long long)scene.curveSegs.size()
+                        + (long long)scene.instances.size();
         long long rays = 500'000'000LL / (prims > 0 ? prims : 1);
         rays = std::clamp(rays, 20'000LL, 2'000'000LL);
         return checkBvh(scene, rays) == 0 ? 0 : 1;

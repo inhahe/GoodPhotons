@@ -5,6 +5,76 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-08-07, v0.153.1): `-checkbvh` FAILED on every scene with a `curve` — the *reference* was wrong, not the BVH
+
+Found by auditing whether the `curve` primitive reaches every render mode on both
+backends. Every renderer was fine; the self-test that is supposed to certify them was
+not:
+
+```
+> ftrace scenes/curve_basics.ftsl -checkbvh
+[checkbvh] 2000000 rays, 4390 mismatches -> FAIL
+```
+
+**`Scene::closestHitLinear` — the brute-force reference `checkBvh` compares the BVH
+against — never learned about `curveSegs`.** It scans `tris`, `spheres`, `implicits` and
+`instances` and stops. So for a fiber scene the BVH was *right* and the reference was
+blind, and every strand the BVH correctly found got scored as a mismatch. The direction of
+the error is what makes this worth recording: a broken reference does not weaken a
+cross-check, it **inverts** it. `-checkbvh` on `curve_basics` was reporting a steady
+0.2% failure rate that was entirely the test's own fault, which means a real BVH
+regression on a groom would have arrived as `4391 mismatches` where the baseline already
+read `4390` — a signal buried in the noise the test was generating itself. A check that
+cries wolf on correct code is worse than no check.
+
+**Fix:** `closestHitLinear` runs the same `makeCurveRay` + `intersectCurveSeg` loop the
+BVH leaf does, guarded on `!curveSegs.empty()` so curve-free scenes don't pay the
+`CurveRay` setup. `curve_basics`, `group`, `implicit`, `cornell` and `fur_basics` all
+report 0 mismatches. **Generalisation:** adding a primitive means adding it to *three*
+places, not two — the BVH leaf, the device leaf, and the linear reference. The first two
+announce themselves (nothing renders / falls back); the third fails silently in the
+direction of a false alarm.
+
+Two companion fixes fell out of the same audit, both about the reference's O(rays×prims)
+cost, which nothing had ever paid before because nothing had ever put 5e5 prims through it:
+
+- **The ray budget didn't count curves (or implicits, or instances).** `-checkbvh` sizes
+  its sweep as `5e8 / prims` to stay bounded, but `prims` was `tris + spheres` only. A
+  groom is *almost entirely* curve segments, so the estimate read ~0 prims and asked for
+  the full 2 M rays — the budget went unbounded on exactly the scenes it exists to bound.
+  Now it counts every range the linear scan actually walks.
+- **The sweep was single-threaded.** Even correctly budgeted, the 20 000-ray floor against
+  `fur_basics` is ~1e10 primitive tests; serially that is **>30 minutes**, which in
+  practice means the test stops being run at all. `checkBvh` now goes through
+  `ft::parallelFor`, with each ray drawing from its own `mix64(i)`-keyed `Pcg32` stream
+  rather than one shared sequence — so the ray set is a pure function of the ray index and
+  the result is reproducible independent of core count or chunk scheduling. It also picks
+  up `parallelFor`'s stop probe, so `ftrace -stop` now lands on a long check.
+
+**What the audit that found it actually established** (worth keeping, because "does every
+mode trace curves?" is not answerable by reading code — a leaf range with no intersector
+does not fault, it traces *past* every strand and renders a furred subject bald, and the
+bald image looks fine):
+
+Each of the ten renderable modes was rendered twice, once from `scenes/curve_basics.ftsl`
+and once from the same scene with every `curve` block stripped, on **both** devices, and
+scored by **fiber coverage** — the fraction of pixels the strands actually change. A mode
+that sees them scores percent; a mode that skips them scores noise.
+
+| | A | B | C | R | W | P | D | M | S | U |
+|---|---|---|---|---|---|---|---|---|---|---|
+| CPU | 10.3%\* | 10.8% | 30.0%\* | 22.5% | 10.0% | 11.0% | 20.2% | 9.9% | 13.3% | 38.0% |
+| GPU | 10.3%\* | 12.2% | 30.0%\* | 22.6% | 10.1% | 14.8% | 19.7% | 11.1% | 9.6% | 12.3% |
+
+CPU-vs-GPU mean luminance agrees to <0.4% on every mode. \*A and C are measured on the
+`-hdr` PFM, and **that detail is the trap**: they are physically-absolute finite-aperture
+cameras whose image here sits at ~5e-5 scene-linear, so every pixel quantises into the
+bottom 8-bit level and the PNG-based metric reports a flat **0.00% coverage that does not
+move even at 2.4e9 photons** — indistinguishable from a mode that ignores curves entirely.
+In float they change 10.3% / 30.0% of pixels by >20% relative radiance and come out 5.4% /
+3.5% darker with the fibers present. A test whose *instrument* saturates fails exactly like
+the bug it is hunting; measure the forward modes in HDR. Harness: `scraps/curve_mode_sweep.py`.
+
 ### FIXED (2026-08-07, v0.152.0): a `fur` block on a MESH/QUAD target generated ZERO strands, silently
 
 Found during bring-up of the `fur { }` generator, and it is worth keeping as a record

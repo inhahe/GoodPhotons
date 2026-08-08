@@ -1774,6 +1774,15 @@ struct Scene {
         for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
         const PatTables tabs = patTables();
         for (const auto& im : implicits) intersectImplicit(r, im, tmin, h, &tabs);
+        // Curve segments are part of the reference too. Omitting them did not make
+        // `-checkbvh` weaker, it made it WRONG: the BVH found every strand the linear
+        // scan couldn't, so the cross-check reported thousands of "mismatches" on any
+        // scene with fibers (curve_basics: 4390/2M) and a real BVH regression would
+        // have been invisible in the noise.
+        if (!curveSegs.empty()) {
+            const CurveRay cray = makeCurveRay(r.d);
+            for (const auto& cs : curveSegs) intersectCurveSeg(cray, r, cs, tmin, h);
+        }
         for (const auto& inst : instances) {
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             Hit lh; lh.t = h.t;

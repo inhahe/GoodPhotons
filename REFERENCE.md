@@ -1635,7 +1635,7 @@ are not auto-lit; bind an FTSL `emit` material instead.)
 
 **Emissive non-mesh geometry (glowing solids).** `emit` is a property of the
 *material*, not of the `mesh` block, so binding an emissive material to anything else —
-a `sphere`, a `quad`, a CSG solid, a marched `isosurface` — makes that surface glow
+a `sphere`, a `quad`, a CSG solid, a marched `isosurface`, a `curve` fiber — makes it glow
 too, identically on CPU and GPU. The difference is that only a mesh has triangles to
 register an emitter against, so these surfaces are seen by **emission-on-hit only**: a
 camera ray (or a specular bounce) that lands on one picks up `emit(λ)`, but NEE and
