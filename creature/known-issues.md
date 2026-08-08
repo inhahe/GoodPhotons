@@ -109,6 +109,47 @@ The other three failures are not this: seed 15 is issue 1, seed 8 sags 84% (issu
 seed 7 survives the shove at 1.02° but fails on sag at 10.8% and gets *worse* at a smaller
 timestep — a separate thing, unexplained.
 
+### 5. PPO's KL early-stop is post-hoc, so 93% of updates run exactly one of five epochs
+
+Measured over the first 1749 updates of the 20 M-step P1 run (`runs/canis/log.jsonl`):
+
+| | value |
+|---|---|
+| `target_kl` | 0.02 |
+| median post-epoch KL | 0.056 |
+| p90 / max | 0.093 / 0.253 |
+| updates completing 1 epoch | 1623 (93%) |
+| updates completing 2 | 126 (7%) |
+| updates completing 3–5 | **0** |
+
+`ppo.update` measures KL over the whole batch on a fresh pass at the end of each epoch and
+breaks if it exceeds `target_kl` — which is honest (an earlier version measured it inside the
+minibatch loop and was biased three ways; see design.md §"PPO is written here rather than
+imported"). What the honest number now says is that **a single epoch already overshoots the
+trust region by ~3×**, so the check can only ever fire after the fact and `epochs: int = 5` is
+decorative. The run is doing a fifth of the optimisation its config describes — the same
+symptom as the bug that was fixed, arrived at from a different cause.
+
+It is not *breaking* the run: evaluation return climbed past 1200 with every animal surviving
+20 s, which is P1's bar. So this is tech debt, not a blocker, and it was deliberately not
+changed mid-run.
+
+The proper fix is one of two, and which one is an empirical question that should be settled
+with a short A/B at ~1 M steps rather than by argument:
+
+- **Check the full-batch KL after every minibatch, not every epoch**, and break mid-epoch.
+  Costs `minibatches` extra forward passes per epoch (cheap against the backward passes) and
+  makes the trust region actually bounding. Expect it to stop after ~1–2 minibatches, i.e. a
+  much smaller update than today's.
+- **Lower `lr` from 3e-4** so an epoch fits inside the trust region and the configured 5
+  epochs actually run. Roughly the same total movement per update, spread over more, smaller
+  gradient steps on the same data.
+
+Note the coupling already documented in design.md: KL scales as (Δµ/σ)², so this interacts
+with `init_log_std` — a policy that has narrowed its σ during training trips the same
+`target_kl` on a smaller parameter move, which is part of why the epoch count never recovers
+as the run matures.
+
 ---
 
 ## Done
