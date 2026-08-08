@@ -1340,6 +1340,45 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   *and* the live window, and once the window got its own repaint cadence it began running
   several times a second: at 480² the sort alone was the bulk of a ~40 ms repaint, now
   ~25 ms.
+- **`-exposure-anchor <value|file>` — an exposure anchor that survives process exit.**
+  The pre-existing lock machinery (`expAnchors`, `RenderCam.expGroup`, the `meterPlan`
+  pre-pass, `-exposure-lock`) shares an anchor only among frames rendered by **one**
+  `ftrace` invocation; it lives in a `std::map` that dies with the process. A sequence
+  rendered one-frame-per-invocation (loom's `render_range`, a batch loop, a single frame
+  re-rendered later) therefore meters every frame independently and can flicker. The new
+  `ExposureAnchorFile` (`main.cpp`, just after `writeFilm`) closes that gap with a
+  deliberately dumb medium — a text file holding one `%.17g` double. `resolve()` first
+  tries to parse the argument **whole** as a finite positive double (the trailing-junk
+  check is what stops a filename like `12frames.txt` reading as the number 12); failing
+  that it treats it as a path, loading the anchor if the file parses and otherwise
+  recording it as a `writePath`. So the *same* command line means "meter and save" on the
+  first frame and "load and reuse" on every later one, which is what lets a caller loop
+  without special-casing frame 0. The flag implies `-exposure-lock`, and must be resolved
+  **before** the camera list is built (the lock changes how cameras are grouped).
+  Write-back is RAII (`AnchorWriteback`, destructor reads `expAnchors[0]`) because the
+  render dispatch has a dozen early `return`s and a save at any one of them would have
+  been missed at the others. `-topng` accepts the same flag — it runs before the main
+  argument loop, so it parses it itself and passes a `double*` down through
+  `convertToPng` → `writeFilm`'s `lockAnchor`.
+  **Why it was needed** (measured on `png/pastel_jack_ring`, 432 frames, static camera —
+  only the ring rotates, so any global brightness change is by construction an artifact):
+  the p99 anchor stepped **42.2%** between adjacent frames while the static background
+  moved 2.2%, p95 0.68% and the median 0.59%. The cause is that a fixed-rank order
+  statistic is discontinuous on a **bimodal** histogram — a compact glint population makes
+  a plateau above a near-empty gap, and the p99 rank crosses that gap as the highlight's
+  *area* sweeps through 1% of frame ("area above 6× p95" measured 0.830% → 1.011% →
+  1.060% → 0.950% → 0.806% across the flicker band). Logged as tech debt in
+  `known-issues.md`: the shared anchor removes the *flicker*, it does not make the
+  statistic continuous, and a still can still anchor on an atypical glint.
+  **Repair path for already-rendered sequences** — `loom.stabilize_exposure(pngs)`
+  (`tools/loom/loom/drive.py`) develops each `<frame>.png.ftbuf` once with `-topng` to
+  read back the anchor that frame *would* have chosen (scraped from the
+  `auto-exposure=<v>` line), takes the **median** across the sequence, and re-develops
+  every frame at it. Median rather than "first frame wins" because on `pastel_jack_ring`
+  frame 0's anchor sat at the **93rd percentile** — 0.502× the median, a full stop — so
+  the obvious rule would have darkened the whole movie. It is a pure post-pass over
+  checkpoints (milliseconds a frame, no photons re-flown), and `render_range(...,
+  stabilize=True)` (the default) runs it after the last frame.
 - **`-hdr` (a 32-bit float PFM beside `-o`)** — the escape hatch from the tone map, added
   because *measuring* off a PNG had quietly been wrong all along. An 8-bit sRGB image clamps
   at white, and a caustic is by definition the brightest thing in frame, so its core prints
@@ -2651,6 +2690,20 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   remaining silent stretch is the scene load itself, which is before the frame size is
   known — opening a guessed-size window there would leave it the wrong shape for the whole
   render, so it isn't done.
+- **The title bar names the compute backend** (`liveTitle()` / `setLiveTitle()` next to
+  `g_windowMode` in `main.cpp`). Every window title is assembled in one place —
+  `scene → output  —  <mode>  —  <status>  —  <backend>` — instead of each call site
+  concatenating its own string, so the backend suffix cannot be dropped by one of them.
+  `backendLabel(gpu, nThreads)` renders `GPU (NVIDIA GeForce RTX 4090)` (the real
+  `cudaDeviceName()`, so a multi-GPU box says *which*) or `CPU (12 threads)`, and it is
+  stamped into `g_windowBackend` **where the device is actually resolved**, i.e. after
+  the VRAM probe in `runRender` — not from the `-device` flag, which is a request that
+  a failed probe or an unsupported feature can silently override. The raster/`-explore`
+  block is the one place a single window legitimately alternates backends within a
+  session (the raster preview and a `mode W` refinement run on the CPU while a `PV_PT`
+  path-trace runs on the GPU), so it precomputes `rasterBackend`/`cpuBackend`/`gpuBackend`
+  once and re-stamps per branch rather than reporting whichever device the frame started
+  on.
 - Repaint granularity is bounded below by the renderer's chunk size, not by this timer:
   `gpuSppChunks` / `cpuSppChunks` retarget ~0.15 s per chunk with a 1 spp floor, so a 480²
   `-mode W -spp 8` frame gets one repaint per spp and the first complete image lands after

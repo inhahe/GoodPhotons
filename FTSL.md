@@ -1970,7 +1970,10 @@ The eye rides a **Catmull-Rom spline** that passes through every `point` control
 
 `closed` loops the curve (wrap-around Catmull-Rom, sampled i/N so frame N == frame 0);
 an open curve spans both endpoints via i/(N−1). All frames share
-up/mode/film; `exposure_lock` shares the frame-0 exposure anchor.
+up/mode/film; `exposure_lock` shares the frame-0 exposure anchor. Note it can only share
+that anchor among frames rendered by the **same `ftrace` process** — a sequence rendered
+one frame per invocation needs the CLI's `-exposure-anchor <file>` to carry the anchor
+across processes (see `REFERENCE.md`).
 
 **Two-axis orientation (forward + up).** The camera basis is fixed by two authored
 axes; `right` is always derived from them, so you never set it. Each axis can be read

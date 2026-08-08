@@ -18,7 +18,9 @@ Design notes:
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -148,12 +150,19 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                  noise: Optional[float] = None, time_s: Optional[float] = None,
                  n: Optional[int] = None, loop: bool = True,
                  skip_existing: bool = False, retries: int = 2,
+                 stabilize: bool = True,
                  extra_args: Sequence[str] = ()) -> List[Path]:
     """Emit and render a frame range; return the rendered PNG paths.
 
     ``loop=True`` (default) renders a **seamless closed loop**; ``loop=False``
     renders an **open** one-shot timeline with distinct endpoints (§11.6).
     ``noise``/``time_s``/``n`` pick the per-frame stop budget (default: 3% noise).
+
+    ``stabilize=True`` (default) runs :func:`stabilize_exposure` at the end, which
+    re-develops the finished frames through one shared auto-exposure anchor.  Without
+    it every frame auto-exposes independently and a scene with a moving specular
+    highlight flickers — see that function for the measurement.  It costs no
+    re-rendering (it works off the ``-checkpoint`` sidecars), so it is on by default.
 
     ``skip_existing=True`` resumes a long sequence that was interrupted by a crash
     or a Ctrl-C instead of starting over.  A frame counts as done only when its
@@ -232,7 +241,109 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                                    f"{retries + 1} attempts")
             print(f"{tag}: exit {r.returncode}, retrying", flush=True)
         pngs.append(png)
+    if stabilize:
+        stabilize_exposure(pngs, anchor_file=outdir / f"{name}_exposure_anchor.txt")
     return pngs
+
+
+# ftrace prints exactly one of these per image write; the number is the auto-exposure
+# gain it chose for that film.
+_ANCHOR_RE = re.compile(r"auto-exposure=([0-9.eE+-]+)")
+
+
+def _frame_anchor(ftrace: Path, ftbuf: Path, png: Path) -> Optional[float]:
+    """Develop one checkpoint with its OWN auto-exposure and report the gain chosen."""
+    r = subprocess.run([str(ftrace), "-topng", str(ftbuf), str(png)],
+                       capture_output=True, text=True, cwd=str(repo_root()))
+    if r.returncode != 0:
+        return None
+    m = _ANCHOR_RE.search(r.stdout)
+    return float(m.group(1)) if m else None
+
+
+def stabilize_exposure(pngs: Sequence[os.PathLike], *,
+                       anchor_file: Optional[os.PathLike] = None,
+                       quiet: bool = False) -> Optional[float]:
+    """Re-develop a rendered sequence through ONE shared auto-exposure anchor.
+
+    A loom sequence is rendered one ftrace process per frame, so every frame picks its
+    own auto-exposure — and that anchor is a single order statistic (the 99th luminance
+    percentile).  When a scene has a bright, compact specular or emitter population the
+    luminance histogram is *bimodal*: ordinary shading in a low mode, the highlight in a
+    far brighter one, with almost no mass between them.  As the highlight's **area**
+    sweeps across 1% of the frame the p99 rank falls off the cliff from one mode to the
+    other and the anchor jumps discontinuously.  Measured on ``png/pastel_jack_ring``:
+    up to **42% between adjacent frames**, while every measure of the actual picture
+    (the static background, p95, the median) moved less than 2.3% over the same step.
+    Each frame is individually defensible; the assembled movie visibly flickers.
+
+    The fix is one anchor for the whole sequence, and it costs no re-rendering: the
+    ``-checkpoint`` sidecars still hold the raw linear film, so only the tone map has to
+    be redone.  Two cheap passes over the checkpoints — measure every frame's own
+    anchor, then re-develop them all through the **median** of those.
+
+    The median specifically, not the first frame's: "first frame wins" is what ftrace's
+    ``-exposure-lock`` does *within* one process, but frame 0 of a loop is an arbitrary
+    phase of it.  On pastel_jack_ring frame 0 lands at the 93rd percentile of the
+    sequence's anchors, so anchoring there would have left the whole movie a full stop
+    dark.  The median leaves the typical frame's exposure exactly where it already was
+    and pulls only the outliers into line.
+
+    Returns the chosen anchor, or ``None`` if no checkpoint was usable (a sequence
+    rendered without ``-checkpoint`` cannot be re-developed, and is left alone).
+    """
+    ftrace = find_ftrace()
+    frames = [Path(p) for p in pngs]
+    pairs = [(p, Path(str(p) + ".ftbuf")) for p in frames]
+    usable = [(p, b) for p, b in pairs if b.is_file()]
+    if not usable:
+        if not quiet:
+            print("[loom] exposure: no .ftbuf checkpoints found, leaving frames as "
+                  "rendered (render with -checkpoint to enable this)", flush=True)
+        return None
+    if len(usable) < len(pairs) and not quiet:
+        print(f"[loom] exposure: {len(pairs) - len(usable)} of {len(pairs)} frames have "
+              f"no checkpoint and will keep their own exposure", flush=True)
+
+    if not quiet:
+        print(f"[loom] exposure: metering {len(usable)} frames…", flush=True)
+    anchors = []
+    for png, ftbuf in usable:
+        a = _frame_anchor(ftrace, ftbuf, png)
+        if a is not None and a > 0.0:
+            anchors.append((png, ftbuf, a))
+    if not anchors:
+        if not quiet:
+            print("[loom] exposure: could not read any frame anchor, leaving frames as "
+                  "rendered", flush=True)
+        return None
+
+    vals = sorted(a for _, _, a in anchors)
+    shared = vals[len(vals) // 2]
+    if not quiet:
+        spread = vals[-1] / vals[0] if vals[0] > 0 else float("inf")
+        print(f"[loom] exposure: per-frame anchors span {spread:.2f}x "
+              f"({math.log2(spread):.2f} stops); sharing the median {shared:.6g}",
+              flush=True)
+    if anchor_file is not None:
+        Path(anchor_file).write_text(f"{shared!r}\n", encoding="utf-8")
+
+    n_re = 0
+    for png, ftbuf, own in anchors:
+        if own == shared:
+            continue          # the meter pass already developed it at exactly this gain
+        r = subprocess.run([str(ftrace), "-topng", str(ftbuf), str(png),
+                            "-exposure-anchor", repr(shared)],
+                           capture_output=True, text=True, cwd=str(repo_root()))
+        if r.returncode != 0:
+            print(f"[loom] exposure: WARNING re-develop failed for {png.name} "
+                  f"(exit {r.returncode}); it keeps its own exposure", flush=True)
+            continue
+        n_re += 1
+    if not quiet:
+        print(f"[loom] exposure: re-developed {n_re} frames through the shared anchor",
+              flush=True)
+    return shared
 
 
 def render_still(scene: Scene, *, t: float = 0.0, name: str = "loom_still",

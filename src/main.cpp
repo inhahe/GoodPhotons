@@ -4198,6 +4198,71 @@ static bool writeFilm(const char* path, const Film& f, double N, double expComp 
     return true;
 }
 
+// --- Shared auto-exposure anchor across separate invocations (-exposure-anchor) -------
+// `-exposure-lock` shares one p99 anchor between the cameras of a camera_path, but only
+// WITHIN a process. A frame-per-invocation sequence — one .ftsl and one ftrace run per
+// frame, which is how batch flyby scripts and any external animator drive the renderer —
+// re-derives the anchor every frame, and that anchor is a single order statistic. When a
+// scene has a bright, compact specular/emitter population (a glossy ring catching an area
+// light, say), the luminance histogram is BIMODAL: the ordinary scene occupies the low
+// mode and the highlight a far-brighter one, with almost no mass between them. As the
+// highlight's AREA sweeps across 1% of the frame, the 99th-percentile rank falls off the
+// cliff from one mode to the other and the anchor jumps discontinuously — measured at up
+// to 42% between adjacent frames of png/pastel_jack_ring, whose real lighting (static
+// background, p95, median) moved less than 2.3% over the same step. Every frame is
+// individually defensible; the assembled movie flickers. Sharing one anchor across the
+// whole sequence removes the artifact by construction, leaving only the genuine (smooth)
+// lighting change.
+//
+// The argument is either a literal positive number (use exactly this anchor and write
+// nothing) or a path: read it if it already holds a positive number, otherwise let this
+// frame compute its anchor normally and save it there for the following frames to reuse.
+struct ExposureAnchorFile {
+    double      value = 0.0;   // >0 = anchor to pre-populate (skip the per-frame p99)
+    std::string writePath;     // non-empty = save the resolved anchor here when we exit
+
+    // Parse a WHOLE string as a finite positive double. The trailing-junk check is what
+    // keeps a filename like "12frames.txt" from being mistaken for the number 12.
+    static bool asNumber(const std::string& s, double& out) {
+        if (s.empty()) return false;
+        const char* p = s.c_str();
+        char* end = nullptr;
+        double v = std::strtod(p, &end);
+        if (end == p) return false;
+        while (*end && std::isspace((unsigned char)*end)) ++end;
+        if (*end || !(v > 0.0) || !std::isfinite(v)) return false;
+        out = v;
+        return true;
+    }
+    void resolve(const std::string& arg) {
+        if (arg.empty()) return;
+        if (asNumber(arg, value)) return;                          // literal anchor
+        std::ifstream in(arg);
+        std::string tok;
+        if (in && (in >> tok) && asNumber(tok, value)) {           // reuse a saved anchor
+            std::printf("[exposure] anchor %.6g loaded from %s (shared with this sequence)\n",
+                        value, arg.c_str());
+            return;
+        }
+        value = 0.0;
+        writePath = arg;                                           // first frame: compute + save
+    }
+    void save(double resolved) const {
+        if (writePath.empty() || !(resolved > 0.0)) return;
+        std::ofstream o(writePath);
+        if (!o) {
+            std::fprintf(stderr, "warning: could not write exposure anchor to %s\n",
+                         writePath.c_str());
+            return;
+        }
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%.17g\n", resolved);
+        o << buf;
+        std::printf("[exposure] anchor %.6g saved to %s (later frames will reuse it)\n",
+                    resolved, writePath.c_str());
+    }
+};
+
 // --- Live terminal preview ----------------------------------------------------
 // Downsample the display film to a small ANSI-truecolour thumbnail and redraw it in
 // place (cursor moved back up over the previous frame) so -time/-forever renders show
@@ -5210,6 +5275,39 @@ static std::string                 g_windowTitle = "ftrace live preview";
 // Each render dispatch (runRender / runSharedGroup / runSharedPhotonMap) stamps it so a
 // multi-camera flight with per-camera modes always shows the mode of the frame on screen.
 static std::string                 g_windowMode;
+// Which device the frame on screen is ACTUALLY being traced on — "GPU (<card>)" or
+// "CPU (N threads)". Stamped by each render dispatch once the device is *resolved*, not
+// when it is requested: `-device auto` falls back to the CPU after probing VRAM, several
+// transport modes have no GPU path at all, and a CUDA build on a machine with no card
+// silently runs on the CPU. Those are exactly the cases where you want the title bar to
+// tell you, because the only other symptom is "this render seems slow".
+static std::string                 g_windowBackend;
+static std::string backendLabel(bool gpu, int nThreads) {
+#ifdef HAVE_CUDA
+    if (gpu) {
+        const char* dev = cudaDeviceName();
+        return (dev && *dev) ? "GPU (" + std::string(dev) + ")" : std::string("GPU");
+    }
+#else
+    (void)gpu;
+#endif
+    if (gpu) return "GPU";
+    return "CPU (" + std::to_string(std::max(1, nThreads)) + " threads)";
+}
+// The ONE place a live-window title is assembled: subject — mode/progress — device.
+// Every setTitle call site goes through this so the device tag cannot be forgotten at
+// one of them (there are a dozen: the placeholder, tessellation, exposure metering, the
+// raster preview, mode W, the path-tracer and the per-camera flight loop). `rest` is the
+// mode/progress part; either half may be empty (the backend is blank until it resolves).
+static std::string liveTitle(const std::string& rest) {
+    std::string t = g_windowTitle;
+    if (!rest.empty())            t += "  \xE2\x80\x94  " + rest;
+    if (!g_windowBackend.empty()) t += "  \xE2\x80\x94  " + g_windowBackend;
+    return t;
+}
+static void setLiveTitle(const std::string& rest) {
+    if (g_liveWin && !g_liveWin->closed()) g_liveWin->setTitle(liveTitle(rest));
+}
 // Human-readable name for a transport mode char (title bar + diagnostics).
 static const char* modeLabel(char m) {
     switch (m) {
@@ -5312,9 +5410,7 @@ static void liveWindowPlaceholder(int w, int h, const std::string& stage) {
     }
     // Re-title even when the window already exists: callers use this to advance the stage
     // ("preparing" -> "tessellating (3/8)" -> the render's own progress line).
-    if (!g_liveWin->closed())
-        g_liveWin->setTitle(stage.empty() ? g_windowTitle
-                                          : g_windowTitle + "  \xE2\x80\x94  " + stage);
+    setLiveTitle(stage);
 }
 
 static void liveWindowUpdate(const Film& f, double N, double expComp, bool absolute,
@@ -5335,11 +5431,11 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     // image the same way the ANSI preview does.
     std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr);
     g_liveWin->update(f.resX, f.resY, rgb);
-    // Reflect the render subject + mode + live progress in the title bar.
-    std::string t = g_windowTitle;
-    if (!g_windowMode.empty())     t += "  \xE2\x80\x94  " + g_windowMode;
-    if (status && *status)         t += "  \xE2\x80\x94  " + std::string(status);
-    g_liveWin->setTitle(t);
+    // Reflect the render subject + mode + live progress + device in the title bar.
+    std::string rest = g_windowMode;
+    if (status && *status)
+        rest += (rest.empty() ? "" : "  \xE2\x80\x94  ") + std::string(status);
+    g_liveWin->setTitle(liveTitle(rest));
     if (g_liveWin->closed()) g_stopRequested = 1;
     g_lastWindowPaint = std::chrono::steady_clock::now();
     const double cost = std::chrono::duration<double>(g_lastWindowPaint - tPaint).count();
@@ -5582,8 +5678,13 @@ static bool readBinaryPPM(const std::string& path, int& W, int& H,
 // `expComp` is the -exposure/-ev multiplier applied on top of the auto-exposure
 // (<= 0 means "plain auto"). It only affects a .ftbuf, whose linear film is still
 // tone-mapped here; a .ppm is already 8-bit sRGB and is copied through verbatim.
+// `lockAnchor` (optional, -exposure-anchor) is the shared auto-exposure anchor: >0 on
+// entry means reuse it instead of measuring this film's p99, and it is written back
+// when it starts at 0. Re-developing a directory of .ftbuf checkpoints through one
+// anchor is how a finished but flickering sequence is repaired WITHOUT re-rendering —
+// the checkpoints still hold the raw linear film, so only the tone map has to be redone.
 static int convertToPng(const std::string& inPath, const std::string& outPath,
-                        double expComp = 0.0) {
+                        double expComp = 0.0, double* lockAnchor = nullptr) {
     if (endsWithCI(inPath, ".ppm")) {
         int W = 0, H = 0; std::vector<uint8_t> rgb;
         if (!readBinaryPPM(inPath, W, H, rgb)) {
@@ -5618,9 +5719,11 @@ static int convertToPng(const std::string& inPath, const std::string& outPath,
         in.read((char*)f.xyz.data(),  (std::streamsize)(f.xyz.size()  * sizeof(Vec3)));
         in.read((char*)f.hits.data(), (std::streamsize)(f.hits.size() * sizeof(double)));
         if (!in) { std::fprintf(stderr, "error: %s truncated\n", inPath.c_str()); return 1; }
-        // Tone-map with the p99 auto-exposure (see note above), scaled by -ev if given.
+        // Tone-map with the p99 auto-exposure (see note above), scaled by -ev if given,
+        // or with the shared -exposure-anchor when one was supplied.
         // writeFilm prints the "wrote <out> ..." line, including the comp when != 1.
-        return writeFilm(outPath.c_str(), f, (double)std::max<long long>(Nph, 1), expComp) ? 0 : 1;
+        return writeFilm(outPath.c_str(), f, (double)std::max<long long>(Nph, 1), expComp,
+                         /*quiet*/false, lockAnchor) ? 0 : 1;
     }
     std::fprintf(stderr,
         "error: -topng converts .ppm and .ftbuf inputs; got '%s'.\n"
@@ -6438,6 +6541,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         }
     }
 #endif
+
+    // Now that the device is resolved, tell the title bar which one won. This is the single
+    // point where `useGpu` stops changing, so stamping here reports the device the frames
+    // are really traced on rather than the one `-device` asked for.
+    g_windowBackend = backendLabel(useGpu, nThreads);
 
     // Now that the device is resolved, warn if this render's BACKWARD layer will actually
     // run on the CPU tracer, which collapses `scene.media` to `backwardMedium()` (see the
@@ -7396,6 +7504,10 @@ static void printHelp(const char* prog) {
 "  -view EX,EY,EZ/LX,LY,LZ[/FOV]   ad-hoc eye/look-at[/fovY] camera; renders just it\n"
 "  -exposure|-ev <c>     override every camera's exposure compensation\n"
 "  -exposure-lock        one shared auto-exposure anchor across all rendered cameras\n"
+"  -exposure-anchor <v|file>  share ONE auto-exposure anchor across separate ftrace\n"
+"                        runs (a frame-per-invocation sequence): a number uses that\n"
+"                        anchor, a path is read if it holds one and written if not.\n"
+"                        Also accepted by -topng, to re-develop .ftbuf checkpoints.\n"
 "  -hdr                  also write a 32-bit float PFM beside -o (scene-linear, no\n"
 "                        exposure/gamma/clamp) so highlights stay measurable — a PNG\n"
 "                        clips every caustic core to the same white and loses its colour\n"
@@ -7515,7 +7627,9 @@ static void printHelp(const char* prog) {
 "\n"
 "Utilities (exit after running):\n"
 "  -topng|-convert <in> <out.png> [-ev <c>]   convert .ppm/.ftbuf to PNG\n"
-"                        (-ev re-develops a .ftbuf brighter/darker, no re-render)\n"
+"                        (-ev re-develops a .ftbuf brighter/darker, no re-render;\n"
+"                         -exposure-anchor <v|file> re-develops a whole flickering\n"
+"                         sequence through one shared anchor, also no re-render)\n"
 "  -review <base>        play a rendered frame sequence on the live window\n"
 "  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
@@ -7572,22 +7686,37 @@ static int run(int argc, char** argv) {
     // checkpoint). Kept before all scene/CLI setup so it is a pure utility path.
     if (argc >= 2 && (!std::strcmp(argv[1], "-topng") || !std::strcmp(argv[1], "-convert"))) {
         if (argc < 4) {
-            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> [-ev <c>] <output.png>\n",
-                         argv[0]);
+            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> [-ev <c>] "
+                                 "[-exposure-anchor <val|file>] <output.png>\n", argv[0]);
             return 2;
         }
         // This branch runs before the main parse loop, so -exposure/-ev has to be picked
         // up here or it is silently ignored (it was, until 0.102.1). Only meaningful for
         // .ftbuf, which still holds linear film and is tone-mapped on the way out; a .ppm
-        // is already 8-bit sRGB and is copied through untouched.
+        // is already 8-bit sRGB and is copied through untouched. Same for
+        // -exposure-anchor, which is what lets a whole directory of .ftbuf checkpoints be
+        // re-developed through ONE anchor (see ExposureAnchorFile).
         double convExp = 0.0;   // <=0 = plain p99 auto-exposure
-        for (int i = 4; i + 1 < argc; ++i)
+        std::string convAnchorArg;
+        for (int i = 4; i + 1 < argc; ++i) {
             if (!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev"))
                 convExp = std::atof(argv[++i]);
-        if (convExp > 0.0 && endsWithCI(argv[2], ".ppm"))
+            else if (!std::strcmp(argv[i], "-exposure-anchor"))
+                convAnchorArg = argv[++i];
+        }
+        const bool isPpm = endsWithCI(argv[2], ".ppm");
+        if (convExp > 0.0 && isPpm)
             std::fprintf(stderr, "warning: -ev ignored for a .ppm input (already 8-bit sRGB); "
                                  "it only applies to a .ftbuf's linear film\n");
-        return convertToPng(argv[2], argv[3], convExp);
+        if (!convAnchorArg.empty() && isPpm)
+            std::fprintf(stderr, "warning: -exposure-anchor ignored for a .ppm input (already "
+                                 "8-bit sRGB); it only applies to a .ftbuf's linear film\n");
+        ExposureAnchorFile convAnchor;
+        convAnchor.resolve(convAnchorArg);
+        int convRc = convertToPng(argv[2], argv[3], convExp,
+                                  convAnchorArg.empty() ? nullptr : &convAnchor.value);
+        if (convRc == 0) convAnchor.save(convAnchor.value);
+        return convRc;
     }
     // Rendered-sequence review player (no rendering): `ftrace -review <base>`.
     // Plays a directory of `<base><digits>.<ext>` frames on the live window/timeline,
@@ -7667,6 +7796,7 @@ static int run(int argc, char** argv) {
     Vec3   viewEye{0,0,0}, viewLook{0,0,0}, viewUp{0,1,0};
     double viewFov = 40.0;
     bool forceExposureLock = false;  // -exposure-lock: one shared auto-exposure anchor across all rendered cameras
+    std::string expAnchorArg;        // -exposure-anchor <val|file>: share that anchor across separate invocations too
     double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (modes A/B/C forward, R/D spp)
     double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (A/B/C, R/D)
     bool resume = false;          // -resume: continue an accumulated render from its .ftbuf checkpoint (A/B/C)
@@ -8092,6 +8222,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-see-through") || !std::strcmp(argv[i], "-seethrough") || !std::strcmp(argv[i], "-glass")) rasterSeeThrough = true;
         else if (!std::strcmp(argv[i], "-glass-clarity") && i + 1 < argc) { rasterClarity = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
+        else if (!std::strcmp(argv[i], "-exposure-anchor") && i + 1 < argc) expAnchorArg = argv[++i];
         else if (!std::strcmp(argv[i], "-stereo") && i + 1 < argc) {
             std::string m = argv[++i];
             for (auto& c : m) c = (char)std::tolower((unsigned char)c);
@@ -8269,6 +8400,17 @@ static int run(int argc, char** argv) {
         };
         if (!ensureOutDir("output", out)) return 2;
         if (!g_pmapSave.empty() && !ensureOutDir("-savemap", g_pmapSave)) return 2;
+    }
+
+    // -exposure-anchor: resolve the shared anchor BEFORE the camera list is built, because
+    // it implies -exposure-lock and the expGroup each camera gets is decided down there.
+    // Once resolved it rides the existing per-group anchor machinery (expAnchors[0]) — a
+    // pre-populated group anchor is exactly what the camera_path exposure-lock already
+    // means, so nothing in the render dispatch needs to know this came from a file.
+    ExposureAnchorFile expAnchorFile;
+    if (!expAnchorArg.empty()) {
+        expAnchorFile.resolve(expAnchorArg);
+        forceExposureLock = true;
     }
 
     bool prism     = !std::strcmp(sceneName, "prism");
@@ -9015,6 +9157,22 @@ static int run(int argc, char** argv) {
     // anchor (group -1) = per-frame auto.
     std::map<int, double> expAnchors;
 
+    // -exposure-anchor: seed group 0 (which -exposure-lock forced every camera into) with
+    // the shared anchor, and arrange to save it back when this invocation is the one that
+    // measured it. The writeback is a destructor rather than a line at the end of the
+    // function because the render dispatch below has a dozen early `return`s; RAII catches
+    // all of them without auditing each one, and it still runs on the Ctrl-C/-stop path
+    // (which unwinds through cudaGracefulShutdown rather than calling _exit).
+    if (expAnchorFile.value > 0.0) expAnchors[0] = expAnchorFile.value;
+    struct AnchorWriteback {
+        const ExposureAnchorFile& f;
+        const std::map<int, double>& anchors;
+        ~AnchorWriteback() {
+            auto it = anchors.find(0);
+            if (it != anchors.end()) f.save(it->second);
+        }
+    } anchorWriteback{expAnchorFile, expAnchors};
+
     // --- Exposure-lock metering plan (which frame each locked group meters from) --------
     // The `exposure_lock <selector>` on a camera_path/orbit/curve chooses the viewpoint the
     // whole group locks to (see CamSpec::EXPLOCK_*). Here we resolve that selector to the
@@ -9203,6 +9361,19 @@ static int run(int argc, char** argv) {
         const bool useGpuIso = false;
         if (rasterGpu) std::fprintf(stderr, "[raster] -raster-gpu needs a CUDA build; using CPU tessellation\n");
 #endif
+        // The raster preview never reaches runRender's device resolution, so stamp the
+        // title bar's device tag from ITS decision instead — otherwise a -raster run would
+        // be the one live window that never says what it is running on.
+        g_windowBackend = backendLabel(useGpuIso, nThreads);
+        // The -explore viewer switches device WITHIN a session — it shows the raster while
+        // you move and a traced image once you stop, and those two layers do not run on the
+        // same processor (mode W traces on the CPU; the PV_PT session is a CUDA one). So the
+        // interactive branches below re-stamp per frame from these, rather than inheriting
+        // the one label above, and the title bar tracks the switch live.
+        const std::string rasterBackend = backendLabel(useGpuIso, nThreads);
+        const std::string cpuBackend    = backendLabel(false, nThreads);
+        const std::string gpuBackend    = backendLabel(true,  nThreads);
+        (void)gpuBackend;
         if (useGpuIso)
             std::printf("[raster] GPU iso preview: primary-ray isosurface render on the GPU (no tessellation)\n");
         else
@@ -9242,11 +9413,8 @@ static int run(int argc, char** argv) {
             auto tessProgress = [&](int done, int total) {
                 if (total <= 0) return;
                 int pct = (int)std::lround(100.0 * done / total);
-                if (g_liveWin && !g_liveWin->closed()) {
-                    g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating (" +
-                                        std::to_string(done) + "/" + std::to_string(total) +
-                                        ", " + std::to_string(pct) + "%)");
-                }
+                setLiveTitle("tessellating (" + std::to_string(done) + "/" +
+                             std::to_string(total) + ", " + std::to_string(pct) + "%)");
                 auto now = std::chrono::steady_clock::now();
                 if (done == 0 || done == total ||
                     std::chrono::duration<double>(now - lastTick).count() >= 1.0) {
@@ -9363,9 +9531,8 @@ static int run(int argc, char** argv) {
                     std::chrono::duration<double>(now - meterTick).count() >= 1.0) {
                     if (g_liveWin && !g_liveWin->closed()) {
                         g_liveWin->update(mc.res, mc.resY, mimg);
-                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  metering exposure "
-                                            "(preview NOT locked yet) " +
-                                            std::to_string(meterDone));
+                        setLiveTitle("metering exposure (preview NOT locked yet) " +
+                                     std::to_string(meterDone));
                     }
                     std::printf("[raster] metering exposure %zu\n", meterDone);
                     std::fflush(stdout);
@@ -9559,10 +9726,9 @@ static int run(int argc, char** argv) {
             if (g_showWindow) {
                 if (!g_liveWin) g_liveWin = std::make_unique<LiveWindow>(W, H, g_windowTitle.c_str());
                 g_liveWin->update(W, H, img);
-                std::string title = g_windowTitle + "  \xE2\x80\x94  raster " +
-                                    (rc.name.empty() ? std::string("preview") : rc.name) + " (" +
-                                    std::to_string(frame + 1) + "/" + std::to_string(toRender.size()) + ")";
-                g_liveWin->setTitle(title);
+                setLiveTitle("raster " + (rc.name.empty() ? std::string("preview") : rc.name) +
+                             " (" + std::to_string(frame + 1) + "/" +
+                             std::to_string(toRender.size()) + ")");
                 if (g_liveWin->closed()) g_stopRequested = 1;
             }
             if (toRender.size() > 1) {
@@ -10893,7 +11059,8 @@ static int run(int argc, char** argv) {
                             drawOverlay(c, VW, VH, img);
                             g_liveWin->update(VW, VH, img);
                         }
-                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                        g_windowBackend = rasterBackend;
+                        setLiveTitle("eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")  [mode W: stop to render]");
                         traceDirty = true;
                         changed = false;
@@ -10976,12 +11143,13 @@ static int run(int argc, char** argv) {
                         g_liveWin->update(VW, VH, show);
                         tracingNow = (wRow > 0);   // keep spinning until the frame is complete
                         const std::string sppTag = wNeedSpp ? " " + std::to_string(wPass + 1) + " spp" : "";
+                        g_windowBackend = cpuBackend;   // mode W traces on the CPU tracer
                         if (tracingNow)
-                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  mode W" + sppTag + " " +
+                            setLiveTitle("mode W" + sppTag + " " +
                                                 std::to_string(100 * (VH - wRow) / std::max(1, VH)) +
                                                 "%  eye(" + fmt3(eye) + ")");
                         else
-                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  mode W" + sppTag +
+                            setLiveTitle("mode W" + sppTag +
                                                 "  eye(" + fmt3(eye) + ")  dir(" + fmt3(fwd) + ")");
                     }
                 }
@@ -11004,7 +11172,8 @@ static int run(int argc, char** argv) {
                             drawOverlay(c, VW, VH, img);
                             g_liveWin->update(VW, VH, img);
                         }
-                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                        g_windowBackend = rasterBackend;
+                        setLiveTitle("eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")  [trace: move to re-aim]");
                         traceDirty = true;
                         changed = false;
@@ -11023,7 +11192,8 @@ static int run(int argc, char** argv) {
                                                                   scene.absolute, &traceAnchor);
                             drawOverlay(c, VW, VH, img);
                             g_liveWin->update(VW, VH, img);
-                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  path-trace " +
+                            g_windowBackend = gpuBackend;   // the PV_PT session is a CUDA one
+                            setLiveTitle("path-trace " +
                                                 std::to_string(spp) + " spp  eye(" + fmt3(eye) + ")");
                             tracingNow = (spp < kTraceCapSpp);   // more to refine -> keep spinning
                         }
@@ -11037,7 +11207,8 @@ static int run(int argc, char** argv) {
                     // repaint, so the zero-copy present (which renders AND shows) is for real
                     // changes only; the warm frame keeps taking the ordinary render path.
                     if (changed && rasterPresent(c, VW, VH, ev, autoExp)) {
-                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                        g_windowBackend = rasterBackend;
+                        setLiveTitle("eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")");
                     } else {
                         std::vector<uint8_t> img =
@@ -11045,7 +11216,8 @@ static int run(int argc, char** argv) {
                         if (changed) {   // only a real change repaints the window
                             drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
                             g_liveWin->update(VW, VH, img);
-                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                            g_windowBackend = rasterBackend;
+                            setLiveTitle("eye(" + fmt3(eye) +
                                                 ")  dir(" + fmt3(fwd) + ")");
                         }
                     }

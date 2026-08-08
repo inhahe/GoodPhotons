@@ -5,6 +5,50 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### DEBT (2026-08-08, v0.157.0): auto-exposure anchors on a single fixed-rank order statistic (p99), which is discontinuous on a bimodal histogram
+
+`writeFilm` picks its gain as `eAuto = 0.9 / p99`, where p99 is the 99th percentile of
+per-pixel `max(r,g,b)` in scene-linear sRGB. That is stable on a unimodal image and
+**not** stable on one with a bright, compact specular/emitter population, because such a
+scene's luminance histogram is bimodal: the ordinary scene in one lobe, a near-empty gap,
+then a plateau of glints. While the highlight's *area* sweeps across 1% of the frame the
+p99 rank crosses the gap, and the anchor moves discontinuously even though nothing about
+the picture's actual brightness did.
+
+Measured on `png/pastel_jack_ring` (432 frames, **static** camera — only the gold ring
+rotates, so any global brightness change is by construction an artifact), reading the raw
+`.ftbuf` film rather than the developed PNGs. Frame-to-frame step of each statistic:
+
+| statistic | median step | p95 step | max step |
+|---|---|---|---|
+| `bg` (static corner pixels) | 0.53% | 1.53% | **2.23%** |
+| `p95` | 0.13% | 0.42% | **0.68%** |
+| `mean` | 0.33% | 1.18% | **1.80%** |
+| `median` | 0.16% | 0.45% | **0.59%** |
+| **`p99` (the anchor)** | 1.40% | 6.02% | **42.17%** |
+
+Every honest measure of the image is smooth; only the anchor jumps. The mechanism is
+confirmed directly — the tail has a plateau at 44.78e12 and "area above 6× p95" crosses
+exactly 1.0% at the flicker frames (0.830% @ f134 → 1.011% @ f138 → 1.060% @ f142 →
+0.950% @ f146 → 0.806% @ f149).
+
+**What shipped is a mitigation, not a fix to the statistic.** `-exposure-anchor
+<value|file>` (and loom's `stabilize_exposure`, which takes the sequence *median* anchor
+and re-develops every `.ftbuf` through `-topng`) makes a sequence share one gain, so the
+discontinuity can't surface as flicker. A single still is still metered by p99 and can
+still be anchored on an atypical glint — there is just no neighbouring frame to reveal it.
+
+**A real fix** would make the anchor continuous in the image. Options, cheapest first:
+blend a band of ranks (e.g. a weighted mean over p97–p99.5) so no single rank crossing a
+gap can move the result; or detect the bimodality explicitly (look for a density minimum
+in the log-luminance histogram above p95) and anchor to the *upper edge of the lower
+mode*, which is what a viewer actually reads as "the picture"; or carry an anchor low-pass
+across frames within a render group. The first is a few lines in `writeFilm` and would want
+a regression over the `pastel_jack_ring` checkpoints (they're on disk, and `-topng`
+develops one in milliseconds, so the test is cheap). Not done here because it changes the
+exposure of *every* existing render, which needs a deliberate re-baseline pass rather than
+a drive-by.
+
 ### DEBT (2026-08-08, v0.156.0): the loom viewer's prebake cache costs ~6.4 MB per frame, which caps a long clock well short of what "1024 MB" suggests
 
 §F8(b)'s `PlayCache` keeps each frame's **adopted** state, and on
