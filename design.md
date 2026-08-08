@@ -333,6 +333,15 @@ question is its per-step or per-frame cost against the loop it sits in.
 
 ### Morphology
 
+- **Anatomy comes from *fitting*, not from training — so conversion costs one training run.**
+  A captured animal's bones/joints/muscles are the morph vector of a pre-authored template,
+  estimated by P5's fitting half (an optimisation, hours, no RL). That vector exists — and is
+  editable — *before* policy training starts. Train once, conditioned on morph, randomised over a
+  **generous neighbourhood** of the fitted vector; every later edit inside that region is free, and
+  edits outside it are style-anchored fine-tunes (P6), not from-scratch retrains. The practical
+  rule: you never need to know the exact target creature at training time, only to choose the
+  randomisation *ranges* generously — and range width is nearly free, since training cost scales
+  with the command space's dimensionality, not its extent.
 - **The morph space is per-body-plan, not one global manifold.** You cannot interpolate a leg into a
   wing: the midpoint body has neither working limb, and no policy exists across a discontinuous
   reward landscape. Morph claims must always be qualified by body plan.

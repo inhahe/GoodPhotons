@@ -207,6 +207,16 @@ distribution.
 
 ## P5 — Video fitting  `[ ]`  ← the research risk
 
+- [ ] **Be clear that fitting yields TWO things, and they are consumed by different phases.**
+      (i) **The animal's anatomy** — the morph vector θ_animal (bone lengths, proportions, mass
+      distribution) of the pre-authored body-plan template that best explains the footage, fit
+      jointly with pose from silhouettes + keypoints. This is an *optimisation measured in hours*,
+      not RL training, and it is available **before** any policy training starts — which is what
+      makes P6's conversion pipeline and P8's anatomy editor work without training twice (see P6).
+      (ii) **The motion** — per-frame joint trajectories, which become AMP demonstration data.
+      The anatomy estimate is a prerequisite of the motion estimate (reprojection error is
+      meaningless through the wrong skeleton), so solve morph first on a few calm clips, then
+      freeze it and solve motion per clip.
 - [ ] 2D keypoints (DeepLabCut or SLEAP; some hand-labelling unavoidable)
 - [ ] Camera intrinsics/extrinsics; fit **directly in the simulator's own joint
       parameterisation** by minimising 2D reprojection error — this sidesteps an entire
@@ -216,8 +226,12 @@ distribution.
       *dog*, compare against the P2 mocap for the same gait, and report a hard error
       number. That says empirically whether the ambitious version is viable, or whether
       video should be demoted to style reference only.
-- [ ] Capture rig — **`notes/capture.md` now exists** (it was a dangling reference until 2026-08-06).
-      4 cameras minimum for a quadruped (they self-occlude far worse than humans), ≥120 fps.
+- [ ] Capture rig — **`notes/capture.md`; hardware is now DECIDED: 4× GoPro HERO 12 Black at
+      high fps** (user spec ~140 fps; see capture.md → "The decided rig" for the settings that are
+      load-bearing: HyperSmooth OFF, native wide FOV with a fisheye camera model fit in calibration
+      — never in-camera Linear dewarp — Protune-locked exposure, timecode sync ≠ genlock).
+      4 cameras minimum for a quadruped (they self-occlude far worse than humans, and in a messy
+      real environment the 4th view is what outvotes a hallucinated keypoint).
       Note that page's central rule: the rig has **two modes that must never share a recording** —
       motion (fast, whole-animal, whatever resolution survives the fps budget) and groom/appearance
       (stills, full sensor, close, controlled light, still subject). Same hardware, opposite settings.
@@ -230,6 +244,51 @@ distribution.
 - [ ] AMP discriminator trained on *realistic* motion, applied to the *stylized* body, to
       hold style in place through retargeting
 - [ ] Topology changes (extra limbs) — genuinely open
+
+### Converting a *captured* animal — order of operations, and the "train twice" worry
+*(added 2026-08-07. The worry, verbatim: "the only way to transform an animal is to include it
+into the training stage, and you can't get the bones, joints, muscles, etc. information to change
+it in the first place until after you've trained it — so you'd have to train it twice." The worry
+rests on one wrong premise, and the rest follows once it is removed.)*
+
+**The premise to remove: anatomy does not come from training.** The bones/joints/muscles of a
+captured animal are not an *output* of the expensive RL stage — they are the **morph vector of a
+template that existed before any camera rolled**, estimated by P5's *fitting* half (an optimisation,
+hours). So the anatomy is on the table, fully editable, **before** the first policy gradient. What
+training produces is only the *motion* that drives that anatomy.
+
+The order that makes conversion cost one training run:
+
+```
+1. author the body-plan template          (.ftcl rig + morph ranges — exists: canis)
+2. capture + FIT  →  θ_animal             (P5's anatomy half; cheap; no RL involved)
+3. [optional] GUI-edit anatomy NOW        (P8 editor works pre-training — tune/validate
+                                           give physical feedback with no policy at all)
+4. train ONCE, conditioned on morph,      (P4: randomise over a NEIGHBOURHOOD that
+   randomised around θ_animal              covers θ_animal, every anticipated edit
+                                           direction, and a generous margin)
+5. GUI-edit after training                (free inside the trained region; the same
+                                           policy walks the edited body — that is P4's
+                                           entire claim)
+6. edits that LEAVE the trained region    (P6 fine-tune: AMP discriminator on the
+                                           realistic motion holds the style — a
+                                           fine-tune, not a from-scratch retrain)
+```
+
+- [ ] **So the real design rule is: decide the morph *ranges* generously before step 4** — you do
+      not need to know the exact target creature at training time, only the *region* your edits will
+      live in. Randomisation cost scales with the dimensionality of the command space (see P10),
+      not with how wide each range is, so generosity is cheap. "Knowing the target during training"
+      collapses to "make sure the target is inside the randomised region" — a far weaker and far
+      cheaper requirement than it sounds.
+- [ ] **Train-twice is the exception path, not the architecture** — it happens only when a
+      *post-hoc* edit leaves the trained region, and even then step 6 is a style-anchored fine-tune.
+      Budget for one full training run plus fine-tunes, not N full runs.
+- [ ] **What genuinely cannot be edited for free: anything not in the morph vector.** A parameter
+      that was never symbolic (a hardcoded attachment point, a new joint, a topology change) is a
+      *different body plan*, and no amount of conditioning rescues it. This is the standing
+      constraint "the morph space is per-body-plan" wearing its practical face — and it is the
+      strongest argument for erring on the side of *more* symbolic parameters in the rig.
 
 ---
 
@@ -264,28 +323,46 @@ Fur is the **least novel thing in this project** — thousands of people have sh
 shipped muscle-actuated animal control fit from video. So it stays last and stays small. What
 follows is the scope, and just as importantly what is deliberately *excluded*.
 
-- [ ] **Gate: a curve primitive in ftrace.** Verified 2026-08-06 — ftrace has **none**: zero hits for
-      `fiber`, `ribbon`, `bezier`, `b-spline`, and all four `hair` matches are the English idiom
-      ("a hair negative"). Without one, fur must be triangle ribbons at ~64 tris/hair, i.e. 10⁸–10⁹
-      triangles for a dog (~1–10M hairs × 8–32 segments). Not viable. Curve primitive + its own BVH
-      is the entry ticket and nothing else starts until it exists.
+- [x] **Gate: a curve primitive in ftrace — SATISFIED 2026-08-07.** ftrace v0.151.0 added the
+      `curve` primitive (strands as round-cone chains, CPU **and** CUDA — 74× GPU on the fiber
+      workload, guarded by `-checkcurve` incl. an fp32-conditioning fix that a probe measured, not
+      guessed). v0.152.0 added the **`fur { on "<object>" … }` groom generator** (`src/fur.h`):
+      area-uniform roots over a named sphere/mesh/quad/triangle, closed-form strand shaping
+      (`lift`/`jitter`, `direction`+`comb`, `gravity`+`droop`, `curl`, `clump` via nearest-guide
+      Voronoi), emitting ordinary `Curve`/`CurveSeg` records so BVH/CPU/CUDA/raster needed zero new
+      code. Demo: `scenes/fur_creature.ftsl`, 308 506 strands over a sphere-built animal, CPU↔GPU
+      parity 0.18 %. v0.153.0 teaches loom to emit `Strand`. **Remaining renderer-side fur work now
+      lives in `../forward raytracer/TODO.md` §P2 (aggregate-BSDF LOD / cost) and §P3 (fiber
+      BCSDF)** — improving/optimising fur means working those two items, not building a primitive.
 - [ ] **Shading: Yan-style double-cylinder, not plain Marschner.** Marschner was derived for *human
       hair*. Animal fur has a **medulla** — a hollow scattering core — which is why Yan et al.
       (2015/2017) added the TT^s/TRT^s lobes. Plain Marschner on a dog reads as plastic doll hair.
+      *(Written down as ftrace TODO §P3; do it there.)*
 - [ ] **Inter-fiber multiple scattering (dual scattering, Zinke 2008) is not optional.** Light coats
       are *dominated* by it; white/cream fur without it renders dark and dead. This is the single
       most common "why does my fur look wrong", so budget for it up front rather than bolting it on.
+      *(Also ftrace §P3.)*
 - [ ] **Antialiasing / LOD is the real technical risk.** A hair is sub-pixel (often 1/5–1/50 of a
-      pixel), so in a path tracer this appears as **variance**, not jaggies — a ray hits a fiber or
-      misses and the two answers differ wildly. You don't antialias fur, you average it, expensively.
-      Past some distance individual fibers must give way to an aggregate volumetric BSDF, and making
-      that transition not pop is where the effort actually goes.
-      **Backward mode only** (`-mode L`): a forward/photon tracer is the wrong vehicle, because
-      photons cast from a light almost never usefully hit sub-pixel fibers.
+      pixel), so in a backward path tracer this appears as **variance**, not jaggies — a ray hits a
+      fiber or misses and the two answers differ wildly. You don't antialias fur, you average it,
+      expensively. Past some distance individual fibers must give way to an aggregate volumetric
+      BSDF, and making that transition not pop is where the effort actually goes.
+      **CORRECTED 2026-08-07 — fur is NOT backward-mode-only; the earlier claim here was measured
+      and retracted** (ftrace §P2). "Sub-pixel" is a *camera-side* statement; from the **light's**
+      side a coat is a dense mat covering a large solid angle — one of the easiest targets in the
+      room — and forward modes splat flux, area-averaging every pixel by construction, so their
+      per-pixel error follows flux, not geometric density. Measured on `fur_creature.ftsl`: the
+      fur-vs-bare-room error penalty is **3.00× forward vs 4.56× backward** — the forward penalty
+      is the *smaller*. The aggregate LOD is still worth building, but in forward modes it buys
+      **cost**, not variance. Render fur in whichever mode the shot wants.
 - [ ] **Procedural groom, driven by the anatomical layer — LOCKED DESIGN DECISION, decided now
-      even though the work is late.** The groom (fiber generation, guide curves, clumping, density,
-      length, guard-hair vs underfur populations, direction field) must be *parameterised by the
-      anatomy*, never hand-painted. Two reasons, and the second is the load-bearing one:
+      even though the work is late.** *(Status 2026-08-07: the mechanical half now exists — ftrace's
+      `fur { }` block **is** a small-parameter-vector procedural groom, which is exactly the shape
+      `notes/capture.md`'s analysis-by-synthesis fitting wants. What remains ours is the
+      **anatomy→groom mapping**: driving those parameters — especially the direction field — from
+      muscle topology / strain / contact history instead of hand-set constants.)* The groom (fiber
+      generation, guide curves, clumping, density, length, guard-hair vs underfur populations,
+      direction field) must be *parameterised by the anatomy*, never hand-painted. Two reasons, and the second is the load-bearing one:
       1. it's the only genuinely novel part of the fur work — direction following muscle topology,
          clumping from strain and contact history, which is the "we own both layers" payoff;
          **and it makes the groom *fittable from photographs*** — a procedural groom is a ~10–30
@@ -573,6 +650,50 @@ seen those names as controls.
       §F8 there; the pacing lesson (bake-rate-paced play vs. prebaked play) transfers directly.
 - [ ] **Bar:** a person can find a good-looking, physically-valid animal by dragging, in one sitting,
       without reading a table.
+
+### The anatomy-transform editor — turn a *captured* animal into another animal by dragging
+*(added 2026-08-07 — asked for explicitly.)* The slider panel above is already this editor's core;
+three additions turn it from "explore morph space" into "transform this dog":
+
+- [ ] **Load a fitted animal as the working point.** Open θ_animal from P5's fitting stage and edit
+      *from* it, rather than from the template default. "Editing bones, joints, muscles and
+      everything else" then means editing the symbolic parameters — which is why P6's closing rule
+      (err on the side of more symbolic params; muscle attachments and strengths included, via P3's
+      grammar) is a prerequisite of this editor, not a nicety.
+- [ ] **Show the trained region on every slider.** Each parameter renders its P4 randomisation
+      interval: inside = the existing policy drives the edited body *right now*; outside = flagged
+      "leaves trained region — P6 fine-tune before this moves". This is the "train twice" worry
+      (see P6) converted into a visible, per-edit cost indicator instead of a surprise after a
+      wasted training run.
+- [ ] **Two lifecycle modes, same UI.** *Pre-training:* edits get physical feedback only
+      (tune/validate — sag, support, buckling), useful for step 3 of P6's pipeline. *Post-training:*
+      the policy runs live while you drag, so you see the edited body *move*, which is the real
+      acceptance test of a morph edit.
+- [ ] **Bar:** load a fitted dog; drag it to jackal proportions and the trained policy trots on
+      unchanged; drag it toward giraffe proportions and the UI says which sliders left the trained
+      region *before* any compute is spent.
+
+### The timeline editor — a shot's knobs over time, on a rasterized strip
+*(added 2026-08-07 — asked for explicitly.)* Not a pose editor: **the tracks hold command channels,
+and the policy synthesizes the motion under them.** This is design.md's directability section made
+concrete — you direct the inputs, sim owns the consequences, and the UI is honest about causality.
+
+- [ ] **Layout.** A rasterized preview strip (thumbnails — MuJoCo offscreen at first, ftrace
+      `-raster-gpu` once P7's `emit_ftsl.py` exists) over one track per channel P10 defines:
+      level-1 knobs (speed, heading), the affect vector, gaze target, level-3 part goals as spans,
+      persistent-state write ports (fatigue, wetness, …) as step/ramp events — the "seek control"
+      from P10's state section gets its UI here — and level-4 hard constraints as markers.
+- [ ] **Causality is the design center.** An edit at time t changes *nothing before t* and
+      invalidates *everything after it* — physics propagates forward only. Implementation: periodic
+      sim-state checkpoints along the timeline; an edit re-simulates from the nearest checkpoint
+      ≤ t as a **latest-wins one-slot job** (the LoomBridge pattern a third time), repainting the
+      strip as frames land. A drag on a knob curve costs one re-sim, not one per mouse event.
+- [ ] **Level-4 markers trigger the offline pass.** "Left forefoot *here* at t=1.2 s" is not a knob
+      — placing such a marker schedules the MuJoCo-MPC trajectory-optimisation pass (P10 level 4)
+      over its span, and the strip renders that span distinctly until it is solved.
+- [ ] **Bar:** scrub a trained gallop; drag the speed curve down across two seconds and write
+      fatigue = 0.8 at the cut; the re-simmed strip shows the animal breaking to a heavy, short
+      trot — nobody posed anything.
 
 ---
 
