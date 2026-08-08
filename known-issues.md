@@ -619,15 +619,39 @@ reasons, both measured rather than assumed, and either one alone is fatal:
    correct image content type — that proxy is the entire reason the GIF works.
 
 **Consequence, which is why both files are committed and both are `.gitignore` exceptions:**
-the animated GIF (320², 20 fps, 3.3 MB) is the *only* thing that plays on the repo page, so it
+the animated GIF (320², 20 fps, 2.74 MB) is the *only* thing that plays on the repo page, so it
 is the embed; the MP4 (480², 60 fps, 3.4 MB) is the full-quality download linked beside it.
 An animated WebP was built and tested first (2.78 MB, better quality per byte) and **discarded**
 — raw serves `.webp` as `text/plain`.
 
-**If the GIF ever needs re-encoding, use gifski, not ffmpeg's palettegen.** Same clip:
-ffmpeg palettegen bottomed out at 5.3 MB for acceptable quality; gifski 1.7.1 (installed via
-npm) hit 3.27 MB at 320²/20 fps/`--quality 65` with visibly less banding on the gyroid glass.
-Command shape: `gifski -o pastel_jack_ring.gif --fps 20 --width 320 --quality 65 frames/*.png`.
+**Re-encoding is no longer a hand-typed command — it is `loom.drive.assemble_gif_gifski`.**
+Use gifski, not ffmpeg's palettegen: on this clip palettegen bottomed out at 5.3 MB for
+acceptable quality, while gifski 1.7.1 hits 2.74 MB at 320²/20 fps/`--quality 65` with visibly
+less banding on the gyroid glass. All three jack examples (`jumping_jack.py`, `pastel_jack.py`,
+`glowing_jack.py`) now call `assemble_gif_gifski(pngs[::GIF_STRIDE], …, fps=GIF_FPS,
+width=GIF_WIDTH, quality=GIF_QUALITY)`, so re-running the example reproduces the committed GIF
+**byte-for-byte** (verified with `cmp`); it falls back to `assemble_gif_ffmpeg` with a printed
+notice if gifski is absent.
+
+*Trap that `find_gifski()` exists to absorb:* `npm install -g gifski` does **not** put gifski on
+PATH on Windows — the package declares no `bin` entry, so `shutil.which("gifski")` fails even
+on a correct install. The real executable is at
+`<npm-global>/node_modules/gifski/bin/{windows|macos|debian}/gifski[.exe]`, and `find_gifski()`
+probes those platform-mapped locations after `which`.
+
+**This GIF is also the regression evidence for the auto-exposure flicker fix.** Measured with
+`scraps/gif_steps.py` (frame-to-frame relative step of the whole-frame mean, and of a static
+background patch nothing ever occupies — the camera and room are static, so any step there is
+pure exposure artefact):
+
+| | frame mean p95 / max | static bg p95 / max |
+|---|---|---|
+| old GIF (pre-fix frames) | 7.974% / 25.953% | 12.276% / 51.172% |
+| new GIF (post-fix frames) | 0.654% / 0.958% | 0.028% / 0.064% |
+
+Source PNGs measure at 0.243% / 0.419% (frame mean) with `scraps/gif_flicker_check.py`, so what
+little step remains in the GIF is palette quantisation, not exposure. Re-run either script
+before replacing the README asset.
 
 ### FIXED (2026-08-07, loom-only, no binary change): a loom example that imports a SIBLING example is unloadable by `loom.viewer.load_build` — so `python -m loom.anim` and the native viewer could not open it
 
