@@ -30,9 +30,15 @@ Three links are genuinely thin, and they are where effort should go:
 1. **Muscle-actuated control for *animals*, at scale.** The impressive muscle-RL work is
    almost entirely human. Animal musculoskeletal models exist, but they were built for
    biomechanical *analysis*, not to sit inside a massively-parallel RL loop.
-2. **Physics-based control fit from in-the-wild monocular *animal* video.** SFV did this
-   for humans — helped enormously by SMPL (a canonical parametric body) and strong human
-   pose estimators. Animals have neither.
+2. **Physics-based control fit from real *animal* video.** SFV did this for humans —
+   helped enormously by SMPL (a canonical parametric body) and strong human pose
+   estimators. Animals have neither, so this project authors its own parametric body (the
+   rig) and fits it. *(Re-rated 2026-08-08: the decided 4-camera capture rig makes the 3D
+   recovery a triangulation problem, not the ill-posed monocular lifting this bullet was
+   written about — the residual risk is keypoint quality and anatomy identifiability, not
+   reconstruction; see todo.md P5 → "The implementation plan". In-the-wild monocular
+   remains the stretch ambition, downstream of P5: the multi-view pipeline produces the
+   paired (video, 3D-motion) data a monocular lifter would train on.)*
 3. **Style-preserving morphology transfer for learned controllers.** Especially under
    muscle actuation, where changing the body changes the *actuators themselves*.
 
@@ -44,7 +50,9 @@ in that gap.
 **The novelty map and the risk map are the same map.** Video fitting is both the most
 novel link and the most likely to disappoint. That is not a coincidence, and it dictates
 the staging in `todo.md`: build the well-trodden 80% fast, then push on the hard parts —
-and arrive at video already holding clean mocap of the same gaits as a yardstick.
+and arrive at video already holding clean mocap of the same gaits as a yardstick. *(The
+4-camera rig decision has since shrunk the reconstruction half of that risk — the staging
+survives on the yardstick argument; todo.md P5 carries the re-rating.)*
 
 ## Architecture
 

@@ -16,12 +16,18 @@ off, so they are not tasks; read them before adding anything here that they woul
 
 ## The ordering question (read this first)
 
-**Yes — video comes late, deliberately.** Monocular video → reliable 3D animal motion is
-simultaneously the *most novel* and the *most likely to disappoint* link in the whole
-system. Everything else is well-trodden. So the plan front-loads the parts that are known
-to work, and arrives at video with a working simulator, a working controller, and — this
-is the point — **a ground-truth yardstick**: public dog mocap of the same gaits, so the
-video pipeline can be scored in centimetres instead of vibes.
+**Yes — video comes late, deliberately.** Video → reliable 3D animal motion was rated the
+*most novel* and the *most likely to disappoint* link in the whole system when this order
+was set — an assessment made for **monocular** input. *(Re-rated 2026-08-08: the decided
+4-camera rig (capture.md) turns 3D recovery into triangulation rather than monocular
+lifting, so the reconstruction half of that risk shrank; what stays risky is keypoint
+quality in clutter and anatomy identifiability — see P5 → "Monocular, re-rated". The
+ordering below still stands on the yardstick argument, but P5 no longer *needs* to be
+last; pull it earlier if logistics allow.)* Everything else is well-trodden. So the plan
+front-loads the parts that are known to work, and arrives at video with a working
+simulator, a working controller, and — this is the point — **a ground-truth yardstick**:
+public dog mocap of the same gaits, so the video pipeline can be scored in centimetres
+instead of vibes.
 
 The order is therefore:
 
@@ -207,6 +213,10 @@ distribution.
 
 ## P5 — Video fitting  `[ ]`  ← the research risk
 
+*(The checkboxes below are the intent. The load-bearing decisions — the optimiser, the objective
+term by term, the keypoint↔rig interface, what a θ evaluation costs — are pinned in **"The
+implementation plan"** at the end of this section, added 2026-08-08.)*
+
 - [ ] **Be clear that fitting yields TWO things, and they are consumed by different phases.**
       (i) **The animal's anatomy** — the morph vector θ_animal (bone lengths, proportions, mass
       distribution) of the pre-authored body-plan template that best explains the footage, fit
@@ -235,6 +245,134 @@ distribution.
       Note that page's central rule: the rig has **two modes that must never share a recording** —
       motion (fast, whole-animal, whatever resolution survives the fps budget) and groom/appearance
       (stills, full sensor, close, controlled light, still subject). Same hardware, opposite settings.
+
+### The implementation plan *(added 2026-08-08)*
+
+*(This subsection exists because the checkboxes above stopped at intent: no optimiser named, no
+objective terms, no silhouette source or metric, no keypoint↔rig correspondence, no statement of
+what one candidate-anatomy evaluation costs. Those are the load-bearing decisions. Same spirit as
+capture.md: decide, and write down why, so the decision can be wrong in public.)*
+
+#### The framing that makes the optimiser question easy: fitting is kinematics, not dynamics
+
+MuJoCo's standard build is not differentiable, and the reflex is to pick between MJX/JAX, finite
+differences, and CMA-ES *for the whole problem*. Wrong frame — **nothing in the fit needs to
+differentiate the dynamics.** The pose problem is: joint configuration q → site positions
+(forward kinematics) → camera projection → residual against 2D evidence. The standard build
+already gives the FK map *and its exact analytic Jacobian* — `mj_kinematics` + `mj_jacSite`
+(∂ site-position / ∂ qpos) — and the calibrated fisheye projection (capture.md) is closed-form
+differentiable. So the solver splits along the anatomy/pose line the section above already drew:
+
+- **Pose, per frame: damped Gauss-Newton (Levenberg–Marquardt)** over ~37 unknowns (the rig's
+  ~31 articulation DOFs + the 6-DOF free root), exact Jacobians, warm-started from the previous
+  frame's solution; 5–15 iterations/frame. This is standard model-based markerless mocap (the
+  same shape as OpenSim IK / Anipose), deliberately boring.
+- **Anatomy, outer loop: CMA-ES over the morph vector** (26 params for canis) — the same call
+  capture.md already made for the ~20-parameter groom, for the same reason: derivative-free,
+  low-dimensional, and the inner objective (converged pose-fit residual as a function of θ) is
+  noisy and non-smooth — RANSAC gates flip, silhouette contours change topology. Default
+  population λ = 4+⌊3·ln 26⌋ = 13; budget a few hundred generations.
+- **MJX is explicitly NOT required.** It becomes interesting only if E_phys (below) is ever
+  promoted from a post-hoc gate to an in-loop term needing dynamics gradients. Don't build the
+  differentiable version first — that is capture.md's "don't build a differentiable renderer"
+  rule making its second appearance.
+
+**The solve runs in two stages per clip:** (1) per-frame LM, temporally chained, on
+E_kp + E_sil + E_lim; (2) one batch LM over the whole clip adding E_temp — its normal matrix is
+block-tridiagonal in time, so this is cheap — with E_phys then evaluated **once** on the smoothed
+trajectory, never inside LM iterations.
+
+#### The objective, term by term (initial weights stated so they can be wrong in public)
+
+- **E_kp — keypoint reprojection** (weight 1, the reference scale). Huber, δ = 2 px, on
+  *undistorted keypoints* (capture.md: never undistort frames), scaled by detector confidence.
+  A view is gated per-keypoint by capture.md's RANSAC triangulation: an outvoted view
+  contributes **zero**, not a residual — a hallucinated keypoint must not pull on the skeleton.
+- **E_sil — silhouette** (weight 0.3). *This is the term that carries the anatomy*: keypoints
+  constrain the skeleton but say nothing about `trunk_radius`, `limb_gracility`, or the belly —
+  girth lives only in the contour, so without E_sil the outer CMA-ES loop is blind to half the
+  morph vector. Source: per-view video segmentation (SAM2-class, prompted once per clip per
+  view; background subtraction as the fallback in a controlled space). Metric: one-directional
+  distance-transform chamfer — per frame/view, precompute the DT of the observed silhouette
+  boundary once; sample the projected occluding contours of the model's capsule geoms; each
+  sample does a bilinear DT lookup (which is also its analytic gradient). Model→observed
+  direction only: robust to segmentation holes and clutter, O(#contour samples), and needs no
+  rasteriser and no soft renderer.
+- **E_temp — temporal smoothness** (weight 0.05; stage-2 only). Second differences of qpos,
+  per-DOF normalised by the authored joint range; first differences on root translation. High fps (capture.md's 140+) is what lets plain second differences do the work
+  a motion prior would otherwise be needed for.
+- **E_lim — joint-limit barrier** (weight 0.01). Log-barrier on the ranges already authored in
+  `canis.ftcl` — those ranges gain their third consumer (after domain-randomisation bounds and
+  conditioning normalisation), which is more evidence they were worth authoring once, centrally.
+- **E_phys — physics plausibility, as a GATE, not a loop term.** On the stage-2 trajectory:
+  (a) implied torques from `mj_inverse` within a strength envelope scaled from tune.py's
+  statics (`tau_static`/`tau_ref`); (b) no floor penetration; (c) stance-foot slip below a
+  threshold while in contact. Frames/clips failing the gate get flagged or down-weighted as AMP
+  demonstrations. Promote to an in-loop penalty only if gating proves too blunt — that is the
+  moment MJX earns consideration, not before.
+- **Weight calibration is the yardstick's first job.** Before any real footage: replay the P2
+  public dog mocap through a *synthetic* copy of the rig — project ground-truth motion through
+  the four calibrated camera models, corrupt with measured DLC noise and dropout — and tune the
+  four weights until the ground truth is a fixed point of the solve within tolerance. Then
+  freeze them. This same replay is the "validation that makes this step honest" checkbox above,
+  and it runs before the pipeline ever sees a real dog.
+
+#### Anatomy before motion, and what one θ evaluation actually costs
+
+Per CMA-ES candidate θ: regenerate the model **once** (build + tune.py). tune.py is one-shot
+statics — seat the feet, one `mj_inverse`, mass-matrix reads — milliseconds, *not* a closed-loop
+or RL process, so it is entirely affordable per candidate (and only E_phys even consults its
+output; the kinematic terms need only geometry). `validate.py`'s collapse-counting never runs
+inside the fit. Then pose-fit a fixed calm-clip subset (~300 frames: every 4th frame of a few
+standing/walking clips), warm-started from the best-so-far member's trajectory. Seconds per
+candidate ⇒ 13 × a few hundred generations = the "hours, not RL training" the section above
+promises — and that budget holds *because of* the warm starts; cold inner solves would make it
+days. Morph first on the calm clips, freeze θ, then solve motion per clip, exactly as already
+stated.
+
+**Initialisation is nearly free, and this is where the 4-camera decision pays.** RANSAC-
+triangulated keypoints give 3D limb-segment lengths *directly*: θ₀ = per-segment medians over
+the calm clips, q₀ = bone-length-aware analytic IK on the triangulated points. CMA-ES polishes;
+it does not search blind.
+
+**Identifiability honesty:** `body_mass` and the mass *distribution* are kinematically invisible
+— no reprojection or silhouette term sees them; they enter only through the E_phys gate, weakly.
+So **weigh the animal** (one number, a bathroom scale) and let the rig's density model
+distribute it. Girth comes from E_sil; lengths from triangulation; mass from a scale. Do not
+pretend video recovers what it cannot.
+
+#### The keypoint↔rig interface must be authored — and the rig cannot express it yet
+
+`creaturelab` currently has **no site support at all**: zero `site` occurrences in
+`emit_mjcf.py`, `schema.py`, or `rigs/canis.ftcl` (checked 2026-08-08). `mj_jacSite` needs
+sites. Concrete work items:
+
+- [ ] **Sites in the grammar/schema/emitter**: `site "name" { on <bone>  pos <expr expr expr> }`
+      with positions written in morph parameters like every other dimension in the rig — a site
+      at the lateral humeral epicondyle must move when `humerus_len` does; a numeric offset goes
+      stale under morph, which is this project's founding rule applied to landmarks. Emit as
+      MJCF `<site>`; list them in `rig_report.py`.
+- [ ] **`notes/keypoints.yaml` — the single source of truth** for the correspondence: DLC/SLEAP
+      keypoint name → rig site name, per-keypoint σ_px, class `rigid|soft` (soft — belly,
+      mid-tail — gets a wide Huber), schema-versioned. The DLC/SLEAP project config is
+      *generated from this file*; the two ends of the interface never restate each other.
+- [ ] **canis v1 keypoint set (~21)**: nose, occiput, withers, croup/tail-base, tail-tip, and
+      per leg ×4: {shoulder|hip point, elbow|stifle, carpus|hock, paw}.
+
+#### Monocular, re-rated *(this resolves an inconsistency the plan carried for two days)*
+
+The ordering rationale at the top of this file — and design.md's thin-link #2 — were written
+when the input was in-the-wild **monocular** video: 2D→3D *lifting* through a learned prior,
+ill-posed, the SFV-for-animals gap. The 2026-08-06/07 rig decision quietly changed the problem:
+four calibrated 140-fps views make 3D recovery a **triangulation** problem, and multi-view
+model-based fitting is well-trodden. What genuinely remains risky in P5: (a) animal keypoint
+detector quality in a messy environment, (b) anatomy identifiability (girth/mass — addressed
+above), and (c) downstream, whether AMP + muscles can imitate the recovered motion. Not the 3D
+lifting. Consequences: **P5 may be pulled earlier** if logistics allow — the P2-first yardstick
+argument still holds and costs nothing to keep — and **monocular is restated as a separate,
+later ambition**, downstream of P5 rather than P5 itself: the multi-view pipeline mass-produces
+exactly the paired (video, 3D-motion) data a monocular lifter would train on. design.md and the
+ordering block at the top of this file are updated to match.
 
 ---
 
