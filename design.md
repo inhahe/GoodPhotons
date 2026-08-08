@@ -3601,3 +3601,37 @@ gates: ship it the moment the hole exists, delete it only by filling the hole.
   scratch scripts → `scraps/`. Renders always launched with `-keepwindow`
   (+ `-checkpoint`/`-interval`) and outside the Bash sandbox so the live window is
   visible.
+
+## `creature/` — the simulated-animal subproject
+
+A **second, self-contained project living in this repo**, not part of the renderer.
+It builds physically-simulated animals whose motion is *learned* rather than keyframed
+(articulated skeleton → muscle/tendon actuators → soft tissue → fur, driven by a neural
+controller). It has its **own** `design.md`, `known-issues.md` and `todo.md` — those are
+authoritative for it, and this file does not duplicate them. Layout: `ftcl/` (lexer,
+parser, expression evaluator for the `.ftcl` creature-description language), `creaturelab/`
+(schema, model build, MJCF emitter for MuJoCo, tuning, validation), `rigs/` (`.ftcl`
+sources, e.g. `canis.ftcl`), `tools/`, `tests/` (28 pytest cases).
+
+**It is Python with a heavy native stack** — MuJoCo 3.11 and a CUDA-13 build of Torch —
+so unlike the renderer it needs a virtualenv, and `requirements.txt` pins it (including
+the pytorch cu130 extra index, without which `torch==2.13.0+cu130` will not resolve). The
+`.venv/` is gitignored and *not* reproducible from the repo alone; recreate it from
+`requirements.txt`. `creature/.gitignore` is its own and its patterns are relative to
+that directory, so it keeps ignoring `out/`, `scraps/`, `.venv/` and `*.log` correctly
+now that it is nested — the root `.gitignore`'s equivalents are anchored (`/out/`,
+`/scraps/`) and deliberately do *not* reach into it.
+
+**It arrived by `git subtree add --prefix=creature`, not by copying**, so all 15 of its
+original commits are in this repo's history rather than being flattened into one "import"
+commit — those messages are substantive design records (the armature-measurement fix, the
+capture-rig decision) and were worth keeping. The consequence to know: `git log` now
+interleaves creature and renderer commits by date, so use `git log -- creature/` to see
+just one side. Its checkout also normalised six files from CRLF to LF, matching this
+repo's `core.autocrlf=input`; content is otherwise byte-identical.
+
+**The naming collision to not trip over:** `creature/` (this subproject) is unrelated to
+the renderer's *fur creature* — `scenes/fur_creature.ftsl`, `fur_creature_gi.png` and the
+`fur { }` groom generator in `src/fur.h`. The latter is a shipped ftrace demo scene; the
+former is a simulation project that does not yet feed it. Nothing in `src/` or `scenes/`
+references `creature/`.
