@@ -1293,6 +1293,40 @@ fur "ball_coat" {
 | `curl_freq <n>` | turns over the strand's length. Default `3` |
 | `clump <0..1>` | blend toward the nearest tuft guide. Default `0` (off) |
 | `clump_size <l>` | tuft **radius** — one guide per `π·clump_size²` of surface. Default `0.02` |
+| `bald "<sphere>" [margin]` | a **named sphere already in the scene** that no strand may enter, optionally grown by `margin`. Repeatable |
+| `bald <x> <y> <z> <r>` | the same as an explicit centre + radius, for a zone that isn't an authored sphere |
+
+**`bald` is how features stay bare.** A coat is grown per body *part*, but the things that
+must not be furred — an eye, a nose leather, a scar — are separate little spheres sitting
+*on* that part, and the part's groom does not know they are there. It roots area-uniformly
+over the whole target, including the ring of skin the eye overlaps, and every strand rooted
+around that ring then grows straight across the eyeball. Making the eye stand *proud* of
+the coat does not help: that only stops it being buried. `bald` culls the hairs instead:
+
+```
+sphere "eye_l" { center 0.4731 0.2026 0.8037  radius 0.014  material eye }
+
+fur "coat_head" {
+    on "head"   material coat   density 450000
+    length 0.014
+    bald "eye_l" 0.001   bald "eye_r" 0.001    # 1 mm margin stops hairs grazing the rim
+}
+```
+
+Naming the sphere (rather than repeating its coordinates) is the point: the bare patch
+stays welded to the feature instead of becoming a second copy that rots when the face
+moves. Three properties worth knowing:
+
+- **The whole strand is tested, not just its root** — and span-wise, not point-wise, so a
+  zone smaller than the gap between two control points can't be skewered. A hair rooted
+  outside the zone that arcs through it under `droop`/`comb`/`clump` is exactly the hair
+  that shows on an eyeball, so culling only by root would defeat the parameter.
+- **It is tested after clumping**, because clumping is what drags a tip sideways into a
+  zone its own root pointed clear of.
+- **It cannot bias the coat.** Roots are still drawn area-uniformly and every survivor is
+  untouched, so the fur outside a zone is bit-for-bit what it was without one — the count
+  simply drops. The load line reports how many went, so a zone that ate the whole groom is
+  visible rather than inferred.
 
 **Roots are area-uniform, always.** Over a mesh the generator samples a triangle
 proportional to its area and then warps the barycentrics, so a low-poly belly and a dense
@@ -1327,6 +1361,7 @@ Each block reports what it made:
 
 ```
 [fur] "lawn_grass" on "lawn": 1622 strands, 3244 segments (mesh 0.1352 m^2)
+[fur] "coat_head" on "head": 21126 strands, 126756 segments (sphere 0.04831 m^2), 611 culled by 2 bald zones
 ```
 
 Worked examples: `scenes/fur_basics.ftsl` (a furred ball, a clumped one, a curled one,

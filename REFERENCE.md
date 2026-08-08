@@ -1874,6 +1874,17 @@ The full key list is in FTSL.md → **§8.7 `fur`**. The shaping controls are `l
 `jitter` (growth direction), `direction` + `comb` (combing and wind), `gravity` + `droop`
 (sag), `curl` + `curl_freq` (a helix), and `clump` + `clump_size` (tufts).
 
+**`bald` keeps features bare.** A coat is grown per body *part*, but an eye or a nose is a
+separate little sphere sitting *on* that part, and the part's groom roots area-uniformly
+over the ring of skin it overlaps — so every strand rooted around the eye grows straight
+across the eyeball, and no `length`/`lift`/`comb` fixes it, because the problem is where
+the roots are, not which way they point. `bald "eye_l" 0.001` (a named scene sphere plus an
+optional margin, or an explicit `<x> <y> <z> <r>`; repeatable) culls any strand that
+reaches into that volume. The test is span-wise over the *whole* strand and runs *after*
+clumping, so a hair that merely arcs through under `droop`/`comb`/`clump` goes too;
+survivors are untouched, so the coat outside a zone is bit-for-bit unchanged and only the
+count drops. The load line reports the cull.
+
 **It is not a new kind of geometry.** The generator emits exactly the `Curve`/`CurveSeg`
 records a hand-written `curve` produces, so the BVH, the CPU tracer, the CUDA megakernel
 and the raster preview need no new code — everything above about round cones, bases,
@@ -1900,7 +1911,7 @@ while tips converge. Guides are located through a CSR uniform grid rather than b
 the root cell — hashing produces cube-shaped tufts on a grid, nearest-guide produces
 Voronoi tufts, which is what hair does.
 
-**Correctness.** `ftrace -checkfur` runs seven sections: roots lying on the target surface
+**Correctness.** `ftrace -checkfur` runs eight sections: roots lying on the target surface
 (off-plane distance, in-triangle containment, sphere radial error); area-uniformity (a 3:1
 area split must produce a 3:1 strand split, the mean barycentric must be ⅓ rather than the
 ½ an unwarped map gives, and `density × area` must be the exact count); determinism, with
@@ -1909,11 +1920,17 @@ and the guide rng by forcing the guide count to one at full clump strength, so e
 that guide's tip; growth direction never pointing into the skin, with lengths inside the jitter window
 and the shaped arc inside its analytic bound; clumping collapsing tip spacing while moving
 no root; the emitted chain being well-formed (segment count, contiguity, monotone taper and
-`u`, correct back-pointers); and a regression section for the load-order trap below. Each
+`u`, correct back-pointers); a regression section for the load-order trap below; and `bald`
+zones — no surviving segment inside a zone, survivors bit-for-bit unchanged from the same
+seed grown without one, and a zone covering the whole target leaving nothing. Each
 section is mutation-tested — a deliberate break in `fur.h` must make the section that owns
-it fail — and that mutation run is why the determinism section now splits the two seed
-paths: with clumping on, either path alone moving is enough to pass, so a build that had
-stopped seeding the *strands* from `spec.seed` slipped through the original test.
+it fail — and that mutation run has twice caught a test that could not fail. It is why the
+determinism section splits the two seed paths (with clumping on, either path alone moving is
+enough to pass, so a build that had stopped seeding the *strands* from `spec.seed` slipped
+through), and why the `bald` section grows a second zone that **floats clear of the skin**,
+containing no roots at all: the original zone sat on the surface and swallowed the roots of
+everything crossing it, so culling by root alone — exactly the bug `bald` exists to prevent —
+passed it.
 
 **Load-order trap (fixed, and pinned).** The deferred `fur` sweep runs during scene
 *loading*, but `Tri::finalize()` — which computes geometric normals and back-fills absent

@@ -81,9 +81,18 @@ sphere "paw_br"    { center 0.557 0.036 0.480 radius 0.033  material skin }
 # 0.064 m out along a forward-and-outward brow direction, so it stands 0.016 m proud of a
 # 0.062 m head wearing 0.014 m fur, and the nose stands 0.015 m proud of a muzzle wearing
 # 0.007 m. Both clear their coat with room to spare.
-sphere { center 0.4731 0.2026 0.8037  radius 0.014   material eye }
-sphere { center 0.5269 0.2026 0.8037  radius 0.014   material eye }
-sphere { center 0.500  0.152  0.838   radius 0.013   material nose }
+#
+# Clearing the coat is NOT the same as being clear of it, and this is the second half of
+# the trap. Standing proud only guarantees the eye is not BURIED; the head's own fur is
+# still rooted area-uniformly over the whole head sphere, including the ring of skin the
+# eye sits in, and every strand rooted around that ring grows straight out across the
+# eyeball. Rendered, the eye came out as a black patch peppered with hair. So these three
+# are NAMED, and the head and muzzle grooms below list them as `bald` zones (with a 1 mm
+# margin, to stop hairs grazing the rim) — the fur is culled out of the feature rather than
+# the feature being pushed out of the fur.
+sphere "eye_l" { center 0.4731 0.2026 0.8037  radius 0.014   material eye }
+sphere "eye_r" { center 0.5269 0.2026 0.8037  radius 0.014   material eye }
+sphere "nose"  { center 0.500  0.152  0.838   radius 0.013   material nose }
 
 # ===========================================================================
 # The coat. One `fur` block per part; every one asks for the SAME density, so the
@@ -139,6 +148,7 @@ fur "coat_head" {
     radius 0.00036
     direction 0 0 1    comb 0.18      # head fur lies FORWARD, over the brow
     droop 0.28   jitter 0.26
+    bald "eye_l" 0.001   bald "eye_r" 0.001   # ...and cull the hairs that grew over them
     seed 15
 }
 fur "coat_muzzle" {
@@ -148,6 +158,8 @@ fur "coat_muzzle" {
     radius 0.00030
     direction 0 0 1    comb 0.20
     droop 0.20   jitter 0.22
+    # The muzzle reaches the lower rim of both eyes as well as the nose, so all three.
+    bald "nose" 0.001   bald "eye_l" 0.001   bald "eye_r" 0.001
     seed 16
 }
 fur "coat_ear_l" {

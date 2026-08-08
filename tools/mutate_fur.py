@@ -2,9 +2,18 @@
 # section that is supposed to catch it actually does. Restores the file afterwards.
 #
 # A guard that cannot fail is not a guard, so every -checkfur section owes a deliberate
-# break that it — and ideally only it — catches. This is not ceremony: the run that added
-# mutation 6 found that §3 could NOT detect the strands losing their seed, because it tested
-# seed sensitivity with clumping on and the guide rng alone moving was enough to pass.
+# break that it — and ideally only it — catches. This is not ceremony: it has now caught a
+# dead test twice, and both times the test looked fine.
+#
+#   mutation 6  — §3 could NOT detect the strands losing their seed, because it tested seed
+#                 sensitivity with clumping on, and the guide rng alone moving was enough.
+#   mutation 10 — §8 could NOT detect `bald` culling by ROOT only, because its zone sat ON
+#                 the surface and was wider than the coat, so it swallowed the roots of
+#                 everything that crossed it and the two implementations agreed exactly.
+#                 §8 gained a second zone floating clear of the skin, containing no roots.
+#
+# The pattern in both: a fixture under which the correct and the broken implementation
+# produce the same answer. Nothing but a mutation run finds those.
 #
 #   python tools/mutate_fur.py        # all of them (slow: one full rebuild each)
 #   python tools/mutate_fur.py 6 9    # just these, by 1-based index
@@ -41,6 +50,20 @@ MUTS = [
     ("guide seed ignores spec.seed",
      "rng.seed(mix64(spec.seed ^ 0x9E3779B97F4A7C15ULL), mix64((uint64_t)g * 2 + 1));",
      "rng.seed(mix64(0x9E3779B97F4A7C15ULL), mix64((uint64_t)g * 2 + 1));", [3]),
+    # `bald` culling by ROOT only is the tempting simplification, and it is exactly the bug
+    # the parameter was added to fix: the hairs that show on an eyeball are the ones rooted
+    # on the skin AROUND it that then grow across it.
+    ("bald tests only the root, not the whole strand",
+     "        for (int k = 0; k + 1 < n; ++k) {\n"
+     "            const Vec3 a = cp[k], ab = cp[k + 1] - a, ac = z.center - a;",
+     "        for (int k = 0; k + 1 < n && false; ++k) {\n"
+     "            const Vec3 a = cp[k], ab = cp[k + 1] - a, ac = z.center - a;", [8]),
+    # A cull must remove the strand's SEGMENTS, not merely flag it: leaving them tessellated
+    # keeps the hair in the scene while the count says it went. §8 catches it as segments
+    # sitting inside the zone.
+    ("bald flags the strand but still tessellates it",
+     "            nseg[i] = 0; baldFlag[i] = 1; return;",
+     "            baldFlag[i] = 1;", [8]),
 ]
 
 # Optional filter: `python mutate_fur.py 6 9` runs only those 1-based mutations, which is

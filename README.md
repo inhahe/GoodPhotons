@@ -63,6 +63,36 @@ renders — so the animation's source is the one Python file, not 432 baked scen
 > for those see the [mode table](REFERENCE.md#render-modes--mode-or-per-camera-mode)
 > and the gallery scenes.
 
+![A small furred creature, a quarter-million procedurally grown strands, lit by
+global illumination in a corner](fur_creature_gi.png)
+
+*A quarter-million individual hairs, and not one of them is authored.
+[`scenes/fur_creature.ftsl`](scenes/fur_creature.ftsl) is eighteen spheres — fifteen for
+the body, three for the eyes and nose — and fifteen `fur { }` blocks for the coat, and
+that is the whole model. The generator turns each block into strands at load time and
+emits them as ordinary curve primitives, so the tracer, the BVH and the CUDA backend
+never learn that fur exists. Reproduce it with
+`ftrace -in scenes/fur_creature.ftsl -mode D -noise 2 -r 720 540 -o png/fur_creature_gi.png -window`
+(720×540, bidirectional path tracing to a 2 % noise target).*
+
+*What makes it read as an animal rather than as a hedgehog of line segments is that
+every strand is **slightly wrong** in its own way — length, lift, droop and comb all
+carry per-strand jitter, and neighbouring strands are pulled toward shared guide hairs
+by `clump`, which is what produces the wisps and partings a uniform coat never has. The
+lighting does the other half: fur is mostly gaps, so the strands are lit far more by
+light that has already bounced off the floor and the walls than by anything direct,
+which is why this is a global-illumination render and why the underside of the belly
+still has colour in it.*
+
+*The eyes are a good illustration of why the generator has the parameters it does. They
+are separate little spheres sitting **on** the head, and the head's own coat is rooted
+uniformly over the whole head — including the ring of skin each eye overlaps — so the
+first render came back with both eyes peppered with hair growing straight across them.
+Making the eyes stand proud of the coat does not fix that; it only stops them being
+buried. The fix is [`bald`](FTSL.md#87-fur--scatter-strands-over-a-surface), which names
+a sphere the groom must keep out of and culls — after clumping, and testing the **whole
+strand** rather than just its root — every hair that reaches into it.*
+
 ---
 
 ## Highlights

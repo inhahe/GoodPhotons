@@ -1284,6 +1284,110 @@ static int checkFur(long long strands) {
                     made, nonFinite, wrongSide, notTilted, bad == 0 ? "PASS" : "FAIL");
     }
 
+    // --- 8. `bald` zones: nothing enters, and nothing else changes --------------------
+    // The parameter exists because a coat is grown per body PART while the features that
+    // must stay bare (an eye) are separate spheres sitting on it — so the failure it fixes
+    // is hair CROSSING an eyeball, not hair rooted in one. Three things have to hold, and
+    // only the first is obvious:
+    //   (a) no SEGMENT of any surviving strand intersects the zone — not merely no root,
+    //       since droop/comb/clump carry a strand rooted outside straight through it;
+    //   (b) the survivors are BIT-FOR-BIT the strands the same seed produced without the
+    //       zone. A cull that perturbed the rest of the coat would make `bald` unusable as
+    //       an edit, and would silently rebias the density it must not touch;
+    //   (c) a zone swallowing the whole target yields zero strands and no crash — the
+    //       degenerate case a compaction pass keyed on `nseg == 0` could easily mishandle.
+    {
+        std::vector<Curve> cs0; std::vector<CurveSeg> sg0;
+        FurSpec s0 = baseSpec(std::max(strands, 20000LL));
+        s0.gravity = Vec3(0, -1, 0);
+        const long long made0 = generateFur(s0, ball, cs0, sg0);
+
+        // A zone on the ball's +y pole, wide enough (0.12 m against an 0.08 m coat) that
+        // strands rooted OUTSIDE it would otherwise grow through it.
+        FurSpec::BaldZone z; z.center = ball.center + Vec3(0, ball.radius, 0); z.radius = 0.12;
+        FurSpec s1 = s0;  s1.bald.push_back(z);
+        std::vector<Curve> cs1; std::vector<CurveSeg> sg1;
+        long long culled = -1;
+        const long long made1 = generateFur(s1, ball, cs1, sg1, nullptr, &culled);
+
+        // (a) point-to-segment distance, recomputed here rather than by calling the
+        // generator's own predicate, so a broken predicate cannot pass its own test.
+        int intruders = 0;
+        for (const CurveSeg& q : sg1) {
+            const Vec3 ab = q.p1 - q.p0, ac = z.center - q.p0;
+            const double den = dot(ab, ab);
+            double t = (den > 1e-24) ? dot(ac, ab) / den : 0.0;
+            t = std::min(std::max(t, 0.0), 1.0);
+            if (length(ac - ab * t) < z.radius) ++intruders;
+        }
+        // (b) the kept strands must be a SUBSEQUENCE of the unculled run, unchanged.
+        int drifted = 0;
+        for (size_t i = 0, j = 0; i < cs1.size(); ++i) {
+            const Vec3 root = sg1[(size_t)cs1[i].firstSeg].p0;
+            while (j < cs0.size() && length(sg0[(size_t)cs0[j].firstSeg].p0 - root) > 0.0) ++j;
+            if (j >= cs0.size()) { ++drifted; break; }          // reordered or invented
+            const Curve& c0 = cs0[j++];
+            if (c0.segCount != cs1[i].segCount) { ++drifted; continue; }
+            for (int k = 0; k < c0.segCount; ++k) {
+                const CurveSeg& p = sg0[(size_t)c0.firstSeg + k];
+                const CurveSeg& q = sg1[(size_t)cs1[i].firstSeg + k];
+                if (length(p.p0 - q.p0) > 0.0 || length(p.p1 - q.p1) > 0.0 ||
+                    p.r0 != q.r0 || p.r1 != q.r1) { ++drifted; break; }
+            }
+        }
+        // (a2) THE CASE THE PARAMETER EXISTS FOR, isolated so that only the span test can
+        // satisfy it: a small zone FLOATING clear of the skin, 50 mm above the +y pole with
+        // a 35 mm radius, so no root is within reach of it (nearest root is the pole itself,
+        // 50 mm away) yet every strand rooted near the pole grows straight through it. A
+        // root-only implementation therefore culls exactly zero here — which (a) alone could
+        // not tell apart from correct behaviour, because its 0.12 m zone sits ON the surface
+        // and swallows the roots of everything that crosses it. The mutation harness found
+        // that hole: `tools/mutate_fur.py` #10 disables the span loop and (a) still passed.
+        // `noRoots` is recomputed here rather than asserted in a comment, so the test keeps
+        // meaning if the ball, the coat length or the jitter window ever change.
+        FurSpec::BaldZone zf;
+        zf.center = ball.center + Vec3(0, ball.radius + 0.05, 0);  zf.radius = 0.035;
+        FurSpec s3 = s0;  s3.bald.push_back(zf);
+        std::vector<Curve> cs3; std::vector<CurveSeg> sg3;
+        long long culledFloat = -1;
+        const long long made3 = generateFur(s3, ball, cs3, sg3, nullptr, &culledFloat);
+        int rootsInFloat = 0, intrudersFloat = 0;
+        for (const Curve& c : cs0)
+            if (length(sg0[(size_t)c.firstSeg].p0 - zf.center) < zf.radius) ++rootsInFloat;
+        for (const CurveSeg& q : sg3) {
+            const Vec3 ab = q.p1 - q.p0, ac = zf.center - q.p0;
+            const double den = dot(ab, ab);
+            double t = (den > 1e-24) ? dot(ac, ab) / den : 0.0;
+            t = std::min(std::max(t, 0.0), 1.0);
+            if (length(ac - ab * t) < zf.radius) ++intrudersFloat;
+        }
+
+        // (c) a zone swallowing the whole ball must leave nothing, quietly.
+        FurSpec::BaldZone all; all.center = ball.center; all.radius = 10.0;
+        FurSpec s2 = s0;  s2.bald.push_back(all);
+        std::vector<Curve> cs2b; std::vector<CurveSeg> sg2b;
+        long long culledAll = -1;
+        const long long made2 = generateFur(s2, ball, cs2b, sg2b, nullptr, &culledAll);
+
+        const bool okCulled = (made1 < made0) && (culled == made0 - made1);
+        const bool okTotal  = (made2 == 0) && sg2b.empty() && cs2b.empty() &&
+                              (culledAll == s0.count);
+        // The floating zone contains no roots BY CONSTRUCTION, so a positive cull there is
+        // proof the whole strand was tested; a zero cull is the root-only bug.
+        const bool okFloat  = (rootsInFloat == 0) && (culledFloat > 0) &&
+                              (culledFloat == made0 - made3);
+        const int bad = intruders + drifted + intrudersFloat +
+                        (!okCulled) + (!okTotal) + (!okFloat);
+        fails += bad;
+        std::printf("[checkfur] 8. bald zones: %lld -> %lld strands (%lld culled), "
+                    "%d segments inside the zone, %d survivors perturbed, "
+                    "floating zone (0 roots in it, got %d) culled %lld with %d crossings left, "
+                    "total-cover left %lld strands -> %s\n",
+                    made0, made1, culled, intruders, drifted,
+                    rootsInFloat, culledFloat, intrudersFloat, made2,
+                    bad == 0 ? "PASS" : "FAIL");
+    }
+
     std::printf("[checkfur] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return fails;
 }

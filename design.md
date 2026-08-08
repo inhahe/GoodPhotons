@@ -357,6 +357,34 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     cell count is capped at 2·10⁶ by coarsening, so a tiny `clump_size` on a large model
     cannot allocate a billion cells. Hashing the root cell would have been simpler and is
     visibly wrong — it gives cube-shaped tufts on a grid instead of Voronoi ones.
+  - *`bald` zones (0.154.0) — the fix for hair growing out of an eyeball.* A coat is grown
+    per body **part**, but the features that must stay bare (an eye, a nose leather) are
+    separate little spheres sitting *on* that part, and the part's groom does not know they
+    exist: it roots area-uniformly over the whole target, including the ring of skin the
+    eye overlaps, so every strand rooted around that ring grows straight across the eye.
+    `scenes/fur_creature.ftsl` had exactly this — the eyes rendered as black patches
+    peppered with hair — and the scene's *existing* comment about placing the eyes proud of
+    the coat did not prevent it: standing proud stops the eye being **buried**, which is a
+    different failure from the eye being **crossed**. `FurSpec::bald` is a list of spheres
+    no strand may enter, culled in `generateFur`. Three choices carry the feature:
+      - *The whole strand is tested, not just the root* — and `furStrandHitsBald` tests
+        **spans** (point-to-segment distance), not control points, because a zone smaller
+        than the gap between two control points would otherwise be skewered. A hair rooted
+        outside a zone that arcs through it under droop/comb is precisely the hair that
+        shows on an eyeball, so a root-only cull would defeat the parameter.
+      - *After clumping*, since clumping is what drags a tip sideways into a zone its own
+        root pointed clear of.
+      - *Culling cannot bias the coat.* Roots are still drawn area-uniformly and survivors
+        are untouched, so fur outside a zone is bit-for-bit what it was; only the count
+        drops. A cull reuses the existing `nseg == 0` compaction path — there is no second
+        way for a strand to disappear — with a parallel `baldFlag` byte array, allocated
+        only when a zone exists, so the load line can report bald culls apart from
+        degenerate strands (a `bald` that quietly ate a whole groom has to be visible, not
+        inferred from a low count).
+    Loader side: `bald "<sphere>" [margin]` resolves through `sphereByName_`, so the bare
+    patch stays welded to the feature instead of being a second copy of its coordinates
+    that rots when the face moves; `bald <x> <y> <z> <r>` covers zones that aren't authored
+    spheres. Both are repeatable statements, scanned like `density_at`.
   - *LOAD-ORDER TRAP (cost a debugging session; now pinned).* The deferred `fur` sweep
     runs inside the **loader**, but `Tri::finalize()` — which computes `gn` and back-fills
     absent shading normals — is called from **`Scene::build()`**, i.e. afterwards. So the
@@ -375,18 +403,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     `on "name"` resolves regardless of authoring order; the sweep runs *before*
     `stripShapeOnlyMeshes`, so a groom can grow on an invisible scalp. `density` is
     divided by `L_²` because it is authored per *authored* unit², not per m².
-  - *Verification.* `-checkfur` (`main.cpp`) is seven sections — roots on the surface;
+  - *Verification.* `-checkfur` (`main.cpp`) is eight sections — roots on the surface;
     area-uniformity (a 3:1 area split must give a 3:1 strand split, mean barycentric ⅓ not
     ½, `density × area` an exact count); determinism across seeds; growth never into the
     skin plus length inside the jitter window and shaped arc inside its analytic bound;
-    clumping collapsing tip spacing while moving **no** root; a well-formed chain; and the
-    load-order regression, built on deliberately **un-finalized** triangles. Note §4
-    measures the direction the strand *leaves* at, not where it ends up: a shallow strand
-    under heavy droop legitimately curves back to the ground. **Mutation-tested** by
-    `tools/mutate_fur.py` — nine deliberate breaks in `fur.h`, each caught by the section
-    that owns it (`python tools/mutate_fur.py 6 9` re-runs individual ones; a full sweep is
-    one rebuild per mutation). `tools/fur_noise.py` is the companion measurement behind
-    TODO §P2's corrected forward-vs-backward note.
+    clumping collapsing tip spacing while moving **no** root; a well-formed chain; the
+    load-order regression, built on deliberately **un-finalized** triangles; and `bald`
+    zones. Note §4 measures the direction the strand *leaves* at, not where it ends up: a
+    shallow strand under heavy droop legitimately curves back to the ground.
+    **Mutation-tested** by `tools/mutate_fur.py` — eleven deliberate breaks in `fur.h`, each
+    caught by the section that owns it (`python tools/mutate_fur.py 6 9` re-runs individual
+    ones; a full sweep is one rebuild per mutation). `tools/fur_noise.py` is the companion
+    measurement behind TODO §P2's corrected forward-vs-backward note.
   - *And the mutation run paid for itself immediately.* `spec.seed` has **two** independent
     consumers — the per-strand rng and the clump-guide rng — and §3's original "seed 8
     differs from seed 7" test ran with clumping **on**, where either one moving alone is
@@ -398,6 +426,18 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     `clump 1.0`, so `w = clump·t` is exactly 1 at the tip and every strand's last control
     point *is* that single guide's tip — a point the strand rng cannot influence. §3 also
     asserts the tips really did collapse, so the isolation can't silently fail open.
+  - *And then it paid for itself a second time, on §8 (0.154.0).* The first §8 tested `bald`
+    with a 0.12 m zone sitting **on** the ball's pole — which, being wider than the coat,
+    swallows the *roots* of everything that crosses it. So mutation #10 ("test only the
+    root, not the whole strand") was MISSED: root-only culling produced exactly the same
+    image on that zone, while being precisely the bug the parameter exists to prevent (an
+    eye is peppered by hairs rooted on the skin *around* it). §8 gained a second zone that
+    **floats clear of the skin** — 50 mm above the pole, 35 mm radius, so no root is within
+    reach of it — where a positive cull is only possible if the span test ran. The test
+    recomputes "no root is inside" rather than asserting it in a comment, so it stays
+    honest if the ball or the coat length ever change. The lesson generalises: a guard whose
+    fixture makes two different implementations agree is not guarding anything, and only a
+    mutation run will tell you which fixture that is.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds

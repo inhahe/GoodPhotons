@@ -134,6 +134,17 @@ than a `parallelFor`, so a groom with a very small `clump_size` (hence many guid
 serial phase. It is O(guides) with guides ≪ strands by construction, so it has not
 mattered.
 
+Also bounded, added with `bald` in v0.154.0: a **bald zone is always a sphere**, and the
+test is a linear scan of the zone list per strand. Both are deliberate — the features that
+need to stay bare (an eye, a nose leather) are already authored as spheres, and a face has
+two or three of them, so a grid or a box/capsule zone would be machinery for a case that
+has not appeared. The shapes that would need one are a bare *stripe* (a capsule) or a
+shaved *patch* following a mesh feature; if either turns up, the right fix is to widen
+`FurSpec::BaldZone` into a small tagged shape with one `distanceToSegment`-style method per
+kind, keeping the whole-strand, post-clump test exactly where it is (`furStrandHitsBald`,
+`src/fur.h`), and to bucket the zones into the groom's existing uniform grid once the count
+is large enough to matter.
+
 ### FIXED (2026-08-07, v0.151.0): the `curve` primitive had no CUDA path — the whole scene fell back to the CPU
 
 Shipped deliberately with the primitive in v0.150.0 (TODO §P1) and ported one version

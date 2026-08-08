@@ -4319,20 +4319,58 @@ private:
             return false;
         }
 
+        // `bald` — one or more spheres this groom must keep out of. Repeatable, and it
+        // takes either form:
+        //     bald "eye_l"          [margin]    a NAMED sphere already in the scene
+        //     bald <x> <y> <z> <r>              an explicit centre and radius
+        // The named form is the one that matters in practice: the eye is already authored
+        // as a sphere, so naming it keeps the bare patch welded to the feature instead of
+        // being a second copy of its coordinates that silently rots when the face moves.
+        // The optional margin (authored units, default 0) grows the zone, which is how you
+        // stop hairs GRAZING a rim they never quite enter.
+        for (const auto& s : b.stmts) {
+            if (s.key != "bald") continue;
+            s.used = true;
+            const auto& w = s.val.words;
+            FurSpec::BaldZone z;
+            if (!w.empty() && !isNumber(w[0])) {
+                auto bs = sphereByName_.find(w[0]);
+                if (bs == sphereByName_.end()) {
+                    fail("fur '" + sp.name + "' bald \"" + w[0] + "\" names no sphere in the scene "
+                         "(use `bald <x> <y> <z> <r>` for a zone that is not one)");
+                    return false;
+                }
+                z.center = bs->second.center;             // already in internal units
+                z.radius = bs->second.radius + (w.size() > 1 ? Len(num(w[1])) : 0.0);
+            } else if (w.size() >= 4) {
+                z.center = P(Vec3{num(w[0]), num(w[1]), num(w[2])});
+                z.radius = Len(num(w[3]));
+            } else {
+                fail("fur '" + sp.name + "' bald needs `\"<sphere name>\" [margin]` or `<x> <y> <z> <r>`");
+                return false;
+            }
+            if (z.radius > 0.0) sp.bald.push_back(z);
+        }
+
         std::string ferr;
+        long long culled = 0;
         if (!surf.isSphere) { surf.tris = L.scene.tris.data() + triFirst; surf.nTris = triCount; }
         const size_t segsBefore = L.scene.curveSegs.size();
-        const long long made = generateFur(sp, surf, L.scene.curves, L.scene.curveSegs, &ferr);
+        const long long made = generateFur(sp, surf, L.scene.curves, L.scene.curveSegs, &ferr, &culled);
         if (made < 0) {
             // A stop during generation is not a scene error — it is a cancelled load, and
             // stopped() is what main.cpp reports. Only a real failure gets a message.
             if (!ferr.empty()) fail(ferr);
             return false;
         }
-        std::fprintf(stderr, "[fur] \"%s\" on \"%s\": %lld strands, %zu segments (%s %.4g m^2)\n",
+        char baldNote[96] = {0};
+        if (!sp.bald.empty())
+            std::snprintf(baldNote, sizeof baldNote, ", %lld culled by %zu bald zone%s",
+                          culled, sp.bald.size(), sp.bald.size() == 1 ? "" : "s");
+        std::fprintf(stderr, "[fur] \"%s\" on \"%s\": %lld strands, %zu segments (%s %.4g m^2)%s\n",
                      sp.name.c_str(), on.c_str(), made,
                      L.scene.curveSegs.size() - segsBefore,
-                     surf.isSphere ? "sphere" : "mesh", furTargetArea(surf));
+                     surf.isSphere ? "sphere" : "mesh", furTargetArea(surf), baldNote);
         return true;
     }
 

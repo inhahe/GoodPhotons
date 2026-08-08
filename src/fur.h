@@ -99,7 +99,45 @@ struct FurSpec {
     double      clumpSize = 0.02;    // tuft radius (one guide per pi*clumpSize^2 of area)
 
     double      rootOffset = 0.0;    // push the root along N (bed the strand into the skin)
+
+    // BALD ZONES — spheres no strand may enter.  A coat is grown per BODY PART, but the
+    // features that must stay bare (an eye, a nose leather, a scar) are separate little
+    // spheres sitting ON that part, and the part's own fur does not know they are there:
+    // it roots area-uniformly over the whole target, including the disc the eye overlaps,
+    // and every strand rooted around that disc then grows straight across the eyeball.
+    // The result is an eye peppered with hair — visibly wrong in a way no combination of
+    // length / lift / comb can fix, because the problem is WHERE the roots are, not which
+    // way they point.
+    //
+    // The cull is per strand and tests the WHOLE strand, not just its root: a hair rooted
+    // outside a zone that arcs through it under droop/comb/clump is exactly the hair that
+    // shows on an eyeball, so keeping it would defeat the parameter.  Culling cannot bias
+    // the surviving coat either — roots are still drawn area-uniformly and every survivor
+    // is untouched, so the fur outside a zone is bit-for-bit what it was without one.
+    struct BaldZone { Vec3 center{0, 0, 0}; double radius = 0.0; };
+    std::vector<BaldZone> bald;
 };
+
+// Does a strand (a polyline of `n` control points, thickened by `rad`) reach into any bald
+// zone?  Tested SPAN-wise rather than point-wise: a small zone can sit entirely between two
+// control points, and a point test would happily let the hair skewer it.
+inline bool furStrandHitsBald(const FurSpec& spec, const Vec3* cp, int n, double rad) {
+    if (spec.bald.empty()) return false;
+    for (const FurSpec::BaldZone& z : spec.bald) {
+        const double rr = z.radius + rad, rr2 = rr * rr;
+        const Vec3 d0 = cp[0] - z.center;
+        if (dot(d0, d0) <= rr2) return true;              // root inside: the common case
+        for (int k = 0; k + 1 < n; ++k) {
+            const Vec3 a = cp[k], ab = cp[k + 1] - a, ac = z.center - a;
+            const double denom = dot(ab, ab);
+            double t = (denom > 1e-24) ? dot(ac, ab) / denom : 0.0;
+            t = std::min(std::max(t, 0.0), 1.0);
+            const Vec3 q = ac - ab * t;                   // centre -> closest point on span
+            if (dot(q, q) <= rr2) return true;
+        }
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // Area-uniform root sampling
@@ -369,8 +407,14 @@ struct FurGuides {
 // groom — the compaction degenerates to a single bulk append.
 inline long long generateFur(const FurSpec& specIn, const FurSurface& surf,
                              std::vector<Curve>& curves, std::vector<CurveSeg>& segs,
-                             std::string* err = nullptr) {
+                             std::string* err = nullptr, long long* baldCulled = nullptr) {
     FurSpec spec = specIn;
+    // Drop no-op zones up front so the per-strand test never sees one, and so a typo'd
+    // `bald "name"` that resolved to nothing costs zero per hair.
+    spec.bald.erase(std::remove_if(spec.bald.begin(), spec.bald.end(),
+                                   [](const FurSpec::BaldZone& z) { return !(z.radius > 0.0); }),
+                    spec.bald.end());
+    if (baldCulled) *baldCulled = 0;
     if (spec.points < 2) spec.points = 2;
     if (spec.subdiv < 1) spec.subdiv = 1;
     if (spec.subdiv > 256) spec.subdiv = 256;
@@ -435,6 +479,11 @@ inline long long generateFur(const FurSpec& specIn, const FurSurface& surf,
     const size_t curveBase = curves.size();
     segs.resize(base + (size_t)count * segsPerStrand);
     std::vector<int> nseg((size_t)count, 0);
+    // A bald cull and a degenerate strand both land as nseg == 0, but only one of them is
+    // something the author asked for, so they are tallied apart — a `bald` that quietly
+    // ate the whole coat has to be visible in the load log, not inferred from a low count.
+    // Only paid for when a zone exists (one byte per strand).
+    std::vector<uint8_t> baldFlag(spec.bald.empty() ? 0 : (size_t)count, 0);
 
     const bool ok = ft::parallelFor((size_t)count, 256, [&](size_t i) {
         // Scratch reused across every strand this thread builds: tessellateCurve appends
@@ -463,6 +512,13 @@ inline long long generateFur(const FurSpec& specIn, const FurSurface& surf,
                 }
             }
         }
+        // Bald zones are tested AFTER clumping, because clumping is what pulls a tip
+        // sideways into a zone its own root pointed clear of. `nseg[i] = 0` routes the
+        // strand into the same compaction path a degenerate strand already takes, so
+        // there is no second way for a hair to disappear.
+        if (furStrandHitsBald(spec, cp.data(), spec.points, spec.radius)) {
+            nseg[i] = 0; baldFlag[i] = 1; return;
+        }
         for (int k = 0; k < spec.points; ++k) {
             const double t = (spec.points > 1) ? (double)k / (spec.points - 1) : 0.0;
             radii[(size_t)k] = spec.radius + (spec.radiusTip - spec.radius) * t;
@@ -475,6 +531,11 @@ inline long long generateFur(const FurSpec& specIn, const FurSurface& surf,
                         (size_t)added * sizeof(CurveSeg));
     });
     if (!ok) { segs.resize(base); return -1; }
+    if (baldCulled) {
+        long long nb = 0;
+        for (uint8_t f : baldFlag) nb += f;
+        *baldCulled = nb;
+    }
 
     // Compaction.  The fast path (nothing dropped) is the overwhelmingly common one and
     // costs a single comparison per strand.
