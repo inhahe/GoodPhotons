@@ -5,49 +5,139 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
-### DEBT (2026-08-08, v0.157.0): auto-exposure anchors on a single fixed-rank order statistic (p99), which is discontinuous on a bimodal histogram
+### BY-DESIGN (2026-08-08, v0.157.0): auto-exposure's p99 anchor can't be stabilised by *any* per-image statistic — the shared anchor **is** the fix, not a mitigation
 
-`writeFilm` picks its gain as `eAuto = 0.9 / p99`, where p99 is the 99th percentile of
-per-pixel `max(r,g,b)` in scene-linear sRGB. That is stable on a unimodal image and
-**not** stable on one with a bright, compact specular/emitter population, because such a
-scene's luminance histogram is bimodal: the ordinary scene in one lobe, a near-empty gap,
-then a plateau of glints. While the highlight's *area* sweeps across 1% of the frame the
-p99 rank crosses the gap, and the anchor moves discontinuously even though nothing about
-the picture's actual brightness did.
+> **This entry previously recorded the wrong root cause and two wrong fixes.** It blamed a
+> *bimodal histogram* ("the rank crosses a near-empty gap") and recommended blending ranks
+> p97–p99.5, or detecting the bimodality and anchoring to the upper edge of the lower mode.
+> The mechanism is wrong and **both fixes are refuted by measurement**. Rewritten so nobody
+> re-derives them. The nine studies live in `scraps/anchor_study*.py` (gitignored scratch —
+> each script's docstring records the hypothesis it killed and why), so **every number they
+> produced is reproduced below** rather than left behind a path that may not exist on your
+> checkout.
 
-Measured on `png/pastel_jack_ring` (432 frames, **static** camera — only the gold ring
-rotates, so any global brightness change is by construction an artifact), reading the raw
-`.ftbuf` film rather than the developed PNGs. Frame-to-frame step of each statistic:
+`writeFilm` picks its gain as `eAuto = 0.9 / p99`, p99 being the 99th percentile of
+per-pixel `max(r,g,b)` in scene-linear sRGB. It is stable on a unimodal image and not on
+one with a bright, compact specular population. Measured on `png/pastel_jack_ring` (432
+frames, **static** camera — only the gold ring rotates, so any global brightness change is
+by construction an artifact), read from the raw `.ftbuf` film:
 
 | statistic | median step | p95 step | max step |
 |---|---|---|---|
 | `bg` (static corner pixels) | 0.53% | 1.53% | **2.23%** |
 | `p95` | 0.13% | 0.42% | **0.68%** |
-| `mean` | 0.33% | 1.18% | **1.80%** |
 | `median` | 0.16% | 0.45% | **0.59%** |
-| **`p99` (the anchor)** | 1.40% | 6.02% | **42.17%** |
+| log-average (Reinhard key) | — | 0.58% | **0.97%** |
+| **`p99` (the anchor)** | 1.40% | 6.04% | **36.17%** |
 
-Every honest measure of the image is smooth; only the anchor jumps. The mechanism is
-confirmed directly — the tail has a plateau at 44.78e12 and "area above 6× p95" crosses
-exactly 1.0% at the flicker frames (0.830% @ f134 → 1.011% @ f138 → 1.060% @ f142 →
-0.950% @ f146 → 0.806% @ f149).
+**The mechanism is an ill-conditioned inversion, not a gap crossing.** At the worst pair
+(`…145 → …146`, 36.17%) the tail shows no bimodal gap. It *saturates* at exactly 4.4780e+13
+— an emitter plateau over ranks 0.995–1.000, ~0.51–0.57% of frame, **identical in both
+frames**. p99 sits *below* that plateau in a sparse continuum whose density above p95 is
+only ~**0.25% of frame per octave**. The anchor solves `area(L) = 1%` for `L`, so
+`dL/d(area)` is ≈ **5 octaves per 1% of area**: the 0.07-point area change the rotating ring
+actually makes (1.1836% → 1.1128% above 4× p95) moves the level a third of an octave. Every
+*fixed-rank* statistic inherits this — which is why p98 and every rank-band blend still
+stepped 6–36%.
 
-**What shipped is a mitigation, not a fix to the statistic.** `-exposure-anchor
-<value|file>` (and loom's `stabilize_exposure`, which takes the sequence *median* anchor
-and re-develops every `.ftbuf` through `-topng`) makes a sequence share one gain, so the
-discontinuity can't surface as flicker. A single still is still metered by p99 and can
-still be anchored on an atypical glint — there is just no neighbouring frame to reveal it.
+**Why no per-image statistic can fix it.** Six families were measured against two
+requirements at once — *stability* on the 432-frame sequence, and *fidelity* (how far the
+result lands from today's p99 across 186 ordinary one-off renders, as the 5th–95th
+percentile spread in stops). Nothing satisfies both:
 
-**A real fix** would make the anchor continuous in the image. Options, cheapest first:
-blend a band of ranks (e.g. a weighted mean over p97–p99.5) so no single rank crossing a
-gap can move the result; or detect the bimodality explicitly (look for a density minimum
-in the log-luminance histogram above p95) and anchor to the *upper edge of the lower
-mode*, which is what a viewer actually reads as "the picture"; or carry an anchor low-pass
-across frames within a render group. The first is a few lines in `writeFilm` and would want
-a regression over the `pastel_jack_ring` checkpoints (they're on disk, and `-topng`
-develops one in milliseconds, so the test is cheap). Not done here because it changes the
-exposure of *every* existing render, which needs a deliberate re-baseline pass rather than
-a drive-by.
+| candidate | max step | median × p99 | spread |
+|---|---|---|---|
+| p99 (shipped) | 36.17% | 1.000× | 0.00 stops |
+| p95 | **0.69%** | 0.475× | 2.59 stops |
+| p98 | 6.98% | 0.756× | 1.62 stops |
+| rank-band blend (logmean p90–p99.5) | 2.35% | 0.525× | 2.30 stops |
+| triangular log-quantile (c99, h4%) | 5.89% | 0.980× | 1.49 stops |
+| clamp `min(p99, C·p95)` | 12.19% | 1.000× | engages on only 3–9% of frames |
+| power means (p = 2…8) | 1.65% | — | 4.04–6.45 stops |
+| energy quantiles (f = 0.5–2%) | **0.00%** | 4.5–6.1× | 7.72 stops |
+| log-average (Reinhard key) | 0.97% | 0.112× | 5.73 stops |
+
+The trade is not a tuning accident, it's structural: where p99 misbehaves its value is
+genuinely *arbitrary*, so there is nothing to be faithful **to**. The clamp fails for a
+second reason — `ppm/meng_test.png.ftbuf` is a legitimate render with p99/p95 = **339×**,
+which `C = 4` would blow out by **6.41 stops**.
+
+**And the pathology is not detectable, so a gated fix is not available either.** A safe
+regulariser would have to leave well-conditioned images bit-identical and act only on
+ill-conditioned ones. The natural test — local density at the anchor, the fraction of frame
+within one octave of p99 — does not separate them. pastel_jack_ring's median density is
+**1.2318%**; ordinary renders' 25th percentile is **0.8672%** and median 1.7556%. The
+pathological sequence is *denser* than a quarter of ordinary renders, and `meng_test` sits
+at 1.2107% — statistically identical to it. No threshold discriminates (at `< 0.20%` it
+fires on 2.7% of ordinary renders and 2.8% of pastel_jack_ring frames).
+
+**Conclusion: the information required is temporal, not spatial.** A single frame simply
+does not contain evidence distinguishing "the ring rotated" from "the scene got brighter" —
+the whole-frame log-average is stable to 0.97% across the sequence, so the picture really
+is not changing, but that is only knowable by *comparing frames*. Therefore
+`-exposure-anchor <value|file>` and loom's `stabilize_exposure` are the **correct** fix and
+should be described that way, not as a workaround. The residual caveat is narrow and real:
+a **single still** is still metered by p99 and can still anchor on an atypical glint, with
+no neighbour to reveal it. That is a property of monocular auto-exposure, not a defect to
+be engineered away; `-ev` and `-exposure-anchor <value>` are the escape hatches.
+
+Endemic check: across every multi-frame sequence in the repo, p99's max step is 36.17%
+(pastel_jack_ring), 33.45% (pastel_jack_ring_halfspeed) and 5.42% (scribble_loop) — so this
+is a scene property of rotating speculars, not a defect that afflicts renders generally.
+
+### DEBT (2026-08-08, v0.157.0): the tone map hard-clips with no shoulder, so the anchor is forced to double as a clipping control
+
+Found while investigating the entry above, and **independent of it** — this is a real,
+fixable defect that the six anchor studies all missed because they assumed the tone curve.
+`filmToRgb8` (`src/main.cpp` ~4101) maps linear to 8-bit as
+`clamp(srgbGamma(lin * exposure) * 255 + 0.5, 0, 255)` — a hard clip, no rolloff. So
+`eAuto = 0.9 / p99` is not really a brightness control, it is a *clipping* control meaning
+"let ~1% of the frame blow out". Clipping is decided by the top of the histogram, so the
+exposure is **forced** to track the top of the histogram — the one part of a
+rotating-specular scene that moves. That is the deeper reason every stable candidate above
+came back 1.5–7.7 stops adrift: they don't control clipping, so they can't stand in for
+something whose entire job is to control clipping.
+
+The fix is a knee-based rolloff that is *exactly* the identity below the knee:
+
+```
+y = x                                     x <= k
+y = k + (1-k)(x-k) / ((x-k) + (1-k))      x >  k     (slope 1 at k, asymptote 1)
+```
+
+Measured end-to-end in 8-bit sRGB (mean |Δ| between consecutive pastel_jack_ring frames —
+both pipelines see the same real motion, so any excess is exposure flicker):
+
+| exposure | knee | mean \|Δ\| | p95 \|Δ\| | max \|Δ\| |
+|---|---|---|---|---|
+| per-frame p99 (shipped) | none | 7.422 | 11.094 | **17.125** |
+| per-frame p99 | 0.90 | 7.147 | 10.567 | 16.581 |
+| shared anchor (shipped fix) | none | 6.348 | 7.464 | **8.011** |
+| shared anchor | 0.90 | 6.054 | 6.787 | **7.254** |
+
+and fidelity on 167 ordinary renders, with the **exposure left untouched**:
+
+| knee | px bit-identical | worst render | blown to #FFFFFF |
+|---|---|---|---|
+| none | 100% | 100% | 0.319% |
+| 0.95 | 99.563% | 99.178% | 0.140% |
+| **0.90** | **99.401%** | **98.999%** | **0.032%** |
+| 0.80 | 93.306% | **0.000%** | 0.000% |
+
+`k = 0.90` is the sweet spot: the knee sits exactly where the anchor puts p99, so the change
+is confined to the ~1% of frame that today is *already* clipped — 99.4% of pixels stay
+bit-identical (worst render 99.0%), blown-white pixels drop **10×**, and worst-case flicker
+improves another 9% on top of the shared anchor. `k ≤ 0.80` is unusable (some render goes to
+0% identical). This also directly addresses the complaint already recorded in `main.cpp`'s
+`-hdr` rationale — "596 of the 22639 pixels of one cap were pure white… its colour read as
+white no matter what the optics did" — by giving highlights somewhere to go.
+
+Not implemented yet because it is a genuine (if small) look change and must land at **all
+four** anchor/tone sites consistently, including the deliberately bit-exact GPU twin:
+`main.cpp:4101` (`filmToRgb8`), `main.cpp:~4597` (ANSI `-preview`), `raster.h:1210`
+(CPU raster / `-explore`), `raster_cuda.cu:1685` (GPU raster). Regression suite is free —
+the `pastel_jack_ring` `.ftbuf` checkpoints are on disk and `-topng` develops one in
+milliseconds; `scraps/anchor_study9.py` already implements the exact curve and both metrics.
 
 ### DEBT (2026-08-08, v0.156.0): the loom viewer's prebake cache costs ~6.4 MB per frame, which caps a long clock well short of what "1024 MB" suggests
 

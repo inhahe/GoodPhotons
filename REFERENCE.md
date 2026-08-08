@@ -2829,17 +2829,31 @@ in the `-raster` preview, so preview and final agree):
   and reuses it. It implies `-exposure-lock`.
 
   **Why per-frame metering can jump at all.** The auto-exposure anchors on a single
-  fixed-rank order statistic — the 99th percentile of per-pixel `max(r,g,b)`. That is
-  perfectly stable on a unimodal image, but a scene with a bright, compact
-  specular/emitter population has a **bimodal** luminance histogram: the ordinary scene
-  in one lobe, a near-empty gap, then a plateau of glints. While the highlight's *area*
-  sweeps across 1% of the frame the p99 rank crosses the gap and the anchor moves
-  discontinuously even though nothing about the picture's actual brightness did. Measured
-  on the `pastel_jack_ring` flyby (432 frames, static camera, rotating gold ring): the
-  worst single-frame step was **42.2% in the anchor** while the static background moved
-  **2.2%**, p95 **0.7%** and the median **0.6%**. A shared anchor removes the jump
-  (worst full-frame step after repair: **0.8%**); it is a mitigation, not a fix to the
-  statistic itself.
+  fixed-rank order statistic — the 99th percentile of per-pixel `max(r,g,b)` — and that
+  statistic solves `area(L) = 1%` for the level `L`. On a scene with a bright, compact
+  specular population the density up there is very thin (measured on `pastel_jack_ring`:
+  ~**0.25% of frame per octave** above p95), so the inversion is ill-conditioned —
+  roughly **5 octaves of level per 1% of area**. A rotating highlight changes that area
+  by a few hundredths of a point, and the anchor moves a third of an octave even though
+  nothing about the picture's brightness did. Measured over that flyby (432 frames,
+  static camera, rotating gold ring): the worst single-frame step was **36.2% in the
+  anchor** while the static background moved **2.2%**, p95 **0.7%**, the median **0.6%**
+  and the whole-frame log-average **1.0%**. A shared anchor removes the jump (worst
+  full-frame step after repair: **0.8%**).
+
+  **A shared anchor is the fix, not a workaround.** Nine studies measured six replacement families — other ranks, rank-band
+  blends, a `min(p99, C·p95)` clamp, power means, energy quantiles, and the Reinhard
+  log-average key — against *stability* on the sequence and *fidelity* to today's exposure
+  across 186 ordinary renders. None satisfies both, and not by a tuning margin: the stable
+  candidates land **1.5–7.7 stops** adrift. The reason is structural — where p99
+  misbehaves its value is genuinely arbitrary, so there is nothing to be faithful to. Nor
+  can the bad case be *detected* and specially handled: by local density at the anchor,
+  `pastel_jack_ring` is denser than a quarter of ordinary renders. A single frame contains
+  no evidence distinguishing "the highlight rotated" from "the scene got brighter"; that
+  information exists only across frames, which is exactly what a shared anchor uses. The
+  residual caveat is narrow: a **single still** is still metered by p99 and can anchor on
+  an atypical glint, with no neighbour to reveal it — use `-ev` or `-exposure-anchor
+  <value>` if it does. See `known-issues.md` for the full measurements.
 
   **Repairing an already-rendered sequence.** If the frames were rendered with
   `-checkpoint`, no re-render is needed: each `<frame>.png.ftbuf` still holds the raw
@@ -3179,7 +3193,7 @@ alone can't restore, so they are not disk-resumable.
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-stop [<pid>\|all]` | **Stop a running render cleanly, from another shell.** `ftrace -stop <pid>` asks that render to do exactly what Ctrl-C does — finish the current chunk, write the final image **and** `.ftbuf` checkpoint, release the CUDA context through the graceful-shutdown path — then waits (up to 120 s) for it to actually exit, so it's safe to script a rebuild right after. `-stop all` targets every running render; a bare `-stop` just **lists** them (pid + scene → output). This exists because a render launched detached has no console to Ctrl-C into, and **force-killing ftrace mid-CUDA is a known way to wedge the NVIDIA driver into a TDR/bugcheck** — so never `taskkill /F` a render, use this. It also releases a window being held open by `-keepwindow`. Implemented as a sentinel file under `<temp>/ftrace/` (a `<pid>.run` entry per live render, a `<pid>.stop` to signal it), which — unlike a named kernel event — crosses the session / window-station boundary between a detached render and the shell signalling it. A stop that arrives while the process is still **loading the scene** aborts the load rather than being waited out: it prints `[stop] scene load stopped before rendering — nothing was rendered or written.` and exits **1** (no scene was built, so nothing could be rendered — the non-zero exit is the correct outcome, not an error in your `.ftsl`). |
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`). **Process-local** — it can only share an anchor between frames rendered by *this* invocation; for a frame-per-invocation sequence use `-exposure-anchor` |
-| `-exposure-anchor <v\|file>` | **Share one auto-exposure anchor across separate `ftrace` invocations** — the missing piece for a sequence whose frames are each rendered by their own process (loom's `render_range`, a batch script, a re-render of one frame). Implies `-exposure-lock`. With a **number** the anchor is used directly (no metering). With a **path**: if the file exists and holds a number that anchor is loaded and reused; otherwise this run meters normally and **writes** its resolved anchor there, so every later frame pointed at the same file develops at the identical gain. Also accepted by **`-topng`**, which is how a *finished* sequence is repaired from its `.ftbuf` checkpoints with no re-render (see **Output**). Without it, per-frame metering can jump discontinuously — the p99 anchor is a fixed-rank order statistic, so on a scene with a bright compact highlight population the histogram is bimodal and the anchor snaps between modes as the highlight's *area* sweeps across 1% of frame (measured on `pastel_jack_ring`: 42% single-frame anchor step while every honest brightness measure moved ≤ 2.3%) |
+| `-exposure-anchor <v\|file>` | **Share one auto-exposure anchor across separate `ftrace` invocations** — the missing piece for a sequence whose frames are each rendered by their own process (loom's `render_range`, a batch script, a re-render of one frame). Implies `-exposure-lock`. With a **number** the anchor is used directly (no metering). With a **path**: if the file exists and holds a number that anchor is loaded and reused; otherwise this run meters normally and **writes** its resolved anchor there, so every later frame pointed at the same file develops at the identical gain. Also accepted by **`-topng`**, which is how a *finished* sequence is repaired from its `.ftbuf` checkpoints with no re-render (see **Output**). Without it, per-frame metering can jump — the p99 anchor solves `area(L) = 1%` for a level, and on a scene with a bright compact highlight population the tail density is so thin (~0.25% of frame per octave) that the inversion is ill-conditioned, so a rotating highlight swings the anchor by a third of an octave (measured on `pastel_jack_ring`: 36% single-frame anchor step while every honest brightness measure moved ≤ 2.3%). This is not fixable in the statistic — see the `exposure_lock` notes and `known-issues.md` |
 | `-hdr` | Also write a **32-bit float PFM** beside `-o` (`<out>.pfm`) holding the **scene-linear** image — the exact buffer the tone map consumes, with no exposure, no gamma and **no clamp**. Written on every periodic in-progress write too, so a still-converging render can be metered. Use it whenever you intend to *measure* rather than look: an 8-bit PNG clamps at white, and a caustic is by definition the brightest thing in frame, so its core prints as `#FFFFFF` with all three channels **equal** — the tone map destroys the caustic's colour and its peak-to-screen ratio before any analysis can see them. (Values are radiance in the film's own scale; peak/median ratios and chromaticity are exposure-invariant, so two renders shot at different stops stay comparable.) PFM is a 3-line ASCII header + raw little-endian `float32` RGB triples, raster order left-to-right **bottom-to-top**. |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
 | `-stereo <mode>` | **3-D stereoscopic output** (stills *and* movies). Renders each camera **twice** — a Left/Right eye pair — and composites them into the `-o` image. `mode` picks the fusion: `sbs` (side-by-side **wall-eyed**, L\|R), `cross` (side-by-side **cross-eyed**, R\|L), `anaglyph` (**red-cyan** Dubois glasses, the default kind), or `anaglyph-gm` (**green-magenta** Dubois). Uses the correct **off-axis** rig — two *parallel* cameras offset along the camera right axis with **asymmetric (sheared) frusta** sharing a convergence plane, so there's **no vertical parallax** (toe-in's eye-strain cause). Both eyes share one auto-exposure anchor, so L/R — and every frame of an exposure-locked `camera_path` — tone-map identically. Rectilinear cameras only (a fisheye camera renders mono, with a warning). See **Stereoscopic 3-D** below. |

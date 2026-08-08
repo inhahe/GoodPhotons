@@ -1362,14 +1362,26 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `convertToPng` → `writeFilm`'s `lockAnchor`.
   **Why it was needed** (measured on `png/pastel_jack_ring`, 432 frames, static camera —
   only the ring rotates, so any global brightness change is by construction an artifact):
-  the p99 anchor stepped **42.2%** between adjacent frames while the static background
-  moved 2.2%, p95 0.68% and the median 0.59%. The cause is that a fixed-rank order
-  statistic is discontinuous on a **bimodal** histogram — a compact glint population makes
-  a plateau above a near-empty gap, and the p99 rank crosses that gap as the highlight's
-  *area* sweeps through 1% of frame ("area above 6× p95" measured 0.830% → 1.011% →
-  1.060% → 0.950% → 0.806% across the flicker band). Logged as tech debt in
-  `known-issues.md`: the shared anchor removes the *flicker*, it does not make the
-  statistic continuous, and a still can still anchor on an atypical glint.
+  the p99 anchor stepped **36.2%** between adjacent frames while the static background
+  moved 2.2%, p95 0.68%, the median 0.59% and the whole-frame log-average 0.97%.
+  The cause is **not** a bimodal histogram (an earlier revision of this bullet and of
+  `known-issues.md` said so; it is wrong, and the fixes it implied are refuted). The tail
+  has no gap — it *saturates* at 4.4780e+13, an emitter plateau over ranks 0.995–1.000 that
+  is identical in both of the worst-pair frames. p99 sits *below* it in a sparse continuum
+  with only ~**0.25% of frame per octave** above p95, so solving `area(L) = 1%` for `L` is
+  ill-conditioned — ≈ **5 octaves per 1% of area** — and the 0.07-point area change the
+  ring actually makes (1.1836% → 1.1128% above 4× p95) moves the level a third of an
+  octave. Every fixed-rank statistic inherits this.
+  **The shared anchor is therefore the fix, not a mitigation.** Nine studies measured six replacement families against stability *and*
+  fidelity; none satisfies both, the stable ones landing 1.5–7.7 stops from today's
+  exposure, because where p99 misbehaves its value is arbitrary and there is nothing to be
+  faithful to. The bad case is also undetectable — pastel_jack_ring's local density at the
+  anchor (median 1.23%) exceeds the 25th percentile of ordinary renders (0.87%) — so a
+  gated regulariser is unavailable too. The needed information is temporal, not spatial.
+  The narrow residual: a single **still** can still anchor on an atypical glint. See
+  `known-issues.md` for all tables, plus a separate, genuinely fixable defect found the
+  same way — the tone map hard-clips with no shoulder, which is *why* the anchor is forced
+  to track the moving top of the histogram.
   **Repair path for already-rendered sequences** — `loom.stabilize_exposure(pngs)`
   (`tools/loom/loom/drive.py`) develops each `<frame>.png.ftbuf` once with `-topng` to
   read back the anchor that frame *would* have chosen (scraped from the
