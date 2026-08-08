@@ -120,7 +120,7 @@ definitions themselves should round-trip to MJCF, not compete with it.
 
 ---
 
-## P1 — Torque-actuated quadruped + PPO  `[~]`
+## P1 — Torque-actuated quadruped + PPO  `[x]`
 
 Smoke-test the entire loop end to end on a body whose dynamics we trust.
 
@@ -197,8 +197,20 @@ Smoke-test the entire loop end to end on a body whose dynamics we trust.
       version scored whichever handful of envs happened to finish on the current step and went
       0.30 → 0.80 in 82 k steps, reproducing the standstill it was written to prevent. The cap
       is in the checkpoint, for the same reason the normaliser is.
-- [ ] **Bar:** a stable gait emerges. It will look bad. That is fine — this step is
+- [x] **Bar:** a stable gait emerges. It will look bad. That is fine — this step is
       testing the plumbing, not the motion.
+      - **Met** (2026-08-08). 20 M steps, 170 min on the CPU, best evaluation return 1224.9.
+        The command curriculum reached the full 0–0.8 Froude range at ~3.4 M steps and the
+        policy tracks the whole of it: over a 64-point command sweep the worst error is
+        −0.040 Froude (5% under) at the top of the range, `r_speed` never drops below 0.93,
+        tilt stays at 3–4°, and **every** animal survives the full 20 s at **every** command.
+        Cost of transport rises monotonically 0.82 → 2.62 across the sweep, which is the
+        physically right shape and is not something the reward asks for directly.
+      - The number that matters is the *table*, not the scalar. The pre-curriculum run scored
+        a respectable-looking mean and had `speed 0.000` in all twelve of its command rows —
+        a perfect standstill. `--eval CKPT` prints the per-command breakdown for exactly this
+        reason; a mean over a command grid a motionless animal reads perfectly at one end of
+        hides the failure the whole of P1 is trying to detect.
       - ~~Blocked on known-issues #3 (passive roll instability)~~ — **unblocked** (2026-08-08).
         `tune.brace` measures the mode a symmetric settle structurally cannot excite and springs
         it, and `stand_test` shoves the body at 10% of its own tipping velocity so the fix has a

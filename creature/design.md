@@ -549,12 +549,37 @@ than the schedule itself:
   prevent. Promotion is a claim about the policy, and a claim about a population cannot be
   made from a sample selected by the thing being measured.
 
+The bar itself is **relative, not absolute**, and that is the third thing that had to be got
+right. A parked animal collects 0.64 of the tracking reward when commands run to 0.3 Froude and
+0.31 when they run to 0.8, so a fixed number means "a little better than standing" at the start
+and "near perfect" later — backwards, since wider commands are the harder task.
+`_standstill_score` computes the parked baseline in closed form (the command components are
+drawn independently and uniformly, so the expectation of `exp(−(u²+w²)/tol²)` factorises into
+two `erf` differences, with `stand_fraction` mixed in separately) and the bar sits
+`curriculum_margin` of the way from there to perfect. `speed_cap` is a property whose setter
+recomputes the bar, so the one place the cap is written from outside — `train.py` restoring it
+on `--resume` — cannot leave a stale bar behind.
+
 `_advance_curriculum` is called only when `auto_reset` is on, so an evaluation env — handed a
 fixed command grid and never training — cannot advance a curriculum it is not part of. The cap
 lives in the checkpoint alongside the weights and the normaliser, for the same reason the
 normaliser does: a resume that restarts the curriculum at its initial width hands a competent
 policy a task it solved millions of steps ago, and the learning curve takes a visible step
 backwards for reasons entirely internal to the resume.
+
+**Result.** 20 M steps in 170 minutes on the CPU. The cap holds at 0.30 for 1.1 M steps while
+tracking climbs 0.40 → 0.83, then widens on earned promotions and reaches the full range at
+~3.4 M. The finished policy tracks the whole of it: over a 64-point command sweep the worst
+error is −0.040 Froude at the top, `r_speed` never falls below 0.93, tilt stays at 3–4°, and
+every animal survives the full 20 s at every command. Cost of transport rises monotonically
+0.82 → 2.62 across the sweep — the physically right shape, and not something the reward asks
+for directly.
+
+**Report the table, not the mean.** The pre-curriculum run's scalar evaluation return looked
+respectable and its per-command breakdown was `speed 0.000` in all twelve rows. A mean over a
+command grid that a motionless animal reads perfectly at one end of will hide a total failure
+to locomote, which is the one thing P1 exists to detect, so `train.py --eval CKPT` prints the
+breakdown and says so underneath it.
 
 ### Textures: non-stationarity, not randomness
 
