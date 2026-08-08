@@ -1,0 +1,92 @@
+# pattern_worley.ftsl — cellular (Worley / Voronoi) noise, all four outputs (O1).
+#
+# The four pattern functions demoed here query the same 3-D cellular point set
+# (one jittered feature point per unit lattice cell) under a runtime metric
+# (0 Euclidean, 1 Manhattan, 2 Chebyshev):
+#
+#   worley(x, y, z, metric)     F1  — distance to the nearest feature point
+#   worley2(x, y, z, metric)    F2  — distance to the second-nearest
+#   worleyd(x, y, z, metric)    F2 - F1 — 0 exactly on the cell borders
+#   worleyid(x, y, z, metric)   flat per-cell random value in [0,1)
+#
+# Each surface below uses a different output/metric pair:
+#   back wall  — worleyd, Euclidean: F2-F1 vanishes on the Voronoi edges, so
+#                thresholding it low paints a dark crack network (dried mud).
+#   left wall  — worley F1, Chebyshev: concentric square rings around each
+#                feature point read as glowing techy panels.
+#   right wall — worley F1, Manhattan: the same field under L1 turns the cells
+#                into diamond facets.
+#   floor      — worleyid: a flat random value per cell — terracotta patchwork
+#                with no shading gradient inside a patch.
+#   stone ball — an isosurface: a sphere dented by Euclidean F1 (front-right).
+#                Cellular noise in a *field* expression; F1 is 1-Lipschitz, so
+#                max_gradient has a clean analytic bound (1 + 11*0.05 = 1.55).
+#                On the GPU a DF_EXPR leaf runs the fp32 pattern VM, so this
+#                also exercises the promote/demote path around the double core.
+#
+#   ftrace -in scenes/pattern_worley.ftsl -n 40000000 -window -keepwindow \
+#          -o png/pattern_worley.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# BACK WALL — crack network: F2-F1 is zero on the equidistant surface between
+# two feature points, so everything below ~0.14 becomes ink. 7 cells/meter.
+pattern "crackle" { expr "smoothstep(0.015, 0.14, worleyd(7*x, 7*y, 7*z, 0))" }
+
+# LEFT WALL — Chebyshev F1: square isolines around each feature point. Weight
+# rises with distance, so panel centres stay light and the borders go dark.
+pattern "panels" { expr "smoothstep(0.15, 0.85, worley(6*x, 6*y, 6*z, 2))" }
+
+# RIGHT WALL — Manhattan F1: the L1 ball is an octahedron, so the isolines are
+# diamonds. Range runs a little past 1, hence the wider smoothstep.
+pattern "facets" { expr "smoothstep(0.2, 1.0, worley(6*x, 6*y, 6*z, 1))" }
+
+# FLOOR — per-cell id: one flat random weight per cell blends the two layers
+# into an unshaded patchwork (borders are the id's ownership boundaries).
+pattern "patch" { expr "worleyid(5*x, 5*y, 5*z, 0)" }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "ink"   { type diffuse reflect rgb 0.05 0.08 0.22 }
+material "lite"  { type diffuse reflect rgb 0.93 0.93 0.93 }
+material "rust"  { type diffuse reflect rgb 0.72 0.30 0.10 }
+material "green" { type diffuse reflect greenwall }
+
+material "backwall"  { type mix  layer "lite" 0.5  layer "ink"  0.5  weight_map pattern:crackle }
+material "leftwall"  { type mix  layer "ink"  0.5  layer "lite" 0.5  weight_map pattern:panels  }
+material "rightwall" { type mix  layer "green" 0.5 layer "lite" 0.5  weight_map pattern:facets  }
+material "floormat"  { type mix  layer "rust" 0.5  layer "lite" 0.5  weight_map pattern:patch   }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material floormat }
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material backwall }
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material leftwall }
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material rightwall }
+
+# A hammered-stone ball: base radius 0.22 dented by Euclidean F1 (recentred on
+# its ~0.65 mean so the dents cut both ways). ~5 cells across the ball at
+# 11 cells/unit. F1 is 1-Lipschitz, so |grad| <= 1 + 11*0.05 = 1.55; 2.0 adds
+# margin. Front-right so the crackle wall stays readable behind it.
+material "stone" { type diffuse reflect rgb 0.62 0.58 0.52 }
+isosurface {
+    material stone
+    function {
+        translate 0.62 0.24 0.62
+        expr "r - 0.22 - 0.05*(worley(11*x, 11*y, 11*z, 0) - 0.65)"
+    }
+    contained_by { min 0.32 -0.06 0.32   max 0.92 0.54 0.92 }
+    max_gradient 2.0
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 400 400 }
+}

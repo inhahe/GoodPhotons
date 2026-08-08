@@ -4372,6 +4372,16 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                 st[sp-1] = (float)vout[(int)nd.a];
                 break;
             }
+            case PatOp::Worley: {  // cellular noise (double core): promote / demote like PovFn
+                float m = st[--sp], zz = st[--sp], yy = st[--sp];
+                double w[3];
+                int mi = (int)floorf(m + 0.5f);
+                if (mi < 0) mi = 0; if (mi > 2) mi = 2;
+                patWorley((double)st[sp-1], (double)yy, (double)zz, mi, w);
+                int sel = (int)nd.a;
+                st[sp-1] = (float)((sel == 3) ? w[2] : (sel == 2) ? (w[1] - w[0]) : w[sel]);
+                break;
+            }
             case PatOp::PovFn: {   // POV internals are double-only: promote args, demote result
                 int id = (int)nd.a;
                 int na = povFnArity(id);

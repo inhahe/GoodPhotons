@@ -25,6 +25,7 @@
 #include <algorithm>       // sort: CSE register-priority ordering
 #include "linalg.h"
 #include "pov_functions.h"   // exact POV-Ray internal isosurface functions (f_torus, ...)
+#include "worley.h"          // 3-D cellular (Worley/Voronoi) noise (host+device)
 
 // The grid sampler below is shared verbatim by the CPU evaluator and the CUDA
 // pattern VM (render_cuda.cu includes this header), so it needs the same
@@ -151,6 +152,17 @@ enum class PatOp : int {
     // varName() are unperturbed.
     DNoise,
     DTurb,
+    // 3-D cellular (Worley/Voronoi) noise, one output per node: `a` holds the
+    // output selector (0=F1 nearest-point distance, 1=F2 second-nearest,
+    // 2=F2-F1 crack network, 3=per-cell random id in [0,1)). Pops (x, y, z,
+    // metric) where metric rounds/clamps to 0 Euclidean / 1 Manhattan /
+    // 2 Chebyshev — a runtime operand, so the look can vary spatially. Pure
+    // function of its operands (CSE shares it; `a` keys the node), evaluated
+    // in double on every backend via the WORLEY_HD patWorley in worley.h
+    // (fp32 VM promotes/demotes, like PovFn/DNoise). Exact F1/F2 by adaptive
+    // ring search, not the approximate 3x3x3 (see worley.h). Appended at the
+    // END of the enum so the VarX..VarV scans and varName() are unperturbed.
+    Worley,
 };
 
 // Register-file size available to a CSE-optimized program (per evaluator invocation).
@@ -567,6 +579,15 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 st[sp-1] = vout[(int)nd.a];
                 break;
             }
+            case PatOp::Worley: {
+                double m = st[--sp], zz = st[--sp], yy = st[--sp], w[3];
+                int mi = (int)floor(m + 0.5);
+                if (mi < 0) mi = 0; if (mi > 2) mi = 2;
+                patWorley(st[sp-1], yy, zz, mi, w);
+                int sel = (int)nd.a;
+                st[sp-1] = (sel == 3) ? w[2] : (sel == 2) ? (w[1] - w[0]) : w[sel];
+                break;
+            }
             case PatOp::PovFn: {
                 int id = (int)nd.a;
                 int na = povFnArity(id);
@@ -714,13 +735,16 @@ inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
         {"smoothstep",PatOp::Smoothstep,3},{"noise",PatOp::Noise,3},
     };
     for (const F& g : fs) if (s == g.n) { out = g.op; arity = g.ar; return true; }
-    // Vector-noise components (O2). The component index rides the povId out-channel
-    // (it is a generic payload slot: the emit site copies it into the node's `a`,
-    // exactly as it does for a POV internal id).
+    // Vector-noise components (O2) and Worley outputs (O1). The component /
+    // output index rides the povId out-channel (it is a generic payload slot:
+    // the emit site copies it into the node's `a`, exactly as it does for a
+    // POV internal id).
     struct V { const char* n; PatOp op; int ar; int comp; };
     static const V vfs[] = {
         {"dnoisex",PatOp::DNoise,3,0},{"dnoisey",PatOp::DNoise,3,1},{"dnoisez",PatOp::DNoise,3,2},
         {"dturbx",PatOp::DTurb,6,0},{"dturby",PatOp::DTurb,6,1},{"dturbz",PatOp::DTurb,6,2},
+        {"worley",PatOp::Worley,4,0},{"worley2",PatOp::Worley,4,1},
+        {"worleyd",PatOp::Worley,4,2},{"worleyid",PatOp::Worley,4,3},
     };
     for (const V& g : vfs) if (s == g.n) { out = g.op; arity = g.ar; povId = g.comp; return true; }
     int id, ar;
@@ -1041,8 +1065,9 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
             PatOp op; int ar; int povId; funcOp(t.name, op, ar, povId);
             PatNode nd; nd.op = op;
             if      (op == PatOp::PovFn) nd.a = (double)povId;
-            else if (op == PatOp::DNoise || op == PatOp::DTurb)
-                                         nd.a = (double)povId;   // component index (0/1/2)
+            else if (op == PatOp::DNoise || op == PatOp::DTurb ||
+                     op == PatOp::Worley)
+                                         nd.a = (double)povId;   // component / output index
             else if (op == PatOp::Tex)   nd.a = (double)t.texId;    // resolved at tokenize
             else if (op == PatOp::Spec)  nd.a = (double)t.texId;    // shares the resolved-index slot
             else if (op == PatOp::Grid || op == PatOp::Scatter)
@@ -1168,6 +1193,7 @@ inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes) {
     if (op == PatOp::PovFn)                       { pops = povFnArity((int)a); return true; }
     if (op == PatOp::DNoise)                      { pops = 3; return true; }
     if (op == PatOp::DTurb)                       { pops = 6; return true; }
+    if (op == PatOp::Worley)                      { pops = 4; return true; }
     if (op == PatOp::Tex)                         { pops = 2; return true; }
     if (op == PatOp::Spec)                        { pops = 1; return true; }
     if (op == PatOp::StReg)                       { pops = 0; pushes = 0; return true; }  // peeks

@@ -1640,6 +1640,30 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `DNoise[0] + 0.5` clamped, bit-exact — anchoring the new code to the already-trusted
   scalar port with zero tolerance.
 
+  **Cellular / Worley noise (`PatOp::Worley`, v0.159.0).** Self-contained in
+  `src/worley.h` (host+device, the same `__CUDACC__` guard idiom as `pov_noise.h`): one
+  feature point per integer lattice cell, jittered by a murmur3-finalizer hash chain
+  (full avalanche, so neighbouring cells are uncorrelated and CPU/GPU agree
+  bit-for-bit). One VM op serves four surface spellings — `worley` (F1), `worley2`
+  (F2), `worleyd` (F2−F1), `worleyid` (per-cell random in `[0,1)`) — with the **output
+  selector riding the node payload `a`** (the `DNoise` component-index convention),
+  while the **metric is a runtime operand** (rounded, clamped to 0 Euclidean /
+  1 Manhattan / 2 Chebyshev) so it can itself be an expression. The search is *exact*,
+  unlike the common 3×3×3 neighbourhood (whose F1 can be beaten by a cell two rings
+  out): concentric Chebyshev rings with the early-out "ring r's cells all lie ≥ r−1
+  away in every supported metric (each metric ≥ the Chebyshev point distance), so once
+  r−1 ≥ F2 no farther ring can improve" — average cost the same 27 cells, worst case a
+  ring or two more; the hard ring cap 8 is unreachable math and only guards NaN inputs.
+  Wiring follows the O2 checklist verbatim: enum appended at the end, `patOpStackEffect`
+  arity 4, payload keys the CSE hash-consing (`worley+worley2` of one point stay two
+  nodes), fp32 device VM promotes/demotes around the double core. `-checkworley` runs
+  seven mutation-tested sections; the load-bearing one compares F1/F2/**and id** against
+  a fixed ±6-block (13³) brute force with no early-out and independent floor/min logic —
+  provably sufficient since cells beyond ring 6 lie ≥ 6 away while F2 within the
+  always-populated 3×3×3 block is ≤ 6 (its Manhattan diameter) — plus metric-ordering
+  (order statistics are monotone), 1-Lipschitz continuity straddling cell walls (the
+  floor-vs-truncation trap), compile/reject, CSE, and distribution sanity.
+
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
   **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the

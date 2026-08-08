@@ -2871,6 +2871,265 @@ static int checkVNoise() {
     return ok ? 0 : 1;
 }
 
+// Worley / cellular noise self-test (src/worley.h: patWorley; src/pattern.h:
+// PatOp::Worley, reached from a pattern expression as worley / worley2 /
+// worleyd / worleyid). Validates, with no scene and no renderer:
+//   §1 EXACTNESS: F1/F2/id against a ±6-block (13^3 = 2197 cells) brute force
+//      with no early-out and independently written floor/min logic, all three
+//      metrics, id exact and F1/F2 to 1e-12. The block is provably sufficient:
+//      cells beyond ring 6 lie >= 6 away in every metric, while F2 within the
+//      always-populated 3x3x3 block is <= 6 (its Manhattan diameter). This is
+//      the section that catches a broken ring enumeration, a too-eager
+//      early-out ((r-1) >= f1 instead of f2), truncation-instead-of-floor at
+//      negative coordinates, and id taken from the wrong cell.
+//   §2 metric ordering: Chebyshev <= Euclidean <= Manhattan holds per point
+//      pair, and order statistics are monotone, so F1 AND F2 obey the same
+//      chain (the feature points don't depend on the metric). A metric index
+//      mixup, or a Chebyshev max written as a min, flips an inequality.
+//   §3 hard invariants: 0 <= F1 <= F2 < inf, id in [0,1), and the per-metric F1
+//      caps from the query's own cell always holding a point: sqrt(3) / 3 / 1.
+//   §4 continuity: F1 and F2 are 1-Lipschitz (k-th smallest of distances to one
+//      fixed global point set), so an eps axis step moves them by <= eps under
+//      every metric. The steps straddle integer cell walls at negative AND
+//      positive coordinates — the classic truncation bug teleports the search
+//      neighbourhood there and jumps F1 by O(1).
+//   §5 the compile path: worley/worley2/worleyd/worleyid == the direct call
+//      (output-selector payload, F2-F1 wiring), the metric operand rounding to
+//      nearest and clamping to [0,2]; wrong arity and unknown names reject.
+//   §6 CSE: identical calls collapse; worley vs worley2 on the same arguments
+//      must NOT (the output selector lives in the payload and keys the node).
+//   §7 distribution sanity: Euclidean F1 mean in [0.4, 0.9] (theory ~0.65),
+//      >= 256 distinct ids in 4096 draws, |corr(F1, id)| < 0.1.
+static int checkWorley() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkworley] %-40s got %.12g want %.12g  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    // Deterministic probe points: fixed LCG, spanning ±20 so cells at negative
+    // coordinates (the floor-vs-truncation trap) are exercised throughout.
+    uint64_t rng = 0x2545F4914F6CDD1Dull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+    const int NPTS = 4096;
+    std::vector<double> px(NPTS), py(NPTS), pz(NPTS);
+    for (int i = 0; i < NPTS; ++i) {
+        px[i] = (frand() - 0.5) * 40.0;
+        py[i] = (frand() - 0.5) * 40.0;
+        pz[i] = (frand() - 0.5) * 40.0;
+    }
+
+    // ---- §1: exact F1/F2/id vs a ±6-block brute force (no early-out) ---------
+    // The reference enumerates a fixed 13^3 raster with its own floor and its
+    // own two-slot min tracking; only the cell hash chain (the noise's
+    // *definition*) is shared. F1/F2 tolerance 1e-12 (identical expression
+    // shapes; the slack only covers compiler scheduling/FMA differences between
+    // the two loops), id compared exactly — a selection flip would need two
+    // feature points at bit-identical distance.
+    {
+        double w1 = 0.0, w2 = 0.0, wid = 0.0;
+        for (int m = 0; m < 3; ++m)
+            for (int i = 0; i < NPTS; ++i) {
+                const double x = px[i], y = py[i], z = pz[i];
+                const int bx = (int)std::floor(x), by = (int)std::floor(y),
+                          bz = (int)std::floor(z);
+                double best1 = 1e300, best2 = 1e300, bestId = 0.0;
+                for (int cz = bz - 6; cz <= bz + 6; ++cz)
+                for (int cy = by - 6; cy <= by + 6; ++cy)
+                for (int cx = bx - 6; cx <= bx + 6; ++cx) {
+                    const unsigned int h1 = patWorleyCellHash(cx, cy, cz);
+                    const unsigned int h2 = patWorleyMix(h1 + 0x9e3779b9u);
+                    const unsigned int h3 = patWorleyMix(h2 + 0x9e3779b9u);
+                    const double fpx = (double)cx + (double)h1 * (1.0 / 4294967296.0);
+                    const double fpy = (double)cy + (double)h2 * (1.0 / 4294967296.0);
+                    const double fpz = (double)cz + (double)h3 * (1.0 / 4294967296.0);
+                    const double dx = x - fpx, dy = y - fpy, dz = z - fpz;
+                    double d;
+                    if (m == 1)      d = std::fabs(dx) + std::fabs(dy) + std::fabs(dz);
+                    else if (m == 2) d = std::fmax(std::fabs(dx), std::fmax(std::fabs(dy), std::fabs(dz)));
+                    else             d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (d < best1) {
+                        best2 = best1; best1 = d;
+                        bestId = (double)patWorleyMix(h3 + 0x9e3779b9u) * (1.0 / 4294967296.0);
+                    } else if (d < best2) {
+                        best2 = d;
+                    }
+                }
+                double w[3]; patWorley(x, y, z, m, w);
+                w1  = std::fmax(w1,  std::fabs(w[0] - best1));
+                w2  = std::fmax(w2,  std::fabs(w[1] - best2));
+                wid = std::fmax(wid, std::fabs(w[2] - bestId));
+            }
+        ok &= chk("S1 F1 vs brute force, all metrics", w1, 0.0, 1e-12);
+        ok &= chk("S1 F2 vs brute force, all metrics", w2, 0.0, 1e-12);
+        ok &= chk("S1 id vs brute force, all metrics", wid, 0.0, 0.0);
+    }
+
+    // ---- §2: metric ordering (same feature points, ordered metrics) ----------
+    {
+        double viol = 0.0;
+        for (int i = 0; i < NPTS; ++i) {
+            double we[3], wm[3], wc[3];
+            patWorley(px[i], py[i], pz[i], 0, we);
+            patWorley(px[i], py[i], pz[i], 1, wm);
+            patWorley(px[i], py[i], pz[i], 2, wc);
+            viol = std::fmax(viol, wc[0] - we[0]);   // cheb F1 <= eucl F1
+            viol = std::fmax(viol, we[0] - wm[0]);   // eucl F1 <= manh F1
+            viol = std::fmax(viol, wc[1] - we[1]);   // same chain for F2
+            viol = std::fmax(viol, we[1] - wm[1]);
+        }
+        ok &= chk("S2 F1/F2 metric ordering (max violation)", viol, 0.0, 0.0);
+    }
+
+    // ---- §3: hard invariants -------------------------------------------------
+    {
+        const double cap[3] = { 1.7320508075688774, 3.0, 1.0 };   // sqrt(3), L1, Linf cell diagonal
+        bool inv = true;
+        for (int m = 0; m < 3 && inv; ++m)
+            for (int i = 0; i < NPTS && inv; ++i) {
+                double w[3]; patWorley(px[i], py[i], pz[i], m, w);
+                if (!(w[0] >= 0.0) || !(w[1] >= w[0]) || !(w[1] < 1e300) ||
+                    !(w[2] >= 0.0) || !(w[2] < 1.0) || !(w[0] <= cap[m])) {
+                    std::printf("[checkworley] S3 invariant broken (metric %d, pt %d): "
+                                "F1=%.17g F2=%.17g id=%.17g  BAD\n", m, i, w[0], w[1], w[2]);
+                    inv = false; ok = false;
+                }
+            }
+        if (inv) ok &= chk("S3 0<=F1<=F2, id in [0,1), F1 caps", 0.0, 0.0, 0.0);
+    }
+
+    // ---- §4: 1-Lipschitz continuity across cell walls ------------------------
+    {
+        const double eps = 1e-3;
+        double wl = 0.0;
+        for (int m = 0; m < 3; ++m)
+            for (int axis = 0; axis < 3; ++axis)
+                for (int i = 0; i < 512; ++i) {
+                    double p[3] = { (frand() - 0.5) * 40.0,
+                                    (frand() - 0.5) * 40.0,
+                                    (frand() - 0.5) * 40.0 };
+                    // snap this axis to straddle the nearest integer plane
+                    p[axis] = std::floor(p[axis] + 0.5) - eps * 0.5;
+                    double q[3] = { p[0], p[1], p[2] };
+                    q[axis] += eps;
+                    double wa[3], wb[3];
+                    patWorley(p[0], p[1], p[2], m, wa);
+                    patWorley(q[0], q[1], q[2], m, wb);
+                    wl = std::fmax(wl, std::fabs(wa[0] - wb[0]));
+                    wl = std::fmax(wl, std::fabs(wa[1] - wb[1]));
+                }
+        ok &= chk("S4 F1/F2 step > eps across cell walls", std::fmax(wl - eps, 0.0), 0.0, 1e-12);
+    }
+
+    // ---- §5: the compile path ------------------------------------------------
+    {
+        struct Case { const char* expr; int metric; int sel; };
+        const Case cases[] = {
+            {"worley(x, y, z, 0)",   0, 0}, {"worley(x, y, z, 1)",   1, 0},
+            {"worley(x, y, z, 2)",   2, 0}, {"worley2(x, y, z, 0)",  0, 1},
+            {"worleyd(x, y, z, 1)",  1, 2}, {"worleyid(x, y, z, 2)", 2, 3},
+            // the metric operand is runtime: round to nearest, clamp to [0,2]
+            {"worley(x, y, z, 0.4)", 0, 0}, {"worley(x, y, z, 1.6)", 2, 0},
+            {"worley(x, y, z, -9)",  0, 0}, {"worley(x, y, z, 99)",  2, 0},
+        };
+        for (const Case& cs : cases) {
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(cs.expr, prog, perr)) {
+                std::printf("[checkworley] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+                ok = false; continue;
+            }
+            double wv = 0.0;
+            for (int i = 0; i < 256; ++i) {
+                PatCtx c = makePatCtx(Vec3{px[i], py[i], pz[i]}, 0.0, Vec3{0, 0, 1});
+                double got = patternEval(prog.data(), (int)prog.size(), c);
+                double w[3]; patWorley(px[i], py[i], pz[i], cs.metric, w);
+                double want = (cs.sel == 3) ? w[2] : (cs.sel == 2) ? (w[1] - w[0]) : w[cs.sel];
+                wv = std::fmax(wv, std::fabs(got - want));
+            }
+            char lbl[80]; std::snprintf(lbl, sizeof lbl, "S5 VM `%s` == direct", cs.expr);
+            ok &= chk(lbl, wv, 0.0, 0.0);
+        }
+        const char* bads[] = {
+            "worley(x, y, z)",         // arity 4, given 3
+            "worley(x, y, z, 0, 1)",   // arity 4, given 5
+            "worleyf(x, y, z, 0)",     // no such spelling
+        };
+        for (const char* be : bads) {
+            std::vector<PatNode> prog; std::string perr;
+            if (compilePatternExpr(be, prog, perr)) {
+                std::printf("[checkworley] `%s` compiled but should be rejected  BAD\n", be);
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §6: CSE shares identical calls; the output selector keys the node ---
+    {
+        std::vector<PatNode> same, sameOpt, mixed, mixedOpt; std::string perr;
+        ok &= compilePatternExpr("worley(x, y, z, 0) + worley(x, y, z, 0)", same, perr);
+        ok &= compilePatternExpr("worley(x, y, z, 0) + worley2(x, y, z, 0)", mixed, perr);
+        sameOpt = same;   patternOptimizeCSE(sameOpt);
+        mixedOpt = mixed; patternOptimizeCSE(mixedOpt);
+        if (sameOpt.size() >= same.size()) {
+            std::printf("[checkworley] CSE did not shrink `worley + worley` (%zu -> %zu)  BAD\n",
+                        same.size(), sameOpt.size());
+            ok = false;
+        }
+        double wv = 0.0;
+        for (int i = 0; i < 256; ++i) {
+            PatCtx c = makePatCtx(Vec3{px[i], py[i], pz[i]}, 0.0, Vec3{0, 0, 1});
+            double w[3]; patWorley(px[i], py[i], pz[i], 0, w);
+            // if the payload were left out of the CSE key, `worley + worley2`
+            // would collapse to 2*F1 and miss (F1 + F2) here
+            wv = std::fmax(wv, std::fabs(patternEval(sameOpt.data(),  (int)sameOpt.size(),  c) - 2.0 * w[0]));
+            wv = std::fmax(wv, std::fabs(patternEval(mixedOpt.data(), (int)mixedOpt.size(), c) - (w[0] + w[1])));
+        }
+        ok &= chk("S6 CSE'd programs evaluate right (max err)", wv, 0.0, 0.0);
+    }
+
+    // ---- §7: distribution sanity ---------------------------------------------
+    {
+        double meanF1 = 0.0, meanId = 0.0;
+        std::vector<double> ids(NPTS), f1s(NPTS);
+        for (int i = 0; i < NPTS; ++i) {
+            double w[3]; patWorley(px[i], py[i], pz[i], 0, w);
+            f1s[i] = w[0]; ids[i] = w[2];
+            meanF1 += w[0]; meanId += w[2];
+        }
+        meanF1 /= NPTS; meanId /= NPTS;
+        if (meanF1 < 0.4 || meanF1 > 0.9) {
+            std::printf("[checkworley] S7 Euclid F1 mean %.4f outside [0.4, 0.9]  BAD\n", meanF1);
+            ok = false;
+        }
+        std::vector<double> sorted = ids;
+        std::sort(sorted.begin(), sorted.end());
+        int distinct = 1;
+        for (int i = 1; i < NPTS; ++i) if (sorted[i] != sorted[i - 1]) ++distinct;
+        if (distinct < 256) {
+            std::printf("[checkworley] S7 only %d distinct ids in %d draws  BAD\n", distinct, NPTS);
+            ok = false;
+        }
+        double cov = 0.0, vf = 0.0, vi = 0.0;
+        for (int i = 0; i < NPTS; ++i) {
+            cov += (f1s[i] - meanF1) * (ids[i] - meanId);
+            vf  += (f1s[i] - meanF1) * (f1s[i] - meanF1);
+            vi  += (ids[i] - meanId) * (ids[i] - meanId);
+        }
+        double corr = cov / std::sqrt(vf * vi + 1e-300);
+        ok &= chk("S7 |corr(F1, id)| < 0.1", std::fmax(std::fabs(corr) - 0.1, 0.0), 0.0, 0.0);
+    }
+
+    std::printf("[checkworley] worst absolute error = %.3g\n", worst);
+    std::printf("[checkworley] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic N-D scatter sampler self-test (src/pattern.h: PatScatter /
 // patScatterSample, reached from a pattern expression as `scatter:<name>(c0, …)`).
 // The ragged sibling of -checkgrid; validates, with no scene and no renderer:
@@ -8001,6 +8260,7 @@ static int run(int argc, char** argv) {
     bool checkUpsampleOnly = false;
     bool checkGridOnly = false;
     bool checkVNoiseOnly = false;
+    bool checkWorleyOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
     bool checkPropOnly = false;
@@ -8396,6 +8656,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkvnoise")) checkVNoiseOnly = true;
+        else if (!std::strcmp(argv[i], "-checkworley")) checkWorleyOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
         else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
@@ -8577,6 +8838,7 @@ static int run(int argc, char** argv) {
     if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed
     if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
     if (checkVNoiseOnly)   return checkVNoise();   // ditto (vector noise / domain warp)
+    if (checkWorleyOnly)   return checkWorley();   // ditto (cellular / Worley noise)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
     if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)

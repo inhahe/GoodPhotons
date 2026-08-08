@@ -4563,14 +4563,19 @@ the *randomness vocabulary* is thin. Nothing below is started.
 - `emit pattern:` / `emit_map` (shipped v0.80.0) — patterns drive emission, not just albedo.
 
 **The gaps — all confirmed absent (0 hits repo-wide):**
-- [ ] **O1 — cellular / Worley / Voronoi noise.** The single biggest hole. `worley`, `voronoi`,
-      `cellular`, `crackle` all return **zero** matches. This is the family behind scales, cracked mud,
-      cobble, cell/pore structure, leather, reptile skin — none of which value noise or fBm can fake.
-      Note `pov_functions.h` explicitly documents **`f_pattern(77)` as EXCLUDED** ("needs POV's
-      Perlin-noise / pattern / pigment engine, not yet ported"), and POV's `crackle` lives behind exactly
-      that door — so this is a known, already-signposted omission. Want F1, F2, F2−F1, and the cell id
-      (for per-cell randomisation), as separate outputs; 3-D; and a distance-metric selector
-      (Euclidean / Manhattan / Chebyshev) since the metric is most of the look.
+- [x] **O1 — cellular / Worley / Voronoi noise.** ✅ 2026-08-08, v0.159.0. Everything the item asked
+      for: 3-D, one jittered feature point per lattice cell (murmur3-finalizer hash chain, CPU/GPU
+      bit-identical), four outputs as separate spellings — `worley` (F1), `worley2` (F2), `worleyd`
+      (F2−F1 crack network), `worleyid` (per-cell random in [0,1)) — and the distance metric as a
+      **runtime operand** (0 Euclidean / 1 Manhattan / 2 Chebyshev, rounded+clamped), so the look can
+      itself vary spatially. One `PatOp::Worley` with the output selector riding the payload `a` (the
+      O2 convention), on all three VM backends; F1/F2 are **exact** (adaptive Chebyshev-ring search
+      with the bound "ring r ≥ r−1 away in every metric", not the common 3×3×3 approximation).
+      Seven-section `-checkworley` (mutation-tested): ±6-block brute force with independent floor/min
+      logic, metric ordering, hard invariants, 1-Lipschitz continuity across cell walls, compile +
+      rejects, CSE payload keying, distribution sanity. Demo `scenes/pattern_worley.ftsl` (all four
+      outputs, all three metrics, plus an F1-dented isosurface stone that exercises the fp32 DF_EXPR
+      path); docs in FTSL.md §6.1 + REFERENCE.md.
 - [x] **O2 — vector-valued noise (`DNoise`) for domain warping.** ✅ 2026-08-08, v0.158.0. Exact ports
       of POV's `DNoise` (gradient-vector noise) and `DTurbulence` (its octave fBm) in `pov_noise.h`,
       exposed as `PatOp::DNoise`/`PatOp::DTurb` with the component index riding the node payload:
@@ -4735,6 +4740,35 @@ that item mostly a binding exercise there.
 ---
 
 ## Progress log
+- 2026-08-08: **O1 — cellular / Worley / Voronoi noise (v0.159.0).** `src/worley.h` +
+  `PatOp::Worley` expose `worley` (F1), `worley2` (F2), `worleyd` (F2−F1) and `worleyid` (flat
+  per-cell id) with a *runtime* metric operand (0 Euclid / 1 Manhattan / 2 Chebyshev,
+  `floor(m+0.5)` clamped) on all three VM backends — one murmur3-fmix32-hashed feature point per
+  integer lattice cell, and an **exact** adaptive search: Chebyshev shells enumerated ring by
+  ring with the early-out "stop once `(r−1) ≥ F2`", sound because every supported metric ≥ the
+  Chebyshev distance and ring r's points lie ≥ r−1 away. `-checkworley` §1 pins that search
+  against a fixed ±6 (13³) brute-force block — sufficient because F2 found within the
+  always-populated 3×3×3 neighbourhood is ≤ 6 (its Manhattan diameter) while cells beyond ring 6
+  are ≥ 6 in every metric; tolerances 1e-12 for F1/F2 (worst observed 1.22e-15), **0.0 for id**.
+  §2–§7 add per-cell id flatness + boundary jumps, metric ordering (order statistics are
+  monotone, so it holds for F2 as well as F1), 1-Lipschitz continuity probes, parser
+  arity/rounding/rejection cases, CSE distinctness of the four selectors, and range sanity.
+  Mutation tests behaved as designed: weakening the early-out to `(r−1) ≥ F1` fails §1-F2
+  (err 0.238) and §4 while **F1 stays exact** — exactly the bug class separating an F1-only
+  implementation from a correct F2 — and `floor`→truncation fails §1/§2/§4 loudly (errs
+  0.69–0.97). **The fp32 discovery is the part worth remembering:** grepping call sites showed
+  `dPatternEvalF` is reached *only* from DF_EXPR isosurface leaves — GPU material patterns run
+  the double VM — so no `-rgb` render ever exercised the fp32 backend (the O2 entry's claim is
+  corrected above). The fix that's also a better demo: `scenes/pattern_worley.ftsl` grew a
+  hammered-stone isosurface ball, `r − 0.22 − 0.05·(worley(11x,11y,11z,0) − 0.65)` — F1 is
+  1-Lipschitz, so `max_gradient` has the analytic bound 1 + 11·0.05 = 1.55 (2.0 shipped) —
+  alongside four wall/floor patterns covering every output/metric pair (Euclidean `worleyd`
+  crack network, Chebyshev square panels, Manhattan diamond facets, `worleyid` terracotta
+  patchwork). CPU↔GPU parity with the fp32 ball in frame: raw 1.11 % (MC grain), 8×-box mean
+  **0.15 %** / max 4.2⁄255 — statistically identical to the ball-less variant (0.16 %),
+  confirming the promote/demote shim keeps the double Worley core exact on GPU. Docs: FTSL.md
+  §6.1 + isosurface expr list, REFERENCE.md pattern section + self-test roster, design.md
+  pattern-VM architecture note.
 - 2026-08-08: **O2 — vector-valued noise for domain warping (v0.158.0).** Exact ports of POV-Ray's
   `DNoise` and `DTurbulence` into `pov_noise.h`, exposed as `dnoisex/y/z(x,y,z)` and
   `dturbx/y/z(x,y,z,octaves,lambda,omega)` in every pattern/field expression on all three VM
@@ -4752,7 +4786,9 @@ that item mostly a binding exercise there.
   device VM promotes/demotes like `PovFn`. Demo `scenes/pattern_warp.ftsl` — marble (sine bands
   displaced by `dturbx`), agate (thresholded warped bands), and Quilez-style fBm-warped value
   noise — renders with identical pattern structure on `-device cpu` and `gpu` (8×-downsampled
-  mean |diff| **0.14 %**, pure MC grain; the fp32 backend verified visually via `-rgb`). Docs:
+  mean |diff| **0.14 %**, pure MC grain). *Correction 2026-08-08: the original claim here that the
+  fp32 backend was "verified visually via `-rgb`" was wrong — `dPatternEvalF` is only reached from
+  DF_EXPR isosurface leaves, so a `-rgb` render never touches it; see the O1 entry.* Docs:
   FTSL.md §6.1 + isosurface expr list, REFERENCE.md pattern section + self-test roster,
   design.md pattern-VM architecture note.
 - 2026-08-07: **`fur { }` — the groom generator, and a wrong claim corrected by measurement

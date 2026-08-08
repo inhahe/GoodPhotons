@@ -5,7 +5,7 @@ long prose blocks whose opening paragraph reads like a plan but whose later
 `**STATUS (date) … DONE**` sub-paragraph says it landed. That makes "what's actually left?"
 expensive to answer.
 
-**This file is the actionable extract, as of 2026-08-05 (ftrace v0.138.0).** It carries only
+**This file is the actionable extract, as of 2026-08-08 (ftrace v0.159.0).** It carries only
 work that is genuinely undone *and* not explicitly ruled out. `TODO.md` remains the
 authoritative design text — every item below names its section/item ID there, and the full
 rationale, prior art and scoping live in that entry, not here.
@@ -117,8 +117,33 @@ materials attached to geometry, and calls a dielectric dispersive only if its `i
 actually varies over 400–700 nm, so a constant-IOR dielectric doesn't nag. Print-only; the mode-W
 image is byte-identical to 0.137.0.
 
-**Section 1 is again empty of actionable ftrace items** — everything left is either blocked on a
-user decision (§2) or deferred by measurement (§3).
+### O — procedural-texture / noise roadmap  *(ftrace; added to TODO.md 2026-08-07)*
+*TODO.md §O (the "third bullet point" batch, user-greenlit 2026-08-07).*
+
+- ~~**O2** vector-valued noise (`DNoise`/`DTurbulence`) for domain warping~~ **DONE 2026-08-08
+  (v0.158.0)** — `dnoisex/y/z`, `dturbx/y/z`, `-checkvnoise`, `scenes/pattern_warp.ftsl`.
+- ~~**O1** cellular / Worley / Voronoi noise~~ **DONE 2026-08-08 (v0.159.0)** — `worley` /
+  `worley2` / `worleyd` / `worleyid` with a runtime Euclid/Manhattan/Chebyshev metric operand,
+  exact adaptive ring search, `-checkworley`, `scenes/pattern_worley.ftsl`.
+- **O3** non-stationary randomness (mostly idiom + docs; needs curvature/cavity primitives)
+- **O4** anisotropic / flow-aligned noise (needs a per-hit tangent frame + flow-field binding)
+- **O5** blue noise / Gabor noise / sparse convolution
+- **O6** reaction–diffusion (a *bake* step feeding the existing `tex:` path)
+- **O7** by-example synthesis / histogram-preserving tiling (composes with `PatOp::Tex`)
+- **O8** band-limiting / antialiasing the noise under minification (the quality gate for O1–O7
+  at distance)
+
+### P2 / P3 — fur follow-ons  *(ftrace)*
+*TODO.md §P (P1 shipped v0.150.0: the native `curve` primitive; the `fur` groom generator
+shipped v0.152.0).*
+
+- **P2** sub-pixel variance + aggregate-BSDF LOD (fibers thinner than a pixel).
+- **P3** fiber BCSDF: Marschner R/TT/TRT baseline, medulla lobes (Yan 2015/2017) for animal
+  fur, dual scattering (Zinke 2008) for light coats.
+
+### J3b — loom N-D / generalized-grammar superset  *(loom)*
+*TODO.md §J3b — four generalizations; item 4 (N-D record input domain) is excluded (user,
+2026-07-25), the rest are open.*
 
 ---
 

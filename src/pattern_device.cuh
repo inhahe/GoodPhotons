@@ -159,6 +159,15 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
                 st[sp-1] = vout[(int)nd.a];
                 break;
             }
+            case PatOp::Worley: {   // cellular noise: a = 0 F1 / 1 F2 / 2 F2-F1 / 3 id
+                double m = st[--sp], zz = st[--sp], yy = st[--sp], w[3];
+                int mi = (int)floor(m + 0.5);
+                if (mi < 0) mi = 0; if (mi > 2) mi = 2;
+                patWorley(st[sp-1], yy, zz, mi, w);
+                int sel = (int)nd.a;
+                st[sp-1] = (sel == 3) ? w[2] : (sel == 2) ? (w[1] - w[0]) : w[sel];
+                break;
+            }
             case PatOp::PovFn: {
                 int id = (int)nd.a;
                 int na = povFnArity(id);

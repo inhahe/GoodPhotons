@@ -2010,7 +2010,8 @@ isosurface {
 The `expr` string is compiled by the **same math VM as procedural patterns** (variables
 `x y z` and `r = |p|`, plus `sin cos tan exp log sqrt abs floor fract sign min max pow
 atan2 clamp mix smoothstep noise`, the vector-noise components `dnoisex/y/z` /
-`dturbx/y/z` for gradient-noise domain warping, and the constant `pi`). Because an arbitrary field is
+`dturbx/y/z` for gradient-noise domain warping, cellular noise
+`worley/worley2/worleyd/worleyid(x, y, z, metric)`, and the constant `pi`). Because an arbitrary field is
 **not** a signed distance and has no analytic bound, a `function` isosurface **must**
 supply a `contained_by { min <x y z>  max <x y z> }` box (the region the surface is
 marched inside). Safe sphere-tracing needs a **Lipschitz bound** `L ≥ max|∇f|` so a step
@@ -2333,6 +2334,15 @@ or a native-primitive wrap — see below). Two authoring forms:
   the coordinate another pattern is sampled at* — `sin(6.2832*(3*x +
   1.1*dturbx(3*x,3*y,3*z, 6, 2, 0.5)))` is the classic POV marble; worked example
   `scenes/pattern_warp.ftsl`, deterministic self-test `ftrace -checkvnoise`.
+  There is also **cellular (Worley / Voronoi) noise** — one jittered feature point
+  per unit lattice cell, queried by `worley(x, y, z, metric)` (F1, the distance to
+  the nearest point), `worley2` (F2), `worleyd` (F2−F1, `0` exactly on cell
+  borders — crack networks), and `worleyid` (a flat per-cell random value in
+  `[0,1)`), all under a runtime `metric` operand rounded and clamped to
+  **0 Euclidean / 1 Manhattan / 2 Chebyshev**. Distances are raw at cell size 1
+  (Euclidean F1 mean ≈ 0.65), F1/F2 are exact (adaptive ring search, not the
+  common 3×3×3 approximation) and CPU/GPU bit-identical; worked example
+  `scenes/pattern_worley.ftsl`, deterministic self-test `ftrace -checkworley`.
   It can also **sample a declared image
   as a term**: `tex:<name>(u, v)` returns the mean of the texel's three linear RGB
   channels (the same `Texture::scalarAt` sampler a `texture:<name>` slot binding uses,
@@ -3217,7 +3227,7 @@ alone can't restore, so they are not disk-resumable.
 `-checkcurve`, `-checkfur`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
-`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checksun`, `-checkbind`, `-checkprop`,
+`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checksun`, `-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
 `PASS`/`FAIL`. `-checkcurve` guards the `curve` primitive: it cross-checks the
 round-cone intersector against the exact analytic SDF, the degenerate

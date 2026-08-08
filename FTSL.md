@@ -364,6 +364,34 @@ Identical calls (same component, same arguments) are merged by the expression
 optimizer; different components of the same point are separate evaluations. Worked
 example: `scenes/pattern_warp.ftsl` (marble, agate, and fBm-warped value noise).
 
+**Cellular noise — `worley`, `worley2`, `worleyd`, `worleyid`:** 3-D Worley /
+Voronoi noise: one deterministically-jittered feature point per unit lattice cell,
+queried under a selectable distance metric. All four take the same arguments
+`(x, y, z, metric)` and read the same point set:
+
+| function | value |
+|---|---|
+| `worley` | **F1** — distance to the nearest feature point (bubbly cells) |
+| `worley2` | **F2** — distance to the second-nearest |
+| `worleyd` | **F2 − F1** — 0 exactly on the borders between cells (crack networks) |
+| `worleyid` | flat random value in `[0,1)` owned by the F1 cell (per-cell randomisation) |
+
+`metric` is an ordinary runtime operand (any expression), rounded to nearest and
+clamped: **0 Euclidean** (round organic cells — stone, cobble), **1 Manhattan**
+(diamond facets), **2 Chebyshev** (square techy panels). Distances are raw at cell
+size 1 — Euclidean F1 spans about `[0, 1.1]` with mean ≈ 0.65 — so scale the input
+coordinates to set the cell density and `smoothstep` the output into `[0,1]`:
+
+```
+# dark crack network on the Voronoi cell borders, 7 cells per unit
+pattern "crackle" { expr "smoothstep(0.015, 0.14, worleyd(7*x, 7*y, 7*z, 0))" }
+```
+
+F1/F2 are mathematically exact (adaptive ring search, not the common fixed
+3×3×3 approximation), identical bit-for-bit on CPU and GPU, and validated by
+`-checkworley`. Worked example: `scenes/pattern_worley.ftsl` (all four outputs,
+all three metrics).
+
 **Image samples — `tex:<name>(u, v)`:** samples a declared `texture` as a *scalar term
 inside the formula*, so a photograph can be one operand of an expression rather than
 only bound wholesale to a slot:
@@ -1455,7 +1483,9 @@ and a Lipschitz bound (`max_gradient`, see §10.3).
   deterministic 3-D value noise in `[0,1]` (same on CPU/GPU). The vector-noise
   components `dnoisex/y/z(x,y,z)` and `dturbx/y/z(x,y,z,octaves,lambda,omega)` (§6.1)
   work here too — they need only coordinates — so a field can be domain-warped by
-  gradient noise. The image sample
+  gradient noise, and so does cellular noise
+  `worley/worley2/worleyd/worleyid(x,y,z,metric)` (§6.1) for crystal/stone-like
+  fields. The image sample
   `tex:<name>(u, v)` (§6.1) is **not** available here — a field expression *defines* a
   surface, so there is no surface to sample yet; using it is a compile error.
 - **Operators:** `+ - * / % ^` and unary `-`. `^` is `pow` (right-assoc), `%` is
