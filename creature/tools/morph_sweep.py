@@ -47,8 +47,11 @@ def one(rig: str, params, seed: int, scale: float):
         return "error", str(e).split("\n")[0][:90]
     model = mujoco.MjModel.from_xml_string(to_mjcf(creature))
     r = stand_test(model, mujoco.MjData(model))
+    # `peak` is the worst tilt reached while recovering from the shove, and is what the verdict
+    # is decided on; `pitch` alone reads tidy on a body that folded sideways and came back.
     detail = (f"sank {r.drop*1000:+5.0f} mm ({r.rel_drop*100:4.1f}%), pitch "
-              f"{r.tilt:+5.1f} deg, margin {r.margin*1000:+5.0f} mm, "
+              f"{r.tilt:+5.1f} deg, peak {r.tilt_peak:5.1f} deg, "
+              f"margin {r.margin*1000:+5.0f} mm, "
               f"peak k {max(L.stiffness for L in loads):7.0f}")
     return ("stands" if r.ok else "collapses"), detail
 

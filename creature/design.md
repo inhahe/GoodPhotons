@@ -151,7 +151,7 @@ actually produced. Four requirements, per joint, take the max:
 | requirement | why it exists |
 |---|---|
 | **static** — hold the measured standing torque within `sag` | the obvious one, and on its own it is badly insufficient |
-| **floor** — tone proportional to the subtree weight the joint *could* carry | a dog standing square needs zero torque at every yaw and abduction joint by symmetry, but they still need tone or the body flops laterally the moment it is disturbed |
+| **floor** — tone proportional to the subtree weight the joint *could* carry | a dog standing square needs zero torque at every yaw and abduction joint by symmetry, but they still need tone or the body flops laterally the moment it is disturbed. Note that *how much* tone is a guess here — a plausible proportionality, not a measurement. `tune.brace`, below, is what replaced the guess |
 | **buckle** — beat the rate at which the required torque grows as the joint deflects | a standing quadruped stacks stifle and shoulder near the ground-reaction line (that is *good* design — it is why a horse can sleep standing), so those joints hold almost no torque and sizing them from that torque gives them almost no spring. The load through them is compressive, so any deflection moves the load line off the joint. Euler buckling. For the stifle this term is ~50× the static one |
 | **ceiling** — never exceed what the declared timestep and integrator can integrate | derived per-joint from `k = I(2πf)²`, *not* authored |
 
@@ -183,6 +183,63 @@ Two things this pass must do that are easy to omit:
   joints are. Chasing that ran one 314 kg draw to 2.3×10⁶ N·m/rad over eight rounds of a
   loop that was never going to converge. Diverging quietly is worse than failing.
 
+**A symmetric settle cannot see an antisymmetric mode — ever.** Not "is unlikely to": the
+default rig is passively unstable in roll with a 0.67 s e-folding time, and it sat at
+*exactly* 0.00° of roll for 19 of 20 simulated seconds, because a perfectly left-right
+symmetric body released from a perfectly symmetric pose has nothing to roll towards. The
+instability was real, the release was clean, and `stand_test` therefore reported a body that
+would fall over the instant a policy breathed on it as STANDS. `measure_buckling` was blind
+to it too, for an unrelated and equally structural reason: the destabilising term *is* the
+ground reaction redistributing between left and right as the mass moves out over one foot
+line, and it runs under a frozen reaction, so every abduction joint's entry is exactly 0.00.
+Three separate instruments, three blind spots, one shared cause — none of them ever moved
+the body sideways.
+
+So `tune.brace` moves it sideways, and `stand_test` gained the same shove as a second phase.
+The disturbance is sized against the stance's own **tipping velocity**
+`v_c = w·√(g/h)` (`tune.tipping_velocity`, from `½mv_c² = mg(√(h²+w²) − h)`), not against the
+Froude speed `√(gL)`: past `v_c` the body rotates about a foot as one rigid piece and *no*
+stiffness helps — measured, with abduction stiffness at ×3, ×12 and ×100 all ending at ~90°
+tilt — so a Froude-quoted nudge measures stance width rather than passive stability. As a
+fraction of `v_c` the shove means the same thing on every morph: `NUDGE_FRACTION = 0.10`
+carries 1% of the energy needed to tip the body over rigidly, so anything that falls, fell
+because it *bent*.
+
+Three findings from this pass are worth keeping, because each one contradicts an assumption
+that felt safe:
+
+- **Stiffness is not monotonically stabilising.** Stiffening all 31 joints ×2 or ×3
+  *collapses* the shove test, while stiffening exactly the four abduction joints ×3 passes
+  it. So the mode has to be identified, not blanketed — `brace` reads the joint-space
+  deviation while growth is still linear (abduction joints come back at 0.21° against 0.0025°
+  for the sagittal ones, an 84× separation) and stiffens only the carriers. Nothing in it
+  knows the word "abduction", or "lateral", or "left".
+- **Peak tilt saturates, so it cannot be a progress signal.** Once a body is past its balance
+  point it ends up on its side regardless, and every failing multiplier reports the same
+  ~95°. On one morph the peak moved 96.8° → 95.6° across a 2× stiffness range and then fell
+  off a cliff to 1.4°. A divergence guard reading that metric concluded stiffness was not
+  helping and gave up one step short of a body that stands. The growth rate `λ` does not
+  saturate — it is measured on the way up, in the linear regime — and it is also the quantity
+  the sizing model is written about, so the guard reads `λ²` instead. `λ²` alone is not enough
+  either: it keeps falling even when the trunk is tipping rigidly, because `‖dq‖` is a
+  joint-deflection norm and stiffer joints deflect less either way, so the guard also stops
+  once the mode's springs have been multiplied fourfold with the peak unmoved.
+- **Selecting the mode repeatedly is self-erasing.** A joint is chosen for deflecting, and
+  stiffening it is precisely what stops it deflecting, so it drops out of the very next read
+  and something else takes its place. The set changed identity every pass, which both starved
+  the secant of two points on one line and stopped raising the joints that were actually the
+  fix. The mode is therefore read **once**, on the unbraced body, and held.
+
+**How much** stiffness is then a two-point solve rather than a search. For a mode with modal
+inertia `I`, destabilising stiffness `K_d` and restoring `x·K₀`, `λ² = (K_d − x·K₀)/I` is
+linear in `x`, so a secant on two measured `(x, λ²)` pairs locates marginal stability with no
+modal inertia, no mass matrix and no mode-shape normalisation to get wrong. `posture.buckle_margin`
+supplies the headroom over marginal, because `K_d` here *is* a buckling gradient — for a
+coordinated mode instead of a single joint — so no new constant is needed. Verified by hand
+before it was written: canis grows at 1.49/s as tuned and 0.575/s at twice the abduction
+stiffness, predicting marginal stability at 2.18× against a measured threshold between 2×
+and 3×. In practice the default rig converges in one pass (peak tilt 105° → 1.5°).
+
 **Armature is measured too, and for the same reason.** Reflected rotor inertia is
 `n²·I_rotor`, so the body-independent quantity is the *fraction* of the load it represents
 — a drive matched to a heavier limb puts a bigger motor behind a similar gear ratio.
@@ -201,9 +258,14 @@ since sizing it afterwards would tune the body against a mass matrix it does not
 Ordering, then, is not incidental — each pass changes the model the next one measures:
 
 ```
-auto_exclude   →  size_armature  →  measure  →  size_tone  →  relax
-(load path)       (mass matrix)     (torques)   (predict)     (correct)
+auto_exclude  →  size_armature  →  measure  →  size_tone  →  relax     →  brace
+(load path)      (mass matrix)     (torques)   (predict)     (correct)    (disturb)
 ```
+
+`brace` is last because a shoved body and a sagging body want opposite corrections applied
+to different joints, and the shove is only meaningful once the creature is standing where
+it will actually stand. The order is safe in the direction it is used and not in the other:
+bracing costs sag nothing measurable (5.36% of withers before, 5.43% after).
 
 Two rig bugs were found by measurement that were invisible to loading, simulating and
 eyeballing, and both had been silently corrupting every torque reported before they were
@@ -230,12 +292,30 @@ ground projection inside the convex hull of the contact points), and it is check
 separately in `tune.support_polygon`.
 
 **Validation.** `tools/rig_report.py` reports the whole measurement; `creaturelab/validate.py`
-runs the acceptance bar — motors off, three seconds of gravity, does it still look like an
-animal standing up. Motors *off* is the point: a body that needs its controller to avoid
-collapsing has pushed the job of not falling over into the policy, where it costs training
-budget forever, instead of into the ligaments, where real animals put it. The tuner and the
-acceptance test share one `SETTLE_SECONDS`; when they disagreed (1.5 s vs 3 s) the tuner
-declared victory on a body that was still sinking.
+runs the acceptance bar — motors off, gravity, **a shove**, does it still look like an animal
+standing up. Motors *off* is the point: a body that needs its controller to avoid collapsing
+has pushed the job of not falling over into the policy, where it costs training budget
+forever, instead of into the ligaments, where real animals put it.
+
+The shove is not robustness testing bolted on top of the stand test; it is what makes the
+stand test able to answer its own question, for the reason above. It runs as a second phase
+after the settle, over the weakest edge of the body's own support polygon, in **both**
+directions — a body that holds together shoved left and folds shoved right has not passed
+anything, and testing both is also what keeps a symmetric rig's tuned gains symmetric, since
+the roll's joint response is *not* antisymmetric (the side that unloads goes slack instead of
+deflecting, so one direction alone reports one shoulder giving 1.9× its mirror). The verdict
+is taken on the worst peak tilt reached during recovery, not the final one: a body that swings
+out to 40° and happens to come back has not passed anything a policy could rely on.
+
+The tuner and the acceptance test share one `SETTLE_SECONDS`; when they disagreed (1.5 s vs
+3 s) the tuner declared victory on a body that was still sinking. `NUDGE_FRACTION` is shared
+for the same reason and it is the stronger case — a tuner that braced against a gentler shove
+than the bar applies would certify bodies the bar then rejects, and one that braced against a
+harsher shove would spend stiffness the bar never asked for. Both constants are set at
+measured *plateaus* rather than chosen for roundness: 0.05–0.12 give the same verdict on all
+48 bodies of the two harder morph scales, which is the property a constant like this needs.
+The calibration also records why the phase exists at all — with the shove disabled, the bar
+passes a body that falls over on its own.
 
 Sanity checks the report performs because they are invisible by eye in a 25-body tree:
 left/right torque symmetry (an asymmetric rig teaches an asymmetric gait), whether each

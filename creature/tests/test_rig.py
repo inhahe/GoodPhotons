@@ -24,9 +24,9 @@ from creaturelab.emit_mjcf import (geom_z_extent, place_on_ground,  # noqa: E402
                                    to_mjcf)
 from creaturelab.tune import (SEAT, UnstablePose, build_tuned,      # noqa: E402
                               ground_reaction, stiffness_ceiling,
-                              support_polygon)
-from creaturelab.validate import (stand_test, trunk_tilt,           # noqa: E402
-                                  withers_height)
+                              support_polygon, tipping_velocity)
+from creaturelab.validate import (SETTLE_SECONDS, stand_test,       # noqa: E402
+                                  trunk_tilt, withers_height)
 
 RIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "rigs", "canis.ftcl")
@@ -295,8 +295,120 @@ def test_tilt_does_not_fold_a_large_rotation_into_a_small_one(quat, expect):
     assert trunk_tilt(model, data) == pytest.approx(expect, abs=1e-6)
 
 
+def test_tipping_velocity_is_the_stance_geometry_and_nothing_else(tuned):
+    """`v_c = w*sqrt(g/h)`, from the support polygon -- not a fraction of the Froude speed.
+
+    Pinned because the temptation to quote the shove in `sqrt(gL)` is strong -- it is the unit
+    everything else in this project uses -- and it is wrong: past `v_c` the body rotates about
+    a foot as one rigid piece, so no stiffness helps, and 0.10*sqrt(gL) is not survived at a
+    hundredfold abduction stiffness. The direction has to come out of the hull too, so that
+    nothing in the tuner needs to know the body has a left and a right.
+    """
+    _, _, model, _ = tuned
+    data = mujoco.MjData(model)
+    place_on_ground(model, data)
+    for _ in range(int(SETTLE_SECONDS / model.opt.timestep)):
+        mujoco.mj_step(model, data)
+
+    pts, _, com, margin = support_polygon(model, data)
+    h = com[2] - np.mean([p[2] for p in pts])
+    v_c, direction = tipping_velocity(model, data)
+    assert v_c == pytest.approx(margin * math.sqrt(9.81 / h), rel=1e-6)
+    assert np.linalg.norm(direction) == pytest.approx(1.0)
+    # A quadruped's weakest support edge is a long one running fore-aft, so the way it topples
+    # is sideways. This asserts the geometry came out right, not that the code knew in advance.
+    assert abs(direction[1]) > abs(direction[0])
+    # And the reason the scale had to be geometric at all: it is nowhere near sqrt(gL).
+    assert v_c < 0.25 * math.sqrt(9.81 * withers_height(model, data))
+
+
+def test_the_shove_is_what_makes_the_stand_test_able_to_answer(tuned):
+    """The regression that matters: without the shove the bar cannot see a real collapse.
+
+    canis is passively unstable in roll with a 0.67 s e-folding time. It sat at *exactly*
+    0.00 deg of roll for 19 of 20 simulated seconds, because a symmetric body released from a
+    symmetric pose has nothing to roll towards -- so a symmetric settle called it STANDS, and
+    P1 would have trained a policy on a dog that falls over on its own. Both halves are
+    pinned here: the shove catches it, and the tuner's `brace` pass fixes it.
+    """
+    from creaturelab import tune
+
+    # The tuned rig -- `brace` included -- must survive its own shove with room to spare.
+    _, _, model, _ = tuned
+    r = stand_test(model, mujoco.MjData(model))
+    assert r.ok, f"tuned rig fell: sag {r.rel_drop*100:.1f}%, peak tilt {r.tilt_peak:.1f} deg"
+    assert r.nudge > 0.0 and r.tilt_peak < 4.0
+
+    # The same rig with `brace` skipped: what the tuner produced before this existed.
+    creature = load(RIG)
+    real, tune.brace = tune.brace, lambda *a, **k: 0.0
+    try:
+        tune.apply_posture(creature)
+    finally:
+        tune.brace = real
+    unbraced = mujoco.MjModel.from_xml_string(to_mjcf(creature))
+
+    assert stand_test(unbraced, mujoco.MjData(unbraced), nudge_frac=0.0).ok, \
+        "a symmetric settle is supposed to be fooled by this body -- that is the whole point"
+    fell = stand_test(unbraced, mujoco.MjData(unbraced))
+    assert not fell.ok and fell.tilt_peak > 45.0, \
+        f"the shove failed to expose the roll mode: peak tilt only {fell.tilt_peak:.1f} deg"
+
+
+def test_brace_stiffens_the_mode_and_not_the_skeleton(tuned):
+    """`brace` must stay surgical, because stiffening broadly makes the body *worse*.
+
+    Measured, and the reason the mode-selection threshold is where it is: stiffening all 31
+    joints by 2x or 3x collapses the shove test outright, while stiffening exactly the four
+    abduction joints by 3x passes it. Stiffness is not monotonically stabilising. So a pass
+    that quietly widened its selection would look like a fix and be a regression, and it
+    would not fail any other test in this file.
+    """
+    creature, _, _, _ = tuned
+    plain = load(RIG)
+    from creaturelab.tune import apply_posture
+
+    real = None
+    try:
+        from creaturelab import tune
+        real, tune.brace = tune.brace, lambda *a, **k: 0.0
+        apply_posture(plain)
+    finally:
+        from creaturelab import tune
+        tune.brace = real
+
+    before = {j.name: j.stiffness for b in plain.bones for j in b.joints}
+    raised = {j.name for b in creature.bones for j in b.joints
+              if j.stiffness > before.get(j.name, 0.0) * 1.001}
+    assert raised, "brace changed nothing at all"
+    assert len(raised) <= 12, f"brace stiffened {len(raised)} joints: {sorted(raised)}"
+    # It must be symmetric on a symmetric rig. `brace` has no notion of mirrored joints; it
+    # gets this by shoving both signs of the weakest axis, because the roll's joint response
+    # is *not* antisymmetric -- the side that unloads goes slack instead of deflecting, and
+    # one direction alone reports one shoulder giving 1.9x its mirror.
+    for name in raised:
+        if "_l" in name:
+            assert name.replace("_l", "_r") in raised, f"{name} raised but not its mirror"
+
+
 def test_randomised_morphs_mostly_stand():
-    """P4's premise: sampling the morph distribution has to yield trainable bodies."""
+    """P4's premise: sampling the morph distribution has to yield trainable bodies.
+
+    All eight, and not marginally -- the worst peak tilt under the shove is 2.6 deg against
+    an 8 deg bar -- so this asserts the full count rather than some fraction of it.
+
+    It briefly did not, and that is the part worth recording. When `stand_test` began
+    shoving the body, seed 3 failed, and the tempting reading was that a harder bar is
+    simply harder and the expected count should follow it down. That reading was wrong.
+    `brace` had identified seed 3's mode correctly and then abandoned it one secant step
+    short of a body that stands, for two bugs that only a failing morph was ever going to
+    surface: it judged progress on peak tilt, which saturates near 95 deg once the body is
+    past its balance point and so carries no gradient in exactly the regime the decision is
+    made in, and it re-measured the mode's joints every pass, which is self-erasing --
+    stiffening a joint is what stops it deflecting, so the fix drops out of the next read --
+    and which silently invalidated the secant's own model. Both are fixed, and documented at
+    length in `tune.brace`. Relaxing this assertion would have concealed both of them.
+    """
     import random
     params = load(RIG).params
     ok = 0

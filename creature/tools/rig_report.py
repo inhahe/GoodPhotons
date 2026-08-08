@@ -32,7 +32,8 @@ from creaturelab.emit_mjcf import (geom_z_extent, natural_mass,  # noqa: E402
                                    place_on_ground, to_mjcf)
 from creaturelab.tune import (SEAT, build_tuned,        # noqa: E402
                               steps_per_cycle_floor)
-from creaturelab.validate import stand_test, withers_height   # noqa: E402
+from creaturelab.validate import (NUDGE_FRACTION, stand_test,   # noqa: E402
+                                  withers_height)
 
 
 def build(rig: str, sets: dict[str, float], clearance: float = 0.01):
@@ -163,6 +164,11 @@ def main() -> int:
     print(f"\nunactuated stand test (3 s, motors off): sank {r.drop*1000:+.0f} mm "
           f"({r.rel_drop*100:.1f}% of withers), pitch {r.tilt:+.1f} deg, "
           f"support margin {r.margin*1000:+.0f} mm  {r.verdict}")
+    # The verdict is decided on the shove, so the shove has to be reported -- otherwise a body
+    # that folds sideways prints a tidy pitch next to *** COLLAPSES ***. A symmetric settle
+    # cannot excite an antisymmetric mode at all, which is the reason this phase exists.
+    print(f"  then shoved at {r.nudge:.3f} m/s ({NUDGE_FRACTION*100:.0f}% of the "
+          f"{r.v_tip:.3f} m/s that would tip this stance over): peak tilt {r.tilt_peak:.1f} deg")
     return 0 if r.ok else 3
 
 

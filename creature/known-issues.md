@@ -57,7 +57,63 @@ failure: seeds 30 and 32 topple to ~50° while sagging only 2–4%, from support
 +60 and +18 mm. They are not sprung too softly — they are bodies whose feet are in the
 wrong place, and no amount of passive tone fixes a foot in the wrong place.
 
-### 3. The default rig is passively unstable in roll, and neither guard can see it
+### 4. `steps_per_cycle_floor`'s integrator branch is factually meaningless, and the ceiling it feeds ignores damping
+
+*(found 2026-08-08, while calibrating `tune.brace`.)* `stiffness_ceiling` derives the
+stiffest followable spring as `k = I(2πf)²` with `f = 1/(steps_per_cycle_floor·dt)`, and
+`steps_per_cycle_floor` returns **12 for implicit integrators and 30 for Euler**. That branch
+does not correspond to anything measurable. On a single hinge, Euler, `implicitfast` and
+`implicit` give **bit-identical** spring-response error, because MuJoCo integrates joint
+damping implicitly in *all* of them and joint stiffness explicitly in *all* of them — the
+integrator choice changes the contact and Coriolis treatment, not the passive spring.
+
+The constant is also mis-framed. It is an **accuracy** budget, not a stability limit:
+
+| steps/cycle | amplitude error | stable? |
+|---|---|---|
+| 12 | ~6% | yes |
+| 8 | ~9% | yes |
+| 6 | ~13% | yes |
+| 4 | ~22% | yes |
+| 3 | — | yes for any ζ ≥ 0.05 |
+
+So 12 buys 6% error, and the "must not be less than" framing implies a cliff that is not
+there. It further ignores `damping_ratio` entirely, although ζ is what actually sets where
+the stability edge sits.
+
+**Why this matters, measured.** The ceiling binds on real bodies. Of the 8 failures in 24
+`--scale 1.0` draws, **five stand at a smaller timestep with no other change** — `brace`
+identifies the mode correctly and then asks for more stiffness than 2 ms can integrate:
+
+```
+seed  1   dt 0.002 falls (164°)   dt 0.001 falls           dt 0.0005 STANDS (2.8°)
+seed  3   dt 0.002 falls (101°)   dt 0.001 STANDS (1.4°)
+seed  5   dt 0.002 falls (166°)   dt 0.001 falls           dt 0.0005 STANDS (1.0°)
+seed  9   dt 0.002 falls ( 94°)   dt 0.001 STANDS (2.3°)
+seed 21   dt 0.002 falls (119°)   dt 0.001 falls           dt 0.0005 STANDS (3.1°)
+```
+
+That is exactly what `stiffness_ceiling`'s own docstring says such a case means — "the
+timestep is too large, which is a real and reportable fact about the model, not something to
+paper over" — so the *behaviour* is honest. The debt is that the constant gating it is partly
+fictional.
+
+Not changed yet, deliberately, for two reasons. First, the defensible loosening to 8 does
+**not** recover these morphs: seed 3 needs 6 and seed 5 needs 4, and 4 is 22% error, so the
+real fix is a smaller default timestep or an implicit spring treatment, not a relaxed
+constant. Second, the single-hinge probe that produced the tables above is not validated on a
+31-joint articulated body with contacts, which is where it would be applied — **redo that
+measurement on the articulated body before touching the constant.**
+
+The other three failures are not this: seed 15 is issue 1, seed 8 sags 84% (issue 2), and
+seed 7 survives the shove at 1.02° but fails on sag at 10.8% and gets *worse* at a smaller
+timestep — a separate thing, unexplained.
+
+---
+
+## Done
+
+### 3. The default rig was passively unstable in roll, and neither guard could see it  **DONE**
 
 *(found 2026-08-08, while writing P1's env.)* The **unmorphed canis rig** stands
 indefinitely from a perfectly symmetric start, and falls over in 3.5–6.5 s under zero
@@ -152,12 +208,12 @@ still need tone or the body flops laterally the moment it is disturbed"), which 
 the one requirement in the table that is a *guess* rather than a measurement of the mode it
 exists to prevent. It guesses 2.2× low.
 
-**Consequences now.** `env.EnvConfig.init_joint_noise` defaults to 0.05, so every P1 episode
-starts in a state the passive body cannot hold, which contradicts the project's own rule that
-not-falling-over belongs in the ligaments and not in the policy. P1's bar ("a stable gait
-emerges") would be measured against a body that falls over on its own, so it is blocked on
-this. `test_env.py::test_passive_body_holds_its_stance` is deliberately written with zero
-reset noise and says so — it passes, and would fail at the default.
+**Consequences at the time.** `env.EnvConfig.init_joint_noise` defaults to 0.05, so every P1
+episode started in a state the passive body could not hold, which contradicts the project's own
+rule that not-falling-over belongs in the ligaments and not in the policy. P1's bar ("a stable
+gait emerges") would have been measured against a body that falls over on its own, so P1 was
+blocked on this. `test_env.py::test_passive_body_holds_its_stance` was deliberately written
+with zero reset noise and said so — it passed, and would have failed at the default.
 
 Ruled out by direct check: the abduction joints are **not** unsprung (39.651 and 39.975
 N·m/rad, in the same range as the sagittal joints), so this is not the zero-stiffness bug it
@@ -171,9 +227,63 @@ no regression test. Both must be validated against the randomised-morph yield (c
 at scale 1.0) rather than just against the default rig, since the change can only make springs
 stiffer and the stiffness ceiling is real.
 
----
+**Fixed**, essentially along those lines, in four pieces:
 
-## Done
+- **`tune.tipping_velocity`** gives the stance its own toppling speed `v_c = w·√(g/h)` from
+  the energy balance `½mv_c² = mg(√(h²+w²) − h)`, plus the direction to topple in, taken as
+  the outward normal of the weakest support-polygon edge. Canis: w = 80.5 mm, h = 459.0 mm,
+  **v_c = 0.372 m/s**, direction (+0.020, −1.000). Nothing in it needs the concepts "lateral"
+  or "left and right" — the direction falls out of the hull.
+- **`validate.stand_test` gained a second phase**: settle, then shove at `NUDGE_FRACTION`
+  (0.10) of `v_c` in **both** signs of that axis, and judge on the worst peak tilt. Sized
+  against `v_c` rather than the Froude speed `√(gL)` because past `v_c` no stiffness helps at
+  all — abduction stiffness at ×3, ×12 and ×100 all end at ~90° tilt — so 0.10 carries 1% of
+  the rigid-tipping energy and anything that falls, fell because it *bent*. The fraction sits
+  on a measured plateau: 0.05–0.12 give the same verdict on all 48 bodies of the two harder
+  morph scales.
+- **`tune.brace`** shoves the settled body, identifies which joints carry the mode from the
+  joint-space deviation while growth is still linear, and sizes them by secant on
+  `λ² = (K_d − x·K₀)/I`, with `posture.buckle_margin` for headroom (no new constant — `K_d`
+  here *is* a buckling gradient, for a coordinated mode rather than a single joint). The
+  default rig converges in one pass: peak tilt **105.3° → 1.5°**, sag 5.28%, 8 joints at ×2,
+  ceiling not binding, `build_tuned` ~1.1 s.
+- **Both signs of the shove**, in the tuner as well as the bar. Not symmetry decoration: the
+  roll's *joint* response is not antisymmetric, because the side that unloads goes slack
+  instead of deflecting, so one direction alone reports one shoulder giving 1.9× its mirror
+  and would spring the pair differently.
+
+Three things learned that were not in the plan, each of which had to be measured because it
+contradicts an assumption that felt safe:
+
+1. **Stiffness is not monotonically stabilising.** Stiffening all 31 joints ×2 or ×3
+   *collapses* the shove test, while stiffening exactly the 4 abduction joints ×3 passes it.
+   So an over-broad mode selection actively harms. The selection threshold (0.6 of the largest
+   deviation) was set at a plateau — the same joint family over a 130× amplitude range, 0.023°
+   to 3.06° — after 0.25 was found to pull in 20 of 31 joints including neck and tail.
+2. **Peak tilt saturates and cannot be a progress signal.** Every failing multiplier reports
+   ~95°, because past the balance point the body ends up on its side regardless. A divergence
+   guard reading it saw 96.8° → 95.6° across a 2× stiffness range, concluded stiffness was not
+   helping, and abandoned a morph one secant step from standing (3.5× gives 1.4°). The guard
+   now reads `λ²`, which is measured in the linear regime and is the quantity the secant models
+   — *and* additionally stops after a fourfold multiplier with the peak unmoved, because `λ²`
+   alone keeps falling under rigid tipping (‖dq‖ is a joint-deflection norm, and stiffer joints
+   deflect less whether or not the trunk is going over). Without that second half, a body shoved
+   at 1.2·v_c ran all six passes and kept **639×** its springs while still landing on its side.
+3. **Re-selecting the mode each pass is self-erasing.** A joint is chosen for deflecting, and
+   stiffening it is exactly what stops it deflecting, so it drops out of the next read and
+   something else replaces it. The set changed identity every pass, which starved the secant of
+   two points on one line *and* stopped raising the joints that were the actual fix. The mode is
+   now read once, on the unbraced body, and held — which is also what the secant's own model
+   requires, since `λ² = (K_d − x·K₀)/I` describes one fixed spring set scaled by one number.
+
+Regression coverage: `test_the_shove_is_what_makes_the_stand_test_able_to_answer` (with
+`tune.brace` stubbed out, the rig passes at `nudge_frac=0` and reaches >45° with the shove —
+i.e. it reproduces the blind spot on demand), `test_tipping_velocity_is_the_stance_geometry_and_nothing_else`,
+`test_brace_stiffens_the_mode_and_not_the_skeleton`, and `test_randomised_morphs_mostly_stand`,
+which is now 8/8 and was what surfaced findings 2 and 3.
+
+Cost to randomised yield, honestly: the bar is strictly harder, so scale-1.0 goes 92% (no
+shove) → 67% (with it). Most of that gap is issue 4 rather than the tuner.
 
 ### `Defaults.joint_armature` and `joint_damping` were absolute literals  **DONE**
 

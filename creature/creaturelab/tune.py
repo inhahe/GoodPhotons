@@ -132,6 +132,99 @@ def support_polygon(model, data):
     return pts, bids, com, float(margin)
 
 
+def tipping_velocity(model, data):
+    """The horizontal speed that would just topple the settled body, and the way it topples.
+
+    Returns `(v_c, direction)`: `v_c` in m/s, `direction` a unit 2-vector in the world xy
+    plane pointing out over the *weakest* edge of the support polygon.
+
+    Energy, nothing more. Toppling about a support edge a horizontal distance `w` away
+    raises the centre of mass from `h` to `sqrt(h^2 + w^2)`, so the kinetic energy needed is
+    `1/2 m v_c^2 = m g (sqrt(h^2 + w^2) - h)`, and for `w << h` that is `m g w^2 / 2h`:
+
+        v_c = w * sqrt(g / h)
+
+    with `w` the static stability margin `support_polygon` already computes and `h` the
+    centre-of-mass height above the contact plane. The small-`w` form is used deliberately
+    rather than the exact radical: `w` here is a *margin*, tens of millimetres against a
+    half-metre `h`, and the approximation is the standard one for that regime.
+
+    Why this exists, and why the obvious alternative is wrong. `validate.stand_test` needs
+    to perturb the body to expose modes a perfectly symmetric settle cannot (known-issues
+    #3: the default rig is passively unstable in roll, and stays at exactly 0.00 deg of roll
+    for 19 of 20 seconds because nothing ever breaks the symmetry). The natural scale for
+    such a nudge is the Froude speed `sqrt(gL)` -- it is the scale everything else in this
+    project is measured in. It does not work, and the measurement is worth recording:
+
+        nudge (x sqrt(gL))    0.02    0.05    0.10    0.20      <- final trunk tilt, deg
+        abduction stiffness x3   1.2    89.7    89.7    89.7        (~89 = lying on its side)
+        x12                      1.2    90.6    90.6    90.6
+        x100                     1.1     1.2    90.9    90.9
+
+    Even a hundredfold stiffer body cannot survive 0.10*sqrt(gL). That is not a tuning
+    shortfall, it is design.md's "a body whose centre of mass leaves its support polygon
+    topples about its feet no matter how rigid its joints are" appearing as a hard ceiling:
+    past `v_c` no joint stiffness whatsoever can help, because the body is not bending, it
+    is rotating about a foot as one rigid piece. A nudge quoted in `sqrt(gL)` therefore
+    means something different on every morph -- for canis 0.10*sqrt(gL) is 68% of `v_c`,
+    while a wide-stance body would shrug it off -- so an acceptance test built on it would
+    be judging stance width, not passive stability.
+
+    Quoted as a fraction of `v_c` it means the same thing everywhere, which is the whole
+    point: a wide stance gets a proportionally bigger nudge, automatically.
+
+    The direction falls out of the same geometry. It is the outward normal of the hull edge
+    the mass is closest to, so nothing here needs the concepts "lateral" or "left/right" --
+    on canis it comes back as (+0.020, -1.000), i.e. sideways, discovered rather than
+    assumed. That is what lets the test mean the same thing on a body plan this module has
+    never seen, up to and including one that does not walk.
+    """
+    import numpy as np
+
+    pts, bids, com, margin = support_polygon(model, data)
+    P = np.array([p[:2] for p in pts])
+    c2 = com[:2]
+
+    # Height above the plane the feet are actually on, not above z = 0: `place_on_ground`
+    # seats the feet by `SEAT` and a real foot geom has thickness, so using the world floor
+    # would misreport `h` by a few millimetres of a half-metre -- small, but free to get
+    # right, and it also makes this correct on a body standing on something raised.
+    h = float(com[2] - np.mean([p[2] for p in pts]))
+    g = float(np.linalg.norm(model.opt.gravity))
+
+    direction = None
+    if len(P) >= 3:
+        try:
+            from scipy.spatial import ConvexHull
+            hull = ConvexHull(P)
+            d = hull.equations[:, :2] @ c2 + hull.equations[:, 2]
+            direction = np.array(hull.equations[int(np.argmax(d)), :2])
+        except Exception:
+            direction = None
+    if direction is None:
+        # Degenerate support (one foot, or all feet collinear): there is no edge to pick, so
+        # topple in the direction the body is *already* going -- the offset of the mass from
+        # the foot line. `support_polygon` reports a negative margin here and the caller
+        # raises `UnstablePose`, so this branch exists to stay well-defined, not to be used.
+        if len(P) == 1:
+            direction = c2 - P[0]
+        else:
+            k = int(np.argmax(((P[:, None, :] - P[None, :, :]) ** 2).sum(-1)))
+            i, j = divmod(k, len(P))
+            ab = P[j] - P[i]
+            direction = np.array([-ab[1], ab[0]])
+            if float(direction @ (c2 - P[i])) < 0.0:
+                direction = -direction
+    norm = float(np.linalg.norm(direction))
+    direction = np.array([1.0, 0.0]) if norm <= 1e-12 else direction / norm
+
+    if h <= 0.0:
+        # The mass is at or below the contact plane. Nothing can tip it; there is no edge to
+        # go over. Reported as an infinite margin rather than a divide-by-zero.
+        return float("inf"), direction
+    return max(0.0, margin) * math.sqrt(g / h), direction
+
+
 @dataclass
 class JointLoad:
     """What one joint has to hold, and what it would take to hold it."""
@@ -715,6 +808,286 @@ def relax(creature: Creature, loads: list[JointLoad], owned_k: set[str],
     return worst
 
 
+def _growth_rate(t, a) -> float:
+    """Fit `a ~ exp(lambda*t)` and return lambda, in 1/s. `a` must be positive."""
+    import numpy as np
+
+    if len(t) < 3:
+        return 0.0
+    A = np.vstack([np.asarray(t), np.ones(len(t))]).T
+    return float(np.linalg.lstsq(A, np.log(np.asarray(a)), rcond=None)[0][0])
+
+
+def brace(creature: Creature, loads: list[JointLoad], owned_k: set[str], owned_c: set[str],
+          iters: int = 6, seconds: float | None = None,
+          trace_out: list | None = None) -> float:
+    """Shove the settled body and stiffen whatever mode catches it out. Returns peak tilt, rad.
+
+    `relax` settles the creature and fixes what sagged. That is a complete answer for
+    symmetric modes and no answer at all for antisymmetric ones, because the settle is
+    symmetric: the default canis rig e-folds in roll every 0.67 s, and sat at *exactly*
+    0.00 degrees of roll for 19 of 20 simulated seconds, because a symmetric body released
+    from a symmetric pose has nothing to roll towards. Neither `relax` nor `stand_test` could
+    see it. `measure_buckling` could not either, for an unrelated and equally structural
+    reason: the destabilising term *is* the ground reaction redistributing between left and
+    right as the mass moves out over one foot line, and `measure_buckling` runs under a
+    frozen reaction, so every abduction joint's entry is exactly 0.00 -- in the diagonal and
+    in the full coupled matrix alike. Three separate instruments, three blind spots, one
+    shared cause: none of them ever moved the body sideways.
+
+    So move it sideways. `validate.stand_test`'s own shove (`tipping_velocity` at
+    `NUDGE_FRACTION`), then the same argument `relax` makes -- measure the deflection that
+    actually happened and stiffen it -- with two differences that matter:
+
+    * **Which joints.** A toppling body reports enormous deflections in everything, so
+      `relax`'s per-joint rule would slam the whole skeleton into the timestep ceiling. The
+      mode is identified instead, by reading the joint-space deviation while the growth is
+      still linear: on canis the four abduction joints come back at 0.21 deg against 0.0025
+      for the sagittal ones, an 84x separation that needs no threshold tuning and, crucially,
+      no name matching. Nothing here knows the word "abduction", or "lateral", or "left".
+      Read once, on the unbraced body, and then held -- the secant below is a model of one
+      fixed set of springs scaled by one number, and re-reading the set each pass both breaks
+      that model and erases itself, since stiffening a joint is what stops it deflecting.
+    * **How much.** Sag is a static balance, so `relax`'s "missed the goal by 5x, multiply by
+      5" is the exact correction for a linear joint. An instability is not static: the
+      amplitude is exponential and the *rate* is what stiffness moves. For a mode with modal
+      inertia `I`, destabilising stiffness `K_d` and restoring `x*K_0`,
+
+          lambda^2 = (K_d - x*K_0) / I
+
+      which is linear in `x`. So fit `lambda` from the measured growth, and the second
+      measurement gives the whole line by secant -- no modal inertia, no mass matrix, no
+      mode-shape normalisation to get wrong. Verified by hand before it was written: canis
+      grows at 1.49/s as tuned and 0.575/s at twice the abduction stiffness, and this
+      predicts marginal stability at 2.18x against a measured threshold between 2x and 3x.
+
+    `posture.buckle_margin` supplies the headroom over marginal, because that is exactly what
+    it already means one level down -- `K_d` here *is* a buckling gradient, for a coordinated
+    mode instead of a single joint. Not a new constant, and the measured requirement agrees:
+    the eigenvalue threshold is 2.18x, the shove is actually survived from 2.5x, so 15%
+    headroom is the minimum and the rig's 1.8 is comfortably inside the timestep ceiling.
+    """
+    import copy
+
+    import mujoco
+    import numpy as np
+
+    from .validate import NUDGE_FRACTION, SETTLE_SECONDS, trunk_tilt_of
+
+    seconds = SETTLE_SECONDS if seconds is None else seconds
+    p = creature.posture
+    goal = max(p.sag, 1e-6)                      # aim at the joint-sag angle, bar is 8 deg
+    by_name = {L.name: L for L in loads}
+    trace: list[tuple[float, float]] = trace_out if trace_out is not None else []
+    best: tuple[float, dict] = (float("inf"), _gains(creature))
+    probe: tuple[float, float] | None = None     # (multiplier so far, lambda^2) of last pass
+    wanted: set[str] | None = None                # the mode's joints, measured once (see below)
+    first_peak: float | None = None               # the unbraced body, for the divergence guard
+    cum, peak = 1.0, 0.0
+
+    for _ in range(iters):
+        model = mujoco.MjModel.from_xml_string(to_mjcf(creature))
+        data = mujoco.MjData(model)
+        place_on_ground(model, data)
+        for _ in range(int(seconds / model.opt.timestep)):
+            mujoco.mj_step(model, data)
+        if not np.all(np.isfinite(data.qpos)):
+            raise RuntimeError("the model went non-finite while settling -- the passive "
+                               "springs are almost certainly too stiff for the timestep")
+
+        # Hinge and slide addresses, in a fixed order, so the deviation is a vector in a
+        # stable basis across the whole loop.
+        jids = [j for j in range(model.njnt)
+                if model.jnt_type[j] in (mujoco.mjtJoint.mjJNT_HINGE,
+                                         mujoco.mjtJoint.mjJNT_SLIDE)]
+        adrs = np.array([int(model.jnt_qposadr[j]) for j in jids], dtype=int)
+        names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) for j in jids]
+        q_settled = np.array(data.qpos[adrs])
+
+        try:
+            v_tip, direction = tipping_velocity(model, data)
+        except Exception:
+            break                                # not standing on anything: nothing to test
+        if not np.isfinite(v_tip) or v_tip <= 0.0:
+            break
+
+        # Both signs of the weakest axis, exactly as `stand_test` judges it -- the tuner aims
+        # at the same measurement its bar uses, which is the same rule that makes
+        # `SETTLE_SECONDS` a shared constant. It is also what keeps a symmetric rig's gains
+        # symmetric: the roll's joint response is *not* antisymmetric, because the side that
+        # unloads goes slack rather than deflecting, so a single direction reports one
+        # shoulder giving 1.9x its mirror and would spring the pair differently. Taking the
+        # elementwise larger of the two reads pairs them up without anything here knowing
+        # that the body has mirrored joints, or a left and a right, at all.
+        peak, lam, dq_mode = 0.0, 0.0, np.zeros(len(adrs))
+        settled = copy.deepcopy(data)
+        every = max(1, int(0.01 / model.opt.timestep))
+        for sign in (+1.0, -1.0):
+            trial = copy.deepcopy(settled)
+            trial.qvel[0:2] += sign * NUDGE_FRACTION * v_tip * direction
+            ts, amps, cross, dq_cross = [], [], None, None
+            for k in range(int(seconds / model.opt.timestep)):
+                mujoco.mj_step(model, trial)
+                if (k + 1) % every:
+                    continue
+                if not np.all(np.isfinite(trial.qpos)):
+                    peak = float("inf")
+                    break
+                dq = np.array(trial.qpos[adrs]) - q_settled
+                tilt = trunk_tilt_of(trial)
+                peak = max(peak, tilt)
+                ts.append((k + 1) * model.opt.timestep)
+                amps.append(max(float(np.linalg.norm(dq)), 1e-12))
+                if cross is None and np.radians(tilt) > goal:
+                    cross, dq_cross = ts[-1], dq
+            if cross is None:
+                continue
+            np.maximum(dq_mode, np.abs(dq_cross), out=dq_mode)
+            # Growth rate, over the window ending at the crossing: after the shove's own
+            # impulse transient has passed, before the topple goes nonlinear.
+            lo = max(cross - 1.0, 0.3)
+            w = [i for i, t in enumerate(ts) if lo <= t <= cross]
+            lam = max(lam, _growth_rate([ts[i] for i in w], [amps[i] for i in w]))
+
+        lam2 = max(lam, 0.0) ** 2
+        first_peak = peak if first_peak is None else first_peak
+        trace.append((np.radians(peak) if np.isfinite(peak) else peak,
+                      peak_stiffness(creature)))
+        if peak < best[0]:
+            best = (peak, _gains(creature))
+        if np.radians(peak) <= goal:
+            break
+        # Same guard as `relax` and for the same reason -- past `tipping_velocity` the body
+        # rotates about a foot as a rigid piece, no stiffness whatsoever helps, and a loop that
+        # keeps multiplying would diverge quietly instead of failing loudly -- but it must not
+        # be asked on `peak`, which is what it was asked on first and is why this comment is
+        # long. Peak tilt *saturates*: once the body is past its balance point it ends up on its
+        # side no matter what, so every failing multiplier reports the same ~95 deg. Measured on
+        # a morph the guard wrongly abandoned, stiffening the joints it had itself selected:
+        #
+        #       x     peak tilt    lambda^2
+        #     1.0      96.81 deg      2.440
+        #     1.5      96.74 deg      1.033
+        #     2.0      95.62 deg      0.558
+        #     3.0       9.24 deg      0.608
+        #     3.5       1.36 deg      0.000   <- stands
+        #
+        # Peak moves 1.9 deg over a 2x stiffness range and then falls off a cliff; as a progress
+        # signal in the only regime the guard is ever consulted in, it carries no gradient at
+        # all. So the tuner saw 96.81 -> 95.62, concluded stiffness was not helping, and gave up
+        # one secant step short of a body that stands -- the secant on those two lambda^2 values
+        # asks for 4.13x, and 3.5x is already enough.
+        #
+        # lambda^2 is the right signal: it is measured in the linear regime on the way up,
+        # before the topple saturates anything, and it is the very quantity the secant below is
+        # a model of.
+        #
+        # `best` keeps tracking `peak`, because that is the actual objective and the bar; it is
+        # only the decision to *stop* that must not be taken on a saturated number.
+        if probe is not None and lam2 > probe[1] * 0.95 and peak >= best[0] * 0.98:
+            break
+        # ... and lambda^2 alone is not enough either, because it does *not* go flat when the
+        # body tips rigidly about a foot, which is the case the guard was written for. ||dq|| is
+        # a joint-deflection norm, so stiffening the joints shrinks its growth rate whether or
+        # not the trunk is still going over: shoved at 1.2x its own `tipping_velocity`, canis
+        # showed lambda^2 falling every pass while the peak tilt sat at 104 deg, so the loop ran
+        # all six iterations, and `best` -- chasing a 1.5 deg wobble between six failures -- kept
+        # the gains from the pass that happened to read lowest, leaving the body with 639x its
+        # springs and still on its side. Quiet divergence with a straight face.
+        #
+        # So also stop once the mode's springs have been multiplied fourfold -- two blind
+        # doublings, or one full secant step -- without the peak moving at all. If the mode were
+        # fixable by these joints the secant would have named a finite multiplier and it would
+        # have been reached by now; a peak still at its starting value after 4x means either
+        # these joints barely couple to the mode or the body is not failing by bending, and both
+        # of those mean passive tone is the wrong tool rather than the insufficient one.
+        if cum >= 4.0 and peak >= first_peak * 0.98:
+            break
+        if not dq_mode.any():
+            break                                # never crossed the goal: nothing to fit
+
+        # The mode: joints that moved appreciably, as a fraction of the largest rather than
+        # as an absolute angle, because the amplitude depends on how hard the shove was.
+        #
+        # The fraction has to be high, and that is the one thing here that was got wrong
+        # first and is worth the space. At 0.25 the read selects 20 of canis's 31 joints,
+        # including the neck and both tail joints, because the deviation has a fat tail once
+        # the body is really moving. Stiffening that set is not merely wasteful: stiffening
+        # *all* 31 joints by 2x or 3x collapses the shove test outright, while stiffening
+        # exactly the four abduction joints by 3x passes it. Stiffness is not monotonically
+        # stabilising, so an over-broad selection can make things worse, and the guard below
+        # would then be the only thing between the tuner and a body it slowly ruined.
+        #
+        # 0.6 is not a tuned number, it is a plateau. The selection it produces is the same
+        # joint family everywhere from 10 ms to 870 ms after the shove -- a 130x range of
+        # amplitude, from 0.023 deg to 3.06 deg -- and it never once picks up an axial joint.
+        # Directly checked against causality: the four abduction joints fix the mode, the
+        # sagittal ones it also selects make the fix cheaper (2x instead of 3x), and the
+        # neck/tail joints 0.25 was pulling in cannot fix it at any multiplier whatsoever.
+        #
+        # Measured once, on the unbraced body, and then held for the rest of the loop. That is
+        # not an optimisation, it is what makes the secant below mean anything: `lambda^2 =
+        # (K_d - x*K_0)/I` is a statement about *one* set of springs scaled by one number `x`,
+        # so re-selecting the joints between passes changes `K_0` underneath the fit and the two
+        # points are no longer on the same line.
+        #
+        # Re-measuring every pass also fails on its own terms, because the selection is
+        # self-erasing: a joint is chosen for deflecting, stiffening it is what stops it
+        # deflecting, so it drops out of the very next read. Measured on the morph above, the
+        # first pass picks the hip abductors and the second does not -- they had been doubled --
+        # and shoulders and stifles appear in their place. The set therefore changed identity
+        # every pass, the secant reset to a blind 2x every time, and the joints that were
+        # actually the fix stopped being raised at 2x. Held instead, the same body converges on
+        # the secant's first real step.
+        if wanted is None:
+            carriers = {names[i] for i in range(len(names))
+                        if dq_mode[i] >= 0.6 * dq_mode.max()}
+            wanted = carriers & owned_k
+        if not wanted:
+            # Every joint carrying the mode was authored by the rig. That is a legitimate
+            # statement -- the author owns those springs -- so leave them alone and let the
+            # stand test report the consequence.
+            break
+
+        if probe is None or lam2 >= probe[1] or lam2 <= 0.0:
+            factor = 2.0                         # first pass, or the secant has no slope yet
+        else:
+            # Secant on the line lambda^2 = A - B*x, solved for the zero, then given the
+            # buckling headroom. Clamped: the model is good but it is still extrapolation.
+            B = (probe[1] - lam2) / (cum - probe[0])
+            x_star = p.buckle_margin * (lam2 + B * cum) / B
+            factor = min(max(x_star / cum, 1.2), 8.0)
+        probe = (cum, lam2)
+
+        applied = 1.0
+        for bone in creature.bones:
+            for j in bone.joints:
+                if j.name not in wanted:
+                    continue
+                L = by_name.get(j.name)
+                new = j.stiffness * factor
+                if p.max_stiffness is not None:
+                    new = min(new, p.max_stiffness)
+                if L is not None:
+                    new = min(new, stiffness_ceiling(creature, L.inertia))
+                if new <= j.stiffness * 1.001:
+                    continue
+                applied = max(applied, new / j.stiffness)
+                if L is not None:
+                    L.relaxed *= new / j.stiffness
+                    L.stiffness = new
+                j.stiffness = new
+                if j.name in owned_c and L is not None:
+                    j.damping = L.damping = (p.damping_ratio * 2.0 *
+                                             math.sqrt(max(new, 0.0) * L.inertia))
+        if applied <= 1.0:
+            break                                # everything is already at its ceiling
+        cum *= applied
+
+    _restore_gains(creature, best[1], by_name)
+    return math.radians(best[0]) if math.isfinite(best[0]) else float("inf")
+
+
 def apply_posture(creature: Creature) -> list[JointLoad]:
     """Measure `creature` and write the resulting passive gains onto its joints.
 
@@ -750,6 +1123,13 @@ def apply_posture(creature: Creature) -> list[JointLoad]:
                 j.damping, _ = L.damping, owned_c.add(j.name)
     # The prediction above is an initial guess; this makes the settled body agree with it.
     relax(creature, loads, owned_k, owned_c)
+    # ... and this asks the one question a symmetric settle structurally cannot answer.
+    # After `relax`, not folded into it: a shoved body and a sagging body want opposite
+    # corrections applied to different joints, and the shove is only meaningful once the
+    # creature is standing where it will actually stand. Bracing the mode costs sag nothing
+    # measurable on canis (5.36% of withers before, 5.43% after), so the order is safe in the
+    # direction it is used and not in the other.
+    brace(creature, loads, owned_k, owned_c)
     return loads
 
 

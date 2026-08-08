@@ -173,9 +173,11 @@ Smoke-test the entire loop end to end on a body whose dynamics we trust.
       accuracy/throughput trade (`sensing.actuator_work`), and every reward term is dimensionless.
 - [ ] **Bar:** a stable gait emerges. It will look bad. That is fine — this step is
       testing the plumbing, not the motion.
-      - **Blocked on known-issues #3** (passive roll instability): the body cannot hold the stance
-        it is reset into, so "stable gait" would be measuring the policy against a body that falls
-        over on its own. Decide that first.
+      - ~~Blocked on known-issues #3 (passive roll instability)~~ — **unblocked** (2026-08-08).
+        `tune.brace` measures the mode a symmetric settle structurally cannot excite and springs
+        it, and `stand_test` shoves the body at 10% of its own tipping velocity so the fix has a
+        bar to be held to. The default rig goes from falling over unaided (105° peak tilt) to
+        1.5°, so the stance every episode resets into is now one the passive body actually holds.
 - [ ] Headless training + checkpointing so runs survive between sessions
 
 ---

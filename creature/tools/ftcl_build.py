@@ -16,7 +16,8 @@ from ftcl.errors import FtclError                     # noqa: E402
 from creaturelab.build import load, sample_morph      # noqa: E402
 from creaturelab.emit_mjcf import place_on_ground, to_mjcf   # noqa: E402
 from creaturelab.tune import build_tuned              # noqa: E402
-from creaturelab.validate import stand_test, withers_height   # noqa: E402
+from creaturelab.validate import (NUDGE_FRACTION, stand_test,   # noqa: E402
+                                  withers_height)
 
 
 def parse_sets(pairs) -> dict[str, float]:
@@ -99,6 +100,10 @@ def main() -> int:
             print(f"  motors off, 3 s: sank {r.drop*1000:+.0f} mm "
                   f"({r.rel_drop*100:.1f}% of withers), pitch {r.tilt:+.1f} deg, "
                   f"support margin {r.margin*1000:+.0f} mm  {r.verdict}")
+            # The verdict is decided on the shove, so the shove has to be reported -- otherwise
+            # a body that folds sideways prints a tidy pitch next to *** COLLAPSES ***.
+            print(f"  shoved at {r.nudge:.3f} m/s ({NUDGE_FRACTION*100:.0f}% of the "
+                  f"{r.v_tip:.3f} m/s that would tip it): peak tilt {r.tilt_peak:.1f} deg")
             if not r.ok:
                 return 2 if not r.finite else 3
 
