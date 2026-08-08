@@ -431,6 +431,89 @@ optimiser and leaves a traceback, whereas a silent mid-episode teleport just tea
 value function that some state transitions to a fresh standing pose for free. The detector
 is therefore MuJoCo's own warning counter, against a per-env baseline that the reset clears.
 
+### PPO is written here rather than imported
+
+`creaturelab/ppo.py` is ~350 lines of PPO. The obvious alternative is Stable-Baselines3, and
+the reason it was rejected is not that PPO is hard — it is that **the parts of it P2 and P10
+have to reach into are exactly the parts SB3 owns**. P2's AMP discriminator adds a second
+reward term computed from a replay buffer of reference motion, inside the rollout loop; P10's
+ASE latents add a per-episode conditioning variable that has to be sampled at reset and fed to
+both the policy and the discriminator. Both are surgery on `collect`. A vendored 350-line
+implementation is cheaper to modify than a subclass fighting a framework, and — the real
+argument — every line of it is a line whose behaviour this project can *state*, which the
+sections below do.
+
+Three details decide whether a PPO run is correct, and none of them announce themselves. A run
+with any of them broken still trains, still shows a falling loss and a rising return, and
+simply arrives somewhere worse:
+
+- **Truncation is not termination.** A terminal state has no future and its value target is
+  the reward alone. A state cut off by the time limit has a perfectly good future the rollout
+  stopped watching, and dropping its value teaches the critic that surviving to the end of a
+  20 s episode is worth as little as falling over — a lie told at the end of every *successful*
+  episode and never at the end of a failed one. `collect` bootstraps `V(final_obs)` on `trunc`
+  rows only; `advantages` therefore needs no `(1 − term)` factor because `next_val` already
+  carries the rule.
+- **The observation normaliser is part of the policy.** A checkpoint without it loads cleanly,
+  is bit-identical in its weights, and behaves untrained, because it is being fed observations
+  in units it has never seen. It goes in the checkpoint next to the optimiser state.
+- **GAE must not cross an auto-reset.** The `(1 − done)` on the recursion is a separate thing
+  from the bootstrap above, and is what stops an advantage propagating backwards from a fresh
+  episode into the one that ended. At ~3% done-fraction per step early in training this is
+  most of the rollout, not an edge case.
+
+**The default initial action std was wrong by enough to stop the run learning.** The usual
+continuous-control default is `log_std = −0.5`, i.e. σ = 0.61 of the action range. Here an
+action of 1.0 is the *full* motor gear, and that gear was sized from the joint's static
+holding torque — so σ = 0.61 is a 60%-of-hold-torque white-noise shove on each of 31 joints,
+50 times a second. Measured on the untrained policy:
+
+| σ | episode length | cost of transport | mean reward |
+|---|---|---|---|
+| 0.000 | 20.00 s | 0.00 | +0.657 |
+| 0.100 | 2.90 s | 0.58 | +0.524 |
+| 0.202 | 1.98 s | 1.96 | +0.446 |
+| 0.400 | 0.92 s | 16.65 | +0.235 |
+| 0.607 | 0.72 s | 106.35 | **−0.035** |
+
+Two failures compound at 0.607. Episodes end in 0.72 s, so a 64-step horizon holds almost no
+post-transient behaviour; and `c_energy` reaches 106, which against `w_energy = 0.02` is a
+2.1/step penalty against the 1.3 the tracking terms pay at their theoretical maximum — the
+reward is net negative for existing. A 400 k-step run at −0.5 has its evaluation return *fall*,
+54 → 19. At −1.6 it reaches 579 with every animal surviving the full 20 s. The point worth
+keeping: this was invisible in the learning curve, which looked like slow progress, and only
+became obvious once the env was measured directly at fixed action noise. **The reward weights
+were not the problem and were not touched.**
+
+**KL has to be measured on the whole batch, on a fresh pass.** Read inside the minibatch loop,
+it measures the policy on the very samples whose gradient it just stepped along, and keeping
+only the last minibatch's value estimates the epoch's KL from `n/minibatches` samples. At the
+smoke-test batch size those two biases together read 0.05–0.11 against a 0.02 target and
+early-stopped after one epoch on almost every update — the run was quietly doing a fifth of the
+optimisation it was configured for. One extra forward pass per epoch buys the honest number.
+Note the coupling this exposes: KL scales as (Δµ/σ)², so a *narrower* policy trips the same
+target sooner and throttles its own optimisation, which is why σ = 0.10 trains worse than
+σ = 0.20 despite surviving longer at initialisation.
+
+**Evaluation runs on its own envs, and that is load-bearing.** `evaluate` assigns a fixed grid
+of commanded speeds so that consecutive evaluations differ only by the policy. Under
+auto-reset, `_reset_idx` draws a *fresh random command* for every env it resets, so the fixed
+grid survives only until the first animal falls over — after which "deterministic evaluation
+over a fixed command set" is quietly scoring a random one. It presented as algorithm noise:
+consecutive evaluations of a steadily improving policy came back 20, 263, 22, and `best.pt`
+was being selected on it. The evaluation env is therefore built with `auto_reset=False`, which
+also stops a scoring pass from costing the training rollout `num_envs` partial episodes.
+
+**Diagnostics are masked by `sane`; the training signal is not.** An env whose integrator
+diverged has a well-defined training outcome (`env.step` pays it −1 and terminates it) and an
+undefined *measured* speed, read out of a diverged `qvel`. One such env logged 806 Froude units
+and made the run's own progress trace unreadable. An unphysical number does not belong in a
+mean.
+
+**The device is the CPU, and that is a measurement.** The nets are 135→256→256→31. Acting is
+one forward pass on a `(64, 135)` batch per control step — far too small to amortise a
+host-device round trip — and MuJoCo on the CPU is the bottleneck by a wide margin either way.
+
 ### Textures: non-stationarity, not randomness
 
 Procedural noise (Perlin/Worley/fBm) is **stationary** — statistically identical

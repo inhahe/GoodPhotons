@@ -225,21 +225,35 @@ def test_actuator_work_does_not_cancel_negative_work():
 
 # ------------------------------------------------------------------------------- the env
 def test_passive_body_holds_its_stance(body):
-    """Zero torque from the reference stance must not fall over.
+    """Zero torque from the reference stance must not fall over -- at the reset noise the
+    training loop actually uses, which is the whole point.
 
     This is the P0 acceptance bar restated inside the env: if the body needs its controller
-    to stay upright, the cost of not falling over has been moved into the policy, where it
-    is paid for the whole life of the project.
+    to stay upright, the cost of not falling over has been moved into the policy, where it is
+    paid for the whole life of the project.
+
+    It used to pin `init_joint_noise=0.0` and say so, because at the default 0.05 the body
+    fell over in 3.5-6.5 s under zero torque (known-issues #3). That made the test agree with
+    the physics while disagreeing with every episode PPO would ever run: it asserted the
+    property only in the one condition where an antisymmetric instability is unobservable,
+    since a perfectly symmetric body released from a perfectly symmetric pose has nothing to
+    roll towards. Now that `tune.brace` sizes the roll mode, the default holds under 2.6 deg
+    for 10 s at *twice* the default noise, so the test asserts what it always meant to.
     """
-    e = CreatureEnv(body, cfg(init_joint_noise=0.0, init_rate_noise=0.0))
+    e = CreatureEnv(body, cfg())          # default reset noise -- deliberately not zeroed
     e.reset(seed=0)
     a = np.zeros(e.act_dim)
+    worst = 0.0
     for k in range(int(20.0 * 50)):
         obs, r, term, trunc, info = e.step(a)
+        worst = max(worst, info["tilt"])
         assert not term, f"collapsed at t={k / 50:.2f}s, tilt {info['tilt']:.1f} deg"
         if trunc:
             break
     assert trunc
+    # Not merely "did not trip the termination threshold": a body that drifts most of the way
+    # there is still one the policy would have to spend its budget propping up.
+    assert worst < 8.0, f"stayed up, but wandered to {worst:.1f} deg doing it"
 
 
 def test_observation_stays_bounded(body):

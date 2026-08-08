@@ -163,9 +163,23 @@ Smoke-test the entire loop end to end on a body whose dynamics we trust.
         **fractional** control steps and linearly interpolated between ring-buffer samples —
         rounding to whole steps at 50 Hz collapses 27 and 32 ms to the same number and deletes
         the anatomy the module exists to express, silently.
-- [ ] PPO baseline, flat ground, forward-velocity reward
+- [x] PPO baseline, flat ground, forward-velocity reward — `creaturelab/ppo.py`.
       - Own implementation in torch (~350 lines) rather than SB3: SB3's vec-env and rollout
         assumptions are exactly what P2's AMP discriminator and P10's ASE latents have to replace.
+      - The three details that decide whether a PPO run is *correct* rather than merely running —
+        truncation bootstraps and termination does not, the observation normaliser is part of the
+        policy and belongs in the checkpoint, and GAE must not cross an auto-reset — each have an
+        assertion in `tests/test_ppo.py` rather than a comment saying they were thought about.
+        All three fail silently: the run still trains, the loss still falls, it just arrives
+        somewhere worse.
+      - **The stock `init_log_std = -0.5` is wrong here by enough to stop the run learning at
+        all**, because an action of 1.0 is the *full* motor gear and that gear was sized from the
+        joint's static hold torque. At σ = 0.61 episodes last 0.72 s and the energy penalty alone
+        is 2.1/step against the 1.3 the tracking terms can pay — the reward is net negative for
+        existing, and evaluation return *falls* over 400 k steps. Measured the env directly at
+        fixed action noise to find it; −1.6 (σ = 0.20) trains. The reward weights were not the
+        problem and were not touched. Table in design.md §"PPO is written here rather than
+        imported".
 - [x] Termination on fall, action-rate + energy penalties — tilt (the *same* measure as P0's
       acceptance bar, deliberately), height ÷ withers, and an insanity check that reads MuJoCo's
       warning counters rather than `isfinite`, because on a bad qvel MuJoCo resets the body itself
@@ -178,7 +192,17 @@ Smoke-test the entire loop end to end on a body whose dynamics we trust.
         it, and `stand_test` shoves the body at 10% of its own tipping velocity so the fix has a
         bar to be held to. The default rig goes from falling over unaided (105° peak tilt) to
         1.5°, so the stance every episode resets into is now one the passive body actually holds.
-- [ ] Headless training + checkpointing so runs survive between sessions
+- [x] Headless training + checkpointing so runs survive between sessions — `tools/train.py`.
+      `--resume` picks a run up mid-flight; `--eval CKPT [--view]` scores or watches one.
+      - Checkpoints on a **wall-clock** interval, not an update count, because the thing they
+        exist to survive is a session ending, and sessions end in minutes rather than in updates.
+        `latest.pt` is rewritten in place for resuming, `best.pt` tracks the best evaluated
+        return so a late collapse cannot destroy the run's best policy.
+      - Evaluation uses its own `auto_reset=False` envs and a fixed command grid. Sharing the
+        training envs looked tidy and was wrong: `_reset_idx` draws a fresh *random* command for
+        every env it resets, so the "fixed" grid survived only until the first animal fell over
+        and consecutive evaluations of a steadily improving policy came back 20, 263, 22 —
+        with `best.pt` being selected on that noise.
 
 ---
 
