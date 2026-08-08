@@ -470,6 +470,20 @@ you pause, which buys back the part of the cost that does scale with pixels. See
 `known-issues.md` for the full breakdown — including a worked example of a benchmark that
 confidently reported one of these optimizations as a regression.
 
+Five rounds of that made the round-trip cheaper. **Prebake** removes it. Hit **prebake** in
+the Live panel (or launch with `-prebake`) and the viewer walks the clock once, keeping every
+frame's *adopted* state — geometry, scene, DAG, skins — in memory; playback then costs
+**0.01 ms a frame** and runs on a real wall clock at whatever `fps` you ask for, instead of at
+whatever loom can bake. Scrubbing the frame slider becomes instant for the same reason. A
+progress bar and a live MB readout run during the walk, and a **cap MB** budget stops it
+before it eats the machine: a cache that hits the cap still plays the prefix it filled from
+memory and falls back to bake-paced play for the rest, so a long clock degrades rather than
+failing. The cache is dropped whenever a parameter or `frames` changes, because a cache built
+at other values is not a cache of what you're looking at. Measured on `scatter_modulated_sweep`
+(96 frames, 603 MB): a requested 24 fps is *delivered*, against 6.5 fps for the same scene
+uncached — and the only real per-frame cost left is the Render tab's raymarch, which you can
+stop paying by switching tabs.
+
 ---
 
 ## Known issues & roadmap

@@ -2782,7 +2782,44 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   crashed or killed viewer can't clean up after itself and only the next run ever can —
   both retained because older builds did litter. Results are
   adopted on whatever frame they land, preserving the user's orbit, zoom, active tab and
-  DAG layout. **Third-party note:** `src/third_party/imnodes/imnodes.cpp` carries
+  DAG layout.
+  **Playback (§F8).** Two schemes, and which one runs is decided per frame by whether the
+  cache holds the frame the clock wants.
+  *(a) Bake-paced.* The clock advances **only at the `bridge.take(r)` site**, never on a
+  timer. That is not a simplification, it is the only correct pacing given a latest-wins
+  one-slot queue: a timer-driven play loop would post frames faster than they bake and
+  most would be superseded before running, showing a stutter of whichever ones won the
+  slot rather than the animation. Starting play must post **once** to prime the loop, or
+  nothing is in flight, nothing lands, and the clock sits still.
+  *(b) Prebaked (`PlayCache`, `-prebake`).* Walks the clock once — serially, one
+  outstanding job at a time, for the same latest-wins reason — and keeps each frame's
+  **adopted** state (`Sidecar`, curves/strips/fields/meshes, `DagGraph`, `ftsl::Loaded`).
+  Adopted, not the payload: `Sidecar::adopt` and `ftsl::loadSource` both *consume* their
+  input, so replaying payloads would need a deep copy of a ~900 KB `minijson` tree per
+  frame *and* would still pay sidecar + ftsl adoption every time round the loop — 63 % of
+  the frame. Frames are exchanged by `std::swap` under a single invariant: **the live
+  locals hold frame `liveIdx`, and slot `liveIdx` is empty.** Showing frame *k* is then
+  park + unpark, two O(1) swaps with no copies, and — the reason this shape was chosen
+  over pointing the pane locals at the cache — it required no refactor of the function
+  those locals live in. The vacated slot doubles as the buffer the next park swaps into,
+  so a playback loop allocates nothing. Results are claimed by a **params fingerprint**
+  (`playCacheKey`, carried on `LoomJob`/`LoomResult`), not by frame number alone, so a
+  bake still in flight when a control moved cannot be filed into the new cache under an
+  index it happens to share. A cache that hits its **cap** covers a prefix, and the clock
+  running off the end drops back to (a) — without that fallback play deadlocks there,
+  since nothing posts, so nothing lands, so the clock never moves. Measured on
+  `scatter_modulated_sweep` (96 frames, 603 MB): a requested 24 fps is delivered at
+  `cache 0.01 + raymarch 20` per frame, against 6.5 fps bake-paced.
+  Two measurement rules the feature had to fix to be believable: a cached frame **clears**
+  `bake`/`sidecar`/`ftsl` (otherwise the breakdown prints work that did not happen, its
+  parts summing to several times the period beside them), and the fps EMA smooths the
+  **period** and inverts at the end — averaging *rates* over a pacer that alternates 2 and
+  3 vblanks reports 25 fps for a true 24. The pacer likewise advances its deadline by
+  exactly one period instead of resetting to `now`, because discarding the overshoot
+  quantises the achievable rate to the display refresh (a 24 fps request delivered a
+  rock-steady 20 at 60 Hz), while banking at most one period of debt so a hitch is
+  absorbed rather than repaid as a burst.
+  **Third-party note:** `src/third_party/imnodes/imnodes.cpp` carries
   `[ftrace patch]` edits for imgui #7543 — see `known-issues.md`; re-vendoring imnodes must
   re-apply them or the DAG pane crashes in `PrimReserve`.
 - **`record.h` / `record_ladder.h`** — **parametric records**: a named bank of per-channel

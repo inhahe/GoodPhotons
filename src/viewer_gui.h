@@ -36,5 +36,15 @@
 // `startPlaying` opens with the transport already running (the `-play` flag), so a
 // loop can be watched — or its per-frame cost traced to stdout — without anyone
 // having to click into the window first.
+//
+// `startPrebake` kicks the §F8(b) prebake walk on open (the `-prebake` flag): the
+// clock is baked once end to end into memory and play then runs out of the cache at
+// a wall-clock rate instead of at loom's bake rate. Combined with `-play` it is the
+// scriptable way to measure what cached playback actually achieves.
+//
+// `prebakeCapMB` overrides the cache's memory budget (`-prebake-cap`); 0 keeps the
+// panel's default. A walk that hits the cap stops there and the prefix it did fill
+// is still played from memory, with the tail falling back to baking on demand.
 int runViewerGui(const std::string& sidecarPath, const std::string& loomScene = "",
-                 bool startPlaying = false);
+                 bool startPlaying = false, bool startPrebake = false,
+                 int prebakeCapMB = 0);

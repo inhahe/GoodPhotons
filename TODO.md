@@ -2121,12 +2121,12 @@ replacement for the renderer or the primary editing tool.**
         -serve` re-renders instantly. This is **C++ interactive-viewer work** (spawn/drive the resident
         process, present its frames, wire scrub/param/edit) — best done with the user present; the MC mesh
         is the working stand-in until then. Textures via **G5** + the F4 material/texture sidecar (done).
-- [~] **F8 — the viewer *plays*, not only *scrubs*.** *(gap found 2026-08-06 answering "does the loom
+- [x] **F8 — the viewer *plays*, not only *scrubs*.** *(gap found 2026-08-06 answering "does the loom
       viewer support viewing loom objects animated?" — answer: it **scrubs**, it does not **play**.)*
       **(a) paced play DONE 2026-08-06** (0.139.0, `src/viewer_gui.cpp`): play/pause button + spacebar,
       `|<` rewind, loop and ping-pong toggles, arrow keys ±1 frame, and a **measured** fps readout.
-      **(b) prebaked play is still open** — that is the one that makes motion judgeable. Notes from
-      doing (a), which (b) should not have to rediscover:
+      **(b) prebaked play DONE 2026-08-08** (0.156.0) — see the write-up at the end of this item.
+      Notes from doing (a), which (b) should not have to rediscover:
       - The clock advances *only* where a result lands (the `bridge.take(r)` site), never on a timer.
         That is the whole trick: pacing to the bake sidesteps latest-wins entirely, so every frame is
         actually shown rather than most being superseded in the one-slot pending job.
@@ -2259,6 +2259,49 @@ replacement for the renderer or the primary editing tool.**
         because driving an ImGui window with synthetic input to measure it is unreliable (ImGui
         clears key state on focus loss, and `PrintWindow` returns white on a D3D11 swapchain). A
         flag plus a stdout trace is the honest way to profile a GUI.
+      - **(b) DONE (v0.156.0): prebaked play — the clock is walked once and kept in memory.**
+        Five speedups had taken uncached play from 1.7 to 9.75 fps by making the round trip
+        cheaper. (b) is the one that *deletes* it: play now costs **0.01 ms/frame**, so the rate is
+        set by what you ask for rather than by what loom can bake.
+        - **Cache the ADOPTED state, not the payload.** The obvious design — keep each frame's
+          `LoomPayload` and re-adopt on replay — only removes `bake`, still paying `sidecar + ftsl`
+          (63 % of the frame) every time round the loop. Worse, it cannot even be written cheaply:
+          `Sidecar::adopt` and `ftsl::loadSource` both *consume* what they are handed, so replay
+          would need a deep copy of a ~900 KB `minijson` tree per frame. A `PlayFrame` therefore
+          holds the post-adoption `sc`/`curves`/`strips`/`fields`/`meshes`/`dag`/`loaded`.
+        - **Frames are exchanged by `std::swap`, under one invariant: the live locals hold frame
+          `liveIdx`, and slot `liveIdx` is empty.** Showing frame *k* is then park + unpark — two
+          O(1) swaps, no copies — and, crucially, it needed **no refactor** of the ~700-line
+          function whose locals those are. The rejected alternative (turn the locals into pointers
+          into the cache) touches every pane. The vacated slot doubles as the buffer the next park
+          swaps into, so a whole loop of playback allocates nothing.
+        - **Results are claimed by KEY, not just by frame number.** `LoomJob`/`LoomResult` carry a
+          fingerprint of every param + `frames`; a bake that was in flight when a control moved
+          would otherwise be filed into the *new* cache under the frame index it happens to share,
+          and play back as a frame of a scene the user has already left.
+        - **A capped cache covers a prefix and degrades instead of failing.** When the clock runs
+          past the cached prefix, play falls back to (a)'s bake-paced advance — the first version
+          deadlocked here (nothing posts, so nothing lands, so the clock never moves).
+          Verified: `-prebake-cap 80` caches 13/96 frames and plays 18.6 fps cached → 6.5 fps
+          bake-paced across the seam, with no stall.
+        - **Two measurement bugs the feature exposed, both fixed.** (1) The breakdown line kept
+          printing the last *uncached* `bake`/`sidecar`/`ftsl` on frames that paid none of them —
+          parts summing to 3× the frame time beside them. A cached frame now reports `cache` and
+          those three are cleared. (2) `playFps` was an EMA of the *rate*; with the pacer the
+          interval alternates 2 and 3 vblanks (33.3/50.0 ms at 60 Hz), whose true mean is 41.7 ms
+          = 24 fps, but averaging 30 and 20 fps gives 25. It now smooths the **period** and inverts
+          at the end. Related: resetting the pace deadline to `now` discarded the overshoot and
+          quantised the achievable rate to the display refresh — asking for 24 delivered a
+          rock-steady 20. The deadline advances by exactly one period now (with at most one
+          period of debt banked, so a hitch is absorbed rather than repaid as a burst).
+        - **Measured, `scatter_modulated_sweep.py`, 96 frames:** prebake 603 MB (6.3 MB/frame),
+          then `24.0–24.8 fps  ~41 ms = cache 0.01 + raymarch 20 + other 21 (prebaked)` against a
+          24 fps request — i.e. the requested rate is delivered and the only real per-frame cost
+          left is the Render tab's raymarch, which is optional (switch tabs). Same session,
+          uncached: `6.5 fps  154 ms = bake 73 + sidecar 2 + ftsl 35 + raymarch 15`.
+        - Also shipped: `-prebake` and `-prebake-cap <MB>` CLI flags, for the same reason `-play`
+          exists — a frame rate you can only reach by clicking into a window is a frame rate
+          nobody records.
       What exists today (`src/viewer_gui.cpp` ~L2774, the F4 **Live (loom)** panel): a `SliderInt("frame")`
       + `DragInt("frames")`. Dragging `frame` marks the live panel `changed`, `LoomBridge::post()`s an
       `introspect`+`emit` at that clock, and the returned sidecar/`.ftsl` re-seed the geometry and the F7

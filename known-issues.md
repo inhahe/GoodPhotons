@@ -5,6 +5,30 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### DEBT (2026-08-08, v0.156.0): the loom viewer's prebake cache costs ~6.4 MB per frame, which caps a long clock well short of what "1024 MB" suggests
+
+§F8(b)'s `PlayCache` keeps each frame's **adopted** state, and on
+`scatter_modulated_sweep.py` that measures **6.4 MB/frame** — 611 MB for a 96-frame clock.
+So the default 1024 MB budget buys about **160 frames**, or 6.7 seconds at 24 fps. That is
+enough to judge a loop and not enough to prebake a shot. The degradation is graceful (the
+prefix plays from memory, the tail falls back to bake-paced play — `-prebake-cap 80` was
+verified to cache 13/96 and cross the seam without stalling), so this is a limit, not a bug.
+
+Where the bytes go has **not** been broken down yet, and that is the first thing to do
+before optimizing anything: `playFrameBytes` reports one total, and the plausible hogs are
+very different in character. The `Sidecar`'s parsed `minijson` tree is ~900 KB of *text
+already consumed* — every frame keeps a full JSON DOM whose only remaining reader is
+`skins.build()`, so it may be droppable outright or replaceable with the handful of fields
+still needed. The `Scene`'s BVH and `dataPool` are real geometry and are not droppable. The
+curve/strip/field/mesh vectors are all re-derived *from* the sidecar and could in principle
+be rebuilt on unpark rather than stored, trading memory for a few ms per frame — which is
+affordable, since the swap currently costs 0.01 ms against a ~41 ms frame.
+
+Two cheaper ideas that need no analysis first: cache only what the visible tabs actually
+consume (a session that never opens the DAG or Fields pane is paying for both), and share
+the per-frame-**identical** parts — on this scene the mesh assets, textures and per-asset
+Blas BVHs are byte-identical across all 96 frames and are currently stored 96 times.
+
 ### FIXED (2026-08-08, v0.155.0): `density_at` read its `t` as a control-point index while every scene and every doc called it a position along the curve
 
 `camera_curve`'s `density_at <t> <rho>` is the camera's speed curve — cameras per unit

@@ -7521,6 +7521,11 @@ static void printHelp(const char* prog) {
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
 "  -viewer <s.json>      open the loom native viewer on a scene-introspection sidecar\n"
 "  -loom <scene.py>      with -viewer: re-derive geometry live from this loom build\n"
+"  -play                 with -viewer: open with the clock already playing\n"
+"  -prebake              with -viewer: bake the whole clock into memory on open, then\n"
+"                        play from cache at a real frame rate instead of at loom's\n"
+"  -prebake-cap <MB>     memory budget for -prebake (default 1024); a cache that hits\n"
+"                        the cap covers a prefix and the rest still bakes on demand\n"
 "  -h | --help           show this help and exit\n"
 "  -version | -V         print the version and exit\n"
 "\n"
@@ -11952,9 +11957,20 @@ int main(int argc, char** argv) {
             const char* viewerSidecar = nullptr;
             const char* viewerLoom    = nullptr;
             bool        viewerPlay    = false;
+            bool        viewerPrebake = false;
+            int         viewerCapMB   = 0;      // 0 = leave the panel's default
             for (int i = 1; i < argc; ++i) {
                 if (!std::strcmp(argv[i], "-play") || !std::strcmp(argv[i], "--play")) {
                     viewerPlay = true;
+                } else if (!std::strcmp(argv[i], "-prebake") || !std::strcmp(argv[i], "--prebake")) {
+                    viewerPrebake = true;
+                } else if (!std::strcmp(argv[i], "-prebake-cap") ||
+                           !std::strcmp(argv[i], "--prebake-cap")) {
+                    if (i + 1 >= argc) {
+                        std::fprintf(stderr, "error: -prebake-cap needs a size in MB\n");
+                        return 1;
+                    }
+                    viewerCapMB = std::atoi(argv[++i]);
                 } else if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
                     if (i + 1 >= argc) {
                         std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
@@ -11970,7 +11986,8 @@ int main(int argc, char** argv) {
                 }
             }
             if (viewerSidecar)
-                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "", viewerPlay);
+                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "", viewerPlay,
+                                    viewerPrebake, viewerCapMB);
             if (viewerLoom) {
                 // -loom names a live channel, and there are two of them: the viewer's F4
                 // re-introspection (-viewer) and the fly editor's E2 value channel
