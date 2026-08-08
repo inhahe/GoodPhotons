@@ -302,6 +302,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     tangent lateral band → front cap; both tangent circles sit at polar angle `acos(a)`,
     `a = (r0−r1)/|ba|`, which is what makes one angular sweep cover all three
     continuously and the preview mesh closed). Coarse by design, ~80 tris/segment.
+  - *A new prim range lives in **three** places, not two* (learned 0.153.1). The BVH leaf
+    and the device leaf are the obvious two, and both announce a mistake loudly — the
+    scene renders wrong, or falls back. The third is `Scene::closestHitLinear`, the
+    brute-force reference `-checkbvh` compares the BVH *against*, and it fails in the
+    opposite direction: it stayed blind to `curveSegs` for three versions, so every strand
+    the BVH correctly found scored as a mismatch and `-checkbvh` reported a permanent
+    ~0.2 % FAIL on any fiber scene. A stale reference doesn't weaken a cross-check, it
+    **inverts** it — the self-test generates exactly the noise a real regression would
+    have to be spotted in. The same commit made the reference's `O(rays × prims)` sweep
+    threaded and taught its ray budget to count non-triangle prims, because a groom is the
+    first thing to put 10⁶ prims through a linear scan (`fur_basics`: 68 min → 2m38s).
+  - *Verified across all ten renderable modes on both devices* (0.153.1) by rendering
+    `curve_basics` against a strand-stripped twin and scoring the fraction of pixels the
+    fibers change; 10–38 % everywhere, CPU↔GPU mean luminance within 0.4 %. The one
+    subtlety is that **A and C must be scored in HDR**: as physically-absolute
+    finite-aperture cameras their image sits at ~5e-5 scene-linear, so on the tone-mapped
+    PNG every pixel quantises into the bottom 8-bit level and they report 0.00 % coverage
+    *even at 2.4e9 photons* — identical to what a mode that ignored curves would print.
+    Harness: `scraps/curve_mode_sweep.py`.
 - **`fur.h`** — the **groom generator** (`fur { on "<object>" … }`), added 0.152.0 for
   TODO §P1 stage 2. `curve.h` gave ftrace a strand; this gives it a way to *author* a
   coat, which is a different problem — nobody types 10⁴–10⁶ hairs, so without a
