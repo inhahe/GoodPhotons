@@ -2647,6 +2647,230 @@ static int checkGrid() {
     return ok ? 0 : 1;
 }
 
+// Deterministic vector-noise self-test (`-checkvnoise`): povDNoise / povDTurbulence
+// (pov_noise.h) and their pattern-VM surface dnoisex/y/z, dturbx/y/z (O2 — domain
+// warping). Six sections, deliberately complementary (mutation-tested by hand:
+// breaking the Y/Z record stride fails §2 while §1 still passes; dropping DTurb's
+// lambda update fails §3 only):
+//   §1 X-component cross-check: povNoise gen 1 IS DNoise[0] + 0.5 clamped to [0,1]
+//      (same corners, same order, same INCRSUMP) — so the trusted scalar port pins
+//      component X bit-for-bit.
+//   §2 all three components vs an independent straight-line re-derivation from
+//      g_povRTable (explicit corner loop, no macros) — this is what guards the
+//      +8/+16 component record stride that §1 cannot see.
+//   §3 DTurbulence identities: octaves 1 == DNoise bit-for-bit; octaves 3 == the
+//      hand-summed omega/lambda series; the octave clamp [1,10] actually clamps.
+//   §4 the compile path: dnoisex/y/z arity 3, dturbx/y/z arity 6, wrong arity is a
+//      compile error, and the VM result equals the direct call.
+//   §5 CSE: two identical dnoisex subtrees share (program shrinks, value identical);
+//      dnoisex vs dnoisey do NOT merge (the component payload keys the node).
+//   §6 sanity: components are mutually distinct, bounded, and non-constant.
+static int checkVNoise() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkvnoise] %-40s got %.12g want %.12g  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    // Deterministic probe points: a fixed LCG, points spanning cells, negative
+    // coordinates (the JB lattice fix), and fractional positions.
+    uint64_t rng = 0x9e3779b97f4a7c15ull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+    const int NPTS = 4096;
+    std::vector<double> px(NPTS), py(NPTS), pz(NPTS);
+    for (int i = 0; i < NPTS; ++i) {
+        px[i] = (frand() - 0.5) * 40.0;
+        py[i] = (frand() - 0.5) * 40.0;
+        pz[i] = (frand() - 0.5) * 40.0;
+    }
+
+    // ---- §1: DNoise[0] + 0.5, clamped, IS povNoise gen 1 (bit-for-bit) -------
+    {
+        double worst1 = 0.0;
+        for (int i = 0; i < NPTS; ++i) {
+            double v[3]; povDNoise(px[i], py[i], pz[i], v);
+            double x = v[0] + 0.5;
+            if (x < 0.0) x = 0.0;
+            if (x > 1.0) x = 1.0;
+            double w = povNoise(px[i], py[i], pz[i], 1);
+            worst1 = std::fmax(worst1, std::fabs(x - w));
+        }
+        ok &= chk("S1 DNoise[0]+0.5 == povNoise gen1 (max err)", worst1, 0.0, 0.0);
+    }
+
+    // ---- §2: all components vs an independent re-derivation ------------------
+    // Straight-line reference: explicit corner loop over the same lattice, gradient
+    // record for component c read at RTable index (hash&0xFF)*2 + 8*c, fields at
+    // +1 (the value/2 bias), +2, +4, +6 — written WITHOUT the POVINCR/POVH macros
+    // so a macro or stride bug in the shipped path cannot also be in the reference.
+    {
+        double worst2 = 0.0;
+        for (int i = 0; i < NPTS; ++i) {
+            double x = px[i], y = py[i], z = pz[i];
+            const double EPS = 1.0e-10;
+            int tmp;
+            tmp = (x >= 0) ? (int)x : (int)(x - (1 - EPS));
+            int ix = (int)((tmp + 10000) & 0xFFF); double fx = x - tmp;
+            tmp = (y >= 0) ? (int)y : (int)(y - (1 - EPS));
+            int iy = (int)((tmp + 10000) & 0xFFF); double fy = y - tmp;
+            tmp = (z >= 0) ? (int)z : (int)(z - (1 - EPS));
+            int iz = (int)((tmp + 10000) & 0xFFF); double fz = z - tmp;
+            double sx = povSCurve(fx), sy = povSCurve(fy), sz = povSCurve(fz);
+            double ref[3] = {0, 0, 0};
+            for (int c8 = 0; c8 < 8; ++c8) {
+                int bx = c8 & 1, by = (c8 >> 1) & 1, bz = (c8 >> 2) & 1;
+                double wx = bx ? sx : 1.0 - sx;
+                double wy = by ? sy : 1.0 - sy;
+                double wz = bz ? sz : 1.0 - sz;
+                double dx = bx ? fx - 1.0 : fx;
+                double dy = by ? fy - 1.0 : fy;
+                double dz = bz ? fz - 1.0 : fz;
+                int h2 = g_povHash[(int)(g_povHash[(int)(ix + bx)] ^ (iy + by))];
+                int base = (g_povHash[(int)h2 ^ (iz + bz)] & 0xFF) * 2;
+                double w = wx * wy * wz;
+                for (int c = 0; c < 3; ++c) {
+                    const double* mp = &g_povRTable[base + 8 * c];
+                    ref[c] += w * (mp[1] + mp[2] * dx + mp[4] * dy + mp[6] * dz);
+                }
+            }
+            double v[3]; povDNoise(x, y, z, v);
+            for (int c = 0; c < 3; ++c)
+                worst2 = std::fmax(worst2, std::fabs(v[c] - ref[c]));
+        }
+        // The reference sums corners in the same order but groups weights
+        // differently (wx*wy*wz vs txty*tz), so allow rounding-level slack.
+        ok &= chk("S2 DNoise xyz vs independent ref (max err)", worst2, 0.0, 1e-12);
+    }
+
+    // ---- §3: DTurbulence identities ------------------------------------------
+    {
+        double w1 = 0.0, w3 = 0.0, wc = 0.0;
+        for (int i = 0; i < 256; ++i) {
+            double dn[3], t1[3], t3[3], tc0[3], tc99[3], tref1[3], tref10[3];
+            povDNoise(px[i], py[i], pz[i], dn);
+            povDTurbulence(px[i], py[i], pz[i], 1, 2.0, 0.5, t1);
+            for (int c = 0; c < 3; ++c) w1 = std::fmax(w1, std::fabs(t1[c] - dn[c]));
+            // octaves 3, lambda 1.7, omega 0.4: DN(p) + 0.4*DN(1.7p) + 0.16*DN(2.89p)
+            povDTurbulence(px[i], py[i], pz[i], 3, 1.7, 0.4, t3);
+            double a[3], b[3], c3[3];
+            povDNoise(px[i], py[i], pz[i], a);
+            povDNoise(px[i] * 1.7, py[i] * 1.7, pz[i] * 1.7, b);
+            povDNoise(px[i] * 1.7 * 1.7, py[i] * 1.7 * 1.7, pz[i] * 1.7 * 1.7, c3);
+            for (int c = 0; c < 3; ++c) {
+                double want = a[c] + 0.4 * b[c] + 0.4 * 0.4 * c3[c];
+                w3 = std::fmax(w3, std::fabs(t3[c] - want));
+            }
+            // clamp: octaves 0 -> 1, octaves 99 -> 10
+            povDTurbulence(px[i], py[i], pz[i], 0, 2.0, 0.5, tc0);
+            povDTurbulence(px[i], py[i], pz[i], 1, 2.0, 0.5, tref1);
+            povDTurbulence(px[i], py[i], pz[i], 99, 2.0, 0.5, tc99);
+            povDTurbulence(px[i], py[i], pz[i], 10, 2.0, 0.5, tref10);
+            for (int c = 0; c < 3; ++c) {
+                wc = std::fmax(wc, std::fabs(tc0[c] - tref1[c]));
+                wc = std::fmax(wc, std::fabs(tc99[c] - tref10[c]));
+            }
+        }
+        ok &= chk("S3 DTurb octaves=1 == DNoise (max err)", w1, 0.0, 0.0);
+        ok &= chk("S3 DTurb octaves=3 == hand sum (max err)", w3, 0.0, 1e-12);
+        ok &= chk("S3 DTurb octave clamp [1,10] (max err)", wc, 0.0, 0.0);
+    }
+
+    // ---- §4: the compile path -------------------------------------------------
+    {
+        struct Case { const char* expr; int comp; bool turb; };
+        const Case cases[] = {
+            {"dnoisex(x, y, z)", 0, false}, {"dnoisey(x, y, z)", 1, false},
+            {"dnoisez(x, y, z)", 2, false},
+            {"dturbx(x, y, z, 6, 2, 0.5)", 0, true},
+            {"dturby(x, y, z, 6, 2, 0.5)", 1, true},
+            {"dturbz(x, y, z, 6, 2, 0.5)", 2, true},
+        };
+        for (const Case& cs : cases) {
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(cs.expr, prog, perr)) {
+                std::printf("[checkvnoise] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+                ok = false; continue;
+            }
+            double wv = 0.0;
+            for (int i = 0; i < 256; ++i) {
+                PatCtx c = makePatCtx(Vec3{px[i], py[i], pz[i]}, 0.0, Vec3{0, 0, 1});
+                double got = patternEval(prog.data(), (int)prog.size(), c);
+                double v[3];
+                if (cs.turb) povDTurbulence(px[i], py[i], pz[i], 6, 2.0, 0.5, v);
+                else         povDNoise(px[i], py[i], pz[i], v);
+                wv = std::fmax(wv, std::fabs(got - v[cs.comp]));
+            }
+            char lbl[80]; std::snprintf(lbl, sizeof lbl, "S4 VM `%s` == direct", cs.expr);
+            ok &= chk(lbl, wv, 0.0, 0.0);
+        }
+        const char* bads[] = {
+            "dnoisex(x, y)",            // arity 3, given 2
+            "dnoisex(x, y, z, 1)",      // arity 3, given 4
+            "dturbx(x, y, z)",          // arity 6, given 3
+            "dnoise(x, y, z)",          // no unsuffixed spelling
+        };
+        for (const char* be : bads) {
+            std::vector<PatNode> prog; std::string perr;
+            if (compilePatternExpr(be, prog, perr)) {
+                std::printf("[checkvnoise] `%s` compiled but should be rejected  BAD\n", be);
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §5: CSE shares identical calls, and the component keys the node ------
+    {
+        std::vector<PatNode> same, sameOpt, mixed, mixedOpt; std::string perr;
+        ok &= compilePatternExpr("dnoisex(x, y, z) + dnoisex(x, y, z)", same, perr);
+        ok &= compilePatternExpr("dnoisex(x, y, z) + dnoisey(x, y, z)", mixed, perr);
+        sameOpt = same;  patternOptimizeCSE(sameOpt);
+        mixedOpt = mixed; patternOptimizeCSE(mixedOpt);
+        if (sameOpt.size() >= same.size()) {
+            std::printf("[checkvnoise] CSE did not shrink `dnoisex + dnoisex` (%zu -> %zu)  BAD\n",
+                        same.size(), sameOpt.size());
+            ok = false;
+        }
+        double wv = 0.0;
+        for (int i = 0; i < 256; ++i) {
+            PatCtx c = makePatCtx(Vec3{px[i], py[i], pz[i]}, 0.0, Vec3{0, 0, 1});
+            double v[3]; povDNoise(px[i], py[i], pz[i], v);
+            wv = std::fmax(wv, std::fabs(patternEval(sameOpt.data(),  (int)sameOpt.size(),  c) - 2.0 * v[0]));
+            wv = std::fmax(wv, std::fabs(patternEval(mixedOpt.data(), (int)mixedOpt.size(), c) - (v[0] + v[1])));
+        }
+        ok &= chk("S5 CSE'd programs evaluate right (max err)", wv, 0.0, 0.0);
+    }
+
+    // ---- §6: components are distinct, bounded, non-constant -------------------
+    {
+        double maxAbs = 0.0, meanSep = 0.0, varX = 0.0, meanX = 0.0;
+        for (int i = 0; i < NPTS; ++i) {
+            double v[3]; povDNoise(px[i], py[i], pz[i], v);
+            for (int c = 0; c < 3; ++c) maxAbs = std::fmax(maxAbs, std::fabs(v[c]));
+            meanSep += std::fabs(v[0] - v[1]) + std::fabs(v[1] - v[2]);
+            meanX   += v[0];
+        }
+        meanSep /= NPTS; meanX /= NPTS;
+        for (int i = 0; i < NPTS; ++i) {
+            double v[3]; povDNoise(px[i], py[i], pz[i], v);
+            varX += (v[0] - meanX) * (v[0] - meanX);
+        }
+        varX /= NPTS;
+        if (maxAbs > 2.0) { std::printf("[checkvnoise] |component| ran to %.3g (>2)  BAD\n", maxAbs); ok = false; }
+        if (meanSep < 0.01) { std::printf("[checkvnoise] components nearly identical (mean sep %.3g) — stride bug?  BAD\n", meanSep); ok = false; }
+        if (varX < 1e-4) { std::printf("[checkvnoise] component X nearly constant (var %.3g)  BAD\n", varX); ok = false; }
+    }
+
+    std::printf("[checkvnoise] worst absolute error = %.3g\n", worst);
+    std::printf("[checkvnoise] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic N-D scatter sampler self-test (src/pattern.h: PatScatter /
 // patScatterSample, reached from a pattern expression as `scatter:<name>(c0, …)`).
 // The ragged sibling of -checkgrid; validates, with no scene and no renderer:
@@ -7776,6 +8000,7 @@ static int run(int argc, char** argv) {
     bool checkGratingOnly = false;
     bool checkUpsampleOnly = false;
     bool checkGridOnly = false;
+    bool checkVNoiseOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
     bool checkPropOnly = false;
@@ -8170,6 +8395,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
+        else if (!std::strcmp(argv[i], "-checkvnoise")) checkVNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
         else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
@@ -8350,6 +8576,7 @@ static int run(int argc, char** argv) {
     if (checkGratingOnly)  return checkGrating();  // deterministic, no scene needed
     if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed
     if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
+    if (checkVNoiseOnly)   return checkVNoise();   // ditto (vector noise / domain warp)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
     if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)

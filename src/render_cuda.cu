@@ -4356,6 +4356,22 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                 break;
             }
             case PatOp::Noise:    { float zz = st[--sp], yy = st[--sp]; st[sp-1] = dPatValueNoiseF(st[sp-1], yy, zz); break; }
+            case PatOp::DNoise: {  // POV vector noise is double-only: promote / demote like PovFn
+                float zz = st[--sp], yy = st[--sp];
+                double vout[3];
+                povDNoise((double)st[sp-1], (double)yy, (double)zz, vout);
+                st[sp-1] = (float)vout[(int)nd.a];
+                break;
+            }
+            case PatOp::DTurb: {   // ditto (octave fBm of DNoise)
+                float om = st[--sp], la = st[--sp], oc = st[--sp];
+                float zz = st[--sp], yy = st[--sp];
+                double vout[3];
+                povDTurbulence((double)st[sp-1], (double)yy, (double)zz,
+                               (double)oc, (double)la, (double)om, vout);
+                st[sp-1] = (float)vout[(int)nd.a];
+                break;
+            }
             case PatOp::PovFn: {   // POV internals are double-only: promote args, demote result
                 int id = (int)nd.a;
                 int na = povFnArity(id);

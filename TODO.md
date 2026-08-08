@@ -4571,11 +4571,15 @@ the *randomness vocabulary* is thin. Nothing below is started.
       that door — so this is a known, already-signposted omission. Want F1, F2, F2−F1, and the cell id
       (for per-cell randomisation), as separate outputs; 3-D; and a distance-metric selector
       (Euclidean / Manhattan / Chebyshev) since the metric is most of the look.
-- [ ] **O2 — vector-valued noise (`DNoise`) for domain warping.** `DNoise` appears **nowhere** — not in
-      `pov_noise.h`, not in `pattern.h`. Domain warping (`noise(p + k*noise(p))`) is *the* cheapest route
-      to non-uniform, flow-like, marbled structure, and today it must be spelled as three independent
-      scalar `noise()` calls at offset lattice points: 3× the cost and a subtly different (less coherent)
-      warp than a true gradient-vector noise. Exposing a 3-vector noise op is small and unlocks a lot.
+- [x] **O2 — vector-valued noise (`DNoise`) for domain warping.** ✅ 2026-08-08, v0.158.0. Exact ports
+      of POV's `DNoise` (gradient-vector noise) and `DTurbulence` (its octave fBm) in `pov_noise.h`,
+      exposed as `PatOp::DNoise`/`PatOp::DTurb` with the component index riding the node payload:
+      `dnoisex/y/z(x,y,z)` and `dturbx/y/z(x,y,z,octaves,lambda,omega)` in every pattern/field expr, on
+      all three VM backends (CPU double, device double, device fp32 promote/demote). Six-section
+      `-checkvnoise` (mutation-tested): gen-1 scalar noise == DNoise[0]+0.5 clamped bit-exact; all
+      3 components vs an independent re-derivation; DTurb hand-summed octaves + clamp; compile
+      path + arity rejects; CSE (component keys the node); range/decorrelation sanity. Demo
+      `scenes/pattern_warp.ftsl` (marble, agate, warped value noise); docs in FTSL.md §6.1 + REFERENCE.md.
 - [ ] **O3 — genuinely *non-stationary* randomness.** Everything above is statistically uniform over
       space — the same texture everywhere. The interesting thing the question was actually about is
       randomness whose *parameters vary spatially*: frequency/octaves/amplitude/anisotropy driven by
@@ -4731,6 +4735,26 @@ that item mostly a binding exercise there.
 ---
 
 ## Progress log
+- 2026-08-08: **O2 — vector-valued noise for domain warping (v0.158.0).** Exact ports of POV-Ray's
+  `DNoise` and `DTurbulence` into `pov_noise.h`, exposed as `dnoisex/y/z(x,y,z)` and
+  `dturbx/y/z(x,y,z,octaves,lambda,omega)` in every pattern/field expression on all three VM
+  backends. The port needed no new tables: the 534-double `g_povRTable` the scalar noise already
+  carried was *sized for* DNoise all along (267 entries = 255 hash range + three 8-stride gradient
+  records at `mp`/`mp+8`/`mp+16` — 255+12). That coincidence became the anchor of the self-test:
+  POV's generator-1 scalar noise is definitionally `DNoise[0] + 0.5` clamped, so `-checkvnoise` §1
+  pins the new vector code against the already-trusted scalar port **bit-exactly** (tol 0.0), and
+  §2 re-derives all three components macro-free to guard the Y/Z strides §1 can't see. Mutation
+  tests behaved as designed: stride 8→2 fails §2 alone (§1 clean, proving the sections are
+  complementary); deleting DTurb's `l *= lambda` fails §3 alone. Design choices worth remembering:
+  the VM stays scalar (one op per *component*, index riding the node payload `a` like `PovFn`'s
+  id — so CSE keys on it and `dnoisex+dnoisey` of one point stay distinct while identical calls
+  collapse); `DTurb` is its own op because the loop-free VM cannot author an octave sum; the fp32
+  device VM promotes/demotes like `PovFn`. Demo `scenes/pattern_warp.ftsl` — marble (sine bands
+  displaced by `dturbx`), agate (thresholded warped bands), and Quilez-style fBm-warped value
+  noise — renders with identical pattern structure on `-device cpu` and `gpu` (8×-downsampled
+  mean |diff| **0.14 %**, pure MC grain; the fp32 backend verified visually via `-rgb`). Docs:
+  FTSL.md §6.1 + isosurface expr list, REFERENCE.md pattern section + self-test roster,
+  design.md pattern-VM architecture note.
 - 2026-08-07: **`fur { }` — the groom generator, and a wrong claim corrected by measurement
   (v0.152.0).** `src/fur.h` + an FTSL `fur { on "<object>" … }` block scatter 10⁴–10⁶ strands
   area-uniformly over a named sphere / mesh / quad / triangle and emit **ordinary `Curve`/

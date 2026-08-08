@@ -343,6 +343,27 @@ meshes and on native primitives that declare a `uv` wrap, see §9). Constant `pi
 **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
 `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
 
+**Vector noise — `dnoisex/y/z`, `dturbx/y/z` (domain warping):** exact ports of
+POV-Ray's gradient-vector noise `DNoise` and its octave sum `DTurbulence`, one
+component per function. `dnoisex(x, y, z)` / `dnoisey(…)` / `dnoisez(…)` are the three
+decorrelated components of one gradient-noise vector at a point;
+`dturbx(x, y, z, octaves, lambda, omega)` (and `dturby` / `dturbz`) sum `octaves`
+copies at frequency `lambda^(i-1)` and amplitude `omega^(i-1)` (POV's defaults are
+6, 2.0, 0.5; `octaves` clamps to [1, 10]). Values are signed raw POV sums (roughly
+`[-1, 1]`, no normalisation), identical bit-for-bit on CPU and GPU. Their point is
+*displacing the coordinate another pattern is sampled at*: scalar `noise()` can only
+modulate a value, but a vector noise can push the lookup point around, which is where
+marble veins, agate banding and fluid-looking swirls come from:
+
+```
+# classic POV marble: sine bands whose band coordinate is displaced by turbulence
+pattern "marble" { expr "0.5 + 0.5*sin(6.2832*(3*x + 1.1*dturbx(3*x, 3*y, 3*z, 6, 2, 0.5)))" }
+```
+
+Identical calls (same component, same arguments) are merged by the expression
+optimizer; different components of the same point are separate evaluations. Worked
+example: `scenes/pattern_warp.ftsl` (marble, agate, and fBm-warped value noise).
+
 **Image samples — `tex:<name>(u, v)`:** samples a declared `texture` as a *scalar term
 inside the formula*, so a photograph can be one operand of an expression rather than
 only bound wholesale to a slot:
@@ -1431,7 +1452,10 @@ and a Lipschitz bound (`max_gradient`, see §10.3).
   when *defining* a surface and read `0`.
 - **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
   `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args). `noise` is
-  deterministic 3-D value noise in `[0,1]` (same on CPU/GPU). The image sample
+  deterministic 3-D value noise in `[0,1]` (same on CPU/GPU). The vector-noise
+  components `dnoisex/y/z(x,y,z)` and `dturbx/y/z(x,y,z,octaves,lambda,omega)` (§6.1)
+  work here too — they need only coordinates — so a field can be domain-warped by
+  gradient noise. The image sample
   `tex:<name>(u, v)` (§6.1) is **not** available here — a field expression *defines* a
   surface, so there is no surface to sample yet; using it is a compile error.
 - **Operators:** `+ - * / % ^` and unary `-`. `^` is `pow` (right-assoc), `%` is

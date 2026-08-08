@@ -1621,6 +1621,25 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   the two cases, and the `PatNode → PatNodeF` upload conversion is memberwise so a
   register index ≤ 32 survives the float trip exactly.
 
+  **Vector-valued POV noise (`PatOp::DNoise` / `PatOp::DTurb`, v0.158.0).** Exact ports of
+  POV-Ray's `DNoise` (gradient-vector noise) and `DTurbulence` (its octave fBm) live beside
+  `povNoise` in `pov_noise.h`, sharing its tables — the 534-double `g_povRTable` was in fact
+  *sized for* DNoise all along (267 conceptual entries = 255 hash range + 12 for the three
+  8-double-stride component records read at `mp`, `mp+8`, `mp+16`). The VM stays scalar: one
+  op per **component**, with the component index (0/1/2) riding the node payload `a` exactly
+  like `PovFn`'s function id, surfacing as `dnoisex/y/z(x,y,z)` and
+  `dturbx/y/z(x,y,z,octaves,lambda,omega)`. `DTurb` is its own op (not authored from
+  `DNoise`) because the VM has no loops, so the octave sum cannot be expressed in-language.
+  Both ops are appended at the enum end (the `VarX..VarV` scans are unperturbed), registered
+  in `patOpStackEffect` so CSE can rewrite through them, and keyed by `a` in the hash-consing
+  so `dnoisex+dnoisey` of one point stay two nodes while a repeated identical call collapses
+  to one. The fp32 device VM (`dPatternEvalF`) promotes to double internally and demotes the
+  result — `PovFn`'s established contract — so all three backends run the identical lattice
+  arithmetic. `-checkvnoise` pins the port in six mutation-tested sections; the load-bearing
+  one is the cross-invariant that POV's generator-1 *scalar* noise is definitionally
+  `DNoise[0] + 0.5` clamped, bit-exact — anchoring the new code to the already-trusted
+  scalar port with zero tolerance.
+
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
   **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the

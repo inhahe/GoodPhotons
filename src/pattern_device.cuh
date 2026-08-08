@@ -146,6 +146,19 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
                 break;
             }
             case PatOp::Noise:    { double zz = st[--sp], yy = st[--sp]; st[sp-1] = dPatValueNoise(st[sp-1], yy, zz); break; }
+            case PatOp::DNoise: {   // POV vector noise, component in nd.a (POV_HD, double)
+                double zz = st[--sp], yy = st[--sp], vout[3];
+                povDNoise(st[sp-1], yy, zz, vout);
+                st[sp-1] = vout[(int)nd.a];
+                break;
+            }
+            case PatOp::DTurb: {    // POV vector turbulence (octave fBm of DNoise)
+                double om = st[--sp], la = st[--sp], oc = st[--sp];
+                double zz = st[--sp], yy = st[--sp], vout[3];
+                povDTurbulence(st[sp-1], yy, zz, oc, la, om, vout);
+                st[sp-1] = vout[(int)nd.a];
+                break;
+            }
             case PatOp::PovFn: {
                 int id = (int)nd.a;
                 int na = povFnArity(id);

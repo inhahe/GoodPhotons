@@ -137,6 +137,20 @@ enum class PatOp : int {
     // them, so patternHasFreeVars' VarX..VarV range and varName() are unperturbed.
     StReg,
     LdReg,
+    // Vector-valued POV gradient noise, one component per node: `a` holds the
+    // component (0=x, 1=y, 2=z). DNoise pops (x, y, z); DTurb pops (x, y, z,
+    // octaves, lambda, omega) — POV's DTurbulence octave sum, exposed as an op
+    // because the VM has no loops so the sum cannot be authored from DNoise
+    // alone. Both are pure functions of their operands (the CSE optimizer may
+    // share them; `a` participates in its node key), evaluated in double on
+    // every backend via the POV_HD povDNoise/povDTurbulence in pov_noise.h —
+    // the same promote/demote contract PovFn uses in the fp32 VM. This is the
+    // primitive behind domain warping (O2): a true gradient-vector noise, not
+    // three offset scalar lattices. Appended at the END of the enum, like
+    // everything since Tex, so patternHasFreeVars' VarX..VarV range and
+    // varName() are unperturbed.
+    DNoise,
+    DTurb,
 };
 
 // Register-file size available to a CSE-optimized program (per evaluator invocation).
@@ -540,6 +554,19 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 break;
             }
             case PatOp::Noise:    { double zz = st[--sp], yy = st[--sp]; st[sp-1] = patValueNoise(st[sp-1], yy, zz); break; }
+            case PatOp::DNoise: {
+                double zz = st[--sp], yy = st[--sp], vout[3];
+                povDNoise(st[sp-1], yy, zz, vout);
+                st[sp-1] = vout[(int)nd.a];
+                break;
+            }
+            case PatOp::DTurb: {
+                double om = st[--sp], la = st[--sp], oc = st[--sp];
+                double zz = st[--sp], yy = st[--sp], vout[3];
+                povDTurbulence(st[sp-1], yy, zz, oc, la, om, vout);
+                st[sp-1] = vout[(int)nd.a];
+                break;
+            }
             case PatOp::PovFn: {
                 int id = (int)nd.a;
                 int na = povFnArity(id);
@@ -687,6 +714,15 @@ inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
         {"smoothstep",PatOp::Smoothstep,3},{"noise",PatOp::Noise,3},
     };
     for (const F& g : fs) if (s == g.n) { out = g.op; arity = g.ar; return true; }
+    // Vector-noise components (O2). The component index rides the povId out-channel
+    // (it is a generic payload slot: the emit site copies it into the node's `a`,
+    // exactly as it does for a POV internal id).
+    struct V { const char* n; PatOp op; int ar; int comp; };
+    static const V vfs[] = {
+        {"dnoisex",PatOp::DNoise,3,0},{"dnoisey",PatOp::DNoise,3,1},{"dnoisez",PatOp::DNoise,3,2},
+        {"dturbx",PatOp::DTurb,6,0},{"dturby",PatOp::DTurb,6,1},{"dturbz",PatOp::DTurb,6,2},
+    };
+    for (const V& g : vfs) if (s == g.n) { out = g.op; arity = g.ar; povId = g.comp; return true; }
     int id, ar;
     if (povFnLookup(s.c_str(), id, ar)) { out = PatOp::PovFn; arity = ar; povId = id; return true; }
     return false;
@@ -1005,6 +1041,8 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
             PatOp op; int ar; int povId; funcOp(t.name, op, ar, povId);
             PatNode nd; nd.op = op;
             if      (op == PatOp::PovFn) nd.a = (double)povId;
+            else if (op == PatOp::DNoise || op == PatOp::DTurb)
+                                         nd.a = (double)povId;   // component index (0/1/2)
             else if (op == PatOp::Tex)   nd.a = (double)t.texId;    // resolved at tokenize
             else if (op == PatOp::Spec)  nd.a = (double)t.texId;    // shares the resolved-index slot
             else if (op == PatOp::Grid || op == PatOp::Scatter)
@@ -1128,6 +1166,8 @@ inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes) {
     if (op >= PatOp::Add && op <= PatOp::Step)    { pops = 2; return true; }
     if (op >= PatOp::Clamp && op <= PatOp::Noise) { pops = 3; return true; }
     if (op == PatOp::PovFn)                       { pops = povFnArity((int)a); return true; }
+    if (op == PatOp::DNoise)                      { pops = 3; return true; }
+    if (op == PatOp::DTurb)                       { pops = 6; return true; }
     if (op == PatOp::Tex)                         { pops = 2; return true; }
     if (op == PatOp::Spec)                        { pops = 1; return true; }
     if (op == PatOp::StReg)                       { pops = 0; pushes = 0; return true; }  // peeks

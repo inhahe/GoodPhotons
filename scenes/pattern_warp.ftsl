@@ -1,0 +1,64 @@
+# pattern_warp.ftsl — domain warping with vector-valued POV gradient noise (O2).
+#
+# The six pattern functions demoed here are the components of POV-Ray's DNoise
+# (gradient-vector noise) and DTurbulence (its octave fBm sum):
+#
+#   dnoisex/dnoisey/dnoisez(x, y, z)                    one gradient component
+#   dturbx/dturby/dturbz(x, y, z, octaves, lambda, omega)   fBm of that component
+#
+# Scalar noise() can only *modulate* a pattern; a vector noise can *displace* the
+# point the pattern is evaluated at ("domain warping"), which is where marble
+# veins, agate banding and fluid-looking swirls come from. Each wall below feeds
+# the warp into a different base pattern. None of the three is expressible with
+# the scalar noise() alone — the displacement needs decorrelated components.
+#
+#   ftrace -in scenes/pattern_warp.ftsl -n 40000000 -window -keepwindow \
+#          -o png/pattern_warp.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# BACK WALL — classic POV marble: plain sine bands in x, with the band coordinate
+# displaced by a 6-octave turbulence component. omega 0.5 / lambda 2 are POV's
+# defaults; amplitude 1.1 on a 3-period band field gives strong folded veins.
+pattern "marble" { expr "0.5 + 0.5*sin(6.2832*(3*x + 1.1*dturbx(3*x, 3*y, 3*z, 6, 2, 0.5)))" }
+
+# FLOOR — warped value noise (the Quilez fBm-warp idiom): noise() sampled at a
+# point pushed around by two *decorrelated* DNoise components, then contrast-
+# stretched. The result reads as curdled / fluid blotches instead of value-noise's
+# static plaid.
+pattern "curdle" { expr "smoothstep(0.35, 0.65, noise(4*x + 1.6*dnoisex(3*x, 1.7, 3*z), 4*z + 1.6*dnoisez(3*x, 1.7, 3*z), 0.31))" }
+
+# LEFT WALL — agate: the same displacement trick, but the warped coordinate is
+# thresholded into sharp light/dark bands. Higher lambda (2.7) crinkles the band
+# edges at a finer scale than the marble above.
+pattern "agate" { expr "smoothstep(0.32, 0.68, 0.5 + 0.5*sin(6.2832*(2.5*y + 1.3*dturby(2*x, 2*y, 2*z, 5, 2.7, 0.55))))" }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "green" { type diffuse reflect greenwall }
+material "ink"   { type diffuse reflect rgb 0.05 0.08 0.22 }
+material "lite"  { type diffuse reflect rgb 0.93 0.93 0.93 }
+material "rust"  { type diffuse reflect rgb 0.72 0.30 0.10 }
+
+material "backwall" { type mix  layer "lite" 0.5  layer "ink"  0.5  weight_map pattern:marble }
+material "floormat" { type mix  layer "lite" 0.5  layer "rust" 0.5  weight_map pattern:curdle }
+material "leftwall" { type mix  layer "lite" 0.5  layer "ink"  0.5  weight_map pattern:agate  }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material floormat }
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material backwall }
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material leftwall }
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 400 400 }
+}

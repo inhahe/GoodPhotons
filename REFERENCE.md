@@ -2009,7 +2009,8 @@ isosurface {
 
 The `expr` string is compiled by the **same math VM as procedural patterns** (variables
 `x y z` and `r = |p|`, plus `sin cos tan exp log sqrt abs floor fract sign min max pow
-atan2 clamp mix smoothstep noise`, and the constant `pi`). Because an arbitrary field is
+atan2 clamp mix smoothstep noise`, the vector-noise components `dnoisex/y/z` /
+`dturbx/y/z` for gradient-noise domain warping, and the constant `pi`). Because an arbitrary field is
 **not** a signed distance and has no analytic bound, a `function` isosurface **must**
 supply a `contained_by { min <x y z>  max <x y z> }` box (the region the surface is
 marched inside). Safe sphere-tracing needs a **Lipschitz bound** `L ≥ max|∇f|` so a step
@@ -2323,7 +2324,16 @@ or a native-primitive wrap — see below). Two authoring forms:
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
   math, `pi`, and functions `abs sqrt sin cos tan exp log floor fract sign saturate min
-  max atan2 step pow clamp mix smoothstep noise`. It can also **sample a declared image
+  max atan2 step pow clamp mix smoothstep noise`. On top of the scalar `noise` there is
+  **vector-valued gradient noise for domain warping**: `dnoisex/y/z(x, y, z)` are the
+  three decorrelated components of POV-Ray's `DNoise` vector at a point, and
+  `dturbx/y/z(x, y, z, octaves, lambda, omega)` the components of its octave sum
+  `DTurbulence` (POV defaults 6, 2.0, 0.5; `octaves` clamps to [1, 10]; values signed,
+  roughly `[-1, 1]`). Where scalar `noise()` can only modulate a value, these *displace
+  the coordinate another pattern is sampled at* — `sin(6.2832*(3*x +
+  1.1*dturbx(3*x,3*y,3*z, 6, 2, 0.5)))` is the classic POV marble; worked example
+  `scenes/pattern_warp.ftsl`, deterministic self-test `ftrace -checkvnoise`.
+  It can also **sample a declared image
   as a term**: `tex:<name>(u, v)` returns the mean of the texel's three linear RGB
   channels (the same `Texture::scalarAt` sampler a `texture:<name>` slot binding uses,
   honouring that texture's `filter`/`wrap`), so a photo can be one *operand* of a formula
@@ -3207,7 +3217,7 @@ alone can't restore, so they are not disk-resumable.
 `-checkcurve`, `-checkfur`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
-`-checkgrid`, `-checkscatter`, `-checksun`, `-checkbind`, `-checkprop`,
+`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checksun`, `-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
 `PASS`/`FAIL`. `-checkcurve` guards the `curve` primitive: it cross-checks the
 round-cone intersector against the exact analytic SDF, the degenerate
