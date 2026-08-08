@@ -514,6 +514,48 @@ mean.
 one forward pass on a `(64, 135)` batch per control step — far too small to amortise a
 host-device round trip — and MuJoCo on the CPU is the bottleneck by a wide margin either way.
 
+### The command curriculum: standing still is a strong local optimum
+
+The tracking reward is `r_speed = exp(−e²/speed_tol²)` with `speed_tol = 0.25`, and commands
+are drawn up to 0.8 Froude. Measured on the untrained policy, that kernel decays to nothing
+well inside the command range:
+
+| commanded | 0.00 | 0.15 | 0.29 | 0.44 | 0.58 | 0.73 | 0.80 |
+|---|---|---|---|---|---|---|---|
+| `r_speed` at a standstill | 0.99 | 0.71 | 0.26 | 0.05 | 0.005 | 0.001 | 0.000 |
+
+Above ~0.44 there is no reward *and no gradient*: an animal that cannot yet move is paid the
+same 0.000 whether it leans forward or falls backward, so more than half of every batch is
+drawn from a region that teaches nothing. What the batch does contain is the other half, where
+standing still scores ~1.0, never terminates, and costs a cost-of-transport of 0.07 against the
+2.4 a flailing attempt at locomotion pays. The first full-range run converged to exactly that
+and stayed there — a `--eval` per-command table showed `speed 0.000` in all twelve command
+rows, tilt under 2°, every animal surviving the full 20 s. It was not a failure to learn. It
+had learned the best policy available to it inside the reward it was given.
+
+So `VecCreatureEnv` widens the commanded-speed bound only as fast as the policy earns it:
+`speed_cap` starts at `curriculum_start = 0.3`, and each promotion adds `curriculum_step`
+until it reaches the configured `speed_range`. Two things about *how* it is judged matter more
+than the schedule itself:
+
+- **The bar is tracking reward, not survival.** Survival is what standing still is already
+  perfect at, so promoting on episode length or total return promotes the local optimum.
+  `_ep_track` accumulates `r_speed` alone.
+- **It is judged over a window of `curriculum_window` episodes, step-weighted.** The first
+  version scored whichever handful of envs happened to finish on the current step, which ran
+  the promotion test dozens of times per rollout on samples of one to five episodes — drawn
+  from a population selected precisely for having ended. It went 0.30 to the full 0.80 in 82 k
+  steps, before the animal could stand, and reproduced the standstill it was written to
+  prevent. Promotion is a claim about the policy, and a claim about a population cannot be
+  made from a sample selected by the thing being measured.
+
+`_advance_curriculum` is called only when `auto_reset` is on, so an evaluation env — handed a
+fixed command grid and never training — cannot advance a curriculum it is not part of. The cap
+lives in the checkpoint alongside the weights and the normaliser, for the same reason the
+normaliser does: a resume that restarts the curriculum at its initial width hands a competent
+policy a task it solved millions of steps ago, and the learning curve takes a visible step
+backwards for reasons entirely internal to the resume.
+
 ### Textures: non-stationarity, not randomness
 
 Procedural noise (Perlin/Worley/fBm) is **stationary** — statistically identical

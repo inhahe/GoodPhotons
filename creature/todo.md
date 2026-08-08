@@ -185,6 +185,18 @@ Smoke-test the entire loop end to end on a body whose dynamics we trust.
       warning counters rather than `isfinite`, because on a bad qvel MuJoCo resets the body itself
       and hands back a finite default pose. Energy is trapezoid-integrated |τ·q̇| at a measured
       accuracy/throughput trade (`sensing.actuator_work`), and every reward term is dimensionless.
+- [x] **Command curriculum, because standing still is a strong local optimum.** With the full
+      0–0.8 Froude command range on from the start, over half of every batch is drawn from
+      commands where `r_speed = exp(−e²/0.25²)` has already decayed to ~0 — no reward *and no
+      gradient* — while the other half pays a standstill ~1.0 for a cost of transport of 0.07
+      against the 2.4 a flailing attempt costs. The first full-range run converged to exactly
+      that: a `--eval` per-command table showed `speed 0.000` in all twelve rows with every
+      animal surviving 20 s. `VecCreatureEnv.speed_cap` now widens only as fast as the policy
+      earns it, judged on **tracking reward** (not survival — survival is what standing still is
+      already perfect at) over a **window of 256 episodes, step-weighted**. The unwindowed first
+      version scored whichever handful of envs happened to finish on the current step and went
+      0.30 → 0.80 in 82 k steps, reproducing the standstill it was written to prevent. The cap
+      is in the checkpoint, for the same reason the normaliser is.
 - [ ] **Bar:** a stable gait emerges. It will look bad. That is fine — this step is
       testing the plumbing, not the motion.
       - ~~Blocked on known-issues #3 (passive roll instability)~~ — **unblocked** (2026-08-08).

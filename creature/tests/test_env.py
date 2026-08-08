@@ -456,3 +456,183 @@ def test_a_recovered_env_is_sane_again_after_reset(body):
         _, _, term, trunc, info = v.step(np.zeros((2, v.act_dim)))
         assert np.all(info["sane"]), "the auto-reset env is still reading as insane"
         assert not np.any(term)
+
+
+# ------------------------------------------------------------------- the command curriculum
+def test_curriculum_starts_narrow_and_never_exceeds_the_declared_range(body):
+    """The commanded speed is what the curriculum widens; the declared range is the ceiling."""
+    c = cfg(curriculum=True, curriculum_start=0.3)
+    v = VecCreatureEnv([body] * 8, c, seed=0, workers=1)
+    v.reset(seed=0)
+    assert v.speed_cap == pytest.approx(0.3)
+    assert v.command[:, 0].max() <= 0.3 + 1e-12
+
+    v.speed_cap = c.speed_range[1]
+    v.command[:] = v.sample_commands(8)
+    assert v.command[:, 0].max() <= c.speed_range[1] + 1e-12
+
+
+def test_curriculum_off_uses_the_full_range_immediately(body):
+    c = cfg(curriculum=False)
+    v = VecCreatureEnv([body] * 4, c, seed=0, workers=1)
+    assert v.speed_cap == pytest.approx(c.speed_range[1])
+
+
+def test_curriculum_promotes_on_tracking_and_not_on_survival(body):
+    """The bar is the *tracking* term, and choosing that over the return is load-bearing.
+
+    The episode return is dominated by episode length -- a 20 s episode of standing still
+    scores several hundred -- so a curriculum judged on return promotes a policy that survives
+    well and tracks badly straight out of the speed range it can actually handle. Which is the
+    exact failure the curriculum exists to prevent, arrived at from the other side.
+    """
+    c = cfg(curriculum=True, curriculum_start=0.3, curriculum_step=0.05,
+            curriculum_margin=0.25, curriculum_window=4)
+    v = VecCreatureEnv([body] * 4, c, seed=0, workers=1)
+    v.reset(seed=0)
+    idx = np.arange(4)
+
+    # Long, well-rewarded episodes that tracked badly: no promotion, however big the return.
+    v._steps[:] = 1000
+    v._ep_track[:] = 1000 * 0.2
+    v._return[:] = 5000.0
+    v._advance_curriculum(idx)
+    assert v.speed_cap == pytest.approx(0.3)
+
+    # Short episodes that tracked well: promoted.
+    v._steps[:] = 50
+    v._ep_track[:] = 50 * 0.9
+    v._return[:] = -100.0
+    v._advance_curriculum(idx)
+    assert v.speed_cap == pytest.approx(0.35)
+
+
+def test_curriculum_needs_a_full_window_before_it_promotes(body):
+    """The bug that made the first version useless, and it is not a tuning matter.
+
+    Scoring whichever handful of envs happened to finish on the current step runs the promotion
+    test dozens of times per rollout, on samples of one to five episodes, drawn from a
+    population selected precisely for having ended. It took the range from 0.30 to the full
+    0.80 in 82k steps -- before the animal could stand -- and so reproduced the exact standstill
+    the curriculum was written to prevent.
+    """
+    c = cfg(curriculum=True, curriculum_start=0.3, curriculum_window=64, curriculum_margin=0.25)
+    v = VecCreatureEnv([body] * 4, c, seed=0, workers=1)
+    v.reset(seed=0)
+    v._steps[:], v._ep_track[:] = 100, 100.0        # flawless tracking, every time
+    for _ in range(15):                             # 60 episodes: one window short
+        v._advance_curriculum(np.arange(4))
+    assert v.speed_cap == pytest.approx(0.3), "promoted on a partial window"
+    v._advance_curriculum(np.arange(4))              # the 64th
+    assert v.speed_cap == pytest.approx(0.35)
+    # ...and the window is cleared, so the next promotion needs another full one.
+    v._advance_curriculum(np.arange(4))
+    assert v.speed_cap == pytest.approx(0.35)
+
+
+def test_curriculum_weights_by_step_not_by_episode(body):
+    """A policy that falls over after 20 well-tracked steps must not count the same as one
+    that held the command for 20 seconds."""
+    c = cfg(curriculum=True, curriculum_start=0.3, curriculum_window=2, curriculum_margin=0.25)
+    v = VecCreatureEnv([body] * 2, c, seed=0, workers=1)
+    v.reset(seed=0)
+    # One long, badly tracked episode and one short, perfect one. Per *episode* the mean is
+    # 0.75; per *step* it is (1000*0.5 + 20*1.0)/1020 = 0.51. The bar sits between the two, so
+    # the weighting is the only thing deciding the outcome and the test cannot pass by accident.
+    assert 0.51 < v.cur_bar < 0.75
+    v._steps[:] = [1000, 20]
+    v._ep_track[:] = [1000 * 0.5, 20 * 1.0]
+    v._advance_curriculum(np.arange(2))
+    assert v.speed_cap == pytest.approx(0.3)
+
+
+def test_curriculum_only_widens(body):
+    """A curriculum that also narrows oscillates, and the signal is a noisy mean over however
+    many episodes happened to finish in one step."""
+    c = cfg(curriculum=True, curriculum_start=0.3, curriculum_margin=0.25, curriculum_window=4)
+    v = VecCreatureEnv([body] * 4, c, seed=0, workers=1)
+    v.reset(seed=0)
+    idx = np.arange(4)
+    v._steps[:], v._ep_track[:] = 100, 100 * 0.9
+    v._advance_curriculum(idx)
+    assert v.speed_cap == pytest.approx(0.35)
+    v._ep_track[:] = 0.0                       # a terrible batch
+    v._advance_curriculum(idx)
+    assert v.speed_cap == pytest.approx(0.35), "the curriculum narrowed"
+
+
+def test_curriculum_stops_at_the_ceiling(body):
+    c = cfg(curriculum=True, curriculum_start=0.78, curriculum_step=0.05, curriculum_window=2)
+    v = VecCreatureEnv([body] * 2, c, seed=0, workers=1)
+    v.reset(seed=0)
+    idx = np.arange(2)
+    for _ in range(10):
+        v._steps[:], v._ep_track[:] = 100, 100.0
+        v._advance_curriculum(idx)
+    assert v.speed_cap == pytest.approx(c.speed_range[1])
+
+
+def test_an_eval_env_does_not_advance_the_curriculum(body):
+    """`auto_reset=False` is how an evaluation env is built, and it is handed a fixed command
+    grid it never sampled. Letting it promote would make the curriculum depend on how often
+    the run was scored."""
+    c = cfg(curriculum=True, curriculum_start=0.3, episode_seconds=0.1)
+    v = VecCreatureEnv([body] * 2, c, seed=0, auto_reset=False, workers=1)
+    v.reset(seed=0)
+    for _ in range(int(0.1 * c.control_hz) + 2):
+        v._ep_track[:] = v._steps * 1.0        # perfect tracking, by construction
+        _, _, _, trunc, _ = v.step(np.zeros((2, v.act_dim)))
+        if trunc.any():
+            break
+    assert v.speed_cap == pytest.approx(0.3)
+
+
+def test_standstill_score_matches_a_motionless_animal(body):
+    """The promotion bar is measured up from this number, so it had better be the real one.
+
+    `_standstill_score` is a closed form -- two `erf` differences and the `stand_fraction`
+    mixture -- and the whole point of it is to be exact where a guess would not be. Checked
+    against the empirical mean of `r_speed` over actual sampled commands at zero velocity.
+    """
+    c = cfg(curriculum=True, curriculum_start=0.3)
+    v = VecCreatureEnv([body] * 2, c, seed=0, workers=1)
+    for cap in (0.3, 0.5, c.speed_range[1]):
+        v.speed_cap = cap
+        cmd = v.sample_commands(200_000)                 # velocity is zero, so error == command
+        empirical = np.exp(-(cmd[:, 0] ** 2 + cmd[:, 1] ** 2) / c.speed_tol ** 2).mean()
+        assert v._standstill_score() == pytest.approx(empirical, abs=3e-3)
+
+
+def test_the_promotion_bar_tracks_the_cap(body):
+    """A fixed absolute bar asks a different question at every width.
+
+    Parked scores 0.64 when commands run to 0.3 Froude and 0.31 when they run to 0.8, so a
+    constant 0.75 means "a little better than standing" at the start and "near perfect" later --
+    backwards, since wider commands are the harder task. The bar is a fixed fraction of the gap
+    from parked to perfect instead, which is the same claim about the policy at every width.
+    """
+    c = cfg(curriculum=True, curriculum_start=0.3, curriculum_margin=0.25)
+    v = VecCreatureEnv([body] * 2, c, seed=0, workers=1)
+    narrow_stand, narrow_bar = v._standstill_score(), v.cur_bar
+    v.speed_cap = c.speed_range[1]                       # the setter must move the bar with it
+    wide_stand, wide_bar = v._standstill_score(), v.cur_bar
+
+    assert wide_stand < narrow_stand, "a wider command range is harder to stand through"
+    assert wide_bar < narrow_bar, "the bar did not follow the cap"
+    for stand, bar in ((narrow_stand, narrow_bar), (wide_stand, wide_bar)):
+        assert bar == pytest.approx(stand + 0.25 * (1.0 - stand))
+        assert stand < bar < 1.0
+
+
+def test_curriculum_advances_from_a_real_rollout(body):
+    """End to end through `step`, because the promotion has to happen *before* the auto-reset
+    zeroes the very counters it is judged on."""
+    c = cfg(curriculum=True, curriculum_start=0.3, curriculum_step=0.05,
+            curriculum_margin=0.25, curriculum_window=4, episode_seconds=0.2)
+    v = VecCreatureEnv([body] * 4, c, seed=0, workers=1)
+    v.reset(seed=0)
+    v.command[:] = 0.0                         # standing still tracks a zero command perfectly
+    a = np.zeros((4, v.act_dim))
+    for _ in range(int(0.2 * c.control_hz) + 1):
+        v.step(a)
+    assert v.speed_cap > 0.3, "a full episode of perfect tracking earned no promotion"

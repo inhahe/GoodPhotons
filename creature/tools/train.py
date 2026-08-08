@@ -44,7 +44,7 @@ def build_envs(cfg: envmod.EnvConfig, n: int, seed: int, auto_reset: bool = True
     return envmod.VecCreatureEnv([body] * n, cfg, seed=seed, auto_reset=auto_reset)
 
 
-def evaluate(env, ac, norm, pcfg) -> dict:
+def evaluate(env, ac, norm, pcfg, per_command: bool = False) -> dict:
     """Deterministic rollout over a fixed command grid. Returns mean return and tracking.
 
     The env passed here must be built with `auto_reset=False`, and that is load-bearing rather
@@ -56,6 +56,12 @@ def evaluate(env, ac, norm, pcfg) -> dict:
 
     A separate env also keeps evaluation from disturbing the training rollout, which otherwise
     has to be re-reset afterwards, throwing away `num_envs` partial episodes every time.
+
+    `per_command` additionally returns the *unaggregated* rows. The scalar mean cannot tell a
+    policy that tracks every command mediocrely from one that tracks the slow half and ignores
+    the fast half, and on this task those are the two things that actually happen -- the second
+    is what standing still looks like, since a motionless animal scores ~0.25 against a uniform
+    command range by getting the near-zero commands right for free.
     """
     n = env.n
     # A fixed spread of forward speeds in Froude units so the score covers the commanded
@@ -66,6 +72,7 @@ def evaluate(env, ac, norm, pcfg) -> dict:
     ret = np.zeros(n)
     alive = np.ones(n, dtype=bool)
     acc = {"tilt": 0.0, "speed": 0.0, "r_speed": 0.0, "cot": 0.0}
+    rows = {k: np.zeros(n) for k in acc}
     live, steps = np.zeros(n), 0
     for _ in range(env.max_steps):
         a = ac.mean_action(norm(obs, pcfg.obs_clip))
@@ -73,7 +80,9 @@ def evaluate(env, ac, norm, pcfg) -> dict:
         ret += rew * alive
         live += alive
         for k in acc:
-            acc[k] += float(np.sum(info[k] * alive))
+            contrib = info[k] * alive
+            acc[k] += float(np.sum(contrib))
+            rows[k] += contrib
         steps += 1
         alive &= ~term          # a fallen env stops contributing and is not restarted
         if not alive.any():
@@ -82,6 +91,12 @@ def evaluate(env, ac, norm, pcfg) -> dict:
     out = {f"eval_{k}": v / tot for k, v in acc.items()}
     out.update(eval_return=float(ret.mean()), eval_survived=float(alive.mean()),
                eval_len=float(live.mean()), eval_steps=steps)
+    if per_command:
+        # Per-env means over that env's own live steps, so a body that fell at step 40 is not
+        # averaged as though it had stood there quietly for the remaining 960.
+        d = np.maximum(live, 1.0)
+        out["per_command"] = {"cmd": grid, "live": live, "alive": alive,
+                              **{k: v / d for k, v in rows.items()}}
     return out
 
 
@@ -122,16 +137,28 @@ def main() -> int:
     norm = ppo.RunningNorm(env.obs_dim)
 
     step, best = 0, -np.inf
+
+    def ckpt_extra() -> dict:
+        # `speed_cap` is training state exactly as much as the network weights are. A resume
+        # that restarts the command curriculum at its initial width hands a competent policy a
+        # task it solved 5M steps ago, and the learning curve takes a visible step backwards
+        # for reasons entirely internal to the resume. Same class of bug as leaving the
+        # observation normaliser out of the checkpoint.
+        return {"best": best, "speed_cap": float(env.speed_cap)}
+
     if args.resume:
         step, extra = ppo.load(args.resume, ac, norm)
         best = extra.get("best", -np.inf)
-        print(f"resumed {args.resume} at {step:,} steps (best eval {best:.2f})", flush=True)
+        env.speed_cap = extra.get("speed_cap", env.speed_cap)
+        print(f"resumed {args.resume} at {step:,} steps (best eval {best:.2f}, "
+              f"command cap {env.speed_cap:.2f})", flush=True)
 
     obs, _ = env.reset(seed=pcfg.seed)
     per_update = pcfg.horizon * pcfg.num_envs
     log_path = out / "log.jsonl"
     t_ck = t0 = time.time()
-    upd = 0
+    upd, step0 = 0, step        # `step0` so `--resume` reports this process's rate, not a
+    #                             throughput of 60k/s inherited from the steps it did not run
     # Every progress line is flushed. A run this long is normally started detached with its
     # stdout redirected to a file, and Python block-buffers a redirected stream at 8 KB -- which
     # is about forty of these lines, or twenty minutes of silence at this rate. The whole
@@ -147,13 +174,15 @@ def main() -> int:
         step += per_update
         upd += 1
 
-        row = {"step": step, "update": upd, "sps": step / max(1e-9, time.time() - t0),
-               **ro.stats, **logs}
+        row = {"step": step, "update": upd,
+               "sps": (step - step0) / max(1e-9, time.time() - t0),
+               "speed_cap": float(env.speed_cap), "cur_score": float(env.cur_score),
+               "cur_bar": float(env.cur_bar), **ro.stats, **logs}
         if upd % args.eval_every == 0:
             row.update(evaluate(eval_env, ac, norm, pcfg))
             if row["eval_return"] > best:
                 best = row["eval_return"]
-                ppo.save(out / "best.pt", ac, norm, pcfg, step, {"best": best})
+                ppo.save(out / "best.pt", ac, norm, pcfg, step, ckpt_extra())
         with open(log_path, "a") as f:
             f.write(json.dumps(row) + "\n")
 
@@ -162,15 +191,18 @@ def main() -> int:
                   if "eval_return" in row else "")
             say(f"{step:>10,}  ret {row.get('ep_return', float('nan')):7.1f}  "
                 f"len {row.get('ep_len', float('nan')):6.1f}  "
-                f"rspd {row['r_speed']:.3f}  tilt {row['tilt']:5.1f}  "
+                f"rspd {row['r_speed']:.3f}  spd {row['speed']:+.3f}"
+                f"/{row['speed_cap']:.2f}  cur {row['cur_score']:.2f}"
+                f"/{row['cur_bar']:.2f}  tilt {row['tilt']:5.1f}  "
                 f"kl {row['kl']:.4f}  sps {row['sps']:5.0f}{ev}")
 
         if time.time() - t_ck > args.checkpoint_minutes * 60:
-            ppo.save(out / "latest.pt", ac, norm, pcfg, step, {"best": best})
+            ppo.save(out / "latest.pt", ac, norm, pcfg, step, ckpt_extra())
             t_ck = time.time()
 
-    ppo.save(out / "latest.pt", ac, norm, pcfg, step, {"best": best})
-    say(f"done: {step:,} steps in {(time.time() - t0) / 60:.1f} min, best eval {best:.2f}")
+    ppo.save(out / "latest.pt", ac, norm, pcfg, step, ckpt_extra())
+    say(f"done: {step:,} steps ({step - step0:,} this run) in "
+        f"{(time.time() - t0) / 60:.1f} min, best eval {best:.2f}")
     env.close()
     eval_env.close()
     return 0
@@ -186,8 +218,20 @@ def run_eval(args, ecfg, pcfg) -> int:
     step, extra = ppo.load(args.eval, ac, norm)
     print(f"{args.eval}: trained {step:,} steps, best {extra.get('best', float('nan')):.2f}")
     if not args.view:
-        for k, v in evaluate(env, ac, norm, pcfg).items():
+        res = evaluate(env, ac, norm, pcfg, per_command=True)
+        pc = res.pop("per_command")
+        for k, v in res.items():
             print(f"  {k:16s} {v:.3f}")
+        print(f"\n  {'cmd':>6s} {'speed':>7s} {'error':>7s} {'r_speed':>8s} {'tilt':>6s} "
+              f"{'cot':>6s} {'alive s':>8s}")
+        for i in range(len(pc["cmd"])):
+            c, s = pc["cmd"][i], pc["speed"][i]
+            print(f"  {c:6.3f} {s:7.3f} {s - c:+7.3f} {pc['r_speed'][i]:8.3f} "
+                  f"{pc['tilt'][i]:6.1f} {pc['cot'][i]:6.2f} "
+                  f"{pc['live'][i] / ecfg.control_hz:7.1f}s"
+                  + ("" if pc["alive"][i] else "  fell"))
+        print("  speeds are Froude (v / sqrt(g*h)); a motionless animal reads cmd 0 perfectly "
+              "and\n  everything else not at all, which is what the scalar mean hides")
         env.close()
         return 0
 

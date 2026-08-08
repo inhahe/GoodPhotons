@@ -29,6 +29,7 @@ learns.
 """
 from __future__ import annotations
 
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -53,6 +54,24 @@ class EnvConfig:
     lateral_range: tuple[float, float] = (-0.15, 0.15)
     yaw_range: tuple[float, float] = (-0.4, 0.4)      # rad per pendulum period
     stand_fraction: float = 0.1                        # episodes commanded to hold still
+
+    # --- command curriculum ---------------------------------------------------------------
+    # The commanded *speed* is widened only as fast as the policy earns it. This is not a
+    # convenience: with the full range on from the start, over half of every batch is drawn
+    # from a region where the reward is flat, and the run reliably converges to standing still.
+    # See `_advance_curriculum` for the measurement and the escape argument.
+    curriculum: bool = True
+    curriculum_start: float = 0.3      # initial upper bound on |commanded speed|
+    curriculum_step: float = 0.05      # how much to widen by, per promotion
+    curriculum_window: int = 256       # episodes that must finish before a promotion is judged
+    # The bar is expressed as a fraction of the gap between "parked" and "perfect", not as an
+    # absolute tracking reward, because an absolute number asks a different question at every
+    # cap width. A motionless animal scores 0.64 of the tracking reward when commands only run
+    # to 0.3 Froude and 0.31 when they run to 0.8 -- so a fixed 0.75 is "track a bit better than
+    # standing" at the start and "track almost perfectly" later, which is backwards: wider
+    # commands are the harder task. `_standstill_score` computes the parked baseline in closed
+    # form and the bar sits this far above it. 0.25 reproduces ~0.73 at the initial width.
+    curriculum_margin: float = 0.25
 
     # --- reward weights (all terms dimensionless) --------------------------------------
     w_speed: float = 1.0
@@ -202,6 +221,22 @@ class VecCreatureEnv:
         self._ctrl = np.zeros((self.n, self.act_dim))
         self._steps = np.zeros(self.n, dtype=np.int64)
         self._return = np.zeros(self.n)
+        # Episode-total tracking reward, which is what the command curriculum is judged on --
+        # deliberately not `_return`, see `_advance_curriculum`.
+        self._ep_track = np.zeros(self.n)
+        self._speed_cap = (float(np.clip(cfg.curriculum_start, *cfg.speed_range))
+                           if cfg.curriculum else cfg.speed_range[1])
+        self._cur_track = self._cur_steps = 0.0     # the promotion window, see `_advance_...`
+        self._cur_eps = 0
+        # The last completed window's score, and the standstill score it has to beat. Both are
+        # exposed in `info` because a curriculum whose decision rule is invisible in the log is
+        # a curriculum you can only debug by rerunning it: the first thing worth knowing about a
+        # cap that has not moved in 900k steps is whether the score is at 0.74 or at 0.40, and
+        # nothing else in the rollout answers that. `r_speed` in the rollout stats is close but
+        # not the same number -- it averages every step in the buffer, including the currently
+        # unfinished episodes, which are exactly the ones that have not fallen over yet.
+        self.cur_score = float("nan")
+        self.cur_bar = self._promotion_bar()
         self._tilt = np.zeros(self.n)
         self._speed = np.zeros(self.n)
         self._cot = np.zeros(self.n)
@@ -220,11 +255,117 @@ class VecCreatureEnv:
     def sample_commands(self, k: int) -> np.ndarray:
         """Draw `k` desired body-frame velocities, in the bodies' own units."""
         c = self.cfg
-        cmd = np.stack([self.rng.uniform(*c.speed_range, k),
+        hi = self.speed_cap if c.curriculum else c.speed_range[1]
+        cmd = np.stack([self.rng.uniform(c.speed_range[0], hi, k),
                         self.rng.uniform(*c.lateral_range, k),
                         self.rng.uniform(*c.yaw_range, k)], axis=1)
         cmd[self.rng.random(k) < c.stand_fraction] = 0.0
         return cmd
+
+    @property
+    def speed_cap(self) -> float:
+        """Current upper bound on the commanded forward speed; see `_advance_curriculum`."""
+        return self._speed_cap
+
+    @speed_cap.setter
+    def speed_cap(self, v: float) -> None:
+        # A property rather than a plain attribute solely so `cur_bar` cannot go stale. The
+        # bar is a function of the cap, and the cap is written from outside this class exactly
+        # once -- `tools/train.py` restores it from a checkpoint on `--resume` -- which is the
+        # one place a recompute is easiest to forget and hardest to notice, since the run would
+        # simply promote against the wrong bar for the rest of its life.
+        self._speed_cap = float(v)
+        self.cur_bar = self._promotion_bar()
+
+    def _standstill_score(self) -> float:
+        """The tracking reward a *motionless* animal collects under the current cap.
+
+        This is the number the promotion bar is measured from, and it is worth having exactly
+        rather than by intuition, because it moves by a factor of two across the curriculum.
+        `r_speed` at zero body velocity is `exp(-(u^2 + w^2) / speed_tol^2)` for a commanded
+        forward/lateral pair `(u, w)`; the two are drawn independently and uniformly, so the
+        expectation factorises into two one-dimensional Gaussian integrals, each of which is an
+        `erf` difference. `stand_fraction` of commands are set to exactly zero and score exactly
+        1, so they are mixed in separately.
+        """
+        tol = self.cfg.speed_tol
+
+        def mean_kernel(lo: float, hi: float) -> float:
+            if hi <= lo:                                    # a degenerate range is a point mass
+                return math.exp(-(lo / tol) ** 2)
+            k = tol * math.sqrt(math.pi) / 2
+            return k * (math.erf(hi / tol) - math.erf(lo / tol)) / (hi - lo)
+
+        lo = self.cfg.speed_range[0]
+        hi = self.speed_cap if self.cfg.curriculum else self.cfg.speed_range[1]
+        moving = mean_kernel(lo, hi) * mean_kernel(*self.cfg.lateral_range)
+        sf = self.cfg.stand_fraction
+        return sf + (1.0 - sf) * moving
+
+    def _promotion_bar(self) -> float:
+        """Tracking reward a window must reach to widen the cap: `curriculum_margin` of the way
+        from a motionless animal's score to a perfect one's."""
+        stand = self._standstill_score()
+        return stand + self.cfg.curriculum_margin * (1.0 - stand)
+
+    def _advance_curriculum(self, idx: np.ndarray) -> None:
+        """Widen the commanded speed range when the finished episodes earned it.
+
+        **The problem this solves, measured rather than assumed.** `speed_tol` is 0.25 Froude
+        and the declared range runs to 0.8, so the tracking kernel `exp(-e^2 / speed_tol^2)`
+        evaluated at a *standing* animal decays across the range like this:
+
+            commanded  0.00  0.15  0.29  0.44  0.58  0.73  0.80
+            r_speed    0.99  0.71  0.26  0.05  0.005 0.001 0.000
+
+        Above about 0.44 there is no reward to be had and, far more importantly, no *gradient*
+        pointing anywhere -- the surface is flat, so those samples tell the policy nothing at
+        all. With the full range on from the start that is over half of every batch. Meanwhile
+        standing still is a genuinely good policy on the rest of it: it scores ~1.0 on the
+        `stand_fraction` and near-zero commands, pays a cost of transport of 0.07 against the
+        2.4 that moving costs, and never terminates. A 1M-step run found exactly that and sat
+        there: commanded 0.0 through 0.8, the measured speed was 0.000 in every column, and the
+        evaluation return oscillated for half a million steps without climbing.
+
+        So the range starts where the gradient is (0.3, i.e. a slow walk) and widens by
+        `curriculum_step` each time completed episodes come back tracking `curriculum_margin`
+        of the way from `_standstill_score` to perfect. The animal is never asked for a speed it
+        has no way to discover it should want.
+
+        Judged on the *tracking* term alone, not on the return. The return is dominated by
+        episode length, so a policy that survives well and tracks badly would promote itself
+        out of the range it can actually handle -- which is the failure this exists to prevent,
+        arrived at from the other side.
+
+        Only ever widens. A curriculum that also narrows on a bad batch oscillates, and the
+        thing being measured is a mean over finished episodes, which is noisy.
+
+        **Judged over a window of `curriculum_window` episodes, and that is the whole
+        difference between this working and not.** The first version scored whichever handful
+        of envs happened to finish on the current step -- so it ran the promotion test dozens
+        of times per rollout, on samples of one to five episodes, drawn from a population
+        selected precisely for having ended. It went 0.30 to the full 0.80 in 82k steps, before
+        the animal could stand, and reproduced the standstill it was written to prevent. The
+        window is one accumulator over ~4 episodes per env, cleared on each decision, so the
+        test runs on a sample large enough to mean something and at most once per window.
+
+        Accumulated per *step*, not per episode, so a policy that falls over after 20 well
+        tracked steps does not count the same as one that held the command for 20 seconds.
+        """
+        if not self.cfg.curriculum or self.speed_cap >= self.cfg.speed_range[1]:
+            return
+        n = self._steps[idx]                    # zeroed by `_reset_one`, so this is the episode
+        self._cur_track += float(np.sum(self._ep_track[idx]))
+        self._cur_steps += float(np.sum(n))
+        self._cur_eps += int(idx.size)
+        if self._cur_eps < self.cfg.curriculum_window or self._cur_steps <= 0:
+            return
+        self.cur_score = score = self._cur_track / self._cur_steps
+        self._cur_track = self._cur_steps = 0.0
+        self._cur_eps = 0
+        if score >= self.cur_bar:
+            self.speed_cap = min(self.cfg.speed_range[1],       # the setter moves `cur_bar` too
+                                 self.speed_cap + self.cfg.curriculum_step)
 
     # ---------------------------------------------------------------------------- reset
     def _reset_one(self, i: int) -> None:
@@ -255,6 +396,7 @@ class VecCreatureEnv:
         self.raw.work_vel[i] = 0.0
         self._steps[i] = 0
         self._return[i] = 0.0
+        self._ep_track[i] = 0.0
         self._prev_action[i] = 0.0
 
     def _reset_idx(self, idx: np.ndarray) -> None:
@@ -345,6 +487,7 @@ class VecCreatureEnv:
         self.rew[~sane] = -1.0
         self._prev_action[:] = action
         self._return += self.rew
+        self._ep_track += r_speed
 
         # ---- termination -------------------------------------------------------------------
         # Identical measure to `validate.trunk_tilt_of`, deliberately: a policy that can
@@ -360,13 +503,19 @@ class VecCreatureEnv:
         self._info_cmd[:] = cmd                      # snapshots -- see __init__
         self._sane[:] = sane
         info = {"command": self._info_cmd, "tilt": self._tilt, "speed": self._speed,
-                "cot": self._cot, "r_speed": self._r_speed, "sane": self._sane}
+                "cot": self._cot, "r_speed": self._r_speed, "sane": self._sane,
+                "speed_cap": self.speed_cap, "cur_score": self.cur_score,
+                "cur_bar": self.cur_bar}
         done = np.nonzero(self.term | self.trunc)[0]
         if done.size:
             info["episode_return"] = self._return[done].copy()
             info["episode_length"] = self._steps[done].copy()
             info["episode_idx"] = done
             if self.auto_reset:
+                # Before the reset, which zeroes the very counters the promotion is judged on.
+                # Gated on `auto_reset` so an evaluation env -- which is handed a fixed command
+                # grid and never trains -- cannot advance a curriculum it is not part of.
+                self._advance_curriculum(done)
                 self.final_obs[done] = self.obs[done]
                 info["final_obs"] = self.final_obs
                 self._reset_idx(done)
