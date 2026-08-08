@@ -5,6 +5,54 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### FIXED (2026-08-08, v0.155.0): `density_at` read its `t` as a control-point index while every scene and every doc called it a position along the curve
+
+`camera_curve`'s `density_at <t> <rho>` is the camera's speed curve — cameras per unit
+length, keyframed along the flight. Every scene in the repo authors those stops as
+**fractions of the way along the path**, `gallery_rain` says so in a comment
+(`# Stops are ARC-LENGTH fractions from scraps/_flyplan.py, not point indices`), and
+`FTSL.md` calls `t` the "normalized position". The loader was doing something else:
+
+```cpp
+double rho = densityAt(g / nSeg);      // g is the SPLINE's global parameter
+```
+
+`g / nSeg` is the normalized **control-point index**, and the two agree only when the
+control points are evenly spaced. On a real flight path they are nowhere near it —
+`gallery_rain`'s loop has 0.27 m between the gold gyroid's channel points and 1.3 m across
+the back cruise, a 5× spread — so every authored dwell landed off its beat by up to a tenth
+of the loop. The dwell written for the glass orb was being spent before the camera got
+there.
+
+This is the second time in this file that a comment describing the *intent* was right and
+the code under it was not, and both times the comment is what made it findable. The rule it
+argues for: when a parameter's units are not obvious from its type (a bare `double` in
+[0,1] can be index, arc length, or time), the name is not enough — say which, in the header
+*and* at the point of use.
+
+**Fix (`src/ftsl.h`, the `camera_curve` sampler):** the density integration became two
+passes. Arc length is not known until the curve has been walked, which is exactly why the
+single-pass version had nothing to hand `densityAt` but `g`; so pass 1 walks the spline for
+`sampS` (which already existed, for the tangent look-ahead) and pass 2 integrates
+`rho(s/Smax) ds`. Cost is one extra spline evaluation per sample, at load time only.
+
+`scraps/_flyplan.py` — the script that *prints* the stops — had a matching error of its
+own: it measured arc length along the **chord polyline** while the camera rides a
+centripetal Catmull-Rom through the points. It now evaluates the real spline (a
+transcription of `catmullRomAt`, kept beside it). The length error was small (23.87 m of
+spline vs 23.69 m of chord; centripetal stays tight, which is why it was chosen), but the
+same change fixed a clearance test that could not see the curve **bowing outside its own
+control points** on a turn — the tightest margin on the loop, over the Klein bottle's cap,
+reads +0.111 m on the spline against +0.120 m on the chords.
+
+**Scope of the behaviour change:** `scenes/gallery_rain.ftsl`, `gallery_settled.ftsl`,
+`gallery.ftsl` and `flythrough.ftsl` all use `density_at`, and all of them meant arc
+length, so this moves their dwells onto the beats they were written for. `gallery_rain`'s
+stops were re-derived against the new (creature-rerouted) curve in the same commit.
+`roll_at` / `fov_at` / `zoom_at` / `fstop_at` / `focus_at` are unaffected — those sample
+the **frame** timeline `i/N`, which is a third parameterization again and the correct one
+for them, since by the time frames exist the density has already placed them.
+
 ### FIXED (2026-08-07, v0.153.1): `-checkbvh` FAILED on every scene with a `curve` — the *reference* was wrong, not the BVH
 
 Found by auditing whether the `curve` primitive reaches every render mode on both

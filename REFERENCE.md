@@ -2749,7 +2749,11 @@ also declares a path, pass `-camera <name>`.
   `frames` count (uniform arc length) or a
   **density** (cameras per unit length) that can vary along the curve via `density_at`
   keyframes — this is the camera's *speed*: high density = many closely-spaced frames =
-  slow dwell, low density = fast. Aim along the travel tangent (default), at a fixed
+  slow dwell, low density = fast. `density_at`'s `t` is the normalized **arc-length**
+  position along the curve (`t=0.5` is half-way *by distance*, **not** the middle control
+  point), so a dwell stays on the beat it was measured for even when the waypoints around
+  it are unevenly spaced — which on a real flight path they always are.
+  Aim along the travel tangent (default), at a fixed
   `look_at`, or at a second `look curve`. The **travel tangent is fold-robust**: where the
   path makes a sharp horizontal U-turn its look-ahead chord loses horizontal reach and would
   otherwise rake the view steeply up into the ceiling / down at the floor, so `min_reach <f>`
@@ -2757,8 +2761,9 @@ also declares a path, pass `-camera <name>`.
   <n>` (default `0`; a Gaussian sigma in frames) temporally smooths the look direction so a
   fold reads as a bounded near-level pan instead of a flick. **Orientation and lens can also be animated**
   per frame over the normalized timeline `t ∈ [0,1]` (`t=0` first frame, `t=1` last),
-  each keyframed by `<name>_at <t> <value>` (piecewise-linear, flat-clamped at the ends,
-  just like `density_at`) or held constant by the bare keyword: **`roll[_at]`** banks the
+  each keyframed by `<name>_at <t> <value>` (piecewise-linear and flat-clamped at the ends,
+  like `density_at` — but note these tracks run on the **frame** timeline `i/N`, not on
+  `density_at`'s arc length) or held constant by the bare keyword: **`roll[_at]`** banks the
   camera about its view axis (the third orientation degree of freedom), and
   **`fov_at` / `zoom_at` / `fstop_at` / `focus_at`** animate the vertical field of view,
   focal-length multiplier, f-number, and focus distance. (`fstop`/`focus` change depth of

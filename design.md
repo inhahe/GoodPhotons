@@ -2271,18 +2271,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       now that they are 0.18–0.24 m deep that is no longer automatic, which is another reason
       the audit is not optional. A column spans a whole y range, so plan overlap *is*
       intersection. `scraps/_standaudit.py`
-      brace-parses every cage's outer box and every cap box and checks all 39 colliders across
-      the 11 stands in 3-D; run it after any stand edit (`-v` also lists every cap's world
+      brace-parses every cage's outer box and every cap box and checks all 42 colliders across
+      the 12 stands in 3-D; run it after any stand edit (`-v` also lists every cap's world
       footprint, which is what you need in front of you before siting a new exhibit — the
       question is never "is there floor", since there are no walls, but "how wide a cap fits
       between its neighbours"). It is **spread-aware** — it
       accumulates every enclosing `group`'s translate onto each collider, because the boxes
       are authored in the pre-spread frame and reading them off the page would audit a layout
       the scene no longer has.
-    - **The flyby threads four pieces, and the ring is threaded *toward* the hall.**
-      `camera_curve "fly"` is a closed 44-point loop through the gold gyroid's empty-air
+    - **The flyby threads five pieces, and the ring is threaded *toward* the hall.**
+      `camera_curve "fly"` is a closed 45-point loop through the gold gyroid's empty-air
       channel (gallery_settled's validated points shifted the same +1.25 z the ball was), the
-      glass orb, the Klein bottle's bulb, and the chrome ring's bore. Three things are
+      FUR CREATURE's coat, the glass orb, the Klein bottle's bulb, and the chrome ring's bore.
+      Three things are
       non-obvious. (a) The Klein pass height is **measured**, not guessed: the quoted bounding
       box includes the handle and the *foot ring*, not the body, sits on the mesh origin, so
       `scraps/_kleinslice.py` walks the real vertices through the mesh/settle/spread chain and
@@ -2294,7 +2295,51 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       arc-length fractions, and this loop is wildly unevenly spaced (0.27 m between channel
       points, 1.3 m across the cruise), so naming the dwells by point index would put every
       one of them in the wrong place — `scraps/_flyplan.py` converts the beats and also tests
-      the polyline at 2 cm against every cage, cap and hero piece.
+      the **spline** (not the chord polyline, which cannot see the curve bow outside its own
+      control points on a turn) at 2 cm against every cage, cap and hero piece. Until 0.155.0
+      the loader was reading those stops as control-point-index fractions anyway, behind the
+      scene's back; see the `density_at` entry below.
+    - **`density_at`'s `t` is normalized ARC LENGTH, and until 0.155.0 the loader read it as a
+      normalized control-point INDEX** (`src/ftsl.h`, the camera-curve sampler). Every scene,
+      every comment and both docs described it as a position along the curve; the code
+      evaluated `densityAt(g / nSeg)`. On an evenly-spaced curve the two agree, which is why it
+      survived — on gallery_rain's loop, where one leg packs seven points into 0.27 m and
+      another spends 1.3 m on two, the dwell meant for the glass orb was landing short of it.
+      The fix makes the sampler **two-pass**, because arc length is not known until the curve
+      has been walked and the obvious single-pass version has nothing to feed `densityAt`
+      except `g/nSeg`: pass one walks the spline at `max(64, 64·nSeg)` samples accumulating
+      *pure* (density-free) arc length, pass two re-integrates `densityAt(s/s_total)·ds` into
+      the cumulative-count table the frame placement actually inverts. Note that this fixes
+      only `density_at`; the lens/orientation tracks (`roll_at`, `fov_at`, `zoom_at`,
+      `fstop_at`, `focus_at`) run on a **third** clock, the frame fraction `i/N`, and were
+      always correct. `scraps/_flyplan.py` had the mirror-image bug — it measured the *chord
+      polyline*, which cannot see the curve bow outside its own control points on a turn — and
+      was moved onto a transcription of `catmullRomAt` at the same time, so its numbers and the
+      loader's are now the same numbers.
+    - **The fur creature is the eleventh exhibit, and it is the only one authored entirely in
+      BAKED WORLD COORDINATES.** `fur { }` is a top-level-only block — the loader rejects it
+      inside a `group` — so a placed groom cannot borrow the spread's `group { translate }`
+      idiom that every other exhibit uses. `scraps/_bakecreature.py` therefore carries the
+      whole body/face/fur table from `scenes/fur_creature.ftsl` and emits the placed block
+      through `p_world = PIVOT_W + S·R_y(yaw)·(p_src − PIVOT_S)` with `S = 1.6`, `yaw = −64.4°`,
+      pivot (6.45, 0.90, 4.40) — every sphere centre *and* every fur `direction` pre-rotated.
+      Three things make this work. (a) **The scale is free.** Fur coverage goes as
+      density × radius × length, so scaling `length`/`radius`/`curl`/`clump_size` by S and
+      `density` by 1/S² gives a visually identical coat at S× size with the *same* strand count
+      and the same memory — 1.6× costs nothing. (b) **The yaw is not a pose choice, it is what
+      the flyby demanded.** `fur` combs nose-to-tail, so a pass running against the grain reads
+      as a hedge; the camera's velocity has to be −F. −64.4° is the yaw at which the animal's
+      long axis already lies along the existing curve point (4.78, 1.35, 5.20)→pivot, which
+      normalizes to (+0.9018, −0.4320) = −F to four places, so the reroute cost two waypoints
+      instead of a rebuilt leg. It also still leaves the still camera at (5.0, 2.95, 9.35) a
+      48°-off-head-on three-quarter *front* view, which the two constraints otherwise pull
+      apart. (c) **The pass height is solved, not chosen.** `_bakecreature.py` sweeps it and
+      reports, per height, the shortest distance to any skin sphere and the total chord inside
+      the coat; 1.295 buries the lens in the head and 1.34 grazes only the back, so the curve
+      holds y = 1.308 dead level across four control points — 12.8 mm of clear air off the head
+      (the closest this camera comes to solid geometry anywhere in the scene) while threading
+      rump, barrel, chest, neck, head and tail brush for 1.16 m at 21 mm/frame. Its cap
+      (1.10 × 0.90) was sized from the real footprint *including* the coat.
     - **Mode `M` is not an option for this scene** even though it is the caustic-friendly mode
       on paper: `photonmap_render.h` has no participating-media code, so M renders the cloud,
       the rain and the bow away entirely — and, unlike mode `U`, does not refuse the scene or

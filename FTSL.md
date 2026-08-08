@@ -1950,10 +1950,15 @@ The eye rides a **Catmull-Rom spline** that passes through every `point` control
   length** (constant speed). With a density, `frames` still fixes the count but the
   density **distributes** those N cameras (more where density is high).
 - **`density <ρ>`** / **`density_at <t> <ρ>`** — cameras per unit length. `density`
-  is constant; `density_at` keyframes it (piecewise-linear over normalized position
-  `t ∈ [0,1]`, t=0 first point, t=1 last). Without `frames`, the count is the integral
-  of ρ over the curve. **High density = many closely-spaced frames = slow dwell**
+  is constant; `density_at` keyframes it (piecewise-linear over the normalized
+  **arc-length** position `t ∈ [0,1]`: t=0 the first point, t=1 the last, t=0.5 the
+  half-way mark **by distance** — *not* by control-point index, so unevenly spaced
+  waypoints don't slide your dwells off their beats). Without `frames`, the count is the
+  integral of ρ over the curve. **High density = many closely-spaced frames = slow dwell**
   through that stretch; low density = fast. This is the camera's "speed" curve.
+  (The `<name>_at` lens/orientation tracks further down run on a *different* clock — the
+  frame timeline `i/N` — because by the time frames exist the density has already placed
+  them.)
 
 **Orientation** (`look …`):
 

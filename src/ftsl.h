@@ -6494,8 +6494,10 @@ private:
     // length — that may itself vary along the curve, giving the camera a "speed": high
     // density = many closely-spaced frames = slow motion through that stretch; low
     // density = fast. `density <rho>` is constant; `density_at <t> <rho>` keyframes it
-    // (piecewise-linear over the normalized position t in [0,1], t=0 first point, t=1
-    // last). The number of cameras placed with local spacing 1/rho follows from
+    // (piecewise-linear over the normalized ARC-LENGTH position t in [0,1]: t=0 the
+    // first point, t=1 the last, t=0.5 the half-way mark BY DISTANCE — not by control
+    // point index; see the two-pass sampling below for why that distinction bites).
+    // The number of cameras placed with local spacing 1/rho follows from
     // integrating rho over arc length; `frames N` (if also given) instead fixes the
     // count and only uses the density to DISTRIBUTE those N cameras. Orientation:
     //   look tangent    (default) — aim along the direction of travel
@@ -6619,6 +6621,19 @@ private:
         // Densely sample the spline; build a cumulative "count" table C(g) = INT rho ds.
         // For a constant/absent density this is just arc length, so the same inversion
         // yields uniform arc-length spacing.
+        //
+        // TWO passes, and the reason is the whole meaning of `density_at`'s t. Arc length
+        // is not known until the curve has been walked, so the obvious single-pass version
+        // has nothing to feed `densityAt` but the spline's own global parameter g/nSeg —
+        // i.e. the normalized CONTROL-POINT INDEX. Those two agree only when the control
+        // points happen to be evenly spaced, and on a real flight path they are nowhere
+        // near it: gallery_rain's loop has 0.27 m between the gyroid channel's points and
+        // 1.3 m across the back cruise, a 5x spread, which slides every authored dwell off
+        // its beat by up to a tenth of the loop. (That was a live bug: the scene's comment
+        // said "ARC-LENGTH fractions, not point indices" while the loader was doing exactly
+        // the latter, so the dwell meant for the glass orb was landing short of it.) So:
+        // pass 1 walks the spline for pure arc length, pass 2 integrates rho against
+        // s/Smax. Cost is one extra spline evaluation per sample at load time.
         int nSeg = closed ? (int)pts.size() : (int)pts.size() - 1;
         int M = std::max(64, 64 * nSeg);
         std::vector<double> sampG((size_t)M + 1), sampC((size_t)M + 1), sampS((size_t)M + 1);
@@ -6627,13 +6642,13 @@ private:
         for (int k = 1; k <= M; ++k) {
             double g = nSeg * (double)k / M;
             Vec3 pcur = catmullRomAt(pts, closed, g, splineAlpha);
-            double ds = length(pcur - prev);
-            double rho = densityAt(g / nSeg);
-            sampC[k] = sampC[k - 1] + rho * ds;
-            sampS[k] = sampS[k - 1] + ds;      // pure arc length (density-free), for look-ahead
+            sampS[k] = sampS[k - 1] + length(pcur - prev);   // pure arc length (density-free)
             sampG[k] = g;
             prev = pcur;
         }
+        const double invS = (sampS[M] > 1e-12) ? 1.0 / sampS[M] : 0.0;
+        for (int k = 1; k <= M; ++k)
+            sampC[k] = sampC[k - 1] + densityAt(sampS[k] * invS) * (sampS[k] - sampS[k - 1]);
         double Cmax = sampC[M];
         if (Cmax <= 0.0) { fail("camera_curve '" + base + "' has zero length or density"); return false; }
 

@@ -280,6 +280,11 @@ texture "tex_marble_heart"    { file textures/marble_heart.png    encoding srgb 
 texture "tex_marble_brass"    { file textures/marble_brass.png    encoding srgb  filter bilinear  wrap clamp }
 texture "tex_marble_oil"      { file textures/marble_oil.png      encoding srgb  filter bilinear  wrap clamp }
 texture "tex_marble_axicon"   { file textures/marble_axicon.png   encoding srgb  filter bilinear  wrap clamp }
+# The eleventh cap, and the only one whose slab is not its own sheet: there are ten source
+# drops and eleven stands now, so `marble texture 2.jpg` (the tallest, 1200x2141) is CUT IN
+# TWO — chrome takes its top 52%, the creature its bottom 48%. The crops share no pixel, so
+# these are two slabs off one block rather than the same stone printed twice.
+texture "tex_marble_creature" { file textures/marble_creature.png encoding srgb  filter bilinear  wrap clamp }
 
 # `wrap clamp` (not `repeat`) with `uv planar axis=y` on each cap isosurface maps ONE slab
 # across each tabletop, referenced to that primitive's own world bounds — a quarried slab cut
@@ -297,6 +302,7 @@ material "capmarble_heart"    { type diffuse  reflect texture:tex_marble_heart }
 material "capmarble_brass"    { type diffuse  reflect texture:tex_marble_brass }
 material "capmarble_oil"      { type diffuse  reflect texture:tex_marble_oil }
 material "capmarble_axicon"   { type diffuse  reflect texture:tex_marble_axicon }
+material "capmarble_creature" { type diffuse  reflect texture:tex_marble_creature }
 
 # --- Hero-object materials -----------------------------------------------------
 # `roughness` after `preset` overrides the preset's polished lobe. Gold needs a LOT here, and
@@ -360,6 +366,23 @@ material "flint"    { type dielectric ior glass:SF10 }
 material "diamond"  { preset diamond }
 material "morpho"   { preset morpho }       # iridescent multilayer Bragg (blue morpho)
 material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) — 2nd iridescent, different model
+
+# --- Fur-creature materials (the eleventh exhibit) ---------------------------------
+# Lifted unchanged from `scenes/fur_creature.ftsl`, prefixed `cr_` so nothing here can
+# collide with the hall's own `chrome`/`glass`/`gold`. They are the only DIFFUSE ORGANIC
+# surfaces in a room of metal and dielectric, which is the point of putting the piece in:
+# every other exhibit answers the sun with a specular highlight, and this one answers with
+# a quarter of a million individually-shadowing fibres.
+#
+# `cr_skin` is never actually seen — the coat covers all of it — but it has to be a sane
+# brown anyway, because at the flyby's closest approach (13 mm off the head; see FLYBY) the
+# lens is INSIDE the coat, and any strand that parts shows what is behind it.
+material "cr_skin"  { type diffuse  reflect rgb 0.30 0.22 0.19 }
+material "cr_coat"  { type diffuse  reflect rgb 0.40 0.25 0.13 }   # warm brown guard hair
+material "cr_belly" { type diffuse  reflect rgb 0.66 0.55 0.40 }   # pale underside
+material "cr_tan"   { type diffuse  reflect rgb 0.58 0.46 0.34 }
+material "cr_eye"   { type glossy   reflect rgb 0.04 0.03 0.03  roughness 0.05 }
+material "cr_nose"  { type glossy   reflect rgb 0.12 0.08 0.08  roughness 0.15 }
 
 # --- THE GROUND. One quad, 46 x 45 m, x[-18,28] z[-19,26] — no walls, no ceiling.
 # The exhibits used to occupy the old hall's footprint (x in [3.2, 6.8], z in [1.5, 4.8]); the
@@ -878,6 +901,56 @@ isosurface "stand_axicon_cap" { material capmarble_axicon
     # ended at exactly +0.60 z, i.e. ZERO margin on the far edge, which is not a cap size —
     # it is a coincidence waiting to become a clipped cusp.
     box { center 2.54 0.80 5.44  size 1.6 0.20 1.34  round 0.02 } }
+
+# --- exhibit: THE FUR CREATURE (the eleventh stand) ------------------------------------
+# Authored in WORLD coordinates with no `group { translate }` wrapper, for the same reason
+# the axicon has none — it has no pre-spread position to be displaced from — and for one it
+# does not share: `fur` blocks are TOP-LEVEL ONLY (the loader rejects one inside a `group`),
+# so the animal itself CANNOT be wrapped. Its 18 spheres and 15 grooms are baked to world by
+# `scraps/_bakecreature.py`; putting the stand under a translate the piece cannot follow is
+# how you get a pedestal with nothing on it, so it stays in world too.
+#
+# WHY HERE: (6.45, 4.40), mid-right, in the free court between the gold gyroid and the glass
+# orb. Four constraints, all measured by `scraps/_placecreature.py` (which projects candidate
+# positions through the real still camera) and `scraps/_bakecreature.py`:
+#   * clear of every existing cap by 0.15 m — stand_glass_cap starts at x=7.15 and this cap
+#     ends at 7.00; stand_gyroid_cap starts at z=5.00 and this ends at 4.85. Those are the
+#     only two that come close; everything else is 0.85 m or more.
+#   * the animal fits the cap it stands on. Spheres PLUS their coat span x 6.05..6.95 and
+#     z 4.06..4.65, inside the 1.10 x 0.90 top with 0.05-0.20 m of margin on every side. It
+#     is worth being explicit that the fur is included in that: a groom is real geometry that
+#     the BVH sees, and a coat overhanging the slab reads as a badly stuffed exhibit.
+#   * ON THE FLYBY LINE, which is what actually picked the spot. Nothing else in the hall is
+#     positioned to be flown THROUGH lengthwise, and the creature has to be: see FLYBY.
+#   * it fills the one hole in the still. The middle court between the gyroid and the orb was
+#     the only empty ground the camera at (5.0, 2.95, 9.35) looks straight at, and every
+#     other candidate in it sat behind one ball or the other.
+#
+# Cage and cap follow the house pattern exactly (cap top y=0.90, matching axicon/chrome/
+# glass), so the piece reads as one of the set rather than an import.
+isosurface "stand_creature" {   # cap top y=0.90
+    material wirecage  union {
+        difference {
+            box { center 6.45 0.1 4.4  size 0.74  0.2   0.74  }
+            box { center 6.45 0.1 4.4  size 0.76  0.178 0.718 }
+            box { center 6.45 0.1 4.4  size 0.718 0.22  0.718 }
+            box { center 6.45 0.1 4.4  size 0.718 0.178 0.76  }
+        }
+        difference {
+            box { center 6.45 0.55 4.4  size 0.3   0.7   0.3   }
+            box { center 6.45 0.55 4.4  size 0.32  0.678 0.278 }
+            box { center 6.45 0.55 4.4  size 0.278 0.72  0.278 }
+            box { center 6.45 0.55 4.4  size 0.278 0.678 0.32  }
+        }
+    }
+}
+isosurface "stand_creature_cap" { material capmarble_creature
+    uv planar axis=y
+    # NOT cantilevered, and this is the only cap in the hall that has nothing to cantilever
+    # FOR: fur is opaque, so the piece throws no caustic and there is no patch to catch. The
+    # cap is therefore sized to the SUBJECT (see the footprint above) rather than to a
+    # measured light patch, and centred under it.
+    box { center 6.45 0.80 4.40  size 1.10 0.20 0.90  round 0.02 } }
 
 # ==============================  HERO PIECES  =================================
 # Each piece is wrapped in the SAME `group { translate }` as its stand — see THE SPREAD
@@ -1436,6 +1509,203 @@ isosurface "stand_axicon_mount" {
     }
 }
 
+# --- THE FUR CREATURE (the eleventh exhibit, and the only living-looking one) -----------
+# GENERATED. Every number below is baked to WORLD by `scraps/_bakecreature.py` from
+# `scenes/fur_creature.ftsl`:
+#
+#     p_world = (6.45, 0.90, 4.40) + 1.6 * R_y(-64.4 deg) * (p_src - (0.50, 0.003, 0.572))
+#
+# Do not hand-edit it. Change the source scene or the script's three constants and re-run
+#     python scraps/_bakecreature.py > scraps/_creature_block.ftsl
+# which also re-prints the footprint, the cap clearances and the flyby's coat/skin margins.
+#
+# WHY BAKED RATHER THAN WRAPPED. Every other exhibit in this hall is a `group { translate }`
+# away from its authored position. This one cannot be: a `fur` block is TOP-LEVEL ONLY, and
+# the loader rejects it inside a group, because a groom is generated at load time against the
+# surface it names and there is no transform in scope to carry. So the alternative to a
+# generator script is 18 sphere centres and 15 rotated `direction` vectors typed by hand,
+# which is 90 numbers and one transposed digit away from an animal with its head on backwards.
+#
+# THE SCALE IS FREE, and that is worth knowing before anyone "optimises" it. Coverage goes as
+# density * radius * length, so a uniform scale S with length/radius/curl/clump_size * S and
+# density / S^2 gives a coat that is pixel-for-pixel the same groom at S times the size, with
+# the SAME strand count and the same memory. Here S = 1.6 (a 0.36 m animal becomes 0.89 m
+# nose to tail, gallery scale) and `density 450000 / 1.6^2 = 175781` pays for it exactly.
+#
+# THE YAW IS NOT A TASTE DECISION. `fur { }` grows a coat that lies from nose to tail, so the
+# flyby is only a fly-THROUGH if it enters at the nose: the camera's velocity has to be -F
+# where F is the way the animal faces. -64.4 deg puts F at (-0.9018, 0, +0.4321), which is
+# exactly antiparallel to the flyby's approach from (4.78, 1.35, 5.20) — and, because F also
+# leans back toward the still camera at (5.0, 2.95, 9.35), the still gets a three-quarter
+# FRONT view (48 deg off head-on) rather than a rump. Those two wants pull opposite ways and
+# 64.4 deg is where they meet; `scraps/_placecreature.py` prints the whole sweep.
+#
+# The three face spheres are NAMED and listed as `bald` zones by the head and muzzle grooms
+# (margin 0.001 * 1.6 = 0.0016). Without that the eyes render as black patches peppered with
+# hair — not hair growing OUT of the eyeball, but hair rooted on the skin ring around it and
+# growing across it, which is why the cull has to be span-wise over the whole strand.
+
+sphere "cr_rump" { center 6.6549 1.1272 4.3018  radius 0.1568  material cr_skin }
+sphere "cr_barrel" { center 6.5106 1.1352 4.371  radius 0.16  material cr_skin }
+sphere "cr_chest" { center 6.3735 1.1352 4.4366  radius 0.1376  material cr_skin }
+sphere "cr_neck" { center 6.2797 1.164 4.4816  radius 0.1088  material cr_skin }
+sphere "cr_head" { center 6.196 1.1928 4.5217  radius 0.0992  material cr_skin }
+sphere "cr_muzzle" { center 6.121 1.148 4.5576  radius 0.0576  material cr_skin }
+sphere "cr_ear_l" { center 6.1837 1.292 4.4478  radius 0.0464  material cr_skin }
+sphere "cr_ear_r" { center 6.2459 1.292 4.5776  radius 0.0464  material cr_skin }
+sphere "cr_haunch_l" { center 6.5794 1.1032 4.2369  radius 0.1152  material cr_skin }
+sphere "cr_haunch_r" { center 6.6582 1.1032 4.4014  radius 0.1152  material cr_skin }
+sphere "cr_tail" { center 6.792 1.1752 4.2362  radius 0.0672  material cr_skin }
+sphere "cr_paw_fl" { center 6.2968 0.9528 4.406  radius 0.048  material cr_skin }
+sphere "cr_paw_fr" { center 6.3493 0.9528 4.5157  radius 0.048  material cr_skin }
+sphere "cr_paw_bl" { center 6.5433 0.9528 4.2541  radius 0.0528  material cr_skin }
+sphere "cr_paw_br" { center 6.6222 0.9528 4.4186  radius 0.0528  material cr_skin }
+
+sphere "cr_eye_l" { center 6.09708 1.21936 4.52137  radius 0.0224  material cr_eye }
+sphere "cr_eye_r" { center 6.13427 1.21936 4.599  radius 0.0224  material cr_eye }
+sphere "cr_nose" { center 6.06618 1.1384 4.5839  radius 0.0208  material cr_nose }
+
+fur "cr_coat_barrel" {
+    on "cr_barrel"  material cr_coat  density 175781
+    points 4   segments 2
+    length 0.0672   length_jitter 0.35
+    radius 0.00064
+    direction 0.90183 0 -0.43209   comb 0.32
+    droop 0.45   jitter 0.3
+    clump 0.45   clump_size 0.0208
+    seed 11
+}
+fur "cr_coat_rump" {
+    on "cr_rump"  material cr_coat  density 175781
+    points 4   segments 2
+    length 0.0704   length_jitter 0.35
+    radius 0.00064
+    direction 0.90183 0 -0.43209   comb 0.38
+    droop 0.5   jitter 0.3
+    clump 0.45   clump_size 0.0208
+    seed 12
+}
+fur "cr_coat_chest" {
+    on "cr_chest"  material cr_belly  density 175781
+    points 4   segments 2
+    length 0.0608   length_jitter 0.35
+    radius 0.00064
+    direction 0.90183 0 -0.43209   comb 0.26
+    droop 0.42   jitter 0.3
+    clump 0.4   clump_size 0.0208
+    seed 13
+}
+fur "cr_coat_neck" {
+    on "cr_neck"  material cr_belly  density 175781
+    points 4   segments 2
+    length 0.0544   length_jitter 0.35
+    radius 0.00064
+    direction 0.90183 0 -0.43209   comb 0.22
+    droop 0.36   jitter 0.3
+    seed 14
+}
+fur "cr_coat_head" {
+    on "cr_head"  material cr_coat  density 175781
+    points 4   segments 2
+    length 0.0224   length_jitter 0.3
+    radius 0.000576
+    direction -0.90183 0 0.43209   comb 0.18
+    droop 0.28   jitter 0.26
+    bald "cr_eye_l" 0.0016   bald "cr_eye_r" 0.0016
+    seed 15
+}
+fur "cr_coat_muzzle" {
+    on "cr_muzzle"  material cr_tan  density 175781
+    points 3   segments 2
+    length 0.0112   length_jitter 0.3
+    radius 0.00048
+    direction -0.90183 0 0.43209   comb 0.2
+    droop 0.2   jitter 0.22
+    bald "cr_nose" 0.0016   bald "cr_eye_l" 0.0016   bald "cr_eye_r" 0.0016
+    seed 16
+}
+fur "cr_coat_ear_l" {
+    on "cr_ear_l"  material cr_coat  density 175781
+    points 3   segments 2
+    length 0.0224   length_jitter 0.35
+    radius 0.00048
+    direction 0 1 0   comb 0.3
+    droop 0.15   jitter 0.3
+    seed 17
+}
+fur "cr_coat_ear_r" {
+    on "cr_ear_r"  material cr_coat  density 175781
+    points 3   segments 2
+    length 0.0224   length_jitter 0.35
+    radius 0.00048
+    direction 0 1 0   comb 0.3
+    droop 0.15   jitter 0.3
+    seed 18
+}
+fur "cr_coat_haunch_l" {
+    on "cr_haunch_l"  material cr_coat  density 175781
+    points 4   segments 2
+    length 0.064   length_jitter 0.35
+    radius 0.00064
+    direction 0.90183 -0.2 -0.43209   comb 0.34
+    droop 0.55   jitter 0.3
+    clump 0.5   clump_size 0.0192
+    seed 19
+}
+fur "cr_coat_haunch_r" {
+    on "cr_haunch_r"  material cr_coat  density 175781
+    points 4   segments 2
+    length 0.064   length_jitter 0.35
+    radius 0.00064
+    direction 0.90183 -0.2 -0.43209   comb 0.34
+    droop 0.55   jitter 0.3
+    clump 0.5   clump_size 0.0192
+    seed 20
+}
+fur "cr_coat_tail" {
+    on "cr_tail"  material cr_coat  density 175781
+    points 5   segments 2
+    length 0.088   length_jitter 0.4
+    radius 0.000672
+    direction 0.90183 0.3 -0.43209   comb 0.55
+    droop 0.3   jitter 0.35
+    clump 0.35   clump_size 0.0256
+    curl 0.144    curl_freq 2.5
+    seed 21
+}
+fur "cr_coat_paw_fl" {
+    on "cr_paw_fl"  material cr_tan  density 175781
+    points 3   segments 2
+    length 0.016   length_jitter 0.3
+    radius 0.00048
+    droop 0.1   jitter 0.25
+    seed 22
+}
+fur "cr_coat_paw_fr" {
+    on "cr_paw_fr"  material cr_tan  density 175781
+    points 3   segments 2
+    length 0.016   length_jitter 0.3
+    radius 0.00048
+    droop 0.1   jitter 0.25
+    seed 23
+}
+fur "cr_coat_paw_bl" {
+    on "cr_paw_bl"  material cr_tan  density 175781
+    points 3   segments 2
+    length 0.016   length_jitter 0.3
+    radius 0.00048
+    droop 0.1   jitter 0.25
+    seed 24
+}
+fur "cr_coat_paw_br" {
+    on "cr_paw_br"  material cr_tan  density 175781
+    points 3   segments 2
+    length 0.016   length_jitter 0.3
+    radius 0.00048
+    droop 0.1   jitter 0.25
+    seed 25
+}
+
 # ==============================  LIGHTING  ====================================
 # TWO lights now that the roof is gone (the xenon short-arc lamp that used to hang here was
 # deleted with the ceiling it hung from — see the header): the SUN, which does essentially
@@ -1746,28 +2016,57 @@ prefer {
 }
 
 # ==============================  FLYBY  =======================================
-# A SEAMLESS closed loop that goes THROUGH four pieces: the gold gyroid's empty-air
-# channel, the glass orb, the Klein bottle's bulb, and the chrome ring's bore. The hall has
-# no walls any more and the exhibits sit 1.6x further apart than they used to (see THE
-# SPREAD), so the loop is both wider and lower than the one gallery_settled flies -- there
-# is nothing left to clip a wing on, and the pieces are far enough apart that the camera
-# has to actually travel between them instead of pivoting.
+# A SEAMLESS closed loop that goes THROUGH five pieces: the gold gyroid's empty-air
+# channel, the FUR CREATURE's coat, the glass orb, the Klein bottle's bulb, and the chrome
+# ring's bore. The hall has no walls any more and the exhibits sit 1.6x further apart than
+# they used to (see THE SPREAD), so the loop is both wider and lower than the one
+# gallery_settled flies -- there is nothing left to clip a wing on, and the pieces are far
+# enough apart that the camera has to actually travel between them instead of pivoting.
 #
-# THE FOUR PASSES, and why each waypoint is the number it is:
+# THE FIVE PASSES, and why each waypoint is the number it is:
 #
-# 1. GOLD GYROID (t 0.04..0.10). Points 4..10 are gallery_settled's OWN validated threaded
+# 1. GOLD GYROID (t 0.048..0.114). Points 4..10 are gallery_settled's OWN validated threaded
 #    channel points, shifted +1.25 in z and nothing else -- which is exactly the rigid
 #    translation this scene's gold gyroid got, so the empty-air tunnel through the
 #    k=10 / T=0.45 lattice still lines up to the millimetre. Do not "tidy" them: they were
 #    solved against the lattice, and 2 cm of drift puts the lens inside a strut.
 #
-# 2. GLASS ORB (t 0.245). World centre (7.70, 1.70, 3.95), r 0.50 -- the orb is levitated
+# 2. FUR CREATURE (t 0.180..0.226), and this is the one pass that is not through a hole, a
+#    bore or a transparent volume. The camera flies through actual FUR: 1.10 m of travel
+#    inside the coat, at 21 mm per frame, the slowest movement anywhere on the loop. Three
+#    things had to line up and all three are measured, not eyeballed.
+#
+#    DIRECTION. `fur { }` combs its strands from nose to tail, so a pass that runs the wrong
+#    way runs into the grain and reads as a hedge. The camera's velocity therefore has to be
+#    -F, where F is the way the animal faces -- and that is not a preference, it is what fixed
+#    the creature's -64.4 deg yaw (see its exhibit block). The approach from the gyroid
+#    channel exit at (4.78, 1.35, 5.20) already lies exactly on the animal's own long axis:
+#    the vector from there to the pivot at (6.45, 4.40) normalizes to (+0.9018, -0.4320),
+#    which IS -F to four places. That is why this leg cost almost nothing -- the old points
+#    banked right and climbed to y=1.98 for no reason except to reach the orb, and the new
+#    ones simply stop climbing.
+#
+#    HEIGHT. y = 1.308 for the whole pass, held dead LEVEL across four control points, for the
+#    same reason the Klein pass is: the centripetal spline must not be free to bow the chord
+#    into anything. 1.308 is solved, not chosen. `scraps/_bakecreature.py` sweeps the height
+#    and reports, for each one, the shortest distance from the line to any SKIN sphere and the
+#    total chord inside the COAT. Those two fight: 1.295 buries the lens in the head, 1.34
+#    grazes only the back. 1.308 keeps 12.8 mm of clear air off the head -- the binding
+#    sphere, and the closest this camera comes to solid geometry anywhere in the scene --
+#    while still threading rump, barrel, chest, neck, head and the tail brush.
+#
+#    WHAT IT BUYS. At 12.8 mm the fibres are 0.64 mm thick and 22-88 mm long, so they cross
+#    the whole frame: the coat stops being a texture and becomes architecture, which is the
+#    entire argument for standing a groom in a gallery of polished objects.
+#
+# 3. GLASS ORB (t 0.264). World centre (7.70, 1.70, 3.95), r 0.50 -- the orb is levitated
 #    0.45 m off its cap now, so the old curve's z=3.50 / y=1.40 pass would miss it by more
 #    than a radius in both axes. That is the reason this curve had to be rewritten at all.
-#    Approach swings in from +z at a shallow angle so the camera crosses the sunlit upper
-#    hemisphere on the way in and comes out looking down its own caustic.
+#    The approach now comes off the creature's tail and climbs from 1.308 to the orb's centre
+#    height, so the camera still crosses the sunlit upper hemisphere on the way in and comes
+#    out looking down its own caustic.
 #
-# 3. KLEIN BOTTLE (t 0.325). The tightest and best beat. scraps/_kleinslice.py walks the
+# 4. KLEIN BOTTLE (t 0.352). The tightest and best beat. scraps/_kleinslice.py walks the
 #    real mesh vertices through the mesh/settle/spread transform chain and reports the body
 #    in horizontal slabs: it is a circle of radius 0.151 about (6.4584, 2.5311) at y=1.12,
 #    and only above y~1.22 does the handle break out toward +x. So y=1.12 is the widest
@@ -1776,10 +2075,11 @@ prefer {
 #    piece's own long axis, world direction (+0.9775, 0, +0.2110) (i.e. its authored yaw of
 #    -12 deg plus the settle's -0.18), entering at +0.30 and leaving at -0.30 along it. The
 #    three pass points are held dead LEVEL so the centripetal spline can't bow the chord
-#    down into the cap: there is only 0.120 m between this line and the cap top at y=1.00,
-#    and that is the tightest clearance anywhere on the loop (scraps/_flyplan.py).
+#    down into the cap: there is only 0.111 m between this line and the cap top at y=1.00,
+#    and that is the tightest clearance to a PEDESTAL anywhere on the loop (the creature's
+#    12.8 mm to its own head is tighter, but that one is the point).
 #
-# 4. CHROME RING. World centre (2.60, 1.30, 1.55), major 0.34 / minor 0.10, and
+# 5. CHROME RING. World centre (2.60, 1.30, 1.55), major 0.34 / minor 0.10, and
 #    `rotate 90 0 0` puts its axis along z -- so the bore is a 0.24 m-radius hole facing
 #    +-z and the pass MUST be nearly parallel to z. The approach points are on the axis
 #    within 0.032 m and travelling within 4 deg of it, so across the tube's 0.20 m of
@@ -1795,19 +2095,27 @@ prefer {
 #    ring, and turns in -- which is why the leg climbs to y=1.95 over the morpho heart
 #    instead of staying low.
 #
-# CLEARANCE. scraps/_flyplan.py samples the polyline at 2 cm and tests it against every
-# stand cage and cap AABB in the file (spread offsets included): no penetrations, and the
-# margins over the caps it flies above are klein +0.120, chrome +0.400, glass +0.431,
-# gyroid +0.705, dumbbell +0.721, oil +1.535. It also reports the arc-length fraction of
-# each beat, which is where the `density_at` stops below come from -- the loop is 26.35 m
-# of very unevenly spaced chord (0.27 m between channel points, 1.3 m across the back
-# cruise), so naming the dwells by point index would have put every one of them in the
-# wrong place.
+# CLEARANCE. scraps/_flyplan.py samples THE SPLINE at 2 cm -- not the chord polyline, which
+# is what it used to do and which cannot see the curve bowing outside its own control points
+# on a turn -- and tests it against every stand cage and cap AABB in the file (spread offsets
+# included): no penetrations, and the margins over the caps it flies above are klein +0.111,
+# creature +0.395, chrome +0.396, glass +0.430, diamond +0.653, gyroid +0.704, heart +0.878.
+#
+# It also reports the arc-length fraction of each beat, which is where the `density_at` stops
+# below come from, and that matters here more than in most scenes: the loop is 23.87 m of very
+# unevenly spaced spline (0.27 m between channel points, 1.3 m across the back cruise), so
+# naming the dwells by control-point index would put every one of them in the wrong place --
+# and until 0.155.0 the LOADER was doing exactly that, behind this comment's back. That is the
+# bug the fix went in for. `density_at`'s t is now the normalized ARC LENGTH it always claimed
+# to be, so these numbers and the ones _flyplan.py prints are finally the same numbers.
 #
 # The RAIN CLOUD is a bounded medium spanning x 6.64..9.36, y 1.97..3.67, z 0.67..3.33
 # (195 x 122 x 191 voxels of 13.98 mm at translate 8.0 2.82 2.0, scale 1.42). The orb leg is
-# the only part of the loop that goes anywhere near it and it passes UNDERNEATH, y <= 1.98
-# against the cloud's floor at 1.97 -- close enough to fly through the rain, not the cloud.
+# the only part of the loop that goes anywhere near it and it passes UNDERNEATH. It used to
+# graze the floor (y <= 1.98 against the cloud's 1.97); rerouting through the creature at
+# y=1.308 dropped that leg by up to 0.67 m, so the margin is now 0.27 m even at the orb and
+# the camera is unambiguously under the cloud, in the rain, rather than clipping its lowest
+# voxels.
 #
 # CLOSURE. gallery_settled's loop closes on a fold -- it runs forward past the start and
 # doubles back, which `look tangent` renders as a 180 deg swing at the front of the hall.
@@ -1827,12 +2135,13 @@ camera_curve "fly" {
     point 4.911  1.384 5.8849
     point 4.761  1.432 5.6259
     point 4.835  1.255 5.4349   # channel exit (-z face)
-    point 4.78   1.35  5.20     # emerge behind the ball
-    point 5.10   1.55  4.95     # bank RIGHT and climb, away from the centre line
-    point 5.70   1.80  4.80
-    point 6.45   1.98  4.75     # sweep right toward the orb, under the cloud's floor
-    point 7.20   1.95  4.55
-    point 7.62   1.82  4.28     # final approach, dropping onto the orb's centre
+    point 4.78   1.35  5.20     # emerge behind the ball — already ON the creature's axis
+    point 5.36   1.308 4.922    # settle onto it and go LEVEL: everything to the exit is 1.308
+    point 5.954  1.308 4.638    # coat entry, 0.55 m off the nose
+    point 6.45   1.308 4.40     # THROUGH THE FUR CREATURE — nose to tail
+    point 6.946  1.308 4.162    # coat exit, out over the tail brush
+    point 7.35   1.45  4.09     # climb out and swing toward the orb
+    point 7.62   1.62  4.02     # final approach, dropping onto the orb's centre
     point 7.70   1.70  3.95     # THROUGH THE GLASS ORB
     point 7.62   1.58  3.58     # out the far side, looking down its own caustic
     point 7.38   1.44  3.18
@@ -1865,13 +2174,19 @@ camera_curve "fly" {
     fps 30                         # 600 frames -> 20 s
     look tangent
     spline centripetal
-    # Stops are ARC-LENGTH fractions from scraps/_flyplan.py, not point indices. The beats
-    # it reports for these 44 points / 23.93 m are: channel 0.048..0.111, orb 0.270,
-    # klein 0.358, ring 0.610, crystal gyroid 0.725, gold gyroid overflight 0.853.
-    density_at 0.00  8   density_at 0.055 20  density_at 0.105 20  density_at 0.16 8
-    density_at 0.270 22  density_at 0.31 14   density_at 0.358 24  density_at 0.40 10
-    density_at 0.50  6   density_at 0.610 20  density_at 0.68 10   density_at 0.725 14
-    density_at 0.80  8   density_at 0.90 6    density_at 1.00 8
+    # Stops are ARC-LENGTH fractions straight off scraps/_flyplan.py, which is what
+    # `density_at` has taken since 0.155.0 (before that the loader silently read them as
+    # control-point-INDEX fractions -- see CLEARANCE above). The beats it reports for these
+    # 45 points / 23.87 m are: gyroid channel 0.048..0.114, CREATURE COAT 0.180..0.226,
+    # orb 0.264, klein 0.352, ring 0.607, crystal gyroid 0.722, gold gyroid overflight 0.851.
+    # The creature gets the highest density on the loop (26) and holds it FLAT across the
+    # whole pass rather than peaking at the middle: 53 frames / 1.8 s at 21 mm per frame, so
+    # the coat crosses the lens slowly enough to be read as individual fibres.
+    density_at 0.000  8  density_at 0.050 20  density_at 0.112 20  density_at 0.150 10
+    density_at 0.180 26  density_at 0.226 26  density_at 0.245 12  density_at 0.264 22
+    density_at 0.300 14  density_at 0.352 24  density_at 0.400 10  density_at 0.500  6
+    density_at 0.607 20  density_at 0.680 10  density_at 0.722 14  density_at 0.800  8
+    density_at 0.900  6  density_at 1.000  8
     closed
     exposure_lock
     film { res 960 540   exposure 0.25 }
