@@ -93,6 +93,15 @@ buried. The fix is [`bald`](FTSL.md#87-fur--scatter-strands-over-a-surface), whi
 a sphere the groom must keep out of and culls — after clumping, and testing the **whole
 strand** rather than just its root — every hair that reaches into it.*
 
+*The same animal also stands in the gallery. [`scenes/gallery_rain.ftsl`](scenes/gallery_rain.ftsl)
+gives it the eleventh plinth and routes the closed camera fly-through **into its coat** — the
+loop threads five pieces now, and this is the only one that is neither a hole, a bore nor a
+transparent volume. The camera spends 1.16 m inside the fur travelling nose-to-tail (with the
+comb, not against it) at 21 mm a frame, the slowest movement anywhere on the flight, passing
+12.8 mm clear of the skull. At that range the strands are 0.64 mm thick and cross the whole
+frame, so the coat stops being a texture and becomes architecture — which is the entire
+argument for standing a groom in a hall of polished objects.*
+
 ---
 
 ## Highlights
