@@ -1725,6 +1725,56 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   side would read 0 against the hit side's real value — biased, not merely noisy. Same
   reasoning that already refuses emission patterns on sphere/cylinder/spot/env emitters.
 
+  **Enclosure (`PatOp::VarCavity`, O3 stage 2, v0.162.0).** `curv` made a pattern follow
+  the SHAPE of the surface it sits on; `cavity` answers the question `curv` structurally
+  cannot: how ENCLOSED is this point? It fires a short hemispherical probe of radius
+  `scene { cavity_radius }` and returns the blocked fraction — 0 on an open plane, ~0.5
+  in a right-angled interior corner, →1 down a crevice. The two are complements, not
+  alternatives, and the difference is **locality**: curvature lives in the second
+  derivative of one normal field, so a right-angled corner between two FLAT faces reads
+  curv = 0 on both of them even though that is exactly where dirt collects, and no
+  differential property of the floor could ever produce the dark ring where a *ball*
+  rests on it. Conversely `cavity` is blind to gentle convexity — a bare sphere in an
+  empty room reads 0 however curved it is — so edge wear still wants `curv`.
+
+  The direction set is a **fixed** cosine-weighted golden-angle Fibonacci hemisphere,
+  not a random draw, and that is the load-bearing decision. A pattern input is read many
+  times per pixel by different tracers (camera hit, light-sample hit, MIS's other
+  estimator) and every read must agree, or the *material* becomes a variance source that
+  MIS smears rather than averages. Deterministic makes `cavity` a true function of
+  position: noise-free, bit-comparable CPU vs GPU, stable frame to frame. The price is
+  **banding** into at most N+1 levels, which is why the documented idiom multiplies the
+  mask by fBm — the mask says where dirt MAY settle, the noise says how much did.
+
+  It is the only pattern input that spends **rays**, so it is gated **twice**:
+  `Scene::needsCavity` (scene-wide, one integer compare that is false for essentially
+  every scene) and `Material::readsCavity` (per-hit, keyed off `Hit::matId`). The second
+  gate is not an optimisation but a correctness-of-cost requirement: `patCtxFromHit` runs
+  for EVERY patterned material, so a scene-wide-only flag would charge N occlusion rays
+  to every unrelated noise-textured surface in a scene that used `cavity` once.
+  `ftsl::setupCavity` sets the flag from `materialFreeInputs` and then lifts it through
+  `mixChildren` to a fixed point, so a `mix` inherits it from a layer (and from a nested
+  mix's layer). The value is computed lazily on first read and cached in
+  `Hit::cavity`/`cavityDone` — which is why those are the only two `DHit` fields with
+  default member initialisers: no intersector writes them, and `dVertHit()` / the scratch
+  hits inside `occluded()` would otherwise hand the cache garbage.
+
+  The device probe (`dCavityAt`) **inlines** the host's exact Duff ONB rather than calling
+  `d3onb` (wrong vector type) and works in `double` throughout even where `Real` is
+  `float`, so the two halves stratify identically; verified numerically (deterministic
+  mode-W CPU vs GPU max Δ 6/255, mode-D auto-exposure identical to all digits). The
+  raster previews pass 0 — they have no BVH at all, by construction (`known-issues.md`).
+
+  `-checkcavity` is the self-test, ten sections, mutation-tested four ways. Its anchor is
+  analytic and **tight** rather than sampling-limited: a horizontal ceiling at height h
+  blocks exactly the cap cosθ > h/R, whose **cosine**-weighted measure is 1 − (h/R)² (it
+  would be 1 − h/R under uniform weighting, and the test asserts it is *not* that), and
+  because the sample set stratifies u = (i+½)/N at bin centres with cosθ = √(1−u) the
+  discrete count matches to 2e-3. Mutation testing found a real hole in it: §6 originally
+  set `h.ng = h.n`, so replacing `orientedGeoN(h)` with `h.ng` SURVIVED — the fix was a
+  `hitAt2(p, n, ng)` helper that holds the geometric normal fixed while varying only the
+  shading normal.
+
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
   **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the

@@ -4610,38 +4610,62 @@ the *randomness vocabulary* is thin. Nothing below is started.
         grime / edge wear on three instances of one torus asset); docs in FTSL.md §6.1 +
         REFERENCE.md; limitations logged in known-issues.md (isosurface and preview-raster both read
         0; non-uniform scale approximated).
-  - [ ] **Stage 2 — `cavity`.** The occlusion-flavoured sibling of `curv`: not the local second
-        derivative but "how enclosed is this point", which is what actually predicts where dirt
-        settles in a *concave corner between two surfaces* that are each locally flat — `curv` reads
-        0 on both faces of a right-angled corner, so it cannot see the one place grime most obviously
-        collects. This is the item that makes O3 complete rather than half-done.
+  - [x] **Stage 2 — `cavity`, the enclosure free variable.** ✅ 2026-08-10, v0.162.0.
+        `PatOp::VarCavity` exposes the blocked fraction of a short hemispherical probe of radius
+        `scene { cavity_radius }` — 0 on an open plane, ~0.5 in a right-angled interior corner, →1
+        down a crevice — on all three VM backends, on every primitive including `isosurface` (which
+        `curv` cannot do). It is the complement `curv` structurally cannot be: curvature lives in
+        the second derivative of ONE normal field, so a corner between two flat faces reads 0 on
+        both, and no differential property of the *floor* could ever produce the dark ring where a
+        *ball* rests on it. Conversely `cavity` is blind to gentle convexity (a lone sphere reads 0
+        however curved), so edge wear still wants `curv`. Built exactly to the design settled by the
+        2026-08-09 investigation below, all three constraints honoured:
+        1. free **variable**, not a `cavity(radius)` VM function — the device VM's `DPatEnvT` carries
+           only sampler tables and BVH traversal lives in render_cuda.cu, so the function spelling
+           would not have ported;
+        2. radius/sample count on the `scene {}` block (`cavity_radius <len>`, default 2% of the
+           AABB diagonal with a printed line saying so; `cavity_samples <n>`, default 16);
+        3. computed **once per hit and cached** (`mutable Hit::cavity`/`cavityDone`), never per
+           `patCtxFromHit` call. Those are the only two `DHit` fields with default member
+           initialisers — no intersector writes them, and `dVertHit()`/`occluded()`'s scratch hits
+           would otherwise hand the cache garbage.
 
-        **Design settled by investigation (2026-08-09), not yet built.** Three constraints found by
-        reading the code, which together rule out the obvious approach:
-        1. The natural spelling — a VM *function* `cavity(radius)` behind an opaque callback, like
-           `texFn`/`specFn` — is self-gating and lets the author pick the probe radius, and it works
-           fine on the CPU. It does **not** port: `DPatEnvT` (pattern_device.cuh) carries only the
-           sampler tables, the BVH traversal lives in render_cuda.cu, and device function pointers
-           are too expensive to call per shading sample. Threading the whole DScene into the pattern
-           VM would also break the deliberate rule that pattern.h knows nothing heavy.
-        2. So `cavity` should be a **free variable like `curv`**, computed by the renderer (which
-           already owns traversal on both backends) and handed over as a plain double. The probe
-           radius then belongs on the *material* or the `scene {}` block, not in the expression.
-        3. **It must not be computed in `patCtxFromHit`.** That is called several times per shading
-           point (`materialRoughness`, `mixResolveChild`, each slot pattern), so an N-ray probe there
-           would be paid over and over. It needs to be computed **once per hit and cached** — a
-           `mutable` field on the Hit filled lazily, or filled by the tracer before shading.
+        The direction set is a **fixed** cosine-weighted golden-angle Fibonacci hemisphere, so
+        `cavity` is a true function of position — noise-free, identical CPU/GPU, stable frame to
+        frame; the price is banding into ≤ N+1 levels, which is why the documented idiom multiplies
+        the mask by fBm (the mask says where dirt MAY settle, the noise says how much did). Gated
+        **twice**, and the second gate is the one that matters: scene-wide `Scene::needsCavity` plus
+        per-material `Material::readsCavity` (`ftsl::setupCavity`, lifted through `mixChildren` to a
+        fixed point so a `mix` inherits from a layer). Without the per-material gate every unrelated
+        noise-textured surface in the scene would pay N occlusion rays, since `patCtxFromHit` runs
+        for every patterned material. Same emit-pattern rejection as `curv` (the emitter-sampled
+        side reports no cavity → MIS bias).
 
-        Two more requirements: the direction set must be **deterministic** (a fixed Fibonacci
-        hemisphere rotated into the hit's tangent frame, no per-sample RNG) or the mask becomes a
-        noise source in its own right and smears under MIS; and the whole thing must be **gated** by
-        a load-time "does any bound pattern read `VarCavity`?" flag — the same gate the isosurface
-        Hessian needs (see known-issues.md), so build it once and use it for both.
+        Ten-section `-checkcavity`, mutation-tested four ways. Its anchor is analytic and *tight*
+        rather than sampling-limited: a ceiling at height h blocks the cap cosθ > h/R, whose
+        **cosine**-weighted measure is 1 − (h/R)² (the test also asserts it is *not* the uniform
+        1 − h/R), and the sample set stratifies u = (i+½)/N at bin centres so the discrete count
+        matches to 2e-3 (worst observed error 0.000868). Mutation testing found a real hole: §6 set
+        `h.ng = h.n`, so replacing `orientedGeoN(h)` with `h.ng` SURVIVED — fixed with a
+        `hitAt2(p, n, ng)` helper holding the geometric normal fixed. CPU/GPU parity verified
+        empirically (mode-W max Δ 6/255 over 129600 px, mode-D auto-exposure identical). Demo
+        `scenes/pattern_cavity.ftsl` (flat-faced block stack that `curv` cannot see at all + two
+        spheres with three contact rings + skirting-board grime); docs in FTSL.md §2/§6.1 +
+        REFERENCE.md (with a `curv` vs `cavity` comparison table); preview-raster limitation logged
+        in known-issues.md — and unlike `curv`'s it is *not* mechanical, the rasterizer has no BVH
+        by construction.
 
-        Wiring follows the `curv` checklist exactly: append the op at the enum end, then name it
-        **explicitly** in `patternHasFreeVars` *and* `patOpStackEffect` (the missing-arity trap that
-        silently disabled CSE for whole programs), and mutation-test the self-test on a shape where
-        the mutation is actually observable.
+        <details><summary>Original design investigation (2026-08-09)</summary>
+
+        Three constraints found by reading the code, which together ruled out the obvious approach:
+        the `cavity(radius)` function spelling does not port to the device VM; so it must be a free
+        variable like `curv` with the radius on the scene block; and it must not be computed in
+        `patCtxFromHit`, which runs several times per shading point. Plus: deterministic direction
+        set (or the mask becomes a noise source that MIS smears) and a load-time gate. Wiring
+        follows the `curv` checklist — append the op at the enum end, name it **explicitly** in
+        `patternHasFreeVars` *and* `patOpStackEffect` (the missing-arity trap that silently disabled
+        CSE for whole programs), mutation-test on a shape where the mutation is observable.
+        </details>
   - [ ] **Stage 3 — distance-to-mesh field**, then the worked idiom section pulling all of it
         together (that is the part of O3 that is genuinely "documentation of what the VM can do").
 - [ ] **O4 — anisotropic / flow-aligned noise.** Noise stretched and steered along a direction field —

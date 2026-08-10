@@ -1,0 +1,141 @@
+# pattern_cavity.ftsl — `cavity`, the enclosure pattern variable (O3 stage 2).
+#
+# `curv` (see scenes/pattern_curvature.ftsl) made a pattern follow the SHAPE of
+# the surface it sits on. `cavity` answers the question `curv` structurally
+# cannot: how ENCLOSED is this point? It fires a short hemispherical probe of
+# radius `cavity_radius` and returns the fraction that is blocked — 0 on an open
+# plane, ~0.5 in a right-angled interior corner, ->1 down a crevice.
+#
+# The two are complements, not alternatives:
+#
+#   * A right-angled corner where two FLAT faces meet reads `curv` == 0 on both
+#     of them — the surfaces genuinely are flat, and curvature is a purely local
+#     property that lives in the second derivative of the normal field. Yet the
+#     inside of that corner is exactly where dirt collects. Only a non-local
+#     measure can see it.
+#   * `cavity` is non-local in a stronger sense too: it sees geometry that is not
+#     part of the surface at all. The dark ring where a ball rests on the floor
+#     depends on the BALL, and appears on the FLOOR — no property of the floor,
+#     however differential, could ever produce it.
+#   * Conversely `cavity` is blind to gentle convexity: a bare sphere in an empty
+#     room reads 0 everywhere however curved it is. Edge wear still wants `curv`.
+#
+# The scene is built so that each of those is visible in one frame:
+#
+#   LEFT   a stack of hard-edged blocks. Every face is FLAT, so a curvature-driven
+#          grime mask would produce nothing at all here; the cavity mask fills each
+#          step's inside corner. (The blocks are an isosurface, which reports
+#          curv = 0 outright — see known-issues.md — so this half of the image is
+#          strictly out of `curv`'s reach.)
+#   RIGHT  two spheres resting on the floor and nearly touching each other. Grime
+#          rings appear at all three contacts — sphere/floor twice, sphere/sphere
+#          once — and they appear on BOTH bodies. A sphere's curvature is the
+#          constant 1/R, so `curv` could only ever coat it uniformly.
+#   FLOOR  a grime band runs along the base of every wall, for the same reason a
+#          skirting board is the dirtiest part of a room.
+#
+# TUNING. `cavity` has no intrinsic scale — the same corner is "deeply enclosed"
+# at a 1 cm probe and "wide open" at 1 m — so `cavity_radius` IS the look. It
+# sets how far from a contact the dirt reaches; left unset it defaults to 2% of
+# the scene's bounding-box diagonal, which is a starting point, not an answer.
+# `cavity_samples` is the probe ray count: the direction set is deterministic
+# (so the mask is noise-free and identical on CPU and GPU), and the price of that
+# is BANDING into at most N+1 levels. Multiplying by fBm, as below, hides it —
+# which is what a dirt pass wants anyway. The mask says where dirt MAY settle;
+# the noise says how much actually did.
+#
+# COST. The probe is the only pattern input that spends rays, so it is gated
+# twice: a scene that never writes `cavity` fires none, and within this scene
+# only the materials that read it are charged.
+#
+#   ftrace -in scenes/pattern_cavity.ftsl -mode D -noise 2.5 \
+#          -window -keepwindow -o png/pattern_cavity.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+
+    # 15 cm, i.e. about the smaller sphere's own radius. Worth being deliberate
+    # about: at 6 cm every band in this image is 2-3 pixels wide and the whole
+    # effect vanishes at a glance, and at 40 cm the room is uniformly filthy and
+    # nothing reads as a contact. The radius is the look.
+    cavity_radius  0.15
+    cavity_samples 24
+}
+
+# ---------------------------------------------------------------------------
+# The crevice mask.
+#
+# smoothstep(0.06, 0.45, cavity): 0.06 rather than 0 because a probe on a truly
+# open floor still catches the odd grazing ray off nearby geometry, and 0.45
+# rather than 1 because a right-angled corner — the dirtiest thing in this scene —
+# only reaches ~0.5 by construction. Ramping to 1 would leave every corner in the
+# room at half strength, and the wider contacts (where the probe is only partly
+# blocked) at nothing at all.
+#
+# The fBm factor is three octaves of the VM's scalar `noise` (which returns
+# [0,1]), normalised by 0.5+0.25+0.125. The 0.3 floor keeps a thin, even deposit
+# in the deepest creases instead of letting the noise punch holes right through.
+# ---------------------------------------------------------------------------
+pattern "crevice" {
+    expr "smoothstep(0.06, 0.45, cavity) *
+          (0.30 + 0.70 * (0.5   * noise(19*x, 19*y, 19*z) +
+                          0.25  * noise(38*x, 38*y, 38*z) +
+                          0.125 * noise(76*x, 76*y, 76*z)) / 0.875)"
+}
+
+# ---------------------------------------------------------------------------
+# Materials. In a `mix`, weight 1 selects the FIRST layer, so the dirt goes first.
+#
+# The deposit is PALE and warm, deliberately lighter than what it sits on: a
+# crevice is already dark from ambient occlusion, so dark grime there is
+# indistinguishable from the shadow that was going to be there anyway. Nothing
+# makes a surface brighter except something on it.
+# ---------------------------------------------------------------------------
+material "white" { type diffuse reflect whitewall 0.75 }
+material "dust"  { type diffuse reflect rgb 0.88 0.82 0.66 }
+material "paint" { type diffuse reflect rgb 0.10 0.30 0.33 }
+material "tile"  { type diffuse reflect rgb 0.30 0.29 0.26 }
+
+material "grimy_paint" { type mix layer "dust" 0.5 layer "paint" 0.5 weight_map pattern:crevice }
+material "grimy_tile"  { type mix layer "dust" 0.5 layer "tile"  0.5 weight_map pattern:crevice }
+
+# ---------------------------------------------------------------------------
+# A 2 x 1 x 2 m room. The FLOOR is grimy — half the point of the scene is the
+# dirt that objects deposit on the surface they rest on — while the walls and
+# ceiling stay clean so the contact rings are not competing with anything.
+# ---------------------------------------------------------------------------
+quad { origin 0 0 0   u 2 0 0   v 0 0 1   material grimy_tile }   # floor
+quad { origin 0 1 0   u 0 0 1   v 2 0 0   material white }        # ceiling
+quad { origin 0 0 0   u 2 0 0   v 0 1 0   material white }        # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material white }        # left
+quad { origin 2 0 0   u 0 1 0   v 0 0 1   material white }        # right
+
+# LEFT: three hard-edged blocks stacked with an overhang, so each step is a
+# genuine right-angled interior corner between two flat faces.
+isosurface {
+    material grimy_paint
+    union {
+        box { size 0.52 0.24 0.46   center 0.50 0.12 0.46 }
+        box { size 0.36 0.22 0.34   center 0.42 0.35 0.40 }
+        box { size 0.22 0.20 0.22   center 0.35 0.56 0.35 }
+    }
+}
+
+# RIGHT: two spheres resting on the floor, almost touching each other (centres
+# 0.387 m apart against radii summing to 0.38, so a 7 mm gap). Three contacts.
+sphere { center 1.30 0.22 0.55   radius 0.22   material grimy_paint }
+sphere { center 1.66 0.16 0.42   radius 0.16   material grimy_paint }
+
+# A wide ceiling panel. Crevices are the darkest places in the room by
+# definition, so they need plenty of bounce light to read at all.
+light area {
+    origin 0.20 0.999 0.12   u 1.6 0 0   v 0 0 0.86   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 1.00 0.62 2.45   look_at 1.00 0.24 0.50   up 0 1 0   fov_y 42
+    mode D
+    film { res 720 400 }
+}

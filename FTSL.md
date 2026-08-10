@@ -123,6 +123,8 @@ scene { units meters  spectral 360 830 1 }
 | `spectral` | `<lo> <hi> <binWidth>` | `360 830 1` | only the **bin width** is applied; the engine range is fixed at 360–830 nm (a warning prints if `lo/hi` differ) |
 | `default_mode` | a mode letter (`A`/`B`/`C`/`D`/`U`/`M`/`R`/`W`/`P`/…) | *(none)* | the render mode used when nothing else picks one. Resolution order: `-mode` (CLI) → a camera's own `mode` → `default_mode` → built-in `B`. `W` is not a transport mode of its own — the loader rewrites it to `R` and switches on the deterministic Whitted estimators for the whole run (a CLI `-mode` still overrides it) |
 | `fps` | `<n>` | *(none)* | default playback rate for flyby animations, read by assembly tooling (e.g. `showcase_flyby.py` when `--fps` is omitted). Overridable per-flyby with `fps <n>` on the `camera_curve`/`camera_path`/`camera_orbit` block. Playback hint only — does not affect rendering |
+| `cavity_radius` | `<len>` | 2% of the scene's AABB diagonal | reach of the `cavity` pattern probe (§6.1). Enclosure has no intrinsic scale, so this *is* the look; the derived default is a starting point and prints a line saying so. Ignored unless some material reads `cavity` |
+| `cavity_samples` | `<n>` | `16` | probe rays per shading point for `cavity`. The direction set is deterministic, so this also caps the number of distinct values the variable can take |
 
 Directions (`up`, `normal`, `dir`, `axis`) are **not** unit-scaled — only points and
 lengths are. There is one `scene` block (extra ones are also scanned but the last
@@ -339,7 +341,7 @@ film thickness, mix weight). Patterns are evaluated per hit.
 **Variables:** `x y z` (world position), `f` (field value, for isosurfaces),
 `nx ny nz` (surface normal), `r` (`|p|`), `u v` (surface texture coordinates — on
 meshes and on native primitives that declare a `uv` wrap, see §9), `curv` (mean
-curvature — see below). Constant `pi`.
+curvature — see below), `cavity` (enclosure — see below). Constant `pi`.
 
 **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
 `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
@@ -386,6 +388,51 @@ scale, approximated by `|det|^(1/3)` for a non-uniform one.
 
 Validated by `-checkcurv`. Worked example: `scenes/pattern_curvature.ftsl` (a raw
 curvature ramp, crevice grime, and edge wear on the same torus).
+
+**Enclosure — `cavity`:** the fraction, in `[0,1]`, of a short hemispherical probe of
+radius `cavity_radius` around the shading point that is **blocked** — `0` on an open
+plane, `~0.5` in a right-angled interior corner, `→1` down a crevice. Works on every
+primitive, including isosurfaces.
+
+`cavity` is the complement of `curv`, not an alternative to it, and the difference is
+what each one *can* see:
+
+- A corner where two **flat** faces meet reads `curv == 0` on both of them — they
+  genuinely are flat, and curvature is local, living in the second derivative of the
+  normal field. Only a non-local measure finds the corner.
+- `cavity` sees geometry that is not part of the surface at all. The dirt ring where a
+  ball rests on the floor depends on the *ball* and appears on the *floor*; no
+  property of the floor could produce it.
+- Conversely, `cavity` is blind to gentle convexity — a lone sphere in an empty room
+  reads `0` everywhere however curved it is. Edge wear still wants `curv`.
+
+```
+# grime that collects wherever the form encloses, and only as much as the noise says
+pattern "crevice" { expr "smoothstep(0.06, 0.45, cavity) * noise(19*x, 19*y, 19*z)" }
+```
+
+Two `scene`-block keys control it (§2): `cavity_radius <len>` — how far the probe
+reaches, which *is* the look, since enclosure has no intrinsic scale (the same corner
+is "deeply enclosed" at a 1 cm probe and "wide open" at 1 m); and
+`cavity_samples <n>` — the ray count, default 16.
+
+The direction set is a **fixed** cosine-weighted Fibonacci spiral, not a random draw.
+A pattern input is read many times per pixel by different tracers, and every read must
+agree or the material itself becomes a source of variance no amount of sampling
+averages away; deterministic makes `cavity` a true function of position — noise-free,
+identical on CPU and GPU, and stable frame to frame. The price is **banding** into at
+most `cavity_samples + 1` levels, which is why the natural idiom multiplies by noise
+(as above) or pushes the value through a `smoothstep`.
+
+`cavity` is the only pattern input that spends **rays**, so it is gated twice: a scene
+that never writes it fires none at all, and within a scene that does, only the
+materials whose own programs read it are charged. An **emission** pattern may not read
+it (nor `curv`): an emitter's sampled point carries no such value, so the emitted
+profile would disagree with the one emission-on-hit reads and MIS would bias the image
+— the loader rejects it.
+
+Validated by `-checkcavity`. Worked example: `scenes/pattern_cavity.ftsl` (stacked
+hard-edged blocks and spheres resting on a floor, with grime at every contact).
 
 **Vector noise — `dnoisex/y/z`, `dturbx/y/z` (domain warping):** exact ports of
 POV-Ray's gradient-vector noise `DNoise` and its octave sum `DTurbulence`, one

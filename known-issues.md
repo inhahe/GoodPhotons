@@ -57,6 +57,29 @@ Not urgent — the preview is explicitly a composition/motion tool and already i
 roughness and film-thickness maps by design — but unlike those it is *silently wrong*
 rather than obviously absent, and the fix is mechanical.
 
+### OPEN (2026-08-10, v0.162.0): `cavity` reads 0 in BOTH preview rasterizers, and unlike `curv` this one is not mechanical
+
+Same symptom as the entry above and a strictly harder cause. `raster.h` and
+`raster_cuda.cu:~902/~935` both pass `0.0` for the cavity argument of `dPatternEval` /
+`makePatCtx`, so a `mix` gated on `cavity` previews as one layer everywhere — `-explore`
+on `scenes/pattern_cavity.ftsl` shows a spotlessly clean room.
+
+The difference from `curv` is that `curv` is a *per-triangle number the tessellator
+already has* (`Tri::finalize()` computes it; the preview just has to carry it), whereas
+`cavity` needs **whole-scene ray traversal** at the shading point. The preview
+rasterizer has no BVH at all — not building one is the entire reason it exists and the
+reason it starts in a fraction of a second on scenes the tracer takes seconds to
+prepare. So there is no cheap version of this: the honest options are (a) build a BVH
+for the preview after all (defeats the point), (b) bake a per-vertex cavity value during
+tessellation using a coarse proxy — a low-res voxel occupancy grid over the tessellated
+`PTri`s, marched instead of traced, which would be approximate but is at least the right
+*shape* of algorithm for a rasterizer — or (c) leave it and document.
+
+Currently (c), and that is defensible: `cavity`'s whole point is contact grime, which is
+a look-development concern, not a composition/motion one, and the preview already ignores
+roughness and film-thickness maps by design. Logged so that a future "make the preview
+show patterns properly" pass doesn't assume this one falls out with `curv`.
+
 ### TECH DEBT (2026-08-09, v0.161.0): a non-uniformly scaled instance's `curv` is approximated by |det|^(1/3)
 
 Mean curvature is 1/length, so the instance path has to rescale it. For a **uniform**

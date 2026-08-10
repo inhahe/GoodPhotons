@@ -292,6 +292,10 @@ struct DTexture {
 
 struct DMaterial {
     int    type;
+    // Twin of Material::readsCavity — the per-hit gate on the cavity probe. See the
+    // note there and on ftsl::setupCavity: without it, one cavity-driven material would
+    // charge cavitySamples occlusion rays to every OTHER patterned surface in the scene.
+    int    readsCavity;
     double reflect[SPEC_N];     // baked reflect spectrum
     double ior[SPEC_N];         // baked index spectrum
     double substrateK[SPEC_N];  // baked thin-film substrate extinction kappa (0 = transparent)
@@ -967,6 +971,14 @@ struct DScene {
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
+    // `cavity` pattern variable (O3 stage 2) — twins of Scene::needsCavity /
+    // cavityRadius / cavitySamples. needsCavity is the load-time "does any material
+    // actually read `cavity`?" gate: it is 0 for essentially every scene, and every
+    // probe site tests it first, so a scene that never says `cavity` pays one integer
+    // compare per shading point and fires no probe rays at all.
+    int    needsCavity;
+    double cavityRadius;
+    int    cavitySamples;
     DEnvMap env;                     // image env tables (env.scale null => constant env)
     int    envIndex;                 // index of the env emitter in `emitters`, or -1 (mirrors Scene::envIndex)
     int    sunCount;                 // number of shape==6 (distant sun) emitters (mirrors Scene::sunCount);
@@ -1671,7 +1683,7 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p, const D
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, env);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, env);
     return d > 0.0 ? d : 0.0;
 }
 
@@ -1775,7 +1787,7 @@ __device__ static double dMedNAt(const DMedium& m, const DVec3& p, const DPatEnv
     if (m.iorN <= 0 || !m.ior) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double n = dPatternEval(m.ior, m.iorN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, env);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, env);
     return n > 1e-3 ? n : 1e-3;
 }
 
@@ -2015,6 +2027,15 @@ struct DHit {
     Real u, v;   // interpolated surface texture coordinates
     DVec3 tangent; Real bitangentSign;  // C6 surface tangent frame for normal mapping
     Real curv;   // O3 mean curvature, signed toward the shaded side (see Hit::curv)
+    // O3 stage 2 cavity, filled LAZILY by dCavityOf() and cached, exactly like the
+    // host's Hit::cavity: it needs whole-scene traversal so no intersector fills it,
+    // and one shading point asks for it several times (mix weight, roughness, reflect).
+    // These two carry DEFAULT INITIALISERS, unlike every other field, because they are
+    // the only ones no intersector writes: a `DHit h;` that some path leaves partly
+    // unwritten (dVertHit, the any-hit scratch hits in occluded()) would otherwise
+    // start with cavityDone = garbage and could return an uninitialised cavity.
+    mutable Real cavity = (Real)0;
+    mutable bool cavityDone = false;
 };
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
@@ -2055,7 +2076,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
             if (!exprPool) return BIG;
             double r = sqrt(px*px + py*py + pz*pz);
             return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, env);
+                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, env);
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -3063,6 +3084,73 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
         }
     }
     return false;
+}
+
+// ---- `cavity` pattern variable (O3 stage 2) — device twin of scene.h cavityAt ----
+// Fires cavitySamples short occlusion rays into the cosine-weighted hemisphere about
+// the shaded-side GEOMETRIC normal and returns the blocked fraction: 0 on a lone
+// plane, ~0.5 in a right-angled interior corner, ->1 deep in a crevice.
+//
+// This must stay BIT-IDENTICAL to the host, because `cavity` is a material input, not
+// a transport estimator: a CPU and a GPU render of the same scene have to agree on the
+// mix weight at every point, and a mixed forward/backward pipeline reads it from both.
+// So the direction set is spelled out here the long way — the same golden-angle
+// Fibonacci spiral, the same (i+0.5)/N stratification, and the same Duff ONB inlined
+// verbatim from linalg.h's onb() rather than calling d3onb (which takes D3, not DVec3,
+// and is free to differ). Everything is double even where Real is float, for the same
+// reason: the direction set is scene data, not a sample.
+//
+// Deliberately NOT a pattern-VM function: DPatEnvT carries only sampler tables, and
+// giving the VM a scene/BVH pointer to call through would cost far more than a
+// variable slot. See the design note in todo.md O3 stage 2.
+__device__ static double dCavityAt(const DScene& sc, const DHit& h) {
+    const int N = sc.cavitySamples;
+    if (N <= 0 || sc.cavityRadius <= 0.0) return 0.0;
+    // Shaded-side geometric normal (orientedGeoN twin): the interpolated shading
+    // normal could tilt the hemisphere into a coarse mesh and self-report occlusion.
+    double nx = (double)h.ng.x, ny = (double)h.ng.y, nz = (double)h.ng.z;
+    if (nx * (double)h.n.x + ny * (double)h.n.y + nz * (double)h.n.z < 0.0) {
+        nx = -nx; ny = -ny; nz = -nz;
+    }
+    // Duff et al. branchless ONB — inlined from linalg.h onb() for bit-parity.
+    const double sign = copysign(1.0, nz);
+    const double a = -1.0 / (sign + nz);
+    const double dd = nx * ny * a;
+    const double tx = 1.0 + sign * nx * nx * a, ty = sign * dd,        tz = -sign * nx;
+    const double bx = dd,                       by = sign + ny * ny * a, bz = -ny;
+    // Offset along the normal by a hair so the probe does not re-hit its own surface.
+    const DVec3 o{(Real)((double)h.p.x + nx * 1e-6),
+                  (Real)((double)h.p.y + ny * 1e-6),
+                  (Real)((double)h.p.z + nz * 1e-6)};
+    const double R = sc.cavityRadius;
+    const double golden = 3.14159265358979323846 * (3.0 - sqrt(5.0));
+    int blocked = 0;
+    for (int i = 0; i < N; ++i) {
+        const double u  = (i + 0.5) / (double)N;
+        const double sr = sqrt(u);          // radius in the projected disc
+        const double cz = sqrt(1.0 - u);    // cos(theta) — the cosine weight
+        const double ph = golden * i;
+        const double cx = sr * cos(ph), cy = sr * sin(ph);
+        const DVec3 d{(Real)(tx * cx + bx * cy + nx * cz),
+                      (Real)(ty * cx + by * cy + ny * cz),
+                      (Real)(tz * cx + bz * cy + nz * cz)};
+        if (occluded(sc, o, d, (Real)R)) ++blocked;
+    }
+    return (double)blocked / (double)N;
+}
+
+// Lazy-fill accessor used at every pattern-eval site that has a surface hit. Cached on
+// the DHit because one shading point builds several pattern contexts (mix weight,
+// roughness, film thickness, a driven reflect record) and each probe costs N rays.
+__device__ static inline double dCavityOf(const DScene& sc, const DHit& h) {
+    // Doubly gated, exactly as on the host (see patCtxFromHit): scene-wide first —
+    // one integer compare for the overwhelming majority of scenes, which never say
+    // `cavity` — then per-material, so a patterned surface that does not read it pays
+    // nothing even in a scene that does.
+    if (!sc.needsCavity) return 0.0;
+    if (h.matId < 0 || !sc.mats[h.matId].readsCavity) return 0.0;
+    if (!h.cavityDone) { h.cavity = (Real)dCavityAt(sc, h); h.cavityDone = true; }
+    return (double)h.cavity;
 }
 
 // ============================ material interactions ============================
@@ -4347,6 +4435,7 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
             // here for the same reason `f`/`nx`/`u` are, and the host agrees (the CPU
             // field path builds its PatCtx with curv = 0 too).
             case PatOp::VarCurv:  st[sp++] = 0.0f; break;
+            case PatOp::VarCavity: st[sp++] = 0.0f; break;
             case PatOp::VarT:     st[sp++] = 0.0f; break;
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = fabsf(st[sp-1]); break;
@@ -4462,7 +4551,7 @@ __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit&
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dPatEnvOf(sc));
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), dPatEnvOf(sc));
 }
 
 // Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
@@ -4482,7 +4571,7 @@ __device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, 
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dPatEnvOf(sc));
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), dPatEnvOf(sc));
 }
 // Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
 // evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
@@ -4529,14 +4618,14 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
     if (m.recRoughMode == 0) {                             // direct scalar expression
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv,
+                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h),
                          dPatEnvOf(sc));
     } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
         v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
     } else {                                               // per-hit driven
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv,
+                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h),
                                 dPatEnvOf(sc));
         v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
                              m.recRoughInterp, h, d);
@@ -4638,7 +4727,7 @@ __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
-                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv,
+                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h),
                             dPatEnvOf(sc));
     out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
                      (double)m.recReflLo, (double)m.recReflHi, d, lambda);
@@ -4718,7 +4807,7 @@ __device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
     double px = y.x, py = y.y, pz = y.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return clamp01(dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                                nOut.x, nOut.y, nOut.z, r, uu, vv, 0.0, dPatEnvOf(sc)));
+                                nOut.x, nOut.y, nOut.z, r, uu, vv, 0.0, 0.0, dPatEnvOf(sc)));
 }
 
 // Draw a point on `em` and return the emission-pattern multiplier there, so a caller can
@@ -11459,6 +11548,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         if (d.mixCount > D_MIXMAX) d.mixCount = D_MIXMAX;
         for (int k = 0; k < d.mixCount; ++k) { d.mixChild[k] = m.mixChildren[k]; d.mixWeight[k] = m.mixWeights[k]; }
         d.mixWeightTex = m.mixWeightTex;
+        d.readsCavity = m.readsCavity ? 1 : 0;
         d.roughnessPat = m.roughnessPat;
         d.filmThicknessPat = m.filmThicknessPat;
         d.mixWeightPat = m.mixWeightPat;
@@ -11935,6 +12025,13 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sensorVAxis  = {scene.sensor.vAxis.x,  scene.sensor.vAxis.y,  scene.sensor.vAxis.z};
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
+    // `cavity` probe settings (O3 stage 2). The host loader has already resolved the
+    // radius (explicit `cavity_radius`, else 2% of the scene AABB diagonal) and the
+    // gate, so the device just mirrors the resolved values — the two backends must
+    // agree on all three or CPU and GPU renders of the same scene diverge.
+    sc.needsCavity   = scene.needsCavity ? 1 : 0;
+    sc.cavityRadius  = scene.cavityRadius;
+    sc.cavitySamples = scene.cavitySamples;
     sc.env = denv;
     sc.envIndex = scene.envIndex;
     sc.sunCount = scene.sunCount;      // >0 enables the direct-view solar-disc miss term

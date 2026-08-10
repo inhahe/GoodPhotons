@@ -176,6 +176,24 @@ enum class PatOp : int {
     // intrinsic, so patternHasFreeVars names it explicitly alongside the VarX..VarV
     // range rather than relying on that range to cover it.
     VarCurv,
+    // SURFACE CAVITY (ambient-occlusion-flavoured enclosure) at the shading point,
+    // spelled `cavity` (O3 stage 2): the fraction of a short hemispherical probe of
+    // radius `scene.cavityRadius` that is BLOCKED. 0 = fully open (a lone plane),
+    // 1 = fully enclosed.
+    //
+    // Why this exists NEXT TO `curv` rather than instead of it: they disagree in exactly
+    // the place that matters. Along a right-angled interior corner between two flat
+    // walls both faces are locally flat, so `curv` reads 0 on each and cannot see the
+    // corner at all — yet that corner is the most obvious place grime collects. `curv`
+    // is a LOCAL second derivative; `cavity` is a NON-LOCAL enclosure measure, so it
+    // also sees the gap between two SEPARATE objects, which no per-surface differential
+    // quantity can. Conversely `cavity` is blind to a gentle convexity that `curv`
+    // reports crisply, so edge WEAR still wants `curv`. They are complements.
+    //
+    // Appended at the end like everything since Tex, and — exactly like VarCurv — named
+    // EXPLICITLY in patternHasFreeVars and patOpStackEffect, because it is a per-hit
+    // surface intrinsic living outside the contiguous VarX..VarV range.
+    VarCavity,
 };
 
 // Register-file size available to a CSE-optimized program (per evaluator invocation).
@@ -384,6 +402,7 @@ struct PatCtx {
     double r = 0;                 // radius |p|
     double u = 0, v = 0;          // surface UV (mesh interpolated or native-primitive wrap)
     double curv = 0;              // mean curvature, 1/length, signed toward the shaded side (O3)
+    double cavity = 0;            // blocked fraction of a short hemispherical probe, [0,1] (O3 s2)
     double t = 0;                 // flyby timeline in [0,1] (camera_curve record tracks only)
     // PatOp::Tex sampler hook. pattern.h deliberately knows nothing about Texture
     // (texture.h drags in the spectral/upsampling machinery and is not something we
@@ -482,7 +501,7 @@ struct PatTableScope {
 };
 
 inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, double v = 0,
-                         double curv = 0) {
+                         double curv = 0, double cavity = 0) {
     PatCtx c;
     c.x = p.x; c.y = p.y; c.z = p.z;
     c.f = f;
@@ -490,6 +509,7 @@ inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, d
     c.r = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
     c.u = u; c.v = v;
     c.curv = curv;
+    c.cavity = cavity;
     return c;
 }
 
@@ -547,6 +567,7 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
             case PatOp::VarU:     st[sp++] = c.u;  break;
             case PatOp::VarV:     st[sp++] = c.v;  break;
             case PatOp::VarCurv:  st[sp++] = c.curv; break;
+            case PatOp::VarCavity: st[sp++] = c.cavity; break;
             case PatOp::VarT:     st[sp++] = c.t;  break;
             // `a` is resolved at load time (bound at the use site, or to the material's
             // albedo_default) and so is unreachable here; 0 keeps the switch total.
@@ -701,6 +722,7 @@ inline bool varOp(const std::string& s, PatOp& out) {
     if (s == "u")  { out = PatOp::VarU;  return true; }
     if (s == "v")  { out = PatOp::VarV;  return true; }
     if (s == "curv") { out = PatOp::VarCurv; return true; } // mean curvature, 1/length (O3)
+    if (s == "cavity") { out = PatOp::VarCavity; return true; } // enclosure in [0,1] (O3 s2)
     if (s == "a")  { out = PatOp::VarA;  return true; }   // albedo — resolved at load time
     return false;
 }
@@ -1002,6 +1024,7 @@ inline const char* varName(PatOp op) {
         case PatOp::VarNz: return "nz";  case PatOp::VarR:  return "r";
         case PatOp::VarU:  return "u";   case PatOp::VarV:  return "v";
         case PatOp::VarCurv: return "curv";
+        case PatOp::VarCavity: return "cavity";
         case PatOp::VarA:  return "a";   default: return nullptr;
     }
 }
@@ -1167,6 +1190,7 @@ inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
     for (const PatNode& nd : prog)
         if ((nd.op >= PatOp::VarX && nd.op <= PatOp::VarV) ||
             nd.op == PatOp::VarCurv ||   // a surface intrinsic living outside the range (O3)
+            nd.op == PatOp::VarCavity || // ditto (O3 stage 2)
             nd.op == PatOp::Tex || nd.op == PatOp::Grid ||
             nd.op == PatOp::Scatter) return true;
     return false;
@@ -1212,6 +1236,7 @@ inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes) {
     // unknown arity makes patternOptimizeCSE bail on the WHOLE program, so a single
     // `curv` anywhere would silently switch off CSE for the entire expression around it.
     if (op == PatOp::VarCurv)                     { pops = 0; return true; }
+    if (op == PatOp::VarCavity)                   { pops = 0; return true; }
     if (op >= PatOp::Neg && op <= PatOp::Saturate){ pops = 1; return true; }
     if (op >= PatOp::Add && op <= PatOp::Step)    { pops = 2; return true; }
     if (op >= PatOp::Clamp && op <= PatOp::Noise) { pops = 3; return true; }

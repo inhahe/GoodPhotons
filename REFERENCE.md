@@ -2338,8 +2338,9 @@ point evaluated per shading sample — that can drive any scalar material parame
 world-space position `x y z`, the implicit field value `f` (the SDF value at the hit,
 `~0` on an isosurface; `0` for explicit geometry), the surface normal `nx ny nz`, the
 radius `r = √(x²+y²+z²)`, the **surface UV coordinates `u v`** (mesh-interpolated,
-or a native-primitive wrap — see below), and the **mean curvature `curv`** (see
-*Curvature-driven, non-stationary patterns* below). Two authoring forms:
+or a native-primitive wrap — see below), the **mean curvature `curv`** (see
+*Curvature-driven, non-stationary patterns* below), and the **enclosure `cavity`**
+(see *Enclosure-driven patterns* below). Two authoring forms:
 
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
@@ -2571,6 +2572,54 @@ wants "least convex", not strictly "negative" — grime collects wherever the fo
 away and nothing wipes it. Same values on CPU and GPU, including through the instance
 rescale. Deterministic self-test `ftrace -checkcurv`, worked example
 `scenes/pattern_curvature.ftsl`.
+
+**Enclosure-driven patterns — `cavity`.** `curv` makes a pattern follow the shape of
+the surface it sits on. `cavity` answers the question `curv` structurally cannot: how
+**enclosed** is this point? It fires a short hemispherical probe of radius
+`cavity_radius` and returns the blocked fraction, in `[0,1]` — `0` on an open plane,
+`~0.5` in a right-angled interior corner, `→1` down a crevice. It works on every
+primitive, isosurfaces included.
+
+The two are complements:
+
+| | `curv` | `cavity` |
+|---|---|---|
+| Corner between two **flat** faces | `0` on both — they really are flat | `~0.5`, the dirtiest place in the room |
+| Contact between two **separate** objects | invisible; curvature is a property of one surface | a ring on **both** bodies — the probe hits whatever is there |
+| A lone sphere in an empty room | `1/R` everywhere | `0` everywhere — nothing to be enclosed by |
+| `isosurface` | `0` (not yet derived) | works normally |
+
+So edge wear still wants `curv`, and contact grime wants `cavity`.
+
+```
+# grime that collects wherever the form encloses, and only as much as the noise says
+pattern "crevice" { expr "smoothstep(0.06, 0.45, cavity) * noise(19*x, 19*y, 19*z)" }
+```
+
+Controlled by two `scene`-block keys. **`cavity_radius <len>`** is how far the probe
+reaches, and it *is* the look: enclosure has no intrinsic scale, so the same corner is
+"deeply enclosed" at a 1 cm probe and "wide open" at 1 m. Left unset it derives 2% of
+the scene's AABB diagonal and prints a line saying so — a starting point, not an
+answer. **`cavity_samples <n>`** (default 16) is the ray count.
+
+The direction set is a **fixed** cosine-weighted Fibonacci spiral rather than a random
+draw, and that is a design decision, not an optimisation: a pattern input is read many
+times per pixel by different tracers, and every read must agree or the material itself
+becomes a variance source that no amount of sampling averages away cleanly.
+Deterministic makes `cavity` a true function of position — noise-free, identical on CPU
+and GPU, stable frame to frame in an animation. The price is **banding** into at most
+`cavity_samples + 1` levels, which is why the idiom above multiplies by noise (and why
+a `smoothstep`, which quantises anyway, hides it too).
+
+`cavity` is the only pattern input that spends **rays**, so it is gated twice: a scene
+that never writes it fires none at all, and within a scene that does, only materials
+whose own programs read it are charged (a `mix` inherits the flag from its layers). An
+**emission** pattern may not read `cavity` or `curv` — an emitter's sampled point
+carries neither, so the emitted profile would disagree with the one emission-on-hit
+reads and MIS would bias the image; the loader rejects it with an explanation.
+
+Deterministic self-test `ftrace -checkcavity`, worked example
+`scenes/pattern_cavity.ftsl`.
 
 ## Participating media / fog
 
@@ -3296,7 +3345,8 @@ alone can't restore, so they are not disk-resumable.
 `-checkcurve`, `-checkfur`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
-`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkcurv`, `-checksun`,
+`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkcurv`,
+`-checkcavity`, `-checksun`,
 `-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
 `PASS`/`FAIL`. `-checkcurve` guards the `curve` primitive: it cross-checks the

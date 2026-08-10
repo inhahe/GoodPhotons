@@ -745,6 +745,15 @@ public:
             if (!dm.empty()) L.defaultMode = normMode(dm, L);
             double dfps = dblOf(b, "fps", 0.0);
             if (dfps > 0.0) L.defaultFps = dfps;
+            // `cavity` probe settings (O3 stage 2). The radius is an authored LENGTH, so
+            // it goes through the unit scale like every other length. Left unset it stays
+            // 0 here and is derived from the scene bounds after build (see
+            // deriveCavityRadius) — a fixed default cannot serve scenes that range from
+            // fibres to rooms.
+            double cr = dblOf(b, "cavity_radius", 0.0);
+            if (cr > 0.0) L.scene.cavityRadius = cr * L_;
+            double cs = dblOf(b, "cavity_samples", 0.0);
+            if (cs >= 1.0) L.scene.cavitySamples = (int)(cs + 0.5);
         }
 
         // Pass 1: collect named spectra (resolve refs lazily), materials, camera.
@@ -926,6 +935,8 @@ public:
         // Diagnostic only (never fails a load): a curv-driven material whose geometry
         // can only report 0 would otherwise render flat with no explanation at all.
         warnCurvOnFlatGeometry(L);
+        // Decide whether any cavity probe rays will ever be fired, and how far.
+        setupCavity(L);
         return true;
     }
 
@@ -999,10 +1010,12 @@ public:
             if (e.emitPat < 0) continue;
             if (e.emitPat < (int)L.scene.patterns.size()) {
                 for (const PatNode& n : L.scene.patterns[e.emitPat].nodes) {
-                    if (n.op != PatOp::VarCurv) continue;
-                    fail("an emit pattern cannot read `curv` — an emitter's sampled point "
-                         "carries no curvature, so the emitted profile would disagree with "
-                         "the one emission-on-hit reads, and MIS would bias the image");
+                    if (n.op != PatOp::VarCurv && n.op != PatOp::VarCavity) continue;
+                    const char* which = (n.op == PatOp::VarCurv) ? "curv" : "cavity";
+                    fail(std::string("an emit pattern cannot read `") + which +
+                         "` — an emitter's sampled point carries no such value, so the "
+                         "emitted profile would disagree with the one emission-on-hit "
+                         "reads, and MIS would bias the image");
                     return false;
                 }
             }
@@ -1018,6 +1031,65 @@ public:
             return false;
         }
         return true;
+    }
+
+    // Decide whether `cavity` costs anything in this scene, and pick its probe radius.
+    //
+    // The GATE is the whole reason cavity is affordable. It is the only pattern input
+    // that spends RAYS (cavitySamples occlusion queries per shading point), so anything
+    // that does not write `cavity` must pay literally nothing — hence a single scan for
+    // PatOp::VarCavity over every bound pattern, exactly mirroring the VarCurv scan in
+    // warnCurvOnFlatGeometry.
+    //
+    // The gate is PER MATERIAL (Material::readsCavity), not merely per scene, and that
+    // distinction matters: the probe is fired lazily from patCtxFromHit, which runs for
+    // EVERY patterned material. A scene-wide flag would therefore tax every noise-
+    // textured surface in the room with cavitySamples occlusion rays just because one
+    // material somewhere reads `cavity`. Keying off the hit's own material id costs a
+    // single load — Hit::matId is already in hand — and charges the probe only where it
+    // is read. Scene::needsCavity survives as the cheap "any at all?" early-out and as
+    // the flag the GPU upload and the radius derivation below key off.
+    //
+    // The RADIUS is derived rather than defaulted to a constant, because cavity is a
+    // non-local measure and therefore has no intrinsic scale: the same corner is "deeply
+    // enclosed" at a 1 cm probe and "wide open" at 1 m. 2% of the scene's AABB diagonal
+    // (sceneRadius is half that diagonal) makes the same model read the same however it
+    // was authored, which no fixed number can. Authored `cavity_radius` always wins.
+    void setupCavity(Loaded& L) {
+        Scene& sc = L.scene;
+        const size_t nm = sc.mats.size();
+        std::vector<PatOp> vars;
+        for (size_t i = 0; i < nm; ++i) {
+            materialFreeInputs(sc.mats[i], L, vars);
+            for (PatOp o : vars)
+                if (o == PatOp::VarCavity) { sc.mats[i].readsCavity = true; break; }
+        }
+        // A `mix` is referenced by geometry by NAME, not by its layers, so a cavity-
+        // reading LAYER has to lift to its parent: the probe is triggered off the hit's
+        // own material id, which is the parent's. Fixed point, for nested mixes. (Same
+        // propagation as warnCurvOnFlatGeometry — see the note there.)
+        for (size_t pass = 0; pass < nm; ++pass) {
+            bool changed = false;
+            for (size_t i = 0; i < nm; ++i) {
+                if (sc.mats[i].readsCavity) continue;
+                for (int c : sc.mats[i].mixChildren)
+                    if (c >= 0 && c < (int)nm && sc.mats[c].readsCavity) {
+                        sc.mats[i].readsCavity = true; changed = true; break;
+                    }
+            }
+            if (!changed) break;
+        }
+        for (size_t i = 0; i < nm; ++i)
+            if (sc.mats[i].readsCavity) { sc.needsCavity = true; break; }
+        if (!sc.needsCavity) return;
+        if (sc.cavityRadius <= 0.0) {
+            sc.cavityRadius = (sc.sceneRadius > 0.0) ? 0.04 * sc.sceneRadius : 0.1;
+            std::fprintf(stderr,
+                "[ftsl] cavity: probe radius %.4g m derived from the scene bounds "
+                "(2%% of the AABB diagonal); set `scene { cavity_radius <len> }` to "
+                "choose it explicitly.\n", sc.cavityRadius);
+        }
+        if (sc.cavitySamples < 1) sc.cavitySamples = 1;
     }
 
     // A `curv`-driven material placed on geometry that can only ever report curvature 0

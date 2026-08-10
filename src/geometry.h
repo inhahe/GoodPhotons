@@ -128,6 +128,18 @@ struct Hit {
     // facet, a FLAT-shaded mesh (no normal field to differentiate), and an implicit
     // isosurface (which would need the field's Hessian — see known-issues.md).
     double curv = 0.0;
+    // Cavity (O3 stage 2) — the blocked fraction of a short hemispherical probe at this
+    // hit, in [0,1], exposed to patterns as `cavity`. Unlike `curv` this is NOT filled
+    // by the intersector: it is non-local, so computing it needs the whole scene, which
+    // an intersector has no business traversing. It is filled LAZILY at shading time by
+    // patCtxFromHit(), and cached here because a single shading point builds several
+    // PatCtxs (a mix weight, a roughness map, a reflect map each ask), and an N-ray
+    // probe per ask would be paid over and over for one identical answer.
+    //
+    // `mutable` so the lazy fill works through the `const Hit&` every shading helper
+    // takes. Only ever written by cavityAt(); nothing else may touch it.
+    mutable double cavity = 0.0;
+    mutable bool   cavityDone = false;
 };
 
 // Geometric surface normal oriented onto the SAME side as the (ray-oriented) shading

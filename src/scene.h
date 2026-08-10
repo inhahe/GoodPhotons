@@ -256,6 +256,13 @@ struct Material {
     std::vector<int>    mixChildren;               // indices into Scene::mats
     std::vector<double> mixWeights;                // selection probs, sum <= 1
 
+    // Does any program bound to this material (or, for a `mix`, to one of its layers)
+    // read the `cavity` variable? Set once at load by ftsl::setupCavity. This is the
+    // per-hit gate on the cavity probe — the ONLY pattern input that spends rays — so
+    // a patterned material that never says `cavity` fires none. See the long note on
+    // setupCavity for why a scene-wide flag would not do.
+    bool readsCavity = false;
+
     // --- Layered (MatType::Layered): a specular coat over a weighted body -------
     // Physical two-layer stack (spec §3.2). The COAT is a reflect-or-enter interface
     // that reuses roughness/roughnessTex for its glossiness (0 = mirror), ior for its
@@ -1031,6 +1038,23 @@ struct Scene {
         t.dataPoolN = (int)dataPool.size();
         return t;
     }
+    // ---- `cavity` probe settings (O3 stage 2) --------------------------------------
+    // How far a cavity probe ray reaches. Cavity is a NON-LOCAL measure, so unlike
+    // `curv` it has no intrinsic scale — "is this enclosed?" is only meaningful
+    // relative to a distance, and the same corner reads deeply enclosed at 1 cm and
+    // wide open at 1 m. Authored as `scene { cavity_radius <len> }`; when left at 0 the
+    // loader derives 2% of the scene's AABB diagonal, which is scale-robust (the same
+    // model reads the same whether it was authored in metres or millimetres) and beats
+    // any fixed default, since scenes here range from fibres to rooms.
+    double cavityRadius = 0.0;
+    // Probe ray count. Deliberately a fixed, DETERMINISTIC direction set (see cavityAt),
+    // not a Monte-Carlo estimate: a mask that changed sample to sample would inject its
+    // own variance into every material it drives and smear under MIS.
+    int cavitySamples = 16;
+    // Load-time gate: true only if some bound pattern actually reads `cavity`. Every
+    // probe is skipped otherwise, so a scene that does not use the feature pays exactly
+    // nothing — which matters, because this is the one pattern input that costs rays.
+    bool needsCavity = false;
     Sensor sensor;
     // Participating media. Zero or more independent regions (global haze, bounded
     // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
@@ -1861,12 +1885,78 @@ inline void bindPatScene(PatCtx& c, const Scene& s) {
     bindPatData(c, s);
 }
 
+// ---------------------------------------------------------------------------
+// `cavity` — the blocked fraction of a short hemispherical probe at a hit (O3 s2).
+// ---------------------------------------------------------------------------
+// Fires `scene.cavitySamples` short occlusion rays into the hemisphere around the
+// shaded-side normal and returns the fraction blocked: 0 on a lone plane, ~0.5 in a
+// right-angled interior corner, ->1 deep in a crevice.
+//
+// The direction set is a FIXED cosine-distributed Fibonacci spiral, not a random draw,
+// and this is the load-bearing design decision rather than an optimisation. A pattern
+// input is not a light-transport estimator: it is read many times per pixel by
+// different tracers (a mix weight here, a roughness there, again on the light subpath),
+// and every one of those reads must agree or the material itself becomes a source of
+// variance that no amount of sampling averages away cleanly. A deterministic set makes
+// `cavity` a true function of position — noise-free, identical on CPU and GPU, and
+// stable frame to frame in an animation.
+//
+// The cost of determinism is BANDING: a fixed direction set can only produce
+// cavitySamples+1 distinct values, so a smooth gradient becomes visible steps. That is
+// why the count is authorable, and why the natural way to use `cavity` is through a
+// `smoothstep` (which quantises anyway) or multiplied by a noise field (which hides the
+// steps entirely) — exactly how the crevice-grime idiom already reads.
+//
+// Cosine weighting, not uniform: cavity stands in for how much ambient light reaches
+// the point, and that is a cosine-weighted integral over the hemisphere. It also puts
+// samples where the geometry actually occludes rather than wasting them near the
+// grazing ring.
+inline double cavityAt(const Scene& scene, const Hit& h) {
+    const int N = scene.cavitySamples;
+    if (N <= 0 || scene.cavityRadius <= 0.0) return 0.0;
+    // Probe about the GEOMETRIC normal on the shaded side: using the shading normal
+    // would let an interpolated normal tilt the hemisphere into the surface on a
+    // coarse mesh and self-report occlusion that is not there.
+    const Vec3 n = orientedGeoN(h);
+    Vec3 t, b;
+    onb(n, t, b);
+    // Offset along the normal by a hair to avoid re-hitting the surface we sit on.
+    const Vec3 o = h.p + n * 1e-6;
+    const double R = scene.cavityRadius;
+    // Golden-angle spiral: the standard low-discrepancy hemisphere set, and the reason
+    // a mere 16 rays already look even rather than clumped.
+    const double golden = 3.14159265358979323846 * (3.0 - std::sqrt(5.0));
+    int blocked = 0;
+    for (int i = 0; i < N; ++i) {
+        // Cosine-weighted: sin(theta) = sqrt(u) with u stratified at bin centres.
+        const double u  = (i + 0.5) / (double)N;
+        const double sr = std::sqrt(u);          // radius in the projected disc
+        const double cz = std::sqrt(1.0 - u);    // cos(theta) — the cosine weight
+        const double ph = golden * i;
+        const Vec3 d = t * (sr * std::cos(ph)) + b * (sr * std::sin(ph)) + n * cz;
+        if (scene.occluded(o, d, R)) ++blocked;
+    }
+    return (double)blocked / (double)N;
+}
+
 // Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
 // implicit field value f (0 on non-implicit surfaces), oriented normal, radius, and
 // the scene's pattern tables (so `tex:<name>(u,v)` and `grid:<name>(…)` sampling
 // inside a pattern work).
 inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
-    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v, h.curv);
+    // `cavity` is filled here rather than by the intersector because it needs the whole
+    // scene, and cached on the Hit because one shading point builds several PatCtxs.
+    // Doubly gated — scene-wide (one compare for the overwhelming majority of scenes,
+    // which never mention `cavity`) and then per-material, so a noise-textured surface
+    // sitting next to a cavity-driven one is not charged cavitySamples occlusion rays
+    // for a variable its own pattern never reads.
+    if (scene.needsCavity && !h.cavityDone &&
+        h.matId >= 0 && h.matId < (int)scene.mats.size() &&
+        scene.mats[h.matId].readsCavity) {
+        h.cavity = cavityAt(scene, h);
+        h.cavityDone = true;
+    }
+    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity);
     bindPatScene(c, scene);
     return c;
 }

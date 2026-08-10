@@ -3463,6 +3463,450 @@ static int checkCurv() {
     return ok ? 0 : 1;
 }
 
+// Deterministic cavity self-test (`-checkcavity`): the `cavity` free variable (O3
+// stage 2 — non-stationary randomness). Builds tiny in-memory scenes; no renderer.
+//
+// `cavity` is the fraction of a short hemispherical probe of radius `cavityRadius`
+// that is BLOCKED at the shading point: 0 on a lone plane, ~0.5 in a right-angled
+// interior corner, ->1 inside a crevice. It complements `curv` — a right-angled
+// corner reads curv == 0 on BOTH flat faces yet is exactly where grime collects, and
+// unlike curv it is non-local, so it also sees the gap between two separate objects.
+//
+// What each section defends, and the mutation it catches:
+//   §1 a lone plane reads EXACTLY 0. Any stray self-hit (a missing normal offset, a
+//      tmin of 0) shows up here as a nonzero on an unoccluded surface.
+//   §2 the ANALYTIC anchor, and the sharpest section by far. With a horizontal
+//      ceiling at height h, a probe ray at polar angle theta travels h/cos(theta) to
+//      reach it, so exactly the cap cos(theta) > h/R is blocked. Under COSINE
+//      weighting that cap has measure 1 - (h/R)^2; under UNIFORM weighting it would
+//      be 1 - h/R (0.75 vs 0.50 at h/R = 1/2). Because the sample set stratifies u =
+//      (i+0.5)/N and cos(theta) = sqrt(1-u), the discrete count is exact, so this is
+//      checked to 2e-3 rather than to sampling noise. Catches: uniform instead of
+//      cosine weighting, a mutated sqrt, and an unstratified/jittered direction set.
+//   §3 the probe RADIUS is honoured: the same ceiling with R < h must read 0. A
+//      mutation that passed an unbounded maxDist to occluded() (i.e. plain ambient
+//      occlusion over the whole scene) passes §2 and dies here — and would make
+//      `cavity` report "in a crevice" for a point on an open floor under a distant
+//      roof, which is the entire distinction the feature rests on.
+//   §4 a right-angled interior corner reads ~1/2 — the canonical value the docs
+//      quote, and the case `curv` cannot see at all.
+//   §5 a point sealed inside a small closed box reads exactly 1.
+//   §6 the hemisphere follows the SHADED SIDE: the same point on the same floor,
+//      probed from underneath, sees the open half-space and reads 0. This is the
+//      orientedGeoN() flip, the twin of -checkcurv's §3.
+//   §7 quantisation and determinism: the result is always an exact multiple of 1/N
+//      (a fixed direction set can produce only N+1 values — the banding the docs warn
+//      about, pinned so nobody "fixes" it by jittering, which would make every
+//      cavity-driven material a noise source), and two calls agree BIT for BIT.
+//   §8 the VM: `cavity` compiles, reaches PatCtx.cavity, defaults to a clean 0, is
+//      visible to patternHasFreeVars (else a cavity-driven material const-folds at
+//      load into whatever the first hit happened to be), is REJECTED in an upsample
+//      body, and is CSE-keyed. That last one is not ceremony: patOpStackEffect not
+//      knowing a new opcode's arity makes patternOptimizeCSE silently bail on the
+//      WHOLE program, which is exactly the bug this section caught for `curv`.
+//   §9 the loader: `needsCavity` is set IFF some material reads `cavity` (it is the
+//      gate that decides whether any probe rays are fired at all, so a false negative
+//      renders the feature as a flat 0 and a false positive taxes every scene), the
+//      radius defaults to a fraction of the scene size, `cavity_radius` /
+//      `cavity_samples` override it, and an EMIT pattern reading `cavity` is
+//      rejected — an emitter's sampled point carries no cavity, so the emitted
+//      profile would disagree with the one emission-on-hit reads and MIS would bias.
+//  §10 the lazy fill in patCtxFromHit caches (one probe per shading point, not one
+//      per pattern context) and does nothing at all when the gate is off.
+static int checkCavity() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkcavity] %-48s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+    auto chkb = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkcavity] %-48s BAD\n", what); ok = false; }
+    };
+    // Add an axis-aligned quad (2 flat tris) spanning `a`..`b` in the two axes that
+    // differ; used to build the plane/corner/box scenes below.
+    auto addQuad = [](Scene& s, const Vec3& p0, const Vec3& e1, const Vec3& e2) {
+        Tri t0; t0.v0 = p0; t0.v1 = p0 + e1; t0.v2 = p0 + e1 + e2;
+        Tri t1; t1.v0 = p0; t1.v1 = p0 + e1 + e2; t1.v2 = p0 + e2;
+        s.tris.push_back(t0); s.tris.push_back(t1);
+    };
+    // build() would also finalise emitters, which these geometry-only scenes have
+    // none of; the probe needs nothing but finalized tris and a BVH.
+    auto finish = [](Scene& s, double radius, int samples) {
+        for (auto& t : s.tris) t.finalize();
+        s.buildBvh();
+        s.cavityRadius = radius; s.cavitySamples = samples; s.needsCavity = true;
+        s.mats.resize(2);
+        s.mats[0].readsCavity = true;    // material 0 = the one under test
+        s.mats[1].readsCavity = false;   // material 1 = a patterned neighbour that doesn't
+    };
+    // A hit that is not the result of any intersection: `cavity` is a function of the
+    // point and the shaded-side normal alone, so it can be probed directly.
+    // `ng` is the triangle's own winding normal and does NOT flip with the ray; `n` is
+    // the ray-oriented shading normal and does. §6 relies on being able to set them
+    // independently, which is the only way to exercise orientedGeoN().
+    // matId 0 throughout: §10 exercises the per-material gate, and the probe is only
+    // reached through a material that declares it reads `cavity`.
+    auto hitAt2 = [](const Vec3& p, const Vec3& n, const Vec3& ng) {
+        Hit h; h.valid = true; h.t = 1.0; h.p = p; h.n = n; h.ng = ng; h.matId = 0; return h;
+    };
+    auto hitAt = [&](const Vec3& p, const Vec3& n) { return hitAt2(p, n, n); };
+
+    // ---- §1: a lone plane is fully open --------------------------------------
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});
+        finish(s, 1.0, 256);
+        ok &= chk("S1 lone plane cavity == 0",
+                  cavityAt(s, hitAt(Vec3{0.13, 0.0, -0.41}, Vec3{0, 1, 0})), 0.0, 0.0);
+    }
+
+    // ---- §2: ceiling at height h -> 1 - (h/R)^2 (the cosine-weighting anchor) --
+    {
+        const double R = 1.0;
+        const int N = 1000;
+        for (double frac : { 0.3, 0.5, 0.7, 0.9 }) {
+            const double h = frac * R;
+            Scene s;
+            addQuad(s, Vec3{-8, h, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});
+            finish(s, R, N);
+            const double want = 1.0 - frac * frac;
+            char lbl[96];
+            std::snprintf(lbl, sizeof lbl, "S2 ceiling h/R=%g -> 1-(h/R)^2", frac);
+            ok &= chk(lbl, cavityAt(s, hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0})), want, 2e-3);
+            // and the uniform-weighted answer must NOT be what we got
+            if (std::fabs(want - (1.0 - frac)) > 1e-6) {
+                double got = cavityAt(s, hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0}));
+                if (std::fabs(got - (1.0 - frac)) < 2e-3) {
+                    std::printf("[checkcavity] S2 h/R=%g reads the UNIFORM-weighted "
+                                "value %.4f  BAD\n", frac, got);
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    // ---- §3: the probe is SHORT — an occluder past R is invisible -------------
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0.5, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});
+        finish(s, 0.4, 256);           // R = 0.4 < h = 0.5
+        ok &= chk("S3 ceiling beyond R reads 0",
+                  cavityAt(s, hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0})), 0.0, 0.0);
+        s.cavityRadius = 0.6;          // now within reach: 1 - (0.5/0.6)^2
+        ok &= chk("S3 same ceiling within R reads 1-(h/R)^2",
+                  cavityAt(s, hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0})),
+                  1.0 - (0.5 / 0.6) * (0.5 / 0.6), 5e-3);
+    }
+
+    // ---- §4: a right-angled interior corner reads ~1/2 ------------------------
+    // Floor in y=0, wall in x=0 rising out of it. A probe point a hair off the wall
+    // has exactly the half-hemisphere x < 0 blocked, which under any normalised
+    // weighting is half the measure. (Only ~1/2 rather than exactly: the golden-angle
+    // azimuths are not mirror-symmetric, so the discrepancy is O(1/N).)
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});     // floor
+        addQuad(s, Vec3{0, -0.1, -8}, Vec3{0, 4, 0}, Vec3{0, 0, 16});    // wall
+        finish(s, 1.0, 4096);
+        ok &= chk("S4 right-angled corner cavity ~ 0.5",
+                  cavityAt(s, hitAt(Vec3{1e-4, 0.0, 0.0}, Vec3{0, 1, 0})), 0.5, 0.02);
+    }
+
+    // ---- §5: sealed inside a closed box reads exactly 1 -----------------------
+    {
+        const double e = 0.1;
+        Scene s;
+        addQuad(s, Vec3{-e, -e, -e}, Vec3{2 * e, 0, 0}, Vec3{0, 0, 2 * e});   // floor
+        addQuad(s, Vec3{-e,  e, -e}, Vec3{2 * e, 0, 0}, Vec3{0, 0, 2 * e});   // ceiling
+        addQuad(s, Vec3{-e, -e, -e}, Vec3{0, 2 * e, 0}, Vec3{0, 0, 2 * e});   // -x
+        addQuad(s, Vec3{ e, -e, -e}, Vec3{0, 2 * e, 0}, Vec3{0, 0, 2 * e});   // +x
+        addQuad(s, Vec3{-e, -e, -e}, Vec3{2 * e, 0, 0}, Vec3{0, 2 * e, 0});   // -z
+        addQuad(s, Vec3{-e, -e,  e}, Vec3{2 * e, 0, 0}, Vec3{0, 2 * e, 0});   // +z
+        finish(s, 1.0, 512);
+        ok &= chk("S5 sealed box cavity == 1",
+                  cavityAt(s, hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0})), 1.0, 0.0);
+    }
+
+    // ---- §6: the hemisphere follows the shaded side ---------------------------
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0.3, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});   // roof above
+        addQuad(s, Vec3{-8, 0, -8},   Vec3{16, 0, 0}, Vec3{0, 0, 16});   // the floor itself
+        finish(s, 1.0, 512);
+        // The floor tri's winding normal is FIXED at +y in both cases; only the
+        // ray-oriented shading normal differs, exactly as it would for a ray arriving
+        // from above vs. from below. A mutation that probed about a raw `h.ng` (or a
+        // raw "always outward") instead of orientedGeoN() reads the roof in BOTH.
+        const Vec3 P{0.2, 0.0, 0.1}, GN{0, 1, 0};
+        double up   = cavityAt(s, hitAt2(P, Vec3{0,  1, 0}, GN));
+        double down = cavityAt(s, hitAt2(P, Vec3{0, -1, 0}, GN));
+        ok &= chk("S6 hit from above sees the roof",   up,   1.0 - 0.09, 5e-3);
+        ok &= chk("S6 hit from below sees open space", down, 0.0, 0.0);
+        // The same for a smooth-shaded surface whose interpolated normal merely TILTS
+        // away from the facet: the flip must key off the SIGN of dot(ng, n), not
+        // replace ng with n (which would let a coarse mesh's shading normal tip the
+        // hemisphere into the surface and self-report occlusion that is not there).
+        Vec3 tilt = normalize(Vec3{0.45, 1.0, -0.3});
+        ok &= chk("S6 tilted shading normal still probes about ng",
+                  cavityAt(s, hitAt2(P, tilt, GN)), up, 0.0);
+    }
+
+    // ---- §7: quantisation to k/N, and bit-for-bit determinism -----------------
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0, -8},   Vec3{16, 0, 0}, Vec3{0, 0, 16});
+        addQuad(s, Vec3{0, -0.1, -8}, Vec3{0, 4, 0},  Vec3{0, 0, 16});
+        for (int N : { 4, 16, 64, 257 }) {
+            finish(s, 1.0, N);
+            Hit h = hitAt(Vec3{0.05, 0.0, 0.0}, Vec3{0, 1, 0});
+            double a = cavityAt(s, h), b = cavityAt(s, h);
+            if (a != b) {
+                std::printf("[checkcavity] S7 N=%d not deterministic (%.17g vs %.17g)"
+                            "  BAD\n", N, a, b);
+                ok = false;
+            }
+            double k = a * N;
+            char lbl[96];
+            std::snprintf(lbl, sizeof lbl, "S7 N=%d value is an exact multiple of 1/N", N);
+            ok &= chk(lbl, k - std::floor(k + 0.5), 0.0, 1e-12);
+        }
+        // N = 0 disables the probe entirely rather than dividing by zero
+        finish(s, 1.0, 0);
+        ok &= chk("S7 cavity_samples 0 -> 0 (no divide by zero)",
+                  cavityAt(s, hitAt(Vec3{0.05, 0.0, 0.0}, Vec3{0, 1, 0})), 0.0, 0.0);
+    }
+
+    // ---- §8: the VM path -------------------------------------------------------
+    {
+        std::vector<PatNode> prog; std::string perr;
+        if (!compilePatternExpr("cavity", prog, perr)) {
+            std::printf("[checkcavity] S8 compile `cavity` FAILED: %s\n", perr.c_str());
+            ok = false;
+        } else {
+            double w = 0.0;
+            for (int i = 0; i < 33; ++i) {
+                double want = i / 32.0;
+                PatCtx c = makePatCtx(Vec3{0.1, 0.2, 0.3}, 0.0, Vec3{0, 0, 1},
+                                      0.0, 0.0, 0.0, want);
+                w = std::fmax(w, std::fabs(patternEval(prog.data(), (int)prog.size(), c) - want));
+            }
+            ok &= chk("S8 VM `cavity` == PatCtx.cavity", w, 0.0, 0.0);
+            chkb("S8 patternHasFreeVars(`cavity`)", patternHasFreeVars(prog));
+        }
+        {   // default PatCtx must be a clean 0, not garbage
+            std::vector<PatNode> p2; std::string e2;
+            if (compilePatternExpr("cavity", p2, e2)) {
+                PatCtx c = makePatCtx(Vec3{1, 2, 3}, 0.0, Vec3{0, 1, 0});
+                ok &= chk("S8 default PatCtx.cavity == 0",
+                          patternEval(p2.data(), (int)p2.size(), c), 0.0, 0.0);
+            }
+        }
+        {   // an upsample body has no surface: reject
+            std::vector<PatNode> p3; std::string e3;
+            if (compilePatternExpr("cavity", p3, e3, false, nullptr, nullptr, false,
+                                   PatVarMode::Upsample)) {
+                std::printf("[checkcavity] S8 `cavity` compiled in an upsample body  BAD\n");
+                ok = false;
+            }
+        }
+        {   // CSE must fold a repeated cavity-rooted SUBTREE (see the header note)
+            std::vector<PatNode> same, opt; std::string e4;
+            const char* expr = "abs(cavity * 2 + 1) + abs(cavity * 2 + 1)";
+            if (!compilePatternExpr(expr, same, e4)) {
+                std::printf("[checkcavity] S8 compile `%s` FAILED: %s\n", expr, e4.c_str());
+                ok = false;
+            } else {
+                opt = same; patternOptimizeCSE(opt);
+                if (opt.size() >= same.size()) {
+                    std::printf("[checkcavity] S8 CSE did not shrink `%s` (%zu -> %zu)"
+                                "  BAD\n", expr, same.size(), opt.size());
+                    ok = false;
+                }
+                PatCtx c = makePatCtx(Vec3{0, 0, 0}, 0.0, Vec3{0, 0, 1},
+                                      0.0, 0.0, 0.0, 0.25);
+                ok &= chk("S8 CSE'd cavity subtree evaluates right",
+                          patternEval(opt.data(), (int)opt.size(), c), 3.0, 0.0);
+            }
+        }
+        // `curv` and `cavity` must be DISTINCT variables, not aliases of one slot
+        {
+            std::vector<PatNode> pc, pv; std::string e5;
+            if (compilePatternExpr("curv", pc, e5) && compilePatternExpr("cavity", pv, e5)) {
+                PatCtx c = makePatCtx(Vec3{0, 0, 0}, 0.0, Vec3{0, 0, 1},
+                                      0.0, 0.0, /*curv=*/7.5, /*cavity=*/0.25);
+                ok &= chk("S8 `curv` reads curv, not cavity",
+                          patternEval(pc.data(), (int)pc.size(), c), 7.5, 0.0);
+                ok &= chk("S8 `cavity` reads cavity, not curv",
+                          patternEval(pv.data(), (int)pv.size(), c), 0.25, 0.0);
+            }
+        }
+    }
+
+    // ---- §9: the loader gate, the defaults, and the emit rejection -------------
+    {
+        auto loadSrc = [&](const std::string& mats, ftsl::Loaded& L, std::string& err) {
+            std::string src =
+                "scene { units meters }\n" + mats + "\n"
+                "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+                "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0"
+                "  spd preset:bb6500 }\n"
+                "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32"
+                "  film { res 8 8 } }\n";
+            return ftsl::loadSource(src, "<checkcavity>", L, err);
+        };
+        // (a) a scene that never says `cavity` must not arm the probe
+        {
+            ftsl::Loaded L; std::string e;
+            if (!loadSrc("material \"probe\" { type diffuse reflect rgb 0.5 0.5 0.5 }",
+                         L, e))
+                { std::printf("[checkcavity] S9 plain scene load FAILED: %s\n", e.c_str()); ok = false; }
+            else chkb("S9 no `cavity` anywhere -> needsCavity false", !L.scene.needsCavity);
+        }
+        // (b) a material that reads it arms the probe and gets a derived radius
+        {
+            ftsl::Loaded L; std::string e;
+            const char* body =
+                "pattern \"cav\" { expr \"cavity\" }\n"
+                "material \"a\" { type diffuse reflect rgb 0.9 0.9 0.9 }\n"
+                "material \"b\" { type diffuse reflect rgb 0.1 0.1 0.1 }\n"
+                "material \"probe\" { type mix layer \"a\" 0.5 layer \"b\" 0.5"
+                "  weight_map pattern:cav }";
+            if (!loadSrc(body, L, e))
+                { std::printf("[checkcavity] S9 cavity scene load FAILED: %s\n", e.c_str()); ok = false; }
+            else {
+                chkb("S9 material reads `cavity` -> needsCavity true", L.scene.needsCavity);
+                chkb("S9 derived cavityRadius > 0", L.scene.cavityRadius > 0.0);
+                chkb("S9 derived cavityRadius < scene radius",
+                     L.scene.cavityRadius < L.scene.sceneRadius);
+                chkb("S9 default cavitySamples >= 1", L.scene.cavitySamples >= 1);
+                int mi = L.scene.tris.empty() ? -1 : L.scene.tris[0].matId;
+                chkb("S9 the reading material is flagged",
+                     mi >= 0 && L.scene.mats[mi].readsCavity);
+            }
+        }
+        // (b2) the per-material flag must LIFT through a mix: geometry names the mix,
+        // not its layers, so a layer that reads `cavity` has to arm the parent or the
+        // probe never fires and the pattern renders as a flat 0.
+        {
+            ftsl::Loaded L; std::string e;
+            const char* body =
+                "pattern \"cav\" { expr \"cavity\" }\n"
+                "material \"a\" { type diffuse reflect rgb 0.9 0.9 0.9"
+                "  reflect_map pattern:cav }\n"
+                "material \"b\" { type diffuse reflect rgb 0.1 0.1 0.1 }\n"
+                "material \"probe\" { type mix layer \"a\" 0.5 layer \"b\" 0.5 }";
+            if (!loadSrc(body, L, e))
+                { std::printf("[checkcavity] S9 mix-layer load FAILED: %s\n", e.c_str()); ok = false; }
+            else {
+                int mi = L.scene.tris.empty() ? -1 : L.scene.tris[0].matId;
+                chkb("S9 mix inherits readsCavity from a layer",
+                     mi >= 0 && L.scene.mats[mi].readsCavity);
+                // …and a material that does NOT read it stays unflagged, or the gate is
+                // vacuous and everything pays for the probe.
+                bool anyClean = false;
+                for (const auto& m : L.scene.mats) if (!m.readsCavity) anyClean = true;
+                chkb("S9 non-reading materials stay unflagged", anyClean);
+            }
+        }
+        // (c) explicit overrides win
+        {
+            ftsl::Loaded L; std::string e;
+            std::string src =
+                "scene { units meters  cavity_radius 0.037  cavity_samples 48 }\n"
+                "pattern \"cav\" { expr \"cavity\" }\n"
+                "material \"a\" { type diffuse reflect rgb 0.9 0.9 0.9 }\n"
+                "material \"b\" { type diffuse reflect rgb 0.1 0.1 0.1 }\n"
+                "material \"probe\" { type mix layer \"a\" 0.5 layer \"b\" 0.5"
+                "  weight_map pattern:cav }\n"
+                "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+                "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0"
+                "  spd preset:bb6500 }\n"
+                "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32"
+                "  film { res 8 8 } }\n";
+            if (!ftsl::loadSource(src, "<checkcavity>", L, e))
+                { std::printf("[checkcavity] S9 override load FAILED: %s\n", e.c_str()); ok = false; }
+            else {
+                ok &= chk("S9 cavity_radius honoured", L.scene.cavityRadius, 0.037, 1e-12);
+                ok &= chk("S9 cavity_samples honoured", (double)L.scene.cavitySamples, 48.0, 0.0);
+            }
+        }
+        // (d) an emit pattern reading `cavity` must be rejected (MIS bias, see header).
+        // The emission pattern lives on the LIGHT (`spd_map pattern:…`, which becomes
+        // Material::emitPat), so this fragment replaces the stock light rather than
+        // adding a material.
+        {
+            auto emitScene = [&](const char* expr, std::string& err) {
+                ftsl::Loaded L;
+                std::string src =
+                    "scene { units meters }\n"
+                    "pattern \"ep\" { expr \"" + std::string(expr) + "\" }\n"
+                    "material \"probe\" { type diffuse reflect rgb 0.5 0.5 0.5 }\n"
+                    "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+                    "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0"
+                    "  spd preset:bb6500  spd_map pattern:ep }\n"
+                    "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32"
+                    "  film { res 8 8 } }\n";
+                return ftsl::loadSource(src, "<checkcavity>", L, err);
+            };
+            std::string e;
+            if (emitScene("cavity", e))
+                chkb("S9 emit pattern reading `cavity` is rejected", false);
+            else if (e.find("cavity") == std::string::npos) {
+                std::printf("[checkcavity] S9 emit rejection message omits `cavity`"
+                            " (was: %s)  BAD\n", e.c_str());
+                ok = false;
+            }
+            // …and the guard must not be a blanket ban on emission patterns: a plain
+            // UV-driven one still has to load, or the check is vacuously "passing".
+            std::string e2;
+            if (!emitScene("0.5 + 0.5 * sin(20 * u)", e2)) {
+                std::printf("[checkcavity] S9 an ordinary emit pattern was rejected"
+                            " (%s)  BAD\n", e2.c_str());
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §10: the lazy fill caches, and does nothing when the gate is off ------
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0.5, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});
+        finish(s, 1.0, 256);
+        Hit h = hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0});
+        PatCtx c1 = patCtxFromHit(s, h);
+        chkb("S10 patCtxFromHit marks the hit done", h.cavityDone);
+        ok &= chk("S10 patCtxFromHit fills cavity", c1.cavity, 1.0 - 0.25, 5e-3);
+        // Poison the cache: a second context must REUSE it, not re-probe. That is the
+        // whole point of caching on the Hit — several PatCtxs per shading point.
+        h.cavity = 0.123456;
+        PatCtx c2 = patCtxFromHit(s, h);
+        ok &= chk("S10 second PatCtx reuses the cached value", c2.cavity, 0.123456, 0.0);
+        // PER-MATERIAL gate: material 1 never says `cavity`, so a hit on it must fire no
+        // probe even though the scene as a whole is armed. Without this the feature
+        // silently taxes every other patterned surface in a cavity scene.
+        Hit hOther = hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0});
+        hOther.matId = 1;
+        PatCtx cOther = patCtxFromHit(s, hOther);
+        ok &= chk("S10 material that ignores `cavity` -> 0", cOther.cavity, 0.0, 0.0);
+        chkb("S10 that material's hit is left unprobed", !hOther.cavityDone);
+        // Scene gate off: no probe, a clean 0, and the hit left untouched.
+        s.needsCavity = false;
+        Hit h2 = hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0});
+        PatCtx c3 = patCtxFromHit(s, h2);
+        ok &= chk("S10 scene gate off -> cavity 0", c3.cavity, 0.0, 0.0);
+        chkb("S10 scene gate off leaves the hit unprobed", !h2.cavityDone);
+    }
+
+    std::printf("[checkcavity] worst absolute error = %.3g\n", worst);
+    std::printf("[checkcavity] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic N-D scatter sampler self-test (src/pattern.h: PatScatter /
 // patScatterSample, reached from a pattern expression as `scatter:<name>(c0, …)`).
 // The ragged sibling of -checkgrid; validates, with no scene and no renderer:
@@ -8597,6 +9041,7 @@ static int run(int argc, char** argv) {
     bool checkVNoiseOnly = false;
     bool checkWorleyOnly = false;
     bool checkCurvOnly = false;
+    bool checkCavityOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
     bool checkPropOnly = false;
@@ -9011,6 +9456,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkvnoise")) checkVNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkworley")) checkWorleyOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
+        else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
         else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
@@ -9197,6 +9643,7 @@ static int run(int argc, char** argv) {
     if (checkVNoiseOnly)   return checkVNoise();   // ditto (vector noise / domain warp)
     if (checkWorleyOnly)   return checkWorley();   // ditto (cellular / Worley noise)
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
+    if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
     if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)
