@@ -108,6 +108,7 @@ body/joint tree, which is what makes the MJCF emitter cheap.
 | respiration (lungs, diaphragm, ribcage) | **partly** | the *oscillation* is offline; the **aerobic budget** is in the loop, because it is what makes sustained speed cost something. See below |
 | soft tissue (flesh, fat, skin slide) | **no** | offline render pass — FEM in-loop is prohibitive and buys the controller nothing |
 | fur / surface | **no** | offline |
+| sound (voice, contacts, breath) | **no** | offline, but *event-driven by in-loop state* — exhale slots, contact impulses, effort — which is exactly what a hand-placed foley pass cannot see. See §"Sound is an output of the same systems" |
 
 ### Why the skeleton is the foundational layer, not the muscles
 
@@ -386,6 +387,45 @@ motion is breathing, and its absence is a large part of why a still CG creature 
 the flank rise and fall, nostril flare, the ribcage moving under fur (which the fur groom
 already deforms with skin strain), and, in cold air, visible breath, which ftrace's
 participating media can already render.
+
+### Sound is an output of the same systems, not a foley pass
+
+*(added 2026-08-09 — sound was entirely absent from this document until then.)* The default
+pipeline — a sound designer drops barks and footsteps on the timeline after the render — fails
+the way keyframed breathing fails, and for the same reason: **vocalisation is respiration.**
+Nearly all mammal vocalisation is egressive — air driven out through the larynx — so a call is
+an event on the exhale half of the very cycle the section above just pinned to the gait. The
+consequences chain directly off decisions already made:
+
+- **Timing is inherited, not authored.** At a gallop breathing locks 1:1 to the stride, so the
+  voice does too — a dog barking mid-chase barks in stride rhythm *for free*, because the
+  behaviour layer only requests ("vocalize, type T, intensity a") and the respiration layer
+  resolves the request to the next legal exhale slot (or steals the exhale for urgent calls,
+  visibly costing a breath in the flank). Panting is the degenerate case: the audible pant *is*
+  the ~5–6 Hz mechanical oscillation — one airway, one rate, nothing separate to drift. The cat
+  purr is the one common exception (continuous through both phases via ~25–30 Hz laryngeal
+  gating, Remmers & Gautier 1972) and is modelled as a *state* with an explicit gate bypass,
+  not an event.
+- **The voice is allometric, like everything else with a rate.** Formant dispersion is set by
+  vocal-tract length (ΔF ≈ c/2·VTL — Fitch 1997), and VTL tracks skull scale, which the morph
+  vector already carries; F0 follows M^−0.4 with wide honest scatter (Bowling et al. 2017). So
+  the *default* voice is derived from θ, and the scatter is an explicit override knob — which is
+  precisely what lets a fictional creature's voice be a choice while the default stays
+  plausible. Same claim as conduction delays and breath rate: 40 kg heavier is one knob, and
+  the voice deepens by itself.
+- **Synthesis is analysis-resynthesis, not simulation.** Articulatory (physical) voice
+  synthesis is ruled out by the cost model — decades of unsolved realism problems for human
+  speech alone. Recorded calls from the capture animal (capture.md §Audio — recorded from the
+  first session onward, because capture cannot be re-run) are decomposed with a WORLD-class
+  vocoder into F0 / spectral envelope / aperiodicity; every morph and effort edit is
+  closed-form in that parameter space.
+- **Contacts export foley events.** MuJoCo already computes every footfall and body impact; the
+  audio deliverable is dry stems (voice, contacts, breath) plus the raw event track
+  (t, bodies, impulse, material class). Propagation, reverb and mixing belong to the scene and
+  the listener, not the creature — the contract ends at the dry stems, the way the render
+  contract ends at the image.
+
+Work items: todo.md **P12**; capture protocol: `notes/capture.md` §Audio.
 
 ### The training environment: only signals a nerve could carry
 

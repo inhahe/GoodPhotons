@@ -155,3 +155,67 @@ Groom/appearance mode is unchanged by this decision: stills of a stationary subj
 sensor resolution, close range and controlled raking light — a phone (or the GoPros in 27 MP
 photo mode, though a phone focuses closer) remains entirely adequate. The two modes still must
 never share a recording.
+
+## Audio — the stream the rig was about to throw away  *(added 2026-08-09)*
+
+The pages above capture what the animal *does* and what it *looks like* and silently discard what
+it *sounds like*. That omission is expensive in exactly one direction: every downstream consumer
+of sound (todo.md **P12**) is deferrable, but the recording is not — a session that ran without
+audio cannot be re-run. So the protocol change is immediate even though the consumers come later:
+**from the first motion session onward, sound is recorded.**
+
+### What comes free: four synced GoPro tracks
+
+Every motion-mode recording already contains four audio tracks, timecode-labelled with the video
+by construction. Enable Protune **RAW audio (.wav sidecar)** on all four cameras — it is a QR
+scan away given GoPro Labs is already installed. Their quality is honestly mediocre (distance,
+AGC history, and above all **wind** — fit foam/deadcat covers; wind is the difference between a
+usable track and a useless one), but two of the three uses of audio need *timing*, not fidelity:
+
+- **Footfall onsets.** A footfall is a broadband transient; spectral-flux onset detection on a
+  48 kHz track localises it to well under a millisecond, against 4–8 ms video frames *plus* the
+  sub-frame shutter offsets §Sync already documents. Contact timing is precisely where video is
+  weakest (a paw at the ground is where occlusion, blur and rolling-shutter skew all concentrate)
+  and precisely what P5's physics-plausibility term wants. One correction is mandatory: sound
+  travels at ~343 m/s ≈ **2.9 ms per metre**, so at 10 m the propagation delay is ~29 ms — several
+  frames' worth, far larger than the error being fixed. The fitted trajectory knows where the
+  animal is at every frame, so the per-event delay to each camera is closed-form: solve pose
+  coarsely, correct the onsets, and the sharpened contacts feed back into the fit's contact
+  regulariser. Gate the whole signal by SNR — hooves on hard ground are a strong signal, a dog on
+  grass is not, and an onset that isn't clearly there should count for nothing.
+- **Vocalization *timing* and pairing.** Which bark happened during which stride, at which breath
+  phase — the pairing datum P12's breath-gated scheduler is fit against. The GoPro tracks
+  timestamp the bark; they do not have to make it pretty.
+
+### What does not come free: the library recorder
+
+The third use — the **vocalization library** (the samples the creature will actually play) — is
+the one the GoPro tracks cannot serve: too far, too windy, too compressed. Add exactly one piece
+of hardware: a **32-bit-float field recorder with a directional (super-cardioid/shotgun) mic**
+— Zoom F2/F3 class. 32-bit float removes gain-setting from the protocol entirely (nothing to
+clip, nothing to ride during a session with an uncooperative subject), which fits a rig philosophy
+that already trades operator attention away wherever possible. Sync is the solved dual-system
+problem: the **clap/flash that already starts every recording** serves double duty (flash for the
+cameras, clap for every mic), and cross-correlation against the GoPro tracks recovers alignment
+even when the clap is missed. Recorder drift over a take at these durations is a few ms — fine
+for a library sample, irrelevant for pairing.
+
+### The two-mode rule extends to audio, with the same shape
+
+Motion-mode audio (far, synced, timing-first) cannot yield library vocals, and a library session
+cannot yield gait pairing — the same "opposite settings, same hardware" doctrine, applied to
+sound:
+
+| | **motion mode** (audio side) | **vocal session** (audio's groom mode) |
+|---|---|---|
+| what it's for | onset timing; (vocal, stride, breath-phase) pairing | the sample library itself |
+| mic | 4× GoPro tracks + recorder wherever it fits | shotgun close (≤1 m if the animal allows) |
+| environment | whatever the space gives | quiet, wind-sheltered, controlled |
+| subject | moving, incidental vocalizations | provoked/opportunistic — doorbell, play, food |
+| cameras | all four (that's the point) | **1–2 close** — see below |
+
+The vocal session should still run one or two cameras close: the whole-animal 3 m framing of
+motion mode cannot resolve the jaw/lip/throat detail that must co-animate with a vocalization,
+and the close session captures exactly that (sound, face/head motion) pair at high resolution.
+That is the audio analogue of "groom needs its own stills session" — and like groom mode, it is
+cheap, unhurried, and can be repeated on a calm subject.

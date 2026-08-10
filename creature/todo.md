@@ -50,6 +50,9 @@ P10 layered control         (DESIGN before P2; BUILD alongside P4 — see below)
 P11 flight                  (out of the main line; a separate body plan and a
                              separate physics problem — but it scopes P4's claim,
                              so read it before P4 is built)
+P12 sound                   (offline + event-driven, downstream of everything —
+                             except its raw material, which P5's capture sessions
+                             record from day one; see capture.md §Audio)
 ```
 
 **P10's design cannot wait for its slot.** Every control channel you want at the end — morph vector,
@@ -353,6 +356,11 @@ implementation plan"** at the end of this section, added 2026-08-08.)*
       Note that page's central rule: the rig has **two modes that must never share a recording** —
       motion (fast, whole-animal, whatever resolution survives the fps budget) and groom/appearance
       (stills, full sensor, close, controlled light, still subject). Same hardware, opposite settings.
+      **Audio is recorded from the first session onward** — the four cameras' RAW-audio tracks are
+      free, footfall onsets beat video timing by an order of magnitude (a physics-plausibility aid
+      for this very phase), and P12's vocal library cannot be collected retroactively. capture.md
+      §Audio has the protocol, including the third mode it adds: the vocal session, audio's groom
+      mode.
 
 ### The implementation plan *(added 2026-08-08)*
 
@@ -858,6 +866,12 @@ separate channels is how you get a 200-dimensional command space by accident.
       *between* actions.
 - [ ] **Piloerection** — a state knob on the **fur groom**, connecting P7's look layer to the control
       layer.
+- [ ] **Vocalization** *(added 2026-08-09)* — the same omission as breathing, and coupled to it: a
+      dog barks **on the exhale**, so at a gallop the voice inherits the 1:1 stride lock for free
+      through the gate it shares with respiration. One behaviour-channel bit ("vocalize, type T,
+      intensity a"), resolved by the sound layer to the next legal exhale slot — the channel stays
+      cheap because *timing is the respiration layer's job, not the command's*. The whole story:
+      **P12**.
 
 ### Persistent state: three things, all of which fatigue needs
 
@@ -1201,6 +1215,108 @@ work as written. **Gaze is a standout: bird head stabilisation is famously preci
 iconic, and it falls straight out of "hold gaze fixed" as a goal** with no new machinery. And the
 legs do not go away — perching, takeoff and walking still need them, so flight is *additive* to the
 quadruped work rather than a replacement for it.
+
+---
+
+## P12 — Sound  `[ ]`  ← downstream of everything, except the part that can't wait
+
+*(Added 2026-08-09 — "I completely forgot about a whole aspect of the animal capture: the sounds it
+makes." The forgetting is diagnostic: eleven phases treat the creature as a silent film, and the one
+part of the project that cannot be re-run — capture — was about to throw its audio away. The capture
+half is already fixed: `notes/capture.md` §Audio. This phase is everything downstream of the
+recordings. It sits last in the numbering because nothing else depends on it, but its raw material
+is collected in P5's sessions, which is why the recording items live there and only the processing
+lives here.)*
+
+### The framing that keeps this phase small: sound is an output of systems that already exist
+
+The reflex is to treat creature sound as a foley pass — a sound designer drops barks on the timeline
+after the render. That fails exactly the way keyframed breathing fails, and for the same reason:
+**vocalization is respiration.** A dog cannot bark on an inhale; nearly all mammal vocalisation is
+egressive — air driven *out* through the larynx — so every call is an event on the exhale half of a
+cycle the creature already has (P3 lungs/diaphragm; design.md §breathing). At a gallop, breathing is
+locked 1:1 to the stride (Bramble & Carrier 1983) — which means at a gallop the *voice* is locked to
+the stride too, for free, because the gate is inherited rather than authored. A foley pass cannot
+know any of this. The simulation already does. So the architecture is the same one P10 uses for
+everything else: **the behaviour layer requests, the respiration layer schedules, the sound layer
+renders.**
+
+- [ ] **The command is one bit plus a type, not a waveform trigger.** P10 gains a "vocalize
+      (type T, intensity a)" channel. The sound layer resolves it to the **next legal exhale
+      slot** — or steals the exhale early for urgent calls (a startled yelp interrupts the cycle;
+      the respiration state takes the hit, which is correct *and visible in the flank*). The
+      channel stays cheap because timing is not its job.
+- [ ] **Panting sound is not a new sound.** Panting (P3: ~5–6 Hz resonant dead-space oscillation,
+      thermoregulation not gas exchange) **is** the sound source — same airway, same rate. The
+      audible pant's rate and amplitude come straight from the mechanical panting state. If the
+      heard rate and the flank's rate can ever disagree, the model is wrong — that identity is the
+      test.
+- [ ] **The purr is the exception, and it needs an explicit bypass.** Cat purring runs continuously
+      across inhale *and* exhale (laryngeal muscle twitch at ~25–30 Hz gating airflow, Remmers &
+      Gautier 1972) — the one common vocalisation that is not exhale-gated. Model it as a *state*
+      modulating whatever airflow is already moving, not an event — with the audible asymmetry at
+      the inhale/exhale boundary kept, because that hitch is what real purrs sound like.
+
+### Synthesis: analysis-resynthesis, not articulatory simulation
+
+Simulating larynx + vocal tract acoustics (articulatory synthesis) has decades of unsolved realism
+problems for *human* speech, with far more effort spent than this project can. The cost-model
+doctrine kills it on contact: enormous cost, and the output would be *worse* than playback. The
+decided path is the vocoder middle road — real recordings, parameterised so physics and morphology
+can edit them:
+
+- [ ] **Build the vocalisation library from the animal's own calls** (capture.md §Audio: 32-bit
+      float recorder + shotgun; the vocal session is audio's groom mode). Segment, denoise, label
+      by type (bark classes, whine, growl, huff, yelp) — and, the part no stock sound library has,
+      **pair each call with the breath phase and fitted pose at emission**, because the cameras
+      were rolling and P5's pipeline runs on those same clips.
+- [ ] **Decompose with a WORLD-class vocoder** (Morise et al. 2016): F0 track + spectral envelope +
+      band aperiodicity. Resynthesis from unmodified parameters is near-transparent, and every knob
+      below is an edit in that parameter space. Playback at an exhale slot takes intensity/effort
+      from the respiration state — louder = more subglottal pressure = higher F0 + flatter spectral
+      tilt, one mapping, fit from the library's own soft/loud pairs rather than invented.
+- [ ] **Foley is an event export, not sound design.** MuJoCo already computes every contact. Export
+      the contact-event stream — (t, body pair, normal impulse, material class) — and render
+      footfalls, body-drops and scrapes by triggering recorded impact samples scaled by impulse.
+      Timing comes from physics; only the timbre library is authored. Same architecture as the
+      vocal side: **simulation supplies the events, recordings supply the sound.** Deliverable for
+      any render: dry stems (voice, contacts, breath) + the event track itself for whoever mixes.
+- [ ] **The breath itself is a stem.** Between calls the respiration layer is still audible at
+      rest/exertion extremes (pant, post-sprint blow, sigh — the P3 recovery states). Render it
+      from looped/granulated recorded breath noise driven by flow rate — near-free, and it is the
+      layer that makes the creature sound *present* even when silent in the vocal sense.
+
+### Morphing the voice: the same bet as P4, applied to sound
+
+The project's central claim is that anatomy is a conditioning input, not a new asset per creature.
+Sound has an unusually clean version of that claim, because bioacoustics already measured the map:
+
+- [ ] **Formant dispersion is set by vocal-tract length: ΔF ≈ c / 2·VTL** (Fitch 1997 — source-
+      filter theory, verified across macaques and dogs; VTL tracks skull size). The morph vector
+      already carries skull scale, so the spectral-envelope warp is *determined by θ*, not
+      authored: shrink the creature and the formants spread apart; the lion morph packs them down.
+      Closed-form edit on the vocoder envelope.
+- [ ] **F0 follows mass allometrically — with honest scatter.** Across mammals F0 ∝ M^(−0.4)
+      (Bowling et al. 2017), but residuals span orders of magnitude (the koala out-basses animals
+      dozens of times its mass through a novel velar organ). So: **allometric default, explicit
+      morph override** — the same pattern as every allometric parameter in P4. The scatter is not
+      noise to hide; it is exactly the freedom that makes a fictional creature's voice a *choice*
+      while the default stays plausible.
+- [ ] **Validation, the falsifiable kind:** (i) **breath-gate test** — render a vocalising gallop
+      and check *automatically* that every call onset lands inside an exhale window (and that at
+      gallop, call rate ≡ stride rate when the channel is held high); (ii) **Fitch-slope test** —
+      morph canis skull 0.5×→2×, measure formant dispersion of the resynthesised bark, confirm the
+      1/VTL law with no per-morph authoring.
+
+### Explicitly NOT doing (sound edition)
+
+- **Articulatory / physical voice synthesis** — cost model, see above.
+- **Room acoustics and propagation** — reverb, occlusion, distance filtering, HRTF are the
+  *listener's* problem (a game-engine/DAW pass over the dry stems), not the creature's. The
+  contract ends at dry stems + event track.
+- **Speech and lip-sync** — different literature, different face rig, and it drags in language.
+- **Hearing as a sense** (the creature reacting to sounds) — deferred until a world exists to
+  produce them; P10's "object interaction is content" argument applies verbatim.
 
 ---
 
