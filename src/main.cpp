@@ -2438,7 +2438,12 @@ static int checkUpsample() {
 //   (d) the three out-of-box policies: clamp (edge-extend), wrap (period hi-lo, with
 //       sample n-1 aliasing sample 0) and extrapolate (the boundary cell continues);
 //   (e) the compile path: `grid:<name>(…)` resolves through a PatTableScope, takes the
-//       GRID's own dimensionality as its arity, and pushes coordinates in axis order.
+//       GRID's own dimensionality as its arity, and pushes coordinates in axis order;
+//   (f) an UNBOUND table abandons the program (evaluates 0) instead of corrupting the
+//       stack and returning a coordinate;
+//   (g) end-to-end through a medium's density field, via Scene::patTables();
+//   (h) CSE over a table-sampling program: handed the tables it collapses a repeated
+//       `grid:` sample to one fetch + LdReg, bit-identically; handed none it declines.
 static int checkGrid() {
     auto mk = [](int ndim, const int* shape, const double* lo, const double* hi,
                  PatGridOutside os, int off, int count) {
@@ -2639,6 +2644,71 @@ static int checkGrid() {
             const Vec3 p(0.8, 0.0, 0.0);                // ramp(0.8) = 0.25 + 0.8*0.5
             ok &= chk("medium density `grid:ramp(x)`", med.densityAt(p, &tabs), 0.65, 1e-6);
             ok &= chk("medium density, tables omitted", med.densityAt(p, nullptr), 0.0, 1e-12);
+        }
+    }
+
+    // ---- (h) CSE over a table-sampling program -------------------------------
+    // The expression language has no local variables, so the non-stationary idiom
+    // (REFERENCE.md) writes the SAME `grid:` sample out at every site it drives —
+    // routinely half a dozen times in one expression. That is only affordable because
+    // the loader CSEs it down to one lattice fetch, and the pass can only model a
+    // `grid:` node's arity if it is handed the tables (the arity is the TABLE's ndim,
+    // which is nowhere in the program). Three things to pin, in order of what has
+    // actually broken:
+    //   * with tables, a repeated sample SHRINKS the program (before this, the pass
+    //     hit `grid:` and abandoned the whole expression, so nothing shrank and the
+    //     idiom quietly cost N fetches);
+    //   * the optimized program still evaluates bit-for-bit identically;
+    //   * WITHOUT tables the pass must decline rather than guess an arity — a wrong
+    //     pop count would silently mis-model the stack.
+    {
+        Scene sc;
+        sc.dataPool.assign(pool.begin(), pool.end());
+        sc.grids.push_back(gClamp);                     // index 0 == "ramp" (1-D)
+        sc.grids.push_back(g23);                        // index 1 == "tbl"  (2-D)
+        const PatTables tabs = sc.patTables();
+        // Both arities in one expression, each sampled twice, plus a shared non-table
+        // subtree — the shape a real gate/field pattern has.
+        const char* src = "grid:ramp(u) * grid:tbl(u, v) + grid:ramp(u) - grid:tbl(u, v)"
+                          " + sin(u * 3) * sin(u * 3)";
+        std::vector<PatNode> base; std::string perr;
+        if (!compilePatternExpr(src, base, perr, false, nullptr, &scope)) {
+            std::printf("[checkgrid] compile CSE probe FAILED: %s\n", perr.c_str());
+            ok = false;
+        } else {
+            std::vector<PatNode> opt = base;
+            patternOptimizeCSE(opt, &tabs);
+            if (opt.size() >= base.size()) {
+                std::printf("[checkgrid] CSE did not shrink a grid-sampling program "
+                            "(%zu -> %zu)  BAD\n", base.size(), opt.size());
+                ok = false;
+            }
+            bool sawLd = false;
+            for (const PatNode& nd : opt) if (nd.op == PatOp::LdReg) { sawLd = true; break; }
+            if (!sawLd) {
+                std::printf("[checkgrid] CSE emitted no LdReg for a repeated grid sample  BAD\n");
+                ok = false;
+            }
+            // Bit-identical, not merely close: the whole safety argument for CSE is that
+            // a register load reproduces the recomputation exactly.
+            int bad = 0;
+            for (int i = 0; i < 64; ++i) {
+                PatCtx c;
+                c.u = -0.4 + i * 0.03; c.v = 2.6 - i * 0.06;      // straddles both domains
+                patBindTables(c, &tabs);
+                double v0 = patternEval(base.data(), (int)base.size(), c);
+                double v1 = patternEval(opt.data(),  (int)opt.size(),  c);
+                if (std::memcmp(&v0, &v1, sizeof v0) != 0) ++bad;
+            }
+            ok &= chk("(h) CSE'd grid program bit-identical", (double)bad, 0.0, 0.0);
+            // No tables => must decline, leaving the program byte-for-byte untouched.
+            std::vector<PatNode> none = base;
+            patternOptimizeCSE(none, nullptr);
+            if (none.size() != base.size()) {
+                std::printf("[checkgrid] CSE rewrote a grid program with no tables in hand "
+                            "(%zu -> %zu)  BAD\n", base.size(), none.size());
+                ok = false;
+            }
         }
     }
 

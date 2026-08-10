@@ -1625,11 +1625,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   optimization is bit-identical in the host double evaluator **and** the device float
   evaluator (`dPatternEvalF`) even though those two disagree with each other. Constant
   folding was rejected for exactly this reason: host-double folding would change the
-  float path's bits. (2) It is hooked **only at the final-consumption site**
-  (`ftsl.h addFunctionLeaf`, after `compilePatternExpr`) — never inside compilation —
-  because `patternSubstitute` splices programs together and two pre-optimized fragments'
-  register indices would collide. (3) It is belt-and-braces conservative: programs with
-  `Grid`/`Scatter` (arity lives in the table, not the node) bail, the re-emitted program
+  float path's bits. (2) It is hooked **only at final-consumption sites** — never inside
+  compilation — because `patternSubstitute` splices programs together and two
+  pre-optimized fragments' register indices would collide. (3) It is belt-and-braces
+  conservative: an op whose arity it cannot determine makes it bail, the re-emitted program
   is re-simulated for stack balance, and 6 full-variable probe points are bit-compared
   (`memcmp`) old-vs-new before the rewrite is accepted — any mismatch keeps the
   original. Since the ops are appended at the enum end, the `VarX..VarV` range tests
@@ -1849,6 +1848,90 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   distance. Exterior distances are provably exact (a buried triangle can never be nearer to
   an exterior point than the boundary the segment to it crosses), and the exterior is what
   the feature is for.
+
+  **The non-stationary idiom, and the CSE it forced (O3 close-out, v0.164.0).** `curv`,
+  `cavity` and `sdf` are three answers to one question, and the payoff is not any of them
+  alone but what they let you do to a noise call: *every argument of one is an ordinary
+  expression*, so a scene-aware field can change **what kind** of noise appears where
+  rather than merely how much of it shows. The division of labour that makes this legible
+  is **gate** (where the effect may appear at all — `curv`, `cavity`, cheap and local)
+  versus **field** (what the noise there should look like — an `sdf`, smooth, unbounded,
+  about a named object). Documented in REFERENCE.md → "Putting them together —
+  non-stationary noise", cross-referenced from FTSL.md §6, worked in
+  `scenes/pattern_nonstationary.ftsl` (one `sdf` around a hovering bead driving three
+  surfaces with three different gates).
+
+  Two of the three traps written up there are properties of *this implementation*, not
+  folklore, and both were found by reading the code rather than by rendering:
+  `povDTurbulence` truncates its octave count (`int oct = (int)octaves`) and Worley rounds
+  its metric to `0..2`, so a field-driven value of either **pops at integer contours**
+  instead of fading. The correct idioms are to fade the extra octave's *amplitude*
+  (centred on zero, so detail arrives without shifting the mean) and to drive `metric`
+  with a step. The third trap is analytic: `noise(k(p)·p)` has local frequency
+  `k + p·dk/dp`, which is not the `k` requested, depends on distance from the *origin*,
+  and shears the pattern into streaks along `∇k` — so crossfade two **fixed** frequencies,
+  `mix(noise(3*p), noise(16*p), t)`.
+
+  A fourth lesson came out of the demo render rather than the code, and is now in both the
+  scene's header and the REFERENCE section: a correct crossfade can still be *invisible*,
+  and for two independent reasons.
+
+  * `mix` of two independent noises has **half their variance**, so the half-way band is a
+    flat grey smear. The stretch belongs **after** the blend
+    (`smoothstep(0.38, 0.62, mix(a, b, t))`), which re-normalises it at every `t`, not on
+    each band before it, which does not.
+  * The ramp has to be **matched to the distances that actually occur**. This was measured,
+    not guessed, by rendering the raw `grid:bead` value as a reflectance and dividing (in
+    *linear* light — the tone map otherwise flatters every ratio toward 1) by a constant-1
+    render of the same frame. The answer: the bead hovers 0.30 m up, so no floor point is
+    nearer than 0.21 m and the far corners are only ~0.9 m away — the entire floor lives
+    inside a single 2:1 span. The 0.35..0.85 m ramp that "obviously" spanned the room in
+    fact held the whole visible floor between t = 0.9 and t = 1.0, showing the fine band
+    alone and looking perfectly stationary. 0.26..0.58 m reads immediately.
+
+  Related, and already documented in the scene: `cavity_radius` larger than the feature it
+  is probing (0.22 m on a 0.22 m plinth) saturates the mask to a flat 1. The general shape
+  of both mistakes is the same — a field-driven mask is only as good as the match between
+  its transfer curve and the range the field actually takes on the surface being shaded.
+
+  The idiom then ran straight into a real cost. The expression language has **no local
+  variables** (no `let`, and a pattern cannot name another pattern), so a field that gates
+  one term and steers another must be spelled out at every site — six times in the worked
+  scene's `wear` pattern. Every one of those was a separate trilinear lattice fetch,
+  because CSE had never been applied to material patterns at all (it was wired only at
+  `addFunctionLeaf`, for isosurface `function` exprs) and, worse, `patOpStackEffect`
+  returned `false` for `Grid`/`Scatter`, which would have made the pass bail on the whole
+  expression even if it had run. So documenting the idiom honestly required making it
+  cheap:
+
+  * `patOpStackEffect` and `patternOptimizeCSE` take an optional `const PatTables*`. A
+    table op's arity is the **table's** `ndim`, which is nowhere in the program, so it can
+    only be answered by whoever knows which tables the program will be evaluated against.
+    The clamp applied there is deliberately the *evaluator's* (`[1, PAT_ND_MAX_DIM]`), not
+    the header's nominal value: what has to match is the actual pop count.
+  * §6's probe contexts now bind those tables. Unbound, `patternEval` abandons the whole
+    program at a `Grid` and returns 0.0 — so both sides would have compared equal no
+    matter how wrong the re-emission was, i.e. the safety net would have silently stopped
+    catching anything on exactly the programs it was newly being asked to cover. The probe
+    rows also gained `curv`/`cavity` columns for the same reason: a variable left at 0 is
+    a variable the comparison is not exercising.
+  * `Builder::optimizePatterns` runs **last** in `build()` — after `setupCavity`,
+    `warnCurvOnFlatGeometry`, `checkEmitPatsSupported` — over every `Scene::patterns`
+    program and every `Medium::density`/`ior`. CSE preserves the first occurrence of every
+    op, so those analyses would still be correct if reordered, but running it last means
+    no future analysis has to know that `LdReg` exists.
+  * `addFunctionLeaf` now passes the tables too, so a `grid:`-sampling field formula is
+    optimized as well. It stays a separate call site because the program is about to be
+    appended to a *shared* node pool holding one leaf after another, and the pass requires
+    a single-rooted program.
+
+  Measured on `scenes/pattern_nonstationary.ftsl` via the new opt-in `FTRACE_CSE_DEBUG`
+  (same shape as `FTRACE_CHUNK_DEBUG`; the report is the only way to see a pass that is
+  bit-identical by construction): `pattern 2: 126 -> 71 nodes, 6 -> 1 table sample(s)`.
+  Table samples are reported separately from nodes because a `grid:` fetch is 8 pool reads
+  and a trilinear blend, so the node count alone understates it. `-checkgrid` §(h) pins
+  all three behaviours — shrinks and emits `LdReg` with tables in hand, stays bit-identical
+  over 64 probe points, and **declines**, leaving the program untouched, without them.
 
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as

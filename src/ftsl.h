@@ -954,7 +954,80 @@ public:
         warnCurvOnFlatGeometry(L);
         // Decide whether any cavity probe rays will ever be fired, and how far.
         setupCavity(L);
+        // LAST: collapse repeated subexpressions in every shading-hot program.
+        optimizePatterns(L);
         return true;
+    }
+
+    // Run the CSE pass over every pattern program that a render will evaluate per
+    // shading point — material `pattern` blocks and medium density/ior programs.
+    //
+    // WHY THIS EXISTS AT ALL. The expression language has no local variables: there is
+    // no `let`, and a pattern cannot reference another pattern. So a scene-aware field
+    // that drives several terms at once — the non-stationary idiom, where the same
+    // `1 - smoothstep(lo, hi, grid:d(x, y, z))` gates one term and steers another — has
+    // to be written out in full at every site it appears. Eight uses would be eight
+    // trilinear lattice fetches per shading point if the repeats survived compilation.
+    // With this pass they collapse to one evaluation and one register load each, which
+    // is what lets REFERENCE.md tell an author to repeat the field freely instead of
+    // hand-unrolling their scene around a performance trap.
+    //
+    // WHY LAST. It runs after every pass that INSPECTS a compiled program — setupCavity
+    // (does any pattern read `cavity`, and how far should the probe reach),
+    // warnCurvOnFlatGeometry, checkEmitPatsSupported, rejectUnbakedSdf. CSE keeps the
+    // first occurrence of every op and only rewrites LATER ones, so those analyses would
+    // still be correct afterwards, but ordering them before it means none of them has to
+    // know that — a future analysis can be added anywhere above without a hidden
+    // requirement to also handle LdReg.
+    //
+    // WHY THE TABLES. `grid:`/`scatter:` pop as many operands as the named table has
+    // dimensions, which is not in the program, so patternOptimizeCSE has to be handed
+    // the same table set the program will be evaluated against or it cannot model the
+    // op and gives up on the whole expression. patTables() is safe to take here: it is
+    // used and discarded within this call, and the Scene is not moved in between.
+    //
+    // NOT DONE HERE: `implicit`/`function` field formulas (already CSE'd individually at
+    // compile time, before being appended to a SHARED node pool — the pool holds several
+    // programs end to end and is not the single-rooted program this pass requires), and
+    // record / camera_curve drivers (evaluated per frame, not per shading point).
+    void optimizePatterns(Loaded& L) {
+        const PatTables tabs = L.scene.patTables();
+        // Opt-in report (FTRACE_CSE_DEBUG, same shape as FTRACE_CHUNK_DEBUG): the pass is
+        // bit-identical by construction, so a render can never SHOW whether it fired — a
+        // program it silently declined costs N lattice fetches and looks exactly right.
+        // This is the only way to see it, and the only cost when the variable is unset is
+        // one getenv per load.
+        static const bool dbg = std::getenv("FTRACE_CSE_DEBUG") != nullptr;
+        long long before = 0, after = 0;
+        // Table samples are reported separately from the node total because they are the
+        // expensive op, not just another node: a `grid:` fetch is 8 pool reads and a
+        // trilinear blend, so "6 -> 1 table samples" is the number that matters and a
+        // node count alone would understate it.
+        auto nTab = [](const std::vector<PatNode>& p) {
+            int k = 0;
+            for (const PatNode& nd : p)
+                if (nd.op == PatOp::Grid || nd.op == PatOp::Scatter) ++k;
+            return k;
+        };
+        auto run = [&](std::vector<PatNode>& prog, const char* what, const std::string& who) {
+            const size_t n0 = prog.size();
+            const int t0 = nTab(prog);
+            patternOptimizeCSE(prog, &tabs);
+            before += (long long)n0; after += (long long)prog.size();
+            if (dbg && prog.size() != n0)
+                std::fprintf(stderr, "[cse] %s %s: %zu -> %zu nodes, %d -> %d table sample(s)\n",
+                             what, who.c_str(), n0, prog.size(), t0, nTab(prog));
+        };
+        for (size_t i = 0; i < L.scene.patterns.size(); ++i)
+            run(L.scene.patterns[i].nodes, "pattern", std::to_string(i));
+        for (size_t i = 0; i < L.scene.media.size(); ++i) {
+            run(L.scene.media[i].density, "medium density", std::to_string(i));
+            run(L.scene.media[i].ior,     "medium ior",     std::to_string(i));
+        }
+        if (dbg)
+            std::fprintf(stderr, "[cse] total %lld -> %lld nodes over %zu pattern(s), "
+                                 "%zu medium/media\n",
+                         before, after, L.scene.patterns.size(), L.scene.media.size());
     }
 
     // Remove every `mesh { shape_only yes }` group's triangles from Scene::tris.
@@ -5325,7 +5398,21 @@ private:
         // CSE the compiled program: field formulas are the sphere-trace's inner loop
         // (every march step + shadow ray runs this program), and machine-generated
         // exprs repeat whole subtrees. Bit-identical by construction (see pattern.h).
-        patternOptimizeCSE(prog);
+        //
+        // Here rather than in optimizePatterns because the program is about to be
+        // APPENDED to a shared node pool that holds one leaf after another; the pass
+        // needs a single-rooted program, which this is and the pool is not.
+        //
+        // Handing over the tables is what lets a `grid:`-sampling field be optimized at
+        // all — `grid:terrain(x, z)` repeated across a min/max CSG tree is exactly the
+        // case worth collapsing. The headers carry their `ndim` from the data pass (an
+        // `sdf`'s is reserved at registration), which is all the arity model needs; the
+        // sdf SAMPLES are still zero this early, but that only makes the pass's probe
+        // comparison weaker, never wrong — both sides read the same zeros.
+        {
+            const PatTables tabs = loadedRef_ ? loadedRef_->scene.patTables() : PatTables{};
+            patternOptimizeCSE(prog, &tabs);
+        }
         Affine L2W;
         for (int k = 0; k < 9; ++k) L2W.m[k] = L_ * authoredXf.m[k];
         L2W.t = authoredXf.t * L_;

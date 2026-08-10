@@ -1,0 +1,285 @@
+# pattern_nonstationary.ftsl — the O3 idiom: noise whose PARAMETERS vary in space.
+#
+# Every noise primitive in the language is STATIONARY. `noise`, `dturb`, `worley` are
+# functions of position, so their statistics are the same everywhere: one grain size,
+# one contrast, one character, tiled over the whole world. That is why procedural
+# texture so often reads as wallpaper — the pattern describes the SPACE, not the object
+# sitting in it, and moving the object slides the pattern off it.
+#
+# The fix is not another noise. It is that every ARGUMENT of a noise call is an ordinary
+# expression, so any of them can be driven by a field — and the language has three
+# fields that know something about the scene:
+#
+#   `curv`               the shape of the surface I am on   (local, a 2nd derivative)
+#   `cavity`             how enclosed this point is         (non-local, short probe)
+#   `grid:<sdf>(x,y,z)`  how far I am from THAT object      (non-local, unbounded)
+#
+# THE DIVISION OF LABOUR THIS SCENE IS BUILT TO SHOW. It is tempting to use all three
+# the same way — as a mask multiplied over some noise — and that is the weakest thing
+# they do, because multiplying only changes how VISIBLE the noise is, never what it
+# looks like. The stronger idiom splits the job in two:
+#
+#   a GATE says WHERE the effect may appear at all
+#   a FIELD says WHAT KIND of noise appears there
+#
+# One field (the distance to the glowing bead) plays the second role on all three
+# surfaces below, and each surface has a different gate — or none:
+#
+#   FLOOR    NO gate: the mottle covers the whole floor at full strength, everywhere.
+#            The only thing the distance field touches is its STATISTICS — a 4-per-metre
+#            swell in the far corner crossfading to a 22-per-metre grain under the bead,
+#            with a third, finer octave fading in on top of it. Nothing gets brighter or
+#            more visible as you approach the bead; it gets FINER. That is the whole
+#            claim of non-stationary texture, in one surface.
+#   PLINTH   gated by `cavity`, so the pale deposit collects only where the form
+#            encloses — the seam around the plinth's base and the contact circle where
+#            the ring rests on it. Same crossfaded noise as the floor, so the deposit
+#            near the bead is a tight crust and the deposit at the far end is a coarse
+#            mottle. Every face of this box is FLAT, which is the point: a curvature
+#            mask would find nothing here at all.
+#   RING     gated by `curv`, so bare metal shows only on the most convex band. The wear
+#            noise is DOMAIN-WARPED and the warp amount is the distance to the bead:
+#            near it the patch outlines are marbled and torn, on the far side the same
+#            patches have smooth, lazy edges.
+#
+# WHY A CROSSFADE, AND NOT `noise(k*x, …)` WITH A VARYING k. Scaling the coordinate by a
+# field is the obvious way to "vary the frequency", and it is a trap: the local frequency
+# of noise(k(p)*p) is d/dp (k(p)*p) = k + p*dk/dp, so what you get is not the k you asked
+# for, it depends on how far you are from the ORIGIN, and the extra term shears the
+# pattern into streaks along the gradient of k. Crossfading two noises evaluated at two
+# FIXED frequencies has none of that: each term is a proper stationary noise and only the
+# blend weight moves. `mix(noise(3*p), noise(16*p), t)` is the whole idiom.
+#
+# MAKING THE CROSSFADE ACTUALLY READ. Two things have to be got right or the effect is
+# invisible even though the maths is correct, and both were wrong in the first draft of
+# this scene:
+#
+#   1. A blend of two INDEPENDENT noises has LESS CONTRAST than either of them — the
+#      variance of (a+b)/2 is half the variance of a — so the halfway ring comes out as a
+#      flat grey smear between two textures you can no longer see. Put the contrast stretch
+#      AFTER the blend, not on each band before it: `smoothstep(0.38, 0.62, mix(a, b, t))`
+#      re-normalises whatever the blend hands it, so the midpoint reads as an intermediate
+#      grain at full strength instead of as a washed-out average of two.
+#   2. The ramp has to be matched to the distances that actually OCCUR on the surface, and
+#      short enough that both of its ends own real area. Measure them rather than guessing:
+#      the bead hovers 0.30 m up, so no floor point is nearer than 0.21 m, and the far
+#      corners of this small room are only ~0.9 m away — the whole floor lives inside one
+#      2:1 span of distance. A ramp of 0.35..0.85 m (the first draft) therefore left almost
+#      the entire visible floor sitting between t = 0.9 and t = 1.0, i.e. showing the fine
+#      band alone and looking perfectly stationary. 0.26..0.58 puts pure fine grain inside
+#      a 0.18 m circle under the bead, pure coarse swell outside a 0.60 m one, and the
+#      crossfade in the annulus between them.
+#
+# WHY NOT A VARYING `octaves` EITHER. `dturbx(…, octaves, …)` truncates its octave count
+# to an integer, so driving it with a field does not add detail smoothly — it POPS along
+# the contour where the field crosses each integer, and the seam is visible. Fade the
+# extra octave's AMPLITUDE in instead, as the floor does with `t*0.30*(noise(60*p) - 0.5)`:
+# centred on zero so it adds detail without shifting the mean, and continuous everywhere.
+#
+# NO LOCAL VARIABLES. The expression language has no `let` and a pattern cannot name
+# another pattern, so the nearness field is written out in full at every site that uses
+# it — six times in "wear" alone. That is not the cost it looks like: the loader runs a
+# common-subexpression pass over every compiled pattern, so the repeats collapse to one
+# evaluation and one lattice fetch per shading point. Watch it happen with
+#
+#   set FTRACE_CSE_DEBUG=1
+#
+# which on this scene reports `pattern 2: 126 -> 71 nodes, 6 -> 1 table sample(s)`.
+# Write the field out as many times as the idiom needs; repeating it is free.
+#
+# The two meshes are not in the repository (`*.obj` is git-ignored); regenerate them
+# byte-for-byte with the checked-in generator. `--smooth` is not optional — without
+# analytic per-vertex normals `curv` reads 0 and the ring's gate never opens:
+#
+#   python tools/make_mesh.py torus  --nu 200 --nv 100 --major 0.32 --minor 0.20 \
+#                             --smooth -o scenes/torus_fat.obj
+#   python tools/make_mesh.py sphere --subdiv 3 --radius 0.09 --smooth -o scenes/bead.obj
+#
+#   ftrace -in scenes/pattern_nonstationary.ftsl -mode D -noise 3 \
+#          -window -keepwindow -o png/pattern_nonstationary.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+
+    # 12 cm. `cavity_radius` IS the look, and the failure mode in both directions is on
+    # display here: the 5.6 cm default (2% of this room's diagonal) makes the seams a
+    # 3-pixel liner you cannot see across the room, while 22 cm is *taller than the
+    # plinth*, so every point on it is within reach of the floor and the mask saturates
+    # to a flat 1 over the whole box — a crust that covers everything says nothing.
+    cavity_radius  0.12
+    cavity_samples 24
+}
+
+# ---------------------------------------------------------------------------
+# The macro field: signed distance to the glowing bead, in metres.
+#
+# `pad 1.0` is the number that matters. The lattice is the bead's own 18 cm bounding box
+# grown by the padding, and OUTSIDE it the sampler clamps — so a mask keyed on this field
+# simply stops changing past the padding. Every ramp in this file finishes by 0.58 m, so
+# the padding only has to comfortably exceed that; the default (a quarter of the longest
+# axis, i.e. 4.5 cm here) would leave the whole room sitting on the clamped edge value,
+# reading one constant. Padding much beyond the longest ramp is not free either — it is
+# the same `res` spread over a bigger box.
+#
+# `res` is samples along the longest padded axis, so 128 over 2.18 m is a 1.7 cm voxel.
+# Distances are measured exactly where the bake seeds and sweeps them, so `res` buys
+# spatial resolution, not accuracy — and a distance-to-a-sphere field is about the
+# smoothest thing a lattice can be asked to hold.
+# ---------------------------------------------------------------------------
+sdf "bead" { object "bead"  res 128  pad 1.0 }
+
+# ---------------------------------------------------------------------------
+# FLOOR — the same texture everywhere, at two different grain sizes.
+#
+# There is no gate in this expression: `mix(a, b, t)` is a convex combination, so the
+# mottle is exactly as strong under the bead as it is in the far corner. `t` is the
+# nearness — 1 within 0.26 m of the bead, 0 past 0.58 m — and all it does is choose WHICH
+# noise you are looking at. The blend is contrast-stretched AFTER the fact, for the reason
+# in the header. The third term is the continuously faded octave: centred on zero (hence
+# the `- 0.5`) so that fading it in adds detail without brightening anything.
+# ---------------------------------------------------------------------------
+pattern "grain" {
+    expr "0.10 + 0.80 * (smoothstep(0.38, 0.62,
+                             mix(noise( 4.0*x,  4.0*y,  4.0*z),
+                                 noise(22.0*x, 22.0*y, 22.0*z),
+                                 1 - smoothstep(0.26, 0.58, grid:bead(x, y, z))))
+                         + (1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))
+                           * 0.30 * (noise(60*x, 60*y, 60*z) - 0.5))"
+}
+
+# ---------------------------------------------------------------------------
+# PLINTH — `cavity` gates, the distance field sets the grain.
+#
+# `cavity` reads ~0 on an open face, ~0.5 in a right-angled interior corner and rises
+# toward 1 down a crevice, so 0.04..0.34 selects the seams and leaves the open faces
+# clean. Note the gate does not mention the bead at all: the deposit is equally strong at
+# both ends of the plinth, and only its grain changes.
+#
+# The 0.25 floor under the noise keeps the deposit continuous rather than breaking it
+# into islands, and it also hides `cavity`'s banding: the probe direction set is
+# deterministic (which is what makes the mask noise-free and identical on CPU and GPU)
+# and the price of that is quantisation into at most `cavity_samples + 1` levels.
+# ---------------------------------------------------------------------------
+pattern "crust" {
+    expr "smoothstep(0.04, 0.34, cavity) *
+          (0.25 + 0.75 * smoothstep(0.38, 0.62,
+                             mix(noise( 4.5*x,  4.5*y,  4.5*z),
+                                 noise(30.0*x, 30.0*y, 30.0*z),
+                                 1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))))"
+}
+
+# ---------------------------------------------------------------------------
+# RING — `curv` gates, the distance field warps.
+#
+# The gate is calibrated the way scenes/pattern_curvature.ftsl explains: torus_fat.obj
+# runs H = -1.67 (throat) .. +2.50 (tube top) .. +3.46 (outer equator) as authored, and
+# curvature is 1/length so `scale 0.5` DOUBLES it — the ring below sees
+# H = -3.33 .. +5.00 .. +6.92, and 5.2..6.4 is therefore the outer, upper face of the
+# tube: everything from the equator round to about 75 degrees above it.
+#
+# The warp is the second factor. Each coordinate of the wear noise is displaced by the
+# matching component of a `dturb` vector, scaled by the nearness SQUARED — the transfer
+# curve is yours to choose, and squaring keeps the warp local to the bead instead of
+# smearing weakly over the whole ring. The tight smoothstep(0.42, 0.62) turns the noise
+# into hard-edged patches, so the warp shows up as the SHAPE of their outlines rather
+# than as a general blur.
+# ---------------------------------------------------------------------------
+pattern "wear" {
+    expr "smoothstep(5.2, 6.4, curv) *
+          smoothstep(0.42, 0.62,
+              noise(16*x + 2.2*(1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))
+                             * (1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))
+                             * dturbx(5*x, 5*y, 5*z, 4, 2, 0.5),
+                    16*y + 2.2*(1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))
+                             * (1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))
+                             * dturby(5*x, 5*y, 5*z, 4, 2, 0.5),
+                    16*z + 2.2*(1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))
+                             * (1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))
+                             * dturbz(5*x, 5*y, 5*z, 4, 2, 0.5)))"
+}
+
+# ---------------------------------------------------------------------------
+# Materials. In a `mix`, weight 1 selects the FIRST layer, so the layer the mask means
+# by "1" is written first — pale before dark, bare metal before paint.
+# ---------------------------------------------------------------------------
+material "white"    { type diffuse reflect whitewall 0.75 }
+material "paint"    { type diffuse reflect rgb 0.13 0.42 0.38 }
+material "steel"    { type glossy  reflect rgb 0.86 0.86 0.88  roughness 0.40 }
+material "concrete" { type diffuse reflect rgb 0.19 0.18 0.17 }
+material "pale"     { type diffuse reflect rgb 0.74 0.71 0.65 }
+# The deposit is PALER still. A seam is already dark from ambient occlusion, so a dark
+# crust there is indistinguishable from the shadow that was going to be there anyway;
+# nothing makes a surface brighter except something actually deposited on it.
+material "mineral"  { type diffuse reflect rgb 0.90 0.86 0.75 }
+# A near-black body radiating a warm spectrum: `emit` is what makes every triangle bound
+# to it an emitter, and binding it to a `mesh {}` is what makes it sampleable as a light.
+material "hot"      { type diffuse reflect rgb 0.02 0.02 0.02  emit preset:bb2800 }
+
+material "grainmat" { type mix layer "pale"    0.5 layer "concrete" 0.5 weight_map pattern:grain }
+material "crustmat" { type mix layer "mineral" 0.5 layer "concrete" 0.5 weight_map pattern:crust }
+material "wearmat"  { type mix layer "steel"   0.5 layer "paint"    0.5 weight_map pattern:wear  }
+
+# ---------------------------------------------------------------------------
+# A 2.0 x 1.2 x 1.5 m room.
+# ---------------------------------------------------------------------------
+quad { origin 0 0 0     u 2 0 0    v 0 0 1.5   material grainmat }   # floor
+quad { origin 0 1.2 0   u 0 0 1.5  v 2 0 0     material white }      # ceiling
+quad { origin 0 0 0     u 2 0 0    v 0 1.2 0   material white }      # back
+quad { origin 0 0 0     u 0 0 1.5  v 0 1.2 0   material white }      # left
+quad { origin 2 0 0     u 0 1.2 0  v 0 0 1.5   material white }      # right
+
+# The plinth: 0.85 x 0.22 x 0.60, pushed back and to the right so that open floor wraps
+# around it on two sides. That is a framing decision with a reason: the floor is the
+# surface carrying the claim of this scene, and the region of it with the most to say —
+# directly under the bead, where the grain is finest — must not be the region a prop is
+# standing on.
+isosurface {
+    material crustmat
+    box { size 0.85 0.22 0.60   center 1.42 0.11 0.62 }
+}
+
+# The ring, resting on the plinth. torus_fat.obj is 1.04 m across and 0.40 m thick as
+# authored; at `scale 0.5` that is a 0.52 m ring of 0.10 m tube, so a centre height of
+# 0.22 + 0.10 = 0.32 puts it exactly in contact — and that contact circle is where the
+# plinth's own `cavity` gate picks up its second band. Note what produces it: two
+# SEPARATE objects, each of them locally flat or gently curved where they meet. No
+# property of the plinth alone, and no curvature of either, could put a mark there.
+mesh {
+    file "scenes/torus_fat.obj"
+    material wearmat
+    translate 1.42 0.32 0.62
+    scale 0.5
+}
+
+# The bead: the object the distance field measures, and a warm accent light. It hovers
+# over bare floor rather than resting on anything, which is deliberate — the whole reason
+# to reach for an `sdf` is that the field does not care whether the object it measures
+# touches, or is even reachable from, the surface being shaded. Directly beneath it the
+# floor is 0.21 m from the metal, so the fine grain is at full strength there; the 0.58 m
+# end of the ramp is a circle of radius 0.60 m around that spot, and the floor is 2.0 x
+# 1.5 m, so both regimes and the ring between them all fit in one frame.
+mesh "bead" {
+    file "scenes/bead.obj"
+    material hot
+    translate 0.72 0.30 0.95
+    lumens 450
+}
+
+# The key light is the ceiling panel, not the bead. That matters for reading the image:
+# if the bead lit the room the near half would simply be BRIGHTER, and a brightness
+# gradient is exactly what this scene is claiming not to be about. It is nearly the whole
+# ceiling so the floor is lit flatly from end to end — a pool of light would be another
+# gradient competing with the one thing worth looking at.
+light area {
+    origin 0.06 1.199 0.06   u 1.88 0 0   v 0 0 1.38   normal 0 -1 0
+    spd preset:bb6500
+    lumens 34000
+}
+
+# High and looking well down: the floor is the canvas, so it gets the frame.
+camera "cam" {
+    eye 1.05 1.06 2.45   look_at 1.02 0.03 0.80   up 0 1 0   fov_y 44
+    mode D
+    film { res 800 450 }
+}

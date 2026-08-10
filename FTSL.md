@@ -683,6 +683,25 @@ checks every lattice sample against it exactly. `scenes/pattern_sdf.ftsl` render
 that isolates the feature — a ring hovering clear of the floor, so `curv` (the floor is
 flat) and `cavity` (nothing touches it) both read 0 and only a distance field can see it.
 
+**Using `curv`, `cavity` and `sdf` together.** Each one on its own is a mask; the reason
+they exist is that every argument of a noise call is an ordinary expression, so a
+scene-aware field can change *what kind* of noise appears where — not merely how much of
+it shows. `curv` and `cavity` are natural **gates** (where the effect may appear at all);
+an `sdf` is a natural **field** (what the noise there should look like). Two approaches
+look obvious and are wrong: driving a frequency by scaling the coordinate (it shears the
+pattern into streaks, and the resulting frequency is not the one you asked for), and
+driving `octaves` or Worley's `metric` with a ramp (both are truncated to integers, so
+they pop at contours instead of fading). Both have a correct idiom, written up with the
+calculus in **REFERENCE.md → "Putting them together — non-stationary noise"**; the worked
+scene is `scenes/pattern_nonstationary.ftsl`.
+
+Repeating a field costs nothing. The expression language has no local variables and a
+pattern cannot name another pattern, so a field driving several terms must be spelled out
+at each one — but the loader runs a common-subexpression pass over every compiled
+`pattern` and every medium `density`/`ior` program, so the repeats collapse to a single
+evaluation, and a repeated `grid:`/`sdf` read to a single lattice fetch.
+`FTRACE_CSE_DEBUG=1` prints what it collapsed.
+
 **Inline array literals — `[0 1](u)`:** most of the tables an author actually writes are
 three numbers long and used exactly once, and giving each of those a name, a block and a
 `pattern` wrapper is more ceremony than content. So an array may be written **where it is

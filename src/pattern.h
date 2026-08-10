@@ -1206,6 +1206,19 @@ inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
 // ray bottoms out in patternEval / dPatternEval[F]), collapsing those repeats is a
 // direct hot-path win on BOTH backends: the optimized program is what gets uploaded.
 //
+// HAND-WRITTEN patterns repeat subtrees for a different and unavoidable reason: the
+// expression language has no local variables. There is no `let`, so a scene-aware
+// field that gates one term and steers another — the non-stationary idiom, where the
+// same `1 - smoothstep(lo, hi, grid:d(x, y, z))` appears at every site it drives —
+// has to be spelled out in full at each site. Without CSE an eight-use field is eight
+// trilinear lattice fetches per shading point; with it, one. So this pass runs over
+// every material `pattern` program and every medium density/ior program too, not just
+// field formulas, and that is what makes "write it out as many times as you need"
+// honest advice rather than a performance trap. It is also why Grid/Scatter arity is
+// resolved from the scene's tables below instead of bailing: a program built around a
+// repeated `grid:` sample is precisely the one with the most to gain, and refusing to
+// model the op would have switched the optimizer off for exactly those programs.
+//
 // Method: simulate the postfix stack, hash-consing every (op, payload, children)
 // node into a DAG. Any interior node the DAG reaches >= 2 times becomes a register
 // candidate; the top PAT_CSE_REGS by saved-work get a register. The program is then
@@ -1219,15 +1232,20 @@ inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
 // returns precisely what the recomputation would have. No arithmetic is folded,
 // reordered or changed; the emission order of the surviving nodes is the original
 // post-order. The optimizer additionally refuses anything it cannot prove out:
-// unknown arities (Grid/Scatter — table-dimension arity), already-optimized
-// programs, malformed stacks, and as a final belt-and-braces check it bit-compares
-// original vs optimized at a set of probe points before committing.
+// unknown arities (a Grid/Scatter whose table set was not handed in, or any op added
+// later without a stack-effect line), already-optimized programs, malformed stacks,
+// and as a final belt-and-braces check it bit-compares original vs optimized at a set
+// of probe points before committing.
 // ---------------------------------------------------------------------------
 
 // Stack effect of one node: how many operands it pops and pushes. False when the
 // arity cannot be read from the node alone (Grid/Scatter: the arity is the named
-// table's own dimensionality, which lives outside the program).
-inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes) {
+// table's own dimensionality, which lives outside the program) AND no table set was
+// handed in to look it up in. Pass the scene's `tabs` and those two become knowable,
+// which is what lets a `grid:`-bearing program be optimized at all — see the Grid
+// case below.
+inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes,
+                             const PatTables* tabs = nullptr) {
     pushes = 1;
     if (op >= PatOp::Const && op <= PatOp::VarT)  { pops = 0; return true; }
     if (op == PatOp::VarA)                        { pops = 0; return true; }
@@ -1248,10 +1266,34 @@ inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes) {
     if (op == PatOp::Spec)                        { pops = 1; return true; }
     if (op == PatOp::StReg)                       { pops = 0; pushes = 0; return true; }  // peeks
     if (op == PatOp::LdReg)                       { pops = 0; pushes = 1; return true; }
-    return false;   // Grid / Scatter / anything future: bail out of optimizing
+    // An N-D table sample pops its table's own `ndim` coordinates. That number is not
+    // in the node — the node carries only the resolved table INDEX — so it can only be
+    // answered when the caller supplies the same table set the program will be evaluated
+    // against. Note the clamp: it is deliberately the identical one patternEval applies
+    // (and the device evaluators too), because what must match here is the evaluator's
+    // ACTUAL pop count, not the header's nominal dimensionality. A header claiming ndim 9
+    // pops PAT_ND_MAX_DIM in the VM, so it must pop PAT_ND_MAX_DIM here as well or the
+    // re-emitted program would be modelled with the wrong stack depth.
+    if (op == PatOp::Grid) {
+        if (!tabs || !tabs->grids) return false;
+        const int gi = (int)a;
+        if (gi < 0 || gi >= tabs->nGrids) return false;
+        const int nd = tabs->grids[gi].ndim;
+        pops = nd < 1 ? 1 : (nd > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : nd);
+        return true;
+    }
+    if (op == PatOp::Scatter) {
+        if (!tabs || !tabs->scatters) return false;
+        const int si = (int)a;
+        if (si < 0 || si >= tabs->nScatters) return false;
+        const int nd = tabs->scatters[si].ndim;
+        pops = nd < 1 ? 1 : (nd > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : nd);
+        return true;
+    }
+    return false;   // anything future: bail out of optimizing
 }
 
-inline void patternOptimizeCSE(std::vector<PatNode>& prog) {
+inline void patternOptimizeCSE(std::vector<PatNode>& prog, const PatTables* tabs = nullptr) {
     const int n = (int)prog.size();
     if (n < 4) return;   // nothing worth sharing
     // ---- 1. postfix -> hash-consed DAG --------------------------------------
@@ -1263,7 +1305,7 @@ inline void patternOptimizeCSE(std::vector<PatNode>& prog) {
         const PatNode& nd = prog[i];
         if (nd.op == PatOp::StReg || nd.op == PatOp::LdReg) return;  // already optimized
         int pops, pushes;
-        if (!patOpStackEffect(nd.op, nd.a, pops, pushes)) return;    // unknown arity
+        if (!patOpStackEffect(nd.op, nd.a, pops, pushes, tabs)) return;  // unknown arity
         if (pops > (int)stk.size()) return;                          // malformed program
         DagNode dn; dn.op = nd.op; dn.a = nd.a;
         dn.kids.assign(stk.end() - pops, stk.end());
@@ -1348,7 +1390,7 @@ inline void patternOptimizeCSE(std::vector<PatNode>& prog) {
         int sp = 0, maxSp = 0;
         for (const PatNode& nd : out) {
             int pops, pushes;
-            if (!patOpStackEffect(nd.op, nd.a, pops, pushes)) return;
+            if (!patOpStackEffect(nd.op, nd.a, pops, pushes, tabs)) return;
             if (pops > sp) return;
             sp += pushes - pops;
             if (sp > maxSp) maxSp = sp;
@@ -1356,20 +1398,31 @@ inline void patternOptimizeCSE(std::vector<PatNode>& prog) {
         if (sp != 1 || maxSp > 64) return;   // evaluator stack is 64 deep
     }
     // ---- 6. belt-and-braces: bit-compare original vs optimized ---------------
-    static const double probe[6][11] = {
-        // x      y      z      f    nx     ny     nz     r      u      v      t
-        { 0.31, -1.27,  2.63, 0.05, 0.27,  0.53, -0.80, 2.93,  0.37,  0.71, 0.13},
-        {-2.11,  0.04, -0.57, -0.2, -0.7,  0.10,  0.70, 2.19,  0.93,  0.08, 0.77},
-        { 5.02,  3.33, -4.19, 1.30, 0.57, -0.57,  0.59, 7.25,  0.11,  0.99, 0.42},
-        {-0.02, -0.03,  0.01, 0.00, 0.00,  1.00,  0.00, 0.04,  0.50,  0.50, 0.00},
-        { 12.7, -8.31,  0.66, -3.1, 0.80,  0.00, -0.60, 15.2,  0.66,  0.25, 1.00},
-        {-0.99,  0.98, -0.97, 0.42, -0.5,  0.50, -0.70, 1.70,  0.01,  0.02, 0.55},
+    // Every free variable the VM has gets a DISTINCT non-zero value on at least one
+    // row. A column left at 0 would make any subtree that reads it collapse to the same
+    // constant on both sides and pass the comparison without exercising anything — so
+    // `curv` and `cavity` carry real values here even though they are leaves.
+    static const double probe[6][13] = {
+        // x      y      z      f    nx     ny     nz     r      u      v      t    curv  cavity
+        { 0.31, -1.27,  2.63, 0.05, 0.27,  0.53, -0.80, 2.93,  0.37,  0.71, 0.13,  4.10, 0.23},
+        {-2.11,  0.04, -0.57, -0.2, -0.7,  0.10,  0.70, 2.19,  0.93,  0.08, 0.77, -1.75, 0.86},
+        { 5.02,  3.33, -4.19, 1.30, 0.57, -0.57,  0.59, 7.25,  0.11,  0.99, 0.42, 21.30, 0.05},
+        {-0.02, -0.03,  0.01, 0.00, 0.00,  1.00,  0.00, 0.04,  0.50,  0.50, 0.00,  0.00, 0.50},
+        { 12.7, -8.31,  0.66, -3.1, 0.80,  0.00, -0.60, 15.2,  0.66,  0.25, 1.00, -0.31, 1.00},
+        {-0.99,  0.98, -0.97, 0.42, -0.5,  0.50, -0.70, 1.70,  0.01,  0.02, 0.55,  7.62, 0.00},
     };
     for (int p = 0; p < 6; ++p) {
         PatCtx c;
         c.x = probe[p][0]; c.y = probe[p][1]; c.z  = probe[p][2]; c.f = probe[p][3];
         c.nx = probe[p][4]; c.ny = probe[p][5]; c.nz = probe[p][6]; c.r = probe[p][7];
         c.u = probe[p][8]; c.v = probe[p][9]; c.t  = probe[p][10];
+        c.curv = probe[p][11]; c.cavity = probe[p][12];
+        // The tables have to be bound or this check quietly stops checking anything: an
+        // unbound Grid/Scatter makes patternEval abandon the WHOLE program and return
+        // 0.0, so both sides would come back 0.0 and compare equal no matter how wrong
+        // the re-emission was. Bound, the probe really does sample the lattice and the
+        // comparison covers the table ops like every other op.
+        patBindTables(c, tabs);
         double v0 = patternEval(prog.data(), n, c);
         double v1 = patternEval(out.data(), (int)out.size(), c);
         if (std::memcmp(&v0, &v1, 8) != 0) return;   // should be unreachable

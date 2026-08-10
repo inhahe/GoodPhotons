@@ -4585,7 +4585,9 @@ the *randomness vocabulary* is thin. Nothing below is started.
       3 components vs an independent re-derivation; DTurb hand-summed octaves + clamp; compile
       path + arity rejects; CSE (component keys the node); range/decorrelation sanity. Demo
       `scenes/pattern_warp.ftsl` (marble, agate, warped value noise); docs in FTSL.md §6.1 + REFERENCE.md.
-- [ ] **O3 — genuinely *non-stationary* randomness.** Everything above is statistically uniform over
+- [x] **O3 — genuinely *non-stationary* randomness.** ✅ **DONE 2026-08-10** — all four sub-items:
+      `curv` (v0.161.0), `cavity` (v0.162.0), `sdf` (v0.163.0), worked idiom + docs + the pattern
+      CSE it forced (v0.164.0). Everything above is statistically uniform over
       space — the same texture everywhere. The interesting thing the question was actually about is
       randomness whose *parameters vary spatially*: frequency/octaves/amplitude/anisotropy driven by
       another field (curvature, cavity, a `grid:` mask, distance-to-feature, a strain map). The VM can
@@ -4666,8 +4668,90 @@ the *randomness vocabulary* is thin. Nothing below is started.
         `patternHasFreeVars` *and* `patOpStackEffect` (the missing-arity trap that silently disabled
         CSE for whole programs), mutation-test on a shape where the mutation is observable.
         </details>
-  - [ ] **Stage 3 — distance-to-mesh field**, then the worked idiom section pulling all of it
-        together (that is the part of O3 that is genuinely "documentation of what the VM can do").
+  - [x] **Stage 3 — distance-to-mesh field.** ✅ 2026-08-10, v0.163.0. `sdf "halo" { object
+        "ring"  res 128  pad 0.65 }` bakes the signed distance to one named `mesh` onto a
+        lattice and registers it as an ordinary `PatGrid`, read as `grid:halo(x, y, z)`.
+        **Zero new VM opcodes and zero new device code** — the feature is a bake plus a
+        header — which is exactly why it works unchanged at every site `grid:` already
+        works, including a `medium`'s `density`/`ior` program. That last one is the case
+        `curv` and `cavity` structurally cannot reach: a volume has no normal, no UV and no
+        hit point, so a spatial field is the only kind of input it can take.
+
+        The bake (`meshvox::bakeSignedDistance`) is sign from the existing signed-crossing
+        (generalized winding) scanline — so a multi-body model reads as a union rather than
+        hollowing out — then an exact point-triangle narrow band (Ericson's full
+        Voronoi-region routine, not the barycentric-clamp shortcut that is wrong on obtuse
+        triangles), then Bridson closest-**triangle** sweeps. Propagation was originally the
+        feather pass's separable EDT seeded with exact distances; that is not a distance
+        transform (F&H is valid only for BINARY seeds — it adds squares where distance adds
+        lengths) and read a 71.5 mm torus tube as 47 mm: smooth, plausible, 34 % short.
+        Caught by measuring the source mesh in Python rather than trusting the render.
+
+        Load order forced a two-phase split — `reserveSdf` registers the name before patterns
+        compile, `fillSdfs` bakes after geometry loads — plus `rejectUnbakedSdf`, which makes
+        it a load ERROR to read an `sdf` from the two things evaluated *during* the load (a
+        procedural `texture`, a `camera_curve` driver) rather than handing back 0, since 0 in
+        a distance field means "exactly on the surface".
+
+        `-checksdf`: nine sections anchored on axis-aligned **boxes**, which carry no
+        tessellation error and have a closed-form signed distance, so bake and analytic are
+        the same number at every lattice sample (2e-6, i.e. float storage precision) instead
+        of merely close. It caught a real bug while being written: `SdfBake` was produced
+        x-fastest but `PatGrid` is axis-0-outermost, so the published field was transposed —
+        invisible in every aggregate statistic, visible only by sampling through
+        `patGridSample`. Demo `scenes/pattern_sdf.ftsl` (a ring hovering clear of the floor,
+        where `curv` reads 0 because the floor is flat and `cavity` reads 0 because nothing
+        touches it), docs in FTSL.md §6, REFERENCE.md, design.md, known-issues.md.
+  - [x] **The worked idiom section** pulling `curv` + `cavity` + `sdf` together — the part of
+        O3 that is genuinely "documentation of what the VM can do". **DONE v0.164.0.**
+
+        REFERENCE.md → "Putting them together — non-stationary noise" (linked from the TOC,
+        cross-referenced from FTSL.md §6), demo `scenes/pattern_nonstationary.ftsl`.
+        The thesis: every noise primitive is *stationary*, so what makes texture describe the
+        OBJECT rather than the SPACE is that every ARGUMENT of a noise call is an ordinary
+        expression. The organising distinction is **gate** (where the effect may appear —
+        `curv`, `cavity`) vs **field** (what kind of noise appears there — an `sdf`);
+        amplitude masking is the weakest use, because it only changes visibility. One `sdf`
+        around a hovering bead drives all three surfaces: the floor with NO gate (pure
+        coarse→fine crossfade at full strength everywhere), the plinth gated by `cavity`
+        (every face flat, so a curvature mask would find nothing), the ring gated by `curv`
+        with the field spent on a domain warp.
+
+        Three traps, written up with the reasons: (1) varying frequency by scaling the
+        coordinate — local frequency of `noise(k(p)·p)` is `k + p·dk/dp`, so it is not the k
+        asked for, it depends on distance from the origin, and it shears into streaks along
+        ∇k; (2) varying `octaves` or Worley `metric`, both truncated/rounded in this
+        implementation (`int oct = (int)octaves`, pov_noise.h:3142) so a field-driven value
+        POPS at integer contours — fade the extra octave's amplitude instead, centred on
+        zero; (3) no `let` in the expression language, so fields must be repeated.
+
+        Trap 3 required making the claim TRUE first. `patternOptimizeCSE` had only ever been
+        wired at `addFunctionLeaf` (isosurface `function` exprs), never at material patterns,
+        and `patOpStackEffect` returned `false` for `Grid`/`Scatter` (arity lives in the
+        table, not the program), so any `grid:`-bearing program was un-optimizable anyway.
+        Fixed by threading an optional `const PatTables*` through `patOpStackEffect` /
+        `patternOptimizeCSE`, binding tables (plus `curv`/`cavity` columns) into the §6
+        verification probe — unbound, `patternEval` bails at a `Grid` and returns 0.0 on both
+        sides, so the safety net would have silently stopped checking — and adding
+        `Builder::optimizePatterns`, run last in `build()`, over every `Scene::patterns`
+        program and every `Medium::density`/`ior`. New opt-in `FTRACE_CSE_DEBUG=1` reports
+        what collapsed (`pattern 2: 126 -> 71 nodes, 6 -> 1 table sample(s)`); new
+        `-checkgrid` §(h) pins shrink + `LdReg` emission + 64-point bit-identity + the
+        no-tables decline.
+
+        Two staging lessons the render taught, now in the scene header, REFERENCE.md and
+        design.md: `mix` of two independent noises has HALF their variance, so the contrast
+        stretch belongs AFTER the blend (`smoothstep(0.38, 0.62, mix(a, b, t))`), not on each
+        band before it; and the ramp must be matched to the distances that actually occur —
+        measured here by rendering raw `grid:bead` as a reflectance and dividing, in LINEAR
+        light, by a constant-1 render of the same frame. The bead hovers 0.30 m up in a small
+        room, so the whole floor spans only 0.21..0.9 m: the "obvious" 0.35..0.85 ramp held
+        the entire visible floor at t = 0.9..1.0 and looked perfectly stationary. 0.26..0.58
+        with a 4 ⇄ 22 per-metre split reads at a glance. Same failure shape as
+        `cavity_radius` exceeding the feature it probes.
+
+        Scene assets are git-ignored `*.obj`; the header now carries the exact
+        `tools/make_mesh.py` commands, verified to reproduce both meshes byte-for-byte.
 - [ ] **O4 — anisotropic / flow-aligned noise.** Noise stretched and steered along a direction field —
       wood grain following a trunk, hair/fur flow, brushed metal, muscle striation. Needs a per-hit
       tangent frame (partly there via `nx ny nz` + UV derivatives) and a way to bind a flow field.

@@ -32,6 +32,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Implicit surfaces (`isosurface`)](#implicit-surfaces-isosurface)
 - [Textures](#textures)
 - [Procedural patterns (math-driven materials)](#procedural-patterns-math-driven-materials)
+  - [Putting them together — non-stationary noise](#putting-them-together--non-stationary-noise)
 - [Participating media / fog](#participating-media--fog)
 - [Scene language (FTSL)](#scene-language-ftsl)
   - [Conditional blocks (`prefer { … } else { … }`)](#conditional-blocks-prefer----else---)
@@ -2666,6 +2667,134 @@ Deterministic self-test `ftrace -checksdf` (it bakes axis-aligned boxes, which c
 tessellation error and whose signed distance is closed-form, and checks every lattice
 sample against it exactly), worked example `scenes/pattern_sdf.ftsl`. Full syntax in
 FTSL.md §6.
+
+### Putting them together — non-stationary noise
+
+**The problem all three solve.** Every noise primitive in the language — `noise`,
+`dturb*`, `worley*` — is **stationary**: its statistics are the same everywhere. Turn
+one loose on a room and every square metre gets the same grain, the same contrast, the
+same feature size. Real surfaces are not like that. Wear is coarse where a hand grips
+and fine where nothing touches it; frost is chunky near the cold and powdery away from
+it. What changes across the object is not *how much* noise there is but *what kind*.
+
+Nothing in the noise functions offers that, and nothing needs to: **every argument of a
+noise call is an ordinary expression**, so a scene-aware field can drive it. `curv`,
+`cavity` and `grid:<sdf>(x, y, z)` are those fields.
+
+**Gate versus field — the division of labour.** The two jobs are different, and the
+whole idiom is keeping them apart:
+
+* a **gate** says *where* the effect may appear at all. `curv` and `cavity` are gates:
+  cheap, about the surface's own situation, and naturally read through a `smoothstep`
+  into `[0,1]`.
+* a **field** says *what kind* of noise appears there. An `sdf` is the natural one — it
+  is smooth, unbounded, and about a **named** object, so "coarse near the bead" is
+  something you can actually write.
+
+Multiplying a mask over noise is the *weakest* thing you can do with a field, because it
+only changes **visibility** — the noise underneath is identical everywhere and the eye
+reads it as a stencil. What sells non-stationarity is a change of *statistics* on a
+surface that is fully covered.
+
+| Modulate | How | Reads as |
+|---|---|---|
+| Amplitude | `t * noise(k*p)` | a stencil — weakest |
+| Grain | `mix(noise(3*p), noise(16*p), t)` | coarse ⇄ fine |
+| Detail | `noise(k*p) + t*0.30*(noise(4*k*p) - 0.5)` | plain ⇄ busy |
+| Character | `noise(k*p + t*A*dturb*(…))` | regular ⇄ churned |
+| Cell shape | `worley1(…, t)` with `t` a **step** | round ⇄ diamond ⇄ square |
+
+**Trap 1 — do not vary frequency by scaling the coordinate.** The obvious way to make
+noise finer in one place is `noise(k(p) * p)` with `k` driven by a field. It does not
+work. The local frequency of that expression is the derivative of its argument,
+
+```
+d/dp [ k(p)·p ] = k(p) + p · dk/dp
+```
+
+so the pattern's actual frequency is **not** the `k` you asked for; it depends on how far
+`p` happens to be from the *origin* (move the object and the texture changes); and
+because the extra term points along `∇k`, the noise is **sheared into streaks** in the
+direction the field varies. Crossfade two **fixed** frequencies instead —
+`mix(noise(3*p), noise(16*p), t)`. Both operands are stationary and correct, and only the
+blend moves.
+
+**Making the crossfade actually read.** Two things sink it even when the maths is right.
+
+First, a blend of two *independent* noises has **less contrast than either of them** — the
+variance of `(a+b)/2` is half the variance of `a` — so the half-way band arrives as a flat
+grey smear between two textures you can no longer see. Put the contrast stretch **after**
+the blend rather than on each band before it: `smoothstep(0.38, 0.62, mix(a, b, t))`
+re-normalises whatever the blend hands it, so the midpoint reads as an intermediate grain
+at full strength.
+
+Second, **match the ramp to the distances that actually occur** on the surface, and keep
+it short enough that both ends own real area. Measure them, don't guess: in the worked
+scene the bead hovers 0.30 m above the floor, so no floor point is nearer than 0.21 m and
+the far corners of the room are only ~0.9 m away — the whole floor lives inside a single
+2:1 span of distance. A `smoothstep(0.35, 0.85, …)` ramp therefore left almost the entire
+visible floor between `t = 0.9` and `t = 1.0`: only the fine band was ever on screen, and
+the render looked perfectly stationary even though the expression was correct.
+`smoothstep(0.26, 0.58, …)` gives pure fine grain inside a 0.18 m circle under the bead,
+pure coarse swell outside a 0.60 m one, and the crossfade in the annulus between.
+
+**Trap 2 — do not vary `octaves`.** `dturb*`'s octave count is truncated to an integer
+(`int oct = (int)octaves`), so a field-driven count does not fade an octave in: it
+**pops** on the contour where the field crosses each whole number, leaving a visible
+seam. Fade the extra octave's **amplitude** instead, centred on zero so it adds detail
+without shifting the mean:
+
+```
+noise(16*x, 16*y, 16*z) + t * 0.30 * (noise(48*x, 48*y, 48*z) - 0.5)
+```
+
+The same applies to Worley's `metric`, which is rounded to `0..2`: drive it with a
+**step**, never a ramp — a half-way value is not a half-way metric, it is one of the two
+whole ones.
+
+**Trap 3 — repeating the field is free, so repeat it.** The expression language has no
+local variables (no `let`), and a pattern cannot reference another pattern, so a field
+that gates one term and steers another has to be written out in full at every site. That
+looks expensive and is not: the loader runs a common-subexpression pass over every
+`pattern` program and every medium `density`/`ior` program, collapsing the repeats to one
+evaluation — and, for an `sdf`, **one lattice fetch** per shading point. Set
+`FTRACE_CSE_DEBUG=1` to watch it happen; on the worked example below it reports
+
+```
+[cse] pattern 2: 126 -> 71 nodes, 6 -> 1 table sample(s)
+```
+
+**Worked example: `scenes/pattern_nonstationary.ftsl`.** One `sdf` around a glowing bead
+drives three surfaces, each giving the same field a different job:
+
+```
+sdf "bead" { object "bead"  res 128  pad 1.0 }
+
+# FLOOR — no gate at all: a pure grain crossfade over the whole surface, plus a
+# faded third octave. Nothing is hidden; only the statistics change.
+pattern "grain" {
+    expr "0.10 + 0.80 * (smoothstep(0.38, 0.62,
+                             mix(noise( 4.0*x,  4.0*y,  4.0*z),
+                                 noise(22.0*x, 22.0*y, 22.0*z),
+                                 1 - smoothstep(0.26, 0.58, grid:bead(x, y, z))))
+                         + (1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))
+                           * 0.30 * (noise(60*x, 60*y, 60*z) - 0.5))"
+}
+
+# PLINTH — `cavity` gates WHERE crust may form; the field sets its grain.
+pattern "crust" {
+    expr "smoothstep(0.04, 0.34, cavity) *
+          (0.25 + 0.75 * smoothstep(0.38, 0.62,
+                             mix(noise( 4.5*x,  4.5*y,  4.5*z),
+                                 noise(30.0*x, 30.0*y, 30.0*z),
+                                 1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))))"
+}
+```
+
+The third pattern (`wear`, on a ring) is gated by `curv` and spends the field on a
+**domain warp** — nearness *squared*, so the warp stays near zero until the bead is close
+and then rises fast — turning a regular pattern into a churned one without changing its
+amplitude at all.
 
 ## Participating media / fog
 
