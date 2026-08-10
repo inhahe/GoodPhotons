@@ -706,7 +706,17 @@ question is its per-step or per-frame cost against the loop it sits in.
   interface must be *designed* long before it is built.
 - **Part-specific control is one generic mechanism, not N channels** — a goal for a body-part set,
   injected as a goal rather than overriding actuators. Overriding actuators discards the balance
-  solution that makes the motion physical.
+  solution that makes the motion physical. **The positive half of this, which matters more than the
+  prohibition: putting the request in the *observation* is what makes anticipation possible.** A real
+  animal lifting a hind foot shifts its weight into the remaining support triangle *before* the lift
+  — feedforward, not a reaction to the resulting wobble (Belen'kii et al. 1967; Massion 1992: raise
+  a human arm and the postural leg muscles fire ~100 ms ahead of the prime mover). A policy that
+  reads the goal a moment before it must act can spend that time loading the other three legs.
+  Override deletes exactly this: the rest of the body finds out by feeling the balance error
+  afterwards, which is a condition no animal is ever in — the nearest real equivalent is having
+  your leg yanked out from under you, and that *does* put people on the floor. So the request is not
+  "don't touch the actuators" for tidiness; it is that the observation path is the anticipation
+  path.
 - **Plan with the simulator; do not learn an approximation of it.** MuJoCo is already an accurate,
   fast, differentiable-enough forward model. A learned dynamics model would be a lossy copy of
   something we own outright.

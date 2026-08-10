@@ -717,6 +717,26 @@ anything expensive**, even though it's built later.
       the observation + reward and let the policy satisfy it**, adapting the rest of the body itself.
       The policy stays in charge, so it stays stable. (Residual-on-output and per-limb sub-policy
       decomposition are the alternatives; both are more fragile. Try goal-injection first.)
+      - **What is forbidden is the override, never the capability** *(clarified 2026-08-09 — the
+        original wording read as though part-specific control itself were disallowed)*. "Lift your
+        back right foot" is absolutely a thing to build; it is built by goal injection.
+      - **The observation path is the anticipation path, and that is the real argument.** A dog
+        lifting a hind foot shifts weight into the remaining support triangle *before* the lift —
+        anticipatory postural adjustment, feedforward rather than a reaction to the wobble
+        (Belen'kii et al. 1967; Massion 1992). Because the goal arrives in the observation, the
+        policy can do the same. Override cannot: the rest of the body learns about the lift by
+        feeling the balance error, a condition no animal is ever in.
+      - **Therefore the goal channel must be randomised during training like every other
+        conditioning input** — bolted on afterwards there was never any pressure to learn the
+        anticipation, and the standing constraint says the channel is ignored anyway.
+      - **Falsifiable check once it exists:** in a trained rollout the weight shift should *lead*
+        the foot lift. If the centre of pressure only moves after the foot is airborne, the policy
+        is reacting rather than anticipating and the channel is not doing its job — an objective
+        test for a level-3 goal, which is rarer than it sounds (see design.md §"How a knob acquires
+        meaning" on the verification asymmetry).
+      - **It stays a soft goal, deliberately.** The reward is a weighted sum, so a request for the
+        foot to be raised at a moment it must bear load is traded off rather than obeyed. That is
+        correct, and it is exactly why level 4 below is flagged as probably not a policy at all.
 - [ ] **Level 4 — accept that this may not be a policy at all.** "Foot exactly there at exactly that
       frame" is a hard constraint and a policy is a soft thing. Realistic answer is **hybrid**:
       learned controller produces the base motion, then a physics-aware trajectory-optimisation pass
