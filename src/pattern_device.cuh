@@ -170,6 +170,12 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
                 st[sp-1] = (sel == 3) ? w[2] : (sel == 2) ? (w[1] - w[0]) : w[sel];
                 break;
             }
+            case PatOp::Gabor: {    // anisotropic band-limited noise (GABOR_HD, double)
+                double dz = st[--sp], dy = st[--sp], dx = st[--sp];
+                double ff = st[--sp], zz = st[--sp], yy = st[--sp];
+                st[sp-1] = patGabor(st[sp-1], yy, zz, ff, dx, dy, dz);
+                break;
+            }
             case PatOp::PovFn: {
                 int id = (int)nd.a;
                 int na = povFnArity(id);

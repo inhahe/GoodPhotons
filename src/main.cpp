@@ -3200,6 +3200,358 @@ static int checkWorley() {
     return ok ? 0 : 1;
 }
 
+// Gabor / anisotropic band-limited noise self-test (src/gabor.h: patGaborRaw,
+// patGabor, patGaborCosTurns; src/pattern.h: PatOp::Gabor, reached from a pattern
+// expression as `gabor(x, y, z, f, wx, wy, wz)`). O4. No scene, no renderer.
+//
+//   §1 the 3x3x3 neighbourhood is EXACT, not the usual 95%-of-a-Gaussian
+//      approximation: a +-4-block brute force (its own floor, its own Poisson draw,
+//      its own accumulation) must reproduce patGaborRaw BIT for bit, and no impulse
+//      in a cell two or more rings out may land inside the unit support at all.
+//   §2 the hand-rolled cosine: within 1e-14 of libm's cos(2*pi*t) over +-4096 turns,
+//      exactly even, and exactly 1-periodic in turns. It exists because libm `cos` is
+//      not correctly rounded and CUDA's differs from the host's, which would break the
+//      backend-identical contract; so it has to be verified against libm, not used
+//      from it.
+//   §3 the ANALYTIC normalisation: mean 0 and variance lambda/3 * 1/2 * INT E^2 =
+//      0.28566907, independently of the frequency and the steering direction. The
+//      f-independence is the whole reason each impulse carries a random phase, so it
+//      is checked at f = 0, 0.5, 2, 8 and for the isotropic fallback.
+//   §4 the [0,1] shading mapping: in range, mean 0.5, and the 3-sigma scale clips
+//      under 1% of samples.
+//   §5 ANISOTROPY: along the steering direction the field crosses zero at ~2f per unit
+//      (the mean crossing rate of a process centred at frequency f); across it, at the
+//      envelope's own rate, which is smaller by the whole ratio f.
+//   §6 NO POSITIONAL SHEAR — the O4 point. With a direction field that VARIES in
+//      space, the local frequency stays f whether the shading point is at the origin
+//      or 3000 units away, because a kernel only ever sees the offset from its own
+//      centre: the residual is (dw/dp).u with |u| <= 1, not O(|p|) as it is for
+//      `noise(R(p) * p)`.
+//   §7 EXACT stationarity. Per-cell Poisson(lambda) points uniform in the cell IS a
+//      homogeneous Poisson process, so the statistics do not know where the cells are:
+//      the variance is the same sampled on the integer lattice and off it. Lattice
+//      value noise fails that badly (on-lattice it is the raw hash, mid-cell it is an
+//      average of eight), and the test asserts that contrast so it cannot pass
+//      vacuously.
+//   §8 continuity across cell walls (the C2 envelope and the search boundary).
+//   §9 the compile path (VM == direct call, zero direction == isotropic, bad arity and
+//      unknown spellings rejected) and CSE (identical calls collapse, a different
+//      frequency does not).
+static int checkGabor() {
+    double worst = 0.0;
+    bool ok = true;
+    // `worst` tracks only the EXACT checks (tol <= 1e-12); the statistical sections
+    // deviate by design and would otherwise swamp the report.
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (tol <= 1e-12 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkgabor] %-46s got %.12g want %.12g  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+    const double VAR_WANT = 0.28566907466;   // lambda/3 * 1/2 * 4*pi*1024/45045, lambda = 6
+
+    // ---- §1: 3x3x3 is exact, vs a ±4-block brute force -----------------------
+    {
+        double wd = 0.0;
+        long long outside = 0, impulses = 0;
+        for (int i = 0; i < 384; ++i) {
+            const double x = (frand() - 0.5) * 60.0;
+            const double y = (frand() - 0.5) * 60.0;
+            const double z = (frand() - 0.5) * 60.0;
+            const double f = 0.5 + 4.0 * frand();
+            const double wx = frand() * 2.0 - 1.0, wy = frand() * 2.0 - 1.0,
+                         wz = frand() * 2.0 - 1.0;
+            const double inv = 1.0 / std::sqrt(wx * wx + wy * wy + wz * wz);
+            const double ox = wx * inv, oy = wy * inv, oz = wz * inv;
+            const int bx = (int)std::floor(x), by = (int)std::floor(y),
+                      bz = (int)std::floor(z);
+            double acc = 0.0;
+            for (int dz = -4; dz <= 4; ++dz)
+            for (int dy = -4; dy <= 4; ++dy)
+            for (int dx = -4; dx <= 4; ++dx) {
+                const int cx = bx + dx, cy = by + dy, cz = bz + dz;
+                const unsigned int h0 = patGaborCellHash(cx, cy, cz);
+                int n = 0;                              // independent Poisson draw
+                {
+                    double p = 1.0;
+                    unsigned int hc = patGaborMix(h0 ^ 0x2f6a5d21u);
+                    while (true) {
+                        p *= (double)hc * (1.0 / 4294967296.0);
+                        if (p <= std::exp(-PAT_GABOR_LAMBDA)) break;
+                        if (++n >= PAT_GABOR_NMAX) break;
+                        hc = patGaborMix(hc + 0x9e3779b9u);
+                    }
+                }
+                const int ring = std::max(std::abs(dx), std::max(std::abs(dy), std::abs(dz)));
+                for (int k = 0; k < n; ++k) {
+                    const unsigned int hb = patGaborMix(h0 + 0x9e3779b9u * (unsigned int)(k + 1));
+                    const double fx = (double)cx + (double)patGaborMix(hb + 0x85ebca6bu) * (1.0 / 4294967296.0);
+                    const double fy = (double)cy + (double)patGaborMix(hb + 0xc2b2ae35u) * (1.0 / 4294967296.0);
+                    const double fz = (double)cz + (double)patGaborMix(hb + 0x27d4eb2fu) * (1.0 / 4294967296.0);
+                    const double ux = x - fx, uy = y - fy, uz = z - fz;
+                    const double d2 = ux * ux + uy * uy + uz * uz;
+                    ++impulses;
+                    if (d2 >= 1.0) continue;
+                    if (ring > 1) { ++outside; continue; }   // would be MISSED by 3x3x3
+                    const double e1 = 1.0 - d2, env = e1 * e1 * e1;
+                    const double w  = (double)patGaborMix(hb + 0x165667b1u) * (2.0 / 4294967296.0) - 1.0;
+                    const double ph = (double)patGaborMix(hb + 0x9e3779b1u) * (1.0 / 4294967296.0);
+                    acc += w * env * patGaborCosTurns(f * (ux * ox + uy * oy + uz * oz) + ph);
+                }
+            }
+            wd = std::fmax(wd, std::fabs(acc - patGaborRaw(x, y, z, f, wx, wy, wz)));
+        }
+        ok &= chk("S1 impulses inside support beyond ring 1", (double)outside, 0.0, 0.0);
+        ok &= chk("S1 field vs ±4-block brute force", wd, 0.0, 0.0);
+        if (impulses < 100000) {   // the brute force must actually have drawn something
+            std::printf("[checkgabor] S1 only %lld impulses drawn — test is vacuous  BAD\n", impulses);
+            ok = false;
+        }
+    }
+
+    // ---- §2: the hand-rolled cos(2*pi*t) -------------------------------------
+    {
+        double wc = 0.0, wodd = 0.0, wper = 0.0;
+        const double TAU = 6.283185307179586476925286766559;
+        // The reference reduces in TURNS first (`t - floor(t + 0.5)` is exact) and only
+        // then multiplies by 2*pi. Handing libm the unreduced `TAU * t` instead would
+        // measure ITS argument error rather than ours: at 4096 turns that product
+        // already carries ~3e-12 of rounding, 300x the discrepancy being looked for.
+        // Large arguments are covered by the exact-periodicity check.
+        for (int i = 0; i < 20000; ++i) {
+            const double t  = (frand() - 0.5) * 8192.0;
+            const double tr = t - std::floor(t + 0.5);
+            wc   = std::fmax(wc,   std::fabs(patGaborCosTurns(t) - std::cos(TAU * tr)));
+            wodd = std::fmax(wodd, std::fabs(patGaborCosTurns(t) - patGaborCosTurns(-t)));
+            wper = std::fmax(wper, std::fabs(patGaborCosTurns(t) - patGaborCosTurns(t + 64.0)));
+        }
+        // the endpoints, where the folded Taylor series is worked hardest
+        for (int q = 0; q <= 4096; ++q) {
+            const double t = (double)q / 4096.0;
+            wc = std::fmax(wc, std::fabs(patGaborCosTurns(t) - std::cos(TAU * t)));
+        }
+        ok &= chk("S2 cos(2pi t) vs libm", wc, 0.0, 1e-14);
+        ok &= chk("S2 cos is exactly even", wodd, 0.0, 0.0);
+        ok &= chk("S2 cos is exactly 1-periodic in turns", wper, 0.0, 0.0);
+    }
+
+    // ---- §3: moments match the analytic normalisation ------------------------
+    {
+        struct Cfg { double f, wx, wy, wz; const char* lbl; };
+        const Cfg cfgs[] = {
+            {0.0, 1.0, 0.0, 0.0, "f=0   axis"},
+            {0.5, 1.0, 0.0, 0.0, "f=0.5 axis"},
+            {2.0, 0.3, -0.7, 0.5, "f=2   oblique"},
+            {8.0, 0.3, -0.7, 0.5, "f=8   oblique"},
+            {2.0, 0.0, 0.0, 0.0, "f=2   isotropic"},
+        };
+        const int N = 8000;
+        for (const Cfg& c : cfgs) {
+            double s = 0.0, s2 = 0.0;
+            for (int i = 0; i < N; ++i) {
+                const double g = patGaborRaw((frand() - 0.5) * 400.0,
+                                             (frand() - 0.5) * 400.0,
+                                             (frand() - 0.5) * 400.0,
+                                             c.f, c.wx, c.wy, c.wz);
+                s += g; s2 += g * g;
+            }
+            const double mean = s / N, var = s2 / N - mean * mean;
+            char lbl[80];
+            std::snprintf(lbl, sizeof lbl, "S3 %s mean", c.lbl);
+            ok &= chk(lbl, mean, 0.0, 0.05);
+            std::snprintf(lbl, sizeof lbl, "S3 %s variance", c.lbl);
+            ok &= chk(lbl, var, VAR_WANT, 0.09 * VAR_WANT);
+        }
+    }
+
+    // ---- §4: the [0,1] shading mapping ---------------------------------------
+    {
+        const int N = 20000;
+        double s = 0.0; int clipped = 0; bool inRange = true;
+        for (int i = 0; i < N; ++i) {
+            const double x = (frand() - 0.5) * 400.0, y = (frand() - 0.5) * 400.0,
+                         z = (frand() - 0.5) * 400.0;
+            const double g = patGabor(x, y, z, 3.0, 1.0, 0.4, -0.2);
+            if (!(g >= 0.0 && g <= 1.0)) inRange = false;
+            if (g <= 0.0 || g >= 1.0) ++clipped;
+            s += g;
+        }
+        if (!inRange) { std::printf("[checkgabor] S4 patGabor left [0,1]  BAD\n"); ok = false; }
+        ok &= chk("S4 mean of the [0,1] mapping", s / N, 0.5, 0.02);
+        ok &= chk("S4 clip rate", (double)clipped / N, 0.0, 0.01);
+    }
+
+    // Mean zero-crossings per unit length of the raw field along a unit walk
+    // direction. For a process whose spectrum sits at frequency F this is 2F.
+    auto crossRate = [&](double px, double py, double pz,
+                         double ax, double ay, double az,
+                         double f, double wx, double wy, double wz,
+                         double len, int steps) {
+        double prev = patGaborRaw(px, py, pz, f, wx, wy, wz);
+        int cross = 0;
+        for (int s = 1; s <= steps; ++s) {
+            const double t = len * (double)s / (double)steps;
+            const double v = patGaborRaw(px + ax * t, py + ay * t, pz + az * t,
+                                         f, wx, wy, wz);
+            if ((v < 0.0) != (prev < 0.0)) ++cross;
+            prev = v;
+        }
+        return (double)cross / len;
+    };
+
+    // ---- §5: anisotropy -------------------------------------------------------
+    {
+        const double f = 8.0;
+        const double along  = crossRate(3.7, -1.3, 0.9, 1, 0, 0, f, 1, 0, 0, 80.0, 12000);
+        const double across = crossRate(3.7, -1.3, 0.9, 0, 1, 0, f, 1, 0, 0, 80.0, 12000);
+        ok &= chk("S5 crossings/unit along w^ (want 2f)", along, 2.0 * f, 0.2 * 2.0 * f);
+        if (!(across < 0.25 * along)) {
+            std::printf("[checkgabor] S5 across-direction rate %.3f not << along %.3f  BAD\n",
+                        across, along);
+            ok = false;
+        }
+    }
+
+    // ---- §6: no positional shear, with a VARYING direction field --------------
+    {
+        const double f = 6.0;
+        // w^(p) turns slowly with x; over the 30-unit probe it swings ~0.06 rad, and
+        // the kernel-local residual (dw/dp).u is bounded by that rate times ONE cell —
+        // the same bound at the origin and 3000 units out. A rotated-coordinate noise
+        // would instead pick up a term proportional to |p| and shear itself apart.
+        auto wyOf = [](double x) { return 0.35 * std::sin(0.002 * x); };
+        const double nearR = crossRate(0.0, 0.0, 0.0, 1, 0, 0, f, 1, wyOf(0.0), 0, 30.0, 6000);
+        const double farX  = 3000.0;
+        const double farR  = crossRate(farX, -2777.0, 1913.0, 1, 0, 0, f, 1, wyOf(farX), 0, 30.0, 6000);
+        ok &= chk("S6 crossings/unit at |p| ~ 0 (want 2f)",    nearR, 2.0 * f, 0.22 * 2.0 * f);
+        ok &= chk("S6 crossings/unit at |p| ~ 4000 (want 2f)", farR,  2.0 * f, 0.22 * 2.0 * f);
+    }
+
+    // ---- §7: exact stationarity (and the contrast that makes it non-vacuous) --
+    {
+        const double offs[3][3] = { {0.0, 0.0, 0.0}, {0.5, 0.5, 0.5}, {0.137, 0.611, 0.29} };
+        double gv[3], nv[3];
+        for (int o = 0; o < 3; ++o) {
+            double sg = 0.0, sg2 = 0.0, sn = 0.0, sn2 = 0.0;
+            int n = 0;
+            for (int ix = -12; ix <= 12; ++ix)
+            for (int iy = -12; iy <= 12; ++iy)
+            for (int iz = -12; iz <= 12; ++iz) {
+                const double x = (double)ix + offs[o][0];
+                const double y = (double)iy + offs[o][1];
+                const double z = (double)iz + offs[o][2];
+                const double g = patGaborRaw(x, y, z, 2.0, 1.0, 0.0, 0.0);
+                const double v = patValueNoise(x, y, z);
+                sg += g; sg2 += g * g; sn += v; sn2 += v * v; ++n;
+            }
+            gv[o] = sg2 / n - (sg / n) * (sg / n);
+            nv[o] = sn2 / n - (sn / n) * (sn / n);
+        }
+        const double gSpread = (std::fmax(gv[0], std::fmax(gv[1], gv[2])) /
+                                std::fmin(gv[0], std::fmin(gv[1], gv[2]))) - 1.0;
+        const double nSpread = (std::fmax(nv[0], std::fmax(nv[1], nv[2])) /
+                                std::fmin(nv[0], std::fmin(nv[1], nv[2]))) - 1.0;
+        ok &= chk("S7 gabor variance spread over sub-cell offsets", gSpread, 0.0, 0.12);
+        if (!(nSpread > 3.0 * std::fmax(gSpread, 0.02))) {
+            std::printf("[checkgabor] S7 value-noise spread %.3f not >> gabor's %.3f — "
+                        "the test would pass vacuously  BAD\n", nSpread, gSpread);
+            ok = false;
+        }
+    }
+
+    // ---- §8: continuity across cell walls ------------------------------------
+    {
+        const double eps = 1e-6;
+        double wl = 0.0;
+        for (int axis = 0; axis < 3; ++axis)
+            for (int i = 0; i < 400; ++i) {
+                double p[3] = { (frand() - 0.5) * 40.0, (frand() - 0.5) * 40.0,
+                                (frand() - 0.5) * 40.0 };
+                p[axis] = std::floor(p[axis] + 0.5) - eps * 0.5;   // straddle the wall
+                double q[3] = { p[0], p[1], p[2] };
+                q[axis] += eps;
+                wl = std::fmax(wl, std::fabs(patGaborRaw(p[0], p[1], p[2], 4.0, 1, 0.3, -0.2) -
+                                             patGaborRaw(q[0], q[1], q[2], 4.0, 1, 0.3, -0.2)));
+            }
+        ok &= chk("S8 step across a cell wall", wl, 0.0, 1e-3);
+    }
+
+    // ---- §9: the compile path and CSE ----------------------------------------
+    {
+        struct Case { const char* expr; double f, wx, wy, wz; };
+        const Case cases[] = {
+            {"gabor(x, y, z, 2, 1, 0, 0)",          2.0, 1.0, 0.0,  0.0},
+            {"gabor(x, y, z, 5.5, 0.3, -0.7, 0.5)", 5.5, 0.3, -0.7, 0.5},
+            {"gabor(x, y, z, 3, 0, 0, 0)",          3.0, 0.0, 0.0,  0.0},   // isotropic
+            {"gabor(2*x, y, z, 1, nx, ny, nz)",     1.0, 0.0, 0.0,  1.0},   // scaled + normal
+        };
+        for (int ci = 0; ci < (int)(sizeof cases / sizeof cases[0]); ++ci) {
+            const Case& cs = cases[ci];
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(cs.expr, prog, perr)) {
+                std::printf("[checkgabor] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+                ok = false; continue;
+            }
+            double wv = 0.0;
+            for (int i = 0; i < 128; ++i) {
+                const double x = (frand() - 0.5) * 40.0, y = (frand() - 0.5) * 40.0,
+                             z = (frand() - 0.5) * 40.0;
+                PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+                const double got  = patternEval(prog.data(), (int)prog.size(), c);
+                const double want = patGabor(ci == 3 ? 2.0 * x : x, y, z,
+                                             cs.f, cs.wx, cs.wy, cs.wz);
+                wv = std::fmax(wv, std::fabs(got - want));
+            }
+            char lbl[96]; std::snprintf(lbl, sizeof lbl, "S9 VM `%s` == direct", cs.expr);
+            ok &= chk(lbl, wv, 0.0, 0.0);
+        }
+        const char* bads[] = {
+            "gabor(x, y, z, 1, 0, 0)",        // arity 7, given 6
+            "gabor(x, y, z, 1, 0, 0, 0, 0)",  // arity 7, given 8
+            "gabor(x, y, z)",                 // arity 7, given 3
+            "gabour(x, y, z, 1, 1, 0, 0)",    // no such spelling
+        };
+        for (const char* be : bads) {
+            std::vector<PatNode> prog; std::string perr;
+            if (compilePatternExpr(be, prog, perr)) {
+                std::printf("[checkgabor] `%s` compiled but should be rejected  BAD\n", be);
+                ok = false;
+            }
+        }
+        std::vector<PatNode> same, sameOpt, diff, diffOpt; std::string perr;
+        ok &= compilePatternExpr("gabor(x,y,z,2,1,0,0) + gabor(x,y,z,2,1,0,0)", same, perr);
+        ok &= compilePatternExpr("gabor(x,y,z,2,1,0,0) + gabor(x,y,z,3,1,0,0)", diff, perr);
+        sameOpt = same; patternOptimizeCSE(sameOpt);
+        diffOpt = diff; patternOptimizeCSE(diffOpt);
+        if (sameOpt.size() >= same.size()) {
+            std::printf("[checkgabor] CSE did not shrink `gabor + gabor` (%zu -> %zu)  BAD\n",
+                        same.size(), sameOpt.size());
+            ok = false;
+        }
+        double wv = 0.0;
+        for (int i = 0; i < 128; ++i) {
+            const double x = (frand() - 0.5) * 40.0, y = (frand() - 0.5) * 40.0,
+                         z = (frand() - 0.5) * 40.0;
+            PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+            const double g2 = patGabor(x, y, z, 2.0, 1, 0, 0);
+            const double g3 = patGabor(x, y, z, 3.0, 1, 0, 0);
+            wv = std::fmax(wv, std::fabs(patternEval(sameOpt.data(), (int)sameOpt.size(), c) - 2.0 * g2));
+            wv = std::fmax(wv, std::fabs(patternEval(diffOpt.data(), (int)diffOpt.size(), c) - (g2 + g3)));
+        }
+        ok &= chk("S9 CSE'd programs evaluate right (max err)", wv, 0.0, 0.0);
+    }
+
+    std::printf("[checkgabor] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkgabor] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic mean-curvature self-test (`-checkcurv`): the `curv` free variable
 // (O3 — non-stationary randomness). Runs with no scene and no renderer.
 //
@@ -9577,6 +9929,7 @@ static int run(int argc, char** argv) {
     bool checkGridOnly = false;
     bool checkVNoiseOnly = false;
     bool checkWorleyOnly = false;
+    bool checkGaborOnly = false;
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkSdfOnly = false;
@@ -9993,6 +10346,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkvnoise")) checkVNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkworley")) checkWorleyOnly = true;
+        else if (!std::strcmp(argv[i], "-checkgabor")) checkGaborOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
@@ -10181,6 +10535,7 @@ static int run(int argc, char** argv) {
     if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
     if (checkVNoiseOnly)   return checkVNoise();   // ditto (vector noise / domain warp)
     if (checkWorleyOnly)   return checkWorley();   // ditto (cellular / Worley noise)
+    if (checkGaborOnly)    return checkGabor();    // ditto (anisotropic band-limited Gabor noise)
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)

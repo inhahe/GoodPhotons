@@ -26,6 +26,7 @@
 #include "linalg.h"
 #include "pov_functions.h"   // exact POV-Ray internal isosurface functions (f_torus, ...)
 #include "worley.h"          // 3-D cellular (Worley/Voronoi) noise (host+device)
+#include "gabor.h"           // anisotropic band-limited Gabor noise (host+device)
 
 // The grid sampler below is shared verbatim by the CPU evaluator and the CUDA
 // pattern VM (render_cuda.cu includes this header), so it needs the same
@@ -194,6 +195,25 @@ enum class PatOp : int {
     // EXPLICITLY in patternHasFreeVars and patOpStackEffect, because it is a per-hit
     // surface intrinsic living outside the contiguous VarX..VarV range.
     VarCavity,
+    // ANISOTROPIC BAND-LIMITED GABOR NOISE (O4), spelled
+    // `gabor(x, y, z, f, wx, wy, wz)` — arity 7, the widest op in the VM. Pops the
+    // sample point, the frequency in cycles per unit of the caller's (already scaled)
+    // space, and a steering direction which need not be normalised and may be any
+    // expression; a zero-length direction selects isotropic band-pass noise. Returns
+    // [0,1] with mean 0.5, like `noise`.
+    //
+    // Every other noise here is a LATTICE noise, so its orientation is baked into the
+    // grid and the only way to steer it is to warp the coordinates — which re-incurs
+    // exactly the position-dependent shear that the non-stationary write-up warns about
+    // for spatially varying FREQUENCY, for the same reason (the Jacobian of R(p)*p
+    // carries a term proportional to |p|). Gabor noise carries orientation and
+    // bandwidth as KERNEL parameters instead, so it steers with no shear at all, and is
+    // band-limited into the bargain. Pure function of its operands (CSE shares it), no
+    // payload, evaluated in double on every backend via the GABOR_HD patGabor in
+    // gabor.h — including its own deterministic cosine, because libm's is not
+    // bit-identical between host and device. Appended at the END of the enum, so the
+    // VarX..VarV scans and varName() are unperturbed.
+    Gabor,
 };
 
 // Register-file size available to a CSE-optimized program (per evaluator invocation).
@@ -626,6 +646,12 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 st[sp-1] = (sel == 3) ? w[2] : (sel == 2) ? (w[1] - w[0]) : w[sel];
                 break;
             }
+            case PatOp::Gabor: {
+                double dz = st[--sp], dy = st[--sp], dx = st[--sp];
+                double ff = st[--sp], zz = st[--sp], yy = st[--sp];
+                st[sp-1] = patGabor(st[sp-1], yy, zz, ff, dx, dy, dz);
+                break;
+            }
             case PatOp::PovFn: {
                 int id = (int)nd.a;
                 int na = povFnArity(id);
@@ -773,6 +799,8 @@ inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
         {"atan2",PatOp::Atan2,2},{"step",PatOp::Step,2},
         {"clamp",PatOp::Clamp,3},{"mix",PatOp::Mix,3},
         {"smoothstep",PatOp::Smoothstep,3},{"noise",PatOp::Noise,3},
+        // anisotropic Gabor noise (O4): point, frequency, steering direction
+        {"gabor",PatOp::Gabor,7},
     };
     for (const F& g : fs) if (s == g.n) { out = g.op; arity = g.ar; return true; }
     // Vector-noise components (O2) and Worley outputs (O1). The component /
@@ -1262,6 +1290,7 @@ inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes,
     if (op == PatOp::DNoise)                      { pops = 3; return true; }
     if (op == PatOp::DTurb)                       { pops = 6; return true; }
     if (op == PatOp::Worley)                      { pops = 4; return true; }
+    if (op == PatOp::Gabor)                       { pops = 7; return true; }
     if (op == PatOp::Tex)                         { pops = 2; return true; }
     if (op == PatOp::Spec)                        { pops = 1; return true; }
     if (op == PatOp::StReg)                       { pops = 0; pushes = 0; return true; }  // peeks

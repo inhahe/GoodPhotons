@@ -483,6 +483,46 @@ F1/F2 are mathematically exact (adaptive ring search, not the common fixed
 `-checkworley`. Worked example: `scenes/pattern_worley.ftsl` (all four outputs,
 all three metrics).
 
+**Anisotropic noise — `gabor(x, y, z, f, wx, wy, wz)`:** band-limited Gabor noise,
+returning `[0,1]` with mean `0.5` like `noise`. `f` is the frequency in **cycles per
+unit of the coordinates you pass in**, and `(wx, wy, wz)` is the **steering
+direction** — the field oscillates *along* that vector, so the visible streaks run
+**perpendicular** to it. The vector need not be normalised; a zero-length one selects
+**isotropic band-pass** noise (each impulse then picks its own direction).
+
+Both `f` and the direction are ordinary sub-expressions, so they may vary from point
+to point, and that is the reason this function exists. Every other noise here is a
+*lattice* noise, whose orientation is baked into its grid; the only way to steer one is
+to warp the coordinates, `noise(R(p)·p)`, whose Jacobian is `R + (dR/dp)·p`. The second
+term grows with distance from the (arbitrary) origin, so a warped lattice noise shears
+further and further out and never has quite the orientation asked for — the same trap
+as spatially varying frequency (§6, *Using `curv`, `cavity` and `sdf` together*). A
+Gabor kernel only ever sees the offset from **its own centre**, at most one cell, so a
+varying direction leaves a residual bounded by the local turning rate instead of by
+`|p|`:
+
+```
+# wood end grain: oscillate RADIALLY about a vertical axis and the bands close
+# into growth rings — one expression, no polar remap
+pattern "wood" { expr "smoothstep(0.34, 0.66, gabor(8*x, 8*y, 8*z, 2.2, x - 0.35, 0, z - 0.35))" }
+
+# brushed metal: oscillate across the surface, and squash one axis so the kernels
+# stretch into long scratches along it
+pattern "brushed" { expr "smoothstep(0.26, 0.74, gabor(30*x, 3*y, 30*z, 1.6, 0, 0, 1))" }
+```
+
+Anisotropy has two independent knobs: the **direction** sets which way the field
+oscillates, and **scaling the input coordinates unevenly** stretches the kernels
+themselves (`3*y` against `30*x` above makes each one ten times taller than it is
+wide). Because the impulses are a genuinely homogeneous Poisson process the noise is
+stationary under *arbitrary* translation, not merely integer ones; because each impulse
+carries a random phase the variance is exactly independent of `f`; and because the
+spectrum is a narrow band rather than everything up to the lattice Nyquist, this is the
+one noise here that minifies gracefully. Bit-identical on CPU and GPU (including its
+own cosine — libm's is not), validated by `-checkgabor`. Worked example:
+`scenes/pattern_gabor.ftsl` (isotropic speckle, brushed metal, wood end grain,
+flow-aligned fibre, latitude striation on a sphere).
+
 **Image samples — `tex:<name>(u, v)`:** samples a declared `texture` as a *scalar term
 inside the formula*, so a photograph can be one operand of an expression rather than
 only bound wholesale to a slot:
@@ -1663,7 +1703,9 @@ and a Lipschitz bound (`max_gradient`, see §10.3).
   work here too — they need only coordinates — so a field can be domain-warped by
   gradient noise, and so does cellular noise
   `worley/worley2/worleyd/worleyid(x,y,z,metric)` (§6.1) for crystal/stone-like
-  fields. The image sample
+  fields and `gabor(x,y,z,f,wx,wy,wz)` (§6.1) for directional ones — though a field
+  driven by Gabor noise needs a generous `max_gradient`, since its slope scales with
+  `f`. The image sample
   `tex:<name>(u, v)` (§6.1) is **not** available here — a field expression *defines* a
   surface, so there is no surface to sample yet; using it is a compile error.
 - **Operators:** `+ - * / % ^` and unary `-`. `^` is `pow` (right-assoc), `%` is

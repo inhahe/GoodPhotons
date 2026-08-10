@@ -2346,7 +2346,7 @@ or a native-primitive wrap — see below), the **mean curvature `curv`** (see
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
   math, `pi`, and functions `abs sqrt sin cos tan exp log floor fract sign saturate min
-  max atan2 step pow clamp mix smoothstep noise`. On top of the scalar `noise` there is
+  max atan2 step pow clamp mix smoothstep noise gabor`. On top of the scalar `noise` there is
   **vector-valued gradient noise for domain warping**: `dnoisex/y/z(x, y, z)` are the
   three decorrelated components of POV-Ray's `DNoise` vector at a point, and
   `dturbx/y/z(x, y, z, octaves, lambda, omega)` the components of its octave sum
@@ -2364,6 +2364,27 @@ or a native-primitive wrap — see below), the **mean curvature `curv`** (see
   (Euclidean F1 mean ≈ 0.65), F1/F2 are exact (adaptive ring search, not the
   common 3×3×3 approximation) and CPU/GPU bit-identical; worked example
   `scenes/pattern_worley.ftsl`, deterministic self-test `ftrace -checkworley`.
+  And there is **anisotropic, band-limited Gabor noise** —
+  `gabor(x, y, z, f, wx, wy, wz)`, returning `[0,1]` with mean `0.5` like `noise`.
+  `f` is the frequency in **cycles per unit of the coordinates you hand it**, and
+  `(wx, wy, wz)` is the **steering direction**: the field oscillates *along* that
+  vector, so the visible streaks run perpendicular to it. A zero-length vector means
+  **isotropic band-pass** noise. Both the direction and the frequency are ordinary
+  sub-expressions, so they can vary from point to point — which is the reason the
+  primitive exists. Steering a *lattice* noise means writing `noise(R(p)·p)`, whose
+  Jacobian is `R + (dR/dp)·p`: the second term grows with distance from the origin, so
+  the texture shears further and further out and never has quite the orientation you
+  asked for (the same trap as spatially varying frequency — see *Putting them
+  together* below). A Gabor kernel only sees the offset from **its own centre**, at
+  most one cell, so a varying direction leaves a residual bounded by the local turning
+  rate rather than by `|p|`. Being band-limited it is also the one noise here that
+  minifies gracefully. Everything is analytic: the impulses are a genuinely
+  homogeneous Poisson process (so the field is stationary under *arbitrary*, not just
+  integer, translation), the compactly supported C² envelope makes the 3×3×3 search
+  exact rather than the usual 95%-of-a-Gaussian, and the per-impulse random phase makes
+  the variance independent of `f`. Worked example `scenes/pattern_gabor.ftsl`
+  (isotropic speckle, brushed metal, wood rings round an off-screen trunk, flow-aligned
+  fibre), deterministic self-test `ftrace -checkgabor`.
   It can also **sample a declared image
   as a term**: `tex:<name>(u, v)` returns the mean of the texel's three linear RGB
   channels (the same `Texture::scalarAt` sampler a `texture:<name>` slot binding uses,
@@ -3520,7 +3541,7 @@ alone can't restore, so they are not disk-resumable.
 `-checkcurve`, `-checkfur`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
-`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkcurv`,
+`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`, `-checkcurv`,
 `-checkcavity`, `-checksdf`, `-checksun`,
 `-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints

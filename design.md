@@ -1933,6 +1933,74 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   all three behaviours — shrinks and emits `LdReg` with tables in hand, stays bit-identical
   over 64 probe points, and **declines**, leaving the program untouched, without them.
 
+  **Anisotropic Gabor noise (`PatOp::Gabor`, O4, v0.165.0).** `src/gabor.h`,
+  `gabor(x, y, z, f, wx, wy, wz)` — arity 7, the widest op in the VM. The O3 write-up had
+  just finished explaining why you must *not* make a lattice noise's frequency a function
+  of position (`noise(k(p)·p)` has local frequency `k + p·dk/dp`, so it shears with
+  distance from an arbitrary origin). O4 asks for the same thing one axis over — noise
+  *steered* along a direction field — and the obvious `noise(R(p)·p)` fails for exactly
+  the same reason: the Jacobian is `R + (dR/dp)·p`, and the second term again grows with
+  `|p|`. There is no way to fix that inside a lattice noise, because a lattice noise's
+  orientation *is* its grid. So the honest answer to O4 is a different construction, one
+  where orientation is a **kernel parameter**: a Gabor kernel only ever sees the offset
+  from its own centre, which is bounded by one cell, so a varying direction leaves a
+  residual bounded by the local turning rate rather than by position. That is measured,
+  not asserted: `-checkgabor` §6 runs a *varying* direction field and finds the same
+  local frequency at the origin and 4000 units out.
+
+  The TODO's premise for O4 was "needs a per-hit tangent frame". It doesn't — and `Hit`
+  has carried one since C6 (`tangent` + `bitangentSign`) anyway. Exposing `tx ty tz` was
+  considered and rejected: it largely duplicates the already-exposed `u`/`v`, and it would
+  only have fed the coordinate-rotation idiom that the paragraph above rules out. The
+  useful thing to expose was the *primitive*, not the frame.
+
+  Four design choices are worth recording because each replaces a standard approximation
+  with something exact:
+
+  * **A compactly supported C² envelope, `(1-r²)³` of radius exactly one cell**, instead
+    of Lagae's Gaussian truncated at 5% of its peak. The textbook 3×3×3 search is
+    therefore *approximate* — it silently drops the tails — whereas here a cell two rings
+    out is >1 away in the infinity norm, hence outside every kernel it can hold, so
+    3×3×3 is **mathematically exact** (`-checkgabor` §1 pins it against a ±4-block brute
+    force, bit for bit, and separately counts impulses that a 3×3×3 would have missed:
+    zero). It also removes the `exp` entirely and lets the support test run on the
+    *squared* distance, which rejects ~85% of candidates in three multiplies.
+  * **Per-cell Poisson(λ) points, uniform in the cell.** The union of independent Poisson
+    processes on disjoint regions is a homogeneous Poisson process, so the impulse set is
+    not merely jittered-on-a-grid — it genuinely has no grid, and the noise is stationary
+    under *arbitrary* translation, not just integer ones. §7 measures that, and asserts
+    the contrast against lattice value noise (whose variance differs 8× between
+    on-lattice and mid-cell samples) so it cannot pass vacuously.
+  * **A random phase per impulse** (Lagae & Drettakis' phase-augmented form). This is what
+    makes the normalisation *analytic*: `E_φ[cos²(θ+φ)] = ½` pointwise, so Campbell's
+    theorem gives `Var = λ·E[w²]·½·∫E² = 0.28566907` with **no dependence on `f`** — which
+    matters here far more than in an offline tool, because `f` is a runtime operand and a
+    zero-phase kernel's variance would drift as it moved.
+  * **Its own cosine.** `patGaborCosTurns` reduces in *turns* (`t - floor(t+0.5)` is
+    exact), folds to `[0, π/2]` and evaluates a Taylor series to `x²²`. libm's `cos` is
+    not correctly rounded and CUDA's differs from the host's by up to 2 ulp, which would
+    break the "a pattern evaluates bit-for-bit identically on every backend" contract that
+    `patWorley`/`povDNoise` keep. §2 verifies it against libm to 8e-16 — and had to be
+    *fixed* to do so: comparing against `cos(2π·t)` at 4096 turns measures libm's own
+    argument error (~3e-12), 300× the discrepancy being looked for, so the reference
+    reduces in turns first and large arguments are covered by an exact-periodicity check.
+
+  Wiring is the O2 checklist verbatim (enum appended at the end, one case in each of the
+  three VMs with the fp32 one promoting/demoting around the double core, `patOpStackEffect`
+  arity 7, no payload so CSE shares identical calls by structure alone). Worked example
+  `scenes/pattern_gabor.ftsl`: isotropic band-pass speckle, brushed metal, **wood end
+  grain** (steer radially about a vertical axis and the bands close into growth rings — one
+  expression, no polar remap, and the degenerate direction at the axis falls back to
+  isotropic, which is what a real pith looks like), flow-aligned fibre, latitude striation.
+  Two independent anisotropy knobs are worth stating outright, because authors reach for
+  the wrong one: the **direction** chooses which way the field oscillates (streaks run
+  *perpendicular* to it), while **scaling the input coordinates unevenly** stretches the
+  kernels themselves.
+
+  This also lands most of O8 as a side effect: the spectrum is a narrow band the author
+  picks rather than everything up to the lattice Nyquist, so it is the one noise here that
+  minifies gracefully.
+
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
   **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the

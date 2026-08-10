@@ -4752,13 +4752,42 @@ the *randomness vocabulary* is thin. Nothing below is started.
 
         Scene assets are git-ignored `*.obj`; the header now carries the exact
         `tools/make_mesh.py` commands, verified to reproduce both meshes byte-for-byte.
-- [ ] **O4 — anisotropic / flow-aligned noise.** Noise stretched and steered along a direction field —
-      wood grain following a trunk, hair/fur flow, brushed metal, muscle striation. Needs a per-hit
-      tangent frame (partly there via `nx ny nz` + UV derivatives) and a way to bind a flow field.
-- [ ] **O5 — blue noise / Gabor noise / sparse convolution.** Zero hits for `blue noise` or `gabor`.
-      Blue-noise point sets matter for *placement* (freckles, pores, spots) as much as shading; Gabor
-      noise is the principled band-limited/anisotropic alternative to lattice noise and antialiases
-      properly under minification, which lattice value noise does not.
+- [x] **O4 — anisotropic / flow-aligned noise.** ✅ **DONE v0.165.0** — `gabor(x, y, z, f, wx, wy, wz)`,
+      `src/gabor.h`, self-test `-checkgabor` (9 sections), worked scene `scenes/pattern_gabor.ftsl`.
+
+      The premise above ("needs a per-hit tangent frame") turned out to be wrong twice over. `Hit`
+      has carried one since C6 (`tangent` + `bitangentSign`, geometry.h:115) — and exposing it would
+      not have helped, because the only thing a frame buys a *lattice* noise is the coordinate
+      rotation `noise(R(p)·p)`, whose Jacobian `R + (dR/dp)·p` shears with distance from an arbitrary
+      origin for exactly the reason O3's write-up gives for spatially varying frequency. A lattice
+      noise's orientation *is* its grid; there is no fixing it from outside. So O4 is a different
+      primitive, not a new variable: Gabor noise (sparse convolution of oriented band-pass kernels),
+      where orientation and bandwidth are **kernel** parameters and a kernel only ever sees the offset
+      from its own centre. A varying direction then leaves a residual bounded by the local turning
+      rate, not by `|p|` — `-checkgabor` §6 measures the same local frequency at the origin and 4000
+      units out, with a direction field that is actually varying.
+
+      Four places where the standard recipe was replaced by something exact: a compactly supported C²
+      envelope `(1-r²)³` of radius one cell, so the 3×3×3 search is *exact* rather than Lagae's
+      truncated-Gaussian 95% (and needs no `exp`); per-cell Poisson(λ) impulses, which make the point
+      set a genuinely homogeneous Poisson process, hence stationary under *arbitrary* translation
+      (§7, asserted against lattice value noise's 8× on-lattice/mid-cell variance gap so it can't pass
+      vacuously); a per-impulse random phase, which makes the variance analytic and **independent of
+      `f`** — necessary because `f` is a runtime operand; and its own range-reduced cosine, because
+      libm's is not correctly rounded and CUDA's differs from the host's, which would break the
+      backend-identical contract.
+
+      Author-facing: two independent anisotropy knobs — the **direction** sets which way the field
+      oscillates (streaks run *perpendicular* to it), while **scaling the coordinates unevenly**
+      stretches the kernels. Wood end grain is the demo that makes the varying-direction case obvious:
+      steer radially about a vertical axis and the bands close into growth rings, one expression, no
+      polar remap.
+- [ ] **O5 — blue noise / sparse convolution *placement*.** Gabor noise itself is **done** under O4
+      above (v0.165.0) — band-limited, anisotropic, sparse-convolution, and it answers the
+      "antialiases properly under minification" half of this item. What is still missing is the
+      *placement* half: blue-noise point sets for freckles, pores, spots — a Poisson-disk / dart-throwing
+      point set queryable from a pattern the way `worley` queries its jittered lattice. Note
+      `patGaborRaw`'s per-cell Poisson draw is already most of the machinery.
 - [ ] **O6 — reaction–diffusion.** Zero hits. Gray–Scott on a texture domain is the classic route to
       coat patterning (spots→stripes→labyrinths as one continuous knob) and is a *bake* step, not a
       per-hit evaluation, so it fits the existing `tex:` path: bake offline → sample in a formula.

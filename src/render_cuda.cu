@@ -4495,6 +4495,13 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
                 st[sp-1] = (float)((sel == 3) ? w[2] : (sel == 2) ? (w[1] - w[0]) : w[sel]);
                 break;
             }
+            case PatOp::Gabor: {   // Gabor noise (double core): promote / demote like PovFn
+                float dz = st[--sp], dy = st[--sp], dx = st[--sp];
+                float ff = st[--sp], zz = st[--sp], yy = st[--sp];
+                st[sp-1] = (float)patGabor((double)st[sp-1], (double)yy, (double)zz,
+                                           (double)ff, (double)dx, (double)dy, (double)dz);
+                break;
+            }
             case PatOp::PovFn: {   // POV internals are double-only: promote args, demote result
                 int id = (int)nd.a;
                 int na = povFnArity(id);
