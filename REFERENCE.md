@@ -2621,6 +2621,52 @@ reads and MIS would bias the image; the loader rejects it with an explanation.
 Deterministic self-test `ftrace -checkcavity`, worked example
 `scenes/pattern_cavity.ftsl`.
 
+**Distance-driven patterns — `sdf`.** `curv` reads the surface a point is *on* and
+`cavity` reads how enclosed it is; neither can answer *"how far is this point from
+**that** object?"* — the question behind moss creeping up from the ground, frost
+thickening away from a heat source, or wear radiating out from a contact. An `sdf`
+element bakes the **signed distance to one named mesh** onto a 3-D lattice and publishes
+it under the ordinary `grid:` namespace:
+
+```
+mesh "ring" { file "scenes/torus.obj"  material steel  scale 0.75  translate 1 0.22 0.8 }
+sdf  "halo" { object "ring"  res 128  pad 0.65 }     # res 8..512 (96); pad ⇒ ¼ longest axis
+
+pattern "bloom" { expr "1 - smoothstep(0.12, 0.30, grid:halo(x, y, z))" }
+```
+
+Negative inside, positive outside, in world units. Because it *is* a grid it needs no new
+syntax and works at every site a grid already works — a `pattern`, a material slot, an
+`isosurface` leaf, and a **medium `density`/`ior` program**, which is the case the other
+two cannot reach at all: a volume has no normal, no UV and no hit point to hang a surface
+property off, so a spatial field is the only kind of input it can take.
+
+`pad` is the range of the effect: outside the lattice the sampler clamps, so a
+distance-keyed mask stops varying there. The default suits a band hugging the object;
+reaching across a room means saying so. `res` buys spatial resolution, not accuracy —
+distances are measured exactly (an exact point-triangle narrow band, then Bridson
+closest-triangle sweeps), and the sign comes from the same generalized-winding
+voxelization a `medium`'s `bounds { object … }` uses, so a model made of several
+overlapping closed bodies reads as their **union** instead of hollowing out.
+
+Because the bake needs the geometry, an `sdf` cannot be read by anything evaluated
+*during* the load — a procedural `texture { rgb "…" }`, a `camera_curve` driver. The
+loader refuses those rather than returning 0, which in a distance field would mean
+"exactly on the surface".
+
+| | `curv` | `cavity` | `sdf` |
+|---|---|---|---|
+| Kind | local (2nd derivative) | non-local, short probe | non-local, unbounded |
+| About | the surface you are on | *everything* nearby | **one named object** |
+| A ring hovering clear of a floor | `0` — the floor is flat | `~0` — nothing touches | the halo you wanted |
+| Readable from a `medium` | no | no | **yes** |
+| Cost | free | rays, gated per material | one load-time bake |
+
+Deterministic self-test `ftrace -checksdf` (it bakes axis-aligned boxes, which carry no
+tessellation error and whose signed distance is closed-form, and checks every lattice
+sample against it exactly), worked example `scenes/pattern_sdf.ftsl`. Full syntax in
+FTSL.md §6.
+
 ## Participating media / fog
 
 `medium { sigma_t <v> albedo <v> g <v> rayleigh <bool> }`, or from the CLI with
@@ -3346,7 +3392,7 @@ alone can't restore, so they are not disk-resumable.
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkcurv`,
-`-checkcavity`, `-checksun`,
+`-checkcavity`, `-checksdf`, `-checksun`,
 `-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
 `PASS`/`FAIL`. `-checkcurve` guards the `curve` primitive: it cross-checks the

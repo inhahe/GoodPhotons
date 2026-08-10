@@ -623,6 +623,66 @@ partition of unity, symmetry, the closed-form two-sample weight for several expo
 far-field flattening, and the compile/arity/namespace rules), and
 `scenes/pattern_scatter.ftsl` renders one feature per wall strip.
 
+**Distance to an object — `sdf "<name>" { object "<mesh>" }`:** an `sdf` element bakes the
+**signed distance to a named mesh** onto a 3-D lattice and registers it under the ordinary
+`grid:` namespace, so it is read as `grid:<name>(x, y, z)` — negative inside the object,
+positive outside, in world units. There is no new expression syntax and no new opcode: an
+`sdf` *is* a `grid`, just one whose samples are measured off the scene instead of typed
+out, so it works unchanged at **every** site a grid already works — a `pattern`, a material
+slot, an `isosurface` leaf, a medium `density`/`ior` program.
+
+```
+mesh "ring" { file "scenes/torus.obj"  material steel  scale 0.75  translate 1 0.22 0.8 }
+
+sdf "halo" { object "ring"  res 128  pad 0.65 }
+
+# frost on the floor, keyed on how near the (hovering, untouching) ring is
+pattern "bloom" { expr "1 - smoothstep(0.12, 0.40, grid:halo(x, y, z))" }
+
+# …and the same field driving a volume, which has no surface to hang a property off
+medium "glow" { sigma_t 1.6  albedo 0.85  density_max 1
+                density "max(0, 1 - smoothstep(0, 0.30, grid:halo(x, y, z)))"
+                bounds { min 0.32 0 0.12   max 1.68 0.62 1.48 } }
+```
+
+| Key | Meaning |
+|---|---|
+| `object "<name>"` | The `mesh` block to measure distance to. **Required.** Must be a plain `mesh`: a `mesh_asset` keeps its triangles in object space behind a BLAS, so there are no world triangles to measure, and the loader says so rather than baking nonsense. |
+| `res` | Samples along the **longest** padded axis; the other two get however many cubic voxels that implies. `8..512`, omitted ⇒ **96**. Buys spatial resolution, not accuracy — the distances themselves are measured exactly. |
+| `pad` | How far **outside** the object's bounding box the lattice reaches, in scene units. Omitted ⇒ **a quarter of the object's longest axis**. This is the control that matters — see below. |
+| `outside` | The same three policies as a `grid` (`clamp` default, `wrap`, `extrapolate`). `clamp` is nearly always right here: past the padding the field simply stops changing. |
+
+`pad` **is the range of the effect.** Outside the lattice the sampler clamps, so a mask
+keyed on distance stops varying there; the default is sized for a band hugging the object,
+and anything meant to reach across a room has to say so. The bake reports itself at load:
+
+```
+[sdf] "halo": 127 x 97 x 128 samples over 0.01555 m voxels (16384 tris, 0.65 m pad,
+      deepest interior -0.09634 m)
+```
+
+Two ordering rules follow from *when* the bake can happen — the name has to exist before
+patterns compile, the geometry has to exist before any distance can be measured:
+
+* An `sdf` may name a mesh declared **anywhere** in the file; declaration order does not
+  matter.
+* An `sdf` **cannot** be read by anything that is itself evaluated *while the scene loads*
+  — a procedural `texture { rgb "…" }`, a `camera_curve` driver. Those are load errors
+  rather than silent zeros, because 0 in a distance field means "exactly on the surface":
+  the one wrong answer that looks entirely reasonable.
+
+A mesh made of several **overlapping or self-intersecting** closed bodies reads as their
+**union** (generalized winding — the same signed-crossing voxelization a `medium`'s
+`bounds { object … }` uses) instead of hollowing out where they overlap. Distances
+*outside* such a union are exact; distances *inside* it are measured to the nearest
+triangle, which may be a buried one — see `known-issues.md`.
+
+`ftrace -checksdf` is the deterministic self-test: it bakes axis-aligned **boxes**, whose
+12 triangles carry no tessellation error and whose signed distance is closed-form, and
+checks every lattice sample against it exactly. `scenes/pattern_sdf.ftsl` renders the case
+that isolates the feature — a ring hovering clear of the floor, so `curv` (the floor is
+flat) and `cavity` (nothing touches it) both read 0 and only a distance field can see it.
+
 **Inline array literals — `[0 1](u)`:** most of the tables an author actually writes are
 three numbers long and used exactly once, and giving each of those a name, a block and a
 `pattern` wrapper is more ceremony than content. So an array may be written **where it is
@@ -2221,8 +2281,11 @@ is why this stays per-scene rather than a raised global default.
 ## 17. Load order and validation
 
 The loader runs in passes: scene units/spectral → spectra → textures → patterns →
-materials (+ mix/layered resolve) → geometry/lights/medium/cameras/render →
-`Scene::build()`. Notable hard errors: unknown block/material/type/preset, a scene
+materials (+ mix/layered resolve) → geometry/lights/medium/cameras/render → **`sdf`
+bakes** → `Scene::build()`. (`sdf` is split across two of those: it reserves its name
+before patterns compile — so `grid:<name>(…)` resolves and type-checks — and fills in the
+measured samples after the geometry it measures exists.) Notable hard errors: unknown
+block/material/type/preset, a scene
 with **no light**, a `mix` with nested children or weights summing > 1, a `function`
 isosurface without `contained_by`, an isosurface without exactly one root element, and
 any unknown spectrum/preset/identifier.

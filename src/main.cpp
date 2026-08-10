@@ -3907,6 +3907,473 @@ static int checkCavity() {
     return ok ? 0 : 1;
 }
 
+// Deterministic signed-distance-field self-test (`-checksdf`): the `sdf` element (O3
+// stage 3 — non-stationary randomness). Bakes tiny meshes in memory; no renderer.
+//
+// `curv` reads the surface a shading point is ON and `cavity` reads how enclosed it is,
+// but neither can answer "how far is this point from THAT object" — the question behind
+// moss creeping up from the ground, frost thickening away from a heat source, or wear
+// radiating out from a contact. `sdf "name" { object "…" }` bakes that distance onto a
+// lattice and publishes it as an ordinary `grid:name(x, y, z)`.
+//
+// The whole suite rests on one choice: **the test geometry is an axis-aligned BOX**.
+// A box is exactly representable by 12 triangles, and its signed distance has a closed
+// form, so the bake and the analytic answer are not "close" — they are the SAME NUMBER,
+// checked to float storage precision at every one of ~40 000 lattice samples. That turns
+// what would otherwise be an eyeball test into an exact one, and it is why a sphere (whose
+// tessellation error, R·(1−cos(π/N)), swamps every real defect) is not used here.
+//
+// What each section defends, and the mutation it catches:
+//   §1 THE ANCHOR. Every sample of a padded box bake equals the analytic box SDF. This
+//      is simultaneously the sign (stage 1), the exact narrow band (stage 2) and the
+//      propagation (stage 3), because a single wrong triangle anywhere breaks it.
+//   §2 PROPAGATION REACH, reported separately for samples more than 3 voxels from the
+//      surface — the ones the narrow band never seeds, which are right only if the
+//      closest-triangle sweeps carried a triangle out to them. This is the section that
+//      caught the original bug: seeding the exact separable EDT with exact squared
+//      distances is not a distance transform (it adds SQUARES where distance adds
+//      LENGTHS), which read a 71.5 mm tube as 47 mm — smooth, plausible, and 34 % short.
+//   §3 UNION SEMANTICS on two OVERLAPPING boxes: the overlap must read INSIDE. An
+//      even-odd (parity) voxelizer hollows it out instead, which is the exact failure the
+//      signed-crossing scanline in `voxelizeSolidInto` exists to avoid. The exterior
+//      distance is additionally checked against min(dA, dB), which is provably the
+//      union's own exterior distance.
+//   §4 A NON-CONVEX configuration — two DISJOINT boxes — where the closest triangle is
+//      often across a gap and the sweeps have to carry it there. Still exact.
+//   §5 LATTICE GEOMETRY: cubic voxels on all three axes, `res` samples along the LONGEST
+//      one, `lo` at the padded AABB corner, `hiCorner()` at the far one. A field whose
+//      lattice is misplaced is wrong everywhere while looking perfectly smooth.
+//   §6 `pointTriDistSq` against an INDEPENDENT exact reference on OBTUSE triangles. The
+//      tempting "project onto the plane and clamp the barycentrics" shortcut is wrong
+//      exactly there, and an imported mesh is full of obtuse triangles.
+//   §7 THE MEMORY ORDER, sampled through `patGridSample` itself. `SdfBake` is produced
+//      x-fastest but `PatGrid` is "axis 0 outermost", so the bake transposes on the way
+//      out; getting that backwards is invisible in every aggregate statistic and shows up
+//      only as a field that is plausible but rotated. Checked by comparing the sampled
+//      grid against the analytic box SDF at off-lattice points.
+//   §8 THE LOADER round trip: an `sdf` block over an in-memory cube OBJ registers a real
+//      ndim-3 `PatGrid`, and reading it from a material reproduces the analytic field.
+//   §9 THE LOADER'S REFUSALS: no `object`, an unknown object, a duplicate name, `res` out
+//      of range, a negative `pad` — and the one that is not mere validation, an `sdf` read
+//      from a procedural `texture`, which is BAKED DURING THE LOAD, before the geometry it
+//      measures exists. Letting that through would return 0, and 0 in a distance field
+//      means "exactly on the surface": the most confidently wrong answer available.
+static int checkSdf() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checksdf] %-52s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+    auto chkb = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checksdf] %-52s BAD\n", what); ok = false; }
+        return cond;
+    };
+
+    // ---- shared helpers -------------------------------------------------------
+    // The 8 corners of a box, then 6 quads wound COUNTER-CLOCKWISE seen from OUTSIDE.
+    // The winding is load-bearing: `voxelizeSolidInto` takes the sign of each crossing
+    // from the projected triangle area, so an inside-out box voxelizes to nothing.
+    auto addBox = [](std::vector<Tri>& out, const Vec3& c, const Vec3& e) {
+        const Vec3 v[8] = {
+            {c.x - e.x, c.y - e.y, c.z - e.z}, {c.x + e.x, c.y - e.y, c.z - e.z},
+            {c.x + e.x, c.y + e.y, c.z - e.z}, {c.x - e.x, c.y + e.y, c.z - e.z},
+            {c.x - e.x, c.y - e.y, c.z + e.z}, {c.x + e.x, c.y - e.y, c.z + e.z},
+            {c.x + e.x, c.y + e.y, c.z + e.z}, {c.x - e.x, c.y + e.y, c.z + e.z},
+        };
+        static const int f[6][4] = {
+            {0, 3, 2, 1},   // -z
+            {4, 5, 6, 7},   // +z
+            {0, 1, 5, 4},   // -y
+            {3, 7, 6, 2},   // +y
+            {0, 4, 7, 3},   // -x
+            {1, 2, 6, 5},   // +x
+        };
+        for (const auto& q : f) {
+            Tri a; a.v0 = v[q[0]]; a.v1 = v[q[1]]; a.v2 = v[q[2]];
+            Tri b; b.v0 = v[q[0]]; b.v1 = v[q[2]]; b.v2 = v[q[3]];
+            out.push_back(a); out.push_back(b);
+        }
+    };
+    // Exact signed distance to an axis-aligned box (Quilez's closed form): outside, the
+    // length of the componentwise-positive overhang; inside, the negated distance to the
+    // nearest face.
+    auto boxSdf = [](const Vec3& p, const Vec3& c, const Vec3& e) {
+        const Vec3 q(std::fabs(p.x - c.x) - e.x,
+                     std::fabs(p.y - c.y) - e.y,
+                     std::fabs(p.z - c.z) - e.z);
+        const Vec3 qp(std::max(q.x, 0.0), std::max(q.y, 0.0), std::max(q.z, 0.0));
+        return length(qp) + std::min(std::max(q.x, std::max(q.y, q.z)), 0.0);
+    };
+
+    // The bake's geometry is chosen so no lattice sample ever lands exactly ON a face:
+    // a sample at distance 0 has an arbitrary sign under the voxelizer's half-open span
+    // rule, and would make the anchor flap rather than fail. `pad` is deliberately not a
+    // round multiple of the voxel edge, which also keeps `nx/ny/nz` off their floor()
+    // boundaries.
+    const Vec3  kC(0.0, 0.0, 0.0), kE(0.5, 0.36, 0.24);
+    const double kPad = 0.2718;
+    const int    kRes = 41;
+
+    // ---- §1: the analytic anchor ----------------------------------------------
+    meshvox::SdfBake bake;
+    {
+        std::vector<Tri> tris;
+        addBox(tris, kC, kE);
+        bake = meshvox::bakeSignedDistance(tris.data(), 0, tris.size(), kRes, kPad);
+        if (!chkb("§1 box bake is non-empty", !bake.empty())) {
+            std::printf("[checksdf] FAIL\n");
+            return 1;
+        }
+        double wAll = 0.0, wFar = 0.0;
+        int nFar = 0, signBad = 0;
+        for (int i = 0; i < bake.nx; ++i)
+            for (int j = 0; j < bake.ny; ++j)
+                for (int k = 0; k < bake.nz; ++k) {
+                    const Vec3 p = bake.lo + Vec3(i * bake.h, j * bake.h, k * bake.h);
+                    const double want = boxSdf(p, kC, kE);
+                    const double got  = (double)bake.d[bake.at(i, j, k)];
+                    const double e = std::fabs(got - want);
+                    if (e > wAll) wAll = e;
+                    if ((got < 0.0) != (want < 0.0)) ++signBad;
+                    if (std::fabs(want) > 3.0 * bake.h) {
+                        ++nFar;
+                        if (e > wFar) wFar = e;
+                    }
+                }
+        ok &= chk("§1 worst |bake - analytic box SDF|", wAll, 0.0, 2e-6);
+        ok &= chk("§1 sign disagreements", (double)signBad, 0.0, 0.0);
+        // ---- §2: and specifically where only the sweeps can have reached -------
+        chkb("§2 the far-from-surface set is non-trivial", nFar > 1000);
+        ok &= chk("§2 worst error > 3 voxels from the surface", wFar, 0.0, 2e-6);
+    }
+
+    // ---- §3: two OVERLAPPING boxes read as their union -------------------------
+    {
+        const Vec3 cA(0.0, 0.0, 0.0), eA(0.4, 0.4, 0.4);
+        const Vec3 cB(0.5, 0.1, 0.0), eB(0.4, 0.25, 0.3);
+        std::vector<Tri> tris;
+        addBox(tris, cA, eA);
+        addBox(tris, cB, eB);
+        meshvox::SdfBake b2 = meshvox::bakeSignedDistance(tris.data(), 0, tris.size(), 33, 0.2137);
+        if (chkb("§3 overlapping-union bake is non-empty", !b2.empty())) {
+            int signBad = 0, overlapSamples = 0;
+            double wOut = 0.0;
+            for (int i = 0; i < b2.nx; ++i)
+                for (int j = 0; j < b2.ny; ++j)
+                    for (int k = 0; k < b2.nz; ++k) {
+                        const Vec3 p = b2.lo + Vec3(i * b2.h, j * b2.h, k * b2.h);
+                        const double dA = boxSdf(p, cA, eA), dB = boxSdf(p, cB, eB);
+                        const double got = (double)b2.d[b2.at(i, j, k)];
+                        const bool inside = (dA < 0.0) || (dB < 0.0);
+                        // Skip samples within half a voxel of either surface: their sign
+                        // is decided by the voxelizer's half-open span rule, not by the
+                        // question being asked here.
+                        if (std::min(std::fabs(dA), std::fabs(dB)) > 0.5 * b2.h &&
+                            (got < 0.0) != inside) ++signBad;
+                        if (dA < 0.0 && dB < 0.0) ++overlapSamples;
+                        // OUTSIDE both, the union's own distance provably equals
+                        // min(dA, dB): the nearer of the two closest points cannot lie in
+                        // the other box's interior without that box's surface being nearer
+                        // still. (INSIDE it does not — the bake also sees the two boxes'
+                        // buried faces, which are not on the union's boundary. That is a
+                        // documented limitation, not something this test hides.)
+                        if (dA > 0.0 && dB > 0.0)
+                            wOut = std::max(wOut, std::fabs(got - std::min(dA, dB)));
+                    }
+            chkb("§3 the two boxes actually overlap", overlapSamples > 100);
+            ok &= chk("§3 union sign disagreements (parity would hollow)",
+                      (double)signBad, 0.0, 0.0);
+            ok &= chk("§3 worst exterior |bake - min(dA,dB)|", wOut, 0.0, 2e-6);
+        }
+    }
+
+    // ---- §4: two DISJOINT boxes — non-convex, gap-crossing propagation ---------
+    {
+        const Vec3 cA(0.0, 0.0, 0.0), eA(0.30, 0.30, 0.30);
+        const Vec3 cB(1.2, 0.0, 0.0), eB(0.20, 0.35, 0.25);
+        std::vector<Tri> tris;
+        addBox(tris, cA, eA);
+        addBox(tris, cB, eB);
+        meshvox::SdfBake b3 = meshvox::bakeSignedDistance(tris.data(), 0, tris.size(), 49, 0.1613);
+        if (chkb("§4 disjoint-pair bake is non-empty", !b3.empty())) {
+            double w = 0.0;
+            for (int i = 0; i < b3.nx; ++i)
+                for (int j = 0; j < b3.ny; ++j)
+                    for (int k = 0; k < b3.nz; ++k) {
+                        const Vec3 p = b3.lo + Vec3(i * b3.h, j * b3.h, k * b3.h);
+                        const double dA = boxSdf(p, cA, eA), dB = boxSdf(p, cB, eB);
+                        // Disjoint and separated by more than either one's inradius, so
+                        // every boundary point of each box IS on the union's boundary and
+                        // the union's signed distance is just the nearer of the two.
+                        const double m = std::min(std::fabs(dA), std::fabs(dB));
+                        const double want = (dA < 0.0 || dB < 0.0) ? -m : m;
+                        w = std::max(w, std::fabs((double)b3.d[b3.at(i, j, k)] - want));
+                    }
+            ok &= chk("§4 worst |bake - union of two disjoint boxes|", w, 0.0, 2e-6);
+        }
+    }
+
+    // ---- §5: lattice geometry --------------------------------------------------
+    {
+        const Vec3 ext = kE * 2.0 + Vec3(2 * kPad, 2 * kPad, 2 * kPad);
+        const double maxExt = std::max(ext.x, std::max(ext.y, ext.z));
+        ok &= chk("§5 voxel edge == longestAxis / (res - 1)",
+                  bake.h, maxExt / (kRes - 1), 1e-12);
+        ok &= chk("§5 lo.x == aabbLo.x - pad", bake.lo.x, kC.x - kE.x - kPad, 1e-12);
+        ok &= chk("§5 lo.y == aabbLo.y - pad", bake.lo.y, kC.y - kE.y - kPad, 1e-12);
+        ok &= chk("§5 lo.z == aabbLo.z - pad", bake.lo.z, kC.z - kE.z - kPad, 1e-12);
+        ok &= chk("§5 res samples along the longest axis", (double)bake.nx, (double)kRes, 0.0);
+        chkb("§5 shorter axes get fewer samples", bake.ny < bake.nx && bake.nz < bake.ny);
+        // Cubic voxels: the same h on every axis, so the lattice covers each axis to
+        // within one voxel of its padded extent and never overshoots it.
+        const Vec3 hic = bake.hiCorner();
+        chkb("§5 hiCorner covers the padded AABB (within one voxel)",
+             hic.x >= kC.x + kE.x + kPad - 1e-12 &&
+             hic.y >= kC.y + kE.y + kPad - bake.h &&
+             hic.z >= kC.z + kE.z + kPad - bake.h);
+        chkb("§5 hiCorner does not overshoot",
+             hic.y <= kC.y + kE.y + kPad + 1e-12 &&
+             hic.z <= kC.z + kE.z + kPad + 1e-12);
+        ok &= chk("§5 sample count == nx*ny*nz", (double)bake.d.size(),
+                  (double)((size_t)bake.nx * bake.ny * bake.nz), 0.0);
+    }
+
+    // ---- §6: pointTriDistSq on obtuse triangles, vs an independent routine -----
+    {
+        // Independent and exact: project onto the plane; if the projection is inside the
+        // triangle that IS the closest point, otherwise the closest point lies on one of
+        // the three edges. Shares no code with the Voronoi-region version under test.
+        auto refDistSq = [](const Vec3& p, const Vec3& a, const Vec3& b, const Vec3& c) {
+            const Vec3 n = cross(b - a, c - a);
+            const double nn = dot(n, n);
+            if (nn > 0.0) {
+                const Vec3 q = p - n * (dot(n, p - a) / nn);          // p projected onto the plane
+                const double u = dot(cross(b - a, q - a), n) / nn;
+                const double v = dot(cross(q - a, c - a), n) / nn;
+                if (u >= 0.0 && v >= 0.0 && u + v <= 1.0) { const Vec3 e = p - q; return dot(e, e); }
+            }
+            auto segDistSq = [&](const Vec3& s, const Vec3& t) {
+                const Vec3 d = t - s;
+                const double dd = dot(d, d);
+                double w = (dd > 0.0) ? dot(p - s, d) / dd : 0.0;
+                w = std::min(std::max(w, 0.0), 1.0);
+                const Vec3 e = p - (s + d * w);
+                return dot(e, e);
+            };
+            return std::min(segDistSq(a, b), std::min(segDistSq(b, c), segDistSq(c, a)));
+        };
+        // A deliberately obtuse sliver (the angle at v1 is ~170 degrees) plus a second
+        // one rotated out of any axis plane, probed on a coarse lattice that covers all
+        // seven Voronoi regions and the interior.
+        const Vec3 tA[3][3] = {
+            {{0.0, 0.0, 0.0}, {1.0, 0.06, 0.0}, {2.0, 0.0, 0.0}},
+            {{0.0, 0.0, 0.0}, {0.9, 0.05, 0.4}, {1.7, -0.3, 0.9}},
+            {{-0.2, 0.1, -0.3}, {1.4, 0.02, 0.15}, {0.6, -0.05, 0.05}},
+        };
+        double w = 0.0;
+        for (const auto& t : tA)
+            for (int a = -6; a <= 6; ++a)
+                for (int b = -6; b <= 6; ++b)
+                    for (int c = -6; c <= 6; ++c) {
+                        const Vec3 p(0.25 * a, 0.25 * b, 0.25 * c);
+                        w = std::max(w, std::fabs(meshvox::pointTriDistSq(p, t[0], t[1], t[2]) -
+                                                  refDistSq(p, t[0], t[1], t[2])));
+                    }
+        ok &= chk("§6 pointTriDistSq vs independent exact routine", w, 0.0, 1e-12);
+    }
+
+    // ---- §7: memory order, read the way a pattern reads it ---------------------
+    {
+        // Publish the §1 bake as a PatGrid exactly the way the loader does, then sample
+        // it through patGridSample at OFF-lattice points. Trilinear interpolation of an
+        // exact distance field is not itself exact, so the tolerance is the interpolation
+        // error of a field whose second derivative is O(1/|d|) — but a transposed lattice
+        // is off by whole tenths, three orders of magnitude above it.
+        PatGrid g;
+        g.ndim = 3;
+        g.shape[0] = bake.nx; g.shape[1] = bake.ny; g.shape[2] = bake.nz;
+        const Vec3 hic = bake.hiCorner();
+        g.lo[0] = bake.lo.x; g.lo[1] = bake.lo.y; g.lo[2] = bake.lo.z;
+        g.hi[0] = hic.x;     g.hi[1] = hic.y;     g.hi[2] = hic.z;
+        g.outside = PatGridOutside::Clamp;
+        g.off = 0; g.count = (int)bake.d.size();
+        double w = 0.0;
+        for (int a = 1; a < 12; ++a)
+            for (int b = 1; b < 12; ++b)
+                for (int c = 1; c < 12; ++c) {
+                    // Irrational-ish offsets so no probe lands on a lattice node.
+                    const Vec3 p(bake.lo.x + (a + 0.371) * (bake.nx - 2) * bake.h / 12.0,
+                                 bake.lo.y + (b + 0.517) * (bake.ny - 2) * bake.h / 12.0,
+                                 bake.lo.z + (c + 0.233) * (bake.nz - 2) * bake.h / 12.0);
+                    const double co[3] = {p.x, p.y, p.z};
+                    const double got = patGridSample(g, bake.d.data(), (int)bake.d.size(), co);
+                    w = std::max(w, std::fabs(got - boxSdf(p, kC, kE)));
+                }
+        ok &= chk("§7 patGridSample vs analytic (axis order + interp)", w, 0.0, 0.35 * bake.h);
+        // And the transposed reading is unambiguously worse — otherwise the tolerance
+        // above is loose enough to pass either way and the section proves nothing.
+        PatGrid gt = g;
+        gt.shape[0] = bake.nz; gt.shape[2] = bake.nx;
+        gt.lo[0] = bake.lo.z;  gt.lo[2] = bake.lo.x;
+        gt.hi[0] = hic.z;      gt.hi[2] = hic.x;
+        double wt = 0.0;
+        for (int a = 1; a < 12; ++a)
+            for (int c = 1; c < 12; ++c) {
+                const Vec3 p(bake.lo.x + (a + 0.371) * (bake.nx - 2) * bake.h / 12.0,
+                             0.0,
+                             bake.lo.z + (c + 0.233) * (bake.nz - 2) * bake.h / 12.0);
+                const double co[3] = {p.x, p.y, p.z};
+                wt = std::max(wt, std::fabs(patGridSample(gt, bake.d.data(), (int)bake.d.size(), co) -
+                                            boxSdf(p, kC, kE)));
+            }
+        chkb("§7 a transposed lattice would fail loudly", wt > 20.0 * (0.35 * bake.h));
+    }
+
+    // ---- §8: the loader round trip ---------------------------------------------
+    // A cube as OBJ text, handed to the loader through the same in-memory asset overlay
+    // the loom live channel uses, so the test needs no file on disk.
+    auto cubeObj = [](const Vec3& c, const Vec3& e) {
+        std::string s = "# unit box\n";
+        char buf[128];
+        const double sx[8] = {-1, 1, 1, -1, -1, 1, 1, -1};
+        const double sy[8] = {-1, -1, 1, 1, -1, -1, 1, 1};
+        const double sz[8] = {-1, -1, -1, -1, 1, 1, 1, 1};
+        for (int i = 0; i < 8; ++i) {
+            std::snprintf(buf, sizeof buf, "v %.17g %.17g %.17g\n",
+                          c.x + sx[i] * e.x, c.y + sy[i] * e.y, c.z + sz[i] * e.z);
+            s += buf;
+        }
+        static const int f[6][4] = {
+            {0, 3, 2, 1}, {4, 5, 6, 7}, {0, 1, 5, 4}, {3, 7, 6, 2}, {0, 4, 7, 3}, {1, 2, 6, 5},
+        };
+        for (const auto& q : f) {   // 1-based indices, quads (the loader triangulates)
+            std::snprintf(buf, sizeof buf, "f %d %d %d %d\n",
+                          q[0] + 1, q[1] + 1, q[2] + 1, q[3] + 1);
+            s += buf;
+        }
+        return s;
+    };
+    // `body` is dropped between the scene header and the geometry; every scene here has
+    // the same cube, camera and light so only the `sdf` fragment varies.
+    auto loadWithCube = [&](const std::string& body, ftsl::Loaded& L, std::string& err) {
+        assetbytes::Overlay ov;
+        ov.put("cube.obj", cubeObj(kC, kE));
+        const std::string src =
+            "scene { units meters  spectral 360 830 1 }\n" + body +
+            "material \"grey\" { type diffuse reflect rgb 0.5 0.5 0.5 }\n"
+            "mesh \"blk\" { file \"cube.obj\"  material grey }\n"
+            "quad { origin -2 -1 -2  u 4 0 0  v 0 0 4  material grey }\n"
+            "light area { origin -0.5 1.5 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0"
+            "  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0 0.6 2.5  look_at 0 0 0  up 0 1 0  fov_y 40"
+            "  film { res 8 8 } }\n";
+        return ftsl::loadSource(src, "<checksdf>", L, err, {}, nullptr, &ov);
+    };
+    {
+        ftsl::Loaded L; std::string e;
+        const std::string body =
+            "sdf \"halo\" { object \"blk\"  res 41  pad 0.2718 }\n"
+            "pattern \"prox\" { expr \"grid:halo(x, y, z)\" }\n";
+        if (!chkb("§8 sdf scene loads", loadWithCube(body, L, e)))
+            std::printf("[checksdf]     load error: %s\n", e.c_str());
+        else if (chkb("§8 one grid registered", L.scene.grids.size() == 1)) {
+            const PatGrid& g = L.scene.grids[0];
+            ok &= chk("§8 registered grid is 3-D", (double)g.ndim, 3.0, 0.0);
+            ok &= chk("§8 grid sample count", (double)g.count,
+                      (double)((size_t)g.shape[0] * g.shape[1] * g.shape[2]), 0.0);
+            chkb("§8 samples landed in the shared pool",
+                 g.off >= 0 && g.off + g.count <= (int)L.scene.dataPool.size());
+            ok &= chk("§8 lattice lo.x == aabbLo.x - pad", g.lo[0], kC.x - kE.x - 0.2718, 1e-9);
+            // The payload: read the published field the way a material would.
+            double w = 0.0;
+            for (int a = 1; a < 10; ++a)
+                for (int b = 1; b < 10; ++b)
+                    for (int c = 1; c < 10; ++c) {
+                        const Vec3 p(g.lo[0] + (g.hi[0] - g.lo[0]) * (a + 0.31) / 10.5,
+                                     g.lo[1] + (g.hi[1] - g.lo[1]) * (b + 0.47) / 10.5,
+                                     g.lo[2] + (g.hi[2] - g.lo[2]) * (c + 0.19) / 10.5);
+                        const double co[3] = {p.x, p.y, p.z};
+                        w = std::max(w, std::fabs(patGridSample(g, L.scene.dataPool.data(),
+                                                                (int)L.scene.dataPool.size(), co) -
+                                                  boxSdf(p, kC, kE)));
+                    }
+            const double hh = (g.hi[0] - g.lo[0]) / (g.shape[0] - 1);
+            ok &= chk("§8 published field vs analytic box SDF", w, 0.0, 0.35 * hh);
+        }
+    }
+
+    // ---- §9: the loader's refusals ---------------------------------------------
+    {
+        auto rejects = [&](const char* label, const std::string& body, const char* needle) {
+            ftsl::Loaded L; std::string e;
+            if (loadWithCube(body, L, e)) { chkb(label, false); return; }
+            if (needle && e.find(needle) == std::string::npos) {
+                std::printf("[checksdf] %-52s message omits \"%s\" (was: %s)  BAD\n",
+                            label, needle, e.c_str());
+                ok = false;
+            }
+        };
+        rejects("§9 sdf without `object` is rejected",
+                "sdf \"halo\" { res 32 }\n", "object");
+        rejects("§9 sdf naming an unknown object is rejected",
+                "sdf \"halo\" { object \"nope\" }\n", "nope");
+        rejects("§9 duplicate sdf/grid name is rejected",
+                "sdf \"halo\" { object \"blk\" }\nsdf \"halo\" { object \"blk\" }\n",
+                "duplicate");
+        rejects("§9 res below the floor is rejected",
+                "sdf \"halo\" { object \"blk\"  res 4 }\n", "res");
+        rejects("§9 res above the ceiling is rejected",
+                "sdf \"halo\" { object \"blk\"  res 4096 }\n", "res");
+        rejects("§9 negative pad is rejected",
+                "sdf \"halo\" { object \"blk\"  pad -1 }\n", "pad");
+        // The one that matters: a procedural texture is baked WHILE the scene loads.
+        rejects("§9 sdf read from a procedural texture is rejected",
+                "sdf \"halo\" { object \"blk\" }\n"
+                "texture \"t\" { res 8 8  rgb \"grid:halo(u, v, 0)\" \"0\" \"0\" }\n",
+                "halo");
+        // …and the guard is not a blanket ban: the same texture over an ordinary
+        // expression still loads, or the check above is vacuous.
+        {
+            ftsl::Loaded L; std::string e;
+            if (!loadWithCube("texture \"t\" { res 8 8  rgb \"u\" \"v\" \"0.5\" }\n", L, e)) {
+                std::printf("[checksdf] §9 an ordinary procedural texture was rejected"
+                            " (%s)  BAD\n", e.c_str());
+                ok = false;
+            }
+        }
+        // Inputs with no lattice to bake onto return an EMPTY bake, which the loader turns
+        // into a load error. The alternative — a lattice of zeros — would be worse than no
+        // field at all, because 0 in a distance field means "exactly on the surface".
+        {
+            std::vector<Tri> tris;
+            addBox(tris, kC, Vec3(0, 0, 0));            // all 8 corners coincident
+            chkb("§9 zero-extent mesh with no pad bakes to an empty lattice",
+                 meshvox::bakeSignedDistance(tris.data(), 0, tris.size(), 16, 0.0).empty());
+            chkb("§9 empty triangle range bakes to an empty lattice",
+                 meshvox::bakeSignedDistance(tris.data(), 0, 0, 16, 0.1).empty());
+            // A zero-VOLUME mesh with padding is NOT empty, and must not be: it still has a
+            // perfectly good unsigned field (here, distance to a point). What it must not do
+            // is invent an interior out of a solid that has no inside.
+            meshvox::SdfBake pt = meshvox::bakeSignedDistance(tris.data(), 0, tris.size(), 16, 0.1);
+            if (chkb("§9 zero-volume mesh with pad still bakes", !pt.empty())) {
+                double mn = 1e30, mx = -1e30;
+                for (float v : pt.d) { mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); }
+                chkb("§9 …and invents no interior", mn >= 0.0);
+                chkb("§9 …and its far corner is a real distance", mx > 0.05);
+            }
+        }
+    }
+
+    std::printf("[checksdf] worst absolute error = %.3g\n", worst);
+    std::printf("[checksdf] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic N-D scatter sampler self-test (src/pattern.h: PatScatter /
 // patScatterSample, reached from a pattern expression as `scatter:<name>(c0, …)`).
 // The ragged sibling of -checkgrid; validates, with no scene and no renderer:
@@ -9042,6 +9509,7 @@ static int run(int argc, char** argv) {
     bool checkWorleyOnly = false;
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
+    bool checkSdfOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
     bool checkPropOnly = false;
@@ -9457,6 +9925,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkworley")) checkWorleyOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
+        else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
         else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
@@ -9644,6 +10113,7 @@ static int run(int argc, char** argv) {
     if (checkWorleyOnly)   return checkWorley();   // ditto (cellular / Worley noise)
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
+    if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
     if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)

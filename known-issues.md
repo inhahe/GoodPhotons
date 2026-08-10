@@ -80,6 +80,27 @@ a look-development concern, not a composition/motion one, and the preview alread
 roughness and film-thickness maps by design. Logged so that a future "make the preview
 show patterns properly" pass doesn't assume this one falls out with `curv`.
 
+### OPEN (2026-08-10, v0.163.0): an `sdf` over a self-overlapping mesh is exact outside but not inside
+
+`meshvox::bakeSignedDistance` takes its **sign** from generalized winding, so a model made
+of several overlapping or self-intersecting closed bodies correctly reads as their *union*
+rather than hollowing out. Its **magnitude**, though, is the distance to the nearest
+triangle — and inside such a union some triangles are *buried*, interior to the solid and
+therefore not on the union's boundary at all. So an interior sample near a buried face
+reports a distance much smaller than its true distance to the union's surface.
+
+Outside the union this cannot happen and the field is exact: a segment from an exterior
+point to a buried triangle must cross the boundary, so the boundary is always nearer.
+`-checksdf` §3 pins both halves — exterior distances checked against `min(dA, dB)`, and the
+sign checked everywhere — rather than papering over the interior case.
+
+Defensible for now because every idiom the feature exists for (proximity masks, auras,
+moss/frost/wear gradients) reads the field from *outside* the object, and because the
+proper fix is not small: it needs the union's actual boundary, i.e. a mesh-boolean or a
+narrow-band re-extraction of the zero level set followed by a re-sweep against *that*. If
+an interior-accurate field is ever needed (e.g. driving a medium *inside* a self-
+intersecting model), that is the work.
+
 ### TECH DEBT (2026-08-09, v0.161.0): a non-uniformly scaled instance's `curv` is approximated by |det|^(1/3)
 
 Mean curvature is 1/length, so the instance path has to rescale it. For a **uniform**

@@ -1775,6 +1775,81 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `hitAt2(p, n, ng)` helper that holds the geometric normal fixed while varying only the
   shading normal.
 
+  **Distance to a named object (`sdf`, O3 stage 3, v0.163.0).** `curv` reads the surface a
+  point is ON and `cavity` reads how enclosed it is; neither can answer "how far is this
+  point from THAT object", which is non-local in a way no per-hit property can be, and is
+  about a *named* object rather than about everything. The whole feature is **a bake plus a
+  header**: `sdf "halo" { object "ring" res 128 pad 0.65 }` measures the signed distance to
+  one `mesh` onto a lattice and registers it as an ordinary `PatGrid`, read as
+  `grid:halo(x, y, z)`. **Zero new VM opcodes, zero new device code** — which is exactly why
+  it works, unchanged, at every site `grid:` already works: patterns, material slots,
+  `isosurface` leaves, `camera_curve` drivers, and *medium `density`/`ior` programs*. That
+  last one is the case `curv`/`cavity` structurally cannot reach: a volume has no normal, no
+  UV and no hit point, so a spatial field is the only input it can take.
+
+  The bake (`meshvox::bakeSignedDistance`) is three stages, and each one is a deliberate
+  choice over a cheaper wrong alternative:
+  1. **Sign** from `voxelizeSolidInto` — the signed-crossing (generalized winding) scanline
+     extracted out of `voxelizeSolid` for this. A multi-body or self-intersecting model
+     therefore reads as its **union** instead of hollowing out where the bodies overlap. Sign
+     is the only part of an SDF a mesh can be genuinely ambiguous about, and this is the one
+     place in the codebase where that has already been argued out and measured (the fog
+     bound).
+  2. **Exact narrow band**: every triangle visits the samples within 2 voxels of its AABB
+     and records the exact point-triangle distance *and which triangle produced it*, via
+     `pointTriDistSq` (Ericson §5.1.5, full Voronoi-region test — the "project and clamp the
+     barycentrics" shortcut is wrong on obtuse triangles, i.e. on most imported geometry).
+     Parallelised over z-slabs after bucketing triangles into the slabs they touch, so no
+     two threads share a sample and no atomics are needed.
+  3. **Propagation** by Bridson's closest-**triangle** sweep (SDFGen): 2 rounds × 8 octant
+     sweeps, each sample adopting a neighbour's closest triangle if re-measuring against it
+     wins. Distance stays exact-per-triangle everywhere; only the *search* is approximate.
+
+  Stage 3 was originally the exact separable EDT that `featherGrid` uses, seeded with the
+  narrow band's exact squared distances. That is **not a distance transform**: F&H computes
+  min over q of (|p−q|² + f[q]), which is only correct for BINARY seeds — with exact seeds
+  it adds *squares* where distance adds *lengths* (the two legs are collinear in the case
+  that matters, so the answer wants (|p−q| + d_q)², not |p−q|² + d_q²). It read a 71.5 mm
+  torus tube as 47 mm: smooth, plausible, and 34 % short. Propagating the closest
+  *primitive* rather than a distance is what makes the composition legal. The trap is
+  documented at the function with the measured numbers.
+
+  **Load ordering is forced to split in two**, because the name must resolve before Pass 1c
+  compiles patterns but the samples cannot exist before Pass 3 loads geometry.
+  `Builder::reserveSdf` (Pass 1a′) registers an empty ndim-3 `PatGrid` under `gridIndex_`, so
+  `grid:halo(x,y,z)` type-checks and any other arity is a compile error; `fillSdfs` (after
+  Pass 3) resolves the `MeshGroup`, bakes, and appends to `Scene::dataPool`. The gap between
+  them is real, so `rejectUnbakedSdf` guards the only two places a pattern is *evaluated
+  during the load* — a procedural `texture { rgb … }` bake and a `camera_curve` driver — and
+  makes them load errors. Letting them through would return `patGridSample`'s empty-table 0,
+  and 0 in a distance field means "exactly on the surface": the most confidently wrong answer
+  available.
+
+  One subtlety worth the comment it carries: `SdfBake::d` is written in **PatGrid order (axis
+  0 outermost)**, not the x-fastest order the voxelizer and sweeps work in, so the array can
+  be appended to the pool verbatim. The transpose happens once, in stage 4. Getting it
+  backwards is invisible in every aggregate statistic — min, max, histogram, "deepest
+  interior" all agree — and shows up only as a field that is plausible but rotated, which is
+  why `-checksdf` §7 samples through `patGridSample` and separately asserts that the
+  transposed reading would fail loudly.
+
+  `-checksdf` rests on one choice: **the test geometry is an axis-aligned box**, exactly
+  representable by 12 triangles and with a closed-form signed distance, so the bake and the
+  analytic answer are the same number at all ~40 000 lattice samples (checked to 2e-6, i.e.
+  float storage precision) rather than merely close. A sphere would have buried every real
+  defect under its own tessellation error, R·(1−cos π/N). Nine sections: the anchor, the
+  propagation reach reported separately for samples > 3 voxels out, union semantics on
+  overlapping boxes (a parity voxelizer hollows the overlap and dies here), a disjoint pair
+  for gap-crossing propagation, lattice geometry, `pointTriDistSq` against an independently
+  written exact routine on obtuse triangles, the memory order, the loader round trip through
+  an in-memory OBJ via `assetbytes::Overlay`, and the six refusals.
+
+  Known limitation, logged: *inside* an overlapping union the magnitude is the distance to
+  the nearest triangle, which may be a buried one, so it is not the union's own interior
+  distance. Exterior distances are provably exact (a buried triangle can never be nearer to
+  an exterior point than the boundary the segment to it crosses), and the exterior is what
+  the feature is for.
+
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
   **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the

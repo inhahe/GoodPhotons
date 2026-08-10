@@ -795,6 +795,17 @@ public:
             if (b.type != "scatter") continue;
             if (!addScatter(b, L)) return false;
         }
+        // Pass 1a': `sdf` blocks RESERVE their grid slot here and are BAKED after the
+        // geometry pass (fillSdfs). An sdf is a grid whose samples are measured off the
+        // scene rather than typed out, so its name and arity have to exist before patterns
+        // compile (Pass 1c) while its data cannot exist until the mesh it measures has
+        // loaded (Pass 3). Everything read at RENDER time — materials, media, isosurface
+        // fields — is filled by then; the two things baked DURING the load are guarded
+        // explicitly (see rejectUnbakedSdf).
+        for (const auto& b : blocks) {
+            if (b.type != "sdf") continue;
+            if (!reserveSdf(b, L)) return false;
+        }
 
         // Pass 1b: image textures (must exist before materials that bind them).
         for (const auto& b : blocks) {
@@ -878,11 +889,17 @@ public:
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
                      b.type == "texture" || b.type == "pattern" || b.type == "record" ||
-                     b.type == "grid" || b.type == "scatter" ||
+                     b.type == "grid" || b.type == "scatter" || b.type == "sdf" ||
                      b.type == "upsample" ||
                      b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
         }
+        // Bake every reserved `sdf` now that world geometry exists. FIRST of the deferred
+        // sweeps, so a groom's driver, a fog density and a medium bound can all read the
+        // field — and before `stripShapeOnlyMeshes`, so a proxy mesh can define a field and
+        // then be removed from the render.
+        if (!fillSdfs(L)) return false;
+
         // Deferred fur sweep. Before the medium sweep and before stripShapeOnlyMeshes, so
         // a groom can be grown on a `shape_only` scalp that is then removed from the scene.
         for (const Block* fb : furBlocks) {
@@ -2464,6 +2481,12 @@ private:
             if (!compilePatternExpr(rgbS->val.words[0], pr, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
             if (!compilePatternExpr(rgbS->val.words[1], pg, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
             if (!compilePatternExpr(rgbS->val.words[2], pb, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
+            // This bake runs in Pass 1b, long before geometry, so an `sdf` it reads is
+            // still empty; say so instead of baking a texture against a field of zeros.
+            const std::string twho = "texture '" + b.name + "'";
+            if (!rejectUnbakedSdf(pr, twho, "a procedural `texture { rgb … }`") ||
+                !rejectUnbakedSdf(pg, twho, "a procedural `texture { rgb … }`") ||
+                !rejectUnbakedSdf(pb, twho, "a procedural `texture { rgb … }`")) return false;
             int res = (int)dblOf(b, "res", 512.0);
             if (res < 1) res = 1; else if (res > 8192) res = 8192;
             tex.encoding = TexEncoding::Linear;   // expr outputs are linear albedo already
@@ -3335,6 +3358,170 @@ private:
         int id = (int)L.scene.grids.size();
         L.scene.grids.push_back(g);
         gridIndex_[b.name] = id;
+        return true;
+    }
+
+    // ---- `sdf "name" { object "mesh" res N pad D }` — a measured distance grid ----
+    //
+    // O3 stage 3. A distance-to-mesh field: `grid:<name>(x, y, z)` reads the signed
+    // distance in world units to the named mesh, negative inside. It is deliberately a
+    // GRID and not a new pattern variable, because a grid already reaches every place a
+    // field could be wanted — a material's slot or `weight_map`, an `isosurface` leaf, a
+    // medium's `density`/`ior` program, a `camera_curve` driver — on both backends,
+    // through code that is already written and already uploaded to the device. The whole
+    // feature is therefore a bake plus a header; the VM learns nothing new.
+    //
+    // Why this is the third leg of O3: `curv` reads the shape of the surface a point is
+    // ON and `cavity` reads how enclosed it is, but neither can answer "how far is this
+    // point from that object over there" — the question behind moss creeping up from the
+    // ground, frost thickening away from a heat source, wear radiating from a contact, or
+    // fog that hugs a silhouette. That question is non-local in a way no per-hit property
+    // can be, and unlike `cavity` it is about a NAMED object rather than everything.
+    //
+    // Two-phase, and the split is forced: the name must resolve before patterns compile,
+    // the data cannot exist before geometry loads. `reserveSdf` runs in Pass 1a' and
+    // registers an empty 3-D header; `fillSdfs` runs after Pass 3 and fills it.
+    struct PendingSdf {
+        const Block* blk = nullptr;
+        int gridId = -1;
+    };
+    std::vector<PendingSdf> pendingSdfs_;
+
+    bool reserveSdf(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("sdf needs a \"name\""); return false; }
+        if (gridIndex_.count(b.name)) {
+            fail("duplicate grid/sdf name '" + b.name + "' — an `sdf` registers under the "
+                 "same `grid:` namespace it is read through");
+            return false;
+        }
+        const std::string who = genWho("sdf", b.name);
+        if (!find(b, "object")) {
+            fail(who + " needs `object \"<mesh name>\"` — the geometry to measure distance to");
+            return false;
+        }
+        // The header is real (ndim 3, so `grid:name(x,y,z)` type-checks and any other
+        // arity is rejected at compile time) but holds no samples yet; `patGridSample`
+        // reads count <= 0 as 0, which is why an unbaked read has to be refused rather
+        // than left to return a plausible-looking zero.
+        PatGrid g;
+        g.ndim = 3;
+        for (int a = 0; a < 3; ++a) { g.shape[a] = 1; g.lo[a] = 0; g.hi[a] = 1; }
+        g.outside = PatGridOutside::Clamp;
+        g.off = 0; g.count = 0;
+        PendingSdf ps;
+        ps.gridId = (int)L.scene.grids.size();
+        ps.blk = &b;
+        L.scene.grids.push_back(g);
+        gridIndex_[b.name] = ps.gridId;
+        pendingSdfs_.push_back(ps);
+        return true;
+    }
+
+    // Is `nodes` reading a grid slot that is still an unbaked `sdf`? Called from the two
+    // places a pattern is EVALUATED during the load rather than during the render — a
+    // procedural `texture`'s bake and a `camera_curve` driver — where the samples genuinely
+    // do not exist yet. Without this the read would quietly return 0, which for a distance
+    // field means "exactly on the surface" and would look like a plausible result.
+    bool rejectUnbakedSdf(const std::vector<PatNode>& nodes, const std::string& who,
+                          const char* what) {
+        if (pendingSdfs_.empty()) return true;
+        for (const PatNode& nd : nodes) {
+            if (nd.op != PatOp::Grid) continue;
+            for (const PendingSdf& ps : pendingSdfs_) {
+                if (ps.gridId != (int)nd.a) continue;
+                fail(who + ": `grid:" + ps.blk->name + "` is a baked `sdf`, and " +
+                     std::string(what) + " is evaluated while the scene is still loading — "
+                     "before the geometry it measures exists. Read it from a material, a "
+                     "medium or an `isosurface` field instead, which are evaluated during "
+                     "the render.");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool fillSdfs(Loaded& L) {
+        for (const PendingSdf& ps : pendingSdfs_) {
+            if (stopped()) return false;
+            const Block& b = *ps.blk;
+            const std::string who = genWho("sdf", b.name);
+            const std::string onm = strOf(b, "object", "");
+
+            // Resolve the named object to a run of WORLD triangles. Same registry the
+            // medium's `bounds { object … }` uses, and the same two failure modes.
+            const MeshGroup* grp = nullptr;
+            for (const MeshGroup& mg : L.scene.meshGroups)
+                if (mg.name == onm) { grp = &mg; break; }
+            if (!grp || grp->triCount == 0) {
+                fail(who + ": `object \"" + onm + "\"` names no mesh with world triangles" +
+                     std::string((grp && grp->blasId >= 0)
+                         ? " (it is an INSTANCED mesh_asset, whose triangles live in object "
+                           "space behind a BLAS; measure a non-instanced `mesh` block instead)"
+                         : " — give the name of a `mesh` block"));
+                return false;
+            }
+
+            const int res = (int)dblOf(b, "res", 96.0);
+            if (res < 8 || res > 512) { fail(who + ": `res` must be 8..512"); return false; }
+
+            // `pad` is how far OUTSIDE the mesh the field is measured, and it is the
+            // feature's real control: outside the lattice the sampler clamps, so a mask
+            // keyed on distance simply stops changing there. Default is a quarter of the
+            // object's longest axis — enough for the "band hugging the object" idiom this
+            // exists for, and a value the author is expected to raise when the effect is
+            // supposed to reach across the room.
+            Vec3 blo(1e300, 1e300, 1e300), bhi(-1e300, -1e300, -1e300);
+            for (size_t t = 0; t < grp->triCount; ++t) {
+                const Tri& tr = L.scene.tris[grp->triStart + t];
+                for (const Vec3& v : {tr.v0, tr.v1, tr.v2}) {
+                    blo.x = std::min(blo.x, v.x); blo.y = std::min(blo.y, v.y); blo.z = std::min(blo.z, v.z);
+                    bhi.x = std::max(bhi.x, v.x); bhi.y = std::max(bhi.y, v.y); bhi.z = std::max(bhi.z, v.z);
+                }
+            }
+            const Vec3 bext = bhi - blo;
+            const double longest = std::max(bext.x, std::max(bext.y, bext.z));
+            // The default is already in internal units (it is derived from the world AABB),
+            // so only an AUTHORED `pad` goes through Len().
+            const double pad = find(b, "pad") ? Len(dblOf(b, "pad", 0.0)) : 0.25 * longest;
+            if (pad < 0.0) { fail(who + ": `pad` is a distance and cannot be negative"); return false; }
+
+            meshvox::SdfBake bake = meshvox::bakeSignedDistance(
+                L.scene.tris.data(), grp->triStart, grp->triCount, res, pad);
+            if (stopped()) return false;
+            if (bake.empty()) {
+                fail(who + ": the bake produced an empty lattice (degenerate mesh, or a "
+                     "`res`/`pad` combination asking for more than 120 M samples)");
+                return false;
+            }
+
+            PatGrid& g = L.scene.grids[ps.gridId];
+            g.ndim = 3;
+            g.shape[0] = bake.nx; g.shape[1] = bake.ny; g.shape[2] = bake.nz;
+            const Vec3 hic = bake.hiCorner();
+            g.lo[0] = bake.lo.x; g.lo[1] = bake.lo.y; g.lo[2] = bake.lo.z;
+            g.hi[0] = hic.x;     g.hi[1] = hic.y;     g.hi[2] = hic.z;
+            std::string os = strOf(b, "outside", "clamp");
+            if (!parseGridOutside(os, g.outside)) {
+                fail(who + ": unknown `outside` '" + os + "' (clamp|wrap|extrapolate)");
+                return false;
+            }
+            g.off   = (int)L.scene.dataPool.size();
+            g.count = (int)bake.d.size();
+            L.scene.dataPool.insert(L.scene.dataPool.end(), bake.d.begin(), bake.d.end());
+
+            double inMost = 0.0;
+            for (float v : bake.d) inMost = std::min(inMost, (double)v);
+            std::fprintf(stderr,
+                "[sdf] \"%s\": %d x %d x %d samples over %.4g m voxels (%zu tris, %.4g m pad, "
+                "deepest interior %.4g m)\n", b.name.c_str(), bake.nx, bake.ny, bake.nz,
+                bake.h, grp->triCount, pad, inMost);
+            if (!(inMost < 0.0))
+                std::fprintf(stderr,
+                    "[sdf] warning: \"%s\" has no interior — the mesh is open, inside-out, or "
+                    "thinner than one voxel, so the field is unsigned. Raise `res`.\n",
+                    b.name.c_str());
+        }
+        pendingSdfs_.clear();
         return true;
     }
 
@@ -6989,6 +7176,10 @@ private:
                      "': references a surface variable — only the flyby timeline `t` is in scope here");
                 recOk = false; return;
             }
+            // Flyby tracks are resolved to per-frame numbers during the LOAD, so an `sdf`
+            // read here would sample a field that has not been baked yet.
+            if (!rejectUnbakedSdf(drv, "camera_curve '" + base + "' " + key + " driver",
+                                  "a `camera_curve` driver")) { recOk = false; return; }
             rt.recIdx = rit->second; rt.chanIdx = ci; rt.driver = std::move(drv);
         };
         RecTrack fovRec, rollRec, zoomRec, fstopRec, focusRec;
