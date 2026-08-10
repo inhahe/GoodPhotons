@@ -375,6 +375,72 @@ change the geometry the author asked for, and on an animated channel it would qu
 motion into pops. Once-per-element rather than once-per-emit because emit runs every frame
 (`tests/test_sweep.py::test_sweptmesh_warns_once_on_fractional_turns_closed_spine`).
 
+### 7a′. Native fibers — `Strand` on ftrace's `curve` primitive (added 2026-08-07)
+`tube()` and `Beads` were both *workarounds for a missing primitive*: ftrace could not
+draw a round fiber, so loom either tessellated one into a per-frame OBJ or approximated
+it with a string of spheres. ftrace 0.150 added **`curve`** (FTSL §8.6) — control
+points + a radius, flattened at load into a watertight chain of round cones — and 0.151
+put it on the GPU. `Strand` emits it directly. No mesh file, no ring count to choose, no
+mitre to get wrong however sharply the fiber bends, and a taper for free.
+
+This is principle 5 (**emit-`.ftsl`-first**) collecting on a debt: the sweep engine
+remains the right answer for a *non-circular* profile, a twist, or when the triangles
+themselves are the product, but a circular tube is now the renderer's job.
+
+**The interesting part is the basis, and it is principle 4 (structural loops) again.**
+The spine is sampled at emit time (principle 2, discretize last) and those samples have
+to be handed over as *control* points, so the question is which basis reproduces them.
+
+- **Open spine → `catmull_rom`.** It interpolates, so the samples *are* the control
+  points and the strand passes exactly through them. `curve.h` builds an end span's
+  missing neighbour by clamping (`at(i) = pts[clamp(i)]`), which is the correct free-end
+  behaviour.
+- **Closed spine → `bspline`, wrapped by 3.** That same clamp is why Catmull-Rom
+  **cannot close a loop**: the seam span's tangent is computed from a duplicated phantom
+  rather than the point that really precedes it, so the loop is C1-broken at exactly one
+  place — and wrapping the list to fix the tangent makes some span get drawn twice. A
+  uniform cubic B-spline has no phantoms at all: span `sp` reads `pts[sp..sp+3]` and an
+  `n`-point list yields `n−3` spans, so emitting `[C₀ … C_{N−1}, C₀, C₁, C₂]` gives
+  **exactly N spans**, never touches the clamp, and is C2 *at the seam like everywhere
+  else*. There is nothing special about the seam because the seam does not exist.
+
+The price of an approximating basis is that the control points cannot just *be* the
+samples — the fiber would shrink inside its own polygon. So `loom/strands.py` **solves**
+for them: a uniform cubic B-spline span starts at `(Q[sp] + 4·Q[sp+1] + Q[sp+2])/6`, so
+pinning span `sp`'s start to sample `S[sp]` is the cyclic tridiagonal system
+`C[i−1] + 4·C[i] + C[i+1] = 6·S[i−1]` (mod N), solved by Sherman–Morrison. Its circulant
+eigenvalues are `4 + 2cos(2πk/N) ∈ [2, 6]`, so it is well conditioned at any N. The
+closed strand therefore passes through the sampled spine *and* closes seamlessly, rather
+than trading one for the other. `tests/test_strand.py` re-implements `curve.h`'s two span
+evaluators (same clamping, same basis matrices) and checks the round trip, including a
+deliberate **control**: the naive wrapped Catmull-Rom must visibly kink at the seam, or
+the seam test would be proving nothing.
+
+**Radius registration is off-by-one-able, so it is pinned by a test.** ftrace attaches
+radii to control points and interpolates them *linearly along the span*, and each basis
+pins them differently (`spanPoints`: Catmull-Rom span `sp` uses `rat(sp)`/`rat(sp+1)`;
+B-spline span `sp` uses `rat(sp+1)`/`rat(sp+2)`). So on the wrapped closed list, control
+point `j` carries the radius of sample `j−1`. Getting that wrong slides a `radius_profile`
+bulge one sample around the loop — invisible on a circle, obvious on anything else.
+
+**And the radius has to close too.** On a loop the root and the tip are the same place, so
+a `radius_tip ≠ radius`, or a `radius_profile` with `f(1) ≠ f(0)`, is a step in the fiber
+exactly at the seam. `Strand._check_seam` warns once per element, deliberately mirroring
+`SweptMesh._check_turns` — warn, never snap.
+
+**Fallout: `eval_curve` now clamps an open path instead of wrapping it.** An open strand
+has to sample its endpoint to reach its tip, and `u = 1` used to wrap round to the *start*
+of the path — which is why every internal sampler stopped at `k/n` and quietly truncated
+the last `1/n` of an open curve (the viewer's polyline said so in a comment). Wrapping is
+meaningful only for a closed curve; an open one has two ends. Values in `[0, 1)` are
+unchanged either way, so this is a strict improvement, and the viewer's display polylines
+now run endpoint-inclusive on open paths as well.
+
+**The native viewer tubes it (see §F4).** A `Strand` has no triangles to show the Meshes
+tab, so the sidecar carries a `strand` record (spine points + per-sample radii) and
+`viewer_gui.cpp`'s `strandToMesh` sweeps a preview tube along a rotation-minimising frame.
+That geometry exists only in the preview pane — ftrace itself traces the analytic cones.
+
 ### 7b. Isosurface + N-D slicer
 Emit an ftsl `isosurface`/`function` block whose input coordinates are pre-transformed
 by the Layer-2 slicer (rotate/scale/shear/drift, or true N-D slice if the function
@@ -1147,6 +1213,17 @@ tools/loom/
   `renderIsoPreviewCuda` (the `-raster-gpu` sphere-tracer — no tessellation), driven by an orbit camera and
   blitted into a D3D11 texture. This closes the last big open §F piece; the `emit` command also lays the
   groundwork for F4 off-thread re-tessellation over the live channel.
+  **F4 fibers are complete (2026-08-07, ftrace 0.153.0):** a `Strand` (§7a′) has *no* mesh to hand over —
+  its whole point is that ftrace's native `curve` flattens control points + radii into round cones at
+  load — so `_describe_element` emits a `strand` record instead (`points` = the sampled **spine** points,
+  not the emitted B-spline control points, plus the matching `radii`, `closed`, `basis`), and the C++
+  side's `strandToMesh` tubes it for the preview: one ring of `STRAND_SIDES` vertices per sample, swept
+  along a **rotation-minimising frame** (parallel transport, Rodrigues per step) so the tube doesn't
+  corkscrew round a bend. A closed fiber's frame has a residual **holonomy** after transporting across
+  the seam; that angle is spread linearly along the loop (`c[n-1] − c[0] ==` the mismatch) so the tube
+  closes on itself exactly instead of paying for the whole twist in one sheared band of triangles — the
+  same "the seam is structural, not patched" rule as the B-spline basis itself. The tube is
+  preview-only geometry: it never reaches the renderer, which traces the analytic cone chain.
 - **M8 — Affine composition.** ✅ done. Collapse an arbitrarily long chain of N-D Givens
   rotations **+ translations** into one baked `(Mat, offset)` affine per frame (extend
   `rotations()` to homogeneous coords). Win: one affine in the emitted expr instead of a

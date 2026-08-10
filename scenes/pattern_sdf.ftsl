@@ -1,0 +1,155 @@
+# pattern_sdf.ftsl — `sdf`, the distance-to-an-object field (O3 stage 3).
+#
+# The O3 series is about NON-STATIONARY randomness: patterns whose statistics change
+# with where you are, instead of tiling the same noise over everything. Its three
+# stages answer three different questions, and the third is the one the first two
+# structurally cannot reach:
+#
+#   `curv`   what SHAPE is the surface I am on?      (local: a second derivative)
+#   `cavity` how ENCLOSED is this point?             (non-local, but only out to a
+#                                                     short probe radius, and only
+#                                                     about *everything* at once)
+#   `sdf`    how far am I from THAT object?          (non-local, unbounded, and about
+#                                                     one NAMED object)
+#
+# This scene is built around the case that isolates the third. A steel ring HOVERS
+# 12 cm above the floor — it touches nothing, and neither does anything else:
+#
+#   * `curv` reads 0 everywhere on the floor. The floor is flat. It genuinely is
+#     flat, at every point, and no amount of differential geometry will ever notice
+#     that there is a torus in the air above it.
+#   * `cavity` reads ~0 there too. Its probe is a SHORT hemisphere — that is the
+#     whole reason it means "crevice" and not "ambient occlusion" — and at any
+#     sensible radius it does not reach 12 cm, let alone 30. Raise the radius until
+#     it does and the mask stops being a crevice mask: every wall base and every
+#     corner in the room lights up as well, because `cavity` cannot be pointed at
+#     one object.
+#   * `sdf "halo" { object "ring" }` bakes the signed distance to that one mesh onto
+#     a lattice and publishes it as an ordinary `grid:halo(x, y, z)`. Every pattern
+#     site in the language can then read it, because it IS a grid — there is no new
+#     expression syntax here, and nothing else in the VM had to change.
+#
+# TWO CONSUMERS, ONE FIELD. The point of publishing it as a grid rather than as a
+# per-hit variable is that the field is not attached to a surface at all, so things
+# that are not surfaces can read it:
+#
+#   FLOOR   a frost bloom whose brightness is keyed on the distance to the ring. It
+#           comes out as a RING, brightest under the tube and fading both outward and
+#           inward toward the hole — a shape that is not the object's silhouette, not
+#           its shadow, and not anything a projection would give you.
+#   AIR     a `medium` whose `density` is the same expression, so a faint aura clings
+#           to the metal and thins out into the room. A participating medium has no
+#           normal, no UV and no hit point to hang a surface property off; a spatial
+#           field is the only kind of input it can take.
+#
+# TUNING. `pad` is the control that matters. The lattice covers the object's bounding
+# box grown by `pad`, and OUTSIDE it the sampler clamps — so a distance-keyed mask
+# simply stops changing past the padding. The default (a quarter of the object's
+# longest axis) is sized for a band hugging the object; anything meant to reach across
+# a room has to say so, as `pad 0.65` does below. `res` is samples along the longest
+# padded axis; the bake is exact where it is seeded and swept, so `res` buys spatial
+# resolution, not accuracy, and 96–160 is plenty for a mask this soft.
+#
+#   ftrace -in scenes/pattern_sdf.ftsl -mode D -noise 2.5 \
+#          -window -keepwindow -o png/pattern_sdf.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# ---------------------------------------------------------------------------
+# The field. `object` names a `mesh` block, and the bake happens after the geometry
+# loads — which is why an `sdf` cannot be read by anything that is itself evaluated
+# during the load (a procedural `texture { rgb … }`, a `camera_curve` driver). The
+# loader refuses those rather than handing back 0, because 0 in a distance field
+# means "exactly on the surface".
+#
+# 1.4 m of padding on a 0.68 m ring: the lattice has to reach the floor (12 cm below
+# the tube) and then keep going far enough that the bloom has somewhere to fade to.
+# ---------------------------------------------------------------------------
+sdf "halo" { object "ring"  res 128  pad 0.65 }
+
+# ---------------------------------------------------------------------------
+# The floor mask, and the one number in this file worth understanding. Beneath the
+# TUBE the field reads 0.1225 m (the hovering gap); beneath the ring's HOLE it reads
+# about 0.23 m, because the nearest metal is now up and out to the side; and it keeps
+# growing outward from there. So the ramp is laid across exactly that 0.12-0.30 m
+# window, and the bloom comes out as a RING with a dimmer middle — the shape of the
+# distance field, which is neither the object's silhouette nor its shadow. Widen the
+# ramp to 0.12-0.6 and the hole fills in: the mask becomes a soft blob and the whole
+# point of the scene disappears. That is the failure mode to watch for whenever a mask
+# is keyed on an absolute distance.
+#
+# The fBm factor is the same idiom as scenes/pattern_cavity.ftsl: the field says where
+# frost MAY settle, the noise says how much actually did. Unlike `cavity` there is no
+# banding to hide here — a baked lattice is smooth — so the noise is doing purely
+# aesthetic work and the 0.35 floor keeps the deposit continuous.
+# ---------------------------------------------------------------------------
+pattern "bloom" {
+    expr "(1 - smoothstep(0.12, 0.30, grid:halo(x, y, z))) *
+          (0.35 + 0.65 * (0.5   * noise(21*x, 21*y, 21*z) +
+                          0.25  * noise(42*x, 42*y, 42*z) +
+                          0.125 * noise(84*x, 84*y, 84*z)) / 0.875)"
+}
+
+# The aura is keyed much tighter — it is measuring distance to the metal itself, not
+# to the metal from across a room — and it is clamped at 0 so the field's INTERIOR
+# (where the distance goes negative, inside the tube) cannot drive density negative.
+pattern "aura" { expr "max(0, 1 - smoothstep(0.0, 0.22, grid:halo(x, y, z)))" }
+
+# ---------------------------------------------------------------------------
+# Materials. In a `mix`, weight 1 selects the FIRST layer, so the frost goes first.
+# ---------------------------------------------------------------------------
+material "white" { type diffuse reflect whitewall 0.75 }
+material "frost" { type diffuse reflect rgb 0.80 0.88 0.97 }
+material "slate" { type diffuse reflect rgb 0.15 0.13 0.11 }
+material "steel" { type glossy  reflect metal:chromium  roughness 0.18 }
+
+material "frosted_floor" {
+    type mix  layer "frost" 0.5  layer "slate" 0.5  weight_map pattern:bloom
+}
+
+# ---------------------------------------------------------------------------
+# A 2 x 1.2 x 1.6 m room. Only the floor is frosted; the walls stay clean so the
+# bloom is not competing with anything.
+# ---------------------------------------------------------------------------
+quad { origin 0 0 0     u 2 0 0    v 0 0 1.6   material frosted_floor }   # floor
+quad { origin 0 1.2 0   u 0 0 1.6  v 2 0 0     material white }           # ceiling
+quad { origin 0 0 0     u 2 0 0    v 0 1.2 0   material white }           # back
+quad { origin 0 0 0     u 0 0 1.6  v 0 1.2 0   material white }           # left
+quad { origin 2 0 0     u 0 1.2 0  v 0 0 1.6   material white }           # right
+
+# The ring: 0.675 m across, 0.195 m thick, centred 0.22 m up — so its lowest point
+# sits 0.1225 m clear of the floor. It touches nothing.
+mesh "ring" {
+    file "scenes/torus.obj"
+    material steel
+    scale 0.75
+    translate 1.0 0.22 0.8
+}
+
+# The aura. `density_max` is the majorant the tracker needs; the pattern is bounded
+# by 1 at the metal, so 1 is both correct and tight. The bounds box is the ring plus
+# roughly the ramp width — outside it there would be nothing to see anyway, and a
+# medium is charged for the volume it occupies, not for the density in it.
+medium "glow" {
+    sigma_t     1.0
+    albedo      0.9
+    density     "pattern:aura"
+    density_max 1.0
+    bounds { min 0.40 0.06 0.20   max 1.60 0.55 1.40 }
+}
+
+# A wide ceiling panel: the frost is a pale deposit on a dark floor, and pale-on-dark
+# needs light on it to read at all.
+light area {
+    origin 0.25 1.199 0.25   u 1.5 0 0   v 0 0 1.0   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 1.00 1.02 2.35   look_at 1.00 0.16 0.80   up 0 1 0   fov_y 44
+    mode D
+    film { res 720 400 }
+}

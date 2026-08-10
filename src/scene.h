@@ -7,6 +7,7 @@
 #include "geometry.h"
 #include "bvh.h"
 #include "implicit.h"
+#include "curve.h"       // curve / fiber primitive (hair, fur, grass, wire) — TODO §P1
 #include "pattern.h"
 #include "spectrum.h"
 #include "scene_film.h"
@@ -254,6 +255,13 @@ struct Material {
     // single-step and the CDF bounded).
     std::vector<int>    mixChildren;               // indices into Scene::mats
     std::vector<double> mixWeights;                // selection probs, sum <= 1
+
+    // Does any program bound to this material (or, for a `mix`, to one of its layers)
+    // read the `cavity` variable? Set once at load by ftsl::setupCavity. This is the
+    // per-hit gate on the cavity probe — the ONLY pattern input that spends rays — so
+    // a patterned material that never says `cavity` fires none. See the long note on
+    // setupCavity for why a scene-wide flag would not do.
+    bool readsCavity = false;
 
     // --- Layered (MatType::Layered): a specular coat over a weighted body -------
     // Physical two-layer stack (spec §3.2). The COAT is a reflect-or-enter interface
@@ -951,6 +959,26 @@ struct MeshInstance {
     Affine toWorld = Affine::identity();   // local -> world
     Affine toLocal = Affine::identity();   // world -> local (= toWorld.inverse())
     int matOverride = -1;                  // >=0 replaces the BLAS triangles' matId
+    // Derived from toWorld: the factor a LOCAL curvature (1/length) is multiplied by to
+    // become a WORLD curvature (O3). Curvature is inverse-length, so it scales by
+    // 1/|det(linear)|^(1/3) — the average linear scale. Cached rather than recomputed
+    // per hit: instanceHitToWorld is on the shading hot path and this needs a cbrt.
+    // Exact for a uniform scale; an approximation under a non-uniform one (see
+    // instanceHitToWorld). 1.0 for any rigid transform.
+    double curvScale = 1.0;
+    // The ONLY way to set the transform, so the derived curvScale (and toLocal) can
+    // never silently go stale behind a direct `inst.toWorld = …` assignment.
+    void setToWorld(const Affine& xf) {
+        toWorld = xf;
+        toLocal = xf.inverse();
+        const double* m = xf.m;
+        double det = m[0] * (m[4] * m[8] - m[5] * m[7])
+                   - m[1] * (m[3] * m[8] - m[5] * m[6])
+                   + m[2] * (m[3] * m[7] - m[4] * m[6]);
+        double a = std::fabs(det);
+        double s = (a > 1e-30) ? std::cbrt(a) : 1.0;   // average linear scale
+        curvScale = 1.0 / s;
+    }
 };
 
 // A named mesh object as authored (one `mesh` or `mesh_asset` block), kept so tools
@@ -974,6 +1002,12 @@ struct Scene {
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
     std::vector<Implicit> implicits;   // isosurfaces / metaballs / (smooth) CSG
+    // Curve / fiber primitives (hair, fur, grass, wire). `curves` is one entry per
+    // authored strand and exists for diagnostics and future per-strand data; the thing
+    // actually traced — and the thing the BVH indexes — is the flat `curveSegs` pool of
+    // round cones each strand was flattened into at load time (see curve.h).
+    std::vector<Curve>    curves;
+    std::vector<CurveSeg> curveSegs;
     std::vector<Blas> blasList;        // shared instanced mesh assets (local space)
     std::vector<MeshInstance> instances; // placements of blasList into the world
     std::vector<MeshGroup> meshGroups;   // named mesh objects (for -check-watertight)
@@ -1004,6 +1038,23 @@ struct Scene {
         t.dataPoolN = (int)dataPool.size();
         return t;
     }
+    // ---- `cavity` probe settings (O3 stage 2) --------------------------------------
+    // How far a cavity probe ray reaches. Cavity is a NON-LOCAL measure, so unlike
+    // `curv` it has no intrinsic scale — "is this enclosed?" is only meaningful
+    // relative to a distance, and the same corner reads deeply enclosed at 1 cm and
+    // wide open at 1 m. Authored as `scene { cavity_radius <len> }`; when left at 0 the
+    // loader derives 2% of the scene's AABB diagonal, which is scale-robust (the same
+    // model reads the same whether it was authored in metres or millimetres) and beats
+    // any fixed default, since scenes here range from fibres to rooms.
+    double cavityRadius = 0.0;
+    // Probe ray count. Deliberately a fixed, DETERMINISTIC direction set (see cavityAt),
+    // not a Monte-Carlo estimate: a mask that changed sample to sample would inject its
+    // own variance into every material it drives and smear under MIS.
+    int cavitySamples = 16;
+    // Load-time gate: true only if some bound pattern actually reads `cavity`. Every
+    // probe is skipped otherwise, so a scene that does not use the feature pays exactly
+    // nothing — which matters, because this is the one pattern input that costs rays.
+    bool needsCavity = false;
     Sensor sensor;
     // Participating media. Zero or more independent regions (global haze, bounded
     // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
@@ -1542,8 +1593,12 @@ struct Scene {
             Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
             boxes.push_back(b);
         }
-        boxes.reserve(boxes.size() + implicits.size() + instances.size());
+        boxes.reserve(boxes.size() + implicits.size() + curveSegs.size() + instances.size());
         for (const auto& im : implicits) boxes.push_back(im.bounds);
+        // One leaf per round cone, NOT per strand: a whole hair's box is mostly empty,
+        // and a BVH over long thin near-collinear boxes is exactly the degeneracy
+        // TODO §P1 warned about. Per-segment bounds are also exact for what is tested.
+        for (const auto& cs : curveSegs) boxes.push_back(curveSegBounds(cs));
         // One TLAS leaf per instance: the BLAS's local bounding box transformed into
         // world space (union of its 8 transformed corners — the tightest world AABB
         // of a rotated box short of re-bounding the actual triangles).
@@ -1577,6 +1632,15 @@ struct Scene {
         Vec3 wt = inst.toWorld.applyDir(lh.tangent);
         double wtl = std::sqrt(dot(wt, wt));
         if (wtl > 1e-12) lh.tangent = wt * (1.0 / wtl);
+        // Curvature is 1/LENGTH, so an instance that scales the mesh must scale it too:
+        // blow a sphere up 10x and it gets ten times flatter. The factor is the average
+        // linear scale |det(linear)|^(1/3), which is exact for a uniform scale (the case
+        // that matters) and a reasonable mean under a mild non-uniform one — a genuinely
+        // anisotropic scale changes the two principal curvatures by DIFFERENT amounts, so
+        // no single scalar can be right and this is documented as an approximation.
+        // Also re-flip if the world-space re-orientation flipped the shading normal.
+        lh.curv *= inst.curvScale;
+        if (dot(r.d, wn) >= 0.0) lh.curv = -lh.curv;
         if (inst.matOverride >= 0) lh.matId = inst.matOverride;
     }
 
@@ -1611,7 +1675,13 @@ struct Scene {
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
+        const size_t nC = curveSegs.size();
         const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
+        // Unit ray direction + 1/|d| for the round-cone algebra: once per ray, not once
+        // per segment (a fur render tests thousands of segments per ray). See curve.h.
+        // Guarded on nC so a curve-free scene does not pay a sqrt on every single ray —
+        // verified bit-identical against the pre-curve binary on the sample scenes.
+        const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
         // Sampled tables, in case an implicit's field formula reads `grid:`/`scatter:`.
         // Built once per ray, not per implicit hit: three pointer copies either way, and
         // the lambda is called many times.
@@ -1620,8 +1690,9 @@ struct Scene {
             if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs)) tm = h.t; }
+            else if (prim < (int)(nT + nS + nI + nC)) { if (intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h)) tm = h.t; }
             else {
-                const MeshInstance& inst = instances[prim - nT - nS - nI];
+                const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
                 Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
                 Hit lh; lh.t = h.t;                    // running world tMax == local tMax
                 if (blasList[inst.blasId].intersectLocal(lr, tmin, lh)) {
@@ -1644,15 +1715,19 @@ struct Scene {
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
+        const size_t nC = curveSegs.size();
         const double seg = maxDist - tmin;
         const TriShear sh = makeTriShear(r.d);   // watertight shear for world tris: once per ray
+        const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};   // see closestHit
         const PatTables tabs = patTables();      // see closestHit
         return bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
             if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
-            const MeshInstance& inst = instances[prim - nT - nS - nI];
+            if (prim < (int)(nT + nS + nI + nC))
+                return intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h, /*anyHit=*/true);
+            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             return blasList[inst.blasId].occludedLocal(lr, tmin, seg);  // world seg == local seg
         });
@@ -1752,6 +1827,15 @@ struct Scene {
         for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
         const PatTables tabs = patTables();
         for (const auto& im : implicits) intersectImplicit(r, im, tmin, h, &tabs);
+        // Curve segments are part of the reference too. Omitting them did not make
+        // `-checkbvh` weaker, it made it WRONG: the BVH found every strand the linear
+        // scan couldn't, so the cross-check reported thousands of "mismatches" on any
+        // scene with fibers (curve_basics: 4390/2M) and a real BVH regression would
+        // have been invisible in the noise.
+        if (!curveSegs.empty()) {
+            const CurveRay cray = makeCurveRay(r.d);
+            for (const auto& cs : curveSegs) intersectCurveSeg(cray, r, cs, tmin, h);
+        }
         for (const auto& inst : instances) {
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             Hit lh; lh.t = h.t;
@@ -1801,12 +1885,78 @@ inline void bindPatScene(PatCtx& c, const Scene& s) {
     bindPatData(c, s);
 }
 
+// ---------------------------------------------------------------------------
+// `cavity` — the blocked fraction of a short hemispherical probe at a hit (O3 s2).
+// ---------------------------------------------------------------------------
+// Fires `scene.cavitySamples` short occlusion rays into the hemisphere around the
+// shaded-side normal and returns the fraction blocked: 0 on a lone plane, ~0.5 in a
+// right-angled interior corner, ->1 deep in a crevice.
+//
+// The direction set is a FIXED cosine-distributed Fibonacci spiral, not a random draw,
+// and this is the load-bearing design decision rather than an optimisation. A pattern
+// input is not a light-transport estimator: it is read many times per pixel by
+// different tracers (a mix weight here, a roughness there, again on the light subpath),
+// and every one of those reads must agree or the material itself becomes a source of
+// variance that no amount of sampling averages away cleanly. A deterministic set makes
+// `cavity` a true function of position — noise-free, identical on CPU and GPU, and
+// stable frame to frame in an animation.
+//
+// The cost of determinism is BANDING: a fixed direction set can only produce
+// cavitySamples+1 distinct values, so a smooth gradient becomes visible steps. That is
+// why the count is authorable, and why the natural way to use `cavity` is through a
+// `smoothstep` (which quantises anyway) or multiplied by a noise field (which hides the
+// steps entirely) — exactly how the crevice-grime idiom already reads.
+//
+// Cosine weighting, not uniform: cavity stands in for how much ambient light reaches
+// the point, and that is a cosine-weighted integral over the hemisphere. It also puts
+// samples where the geometry actually occludes rather than wasting them near the
+// grazing ring.
+inline double cavityAt(const Scene& scene, const Hit& h) {
+    const int N = scene.cavitySamples;
+    if (N <= 0 || scene.cavityRadius <= 0.0) return 0.0;
+    // Probe about the GEOMETRIC normal on the shaded side: using the shading normal
+    // would let an interpolated normal tilt the hemisphere into the surface on a
+    // coarse mesh and self-report occlusion that is not there.
+    const Vec3 n = orientedGeoN(h);
+    Vec3 t, b;
+    onb(n, t, b);
+    // Offset along the normal by a hair to avoid re-hitting the surface we sit on.
+    const Vec3 o = h.p + n * 1e-6;
+    const double R = scene.cavityRadius;
+    // Golden-angle spiral: the standard low-discrepancy hemisphere set, and the reason
+    // a mere 16 rays already look even rather than clumped.
+    const double golden = 3.14159265358979323846 * (3.0 - std::sqrt(5.0));
+    int blocked = 0;
+    for (int i = 0; i < N; ++i) {
+        // Cosine-weighted: sin(theta) = sqrt(u) with u stratified at bin centres.
+        const double u  = (i + 0.5) / (double)N;
+        const double sr = std::sqrt(u);          // radius in the projected disc
+        const double cz = std::sqrt(1.0 - u);    // cos(theta) — the cosine weight
+        const double ph = golden * i;
+        const Vec3 d = t * (sr * std::cos(ph)) + b * (sr * std::sin(ph)) + n * cz;
+        if (scene.occluded(o, d, R)) ++blocked;
+    }
+    return (double)blocked / (double)N;
+}
+
 // Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
 // implicit field value f (0 on non-implicit surfaces), oriented normal, radius, and
 // the scene's pattern tables (so `tex:<name>(u,v)` and `grid:<name>(…)` sampling
 // inside a pattern work).
 inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
-    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v);
+    // `cavity` is filled here rather than by the intersector because it needs the whole
+    // scene, and cached on the Hit because one shading point builds several PatCtxs.
+    // Doubly gated — scene-wide (one compare for the overwhelming majority of scenes,
+    // which never mention `cavity`) and then per-material, so a noise-textured surface
+    // sitting next to a cavity-driven one is not charged cavitySamples occlusion rays
+    // for a variable its own pattern never reads.
+    if (scene.needsCavity && !h.cavityDone &&
+        h.matId >= 0 && h.matId < (int)scene.mats.size() &&
+        scene.mats[h.matId].readsCavity) {
+        h.cavity = cavityAt(scene, h);
+        h.cavityDone = true;
+    }
+    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity);
     bindPatScene(c, scene);
     return c;
 }

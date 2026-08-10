@@ -32,6 +32,22 @@ struct Tri {
     // parameterization falls back to an arbitrary basis around gn.
     Vec3   tangent{1, 0, 0};
     double bitangentSign = 1.0;
+    // MEAN CURVATURE of the interpolated shading-normal field over this face (O3),
+    // in 1/length units, with the OUTWARD (gn-side) convention: a convex bulge is
+    // positive, a concave pit negative, a plane exactly 0. A unit sphere reads +1.
+    //
+    // Derived once here rather than per hit because it is genuinely CONSTANT over the
+    // face: barycentric interpolation makes n(p) linear in p, so its differential dn
+    // — and hence the shape operator and its trace — does not vary across the triangle.
+    // Per-hit cost is therefore a single copy, not a computation.
+    //
+    // Piecewise-constant across the mesh, but NOT visibly faceted where it matters: on a
+    // smoothly-normalled mesh neighbouring faces see nearly the same dn, so curvature
+    // varies smoothly too. It jumps only across a crease — where the surface really does
+    // have discontinuous curvature. A flat-shaded face (n0==n1==n2==gn) reads exactly 0,
+    // which is the honest answer: a facet is flat, and a faceted mesh carries its
+    // curvature on the edges as a distribution the field cannot represent.
+    double curvature = 0.0;
     void finalize() {
         gn = normalize(cross(v1 - v0, v2 - v0));
         if (dot(n0, n0) < 1e-12) n0 = gn;
@@ -55,6 +71,30 @@ struct Tri {
                 bitangentSign = (dot(cross(gn, tangent), B) < 0.0) ? -1.0 : 1.0;
             } else { Vec3 bb; onb(gn, tangent, bb); bitangentSign = 1.0; }
         } else { Vec3 bb; onb(gn, tangent, bb); bitangentSign = 1.0; }
+        // Mean curvature H = 1/2 * trace(dn restricted to the tangent plane).
+        // dn maps e1 -> n1-n0 and e2 -> n2-n0 (barycentric interpolation is linear, so
+        // this determines dn on the whole tangent plane). The trace of a linear map is
+        // basis-independent but must be taken in a DUAL basis, since {e1,e2} is not
+        // orthonormal: trace = e1*·dn(e1) + e2*·dn(e2) where {e1*,e2*} is dual to
+        // {e1,e2}. Inverting the 2x2 Gram matrix gives the closed form below, which
+        // also drops dn's out-of-plane component automatically (the dual vectors are
+        // in-plane), so no explicit projection is needed.
+        //
+        // Sanity anchors: a unit sphere with exact outward vertex normals has
+        // n = p, so dn = identity, trace = 2, H = 1. A plane has n0==n1==n2, so
+        // dn = 0 and H = 0. Scaling the mesh by s scales H by 1/s, as curvature must.
+        {
+            Vec3 dn1 = n1 - n0, dn2 = n2 - n0;
+            double gA = dot(e1, e1), gB = dot(e1, e2), gC = dot(e2, e2);
+            double gdet = gA * gC - gB * gB;                 // = 4 * area^2 > 0
+            if (gdet > 1e-24) {
+                double trace = (gC * dot(e1, dn1) - gB * dot(e2, dn1)
+                              - gB * dot(e1, dn2) + gA * dot(e2, dn2)) / gdet;
+                curvature = 0.5 * trace;
+            } else {
+                curvature = 0.0;                             // degenerate sliver
+            }
+        }
     }
 };
 
@@ -77,6 +117,29 @@ struct Hit {
     // (+1/-1) gives the bitangent handedness (B = cross(n, tangent)*bitangentSign).
     Vec3   tangent{1, 0, 0};
     double bitangentSign = 1.0;
+    // Mean curvature at the hit, 1/length, exposed to procedural patterns as `curv` (O3).
+    // Signed RELATIVE TO THE SIDE BEING SHADED: the intersector negates it whenever it
+    // flips the normal to face the ray, so a surface bulging toward the viewer is always
+    // positive and a pit is always negative — the same sphere reads +1/R from outside and
+    // -1/R from inside, which is what "how concave is it here" means locally.
+    // Analytic where the shape knows its own curvature (sphere 1/R, curve/round-cone
+    // 1/(2R)), per-face from the interpolated shading normals on a mesh that carries
+    // `vn`, and honestly 0 where there is no curvature to report: a quad or other flat
+    // facet, a FLAT-shaded mesh (no normal field to differentiate), and an implicit
+    // isosurface (which would need the field's Hessian — see known-issues.md).
+    double curv = 0.0;
+    // Cavity (O3 stage 2) — the blocked fraction of a short hemispherical probe at this
+    // hit, in [0,1], exposed to patterns as `cavity`. Unlike `curv` this is NOT filled
+    // by the intersector: it is non-local, so computing it needs the whole scene, which
+    // an intersector has no business traversing. It is filled LAZILY at shading time by
+    // patCtxFromHit(), and cached here because a single shading point builds several
+    // PatCtxs (a mix weight, a roughness map, a reflect map each ask), and an N-ray
+    // probe per ask would be paid over and over for one identical answer.
+    //
+    // `mutable` so the lazy fill works through the `const Hit&` every shading helper
+    // takes. Only ever written by cavityAt(); nothing else may touch it.
+    mutable double cavity = 0.0;
+    mutable bool   cavityDone = false;
 };
 
 // Geometric surface normal oriented onto the SAME side as the (ray-oriented) shading
@@ -248,9 +311,12 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     Vec3 ns = tri.n0 * b0 + tri.n1 * b1 + tri.n2 * b2;
     double nl = dot(ns, ns);
     ns = (nl > 1e-18) ? ns * (1.0 / std::sqrt(nl)) : tri.gn;
-    hit.n = (dot(r.d, ns) < 0.0) ? ns : -ns;
+    bool flipped = !(dot(r.d, ns) < 0.0);
+    hit.n = flipped ? -ns : ns;
     hit.tangent = tri.tangent;             // per-triangle tangent (constant across the face)
     hit.bitangentSign = tri.bitangentSign; // for tangent-space normal mapping (C6)
+    // Curvature follows the shaded side: seen from the back, a bulge IS a pit (O3).
+    hit.curv = flipped ? -tri.curvature : tri.curvature;
     return true;
 }
 
@@ -274,7 +340,11 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     hit.t = t; hit.p = r.o + r.d * t; hit.valid = true;
     Vec3 ng = normalize(hit.p - s.c);
     hit.ng = ng;
-    hit.n = (dot(r.d, ng) < 0.0) ? ng : -ng;
+    bool sFlipped = !(dot(r.d, ng) < 0.0);
+    hit.n = sFlipped ? -ng : ng;
+    // Analytic mean curvature of a sphere: 1/R everywhere, negated when seen from
+    // inside (a room-sized sphere is concave to anything standing in it).
+    hit.curv = (s.r > 1e-12) ? ((sFlipped ? -1.0 : 1.0) / s.r) : 0.0;
     hit.matId = s.matId; hit.sensorId = -1;
     // Equirectangular (lat/long) UV so spheres can be textured (globes, eyeballs).
     hit.u = 0.5 + std::atan2(ng.z, ng.x) / (2.0 * PI);

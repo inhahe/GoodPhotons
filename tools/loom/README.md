@@ -2,8 +2,8 @@
 
 Loom is a **programmatic-first** Python toolkit for building 3-D scenes and
 **seamless looping animations** out of composable *modulators*, *curves / grids /
-scatter data*, *sweeps* (ribbons / tubes / blobs), and *N-D-transformed
-isosurfaces*. It targets the [Good Photons / `ftrace`](../../README.md) spectral
+scatter data*, *sweeps* (ribbons / tubes / blobs), *fibers* (hair / wire / thread, on
+ftrace's native `curve` primitive), and *N-D-transformed isosurfaces*. It targets the [Good Photons / `ftrace`](../../README.md) spectral
 forward raytracer by **emitting one `.ftsl` scene per frame**, but is written to
 stand alone (the model is plain Python, so it can drive any renderer or a preview).
 
@@ -74,6 +74,9 @@ tools/loom/
 │   ├── pov.py       POV-Ray function library, with which are N-D-generalizable
 │   ├── spatial.py   spatial expression DSL (X, Y, Z, U, V, T + math + Image/VolumeField/SigAt terms) → ftsl `expr`
 │   ├── sweep.py     sweep engine (rotation-minimizing frames, ribbon/tube/skin_rings, OBJ out)
+│   ├── strands.py   control points for ftrace's native `curve` fiber primitive
+│   │                (open → interpolating catmull_rom; closed → a *solved* periodic
+│   │                 B-spline, so the loop closes C2 with no seam and no mesh at all)
 │   ├── mcubes.py    adaptive marching cubes (bake a scalar field to a mesh)
 │   ├── vdbio.py     bake a field to a dense grid → OpenVDB .vdb (density/temperature); reads .vdb and NanoVDB .nvdb
 │   ├── axes.py      axis-typed signals: broadcast/pin/mod composition + sample/reduce grammar + lower() onto any scene value-site
@@ -179,6 +182,7 @@ rest come back as a generic ordered `Block` that re-emits its source layout exac
 | Script | What it makes |
 |---|---|
 | `ribbon_loop.py` | a seamless looping swept **ribbon** (plus a twin tube) |
+| `strand_loop.py` | the same idea on ftrace's **native `curve` primitive** instead of a mesh: eight closed **fibers** in a breathing tangle, each with a periodic `radius_profile`, plus a ring of tapered open guide hairs. Nothing is written to disk — a fiber is a few lines of `.ftsl` and ftrace flattens it into watertight round cones at load. Worth reading next to `ribbon_loop.py`: a closed spine is emitted as a *solved* periodic B-spline, so the loop is C2 **through** the seam rather than closed by fixup |
 | `scribble_loop.py` | a seamless looping 3-D "scribble" curve |
 | `gyroid_loop.py` | a seamless looping **gyroid** isosurface |
 | `jumping_jack.py` | a **jack tumbling through a world-static gyroid**: six arms (3 gold, 3 SF10 glass) built as `intersect { union{sphere,cylinder} function{gyroid} }`, where only the arm leaves carry the pose so the lattice flows *through* the moving solid instead of riding along. The carving gyroid's level is picked by **volume fraction** (`--solid`, inverted numerically off the gyroid's own sampled distribution) rather than by a raw threshold — that is what makes the parts read as open lattice rather than dimpled balls. `--solid` alone cannot separate *lacy* from *see-through*, though, since for a one-level carve the surviving envelope **is** the volume fraction; so a sparse **counter-network** (`--counter`) taken from the gyroid's *other* labyrinth, `g >= t`, is unioned in. It threads down the middle of the first one's voids — exactly where the sight-lines run — so it halves how much of the room shows through the part for ~2 points of envelope, where buying the same reduction out of `--solid` costs ~12. Both fold into a **single** `function` leaf via `min(a,b) = ((a+b) − |a−b|)/2`, whose `a+b` is constant here, so the gyroid is still evaluated once per march step. The motion is a real jack's tumble: the ±y arm pair *is* the spin axis, it leans `--tilt` off vertical and precesses, so the two axis balls ride antiphase circles — and because that holds the bottom ball at a *constant* height, standing the jack exactly on the floor is the closed form `arm·cos(tilt) + ball` rather than a search (`rest_height`). One axis is all gold, one all glass, and the spin axis carries one of each so the jack's top and bottom stay distinguishable. Delivered as a 60 fps MP4 (432 frames, 7.2 s) plus a 20 fps GIF built from every 3rd frame, since a GIF's integer-centisecond frame delay cannot express 60. Shows the CSG field tree from a custom `Element`, plus mode W + `-gi` for a flicker-free loop |

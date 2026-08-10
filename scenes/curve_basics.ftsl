@@ -1,0 +1,138 @@
+# The CURVE / FIBER primitive — hair, fur, grass, wire, thread.
+#
+# A `curve` is control points plus a radius. ftrace flattens it at load time into a chain
+# of ROUND CONES (each the convex hull of a sphere at either end), which is what the BVH
+# indexes and what rays actually intersect — one strand costs a handful of segments rather
+# than the ~64 triangles a ribbon would need, which is the whole reason the primitive
+# exists (10^8-10^9 triangles for one furred animal is not an optimisation problem).
+#
+# Because adjacent round cones SHARE their end sphere, the chain is watertight and smooth
+# at the joints with no mitre logic: a strand is a single closed surface however sharply
+# it bends.
+#
+#   basis      linear | catmull_rom | bezier | bspline      (default catmull_rom)
+#   radius     <r>              root radius, default 1 mm
+#   radius_tip <r>              tip radius; default = radius (an untapered tube)
+#   segments   <n>              round cones per span, default 4 (linear forces 1)
+#   point x y z [r=<r>]         repeated, at least 2; `r=` overrides the taper at a point
+#
+# The hit's `u` runs 0 (root) -> 1 (tip) along the strand and `v` around its
+# circumference, so a pattern or texture can vary along or around a fiber.
+#
+#   ftrace -in scenes/curve_basics.ftsl -mode W -device cpu -spp 64 \
+#          -o png/curve_basics.png -window -keepwindow
+
+scene { units meters  spectral 360 830 1 }
+
+spectrum "goldish"  = rgb 0.90 0.75 0.30
+spectrum "copperish" = rgb 0.85 0.45 0.30
+
+material "white"  { type diffuse  reflect whitewall 0.75 }
+material "grey"   { type diffuse  reflect 0.30 }
+material "red"    { type diffuse  reflect rgb 0.62 0.10 0.10 }
+material "gold"   { type glossy   reflect spectrum:goldish   roughness 0.12 }
+material "copper" { type glossy   reflect spectrum:copperish roughness 0.30 }
+
+# `u` runs along the strand, so this bands each fiber root-to-tip.
+pattern "p_bands" { expr "0.5+0.5*sin(2*pi*9*u)" }
+material "banded" { type diffuse  reflect rgb 0.95 0.35 0.20  reflect_map pattern:p_bands }
+material "teal"   { type diffuse  reflect rgb 0.15 0.60 0.55 }
+
+# --- an open box ---
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material grey  }   # back wall
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material white }   # left wall
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material white }   # right wall
+
+# A broad ceiling panel rather than a small one: a fiber is thin, so a small source
+# leaves most of a strand's circumference in shadow and the whole scene reads black.
+light area {
+    origin 0.10 0.985 0.10   u 0.80 0 0   v 0 0 0.80   normal 0 -1 0
+    power 240   spd preset:d65
+}
+
+# --- 1. LINEAR: the control points ARE the polyline. A hard zig-zag, which is exactly
+#        the case that shows the joints are seamless (each corner is a sphere).
+curve "zigzag" {
+    material red
+    basis linear
+    radius 0.012
+    point 0.10 0.02 0.55
+    point 0.16 0.30 0.55
+    point 0.10 0.58 0.55
+    point 0.16 0.84 0.55
+}
+
+# --- 2. CATMULL-ROM (the default): interpolates every control point, so an authored
+#        guide hair passes exactly through the points you place. Tapered root->tip like
+#        a real strand, and thickened by hand at one point to show `r=` winning.
+curve "guide_hair" {
+    material gold
+    basis catmull_rom
+    radius 0.016
+    radius_tip 0.002
+    segments 12
+    point 0.30 0.02 0.55
+    point 0.36 0.24 0.48
+    point 0.27 0.46 0.60  r=0.028
+    point 0.35 0.68 0.50
+    point 0.29 0.88 0.56
+}
+
+# --- 3. BEZIER: a cubic chain, P0 C C P1 C C P2 ... (3k+1 points). Two spans here.
+curve "wire" {
+    material copper
+    basis bezier
+    radius 0.009
+    segments 16
+    point 0.52 0.02 0.55
+    point 0.72 0.16 0.55
+    point 0.38 0.34 0.55
+    point 0.56 0.46 0.55
+    point 0.74 0.58 0.55
+    point 0.40 0.76 0.55
+    point 0.58 0.90 0.55
+}
+
+# --- 4. B-SPLINE: approximating and C2, so the curve is smoother than its control
+#        polygon and does NOT pass through the points — the right basis for a groom
+#        solver's output. Banded by `u` to show the along-strand parameterisation.
+curve "smooth_strand" {
+    material banded
+    basis bspline
+    radius 0.014
+    radius_tip 0.004
+    segments 16
+    point 0.78 0.00 0.55
+    point 0.94 0.20 0.45
+    point 0.70 0.42 0.62
+    point 0.96 0.62 0.46
+    point 0.74 0.84 0.58
+    point 0.90 1.02 0.52
+}
+
+# --- 5. A strand under a GROUP transform: the affine is applied to the control points
+#        before flattening (every basis here is affine-invariant, so this is exact), and
+#        the radius picks up the group's uniform scale.
+group {
+    translate 0.50 0.02 0.95
+    rotate 0 35 0
+    scale 0.70
+    curve "tilted" {
+        material teal
+        radius 0.020
+        radius_tip 0.004
+        segments 12
+        point -0.30 0 0
+        point -0.10 0.35 0.10
+        point  0.10 0.62 -0.10
+        point  0.30 0.80 0
+    }
+}
+
+camera "cam" {
+    eye 0.5 0.55 2.05   look_at 0.5 0.48 0.55   up 0 1 0   fov_y 42
+    mode W
+    film { res 640 480 }
+}

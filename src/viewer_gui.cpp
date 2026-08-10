@@ -3,7 +3,7 @@
 #ifndef _WIN32
 // -------- Non-Windows stub: the native viewer needs Win32 + D3D11 --------------
 #include <cstdio>
-int runViewerGui(const std::string&, const std::string&, bool) {
+int runViewerGui(const std::string&, const std::string&, bool, bool, int) {
     std::fprintf(stderr, "error: -viewer is only available on Windows builds.\n");
     return 1;
 }
@@ -385,9 +385,11 @@ static std::vector<FieldGeom> collectFields(const Sidecar& sc) {
 }
 
 // --------------------------------------------------------------------------
-// F4 — SweptMesh tessellated geometry. Each swept_mesh object carries a `mesh`
-// key (vertices / faces / uvs) baked by loom; the viewer draws it as a shaded,
-// depth-sorted triangle surface in a 3-D orbit pane.
+// F4 — tessellated geometry. A `swept_mesh` object carries a `mesh` key
+// (vertices / faces / uvs) baked by loom; a `strand` object carries a fiber
+// centreline + per-sample radius and is tubed here (see `strandToMesh`). Either
+// way the viewer draws a shaded, depth-buffered triangle surface in a 3-D orbit
+// pane.
 // --------------------------------------------------------------------------
 struct MeshGeom {
     std::string        id, name, material;
@@ -398,6 +400,125 @@ struct MeshGeom {
     std::vector<float> uvs;     // flat uv (2 per vertex), may be empty
 };
 
+// A loom `Strand` ships NO triangles: it emits ftrace's native `curve` primitive,
+// which the renderer flattens into a watertight chain of round cones itself. This
+// pane is a triangle rasteriser, so the fiber is tubed *here*, from the sidecar's
+// spine samples + per-sample radius: one ring of STRAND_SIDES vertices per sample,
+// swept along a rotation-minimising frame so the tube doesn't corkscrew round a
+// bend. Preview geometry only — ftrace still renders the analytic cones, never these.
+static const int STRAND_SIDES = 10;
+
+static bool strandToMesh(const minijson::Value& s, MeshGeom& g) {
+    std::vector<std::vector<float>> pv, rv;
+    readFlatVecs(s.find("points"), pv);
+    readFlatVecs(s.find("radii"), rv);
+    const int n = (int)pv.size();
+    if (n < 2) return false;
+    const minijson::Value* cl = s.find("closed");
+    const bool closed = cl && cl->asBool(false);
+
+    std::vector<Vec3>   P(n);
+    std::vector<double> R(n, 0.0);
+    for (int i = 0; i < n; ++i) {
+        const std::vector<float>& v = pv[i];
+        P[i] = Vec3(v.size() > 0 ? v[0] : 0.0f, v.size() > 1 ? v[1] : 0.0f,
+                    v.size() > 2 ? v[2] : 0.0f);
+        R[i] = (i < (int)rv.size() && !rv[i].empty()) ? rv[i][0] : 0.0;
+    }
+    // Per-sample tangent: a central difference, wrapped on a closed fiber and
+    // one-sided at an open fiber's two ends.
+    std::vector<Vec3> T(n);
+    for (int i = 0; i < n; ++i) {
+        Vec3 d;
+        if (closed)           d = P[(i + 1) % n] - P[(i + n - 1) % n];
+        else if (i == 0)      d = P[1] - P[0];
+        else if (i == n - 1)  d = P[n - 1] - P[n - 2];
+        else                  d = P[i + 1] - P[i - 1];
+        double L = length(d);
+        T[i] = (L > 1e-12) ? d / L : Vec3(0, 0, 1);
+    }
+    // Parallel transport: carry the reference vector forward by the same rotation
+    // that takes T[i-1] to T[i]. A fixed reference (say world up) would make the
+    // ring shear wherever the fiber turns; this keeps consecutive rings aligned.
+    auto transport = [](const Vec3& u, const Vec3& t0, const Vec3& t1) {
+        Vec3   ax = cross(t0, t1);
+        double sn = length(ax), cs = dot(t0, t1);
+        Vec3   r  = u;
+        if (sn > 1e-12) {                                   // Rodrigues about t0 x t1
+            ax = ax / sn;
+            double a = std::atan2(sn, cs), c = std::cos(a), si = std::sin(a);
+            r = u * c + cross(ax, u) * si + ax * (dot(ax, u) * (1.0 - c));
+        }
+        r = r - t1 * dot(r, t1);                            // undo accumulated drift
+        double L = length(r);
+        if (L < 1e-9) { Vec3 b; onb(t1, r, b); L = length(r); }
+        return r / L;
+    };
+    std::vector<Vec3> U(n);
+    { Vec3 b; onb(T[0], U[0], b); }
+    for (int i = 1; i < n; ++i) U[i] = transport(U[i - 1], T[i - 1], T[i]);
+    if (closed && n > 2) {
+        // Transporting once more across the seam does NOT land back on U[0] — that
+        // residual angle is the frame's holonomy, and left alone it becomes a single
+        // sheared band of triangles at one joint. Spread it evenly along the loop so
+        // the tube closes on itself exactly (c[n-1] - c[0] == the mismatch).
+        Vec3   w   = transport(U[n - 1], T[n - 1], T[0]);
+        double ang = std::atan2(dot(cross(w, U[0]), T[0]), dot(w, U[0]));
+        for (int i = 0; i < n; ++i) {
+            double a = ang * ((double)i / (double)(n - 1));
+            double c = std::cos(a), si = std::sin(a);
+            U[i] = U[i] * c + cross(T[i], U[i]) * si;
+        }
+    }
+
+    // A closed fiber emits one extra ring that repeats sample 0 — the positions are
+    // identical (so the tube is still closed) but it carries u=1, which keeps the
+    // texture from folding back over the last span.
+    const int rings = closed ? n + 1 : n;
+    const int K     = STRAND_SIDES;
+    g.verts.reserve((size_t)rings * K * 3);
+    g.uvs.reserve((size_t)rings * K * 2);
+    for (int i = 0; i < rings; ++i) {
+        int   j = i % n;
+        Vec3  V = cross(T[j], U[j]);
+        float u = (rings > 1) ? (float)i / (float)(rings - 1) : 0.0f;
+        for (int k = 0; k < K; ++k) {
+            double a = 2.0 * 3.14159265358979323846 * (double)k / (double)K;
+            Vec3   p = P[j] + (U[j] * std::cos(a) + V * std::sin(a)) * R[j];
+            g.verts.push_back((float)p.x);
+            g.verts.push_back((float)p.y);
+            g.verts.push_back((float)p.z);
+            g.uvs.push_back(u);
+            g.uvs.push_back((float)k / (float)K);
+        }
+    }
+    for (int i = 0; i + 1 < rings; ++i)
+        for (int k = 0; k < K; ++k) {
+            int k1 = (k + 1) % K;
+            int a = i * K + k, b = i * K + k1, c = (i + 1) * K + k1, d = (i + 1) * K + k;
+            g.faces.push_back(a); g.faces.push_back(b); g.faces.push_back(c);
+            g.faces.push_back(a); g.faces.push_back(c); g.faces.push_back(d);
+        }
+    if (!closed) {                       // flat caps, so an open fiber isn't a straw
+        for (int e = 0; e < 2; ++e) {
+            int  j    = e ? n - 1 : 0;
+            int  ring = e ? (rings - 1) * K : 0;
+            int  ctr  = (int)g.verts.size() / 3;
+            g.verts.push_back((float)P[j].x);
+            g.verts.push_back((float)P[j].y);
+            g.verts.push_back((float)P[j].z);
+            g.uvs.push_back(e ? 1.0f : 0.0f); g.uvs.push_back(0.5f);
+            for (int k = 0; k < K; ++k) {
+                int k1 = (k + 1) % K;
+                g.faces.push_back(ctr); g.faces.push_back(ring + k); g.faces.push_back(ring + k1);
+            }
+        }
+    }
+    g.nverts = (int)g.verts.size() / 3;
+    g.nfaces = (int)g.faces.size() / 3;
+    return g.nfaces > 0;
+}
+
 static std::vector<MeshGeom> collectMeshes(const Sidecar& sc) {
     std::vector<MeshGeom> meshes;
     const minijson::Value* objs = sc.arr("objects");
@@ -406,12 +527,18 @@ static std::vector<MeshGeom> collectMeshes(const Sidecar& sc) {
     std::function<void(const minijson::Value&)> visit = [&](const minijson::Value& o) {
         if (const minijson::Value* ch = o.find("children"); ch && ch->isArray())
             for (const auto& c : ch->arr) visit(c);
-        const minijson::Value* m = o.find("mesh");
-        if (!m || !m->isObject()) return;
         MeshGeom g;
         g.id       = scalarStr(o.find("id"), "");
         g.name     = scalarStr(o.find("name"), "");
         g.material = scalarStr(o.find("material"), "");
+        // A fiber has no baked mesh — tube its centreline so it shares this pane
+        // with the swept surfaces instead of being invisible here.
+        if (const minijson::Value* st = o.find("strand"); st && st->isObject()) {
+            if (strandToMesh(*st, g)) meshes.push_back(std::move(g));
+            return;
+        }
+        const minijson::Value* m = o.find("mesh");
+        if (!m || !m->isObject()) return;
         if (const minijson::Value* v = m->find("vertices"); v && v->isArray())
             for (const auto& p : v->arr) {
                 for (int k = 0; k < 3; ++k)
@@ -703,6 +830,7 @@ struct LivePanel {
     // half. Deriving fps from the bake overstated real playback by ~10x here, which is
     // precisely the "pretend it's 30" this feature was supposed to avoid.
     double    playFps = 0.0;
+    double    msPlayPeriod = 0.0;   // the EMA `playFps` is derived from -- see below
     long long lastAdvanceQpc = 0;
     // Per-stage adoption cost, so "why is play slow?" is answered by measurement
     // rather than by guessing at the FTSL round trip. Milliseconds, last frame.
@@ -737,6 +865,14 @@ struct LivePanel {
     double msFtslBuild  = 0.0;  // Block tree -> Scene, INCLUDING assets + accel below
     double msFtslAssets = 0.0;  // of build: mesh files read+parsed from disk (obj/gltf/fbx)
     double msFtslAccel  = 0.0;  // of build: BVH construction (per-asset Blas + Scene::build)
+    // F8(b): the cost of showing a frame from the prebake cache INSTEAD of baking it --
+    // two O(1) state swaps plus the derived-view rebuilds that a fresh adoption would
+    // also have done (the skin atlas, the raymarch pane's scene upload). It exists as
+    // its own term because a cached frame pays NONE of bake/sidecar/ftsl, and leaving
+    // those reading their last uncached values would print a breakdown whose parts sum
+    // to twice the frame time it is printed beside. They are zeroed on a cache hit and
+    // this replaces them; on a real bake the reverse happens.
+    double msCache = 0.0;
     // Set by the Render tab each UI frame it actually draws. Needed because the
     // Live panel is drawn BEFORE the Render pane, so zeroing msRender when a bake
     // lands would blank it every frame during play -- it would always read 0 and
@@ -785,8 +921,15 @@ static void liveAdvanceClock(LivePanel& lp) {
     if (lp.lastAdvanceQpc && f.QuadPart) {
         double dt = double(now.QuadPart - lp.lastAdvanceQpc) / double(f.QuadPart);
         if (dt > 1e-9) {
-            double inst = 1.0 / dt;
-            lp.playFps = lp.playFps > 0.0 ? lp.playFps * 0.8 + inst * 0.2 : inst;
+            // Smooth the PERIOD and invert at the end, not the rate. Averaging rates
+            // is the wrong mean: with the §F8(b) pacer the interval alternates between
+            // two and three vblanks (33.3 / 50.0 ms at 60 Hz), whose true average is
+            // 41.7 ms = 24 fps -- but averaging 30 and 20 fps gives 25. That 6% flatter
+            // it reports the faster it is asked to go, and the readout exists precisely
+            // so the requested rate can be checked against the delivered one.
+            lp.msPlayPeriod = lp.msPlayPeriod > 0.0 ? lp.msPlayPeriod * 0.8 + dt * 1000.0 * 0.2
+                                                    : dt * 1000.0;
+            lp.playFps = 1000.0 / lp.msPlayPeriod;
         }
     }
     lp.lastAdvanceQpc = now.QuadPart;
@@ -1622,11 +1765,12 @@ float4 main(VSOut i) : SV_Target {
 };
 
 // --------------------------------------------------------------------------
-// F4 — mesh pane: SweptMesh tessellated surfaces as a shaded, z-buffered
-// triangle mesh. Orbiting the 3 spatial dims is a view-only re-projection (no
-// re-tessellation, exactly as the F4 rule specifies for isometries of the shown
-// dims). Colour: flat lambert shading, per-object tint, a UV checker, or the
-// material's real skin sampled per-pixel at the interpolated mesh UVs.
+// F4 — mesh pane: SweptMesh tessellated surfaces, plus Strand fibers tubed from
+// their centreline, as a shaded, z-buffered triangle mesh. Orbiting the 3 spatial
+// dims is a view-only re-projection (no re-tessellation, exactly as the F4 rule
+// specifies for isometries of the shown dims). Colour: flat lambert shading,
+// per-object tint, a UV checker, or the material's real skin sampled per-pixel at
+// the interpolated mesh UVs.
 // --------------------------------------------------------------------------
 struct MeshView {
     float yaw = 0.6f, pitch = 0.4f, zoom = 1.0f;
@@ -2582,6 +2726,10 @@ struct LoomJob {
     std::vector<std::pair<std::string, std::string>> params;
     bool wantSidecar = true;    // re-introspect: curves / fields / MESH geometry
     bool wantSource  = true;    // re-emit .ftsl: the Render tab's raymarched field
+    // Fingerprint of the params this job was posted at (see playCacheKey). Carried
+    // only so the result can be matched back against the prebake cache it belongs to;
+    // nothing in the request line uses it.
+    std::string key;
 };
 
 // One finished re-derivation, entire in memory. NOTHING here names a file.
@@ -2610,6 +2758,16 @@ struct LoomResult {
     std::string err;
     std::shared_ptr<LoomPayload> payload;
     double      ms = 0.0;
+    // Which clock frame this bake IS. Echoed back off the job because the prebake pass
+    // (F8b) files each result into a cache SLOT, and the UI's own `lp.frame` has usually
+    // moved on by the time a result lands — filing by "wherever the clock is now" would
+    // scramble the cache in exactly the case that matters, a prebake running ahead of
+    // the display.
+    int         frame = 0;
+    // ...and the parameter fingerprint it was baked at, so a result that was in flight
+    // when a control moved is recognised as belonging to the old scene and dropped
+    // rather than filed into the new cache under the frame number it happens to share.
+    std::string key;
 };
 
 struct LoomBridge {
@@ -2802,6 +2960,8 @@ private:
             }
             LoomResult r;
             r.seq = job.seq;
+            r.frame = job.frame;
+            r.key = job.key;
             r.payload = std::make_shared<LoomPayload>();
             LARGE_INTEGER f, t0, t1;
             QueryPerformanceFrequency(&f);
@@ -2898,19 +3058,172 @@ static void liveSeedParams(LivePanel& lp, const LoomBridge& br) {
         if (lp.params[i].kind == 0 || lp.params[i].kind == 1) { lp.sweep = (int)i; break; }
 }
 
-static LoomJob liveJob(const LivePanel& lp, bool wantSidecar, bool wantSource) {
+// The fingerprint of everything a bake depends on EXCEPT the clock: every declared
+// parameter's value, plus the clock length. Built from `toJson()` — the exact text
+// that goes down the wire — so two states that bake identically fingerprint
+// identically. It is what a prebaked cache (F8b) is a cache OF, and it is stamped onto
+// each job so a result that was in flight across a parameter change can be recognised
+// as belonging to the old scene and dropped instead of filed.
+static std::string playCacheKey(const LivePanel& lp) {
+    std::string k = "n=" + std::to_string(lp.frames);
+    for (const auto& p : lp.params) { k += '\x1f'; k += p.name; k += '='; k += p.toJson(); }
+    return k;
+}
+
+static LoomJob liveJobAt(const LivePanel& lp, int frame, bool wantSidecar, bool wantSource) {
     LoomJob j;
-    j.frame = lp.frame;
+    j.frame = frame;
     j.frames = std::max(1, lp.frames);
     j.wantSidecar = wantSidecar;
     j.wantSource = wantSource;
+    j.key = playCacheKey(lp);
     for (const auto& p : lp.params) j.params.push_back({p.name, p.toJson()});
     return j;
 }
 
+static LoomJob liveJob(const LivePanel& lp, bool wantSidecar, bool wantSource) {
+    return liveJobAt(lp, lp.frame, wantSidecar, wantSource);
+}
+
+// --------------------------------------------------------------------------
+// F8(b) — PREBAKED PLAY.
+//
+// F8(a) plays at the bake rate: the clock steps only when a result lands, which is
+// honest but slow (measured 9.75 fps at v0.148.0 on `scatter_modulated_sweep.py`, of
+// which ~42 ms/frame is loom's own Python bake and ~23 ms is adopting the result).
+// You cannot judge MOTION at 10 fps, which is what a viewer of an animated scene is
+// for. So: walk the whole clock ONCE, keep every frame, then play out of memory.
+//
+// WHAT IS CACHED, and why it is the adopted state rather than the payload. The
+// obvious cache is loom's reply (the sidecar tree + the `.ftsl` text + mesh bytes),
+// which is what the bridge already hands over. That only deletes the `bake 42`, and
+// leaves `sidecar 2 + ftsl 21` to be paid again on every replay of every frame —
+// worse, `Sidecar::adopt` and `ftsl::loadSource` both CONSUME what they are given, so
+// replaying a cached payload would mean deep-copying a ~900 KB tree per frame just to
+// have something to consume. Caching the ADOPTED products instead — the parsed
+// sidecar, the collected curves/strips/fields/meshes, the DAG layout and the built
+// `ftsl::Loaded` scene with its BVH — makes a replayed frame cost nothing but pointer
+// swaps, and the only per-frame work left is drawing.
+//
+// HOW IT AVOIDS COPYING ANY OF THAT. Every cached member is a vector-of-vectors or a
+// Scene; copying one per displayed frame would give back most of the win, and turning
+// the viewer's ~8 pane-state locals into pointers into the cache would be a wide
+// refactor of a long function. Instead the cache holds the SAME types as the live
+// locals and frames are exchanged by `std::swap`, which is O(1) for all of them. The
+// invariant that makes that safe is one line: **the live locals hold frame `liveIdx`,
+// and slot `liveIdx` is empty.** Showing frame k is then always the same two swaps —
+// park the live state back into its own slot, then swap slot k into the live state.
+// --------------------------------------------------------------------------
+
+// One cached clock frame: exactly the viewer state that a bake re-derives.
+struct PlayFrame {
+    bool                     have = false;
+    Sidecar                  sc;
+    std::vector<CurveGeom>   curves;
+    std::vector<StripSeries> strips;
+    std::vector<FieldGeom>   fields;
+    std::vector<MeshGeom>    meshes;
+    DagGraph                 dag;
+    ftsl::Loaded             loaded;
+    bool                     sceneOk = false;
+    std::string              sceneErr;
+    size_t                   bytes = 0;     // estimate; see playFrameBytes
+};
+
+struct PlayCache {
+    std::vector<PlayFrame> f;
+    // Everything a bake depends on besides the clock. A cache built at one set of
+    // parameters is not a cache of the scene the user is now looking at, so any change
+    // to a control (or to `frames`, which re-times the whole clock) drops it. Comparing
+    // a fingerprint rather than trying to notice each edit means a control added later
+    // cannot silently escape the check.
+    std::string key;
+    size_t      bytes = 0;
+    int         capMB = 1024;        // stop prebaking here; the estimate is conservative
+    bool        baking = false;
+    int         bakeNext = 0;        // frame the next prebake post asks for
+    int         bakeHave = 0;        // frames stored (including the one held live)
+    bool        capped = false;      // prebake stopped early: the cache covers a prefix
+    int         liveIdx = -1;        // the frame the LIVE locals hold; that slot is empty
+    // Cached playback is paced by a wall clock, not by the bake — that is the whole
+    // point. 0 means "as fast as it will go", which is the honest way to measure the
+    // ceiling.
+    float       targetFps = 24.0f;
+    long long   lastStepQpc = 0;
+
+    void drop() {
+        f.clear(); key.clear(); bytes = 0; baking = false;
+        bakeNext = 0; bakeHave = 0; capped = false; liveIdx = -1; lastStepQpc = 0;
+    }
+    bool holds(int i) const { return i >= 0 && i < (int)f.size() && f[i].have; }
+    // Can frame `i` be shown without going to loom? Either it is in a slot, or the
+    // live locals are already showing it.
+    bool covers(int i) const { return holds(i) || (i >= 0 && i == liveIdx); }
+    // A prefix cache is still useful (that is the point of the cap), so "usable" is
+    // not "complete" — it is "the frame we want is in it".
+    bool active(const std::string& k, int frames) const {
+        return !f.empty() && (int)f.size() == frames && key == k && bakeHave > 0;
+    }
+};
+
+// Deep size of a parsed JSON tree. Needed because the sidecar is the single largest
+// thing in a cached frame and its cost is invisible from the outside — `sizeof(Value)`
+// says nothing about a 900 KB document. Counts the vectors' own storage plus every
+// string's heap buffer; ignores allocator overhead, so it reads low, which is the
+// right direction for a cap.
+static size_t jsonTreeBytes(const minijson::Value& v) {
+    size_t n = sizeof(minijson::Value) + v.str.capacity();
+    for (const auto& c : v.arr) n += jsonTreeBytes(c);
+    for (const auto& kv : v.obj) n += kv.first.capacity() + jsonTreeBytes(kv.second);
+    return n;
+}
+
+// Estimated resident size of one cached frame. Every term is a real allocation the
+// cache is holding onto; what is NOT counted is small and fixed (names, the DAG's
+// layout, the Loaded camera list), so the number is a floor. Shown as an estimate and
+// used for the cap, never for anything that has to be exact.
+static size_t playFrameBytes(const PlayFrame& pf) {
+    size_t n = jsonTreeBytes(pf.sc.root);
+    for (const auto& c : pf.curves) {
+        n += c.poly.capacity() * 4 + c.ctrl.capacity() * 4;
+        for (const auto& ch : c.channels) n += ch.samp.capacity() * 4;
+    }
+    for (const auto& s : pf.strips) n += (s.x.capacity() + s.y.capacity()) * 4;
+    for (const auto& f : pf.fields)
+        for (const auto& p : f.points)
+            n += p.pos.capacity() * 4 + p.val.capacity() * 4 + p.idx.capacity() * 4;
+    for (const auto& m : pf.meshes)
+        n += m.verts.capacity() * 4 + m.uvs.capacity() * 4 + m.faces.capacity() * 4;
+    const Scene& s = pf.loaded.scene;
+    n += s.tris.capacity() * sizeof(Tri)
+       + s.spheres.capacity() * sizeof(Sphere)
+       + s.implicits.capacity() * sizeof(Implicit)
+       + s.curveSegs.capacity() * sizeof(CurveSeg)
+       + s.instances.capacity() * sizeof(MeshInstance)
+       + s.dataPool.capacity() * sizeof(float)
+       + s.bvh.nodes.capacity() * sizeof(BvhNode)
+       + s.bvh.primIdx.capacity() * sizeof(int);
+    for (const auto& b : s.blasList)
+        n += b.tris.capacity() * sizeof(Tri)
+           + b.bvh.nodes.capacity() * sizeof(BvhNode)
+           + b.bvh.primIdx.capacity() * sizeof(int);
+    for (const auto& t : s.textures)
+        n += t.rgb.capacity() * sizeof(Vec3) + t.coeff.capacity() * sizeof(double) * 3;
+    // The DAG last. Small next to the geometry, and easy to leave out for that reason --
+    // but a cache is capped by this number, so anything omitted here is budget the cap
+    // silently overshoots by. Counted rather than argued about.
+    n += pf.dag.nodes.capacity() * sizeof(DagNode)
+       + pf.dag.edges.capacity() * sizeof(DagEdge)
+       + (pf.dag.pos.capacity() + pf.dag.realSize.capacity()) * sizeof(ImVec2);
+    for (const auto& d : pf.dag.nodes)
+        n += d.op.capacity() + d.label.capacity() + d.axes.capacity() + d.detail.capacity();
+    for (const auto& e : pf.dag.edges) n += e.param.capacity() + e.mode.capacity();
+    return n;
+}
+
 // The left-column "Live (loom)" section. Returns true when something the geometry
 // depends on moved this frame.
-static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
+static bool drawLivePanel(LivePanel& lp, LoomBridge& br, PlayCache& pc) {
     bool changed = false;
     if (!lp.up) {
         ImGui::TextWrapped("Not connected - the viewer is showing the static sidecar.");
@@ -2980,6 +3293,61 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
     ImGui::SameLine();
     ImGui::Checkbox("ping-pong", &lp.pingpong);
 
+    // --- F8(b): prebake the whole clock, then play out of memory ---------------
+    {
+        const std::string key = playCacheKey(lp);
+        const bool valid = pc.active(key, lp.frames);
+        if (pc.baking) {
+            if (ImGui::Button("cancel")) { pc.baking = false; }
+            ImGui::SameLine();
+            const float frac = lp.frames > 0 ? (float)pc.bakeHave / (float)lp.frames : 0.0f;
+            char lab[64];
+            std::snprintf(lab, sizeof lab, "%d/%d", pc.bakeHave, lp.frames);
+            ImGui::ProgressBar(frac, ImVec2(140, 0), lab);
+            ImGui::SameLine();
+            ImGui::TextDisabled("%.0f MB", pc.bytes / 1048576.0);
+        } else {
+            if (!playable) ImGui::BeginDisabled();
+            if (ImGui::Button(valid ? "re-prebake" : "prebake")) {
+                pc.drop();
+                pc.key = key;
+                pc.f.assign((size_t)std::max(1, lp.frames), PlayFrame{});
+                pc.baking = true;
+                pc.bakeNext = 0;
+            }
+            if (!playable) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Walk the clock once, keeping every frame's adopted geometry and\n"
+                    "scene in memory; play (and scrubbing) then costs no bake at all.\n"
+                    "Dropped whenever a parameter or `frames` changes -- a cache built\n"
+                    "at other values is not a cache of what you are looking at.");
+            if (valid) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1), "cached %d/%d, %.0f MB%s",
+                                   pc.bakeHave, lp.frames, pc.bytes / 1048576.0,
+                                   pc.capped ? " (cap)" : "");
+            } else if (!pc.f.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(cache stale)");
+            }
+        }
+        ImGui::SetNextItemWidth(90);
+        ImGui::SliderFloat("fps", &pc.targetFps, 0.0f, 120.0f,
+                           pc.targetFps <= 0.0f ? "free" : "%.0f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Playback rate once the clock is cached. `free` (0) runs as\n"
+                              "fast as the draw allows, which is how you measure the ceiling.\n"
+                              "Uncached play is still paced by the bake and ignores this.");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90);
+        ImGui::DragInt("cap MB", &pc.capMB, 16.0f, 64, 65536);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Stop prebaking once the cache is this big. A partial cache is\n"
+                              "still used -- the frames it holds play from memory and the rest\n"
+                              "fall back to baking, so a long clock degrades instead of failing.");
+    }
+
     // Keyboard: space toggles, arrows step. Guarded on WantTextInput so typing a
     // value into a drag field doesn't scrub the clock out from under the edit.
     if (!ImGui::GetIO().WantTextInput) {
@@ -2999,8 +3367,13 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
     }
     if (lp.playing) {
         ImGui::SameLine();
+        // Say WHICH kind of playback this is. The two rates are not comparable — one is
+        // loom's bake rate, the other is the draw rate — and a bare number would invite
+        // exactly the confusion F8(a)'s fps readout was added to prevent.
+        const char* src = pc.covers(lp.frame) ? " (cached)" : "";
         if (lp.playFps > 0.0)
-            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1), "playing %.1f fps", lp.playFps);
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1), "playing %.1f fps%s",
+                               lp.playFps, src);
         else
             ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.6f, 1), "playing...");
     }
@@ -3008,16 +3381,26 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
     // guessed at: the intuition is that the .ftsl round trip dominates, and on a
     // modest mesh it does not -- the Render pane's synchronous raymarch does.
     {
-        const double acc = lp.lastMs + lp.msSidecar + lp.msFtsl + lp.msRender;
+        const double acc = lp.lastMs + lp.msSidecar + lp.msFtsl + lp.msCache + lp.msRender;
+        // `bake + sidecar + ftsl` and `cache` are mutually exclusive by construction --
+        // a frame is either derived or replayed -- so only the live half is shown. The
+        // point of the swap is that the row it prints gets SHORTER.
+        const bool cached = lp.msCache > 0.0;
         // Show the MEASURED period beside the parts, and the residual explicitly.
         // A breakdown that silently omits the gap between "what I timed" and "what
         // it actually costs" is the same dishonesty as deriving fps from the bake.
         if (lp.playing && lp.playFps > 0.0) {
             const double period = 1000.0 / lp.playFps;
-            ImGui::TextDisabled(
-                "frame %.0f ms = bake %.0f + sidecar %.0f + ftsl %.0f + raymarch %.0f + other %.0f",
-                period, lp.lastMs, lp.msSidecar, lp.msFtsl, lp.msRender,
-                (period - acc > 0.0 ? period - acc : 0.0));
+            const double other  = (period - acc > 0.0 ? period - acc : 0.0);
+            if (cached)
+                ImGui::TextDisabled("frame %.0f ms = cache %.2f + raymarch %.0f + other %.0f",
+                                    period, lp.msCache, lp.msRender, other);
+            else
+                ImGui::TextDisabled(
+                    "frame %.0f ms = bake %.0f + sidecar %.0f + ftsl %.0f + raymarch %.0f + other %.0f",
+                    period, lp.lastMs, lp.msSidecar, lp.msFtsl, lp.msRender, other);
+        } else if (cached) {
+            ImGui::TextDisabled("cache %.2f + raymarch %.0f = %.0f ms", lp.msCache, lp.msRender, acc);
         } else {
             ImGui::TextDisabled("bake %.0f + sidecar %.0f + ftsl %.0f + raymarch %.0f = %.0f ms",
                                 lp.lastMs, lp.msSidecar, lp.msFtsl, lp.msRender, acc);
@@ -3027,6 +3410,8 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
                 "bake     loom: build() + emit + introspect (its own process)\n"
                 "sidecar  parse the introspection JSON, rebuild the DAG and skin buffers\n"
                 "ftsl     parse the .ftsl and load its mesh assets\n"
+                "cache    replaces all three on a prebaked frame: two state swaps plus\n"
+                "         the skin/scene re-point a fresh adoption would also have done\n"
                 "raymarch the Render tab re-tracing the scene on the UI thread.\n"
                 "         Only charged while that tab is open -- switch to Meshes\n"
                 "         to play without it.\n"
@@ -3098,7 +3483,7 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br) {
 // Entry point
 // --------------------------------------------------------------------------
 int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
-                 bool startPlaying) {
+                 bool startPlaying, bool startPrebake, int prebakeCapMB) {
     Sidecar sc;
     if (!sc.load(sidecarPath)) {
         std::fprintf(stderr, "error: -viewer: %s\n", sc.err.c_str());
@@ -3274,6 +3659,70 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
         return true;
     };
 
+    // --- F8(b) prebaked play ------------------------------------------------
+    // See the PlayCache commentary above for why the cache holds ADOPTED state and
+    // why frames move by swapping. `swapWith` is the one primitive: it exchanges the
+    // live pane state with a slot, in O(1), and the invariant it maintains is that the
+    // live locals hold frame `cache.liveIdx` while slot `liveIdx` sits empty.
+    PlayCache cache;
+    auto swapWith = [&](PlayFrame& pf) {
+        std::swap(sc,       pf.sc);
+        std::swap(curves,   pf.curves);
+        std::swap(strips,   pf.strips);
+        std::swap(fields,   pf.fields);
+        std::swap(meshes,   pf.meshes);
+        std::swap(dag,      pf.dag);
+        std::swap(loaded,   pf.loaded);
+        std::swap(sceneOk,  pf.sceneOk);
+        std::swap(sceneErr, pf.sceneErr);
+    };
+    // Park whatever the live locals are showing back into its own slot, leaving the
+    // live state holding the (empty) contents of that slot. Called before adopting a
+    // fresh bake and before swapping a different cached frame in, so a frame is never
+    // in two places and never in none.
+    auto parkLive = [&]() {
+        if (cache.liveIdx < 0 || cache.liveIdx >= (int)cache.f.size()) { cache.liveIdx = -1; return; }
+        PlayFrame& slot = cache.f[cache.liveIdx];
+        swapWith(slot);
+        slot.have = true;
+        cache.liveIdx = -1;
+    };
+    // Show a cached frame. Cheap enough to call from the scrub path as well as from
+    // play — which is the second thing the cache buys: once prebaked, dragging the
+    // frame slider is instant instead of one bake per stop.
+    auto showCached = [&](int k) {
+        if (!cache.holds(k)) return false;
+        MsTimer _t(&live.msCache);
+        // This frame pays no bake, no sidecar adoption and no .ftsl round trip, so the
+        // last-measured values for all three are now describing work that did not
+        // happen. Clear them: a breakdown line whose terms sum to twice the frame time
+        // beside them is worse than no breakdown, because it reads as a real profile.
+        live.lastMs = live.msSidecar = live.msFtsl = 0.0;
+        live.msAdoptJson = live.msAdoptGeom = live.msAdoptDag = live.msAdoptSkins = 0.0;
+        live.msFtslParse = live.msFtslBuild = live.msFtslAssets = live.msFtslAccel = 0.0;
+        parkLive();
+        PlayFrame& slot = cache.f[k];
+        swapWith(slot);
+        // The slot is now "empty" in the bookkeeping sense but still owns whatever the
+        // locals held a moment ago -- deliberately. Freeing it here would cost a Scene
+        // teardown on every step of playback; leaving it means the vacated slot doubles
+        // as the buffer `parkLive` swaps back into, so a whole loop of playback does no
+        // allocation at all. Costs one extra frame's worth of memory, once.
+        slot.have = false;
+        cache.liveIdx = k;
+        // The panes below are not told "the frame changed" by the swap itself: the mesh
+        // pane keys its GPU buffers off `geomGen`, the raymarch pane off its own dirty
+        // flag, and the skins are built from `sc`. All three have to be re-pointed here
+        // exactly as a fresh adoption would.
+        ++mview.geomGen;
+        skins.release();
+        skins.build(sc, baseDir, g_pd3dDevice, g_pd3dDeviceContext);
+#ifdef HAVE_CUDA
+        if (sceneOk) rpane.initFrom(loaded.scene);
+#endif
+        return true;
+    };
+
     // `-play`: open with the transport already running. Only meaningful once the
     // clock has somewhere to go and there is a live channel to re-derive through --
     // a frozen sidecar has no frames to bake, so silently "playing" it would be a lie.
@@ -3282,6 +3731,27 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
         else std::fprintf(stderr, "[play] ignoring -play: %s\n",
                           !live.up ? "no live loom channel (-loom, or a sidecar `build` key)"
                                    : "the sidecar advertises frames = 1 (saved without a clock)");
+    }
+
+    // `-prebake`: start the §F8(b) walk on open. Exactly what the panel's button does,
+    // hoisted to the command line so a cached play can be MEASURED from a script --
+    // the whole point of the cache is a frame rate, and a frame rate you can only get
+    // to by clicking into a window is a frame rate nobody records. Ordered after
+    // `-play` on purpose: the prebake owns the bridge while it runs and the transport
+    // simply waits, so `-prebake -play` starts playing the instant the walk finishes.
+    if (prebakeCapMB > 0) cache.capMB = std::max(1, prebakeCapMB);
+    if (startPrebake) {
+        if (live.up && live.frames > 1) {
+            cache.key      = playCacheKey(live);
+            cache.f.assign((size_t)live.frames, PlayFrame{});
+            cache.baking   = true;
+            cache.bakeNext = 0;
+            std::printf("[prebake] walking %d frames (cap %d MB)\n", live.frames, cache.capMB);
+        } else {
+            std::fprintf(stderr, "[prebake] ignoring -prebake: %s\n",
+                         !live.up ? "no live loom channel (-loom, or a sidecar `build` key)"
+                                  : "the sidecar advertises frames = 1 (saved without a clock)");
+        }
     }
 
     bool done = false;
@@ -3308,6 +3778,12 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                 ++live.baked;
                 live.lastMs  = r.ms;
                 live.lastErr = r.ok ? std::string() : r.err;
+                live.msCache = 0.0;   // a real bake: the cache term is the one now stale
+                // Before the live locals are overwritten by this bake, put the frame
+                // they are currently holding back in its slot. Without this, adopting
+                // over a cached frame would destroy it in place and the cache would
+                // quietly develop holes exactly where playback had already been.
+                if (cache.liveIdx >= 0) parkLive();
                 if (r.ok && r.payload) {
                     if (r.payload->hasSidecar) {
                         MsTimer _t(&live.msSidecar);
@@ -3345,14 +3821,162 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                     }
                 }
                 r.payload.reset();   // last reference: the ~1 MB frame goes here
-                // F8(a): a bake landed, so the clock may take its next step. Doing it
-                // HERE -- rather than on a timer -- is what makes play show every
-                // frame instead of only the ones that won the latest-wins slot. A
-                // failed bake still advances: stalling on a bad frame would look like
-                // a hang, and the error is already on screen.
-                if (live.playing) { liveAdvanceClock(live); livePlayPost = true; }
+
+                // F8(b): the live locals now hold frame `r.frame`, freshly adopted.
+                // Claim the slot for it (the state is not COPIED there -- it stays
+                // live, and `parkLive` will move it home when something else needs the
+                // locals). Three things have to hold before a claim is legitimate:
+                //
+                //   ok    -- caching a FAILED frame would replay the failure forever
+                //            with no way to notice it had ever been transient.
+                //   key   -- a result that was in flight when a control moved belongs
+                //            to the OLD scene. Without this test it would be filed
+                //            into the new cache under the frame number it happens to
+                //            share, and play back as a frame from a scene the user has
+                //            already left. This is the reason LoomJob/LoomResult carry
+                //            a key at all.
+                //   cap   -- an on-demand bake must not push the cache past the budget
+                //            the user set. The prebake walk is exempt because it stops
+                //            ITSELF at the cap one frame later, and refusing the frame
+                //            it is standing on would spin it forever.
+                const size_t capBytes = (size_t)std::max(1, cache.capMB) * 1048576ull;
+                if (r.ok && !cache.f.empty() && r.key == cache.key
+                    && r.frame >= 0 && r.frame < (int)cache.f.size()
+                    && !cache.f[r.frame].have
+                    && (cache.baking || cache.bytes < capBytes)) {
+                    // Size the frame just baked. It is in the LIVE locals, not in its
+                    // slot, so measure it there -- via a park/unpark round trip, which
+                    // is two O(1) swaps and keeps `playFrameBytes` a pure function of a
+                    // PlayFrame rather than a second copy of the same field list. Done
+                    // for on-demand bakes too and not just for the prebake walk, so the
+                    // byte count can never drift away from what is actually held.
+                    const int k = r.frame;
+                    cache.liveIdx = k;
+                    ++cache.bakeHave;
+                    parkLive();
+                    cache.f[k].bytes = playFrameBytes(cache.f[k]);
+                    cache.bytes += cache.f[k].bytes;
+                    // Unpark by hand rather than through showCached: this frame is
+                    // already ON SCREEN and everything derived from it (the skin
+                    // atlas, the CUDA pane's scene upload) is still valid, so going
+                    // the long way round would rebuild all of it for nothing -- once
+                    // per frame of the walk, which is exactly where a prebake can
+                    // least afford it.
+                    swapWith(cache.f[k]);
+                    cache.f[k].have = false;
+                    cache.liveIdx   = k;
+                }
+
+                if (cache.baking) {
+                    // Stop at the cap rather than at the end of the clock if the cap
+                    // comes first: a prefix cache still plays from memory as far as it
+                    // goes, which beats refusing to cache a long clock at all.
+                    if (cache.bytes >= capBytes) {
+                        cache.capped = true;
+                        cache.baking = false;
+                        std::printf("[prebake] cap %d MB reached at frame %d/%d "
+                                    "(%.0f MB); the rest will bake on demand\n",
+                                    cache.capMB, cache.bakeHave, live.frames,
+                                    cache.bytes / 1048576.0);
+                    } else if (cache.bakeNext >= live.frames) {
+                        cache.baking = false;
+                        std::printf("[prebake] %d frames cached, %.0f MB (%.1f MB/frame)\n",
+                                    cache.bakeHave, cache.bytes / 1048576.0,
+                                    cache.bakeHave ? cache.bytes / 1048576.0 / cache.bakeHave : 0.0);
+                    }
+                    // A prebake owns the bridge until it finishes: the clock does not
+                    // move and no play post is made. Advancing the display clock here
+                    // as well would race the walk and leave the cache half-filled.
+                } else if (live.playing) {
+                    // F8(a): a bake landed, so the clock may take its next step. Doing
+                    // it HERE -- rather than on a timer -- is what makes UNCACHED play
+                    // show every frame instead of only the ones that won the
+                    // latest-wins slot. A failed bake still advances: stalling on a bad
+                    // frame would look like a hang, and the error is already on screen.
+                    liveAdvanceClock(live);
+                    livePlayPost = true;
+                }
             }
         }
+
+        // --- F8(b) prebake driver: one outstanding job at a time ---------------
+        // Serial on purpose. The bridge is latest-wins on a ONE-slot pending job, so
+        // posting the whole range up front would bake the last frame and discard the
+        // other N-1 -- the same trap paced play was built to avoid. Walking it one
+        // landing at a time costs nothing extra (loom is the bottleneck either way)
+        // and makes the progress bar mean what it says.
+        if (cache.baking && live.up && bridge.linkUp() && !bridge.busy()
+            && cache.bakeNext < live.frames) {
+            bridge.post(liveJobAt(live, cache.bakeNext, /*wantSidecar=*/true, liveWantSource));
+            ++live.posted;
+            ++cache.bakeNext;
+        } else if (cache.baking && (!live.up || !bridge.linkUp())) {
+            cache.baking = false;      // the link died mid-walk; keep the prefix
+            cache.capped = true;
+        }
+
+        // --- F8(b) cached playback: paced by a wall clock, not by loom ----------
+        // This is the whole payoff. When the frame the clock wants is already in the
+        // cache there is no bake to wait for, so the clock is free to advance on real
+        // time -- `targetFps`, or as fast as the draw allows at 0. The fps readout is
+        // still MEASURED (liveAdvanceClock stamps it), so what it reports is the rate
+        // actually achieved rather than the rate requested.
+        if (live.playing && !cache.baking && cache.covers(live.frame)) {
+            bool step = true;
+            if (cache.targetFps > 0.0f) {
+                LARGE_INTEGER f, now;
+                QueryPerformanceFrequency(&f);
+                QueryPerformanceCounter(&now);
+                const long long per = f.QuadPart > 0
+                                    ? (long long)(double(f.QuadPart) / (double)cache.targetFps)
+                                    : 0;
+                if (!cache.lastStepQpc || !per) {
+                    cache.lastStepQpc = now.QuadPart;     // first step starts the clock
+                } else {
+                    step = (now.QuadPart - cache.lastStepQpc) >= per;
+                    if (step) {
+                        // Advance the DEADLINE by exactly one period instead of
+                        // resetting it to now. Resetting discards the overshoot, and
+                        // since this test is only reached once per UI frame that
+                        // quantises the achievable rate to the display's own refresh:
+                        // on a 60 Hz vsync, asking for 24 waits three vblanks every
+                        // time and delivers a rock-steady 20 (measured, and initially
+                        // mistaken for the cache being the bottleneck). Carrying the
+                        // remainder makes the wait alternate 2 and 3 vblanks and
+                        // average out at the 24 that was asked for.
+                        cache.lastStepQpc += per;
+                        // ...but never bank more than one period of debt. A hitch, a
+                        // drag, or the end of a long prebake would otherwise be repaid
+                        // as a burst of frames at draw rate -- a visible lurch, and the
+                        // opposite of the steady playback this whole feature is for.
+                        if (now.QuadPart - cache.lastStepQpc > per)
+                            cache.lastStepQpc = now.QuadPart;
+                    }
+                }
+            }
+            if (step) liveAdvanceClock(live);
+        }
+        // Whatever moved the clock -- play, the slider, an arrow key -- if the cache
+        // has that frame, show it from memory and skip the bake entirely. Checked
+        // every UI frame rather than only on a change, because a prebake landing can
+        // make a frame available that the clock is already sitting on.
+        if (!cache.baking && cache.holds(live.frame)) showCached(live.frame);
+
+        // Playing off the END of a prefix cache -- the cap stopped the walk short, or
+        // the user hit play on a scene that was never prebaked at all. Nothing above
+        // moved the clock (the wall-clock stepper only runs on frames the cache
+        // covers) and F8(a)'s advance-on-landing cannot fire either, because no bake
+        // is in flight to land. Without this the clock would simply stop and play
+        // would look like a hang. So fall back to bake-paced play for the frames the
+        // cache does not hold, and let the two schemes meet in the middle: the cached
+        // prefix runs at `targetFps`, the tail runs at whatever loom can do.
+        //
+        // Guarded on the bridge being IDLE so a slow bake is waited for rather than
+        // re-posted every UI frame -- with latest-wins, a repost of the same frame
+        // would queue one redundant bake behind the one already running.
+        if (live.playing && !cache.baking && !cache.covers(live.frame)
+            && live.up && bridge.linkUp() && !bridge.busy())
+            livePlayPost = true;
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -3377,7 +4001,7 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
         ImGui::BeginChild("left", ImVec2(leftW, 0), true);
         if (ImGui::CollapsingHeader("Live (loom)",
                                     live.up ? ImGuiTreeNodeFlags_DefaultOpen : 0))
-            livePost = drawLivePanel(live, bridge) || livePost;
+            livePost = drawLivePanel(live, bridge, cache) || livePost;
         if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen))
             drawScenePanel(sc);
         if (ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen))
@@ -3516,10 +4140,29 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
             if (!open || ImGui::IsKeyPressed(ImGuiKey_Escape)) dag.maximized = false;
         }
 
+        // F8(b): anything that is not the clock invalidates the cache, because the
+        // cache is of THESE parameters at every frame. Compared as a fingerprint (see
+        // playCacheKey) rather than by watching individual controls, so a control added
+        // later cannot silently escape the check. The frames the cache holds are
+        // released here and not lazily, so the memory goes back at the moment the user
+        // changes something rather than at the next prebake.
+        {
+            const std::string key = playCacheKey(live);
+            // Safe to drop outright: by the invariant the frame on screen lives in the
+            // LOCALS, not in a slot, so the display survives the cache going away.
+            if (!cache.f.empty() && key != cache.key) cache.drop();
+        }
+
         // At most one post per frame, and posting OVERWRITES any job that has not
         // started: a fast sweep drag therefore costs one bake of wherever the user
         // ends up, not one bake per intermediate frame. That is the latest-wins rule.
-        if (livePost && live.up && bridge.linkUp()) {
+        //
+        // Two things suppress it. A prebake owns the bridge (its own serial driver
+        // above posts instead), and a frame the cache can already show needs no bake at
+        // all -- which is what makes a prebaked scrub instant rather than one round
+        // trip per stop.
+        if (livePost && live.up && bridge.linkUp()
+            && !cache.baking && !cache.covers(live.frame)) {
             bridge.post(liveJob(live, /*wantSidecar=*/true, liveWantSource));
             ++live.posted;
         }
@@ -3541,12 +4184,22 @@ int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
             if (now - lastLog > 1.0) {
                 lastLog = now;
                 const double period = 1000.0 / live.playFps;
-                const double acc = live.lastMs + live.msSidecar + live.msFtsl + live.msRender;
-                std::printf("[play] %5.1f fps  %6.1f ms = bake %.0f + sidecar %.0f + "
-                            "ftsl %.0f + raymarch %.0f + other %.0f\n",
-                            live.playFps, period, live.lastMs, live.msSidecar,
-                            live.msFtsl, live.msRender,
-                            (period - acc > 0.0 ? period - acc : 0.0));
+                const double acc = live.lastMs + live.msSidecar + live.msFtsl
+                                 + live.msCache + live.msRender;
+                const double other = (period - acc > 0.0 ? period - acc : 0.0);
+                // Same split as the panel: a prebaked frame pays `cache` INSTEAD of
+                // bake/sidecar/ftsl, and printing the three it did not pay would make
+                // the log unusable for exactly the comparison it exists to support --
+                // uncached play against cached play.
+                if (live.msCache > 0.0)
+                    std::printf("[play] %5.1f fps  %6.1f ms = cache %.2f + raymarch %.0f "
+                                "+ other %.0f   (prebaked)\n",
+                                live.playFps, period, live.msCache, live.msRender, other);
+                else
+                    std::printf("[play] %5.1f fps  %6.1f ms = bake %.0f + sidecar %.0f + "
+                                "ftsl %.0f + raymarch %.0f + other %.0f\n",
+                                live.playFps, period, live.lastMs, live.msSidecar,
+                                live.msFtsl, live.msRender, other);
                 // The raymarch broken open, on its own line. A printed trace is what
                 // gets diffed between builds and quoted afterwards, so it must carry
                 // the same detail as the panel -- a bare `raymarch N` in the log is

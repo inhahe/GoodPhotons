@@ -49,6 +49,11 @@
 # (480x480 / 60 fps / 3.4 MB). Together ~6.6 MB, small enough not to bloat a clone.
 !/pastel_jack_ring.mp4
 !/pastel_jack_ring.gif
+# Same reasoning for the README's second demo, the STILL of the `fur` generator: a render
+# output like every other .png here, but also the only picture of the coat anyone landing
+# on the repo page will see, so it has to be IN the repo rather than merely regenerable
+# (`ftrace -in scenes/fur_creature.ftsl -mode D -noise 2`). 720x540, ~0.9 MB.
+!/fur_creature_gi.png
 # The demo's SCENE, by contrast, is NOT committed in rendered form: the animation is
 # tools/loom/examples/pastel_jack.py, and the ~1700 per-frame `.ftsl` it emits into png/
 # are generated artifacts exactly like the PNGs beside them. `.ftsl` has no blanket rule
@@ -138,3 +143,6 @@ tools/ftslbench.exe
 
 # built on demand by tools/meshbench.bat (source is checked in, binary is not)
 tools/meshbench.exe
+
+# MuJoCo writes this next to the cwd whenever a warning fires; pure noise.
+MUJOCO_LOG.TXT

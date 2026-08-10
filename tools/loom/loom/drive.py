@@ -18,7 +18,9 @@ Design notes:
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -148,12 +150,19 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                  noise: Optional[float] = None, time_s: Optional[float] = None,
                  n: Optional[int] = None, loop: bool = True,
                  skip_existing: bool = False, retries: int = 2,
+                 stabilize: bool = True,
                  extra_args: Sequence[str] = ()) -> List[Path]:
     """Emit and render a frame range; return the rendered PNG paths.
 
     ``loop=True`` (default) renders a **seamless closed loop**; ``loop=False``
     renders an **open** one-shot timeline with distinct endpoints (§11.6).
     ``noise``/``time_s``/``n`` pick the per-frame stop budget (default: 3% noise).
+
+    ``stabilize=True`` (default) runs :func:`stabilize_exposure` at the end, which
+    re-develops the finished frames through one shared auto-exposure anchor.  Without
+    it every frame auto-exposes independently and a scene with a moving specular
+    highlight flickers — see that function for the measurement.  It costs no
+    re-rendering (it works off the ``-checkpoint`` sidecars), so it is on by default.
 
     ``skip_existing=True`` resumes a long sequence that was interrupted by a crash
     or a Ctrl-C instead of starting over.  A frame counts as done only when its
@@ -232,7 +241,109 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                                    f"{retries + 1} attempts")
             print(f"{tag}: exit {r.returncode}, retrying", flush=True)
         pngs.append(png)
+    if stabilize:
+        stabilize_exposure(pngs, anchor_file=outdir / f"{name}_exposure_anchor.txt")
     return pngs
+
+
+# ftrace prints exactly one of these per image write; the number is the auto-exposure
+# gain it chose for that film.
+_ANCHOR_RE = re.compile(r"auto-exposure=([0-9.eE+-]+)")
+
+
+def _frame_anchor(ftrace: Path, ftbuf: Path, png: Path) -> Optional[float]:
+    """Develop one checkpoint with its OWN auto-exposure and report the gain chosen."""
+    r = subprocess.run([str(ftrace), "-topng", str(ftbuf), str(png)],
+                       capture_output=True, text=True, cwd=str(repo_root()))
+    if r.returncode != 0:
+        return None
+    m = _ANCHOR_RE.search(r.stdout)
+    return float(m.group(1)) if m else None
+
+
+def stabilize_exposure(pngs: Sequence[os.PathLike], *,
+                       anchor_file: Optional[os.PathLike] = None,
+                       quiet: bool = False) -> Optional[float]:
+    """Re-develop a rendered sequence through ONE shared auto-exposure anchor.
+
+    A loom sequence is rendered one ftrace process per frame, so every frame picks its
+    own auto-exposure — and that anchor is a single order statistic (the 99th luminance
+    percentile).  When a scene has a bright, compact specular or emitter population the
+    luminance histogram is *bimodal*: ordinary shading in a low mode, the highlight in a
+    far brighter one, with almost no mass between them.  As the highlight's **area**
+    sweeps across 1% of the frame the p99 rank falls off the cliff from one mode to the
+    other and the anchor jumps discontinuously.  Measured on ``png/pastel_jack_ring``:
+    up to **42% between adjacent frames**, while every measure of the actual picture
+    (the static background, p95, the median) moved less than 2.3% over the same step.
+    Each frame is individually defensible; the assembled movie visibly flickers.
+
+    The fix is one anchor for the whole sequence, and it costs no re-rendering: the
+    ``-checkpoint`` sidecars still hold the raw linear film, so only the tone map has to
+    be redone.  Two cheap passes over the checkpoints — measure every frame's own
+    anchor, then re-develop them all through the **median** of those.
+
+    The median specifically, not the first frame's: "first frame wins" is what ftrace's
+    ``-exposure-lock`` does *within* one process, but frame 0 of a loop is an arbitrary
+    phase of it.  On pastel_jack_ring frame 0 lands at the 93rd percentile of the
+    sequence's anchors, so anchoring there would have left the whole movie a full stop
+    dark.  The median leaves the typical frame's exposure exactly where it already was
+    and pulls only the outliers into line.
+
+    Returns the chosen anchor, or ``None`` if no checkpoint was usable (a sequence
+    rendered without ``-checkpoint`` cannot be re-developed, and is left alone).
+    """
+    ftrace = find_ftrace()
+    frames = [Path(p) for p in pngs]
+    pairs = [(p, Path(str(p) + ".ftbuf")) for p in frames]
+    usable = [(p, b) for p, b in pairs if b.is_file()]
+    if not usable:
+        if not quiet:
+            print("[loom] exposure: no .ftbuf checkpoints found, leaving frames as "
+                  "rendered (render with -checkpoint to enable this)", flush=True)
+        return None
+    if len(usable) < len(pairs) and not quiet:
+        print(f"[loom] exposure: {len(pairs) - len(usable)} of {len(pairs)} frames have "
+              f"no checkpoint and will keep their own exposure", flush=True)
+
+    if not quiet:
+        print(f"[loom] exposure: metering {len(usable)} frames…", flush=True)
+    anchors = []
+    for png, ftbuf in usable:
+        a = _frame_anchor(ftrace, ftbuf, png)
+        if a is not None and a > 0.0:
+            anchors.append((png, ftbuf, a))
+    if not anchors:
+        if not quiet:
+            print("[loom] exposure: could not read any frame anchor, leaving frames as "
+                  "rendered", flush=True)
+        return None
+
+    vals = sorted(a for _, _, a in anchors)
+    shared = vals[len(vals) // 2]
+    if not quiet:
+        spread = vals[-1] / vals[0] if vals[0] > 0 else float("inf")
+        print(f"[loom] exposure: per-frame anchors span {spread:.2f}x "
+              f"({math.log2(spread):.2f} stops); sharing the median {shared:.6g}",
+              flush=True)
+    if anchor_file is not None:
+        Path(anchor_file).write_text(f"{shared!r}\n", encoding="utf-8")
+
+    n_re = 0
+    for png, ftbuf, own in anchors:
+        if own == shared:
+            continue          # the meter pass already developed it at exactly this gain
+        r = subprocess.run([str(ftrace), "-topng", str(ftbuf), str(png),
+                            "-exposure-anchor", repr(shared)],
+                           capture_output=True, text=True, cwd=str(repo_root()))
+        if r.returncode != 0:
+            print(f"[loom] exposure: WARNING re-develop failed for {png.name} "
+                  f"(exit {r.returncode}); it keeps its own exposure", flush=True)
+            continue
+        n_re += 1
+    if not quiet:
+        print(f"[loom] exposure: re-developed {n_re} frames through the shared anchor",
+              flush=True)
+    return shared
 
 
 def render_still(scene: Scene, *, t: float = 0.0, name: str = "loom_still",
@@ -267,6 +378,42 @@ def _find_ffmpeg() -> str:
     if ff is None:
         raise RuntimeError("ffmpeg not found on PATH (needed for video assembly)")
     return ff
+
+
+def find_gifski() -> Optional[str]:
+    """Locate the ``gifski`` encoder, or ``None`` if it isn't installed.
+
+    Checked in order: ``PATH``; then the npm global package, whose shipped binary is
+    NOT put on ``PATH`` by ``npm install -g gifski`` on Windows (the package has no
+    ``bin`` entry — it exposes a JS API and drops the platform executables under
+    ``node_modules/gifski/bin/<platform>/``), which is exactly the trap that makes a
+    freshly installed gifski look missing.
+
+    Install with ``npm install -g gifski`` (or ``cargo install gifski``).
+    """
+    exe = shutil.which("gifski")
+    if exe:
+        return exe
+    plat = {"win32": ("windows", "gifski.exe"),
+            "darwin": ("macos", "gifski"),
+            "linux": ("debian", "gifski")}.get(sys.platform)
+    if plat is None:
+        return None
+    roots = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        roots.append(Path(appdata) / "npm" / "node_modules")
+    npm_prefix = os.environ.get("NPM_CONFIG_PREFIX")
+    if npm_prefix:
+        roots.append(Path(npm_prefix) / "node_modules")
+    roots += [Path.home() / ".npm-global" / "lib" / "node_modules",
+              Path("/usr/local/lib/node_modules"),
+              Path("/usr/lib/node_modules")]
+    for root in roots:
+        cand = root / "gifski" / "bin" / plat[0] / plat[1]
+        if cand.is_file():
+            return str(cand)
+    return None
 
 
 _FRAME_PATTERN = "f%06d.png"
@@ -333,6 +480,59 @@ def assemble_gif_ffmpeg(pngs: Sequence[os.PathLike], out_gif: os.PathLike,
     if r.returncode != 0:
         raise RuntimeError("ffmpeg failed:\n" + r.stderr.decode("utf-8", "replace")[-2000:])
     print(f"[loom] wrote {out_gif} ({len(pngs)} frames @ {fps} fps)", flush=True)
+    return out_gif
+
+
+def assemble_gif_gifski(pngs: Sequence[os.PathLike], out_gif: os.PathLike,
+                        *, fps: float = 20.0, width: Optional[int] = None,
+                        quality: int = 65, loop: int = 0,
+                        fallback: bool = True) -> Path:
+    """Assemble a looping GIF with **gifski**, falling back to ffmpeg if it's absent.
+
+    Use this for anything that has to be *small* as well as clean — a README embed,
+    where GitHub is the only viewer that matters.  gifski quantizes across the whole
+    sequence with per-frame dithering tuned to the shared palette; ffmpeg's
+    ``palettegen``/``paletteuse`` (:func:`assemble_gif_ffmpeg`) is a fine general
+    encoder but is measurably worse per byte on smooth shading.  Measured on the
+    ``pastel_jack_ring`` loop (144 frames, 320², 20 fps): ffmpeg bottomed out at
+    **5.3 MB** for acceptable quality, gifski 1.7.1 at ``--quality 65`` produced
+    **2.7 MB** with visibly less banding on the gyroid glass.
+
+    ``width`` downscales (gifski's own Lanczos), ``loop=0`` repeats forever.
+
+    Frames are passed in the order given — gifski does *not* sort or renumber them —
+    so a caller applying a stride just slices its own list.
+
+    Raises if gifski is missing and ``fallback`` is False; otherwise degrades to
+    :func:`assemble_gif_ffmpeg` with a printed notice (which ignores ``width``, so a
+    fallback GIF comes out at the source resolution and will be bigger).
+    """
+    out_gif = Path(out_gif)
+    pngs = [Path(p) for p in pngs]
+    if not pngs:
+        raise ValueError("no frames to assemble")
+    exe = find_gifski()
+    if exe is None:
+        if not fallback:
+            raise RuntimeError("gifski not found (npm install -g gifski / cargo install gifski)")
+        print("[loom] gifski not found — falling back to ffmpeg palettegen "
+              "(bigger file; `npm install -g gifski` for the small one)", flush=True)
+        return assemble_gif_ffmpeg(pngs, out_gif, fps=fps, loop=loop)
+    cmd = [exe, "-o", str(out_gif), "--fps", f"{fps:g}", "--quality", str(int(quality))]
+    if width:
+        cmd += ["--width", str(int(width))]
+    if loop != 0:
+        cmd += ["--repeat", str(int(loop) if loop > 0 else -1)]
+    cmd += [str(p) for p in pngs]
+    print(f"[loom] {exe} -o {out_gif} --fps {fps:g} "
+          f"{'--width ' + str(width) + ' ' if width else ''}--quality {quality} "
+          f"({len(pngs)} frames)", flush=True)
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        raise RuntimeError("gifski failed:\n" + r.stderr.decode("utf-8", "replace")[-2000:])
+    size = out_gif.stat().st_size
+    print(f"[loom] wrote {out_gif} ({len(pngs)} frames @ {fps} fps, "
+          f"{size / 1e6:.2f} MB)", flush=True)
     return out_gif
 
 

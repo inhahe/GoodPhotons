@@ -63,6 +63,45 @@ renders — so the animation's source is the one Python file, not 432 baked scen
 > for those see the [mode table](REFERENCE.md#render-modes--mode-or-per-camera-mode)
 > and the gallery scenes.
 
+![A small furred creature, a quarter-million procedurally grown strands, lit by
+global illumination in a corner](fur_creature_gi.png)
+
+*A quarter-million individual hairs, and not one of them is authored.
+[`scenes/fur_creature.ftsl`](scenes/fur_creature.ftsl) is eighteen spheres — fifteen for
+the body, three for the eyes and nose — and fifteen `fur { }` blocks for the coat, and
+that is the whole model. The generator turns each block into strands at load time and
+emits them as ordinary curve primitives, so the tracer, the BVH and the CUDA backend
+never learn that fur exists. Reproduce it with
+`ftrace -in scenes/fur_creature.ftsl -mode D -noise 2 -r 720 540 -o png/fur_creature_gi.png -window`
+(720×540, bidirectional path tracing to a 2 % noise target).*
+
+*What makes it read as an animal rather than as a hedgehog of line segments is that
+every strand is **slightly wrong** in its own way — length, lift, droop and comb all
+carry per-strand jitter, and neighbouring strands are pulled toward shared guide hairs
+by `clump`, which is what produces the wisps and partings a uniform coat never has. The
+lighting does the other half: fur is mostly gaps, so the strands are lit far more by
+light that has already bounced off the floor and the walls than by anything direct,
+which is why this is a global-illumination render and why the underside of the belly
+still has colour in it.*
+
+*The eyes are a good illustration of why the generator has the parameters it does. They
+are separate little spheres sitting **on** the head, and the head's own coat is rooted
+uniformly over the whole head — including the ring of skin each eye overlaps — so the
+first render came back with both eyes peppered with hair growing straight across them.
+Making the eyes stand proud of the coat does not fix that; it only stops them being
+buried. The fix is [`bald`](FTSL.md#87-fur--scatter-strands-over-a-surface), which names
+a sphere the groom must keep out of and culls — after clumping, and testing the **whole
+strand** rather than just its root — every hair that reaches into it.*
+
+*The same animal also stands in the gallery. [`scenes/gallery_rain.ftsl`](scenes/gallery_rain.ftsl)
+gives it the eleventh plinth and routes the closed camera fly-through **into its coat** — the
+loop threads five pieces now, and this is the only one that is neither a hole, a bore nor a
+transparent volume. The camera spends 1.16 m inside the fur travelling nose-to-tail (with the
+comb, not against it) at 21 mm a frame, the slowest movement anywhere on the flight, passing
+12.8 mm clear of the skull. At that range the strands are 0.64 mm thick and cross the whole
+frame, so the coat stops being a texture and becomes architecture — which is the entire
+argument for standing a groom in a hall of polished objects.*
+
 ---
 
 ## Highlights
@@ -88,6 +127,18 @@ renders — so the animation's source is the one Python file, not 432 baked scen
   diffraction gratings, fluorescence, and stochastic mixes.
 - **Wave-optical effects** — thin-film Airy interference, Abelès multilayer
   stacks, and reflective diffraction gratings.
+- **Curve / fiber primitive** — `curve` strands for hair, fur, grass, wire and
+  thread, in four bases (`linear`, `catmull_rom`, `bezier`, `bspline`), traced as
+  chains of **round cones** that share their end spheres, so a strand is one
+  watertight surface with no cracks at the joints — a handful of segments per hair
+  instead of the ~64 triangles a ribbon would need. Ray-traced on **CPU and GPU**
+  (74× measured on a 96 000-segment fur patch), and shown by the raster preview.
+- **Fur / groom generator** — `fur { on "<object>" … }` scatters 10⁴–10⁶ strands
+  **area-uniformly** over any named sphere, mesh, quad or triangle and shapes them with
+  lift, comb, gravity droop, curl and Voronoi clumping. It emits ordinary `curve`
+  records, so a groom needs no new code anywhere downstream and inherits the GPU path
+  for free; the build is a deterministic, lock-free pure function of
+  `(surface, parameters, seed)`.
 - **Participating media** — one or many coexisting (superposed) fog regions with
   Henyey–Greenstein or Rayleigh scattering; box / sphere / **named-object** bounds
   (fog shaped to a sphere, isosurface field, or mesh AABB) and heterogeneous
@@ -259,6 +310,7 @@ stays something you can actually read end to end.
 | Building SPDs — blackbody, gaussian, measured tables, `rgb` upsampling, IOR curves, the named presets | [Spectra](REFERENCE.md#spectra-spds-reflectances-indices) |
 | Area / sphere / cylinder / spot / sun / environment emitters and how they're sampled | [Lights](REFERENCE.md#lights) |
 | Primitives, transforms, meshes (`.obj` / `.gltf` / `.glb` / `.fbx` / `.stl` / `.ply` / `.ftmesh`), CSG, isosurfaces | [Geometry](REFERENCE.md#geometry) |
+| Hair / fur / grass / wire strands — the `curve` primitive and its four bases | [Curves and fibers](REFERENCE.md#curves-and-fibers-curve) |
 | Image textures, UV handling, and the math-driven procedural patterns | [Textures](REFERENCE.md#textures) · [Patterns](REFERENCE.md#procedural-patterns-math-driven-materials) |
 | Fog and volumes: homogeneous, bounded, heterogeneous density fields, OpenVDB / NanoVDB import | [Participating media](REFERENCE.md#participating-media--fog) |
 | A tour of the scene language, and stereoscopic / animation workflows | [Scene language](REFERENCE.md#scene-language-ftsl) |
@@ -279,10 +331,10 @@ building 3-D scenes and **seamless looping animations** that render on ftrace. L
 animates *continuous* things — modulator graphs, curves, fields, N-D-transformed
 isosurfaces — and discretizes **last, per frame**, emitting one `.ftsl` per frame
 which ftrace then renders (raster preview or full path trace) and assembles into a
-GIF/MP4. It ships with ready-to-run examples (swept ribbons/tubes, gyroid and other
-triply-periodic minimal-surface loops, higher-dimensional gyroid slices, function-driven
-materials, 2-D motion graphics, spacetime-transform videos) and stands alone (it can
-drive any renderer).
+GIF/MP4. It ships with ready-to-run examples (swept ribbons/tubes, native `curve` fiber
+tangles, gyroid and other triply-periodic minimal-surface loops, higher-dimensional
+gyroid slices, function-driven materials, 2-D motion graphics, spacetime-transform
+videos) and stands alone (it can drive any renderer).
 
 **The [demo at the top of this page](#demo) is a loom animation** —
 [`tools/loom/examples/pastel_jack.py`](tools/loom/examples/pastel_jack.py) — and it is
@@ -344,7 +396,11 @@ sidecar), and a procedural `r`/`g`/`b` formula skin is baked on the CPU through 
 pattern VM — including `tex:<name>(u,v)` sampling of an image declared above it — so the
 preview matches what the renderer would produce. A mesh with no skin, or a skin that fails to
 load or compile, falls back to grey and the reason is printed under the pane. `IsoMesh`
-isosurfaces are baked to a marching-cubes mesh and shown in the same Meshes tab. When the sidecar carries a
+isosurfaces are baked to a marching-cubes mesh and shown in the same Meshes tab, and a `Strand`
+fiber — which ships no triangles at all, since ftrace's native `curve` primitive flattens itself
+into round cones at load — is **tubed** for the preview from its centreline and per-sample
+radius, swept along a rotation-minimising frame so a closed loop's tube closes without a twisted
+band at the seam. When the sidecar carries a
 `source` key — the `.ftsl` `save_sidecar` emits beside it — a **Render tab** raymarches the
 *real* isosurface **field** in-process: it parses the `.ftsl` with ftrace's own `ftsl::load`
 and sphere-traces the field bytecode via `renderIsoPreviewCuda` (the `-raster-gpu` preview
@@ -413,6 +469,20 @@ resolution *only while the transport is playing*, snapping back to full resoluti
 you pause, which buys back the part of the cost that does scale with pixels. See
 `known-issues.md` for the full breakdown — including a worked example of a benchmark that
 confidently reported one of these optimizations as a regression.
+
+Five rounds of that made the round-trip cheaper. **Prebake** removes it. Hit **prebake** in
+the Live panel (or launch with `-prebake`) and the viewer walks the clock once, keeping every
+frame's *adopted* state — geometry, scene, DAG, skins — in memory; playback then costs
+**0.01 ms a frame** and runs on a real wall clock at whatever `fps` you ask for, instead of at
+whatever loom can bake. Scrubbing the frame slider becomes instant for the same reason. A
+progress bar and a live MB readout run during the walk, and a **cap MB** budget stops it
+before it eats the machine: a cache that hits the cap still plays the prefix it filled from
+memory and falls back to bake-paced play for the rest, so a long clock degrades rather than
+failing. The cache is dropped whenever a parameter or `frames` changes, because a cache built
+at other values is not a cache of what you're looking at. Measured on `scatter_modulated_sweep`
+(96 frames, 603 MB): a requested 24 fps is *delivered*, against 6.5 fps for the same scene
+uncached — and the only real per-frame cost left is the Render tab's raymarch, which you can
+stop paying by switching tabs.
 
 ---
 

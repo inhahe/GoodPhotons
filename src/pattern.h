@@ -25,6 +25,8 @@
 #include <algorithm>       // sort: CSE register-priority ordering
 #include "linalg.h"
 #include "pov_functions.h"   // exact POV-Ray internal isosurface functions (f_torus, ...)
+#include "worley.h"          // 3-D cellular (Worley/Voronoi) noise (host+device)
+#include "gabor.h"           // anisotropic band-limited Gabor noise (host+device)
 
 // The grid sampler below is shared verbatim by the CPU evaluator and the CUDA
 // pattern VM (render_cuda.cu includes this header), so it needs the same
@@ -137,6 +139,81 @@ enum class PatOp : int {
     // them, so patternHasFreeVars' VarX..VarV range and varName() are unperturbed.
     StReg,
     LdReg,
+    // Vector-valued POV gradient noise, one component per node: `a` holds the
+    // component (0=x, 1=y, 2=z). DNoise pops (x, y, z); DTurb pops (x, y, z,
+    // octaves, lambda, omega) — POV's DTurbulence octave sum, exposed as an op
+    // because the VM has no loops so the sum cannot be authored from DNoise
+    // alone. Both are pure functions of their operands (the CSE optimizer may
+    // share them; `a` participates in its node key), evaluated in double on
+    // every backend via the POV_HD povDNoise/povDTurbulence in pov_noise.h —
+    // the same promote/demote contract PovFn uses in the fp32 VM. This is the
+    // primitive behind domain warping (O2): a true gradient-vector noise, not
+    // three offset scalar lattices. Appended at the END of the enum, like
+    // everything since Tex, so patternHasFreeVars' VarX..VarV range and
+    // varName() are unperturbed.
+    DNoise,
+    DTurb,
+    // 3-D cellular (Worley/Voronoi) noise, one output per node: `a` holds the
+    // output selector (0=F1 nearest-point distance, 1=F2 second-nearest,
+    // 2=F2-F1 crack network, 3=per-cell random id in [0,1)). Pops (x, y, z,
+    // metric) where metric rounds/clamps to 0 Euclidean / 1 Manhattan /
+    // 2 Chebyshev — a runtime operand, so the look can vary spatially. Pure
+    // function of its operands (CSE shares it; `a` keys the node), evaluated
+    // in double on every backend via the WORLEY_HD patWorley in worley.h
+    // (fp32 VM promotes/demotes, like PovFn/DNoise). Exact F1/F2 by adaptive
+    // ring search, not the approximate 3x3x3 (see worley.h). Appended at the
+    // END of the enum so the VarX..VarV scans and varName() are unperturbed.
+    Worley,
+    // SURFACE MEAN CURVATURE at the shading point, spelled `curv` (O3), in 1/length
+    // units and signed toward the shaded side (convex +, concave -, flat 0; a unit
+    // sphere reads +1). This is the first primitive whose whole purpose is to make a
+    // texture NON-STATIONARY: multiplying any noise by a curvature mask concentrates
+    // it on edges (wear, rust, dust) or in crevices (grime), which no amount of
+    // position-driven noise can express, because the statistics have to follow the
+    // SHAPE rather than the space it sits in.
+    //
+    // Appended at the END of the enum like everything since Tex, so existing opcode
+    // numbering is unperturbed — but unlike those, `curv` IS a per-hit surface
+    // intrinsic, so patternHasFreeVars names it explicitly alongside the VarX..VarV
+    // range rather than relying on that range to cover it.
+    VarCurv,
+    // SURFACE CAVITY (ambient-occlusion-flavoured enclosure) at the shading point,
+    // spelled `cavity` (O3 stage 2): the fraction of a short hemispherical probe of
+    // radius `scene.cavityRadius` that is BLOCKED. 0 = fully open (a lone plane),
+    // 1 = fully enclosed.
+    //
+    // Why this exists NEXT TO `curv` rather than instead of it: they disagree in exactly
+    // the place that matters. Along a right-angled interior corner between two flat
+    // walls both faces are locally flat, so `curv` reads 0 on each and cannot see the
+    // corner at all — yet that corner is the most obvious place grime collects. `curv`
+    // is a LOCAL second derivative; `cavity` is a NON-LOCAL enclosure measure, so it
+    // also sees the gap between two SEPARATE objects, which no per-surface differential
+    // quantity can. Conversely `cavity` is blind to a gentle convexity that `curv`
+    // reports crisply, so edge WEAR still wants `curv`. They are complements.
+    //
+    // Appended at the end like everything since Tex, and — exactly like VarCurv — named
+    // EXPLICITLY in patternHasFreeVars and patOpStackEffect, because it is a per-hit
+    // surface intrinsic living outside the contiguous VarX..VarV range.
+    VarCavity,
+    // ANISOTROPIC BAND-LIMITED GABOR NOISE (O4), spelled
+    // `gabor(x, y, z, f, wx, wy, wz)` — arity 7, the widest op in the VM. Pops the
+    // sample point, the frequency in cycles per unit of the caller's (already scaled)
+    // space, and a steering direction which need not be normalised and may be any
+    // expression; a zero-length direction selects isotropic band-pass noise. Returns
+    // [0,1] with mean 0.5, like `noise`.
+    //
+    // Every other noise here is a LATTICE noise, so its orientation is baked into the
+    // grid and the only way to steer it is to warp the coordinates — which re-incurs
+    // exactly the position-dependent shear that the non-stationary write-up warns about
+    // for spatially varying FREQUENCY, for the same reason (the Jacobian of R(p)*p
+    // carries a term proportional to |p|). Gabor noise carries orientation and
+    // bandwidth as KERNEL parameters instead, so it steers with no shear at all, and is
+    // band-limited into the bargain. Pure function of its operands (CSE shares it), no
+    // payload, evaluated in double on every backend via the GABOR_HD patGabor in
+    // gabor.h — including its own deterministic cosine, because libm's is not
+    // bit-identical between host and device. Appended at the END of the enum, so the
+    // VarX..VarV scans and varName() are unperturbed.
+    Gabor,
 };
 
 // Register-file size available to a CSE-optimized program (per evaluator invocation).
@@ -344,6 +421,8 @@ struct PatCtx {
     double nx = 0, ny = 0, nz = 0;// surface normal
     double r = 0;                 // radius |p|
     double u = 0, v = 0;          // surface UV (mesh interpolated or native-primitive wrap)
+    double curv = 0;              // mean curvature, 1/length, signed toward the shaded side (O3)
+    double cavity = 0;            // blocked fraction of a short hemispherical probe, [0,1] (O3 s2)
     double t = 0;                 // flyby timeline in [0,1] (camera_curve record tracks only)
     // PatOp::Tex sampler hook. pattern.h deliberately knows nothing about Texture
     // (texture.h drags in the spectral/upsampling machinery and is not something we
@@ -441,13 +520,16 @@ struct PatTableScope {
     }
 };
 
-inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, double v = 0) {
+inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, double v = 0,
+                         double curv = 0, double cavity = 0) {
     PatCtx c;
     c.x = p.x; c.y = p.y; c.z = p.z;
     c.f = f;
     c.nx = n.x; c.ny = n.y; c.nz = n.z;
     c.r = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
     c.u = u; c.v = v;
+    c.curv = curv;
+    c.cavity = cavity;
     return c;
 }
 
@@ -504,6 +586,8 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
             case PatOp::VarR:     st[sp++] = c.r;  break;
             case PatOp::VarU:     st[sp++] = c.u;  break;
             case PatOp::VarV:     st[sp++] = c.v;  break;
+            case PatOp::VarCurv:  st[sp++] = c.curv; break;
+            case PatOp::VarCavity: st[sp++] = c.cavity; break;
             case PatOp::VarT:     st[sp++] = c.t;  break;
             // `a` is resolved at load time (bound at the use site, or to the material's
             // albedo_default) and so is unreachable here; 0 keeps the switch total.
@@ -540,6 +624,34 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
                 break;
             }
             case PatOp::Noise:    { double zz = st[--sp], yy = st[--sp]; st[sp-1] = patValueNoise(st[sp-1], yy, zz); break; }
+            case PatOp::DNoise: {
+                double zz = st[--sp], yy = st[--sp], vout[3];
+                povDNoise(st[sp-1], yy, zz, vout);
+                st[sp-1] = vout[(int)nd.a];
+                break;
+            }
+            case PatOp::DTurb: {
+                double om = st[--sp], la = st[--sp], oc = st[--sp];
+                double zz = st[--sp], yy = st[--sp], vout[3];
+                povDTurbulence(st[sp-1], yy, zz, oc, la, om, vout);
+                st[sp-1] = vout[(int)nd.a];
+                break;
+            }
+            case PatOp::Worley: {
+                double m = st[--sp], zz = st[--sp], yy = st[--sp], w[3];
+                int mi = (int)floor(m + 0.5);
+                if (mi < 0) mi = 0; if (mi > 2) mi = 2;
+                patWorley(st[sp-1], yy, zz, mi, w);
+                int sel = (int)nd.a;
+                st[sp-1] = (sel == 3) ? w[2] : (sel == 2) ? (w[1] - w[0]) : w[sel];
+                break;
+            }
+            case PatOp::Gabor: {
+                double dz = st[--sp], dy = st[--sp], dx = st[--sp];
+                double ff = st[--sp], zz = st[--sp], yy = st[--sp];
+                st[sp-1] = patGabor(st[sp-1], yy, zz, ff, dx, dy, dz);
+                break;
+            }
             case PatOp::PovFn: {
                 int id = (int)nd.a;
                 int na = povFnArity(id);
@@ -635,6 +747,8 @@ inline bool varOp(const std::string& s, PatOp& out) {
     if (s == "r")  { out = PatOp::VarR;  return true; }
     if (s == "u")  { out = PatOp::VarU;  return true; }
     if (s == "v")  { out = PatOp::VarV;  return true; }
+    if (s == "curv") { out = PatOp::VarCurv; return true; } // mean curvature, 1/length (O3)
+    if (s == "cavity") { out = PatOp::VarCavity; return true; } // enclosure in [0,1] (O3 s2)
     if (s == "a")  { out = PatOp::VarA;  return true; }   // albedo — resolved at load time
     return false;
 }
@@ -685,8 +799,22 @@ inline bool funcOp(const std::string& s, PatOp& out, int& arity, int& povId) {
         {"atan2",PatOp::Atan2,2},{"step",PatOp::Step,2},
         {"clamp",PatOp::Clamp,3},{"mix",PatOp::Mix,3},
         {"smoothstep",PatOp::Smoothstep,3},{"noise",PatOp::Noise,3},
+        // anisotropic Gabor noise (O4): point, frequency, steering direction
+        {"gabor",PatOp::Gabor,7},
     };
     for (const F& g : fs) if (s == g.n) { out = g.op; arity = g.ar; return true; }
+    // Vector-noise components (O2) and Worley outputs (O1). The component /
+    // output index rides the povId out-channel (it is a generic payload slot:
+    // the emit site copies it into the node's `a`, exactly as it does for a
+    // POV internal id).
+    struct V { const char* n; PatOp op; int ar; int comp; };
+    static const V vfs[] = {
+        {"dnoisex",PatOp::DNoise,3,0},{"dnoisey",PatOp::DNoise,3,1},{"dnoisez",PatOp::DNoise,3,2},
+        {"dturbx",PatOp::DTurb,6,0},{"dturby",PatOp::DTurb,6,1},{"dturbz",PatOp::DTurb,6,2},
+        {"worley",PatOp::Worley,4,0},{"worley2",PatOp::Worley,4,1},
+        {"worleyd",PatOp::Worley,4,2},{"worleyid",PatOp::Worley,4,3},
+    };
+    for (const V& g : vfs) if (s == g.n) { out = g.op; arity = g.ar; povId = g.comp; return true; }
     int id, ar;
     if (povFnLookup(s.c_str(), id, ar)) { out = PatOp::PovFn; arity = ar; povId = id; return true; }
     return false;
@@ -923,6 +1051,8 @@ inline const char* varName(PatOp op) {
         case PatOp::VarNx: return "nx";  case PatOp::VarNy: return "ny";
         case PatOp::VarNz: return "nz";  case PatOp::VarR:  return "r";
         case PatOp::VarU:  return "u";   case PatOp::VarV:  return "v";
+        case PatOp::VarCurv: return "curv";
+        case PatOp::VarCavity: return "cavity";
         case PatOp::VarA:  return "a";   default: return nullptr;
     }
 }
@@ -1005,6 +1135,9 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
             PatOp op; int ar; int povId; funcOp(t.name, op, ar, povId);
             PatNode nd; nd.op = op;
             if      (op == PatOp::PovFn) nd.a = (double)povId;
+            else if (op == PatOp::DNoise || op == PatOp::DTurb ||
+                     op == PatOp::Worley)
+                                         nd.a = (double)povId;   // component / output index
             else if (op == PatOp::Tex)   nd.a = (double)t.texId;    // resolved at tokenize
             else if (op == PatOp::Spec)  nd.a = (double)t.texId;    // shares the resolved-index slot
             else if (op == PatOp::Grid || op == PatOp::Scatter)
@@ -1084,6 +1217,8 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
 inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
     for (const PatNode& nd : prog)
         if ((nd.op >= PatOp::VarX && nd.op <= PatOp::VarV) ||
+            nd.op == PatOp::VarCurv ||   // a surface intrinsic living outside the range (O3)
+            nd.op == PatOp::VarCavity || // ditto (O3 stage 2)
             nd.op == PatOp::Tex || nd.op == PatOp::Grid ||
             nd.op == PatOp::Scatter) return true;
     return false;
@@ -1099,6 +1234,19 @@ inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
 // ray bottoms out in patternEval / dPatternEval[F]), collapsing those repeats is a
 // direct hot-path win on BOTH backends: the optimized program is what gets uploaded.
 //
+// HAND-WRITTEN patterns repeat subtrees for a different and unavoidable reason: the
+// expression language has no local variables. There is no `let`, so a scene-aware
+// field that gates one term and steers another — the non-stationary idiom, where the
+// same `1 - smoothstep(lo, hi, grid:d(x, y, z))` appears at every site it drives —
+// has to be spelled out in full at each site. Without CSE an eight-use field is eight
+// trilinear lattice fetches per shading point; with it, one. So this pass runs over
+// every material `pattern` program and every medium density/ior program too, not just
+// field formulas, and that is what makes "write it out as many times as you need"
+// honest advice rather than a performance trap. It is also why Grid/Scatter arity is
+// resolved from the scene's tables below instead of bailing: a program built around a
+// repeated `grid:` sample is precisely the one with the most to gain, and refusing to
+// model the op would have switched the optimizer off for exactly those programs.
+//
 // Method: simulate the postfix stack, hash-consing every (op, payload, children)
 // node into a DAG. Any interior node the DAG reaches >= 2 times becomes a register
 // candidate; the top PAT_CSE_REGS by saved-work get a register. The program is then
@@ -1112,30 +1260,69 @@ inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
 // returns precisely what the recomputation would have. No arithmetic is folded,
 // reordered or changed; the emission order of the surviving nodes is the original
 // post-order. The optimizer additionally refuses anything it cannot prove out:
-// unknown arities (Grid/Scatter — table-dimension arity), already-optimized
-// programs, malformed stacks, and as a final belt-and-braces check it bit-compares
-// original vs optimized at a set of probe points before committing.
+// unknown arities (a Grid/Scatter whose table set was not handed in, or any op added
+// later without a stack-effect line), already-optimized programs, malformed stacks,
+// and as a final belt-and-braces check it bit-compares original vs optimized at a set
+// of probe points before committing.
 // ---------------------------------------------------------------------------
 
 // Stack effect of one node: how many operands it pops and pushes. False when the
 // arity cannot be read from the node alone (Grid/Scatter: the arity is the named
-// table's own dimensionality, which lives outside the program).
-inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes) {
+// table's own dimensionality, which lives outside the program) AND no table set was
+// handed in to look it up in. Pass the scene's `tabs` and those two become knowable,
+// which is what lets a `grid:`-bearing program be optimized at all — see the Grid
+// case below.
+inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes,
+                             const PatTables* tabs = nullptr) {
     pushes = 1;
     if (op >= PatOp::Const && op <= PatOp::VarT)  { pops = 0; return true; }
     if (op == PatOp::VarA)                        { pops = 0; return true; }
+    // A leaf like VarX..VarT and VarA — but it lives past the end of that range, so it
+    // needs its own line. Omitting it does NOT merely leave `curv` itself unshared: an
+    // unknown arity makes patternOptimizeCSE bail on the WHOLE program, so a single
+    // `curv` anywhere would silently switch off CSE for the entire expression around it.
+    if (op == PatOp::VarCurv)                     { pops = 0; return true; }
+    if (op == PatOp::VarCavity)                   { pops = 0; return true; }
     if (op >= PatOp::Neg && op <= PatOp::Saturate){ pops = 1; return true; }
     if (op >= PatOp::Add && op <= PatOp::Step)    { pops = 2; return true; }
     if (op >= PatOp::Clamp && op <= PatOp::Noise) { pops = 3; return true; }
     if (op == PatOp::PovFn)                       { pops = povFnArity((int)a); return true; }
+    if (op == PatOp::DNoise)                      { pops = 3; return true; }
+    if (op == PatOp::DTurb)                       { pops = 6; return true; }
+    if (op == PatOp::Worley)                      { pops = 4; return true; }
+    if (op == PatOp::Gabor)                       { pops = 7; return true; }
     if (op == PatOp::Tex)                         { pops = 2; return true; }
     if (op == PatOp::Spec)                        { pops = 1; return true; }
     if (op == PatOp::StReg)                       { pops = 0; pushes = 0; return true; }  // peeks
     if (op == PatOp::LdReg)                       { pops = 0; pushes = 1; return true; }
-    return false;   // Grid / Scatter / anything future: bail out of optimizing
+    // An N-D table sample pops its table's own `ndim` coordinates. That number is not
+    // in the node — the node carries only the resolved table INDEX — so it can only be
+    // answered when the caller supplies the same table set the program will be evaluated
+    // against. Note the clamp: it is deliberately the identical one patternEval applies
+    // (and the device evaluators too), because what must match here is the evaluator's
+    // ACTUAL pop count, not the header's nominal dimensionality. A header claiming ndim 9
+    // pops PAT_ND_MAX_DIM in the VM, so it must pop PAT_ND_MAX_DIM here as well or the
+    // re-emitted program would be modelled with the wrong stack depth.
+    if (op == PatOp::Grid) {
+        if (!tabs || !tabs->grids) return false;
+        const int gi = (int)a;
+        if (gi < 0 || gi >= tabs->nGrids) return false;
+        const int nd = tabs->grids[gi].ndim;
+        pops = nd < 1 ? 1 : (nd > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : nd);
+        return true;
+    }
+    if (op == PatOp::Scatter) {
+        if (!tabs || !tabs->scatters) return false;
+        const int si = (int)a;
+        if (si < 0 || si >= tabs->nScatters) return false;
+        const int nd = tabs->scatters[si].ndim;
+        pops = nd < 1 ? 1 : (nd > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : nd);
+        return true;
+    }
+    return false;   // anything future: bail out of optimizing
 }
 
-inline void patternOptimizeCSE(std::vector<PatNode>& prog) {
+inline void patternOptimizeCSE(std::vector<PatNode>& prog, const PatTables* tabs = nullptr) {
     const int n = (int)prog.size();
     if (n < 4) return;   // nothing worth sharing
     // ---- 1. postfix -> hash-consed DAG --------------------------------------
@@ -1147,7 +1334,7 @@ inline void patternOptimizeCSE(std::vector<PatNode>& prog) {
         const PatNode& nd = prog[i];
         if (nd.op == PatOp::StReg || nd.op == PatOp::LdReg) return;  // already optimized
         int pops, pushes;
-        if (!patOpStackEffect(nd.op, nd.a, pops, pushes)) return;    // unknown arity
+        if (!patOpStackEffect(nd.op, nd.a, pops, pushes, tabs)) return;  // unknown arity
         if (pops > (int)stk.size()) return;                          // malformed program
         DagNode dn; dn.op = nd.op; dn.a = nd.a;
         dn.kids.assign(stk.end() - pops, stk.end());
@@ -1232,7 +1419,7 @@ inline void patternOptimizeCSE(std::vector<PatNode>& prog) {
         int sp = 0, maxSp = 0;
         for (const PatNode& nd : out) {
             int pops, pushes;
-            if (!patOpStackEffect(nd.op, nd.a, pops, pushes)) return;
+            if (!patOpStackEffect(nd.op, nd.a, pops, pushes, tabs)) return;
             if (pops > sp) return;
             sp += pushes - pops;
             if (sp > maxSp) maxSp = sp;
@@ -1240,20 +1427,31 @@ inline void patternOptimizeCSE(std::vector<PatNode>& prog) {
         if (sp != 1 || maxSp > 64) return;   // evaluator stack is 64 deep
     }
     // ---- 6. belt-and-braces: bit-compare original vs optimized ---------------
-    static const double probe[6][11] = {
-        // x      y      z      f    nx     ny     nz     r      u      v      t
-        { 0.31, -1.27,  2.63, 0.05, 0.27,  0.53, -0.80, 2.93,  0.37,  0.71, 0.13},
-        {-2.11,  0.04, -0.57, -0.2, -0.7,  0.10,  0.70, 2.19,  0.93,  0.08, 0.77},
-        { 5.02,  3.33, -4.19, 1.30, 0.57, -0.57,  0.59, 7.25,  0.11,  0.99, 0.42},
-        {-0.02, -0.03,  0.01, 0.00, 0.00,  1.00,  0.00, 0.04,  0.50,  0.50, 0.00},
-        { 12.7, -8.31,  0.66, -3.1, 0.80,  0.00, -0.60, 15.2,  0.66,  0.25, 1.00},
-        {-0.99,  0.98, -0.97, 0.42, -0.5,  0.50, -0.70, 1.70,  0.01,  0.02, 0.55},
+    // Every free variable the VM has gets a DISTINCT non-zero value on at least one
+    // row. A column left at 0 would make any subtree that reads it collapse to the same
+    // constant on both sides and pass the comparison without exercising anything — so
+    // `curv` and `cavity` carry real values here even though they are leaves.
+    static const double probe[6][13] = {
+        // x      y      z      f    nx     ny     nz     r      u      v      t    curv  cavity
+        { 0.31, -1.27,  2.63, 0.05, 0.27,  0.53, -0.80, 2.93,  0.37,  0.71, 0.13,  4.10, 0.23},
+        {-2.11,  0.04, -0.57, -0.2, -0.7,  0.10,  0.70, 2.19,  0.93,  0.08, 0.77, -1.75, 0.86},
+        { 5.02,  3.33, -4.19, 1.30, 0.57, -0.57,  0.59, 7.25,  0.11,  0.99, 0.42, 21.30, 0.05},
+        {-0.02, -0.03,  0.01, 0.00, 0.00,  1.00,  0.00, 0.04,  0.50,  0.50, 0.00,  0.00, 0.50},
+        { 12.7, -8.31,  0.66, -3.1, 0.80,  0.00, -0.60, 15.2,  0.66,  0.25, 1.00, -0.31, 1.00},
+        {-0.99,  0.98, -0.97, 0.42, -0.5,  0.50, -0.70, 1.70,  0.01,  0.02, 0.55,  7.62, 0.00},
     };
     for (int p = 0; p < 6; ++p) {
         PatCtx c;
         c.x = probe[p][0]; c.y = probe[p][1]; c.z  = probe[p][2]; c.f = probe[p][3];
         c.nx = probe[p][4]; c.ny = probe[p][5]; c.nz = probe[p][6]; c.r = probe[p][7];
         c.u = probe[p][8]; c.v = probe[p][9]; c.t  = probe[p][10];
+        c.curv = probe[p][11]; c.cavity = probe[p][12];
+        // The tables have to be bound or this check quietly stops checking anything: an
+        // unbound Grid/Scatter makes patternEval abandon the WHOLE program and return
+        // 0.0, so both sides would come back 0.0 and compare equal no matter how wrong
+        // the re-emission was. Bound, the probe really does sample the lattice and the
+        // comparison covers the table ops like every other op.
+        patBindTables(c, tabs);
         double v0 = patternEval(prog.data(), n, c);
         double v1 = patternEval(out.data(), (int)out.size(), c);
         if (std::memcmp(&v0, &v1, 8) != 0) return;   // should be unreachable

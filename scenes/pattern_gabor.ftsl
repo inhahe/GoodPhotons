@@ -1,0 +1,110 @@
+# pattern_gabor.ftsl — anisotropic, band-limited Gabor noise (O4).
+#
+#   gabor(x, y, z, f, wx, wy, wz)   ->  [0,1], mean 0.5
+#
+# `f` is the frequency in cycles per unit of the (already scaled) coordinates you
+# hand it, and (wx, wy, wz) is the STEERING DIRECTION: the field oscillates ALONG
+# that vector, so the visible streaks run PERPENDICULAR to it. The vector need not
+# be normalised, and — the whole point of the primitive — it is an ordinary
+# expression, so it can vary from point to point. A zero-length vector selects
+# isotropic band-pass noise.
+#
+# Why this is not just `noise` with rotated coordinates: steering a lattice noise
+# means evaluating `noise(R(p) * p)`, whose Jacobian is `R + (dR/dp) * p` — the
+# second term grows with distance from the (arbitrary) origin, so the texture shears
+# more and more the farther out you shade, and the local orientation is never quite
+# the R you asked for. A Gabor kernel only ever sees the offset from its OWN centre,
+# which is bounded by one cell, so a varying direction leaves a residual bounded by
+# the local turning rate — not by |p|. `ftrace -checkgabor` §6 measures exactly that,
+# at the origin and 4000 units out.
+#
+# The five surfaces:
+#   back wall  — ISOTROPIC band-pass. Zero direction, so every impulse draws its own
+#                direction: a single-scale speckle with no low-frequency blotching,
+#                which is what "band-limited" means and what fBm can never be.
+#   left wall  — BRUSHED METAL. Oscillation across the wall (w^ = +z), and the y
+#                coordinate scaled down 10x so each kernel is stretched vertically:
+#                fine, long vertical scratches.
+#   floor      — WOOD END GRAIN. The steering vector is the RADIAL direction from a
+#                vertical axis standing in the room, so the bands close into growth
+#                rings and the floor reads as a cross-cut through a trunk. This is
+#                the varying-direction case, and it is one expression — not a
+#                coordinate warp, not a polar remap.
+#   right wall — FLOW-ALIGNED FIBRE. The direction comes from a vector noise, so the
+#                streaks swirl like brushed fur.
+#   sphere     — the same brushed treatment wrapped onto a curved surface, steered
+#                by the world y axis so the striation follows lines of latitude.
+#
+#   ftrace -in scenes/pattern_gabor.ftsl -n 40000000 -window -keepwindow \
+#          -o png/pattern_gabor.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# BACK WALL — isotropic band-pass noise. 34 cells/m, 1.2 cycles per cell, so every
+# blob is the same size: there is no octave sum here and no low-frequency drift.
+pattern "speckle" { expr "smoothstep(0.24, 0.76, gabor(34*x, 34*y, 34*z, 1.2, 0, 0, 0))" }
+
+# LEFT WALL (the x = 0 plane, spanned by z and y) — brushed vertically. The
+# oscillation runs along +z, and y is scaled 10x less than z, so each kernel is a
+# long vertical ellipse: scratches an order of magnitude taller than they are wide.
+# 1.6 cycles per cell on top of that puts ~48 scratches across the wall.
+pattern "brushed" { expr "smoothstep(0.26, 0.74, gabor(30*x, 3*y, 30*z, 1.6, 0, 0, 1))" }
+
+# FLOOR — wood END GRAIN. The steering vector is the radial direction away from a
+# vertical axis at (0.35, *, 0.35): oscillating radially closes the bands into growth
+# rings, ~18 of them across the room. A flat plank cut PARALLEL to the trunk would
+# show straight grain instead; the floor is the cross-cut, so the rings show. At the
+# axis itself the direction degenerates to zero and the primitive falls back to
+# isotropic — which is exactly what the pith of a real trunk looks like.
+pattern "wood" {
+    expr "smoothstep(0.34, 0.66, gabor(8*x, 8*y, 8*z, 2.2, x - 0.35, 0, z - 0.35))"
+}
+
+# RIGHT WALL (the x = 1 plane, spanned by y and z) — flow-aligned fibre. The steering
+# direction is a slowly varying vector noise laid IN the wall plane, so the streaks
+# swirl like brushed fur. Note the two dnoise calls each appear once but their shared
+# argument subtrees do not — the pattern CSE collapses those.
+pattern "fibre" {
+    expr "smoothstep(0.28, 0.72, gabor(30*x, 30*y, 30*z, 1.6, 0,
+                                       dnoisex(1.3*x, 1.3*y, 1.3*z),
+                                       dnoisez(1.3*x, 1.3*y, 1.3*z)))"
+}
+
+# SPHERE — striated along lines of latitude: oscillation along world +y.
+pattern "striate" { expr "smoothstep(0.30, 0.70, gabor(34*x, 34*y, 34*z, 1.8, 0, 1, 0))" }
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "ink"   { type diffuse reflect rgb 0.06 0.06 0.09 }
+material "lite"  { type diffuse reflect rgb 0.93 0.93 0.93 }
+material "steel" { type diffuse reflect rgb 0.55 0.57 0.60 }
+material "oak"   { type diffuse reflect rgb 0.55 0.33 0.14 }
+material "amber" { type diffuse reflect rgb 0.80 0.62 0.32 }
+material "teal"  { type diffuse reflect rgb 0.10 0.34 0.36 }
+
+material "backwall"  { type mix  layer "lite"  0.5  layer "ink"   0.5  weight_map pattern:speckle }
+material "leftwall"  { type mix  layer "steel" 0.5  layer "lite"  0.5  weight_map pattern:brushed }
+material "rightwall" { type mix  layer "teal"  0.5  layer "lite"  0.5  weight_map pattern:fibre   }
+material "floormat"  { type mix  layer "oak"   0.5  layer "amber" 0.5  weight_map pattern:wood    }
+material "ballmat"   { type mix  layer "ink"   0.5  layer "steel" 0.5  weight_map pattern:striate }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material floormat }
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }
+quad { origin 0 0 0   u 1 0 0   v 0 1 0   material backwall }
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material leftwall }
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material rightwall }
+
+sphere { center 0.62 0.24 0.62   radius 0.22   material ballmat }
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 400 400 }
+}

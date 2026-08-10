@@ -652,8 +652,14 @@ class Sphere(Element):
 
 class Beads(Element):
     """A view-independent "string of beads": ``count`` spheres sampled evenly
-    along a :class:`LoopCurve` (or a :class:`PointPath`).  This is the simplest
-    way to render a 3-D closed curve before the sweep engine (M4) exists."""
+    along a :class:`LoopCurve` (or a :class:`PointPath`).
+
+    This was loom's first way to show a 3-D curve, back when neither the sweep engine
+    nor ftrace's ``curve`` primitive existed.  For a *continuous* fiber reach for
+    :class:`Strand` instead — it is one ``curve { }`` block, watertight, taperable, and
+    cheaper than N spheres.  ``Beads`` is still the right thing when you actually want
+    beads: discrete markers whose spacing along the curve is the point.
+    """
 
     def __init__(self, curve: Union[LoopCurve, PointPath], count: int,
                  radius, material: str) -> None:
@@ -886,6 +892,163 @@ class IsoMesh(Element):
                 f'material "{self.material}" }}')
 
 
+class Strand(Element):
+    """A spine emitted as ftrace's **native ``curve`` primitive** — a round fiber,
+    no mesh (FTSL §8.6).
+
+    Where :class:`SweptMesh` tessellates a circular profile into an OBJ that ftrace
+    then loads, a ``Strand`` writes the control points straight into the ``.ftsl``
+    and lets ftrace flatten them into round cones at load time.  Nothing is written
+    to disk, the radius can taper, and the fiber is watertight at every joint however
+    sharply it bends — a round cone chain has no mitre to get wrong and no ring
+    resolution to choose.  Use it for hair, fur, grass, wire, thread, tentacles,
+    ribbons-of-rope: anything whose cross-section is a circle.
+
+    ``tube(spine, radius=r)`` and ``Strand(spine, radius=r)`` draw the same shape;
+    prefer the ``Strand`` unless you need a *non-circular* profile, a twist, or the
+    triangles themselves (``SweptMesh`` remains the general sweep).
+
+    **Sampling and basis.**  The spine is sampled at ``count`` points *at the current
+    clock*, then handed to ftrace as control points — see :mod:`loom.strands`.  An
+    **open** spine uses ``catmull_rom``, which interpolates, so the strand passes
+    exactly through every sample.  A **closed** spine uses a wrapped ``bspline``:
+    Catmull-Rom's ends are clamp-duplicated and cannot close a loop seamlessly, while
+    a periodic uniform cubic B-spline (control points wrapped by 3, giving exactly
+    ``count`` spans) is C2 everywhere *including the seam*, with no span drawn twice.
+    Because a B-spline only approximates its control points, the control points are
+    solved for rather than copied, so the closed strand still passes through the
+    sampled spine to machine precision.  This is loom principle #4 — the loop closes
+    structurally, not by patching a seam.
+
+    **Radius.**  ``radius`` (root) and ``radius_tip`` (default: same as ``radius``)
+    may be numbers or :class:`~loom.signals.core.Signal`\\ s, so the fiber can breathe.
+    ``radius_profile`` is an optional ``f(u) -> float`` multiplier along the strand
+    (``u in [0, 1]``), the fiber analogue of :class:`SweptMesh`'s ``scale_profile``.
+    The full law is ``r(u) = lerp(radius, radius_tip, u) * radius_profile(u)``.
+
+    **On a closed spine the radius must close too.**  Root and tip are the *same
+    place*, so a ``radius_tip`` that differs from ``radius``, or a ``radius_profile``
+    with ``f(1) != f(0)``, is a step discontinuity in the fiber exactly at the seam.
+    Like :class:`SweptMesh`'s ``turns``, this is warned about once per element rather
+    than silently snapped — snapping would change the geometry the author asked for.
+
+    ``segments`` is round cones per span.  loom has already discretized the spine
+    into ``count`` short spans, so the default of 2 is plenty; ftrace's own default
+    (for hand-authored curves with a handful of points) is 4.
+    """
+
+    def __init__(self, spine: Union[LoopCurve, PointPath], *, count: int = 64,
+                 radius=0.02, radius_tip=None,
+                 radius_profile: Optional[Callable[[float], float]] = None,
+                 segments: int = 2, closed_spine: bool = True,
+                 material: str = "default", name: str = "strand") -> None:
+        if isinstance(spine, PointPath):
+            spine = LoopCurve(spine, Const(0.0))
+        self.spine = spine
+        self.count = int(count)
+        self.radius = radius
+        self.radius_tip = radius_tip
+        self.radius_profile = radius_profile
+        self.segments = int(segments)
+        self.closed_spine = bool(closed_spine)
+        self.material = material
+        self.name = name
+        self._warned_seam = False
+        if self.closed_spine and self.count < 3:
+            raise ValueError(
+                f"Strand({name!r}): closed_spine=True needs count >= 3 "
+                f"(a loop's periodic B-spline solve has count unknowns), got {self.count}")
+        if not self.closed_spine and self.count < 2:
+            raise ValueError(
+                f"Strand({name!r}): count >= 2, got {self.count}")
+
+    def roots(self) -> List:
+        out: List = [self.spine]
+        for v in (self.radius, self.radius_tip):
+            n = site_node(v)
+            if n is not None:
+                out.append(n)
+        return out
+
+    def _check_seam(self, r_root: float, r_tip: float) -> None:
+        """A closed strand's root and tip are the same point, so the radius has to
+        agree there.  Warn once per element (this runs every frame)."""
+        if self._warned_seam or not self.closed_spine:
+            return
+        prof = self.radius_profile
+        p0 = prof(0.0) if prof is not None else 1.0
+        p1 = prof(1.0) if prof is not None else 1.0
+        scale = max(abs(r_root), abs(r_tip), 1e-30)
+        if abs(r_root * p0 - r_tip * p1) <= 1e-6 * scale:
+            return
+        self._warned_seam = True
+        import warnings
+        warnings.warn(
+            f"Strand({self.name!r}): closed_spine=True but the radius does not close "
+            f"— root {r_root * p0:.4g} vs tip {r_tip * p1:.4g}. On a loop the root and "
+            f"the tip are the same place, so the fiber steps thickness at the seam. "
+            f"Leave `radius_tip` unset (or equal to `radius`) and give a *periodic* "
+            f"`radius_profile` (f(1) == f(0)) to vary thickness around a loop.",
+            stacklevel=3)
+
+    def emit(self, ctx: EmitCtx) -> str:
+        from . import strands as _strands
+        clock, cache = ctx.clock, ctx.cache
+        r_root = num(self.radius, clock, cache)
+        r_tip = r_root if self.radius_tip is None else num(self.radius_tip, clock, cache)
+        self._check_seam(r_root, r_tip)
+
+        pts = _strands.sample_spine(self.spine, self.count, self.closed_spine, clock, cache)
+        basis, ctl, rad_u = _strands.strand_controls(pts, self.closed_spine)
+
+        def radius_at(u: float) -> float:
+            r = r_root + (r_tip - r_root) * u
+            if self.radius_profile is not None:
+                r *= float(self.radius_profile(u))
+            return r
+
+        # Per-point `r=` rather than the loader's `radius`/`radius_tip` taper whenever
+        # the taper would land on the wrong points: a closed strand's control list is
+        # wrapped (so index-linear is not u-linear) and a `radius_profile` is not linear
+        # at all. The `key=val` form is mandatory — a bareword `r` would start a new
+        # statement (FTSL §8.6).
+        explicit = self.closed_spine or self.radius_profile is not None
+        lines = [f'curve "{self.name}" {{',
+                 f'    material "{self.material}"',
+                 f'    basis {basis}',
+                 f'    radius {fmt(r_root)}']
+        if not explicit and r_tip != r_root:
+            lines.append(f'    radius_tip {fmt(r_tip)}')
+        lines.append(f'    segments {self.segments}')
+        for j, p in enumerate(ctl):
+            if explicit:
+                lines.append(f'    point {fmt3(p)}  r={fmt(radius_at(rad_u[j]))}')
+            else:
+                lines.append(f'    point {fmt3(p)}')
+        lines.append('}')
+        return "\n".join(lines)
+
+
+def strand(spine, *, radius: float = 0.02, material: str = "default", count: int = 64,
+           radius_tip=None, radius_profile=None, segments: int = 2,
+           closed_spine: bool = True, name: str = "strand") -> Strand:
+    """A round fiber along the spine, as ftrace's native ``curve`` — the mesh-free
+    replacement for :func:`tube`.  See :class:`Strand`."""
+    return Strand(spine, count=count, radius=radius, radius_tip=radius_tip,
+                  radius_profile=radius_profile, segments=segments,
+                  closed_spine=closed_spine, material=material, name=name)
+
+
+def hair(spine, *, radius: float = 0.004, tip: float = 0.0005,
+         material: str = "default", count: int = 24, segments: int = 2,
+         name: str = "hair") -> Strand:
+    """One tapered hair along an **open** spine: thick at the root, near-zero at the
+    tip.  A thin :class:`Strand` preset — the shape ftrace's ``fur { }`` generates in
+    bulk, for when you want to place a few guide strands by hand."""
+    return Strand(spine, count=count, radius=radius, radius_tip=tip,
+                  segments=segments, closed_spine=False, material=material, name=name)
+
+
 def ribbon(spine, *, width: float = 0.3, material: str = "default", count: int = 64,
            twist=0.0, turns=0.0, closed_spine: bool = True, smooth: int = 0,
            name: str = "ribbon") -> SweptMesh:
@@ -898,7 +1061,13 @@ def ribbon(spine, *, width: float = 0.3, material: str = "default", count: int =
 def tube(spine, *, radius: float = 0.1, sides: int = 12, material: str = "default",
          count: int = 64, twist=0.0, turns=0.0, closed_spine: bool = True,
          smooth: int = 1, name: str = "tube") -> SweptMesh:
-    """A closed circular tube swept along the spine."""
+    """A closed circular tube swept along the spine, as a triangle mesh.
+
+    For a plain round fiber prefer :func:`strand`, which emits ftrace's native ``curve``
+    primitive: no OBJ, no ``sides`` to pick, watertight at any bend, and it can taper.
+    Reach for ``tube`` when you need the triangles themselves, or a ``twist``/``turns``
+    the fiber primitive has no notion of.
+    """
     return SweptMesh(spine, _sweep.circle_profile(sides, 1.0), count=count, scale=radius,
                      twist=twist, turns=turns, closed_spine=closed_spine,
                      closed_profile=True, material=material, smooth=smooth, name=name)

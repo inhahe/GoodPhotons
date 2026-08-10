@@ -123,6 +123,8 @@ scene { units meters  spectral 360 830 1 }
 | `spectral` | `<lo> <hi> <binWidth>` | `360 830 1` | only the **bin width** is applied; the engine range is fixed at 360–830 nm (a warning prints if `lo/hi` differ) |
 | `default_mode` | a mode letter (`A`/`B`/`C`/`D`/`U`/`M`/`R`/`W`/`P`/…) | *(none)* | the render mode used when nothing else picks one. Resolution order: `-mode` (CLI) → a camera's own `mode` → `default_mode` → built-in `B`. `W` is not a transport mode of its own — the loader rewrites it to `R` and switches on the deterministic Whitted estimators for the whole run (a CLI `-mode` still overrides it) |
 | `fps` | `<n>` | *(none)* | default playback rate for flyby animations, read by assembly tooling (e.g. `showcase_flyby.py` when `--fps` is omitted). Overridable per-flyby with `fps <n>` on the `camera_curve`/`camera_path`/`camera_orbit` block. Playback hint only — does not affect rendering |
+| `cavity_radius` | `<len>` | 2% of the scene's AABB diagonal | reach of the `cavity` pattern probe (§6.1). Enclosure has no intrinsic scale, so this *is* the look; the derived default is a starting point and prints a line saying so. Ignored unless some material reads `cavity` |
+| `cavity_samples` | `<n>` | `16` | probe rays per shading point for `cavity`. The direction set is deterministic, so this also caps the number of distinct values the variable can take |
 
 Directions (`up`, `normal`, `dir`, `axis`) are **not** unit-scaled — only points and
 lengths are. There is one `scene` block (extra ones are also scanned but the last
@@ -338,10 +340,188 @@ film thickness, mix weight). Patterns are evaluated per hit.
 
 **Variables:** `x y z` (world position), `f` (field value, for isosurfaces),
 `nx ny nz` (surface normal), `r` (`|p|`), `u v` (surface texture coordinates — on
-meshes and on native primitives that declare a `uv` wrap, see §9). Constant `pi`.
+meshes and on native primitives that declare a `uv` wrap, see §9), `curv` (mean
+curvature — see below), `cavity` (enclosure — see below). Constant `pi`.
 
 **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
 `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
+
+**Surface curvature — `curv` (non-stationary texturing):** the **mean curvature**
+H = (k₁ + k₂)/2 at the shading point, in **1/length** units — a sphere of radius R
+reads `1/R`, a plane reads `0`. It is signed **relative to the side being shaded**:
+convex (bulging toward the viewer) is positive, concave is negative, so the same
+sphere reads `+1/R` from outside and `−1/R` from within.
+
+Every other noise in the VM is *stationary* — a function of position, with the same
+statistics everywhere. Translate the object and the pattern slides off it, because
+the texture describes the space rather than the shape sitting in it. Surface ageing
+is the opposite: paint wears where the form is convex, grime settles where it is
+concave. `curv` is what lets a pattern follow the geometry instead of the space:
+
+```
+# grime that can only exist in the crevices, and only as much as the noise says
+pattern "grime" { expr "smoothstep(-1.6, 1.2, -curv) * noise(9*x, 9*y, 9*z)" }
+
+# the mirror image: a coat that rubs through along convex edges
+pattern "wear"  { expr "smoothstep(1.6, 3.3, curv) * noise(14*x, 14*y, 14*z)" }
+```
+
+`smoothstep` needs `lo < hi`, so negate the field (as in `grime` above) rather than
+swapping the edges to select the concave side.
+
+Where it reads what:
+
+| geometry | `curv` |
+|---|---|
+| `sphere` | exactly `±1/radius` (analytic) |
+| mesh **with** vertex normals (`vn`) | mean curvature of the interpolated normal field, constant per face |
+| mesh **without** `vn` (flat-shaded) | `0` — a facet really is flat |
+| `curve` strand of radius r | `1/(2r)` — a tube's two principal curvatures are `1/r` and `0` |
+| `isosurface` | `0` (not yet derived; see known-issues) |
+
+The flat-shaded row is the one that surprises people: curvature is read off the
+*shading-normal* field, so an OBJ with no `vn` makes every curvature-driven pattern
+collapse to a constant. `tools/make_mesh.py --smooth` emits analytic normals for the
+test meshes. Under `mesh_instance`, curvature is rescaled by the placement's linear
+scale (curvature is 1/length, so a 2× instance halves it) — exact for a uniform
+scale, approximated by `|det|^(1/3)` for a non-uniform one.
+
+Validated by `-checkcurv`. Worked example: `scenes/pattern_curvature.ftsl` (a raw
+curvature ramp, crevice grime, and edge wear on the same torus).
+
+**Enclosure — `cavity`:** the fraction, in `[0,1]`, of a short hemispherical probe of
+radius `cavity_radius` around the shading point that is **blocked** — `0` on an open
+plane, `~0.5` in a right-angled interior corner, `→1` down a crevice. Works on every
+primitive, including isosurfaces.
+
+`cavity` is the complement of `curv`, not an alternative to it, and the difference is
+what each one *can* see:
+
+- A corner where two **flat** faces meet reads `curv == 0` on both of them — they
+  genuinely are flat, and curvature is local, living in the second derivative of the
+  normal field. Only a non-local measure finds the corner.
+- `cavity` sees geometry that is not part of the surface at all. The dirt ring where a
+  ball rests on the floor depends on the *ball* and appears on the *floor*; no
+  property of the floor could produce it.
+- Conversely, `cavity` is blind to gentle convexity — a lone sphere in an empty room
+  reads `0` everywhere however curved it is. Edge wear still wants `curv`.
+
+```
+# grime that collects wherever the form encloses, and only as much as the noise says
+pattern "crevice" { expr "smoothstep(0.06, 0.45, cavity) * noise(19*x, 19*y, 19*z)" }
+```
+
+Two `scene`-block keys control it (§2): `cavity_radius <len>` — how far the probe
+reaches, which *is* the look, since enclosure has no intrinsic scale (the same corner
+is "deeply enclosed" at a 1 cm probe and "wide open" at 1 m); and
+`cavity_samples <n>` — the ray count, default 16.
+
+The direction set is a **fixed** cosine-weighted Fibonacci spiral, not a random draw.
+A pattern input is read many times per pixel by different tracers, and every read must
+agree or the material itself becomes a source of variance no amount of sampling
+averages away; deterministic makes `cavity` a true function of position — noise-free,
+identical on CPU and GPU, and stable frame to frame. The price is **banding** into at
+most `cavity_samples + 1` levels, which is why the natural idiom multiplies by noise
+(as above) or pushes the value through a `smoothstep`.
+
+`cavity` is the only pattern input that spends **rays**, so it is gated twice: a scene
+that never writes it fires none at all, and within a scene that does, only the
+materials whose own programs read it are charged. An **emission** pattern may not read
+it (nor `curv`): an emitter's sampled point carries no such value, so the emitted
+profile would disagree with the one emission-on-hit reads and MIS would bias the image
+— the loader rejects it.
+
+Validated by `-checkcavity`. Worked example: `scenes/pattern_cavity.ftsl` (stacked
+hard-edged blocks and spheres resting on a floor, with grime at every contact).
+
+**Vector noise — `dnoisex/y/z`, `dturbx/y/z` (domain warping):** exact ports of
+POV-Ray's gradient-vector noise `DNoise` and its octave sum `DTurbulence`, one
+component per function. `dnoisex(x, y, z)` / `dnoisey(…)` / `dnoisez(…)` are the three
+decorrelated components of one gradient-noise vector at a point;
+`dturbx(x, y, z, octaves, lambda, omega)` (and `dturby` / `dturbz`) sum `octaves`
+copies at frequency `lambda^(i-1)` and amplitude `omega^(i-1)` (POV's defaults are
+6, 2.0, 0.5; `octaves` clamps to [1, 10]). Values are signed raw POV sums (roughly
+`[-1, 1]`, no normalisation), identical bit-for-bit on CPU and GPU. Their point is
+*displacing the coordinate another pattern is sampled at*: scalar `noise()` can only
+modulate a value, but a vector noise can push the lookup point around, which is where
+marble veins, agate banding and fluid-looking swirls come from:
+
+```
+# classic POV marble: sine bands whose band coordinate is displaced by turbulence
+pattern "marble" { expr "0.5 + 0.5*sin(6.2832*(3*x + 1.1*dturbx(3*x, 3*y, 3*z, 6, 2, 0.5)))" }
+```
+
+Identical calls (same component, same arguments) are merged by the expression
+optimizer; different components of the same point are separate evaluations. Worked
+example: `scenes/pattern_warp.ftsl` (marble, agate, and fBm-warped value noise).
+
+**Cellular noise — `worley`, `worley2`, `worleyd`, `worleyid`:** 3-D Worley /
+Voronoi noise: one deterministically-jittered feature point per unit lattice cell,
+queried under a selectable distance metric. All four take the same arguments
+`(x, y, z, metric)` and read the same point set:
+
+| function | value |
+|---|---|
+| `worley` | **F1** — distance to the nearest feature point (bubbly cells) |
+| `worley2` | **F2** — distance to the second-nearest |
+| `worleyd` | **F2 − F1** — 0 exactly on the borders between cells (crack networks) |
+| `worleyid` | flat random value in `[0,1)` owned by the F1 cell (per-cell randomisation) |
+
+`metric` is an ordinary runtime operand (any expression), rounded to nearest and
+clamped: **0 Euclidean** (round organic cells — stone, cobble), **1 Manhattan**
+(diamond facets), **2 Chebyshev** (square techy panels). Distances are raw at cell
+size 1 — Euclidean F1 spans about `[0, 1.1]` with mean ≈ 0.65 — so scale the input
+coordinates to set the cell density and `smoothstep` the output into `[0,1]`:
+
+```
+# dark crack network on the Voronoi cell borders, 7 cells per unit
+pattern "crackle" { expr "smoothstep(0.015, 0.14, worleyd(7*x, 7*y, 7*z, 0))" }
+```
+
+F1/F2 are mathematically exact (adaptive ring search, not the common fixed
+3×3×3 approximation), identical bit-for-bit on CPU and GPU, and validated by
+`-checkworley`. Worked example: `scenes/pattern_worley.ftsl` (all four outputs,
+all three metrics).
+
+**Anisotropic noise — `gabor(x, y, z, f, wx, wy, wz)`:** band-limited Gabor noise,
+returning `[0,1]` with mean `0.5` like `noise`. `f` is the frequency in **cycles per
+unit of the coordinates you pass in**, and `(wx, wy, wz)` is the **steering
+direction** — the field oscillates *along* that vector, so the visible streaks run
+**perpendicular** to it. The vector need not be normalised; a zero-length one selects
+**isotropic band-pass** noise (each impulse then picks its own direction).
+
+Both `f` and the direction are ordinary sub-expressions, so they may vary from point
+to point, and that is the reason this function exists. Every other noise here is a
+*lattice* noise, whose orientation is baked into its grid; the only way to steer one is
+to warp the coordinates, `noise(R(p)·p)`, whose Jacobian is `R + (dR/dp)·p`. The second
+term grows with distance from the (arbitrary) origin, so a warped lattice noise shears
+further and further out and never has quite the orientation asked for — the same trap
+as spatially varying frequency (§6, *Using `curv`, `cavity` and `sdf` together*). A
+Gabor kernel only ever sees the offset from **its own centre**, at most one cell, so a
+varying direction leaves a residual bounded by the local turning rate instead of by
+`|p|`:
+
+```
+# wood end grain: oscillate RADIALLY about a vertical axis and the bands close
+# into growth rings — one expression, no polar remap
+pattern "wood" { expr "smoothstep(0.34, 0.66, gabor(8*x, 8*y, 8*z, 2.2, x - 0.35, 0, z - 0.35))" }
+
+# brushed metal: oscillate across the surface, and squash one axis so the kernels
+# stretch into long scratches along it
+pattern "brushed" { expr "smoothstep(0.26, 0.74, gabor(30*x, 3*y, 30*z, 1.6, 0, 0, 1))" }
+```
+
+Anisotropy has two independent knobs: the **direction** sets which way the field
+oscillates, and **scaling the input coordinates unevenly** stretches the kernels
+themselves (`3*y` against `30*x` above makes each one ten times taller than it is
+wide). Because the impulses are a genuinely homogeneous Poisson process the noise is
+stationary under *arbitrary* translation, not merely integer ones; because each impulse
+carries a random phase the variance is exactly independent of `f`; and because the
+spectrum is a narrow band rather than everything up to the lattice Nyquist, this is the
+one noise here that minifies gracefully. Bit-identical on CPU and GPU (including its
+own cosine — libm's is not), validated by `-checkgabor`. Worked example:
+`scenes/pattern_gabor.ftsl` (isotropic speckle, brushed metal, wood end grain,
+flow-aligned fibre, latitude striation on a sphere).
 
 **Image samples — `tex:<name>(u, v)`:** samples a declared `texture` as a *scalar term
 inside the formula*, so a photograph can be one operand of an expression rather than
@@ -482,6 +662,85 @@ scatter for the data a grid *cannot* represent.
 partition of unity, symmetry, the closed-form two-sample weight for several exponents,
 far-field flattening, and the compile/arity/namespace rules), and
 `scenes/pattern_scatter.ftsl` renders one feature per wall strip.
+
+**Distance to an object — `sdf "<name>" { object "<mesh>" }`:** an `sdf` element bakes the
+**signed distance to a named mesh** onto a 3-D lattice and registers it under the ordinary
+`grid:` namespace, so it is read as `grid:<name>(x, y, z)` — negative inside the object,
+positive outside, in world units. There is no new expression syntax and no new opcode: an
+`sdf` *is* a `grid`, just one whose samples are measured off the scene instead of typed
+out, so it works unchanged at **every** site a grid already works — a `pattern`, a material
+slot, an `isosurface` leaf, a medium `density`/`ior` program.
+
+```
+mesh "ring" { file "scenes/torus.obj"  material steel  scale 0.75  translate 1 0.22 0.8 }
+
+sdf "halo" { object "ring"  res 128  pad 0.65 }
+
+# frost on the floor, keyed on how near the (hovering, untouching) ring is
+pattern "bloom" { expr "1 - smoothstep(0.12, 0.40, grid:halo(x, y, z))" }
+
+# …and the same field driving a volume, which has no surface to hang a property off
+medium "glow" { sigma_t 1.6  albedo 0.85  density_max 1
+                density "max(0, 1 - smoothstep(0, 0.30, grid:halo(x, y, z)))"
+                bounds { min 0.32 0 0.12   max 1.68 0.62 1.48 } }
+```
+
+| Key | Meaning |
+|---|---|
+| `object "<name>"` | The `mesh` block to measure distance to. **Required.** Must be a plain `mesh`: a `mesh_asset` keeps its triangles in object space behind a BLAS, so there are no world triangles to measure, and the loader says so rather than baking nonsense. |
+| `res` | Samples along the **longest** padded axis; the other two get however many cubic voxels that implies. `8..512`, omitted ⇒ **96**. Buys spatial resolution, not accuracy — the distances themselves are measured exactly. |
+| `pad` | How far **outside** the object's bounding box the lattice reaches, in scene units. Omitted ⇒ **a quarter of the object's longest axis**. This is the control that matters — see below. |
+| `outside` | The same three policies as a `grid` (`clamp` default, `wrap`, `extrapolate`). `clamp` is nearly always right here: past the padding the field simply stops changing. |
+
+`pad` **is the range of the effect.** Outside the lattice the sampler clamps, so a mask
+keyed on distance stops varying there; the default is sized for a band hugging the object,
+and anything meant to reach across a room has to say so. The bake reports itself at load:
+
+```
+[sdf] "halo": 127 x 97 x 128 samples over 0.01555 m voxels (16384 tris, 0.65 m pad,
+      deepest interior -0.09634 m)
+```
+
+Two ordering rules follow from *when* the bake can happen — the name has to exist before
+patterns compile, the geometry has to exist before any distance can be measured:
+
+* An `sdf` may name a mesh declared **anywhere** in the file; declaration order does not
+  matter.
+* An `sdf` **cannot** be read by anything that is itself evaluated *while the scene loads*
+  — a procedural `texture { rgb "…" }`, a `camera_curve` driver. Those are load errors
+  rather than silent zeros, because 0 in a distance field means "exactly on the surface":
+  the one wrong answer that looks entirely reasonable.
+
+A mesh made of several **overlapping or self-intersecting** closed bodies reads as their
+**union** (generalized winding — the same signed-crossing voxelization a `medium`'s
+`bounds { object … }` uses) instead of hollowing out where they overlap. Distances
+*outside* such a union are exact; distances *inside* it are measured to the nearest
+triangle, which may be a buried one — see `known-issues.md`.
+
+`ftrace -checksdf` is the deterministic self-test: it bakes axis-aligned **boxes**, whose
+12 triangles carry no tessellation error and whose signed distance is closed-form, and
+checks every lattice sample against it exactly. `scenes/pattern_sdf.ftsl` renders the case
+that isolates the feature — a ring hovering clear of the floor, so `curv` (the floor is
+flat) and `cavity` (nothing touches it) both read 0 and only a distance field can see it.
+
+**Using `curv`, `cavity` and `sdf` together.** Each one on its own is a mask; the reason
+they exist is that every argument of a noise call is an ordinary expression, so a
+scene-aware field can change *what kind* of noise appears where — not merely how much of
+it shows. `curv` and `cavity` are natural **gates** (where the effect may appear at all);
+an `sdf` is a natural **field** (what the noise there should look like). Two approaches
+look obvious and are wrong: driving a frequency by scaling the coordinate (it shears the
+pattern into streaks, and the resulting frequency is not the one you asked for), and
+driving `octaves` or Worley's `metric` with a ramp (both are truncated to integers, so
+they pop at contours instead of fading). Both have a correct idiom, written up with the
+calculus in **REFERENCE.md → "Putting them together — non-stationary noise"**; the worked
+scene is `scenes/pattern_nonstationary.ftsl`.
+
+Repeating a field costs nothing. The expression language has no local variables and a
+pattern cannot name another pattern, so a field driving several terms must be spelled out
+at each one — but the loader runs a common-subexpression pass over every compiled
+`pattern` and every medium `density`/`ior` program, so the repeats collapse to a single
+evaluation, and a repeated `grid:`/`sdf` read to a single lattice fetch.
+`FTRACE_CSE_DEBUG=1` prints what it collapsed.
 
 **Inline array literals — `[0 1](u)`:** most of the tables an author actually writes are
 three numbers long and used exactly once, and giving each of those a name, a block and a
@@ -1170,11 +1429,213 @@ mesh_instance {               # cheap placement of a named asset
   in, so one asset serves differently scaled/rotated placements.
 - A `mesh_instance` may appear at top level or inside a `group{}` (its transform
   composes with the group's, exactly like `mesh`).
-- **CPU:** true instancing — instances share the BLAS triangles, so N copies add
-  only N affines to memory. All render modes (A/B/C/R/D/P and the photon modes)
-  traverse the two-level BVH. **GPU:** instances are expanded to world-space
-  triangles at upload (flat device memory — the memory saving is CPU-only; images
-  are identical). See known-issues.
+- True instancing on **both** backends — instances share the BLAS triangles, so N
+  copies add only N affines to memory. All render modes (A/B/C/R/D/P and the photon
+  modes) traverse the two-level BVH. The GPU has its own device twin of the same
+  structure (`DBlas` / `DInstance`): the asset is uploaded **once** in local space,
+  the TLAS gets one leaf per instance, and that leaf transforms the ray into
+  BLAS-local space and walks the shared sub-BVH — so the memory win is a device win
+  too. (This paragraph used to claim the GPU expanded instances to world-space
+  triangles at upload; that was true of an earlier build and is no longer.)
+- Because the instance transform is applied to the *ray* rather than baked into the
+  geometry, per-hit quantities are mapped back out on the way home: normals through
+  the inverse-transpose, the tangent frame through the linear part, and **`curv`
+  through `1/|det|^(1/3)`** — mean curvature is 1/length, so `scale 0.5` doubles what
+  a pattern sees (see §6.1).
+
+### 8.6 `curve` — hair, fur, grass, wire, thread
+
+A **strand**: control points plus a radius, flattened at load time into a chain of
+**round cones** (each the convex hull of a sphere at either end). Adjacent cones share
+their end sphere, so the chain is watertight and smooth at the joints with no mitre
+logic — a strand is one closed surface however sharply it bends.
+
+```
+curve "guide_hair" {
+    material gold
+    basis      catmull_rom      # linear | catmull_rom | bezier | bspline
+    radius     0.016            # ROOT radius, default 0.001 (1 mm)
+    radius_tip 0.002            # TIP radius, default = radius (untapered tube)
+    segments   12               # round cones per span, default 4, capped 256
+    point 0.30 0.02 0.55        # repeated, at least 2, in root -> tip order
+    point 0.36 0.24 0.48
+    point 0.27 0.46 0.60  r=0.028
+    point 0.35 0.68 0.50
+    point 0.29 0.88 0.56
+}
+```
+
+| key | meaning |
+|---|---|
+| `material <m>` | required, like every primitive |
+| `basis <b>` | `linear`, `catmull_rom` (default; `catmull-rom`/`catmullrom` also accepted), `bezier`, `bspline` (`b-spline` too) |
+| `radius <r>` | root radius. Default `0.001` |
+| `radius_tip <r>` | tip radius. Default = `radius` |
+| `segments <n>` | round cones per span. Default `4`, clamped to `[1, 256]`; `linear` forces `1` because the polyline is already exact |
+| `point x y z [r=<r>]` | **repeated**, at least 2. `r=` pins the radius at that control point, overriding the taper |
+
+> The per-point radius **must be `key=val`**: `point 0 0.1 0 r=0.002`. Written as a
+> bareword (`point 0 0.1 0 r 0.002`) the value continuation would stop at `r` and start
+> a new statement — the same rule as `uv planar axis=x` (§1.1).
+
+**Control-point counts per basis.** `linear` and `catmull_rom` take any `n ≥ 2` and give
+`n−1` spans; `bezier` is a cubic chain `P0 C C P1 C C P2 …` so it needs `3k+1` points
+(4, 7, 10, …) and gives `(n−1)/3` spans; `bspline` needs `n ≥ 4` and gives `n−3` spans.
+A count the basis can't accept is a load error naming the requirement.
+
+**Interpolating vs approximating.** `linear` and `catmull_rom` pass exactly through
+every point you author — use them for a hand-placed guide hair. `bspline` is
+approximating and C2: smoother than its control polygon, and it does *not* touch the
+points — the right basis for a groom solver's output. `bezier`'s spans meet at every
+third point.
+
+**Radius interpolation** is always **linear** between a span's two endpoint control
+points, never through the basis — a Catmull-Rom radius can overshoot, and a negative
+radius is not a taper, it is a bug.
+
+**Under a `group`.** A `curve` may appear at top level or inside a `group{}`. Every
+basis is affine-invariant, so the loader transforms the *control points* and flattens
+afterwards, which is exactly equal to the other order. The radius picks up the group's
+uniform scale; a **non-uniform** scale prints a `[ftsl] warning:` and uses the
+volume-preserving geometric mean of the three axis scales, because a round fiber cannot
+become elliptical.
+
+Worked example: `scenes/curve_basics.ftsl` (all four bases, a taper, an `r=` bulge, a
+`u`-banded pattern, and a strand inside a transformed group). See REFERENCE.md →
+**Curves and fibers** for how it is traced and for the v1 limits (both CPU and CUDA
+trace strands as of 0.151.0; `-raster` previews them too — what is missing is an
+aggregate LOD for sub-pixel fibers).
+
+---
+
+### 8.7 `fur` — scatter strands over a surface
+
+`curve` is **one** strand, written out by hand. A coat is 10⁴–10⁶ strands, which nobody
+authors as text — so `fur { }` generates them. It samples roots **area-uniformly** over a
+named surface and grows each one with a closed-form shape (lift, comb, gravity droop,
+curl, clump).
+
+What it emits is **not a new kind of geometry**: it is exactly the same strand records a
+hand-written `curve` produces, so the BVH, the CPU tracer, the CUDA megakernel and the
+raster preview all already know how to draw it, and everything in §8.6 (bases, taper,
+watertight joints, `u` along the strand) applies unchanged.
+
+```
+sphere "ball" { center 0.22 0.20 0.55  radius 0.13  material skin }
+
+fur "ball_coat" {
+    on "ball"                   # required — a named sphere, mesh, quad or triangle
+    material brown
+    count 60000
+    length 0.055   length_jitter 0.35
+    radius 0.0006               # radius_tip defaults to 0.25*radius — fur tapers
+    droop 0.55                  # sag under `gravity`
+    jitter 0.25
+    seed 1
+}
+```
+
+| key | meaning |
+|---|---|
+| `on "<object>"` | **required**. The named `sphere`, `mesh`, `quad` or `triangle` to grow on |
+| `material <m>` | required |
+| `count <n>` | exact strand count |
+| `density <n>` | strands per **authored** unit² — used when `count` is absent. Survives rescaling the model, which `count` does not |
+| `seed <n>` | which realisation of the groom. Default `0` |
+| `points <n>` | control points per strand. Default `5`, minimum 2 |
+| `segments <n>` | round cones per span. Default `2`, clamped `[1, 256]`; `linear` forces 1 |
+| `basis <b>` | as §8.6. Default `catmull_rom` |
+| `length <l>` | root→tip length. Default `0.05` |
+| `length_jitter <0..1>` | ± fraction of `length`, uniform. Default `0.2` |
+| `radius <r>` | root radius. Default `0.0008` |
+| `radius_tip <r>` | tip radius. Default **`0.25 * radius`** — unlike `curve`, which defaults to no taper, because an untapered fiber reads as wire rather than hair |
+| `lift <0..1>` | `1` grows straight along the normal, `0` lies flat along the surface. Default `1` |
+| `jitter <0..1>` | random tilt of the growth direction. Default `0.15` |
+| `root_offset <l>` | push the root along the normal, to bed the strand into the skin. Default `0` |
+| `direction <x y z>` | world combing direction (zero = no comb) |
+| `comb <0..1>` | tip displacement along `direction`, as a fraction of `length`. Default `0.35` |
+| `gravity <x y z>` | world "down". Default `0 -1 0` |
+| `droop <0..1>` | tip sag along `gravity`, as a fraction of `length`. Default `0.25` |
+| `curl <0..1>` | helix radius, as a fraction of `length`. Default `0` (off) |
+| `curl_freq <n>` | turns over the strand's length. Default `3` |
+| `clump <0..1>` | blend toward the nearest tuft guide. Default `0` (off) |
+| `clump_size <l>` | tuft **radius** — one guide per `π·clump_size²` of surface. Default `0.02` |
+| `bald "<sphere>" [margin]` | a **named sphere already in the scene** that no strand may enter, optionally grown by `margin`. Repeatable |
+| `bald <x> <y> <z> <r>` | the same as an explicit centre + radius, for a zone that isn't an authored sphere |
+
+**`bald` is how features stay bare.** A coat is grown per body *part*, but the things that
+must not be furred — an eye, a nose leather, a scar — are separate little spheres sitting
+*on* that part, and the part's groom does not know they are there. It roots area-uniformly
+over the whole target, including the ring of skin the eye overlaps, and every strand rooted
+around that ring then grows straight across the eyeball. Making the eye stand *proud* of
+the coat does not help: that only stops it being buried. `bald` culls the hairs instead:
+
+```
+sphere "eye_l" { center 0.4731 0.2026 0.8037  radius 0.014  material eye }
+
+fur "coat_head" {
+    on "head"   material coat   density 450000
+    length 0.014
+    bald "eye_l" 0.001   bald "eye_r" 0.001    # 1 mm margin stops hairs grazing the rim
+}
+```
+
+Naming the sphere (rather than repeating its coordinates) is the point: the bare patch
+stays welded to the feature instead of becoming a second copy that rots when the face
+moves. Three properties worth knowing:
+
+- **The whole strand is tested, not just its root** — and span-wise, not point-wise, so a
+  zone smaller than the gap between two control points can't be skewered. A hair rooted
+  outside the zone that arcs through it under `droop`/`comb`/`clump` is exactly the hair
+  that shows on an eyeball, so culling only by root would defeat the parameter.
+- **It is tested after clumping**, because clumping is what drags a tip sideways into a
+  zone its own root pointed clear of.
+- **It cannot bias the coat.** Roots are still drawn area-uniformly and every survivor is
+  untouched, so the fur outside a zone is bit-for-bit what it was without one — the count
+  simply drops. The load line reports how many went, so a zone that ate the whole groom is
+  visible rather than inferred.
+
+**Roots are area-uniform, always.** Over a mesh the generator samples a triangle
+proportional to its area and then warps the barycentrics, so a low-poly belly and a dense
+face grow the same hairs per square centimetre — the model's tessellation never leaks into
+the look, and `density` means what it says. A `sphere` target is **not** tessellated: roots
+land on the analytic surface with the analytic normal, so a furred ball has no faceting in
+its coat.
+
+**Every bend is quadratic in `t`, growth is linear.** That is what makes a strand leave the
+skin cleanly along its growth direction while the tip carries the full droop/comb/curl
+displacement — a strand that bends at its root reads as broken. It also makes every strand
+independent of every other, hence deterministic and parallel: the groom is a pure function
+of `(surface, parameters, seed)`, so the same seed always rebuilds the same coat.
+
+**Clumping changes shape, never density.** Each strand blends toward its **nearest** clump
+guide with weight `clump · t`, so roots stay exactly where the area-uniform sampler put
+them while tips converge into tufts. Guides are found by a real spatial lookup rather than
+by hashing the root cell — hashing gives cube-shaped tufts on a grid, nearest-guide gives
+Voronoi tufts, which is what hair does.
+
+**Growth never points into the surface.** A direction below the tangent plane is lifted
+back to a shallow grazing angle rather than being rejected, because rejection would
+silently bias the root distribution.
+
+**Ordering doesn't matter.** A `fur` block is resolved in a **deferred pass**, so it may
+sit anywhere in the file and name a surface authored later. The pass runs *before*
+`shape_only` meshes are stripped, so a groom can grow on an invisible scalp that then
+vanishes. An instanced `mesh_instance` cannot be a target — its triangles live in a BLAS,
+not in world space — and that is a load error, not a silent empty coat.
+
+Each block reports what it made:
+
+```
+[fur] "lawn_grass" on "lawn": 1622 strands, 3244 segments (mesh 0.1352 m^2)
+[fur] "coat_head" on "head": 21126 strands, 126756 segments (sphere 0.04831 m^2), 611 culled by 2 bald zones
+```
+
+Worked examples: `scenes/fur_basics.ftsl` (a furred ball, a clumped one, a curled one,
+and a `density`-driven grass patch — the parameters one at a time) and
+`scenes/fur_creature.ftsl` (an animal built from overlapping spheres wearing ~300 000
+strands from a dozen `fur` blocks, all at one shared `density`). Guarded by
+`ftrace -checkfur`.
 
 ---
 
@@ -1189,6 +1650,9 @@ come from:
   `uv planar|spherical|cylindrical [axis=x|y|z]`, or `uv triplanar [scale=<s>]`.
 - **`isosurface`**: `uv planar|spherical|cylindrical [axis=x|y|z]` — the SAME
   projection meshes use, referenced to the primitive's world AABB. Default axis `y`.
+- **`curve`**: built-in and not configurable — `u` runs `0` (root) → `1` (tip) *along*
+  the strand and `v` runs `0`→`1` *around* its circumference, so a pattern can band a
+  fiber lengthwise or ring it. (`tangent` is the strand axis, for anisotropic lobes.)
 
 > The projection **axis must be `key=val`**: `uv planar axis=z`. A bareword
 > (`uv planar z`) would be parsed as a separate statement and the axis silently
@@ -1234,7 +1698,14 @@ and a Lipschitz bound (`max_gradient`, see §10.3).
   when *defining* a surface and read `0`.
 - **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
   `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args). `noise` is
-  deterministic 3-D value noise in `[0,1]` (same on CPU/GPU). The image sample
+  deterministic 3-D value noise in `[0,1]` (same on CPU/GPU). The vector-noise
+  components `dnoisex/y/z(x,y,z)` and `dturbx/y/z(x,y,z,octaves,lambda,omega)` (§6.1)
+  work here too — they need only coordinates — so a field can be domain-warped by
+  gradient noise, and so does cellular noise
+  `worley/worley2/worleyd/worleyid(x,y,z,metric)` (§6.1) for crystal/stone-like
+  fields and `gabor(x,y,z,f,wx,wy,wz)` (§6.1) for directional ones — though a field
+  driven by Gabor noise needs a generous `max_gradient`, since its slope scales with
+  `f`. The image sample
   `tex:<name>(u, v)` (§6.1) is **not** available here — a field expression *defines* a
   surface, so there is no surface to sample yet; using it is a compile error.
 - **Operators:** `+ - * / % ^` and unary `-`. `^` is `pow` (right-assoc), `%` is
@@ -1753,10 +2224,15 @@ The eye rides a **Catmull-Rom spline** that passes through every `point` control
   length** (constant speed). With a density, `frames` still fixes the count but the
   density **distributes** those N cameras (more where density is high).
 - **`density <ρ>`** / **`density_at <t> <ρ>`** — cameras per unit length. `density`
-  is constant; `density_at` keyframes it (piecewise-linear over normalized position
-  `t ∈ [0,1]`, t=0 first point, t=1 last). Without `frames`, the count is the integral
-  of ρ over the curve. **High density = many closely-spaced frames = slow dwell**
+  is constant; `density_at` keyframes it (piecewise-linear over the normalized
+  **arc-length** position `t ∈ [0,1]`: t=0 the first point, t=1 the last, t=0.5 the
+  half-way mark **by distance** — *not* by control-point index, so unevenly spaced
+  waypoints don't slide your dwells off their beats). Without `frames`, the count is the
+  integral of ρ over the curve. **High density = many closely-spaced frames = slow dwell**
   through that stretch; low density = fast. This is the camera's "speed" curve.
+  (The `<name>_at` lens/orientation tracks further down run on a *different* clock — the
+  frame timeline `i/N` — because by the time frames exist the density has already placed
+  them.)
 
 **Orientation** (`look …`):
 
@@ -1768,7 +2244,10 @@ The eye rides a **Catmull-Rom spline** that passes through every `point` control
 
 `closed` loops the curve (wrap-around Catmull-Rom, sampled i/N so frame N == frame 0);
 an open curve spans both endpoints via i/(N−1). All frames share
-up/mode/film; `exposure_lock` shares the frame-0 exposure anchor.
+up/mode/film; `exposure_lock` shares the frame-0 exposure anchor. Note it can only share
+that anchor among frames rendered by the **same `ftrace` process** — a sequence rendered
+one frame per invocation needs the CLI's `-exposure-anchor <file>` to carry the anchor
+across processes (see `REFERENCE.md`).
 
 **Two-axis orientation (forward + up).** The camera basis is fixed by two authored
 axes; `right` is always derived from them, so you never set it. Each axis can be read
@@ -1863,8 +2342,11 @@ is why this stays per-scene rather than a raised global default.
 ## 17. Load order and validation
 
 The loader runs in passes: scene units/spectral → spectra → textures → patterns →
-materials (+ mix/layered resolve) → geometry/lights/medium/cameras/render →
-`Scene::build()`. Notable hard errors: unknown block/material/type/preset, a scene
+materials (+ mix/layered resolve) → geometry/lights/medium/cameras/render → **`sdf`
+bakes** → `Scene::build()`. (`sdf` is split across two of those: it reserves its name
+before patterns compile — so `grid:<name>(…)` resolves and type-checks — and fills in the
+measured samples after the geometry it measures exists.) Notable hard errors: unknown
+block/material/type/preset, a scene
 with **no light**, a `mix` with nested children or weights summing > 1, a `function`
 isosurface without `contained_by`, an isosurface without exactly one root element, and
 any unknown spectrum/preset/identifier.

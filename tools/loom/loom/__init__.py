@@ -31,6 +31,7 @@ from .scene import (
     Scene, Material, Texture, GridDecl, ScatterDecl, skin, ProcTexture, func_skin, Sphere, Beads, Raw,
     Light, Camera, CameraCurve, Element, Group,
     Pattern, SweptMesh, IsoMesh, ribbon, tube, blob, fan, Volume,
+    Strand, strand, hair,
     NamedSpectrum, Upsample,
 )
 from .transform import Transform
@@ -60,6 +61,7 @@ from .sweep import (
     rmf_frames, tangents, sweep_rings, skin_rings, circle_profile, line_profile,
     write_obj,
 )
+from .strands import closed_bspline_controls, strand_controls, sample_spine
 from .iso import (
     Isosurface, Room, gyroid_surface, phase_drift, FIELDS,
     gyroid, schwarz_p, schwarz_d, neovius,
@@ -72,7 +74,8 @@ from .pov import (
 from .pov_nd import nd_field_expr, nd_field_eval, nd_grad_bound_xi
 from .drive import (
     render_range, render_still, emit_frames, assemble_gif,
-    assemble_gif_ffmpeg, assemble_mp4, find_ftrace,
+    assemble_gif_ffmpeg, assemble_gif_gifski, assemble_mp4, find_ftrace,
+    find_gifski, stabilize_exposure,
 )
 from .preview import PreviewServer, preview_range
 from .viewer import (
@@ -119,6 +122,7 @@ __all__ = [
     "Record", "RecordChannel", "RecordStop",
     "parse_ladder", "emit_ladder", "ladder_shape",
     "SweptMesh", "IsoMesh", "ribbon", "tube", "blob", "fan", "Volume",
+    "Strand", "strand", "hair",
     "mesh_field",
     "write_vdb", "read_vdb", "read_vdb_grids", "bake_field", "write_volume",
     "VolumeGrid", "VdbTransform", "ReadGrid",
@@ -131,6 +135,7 @@ __all__ = [
     "Slot", "collect_slots", "SceneDriver", "LiveSession", "serve_live",
     "rmf_frames", "tangents", "sweep_rings", "skin_rings", "circle_profile",
     "line_profile", "write_obj",
+    "closed_bspline_controls", "strand_controls", "sample_spine",
     "Isosurface", "Room", "gyroid_surface", "phase_drift", "FIELDS",
     "gyroid", "schwarz_p", "schwarz_d", "neovius",
     "SliceField", "ND_FIELDS", "nd_grad_bound",
@@ -138,7 +143,8 @@ __all__ = [
     "pov", "PovFn", "POV_FUNCS", "POV_ND_GENERALIZABLE", "POV_PARAMS", "pov_params",
     "nd_field_expr", "nd_field_eval", "nd_grad_bound_xi",
     "render_range", "render_still", "emit_frames", "assemble_gif",
-    "assemble_gif_ffmpeg", "assemble_mp4", "find_ftrace",
+    "assemble_gif_ffmpeg", "assemble_gif_gifski", "assemble_mp4", "find_ftrace",
+    "find_gifski", "stabilize_exposure",
     "PreviewServer", "preview_range",
     "load_build", "build_scene", "introspect", "ViewerModel",
     "SpatialExpr", "Surface", "Image", "VolumeField", "GridSample",

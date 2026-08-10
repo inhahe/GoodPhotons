@@ -95,7 +95,7 @@ template <class TexT>
 __device__ inline double dPatternEval(const PatNode* nodes, int n,
                                       double x, double y, double z, double f,
                                       double nx, double ny, double nz, double r,
-                                      double u, double v,
+                                      double u, double v, double curv, double cavity,
                                       const DPatEnvT<TexT>& env) {
     double st[64]; int sp = 0;
     double reg[PAT_CSE_REGS];   // CSE registers; StReg always precedes LdReg, so no init
@@ -113,6 +113,8 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
             case PatOp::VarR:     st[sp++] = r;  break;
             case PatOp::VarU:     st[sp++] = u;  break;
             case PatOp::VarV:     st[sp++] = v;  break;
+            case PatOp::VarCurv:  st[sp++] = curv; break; // mean curvature at the hit (O3); 0 wherever there is no surface (field/medium sites)
+            case PatOp::VarCavity: st[sp++] = cavity; break; // hemispherical enclosure at the hit (O3 s2); 0 at field/medium sites, which have no surface
             case PatOp::VarT:     st[sp++] = 0.0; break;  // flyby timeline: never in scope on-device (camera_curve exprs are consumed at load)
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = fabs(st[sp-1]); break;
@@ -146,6 +148,34 @@ __device__ inline double dPatternEval(const PatNode* nodes, int n,
                 break;
             }
             case PatOp::Noise:    { double zz = st[--sp], yy = st[--sp]; st[sp-1] = dPatValueNoise(st[sp-1], yy, zz); break; }
+            case PatOp::DNoise: {   // POV vector noise, component in nd.a (POV_HD, double)
+                double zz = st[--sp], yy = st[--sp], vout[3];
+                povDNoise(st[sp-1], yy, zz, vout);
+                st[sp-1] = vout[(int)nd.a];
+                break;
+            }
+            case PatOp::DTurb: {    // POV vector turbulence (octave fBm of DNoise)
+                double om = st[--sp], la = st[--sp], oc = st[--sp];
+                double zz = st[--sp], yy = st[--sp], vout[3];
+                povDTurbulence(st[sp-1], yy, zz, oc, la, om, vout);
+                st[sp-1] = vout[(int)nd.a];
+                break;
+            }
+            case PatOp::Worley: {   // cellular noise: a = 0 F1 / 1 F2 / 2 F2-F1 / 3 id
+                double m = st[--sp], zz = st[--sp], yy = st[--sp], w[3];
+                int mi = (int)floor(m + 0.5);
+                if (mi < 0) mi = 0; if (mi > 2) mi = 2;
+                patWorley(st[sp-1], yy, zz, mi, w);
+                int sel = (int)nd.a;
+                st[sp-1] = (sel == 3) ? w[2] : (sel == 2) ? (w[1] - w[0]) : w[sel];
+                break;
+            }
+            case PatOp::Gabor: {    // anisotropic band-limited noise (GABOR_HD, double)
+                double dz = st[--sp], dy = st[--sp], dx = st[--sp];
+                double ff = st[--sp], zz = st[--sp], yy = st[--sp];
+                st[sp-1] = patGabor(st[sp-1], yy, zz, ff, dx, dy, dz);
+                break;
+            }
             case PatOp::PovFn: {
                 int id = (int)nd.a;
                 int na = povFnArity(id);

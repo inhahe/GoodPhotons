@@ -272,6 +272,105 @@ POV_HD inline double povNoise(double x, double y, double z, int gen) {
     return sum;
 }
 
+// ---- DNoise: POV's vector-valued gradient noise -----------------------------
+// EXACT port of POV-Ray's DNoise(Vector3d& result, const Vector3d& EPoint)
+// (source/core/material/noise.cpp). Same lattice setup and hash as povNoise
+// above; the three components read three consecutive 4-value gradient records
+// from the SAME RTable — X at the hashed record, Y at +8 doubles (4 value/half
+// pairs), Z at +16. That stride is why g_povRTable has 267 conceptual entries
+// (255 + 3*4 = 267): the table was sized for DNoise from the start. Raw sums,
+// no generator variants, no normalisation/clamp — each component is ~[-0.5, 1]
+// with the record's 0.5-bias term, exactly as POV returns it (turbulence warps
+// consume it raw). This is the primitive behind domain warping:
+//   noise(x + k*dnoisex(x,y,z), y + k*dnoisey(...), z + k*dnoisez(...)).
+POV_HD inline void povDNoise(double x, double y, double z, double out[3]) {
+    const double POV_EPS = 1.0e-10;
+    int tmp;
+    tmp = (x >= 0) ? (int)x : (int)(x - (1 - POV_EPS));
+    int ix = (int)((tmp - (-10000)) & 0xFFF);
+    double x_ix = x - tmp;
+    tmp = (y >= 0) ? (int)y : (int)(y - (1 - POV_EPS));
+    int iy = (int)((tmp - (-10000)) & 0xFFF);
+    double y_iy = y - tmp;
+    tmp = (z >= 0) ? (int)z : (int)(z - (1 - POV_EPS));
+    int iz = (int)((tmp - (-10000)) & 0xFFF);
+    double z_iz = z - tmp;
+    double x_jx = x_ix - 1, y_jy = y_iy - 1, z_jz = z_iz - 1;
+    double sx = povSCurve(x_ix), sy = povSCurve(y_iy), sz = povSCurve(z_iz);
+    double tx = 1 - sx, ty = 1 - sy, tz = 1 - sz;
+    double txty = tx * ty, sxty = sx * ty, txsy = tx * sy, sxsy = sx * sy;
+#define POVH2(a,b) (g_povHash[(int)(g_povHash[(int)(a)] ^ (b))])
+#define POVH1I(a,b) ((g_povHash[(int)(a) ^ (b)] & 0xFF) * 2)
+    int ixiy = POVH2(ix,     iy);
+    int jxiy = POVH2(ix + 1, iy);
+    int ixjy = POVH2(ix,     iy + 1);
+    int jxjy = POVH2(ix + 1, iy + 1);
+#define POVINCR(mp,s,px,py,pz) ((s)*((mp)[1] + (mp)[2]*(px) + (mp)[4]*(py) + (mp)[6]*(pz)))
+    const double* mp;
+    double s;
+    mp = &g_povRTable[POVH1I(ixiy, iz)];     s = txty * tz;
+    out[0]  = POVINCR(mp,      s, x_ix, y_iy, z_iz);
+    out[1]  = POVINCR(mp + 8,  s, x_ix, y_iy, z_iz);
+    out[2]  = POVINCR(mp + 16, s, x_ix, y_iy, z_iz);
+    mp = &g_povRTable[POVH1I(jxiy, iz)];     s = sxty * tz;
+    out[0] += POVINCR(mp,      s, x_jx, y_iy, z_iz);
+    out[1] += POVINCR(mp + 8,  s, x_jx, y_iy, z_iz);
+    out[2] += POVINCR(mp + 16, s, x_jx, y_iy, z_iz);
+    mp = &g_povRTable[POVH1I(ixjy, iz)];     s = txsy * tz;
+    out[0] += POVINCR(mp,      s, x_ix, y_jy, z_iz);
+    out[1] += POVINCR(mp + 8,  s, x_ix, y_jy, z_iz);
+    out[2] += POVINCR(mp + 16, s, x_ix, y_jy, z_iz);
+    mp = &g_povRTable[POVH1I(jxjy, iz)];     s = sxsy * tz;
+    out[0] += POVINCR(mp,      s, x_jx, y_jy, z_iz);
+    out[1] += POVINCR(mp + 8,  s, x_jx, y_jy, z_iz);
+    out[2] += POVINCR(mp + 16, s, x_jx, y_jy, z_iz);
+    mp = &g_povRTable[POVH1I(ixiy, iz + 1)]; s = txty * sz;
+    out[0] += POVINCR(mp,      s, x_ix, y_iy, z_jz);
+    out[1] += POVINCR(mp + 8,  s, x_ix, y_iy, z_jz);
+    out[2] += POVINCR(mp + 16, s, x_ix, y_iy, z_jz);
+    mp = &g_povRTable[POVH1I(jxiy, iz + 1)]; s = sxty * sz;
+    out[0] += POVINCR(mp,      s, x_jx, y_iy, z_jz);
+    out[1] += POVINCR(mp + 8,  s, x_jx, y_iy, z_jz);
+    out[2] += POVINCR(mp + 16, s, x_jx, y_iy, z_jz);
+    mp = &g_povRTable[POVH1I(ixjy, iz + 1)]; s = txsy * sz;
+    out[0] += POVINCR(mp,      s, x_ix, y_jy, z_jz);
+    out[1] += POVINCR(mp + 8,  s, x_ix, y_jy, z_jz);
+    out[2] += POVINCR(mp + 16, s, x_ix, y_jy, z_jz);
+    mp = &g_povRTable[POVH1I(jxjy, iz + 1)]; s = sxsy * sz;
+    out[0] += POVINCR(mp,      s, x_jx, y_jy, z_jz);
+    out[1] += POVINCR(mp + 8,  s, x_jx, y_jy, z_jz);
+    out[2] += POVINCR(mp + 16, s, x_jx, y_jy, z_jz);
+#undef POVH2
+#undef POVH1I
+#undef POVINCR
+}
+
+// ---- DTurbulence: POV's vector fBm over DNoise ------------------------------
+// EXACT port of POV's DTurbulence(result, EPoint, Turb): octave i (2..octaves)
+// adds omega^(i-1) * DNoise(EPoint * lambda^(i-1)). POV defaults: octaves 6,
+// lambda 2.0, omega 0.5; the parser clamps octaves to [1, 10], mirrored here so
+// a runtime-driven octave count cannot run away. This is THE turbulence warp
+// vector (`warp { turbulence <k> }` displaces by k * DTurbulence(p)) — exposed
+// because the pattern VM has no loops, so the octave sum cannot be authored
+// from dnoise* alone.
+POV_HD inline void povDTurbulence(double x, double y, double z,
+                                  double octaves, double lambda, double omega,
+                                  double out[3]) {
+    int oct = (int)octaves;
+    if (oct < 1)  oct = 1;
+    if (oct > 10) oct = 10;
+    povDNoise(x, y, z, out);
+    double l = 1.0, o = 1.0, value[3];
+    for (int i = 2; i <= oct; ++i) {
+        l *= lambda;
+        povDNoise(x * l, y * l, z * l, value);
+        o *= omega;
+        out[0] += o * value[0];
+        out[1] += o * value[1];
+        out[2] += o * value[2];
+    }
+}
+
 #undef POVN_MEM
 '''
 

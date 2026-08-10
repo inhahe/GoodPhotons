@@ -431,10 +431,18 @@ static void selfTestColor() {
 // Fire random rays through the scene and assert the BVH agrees with the linear
 // scan (same hit distance, material, sensor). Guards against BVH build/traversal
 // bugs that would silently corrupt the image.
+//
+// Threaded, and it has to be: the reference side is O(rays * prims) with no
+// acceleration at all, so a groom (fur_basics is ~5e5 curve segments) puts the
+// serial version past half an hour — long enough that the test stops being run,
+// which is the same as not having it. Each ray gets its OWN Pcg32 stream keyed by
+// its index instead of drawing from one shared sequence, so the ray set is a pure
+// function of `i` and the run stays reproducible regardless of core count or how
+// the chunk cursor happens to hand work out.
 static int checkBvh(const Scene& scene, long long rays) {
-    Pcg32 rng; rng.seed(1234567u, 0xABCDEFu);
-    int mismatches = 0;
-    for (long long i = 0; i < rays; ++i) {
+    std::atomic<int> mismatches{0};
+    const bool full = ft::parallelFor((size_t)rays, 256, [&](size_t i) {
+        Pcg32 rng; rng.seed(mix64((uint64_t)i), 0xABCDEFu);
         // Random ray: origin in a box around the scene, random direction.
         Vec3 o{rng.uniform() * 3 - 1, rng.uniform() * 3 - 1, rng.uniform() * 3 - 1};
         double z = rng.uniform() * 2 - 1, phi = 2 * PI * rng.uniform();
@@ -446,11 +454,16 @@ static int checkBvh(const Scene& scene, long long rays) {
         bool ok = (a.valid == b.valid) &&
                   (!a.valid || (std::fabs(a.t - b.t) < 1e-7 &&
                                 a.matId == b.matId && a.sensorId == b.sensorId));
-        if (!ok) ++mismatches;
+        if (!ok) mismatches.fetch_add(1, std::memory_order_relaxed);
+    });
+    const int m = mismatches.load();
+    if (!full) {                       // `ftrace -stop` landed mid-check
+        std::printf("[checkbvh] stopped early after partial sweep, %d mismatches so far\n", m);
+        return m;
     }
     std::printf("[checkbvh] %lld rays, %d mismatches -> %s\n",
-                rays, mismatches, mismatches == 0 ? "PASS" : "FAIL");
-    return mismatches;
+                rays, m, m == 0 ? "PASS" : "FAIL");
+    return m;
 }
 
 // Implicit-surface (SDF sphere trace) self-test. A unit-Lipschitz SDF sphere must
@@ -498,6 +511,885 @@ static int checkImplicit(long long rays) {
                 rays, compared, grazed, mismatches, maxdt, maxdn,
                 mismatches == 0 ? "PASS" : "FAIL");
     return mismatches;
+}
+
+// ---------------------------------------------------------------------------
+// CURVE / FIBER self-test  (-checkcurve; curve.h, TODO §P1)
+// ---------------------------------------------------------------------------
+// The round-cone intersector is closed-form algebra with three surface pieces and a
+// band test that decides which piece a root belongs to — exactly the shape of code that
+// looks right, renders plausibly, and is quietly wrong on the pieces a hand-authored
+// test scene happens not to graze. So it is checked against a WHOLLY INDEPENDENT
+// formulation: Inigo Quilez's exact signed distance function for the same solid, which
+// shares no algebra with the intersector (it classifies by comparing squared distances,
+// not by solving a quadratic). Two independent derivations of the same surface agreeing
+// on a million random rays is real evidence; one derivation looking fine is not.
+//
+// Because it IS an exact SDF (Lipschitz 1), sphere-tracing it converges to the true
+// first crossing, which gives ground truth for the far more important question — not
+// "is the reported point on the surface?" but "is it the FIRST one?" A missed near root
+// is the bug that renders fur see-through in exactly the configurations a taper produces.
+static double sdRoundCone(const Vec3& p, const Vec3& a, const Vec3& b, double r1, double r2) {
+    const Vec3   ba = b - a;
+    const double l2 = dot(ba, ba);
+    const double rr = r1 - r2;
+    const double a2 = l2 - rr * rr;
+    if (a2 <= 0.0) {   // one ball swallows the other: the hull IS the larger ball
+        const bool useA = (r1 >= r2);
+        const Vec3 c = useA ? a : b;
+        return length(p - c) - (useA ? r1 : r2);
+    }
+    const double il2 = 1.0 / l2;
+    const Vec3   pa = p - a;
+    const double y = dot(pa, ba);
+    const double z = y - l2;
+    const Vec3   q = pa * l2 - ba * y;
+    const double x2 = dot(q, q);
+    const double y2 = y * y * l2;
+    const double z2 = z * z * l2;
+    const double sgn = (rr < 0.0) ? -1.0 : (rr > 0.0 ? 1.0 : 0.0);
+    const double k = sgn * rr * rr * x2;
+    const double sz = (z < 0.0) ? -1.0 : (z > 0.0 ? 1.0 : 0.0);
+    const double sy = (y < 0.0) ? -1.0 : (y > 0.0 ? 1.0 : 0.0);
+    if (sz * a2 * z2 > k) return std::sqrt(x2 + z2) * il2 - r2;
+    if (sy * a2 * y2 < k) return std::sqrt(x2 + y2) * il2 - r1;
+    return (std::sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
+}
+
+static int checkCurve(long long rays) {
+    Pcg32 rng; rng.seed(0xF1BE125u, 0x5EEDu);
+    auto unitDir = [&]() {
+        double z = rng.uniform() * 2 - 1, phi = 2 * PI * rng.uniform();
+        double rr = std::sqrt(std::max(0.0, 1 - z * z));
+        return Vec3{rr * std::cos(phi), rr * std::sin(phi), z};
+    };
+    int fails = 0;
+
+    // --- 1. surface residual, first-hit agreement, and the normal --------------------
+    // Random round cones spanning the interesting shape space: untapered tubes, strong
+    // tapers in both directions, and near-spherical stubs.
+    {
+        long long tested = 0, agreed = 0, skipped = 0;
+        int missMismatch = 0, badResidual = 0, badT = 0, badNormal = 0, badUV = 0, badBound = 0;
+        double maxRes = 0, maxDt = 0, maxDn = 0;
+        for (long long i = 0; i < rays; ++i) {
+            CurveSeg s;
+            s.p0 = Vec3{rng.uniform() * 2 - 1, rng.uniform() * 2 - 1, rng.uniform() * 2 - 1};
+            s.p1 = s.p0 + unitDir() * (0.05 + rng.uniform() * 1.2);
+            s.r0 = 0.005 + rng.uniform() * 0.35;
+            s.r1 = 0.005 + rng.uniform() * 0.35;
+            s.u0 = 0.25f; s.u1 = 0.75f;
+            // AIM the ray at a random point on/around the cone rather than firing into
+            // an empty box: a uniformly random ray misses a 1 cm fiber essentially always,
+            // and a test that hits 0.5% of the time is testing the miss path. Offsetting
+            // the aim point by up to ~2.5 radii keeps a healthy mix of hits, near-misses
+            // and grazes — including every cap-vs-lateral boundary, which is where the
+            // band classification could be wrong.
+            const Vec3 target = s.p0 + (s.p1 - s.p0) * rng.uniform()
+                              + unitDir() * ((s.r0 + s.r1) * 0.5 * rng.uniform() * 2.5);
+            const Vec3 d = unitDir();
+            const Vec3 o = target - d * (1.0 + rng.uniform() * 3.0);
+            const double sdo = sdRoundCone(o, s.p0, s.p1, s.r0, s.r1);
+            if (sdo < 0.02) { ++skipped; continue; }      // origin inside / on: §3 covers it
+
+            // Ground truth: sphere-trace the exact SDF (never overshoots, since it is a
+            // true distance), and take the first t where the surface is reached.
+            const double tMaxG = 12.0, hitEps = 1e-7;
+            double tg = 0.0; bool gHit = false;
+            for (int it = 0; it < 4000 && tg < tMaxG; ++it) {
+                double dsd = sdRoundCone(o + d * tg, s.p0, s.p1, s.r0, s.r1);
+                if (dsd < hitEps) { gHit = true; break; }
+                tg += dsd;
+            }
+            // A grazing ray is a genuine coin flip at the surface epsilon (the sphere
+            // trace stalls asymptotically alongside a tangent), so it tests floating
+            // point, not the intersector. Skip only those.
+            if (gHit) {
+                double graze = sdRoundCone(o + d * tg, s.p0, s.p1, s.r0, s.r1);
+                if (std::fabs(graze) > 1e-3) { ++skipped; continue; }
+            } else if (tg >= tMaxG) {
+                // may have stalled next to a tangent: check how close it got
+                double closest = DBL_MAX;   // (not `near`: that is a windows.h macro)
+                for (int k = 0; k <= 400; ++k)
+                    closest = std::min(closest, sdRoundCone(o + d * (k * (tMaxG / 400.0)),
+                                                            s.p0, s.p1, s.r0, s.r1));
+                if (closest < 1e-3) { ++skipped; continue; }
+            }
+
+            const CurveRay cr = makeCurveRay(d);
+            Hit h; h.t = DBL_MAX;
+            const bool got = intersectCurveSeg(cr, Ray{o, d}, s, 1e-6, h);
+            ++tested;
+            if (got != gHit) { ++missMismatch; ++fails; continue; }
+            if (!got) continue;
+            ++agreed;
+
+            // (a) the reported point is ON the surface
+            const Vec3 p = o + d * h.t;
+            const double res = std::fabs(sdRoundCone(p, s.p0, s.p1, s.r0, s.r1));
+            maxRes = std::max(maxRes, res);
+            if (res > 1e-6) { ++badResidual; ++fails; }
+            // (b) it is the FIRST one
+            const double dt = std::fabs(h.t - tg);
+            maxDt = std::max(maxDt, dt);
+            if (dt > 1e-4) { ++badT; ++fails; }
+            // (c) the analytic normal matches the SDF gradient
+            const double e = 1e-5;
+            Vec3 g{sdRoundCone(p + Vec3{e,0,0}, s.p0, s.p1, s.r0, s.r1) - sdRoundCone(p - Vec3{e,0,0}, s.p0, s.p1, s.r0, s.r1),
+                   sdRoundCone(p + Vec3{0,e,0}, s.p0, s.p1, s.r0, s.r1) - sdRoundCone(p - Vec3{0,e,0}, s.p0, s.p1, s.r0, s.r1),
+                   sdRoundCone(p + Vec3{0,0,e}, s.p0, s.p1, s.r0, s.r1) - sdRoundCone(p - Vec3{0,0,e}, s.p0, s.p1, s.r0, s.r1)};
+            g = normalize(g);
+            const double dn = length(g - h.ng);
+            maxDn = std::max(maxDn, dn);
+            if (dn > 5e-3) { ++badNormal; ++fails; }
+            // (d) parameterisation: u inside the segment's own span, v a full turn,
+            //     and the shading normal facing the ray.
+            if (h.u < (double)s.u0 - 1e-9 || h.u > (double)s.u1 + 1e-9 ||
+                h.v < 0.0 || h.v > 1.0 || dot(d, h.n) > 0.0) { ++badUV; ++fails; }
+            // (e) the BVH leaf box actually contains the hit — a bound that misses is a
+            //     silently disappearing strand, not a slow one.
+            const Aabb bx = curveSegBounds(s);
+            if (p.x < bx.lo.x - 1e-9 || p.x > bx.hi.x + 1e-9 ||
+                p.y < bx.lo.y - 1e-9 || p.y > bx.hi.y + 1e-9 ||
+                p.z < bx.lo.z - 1e-9 || p.z > bx.hi.z + 1e-9) { ++badBound; ++fails; }
+        }
+        std::printf("[checkcurve] 1. round cone vs exact SDF: %lld rays (%lld hit, %lld grazing skipped)"
+                    " miss=%d res=%d t=%d n=%d uv=%d box=%d"
+                    "  max|sd|=%.2e max|dt|=%.2e max|dn|=%.2e -> %s\n",
+                    tested, agreed, skipped, missMismatch, badResidual, badT, badNormal, badUV, badBound,
+                    maxRes, maxDt, maxDn,
+                    (missMismatch + badResidual + badT + badNormal + badUV + badBound) == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 2. degenerate containment: the hull is a plain sphere ------------------------
+    // r0 - r1 >= |p1 - p0| means one end ball swallows the other. The lateral surface
+    // does not exist, and the answer must be exactly what intersectSphere gives.
+    {
+        int bad = 0; long long n = 0;
+        double maxdt = 0;
+        for (long long i = 0; i < rays / 8; ++i) {
+            CurveSeg s;
+            s.p0 = Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5};
+            const double len = 0.01 + rng.uniform() * 0.2;
+            s.p1 = s.p0 + unitDir() * len;
+            s.r0 = len + 0.05 + rng.uniform() * 0.4;      // big end swallows the small one
+            s.r1 = 0.001 + rng.uniform() * 0.02;
+            const Vec3 o{rng.uniform() * 6 - 3, rng.uniform() * 6 - 3, rng.uniform() * 6 - 3};
+            const Vec3 d = unitDir();
+            Sphere sp{s.p0, s.r0, 0};
+            Hit ha; ha.t = DBL_MAX; const bool hitA = intersectSphere(Ray{o, d}, sp, 1e-6, ha);
+            Hit hb; hb.t = DBL_MAX; const bool hitB = intersectCurveSeg(makeCurveRay(d), Ray{o, d}, s, 1e-6, hb);
+            // Skip tangent grazes (hit/miss coin flip at the epsilon).
+            const Vec3 oc = s.p0 - o; const double proj = dot(oc, d);
+            const double impact = std::sqrt(std::max(0.0, dot(oc, oc) - proj * proj));
+            if (std::fabs(impact - s.r0) < 1e-3) continue;
+            ++n;
+            if (hitA != hitB) { ++bad; continue; }
+            if (!hitA) continue;
+            maxdt = std::max(maxdt, std::fabs(ha.t - hb.t));
+            if (std::fabs(ha.t - hb.t) > 1e-9) ++bad;
+        }
+        fails += bad;
+        std::printf("[checkcurve] 2. degenerate containment == analytic sphere: %lld rays, %d mismatches,"
+                    " max|dt|=%.2e -> %s\n", n, bad, maxdt, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 3. anyHit agrees with the full path ------------------------------------------
+    // Occlusion queries take a shortcut that skips normals/UVs; it must not be able to
+    // change the boolean, INCLUDING for a ray whose origin is inside the fiber (a shadow
+    // ray leaving a strand), which is exactly the case §1 skips.
+    {
+        int bad = 0; long long n = 0, inside = 0;
+        for (long long i = 0; i < rays / 4; ++i) {
+            CurveSeg s;
+            s.p0 = Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5};
+            s.p1 = s.p0 + unitDir() * (0.05 + rng.uniform() * 1.0);
+            s.r0 = 0.01 + rng.uniform() * 0.3;
+            s.r1 = 0.01 + rng.uniform() * 0.3;
+            // Half the origins deliberately INSIDE the fiber.
+            Vec3 o;
+            if (i & 1) { o = s.p0 + (s.p1 - s.p0) * rng.uniform() + unitDir() * (rng.uniform() * s.r0 * 0.5); ++inside; }
+            else       { o = Vec3{rng.uniform() * 4 - 2, rng.uniform() * 4 - 2, rng.uniform() * 4 - 2}; }
+            const Vec3 d = unitDir();
+            const CurveRay cr = makeCurveRay(d);
+            Hit hf; hf.t = DBL_MAX; const bool full = intersectCurveSeg(cr, Ray{o, d}, s, 1e-6, hf);
+            Hit hq; hq.t = DBL_MAX; const bool any  = intersectCurveSeg(cr, Ray{o, d}, s, 1e-6, hq, true);
+            ++n;
+            if (full != any || (full && hf.t != hq.t)) ++bad;
+            // A ray starting inside must find its exit, and that exit must be on the surface.
+            if (full && sdRoundCone(o, s.p0, s.p1, s.r0, s.r1) < -1e-3) {
+                if (std::fabs(sdRoundCone(o + d * hf.t, s.p0, s.p1, s.r0, s.r1)) > 1e-6) ++bad;
+            }
+        }
+        fails += bad;
+        std::printf("[checkcurve] 3. anyHit == full path (%lld inside-origin): %lld rays, %d mismatches -> %s\n",
+                    inside, n, bad, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 4. a CHAIN is watertight at its joints ---------------------------------------
+    // Adjacent round cones share an end sphere, so their union should have no crack —
+    // the whole reason the flattening emits a sphere-swept chain instead of mitred tubes.
+    // Rays are aimed straight at the joints, which is where a crack would be.
+    {
+        std::vector<CurveSeg> chain;
+        std::vector<Vec3>   pts = {{0, 0, 0}, {0.4, 0.5, 0.1}, {-0.2, 0.9, -0.3}, {0.3, 1.4, 0.2}};
+        std::vector<double> rad = {0.06, 0.05, 0.04, 0.02};
+        tessellateCurve(pts, rad, CurveBasis::Linear, 1, 0, 0, chain);
+        int bad = 0; long long n = 0, skipped = 0;
+        auto chainSd = [&](const Vec3& p) {
+            double m = DBL_MAX;
+            for (const auto& c : chain) m = std::min(m, sdRoundCone(p, c.p0, c.p1, c.r0, c.r1));
+            return m;
+        };
+        for (long long i = 0; i < rays / 4; ++i) {
+            // Aim at a random point near a joint, from a random direction.
+            const Vec3 j = pts[1 + (int)(rng.uniform() * 2.999)];
+            const Vec3 target = j + unitDir() * (rng.uniform() * 0.02);
+            const Vec3 d = unitDir();
+            const Vec3 o = target - d * 3.0;
+            const double truth = chainSd(o + d * 3.0);   // is `target` inside the chain?
+            if (std::fabs(truth) < 2e-3) { ++skipped; continue; }   // grazing
+            const CurveRay cr = makeCurveRay(d);
+            Hit h; h.t = DBL_MAX;
+            bool got = false;
+            for (const auto& c : chain) got |= intersectCurveSeg(cr, Ray{o, d}, c, 1e-6, h);
+            ++n;
+            // The target is inside the solid, so a ray through it MUST hit — a crack at
+            // the joint is precisely a ray that passes through and reports nothing.
+            if (truth < 0.0 && !got) ++bad;
+            if (got && std::fabs(chainSd(o + d * h.t)) > 1e-6) ++bad;
+        }
+        fails += bad;
+        std::printf("[checkcurve] 4. chain watertight at joints: %lld rays (%lld grazing skipped), %d cracks -> %s\n",
+                    n, skipped, bad, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 5. basis flattening ----------------------------------------------------------
+    // Catmull-Rom must INTERPOLATE its control points (that is the whole reason it is the
+    // default for an authored guide hair); Bezier must hit its endpoints; linear must be
+    // exact; and every basis must lay `u` down monotonically from 0 to 1.
+    {
+        int bad = 0;
+        const std::vector<Vec3>   pts = {{0, 0, 0}, {0.3, 0.4, 0.1}, {-0.1, 0.9, -0.2},
+                                          {0.4, 1.3, 0.05}, {0.1, 1.8, 0.3}, {0.5, 2.2, 0}, {0.2, 2.6, -0.1}};
+        const std::vector<double> rad = {0.05, 0.045, 0.04, 0.035, 0.03, 0.02, 0.01};
+        struct Case { CurveBasis b; const char* nm; int spans; };
+        const Case cases[] = {{CurveBasis::Linear, "linear", 6},
+                              {CurveBasis::CatmullRom, "catmull_rom", 6},
+                              {CurveBasis::Bezier, "bezier", 2},
+                              {CurveBasis::BSpline, "bspline", 4}};
+        for (const Case& c : cases) {
+            if (curveSpanCount(c.b, (int)pts.size()) != c.spans) { ++bad; continue; }
+            std::vector<CurveSeg> segs;
+            const int sub = (c.b == CurveBasis::Linear) ? 1 : 8;
+            const int n = tessellateCurve(pts, rad, c.b, sub, 7, 3, segs);
+            if (n != (int)segs.size() || n <= 0) { ++bad; continue; }
+            // u marches monotonically from 0 to 1 across the whole strand, and the chain
+            // is contiguous (each segment starts where the last ended).
+            if (std::fabs(segs.front().u0) > 1e-6 || std::fabs(segs.back().u1 - 1.0) > 1e-6) ++bad;
+            for (size_t k = 0; k < segs.size(); ++k) {
+                if (segs[k].u1 < segs[k].u0) ++bad;
+                if (segs[k].matId != 7 || segs[k].curveId != 3) ++bad;
+                if (segs[k].r0 <= 0.0 || segs[k].r1 <= 0.0) ++bad;   // a taper must never go negative
+                if (k && length(segs[k].p0 - segs[k - 1].p1) > 1e-12) ++bad;
+            }
+            // Interpolating bases pass exactly through the control points they claim to.
+            auto onCurve = [&](const Vec3& q) {
+                double m = DBL_MAX;
+                for (const auto& sg : segs) m = std::min(m, length(sg.p0 - q));
+                m = std::min(m, length(segs.back().p1 - q));
+                return m;
+            };
+            if (c.b == CurveBasis::Linear || c.b == CurveBasis::CatmullRom) {
+                for (const Vec3& q : pts) if (onCurve(q) > 1e-9) ++bad;
+            } else if (c.b == CurveBasis::Bezier) {
+                if (onCurve(pts[0]) > 1e-9 || onCurve(pts[3]) > 1e-9 || onCurve(pts[6]) > 1e-9) ++bad;
+            } else {   // a B-spline is APPROXIMATING: it must stay off its own control points
+                if (onCurve(pts[3]) < 1e-6) ++bad;
+            }
+        }
+        // A point count no basis admits must be refused, not silently truncated.
+        std::vector<CurveSeg> junk;
+        std::vector<Vec3> two = {{0, 0, 0}, {0, 1, 0}};
+        std::vector<double> tworad = {0.01, 0.01};
+        if (tessellateCurve(two, tworad, CurveBasis::Bezier, 4, 0, 0, junk) != 0) ++bad;
+        if (tessellateCurve(two, tworad, CurveBasis::BSpline, 4, 0, 0, junk) != 0) ++bad;
+        if (tessellateCurve(two, tworad, CurveBasis::Linear, 4, 0, 0, junk) != 1) ++bad;  // linear forces sub=1
+        fails += bad;
+        std::printf("[checkcurve] 5. basis flattening (linear/catmull_rom/bezier/bspline): %d failures -> %s\n",
+                    bad, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 6. fp32 conditioning at FIBER scale (guards the CUDA device twin) -----------
+    // The CUDA megakernel runs `using Real = float`, so the round-cone quadric must stay
+    // well-conditioned in single precision or a furred scene renders as speckled holes on
+    // the GPU while looking perfect on the CPU — a divergence no image-vs-image test would
+    // attribute to the intersector. This section instantiates the SAME `curveSegCrossings`
+    // the renderer uses at `float` and measures it against the double path.
+    //
+    // Scale matters more than ray count here: §1's cones have centimetre-to-decimetre
+    // radii, which are perfectly conditioned. The cancellation only bites at real fiber
+    // proportions — a sub-millimetre radius with the origin metres away — so this section
+    // sweeps exactly that regime. (Before the origin-recentering fix, the first row below
+    // read `15.0% lost, 11.8 radii`; it is what motivated the fix.)
+    {
+        struct Cfg { double seglen, radius, dist; };
+        const Cfg cfgs[] = {
+            {0.01,  0.0010, 2.0},    // 1 mm hair, 1 cm segments, arm's length
+            {0.01,  0.0010, 10.0},   // ... across a room
+            {0.02,  0.0005, 2.0},    // finer fur, longer segments
+            {0.005, 0.0002, 5.0},    // 0.2 mm down fiber
+        };
+        int bad = 0;
+        for (const Cfg& c : cfgs) {
+            long long tested = 0, lost = 0;
+            double maxErrRadii = 0.0;
+            for (long long i = 0; i < rays / 4; ++i) {
+                CurveSeg s;
+                s.p0 = Vec3{rng.uniform() * 0.2 - 0.1, rng.uniform() * 0.2 - 0.1, rng.uniform() * 0.2 - 0.1};
+                s.p1 = s.p0 + unitDir() * c.seglen;
+                s.r0 = c.radius;
+                s.r1 = c.radius * (0.3 + 0.7 * rng.uniform());
+                // Aim at a jittered point on the fiber (nothing random hits a 1 mm strand).
+                const Vec3 target = s.p0 + (s.p1 - s.p0) * rng.uniform()
+                                  + unitDir() * (c.radius * 1.6 * rng.uniform());
+                const Vec3 o = target + unitDir() * c.dist;
+                const Vec3 d = normalize(target - o);
+
+                const CurveRay cr = makeCurveRay(d);
+                Hit h; h.t = DBL_MAX;
+                if (!intersectCurveSeg(cr, Ray{o, d}, s, 1e-9, h)) continue;
+                ++tested;
+
+                // Same algebra, float instantiation, nearest forward root.
+                const float roF[3] = {(float)o.x, (float)o.y, (float)o.z};
+                const float rdF[3] = {(float)d.x, (float)d.y, (float)d.z};
+                const float p0F[3] = {(float)s.p0.x, (float)s.p0.y, (float)s.p0.z};
+                const float p1F[3] = {(float)s.p1.x, (float)s.p1.y, (float)s.p1.z};
+                float shiftF = 0.0f, bestF = FLT_MAX;
+                curveSegCrossings<float>(roF, rdF, p0F, p1F, (float)s.r0, (float)s.r1, shiftF,
+                    [&](float tn, int, float) {
+                        if (tn < bestF && tn + shiftF > 0.0f) bestF = tn;
+                    });
+                if (bestF == FLT_MAX) { ++lost; continue; }
+                // Error in FIBER RADII: one radius means the hit slid off the strand
+                // entirely, which is what is visible, whereas an absolute tolerance would
+                // be meaningless across four scales.
+                maxErrRadii = std::max(maxErrRadii,
+                                       std::fabs((double)(bestF + shiftF) - h.t) / c.radius);
+            }
+            const double lostPct = tested ? 100.0 * (double)lost / (double)tested : 0.0;
+            // Thresholds: grazing rays are a genuine coin flip in fp32, so a few tenths of
+            // a percent of losses is physics, not a bug; 0.25 radii of slip is invisible on
+            // a fiber a fraction of a pixel wide. The broken form missed both by >40x.
+            const bool ok = (lostPct <= 0.5) && (maxErrRadii <= 0.25);
+            if (!ok) ++bad;
+            std::printf("[checkcurve]    fp32 seg=%.3fm r=%.4fm dist=%.0fm: %lld hits,"
+                        " %.3f%% lost, max err %.3f radii%s\n",
+                        c.seglen, c.radius, c.dist, tested, lostPct, maxErrRadii,
+                        ok ? "" : "   <== FAIL");
+        }
+        fails += bad;
+        std::printf("[checkcurve] 6. fp32 conditioning at fiber scale (CUDA twin): %d failures -> %s\n",
+                    bad, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    std::printf("[checkcurve] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// FUR / GROOM self-test  (-checkfur; fur.h, TODO §P1 stage 2)
+// ---------------------------------------------------------------------------
+// The generator's failures are the quiet kind. It emits ordinary `Curve`/`CurveSeg`
+// records, so nothing downstream can reject a wrong groom — a coat that is subtly
+// non-uniform, or that grows into the skin, or that silently produces zero strands, all
+// look like "geometry" to the BVH and like a rendering problem to the person looking at
+// the image. (That last one is not hypothetical: fur on a mesh target generated exactly
+// zero strands during bring-up, with no error printed anywhere, because the loader runs
+// before `Tri::finalize()` fills in normals. §7 exists specifically to keep that fixed.)
+//
+// So each section checks an INVARIANT of the groom rather than an image: roots on the
+// surface, roots distributed by area, output identical for a seed, strands leaving the
+// skin, clumping changing shape but not density, and the segment chain well-formed.
+static int checkFur(long long strands) {
+    int fails = 0;
+
+    // A two-triangle target with a deliberate 3:1 area ratio: a 3x1 rectangle split by
+    // the diagonal is the wrong test (both halves are equal), so build two independent
+    // right triangles in the z=0 plane with legs chosen to give areas 1.5 and 0.5.
+    std::vector<Tri> flat(2);
+    flat[0].v0 = Vec3(0, 0, 0);   flat[0].v1 = Vec3(3, 0, 0);   flat[0].v2 = Vec3(0, 1, 0);   // area 1.5
+    flat[1].v0 = Vec3(4, 0, 0);   flat[1].v1 = Vec3(5, 0, 0);   flat[1].v2 = Vec3(4, 1, 0);   // area 0.5
+    // NOTE: deliberately NOT finalized. This is the state the loader actually hands the
+    // generator (gn and n0..n2 all zero), and testing the finalized state would test a
+    // configuration that never occurs at load time.
+    FurSurface mesh;  mesh.tris = flat.data();  mesh.nTris = flat.size();
+    FurSurface ball;  ball.isSphere = true;  ball.center = Vec3(0.5, -2, 0.25);  ball.radius = 0.4;
+
+    auto baseSpec = [&](long long n) {
+        FurSpec s;
+        s.matId = 3;  s.name = "test";  s.count = n;  s.seed = 12345;
+        s.points = 5;  s.subdiv = 2;  s.basis = CurveBasis::CatmullRom;
+        s.length = 0.08;  s.lengthJitter = 0.3;
+        s.radius = 0.001;  s.radiusTip = 0.0002;
+        s.lift = 1.0;  s.jitter = 0.2;
+        s.gravity = Vec3(0, 0, -1);  s.droop = 0.3;      // "down" is -z for the z=0 patch
+        return s;
+    };
+
+    // --- 1. every root lies ON the target surface ------------------------------------
+    // The root is the one point the generator does not get to invent: it must be on the
+    // authored skin, or the coat floats off the model / buries itself in it.
+    {
+        int badPlane = 0, badInside = 0, badSphere = 0;
+        double maxOff = 0.0, maxRadErr = 0.0;
+        std::vector<Curve> cs; std::vector<CurveSeg> sg;
+        FurSpec s = baseSpec(strands);
+        s.rootOffset = 0.0;
+        if (generateFur(s, mesh, cs, sg) <= 0) ++badPlane;
+        for (const Curve& c : cs) {
+            const Vec3 r = sg[(size_t)c.firstSeg].p0;
+            maxOff = std::max(maxOff, std::fabs(r.z));
+            if (std::fabs(r.z) > 1e-9) ++badPlane;
+            // Inside one of the two triangles (barycentric, in the z=0 plane).
+            bool in = false;
+            for (const Tri& t : flat) {
+                const Vec3 e1 = t.v1 - t.v0, e2 = t.v2 - t.v0, rp = r - t.v0;
+                const double d00 = dot(e1, e1), d01 = dot(e1, e2), d11 = dot(e2, e2);
+                const double d20 = dot(rp, e1), d21 = dot(rp, e2);
+                const double den = d00 * d11 - d01 * d01;
+                const double b1 = (d11 * d20 - d01 * d21) / den;
+                const double b2 = (d00 * d21 - d01 * d20) / den;
+                if (b1 >= -1e-9 && b2 >= -1e-9 && b1 + b2 <= 1 + 1e-9) { in = true; break; }
+            }
+            if (!in) ++badInside;
+        }
+        std::vector<Curve> cs2; std::vector<CurveSeg> sg2;
+        FurSpec sp = baseSpec(strands);  sp.gravity = Vec3(0, -1, 0);
+        generateFur(sp, ball, cs2, sg2);
+        for (const Curve& c : cs2) {
+            const double e = std::fabs(length(sg2[(size_t)c.firstSeg].p0 - ball.center) - ball.radius);
+            maxRadErr = std::max(maxRadErr, e);
+            if (e > 1e-9) ++badSphere;
+        }
+        const int bad = badPlane + badInside + badSphere;
+        fails += bad;
+        std::printf("[checkfur] 1. roots on the surface: %zu mesh + %zu sphere roots, "
+                    "max off-plane %.2e, max radial err %.2e, %d off-surface -> %s\n",
+                    cs.size(), cs2.size(), maxOff, maxRadErr, bad, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 2. roots are AREA-uniform, and `density` means what it says -----------------
+    // Sampling a triangle uniformly instead of by area is the classic mistake, and it is
+    // nearly invisible on a well-tessellated model — but it makes a coat thin out over
+    // big polygons. The 3:1 area split must show up as a 3:1 strand split.
+    {
+        const long long n = std::max(strands, 20000LL);
+        std::vector<Curve> cs; std::vector<CurveSeg> sg;
+        FurSpec s = baseSpec(n);
+        generateFur(s, mesh, cs, sg);
+        long long inBig = 0;
+        for (const Curve& c : cs) if (sg[(size_t)c.firstSeg].p0.x < 3.5) ++inBig;
+        const double frac = cs.empty() ? 0.0 : (double)inBig / (double)cs.size();
+        // 3-sigma on a binomial with p=0.75 over n samples, floored so a small -checkfur
+        // ray budget does not make this flaky.
+        const double sigma = std::sqrt(0.75 * 0.25 / (double)std::max<long long>(n, 1));
+        const bool okSplit = std::fabs(frac - 0.75) <= std::max(4.0 * sigma, 0.005);
+
+        // `density` * area == count, exactly (area here is 2.0).
+        std::vector<Curve> cd; std::vector<CurveSeg> sd;
+        FurSpec dspec = baseSpec(0);
+        dspec.density = 5000.0;                       // 5000/m^2 over 2 m^2 -> 10000
+        const long long made = generateFur(dspec, mesh, cd, sd);
+        const bool okDensity = (made == 10000);
+
+        // And uniform WITHIN a triangle: the sqrt barycentric warp, not raw (u,v). Split
+        // the big triangle by area with a line parallel to its hypotenuse: the region with
+        // b0 > 1 - sqrt(1/2) ... simpler and just as sharp — the mean of b0 over a triangle
+        // is 1/3, and the broken (unwarped) map gives 1/2.
+        double meanB0 = 0.0; long long nB0 = 0;
+        for (const Curve& c : cs) {
+            const Vec3 r = sg[(size_t)c.firstSeg].p0;
+            if (r.x >= 3.5) continue;
+            // b0 for triangle 0 = 1 - x/3 - y  (v0 at origin, legs 3 and 1)
+            meanB0 += 1.0 - r.x / 3.0 - r.y;  ++nB0;
+        }
+        if (nB0) meanB0 /= (double)nB0;
+        const bool okWarp = std::fabs(meanB0 - 1.0 / 3.0) < 0.01;
+
+        const int bad = (!okSplit) + (!okDensity) + (!okWarp);
+        fails += bad;
+        std::printf("[checkfur] 2. area-uniform roots: 3:1 split gave %.4f (want 0.7500), "
+                    "mean b0 %.4f (want 0.3333), density 5000*2m^2 -> %lld (want 10000) -> %s\n",
+                    frac, meanB0, made, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 3. determinism ---------------------------------------------------------------
+    // A groom is regenerated on every load, so it must be a pure function of its seed —
+    // otherwise a checkpoint/resume, a flyby, or a CPU-vs-GPU comparison all quietly
+    // render different geometry each time. Also: the parallel build must not let thread
+    // scheduling leak into the result.
+    //
+    // There are TWO independent consumers of `spec.seed` — the per-strand rng (root
+    // position + all the shaping jitter) and the guide rng that drives clumping — and they
+    // must BOTH depend on it. Testing "does seed 8 differ from seed 7" with clumping ON
+    // cannot tell them apart: either one alone moving is enough to make the buffers differ,
+    // so a build where the strands stopped honouring the seed still passes. (That is not
+    // hypothetical — mutation-testing this section caught exactly that hole: deleting
+    // `spec.seed` from the strand rng was MISSED by the original single clumped test.) So
+    // the seed sensitivity is checked twice, once with each path isolated.
+    {
+        auto gen = [&](uint64_t seed, double clump, std::vector<CurveSeg>& out) {
+            std::vector<Curve> cs;
+            FurSpec s = baseSpec(std::min(strands, 20000LL));
+            s.seed = seed;  s.clump = clump;  s.clumpSize = 0.15;
+            generateFur(s, mesh, cs, out);
+        };
+        auto differ = [](const std::vector<CurveSeg>& x, const std::vector<CurveSeg>& y) {
+            return x.size() != y.size() ||
+                   std::memcmp(x.data(), y.data(), x.size() * sizeof(CurveSeg)) != 0;
+        };
+        // (a) reproducible: same seed, same groom, twice — with the guide path engaged, so
+        //     the parallel guide build is covered too.
+        std::vector<CurveSeg> a, b;
+        gen(7, 0.6, a);  gen(7, 0.6, b);
+        const bool same = !differ(a, b);
+        // (b) the STRAND rng honours the seed: clumping off, so nothing else can move.
+        std::vector<CurveSeg> u7, u8;
+        gen(7, 0.0, u7);  gen(8, 0.0, u8);
+        const bool okStrandSeed = differ(u7, u8);
+        // (c) the GUIDE rng honours the seed, isolated from the strand rng. Trick: drive the
+        //     guide count to exactly ONE (clump_size 1.0 over this 2 m^2 target gives
+        //     G = round(2/pi) = 1) and clump at full strength, so w = clump*t is exactly 1
+        //     at the tip and EVERY strand's last control point is literally the single
+        //     guide's tip. That one point is then a pure function of the guide rng — the
+        //     strand rng cannot move it — so if the guide seeding stopped reading
+        //     spec.seed the point would be identical across seeds. Also assert the tips
+        //     really did collapse to one point, otherwise the isolation silently didn't
+        //     happen and the comparison below would be testing the strand path again.
+        auto oneGuideTip = [&](uint64_t seed, Vec3& tip, double& spread) {
+            std::vector<Curve> cs; std::vector<CurveSeg> sg;
+            FurSpec s = baseSpec(std::min(strands, 2000LL));
+            s.seed = seed;  s.clump = 1.0;  s.clumpSize = 1.0;
+            generateFur(s, mesh, cs, sg);
+            tip = Vec3(0, 0, 0);  spread = 0.0;
+            if (cs.empty()) return;
+            auto tipOf = [&](const Curve& c) {
+                return sg[(size_t)(c.firstSeg + c.segCount - 1)].p1;
+            };
+            tip = tipOf(cs[0]);
+            for (const Curve& c : cs) spread = std::max(spread, length(tipOf(c) - tip));
+        };
+        Vec3 g7, g8;  double spread7 = 0, spread8 = 0;
+        oneGuideTip(7, g7, spread7);  oneGuideTip(8, g8, spread8);
+        const bool collapsed = (spread7 < 1e-9 && spread8 < 1e-9);   // isolation actually held
+        const bool okGuideSeed = collapsed && length(g7 - g8) > 1e-6;
+        const int bad = (!same) + (!okStrandSeed) + (!okGuideSeed);
+        fails += bad;
+        std::printf("[checkfur] 3. determinism: seed 7 twice %s, strand seed matters %s, "
+                    "guide seed matters %s (1-guide tips %.4f apart, collapse %.1e/%.1e), "
+                    "%zu segments -> %s\n",
+                    same ? "identical" : "DIVERGED", okStrandSeed ? "yes" : "NO",
+                    okGuideSeed ? "yes" : "NO", length(g7 - g8), spread7, spread8,
+                    a.size(), bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 4. strands leave the skin, and honour the length bounds ----------------------
+    // A strand whose GROWTH DIRECTION points below the tangent plane spends its whole
+    // length buried and renders as a bald patch with a shadow. `lift 0` plus a large
+    // `jitter` is exactly the authoring that produces such a direction, so the generator
+    // clamps it back to a shallow grazing angle — this pins that clamp.
+    //
+    // Note the invariant is about the direction the strand LEAVES the root, not about
+    // where it ends up: a shallow strand under heavy gravity droop legitimately curves
+    // back down and touches the skin again (that is what long grass does). So the
+    // direction is measured with shaping off, and the shaping is bounded separately.
+    {
+        auto arcOf = [&](const std::vector<CurveSeg>& sg, const Curve& c) {
+            double a = 0.0;
+            for (int k = 0; k < c.segCount; ++k)
+                a += length(sg[(size_t)c.firstSeg + k].p1 - sg[(size_t)c.firstSeg + k].p0);
+            return a;
+        };
+        const Vec3 N(0, 0, 1);                              // the patch's true normal
+
+        // (a) + (b): adversarial direction authoring, shaping off. A straight strand is
+        // flattened exactly by every basis, so the arc must equal the jittered length to
+        // fp precision — which makes the length window tight rather than decorative.
+        int intoSkin = 0, outOfBounds = 0;
+        double minL = 1e300, maxL = 0.0;
+        std::vector<Curve> cs; std::vector<CurveSeg> sg;
+        FurSpec s = baseSpec(strands);
+        s.lift = 0.0;  s.jitter = 0.9;  s.droop = 0.0;
+        generateFur(s, mesh, cs, sg);
+        for (const Curve& c : cs) {
+            const CurveSeg& f = sg[(size_t)c.firstSeg];
+            const Vec3 d = f.p1 - f.p0;
+            if (dot(d, d) <= 0.0 || dot(normalize(d), N) <= 0.0) ++intoSkin;
+            const double arc = arcOf(sg, c);
+            minL = std::min(minL, arc);  maxL = std::max(maxL, arc);
+            if (arc < s.length * (1.0 - s.lengthJitter) * (1 - 1e-9) ||
+                arc > s.length * (1.0 + s.lengthJitter) * (1 + 1e-9)) ++outOfBounds;
+        }
+
+        // (c) shaping stays bounded. For q(t) = dir*L*t + g*droop*L*t^2 the speed is at
+        // most L*(1 + 2*droop*t), so the arc can never exceed L*(1 + droop) — a closed
+        // bound, so a droop/curl term that blows up is caught rather than merely looking
+        // odd. Curl adds its own helix circumference, hence the extra 2*pi*curl*curlFreq.
+        int unbounded = 0; double maxShaped = 0.0;
+        std::vector<Curve> cs2; std::vector<CurveSeg> sg2;
+        FurSpec s2 = baseSpec(strands);
+        s2.lift = 0.35;  s2.jitter = 0.8;  s2.droop = 0.9;  s2.curl = 0.15;  s2.curlFreq = 3.0;
+        generateFur(s2, mesh, cs2, sg2);
+        const double ceilArc = s2.length * (1.0 + s2.lengthJitter) *
+                               (1.0 + s2.droop + 2.0 * PI * s2.curl * s2.curlFreq);
+        for (const Curve& c : cs2) {
+            const double arc = arcOf(sg2, c);
+            maxShaped = std::max(maxShaped, arc);
+            if (!(arc > 0.0) || arc > ceilArc) ++unbounded;
+        }
+
+        const int bad = intoSkin + outOfBounds + unbounded;
+        fails += bad;
+        std::printf("[checkfur] 4. growth direction + length: %zu strands, %d grew into the skin, "
+                    "%d outside the jitter window (arc %.5f..%.5f m, authored %.3f +/-%.0f%%), "
+                    "%d over the shaping bound (max %.5f <= %.5f m) -> %s\n",
+                    cs.size(), intoSkin, outOfBounds, minL, maxL, s.length,
+                    s.lengthJitter * 100.0, unbounded, maxShaped, ceilArc,
+                    bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 5. clumping changes SHAPE, never density ------------------------------------
+    // The whole point of blending toward a guide with weight proportional to t is that
+    // roots stay exactly where the area-uniform sampler put them. If clumping moved roots
+    // it would gather the coat into tufts AND thin the skin between them, which is a
+    // different (and wrong) look. So: identical roots, collapsed tips.
+    {
+        const long long n = std::min(strands, 8000LL);
+        auto tipsAndRoots = [&](double clump, std::vector<Vec3>& roots, std::vector<Vec3>& tips) {
+            std::vector<Curve> cs; std::vector<CurveSeg> sg;
+            FurSpec s = baseSpec(n);
+            s.clump = clump;  s.clumpSize = 0.12;  s.jitter = 0.35;
+            generateFur(s, mesh, cs, sg);
+            roots.clear(); tips.clear();
+            for (const Curve& c : cs) {
+                roots.push_back(sg[(size_t)c.firstSeg].p0);
+                tips .push_back(sg[(size_t)(c.firstSeg + c.segCount - 1)].p1);
+            }
+        };
+        std::vector<Vec3> r0, t0, r1, t1;
+        tipsAndRoots(0.0, r0, t0);
+        tipsAndRoots(1.0, r1, t1);
+        int movedRoots = 0;
+        const size_t m = std::min(r0.size(), r1.size());
+        for (size_t i = 0; i < m; ++i) if (length(r0[i] - r1[i]) > 1e-12) ++movedRoots;
+        // Mean nearest-neighbour tip distance: O(n^2) on a few thousand tips is fine, and
+        // an exact measure beats a sampled one for a threshold this coarse.
+        auto meanNN = [](const std::vector<Vec3>& v) {
+            double acc = 0.0;
+            for (size_t i = 0; i < v.size(); ++i) {
+                double best = 1e300;
+                for (size_t j = 0; j < v.size(); ++j)
+                    if (j != i) best = std::min(best, dot(v[i] - v[j], v[i] - v[j]));
+                acc += std::sqrt(best);
+            }
+            return v.empty() ? 0.0 : acc / (double)v.size();
+        };
+        const double nn0 = meanNN(t0), nn1 = meanNN(t1);
+        const bool okRoots = (movedRoots == 0) && (r0.size() == r1.size()) && !r0.empty();
+        const bool okTips  = (nn1 < 0.5 * nn0);
+        const int bad = (!okRoots) + (!okTips);
+        fails += bad;
+        std::printf("[checkfur] 5. clumping: %zu roots, %d moved by clumping (want 0), "
+                    "mean tip spacing %.5f -> %.5f m (want <50%%) -> %s\n",
+                    r0.size(), movedRoots, nn0, nn1, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 6. the emitted chain is well-formed ------------------------------------------
+    // Everything a hand-authored `curve` guarantees must hold for a generated one, because
+    // downstream code cannot tell them apart: contiguous cones, positive monotone taper,
+    // `u` marching 0..1, and every segment's `curveId` pointing back at its own Curve.
+    {
+        std::vector<Curve> cs; std::vector<CurveSeg> sg;
+        FurSpec s = baseSpec(std::min(strands, 20000LL));
+        const long long made = generateFur(s, mesh, cs, sg);
+        const int spans = curveSpanCount(s.basis, s.points);
+        const size_t want = (size_t)made * (size_t)spans * (size_t)s.subdiv;
+        int cracks = 0, badRad = 0, badU = 0, badId = 0, badMat = 0, zeroLen = 0;
+        for (size_t ci = 0; ci < cs.size(); ++ci) {
+            const Curve& c = cs[ci];
+            for (int k = 0; k < c.segCount; ++k) {
+                const CurveSeg& q = sg[(size_t)c.firstSeg + k];
+                if (q.curveId != (int)ci) ++badId;
+                if (q.matId != s.matId) ++badMat;
+                if (!(q.r0 > 0.0) || !(q.r1 > 0.0) || q.r1 > q.r0 + 1e-15) ++badRad;
+                if (!(q.u1 >= q.u0)) ++badU;
+                if (length(q.p1 - q.p0) <= 0.0) ++zeroLen;
+                if (k && length(q.p0 - sg[(size_t)c.firstSeg + k - 1].p1) > 1e-12) ++cracks;
+            }
+            if (c.segCount > 0) {
+                if (std::fabs(sg[(size_t)c.firstSeg].u0) > 1e-9) ++badU;
+                if (std::fabs(sg[(size_t)(c.firstSeg + c.segCount - 1)].u1 - 1.0) > 1e-9) ++badU;
+            }
+        }
+        const bool okCount = (sg.size() == want) && (made > 0);
+        const int bad = (!okCount) + cracks + badRad + badU + badId + badMat + zeroLen;
+        fails += bad;
+        std::printf("[checkfur] 6. chain well-formed: %lld strands x %d spans x %d = %zu "
+                    "segments (got %zu), %d cracks, %d bad radii, %d bad u, %d bad ids -> %s\n",
+                    made, spans, s.subdiv, want, sg.size(), cracks, badRad, badU, badId,
+                    bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 7. REGRESSION: un-finalized triangles must still grow fur --------------------
+    // The loader's deferred fur sweep runs BEFORE Scene::build() calls Tri::finalize(), so
+    // the generator sees gn == n0 == n1 == n2 == (0,0,0) on every quad, triangle, and mesh
+    // without authored `vn`. Reading a shading normal there normalizes a zero vector; the
+    // NaN propagates through the strand and is then swallowed by tessellateCurve's
+    // `dot(dp,dp) > 0` coincidence guard, so the groom emits ZERO strands and prints no
+    // error at all. This section pins both halves: zeroed normals still produce strands
+    // pointing the geometric way, and authored shading normals are still honoured.
+    {
+        std::vector<Curve> cs; std::vector<CurveSeg> sg;
+        FurSpec s = baseSpec(2000);
+        s.jitter = 0.0;  s.droop = 0.0;  s.lift = 1.0;
+        const long long made = generateFur(s, mesh, cs, sg);
+        int nonFinite = 0, wrongSide = 0;
+        for (const Curve& c : cs) {
+            const CurveSeg& f = sg[(size_t)c.firstSeg];
+            if (!std::isfinite(f.p0.x) || !std::isfinite(f.p0.y) || !std::isfinite(f.p0.z) ||
+                !std::isfinite(f.p1.x) || !std::isfinite(f.p1.y) || !std::isfinite(f.p1.z))
+                ++nonFinite;
+            if ((f.p1 - f.p0).z <= 0.0) ++wrongSide;      // must grow along +z, the geometric normal
+        }
+        // With real shading normals the coat must follow THEM, not the facet: tilt every
+        // vertex normal 45 degrees toward +x and the strands must lean the same way.
+        std::vector<Tri> tilted = flat;
+        const Vec3 sn = normalize(Vec3(1, 0, 1));
+        for (Tri& t : tilted) { t.n0 = sn; t.n1 = sn; t.n2 = sn; }
+        FurSurface tiltedSurf;  tiltedSurf.tris = tilted.data();  tiltedSurf.nTris = tilted.size();
+        std::vector<Curve> cs2; std::vector<CurveSeg> sg2;
+        generateFur(s, tiltedSurf, cs2, sg2);
+        int notTilted = 0;
+        for (const Curve& c : cs2) {
+            const CurveSeg& f = sg2[(size_t)c.firstSeg];
+            if (dot(normalize(f.p1 - f.p0), sn) < 0.999) ++notTilted;
+        }
+        const bool okMade = (made == 2000) && (cs2.size() == 2000);
+        const int bad = (!okMade) + nonFinite + wrongSide + notTilted;
+        fails += bad;
+        std::printf("[checkfur] 7. un-finalized normals (load-order regression): %lld strands "
+                    "(want 2000), %d non-finite, %d grew inward, %d ignored shading normals -> %s\n",
+                    made, nonFinite, wrongSide, notTilted, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // --- 8. `bald` zones: nothing enters, and nothing else changes --------------------
+    // The parameter exists because a coat is grown per body PART while the features that
+    // must stay bare (an eye) are separate spheres sitting on it — so the failure it fixes
+    // is hair CROSSING an eyeball, not hair rooted in one. Three things have to hold, and
+    // only the first is obvious:
+    //   (a) no SEGMENT of any surviving strand intersects the zone — not merely no root,
+    //       since droop/comb/clump carry a strand rooted outside straight through it;
+    //   (b) the survivors are BIT-FOR-BIT the strands the same seed produced without the
+    //       zone. A cull that perturbed the rest of the coat would make `bald` unusable as
+    //       an edit, and would silently rebias the density it must not touch;
+    //   (c) a zone swallowing the whole target yields zero strands and no crash — the
+    //       degenerate case a compaction pass keyed on `nseg == 0` could easily mishandle.
+    {
+        std::vector<Curve> cs0; std::vector<CurveSeg> sg0;
+        FurSpec s0 = baseSpec(std::max(strands, 20000LL));
+        s0.gravity = Vec3(0, -1, 0);
+        const long long made0 = generateFur(s0, ball, cs0, sg0);
+
+        // A zone on the ball's +y pole, wide enough (0.12 m against an 0.08 m coat) that
+        // strands rooted OUTSIDE it would otherwise grow through it.
+        FurSpec::BaldZone z; z.center = ball.center + Vec3(0, ball.radius, 0); z.radius = 0.12;
+        FurSpec s1 = s0;  s1.bald.push_back(z);
+        std::vector<Curve> cs1; std::vector<CurveSeg> sg1;
+        long long culled = -1;
+        const long long made1 = generateFur(s1, ball, cs1, sg1, nullptr, &culled);
+
+        // (a) point-to-segment distance, recomputed here rather than by calling the
+        // generator's own predicate, so a broken predicate cannot pass its own test.
+        int intruders = 0;
+        for (const CurveSeg& q : sg1) {
+            const Vec3 ab = q.p1 - q.p0, ac = z.center - q.p0;
+            const double den = dot(ab, ab);
+            double t = (den > 1e-24) ? dot(ac, ab) / den : 0.0;
+            t = std::min(std::max(t, 0.0), 1.0);
+            if (length(ac - ab * t) < z.radius) ++intruders;
+        }
+        // (b) the kept strands must be a SUBSEQUENCE of the unculled run, unchanged.
+        int drifted = 0;
+        for (size_t i = 0, j = 0; i < cs1.size(); ++i) {
+            const Vec3 root = sg1[(size_t)cs1[i].firstSeg].p0;
+            while (j < cs0.size() && length(sg0[(size_t)cs0[j].firstSeg].p0 - root) > 0.0) ++j;
+            if (j >= cs0.size()) { ++drifted; break; }          // reordered or invented
+            const Curve& c0 = cs0[j++];
+            if (c0.segCount != cs1[i].segCount) { ++drifted; continue; }
+            for (int k = 0; k < c0.segCount; ++k) {
+                const CurveSeg& p = sg0[(size_t)c0.firstSeg + k];
+                const CurveSeg& q = sg1[(size_t)cs1[i].firstSeg + k];
+                if (length(p.p0 - q.p0) > 0.0 || length(p.p1 - q.p1) > 0.0 ||
+                    p.r0 != q.r0 || p.r1 != q.r1) { ++drifted; break; }
+            }
+        }
+        // (a2) THE CASE THE PARAMETER EXISTS FOR, isolated so that only the span test can
+        // satisfy it: a small zone FLOATING clear of the skin, 50 mm above the +y pole with
+        // a 35 mm radius, so no root is within reach of it (nearest root is the pole itself,
+        // 50 mm away) yet every strand rooted near the pole grows straight through it. A
+        // root-only implementation therefore culls exactly zero here — which (a) alone could
+        // not tell apart from correct behaviour, because its 0.12 m zone sits ON the surface
+        // and swallows the roots of everything that crosses it. The mutation harness found
+        // that hole: `tools/mutate_fur.py` #10 disables the span loop and (a) still passed.
+        // `noRoots` is recomputed here rather than asserted in a comment, so the test keeps
+        // meaning if the ball, the coat length or the jitter window ever change.
+        FurSpec::BaldZone zf;
+        zf.center = ball.center + Vec3(0, ball.radius + 0.05, 0);  zf.radius = 0.035;
+        FurSpec s3 = s0;  s3.bald.push_back(zf);
+        std::vector<Curve> cs3; std::vector<CurveSeg> sg3;
+        long long culledFloat = -1;
+        const long long made3 = generateFur(s3, ball, cs3, sg3, nullptr, &culledFloat);
+        int rootsInFloat = 0, intrudersFloat = 0;
+        for (const Curve& c : cs0)
+            if (length(sg0[(size_t)c.firstSeg].p0 - zf.center) < zf.radius) ++rootsInFloat;
+        for (const CurveSeg& q : sg3) {
+            const Vec3 ab = q.p1 - q.p0, ac = zf.center - q.p0;
+            const double den = dot(ab, ab);
+            double t = (den > 1e-24) ? dot(ac, ab) / den : 0.0;
+            t = std::min(std::max(t, 0.0), 1.0);
+            if (length(ac - ab * t) < zf.radius) ++intrudersFloat;
+        }
+
+        // (c) a zone swallowing the whole ball must leave nothing, quietly.
+        FurSpec::BaldZone all; all.center = ball.center; all.radius = 10.0;
+        FurSpec s2 = s0;  s2.bald.push_back(all);
+        std::vector<Curve> cs2b; std::vector<CurveSeg> sg2b;
+        long long culledAll = -1;
+        const long long made2 = generateFur(s2, ball, cs2b, sg2b, nullptr, &culledAll);
+
+        const bool okCulled = (made1 < made0) && (culled == made0 - made1);
+        const bool okTotal  = (made2 == 0) && sg2b.empty() && cs2b.empty() &&
+                              (culledAll == s0.count);
+        // The floating zone contains no roots BY CONSTRUCTION, so a positive cull there is
+        // proof the whole strand was tested; a zero cull is the root-only bug.
+        const bool okFloat  = (rootsInFloat == 0) && (culledFloat > 0) &&
+                              (culledFloat == made0 - made3);
+        const int bad = intruders + drifted + intrudersFloat +
+                        (!okCulled) + (!okTotal) + (!okFloat);
+        fails += bad;
+        std::printf("[checkfur] 8. bald zones: %lld -> %lld strands (%lld culled), "
+                    "%d segments inside the zone, %d survivors perturbed, "
+                    "floating zone (0 roots in it, got %d) culled %lld with %d crossings left, "
+                    "total-cover left %lld strands -> %s\n",
+                    made0, made1, culled, intruders, drifted,
+                    rootsInFloat, culledFloat, intrudersFloat, made2,
+                    bad == 0 ? "PASS" : "FAIL");
+    }
+
+    std::printf("[checkfur] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    return fails;
 }
 
 // ORIENTED-CONTAINER self-test: rotating an expression isosurface must not change what
@@ -1546,7 +2438,12 @@ static int checkUpsample() {
 //   (d) the three out-of-box policies: clamp (edge-extend), wrap (period hi-lo, with
 //       sample n-1 aliasing sample 0) and extrapolate (the boundary cell continues);
 //   (e) the compile path: `grid:<name>(…)` resolves through a PatTableScope, takes the
-//       GRID's own dimensionality as its arity, and pushes coordinates in axis order.
+//       GRID's own dimensionality as its arity, and pushes coordinates in axis order;
+//   (f) an UNBOUND table abandons the program (evaluates 0) instead of corrupting the
+//       stack and returning a coordinate;
+//   (g) end-to-end through a medium's density field, via Scene::patTables();
+//   (h) CSE over a table-sampling program: handed the tables it collapses a repeated
+//       `grid:` sample to one fetch + LdReg, bit-identically; handed none it declines.
 static int checkGrid() {
     auto mk = [](int ndim, const int* shape, const double* lo, const double* hi,
                  PatGridOutside os, int off, int count) {
@@ -1750,8 +2647,2152 @@ static int checkGrid() {
         }
     }
 
+    // ---- (h) CSE over a table-sampling program -------------------------------
+    // The expression language has no local variables, so the non-stationary idiom
+    // (REFERENCE.md) writes the SAME `grid:` sample out at every site it drives —
+    // routinely half a dozen times in one expression. That is only affordable because
+    // the loader CSEs it down to one lattice fetch, and the pass can only model a
+    // `grid:` node's arity if it is handed the tables (the arity is the TABLE's ndim,
+    // which is nowhere in the program). Three things to pin, in order of what has
+    // actually broken:
+    //   * with tables, a repeated sample SHRINKS the program (before this, the pass
+    //     hit `grid:` and abandoned the whole expression, so nothing shrank and the
+    //     idiom quietly cost N fetches);
+    //   * the optimized program still evaluates bit-for-bit identically;
+    //   * WITHOUT tables the pass must decline rather than guess an arity — a wrong
+    //     pop count would silently mis-model the stack.
+    {
+        Scene sc;
+        sc.dataPool.assign(pool.begin(), pool.end());
+        sc.grids.push_back(gClamp);                     // index 0 == "ramp" (1-D)
+        sc.grids.push_back(g23);                        // index 1 == "tbl"  (2-D)
+        const PatTables tabs = sc.patTables();
+        // Both arities in one expression, each sampled twice, plus a shared non-table
+        // subtree — the shape a real gate/field pattern has.
+        const char* src = "grid:ramp(u) * grid:tbl(u, v) + grid:ramp(u) - grid:tbl(u, v)"
+                          " + sin(u * 3) * sin(u * 3)";
+        std::vector<PatNode> base; std::string perr;
+        if (!compilePatternExpr(src, base, perr, false, nullptr, &scope)) {
+            std::printf("[checkgrid] compile CSE probe FAILED: %s\n", perr.c_str());
+            ok = false;
+        } else {
+            std::vector<PatNode> opt = base;
+            patternOptimizeCSE(opt, &tabs);
+            if (opt.size() >= base.size()) {
+                std::printf("[checkgrid] CSE did not shrink a grid-sampling program "
+                            "(%zu -> %zu)  BAD\n", base.size(), opt.size());
+                ok = false;
+            }
+            bool sawLd = false;
+            for (const PatNode& nd : opt) if (nd.op == PatOp::LdReg) { sawLd = true; break; }
+            if (!sawLd) {
+                std::printf("[checkgrid] CSE emitted no LdReg for a repeated grid sample  BAD\n");
+                ok = false;
+            }
+            // Bit-identical, not merely close: the whole safety argument for CSE is that
+            // a register load reproduces the recomputation exactly.
+            int bad = 0;
+            for (int i = 0; i < 64; ++i) {
+                PatCtx c;
+                c.u = -0.4 + i * 0.03; c.v = 2.6 - i * 0.06;      // straddles both domains
+                patBindTables(c, &tabs);
+                double v0 = patternEval(base.data(), (int)base.size(), c);
+                double v1 = patternEval(opt.data(),  (int)opt.size(),  c);
+                if (std::memcmp(&v0, &v1, sizeof v0) != 0) ++bad;
+            }
+            ok &= chk("(h) CSE'd grid program bit-identical", (double)bad, 0.0, 0.0);
+            // No tables => must decline, leaving the program byte-for-byte untouched.
+            std::vector<PatNode> none = base;
+            patternOptimizeCSE(none, nullptr);
+            if (none.size() != base.size()) {
+                std::printf("[checkgrid] CSE rewrote a grid program with no tables in hand "
+                            "(%zu -> %zu)  BAD\n", base.size(), none.size());
+                ok = false;
+            }
+        }
+    }
+
     std::printf("[checkgrid] worst absolute error = %.3g\n", worst);
     std::printf("[checkgrid] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Deterministic vector-noise self-test (`-checkvnoise`): povDNoise / povDTurbulence
+// (pov_noise.h) and their pattern-VM surface dnoisex/y/z, dturbx/y/z (O2 — domain
+// warping). Six sections, deliberately complementary (mutation-tested by hand:
+// breaking the Y/Z record stride fails §2 while §1 still passes; dropping DTurb's
+// lambda update fails §3 only):
+//   §1 X-component cross-check: povNoise gen 1 IS DNoise[0] + 0.5 clamped to [0,1]
+//      (same corners, same order, same INCRSUMP) — so the trusted scalar port pins
+//      component X bit-for-bit.
+//   §2 all three components vs an independent straight-line re-derivation from
+//      g_povRTable (explicit corner loop, no macros) — this is what guards the
+//      +8/+16 component record stride that §1 cannot see.
+//   §3 DTurbulence identities: octaves 1 == DNoise bit-for-bit; octaves 3 == the
+//      hand-summed omega/lambda series; the octave clamp [1,10] actually clamps.
+//   §4 the compile path: dnoisex/y/z arity 3, dturbx/y/z arity 6, wrong arity is a
+//      compile error, and the VM result equals the direct call.
+//   §5 CSE: two identical dnoisex subtrees share (program shrinks, value identical);
+//      dnoisex vs dnoisey do NOT merge (the component payload keys the node).
+//   §6 sanity: components are mutually distinct, bounded, and non-constant.
+static int checkVNoise() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkvnoise] %-40s got %.12g want %.12g  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    // Deterministic probe points: a fixed LCG, points spanning cells, negative
+    // coordinates (the JB lattice fix), and fractional positions.
+    uint64_t rng = 0x9e3779b97f4a7c15ull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+    const int NPTS = 4096;
+    std::vector<double> px(NPTS), py(NPTS), pz(NPTS);
+    for (int i = 0; i < NPTS; ++i) {
+        px[i] = (frand() - 0.5) * 40.0;
+        py[i] = (frand() - 0.5) * 40.0;
+        pz[i] = (frand() - 0.5) * 40.0;
+    }
+
+    // ---- §1: DNoise[0] + 0.5, clamped, IS povNoise gen 1 (bit-for-bit) -------
+    {
+        double worst1 = 0.0;
+        for (int i = 0; i < NPTS; ++i) {
+            double v[3]; povDNoise(px[i], py[i], pz[i], v);
+            double x = v[0] + 0.5;
+            if (x < 0.0) x = 0.0;
+            if (x > 1.0) x = 1.0;
+            double w = povNoise(px[i], py[i], pz[i], 1);
+            worst1 = std::fmax(worst1, std::fabs(x - w));
+        }
+        ok &= chk("S1 DNoise[0]+0.5 == povNoise gen1 (max err)", worst1, 0.0, 0.0);
+    }
+
+    // ---- §2: all components vs an independent re-derivation ------------------
+    // Straight-line reference: explicit corner loop over the same lattice, gradient
+    // record for component c read at RTable index (hash&0xFF)*2 + 8*c, fields at
+    // +1 (the value/2 bias), +2, +4, +6 — written WITHOUT the POVINCR/POVH macros
+    // so a macro or stride bug in the shipped path cannot also be in the reference.
+    {
+        double worst2 = 0.0;
+        for (int i = 0; i < NPTS; ++i) {
+            double x = px[i], y = py[i], z = pz[i];
+            const double EPS = 1.0e-10;
+            int tmp;
+            tmp = (x >= 0) ? (int)x : (int)(x - (1 - EPS));
+            int ix = (int)((tmp + 10000) & 0xFFF); double fx = x - tmp;
+            tmp = (y >= 0) ? (int)y : (int)(y - (1 - EPS));
+            int iy = (int)((tmp + 10000) & 0xFFF); double fy = y - tmp;
+            tmp = (z >= 0) ? (int)z : (int)(z - (1 - EPS));
+            int iz = (int)((tmp + 10000) & 0xFFF); double fz = z - tmp;
+            double sx = povSCurve(fx), sy = povSCurve(fy), sz = povSCurve(fz);
+            double ref[3] = {0, 0, 0};
+            for (int c8 = 0; c8 < 8; ++c8) {
+                int bx = c8 & 1, by = (c8 >> 1) & 1, bz = (c8 >> 2) & 1;
+                double wx = bx ? sx : 1.0 - sx;
+                double wy = by ? sy : 1.0 - sy;
+                double wz = bz ? sz : 1.0 - sz;
+                double dx = bx ? fx - 1.0 : fx;
+                double dy = by ? fy - 1.0 : fy;
+                double dz = bz ? fz - 1.0 : fz;
+                int h2 = g_povHash[(int)(g_povHash[(int)(ix + bx)] ^ (iy + by))];
+                int base = (g_povHash[(int)h2 ^ (iz + bz)] & 0xFF) * 2;
+                double w = wx * wy * wz;
+                for (int c = 0; c < 3; ++c) {
+                    const double* mp = &g_povRTable[base + 8 * c];
+                    ref[c] += w * (mp[1] + mp[2] * dx + mp[4] * dy + mp[6] * dz);
+                }
+            }
+            double v[3]; povDNoise(x, y, z, v);
+            for (int c = 0; c < 3; ++c)
+                worst2 = std::fmax(worst2, std::fabs(v[c] - ref[c]));
+        }
+        // The reference sums corners in the same order but groups weights
+        // differently (wx*wy*wz vs txty*tz), so allow rounding-level slack.
+        ok &= chk("S2 DNoise xyz vs independent ref (max err)", worst2, 0.0, 1e-12);
+    }
+
+    // ---- §3: DTurbulence identities ------------------------------------------
+    {
+        double w1 = 0.0, w3 = 0.0, wc = 0.0;
+        for (int i = 0; i < 256; ++i) {
+            double dn[3], t1[3], t3[3], tc0[3], tc99[3], tref1[3], tref10[3];
+            povDNoise(px[i], py[i], pz[i], dn);
+            povDTurbulence(px[i], py[i], pz[i], 1, 2.0, 0.5, t1);
+            for (int c = 0; c < 3; ++c) w1 = std::fmax(w1, std::fabs(t1[c] - dn[c]));
+            // octaves 3, lambda 1.7, omega 0.4: DN(p) + 0.4*DN(1.7p) + 0.16*DN(2.89p)
+            povDTurbulence(px[i], py[i], pz[i], 3, 1.7, 0.4, t3);
+            double a[3], b[3], c3[3];
+            povDNoise(px[i], py[i], pz[i], a);
+            povDNoise(px[i] * 1.7, py[i] * 1.7, pz[i] * 1.7, b);
+            povDNoise(px[i] * 1.7 * 1.7, py[i] * 1.7 * 1.7, pz[i] * 1.7 * 1.7, c3);
+            for (int c = 0; c < 3; ++c) {
+                double want = a[c] + 0.4 * b[c] + 0.4 * 0.4 * c3[c];
+                w3 = std::fmax(w3, std::fabs(t3[c] - want));
+            }
+            // clamp: octaves 0 -> 1, octaves 99 -> 10
+            povDTurbulence(px[i], py[i], pz[i], 0, 2.0, 0.5, tc0);
+            povDTurbulence(px[i], py[i], pz[i], 1, 2.0, 0.5, tref1);
+            povDTurbulence(px[i], py[i], pz[i], 99, 2.0, 0.5, tc99);
+            povDTurbulence(px[i], py[i], pz[i], 10, 2.0, 0.5, tref10);
+            for (int c = 0; c < 3; ++c) {
+                wc = std::fmax(wc, std::fabs(tc0[c] - tref1[c]));
+                wc = std::fmax(wc, std::fabs(tc99[c] - tref10[c]));
+            }
+        }
+        ok &= chk("S3 DTurb octaves=1 == DNoise (max err)", w1, 0.0, 0.0);
+        ok &= chk("S3 DTurb octaves=3 == hand sum (max err)", w3, 0.0, 1e-12);
+        ok &= chk("S3 DTurb octave clamp [1,10] (max err)", wc, 0.0, 0.0);
+    }
+
+    // ---- §4: the compile path -------------------------------------------------
+    {
+        struct Case { const char* expr; int comp; bool turb; };
+        const Case cases[] = {
+            {"dnoisex(x, y, z)", 0, false}, {"dnoisey(x, y, z)", 1, false},
+            {"dnoisez(x, y, z)", 2, false},
+            {"dturbx(x, y, z, 6, 2, 0.5)", 0, true},
+            {"dturby(x, y, z, 6, 2, 0.5)", 1, true},
+            {"dturbz(x, y, z, 6, 2, 0.5)", 2, true},
+        };
+        for (const Case& cs : cases) {
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(cs.expr, prog, perr)) {
+                std::printf("[checkvnoise] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+                ok = false; continue;
+            }
+            double wv = 0.0;
+            for (int i = 0; i < 256; ++i) {
+                PatCtx c = makePatCtx(Vec3{px[i], py[i], pz[i]}, 0.0, Vec3{0, 0, 1});
+                double got = patternEval(prog.data(), (int)prog.size(), c);
+                double v[3];
+                if (cs.turb) povDTurbulence(px[i], py[i], pz[i], 6, 2.0, 0.5, v);
+                else         povDNoise(px[i], py[i], pz[i], v);
+                wv = std::fmax(wv, std::fabs(got - v[cs.comp]));
+            }
+            char lbl[80]; std::snprintf(lbl, sizeof lbl, "S4 VM `%s` == direct", cs.expr);
+            ok &= chk(lbl, wv, 0.0, 0.0);
+        }
+        const char* bads[] = {
+            "dnoisex(x, y)",            // arity 3, given 2
+            "dnoisex(x, y, z, 1)",      // arity 3, given 4
+            "dturbx(x, y, z)",          // arity 6, given 3
+            "dnoise(x, y, z)",          // no unsuffixed spelling
+        };
+        for (const char* be : bads) {
+            std::vector<PatNode> prog; std::string perr;
+            if (compilePatternExpr(be, prog, perr)) {
+                std::printf("[checkvnoise] `%s` compiled but should be rejected  BAD\n", be);
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §5: CSE shares identical calls, and the component keys the node ------
+    {
+        std::vector<PatNode> same, sameOpt, mixed, mixedOpt; std::string perr;
+        ok &= compilePatternExpr("dnoisex(x, y, z) + dnoisex(x, y, z)", same, perr);
+        ok &= compilePatternExpr("dnoisex(x, y, z) + dnoisey(x, y, z)", mixed, perr);
+        sameOpt = same;  patternOptimizeCSE(sameOpt);
+        mixedOpt = mixed; patternOptimizeCSE(mixedOpt);
+        if (sameOpt.size() >= same.size()) {
+            std::printf("[checkvnoise] CSE did not shrink `dnoisex + dnoisex` (%zu -> %zu)  BAD\n",
+                        same.size(), sameOpt.size());
+            ok = false;
+        }
+        double wv = 0.0;
+        for (int i = 0; i < 256; ++i) {
+            PatCtx c = makePatCtx(Vec3{px[i], py[i], pz[i]}, 0.0, Vec3{0, 0, 1});
+            double v[3]; povDNoise(px[i], py[i], pz[i], v);
+            wv = std::fmax(wv, std::fabs(patternEval(sameOpt.data(),  (int)sameOpt.size(),  c) - 2.0 * v[0]));
+            wv = std::fmax(wv, std::fabs(patternEval(mixedOpt.data(), (int)mixedOpt.size(), c) - (v[0] + v[1])));
+        }
+        ok &= chk("S5 CSE'd programs evaluate right (max err)", wv, 0.0, 0.0);
+    }
+
+    // ---- §6: components are distinct, bounded, non-constant -------------------
+    {
+        double maxAbs = 0.0, meanSep = 0.0, varX = 0.0, meanX = 0.0;
+        for (int i = 0; i < NPTS; ++i) {
+            double v[3]; povDNoise(px[i], py[i], pz[i], v);
+            for (int c = 0; c < 3; ++c) maxAbs = std::fmax(maxAbs, std::fabs(v[c]));
+            meanSep += std::fabs(v[0] - v[1]) + std::fabs(v[1] - v[2]);
+            meanX   += v[0];
+        }
+        meanSep /= NPTS; meanX /= NPTS;
+        for (int i = 0; i < NPTS; ++i) {
+            double v[3]; povDNoise(px[i], py[i], pz[i], v);
+            varX += (v[0] - meanX) * (v[0] - meanX);
+        }
+        varX /= NPTS;
+        if (maxAbs > 2.0) { std::printf("[checkvnoise] |component| ran to %.3g (>2)  BAD\n", maxAbs); ok = false; }
+        if (meanSep < 0.01) { std::printf("[checkvnoise] components nearly identical (mean sep %.3g) — stride bug?  BAD\n", meanSep); ok = false; }
+        if (varX < 1e-4) { std::printf("[checkvnoise] component X nearly constant (var %.3g)  BAD\n", varX); ok = false; }
+    }
+
+    std::printf("[checkvnoise] worst absolute error = %.3g\n", worst);
+    std::printf("[checkvnoise] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Worley / cellular noise self-test (src/worley.h: patWorley; src/pattern.h:
+// PatOp::Worley, reached from a pattern expression as worley / worley2 /
+// worleyd / worleyid). Validates, with no scene and no renderer:
+//   §1 EXACTNESS: F1/F2/id against a ±6-block (13^3 = 2197 cells) brute force
+//      with no early-out and independently written floor/min logic, all three
+//      metrics, id exact and F1/F2 to 1e-12. The block is provably sufficient:
+//      cells beyond ring 6 lie >= 6 away in every metric, while F2 within the
+//      always-populated 3x3x3 block is <= 6 (its Manhattan diameter). This is
+//      the section that catches a broken ring enumeration, a too-eager
+//      early-out ((r-1) >= f1 instead of f2), truncation-instead-of-floor at
+//      negative coordinates, and id taken from the wrong cell.
+//   §2 metric ordering: Chebyshev <= Euclidean <= Manhattan holds per point
+//      pair, and order statistics are monotone, so F1 AND F2 obey the same
+//      chain (the feature points don't depend on the metric). A metric index
+//      mixup, or a Chebyshev max written as a min, flips an inequality.
+//   §3 hard invariants: 0 <= F1 <= F2 < inf, id in [0,1), and the per-metric F1
+//      caps from the query's own cell always holding a point: sqrt(3) / 3 / 1.
+//   §4 continuity: F1 and F2 are 1-Lipschitz (k-th smallest of distances to one
+//      fixed global point set), so an eps axis step moves them by <= eps under
+//      every metric. The steps straddle integer cell walls at negative AND
+//      positive coordinates — the classic truncation bug teleports the search
+//      neighbourhood there and jumps F1 by O(1).
+//   §5 the compile path: worley/worley2/worleyd/worleyid == the direct call
+//      (output-selector payload, F2-F1 wiring), the metric operand rounding to
+//      nearest and clamping to [0,2]; wrong arity and unknown names reject.
+//   §6 CSE: identical calls collapse; worley vs worley2 on the same arguments
+//      must NOT (the output selector lives in the payload and keys the node).
+//   §7 distribution sanity: Euclidean F1 mean in [0.4, 0.9] (theory ~0.65),
+//      >= 256 distinct ids in 4096 draws, |corr(F1, id)| < 0.1.
+static int checkWorley() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkworley] %-40s got %.12g want %.12g  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    // Deterministic probe points: fixed LCG, spanning ±20 so cells at negative
+    // coordinates (the floor-vs-truncation trap) are exercised throughout.
+    uint64_t rng = 0x2545F4914F6CDD1Dull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+    const int NPTS = 4096;
+    std::vector<double> px(NPTS), py(NPTS), pz(NPTS);
+    for (int i = 0; i < NPTS; ++i) {
+        px[i] = (frand() - 0.5) * 40.0;
+        py[i] = (frand() - 0.5) * 40.0;
+        pz[i] = (frand() - 0.5) * 40.0;
+    }
+
+    // ---- §1: exact F1/F2/id vs a ±6-block brute force (no early-out) ---------
+    // The reference enumerates a fixed 13^3 raster with its own floor and its
+    // own two-slot min tracking; only the cell hash chain (the noise's
+    // *definition*) is shared. F1/F2 tolerance 1e-12 (identical expression
+    // shapes; the slack only covers compiler scheduling/FMA differences between
+    // the two loops), id compared exactly — a selection flip would need two
+    // feature points at bit-identical distance.
+    {
+        double w1 = 0.0, w2 = 0.0, wid = 0.0;
+        for (int m = 0; m < 3; ++m)
+            for (int i = 0; i < NPTS; ++i) {
+                const double x = px[i], y = py[i], z = pz[i];
+                const int bx = (int)std::floor(x), by = (int)std::floor(y),
+                          bz = (int)std::floor(z);
+                double best1 = 1e300, best2 = 1e300, bestId = 0.0;
+                for (int cz = bz - 6; cz <= bz + 6; ++cz)
+                for (int cy = by - 6; cy <= by + 6; ++cy)
+                for (int cx = bx - 6; cx <= bx + 6; ++cx) {
+                    const unsigned int h1 = patWorleyCellHash(cx, cy, cz);
+                    const unsigned int h2 = patWorleyMix(h1 + 0x9e3779b9u);
+                    const unsigned int h3 = patWorleyMix(h2 + 0x9e3779b9u);
+                    const double fpx = (double)cx + (double)h1 * (1.0 / 4294967296.0);
+                    const double fpy = (double)cy + (double)h2 * (1.0 / 4294967296.0);
+                    const double fpz = (double)cz + (double)h3 * (1.0 / 4294967296.0);
+                    const double dx = x - fpx, dy = y - fpy, dz = z - fpz;
+                    double d;
+                    if (m == 1)      d = std::fabs(dx) + std::fabs(dy) + std::fabs(dz);
+                    else if (m == 2) d = std::fmax(std::fabs(dx), std::fmax(std::fabs(dy), std::fabs(dz)));
+                    else             d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (d < best1) {
+                        best2 = best1; best1 = d;
+                        bestId = (double)patWorleyMix(h3 + 0x9e3779b9u) * (1.0 / 4294967296.0);
+                    } else if (d < best2) {
+                        best2 = d;
+                    }
+                }
+                double w[3]; patWorley(x, y, z, m, w);
+                w1  = std::fmax(w1,  std::fabs(w[0] - best1));
+                w2  = std::fmax(w2,  std::fabs(w[1] - best2));
+                wid = std::fmax(wid, std::fabs(w[2] - bestId));
+            }
+        ok &= chk("S1 F1 vs brute force, all metrics", w1, 0.0, 1e-12);
+        ok &= chk("S1 F2 vs brute force, all metrics", w2, 0.0, 1e-12);
+        ok &= chk("S1 id vs brute force, all metrics", wid, 0.0, 0.0);
+    }
+
+    // ---- §2: metric ordering (same feature points, ordered metrics) ----------
+    {
+        double viol = 0.0;
+        for (int i = 0; i < NPTS; ++i) {
+            double we[3], wm[3], wc[3];
+            patWorley(px[i], py[i], pz[i], 0, we);
+            patWorley(px[i], py[i], pz[i], 1, wm);
+            patWorley(px[i], py[i], pz[i], 2, wc);
+            viol = std::fmax(viol, wc[0] - we[0]);   // cheb F1 <= eucl F1
+            viol = std::fmax(viol, we[0] - wm[0]);   // eucl F1 <= manh F1
+            viol = std::fmax(viol, wc[1] - we[1]);   // same chain for F2
+            viol = std::fmax(viol, we[1] - wm[1]);
+        }
+        ok &= chk("S2 F1/F2 metric ordering (max violation)", viol, 0.0, 0.0);
+    }
+
+    // ---- §3: hard invariants -------------------------------------------------
+    {
+        const double cap[3] = { 1.7320508075688774, 3.0, 1.0 };   // sqrt(3), L1, Linf cell diagonal
+        bool inv = true;
+        for (int m = 0; m < 3 && inv; ++m)
+            for (int i = 0; i < NPTS && inv; ++i) {
+                double w[3]; patWorley(px[i], py[i], pz[i], m, w);
+                if (!(w[0] >= 0.0) || !(w[1] >= w[0]) || !(w[1] < 1e300) ||
+                    !(w[2] >= 0.0) || !(w[2] < 1.0) || !(w[0] <= cap[m])) {
+                    std::printf("[checkworley] S3 invariant broken (metric %d, pt %d): "
+                                "F1=%.17g F2=%.17g id=%.17g  BAD\n", m, i, w[0], w[1], w[2]);
+                    inv = false; ok = false;
+                }
+            }
+        if (inv) ok &= chk("S3 0<=F1<=F2, id in [0,1), F1 caps", 0.0, 0.0, 0.0);
+    }
+
+    // ---- §4: 1-Lipschitz continuity across cell walls ------------------------
+    {
+        const double eps = 1e-3;
+        double wl = 0.0;
+        for (int m = 0; m < 3; ++m)
+            for (int axis = 0; axis < 3; ++axis)
+                for (int i = 0; i < 512; ++i) {
+                    double p[3] = { (frand() - 0.5) * 40.0,
+                                    (frand() - 0.5) * 40.0,
+                                    (frand() - 0.5) * 40.0 };
+                    // snap this axis to straddle the nearest integer plane
+                    p[axis] = std::floor(p[axis] + 0.5) - eps * 0.5;
+                    double q[3] = { p[0], p[1], p[2] };
+                    q[axis] += eps;
+                    double wa[3], wb[3];
+                    patWorley(p[0], p[1], p[2], m, wa);
+                    patWorley(q[0], q[1], q[2], m, wb);
+                    wl = std::fmax(wl, std::fabs(wa[0] - wb[0]));
+                    wl = std::fmax(wl, std::fabs(wa[1] - wb[1]));
+                }
+        ok &= chk("S4 F1/F2 step > eps across cell walls", std::fmax(wl - eps, 0.0), 0.0, 1e-12);
+    }
+
+    // ---- §5: the compile path ------------------------------------------------
+    {
+        struct Case { const char* expr; int metric; int sel; };
+        const Case cases[] = {
+            {"worley(x, y, z, 0)",   0, 0}, {"worley(x, y, z, 1)",   1, 0},
+            {"worley(x, y, z, 2)",   2, 0}, {"worley2(x, y, z, 0)",  0, 1},
+            {"worleyd(x, y, z, 1)",  1, 2}, {"worleyid(x, y, z, 2)", 2, 3},
+            // the metric operand is runtime: round to nearest, clamp to [0,2]
+            {"worley(x, y, z, 0.4)", 0, 0}, {"worley(x, y, z, 1.6)", 2, 0},
+            {"worley(x, y, z, -9)",  0, 0}, {"worley(x, y, z, 99)",  2, 0},
+        };
+        for (const Case& cs : cases) {
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(cs.expr, prog, perr)) {
+                std::printf("[checkworley] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+                ok = false; continue;
+            }
+            double wv = 0.0;
+            for (int i = 0; i < 256; ++i) {
+                PatCtx c = makePatCtx(Vec3{px[i], py[i], pz[i]}, 0.0, Vec3{0, 0, 1});
+                double got = patternEval(prog.data(), (int)prog.size(), c);
+                double w[3]; patWorley(px[i], py[i], pz[i], cs.metric, w);
+                double want = (cs.sel == 3) ? w[2] : (cs.sel == 2) ? (w[1] - w[0]) : w[cs.sel];
+                wv = std::fmax(wv, std::fabs(got - want));
+            }
+            char lbl[80]; std::snprintf(lbl, sizeof lbl, "S5 VM `%s` == direct", cs.expr);
+            ok &= chk(lbl, wv, 0.0, 0.0);
+        }
+        const char* bads[] = {
+            "worley(x, y, z)",         // arity 4, given 3
+            "worley(x, y, z, 0, 1)",   // arity 4, given 5
+            "worleyf(x, y, z, 0)",     // no such spelling
+        };
+        for (const char* be : bads) {
+            std::vector<PatNode> prog; std::string perr;
+            if (compilePatternExpr(be, prog, perr)) {
+                std::printf("[checkworley] `%s` compiled but should be rejected  BAD\n", be);
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §6: CSE shares identical calls; the output selector keys the node ---
+    {
+        std::vector<PatNode> same, sameOpt, mixed, mixedOpt; std::string perr;
+        ok &= compilePatternExpr("worley(x, y, z, 0) + worley(x, y, z, 0)", same, perr);
+        ok &= compilePatternExpr("worley(x, y, z, 0) + worley2(x, y, z, 0)", mixed, perr);
+        sameOpt = same;   patternOptimizeCSE(sameOpt);
+        mixedOpt = mixed; patternOptimizeCSE(mixedOpt);
+        if (sameOpt.size() >= same.size()) {
+            std::printf("[checkworley] CSE did not shrink `worley + worley` (%zu -> %zu)  BAD\n",
+                        same.size(), sameOpt.size());
+            ok = false;
+        }
+        double wv = 0.0;
+        for (int i = 0; i < 256; ++i) {
+            PatCtx c = makePatCtx(Vec3{px[i], py[i], pz[i]}, 0.0, Vec3{0, 0, 1});
+            double w[3]; patWorley(px[i], py[i], pz[i], 0, w);
+            // if the payload were left out of the CSE key, `worley + worley2`
+            // would collapse to 2*F1 and miss (F1 + F2) here
+            wv = std::fmax(wv, std::fabs(patternEval(sameOpt.data(),  (int)sameOpt.size(),  c) - 2.0 * w[0]));
+            wv = std::fmax(wv, std::fabs(patternEval(mixedOpt.data(), (int)mixedOpt.size(), c) - (w[0] + w[1])));
+        }
+        ok &= chk("S6 CSE'd programs evaluate right (max err)", wv, 0.0, 0.0);
+    }
+
+    // ---- §7: distribution sanity ---------------------------------------------
+    {
+        double meanF1 = 0.0, meanId = 0.0;
+        std::vector<double> ids(NPTS), f1s(NPTS);
+        for (int i = 0; i < NPTS; ++i) {
+            double w[3]; patWorley(px[i], py[i], pz[i], 0, w);
+            f1s[i] = w[0]; ids[i] = w[2];
+            meanF1 += w[0]; meanId += w[2];
+        }
+        meanF1 /= NPTS; meanId /= NPTS;
+        if (meanF1 < 0.4 || meanF1 > 0.9) {
+            std::printf("[checkworley] S7 Euclid F1 mean %.4f outside [0.4, 0.9]  BAD\n", meanF1);
+            ok = false;
+        }
+        std::vector<double> sorted = ids;
+        std::sort(sorted.begin(), sorted.end());
+        int distinct = 1;
+        for (int i = 1; i < NPTS; ++i) if (sorted[i] != sorted[i - 1]) ++distinct;
+        if (distinct < 256) {
+            std::printf("[checkworley] S7 only %d distinct ids in %d draws  BAD\n", distinct, NPTS);
+            ok = false;
+        }
+        double cov = 0.0, vf = 0.0, vi = 0.0;
+        for (int i = 0; i < NPTS; ++i) {
+            cov += (f1s[i] - meanF1) * (ids[i] - meanId);
+            vf  += (f1s[i] - meanF1) * (f1s[i] - meanF1);
+            vi  += (ids[i] - meanId) * (ids[i] - meanId);
+        }
+        double corr = cov / std::sqrt(vf * vi + 1e-300);
+        ok &= chk("S7 |corr(F1, id)| < 0.1", std::fmax(std::fabs(corr) - 0.1, 0.0), 0.0, 0.0);
+    }
+
+    std::printf("[checkworley] worst absolute error = %.3g\n", worst);
+    std::printf("[checkworley] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Gabor / anisotropic band-limited noise self-test (src/gabor.h: patGaborRaw,
+// patGabor, patGaborCosTurns; src/pattern.h: PatOp::Gabor, reached from a pattern
+// expression as `gabor(x, y, z, f, wx, wy, wz)`). O4. No scene, no renderer.
+//
+//   §1 the 3x3x3 neighbourhood is EXACT, not the usual 95%-of-a-Gaussian
+//      approximation: a +-4-block brute force (its own floor, its own Poisson draw,
+//      its own accumulation) must reproduce patGaborRaw BIT for bit, and no impulse
+//      in a cell two or more rings out may land inside the unit support at all.
+//   §2 the hand-rolled cosine: within 1e-14 of libm's cos(2*pi*t) over +-4096 turns,
+//      exactly even, and exactly 1-periodic in turns. It exists because libm `cos` is
+//      not correctly rounded and CUDA's differs from the host's, which would break the
+//      backend-identical contract; so it has to be verified against libm, not used
+//      from it.
+//   §3 the ANALYTIC normalisation: mean 0 and variance lambda/3 * 1/2 * INT E^2 =
+//      0.28566907, independently of the frequency and the steering direction. The
+//      f-independence is the whole reason each impulse carries a random phase, so it
+//      is checked at f = 0, 0.5, 2, 8 and for the isotropic fallback.
+//   §4 the [0,1] shading mapping: in range, mean 0.5, and the 3-sigma scale clips
+//      under 1% of samples.
+//   §5 ANISOTROPY: along the steering direction the field crosses zero at ~2f per unit
+//      (the mean crossing rate of a process centred at frequency f); across it, at the
+//      envelope's own rate, which is smaller by the whole ratio f.
+//   §6 NO POSITIONAL SHEAR — the O4 point. With a direction field that VARIES in
+//      space, the local frequency stays f whether the shading point is at the origin
+//      or 3000 units away, because a kernel only ever sees the offset from its own
+//      centre: the residual is (dw/dp).u with |u| <= 1, not O(|p|) as it is for
+//      `noise(R(p) * p)`.
+//   §7 EXACT stationarity. Per-cell Poisson(lambda) points uniform in the cell IS a
+//      homogeneous Poisson process, so the statistics do not know where the cells are:
+//      the variance is the same sampled on the integer lattice and off it. Lattice
+//      value noise fails that badly (on-lattice it is the raw hash, mid-cell it is an
+//      average of eight), and the test asserts that contrast so it cannot pass
+//      vacuously.
+//   §8 continuity across cell walls (the C2 envelope and the search boundary).
+//   §9 the compile path (VM == direct call, zero direction == isotropic, bad arity and
+//      unknown spellings rejected) and CSE (identical calls collapse, a different
+//      frequency does not).
+static int checkGabor() {
+    double worst = 0.0;
+    bool ok = true;
+    // `worst` tracks only the EXACT checks (tol <= 1e-12); the statistical sections
+    // deviate by design and would otherwise swamp the report.
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (tol <= 1e-12 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkgabor] %-46s got %.12g want %.12g  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+    const double VAR_WANT = 0.28566907466;   // lambda/3 * 1/2 * 4*pi*1024/45045, lambda = 6
+
+    // ---- §1: 3x3x3 is exact, vs a ±4-block brute force -----------------------
+    {
+        double wd = 0.0;
+        long long outside = 0, impulses = 0;
+        for (int i = 0; i < 384; ++i) {
+            const double x = (frand() - 0.5) * 60.0;
+            const double y = (frand() - 0.5) * 60.0;
+            const double z = (frand() - 0.5) * 60.0;
+            const double f = 0.5 + 4.0 * frand();
+            const double wx = frand() * 2.0 - 1.0, wy = frand() * 2.0 - 1.0,
+                         wz = frand() * 2.0 - 1.0;
+            const double inv = 1.0 / std::sqrt(wx * wx + wy * wy + wz * wz);
+            const double ox = wx * inv, oy = wy * inv, oz = wz * inv;
+            const int bx = (int)std::floor(x), by = (int)std::floor(y),
+                      bz = (int)std::floor(z);
+            double acc = 0.0;
+            for (int dz = -4; dz <= 4; ++dz)
+            for (int dy = -4; dy <= 4; ++dy)
+            for (int dx = -4; dx <= 4; ++dx) {
+                const int cx = bx + dx, cy = by + dy, cz = bz + dz;
+                const unsigned int h0 = patGaborCellHash(cx, cy, cz);
+                int n = 0;                              // independent Poisson draw
+                {
+                    double p = 1.0;
+                    unsigned int hc = patGaborMix(h0 ^ 0x2f6a5d21u);
+                    while (true) {
+                        p *= (double)hc * (1.0 / 4294967296.0);
+                        if (p <= std::exp(-PAT_GABOR_LAMBDA)) break;
+                        if (++n >= PAT_GABOR_NMAX) break;
+                        hc = patGaborMix(hc + 0x9e3779b9u);
+                    }
+                }
+                const int ring = std::max(std::abs(dx), std::max(std::abs(dy), std::abs(dz)));
+                for (int k = 0; k < n; ++k) {
+                    const unsigned int hb = patGaborMix(h0 + 0x9e3779b9u * (unsigned int)(k + 1));
+                    const double fx = (double)cx + (double)patGaborMix(hb + 0x85ebca6bu) * (1.0 / 4294967296.0);
+                    const double fy = (double)cy + (double)patGaborMix(hb + 0xc2b2ae35u) * (1.0 / 4294967296.0);
+                    const double fz = (double)cz + (double)patGaborMix(hb + 0x27d4eb2fu) * (1.0 / 4294967296.0);
+                    const double ux = x - fx, uy = y - fy, uz = z - fz;
+                    const double d2 = ux * ux + uy * uy + uz * uz;
+                    ++impulses;
+                    if (d2 >= 1.0) continue;
+                    if (ring > 1) { ++outside; continue; }   // would be MISSED by 3x3x3
+                    const double e1 = 1.0 - d2, env = e1 * e1 * e1;
+                    const double w  = (double)patGaborMix(hb + 0x165667b1u) * (2.0 / 4294967296.0) - 1.0;
+                    const double ph = (double)patGaborMix(hb + 0x9e3779b1u) * (1.0 / 4294967296.0);
+                    acc += w * env * patGaborCosTurns(f * (ux * ox + uy * oy + uz * oz) + ph);
+                }
+            }
+            wd = std::fmax(wd, std::fabs(acc - patGaborRaw(x, y, z, f, wx, wy, wz)));
+        }
+        ok &= chk("S1 impulses inside support beyond ring 1", (double)outside, 0.0, 0.0);
+        ok &= chk("S1 field vs ±4-block brute force", wd, 0.0, 0.0);
+        if (impulses < 100000) {   // the brute force must actually have drawn something
+            std::printf("[checkgabor] S1 only %lld impulses drawn — test is vacuous  BAD\n", impulses);
+            ok = false;
+        }
+    }
+
+    // ---- §2: the hand-rolled cos(2*pi*t) -------------------------------------
+    {
+        double wc = 0.0, wodd = 0.0, wper = 0.0;
+        const double TAU = 6.283185307179586476925286766559;
+        // The reference reduces in TURNS first (`t - floor(t + 0.5)` is exact) and only
+        // then multiplies by 2*pi. Handing libm the unreduced `TAU * t` instead would
+        // measure ITS argument error rather than ours: at 4096 turns that product
+        // already carries ~3e-12 of rounding, 300x the discrepancy being looked for.
+        // Large arguments are covered by the exact-periodicity check.
+        for (int i = 0; i < 20000; ++i) {
+            const double t  = (frand() - 0.5) * 8192.0;
+            const double tr = t - std::floor(t + 0.5);
+            wc   = std::fmax(wc,   std::fabs(patGaborCosTurns(t) - std::cos(TAU * tr)));
+            wodd = std::fmax(wodd, std::fabs(patGaborCosTurns(t) - patGaborCosTurns(-t)));
+            wper = std::fmax(wper, std::fabs(patGaborCosTurns(t) - patGaborCosTurns(t + 64.0)));
+        }
+        // the endpoints, where the folded Taylor series is worked hardest
+        for (int q = 0; q <= 4096; ++q) {
+            const double t = (double)q / 4096.0;
+            wc = std::fmax(wc, std::fabs(patGaborCosTurns(t) - std::cos(TAU * t)));
+        }
+        ok &= chk("S2 cos(2pi t) vs libm", wc, 0.0, 1e-14);
+        ok &= chk("S2 cos is exactly even", wodd, 0.0, 0.0);
+        ok &= chk("S2 cos is exactly 1-periodic in turns", wper, 0.0, 0.0);
+    }
+
+    // ---- §3: moments match the analytic normalisation ------------------------
+    {
+        struct Cfg { double f, wx, wy, wz; const char* lbl; };
+        const Cfg cfgs[] = {
+            {0.0, 1.0, 0.0, 0.0, "f=0   axis"},
+            {0.5, 1.0, 0.0, 0.0, "f=0.5 axis"},
+            {2.0, 0.3, -0.7, 0.5, "f=2   oblique"},
+            {8.0, 0.3, -0.7, 0.5, "f=8   oblique"},
+            {2.0, 0.0, 0.0, 0.0, "f=2   isotropic"},
+        };
+        const int N = 8000;
+        for (const Cfg& c : cfgs) {
+            double s = 0.0, s2 = 0.0;
+            for (int i = 0; i < N; ++i) {
+                const double g = patGaborRaw((frand() - 0.5) * 400.0,
+                                             (frand() - 0.5) * 400.0,
+                                             (frand() - 0.5) * 400.0,
+                                             c.f, c.wx, c.wy, c.wz);
+                s += g; s2 += g * g;
+            }
+            const double mean = s / N, var = s2 / N - mean * mean;
+            char lbl[80];
+            std::snprintf(lbl, sizeof lbl, "S3 %s mean", c.lbl);
+            ok &= chk(lbl, mean, 0.0, 0.05);
+            std::snprintf(lbl, sizeof lbl, "S3 %s variance", c.lbl);
+            ok &= chk(lbl, var, VAR_WANT, 0.09 * VAR_WANT);
+        }
+    }
+
+    // ---- §4: the [0,1] shading mapping ---------------------------------------
+    {
+        const int N = 20000;
+        double s = 0.0; int clipped = 0; bool inRange = true;
+        for (int i = 0; i < N; ++i) {
+            const double x = (frand() - 0.5) * 400.0, y = (frand() - 0.5) * 400.0,
+                         z = (frand() - 0.5) * 400.0;
+            const double g = patGabor(x, y, z, 3.0, 1.0, 0.4, -0.2);
+            if (!(g >= 0.0 && g <= 1.0)) inRange = false;
+            if (g <= 0.0 || g >= 1.0) ++clipped;
+            s += g;
+        }
+        if (!inRange) { std::printf("[checkgabor] S4 patGabor left [0,1]  BAD\n"); ok = false; }
+        ok &= chk("S4 mean of the [0,1] mapping", s / N, 0.5, 0.02);
+        ok &= chk("S4 clip rate", (double)clipped / N, 0.0, 0.01);
+    }
+
+    // Mean zero-crossings per unit length of the raw field along a unit walk
+    // direction. For a process whose spectrum sits at frequency F this is 2F.
+    auto crossRate = [&](double px, double py, double pz,
+                         double ax, double ay, double az,
+                         double f, double wx, double wy, double wz,
+                         double len, int steps) {
+        double prev = patGaborRaw(px, py, pz, f, wx, wy, wz);
+        int cross = 0;
+        for (int s = 1; s <= steps; ++s) {
+            const double t = len * (double)s / (double)steps;
+            const double v = patGaborRaw(px + ax * t, py + ay * t, pz + az * t,
+                                         f, wx, wy, wz);
+            if ((v < 0.0) != (prev < 0.0)) ++cross;
+            prev = v;
+        }
+        return (double)cross / len;
+    };
+
+    // ---- §5: anisotropy -------------------------------------------------------
+    {
+        const double f = 8.0;
+        const double along  = crossRate(3.7, -1.3, 0.9, 1, 0, 0, f, 1, 0, 0, 80.0, 12000);
+        const double across = crossRate(3.7, -1.3, 0.9, 0, 1, 0, f, 1, 0, 0, 80.0, 12000);
+        ok &= chk("S5 crossings/unit along w^ (want 2f)", along, 2.0 * f, 0.2 * 2.0 * f);
+        if (!(across < 0.25 * along)) {
+            std::printf("[checkgabor] S5 across-direction rate %.3f not << along %.3f  BAD\n",
+                        across, along);
+            ok = false;
+        }
+    }
+
+    // ---- §6: no positional shear, with a VARYING direction field --------------
+    {
+        const double f = 6.0;
+        // w^(p) turns slowly with x; over the 30-unit probe it swings ~0.06 rad, and
+        // the kernel-local residual (dw/dp).u is bounded by that rate times ONE cell —
+        // the same bound at the origin and 3000 units out. A rotated-coordinate noise
+        // would instead pick up a term proportional to |p| and shear itself apart.
+        auto wyOf = [](double x) { return 0.35 * std::sin(0.002 * x); };
+        const double nearR = crossRate(0.0, 0.0, 0.0, 1, 0, 0, f, 1, wyOf(0.0), 0, 30.0, 6000);
+        const double farX  = 3000.0;
+        const double farR  = crossRate(farX, -2777.0, 1913.0, 1, 0, 0, f, 1, wyOf(farX), 0, 30.0, 6000);
+        ok &= chk("S6 crossings/unit at |p| ~ 0 (want 2f)",    nearR, 2.0 * f, 0.22 * 2.0 * f);
+        ok &= chk("S6 crossings/unit at |p| ~ 4000 (want 2f)", farR,  2.0 * f, 0.22 * 2.0 * f);
+    }
+
+    // ---- §7: exact stationarity (and the contrast that makes it non-vacuous) --
+    {
+        const double offs[3][3] = { {0.0, 0.0, 0.0}, {0.5, 0.5, 0.5}, {0.137, 0.611, 0.29} };
+        double gv[3], nv[3];
+        for (int o = 0; o < 3; ++o) {
+            double sg = 0.0, sg2 = 0.0, sn = 0.0, sn2 = 0.0;
+            int n = 0;
+            for (int ix = -12; ix <= 12; ++ix)
+            for (int iy = -12; iy <= 12; ++iy)
+            for (int iz = -12; iz <= 12; ++iz) {
+                const double x = (double)ix + offs[o][0];
+                const double y = (double)iy + offs[o][1];
+                const double z = (double)iz + offs[o][2];
+                const double g = patGaborRaw(x, y, z, 2.0, 1.0, 0.0, 0.0);
+                const double v = patValueNoise(x, y, z);
+                sg += g; sg2 += g * g; sn += v; sn2 += v * v; ++n;
+            }
+            gv[o] = sg2 / n - (sg / n) * (sg / n);
+            nv[o] = sn2 / n - (sn / n) * (sn / n);
+        }
+        const double gSpread = (std::fmax(gv[0], std::fmax(gv[1], gv[2])) /
+                                std::fmin(gv[0], std::fmin(gv[1], gv[2]))) - 1.0;
+        const double nSpread = (std::fmax(nv[0], std::fmax(nv[1], nv[2])) /
+                                std::fmin(nv[0], std::fmin(nv[1], nv[2]))) - 1.0;
+        ok &= chk("S7 gabor variance spread over sub-cell offsets", gSpread, 0.0, 0.12);
+        if (!(nSpread > 3.0 * std::fmax(gSpread, 0.02))) {
+            std::printf("[checkgabor] S7 value-noise spread %.3f not >> gabor's %.3f — "
+                        "the test would pass vacuously  BAD\n", nSpread, gSpread);
+            ok = false;
+        }
+    }
+
+    // ---- §8: continuity across cell walls ------------------------------------
+    {
+        const double eps = 1e-6;
+        double wl = 0.0;
+        for (int axis = 0; axis < 3; ++axis)
+            for (int i = 0; i < 400; ++i) {
+                double p[3] = { (frand() - 0.5) * 40.0, (frand() - 0.5) * 40.0,
+                                (frand() - 0.5) * 40.0 };
+                p[axis] = std::floor(p[axis] + 0.5) - eps * 0.5;   // straddle the wall
+                double q[3] = { p[0], p[1], p[2] };
+                q[axis] += eps;
+                wl = std::fmax(wl, std::fabs(patGaborRaw(p[0], p[1], p[2], 4.0, 1, 0.3, -0.2) -
+                                             patGaborRaw(q[0], q[1], q[2], 4.0, 1, 0.3, -0.2)));
+            }
+        ok &= chk("S8 step across a cell wall", wl, 0.0, 1e-3);
+    }
+
+    // ---- §9: the compile path and CSE ----------------------------------------
+    {
+        struct Case { const char* expr; double f, wx, wy, wz; };
+        const Case cases[] = {
+            {"gabor(x, y, z, 2, 1, 0, 0)",          2.0, 1.0, 0.0,  0.0},
+            {"gabor(x, y, z, 5.5, 0.3, -0.7, 0.5)", 5.5, 0.3, -0.7, 0.5},
+            {"gabor(x, y, z, 3, 0, 0, 0)",          3.0, 0.0, 0.0,  0.0},   // isotropic
+            {"gabor(2*x, y, z, 1, nx, ny, nz)",     1.0, 0.0, 0.0,  1.0},   // scaled + normal
+        };
+        for (int ci = 0; ci < (int)(sizeof cases / sizeof cases[0]); ++ci) {
+            const Case& cs = cases[ci];
+            std::vector<PatNode> prog; std::string perr;
+            if (!compilePatternExpr(cs.expr, prog, perr)) {
+                std::printf("[checkgabor] compile `%s` FAILED: %s\n", cs.expr, perr.c_str());
+                ok = false; continue;
+            }
+            double wv = 0.0;
+            for (int i = 0; i < 128; ++i) {
+                const double x = (frand() - 0.5) * 40.0, y = (frand() - 0.5) * 40.0,
+                             z = (frand() - 0.5) * 40.0;
+                PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+                const double got  = patternEval(prog.data(), (int)prog.size(), c);
+                const double want = patGabor(ci == 3 ? 2.0 * x : x, y, z,
+                                             cs.f, cs.wx, cs.wy, cs.wz);
+                wv = std::fmax(wv, std::fabs(got - want));
+            }
+            char lbl[96]; std::snprintf(lbl, sizeof lbl, "S9 VM `%s` == direct", cs.expr);
+            ok &= chk(lbl, wv, 0.0, 0.0);
+        }
+        const char* bads[] = {
+            "gabor(x, y, z, 1, 0, 0)",        // arity 7, given 6
+            "gabor(x, y, z, 1, 0, 0, 0, 0)",  // arity 7, given 8
+            "gabor(x, y, z)",                 // arity 7, given 3
+            "gabour(x, y, z, 1, 1, 0, 0)",    // no such spelling
+        };
+        for (const char* be : bads) {
+            std::vector<PatNode> prog; std::string perr;
+            if (compilePatternExpr(be, prog, perr)) {
+                std::printf("[checkgabor] `%s` compiled but should be rejected  BAD\n", be);
+                ok = false;
+            }
+        }
+        std::vector<PatNode> same, sameOpt, diff, diffOpt; std::string perr;
+        ok &= compilePatternExpr("gabor(x,y,z,2,1,0,0) + gabor(x,y,z,2,1,0,0)", same, perr);
+        ok &= compilePatternExpr("gabor(x,y,z,2,1,0,0) + gabor(x,y,z,3,1,0,0)", diff, perr);
+        sameOpt = same; patternOptimizeCSE(sameOpt);
+        diffOpt = diff; patternOptimizeCSE(diffOpt);
+        if (sameOpt.size() >= same.size()) {
+            std::printf("[checkgabor] CSE did not shrink `gabor + gabor` (%zu -> %zu)  BAD\n",
+                        same.size(), sameOpt.size());
+            ok = false;
+        }
+        double wv = 0.0;
+        for (int i = 0; i < 128; ++i) {
+            const double x = (frand() - 0.5) * 40.0, y = (frand() - 0.5) * 40.0,
+                         z = (frand() - 0.5) * 40.0;
+            PatCtx c = makePatCtx(Vec3{x, y, z}, 0.0, Vec3{0, 0, 1});
+            const double g2 = patGabor(x, y, z, 2.0, 1, 0, 0);
+            const double g3 = patGabor(x, y, z, 3.0, 1, 0, 0);
+            wv = std::fmax(wv, std::fabs(patternEval(sameOpt.data(), (int)sameOpt.size(), c) - 2.0 * g2));
+            wv = std::fmax(wv, std::fabs(patternEval(diffOpt.data(), (int)diffOpt.size(), c) - (g2 + g3)));
+        }
+        ok &= chk("S9 CSE'd programs evaluate right (max err)", wv, 0.0, 0.0);
+    }
+
+    std::printf("[checkgabor] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkgabor] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Deterministic mean-curvature self-test (`-checkcurv`): the `curv` free variable
+// (O3 — non-stationary randomness). Runs with no scene and no renderer.
+//
+// `curv` is mean curvature H = 1/2 * trace(shape operator) in 1/length units, derived
+// once per triangle in Tri::finalize() from the interpolated shading-normal field, and
+// analytically for spheres and curve segments. It is signed RELATIVE TO THE SHADED
+// SIDE: every intersector negates it when it flips the normal to face the ray.
+//
+// What each section is actually defending, and the mutation it catches:
+//   §1 tessellated sphere of radius R -> H == 1/R on every face, and scaling the mesh
+//      by s scales H by 1/s. Curvature is 1/length; a mutation that forgot to divide by
+//      the Gram determinant (or divided by area instead of area^2) would still read
+//      "about right" at R = 1 and blow up everywhere else, so the radius sweep — not the
+//      unit sphere — is the real test.
+//   §2 a flat-shaded triangle (n0==n1==n2==gn) reads EXACTLY 0. dn = 0 there, so any
+//      stray additive term in the trace shows up as a nonzero on a facet.
+//   §3 sign / side, through the real intersectSphere: a ray hitting a sphere from
+//      OUTSIDE reads +1/R, the same sphere hit from INSIDE reads -1/R. This is the only
+//      section that exercises the flip-negation, and it is the one that fails if the
+//      convention is ever "always outward" instead of "relative to the shaded side".
+//   §4 a saddle: vertex normals whose two principal curvatures cancel give H ~ 0 even
+//      though |dn| is large. Tests the TRACE rather than a magnitude — a mutation using
+//      |dn| or sqrt(dn.dn) passes §1 and §5 and dies here.
+//   §5 a cylinder of radius R: H = 1/(2R), not 1/R and not 0. Mean curvature averages
+//      the two principal curvatures (1/R and 0); Gaussian curvature would be 0 here.
+//      Catches a mutated 0.5 factor and catches confusing the two curvature notions.
+//   §6 basis independence: permuting the vertex order and skewing the triangle to a very
+//      non-equilateral shape must not change H. The dual-basis inversion is exactly what
+//      makes this true — the naive dot(e1,dn1)/|e1|^2 + dot(e2,dn2)/|e2|^2 is only right
+//      for an orthogonal edge pair, so this is the section that catches dropping it.
+//   §7 the VM: `curv` compiles in a surface expression and reaches PatCtx.curv, is
+//      REJECTED in an upsample body (a disjoint r/g/b/w vocabulary with no surface), is
+//      visible to patternHasFreeVars (else a curvature-driven material would be constant-
+//      folded at load time into whatever the first hit happened to be), and is CSE-keyed.
+//   §8 a curve segment through the real intersectCurveSeg: a fiber of radius r is a
+//      surface of revolution with H = 1/(2r), which is enormous for hair-scale radii —
+//      the honest answer, and worth pinning so nobody "fixes" it to 1/r.
+static int checkCurv() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkcurv] %-46s got %.12g want %.12g  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+    auto mkTri = [](const Vec3& a, const Vec3& b, const Vec3& c,
+                    const Vec3& na, const Vec3& nb, const Vec3& nc) {
+        Tri t; t.v0 = a; t.v1 = b; t.v2 = c; t.n0 = na; t.n1 = nb; t.n2 = nc;
+        t.finalize(); return t;
+    };
+
+    // ---- §1: tessellated sphere -> H = 1/R, and H scales as 1/R ---------------
+    // Exact analytic vertex normals (n = (p-c)/R), so the interpolated normal field is
+    // the sphere's own and H must be exactly 1/R up to the linearisation error of a
+    // finite facet. That error shrinks with the facet, so the tolerance is relative and
+    // generous rather than tight — the point is the 1/R LAW, checked over 4 decades.
+    {
+        const double radii[] = { 0.01, 0.1, 1.0, 10.0, 100.0 };
+        for (double R : radii) {
+            const int NLAT = 24, NLON = 48;
+            double wrel = 0.0;
+            auto sph = [&](int i, int j) {
+                double th = M_PI * (double)i / (double)NLAT;
+                double ph = 2.0 * M_PI * (double)j / (double)NLON;
+                return Vec3{ std::sin(th) * std::cos(ph), std::cos(th), std::sin(th) * std::sin(ph) };
+            };
+            for (int i = 0; i < NLAT; ++i)
+                for (int j = 0; j < NLON; ++j) {
+                    Vec3 a = sph(i, j), b = sph(i + 1, j), c = sph(i + 1, j + 1);
+                    Tri t = mkTri(a * R, b * R, c * R, a, b, c);
+                    // skip the degenerate slivers at the poles, where a whole edge collapses
+                    if (dot(cross(t.v1 - t.v0, t.v2 - t.v0), cross(t.v1 - t.v0, t.v2 - t.v0))
+                        < 1e-18 * R * R * R * R) continue;
+                    wrel = std::fmax(wrel, std::fabs(t.curvature - 1.0 / R) * R);
+                }
+            char lbl[80];
+            std::snprintf(lbl, sizeof lbl, "S1 sphere R=%g -> H=1/R (relative)", R);
+            ok &= chk(lbl, wrel, 0.0, 2e-3);
+        }
+    }
+
+    // ---- §2: a flat-shaded facet is exactly flat ------------------------------
+    {
+        double w = 0.0;
+        for (int i = 0; i < 256; ++i) {
+            Vec3 a{ frand() * 4 - 2, frand() * 4 - 2, frand() * 4 - 2 };
+            Vec3 b{ frand() * 4 - 2, frand() * 4 - 2, frand() * 4 - 2 };
+            Vec3 c{ frand() * 4 - 2, frand() * 4 - 2, frand() * 4 - 2 };
+            Tri t; t.v0 = a; t.v1 = b; t.v2 = c; t.finalize();   // no vn => flat
+            w = std::fmax(w, std::fabs(t.curvature));
+        }
+        ok &= chk("S2 flat-shaded facet H == 0", w, 0.0, 0.0);
+    }
+
+    // ---- §3: sign is relative to the shaded side (via intersectSphere) --------
+    {
+        const double R = 2.5;
+        Sphere s; s.c = Vec3{0.3, -1.1, 0.7}; s.r = R;
+        double wOut = 0.0, wIn = 0.0;
+        for (int i = 0; i < 128; ++i) {
+            // a random direction; shoot inward from far away, and outward from the centre
+            double z = frand() * 2 - 1, ph = frand() * 2 * M_PI, sr = std::sqrt(std::fmax(0.0, 1 - z * z));
+            Vec3 d{ sr * std::cos(ph), sr * std::sin(ph), z };
+            Hit ho; ho.t = DBL_MAX;
+            Ray rout{ s.c + d * (R * 10.0), d * -1.0 };
+            if (intersectSphere(rout, s, 1e-6, ho) && ho.valid)
+                wOut = std::fmax(wOut, std::fabs(ho.curv - 1.0 / R));
+            else { std::printf("[checkcurv] S3 outside ray missed  BAD\n"); ok = false; }
+            Hit hi; hi.t = DBL_MAX;
+            Ray rin{ s.c, d };
+            if (intersectSphere(rin, s, 1e-6, hi) && hi.valid)
+                wIn = std::fmax(wIn, std::fabs(hi.curv - (-1.0 / R)));
+            else { std::printf("[checkcurv] S3 inside ray missed  BAD\n"); ok = false; }
+        }
+        ok &= chk("S3 sphere hit from outside -> +1/R", wOut, 0.0, 1e-12);
+        ok &= chk("S3 same sphere from inside  -> -1/R", wIn,  0.0, 1e-12);
+    }
+
+    // ---- §4: a saddle has H ~ 0 despite a large |dn| --------------------------
+    // Take the graph z = (x^2 - y^2)/(2a) at the origin: principal curvatures +1/a and
+    // -1/a, so H = 0 exactly. Sample a small triangle around the origin with the exact
+    // analytic normals of that surface; the residual is the facet linearisation error.
+    {
+        const double a = 1.0;
+        auto srf = [&](double x, double y) { return Vec3{ x, y, (x * x - y * y) / (2 * a) }; };
+        auto nrm = [&](double x, double y) { return normalize(Vec3{ -x / a, y / a, 1.0 }); };
+        double w = 0.0, mag = 0.0;
+        const double hstep = 1e-3;
+        for (int k = 0; k < 32; ++k) {
+            double ang = 2.0 * M_PI * (double)k / 32.0;
+            double x1 = hstep * std::cos(ang),        y1 = hstep * std::sin(ang);
+            double x2 = hstep * std::cos(ang + 2.09), y2 = hstep * std::sin(ang + 2.09);
+            Tri t = mkTri(srf(0, 0), srf(x1, y1), srf(x2, y2),
+                          nrm(0, 0), nrm(x1, y1), nrm(x2, y2));
+            w = std::fmax(w, std::fabs(t.curvature));
+            Vec3 d1 = t.n1 - t.n0, d2 = t.n2 - t.n0;
+            mag = std::fmax(mag, std::sqrt(std::fmax(dot(d1, d1), dot(d2, d2))));
+        }
+        ok &= chk("S4 saddle H == 0 (trace, not magnitude)", w, 0.0, 1e-6);
+        // guard the guard: if |dn| were ~0 the section would pass vacuously
+        if (!(mag > 1e-5)) { std::printf("[checkcurv] S4 |dn| too small (%.3g) — vacuous  BAD\n", mag); ok = false; }
+    }
+
+    // ---- §5: a cylinder of radius R has H = 1/(2R), not 1/R -------------------
+    {
+        const double radii[] = { 0.25, 1.0, 7.0 };
+        for (double R : radii) {
+            const int NANG = 64, NAX = 4;
+            double wrel = 0.0;
+            auto cyl = [&](int i, int j, Vec3& p, Vec3& n) {
+                double ph = 2.0 * M_PI * (double)i / (double)NANG;
+                n = Vec3{ std::cos(ph), 0.0, std::sin(ph) };
+                p = Vec3{ R * n.x, (double)j * (R * 0.5), R * n.z };
+            };
+            for (int i = 0; i < NANG; ++i)
+                for (int j = 0; j < NAX; ++j) {
+                    Vec3 pa, na, pb, nb, pc, nc;
+                    cyl(i, j, pa, na); cyl(i + 1, j, pb, nb); cyl(i + 1, j + 1, pc, nc);
+                    Tri t = mkTri(pa, pb, pc, na, nb, nc);
+                    wrel = std::fmax(wrel, std::fabs(t.curvature - 0.5 / R) * R);
+                }
+            char lbl[80];
+            std::snprintf(lbl, sizeof lbl, "S5 cylinder R=%g -> H=1/(2R) (relative)", R);
+            ok &= chk(lbl, wrel, 0.0, 3e-3);
+        }
+    }
+
+    // ---- §6: basis independence — skewed edges, on a NON-umbilic surface ------
+    // The trace of a linear map does not depend on the basis it is read in, but only when
+    // the DUAL basis is used. The naive per-edge sum dot(e1,dn1)/|e1|^2 + dot(e2,dn2)/|e2|^2
+    // is right only for an ORTHOGONAL edge pair, so this section deliberately skews them.
+    //
+    // It has to be run on a CYLINDER, not a sphere. A sphere is umbilic — dn is a multiple
+    // of the identity there, so the naive sum returns the correct 1/R for *every* basis,
+    // orthogonal or not. That makes a sphere blind to this mutation (confirmed by mutation
+    // testing: the naive form passes S1 and an earlier sphere-based S6, and is caught only
+    // where the two principal curvatures differ). On a cylinder the same skew reads
+    // ~0.75/R instead of 0.5/R — a 50% error.
+    {
+        const double R = 1.3;
+        auto cylP = [&](double ph, double y) { return Vec3{ R * std::cos(ph), y, R * std::sin(ph) }; };
+        auto cylN = [&](double ph)           { return Vec3{ std::cos(ph), 0.0, std::sin(ph) }; };
+        double wperm = 0.0, wskew = 0.0;
+        for (int k = 0; k < 64; ++k) {
+            double ph0 = frand() * 2 * M_PI, y0 = (frand() - 0.5) * 4.0;
+            const double dph = 0.02;
+            // e1 runs purely circumferentially, e2 shares that circumferential run and adds
+            // an axial one: e1.e2 = (R*dph)^2 != 0, so the Gram matrix is far from diagonal.
+            double ph1 = ph0 + dph,        y1 = y0;
+            double ph2 = ph0 + dph,        y2 = y0 + R * dph * 1.4;
+            Vec3 pa = cylP(ph0, y0), pb = cylP(ph1, y1), pc = cylP(ph2, y2);
+            Vec3 na = cylN(ph0),     nb = cylN(ph1),     nc = cylN(ph2);
+            Tri t0 = mkTri(pa, pb, pc, na, nb, nc);
+            Tri t1 = mkTri(pb, pc, pa, nb, nc, na);   // rotate the vertex order
+            Tri t2 = mkTri(pa, pc, pb, na, nc, nb);   // swap two (flips gn, but not H)
+            wperm = std::fmax(wperm, std::fabs(t1.curvature - t0.curvature) * R);
+            wperm = std::fmax(wperm, std::fabs(t2.curvature - t0.curvature) * R);
+            wskew = std::fmax(wskew, std::fabs(t0.curvature - 0.5 / R) * R);
+        }
+        ok &= chk("S6 H invariant under vertex permutation", wperm, 0.0, 1e-9);
+        ok &= chk("S6 skewed edges still read 1/(2R) (rel)", wskew, 0.0, 1e-3);
+    }
+
+    // ---- §7: the VM path ------------------------------------------------------
+    {
+        std::vector<PatNode> prog; std::string perr;
+        if (!compilePatternExpr("curv", prog, perr)) {
+            std::printf("[checkcurv] S7 compile `curv` FAILED: %s\n", perr.c_str());
+            ok = false;
+        } else {
+            double w = 0.0;
+            for (int i = 0; i < 64; ++i) {
+                double want = (frand() - 0.5) * 20.0;
+                PatCtx c = makePatCtx(Vec3{0.1, 0.2, 0.3}, 0.0, Vec3{0, 0, 1}, 0.0, 0.0, want);
+                w = std::fmax(w, std::fabs(patternEval(prog.data(), (int)prog.size(), c) - want));
+            }
+            ok &= chk("S7 VM `curv` == PatCtx.curv", w, 0.0, 0.0);
+            if (!patternHasFreeVars(prog)) {
+                std::printf("[checkcurv] S7 patternHasFreeVars(`curv`) is false — would const-fold  BAD\n");
+                ok = false;
+            }
+        }
+        // default PatCtx (no curvature supplied) must be a clean 0, not garbage
+        {
+            std::vector<PatNode> p2; std::string e2;
+            if (compilePatternExpr("curv", p2, e2)) {
+                PatCtx c = makePatCtx(Vec3{1, 2, 3}, 0.0, Vec3{0, 1, 0});
+                ok &= chk("S7 default PatCtx.curv == 0",
+                          patternEval(p2.data(), (int)p2.size(), c), 0.0, 0.0);
+            }
+        }
+        // an upsample body has a disjoint r/g/b/w vocabulary and no surface: reject
+        {
+            std::vector<PatNode> p3; std::string e3;
+            if (compilePatternExpr("curv", p3, e3, false, nullptr, nullptr, false,
+                                   PatVarMode::Upsample)) {
+                std::printf("[checkcurv] S7 `curv` compiled in an upsample body  BAD\n");
+                ok = false;
+            }
+        }
+        // CSE must fold a repeated curv-rooted SUBTREE, and the fold must still be right.
+        // Note the subtree has to be more than the bare leaf: a postfix program spends one
+        // node on `curv` either way, so `curv + curv` legitimately cannot shrink. What must
+        // shrink is a compound expression built on it — which is also the case that matters,
+        // since that is what a real curvature-driven material writes.
+        {
+            std::vector<PatNode> same, opt; std::string e4;
+            const char* expr = "abs(curv * 2 + 1) + abs(curv * 2 + 1)";
+            if (!compilePatternExpr(expr, same, e4)) {
+                std::printf("[checkcurv] S7 compile `%s` FAILED: %s\n", expr, e4.c_str()); ok = false;
+            } else {
+                opt = same; patternOptimizeCSE(opt);
+                if (opt.size() >= same.size()) {
+                    std::printf("[checkcurv] S7 CSE did not shrink `%s` (%zu -> %zu)  BAD\n",
+                                expr, same.size(), opt.size());
+                    ok = false;
+                }
+                PatCtx c = makePatCtx(Vec3{0, 0, 0}, 0.0, Vec3{0, 0, 1}, 0.0, 0.0, -3.25);
+                ok &= chk("S7 CSE'd curv subtree evaluates right",
+                          patternEval(opt.data(), (int)opt.size(), c), 11.0, 0.0);
+            }
+        }
+    }
+
+    // ---- §8: a curve segment reads H = 1/(2r) ---------------------------------
+    {
+        const double radii[] = { 0.001, 0.05, 0.5 };
+        for (double rr : radii) {
+            CurveSeg s; s.p0 = Vec3{-1, 0, 0}; s.p1 = Vec3{1, 0, 0}; s.r0 = rr; s.r1 = rr;
+            Vec3 d{0, 0, 1};
+            Ray r{ Vec3{0.13, 0.0, -5.0}, d };
+            CurveRay cr = makeCurveRay(d);
+            Hit h; h.t = DBL_MAX;
+            if (!intersectCurveSeg(cr, r, s, 1e-9, h) || !h.valid) {
+                std::printf("[checkcurv] S8 curve r=%g missed  BAD\n", rr); ok = false; continue;
+            }
+            char lbl[80];
+            std::snprintf(lbl, sizeof lbl, "S8 curve r=%g -> H=1/(2r)", rr);
+            ok &= chk(lbl, h.curv * rr, 0.5, 1e-9);   // scaled so the tolerance is relative
+        }
+    }
+
+    // ---- §9: instancing rescales curvature by 1/scale -------------------------
+    // Curvature is 1/length, so a BLAS hit's LOCAL curvature must be divided by the
+    // instance's linear scale on the way out to world space. MeshInstance caches that
+    // factor in setToWorld(); the identities pinned here are the ones a reader would
+    // assume and a mutation would break: rigid => 1 (a rotation or translation must not
+    // touch curvature at all), uniform s => 1/s, and non-uniform => the cube root of
+    // |det|, the average linear scale.
+    {
+        auto scaleXf = [](double sx, double sy, double sz) {
+            Affine a; a.m[0] = sx; a.m[4] = sy; a.m[8] = sz; return a;
+        };
+        MeshInstance mi;
+        mi.setToWorld(Affine::identity());
+        ok &= chk("S9 identity instance curvScale == 1", mi.curvScale, 1.0, 0.0);
+        // a pure rotation about Y: det = 1, so curvature is untouched
+        {
+            double th = 0.7; Affine rot;
+            rot.m[0] = std::cos(th); rot.m[2] = std::sin(th);
+            rot.m[6] = -std::sin(th); rot.m[8] = std::cos(th);
+            rot.t = Vec3{5, -3, 2};                       // translation is irrelevant too
+            mi.setToWorld(rot);
+            ok &= chk("S9 rigid instance curvScale == 1", mi.curvScale, 1.0, 1e-15);
+        }
+        const double us[] = { 0.1, 0.5, 2.0, 37.0 };
+        for (double s : us) {
+            mi.setToWorld(scaleXf(s, s, s));
+            char lbl[80]; std::snprintf(lbl, sizeof lbl, "S9 uniform scale %g -> 1/%g", s, s);
+            ok &= chk(lbl, mi.curvScale, 1.0 / s, 1e-12);
+        }
+        mi.setToWorld(scaleXf(2.0, 4.0, 8.0));            // |det|^(1/3) = 4
+        ok &= chk("S9 non-uniform scale -> 1/cbrt|det|", mi.curvScale, 0.25, 1e-12);
+        // a degenerate (flattened) instance must not produce inf/NaN downstream
+        mi.setToWorld(scaleXf(1.0, 0.0, 1.0));
+        if (!std::isfinite(mi.curvScale)) {
+            std::printf("[checkcurv] S9 degenerate instance curvScale is not finite  BAD\n");
+            ok = false;
+        }
+    }
+
+    std::printf("[checkcurv] worst absolute error = %.3g\n", worst);
+    std::printf("[checkcurv] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Deterministic cavity self-test (`-checkcavity`): the `cavity` free variable (O3
+// stage 2 — non-stationary randomness). Builds tiny in-memory scenes; no renderer.
+//
+// `cavity` is the fraction of a short hemispherical probe of radius `cavityRadius`
+// that is BLOCKED at the shading point: 0 on a lone plane, ~0.5 in a right-angled
+// interior corner, ->1 inside a crevice. It complements `curv` — a right-angled
+// corner reads curv == 0 on BOTH flat faces yet is exactly where grime collects, and
+// unlike curv it is non-local, so it also sees the gap between two separate objects.
+//
+// What each section defends, and the mutation it catches:
+//   §1 a lone plane reads EXACTLY 0. Any stray self-hit (a missing normal offset, a
+//      tmin of 0) shows up here as a nonzero on an unoccluded surface.
+//   §2 the ANALYTIC anchor, and the sharpest section by far. With a horizontal
+//      ceiling at height h, a probe ray at polar angle theta travels h/cos(theta) to
+//      reach it, so exactly the cap cos(theta) > h/R is blocked. Under COSINE
+//      weighting that cap has measure 1 - (h/R)^2; under UNIFORM weighting it would
+//      be 1 - h/R (0.75 vs 0.50 at h/R = 1/2). Because the sample set stratifies u =
+//      (i+0.5)/N and cos(theta) = sqrt(1-u), the discrete count is exact, so this is
+//      checked to 2e-3 rather than to sampling noise. Catches: uniform instead of
+//      cosine weighting, a mutated sqrt, and an unstratified/jittered direction set.
+//   §3 the probe RADIUS is honoured: the same ceiling with R < h must read 0. A
+//      mutation that passed an unbounded maxDist to occluded() (i.e. plain ambient
+//      occlusion over the whole scene) passes §2 and dies here — and would make
+//      `cavity` report "in a crevice" for a point on an open floor under a distant
+//      roof, which is the entire distinction the feature rests on.
+//   §4 a right-angled interior corner reads ~1/2 — the canonical value the docs
+//      quote, and the case `curv` cannot see at all.
+//   §5 a point sealed inside a small closed box reads exactly 1.
+//   §6 the hemisphere follows the SHADED SIDE: the same point on the same floor,
+//      probed from underneath, sees the open half-space and reads 0. This is the
+//      orientedGeoN() flip, the twin of -checkcurv's §3.
+//   §7 quantisation and determinism: the result is always an exact multiple of 1/N
+//      (a fixed direction set can produce only N+1 values — the banding the docs warn
+//      about, pinned so nobody "fixes" it by jittering, which would make every
+//      cavity-driven material a noise source), and two calls agree BIT for BIT.
+//   §8 the VM: `cavity` compiles, reaches PatCtx.cavity, defaults to a clean 0, is
+//      visible to patternHasFreeVars (else a cavity-driven material const-folds at
+//      load into whatever the first hit happened to be), is REJECTED in an upsample
+//      body, and is CSE-keyed. That last one is not ceremony: patOpStackEffect not
+//      knowing a new opcode's arity makes patternOptimizeCSE silently bail on the
+//      WHOLE program, which is exactly the bug this section caught for `curv`.
+//   §9 the loader: `needsCavity` is set IFF some material reads `cavity` (it is the
+//      gate that decides whether any probe rays are fired at all, so a false negative
+//      renders the feature as a flat 0 and a false positive taxes every scene), the
+//      radius defaults to a fraction of the scene size, `cavity_radius` /
+//      `cavity_samples` override it, and an EMIT pattern reading `cavity` is
+//      rejected — an emitter's sampled point carries no cavity, so the emitted
+//      profile would disagree with the one emission-on-hit reads and MIS would bias.
+//  §10 the lazy fill in patCtxFromHit caches (one probe per shading point, not one
+//      per pattern context) and does nothing at all when the gate is off.
+static int checkCavity() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkcavity] %-48s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+    auto chkb = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checkcavity] %-48s BAD\n", what); ok = false; }
+    };
+    // Add an axis-aligned quad (2 flat tris) spanning `a`..`b` in the two axes that
+    // differ; used to build the plane/corner/box scenes below.
+    auto addQuad = [](Scene& s, const Vec3& p0, const Vec3& e1, const Vec3& e2) {
+        Tri t0; t0.v0 = p0; t0.v1 = p0 + e1; t0.v2 = p0 + e1 + e2;
+        Tri t1; t1.v0 = p0; t1.v1 = p0 + e1 + e2; t1.v2 = p0 + e2;
+        s.tris.push_back(t0); s.tris.push_back(t1);
+    };
+    // build() would also finalise emitters, which these geometry-only scenes have
+    // none of; the probe needs nothing but finalized tris and a BVH.
+    auto finish = [](Scene& s, double radius, int samples) {
+        for (auto& t : s.tris) t.finalize();
+        s.buildBvh();
+        s.cavityRadius = radius; s.cavitySamples = samples; s.needsCavity = true;
+        s.mats.resize(2);
+        s.mats[0].readsCavity = true;    // material 0 = the one under test
+        s.mats[1].readsCavity = false;   // material 1 = a patterned neighbour that doesn't
+    };
+    // A hit that is not the result of any intersection: `cavity` is a function of the
+    // point and the shaded-side normal alone, so it can be probed directly.
+    // `ng` is the triangle's own winding normal and does NOT flip with the ray; `n` is
+    // the ray-oriented shading normal and does. §6 relies on being able to set them
+    // independently, which is the only way to exercise orientedGeoN().
+    // matId 0 throughout: §10 exercises the per-material gate, and the probe is only
+    // reached through a material that declares it reads `cavity`.
+    auto hitAt2 = [](const Vec3& p, const Vec3& n, const Vec3& ng) {
+        Hit h; h.valid = true; h.t = 1.0; h.p = p; h.n = n; h.ng = ng; h.matId = 0; return h;
+    };
+    auto hitAt = [&](const Vec3& p, const Vec3& n) { return hitAt2(p, n, n); };
+
+    // ---- §1: a lone plane is fully open --------------------------------------
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});
+        finish(s, 1.0, 256);
+        ok &= chk("S1 lone plane cavity == 0",
+                  cavityAt(s, hitAt(Vec3{0.13, 0.0, -0.41}, Vec3{0, 1, 0})), 0.0, 0.0);
+    }
+
+    // ---- §2: ceiling at height h -> 1 - (h/R)^2 (the cosine-weighting anchor) --
+    {
+        const double R = 1.0;
+        const int N = 1000;
+        for (double frac : { 0.3, 0.5, 0.7, 0.9 }) {
+            const double h = frac * R;
+            Scene s;
+            addQuad(s, Vec3{-8, h, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});
+            finish(s, R, N);
+            const double want = 1.0 - frac * frac;
+            char lbl[96];
+            std::snprintf(lbl, sizeof lbl, "S2 ceiling h/R=%g -> 1-(h/R)^2", frac);
+            ok &= chk(lbl, cavityAt(s, hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0})), want, 2e-3);
+            // and the uniform-weighted answer must NOT be what we got
+            if (std::fabs(want - (1.0 - frac)) > 1e-6) {
+                double got = cavityAt(s, hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0}));
+                if (std::fabs(got - (1.0 - frac)) < 2e-3) {
+                    std::printf("[checkcavity] S2 h/R=%g reads the UNIFORM-weighted "
+                                "value %.4f  BAD\n", frac, got);
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    // ---- §3: the probe is SHORT — an occluder past R is invisible -------------
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0.5, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});
+        finish(s, 0.4, 256);           // R = 0.4 < h = 0.5
+        ok &= chk("S3 ceiling beyond R reads 0",
+                  cavityAt(s, hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0})), 0.0, 0.0);
+        s.cavityRadius = 0.6;          // now within reach: 1 - (0.5/0.6)^2
+        ok &= chk("S3 same ceiling within R reads 1-(h/R)^2",
+                  cavityAt(s, hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0})),
+                  1.0 - (0.5 / 0.6) * (0.5 / 0.6), 5e-3);
+    }
+
+    // ---- §4: a right-angled interior corner reads ~1/2 ------------------------
+    // Floor in y=0, wall in x=0 rising out of it. A probe point a hair off the wall
+    // has exactly the half-hemisphere x < 0 blocked, which under any normalised
+    // weighting is half the measure. (Only ~1/2 rather than exactly: the golden-angle
+    // azimuths are not mirror-symmetric, so the discrepancy is O(1/N).)
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});     // floor
+        addQuad(s, Vec3{0, -0.1, -8}, Vec3{0, 4, 0}, Vec3{0, 0, 16});    // wall
+        finish(s, 1.0, 4096);
+        ok &= chk("S4 right-angled corner cavity ~ 0.5",
+                  cavityAt(s, hitAt(Vec3{1e-4, 0.0, 0.0}, Vec3{0, 1, 0})), 0.5, 0.02);
+    }
+
+    // ---- §5: sealed inside a closed box reads exactly 1 -----------------------
+    {
+        const double e = 0.1;
+        Scene s;
+        addQuad(s, Vec3{-e, -e, -e}, Vec3{2 * e, 0, 0}, Vec3{0, 0, 2 * e});   // floor
+        addQuad(s, Vec3{-e,  e, -e}, Vec3{2 * e, 0, 0}, Vec3{0, 0, 2 * e});   // ceiling
+        addQuad(s, Vec3{-e, -e, -e}, Vec3{0, 2 * e, 0}, Vec3{0, 0, 2 * e});   // -x
+        addQuad(s, Vec3{ e, -e, -e}, Vec3{0, 2 * e, 0}, Vec3{0, 0, 2 * e});   // +x
+        addQuad(s, Vec3{-e, -e, -e}, Vec3{2 * e, 0, 0}, Vec3{0, 2 * e, 0});   // -z
+        addQuad(s, Vec3{-e, -e,  e}, Vec3{2 * e, 0, 0}, Vec3{0, 2 * e, 0});   // +z
+        finish(s, 1.0, 512);
+        ok &= chk("S5 sealed box cavity == 1",
+                  cavityAt(s, hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0})), 1.0, 0.0);
+    }
+
+    // ---- §6: the hemisphere follows the shaded side ---------------------------
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0.3, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});   // roof above
+        addQuad(s, Vec3{-8, 0, -8},   Vec3{16, 0, 0}, Vec3{0, 0, 16});   // the floor itself
+        finish(s, 1.0, 512);
+        // The floor tri's winding normal is FIXED at +y in both cases; only the
+        // ray-oriented shading normal differs, exactly as it would for a ray arriving
+        // from above vs. from below. A mutation that probed about a raw `h.ng` (or a
+        // raw "always outward") instead of orientedGeoN() reads the roof in BOTH.
+        const Vec3 P{0.2, 0.0, 0.1}, GN{0, 1, 0};
+        double up   = cavityAt(s, hitAt2(P, Vec3{0,  1, 0}, GN));
+        double down = cavityAt(s, hitAt2(P, Vec3{0, -1, 0}, GN));
+        ok &= chk("S6 hit from above sees the roof",   up,   1.0 - 0.09, 5e-3);
+        ok &= chk("S6 hit from below sees open space", down, 0.0, 0.0);
+        // The same for a smooth-shaded surface whose interpolated normal merely TILTS
+        // away from the facet: the flip must key off the SIGN of dot(ng, n), not
+        // replace ng with n (which would let a coarse mesh's shading normal tip the
+        // hemisphere into the surface and self-report occlusion that is not there).
+        Vec3 tilt = normalize(Vec3{0.45, 1.0, -0.3});
+        ok &= chk("S6 tilted shading normal still probes about ng",
+                  cavityAt(s, hitAt2(P, tilt, GN)), up, 0.0);
+    }
+
+    // ---- §7: quantisation to k/N, and bit-for-bit determinism -----------------
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0, -8},   Vec3{16, 0, 0}, Vec3{0, 0, 16});
+        addQuad(s, Vec3{0, -0.1, -8}, Vec3{0, 4, 0},  Vec3{0, 0, 16});
+        for (int N : { 4, 16, 64, 257 }) {
+            finish(s, 1.0, N);
+            Hit h = hitAt(Vec3{0.05, 0.0, 0.0}, Vec3{0, 1, 0});
+            double a = cavityAt(s, h), b = cavityAt(s, h);
+            if (a != b) {
+                std::printf("[checkcavity] S7 N=%d not deterministic (%.17g vs %.17g)"
+                            "  BAD\n", N, a, b);
+                ok = false;
+            }
+            double k = a * N;
+            char lbl[96];
+            std::snprintf(lbl, sizeof lbl, "S7 N=%d value is an exact multiple of 1/N", N);
+            ok &= chk(lbl, k - std::floor(k + 0.5), 0.0, 1e-12);
+        }
+        // N = 0 disables the probe entirely rather than dividing by zero
+        finish(s, 1.0, 0);
+        ok &= chk("S7 cavity_samples 0 -> 0 (no divide by zero)",
+                  cavityAt(s, hitAt(Vec3{0.05, 0.0, 0.0}, Vec3{0, 1, 0})), 0.0, 0.0);
+    }
+
+    // ---- §8: the VM path -------------------------------------------------------
+    {
+        std::vector<PatNode> prog; std::string perr;
+        if (!compilePatternExpr("cavity", prog, perr)) {
+            std::printf("[checkcavity] S8 compile `cavity` FAILED: %s\n", perr.c_str());
+            ok = false;
+        } else {
+            double w = 0.0;
+            for (int i = 0; i < 33; ++i) {
+                double want = i / 32.0;
+                PatCtx c = makePatCtx(Vec3{0.1, 0.2, 0.3}, 0.0, Vec3{0, 0, 1},
+                                      0.0, 0.0, 0.0, want);
+                w = std::fmax(w, std::fabs(patternEval(prog.data(), (int)prog.size(), c) - want));
+            }
+            ok &= chk("S8 VM `cavity` == PatCtx.cavity", w, 0.0, 0.0);
+            chkb("S8 patternHasFreeVars(`cavity`)", patternHasFreeVars(prog));
+        }
+        {   // default PatCtx must be a clean 0, not garbage
+            std::vector<PatNode> p2; std::string e2;
+            if (compilePatternExpr("cavity", p2, e2)) {
+                PatCtx c = makePatCtx(Vec3{1, 2, 3}, 0.0, Vec3{0, 1, 0});
+                ok &= chk("S8 default PatCtx.cavity == 0",
+                          patternEval(p2.data(), (int)p2.size(), c), 0.0, 0.0);
+            }
+        }
+        {   // an upsample body has no surface: reject
+            std::vector<PatNode> p3; std::string e3;
+            if (compilePatternExpr("cavity", p3, e3, false, nullptr, nullptr, false,
+                                   PatVarMode::Upsample)) {
+                std::printf("[checkcavity] S8 `cavity` compiled in an upsample body  BAD\n");
+                ok = false;
+            }
+        }
+        {   // CSE must fold a repeated cavity-rooted SUBTREE (see the header note)
+            std::vector<PatNode> same, opt; std::string e4;
+            const char* expr = "abs(cavity * 2 + 1) + abs(cavity * 2 + 1)";
+            if (!compilePatternExpr(expr, same, e4)) {
+                std::printf("[checkcavity] S8 compile `%s` FAILED: %s\n", expr, e4.c_str());
+                ok = false;
+            } else {
+                opt = same; patternOptimizeCSE(opt);
+                if (opt.size() >= same.size()) {
+                    std::printf("[checkcavity] S8 CSE did not shrink `%s` (%zu -> %zu)"
+                                "  BAD\n", expr, same.size(), opt.size());
+                    ok = false;
+                }
+                PatCtx c = makePatCtx(Vec3{0, 0, 0}, 0.0, Vec3{0, 0, 1},
+                                      0.0, 0.0, 0.0, 0.25);
+                ok &= chk("S8 CSE'd cavity subtree evaluates right",
+                          patternEval(opt.data(), (int)opt.size(), c), 3.0, 0.0);
+            }
+        }
+        // `curv` and `cavity` must be DISTINCT variables, not aliases of one slot
+        {
+            std::vector<PatNode> pc, pv; std::string e5;
+            if (compilePatternExpr("curv", pc, e5) && compilePatternExpr("cavity", pv, e5)) {
+                PatCtx c = makePatCtx(Vec3{0, 0, 0}, 0.0, Vec3{0, 0, 1},
+                                      0.0, 0.0, /*curv=*/7.5, /*cavity=*/0.25);
+                ok &= chk("S8 `curv` reads curv, not cavity",
+                          patternEval(pc.data(), (int)pc.size(), c), 7.5, 0.0);
+                ok &= chk("S8 `cavity` reads cavity, not curv",
+                          patternEval(pv.data(), (int)pv.size(), c), 0.25, 0.0);
+            }
+        }
+    }
+
+    // ---- §9: the loader gate, the defaults, and the emit rejection -------------
+    {
+        auto loadSrc = [&](const std::string& mats, ftsl::Loaded& L, std::string& err) {
+            std::string src =
+                "scene { units meters }\n" + mats + "\n"
+                "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+                "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0"
+                "  spd preset:bb6500 }\n"
+                "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32"
+                "  film { res 8 8 } }\n";
+            return ftsl::loadSource(src, "<checkcavity>", L, err);
+        };
+        // (a) a scene that never says `cavity` must not arm the probe
+        {
+            ftsl::Loaded L; std::string e;
+            if (!loadSrc("material \"probe\" { type diffuse reflect rgb 0.5 0.5 0.5 }",
+                         L, e))
+                { std::printf("[checkcavity] S9 plain scene load FAILED: %s\n", e.c_str()); ok = false; }
+            else chkb("S9 no `cavity` anywhere -> needsCavity false", !L.scene.needsCavity);
+        }
+        // (b) a material that reads it arms the probe and gets a derived radius
+        {
+            ftsl::Loaded L; std::string e;
+            const char* body =
+                "pattern \"cav\" { expr \"cavity\" }\n"
+                "material \"a\" { type diffuse reflect rgb 0.9 0.9 0.9 }\n"
+                "material \"b\" { type diffuse reflect rgb 0.1 0.1 0.1 }\n"
+                "material \"probe\" { type mix layer \"a\" 0.5 layer \"b\" 0.5"
+                "  weight_map pattern:cav }";
+            if (!loadSrc(body, L, e))
+                { std::printf("[checkcavity] S9 cavity scene load FAILED: %s\n", e.c_str()); ok = false; }
+            else {
+                chkb("S9 material reads `cavity` -> needsCavity true", L.scene.needsCavity);
+                chkb("S9 derived cavityRadius > 0", L.scene.cavityRadius > 0.0);
+                chkb("S9 derived cavityRadius < scene radius",
+                     L.scene.cavityRadius < L.scene.sceneRadius);
+                chkb("S9 default cavitySamples >= 1", L.scene.cavitySamples >= 1);
+                int mi = L.scene.tris.empty() ? -1 : L.scene.tris[0].matId;
+                chkb("S9 the reading material is flagged",
+                     mi >= 0 && L.scene.mats[mi].readsCavity);
+            }
+        }
+        // (b2) the per-material flag must LIFT through a mix: geometry names the mix,
+        // not its layers, so a layer that reads `cavity` has to arm the parent or the
+        // probe never fires and the pattern renders as a flat 0.
+        {
+            ftsl::Loaded L; std::string e;
+            const char* body =
+                "pattern \"cav\" { expr \"cavity\" }\n"
+                "material \"a\" { type diffuse reflect rgb 0.9 0.9 0.9"
+                "  reflect_map pattern:cav }\n"
+                "material \"b\" { type diffuse reflect rgb 0.1 0.1 0.1 }\n"
+                "material \"probe\" { type mix layer \"a\" 0.5 layer \"b\" 0.5 }";
+            if (!loadSrc(body, L, e))
+                { std::printf("[checkcavity] S9 mix-layer load FAILED: %s\n", e.c_str()); ok = false; }
+            else {
+                int mi = L.scene.tris.empty() ? -1 : L.scene.tris[0].matId;
+                chkb("S9 mix inherits readsCavity from a layer",
+                     mi >= 0 && L.scene.mats[mi].readsCavity);
+                // …and a material that does NOT read it stays unflagged, or the gate is
+                // vacuous and everything pays for the probe.
+                bool anyClean = false;
+                for (const auto& m : L.scene.mats) if (!m.readsCavity) anyClean = true;
+                chkb("S9 non-reading materials stay unflagged", anyClean);
+            }
+        }
+        // (c) explicit overrides win
+        {
+            ftsl::Loaded L; std::string e;
+            std::string src =
+                "scene { units meters  cavity_radius 0.037  cavity_samples 48 }\n"
+                "pattern \"cav\" { expr \"cavity\" }\n"
+                "material \"a\" { type diffuse reflect rgb 0.9 0.9 0.9 }\n"
+                "material \"b\" { type diffuse reflect rgb 0.1 0.1 0.1 }\n"
+                "material \"probe\" { type mix layer \"a\" 0.5 layer \"b\" 0.5"
+                "  weight_map pattern:cav }\n"
+                "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+                "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0"
+                "  spd preset:bb6500 }\n"
+                "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32"
+                "  film { res 8 8 } }\n";
+            if (!ftsl::loadSource(src, "<checkcavity>", L, e))
+                { std::printf("[checkcavity] S9 override load FAILED: %s\n", e.c_str()); ok = false; }
+            else {
+                ok &= chk("S9 cavity_radius honoured", L.scene.cavityRadius, 0.037, 1e-12);
+                ok &= chk("S9 cavity_samples honoured", (double)L.scene.cavitySamples, 48.0, 0.0);
+            }
+        }
+        // (d) an emit pattern reading `cavity` must be rejected (MIS bias, see header).
+        // The emission pattern lives on the LIGHT (`spd_map pattern:…`, which becomes
+        // Material::emitPat), so this fragment replaces the stock light rather than
+        // adding a material.
+        {
+            auto emitScene = [&](const char* expr, std::string& err) {
+                ftsl::Loaded L;
+                std::string src =
+                    "scene { units meters }\n"
+                    "pattern \"ep\" { expr \"" + std::string(expr) + "\" }\n"
+                    "material \"probe\" { type diffuse reflect rgb 0.5 0.5 0.5 }\n"
+                    "quad { origin 0 0 0  u 1 0 0  v 0 1 0  material probe }\n"
+                    "light area { origin 0 0.99 0.1  u 1 0 0  v 0 0 0.4  normal 0 -1 0"
+                    "  spd preset:bb6500  spd_map pattern:ep }\n"
+                    "camera \"c\" { eye 0.5 0.5 2  look_at 0.5 0.5 0  up 0 1 0  fov_y 32"
+                    "  film { res 8 8 } }\n";
+                return ftsl::loadSource(src, "<checkcavity>", L, err);
+            };
+            std::string e;
+            if (emitScene("cavity", e))
+                chkb("S9 emit pattern reading `cavity` is rejected", false);
+            else if (e.find("cavity") == std::string::npos) {
+                std::printf("[checkcavity] S9 emit rejection message omits `cavity`"
+                            " (was: %s)  BAD\n", e.c_str());
+                ok = false;
+            }
+            // …and the guard must not be a blanket ban on emission patterns: a plain
+            // UV-driven one still has to load, or the check is vacuously "passing".
+            std::string e2;
+            if (!emitScene("0.5 + 0.5 * sin(20 * u)", e2)) {
+                std::printf("[checkcavity] S9 an ordinary emit pattern was rejected"
+                            " (%s)  BAD\n", e2.c_str());
+                ok = false;
+            }
+        }
+    }
+
+    // ---- §10: the lazy fill caches, and does nothing when the gate is off ------
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0.5, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});
+        finish(s, 1.0, 256);
+        Hit h = hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0});
+        PatCtx c1 = patCtxFromHit(s, h);
+        chkb("S10 patCtxFromHit marks the hit done", h.cavityDone);
+        ok &= chk("S10 patCtxFromHit fills cavity", c1.cavity, 1.0 - 0.25, 5e-3);
+        // Poison the cache: a second context must REUSE it, not re-probe. That is the
+        // whole point of caching on the Hit — several PatCtxs per shading point.
+        h.cavity = 0.123456;
+        PatCtx c2 = patCtxFromHit(s, h);
+        ok &= chk("S10 second PatCtx reuses the cached value", c2.cavity, 0.123456, 0.0);
+        // PER-MATERIAL gate: material 1 never says `cavity`, so a hit on it must fire no
+        // probe even though the scene as a whole is armed. Without this the feature
+        // silently taxes every other patterned surface in a cavity scene.
+        Hit hOther = hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0});
+        hOther.matId = 1;
+        PatCtx cOther = patCtxFromHit(s, hOther);
+        ok &= chk("S10 material that ignores `cavity` -> 0", cOther.cavity, 0.0, 0.0);
+        chkb("S10 that material's hit is left unprobed", !hOther.cavityDone);
+        // Scene gate off: no probe, a clean 0, and the hit left untouched.
+        s.needsCavity = false;
+        Hit h2 = hitAt(Vec3{0, 0, 0}, Vec3{0, 1, 0});
+        PatCtx c3 = patCtxFromHit(s, h2);
+        ok &= chk("S10 scene gate off -> cavity 0", c3.cavity, 0.0, 0.0);
+        chkb("S10 scene gate off leaves the hit unprobed", !h2.cavityDone);
+    }
+
+    std::printf("[checkcavity] worst absolute error = %.3g\n", worst);
+    std::printf("[checkcavity] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// Deterministic signed-distance-field self-test (`-checksdf`): the `sdf` element (O3
+// stage 3 — non-stationary randomness). Bakes tiny meshes in memory; no renderer.
+//
+// `curv` reads the surface a shading point is ON and `cavity` reads how enclosed it is,
+// but neither can answer "how far is this point from THAT object" — the question behind
+// moss creeping up from the ground, frost thickening away from a heat source, or wear
+// radiating out from a contact. `sdf "name" { object "…" }` bakes that distance onto a
+// lattice and publishes it as an ordinary `grid:name(x, y, z)`.
+//
+// The whole suite rests on one choice: **the test geometry is an axis-aligned BOX**.
+// A box is exactly representable by 12 triangles, and its signed distance has a closed
+// form, so the bake and the analytic answer are not "close" — they are the SAME NUMBER,
+// checked to float storage precision at every one of ~40 000 lattice samples. That turns
+// what would otherwise be an eyeball test into an exact one, and it is why a sphere (whose
+// tessellation error, R·(1−cos(π/N)), swamps every real defect) is not used here.
+//
+// What each section defends, and the mutation it catches:
+//   §1 THE ANCHOR. Every sample of a padded box bake equals the analytic box SDF. This
+//      is simultaneously the sign (stage 1), the exact narrow band (stage 2) and the
+//      propagation (stage 3), because a single wrong triangle anywhere breaks it.
+//   §2 PROPAGATION REACH, reported separately for samples more than 3 voxels from the
+//      surface — the ones the narrow band never seeds, which are right only if the
+//      closest-triangle sweeps carried a triangle out to them. This is the section that
+//      caught the original bug: seeding the exact separable EDT with exact squared
+//      distances is not a distance transform (it adds SQUARES where distance adds
+//      LENGTHS), which read a 71.5 mm tube as 47 mm — smooth, plausible, and 34 % short.
+//   §3 UNION SEMANTICS on two OVERLAPPING boxes: the overlap must read INSIDE. An
+//      even-odd (parity) voxelizer hollows it out instead, which is the exact failure the
+//      signed-crossing scanline in `voxelizeSolidInto` exists to avoid. The exterior
+//      distance is additionally checked against min(dA, dB), which is provably the
+//      union's own exterior distance.
+//   §4 A NON-CONVEX configuration — two DISJOINT boxes — where the closest triangle is
+//      often across a gap and the sweeps have to carry it there. Still exact.
+//   §5 LATTICE GEOMETRY: cubic voxels on all three axes, `res` samples along the LONGEST
+//      one, `lo` at the padded AABB corner, `hiCorner()` at the far one. A field whose
+//      lattice is misplaced is wrong everywhere while looking perfectly smooth.
+//   §6 `pointTriDistSq` against an INDEPENDENT exact reference on OBTUSE triangles. The
+//      tempting "project onto the plane and clamp the barycentrics" shortcut is wrong
+//      exactly there, and an imported mesh is full of obtuse triangles.
+//   §7 THE MEMORY ORDER, sampled through `patGridSample` itself. `SdfBake` is produced
+//      x-fastest but `PatGrid` is "axis 0 outermost", so the bake transposes on the way
+//      out; getting that backwards is invisible in every aggregate statistic and shows up
+//      only as a field that is plausible but rotated. Checked by comparing the sampled
+//      grid against the analytic box SDF at off-lattice points.
+//   §8 THE LOADER round trip: an `sdf` block over an in-memory cube OBJ registers a real
+//      ndim-3 `PatGrid`, and reading it from a material reproduces the analytic field.
+//   §9 THE LOADER'S REFUSALS: no `object`, an unknown object, a duplicate name, `res` out
+//      of range, a negative `pad` — and the one that is not mere validation, an `sdf` read
+//      from a procedural `texture`, which is BAKED DURING THE LOAD, before the geometry it
+//      measures exists. Letting that through would return 0, and 0 in a distance field
+//      means "exactly on the surface": the most confidently wrong answer available.
+static int checkSdf() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checksdf] %-52s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+    auto chkb = [&](const char* what, bool cond) {
+        if (!cond) { std::printf("[checksdf] %-52s BAD\n", what); ok = false; }
+        return cond;
+    };
+
+    // ---- shared helpers -------------------------------------------------------
+    // The 8 corners of a box, then 6 quads wound COUNTER-CLOCKWISE seen from OUTSIDE.
+    // The winding is load-bearing: `voxelizeSolidInto` takes the sign of each crossing
+    // from the projected triangle area, so an inside-out box voxelizes to nothing.
+    auto addBox = [](std::vector<Tri>& out, const Vec3& c, const Vec3& e) {
+        const Vec3 v[8] = {
+            {c.x - e.x, c.y - e.y, c.z - e.z}, {c.x + e.x, c.y - e.y, c.z - e.z},
+            {c.x + e.x, c.y + e.y, c.z - e.z}, {c.x - e.x, c.y + e.y, c.z - e.z},
+            {c.x - e.x, c.y - e.y, c.z + e.z}, {c.x + e.x, c.y - e.y, c.z + e.z},
+            {c.x + e.x, c.y + e.y, c.z + e.z}, {c.x - e.x, c.y + e.y, c.z + e.z},
+        };
+        static const int f[6][4] = {
+            {0, 3, 2, 1},   // -z
+            {4, 5, 6, 7},   // +z
+            {0, 1, 5, 4},   // -y
+            {3, 7, 6, 2},   // +y
+            {0, 4, 7, 3},   // -x
+            {1, 2, 6, 5},   // +x
+        };
+        for (const auto& q : f) {
+            Tri a; a.v0 = v[q[0]]; a.v1 = v[q[1]]; a.v2 = v[q[2]];
+            Tri b; b.v0 = v[q[0]]; b.v1 = v[q[2]]; b.v2 = v[q[3]];
+            out.push_back(a); out.push_back(b);
+        }
+    };
+    // Exact signed distance to an axis-aligned box (Quilez's closed form): outside, the
+    // length of the componentwise-positive overhang; inside, the negated distance to the
+    // nearest face.
+    auto boxSdf = [](const Vec3& p, const Vec3& c, const Vec3& e) {
+        const Vec3 q(std::fabs(p.x - c.x) - e.x,
+                     std::fabs(p.y - c.y) - e.y,
+                     std::fabs(p.z - c.z) - e.z);
+        const Vec3 qp(std::max(q.x, 0.0), std::max(q.y, 0.0), std::max(q.z, 0.0));
+        return length(qp) + std::min(std::max(q.x, std::max(q.y, q.z)), 0.0);
+    };
+
+    // The bake's geometry is chosen so no lattice sample ever lands exactly ON a face:
+    // a sample at distance 0 has an arbitrary sign under the voxelizer's half-open span
+    // rule, and would make the anchor flap rather than fail. `pad` is deliberately not a
+    // round multiple of the voxel edge, which also keeps `nx/ny/nz` off their floor()
+    // boundaries.
+    const Vec3  kC(0.0, 0.0, 0.0), kE(0.5, 0.36, 0.24);
+    const double kPad = 0.2718;
+    const int    kRes = 41;
+
+    // ---- §1: the analytic anchor ----------------------------------------------
+    meshvox::SdfBake bake;
+    {
+        std::vector<Tri> tris;
+        addBox(tris, kC, kE);
+        bake = meshvox::bakeSignedDistance(tris.data(), 0, tris.size(), kRes, kPad);
+        if (!chkb("§1 box bake is non-empty", !bake.empty())) {
+            std::printf("[checksdf] FAIL\n");
+            return 1;
+        }
+        double wAll = 0.0, wFar = 0.0;
+        int nFar = 0, signBad = 0;
+        for (int i = 0; i < bake.nx; ++i)
+            for (int j = 0; j < bake.ny; ++j)
+                for (int k = 0; k < bake.nz; ++k) {
+                    const Vec3 p = bake.lo + Vec3(i * bake.h, j * bake.h, k * bake.h);
+                    const double want = boxSdf(p, kC, kE);
+                    const double got  = (double)bake.d[bake.at(i, j, k)];
+                    const double e = std::fabs(got - want);
+                    if (e > wAll) wAll = e;
+                    if ((got < 0.0) != (want < 0.0)) ++signBad;
+                    if (std::fabs(want) > 3.0 * bake.h) {
+                        ++nFar;
+                        if (e > wFar) wFar = e;
+                    }
+                }
+        ok &= chk("§1 worst |bake - analytic box SDF|", wAll, 0.0, 2e-6);
+        ok &= chk("§1 sign disagreements", (double)signBad, 0.0, 0.0);
+        // ---- §2: and specifically where only the sweeps can have reached -------
+        chkb("§2 the far-from-surface set is non-trivial", nFar > 1000);
+        ok &= chk("§2 worst error > 3 voxels from the surface", wFar, 0.0, 2e-6);
+    }
+
+    // ---- §3: two OVERLAPPING boxes read as their union -------------------------
+    {
+        const Vec3 cA(0.0, 0.0, 0.0), eA(0.4, 0.4, 0.4);
+        const Vec3 cB(0.5, 0.1, 0.0), eB(0.4, 0.25, 0.3);
+        std::vector<Tri> tris;
+        addBox(tris, cA, eA);
+        addBox(tris, cB, eB);
+        meshvox::SdfBake b2 = meshvox::bakeSignedDistance(tris.data(), 0, tris.size(), 33, 0.2137);
+        if (chkb("§3 overlapping-union bake is non-empty", !b2.empty())) {
+            int signBad = 0, overlapSamples = 0;
+            double wOut = 0.0;
+            for (int i = 0; i < b2.nx; ++i)
+                for (int j = 0; j < b2.ny; ++j)
+                    for (int k = 0; k < b2.nz; ++k) {
+                        const Vec3 p = b2.lo + Vec3(i * b2.h, j * b2.h, k * b2.h);
+                        const double dA = boxSdf(p, cA, eA), dB = boxSdf(p, cB, eB);
+                        const double got = (double)b2.d[b2.at(i, j, k)];
+                        const bool inside = (dA < 0.0) || (dB < 0.0);
+                        // Skip samples within half a voxel of either surface: their sign
+                        // is decided by the voxelizer's half-open span rule, not by the
+                        // question being asked here.
+                        if (std::min(std::fabs(dA), std::fabs(dB)) > 0.5 * b2.h &&
+                            (got < 0.0) != inside) ++signBad;
+                        if (dA < 0.0 && dB < 0.0) ++overlapSamples;
+                        // OUTSIDE both, the union's own distance provably equals
+                        // min(dA, dB): the nearer of the two closest points cannot lie in
+                        // the other box's interior without that box's surface being nearer
+                        // still. (INSIDE it does not — the bake also sees the two boxes'
+                        // buried faces, which are not on the union's boundary. That is a
+                        // documented limitation, not something this test hides.)
+                        if (dA > 0.0 && dB > 0.0)
+                            wOut = std::max(wOut, std::fabs(got - std::min(dA, dB)));
+                    }
+            chkb("§3 the two boxes actually overlap", overlapSamples > 100);
+            ok &= chk("§3 union sign disagreements (parity would hollow)",
+                      (double)signBad, 0.0, 0.0);
+            ok &= chk("§3 worst exterior |bake - min(dA,dB)|", wOut, 0.0, 2e-6);
+        }
+    }
+
+    // ---- §4: two DISJOINT boxes — non-convex, gap-crossing propagation ---------
+    {
+        const Vec3 cA(0.0, 0.0, 0.0), eA(0.30, 0.30, 0.30);
+        const Vec3 cB(1.2, 0.0, 0.0), eB(0.20, 0.35, 0.25);
+        std::vector<Tri> tris;
+        addBox(tris, cA, eA);
+        addBox(tris, cB, eB);
+        meshvox::SdfBake b3 = meshvox::bakeSignedDistance(tris.data(), 0, tris.size(), 49, 0.1613);
+        if (chkb("§4 disjoint-pair bake is non-empty", !b3.empty())) {
+            double w = 0.0;
+            for (int i = 0; i < b3.nx; ++i)
+                for (int j = 0; j < b3.ny; ++j)
+                    for (int k = 0; k < b3.nz; ++k) {
+                        const Vec3 p = b3.lo + Vec3(i * b3.h, j * b3.h, k * b3.h);
+                        const double dA = boxSdf(p, cA, eA), dB = boxSdf(p, cB, eB);
+                        // Disjoint and separated by more than either one's inradius, so
+                        // every boundary point of each box IS on the union's boundary and
+                        // the union's signed distance is just the nearer of the two.
+                        const double m = std::min(std::fabs(dA), std::fabs(dB));
+                        const double want = (dA < 0.0 || dB < 0.0) ? -m : m;
+                        w = std::max(w, std::fabs((double)b3.d[b3.at(i, j, k)] - want));
+                    }
+            ok &= chk("§4 worst |bake - union of two disjoint boxes|", w, 0.0, 2e-6);
+        }
+    }
+
+    // ---- §5: lattice geometry --------------------------------------------------
+    {
+        const Vec3 ext = kE * 2.0 + Vec3(2 * kPad, 2 * kPad, 2 * kPad);
+        const double maxExt = std::max(ext.x, std::max(ext.y, ext.z));
+        ok &= chk("§5 voxel edge == longestAxis / (res - 1)",
+                  bake.h, maxExt / (kRes - 1), 1e-12);
+        ok &= chk("§5 lo.x == aabbLo.x - pad", bake.lo.x, kC.x - kE.x - kPad, 1e-12);
+        ok &= chk("§5 lo.y == aabbLo.y - pad", bake.lo.y, kC.y - kE.y - kPad, 1e-12);
+        ok &= chk("§5 lo.z == aabbLo.z - pad", bake.lo.z, kC.z - kE.z - kPad, 1e-12);
+        ok &= chk("§5 res samples along the longest axis", (double)bake.nx, (double)kRes, 0.0);
+        chkb("§5 shorter axes get fewer samples", bake.ny < bake.nx && bake.nz < bake.ny);
+        // Cubic voxels: the same h on every axis, so the lattice covers each axis to
+        // within one voxel of its padded extent and never overshoots it.
+        const Vec3 hic = bake.hiCorner();
+        chkb("§5 hiCorner covers the padded AABB (within one voxel)",
+             hic.x >= kC.x + kE.x + kPad - 1e-12 &&
+             hic.y >= kC.y + kE.y + kPad - bake.h &&
+             hic.z >= kC.z + kE.z + kPad - bake.h);
+        chkb("§5 hiCorner does not overshoot",
+             hic.y <= kC.y + kE.y + kPad + 1e-12 &&
+             hic.z <= kC.z + kE.z + kPad + 1e-12);
+        ok &= chk("§5 sample count == nx*ny*nz", (double)bake.d.size(),
+                  (double)((size_t)bake.nx * bake.ny * bake.nz), 0.0);
+    }
+
+    // ---- §6: pointTriDistSq on obtuse triangles, vs an independent routine -----
+    {
+        // Independent and exact: project onto the plane; if the projection is inside the
+        // triangle that IS the closest point, otherwise the closest point lies on one of
+        // the three edges. Shares no code with the Voronoi-region version under test.
+        auto refDistSq = [](const Vec3& p, const Vec3& a, const Vec3& b, const Vec3& c) {
+            const Vec3 n = cross(b - a, c - a);
+            const double nn = dot(n, n);
+            if (nn > 0.0) {
+                const Vec3 q = p - n * (dot(n, p - a) / nn);          // p projected onto the plane
+                const double u = dot(cross(b - a, q - a), n) / nn;
+                const double v = dot(cross(q - a, c - a), n) / nn;
+                if (u >= 0.0 && v >= 0.0 && u + v <= 1.0) { const Vec3 e = p - q; return dot(e, e); }
+            }
+            auto segDistSq = [&](const Vec3& s, const Vec3& t) {
+                const Vec3 d = t - s;
+                const double dd = dot(d, d);
+                double w = (dd > 0.0) ? dot(p - s, d) / dd : 0.0;
+                w = std::min(std::max(w, 0.0), 1.0);
+                const Vec3 e = p - (s + d * w);
+                return dot(e, e);
+            };
+            return std::min(segDistSq(a, b), std::min(segDistSq(b, c), segDistSq(c, a)));
+        };
+        // A deliberately obtuse sliver (the angle at v1 is ~170 degrees) plus a second
+        // one rotated out of any axis plane, probed on a coarse lattice that covers all
+        // seven Voronoi regions and the interior.
+        const Vec3 tA[3][3] = {
+            {{0.0, 0.0, 0.0}, {1.0, 0.06, 0.0}, {2.0, 0.0, 0.0}},
+            {{0.0, 0.0, 0.0}, {0.9, 0.05, 0.4}, {1.7, -0.3, 0.9}},
+            {{-0.2, 0.1, -0.3}, {1.4, 0.02, 0.15}, {0.6, -0.05, 0.05}},
+        };
+        double w = 0.0;
+        for (const auto& t : tA)
+            for (int a = -6; a <= 6; ++a)
+                for (int b = -6; b <= 6; ++b)
+                    for (int c = -6; c <= 6; ++c) {
+                        const Vec3 p(0.25 * a, 0.25 * b, 0.25 * c);
+                        w = std::max(w, std::fabs(meshvox::pointTriDistSq(p, t[0], t[1], t[2]) -
+                                                  refDistSq(p, t[0], t[1], t[2])));
+                    }
+        ok &= chk("§6 pointTriDistSq vs independent exact routine", w, 0.0, 1e-12);
+    }
+
+    // ---- §7: memory order, read the way a pattern reads it ---------------------
+    {
+        // Publish the §1 bake as a PatGrid exactly the way the loader does, then sample
+        // it through patGridSample at OFF-lattice points. Trilinear interpolation of an
+        // exact distance field is not itself exact, so the tolerance is the interpolation
+        // error of a field whose second derivative is O(1/|d|) — but a transposed lattice
+        // is off by whole tenths, three orders of magnitude above it.
+        PatGrid g;
+        g.ndim = 3;
+        g.shape[0] = bake.nx; g.shape[1] = bake.ny; g.shape[2] = bake.nz;
+        const Vec3 hic = bake.hiCorner();
+        g.lo[0] = bake.lo.x; g.lo[1] = bake.lo.y; g.lo[2] = bake.lo.z;
+        g.hi[0] = hic.x;     g.hi[1] = hic.y;     g.hi[2] = hic.z;
+        g.outside = PatGridOutside::Clamp;
+        g.off = 0; g.count = (int)bake.d.size();
+        double w = 0.0;
+        for (int a = 1; a < 12; ++a)
+            for (int b = 1; b < 12; ++b)
+                for (int c = 1; c < 12; ++c) {
+                    // Irrational-ish offsets so no probe lands on a lattice node.
+                    const Vec3 p(bake.lo.x + (a + 0.371) * (bake.nx - 2) * bake.h / 12.0,
+                                 bake.lo.y + (b + 0.517) * (bake.ny - 2) * bake.h / 12.0,
+                                 bake.lo.z + (c + 0.233) * (bake.nz - 2) * bake.h / 12.0);
+                    const double co[3] = {p.x, p.y, p.z};
+                    const double got = patGridSample(g, bake.d.data(), (int)bake.d.size(), co);
+                    w = std::max(w, std::fabs(got - boxSdf(p, kC, kE)));
+                }
+        ok &= chk("§7 patGridSample vs analytic (axis order + interp)", w, 0.0, 0.35 * bake.h);
+        // And the transposed reading is unambiguously worse — otherwise the tolerance
+        // above is loose enough to pass either way and the section proves nothing.
+        PatGrid gt = g;
+        gt.shape[0] = bake.nz; gt.shape[2] = bake.nx;
+        gt.lo[0] = bake.lo.z;  gt.lo[2] = bake.lo.x;
+        gt.hi[0] = hic.z;      gt.hi[2] = hic.x;
+        double wt = 0.0;
+        for (int a = 1; a < 12; ++a)
+            for (int c = 1; c < 12; ++c) {
+                const Vec3 p(bake.lo.x + (a + 0.371) * (bake.nx - 2) * bake.h / 12.0,
+                             0.0,
+                             bake.lo.z + (c + 0.233) * (bake.nz - 2) * bake.h / 12.0);
+                const double co[3] = {p.x, p.y, p.z};
+                wt = std::max(wt, std::fabs(patGridSample(gt, bake.d.data(), (int)bake.d.size(), co) -
+                                            boxSdf(p, kC, kE)));
+            }
+        chkb("§7 a transposed lattice would fail loudly", wt > 20.0 * (0.35 * bake.h));
+    }
+
+    // ---- §8: the loader round trip ---------------------------------------------
+    // A cube as OBJ text, handed to the loader through the same in-memory asset overlay
+    // the loom live channel uses, so the test needs no file on disk.
+    auto cubeObj = [](const Vec3& c, const Vec3& e) {
+        std::string s = "# unit box\n";
+        char buf[128];
+        const double sx[8] = {-1, 1, 1, -1, -1, 1, 1, -1};
+        const double sy[8] = {-1, -1, 1, 1, -1, -1, 1, 1};
+        const double sz[8] = {-1, -1, -1, -1, 1, 1, 1, 1};
+        for (int i = 0; i < 8; ++i) {
+            std::snprintf(buf, sizeof buf, "v %.17g %.17g %.17g\n",
+                          c.x + sx[i] * e.x, c.y + sy[i] * e.y, c.z + sz[i] * e.z);
+            s += buf;
+        }
+        static const int f[6][4] = {
+            {0, 3, 2, 1}, {4, 5, 6, 7}, {0, 1, 5, 4}, {3, 7, 6, 2}, {0, 4, 7, 3}, {1, 2, 6, 5},
+        };
+        for (const auto& q : f) {   // 1-based indices, quads (the loader triangulates)
+            std::snprintf(buf, sizeof buf, "f %d %d %d %d\n",
+                          q[0] + 1, q[1] + 1, q[2] + 1, q[3] + 1);
+            s += buf;
+        }
+        return s;
+    };
+    // `body` is dropped between the scene header and the geometry; every scene here has
+    // the same cube, camera and light so only the `sdf` fragment varies.
+    auto loadWithCube = [&](const std::string& body, ftsl::Loaded& L, std::string& err) {
+        assetbytes::Overlay ov;
+        ov.put("cube.obj", cubeObj(kC, kE));
+        const std::string src =
+            "scene { units meters  spectral 360 830 1 }\n" + body +
+            "material \"grey\" { type diffuse reflect rgb 0.5 0.5 0.5 }\n"
+            "mesh \"blk\" { file \"cube.obj\"  material grey }\n"
+            "quad { origin -2 -1 -2  u 4 0 0  v 0 0 4  material grey }\n"
+            "light area { origin -0.5 1.5 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0"
+            "  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0 0.6 2.5  look_at 0 0 0  up 0 1 0  fov_y 40"
+            "  film { res 8 8 } }\n";
+        return ftsl::loadSource(src, "<checksdf>", L, err, {}, nullptr, &ov);
+    };
+    {
+        ftsl::Loaded L; std::string e;
+        const std::string body =
+            "sdf \"halo\" { object \"blk\"  res 41  pad 0.2718 }\n"
+            "pattern \"prox\" { expr \"grid:halo(x, y, z)\" }\n";
+        if (!chkb("§8 sdf scene loads", loadWithCube(body, L, e)))
+            std::printf("[checksdf]     load error: %s\n", e.c_str());
+        else if (chkb("§8 one grid registered", L.scene.grids.size() == 1)) {
+            const PatGrid& g = L.scene.grids[0];
+            ok &= chk("§8 registered grid is 3-D", (double)g.ndim, 3.0, 0.0);
+            ok &= chk("§8 grid sample count", (double)g.count,
+                      (double)((size_t)g.shape[0] * g.shape[1] * g.shape[2]), 0.0);
+            chkb("§8 samples landed in the shared pool",
+                 g.off >= 0 && g.off + g.count <= (int)L.scene.dataPool.size());
+            ok &= chk("§8 lattice lo.x == aabbLo.x - pad", g.lo[0], kC.x - kE.x - 0.2718, 1e-9);
+            // The payload: read the published field the way a material would.
+            double w = 0.0;
+            for (int a = 1; a < 10; ++a)
+                for (int b = 1; b < 10; ++b)
+                    for (int c = 1; c < 10; ++c) {
+                        const Vec3 p(g.lo[0] + (g.hi[0] - g.lo[0]) * (a + 0.31) / 10.5,
+                                     g.lo[1] + (g.hi[1] - g.lo[1]) * (b + 0.47) / 10.5,
+                                     g.lo[2] + (g.hi[2] - g.lo[2]) * (c + 0.19) / 10.5);
+                        const double co[3] = {p.x, p.y, p.z};
+                        w = std::max(w, std::fabs(patGridSample(g, L.scene.dataPool.data(),
+                                                                (int)L.scene.dataPool.size(), co) -
+                                                  boxSdf(p, kC, kE)));
+                    }
+            const double hh = (g.hi[0] - g.lo[0]) / (g.shape[0] - 1);
+            ok &= chk("§8 published field vs analytic box SDF", w, 0.0, 0.35 * hh);
+        }
+    }
+
+    // ---- §9: the loader's refusals ---------------------------------------------
+    {
+        auto rejects = [&](const char* label, const std::string& body, const char* needle) {
+            ftsl::Loaded L; std::string e;
+            if (loadWithCube(body, L, e)) { chkb(label, false); return; }
+            if (needle && e.find(needle) == std::string::npos) {
+                std::printf("[checksdf] %-52s message omits \"%s\" (was: %s)  BAD\n",
+                            label, needle, e.c_str());
+                ok = false;
+            }
+        };
+        rejects("§9 sdf without `object` is rejected",
+                "sdf \"halo\" { res 32 }\n", "object");
+        rejects("§9 sdf naming an unknown object is rejected",
+                "sdf \"halo\" { object \"nope\" }\n", "nope");
+        rejects("§9 duplicate sdf/grid name is rejected",
+                "sdf \"halo\" { object \"blk\" }\nsdf \"halo\" { object \"blk\" }\n",
+                "duplicate");
+        rejects("§9 res below the floor is rejected",
+                "sdf \"halo\" { object \"blk\"  res 4 }\n", "res");
+        rejects("§9 res above the ceiling is rejected",
+                "sdf \"halo\" { object \"blk\"  res 4096 }\n", "res");
+        rejects("§9 negative pad is rejected",
+                "sdf \"halo\" { object \"blk\"  pad -1 }\n", "pad");
+        // The one that matters: a procedural texture is baked WHILE the scene loads.
+        rejects("§9 sdf read from a procedural texture is rejected",
+                "sdf \"halo\" { object \"blk\" }\n"
+                "texture \"t\" { res 8 8  rgb \"grid:halo(u, v, 0)\" \"0\" \"0\" }\n",
+                "halo");
+        // …and the guard is not a blanket ban: the same texture over an ordinary
+        // expression still loads, or the check above is vacuous.
+        {
+            ftsl::Loaded L; std::string e;
+            if (!loadWithCube("texture \"t\" { res 8 8  rgb \"u\" \"v\" \"0.5\" }\n", L, e)) {
+                std::printf("[checksdf] §9 an ordinary procedural texture was rejected"
+                            " (%s)  BAD\n", e.c_str());
+                ok = false;
+            }
+        }
+        // Inputs with no lattice to bake onto return an EMPTY bake, which the loader turns
+        // into a load error. The alternative — a lattice of zeros — would be worse than no
+        // field at all, because 0 in a distance field means "exactly on the surface".
+        {
+            std::vector<Tri> tris;
+            addBox(tris, kC, Vec3(0, 0, 0));            // all 8 corners coincident
+            chkb("§9 zero-extent mesh with no pad bakes to an empty lattice",
+                 meshvox::bakeSignedDistance(tris.data(), 0, tris.size(), 16, 0.0).empty());
+            chkb("§9 empty triangle range bakes to an empty lattice",
+                 meshvox::bakeSignedDistance(tris.data(), 0, 0, 16, 0.1).empty());
+            // A zero-VOLUME mesh with padding is NOT empty, and must not be: it still has a
+            // perfectly good unsigned field (here, distance to a point). What it must not do
+            // is invent an interior out of a solid that has no inside.
+            meshvox::SdfBake pt = meshvox::bakeSignedDistance(tris.data(), 0, tris.size(), 16, 0.1);
+            if (chkb("§9 zero-volume mesh with pad still bakes", !pt.empty())) {
+                double mn = 1e30, mx = -1e30;
+                for (float v : pt.d) { mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); }
+                chkb("§9 …and invents no interior", mn >= 0.0);
+                chkb("§9 …and its far corner is a real distance", mx > 0.05);
+            }
+        }
+    }
+
+    std::printf("[checksdf] worst absolute error = %.3g\n", worst);
+    std::printf("[checksdf] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -3306,6 +6347,71 @@ static bool writeFilm(const char* path, const Film& f, double N, double expComp 
     return true;
 }
 
+// --- Shared auto-exposure anchor across separate invocations (-exposure-anchor) -------
+// `-exposure-lock` shares one p99 anchor between the cameras of a camera_path, but only
+// WITHIN a process. A frame-per-invocation sequence — one .ftsl and one ftrace run per
+// frame, which is how batch flyby scripts and any external animator drive the renderer —
+// re-derives the anchor every frame, and that anchor is a single order statistic. When a
+// scene has a bright, compact specular/emitter population (a glossy ring catching an area
+// light, say), the luminance histogram is BIMODAL: the ordinary scene occupies the low
+// mode and the highlight a far-brighter one, with almost no mass between them. As the
+// highlight's AREA sweeps across 1% of the frame, the 99th-percentile rank falls off the
+// cliff from one mode to the other and the anchor jumps discontinuously — measured at up
+// to 42% between adjacent frames of png/pastel_jack_ring, whose real lighting (static
+// background, p95, median) moved less than 2.3% over the same step. Every frame is
+// individually defensible; the assembled movie flickers. Sharing one anchor across the
+// whole sequence removes the artifact by construction, leaving only the genuine (smooth)
+// lighting change.
+//
+// The argument is either a literal positive number (use exactly this anchor and write
+// nothing) or a path: read it if it already holds a positive number, otherwise let this
+// frame compute its anchor normally and save it there for the following frames to reuse.
+struct ExposureAnchorFile {
+    double      value = 0.0;   // >0 = anchor to pre-populate (skip the per-frame p99)
+    std::string writePath;     // non-empty = save the resolved anchor here when we exit
+
+    // Parse a WHOLE string as a finite positive double. The trailing-junk check is what
+    // keeps a filename like "12frames.txt" from being mistaken for the number 12.
+    static bool asNumber(const std::string& s, double& out) {
+        if (s.empty()) return false;
+        const char* p = s.c_str();
+        char* end = nullptr;
+        double v = std::strtod(p, &end);
+        if (end == p) return false;
+        while (*end && std::isspace((unsigned char)*end)) ++end;
+        if (*end || !(v > 0.0) || !std::isfinite(v)) return false;
+        out = v;
+        return true;
+    }
+    void resolve(const std::string& arg) {
+        if (arg.empty()) return;
+        if (asNumber(arg, value)) return;                          // literal anchor
+        std::ifstream in(arg);
+        std::string tok;
+        if (in && (in >> tok) && asNumber(tok, value)) {           // reuse a saved anchor
+            std::printf("[exposure] anchor %.6g loaded from %s (shared with this sequence)\n",
+                        value, arg.c_str());
+            return;
+        }
+        value = 0.0;
+        writePath = arg;                                           // first frame: compute + save
+    }
+    void save(double resolved) const {
+        if (writePath.empty() || !(resolved > 0.0)) return;
+        std::ofstream o(writePath);
+        if (!o) {
+            std::fprintf(stderr, "warning: could not write exposure anchor to %s\n",
+                         writePath.c_str());
+            return;
+        }
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%.17g\n", resolved);
+        o << buf;
+        std::printf("[exposure] anchor %.6g saved to %s (later frames will reuse it)\n",
+                    resolved, writePath.c_str());
+    }
+};
+
 // --- Live terminal preview ----------------------------------------------------
 // Downsample the display film to a small ANSI-truecolour thumbnail and redraw it in
 // place (cursor moved back up over the previous frame) so -time/-forever renders show
@@ -4318,6 +7424,39 @@ static std::string                 g_windowTitle = "ftrace live preview";
 // Each render dispatch (runRender / runSharedGroup / runSharedPhotonMap) stamps it so a
 // multi-camera flight with per-camera modes always shows the mode of the frame on screen.
 static std::string                 g_windowMode;
+// Which device the frame on screen is ACTUALLY being traced on — "GPU (<card>)" or
+// "CPU (N threads)". Stamped by each render dispatch once the device is *resolved*, not
+// when it is requested: `-device auto` falls back to the CPU after probing VRAM, several
+// transport modes have no GPU path at all, and a CUDA build on a machine with no card
+// silently runs on the CPU. Those are exactly the cases where you want the title bar to
+// tell you, because the only other symptom is "this render seems slow".
+static std::string                 g_windowBackend;
+static std::string backendLabel(bool gpu, int nThreads) {
+#ifdef HAVE_CUDA
+    if (gpu) {
+        const char* dev = cudaDeviceName();
+        return (dev && *dev) ? "GPU (" + std::string(dev) + ")" : std::string("GPU");
+    }
+#else
+    (void)gpu;
+#endif
+    if (gpu) return "GPU";
+    return "CPU (" + std::to_string(std::max(1, nThreads)) + " threads)";
+}
+// The ONE place a live-window title is assembled: subject — mode/progress — device.
+// Every setTitle call site goes through this so the device tag cannot be forgotten at
+// one of them (there are a dozen: the placeholder, tessellation, exposure metering, the
+// raster preview, mode W, the path-tracer and the per-camera flight loop). `rest` is the
+// mode/progress part; either half may be empty (the backend is blank until it resolves).
+static std::string liveTitle(const std::string& rest) {
+    std::string t = g_windowTitle;
+    if (!rest.empty())            t += "  \xE2\x80\x94  " + rest;
+    if (!g_windowBackend.empty()) t += "  \xE2\x80\x94  " + g_windowBackend;
+    return t;
+}
+static void setLiveTitle(const std::string& rest) {
+    if (g_liveWin && !g_liveWin->closed()) g_liveWin->setTitle(liveTitle(rest));
+}
 // Human-readable name for a transport mode char (title bar + diagnostics).
 static const char* modeLabel(char m) {
     switch (m) {
@@ -4420,9 +7559,7 @@ static void liveWindowPlaceholder(int w, int h, const std::string& stage) {
     }
     // Re-title even when the window already exists: callers use this to advance the stage
     // ("preparing" -> "tessellating (3/8)" -> the render's own progress line).
-    if (!g_liveWin->closed())
-        g_liveWin->setTitle(stage.empty() ? g_windowTitle
-                                          : g_windowTitle + "  \xE2\x80\x94  " + stage);
+    setLiveTitle(stage);
 }
 
 static void liveWindowUpdate(const Film& f, double N, double expComp, bool absolute,
@@ -4443,11 +7580,11 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     // image the same way the ANSI preview does.
     std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr);
     g_liveWin->update(f.resX, f.resY, rgb);
-    // Reflect the render subject + mode + live progress in the title bar.
-    std::string t = g_windowTitle;
-    if (!g_windowMode.empty())     t += "  \xE2\x80\x94  " + g_windowMode;
-    if (status && *status)         t += "  \xE2\x80\x94  " + std::string(status);
-    g_liveWin->setTitle(t);
+    // Reflect the render subject + mode + live progress + device in the title bar.
+    std::string rest = g_windowMode;
+    if (status && *status)
+        rest += (rest.empty() ? "" : "  \xE2\x80\x94  ") + std::string(status);
+    g_liveWin->setTitle(liveTitle(rest));
     if (g_liveWin->closed()) g_stopRequested = 1;
     g_lastWindowPaint = std::chrono::steady_clock::now();
     const double cost = std::chrono::duration<double>(g_lastWindowPaint - tPaint).count();
@@ -4690,8 +7827,13 @@ static bool readBinaryPPM(const std::string& path, int& W, int& H,
 // `expComp` is the -exposure/-ev multiplier applied on top of the auto-exposure
 // (<= 0 means "plain auto"). It only affects a .ftbuf, whose linear film is still
 // tone-mapped here; a .ppm is already 8-bit sRGB and is copied through verbatim.
+// `lockAnchor` (optional, -exposure-anchor) is the shared auto-exposure anchor: >0 on
+// entry means reuse it instead of measuring this film's p99, and it is written back
+// when it starts at 0. Re-developing a directory of .ftbuf checkpoints through one
+// anchor is how a finished but flickering sequence is repaired WITHOUT re-rendering —
+// the checkpoints still hold the raw linear film, so only the tone map has to be redone.
 static int convertToPng(const std::string& inPath, const std::string& outPath,
-                        double expComp = 0.0) {
+                        double expComp = 0.0, double* lockAnchor = nullptr) {
     if (endsWithCI(inPath, ".ppm")) {
         int W = 0, H = 0; std::vector<uint8_t> rgb;
         if (!readBinaryPPM(inPath, W, H, rgb)) {
@@ -4726,9 +7868,11 @@ static int convertToPng(const std::string& inPath, const std::string& outPath,
         in.read((char*)f.xyz.data(),  (std::streamsize)(f.xyz.size()  * sizeof(Vec3)));
         in.read((char*)f.hits.data(), (std::streamsize)(f.hits.size() * sizeof(double)));
         if (!in) { std::fprintf(stderr, "error: %s truncated\n", inPath.c_str()); return 1; }
-        // Tone-map with the p99 auto-exposure (see note above), scaled by -ev if given.
+        // Tone-map with the p99 auto-exposure (see note above), scaled by -ev if given,
+        // or with the shared -exposure-anchor when one was supplied.
         // writeFilm prints the "wrote <out> ..." line, including the comp when != 1.
-        return writeFilm(outPath.c_str(), f, (double)std::max<long long>(Nph, 1), expComp) ? 0 : 1;
+        return writeFilm(outPath.c_str(), f, (double)std::max<long long>(Nph, 1), expComp,
+                         /*quiet*/false, lockAnchor) ? 0 : 1;
     }
     std::fprintf(stderr,
         "error: -topng converts .ppm and .ftbuf inputs; got '%s'.\n"
@@ -5546,6 +8690,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         }
     }
 #endif
+
+    // Now that the device is resolved, tell the title bar which one won. This is the single
+    // point where `useGpu` stops changing, so stamping here reports the device the frames
+    // are really traced on rather than the one `-device` asked for.
+    g_windowBackend = backendLabel(useGpu, nThreads);
 
     // Now that the device is resolved, warn if this render's BACKWARD layer will actually
     // run on the CPU tracer, which collapses `scene.media` to `backwardMedium()` (see the
@@ -6504,6 +9653,10 @@ static void printHelp(const char* prog) {
 "  -view EX,EY,EZ/LX,LY,LZ[/FOV]   ad-hoc eye/look-at[/fovY] camera; renders just it\n"
 "  -exposure|-ev <c>     override every camera's exposure compensation\n"
 "  -exposure-lock        one shared auto-exposure anchor across all rendered cameras\n"
+"  -exposure-anchor <v|file>  share ONE auto-exposure anchor across separate ftrace\n"
+"                        runs (a frame-per-invocation sequence): a number uses that\n"
+"                        anchor, a path is read if it holds one and written if not.\n"
+"                        Also accepted by -topng, to re-develop .ftbuf checkpoints.\n"
 "  -hdr                  also write a 32-bit float PFM beside -o (scene-linear, no\n"
 "                        exposure/gamma/clamp) so highlights stay measurable — a PNG\n"
 "                        clips every caustic core to the same white and loses its colour\n"
@@ -6608,6 +9761,8 @@ static void printHelp(const char* prog) {
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
 "  -raster-iso <n>       marching-cubes resolution for isosurfaces (0 = skip)\n"
+"  -raster-curve-budget <n>  max preview triangles spent on curve/fur strands (default 12000000;\n"
+"                        over it the tubes coarsen, then whole strands thin out)\n"
 "  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T to cycle\n"
 "                        the lit preview: raster -> mode W (deterministic, CPU, any scene) -> path-traced (GPU)\n"
 "  -noclip|-nocollide    start the fly viewer with wall collision off\n"
@@ -6623,12 +9778,19 @@ static void printHelp(const char* prog) {
 "\n"
 "Utilities (exit after running):\n"
 "  -topng|-convert <in> <out.png> [-ev <c>]   convert .ppm/.ftbuf to PNG\n"
-"                        (-ev re-develops a .ftbuf brighter/darker, no re-render)\n"
+"                        (-ev re-develops a .ftbuf brighter/darker, no re-render;\n"
+"                         -exposure-anchor <v|file> re-develops a whole flickering\n"
+"                         sequence through one shared anchor, also no re-render)\n"
 "  -review <base>        play a rendered frame sequence on the live window\n"
 "  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
 "  -viewer <s.json>      open the loom native viewer on a scene-introspection sidecar\n"
 "  -loom <scene.py>      with -viewer: re-derive geometry live from this loom build\n"
+"  -play                 with -viewer: open with the clock already playing\n"
+"  -prebake              with -viewer: bake the whole clock into memory on open, then\n"
+"                        play from cache at a real frame rate instead of at loom's\n"
+"  -prebake-cap <MB>     memory budget for -prebake (default 1024); a cache that hits\n"
+"                        the cap covers a prefix and the rest still bakes on demand\n"
 "  -h | --help           show this help and exit\n"
 "  -version | -V         print the version and exit\n"
 "\n"
@@ -6675,22 +9837,37 @@ static int run(int argc, char** argv) {
     // checkpoint). Kept before all scene/CLI setup so it is a pure utility path.
     if (argc >= 2 && (!std::strcmp(argv[1], "-topng") || !std::strcmp(argv[1], "-convert"))) {
         if (argc < 4) {
-            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> [-ev <c>] <output.png>\n",
-                         argv[0]);
+            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> [-ev <c>] "
+                                 "[-exposure-anchor <val|file>] <output.png>\n", argv[0]);
             return 2;
         }
         // This branch runs before the main parse loop, so -exposure/-ev has to be picked
         // up here or it is silently ignored (it was, until 0.102.1). Only meaningful for
         // .ftbuf, which still holds linear film and is tone-mapped on the way out; a .ppm
-        // is already 8-bit sRGB and is copied through untouched.
+        // is already 8-bit sRGB and is copied through untouched. Same for
+        // -exposure-anchor, which is what lets a whole directory of .ftbuf checkpoints be
+        // re-developed through ONE anchor (see ExposureAnchorFile).
         double convExp = 0.0;   // <=0 = plain p99 auto-exposure
-        for (int i = 4; i + 1 < argc; ++i)
+        std::string convAnchorArg;
+        for (int i = 4; i + 1 < argc; ++i) {
             if (!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev"))
                 convExp = std::atof(argv[++i]);
-        if (convExp > 0.0 && endsWithCI(argv[2], ".ppm"))
+            else if (!std::strcmp(argv[i], "-exposure-anchor"))
+                convAnchorArg = argv[++i];
+        }
+        const bool isPpm = endsWithCI(argv[2], ".ppm");
+        if (convExp > 0.0 && isPpm)
             std::fprintf(stderr, "warning: -ev ignored for a .ppm input (already 8-bit sRGB); "
                                  "it only applies to a .ftbuf's linear film\n");
-        return convertToPng(argv[2], argv[3], convExp);
+        if (!convAnchorArg.empty() && isPpm)
+            std::fprintf(stderr, "warning: -exposure-anchor ignored for a .ppm input (already "
+                                 "8-bit sRGB); it only applies to a .ftbuf's linear film\n");
+        ExposureAnchorFile convAnchor;
+        convAnchor.resolve(convAnchorArg);
+        int convRc = convertToPng(argv[2], argv[3], convExp,
+                                  convAnchorArg.empty() ? nullptr : &convAnchor.value);
+        if (convRc == 0) convAnchor.save(convAnchor.value);
+        return convRc;
     }
     // Rendered-sequence review player (no rendering): `ftrace -review <base>`.
     // Plays a directory of `<base><digits>.<ext>` frames on the live window/timeline,
@@ -6719,6 +9896,8 @@ static int run(int argc, char** argv) {
     double focusDist = 0.0;   // mode C thin-lens focus distance (0 = no lens)
     bool checkBvhOnly = false;
     bool checkImplicitOnly = false;
+    bool checkCurveOnly = false;
+    bool checkFurOnly = false;
     bool checkContainerOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
@@ -6748,6 +9927,12 @@ static int run(int argc, char** argv) {
     bool checkGratingOnly = false;
     bool checkUpsampleOnly = false;
     bool checkGridOnly = false;
+    bool checkVNoiseOnly = false;
+    bool checkWorleyOnly = false;
+    bool checkGaborOnly = false;
+    bool checkCurvOnly = false;
+    bool checkCavityOnly = false;
+    bool checkSdfOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
     bool checkPropOnly = false;
@@ -6768,6 +9953,7 @@ static int run(int argc, char** argv) {
     Vec3   viewEye{0,0,0}, viewLook{0,0,0}, viewUp{0,1,0};
     double viewFov = 40.0;
     bool forceExposureLock = false;  // -exposure-lock: one shared auto-exposure anchor across all rendered cameras
+    std::string expAnchorArg;        // -exposure-anchor <val|file>: share that anchor across separate invocations too
     double timeBudgetSec = 0.0;   // -time <sec>: wall-clock render budget (modes A/B/C forward, R/D spp)
     double noiseTarget = 0.0;     // -noise <pct>: stop when estimated graininess falls to this % (A/B/C, R/D)
     bool resume = false;          // -resume: continue an accumulated render from its .ftbuf checkpoint (A/B/C)
@@ -6785,6 +9971,10 @@ static int run(int argc, char** argv) {
     std::string animSidecar;      // -anim <file.json>: loom CurveDrive sidecar the curve editor seeds from / saves back to (E2 channel a)
     std::string animLoomScene;    // -loom <scene.py>: with -anim, the build file the LIVE channel re-derives from (E2 channel b)
     int  rasterIso   = 96;        // -raster-iso <n>: marching-cubes resolution for isosurfaces (0 = skip)
+    // -raster-curve-budget <n>: cap on preview triangles spent tessellating curve/fur strands.
+    // 0 = raster::kDefaultCurveBudget. A groomed pelt is millions of segments; at the full
+    // 80-tris/segment cone that is tens of GB of PTri, which is what used to wedge -explore.
+    size_t rasterCurveBudget = 0;
     bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
     int  rasterBench = 0;         // -raster-bench <n>: render the first camera n times, report steady-state ms/frame (explorer metric)
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
@@ -6966,10 +10156,11 @@ static int run(int argc, char** argv) {
         if (parseOnly) {
             const Scene& sc = ftslScene.scene;
             std::printf("[parseonly] ok: %zu materials, %zu records, %zu emitters, "
-                        "%zu spheres, %zu tris, %zu implicits, %zu textures, "
-                        "%zu patterns, %zu cameras\n",
+                        "%zu spheres, %zu tris, %zu implicits, %zu curves (%zu segs), "
+                        "%zu textures, %zu patterns, %zu cameras\n",
                         sc.mats.size(), sc.records.size(), sc.emitters.size(),
                         sc.spheres.size(), sc.tris.size(), sc.implicits.size(),
+                        sc.curves.size(), sc.curveSegs.size(),
                         sc.textures.size(), sc.patterns.size(),
                         ftslScene.cameras.size());
             return 0;
@@ -6987,6 +10178,15 @@ static int run(int argc, char** argv) {
     }
 
     for (int i = 1; i < argc; ++i) {
+        // NOTE — why this option table is split into SEGMENTS. MSVC caps how deeply blocks
+        // may nest (C1061, ~128 levels) and every link of an `else if` chain costs one
+        // level, so a single chain covering every flag hits the compiler limit and the
+        // build dies on whichever flag happened to be added last. Each segment is its own
+        // chain that ends in `else handled = false;`, and the next one only runs when the
+        // previous matched nothing; the LAST segment ends in the unknown-option error.
+        // Adding a flag = appending to the segment it belongs with; if a segment grows
+        // past ~100 links, start another one the same way.
+        bool handled = true;
         if (!std::strcmp(argv[i], "-n") && i + 1 < argc) {
             // Photon count. Accept both plain integers ("200000000") and scientific /
             // float shorthand ("2e8", "1.5e9") — atoll stops at the 'e', so parse the
@@ -7105,11 +10305,17 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-focus") && i + 1 < argc) focusDist = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-checkbvh")) checkBvhOnly = true;
         else if (!std::strcmp(argv[i], "-checkimplicit")) checkImplicitOnly = true;
+        else if (!std::strcmp(argv[i], "-checkcurve")) checkCurveOnly = true;
+        else if (!std::strcmp(argv[i], "-checkfur")) checkFurOnly = true;
         else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
         else if (!std::strcmp(argv[i], "-checkfluoro")) checkFluoroOnly = true;
-        else if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
+        else handled = false;
+
+        // ---- segment 2 (see the nesting note at the top of the loop) ----------------
+        if (!handled) {
+        if (!std::strcmp(argv[i], "-mesh") && i + 1 < argc) meshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-meshscale") && i + 1 < argc) meshScale = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-export-mesh") && i + 1 < argc) exportMeshPath = argv[++i];
         else if (!std::strcmp(argv[i], "-mesh-res") && i + 1 < argc) exportMeshRes = std::atoi(argv[++i]);
@@ -7138,6 +10344,12 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkgrating")) checkGratingOnly = true;
         else if (!std::strcmp(argv[i], "-checkupsample")) checkUpsampleOnly = true;
         else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
+        else if (!std::strcmp(argv[i], "-checkvnoise")) checkVNoiseOnly = true;
+        else if (!std::strcmp(argv[i], "-checkworley")) checkWorleyOnly = true;
+        else if (!std::strcmp(argv[i], "-checkgabor")) checkGaborOnly = true;
+        else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
+        else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
+        else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
         else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
@@ -7187,9 +10399,12 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-no-meter") || !std::strcmp(argv[i], "-nometer")) noMeter = true;
         else if (!std::strcmp(argv[i], "-noclip") || !std::strcmp(argv[i], "-nocollide")) viewerNoclip = true;
         else if (!std::strcmp(argv[i], "-raster-iso") && i + 1 < argc) rasterIso = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-raster-curve-budget") && i + 1 < argc)
+            rasterCurveBudget = (size_t)std::max(0LL, std::atoll(argv[++i]));
         else if (!std::strcmp(argv[i], "-see-through") || !std::strcmp(argv[i], "-seethrough") || !std::strcmp(argv[i], "-glass")) rasterSeeThrough = true;
         else if (!std::strcmp(argv[i], "-glass-clarity") && i + 1 < argc) { rasterClarity = std::clamp(std::atof(argv[++i]), 0.0, 1.0); rasterSeeThrough = true; }
         else if (!std::strcmp(argv[i], "-exposure-lock")) forceExposureLock = true;
+        else if (!std::strcmp(argv[i], "-exposure-anchor") && i + 1 < argc) expAnchorArg = argv[++i];
         else if (!std::strcmp(argv[i], "-stereo") && i + 1 < argc) {
             std::string m = argv[++i];
             for (auto& c : m) c = (char)std::tolower((unsigned char)c);
@@ -7243,6 +10458,7 @@ static int run(int argc, char** argv) {
             std::fprintf(stderr, "ftrace: unknown option '%s' (try -h / --help)\n", argv[i]);
             return 2;
         }
+        }   // end segment 2
     }
     if (nThreads < 1) nThreads = 1;
 
@@ -7304,6 +10520,8 @@ static int run(int argc, char** argv) {
         g_windowTitle = "ftrace  \xE2\x80\x94  " + scene + "  \xE2\x86\x92  " + out;
     }
     if (checkImplicitOnly) return checkImplicit(500'000) == 0 ? 0 : 1; // deterministic, no scene needed
+    if (checkCurveOnly)    return checkCurve(200'000) == 0 ? 0 : 1;    // deterministic, no scene needed
+    if (checkFurOnly)      return checkFur(50'000) == 0 ? 0 : 1;      // deterministic, no scene needed
     if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed
@@ -7315,6 +10533,12 @@ static int run(int argc, char** argv) {
     if (checkGratingOnly)  return checkGrating();  // deterministic, no scene needed
     if (checkUpsampleOnly) return checkUpsample(); // deterministic, no scene needed
     if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
+    if (checkVNoiseOnly)   return checkVNoise();   // ditto (vector noise / domain warp)
+    if (checkWorleyOnly)   return checkWorley();   // ditto (cellular / Worley noise)
+    if (checkGaborOnly)    return checkGabor();    // ditto (anisotropic band-limited Gabor noise)
+    if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
+    if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
+    if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
     if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)
@@ -7365,6 +10589,17 @@ static int run(int argc, char** argv) {
         };
         if (!ensureOutDir("output", out)) return 2;
         if (!g_pmapSave.empty() && !ensureOutDir("-savemap", g_pmapSave)) return 2;
+    }
+
+    // -exposure-anchor: resolve the shared anchor BEFORE the camera list is built, because
+    // it implies -exposure-lock and the expGroup each camera gets is decided down there.
+    // Once resolved it rides the existing per-group anchor machinery (expAnchors[0]) — a
+    // pre-populated group anchor is exactly what the camera_path exposure-lock already
+    // means, so nothing in the render dispatch needs to know this came from a file.
+    ExposureAnchorFile expAnchorFile;
+    if (!expAnchorArg.empty()) {
+        expAnchorFile.resolve(expAnchorArg);
+        forceExposureLock = true;
     }
 
     bool prism     = !std::strcmp(sceneName, "prism");
@@ -7504,7 +10739,12 @@ static int run(int argc, char** argv) {
     if (checkBvhOnly) {
         // Bound the linear-reference work (~O(rays * prims)) so the self-test
         // stays fast even for big meshes: ~5e8 primitive tests, clamped.
-        long long prims = (long long)scene.tris.size() + (long long)scene.spheres.size();
+        // Count every prim the linear reference actually scans. A groom is nearly all
+        // curve segments, so leaving those out of the estimate made the "bounded"
+        // budget unbounded on exactly the scenes that need it most.
+        long long prims = (long long)scene.tris.size() + (long long)scene.spheres.size()
+                        + (long long)scene.implicits.size() + (long long)scene.curveSegs.size()
+                        + (long long)scene.instances.size();
         long long rays = 500'000'000LL / (prims > 0 ? prims : 1);
         rays = std::clamp(rays, 20'000LL, 2'000'000LL);
         return checkBvh(scene, rays) == 0 ? 0 : 1;
@@ -8106,6 +11346,22 @@ static int run(int argc, char** argv) {
     // anchor (group -1) = per-frame auto.
     std::map<int, double> expAnchors;
 
+    // -exposure-anchor: seed group 0 (which -exposure-lock forced every camera into) with
+    // the shared anchor, and arrange to save it back when this invocation is the one that
+    // measured it. The writeback is a destructor rather than a line at the end of the
+    // function because the render dispatch below has a dozen early `return`s; RAII catches
+    // all of them without auditing each one, and it still runs on the Ctrl-C/-stop path
+    // (which unwinds through cudaGracefulShutdown rather than calling _exit).
+    if (expAnchorFile.value > 0.0) expAnchors[0] = expAnchorFile.value;
+    struct AnchorWriteback {
+        const ExposureAnchorFile& f;
+        const std::map<int, double>& anchors;
+        ~AnchorWriteback() {
+            auto it = anchors.find(0);
+            if (it != anchors.end()) f.save(it->second);
+        }
+    } anchorWriteback{expAnchorFile, expAnchors};
+
     // --- Exposure-lock metering plan (which frame each locked group meters from) --------
     // The `exposure_lock <selector>` on a camera_path/orbit/curve chooses the viewpoint the
     // whole group locks to (see CamSpec::EXPLOCK_*). Here we resolve that selector to the
@@ -8294,6 +11550,19 @@ static int run(int argc, char** argv) {
         const bool useGpuIso = false;
         if (rasterGpu) std::fprintf(stderr, "[raster] -raster-gpu needs a CUDA build; using CPU tessellation\n");
 #endif
+        // The raster preview never reaches runRender's device resolution, so stamp the
+        // title bar's device tag from ITS decision instead — otherwise a -raster run would
+        // be the one live window that never says what it is running on.
+        g_windowBackend = backendLabel(useGpuIso, nThreads);
+        // The -explore viewer switches device WITHIN a session — it shows the raster while
+        // you move and a traced image once you stop, and those two layers do not run on the
+        // same processor (mode W traces on the CPU; the PV_PT session is a CUDA one). So the
+        // interactive branches below re-stamp per frame from these, rather than inheriting
+        // the one label above, and the title bar tracks the switch live.
+        const std::string rasterBackend = backendLabel(useGpuIso, nThreads);
+        const std::string cpuBackend    = backendLabel(false, nThreads);
+        const std::string gpuBackend    = backendLabel(true,  nThreads);
+        (void)gpuBackend;
         if (useGpuIso)
             std::printf("[raster] GPU iso preview: primary-ray isosurface render on the GPU (no tessellation)\n");
         else
@@ -8333,11 +11602,8 @@ static int run(int argc, char** argv) {
             auto tessProgress = [&](int done, int total) {
                 if (total <= 0) return;
                 int pct = (int)std::lround(100.0 * done / total);
-                if (g_liveWin && !g_liveWin->closed()) {
-                    g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  tessellating (" +
-                                        std::to_string(done) + "/" + std::to_string(total) +
-                                        ", " + std::to_string(pct) + "%)");
-                }
+                setLiveTitle("tessellating (" + std::to_string(done) + "/" +
+                             std::to_string(total) + ", " + std::to_string(pct) + "%)");
                 auto now = std::chrono::steady_clock::now();
                 if (done == 0 || done == total ||
                     std::chrono::duration<double>(now - lastTick).count() >= 1.0) {
@@ -8346,7 +11612,7 @@ static int run(int argc, char** argv) {
                     lastTick = now;
                 }
             };
-            prims = raster::tessellate(scene, rasterIso, tessProgress);
+            prims = raster::tessellate(scene, rasterIso, tessProgress, rasterCurveBudget);
             auto rt1 = std::chrono::steady_clock::now();
             std::printf("[raster] %zu triangles in %.2fs; rendering %zu camera(s) on %d threads%s\n",
                         prims.size(), std::chrono::duration<double>(rt1 - rt0).count(),
@@ -8454,9 +11720,8 @@ static int run(int argc, char** argv) {
                     std::chrono::duration<double>(now - meterTick).count() >= 1.0) {
                     if (g_liveWin && !g_liveWin->closed()) {
                         g_liveWin->update(mc.res, mc.resY, mimg);
-                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  metering exposure "
-                                            "(preview NOT locked yet) " +
-                                            std::to_string(meterDone));
+                        setLiveTitle("metering exposure (preview NOT locked yet) " +
+                                     std::to_string(meterDone));
                     }
                     std::printf("[raster] metering exposure %zu\n", meterDone);
                     std::fflush(stdout);
@@ -8650,10 +11915,9 @@ static int run(int argc, char** argv) {
             if (g_showWindow) {
                 if (!g_liveWin) g_liveWin = std::make_unique<LiveWindow>(W, H, g_windowTitle.c_str());
                 g_liveWin->update(W, H, img);
-                std::string title = g_windowTitle + "  \xE2\x80\x94  raster " +
-                                    (rc.name.empty() ? std::string("preview") : rc.name) + " (" +
-                                    std::to_string(frame + 1) + "/" + std::to_string(toRender.size()) + ")";
-                g_liveWin->setTitle(title);
+                setLiveTitle("raster " + (rc.name.empty() ? std::string("preview") : rc.name) +
+                             " (" + std::to_string(frame + 1) + "/" +
+                             std::to_string(toRender.size()) + ")");
                 if (g_liveWin->closed()) g_stopRequested = 1;
             }
             if (toRender.size() > 1) {
@@ -9984,7 +13248,8 @@ static int run(int argc, char** argv) {
                             drawOverlay(c, VW, VH, img);
                             g_liveWin->update(VW, VH, img);
                         }
-                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                        g_windowBackend = rasterBackend;
+                        setLiveTitle("eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")  [mode W: stop to render]");
                         traceDirty = true;
                         changed = false;
@@ -10067,12 +13332,13 @@ static int run(int argc, char** argv) {
                         g_liveWin->update(VW, VH, show);
                         tracingNow = (wRow > 0);   // keep spinning until the frame is complete
                         const std::string sppTag = wNeedSpp ? " " + std::to_string(wPass + 1) + " spp" : "";
+                        g_windowBackend = cpuBackend;   // mode W traces on the CPU tracer
                         if (tracingNow)
-                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  mode W" + sppTag + " " +
+                            setLiveTitle("mode W" + sppTag + " " +
                                                 std::to_string(100 * (VH - wRow) / std::max(1, VH)) +
                                                 "%  eye(" + fmt3(eye) + ")");
                         else
-                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  mode W" + sppTag +
+                            setLiveTitle("mode W" + sppTag +
                                                 "  eye(" + fmt3(eye) + ")  dir(" + fmt3(fwd) + ")");
                     }
                 }
@@ -10095,7 +13361,8 @@ static int run(int argc, char** argv) {
                             drawOverlay(c, VW, VH, img);
                             g_liveWin->update(VW, VH, img);
                         }
-                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                        g_windowBackend = rasterBackend;
+                        setLiveTitle("eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")  [trace: move to re-aim]");
                         traceDirty = true;
                         changed = false;
@@ -10114,7 +13381,8 @@ static int run(int argc, char** argv) {
                                                                   scene.absolute, &traceAnchor);
                             drawOverlay(c, VW, VH, img);
                             g_liveWin->update(VW, VH, img);
-                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  path-trace " +
+                            g_windowBackend = gpuBackend;   // the PV_PT session is a CUDA one
+                            setLiveTitle("path-trace " +
                                                 std::to_string(spp) + " spp  eye(" + fmt3(eye) + ")");
                             tracingNow = (spp < kTraceCapSpp);   // more to refine -> keep spinning
                         }
@@ -10128,7 +13396,8 @@ static int run(int argc, char** argv) {
                     // repaint, so the zero-copy present (which renders AND shows) is for real
                     // changes only; the warm frame keeps taking the ordinary render path.
                     if (changed && rasterPresent(c, VW, VH, ev, autoExp)) {
-                        g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                        g_windowBackend = rasterBackend;
+                        setLiveTitle("eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")");
                     } else {
                         std::vector<uint8_t> img =
@@ -10136,7 +13405,8 @@ static int run(int argc, char** argv) {
                         if (changed) {   // only a real change repaints the window
                             drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
                             g_liveWin->update(VW, VH, img);
-                            g_liveWin->setTitle(g_windowTitle + "  \xE2\x80\x94  eye(" + fmt3(eye) +
+                            g_windowBackend = rasterBackend;
+                            setLiveTitle("eye(" + fmt3(eye) +
                                                 ")  dir(" + fmt3(fwd) + ")");
                         }
                     }
@@ -11048,9 +14318,20 @@ int main(int argc, char** argv) {
             const char* viewerSidecar = nullptr;
             const char* viewerLoom    = nullptr;
             bool        viewerPlay    = false;
+            bool        viewerPrebake = false;
+            int         viewerCapMB   = 0;      // 0 = leave the panel's default
             for (int i = 1; i < argc; ++i) {
                 if (!std::strcmp(argv[i], "-play") || !std::strcmp(argv[i], "--play")) {
                     viewerPlay = true;
+                } else if (!std::strcmp(argv[i], "-prebake") || !std::strcmp(argv[i], "--prebake")) {
+                    viewerPrebake = true;
+                } else if (!std::strcmp(argv[i], "-prebake-cap") ||
+                           !std::strcmp(argv[i], "--prebake-cap")) {
+                    if (i + 1 >= argc) {
+                        std::fprintf(stderr, "error: -prebake-cap needs a size in MB\n");
+                        return 1;
+                    }
+                    viewerCapMB = std::atoi(argv[++i]);
                 } else if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
                     if (i + 1 >= argc) {
                         std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
@@ -11066,7 +14347,8 @@ int main(int argc, char** argv) {
                 }
             }
             if (viewerSidecar)
-                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "", viewerPlay);
+                return runViewerGui(viewerSidecar, viewerLoom ? viewerLoom : "", viewerPlay,
+                                    viewerPrebake, viewerCapMB);
             if (viewerLoom) {
                 // -loom names a live channel, and there are two of them: the viewer's F4
                 // re-introspection (-viewer) and the fly editor's E2 value channel

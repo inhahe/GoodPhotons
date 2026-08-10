@@ -1,0 +1,240 @@
+# A FURRED CREATURE — what the `fur` generator is actually for.
+#
+# `scenes/fur_basics.ftsl` demonstrates the parameters one at a time. This one is the
+# payoff: an animal-shaped subject wearing ~250 000 strands, grown by a dozen `fur`
+# blocks over a body built from overlapping analytic spheres.
+#
+# Three things this scene is deliberately showing:
+#
+#   1. ANALYTIC targets. Every part is a `sphere`, so roots are sampled on the true
+#      surface with the true normal — no tessellation anywhere in the coat, and no
+#      faceting in the root distribution however close the camera gets.
+#
+#   2. `density`, not `count`. Every patch asks for the SAME strands per square metre,
+#      so the coat is automatically consistent across parts of wildly different size
+#      (a 0.10 m body and a 0.014 m toe) without hand-tuning a count for each. That is
+#      the parameter that survives editing the model.
+#
+#   3. Fur hides its own seams. The body is a union of overlapping spheres, which as
+#      bare geometry reads as a pile of balls; grown over, the intersections vanish.
+#      This is why fur is forgiving enough to be worth generating procedurally.
+#
+#   ftrace -in scenes/fur_creature.ftsl -mode W -spp 64 \
+#          -o png/fur_creature.png -window -keepwindow -checkpoint
+
+scene { units meters  spectral 360 830 1 }
+
+material "wall"  { type diffuse  reflect whitewall 0.72 }
+material "floor" { type diffuse  reflect rgb 0.34 0.30 0.27 }
+material "skin"  { type diffuse  reflect rgb 0.30 0.22 0.19 }
+
+material "coat"  { type diffuse  reflect rgb 0.40 0.25 0.13 }   # warm brown guard hair
+material "belly" { type diffuse  reflect rgb 0.66 0.55 0.40 }   # pale underside
+material "tan"   { type diffuse  reflect rgb 0.58 0.46 0.34 }
+material "eye"   { type glossy   reflect rgb 0.04 0.03 0.03  roughness 0.05 }
+material "nose"  { type glossy   reflect rgb 0.12 0.08 0.08  roughness 0.15 }
+
+# --- room ---
+quad { origin 0 0 0   u 1 0 0   v 0 0 1.4   material floor }
+quad { origin 0 0 0   u 0 1 0   v 1 0 0     material wall  }    # back wall
+quad { origin 0 0 0   u 0 0 1.4 v 0 1 0     material wall  }    # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1.4   material wall  }    # right
+quad { origin 0 1 0   u 0 0 1.4 v 1 0 0     material wall  }    # ceiling
+
+# A fiber is thin, so a small source leaves most of a strand's circumference in shadow
+# and the whole coat reads black. Broad sources are what make fur legible — hence a
+# ceiling panel rather than a point, plus a soft fill from the front.
+light area {
+    origin 0.15 0.985 0.20   u 0.70 0 0   v 0 0 0.75   normal 0 -1 0
+    power 300   spd preset:d65
+}
+light area {
+    origin 0.20 0.30 1.28   u 0.60 0 0   v 0 0.45 0   normal 0 0 -1
+    power 55    spd preset:d65
+}
+
+# ===========================================================================
+# The body. Overlapping spheres; the fur unifies them.
+# ===========================================================================
+sphere "rump"      { center 0.50 0.145 0.430  radius 0.098  material skin }
+sphere "barrel"    { center 0.50 0.150 0.530  radius 0.100  material skin }
+sphere "chest"     { center 0.50 0.150 0.625  radius 0.086  material skin }
+sphere "neck"      { center 0.50 0.168 0.690  radius 0.068  material skin }
+sphere "head"      { center 0.50 0.186 0.748  radius 0.062  material skin }
+sphere "muzzle"    { center 0.50 0.158 0.800  radius 0.036  material skin }
+sphere "ear_l"     { center 0.455 0.248 0.735 radius 0.029  material skin }
+sphere "ear_r"     { center 0.545 0.248 0.735 radius 0.029  material skin }
+sphere "haunch_l"  { center 0.443 0.130 0.455 radius 0.072  material skin }
+sphere "haunch_r"  { center 0.557 0.130 0.455 radius 0.072  material skin }
+sphere "tail"      { center 0.50 0.175 0.335  radius 0.042  material skin }
+sphere "paw_fl"    { center 0.462 0.036 0.660 radius 0.030  material skin }
+sphere "paw_fr"    { center 0.538 0.036 0.660 radius 0.030  material skin }
+sphere "paw_bl"    { center 0.443 0.036 0.480 radius 0.033  material skin }
+sphere "paw_br"    { center 0.557 0.036 0.480 radius 0.033  material skin }
+
+# Face. Not furred — the contrast is what makes the coat read as fur rather than moss.
+#
+# These have to be placed against the COAT, not against the skin, and that is easy to get
+# wrong: an eye whose centre sits 0.055 m from a 0.062 m head is *inside* the skin, pokes
+# 4 mm proud of it, and then disappears completely under 24 mm of head fur. The rule is
+# `dist(center) + radius − skin_radius  >  the fur length on that part`. Here each eye sits
+# 0.064 m out along a forward-and-outward brow direction, so it stands 0.016 m proud of a
+# 0.062 m head wearing 0.014 m fur, and the nose stands 0.015 m proud of a muzzle wearing
+# 0.007 m. Both clear their coat with room to spare.
+#
+# Clearing the coat is NOT the same as being clear of it, and this is the second half of
+# the trap. Standing proud only guarantees the eye is not BURIED; the head's own fur is
+# still rooted area-uniformly over the whole head sphere, including the ring of skin the
+# eye sits in, and every strand rooted around that ring grows straight out across the
+# eyeball. Rendered, the eye came out as a black patch peppered with hair. So these three
+# are NAMED, and the head and muzzle grooms below list them as `bald` zones (with a 1 mm
+# margin, to stop hairs grazing the rim) — the fur is culled out of the feature rather than
+# the feature being pushed out of the fur.
+sphere "eye_l" { center 0.4731 0.2026 0.8037  radius 0.014   material eye }
+sphere "eye_r" { center 0.5269 0.2026 0.8037  radius 0.014   material eye }
+sphere "nose"  { center 0.500  0.152  0.838   radius 0.013   material nose }
+
+# ===========================================================================
+# The coat. One `fur` block per part; every one asks for the SAME density, so the
+# strands per square centimetre match across parts 7x apart in size.
+#
+# `direction 0 0 -1  comb` lays the coat back from nose to tail — the single cue that
+# most makes a groom read as an animal rather than a pincushion — and `droop` sags it
+# under gravity so the silhouette has weight.
+# ===========================================================================
+fur "coat_barrel" {
+    on "barrel"   material coat   density 450000
+    points 4   segments 2
+    length 0.042   length_jitter 0.35
+    radius 0.00040
+    direction 0 0 -1   comb 0.32
+    droop 0.45   jitter 0.30
+    clump 0.45   clump_size 0.013
+    seed 11
+}
+fur "coat_rump" {
+    on "rump"     material coat   density 450000
+    points 4   segments 2
+    length 0.044   length_jitter 0.35
+    radius 0.00040
+    direction 0 0 -1   comb 0.38
+    droop 0.50   jitter 0.30
+    clump 0.45   clump_size 0.013
+    seed 12
+}
+fur "coat_chest" {
+    on "chest"    material belly  density 450000
+    points 4   segments 2
+    length 0.038   length_jitter 0.35
+    radius 0.00040
+    direction 0 0 -1   comb 0.26
+    droop 0.42   jitter 0.30
+    clump 0.40   clump_size 0.013
+    seed 13
+}
+fur "coat_neck" {
+    on "neck"     material belly  density 450000
+    points 4   segments 2
+    length 0.034   length_jitter 0.35
+    radius 0.00040
+    direction 0 0 -1   comb 0.22
+    droop 0.36   jitter 0.30
+    seed 14
+}
+fur "coat_head" {
+    on "head"     material coat   density 450000
+    points 4   segments 2
+    length 0.014   length_jitter 0.30      # short enough that the eyes stay clear of it
+    radius 0.00036
+    direction 0 0 1    comb 0.18      # head fur lies FORWARD, over the brow
+    droop 0.28   jitter 0.26
+    bald "eye_l" 0.001   bald "eye_r" 0.001   # ...and cull the hairs that grew over them
+    seed 15
+}
+fur "coat_muzzle" {
+    on "muzzle"   material tan    density 450000
+    points 3   segments 2
+    length 0.007   length_jitter 0.30      # ditto, for the nose
+    radius 0.00030
+    direction 0 0 1    comb 0.20
+    droop 0.20   jitter 0.22
+    # The muzzle reaches the lower rim of both eyes as well as the nose, so all three.
+    bald "nose" 0.001   bald "eye_l" 0.001   bald "eye_r" 0.001
+    seed 16
+}
+fur "coat_ear_l" {
+    on "ear_l"    material coat   density 450000
+    points 3   segments 2
+    length 0.014   length_jitter 0.35
+    radius 0.00030
+    direction 0 1 0    comb 0.30
+    droop 0.15   jitter 0.30
+    seed 17
+}
+fur "coat_ear_r" {
+    on "ear_r"    material coat   density 450000
+    points 3   segments 2
+    length 0.014   length_jitter 0.35
+    radius 0.00030
+    direction 0 1 0    comb 0.30
+    droop 0.15   jitter 0.30
+    seed 18
+}
+fur "coat_haunch_l" {
+    on "haunch_l" material coat   density 450000
+    points 4   segments 2
+    length 0.040   length_jitter 0.35
+    radius 0.00040
+    direction 0 -0.2 -1   comb 0.34
+    droop 0.55   jitter 0.30
+    clump 0.50   clump_size 0.012
+    seed 19
+}
+fur "coat_haunch_r" {
+    on "haunch_r" material coat   density 450000
+    points 4   segments 2
+    length 0.040   length_jitter 0.35
+    radius 0.00040
+    direction 0 -0.2 -1   comb 0.34
+    droop 0.55   jitter 0.30
+    clump 0.50   clump_size 0.012
+    seed 20
+}
+# The tail is the one place a big `curl` earns its keep — a bushy, twisted brush.
+fur "coat_tail" {
+    on "tail"     material coat   density 450000
+    points 5   segments 2
+    length 0.055   length_jitter 0.40
+    radius 0.00042
+    direction 0 0.3 -1   comb 0.55
+    droop 0.30   jitter 0.35
+    curl 0.09    curl_freq 2.5
+    clump 0.35   clump_size 0.016
+    seed 21
+}
+# Paws: short fur, and NO droop worth the name — long drooping fur here would grow
+# straight through the floor, which is the one place this generator has no opinion.
+fur "coat_paws_fl" { on "paw_fl" material tan    density 450000
+                     points 3  segments 2  length 0.010  length_jitter 0.30
+                     radius 0.00030  droop 0.10  jitter 0.25  seed 22 }
+fur "coat_paws_fr" { on "paw_fr" material tan    density 450000
+                     points 3  segments 2  length 0.010  length_jitter 0.30
+                     radius 0.00030  droop 0.10  jitter 0.25  seed 23 }
+fur "coat_paws_bl" { on "paw_bl" material tan    density 450000
+                     points 3  segments 2  length 0.010  length_jitter 0.30
+                     radius 0.00030  droop 0.10  jitter 0.25  seed 24 }
+fur "coat_paws_br" { on "paw_br" material tan    density 450000
+                     points 3  segments 2  length 0.010  length_jitter 0.30
+                     radius 0.00030  droop 0.10  jitter 0.25  seed 25 }
+
+# Aimed at the HEAD, not at the body centre — the face is the part that has to read, and
+# a three-quarter front view puts the muzzle and the combed-back flank in the same frame.
+# The eye has to stay INSIDE the room (the floor only runs to z = 1.4) and, less obviously,
+# in FRONT of the z = 1.28 fill panel: back it off past that and the light's own emissive
+# quad fills half the frame as a white wall. Widening `fov_y` is the way to gain context
+# here, not retreating.
+camera "cam" {
+    eye 0.74 0.31 1.21   look_at 0.50 0.17 0.72   up 0 1 0   fov_y 42
+    mode W
+    film { res 720 540 }
+}

@@ -71,6 +71,7 @@
 #include "meshvoxel.h"   // solid voxelization for `medium { bounds { object "<mesh>" } }`
 #include "fbx.h"
 #include "upsample.h"
+#include "fur.h"         // `fur { }` groom generator — scatters `curve` strands (TODO §P1)
 #include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long load
 #include "color.h"
 #include "sky.h"
@@ -744,6 +745,15 @@ public:
             if (!dm.empty()) L.defaultMode = normMode(dm, L);
             double dfps = dblOf(b, "fps", 0.0);
             if (dfps > 0.0) L.defaultFps = dfps;
+            // `cavity` probe settings (O3 stage 2). The radius is an authored LENGTH, so
+            // it goes through the unit scale like every other length. Left unset it stays
+            // 0 here and is derived from the scene bounds after build (see
+            // deriveCavityRadius) — a fixed default cannot serve scenes that range from
+            // fibres to rooms.
+            double cr = dblOf(b, "cavity_radius", 0.0);
+            if (cr > 0.0) L.scene.cavityRadius = cr * L_;
+            double cs = dblOf(b, "cavity_samples", 0.0);
+            if (cs >= 1.0) L.scene.cavitySamples = (int)(cs + 0.5);
         }
 
         // Pass 1: collect named spectra (resolve refs lazily), materials, camera.
@@ -784,6 +794,17 @@ public:
         for (const auto& b : blocks) {
             if (b.type != "scatter") continue;
             if (!addScatter(b, L)) return false;
+        }
+        // Pass 1a': `sdf` blocks RESERVE their grid slot here and are BAKED after the
+        // geometry pass (fillSdfs). An sdf is a grid whose samples are measured off the
+        // scene rather than typed out, so its name and arity have to exist before patterns
+        // compile (Pass 1c) while its data cannot exist until the mesh it measures has
+        // loaded (Pass 3). Everything read at RENDER time — materials, media, isosurface
+        // fields — is filled by then; the two things baked DURING the load are guarded
+        // explicitly (see rejectUnbakedSdf).
+        for (const auto& b : blocks) {
+            if (b.type != "sdf") continue;
+            if (!reserveSdf(b, L)) return false;
         }
 
         // Pass 1b: image textures (must exist before materials that bind them).
@@ -843,8 +864,11 @@ public:
         // `medium` blocks are DEFERRED to a second sweep so `bounds { object "name" }`
         // can reference any named sphere / isosurface / mesh regardless of authoring
         // order (the object registries are populated by the geometry builders below).
+        // `fur` is deferred for the same reason: `on "body"` must resolve against the
+        // named-object registries no matter where the block sits relative to its target.
         bool haveLight = false;
         std::vector<const Block*> mediaBlocks;
+        std::vector<const Block*> furBlocks;
         for (const auto& b : blocks) {
             if (stopped()) return false;
             if      (b.type == "sphere")   { if (!addSphere(b, L)) return false; }
@@ -853,6 +877,8 @@ public:
             else if (b.type == "mesh")     { if (!addMesh(b, L)) return false; }
             else if (b.type == "mesh_instance") { if (!addMeshInstance(b, L)) return false; }
             else if (b.type == "isosurface") { if (!addIsosurface(b, L)) return false; }
+            else if (b.type == "curve")    { if (!addCurve(b, L)) return false; }
+            else if (b.type == "fur")      { furBlocks.push_back(&b); }
             else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
             else if (b.type == "group")    { if (!addGroup(b, L, Affine::identity(), haveLight)) return false; }
             else if (b.type == "medium")   { mediaBlocks.push_back(&b); }
@@ -863,10 +889,22 @@ public:
             else if (b.type == "render")   { if (!applyRender(b, L)) return false; }
             else if (b.type == "scene" || b.type == "spectrum" || b.type == "material" ||
                      b.type == "texture" || b.type == "pattern" || b.type == "record" ||
-                     b.type == "grid" || b.type == "scatter" ||
+                     b.type == "grid" || b.type == "scatter" || b.type == "sdf" ||
                      b.type == "upsample" ||
                      b.type == "mesh_asset") { /* handled */ }
             else { fail("unknown top-level block '" + b.type + "'"); return false; }
+        }
+        // Bake every reserved `sdf` now that world geometry exists. FIRST of the deferred
+        // sweeps, so a groom's driver, a fog density and a medium bound can all read the
+        // field — and before `stripShapeOnlyMeshes`, so a proxy mesh can define a field and
+        // then be removed from the render.
+        if (!fillSdfs(L)) return false;
+
+        // Deferred fur sweep. Before the medium sweep and before stripShapeOnlyMeshes, so
+        // a groom can be grown on a `shape_only` scalp that is then removed from the scene.
+        for (const Block* fb : furBlocks) {
+            if (stopped()) return false;
+            if (!addFur(*fb, L)) return false;
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
         for (const Block* mb : mediaBlocks) {
@@ -911,7 +949,85 @@ public:
         // material on its geometry, so this is the first moment the SHAPE of every
         // emission pattern's emitter is known. Reject the shapes that cannot honour one.
         if (!checkEmitPatsSupported(L)) return false;
+        // Diagnostic only (never fails a load): a curv-driven material whose geometry
+        // can only report 0 would otherwise render flat with no explanation at all.
+        warnCurvOnFlatGeometry(L);
+        // Decide whether any cavity probe rays will ever be fired, and how far.
+        setupCavity(L);
+        // LAST: collapse repeated subexpressions in every shading-hot program.
+        optimizePatterns(L);
         return true;
+    }
+
+    // Run the CSE pass over every pattern program that a render will evaluate per
+    // shading point — material `pattern` blocks and medium density/ior programs.
+    //
+    // WHY THIS EXISTS AT ALL. The expression language has no local variables: there is
+    // no `let`, and a pattern cannot reference another pattern. So a scene-aware field
+    // that drives several terms at once — the non-stationary idiom, where the same
+    // `1 - smoothstep(lo, hi, grid:d(x, y, z))` gates one term and steers another — has
+    // to be written out in full at every site it appears. Eight uses would be eight
+    // trilinear lattice fetches per shading point if the repeats survived compilation.
+    // With this pass they collapse to one evaluation and one register load each, which
+    // is what lets REFERENCE.md tell an author to repeat the field freely instead of
+    // hand-unrolling their scene around a performance trap.
+    //
+    // WHY LAST. It runs after every pass that INSPECTS a compiled program — setupCavity
+    // (does any pattern read `cavity`, and how far should the probe reach),
+    // warnCurvOnFlatGeometry, checkEmitPatsSupported, rejectUnbakedSdf. CSE keeps the
+    // first occurrence of every op and only rewrites LATER ones, so those analyses would
+    // still be correct afterwards, but ordering them before it means none of them has to
+    // know that — a future analysis can be added anywhere above without a hidden
+    // requirement to also handle LdReg.
+    //
+    // WHY THE TABLES. `grid:`/`scatter:` pop as many operands as the named table has
+    // dimensions, which is not in the program, so patternOptimizeCSE has to be handed
+    // the same table set the program will be evaluated against or it cannot model the
+    // op and gives up on the whole expression. patTables() is safe to take here: it is
+    // used and discarded within this call, and the Scene is not moved in between.
+    //
+    // NOT DONE HERE: `implicit`/`function` field formulas (already CSE'd individually at
+    // compile time, before being appended to a SHARED node pool — the pool holds several
+    // programs end to end and is not the single-rooted program this pass requires), and
+    // record / camera_curve drivers (evaluated per frame, not per shading point).
+    void optimizePatterns(Loaded& L) {
+        const PatTables tabs = L.scene.patTables();
+        // Opt-in report (FTRACE_CSE_DEBUG, same shape as FTRACE_CHUNK_DEBUG): the pass is
+        // bit-identical by construction, so a render can never SHOW whether it fired — a
+        // program it silently declined costs N lattice fetches and looks exactly right.
+        // This is the only way to see it, and the only cost when the variable is unset is
+        // one getenv per load.
+        static const bool dbg = std::getenv("FTRACE_CSE_DEBUG") != nullptr;
+        long long before = 0, after = 0;
+        // Table samples are reported separately from the node total because they are the
+        // expensive op, not just another node: a `grid:` fetch is 8 pool reads and a
+        // trilinear blend, so "6 -> 1 table samples" is the number that matters and a
+        // node count alone would understate it.
+        auto nTab = [](const std::vector<PatNode>& p) {
+            int k = 0;
+            for (const PatNode& nd : p)
+                if (nd.op == PatOp::Grid || nd.op == PatOp::Scatter) ++k;
+            return k;
+        };
+        auto run = [&](std::vector<PatNode>& prog, const char* what, const std::string& who) {
+            const size_t n0 = prog.size();
+            const int t0 = nTab(prog);
+            patternOptimizeCSE(prog, &tabs);
+            before += (long long)n0; after += (long long)prog.size();
+            if (dbg && prog.size() != n0)
+                std::fprintf(stderr, "[cse] %s %s: %zu -> %zu nodes, %d -> %d table sample(s)\n",
+                             what, who.c_str(), n0, prog.size(), t0, nTab(prog));
+        };
+        for (size_t i = 0; i < L.scene.patterns.size(); ++i)
+            run(L.scene.patterns[i].nodes, "pattern", std::to_string(i));
+        for (size_t i = 0; i < L.scene.media.size(); ++i) {
+            run(L.scene.media[i].density, "medium density", std::to_string(i));
+            run(L.scene.media[i].ior,     "medium ior",     std::to_string(i));
+        }
+        if (dbg)
+            std::fprintf(stderr, "[cse] total %lld -> %lld nodes over %zu pattern(s), "
+                                 "%zu medium/media\n",
+                         before, after, L.scene.patterns.size(), L.scene.media.size());
     }
 
     // Remove every `mesh { shape_only yes }` group's triangles from Scene::tris.
@@ -970,9 +1086,29 @@ public:
     // EmitTri's barycentric UVs, the same interpolation geometry.h does). A sphere/tube/
     // spot/env emitter has no such correspondence, so refuse loudly rather than render
     // a wrong image — the same rule checkSlotPatSupported applies to reflect/transmit.
+    //
+    // `curv` (O3) fails the SAME test for a different reason: it is not a shape at all
+    // but a VARIABLE that only one of the two sides can answer. Emitter::samplePoint
+    // reports a position, a normal and (u,v) — it has no curvature to report — so
+    // emitterPatMulAt() necessarily reads curv = 0, while emission-on-hit reads the real
+    // value off the Hit. On a smooth-shaded mesh emitter those differ, and MIS would
+    // combine two different profiles into a biased image. Refuse it on every shape,
+    // including the quad where curv is trivially 0 on both sides: a curvature-driven
+    // emission profile that is identically zero is not something to render silently.
     bool checkEmitPatsSupported(Loaded& L) {
         for (const auto& e : L.scene.emitters) {
             if (e.emitPat < 0) continue;
+            if (e.emitPat < (int)L.scene.patterns.size()) {
+                for (const PatNode& n : L.scene.patterns[e.emitPat].nodes) {
+                    if (n.op != PatOp::VarCurv && n.op != PatOp::VarCavity) continue;
+                    const char* which = (n.op == PatOp::VarCurv) ? "curv" : "cavity";
+                    fail(std::string("an emit pattern cannot read `") + which +
+                         "` — an emitter's sampled point carries no such value, so the "
+                         "emitted profile would disagree with the one emission-on-hit "
+                         "reads, and MIS would bias the image");
+                    return false;
+                }
+            }
             if (e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh) continue;
             const char* what = (e.shape == EmitterShape::Sphere)   ? "sphere"
                              : (e.shape == EmitterShape::Cylinder) ? "cylinder"
@@ -985,6 +1121,143 @@ public:
             return false;
         }
         return true;
+    }
+
+    // Decide whether `cavity` costs anything in this scene, and pick its probe radius.
+    //
+    // The GATE is the whole reason cavity is affordable. It is the only pattern input
+    // that spends RAYS (cavitySamples occlusion queries per shading point), so anything
+    // that does not write `cavity` must pay literally nothing — hence a single scan for
+    // PatOp::VarCavity over every bound pattern, exactly mirroring the VarCurv scan in
+    // warnCurvOnFlatGeometry.
+    //
+    // The gate is PER MATERIAL (Material::readsCavity), not merely per scene, and that
+    // distinction matters: the probe is fired lazily from patCtxFromHit, which runs for
+    // EVERY patterned material. A scene-wide flag would therefore tax every noise-
+    // textured surface in the room with cavitySamples occlusion rays just because one
+    // material somewhere reads `cavity`. Keying off the hit's own material id costs a
+    // single load — Hit::matId is already in hand — and charges the probe only where it
+    // is read. Scene::needsCavity survives as the cheap "any at all?" early-out and as
+    // the flag the GPU upload and the radius derivation below key off.
+    //
+    // The RADIUS is derived rather than defaulted to a constant, because cavity is a
+    // non-local measure and therefore has no intrinsic scale: the same corner is "deeply
+    // enclosed" at a 1 cm probe and "wide open" at 1 m. 2% of the scene's AABB diagonal
+    // (sceneRadius is half that diagonal) makes the same model read the same however it
+    // was authored, which no fixed number can. Authored `cavity_radius` always wins.
+    void setupCavity(Loaded& L) {
+        Scene& sc = L.scene;
+        const size_t nm = sc.mats.size();
+        std::vector<PatOp> vars;
+        for (size_t i = 0; i < nm; ++i) {
+            materialFreeInputs(sc.mats[i], L, vars);
+            for (PatOp o : vars)
+                if (o == PatOp::VarCavity) { sc.mats[i].readsCavity = true; break; }
+        }
+        // A `mix` is referenced by geometry by NAME, not by its layers, so a cavity-
+        // reading LAYER has to lift to its parent: the probe is triggered off the hit's
+        // own material id, which is the parent's. Fixed point, for nested mixes. (Same
+        // propagation as warnCurvOnFlatGeometry — see the note there.)
+        for (size_t pass = 0; pass < nm; ++pass) {
+            bool changed = false;
+            for (size_t i = 0; i < nm; ++i) {
+                if (sc.mats[i].readsCavity) continue;
+                for (int c : sc.mats[i].mixChildren)
+                    if (c >= 0 && c < (int)nm && sc.mats[c].readsCavity) {
+                        sc.mats[i].readsCavity = true; changed = true; break;
+                    }
+            }
+            if (!changed) break;
+        }
+        for (size_t i = 0; i < nm; ++i)
+            if (sc.mats[i].readsCavity) { sc.needsCavity = true; break; }
+        if (!sc.needsCavity) return;
+        if (sc.cavityRadius <= 0.0) {
+            sc.cavityRadius = (sc.sceneRadius > 0.0) ? 0.04 * sc.sceneRadius : 0.1;
+            std::fprintf(stderr,
+                "[ftsl] cavity: probe radius %.4g m derived from the scene bounds "
+                "(2%% of the AABB diagonal); set `scene { cavity_radius <len> }` to "
+                "choose it explicitly.\n", sc.cavityRadius);
+        }
+        if (sc.cavitySamples < 1) sc.cavitySamples = 1;
+    }
+
+    // A `curv`-driven material placed on geometry that can only ever report curvature 0
+    // renders as a FLAT COLOUR with no error of any kind — the single easiest way to
+    // waste an hour on this feature, and the reason `scenes/pattern_curvature.ftsl` has
+    // a paragraph of its header devoted to it. Three ways to land there: a flat-shaded
+    // mesh (no `vn`, so there is no normal field to differentiate), an isosurface (would
+    // need the field Hessian — see known-issues.md), and a plain quad/flat facet.
+    //
+    // This is a WARNING, not a `fail`: every one of those is a legal scene, and a
+    // material may deliberately be shared between a smooth mesh and a flat backdrop. So
+    // the test is deliberately conservative — warn only when EVERY primitive using the
+    // material is a zero-curvature one, i.e. when the pattern provably cannot do
+    // anything anywhere. A material with even one smooth-shaded user stays silent.
+    //
+    // Costs nothing on a scene that does not use `curv`: the geometry scan is skipped
+    // entirely unless some material actually reads it.
+    void warnCurvOnFlatGeometry(Loaded& L) {
+        Scene& sc = L.scene;
+        const size_t nm = sc.mats.size();
+        if (nm == 0) return;
+
+        std::vector<char> readsCurv(nm, 0);
+        std::vector<PatOp> vars;
+        bool any = false;
+        for (size_t i = 0; i < nm; ++i) {
+            materialFreeInputs(sc.mats[i], L, vars);
+            for (PatOp o : vars)
+                if (o == PatOp::VarCurv) { readsCurv[i] = 1; any = true; break; }
+        }
+        if (!any) return;
+        // Geometry references a `mix` by name, not its layers, so a curv-reading LAYER
+        // has to lift to its parent or the scan below would find it no users at all and
+        // stay quiet about a real mistake. Iterate to a fixed point for nested mixes.
+        for (size_t pass = 0; pass < nm; ++pass) {
+            bool changed = false;
+            for (size_t i = 0; i < nm; ++i) {
+                if (readsCurv[i]) continue;
+                for (int c : sc.mats[i].mixChildren)
+                    if (c >= 0 && c < (int)nm && readsCurv[c]) { readsCurv[i] = 1; changed = true; break; }
+            }
+            if (!changed) break;
+        }
+
+        std::vector<char> users(nm, 0), canCurve(nm, 0);
+        auto note = [&](int m, bool nonzero) {
+            if (m < 0 || m >= (int)nm || !readsCurv[m]) return;
+            users[m] = 1;
+            if (nonzero) canCurve[m] = 1;
+        };
+        // A triangle's curvature is baked by Tri::finalize(); exactly 0 is the
+        // flat-shaded / flat-facet signature this is looking for.
+        for (const Tri& t : sc.tris)           note(t.matId, t.curvature != 0.0);
+        for (const Sphere& s : sc.spheres)     note(s.matId, s.r > 0.0);
+        for (const CurveSeg& c : sc.curveSegs) note(c.matId, true);
+        for (const Implicit& im : sc.implicits) note(im.matId, false);
+        for (const MeshInstance& mi : sc.instances) {
+            if (mi.blasId < 0 || mi.blasId >= (int)sc.blasList.size()) continue;
+            for (const Tri& t : sc.blasList[mi.blasId].tris)
+                note(mi.matOverride >= 0 ? mi.matOverride : t.matId, t.curvature != 0.0);
+        }
+
+        // A Material carries no name of its own, so recover the authored one from the
+        // loader's name->index map (reversed once, and only when something will warn).
+        std::vector<const std::string*> matName(nm, nullptr);
+        for (const auto& kv : matIndex_)
+            if (kv.second >= 0 && kv.second < (int)nm) matName[kv.second] = &kv.first;
+
+        for (size_t i = 0; i < nm; ++i) {
+            if (!readsCurv[i] || !users[i] || canCurve[i]) continue;
+            std::fprintf(stderr,
+                "[ftsl] warning: material '%s' reads `curv`, but every piece of geometry "
+                "using it reports curvature 0 (a flat-shaded mesh, an isosurface, or a "
+                "flat facet), so the pattern will render as a flat colour. A mesh needs "
+                "vertex normals — regenerate it with `tools/make_mesh.py --smooth`, or "
+                "export with smoothing on.\n",
+                matName[i] ? matName[i]->c_str() : "<unnamed>");
+        }
     }
 
 private:
@@ -1181,6 +1454,12 @@ private:
     std::unordered_map<std::string, NamedSphere> sphereByName_;   // named sphere -> world center/radius
     std::unordered_map<std::string, int>         implicitByName_; // named isosurface -> Scene::implicits index
     std::unordered_map<std::string, Aabb>        meshAabbByName_; // named mesh -> world AABB
+    // Named world-triangle ranges, for `fur { on "name" }` to scatter roots over. Filled
+    // by quad/triangle/mesh (anything that appends to Scene::tris under a name) — a
+    // superset of meshGroups, which only mesh blocks create. Read by the deferred fur
+    // sweep, which runs BEFORE stripShapeOnlyMeshes, so a `mesh { shape_only yes }` scalp
+    // can grow a coat and then vanish from the render.
+    std::unordered_map<std::string, std::pair<size_t, size_t>> triRangeByName_;
     std::unordered_map<std::string, int>         blasIndex_;      // mesh_asset name -> Scene::blasList index
     // `mesh { shape_only yes }` groups (indices into Scene::meshGroups), removed from
     // Scene::tris by stripShapeOnlyMeshes() once the deferred medium sweep has read them.
@@ -2275,6 +2554,12 @@ private:
             if (!compilePatternExpr(rgbS->val.words[0], pr, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb r: " + perr); return false; }
             if (!compilePatternExpr(rgbS->val.words[1], pg, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb g: " + perr); return false; }
             if (!compilePatternExpr(rgbS->val.words[2], pb, perr, false, &texScope_, &tableScope_)) { fail("texture '" + b.name + "' rgb b: " + perr); return false; }
+            // This bake runs in Pass 1b, long before geometry, so an `sdf` it reads is
+            // still empty; say so instead of baking a texture against a field of zeros.
+            const std::string twho = "texture '" + b.name + "'";
+            if (!rejectUnbakedSdf(pr, twho, "a procedural `texture { rgb … }`") ||
+                !rejectUnbakedSdf(pg, twho, "a procedural `texture { rgb … }`") ||
+                !rejectUnbakedSdf(pb, twho, "a procedural `texture { rgb … }`")) return false;
             int res = (int)dblOf(b, "res", 512.0);
             if (res < 1) res = 1; else if (res > 8192) res = 8192;
             tex.encoding = TexEncoding::Linear;   // expr outputs are linear albedo already
@@ -3146,6 +3431,170 @@ private:
         int id = (int)L.scene.grids.size();
         L.scene.grids.push_back(g);
         gridIndex_[b.name] = id;
+        return true;
+    }
+
+    // ---- `sdf "name" { object "mesh" res N pad D }` — a measured distance grid ----
+    //
+    // O3 stage 3. A distance-to-mesh field: `grid:<name>(x, y, z)` reads the signed
+    // distance in world units to the named mesh, negative inside. It is deliberately a
+    // GRID and not a new pattern variable, because a grid already reaches every place a
+    // field could be wanted — a material's slot or `weight_map`, an `isosurface` leaf, a
+    // medium's `density`/`ior` program, a `camera_curve` driver — on both backends,
+    // through code that is already written and already uploaded to the device. The whole
+    // feature is therefore a bake plus a header; the VM learns nothing new.
+    //
+    // Why this is the third leg of O3: `curv` reads the shape of the surface a point is
+    // ON and `cavity` reads how enclosed it is, but neither can answer "how far is this
+    // point from that object over there" — the question behind moss creeping up from the
+    // ground, frost thickening away from a heat source, wear radiating from a contact, or
+    // fog that hugs a silhouette. That question is non-local in a way no per-hit property
+    // can be, and unlike `cavity` it is about a NAMED object rather than everything.
+    //
+    // Two-phase, and the split is forced: the name must resolve before patterns compile,
+    // the data cannot exist before geometry loads. `reserveSdf` runs in Pass 1a' and
+    // registers an empty 3-D header; `fillSdfs` runs after Pass 3 and fills it.
+    struct PendingSdf {
+        const Block* blk = nullptr;
+        int gridId = -1;
+    };
+    std::vector<PendingSdf> pendingSdfs_;
+
+    bool reserveSdf(const Block& b, Loaded& L) {
+        if (b.name.empty()) { fail("sdf needs a \"name\""); return false; }
+        if (gridIndex_.count(b.name)) {
+            fail("duplicate grid/sdf name '" + b.name + "' — an `sdf` registers under the "
+                 "same `grid:` namespace it is read through");
+            return false;
+        }
+        const std::string who = genWho("sdf", b.name);
+        if (!find(b, "object")) {
+            fail(who + " needs `object \"<mesh name>\"` — the geometry to measure distance to");
+            return false;
+        }
+        // The header is real (ndim 3, so `grid:name(x,y,z)` type-checks and any other
+        // arity is rejected at compile time) but holds no samples yet; `patGridSample`
+        // reads count <= 0 as 0, which is why an unbaked read has to be refused rather
+        // than left to return a plausible-looking zero.
+        PatGrid g;
+        g.ndim = 3;
+        for (int a = 0; a < 3; ++a) { g.shape[a] = 1; g.lo[a] = 0; g.hi[a] = 1; }
+        g.outside = PatGridOutside::Clamp;
+        g.off = 0; g.count = 0;
+        PendingSdf ps;
+        ps.gridId = (int)L.scene.grids.size();
+        ps.blk = &b;
+        L.scene.grids.push_back(g);
+        gridIndex_[b.name] = ps.gridId;
+        pendingSdfs_.push_back(ps);
+        return true;
+    }
+
+    // Is `nodes` reading a grid slot that is still an unbaked `sdf`? Called from the two
+    // places a pattern is EVALUATED during the load rather than during the render — a
+    // procedural `texture`'s bake and a `camera_curve` driver — where the samples genuinely
+    // do not exist yet. Without this the read would quietly return 0, which for a distance
+    // field means "exactly on the surface" and would look like a plausible result.
+    bool rejectUnbakedSdf(const std::vector<PatNode>& nodes, const std::string& who,
+                          const char* what) {
+        if (pendingSdfs_.empty()) return true;
+        for (const PatNode& nd : nodes) {
+            if (nd.op != PatOp::Grid) continue;
+            for (const PendingSdf& ps : pendingSdfs_) {
+                if (ps.gridId != (int)nd.a) continue;
+                fail(who + ": `grid:" + ps.blk->name + "` is a baked `sdf`, and " +
+                     std::string(what) + " is evaluated while the scene is still loading — "
+                     "before the geometry it measures exists. Read it from a material, a "
+                     "medium or an `isosurface` field instead, which are evaluated during "
+                     "the render.");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool fillSdfs(Loaded& L) {
+        for (const PendingSdf& ps : pendingSdfs_) {
+            if (stopped()) return false;
+            const Block& b = *ps.blk;
+            const std::string who = genWho("sdf", b.name);
+            const std::string onm = strOf(b, "object", "");
+
+            // Resolve the named object to a run of WORLD triangles. Same registry the
+            // medium's `bounds { object … }` uses, and the same two failure modes.
+            const MeshGroup* grp = nullptr;
+            for (const MeshGroup& mg : L.scene.meshGroups)
+                if (mg.name == onm) { grp = &mg; break; }
+            if (!grp || grp->triCount == 0) {
+                fail(who + ": `object \"" + onm + "\"` names no mesh with world triangles" +
+                     std::string((grp && grp->blasId >= 0)
+                         ? " (it is an INSTANCED mesh_asset, whose triangles live in object "
+                           "space behind a BLAS; measure a non-instanced `mesh` block instead)"
+                         : " — give the name of a `mesh` block"));
+                return false;
+            }
+
+            const int res = (int)dblOf(b, "res", 96.0);
+            if (res < 8 || res > 512) { fail(who + ": `res` must be 8..512"); return false; }
+
+            // `pad` is how far OUTSIDE the mesh the field is measured, and it is the
+            // feature's real control: outside the lattice the sampler clamps, so a mask
+            // keyed on distance simply stops changing there. Default is a quarter of the
+            // object's longest axis — enough for the "band hugging the object" idiom this
+            // exists for, and a value the author is expected to raise when the effect is
+            // supposed to reach across the room.
+            Vec3 blo(1e300, 1e300, 1e300), bhi(-1e300, -1e300, -1e300);
+            for (size_t t = 0; t < grp->triCount; ++t) {
+                const Tri& tr = L.scene.tris[grp->triStart + t];
+                for (const Vec3& v : {tr.v0, tr.v1, tr.v2}) {
+                    blo.x = std::min(blo.x, v.x); blo.y = std::min(blo.y, v.y); blo.z = std::min(blo.z, v.z);
+                    bhi.x = std::max(bhi.x, v.x); bhi.y = std::max(bhi.y, v.y); bhi.z = std::max(bhi.z, v.z);
+                }
+            }
+            const Vec3 bext = bhi - blo;
+            const double longest = std::max(bext.x, std::max(bext.y, bext.z));
+            // The default is already in internal units (it is derived from the world AABB),
+            // so only an AUTHORED `pad` goes through Len().
+            const double pad = find(b, "pad") ? Len(dblOf(b, "pad", 0.0)) : 0.25 * longest;
+            if (pad < 0.0) { fail(who + ": `pad` is a distance and cannot be negative"); return false; }
+
+            meshvox::SdfBake bake = meshvox::bakeSignedDistance(
+                L.scene.tris.data(), grp->triStart, grp->triCount, res, pad);
+            if (stopped()) return false;
+            if (bake.empty()) {
+                fail(who + ": the bake produced an empty lattice (degenerate mesh, or a "
+                     "`res`/`pad` combination asking for more than 120 M samples)");
+                return false;
+            }
+
+            PatGrid& g = L.scene.grids[ps.gridId];
+            g.ndim = 3;
+            g.shape[0] = bake.nx; g.shape[1] = bake.ny; g.shape[2] = bake.nz;
+            const Vec3 hic = bake.hiCorner();
+            g.lo[0] = bake.lo.x; g.lo[1] = bake.lo.y; g.lo[2] = bake.lo.z;
+            g.hi[0] = hic.x;     g.hi[1] = hic.y;     g.hi[2] = hic.z;
+            std::string os = strOf(b, "outside", "clamp");
+            if (!parseGridOutside(os, g.outside)) {
+                fail(who + ": unknown `outside` '" + os + "' (clamp|wrap|extrapolate)");
+                return false;
+            }
+            g.off   = (int)L.scene.dataPool.size();
+            g.count = (int)bake.d.size();
+            L.scene.dataPool.insert(L.scene.dataPool.end(), bake.d.begin(), bake.d.end());
+
+            double inMost = 0.0;
+            for (float v : bake.d) inMost = std::min(inMost, (double)v);
+            std::fprintf(stderr,
+                "[sdf] \"%s\": %d x %d x %d samples over %.4g m voxels (%zu tris, %.4g m pad, "
+                "deepest interior %.4g m)\n", b.name.c_str(), bake.nx, bake.ny, bake.nz,
+                bake.h, grp->triCount, pad, inMost);
+            if (!(inMost < 0.0))
+                std::fprintf(stderr,
+                    "[sdf] warning: \"%s\" has no interior — the mesh is open, inside-out, or "
+                    "thinner than one voxel, so the field is unsigned. Raise `res`.\n",
+                    b.name.c_str());
+        }
+        pendingSdfs_.clear();
         return true;
     }
 
@@ -4085,6 +4534,7 @@ private:
         t2.uv0 = {0, 0, 0}; t2.uv1 = {1, 1, 0}; t2.uv2 = {0, 1, 0};
         L.scene.tris.push_back(t1);
         L.scene.tris.push_back(t2);
+        if (!b.name.empty()) triRangeByName_[b.name] = {L.scene.tris.size() - 2, 2};
         return true;
     }
     bool addTriangle(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
@@ -4092,8 +4542,269 @@ private:
         vec3Of(b, "v0", v0); vec3Of(b, "v1", v1); vec3Of(b, "v2", v2);
         int id = matFieldId(b, L, "triangle"); if (id < 0) return false;
         L.scene.tris.push_back(Tri{P(xf.apply(v0)), P(xf.apply(v1)), P(xf.apply(v2)), id, -1, {}});
+        if (!b.name.empty()) triRangeByName_[b.name] = {L.scene.tris.size() - 1, 1};
         return true;
     }
+    // ---- curve / fiber (hair, fur, grass, wire) -------------------------------
+    // A `curve { material <m>  point ... point ... }` builds one strand: control points
+    // under a chosen basis, flattened at load time into the round-cone chain the tracer
+    // actually intersects (see curve.h).
+    //
+    //   basis      linear | catmull_rom | bezier | bspline      (default catmull_rom)
+    //   radius     <r>            root radius (authored units), default 1 mm
+    //   radius_tip <r>            tip radius; default = radius (an untapered tube)
+    //   segments   <n>            round cones per span, default 4 (linear forces 1)
+    //   point x y z [r=<r>]       repeated, >= 2 — a per-point `r=` overrides the taper
+    //
+    // Radii come from three places, in increasing priority: the `radius`/`radius_tip`
+    // taper (linear in control-point index, which is what a groom wants), then an
+    // explicit per-point `r=`. The taper is expressed in point index rather than arc
+    // length on purpose — it must be computable before the curve exists.
+    bool addCurve(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
+        int id = matFieldId(b, L, "curve"); if (id < 0) return false;
+
+        const std::string bs = strOf(b, "basis", "catmull_rom");
+        CurveBasis basis;
+        if      (bs == "linear")                        basis = CurveBasis::Linear;
+        else if (bs == "catmull_rom" || bs == "catmull-rom" ||
+                 bs == "catmullrom")                    basis = CurveBasis::CatmullRom;
+        else if (bs == "bezier")                        basis = CurveBasis::Bezier;
+        else if (bs == "bspline" || bs == "b-spline")   basis = CurveBasis::BSpline;
+        else { fail("curve: unknown basis '" + bs + "' (linear, catmull_rom, bezier, bspline)"); return false; }
+
+        const double rRoot = dblOf(b, "radius", 0.001);
+        const double rTip  = dblOf(b, "radius_tip", rRoot);
+        int subdiv = (int)dblOf(b, "segments", 4.0);
+        if (subdiv < 1) subdiv = 1;
+        if (subdiv > 256) subdiv = 256;   // a per-span cap; nothing sane needs more
+
+        // Gather the repeated `point` statements (in authoring order). A per-point radius
+        // rides as a `key=val` value continuation (`point 0 0.1 0 r=0.002`) because FTSL's
+        // statement splitter would start a NEW statement at a bareword — the same reason
+        // `uv planar axis=x` has to be written with `=`.
+        std::vector<Vec3>   pts;
+        std::vector<double> radii;
+        std::vector<int>    explicitR;   // 1 where the author gave an `r=`
+        for (const auto& s : b.stmts) {
+            if (s.key != "point") continue;
+            s.used = true;
+            if (s.val.words.size() < 3) { fail("curve: `point` needs x y z"); return false; }
+            pts.push_back(Vec3{num(s.val.words[0]), num(s.val.words[1]), num(s.val.words[2])});
+            double pr = 0.0; bool haveR = false;
+            for (size_t k = 3; k < s.val.words.size(); ++k) {
+                std::string key, val;
+                if (!splitEq(s.val.words[k], key, val)) continue;
+                if (key == "r" || key == "radius") { pr = num(val); haveR = true; }
+            }
+            radii.push_back(pr);
+            explicitR.push_back(haveR ? 1 : 0);
+        }
+        const int n = (int)pts.size();
+        if (n < 2) { fail("curve needs at least 2 `point` statements"); return false; }
+        const int spans = curveSpanCount(basis, n);
+        if (spans <= 0) {
+            fail("curve: " + std::to_string(n) + " control points is not a valid " + bs +
+                 (basis == CurveBasis::Bezier ? " chain (needs 3k+1: 4, 7, 10, ...)"
+                                              : " curve (needs at least 4)"));
+            return false;
+        }
+
+        // Fill the un-authored radii from the root->tip taper, then take everything to
+        // world space. An affine map commutes with every basis, so transforming the
+        // CONTROL points and flattening afterwards is identical to the other order —
+        // which is what lets a `group { rotate ... }` carry a strand for free.
+        bool nonUniform = false;
+        const double us = xf.uniformScale(nonUniform);
+        for (int i = 0; i < n; ++i) {
+            double rr = explicitR[i] ? radii[i]
+                                     : rRoot + (rTip - rRoot) * (n > 1 ? (double)i / (n - 1) : 0.0);
+            // A non-uniform group scale cannot be represented by a round cross-section
+            // (it would make an elliptical fiber), so the radius takes the geometric mean
+            // of the three axis scales — the scale that preserves the swept volume. The
+            // approximation is noted rather than fatal: at fiber widths it is invisible,
+            // and refusing to load would make a strand the one primitive a group cannot
+            // hold. (`uniformScale` returns the max axis scale; for the uniform case,
+            // which is every ordinary scene, that IS the exact scale and nothing changes.)
+            radii[i] = Len(rr) * us;
+            pts[i] = P(xf.apply(pts[i]));
+        }
+        if (nonUniform) {
+            const double sx = std::sqrt(xf.m[0]*xf.m[0] + xf.m[3]*xf.m[3] + xf.m[6]*xf.m[6]);
+            const double sy = std::sqrt(xf.m[1]*xf.m[1] + xf.m[4]*xf.m[4] + xf.m[7]*xf.m[7]);
+            const double sz = std::sqrt(xf.m[2]*xf.m[2] + xf.m[5]*xf.m[5] + xf.m[8]*xf.m[8]);
+            const double gm = std::cbrt(std::max(1e-300, sx * sy * sz));
+            for (int i = 0; i < n; ++i) radii[i] *= gm / (us > 0.0 ? us : 1.0);
+            std::fprintf(stderr, "[ftsl] warning: curve%s%s%s under a non-uniform group scale — "
+                                 "the fiber radius uses the volume-preserving geometric mean "
+                                 "(a round fiber cannot become elliptical)\n",
+                         b.name.empty() ? "" : " '", b.name.c_str(), b.name.empty() ? "" : "'");
+        }
+
+        Curve c;
+        c.matId = id;
+        c.basis = basis;
+        c.name  = b.name;
+        c.firstSeg = (int)L.scene.curveSegs.size();
+        c.segCount = tessellateCurve(pts, radii, basis, subdiv, id,
+                                     (int)L.scene.curves.size(), L.scene.curveSegs);
+        if (c.segCount <= 0) { fail("curve: control points are all coincident"); return false; }
+        L.scene.curves.push_back(std::move(c));
+        return true;
+    }
+
+    // ---- fur / groom generator ------------------------------------------------
+    // `fur { on "<object>"  material <m>  count|density ... }` scatters strands over a
+    // named surface. It is pure sugar over `curve`: the generator (src/fur.h) emits the
+    // same Curve/CurveSeg records a hand-authored strand does, so nothing downstream —
+    // BVH, CPU tracer, CUDA megakernel, raster preview — needs to know fur exists.
+    //
+    // DEFERRED to a second sweep (like `medium`) so `on "body"` resolves regardless of
+    // authoring order: a `fur` block above the mesh it grows on is the natural way to
+    // write it, and an order-dependent scene language is a trap.
+    //
+    //   on         "<name>"       required — a named sphere, mesh, quad or triangle
+    //   material   <m>            required
+    //   count      <n>            exact strand count           } one of the two
+    //   density    <n>            strands per authored unit^2  }
+    //   seed       <n>            groom realisation (default 0)
+    //   points     <n>            control points per strand (default 5)
+    //   segments   <n>            round cones per span (default 2)
+    //   basis      linear|catmull_rom|bezier|bspline  (default catmull_rom)
+    //   length <l>  length_jitter <0..1>
+    //   radius <r>  radius_tip <r>        (radius_tip defaults to 0.25*radius — fur tapers)
+    //   lift <0..1>  jitter <0..1>  root_offset <l>
+    //   direction <x y z>  comb <0..1>
+    //   gravity <x y z>    droop <0..1>
+    //   curl <0..1>        curl_freq <n>
+    //   clump <0..1>       clump_size <l>
+    bool addFur(const Block& b, Loaded& L) {
+        const std::string on = strOf(b, "on");
+        if (on.empty()) { fail("fur needs `on \"<object>\"` — the named surface to grow on"); return false; }
+        int id = matFieldId(b, L, "fur"); if (id < 0) return false;
+
+        // Resolve the target as an INDEX RANGE, never as a pointer held across the
+        // parameter reads below: Scene::tris is a vector, and a stored `Tri*` would be a
+        // dangling reference the moment anything appended to it. The pointer is taken at
+        // the call site, one statement before it is used.
+        FurSurface surf;
+        size_t triFirst = 0, triCount = 0;
+        auto sph = sphereByName_.find(on);
+        auto tri = triRangeByName_.find(on);
+        if (sph != sphereByName_.end()) {
+            surf.isSphere = true;
+            surf.center = sph->second.center;
+            surf.radius = sph->second.radius;
+        } else if (tri != triRangeByName_.end() && tri->second.second > 0) {
+            triFirst = tri->second.first;
+            triCount = tri->second.second;
+        } else {
+            fail("fur `on \"" + on + "\"` names no sphere, mesh, quad or triangle in the scene "
+                 "(an instanced `mesh_instance` cannot be a fur target — its triangles live in "
+                 "a BLAS, not in world space)");
+            return false;
+        }
+
+        FurSpec sp;
+        sp.matId = id;
+        sp.name  = b.name.empty() ? ("fur:" + on) : b.name;
+
+        const std::string bs = strOf(b, "basis", "catmull_rom");
+        if      (bs == "linear")                        sp.basis = CurveBasis::Linear;
+        else if (bs == "catmull_rom" || bs == "catmull-rom" ||
+                 bs == "catmullrom")                    sp.basis = CurveBasis::CatmullRom;
+        else if (bs == "bezier")                        sp.basis = CurveBasis::Bezier;
+        else if (bs == "bspline" || bs == "b-spline")   sp.basis = CurveBasis::BSpline;
+        else { fail("fur: unknown basis '" + bs + "' (linear, catmull_rom, bezier, bspline)"); return false; }
+
+        sp.count  = (long long)dblOf(b, "count", 0.0);
+        sp.seed   = (uint64_t)std::max(0.0, dblOf(b, "seed", 0.0));
+        sp.points = (int)dblOf(b, "points", 5.0);
+        sp.subdiv = (int)dblOf(b, "segments", 2.0);
+
+        // Authored -> internal units. A length scales by L_; an AREA density scales by
+        // 1/L_^2, which is the one conversion in this block that is easy to get backwards:
+        // `density 20000` must mean 20000 hairs per authored square unit whatever `scene {
+        // units }` says, so the count it implies has to be computed against the authored
+        // area, i.e. internalArea / L_^2.
+        sp.density   = dblOf(b, "density", 0.0) / (L_ * L_);
+        sp.length    = Len(dblOf(b, "length", 0.05));
+        sp.lengthJitter = dblOf(b, "length_jitter", 0.2);
+        sp.radius    = Len(dblOf(b, "radius", 0.0008));
+        // A negative tip radius is the sentinel for "unauthored", which fur.h turns into
+        // 0.25*radius. An untapered fiber reads as wire, not hair, so fur's default
+        // deliberately differs from `curve`'s (which defaults to no taper at all).
+        sp.radiusTip = find(b, "radius_tip") ? Len(dblOf(b, "radius_tip", 0.0)) : -1.0;
+        sp.lift      = dblOf(b, "lift", 1.0);
+        sp.jitter    = dblOf(b, "jitter", 0.15);
+        sp.rootOffset = Len(dblOf(b, "root_offset", 0.0));
+        vec3Of(b, "direction", sp.comb);
+        sp.combAmount = dblOf(b, "comb", 0.35);
+        vec3Of(b, "gravity", sp.gravity);
+        sp.droop     = dblOf(b, "droop", 0.25);
+        sp.curl      = dblOf(b, "curl", 0.0);
+        sp.curlFreq  = dblOf(b, "curl_freq", 3.0);
+        sp.clump     = dblOf(b, "clump", 0.0);
+        sp.clumpSize = Len(dblOf(b, "clump_size", 0.02));
+        if (sp.count <= 0 && sp.density <= 0.0) {
+            fail("fur '" + sp.name + "' needs a positive `count` or `density`");
+            return false;
+        }
+
+        // `bald` — one or more spheres this groom must keep out of. Repeatable, and it
+        // takes either form:
+        //     bald "eye_l"          [margin]    a NAMED sphere already in the scene
+        //     bald <x> <y> <z> <r>              an explicit centre and radius
+        // The named form is the one that matters in practice: the eye is already authored
+        // as a sphere, so naming it keeps the bare patch welded to the feature instead of
+        // being a second copy of its coordinates that silently rots when the face moves.
+        // The optional margin (authored units, default 0) grows the zone, which is how you
+        // stop hairs GRAZING a rim they never quite enter.
+        for (const auto& s : b.stmts) {
+            if (s.key != "bald") continue;
+            s.used = true;
+            const auto& w = s.val.words;
+            FurSpec::BaldZone z;
+            if (!w.empty() && !isNumber(w[0])) {
+                auto bs = sphereByName_.find(w[0]);
+                if (bs == sphereByName_.end()) {
+                    fail("fur '" + sp.name + "' bald \"" + w[0] + "\" names no sphere in the scene "
+                         "(use `bald <x> <y> <z> <r>` for a zone that is not one)");
+                    return false;
+                }
+                z.center = bs->second.center;             // already in internal units
+                z.radius = bs->second.radius + (w.size() > 1 ? Len(num(w[1])) : 0.0);
+            } else if (w.size() >= 4) {
+                z.center = P(Vec3{num(w[0]), num(w[1]), num(w[2])});
+                z.radius = Len(num(w[3]));
+            } else {
+                fail("fur '" + sp.name + "' bald needs `\"<sphere name>\" [margin]` or `<x> <y> <z> <r>`");
+                return false;
+            }
+            if (z.radius > 0.0) sp.bald.push_back(z);
+        }
+
+        std::string ferr;
+        long long culled = 0;
+        if (!surf.isSphere) { surf.tris = L.scene.tris.data() + triFirst; surf.nTris = triCount; }
+        const size_t segsBefore = L.scene.curveSegs.size();
+        const long long made = generateFur(sp, surf, L.scene.curves, L.scene.curveSegs, &ferr, &culled);
+        if (made < 0) {
+            // A stop during generation is not a scene error — it is a cancelled load, and
+            // stopped() is what main.cpp reports. Only a real failure gets a message.
+            if (!ferr.empty()) fail(ferr);
+            return false;
+        }
+        char baldNote[96] = {0};
+        if (!sp.bald.empty())
+            std::snprintf(baldNote, sizeof baldNote, ", %lld culled by %zu bald zone%s",
+                          culled, sp.bald.size(), sp.bald.size() == 1 ? "" : "s");
+        std::fprintf(stderr, "[fur] \"%s\" on \"%s\": %lld strands, %zu segments (%s %.4g m^2)%s\n",
+                     sp.name.c_str(), on.c_str(), made,
+                     L.scene.curveSegs.size() - segsBefore,
+                     surf.isSphere ? "sphere" : "mesh", furTargetArea(surf), baldNote);
+        return true;
+    }
+
     bool addMesh(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
         std::string file = strOf(b, "file");
         if (file.empty()) { fail("mesh needs a file"); return false; }
@@ -4284,6 +4995,7 @@ private:
             g.blasId   = -1;
             g.matId    = id;
             g.shapeOnly = shapeOnly;
+            if (!b.name.empty()) triRangeByName_[b.name] = {triStart, L.scene.tris.size() - triStart};
             L.scene.meshGroups.push_back(std::move(g));
             // A shape-only mesh exists purely to hand its silhouette to something else
             // (today: a `medium { bounds { object "<name>" } }` containment bake). Its
@@ -4513,8 +5225,7 @@ private:
 
         MeshInstance inst;
         inst.blasId = it->second;
-        inst.toWorld = xf;
-        inst.toLocal = xf.inverse();
+        inst.setToWorld(xf);            // also derives toLocal + the O3 curvature scale
         inst.matOverride = matOverride;
         L.scene.instances.push_back(inst);
         return true;
@@ -4569,9 +5280,10 @@ private:
             else if (s.key == "mesh")     { if (!addMesh(*cb, L, world)) return false; }
             else if (s.key == "mesh_instance") { if (!addMeshInstance(*cb, L, world)) return false; }
             else if (s.key == "isosurface") { if (!addIsosurface(*cb, L, world)) return false; }
+            else if (s.key == "curve")    { if (!addCurve(*cb, L, world)) return false; }
             else if (s.key == "light")    { if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false; haveLight = true; }
             else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
-            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, light, group)"); return false; }
+            else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, curve, light, group)"); return false; }
         }
         return true;
     }
@@ -4686,7 +5398,21 @@ private:
         // CSE the compiled program: field formulas are the sphere-trace's inner loop
         // (every march step + shadow ray runs this program), and machine-generated
         // exprs repeat whole subtrees. Bit-identical by construction (see pattern.h).
-        patternOptimizeCSE(prog);
+        //
+        // Here rather than in optimizePatterns because the program is about to be
+        // APPENDED to a shared node pool that holds one leaf after another; the pass
+        // needs a single-rooted program, which this is and the pool is not.
+        //
+        // Handing over the tables is what lets a `grid:`-sampling field be optimized at
+        // all — `grid:terrain(x, z)` repeated across a min/max CSG tree is exactly the
+        // case worth collapsing. The headers carry their `ndim` from the data pass (an
+        // `sdf`'s is reserved at registration), which is all the arity model needs; the
+        // sdf SAMPLES are still zero this early, but that only makes the pass's probe
+        // comparison weaker, never wrong — both sides read the same zeros.
+        {
+            const PatTables tabs = loadedRef_ ? loadedRef_->scene.patTables() : PatTables{};
+            patternOptimizeCSE(prog, &tabs);
+        }
         Affine L2W;
         for (int k = 0; k < 9; ++k) L2W.m[k] = L_ * authoredXf.m[k];
         L2W.t = authoredXf.t * L_;
@@ -6212,8 +6938,10 @@ private:
     // length — that may itself vary along the curve, giving the camera a "speed": high
     // density = many closely-spaced frames = slow motion through that stretch; low
     // density = fast. `density <rho>` is constant; `density_at <t> <rho>` keyframes it
-    // (piecewise-linear over the normalized position t in [0,1], t=0 first point, t=1
-    // last). The number of cameras placed with local spacing 1/rho follows from
+    // (piecewise-linear over the normalized ARC-LENGTH position t in [0,1]: t=0 the
+    // first point, t=1 the last, t=0.5 the half-way mark BY DISTANCE — not by control
+    // point index; see the two-pass sampling below for why that distinction bites).
+    // The number of cameras placed with local spacing 1/rho follows from
     // integrating rho over arc length; `frames N` (if also given) instead fixes the
     // count and only uses the density to DISTRIBUTE those N cameras. Orientation:
     //   look tangent    (default) — aim along the direction of travel
@@ -6337,6 +7065,19 @@ private:
         // Densely sample the spline; build a cumulative "count" table C(g) = INT rho ds.
         // For a constant/absent density this is just arc length, so the same inversion
         // yields uniform arc-length spacing.
+        //
+        // TWO passes, and the reason is the whole meaning of `density_at`'s t. Arc length
+        // is not known until the curve has been walked, so the obvious single-pass version
+        // has nothing to feed `densityAt` but the spline's own global parameter g/nSeg —
+        // i.e. the normalized CONTROL-POINT INDEX. Those two agree only when the control
+        // points happen to be evenly spaced, and on a real flight path they are nowhere
+        // near it: gallery_rain's loop has 0.27 m between the gyroid channel's points and
+        // 1.3 m across the back cruise, a 5x spread, which slides every authored dwell off
+        // its beat by up to a tenth of the loop. (That was a live bug: the scene's comment
+        // said "ARC-LENGTH fractions, not point indices" while the loader was doing exactly
+        // the latter, so the dwell meant for the glass orb was landing short of it.) So:
+        // pass 1 walks the spline for pure arc length, pass 2 integrates rho against
+        // s/Smax. Cost is one extra spline evaluation per sample at load time.
         int nSeg = closed ? (int)pts.size() : (int)pts.size() - 1;
         int M = std::max(64, 64 * nSeg);
         std::vector<double> sampG((size_t)M + 1), sampC((size_t)M + 1), sampS((size_t)M + 1);
@@ -6345,13 +7086,13 @@ private:
         for (int k = 1; k <= M; ++k) {
             double g = nSeg * (double)k / M;
             Vec3 pcur = catmullRomAt(pts, closed, g, splineAlpha);
-            double ds = length(pcur - prev);
-            double rho = densityAt(g / nSeg);
-            sampC[k] = sampC[k - 1] + rho * ds;
-            sampS[k] = sampS[k - 1] + ds;      // pure arc length (density-free), for look-ahead
+            sampS[k] = sampS[k - 1] + length(pcur - prev);   // pure arc length (density-free)
             sampG[k] = g;
             prev = pcur;
         }
+        const double invS = (sampS[M] > 1e-12) ? 1.0 / sampS[M] : 0.0;
+        for (int k = 1; k <= M; ++k)
+            sampC[k] = sampC[k - 1] + densityAt(sampS[k] * invS) * (sampS[k] - sampS[k - 1]);
         double Cmax = sampC[M];
         if (Cmax <= 0.0) { fail("camera_curve '" + base + "' has zero length or density"); return false; }
 
@@ -6522,6 +7263,10 @@ private:
                      "': references a surface variable — only the flyby timeline `t` is in scope here");
                 recOk = false; return;
             }
+            // Flyby tracks are resolved to per-frame numbers during the LOAD, so an `sdf`
+            // read here would sample a field that has not been baked yet.
+            if (!rejectUnbakedSdf(drv, "camera_curve '" + base + "' " + key + " driver",
+                                  "a `camera_curve` driver")) { recOk = false; return; }
             rt.recIdx = rit->second; rt.chanIdx = ci; rt.driver = std::move(drv);
         };
         RecTrack fovRec, rollRec, zoomRec, fstopRec, focusRec;

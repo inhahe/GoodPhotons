@@ -33,7 +33,12 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
 
 ## Module map (src/)
 
-- **`main.cpp`** (~6200) — CLI parsing, mode dispatch, chunking/progressive loop
+- **`main.cpp`** (~6200) — CLI parsing (the option table is a chain of `else if`s split
+  into **segments** — each ends `else handled = false;` and the next is guarded by
+  `if (!handled)`, because one unbroken chain hit MSVC's `C1061: blocks nested too deeply`
+  at ~128 links and the build then fails on whatever flag was added last; append new flags
+  to a segment, and start another once one nears ~100 links), mode dispatch,
+  chunking/progressive loop
   (`cpuSppChunks`, `chunkFixed = !progressive && g_showWindow` — a bare fixed `-n`
   with no `-window`/budget flag runs monolithically with output only at the end),
   periodic write/`-interval`, checkpoint/resume (`.ftbuf`), multi-camera shared
@@ -208,6 +213,248 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (`__fmul_rn`/`__fsub_rn`, plus `double` overloads for the `Real = double` build) — see
   `render_cuda.cu`. Exactly the same failure and the same fix as the rasterizer's
   `edgeRow`/`edgeAt` below. Fixed 0.116.0; measurement in `known-issues.md`.
+- **`curve.h`** — the **curve / fiber** primitive (hair, fur, grass, wire, thread),
+  added 0.150.0 for TODO §P1. A `curve` is control points + a radius; the loader
+  **flattens it at load time** into a chain of `CurveSeg` **round cones** (the convex
+  hull of a sphere at either end — a capsule with a linearly varying radius), and the
+  BVH indexes one leaf per *cone*, not per strand.
+  - *Why flatten, and why round cones.* A triangle ribbon costs ~64 tris/hair, so one
+    furred animal is 10⁸–10⁹ triangles — that is the whole reason the primitive exists.
+    Flattening up front (rather than evaluating the basis per ray) buys **exact leaf
+    bounds** ("bound what you test", vs. a strand box that is mostly empty), keeps basis
+    evaluation out of the inner loop that §P2's sub-pixel variance will hammer, and
+    leaves a POD record the GPU port uploads directly (0.151.0 does exactly that —
+    `DCurveSeg` is a narrowing memcpy of `CurveSeg`). It costs memory
+    (80 B/seg) and discretised curvature. Round rather than camera-facing ribbons
+    because adjacent cones **share their end sphere**, making the chain watertight and
+    smooth at joints with **no mitre logic** — a strand is one closed surface however
+    sharply it bends.
+  - *The intersector.* A round cone's boundary is three pieces — the tangent **lateral**
+    cone and a **spherical cap** at each end — discriminated by one axial coordinate
+    `y = dot(ba, p−p0) − r0·(r0−r1)` against the band `(0, d2)`, `d2 = |ba|² − (r0−r1)²`
+    (parameterisation from Inigo Quilez). Entry into a union is the **min over pieces of
+    entry into each piece**, so the code enumerates *all* roots of *all three* quadrics,
+    restricts each root by its own piece's `y` range, and takes the minimum. That is what
+    makes it correct for an origin **inside** the fiber (a shadow ray must still find its
+    exit) as well as outside. `d2 <= 0` means one ball swallows the other and the hull is
+    just the bigger sphere — a separate branch, checked against `intersectSphere`
+    bit-for-bit. `makeCurveRay` hoists the one `sqrt` per ray (cf. `TriShear`), and
+    `scene.h` builds it only when `curveSegs` is non-empty so a curve-free scene pays a
+    predictable branch and nothing else — **verified bit-identical** to the pre-curve
+    binary (modes R and W × triangles / implicits / instances, md5-compared against a
+    `git worktree` build of HEAD).
+  - *Conditioning: origin recentering (0.151.0).* The quadric's constant term
+    `k0 = d2·m5 − m1² + 2·m1·rr·r0 − m0·r0²` is a difference of two nearly equal large
+    products. At the scale a fiber is actually authored at — `r ≈ 1 mm`, segment ≈ 1 cm,
+    origin 2 m away — `d2·m5` and `m1²` are each ~4·10⁻⁴ while `k0` is ~10⁻¹⁰: **six
+    decades**, the entire fp32 mantissa. So `curveSegCrossings` first slides the ray
+    origin along itself to its closest approach to `p0` (`shift = dot(p0−ro, rd)`) and
+    every accepted root undoes the shift. This is an exact re-parameterisation — it
+    changes conditioning, nothing else — and it is the round-cone analogue of the
+    perpendicular-offset trick `intersectSphere` already uses (Ray Tracing Gems ch. 7).
+    Measured: without it the fp32 intersector **loses 12–36 % of fiber hits** and
+    misplaces the rest by **11–42 radii** (strands would render as speckled holes on the
+    GPU while looking perfect on the CPU, with no image-level test able to blame the
+    intersector); with it, ≤ 0.06 radii. It also tightened the double path 16× (§1 max SDF
+    residual 8.60e-13 → 5.23e-14). **Trap:** after recentering the near root is normally
+    *negative* (the origin now sits beside the fiber), so `tmin`/running-closest filtering
+    must happen **after** undoing the shift — filtering in shifted space discards exactly
+    the root you want. Both the host lambda and the device `CURVE_OFFER` macro do the
+    unshift first, and both say so in a comment.
+  - *Root enumeration is scalar-templated.* `curveSegCrossings<S>(ro, rd, p0, p1, r0, r1,
+    shift, offer)` takes geometry as `S[3]` arrays (not `Vec3`) precisely so a `float`
+    instantiation does its dot products in float — that being the thing under test. The
+    renderer instantiates it at `double`; `-checkcurve` §6 instantiates the *same code* at
+    `float`. Without the templating, the self-test could only have validated algebra the
+    GPU does not run.
+  - *Bases.* `linear` (exact, `segments` forced to 1), uniform **Catmull-Rom** (default,
+    interpolating — an authored guide hair passes through its points; ends
+    clamp-duplicated), **Bezier** (cubic chain, `3k+1` points), uniform cubic
+    **B-spline** (approximating + C2, the shape a groom solver emits). All four are
+    affine-invariant, which is why `ftsl.h` transforms the *control points* and flattens
+    afterwards — a `group { rotate … }` carries a strand exactly, for free. Radius is
+    interpolated **linearly** between a span's endpoint control points, never through the
+    basis: a Catmull-Rom radius can overshoot, and a negative radius is not a taper.
+  - *Hit record.* `u` = strand parameter 0 (root) → 1 (tip), carried on the segment as
+    `u0`/`u1` so a pattern can band a fiber lengthwise; `v` = azimuth from the segment's
+    own `onb(axis)`; `tangent` = the axis Gram-Schmidt'd against the shading normal.
+    The v1 azimuthal frame is **per-segment, not parallel-transported**, so `v` can step
+    at a sharp joint — logged in `known-issues.md`.
+  - *Verification.* `-checkcurve` (`main.cpp`) is six sections: the intersector vs. the
+    exact analytic SDF (sphere-traced ground truth, with rays *aimed* at the fiber —
+    uniformly random rays essentially never hit something 1 mm wide, which made the first
+    draft of this section vacuous at 950 hits per 200 k rays); the degenerate containment
+    case vs. `intersectSphere`; `anyHit` vs. the full path with half the origins inside;
+    watertightness at chain joints; basis flattening; and **fp32 conditioning** at four
+    fiber scales (error measured in *fiber radii*, since an absolute tolerance is
+    meaningless across scales). **Mutation-tested**: dropping the p0-cap band restriction
+    fails only §3, dropping the p1 cap fails §1 and §4, and forcing `shift = 0` fails only
+    §6 (on all four rows) — so the sections are complementary, not redundant.
+  - *On the GPU since 0.151.0.* `DCurveSeg` + `intersectCurveSeg` in `render_cuda.cu` are
+    the device twin, and `curveSegs` became the **fifth** prim range in the flat BVH
+    dispatch (`tris | spheres | implicits | curveSegs | instances`) — which shifts the
+    instance index arithmetic in *both* `closestHit` and `occluded`, the classic way to
+    break instancing while porting something else. `cudaForwardSupported` no longer
+    rejects curve scenes; it only screens their **materials**, like every other
+    primitive's. Measured 74× (512 spp, 400×300, 96 000 segments: 59.1 s → 0.8 s at
+    identical 4.42 % noise). The general lesson worth carrying to the next primitive: a
+    device port is **not mechanical** when the megakernel is fp32 — check the
+    conditioning of any quadric *at the scale the primitive is actually authored at*,
+    because a well-behaved `double` intersector can be numerically useless in `float`.
+    The **raster preview** was never gated —
+    `raster::tessellate` stage (2b) meshes each round cone by
+    sweeping rings through the same three pieces the intersector knows (back cap →
+    tangent lateral band → front cap; both tangent circles sit at polar angle `acos(a)`,
+    `a = (r0−r1)/|ba|`, which is what makes one angular sweep cover all three
+    continuously and the preview mesh closed). Coarse by design, ~80 tris/segment.
+    *Coarse was still ~46 GB* (0.160.0): a groom is 10⁶ segments and `sizeof(PTri)` is
+    320 B, so the fixed 80-tris/segment cone made `-explore` on `gallery_rain`
+    (1.79 M segments) allocate tens of gigabytes and page-thrash forever behind an
+    unchanging `tessellating (0/33)` placeholder. Stage (2b) now runs under a **triangle
+    budget** (`raster::kDefaultCurveBudget`, 12 M; `-raster-curve-budget`): it takes the
+    richest LOD on the ladder `{10,2} → {6,1} → {4,1} → {3,1} → {4,0} → {3,0} → {2,0}`
+    (`{azimuth divisions, rings per cap}`; `ccap == 0` drops the sub-pixel end caps,
+    `cu == 2` is a double-sided ribbon) that fits, and thins whole strands by
+    `CurveSeg::curveId` only if even the cheapest tube doesn't. The lesson generalises:
+    **a per-primitive preview cost that is fine for the primitive is not fine for the
+    generator that authors 10⁶ of them** — every "coarse by design" constant that a groom,
+    an instancer or a particle system can multiply needs a budget, not a constant.
+  - *A new prim range lives in **three** places, not two* (learned 0.153.1). The BVH leaf
+    and the device leaf are the obvious two, and both announce a mistake loudly — the
+    scene renders wrong, or falls back. The third is `Scene::closestHitLinear`, the
+    brute-force reference `-checkbvh` compares the BVH *against*, and it fails in the
+    opposite direction: it stayed blind to `curveSegs` for three versions, so every strand
+    the BVH correctly found scored as a mismatch and `-checkbvh` reported a permanent
+    ~0.2 % FAIL on any fiber scene. A stale reference doesn't weaken a cross-check, it
+    **inverts** it — the self-test generates exactly the noise a real regression would
+    have to be spotted in. The same commit made the reference's `O(rays × prims)` sweep
+    threaded and taught its ray budget to count non-triangle prims, because a groom is the
+    first thing to put 10⁶ prims through a linear scan (`fur_basics`: 68 min → 2m38s).
+  - *Verified across all ten renderable modes on both devices* (0.153.1) by rendering
+    `curve_basics` against a strand-stripped twin and scoring the fraction of pixels the
+    fibers change; 10–38 % everywhere, CPU↔GPU mean luminance within 0.4 %. The one
+    subtlety is that **A and C must be scored in HDR**: as physically-absolute
+    finite-aperture cameras their image sits at ~5e-5 scene-linear, so on the tone-mapped
+    PNG every pixel quantises into the bottom 8-bit level and they report 0.00 % coverage
+    *even at 2.4e9 photons* — identical to what a mode that ignored curves would print.
+    Harness: `scraps/curve_mode_sweep.py`.
+- **`fur.h`** — the **groom generator** (`fur { on "<object>" … }`), added 0.152.0 for
+  TODO §P1 stage 2. `curve.h` gave ftrace a strand; this gives it a way to *author* a
+  coat, which is a different problem — nobody types 10⁴–10⁶ hairs, so without a
+  generator the primitive is limited to the handful of wires you are willing to write
+  out. A pure function of `(surface, parameters, seed, index) -> strands`.
+  - *It emits no new geometry type.* `generateFur` appends exactly the `Curve` /
+    `CurveSeg` records `ftsl.h`'s hand-authored `curve` path produces, so the BVH, the
+    CPU tracer, the CUDA megakernel and the raster preview all needed **zero** new code
+    and a groom inherited the 0.151.0 GPU port for free. That constraint is what kept
+    the feature to one header plus a loader arm.
+  - *Roots are area-uniform.* A prefix CDF over triangle area plus the sqrt barycentric
+    warp — sampling a triangle *uniformly* instead is the classic mistake and is nearly
+    invisible on an even mesh, yet it thins the coat over large polygons and makes
+    `density` meaningless. A `sphere` target is **not** tessellated at all: roots land on
+    the analytic surface with the analytic normal, so a furred ball has no faceting in
+    its root distribution.
+  - *Shaping is closed-form, and that is the design.* Growth is linear in the arc
+    parameter `t`; droop, comb, curl and clump are all quadratic in it, so the root
+    leaves the skin along its growth direction (a strand that bends at its root reads as
+    broken) while the tip carries the full displacement. Closed-form is what makes each
+    strand independent of every other, hence the build is a lock-free `ft::parallelFor`
+    into a preallocated slice whose result does not depend on scheduling. No simulation,
+    no solver, no collision — a deliberate first tier.
+  - *Variable output, handled honestly.* `tessellateCurve` may emit fewer cones than the
+    upper bound (it drops coincident samples), so each strand records its own count and a
+    serial compaction closes the gaps; the "nothing dropped" case (every ordinary groom)
+    degenerates to a single bulk append. If any strand *was* dropped, every `curveId` is
+    renumbered rather than left stale.
+  - *Clumping uses a real spatial structure.* Strands blend toward their **nearest** guide
+    with weight `clump·t`, so roots stay exactly where the sampler put them — clumping
+    must change a coat's **shape, never its density**. Guides live in a CSR uniform grid
+    with shell-only ring expansion and a "one ring past the first hit" stop rule (the
+    classic off-by-one: the nearest guide can sit beyond the first non-empty ring). The
+    cell count is capped at 2·10⁶ by coarsening, so a tiny `clump_size` on a large model
+    cannot allocate a billion cells. Hashing the root cell would have been simpler and is
+    visibly wrong — it gives cube-shaped tufts on a grid instead of Voronoi ones.
+  - *`bald` zones (0.154.0) — the fix for hair growing out of an eyeball.* A coat is grown
+    per body **part**, but the features that must stay bare (an eye, a nose leather) are
+    separate little spheres sitting *on* that part, and the part's groom does not know they
+    exist: it roots area-uniformly over the whole target, including the ring of skin the
+    eye overlaps, so every strand rooted around that ring grows straight across the eye.
+    `scenes/fur_creature.ftsl` had exactly this — the eyes rendered as black patches
+    peppered with hair — and the scene's *existing* comment about placing the eyes proud of
+    the coat did not prevent it: standing proud stops the eye being **buried**, which is a
+    different failure from the eye being **crossed**. `FurSpec::bald` is a list of spheres
+    no strand may enter, culled in `generateFur`. Three choices carry the feature:
+      - *The whole strand is tested, not just the root* — and `furStrandHitsBald` tests
+        **spans** (point-to-segment distance), not control points, because a zone smaller
+        than the gap between two control points would otherwise be skewered. A hair rooted
+        outside a zone that arcs through it under droop/comb is precisely the hair that
+        shows on an eyeball, so a root-only cull would defeat the parameter.
+      - *After clumping*, since clumping is what drags a tip sideways into a zone its own
+        root pointed clear of.
+      - *Culling cannot bias the coat.* Roots are still drawn area-uniformly and survivors
+        are untouched, so fur outside a zone is bit-for-bit what it was; only the count
+        drops. A cull reuses the existing `nseg == 0` compaction path — there is no second
+        way for a strand to disappear — with a parallel `baldFlag` byte array, allocated
+        only when a zone exists, so the load line can report bald culls apart from
+        degenerate strands (a `bald` that quietly ate a whole groom has to be visible, not
+        inferred from a low count).
+    Loader side: `bald "<sphere>" [margin]` resolves through `sphereByName_`, so the bare
+    patch stays welded to the feature instead of being a second copy of its coordinates
+    that rots when the face moves; `bald <x> <y> <z> <r>` covers zones that aren't authored
+    spheres. Both are repeatable statements, scanned like `density_at`.
+  - *LOAD-ORDER TRAP (cost a debugging session; now pinned).* The deferred `fur` sweep
+    runs inside the **loader**, but `Tri::finalize()` — which computes `gn` and back-fills
+    absent shading normals — is called from **`Scene::build()`**, i.e. afterwards. So the
+    generator sees `gn == n0 == n1 == n2 == (0,0,0)` on every quad, triangle, and mesh
+    without authored `vn`. `normalize` of that zero made the whole strand NaN, and the NaN
+    was then swallowed by `tessellateCurve`'s `dot(dp,dp) > 0` coincidence guard — so a
+    groom emitted **zero strands and printed no error at all**. `furSampleRoot` now
+    derives the geometric normal from the vertices itself and uses shading normals only
+    when genuinely present. The general lesson: **anything reading `Tri` during loading
+    must assume it is not finalized.**
+  - *Loader wiring (`ftsl.h`).* `triRangeByName_` maps a name → `(first, count)` into
+    `Scene::tris`, filled by `addQuad`/`addTriangle`/`addMesh`. The target is resolved as
+    an **index range**, never a `Tri*` held across the parameter reads — `Scene::tris` is
+    a vector and a stored pointer would dangle the moment anything appended. Like
+    `medium`, `fur` is collected in Pass 3 and processed in a **deferred sweep** so
+    `on "name"` resolves regardless of authoring order; the sweep runs *before*
+    `stripShapeOnlyMeshes`, so a groom can grow on an invisible scalp. `density` is
+    divided by `L_²` because it is authored per *authored* unit², not per m².
+  - *Verification.* `-checkfur` (`main.cpp`) is eight sections — roots on the surface;
+    area-uniformity (a 3:1 area split must give a 3:1 strand split, mean barycentric ⅓ not
+    ½, `density × area` an exact count); determinism across seeds; growth never into the
+    skin plus length inside the jitter window and shaped arc inside its analytic bound;
+    clumping collapsing tip spacing while moving **no** root; a well-formed chain; the
+    load-order regression, built on deliberately **un-finalized** triangles; and `bald`
+    zones. Note §4 measures the direction the strand *leaves* at, not where it ends up: a
+    shallow strand under heavy droop legitimately curves back to the ground.
+    **Mutation-tested** by `tools/mutate_fur.py` — eleven deliberate breaks in `fur.h`, each
+    caught by the section that owns it (`python tools/mutate_fur.py 6 9` re-runs individual
+    ones; a full sweep is one rebuild per mutation). `tools/fur_noise.py` is the companion
+    measurement behind TODO §P2's corrected forward-vs-backward note.
+  - *And the mutation run paid for itself immediately.* `spec.seed` has **two** independent
+    consumers — the per-strand rng and the clump-guide rng — and §3's original "seed 8
+    differs from seed 7" test ran with clumping **on**, where either one moving alone is
+    enough to make the buffers differ. Deleting `spec.seed` from the *strand* seeding was
+    therefore MISSED: the groom would silently have ignored the seed entirely in any scene
+    without `clump`. §3 now checks each path in isolation — the strand rng with clumping
+    off (nothing else can move), and the guide rng by driving the guide count to exactly
+    **one** (`clump_size` large enough that `G = round(area/πr²)` clamps to 1) at
+    `clump 1.0`, so `w = clump·t` is exactly 1 at the tip and every strand's last control
+    point *is* that single guide's tip — a point the strand rng cannot influence. §3 also
+    asserts the tips really did collapse, so the isolation can't silently fail open.
+  - *And then it paid for itself a second time, on §8 (0.154.0).* The first §8 tested `bald`
+    with a 0.12 m zone sitting **on** the ball's pole — which, being wider than the coat,
+    swallows the *roots* of everything that crosses it. So mutation #10 ("test only the
+    root, not the whole strand") was MISSED: root-only culling produced exactly the same
+    image on that zone, while being precisely the bug the parameter exists to prevent (an
+    eye is peppered by hairs rooted on the skin *around* it). §8 gained a second zone that
+    **floats clear of the skin** — 50 mm above the pole, 35 mm radius, so no root is within
+    reach of it — where a positive cull is only possible if the span test ran. The test
+    recomputes "no root is inside" rather than asserting it in a comment, so it stays
+    honest if the ball or the coat length ever change. The lesson generalises: a guard whose
+    fixture makes two different implementations agree is not guarding anything, and only a
+    mutation run will tell you which fixture that is.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds
@@ -1110,6 +1357,57 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   *and* the live window, and once the window got its own repaint cadence it began running
   several times a second: at 480² the sort alone was the bulk of a ~40 ms repaint, now
   ~25 ms.
+- **`-exposure-anchor <value|file>` — an exposure anchor that survives process exit.**
+  The pre-existing lock machinery (`expAnchors`, `RenderCam.expGroup`, the `meterPlan`
+  pre-pass, `-exposure-lock`) shares an anchor only among frames rendered by **one**
+  `ftrace` invocation; it lives in a `std::map` that dies with the process. A sequence
+  rendered one-frame-per-invocation (loom's `render_range`, a batch loop, a single frame
+  re-rendered later) therefore meters every frame independently and can flicker. The new
+  `ExposureAnchorFile` (`main.cpp`, just after `writeFilm`) closes that gap with a
+  deliberately dumb medium — a text file holding one `%.17g` double. `resolve()` first
+  tries to parse the argument **whole** as a finite positive double (the trailing-junk
+  check is what stops a filename like `12frames.txt` reading as the number 12); failing
+  that it treats it as a path, loading the anchor if the file parses and otherwise
+  recording it as a `writePath`. So the *same* command line means "meter and save" on the
+  first frame and "load and reuse" on every later one, which is what lets a caller loop
+  without special-casing frame 0. The flag implies `-exposure-lock`, and must be resolved
+  **before** the camera list is built (the lock changes how cameras are grouped).
+  Write-back is RAII (`AnchorWriteback`, destructor reads `expAnchors[0]`) because the
+  render dispatch has a dozen early `return`s and a save at any one of them would have
+  been missed at the others. `-topng` accepts the same flag — it runs before the main
+  argument loop, so it parses it itself and passes a `double*` down through
+  `convertToPng` → `writeFilm`'s `lockAnchor`.
+  **Why it was needed** (measured on `png/pastel_jack_ring`, 432 frames, static camera —
+  only the ring rotates, so any global brightness change is by construction an artifact):
+  the p99 anchor stepped **36.2%** between adjacent frames while the static background
+  moved 2.2%, p95 0.68%, the median 0.59% and the whole-frame log-average 0.97%.
+  The cause is **not** a bimodal histogram (an earlier revision of this bullet and of
+  `known-issues.md` said so; it is wrong, and the fixes it implied are refuted). The tail
+  has no gap — it *saturates* at 4.4780e+13, an emitter plateau over ranks 0.995–1.000 that
+  is identical in both of the worst-pair frames. p99 sits *below* it in a sparse continuum
+  with only ~**0.25% of frame per octave** above p95, so solving `area(L) = 1%` for `L` is
+  ill-conditioned — ≈ **5 octaves per 1% of area** — and the 0.07-point area change the
+  ring actually makes (1.1836% → 1.1128% above 4× p95) moves the level a third of an
+  octave. Every fixed-rank statistic inherits this.
+  **The shared anchor is therefore the fix, not a mitigation.** Nine studies measured six replacement families against stability *and*
+  fidelity; none satisfies both, the stable ones landing 1.5–7.7 stops from today's
+  exposure, because where p99 misbehaves its value is arbitrary and there is nothing to be
+  faithful to. The bad case is also undetectable — pastel_jack_ring's local density at the
+  anchor (median 1.23%) exceeds the 25th percentile of ordinary renders (0.87%) — so a
+  gated regulariser is unavailable too. The needed information is temporal, not spatial.
+  The narrow residual: a single **still** can still anchor on an atypical glint. See
+  `known-issues.md` for all tables, plus a separate, genuinely fixable defect found the
+  same way — the tone map hard-clips with no shoulder, which is *why* the anchor is forced
+  to track the moving top of the histogram.
+  **Repair path for already-rendered sequences** — `loom.stabilize_exposure(pngs)`
+  (`tools/loom/loom/drive.py`) develops each `<frame>.png.ftbuf` once with `-topng` to
+  read back the anchor that frame *would* have chosen (scraped from the
+  `auto-exposure=<v>` line), takes the **median** across the sequence, and re-develops
+  every frame at it. Median rather than "first frame wins" because on `pastel_jack_ring`
+  frame 0's anchor sat at the **93rd percentile** — 0.502× the median, a full stop — so
+  the obvious rule would have darkened the whole movie. It is a pure post-pass over
+  checkpoints (milliseconds a frame, no photons re-flown), and `render_range(...,
+  stabilize=True)` (the default) runs it after the last frame.
 - **`-hdr` (a 32-bit float PFM beside `-o`)** — the escape hatch from the tone map, added
   because *measuring* off a PNG had quietly been wrong all along. An 8-bit sRGB image clamps
   at white, and a caustic is by definition the brightest thing in frame, so its core prints
@@ -1327,11 +1625,10 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   optimization is bit-identical in the host double evaluator **and** the device float
   evaluator (`dPatternEvalF`) even though those two disagree with each other. Constant
   folding was rejected for exactly this reason: host-double folding would change the
-  float path's bits. (2) It is hooked **only at the final-consumption site**
-  (`ftsl.h addFunctionLeaf`, after `compilePatternExpr`) — never inside compilation —
-  because `patternSubstitute` splices programs together and two pre-optimized fragments'
-  register indices would collide. (3) It is belt-and-braces conservative: programs with
-  `Grid`/`Scatter` (arity lives in the table, not the node) bail, the re-emitted program
+  float path's bits. (2) It is hooked **only at final-consumption sites** — never inside
+  compilation — because `patternSubstitute` splices programs together and two
+  pre-optimized fragments' register indices would collide. (3) It is belt-and-braces
+  conservative: an op whose arity it cannot determine makes it bail, the re-emitted program
   is re-simulated for stack balance, and 6 full-variable probe points are bit-compared
   (`memcmp`) old-vs-new before the rewrite is accepted — any mismatch keeps the
   original. Since the ops are appended at the enum end, the `VarX..VarV` range tests
@@ -1339,6 +1636,370 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   evaluator switches (host `patternEval`, device `dPatternEval` / `dPatternEvalF`) carry
   the two cases, and the `PatNode → PatNodeF` upload conversion is memberwise so a
   register index ≤ 32 survives the float trip exactly.
+
+  **Vector-valued POV noise (`PatOp::DNoise` / `PatOp::DTurb`, v0.158.0).** Exact ports of
+  POV-Ray's `DNoise` (gradient-vector noise) and `DTurbulence` (its octave fBm) live beside
+  `povNoise` in `pov_noise.h`, sharing its tables — the 534-double `g_povRTable` was in fact
+  *sized for* DNoise all along (267 conceptual entries = 255 hash range + 12 for the three
+  8-double-stride component records read at `mp`, `mp+8`, `mp+16`). The VM stays scalar: one
+  op per **component**, with the component index (0/1/2) riding the node payload `a` exactly
+  like `PovFn`'s function id, surfacing as `dnoisex/y/z(x,y,z)` and
+  `dturbx/y/z(x,y,z,octaves,lambda,omega)`. `DTurb` is its own op (not authored from
+  `DNoise`) because the VM has no loops, so the octave sum cannot be expressed in-language.
+  Both ops are appended at the enum end (the `VarX..VarV` scans are unperturbed), registered
+  in `patOpStackEffect` so CSE can rewrite through them, and keyed by `a` in the hash-consing
+  so `dnoisex+dnoisey` of one point stay two nodes while a repeated identical call collapses
+  to one. The fp32 device VM (`dPatternEvalF`) promotes to double internally and demotes the
+  result — `PovFn`'s established contract — so all three backends run the identical lattice
+  arithmetic. `-checkvnoise` pins the port in six mutation-tested sections; the load-bearing
+  one is the cross-invariant that POV's generator-1 *scalar* noise is definitionally
+  `DNoise[0] + 0.5` clamped, bit-exact — anchoring the new code to the already-trusted
+  scalar port with zero tolerance.
+
+  **Cellular / Worley noise (`PatOp::Worley`, v0.159.0).** Self-contained in
+  `src/worley.h` (host+device, the same `__CUDACC__` guard idiom as `pov_noise.h`): one
+  feature point per integer lattice cell, jittered by a murmur3-finalizer hash chain
+  (full avalanche, so neighbouring cells are uncorrelated and CPU/GPU agree
+  bit-for-bit). One VM op serves four surface spellings — `worley` (F1), `worley2`
+  (F2), `worleyd` (F2−F1), `worleyid` (per-cell random in `[0,1)`) — with the **output
+  selector riding the node payload `a`** (the `DNoise` component-index convention),
+  while the **metric is a runtime operand** (rounded, clamped to 0 Euclidean /
+  1 Manhattan / 2 Chebyshev) so it can itself be an expression. The search is *exact*,
+  unlike the common 3×3×3 neighbourhood (whose F1 can be beaten by a cell two rings
+  out): concentric Chebyshev rings with the early-out "ring r's cells all lie ≥ r−1
+  away in every supported metric (each metric ≥ the Chebyshev point distance), so once
+  r−1 ≥ F2 no farther ring can improve" — average cost the same 27 cells, worst case a
+  ring or two more; the hard ring cap 8 is unreachable math and only guards NaN inputs.
+  Wiring follows the O2 checklist verbatim: enum appended at the end, `patOpStackEffect`
+  arity 4, payload keys the CSE hash-consing (`worley+worley2` of one point stay two
+  nodes), fp32 device VM promotes/demotes around the double core. `-checkworley` runs
+  seven mutation-tested sections; the load-bearing one compares F1/F2/**and id** against
+  a fixed ±6-block (13³) brute force with no early-out and independent floor/min logic —
+  provably sufficient since cells beyond ring 6 lie ≥ 6 away while F2 within the
+  always-populated 3×3×3 block is ≤ 6 (its Manhattan diameter) — plus metric-ordering
+  (order statistics are monotone), 1-Lipschitz continuity straddling cell walls (the
+  floor-vs-truncation trap), compile/reject, CSE, and distribution sanity.
+
+  **Mean curvature (`PatOp::VarCurv`, O3 stage 1, v0.161.0).** Every other noise in the
+  VM is **stationary** — a function of position, so translating an object slides the
+  pattern off it. `curv` is the first *non-stationary* driver: a per-hit property of the
+  SHAPE, so `noise * mask(curv)` follows the geometry and keeps following it when the
+  object moves. It is the mean curvature H = (k₁+k₂)/2 in 1/length, carried on
+  `HitRecord::curv` and threaded into `PatCtx` by `patCtxFromHit`.
+
+  Unlike the ops above it is **not a function but a leaf variable**, and it lives
+  *outside* the contiguous `VarX..VarV` range that `patternHasFreeVars` scans (it is
+  appended at the enum end, per the O2 checklist, so that range stays unperturbed).
+  That combination is the trap: it must therefore be named **explicitly** in both
+  `patternHasFreeVars` *and* `patOpStackEffect`. Omitting the latter is not the local
+  no-op it looks like — an unknown arity makes `patternOptimizeCSE` bail on the **whole
+  program**, so a single `curv` anywhere would have silently switched CSE off for the
+  entire surrounding expression. (That bug was real and was caught only by the
+  self-test's CSE section.)
+
+  Where the number comes from, per primitive: `sphere` is analytic (±1/R); a `curve`
+  round-cone is a surface of revolution, k = 1/R and ~0 along the axis, so H = 1/(2R) at
+  the interpolated radius; a **mesh** is per-face in `Tri::finalize()`, H = ½·trace of
+  the shading-normal differential restricted to the tangent plane. That trace must be
+  taken in the **dual basis** — {e₁,e₂} is not orthonormal, so the 2×2 Gram matrix has to
+  be inverted. A quad/flat facet, a flat-shaded mesh (no normal field to differentiate)
+  and an isosurface all honestly report 0 rather than guess.
+
+  Two invariants the rest of the system has to respect. **Sign** is relative to the side
+  being shaded: every intersector negates `curv` when it flips the normal toward the ray,
+  so a bulge is always + and a pit always −, and the same sphere reads +1/R outside and
+  −1/R inside. **Scale**: H is 1/length, so the instance path rescales it (`scale 0.5`
+  doubles it); a non-uniform scale is approximated by |det|^(1/3).
+
+  `-checkcurv` is the self-test, nine sections, mutation-tested. Worth recording *why*
+  section 6 (basis independence) is built on a **cylinder** and not the sphere it started
+  on: a sphere is **umbilic**, dn is a multiple of the identity there, so the naive
+  per-edge trace that omits the dual basis returns the correct 1/R for *every* basis. The
+  omission is only observable on a non-umbilic surface — the sphere sections passed the
+  mutant happily.
+
+  One load-time guard falls out of this: an **emission** pattern may not read `curv`
+  (`checkEmitPatsSupported`). Emission is read from both sides of transport and MIS
+  combines them, but `Emitter::samplePoint` has no curvature to report, so the sampled
+  side would read 0 against the hit side's real value — biased, not merely noisy. Same
+  reasoning that already refuses emission patterns on sphere/cylinder/spot/env emitters.
+
+  **Enclosure (`PatOp::VarCavity`, O3 stage 2, v0.162.0).** `curv` made a pattern follow
+  the SHAPE of the surface it sits on; `cavity` answers the question `curv` structurally
+  cannot: how ENCLOSED is this point? It fires a short hemispherical probe of radius
+  `scene { cavity_radius }` and returns the blocked fraction — 0 on an open plane, ~0.5
+  in a right-angled interior corner, →1 down a crevice. The two are complements, not
+  alternatives, and the difference is **locality**: curvature lives in the second
+  derivative of one normal field, so a right-angled corner between two FLAT faces reads
+  curv = 0 on both of them even though that is exactly where dirt collects, and no
+  differential property of the floor could ever produce the dark ring where a *ball*
+  rests on it. Conversely `cavity` is blind to gentle convexity — a bare sphere in an
+  empty room reads 0 however curved it is — so edge wear still wants `curv`.
+
+  The direction set is a **fixed** cosine-weighted golden-angle Fibonacci hemisphere,
+  not a random draw, and that is the load-bearing decision. A pattern input is read many
+  times per pixel by different tracers (camera hit, light-sample hit, MIS's other
+  estimator) and every read must agree, or the *material* becomes a variance source that
+  MIS smears rather than averages. Deterministic makes `cavity` a true function of
+  position: noise-free, bit-comparable CPU vs GPU, stable frame to frame. The price is
+  **banding** into at most N+1 levels, which is why the documented idiom multiplies the
+  mask by fBm — the mask says where dirt MAY settle, the noise says how much did.
+
+  It is the only pattern input that spends **rays**, so it is gated **twice**:
+  `Scene::needsCavity` (scene-wide, one integer compare that is false for essentially
+  every scene) and `Material::readsCavity` (per-hit, keyed off `Hit::matId`). The second
+  gate is not an optimisation but a correctness-of-cost requirement: `patCtxFromHit` runs
+  for EVERY patterned material, so a scene-wide-only flag would charge N occlusion rays
+  to every unrelated noise-textured surface in a scene that used `cavity` once.
+  `ftsl::setupCavity` sets the flag from `materialFreeInputs` and then lifts it through
+  `mixChildren` to a fixed point, so a `mix` inherits it from a layer (and from a nested
+  mix's layer). The value is computed lazily on first read and cached in
+  `Hit::cavity`/`cavityDone` — which is why those are the only two `DHit` fields with
+  default member initialisers: no intersector writes them, and `dVertHit()` / the scratch
+  hits inside `occluded()` would otherwise hand the cache garbage.
+
+  The device probe (`dCavityAt`) **inlines** the host's exact Duff ONB rather than calling
+  `d3onb` (wrong vector type) and works in `double` throughout even where `Real` is
+  `float`, so the two halves stratify identically; verified numerically (deterministic
+  mode-W CPU vs GPU max Δ 6/255, mode-D auto-exposure identical to all digits). The
+  raster previews pass 0 — they have no BVH at all, by construction (`known-issues.md`).
+
+  `-checkcavity` is the self-test, ten sections, mutation-tested four ways. Its anchor is
+  analytic and **tight** rather than sampling-limited: a horizontal ceiling at height h
+  blocks exactly the cap cosθ > h/R, whose **cosine**-weighted measure is 1 − (h/R)² (it
+  would be 1 − h/R under uniform weighting, and the test asserts it is *not* that), and
+  because the sample set stratifies u = (i+½)/N at bin centres with cosθ = √(1−u) the
+  discrete count matches to 2e-3. Mutation testing found a real hole in it: §6 originally
+  set `h.ng = h.n`, so replacing `orientedGeoN(h)` with `h.ng` SURVIVED — the fix was a
+  `hitAt2(p, n, ng)` helper that holds the geometric normal fixed while varying only the
+  shading normal.
+
+  **Distance to a named object (`sdf`, O3 stage 3, v0.163.0).** `curv` reads the surface a
+  point is ON and `cavity` reads how enclosed it is; neither can answer "how far is this
+  point from THAT object", which is non-local in a way no per-hit property can be, and is
+  about a *named* object rather than about everything. The whole feature is **a bake plus a
+  header**: `sdf "halo" { object "ring" res 128 pad 0.65 }` measures the signed distance to
+  one `mesh` onto a lattice and registers it as an ordinary `PatGrid`, read as
+  `grid:halo(x, y, z)`. **Zero new VM opcodes, zero new device code** — which is exactly why
+  it works, unchanged, at every site `grid:` already works: patterns, material slots,
+  `isosurface` leaves, `camera_curve` drivers, and *medium `density`/`ior` programs*. That
+  last one is the case `curv`/`cavity` structurally cannot reach: a volume has no normal, no
+  UV and no hit point, so a spatial field is the only input it can take.
+
+  The bake (`meshvox::bakeSignedDistance`) is three stages, and each one is a deliberate
+  choice over a cheaper wrong alternative:
+  1. **Sign** from `voxelizeSolidInto` — the signed-crossing (generalized winding) scanline
+     extracted out of `voxelizeSolid` for this. A multi-body or self-intersecting model
+     therefore reads as its **union** instead of hollowing out where the bodies overlap. Sign
+     is the only part of an SDF a mesh can be genuinely ambiguous about, and this is the one
+     place in the codebase where that has already been argued out and measured (the fog
+     bound).
+  2. **Exact narrow band**: every triangle visits the samples within 2 voxels of its AABB
+     and records the exact point-triangle distance *and which triangle produced it*, via
+     `pointTriDistSq` (Ericson §5.1.5, full Voronoi-region test — the "project and clamp the
+     barycentrics" shortcut is wrong on obtuse triangles, i.e. on most imported geometry).
+     Parallelised over z-slabs after bucketing triangles into the slabs they touch, so no
+     two threads share a sample and no atomics are needed.
+  3. **Propagation** by Bridson's closest-**triangle** sweep (SDFGen): 2 rounds × 8 octant
+     sweeps, each sample adopting a neighbour's closest triangle if re-measuring against it
+     wins. Distance stays exact-per-triangle everywhere; only the *search* is approximate.
+
+  Stage 3 was originally the exact separable EDT that `featherGrid` uses, seeded with the
+  narrow band's exact squared distances. That is **not a distance transform**: F&H computes
+  min over q of (|p−q|² + f[q]), which is only correct for BINARY seeds — with exact seeds
+  it adds *squares* where distance adds *lengths* (the two legs are collinear in the case
+  that matters, so the answer wants (|p−q| + d_q)², not |p−q|² + d_q²). It read a 71.5 mm
+  torus tube as 47 mm: smooth, plausible, and 34 % short. Propagating the closest
+  *primitive* rather than a distance is what makes the composition legal. The trap is
+  documented at the function with the measured numbers.
+
+  **Load ordering is forced to split in two**, because the name must resolve before Pass 1c
+  compiles patterns but the samples cannot exist before Pass 3 loads geometry.
+  `Builder::reserveSdf` (Pass 1a′) registers an empty ndim-3 `PatGrid` under `gridIndex_`, so
+  `grid:halo(x,y,z)` type-checks and any other arity is a compile error; `fillSdfs` (after
+  Pass 3) resolves the `MeshGroup`, bakes, and appends to `Scene::dataPool`. The gap between
+  them is real, so `rejectUnbakedSdf` guards the only two places a pattern is *evaluated
+  during the load* — a procedural `texture { rgb … }` bake and a `camera_curve` driver — and
+  makes them load errors. Letting them through would return `patGridSample`'s empty-table 0,
+  and 0 in a distance field means "exactly on the surface": the most confidently wrong answer
+  available.
+
+  One subtlety worth the comment it carries: `SdfBake::d` is written in **PatGrid order (axis
+  0 outermost)**, not the x-fastest order the voxelizer and sweeps work in, so the array can
+  be appended to the pool verbatim. The transpose happens once, in stage 4. Getting it
+  backwards is invisible in every aggregate statistic — min, max, histogram, "deepest
+  interior" all agree — and shows up only as a field that is plausible but rotated, which is
+  why `-checksdf` §7 samples through `patGridSample` and separately asserts that the
+  transposed reading would fail loudly.
+
+  `-checksdf` rests on one choice: **the test geometry is an axis-aligned box**, exactly
+  representable by 12 triangles and with a closed-form signed distance, so the bake and the
+  analytic answer are the same number at all ~40 000 lattice samples (checked to 2e-6, i.e.
+  float storage precision) rather than merely close. A sphere would have buried every real
+  defect under its own tessellation error, R·(1−cos π/N). Nine sections: the anchor, the
+  propagation reach reported separately for samples > 3 voxels out, union semantics on
+  overlapping boxes (a parity voxelizer hollows the overlap and dies here), a disjoint pair
+  for gap-crossing propagation, lattice geometry, `pointTriDistSq` against an independently
+  written exact routine on obtuse triangles, the memory order, the loader round trip through
+  an in-memory OBJ via `assetbytes::Overlay`, and the six refusals.
+
+  Known limitation, logged: *inside* an overlapping union the magnitude is the distance to
+  the nearest triangle, which may be a buried one, so it is not the union's own interior
+  distance. Exterior distances are provably exact (a buried triangle can never be nearer to
+  an exterior point than the boundary the segment to it crosses), and the exterior is what
+  the feature is for.
+
+  **The non-stationary idiom, and the CSE it forced (O3 close-out, v0.164.0).** `curv`,
+  `cavity` and `sdf` are three answers to one question, and the payoff is not any of them
+  alone but what they let you do to a noise call: *every argument of one is an ordinary
+  expression*, so a scene-aware field can change **what kind** of noise appears where
+  rather than merely how much of it shows. The division of labour that makes this legible
+  is **gate** (where the effect may appear at all — `curv`, `cavity`, cheap and local)
+  versus **field** (what the noise there should look like — an `sdf`, smooth, unbounded,
+  about a named object). Documented in REFERENCE.md → "Putting them together —
+  non-stationary noise", cross-referenced from FTSL.md §6, worked in
+  `scenes/pattern_nonstationary.ftsl` (one `sdf` around a hovering bead driving three
+  surfaces with three different gates).
+
+  Two of the three traps written up there are properties of *this implementation*, not
+  folklore, and both were found by reading the code rather than by rendering:
+  `povDTurbulence` truncates its octave count (`int oct = (int)octaves`) and Worley rounds
+  its metric to `0..2`, so a field-driven value of either **pops at integer contours**
+  instead of fading. The correct idioms are to fade the extra octave's *amplitude*
+  (centred on zero, so detail arrives without shifting the mean) and to drive `metric`
+  with a step. The third trap is analytic: `noise(k(p)·p)` has local frequency
+  `k + p·dk/dp`, which is not the `k` requested, depends on distance from the *origin*,
+  and shears the pattern into streaks along `∇k` — so crossfade two **fixed** frequencies,
+  `mix(noise(3*p), noise(16*p), t)`.
+
+  A fourth lesson came out of the demo render rather than the code, and is now in both the
+  scene's header and the REFERENCE section: a correct crossfade can still be *invisible*,
+  and for two independent reasons.
+
+  * `mix` of two independent noises has **half their variance**, so the half-way band is a
+    flat grey smear. The stretch belongs **after** the blend
+    (`smoothstep(0.38, 0.62, mix(a, b, t))`), which re-normalises it at every `t`, not on
+    each band before it, which does not.
+  * The ramp has to be **matched to the distances that actually occur**. This was measured,
+    not guessed, by rendering the raw `grid:bead` value as a reflectance and dividing (in
+    *linear* light — the tone map otherwise flatters every ratio toward 1) by a constant-1
+    render of the same frame. The answer: the bead hovers 0.30 m up, so no floor point is
+    nearer than 0.21 m and the far corners are only ~0.9 m away — the entire floor lives
+    inside a single 2:1 span. The 0.35..0.85 m ramp that "obviously" spanned the room in
+    fact held the whole visible floor between t = 0.9 and t = 1.0, showing the fine band
+    alone and looking perfectly stationary. 0.26..0.58 m reads immediately.
+
+  Related, and already documented in the scene: `cavity_radius` larger than the feature it
+  is probing (0.22 m on a 0.22 m plinth) saturates the mask to a flat 1. The general shape
+  of both mistakes is the same — a field-driven mask is only as good as the match between
+  its transfer curve and the range the field actually takes on the surface being shaded.
+
+  The idiom then ran straight into a real cost. The expression language has **no local
+  variables** (no `let`, and a pattern cannot name another pattern), so a field that gates
+  one term and steers another must be spelled out at every site — six times in the worked
+  scene's `wear` pattern. Every one of those was a separate trilinear lattice fetch,
+  because CSE had never been applied to material patterns at all (it was wired only at
+  `addFunctionLeaf`, for isosurface `function` exprs) and, worse, `patOpStackEffect`
+  returned `false` for `Grid`/`Scatter`, which would have made the pass bail on the whole
+  expression even if it had run. So documenting the idiom honestly required making it
+  cheap:
+
+  * `patOpStackEffect` and `patternOptimizeCSE` take an optional `const PatTables*`. A
+    table op's arity is the **table's** `ndim`, which is nowhere in the program, so it can
+    only be answered by whoever knows which tables the program will be evaluated against.
+    The clamp applied there is deliberately the *evaluator's* (`[1, PAT_ND_MAX_DIM]`), not
+    the header's nominal value: what has to match is the actual pop count.
+  * §6's probe contexts now bind those tables. Unbound, `patternEval` abandons the whole
+    program at a `Grid` and returns 0.0 — so both sides would have compared equal no
+    matter how wrong the re-emission was, i.e. the safety net would have silently stopped
+    catching anything on exactly the programs it was newly being asked to cover. The probe
+    rows also gained `curv`/`cavity` columns for the same reason: a variable left at 0 is
+    a variable the comparison is not exercising.
+  * `Builder::optimizePatterns` runs **last** in `build()` — after `setupCavity`,
+    `warnCurvOnFlatGeometry`, `checkEmitPatsSupported` — over every `Scene::patterns`
+    program and every `Medium::density`/`ior`. CSE preserves the first occurrence of every
+    op, so those analyses would still be correct if reordered, but running it last means
+    no future analysis has to know that `LdReg` exists.
+  * `addFunctionLeaf` now passes the tables too, so a `grid:`-sampling field formula is
+    optimized as well. It stays a separate call site because the program is about to be
+    appended to a *shared* node pool holding one leaf after another, and the pass requires
+    a single-rooted program.
+
+  Measured on `scenes/pattern_nonstationary.ftsl` via the new opt-in `FTRACE_CSE_DEBUG`
+  (same shape as `FTRACE_CHUNK_DEBUG`; the report is the only way to see a pass that is
+  bit-identical by construction): `pattern 2: 126 -> 71 nodes, 6 -> 1 table sample(s)`.
+  Table samples are reported separately from nodes because a `grid:` fetch is 8 pool reads
+  and a trilinear blend, so the node count alone understates it. `-checkgrid` §(h) pins
+  all three behaviours — shrinks and emits `LdReg` with tables in hand, stays bit-identical
+  over 64 probe points, and **declines**, leaving the program untouched, without them.
+
+  **Anisotropic Gabor noise (`PatOp::Gabor`, O4, v0.165.0).** `src/gabor.h`,
+  `gabor(x, y, z, f, wx, wy, wz)` — arity 7, the widest op in the VM. The O3 write-up had
+  just finished explaining why you must *not* make a lattice noise's frequency a function
+  of position (`noise(k(p)·p)` has local frequency `k + p·dk/dp`, so it shears with
+  distance from an arbitrary origin). O4 asks for the same thing one axis over — noise
+  *steered* along a direction field — and the obvious `noise(R(p)·p)` fails for exactly
+  the same reason: the Jacobian is `R + (dR/dp)·p`, and the second term again grows with
+  `|p|`. There is no way to fix that inside a lattice noise, because a lattice noise's
+  orientation *is* its grid. So the honest answer to O4 is a different construction, one
+  where orientation is a **kernel parameter**: a Gabor kernel only ever sees the offset
+  from its own centre, which is bounded by one cell, so a varying direction leaves a
+  residual bounded by the local turning rate rather than by position. That is measured,
+  not asserted: `-checkgabor` §6 runs a *varying* direction field and finds the same
+  local frequency at the origin and 4000 units out.
+
+  The TODO's premise for O4 was "needs a per-hit tangent frame". It doesn't — and `Hit`
+  has carried one since C6 (`tangent` + `bitangentSign`) anyway. Exposing `tx ty tz` was
+  considered and rejected: it largely duplicates the already-exposed `u`/`v`, and it would
+  only have fed the coordinate-rotation idiom that the paragraph above rules out. The
+  useful thing to expose was the *primitive*, not the frame.
+
+  Four design choices are worth recording because each replaces a standard approximation
+  with something exact:
+
+  * **A compactly supported C² envelope, `(1-r²)³` of radius exactly one cell**, instead
+    of Lagae's Gaussian truncated at 5% of its peak. The textbook 3×3×3 search is
+    therefore *approximate* — it silently drops the tails — whereas here a cell two rings
+    out is >1 away in the infinity norm, hence outside every kernel it can hold, so
+    3×3×3 is **mathematically exact** (`-checkgabor` §1 pins it against a ±4-block brute
+    force, bit for bit, and separately counts impulses that a 3×3×3 would have missed:
+    zero). It also removes the `exp` entirely and lets the support test run on the
+    *squared* distance, which rejects ~85% of candidates in three multiplies.
+  * **Per-cell Poisson(λ) points, uniform in the cell.** The union of independent Poisson
+    processes on disjoint regions is a homogeneous Poisson process, so the impulse set is
+    not merely jittered-on-a-grid — it genuinely has no grid, and the noise is stationary
+    under *arbitrary* translation, not just integer ones. §7 measures that, and asserts
+    the contrast against lattice value noise (whose variance differs 8× between
+    on-lattice and mid-cell samples) so it cannot pass vacuously.
+  * **A random phase per impulse** (Lagae & Drettakis' phase-augmented form). This is what
+    makes the normalisation *analytic*: `E_φ[cos²(θ+φ)] = ½` pointwise, so Campbell's
+    theorem gives `Var = λ·E[w²]·½·∫E² = 0.28566907` with **no dependence on `f`** — which
+    matters here far more than in an offline tool, because `f` is a runtime operand and a
+    zero-phase kernel's variance would drift as it moved.
+  * **Its own cosine.** `patGaborCosTurns` reduces in *turns* (`t - floor(t+0.5)` is
+    exact), folds to `[0, π/2]` and evaluates a Taylor series to `x²²`. libm's `cos` is
+    not correctly rounded and CUDA's differs from the host's by up to 2 ulp, which would
+    break the "a pattern evaluates bit-for-bit identically on every backend" contract that
+    `patWorley`/`povDNoise` keep. §2 verifies it against libm to 8e-16 — and had to be
+    *fixed* to do so: comparing against `cos(2π·t)` at 4096 turns measures libm's own
+    argument error (~3e-12), 300× the discrepancy being looked for, so the reference
+    reduces in turns first and large arguments are covered by an exact-periodicity check.
+
+  Wiring is the O2 checklist verbatim (enum appended at the end, one case in each of the
+  three VMs with the fp32 one promoting/demoting around the double core, `patOpStackEffect`
+  arity 7, no payload so CSE shares identical calls by structure alone). Worked example
+  `scenes/pattern_gabor.ftsl`: isotropic band-pass speckle, brushed metal, **wood end
+  grain** (steer radially about a vertical axis and the bands close into growth rings — one
+  expression, no polar remap, and the degenerate direction at the axis falls back to
+  isotropic, which is what a real pith looks like), flow-aligned fibre, latitude striation.
+  Two independent anisotropy knobs are worth stating outright, because authors reach for
+  the wrong one: the **direction** chooses which way the field oscillates (streaks run
+  *perpendicular* to it), while **scaling the input coordinates unevenly** stretches the
+  kernels themselves.
+
+  This also lands most of O8 as a side effect: the spectrum is a narrow band the author
+  picks rather than everything up to the lattice Nyquist, so it is the one noise here that
+  minifies gracefully.
 
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
@@ -2041,18 +2702,19 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       now that they are 0.18–0.24 m deep that is no longer automatic, which is another reason
       the audit is not optional. A column spans a whole y range, so plan overlap *is*
       intersection. `scraps/_standaudit.py`
-      brace-parses every cage's outer box and every cap box and checks all 39 colliders across
-      the 11 stands in 3-D; run it after any stand edit (`-v` also lists every cap's world
+      brace-parses every cage's outer box and every cap box and checks all 42 colliders across
+      the 12 stands in 3-D; run it after any stand edit (`-v` also lists every cap's world
       footprint, which is what you need in front of you before siting a new exhibit — the
       question is never "is there floor", since there are no walls, but "how wide a cap fits
       between its neighbours"). It is **spread-aware** — it
       accumulates every enclosing `group`'s translate onto each collider, because the boxes
       are authored in the pre-spread frame and reading them off the page would audit a layout
       the scene no longer has.
-    - **The flyby threads four pieces, and the ring is threaded *toward* the hall.**
-      `camera_curve "fly"` is a closed 44-point loop through the gold gyroid's empty-air
+    - **The flyby threads five pieces, and the ring is threaded *toward* the hall.**
+      `camera_curve "fly"` is a closed 45-point loop through the gold gyroid's empty-air
       channel (gallery_settled's validated points shifted the same +1.25 z the ball was), the
-      glass orb, the Klein bottle's bulb, and the chrome ring's bore. Three things are
+      FUR CREATURE's coat, the glass orb, the Klein bottle's bulb, and the chrome ring's bore.
+      Three things are
       non-obvious. (a) The Klein pass height is **measured**, not guessed: the quoted bounding
       box includes the handle and the *foot ring*, not the body, sits on the mesh origin, so
       `scraps/_kleinslice.py` walks the real vertices through the mesh/settle/spread chain and
@@ -2064,7 +2726,51 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       arc-length fractions, and this loop is wildly unevenly spaced (0.27 m between channel
       points, 1.3 m across the cruise), so naming the dwells by point index would put every
       one of them in the wrong place — `scraps/_flyplan.py` converts the beats and also tests
-      the polyline at 2 cm against every cage, cap and hero piece.
+      the **spline** (not the chord polyline, which cannot see the curve bow outside its own
+      control points on a turn) at 2 cm against every cage, cap and hero piece. Until 0.155.0
+      the loader was reading those stops as control-point-index fractions anyway, behind the
+      scene's back; see the `density_at` entry below.
+    - **`density_at`'s `t` is normalized ARC LENGTH, and until 0.155.0 the loader read it as a
+      normalized control-point INDEX** (`src/ftsl.h`, the camera-curve sampler). Every scene,
+      every comment and both docs described it as a position along the curve; the code
+      evaluated `densityAt(g / nSeg)`. On an evenly-spaced curve the two agree, which is why it
+      survived — on gallery_rain's loop, where one leg packs seven points into 0.27 m and
+      another spends 1.3 m on two, the dwell meant for the glass orb was landing short of it.
+      The fix makes the sampler **two-pass**, because arc length is not known until the curve
+      has been walked and the obvious single-pass version has nothing to feed `densityAt`
+      except `g/nSeg`: pass one walks the spline at `max(64, 64·nSeg)` samples accumulating
+      *pure* (density-free) arc length, pass two re-integrates `densityAt(s/s_total)·ds` into
+      the cumulative-count table the frame placement actually inverts. Note that this fixes
+      only `density_at`; the lens/orientation tracks (`roll_at`, `fov_at`, `zoom_at`,
+      `fstop_at`, `focus_at`) run on a **third** clock, the frame fraction `i/N`, and were
+      always correct. `scraps/_flyplan.py` had the mirror-image bug — it measured the *chord
+      polyline*, which cannot see the curve bow outside its own control points on a turn — and
+      was moved onto a transcription of `catmullRomAt` at the same time, so its numbers and the
+      loader's are now the same numbers.
+    - **The fur creature is the eleventh exhibit, and it is the only one authored entirely in
+      BAKED WORLD COORDINATES.** `fur { }` is a top-level-only block — the loader rejects it
+      inside a `group` — so a placed groom cannot borrow the spread's `group { translate }`
+      idiom that every other exhibit uses. `scraps/_bakecreature.py` therefore carries the
+      whole body/face/fur table from `scenes/fur_creature.ftsl` and emits the placed block
+      through `p_world = PIVOT_W + S·R_y(yaw)·(p_src − PIVOT_S)` with `S = 1.6`, `yaw = −64.4°`,
+      pivot (6.45, 0.90, 4.40) — every sphere centre *and* every fur `direction` pre-rotated.
+      Three things make this work. (a) **The scale is free.** Fur coverage goes as
+      density × radius × length, so scaling `length`/`radius`/`curl`/`clump_size` by S and
+      `density` by 1/S² gives a visually identical coat at S× size with the *same* strand count
+      and the same memory — 1.6× costs nothing. (b) **The yaw is not a pose choice, it is what
+      the flyby demanded.** `fur` combs nose-to-tail, so a pass running against the grain reads
+      as a hedge; the camera's velocity has to be −F. −64.4° is the yaw at which the animal's
+      long axis already lies along the existing curve point (4.78, 1.35, 5.20)→pivot, which
+      normalizes to (+0.9018, −0.4320) = −F to four places, so the reroute cost two waypoints
+      instead of a rebuilt leg. It also still leaves the still camera at (5.0, 2.95, 9.35) a
+      48°-off-head-on three-quarter *front* view, which the two constraints otherwise pull
+      apart. (c) **The pass height is solved, not chosen.** `_bakecreature.py` sweeps it and
+      reports, per height, the shortest distance to any skin sphere and the total chord inside
+      the coat; 1.295 buries the lens in the head and 1.34 grazes only the back, so the curve
+      holds y = 1.308 dead level across four control points — 12.8 mm of clear air off the head
+      (the closest this camera comes to solid geometry anywhere in the scene) while threading
+      rump, barrel, chest, neck, head and tail brush for 1.16 m at 21 mm/frame. Its cap
+      (1.10 × 0.90) was sized from the real footprint *including* the coat.
     - **Mode `M` is not an option for this scene** even though it is the caustic-friendly mode
       on paper: `photonmap_render.h` has no participating-media code, so M renders the cloud,
       the rain and the bow away entirely — and, unlike mode `U`, does not refuse the scene or
@@ -2376,6 +3082,20 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   remaining silent stretch is the scene load itself, which is before the frame size is
   known — opening a guessed-size window there would leave it the wrong shape for the whole
   render, so it isn't done.
+- **The title bar names the compute backend** (`liveTitle()` / `setLiveTitle()` next to
+  `g_windowMode` in `main.cpp`). Every window title is assembled in one place —
+  `scene → output  —  <mode>  —  <status>  —  <backend>` — instead of each call site
+  concatenating its own string, so the backend suffix cannot be dropped by one of them.
+  `backendLabel(gpu, nThreads)` renders `GPU (NVIDIA GeForce RTX 4090)` (the real
+  `cudaDeviceName()`, so a multi-GPU box says *which*) or `CPU (12 threads)`, and it is
+  stamped into `g_windowBackend` **where the device is actually resolved**, i.e. after
+  the VRAM probe in `runRender` — not from the `-device` flag, which is a request that
+  a failed probe or an unsupported feature can silently override. The raster/`-explore`
+  block is the one place a single window legitimately alternates backends within a
+  session (the raster preview and a `mode W` refinement run on the CPU while a `PV_PT`
+  path-trace runs on the GPU), so it precomputes `rasterBackend`/`cpuBackend`/`gpuBackend`
+  once and re-stamps per branch rather than reporting whichever device the frame started
+  on.
 - Repaint granularity is bounded below by the renderer's chunk size, not by this timer:
   `gpuSppChunks` / `cpuSppChunks` retarget ~0.15 s per chunk with a 1 spp floor, so a 480²
   `-mode W -spp 8` frame gets one repaint per spp and the first complete image lands after
@@ -2507,7 +3227,44 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   crashed or killed viewer can't clean up after itself and only the next run ever can —
   both retained because older builds did litter. Results are
   adopted on whatever frame they land, preserving the user's orbit, zoom, active tab and
-  DAG layout. **Third-party note:** `src/third_party/imnodes/imnodes.cpp` carries
+  DAG layout.
+  **Playback (§F8).** Two schemes, and which one runs is decided per frame by whether the
+  cache holds the frame the clock wants.
+  *(a) Bake-paced.* The clock advances **only at the `bridge.take(r)` site**, never on a
+  timer. That is not a simplification, it is the only correct pacing given a latest-wins
+  one-slot queue: a timer-driven play loop would post frames faster than they bake and
+  most would be superseded before running, showing a stutter of whichever ones won the
+  slot rather than the animation. Starting play must post **once** to prime the loop, or
+  nothing is in flight, nothing lands, and the clock sits still.
+  *(b) Prebaked (`PlayCache`, `-prebake`).* Walks the clock once — serially, one
+  outstanding job at a time, for the same latest-wins reason — and keeps each frame's
+  **adopted** state (`Sidecar`, curves/strips/fields/meshes, `DagGraph`, `ftsl::Loaded`).
+  Adopted, not the payload: `Sidecar::adopt` and `ftsl::loadSource` both *consume* their
+  input, so replaying payloads would need a deep copy of a ~900 KB `minijson` tree per
+  frame *and* would still pay sidecar + ftsl adoption every time round the loop — 63 % of
+  the frame. Frames are exchanged by `std::swap` under a single invariant: **the live
+  locals hold frame `liveIdx`, and slot `liveIdx` is empty.** Showing frame *k* is then
+  park + unpark, two O(1) swaps with no copies, and — the reason this shape was chosen
+  over pointing the pane locals at the cache — it required no refactor of the function
+  those locals live in. The vacated slot doubles as the buffer the next park swaps into,
+  so a playback loop allocates nothing. Results are claimed by a **params fingerprint**
+  (`playCacheKey`, carried on `LoomJob`/`LoomResult`), not by frame number alone, so a
+  bake still in flight when a control moved cannot be filed into the new cache under an
+  index it happens to share. A cache that hits its **cap** covers a prefix, and the clock
+  running off the end drops back to (a) — without that fallback play deadlocks there,
+  since nothing posts, so nothing lands, so the clock never moves. Measured on
+  `scatter_modulated_sweep` (96 frames, 603 MB): a requested 24 fps is delivered at
+  `cache 0.01 + raymarch 20` per frame, against 6.5 fps bake-paced.
+  Two measurement rules the feature had to fix to be believable: a cached frame **clears**
+  `bake`/`sidecar`/`ftsl` (otherwise the breakdown prints work that did not happen, its
+  parts summing to several times the period beside them), and the fps EMA smooths the
+  **period** and inverts at the end — averaging *rates* over a pacer that alternates 2 and
+  3 vblanks reports 25 fps for a true 24. The pacer likewise advances its deadline by
+  exactly one period instead of resetting to `now`, because discarding the overshoot
+  quantises the achievable rate to the display refresh (a 24 fps request delivered a
+  rock-steady 20 at 60 Hz), while banking at most one period of debt so a hitch is
+  absorbed rather than repaid as a burst.
+  **Third-party note:** `src/third_party/imnodes/imnodes.cpp` carries
   `[ftrace patch]` edits for imgui #7543 — see `known-issues.md`; re-vendoring imnodes must
   re-apply them or the DAG pane crashes in `PrimReserve`.
 - **`record.h` / `record_ladder.h`** — **parametric records**: a named bank of per-channel
@@ -2678,6 +3435,22 @@ Design points worth keeping:
   the hit and never sees the 1.0→0.0 wrap, but the rasterizer *interpolates*, so a
   triangle straddling the seam would run `u` backwards across the entire texture. Any
   triangle whose `u` spread exceeds 0.5 has its low corners lifted by +1.
+- **A new PRIMITIVE needs the same "did every consumer get it?" sweep a new material
+  feature does** (0.150.0). The `applyMat` comment above exists because a per-material
+  feature once got wired into three of four geometry paths; the `curve` primitive was the
+  geometry-level version of the same miss. It shipped with the tracer, the BVH and a CUDA
+  gate all correct, and `-raster` drawing `curve_basics` as `[raster] 12 triangles` — the
+  box, none of the five strands, **silently**. Worse than the CUDA case, because CUDA at
+  least has a gate to fall back through and the preview has none: nothing warns, the scene
+  just looks empty. Now stage `(2b)` of `tessellate` meshes each `CurveSeg` as a round
+  cone, sweeping rings through the same three pieces the intersector knows (back cap →
+  tangent lateral band → front cap). Both tangent circles sit at polar angle `acos(a)`,
+  `a = (r0−r1)/|ba|`, on their respective end spheres — that single fact is what lets one
+  angular sweep cover all three pieces continuously, so the preview mesh is closed exactly
+  like the surface it approximates, and the `|a| ≥ 1` degenerate (one ball swallows the
+  other) falls out for free as a collapsed cap. `v` uses the same `onb(axis)` the analytic
+  hit does, so a `u`/`v` pattern previews where it will land. ~80 tris/segment, which does
+  not scale to a real groom — see `known-issues.md`.
 - **A `weight_map` mix is a PER-PIXEL material swap, not a per-material choice** (0.136.0).
   `mixDominantChild` only compares the *constant* weights, so a weight-mapped mix (always
   50/50, hence always child 0) previewed as one flat winner while `-mode W` — which calls
@@ -2980,6 +3753,17 @@ unrecognised value into some other device code hands a kernel malformed geometry
 malformed geometry inside a kernel does not fail cleanly — it can fault the display
 driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
 
+A **whole missing primitive** is the same rule at the coarsest grain. When 0.150.0 added
+`curveSegs` as a fifth prim range, the megakernel's hit routine still knew only four
+(`tri | sphere | implicit | instance`), so the gate sent any curve scene to the CPU
+wholesale. Without that gate the device would not have failed at all — it would happily
+miss every strand and render a furred subject **bald**, which is far worse than a fallback
+because it looks like a plausible image. 0.151.0 removed the gate by writing the missing
+device twin (`DCurveSeg` + `intersectCurveSeg`, and the fifth range in both `closestHit`
+and `occluded`); what survives is the *screen*, which still checks curve **materials**
+exactly like every other primitive's. That is the intended lifecycle of one of these
+gates: ship it the moment the hole exists, delete it only by filling the hole.
+
 ## Benchmarks & perf discipline
 
 - `scraps/bench.py` — 19 standard configs (13 CPU + 6 GPU; cornell + gallery
@@ -3209,3 +3993,37 @@ driver. See `gpu-fallbacks.md` for the per-feature fallback tables.
   scratch scripts → `scraps/`. Renders always launched with `-keepwindow`
   (+ `-checkpoint`/`-interval`) and outside the Bash sandbox so the live window is
   visible.
+
+## `creature/` — the simulated-animal subproject
+
+A **second, self-contained project living in this repo**, not part of the renderer.
+It builds physically-simulated animals whose motion is *learned* rather than keyframed
+(articulated skeleton → muscle/tendon actuators → soft tissue → fur, driven by a neural
+controller). It has its **own** `design.md`, `known-issues.md` and `todo.md` — those are
+authoritative for it, and this file does not duplicate them. Layout: `ftcl/` (lexer,
+parser, expression evaluator for the `.ftcl` creature-description language), `creaturelab/`
+(schema, model build, MJCF emitter for MuJoCo, tuning, validation), `rigs/` (`.ftcl`
+sources, e.g. `canis.ftcl`), `tools/`, `tests/` (28 pytest cases).
+
+**It is Python with a heavy native stack** — MuJoCo 3.11 and a CUDA-13 build of Torch —
+so unlike the renderer it needs a virtualenv, and `requirements.txt` pins it (including
+the pytorch cu130 extra index, without which `torch==2.13.0+cu130` will not resolve). The
+`.venv/` is gitignored and *not* reproducible from the repo alone; recreate it from
+`requirements.txt`. `creature/.gitignore` is its own and its patterns are relative to
+that directory, so it keeps ignoring `out/`, `scraps/`, `.venv/` and `*.log` correctly
+now that it is nested — the root `.gitignore`'s equivalents are anchored (`/out/`,
+`/scraps/`) and deliberately do *not* reach into it.
+
+**It arrived by `git subtree add --prefix=creature`, not by copying**, so all 15 of its
+original commits are in this repo's history rather than being flattened into one "import"
+commit — those messages are substantive design records (the armature-measurement fix, the
+capture-rig decision) and were worth keeping. The consequence to know: `git log` now
+interleaves creature and renderer commits by date, so use `git log -- creature/` to see
+just one side. Its checkout also normalised six files from CRLF to LF, matching this
+repo's `core.autocrlf=input`; content is otherwise byte-identical.
+
+**The naming collision to not trip over:** `creature/` (this subproject) is unrelated to
+the renderer's *fur creature* — `scenes/fur_creature.ftsl`, `fur_creature_gi.png` and the
+`fur { }` groom generator in `src/fur.h`. The latter is a shipped ftrace demo scene; the
+former is a simulation project that does not yet feed it. Nothing in `src/` or `scenes/`
+references `creature/`.

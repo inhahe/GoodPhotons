@@ -5,6 +5,646 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-09, v0.161.0): `curv` reads 0 on an ISOSURFACE, so curvature-driven materials silently flatten there
+
+`curv` (O3 stage 1) is analytic on a `sphere`, per-radius on a `curve`, and per-face on a
+mesh that carries `vn` — but an **implicit isosurface always reports 0**, because the ray
+hit only knows the field's *gradient* (the normal) and mean curvature needs its second
+derivatives. The failure is silent and looks exactly like a correctly-authored flat
+material, which is the bad part: `scenes/pattern_curvature.ftsl`'s own grime/wear masks
+would render as a uniform colour on an isosurface with no diagnostic at all.
+
+**Proper fix.** H for a level set is the divergence of the unit gradient,
+`H = ½·∇·(∇f/|∇f|)`, so it needs the field **Hessian** at the hit. `implicit.h` already
+central-differences the gradient; the Hessian is the same trick one order up (6 extra
+field evaluations for the symmetric 3×3, or 9 if the mixed terms are done naively).
+That is far too expensive to pay unconditionally — most isosurfaces bind no pattern at
+all, let alone one reading curvature — so it must be **gated**: a "does any pattern bound
+anywhere on this material read `VarCurv`?" flag computed at load (the machinery exists —
+`materialFreeInputs` already walks every bound pattern's nodes, and
+`checkEmitPatsSupported` now scans for `PatOp::VarCurv` specifically) and checked before
+spending the evaluations. Step size wants to follow the same scale the gradient
+difference uses, and the result needs the same shaded-side negation every other
+primitive applies.
+
+Until then the honest 0 is the right behaviour — it is documented in `REFERENCE.md`'s
+per-geometry table and in the `HitRecord::curv` comment.
+
+**Mitigated (v0.161.1):** `Builder::warnCurvOnFlatGeometry` now warns at load when a
+curv-reading material's geometry can only ever report 0 — covering the isosurface case
+along with the more common flat-shaded-mesh one. It is deliberately conservative (it
+warns only when *every* primitive using the material is a zero-curvature one, so a
+material shared with a smooth mesh stays quiet) and it costs nothing on a scene that
+does not read `curv`. That turns a silent flat render into a named diagnostic, but it
+is a *diagnostic*, not the fix — the Hessian work above is still open.
+
+### OPEN (2026-08-09, v0.161.0): `curv` reads 0 in the PREVIEW rasterizer, so `-explore` misrepresents a curvature-driven material
+
+`raster.h:~1608` builds its shading context with
+`makePatCtx(g.wpos[i], 0.0, N0, g.uv[i].x, g.uv[i].y)` — no curvature argument — so
+`PatCtx::curv` defaults to 0 for the whole preview. A material whose `weight_map` is
+gated on curvature therefore previews as one of its two layers everywhere, and
+`-explore` on `scenes/pattern_curvature.ftsl` shows three flat tori instead of the ramp /
+grime / wear the traced render produces.
+
+This is the same class as the six "preview showed a material as flat colour" gaps fixed
+in 0.135.0/0.136.0, and it is *fixable* rather than fundamental: the preview tessellates
+to `PTri`s with interpolated normals, so it could carry the same per-face curvature
+`Tri::finalize()` computes and interpolate or flat-fill it. The cost is one more float
+per preview triangle plus the finalize arithmetic during tessellation.
+
+Not urgent — the preview is explicitly a composition/motion tool and already ignores
+roughness and film-thickness maps by design — but unlike those it is *silently wrong*
+rather than obviously absent, and the fix is mechanical.
+
+### OPEN (2026-08-10, v0.162.0): `cavity` reads 0 in BOTH preview rasterizers, and unlike `curv` this one is not mechanical
+
+Same symptom as the entry above and a strictly harder cause. `raster.h` and
+`raster_cuda.cu:~902/~935` both pass `0.0` for the cavity argument of `dPatternEval` /
+`makePatCtx`, so a `mix` gated on `cavity` previews as one layer everywhere — `-explore`
+on `scenes/pattern_cavity.ftsl` shows a spotlessly clean room.
+
+The difference from `curv` is that `curv` is a *per-triangle number the tessellator
+already has* (`Tri::finalize()` computes it; the preview just has to carry it), whereas
+`cavity` needs **whole-scene ray traversal** at the shading point. The preview
+rasterizer has no BVH at all — not building one is the entire reason it exists and the
+reason it starts in a fraction of a second on scenes the tracer takes seconds to
+prepare. So there is no cheap version of this: the honest options are (a) build a BVH
+for the preview after all (defeats the point), (b) bake a per-vertex cavity value during
+tessellation using a coarse proxy — a low-res voxel occupancy grid over the tessellated
+`PTri`s, marched instead of traced, which would be approximate but is at least the right
+*shape* of algorithm for a rasterizer — or (c) leave it and document.
+
+Currently (c), and that is defensible: `cavity`'s whole point is contact grime, which is
+a look-development concern, not a composition/motion one, and the preview already ignores
+roughness and film-thickness maps by design. Logged so that a future "make the preview
+show patterns properly" pass doesn't assume this one falls out with `curv`.
+
+### OPEN (2026-08-10, v0.163.0): an `sdf` over a self-overlapping mesh is exact outside but not inside
+
+`meshvox::bakeSignedDistance` takes its **sign** from generalized winding, so a model made
+of several overlapping or self-intersecting closed bodies correctly reads as their *union*
+rather than hollowing out. Its **magnitude**, though, is the distance to the nearest
+triangle — and inside such a union some triangles are *buried*, interior to the solid and
+therefore not on the union's boundary at all. So an interior sample near a buried face
+reports a distance much smaller than its true distance to the union's surface.
+
+Outside the union this cannot happen and the field is exact: a segment from an exterior
+point to a buried triangle must cross the boundary, so the boundary is always nearer.
+`-checksdf` §3 pins both halves — exterior distances checked against `min(dA, dB)`, and the
+sign checked everywhere — rather than papering over the interior case.
+
+Defensible for now because every idiom the feature exists for (proximity masks, auras,
+moss/frost/wear gradients) reads the field from *outside* the object, and because the
+proper fix is not small: it needs the union's actual boundary, i.e. a mesh-boolean or a
+narrow-band re-extraction of the zero level set followed by a re-sweep against *that*. If
+an interior-accurate field is ever needed (e.g. driving a medium *inside* a self-
+intersecting model), that is the work.
+
+### TECH DEBT (2026-08-09, v0.161.0): a non-uniformly scaled instance's `curv` is approximated by |det|^(1/3)
+
+Mean curvature is 1/length, so the instance path has to rescale it. For a **uniform**
+`scale s` that is exact: H_world = H_local / s. For a non-uniform scale it is not — the
+two principal curvatures rescale by *different* factors that depend on the surface
+orientation relative to the scale axes, and the shape operator has to be conjugated by
+the transform properly. The current code takes `|det(M)|^(1/3)` as an effective isotropic
+scale, which is exact when the scale is uniform and degrades smoothly as it is not.
+
+`-checkcurv` §9 pins the behaviour rather than the ideal: `scaleXf(2,4,8)` is asserted to
+give 1/4 (|det|^(1/3) = 4), and `scaleXf(1,0,1)` is asserted only to stay **finite**. So
+this is a documented approximation with a test, not an unknown.
+
+**Proper fix** is to transform the shape operator: normals go through M⁻ᵀ and tangents
+through M, so the correct H needs the full 2×2 second-fundamental-form conjugation at the
+hit, not a scalar factor. Worth doing if a scene ever squashes a curvature-textured mesh
+hard along one axis; invisible for the uniform scales every checked-in scene uses.
+
+### FIXED (2026-08-08, v0.160.0): `-explore` on a FURRED scene never started — the curve preview sweep allocated ~46 GB of triangles and thrashed the page file forever
+
+`ftrace scenes\gallery_rain.ftsl -explore` sat with the live window titled
+**`tessellating (0/33)`** indefinitely. The title was the giveaway and was misread twice:
+`raster::tessellate`'s own progress callback formats `tessellating (N/M, P%)` — *with* a
+percentage — so a title with no percentage is the **placeholder** stamped by
+`main.cpp:~9884` *before* tessellation. Nothing had entered the implicit marcher at all.
+Confirmed from a captured stdout: the last line was
+`[raster] solid-shaded preview: tessellating scene (iso res 96) ...` and
+`[raster] tessellating implicit 0/33 (0%)` (raster.h's `progress(0, nImp)`) never printed.
+
+The stall was section **(2b)** of `raster::tessellate`, which runs *before* (3) and has no
+progress reporting: it sweeps every `CurveSeg` into a closed round-cone mesh at a fixed
+`CU = 10`, `CCAP = 2` — **80 triangles per segment**. `gallery_rain` carries **1 786 496**
+fur segments (a 15-block groom on the creature), and `sizeof(PTri) == 320 B`, so that is
+**~46 GB** of preview geometry — **~92 GB** transiently while `std::vector` doubles.
+Measured on the wedged process: **71.9 GB private bytes**, 39.7 GB working set, ~57 % of one
+core (it was page-faulting, not computing). A second copy of the same run had been squeezed
+to a 0.01 GB working set by the first. Non-invasive `cdb -p <pid> -c "~*k; qd"` sampling
+matched: main thread parked in `SleepEx`, no tessellation workers, message pump idle.
+
+**Fix (raster.h §2b):** the curve sweep now runs under a **triangle budget**
+(`kDefaultCurveBudget = 12 M`, `-raster-curve-budget <n>`). It walks a LOD ladder
+`{10,2} → {6,1} → {4,1} → {3,1} → {4,0} → {3,0} → {2,0}` (`{azimuthal divisions, rings per
+spherical cap}`; `ccap == 0` drops the sub-pixel end caps, `cu == 2` degenerates to a
+double-sided flat ribbon) and takes the richest LOD that fits. Only if the cheapest one
+still busts the budget does it thin whole **strands** — keyed on `CurveSeg::curveId`, so a
+kept strand stays continuous instead of dashed. The per-segment `std::vector<Ring>` is now a
+fixed stack buffer (it was one heap allocation per segment, millions of them), and `out` is
+reserved for the exact post-budget count so the doubling spike is gone.
+
+Result on `gallery_rain`: 3-sided capless tube, 6 tris/segment, **10.7 M curve triangles**
+(14.5 M scene total) tessellated in **3.1 s**, ~13.6 GB peak private, and the interactive
+viewer runs at **10.7 fps**. A/B stills (`png/fur_lod_full.png` = ribbon,
+`png/fur_lod_mid.png` = 3-sided, `png/fur_lod_hi.png` = 4-sided) are why the default is 12 M
+and not 8 M: the ribbon samples only two azimuths and reads visibly darker and patchier,
+while the 3-sided tube is indistinguishable from the full cone at preview resolution.
+
+**Two things this exposed, both handled in the same change:**
+1. `main.cpp`'s option table was **at MSVC's block-nesting ceiling** — adding one more
+   `else if` failed the build with `C1061: compiler limit: blocks nested too deeply`.
+   The chain is now split into **segments**, each ending in `else handled = false;` with the
+   next guarded by `if (!handled)`, so new flags no longer approach the limit.
+2. Section (2b) still reports **no progress**. It is now ~1 s rather than forever, so the
+   frozen `tessellating (0/33)` placeholder is no longer misleading in practice — but a
+   scene an order of magnitude furrier would look stalled again for a few seconds. See the
+   related open entry on `CurveSeg` being 80 bytes; `PTri` at 320 B (all-double positions,
+   normals and UVs for a *preview*) is the bigger prize and is untouched.
+
+### BY-DESIGN (2026-08-08, v0.157.0): auto-exposure's p99 anchor can't be stabilised by *any* per-image statistic — the shared anchor **is** the fix, not a mitigation
+
+> **This entry previously recorded the wrong root cause and two wrong fixes.** It blamed a
+> *bimodal histogram* ("the rank crosses a near-empty gap") and recommended blending ranks
+> p97–p99.5, or detecting the bimodality and anchoring to the upper edge of the lower mode.
+> The mechanism is wrong and **both fixes are refuted by measurement**. Rewritten so nobody
+> re-derives them. The nine studies live in `scraps/anchor_study*.py` (gitignored scratch —
+> each script's docstring records the hypothesis it killed and why), so **every number they
+> produced is reproduced below** rather than left behind a path that may not exist on your
+> checkout.
+
+`writeFilm` picks its gain as `eAuto = 0.9 / p99`, p99 being the 99th percentile of
+per-pixel `max(r,g,b)` in scene-linear sRGB. It is stable on a unimodal image and not on
+one with a bright, compact specular population. Measured on `png/pastel_jack_ring` (432
+frames, **static** camera — only the gold ring rotates, so any global brightness change is
+by construction an artifact), read from the raw `.ftbuf` film:
+
+| statistic | median step | p95 step | max step |
+|---|---|---|---|
+| `bg` (static corner pixels) | 0.53% | 1.53% | **2.23%** |
+| `p95` | 0.13% | 0.42% | **0.68%** |
+| `median` | 0.16% | 0.45% | **0.59%** |
+| log-average (Reinhard key) | — | 0.58% | **0.97%** |
+| **`p99` (the anchor)** | 1.40% | 6.04% | **36.17%** |
+
+**The mechanism is an ill-conditioned inversion, not a gap crossing.** At the worst pair
+(`…145 → …146`, 36.17%) the tail shows no bimodal gap. It *saturates* at exactly 4.4780e+13
+— an emitter plateau over ranks 0.995–1.000, ~0.51–0.57% of frame, **identical in both
+frames**. p99 sits *below* that plateau in a sparse continuum whose density above p95 is
+only ~**0.25% of frame per octave**. The anchor solves `area(L) = 1%` for `L`, so
+`dL/d(area)` is ≈ **5 octaves per 1% of area**: the 0.07-point area change the rotating ring
+actually makes (1.1836% → 1.1128% above 4× p95) moves the level a third of an octave. Every
+*fixed-rank* statistic inherits this — which is why p98 and every rank-band blend still
+stepped 6–36%.
+
+**Why no per-image statistic can fix it.** Six families were measured against two
+requirements at once — *stability* on the 432-frame sequence, and *fidelity* (how far the
+result lands from today's p99 across 186 ordinary one-off renders, as the 5th–95th
+percentile spread in stops). Nothing satisfies both:
+
+| candidate | max step | median × p99 | spread |
+|---|---|---|---|
+| p99 (shipped) | 36.17% | 1.000× | 0.00 stops |
+| p95 | **0.69%** | 0.475× | 2.59 stops |
+| p98 | 6.98% | 0.756× | 1.62 stops |
+| rank-band blend (logmean p90–p99.5) | 2.35% | 0.525× | 2.30 stops |
+| triangular log-quantile (c99, h4%) | 5.89% | 0.980× | 1.49 stops |
+| clamp `min(p99, C·p95)` | 12.19% | 1.000× | engages on only 3–9% of frames |
+| power means (p = 2…8) | 1.65% | — | 4.04–6.45 stops |
+| energy quantiles (f = 0.5–2%) | **0.00%** | 4.5–6.1× | 7.72 stops |
+| log-average (Reinhard key) | 0.97% | 0.112× | 5.73 stops |
+
+The trade is not a tuning accident, it's structural: where p99 misbehaves its value is
+genuinely *arbitrary*, so there is nothing to be faithful **to**. The clamp fails for a
+second reason — `ppm/meng_test.png.ftbuf` is a legitimate render with p99/p95 = **339×**,
+which `C = 4` would blow out by **6.41 stops**.
+
+**And the pathology is not detectable, so a gated fix is not available either.** A safe
+regulariser would have to leave well-conditioned images bit-identical and act only on
+ill-conditioned ones. The natural test — local density at the anchor, the fraction of frame
+within one octave of p99 — does not separate them. pastel_jack_ring's median density is
+**1.2318%**; ordinary renders' 25th percentile is **0.8672%** and median 1.7556%. The
+pathological sequence is *denser* than a quarter of ordinary renders, and `meng_test` sits
+at 1.2107% — statistically identical to it. No threshold discriminates (at `< 0.20%` it
+fires on 2.7% of ordinary renders and 2.8% of pastel_jack_ring frames).
+
+**Conclusion: the information required is temporal, not spatial.** A single frame simply
+does not contain evidence distinguishing "the ring rotated" from "the scene got brighter" —
+the whole-frame log-average is stable to 0.97% across the sequence, so the picture really
+is not changing, but that is only knowable by *comparing frames*. Therefore
+`-exposure-anchor <value|file>` and loom's `stabilize_exposure` are the **correct** fix and
+should be described that way, not as a workaround. The residual caveat is narrow and real:
+a **single still** is still metered by p99 and can still anchor on an atypical glint, with
+no neighbour to reveal it. That is a property of monocular auto-exposure, not a defect to
+be engineered away; `-ev` and `-exposure-anchor <value>` are the escape hatches.
+
+Endemic check: across every multi-frame sequence in the repo, p99's max step is 36.17%
+(pastel_jack_ring), 33.45% (pastel_jack_ring_halfspeed) and 5.42% (scribble_loop) — so this
+is a scene property of rotating speculars, not a defect that afflicts renders generally.
+
+### DEBT (2026-08-08, v0.157.0): the tone map hard-clips with no shoulder, so the anchor is forced to double as a clipping control
+
+Found while investigating the entry above, and **independent of it** — this is a real,
+fixable defect that the six anchor studies all missed because they assumed the tone curve.
+`filmToRgb8` (`src/main.cpp` ~4101) maps linear to 8-bit as
+`clamp(srgbGamma(lin * exposure) * 255 + 0.5, 0, 255)` — a hard clip, no rolloff. So
+`eAuto = 0.9 / p99` is not really a brightness control, it is a *clipping* control meaning
+"let ~1% of the frame blow out". Clipping is decided by the top of the histogram, so the
+exposure is **forced** to track the top of the histogram — the one part of a
+rotating-specular scene that moves. That is the deeper reason every stable candidate above
+came back 1.5–7.7 stops adrift: they don't control clipping, so they can't stand in for
+something whose entire job is to control clipping.
+
+The fix is a knee-based rolloff that is *exactly* the identity below the knee:
+
+```
+y = x                                     x <= k
+y = k + (1-k)(x-k) / ((x-k) + (1-k))      x >  k     (slope 1 at k, asymptote 1)
+```
+
+Measured end-to-end in 8-bit sRGB (mean |Δ| between consecutive pastel_jack_ring frames —
+both pipelines see the same real motion, so any excess is exposure flicker):
+
+| exposure | knee | mean \|Δ\| | p95 \|Δ\| | max \|Δ\| |
+|---|---|---|---|---|
+| per-frame p99 (shipped) | none | 7.422 | 11.094 | **17.125** |
+| per-frame p99 | 0.90 | 7.147 | 10.567 | 16.581 |
+| shared anchor (shipped fix) | none | 6.348 | 7.464 | **8.011** |
+| shared anchor | 0.90 | 6.054 | 6.787 | **7.254** |
+
+and fidelity on 167 ordinary renders, with the **exposure left untouched**:
+
+| knee | px bit-identical | worst render | blown to #FFFFFF |
+|---|---|---|---|
+| none | 100% | 100% | 0.319% |
+| 0.95 | 99.563% | 99.178% | 0.140% |
+| **0.90** | **99.401%** | **98.999%** | **0.032%** |
+| 0.80 | 93.306% | **0.000%** | 0.000% |
+
+`k = 0.90` is the sweet spot: the knee sits exactly where the anchor puts p99, so the change
+is confined to the ~1% of frame that today is *already* clipped — 99.4% of pixels stay
+bit-identical (worst render 99.0%), blown-white pixels drop **10×**, and worst-case flicker
+improves another 9% on top of the shared anchor. `k ≤ 0.80` is unusable (some render goes to
+0% identical). This also directly addresses the complaint already recorded in `main.cpp`'s
+`-hdr` rationale — "596 of the 22639 pixels of one cap were pure white… its colour read as
+white no matter what the optics did" — by giving highlights somewhere to go.
+
+Not implemented yet because it is a genuine (if small) look change and must land at **all
+four** anchor/tone sites consistently, including the deliberately bit-exact GPU twin:
+`main.cpp:4101` (`filmToRgb8`), `main.cpp:~4597` (ANSI `-preview`), `raster.h:1210`
+(CPU raster / `-explore`), `raster_cuda.cu:1685` (GPU raster). Regression suite is free —
+the `pastel_jack_ring` `.ftbuf` checkpoints are on disk and `-topng` develops one in
+milliseconds; `scraps/anchor_study9.py` already implements the exact curve and both metrics.
+
+### DEBT (2026-08-08, v0.156.0): the loom viewer's prebake cache costs ~6.4 MB per frame, which caps a long clock well short of what "1024 MB" suggests
+
+§F8(b)'s `PlayCache` keeps each frame's **adopted** state, and on
+`scatter_modulated_sweep.py` that measures **6.4 MB/frame** — 611 MB for a 96-frame clock.
+So the default 1024 MB budget buys about **160 frames**, or 6.7 seconds at 24 fps. That is
+enough to judge a loop and not enough to prebake a shot. The degradation is graceful (the
+prefix plays from memory, the tail falls back to bake-paced play — `-prebake-cap 80` was
+verified to cache 13/96 and cross the seam without stalling), so this is a limit, not a bug.
+
+Where the bytes go has **not** been broken down yet, and that is the first thing to do
+before optimizing anything: `playFrameBytes` reports one total, and the plausible hogs are
+very different in character. The `Sidecar`'s parsed `minijson` tree is ~900 KB of *text
+already consumed* — every frame keeps a full JSON DOM whose only remaining reader is
+`skins.build()`, so it may be droppable outright or replaceable with the handful of fields
+still needed. The `Scene`'s BVH and `dataPool` are real geometry and are not droppable. The
+curve/strip/field/mesh vectors are all re-derived *from* the sidecar and could in principle
+be rebuilt on unpark rather than stored, trading memory for a few ms per frame — which is
+affordable, since the swap currently costs 0.01 ms against a ~41 ms frame.
+
+Two cheaper ideas that need no analysis first: cache only what the visible tabs actually
+consume (a session that never opens the DAG or Fields pane is paying for both), and share
+the per-frame-**identical** parts — on this scene the mesh assets, textures and per-asset
+Blas BVHs are byte-identical across all 96 frames and are currently stored 96 times.
+
+### FIXED (2026-08-08, v0.155.0): `density_at` read its `t` as a control-point index while every scene and every doc called it a position along the curve
+
+`camera_curve`'s `density_at <t> <rho>` is the camera's speed curve — cameras per unit
+length, keyframed along the flight. Every scene in the repo authors those stops as
+**fractions of the way along the path**, `gallery_rain` says so in a comment
+(`# Stops are ARC-LENGTH fractions from scraps/_flyplan.py, not point indices`), and
+`FTSL.md` calls `t` the "normalized position". The loader was doing something else:
+
+```cpp
+double rho = densityAt(g / nSeg);      // g is the SPLINE's global parameter
+```
+
+`g / nSeg` is the normalized **control-point index**, and the two agree only when the
+control points are evenly spaced. On a real flight path they are nowhere near it —
+`gallery_rain`'s loop has 0.27 m between the gold gyroid's channel points and 1.3 m across
+the back cruise, a 5× spread — so every authored dwell landed off its beat by up to a tenth
+of the loop. The dwell written for the glass orb was being spent before the camera got
+there.
+
+This is the second time in this file that a comment describing the *intent* was right and
+the code under it was not, and both times the comment is what made it findable. The rule it
+argues for: when a parameter's units are not obvious from its type (a bare `double` in
+[0,1] can be index, arc length, or time), the name is not enough — say which, in the header
+*and* at the point of use.
+
+**Fix (`src/ftsl.h`, the `camera_curve` sampler):** the density integration became two
+passes. Arc length is not known until the curve has been walked, which is exactly why the
+single-pass version had nothing to hand `densityAt` but `g`; so pass 1 walks the spline for
+`sampS` (which already existed, for the tangent look-ahead) and pass 2 integrates
+`rho(s/Smax) ds`. Cost is one extra spline evaluation per sample, at load time only.
+
+`scraps/_flyplan.py` — the script that *prints* the stops — had a matching error of its
+own: it measured arc length along the **chord polyline** while the camera rides a
+centripetal Catmull-Rom through the points. It now evaluates the real spline (a
+transcription of `catmullRomAt`, kept beside it). The length error was small (23.87 m of
+spline vs 23.69 m of chord; centripetal stays tight, which is why it was chosen), but the
+same change fixed a clearance test that could not see the curve **bowing outside its own
+control points** on a turn — the tightest margin on the loop, over the Klein bottle's cap,
+reads +0.111 m on the spline against +0.120 m on the chords.
+
+**Scope of the behaviour change:** `scenes/gallery_rain.ftsl`, `gallery_settled.ftsl`,
+`gallery.ftsl` and `flythrough.ftsl` all use `density_at`, and all of them meant arc
+length, so this moves their dwells onto the beats they were written for. `gallery_rain`'s
+stops were re-derived against the new (creature-rerouted) curve in the same commit.
+`roll_at` / `fov_at` / `zoom_at` / `fstop_at` / `focus_at` are unaffected — those sample
+the **frame** timeline `i/N`, which is a third parameterization again and the correct one
+for them, since by the time frames exist the density has already placed them.
+
+### FIXED (2026-08-07, v0.153.1): `-checkbvh` FAILED on every scene with a `curve` — the *reference* was wrong, not the BVH
+
+Found by auditing whether the `curve` primitive reaches every render mode on both
+backends. Every renderer was fine; the self-test that is supposed to certify them was
+not:
+
+```
+> ftrace scenes/curve_basics.ftsl -checkbvh
+[checkbvh] 2000000 rays, 4390 mismatches -> FAIL
+```
+
+**`Scene::closestHitLinear` — the brute-force reference `checkBvh` compares the BVH
+against — never learned about `curveSegs`.** It scans `tris`, `spheres`, `implicits` and
+`instances` and stops. So for a fiber scene the BVH was *right* and the reference was
+blind, and every strand the BVH correctly found got scored as a mismatch. The direction of
+the error is what makes this worth recording: a broken reference does not weaken a
+cross-check, it **inverts** it. `-checkbvh` on `curve_basics` was reporting a steady
+0.2% failure rate that was entirely the test's own fault, which means a real BVH
+regression on a groom would have arrived as `4391 mismatches` where the baseline already
+read `4390` — a signal buried in the noise the test was generating itself. A check that
+cries wolf on correct code is worse than no check.
+
+**Fix:** `closestHitLinear` runs the same `makeCurveRay` + `intersectCurveSeg` loop the
+BVH leaf does, guarded on `!curveSegs.empty()` so curve-free scenes don't pay the
+`CurveRay` setup. `curve_basics`, `group`, `implicit`, `cornell` and `fur_basics` all
+report 0 mismatches. **Generalisation:** adding a primitive means adding it to *three*
+places, not two — the BVH leaf, the device leaf, and the linear reference. The first two
+announce themselves (nothing renders / falls back); the third fails silently in the
+direction of a false alarm.
+
+Two companion fixes fell out of the same audit, both about the reference's O(rays×prims)
+cost, which nothing had ever paid before because nothing had ever put 5e5 prims through it:
+
+- **The ray budget didn't count curves (or implicits, or instances).** `-checkbvh` sizes
+  its sweep as `5e8 / prims` to stay bounded, but `prims` was `tris + spheres` only. A
+  groom is *almost entirely* curve segments, so the estimate read ~0 prims and asked for
+  the full 2 M rays — the budget went unbounded on exactly the scenes it exists to bound.
+  Now it counts every range the linear scan actually walks.
+- **The sweep was single-threaded.** Even correctly budgeted, the 20 000-ray floor against
+  `fur_basics` is ~1e10 primitive tests; serially that is **>30 minutes**, which in
+  practice means the test stops being run at all. `checkBvh` now goes through
+  `ft::parallelFor`, with each ray drawing from its own `mix64(i)`-keyed `Pcg32` stream
+  rather than one shared sequence — so the ray set is a pure function of the ray index and
+  the result is reproducible independent of core count or chunk scheduling. It also picks
+  up `parallelFor`'s stop probe, so `ftrace -stop` now lands on a long check.
+
+**What the audit that found it actually established** (worth keeping, because "does every
+mode trace curves?" is not answerable by reading code — a leaf range with no intersector
+does not fault, it traces *past* every strand and renders a furred subject bald, and the
+bald image looks fine):
+
+Each of the ten renderable modes was rendered twice, once from `scenes/curve_basics.ftsl`
+and once from the same scene with every `curve` block stripped, on **both** devices, and
+scored by **fiber coverage** — the fraction of pixels the strands actually change. A mode
+that sees them scores percent; a mode that skips them scores noise.
+
+| | A | B | C | R | W | P | D | M | S | U |
+|---|---|---|---|---|---|---|---|---|---|---|
+| CPU | 10.3%\* | 10.8% | 30.0%\* | 22.5% | 10.0% | 11.0% | 20.2% | 9.9% | 13.3% | 38.0% |
+| GPU | 10.3%\* | 12.2% | 30.0%\* | 22.6% | 10.1% | 14.8% | 19.7% | 11.1% | 9.6% | 12.3% |
+
+CPU-vs-GPU mean luminance agrees to <0.4% on every mode. \*A and C are measured on the
+`-hdr` PFM, and **that detail is the trap**: they are physically-absolute finite-aperture
+cameras whose image here sits at ~5e-5 scene-linear, so every pixel quantises into the
+bottom 8-bit level and the PNG-based metric reports a flat **0.00% coverage that does not
+move even at 2.4e9 photons** — indistinguishable from a mode that ignores curves entirely.
+In float they change 10.3% / 30.0% of pixels by >20% relative radiance and come out 5.4% /
+3.5% darker with the fibers present. A test whose *instrument* saturates fails exactly like
+the bug it is hunting; measure the forward modes in HDR. Harness: `scraps/curve_mode_sweep.py`.
+
+### FIXED (2026-08-07, v0.152.0): a `fur` block on a MESH/QUAD target generated ZERO strands, silently
+
+Found during bring-up of the `fur { }` generator, and it is worth keeping as a record
+because every layer that could have complained stayed quiet:
+
+```
+[fur] "ball_coat"  on "ball": 60000 strands, 480000 segments (sphere 0.2124 m^2)
+[fur] "lawn_grass" on "lawn":     0 strands,      0 segments (mesh   0.1352 m^2)
+```
+
+Spheres worked; every triangle-backed target produced an empty coat with no error, no
+warning, and a *correct* surface area in the log (so the area CDF was demonstrably fine).
+
+**Root cause: loader-vs-`Scene::build()` ordering.** `Tri::finalize()` — which computes
+the geometric normal `gn` and back-fills absent shading normals `n0..n2` — is called from
+`Scene::build()` (`scene.h`), which runs **after** the loader. The deferred `fur` sweep
+runs **inside** the loader, so it saw `gn == n0 == n1 == n2 == (0,0,0)` for every quad,
+every `triangle`, and every mesh without authored `vn`. `normalize()` is
+`a / length(a)`, so the root normal became NaN; the NaN propagated through the whole
+strand; and `tessellateCurve`'s coincident-sample guard `if (dot(dp,dp) > 0.0)` is
+**false for NaN**, so every segment was dropped and the strand vanished. A guard written
+to skip degenerate input silently swallowed corrupt input.
+
+**Fix.** `furSampleRoot` derives the geometric normal from the vertices itself
+(`cross(v1−v0, v2−v0)`) and uses shading normals only when they are genuinely present,
+with a final fallback for a degenerate triangle. Pinned by **`-checkfur` §7**, which
+deliberately builds on **un-finalized** `Tri`s — testing the finalized state would have
+tested a configuration that never occurs at load time — and also checks that real
+authored shading normals are still honoured.
+
+**Generalisation worth carrying:** anything that reads a `Tri` *during loading* must
+assume it is not finalized. `fur` is the first loader-time consumer of triangle normals;
+the next one will hit the same trap.
+
+### OPEN (2026-08-07, v0.152.0): `fur` cannot grow on a `mesh_instance`, and a huge groom peaks at 2× its final memory
+
+Two bounded limits of the v1 groom generator (`src/fur.h`), logged rather than fixed:
+
+- **No instanced targets.** `fur { on "…" }` resolves a name to a range of *world-space*
+  triangles in `Scene::tris`. An instanced `mesh_instance` keeps its triangles in a BLAS
+  in object space with a per-instance transform, so there is nothing in world space to
+  scatter over. This is a clear load error rather than a silent empty coat, but it means
+  the natural way to author a herd — one `mesh_asset`, many instances — cannot be furred.
+  *Proper fix:* sample in the asset's object space and transform each root + normal by the
+  instance transform (normals by the inverse-transpose), generating one groom per instance;
+  or, better for memory, teach the BVH to instance a **groom** the way it instances a mesh.
+- **Peak memory is the upper bound, not the result.** `generateFur` preallocates
+  `count × spans × subdiv` segments because `tessellateCurve` emits a variable number and
+  the build is a lock-free `parallelFor` into a fixed slice. Compaction is in-place, so
+  the peak is the bound — fine (the bound is nearly always exact), except that the bound
+  itself is large: 1 M strands × 8 cones × 80 B ≈ **640 MB**, on top of the `CurveSeg`
+  footprint issue already logged below. *Proper fix* is the same one that entry names —
+  shrink `CurveSeg` — plus, if a groom ever needs to stream, a two-pass count-then-fill.
+
+Also minor, not worth its own entry: clump **guides** are built in a serial loop rather
+than a `parallelFor`, so a groom with a very small `clump_size` (hence many guides) has a
+serial phase. It is O(guides) with guides ≪ strands by construction, so it has not
+mattered.
+
+Also bounded, added with `bald` in v0.154.0: a **bald zone is always a sphere**, and the
+test is a linear scan of the zone list per strand. Both are deliberate — the features that
+need to stay bare (an eye, a nose leather) are already authored as spheres, and a face has
+two or three of them, so a grid or a box/capsule zone would be machinery for a case that
+has not appeared. The shapes that would need one are a bare *stripe* (a capsule) or a
+shaved *patch* following a mesh feature; if either turns up, the right fix is to widen
+`FurSpec::BaldZone` into a small tagged shape with one `distanceToSegment`-style method per
+kind, keeping the whole-strand, post-clump test exactly where it is (`furStrandHitsBald`,
+`src/fur.h`), and to bucket the zones into the groom's existing uniform grid once the count
+is large enough to matter.
+
+### FIXED (2026-08-07, v0.151.0): the `curve` primitive had no CUDA path — the whole scene fell back to the CPU
+
+Shipped deliberately with the primitive in v0.150.0 (TODO §P1) and ported one version
+later. `cudaForwardSupported` used to return false for any scene with `scene.curveSegs`
+non-empty (and `cudaBdptSupported`/`cudaBackwardSupported` chain to it), so modes A/B/C/D/R
+went to the CPU tracer. The fallback was correct and not the bug — the device hit routine
+knew four prim ranges (`tri | sphere | implicit | instance`) and a fifth one with no
+intersector would not fault, it would silently trace *past* every strand and render a
+furred subject **bald**. A plausible-looking wrong image is worse than a fallback.
+
+**Fix:** `DCurveSeg` + `intersectCurveSeg` in `render_cuda.cu`, a fifth range in both
+`closestHit` and `occluded` (and the instance index arithmetic shifted past it in both),
+and a straight narrowing copy in the scene bake — `CurveSeg` was already a POD laid out for
+exactly this. The material support screen still applies to curve materials like any other
+primitive's. Measured on a 4 000-strand / 96 000-segment fur patch at 400×300: **59.1 s →
+0.8 s (74×)** at 512 spp for the same 4.42% noise. Verified equal: mode W is deterministic
+on both devices, and CPU vs GPU gives mean |Δlum| 5e-4 on the fur patch and 3e-5 on
+`curve_basics`, with divergence confined to grazing silhouette pixels. Curve-free scenes
+are still bit-identical on the CPU (cornell / implicit / group md5s unchanged) and agree
+CPU↔GPU — `group` in particular exercises the instance range whose indices shifted.
+
+**The port was not mechanical, and the reason is worth keeping.** The device runs
+`using Real = float`, and the round-cone quadric is *catastrophically ill-conditioned* in
+fp32 at fiber scale: `k0 = d2*m5 - m1*m1 + …` has both terms ~4e-4 while their difference
+is ~1e-10 for a 1 mm strand seen from 2 m — six decades of cancellation, i.e. the entire
+fp32 mantissa. A naive transliteration measured **12–36% of hits lost outright and errors
+of 11–42 fiber radii**: strands would have rendered as speckled holes on the GPU while
+looking perfect on the CPU, and no image-level test would have blamed the intersector.
+
+The fix is *origin recentering* — slide the ray origin to its closest approach to `p0`
+before forming any quadric, undo the shift on each accepted root. Exact in exact
+arithmetic, purely a conditioning change, and the round-cone analogue of the
+perpendicular-offset trick `intersectSphere` already uses from Ray Tracing Gems ch.7. It is
+applied on **both** host and device: double merely postpones the identical failure to
+scenes ~1e9× larger, and sharing the formulation means the self-test validates the algebra
+the GPU actually runs. It also improved the double path — `-checkcurve` §1's max SDF
+residual fell 8.60e-13 → 5.23e-14.
+
+Guarded permanently by **`-checkcurve` §6**, which instantiates the host's
+`curveSegCrossings` (templated on the scalar type precisely so this is possible) at `float`
+and asserts <0.5% lost hits and <0.25 radii of error across four fiber configurations.
+Mutation-tested: disabling the recentering fails §6 on all four rows while sections **1–5
+all still pass**, so §6 tests something no other section can see.
+
+### FIXED (2026-08-07, v0.150.0): `-raster` / `-raster-gpu` drew a scene of `curve` strands as EMPTY, with no warning
+
+Found immediately after the primitive landed, by previewing `scenes/curve_basics.ftsl`:
+`[raster] 12 triangles` — the six box quads and **not one of the five strands** — and no
+message saying anything had been skipped.
+
+The preview rasterizer builds its draw list from triangles (world tris, tessellated
+spheres, marched isosurfaces, baked instances). It had no curve path and, unlike the CUDA
+gate above, **no gate either**, so a curve scene did not fall back and did not warn — it
+just previewed empty. That is the same failure class the CUDA gate exists to prevent, and
+worse here because there is nothing to notice: "geometry I can't draw is geometry that
+isn't there." `raster.h`'s own `applyMat` comment already warns about exactly this ("adding
+a per-material preview feature can no longer be wired into three of the four paths and
+silently dropped on the fourth — which is how marched implicits ended up unable to show a
+skin at all"); this was the geometry-level version of the same mistake.
+
+**Fix:** stage `(2b)` in `raster::tessellate` meshes each `CurveSeg` as a proper round
+cone. The surface is swept as a stack of rings about the segment axis, walking the same
+three pieces the analytic intersector knows: the back cap of `sphere(p0,r0)`, the tangent
+lateral band, and the front cap of `sphere(p1,r1)`. With `a = (r0−r1)/|p1−p0|` the tangent
+circles sit at polar angle `acos(a)` on **both** end spheres, which is what lets one
+angular sweep cover all three pieces continuously — so the preview mesh is closed, exactly
+like the surface it approximates. The `|a| ≥ 1` degenerate (one ball swallows the other)
+falls out for free: the swallowed sphere's cap collapses to zero rings and the survivor is
+drawn whole, matching the intersector's `d2 <= 0` branch. `v` uses the same `onb(axis)` the
+analytic hit does, so a `u`/`v` pattern previews where it will actually land. Coarse by
+design (`CU = 10` azimuthal, `CCAP = 2` rings/cap ≈ 80 tris/segment) — a fiber is a few
+pixels wide in a preview and the silhouette is the point. `curve_basics` now tessellates to
+13372 triangles and previews all five strands with their taper, `r=` bulge, `u`-banding and
+group transform.
+
+*Residual, not worth fixing yet:* 80 tris/segment does not scale to a real groom (1 M
+strands × 16 segments would be 1.3 G preview triangles). Nothing authors a groom that big
+yet — see the `CurveSeg` memory entry below, which hits first — but when the `fur { … }`
+generator lands, the raster path will want a segment-count-driven LOD (drop the caps, then
+drop to a single camera-facing quad per strand).
+
+### OPEN (2026-08-07, v0.150.0): a `curve`'s azimuthal `v` is a PER-SEGMENT frame, not parallel-transported — it can step at a sharp joint
+
+`intersectCurveSeg` builds the azimuthal frame from `onb(axis)` of the round cone that was
+hit, so `v = 0.5 + atan2(dot(radial,B), dot(radial,T)) / 2π` is measured against a basis
+that is a discontinuous function of the axis direction. Along a smooth strand successive
+segments' axes barely differ and `v` is effectively continuous; across a **sharp** bend
+(the `linear` zig-zag in `scenes/curve_basics.ftsl` is the extreme case) the reference
+direction can rotate abruptly and a `v`-driven pattern will show a seam at the joint.
+
+`u` is unaffected — it is carried explicitly as `u0`/`u1` per segment and is exactly
+continuous by construction — so lengthwise banding (the common case, and what fur
+colouring actually wants) is already correct. This only bites a texture that wraps *around*
+the fiber.
+
+Proper fix: **parallel-transport** a reference frame along the strand at tessellation time
+(rotation-minimising frame — Bishop frame, or the double-reflection method of Wang et al.
+2008, which is cheap and stable), store the per-segment reference vector on `CurveSeg`
+(one `Vec3`, or two floats if packed against the axis), and measure `v` against that
+instead of a locally-derived `onb`. It belongs in `tessellateCurve`, where the whole
+strand is in hand, not in the intersector. Deferred because no current material varies
+with a fiber's `v`, and because the frame a fiber BCSDF (§P3) needs is the *same* one —
+so it is better built once, with that consumer in view.
+
+### OPEN (2026-08-07, v0.150.0): `CurveSeg` is 80 bytes, so a real groom is ~1.3 GB before anything else is loaded
+
+`struct CurveSeg` is `Vec3 p0, p1` (6 × `double` = 48 B) + `double r0, r1` (16 B) +
+`int matId, curveId` (8 B) + `float u0, u1` (8 B) = **80 B**. At the scale the primitive
+exists for — 1 M strands × 16 segments — that is **1.28 GB** of segments alone, before the
+BVH (which adds a leaf *per segment*, not per strand). 10 M hairs is not representable at
+all.
+
+This is inherent to flattening at load and is the accepted trade (see `design.md` →
+`curve.h` for why flattening wins), but the constant is larger than it needs to be. The
+obvious reductions, roughly in order of value per unit of risk:
+- **`float` positions/radii** — halves it to ~40 B. A fiber is 10–100 µm wide; `float`'s
+  ~7 digits is ample for a strand's own geometry, though the *world* position of a hair on
+  a large model is where fp32 would start to hurt, so this wants a per-curve origin.
+- **Store `p0` + a packed axis + length** rather than two full endpoints, exploiting that
+  consecutive segments share an endpoint (the chain is contiguous by construction — §5 of
+  `-checkcurve` asserts `segs[k].p0 == segs[k-1].p1`). A chain of `n` segments has `n+1`
+  endpoints, not `2n`.
+- **Drop `curveId`/`matId` to a per-*curve* indirection** — every segment of a strand
+  shares both, and `Curve` already records `firstSeg`/`segCount`.
+- **`u0`/`u1` are derivable** from the segment index within its curve (`u = k/segCount`
+  for a uniform subdivision, which is what `tessellateCurve` emits), so they are pure
+  redundancy today; they exist so a future non-uniform subdivision stays expressible.
+Not urgent — nothing yet authors a groom big enough to hit it (the biggest scene in
+`scenes/` has five strands) — but it is the first wall §P2's fur work will run into, and
+the fixes are all local to `curve.h` + `tessellateCurve`.
+
 ### OPEN (2026-08-07, v0.149.0, amended v0.149.1): the live window cannot repaint mid-image — its finest granularity is one whole image at 1 spp, not "every N rows"
 
 **What was asked for vs what was delivered.** The request was for the live window to refresh
@@ -93,15 +733,39 @@ reasons, both measured rather than assumed, and either one alone is fatal:
    correct image content type — that proxy is the entire reason the GIF works.
 
 **Consequence, which is why both files are committed and both are `.gitignore` exceptions:**
-the animated GIF (320², 20 fps, 3.3 MB) is the *only* thing that plays on the repo page, so it
+the animated GIF (320², 20 fps, 2.74 MB) is the *only* thing that plays on the repo page, so it
 is the embed; the MP4 (480², 60 fps, 3.4 MB) is the full-quality download linked beside it.
 An animated WebP was built and tested first (2.78 MB, better quality per byte) and **discarded**
 — raw serves `.webp` as `text/plain`.
 
-**If the GIF ever needs re-encoding, use gifski, not ffmpeg's palettegen.** Same clip:
-ffmpeg palettegen bottomed out at 5.3 MB for acceptable quality; gifski 1.7.1 (installed via
-npm) hit 3.27 MB at 320²/20 fps/`--quality 65` with visibly less banding on the gyroid glass.
-Command shape: `gifski -o pastel_jack_ring.gif --fps 20 --width 320 --quality 65 frames/*.png`.
+**Re-encoding is no longer a hand-typed command — it is `loom.drive.assemble_gif_gifski`.**
+Use gifski, not ffmpeg's palettegen: on this clip palettegen bottomed out at 5.3 MB for
+acceptable quality, while gifski 1.7.1 hits 2.74 MB at 320²/20 fps/`--quality 65` with visibly
+less banding on the gyroid glass. All three jack examples (`jumping_jack.py`, `pastel_jack.py`,
+`glowing_jack.py`) now call `assemble_gif_gifski(pngs[::GIF_STRIDE], …, fps=GIF_FPS,
+width=GIF_WIDTH, quality=GIF_QUALITY)`, so re-running the example reproduces the committed GIF
+**byte-for-byte** (verified with `cmp`); it falls back to `assemble_gif_ffmpeg` with a printed
+notice if gifski is absent.
+
+*Trap that `find_gifski()` exists to absorb:* `npm install -g gifski` does **not** put gifski on
+PATH on Windows — the package declares no `bin` entry, so `shutil.which("gifski")` fails even
+on a correct install. The real executable is at
+`<npm-global>/node_modules/gifski/bin/{windows|macos|debian}/gifski[.exe]`, and `find_gifski()`
+probes those platform-mapped locations after `which`.
+
+**This GIF is also the regression evidence for the auto-exposure flicker fix.** Measured with
+`scraps/gif_steps.py` (frame-to-frame relative step of the whole-frame mean, and of a static
+background patch nothing ever occupies — the camera and room are static, so any step there is
+pure exposure artefact):
+
+| | frame mean p95 / max | static bg p95 / max |
+|---|---|---|
+| old GIF (pre-fix frames) | 7.974% / 25.953% | 12.276% / 51.172% |
+| new GIF (post-fix frames) | 0.654% / 0.958% | 0.028% / 0.064% |
+
+Source PNGs measure at 0.243% / 0.419% (frame mean) with `scraps/gif_flicker_check.py`, so what
+little step remains in the GIF is palette quantisation, not exposure. Re-run either script
+before replacing the README asset.
 
 ### FIXED (2026-08-07, loom-only, no binary change): a loom example that imports a SIBLING example is unloadable by `loom.viewer.load_build` — so `python -m loom.anim` and the native viewer could not open it
 

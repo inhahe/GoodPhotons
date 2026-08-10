@@ -771,6 +771,12 @@ FRAMES = 432
 FPS = 60
 GIF_STRIDE = 3
 GIF_FPS = 20
+# The GIF is also the README embed, and GitHub is the only viewer that matters for it, so
+# it is encoded with gifski rather than ffmpeg's palettegen (measurably smaller per unit of
+# quality on smooth shading — 2.7 MB vs 5.3 MB on this clip) and downscaled: a 480² GIF is
+# ~4x the bytes for detail the README column width throws away anyway.
+GIF_WIDTH = 320
+GIF_QUALITY = 65
 
 # Closed room, camera inside it (so glass has a whole interior to refract).  It is
 # deep in +z because the camera stands *inside* and still has to clear the jack's
@@ -859,7 +865,7 @@ def main() -> int:
         return 0
 
     from loom import render_range
-    from loom.drive import assemble_gif_ffmpeg, assemble_mp4, default_outdir
+    from loom.drive import assemble_gif_gifski, assemble_mp4, default_outdir
     pngs = render_range(scene, FRAMES, name="jumping_jack", fps=FPS, n=1,
                         interval=8.0, skip_existing=True, extra_args=WHITTED)
     out = default_outdir("jumping_jack")
@@ -867,7 +873,8 @@ def main() -> int:
     # GIF because it is not restricted to a 256-entry palette.
     assemble_mp4(pngs, out / "jumping_jack.mp4", fps=FPS)
     # The GIF is the compatibility copy — see the GIF_FPS comment for why it cannot be 60.
-    assemble_gif_ffmpeg(pngs[::GIF_STRIDE], out / "jumping_jack.gif", fps=GIF_FPS)
+    assemble_gif_gifski(pngs[::GIF_STRIDE], out / "jumping_jack.gif", fps=GIF_FPS,
+                        width=GIF_WIDTH, quality=GIF_QUALITY)
     return 0
 
 

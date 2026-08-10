@@ -896,8 +896,14 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             float3 pn = normalize3(wn);
             double qx = wpos.x, qy = wpos.y, qz = wpos.z;
             double qr = sqrt(qx * qx + qy * qy + qz * qz);
+            // curv = 0: the raster preview shades a VERTEX BUFFER, not a ray-triangle
+            // hit, so no per-face curvature is in hand here. The CPU raster twin passes
+            // none either, so the two previews agree; `curv` is a tracer-only input.
+            // cavity = 0 for a stronger reason: the probe needs whole-scene ray
+            // traversal, and the raster preview has no BVH at all — it exists precisely
+            // to avoid one. Both are logged in known-issues.md.
             wt = dPatternEval(patNodes + wp.off, wp.n, qx, qy, qz, 0.0,
-                              pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, patEnv);
+                              pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, 0.0, 0.0, patEnv);
         } else if (mx.weightTex >= 0 && mx.weightTex < nTex) {
             wt = texMeta[mx.weightTex].patScalarAt((double)uu, (double)vv);
         }
@@ -928,8 +934,9 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         double r  = sqrt(px * px + py * py + pz * pz);
         // f = 0: the implicit field value is exactly 0 on the level set the marched mesh
         // approximates, matching both the CPU preview and the tracer's own hit context.
+        // curv/cavity = 0 here for the same reason as the mix-weight site above.
         double s = dPatternEval(patNodes + pp.off, pp.n, px, py, pz, 0.0,
-                                pn.x, pn.y, pn.z, r, (double)uu, (double)vv, patEnv);
+                                pn.x, pn.y, pn.z, r, (double)uu, (double)vv, 0.0, 0.0, patEnv);
         col = col * (float)fmin(1.0, fmax(0.0, s));
     }
     if (emissive) { accum[i] = col * emisBoost; return; }   // raw emitter radiance

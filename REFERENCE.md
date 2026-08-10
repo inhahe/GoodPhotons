@@ -27,9 +27,12 @@ Three neighbouring documents cover what this one only summarises:
   - [Spectral representation vs. other renderers](#spectral-representation-vs-other-renderers)
 - [Lights](#lights)
 - [Geometry](#geometry)
+  - [Curves and fibers (`curve`)](#curves-and-fibers-curve)
+  - [Grooms (`fur`)](#grooms-fur)
   - [Implicit surfaces (`isosurface`)](#implicit-surfaces-isosurface)
 - [Textures](#textures)
 - [Procedural patterns (math-driven materials)](#procedural-patterns-math-driven-materials)
+  - [Putting them together — non-stationary noise](#putting-them-together--non-stationary-noise)
 - [Participating media / fog](#participating-media--fog)
 - [Scene language (FTSL)](#scene-language-ftsl)
   - [Conditional blocks (`prefer { … } else { … }`)](#conditional-blocks-prefer----else---)
@@ -344,7 +347,8 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > **Quick preview — `-raster` (not a transport mode).** To eyeball *composition*
 > and *camera motion* before committing to a full render, `-raster` skips light
 > transport entirely: it tessellates the whole scene once (analytic spheres →
-> UV spheres, isosurfaces/CSG → marching-tetrahedra mesh, instanced meshes baked
+> UV spheres, isosurfaces/CSG → marching-tetrahedra mesh, `curve` strands → a
+> round-cone mesh per segment, instanced meshes baked
 > to world space) and z-buffers each camera as solid, flat diffuse+headlight
 > triangles — roughly **1 fps at 1280×720**. There is **no** transparency,
 > reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
@@ -412,6 +416,24 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > isosurface mesh fineness with `-raster-iso <n>` (default 96 cells along the
 > longest axis; `0` skips implicit surfaces). Example:
 > `ftrace -in scenes/gallery_settled.ftsl -raster -window -o png/preview.png`.
+>
+> **Fur / curve strands are previewed under a triangle budget —
+> `-raster-curve-budget <n>` (default 12000000).** Every curve segment is swept into a
+> round-cone mesh so a furred subject doesn't preview bald, but a groomed pelt is
+> *millions* of segments: `scenes/fur_creature.ftsl` and the creature in
+> `scenes/gallery_rain.ftsl` carry ~1.79 M each, and at the full 80-triangles-per-segment
+> cone that would be tens of gigabytes of preview geometry. So the sweep picks the
+> coarsest tube that fits the budget — 10-sided capped → 6/4/3-sided → capless →
+> a flat double-sided ribbon — and only if even the cheapest one busts the budget does it
+> thin whole **strands** (kept strands stay continuous, never dashed). At the default
+> those two pelts land on a 3-sided capless tube, ~6 triangles/segment, which is
+> visually indistinguishable from the full cone at preview resolution. When the budget
+> bites, ftrace says so:
+> `[raster] 1786496 curve segments over the 12000000-triangle preview budget: 3-sided
+> uncapped tube, 6 tris/segment (10718976 tris)`. Raise `-raster-curve-budget` for
+> rounder strands if you have the RAM (each preview triangle is ~320 B), lower it on a
+> small machine. This only affects the **preview**; the ray-traced modes intersect the
+> analytic strands exactly and ignore the budget entirely.
 >
 > **GPU-accelerated preview — `-device gpu` (or `auto`).** When ftrace is built
 > with CUDA, the preview rasterizer runs on the GPU: the tessellated world
@@ -1632,7 +1654,7 @@ are not auto-lit; bind an FTSL `emit` material instead.)
 
 **Emissive non-mesh geometry (glowing solids).** `emit` is a property of the
 *material*, not of the `mesh` block, so binding an emissive material to anything else —
-a `sphere`, a `quad`, a CSG solid, a marched `isosurface` — makes that surface glow
+a `sphere`, a `quad`, a CSG solid, a marched `isosurface`, a `curve` fiber — makes it glow
 too, identically on CPU and GPU. The difference is that only a mesh has triangles to
 register an emitter against, so these surfaces are seen by **emission-on-hit only**: a
 camera ray (or a specular bounce) that lands on one picks up `emit(λ)`, but NEE and
@@ -1662,7 +1684,8 @@ first.
 
 ## Geometry
 
-`sphere`, `quad` (parallelogram), `triangle`, and `mesh` (**OBJ, glTF 2.0 / GLB,
+`sphere`, `quad` (parallelogram), `triangle`, `curve` (a hair/fur/wire strand — see
+**Curves and fibers** below), and `mesh` (**OBJ, glTF 2.0 / GLB,
 Autodesk FBX, and `.ftmesh`** import — the loader dispatches on file extension). glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
@@ -1719,7 +1742,7 @@ at load time from the mesh's world-space bounding box (the optional token is the
 projection/up axis, default `y`).
 `group { translate … rotate … scale … shear … <children> }` composes transform
 hierarchies (baked to world space at load). Children may be `sphere`, `quad`,
-`triangle`, `mesh`, `mesh_instance`, `isosurface`, `light`, or nested `group`s —
+`triangle`, `mesh`, `mesh_instance`, `isosurface`, `curve`, `light`, or nested `group`s —
 so a physically-settled rest pose (e.g. from `tools/settle_scene.py`) can wrap an
 isosurface CSG/implicit just as easily as a mesh. `shear <a> <b> <c>` adds a
 unit-diagonal upper-triangular skew (`x' = x + a·y + b·z`, `y' = y + c·z`) to the
@@ -1750,6 +1773,204 @@ edge signs are what used to crack — the GPU float path. (v0.116.0 fixed a real
 GPU: the guarantee needs the edge functions' two products to stay *unfused*, and nvcc's
 default fused multiply-add was silently breaking the antisymmetry, so a mesh edge that landed
 dead on a column of pixel centres let the background through. See `known-issues.md`.)
+
+### Curves and fibers (`curve`)
+
+A `curve` is a **strand**: control points plus a radius, for hair, fur, grass, wire,
+thread and cables. It exists because the alternative is untenable — a triangle ribbon
+costs ~64 triangles per hair, so one furred animal (1–10 M hairs × 8–32 segments) is
+**10⁸–10⁹ triangles**. A strand instead costs a handful of segments.
+
+```
+curve "guide_hair" {
+    material gold
+    basis      catmull_rom       # linear | catmull_rom | bezier | bspline
+    radius     0.016             # root radius (default 0.001 = 1 mm)
+    radius_tip 0.002             # tip radius (default = radius, i.e. untapered)
+    segments   12                # round cones per span (default 4; linear forces 1)
+    point 0.30 0.02 0.55
+    point 0.36 0.24 0.48
+    point 0.27 0.46 0.60  r=0.028   # `r=` overrides the taper at one point
+    point 0.35 0.68 0.50
+    point 0.29 0.88 0.56
+}
+```
+
+**How it is traced.** ftrace **flattens the curve at load time** into a chain of
+**round cones** — each the convex hull of a sphere at either end, i.e. a capsule whose
+radius varies linearly (`src/curve.h`). The BVH indexes one leaf per *round cone*, not
+per strand, because a whole hair's bounding box is mostly empty space. Flattening up
+front rather than evaluating the basis per ray means exact leaf bounds ("bound what you
+test"), no basis evaluation in the inner loop, and a POD segment record that a future
+GPU port can upload directly.
+
+Because adjacent round cones **share their end sphere**, the chain is watertight and
+smooth at the joints with no mitre logic: a strand is a single closed surface however
+sharply it bends. That is why the `linear` zig-zag in `scenes/curve_basics.ftsl` has
+no cracks at its corners.
+
+**Bases.** All four are affine-invariant, so a `group { translate … rotate … scale … }`
+transforms the control points and the flattening is exact; the radius picks up the
+group's uniform scale (a non-uniform scale warns and uses the volume-preserving
+geometric mean, since a round fiber cannot become elliptical).
+
+| `basis` | points needed | spans | behaviour |
+|---|---|---|---|
+| `linear` | ≥ 2 | `n−1` | the control points **are** the polyline; `segments` is forced to 1 |
+| `catmull_rom` *(default)* | ≥ 2 | `n−1` | **interpolating** — the strand passes exactly through every point you author, so it is the right basis for a hand-placed guide hair. Ends are clamp-duplicated |
+| `bezier` | `3k+1` | `(n−1)/3` | cubic chain, `P0 C C P1 C C P2 …` |
+| `bspline` | ≥ 4 | `n−3` | **approximating** and C2 — smoother than its control polygon and does *not* pass through the points; the right basis for a groom solver's output |
+
+Radius is interpolated **linearly** between a span's two endpoint control points, never
+through the basis — a Catmull-Rom radius can overshoot, and a negative radius is not a
+taper, it is a bug.
+
+**Texture coordinates.** The hit's `u` runs `0` (root) → `1` (tip) along the strand and
+`v` runs around its circumference, so a `pattern` or texture can vary along or around a
+fiber (`scenes/curve_basics.ftsl` bands one strand with
+`expr "0.5+0.5*sin(2*pi*9*u)"`). `tangent` is the strand's axis, Gram-Schmidt'd against
+the shading normal — the frame an anisotropic or fiber BSDF wants.
+
+**Correctness.** `ftrace -checkcurve` runs six sections: the round-cone intersector
+against Inigo Quilez's exact analytic SDF (position, first-hit `t`, normal vs. the
+numerical SDF gradient, `u`/`v` ranges, and AABB containment); the degenerate case where
+one end sphere swallows the other, which must equal the analytic ray–sphere test
+exactly; `anyHit` agreement with the full path including origins *inside* the fiber;
+watertightness at chain joints; basis flattening (span counts, monotone `u`, chain
+contiguity, and that interpolating bases hit their control points while `bspline` stays
+off them); and the **fp32 conditioning** of the quadric at fiber scale, which the CUDA
+path depends on (see below).
+
+**Numerics.** The round-cone quadric's constant term is a difference of two large,
+nearly equal products. At fiber scale — a 1 mm radius on a 1 cm segment viewed from 2 m
+— those products are ~4·10⁻⁴ while their difference is ~10⁻¹⁰: **six decades**, i.e. the
+entire fp32 mantissa. So before forming the quadric, both the host and the device slide
+the ray origin along itself to its closest approach to the segment's root point, and undo
+that shift on each accepted root. This is an exact re-parameterisation — it changes only
+the *conditioning* — and it is what makes the intersector usable in the fp32 CUDA
+megakernel. Without it, 12–36 % of fiber hits are lost outright and the rest land tens of
+radii off (strands render as speckled holes on the GPU while looking perfect on the CPU);
+with it the fp32 error stays under 0.06 radii. `-checkcurve` §6 instantiates the real
+intersector at `float` and guards exactly this.
+
+**Limits (v1).** Curves run on **both the CPU and the GPU** in the ray-traced modes as of
+0.151.0 (measured 74× on a 96 000-segment fur patch), and the `-raster` / `-raster-gpu`
+previews show strands too (each round cone is meshed at preview fidelity). What is still
+missing is the *aggregate LOD*: every fiber is intersected individually, so a groom's cost
+is linear in strand count and sub-pixel fibers are a variance sink. See `known-issues.md`,
+which also covers the per-segment azimuthal `v` frame and `CurveSeg`'s memory footprint.
+
+**Authoring one procedurally.** The bundled Loom toolkit emits `curve` blocks from an
+animated spine: `Strand` / `strand()` / `hair()` (`tools/loom/loom/scene.py`). It samples
+the spine per frame and picks the basis for you — `catmull_rom` for an open spine (it
+interpolates, so the fiber passes through the samples), and for a *closed* spine a
+**periodic** `bspline` whose control points are solved so the loop is C2 through the seam
+*and* still on the spine. That is worth knowing even if you never use loom: it is the
+general recipe for closing a loop with this primitive, since `catmull_rom`'s
+clamp-duplicated ends cannot. See `tools/loom/DESIGN.md` §7a′ and
+`tools/loom/examples/strand_loop.py`.
+
+### Grooms (`fur`)
+
+A `curve` is one strand, written out by hand. A coat is 10⁴–10⁶ strands, which nobody
+authors as text — so a **`fur { }`** block generates them (`src/fur.h`), scattering roots
+over a named surface and growing each one with a closed-form shape:
+
+```
+sphere "ball" { center 0.22 0.20 0.55  radius 0.13  material skin }
+
+fur "ball_coat" {
+    on "ball"                 # a named sphere, mesh, quad or triangle
+    material brown
+    count 60000               # or `density <n>` — strands per authored unit^2
+    length 0.055  length_jitter 0.35
+    radius 0.0006             # radius_tip defaults to 0.25*radius
+    droop 0.55  jitter 0.25  seed 1
+}
+```
+
+The full key list is in FTSL.md → **§8.7 `fur`**. The shaping controls are `lift` /
+`jitter` (growth direction), `direction` + `comb` (combing and wind), `gravity` + `droop`
+(sag), `curl` + `curl_freq` (a helix), and `clump` + `clump_size` (tufts).
+
+**`bald` keeps features bare.** A coat is grown per body *part*, but an eye or a nose is a
+separate little sphere sitting *on* that part, and the part's groom roots area-uniformly
+over the ring of skin it overlaps — so every strand rooted around the eye grows straight
+across the eyeball, and no `length`/`lift`/`comb` fixes it, because the problem is where
+the roots are, not which way they point. `bald "eye_l" 0.001` (a named scene sphere plus an
+optional margin, or an explicit `<x> <y> <z> <r>`; repeatable) culls any strand that
+reaches into that volume. The test is span-wise over the *whole* strand and runs *after*
+clumping, so a hair that merely arcs through under `droop`/`comb`/`clump` goes too;
+survivors are untouched, so the coat outside a zone is bit-for-bit unchanged and only the
+count drops. The load line reports the cull.
+
+**It is not a new kind of geometry.** The generator emits exactly the `Curve`/`CurveSeg`
+records a hand-written `curve` produces, so the BVH, the CPU tracer, the CUDA megakernel
+and the raster preview need no new code — everything above about round cones, bases,
+taper, watertight joints and the `u`/`v`/`tangent` frame applies to generated strands
+unchanged, and a groom inherits the GPU speedup for free.
+
+**Area-uniform roots.** Over a mesh, a triangle is picked proportional to its area and the
+barycentrics are sqrt-warped, so a low-poly belly and a dense face grow the same hairs per
+square centimetre and `density` is meaningful. A `sphere` target is not tessellated at all
+— roots land on the analytic surface with the analytic normal, so a furred ball has no
+faceting in its coat and no tessellation bias in its density.
+
+**Deterministic and parallel.** A strand is a pure function of `(surface, parameters, seed,
+index)` — no simulation, no solver, no neighbour queries — so the build is a lock-free
+`parallelFor` whose result does not depend on how the work was scheduled, and the same seed
+always rebuilds the same coat (which is what a checkpoint/resume, a flyby, or a CPU-vs-GPU
+comparison all quietly depend on). Growth is linear in the arc parameter `t` and every bend
+is quadratic in it, so the root leaves the skin along its growth direction while the tip
+carries the full displacement.
+
+**Clumping changes shape, never density.** Strands blend toward their **nearest** tuft
+guide with weight `clump · t`: roots stay exactly where the area-uniform sampler put them
+while tips converge. Guides are located through a CSR uniform grid rather than by hashing
+the root cell — hashing produces cube-shaped tufts on a grid, nearest-guide produces
+Voronoi tufts, which is what hair does.
+
+**Correctness.** `ftrace -checkfur` runs eight sections: roots lying on the target surface
+(off-plane distance, in-triangle containment, sphere radial error); area-uniformity (a 3:1
+area split must produce a 3:1 strand split, the mean barycentric must be ⅓ rather than the
+½ an unwarped map gives, and `density × area` must be the exact count); determinism, with
+the **two** consumers of the seed checked separately — the per-strand rng with clumping off,
+and the guide rng by forcing the guide count to one at full clump strength, so every tip *is*
+that guide's tip; growth direction never pointing into the skin, with lengths inside the jitter window
+and the shaped arc inside its analytic bound; clumping collapsing tip spacing while moving
+no root; the emitted chain being well-formed (segment count, contiguity, monotone taper and
+`u`, correct back-pointers); a regression section for the load-order trap below; and `bald`
+zones — no surviving segment inside a zone, survivors bit-for-bit unchanged from the same
+seed grown without one, and a zone covering the whole target leaving nothing. Each
+section is mutation-tested — a deliberate break in `fur.h` must make the section that owns
+it fail — and that mutation run has twice caught a test that could not fail. It is why the
+determinism section splits the two seed paths (with clumping on, either path alone moving is
+enough to pass, so a build that had stopped seeding the *strands* from `spec.seed` slipped
+through), and why the `bald` section grows a second zone that **floats clear of the skin**,
+containing no roots at all: the original zone sat on the surface and swallowed the roots of
+everything crossing it, so culling by root alone — exactly the bug `bald` exists to prevent —
+passed it.
+
+**Load-order trap (fixed, and pinned).** The deferred `fur` sweep runs during scene
+*loading*, but `Tri::finalize()` — which computes geometric normals and back-fills absent
+shading normals — does not run until `Scene::build()`. So the generator sees zeroed normals
+on every quad, triangle and mesh without authored `vn`. Normalizing that zero vector made
+every strand NaN, and the NaN was then swallowed by the flattener's coincident-point guard,
+so a groom emitted **zero strands with no error printed anywhere**. The generator now
+derives the geometric normal from the vertices itself and uses shading normals only when
+they are genuinely present; `-checkfur` §7 builds on deliberately un-finalized triangles to
+keep it that way.
+
+**Limits.** The generator's ceiling is deliberate: no collision, no styling curves, no
+interactive brushing. It also inherits the curve limits above — most importantly the
+missing aggregate LOD, which is what decides how large a groom stays affordable. A
+`mesh_instance` cannot be a target (its triangles live in a BLAS, not in world space);
+see `known-issues.md`.
+
+Worked examples: `scenes/fur_basics.ftsl` isolates each parameter; `scenes/fur_creature.ftsl`
+is the payoff — an animal built from overlapping analytic spheres wearing ~300 000 strands
+from a dozen `fur` blocks at one shared `density`, which is also a demonstration that fur
+hides the seams of the geometry underneath it.
 
 ### Implicit surfaces (`isosurface`)
 
@@ -1807,7 +2028,9 @@ isosurface {
 
 The `expr` string is compiled by the **same math VM as procedural patterns** (variables
 `x y z` and `r = |p|`, plus `sin cos tan exp log sqrt abs floor fract sign min max pow
-atan2 clamp mix smoothstep noise`, and the constant `pi`). Because an arbitrary field is
+atan2 clamp mix smoothstep noise`, the vector-noise components `dnoisex/y/z` /
+`dturbx/y/z` for gradient-noise domain warping, cellular noise
+`worley/worley2/worleyd/worleyid(x, y, z, metric)`, and the constant `pi`). Because an arbitrary field is
 **not** a signed distance and has no analytic bound, a `function` isosurface **must**
 supply a `contained_by { min <x y z>  max <x y z> }` box (the region the surface is
 marched inside). Safe sphere-tracing needs a **Lipschitz bound** `L ≥ max|∇f|` so a step
@@ -2115,13 +2338,54 @@ point evaluated per shading sample — that can drive any scalar material parame
 *procedurally*, without a texture image. The variables available to a pattern are the
 world-space position `x y z`, the implicit field value `f` (the SDF value at the hit,
 `~0` on an isosurface; `0` for explicit geometry), the surface normal `nx ny nz`, the
-radius `r = √(x²+y²+z²)`, and the **surface UV coordinates `u v`** (mesh-interpolated,
-or a native-primitive wrap — see below). Two authoring forms:
+radius `r = √(x²+y²+z²)`, the **surface UV coordinates `u v`** (mesh-interpolated,
+or a native-primitive wrap — see below), the **mean curvature `curv`** (see
+*Curvature-driven, non-stationary patterns* below), and the **enclosure `cavity`**
+(see *Enclosure-driven patterns* below). Two authoring forms:
 
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
   math, `pi`, and functions `abs sqrt sin cos tan exp log floor fract sign saturate min
-  max atan2 step pow clamp mix smoothstep noise`. It can also **sample a declared image
+  max atan2 step pow clamp mix smoothstep noise gabor`. On top of the scalar `noise` there is
+  **vector-valued gradient noise for domain warping**: `dnoisex/y/z(x, y, z)` are the
+  three decorrelated components of POV-Ray's `DNoise` vector at a point, and
+  `dturbx/y/z(x, y, z, octaves, lambda, omega)` the components of its octave sum
+  `DTurbulence` (POV defaults 6, 2.0, 0.5; `octaves` clamps to [1, 10]; values signed,
+  roughly `[-1, 1]`). Where scalar `noise()` can only modulate a value, these *displace
+  the coordinate another pattern is sampled at* — `sin(6.2832*(3*x +
+  1.1*dturbx(3*x,3*y,3*z, 6, 2, 0.5)))` is the classic POV marble; worked example
+  `scenes/pattern_warp.ftsl`, deterministic self-test `ftrace -checkvnoise`.
+  There is also **cellular (Worley / Voronoi) noise** — one jittered feature point
+  per unit lattice cell, queried by `worley(x, y, z, metric)` (F1, the distance to
+  the nearest point), `worley2` (F2), `worleyd` (F2−F1, `0` exactly on cell
+  borders — crack networks), and `worleyid` (a flat per-cell random value in
+  `[0,1)`), all under a runtime `metric` operand rounded and clamped to
+  **0 Euclidean / 1 Manhattan / 2 Chebyshev**. Distances are raw at cell size 1
+  (Euclidean F1 mean ≈ 0.65), F1/F2 are exact (adaptive ring search, not the
+  common 3×3×3 approximation) and CPU/GPU bit-identical; worked example
+  `scenes/pattern_worley.ftsl`, deterministic self-test `ftrace -checkworley`.
+  And there is **anisotropic, band-limited Gabor noise** —
+  `gabor(x, y, z, f, wx, wy, wz)`, returning `[0,1]` with mean `0.5` like `noise`.
+  `f` is the frequency in **cycles per unit of the coordinates you hand it**, and
+  `(wx, wy, wz)` is the **steering direction**: the field oscillates *along* that
+  vector, so the visible streaks run perpendicular to it. A zero-length vector means
+  **isotropic band-pass** noise. Both the direction and the frequency are ordinary
+  sub-expressions, so they can vary from point to point — which is the reason the
+  primitive exists. Steering a *lattice* noise means writing `noise(R(p)·p)`, whose
+  Jacobian is `R + (dR/dp)·p`: the second term grows with distance from the origin, so
+  the texture shears further and further out and never has quite the orientation you
+  asked for (the same trap as spatially varying frequency — see *Putting them
+  together* below). A Gabor kernel only sees the offset from **its own centre**, at
+  most one cell, so a varying direction leaves a residual bounded by the local turning
+  rate rather than by `|p|`. Being band-limited it is also the one noise here that
+  minifies gracefully. Everything is analytic: the impulses are a genuinely
+  homogeneous Poisson process (so the field is stationary under *arbitrary*, not just
+  integer, translation), the compactly supported C² envelope makes the 3×3×3 search
+  exact rather than the usual 95%-of-a-Gaussian, and the per-impulse random phase makes
+  the variance independent of `f`. Worked example `scenes/pattern_gabor.ftsl`
+  (isotropic speckle, brushed metal, wood rings round an off-screen trunk, flow-aligned
+  fibre), deterministic self-test `ftrace -checkgabor`.
+  It can also **sample a declared image
   as a term**: `tex:<name>(u, v)` returns the mean of the texel's three linear RGB
   channels (the same `Texture::scalarAt` sampler a `texture:<name>` slot binding uses,
   honouring that texture's `filter`/`wrap`), so a photo can be one *operand* of a formula
@@ -2282,6 +2546,277 @@ stripe authored in `(u,v)` space wraps *around* the object (a globe, tiles conve
 at the poles, a grid on box faces) instead of slicing through world space. See
 `scenes/uv_native.ftsl`.
 
+**Curvature-driven, non-stationary patterns.** Every noise above is **stationary**: it
+is a function of position, so its statistics are the same everywhere and translating an
+object slides the pattern off it — the texture describes the *space*, not the shape in
+it. Real surface ageing is the opposite. Paint wears where the form is **convex** and
+something rubbed it; grime settles where the form is **concave** and nothing washes it
+out. That is a property of the geometry, so no amount of position-driven noise can
+express it. The `curv` variable closes the gap: it is the **mean curvature**
+H = (k₁+k₂)/2 at the shading point, in 1/length units, so multiplying any noise by a
+curvature mask makes it *non-stationary* — it follows the shape, and keeps following it
+when the object moves.
+
+`curv` is **signed toward the side being shaded**: convex is positive, concave negative,
+flat 0. Every intersector negates it when it flips the normal to face the ray, so the
+same sphere reads `+1/R` from outside and `−1/R` from within. What each geometry reports:
+
+| Geometry | `curv` |
+|---|---|
+| `sphere` | ±1/radius, analytic |
+| `curve` / fiber | 1/(2·radius) at the hit's interpolated radius (fibers are thin, so this is a **large** number — which is exactly what lets a pattern tell fiber from body) |
+| mesh **with** `vn` | per-face, from the interpolated shading-normal field |
+| mesh **without** `vn` | `0` — a flat-shaded mesh has no normal field to differentiate, so it honestly reads zero rather than guessing |
+| `quad` / flat facet | `0` |
+| `isosurface` | `0` (would need the field's Hessian; see `known-issues.md`) |
+
+Two things to get right. First, **the mesh must carry vertex normals** — generate one
+with `tools/make_mesh.py --smooth`, or the whole material collapses to a flat colour.
+(The loader warns about exactly this: if every primitive using a curv-reading material
+reports 0, it says so by name at load rather than letting you render a flat image and
+wonder why.) Second, **curvature is 1/length, so an instance's scale changes it**: `scale 0.5` doubles
+what the shader sees. Thresholds cut against the authored mesh will be wrong once it is
+placed, which is the easiest way to end up with a flat-looking result — measure the
+actual range rather than guessing.
+
+```
+# crevice grime: a noise field gated by the LEAST convex part of the form
+pattern "grime" { expr "smoothstep(-5.0, -1.0, -curv) * (0.35 + 0.65*noise(11*x,11*y,11*z))" }
+# edge wear: the mirror image, gated by the MOST convex band
+pattern "wear"  { expr "smoothstep(5.8, 6.9, curv) * step(0.5, noise(16*x,16*y,16*z))" }
+```
+
+`smoothstep` requires `lo < hi`, so a mask that should *increase* as curvature falls is
+written by negating the field (`-curv`) rather than by swapping the edges. Feeding either
+mask to a `mix` `weight_map` gives the usual dirt / edge-wear pass, driven by actual
+differential geometry instead of a painted or baked mask. Note that a dirt mask usually
+wants "least convex", not strictly "negative" — grime collects wherever the form turns
+away and nothing wipes it. Same values on CPU and GPU, including through the instance
+rescale. Deterministic self-test `ftrace -checkcurv`, worked example
+`scenes/pattern_curvature.ftsl`.
+
+**Enclosure-driven patterns — `cavity`.** `curv` makes a pattern follow the shape of
+the surface it sits on. `cavity` answers the question `curv` structurally cannot: how
+**enclosed** is this point? It fires a short hemispherical probe of radius
+`cavity_radius` and returns the blocked fraction, in `[0,1]` — `0` on an open plane,
+`~0.5` in a right-angled interior corner, `→1` down a crevice. It works on every
+primitive, isosurfaces included.
+
+The two are complements:
+
+| | `curv` | `cavity` |
+|---|---|---|
+| Corner between two **flat** faces | `0` on both — they really are flat | `~0.5`, the dirtiest place in the room |
+| Contact between two **separate** objects | invisible; curvature is a property of one surface | a ring on **both** bodies — the probe hits whatever is there |
+| A lone sphere in an empty room | `1/R` everywhere | `0` everywhere — nothing to be enclosed by |
+| `isosurface` | `0` (not yet derived) | works normally |
+
+So edge wear still wants `curv`, and contact grime wants `cavity`.
+
+```
+# grime that collects wherever the form encloses, and only as much as the noise says
+pattern "crevice" { expr "smoothstep(0.06, 0.45, cavity) * noise(19*x, 19*y, 19*z)" }
+```
+
+Controlled by two `scene`-block keys. **`cavity_radius <len>`** is how far the probe
+reaches, and it *is* the look: enclosure has no intrinsic scale, so the same corner is
+"deeply enclosed" at a 1 cm probe and "wide open" at 1 m. Left unset it derives 2% of
+the scene's AABB diagonal and prints a line saying so — a starting point, not an
+answer. **`cavity_samples <n>`** (default 16) is the ray count.
+
+The direction set is a **fixed** cosine-weighted Fibonacci spiral rather than a random
+draw, and that is a design decision, not an optimisation: a pattern input is read many
+times per pixel by different tracers, and every read must agree or the material itself
+becomes a variance source that no amount of sampling averages away cleanly.
+Deterministic makes `cavity` a true function of position — noise-free, identical on CPU
+and GPU, stable frame to frame in an animation. The price is **banding** into at most
+`cavity_samples + 1` levels, which is why the idiom above multiplies by noise (and why
+a `smoothstep`, which quantises anyway, hides it too).
+
+`cavity` is the only pattern input that spends **rays**, so it is gated twice: a scene
+that never writes it fires none at all, and within a scene that does, only materials
+whose own programs read it are charged (a `mix` inherits the flag from its layers). An
+**emission** pattern may not read `cavity` or `curv` — an emitter's sampled point
+carries neither, so the emitted profile would disagree with the one emission-on-hit
+reads and MIS would bias the image; the loader rejects it with an explanation.
+
+Deterministic self-test `ftrace -checkcavity`, worked example
+`scenes/pattern_cavity.ftsl`.
+
+**Distance-driven patterns — `sdf`.** `curv` reads the surface a point is *on* and
+`cavity` reads how enclosed it is; neither can answer *"how far is this point from
+**that** object?"* — the question behind moss creeping up from the ground, frost
+thickening away from a heat source, or wear radiating out from a contact. An `sdf`
+element bakes the **signed distance to one named mesh** onto a 3-D lattice and publishes
+it under the ordinary `grid:` namespace:
+
+```
+mesh "ring" { file "scenes/torus.obj"  material steel  scale 0.75  translate 1 0.22 0.8 }
+sdf  "halo" { object "ring"  res 128  pad 0.65 }     # res 8..512 (96); pad ⇒ ¼ longest axis
+
+pattern "bloom" { expr "1 - smoothstep(0.12, 0.30, grid:halo(x, y, z))" }
+```
+
+Negative inside, positive outside, in world units. Because it *is* a grid it needs no new
+syntax and works at every site a grid already works — a `pattern`, a material slot, an
+`isosurface` leaf, and a **medium `density`/`ior` program**, which is the case the other
+two cannot reach at all: a volume has no normal, no UV and no hit point to hang a surface
+property off, so a spatial field is the only kind of input it can take.
+
+`pad` is the range of the effect: outside the lattice the sampler clamps, so a
+distance-keyed mask stops varying there. The default suits a band hugging the object;
+reaching across a room means saying so. `res` buys spatial resolution, not accuracy —
+distances are measured exactly (an exact point-triangle narrow band, then Bridson
+closest-triangle sweeps), and the sign comes from the same generalized-winding
+voxelization a `medium`'s `bounds { object … }` uses, so a model made of several
+overlapping closed bodies reads as their **union** instead of hollowing out.
+
+Because the bake needs the geometry, an `sdf` cannot be read by anything evaluated
+*during* the load — a procedural `texture { rgb "…" }`, a `camera_curve` driver. The
+loader refuses those rather than returning 0, which in a distance field would mean
+"exactly on the surface".
+
+| | `curv` | `cavity` | `sdf` |
+|---|---|---|---|
+| Kind | local (2nd derivative) | non-local, short probe | non-local, unbounded |
+| About | the surface you are on | *everything* nearby | **one named object** |
+| A ring hovering clear of a floor | `0` — the floor is flat | `~0` — nothing touches | the halo you wanted |
+| Readable from a `medium` | no | no | **yes** |
+| Cost | free | rays, gated per material | one load-time bake |
+
+Deterministic self-test `ftrace -checksdf` (it bakes axis-aligned boxes, which carry no
+tessellation error and whose signed distance is closed-form, and checks every lattice
+sample against it exactly), worked example `scenes/pattern_sdf.ftsl`. Full syntax in
+FTSL.md §6.
+
+### Putting them together — non-stationary noise
+
+**The problem all three solve.** Every noise primitive in the language — `noise`,
+`dturb*`, `worley*` — is **stationary**: its statistics are the same everywhere. Turn
+one loose on a room and every square metre gets the same grain, the same contrast, the
+same feature size. Real surfaces are not like that. Wear is coarse where a hand grips
+and fine where nothing touches it; frost is chunky near the cold and powdery away from
+it. What changes across the object is not *how much* noise there is but *what kind*.
+
+Nothing in the noise functions offers that, and nothing needs to: **every argument of a
+noise call is an ordinary expression**, so a scene-aware field can drive it. `curv`,
+`cavity` and `grid:<sdf>(x, y, z)` are those fields.
+
+**Gate versus field — the division of labour.** The two jobs are different, and the
+whole idiom is keeping them apart:
+
+* a **gate** says *where* the effect may appear at all. `curv` and `cavity` are gates:
+  cheap, about the surface's own situation, and naturally read through a `smoothstep`
+  into `[0,1]`.
+* a **field** says *what kind* of noise appears there. An `sdf` is the natural one — it
+  is smooth, unbounded, and about a **named** object, so "coarse near the bead" is
+  something you can actually write.
+
+Multiplying a mask over noise is the *weakest* thing you can do with a field, because it
+only changes **visibility** — the noise underneath is identical everywhere and the eye
+reads it as a stencil. What sells non-stationarity is a change of *statistics* on a
+surface that is fully covered.
+
+| Modulate | How | Reads as |
+|---|---|---|
+| Amplitude | `t * noise(k*p)` | a stencil — weakest |
+| Grain | `mix(noise(3*p), noise(16*p), t)` | coarse ⇄ fine |
+| Detail | `noise(k*p) + t*0.30*(noise(4*k*p) - 0.5)` | plain ⇄ busy |
+| Character | `noise(k*p + t*A*dturb*(…))` | regular ⇄ churned |
+| Cell shape | `worley1(…, t)` with `t` a **step** | round ⇄ diamond ⇄ square |
+
+**Trap 1 — do not vary frequency by scaling the coordinate.** The obvious way to make
+noise finer in one place is `noise(k(p) * p)` with `k` driven by a field. It does not
+work. The local frequency of that expression is the derivative of its argument,
+
+```
+d/dp [ k(p)·p ] = k(p) + p · dk/dp
+```
+
+so the pattern's actual frequency is **not** the `k` you asked for; it depends on how far
+`p` happens to be from the *origin* (move the object and the texture changes); and
+because the extra term points along `∇k`, the noise is **sheared into streaks** in the
+direction the field varies. Crossfade two **fixed** frequencies instead —
+`mix(noise(3*p), noise(16*p), t)`. Both operands are stationary and correct, and only the
+blend moves.
+
+**Making the crossfade actually read.** Two things sink it even when the maths is right.
+
+First, a blend of two *independent* noises has **less contrast than either of them** — the
+variance of `(a+b)/2` is half the variance of `a` — so the half-way band arrives as a flat
+grey smear between two textures you can no longer see. Put the contrast stretch **after**
+the blend rather than on each band before it: `smoothstep(0.38, 0.62, mix(a, b, t))`
+re-normalises whatever the blend hands it, so the midpoint reads as an intermediate grain
+at full strength.
+
+Second, **match the ramp to the distances that actually occur** on the surface, and keep
+it short enough that both ends own real area. Measure them, don't guess: in the worked
+scene the bead hovers 0.30 m above the floor, so no floor point is nearer than 0.21 m and
+the far corners of the room are only ~0.9 m away — the whole floor lives inside a single
+2:1 span of distance. A `smoothstep(0.35, 0.85, …)` ramp therefore left almost the entire
+visible floor between `t = 0.9` and `t = 1.0`: only the fine band was ever on screen, and
+the render looked perfectly stationary even though the expression was correct.
+`smoothstep(0.26, 0.58, …)` gives pure fine grain inside a 0.18 m circle under the bead,
+pure coarse swell outside a 0.60 m one, and the crossfade in the annulus between.
+
+**Trap 2 — do not vary `octaves`.** `dturb*`'s octave count is truncated to an integer
+(`int oct = (int)octaves`), so a field-driven count does not fade an octave in: it
+**pops** on the contour where the field crosses each whole number, leaving a visible
+seam. Fade the extra octave's **amplitude** instead, centred on zero so it adds detail
+without shifting the mean:
+
+```
+noise(16*x, 16*y, 16*z) + t * 0.30 * (noise(48*x, 48*y, 48*z) - 0.5)
+```
+
+The same applies to Worley's `metric`, which is rounded to `0..2`: drive it with a
+**step**, never a ramp — a half-way value is not a half-way metric, it is one of the two
+whole ones.
+
+**Trap 3 — repeating the field is free, so repeat it.** The expression language has no
+local variables (no `let`), and a pattern cannot reference another pattern, so a field
+that gates one term and steers another has to be written out in full at every site. That
+looks expensive and is not: the loader runs a common-subexpression pass over every
+`pattern` program and every medium `density`/`ior` program, collapsing the repeats to one
+evaluation — and, for an `sdf`, **one lattice fetch** per shading point. Set
+`FTRACE_CSE_DEBUG=1` to watch it happen; on the worked example below it reports
+
+```
+[cse] pattern 2: 126 -> 71 nodes, 6 -> 1 table sample(s)
+```
+
+**Worked example: `scenes/pattern_nonstationary.ftsl`.** One `sdf` around a glowing bead
+drives three surfaces, each giving the same field a different job:
+
+```
+sdf "bead" { object "bead"  res 128  pad 1.0 }
+
+# FLOOR — no gate at all: a pure grain crossfade over the whole surface, plus a
+# faded third octave. Nothing is hidden; only the statistics change.
+pattern "grain" {
+    expr "0.10 + 0.80 * (smoothstep(0.38, 0.62,
+                             mix(noise( 4.0*x,  4.0*y,  4.0*z),
+                                 noise(22.0*x, 22.0*y, 22.0*z),
+                                 1 - smoothstep(0.26, 0.58, grid:bead(x, y, z))))
+                         + (1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))
+                           * 0.30 * (noise(60*x, 60*y, 60*z) - 0.5))"
+}
+
+# PLINTH — `cavity` gates WHERE crust may form; the field sets its grain.
+pattern "crust" {
+    expr "smoothstep(0.04, 0.34, cavity) *
+          (0.25 + 0.75 * smoothstep(0.38, 0.62,
+                             mix(noise( 4.5*x,  4.5*y,  4.5*z),
+                                 noise(30.0*x, 30.0*y, 30.0*z),
+                                 1 - smoothstep(0.26, 0.58, grid:bead(x, y, z)))))"
+}
+```
+
+The third pattern (`wear`, on a ring) is gated by `curv` and spends the field on a
+**domain warp** — nearness *squared*, so the warp stays near zero until the bead is close
+and then rises fast — turning a regular pattern into a churned one without changing its
+amplitude at all.
+
 ## Participating media / fog
 
 `medium { sigma_t <v> albedo <v> g <v> rayleigh <bool> }`, or from the CLI with
@@ -2428,7 +2963,8 @@ sphere=((0.5, 0.45, 0.5), 0.32), density_max=1.2)`.
 
 An FTSL file is a list of blocks. Top-level block types: `scene` (the
 `units …` / `spectral …` header), `material`, `texture`, `pattern` (procedural scalar
-field), `spectrum`, `sphere`, `quad`, `triangle`, `mesh`, `isosurface` (implicit SDF
+field), `spectrum`, `sphere`, `quad`, `triangle`, `mesh`, `curve` (a hair/fur/wire
+strand), `isosurface` (implicit SDF
 surface / CSG / metaballs / arbitrary `function` formulas), `light`, `group`, `medium`,
 `camera`, `camera_path` (keyframed camera animation), `camera_orbit` (turntable /
 fly-around: N frames on a circle around a `center`, for MP4 orbits), `camera_curve`
@@ -2546,7 +3082,11 @@ also declares a path, pass `-camera <name>`.
   `frames` count (uniform arc length) or a
   **density** (cameras per unit length) that can vary along the curve via `density_at`
   keyframes — this is the camera's *speed*: high density = many closely-spaced frames =
-  slow dwell, low density = fast. Aim along the travel tangent (default), at a fixed
+  slow dwell, low density = fast. `density_at`'s `t` is the normalized **arc-length**
+  position along the curve (`t=0.5` is half-way *by distance*, **not** the middle control
+  point), so a dwell stays on the beat it was measured for even when the waypoints around
+  it are unevenly spaced — which on a real flight path they always are.
+  Aim along the travel tangent (default), at a fixed
   `look_at`, or at a second `look curve`. The **travel tangent is fold-robust**: where the
   path makes a sharp horizontal U-turn its look-ahead chord loses horizontal reach and would
   otherwise rake the view steeply up into the ceiling / down at the floor, so `min_reach <f>`
@@ -2554,8 +3094,9 @@ also declares a path, pass `-camera <name>`.
   <n>` (default `0`; a Gaussian sigma in frames) temporally smooths the look direction so a
   fold reads as a bounded near-level pan instead of a flick. **Orientation and lens can also be animated**
   per frame over the normalized timeline `t ∈ [0,1]` (`t=0` first frame, `t=1` last),
-  each keyframed by `<name>_at <t> <value>` (piecewise-linear, flat-clamped at the ends,
-  just like `density_at`) or held constant by the bare keyword: **`roll[_at]`** banks the
+  each keyframed by `<name>_at <t> <value>` (piecewise-linear and flat-clamped at the ends,
+  like `density_at` — but note these tracks run on the **frame** timeline `i/N`, not on
+  `density_at`'s arc length) or held constant by the bare keyword: **`roll[_at]`** banks the
   camera about its view axis (the third orientation degree of freedom), and
   **`fov_at` / `zoom_at` / `fstop_at` / `focus_at`** animate the vertical field of view,
   focal-length multiplier, f-number, and focus distance. (`fstop`/`focus` change depth of
@@ -2609,6 +3150,53 @@ in the `-raster` preview, so preview and final agree):
   `exposure_lock` is a no-op there. The global `-exposure-lock` CLI flag instead locks
   *all* rendered cameras to one anchor (metered from the first frame), overriding
   per-path selectors.
+
+  **Both are process-local.** A scene `exposure_lock` and `-exposure-lock` can only
+  share an anchor between frames rendered by the *same* `ftrace` invocation — they hold
+  the anchor in memory and it dies with the process. A sequence rendered **one frame per
+  invocation** (loom's `render_range`, a batch loop, or a single frame re-rendered
+  later) therefore still meters every frame independently, and can still flicker. For
+  that case use **`-exposure-anchor <value|file>`**, which carries the anchor across
+  processes: given a *number* it locks to it outright; given a *path*, the first run
+  meters, writes its anchor there, and every later run pointed at the same file loads
+  and reuses it. It implies `-exposure-lock`.
+
+  **Why per-frame metering can jump at all.** The auto-exposure anchors on a single
+  fixed-rank order statistic — the 99th percentile of per-pixel `max(r,g,b)` — and that
+  statistic solves `area(L) = 1%` for the level `L`. On a scene with a bright, compact
+  specular population the density up there is very thin (measured on `pastel_jack_ring`:
+  ~**0.25% of frame per octave** above p95), so the inversion is ill-conditioned —
+  roughly **5 octaves of level per 1% of area**. A rotating highlight changes that area
+  by a few hundredths of a point, and the anchor moves a third of an octave even though
+  nothing about the picture's brightness did. Measured over that flyby (432 frames,
+  static camera, rotating gold ring): the worst single-frame step was **36.2% in the
+  anchor** while the static background moved **2.2%**, p95 **0.7%**, the median **0.6%**
+  and the whole-frame log-average **1.0%**. A shared anchor removes the jump (worst
+  full-frame step after repair: **0.8%**).
+
+  **A shared anchor is the fix, not a workaround.** Nine studies measured six replacement families — other ranks, rank-band
+  blends, a `min(p99, C·p95)` clamp, power means, energy quantiles, and the Reinhard
+  log-average key — against *stability* on the sequence and *fidelity* to today's exposure
+  across 186 ordinary renders. None satisfies both, and not by a tuning margin: the stable
+  candidates land **1.5–7.7 stops** adrift. The reason is structural — where p99
+  misbehaves its value is genuinely arbitrary, so there is nothing to be faithful to. Nor
+  can the bad case be *detected* and specially handled: by local density at the anchor,
+  `pastel_jack_ring` is denser than a quarter of ordinary renders. A single frame contains
+  no evidence distinguishing "the highlight rotated" from "the scene got brighter"; that
+  information exists only across frames, which is exactly what a shared anchor uses. The
+  residual caveat is narrow: a **single still** is still metered by p99 and can anchor on
+  an atypical glint, with no neighbour to reveal it — use `-ev` or `-exposure-anchor
+  <value>` if it does. See `known-issues.md` for the full measurements.
+
+  **Repairing an already-rendered sequence.** If the frames were rendered with
+  `-checkpoint`, no re-render is needed: each `<frame>.png.ftbuf` still holds the raw
+  linear film, so `ftrace -topng <ftbuf> <png> -exposure-anchor <value>` re-develops it
+  at a shared gain in milliseconds. loom's `loom.stabilize_exposure(pngs)` automates
+  exactly that — it develops each checkpoint once to read back the anchor it *would*
+  have chosen, takes the **median** across the sequence (not the first frame, which on
+  `pastel_jack_ring` sat at the 93rd percentile — a full stop off), then re-develops
+  every frame at that median. `render_range(..., stabilize=True)` (the default) runs it
+  automatically after the last frame.
 
 ### Multi-camera shared photon pass (modes `A`, `B`, and `M`)
 
@@ -2844,7 +3432,7 @@ add-on), this doubles as a Blender → FTSL path.
 | `-n <photons>` | Trace exactly this many photons/samples |
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension). Missing parent directories are created before the render starts (reported as `[out] created output directory …`), so a render aimed at a fresh `png/<series>/` subdir can't be traced to completion and then lost at write time. Mode `V` produces a *pair* of images (the two independent estimates it cross-checks) and writes them as `<out>_forward` / `<out>_backward` beside the given path |
-| `-topng <in> <out.png> [-ev <c>]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker. See **Output** |
+| `-topng <in> <out.png> [-ev <c>] [-exposure-anchor <v\|file>]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker, `-exposure-anchor` develops it at a **shared** gain so a whole sequence of checkpoints can be re-developed flicker-free. See **Output** |
 | `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |
 | `-mode <A..D,M,S,U,P,R,V>` | Render mode (default `B`) |
@@ -2917,12 +3505,13 @@ alone can't restore, so they are not disk-resumable.
 | `-noise <pct>` | Render until the noise floor drops below `pct` % |
 | `-forever` | Refine indefinitely (Ctrl-C stops gracefully) |
 | `-preview` | Live ANSI thumbnail while rendering |
-| `-window` | Open a real OS window (Win32; no-op off Windows) showing the actual tone-mapped pixels, refreshed every `-window-interval` (default 0.2 s, independent of the `-interval` disk-write cadence — so the image builds up on screen while it renders rather than appearing only when it's finished). The image is **presented by Direct3D 11** (a flip-model swap chain; the control strip below it stays GDI), which is what keeps a fast renderer fast: the previous CPU present — a per-pixel RGB→BGRA repack plus a `HALFTONE` `StretchDIBits` — cost **9 ms/frame** at 1920², more than the render it was displaying, and charged it to the render thread; it is now **~1.3 ms**. In the GPU-rasterized interactive explorer (`-raster -explore -device gpu`) the frame skips host memory **entirely**: CUDA is handed the window's own D3D11 texture and the tone-map kernel writes the finished pixels straight into it, so there is no device→host download, no re-upload, and no host touch of the image at all (measured at 3840²: **26.1 ms → 9.7 ms** per displayed frame). ftrace prints one line saying which way it's presenting; the copy path is used automatically whenever the fast one can't be (notably when D3D picks a different adapter than the CUDA device, as on hybrid iGPU/dGPU laptops, or when a flypath overlay has to be drawn into the pixels). `FTRACE_LIVE_GDI=1` forces the old GDI path (and ftrace falls back to it automatically if D3D can't start). The window is put on screen **before the render starts** — as soon as the scene has loaded and the frame size is known — showing a near-black placeholder with the current stage in the title bar (`preparing…`, `mode W — starting…`), then the first rendered chunk replaces it. Previously it was created lazily by the first repaint, so in the ray-traced modes no window existed until the render was already over and the finished image appeared to flash up for a split second as the process exited. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>`, then the transport mode driving that frame (`mode B (pinhole)`, `mode D (BDPT)`, `mode M (photon map)`, …; a per-camera flight shows the mode of the frame currently on screen), then the live status (`spp` / `% noise` or photon count) as it converges, so you can tell at a glance which scene/file the window is showing, how it's being rendered, and how far along it is. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
+| `-window` | Open a real OS window (Win32; no-op off Windows) showing the actual tone-mapped pixels, refreshed every `-window-interval` (default 0.2 s, independent of the `-interval` disk-write cadence — so the image builds up on screen while it renders rather than appearing only when it's finished). The image is **presented by Direct3D 11** (a flip-model swap chain; the control strip below it stays GDI), which is what keeps a fast renderer fast: the previous CPU present — a per-pixel RGB→BGRA repack plus a `HALFTONE` `StretchDIBits` — cost **9 ms/frame** at 1920², more than the render it was displaying, and charged it to the render thread; it is now **~1.3 ms**. In the GPU-rasterized interactive explorer (`-raster -explore -device gpu`) the frame skips host memory **entirely**: CUDA is handed the window's own D3D11 texture and the tone-map kernel writes the finished pixels straight into it, so there is no device→host download, no re-upload, and no host touch of the image at all (measured at 3840²: **26.1 ms → 9.7 ms** per displayed frame). ftrace prints one line saying which way it's presenting; the copy path is used automatically whenever the fast one can't be (notably when D3D picks a different adapter than the CUDA device, as on hybrid iGPU/dGPU laptops, or when a flypath overlay has to be drawn into the pixels). `FTRACE_LIVE_GDI=1` forces the old GDI path (and ftrace falls back to it automatically if D3D can't start). The window is put on screen **before the render starts** — as soon as the scene has loaded and the frame size is known — showing a near-black placeholder with the current stage in the title bar (`preparing…`, `mode W — starting…`), then the first rendered chunk replaces it. Previously it was created lazily by the first repaint, so in the ray-traced modes no window existed until the render was already over and the finished image appeared to flash up for a split second as the process exited. Full-resolution, unlike `-preview`'s terminal thumbnail; runs on its own UI thread. A plain fixed-`-n` forward render is auto-chunked so the view converges live, and closing the window stops the render (final image is still written). The title bar identifies the render as `ftrace — <scene> → <output>`, then the transport mode driving that frame (`mode B (pinhole)`, `mode D (BDPT)`, `mode M (photon map)`, …; a per-camera flight shows the mode of the frame currently on screen), then the live status (`spp` / `% noise` or photon count) as it converges, and finally the **compute backend** actually in use — `GPU (NVIDIA GeForce RTX 4090)` (the real device name, so a multi-GPU box says *which* one) or `CPU (12 threads)` — so you can tell at a glance which scene/file the window is showing, how it's being rendered, how far along it is, and what's doing the work. The backend is reported from where the device is *resolved*, not from what `-device` asked for, so a `-device gpu` that fell back (no CUDA build, no free VRAM, an unsupported feature) reads `CPU` and says so; in the interactive explorer, where the raster preview and a `mode W` refinement run on the CPU while a path-trace refinement runs on the GPU, the label follows whichever pass produced the frame on screen. The window opens at (and won't be dragged smaller than) a readable minimum so that `<scene> → <output>` title stays legible even for a small image; the picture is aspect-fit and letterboxed inside whatever size the window is. |
 | `-keepwindow` / `-hold` | Like `-window`, but **don't auto-close** the live window when the render finishes — normally the window is torn down at process exit the instant the last frame completes, so a finished image only flashes on screen. With this set, ftrace keeps the final image up and blocks until you close the window yourself (handy for inspecting a quick `-raster` preview or a completed still). Implies `-window`. |
 | `-interval <s>` | Periodic image write / status line / ANSI `-preview` refresh (default 15 s). This is the **crash-safety** cadence — how often the PNG and the `.ftbuf` checkpoint are rewritten — and is deliberately *not* what drives the live window (see `-window-interval`). |
 | `-window-interval <s>` | How often the `-window` live view repaints (default 0.2 s), independent of `-interval`. The two used to share one timer, which meant any render finishing inside one interval never showed a single live frame — a 5 s `-mode W` frame under `-interval 8` painted once, as the process was exiting, so the finished image just flashed and vanished. They are separate now because they want opposite cadences: rewriting a PNG and a multi-megabyte checkpoint five times a second is pointless disk churn, while repainting a window every 15 s defeats the point of having one. Repaint granularity is bounded below by the renderer's own chunk size (one chunk ≈ 0.15 s of GPU work, minimum 1 spp), so on a 480² `-mode W -spp 8` frame you get one repaint per spp — the first complete image lands after ~0.6 s instead of after 5 s. Measured cost of the extra repaints there: **+3.9 %** of render time (a repaint tone-maps and presents the whole frame, ~25 ms at 480²). The floor is adaptive — never less than the larger of this value and 12× what the last repaint actually cost — so a 4K film backs itself off instead of spending all its time painting. `0` means "every chunk, subject only to that budget". `FTRACE_WINDOW_DEBUG=1` logs each repaint and its cost. |
 | `-raster` | Fast solid-shaded **preview** (no light transport): z-buffer the whole scene as flat-shaded triangles, one image per selected camera. Honours `-camera` and `-window` (a `camera_curve` flyby animates in the window; a single still becomes an **interactive fly camera** — Space/`+` fly forward, Shift/`-` back, move the mouse off-centre to steer (rate/joystick look, cursor stays visible), wheel = dolly, Ctrl+wheel = step size, `C` = wall collision, `0` resets, `P` prints a paste-ready camera, plus **Clip/Reset buttons** in a panel below the image). See the preview note under **Render modes**, and `-explore` below to drop straight into this viewer at a flyby's first frame. |
 | `-raster-iso <n>` | Isosurface mesh fineness for `-raster` (cells along the longest bounds axis; default 96, `0` skips implicits) |
+| `-raster-curve-budget <n>` | Cap on the preview triangles spent tessellating **curve / fur strands** (default `12000000`, ~3.8 GB of preview geometry). Past it the round-cone tubes coarsen (10-sided capped → 6/4/3-sided → capless → flat ribbon), and only if the cheapest tube still busts the budget are whole **strands** thinned out. A groomed pelt is millions of segments, so without this a `-raster`/`-explore` on one would allocate tens of GB and appear to hang. Preview-only — the ray-traced modes intersect the analytic strands and ignore it. |
 | `-raster-bench <n>` | Raster **frame-rate benchmark**: after the scene is built (and uploaded, on the GPU), re-render the first selected camera `n` times and report steady-state **ms/frame** (min/median/mean + fps) — the interactive explorer's per-move cost, measured independently of startup. With `-device gpu` also prints a per-pass breakdown (clearvis/project/raster/shade/clear/expose+encode/download, timed with CUDA events on the GPU timeline). Add `-window` and it also reports the **live-window present tail** — what handing each finished frame to the preview costs the render thread — because that tail used to be larger than the render itself and a backend speedup is only real if it stays small. With `-device gpu -window` it then runs a **second, zero-copy phase**: the same `n` frames rendered directly into the window's D3D11 texture, reported as one combined `render+present` figure (there is no separate tail to report — there is no handoff) plus its own per-pass breakdown, so the two presentation paths can be compared pass by pass on one run. Note that the zero-copy *median* pins at the display refresh (16.67 ms / 60.0 fps) because presenting blocks on vblank once both back buffers are queued — read **min** for the true pipeline cost. Writes the last frame to `-o` so backends/builds can be byte-compared. |
 | `-see-through` / `-seethrough` / `-glass` | In `-raster`, render **clear** materials (dielectric / thin-film / filter / diffuse-transmit) as actually see-through instead of solid ghosts: each clear surface between the camera and the opaque background **dims** and **milkily hazes** what's behind it, cumulative with the number of clear surfaces crossed (no refraction, no coloured absorption). Order-independent, so overlapping glass needs no sort. See the preview note under **Render modes**. |
 | `-glass-clarity <0..1>` | Per-surface transmittance for `-see-through` (default `0.85`; higher = clearer / less dimming). Passing it implies `-see-through`. |
@@ -2931,9 +3520,14 @@ alone can't restore, so they are not disk-resumable.
 | `-noclip` / `-nocollide` | Start the interactive fly-viewer with **wall collision off** (fly through geometry) — for placing a camera *outside* the room or *inside* glass. Collision is **on by default** (you can't fly through walls); press `C` in the viewer to cycle `slide` → `stop` → `noclip` live. See the fly-camera controls under **Interactive fly camera**. |
 | `-anim <file.json>` | Edit a **loom `CurveDrive` sidecar** in the interactive fly editor (implies `-explore`). The editor's control points become the drive's N-dimensional points: channels 0–2 are the point you see and move in 3-D, channels 3+ are non-spatial values carried along per point. **Save** writes the reshaped curve back to the sidecar atomically, preserving the drive's name/mode/dims and every channel → scene-variable **binding**. A sidecar that doesn't exist yet is created on the first Save (from whatever control points the scene seeded), so this is also how you start a drive. See **Editing a loom animation drive** under **Interactive fly camera**. |
 | `-loom <scene.py>` | Keep a **live loom process** alongside the window so the scene can be *re-derived*, not merely re-viewed. With `-anim` it turns the fly editor into a real animation editor: scrubbing asks loom for the scene as of that point on the drive, so the **bound scene variables** move in the viewport (loom does the curve sampling, so the preview can't drift from the final render), and the panel grows a **loom bind row** for editing channel → variable bindings and the channel count live. With `-viewer` it drives the loom sidecar viewer's **Live (loom)** panel instead (one control per `build()` parameter, plus the sweep axis). See **Editing a loom animation drive** and **Live re-derivation**. |
+| `-viewer <sidecar.json>` | Open the **loom native viewer** on a scene-introspection sidecar (written by `loom.viewer.ViewerModel.save_sidecar`) instead of rendering — a Dear ImGui / Direct3D 11 window with the object list, dataset table, N-D curve pane, strip charts, modulator-DAG graph, Fields / Meshes tabs and (when the sidecar carries a `source` key) a Render tab that raymarches the real field in-process. Add `-loom <scene.py>` to make it **live**. See **Native viewer** in the README. |
+| `-play` | With `-viewer`: open with the clock **already playing**, so a loop can be watched — or its per-frame cost read off the `[play]` breakdown printed to stdout — without clicking into the window. Ignored (with a printed reason) when there is no live loom channel or the sidecar advertises `frames = 1`. |
+| `-prebake` | With `-viewer`: walk the clock **once** on open and keep every frame's adopted state in memory, then play out of that cache on a wall clock at the panel's `fps` rather than at loom's bake rate. Costs ~0.01 ms a frame to show, so the requested rate is actually delivered, and it makes scrubbing the frame slider instant too. The cache is dropped whenever a build parameter or `frames` changes — a cache built at other values is not a cache of what you are looking at. Same thing as the panel's **prebake** button; the flag exists so a played frame rate can be measured from a script. |
+| `-prebake-cap <MB>` | Memory budget for `-prebake` (default `1024`, also settable live as the panel's **cap MB**). A walk that reaches the cap stops there and says where: the **prefix** it did fill still plays from memory and the remaining frames fall back to bake-paced play, so a long clock degrades instead of failing. |
 | `-resume` / `-checkpoint` | Resume from / always write a `<out>.ftbuf` checkpoint (modes `A`/`B`/`C`, `R`/`D`, and `P`) |
 | `-stop [<pid>\|all]` | **Stop a running render cleanly, from another shell.** `ftrace -stop <pid>` asks that render to do exactly what Ctrl-C does — finish the current chunk, write the final image **and** `.ftbuf` checkpoint, release the CUDA context through the graceful-shutdown path — then waits (up to 120 s) for it to actually exit, so it's safe to script a rebuild right after. `-stop all` targets every running render; a bare `-stop` just **lists** them (pid + scene → output). This exists because a render launched detached has no console to Ctrl-C into, and **force-killing ftrace mid-CUDA is a known way to wedge the NVIDIA driver into a TDR/bugcheck** — so never `taskkill /F` a render, use this. It also releases a window being held open by `-keepwindow`. Implemented as a sentinel file under `<temp>/ftrace/` (a `<pid>.run` entry per live render, a `<pid>.stop` to signal it), which — unlike a named kernel event — crosses the session / window-station boundary between a detached render and the shell signalling it. A stop that arrives while the process is still **loading the scene** aborts the load rather than being waited out: it prints `[stop] scene load stopped before rendering — nothing was rendered or written.` and exits **1** (no scene was built, so nothing could be rendered — the non-zero exit is the correct outcome, not an error in your `.ftsl`). |
-| `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`) |
+| `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`). **Process-local** — it can only share an anchor between frames rendered by *this* invocation; for a frame-per-invocation sequence use `-exposure-anchor` |
+| `-exposure-anchor <v\|file>` | **Share one auto-exposure anchor across separate `ftrace` invocations** — the missing piece for a sequence whose frames are each rendered by their own process (loom's `render_range`, a batch script, a re-render of one frame). Implies `-exposure-lock`. With a **number** the anchor is used directly (no metering). With a **path**: if the file exists and holds a number that anchor is loaded and reused; otherwise this run meters normally and **writes** its resolved anchor there, so every later frame pointed at the same file develops at the identical gain. Also accepted by **`-topng`**, which is how a *finished* sequence is repaired from its `.ftbuf` checkpoints with no re-render (see **Output**). Without it, per-frame metering can jump — the p99 anchor solves `area(L) = 1%` for a level, and on a scene with a bright compact highlight population the tail density is so thin (~0.25% of frame per octave) that the inversion is ill-conditioned, so a rotating highlight swings the anchor by a third of an octave (measured on `pastel_jack_ring`: 36% single-frame anchor step while every honest brightness measure moved ≤ 2.3%). This is not fixable in the statistic — see the `exposure_lock` notes and `known-issues.md` |
 | `-hdr` | Also write a **32-bit float PFM** beside `-o` (`<out>.pfm`) holding the **scene-linear** image — the exact buffer the tone map consumes, with no exposure, no gamma and **no clamp**. Written on every periodic in-progress write too, so a still-converging render can be metered. Use it whenever you intend to *measure* rather than look: an 8-bit PNG clamps at white, and a caustic is by definition the brightest thing in frame, so its core prints as `#FFFFFF` with all three channels **equal** — the tone map destroys the caustic's colour and its peak-to-screen ratio before any analysis can see them. (Values are radiance in the film's own scale; peak/median ratios and chromaticity are exposure-invariant, so two renders shot at different stops stay comparable.) PFM is a 3-line ASCII header + raw little-endian `float32` RGB triples, raster order left-to-right **bottom-to-top**. |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
 | `-stereo <mode>` | **3-D stereoscopic output** (stills *and* movies). Renders each camera **twice** — a Left/Right eye pair — and composites them into the `-o` image. `mode` picks the fusion: `sbs` (side-by-side **wall-eyed**, L\|R), `cross` (side-by-side **cross-eyed**, R\|L), `anaglyph` (**red-cyan** Dubois glasses, the default kind), or `anaglyph-gm` (**green-magenta** Dubois). Uses the correct **off-axis** rig — two *parallel* cameras offset along the camera right axis with **asymmetric (sheared) frusta** sharing a convergence plane, so there's **no vertical parallax** (toe-in's eye-strain cause). Both eyes share one auto-exposure anchor, so L/R — and every frame of an exposure-locked `camera_path` — tone-map identically. Rectilinear cameras only (a fisheye camera renders mono, with a warning). See **Stereoscopic 3-D** below. |
@@ -2944,11 +3538,25 @@ alone can't restore, so they are not disk-resumable.
 | `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checkimplicit`,
-`-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`, `-checkthinfilm`,
+`-checkcurve`, `-checkfur`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
+`-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
-`-checkgrid`, `-checkscatter`, `-checksun`, `-checkbind`, `-checkprop`,
+`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`, `-checkcurv`,
+`-checkcavity`, `-checksdf`, `-checksun`,
+`-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
-`PASS`/`FAIL`. `-checkcontainer` guards the isosurface container clip: rotating an
+`PASS`/`FAIL`. `-checkcurve` guards the `curve` primitive: it cross-checks the
+round-cone intersector against the exact analytic SDF, the degenerate
+one-sphere-swallows-the-other case against the analytic ray–sphere test, `anyHit`
+against the full path (with half the origins *inside* the fiber), watertightness at
+chain joints, the four bases' flattening, and the **fp32 conditioning** of the quadric at
+fiber scale (the same code instantiated at `float`, as the CUDA megakernel runs it) —
+see **Curves and fibers** above. `-checkfur` guards the `fur` generator on top of that,
+in seven sections: roots on the surface, area-uniform root distribution, determinism
+across seeds, growth never pointing into the skin, clumping that collapses tips without
+moving roots, a well-formed segment chain, and a regression on the loader-ordering trap
+that once made a whole groom generate zero strands silently — see **Grooms** above.
+`-checkcontainer` guards the isosurface container clip: rotating an
 isosurface must not change what a ray sees, so it builds the same solid twice
 (axis-aligned and rigidly rotated) and checks that correspondingly rotated rays
 return identical hit distances. `-checklattice` guards **mode W**'s deterministic
@@ -2996,6 +3604,22 @@ ftrace -topng out.png.ftbuf out_bright.png -ev 3
 `-ev` applies only to a `.ftbuf` (which still holds linear film); on a `.ppm` input it
 warns and is ignored, since that file is already 8-bit sRGB. *(Before 0.102.1 `-ev` was
 silently dropped on this path — `-topng` runs before the main argument loop.)*
+
+A trailing **`-exposure-anchor <value|file>`** instead replaces the per-image p99
+auto-exposure with a **shared** anchor, which is how a finished *sequence* is repaired
+without re-rendering a single photon: develop every frame's checkpoint at one gain and
+the frame-to-frame brightness flicker of independent metering disappears.
+
+```
+ftrace -topng frame000.png.ftbuf frame000.png -exposure-anchor anchor.txt   # meters, saves
+ftrace -topng frame001.png.ftbuf frame001.png -exposure-anchor anchor.txt   # loads, reuses
+```
+
+Like the render-side flag, a bare number is used as-is and a path is
+load-if-present / meter-and-save otherwise. `-exposure-anchor` also applies only to a
+`.ftbuf`. See **`exposure_lock`** under **Cameras** for why per-frame metering jumps and
+for loom's `stabilize_exposure()`, which drives this automatically over a whole
+directory of checkpoints.
 
 ### Denoising (`-denoise`)
 

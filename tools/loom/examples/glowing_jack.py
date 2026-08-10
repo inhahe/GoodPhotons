@@ -153,12 +153,13 @@ def main() -> int:
         return 0
 
     from loom import render_range
-    from loom.drive import assemble_gif_ffmpeg, assemble_mp4, default_outdir
+    from loom.drive import assemble_gif_gifski, assemble_mp4, default_outdir
     pngs = render_range(scene, jj.FRAMES, name="glowing_jack", fps=jj.FPS, n=1,
                         interval=8.0, skip_existing=True, extra_args=jj.WHITTED)
     out = default_outdir("glowing_jack")
     assemble_mp4(pngs, out / "glowing_jack.mp4", fps=jj.FPS)
-    assemble_gif_ffmpeg(pngs[::jj.GIF_STRIDE], out / "glowing_jack.gif", fps=jj.GIF_FPS)
+    assemble_gif_gifski(pngs[::jj.GIF_STRIDE], out / "glowing_jack.gif", fps=jj.GIF_FPS,
+                        width=jj.GIF_WIDTH, quality=jj.GIF_QUALITY)
     return 0
 
 

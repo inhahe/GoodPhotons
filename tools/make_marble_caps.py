@@ -88,7 +88,20 @@ CAPS = [
     # #2 carries a near-black grey field beside its gold; at full contrast it bottoms out at
     # 0.006 linear (sRGB 19), which reads as a HOLE in the tabletop rather than dark stone.
     # k=0.75 lifts the floor without touching the veins.
-    ('marble_chrome',  'marble texture 2.jpg',    'stand_chrome_cap',   None,           0.75, 1.00),
+    #
+    # #2 IS ALSO THE ONE SHEET CUT INTO TWO SLABS, because the gallery grew an eleventh cap
+    # (the fur creature) and there are only ten source drops. Reusing a sheet whole would put
+    # the same stone on two tabletops, which is the one thing this set exists not to do — so
+    # the sheet is quarried instead: it is 1200x2141, the tallest in the set, and chrome takes
+    # the top 52% while the creature takes the bottom 48%. The two crops share no pixel, so
+    # they are two slabs off one block, which is what a real gallery's matched tabletops are.
+    # Chrome's cap is 105x21 px in the still, so losing half its sheet costs nothing visible.
+    ('marble_chrome',  'marble texture 2.jpg',    'stand_chrome_cap',  (0, 0, 1, 0.52),  0.75, 1.00),
+    # The creature is opaque fur — zero caustic, so the stone is free. It gets a touch more
+    # compression than chrome (0.70 vs 0.75) for a reason chrome does not have: it is the only
+    # cap with a DARK BROWN subject standing on it, and #2's near-black field would swallow the
+    # paws. k=0.70 lifts the floor far enough for the feet to read against it.
+    ('marble_creature', 'marble texture 2.jpg',   'stand_creature_cap', (0, 0.52, 1, 1),  0.70, 1.00),
     # `marble texture 3.5.avif` is a WATERMARKED VectorStock preview: a black footer bar with
     # the agency name and stock id runs across the bottom ~9 % (it is why that file measured
     # p5 = 0.000 while every other sheet floors around 0.45).  The stone above the bar is

@@ -1,5 +1,44 @@
 # Loom — TODO
 
+## Emit ftrace's native `curve` fiber primitive
+
+**✅ DONE.** ftrace 0.150 added `curve { }` (FTSL §8.6) — control points + a radius,
+flattened at load into a watertight chain of round cones — and 0.151 put it on the GPU.
+Loom now emits it directly as a **`Strand`** element (`loom/scene.py`), with `strand()`
+and `hair()` factories and the control-point maths in `loom/strands.py`. That retires two
+workarounds for the missing primitive: `tube()` tessellated a circle into a per-frame OBJ,
+and `Beads` approximated a curve with a string of spheres (its own docstring called itself
+"the simplest way to render a 3-D closed curve before the sweep engine exists"). Both
+remain — `SweptMesh` is still the right answer for a non-circular profile, a twist, or
+when the triangles are the product — but a round fiber is now the renderer's job.
+
+The load-bearing decision is the **basis**, and it is core principle 4 again. An open
+spine emits `catmull_rom`, which interpolates, so the strand passes exactly through the
+sampled spine. A closed spine **cannot** use Catmull-Rom: `curve.h` builds an end span's
+missing neighbour by clamping (`at(i) = pts[clamp(i)]`), so the seam span's tangent comes
+from a duplicated phantom and the loop is C1-broken at exactly one place. So a closed
+spine emits a **periodic uniform cubic B-spline** — control points wrapped by 3, giving
+exactly N spans, never touching the clamp, C2 *through* the seam. Because a B-spline only
+approximates, the control points are **solved** for (a cyclic tridiagonal system, by
+Sherman–Morrison) rather than copied, so the loop is seamless *and* on the spine instead
+of one or the other. Tests re-implement `curve.h`'s span evaluators and check the round
+trip, with a deliberate control that the naive wrapped Catmull-Rom does kink
+(`tests/test_strand.py`); the design record is `DESIGN.md` §7a′.
+
+Also: `Strand._check_seam` warns once per element when a closed fiber's radius doesn't
+close (`radius_tip != radius`, or a non-periodic `radius_profile`), mirroring
+`SweptMesh._check_turns` — warn, never snap. And `eval_curve` now **clamps** an open path
+instead of wrapping it, so an open strand can sample its endpoint and reach its tip.
+Example: `examples/strand_loop.py`.
+
+The native viewer keeps up (ftrace 0.153.0): the sidecar gains a `strand` record (spine
+points + per-sample radii + `closed`/`basis`) and `viewer_gui.cpp`'s `strandToMesh` tubes
+it for the **Meshes** tab along a rotation-minimising frame, spreading a closed fiber's
+frame holonomy evenly round the loop so the preview tube closes without a sheared band at
+the seam. That tube is preview-only — the renderer still traces the analytic cone chain.
+
+---
+
 ## Per-object Transform (size / position / rotation / x·y·z skew), signal-modulatable
 
 **✅ DONE (Phases A + B).** Loom now has a general `Transform` (`loom/transform.py`)
