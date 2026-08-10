@@ -2549,7 +2549,9 @@ same sphere reads `+1/R` from outside and `−1/R` from within. What each geomet
 
 Two things to get right. First, **the mesh must carry vertex normals** — generate one
 with `tools/make_mesh.py --smooth`, or the whole material collapses to a flat colour.
-Second, **curvature is 1/length, so an instance's scale changes it**: `scale 0.5` doubles
+(The loader warns about exactly this: if every primitive using a curv-reading material
+reports 0, it says so by name at load rather than letting you render a flat image and
+wonder why.) Second, **curvature is 1/length, so an instance's scale changes it**: `scale 0.5` doubles
 what the shader sees. Thresholds cut against the authored mesh will be wrong once it is
 placed, which is the easiest way to end up with a flat-looking result — measure the
 actual range rather than guessing.

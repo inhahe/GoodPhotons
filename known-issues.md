@@ -28,9 +28,15 @@ difference uses, and the result needs the same shaded-side negation every other
 primitive applies.
 
 Until then the honest 0 is the right behaviour — it is documented in `REFERENCE.md`'s
-per-geometry table and in the `HitRecord::curv` comment — but a **load-time warning**
-when a curv-reading pattern lands on an isosurface would be cheap and is probably worth
-doing before the real fix.
+per-geometry table and in the `HitRecord::curv` comment.
+
+**Mitigated (v0.161.1):** `Builder::warnCurvOnFlatGeometry` now warns at load when a
+curv-reading material's geometry can only ever report 0 — covering the isosurface case
+along with the more common flat-shaded-mesh one. It is deliberately conservative (it
+warns only when *every* primitive using the material is a zero-curvature one, so a
+material shared with a smooth mesh stays quiet) and it costs nothing on a scene that
+does not read `curv`. That turns a silent flat render into a named diagnostic, but it
+is a *diagnostic*, not the fix — the Hessian work above is still open.
 
 ### OPEN (2026-08-09, v0.161.0): `curv` reads 0 in the PREVIEW rasterizer, so `-explore` misrepresents a curvature-driven material
 
