@@ -687,6 +687,26 @@ anything expensive**, even though it's built later.
 
 - [ ] **Level 1 — the knobs.** design.md already guessed at these ("menace is probably a knob, not a
       layer"); this is where that gets cashed out. Randomise them during P2/P3 training.
+      - **Establish which kind of grounding each knob needs before building it** — see design.md
+        §"How a knob acquires meaning". Speed/heading/height/gaze are grounded by a *measurement*
+        (the reward is the definition, and P1 proved it works with no prior at all); affect words
+        are grounded only by *examples* through AMP's discriminator; gait is grounded by neither
+        and is therefore not a knob. Mixing these up is how a channel gets built that cannot be
+        trained.
+      - **Decompose affect into measured channels first, and hand the discriminator only the
+        residue.** Ear carriage is a joint angle, body height is measurable, fore/aft weight
+        distribution falls out of contact forces, gaze is a target, piloerection is a fur knob.
+        What is left needing examples is motion *quality* (jerk, tail-whip sharpness,
+        co-contraction). Worth the effort because measured channels are dimensionless and survive
+        P4's morph transfer, while a dog-clip discriminator does not.
+- [ ] **Guard against the label confound in the AMP data** *(added 2026-08-09)*. "Randomise
+      conditioning inputs jointly" is free for measured channels and is *not* free for
+      example-grounded ones: if every clip labelled angry is also fast, the discriminator cannot
+      separate them and the anger knob becomes a second speed knob. Mocap of an angry-but-slow dog
+      may not exist. Label along the factored channels rather than with one word, hold out a
+      combination and test it explicitly, and check the discriminator cannot predict speed from an
+      affect clip's residual. This is the failure that passes a single-knob demo and fails in
+      combination — and unlike a tracking error there is no table that reports it.
 - [ ] **Level 2 — latent skill space.** This is **ASE** (Peng et al. 2022), the direct successor to
       the AMP already chosen in P2 — so the plan is already pointed at it and this is a smaller step
       than it looks. Gives continuous blending between manners and is the natural drive target for

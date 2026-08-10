@@ -711,6 +711,63 @@ question is its per-step or per-frame cost against the loop it sits in.
   fast, differentiable-enough forward model. A learned dynamics model would be a lossy copy of
   something we own outright.
 
+### How a knob acquires meaning — measurement, examples, or neither
+
+*(added 2026-08-09, from the question "the policy starts knowing nothing about the animal, so how
+does it know what to map to 'run', 'be angry', 'lift your back right foot'?" The three examples
+turn out to use three different mechanisms, and knowing which one a proposed knob needs is the
+first thing to establish about it.)*
+
+A conditioning channel is meaningless at initialisation. It acquires meaning exactly two ways —
+**a measurement, or a set of examples** — and there is no third. Most of the design's job is
+arranging for as many channels as possible to be the first kind.
+
+**Grounded by measurement.** The reward *is* the definition. "Run at 0.5 Froude" means nothing to
+the net at init; it means something because `r_speed = exp(−(v − cmd)²/tol²)` pays only when the
+measured velocity matches the number in the channel. The channel and the measurement are two
+halves of one statement, and no anatomical prior is involved. P1 is the existence proof: at 1.1 M
+steps the command channel was decorative and the animal stood still; by 3.4 M it tracked all 64
+command rows to within 0.04 Froude. Speed, heading, body height, gaze target and part goals are
+all this kind. Note there is no naming problem here and no language layer — "back right foot" is
+an index into the rig, the goal is `(part index, target)` in the observation, and the policy
+learns "when channel *k* carries a target, moving body-*k* there is what pays".
+
+**Grounded by examples.** "Angry" has no sensor, so the reward cannot be written. You do not
+define it; you point at clips of it and let AMP's discriminator learn "did this motion come from
+that set?". The knob is the *label attached to the clip set*, and the definition is extensional
+rather than intensional — the human labels examples and never writes a specification. This is
+precisely why P2 chose AMP over DeepMimic: DeepMimic imitates a specific phase-aligned trajectory,
+AMP imitates a *manner* from unaligned clips. ASE (P10 level 2) then replaces N discrete labels
+with a latent space in which the labels are anchors.
+
+**Neither — delete the knob.** The preferred outcome where it is available, and the first bullet
+of this section is the worked example: there is no gait channel, because speed plus an energy
+penalty puts walk/trot/gallop at the right speeds by itself. The mapping problem for a gait knob
+is not solved, it is deleted. Level 0 intents ("flee", "go there") are the same shape — a planner
+*above* the policy that emits speed and heading, so they ground out in measurement transitively.
+
+Three consequences worth acting on:
+
+- **Decompose an affect knob into measured channels before handing the remainder to a
+  discriminator.** Quadruped affect is posture and tension (see "Textures"/P10): ear carriage is a
+  joint angle, body height is measurable, fore/aft weight distribution falls out of contact forces,
+  gaze is a target, piloerection is a fur-groom knob. All measurable. The residue that genuinely
+  needs examples is motion *quality* — jerk, tail-whip sharpness, co-contraction — and it is
+  smaller than "angry" makes it sound. This is not tidiness: a measured channel is dimensionless
+  and transfers across morphs, whereas a discriminator trained on dog clips is tied to dog-shaped
+  bodies, so every channel moved from examples to measurement is a P4 liability removed.
+- **An example-grounded knob can only be randomised as jointly as its data.** "Randomise
+  conditioning inputs jointly" (first bullet) is cheap for measured channels and *not free* here:
+  if every clip labelled angry is also fast, the discriminator cannot separate the two and the
+  anger knob silently becomes a second speed knob. Mocap of an angry-but-slow dog may not exist.
+  Mitigations: label along the factored channels rather than with one word; hold out a combination
+  and test it; check the discriminator cannot predict speed from the residual. This is the failure
+  mode that looks fine in a single-knob demo and falls apart in combination.
+- **The two kinds verify differently, and the asymmetry is permanent.** A measured knob gets a
+  64-row table with a worst-case error. An example-grounded knob's only test is a human looking at
+  it, so it can be wrong or entangled without anything reporting so. Weight demo evidence
+  accordingly.
+
 ### Morphology
 
 - **Anatomy comes from *fitting*, not from training — so conversion costs one training run.**
