@@ -4612,9 +4612,36 @@ the *randomness vocabulary* is thin. Nothing below is started.
         0; non-uniform scale approximated).
   - [ ] **Stage 2 — `cavity`.** The occlusion-flavoured sibling of `curv`: not the local second
         derivative but "how enclosed is this point", which is what actually predicts where dirt
-        settles in a *concave corner between two surfaces* that are each locally flat (`curv` reads 0
-        on both). Wants a short ray-bundle AO probe at the hit, cached//gated the same way the
-        isosurface Hessian would have to be — most materials read neither.
+        settles in a *concave corner between two surfaces* that are each locally flat — `curv` reads
+        0 on both faces of a right-angled corner, so it cannot see the one place grime most obviously
+        collects. This is the item that makes O3 complete rather than half-done.
+
+        **Design settled by investigation (2026-08-09), not yet built.** Three constraints found by
+        reading the code, which together rule out the obvious approach:
+        1. The natural spelling — a VM *function* `cavity(radius)` behind an opaque callback, like
+           `texFn`/`specFn` — is self-gating and lets the author pick the probe radius, and it works
+           fine on the CPU. It does **not** port: `DPatEnvT` (pattern_device.cuh) carries only the
+           sampler tables, the BVH traversal lives in render_cuda.cu, and device function pointers
+           are too expensive to call per shading sample. Threading the whole DScene into the pattern
+           VM would also break the deliberate rule that pattern.h knows nothing heavy.
+        2. So `cavity` should be a **free variable like `curv`**, computed by the renderer (which
+           already owns traversal on both backends) and handed over as a plain double. The probe
+           radius then belongs on the *material* or the `scene {}` block, not in the expression.
+        3. **It must not be computed in `patCtxFromHit`.** That is called several times per shading
+           point (`materialRoughness`, `mixResolveChild`, each slot pattern), so an N-ray probe there
+           would be paid over and over. It needs to be computed **once per hit and cached** — a
+           `mutable` field on the Hit filled lazily, or filled by the tracer before shading.
+
+        Two more requirements: the direction set must be **deterministic** (a fixed Fibonacci
+        hemisphere rotated into the hit's tangent frame, no per-sample RNG) or the mask becomes a
+        noise source in its own right and smears under MIS; and the whole thing must be **gated** by
+        a load-time "does any bound pattern read `VarCavity`?" flag — the same gate the isosurface
+        Hessian needs (see known-issues.md), so build it once and use it for both.
+
+        Wiring follows the `curv` checklist exactly: append the op at the enum end, then name it
+        **explicitly** in `patternHasFreeVars` *and* `patOpStackEffect` (the missing-arity trap that
+        silently disabled CSE for whole programs), and mutation-test the self-test on a shape where
+        the mutation is actually observable.
   - [ ] **Stage 3 — distance-to-mesh field**, then the worked idiom section pulling all of it
         together (that is the part of O3 that is genuinely "documentation of what the VM can do").
 - [ ] **O4 — anisotropic / flow-aligned noise.** Noise stretched and steered along a direction field —
