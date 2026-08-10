@@ -338,10 +338,54 @@ film thickness, mix weight). Patterns are evaluated per hit.
 
 **Variables:** `x y z` (world position), `f` (field value, for isosurfaces),
 `nx ny nz` (surface normal), `r` (`|p|`), `u v` (surface texture coordinates — on
-meshes and on native primitives that declare a `uv` wrap, see §9). Constant `pi`.
+meshes and on native primitives that declare a `uv` wrap, see §9), `curv` (mean
+curvature — see below). Constant `pi`.
 
 **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
 `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
+
+**Surface curvature — `curv` (non-stationary texturing):** the **mean curvature**
+H = (k₁ + k₂)/2 at the shading point, in **1/length** units — a sphere of radius R
+reads `1/R`, a plane reads `0`. It is signed **relative to the side being shaded**:
+convex (bulging toward the viewer) is positive, concave is negative, so the same
+sphere reads `+1/R` from outside and `−1/R` from within.
+
+Every other noise in the VM is *stationary* — a function of position, with the same
+statistics everywhere. Translate the object and the pattern slides off it, because
+the texture describes the space rather than the shape sitting in it. Surface ageing
+is the opposite: paint wears where the form is convex, grime settles where it is
+concave. `curv` is what lets a pattern follow the geometry instead of the space:
+
+```
+# grime that can only exist in the crevices, and only as much as the noise says
+pattern "grime" { expr "smoothstep(-1.6, 1.2, -curv) * noise(9*x, 9*y, 9*z)" }
+
+# the mirror image: a coat that rubs through along convex edges
+pattern "wear"  { expr "smoothstep(1.6, 3.3, curv) * noise(14*x, 14*y, 14*z)" }
+```
+
+`smoothstep` needs `lo < hi`, so negate the field (as in `grime` above) rather than
+swapping the edges to select the concave side.
+
+Where it reads what:
+
+| geometry | `curv` |
+|---|---|
+| `sphere` | exactly `±1/radius` (analytic) |
+| mesh **with** vertex normals (`vn`) | mean curvature of the interpolated normal field, constant per face |
+| mesh **without** `vn` (flat-shaded) | `0` — a facet really is flat |
+| `curve` strand of radius r | `1/(2r)` — a tube's two principal curvatures are `1/r` and `0` |
+| `isosurface` | `0` (not yet derived; see known-issues) |
+
+The flat-shaded row is the one that surprises people: curvature is read off the
+*shading-normal* field, so an OBJ with no `vn` makes every curvature-driven pattern
+collapse to a constant. `tools/make_mesh.py --smooth` emits analytic normals for the
+test meshes. Under `mesh_instance`, curvature is rescaled by the placement's linear
+scale (curvature is 1/length, so a 2× instance halves it) — exact for a uniform
+scale, approximated by `|det|^(1/3)` for a non-uniform one.
+
+Validated by `-checkcurv`. Worked example: `scenes/pattern_curvature.ftsl` (a raw
+curvature ramp, crevice grime, and edge wear on the same torus).
 
 **Vector noise — `dnoisex/y/z`, `dturbx/y/z` (domain warping):** exact ports of
 POV-Ray's gradient-vector noise `DNoise` and its octave sum `DTurbulence`, one
@@ -1219,11 +1263,19 @@ mesh_instance {               # cheap placement of a named asset
   in, so one asset serves differently scaled/rotated placements.
 - A `mesh_instance` may appear at top level or inside a `group{}` (its transform
   composes with the group's, exactly like `mesh`).
-- **CPU:** true instancing — instances share the BLAS triangles, so N copies add
-  only N affines to memory. All render modes (A/B/C/R/D/P and the photon modes)
-  traverse the two-level BVH. **GPU:** instances are expanded to world-space
-  triangles at upload (flat device memory — the memory saving is CPU-only; images
-  are identical). See known-issues.
+- True instancing on **both** backends — instances share the BLAS triangles, so N
+  copies add only N affines to memory. All render modes (A/B/C/R/D/P and the photon
+  modes) traverse the two-level BVH. The GPU has its own device twin of the same
+  structure (`DBlas` / `DInstance`): the asset is uploaded **once** in local space,
+  the TLAS gets one leaf per instance, and that leaf transforms the ray into
+  BLAS-local space and walks the shared sub-BVH — so the memory win is a device win
+  too. (This paragraph used to claim the GPU expanded instances to world-space
+  triangles at upload; that was true of an earlier build and is no longer.)
+- Because the instance transform is applied to the *ray* rather than baked into the
+  geometry, per-hit quantities are mapped back out on the way home: normals through
+  the inverse-transpose, the tangent frame through the linear part, and **`curv`
+  through `1/|det|^(1/3)`** — mean curvature is 1/length, so `scale 0.5` doubles what
+  a pattern sees (see §6.1).
 
 ### 8.6 `curve` — hair, fur, grass, wire, thread
 

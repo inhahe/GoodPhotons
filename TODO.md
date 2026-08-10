@@ -4592,6 +4592,31 @@ the *randomness vocabulary* is thin. Nothing below is started.
       already *express* this (any argument is an expression), so this is mostly **idiom + primitives +
       docs**, not new machinery: a worked `docs/` section plus the missing primitives (curvature/cavity
       as free variables, a distance-to-mesh field) would make it authorable.
+  - [x] **Stage 1 — `curv`, the mean-curvature free variable.** ✅ 2026-08-09, v0.161.0.
+        `PatOp::VarCurv` exposes H = (k₁+k₂)/2 in 1/length at the shading point, signed toward the
+        shaded side (convex +, concave −, flat 0), on all three VM backends. Analytic on `sphere`
+        (±1/R) and `curve` (1/(2r)); per-face on a mesh with `vn` via `Tri::finalize()`, taking the
+        shading-normal differential's trace in the **dual basis** (the Gram matrix must be inverted —
+        the naive per-edge trace is only wrong on a *non-umbilic* surface, which is why the test's
+        basis-independence section had to be rebuilt on a cylinder after a sphere version passed the
+        mutant). Instance path rescales by 1/|det|^(1/3), CPU/GPU parity verified empirically.
+        Nine-section `-checkcurv` (mutation-tested); it caught a real CSE bug — `patOpStackEffect`
+        had no `VarCurv` case, and an unknown arity makes `patternOptimizeCSE` bail on the *whole
+        program*, so one `curv` silently disabled CSE for every expression around it. New load-time
+        guard: an **emit** pattern may not read `curv` (the emitter-sampled side has no curvature to
+        report, so MIS would combine two different profiles → bias). `tools/make_mesh.py` gained
+        `--smooth`/`--major`/`--minor`/`--radius` (analytic `vn`; opt-in so the existing flat-shaded
+        scenes regenerate byte-identically). Demo `scenes/pattern_curvature.ftsl` (raw ramp / crevice
+        grime / edge wear on three instances of one torus asset); docs in FTSL.md §6.1 +
+        REFERENCE.md; limitations logged in known-issues.md (isosurface and preview-raster both read
+        0; non-uniform scale approximated).
+  - [ ] **Stage 2 — `cavity`.** The occlusion-flavoured sibling of `curv`: not the local second
+        derivative but "how enclosed is this point", which is what actually predicts where dirt
+        settles in a *concave corner between two surfaces* that are each locally flat (`curv` reads 0
+        on both). Wants a short ray-bundle AO probe at the hit, cached//gated the same way the
+        isosurface Hessian would have to be — most materials read neither.
+  - [ ] **Stage 3 — distance-to-mesh field**, then the worked idiom section pulling all of it
+        together (that is the part of O3 that is genuinely "documentation of what the VM can do").
 - [ ] **O4 — anisotropic / flow-aligned noise.** Noise stretched and steered along a direction field —
       wood grain following a trunk, hair/fur flow, brushed metal, muscle striation. Needs a per-hit
       tangent frame (partly there via `nx ny nz` + UV derivatives) and a way to bind a flow field.
@@ -4612,8 +4637,12 @@ the *randomness vocabulary* is thin. Nothing below is started.
       distance. This is a *quality* prerequisite for taking O1–O7 seriously in a beauty render.
 
 **Ordering note.** O2 then O1 buys the most look per line of code (domain warping + cellular covers a
-huge fraction of natural texture); O3 is mostly documentation of what the VM can already do; O8 is the
-one that decides whether any of it survives a real render at distance.
+huge fraction of natural texture); O8 is the one that decides whether any of it survives a real render
+at distance. The "O3 is mostly documentation" call above turned out to be **half wrong**: the *idiom*
+is indeed already expressible, but the primitives it needs are not documentation at all — `curv`
+(stage 1) touched every intersector, both BVH levels, the instance transform path and all three VM
+backends, because a non-stationary driver is by definition a per-hit geometric quantity the renderer
+was not previously carrying.
 
 **Cross-project link.** `D:\visual studio projects\creature` → `todo.md` **P7** wants exactly O1/O3/O6
 ("non-stationary texture: curvature/cavity masks, spatially-varying noise parameters, domain warping,

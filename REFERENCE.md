@@ -2337,8 +2337,9 @@ point evaluated per shading sample — that can drive any scalar material parame
 *procedurally*, without a texture image. The variables available to a pattern are the
 world-space position `x y z`, the implicit field value `f` (the SDF value at the hit,
 `~0` on an isosurface; `0` for explicit geometry), the surface normal `nx ny nz`, the
-radius `r = √(x²+y²+z²)`, and the **surface UV coordinates `u v`** (mesh-interpolated,
-or a native-primitive wrap — see below). Two authoring forms:
+radius `r = √(x²+y²+z²)`, the **surface UV coordinates `u v`** (mesh-interpolated,
+or a native-primitive wrap — see below), and the **mean curvature `curv`** (see
+*Curvature-driven, non-stationary patterns* below). Two authoring forms:
 
 - **Free-form expression** — `expr "0.5 + 0.5*sin(40*y)"` (must be quoted). Compiled by
   a shunting-yard parser to a postfix scalar VM. Supports `+ - * / ^ %`, comparison-free
@@ -2521,6 +2522,53 @@ for un-`vt`'d meshes**, referenced to the surface's world bounds. So a checker o
 stripe authored in `(u,v)` space wraps *around* the object (a globe, tiles converging
 at the poles, a grid on box faces) instead of slicing through world space. See
 `scenes/uv_native.ftsl`.
+
+**Curvature-driven, non-stationary patterns.** Every noise above is **stationary**: it
+is a function of position, so its statistics are the same everywhere and translating an
+object slides the pattern off it — the texture describes the *space*, not the shape in
+it. Real surface ageing is the opposite. Paint wears where the form is **convex** and
+something rubbed it; grime settles where the form is **concave** and nothing washes it
+out. That is a property of the geometry, so no amount of position-driven noise can
+express it. The `curv` variable closes the gap: it is the **mean curvature**
+H = (k₁+k₂)/2 at the shading point, in 1/length units, so multiplying any noise by a
+curvature mask makes it *non-stationary* — it follows the shape, and keeps following it
+when the object moves.
+
+`curv` is **signed toward the side being shaded**: convex is positive, concave negative,
+flat 0. Every intersector negates it when it flips the normal to face the ray, so the
+same sphere reads `+1/R` from outside and `−1/R` from within. What each geometry reports:
+
+| Geometry | `curv` |
+|---|---|
+| `sphere` | ±1/radius, analytic |
+| `curve` / fiber | 1/(2·radius) at the hit's interpolated radius (fibers are thin, so this is a **large** number — which is exactly what lets a pattern tell fiber from body) |
+| mesh **with** `vn` | per-face, from the interpolated shading-normal field |
+| mesh **without** `vn` | `0` — a flat-shaded mesh has no normal field to differentiate, so it honestly reads zero rather than guessing |
+| `quad` / flat facet | `0` |
+| `isosurface` | `0` (would need the field's Hessian; see `known-issues.md`) |
+
+Two things to get right. First, **the mesh must carry vertex normals** — generate one
+with `tools/make_mesh.py --smooth`, or the whole material collapses to a flat colour.
+Second, **curvature is 1/length, so an instance's scale changes it**: `scale 0.5` doubles
+what the shader sees. Thresholds cut against the authored mesh will be wrong once it is
+placed, which is the easiest way to end up with a flat-looking result — measure the
+actual range rather than guessing.
+
+```
+# crevice grime: a noise field gated by the LEAST convex part of the form
+pattern "grime" { expr "smoothstep(-5.0, -1.0, -curv) * (0.35 + 0.65*noise(11*x,11*y,11*z))" }
+# edge wear: the mirror image, gated by the MOST convex band
+pattern "wear"  { expr "smoothstep(5.8, 6.9, curv) * step(0.5, noise(16*x,16*y,16*z))" }
+```
+
+`smoothstep` requires `lo < hi`, so a mask that should *increase* as curvature falls is
+written by negating the field (`-curv`) rather than by swapping the edges. Feeding either
+mask to a `mix` `weight_map` gives the usual dirt / edge-wear pass, driven by actual
+differential geometry instead of a painted or baked mask. Note that a dirt mask usually
+wants "least convex", not strictly "negative" — grime collects wherever the form turns
+away and nothing wipes it. Same values on CPU and GPU, including through the instance
+rescale. Deterministic self-test `ftrace -checkcurv`, worked example
+`scenes/pattern_curvature.ftsl`.
 
 ## Participating media / fog
 
@@ -3246,7 +3294,8 @@ alone can't restore, so they are not disk-resumable.
 `-checkcurve`, `-checkfur`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
-`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checksun`, `-checkbind`, `-checkprop`,
+`-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkcurv`, `-checksun`,
+`-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints
 `PASS`/`FAIL`. `-checkcurve` guards the `curve` primitive: it cross-checks the
 round-cone intersector against the exact analytic SDF, the degenerate

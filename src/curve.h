@@ -361,6 +361,14 @@ inline bool intersectCurveSeg(const CurveRay& cr, const Ray& r, const CurveSeg& 
     double tl = std::sqrt(dot(tg, tg));
     hit.tangent = (tl > 1e-12) ? tg * (1.0 / tl) : T;
     hit.bitangentSign = 1.0;
+    // Mean curvature (O3). A round cone is a surface of revolution whose principal
+    // curvatures are 1/R around the axis and ~0 along it, so H = 1/(2R) at the local
+    // (linearly interpolated) radius. Strand radii are tiny, so this is a LARGE number —
+    // the honest answer, and exactly what lets `curv` tell fiber from body in a mixed
+    // scene. Negated when we are looking at the inside wall, like every other primitive.
+    double rLoc = (double)s.r0 + ((double)s.r1 - (double)s.r0) * f;
+    double hSign = (dot(r.d, ng) < 0.0) ? 1.0 : -1.0;
+    hit.curv = (rLoc > 1e-12) ? hSign * 0.5 / rLoc : 0.0;
     return true;
 }
 

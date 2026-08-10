@@ -5,6 +5,70 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-09, v0.161.0): `curv` reads 0 on an ISOSURFACE, so curvature-driven materials silently flatten there
+
+`curv` (O3 stage 1) is analytic on a `sphere`, per-radius on a `curve`, and per-face on a
+mesh that carries `vn` — but an **implicit isosurface always reports 0**, because the ray
+hit only knows the field's *gradient* (the normal) and mean curvature needs its second
+derivatives. The failure is silent and looks exactly like a correctly-authored flat
+material, which is the bad part: `scenes/pattern_curvature.ftsl`'s own grime/wear masks
+would render as a uniform colour on an isosurface with no diagnostic at all.
+
+**Proper fix.** H for a level set is the divergence of the unit gradient,
+`H = ½·∇·(∇f/|∇f|)`, so it needs the field **Hessian** at the hit. `implicit.h` already
+central-differences the gradient; the Hessian is the same trick one order up (6 extra
+field evaluations for the symmetric 3×3, or 9 if the mixed terms are done naively).
+That is far too expensive to pay unconditionally — most isosurfaces bind no pattern at
+all, let alone one reading curvature — so it must be **gated**: a "does any pattern bound
+anywhere on this material read `VarCurv`?" flag computed at load (the machinery exists —
+`materialFreeInputs` already walks every bound pattern's nodes, and
+`checkEmitPatsSupported` now scans for `PatOp::VarCurv` specifically) and checked before
+spending the evaluations. Step size wants to follow the same scale the gradient
+difference uses, and the result needs the same shaded-side negation every other
+primitive applies.
+
+Until then the honest 0 is the right behaviour — it is documented in `REFERENCE.md`'s
+per-geometry table and in the `HitRecord::curv` comment — but a **load-time warning**
+when a curv-reading pattern lands on an isosurface would be cheap and is probably worth
+doing before the real fix.
+
+### OPEN (2026-08-09, v0.161.0): `curv` reads 0 in the PREVIEW rasterizer, so `-explore` misrepresents a curvature-driven material
+
+`raster.h:~1608` builds its shading context with
+`makePatCtx(g.wpos[i], 0.0, N0, g.uv[i].x, g.uv[i].y)` — no curvature argument — so
+`PatCtx::curv` defaults to 0 for the whole preview. A material whose `weight_map` is
+gated on curvature therefore previews as one of its two layers everywhere, and
+`-explore` on `scenes/pattern_curvature.ftsl` shows three flat tori instead of the ramp /
+grime / wear the traced render produces.
+
+This is the same class as the six "preview showed a material as flat colour" gaps fixed
+in 0.135.0/0.136.0, and it is *fixable* rather than fundamental: the preview tessellates
+to `PTri`s with interpolated normals, so it could carry the same per-face curvature
+`Tri::finalize()` computes and interpolate or flat-fill it. The cost is one more float
+per preview triangle plus the finalize arithmetic during tessellation.
+
+Not urgent — the preview is explicitly a composition/motion tool and already ignores
+roughness and film-thickness maps by design — but unlike those it is *silently wrong*
+rather than obviously absent, and the fix is mechanical.
+
+### TECH DEBT (2026-08-09, v0.161.0): a non-uniformly scaled instance's `curv` is approximated by |det|^(1/3)
+
+Mean curvature is 1/length, so the instance path has to rescale it. For a **uniform**
+`scale s` that is exact: H_world = H_local / s. For a non-uniform scale it is not — the
+two principal curvatures rescale by *different* factors that depend on the surface
+orientation relative to the scale axes, and the shape operator has to be conjugated by
+the transform properly. The current code takes `|det(M)|^(1/3)` as an effective isotropic
+scale, which is exact when the scale is uniform and degrades smoothly as it is not.
+
+`-checkcurv` §9 pins the behaviour rather than the ideal: `scaleXf(2,4,8)` is asserted to
+give 1/4 (|det|^(1/3) = 4), and `scaleXf(1,0,1)` is asserted only to stay **finite**. So
+this is a documented approximation with a test, not an unknown.
+
+**Proper fix** is to transform the shape operator: normals go through M⁻ᵀ and tangents
+through M, so the correct H needs the full 2×2 second-fundamental-form conjugation at the
+hit, not a scalar factor. Worth doing if a scene ever squashes a curvature-textured mesh
+hard along one axis; invisible for the uniform scales every checked-in scene uses.
+
 ### FIXED (2026-08-08, v0.160.0): `-explore` on a FURRED scene never started — the curve preview sweep allocated ~46 GB of triangles and thrashed the page file forever
 
 `ftrace scenes\gallery_rain.ftsl -explore` sat with the live window titled

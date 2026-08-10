@@ -982,9 +982,27 @@ public:
     // EmitTri's barycentric UVs, the same interpolation geometry.h does). A sphere/tube/
     // spot/env emitter has no such correspondence, so refuse loudly rather than render
     // a wrong image — the same rule checkSlotPatSupported applies to reflect/transmit.
+    //
+    // `curv` (O3) fails the SAME test for a different reason: it is not a shape at all
+    // but a VARIABLE that only one of the two sides can answer. Emitter::samplePoint
+    // reports a position, a normal and (u,v) — it has no curvature to report — so
+    // emitterPatMulAt() necessarily reads curv = 0, while emission-on-hit reads the real
+    // value off the Hit. On a smooth-shaded mesh emitter those differ, and MIS would
+    // combine two different profiles into a biased image. Refuse it on every shape,
+    // including the quad where curv is trivially 0 on both sides: a curvature-driven
+    // emission profile that is identically zero is not something to render silently.
     bool checkEmitPatsSupported(Loaded& L) {
         for (const auto& e : L.scene.emitters) {
             if (e.emitPat < 0) continue;
+            if (e.emitPat < (int)L.scene.patterns.size()) {
+                for (const PatNode& n : L.scene.patterns[e.emitPat].nodes) {
+                    if (n.op != PatOp::VarCurv) continue;
+                    fail("an emit pattern cannot read `curv` — an emitter's sampled point "
+                         "carries no curvature, so the emitted profile would disagree with "
+                         "the one emission-on-hit reads, and MIS would bias the image");
+                    return false;
+                }
+            }
             if (e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh) continue;
             const char* what = (e.shape == EmitterShape::Sphere)   ? "sphere"
                              : (e.shape == EmitterShape::Cylinder) ? "cylinder"
@@ -4794,8 +4812,7 @@ private:
 
         MeshInstance inst;
         inst.blasId = it->second;
-        inst.toWorld = xf;
-        inst.toLocal = xf.inverse();
+        inst.setToWorld(xf);            // also derives toLocal + the O3 curvature scale
         inst.matOverride = matOverride;
         L.scene.instances.push_back(inst);
         return true;

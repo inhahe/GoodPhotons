@@ -1,0 +1,158 @@
+# pattern_curvature.ftsl — `curv`, the mean-curvature pattern variable (O3).
+#
+# Every other noise in the VM is STATIONARY: its statistics are the same
+# everywhere, because it is a function of position alone. Translate the object
+# and the pattern slides off it; the texture describes the *space*, not the
+# shape sitting in it. Real surface ageing is the opposite — paint wears where
+# the form is convex and something rubbed it, grime settles where the form is
+# concave and nothing washes it out. That is a property of the SHAPE, so no
+# amount of position-driven noise can express it.
+#
+# `curv` closes that gap. It is the MEAN CURVATURE at the shading point,
+# H = (k1 + k2)/2, in 1/length units (so a sphere of radius R reads 1/R), signed
+# toward the side being shaded: convex is positive, concave negative, flat 0.
+# Multiply any noise by a curvature mask and the noise becomes non-stationary —
+# it follows the geometry, and keeps following it when the object moves.
+#
+# The three tori are the same mesh with three materials:
+#   LEFT   raw `curv`, as a blue -> red ramp. The outer equator is the most
+#          convex part of the surface and the throat the most concave, so the
+#          ring reads red on the outside and blue down inside the hole.
+#   MIDDLE CREVICE GRIME. A noise field gated by *negative* curvature, so the
+#          dirt can only exist in the throat and vanishes on the outer ring —
+#          the usual dirt pass, driven by actual differential geometry rather
+#          than a painted or baked mask.
+#   RIGHT  EDGE WEAR. The same idea mirrored: a coat gated by *positive*
+#          curvature rubs through to bare metal along the convex outer ring and
+#          survives untouched inside the hole.
+#
+# THE MESH MUST CARRY VERTEX NORMALS. `curv` is derived from the interpolated
+# shading-normal field, so a flat-shaded mesh honestly reads 0 everywhere and
+# all three materials collapse to a flat colour. Generate it with:
+#
+#   python tools/make_mesh.py torus -o scenes/torus_fat.obj \
+#          --nu 200 --nv 100 --major 0.32 --minor 0.2 --smooth
+#
+# `--minor 0.2` against `--major 0.32` matters: mean curvature only goes
+# NEGATIVE where 2*minor > major, otherwise the tube's own 1/minor curvature
+# dominates and even the throat stays convex on average.
+#
+# CALIBRATING THE THRESHOLDS. Curvature is 1/length, so an instance's scale
+# changes it — `scale 0.5` DOUBLES it. As authored the mesh runs
+# H = -1.67 (throat) .. +2.50 (tube top/bottom) .. +3.46 (outer equator);
+# placed at `scale 0.5` the shader therefore sees
+# H = -3.33 .. +5.00 .. +6.92, and that is what the numbers below are cut for.
+# Getting this wrong is the easiest way to end up with a flat-looking result, so
+# when adapting this scene, measure rather than guess.
+#
+#   ftrace -in scenes/pattern_curvature.ftsl -mode D -noise 2.5 \
+#          -window -keepwindow -o png/pattern_curvature.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# ---------------------------------------------------------------------------
+# The three curvature drivers.
+# ---------------------------------------------------------------------------
+
+# Raw curvature across the torus's full world-space range.
+pattern "curv_ramp" { expr "smoothstep(-3.3, 6.9, curv)" }
+
+# CREVICE MASK: the mirror of `wear` below. `curv` runs the wrong way round for this
+# and smoothstep needs lo < hi, so the FIELD is negated rather than the edges swapped.
+#
+# The ramp runs from H = 5 (clean) down to H = 1 (fully dirty) — i.e. it reaches well
+# past H = 0 and covers the whole RECESSED inner face, not only the strictly concave
+# part. That is deliberate, and it is what a real dirt pass wants: grime collects
+# wherever the form turns away and nothing wipes it, which is "least convex", not
+# "negative". Cutting at H < 0 instead would confine the dirt to a sliver at the very
+# bottom of the throat, which on this torus is a few pixels wide and invisible. The
+# tube's top (H = 5) and its outer equator (H = 6.9) stay clean.
+#
+# Multiplying by fBm stops the dirt from
+# looking like a clean analytic band — the mask says WHERE dirt may settle, the
+# noise says how much actually did. (The VM has no `turbulence`; three octaves of
+# the scalar `noise`, normalised by 0.5+0.25+0.125, is that written out. `noise`
+# returns [0,1].)
+pattern "grime" {
+    expr "smoothstep(-5.0, -1.0, -curv) *
+          (0.35 + 0.65 * (0.5   * noise(11*x, 11*y, 11*z) +
+                          0.25  * noise(22*x, 22*y, 22*z) +
+                          0.125 * noise(44*x, 44*y, 44*z)) / 0.875)"
+}
+
+# WEAR MASK: the mirror image — nonzero only on the most convex band, the outer
+# equator (H ~ 6.9 there against ~5.0 over the rest of the tube). The noise is
+# pushed through a tight smoothstep so the coat breaks into patches with bare
+# metal between them instead of fading uniformly.
+pattern "wear" {
+    expr "smoothstep(5.8, 6.9, curv) *
+          smoothstep(0.40, 0.60, (0.5   * noise(16*x, 16*y, 16*z) +
+                                  0.25  * noise(32*x, 32*y, 32*z) +
+                                  0.125 * noise(64*x, 64*y, 64*z)) / 0.875)"
+}
+
+# ---------------------------------------------------------------------------
+# Materials.
+#
+# NOTE the layer order: in a `mix`, weight 1 selects the FIRST layer and weight 0
+# the second. So the layer the mask means by "1" has to be written first — dirt
+# before paint, bare steel before paint, warm before cool.
+# ---------------------------------------------------------------------------
+
+material "white" { type diffuse reflect whitewall 0.75 }
+material "cool"  { type diffuse reflect rgb 0.06 0.16 0.72 }
+material "warm"  { type diffuse reflect rgb 0.88 0.14 0.05 }
+material "paint" { type diffuse reflect rgb 0.14 0.46 0.40 }
+# The settled deposit is PALE, warm dust — deliberately LIGHTER than the paint. A
+# crevice is already dark from ambient occlusion, so a dark grime there is
+# indistinguishable from the shadow that was going to be there anyway; a light
+# deposit cannot be mistaken for shading, because no shadow makes a surface
+# brighter. (Tried dark rust first; it read as plain AO.)
+material "dust"  { type diffuse reflect rgb 0.86 0.80 0.64 }
+# Bare metal has to be BRIGHT to read against the paint, and rough enough to pick up
+# the room rather than mirror the dark space in front of the tori.
+material "steel" { type glossy   reflect rgb 0.86 0.86 0.88  roughness 0.42 }
+
+material "rampmat"  { type mix layer "warm"  0.5 layer "cool"  0.5 weight_map pattern:curv_ramp }
+material "grimemat" { type mix layer "dust"  0.5 layer "paint" 0.5 weight_map pattern:grime }
+material "wearmat"  { type mix layer "steel" 0.5 layer "paint" 0.5 weight_map pattern:wear }
+
+# ---------------------------------------------------------------------------
+# A 2 m wide box holding three tori. The mesh is loaded ONCE as a shared asset
+# and placed three times, so its 40k triangles are stored and BVH'd a single
+# time — and the instance path's curvature rescaling gets exercised for free.
+# ---------------------------------------------------------------------------
+
+quad { origin 0 0 0   u 2 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 2 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 2 0 0   v 0 1 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material white }   # left
+quad { origin 2 0 0   u 0 1 0   v 0 0 1   material white }   # right
+
+mesh_asset "torus" {
+    file "scenes/torus_fat.obj"
+    material paint
+}
+
+# Tipped toward the camera so the outer ring and the throat are both visible at
+# once — the contrast between them is the whole point. Outer diameter is
+# 2*(0.32+0.2)*0.5 = 0.52 m, placed 0.6 m apart, so they clear each other.
+mesh_instance { of "torus"  material rampmat   translate 0.40 0.36 0.52  rotate -74 0 0  scale 0.5 }
+mesh_instance { of "torus"  material grimemat  translate 1.00 0.36 0.52  rotate -74 0 0  scale 0.5 }
+mesh_instance { of "torus"  material wearmat   translate 1.60 0.36 0.52  rotate -74 0 0  scale 0.5 }
+
+# A wide ceiling panel: the crevice mask puts its dirt in the one place the room is
+# darkest, so the throat needs enough bounce light to actually be readable.
+light area {
+    origin 0.20 0.999 0.12   u 1.6 0 0   v 0 0 0.86   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 1.0 0.70 2.55   look_at 1.0 0.36 0.52   up 0 1 0   fov_y 40
+    mode D
+    film { res 720 400 }
+}

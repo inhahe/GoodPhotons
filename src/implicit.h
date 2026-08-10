@@ -417,6 +417,16 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             Vec3 uv = projectUV(p, b.lo, b.hi, ctr, im.uvProj, im.uvAxis);
             hit.u = uv.x; hit.v = uv.y;
         } else { hit.u = 0.0; hit.v = 0.0; }
+        // Curvature (O3) reads 0 on an isosurface for now. NOT because an isosurface has
+        // no curvature — it has a perfectly well-defined one — but because recovering it
+        // needs the field's HESSIAN (six more field evaluations per hit, on top of the
+        // three the gradient already costs), and the sphere-trace inner loop is the
+        // hottest path in the renderer. Taxing every implicit scene for a feature almost
+        // none of them use is the wrong trade until there is a "does any bound pattern
+        // actually read curv?" gate. Written EXPLICITLY rather than left alone because
+        // `hit` is a REUSED record: skipping the store would leak the previously-tested
+        // primitive's curvature into this hit. Logged in known-issues.md.
+        hit.curv = 0.0;
         return true;
     };
 

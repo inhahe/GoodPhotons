@@ -1681,6 +1681,50 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   (order statistics are monotone), 1-Lipschitz continuity straddling cell walls (the
   floor-vs-truncation trap), compile/reject, CSE, and distribution sanity.
 
+  **Mean curvature (`PatOp::VarCurv`, O3 stage 1, v0.161.0).** Every other noise in the
+  VM is **stationary** — a function of position, so translating an object slides the
+  pattern off it. `curv` is the first *non-stationary* driver: a per-hit property of the
+  SHAPE, so `noise * mask(curv)` follows the geometry and keeps following it when the
+  object moves. It is the mean curvature H = (k₁+k₂)/2 in 1/length, carried on
+  `HitRecord::curv` and threaded into `PatCtx` by `patCtxFromHit`.
+
+  Unlike the ops above it is **not a function but a leaf variable**, and it lives
+  *outside* the contiguous `VarX..VarV` range that `patternHasFreeVars` scans (it is
+  appended at the enum end, per the O2 checklist, so that range stays unperturbed).
+  That combination is the trap: it must therefore be named **explicitly** in both
+  `patternHasFreeVars` *and* `patOpStackEffect`. Omitting the latter is not the local
+  no-op it looks like — an unknown arity makes `patternOptimizeCSE` bail on the **whole
+  program**, so a single `curv` anywhere would have silently switched CSE off for the
+  entire surrounding expression. (That bug was real and was caught only by the
+  self-test's CSE section.)
+
+  Where the number comes from, per primitive: `sphere` is analytic (±1/R); a `curve`
+  round-cone is a surface of revolution, k = 1/R and ~0 along the axis, so H = 1/(2R) at
+  the interpolated radius; a **mesh** is per-face in `Tri::finalize()`, H = ½·trace of
+  the shading-normal differential restricted to the tangent plane. That trace must be
+  taken in the **dual basis** — {e₁,e₂} is not orthonormal, so the 2×2 Gram matrix has to
+  be inverted. A quad/flat facet, a flat-shaded mesh (no normal field to differentiate)
+  and an isosurface all honestly report 0 rather than guess.
+
+  Two invariants the rest of the system has to respect. **Sign** is relative to the side
+  being shaded: every intersector negates `curv` when it flips the normal toward the ray,
+  so a bulge is always + and a pit always −, and the same sphere reads +1/R outside and
+  −1/R inside. **Scale**: H is 1/length, so the instance path rescales it (`scale 0.5`
+  doubles it); a non-uniform scale is approximated by |det|^(1/3).
+
+  `-checkcurv` is the self-test, nine sections, mutation-tested. Worth recording *why*
+  section 6 (basis independence) is built on a **cylinder** and not the sphere it started
+  on: a sphere is **umbilic**, dn is a multiple of the identity there, so the naive
+  per-edge trace that omits the dual basis returns the correct 1/R for *every* basis. The
+  omission is only observable on a non-umbilic surface — the sphere sections passed the
+  mutant happily.
+
+  One load-time guard falls out of this: an **emission** pattern may not read `curv`
+  (`checkEmitPatsSupported`). Emission is read from both sides of transport and MIS
+  combines them, but `Emitter::samplePoint` has no curvature to report, so the sampled
+  side would read 0 against the hit side's real value — biased, not merely noisy. Same
+  reasoning that already refuses emission patterns on sphere/cylinder/spot/env emitters.
+
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
   **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the

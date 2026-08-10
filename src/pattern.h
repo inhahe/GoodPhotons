@@ -163,6 +163,19 @@ enum class PatOp : int {
     // ring search, not the approximate 3x3x3 (see worley.h). Appended at the
     // END of the enum so the VarX..VarV scans and varName() are unperturbed.
     Worley,
+    // SURFACE MEAN CURVATURE at the shading point, spelled `curv` (O3), in 1/length
+    // units and signed toward the shaded side (convex +, concave -, flat 0; a unit
+    // sphere reads +1). This is the first primitive whose whole purpose is to make a
+    // texture NON-STATIONARY: multiplying any noise by a curvature mask concentrates
+    // it on edges (wear, rust, dust) or in crevices (grime), which no amount of
+    // position-driven noise can express, because the statistics have to follow the
+    // SHAPE rather than the space it sits in.
+    //
+    // Appended at the END of the enum like everything since Tex, so existing opcode
+    // numbering is unperturbed — but unlike those, `curv` IS a per-hit surface
+    // intrinsic, so patternHasFreeVars names it explicitly alongside the VarX..VarV
+    // range rather than relying on that range to cover it.
+    VarCurv,
 };
 
 // Register-file size available to a CSE-optimized program (per evaluator invocation).
@@ -370,6 +383,7 @@ struct PatCtx {
     double nx = 0, ny = 0, nz = 0;// surface normal
     double r = 0;                 // radius |p|
     double u = 0, v = 0;          // surface UV (mesh interpolated or native-primitive wrap)
+    double curv = 0;              // mean curvature, 1/length, signed toward the shaded side (O3)
     double t = 0;                 // flyby timeline in [0,1] (camera_curve record tracks only)
     // PatOp::Tex sampler hook. pattern.h deliberately knows nothing about Texture
     // (texture.h drags in the spectral/upsampling machinery and is not something we
@@ -467,13 +481,15 @@ struct PatTableScope {
     }
 };
 
-inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, double v = 0) {
+inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, double v = 0,
+                         double curv = 0) {
     PatCtx c;
     c.x = p.x; c.y = p.y; c.z = p.z;
     c.f = f;
     c.nx = n.x; c.ny = n.y; c.nz = n.z;
     c.r = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
     c.u = u; c.v = v;
+    c.curv = curv;
     return c;
 }
 
@@ -530,6 +546,7 @@ inline double patternEval(const PatNode* nodes, int n, const PatCtx& c) {
             case PatOp::VarR:     st[sp++] = c.r;  break;
             case PatOp::VarU:     st[sp++] = c.u;  break;
             case PatOp::VarV:     st[sp++] = c.v;  break;
+            case PatOp::VarCurv:  st[sp++] = c.curv; break;
             case PatOp::VarT:     st[sp++] = c.t;  break;
             // `a` is resolved at load time (bound at the use site, or to the material's
             // albedo_default) and so is unreachable here; 0 keeps the switch total.
@@ -683,6 +700,7 @@ inline bool varOp(const std::string& s, PatOp& out) {
     if (s == "r")  { out = PatOp::VarR;  return true; }
     if (s == "u")  { out = PatOp::VarU;  return true; }
     if (s == "v")  { out = PatOp::VarV;  return true; }
+    if (s == "curv") { out = PatOp::VarCurv; return true; } // mean curvature, 1/length (O3)
     if (s == "a")  { out = PatOp::VarA;  return true; }   // albedo — resolved at load time
     return false;
 }
@@ -983,6 +1001,7 @@ inline const char* varName(PatOp op) {
         case PatOp::VarNx: return "nx";  case PatOp::VarNy: return "ny";
         case PatOp::VarNz: return "nz";  case PatOp::VarR:  return "r";
         case PatOp::VarU:  return "u";   case PatOp::VarV:  return "v";
+        case PatOp::VarCurv: return "curv";
         case PatOp::VarA:  return "a";   default: return nullptr;
     }
 }
@@ -1147,6 +1166,7 @@ inline bool compilePatternExpr(const std::string& expr, std::vector<PatNode>& ou
 inline bool patternHasFreeVars(const std::vector<PatNode>& prog) {
     for (const PatNode& nd : prog)
         if ((nd.op >= PatOp::VarX && nd.op <= PatOp::VarV) ||
+            nd.op == PatOp::VarCurv ||   // a surface intrinsic living outside the range (O3)
             nd.op == PatOp::Tex || nd.op == PatOp::Grid ||
             nd.op == PatOp::Scatter) return true;
     return false;
@@ -1187,6 +1207,11 @@ inline bool patOpStackEffect(PatOp op, double a, int& pops, int& pushes) {
     pushes = 1;
     if (op >= PatOp::Const && op <= PatOp::VarT)  { pops = 0; return true; }
     if (op == PatOp::VarA)                        { pops = 0; return true; }
+    // A leaf like VarX..VarT and VarA — but it lives past the end of that range, so it
+    // needs its own line. Omitting it does NOT merely leave `curv` itself unshared: an
+    // unknown arity makes patternOptimizeCSE bail on the WHOLE program, so a single
+    // `curv` anywhere would silently switch off CSE for the entire expression around it.
+    if (op == PatOp::VarCurv)                     { pops = 0; return true; }
     if (op >= PatOp::Neg && op <= PatOp::Saturate){ pops = 1; return true; }
     if (op >= PatOp::Add && op <= PatOp::Step)    { pops = 2; return true; }
     if (op >= PatOp::Clamp && op <= PatOp::Noise) { pops = 3; return true; }

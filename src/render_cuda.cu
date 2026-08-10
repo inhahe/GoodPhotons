@@ -469,7 +469,8 @@ struct DMediumStack {
 };
 
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
-                 DVec3 tangent; double bitangentSign; };  // C6 tangent frame for normal mapping
+                 DVec3 tangent; double bitangentSign;    // C6 tangent frame for normal mapping
+                 double curvature; };                    // O3 per-face mean curvature (Tri::finalize)
 struct DSphere { DVec3 c; double r; int matId; };
 // One round cone of a curve/fiber strand — the device twin of CurveSeg (curve.h). The host
 // record is already a POD in exactly this shape; only the scalar type narrows to Real.
@@ -493,6 +494,9 @@ struct DInstance {
     // toWorld linear part (local -> world for plain DIRECTIONS): transforms the surface
     // tangent for normal mapping on instanced meshes (C6). affDir(Wm, tangent).
     double Wm[9];
+    // O3: local curvature (1/length) -> world curvature multiplier, = 1/|det(linear)|^(1/3).
+    // Host-precomputed (MeshInstance::curvScale) so the device does no cbrt per hit.
+    double curvScale;
     int    blasId;
     int    matOverride;   // >=0 replaces the BLAS triangles' matId (mirrors host)
 };
@@ -1667,7 +1671,7 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p, const D
     if (!m.heterogeneous || !m.density) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, env);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, env);
     return d > 0.0 ? d : 0.0;
 }
 
@@ -1771,7 +1775,7 @@ __device__ static double dMedNAt(const DMedium& m, const DVec3& p, const DPatEnv
     if (m.iorN <= 0 || !m.ior) return 1.0;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double n = dPatternEval(m.ior, m.iorN, p.x, p.y, p.z, 0.0,
-                            0.0, 0.0, 0.0, r, 0.0, 0.0, env);
+                            0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, env);
     return n > 1e-3 ? n : 1e-3;
 }
 
@@ -2010,6 +2014,7 @@ struct DHit {
     int matId, sensorId;
     Real u, v;   // interpolated surface texture coordinates
     DVec3 tangent; Real bitangentSign;  // C6 surface tangent frame for normal mapping
+    Real curv;   // O3 mean curvature, signed toward the shaded side (see Hit::curv)
 };
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
@@ -2050,7 +2055,7 @@ __device__ static double dFieldLeafSDF(const DFieldNode& nd, double px, double p
             if (!exprPool) return BIG;
             double r = sqrt(px*px + py*py + pz*pz);
             return dPatternEval(exprPool + nd.exprOff, nd.exprN, px, py, pz, 0.0,
-                                0.0, 0.0, 0.0, r, 0.0, 0.0, env);
+                                0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, env);
         }
         case DF_BOX: {
             double r = nd.p[3];
@@ -2373,6 +2378,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             dProjectUV(px, py, pz, im.uvLo, im.uvHi, im.uvProj, im.uvAxis, uu, vv);
             hit.u = (Real)uu; hit.v = (Real)vv;
         } else { hit.u = 0; hit.v = 0; }
+        hit.curv = (Real)0;   // O3: isosurface curvature needs the Hessian — see implicit.h
         return true;
     };
 
@@ -2530,9 +2536,12 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     DVec3 ns = tri.n0 * b0 + tri.n1 * b1 + tri.n2 * b2;
     Real nl = dot(ns, ns);
     ns = (nl > (Real)1e-18) ? ns * ((Real)1 / sqrt(nl)) : tri.gn;
-    hit.n = (dot(rd, ns) < 0) ? ns : -ns;
+    bool flipped = !(dot(rd, ns) < 0);
+    hit.n = flipped ? -ns : ns;
     hit.tangent = tri.tangent;                 // per-triangle tangent (C6 normal mapping)
     hit.bitangentSign = (Real)tri.bitangentSign;
+    // O3: curvature follows the shaded side, exactly as the host intersectTri does.
+    hit.curv = (Real)(flipped ? -tri.curvature : tri.curvature);
     return true;
 }
 // Interface-preserving wrapper (builds the shear inline) for any one-off caller.
@@ -2568,7 +2577,10 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     hit.t = t; hit.p = ro + rd * t; hit.valid = true;
     DVec3 ng = normalize(hit.p - s.c);
     hit.ng = ng;
-    hit.n = (dot(rd, ng) < 0) ? ng : -ng;
+    bool sFlipped = !(dot(rd, ng) < 0);
+    hit.n = sFlipped ? -ng : ng;
+    // O3: analytic 1/R, negated from inside — mirrors the host intersectSphere.
+    hit.curv = (s.r > 1e-12) ? (Real)((sFlipped ? -1.0 : 1.0) / s.r) : (Real)0;
     hit.matId = s.matId; hit.sensorId = -1;
     // Equirectangular (lat/long) UV so spheres can be textured (mirrors host).
     Real ny = ng.y < (Real)-1 ? (Real)-1 : (ng.y > (Real)1 ? (Real)1 : ng.y);
@@ -2725,6 +2737,10 @@ __device__ static bool intersectCurveSeg(const DCurveRay& cr, const DVec3& ro, c
     const Real tl = sqrt(dot(tg, tg));
     hit.tangent = (tl > (Real)1e-12) ? tg * ((Real)1 / tl) : T;
     hit.bitangentSign = (Real)1;
+    // O3 mean curvature H = 1/(2R) at the local radius — mirrors host intersectCurveSeg.
+    const Real rLoc = s.r0 + (s.r1 - s.r0) * f;
+    const Real hSign = (dot(rd, ng) < (Real)0) ? (Real)1 : (Real)-1;
+    hit.curv = (rLoc > (Real)1e-12) ? hSign * (Real)0.5 / rLoc : (Real)0;
     return true;
 }
 
@@ -2852,6 +2868,9 @@ __device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro
     DVec3 wt = affDir(inst.Wm, lh.tangent);
     Real wtl = sqrt(dot(wt, wt));
     if (wtl > (Real)1e-12) lh.tangent = wt * ((Real)1 / wtl);
+    // O3: rescale curvature into world units and re-flip with the normal — mirrors host.
+    lh.curv *= (Real)inst.curvScale;
+    if (dot(rd, wn) >= 0) lh.curv = -lh.curv;
     if (inst.matOverride >= 0) lh.matId = inst.matOverride;
 }
 
@@ -4323,6 +4342,11 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
             case PatOp::VarR:     st[sp++] = r;  break;
             case PatOp::VarU:     st[sp++] = u;  break;
             case PatOp::VarV:     st[sp++] = v;  break;
+            // This fp32 VM only ever evaluates DF_EXPR implicit FIELDS, which are
+            // functions of a point in space with no surface at all — so `curv` is 0
+            // here for the same reason `f`/`nx`/`u` are, and the host agrees (the CPU
+            // field path builds its PatCtx with curv = 0 too).
+            case PatOp::VarCurv:  st[sp++] = 0.0f; break;
             case PatOp::VarT:     st[sp++] = 0.0f; break;
             case PatOp::Neg:      st[sp-1] = -st[sp-1]; break;
             case PatOp::Abs:      st[sp-1] = fabsf(st[sp-1]); break;
@@ -4438,7 +4462,7 @@ __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit&
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, dPatEnvOf(sc));
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dPatEnvOf(sc));
 }
 
 // Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
@@ -4458,7 +4482,7 @@ __device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, 
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, dPatEnvOf(sc));
+                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dPatEnvOf(sc));
 }
 // Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
 // evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
@@ -4505,14 +4529,14 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
     if (m.recRoughMode == 0) {                             // direct scalar expression
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
+                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv,
                          dPatEnvOf(sc));
     } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
         v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
     } else {                                               // per-hit driven
         double px = h.p.x, py = h.p.y, pz = h.p.z, r = sqrt(px * px + py * py + pz * pz);
         double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
+                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv,
                                 dPatEnvOf(sc));
         v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
                              m.recRoughInterp, h, d);
@@ -4614,7 +4638,7 @@ __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
-                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v,
+                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv,
                             dPatEnvOf(sc));
     out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
                      (double)m.recReflLo, (double)m.recReflHi, d, lambda);
@@ -4694,7 +4718,7 @@ __device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
     double px = y.x, py = y.y, pz = y.z;
     double r = sqrt(px * px + py * py + pz * pz);
     return clamp01(dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                                nOut.x, nOut.y, nOut.z, r, uu, vv, dPatEnvOf(sc)));
+                                nOut.x, nOut.y, nOut.z, r, uu, vv, 0.0, dPatEnvOf(sc)));
 }
 
 // Draw a point on `em` and return the emission-pattern multiplier there, so a caller can
@@ -5814,6 +5838,13 @@ struct DVertex {
     double mediumG;             // HG asymmetry g at a BV_MEDIUM vertex
     int   mediumId;             // sc.media index at a BV_MEDIUM vertex (-1 otherwise)
     Real  u, v;                 // interpolated surface texcoords (per-hit BSDF eval, M9)
+    // Mean curvature at this vertex (O3). Carried for the same reason u/v are: the
+    // connection BSDF is re-evaluated here from a reconstructed DHit, and a material
+    // whose roughness/reflectance is driven by `curv` would otherwise read a DIFFERENT
+    // value on the GPU than on the CPU — where bdpt.h's Vertex keeps the whole Hit and
+    // so gets curvature for free. Matching it here is what keeps GPU BDPT consistent
+    // with every other integrator on a curvature-driven material.
+    Real  curv;
     // This vertex's `emit pattern:` factor (device twin of bdpt.h Vertex::emitPatW),
     // cached because dVertexLe is called from several MIS strategies and has no DHit to
     // re-evaluate the pattern from. 1 for a non-emissive vertex or an unpatterned light,
@@ -5872,7 +5903,7 @@ __device__ static inline DHit dVertHit(const DVertex& vt) {
     h.t = (Real)0; h.valid = true;
     h.p = vt.p; h.n = vt.ns; h.ng = vt.ng;
     h.matId = vt.matId; h.sensorId = -1;
-    h.u = vt.u; h.v = vt.v;
+    h.u = vt.u; h.v = vt.v; h.curv = vt.curv;
     return h;
 }
 
@@ -8253,7 +8284,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // Host twin: bdpt.h's slotPatMul at the same hit.
         v.emitPatW = (mp->emitPat >= 0) ? (Real)dEmitPatMul(sc, mp->emitPat, h) : (Real)1;
         v.mediumG = 0.0; v.mediumId = -1;
-        v.u = h.u; v.v = h.v;   // per-hit texcoords for textured/patterned/record BSDF eval (M9)
+        v.u = h.u; v.v = h.v; v.curv = h.curv;   // per-hit texcoords + curvature for textured/patterned/record BSDF eval (M9, O3)
         v.nUp = nUp;
         v.pdfFwd = dConvertDensity(pdfFwd, path[n - 1], v);
         path[n] = v; int cur = n; n++;
@@ -9742,6 +9773,12 @@ struct DVcmLV {
     float  lambda;
     int    matId, edges;
     Real   u, v;
+    Real   curv;           // O3 mean curvature — here for the same reason u/v are: the
+                           // connection BSDF is re-evaluated at this vertex, so a
+                           // curvature-driven material must not read a different value
+                           // in VCM than in every other integrator. Costs 8 B/slot after
+                           // alignment (the slab goes 128 -> 136 B), which is the price
+                           // of that consistency on the largest allocation in a session.
     int    nUp;            // hero wavelengths still live here (1 == de-hero'd / single-λ)
 };
 
@@ -9781,13 +9818,13 @@ __device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
     DVertex v; v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
-    v.mediumG = 0; v.mediumId = -1; v.u = h.u; v.v = h.v; return v;
+    v.mediumG = 0; v.mediumId = -1; v.u = h.u; v.v = h.v; v.curv = h.curv; return v;
 }
 __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
     DVertex v; v.type = BV_SURFACE; v.p = lv.p; v.ns = lv.ns; v.ng = lv.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = lv.matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
-    v.mediumG = 0; v.mediumId = -1; v.u = lv.u; v.v = lv.v; return v;
+    v.mediumG = 0; v.mediumId = -1; v.u = lv.u; v.v = lv.v; v.curv = lv.curv; return v;
 }
 
 // Sample a scattering continuation at a surface vertex (device twin of vcm.h scatterSample).
@@ -10148,7 +10185,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     lv.beta = beta; lv.lambda = (float)lambda;
                     lv.cx = cieLx; lv.cy = cieLy; lv.cz = cieLz;
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
-                    lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v;
+                    lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v; lv.curv = h.curv;
                     lv.nUp = nUp;
                     lvSlab[i * vcmCap + stored] = lv;
                     if (NS > 0 && lvSec) {
@@ -11171,6 +11208,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.n2 = {t.n2.x, t.n2.y, t.n2.z};
         d.tangent = {t.tangent.x, t.tangent.y, t.tangent.z};
         d.bitangentSign = t.bitangentSign;
+        d.curvature = t.curvature;      // O3 per-face mean curvature (from Tri::finalize)
         d.matId = t.matId; d.sensorId = t.sensorId;
         return d;
     };
@@ -11254,6 +11292,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.Nm[3] = inv.m[1]; d.Nm[4] = inv.m[4]; d.Nm[5] = inv.m[7];
         d.Nm[6] = inv.m[2]; d.Nm[7] = inv.m[5]; d.Nm[8] = inv.m[8];
         for (int k = 0; k < 9; ++k) d.Wm[k] = in.toWorld.m[k];   // tangent local->world (C6)
+        d.curvScale = in.curvScale;                              // curvature local->world (O3)
         d.blasId = in.blasId; d.matOverride = in.matOverride;
     }
     (void)haveInstances;

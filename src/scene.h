@@ -952,6 +952,26 @@ struct MeshInstance {
     Affine toWorld = Affine::identity();   // local -> world
     Affine toLocal = Affine::identity();   // world -> local (= toWorld.inverse())
     int matOverride = -1;                  // >=0 replaces the BLAS triangles' matId
+    // Derived from toWorld: the factor a LOCAL curvature (1/length) is multiplied by to
+    // become a WORLD curvature (O3). Curvature is inverse-length, so it scales by
+    // 1/|det(linear)|^(1/3) — the average linear scale. Cached rather than recomputed
+    // per hit: instanceHitToWorld is on the shading hot path and this needs a cbrt.
+    // Exact for a uniform scale; an approximation under a non-uniform one (see
+    // instanceHitToWorld). 1.0 for any rigid transform.
+    double curvScale = 1.0;
+    // The ONLY way to set the transform, so the derived curvScale (and toLocal) can
+    // never silently go stale behind a direct `inst.toWorld = …` assignment.
+    void setToWorld(const Affine& xf) {
+        toWorld = xf;
+        toLocal = xf.inverse();
+        const double* m = xf.m;
+        double det = m[0] * (m[4] * m[8] - m[5] * m[7])
+                   - m[1] * (m[3] * m[8] - m[5] * m[6])
+                   + m[2] * (m[3] * m[7] - m[4] * m[6]);
+        double a = std::fabs(det);
+        double s = (a > 1e-30) ? std::cbrt(a) : 1.0;   // average linear scale
+        curvScale = 1.0 / s;
+    }
 };
 
 // A named mesh object as authored (one `mesh` or `mesh_asset` block), kept so tools
@@ -1588,6 +1608,15 @@ struct Scene {
         Vec3 wt = inst.toWorld.applyDir(lh.tangent);
         double wtl = std::sqrt(dot(wt, wt));
         if (wtl > 1e-12) lh.tangent = wt * (1.0 / wtl);
+        // Curvature is 1/LENGTH, so an instance that scales the mesh must scale it too:
+        // blow a sphere up 10x and it gets ten times flatter. The factor is the average
+        // linear scale |det(linear)|^(1/3), which is exact for a uniform scale (the case
+        // that matters) and a reasonable mean under a mild non-uniform one — a genuinely
+        // anisotropic scale changes the two principal curvatures by DIFFERENT amounts, so
+        // no single scalar can be right and this is documented as an approximation.
+        // Also re-flip if the world-space re-orientation flipped the shading normal.
+        lh.curv *= inst.curvScale;
+        if (dot(r.d, wn) >= 0.0) lh.curv = -lh.curv;
         if (inst.matOverride >= 0) lh.matId = inst.matOverride;
     }
 
@@ -1837,7 +1866,7 @@ inline void bindPatScene(PatCtx& c, const Scene& s) {
 // the scene's pattern tables (so `tex:<name>(u,v)` and `grid:<name>(…)` sampling
 // inside a pattern work).
 inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
-    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v);
+    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v, h.curv);
     bindPatScene(c, scene);
     return c;
 }

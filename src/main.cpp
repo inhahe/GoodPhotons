@@ -3130,6 +3130,339 @@ static int checkWorley() {
     return ok ? 0 : 1;
 }
 
+// Deterministic mean-curvature self-test (`-checkcurv`): the `curv` free variable
+// (O3 — non-stationary randomness). Runs with no scene and no renderer.
+//
+// `curv` is mean curvature H = 1/2 * trace(shape operator) in 1/length units, derived
+// once per triangle in Tri::finalize() from the interpolated shading-normal field, and
+// analytically for spheres and curve segments. It is signed RELATIVE TO THE SHADED
+// SIDE: every intersector negates it when it flips the normal to face the ray.
+//
+// What each section is actually defending, and the mutation it catches:
+//   §1 tessellated sphere of radius R -> H == 1/R on every face, and scaling the mesh
+//      by s scales H by 1/s. Curvature is 1/length; a mutation that forgot to divide by
+//      the Gram determinant (or divided by area instead of area^2) would still read
+//      "about right" at R = 1 and blow up everywhere else, so the radius sweep — not the
+//      unit sphere — is the real test.
+//   §2 a flat-shaded triangle (n0==n1==n2==gn) reads EXACTLY 0. dn = 0 there, so any
+//      stray additive term in the trace shows up as a nonzero on a facet.
+//   §3 sign / side, through the real intersectSphere: a ray hitting a sphere from
+//      OUTSIDE reads +1/R, the same sphere hit from INSIDE reads -1/R. This is the only
+//      section that exercises the flip-negation, and it is the one that fails if the
+//      convention is ever "always outward" instead of "relative to the shaded side".
+//   §4 a saddle: vertex normals whose two principal curvatures cancel give H ~ 0 even
+//      though |dn| is large. Tests the TRACE rather than a magnitude — a mutation using
+//      |dn| or sqrt(dn.dn) passes §1 and §5 and dies here.
+//   §5 a cylinder of radius R: H = 1/(2R), not 1/R and not 0. Mean curvature averages
+//      the two principal curvatures (1/R and 0); Gaussian curvature would be 0 here.
+//      Catches a mutated 0.5 factor and catches confusing the two curvature notions.
+//   §6 basis independence: permuting the vertex order and skewing the triangle to a very
+//      non-equilateral shape must not change H. The dual-basis inversion is exactly what
+//      makes this true — the naive dot(e1,dn1)/|e1|^2 + dot(e2,dn2)/|e2|^2 is only right
+//      for an orthogonal edge pair, so this is the section that catches dropping it.
+//   §7 the VM: `curv` compiles in a surface expression and reaches PatCtx.curv, is
+//      REJECTED in an upsample body (a disjoint r/g/b/w vocabulary with no surface), is
+//      visible to patternHasFreeVars (else a curvature-driven material would be constant-
+//      folded at load time into whatever the first hit happened to be), and is CSE-keyed.
+//   §8 a curve segment through the real intersectCurveSeg: a fiber of radius r is a
+//      surface of revolution with H = 1/(2r), which is enormous for hair-scale radii —
+//      the honest answer, and worth pinning so nobody "fixes" it to 1/r.
+static int checkCurv() {
+    double worst = 0.0;
+    bool ok = true;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkcurv] %-46s got %.12g want %.12g  err=%.3g  BAD\n", what, got, want, e);
+        return e <= tol;
+    };
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    auto frand = [&]() {   // [0,1)
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+    auto mkTri = [](const Vec3& a, const Vec3& b, const Vec3& c,
+                    const Vec3& na, const Vec3& nb, const Vec3& nc) {
+        Tri t; t.v0 = a; t.v1 = b; t.v2 = c; t.n0 = na; t.n1 = nb; t.n2 = nc;
+        t.finalize(); return t;
+    };
+
+    // ---- §1: tessellated sphere -> H = 1/R, and H scales as 1/R ---------------
+    // Exact analytic vertex normals (n = (p-c)/R), so the interpolated normal field is
+    // the sphere's own and H must be exactly 1/R up to the linearisation error of a
+    // finite facet. That error shrinks with the facet, so the tolerance is relative and
+    // generous rather than tight — the point is the 1/R LAW, checked over 4 decades.
+    {
+        const double radii[] = { 0.01, 0.1, 1.0, 10.0, 100.0 };
+        for (double R : radii) {
+            const int NLAT = 24, NLON = 48;
+            double wrel = 0.0;
+            auto sph = [&](int i, int j) {
+                double th = M_PI * (double)i / (double)NLAT;
+                double ph = 2.0 * M_PI * (double)j / (double)NLON;
+                return Vec3{ std::sin(th) * std::cos(ph), std::cos(th), std::sin(th) * std::sin(ph) };
+            };
+            for (int i = 0; i < NLAT; ++i)
+                for (int j = 0; j < NLON; ++j) {
+                    Vec3 a = sph(i, j), b = sph(i + 1, j), c = sph(i + 1, j + 1);
+                    Tri t = mkTri(a * R, b * R, c * R, a, b, c);
+                    // skip the degenerate slivers at the poles, where a whole edge collapses
+                    if (dot(cross(t.v1 - t.v0, t.v2 - t.v0), cross(t.v1 - t.v0, t.v2 - t.v0))
+                        < 1e-18 * R * R * R * R) continue;
+                    wrel = std::fmax(wrel, std::fabs(t.curvature - 1.0 / R) * R);
+                }
+            char lbl[80];
+            std::snprintf(lbl, sizeof lbl, "S1 sphere R=%g -> H=1/R (relative)", R);
+            ok &= chk(lbl, wrel, 0.0, 2e-3);
+        }
+    }
+
+    // ---- §2: a flat-shaded facet is exactly flat ------------------------------
+    {
+        double w = 0.0;
+        for (int i = 0; i < 256; ++i) {
+            Vec3 a{ frand() * 4 - 2, frand() * 4 - 2, frand() * 4 - 2 };
+            Vec3 b{ frand() * 4 - 2, frand() * 4 - 2, frand() * 4 - 2 };
+            Vec3 c{ frand() * 4 - 2, frand() * 4 - 2, frand() * 4 - 2 };
+            Tri t; t.v0 = a; t.v1 = b; t.v2 = c; t.finalize();   // no vn => flat
+            w = std::fmax(w, std::fabs(t.curvature));
+        }
+        ok &= chk("S2 flat-shaded facet H == 0", w, 0.0, 0.0);
+    }
+
+    // ---- §3: sign is relative to the shaded side (via intersectSphere) --------
+    {
+        const double R = 2.5;
+        Sphere s; s.c = Vec3{0.3, -1.1, 0.7}; s.r = R;
+        double wOut = 0.0, wIn = 0.0;
+        for (int i = 0; i < 128; ++i) {
+            // a random direction; shoot inward from far away, and outward from the centre
+            double z = frand() * 2 - 1, ph = frand() * 2 * M_PI, sr = std::sqrt(std::fmax(0.0, 1 - z * z));
+            Vec3 d{ sr * std::cos(ph), sr * std::sin(ph), z };
+            Hit ho; ho.t = DBL_MAX;
+            Ray rout{ s.c + d * (R * 10.0), d * -1.0 };
+            if (intersectSphere(rout, s, 1e-6, ho) && ho.valid)
+                wOut = std::fmax(wOut, std::fabs(ho.curv - 1.0 / R));
+            else { std::printf("[checkcurv] S3 outside ray missed  BAD\n"); ok = false; }
+            Hit hi; hi.t = DBL_MAX;
+            Ray rin{ s.c, d };
+            if (intersectSphere(rin, s, 1e-6, hi) && hi.valid)
+                wIn = std::fmax(wIn, std::fabs(hi.curv - (-1.0 / R)));
+            else { std::printf("[checkcurv] S3 inside ray missed  BAD\n"); ok = false; }
+        }
+        ok &= chk("S3 sphere hit from outside -> +1/R", wOut, 0.0, 1e-12);
+        ok &= chk("S3 same sphere from inside  -> -1/R", wIn,  0.0, 1e-12);
+    }
+
+    // ---- §4: a saddle has H ~ 0 despite a large |dn| --------------------------
+    // Take the graph z = (x^2 - y^2)/(2a) at the origin: principal curvatures +1/a and
+    // -1/a, so H = 0 exactly. Sample a small triangle around the origin with the exact
+    // analytic normals of that surface; the residual is the facet linearisation error.
+    {
+        const double a = 1.0;
+        auto srf = [&](double x, double y) { return Vec3{ x, y, (x * x - y * y) / (2 * a) }; };
+        auto nrm = [&](double x, double y) { return normalize(Vec3{ -x / a, y / a, 1.0 }); };
+        double w = 0.0, mag = 0.0;
+        const double hstep = 1e-3;
+        for (int k = 0; k < 32; ++k) {
+            double ang = 2.0 * M_PI * (double)k / 32.0;
+            double x1 = hstep * std::cos(ang),        y1 = hstep * std::sin(ang);
+            double x2 = hstep * std::cos(ang + 2.09), y2 = hstep * std::sin(ang + 2.09);
+            Tri t = mkTri(srf(0, 0), srf(x1, y1), srf(x2, y2),
+                          nrm(0, 0), nrm(x1, y1), nrm(x2, y2));
+            w = std::fmax(w, std::fabs(t.curvature));
+            Vec3 d1 = t.n1 - t.n0, d2 = t.n2 - t.n0;
+            mag = std::fmax(mag, std::sqrt(std::fmax(dot(d1, d1), dot(d2, d2))));
+        }
+        ok &= chk("S4 saddle H == 0 (trace, not magnitude)", w, 0.0, 1e-6);
+        // guard the guard: if |dn| were ~0 the section would pass vacuously
+        if (!(mag > 1e-5)) { std::printf("[checkcurv] S4 |dn| too small (%.3g) — vacuous  BAD\n", mag); ok = false; }
+    }
+
+    // ---- §5: a cylinder of radius R has H = 1/(2R), not 1/R -------------------
+    {
+        const double radii[] = { 0.25, 1.0, 7.0 };
+        for (double R : radii) {
+            const int NANG = 64, NAX = 4;
+            double wrel = 0.0;
+            auto cyl = [&](int i, int j, Vec3& p, Vec3& n) {
+                double ph = 2.0 * M_PI * (double)i / (double)NANG;
+                n = Vec3{ std::cos(ph), 0.0, std::sin(ph) };
+                p = Vec3{ R * n.x, (double)j * (R * 0.5), R * n.z };
+            };
+            for (int i = 0; i < NANG; ++i)
+                for (int j = 0; j < NAX; ++j) {
+                    Vec3 pa, na, pb, nb, pc, nc;
+                    cyl(i, j, pa, na); cyl(i + 1, j, pb, nb); cyl(i + 1, j + 1, pc, nc);
+                    Tri t = mkTri(pa, pb, pc, na, nb, nc);
+                    wrel = std::fmax(wrel, std::fabs(t.curvature - 0.5 / R) * R);
+                }
+            char lbl[80];
+            std::snprintf(lbl, sizeof lbl, "S5 cylinder R=%g -> H=1/(2R) (relative)", R);
+            ok &= chk(lbl, wrel, 0.0, 3e-3);
+        }
+    }
+
+    // ---- §6: basis independence — skewed edges, on a NON-umbilic surface ------
+    // The trace of a linear map does not depend on the basis it is read in, but only when
+    // the DUAL basis is used. The naive per-edge sum dot(e1,dn1)/|e1|^2 + dot(e2,dn2)/|e2|^2
+    // is right only for an ORTHOGONAL edge pair, so this section deliberately skews them.
+    //
+    // It has to be run on a CYLINDER, not a sphere. A sphere is umbilic — dn is a multiple
+    // of the identity there, so the naive sum returns the correct 1/R for *every* basis,
+    // orthogonal or not. That makes a sphere blind to this mutation (confirmed by mutation
+    // testing: the naive form passes S1 and an earlier sphere-based S6, and is caught only
+    // where the two principal curvatures differ). On a cylinder the same skew reads
+    // ~0.75/R instead of 0.5/R — a 50% error.
+    {
+        const double R = 1.3;
+        auto cylP = [&](double ph, double y) { return Vec3{ R * std::cos(ph), y, R * std::sin(ph) }; };
+        auto cylN = [&](double ph)           { return Vec3{ std::cos(ph), 0.0, std::sin(ph) }; };
+        double wperm = 0.0, wskew = 0.0;
+        for (int k = 0; k < 64; ++k) {
+            double ph0 = frand() * 2 * M_PI, y0 = (frand() - 0.5) * 4.0;
+            const double dph = 0.02;
+            // e1 runs purely circumferentially, e2 shares that circumferential run and adds
+            // an axial one: e1.e2 = (R*dph)^2 != 0, so the Gram matrix is far from diagonal.
+            double ph1 = ph0 + dph,        y1 = y0;
+            double ph2 = ph0 + dph,        y2 = y0 + R * dph * 1.4;
+            Vec3 pa = cylP(ph0, y0), pb = cylP(ph1, y1), pc = cylP(ph2, y2);
+            Vec3 na = cylN(ph0),     nb = cylN(ph1),     nc = cylN(ph2);
+            Tri t0 = mkTri(pa, pb, pc, na, nb, nc);
+            Tri t1 = mkTri(pb, pc, pa, nb, nc, na);   // rotate the vertex order
+            Tri t2 = mkTri(pa, pc, pb, na, nc, nb);   // swap two (flips gn, but not H)
+            wperm = std::fmax(wperm, std::fabs(t1.curvature - t0.curvature) * R);
+            wperm = std::fmax(wperm, std::fabs(t2.curvature - t0.curvature) * R);
+            wskew = std::fmax(wskew, std::fabs(t0.curvature - 0.5 / R) * R);
+        }
+        ok &= chk("S6 H invariant under vertex permutation", wperm, 0.0, 1e-9);
+        ok &= chk("S6 skewed edges still read 1/(2R) (rel)", wskew, 0.0, 1e-3);
+    }
+
+    // ---- §7: the VM path ------------------------------------------------------
+    {
+        std::vector<PatNode> prog; std::string perr;
+        if (!compilePatternExpr("curv", prog, perr)) {
+            std::printf("[checkcurv] S7 compile `curv` FAILED: %s\n", perr.c_str());
+            ok = false;
+        } else {
+            double w = 0.0;
+            for (int i = 0; i < 64; ++i) {
+                double want = (frand() - 0.5) * 20.0;
+                PatCtx c = makePatCtx(Vec3{0.1, 0.2, 0.3}, 0.0, Vec3{0, 0, 1}, 0.0, 0.0, want);
+                w = std::fmax(w, std::fabs(patternEval(prog.data(), (int)prog.size(), c) - want));
+            }
+            ok &= chk("S7 VM `curv` == PatCtx.curv", w, 0.0, 0.0);
+            if (!patternHasFreeVars(prog)) {
+                std::printf("[checkcurv] S7 patternHasFreeVars(`curv`) is false — would const-fold  BAD\n");
+                ok = false;
+            }
+        }
+        // default PatCtx (no curvature supplied) must be a clean 0, not garbage
+        {
+            std::vector<PatNode> p2; std::string e2;
+            if (compilePatternExpr("curv", p2, e2)) {
+                PatCtx c = makePatCtx(Vec3{1, 2, 3}, 0.0, Vec3{0, 1, 0});
+                ok &= chk("S7 default PatCtx.curv == 0",
+                          patternEval(p2.data(), (int)p2.size(), c), 0.0, 0.0);
+            }
+        }
+        // an upsample body has a disjoint r/g/b/w vocabulary and no surface: reject
+        {
+            std::vector<PatNode> p3; std::string e3;
+            if (compilePatternExpr("curv", p3, e3, false, nullptr, nullptr, false,
+                                   PatVarMode::Upsample)) {
+                std::printf("[checkcurv] S7 `curv` compiled in an upsample body  BAD\n");
+                ok = false;
+            }
+        }
+        // CSE must fold a repeated curv-rooted SUBTREE, and the fold must still be right.
+        // Note the subtree has to be more than the bare leaf: a postfix program spends one
+        // node on `curv` either way, so `curv + curv` legitimately cannot shrink. What must
+        // shrink is a compound expression built on it — which is also the case that matters,
+        // since that is what a real curvature-driven material writes.
+        {
+            std::vector<PatNode> same, opt; std::string e4;
+            const char* expr = "abs(curv * 2 + 1) + abs(curv * 2 + 1)";
+            if (!compilePatternExpr(expr, same, e4)) {
+                std::printf("[checkcurv] S7 compile `%s` FAILED: %s\n", expr, e4.c_str()); ok = false;
+            } else {
+                opt = same; patternOptimizeCSE(opt);
+                if (opt.size() >= same.size()) {
+                    std::printf("[checkcurv] S7 CSE did not shrink `%s` (%zu -> %zu)  BAD\n",
+                                expr, same.size(), opt.size());
+                    ok = false;
+                }
+                PatCtx c = makePatCtx(Vec3{0, 0, 0}, 0.0, Vec3{0, 0, 1}, 0.0, 0.0, -3.25);
+                ok &= chk("S7 CSE'd curv subtree evaluates right",
+                          patternEval(opt.data(), (int)opt.size(), c), 11.0, 0.0);
+            }
+        }
+    }
+
+    // ---- §8: a curve segment reads H = 1/(2r) ---------------------------------
+    {
+        const double radii[] = { 0.001, 0.05, 0.5 };
+        for (double rr : radii) {
+            CurveSeg s; s.p0 = Vec3{-1, 0, 0}; s.p1 = Vec3{1, 0, 0}; s.r0 = rr; s.r1 = rr;
+            Vec3 d{0, 0, 1};
+            Ray r{ Vec3{0.13, 0.0, -5.0}, d };
+            CurveRay cr = makeCurveRay(d);
+            Hit h; h.t = DBL_MAX;
+            if (!intersectCurveSeg(cr, r, s, 1e-9, h) || !h.valid) {
+                std::printf("[checkcurv] S8 curve r=%g missed  BAD\n", rr); ok = false; continue;
+            }
+            char lbl[80];
+            std::snprintf(lbl, sizeof lbl, "S8 curve r=%g -> H=1/(2r)", rr);
+            ok &= chk(lbl, h.curv * rr, 0.5, 1e-9);   // scaled so the tolerance is relative
+        }
+    }
+
+    // ---- §9: instancing rescales curvature by 1/scale -------------------------
+    // Curvature is 1/length, so a BLAS hit's LOCAL curvature must be divided by the
+    // instance's linear scale on the way out to world space. MeshInstance caches that
+    // factor in setToWorld(); the identities pinned here are the ones a reader would
+    // assume and a mutation would break: rigid => 1 (a rotation or translation must not
+    // touch curvature at all), uniform s => 1/s, and non-uniform => the cube root of
+    // |det|, the average linear scale.
+    {
+        auto scaleXf = [](double sx, double sy, double sz) {
+            Affine a; a.m[0] = sx; a.m[4] = sy; a.m[8] = sz; return a;
+        };
+        MeshInstance mi;
+        mi.setToWorld(Affine::identity());
+        ok &= chk("S9 identity instance curvScale == 1", mi.curvScale, 1.0, 0.0);
+        // a pure rotation about Y: det = 1, so curvature is untouched
+        {
+            double th = 0.7; Affine rot;
+            rot.m[0] = std::cos(th); rot.m[2] = std::sin(th);
+            rot.m[6] = -std::sin(th); rot.m[8] = std::cos(th);
+            rot.t = Vec3{5, -3, 2};                       // translation is irrelevant too
+            mi.setToWorld(rot);
+            ok &= chk("S9 rigid instance curvScale == 1", mi.curvScale, 1.0, 1e-15);
+        }
+        const double us[] = { 0.1, 0.5, 2.0, 37.0 };
+        for (double s : us) {
+            mi.setToWorld(scaleXf(s, s, s));
+            char lbl[80]; std::snprintf(lbl, sizeof lbl, "S9 uniform scale %g -> 1/%g", s, s);
+            ok &= chk(lbl, mi.curvScale, 1.0 / s, 1e-12);
+        }
+        mi.setToWorld(scaleXf(2.0, 4.0, 8.0));            // |det|^(1/3) = 4
+        ok &= chk("S9 non-uniform scale -> 1/cbrt|det|", mi.curvScale, 0.25, 1e-12);
+        // a degenerate (flattened) instance must not produce inf/NaN downstream
+        mi.setToWorld(scaleXf(1.0, 0.0, 1.0));
+        if (!std::isfinite(mi.curvScale)) {
+            std::printf("[checkcurv] S9 degenerate instance curvScale is not finite  BAD\n");
+            ok = false;
+        }
+    }
+
+    std::printf("[checkcurv] worst absolute error = %.3g\n", worst);
+    std::printf("[checkcurv] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Deterministic N-D scatter sampler self-test (src/pattern.h: PatScatter /
 // patScatterSample, reached from a pattern expression as `scatter:<name>(c0, …)`).
 // The ragged sibling of -checkgrid; validates, with no scene and no renderer:
@@ -8263,6 +8596,7 @@ static int run(int argc, char** argv) {
     bool checkGridOnly = false;
     bool checkVNoiseOnly = false;
     bool checkWorleyOnly = false;
+    bool checkCurvOnly = false;
     bool checkScatterOnly = false;
     bool checkBindOnly = false;
     bool checkPropOnly = false;
@@ -8676,6 +9010,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkgrid")) checkGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkvnoise")) checkVNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkworley")) checkWorleyOnly = true;
+        else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkscatter")) checkScatterOnly = true;
         else if (!std::strcmp(argv[i], "-checkbind")) checkBindOnly = true;
         else if (!std::strcmp(argv[i], "-checkprop")) checkPropOnly = true;
@@ -8861,6 +9196,7 @@ static int run(int argc, char** argv) {
     if (checkGridOnly)     return checkGrid();     // deterministic, no scene needed
     if (checkVNoiseOnly)   return checkVNoise();   // ditto (vector noise / domain warp)
     if (checkWorleyOnly)   return checkWorley();   // ditto (cellular / Worley noise)
+    if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkScatterOnly)  return checkScatter();  // ditto (the ragged sibling)
     if (checkBindOnly)     return checkBind();     // deterministic, no scene needed
     if (checkPropOnly)     return checkProp();     // ditto (loads in-memory scenes only)
