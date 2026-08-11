@@ -22,40 +22,22 @@
 //
 // RECONSTRUCTING THE ODF FROM A SECOND MOMENT.  The grid stores only `T = <t t^T>`, so the
 // ODF has to be reconstructed from it.  A second moment does not determine a distribution,
-// so this is a modelling choice, and the one made here is the ANGULAR CENTRAL GAUSSIAN:
-//
-//      p(t) ~ (t^T A^-1 t)^(-3/2)      sampled as   t = normalize(sqrt(A) g),  g ~ N(0, I)
-//
-// with A symmetric positive semi-definite, sharing T's eigenvectors.  Three things recommend
-// it over the obvious alternatives:
-//
-//   * ITS THREE CORNER CASES ARE EXACT, and they are exactly the three corners of the space
-//     of orientation tensors.  `A = diag(1,0,0)` is a delta on one axis — locally parallel
-//     strands, where real fur spends nearly all its time.  `A = I` is the uniform sphere.
-//     `A = diag(1,1,0)` is the UNIFORM GREAT CIRCLE — a girdle, strands lying every which way
-//     within a common plane, which is what happens over a whorl or wherever a coat sweeps
-//     across curvature inside one cell.  A mixture of bipolar lobes (an earlier draft used
-//     Watson lobes on T's eigenvectors) is exact at the first two and badly wrong at the
-//     third: it turns a uniform ring into two orthogonal deltas, and measured 43% L1 error
-//     against the population it stands for.  The ACG measures ~2%.
-//   * IT IS MOMENT-MATCHED EVERYWHERE ELSE.  `A` is recovered from T by inverting
-//     `m_i(A) = a_i * INTEGRAL_0^inf du / [ (1 + 2 u a_i) * PROD_j sqrt(1 + 2 u a_j) ]`,
-//     which `AcgTable` does once at startup over the whole (compact, triangular) space of
-//     eigenvalue triples and then interpolates.  So the phase function and the extinction
-//     are read off the same tensor and cannot drift apart.
-//   * IT IS TRIVIAL AND EXACT TO SAMPLE — three Gaussians and a normalise, no rejection, no
-//     inverse-CDF table, no failure mode when the distribution is nearly a delta.
+// so this is a modelling choice, and the one made here is the BINGHAM — the MAXIMUM-ENTROPY
+// distribution on the sphere with a given second moment, which is the precise sense in which
+// it assumes nothing beyond what the grid stored.  Two cheaper families were built and
+// MEASURED against explicit fiber populations before it, and each fails a case real fur
+// contains; the comparison table and the reasoning are at `struct BinghamTable` below.
 //
 // THE SIGN.  `t t^T == (-t)(-t)^T`, so everything above is antipodally symmetric (which is
-// also why the ACG is the right family and a von Mises-Fisher would have had to be
+// also why an axial family is the right one and a von Mises-Fisher would have had to be
 // symmetrised by hand).  The sign is therefore NOT in the second moment, and it is not
 // ignorable either: the cuticle tilt `alpha` tips the R and TRT lobes toward the root, so
 // reversing a tangent moves the aggregate response — by 27% on a perfectly parallel cell,
 // which is the case everything else in this file gets exactly right.  So the sign comes from
 // a separate quantity, the cell's FIRST moment `v = sum(r l t)/sum(r l)`, which `FurGrid`
 // stores in the four bytes the unit trace made redundant.  `FurODF::orient` spends it: draw
-// the axis from the ACG, then point it along `v` with probability `(1 + |v|)/2`.  The two
-// moments never interfere — no choice of sign can change `T`.
+// the AXIS from the Bingham, then point it along `v` with probability `(1 + |v|)/2`.  The
+// two moments never interfere — no choice of sign can change `T`.
 
 #pragma once
 
@@ -67,6 +49,7 @@
 #include "rng.h"
 #include "hair.h"
 #include "fur_grid.h"
+#include "vdbgrid.h"   // halfBitsToFloat / floatToHalfBits (the fp16 helpers, not the grid)
 
 namespace furvol {
 
@@ -351,35 +334,68 @@ struct FurODF {
     Vec3   mean{0, 0, 0};                       // unit mean tangent, or zero if unoriented
     double pAlign = 0.5;                        // P(sampled tangent points along `mean`)
 
-    static FurODF fromCell(const FurCell& fc) {
-        FurODF o;
-        o.mean   = furMeanDir(fc.mdir);
+    // Kent's tuning constant: the unique root in (0,3] of SUM 1/(bk + 2 lam_i) = 1.  `warm`
+    // is a starting guess (0 = none); with one, three Newton steps land on the root to
+    // machine precision, which is what makes a CACHED bk safe to refine rather than trust.
+    static double kentBk(const double lam[3], double warm = 0.0) {
+        auto f = [&](double x) {
+            double s = -1.0;
+            for (int i = 0; i < 3; ++i) s += 1.0 / (x + 2.0 * lam[i]);
+            return s;
+        };
+        double bk = (warm > 1e-9 && warm <= 3.0) ? warm : 0.0;
+        if (bk <= 0.0) {                                // cold: bisect, f is strictly falling
+            double lo = 1e-9, hi = 3.0;
+            for (int it = 0; it < 60; ++it) {
+                const double mid = 0.5 * (lo + hi);
+                if (f(mid) > 0.0) lo = mid; else hi = mid;
+            }
+            return 0.5 * (lo + hi);
+        }
+        for (int it = 0; it < 3; ++it) {
+            double d = 0.0;
+            for (int i = 0; i < 3; ++i) { const double q = bk + 2.0 * lam[i]; d -= 1.0 / (q * q); }
+            if (!(std::fabs(d) > 1e-30)) break;
+            bk = std::min(3.0, std::max(1e-9, bk - f(bk) / d));
+        }
+        return bk;
+    }
+
+    // Everything downstream of the eigenbasis, the two concentrations and the packed mean.
+    // Split out from `fromCell` because THIS half is cheap and the other half is not: a
+    // Jacobi eigendecomposition plus a table lookup, per collision, would dominate the far
+    // tier.  `FurVolume` precomputes the expensive half per cell and calls this.
+    void finish(uint32_t mdir, double warmBk = 0.0) {
+        mean = furMeanDir(mdir);
         // A two-delta population with a fraction q along +v and 1-q along -v has
         // |mean| = |2q - 1|, so q = (1 + |mean|) / 2 EXACTLY.  That rule is also right at
         // both ends of the general case: a perfectly combed cell always aligns, an
         // unoriented one is a coin flip, and it is monotone in between.
-        o.pAlign = 0.5 * (1.0 + furMeanCoherence(fc.mdir));
-        const double m[6] = {fc.txx, fc.tyy, furTzz(fc), fc.txy, fc.txz, fc.tyz};
-        symEigen3(m, o.e, o.tau);
-        double s = 0.0;
-        for (int i = 0; i < 3; ++i) { o.tau[i] = std::max(0.0, o.tau[i]); s += o.tau[i]; }
-        if (s > 1e-30) for (int i = 0; i < 3; ++i) o.tau[i] /= s;
-        bingham().lookup(o.tau, o.b);
-        for (int i = 0; i < 3; ++i) o.lam[i] = std::max(0.0, o.b[0] - o.b[i]);
-        // Kent's tuning constant: the unique root in (0,3] of SUM 1/(bk + 2 lam_i) = 1.
-        double lo = 1e-9, hi = 3.0;
-        for (int it = 0; it < 60; ++it) {
-            const double mid = 0.5 * (lo + hi);
-            double f = 0.0;
-            for (int i = 0; i < 3; ++i) f += 1.0 / (mid + 2.0 * o.lam[i]);
-            if (f > 1.0) lo = mid; else hi = mid;
-        }
-        const double bk = 0.5 * (lo + hi);
+        pAlign = 0.5 * (1.0 + furMeanCoherence(mdir));
+        for (int i = 0; i < 3; ++i) lam[i] = std::max(0.0, b[0] - b[i]);
+        const double bk = kentBk(lam, warmBk);
         for (int i = 0; i < 3; ++i) {
-            o.om[i] = 1.0 + 2.0 * o.lam[i] / bk;
-            o.sa[i] = 1.0 / std::sqrt(o.om[i]);
+            om[i] = 1.0 + 2.0 * lam[i] / bk;
+            sa[i] = 1.0 / std::sqrt(om[i]);
         }
-        o.invM = 1.0 / (std::exp(-(3.0 - bk) * 0.5) * std::pow(3.0 / bk, 1.5));
+        invM = 1.0 / (std::exp(-(3.0 - bk) * 0.5) * std::pow(3.0 / bk, 1.5));
+    }
+
+    // The eigen half: `T`'s orthonormal eigenvectors and its descending, renormalised
+    // eigenvalues.  Separate so `FurVolume::build` can run it once per cell.
+    static void eigenOf(const FurCell& fc, Vec3 e[3], double tau[3]) {
+        const double m[6] = {fc.txx, fc.tyy, furTzz(fc), fc.txy, fc.txz, fc.tyz};
+        symEigen3(m, e, tau);
+        double s = 0.0;
+        for (int i = 0; i < 3; ++i) { tau[i] = std::max(0.0, tau[i]); s += tau[i]; }
+        if (s > 1e-30) for (int i = 0; i < 3; ++i) tau[i] /= s;
+    }
+
+    static FurODF fromCell(const FurCell& fc) {
+        FurODF o;
+        eigenOf(fc, o.e, o.tau);
+        bingham().lookup(o.tau, o.b);
+        o.finish(fc.mdir);
         return o;
     }
 
@@ -471,5 +487,206 @@ inline Vec3 fiberNormalFor(const Vec3& t, const Vec3& wo, double h) {
     const double a = std::asin(hair::clampd(h, -1.0, 1.0));
     return oPerp * std::cos(a) - bi * std::sin(a);
 }
+
+// ---------------------------------------------------------------------------------------
+// THE MEDIUM ITSELF: a `FurGrid` plus the per-cell ODF the far tier scatters off.
+//
+// WHY A SIDE TABLE AND NOT A CALL.  `FurODF::fromCell` is a Jacobi eigendecomposition, a
+// table lookup and a root find.  That is nothing once per cell and ruinous once per
+// COLLISION, and a path through a dense coat collides tens of times.  So the expensive half
+// is run once per occupied cell at startup and packed into 16 bytes:
+//
+//      two 16:16 octahedral directions   the first two eigenvectors of T (the third is
+//                                        their cross product, and Gram-Schmidt at decode
+//                                        repairs the ~0.002 degrees quantisation costs)
+//      three halves                      b_0, b_1 and Kent's bk
+//
+// Sixteen bytes is deliberately the same order as the grid's own 32, so turning the far tier
+// on raises the coat's memory by half rather than by a factor.  bk is *refined* at decode
+// rather than trusted — three Newton steps from the stored value, which is exact to machine
+// precision and costs nine divisions — because the rejection bound M is only an upper bound
+// when bk really is the root, and a half-precision bk is not.
+//
+// WHY FREE FLIGHT IS EXACT AND NOT DELTA-TRACKED.  `sigma_t` varies from cell to cell, so
+// this is a heterogeneous medium and the reflex is delta tracking against a majorant.  It is
+// not needed: along a FIXED ray the direction argument of `sigma_t(d)` never changes, so
+// sigma_t is piecewise CONSTANT on the DDA's own cell segments.  Inverting `INT sigma_t dt =
+// -log(1-u)` is then a running subtraction inside the same march that already computes tau —
+// no majorant, no null collisions, no dependence on the density ratio between the densest
+// cell and the emptiest.  A coat is exactly the case delta tracking handles worst (a thin
+// skin of very dense cells inside a mostly empty box), so this is not a small win.
+struct FurVolume {
+    struct Rec {                    // 16 bytes; one per grid cell
+        uint32_t d0 = 0, d1 = 0;    // 16:16 octahedral e[0], e[1]
+        uint16_t hb0 = 0, hb1 = 0;  // half-float Bingham concentrations
+        uint16_t hbk = 0;           // half-float Kent bk (refined at decode)
+        uint16_t pad = 0;
+    };
+    const FurGrid* grid = nullptr;
+    std::vector<Rec> rec;
+
+    bool valid() const { return grid && grid->valid && !rec.empty(); }
+    size_t bytes() const { return rec.size() * sizeof(Rec); }
+
+    // 16:16 octahedral, the same mapping `furPackMean` uses at 12:12.
+    static uint32_t packDir(const Vec3& v) {
+        const double s = std::fabs(v.x) + std::fabs(v.y) + std::fabs(v.z);
+        if (!(s > 0.0)) return 0;
+        double x = v.x / s, y = v.y / s;
+        if (v.z < 0.0) {
+            const double nx = (1.0 - std::fabs(y)) * (x >= 0.0 ? 1.0 : -1.0);
+            const double ny = (1.0 - std::fabs(x)) * (y >= 0.0 ? 1.0 : -1.0);
+            x = nx; y = ny;
+        }
+        const uint32_t qx = (uint32_t)std::lround(std::min(1.0, std::max(0.0, x * 0.5 + 0.5)) * 65535.0);
+        const uint32_t qy = (uint32_t)std::lround(std::min(1.0, std::max(0.0, y * 0.5 + 0.5)) * 65535.0);
+        return (qy << 16) | qx;
+    }
+    static Vec3 unpackDir(uint32_t p) {
+        double x = (double)(p & 0xFFFFu) * (1.0 / 65535.0) * 2.0 - 1.0;
+        double y = (double)(p >> 16) * (1.0 / 65535.0) * 2.0 - 1.0;
+        double z = 1.0 - std::fabs(x) - std::fabs(y);
+        if (z < 0.0) {
+            const double nx = (1.0 - std::fabs(y)) * (x >= 0.0 ? 1.0 : -1.0);
+            const double ny = (1.0 - std::fabs(x)) * (y >= 0.0 ? 1.0 : -1.0);
+            x = nx; y = ny;
+        }
+        return normalize(Vec3{x, y, z});
+    }
+
+    // Reconstruct one cell's ODF.  Everything here is O(20 flops) plus three Newton steps.
+    FurODF odfAt(size_t ci) const {
+        FurODF o;
+        const Rec& r = rec[ci];
+        o.e[0] = unpackDir(r.d0);
+        Vec3 e1 = unpackDir(r.d1);
+        // Quantising two unit vectors independently loses their exact orthogonality, and the
+        // Bingham's normalising constant assumes an orthonormal frame.  One Gram-Schmidt
+        // step restores it; the correction is ~1e-5 rad, so nothing else notices.
+        e1 = e1 - o.e[0] * dot(o.e[0], e1);
+        const double l1 = length(e1);
+        if (l1 > 1e-9) o.e[1] = e1 * (1.0 / l1); else onb(o.e[0], o.e[1], o.e[2]);
+        o.e[2] = cross(o.e[0], o.e[1]);
+        o.b[0] = halfBitsToFloat(r.hb0);
+        o.b[1] = halfBitsToFloat(r.hb1);
+        o.b[2] = 0.0;
+        o.finish(grid->cells[ci].mdir, halfBitsToFloat(r.hbk));
+        return o;
+    }
+
+    // One record per occupied cell; empty cells keep a zero one and are never read, since a
+    // collision can only happen where `c > 0`.  `forEach(n, f)` runs `f(i)` for i in [0,n),
+    // however the caller likes — passing it in keeps this header free of the threading layer
+    // and lets the self-test run it serially.  Returns false if the caller's parallel-for was
+    // cancelled (a scene-load stop), in which case the table is partial and unusable.
+    template <class ParallelFor>
+    bool build(const FurGrid& g, ParallelFor&& forEach) {
+        grid = &g;
+        rec.clear();
+        if (!g.valid) return true;
+        bingham();                        // force the startup table before any thread runs
+        rec.assign(g.cells.size(), Rec{});
+        const bool ok = forEach(g.cells.size(), [&](size_t ci) {
+            const FurCell& fc = g.cells[ci];
+            if (!(fc.c > 0.0f)) return;
+            Vec3 e[3]; double tau[3], b[3];
+            FurODF::eigenOf(fc, e, tau);
+            bingham().lookup(tau, b);
+            double lam[3];
+            for (int i = 0; i < 3; ++i) lam[i] = std::max(0.0, b[0] - b[i]);
+            Rec& r = rec[ci];
+            r.d0  = packDir(e[0]);
+            r.d1  = packDir(e[1]);
+            r.hb0 = floatToHalfBits((float)b[0]);
+            r.hb1 = floatToHalfBits((float)b[1]);
+            r.hbk = floatToHalfBits((float)FurODF::kentBk(lam));
+        });
+        if (!ok) rec.clear();
+        return ok;
+    }
+
+    // What a free-flight draw found.
+    struct Flight {
+        bool   hit   = false;   // did a collision happen before `maxDist`
+        double t     = 0.0;     // distance to it
+        double tau   = 0.0;     // optical depth actually traversed (== the sampled one on a
+                                // hit, == the total through the segment on a miss)
+        size_t ci    = 0;       // the colliding cell
+    };
+
+    // Sample a collision along `o + t*d`, t in (0, maxDist].  `u` is one uniform.  Exact
+    // inverse-CDF, by the piecewise-constant argument above: walk the DDA subtracting each
+    // cell segment's optical depth from the target and stop inside the cell that exhausts it.
+    Flight sampleFlight(const Vec3& o, const Vec3& d, double maxDist, double u) const {
+        Flight f;
+        if (!valid() || !(maxDist > 0.0)) return f;
+        const double want = -std::log(std::max(1e-300, 1.0 - u));
+        double t0 = 0.0, t1 = maxDist;
+        for (int a = 0; a < 3; ++a) {                       // slab clip against the grid box
+            const double od = (&d.x)[a], oo = (&o.x)[a];
+            const double bl = (&grid->lo.x)[a], bh = (&grid->hi.x)[a];
+            if (std::fabs(od) < 1e-15) { if (oo < bl || oo > bh) return f; continue; }
+            const double inv = 1.0 / od;
+            double na = (bl - oo) * inv, fa = (bh - oo) * inv;
+            if (na > fa) std::swap(na, fa);
+            t0 = std::max(t0, na); t1 = std::min(t1, fa);
+            if (t0 > t1) return f;
+        }
+        const Vec3 pe = o + d * (t0 + 1e-9);
+        int ix = std::min(grid->nx - 1, std::max(0, (int)((pe.x - grid->lo.x) * grid->invCell.x)));
+        int iy = std::min(grid->ny - 1, std::max(0, (int)((pe.y - grid->lo.y) * grid->invCell.y)));
+        int iz = std::min(grid->nz - 1, std::max(0, (int)((pe.z - grid->lo.z) * grid->invCell.z)));
+        int step[3]; double tMax[3], tDelta[3];
+        for (int a = 0; a < 3; ++a) {
+            const double od = (&d.x)[a];
+            const int    ii = (a == 0 ? ix : a == 1 ? iy : iz);
+            const double cs = (&grid->cell.x)[a], bl = (&grid->lo.x)[a];
+            if (std::fabs(od) < 1e-15) { step[a] = 0; tMax[a] = 1e300; tDelta[a] = 1e300; continue; }
+            step[a]   = od > 0.0 ? 1 : -1;
+            tDelta[a] = cs / std::fabs(od);
+            tMax[a]   = (bl + (ii + (od > 0.0 ? 1 : 0)) * cs - (&o.x)[a]) / od;
+        }
+        double t = t0, acc = 0.0;
+        int guard = 4 * (grid->nx + grid->ny + grid->nz) + 8;
+        while (t < t1 && guard-- > 0) {
+            const int    axis = (tMax[0] < tMax[1]) ? ((tMax[0] < tMax[2]) ? 0 : 2)
+                                                    : ((tMax[1] < tMax[2]) ? 1 : 2);
+            const double tNext = std::min(tMax[axis], t1);
+            const double seg   = tNext - t;
+            if (seg > 0.0) {
+                const size_t ci = (size_t)grid->index(ix, iy, iz);
+                const double st = FurGrid::sigmaT(grid->cells[ci], d);
+                if (st > 0.0) {
+                    const double add = st * seg;
+                    if (acc + add >= want) {                 // the collision is in this cell
+                        f.hit = true;
+                        f.t   = t + (want - acc) / st;
+                        f.tau = want;
+                        f.ci  = ci;
+                        return f;
+                    }
+                    acc += add;
+                }
+            }
+            t = tNext;
+            if (t >= t1) break;
+            const int i = (axis == 0 ? (ix += step[0]) : axis == 1 ? (iy += step[1]) : (iz += step[2]));
+            const int n = (axis == 0 ? grid->nx : axis == 1 ? grid->ny : grid->nz);
+            if (i < 0 || i >= n) break;
+            tMax[axis] += tDelta[axis];
+        }
+        f.tau = acc;
+        return f;
+    }
+
+    // Transmittance of the coat over a segment — the shadow-ray half.  Free, in the sense
+    // that it is the same march the free flight runs, and NOT a second kind of quantity:
+    // `exp(-tau)` with tau the expected crossing count is the probability of crossing no
+    // fiber at all, which is exactly what a strand-by-strand shadow test estimates.
+    double transmittance(const Vec3& o, const Vec3& d, double maxDist) const {
+        if (!valid() || !(maxDist > 0.0)) return 1.0;
+        return std::exp(-grid->march(o, d, maxDist).tau);
+    }
+};
 
 }  // namespace furvol

@@ -4017,7 +4017,7 @@ segment's cross-section (and correctly zero for a chained strand), and a coarse 
 a density taper dilutes σ_t along exactly the rays being measured, by almost exactly enough
 to cancel the Jensen bias.
 `-checkfurvol` guards the **aggregate scattering model** that turns those grid cells into a
-participating medium, in six sections: the symmetric eigensolver; the startup table that
+participating medium, in eight sections: the symmetric eigensolver; the startup table that
 inverts the **Bingham** distribution's second moment (worst error 1.2e-3 over the whole space
 of eigenvalue triples); the reconstructed orientation distribution's own second moment against
 the cell's `T`, plus its *first* moment where the sign rule is exact; the round trip from an
@@ -4028,7 +4028,14 @@ That last one is what rejected two cheaper orientation distributions: a Watson m
 girdle into two orthogonal lobes (0.43) and an ACG smears a combed clump (0.26), where the
 shipping Bingham measures 0.006 / 0.080 / 0.040 / 0.023 on parallel / combed / isotropic /
 girdle. Its tolerances sit just above those numbers on purpose, so a regression in the ODF
-family is caught rather than tolerated.
+family is caught rather than tolerated. The last two sections cover the medium itself: the
+16-byte-per-cell ODF cache the far tier reads instead of re-running an eigendecomposition per
+collision, and the **free flight**, which is sampled by exact inverse-CDF inside the DDA
+rather than by delta tracking (`σ_t` is piecewise constant along a fixed ray, so no majorant
+is needed — and a coat, a thin skin of dense cells in a mostly empty box, is the case delta
+tracking handles worst). That one is falsifiable and so worth having: the survival probability
+over a segment must be exactly `exp(−τ)` for the same `τ` `-checkfurgrid` §4 already tied to
+the number of strands real rays hit.
 `-checkhair` guards the **fiber BCSDF** (Marschner's R / TT / TRT lobes in Chiang's
 energy-conserving form, plus Yan's medulla and Zinke's dual scattering) in eleven sections. A hair BCSDF that is subtly wrong still looks
 like hair, so every claim is a number rather than a picture — and wherever the physics

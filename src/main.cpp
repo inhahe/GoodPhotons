@@ -2115,6 +2115,147 @@ static int checkFurVol() {
                     allOk ? "PASS" : "FAIL");
     }
 
+    // A coat-like field for the two medium sections: a slab of clumped, mostly-combed
+    // strands, which is the geometry the far tier will actually be asked to march.
+    FurGrid coat;
+    {
+        Pcg32 rng; rng.seed(31337, 5);
+        std::vector<CurveSeg> segs;
+        for (int c = 0; c < 900; ++c) {
+            const Vec3 root(rng.uniform(), 0.02 * rng.uniform(), rng.uniform());
+            const Vec3 comb = normalize(Vec3(0.25 + 0.1 * rng.uniform(), 1.0, 0.1 * rng.uniform()));
+            Vec3 p = root;
+            for (int k = 0; k < 8; ++k) {
+                CurveSeg s;
+                s.p0 = p;
+                const Vec3 jit(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5);
+                p = p + (comb + jit * 0.35) * 0.03;
+                s.p1 = p;
+                s.r0 = 0.0006; s.r1 = 0.0005;
+                segs.push_back(s);
+            }
+        }
+        coat.build(segs, [](int) { return true; }, 48 * 48 * 48);
+    }
+    furvol::FurVolume vol;
+    vol.build(coat, [](size_t n, auto&& f) {
+        for (size_t i = 0; i < n; ++i) f(i);       // serial: the test wants determinism
+        return true;
+    });
+
+    // ---- 7. the per-cell ODF cache is the ODF ----------------------------------------
+    // `FurVolume` exists because `FurODF::fromCell` is far too expensive to run per
+    // collision, so what it stores has to BE what that call would have produced. The two
+    // eigenvectors survive as 16:16 octahedral directions and the concentrations as halves,
+    // and the question is whether that quantisation is invisible where it matters.
+    //
+    // It is not enough to compare the stored numbers: b is ~3000 in a combed cell, where a
+    // half's spacing is 2, and the eigenvectors of a nearly-isotropic cell are arbitrary
+    // (any orthonormal frame diagonalises a multiple of I). BOTH of those are harmless, and
+    // a component-wise check would fail on both. So what is compared is the thing that
+    // actually gets used: the SECOND MOMENT of the reconstructed distribution, which is
+    // basis-free, saturates exactly where the half loses precision, and is the one quantity
+    // the whole file is built to preserve.
+    {
+        Pcg32 rng; rng.seed(4242, 7);
+        double worstT = 0.0, worstBk = 0.0;
+        int checked = 0;
+        for (size_t ci = 0; ci < coat.cells.size(); ++ci) {
+            if (!(coat.cells[ci].c > 0.0f)) continue;
+            if ((ci % 37) != 0) continue;                  // a spread sample, not all 30k
+            ++checked;
+            const furvol::FurODF ref = furvol::FurODF::fromCell(coat.cells[ci]);
+            const furvol::FurODF got = vol.odfAt(ci);
+            // Kent's bk is STORED as a half and refined by three Newton steps at decode. The
+            // check that matters is not that it matches the uncached bk — it cannot, because
+            // the decoded `b` it is a root for is itself a half and so is a slightly different
+            // number — but that the refine lands on the true root OF THE DECODED lam. If it
+            // did not, `invM` would stop being an upper bound and the rejection sampler would
+            // quietly become biased rather than merely inefficient. So: recompute bk cold, by
+            // bisection, from the same decoded lam, and demand machine precision.
+            {
+                const double bkCold = furvol::FurODF::kentBk(got.lam);
+                const double mCold  = std::exp(-(3.0 - bkCold) * 0.5) * std::pow(3.0 / bkCold, 1.5);
+                worstBk = std::max(worstBk, std::fabs(got.invM * mCold - 1.0));
+            }
+            double mr[6] = {0, 0, 0, 0, 0, 0}, mg[6] = {0, 0, 0, 0, 0, 0};
+            const int NS = 3000;
+            for (int s = 0; s < NS; ++s) {
+                const Vec3 a = ref.sample(rng), b = got.sample(rng);
+                const double* av = &a.x; const double* bv = &b.x;
+                for (int i = 0, k = 0; i < 3; ++i)
+                    for (int j = i; j < 3; ++j, ++k) { mr[k] += av[i] * av[j]; mg[k] += bv[i] * bv[j]; }
+            }
+            for (int k = 0; k < 6; ++k)
+                worstT = std::max(worstT, std::fabs(mr[k] - mg[k]) / NS);
+        }
+        // 3000 draws put the Monte Carlo noise floor at ~1e-2 per component, so this is a
+        // check that the cache is not GROSSLY wrong; §8 and the render are what pin it.
+        const bool ok = checked > 100 && worstT < 3e-2 && worstBk < 1e-12;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 7. ODF cache (%.1f KB over %d cells, %d sampled): worst second-"
+                    "moment drift %.2e, worst |1/M - 1/M_exact| %.2e -> %s\n",
+                    vol.bytes() / 1024.0, coat.occupied, checked, worstT, worstBk,
+                    ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 8. free flight is EXACT, not delta-tracked -----------------------------------
+    // `sigma_t(d)` is piecewise constant along a fixed ray, so the collision distance can be
+    // drawn by inverting the optical depth inside the DDA instead of by delta tracking
+    // against a majorant. The claim that makes is falsifiable: the probability of reaching
+    // distance L without colliding must be exactly `exp(-tau(L))`, with `tau` the very
+    // quantity `FurGrid::march` reports and `-checkfurgrid` §4 already tied to the number of
+    // strands real rays hit. If the inversion were even slightly wrong — an off-by-one cell,
+    // a dropped segment, a majorant left in — the survival curve would drift from it.
+    //
+    // A majorant-based tracker would also be measurably worse HERE and not just in theory: a
+    // coat is a thin skin of very dense cells inside a mostly empty box, which is the exact
+    // shape delta tracking handles worst.
+    {
+        Pcg32 rng; rng.seed(90210, 3);
+        const int NR = 400, NS = 400;
+        double worst = 0.0, worstAt = 0.0;
+        int    zeroHits = 0;
+        for (int r = 0; r < NR; ++r) {
+            const Vec3 o(rng.uniform() * 0.8 + 0.1, -0.05, rng.uniform() * 0.8 + 0.1);
+            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, 1.0, rng.uniform() - 0.5));
+            const double L = 0.35;
+            const double tau = coat.march(o, d, L).tau;
+            if (!(tau > 0.05)) continue;                  // a ray that saw no coat proves nothing
+            ++zeroHits;
+            int survived = 0;
+            for (int s = 0; s < NS; ++s)
+                if (!vol.sampleFlight(o, d, L, rng.uniform()).hit) ++survived;
+            const double emp = (double)survived / NS;
+            const double ana = std::exp(-tau);
+            // Binomial standard error at this sample count, so the bar scales with p.
+            const double se = std::sqrt(std::max(1e-12, ana * (1.0 - ana) / NS));
+            const double z  = std::fabs(emp - ana) / std::max(1e-6, se);
+            if (z > worst) { worst = z; worstAt = tau; }
+        }
+        // Worst of ~400 z-scores: the expected maximum of 400 standard normals is ~3.0, so
+        // 5 sigma is a real failure and not a tail. Also asserted: the flight never reports a
+        // collision beyond the segment, and never inside an empty cell.
+        bool clean = true;
+        for (int s = 0; s < 20000 && clean; ++s) {
+            const Vec3 o(rng.uniform(), rng.uniform() * 0.4 - 0.1, rng.uniform());
+            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const double L = 0.2 + 0.3 * rng.uniform();
+            const auto f = vol.sampleFlight(o, d, L, rng.uniform());
+            if (!f.hit) continue;
+            if (!(f.t > 0.0) || f.t > L + 1e-9) clean = false;
+            else if (!(coat.cells[f.ci].c > 0.0f)) clean = false;
+            else if (coat.at(o + d * f.t) != &coat.cells[f.ci]) clean = false;   // right cell
+        }
+        const bool ok = zeroHits > 100 && worst < 5.0 && clean;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 8. free flight: survival vs exp(-tau) over %d rays x %d draws, "
+                    "worst %.2f sigma (at tau=%.2f), %s -> %s\n",
+                    zeroHits, NS, worst, worstAt,
+                    clean ? "collisions in-range and in the right cell" : "BAD COLLISION",
+                    ok ? "PASS" : "FAIL");
+    }
+
     std::printf("[checkfurvol] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return fails;
 }
