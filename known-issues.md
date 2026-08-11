@@ -10703,12 +10703,47 @@ the pre-fix binary (md5), as is a `-dual-scatter` render, so this was a pure opt
 leaf-rejection path over 20 000 rays on a scene mixing hair curves, non-hair curves, triangles
 and a sphere.
 
-Two limits remain, neither pressing enough for its own entry: the far tier still holds the
-strands and their BVH in memory (it only stops *traversing* them), so a coat that does not fit
-still does not fit — on this machine ~900 k strands / 9 M segments needs 2.2 GB and 3 M strands
-`bad allocation`s; and `MatType::Hair` is CPU-only on the GPU (`cudaForwardSupported`), so if
-P3 ever lands the fiber BCSDF on the device, `-fur-volume` will need a GPU gate or it will be
-silently ignored there.
+What it does not fix is **memory** — see the next entry.
+
+## OPEN (tech debt, 2026-08-11, v0.179.0): `-fur-volume` stops *traversing* the strands but never stops *storing* them
+
+The far tier summarises a coat into a 128³ density grid plus a 16 B/cell orientation table (96 MB
+total) and, since v0.179.0, no longer has the fibers in the BVH it walks. But `scene.curveSegs`
+and the full `bvh` are still built and still resident, because `main.cpp` builds the grid *from*
+`scene.curveSegs` and nothing frees them afterwards. So the representation that exists to make a
+coat cheap does not make it **fit**: measured peak working set on the benchmark scene is 2.2 GB
+at 900 k strands / 9 M segments (~247 B per segment), and 3 M strands (30 M segments) dies with
+`error: bad allocation`. A coat too large to load is still too large to render, which blocks the
+obvious next question — where the aggregate's accuracy finally breaks down — because the fiber
+counts where that would show up cannot be loaded.
+
+**The proper fix.** After the grid and the ODF table are built, plain `-fur-volume` (i.e. *not*
+`-fur-lod`, whose near tier needs the strands, and not `-dual-scatter`, which keeps them) can
+erase the `MatType::Hair` curve segments and rebuild `bvh` — `Scene::buildBvh()` already rebuilds
+from scratch over the current vectors, and `collectPrimBoxes` already knows how to drop hair, so
+the mechanics are in place. The care needed is in the gating, not the code: it must not fire for
+a forward mode (A/B/C trace the curves directly and would render a bald ball), nor for the raster
+path (`raster.h` iterates `curveSegs` for its own pass), and the decision has to be made where
+the render mode is known. Cheapest correct version is probably to drop the strands only for
+backward modes with `-fur-volume` and no `-fur-lod`/`-dual-scatter`, and to say so in the log
+line the way the hair-free BVH already does.
+
+**Related, latent, not worth code today.** `MatType::Hair` is CPU-only on the GPU
+(`cudaForwardSupported` in `render_cuda.cu` rejects any scene containing it), so every fur scene
+falls back to the CPU and `-fur-volume` is never reached on-device. If §P3 ever lands the fiber
+BCSDF on the GPU that stops being true, and `-fur-volume` / `-fur-lod` will need an explicit
+device gate in `main.cpp` — otherwise the GPU megakernel will trace the strands and silently
+ignore the flag.
+
+**Repro.**
+```
+ftrace -in scraps/furbench/coat_900k.ftsl -mode R -r 40 30 -spp 1 -window -o png/furbench/p.png
+# ...peak working set ~2.2 GB.  Then the rung that does not fit:
+ftrace -in scraps/furbench/coat_3m.ftsl  -mode R -r 40 30 -spp 1 -window -o png/furbench/p.png
+# -> error: bad allocation
+```
+(Note the machine this was measured on had ~5 GB of *commit* free, not 64 GB — check
+`FreeVirtualMemory`, not `FreePhysicalMemory`, before concluding a given rung is unloadable.)
 
 The original entry follows.
 
