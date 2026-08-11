@@ -2239,6 +2239,64 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   `fnoise(90*x, 90*y + 0.5, 90*z, 90*fw, 3)`, and its hand derivation is kept in the
   comment as the explanation of what `fw` contains.
 
+  **Stochastic tiling (`src/stochtile.h`, O7, v0.170.0).** `texture "n" { tiling stochastic
+  patch <p> seed <s> }` is Heitz & Neyret's (HPG 2018) histogram-preserving blending: at each
+  shading point, three randomly offset crops on a triangle lattice, blended with the
+  barycentric weights. The problem is **not** seams — the demo's source is deliberately
+  seamlessly periodic and still fails, because at six repeats per metre the eye locks onto
+  the same rosette marching in a grid, which no wrap mode can address. The naive fix is worse
+  than the disease: averaging three crops of a bimodal image emits the mean of its two modes,
+  a colour occurring nowhere in the source, and the wall goes to soup. So each channel is
+  **rank-transformed** at load onto `N(1/2, 1/6)` (`gaussRgb` / `gaussGray` planes), the taps
+  are blended there, the variance the average destroyed is restored by dividing the centred
+  blend by `sqrt(Σwᵢ²)`, and the result is inverted through a stored 1-D LUT (`lutRgb` /
+  `lutGray`). `E[Σwᵢ²] = 1/2` for Dirichlet(1,1,1) weights, so an unrestored blend sits at
+  `1/√2 = 0.707×` the source's sd; `-checkstochtile` measures 0.4999 and 0.708× against those
+  closed forms. Architecture points, each of which was forced by a measurement:
+  • *The blend is in linear RGB, not in Jakob–Hanika coefficient space.* Blending coefficients
+  per channel produced visible blue-cyan fringing, because coefficient space is not a colour
+  space: `R = sigmoid(p(t))` is nonlinear in `c`, so a weighted mean of coefficient triples is
+  not the weighted mean of the colours. The three taps are therefore blended as RGB and the
+  blended colour converted through **one shared, texture-independent** 64³ coefficient LUT
+  (`upsample::coeffLut`, `stochJhCoeff`), built lazily and threaded (~0.6 s, 3.1 MB) on first
+  stochastic-texture load. This is also what makes the three backends agree: the spectral CPU
+  path (`Texture::reflectanceAt`), CUDA (`dTexReflAt`) and the mode-W raster preview run the
+  *identical* operator on the *identical* planes, differing only in where the planes live.
+  • *The LUT's real problem was conditioning, not resolution.* A colour whose reflectance is
+  pinned at 0 or 1 across the band needs `|p| → ∞`; the unbounded fitter returns `|c| = 1.6e6`
+  at the white corner, and trilinear interpolation between that and a moderate neighbour is
+  meaningless — worst reflectance error 0.81. The fix is **projected Gauss-Newton**:
+  `fitSigmoid` takes an optional `pMax`, and inside its backtracking line search the trial
+  point is pulled back into the bounded set (`upsample::clampSaturated`) *before* being
+  scored, so what the search accepts is the best **bounded** colour match rather than an
+  unbounded one mangled afterwards. Bounding a finished fit instead costs 0.037 of
+  `|XYZ − target|` near white; projecting inside the loop lets the remaining freedom
+  compensate for the clip. `clampSaturated` soft-compresses `p` through `pMax·tanh(p/pMax)`
+  (identity for small `p`, and it preserves every root exactly, so the wavelengths where R
+  crosses ½ do not move) and weighted-least-squares a quadratic back through the compressed
+  curve over 380–730 nm with weight `max(dSigmoid(pc), 1e-3)`. Three simpler alternatives were
+  implemented and rejected on measurement, and the source comment records each: uniform
+  scaling of `c` (shrinks the unsaturated middle; dark saturated red `|dR| = 0.97`), a 3-node
+  clamp at 360/595/830 nm (`|dR| = 1.0` near white — the fit is *unconstrained* where the CMFs
+  vanish, so those nodes hold noise), and one at 400/550/700 nm (`|XYZ − target| = 0.37` near
+  white, because white's fit puts its roots within a nanometre of exactly 400 and 700). A
+  CMF-weighted LS also lost (worst 0.037 → 0.088).
+  • *The right metric is round-trip `|XYZ − target|`, not reflectance agreement with
+  `upsample::fit`.* Comparing curves is a trap for exactly the reason above: two coefficient
+  triples producing the identical colour can differ by `|dR| = 1` past 700 nm where the CMFs
+  are zero. `-checkstochtile` §8 therefore scores XYZ round-trip over 3000 colours (half cubed
+  toward black) and carries the un-tabulated fit as a **control**, holding the LUT to "no
+  worse than the fitter it stands in for" (`wL < wF + 0.025`) rather than to an unachievable
+  ideal. Grid size was picked from a sweep, not taste: 48³ worst 0.036, 64³ worst 0.019, 80³
+  worst 0.016 — it stops improving because the residual is no longer the table but the
+  sigmoid-of-a-quadratic model's own 0.019 error at pure white, so `STOCH_JH_N = 64`,
+  `STOCH_JH_PMAX = 60`.
+  • *A latent `fitSigmoid` divergence was found on the way and fixed.* Undamped Gauss-Newton
+  diverged for dark saturated colours (red at Y=0.001 gave `|XYZ − target| = 1.41`, blue at
+  Y=0.01 gave 1.40); the backtracking line search brought those to 0.0008 / 0.0001, and §8
+  now asserts them so they cannot regress. This affected *every* Jakob–Hanika upsample in the
+  renderer, not just the tiling LUT.
+
   **Inline array literals** (`roughness [0 1](u)`, `weight_map [[0 0.5][0.5 1]](u,v)`) are
   the write-it-where-you-use-it spelling of the same thing, and they are implemented as
   **pure sugar**: a loader pre-pass (`Builder::desugarArrays`, run immediately before the

@@ -1,0 +1,83 @@
+# Histogram-preserving stochastic tiling (Heitz & Neyret 2018) — A/B demo.
+#
+# One wall, two halves, ONE source image (scenes/lichen.ppm), lit identically:
+#
+#   left  half   `tiling none`        — ordinary repeat tiling
+#   right half   `tiling stochastic`  — the by-example blending operator
+#
+# The source is deliberately *seamlessly periodic* (see tools/make_stochtex.py), so
+# the left half has no seams at all. It still fails, and the failure is the point:
+# at six repeats per metre the eye locks onto the same lichen rosette marching in a
+# grid. Nothing about a wrap mode can fix that — the image simply does not contain
+# enough distinct content, and the only cure is to stop showing the same crop twice.
+#
+# The right half draws, at every shading point, three randomly offset crops on a
+# triangle lattice and blends them with the barycentric weights. Done naively that
+# would be worse than the repetition: averaging three crops of a bimodal image
+# produces the mean of rock and lichen, a mid-grey that occurs nowhere in the source,
+# and the wall would turn to soup. The operator avoids it by blending in a *rank-
+# transformed* (Gaussian) space and restoring the variance the average destroyed, so
+# every value it emits is a value the source actually contains. Contrast, histogram
+# and colour statistics survive; the lattice does not.
+#
+#   ftrace -in scenes/stochtile.ftsl -mode W -o png/stochtile_raster.png -window -hold
+#   ftrace -in scenes/stochtile.ftsl -time 240 -o png/stochtile.png -window -hold -checkpoint
+#   ftrace -in scenes/stochtile.ftsl -device gpu -time 240 -o png/stochtile_gpu.png -window -hold
+#
+# All three backends share src/stochtile.h, so they must agree.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# --- the same image, twice, tiled two different ways -------------------------
+texture "lichen_plain" {
+    file     scenes/lichen.ppm
+    encoding srgb
+    filter   bilinear
+    wrap     repeat
+}
+
+texture "lichen_stoch" {
+    file     scenes/lichen.ppm
+    encoding srgb
+    filter   bilinear
+    wrap     repeat
+    tiling   stochastic     # the operator
+    patch    1.0            # lattice cell size, in texture repeats (1 = the paper's)
+    seed     3              # which realisation of the random crop offsets
+}
+
+material "plain" { type diffuse reflect texture:lichen_plain }
+material "stoch" { type diffuse reflect texture:lichen_stoch }
+
+# --- the wall: two unit planes flush at x = 1, so the halves abut ------------
+# `uv triplanar scale=6` projects from world space at six repeats per metre, which is
+# both what makes the repetition visible on the left and what makes `patch` meaningful
+# on the right (patch is measured in those repeats). Both halves use the SAME
+# projection, and the seam sits at an integer number of repeats, so the left half's
+# content is exactly what the right half's would have been without the operator.
+mesh {
+    file      scenes/uvplane.obj
+    material  plain
+    uv        triplanar scale=6
+}
+mesh {
+    file      scenes/uvplane.obj
+    material  stoch
+    uv        triplanar scale=6
+    translate 1 0 0
+}
+
+# --- a broad soft source just behind the camera, for an even wash ------------
+light area {
+    origin -0.2 -0.2 2.3   u 2.4 0 0   v 0 1.4 0   normal 0 0 -1
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 1 0.5 2.0   look_at 1 0.5 0   up 0 1 0   fov_y 28.07
+    mode B
+    film { res 768 384 }
+}

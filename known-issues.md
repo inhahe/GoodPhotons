@@ -5,6 +5,28 @@ as practical; this file is the fallback for what can't be addressed immediately.
 
 ## Open issues
 
+### OPEN (2026-08-10, v0.170.0): the sigmoid upsampling model itself is ~0.019 off at pure white, and stochastic tiling's LUT inherits that
+
+Not a tiling bug, but it surfaces there and sets the floor on `-checkstochtile` §8's
+tolerance, so it is worth naming. Jakob–Hanika represents a reflectance as
+`R(λ) = sigmoid(p(t))` with `p` **quadratic** in `t = (λ−595)/235`. A colour pinned at
+R ≡ 1 across the whole band therefore needs `|p| → ∞`, which is not representable, and the
+stochastic-tiling LUT bounds `|p| ≤ 60` (`STOCH_JH_PMAX`) precisely so its entries stay
+interpolable. The residual round-trip error is worst at the gamut extremes: **0.014–0.019 of
+`|XYZ − target|` near pure white**, against a mean of 2.7e-4 over 3000 random colours.
+
+Measured to be the *model's* limit and not the table's: a 48³ grid is worst 0.036, 64³ is
+0.019 and 80³ is 0.016, i.e. resolution stops buying anything once the un-tabulated fitter's
+own 0.019 at white dominates. §8 therefore holds the LUT to the fitter as a control
+(`worst_LUT < worst_fit + 0.025`) rather than to zero.
+
+**Proper fix** (if it ever matters visually — it currently does not; 0.019 in XYZ on a pure
+white texel is well under a JND at the exposures these renders use): raise the polynomial
+degree, or switch to a bounded parameterisation of the sigmoid's argument so saturation is
+representable at finite coordinates. Both change `upsample::fit`'s coefficient count and so
+touch the CPU/CUDA/raster reflectance evaluators and the on-disk `.ftbuf` assumptions
+together — a real refactor, not a tweak, which is why it is logged rather than done.
+
 ### OPEN (2026-08-09, v0.161.0): `curv` reads 0 on an ISOSURFACE, so curvature-driven materials silently flatten there
 
 `curv` (O3 stage 1) is analytic on a `sphere`, per-radius on a `curve`, and per-face on a
@@ -6723,6 +6745,21 @@ disabled so long compute kernels wouldn't be killed by the default 2 s watchdog.
    it, and returns for the orderly teardown.
 
 ## Recently fixed
+
+### `upsample::fitSigmoid` diverged for dark saturated colours — FIXED 2026-08-10 (v0.170.0)
+
+Found while building O7's Jakob–Hanika coefficient LUT, but it was **not** specific to
+tiling: it affected every JH upsample in the renderer (image textures, `rgb` colours,
+procedural skins). The Gauss-Newton solve in `src/upsample.h` took a full undamped step,
+which for colours near the black corner of a saturated hue overshot into the flat tail of
+the sigmoid, where the Jacobian is ~0 and the next step is enormous. Measured round-trip
+`|XYZ − target|`: red at Y=0.001 → **1.41**; blue at Y=0.01 → **1.40** (i.e. the returned
+spectrum was not the requested colour in any sense).
+
+**Fix:** a backtracking line search — halve the step until the residual actually decreases.
+Those two cases now come back at 0.0008 and 0.0001, and `ftrace -checkstochtile` §8 asserts
+both (`fitErr(1e-3,0,0) < 1e-3`, `fitErr(0,0,1e-2) < 1e-3`) with the old values in the
+comment, so a regression names itself.
 
 ### loom rejected its own `reflect pattern:<name>` emission — FIXED 2026-07-28 (v0.93.0)
 

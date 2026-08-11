@@ -31,6 +31,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Grooms (`fur`)](#grooms-fur)
   - [Implicit surfaces (`isosurface`)](#implicit-surfaces-isosurface)
 - [Textures](#textures)
+  - [Stochastic tiling (`tiling stochastic`)](#stochastic-tiling-tiling-stochastic)
 - [Procedural patterns (math-driven materials)](#procedural-patterns-math-driven-materials)
   - [Putting them together — non-stationary noise](#putting-them-together--non-stationary-noise)
 - [Participating media / fog](#participating-media--fog)
@@ -2392,6 +2393,62 @@ Worked example `scenes/pattern_reaction.ftsl` (a maze wall, spots gated by a noi
 3×3 seamless tiling, pitted flooring, and a triplanar-projected leopard torus),
 deterministic self-test `ftrace -checkreaction`.
 
+### Stochastic tiling (`tiling stochastic`)
+
+Any image texture can be tiled **without the lattice being visible**, by
+**histogram-preserving blending** (Heitz & Neyret, HPG 2018):
+
+```
+texture "lichen" {
+    file     scenes/lichen.ppm
+    encoding srgb
+    wrap     repeat
+    tiling   stochastic     # default: none
+    patch    1.0            # lattice cell size, in texture repeats (1 = the paper's)
+    seed     3              # which realisation of the random crop offsets
+}
+```
+
+The problem it solves is *not* seams — a seamlessly periodic source still fails, because
+at six repeats per metre the eye locks onto the same feature marching in a grid, and no
+wrap mode can fix that. The only cure is to stop showing the same crop twice.
+
+At every shading point the operator draws **three randomly offset crops** of the source
+on a triangle lattice and blends them with the barycentric weights. Done naively that
+is *worse* than repeating: averaging three crops of a bimodal image yields the mean of
+its two modes — a colour occurring nowhere in the source — and the texture turns to
+soup. So instead each channel is **rank-transformed** at load onto `N(1/2, 1/6)`, the
+three taps are blended there, the variance the average destroyed is restored by
+dividing the centred blend by `sqrt(Σwᵢ²)`, and the result is inverted through a stored
+1-D LUT. Every value emitted is therefore a value the source actually contains:
+contrast, histogram and colour statistics survive, the lattice does not.
+(`Σwᵢ²` averages `1/2` for Dirichlet(1,1,1) weights, so an unrestored blend would sit at
+`0.707×` the source's standard deviation; `-checkstochtile` measures both.)
+
+Notes that matter in practice:
+
+- **`patch` is measured in texture repeats**, not metres or texels, so it composes with
+  whatever UV scale the projection uses. `patch 1.0` is the paper's default; smaller
+  values shuffle more aggressively at the cost of blurring features larger than a cell.
+- **`seed` picks the realisation.** Two textures with the same file and different seeds
+  decorrelate; the same seed reproduces exactly, on every backend.
+- **The blend happens in linear RGB, not in spectral-coefficient space.** Jakob–Hanika
+  coefficients are *not* a colour space — interpolating them channel-wise produces
+  visible blue-cyan fringing — so the three taps are blended as RGB and the blended
+  colour is then converted to a reflectance through one shared, texture-independent
+  64³ coefficient LUT (built lazily, threaded, ~0.6 s, 3.1 MB, the first time a
+  stochastic texture loads). This is also what lets the spectral CPU path, the CUDA
+  path and the mode-`W` raster preview run the *identical* operator on the *identical*
+  planes.
+- **Cost is three taps instead of one**, plus a LUT lookup per channel; the
+  rank-transform planes are built once at load and roughly double the texture's memory.
+- Works with every UV source (including `triplanar`), on `reflect texture:<name>` albedo
+  and inside `tex:<name>(u, v)` pattern terms, on CPU and GPU alike.
+
+Worked A/B example `scenes/stochtile.ftsl` (one wall, two halves, one source image:
+`tiling none` on the left, `tiling stochastic` on the right), deterministic self-test
+`ftrace -checkstochtile`.
+
 ## Procedural patterns (math-driven materials)
 
 A `pattern "name" { … }` block compiles a **scalar field** — a function of the hit
@@ -3671,7 +3728,7 @@ alone can't restore, so they are not disk-resumable.
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
-`-checkbluenoise`, `-checkfnoise`, `-checkreaction`, `-checkcurv`,
+`-checkbluenoise`, `-checkfnoise`, `-checkstochtile`, `-checkreaction`, `-checkcurv`,
 `-checkcavity`, `-checksdf`, `-checksun`,
 `-checkbind`, `-checkprop`,
 `-checkarray`, `-checklattice`. Each runs deterministically without a scene and prints

@@ -21,12 +21,15 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <algorithm>
+#include <numeric>
 #include <fstream>
 #include <sstream>
 #include "linalg.h"
 #include "color.h"
 #include "upsample.h"
 #include "spectrum.h"
+#include "stochtile.h"
 
 // stb_image API (implementation lives in src/stb_image_impl.cpp). Declared here so
 // this header stays light and CUDA never parses the full stb_image.h.
@@ -63,6 +66,33 @@ struct Texture {
     TexFilter   filter   = TexFilter::Bilinear;
     TexWrap     wrap     = TexWrap::Repeat;
 
+    // Histogram-preserving stochastic tiling (O7, `tiling stochastic`). See stochtile.h
+    // for the operator. Enabling it adds TWO Gaussianized plane sets, one per space the
+    // renderer actually asks a texture to be filtered in:
+    //
+    //   gaussRgb   (3ch) — linear RGB. Used by sampleRgb, normal maps, the raster
+    //                      preview AND the spectral path, which blends here and then
+    //                      converts the blended colour to a spectrum through the shared
+    //                      upsample::coeffLut(). Blending the Jakob-Hanika coefficients
+    //                      instead was the first implementation and is wrong — see the
+    //                      measurements in stochtile.h. Doing it this way also means the
+    //                      preview and the render run the identical operator on the
+    //                      identical planes, so they agree by construction.
+    //   gaussGray  (1ch) — the scalar mean, for roughness / weight maps and `tex:`.
+    //                      Not the mean of the three blended colour channels: three
+    //                      independent inverse transforms averaged is not the inverse
+    //                      transform of the mean, and the device backends rank the gray
+    //                      plane separately, so deriving it would put CPU and GPU on
+    //                      different values.
+    //
+    // Each plane is float: the values are quantiles, so the extra mantissa of a double
+    // buys nothing, and this already costs 16 bytes/texel on top of the source.
+    StochTile          stoch;
+    std::vector<float> gaussRgb,  lutRgb;      // 3*w*h  /  3*STOCH_LUT_N
+    std::vector<float> gaussGray, lutGray;     // 1*w*h  /  1*STOCH_LUT_N
+    bool stochastic() const { return stoch.on != 0 && !gaussRgb.empty(); }
+    int  filterCode() const { return filter == TexFilter::Nearest ? 0 : 1; }
+
     bool valid() const { return w > 0 && h > 0 && (int)rgb.size() == w * h; }
 
     // Precompute the Jakob-Hanika reflectance coefficients per texel (once). Called
@@ -87,6 +117,63 @@ struct Texture {
             return false;
         }
         return true;
+    }
+
+    // Rank-transform one plane set into interleaved Gaussianized floats plus the
+    // per-channel inverse LUT (O7). `get(i, c)` reads channel c of texel i.
+    //
+    // The transform is the empirical rank, not a fitted Gaussian: texel of rank r among n
+    // gets the quantile at (r + 1/2)/n, which maps ANY histogram — bimodal, clipped,
+    // spiky, a two-colour tile pattern — onto N(1/2, 1/6) exactly. The LUT inverts it by
+    // walking the same sorted array at uniformly spaced values of G, so T^-1(T(x)) == x to
+    // within the LUT's linear interpolation. Ties are broken by texel index so the result
+    // is deterministic regardless of the sort implementation.
+    template <class Get>
+    static void gaussianizePlanes(size_t n, int nch, Get get,
+                                  std::vector<float>& gauss, std::vector<float>& lut) {
+        gauss.assign(n * (size_t)nch, 0.0f);
+        lut.assign((size_t)nch * STOCH_LUT_N, 0.0f);
+        if (n == 0) return;
+        std::vector<size_t> ord(n);
+        std::vector<double> val(n);
+        for (int c = 0; c < nch; ++c) {
+            for (size_t i = 0; i < n; ++i) { ord[i] = i; val[i] = get(i, c); }
+            std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
+                return val[a] != val[b] ? (val[a] < val[b]) : (a < b);
+            });
+            for (size_t r = 0; r < n; ++r)
+                gauss[ord[r] * (size_t)nch + c] = (float)stochForward(r, n);
+            float* L = lut.data() + (size_t)c * STOCH_LUT_N;
+            for (int j = 0; j < STOCH_LUT_N; ++j) {
+                const double g = STOCH_G_LO + (STOCH_G_HI - STOCH_G_LO) *
+                                              ((double)j / (double)(STOCH_LUT_N - 1));
+                const double p = stochNormalCdf((g - STOCH_G_MEAN) / STOCH_G_SIGMA);
+                const double t = p * (double)n - 0.5;   // the continuous rank G asks for
+                if (t <= 0.0)                    L[j] = (float)val[ord[0]];
+                else if (t >= (double)(n - 1))   L[j] = (float)val[ord[n - 1]];
+                else {
+                    const double f = std::floor(t);
+                    const size_t i0 = (size_t)f;
+                    const double fr = t - f;
+                    L[j] = (float)(val[ord[i0]] * (1.0 - fr) + val[ord[i0 + 1]] * fr);
+                }
+            }
+        }
+    }
+
+    // Build the Gaussianized planes (O7). Both are transforms of the linear-RGB texels,
+    // so unlike buildReflCoeff this has no ordering dependency on anything else.
+    void buildStochastic() {
+        if (!stoch.on || !valid() || hasPalette()) return;
+        const size_t n = (size_t)w * h;
+        gaussianizePlanes(n, 3, [&](size_t i, int c) {
+            return c == 0 ? rgb[i].x : (c == 1 ? rgb[i].y : rgb[i].z);
+        }, gaussRgb, lutRgb);
+        gaussianizePlanes(n, 1, [&](size_t i, int) {
+            return (rgb[i].x + rgb[i].y + rgb[i].z) * (1.0 / 3.0);
+        }, gaussGray, lutGray);
+        (void)upsample::coeffLut();   // force the shared RGB->coefficient table now, so
+                                      // the cost lands in load rather than first hit
     }
 
     // Integrate each palette spectrum against the CIE curves under an equal-energy
@@ -153,6 +240,11 @@ struct Texture {
         // An INDEX map's texels are palette indices, not colours: resolve through the
         // palette rather than returning the index as if it were a shade of grey.
         if (hasPalette()) return paletteRgbAt(u, v);
+        if (stochastic()) {   // O7: three offset taps blended in RGB-Gaussian space
+            double o[3];
+            stochSample(stoch, gaussRgb.data(), lutRgb.data(), 3, w, h, filterCode(), u, v, o);
+            return Vec3{o[0], o[1], o[2]};
+        }
         if (filter == TexFilter::Nearest) {
             int x = wrapIndex((int)std::floor(u * w), w);
             int y = wrapIndex((int)std::floor((1.0 - v) * h), h);
@@ -176,6 +268,15 @@ struct Texture {
     // upsampling — the value is used directly as the scalar parameter, so such maps
     // should be authored `encoding linear`. Mirrored on the GPU by dTexScalarAt.
     double scalarAt(double u, double v) const {
+        // O7: the scalar plane gets its OWN rank transform rather than averaging the three
+        // stochastic colour channels — a roughness map wants its own histogram preserved,
+        // and the device's dTexScalarAt reads a gray plane too, so this is also what keeps
+        // the two backends identical. (For a grey source the two agree anyway.)
+        if (stoch.on && !gaussGray.empty()) {
+            double o[1];
+            stochSample(stoch, gaussGray.data(), lutGray.data(), 1, w, h, filterCode(), u, v, o);
+            return o[0];
+        }
         Vec3 c = sampleRgb(u, v);
         return (c.x + c.y + c.z) * (1.0 / 3.0);
     }
@@ -212,6 +313,17 @@ struct Texture {
     double reflectanceAt(double u, double v, double lambda) const {
         if (hasPalette()) return paletteReflectanceAt(u, v, lambda);
         if (coeff.empty()) return 0.5;
+        if (stochastic()) {
+            // O7: blend the three crops in linear RGB — the same planes, lattice and
+            // weights the preview uses — then convert that colour to a spectrum. See
+            // stochtile.h for why this is not done in coefficient space.
+            double c[3];
+            stochSample(stoch, gaussRgb.data(), lutRgb.data(), 3, w, h, filterCode(),
+                        u, v, c);
+            double cs[3];
+            stochJhCoeff(upsample::coeffLut().data(), c[0], c[1], c[2], cs);
+            return stochReflAt(cs, lambda);
+        }
         auto at = [&](int x, int y) -> const std::array<double, 3>& {
             return coeff[(size_t)y * w + x];
         };

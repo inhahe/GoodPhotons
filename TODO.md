@@ -4852,10 +4852,34 @@ the *randomness vocabulary* is thin. Nothing below is started.
       1.0 by construction, so asserting on range would be vacuous) and dominant wavelength from a
       radially averaged separable DFT *at the shipped defaults*, `rdStable` vs actual divergence, and
       determinism/resampler identities. Demo `scenes/pattern_reaction.ftsl`.
-- [ ] **O7 — by-example texture synthesis / stochastic tiling.** Zero hits for `texture synthesis`,
-      `wang tile`, `histogram-preserving`, `by-example`. Heitz–Neyret histogram-preserving blending is
-      the standard way to tile one photo infinitely without visible repetition, and it composes with
-      `PatOp::Tex` rather than replacing it.
+- [x] **O7 — by-example texture synthesis / stochastic tiling.** ✅ **DONE v0.170.0.** Heitz–Neyret
+      (HPG 2018) histogram-preserving blending, as `texture "n" { tiling stochastic  patch <p>
+      seed <s> }` (`src/stochtile.h`) — it composes with `PatOp::Tex` rather than replacing it, so
+      `reflect texture:`, `tex:<name>(u,v)`, triplanar, GPU upload and the raster preview all work
+      unchanged. Three randomly offset crops on a triangle lattice, barycentric-weighted. The naive
+      version is *worse* than repeating (the mean of a bimodal image is a colour the source never
+      contains), so each channel is rank-transformed at load onto `N(1/2, 1/6)`, blended there, the
+      variance the average destroyed restored by `÷sqrt(Σwᵢ²)`, and inverted through a 1-D LUT;
+      `E[Σwᵢ²] = 1/2` for Dirichlet(1,1,1), measured 0.4999 / 0.708×.
+
+      The interesting part was **not** the paper. (1) Blending Jakob–Hanika coefficients per channel
+      fringes blue-cyan — coefficient space is not a colour space — so the blend runs in linear RGB
+      and the result converts through one shared 64³ coefficient LUT, which is also what makes the
+      spectral CPU, CUDA and mode-W raster paths run the identical operator on identical planes.
+      (2) That LUT is uninterpolable naively: saturated colours need `|p| → ∞` and the fitter returns
+      `|c| = 1.6e6` at the white corner (worst reflectance error 0.81). Fixed by **projected**
+      Gauss-Newton — the line search's trial point is pulled into the bounded set before being
+      scored, so it accepts the best *bounded* colour match. Three simpler bounds were implemented
+      and rejected on measurement (uniform `c` scaling: dark red `|dR| = 0.97`; 3-node clamp at
+      360/595/830: `|dR| = 1.0`, those nodes sit where the CMFs vanish and hold noise; at
+      400/550/700: `|XYZ−target| = 0.37`, white's roots land within a nm of both). (3) The metric
+      had to change too: reflectance agreement with `upsample::fit` is a trap, since two triples
+      giving the identical colour can differ by `|dR| = 1` past 700 nm — `-checkstochtile` §8 scores
+      round-trip `|XYZ − target|` with the un-tabulated fitter as a control. (4) Doing all this
+      exposed a latent **`fitSigmoid` divergence** affecting every JH upsample in the renderer
+      (dark red 1.41, dark blue 1.40 → 0.0008 / 0.0001), now asserted. Grid size chosen by sweep
+      (48³ 0.036 / 64³ 0.019 / 80³ 0.016, the floor being the sigmoid model's own error at white).
+      A/B demo `scenes/stochtile.ftsl`, self-test `ftrace -checkstochtile`.
 - [x] **O8 — antialiasing the noise.** ✅ **DONE — stage 1 v0.168.0, stage 2 v0.169.0.** None of the above
       currently band-limits. Under minification a lattice noise aliases badly; a
       filtered/analytically-band-limited variant (or an explicit octave-cutoff driven by the screen-space

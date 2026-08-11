@@ -81,6 +81,7 @@
 #include "render_cuda.h"
 #include "render_progress.h"
 #include "pattern_device.cuh"   // DPattern / DPatEnvT / dPatternEval — shared with raster_cuda.cu
+#include "stochtile.h"    // O7: the host/device-shared histogram-preserving tiling operator
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
 #include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
@@ -285,6 +286,19 @@ struct DTexture {
                            // (roughness/film-thickness, §9.4) — dTexScalarAt twin
     const double* rgb;     // 3*w*h linear RGB, uploaded only for NORMAL-MAP textures
                            // (C6) — dTexNormalAt twin (needs true vector direction)
+    // O7 stochastic tiling: the parameters plus the two Gaussianized plane sets and
+    // their inverse LUTs, mirroring Texture::gauss*/lut* one for one. All null (and
+    // stoch.on == 0) unless the texture asked for `tiling stochastic`; the samplers below
+    // then take exactly the same branch the host does, over the same float data, so the
+    // two backends land on the same crop of the image with the same weights.
+    // `jhLut` is the ONE shared, texture-independent RGB -> Jakob-Hanika coefficient
+    // table (upsample::coeffLut(), sqrt-warped STOCH_JH_N^3); the spectral path blends
+    // in linear RGB and then converts through it, because blending JH coefficients per
+    // channel leaves the image's colour manifold (see stochtile.h).
+    StochTile    stoch;
+    const float* gaussRgb;   const float* lutRgb;
+    const float* gaussGray;  const float* lutGray;
+    const float* jhLut;
     // The pattern VM's `tex:` hook (pattern_device.cuh). Defined out of line below,
     // next to dTexScalarAt, which it forwards to.
     __device__ double patScalarAt(double u, double v) const;
@@ -4270,6 +4284,17 @@ __device__ static int dWrapIndex(int i, int n, int wrap) {
 // (v flipped so v=0 is the image bottom) then evaluate the sigmoid. The exact
 // device twin of Texture::reflectanceAt (nearest + bilinear filtering).
 __device__ static Real dTexReflAt(const DTexture& tx, Real u, Real v, Real lambda) {
+    if (tx.stoch.on && tx.gaussRgb && tx.jhLut) {   // O7 — twin of Texture::reflectanceAt
+        // Blend the three crops in linear RGB — the same planes, lattice and weights the
+        // raster preview uses — then convert that colour to a spectrum through the shared
+        // LUT. See stochtile.h for why this is not done in coefficient space.
+        double c[3];
+        stochSample(tx.stoch, tx.gaussRgb, tx.lutRgb, 3, tx.w, tx.h, tx.filter,
+                    (double)u, (double)v, c);
+        double cs[3];
+        stochJhCoeff(tx.jhLut, c[0], c[1], c[2], cs);
+        return dReflAt(cs, lambda);
+    }
     if (tx.filter == 0) {   // Nearest
         int x = dWrapIndex((int)floor((double)u * tx.w), tx.w, tx.wrap);
         int y = dWrapIndex((int)floor((1.0 - (double)v) * tx.h), tx.h, tx.wrap);
@@ -4315,6 +4340,12 @@ __device__ static Real dTexReflTriplanar(const DTexture& tx, const DVec3& p, con
 // maps (roughness, film thickness, §9.4). v flipped so v=0 is the image bottom.
 __device__ static double dTexScalarAt(const DTexture& tx, Real u, Real v) {
     if (!tx.gray) return 0.5;
+    if (tx.stoch.on && tx.gaussGray) {   // O7 — twin of Texture::scalarAt's branch
+        double o[1];
+        stochSample(tx.stoch, tx.gaussGray, tx.lutGray, 1, tx.w, tx.h, tx.filter,
+                    (double)u, (double)v, o);
+        return o[0];
+    }
     if (tx.filter == 0) {   // Nearest
         int x = dWrapIndex((int)floor((double)u * tx.w), tx.w, tx.wrap);
         int y = dWrapIndex((int)floor((1.0 - (double)v) * tx.h), tx.h, tx.wrap);
@@ -4340,6 +4371,15 @@ __device__ inline double DTexture::patScalarAt(double u, double v) const {
 // the linear RGB, remaps [0,1]->[-1,1], normalizes. v flipped so v=0 is image bottom.
 __device__ static DVec3 dTexNormalAt(const DTexture& tx, Real u, Real v) {
     if (!tx.rgb) return DVec3{(Real)0, (Real)0, (Real)1};
+    if (tx.stoch.on && tx.gaussRgb) {   // O7 — the host reaches this via sampleRgb
+        double o[3];
+        stochSample(tx.stoch, tx.gaussRgb, tx.lutRgb, 3, tx.w, tx.h, tx.filter,
+                    (double)u, (double)v, o);
+        DVec3 n{(Real)(2.0 * o[0] - 1.0), (Real)(2.0 * o[1] - 1.0), (Real)(2.0 * o[2] - 1.0)};
+        Real l = (Real)sqrt((double)(n.x * n.x + n.y * n.y + n.z * n.z));
+        return (l > (Real)1e-12) ? DVec3{n.x / l, n.y / l, n.z / l}
+                                 : DVec3{(Real)0, (Real)0, (Real)1};
+    }
     auto texel = [&](int x, int y) -> DVec3 {
         size_t o = ((size_t)y * tx.w + x) * 3;
         return DVec3{(Real)tx.rgb[o], (Real)tx.rgb[o + 1], (Real)tx.rgb[o + 2]};
@@ -11864,6 +11904,9 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             usedAsNormal[m.normalTex] = 1;
     std::vector<DTexture> dtex;
     size_t txIdx = 0;
+    // O7: the RGB -> Jakob-Hanika coefficient table is texture-independent, so upload it
+    // once (lazily — only if some texture is actually stochastic) and share the pointer.
+    const float* d_jhLut = nullptr;
     for (const auto& tx : scene.textures) {
         DTexture dt;
         dt.w = tx.w; dt.h = tx.h;
@@ -11903,6 +11946,17 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         } else {
             dt.rgb = nullptr;
         }
+        // O7: the Gaussianized plane sets, already built (and already float) on the host —
+        // uploaded verbatim so the device transform IS the host transform, not a re-derived
+        // one. Empty vectors upload as null and the samplers fall through to plain tiling.
+        dt.stoch = tx.stoch;
+        auto up1 = [&](const std::vector<float>& v) -> const float* {
+            return v.empty() ? nullptr : (const float*)keep(uploadVec(v));
+        };
+        dt.gaussRgb   = up1(tx.gaussRgb);    dt.lutRgb   = up1(tx.lutRgb);
+        dt.gaussGray  = up1(tx.gaussGray);   dt.lutGray  = up1(tx.lutGray);
+        if (dt.gaussRgb && !d_jhLut) d_jhLut = up1(upsample::coeffLut());
+        dt.jhLut = dt.gaussRgb ? d_jhLut : nullptr;
         dtex.push_back(dt);
         ++txIdx;
     }

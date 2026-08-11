@@ -380,6 +380,49 @@ channels), so `tex:` and the scalar maps read the concentration exactly.
 
 Worked example `scenes/pattern_reaction.ftsl`; self-test `ftrace -checkreaction`.
 
+### 5.3 Stochastic tiling (`tiling stochastic`)
+
+Any image texture may be tiled so the **repeat lattice is invisible**, by
+histogram-preserving blending (Heitz & Neyret 2018):
+
+```
+texture "lichen" {
+    file   scenes/lichen.ppm
+    wrap   repeat
+    tiling stochastic      # none (default) | stochastic
+    patch  1.0             # lattice cell size, in texture repeats (default 1.0, > 0)
+    seed   3               # which realisation of the crop offsets (default 0)
+}
+```
+
+- `patch` is in **texture repeats**, so it composes with whatever UV scale the
+  projection applies; `1.0` is the paper's default. Smaller cells shuffle harder but
+  blur features bigger than a cell.
+- `seed` selects the realisation and reproduces exactly across backends.
+- `tiling`/`patch`/`seed` are only meaningful on `file` textures (an `rgb` skin or a
+  `reaction` bake is already procedural / seamless). `patch` and `seed` are ignored
+  when `tiling` is `none`.
+
+What it does per shading point: sample **three** randomly offset crops on a triangle
+lattice and blend them with the barycentric weights. Because a plain average of three
+crops of a bimodal image produces the mean of its two modes — a colour the source never
+contains — the blend runs in a **rank-transformed** space instead: each channel is
+mapped at load onto `N(1/2, 1/6)`, the taps are blended there, the variance the average
+destroyed is restored by dividing the centred blend by `sqrt(Σwᵢ²)`, and the result is
+inverted through a stored 1-D LUT. Histogram, contrast and colour statistics survive.
+
+The blend is in **linear RGB**, then converted to a reflectance through one shared 64³
+Jakob–Hanika coefficient LUT (built lazily on first use). Blending the coefficients
+themselves would be wrong — coefficient space is not a colour space, and doing so
+fringes blue-cyan. Because all three backends (spectral CPU, CUDA, mode-`W` raster) run
+that same operator on the same planes, they agree.
+
+Costs three texture taps instead of one and roughly doubles the texture's memory (the
+rank-transform planes). Works with every UV source including `triplanar`, with
+`reflect texture:<name>`, and inside `tex:<name>(u, v)` pattern terms.
+
+Worked A/B example `scenes/stochtile.ftsl`; self-test `ftrace -checkstochtile`.
+
 ---
 
 ## 6. `pattern` — procedural scalar fields

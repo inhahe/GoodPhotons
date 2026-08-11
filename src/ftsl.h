@@ -2544,6 +2544,28 @@ private:
         else if (wr == "clamp")  tex.wrap = TexWrap::Clamp;
         else if (wr == "mirror") tex.wrap = TexWrap::Mirror;
         else { fail("texture '" + b.name + "': unknown wrap '" + wr + "' (repeat|clamp|mirror)"); return false; }
+        // O7: histogram-preserving stochastic tiling (Heitz-Neyret). `tiling none` is the
+        // ordinary lattice repeat; `tiling stochastic` blends three randomly offset crops
+        // through a rank transform so the repeat stops being visible. See stochtile.h.
+        std::string tl = strOf(b, "tiling", "none");
+        if (tl == "stochastic") {
+            tex.stoch.on    = 1;
+            tex.stoch.patch = dblOf(b, "patch", 1.0);
+            tex.stoch.seed  = (unsigned)(long long)dblOf(b, "seed", 0.0);
+            if (!(tex.stoch.patch > 0.0)) {
+                fail("texture '" + b.name + "': patch must be > 0"); return false;
+            }
+            if (tex.wrap != TexWrap::Repeat) {
+                // Not a hard error, but silence would be worse: the setting is inert.
+                std::printf("[warn] texture '%s': `wrap %s` is ignored under `tiling "
+                            "stochastic` — the lattice offsets fetch arbitrarily far "
+                            "outside [0,1], so the fetch always repeats.\n",
+                            b.name.c_str(), wr.c_str());
+            }
+        } else if (tl != "none") {
+            fail("texture '" + b.name + "': unknown tiling '" + tl + "' (none|stochastic)");
+            return false;
+        }
 
         const Stmt* rxnS = find(b, "reaction");
         const Stmt* rgbS = rxnS ? nullptr : find(b, "rgb");
@@ -2697,6 +2719,26 @@ private:
         // the one most likely to be running when a `-stop` arrives; false means it was
         // abandoned mid-fit and the half-built texture must not enter the scene.
         if (!tex.buildReflCoeff()) { fail("scene load stopped by request"); return false; }
+        // O7: rank-transform every plane the texture might be asked for — the linear-RGB
+        // colour plane and the grayscale scalar plane. Deliberately NOT the Jakob-Hanika
+        // coefficients: coefficient space is not a colour space, so blending there fringes
+        // blue-cyan (see stochtile.h). The blend runs in RGB and the blended colour is
+        // converted through the shared coefficient LUT at shading time.
+        if (tex.stoch.on) {
+            if (tex.hasPalette()) {
+                // An index map's texels are categorical labels; blending three of them
+                // through a histogram would silently invent palette entries.
+                fail("texture '" + b.name + "': `tiling stochastic` cannot be combined with "
+                     "`palette` — palette indices are categorical and must not be blended");
+                return false;
+            }
+            const auto stT0 = std::chrono::steady_clock::now();
+            tex.buildStochastic();
+            const double stSec = std::chrono::duration<double>(
+                                     std::chrono::steady_clock::now() - stT0).count();
+            std::printf("[tiling] texture '%s': stochastic, %dx%d, patch %.3g, seed %u  (%.2f s)\n",
+                        b.name.c_str(), tex.w, tex.h, tex.stoch.patch, tex.stoch.seed, stSec);
+        }
         int id = (int)L.scene.textures.size();
         L.scene.textures.push_back(std::move(tex));
         textureIndex_[b.name] = id;

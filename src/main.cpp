@@ -4101,6 +4101,455 @@ static int checkFNoise() {
     return ok ? 0 : 1;
 }
 
+// Histogram-preserving stochastic tiling self-test (src/stochtile.h, and the Texture
+// branches it drives). O7. No scene, no renderer.
+//
+// The feature makes exactly one claim that a picture cannot settle: that blending three
+// randomly offset crops of an image hides the repeat WITHOUT the contrast loss that makes
+// the naive cross-fade unusable. Both halves of that are measured here, against a control
+// that is the naive blend itself — so §4 cannot pass by being a no-op, and §5 cannot pass
+// by washing the image out.
+//
+//   §1 THE RANK TRANSFORM ROUND-TRIPS. Acklam+Halley's quantile against std::erfc to
+//      full double precision, then T^-1(T(x)) == x over every texel of a deliberately
+//      awkward histogram (skewed, clipped at both ends, with a spike). This is the piece
+//      everything else rests on: if T^-1 is not T's inverse, the operator changes the
+//      image's colours even where it does no blending at all.
+//   §2 T REALLY GAUSSIANIZES. The transformed plane's mean and standard deviation must be
+//      1/2 and 1/6, and its deciles must be the normal's — for an input histogram that is
+//      nothing like a Gaussian. (Rank-based, so this holds for ANY input; the section
+//      exists because a fitted mean/variance "Gaussianization" would fail it.)
+//   §3 THE LATTICE IS A PARTITION OF UNITY. Exactly three distinct vertices anywhere,
+//      weights non-negative and summing to 1 to 1e-12, and the assembled operator is
+//      continuous across cell boundaries — the seam test, which a naive tiling of square
+//      cells fails outright.
+//   §4 THE HEADLINE: VARIANCE IS PRESERVED, AND THE CONTROL LOSES IT. Over many random
+//      lookups the operator's output standard deviation must match the source's, and its
+//      deciles must match the source's — while the SAME three taps with the SAME weights,
+//      averaged the obvious way, must come out measurably flatter. The predicted loss is
+//      not a guess: barycentrics of a uniform point in a triangle are Dirichlet(1,1,1),
+//      so E[sum w^2] = 1/2 and the naive blend's standard deviation should land near
+//      1/sqrt(2) = 0.707 of the source's. The test asserts that prediction too.
+//   §5 THE REPEAT IS ACTUALLY BROKEN. Plain tiling satisfies f(u+1,v) == f(u,v) exactly,
+//      which is the artefact. Under the operator the mean |f(u+1,v) - f(u,v)| must rise to
+//      a substantial fraction of the mean difference between two UNRELATED lookups — i.e.
+//      a one-repeat shift now looks like new content, not the same content again.
+//   §6 SEED AND PATCH ARE LIVE, AND THE OPERATOR IS DETERMINISTIC. Two seeds must give
+//      different crops; the same call twice must be bit-identical (the backends rely on
+//      that — the lattice hash is integer precisely so a CPU and a GPU cannot disagree).
+//   §7 THE TEXTURE INTEGRATION. sampleRgb / scalarAt / reflectanceAt all take the branch,
+//      stay in range, and — the anti-regression that matters — a texture with `tiling
+//      none` is bit-identical to what it was before the feature existed.
+static int checkStochTile() {
+    bool ok = true;
+    double worst = 0.0;
+    auto chk = [&](const char* what, double got, double want, double tol) {
+        double e = std::fabs(got - want);
+        if (tol <= 1e-12 && e > worst) worst = e;
+        if (e > tol)
+            std::printf("[checkstochtile] %-52s got %.12g want %.12g  err=%.3g  BAD\n",
+                        what, got, want, e);
+        return e <= tol;
+    };
+    auto want = [&](const char* what, bool cond) {
+        if (!cond) std::printf("[checkstochtile] %s  BAD\n", what);
+        return cond;
+    };
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    auto frand = [&]() {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(rng >> 11) / 9007199254740992.0;
+    };
+
+    // ---- the test image -----------------------------------------------------
+    // Short correlation length (so two random crops are near-independent, which is what
+    // makes §4's variance arithmetic a prediction rather than a fudge) but a violently
+    // non-Gaussian histogram: a smooth value-noise field pushed through a fourth power,
+    // then clipped. Skewed, spiky at 0, hard-clipped at 1 — everything a fitted Gaussian
+    // transform would mangle and a rank transform must not.
+    const int TW = 96, TH = 96;
+    const size_t TN = (size_t)TW * TH;
+    std::vector<double> src(TN);
+    for (int y = 0; y < TH; ++y) {
+        for (int x = 0; x < TW; ++x) {
+            const double f = patValueNoise(x * 0.34, y * 0.34, 11.5);
+            double v = std::pow(f, 4.0) * 1.6;
+            if (v > 1.0) v = 1.0;
+            src[(size_t)y * TW + x] = v;
+        }
+    }
+    auto meanOf = [](const std::vector<double>& a) {
+        double s = 0.0; for (double v : a) s += v; return s / (double)a.size();
+    };
+    auto sdOf = [&](const std::vector<double>& a) {
+        const double m = meanOf(a);
+        double s = 0.0; for (double v : a) s += (v - m) * (v - m);
+        return std::sqrt(s / (double)a.size());
+    };
+    auto decilesOf = [](std::vector<double> a, double d[9]) {
+        std::sort(a.begin(), a.end());
+        for (int k = 1; k <= 9; ++k) {
+            double t = 0.1 * k * (double)(a.size() - 1);
+            size_t i = (size_t)t; double fr = t - (double)i;
+            d[k - 1] = (i + 1 < a.size()) ? a[i] * (1 - fr) + a[i + 1] * fr : a.back();
+        }
+    };
+
+    std::vector<float> gauss, lut;
+    Texture::gaussianizePlanes(TN, 1, [&](size_t i, int) { return src[i]; }, gauss, lut);
+
+    // A float copy of the source, so §4/§5 can take *plain* bilinear tiled samples through
+    // exactly the same fetch path the operator uses. This is the honest control: bilinear
+    // filtering is itself a low-pass, so it costs variance no matter how the texture is
+    // tiled, and that loss must not be charged to the blending operator. Comparing the
+    // operator against the texel histogram instead would report a ~7% "contrast loss" that
+    // plain tiling suffers just as much.
+    std::vector<float> srcF(TN);
+    for (size_t i = 0; i < TN; ++i) srcF[i] = (float)src[i];
+
+    // ---- §1 the rank transform round-trips ----------------------------------
+    {
+        double wq = 0.0;
+        for (int k = 1; k < 400; ++k) {
+            const double p = (double)k / 400.0;
+            wq = std::max(wq, std::fabs(stochNormalCdf(stochNormalQuantile(p)) - p));
+        }
+        ok &= chk("S1 quantile inverts the normal CDF", wq, 0.0, 1e-14);
+        ok &= chk("S1 quantile(1/2)", stochNormalQuantile(0.5), 0.0, 1e-14);
+        ok &= chk("S1 quantile(0.975)", stochNormalQuantile(0.975), 1.959963984540054, 1e-12);
+        // T^-1(T(x)) over every texel. The LUT has 2048 entries and the source has 9216,
+        // so the reconstruction is an interpolation of the sorted values, not a lookup —
+        // the error reported here is the whole cost of storing T^-1 as a table.
+        double wr = 0.0;
+        for (size_t i = 0; i < TN; ++i)
+            wr = std::max(wr, std::fabs(stochInvT(lut.data(), (double)gauss[i]) - src[i]));
+        std::printf("[checkstochtile] S1 worst |T^-1(T(x)) - x| over %zu texels = %.3g\n", TN, wr);
+        ok &= want("S1 the inverse LUT does not reconstruct the image", wr < 5e-3);
+    }
+
+    // ---- §2 the transformed plane is N(1/2, 1/6) ----------------------------
+    {
+        std::vector<double> g(TN);
+        for (size_t i = 0; i < TN; ++i) g[i] = (double)gauss[i];
+        const double gm = meanOf(g), gs = sdOf(g);
+        ok &= chk("S2 Gaussianized mean", gm, STOCH_G_MEAN, 1e-6);
+        // Untruncated (the plane is float and the LUT's domain is +-6 sigma), so this is
+        // 1/6 to within the discreteness of n mid-rank quantiles — not merely "close".
+        ok &= chk("S2 Gaussianized sd", gs, STOCH_G_SIGMA, 5e-4);
+        double gd[9], sd[9];
+        decilesOf(g, gd);
+        decilesOf(src, sd);
+        double wd = 0.0;
+        for (int k = 0; k < 9; ++k)
+            wd = std::max(wd, std::fabs(gd[k] - (STOCH_G_MEAN + STOCH_G_SIGMA *
+                                                 stochNormalQuantile(0.1 * (k + 1)))));
+        ok &= chk("S2 Gaussianized deciles match the normal's", wd, 0.0, 2e-3);
+        // The control: the SOURCE's deciles are nothing like the normal's, so §2 is a
+        // claim about the transform rather than about the test image.
+        double wsrc = 0.0;
+        for (int k = 0; k < 9; ++k)
+            wsrc = std::max(wsrc, std::fabs(sd[k] - (STOCH_G_MEAN + STOCH_G_SIGMA *
+                                                     stochNormalQuantile(0.1 * (k + 1)))));
+        std::printf("[checkstochtile] S2 decile distance from normal: source %.4f  "
+                    "transformed %.4f\n", wsrc, wd);
+        ok &= want("S2 the source was already Gaussian — the test proves nothing", wsrc > 0.05);
+    }
+
+    // ---- §3 the lattice --------------------------------------------------------
+    StochTile st; st.on = 1; st.patch = 1.0; st.seed = 7u;
+    {
+        double wsum = 0.0, wneg = 0.0;
+        bool distinct = true;
+        for (int i = 0; i < 20000; ++i) {
+            const double u = (frand() - 0.5) * 40.0, v = (frand() - 0.5) * 40.0;
+            double w[3], ou[3], ov[3];
+            stochTriGrid(u, v, st.patch, st.seed, w, ou, ov);
+            wsum = std::max(wsum, std::fabs(w[0] + w[1] + w[2] - 1.0));
+            for (int k = 0; k < 3; ++k) wneg = std::min(wneg, w[k]);
+            for (int a = 0; a < 3; ++a)
+                for (int b = a + 1; b < 3; ++b)
+                    if (ou[a] == ou[b] && ov[a] == ov[b]) distinct = false;
+        }
+        ok &= chk("S3 barycentrics sum to 1", wsum, 0.0, 1e-12);
+        ok &= want("S3 a barycentric went negative", wneg >= 0.0);
+        ok &= want("S3 two lattice taps collided", distinct);
+        // Continuity: the operator must not step anywhere, least of all where the tap set
+        // changes. A cell-based tiling with a hard boundary would show O(range) jumps here.
+        const double eps = 1e-7;
+        double jump = 0.0;
+        for (int i = 0; i < 20000; ++i) {
+            const double u = frand() * 8.0, v = frand() * 8.0;
+            double a[1], b[1];
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, a);
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u + eps, v + eps, b);
+            jump = std::max(jump, std::fabs(a[0] - b[0]));
+        }
+        std::printf("[checkstochtile] S3 largest step over a %.0e UV nudge = %.3g\n", eps, jump);
+        ok &= want("S3 the operator is discontinuous", jump < 1e-2);
+    }
+
+    // ---- §4 variance preservation, against the naive blend ------------------
+    {
+        const int N = 200000;
+        std::vector<double> out(N), naive(N), plain(N);
+        double swsq = 0.0;
+        for (int i = 0; i < N; ++i) {
+            const double u = frand() * 16.0, v = frand() * 16.0;
+            double o[1];
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, o);
+            out[i] = o[0];
+            // Reference: ordinary repeat tiling, same bilinear fetch, no blending at all.
+            // Everything below is measured against THIS, not against the texel histogram,
+            // because the bilinear low-pass costs contrast in plain tiling too.
+            double p[1];
+            stochFetch(srcF.data(), 1, TW, TH, 1, u, v, p);
+            plain[i] = p[0];
+            // The control: identical lattice, identical weights, identical taps — but
+            // averaged in the image's own space with no variance restoration. This is
+            // what a by-hand implementation of "blend three random crops" produces.
+            double w[3], ou[3], ov[3];
+            stochTriGrid(u, v, st.patch, st.seed, w, ou, ov);
+            swsq += w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+            double acc = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                double g1[1];
+                stochFetch(gauss.data(), 1, TW, TH, 1, u + ou[k], v + ov[k], g1);
+                acc += w[k] * stochInvT(lut.data(), g1[0]);
+            }
+            naive[i] = acc;
+        }
+        const double ssd = sdOf(src), psd = sdOf(plain), osd = sdOf(out), nsd = sdOf(naive);
+        std::printf("[checkstochtile] S4 sd: texels %.4f  plain tiling %.4f  "
+                    "operator %.4f (%.3fx plain)  naive blend %.4f (%.3fx plain)\n",
+                    ssd, psd, osd, osd / psd, nsd, nsd / psd);
+        std::printf("[checkstochtile] S4 mean sum(w^2) = %.4f (Dirichlet prediction 0.5), "
+                    "so the naive blend should sit near %.3fx\n",
+                    swsq / N, std::sqrt(swsq / N));
+        ok &= chk("S4 E[sum w^2] over the triangle", swsq / N, 0.5, 5e-3);
+        ok &= want("S4 the operator did not preserve contrast",
+                   osd / psd > 0.95 && osd / psd < 1.05);
+        ok &= want("S4 the naive control did not lose contrast", nsd / psd < 0.88);
+        // Not just the second moment: the whole distribution.
+        double od[9], pd[9];
+        decilesOf(out, od);
+        decilesOf(plain, pd);
+        double wd = 0.0, wn = 0.0;
+        std::vector<double> nv = naive; double nd[9]; decilesOf(nv, nd);
+        for (int k = 0; k < 9; ++k) {
+            wd = std::max(wd, std::fabs(od[k] - pd[k]));
+            wn = std::max(wn, std::fabs(nd[k] - pd[k]));
+        }
+        std::printf("[checkstochtile] S4 worst decile shift: operator %.4f  naive %.4f\n", wd, wn);
+        ok &= want("S4 the output histogram drifted from plain tiling's", wd < 0.05);
+        ok &= want("S4 the naive control's histogram did not drift", wn > wd * 1.5);
+    }
+
+    // ---- §5 the repeat is broken -------------------------------------------
+    {
+        const int N = 60000;
+        double dRepeat = 0.0, dRandom = 0.0, dPlain = 0.0;
+        for (int i = 0; i < N; ++i) {
+            const double u = frand() * 16.0, v = frand() * 16.0;
+            double a[1], b[1], c[1];
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, a);
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u + 1.0, v, b);
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1,
+                        frand() * 16.0, frand() * 16.0, c);
+            dRepeat += std::fabs(a[0] - b[0]);
+            dRandom += std::fabs(a[0] - c[0]);
+            // Plain tiling: exactly periodic, so this difference is identically zero and
+            // the eye is free to find the lattice.
+            double p0[1], p1[1];
+            stochFetch(gauss.data(), 1, TW, TH, 1, u, v, p0);
+            stochFetch(gauss.data(), 1, TW, TH, 1, u + 1.0, v, p1);
+            dPlain += std::fabs(p0[0] - p1[0]);
+        }
+        dRepeat /= N; dRandom /= N; dPlain /= N;
+        std::printf("[checkstochtile] S5 mean |f(u+1,v) - f(u,v)|: plain %.3g  stochastic "
+                    "%.4f  (unrelated pair %.4f, ratio %.3f)\n",
+                    dPlain, dRepeat, dRandom, dRepeat / dRandom);
+        ok &= chk("S5 plain tiling is exactly periodic", dPlain, 0.0, 1e-12);
+        ok &= want("S5 a one-repeat shift still returns the same content",
+                   dRepeat / dRandom > 0.8);
+    }
+
+    // ---- §6 seed / patch / determinism --------------------------------------
+    {
+        StochTile s2 = st; s2.seed = 8u;
+        StochTile s3 = st; s3.patch = 3.0;
+        double diffSeed = 0.0, diffPatch = 0.0;
+        bool identical = true;
+        for (int i = 0; i < 5000; ++i) {
+            const double u = frand() * 8.0, v = frand() * 8.0;
+            double a[1], b[1], c[1], d[1];
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, a);
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, d);
+            stochSample(s2, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, b);
+            stochSample(s3, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, c);
+            if (a[0] != d[0]) identical = false;
+            diffSeed  += std::fabs(a[0] - b[0]);
+            diffPatch += std::fabs(a[0] - c[0]);
+        }
+        ok &= want("S6 the operator is not deterministic", identical);
+        ok &= want("S6 `seed` does not change the crop", diffSeed / 5000.0 > 0.02);
+        ok &= want("S6 `patch` does not change the lattice", diffPatch / 5000.0 > 0.02);
+    }
+
+    // ---- §7 the Texture integration -----------------------------------------
+    {
+        Texture plain;
+        plain.name = "chk"; plain.w = TW; plain.h = TH;
+        plain.encoding = TexEncoding::Linear;
+        plain.rgb.resize(TN);
+        for (size_t i = 0; i < TN; ++i) {
+            const double s = src[i];
+            plain.rgb[i] = Vec3{s, s * 0.6 + 0.2, 1.0 - s};
+        }
+        Texture stoc = plain;
+        if (!plain.buildReflCoeff() || !stoc.buildReflCoeff()) {
+            ok &= want("S7 buildReflCoeff failed", false);
+        }
+        stoc.stoch = st;
+        stoc.buildStochastic();
+        ok &= want("S7 buildStochastic left a plane empty",
+                   stoc.stochastic() && !stoc.gaussGray.empty() && !stoc.lutRgb.empty());
+        // The anti-regression: enabling the feature must not perturb a texture that did
+        // not ask for it. Bit-for-bit, at every sampler.
+        bool same = true;
+        double devRgb = 0.0, devScl = 0.0, devRfl = 0.0;
+        double lo = 1e9, hi = -1e9;
+        for (int i = 0; i < 4000; ++i) {
+            const double u = frand() * 4.0, v = frand() * 4.0;
+            const double lam = 400.0 + frand() * 300.0;
+            Texture ref = plain;   // a copy that never saw buildStochastic
+            (void)ref;
+            const Vec3 p0 = plain.sampleRgb(u, v);
+            const Vec3 s0 = stoc.sampleRgb(u, v);
+            devRgb = std::max(devRgb, std::fabs(p0.x - s0.x));
+            devScl = std::max(devScl, std::fabs(plain.scalarAt(u, v) - stoc.scalarAt(u, v)));
+            devRfl = std::max(devRfl, std::fabs(plain.reflectanceAt(u, v, lam) -
+                                                stoc.reflectanceAt(u, v, lam)));
+            lo = std::min(lo, std::min(s0.x, std::min(s0.y, s0.z)));
+            hi = std::max(hi, std::max(s0.x, std::max(s0.y, s0.z)));
+            const double r = stoc.reflectanceAt(u, v, lam);
+            if (!(r >= 0.0 && r <= 1.0)) same = false;
+        }
+        ok &= want("S7 a stochastic reflectance left [0,1]", same);
+        ok &= want("S7 sampleRgb left the source's range",
+                   lo >= -1e-9 && hi <= 1.0 + 1e-9);
+        std::printf("[checkstochtile] S7 stochastic vs plain, max |delta|: rgb %.4f  "
+                    "scalar %.4f  reflectance %.4f\n", devRgb, devScl, devRfl);
+        ok &= want("S7 `tiling stochastic` had no effect on any sampler",
+                   devRgb > 0.05 && devScl > 0.02 && devRfl > 0.02);
+        // ...and a texture left at `tiling none` is untouched by all of the above.
+        Texture untouched;
+        untouched.name = "chk2"; untouched.w = TW; untouched.h = TH;
+        untouched.encoding = TexEncoding::Linear;
+        untouched.rgb = plain.rgb;
+        if (!untouched.buildReflCoeff()) ok &= want("S7 buildReflCoeff failed (2)", false);
+        untouched.buildStochastic();   // a no-op when stoch.on == 0
+        double drift = 0.0;
+        for (int i = 0; i < 2000; ++i) {
+            const double u = frand() * 4.0, v = frand() * 4.0;
+            const Vec3 a = plain.sampleRgb(u, v), b = untouched.sampleRgb(u, v);
+            drift = std::max(drift, std::fabs(a.x - b.x) + std::fabs(a.y - b.y) +
+                                    std::fabs(a.z - b.z));
+            drift = std::max(drift, std::fabs(plain.scalarAt(u, v) - untouched.scalarAt(u, v)));
+        }
+        ok &= chk("S7 `tiling none` is bit-identical to before", drift, 0.0, 0.0);
+    }
+
+    // ---- §8 the shared RGB -> Jakob-Hanika coefficient LUT ---------------------
+    // The spectral path blends in linear RGB and converts the blended COLOUR through
+    // upsample::coeffLut(). The thing that must hold is that the tabulated spectrum still
+    // IS the requested colour, so the metric here is the round-trip |XYZ - target|:
+    // integrate the LUT's reflectance against the same CMF/D65 basis the fitter used and
+    // compare to the colour that was asked for. That is exactly what a renderer sees.
+    //
+    // Comparing the LUT's reflectance CURVE against upsample::fit's would be the obvious
+    // test and is a trap: the fit is unconstrained wherever the CMFs vanish, so two
+    // coefficient triples that produce the identical colour can differ by |dR| = 1 out at
+    // 700+ nm. The un-tabulated fit is therefore carried alongside as a control — the LUT
+    // is allowed to be no worse than the fitter it is standing in for, not perfect.
+    //
+    // The grid is sqrt-warped because a linear one is hopeless near black (measured:
+    // 48^3 linear gives mean |dR| 1.0e-2 / worst 2.4e-2 on the lichen asset, vs 1.4e-4 /
+    // 4.3e-3 warped), so half the samples below are pushed hard toward zero.
+    {
+        const float* lut = upsample::coeffLut().data();
+        const upsample::Basis& B = upsample::basis();
+        auto xyzErr = [&](const double* c, double r, double g, double b) {
+            double tX, tY, tZ; upsample::linSrgbToXyz(r, g, b, tX, tY, tZ);
+            double X = 0, Y = 0, Z = 0;
+            for (int s = 0; s < upsample::Basis::N; ++s) {
+                const double sv = stochReflAt(c, B.lam[s]);
+                X += sv * B.wX[s]; Y += sv * B.wY[s]; Z += sv * B.wZ[s];
+            }
+            return std::sqrt((X - tX) * (X - tX) + (Y - tY) * (Y - tY) + (Z - tZ) * (Z - tZ));
+        };
+        auto fitErr = [&](double r, double g, double b) {
+            const auto f = upsample::fit(r, g, b);
+            const double c[3] = {f[0], f[1], f[2]};
+            return xyzErr(c, r, g, b);
+        };
+        double wL = 0.0, sL = 0.0, wF = 0.0, sF = 0.0; int n8 = 0;
+        double wr = 0, wg = 0, wb = 0;
+        for (int i = 0; i < 3000; ++i) {
+            // Half uniform over the cube, half cubed toward black — the regime the warp
+            // exists for and where a linear table falls apart.
+            const bool dark = (i & 1) != 0;
+            auto pick = [&]() { const double x = frand(); return dark ? x * x * x : x; };
+            const double r = pick(), g = pick(), b = pick();
+            double c[3];
+            stochJhCoeff(lut, r, g, b, c);
+            const double eL = xyzErr(c, r, g, b), eF = fitErr(r, g, b);
+            if (eL > wL) { wL = eL; wr = r; wg = g; wb = b; }
+            wF = std::max(wF, eF); sL += eL; sF += eF; ++n8;
+        }
+        std::printf("[checkstochtile] S8 round-trip |XYZ - target|: LUT mean %.5f worst "
+                    "%.4f at rgb (%.3f %.3f %.3f)  |  un-tabulated fit mean %.5f worst "
+                    "%.4f\n", sL / n8, wL, wr, wg, wb, sF / n8, wF);
+        ok &= want("S8 the LUT does not reproduce the requested colour", sL / n8 < 1e-3);
+        ok &= want("S8 the LUT has a bad outlier", wL < 0.03);
+        ok &= want("S8 the LUT is much worse than the fitter it replaces", wL < wF + 0.025);
+        // At the grid nodes no interpolation happens, so the LUT must be as good as the
+        // fitter to within the deliberate soft clip (upsample::clampSaturated) and float
+        // storage. A larger gap is an indexing or warp bug, not a resolution limit.
+        double nodeGap = 0.0;
+        for (int i = 0; i < STOCH_JH_N; i += 7)
+            for (int j = 0; j < STOCH_JH_N; j += 11)
+                for (int k = 0; k < STOCH_JH_N; k += 13) {
+                    // The grid is uniform in sqrt(channel), so the colour AT node i is
+                    // the square of the node coordinate.
+                    const double gr = (double)i / (STOCH_JH_N - 1);
+                    const double gg = (double)j / (STOCH_JH_N - 1);
+                    const double gb = (double)k / (STOCH_JH_N - 1);
+                    const double r = gr * gr, g = gg * gg, b = gb * gb;
+                    double c[3];
+                    stochJhCoeff(lut, r, g, b, c);
+                    nodeGap = std::max(nodeGap, xyzErr(c, r, g, b) - fitErr(r, g, b));
+                }
+        std::printf("[checkstochtile] S8 grid-node error above the fitter = %.3g\n", nodeGap);
+        ok &= want("S8 the LUT is not exact at its own grid nodes", nodeGap < 5e-3);
+        // The fitter itself. upsample::fitSigmoid used to diverge for DARK SATURATED
+        // colours: the sigmoid-of-a-quadratic needs |c| in the hundreds there, so dSigmoid
+        // underflows, the Gauss-Newton Jacobian goes near-singular and Cramer's rule
+        // returns an enormous step. Measured before the backtracking line search was
+        // added: red at Y=0.001 gave |XYZ - target| = 1.41 and blue at Y=0.01 gave 1.40,
+        // i.e. the "fit" was not even the right colour. Those two are asserted by name so
+        // the line search cannot be removed without this failing.
+        const double rDark = fitErr(1e-3, 0.0, 0.0), bDark = fitErr(0.0, 0.0, 1e-2);
+        std::printf("[checkstochtile] S8 fit residual: dark red %.4f (was 1.41)  "
+                    "dark blue %.4f (was 1.40)\n", rDark, bDark);
+        ok &= want("S8 fitSigmoid diverges on dark saturated red", rDark < 1e-3);
+        ok &= want("S8 fitSigmoid diverges on dark saturated blue", bDark < 1e-3);
+    }
+
+    std::printf("[checkstochtile] worst absolute error (exact checks) = %.3g\n", worst);
+    std::printf("[checkstochtile] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 // Blue-noise / Poisson-disk placement self-test (src/bluenoise.h: patBlueNoise,
 // patBNAccept, patBNPrecedes; src/pattern.h: PatOp::BlueNoise, reached from a pattern
 // expression as `bnoise/bnoise2/bnoised/bnoiseid(x, y, z, r)`). O5. No scene, no
@@ -11396,6 +11845,7 @@ static int run(int argc, char** argv) {
     bool checkBlueNoiseOnly = false;
     bool checkReactionOnly = false;
     bool checkFNoiseOnly = false;
+    bool checkStochTileOnly = false;
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkSdfOnly = false;
@@ -11816,6 +12266,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkbluenoise")) checkBlueNoiseOnly = true;
         else if (!std::strcmp(argv[i], "-checkreaction")) checkReactionOnly = true;
         else if (!std::strcmp(argv[i], "-checkfnoise")) checkFNoiseOnly = true;
+        else if (!std::strcmp(argv[i], "-checkstochtile")) checkStochTileOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurv")) checkCurvOnly = true;
         else if (!std::strcmp(argv[i], "-checkcavity")) checkCavityOnly = true;
         else if (!std::strcmp(argv[i], "-checksdf")) checkSdfOnly = true;
@@ -12008,6 +12459,7 @@ static int run(int argc, char** argv) {
     if (checkBlueNoiseOnly) return checkBlueNoise();  // ditto (blue-noise / Poisson-disk placement)
     if (checkReactionOnly)  return checkReaction();   // ditto (Gray-Scott reaction-diffusion bake)
     if (checkFNoiseOnly)    return checkFNoise();     // ditto (filtered / band-limited fBm)
+    if (checkStochTileOnly) return checkStochTile();  // ditto (histogram-preserving tiling)
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkSdfOnly)      return checkSdf();      // ditto (`sdf` bake; exact vs an analytic box)
