@@ -4991,7 +4991,7 @@ that item mostly a binding exercise there.
       distinguish the strand rng from the guide rng, so deleting `spec.seed` from the strand
       seeding went undetected. §3 now isolates each path). Demos: `scenes/fur_basics.ftsl`,
       `scenes/fur_creature.ftsl`.
-- [ ] **P2 — sub-pixel variance and the aggregate-BSDF LOD.** The reason fiber rendering is
+- [x] **P2 — sub-pixel variance and the aggregate-BSDF LOD. ✅ DONE v0.178.0** (stages 1, 2a, 2b, 2c). The reason fiber rendering is
       expensive is not the intersector. A fiber is typically **1/5 to 1/50 of a pixel wide**, so in
       a **backward** path tracer each camera ray either hits or misses and the two answers differ
       wildly — it shows up as **variance**, not aliasing, and it is one of the classic SPP sinks.
@@ -5073,7 +5073,7 @@ that item mostly a binding exercise there.
         where a cell's fibers are parallel. New self-test `-checkfurgrid` (five sections) validates
         the model against the **shipping curve intersector** rather than another closed form. The
         walk stays the default and is byte-for-byte unchanged. See `design.md` → `fur_grid.h`.
-  - [ ] **P2 stage 2 — the aggregate volumetric far tier.** Turn the grid into a real
+  - [x] **P2 stage 2 — the aggregate volumetric far tier. ✅ DONE v0.178.0** (all three stages). Turn the grid into a real
         participating medium (`MediumBound`, per-λ free flight) carrying an aggregate fiber BSDF,
         and build the footprint-based near/far transition that decides per ray whether to trace
         strands or march the medium. Making that transition not pop is the actual work.
