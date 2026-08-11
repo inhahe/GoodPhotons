@@ -60,15 +60,24 @@ is only `sigma_a 0.0014`).
 
 **What is genuinely wrong is the variance**, and it has one structural cause:
 
-- **NEE is the only direct-lighting strategy at a hair vertex, with no MIS partner.** Same
-  structural gap as the `type glossy` entry further down: `backward.h` has no area-light pdf,
-  so a directly-hit emitter after a non-delta vertex is discarded (`specularArrival = false`)
-  and cannot be MIS-combined. Sampling a large area light against a peaked BCSDF is exactly
-  the high-variance case MIS exists to fix. (Env lighting is fine — `envGeom` *does* MIS hair
-  against `hair::pdf`, and it converges visibly faster.)
+- **NEE is the only direct-lighting strategy at a hair vertex, with no MIS partner.** Hair
+  *does* NEE (unlike `type glossy`, which further down is logged as doing no direct lighting
+  at all) — but the other half of the MIS pair is thrown away. `src/backward.h:1422` counts a
+  directly-hit emitter only `if (m.isLight && specularArrival && ...)`, and every non-delta
+  bounce clears `specularArrival`, so after a hair vertex the BSDF-sampling strategy simply
+  never contributes. It cannot be weighted in instead, because there is no area-light
+  solid-angle pdf at the hit to build the balance heuristic from. The estimator is still
+  **unbiased** (NEE alone covers area lights); it is just NEE alone against a peaked BCSDF,
+  which is exactly the high-variance case MIS exists to fix. Environment lighting is the
+  control that proves it: `envGeom` *does* have a pdf and *does* MIS hair against
+  `hair::pdf` (line 1347–1352), and an env-lit coat converges visibly faster than an
+  area-lit one.
 
 **Proper fixes, in order of value:**
-- **Area-light MIS at non-delta vertices** — fixes the variance, and the `glossy` bug with it.
+- **An area-light solid-angle pdf, and MIS at non-delta vertices** — i.e. drop the
+  `specularArrival` gate at `backward.h:1422` and weight the emitter hit against `contBsdfPdf`
+  the way the env branch already does twenty lines earlier. This is the one change that helps
+  every peaked non-delta lobe in modes R/W at once, hair and glossy included.
 - **Dual scattering (Zinke et al. 2008)** — TODO §P3 stage 4. Approximates the deep
   multiple-scattering component analytically instead of walking it, which is how production
   renderers make near-white fur both bright and fast. Not needed for *correctness* here (the
