@@ -1278,11 +1278,16 @@ Two practical notes:
 - **Light it broadly.** A fiber is thin, so a small or point-like source leaves most of
   each strand's circumference unlit and the whole coat reads as black felt. Area lights,
   and a back light to feed the TT lobe, are what make the model worth having.
-- **Mode support.** Hair renders in `W`, `R`, `A`/`B`/`C`, `D` (BDPT) and `V` (VCM). Modes
+- **Mode support.** Hair renders in `W`, `R`, `A`/`B`/`C`, `D` (BDPT) and `U` (VCM). Modes
   `M` (photon map) and `S` (SPPM) *scatter* through it correctly but never gather on it —
   their photon records store no incident direction, so a directional fiber lobe has nothing
-  to evaluate against; a strand is treated like a glossy surface there. The GPU backends
-  fall back to the CPU tracer for any scene containing a `hair` material.
+  to evaluate against; a strand is treated like a glossy surface there. Hair runs **on the
+  GPU** in the forward modes (`A`/`B`/`C`) and the backward tracer (`R`, `W`) — and the
+  modes composed from them (`V`, `P`) — since 0.181.0: on `hair_basics`, GPU mode `R` is
+  ~20× the CPU and mode `B` ~6×. Renders that still fall back to the CPU tracer:
+  `-dual-scatter` (the approximation is host-side), and hair scenes in the GPU BDPT (`D`),
+  photon-map (`M`/`S`) and VCM (`U`) backends, whose vertex/gather machinery would shade a
+  strand as Lambertian.
 
 See `scenes/hair_basics.ftsl`.
 

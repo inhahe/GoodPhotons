@@ -10443,19 +10443,24 @@ static void buildFurFields(const Scene& scene) {
 }
 
 #ifdef HAVE_CUDA
-// cudaBackwardSupported, plus the one thing it cannot see: the `-fur-volume` far tier lives
-// ONLY in the CPU BackwardRenderer (BackwardRenderer::furVol), and renderBackwardCuda has no
-// equivalent. Handing a coat-as-medium scene to the device kernel therefore renders the coat
-// as nothing at all.
+// cudaBackwardSupported, plus the two things it cannot see (both RENDER OPTIONS, not scene
+// properties):
+//   * the `-fur-volume` far tier lives ONLY in the CPU BackwardRenderer
+//     (BackwardRenderer::furVol), and renderBackwardCuda has no equivalent. Handing a
+//     coat-as-medium scene to the device kernel therefore renders the coat as nothing at all.
+//   * `-dual-scatter` replaces the coat's multiple-scattering random walk with the
+//     Zinke dual-scattering approximation (BackwardRenderer::dualScatter) — CPU-only; the
+//     device D_HAIR case is the plain single-fiber walk. Running it on the GPU would
+//     silently drop the option, so a hair scene under -dual-scatter stays on the CPU.
 //
-// This used to be harmless-by-accident -- `MatType::Hair` is not POD-bakeable, so
-// cudaForwardSupported rejected every fur scene before it got here. Dropping the strands
-// removes that accident (a scene with no hair left in it bakes fine), so the gate has to be
-// stated rather than relied upon. It is stated for the keep-strands case too, because a
-// latent gate that only holds by coincidence is a bug waiting for §P3 to land the fiber
-// BCSDF on the device.
+// (§P3 landed the single-fiber BCSDF on the device in 0.181.0, so plain hair scenes no
+// longer fall back — these two option gates are now the ONLY reasons a fur scene leaves
+// the GPU backward path.)
 static bool backwardOnGpuOk(const Scene& scene, const Camera& cam) {
     if (g_furVolume && g_furVolData.valid()) return false;
+    if (g_dualScatter)
+        for (const auto& m : scene.mats)
+            if (m.type == MatType::Hair) return false;
     return cudaBackwardSupported(scene, cam);
 }
 #endif

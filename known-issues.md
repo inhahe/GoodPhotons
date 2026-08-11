@@ -156,23 +156,41 @@ is only `sigma_a 0.0014`).
 `scenes/hair_basics.ftsl` therefore defaults to mode `W` (deterministic, noise-free) and uses
 realistic absorptions rather than a near-white fur, and its header says why.
 
-### OPEN (2026-08-10, v0.172.0): the GPU backends fall back to the CPU for any scene containing a `hair` material
+### DONE (2026-08-11, v0.181.0): the GPU backends no longer fall back to the CPU for `hair` materials
 
-`cudaForwardSupported()` (`src/render_cuda.cu`) rejects a scene if any material — directly or
-as a `mix` child — is `MatType::Hair`, and `renderBackwardRGBCuda`'s gate rejects it through
-its `default: return false`. The device `shadeStep` has no Hair branch, and the model needs
-the strand tangent and the impact parameter, neither of which the device `Hit` carries.
+Was: `cudaForwardSupported()` rejected any scene whose material set contained `MatType::Hair`
+(directly or as a `mix` child), and the backward gate rejected it through `default: return
+false` — one strand of fur sent the whole scene to the CPU tracer, and hair scenes are
+exactly the ones that need the most samples.
 
-Like `Layered`, **one** hair material sends the whole scene to the CPU tracer. That is the
-right failure mode (better than the device silently shading strands as something they are
-not), but it means a furred character in an otherwise GPU-friendly scene loses the GPU
-entirely — and hair scenes are exactly the ones that want it, since they are also the ones
-that need the most samples (see the entry above).
+Fixed exactly along the lines sketched here: the device `Hit` now carries `fiberRadius`
+(stamped by the curve intersector; the tangent already rode in `Hit.tan`), `hair.h` is ported
+to `__device__` doubles as the `dhair` namespace in `src/render_cuda.cu`, the forward tracer
+interacts through `interactHair` (connect-then-scatter with mode-A/B splats, hero de-heroes),
+and the backward tracer through `bkInteractHair` + a rho=1 NEE whose light/env geometry terms
+swap the surface cosine for the full-sphere `π·hairFCos` fiber response. Validated CPU-vs-GPU
+on `hair_basics`: channel means agree to ≤0.5 % in both directions; mode R runs **19.7×**
+faster on the RTX 4090 (368 s → 19 s at 64 spp), mode B **6.4×** (72 s → 11 s at 20 M
+photons).
 
-**Proper fix:** add `tangent` + `fiberRadius` to the device `Hit`, port `hair.h` to
-`__device__` (it is header-only and depends on nothing but `<cmath>` and `linalg.h`, so this
-is mostly a matter of `__host__ __device__` annotations and replacing `double` where it
-matters), and give `shadeStep`/`bkInteract` a `D_HAIR` case.
+Still CPU-only, by design: `-dual-scatter` hair (the approximation is host-side), and hair
+scenes in the BDPT (`D`), photon-map (`M`/`S`) and VCM (`U`) GPU backends, whose
+vertex/gather machinery treats every non-specular vertex as Lambertian — those fall back
+exactly as before.
+
+The port also surfaced (and fixed) a nasty CUDA build hazard, recorded here because the
+failure is total and looks nothing like its cause: `hair.h`'s `besselI0` ↔ `logBesselI0` are
+mutually recursive (each one's other-range branch calls the other; runtime-safe, the branches
+partition on `x > 12`). Ported as-is, that *static* cycle made nvlink declare the stack of
+every kernel that can reach them "cannot be statically determined", which strips those
+kernels' `MIN_STACK_SIZE` attribute — the driver then stops auto-reserving their real stack
+need (7–15 KB) and they run on the 1 KB `cudaLimitStackSize` default. Result: **every** GPU
+render, hair or not, died at launch with `illegal memory access` (device stack overflow, per
+compute-sanitizer). The device port therefore splits the pair into two cross-call-free cores
+(`besselI0Series`, `logBesselI0Asym`) plus branch-picking wrappers — bit-identical values,
+acyclic call graph, real MIN_STACK restored (kTrace 10072 B / kBackward 15456 B / kWfShade
+8840 B). If a future device function ever reintroduces a static call cycle, the tell is the
+nvlink warning `Stack size for entry function '…' cannot be statically determined`.
 
 ### OPEN (2026-08-10, v0.170.0): the sigmoid upsampling model itself is ~0.019 off at pure white, and stochastic tiling's LUT inherits that
 

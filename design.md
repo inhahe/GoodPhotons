@@ -702,14 +702,30 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
       die in a couple of bounces while the fiber walk still cannot early-out. That case is
       logged in `known-issues.md`; the fix Zinke gives for it is §4.1.2's voxel density grid
       instead of BVH ray shooting.
-  - *CUDA falls back.* `cudaForwardSupported()` rejects any scene containing a `Hair`
-    material (directly or as a `mix` child): the device `shadeStep` has no Hair branch, and the
-    model needs the strand tangent and impact parameter, which the device `Hit` does not carry.
-    Like `Layered`, one hair material sends the whole scene to the CPU tracer rather than
-    letting the device silently shade strands as something they are not. `MatType::Hair` is
-    appended at the **end** of the enum because `render_cuda.cu`'s `D_*` tags are `(int)m.type`.
-    This is also why `-dual-scatter` can never be silently ignored on the GPU: a scene with
-    no `hair` material has nothing for it to do, and a scene with one is already on the CPU.
+  - *CUDA runs hair natively (0.181.0).* `hair.h` is ported wholesale to `__device__`
+    doubles as `render_cuda.cu`'s `dhair` namespace (`D_HAIR = (int)MatType::Hair`, still
+    appended at the **end** of the enum because the `D_*` tags are `(int)m.type`); the device
+    `Hit` carries `fiberRadius` stamped by the curve intersector (the tangent already rode in
+    `tan`). Forward: `interactHair` — connect-then-scatter like Fluorescent (narrow-but-finite
+    lobes are camera-visible, so it splats to every mode-A/B camera via `splatSurfaceAllHair`
+    before sampling), RR on the fiber throughput `fv·cosLong/pdf`, far-side TT/TRT exits
+    offset by `dHairExitOffset`; the hero tracer de-heroes onto it (σ_a is per-λ). Backward:
+    `bkInteractHair` + NEE with `rho = 1` where `bkEmitterGeom`/`bkNeeLight`/`bkEnvGeom`/
+    `bkNeeEnv` take an optional `DHairShade*` and swap the surface cosine for the full-sphere
+    `π·hairFCos` fiber response. Both bodies are `__noinline__` so the fat double-precision
+    frames (DHairShade + `dhair::sample` locals) stay out of the shared tracer frames and out
+    of every kernel's statically-computed MIN_STACK. One porting trap is load-bearing:
+    `hair.h`'s `besselI0 ↔ logBesselI0` mutual recursion (runtime-safe, statically a cycle)
+    made nvlink mark every kernel reaching them "stack size cannot be statically determined",
+    which strips MIN_STACK and drops those kernels to the 1 KB `cudaLimitStackSize` default —
+    every GPU render then died of stack overflow, hair or not. The device pair is therefore
+    split into acyclic cores (`besselI0Series` / `logBesselI0Asym`) with branch-picking
+    wrappers, bit-identical per branch. Validated on `hair_basics`: CPU/GPU channel means
+    agree ≤0.5 %; mode R 19.7× faster, mode B 6.4× (RTX 4090). Still CPU-only: `-dual-scatter`
+    hair (host-side approximation — the gate lives in `main.cpp`'s `backwardOnGpuOk`), and
+    hair scenes in the BDPT / photon-map GPU backends (their vertex/gather machinery shades
+    non-specular vertices as Lambertian; they reject via `sceneUsesHairMaterial`, and the
+    VCM / SPPM backends inherit the reject by chaining those gates).
 - **`Scene::walkFibers`** (`scene.h`, 0.174.0) — the shadow-ray traversal dual scattering
   needs and nothing else has: call back for every `Hair` strand crossed, and report `false`
   if anything opaque is in the way.
