@@ -39,6 +39,14 @@ struct HairShade {
     hair::Frame fr;
     Vec3   woLocal{1, 0, 0};   // the direction the path ARRIVED from, in the fiber frame
     double radius = 0.0;       // world fiber radius; 0 = this hit is not on a strand
+    // This is a VIRTUAL fiber, drawn from a density grid's orientation distribution at a
+    // volumetric collision (`-fur-volume`, the far LOD tier), not a strand the BVH found.
+    // Physically it is the same fiber and the same BCSDF; what changes is VISIBILITY. The
+    // strands around it were never traced, so a shadow ray from here must skip fibers in the
+    // BVH (they are not there) and pick the coat up as a TRANSMITTANCE instead. Every
+    // connection therefore has to know which kind of fiber it is standing on — see
+    // backward.h's emitterGeom/envGeom.
+    bool   aggregate = false;
 };
 
 // Build the BCSDF at a hit. `wPrev` points away from the surface, back along the path

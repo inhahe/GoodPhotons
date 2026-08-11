@@ -10676,3 +10676,47 @@ validation — it is that the fixtures now spell lights that exist:
 `Light("sphere", center=…, radius=…, power=…)` in `test_image_term.py`,
 `test_material_bundle.py` and `test_viewer.py`, and `Light("collimated", origin=…, dir=…)`
 in `test_grammar_scene.py` (which deliberately round-trips a *non-default* subtype).
+
+## OPEN (tech debt, 2026-08-11, v0.177.0): `-fur-volume`'s far tier is *slower* than the strands it replaces at modest fiber counts
+
+`-fur-volume` (P2 stage 2b, `src/fur_volume.h` + `BackwardRenderer::furInteract` in
+`src/backward.h`) is correct but not yet a win. Measured on `scenes/_dual_pale_sky.ftsl`
+(90 k strands / 900 k curve segments, coat filling the frame), mode `R`, 200×150,
+`-max-bounce 200`, equal 150 s wall clock:
+
+| | samples | noise |
+|---|---|---|
+| strands (reference) | 2223 spp | 2.12 % |
+| `-fur-volume` | 583 spp | 4.14 % |
+
+~3.8× fewer samples per second. Accuracy is fine — developed through one shared
+`-exposure-anchor 2e-14`, the aggregate's scene-linear mean luminance over the coat is 0.9 %
+below the strand reference (0.61783 vs 0.62317), 0.2 % below over the whole frame — so this is
+purely a cost problem.
+
+**Why.** The number of collisions along a path *is* the number of fiber crossings, identical
+either way, so the only thing the tier saves is BVH traversal — and a 900 k-segment curve BVH
+is cheap. Against that saving it pays, per collision: a DDA march through the density grid for
+the free flight, a Bingham ODF reconstruction (`odfAt`), and a cross-section-importance tangent
+draw (`sampleTangentXsec`). At 90 k strands the new per-collision work costs more than the
+traversal it removes.
+
+**Why it is still the right thing.** The cost is independent of fiber count — the same grid,
+the same march, whether a cell holds 10³ or 10⁷ fibers — so the crossover is somewhere above
+this scene, and it is the aggregate representation stage 2c's footprint LOD needs to exist at
+all. But the crossover point has **not been measured**, and it should be: render the same coat
+at 90 k / 900 k / 9 M strands and find where the curves cross. If the crossover turns out to be
+implausibly high, the per-collision work is where to look — `odfAt` currently reconstructs the
+Bingham normalisation per collision and could be cached into the cell's side table at build
+time, and the DDA re-walks from the ray origin rather than resuming a cursor.
+
+**Repro.**
+```
+ftrace -in scenes/_dual_pale_sky.ftsl -mode R -r 200 150 -max-bounce 200 \
+    -o png/fv_ref2.png -time 150 -window -keepwindow
+ftrace -in scenes/_dual_pale_sky.ftsl -mode R -r 200 150 -max-bounce 200 -fur-volume \
+    -o png/fv_agg2.png -time 150 -window -keepwindow
+ftrace -topng png/fv_ref2.png.ftbuf png/fv_ref2_a.png -exposure-anchor 2e-14
+ftrace -topng png/fv_agg2.png.ftbuf png/fv_agg2_a.png -exposure-anchor 2e-14
+python scraps/_coatcmp.py png/fv_ref2_a.png png/fv_agg2_a.png
+```

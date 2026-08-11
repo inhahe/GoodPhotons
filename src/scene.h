@@ -1706,7 +1706,14 @@ struct Scene {
         if (pl > 1e-12) h.n = pert * (1.0 / pl);
     }
 
-    Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr) const {
+    // `skipHair` makes fibers INVISIBLE to the closest-hit query, the same way
+    // `occludedSkipHair` below makes them invisible to a shadow ray, and for the same
+    // reason: when a coat is being rendered as a MEDIUM (`-fur-volume`, the far LOD tier)
+    // the strands are summarised by the density grid, and hitting one as geometry would
+    // count it twice — once as a surface and once as optical depth. As there, only
+    // `MatType::Hair` curves are skipped: grass and wire are curves too and stay solid.
+    Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr,
+                   bool skipHair = false) const {
         Hit h;
         double tMax = DBL_MAX;
         const size_t nT = tris.size();
@@ -1727,7 +1734,12 @@ struct Scene {
             if (prim < (int)nT)            { if (intersectTri(sh, r, tris[prim], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ if (intersectSphere(r, spheres[prim - nT], tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI)) { if (intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs)) tm = h.t; }
-            else if (prim < (int)(nT + nS + nI + nC)) { if (intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h)) tm = h.t; }
+            else if (prim < (int)(nT + nS + nI + nC)) {
+                const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
+                if (skipHair && cs.matId >= 0 && cs.matId < (int)mats.size() &&
+                    mats[cs.matId].type == MatType::Hair) return;
+                if (intersectCurveSeg(cray, r, cs, tmin, h)) tm = h.t;
+            }
             else {
                 const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
                 Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};

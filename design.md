@@ -847,6 +847,49 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     whether or not the tangent, the normal or the frame are right. That is a useful *fact*
     (an aggregate collision's throughput multiplier is the fiber albedo with zero variance)
     but it is not a test, and a green line that cannot fail is worse than no line.
+  - *`FurVolume` — the medium itself, and why the expensive half is a side table.*
+    `FurODF::fromCell` is a Jacobi eigendecomposition, a table lookup and a root find: nothing
+    once per cell, ruinous once per *collision*, and a path through a dense coat collides tens
+    of times. So it runs once per occupied cell at startup into **16 bytes** — two 16:16
+    octahedral eigenvectors (the third is their cross product; Gram-Schmidt at decode repairs
+    the ~0.002° quantisation costs) and three halves (`b₀`, `b₁`, Kent's `b_k`). `b_k` is
+    *refined* at decode by three Newton steps rather than trusted, because the rejection bound
+    `M` is only an upper bound when `b_k` really is the root and a half-precision one is not
+    (`-checkfurvol` §7 isolates that refine: `|1/M · M_exact − 1| = 5.6e-16`).
+  - *Free flight is **exact**, not delta-tracked.* Along a *fixed* ray the direction argument of
+    `σ_t(d)` never changes, so `σ_t` is piecewise constant on the DDA's own cell segments and
+    `∫σ_t dt = −log(1−u)` inverts by running subtraction inside the same march that computes τ.
+    No majorant, no null collisions, no dependence on the density ratio between the densest and
+    emptiest cell — and a coat (a thin dense skin inside a mostly empty box) is precisely the
+    case delta tracking handles worst. `-checkfurvol` §8 falsifies the claim the only way it
+    can be falsified: survival vs `exp(−τ)` as a binomial z-score over 268 rays × 400 draws.
+- **`-fur-volume` — the coat as a medium** (P2 stage 2b, `backward.h`). Where `-dual-grid`
+  keeps the strands and reads only the *shadow* off the grid, this replaces the strands
+  outright: `BackwardRenderer::furVol` non-null makes `Scene::closestHit` skip every
+  `MatType::Hair` curve (a new `skipHair` flag mirroring `occludedSkipHair`) and the tracer
+  free-flights against `σ_t(d)` instead. Both the scalar and the hero loop; the hero loop
+  de-heros at a collision, exactly as it already does at a `Hair` surface, because a fiber's
+  response is wavelength-dependent through `σ_a`.
+  - *Composition with fog is a **minimum**, not a special case.* The fur flight is sampled
+    before the fog block and shortens `dSurf`. That is exact rather than convenient: the first
+    collision in a union of independent media is the minimum of their independent free flights,
+    and taking the min this way also attributes the collision to the right medium.
+  - *NEE needed a third visibility path.* `scene.occluded` reports the very strands the tier is
+    pretending not to have as blockers — used unchanged, the coat self-shadows to black. So
+    `HairShade::aggregate` selects `occludedSkipHair` (walls only) **plus**
+    `FurVolume::transmittance` as a continuous `exp(−τ)` factor folded into the response, in
+    both `emitterGeom` and `envGeom`. This is the same shape as the dual-scattering
+    substitution: the shadow ray becomes part of the shading rather than a separate binary test.
+  - *No dual-scattering branch, on purpose.* Dual scattering is an **analytic stand-in** for
+    exactly the multiple scattering this path now simulates directly; running both double-counts
+    it. `-fur-volume` therefore does not end the path at a fiber the way `-dual-scatter` does.
+  - *What it is and is not for.* It is **not** faster at equal quality on a coat that fills the
+    frame — the collision count *is* the crossing count, so the only saving is BVH traversal.
+    What it buys is that cost stops scaling with **fiber count**, and that the coat finally has
+    an aggregate representation a footprint-based LOD decision can switch to (stage 2c). What it
+    loses is everything that lived on an individual strand: no silhouette, and no `u`/`v` at a
+    collision, so a textured hair `reflect` reads at the default `Hit`'s coordinates — the same
+    class of approximation as `-dual-grid`'s textured `σ_a`.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds

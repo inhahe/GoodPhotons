@@ -5092,12 +5092,34 @@ that item mostly a binding exercise there.
           a perfectly parallel cell** (the 3° cuticle tilt breaks `t̂ → −t̂`), so `FurCell` now
           carries the first moment in the 4 bytes `tzz` used to occupy, at zero memory cost.
           See `design.md` → `fur_volume.h`.
-    - [ ] **stage 2b — the volumetric random walk** in `backward.h` (mode `R`): free flight
-          against `σ_t(d)`, collision → `sampleTangentXsec` + `h` + `hair::sample`, NEE with the
-          transmittance already computed by `FurGrid::march`'s `τ`. Needs hair-skipping in the
-          scene BVH (the `occludedSkipHair` pattern) and a `Hit` proxy for texture lookups. Also
-          needs a per-cell cache for `FurODF::fromCell` — a Jacobi eigendecomposition plus a
-          table lookup per collision is far too expensive to run inline.
+    - [x] **stage 2b — the volumetric random walk. ✅ DONE v0.177.0** (`-fur-volume [cells]`,
+          backward modes `R`/`W`, both the scalar and hero loops). `BackwardRenderer::furVol`
+          non-null makes the coat a MEDIUM: `closestHit` gains a `skipHair` flag so fibers leave
+          the BVH entirely, `FurVolume::sampleFlight` draws a collision against `σ_t(d)`, and
+          `furInteract()` invents the vertex — a tangent from `sampleTangentXsec`, a uniform
+          impact parameter, `fiberNormalFor` for the normal, then the ordinary `hairShadeAt` /
+          `hair::sample`. Four things worth keeping:
+          (1) the fur flight is sampled BEFORE the fog block and shortens `dSurf`, which is not a
+          hack — the first collision in a union of independent media is the **minimum** of their
+          independent free flights, so taking the min composes them exactly;
+          (2) NEE needed a new visibility path, since `scene.occluded` reports the very strands
+          the tier is pretending not to have; `HairShade::aggregate` selects `occludedSkipHair`
+          for walls plus `FurVolume::transmittance` as a continuous factor, in both `emitterGeom`
+          and `envGeom`;
+          (3) no dual-scattering branch on purpose — dual scattering is an *analytic* stand-in for
+          exactly the multiple scattering this path now simulates, so combining them double-counts;
+          (4) it is **not** a speed win at this fiber count — it is a **loss**. Measured on
+          `scenes/_dual_pale_sky.ftsl` (90 k strands / 900 k segments), mode R, 200×150,
+          `-max-bounce 200`, equal 150 s wall clock: strands **2223 spp @ 2.12 % noise** vs
+          aggregate **583 spp @ 4.14 % noise** — ~3.8× *fewer* samples per second. It is
+          nonetheless **accurate**: developed through one shared `-exposure-anchor 2e-14`, the
+          aggregate's scene-linear mean Y over the coat is **0.9 % below** the strand reference
+          (0.61783 vs 0.62317) and 0.2 % below over the whole frame. The reason it loses here is
+          that the collision count *is* the crossing count, so the only saving is BVH traversal —
+          and 900 k segments is a cheap BVH. What the tier actually buys is that its cost stops
+          scaling with fiber count at all (the same grid, the same march, whether the cell holds
+          10³ or 10⁷ fibers), and that the coat finally has an aggregate representation —
+          which is what stage 2c exists to cash in.
     - [ ] **stage 2c — the near/far transition**, from `Camera::footprintPerDist(spp, rx, ry)`
           (`camera.h:219`) and `Hit::fw` / `patShadingFootprint` (`backward.h:1396`,
           `pattern.h:299`), plus the user-facing flag. Making it not pop is the actual work.

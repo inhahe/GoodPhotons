@@ -150,7 +150,11 @@ argument for standing a groom in a hall of polished objects.*
   `-dual-scatter` will instead approximate it analytically (Zinke et al. 2008) — about
   twice the speed of the reference on the case it exists for, biased on purpose, and
   `-dual-grid` adds another 1.5× on a dense coat by counting the strands a shadow ray
-  crosses from a fiber-density grid instead of intersecting each one. The
+  crosses from a fiber-density grid instead of intersecting each one. Push that idea all
+  the way and `-fur-volume` deletes the strands entirely: the coat becomes a
+  **participating medium**, and each free-flight collision invents one virtual fiber from
+  the cell's reconstructed orientation distribution — the far LOD tier, for fur small
+  enough on screen to have no silhouette left to lose. The
   physics is guarded by `-checkhair`, which asserts the white furnace as *algebra* at
   1e-12 rather than as a picture, and catches a sign typo in Zinke's own eq. 16 by
   measuring its order of convergence.

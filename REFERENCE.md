@@ -28,6 +28,7 @@ Three neighbouring documents cover what this one only summarises:
     - [`preset` — measured species](#preset--measured-species)
     - [Dual scattering (`-dual-scatter`)](#dual-scattering--dual-scatter)
       - [The fiber-density grid (`-dual-grid`)](#the-fiber-density-grid--dual-grid)
+      - [The coat as a medium (`-fur-volume`)](#the-coat-as-a-medium--fur-volume)
 - [Spectra (SPDs, reflectances, indices)](#spectra-spds-reflectances-indices)
   - [Spectral representation vs. other renderers](#spectral-representation-vs-other-renderers)
 - [Lights](#lights)
@@ -1412,6 +1413,67 @@ segments, 423 ms / 64 MB over `fur_species`'s 2.48M.
 
 The tables are cached per (material, wavelength bin, absorption bin) and built lazily on
 first use, so the cost is paid once per render regardless of how many strands there are.
+
+##### The coat as a medium (`-fur-volume`)
+
+`-dual-grid` keeps the strands and reads only the *shadow* off the grid. `-fur-volume` goes
+the whole way: with it on, **fibers are not geometry at all**. `Scene::closestHit` skips
+every `MatType::Hair` curve, and the backward tracer instead samples a free flight against
+the same field's `σ_t(d)`. This is the coat's **far LOD tier** — for fur that is small on
+screen, where a strand is under a pixel and there is no silhouette left to resolve.
+
+A collision is three steps, all of which `-checkfurvol` verifies independently:
+
+1. **Free flight**, exact rather than delta-tracked. Along a *fixed* ray the direction
+   argument of `σ_t(d)` never changes, so `σ_t` is piecewise constant on the DDA's own cell
+   segments and `∫σ_t dt = −log(1−u)` inverts by running subtraction inside the march. No
+   majorant, no null collisions — which matters, because a coat (a thin dense skin inside a
+   mostly empty box) is exactly the case delta tracking handles worst.
+2. **A tangent**, drawn from the cell's reconstructed orientation distribution. The grid
+   stores only the second moment `T`, so the ODF is reconstructed as the **Bingham** —
+   the maximum-entropy distribution on the sphere with that moment. (Two cheaper families
+   were measured first: a Watson mixture turns a girdle into two orthogonal lobes and an ACG
+   smears a combed clump.) The draw is importance-sampled **by cross-section**, since a ray
+   meets a perpendicular fiber more often than a parallel one.
+3. **The ordinary fiber BCSDF** at a *virtual* hit. There is no surface to measure the impact
+   parameter `h` from, so `h` is drawn uniformly on `[−1, 1]` — as it is for a ray crossing a
+   cylinder at a uniform offset — and the normal that *would* have produced it is
+   reconstructed. Everything downstream is the same `hair::` code a real strand runs.
+
+Next-event estimation changes with it. `scene.occluded` would report the very strands this
+tier is pretending not to have as blockers, so a connection from a fur collision tests only
+non-hair geometry for occlusion and multiplies in the coat's `exp(−τ)` transmittance as a
+continuous factor instead. Direct lights and the environment both go through it.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-fur-volume [cells]` | off (`2097152` = 128³ when given) | Render every `type hair` coat as a participating medium. Backward modes (`R`, `W`) only. Shares the density field with `-dual-grid` — given both, it is built once at the larger budget — and adds 16 B/cell for the orientation table (32 MB at 128³). |
+
+**What it costs and buys.** On a modest coat it is not a speed win but a **loss**. Measured on
+a 90 k-strand coat filling the frame (mode `R`, 200×150, `-max-bounce 200`, equal 150 s):
+
+| | samples | noise |
+|---|---|---|
+| strands (reference) | 2223 spp | 2.12 % |
+| `-fur-volume` | 583 spp | 4.14 % |
+
+It is, however, **accurate**: developed through one shared `-exposure-anchor`, the aggregate's
+scene-linear mean luminance over the coat lands **0.9 %** below the strand reference (0.9989 of
+it over the whole frame). The reason it loses is that the number of collisions along a path is
+the number of fiber crossings, which is the same either way — so all it saves is BVH traversal,
+and 900 k curve segments is a cheap BVH. What it buys is that the cost stops
+scaling with **fiber count** — a coat of 90 k strands and one of 9 M strands march the same
+grid — and that the coat now has a genuine aggregate representation to hand a footprint-based
+LOD decision. It composes with fog correctly (the first collision in a union of independent
+media is the minimum of their independent free flights, which is exactly how the two are
+sampled), and it deliberately does **not** combine with `-dual-scatter`: dual scattering is
+an analytic stand-in for the very multiple scattering this path now simulates directly.
+
+Two things are genuinely lost, both from the same cause — a collision knows its cell, not a
+strand. There is no `u`/`v`, so a hair material whose colour comes from a texture or pattern
+reads at the default hit's coordinates (the same class of approximation as `-dual-grid`'s
+textured `σ_a`); and per-strand silhouette detail is gone by construction, which is the
+point of a far tier and the reason it is opt-in rather than automatic.
 
 **Parametric records.** A **record** is a named bank of per-channel look-up tables over
 a shared scalar domain `[lo,hi]`. A single per-hit **driver** scalar samples every
@@ -3938,6 +4000,7 @@ scene features so a render (especially the backward camera modes `R`/`P`, and th
 | `-dual-db <d>` / `-dual-df <d>` | Override `d_b` (the local backscatter lobe) or `d_f` (the light let through the coat) on its own; either unset follows `-dual-density`. `-dual-df 0` leaves only the directly-lit term, which is how a brightness error gets attributed to one branch. |
 | `-dual-max-cross <n>` | Strands one dual-scattering shadow ray counts before it stops (default `64`). |
 | `-dual-grid [cells]` | Count dual-scattering crossings by marching a **fiber-density grid** (Zinke §4.1.2) instead of walking the strands one by one — the crossing count comes from `∫σ_t dt` with no curve intersections, and is drawn as a Poisson variate so it stays a drop-in for the walk. 1.5× faster than the walk on a dense coat, which is what turns `-dual-scatter` from a net loss into a win there. Optional argument is a cell **budget** (default `2097152` = 128³), split into roughly cubic cells over the fur's bounds; ~64 MB at the default. Needs `-dual-scatter`. See [The fiber-density grid](#the-fiber-density-grid--dual-grid). |
+| `-fur-volume [cells]` | Render `type hair` coats as a **participating medium** instead of as strands — the coat's far LOD tier. Fibers leave the BVH entirely; a ray free-flights against the same grid's `σ_t(d)` (exact inverse-CDF, not delta tracking) and each collision invents one virtual fiber, drawing its tangent from the cell's reconstructed Bingham orientation distribution and shading it with the ordinary BCSDF. Cost stops scaling with fiber count; per-strand silhouette and texture coordinates are lost, so this is for fur that is small on screen. Backward modes only. Shares the field (and the `cells` budget) with `-dual-grid`, plus 16 B/cell. See [The coat as a medium](#the-coat-as-a-medium--fur-volume). |
 
 **Long-running / output** — `-time` / `-noise` / `-forever` / `-preview` / `-window` /
 `-interval` apply to every image-forming mode (forward `A`/`B`/`C`, the spp modes `R`/`D`,

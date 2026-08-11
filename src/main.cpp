@@ -10122,6 +10122,14 @@ static int    g_dualMaxCross = 64;    // -dual-max-cross
 static bool   g_dualGrid = false;
 static int    g_dualGridCells = 128 * 128 * 128;
 static FurGrid g_furGridData;
+// -fur-volume: P2 stage 2b, the coat's FAR LOD tier. Reuses exactly the same density field
+// (so `-dual-grid -fur-volume` builds it once, at the larger of the two budgets) and adds a
+// 16-byte-per-cell orientation-distribution table on top. Where -dual-grid keeps the strands
+// and only reads the SHADOW off the grid, this replaces the strands outright: the camera ray
+// stops intersecting fibers and free-flights against sigma_t instead. Backward modes only.
+static bool   g_furVolume = false;
+static int    g_furVolumeCells = 128 * 128 * 128;
+static furvol::FurVolume g_furVolData;
 
 // Mode W lights a surface ONLY by next-event estimation, and a shadow ray is blocked by
 // any geometry at all -- dielectrics very much included (Scene::occluded: "can't connect
@@ -10595,6 +10603,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         br.dualMaxCross = g_dualMaxCross;
         br.dualDb = g_dualDb; br.dualDf = g_dualDf;
         br.furGrid = g_furGridData.valid ? &g_furGridData : nullptr;
+        br.furVol  = g_furVolData.valid() ? &g_furVolData : nullptr;
         // Shading footprint for `fw` (O8 stage 2). Mode W only — see fwPerDist for why a
         // stochastic sampler wants none — and derived from the run's REQUESTED spp rather
         // than this call's chunk, so every chunk of a progressive or resumed render filters
@@ -13349,6 +13358,17 @@ static void printHelp(const char* prog) {
 "                        and a per-strand colour TEXTURE is sampled at the shading fiber\n"
 "                        rather than the crossed ones. `cells` is a budget, not an axis\n"
 "                        count (default 2097152, i.e. 128^3; 32 B/cell)\n"
+"  -fur-volume [cells]   render the coat as a PARTICIPATING MEDIUM instead of as strands\n"
+"                        (backward modes R/W; the far LOD tier). Fibers vanish from the BVH\n"
+"                        entirely: a ray free-flights against the same grid's sigma_t and\n"
+"                        each collision invents one virtual fiber, drawing its tangent from\n"
+"                        the cell's reconstructed orientation distribution and shading it\n"
+"                        with the ordinary BCSDF. Cost stops scaling with fiber count and\n"
+"                        starts scaling with optical depth, and the geometry is no longer\n"
+"                        resolved — so this is for fur that is SMALL ON SCREEN, where a\n"
+"                        strand is under a pixel and there is no silhouette left to lose.\n"
+"                        Shares the density field with -dual-grid (same `cells` budget\n"
+"                        meaning) and adds 16 B/cell for the orientation table\n"
 "\n"
 "Denoising (post-pass on the linear image; affects the file AND the live window):\n"
 "  -denoise [amount]     edge-aware a-trous filter for SPECTRAL speckle. CHROMA ONLY by\n"
@@ -13881,6 +13901,15 @@ static int run(int argc, char** argv) {
                 if (end && *end == '\0' && v >= 1.0) { ++i; g_dualGridCells = (int)std::min(v, 3e8); }
             }
         }
+        // -fur-volume [cells]: same optional-budget parsing as -dual-grid above.
+        else if (!std::strcmp(argv[i], "-fur-volume")) {
+            g_furVolume = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                char* end = nullptr;
+                const double v = std::strtod(argv[i + 1], &end);
+                if (end && *end == '\0' && v >= 1.0) { ++i; g_furVolumeCells = (int)std::min(v, 3e8); }
+            }
+        }
         // -denoise [amount]: the optional amount scales BOTH tolerances, so `-denoise 2`
         // is twice as aggressive and `-denoise 0.5` half. The argument is optional, so
         // only consume the next token if it actually parses as a number — otherwise
@@ -14408,29 +14437,51 @@ static int run(int argc, char** argv) {
                         "forward modes A/B/C and photon-map M/S on the CPU)\n", g_heroC);
     }
 
-    // -dual-grid: build the fiber density field once, before any render thread exists.
-    // Placed here rather than at scene load because it is opt-in and costs a pass over
+    // -dual-grid / -fur-volume: build the fiber density field once, before any render thread
+    // exists. Placed here rather than at scene load because it is opt-in and costs a pass over
     // every CurveSeg -- a scene with no fur, or a run without -dual-scatter, must not pay.
-    if (g_dualGrid) {
-        if (!g_dualScatter) {
+    // Both flags want the SAME field, so they share one build at the larger budget.
+    {
+        const bool gridForDual = g_dualGrid && g_dualScatter;
+        if (g_dualGrid && !g_dualScatter)
             std::printf("[ignore] -dual-grid does nothing without -dual-scatter (it only "
                         "changes HOW the coat is measured along a shadow ray)\n");
-        } else {
+        if (gridForDual || g_furVolume) {
+            const int cells = std::max(gridForDual ? g_dualGridCells : 1,
+                                       g_furVolume ? g_furVolumeCells : 1);
             const auto t0 = std::chrono::steady_clock::now();
             g_furGridData.build(scene.curveSegs, [&](int matId) {
                 return matId >= 0 && matId < (int)scene.mats.size() &&
                        scene.mats[matId].type == MatType::Hair;
-            }, g_dualGridCells);
+            }, cells);
             const double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();
+            const char* tag = gridForDual ? "dual-grid" : "fur-volume";
             if (g_furGridData.valid)
-                std::printf("[dual-grid] %dx%dx%d cells (%d occupied, %.1f MB) over %zu fiber "
-                            "segments in %.0f ms\n", g_furGridData.nx, g_furGridData.ny,
+                std::printf("[%s] %dx%dx%d cells (%d occupied, %.1f MB) over %zu fiber "
+                            "segments in %.0f ms\n", tag, g_furGridData.nx, g_furGridData.ny,
                             g_furGridData.nz, g_furGridData.occupied,
                             g_furGridData.bytes() / (1024.0 * 1024.0), scene.curveSegs.size(), ms);
-            else
+            else if (gridForDual)
                 std::printf("[dual-grid] scene has no hair fibers -- falling back to the "
                             "ray-shooting walk\n");
+            else
+                std::printf("[fur-volume] scene has no hair fibers -- rendering normally\n");
+        }
+        // The far tier's own half: one Bingham fit per occupied cell. Parallel because a
+        // 128^3 coat is ~1e5 Jacobi eigendecompositions plus as many table lookups, and it
+        // is embarrassingly so (each cell reads only itself).
+        if (g_furVolume && g_furGridData.valid) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok = g_furVolData.build(g_furGridData, [](size_t n, auto&& f) {
+                return ft::parallelFor(n, 256, [&](size_t i) { f(i); });
+            });
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (ok && g_furVolData.valid())
+                std::printf("[fur-volume] far-tier ODF table %.1f MB in %.0f ms -- strands are "
+                            "now a MEDIUM (no fiber geometry in the backward tracer)\n",
+                            g_furVolData.bytes() / (1024.0 * 1024.0), ms);
         }
     }
 
