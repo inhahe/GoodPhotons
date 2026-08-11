@@ -39,15 +39,24 @@
 // `dot(w, t)`).  So one quadratic form gives both the extinction and the inclination to
 // look the dual-scattering tables up at.
 //
-// WHAT IT DELIBERATELY LOSES: the SIGN of the tangent.  `t t^T == (-t)(-t)^T`, so a cell
-// cannot tell a strand from its reverse, and `sqrt(d^T T d)` is `|sin theta|`.  That is not
-// a defect to paper over — it is the honest content of a second moment, and the right
-// response is to marginalise over the two signs rather than pick one (see `furAvgSigned`).
-// The tables it feeds are near-even in theta anyway; only the ~3 degree cuticle tilt breaks
-// the symmetry.
+// THE SIGN OF THE TANGENT is not in `T` at all: `t t^T == (-t)(-t)^T`, so the second moment
+// cannot tell a strand from its reverse, and `sqrt(d^T T d)` is `|sin theta|`.  Extinction
+// does not care — a fiber blocks the same either way — so `sigma_t`, `march` and the
+// dual-scattering read are all correctly sign-blind, and marginalise over the two signs
+// rather than invent one (see `furAvgSigned`).  SCATTERING does care: the cuticle tilt
+// `alpha` tips the R and TRT lobes toward the root, and reversing the tangent tips them the
+// other way, which moved the aggregate far tier's response by 27% against the explicit
+// population it stands for even for a perfectly parallel cell (`-checkfurvol` §6).  So each
+// cell also carries the FIRST moment, `v = sum(r l t) / sum(r l)`, packed into the 4 bytes
+// that `tzz` used to occupy — `tzz` is redundant because `T` is unit-trace by construction,
+// so `tzz == 1 - txx - tyy` exactly.  `|v|` is the sign coherence: 1 for a combed cell, 0
+// for a groom with no preferred direction, and the fraction of mass pointing along `v` is
+// `(1 + |v|) / 2` exactly for a two-delta population, which is the rule `FurODF::sample`
+// uses.  The grid therefore stores a first AND a second moment for the same 32 bytes.
 //
 // COST: 32 bytes per cell (see FurCell), so a 64^3 grid is 8 MB and a 128^3 grid 64 MB,
-// against ~1.3 GB for the `CurveSeg` pool of a real groom.
+// against ~1.3 GB for the `CurveSeg` pool of a real groom.  The build transiently needs
+// another 12 bytes per cell for the mean-tangent accumulator, freed before it returns.
 
 #pragma once
 
@@ -60,18 +69,62 @@
 #include "curve.h"
 
 // ---------------------------------------------------------------------------------------
+// Octahedral direction + coherence in one word: 12 bits per octahedral coordinate (about
+// 0.05 degrees, far finer than a cell's tangent spread) and 8 bits of |v| in [0,1].  Zero
+// means "no preferred direction", which is what a default-constructed cell must decode to.
+inline uint32_t furPackMean(const Vec3& v, double coh) {
+    const double l1 = std::fabs(v.x) + std::fabs(v.y) + std::fabs(v.z);
+    if (!(l1 > 0.0) || !(coh > 0.0)) return 0;
+    double x = v.x / l1, y = v.y / l1;
+    if (v.z < 0.0) {
+        const double ax = std::fabs(x), ay = std::fabs(y);
+        const double nx = (1.0 - ay) * (x >= 0.0 ? 1.0 : -1.0);
+        const double ny = (1.0 - ax) * (y >= 0.0 ? 1.0 : -1.0);
+        x = nx; y = ny;
+    }
+    const uint32_t qx = (uint32_t)std::lround(std::min(1.0, std::max(0.0, x * 0.5 + 0.5)) * 4095.0);
+    const uint32_t qy = (uint32_t)std::lround(std::min(1.0, std::max(0.0, y * 0.5 + 0.5)) * 4095.0);
+    uint32_t qc = (uint32_t)std::lround(std::min(1.0, coh) * 255.0);
+    if (qc == 0) qc = 1;                     // a nonzero |v| must not decode as "unoriented"
+    return (qc << 24) | (qy << 12) | qx;
+}
+inline double furMeanCoherence(uint32_t p) { return (double)(p >> 24) * (1.0 / 255.0); }
+inline Vec3 furMeanDir(uint32_t p) {
+    if (!p) return Vec3{0, 0, 0};
+    double x = (double)(p & 0xFFFu) * (1.0 / 4095.0) * 2.0 - 1.0;
+    double y = (double)((p >> 12) & 0xFFFu) * (1.0 / 4095.0) * 2.0 - 1.0;
+    double z = 1.0 - std::fabs(x) - std::fabs(y);
+    if (z < 0.0) {
+        const double ax = std::fabs(x), ay = std::fabs(y);
+        const double nx = (1.0 - ay) * (x >= 0.0 ? 1.0 : -1.0);
+        const double ny = (1.0 - ax) * (y >= 0.0 ? 1.0 : -1.0);
+        x = nx; y = ny;
+    }
+    return normalize(Vec3{x, y, z});
+}
+
 // One voxel.  Kept to 32 bytes so a fine grid stays in a size worth having: `c` is the
-// extinction scale, the six floats are the upper triangle of the normalised symmetric
-// orientation tensor, and `matId` is the material with the most fiber mass in the cell
-// (a coat is authored per-material, so cells are overwhelmingly pure; the dual-scattering
-// tables are per-material and something must be picked).
+// extinction scale, the five floats are the upper triangle of the normalised symmetric
+// orientation tensor minus its redundant `tzz` (unit trace: `tzz == 1 - txx - tyy`), `mdir`
+// is the packed mean tangent that buys back the sign the tensor cannot hold, and `matId` is
+// the material with the most fiber mass in the cell (a coat is authored per-material, so
+// cells are overwhelmingly pure; the dual-scattering tables are per-material and something
+// must be picked).
 struct FurCell {
-    float   c   = 0.0f;                 // (2/V) * sum(r*l)   [1/length]
-    float   txx = 0.0f, tyy = 0.0f, tzz = 0.0f;
-    float   txy = 0.0f, txz = 0.0f, tyz = 0.0f;
-    int32_t matId = -1;
+    float    c   = 0.0f;                // (2/V) * sum(r*l)   [1/length]
+    float    txx = 0.0f, tyy = 0.0f;    // tzz is NOT stored — see furTzz()
+    float    txy = 0.0f, txz = 0.0f, tyz = 0.0f;
+    uint32_t mdir  = 0;                 // 12:12 octahedral mean tangent + 8-bit coherence
+    int32_t  matId = -1;
 };
 static_assert(sizeof(FurCell) == 32, "FurCell is meant to be 32 bytes");
+
+// The component the unit trace makes redundant.  Clamped at 0 because float accumulation of
+// 10^5 deposits can put the recovered value a few ulp negative in a cell whose tangents all
+// lie in the xy plane.
+inline double furTzz(const FurCell& fc) {
+    return std::max(0.0, 1.0 - (double)fc.txx - (double)fc.tyy);
+}
 
 // What a march through the grid measured.
 struct FurMarch {
@@ -107,7 +160,7 @@ struct FurGrid {
     // construction, so the form lies in [0,1] mathematically, but float accumulation of
     // 10^5 deposits can push it a few ulp outside.
     static double furSin2(const FurCell& fc, const Vec3& d) {
-        const double v = d.x * d.x * fc.txx + d.y * d.y * fc.tyy + d.z * d.z * fc.tzz
+        const double v = d.x * d.x * fc.txx + d.y * d.y * fc.tyy + d.z * d.z * furTzz(fc)
                        + 2.0 * (d.x * d.y * fc.txy + d.x * d.z * fc.txz + d.y * d.z * fc.tyz);
         return std::min(1.0, std::max(0.0, v));
     }
@@ -169,6 +222,10 @@ struct FurGrid {
         // in pass 3), using `c` as the running `sum(r*l)` so no second array is needed.
         // `matId` is resolved by keeping the best-so-far mass in a side table only when
         // the scene actually mixes fiber materials, which is rare and cheap to detect.
+        // The one accumulator that has nowhere to live in the packed cell: the mean tangent
+        // is a signed vector and `mdir` is a quantised unit direction, so it is summed here
+        // in full precision and packed once in pass 3.  Freed on return.
+        std::vector<Vec3> meanAcc(cells.size(), Vec3{0, 0, 0});
         std::vector<float> matMass;
         int firstMat = -1; bool mixed = false;
         for (const CurveSeg& s : segs) {
@@ -199,11 +256,12 @@ struct FurGrid {
                 ix = std::min(nx - 1, std::max(0, ix));
                 iy = std::min(ny - 1, std::max(0, iy));
                 iz = std::min(nz - 1, std::max(0, iz));
-                FurCell& fc = cells[(size_t)index(ix, iy, iz)];
+                const size_t ci = (size_t)index(ix, iy, iz);
+                FurCell& fc = cells[ci];
+                meanAcc[ci] = meanAcc[ci] + t * w;
                 fc.c   += (float)w;
                 fc.txx += (float)(w * t.x * t.x);
                 fc.tyy += (float)(w * t.y * t.y);
-                fc.tzz += (float)(w * t.z * t.z);
                 fc.txy += (float)(w * t.x * t.y);
                 fc.txz += (float)(w * t.x * t.z);
                 fc.tyz += (float)(w * t.y * t.z);
@@ -222,13 +280,17 @@ struct FurGrid {
         // Pass 3: normalise.  `T /= sum(r*l)` makes it unit-trace; `c = 2*sum(r*l)/V` turns
         // the mass into an extinction coefficient.
         const double invV = 1.0 / cellVol;
-        for (FurCell& fc : cells) {
+        for (size_t ci = 0; ci < cells.size(); ++ci) {
+            FurCell& fc = cells[ci];
             const double m = fc.c;
             if (!(m > 0.0)) { fc = FurCell{}; continue; }
             ++occupied;
             const float inv = (float)(1.0 / m);
-            fc.txx *= inv; fc.tyy *= inv; fc.tzz *= inv;
+            fc.txx *= inv; fc.tyy *= inv;
             fc.txy *= inv; fc.txz *= inv; fc.tyz *= inv;
+            const Vec3   mv  = meanAcc[ci] * (1.0 / m);
+            const double coh = std::min(1.0, length(mv));
+            fc.mdir = furPackMean(mv, coh);
             fc.c = (float)(2.0 * m * invV);
         }
         valid = true;

@@ -775,10 +775,14 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
   - *What it deliberately loses.* (a) The Jensen step is biased **high by at most +3.98%** —
     one-signed, so a grid never *under*-attenuates — and is *exactly zero* where a cell's fibers
     are locally parallel (`T` rank-1, the root factors out), worst at full isotropy
-    (`√(2/3) = 0.8165` vs the true `⟨sinθ⟩ = π/4 = 0.7854`). (b) The tangent's **sign** is
-    unrecoverable, since `t̂t̂ᵀ == (−t̂)(−t̂)ᵀ`; the right response is to marginalise over both
-    signs (`furAvgSigned` evaluates the table at ±θ and averages), not to pick one — and the
-    dual tables are near-even in θ anyway, only the ~3° cuticle tilt `α` breaks the symmetry.
+    (`√(2/3) = 0.8165` vs the true `⟨sinθ⟩ = π/4 = 0.7854`). (b) The tangent's **sign** is not
+    in `T`, since `t̂t̂ᵀ == (−t̂)(−t̂)ᵀ`, so each cell also carries the **first** moment
+    `v = Σrℓt̂ / Σrℓ` as a 12:12 octahedral direction plus an 8-bit coherence, packed into the
+    4 bytes `tzz` used to occupy (`tzz = 1 − txx − tyy` because `T` is unit-trace by
+    construction) — a first *and* a second moment for the same 32 bytes. `-dual-grid`'s own
+    lookup still marginalises over both signs (`furAvgSigned` evaluates the table at ±θ and
+    averages), which is right for it because the dual tables are near-even in θ; the aggregate
+    far tier (`fur_volume.h`) uses the first moment instead, and needs to — see below.
     (c) The crossed material's tables are evaluated at the **shading point's** texture
     coordinates, where the walk had each crossed fiber's own. All three are approximations on
     top of an approximation, which is why `-dual-grid` is opt-in and the walk stays the default.
@@ -792,6 +796,57 @@ M-deposit/gather, R, D (untextured), and the raster preview (`-raster-gpu`).
     for a chained strand, where every cap but the two ends is interior to the chain); and a
     coarse grid straddling a density taper dilutes `σ_t` along exactly the rays being measured,
     by almost precisely enough to cancel the Jensen bias and certify a broken model.
+- **`fur_volume.h`** — the **aggregate scattering model** that turns a `FurGrid` cell into a
+  participating medium, so distant fur can be *marched* instead of intersected. Validated by
+  `-checkfurvol` (six sections).
+  - *The model is three steps at a collision.* `σ_t(d) = c·√(1 − dᵀTd)` gives the free flight
+    (∫σ_t dt is literally Zinke's **expected number of fiber crossings**, with no primitive
+    tests); a tangent is drawn from a reconstructed **orientation distribution**; and the
+    existing `hair::` BCSDF is evaluated at a *virtual* hit whose normal `fiberNormalFor()`
+    reconstructs from that tangent and an offset `h`. Nothing about the fiber shading model
+    changes — only where its inputs come from.
+  - *The ODF is a **Bingham**, `p(t̂) ∝ exp(t̂ᵀBt̂)`* — the maximum-entropy distribution on the
+    sphere with a given second moment, i.e. the one that assumes nothing beyond what the grid
+    stored. Two cheaper families were built and measured against explicit fiber populations
+    first, and both fail a case fur actually contains: a **Watson mixture** on `T`'s
+    eigenvectors turns a *girdle* (strands every which way within a plane, what a coat does
+    over a whorl) into two orthogonal deltas (L1 error 0.43), and the **ACG** fixes the girdle
+    but its polynomial tails smear a tight combed clump over twice the sphere it should
+    (0.26). Bingham is Gaussian-tailed like Watson *and* covers girdles like the ACG, and wins
+    on every population measured (0.006 / 0.080 / 0.040 / 0.023). The comparison table lives
+    in the header comment so the two rejected families stay rejected.
+  - *`B` is obtained from `T` by a startup table.* The moment map has a closed-form azimuthal
+    integral in **exponentially scaled** modified Bessels `k_n = e⁻ˣIₙ(x)` (unscaled, both the
+    exponential and `I₀` overflow well before the concentration a near-parallel cell needs),
+    with a `c = w·sinh(κz)` substitution that keeps ~40 quadrature nodes inside a peak of
+    half-width `1/√(2b)` however sharp it gets. The inverse is a damped Newton over the
+    eigenvalue triangle sheared onto the unit square, run once and interpolated. **Its
+    variables are the *gap* `log(1+b₁−b₂)` and the *floor* `log(1+b₂)`, not the two b's** —
+    in the obvious parameterisation the whole `τ₃ = 0` edge (every planar cell) pins both
+    coordinates at their maximum with only their difference distinguishing points, and the
+    Newton stalls there, silently returning the *girdle* solution for a **parallel** cell.
+    That bug cost a factor of 10 in table accuracy (1.15e-2 → 1.15e-3).
+  - *Sampling is Kent, Ganeiber & Mardia (2013)*: an ACG proposal `Ω = I + 2Λ/b_k` sampled in
+    closed form as `normalize(Ω^(−1/2)z)`, accepted with `e^(−t̂ᵀΛt̂)(t̂ᵀΩt̂)^(3/2)/M`.
+    Acceptance is 100% at isotropy, ~90% on a girdle, never below ~50%.
+  - *The tangent's sign is drawn separately, and this is not optional.* The axis part of the
+    ODF is antipodally symmetric by construction, so a sampled **axis** is aligned with the
+    cell's first moment `v` with probability `(1+|v|)/2` — exact for a two-delta population
+    and right at both endpoints. Skipping it (drawing the sign uniformly) moved the aggregate
+    response **27% even on a perfectly parallel cell**, because the ~3° cuticle tilt `α` tips
+    R/TRT toward the root and so breaks `t̂ → −t̂` symmetry. Keeping the axis and the sign as
+    separate steps is what leaves `T` untouched by the choice, since `t̂t̂ᵀ == (−t̂)(−t̂)ᵀ`.
+  - *`-checkfurvol` §6 measures **L1 over the whole outgoing sphere**, not a worst-case
+    pointwise ratio.* The first draft took the worst ratio over three random `wi` and reported
+    3.59 for a combed clump — an alarming number that meant nothing, picked up in a direction
+    the tight true lobe cannot reach and where *both* functions are ~0. A path tracer sees the
+    integral, so the error that matters is `Σ|S_agg − S_true| / Σ S_true`.
+  - *The white-furnace test that is **not** there.* Averaging `f·|cos|/pdf` over BCSDF samples
+    is **vacuous** in this model and the first draft shipped it: `apPdf` normalises the very
+    `A_p` that `f` sums, so the ratio is identically `Σ_p A_p` — exactly 1.0 (dev 0.00e+00)
+    whether or not the tangent, the normal or the frame are right. That is a useful *fact*
+    (an aggregate collision's throughput multiplier is the fiber albedo with zero variance)
+    but it is not a test, and a green line that cannot fail is worse than no line.
 - **`mesh.h`** (+ `gltf.h`, `fbx.h`/`fbx_load.cpp`) — OBJ (custom fast parser:
   single fread, in-place float/int scan), glTF/GLB subset, FBX geometry-only.
   **Crease-angle auto-smoothing** (`smooth 1` on a mesh with no authored `vn`) welds

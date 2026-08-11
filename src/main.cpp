@@ -166,6 +166,7 @@
 #include "denoise.h"            // -denoise: luma/chroma a-trous filter for MC speckle
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "fur_grid.h"           // -checkfurgrid / -dual-grid: voxel fiber density + orientation grid
+#include "fur_volume.h"         // -checkfurvol: aggregate fiber scattering (P2 stage 2)
 #include "hair.h"               // -checkhair: fiber BCSDF (Marschner lobes, Chiang form)
 #include "render_progress.h"   // SppProgress — used unconditionally below; the CUDA
                                // header also pulls it in, but CPU-only builds need it too
@@ -1673,6 +1674,448 @@ static int checkFurGrid() {
     }
 
     std::printf("[checkfurgrid] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// FUR AGGREGATE-SCATTERING self-test  (-checkfurvol; fur_volume.h, TODO §P2 stage 2)
+// ---------------------------------------------------------------------------
+// `fur_grid.h` says how much fiber is along a ray; `fur_volume.h` says what light does when
+// it meets that fiber. The second is where a volumetric fur LOD normally goes wrong,
+// because the usual failure is not a visible artefact — it is a phase function that quietly
+// loses or invents energy, or an orientation distribution that reproduces the mean but not
+// the shape, and either one reads as "the coat is the wrong colour" rather than as a bug.
+//
+// So the sections below pin the chain down link by link, in the order a photon walks it:
+// the eigen-decomposition that reads the cell (1), the Watson kernel the reconstruction is
+// built from (2), the reconstruction reproducing the cell's tensor EXACTLY (3), the virtual
+// fiber hit being a true inverse of the real one (4), the cross-section weighting agreeing
+// with the grid's own extinction to within the known Jensen bound (5), and finally the whole
+// aggregate collision conserving energy in a white furnace (6).
+static int checkFurVol() {
+    int fails = 0;
+
+    // ---- 1. symmetric eigendecomposition --------------------------------------------
+    // Everything downstream is expressed in T's eigenbasis, so an eigenbasis that is not
+    // orthonormal — the classic failure of the closed-form 3x3 solution when two eigenvalues
+    // coincide, which for fur is the COMMON case (an axially symmetric or isotropic cell) —
+    // would silently tilt every reconstructed tangent.
+    {
+        Pcg32 rng; rng.seed(9001, 1);
+        double worstRes = 0.0, worstOrth = 0.0, worstOrder = 0.0;
+        for (int trial = 0; trial < 500; ++trial) {
+            // Build a genuine second-moment matrix from a random tangent population, so the
+            // matrices under test are the ones the grid actually produces (PSD, unit trace).
+            double m[6] = {0, 0, 0, 0, 0, 0};
+            const int n = 40;
+            // A deliberately degenerate mix: a third of the trials are axially symmetric.
+            const bool axial = (trial % 3) == 0;
+            const Vec3 ax = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            for (int i = 0; i < n; ++i) {
+                Vec3 t;
+                if (axial) {
+                    Vec3 a, b; onb(ax, a, b);
+                    const double u = 2.0 * rng.uniform() - 1.0;
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u)), ph = 2.0 * PI * rng.uniform();
+                    t = normalize(ax * u + a * (r * std::cos(ph)) + b * (r * std::sin(ph)));
+                } else {
+                    t = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+                }
+                m[0] += t.x * t.x; m[1] += t.y * t.y; m[2] += t.z * t.z;
+                m[3] += t.x * t.y; m[4] += t.x * t.z; m[5] += t.y * t.z;
+            }
+            for (int k = 0; k < 6; ++k) m[k] /= n;
+            Vec3 e[3]; double lam[3];
+            furvol::symEigen3(m, e, lam);
+            const double M[3][3] = {{m[0], m[3], m[4]}, {m[3], m[1], m[5]}, {m[4], m[5], m[2]}};
+            for (int i = 0; i < 3; ++i) {
+                const Vec3 v = e[i];
+                const Vec3 Mv{M[0][0] * v.x + M[0][1] * v.y + M[0][2] * v.z,
+                              M[1][0] * v.x + M[1][1] * v.y + M[1][2] * v.z,
+                              M[2][0] * v.x + M[2][1] * v.y + M[2][2] * v.z};
+                worstRes = std::max(worstRes, length(Mv - v * lam[i]));
+                for (int j = 0; j < 3; ++j)
+                    worstOrth = std::max(worstOrth,
+                                         std::fabs(dot(e[i], e[j]) - (i == j ? 1.0 : 0.0)));
+            }
+            worstOrder = std::max(worstOrder, std::max(lam[1] - lam[0], lam[2] - lam[1]));
+        }
+        const bool ok = worstRes < 1e-12 && worstOrth < 1e-12 && worstOrder <= 0.0;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 1. eigen: worst |Mv-lv| %.2e, worst orthonormality %.2e, "
+                    "descending %s -> %s\n",
+                    worstRes, worstOrth, worstOrder <= 0.0 ? "yes" : "NO",
+                    ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 2. the Bingham table inverts its own moment map ------------------------------
+    // Everything downstream assumes `bingham().lookup(tau)` returns concentrations whose
+    // distribution really has second moment `tau`. Four things sit between those: a scaled-
+    // Bessel azimuthal reduction, a Simpson quadrature on a sinh-warped grid, a damped Newton
+    // inversion, and bilinear interpolation between grid nodes. This checks the composition
+    // at OFF-NODE points (on-node it would only be re-testing Newton's own convergence), by
+    // feeding the looked-up concentrations back through the forward integral. It sweeps the
+    // whole eigenvalue triangle, so the parallel, girdle and isotropic corners are all
+    // covered along with everything between them.
+    {
+        double worst = 0.0, worstTau[3] = {0, 0, 0};
+        const int M = 17;
+        for (int j = 0; j < M; ++j)
+            for (int i = 0; i < M; ++i) {
+                // Half-cell offsets put every sample between grid nodes.
+                const double Ap = (i + 0.5) / M, Bp = (j + 0.5) / M;
+                double tau[3]; furvol::BinghamTable::tauAt(Ap, Bp, tau);
+                double b[3];   furvol::bingham().lookup(tau, b);
+                double m[3];   furvol::BinghamTable::moments(b[0], b[1], m);
+                double e = 0.0;
+                for (int k = 0; k < 3; ++k) e = std::max(e, std::fabs(m[k] - tau[k]));
+                if (e > worst) { worst = e; for (int k = 0; k < 3; ++k) worstTau[k] = tau[k]; }
+            }
+        const bool ok = worst < 4e-3;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 2. Bingham table: worst |moment(lookup(tau)) - tau| over %d "
+                    "off-node points = %.2e (at tau=(%.3f %.3f %.3f)) -> %s\n",
+                    M * M, worst, worstTau[0], worstTau[1], worstTau[2], ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 3. the reconstructed ODF reproduces the cell's tensor EXACTLY ----------------
+    // This is the property the model was designed around: the phase function and the
+    // extinction are read off the same T, so if the ODF's own second moment drifted from T
+    // the two halves of the medium would disagree and a coat would scatter as if it were
+    // denser (or thinner) than it attenuates. Five populations are used, chosen to sit at
+    // the corners of the space: parallel (T rank-1), isotropic, a girdle (the case the
+    // two-lobe reconstruction handles WORST, kept in deliberately), a random mixture, and a
+    // 75/25 SIGN SPLIT along one axis, which has exactly the same rank-1 T as `parallel` and
+    // exists only to exercise the first moment.
+    //
+    // The first moment is checked here too, but only where the rule is EXACT. `orient` points
+    // a sampled axis along the cell's mean tangent with probability `(1 + |v|)/2`, which
+    // reproduces E[t] exactly for a population that is two opposed deltas (`parallel`,
+    // `signed`) and approximately otherwise: for a spread population E[t] also picks up the
+    // Watson lobe's own E[|u|], which is not |v|. Asserting exactness where it does not hold
+    // would be asserting a coincidence, so the other three only REPORT the recovered
+    // coherence — the quantity that actually drives the sign choice.
+    {
+        struct Pop { const char* name; int kind; bool signExact; };
+        const Pop pops[5] = {{"parallel", 0, true},  {"isotropic", 1, false}, {"girdle", 2, false},
+                             {"random", 3, false},   {"signed 75", 4, true}};
+        double worst = 0.0; const char* worstName = "";
+        double worstFirst = 0.0; const char* worstFirstName = "";
+        for (const Pop& p : pops) {
+            Pcg32 rng; rng.seed(505 + p.kind, 1);
+            const Vec3 ax = normalize(Vec3(0.3, -0.8, 0.5));
+            Vec3 pa, pb; onb(ax, pa, pb);
+            double m[6] = {0, 0, 0, 0, 0, 0};
+            Vec3 mv{0, 0, 0};
+            const int n = 20000;
+            for (int i = 0; i < n; ++i) {
+                Vec3 t;
+                const double ph = 2.0 * PI * rng.uniform();
+                if (p.kind == 0) t = ax;
+                else if (p.kind == 1) {
+                    const double u = 2.0 * rng.uniform() - 1.0;
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                } else if (p.kind == 2) {
+                    t = pa * std::cos(ph) + pb * std::sin(ph);          // uniform in a plane
+                } else if (p.kind == 3) {
+                    const double u = 0.6 + 0.4 * rng.uniform();          // a combed clump
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                } else {
+                    t = (i % 4 == 0) ? ax * -1.0 : ax;                   // 75% one way
+                }
+                mv = mv + t;
+                m[0] += t.x * t.x; m[1] += t.y * t.y; m[2] += t.z * t.z;
+                m[3] += t.x * t.y; m[4] += t.x * t.z; m[5] += t.y * t.z;
+            }
+            for (int k = 0; k < 6; ++k) m[k] /= n;
+            mv = mv * (1.0 / n);
+            FurCell fc;
+            fc.c = 1.0f;
+            fc.txx = (float)m[0]; fc.tyy = (float)m[1];
+            fc.txy = (float)m[3]; fc.txz = (float)m[4]; fc.tyz = (float)m[5];
+            fc.mdir = furPackMean(mv, std::min(1.0, length(mv)));
+            const furvol::FurODF odf = furvol::FurODF::fromCell(fc);
+            double q[6] = {0, 0, 0, 0, 0, 0};
+            Vec3 qv{0, 0, 0};
+            const int N = 400000;
+            for (int i = 0; i < N; ++i) {
+                const Vec3 t = odf.sample(rng);
+                qv = qv + t;
+                q[0] += t.x * t.x; q[1] += t.y * t.y; q[2] += t.z * t.z;
+                q[3] += t.x * t.y; q[4] += t.x * t.z; q[5] += t.y * t.z;
+            }
+            double e = 0.0;
+            for (int k = 0; k < 6; ++k) e = std::max(e, std::fabs(q[k] / N - m[k]));
+            if (e > worst) { worst = e; worstName = p.name; }
+            qv = qv * (1.0 / N);
+            const double fe = length(qv - mv);
+            if (p.signExact && fe > worstFirst) { worstFirst = fe; worstFirstName = p.name; }
+            std::printf("[checkfurvol]    %-10s tau=(%.3f %.3f %.3f) b=(%.1f %.1f) coh=%.3f "
+                        "T err %.2e  E[t] err %.2e%s\n",
+                        p.name, odf.tau[0], odf.tau[1], odf.tau[2], odf.b[0], odf.b[1],
+                        furMeanCoherence(fc.mdir), e, fe, p.signExact ? " (asserted)" : "");
+        }
+        const bool ok = worst < 4e-3 && worstFirst < 4e-3;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 3. ODF second moment == T: worst component error %.2e (%s); "
+                    "first moment where exact %.2e (%s); 4e5 draws -> %s\n",
+                    worst, worstName, worstFirst, worstFirstName, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 4. the virtual fiber hit inverts the real one -------------------------------
+    // In a volume there is no surface to measure the impact parameter from, so h is drawn
+    // and the normal that WOULD have produced it is reconstructed. If that reconstruction
+    // were off by a sign or a rotation the BCSDF would be evaluated at the wrong h, which
+    // shifts the TRT caustic and the whole azimuthal structure without ever producing a NaN
+    // or an obviously wrong picture. Round-tripping through the shipping `hair::hFromHit`
+    // is the sharpest possible statement of "these two paths agree".
+    {
+        Pcg32 rng; rng.seed(606, 1);
+        double worst = 0.0;
+        for (int i = 0; i < 200000; ++i) {
+            const Vec3 t  = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const Vec3 wo = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            if (std::fabs(dot(t, wo)) > 0.999) continue;      // end-on: h is undefined, not wrong
+            const double h = 2.0 * rng.uniform() - 1.0;
+            const Vec3 n = furvol::fiberNormalFor(t, wo, h);
+            worst = std::max(worst, std::fabs(hair::hFromHit(n, t, wo) - h));
+        }
+        const bool ok = worst < 1e-9;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 4. virtual hit: worst |hFromHit(fiberNormalFor(h)) - h| over "
+                    "2e5 draws = %.2e -> %s\n", worst, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 5. cross-section weighting agrees with the grid's extinction -----------------
+    // The sampler draws tangents by rejecting with probability sin(angle(d,t)), so its
+    // ACCEPTANCE RATE is the exact <sin theta> of the cell — the very quantity `FurGrid`
+    // approximates by pulling the root outside the sum. Comparing the two closes the loop
+    // between the two files: the ratio must be 1 for a parallel cell (nothing to approximate)
+    // and 1.0398 at isotropy (the known, one-signed Jensen bound), and it must never exceed
+    // that, because "the grid never under-attenuates" is what makes the bias safe to ship.
+    {
+        Pcg32 rng; rng.seed(707, 1);
+        double worstRatio = 0.0, parallelRatio = 1.0, isoRatio = 1.0;
+        for (int kind = 0; kind < 3; ++kind) {
+            const Vec3 ax = normalize(Vec3(0.2, 0.9, -0.35));
+            Vec3 pa, pb; onb(ax, pa, pb);
+            double m[6] = {0, 0, 0, 0, 0, 0};
+            const int n = 20000;
+            for (int i = 0; i < n; ++i) {
+                Vec3 t; const double ph = 2.0 * PI * rng.uniform();
+                if (kind == 0) t = ax;
+                else if (kind == 1) {
+                    const double u = 2.0 * rng.uniform() - 1.0;
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                } else {
+                    const double u = 0.75 + 0.25 * rng.uniform();
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                }
+                m[0] += t.x * t.x; m[1] += t.y * t.y; m[2] += t.z * t.z;
+                m[3] += t.x * t.y; m[4] += t.x * t.z; m[5] += t.y * t.z;
+            }
+            for (int k = 0; k < 6; ++k) m[k] /= n;
+            FurCell fc; fc.c = 1.0f;
+            fc.txx = (float)m[0]; fc.tyy = (float)m[1];
+            fc.txy = (float)m[3]; fc.txz = (float)m[4]; fc.tyz = (float)m[5];
+            const furvol::FurODF odf = furvol::FurODF::fromCell(fc);
+            // Average over directions so the number is a property of the cell, not of one ray.
+            double sumTrue = 0.0, sumGrid = 0.0;
+            const int NDIR = 24, NT = 20000;
+            for (int d = 0; d < NDIR; ++d) {
+                const Vec3 dir = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                                rng.uniform() - 0.5));
+                double acc = 0.0;
+                for (int i = 0; i < NT; ++i) {
+                    const Vec3 t = odf.sample(rng);
+                    const double c = dot(t, dir);
+                    acc += std::sqrt(std::max(0.0, 1.0 - c * c));
+                }
+                sumTrue += acc / NT;
+                sumGrid += FurGrid::sigmaT(fc, dir);
+            }
+            const double ratio = sumGrid / std::max(1e-30, sumTrue);
+            if (kind == 0) parallelRatio = ratio;
+            if (kind == 1) isoRatio = ratio;
+            worstRatio = std::max(worstRatio, ratio);
+        }
+        const bool ok = std::fabs(parallelRatio - 1.0) < 3e-3 &&
+                        std::fabs(isoRatio - 1.0398) < 6e-3 && worstRatio < 1.0398 + 6e-3;
+        if (!ok) ++fails;
+        std::printf("[checkfurvol] 5. Jensen bound: grid sigma_t / sampled <sin> = %.4f parallel, "
+                    "%.4f isotropic (bound 1.0398), worst %.4f -> %s\n",
+                    parallelRatio, isoRatio, worstRatio, ok ? "PASS" : "FAIL");
+    }
+
+    // ---- 6. the aggregate phase function vs the fiber population it stands for --------
+    // This is the section that decides whether the far tier is worth having, because it
+    // measures the ONE thing the reconstruction can still get wrong after sections 1-5: the
+    // SHAPE of the orientation distribution. A cell's true directional source is
+    //
+    //     S_true(d -> wi) = (1/V) SUM_i 2 r_i l_i sin(theta_i) * E_h[ f_i * |cos| ]
+    //
+    // and the aggregate replaces the sum over strands with `sigma_t(d)` times an expectation
+    // over the reconstructed ODF. Their difference factors into exactly two pieces: the
+    // Jensen factor (section 5, bounded at 1.0398, divided out here) and the SHAPE error,
+    // which is 0 if and only if the reconstruction stands in for the population properly.
+    // Section 3 only pinned the second MOMENT; this pins the function that moment has to
+    // stand in for.
+    //
+    // THE METRIC IS L1 OVER THE WHOLE OUTGOING SPHERE, not a worst-case pointwise ratio. An
+    // earlier draft took the worst ratio over three random `wi`, and reported 3.59 for a
+    // combed clump — an alarming number that meant almost nothing, because it was picked up
+    // in a direction the tight true lobe cannot reach at all and where BOTH functions are
+    // near zero. What a path tracer actually sees is the integral, so the error that matters
+    // is `sum|S_agg - S_true| / sum S_true` over a Fibonacci sphere of outgoing directions:
+    // a genuine "what fraction of the scattered energy goes to the wrong place". `energy`
+    // (the ratio of the two sums) is reported alongside it as the part that survives even a
+    // perfectly diffuse mis-shaping.
+    //
+    // NOTE ON THE TEST THAT IS *NOT* HERE. The obvious check — sample the BCSDF at a virtual
+    // hit and average `f * |cos| / pdf`, expecting the white-furnace 1 — is VACUOUS in this
+    // model, and the first draft of this section shipped it. `apPdf` normalises the very
+    // `A_p` that `f` sums, so the ratio is identically `SUM_p A_p` for every sample, every
+    // direction and every frame: it returns exactly 1.0 (dev 0.00e+00) whether or not the
+    // tangent, the normal or the frame are right. That is a useful FACT — it means an
+    // aggregate collision's throughput multiplier is the fiber's albedo with no variance at
+    // all — but it is not a test, and a green line that cannot fail is worse than no line.
+    {
+        struct Pop { const char* name; int kind; double tol; };
+        const Pop pops[4] = {{"parallel", 0, 0.02}, {"combed", 1, 0.12},
+                             {"isotropic", 2, 0.06}, {"girdle", 3, 0.05}};
+        hair::Params pr;
+        pr.betaM = 0.3; pr.betaN = 0.3; pr.alpha = 2.0;
+        const double sigmaA = 0.2;
+        const int NF = 2000;     // explicit strands making up the truth
+        const int NA = 4000;     // ODF draws standing in for them
+        const int MH = 12;       // h quadrature nodes (deterministic: E_h is a smooth 1-D integral)
+        const int NW = 24;       // outgoing directions, Fibonacci-spaced over the whole sphere
+        std::vector<Vec3> wis((size_t)NW);
+        for (int k = 0; k < NW; ++k) {
+            const double z  = 1.0 - 2.0 * (k + 0.5) / NW;
+            const double r  = std::sqrt(std::max(0.0, 1.0 - z * z));
+            const double ph = 2.0 * PI * (k * 0.6180339887498949);
+            wis[(size_t)k] = Vec3(r * std::cos(ph), r * std::sin(ph), z);
+        }
+        bool allOk = true;
+        for (const Pop& p : pops) {
+            Pcg32 rng; rng.seed(880 + p.kind, 1);
+            const Vec3 ax = normalize(Vec3(0.15, 0.95, -0.27));
+            Vec3 pa, pb; onb(ax, pa, pb);
+            std::vector<Vec3> pop((size_t)NF);
+            double m[6] = {0, 0, 0, 0, 0, 0};
+            Vec3 mv{0, 0, 0};
+            for (int i = 0; i < NF; ++i) {
+                Vec3 t; const double ph = 2.0 * PI * rng.uniform();
+                if (p.kind == 0) t = ax;
+                else if (p.kind == 1) {
+                    const double u = 0.85 + 0.15 * rng.uniform();       // a combed clump
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                } else if (p.kind == 2) {
+                    const double u = 2.0 * rng.uniform() - 1.0;
+                    const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+                    t = normalize(ax * u + pa * (r * std::cos(ph)) + pb * (r * std::sin(ph)));
+                } else {
+                    t = pa * std::cos(ph) + pb * std::sin(ph);
+                }
+                pop[(size_t)i] = t;
+                mv = mv + t;
+                m[0] += t.x * t.x; m[1] += t.y * t.y; m[2] += t.z * t.z;
+                m[3] += t.x * t.y; m[4] += t.x * t.z; m[5] += t.y * t.z;
+            }
+            for (int k = 0; k < 6; ++k) m[k] /= NF;
+            mv = mv * (1.0 / NF);
+            FurCell fc; fc.c = 1.0f;
+            fc.txx = (float)m[0]; fc.tyy = (float)m[1];
+            fc.txy = (float)m[3]; fc.txz = (float)m[4]; fc.tyz = (float)m[5];
+            fc.mdir = furPackMean(mv, std::min(1.0, length(mv)));
+            const furvol::FurODF odf = furvol::FurODF::fromCell(fc);
+
+            // One strand's contribution to every outgoing direction at once: the Bcsdf and the
+            // frame depend only on (t, wo, h), so they are built MH times, not MH*NW times.
+            auto addFiber = [&](const Vec3& t, const Vec3& wo, double wSin, double* out) {
+                for (int q = 0; q < MH; ++q) {
+                    const double h = 2.0 * (q + 0.5) / MH - 1.0;
+                    const hair::Bcsdf b = hair::make(pr, h, sigmaA);
+                    const hair::Frame fr = hair::frameFromHit(furvol::fiberNormalFor(t, wo, h), t);
+                    const Vec3 woL = hair::toLocal(fr, wo);
+                    for (int k = 0; k < NW; ++k) {
+                        const Vec3 wiL = hair::toLocal(fr, wis[(size_t)k]);
+                        const double cosLong =
+                            hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wiL.x, -1.0, 1.0)));
+                        out[k] += wSin * hair::f(b, woL, wiL) * cosLong;
+                    }
+                }
+            };
+
+            double worstShape = 0.0, worstEnergy = 0.0;
+            for (int pass = 0; pass < 3; ++pass) {
+                const Vec3 d  = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                               rng.uniform() - 0.5));
+                const Vec3 wo = d * -1.0;                        // arrival direction, reversed
+                std::vector<double> truth((size_t)NW, 0.0), agg((size_t)NW, 0.0);
+                for (int i = 0; i < NF; ++i) {
+                    const double c = dot(pop[(size_t)i], d);
+                    addFiber(pop[(size_t)i], wo, std::sqrt(std::max(0.0, 1.0 - c * c)),
+                             truth.data());
+                }
+                // The aggregate side is quasi-random in the two dimensions that shape the
+                // lobe (|u| and azimuth), so what this measures is the model's error and not
+                // the sampler's: a plain pseudo-random draw needed ~10x the samples to get
+                // the same digit.
+                auto halton = [](int n, int base) {
+                    double f = 1.0 / base, r = 0.0;
+                    while (n > 0) { r += f * (n % base); n /= base; f /= base; }
+                    return r;
+                };
+                double sn = 0.0;
+                for (int j = 0; j < NA; ++j) {
+                    const double uq[6] = {halton(j + 1, 2), halton(j + 1, 3), halton(j + 1, 5),
+                                          halton(j + 1, 7), halton(j + 1, 11), rng.uniform()};
+                    const Vec3 t = odf.sample(uq, rng);
+                    const double c = dot(t, d);
+                    const double s = std::sqrt(std::max(0.0, 1.0 - c * c));
+                    addFiber(t, wo, s, agg.data());
+                    sn += s;
+                }
+                sn /= NA;
+                // The Jensen factor is section 5's business, so divide it out and leave only
+                // the shape error: scale the aggregate by sigma_t/(c*<sin>) and compare.
+                const double jensen = FurGrid::sigmaT(fc, d) / std::max(1e-30, sn);
+                const double kT = 1.0 / NF, kA = jensen / NA;
+                double sumT = 0.0, sumA = 0.0, l1 = 0.0;
+                for (int k = 0; k < NW; ++k) {
+                    const double a = agg[(size_t)k] * kA, b = truth[(size_t)k] * kT;
+                    sumA += a; sumT += b; l1 += std::fabs(a - b);
+                }
+                worstShape  = std::max(worstShape, l1 / std::max(1e-30, sumT));
+                worstEnergy = std::max(worstEnergy,
+                                       std::fabs(sumA / std::max(1e-30, sumT) - 1.0));
+            }
+            const bool ok = worstShape < p.tol;
+            if (!ok) allOk = false;
+            std::printf("[checkfurvol]    %-10s L1 shape error %.4f (tol %.2f), energy off by "
+                        "%.4f%s\n", p.name, worstShape, p.tol, worstEnergy, ok ? "" : "  <-- FAIL");
+        }
+        if (!allOk) ++fails;
+        // The tolerances are set just above the measured Bingham numbers (0.006 / 0.080 /
+        // 0.040 / 0.023), not at some round "close enough" figure, because their whole job is
+        // to catch a REGRESSION in the ODF family. The two families tried before this one
+        // would each fail two of these four lines: a Watson mixture turns the girdle into two
+        // orthogonal lobes (0.43) and the ACG's polynomial tails smear the combed clump
+        // (0.26). See the table at the head of fur_volume.h. What is left is not a modelling
+        // defect but the honest residual of standing in for N strands with one smooth ODF —
+        // `parallel` is nonzero only because BMAX caps the concentration short of a delta.
+        std::printf("[checkfurvol] 6. aggregate phase vs the real population -> %s\n",
+                    allOk ? "PASS" : "FAIL");
+    }
+
+    std::printf("[checkfurvol] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return fails;
 }
 
@@ -12940,6 +13383,7 @@ static int run(int argc, char** argv) {
     bool checkCurveOnly = false;
     bool checkFurOnly = false;
     bool checkFurGridOnly = false;
+    bool checkFurVolOnly = false;
     bool checkContainerOnly = false;
     bool bvhStatsOnly = false;
     bool checkLensOnly = false;
@@ -13380,6 +13824,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkcurve")) checkCurveOnly = true;
         else if (!std::strcmp(argv[i], "-checkfur")) checkFurOnly = true;
         else if (!std::strcmp(argv[i], "-checkfurgrid")) checkFurGridOnly = true;
+        else if (!std::strcmp(argv[i], "-checkfurvol")) checkFurVolOnly = true;
         else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
         else if (!std::strcmp(argv[i], "-bvhstats")) bvhStatsOnly = true;
         else if (!std::strcmp(argv[i], "-checklens")) checkLensOnly = true;
@@ -13601,6 +14046,7 @@ static int run(int argc, char** argv) {
     if (checkCurveOnly)    return checkCurve(200'000) == 0 ? 0 : 1;    // deterministic, no scene needed
     if (checkFurOnly)      return checkFur(50'000) == 0 ? 0 : 1;      // deterministic, no scene needed
     if (checkFurGridOnly)  return checkFurGrid() == 0 ? 0 : 1;        // deterministic, no scene needed
+    if (checkFurVolOnly)   return checkFurVol() == 0 ? 0 : 1;         // deterministic, no scene needed
     if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed
     if (checkLensOnly)     return checkLens();     // deterministic, no scene needed
     if (checkFluoroOnly)   return checkFluoro();   // deterministic, no scene needed

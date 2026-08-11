@@ -5077,6 +5077,30 @@ that item mostly a binding exercise there.
         participating medium (`MediumBound`, per-λ free flight) carrying an aggregate fiber BSDF,
         and build the footprint-based near/far transition that decides per ray whether to trace
         strands or march the medium. Making that transition not pop is the actual work.
+    - [x] **stage 2a — the aggregate scattering model.** `src/fur_volume.h` + `-checkfurvol`
+          (six sections). A collision is three steps: `σ_t(d) = c√(1 − dᵀTd)` for the free
+          flight (`∫σ_t dt` is literally Zinke's expected fiber-crossing count, no primitive
+          tests), a tangent drawn from a reconstructed ODF, then the *existing* `hair::` BCSDF
+          at a **virtual** hit whose normal `fiberNormalFor()` rebuilds from that tangent and an
+          offset `h`. Three findings worth keeping: (1) the ODF must be a **Bingham** — a Watson
+          mixture turns a girdle into two orthogonal lobes (L1 0.43) and an ACG smears a combed
+          clump (0.26), vs Bingham's 0.006/0.080/0.040/0.023; (2) the Newton that inverts its
+          moment map must solve for the **gap and floor** `(log(1+b₁−b₂), log(1+b₂))`, because in
+          the obvious variables the whole `τ₃ = 0` edge pins both at their maximum and the solver
+          silently returns the *girdle* answer for a **parallel** cell; (3) the tangent's **sign**
+          matters — `T` does not contain it, and drawing it uniformly moved the response **27% on
+          a perfectly parallel cell** (the 3° cuticle tilt breaks `t̂ → −t̂`), so `FurCell` now
+          carries the first moment in the 4 bytes `tzz` used to occupy, at zero memory cost.
+          See `design.md` → `fur_volume.h`.
+    - [ ] **stage 2b — the volumetric random walk** in `backward.h` (mode `R`): free flight
+          against `σ_t(d)`, collision → `sampleTangentXsec` + `h` + `hair::sample`, NEE with the
+          transmittance already computed by `FurGrid::march`'s `τ`. Needs hair-skipping in the
+          scene BVH (the `occludedSkipHair` pattern) and a `Hit` proxy for texture lookups. Also
+          needs a per-cell cache for `FurODF::fromCell` — a Jacobi eigendecomposition plus a
+          table lookup per collision is far too expensive to run inline.
+    - [ ] **stage 2c — the near/far transition**, from `Camera::footprintPerDist(spp, rx, ry)`
+          (`camera.h:219`) and `Hit::fw` / `patShadingFootprint` (`backward.h:1396`,
+          `pattern.h:299`), plus the user-facing flag. Making it not pop is the actual work.
 - [x] **P3 — fiber BCSDF. ✅ DONE v0.174.0** (all four stages).  Marschner R/TT/TRT is the baseline, but it was derived for *human hair*;
       **animal fur has a medulla** (hollow scattering core), which is why Yan et al. 2015/2017 add
       the TT^s/TRT^s lobes of the double-cylinder model. Plain Marschner on fur reads as plastic.

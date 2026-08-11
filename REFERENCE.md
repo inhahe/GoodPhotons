@@ -3985,7 +3985,7 @@ alone can't restore, so they are not disk-resumable.
 | `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checkimplicit`,
-`-checkcurve`, `-checkfur`, `-checkfurgrid`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
+`-checkcurve`, `-checkfur`, `-checkfurgrid`, `-checkfurvol`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
@@ -4016,6 +4016,19 @@ drafts got a *wrong* answer that looked right: capsule end caps are 5% of an iso
 segment's cross-section (and correctly zero for a chained strand), and a coarse grid straddling
 a density taper dilutes σ_t along exactly the rays being measured, by almost exactly enough
 to cancel the Jensen bias.
+`-checkfurvol` guards the **aggregate scattering model** that turns those grid cells into a
+participating medium, in six sections: the symmetric eigensolver; the startup table that
+inverts the **Bingham** distribution's second moment (worst error 1.2e-3 over the whole space
+of eigenvalue triples); the reconstructed orientation distribution's own second moment against
+the cell's `T`, plus its *first* moment where the sign rule is exact; the round trip from an
+offset `h` to a virtual fiber normal and back; the Jensen factor against its 1.0398 bound; and
+— the section that decides whether the far tier is worth having — the aggregate's directional
+response against **explicit fiber populations**, as L1 error over the whole outgoing sphere.
+That last one is what rejected two cheaper orientation distributions: a Watson mixture turns a
+girdle into two orthogonal lobes (0.43) and an ACG smears a combed clump (0.26), where the
+shipping Bingham measures 0.006 / 0.080 / 0.040 / 0.023 on parallel / combed / isotropic /
+girdle. Its tolerances sit just above those numbers on purpose, so a regression in the ODF
+family is caught rather than tolerated.
 `-checkhair` guards the **fiber BCSDF** (Marschner's R / TT / TRT lobes in Chiang's
 energy-conserving form, plus Yan's medulla and Zinke's dual scattering) in eleven sections. A hair BCSDF that is subtly wrong still looks
 like hair, so every claim is a number rather than a picture — and wherever the physics
